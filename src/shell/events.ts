@@ -20,6 +20,7 @@ import {
 } from "../shared/types";
 import { applyChannelStatus } from "./connection";
 import type { LiveSubscriptionHandle, LiveTopicConsumer } from "./live-channel";
+import { fetchWithinBudget } from "./bounded-fetch";
 import { liveChannel, registerRecoveryWork } from "./live";
 import { createStateReconciler } from "./recovery";
 import { renderBuildBadge } from "./connection";
@@ -226,17 +227,28 @@ async function applyDocumentFrame(payload: StatePayload, generation: number): Pr
   }
 }
 
+// How long the state fetch may go unanswered. A phone that changed networks
+// mid-request gets no error, only silence; unbounded, that silence would hold
+// the lifecycle recovery's coalescer (see `shell/recovery.ts`) and every
+// later wake-up would be dropped. Under the recovery ceiling, so the fetch
+// is the one that fails, and the reconciler's ordering sees a real rejection.
+export const STATE_FETCH_TIMEOUT_MS = 15_000;
+
 // The one path that converges this client on authoritative state and a fresh
 // stream. Both the explicit callers (scope widening, compare-target change)
 // and the lifecycle wake-up below go through it, so the reconciler's ordering
 // guard covers them all: an older fetch cannot land on top of newer state,
 // whichever route delivered that state.
 const stateReconciler = createStateReconciler<StatePayload>({
-  fetchState: async () => {
-    const response = await fetch(contextualAppUrl(appUrl("/api/state")));
-    if (!response.ok) throw new Error(`state refresh failed: ${response.status}`);
-    return (await response.json()) as StatePayload;
-  },
+  fetchState: () => fetchWithinBudget(
+    (input, init) => fetch(input, init),
+    contextualAppUrl(appUrl("/api/state")),
+    STATE_FETCH_TIMEOUT_MS,
+    async response => {
+      if (!response.ok) throw new Error(`state refresh failed: ${response.status}`);
+      return (await response.json()) as StatePayload;
+    },
+  ),
   freshnessOf: payload => payload.generatedAt,
   applyState: payload => {
     // Decided against the roots this client still holds, BEFORE the snapshot

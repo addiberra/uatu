@@ -84,43 +84,98 @@ export type LifecycleRecoveryTarget = {
   removeEventListener(type: string, listener: (event: Event) => void): void;
 };
 
+export type LifecycleRecoveryTimers = {
+  setTimeout(callback: () => void, delay: number): ReturnType<typeof setTimeout>;
+  clearTimeout(timer: ReturnType<typeof setTimeout>): void;
+};
+
+const defaultTimers: LifecycleRecoveryTimers = {
+  setTimeout: (callback, delay) => setTimeout(callback, delay),
+  clearTimeout: timer => clearTimeout(timer),
+};
+
+// How long one recovery may hold the coalescer. Every registered task is
+// meant to bound itself (the state fetch carries a timeout shorter than
+// this); the ceiling guards against one that does not, so no single hung
+// task can leave every later wake-up signal dropped. It releases the slot
+// only — the work stays owned by whoever registered it, and the reconciler's
+// ordering guards make a late completion harmless.
+export const RECOVERY_CEILING_MS = 30_000;
+
 export type LifecycleRecovery = {
   // Runs a recovery unless one is already in flight.
   request(): void;
   dispose(): void;
 };
 
+type Attempt = { timer: ReturnType<typeof setTimeout> | null };
+
 export function createLifecycleRecovery(options: {
   win: LifecycleRecoveryTarget;
   doc: LifecycleRecoveryTarget & { visibilityState?: string };
   recover: () => Promise<unknown>;
-  // The page is being discarded rather than frozen: tear the channel down for
-  // good so its retry cycle does not outlive the document.
-  discard: () => void;
+  // The page is being hidden (`pagehide`, whether or not the browser
+  // promises to restore it): drop the connection and its pending timers,
+  // keeping subscriptions and cursors, so a later wake-up resumes. Never a
+  // teardown. iOS fires an unpersisted `pagehide` for a standalone page it
+  // then keeps alive, and a page that really unloads takes its timers with
+  // it — so no lifecycle event is proof the document will never run again.
+  release: () => void;
+  timers?: LifecycleRecoveryTimers;
+  ceilingMs?: number;
 }): LifecycleRecovery {
-  let inFlight = false;
+  const timers = options.timers ?? defaultTimers;
+  const ceilingMs = options.ceilingMs ?? RECOVERY_CEILING_MS;
+  // The recovery holding the coalescer. An object rather than a flag so the
+  // late settlement of an abandoned recovery cannot release a newer one's slot.
+  let inFlight: Attempt | null = null;
+  // Set when the page was released while a recovery was in flight. That
+  // recovery's channel is gone — the release suspended it — so its completion
+  // no longer leaves the page connected, and the next signal cannot be
+  // treated as a duplicate of it.
+  let releasedInFlight = false;
+  // A signal that arrived after such a release, to run once the slot frees.
+  let queued = false;
   let disposed = false;
 
+  const settle = (attempt: Attempt) => {
+    if (inFlight !== attempt) return;
+    if (attempt.timer !== null) timers.clearTimeout(attempt.timer);
+    inFlight = null;
+    releasedInFlight = false;
+    if (queued) {
+      queued = false;
+      request();
+    }
+  };
+
   const request = () => {
-    // An overlapping signal has nothing to add: the recovery already in
-    // flight fetches current state and installs a fresh stream, which is the
-    // whole of what a second one would do. Dropping it — rather than queuing
-    // it — is what keeps a `pageshow` + `visibilitychange` + `online` burst
-    // from turning into a request storm on a phone waking up.
-    if (disposed || inFlight) return;
-    inFlight = true;
+    if (disposed) return;
+    if (inFlight !== null) {
+      // An overlapping signal usually has nothing to add: the recovery in
+      // flight fetches current state and installs a fresh stream, which is
+      // the whole of what a second one would do. Dropping it — rather than
+      // queuing it — is what keeps a `pageshow` + `visibilitychange` +
+      // `online` burst from turning into a request storm on a phone waking
+      // up. The exception is a page hidden and shown again while that
+      // recovery was still waiting on its work: the hide took its channel
+      // away, so this signal is the only thing that will bring one back.
+      if (releasedInFlight) queued = true;
+      return;
+    }
+    const attempt: Attempt = { timer: null };
+    inFlight = attempt;
+    attempt.timer = timers.setTimeout(() => settle(attempt), ceilingMs);
     let running: Promise<unknown>;
     try {
       running = Promise.resolve(options.recover());
     } catch {
       // A synchronous throw is still a finished attempt; the next signal
       // must be free to try again.
-      inFlight = false;
+      settle(attempt);
       return;
     }
-    void running.catch(() => undefined).then(() => {
-      inFlight = false;
-    });
+    void running.catch(() => undefined).then(() => settle(attempt));
   };
 
   const onPageShow = (event: Event) => {
@@ -130,15 +185,21 @@ export function createLifecycleRecovery(options: {
     // `persisted: false`, and boot already installed a stream.
     if ((event as PageTransitionEvent).persisted) request();
   };
+  // Every hide goes through here — a hidden page, and `pagehide` whatever
+  // `persisted` says (a frozen page and a "discarded" one the browser keeps
+  // alive anyway are released the same way, and the listeners stay armed for
+  // whichever wake-up comes) — so the coalescer knows when an in-flight
+  // recovery has lost its channel.
+  const release = () => {
+    options.release();
+    if (inFlight !== null) releasedInFlight = true;
+  };
   const onVisibility = () => {
     if (options.doc.visibilityState === "visible") request();
+    else release();
   };
   const onOnline = () => request();
-  const onPageHide = (event: Event) => {
-    // `persisted` means frozen for the back/forward cache — a later `pageshow`
-    // brings it back and recovers. Only an unpersisted hide is a discard.
-    if (!(event as PageTransitionEvent).persisted) options.discard();
-  };
+  const onPageHide = () => release();
 
   options.win.addEventListener("pageshow", onPageShow);
   options.win.addEventListener("online", onOnline);
@@ -149,6 +210,8 @@ export function createLifecycleRecovery(options: {
     request,
     dispose() {
       disposed = true;
+      queued = false;
+      if (inFlight !== null) settle(inFlight);
       options.win.removeEventListener("pageshow", onPageShow);
       options.win.removeEventListener("online", onOnline);
       options.win.removeEventListener("pagehide", onPageHide);
