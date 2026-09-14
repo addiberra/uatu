@@ -283,6 +283,13 @@ export class ChatAdapter {
   private readonly removedChildAttribution = new Map<string, Set<string>>();
   private readonly attributionReconstructions = new Map<string, Promise<void>>();
   private readonly attributionEpochs = new Map<string, number>();
+  // When each live-banked figure arrived, as a running sequence, so a
+  // reconstruction can tell an update that landed during its read (newer
+  // than the store) from one banked before it began (which the store may
+  // have overtaken — a partial figure seen before a disconnect, the child
+  // finishing while the stream was down).
+  private attributionSequence = 0;
+  private readonly attributionArrivals = new Map<string, Map<string, number>>();
   // Attribution keys whose tally has been squared against the child's stored
   // history. A live tally alone is not proof of completeness: a parent evicted
   // mid-run loses its maps, and the child's next event recreates one holding
@@ -413,6 +420,28 @@ export class ChatAdapter {
     // that complete source for recovery, never the bounded visible page.
     const configuration = await this.configuration(id);
     const items = [...page.items];
+    // A conversation's price is the sum of every message's, and the client
+    // folds it from the usage carriers it holds — so the newest page alone
+    // would present a partial figure that grows as older pages load. Where
+    // the provider exposes the complete transcript, every priced carrier
+    // rides the first page: hidden, small, keyed by message id, and
+    // idempotent when an older page later restates it. Priced only — an
+    // agent that prices nothing (Claude Code) has a carrier per assistant
+    // frame, and shipping those would grow the first page with the whole
+    // conversation for a fold that has nothing to sum. A subagent's spend
+    // lives on the row that launched it, so those rows ride too — the
+    // attribution pass below gives them their child's aggregate like any
+    // row on the page. They render, as an out-of-page background task
+    // already does, and merge in place when their page loads.
+    if (page.completeItems && !cursor) {
+      const held = new Set(items.map(item => item.id));
+      for (const item of page.completeItems) {
+        if (held.has(item.id)) continue;
+        const pricedCarrier = item.type === "assistant_message" && item.markdown === "" && item.usage?.costUsd !== undefined;
+        const launcher = item.type === "tool" && item.childConversationId !== undefined;
+        if (pricedCarrier || launcher) items.push(item);
+      }
+    }
     // Stable sort with no id tiebreaker: parts of one message share the
     // message's timestamp, so ties must fall back to the provider's own part
     // order (the order `flatMap` already produced). Comparing ids instead
@@ -466,24 +495,7 @@ export class ChatAdapter {
     // child rather than per open (the aggregate is still computed here, not
     // fetched per render) — and in parallel, so a fan-out costs one round trip
     // rather than one each.
-    const unattributed = [...new Set(items.flatMap(item =>
-      item.type === "tool" && item.childConversationId && !this.completeAttributions.has(attributionKey(id, item.childConversationId))
-        ? [item.childConversationId]
-        : []))];
-    await Promise.all(unattributed.map(childId => this.reconstructAttribution(id, childId)));
-    for (let index = 0; index < items.length; index += 1) {
-      const item = items[index]!;
-      if (item.type !== "tool" || !item.childConversationId) continue;
-      const key = attributionKey(id, item.childConversationId);
-      const model = latestModel(this.childModels.get(key));
-      const usage = sumUsage(this.childUsage.get(key));
-      if (model === undefined && usage === undefined) continue;
-      items[index] = {
-        ...item,
-        ...(model === undefined ? {} : { model }),
-        ...(usage === undefined ? {} : { usage }),
-      };
-    }
+    await this.attributeLaunchers(id, items);
     // OpenCode 1.18 never emits `question.v2.asked`, so a pending question is
     // invisible to the event stream and only the provider knows about it.
     // Asking here is what makes an open question answerable at all. A failed
@@ -1325,8 +1337,46 @@ export class ChatAdapter {
     // No buffered update from the discarded branch may apply after replace.
     this.eventCoalescer?.discard(conversationId);
     this.rememberReversibleHistory(conversationId, state);
-    if (changed) projection.replace(items);
+    if (changed) {
+      // The replacement is the provider's raw rows: a launcher among them
+      // carries no attribution, so the banked tallies go back on before
+      // they replace what the client shows.
+      await this.attributeLaunchers(conversationId, items);
+      projection.replace(items);
+      // A revert in a subagent rewrote what its store holds: the tally its
+      // parent banked for it — and every ancestor's, through the inclusive
+      // figure — counts spend that is gone, and no removal event says so.
+      // Forget it, square against the rewritten store, and put the fresh
+      // figure on the launching row.
+      await this.rebuildChildAttribution(conversationId);
+    }
     return state;
+  }
+
+  private async rebuildChildAttribution(childId: string): Promise<void> {
+    let parentId: string | null;
+    try {
+      parentId = await this.parentOf(childId);
+    } catch {
+      return;
+    }
+    if (!parentId) return;
+    const key = attributionKey(parentId, childId);
+    // A read in flight for the old store must not bank what it finds.
+    this.attributionEpochs.set(key, (this.attributionEpochs.get(key) ?? 0) + 1);
+    this.childUsage.delete(key);
+    this.childModels.delete(key);
+    this.removedChildAttribution.delete(key);
+    this.attributionArrivals.delete(key);
+    this.completeAttributions.delete(key);
+    await this.reconstructAttribution(parentId, childId);
+    // The dedupe may have handed back that stale in-flight read; it banks
+    // nothing, so square once more from a clean start.
+    if (!this.completeAttributions.has(key)) await this.reconstructAttribution(parentId, childId);
+    const coalescer = this.eventCoalescer;
+    if (!coalescer) return;
+    this.decorateLauncherRow(parentId, childId, coalescer, true);
+    await this.propagateInclusive(parentId, childId, coalescer);
   }
 
   private scheduleRevertReconciliation(conversationId: string, lifecycle: RevertLifecycle): void {
@@ -1567,12 +1617,21 @@ export class ChatAdapter {
    * which is what stops a child that genuinely reported nothing from being
    * re-read on every open.
    */
-  private reconstructAttribution(parentId: string, childId: string): Promise<void> {
+  /**
+   * `ancestry` is the chain of sessions whose reads this one is nested in. A
+   * grandchild found in the read is reconstructed in turn; one that leads back
+   * into that chain (a loop in the data) is skipped rather than awaited, since
+   * the in-flight dedupe would hand back the very promise being waited on. An
+   * independent read of the same child already in flight — the child's own
+   * transcript opened at the same moment — is not on the chain, and is awaited
+   * like any other so its figure lands here too.
+   */
+  private reconstructAttribution(parentId: string, childId: string, ancestry: ReadonlySet<string> = new Set()): Promise<void> {
     const key = attributionKey(parentId, childId);
     const existing = this.attributionReconstructions.get(key);
     if (existing) return existing;
     const epoch = this.attributionEpochs.get(key) ?? 0;
-    const pending = this.reconstructAttributionOnce(key, childId, epoch).finally(() => {
+    const pending = this.reconstructAttributionRead(key, childId, epoch, new Set([...ancestry, childId])).finally(() => {
       if (this.attributionReconstructions.get(key) === pending) {
         this.attributionReconstructions.delete(key);
         this.attributionEpochs.delete(key);
@@ -1582,9 +1641,11 @@ export class ChatAdapter {
     return pending;
   }
 
-  private async reconstructAttributionOnce(key: string, childId: string, epoch: number): Promise<void> {
+  private async reconstructAttributionRead(key: string, childId: string, epoch: number, ancestry: ReadonlySet<string>): Promise<void> {
     const byMessage = new Map<string, TokenUsage>();
     const byModel = new Map<string, MessageModel>();
+    let descendantsIncomplete = false;
+    const readStartedAt = this.attributionSequence;
     try {
       // Every message, in one read: banking a partial tally would permanently
       // underreport the child, because a banked key is never re-read. The
@@ -1595,14 +1656,30 @@ export class ChatAdapter {
       // read; pages walk newest to oldest, so the first page's last-reported
       // model is the child's newest and is kept.
       let cursor: string | undefined;
+      const grandchildren = new Set<string>();
       do {
         const page = await this.provider.listMessages(childId, { cursor, limit: RECONSTRUCTION_READ_LIMIT });
         for (const reported of page.accounting) {
           if (reported.usage) byMessage.set(reported.messageId, reported.usage);
           if (reported.model) byModel.set(reported.messageId, { model: reported.model, createdAt: reported.createdAt });
         }
+        for (const item of page.completeItems ?? page.items) {
+          if (item.type === "tool" && item.childConversationId && !ancestry.has(item.childConversationId)) grandchildren.add(item.childConversationId);
+        }
         cursor = page.nextCursor;
       } while (cursor !== undefined);
+      // The child's own subagents count toward it, so its figure here is
+      // inclusive: each grandchild is squared against its store the same
+      // way (recursively) and banked on this tally under its own key. A
+      // grandchild whose read did not complete leaves this tally incomplete
+      // too — banked for what it holds, but not marked squared, so the next
+      // open reads again rather than under-reporting the nest for good.
+      for (const grandchildId of grandchildren) {
+        await this.reconstructAttribution(childId, grandchildId, ancestry);
+        if (!this.completeAttributions.has(attributionKey(childId, grandchildId))) descendantsIncomplete = true;
+        const inclusive = sumUsage(this.childUsage.get(attributionKey(childId, grandchildId)));
+        if (inclusive !== undefined) byMessage.set(`agent:${grandchildId}`, inclusive);
+      }
     } catch {
       return;
     }
@@ -1610,13 +1687,23 @@ export class ChatAdapter {
     // from before that boundary must not repopulate the cleared maps and mark
     // a potentially incomplete answer authoritative.
     if ((this.attributionEpochs.get(key) ?? 0) !== epoch) return;
-    // Live events may have landed while the read was in flight, and they are
-    // newer than the stored snapshot — per message the live figure wins, and
-    // a model attributed live outranks the stored one. Overwriting instead
-    // would bank the stale snapshot permanently once the events fall behind
-    // the replay cursor.
+    // Live events that landed while the read was in flight are newer than
+    // the stored snapshot — for those the live figure wins, or the stale
+    // snapshot would be banked permanently once the events fall behind the
+    // replay cursor. A figure banked before the read began is the older
+    // one: the store may have overtaken it (a partial figure seen before a
+    // disconnect, the child finishing while the stream was down), so it
+    // stands only where the store has nothing for that message — a tally
+    // rebuilt live after an eviction, which the store read is squaring, not
+    // replacing. A message the store dropped is handled where the drop is
+    // seen: a removal event withdraws it, and a revert invalidates the
+    // child's tally outright. A model attributed live outranks the stored
+    // one either way.
     const live = this.childUsage.get(key);
-    if (live) for (const [messageId, usage] of live) byMessage.set(messageId, usage);
+    const arrivals = this.attributionArrivals.get(key);
+    if (live) for (const [messageId, usage] of live) {
+      if (!byMessage.has(messageId) || (arrivals?.get(messageId) ?? 0) > readStartedAt) byMessage.set(messageId, usage);
+    }
     const liveModels = this.childModels.get(key);
     if (liveModels) for (const [messageId, model] of liveModels) byModel.set(messageId, model);
     const removed = this.removedChildAttribution.get(key);
@@ -1626,6 +1713,7 @@ export class ChatAdapter {
     }
     this.bankAttribution(this.childUsage, key, byMessage);
     this.bankAttribution(this.childModels, key, byModel);
+    if (descendantsIncomplete) return;
     // Squared against the store from here on; only an eviction re-arms the read.
     this.completeAttributions.add(key);
     this.removedChildAttribution.delete(key);
@@ -1698,6 +1786,7 @@ export class ChatAdapter {
       const byMessage = this.childUsage.get(key) ?? new Map<string, TokenUsage>();
       byMessage.set(reported.messageId, reported.usage);
       this.bankAttribution(this.childUsage, key, byMessage);
+      this.stampArrival(key, reported.messageId);
       this.removedChildAttribution.get(key)?.delete(reported.messageId);
     }
     if (removedMessageId !== undefined) {
@@ -1712,12 +1801,58 @@ export class ChatAdapter {
         this.bankAttribution(this.removedChildAttribution, key, removed);
       }
     }
-    // Nothing to decorate if the parent is not projected — the row lives in
-    // its timeline, and an unprojected parent has no row on screen to carry
-    // the figure. The lookup walks the projection unordered: this runs per
-    // child event, and OpenCode restates a message's tokens many times a
-    // turn, so sorting the whole parent timeline each time (what `items()`
-    // does) would make a chatty subagent cost the parent's length per chunk.
+    this.decorateLauncherRow(parentId, conversationId, coalescer, removedMessageId !== undefined);
+    // A subagent's spend counts toward every conversation above it: the
+    // child's inclusive figure — its own messages and its subagents' — is
+    // banked on the grandparent's tally for the child, under a key no
+    // message can collide with, and so on up. The chip on the top-level
+    // conversation is then what the whole run cost, nested or not.
+    await this.propagateInclusive(parentId, conversationId, coalescer);
+  }
+
+  private async propagateInclusive(parentId: string, childId: string, coalescer: ProviderUpdateCoalescer): Promise<void> {
+    let grandparentId: string | null;
+    try {
+      grandparentId = await this.parentOf(parentId);
+    } catch {
+      return;
+    }
+    if (!grandparentId) return;
+    const key = attributionKey(grandparentId, parentId);
+    const byMessage = this.childUsage.get(key) ?? new Map<string, TokenUsage>();
+    const agentKey = `agent:${childId}`;
+    const previous = byMessage.get(agentKey);
+    const inclusive = sumUsage(this.childUsage.get(attributionKey(parentId, childId)));
+    if (inclusive === undefined) byMessage.delete(agentKey);
+    else byMessage.set(agentKey, inclusive);
+    this.bankAttribution(this.childUsage, key, byMessage);
+    this.stampArrival(key, agentKey);
+    // A tally that shrank — a removed or reverted message below — must be
+    // put on the row as a replacement: an ordinary upsert keeps attribution
+    // the update omits, which is right for a tool's own progress and wrong
+    // for spend that is no longer there.
+    const shrank = previous !== undefined && (inclusive === undefined || shrankFrom(previous, inclusive));
+    this.decorateLauncherRow(grandparentId, parentId, coalescer, shrank);
+    await this.propagateInclusive(grandparentId, parentId, coalescer);
+  }
+
+  private stampArrival(key: string, id: string): void {
+    const arrivals = this.attributionArrivals.get(key) ?? new Map<string, number>();
+    arrivals.set(id, ++this.attributionSequence);
+    this.bankAttribution(this.attributionArrivals, key, arrivals);
+  }
+
+  /**
+   * Put the banked tally onto the row that launched the child, if the parent
+   * is projected — the row lives in its timeline, and an unprojected parent
+   * has no row on screen to carry the figure. The lookup walks the projection
+   * unordered: this runs per child event, and OpenCode restates a message's
+   * tokens many times a turn, so sorting the whole parent timeline each time
+   * (what `items()` does) would make a chatty subagent cost the parent's
+   * length per chunk.
+   */
+  private decorateLauncherRow(parentId: string, conversationId: string, coalescer: ProviderUpdateCoalescer, replace: boolean): void {
+    const key = attributionKey(parentId, conversationId);
     const parent = this.projections.get(parentId);
     const row = parent?.find(item => item.type === "tool" && item.childConversationId === conversationId);
     if (!row || row.type !== "tool") return;
@@ -1727,7 +1862,7 @@ export class ChatAdapter {
     // token counts actually move, and an upsert that restates the row
     // verbatim still costs a replay frame for every subscriber.
     if ((model === undefined ? row.model === undefined : row.model === model) && (usage === undefined ? row.usage === undefined : sameUsage(row.usage, usage))) return;
-    if (removedMessageId !== undefined) {
+    if (replace) {
       const { usage: _usage, model: _model, ...withoutAttribution } = row;
       // Upserts deliberately preserve attribution omitted by ordinary tool
       // updates. Remove first so an intentional clear is not merged away.
@@ -1905,6 +2040,34 @@ export class ChatAdapter {
 
   /** The provider's live background tasks for this conversation, as running rows. */
   /** Null when the provider cannot list: unknown, not empty. */
+  /**
+   * Put each subagent's banked tally onto the row that launched it, reading
+   * a child's store first where the tally is not yet squared against it.
+   * Used for a history page and for the items a reversible-history
+   * replacement puts in a projection's place — raw rows from the provider,
+   * which carry no attribution of their own.
+   */
+  private async attributeLaunchers(id: string, items: ConversationItem[]): Promise<void> {
+    const unattributed = [...new Set(items.flatMap(item =>
+      item.type === "tool" && item.childConversationId && !this.completeAttributions.has(attributionKey(id, item.childConversationId))
+        ? [item.childConversationId]
+        : []))];
+    await Promise.all(unattributed.map(childId => this.reconstructAttribution(id, childId)));
+    for (let index = 0; index < items.length; index += 1) {
+      const item = items[index]!;
+      if (item.type !== "tool" || !item.childConversationId) continue;
+      const key = attributionKey(id, item.childConversationId);
+      const model = latestModel(this.childModels.get(key));
+      const usage = sumUsage(this.childUsage.get(key));
+      if (model === undefined && usage === undefined) continue;
+      items[index] = {
+        ...item,
+        ...(model === undefined ? {} : { model }),
+        ...(usage === undefined ? {} : { usage }),
+      };
+    }
+  }
+
   private async liveBackgroundTasks(id: string): Promise<ConversationItem[] | null> {
     if (!this.provider.listBackgroundTasks) return null;
     try {
@@ -2396,6 +2559,11 @@ const MAX_CHILD_ATTRIBUTIONS = 512;
 // NUL: a session id cannot contain one, so the two halves stay unambiguous.
 const ATTRIBUTION_SEPARATOR = "\u0000";
 
+/** Whether any figure in `next` is below the same figure in `previous`. */
+function shrankFrom(previous: TokenUsage, next: TokenUsage): boolean {
+  return TOKEN_USAGE_COMPONENTS.some(key => (next[key] ?? 0) < (previous[key] ?? 0)) || (next.costUsd ?? 0) < (previous.costUsd ?? 0);
+}
+
 function attributionKey(parentId: string, childId: string): string {
   return `${parentId}${ATTRIBUTION_SEPARATOR}${childId}`;
 }
@@ -2418,6 +2586,7 @@ function sumUsage(byMessage: Map<string, TokenUsage> | undefined): TokenUsage | 
       const value = usage[key];
       if (value !== undefined) total[key] = (total[key] ?? 0) + value;
     }
+    if (usage.costUsd !== undefined) total.costUsd = (total.costUsd ?? 0) + usage.costUsd;
   }
   return Object.keys(total).length > 0 ? total : undefined;
 }

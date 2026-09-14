@@ -20,6 +20,7 @@ import { buildPlanRowNodes, noteUsageReport, revealUsagePane } from "./usage-pan
 import { isLiveConversationStatus } from "./types";
 import { contextReadout } from "./context-readout";
 import { totalTokens } from "./usage";
+import { resolveSessionTotals, type ConversationTotals } from "./conversation-totals";
 import {
   addAcceptedDraft,
   applyChatEvent,
@@ -124,6 +125,7 @@ export function initChat(api = new ChatApiClient()): void {
   const planSessionTitle = document.querySelector<HTMLElement>("#chat-plan-session-title");
   const planSessionCost = document.querySelector<HTMLElement>("#chat-plan-session-cost");
   const planSessionModels = document.querySelector<HTMLElement>("#chat-plan-session-models");
+  const planSessionAgents = document.querySelector<HTMLElement>("#chat-plan-session-agents");
   const composerChips = document.querySelector<HTMLElement>("#chat-composer-chips");
   // The reason the latest status event carried (a retry's attempt and HTTP
   // status), shown with the named state — per conversation, so a switch
@@ -753,7 +755,10 @@ export function initChat(api = new ChatApiClient()): void {
   // text — the track row and the timeline row must produce the same title.
   const subagentLabelFor = (conversationId: string, source: ChatProjection | null): string => {
     const entry = source ? subagentEntries(source.items).find(candidate => candidate.conversationId === conversationId) : undefined;
-    return entry ? subagentLabel(entry) : "Subagent";
+    if (!entry) return "Subagent";
+    // What the child session cost, beside its name, once it has reported a
+    // price — the same figure its timeline row and the Agents table state.
+    return entry.usage?.costUsd ? `${subagentLabel(entry)} · ${formatUsd(entry.usage.costUsd)}` : subagentLabel(entry);
   };
   subagentsItems?.addEventListener("click", event => {
     const open = (event.target as Element).closest<HTMLElement>("[data-open-conversation]");
@@ -852,10 +857,20 @@ export function initChat(api = new ChatApiClient()): void {
     const dismissed = projection ? dismissedSubagents(projection.conversationId) : new Set<string>();
     const entries = all.filter(entry => !dismissed.has(entry.id));
     const signature = entries
-      .map(entry => [entry.id, entry.status, entry.subagent ?? "", entry.description, entry.conversationId ?? "", entry.model ?? "", entry.usage ? String(totalTokens(entry.usage)) : ""].join("\u0001"))
+      .map(entry => [entry.id, entry.status, entry.subagent ?? "", entry.description, entry.conversationId ?? "", entry.model ?? "", entry.usage ? String(totalTokens(entry.usage)) : "", entry.usage?.costUsd ?? ""].join("\u0001"))
       .join("\u0002");
     if (signature === paintedSubagents) return;
     paintedSubagents = signature;
+    // The open transcript's title states the same cost as the row: a running
+    // subagent's price moves while its transcript is open, and a title
+    // computed once at the click would keep the earlier figure.
+    if (child && drilldownTitle) {
+      const label = subagentLabelFor(child.conversationId, projection);
+      if (label !== child.label) {
+        child.label = label;
+        drilldownTitle.textContent = label;
+      }
+    }
     if (dismissButton) {
       dismissButton.hidden = !entries.some(entry => entry.status !== "running" && entry.status !== "pending");
     }
@@ -894,6 +909,9 @@ export function initChat(api = new ChatApiClient()): void {
       const attribution = [
         entry.model,
         declares("context") && entry.usage ? `${formatTokens(totalTokens(entry.usage))} tokens` : undefined,
+        // The child's own price, where its session reported one. Zero is
+        // an unpriced model, not a free one, and is not asserted.
+        declares("context") && entry.usage?.costUsd ? formatUsd(entry.usage.costUsd) : undefined,
       ].filter(Boolean).join(" · ");
       if (attribution) {
         const note = document.createElement("span");
@@ -1662,6 +1680,7 @@ export function initChat(api = new ChatApiClient()): void {
    * resets keep pace with the clock.
    */
   let paintedPlanReport: ContextReportItem | undefined;
+  let paintedTotalsKey: string | undefined;
   // The standing the chip and readout were last painted for, so a rate
   // limit that begins or ends without a new plan report still repaints.
   let paintedStanding: RateLimitStanding | undefined;
@@ -1711,8 +1730,46 @@ export function initChat(api = new ChatApiClient()): void {
     const family = exact ?? models.find(model => !model.default && ids(model).some(candidate => bare.includes(strip(candidate))));
     return family?.name ?? id;
   };
-  const paintPlanSession = (session: SessionTotals | undefined, items: readonly ConversationItem[]) => {
+  // The per-agent split, when the conversation launched subagents: the main
+  // agent's own spend, then each subagent with the model it ran. An agent
+  // that reported no price is listed with a dash, not a zero.
+  const paintPlanAgents = (agents: ConversationTotals["agents"]) => {
+    const table = planSessionAgents?.closest("table");
+    if (!planSessionAgents || !table) return;
+    const shown = agents !== undefined && agents.some(agent => !agent.main);
+    table.hidden = !shown;
+    if (!shown) {
+      planSessionAgents.replaceChildren();
+      return;
+    }
+    planSessionAgents.replaceChildren(...agents.map(agent => {
+      const row = document.createElement("tr");
+      const name = document.createElement("td");
+      name.textContent = agent.label;
+      name.title = agent.label;
+      if (agent.model) {
+        const model = document.createElement("span");
+        model.className = "chat-plan-session-agent-model";
+        model.textContent = sessionModelName(agent.model);
+        name.append(model);
+      }
+      row.append(name);
+      for (const [text, title] of [
+        [formatTokens(agent.input + agent.cacheRead + agent.cacheWrite), `${agent.input.toLocaleString()} input · ${agent.cacheRead.toLocaleString()} cache read · ${agent.cacheWrite.toLocaleString()} cache write`],
+        [formatTokens(agent.output), `${agent.output.toLocaleString()} output`],
+        [agent.costUsd ? formatUsd(agent.costUsd) : "—", agent.costUsd ? "" : "No price reported"],
+      ]) {
+        const cell = document.createElement("td");
+        cell.textContent = text!;
+        if (title) cell.title = title;
+        row.append(cell);
+      }
+      return row;
+    }));
+  };
+  const paintPlanSession = (session: ConversationTotals | undefined, items: readonly ConversationItem[]) => {
     if (!planSession || !planSessionCost || !planSessionModels) return;
+    paintPlanAgents(session?.agents);
     planSession.hidden = !session;
     if (!session) return;
     // "This conversation", or "since HH:MM" when the tally began after the
@@ -1730,7 +1787,9 @@ export function initChat(api = new ChatApiClient()): void {
         [sessionModelName(model.id), model.id],
         [formatTokens(model.input + model.cacheRead + model.cacheWrite), `${model.input.toLocaleString()} input · ${model.cacheRead.toLocaleString()} cache read · ${model.cacheWrite.toLocaleString()} cache write`],
         [formatTokens(model.output), `${model.output.toLocaleString()} output`],
-        [formatUsd(model.costUsd), ""],
+        // A row whose every contribution came unpriced says so rather
+        // than asserting the model was free.
+        ["unpriced" in model && model.unpriced ? "—" : formatUsd(model.costUsd), "unpriced" in model && model.unpriced ? "No price reported" : ""],
       ];
       for (const [text, title] of cells) {
         const cell = document.createElement("td");
@@ -1753,14 +1812,19 @@ export function initChat(api = new ChatApiClient()): void {
     if (!planUsage || !planUsageSummary) return;
     const report = projection && declares("context") ? latestPlanReport(projection.items) : undefined;
     const plan = report?.plan;
+    // The conversation's totals: the report's own where the agent tallies
+    // them (Claude Code), else folded from the priced usage carriers
+    // (OpenCode). Either way the chip and the block below read one figure.
+    const totals = projection && declares("context") ? resolveSessionTotals(projection.items) : undefined;
     // One chip for the plan and the standing together. It can be shown for
     // a standing alone, so a login with no plan is not left with nowhere to
     // say it is rate limited.
-    const chip = planChip(report, standing);
+    const chip = planChip(report || totals ? { ...(plan ? { plan } : {}), ...(totals ? { session: totals } : {}) } : undefined, standing);
     planUsage.hidden = !chip;
     if (!chip) {
       planUsage.open = false;
       paintedPlanReport = undefined;
+      paintedTotalsKey = undefined;
       paintedStanding = undefined;
       // An empty plan still tells the pane something: this login has none.
       if (report?.plan) noteUsageReport({ plan: report.plan, reportedAt: report.createdAt });
@@ -1779,8 +1843,13 @@ export function initChat(api = new ChatApiClient()): void {
     const sameStanding = standing?.message === paintedStanding?.message
       && standing?.level === paintedStanding?.level
       && standing?.resetsAt === paintedStanding?.resetsAt;
-    if (report === paintedPlanReport && sameStanding) return;
+    // Folded totals are a fresh object per fold, so they are keyed by what
+    // they say: a restated carrier that moved the cost repaints, one that
+    // did not is a no-op.
+    const totalsKey = totals ? `${totals.costUsd}\u0001${totals.models.map(model => `${model.id}:${model.costUsd}:${model.input}:${model.output}:${model.cacheRead}:${model.cacheWrite}`).join(",")}\u0001${(totals.agents ?? []).map(agent => `${agent.id}:${agent.label}:${agent.model ?? ""}:${agent.costUsd ?? ""}:${agent.input}:${agent.output}:${agent.cacheRead}:${agent.cacheWrite}`).join(",")}` : undefined;
+    if (report === paintedPlanReport && totalsKey === paintedTotalsKey && sameStanding) return;
     paintedPlanReport = report;
+    paintedTotalsKey = totalsKey;
     paintedStanding = standing;
     if (planReadoutStanding) {
       const resets = standing?.resetsAt === undefined ? "" : ` Resets ${new Date(standing.resetsAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}.`;
@@ -1798,7 +1867,7 @@ export function initChat(api = new ChatApiClient()): void {
         ? "Open for what the login reported and when it resets"
         : "This login reports no plan limits · open for this conversation's cost and per-model usage";
     paintPlanRows();
-    paintPlanSession(report?.session, projection?.items ?? []);
+    paintPlanSession(totals, projection?.items ?? []);
     if (plan) noteUsageReport({ plan, reportedAt: report!.createdAt });
   };
   planUsage?.addEventListener("toggle", () => {

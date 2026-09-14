@@ -194,6 +194,49 @@ describe("OpenCode conversation inventory and history", () => {
     inventory.cancel();
   });
 
+  test("every priced usage carrier rides the first page, so the cost fold sees the whole conversation", async () => {
+    const provider = new FakeProvider();
+    provider.sessions = [fixtureSession("session")];
+    const priced = (id: string, created: number, cost: number) => ({
+      id, type: "assistant", time: { created }, modelID: "gpt-5.6-sol", providerID: "openai",
+      tokens: { input: 100, output: 10 }, cost, content: [{ id: `prt_${id}`, type: "text", text: `Reply ${id}` }],
+    });
+    const older = priced("older", 1, 0.5);
+    const newer = priced("newer", 101, 0.25);
+    // A subagent launched from the older page: its spend lives on the row
+    // that launched it, so the row rides the first page and is attributed.
+    const launch = {
+      id: "launch", type: "assistant", time: { created: 2 }, modelID: "gpt-5.6-sol", providerID: "openai",
+      content: [{ id: "prt_task", type: "tool", tool: "task", callID: "c1", state: { status: "completed", input: { description: "Review renderer", subagent_type: "explore" }, metadata: { sessionId: "child" }, output: "done" } }],
+    };
+    // The provider pages locally over the complete transcript: the newest
+    // page holds one message, the transcript everything.
+    provider.pages.set("first", { items: [newer], nextCursor: "older-page", configurationItems: [older, launch, newer] });
+    provider.pages.set("older-page", { items: [older, launch], configurationItems: [older, launch, newer] });
+    const listMessages = provider.readMessages.bind(provider);
+    provider.readMessages = async (sessionId, options) => {
+      if (sessionId !== "child") return listMessages(sessionId, options);
+      return { items: [{ id: "child_a", type: "assistant", modelID: "gpt-5.6-sol", time: { created: 3 }, tokens: { input: 50, output: 5 }, cost: 0.125 }] as never[] };
+    };
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd() });
+
+    const first = await adapter.history("session");
+    const carriers = (items: readonly ConversationItem[]) => items.filter(item => item.type === "assistant_message" && item.markdown === "" && item.usage).map(item => item.id).sort();
+    // The older message's text is not on the page; its price is, and so is
+    // the subagent's row with its child's aggregate.
+    expect(first.items.some(item => item.id === "part:prt_older")).toBe(false);
+    expect(carriers(first.items)).toEqual(["usage:newer", "usage:older"]);
+    expect(first.items.find(item => item.id === "tool:prt_task")).toEqual(expect.objectContaining({ childConversationId: "child", model: "gpt-5.6-sol", usage: expect.objectContaining({ costUsd: 0.125 }) }));
+    expect(first.olderCursor).toBeDefined();
+
+    // Loading the older page restates the carrier under the same id: one
+    // item in the projection, not two.
+    const older_page = await adapter.history("session", { cursor: first.olderCursor });
+    expect(older_page.items.some(item => item.id === "part:prt_older")).toBe(true);
+    expect(carriers(adapter.projectionForTests("session").items())).toEqual(["usage:newer", "usage:older"]);
+    expect(adapter.projectionForTests("session").items().filter(item => item.id === "tool:prt_task")).toHaveLength(1);
+  });
+
   test("repairs a persisted default title from before the newest message page", async () => {
     const provider = new FakeProvider();
     provider.sessions = [{ ...fixtureSession("session"), title: "New session - 2026-08-15T12:00:00Z" }];
@@ -2608,22 +2651,24 @@ describe("pending permission recovery", () => {
       id: `e-part-${id}`, type: "message.part.updated",
       data: { part: { id: `prt_${id}`, messageID: id, sessionID: "child", type: "text", text: "findings" } },
     });
-    const message = (id: string, input: number, output: number) => ({
+    // The price restates with the tokens, and follows the same rule: the
+    // message's latest figure, counted once.
+    const message = (id: string, input: number, output: number, cost: number) => ({
       id: `e-${id}-${input}`, type: "message.updated",
-      data: { info: { id, sessionID: "child", role: "assistant", modelID: "claude-sonnet-4-5", time: { created: 2 }, tokens: { input, output, cache: { read: 100, write: 0 } } } },
+      data: { info: { id, sessionID: "child", role: "assistant", modelID: "claude-sonnet-4-5", time: { created: 2 }, tokens: { input, output, cache: { read: 100, write: 0 } }, cost } },
     });
     // Two messages, and one of them restated: `message.updated` reports a
     // message's growing tokens rather than a delta, so the restatement must
     // replace that message's figure and not add to it.
     provider.eventQueue.push(part("msg_a") as never);
-    provider.eventQueue.push(message("msg_a", 1_000, 10) as never);
-    provider.eventQueue.push(message("msg_a", 1_200, 20) as never);
+    provider.eventQueue.push(message("msg_a", 1_000, 10, 0.5) as never);
+    provider.eventQueue.push(message("msg_a", 1_200, 20, 0.75) as never);
     provider.eventQueue.push(part("msg_b") as never);
-    provider.eventQueue.push(message("msg_b", 800, 5) as never);
+    provider.eventQueue.push(message("msg_b", 800, 5, 0.25) as never);
     while (sumInput(row()) !== 2_000) await Bun.sleep(1);
     expect(row()).toEqual(expect.objectContaining({
       model: "claude-sonnet-4-5",
-      usage: { input: 2_000, output: 25, cacheRead: 200, cacheWrite: 0 },
+      usage: { input: 2_000, output: 25, cacheRead: 200, cacheWrite: 0, costUsd: 1 },
     }));
 
     // A message that emits a second text part reports the SAME cumulative
@@ -2633,7 +2678,7 @@ describe("pending permission recovery", () => {
       id: "e-part-msg_b-2", type: "message.part.updated",
       data: { part: { id: "prt_msg_b_2", messageID: "msg_b", sessionID: "child", type: "text", text: "and more" } },
     } as never);
-    provider.eventQueue.push(message("msg_b", 900, 7) as never);
+    provider.eventQueue.push(message("msg_b", 900, 7, 0.375) as never);
     while (sumInput(row()) === 2_000) await Bun.sleep(1);
     expect(sumInput(row())).toBe(2_100);
 
@@ -2643,7 +2688,7 @@ describe("pending permission recovery", () => {
     const reopened = await adapter.history("parent");
     expect(reopened.items.find(item => item.type === "tool")).toEqual(expect.objectContaining({
       model: "claude-sonnet-4-5",
-      usage: { input: 2_100, output: 27, cacheRead: 200, cacheWrite: 0 },
+      usage: { input: 2_100, output: 27, cacheRead: 200, cacheWrite: 0, costUsd: 1.125 },
     }));
 
     // The tool part's own later update knows nothing about attribution; it
@@ -2654,8 +2699,256 @@ describe("pending permission recovery", () => {
         status: "completed", input: { description: "Review renderer", subagent_type: "explore" }, metadata: { sessionId: "child" }, output: "done",
       } } },
     } as never);
-    expect(row()).toEqual(expect.objectContaining({ status: "completed", model: "claude-sonnet-4-5", usage: { input: 2_100, output: 27, cacheRead: 200, cacheWrite: 0 } }));
+    expect(row()).toEqual(expect.objectContaining({ status: "completed", model: "claude-sonnet-4-5", usage: { input: 2_100, output: 27, cacheRead: 200, cacheWrite: 0, costUsd: 1.125 } }));
 
+    await adapter.stopEventPump();
+    await pump;
+  });
+
+  test("a nested subagent's spend reaches the top-level row, from the store and live", async () => {
+    const provider = new FakeProvider();
+    provider.sessions = [fixtureSession("parent"), { ...fixtureSession("child"), parentId: "parent" }, { ...fixtureSession("grandchild"), parentId: "child" }];
+    const launcher = (id: string, target: string) => ({
+      id, type: "assistant", time: { created: 1 },
+      content: [{ id: `prt_${id}`, type: "tool", tool: "task", callID: id, state: { status: "completed", input: { description: `Run ${target}`, subagent_type: "explore" }, metadata: { sessionId: target }, output: "done" } }],
+    });
+    const priced = (id: string, cost: number) => ({ id, type: "assistant", modelID: "gpt-5.6-sol", providerID: "openai", time: { created: 2 }, tokens: { input: 100, output: 10 }, cost });
+    provider.pages.set("first", { items: [launcher("launch_child", "child")] });
+    const listMessages = provider.readMessages.bind(provider);
+    provider.readMessages = async (sessionId, options) => {
+      if (sessionId === "child") return { items: [launcher("launch_grandchild", "grandchild"), priced("child_msg", 0.5)] as never[] };
+      if (sessionId === "grandchild") return { items: [priced("grandchild_msg", 0.25)] as never[] };
+      return listMessages(sessionId, options);
+    };
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g", coalesceWindowMs: 1 });
+
+    // From the store: the child's row on the parent carries the child's own
+    // spend and its subagent's.
+    const snapshot = await adapter.history("parent");
+    const row = () => adapter.projectionForTests("parent").items().find(item => item.type === "tool");
+    expect(snapshot.items.find(item => item.type === "tool")).toEqual(expect.objectContaining({
+      childConversationId: "child", usage: { input: 200, output: 20, costUsd: 0.75 },
+    }));
+
+    // Live: a grandchild message restates its price; the parent's row moves.
+    const pump = adapter.startEventPump();
+    provider.eventQueue.push({
+      id: "e-part", type: "message.part.updated",
+      data: { part: { id: "prt_g", messageID: "grandchild_msg", sessionID: "grandchild", type: "text", text: "more" } },
+    } as never);
+    provider.eventQueue.push({
+      id: "e-msg", type: "message.updated",
+      data: { info: { id: "grandchild_msg", sessionID: "grandchild", role: "assistant", modelID: "gpt-5.6-sol", time: { created: 2 }, tokens: { input: 300, output: 30 }, cost: 0.5 } },
+    } as never);
+    while (row()?.type === "tool" && row()!.usage?.costUsd !== 1) await Bun.sleep(1);
+    expect(row()).toEqual(expect.objectContaining({ usage: { input: 400, output: 40, costUsd: 1 } }));
+    await adapter.stopEventPump();
+    await pump;
+  });
+
+  test("a grandchild whose store read failed is read again on the next open", async () => {
+    const provider = new FakeProvider();
+    provider.sessions = [fixtureSession("parent"), { ...fixtureSession("child"), parentId: "parent" }, { ...fixtureSession("grandchild"), parentId: "child" }];
+    const launcher = (id: string, target: string) => ({
+      id, type: "assistant", time: { created: 1 },
+      content: [{ id: `prt_${id}`, type: "tool", tool: "task", callID: id, state: { status: "completed", input: { description: `Run ${target}`, subagent_type: "explore" }, metadata: { sessionId: target }, output: "done" } }],
+    });
+    const priced = (id: string, cost: number) => ({ id, type: "assistant", modelID: "gpt-5.6-sol", providerID: "openai", time: { created: 2 }, tokens: { input: 100, output: 10 }, cost });
+    provider.pages.set("first", { items: [launcher("launch_child", "child")] });
+    let grandchildReads = 0;
+    const listMessages = provider.readMessages.bind(provider);
+    provider.readMessages = async (sessionId, options) => {
+      if (sessionId === "child") return { items: [launcher("launch_grandchild", "grandchild"), priced("child_msg", 0.5)] as never[] };
+      if (sessionId === "grandchild") {
+        grandchildReads += 1;
+        if (grandchildReads === 1) throw new Error("transient");
+        return { items: [priced("grandchild_msg", 0.25)] as never[] };
+      }
+      return listMessages(sessionId, options);
+    };
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g" });
+    const row = (snapshot: { items: ConversationItem[] }) => snapshot.items.find(item => item.type === "tool");
+    // First open: the child's own spend is banked, the grandchild's is not
+    // yet known — and the tally is not marked squared.
+    expect(row(await adapter.history("parent"))).toEqual(expect.objectContaining({ usage: { input: 100, output: 10, costUsd: 0.5 } }));
+    // Next open reads the grandchild again and the nest is whole.
+    expect(row(await adapter.history("parent"))).toEqual(expect.objectContaining({ usage: { input: 200, output: 20, costUsd: 0.75 } }));
+    expect(grandchildReads).toBe(2);
+    // Squared now: a third open reads nothing more.
+    await adapter.history("parent");
+    expect(grandchildReads).toBe(2);
+  });
+
+  test("a grandchild already being read for its own transcript is awaited by the top-level open", async () => {
+    const provider = new FakeProvider();
+    provider.sessions = [fixtureSession("parent"), { ...fixtureSession("child"), parentId: "parent" }, { ...fixtureSession("grandchild"), parentId: "child" }];
+    const launcher = (id: string, target: string) => ({
+      id, type: "assistant", time: { created: 1 },
+      content: [{ id: `prt_${id}`, type: "tool", tool: "task", callID: id, state: { status: "completed", input: { description: `Run ${target}`, subagent_type: "explore" }, metadata: { sessionId: target }, output: "done" } }],
+    });
+    const priced = (id: string, cost: number) => ({ id, type: "assistant", modelID: "gpt-5.6-sol", providerID: "openai", time: { created: 2 }, tokens: { input: 100, output: 10 }, cost });
+    provider.pages.set("first", { items: [launcher("launch_child", "child")] });
+    let releaseGrandchild = () => {};
+    const gate = new Promise<void>(resolve => { releaseGrandchild = resolve; });
+    let grandchildReads = 0;
+    const listMessages = provider.readMessages.bind(provider);
+    provider.readMessages = async (sessionId, options) => {
+      if (sessionId === "child") return { items: [launcher("launch_grandchild", "grandchild"), priced("child_msg", 0.5)] as never[] };
+      if (sessionId === "grandchild") {
+        grandchildReads += 1;
+        await gate;
+        return { items: [priced("grandchild_msg", 0.25)] as never[] };
+      }
+      return listMessages(sessionId, options);
+    };
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g" });
+    // The child's transcript is opened first and is mid-read of its
+    // grandchild when the top-level conversation opens.
+    const childOpen = adapter.history("child");
+    while (grandchildReads === 0) await Bun.sleep(1);
+    const parentOpen = adapter.history("parent");
+    await Bun.sleep(5);
+    releaseGrandchild();
+    await childOpen;
+    const snapshot = await parentOpen;
+    expect(snapshot.items.find(item => item.type === "tool")).toEqual(expect.objectContaining({ usage: { input: 200, output: 20, costUsd: 0.75 } }));
+    // One read served both; the nest is squared, so a reopen reads nothing more.
+    expect(grandchildReads).toBe(1);
+    await adapter.history("parent");
+    expect(grandchildReads).toBe(1);
+  });
+
+  test("a figure seen live before a read does not overwrite what the store says now", async () => {
+    const provider = new FakeProvider();
+    provider.sessions = [fixtureSession("parent"), { ...fixtureSession("child"), parentId: "parent" }];
+    provider.pages.set("first", { items: [{
+      id: "launch", type: "assistant", time: { created: 1 },
+      content: [{ id: "prt_task", type: "tool", tool: "task", callID: "c1", state: { status: "completed", input: { description: "Review", subagent_type: "explore" }, metadata: { sessionId: "child" }, output: "done" } }],
+    }] });
+    // The store already holds the child's final figure.
+    const listMessages = provider.readMessages.bind(provider);
+    provider.readMessages = async (sessionId, options) => {
+      if (sessionId === "child") return { items: [{ id: "child_msg", type: "assistant", modelID: "gpt-5.6-sol", providerID: "openai", time: { created: 2 }, tokens: { input: 300, output: 30 }, cost: 0.75 }] as never[] };
+      return listMessages(sessionId, options);
+    };
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g", coalesceWindowMs: 1 });
+    const pump = adapter.startEventPump();
+    // A partial figure for that message was seen live earlier — before the
+    // stream dropped and the child finished — and banked with no parent open.
+    provider.eventQueue.push({
+      id: "e-part", type: "message.part.updated",
+      data: { part: { id: "prt_c", messageID: "child_msg", sessionID: "child", type: "text", text: "partial" } },
+    } as never);
+    provider.eventQueue.push({
+      id: "e-msg", type: "message.updated",
+      data: { info: { id: "child_msg", sessionID: "child", role: "assistant", modelID: "gpt-5.6-sol", time: { created: 2 }, tokens: { input: 100, output: 10 }, cost: 0.25 } },
+    } as never);
+    await Bun.sleep(30);
+    // Opening the parent reads the store: its final figure stands, the
+    // older live one does not overwrite it — and the tally is squared.
+    const snapshot = await adapter.history("parent");
+    expect(snapshot.items.find(item => item.type === "tool")).toEqual(expect.objectContaining({ usage: { input: 300, output: 30, costUsd: 0.75 } }));
+    await adapter.stopEventPump();
+    await pump;
+  });
+
+  test("removing a grandchild's message takes its spend off the top-level row", async () => {
+    const provider = new FakeProvider();
+    provider.sessions = [fixtureSession("parent"), { ...fixtureSession("child"), parentId: "parent" }, { ...fixtureSession("grandchild"), parentId: "child" }];
+    const launcher = (id: string, target: string) => ({
+      id, type: "assistant", time: { created: 1 },
+      content: [{ id: `prt_${id}`, type: "tool", tool: "task", callID: id, state: { status: "completed", input: { description: `Run ${target}`, subagent_type: "explore" }, metadata: { sessionId: target }, output: "done" } }],
+    });
+    provider.pages.set("first", { items: [launcher("launch_child", "child")] });
+    const listMessages = provider.readMessages.bind(provider);
+    provider.readMessages = async (sessionId, options) => {
+      if (sessionId === "child") return { items: [launcher("launch_grandchild", "grandchild")] as never[] };
+      if (sessionId === "grandchild") return { items: [{ id: "grandchild_msg", type: "assistant", modelID: "gpt-5.6-sol", providerID: "openai", time: { created: 2 }, tokens: { input: 100, output: 10 }, cost: 0.25 }] as never[] };
+      return listMessages(sessionId, options);
+    };
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g", coalesceWindowMs: 1 });
+    const row = () => adapter.projectionForTests("parent").items().find(item => item.type === "tool") as { usage?: { input?: number; output?: number; costUsd?: number } } | undefined;
+    await adapter.history("parent");
+    expect(row()?.usage).toEqual({ input: 100, output: 10, costUsd: 0.25 });
+    // The grandchild's only priced message is removed (a revert below):
+    // the child's inclusive tally shrinks to nothing, and so does the row.
+    const pump = adapter.startEventPump();
+    provider.eventQueue.push({ id: "remove", type: "message.removed", properties: { sessionID: "grandchild", messageID: "grandchild_msg" } } as never);
+    while (row()?.usage !== undefined) await Bun.sleep(1);
+    expect(row()).not.toHaveProperty("usage");
+    await adapter.stopEventPump();
+    await pump;
+  });
+
+  test("a revert inside a subagent takes the reverted spend off the parent's row", async () => {
+    const provider = new FakeProvider();
+    provider.agent.capabilities.push("reversible-history");
+    provider.sessions = [fixtureSession("parent"), { ...fixtureSession("child"), parentId: "parent" }];
+    const historyState = { staged: true, canUndo: false, canRedo: true, revertedMessages: [] };
+    provider.getReversibleHistoryState = async () => historyState;
+    provider.undo = async () => ({ outcome: "changed", state: historyState });
+    provider.redo = async () => ({ outcome: "changed", state: historyState });
+    provider.revert = async () => ({ outcome: "changed", state: historyState });
+    provider.restore = async () => ({ outcome: "changed", state: historyState });
+    const priced = (id: string, cost: number) => ({ id, type: "assistant", modelID: "gpt-5.6-sol", providerID: "openai", time: { created: 2 }, tokens: { input: 100, output: 10 }, cost, content: [{ id: `prt_${id}`, type: "text", text: id }] });
+    let childVisible = [priced("child_a", 0.5), priced("child_b", 0.25)];
+    provider.pages.set("first", { items: [{
+      id: "launch", type: "assistant", time: { created: 1 },
+      content: [{ id: "prt_task", type: "tool", tool: "task", callID: "c1", state: { status: "completed", input: { description: "Review", subagent_type: "explore" }, metadata: { sessionId: "child" }, output: "done" } }],
+    }] });
+    const listMessages = provider.readMessages.bind(provider);
+    provider.readMessages = async (sessionId, options) => (sessionId === "child" ? { items: childVisible as never[] } : listMessages(sessionId, options));
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g", coalesceWindowMs: 1 });
+    const row = () => adapter.projectionForTests("parent").items().find(item => item.type === "tool") as { usage?: { input?: number; output?: number; costUsd?: number } } | undefined;
+    await adapter.history("parent");
+    expect(row()?.usage?.costUsd).toBe(0.75);
+
+    // The child's second message is reverted: its store now holds one
+    // message, and the lifecycle event is all the parent hears about it.
+    const pump = adapter.startEventPump();
+    childVisible = [priced("child_a", 0.5)];
+    provider.eventQueue.push({ type: "session.next.revert.staged", data: { sessionID: "child" } } as never);
+    while (row()?.usage?.costUsd !== 0.5) await Bun.sleep(1);
+    expect(row()?.usage).toEqual({ input: 100, output: 10, costUsd: 0.5 });
+    // Squared against the rewritten store: a reopen reads the same figure.
+    expect((await adapter.history("parent")).items.find(item => item.type === "tool")).toEqual(expect.objectContaining({ usage: { input: 100, output: 10, costUsd: 0.5 } }));
+    await adapter.stopEventPump();
+    await pump;
+  });
+
+  test("a reversible-history replacement of the parent keeps its subagents' spend on their rows", async () => {
+    const provider = new FakeProvider();
+    provider.agent.capabilities.push("reversible-history");
+    provider.sessions = [fixtureSession("parent"), { ...fixtureSession("child"), parentId: "parent" }];
+    const historyState = { staged: true, canUndo: false, canRedo: true, revertedMessages: [] };
+    provider.getReversibleHistoryState = async () => historyState;
+    provider.undo = async () => ({ outcome: "changed", state: historyState });
+    provider.redo = async () => ({ outcome: "changed", state: historyState });
+    provider.revert = async () => ({ outcome: "changed", state: historyState });
+    provider.restore = async () => ({ outcome: "changed", state: historyState });
+    const launcher = {
+      id: "launch", type: "assistant", time: { created: 1 },
+      content: [{ id: "prt_task", type: "tool", tool: "task", callID: "c1", state: { status: "completed", input: { description: "Review", subagent_type: "explore" }, metadata: { sessionId: "child" }, output: "done" } }],
+    };
+    let parentVisible = [launcher, { id: "later", type: "user", time: { created: 5 }, text: "discard me" }];
+    const listMessages = provider.readMessages.bind(provider);
+    provider.readMessages = async (sessionId, options) => {
+      if (sessionId === "child") return { items: [{ id: "child_msg", type: "assistant", modelID: "gpt-5.6-sol", providerID: "openai", time: { created: 2 }, tokens: { input: 100, output: 10 }, cost: 0.5 }] as never[] };
+      if (sessionId === "parent") return { items: parentVisible as never[] };
+      return listMessages(sessionId, options);
+    };
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g", coalesceWindowMs: 1 });
+    const row = () => adapter.projectionForTests("parent").items().find(item => item.type === "tool") as { usage?: { costUsd?: number } } | undefined;
+    await adapter.history("parent");
+    expect(row()?.usage?.costUsd).toBe(0.5);
+
+    // The parent's own later prompt is reverted: its history is replaced
+    // with the provider's raw rows, and the launcher keeps its child's spend.
+    const pump = adapter.startEventPump();
+    parentVisible = [launcher];
+    provider.eventQueue.push({ type: "session.next.revert.staged", data: { sessionID: "parent" } } as never);
+    while (adapter.projectionForTests("parent").items().some(item => item.id === "message:later")) await Bun.sleep(1);
+    expect(row()?.usage?.costUsd).toBe(0.5);
     await adapter.stopEventPump();
     await pump;
   });
