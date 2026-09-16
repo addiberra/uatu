@@ -446,8 +446,10 @@ server {
     location / {
         proxy_pass http://127.0.0.1:4700;
         proxy_http_version 1.1;
-        # REQUIRED: the hub's origin gate compares Origin against this.
-        proxy_set_header Host $host;
+        # REQUIRED: the hub's origin gate compares Origin against this, and
+        # the session cookie is named for its port. $http_host is the
+        # browser's header verbatim; $host would drop a non-default port.
+        proxy_set_header Host $http_host;
         proxy_set_header X-Forwarded-Proto $scheme;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         # WebSockets (the terminal) and SSE (the live stream).
@@ -541,5 +543,13 @@ tail -f /tmp/uatu-hub.log
 - **Login lockout**: five failed attempts per minute per address; wait a
   minute. Revoke a single device from the dashboard's Devices pane; rotate
   everyone's sessions by deleting `sessions.json` in the state dir.
+- **Several hubs through port forwards** (`ssh -L`, AWS SSM, WSL2) reached
+  as `127.0.0.1:4700`, `:4701`, and so on keep separate logins. Browsers
+  scope cookies by host, not port, so the hub names its session cookie for
+  the port the browser used (`uatu_hub_4701`). At a default port the name
+  stays `uatu_hub`. Nothing to configure. Browsers still send every hub's
+  cookie to every port on that host (cookies never isolate by port), so
+  forward only hubs you would hand your password to. A fronting proxy must
+  still pass `Host` through unchanged (see Path C).
 - **Sizing**: each running session is one Bun process (plus a watchdog and
   your shells). A handful of sessions is well within a small homelab box.
