@@ -207,10 +207,51 @@ test("a user-expanded folder is preserved across an unrelated filesystem refresh
   // expansion the user chose must survive.
   await fs.writeFile(workspacePath("README.md"), "# Refreshed\n\nNew content.\n", "utf8");
 
-  // Give the SSE loop a moment to deliver the refresh.
-  await page.waitForTimeout(500);
+  // Wait for the actual refresh, not a delay that can pass before delivery.
+  await expect(page.locator("#preview")).toContainText("New content.");
 
   await expect(metadataFolder).toHaveAttribute("aria-expanded", "true");
+});
+
+test("a user-expanded folder is preserved when a file is added", async ({ page, request }) => {
+  await bootSession(page, request);
+  await treeRow(page, "README.md").click();
+  const metadataFolder = treeRow(page, "metadata/");
+  await metadataFolder.click();
+  await expect(metadataFolder).toHaveAttribute("aria-expanded", "true");
+
+  await fs.writeFile(workspacePath("added.md"), "# Added\n", "utf8");
+  await expect(treeRow(page, "added.md")).toBeAttached();
+  await expect(metadataFolder).toHaveAttribute("aria-expanded", "true");
+});
+
+test("a user-collapsed active folder stays collapsed when its file is updated", async ({ page, request }) => {
+  await bootSession(page, request);
+  const guidesFolder = treeRow(page, "guides/");
+  await guidesFolder.click();
+  await treeRow(page, "guides/setup.md").click();
+  await expect(page.locator("#preview-path")).toHaveText("guides/setup.md");
+  await expect(page.locator("#follow-toggle")).toHaveAttribute("aria-pressed", "false");
+  await guidesFolder.click();
+  await expect(guidesFolder).toHaveAttribute("aria-expanded", "false");
+
+  await fs.writeFile(workspacePath("guides", "setup.md"), "# Setup\n\nCollapsed folder refresh.\n", "utf8");
+  await expect(page.locator("#preview")).toContainText("Collapsed folder refresh.");
+  await expect(guidesFolder).toHaveAttribute("aria-expanded", "false");
+});
+
+test("a user-collapsed active folder stays collapsed when an unrelated file is added", async ({ page, request }) => {
+  await bootSession(page, request);
+  const guidesFolder = treeRow(page, "guides/");
+  await guidesFolder.click();
+  await treeRow(page, "guides/setup.md").click();
+  await expect(page.locator("#preview-path")).toHaveText("guides/setup.md");
+  await guidesFolder.click();
+  await expect(guidesFolder).toHaveAttribute("aria-expanded", "false");
+
+  await fs.writeFile(workspacePath("added.md"), "# Added\n", "utf8");
+  await expect(treeRow(page, "added.md")).toBeAttached();
+  await expect(guidesFolder).toHaveAttribute("aria-expanded", "false");
 });
 
 // Spec coverage for the `document-tree` capability's "Render the document
