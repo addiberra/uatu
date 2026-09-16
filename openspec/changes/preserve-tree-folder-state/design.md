@@ -53,11 +53,15 @@ Alternative rejected: suppress every refresh-time reveal. The diagnostic experim
 
 Separate the current `revealAndSelect` responsibilities, either with a clearly named reveal option or two internal operations. Always reconcile selected rows through the existing programmatic-update guard. Expand ancestors only when the reveal decision requires it. This preserves the active file's selection after a rebuild even if its row is hidden under a collapsed ancestor, and avoids leaving the directory itself selected after a collapse click.
 
+Browser verification confirmed that clicking a directory to reopen it replaces the selected leaf with the directory. Reconcile directory-selection callbacks to the currently available application-selected file without revealing or focusing it. Selection and keyboard focus are separate library APIs: focus stays on the directory so arrow navigation still works. Do not restore the last represented file when the current selection is explicitly cleared or unavailable. The user approved this directory-interaction reconciliation during implementation.
+
 Alternative rejected: skip the whole selection operation when the active document is unchanged. A rebuild or folder interaction may have changed library selection, so skipping synchronization can preserve expansion at the cost of incorrect selected rows.
 
 ### 3. Apply the same reveal decision to reset inputs
 
 For All-to-All path-set changes, snapshot the library's currently expanded directories before resetting. Restore surviving expanded directories and union in selected-file ancestors only if a reveal is required. With unchanged selection, the expanded snapshot alone determines existing directory state; collapsed directories remain absent from it, and new unrelated directories use the closed default.
+
+Direct adapter tests also exposed a nested-state edge: the library's `initialExpandedPaths` opens ancestors of expanded descendants, even when those ancestors were manually collapsed. After an All-to-All reset, use public directory handles to collapse any implicitly reopened ancestors absent from the intended expanded set. Keep expanded descendants intact and exempt ancestors needed by a genuine selection reveal. This is a reset-boundary restoration, not a second continuously tracked expansion model. The user approved including this correction during implementation.
 
 Use the same decision for both initial expansion inputs and post-reset selection handling. Fixing only one of these paths leaves one of the confirmed failures intact. Keep the existing path fingerprint optimization; avoiding redundant resets alone cannot fix content-only updates.
 

@@ -225,33 +225,136 @@ test("a user-expanded folder is preserved when a file is added", async ({ page, 
   await expect(metadataFolder).toHaveAttribute("aria-expanded", "true");
 });
 
-test("a user-collapsed active folder stays collapsed when its file is updated", async ({ page, request }) => {
-  await bootSession(page, request);
+async function collapseSelectedAncestorAndExpandMetadata(page: Page): Promise<void> {
   const guidesFolder = treeRow(page, "guides/");
-  await guidesFolder.click();
-  await treeRow(page, "guides/setup.md").click();
   await expect(page.locator("#preview-path")).toHaveText("guides/setup.md");
-  await expect(page.locator("#follow-toggle")).toHaveAttribute("aria-pressed", "false");
+  await expect(treeRow(page, "guides/setup.md")).toHaveAttribute("aria-selected", "true");
+  await treeRow(page, "metadata/").click();
+  await expect(treeRow(page, "metadata/")).toHaveAttribute("aria-expanded", "true");
   await guidesFolder.click();
   await expect(guidesFolder).toHaveAttribute("aria-expanded", "false");
+}
+
+async function expectPreservedFolderState(page: Page, follow = false): Promise<void> {
+  await expect(page.locator("#preview-path")).toHaveText("guides/setup.md");
+  await expect(page.locator("#follow-toggle")).toHaveAttribute("aria-pressed", String(follow));
+  await expect(treeRow(page, "metadata/")).toHaveAttribute("aria-expanded", "true");
+  const guidesFolder = treeRow(page, "guides/");
+  await expect(guidesFolder).toHaveAttribute("aria-expanded", "false");
+
+  // Selection must survive even while its row is hidden, including resetPaths.
+  const selectedPaths = () => page.locator("#tree").evaluate(element =>
+    (element as HTMLElement & { __pierreFileTree: { getSelectedPaths(): string[] } }).__pierreFileTree.getSelectedPaths());
+  await expect.poll(selectedPaths).toEqual(["guides/setup.md"]);
+  await guidesFolder.click();
+  await expect(guidesFolder).toHaveAttribute("aria-expanded", "true");
+  await expect(treeRow(page, "guides/setup.md")).toHaveAttribute("aria-selected", "true");
+  await expect(page.locator("#preview-path")).toHaveText("guides/setup.md");
+  await expect(page.locator("#follow-toggle")).toHaveAttribute("aria-pressed", String(follow));
+}
+
+test("a user-collapsed active folder stays collapsed when its file is updated", async ({ page, request }) => {
+  await bootSession(page, request);
+  await treeRow(page, "guides/").click();
+  await treeRow(page, "guides/setup.md").click();
+  await collapseSelectedAncestorAndExpandMetadata(page);
+  await expect(page.locator("#follow-toggle")).toHaveAttribute("aria-pressed", "false");
 
   await fs.writeFile(workspacePath("guides", "setup.md"), "# Setup\n\nCollapsed folder refresh.\n", "utf8");
   await expect(page.locator("#preview")).toContainText("Collapsed folder refresh.");
-  await expect(guidesFolder).toHaveAttribute("aria-expanded", "false");
+  await expectPreservedFolderState(page);
 });
 
 test("a user-collapsed active folder stays collapsed when an unrelated file is added", async ({ page, request }) => {
   await bootSession(page, request);
-  const guidesFolder = treeRow(page, "guides/");
-  await guidesFolder.click();
+  await treeRow(page, "guides/").click();
   await treeRow(page, "guides/setup.md").click();
-  await expect(page.locator("#preview-path")).toHaveText("guides/setup.md");
-  await guidesFolder.click();
-  await expect(guidesFolder).toHaveAttribute("aria-expanded", "false");
+  await collapseSelectedAncestorAndExpandMetadata(page);
+  await expect(page.locator("#follow-toggle")).toHaveAttribute("aria-pressed", "false");
 
   await fs.writeFile(workspacePath("added.md"), "# Added\n", "utf8");
   await expect(treeRow(page, "added.md")).toBeAttached();
-  await expect(guidesFolder).toHaveAttribute("aria-expanded", "false");
+  await expectPreservedFolderState(page);
+});
+
+for (const operation of ["removed", "renamed"] as const) {
+  test(`a user-collapsed active folder stays collapsed when an unrelated file is ${operation}`, async ({ page, request }) => {
+    await bootSession(page, request, { extras: { "unrelated.md": "# Unrelated\n" } });
+    await treeRow(page, "guides/").click();
+    await treeRow(page, "guides/setup.md").click();
+    await collapseSelectedAncestorAndExpandMetadata(page);
+    await expect(page.locator("#follow-toggle")).toHaveAttribute("aria-pressed", "false");
+    // Establish presence before removal so absence cannot pass before delivery.
+    await expect(treeRow(page, "unrelated.md")).toBeAttached();
+    if (operation === "removed") {
+      await fs.unlink(workspacePath("unrelated.md"));
+    } else {
+      await fs.rename(workspacePath("unrelated.md"), workspacePath("renamed.md"));
+      await expect(treeRow(page, "renamed.md")).toBeAttached();
+    }
+    await expect(treeRow(page, "unrelated.md")).not.toBeAttached();
+    await expectPreservedFolderState(page);
+  });
+}
+
+test("a user-collapsed active folder stays collapsed with Follow on when the same document updates", async ({ page, request }) => {
+  await bootSession(page, request);
+  await treeRow(page, "README.md").click();
+  await expect(page.locator("#follow-toggle")).toHaveAttribute("aria-pressed", "false");
+  await page.locator("#follow-toggle").click();
+  await expect(page.locator("#follow-toggle")).toHaveAttribute("aria-pressed", "true");
+  await fs.writeFile(workspacePath("guides", "setup.md"), "# Setup\n\nFollow setup.\n", "utf8");
+  await expect(page.locator("#preview")).toContainText("Follow setup.");
+  await collapseSelectedAncestorAndExpandMetadata(page);
+  await expect(page.locator("#follow-toggle")).toHaveAttribute("aria-pressed", "true");
+
+  await fs.writeFile(workspacePath("guides", "setup.md"), "# Setup\n\nSame document refreshed with Follow.\n", "utf8");
+  await expect(page.locator("#preview")).toContainText("Same document refreshed with Follow.");
+  await expectPreservedFolderState(page, true);
+});
+
+test("pointer and keyboard navigation retain folder focus after a collapsed active leaf refresh", async ({ page, request }) => {
+  await bootSession(page, request);
+  await treeRow(page, "README.md").click();
+  await page.locator("#follow-toggle").click();
+  await expect(page.locator("#follow-toggle")).toHaveAttribute("aria-pressed", "true");
+  await fs.writeFile(workspacePath("guides", "setup.md"), "# Setup\n\nNavigation before refresh.\n", "utf8");
+  await expect(page.locator("#preview-path")).toHaveText("guides/setup.md");
+  const folder = treeRow(page, "guides/");
+  await folder.click();
+  await expect(folder).toHaveAttribute("aria-expanded", "false");
+
+  await fs.writeFile(workspacePath("guides", "setup.md"), "# Setup\n\nNavigation after refresh.\n", "utf8");
+  await expect(page.locator("#preview")).toContainText("Navigation after refresh.");
+  await expect(folder).toHaveAttribute("aria-expanded", "false");
+  await folder.click();
+  await expect(folder).toHaveAttribute("aria-expanded", "true");
+  await expect(treeRow(page, "guides/setup.md")).toHaveAttribute("aria-selected", "true");
+  const focusedPath = () => page.locator("#tree").evaluate(element =>
+    (element as HTMLElement & { __pierreFileTree: { getFocusedPath(): string | null } }).__pierreFileTree.getFocusedPath());
+  await expect.poll(focusedPath).toBe("guides/");
+  await expect(folder).toBeFocused();
+  await expect(page.locator("#follow-toggle")).toHaveAttribute("aria-pressed", "true");
+
+  // The fixture has exactly notes.adoc then setup.md in guides/. Right from
+  // the open folder focuses its first child; arrows move focus independently
+  // of the active document until Enter activates the focused file.
+  await page.keyboard.press("ArrowRight");
+  await expect.poll(focusedPath).toBe("guides/notes.adoc");
+  await page.keyboard.press("ArrowDown");
+  await expect.poll(focusedPath).toBe("guides/setup.md");
+  await page.keyboard.press("ArrowUp");
+  await expect.poll(focusedPath).toBe("guides/notes.adoc");
+  await expect(page.locator("#preview-path")).toHaveText("guides/setup.md");
+  await expect(page.locator("#follow-toggle")).toHaveAttribute("aria-pressed", "true");
+  await page.keyboard.press("Enter");
+  await expect(page.locator("#preview-path")).toHaveText("guides/notes.adoc");
+  await expect.poll(() => new URL(page.url()).pathname).toBe("/guides/notes.adoc");
+  await expect(treeRow(page, "guides/notes.adoc")).toHaveAttribute("aria-selected", "true");
+  await expect(page.locator("#follow-toggle")).toHaveAttribute("aria-pressed", "false");
+  await treeRow(page, "guides/setup.md").click();
+  await expect(page.locator("#preview-path")).toHaveText("guides/setup.md");
+  await expect(treeRow(page, "guides/setup.md")).toHaveAttribute("aria-selected", "true");
 });
 
 // Spec coverage for the `document-tree` capability's "Render the document

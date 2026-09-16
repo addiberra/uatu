@@ -1,4 +1,6 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { parseHTML } from "linkedom";
+import type { FileTree, FileTreeDirectoryHandle } from "@pierre/trees";
 
 import type { ChangedFileSummary, RepositorySnapshot, RootGroup } from "../shared/types";
 import {
@@ -7,8 +9,243 @@ import {
   computeFilesPaneFilterMembership,
   computeFilteredPaths,
   reconcileFilterExpansion,
+  TreeView,
   type FilesPaneFilterMembership,
 } from "./tree-view";
+
+describe("TreeView selection lifecycle with the real library", () => {
+  let container: HTMLElement & { __pierreFileTree?: FileTree };
+  let view: TreeView;
+  let selections: string[];
+  let restoreGlobals: () => void;
+  const leaf = "guides/deep/active.md";
+  const other = "other/deep/next.md";
+  const paths = [leaf, "guides/deep/sibling.md", other, "kept/open.md"];
+
+  function roots(entries = paths, ids: Record<string, string> = {}): RootGroup[] {
+    return [makeRoot({
+      id: "r1", label: "project",
+      docs: entries.map(relativePath => ({
+        id: ids[relativePath] ?? relativePath,
+        name: relativePath.split("/").at(-1)!, relativePath,
+        rootId: "r1", mtimeMs: 0, kind: "markdown",
+      })),
+    })];
+  }
+
+  function tree(): FileTree {
+    expect(container.__pierreFileTree).toBeDefined();
+    return container.__pierreFileTree!;
+  }
+
+  function directory(path: string): FileTreeDirectoryHandle {
+    const handle = tree().getItem(path);
+    expect(handle?.isDirectory()).toBe(true);
+    return handle as FileTreeDirectoryHandle;
+  }
+
+  beforeEach(() => {
+    const { document, window } = parseHTML("<!doctype html><html><body><div id='tree'></div></body></html>");
+    const globals: Record<string, unknown> = {
+      document, window, HTMLElement: window.HTMLElement, Element: window.Element,
+      HTMLStyleElement: window.HTMLStyleElement, Node: window.Node,
+      HTMLTemplateElement: window.HTMLTemplateElement,
+      HTMLDivElement: window.HTMLDivElement,
+      SVGElement: window.SVGElement,
+      ShadowRoot: window.ShadowRoot,
+      MutationObserver: window.MutationObserver,
+      matchMedia: () => ({ matches: false }),
+    };
+    const previous = Object.entries(globals).map(([key]) => [key, Object.getOwnPropertyDescriptor(globalThis, key)] as const);
+    // linkedom has no layout/scroll implementation. Supply browser defaults,
+    // not a fake tree: all model mutations and callbacks remain Pierre's.
+    const prototype = window.HTMLElement.prototype;
+    const layout = { scrollTop: 0, scrollLeft: 0, clientHeight: 600, clientWidth: 300 };
+    const previousLayout = Object.keys(layout).map(key => [key, Object.getOwnPropertyDescriptor(prototype, key)] as const);
+    for (const [key, value] of Object.entries(layout)) {
+      Object.defineProperty(prototype, key, { configurable: true, writable: true, value });
+    }
+    for (const [key, value] of Object.entries(globals)) {
+      Object.defineProperty(globalThis, key, { configurable: true, writable: true, value });
+    }
+    restoreGlobals = () => {
+      for (const [key, descriptor] of previousLayout) {
+        if (descriptor) Object.defineProperty(prototype, key, descriptor);
+        else Reflect.deleteProperty(prototype, key);
+      }
+      for (const [key, descriptor] of previous) {
+        if (descriptor) Object.defineProperty(globalThis, key, descriptor);
+        else Reflect.deleteProperty(globalThis, key);
+      }
+    };
+    container = document.getElementById("tree") as typeof container;
+    selections = [];
+    view = new TreeView({ container, onSelectDocument: id => selections.push(id) });
+  });
+
+  afterEach(() => {
+    try {
+      view.dispose();
+      expect(selections).toEqual([]);
+    } finally {
+      restoreGlobals();
+    }
+  });
+
+  it("reveals an initial nested selection without emitting a navigation echo", () => {
+    view.update(roots(), leaf);
+    expect(directory("guides/").isExpanded()).toBe(true);
+    expect(directory("guides/deep/").isExpanded()).toBe(true);
+    expect(directory("other/").isExpanded()).toBe(false);
+    expect(tree().getSelectedPaths()).toEqual([leaf]);
+  });
+
+  for (const refresh of ["unchanged", "addition", "removal", "rename"] as const) {
+    it(`preserves collapsed ancestors and hidden leaf selection after ${refresh}`, () => {
+      view.update(roots(), leaf);
+      directory("guides/").collapse();
+      expect(directory("guides/deep/").isExpanded()).toBe(true);
+      directory("kept/").expand();
+      // Folder interactions can leave a directory selected. Synchronization
+      // must restore the application's leaf without revealing its ancestors.
+      tree().getItem(leaf)!.deselect();
+      directory("guides/").select();
+      const next = refresh === "addition" ? [...paths, "new/file.md"]
+        : refresh === "removal" ? paths.filter(path => path !== other)
+        : refresh === "rename" ? paths.map(path => path === other ? "renamed/file.md" : path)
+        : paths;
+      view.update(roots(next), leaf);
+      expect(directory("guides/").isExpanded()).toBe(false);
+      expect(directory("guides/deep/").isExpanded()).toBe(true);
+      expect(directory("kept/").isExpanded()).toBe(true);
+      expect(tree().getSelectedPaths()).toEqual([leaf]);
+      if (refresh === "addition") expect(directory("new/").isExpanded()).toBe(false);
+      directory("guides/").expand();
+      expect(tree().getItem(leaf)?.isSelected()).toBe(true);
+    });
+  }
+
+  it("immediately restores the hidden active leaf after directory selection without moving folder focus", () => {
+    view.update(roots(), leaf);
+    const folder = directory("guides/");
+    folder.collapse();
+    folder.focus();
+    const focusedPath = tree().getFocusedPath();
+    expect(focusedPath).not.toBeNull();
+    tree().getItem(leaf)!.deselect();
+    folder.select();
+    // No update() or refresh: the real selection callback reconciles now.
+    expect(tree().getSelectedPaths()).toEqual([leaf]);
+    expect(folder.isExpanded()).toBe(false);
+    expect(tree().getFocusedPath()).toBe(focusedPath);
+    expect(selections).toEqual([]);
+  });
+
+  for (const nextSelection of [null, "unavailable.md"]) {
+    it(`does not resurrect the previous leaf on directory selection after selecting ${nextSelection}`, () => {
+      view.update(roots(), leaf);
+      directory("guides/").collapse();
+      view.update(roots(), nextSelection);
+      const folder = directory("guides/");
+      folder.focus();
+      const focusedPath = tree().getFocusedPath();
+      expect(focusedPath).not.toBeNull();
+      folder.select();
+      expect(tree().getSelectedPaths()).not.toContain(leaf);
+      expect(folder.isExpanded()).toBe(false);
+      expect(tree().getFocusedPath()).toBe(focusedPath);
+      expect(selections).toEqual([]);
+    });
+  }
+
+  it("reveals a changed document additively", () => {
+    view.update(roots(), leaf);
+    directory("guides/").collapse();
+    directory("kept/").expand();
+    view.update(roots(), other);
+    expect(directory("other/").isExpanded()).toBe(true);
+    expect(directory("other/deep/").isExpanded()).toBe(true);
+    expect(directory("kept/").isExpanded()).toBe(true);
+    expect(directory("guides/").isExpanded()).toBe(false);
+    expect(tree().getSelectedPaths()).toEqual([other]);
+  });
+
+  it("forwards a library selection after refresh instead of leaving the update guard active", () => {
+    view.update(roots(), leaf);
+    view.update(roots([...paths, "new.md"]), leaf);
+    expect(selections).toEqual([]);
+    tree().getItem(leaf)!.deselect();
+    tree().getItem(other)!.select();
+    expect(selections).toEqual([other]);
+    selections.length = 0;
+    view.update(roots([...paths, "new.md"]), other);
+    expect(tree().getSelectedPaths()).toEqual([other]);
+  });
+
+  it("reveals the same document after explicit selection clearing", () => {
+    view.update(roots(), leaf);
+    directory("guides/").collapse();
+    view.update(roots(), null);
+    view.update(roots(), leaf);
+    expect(directory("guides/").isExpanded()).toBe(true);
+    expect(tree().getSelectedPaths()).toEqual([leaf]);
+  });
+
+  it("keeps a surviving ancestor collapsed when a represented same-path selection returns", () => {
+    view.update(roots(), leaf);
+    directory("guides/").collapse();
+    view.update(roots(paths.filter(path => path !== leaf)), leaf);
+    expect(directory("guides/").isExpanded()).toBe(false);
+    view.update(roots(), leaf);
+    expect(directory("guides/").isExpanded()).toBe(false);
+    expect(tree().getSelectedPaths()).toEqual([leaf]);
+    directory("guides/").expand();
+    expect(tree().getItem(leaf)?.isSelected()).toBe(true);
+  });
+
+  it("reveals a different unavailable selection when it first becomes represented", () => {
+    const missing = paths.filter(path => path !== other);
+    view.update(roots(missing), leaf);
+    directory("kept/").expand();
+    view.update(roots(missing), other);
+    view.update(roots(), other);
+    expect(directory("other/").isExpanded()).toBe(true);
+    expect(directory("other/deep/").isExpanded()).toBe(true);
+    expect(directory("kept/").isExpanded()).toBe(true);
+    expect(tree().getSelectedPaths()).toEqual([other]);
+  });
+
+  it("reveals a changed resolved path even when document identity is unchanged", () => {
+    view.update(roots(paths, { [leaf]: "stable-id" }), "stable-id");
+    const moved = "moved/deep/active.md";
+    view.update(roots(paths.map(path => path === leaf ? moved : path), { [moved]: "stable-id" }), "stable-id");
+    expect(directory("moved/").isExpanded()).toBe(true);
+    expect(directory("moved/deep/").isExpanded()).toBe(true);
+    expect(tree().getSelectedPaths()).toEqual([moved]);
+  });
+
+  it("reveals a changed document identity even at the same tree path", () => {
+    view.update(roots(), leaf);
+    directory("guides/").collapse();
+    view.update(roots(paths, { [leaf]: "replacement-id" }), "replacement-id");
+    expect(directory("guides/").isExpanded()).toBe(true);
+    expect(tree().getSelectedPaths()).toEqual([leaf]);
+  });
+
+  it("clears mounted state on disposal and reveals on a fresh mount", () => {
+    view.update(roots(), leaf);
+    directory("guides/").collapse();
+    const mounted = tree();
+    view.dispose();
+    expect(container.__pierreFileTree).toBeUndefined();
+    expect(view.getVisibleLeafCount()).toBe(0);
+    expect(view.getVisibleBinaryLeafCount()).toBe(0);
+    view.update(roots(), leaf);
+    expect(tree()).not.toBe(mounted);
+    expect(directory("guides/").isExpanded()).toBe(true);
+    expect(tree().getSelectedPaths()).toEqual([leaf]);
+  });
+});
 
 function makeRoot(overrides: Partial<RootGroup> & { id: string; label: string; docs: RootGroup["docs"] }): RootGroup {
   return {

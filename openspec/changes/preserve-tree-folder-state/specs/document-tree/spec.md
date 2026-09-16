@@ -66,6 +66,12 @@ A new selection that cannot yet be represented in the tree SHALL receive its pen
 - **THEN** the ancestor remains collapsed
 - **AND** the document is selected when the user manually reopens the ancestor
 
+#### Scenario: Expanded descendants survive beneath a collapsed ancestor
+- **GIVEN** the Files-pane filter is All and `guides/deep/` is expanded beneath manually collapsed `guides/`
+- **WHEN** an unrelated file is added, removed, or renamed without changing the active document
+- **THEN** `guides/` remains collapsed
+- **AND** reopening `guides/` shows `guides/deep/` still expanded
+
 #### Scenario: A new selection is revealed when it first becomes available
 - **GIVEN** the Files-pane filter is All
 - **AND** the application selected a different document while that document was unavailable

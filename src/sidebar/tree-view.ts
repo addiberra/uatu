@@ -75,6 +75,14 @@ export class TreeView {
   // selection changes leave it intact. Calling resetPaths is what wipes the
   // library's internal expansion state, so we want to do it only when needed.
   private lastPathsKey = "";
+  // Application selection last represented by the library, not its current
+  // selected row (folder clicks and resets can change that independently).
+  // Keep this across temporary absence so a returning document isn't revealed
+  // again; explicit clearing and disposal start a new selection lifecycle.
+  private lastRepresentedSelection: { documentId: string; path: string } | null = null;
+  // Unlike the last represented selection, this is null while the current
+  // application selection is cleared or unavailable in the tree.
+  private currentSelectedPath: string | null = null;
   // Path-narrow guard for the library's `onSelectionChange` callback. While
   // we're performing a programmatic update, this holds the path we just
   // asked the library to select. A callback echoing that same path is
@@ -147,8 +155,17 @@ export class TreeView {
 
     const initialSelectedPath =
       selectedDocumentId !== null ? this.pathForDocumentId(selectedDocumentId) : null;
+    this.currentSelectedPath = initialSelectedPath;
+    if (selectedDocumentId === null) this.lastRepresentedSelection = null;
+    // Only All-to-All background updates suppress reveal. Filter transitions
+    // and Changed mode retain their existing expansion policy.
+    const revealSelection = this.tree === null
+      || previousFilterKind !== "all"
+      || nextFilterKind !== "all"
+      || this.lastRepresentedSelection?.documentId !== selectedDocumentId
+      || this.lastRepresentedSelection?.path !== initialSelectedPath;
     const initialReveal =
-      initialSelectedPath !== null ? ancestorPaths(initialSelectedPath) : [];
+      initialSelectedPath !== null && revealSelection ? ancestorPaths(initialSelectedPath) : [];
 
     // Compute the path set we'll hand to the library plus the auto-expand
     // list. Filter-on returns the reduced set; filter-off returns the full
@@ -251,9 +268,7 @@ export class TreeView {
         this.ensureRevealCueStyleElement();
         this.syncFollowOverrideObserver();
         this.applyFollowOverrideAttribute();
-        if (initialSelectedPath !== null) {
-          this.revealAndSelect(initialSelectedPath);
-        }
+        this.syncDocumentSelection(selectedDocumentId, initialSelectedPath, revealSelection);
       });
       // Backstop the synchronous attribute stamp — the library may render
       // the override row on the next frame after first mount.
@@ -265,7 +280,7 @@ export class TreeView {
 
     // Update path: also wrap in the guard. resetPaths can fire
     // onSelectionChange synchronously if the previously-selected path is no
-    // longer in the new path set, and revealAndSelect deliberately drives
+    // longer in the new path set, and syncDocumentSelection deliberately drives
     // multiple selection mutations. Both must not be mistaken for user input.
     this.withProgrammaticUpdate(initialSelectedPath, () => {
       const tree = this.tree;
@@ -282,6 +297,16 @@ export class TreeView {
         const preserved = nextFilterKind === "all" ? this.readExpandedPaths() : [];
         const mergedReveal = mergeUnique(autoExpanded, preserved);
         tree.resetPaths(renderedPaths, { initialExpandedPaths: mergedReveal });
+        if (previousFilterKind === "all" && nextFilterKind === "all") {
+          // Initialization also opens ancestors of expanded descendants. Undo
+          // that implicit reveal without collapsing the descendants themselves.
+          const intendedExpanded = new Set(mergedReveal);
+          for (const path of this.readExpandedPaths()) {
+            if (intendedExpanded.has(path)) continue;
+            const handle = tree.getItem(path);
+            if (handle && isDirectoryHandle(handle)) handle.collapse();
+          }
+        }
         this.lastPathsKey = nextKey;
       }
 
@@ -289,12 +314,10 @@ export class TreeView {
       this.syncFollowOverrideObserver();
       this.applyFollowOverrideAttribute();
 
-      if (initialSelectedPath !== null) {
-        this.revealAndSelect(initialSelectedPath);
-      }
+      this.syncDocumentSelection(selectedDocumentId, initialSelectedPath, revealSelection);
     });
 
-    // revealAndSelect and resetPaths drive library re-renders that may not
+    // syncDocumentSelection and resetPaths drive library re-renders that may not
     // be in the DOM yet by the time the synchronous applyFollowOverrideAttribute
     // above runs. Re-apply on the next frame as a backstop — the
     // MutationObserver should also catch the row insertion, but Playwright
@@ -358,27 +381,28 @@ export class TreeView {
     this.renderedLeafCount = 0;
     this.renderedBinaryLeafCount = 0;
     this.lastPathsKey = "";
+    this.lastRepresentedSelection = null;
+    this.currentSelectedPath = null;
     this.lastFilterKind = "all";
     this.fullTreeExpansionSnapshot = null;
     this.followOverridePath = null;
   }
 
-  // Walk the ancestor chain of `path`, expanding each directory that isn't
-  // already open. Deselect any currently-selected paths that aren't `path`
-  // (the library supports multi-select, but uatu has exactly one active
-  // document at a time). Then select the leaf. Expansion is additive —
-  // we never collapse a directory the user opened.
-  private revealAndSelect(path: string): void {
+  // Always reconcile selected rows, even under a collapsed ancestor. Reveal
+  // is a separate, additive operation reserved for navigation/filter policy.
+  private syncDocumentSelection(documentId: string | null, path: string | null, reveal: boolean): void {
     if (this.tree === null) {
       return;
     }
     this.withProgrammaticUpdate(path, () => {
       const tree = this.tree;
       if (tree === null) return;
-      for (const ancestor of ancestorPaths(path)) {
-        const handle = tree.getItem(ancestor);
-        if (handle && isDirectoryHandle(handle) && !handle.isExpanded()) {
-          handle.expand();
+      if (path !== null && reveal) {
+        for (const ancestor of ancestorPaths(path)) {
+          const handle = tree.getItem(ancestor);
+          if (handle && isDirectoryHandle(handle) && !handle.isExpanded()) {
+            handle.expand();
+          }
         }
       }
       for (const previouslySelected of tree.getSelectedPaths()) {
@@ -388,9 +412,12 @@ export class TreeView {
           handle.deselect();
         }
       }
-      const leaf = tree.getItem(path);
+      const leaf = path !== null ? tree.getItem(path) : null;
       if (leaf && !leaf.isSelected()) {
         leaf.select();
+      }
+      if (leaf && documentId !== null && path !== null) {
+        this.lastRepresentedSelection = { documentId, path };
       }
     });
   }
@@ -425,6 +452,13 @@ export class TreeView {
     }
     const documentId = this.pathToDocumentId.get(first);
     if (!documentId) {
+      // Directory clicks select the directory before toggling it. Keep the
+      // active-document highlight, but leave focus on the directory so native
+      // tree keyboard navigation continues from the user's interaction.
+      const path = this.currentSelectedPath;
+      if (this.tree?.getItem(first)?.isDirectory() && path !== null && this.tree.getItem(path)) {
+        this.syncDocumentSelection(this.pathToDocumentId.get(path) ?? null, path, false);
+      }
       return;
     }
     this.onSelectDocument(documentId);
