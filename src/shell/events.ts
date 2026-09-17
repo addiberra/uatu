@@ -184,6 +184,7 @@ async function applyDocumentFrame(payload: StatePayload, generation: number): Pr
     previousSelectedId,
     payload.changedId,
     appState.followEnabled,
+    appState.selectionCleared,
   ));
 
   // Reveal the newly-selected file only when selection actually changed —

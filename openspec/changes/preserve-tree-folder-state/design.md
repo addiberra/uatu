@@ -1,88 +1,93 @@
 ## Context
 
-See `proposal.md` for motivation and `specs/document-tree/spec.md` for the behavior contract.
+See `proposal.md` for motivation and `specs/document-tree/spec.md` for the revised contract. The user chose manual ancestor collapse as an explicit close-document action: selection and preview clear, Follow turns off, and the intentional empty state survives reloads.
 
-Accepted document live frames reach `renderSidebar()` through `src/shell/events.ts`, which invokes `TreeView.update()` through `src/sidebar/shell.ts` even if the active document is unchanged. The tree adapter currently:
+The earlier implementation separated reveal from selection, preserved library expansion across resets, and restored the active file after directory clicks. Fresh UX review led to replacing that last policy, not stacking another behavior on it. `validation.md` and `research.md` remain historical evidence for the previous design; the affected implementation and verification tasks are reopened.
 
-1. Computes selected-file ancestors on every update.
-2. Merges those ancestors with preserved expansions when a changed path set requires `resetPaths`.
-3. Calls `revealAndSelect()` unconditionally for any selected document, expanding its ancestors again even without a path reset.
+Accepted live frames reach `TreeView.update()` through `src/shell/events.ts` and `src/sidebar/shell.ts`. There are important existing constraints:
 
-The library already supplies the expansion state needed for rebuilds. The missing distinction is between synchronizing selection and revealing a newly active document.
-
-### Diagnosis evidence
-
-The existing workspace changes in `tests/e2e/document-tree.e2e.ts` include three new reproductions and replace an older fixed 500 ms wait with a preview-content assertion. Against unchanged product code, this command repeatedly returned two passes and two failures:
-
-```sh
-bun run test:e2e tests/e2e/document-tree.e2e.ts --grep 'user-expanded|user-collapsed' --workers=1
-```
-
-| Case | Current result |
-| --- | --- |
-| Expanded unrelated folder, content update | Pass |
-| Expanded unrelated folder, file addition | Pass |
-| Collapsed selected-file ancestor, selected-file update | Fails: folder reopens |
-| Collapsed selected-file ancestor, unrelated addition | Fails: folder reopens |
-
-Temporarily removing refresh-time `revealAndSelect()` made the content-update case pass but left the addition failing. Also removing forced ancestor expansion from reset inputs made all four pass. Those diagnostic edits were reverted: they establish causality, not a production-ready fix. Removal/rename cases, Follow-on same-document updates, and Changed-filter behavior have not yet been verified by these reproductions.
+- The library owns expansion and focus. Selection callbacks can precede directory toggling, so a directory-selection callback alone does not identify a completed manual collapse.
+- `resetPaths` initializes expanded ancestors of expanded descendants. Exact All-to-All restoration still needs a boundary snapshot and public-handle reconciliation.
+- `nextSelectedDocumentId()` currently chooses a default when the current ID is null. Clearing only the ID would allow the next live update to undo deselection.
+- Selection, preview mode/rendering, in-flight loads, URL/history, and persisted document restoration have separate lifecycle responsibilities. Closing the document must reconcile them together rather than merely remove its row highlight.
 
 ## Goals / Non-Goals
 
 **Goals:**
-- Keep the correction inside the tree adapter where refresh, selection, and expansion already meet.
-- Separate selection synchronization from the decision to reveal ancestors.
-- Read current expansion from the library rather than introduce a second folder-state model.
+- Keep manual tree-input detection in the adapter, and application deselection in the existing shell selection/preview lifecycle.
+- Distinguish intentional empty selection from startup without a selection and from a retained but temporarily unavailable document.
+- Preserve existing genuine-selection reveal and library-owned expansion/focus behavior.
+- Exercise native pointer, touch, and keyboard interaction and real refresh/reload behavior in acceptance tests.
 
 **Non-Goals:**
-- Changing document identity, server event payloads, URL behavior, or Follow rules.
-- Persistent browser storage for folder state.
-- Redesigning filter transitions or repairing separate Changed-mode expansion issues.
+- A second continuously tracked folder-expansion model or persistence of expansion across reloads.
+- New server events or APIs, replacement of the tree library, or custom row DOM/keyboard navigation.
+- Changed-filter expansion redesign, unrelated virtualization/performance work, and mobile visual polish.
 
 ## Decisions
 
-### 1. Remember the last active document presented to the tree
+### 1. Observe completed manual collapse, not directory selection
 
-Track the last application-selected document identity and resolved tree path successfully represented by the adapter. Compare the new identity/path before overwriting that state. Initial mount and a changed selection request reveal; an unchanged selection during an All-to-All update does not. Temporary absence must not erase the last represented selection: restoring the same document at the same path synchronizes selection without reopening surviving collapsed ancestors, whereas a different selected document becoming representable for the first time receives reveal. Clear this bookkeeping on disposal and when the application explicitly clears selection.
+The adapter reports an explicit user deselection when a native interaction changes an expanded directory to collapsed and that directory is an ancestor of the application's active document. Match canonical directory paths with separator boundaries; a similarly prefixed sibling is not an ancestor.
 
-Do not use `getSelectedPaths()` alone to infer navigation: user input and path rebuilds can mutate library selection before the application update arrives. Similarly, Follow being enabled is not itself a reveal request; only a resulting change of active document is.
+Observe the library's before/after expansion state at the user-input boundary rather than treating any selection callback or directory click as collapse. Pointer/touch clicks, native Enter/Space activation, and library-owned ArrowLeft collapse need coverage. ArrowLeft that only moves focus, opening a directory, unrelated-folder collapse, and interactions with no active document do not request deselection. Leave the library to perform the operation and keep keyboard focus on the operated folder; do not prevent or replace its native navigation. If closing the document drops the operated folder from the Changed view (it was shown only through the active-selection override), the library moves focus to a remaining visible row; the filter does not keep the folder around just to hold focus.
 
-Alternative rejected: suppress every refresh-time reveal. The diagnostic experiment used this, but it breaks genuine selection changes after first mount.
+Adapter-driven resets, filter initialization/transitions, and public-handle expansion restoration are programmatic operations, not evidence of user intent. Retain the programmatic guard and dispose any input observers/listeners. There is no need to maintain an ongoing independent map of every directory's state.
 
-### 2. Synchronize selected rows without necessarily expanding ancestors
+Alternative rejected: deselect whenever the active row is hidden or any directory becomes selected. Both would misclassify unrelated navigation and background/filter work.
 
-Separate the current `revealAndSelect` responsibilities, either with a clearly named reveal option or two internal operations. Always reconcile selected rows through the existing programmatic-update guard. Expand ancestors only when the reveal decision requires it. This preserves the active file's selection after a rebuild even if its row is hidden under a collapsed ancestor, and avoids leaving the directory itself selected after a collapse click.
+### 2. Close the document through one application action
 
-Browser verification confirmed that clicking a directory to reopen it replaces the selected leaf with the directory. Reconcile directory-selection callbacks to the currently available application-selected file without revealing or focusing it. Selection and keyboard focus are separate library APIs: focus stays on the directory so arrow navigation still works. Do not restore the last represented file when the current selection is explicitly cleared or unavailable. The user approved this directory-interaction reconciliation during implementation.
+Extend Follow's existing Rule A manual-navigation handling with a dedicated deselection variant, rather than create a fifth rule or an independent tree-side state mutation. It clears the requested document, marks the selection intentionally empty, disables Follow and updates its controls, resets the document preview mode, and renders the existing empty preview with no stale title/path/content. Synchronize the tree to no selected file without immediately restoring the former leaf. Preserve directory keyboard focus and do not navigate touch users away from Files simply because they collapsed a folder; the Preview tab must show the empty state when visited. The `follow-mode` delta updates the four-rule contract and programmatic guard alongside the tree behavior.
 
-Alternative rejected: skip the whole selection operation when the active document is unchanged. A rebuild or folder interaction may have changed library selection, so skipping synchronization can preserve expansion at the cost of incorrect selected rows.
+Coordinate preview-load cancellation/invalidation with this state transition. A response already in flight for the closed document must not remount rendered, source, or diff content after deselection or a later navigation. Rendering the empty DOM alone is not a sufficient lifecycle boundary.
 
-### 3. Apply the same reveal decision to reset inputs
+Reopening the folder changes expansion only. A subsequent explicit file selection uses the normal navigation path and requests reveal as a new selection. Enabling Follow clears intentional-empty state and invokes its existing latest-document selection behavior. Existing explicit search/history/deep-link navigation remains document navigation, not a background fallback.
 
-For All-to-All path-set changes, snapshot the library's currently expanded directories before resetting. Restore surviving expanded directories and union in selected-file ancestors only if a reveal is required. With unchanged selection, the expanded snapshot alone determines existing directory state; collapsed directories remain absent from it, and new unrelated directories use the closed default.
+Alternative rejected: clear only the tree highlight while retaining the preview or hidden active identity. The user explicitly chose to close the document entirely.
 
-Direct adapter tests also exposed a nested-state edge: the library's `initialExpandedPaths` opens ancestors of expanded descendants, even when those ancestors were manually collapsed. After an All-to-All reset, use public directory handles to collapse any implicitly reopened ancestors absent from the intended expanded set. Keep expanded descendants intact and exempt ancestors needed by a genuine selection reveal. This is a reset-boundary restoration, not a second continuously tracked expansion model. The user approved including this correction during implementation.
+### 3. Persist intentional emptiness without changing first-visit defaults
 
-Use the same decision for both initial expansion inputs and post-reset selection handling. Fixing only one of these paths leaves one of the confirmed failures intact. Keep the existing path fingerprint optimization; avoiding redundant resets alone cannot fix content-only updates.
+Represent explicit deselection separately from the absence of an initial selection. The user chose browser-only persistence for this indication: use workspace/base-path-scoped local storage through the existing presentation-storage wrapper. Do not add the indication to the personal-state API. Existing document-path, Follow, and other personal preferences remain Hub-backed; closing a document can still clear the remembered document path and save Follow off through their existing fields. A browser without the indication continues to use existing startup rules; do not change every null selection into permanent emptiness.
 
-Filter initialization and All/Changed transitions retain their separate existing expansion policy. Do not change the meaning of `reconcileFilterExpansion`, the full-tree filter snapshot, or Changed-mode automatic ancestor expansion as part of this correction.
+Live-frame and reconnect/resume reconciliation must retain intentionally empty selection with Follow off instead of running the current null-to-default fallback. Boot at the workspace root reads the browser indication before any saved Hub destination and restores the empty state after reload. Filter changes may change visible paths but cannot choose a document. Only explicit document navigation or enabling Follow removes the browser indication; background reconciliation in another tab must not erase it. Commit-preview navigation does not itself resume document selection. Do not use storage events to force other already-open clients to change their current document.
 
-Alternative rejected: continuously track every folder toggle in application state. The library already owns this state, and a second model adds reconciliation and lifecycle risk.
+Keep URL/history and remembered document destination consistent with closing the document: the current location must no longer name the closed file, and its stored path must not override intentional emptiness during boot. Use the existing session/base-path-aware navigation helpers to represent the session's no-document location; preserve ordinary explicit history/deep-link navigation as a way to select a document again. Do not add a server protocol or global cross-workspace preference.
 
-### 4. Preserve the real browser reproduction as the acceptance seam
+Alternative rejected: rely on `selectedId === null` alone. It is currently also the startup/default-selection signal, so the next refresh or reload could reopen a document without user action.
 
-The regression must exercise real folder clicks, the file watcher/live refresh, and the actual tree library. Pure ancestor-list helper tests cannot catch the unconditional reveal call or lost selection after a rebuild. Extend the reproductions to assert selected-row state after manually reopening a folder, stable Follow/preview identity, unrelated removal/rename, and a Follow-on refresh that retains the same document. Retain existing initial-selection and Follow-switch tests as positive reveal controls.
+### 4. Retain conditional reveal and reset-boundary expansion preservation
 
-Wait for observable completion (new row present, removed row absent, updated preview content), not a fixed sleep. Use the library's existing model access hook where virtualization prevents a reliable row-presence assertion.
+Read current expansion from library handles before All-to-All path rebuilds. Restore surviving expanded paths, adding selected-file ancestors only for a genuine selection reveal. When initialization implicitly opens ancestors of an expanded descendant, restore the intended collapsed ancestors through public handles without collapsing the descendants themselves. With intentionally empty selection, no selected-file ancestors are added. Keep the existing path fingerprint optimization.
+
+Representation tracking is scoped to the current requested document identity. Initial/new selection requests reveal; an unchanged selection during background refresh does not. Clear representation on deliberate deselection, a changed requested identity (including an unavailable document), or disposal. A continuously retained unavailable document returning is still distinct from explicit deselection; A → unavailable B → A is still a new navigation. Tests for retained identity must not use a manual ancestor collapse as setup, since that now deliberately clears the request.
+
+Keep the existing filter-specific expansion policy. Programmatic filter-driven visibility changes do not close the document, while a genuine user ancestor collapse closes it in either All or Changed mode. A later filter-driven expansion may follow its existing policy but must not recreate a document selection or nonempty preview.
+
+### 5. Remove conflicting restoration and revalidate activation independently
+
+Remove directory-callback reconciliation whose purpose is to keep or restore a hidden active file after manual ancestor collapse. Do not restore that file when its folder reopens, and remove tests asserting the superseded behavior.
+
+Preserve the separate existing rule that deliberate activation of an already-selected visible file invokes manual navigation exactly once, including Follow-off and touch Preview behavior. That is still required even though collapse/reopen no longer produces this state. Reevaluate the existing activation bridge after removing hidden-selection reconciliation: retain only the part needed for actual same-file activation, keep ordinary selection changes library-driven, and verify disposal and programmatic-echo suppression. Do not keep obsolete complexity merely because it was previously implemented.
+
+### 6. Verify empty state through real browser refreshes
+
+Rewrite the previous collapsed-active-file reproductions: after manual ancestor collapse they must assert no active file, empty preview, and Follow off, including when Follow was previously on. Assert this remains true after reopening, changing the former document's content, unrelated add/remove/rename, filter transitions, reconnect/resume, and reload. Explicit file navigation and enabling Follow are the positive resumption controls.
+
+An empty preview is no longer a refresh-completion signal. Await evidence that the specific update reached the index (library model/metadata, row addition/removal, or existing live-state observability) before asserting continued emptiness and folder state. Do not replace this with fixed sleeps. Test delayed old document responses, nested and multi-root ancestor matching, all native input routes, unrelated-folder controls, and programmatic restoration that must not close a document. Keep browser screenshots/evidence in `test-results/`, not this change directory.
 
 ## Risks / Trade-offs
 
-- **Over-suppressing reveal hides genuinely new selection** → Compare application identity/resolved path and verify initial nested selection, manual navigation, Follow navigation, and unavailable-selection recovery.
-- **Restoring expansion but losing selected rows** → Keep selection synchronization unconditional and assert the active file remains selected when its ancestor is reopened.
-- **Changed-filter behavior regresses through shared reset code** → Limit the new preservation branch to All-to-All refreshes and run the existing filter suite without redesigning its policy.
-- **Asynchronous refresh makes tests pass too early** → Wait for evidence that the specific filesystem change reached the UI before checking folder state.
-- **Existing spec language forbids custom expansion handling despite requiring preservation/reveal** → Clarify that public-API orchestration and boundary snapshots are allowed, while the library remains the owner of current state and DOM.
+- **False deselection from programmatic collapse or focus movement** → Require a native user action and an actual expanded-to-collapsed ancestor transition; test ArrowLeft focus-only and reset/filter controls.
+- **Refresh or reload resurrects the closed document** → Persist explicit-empty intent and carry it through live, recovery, boot, and stored-destination reconciliation.
+- **A late preview response undoes the close action** → Invalidate pending document presentation and assert empty preview after delayed responses resolve.
+- **First visits unexpectedly start empty** → Interpret only deliberate persisted deselection as intentional-empty state; keep legacy/default boot behavior.
+- **User loses place when closing a parent folder** → This is the approved interaction, not an accidental side effect. Keep focus on that folder and require explicit file navigation or Follow activation to resume.
+- **Tests pass before a background update arrives** → Use index/live/model completion evidence independent of the empty preview.
+- **Historical green reports are mistaken for current acceptance** → Preserve them as history, reopen the affected tasks, and append new validation only after implementation.
 
 ## Migration Plan
 
-No data or API migration is required. Ship as a client-side adapter correction after the focused and related regression suites pass. Reverting the adapter change restores previous behavior without storage cleanup. Before preparing a fix PR, check the latest stable release for the broken behavior and follow the repository's release-note override rules if it is unreleased-only.
+The implementation adds a browser-local marker, not a Hub record field; no server data/API migration or API revision is needed. Existing browsers without the marker keep the current startup selection policy. The briefly implemented Hub-field extension was superseded by the user's browser-only decision and is not part of the final change. Earlier hidden-selection behavior and its tests must be replaced by the reopened tasks.
+
+Ship only after the revised lifecycle, input, persistence, and related browser suites pass. Older code ignores the new browser key without changing existing Hub records. Before preparing a fix PR, check the latest stable release and follow the repository's release-note classification/override rules for the final user-visible delta.

@@ -171,6 +171,7 @@ export const appState = {
   roots: [] as RootGroup[],
   repositories: [] as RepositorySnapshot[],
   selectedId: null as string | null,
+  selectionCleared: false,
   previewMode: { kind: "document" } as PreviewMode,
   followEnabled: true,
   // Source / Rendered view preference for documents with a non-trivial

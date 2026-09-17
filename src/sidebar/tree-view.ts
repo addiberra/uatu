@@ -27,6 +27,7 @@ export type TreeViewSelectionHandler = (documentId: string) => void;
 export type TreeViewOptions = {
   container: HTMLElement;
   onSelectDocument: TreeViewSelectionHandler;
+  onDeselectDocument?: () => void;
 };
 
 export type GitStatusForView = {
@@ -62,6 +63,7 @@ function isDirectoryHandle(handle: FileTreeItemHandle): handle is FileTreeDirect
 export class TreeView {
   private readonly container: HTMLElement;
   private readonly onSelectDocument: TreeViewSelectionHandler;
+  private readonly onDeselectDocument: (() => void) | undefined;
   private readonly pathToDocumentId = new Map<string, string>();
   private readonly rootPrefixById = new Map<string, string>();
   // Visible-leaf counts the library is currently rendering. Drives the
@@ -78,8 +80,11 @@ export class TreeView {
   // Application selection last represented by the library, not its current
   // selected row (folder clicks and resets can change that independently).
   // Keep this across temporary absence so a returning document isn't revealed
-  // again; explicit clearing and disposal start a new selection lifecycle.
+  // again; a changed requested identity (even an unavailable one), explicit
+  // clearing, and disposal start a new selection lifecycle.
   private lastRepresentedSelection: { documentId: string; path: string } | null = null;
+  private requestedDocumentId: string | null = null;
+  private removeActivationBridge: (() => void) | null = null;
   // Unlike the last represented selection, this is null while the current
   // application selection is cleared or unavailable in the tree.
   private currentSelectedPath: string | null = null;
@@ -120,6 +125,7 @@ export class TreeView {
   constructor(options: TreeViewOptions) {
     this.container = options.container;
     this.onSelectDocument = options.onSelectDocument;
+    this.onDeselectDocument = options.onDeselectDocument;
     this.unsubscribeColorScheme = onColorSchemeChange(scheme => {
       this.applyTreeTheme(scheme);
     });
@@ -156,7 +162,8 @@ export class TreeView {
     const initialSelectedPath =
       selectedDocumentId !== null ? this.pathForDocumentId(selectedDocumentId) : null;
     this.currentSelectedPath = initialSelectedPath;
-    if (selectedDocumentId === null) this.lastRepresentedSelection = null;
+    if (selectedDocumentId !== this.requestedDocumentId) this.lastRepresentedSelection = null;
+    this.requestedDocumentId = selectedDocumentId;
     // Only All-to-All background updates suppress reveal. Filter transitions
     // and Changed mode retain their existing expansion policy.
     const revealSelection = this.tree === null
@@ -261,6 +268,7 @@ export class TreeView {
         this.container.innerHTML = "";
         this.applyTreeTheme(activeColorScheme());
         this.tree.render({ fileTreeContainer: this.container });
+        this.installActivationBridge();
         // Pin the library instance to the host element so e2e tests can call
         // `scrollToPath` to reveal virtualized rows for assertion.
         (this.container as unknown as { __pierreFileTree: FileTree }).__pierreFileTree = this.tree;
@@ -360,6 +368,8 @@ export class TreeView {
   }
 
   dispose(): void {
+    this.removeActivationBridge?.();
+    this.removeActivationBridge = null;
     if (this.unsubscribeColorScheme !== null) {
       this.unsubscribeColorScheme();
       this.unsubscribeColorScheme = null;
@@ -382,6 +392,7 @@ export class TreeView {
     this.renderedBinaryLeafCount = 0;
     this.lastPathsKey = "";
     this.lastRepresentedSelection = null;
+    this.requestedDocumentId = null;
     this.currentSelectedPath = null;
     this.lastFilterKind = "all";
     this.fullTreeExpansionSnapshot = null;
@@ -452,16 +463,142 @@ export class TreeView {
     }
     const documentId = this.pathToDocumentId.get(first);
     if (!documentId) {
-      // Directory clicks select the directory before toggling it. Keep the
-      // active-document highlight, but leave focus on the directory so native
-      // tree keyboard navigation continues from the user's interaction.
+      // Directory clicks only expand/collapse: a directory never stays
+      // selected. The library selects the directory BEFORE toggling it, so
+      // the expansion state read here is still the pre-click state. Put the
+      // selection back on the active document (focus stays on the directory),
+      // except when this click collapses one of its ancestors — that closes
+      // the document instead and must not resurrect a hidden leaf.
+      const tree = this.tree;
+      const directory = tree?.getItem(first);
+      if (!tree || !directory || !isDirectoryHandle(directory)) return;
       const path = this.currentSelectedPath;
-      if (this.tree?.getItem(first)?.isDirectory() && path !== null && this.tree.getItem(path)) {
+      const collapsesAncestor = path !== null
+        && ancestorPaths(path).includes(first) && directory.isExpanded();
+      if (path !== null && !collapsesAncestor && tree.getItem(path)) {
         this.syncDocumentSelection(this.pathToDocumentId.get(path) ?? null, path, false);
+        return;
       }
+      this.withProgrammaticUpdate(null, () => {
+        for (const selectedPath of tree.getSelectedPaths()) {
+          const handle = tree.getItem(selectedPath);
+          if (handle && isDirectoryHandle(handle) && handle.isSelected()) handle.deselect();
+        }
+      });
       return;
     }
     this.onSelectDocument(documentId);
+  }
+
+  // Pierre renders native row buttons: pointer/tap and Enter/Space all produce
+  // a click. Its row click handler synchronously selects, then focuses. Observe
+  // before/after that handler, supplementing ONLY a selection that was already
+  // current. Changed selections remain entirely library-driven. No keyboard
+  // interception, deferred routing, or row-DOM modifications are needed.
+  private installActivationBridge(): void {
+    const shadow = this.container.shadowRoot;
+    if (!shadow) return;
+    const candidates = new WeakMap<Event, string>();
+    const pendingBoundaries = new Set<() => void>();
+    const captureCollapse = (event: Event) => {
+      const tree = this.tree;
+      const path = this.currentSelectedPath;
+      const documentId = this.requestedDocumentId;
+      if (!tree || !path || !documentId || event.defaultPrevented
+        || this.expectedSelectedPath !== null) return;
+      if (event.type === "keydown" && (event as KeyboardEvent).key !== "ArrowLeft") return;
+      if (event.type === "click" && (event as MouseEvent).button !== 0) return;
+      const targets = event.composedPath();
+      const target = targets[0];
+      if (!(target instanceof Element)) return;
+      const control = target.closest("button, input, textarea, select, a, [contenteditable]");
+      if (control && !control.matches('button[data-type="item"][data-item-path]')) return;
+      if (event.type === "click") {
+        const operatedPath = control?.getAttribute("data-item-path");
+        const operated = operatedPath ? tree.getItem(operatedPath) : null;
+        if (!operated || !isDirectoryHandle(operated) || !operated.isExpanded()
+          || !ancestorPaths(path).includes(operatedPath!)) return;
+      }
+      // Snapshot only this requested file's ancestors, not a parallel expansion
+      // model. Canonical trailing slashes distinguish guides/ from guides-old/.
+      const expanded = ancestorPaths(path).filter(ancestor => {
+        const handle = tree.getItem(ancestor);
+        return handle && isDirectoryHandle(handle) && handle.isExpanded();
+      });
+      if (expanded.length === 0) return;
+      const boundaryTargets = targets.slice(0, targets.indexOf(shadow) + 1);
+      let cleanupTimer: ReturnType<typeof setTimeout> | undefined;
+      const cleanup = () => {
+        clearTimeout(cleanupTimer);
+        for (const target of boundaryTargets) target.removeEventListener(event.type, afterLibrary);
+        pendingBoundaries.delete(cleanup);
+      };
+      const afterLibrary = (observed: Event) => {
+        if (observed !== event) return;
+        if (this.tree !== tree || this.requestedDocumentId !== documentId
+          || this.currentSelectedPath !== path) {
+          cleanup();
+          return;
+        }
+        const collapsed = expanded.some(ancestor => {
+          const handle = tree.getItem(ancestor);
+          return handle && isDirectoryHandle(handle) && !handle.isExpanded();
+        });
+        if (collapsed) {
+          cleanup();
+          this.onDeselectDocument?.();
+        } else if (observed.currentTarget === shadow || observed.cancelBubble) {
+          cleanup();
+        }
+      };
+      // Pierre handles keydown on the row (or tree root for sticky rows), then
+      // prevents default and stops propagation. A shadow bubble observer misses
+      // ArrowLeft. Register after its existing handlers on this event's path:
+      // stopPropagation still permits our same-target listener. Click follows
+      // the same boundary, including native Enter/Space and touch-generated clicks.
+      // We never cancel input, replace handlers, or change row DOM/focus.
+      for (const target of boundaryTargets) target.addEventListener(event.type, afterLibrary);
+      pendingBoundaries.add(cleanup);
+      // Fallback for events stopped before our observers. Native dispatch can
+      // run microtask checkpoints BETWEEN listeners: a capture-scheduled
+      // microtask would remove these observers before Pierre handles the input.
+      // Only cleanup waits for the next task; deselection remains synchronous
+      // immediately after the library's actual collapse.
+      cleanupTimer = setTimeout(cleanup, 0);
+    };
+    const capture = (event: Event) => {
+      const click = event as MouseEvent;
+      if (event.defaultPrevented || click.button !== 0
+        || click.altKey || click.ctrlKey || click.metaKey || click.shiftKey) return;
+      const target = event.composedPath()[0];
+      if (!(target instanceof Element)) return;
+      // Do not interpret controls nested in rows (menus, rename inputs, etc.)
+      // as document activation. The row button itself is the sole target.
+      const button = target.closest("button, input, textarea, select, a, [contenteditable]");
+      if (!button?.matches('button[data-type="item"][data-item-path]')) return;
+      const path = button.getAttribute("data-item-path");
+      if (!path || !this.pathToDocumentId.has(path) || path === this.expectedSelectedPath) return;
+      const selected = this.tree?.getSelectedPaths();
+      if (selected?.length === 1 && selected[0] === path) candidates.set(event, path);
+    };
+    const activate = (event: Event) => {
+      const path = candidates.get(event);
+      candidates.delete(event);
+      if (!path || event.defaultPrevented || path === this.expectedSelectedPath) return;
+      const documentId = this.pathToDocumentId.get(path);
+      if (documentId && this.tree?.getItem(path)?.isSelected()) this.onSelectDocument(documentId);
+    };
+    shadow.addEventListener("click", capture, true);
+    shadow.addEventListener("click", captureCollapse, true);
+    shadow.addEventListener("keydown", captureCollapse, true);
+    shadow.addEventListener("click", activate);
+    this.removeActivationBridge = () => {
+      shadow.removeEventListener("click", capture, true);
+      shadow.removeEventListener("click", captureCollapse, true);
+      shadow.removeEventListener("keydown", captureCollapse, true);
+      shadow.removeEventListener("click", activate);
+      for (const cleanup of pendingBoundaries) cleanup();
+    };
   }
 
   private pathForDocumentId(documentId: string): string | null {
@@ -541,7 +678,20 @@ export class TreeView {
     }
     const style = document.createElement("style");
     style.setAttribute("data-uatu-style", "filter-reveal-cue");
-    style.textContent = `[data-uatu-filter-reveal="true"] { opacity: 0.55; font-style: italic; }`;
+    // The library rings whichever row it considers active, including after a
+    // pointer click. Keep the ring for keyboard navigation only, so clicking
+    // a folder (which merely toggles it) leaves no selected-looking row.
+    // Library styles live in cascade layers; this unlayered rule wins.
+    style.textContent = `[data-uatu-filter-reveal="true"] { opacity: 0.55; font-style: italic; }
+[data-type="item"][data-item-focused="true"]:not(:focus-visible)::before { outline: none; }
+@media (hover: none) {
+  /* Touch browsers (iOS Safari) keep :hover on the last tapped row, which
+     paints a tapped folder like a selection. No hover tint without hover. */
+  [data-type="item"]:hover:not([data-item-selected="true"]):not([data-item-drag-target="true"]) {
+    background-color: var(--trees-bg);
+    --truncate-marker-background-overlay-color: transparent;
+  }
+}`;
     shadow.appendChild(style);
     this.revealCueStyleElement = style;
   }
