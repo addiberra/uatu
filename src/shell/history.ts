@@ -15,7 +15,7 @@ import { renderSidebar } from "../sidebar/shell";
 import { setFollowEnabled, syncFollowToggle } from "./follow";
 import { defaultDocumentId } from "../shared/types";
 import { appState } from "./state";
-import { setPreviewMode, setSelectedId } from "./selection";
+import { clearDocumentSelection, resumeDocumentSelection, setPreviewMode, setSelectedId } from "./selection";
 import {
   activateCommitPreview,
   commitPreviewParamsFromUrl,
@@ -47,6 +47,11 @@ export function pushSelection(documentId: string, relativePath: string) {
     return;
   }
   window.history.pushState({ documentId }, "", url);
+}
+
+export function recordEmptySelection(replace = false): void {
+  const method = replace ? "replaceState" : "pushState";
+  window.history[method]({ selectionCleared: true }, "", appUrl("/"));
 }
 
 export function buildCommitPreviewPath(repositoryId: string, sha: string): string {
@@ -176,6 +181,15 @@ export function attachPopstateHandler() {
     }
 
     const urlRelativePath = appDocumentRelativePath(window.location.pathname);
+
+    if (!urlRelativePath && event.state?.selectionCleared === true) {
+      clearDocumentSelection();
+      setPreviewMode({ kind: "empty" });
+      renderSidebar();
+      renderEmptyPreview("No document selected", "Waiting for viewable files");
+      return;
+    }
+    resumeDocumentSelection();
 
     if (!urlRelativePath) {
       const fallbackId = defaultDocumentId(appState.roots);

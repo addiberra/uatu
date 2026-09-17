@@ -466,7 +466,9 @@ export function nextSelectedDocumentId(
   currentId: string | null,
   changedId: string | null,
   followEnabled: boolean,
+  selectionCleared = false,
 ): string | null {
+  if (!followEnabled && selectionCleared) return null;
   // Navigation intent survives index gaps and binary classification.
   if (!followEnabled && currentId) return currentId;
 

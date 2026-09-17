@@ -13,8 +13,9 @@ export function chooseSelectionForFileEvent(
   previousSelectedId: string | null,
   changedId: string | null,
   followEnabled: boolean,
+  selectionCleared = false,
 ): string | null {
-  return nextSelectedDocumentId(roots, previousSelectedId, changedId, followEnabled);
+  return nextSelectedDocumentId(roots, previousSelectedId, changedId, followEnabled, selectionCleared);
 }
 
 // Rule B catch-up — when the user flips the chip from off → on, decide
