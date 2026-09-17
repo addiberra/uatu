@@ -23,7 +23,7 @@ import { mountLayoutToolbar, syncLayoutChooser } from "./layout";
 import { documentDiffCache, type RenderedDocument } from "./mount";
 import { refreshOutline } from "./outline";
 import { extensionToLanguage, syncViewToggle } from "./view-mode";
-import { setPreviewMode } from "../shell/selection";
+import { getSelectionGeneration, setPreviewMode } from "../shell/selection";
 
 const previewElementMaybe = document.querySelector<HTMLElement>("#preview");
 
@@ -55,9 +55,17 @@ function loadingSignal(): LoadingSignal {
 // state out from under the request the user is actually waiting on.
 let diffLoadGeneration = 0;
 
+export function cancelDiffPresentation(): void {
+  ++diffLoadGeneration;
+  ++diffRenderGeneration;
+  diffLoadingSignal?.settle();
+}
+
 export async function applyDiffForActiveDocument(documentId: string): Promise<void> {
+  const selectionGeneration = getSelectionGeneration();
   const generation = ++diffLoadGeneration;
   const isCurrent = () => generation === diffLoadGeneration
+    && selectionGeneration === getSelectionGeneration()
     && appState.previewMode.kind === "document"
     && appState.selectedId === documentId
     && appState.viewMode === "diff"
@@ -122,8 +130,10 @@ export async function renderDiffIntoPreview(
   payload: DocumentDiffPayload,
   ownsLoad: () => boolean = () => true,
 ): Promise<void> {
+  const selectionGeneration = getSelectionGeneration();
   const generation = ++diffRenderGeneration;
   const isCurrent = () => generation === diffRenderGeneration && ownsLoad()
+    && selectionGeneration === getSelectionGeneration()
     && appState.previewMode.kind === "document"
     && appState.selectedId === documentId && appState.viewMode === "diff"
     && Boolean(findDocumentById(documentId));

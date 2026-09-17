@@ -37,7 +37,7 @@ import { refreshOutline } from "./outline";
 import { clearUpdateSignal, syncFileFactsStrip } from "./file-facts-strip";
 import { attachMetadataCardToggleListener, renderMetadataCard } from "./metadata-card";
 import { syncViewToggle } from "./view-mode";
-import { getSelectedDestination, setPreviewMode } from "../shell/selection";
+import { getSelectedDestination, getSelectionGeneration, setPreviewMode } from "../shell/selection";
 import { createDocumentLoadGuard } from "./load-generation";
 
 export type RenderedDocumentAuthor = { name: string; email?: string };
@@ -81,7 +81,7 @@ const previewShellElement: HTMLElement = previewShellElementMaybe;
 // (preserve scroll — the user is mid-read and a file-watcher reload must not
 // yank them back to the top).
 let lastLoadedDocumentId: string | null = null;
-const documentLoadGuard = createDocumentLoadGuard();
+const documentLoadGuard = createDocumentLoadGuard(getSelectionGeneration);
 const alwaysCurrent = () => true;
 
 // `DocumentDiffPayload` is imported from `./document-diff-view` (above) so
@@ -353,12 +353,14 @@ export async function renderSplitPayloads(
 }
 
 export async function loadDocument(documentId: string, onPresented?: () => void) {
+  const selectionGeneration = getSelectionGeneration();
   if (deferHiddenPreview(() => {
     const current = appState.selectedId;
-    if (current && appState.previewMode.kind === "document") void loadDocument(current, current === documentId ? onPresented : undefined);
+    if (current && appState.previewMode.kind === "document") void loadDocument(current,
+      current === documentId && selectionGeneration === getSelectionGeneration() ? onPresented : undefined);
   })) return;
   await executeLoadDocument(documentId);
-  if (appState.selectedId === documentId) onPresented?.();
+  if (selectionGeneration === getSelectionGeneration() && appState.selectedId === documentId) onPresented?.();
 }
 
 async function executeLoadDocument(documentId: string) {

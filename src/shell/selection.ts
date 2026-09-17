@@ -7,15 +7,44 @@
 
 import { appState, type PreviewMode } from "./state";
 import { persistPersonalWorkspaceState } from "./personal-state";
+import { writeSelectionCleared } from "./selection-storage";
 
 let selectedDestination: { id: string; name: string; relativePath: string } | null = null;
+let selectionGeneration = 0;
+
+// Presentation requests capture this epoch, not just an id: close → reselect
+// of the same file must never make an old response current again.
+export function getSelectionGeneration(): number {
+  return selectionGeneration;
+}
+
+export function resumeDocumentSelection(): void {
+  appState.selectionCleared = false;
+  writeSelectionCleared(false);
+}
+
+export function clearDocumentSelection(): void {
+  ++selectionGeneration;
+  selectedDestination = null;
+  appState.selectedId = null;
+  appState.selectionCleared = true;
+  writeSelectionCleared(true);
+  persistPersonalWorkspaceState({ documentPath: null, follow: false });
+}
 
 export function getSelectedDestination() {
   return selectedDestination;
 }
 
-export function setSelectedId(next: string | null): void {
-  if (next !== appState.selectedId) selectedDestination = null;
+export function setSelectedId(next: string | null, origin: "reconcile" | "navigation" = "reconcile"): void {
+  // Watcher frames still remember the destination through the existing Hub
+  // preference, but must not erase a browser marker written by another tab.
+  // Only explicit navigation (including same-file activation) resumes it.
+  if (origin === "navigation") resumeDocumentSelection();
+  if (next !== appState.selectedId) {
+    selectedDestination = null;
+    ++selectionGeneration;
+  }
   appState.selectedId = next;
   if (next) {
     for (const root of appState.roots) {
