@@ -23,6 +23,7 @@ import { appBasePath, workspaceIdFromBasePath } from "../shared/app-url";
 import type { WorkspaceActivity } from "../shared/live-protocol";
 import { liveChannel } from "./live";
 import { openWorktreeFork } from "./worktree-picker";
+import { watchWorktreeInventory, WORKTREES_CHANGED_EVENT } from "./worktree-live";
 
 export type HubWorkspaceSummary = {
   id: string;
@@ -464,7 +465,7 @@ export function initHubNav(): void {
   // last read): read the list again, and again while an answer still lacks
   // one reported after that request went out. The next answer lists it or,
   // no longer predating the report, prunes it.
-  window.addEventListener("uatu:worktrees-changed", () => { void refreshHubState(); });
+  window.addEventListener(WORKTREES_CHANGED_EVENT, () => { void refreshHubState(); });
   let refreshPending = false;
   const refreshForUnlisted = () => {
     if (refreshPending || [...activity.keys()].every(isListed)) return;
@@ -484,6 +485,12 @@ export function initHubNav(): void {
     worktreeNavigation = state.worktreeNavigation;
     updateChip();
     control.hidden = false;
+
+    // A Hub that serves worktree operations publishes inventory
+    // invalidations on the page's existing live stream. The real Hub and the
+    // isolated review host are told apart by nothing but this state field:
+    // the same picker code runs against both.
+    if (worktreeNavigation) watchWorktreeInventory(liveChannel(), window);
 
     // Live facts from the stream. The channel replays the latest facts per
     // workspace as this registers, so the snapshot the hub sent while the
