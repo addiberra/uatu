@@ -35,8 +35,7 @@ import type {
   ReversibleHistoryState,
   SubagentLine,
   TokenUsage,
-  ToolItem,
-} from "./types";
+  ToolItem, AgentUsageReport, UsageReadMode, UsageReadResult } from "./types";
 import { ConversationNotFoundError, isSessionInWorkspace } from "./workspace";
 
 const DEFAULT_PAGE_SIZE = 50;
@@ -63,6 +62,13 @@ export class InvalidPermissionChoiceError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "InvalidPermissionChoiceError";
+  }
+}
+
+export class UsageUnsupportedError extends Error {
+  constructor() {
+    super("this agent does not report plan usage");
+    this.name = "UsageUnsupportedError";
   }
 }
 
@@ -1531,6 +1537,36 @@ export class ChatAdapter {
    * reports the stop as that task settling, which is what the timeline
    * records; this only carries the request.
    */
+  /** The login's plan usage as the provider last read it; null when nothing has been read. */
+  async usage(): Promise<AgentUsageReport | null> {
+    if (!this.provider.usageReport || !this.provider.describe().capabilities.includes("usage")) throw new UsageUnsupportedError();
+    return (await this.provider.usageReport()) ?? null;
+  }
+
+  /**
+   * Read plan usage now. Idempotent per client request id, and one read at
+   * a time across request ids: a second ask while one is out joins it
+   * rather than starting another (spec) — when the one out answers at
+   * least as much. A "start" asked while a live-only read is out runs
+   * after it: joined, it would be told "no-live-session" for the session
+   * it asked to start.
+   */
+  readUsage(clientRequestId: string, mode: UsageReadMode): Promise<UsageReadResult> {
+    return this.receipts.run(`usage-read:${clientRequestId}`, async () => {
+      const provider = this.provider;
+      if (!provider.readUsage || !provider.describe().capabilities.includes("usage")) throw new UsageUnsupportedError();
+      const inFlight = this.usageRead;
+      if (inFlight && (inFlight.mode === mode || mode === "live-only")) return inFlight.promise;
+      const run = inFlight ? inFlight.promise.catch(() => undefined).then(() => provider.readUsage!(mode)) : provider.readUsage(mode);
+      const entry = { mode, promise: run };
+      entry.promise = run.finally(() => { if (this.usageRead === entry) this.usageRead = null; });
+      this.usageRead = entry;
+      return entry.promise;
+    });
+  }
+
+  private usageRead: { mode: UsageReadMode; promise: Promise<UsageReadResult> } | null = null;
+
   stopTask(conversationId: string, taskId: string, clientRequestId: string): Promise<{ stopped: true }> {
     return this.receipts.run(`stop-task:${conversationId}:${taskId}:${clientRequestId}`, async () => {
       await this.requireSession(conversationId);
