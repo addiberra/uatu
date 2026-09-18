@@ -36,6 +36,11 @@ function fixture(): RootGroup[] {
 }
 
 describe("chooseSelectionForFileEvent — Rule C / Rule D", () => {
+  test("intentional emptiness suppresses defaults, unlike startup null", () => {
+    expect(chooseSelectionForFileEvent(fixture(), null, "/tmp/docs/README.md", false, true)).toBeNull();
+    expect(chooseSelectionForFileEvent(fixture(), null, null, false)).toBe("/tmp/docs/guides/setup.md");
+    expect(chooseSelectionForFileEvent(fixture(), null, "/tmp/docs/README.md", true, true)).toBe("/tmp/docs/README.md");
+  });
   test("Rule C: follow on + non-binary change → selection moves to changed file", () => {
     const roots = fixture();
     const next = chooseSelectionForFileEvent(

@@ -20,7 +20,7 @@ import { applyViewMode } from "../preview/view-mode";
 import { renderBuildBadge } from "./connection";
 import { applyServerSnapshot, connectEvents } from "./events";
 import { watchPageLifecycle } from "./live";
-import { replaceSelection, scrollToFragment } from "./history";
+import { recordEmptySelection, replaceSelection, scrollToFragment } from "./history";
 import {
   appState,
   readPaneState,
@@ -31,7 +31,8 @@ import {
   persistPersonalWorkspaceState,
 } from "./personal-state";
 import { contextualAppUrl } from "./watch-context";
-import { setPreviewMode, setSelectedId } from "./selection";
+import { clearDocumentSelection, resumeDocumentSelection, setPreviewMode, setSelectedId } from "./selection";
+import { readSelectionCleared } from "./selection-storage";
 import {
   commitPreviewParamsFromUrl,
   renderCommitPreview,
@@ -78,13 +79,21 @@ export async function loadInitialState(onWorkspaceReady?: () => void) {
   let directLinkMessage: { title: string; body: string } | null = null;
   let explicitDocumentPath: string | null = null;
   const initialCommitPreview = commitPreviewParamsFromUrl();
+  // A commit surface is not document resumption. Preserve browser-local
+  // close intent so a later root arrival remains empty.
+  if (hasExplicitRoute && !initialCommitPreview) resumeDocumentSelection();
 
   if (initialCommitPreview) {
     setFollowEnabled(false);
     setSelectedId(null);
     setPreviewMode({ kind: "commit", ...initialCommitPreview });
+  } else if (!hasExplicitRoute && readSelectionCleared()) {
+    clearDocumentSelection();
+    setFollowEnabled(false);
+    setPreviewMode({ kind: "empty" });
+    recordEmptySelection(true);
   } else if (!hasExplicitRoute) {
-    setFollowEnabled(personalState.follow ?? payload.initialFollow);
+    setFollowEnabled(personalState.follow ?? payload.initialFollow, true);
     const savedDocument = personalState.documentPath
       ? findDocumentByRelativePath(personalState.documentPath)
       : null;
@@ -134,6 +143,16 @@ export async function loadInitialState(onWorkspaceReady?: () => void) {
 
   syncFollowToggle();
   renderSidebar();
+  // Restoration above is read-only. From here the UI is interactive, even
+  // while the initial preview request is pending: never drop those writes or
+  // overwrite them later with the initial route's intent.
+  enablePersonalStatePersistence();
+  if (initialCommitPreview || hasExplicitRoute) {
+    persistPersonalWorkspaceState({
+      follow: false,
+      ...(explicitDocumentPath ? { documentPath: explicitDocumentPath } : {}),
+    });
+  }
   onWorkspaceReady?.();
   connectEvents();
   // Resume from the cursor even if the initial preview is still loading.
@@ -166,17 +185,7 @@ export async function loadInitialState(onWorkspaceReady?: () => void) {
         requestAnimationFrame(() => scrollToFragment(initialHash.slice(1)));
       }
     });
-  }
-
-  enablePersonalStatePersistence();
-  // Restored/default values are read-only at boot: writing a full snapshot
-  // here could overwrite newer field-level writes from another open client.
-  // An explicit route is current user intent, so only its affected fields are
-  // persisted for future root arrivals.
-  if (initialCommitPreview || hasExplicitRoute) {
-    persistPersonalWorkspaceState({
-      follow: false,
-      ...(explicitDocumentPath ? { documentPath: explicitDocumentPath } : {}),
-    });
+  } else {
+    renderEmptyPreview("No document selected", "Waiting for viewable files");
   }
 }

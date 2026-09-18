@@ -1,4 +1,6 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { parseHTML } from "linkedom";
+import type { FileTree, FileTreeDirectoryHandle } from "@pierre/trees";
 
 import type { ChangedFileSummary, RepositorySnapshot, RootGroup } from "../shared/types";
 import {
@@ -7,8 +9,618 @@ import {
   computeFilesPaneFilterMembership,
   computeFilteredPaths,
   reconcileFilterExpansion,
+  TreeView,
   type FilesPaneFilterMembership,
 } from "./tree-view";
+
+describe("TreeView selection lifecycle with the real library", () => {
+  let container: HTMLElement & { __pierreFileTree?: FileTree };
+  let view: TreeView;
+  let selections: string[];
+  let deselections: number;
+  let restoreGlobals: () => void;
+  const leaf = "guides/deep/active.md";
+  const other = "other/deep/next.md";
+  const paths = [leaf, "guides/direct.md", "guides/deep/sibling.md", other, "kept/open.md"];
+
+  function roots(entries = paths, ids: Record<string, string> = {}): RootGroup[] {
+    return [makeRoot({
+      id: "r1", label: "project",
+      docs: entries.map(relativePath => ({
+        id: ids[relativePath] ?? relativePath,
+        name: relativePath.split("/").at(-1)!, relativePath,
+        rootId: "r1", mtimeMs: 0, kind: "markdown",
+      })),
+    })];
+  }
+
+  function tree(): FileTree {
+    expect(container.__pierreFileTree).toBeDefined();
+    return container.__pierreFileTree!;
+  }
+
+  function directory(path: string): FileTreeDirectoryHandle {
+    const handle = tree().getItem(path);
+    expect(handle?.isDirectory()).toBe(true);
+    return handle as FileTreeDirectoryHandle;
+  }
+
+  function installClickHarness() {
+    // linkedom runs capture listeners in bubble order. Supply that missing DOM
+    // phase only; the target/bubble handlers, selection, and callbacks below
+    // are still the real library. Browser tests cover actual native dispatch,
+    // including the clicks synthesized by Enter/Space and touch taps.
+    const captures = new Map<string, Set<EventListenerOrEventListenerObject>>([
+      ["click", new Set()], ["keydown", new Set()],
+    ]);
+    const attachShadow = container.attachShadow.bind(container);
+    container.attachShadow = init => {
+      const shadow = attachShadow(init);
+      const add = shadow.addEventListener.bind(shadow);
+      const remove = shadow.removeEventListener.bind(shadow);
+      shadow.addEventListener = (type: string, listener: EventListenerOrEventListenerObject | null, options?: boolean | AddEventListenerOptions) => {
+        if (captures.has(type) && options === true && listener) captures.get(type)!.add(listener);
+        else if (listener) add(type, listener, options);
+      };
+      shadow.removeEventListener = (type: string, listener: EventListenerOrEventListenerObject | null, options?: boolean | EventListenerOptions) => {
+        if (captures.has(type) && options === true && listener) captures.get(type)!.delete(listener);
+        else if (listener) remove(type, listener, options);
+      };
+      return shadow;
+    };
+    const prepare = (target: HTMLElement, properties: Record<string, unknown> = {}, dispatchTarget: EventTarget = target) => {
+      const type = properties.key ? "keydown" : "click";
+      const event = new window.Event(type, { bubbles: true, cancelable: true });
+      Object.assign(event, { button: 0, ...properties });
+      if (properties.cancelled) event.preventDefault();
+      const path: EventTarget[] = [];
+      for (let node: Node | null = target; node; node = node.parentNode) path.push(node);
+      Object.defineProperty(event, "composedPath", { value: () => path });
+      for (const listener of captures.get(type)!) {
+        if (typeof listener === "function") listener(event);
+        else listener.handleEvent(event);
+      }
+      return () => {
+        dispatchTarget.dispatchEvent(event);
+        return event;
+      };
+    };
+    const dispatch = (target: HTMLElement, properties: Record<string, unknown> = {}, dispatchTarget: EventTarget = target) =>
+      prepare(target, properties, dispatchTarget)();
+    return Object.assign(dispatch, {
+      // Native browser dispatch can checkpoint microtasks between listeners;
+      // a synchronous JS dispatchEvent call (including linkedom) cannot.
+      withMicrotaskCheckpoint: async (target: HTMLElement, properties: Record<string, unknown> = {}) => {
+        const finish = prepare(target, properties);
+        await Promise.resolve();
+        return finish();
+      },
+    });
+  }
+
+  beforeEach(() => {
+    const { document, window } = parseHTML("<!doctype html><html><body><div id='tree'></div></body></html>");
+    const globals: Record<string, unknown> = {
+      document, window, HTMLElement: window.HTMLElement, Element: window.Element,
+      HTMLStyleElement: window.HTMLStyleElement, Node: window.Node,
+      HTMLTemplateElement: window.HTMLTemplateElement,
+      HTMLDivElement: window.HTMLDivElement,
+      SVGElement: window.SVGElement,
+      ShadowRoot: window.ShadowRoot,
+      MutationObserver: window.MutationObserver,
+      matchMedia: () => ({ matches: false }),
+      requestAnimationFrame: () => 0,
+      cancelAnimationFrame: () => {},
+    };
+    const previous = Object.entries(globals).map(([key]) => [key, Object.getOwnPropertyDescriptor(globalThis, key)] as const);
+    // linkedom has no layout/scroll implementation. Supply browser defaults,
+    // not a fake tree: all model mutations and callbacks remain Pierre's.
+    const prototype = window.HTMLElement.prototype;
+    const layout = { scrollTop: 0, scrollLeft: 0, clientHeight: 600, clientWidth: 300 };
+    const previousLayout = Object.keys(layout).map(key => [key, Object.getOwnPropertyDescriptor(prototype, key)] as const);
+    for (const [key, value] of Object.entries(layout)) {
+      Object.defineProperty(prototype, key, { configurable: true, writable: true, value });
+    }
+    for (const [key, value] of Object.entries(globals)) {
+      Object.defineProperty(globalThis, key, { configurable: true, writable: true, value });
+    }
+    restoreGlobals = () => {
+      for (const [key, descriptor] of previousLayout) {
+        if (descriptor) Object.defineProperty(prototype, key, descriptor);
+        else Reflect.deleteProperty(prototype, key);
+      }
+      for (const [key, descriptor] of previous) {
+        if (descriptor) Object.defineProperty(globalThis, key, descriptor);
+        else Reflect.deleteProperty(globalThis, key);
+      }
+    };
+    container = document.getElementById("tree") as typeof container;
+    selections = [];
+    deselections = 0;
+    view = new TreeView({ container, onSelectDocument: id => selections.push(id), onDeselectDocument: () => {
+      deselections++;
+      view.update(roots(), null);
+    } });
+  });
+
+  afterEach(() => {
+    try {
+      view.dispose();
+      expect(selections).toEqual([]);
+    } finally {
+      restoreGlobals();
+    }
+  });
+
+  it("reveals an initial nested selection without emitting a navigation echo", () => {
+    view.update(roots(), leaf);
+    expect(directory("guides/").isExpanded()).toBe(true);
+    expect(directory("guides/deep/").isExpanded()).toBe(true);
+    expect(directory("other/").isExpanded()).toBe(false);
+    expect(tree().getSelectedPaths()).toEqual([leaf]);
+  });
+
+  for (const refresh of ["unchanged", "addition", "removal", "rename"] as const) {
+    it(`preserves programmatically collapsed ancestors and requested leaf selection after ${refresh}`, () => {
+      view.update(roots(), leaf);
+      directory("guides/").collapse();
+      expect(directory("guides/deep/").isExpanded()).toBe(true);
+      directory("kept/").expand();
+      // Folder interactions can leave a directory selected. Synchronization
+      // must restore the application's leaf without revealing its ancestors.
+      tree().getItem(leaf)!.deselect();
+      directory("guides/").select();
+      const next = refresh === "addition" ? [...paths, "new/file.md"]
+        : refresh === "removal" ? paths.filter(path => path !== other)
+        : refresh === "rename" ? paths.map(path => path === other ? "renamed/file.md" : path)
+        : paths;
+      view.update(roots(next), leaf);
+      expect(directory("guides/").isExpanded()).toBe(false);
+      expect(directory("guides/deep/").isExpanded()).toBe(true);
+      expect(directory("kept/").isExpanded()).toBe(true);
+      expect(tree().getSelectedPaths()).toEqual([leaf]);
+      expect(deselections).toBe(0);
+      if (refresh === "addition") expect(directory("new/").isExpanded()).toBe(false);
+      directory("guides/").expand();
+      expect(tree().getItem(leaf)?.isSelected()).toBe(true);
+    });
+  }
+
+  it("does not mistake ArrowLeft focus movement for collapse, even though the library consumes it", () => {
+    const dispatch = installClickHarness();
+    view.update(roots(), leaf);
+    tree().getItem(leaf)!.focus();
+    const row = container.shadowRoot!.querySelector<HTMLElement>(`[data-item-path="${leaf}"]`)!;
+    let reachedShadow = false;
+    container.shadowRoot!.addEventListener("keydown", () => { reachedShadow = true; });
+    const event = dispatch(row, { key: "ArrowLeft" });
+    expect(tree().getFocusedPath()).toBe("guides/deep/");
+    expect(directory("guides/deep/").isExpanded()).toBe(true);
+    expect(deselections).toBe(0);
+    expect(reachedShadow).toBe(false);
+    expect(event.defaultPrevented).toBe(true);
+    expect(tree().getSelectedPaths()).toEqual([leaf]);
+  });
+
+  it("observes ArrowLeft handled at the tree root without depending on bubbling to the shadow", () => {
+    const dispatch = installClickHarness();
+    view.update(roots(), leaf);
+    directory("guides/").focus();
+    const root = container.shadowRoot!.querySelector<HTMLElement>('[role="tree"]')!;
+    const event = dispatch(root, { key: "ArrowLeft" });
+    expect(event.defaultPrevented).toBe(true);
+    expect(deselections).toBe(1);
+    expect(tree().getFocusedPath()).toBe("guides/");
+  });
+
+  for (const input of ["click", "ArrowLeft"]) {
+    it(`retains ${input} collapse observers through a native-style microtask checkpoint`, async () => {
+      const dispatch = installClickHarness();
+      view.update(roots(), leaf);
+      directory("guides/").focus();
+      const row = container.shadowRoot!.querySelector<HTMLElement>('[data-item-path="guides/"]')!;
+      await dispatch.withMicrotaskCheckpoint(row, input === "ArrowLeft" ? { key: input } : {});
+      expect(deselections).toBe(1);
+      expect(tree().getSelectedPaths()).toEqual([]);
+      expect(directory("guides/").isExpanded()).toBe(false);
+      expect(tree().getFocusedPath()).toBe("guides/");
+    });
+  }
+
+  for (const refresh of ["unchanged", "addition", "removal", "rename"] as const) {
+    it(`keeps deliberate empty selection and expanded descendants after ${refresh}`, () => {
+      const dispatch = installClickHarness();
+      view.update(roots(), leaf);
+      directory("kept/").expand();
+      dispatch(container.shadowRoot!.querySelector<HTMLElement>('[data-item-path="guides/"]')!);
+      expect(deselections).toBe(1);
+      const next = refresh === "addition" ? [...paths, "new/file.md"]
+        : refresh === "removal" ? paths.filter(path => path !== other)
+        : refresh === "rename" ? paths.map(path => path === other ? "renamed/file.md" : path)
+        : paths;
+      view.update(roots(next), null);
+      expect(tree().getSelectedPaths()).toEqual([]);
+      expect(directory("guides/").isExpanded()).toBe(false);
+      expect(directory("guides/deep/").isExpanded()).toBe(true);
+      expect(directory("kept/").isExpanded()).toBe(true);
+      expect(deselections).toBe(1);
+      dispatch(container.shadowRoot!.querySelector<HTMLElement>('[data-item-path="guides/"]')!);
+      expect(tree().getSelectedPaths()).not.toContain(leaf);
+      view.update(roots(next), leaf);
+      expect(tree().getSelectedPaths()).toEqual([leaf]);
+      expect(directory("guides/").isExpanded()).toBe(true);
+    });
+  }
+
+  for (const selected of [null, "unknown.md", "unavailable.md"]) {
+    it(`ignores manual collapse with requested selection ${selected}`, () => {
+      const dispatch = installClickHarness();
+      view.update(roots(), selected);
+      directory("guides/").expand();
+      const row = container.shadowRoot!.querySelector<HTMLElement>('[data-item-path="guides/"]')!;
+      dispatch(row);
+      expect(directory("guides/").isExpanded()).toBe(false);
+      expect(deselections).toBe(0);
+    });
+  }
+
+  it("ignores opening, unrelated and similarly prefixed directories", () => {
+    const dispatch = installClickHarness();
+    view.update(roots([...paths, "guides-old/file.md", "guide/file.md"]), leaf);
+    for (const folder of ["other/deep/", "guides-old/", "guide/"]) {
+      const row = () => container.shadowRoot!.querySelector<HTMLElement>(`[data-item-path="${folder}"]`)!;
+      dispatch(row());
+      expect(directory(folder).isExpanded()).toBe(true);
+      dispatch(row());
+      expect(directory(folder).isExpanded()).toBe(false);
+      expect(deselections).toBe(0);
+    }
+    expect(directory("guides/").isExpanded()).toBe(true);
+  });
+
+  it("does not close a retained but unavailable request when its surviving folder is collapsed", () => {
+    const dispatch = installClickHarness();
+    view.update(roots(), leaf);
+    view.update(roots(paths.filter(path => path !== leaf)), leaf);
+    dispatch(container.shadowRoot!.querySelector<HTMLElement>('[data-item-path="guides/"]')!);
+    expect(directory("guides/").isExpanded()).toBe(false);
+    expect(deselections).toBe(0);
+    view.update(roots(), leaf);
+    expect(directory("guides/").isExpanded()).toBe(false);
+    expect(tree().getSelectedPaths()).toEqual([leaf]);
+  });
+
+  for (const ancestor of ["project/", "project/guides/", "project/guides/deep/"]) {
+    it(`matches multi-root ancestor ${ancestor}, not another root's same relative path`, () => {
+      const dispatch = installClickHarness();
+      const groups = [...roots(), makeRoot({ id: "r2", label: "project-old", docs: [
+        { ...roots()[0]!.docs[0]!, id: "second", rootId: "r2" },
+      ] })];
+      view.dispose();
+      view = new TreeView({ container, onSelectDocument: id => selections.push(id), onDeselectDocument: () => {
+        deselections++;
+        view.update(groups, null);
+      } });
+      view.update(groups, leaf);
+      directory("project-old/").expand();
+      directory("project-old/guides/deep/").expand();
+      const sibling = container.shadowRoot!.querySelector<HTMLElement>('[data-item-path="project-old/guides/deep/"]')!;
+      dispatch(sibling);
+      expect(directory("project-old/guides/deep/").isExpanded()).toBe(false);
+      expect(deselections).toBe(0);
+      directory(ancestor).focus();
+      const row = container.shadowRoot!.querySelector<HTMLElement>(`[data-item-path="${ancestor}"]`)!;
+      dispatch(row, { key: "ArrowLeft" });
+      expect(deselections).toBe(1);
+      expect(directory(ancestor).isExpanded()).toBe(false);
+      expect(tree().getSelectedPaths()).toEqual([]);
+      expect(tree().getFocusedPath()).toBe(ancestor);
+    });
+  }
+
+  it("keeps the active leaf selected when an unrelated root's directories are clicked", () => {
+    const dispatch = installClickHarness();
+    // Enough entries that the library renders project-old/ and its guides/
+    // as separate (unflattened) directory rows.
+    const groups = [...roots(), makeRoot({ id: "r2", label: "project-old",
+      docs: roots()[0]!.docs.map(doc => ({ ...doc, id: `second-${doc.id}`, rootId: "r2" })),
+    })];
+    view.update(groups, leaf);
+    const active = `project/${leaf}`;
+    expect(tree().getSelectedPaths()).toEqual([active]);
+    // Open then close the unrelated root, and an unrelated folder beside the
+    // active document's ancestors.
+    for (const path of ["project-old/", "project-old/", "project/kept/", "project/kept/"]) {
+      directory(path).focus();
+      const row = container.shadowRoot!.querySelector<HTMLElement>(`[data-item-path="${path}"]`);
+      expect(row, path).not.toBeNull();
+      dispatch(row!);
+      expect(tree().getSelectedPaths()).toEqual([active]);
+      expect(tree().getFocusedPath()).toBe(path);
+    }
+    expect(directory("project-old/").isExpanded()).toBe(false);
+    expect(directory("project/kept/").isExpanded()).toBe(false);
+    expect(deselections).toBe(0);
+    expect(selections).toEqual([]);
+  });
+
+  it("ignores a collapse boundary after the requested document changes", () => {
+    const dispatch = installClickHarness();
+    view.update(roots(), leaf);
+    const row = container.shadowRoot!.querySelector<HTMLElement>('[data-item-path="guides/"]')!;
+    // Registered before the adapter's event-boundary listener, after Pierre's
+    // handler: a newer application request must not be closed by the old input.
+    row.addEventListener("click", () => view.update(roots(), other));
+    dispatch(row);
+    expect(directory("guides/").isExpanded()).toBe(false);
+    expect(tree().getSelectedPaths()).toEqual([other]);
+    expect(deselections).toBe(0);
+  });
+
+  it("programmatic collapse, reset restoration and filter reconciliation never emit deselection", () => {
+    installClickHarness();
+    view.update(roots(), leaf);
+    directory("guides/").collapse();
+    view.update(roots([...paths, "added.md"]), leaf);
+    expect(directory("guides/").isExpanded()).toBe(false);
+    expect(directory("guides/deep/").isExpanded()).toBe(true);
+    const filter = { allowedByRoot: new Map([["r1", new Set([other])]]) };
+    view.update(roots(), leaf, { filter });
+    view.update(roots(), leaf);
+    expect(deselections).toBe(0);
+    expect(tree().getSelectedPaths()).toEqual([leaf]);
+  });
+
+  it("manual collapse under Changed emits once; subsequent resets and filters cannot restore a cleared request", () => {
+    const dispatch = installClickHarness();
+    const filter = { allowedByRoot: new Map([["r1", new Set(paths)]]) };
+    view.dispose();
+    view = new TreeView({ container, onSelectDocument: id => selections.push(id), onDeselectDocument: () => {
+      deselections++;
+      view.update(roots(), null, { filter });
+    } });
+    view.update(roots(), leaf, { filter });
+    const row = container.shadowRoot!.querySelector<HTMLElement>('[data-item-path="guides/"]')!;
+    dispatch(row, { detail: 0 }); // Native Enter/Space use the same button click boundary.
+    expect(deselections).toBe(1);
+    expect(directory("guides/").isExpanded()).toBe(false);
+    view.update(roots([...paths, "added.md"]), null);
+    view.update(roots(), null, { filter });
+    view.update(roots(), null);
+    expect(tree().getSelectedPaths()).toEqual([]);
+    expect(deselections).toBe(1);
+  });
+
+  it("removes collapse observers and pending event listeners on disposal and installs them once on remount", () => {
+    const dispatch = installClickHarness();
+    view.update(roots(), leaf);
+    const oldRow = container.shadowRoot!.querySelector<HTMLElement>('[data-item-path="guides/"]')!;
+    dispatch(oldRow);
+    expect(deselections).toBe(1);
+    view.dispose();
+    dispatch(oldRow, { key: "ArrowLeft" });
+    dispatch(oldRow);
+    expect(deselections).toBe(1);
+    view.update(roots(), leaf);
+    const row = container.shadowRoot!.querySelector<HTMLElement>('[data-item-path="guides/"]')!;
+    directory("guides/").focus();
+    dispatch(row, { key: "ArrowLeft" });
+    expect(deselections).toBe(2);
+  });
+
+  it("never leaves a directory selected; an active leaf under a collapsed ancestor stays represented", () => {
+    view.update(roots(), leaf);
+    const folder = directory("guides/");
+    folder.collapse();
+    folder.focus();
+    const focusedPath = tree().getFocusedPath();
+    expect(focusedPath).not.toBeNull();
+    tree().getItem(leaf)!.deselect();
+    // Pre-toggle state is collapsed: this interaction opens the folder, so
+    // the still-active document keeps its selection.
+    folder.select();
+    expect(tree().getSelectedPaths()).toEqual([leaf]);
+    expect(folder.isExpanded()).toBe(false);
+    expect(tree().getFocusedPath()).toBe(focusedPath);
+    expect(selections).toEqual([]);
+  });
+
+  it("drops a directory selection without restoring the leaf when an expanded ancestor is selected", () => {
+    view.update(roots(), leaf);
+    const folder = directory("guides/deep/");
+    folder.focus();
+    // Pre-toggle state is expanded: the click that follows collapses the
+    // ancestor and closes the document, so the leaf must not come back.
+    // (A real click selects only the directory; model that replacement.)
+    tree().getItem(leaf)!.deselect();
+    folder.select();
+    expect(tree().getSelectedPaths()).toEqual([]);
+    expect(tree().getFocusedPath()).toBe("guides/deep/");
+    expect(selections).toEqual([]);
+    expect(deselections).toBe(0);
+  });
+
+  for (const ancestor of ["guides/", "guides/deep/"]) {
+    for (const input of ["click", "ArrowLeft"]) {
+      it(`closes once on native ${input} collapse of ${ancestor} and never on reopening`, () => {
+        const dispatch = installClickHarness();
+        view.update(roots(), leaf);
+        directory(ancestor).focus();
+        const row = container.shadowRoot!.querySelector<HTMLElement>(`[data-item-path="${ancestor}"]`)!;
+        dispatch(row, input === "ArrowLeft" ? { key: input } : {});
+        expect(deselections).toBe(1);
+        expect(directory(ancestor).isExpanded()).toBe(false);
+        expect(tree().getSelectedPaths()).toEqual([]);
+        expect(tree().getFocusedPath()).toBe(ancestor);
+        dispatch(row);
+        expect(deselections).toBe(1);
+        expect(tree().getSelectedPaths()).toEqual([]);
+      });
+    }
+  }
+
+  for (const nextSelection of [null, "unavailable.md"]) {
+    it(`does not resurrect the previous leaf on directory selection after selecting ${nextSelection}`, () => {
+      view.update(roots(), leaf);
+      directory("guides/").collapse();
+      view.update(roots(), nextSelection);
+      const folder = directory("guides/");
+      folder.focus();
+      const focusedPath = tree().getFocusedPath();
+      expect(focusedPath).not.toBeNull();
+      folder.select();
+      expect(tree().getSelectedPaths()).toEqual([]);
+      expect(folder.isExpanded()).toBe(false);
+      expect(tree().getFocusedPath()).toBe(focusedPath);
+      expect(selections).toEqual([]);
+    });
+  }
+
+  it("reveals a changed document additively", () => {
+    view.update(roots(), leaf);
+    directory("guides/").collapse();
+    directory("kept/").expand();
+    view.update(roots(), other);
+    expect(directory("other/").isExpanded()).toBe(true);
+    expect(directory("other/deep/").isExpanded()).toBe(true);
+    expect(directory("kept/").isExpanded()).toBe(true);
+    expect(directory("guides/").isExpanded()).toBe(false);
+    expect(tree().getSelectedPaths()).toEqual([other]);
+  });
+
+  it("forwards a library selection after refresh instead of leaving the update guard active", () => {
+    view.update(roots(), leaf);
+    view.update(roots([...paths, "new.md"]), leaf);
+    expect(selections).toEqual([]);
+    tree().getItem(leaf)!.deselect();
+    tree().getItem(other)!.select();
+    expect(selections).toEqual([other]);
+    selections.length = 0;
+    view.update(roots([...paths, "new.md"]), other);
+    expect(tree().getSelectedPaths()).toEqual([other]);
+  });
+
+  it("reveals the same document after explicit selection clearing", () => {
+    view.update(roots(), leaf);
+    directory("guides/").collapse();
+    view.update(roots(), null);
+    view.update(roots(), leaf);
+    expect(directory("guides/").isExpanded()).toBe(true);
+    expect(tree().getSelectedPaths()).toEqual([leaf]);
+  });
+
+  it("reveals returning A after navigation to unavailable B", () => {
+    view.update(roots(), leaf);
+    directory("guides/").collapse();
+    directory("kept/").expand();
+    view.update(roots(), "unavailable.md");
+    view.update(roots(), leaf);
+    expect(directory("guides/").isExpanded()).toBe(true);
+    expect(directory("kept/").isExpanded()).toBe(true);
+    expect(tree().getSelectedPaths()).toEqual([leaf]);
+  });
+
+  it("routes real-library file clicks exactly once, including selected-file activation and remount", () => {
+    const dispatchClick = installClickHarness();
+    view.update(roots(), leaf);
+    expect(selections).toEqual([]);
+    const click = (path: string, properties: Record<string, unknown> = {}) => {
+      const row = container.shadowRoot!.querySelector<HTMLElement>(`[data-item-path="${path}"]`)!;
+      expect(row).not.toBeNull();
+      dispatchClick(row, properties);
+    };
+    click(leaf);
+    expect(selections.splice(0)).toEqual([leaf]);
+    click(leaf, { detail: 0 });
+    expect(selections.splice(0)).toEqual([leaf]);
+    click("guides/deep/sibling.md");
+    expect(selections.splice(0)).toEqual(["guides/deep/sibling.md"]);
+    click("guides/deep/sibling.md");
+    expect(selections.splice(0)).toEqual(["guides/deep/sibling.md"]);
+    const oldRow = container.shadowRoot!.querySelector<HTMLElement>(`[data-item-path="${leaf}"]`)!;
+    view.dispose();
+    dispatchClick(oldRow);
+    expect(selections).toEqual([]);
+    view.update(roots(), leaf);
+    expect(selections).toEqual([]);
+    click(leaf);
+    expect(selections.splice(0)).toEqual([leaf]);
+  });
+
+  it("does not bridge modified, cancelled, secondary, or nested-control clicks", () => {
+    const dispatchClick = installClickHarness();
+    view.update(roots(), leaf);
+    const row = container.shadowRoot!.querySelector<HTMLElement>(`[data-item-path="${leaf}"]`)!;
+    // Isolate the bridge's exclusions from Pierre's independent modified-click
+    // selection policy by dispatching the bubble phase directly at the shadow.
+    const shadow = container.shadowRoot!;
+    for (const properties of [{ altKey: true }, { ctrlKey: true }, { metaKey: true }, { shiftKey: true }, { button: 1 }, { button: 2 }, { cancelled: true }]) {
+      dispatchClick(row, properties, shadow);
+    }
+    expect(selections).toEqual([]);
+    const input = document.createElement("input");
+    row.appendChild(input);
+    dispatchClick(input, {}, shadow);
+    expect(selections).toEqual([]);
+    dispatchClick(row, {}, shadow);
+    expect(selections.splice(0)).toEqual([leaf]);
+  });
+
+  it("keeps a surviving ancestor collapsed when a represented same-path selection returns", () => {
+    view.update(roots(), leaf);
+    directory("guides/").collapse();
+    view.update(roots(paths.filter(path => path !== leaf)), leaf);
+    expect(directory("guides/").isExpanded()).toBe(false);
+    view.update(roots(), leaf);
+    expect(directory("guides/").isExpanded()).toBe(false);
+    expect(tree().getSelectedPaths()).toEqual([leaf]);
+    directory("guides/").expand();
+    expect(tree().getItem(leaf)?.isSelected()).toBe(true);
+  });
+
+  it("reveals a different unavailable selection when it first becomes represented", () => {
+    const missing = paths.filter(path => path !== other);
+    view.update(roots(missing), leaf);
+    directory("kept/").expand();
+    view.update(roots(missing), other);
+    view.update(roots(), other);
+    expect(directory("other/").isExpanded()).toBe(true);
+    expect(directory("other/deep/").isExpanded()).toBe(true);
+    expect(directory("kept/").isExpanded()).toBe(true);
+    expect(tree().getSelectedPaths()).toEqual([other]);
+  });
+
+  it("reveals a changed resolved path even when document identity is unchanged", () => {
+    view.update(roots(paths, { [leaf]: "stable-id" }), "stable-id");
+    const moved = "moved/deep/active.md";
+    view.update(roots(paths.map(path => path === leaf ? moved : path), { [moved]: "stable-id" }), "stable-id");
+    expect(directory("moved/").isExpanded()).toBe(true);
+    expect(directory("moved/deep/").isExpanded()).toBe(true);
+    expect(tree().getSelectedPaths()).toEqual([moved]);
+  });
+
+  it("reveals a changed document identity even at the same tree path", () => {
+    view.update(roots(), leaf);
+    directory("guides/").collapse();
+    view.update(roots(paths, { [leaf]: "replacement-id" }), "replacement-id");
+    expect(directory("guides/").isExpanded()).toBe(true);
+    expect(tree().getSelectedPaths()).toEqual([leaf]);
+  });
+
+  it("clears mounted state on disposal and reveals on a fresh mount", () => {
+    view.update(roots(), leaf);
+    directory("guides/").collapse();
+    const mounted = tree();
+    view.dispose();
+    expect(container.__pierreFileTree).toBeUndefined();
+    expect(view.getVisibleLeafCount()).toBe(0);
+    expect(view.getVisibleBinaryLeafCount()).toBe(0);
+    view.update(roots(), leaf);
+    expect(tree()).not.toBe(mounted);
+    expect(directory("guides/").isExpanded()).toBe(true);
+    expect(tree().getSelectedPaths()).toEqual([leaf]);
+  });
+});
 
 function makeRoot(overrides: Partial<RootGroup> & { id: string; label: string; docs: RootGroup["docs"] }): RootGroup {
   return {

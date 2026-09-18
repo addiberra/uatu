@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
 import { BackgroundTasksUnsupportedError, ChatQueueFullError, CommandAttachmentsError, ConversationRenameUnsupportedError, deriveConversationTitle, InteractionConflictError, InvalidConversationTitleError, InvalidModeSelectionError, InvalidModelSelectionError, InvalidVariantSelectionError, ChatAdapter, parseSlashCommand, QueuedMessageNotHeldError, ReversibleHistoryUnsupportedError, UnknownAttachmentError } from "./adapter";
-import { createProviderEventMemory, normalizeProviderEvent, normalizeProviderMessage, storedMessageUsage, type ProviderEvent, type ProviderMessage } from "./opencode/normalization";
+import { createProviderEventMemory, normalizeProviderEvent, normalizeProviderMessage, storedMessageUsage, storedPromptId, type ProviderEvent, type ProviderMessage } from "./opencode/normalization";
 import type { ChatAgent } from "./types";
 import type {
   NormalizedProviderEvent,
@@ -12,7 +12,7 @@ import type {
   StoredMessageAccounting,
 } from "./provider";
 import { ReversibleHistoryTargetError, UnsupportedVariantSelectionError } from "./provider";
-import type { ChatEvent, ChatModel, ConversationItem, ModelSelection, ReversibleHistoryResult, ReversibleHistoryState } from "./types";
+import type { ChatEvent, ChatModel, ConversationItem, ToolItem, ModelSelection, ReversibleHistoryResult, ReversibleHistoryState } from "./types";
 import { ConversationNotFoundError } from "./workspace";
 import { MetricsRegistry } from "../debug/metrics";
 import type { ConversationInventorySubscription } from "./inventory-broadcaster";
@@ -133,10 +133,14 @@ class FakeProvider implements ChatProvider {
 type RawPage = { items: ProviderMessage[]; nextCursor?: string; configurationItems?: ProviderMessage[] };
 
 function normalizeRawPage(page: RawPage): ProviderHistoryPage {
+  // As the real provider does: a reply that names no prompt answers the
+  // newest user message before it.
   const accounting: StoredMessageAccounting[] = [];
+  let newestPrompt: string | undefined;
   for (const message of page.items) {
+    newestPrompt = storedPromptId(message) ?? newestPrompt;
     const reported = storedMessageUsage(message);
-    if (reported) accounting.push(reported);
+    if (reported) accounting.push(reported.promptId === undefined && newestPrompt !== undefined ? { ...reported, promptId: newestPrompt } : reported);
   }
   return {
     items: page.items.flatMap(message => normalizeProviderMessage(message)),
@@ -2705,7 +2709,7 @@ describe("pending permission recovery", () => {
     await pump;
   });
 
-  test("a nested subagent's spend reaches the top-level row, from the store and live", async () => {
+  test("a nested subagent is listed beneath the row that launched its branch, from the store and live", async () => {
     const provider = new FakeProvider();
     provider.sessions = [fixtureSession("parent"), { ...fixtureSession("child"), parentId: "parent" }, { ...fixtureSession("grandchild"), parentId: "child" }];
     const launcher = (id: string, target: string) => ({
@@ -2722,15 +2726,18 @@ describe("pending permission recovery", () => {
     };
     const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g", coalesceWindowMs: 1 });
 
-    // From the store: the child's row on the parent carries the child's own
-    // spend and its subagent's.
+    // From the store: the child's row states the child's OWN spend, and the
+    // subagent it launched is a line beneath it with its own — nothing is
+    // added into the row, so row and line sum to what the branch cost.
     const snapshot = await adapter.history("parent");
-    const row = () => adapter.projectionForTests("parent").items().find(item => item.type === "tool");
+    const row = () => adapter.projectionForTests("parent").items().find(item => item.type === "tool") as ToolItem | undefined;
     expect(snapshot.items.find(item => item.type === "tool")).toEqual(expect.objectContaining({
-      childConversationId: "child", usage: { input: 200, output: 20, costUsd: 0.75 },
+      childConversationId: "child", model: "gpt-5.6-sol", usage: { input: 100, output: 10, costUsd: 0.5 },
+      descendants: [{ id: "tool:prt_launch_grandchild", parentId: "tool:prt_launch_child", description: "Run grandchild", subagent: "explore", conversationId: "grandchild", model: "gpt-5.6-sol", usage: { input: 100, output: 10, costUsd: 0.25 } }],
     }));
 
-    // Live: a grandchild message restates its price; the parent's row moves.
+    // Live: a grandchild message restates its price; its line moves, and the
+    // row above it does not.
     const pump = adapter.startEventPump();
     provider.eventQueue.push({
       id: "e-part", type: "message.part.updated",
@@ -2740,8 +2747,11 @@ describe("pending permission recovery", () => {
       id: "e-msg", type: "message.updated",
       data: { info: { id: "grandchild_msg", sessionID: "grandchild", role: "assistant", modelID: "gpt-5.6-sol", time: { created: 2 }, tokens: { input: 300, output: 30 }, cost: 0.5 } },
     } as never);
-    while (row()?.type === "tool" && row()!.usage?.costUsd !== 1) await Bun.sleep(1);
-    expect(row()).toEqual(expect.objectContaining({ usage: { input: 400, output: 40, costUsd: 1 } }));
+    await waitUntil(() => row()?.descendants?.[0]?.usage?.costUsd === 0.5);
+    expect(row()).toEqual(expect.objectContaining({
+      usage: { input: 100, output: 10, costUsd: 0.5 },
+      descendants: [expect.objectContaining({ conversationId: "grandchild", usage: { input: 300, output: 30, costUsd: 0.5 } })],
+    }));
     await adapter.stopEventPump();
     await pump;
   });
@@ -2768,11 +2778,17 @@ describe("pending permission recovery", () => {
     };
     const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g" });
     const row = (snapshot: { items: ConversationItem[] }) => snapshot.items.find(item => item.type === "tool");
-    // First open: the child's own spend is banked, the grandchild's is not
-    // yet known — and the tally is not marked squared.
-    expect(row(await adapter.history("parent"))).toEqual(expect.objectContaining({ usage: { input: 100, output: 10, costUsd: 0.5 } }));
+    // First open: the child's own spend is banked; the grandchild is listed,
+    // since the child's transcript names it, but with no figure — its spend is
+    // not yet known — and the tally is not marked squared.
+    const first = row(await adapter.history("parent")) as ToolItem;
+    expect(first.usage).toEqual({ input: 100, output: 10, costUsd: 0.5 });
+    expect(first.descendants).toEqual([{ id: "tool:prt_launch_grandchild", parentId: "tool:prt_launch_child", description: "Run grandchild", subagent: "explore", conversationId: "grandchild" }]);
     // Next open reads the grandchild again and the nest is whole.
-    expect(row(await adapter.history("parent"))).toEqual(expect.objectContaining({ usage: { input: 200, output: 20, costUsd: 0.75 } }));
+    expect(row(await adapter.history("parent"))).toEqual(expect.objectContaining({
+      usage: { input: 100, output: 10, costUsd: 0.5 },
+      descendants: [expect.objectContaining({ conversationId: "grandchild", usage: { input: 100, output: 10, costUsd: 0.25 } })],
+    }));
     expect(grandchildReads).toBe(2);
     // Squared now: a third open reads nothing more.
     await adapter.history("parent");
@@ -2811,11 +2827,353 @@ describe("pending permission recovery", () => {
     releaseGrandchild();
     await childOpen;
     const snapshot = await parentOpen;
-    expect(snapshot.items.find(item => item.type === "tool")).toEqual(expect.objectContaining({ usage: { input: 200, output: 20, costUsd: 0.75 } }));
+    expect(snapshot.items.find(item => item.type === "tool")).toEqual(expect.objectContaining({
+      usage: { input: 100, output: 10, costUsd: 0.5 },
+      descendants: [expect.objectContaining({ conversationId: "grandchild", usage: { input: 100, output: 10, costUsd: 0.25 } })],
+    }));
     // One read served both; the nest is squared, so a reopen reads nothing more.
     expect(grandchildReads).toBe(1);
     await adapter.history("parent");
     expect(grandchildReads).toBe(1);
+  });
+
+  // A subagent handed a further task (OpenCode's `task_id`) is ONE session and
+  // TWO rows. These fixtures are that shape: a prompt per task, a row per task.
+  const taskRow = (part: string, created: number, description: string, target = "child", resumed = false, gave?: string) => ({
+    id: `launch_${part}`, type: "assistant", time: { created },
+    content: [{ id: part, type: "tool", tool: "task", callID: part, state: {
+      status: "completed", input: { description, subagent_type: "general", ...(gave === undefined ? {} : { prompt: gave }), ...(resumed ? { task_id: target } : {}) }, metadata: { sessionId: target }, output: "done",
+    } }],
+  });
+  // Classic-store records, the shape a compacting subagent's session has: a
+  // user message per task, plus the two OpenCode adds when the subagent
+  // summarises itself — a compaction request and a synthetic "continue".
+  const asked = (id: string, created: number, text: string) => ({ info: { id, role: "user", time: { created } }, parts: [{ type: "text", text }] });
+  const compactionRequest = (id: string, created: number) => ({ info: { id, role: "user", time: { created } }, parts: [{ type: "compaction" }] });
+  const continued = (id: string, created: number) => ({ info: { id, role: "user", time: { created } }, parts: [{ type: "text", text: "Continue if you have next steps, or stop and ask for clarification.", synthetic: true }] });
+  const answered = (id: string, created: number, promptId: string, input: number, cost: number) => ({ info: { id, role: "assistant", parentID: promptId, modelID: "gpt-5.6-sol", providerID: "openai", time: { created }, tokens: { input, output: 0 }, cost }, parts: [] });
+  const prompt = (id: string, created: number) => ({ id, type: "user", time: { created }, text: "do it" });
+  const reply = (id: string, created: number, input: number, cost: number) => ({ id, type: "assistant", modelID: "gpt-5.6-sol", providerID: "openai", time: { created }, tokens: { input, output: input / 100 }, cost });
+  const rowsOf = (items: ConversationItem[]) => items.filter((item): item is ToolItem => item.type === "tool").sort((left, right) => left.createdAt - right.createdAt);
+
+  test("a subagent given a second task is billed once: each row states its own task, live and from the store", async () => {
+    const provider = new FakeProvider();
+    provider.sessions = [fixtureSession("parent"), { ...fixtureSession("child"), parentId: "parent" }];
+    provider.pages.set("first", { items: [taskRow("prt_t1", 1, "First task")] });
+    let childStore: unknown[] = [];
+    const listMessages = provider.readMessages.bind(provider);
+    provider.readMessages = async (sessionId, options) => (sessionId === "child" ? { items: childStore as never[] } : listMessages(sessionId, options));
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g", coalesceWindowMs: 1 });
+    await adapter.history("parent");
+    const rows = () => rowsOf(adapter.projectionForTests("parent").items());
+    const live = (id: string, promptId: string, input: number, cost: number) => ({
+      id: `e-${id}-${input}`, type: "message.updated",
+      data: { info: { id, sessionID: "child", role: "assistant", parentID: promptId, modelID: "gpt-5.6-sol", time: { created: 3 }, tokens: { input, output: input / 100 }, cost } },
+    });
+    const pump = adapter.startEventPump();
+    provider.eventQueue.push(live("m1", "p1", 1_000, 0.5) as never);
+    await waitUntil(() => rows()[0]?.usage?.input === 1_000);
+
+    // The main agent hands the SAME subagent a further task: a second row for
+    // the same child session, then that task's reply.
+    provider.eventQueue.push({
+      id: "e-row-2", type: "message.part.updated",
+      data: { part: { id: "prt_t2", messageID: "launch_prt_t2", sessionID: "parent", type: "tool", tool: "task", callID: "prt_t2", state: {
+        status: "running", input: { description: "Second task", subagent_type: "general", task_id: "child" }, metadata: { sessionId: "child" },
+      } } },
+    } as never);
+    provider.eventQueue.push(live("m2", "p2", 400, 0.2) as never);
+    await waitUntil(() => rows()[1]?.usage?.input === 400);
+    // The second row states the second task alone, and the first is untouched:
+    // keyed by session, the second row opened at the first one's total.
+    expect(rows().map(row => row.usage)).toEqual([{ input: 1_000, output: 10, costUsd: 0.5 }, { input: 400, output: 4, costUsd: 0.2 }]);
+    // The second task's figure restates as it streams; only its row moves.
+    provider.eventQueue.push(live("m2", "p2", 600, 0.3) as never);
+    await waitUntil(() => rows()[1]?.usage?.input === 600);
+    expect(rows().map(row => row.usage?.costUsd)).toEqual([0.5, 0.3]);
+    await adapter.stopEventPump();
+    await pump;
+
+    // From the store, in a process that saw none of it live. The v2 records
+    // name no prompt: each reply answers the newest prompt before it.
+    provider.pages.set("first", { items: [taskRow("prt_t1", 1, "First task"), taskRow("prt_t2", 5, "Second task", "child", true)] });
+    childStore = [prompt("p1", 2), reply("m1", 3, 1_000, 0.5), prompt("p2", 6), reply("m2", 7, 600, 0.3)];
+    const reopened = rowsOf((await new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g2" }).history("parent")).items);
+    expect(reopened.map(row => row.usage)).toEqual([{ input: 1_000, output: 10, costUsd: 0.5 }, { input: 600, output: 6, costUsd: 0.3 }]);
+    // Together the rows are what the session spent — no more.
+    expect(reopened.reduce((sum, row) => sum + (row.usage?.costUsd ?? 0), 0)).toBeCloseTo(0.8);
+  });
+
+  test("a subagent that compacted during its first task bills the compaction to that task, not the next", async () => {
+    // A real session's shape and figures: one `general`, two tasks, one
+    // compaction partway through the first. Four user messages, two rows:
+    // paired by position, the compaction request and the "continue" — and the
+    // 258k tokens answering them — were handed to the SECOND task.
+    const provider = new FakeProvider();
+    provider.sessions = [fixtureSession("parent"), { ...fixtureSession("child"), parentId: "parent" }];
+    provider.pages.set("first", { items: [
+      taskRow("prt_t1", 1, "Audit", "child", false, "Read-only audit, do not edit."),
+      taskRow("prt_t2", 9, "Re-audit", "child", true, "Re-audit the current files after fixes."),
+    ] });
+    const listMessages = provider.readMessages.bind(provider);
+    provider.readMessages = async (sessionId, options) => (sessionId === "child" ? { items: [
+      asked("p1", 2, "Read-only audit, do not edit."), answered("m1", 3, "p1", 270_923, 0.27),
+      compactionRequest("pc", 4), answered("mc", 5, "pc", 38_970, 0.04),
+      continued("ps", 6), answered("ms", 7, "ps", 218_840, 0.22),
+      asked("p2", 10, "Re-audit the current files after fixes."), answered("m2", 11, "p2", 23_000, 0.02),
+    ] as never[] } : listMessages(sessionId, options));
+    const rows = rowsOf((await new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g" }).history("parent")).items);
+    expect(rows.map(row => row.usage?.input)).toEqual([528_733, 23_000]);
+    expect(rows.map(row => row.usage?.costUsd)).toEqual([expect.closeTo(0.53, 10), 0.02]);
+  });
+
+  test("live, a compaction between two tasks stays with the first as the second task's row and prompt arrive", async () => {
+    const provider = new FakeProvider();
+    provider.sessions = [fixtureSession("parent"), { ...fixtureSession("child"), parentId: "parent" }];
+    provider.pages.set("first", { items: [taskRow("prt_t1", 1, "Audit", "child", false, "Read-only audit, do not edit.")] });
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g", coalesceWindowMs: 1 });
+    await adapter.history("parent");
+    const rows = () => rowsOf(adapter.projectionForTests("parent").items());
+    const user = (id: string) => ({ id: `e-u-${id}`, type: "message.updated", data: { info: { id, sessionID: "child", role: "user", time: { created: 2 } } } });
+    const typed = (id: string, text: string, synthetic = false) => ({ id: `e-t-${id}`, type: "message.part.updated", data: { part: { id: `prt_${id}`, messageID: id, sessionID: "child", type: "text", text, ...(synthetic ? { synthetic: true } : {}) } } });
+    const spent = (id: string, promptId: string, input: number) => ({ id: `e-a-${id}`, type: "message.updated", data: { info: { id, sessionID: "child", role: "assistant", parentID: promptId, modelID: "gpt-5.6-sol", time: { created: 3 }, tokens: { input, output: 0 }, cost: input / 1_000_000 } } });
+    const pump = adapter.startEventPump();
+    for (const event of [
+      user("p1"), typed("p1", "Read-only audit, do not edit."), spent("m1", "p1", 270_923),
+      // The subagent summarises itself: a request with no text, then OpenCode's own "continue".
+      user("pc"), spent("mc", "pc", 38_970),
+      user("ps"), typed("ps", "Continue if you have next steps, or stop and ask for clarification.", true), spent("ms", "ps", 218_840),
+    ]) provider.eventQueue.push(event as never);
+    await waitUntil(() => rows()[0]?.usage?.input === 528_733);
+
+    // The second task: its row in the parent, then its prompt and reply in the child.
+    provider.eventQueue.push({
+      id: "e-row-2", type: "message.part.updated",
+      data: { part: { id: "prt_t2", messageID: "launch_prt_t2", sessionID: "parent", type: "tool", tool: "task", callID: "prt_t2", state: {
+        status: "running", input: { description: "Re-audit", subagent_type: "general", prompt: "Re-audit the current files after fixes.", task_id: "child" }, metadata: { sessionId: "child" },
+      } } },
+    } as never);
+    for (const event of [user("p2"), typed("p2", "Re-audit the current files after fixes."), spent("m2", "p2", 23_000)]) provider.eventQueue.push(event as never);
+    await waitUntil(() => rows()[1]?.usage?.input === 23_000);
+    expect(rows().map(row => row.usage?.input)).toEqual([528_733, 23_000]);
+    await adapter.stopEventPump();
+    await pump;
+  });
+
+  test("a nested subagent launched after a compaction still hangs off the task it was launched during", async () => {
+    const provider = new FakeProvider();
+    provider.sessions = [fixtureSession("parent"), { ...fixtureSession("child"), parentId: "parent" }, { ...fixtureSession("grandchild"), parentId: "child" }];
+    provider.pages.set("first", { items: [taskRow("prt_t1", 1, "Audit", "child", false, "Audit."), taskRow("prt_t2", 9, "Re-audit", "child", true, "Re-audit.")] });
+    const listMessages = provider.readMessages.bind(provider);
+    provider.readMessages = async (sessionId, options) => {
+      // Still the FIRST task when the helper is launched: two of the child's
+      // user messages so far are OpenCode's own, not tasks.
+      if (sessionId === "child") return { items: [asked("p1", 2, "Audit."), compactionRequest("pc", 3), continued("ps", 4), taskRow("prt_g", 5, "Help", "grandchild"), answered("m1", 6, "ps", 1_000, 0.5), asked("p2", 10, "Re-audit."), answered("m2", 11, "p2", 400, 0.2)] as never[] };
+      if (sessionId === "grandchild") return { items: [prompt("pg", 5), reply("mg", 6, 100, 0.1)] as never[] };
+      return listMessages(sessionId, options);
+    };
+    const rows = rowsOf((await new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g" }).history("parent")).items);
+    expect(rows[0]?.descendants).toEqual([expect.objectContaining({ id: "tool:prt_g", parentId: "tool:prt_t1", usage: { input: 100, output: 1, costUsd: 0.1 } })]);
+    expect(rows[1]).not.toHaveProperty("descendants");
+    expect(rows.map(row => row.usage?.costUsd)).toEqual([0.5, 0.2]);
+  });
+
+  test("when no prompt matches any task's, pairing falls back to position rather than piling everything on one row", async () => {
+    // Texts that cannot be compared usefully (a provider that rewrites the
+    // prompt it stores) must not make the second task vanish into the first.
+    const provider = new FakeProvider();
+    provider.sessions = [fixtureSession("parent"), { ...fixtureSession("child"), parentId: "parent" }];
+    provider.pages.set("first", { items: [taskRow("prt_t1", 1, "First", "child", false, "Do the first thing."), taskRow("prt_t2", 5, "Second", "child", true, "Do the second thing.")] });
+    const listMessages = provider.readMessages.bind(provider);
+    provider.readMessages = async (sessionId, options) => (sessionId === "child"
+      ? { items: [asked("p1", 2, "[rewritten] first"), answered("m1", 3, "p1", 1_000, 0.5), asked("p2", 6, "[rewritten] second"), answered("m2", 7, "p2", 400, 0.2)] as never[] }
+      : listMessages(sessionId, options));
+    const rows = rowsOf((await new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g" }).history("parent")).items);
+    expect(rows.map(row => row.usage?.costUsd)).toEqual([0.5, 0.2]);
+  });
+
+  test("after a restart mid-task, a reply that names no prompt answers the newest prompt the store knows", async () => {
+    // The workspace comes up while a reused subagent is on its SECOND task:
+    // the store already holds that task's prompt, the event stream's own
+    // memory of prompts starts empty, and the live record names no `parentID`.
+    // Unpaired, the second task's spend would fall to the first task's row.
+    const provider = new FakeProvider();
+    provider.sessions = [fixtureSession("parent"), { ...fixtureSession("child"), parentId: "parent" }];
+    provider.pages.set("first", { items: [taskRow("prt_t1", 1, "First task"), taskRow("prt_t2", 5, "Second task", "child", true)] });
+    const listMessages = provider.readMessages.bind(provider);
+    provider.readMessages = async (sessionId, options) => (sessionId === "child"
+      ? { items: [prompt("p1", 2), reply("m1", 3, 1_000, 0.5), prompt("p2", 6)] as never[] }
+      : listMessages(sessionId, options));
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g", coalesceWindowMs: 1 });
+    const rows = () => rowsOf(adapter.projectionForTests("parent").items());
+    await adapter.history("parent");
+    expect(rows().map(row => row.usage?.costUsd)).toEqual([0.5, undefined]);
+
+    const unnamed = (id: string, input: number, cost: number) => ({
+      id: `e-${id}-${input}`, type: "message.updated",
+      data: { info: { id, sessionID: "child", role: "assistant", modelID: "gpt-5.6-sol", time: { created: 7 }, tokens: { input, output: input / 100 }, cost } },
+    });
+    const pump = adapter.startEventPump();
+    provider.eventQueue.push(unnamed("m2", 400, 0.2) as never);
+    await waitUntil(() => rows()[1]?.usage?.input === 400);
+    expect(rows().map(row => row.usage)).toEqual([{ input: 1_000, output: 10, costUsd: 0.5 }, { input: 400, output: 4, costUsd: 0.2 }]);
+    // A restatement of the FIRST task's message, equally unnamed, stays where
+    // the store paired it rather than moving to the task running now.
+    provider.eventQueue.push(unnamed("m1", 1_200, 0.6) as never);
+    await waitUntil(() => rows()[0]?.usage?.input === 1_200);
+    expect(rows().map(row => row.usage?.costUsd)).toEqual([0.6, 0.2]);
+    await adapter.stopEventPump();
+    await pump;
+  });
+
+  test("an older page's row keeps its place among all the rows that launched the child", async () => {
+    // Paged history returns some of a child's rows at a time. Placed among
+    // only the rows on its page, the first task's row would be the only row
+    // and claim the whole session.
+    const provider = new FakeProvider();
+    provider.sessions = [fixtureSession("parent"), { ...fixtureSession("child"), parentId: "parent" }];
+    const all = [taskRow("prt_t1", 1, "First task"), taskRow("prt_t2", 5, "Second task", "child", true)];
+    provider.pages.set("first", { items: [all[1]!], configurationItems: all, nextCursor: "older" });
+    provider.pages.set("older", { items: [all[0]!], configurationItems: all });
+    const listMessages = provider.readMessages.bind(provider);
+    provider.readMessages = async (sessionId, options) => (sessionId === "child"
+      ? { items: [prompt("p1", 2), reply("m1", 3, 1_000, 0.5), prompt("p2", 6), reply("m2", 7, 400, 0.2)] as never[] }
+      : listMessages(sessionId, options));
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g" });
+    const first = await adapter.history("parent");
+    expect(rowsOf(first.items).map(row => row.usage?.costUsd)).toEqual([0.5, 0.2]);
+    expect(first.olderCursor).toBeDefined();
+    const older = await adapter.history("parent", { cursor: first.olderCursor });
+    expect(rowsOf(older.items).map(row => [row.id, row.usage?.costUsd])).toEqual([["tool:prt_t1", 0.5]]);
+  });
+
+  test("subagents nest to any depth as lines, each under what launched it, and a change at the bottom reaches the top", async () => {
+    const provider = new FakeProvider();
+    provider.sessions = [fixtureSession("parent"), { ...fixtureSession("child"), parentId: "parent" },
+      { ...fixtureSession("grandchild"), parentId: "child" }, { ...fixtureSession("great"), parentId: "grandchild" }];
+    provider.pages.set("first", { items: [taskRow("prt_c", 1, "Audit docs")] });
+    const listMessages = provider.readMessages.bind(provider);
+    provider.readMessages = async (sessionId, options) => {
+      if (sessionId === "child") return { items: [prompt("pc", 2), taskRow("prt_g", 3, "Find files", "grandchild"), reply("mc", 4, 100, 0.0116)] as never[] };
+      if (sessionId === "grandchild") return { items: [prompt("pg", 4), taskRow("prt_gg", 5, "Count lines", "great"), reply("mg", 6, 200, 0.0119)] as never[] };
+      if (sessionId === "great") return { items: [prompt("pgg", 6), reply("mgg", 7, 300, 0.0136)] as never[] };
+      return listMessages(sessionId, options);
+    };
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g", coalesceWindowMs: 1 });
+    const row = () => rowsOf(adapter.projectionForTests("parent").items())[0];
+    await adapter.history("parent");
+    // Three layers below the conversation: the row is the child's own spend,
+    // and the two below are lines — the second hanging off the first.
+    expect(row()?.usage?.costUsd).toBe(0.0116);
+    expect(row()?.descendants).toEqual([
+      { id: "tool:prt_g", parentId: "tool:prt_c", description: "Find files", subagent: "general", conversationId: "grandchild", model: "gpt-5.6-sol", usage: { input: 200, output: 2, costUsd: 0.0119 } },
+      { id: "tool:prt_gg", parentId: "tool:prt_g", description: "Count lines", subagent: "general", conversationId: "great", model: "gpt-5.6-sol", usage: { input: 300, output: 3, costUsd: 0.0136 } },
+    ]);
+    // Row and lines are what the whole branch cost, each message once.
+    const branch = (row()?.usage?.costUsd ?? 0) + (row()?.descendants ?? []).reduce((sum, line) => sum + (line.usage?.costUsd ?? 0), 0);
+    expect(branch).toBeCloseTo(0.0371);
+
+    const pump = adapter.startEventPump();
+    provider.eventQueue.push({
+      id: "e-deep", type: "message.updated",
+      data: { info: { id: "mgg", sessionID: "great", role: "assistant", parentID: "pgg", modelID: "gpt-5.6-sol", time: { created: 7 }, tokens: { input: 900, output: 9 }, cost: 0.04 } },
+    } as never);
+    await waitUntil(() => row()?.descendants?.[1]?.usage?.costUsd === 0.04);
+    expect(row()?.usage?.costUsd).toBe(0.0116);
+    expect(row()?.descendants?.[0]?.usage?.costUsd).toBe(0.0119);
+    await adapter.stopEventPump();
+    await pump;
+  });
+
+  test("a nested subagent is listed under the task during which it was launched", async () => {
+    const provider = new FakeProvider();
+    provider.sessions = [fixtureSession("parent"), { ...fixtureSession("child"), parentId: "parent" }, { ...fixtureSession("grandchild"), parentId: "child" }];
+    provider.pages.set("first", { items: [taskRow("prt_t1", 1, "First task"), taskRow("prt_t2", 5, "Second task", "child", true)] });
+    const listMessages = provider.readMessages.bind(provider);
+    provider.readMessages = async (sessionId, options) => {
+      // The child launched its helper while answering its SECOND task.
+      if (sessionId === "child") return { items: [prompt("p1", 2), reply("m1", 3, 1_000, 0.5), prompt("p2", 6), taskRow("prt_g", 7, "Help", "grandchild"), reply("m2", 8, 400, 0.2)] as never[] };
+      if (sessionId === "grandchild") return { items: [prompt("pg", 7), reply("mg", 8, 100, 0.1)] as never[] };
+      return listMessages(sessionId, options);
+    };
+    const rows = rowsOf((await new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g" }).history("parent")).items);
+    expect(rows[0]).not.toHaveProperty("descendants");
+    expect(rows[1]?.descendants).toEqual([expect.objectContaining({ id: "tool:prt_g", parentId: "tool:prt_t2", usage: { input: 100, output: 1, costUsd: 0.1 } })]);
+  });
+
+  test("a subagent that launches its own subagent live is listed once its row appears", async () => {
+    const provider = new FakeProvider();
+    provider.sessions = [fixtureSession("parent"), { ...fixtureSession("child"), parentId: "parent" }, { ...fixtureSession("grandchild"), parentId: "child" }];
+    provider.pages.set("first", { items: [taskRow("prt_c", 1, "Audit docs")] });
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g", coalesceWindowMs: 1 });
+    await adapter.history("parent");
+    const row = () => rowsOf(adapter.projectionForTests("parent").items())[0];
+    const pump = adapter.startEventPump();
+    const spend = (id: string, sessionID: string, promptId: string, cost: number) => ({
+      id: `e-${id}`, type: "message.updated",
+      data: { info: { id, sessionID, role: "assistant", parentID: promptId, modelID: "gpt-5.6-sol", time: { created: 3 }, tokens: { input: 100, output: 1 }, cost } },
+    });
+    provider.eventQueue.push(spend("mc", "child", "pc", 0.5) as never);
+    // The child's own timeline gains a launcher row; the conversation above
+    // it has no such row, only the line.
+    provider.eventQueue.push({
+      id: "e-launch", type: "message.part.updated",
+      data: { part: { id: "prt_g", messageID: "mc", sessionID: "child", type: "tool", tool: "task", callID: "prt_g", state: {
+        status: "running", input: { description: "Find files", subagent_type: "explore" }, metadata: { sessionId: "grandchild" },
+      } } },
+    } as never);
+    provider.eventQueue.push(spend("mg", "grandchild", "pg", 0.25) as never);
+    await waitUntil(() => row()?.descendants?.[0]?.usage?.costUsd === 0.25);
+    expect(row()?.usage?.costUsd).toBe(0.5);
+    expect(row()?.descendants).toEqual([{ id: "tool:prt_g", parentId: "tool:prt_c", description: "Find files", subagent: "explore", conversationId: "grandchild", model: "gpt-5.6-sol", usage: { input: 100, output: 1, costUsd: 0.25 } }]);
+
+    // The nested task's tool part is removed (outside any revert): its line
+    // and its cost leave the row above, and — the tally being squared — a
+    // reopen must not bring them back from the launcher record.
+    provider.eventQueue.push({ id: "e-unlaunch", type: "message.part.removed", properties: { sessionID: "child", messageID: "mc", partID: "prt_g" } } as never);
+    await waitUntil(() => row()?.descendants === undefined);
+    expect(row()).not.toHaveProperty("descendants");
+    expect(row()?.usage?.costUsd).toBe(0.5);
+    expect(rowsOf((await adapter.history("parent")).items)[0]).not.toHaveProperty("descendants");
+    await adapter.stopEventPump();
+    await pump;
+  });
+
+  test("a nested launcher removed while its ancestor's stored read is in flight is not banked from that read", async () => {
+    const provider = new FakeProvider();
+    provider.sessions = [fixtureSession("parent"), { ...fixtureSession("child"), parentId: "parent" }, { ...fixtureSession("grandchild"), parentId: "child" }];
+    provider.pages.set("first", { items: [taskRow("prt_c", 1, "Audit docs")] });
+    let releaseChild = () => {};
+    const gate = new Promise<void>(resolve => { releaseChild = resolve; });
+    let childReads = 0;
+    const listMessages = provider.readMessages.bind(provider);
+    provider.readMessages = async (sessionId, options) => {
+      if (sessionId === "child") {
+        childReads += 1;
+        // The store as it was when the read began: the nested launcher is still in it.
+        const stale = { items: [prompt("pc", 2), taskRow("prt_g", 3, "Find files", "grandchild"), reply("mc", 4, 100, 0.5)] as never[] };
+        await gate;
+        return stale;
+      }
+      if (sessionId === "grandchild") return { items: [prompt("pg", 4), reply("mg", 5, 100, 0.25)] as never[] };
+      return listMessages(sessionId, options);
+    };
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g", coalesceWindowMs: 1 });
+    const pump = adapter.startEventPump();
+    const opening = adapter.history("parent");
+    await waitUntil(() => childReads === 1);
+    // The removal lands mid-read, when no launcher record exists to edit yet.
+    provider.eventQueue.push({ id: "e-unlaunch", type: "message.part.removed", properties: { sessionID: "child", messageID: "mc", partID: "prt_g" } } as never);
+    await Bun.sleep(20);
+    releaseChild();
+    const opened = rowsOf((await opening).items)[0];
+    expect(opened?.usage?.costUsd).toBe(0.5);
+    expect(opened).not.toHaveProperty("descendants");
+    // Squared without it: a reopen reads nothing more and lists nothing more.
+    expect(rowsOf((await adapter.history("parent")).items)[0]).not.toHaveProperty("descendants");
+    expect(childReads).toBe(1);
+    await adapter.stopEventPump();
+    await pump;
   });
 
   test("a figure seen live before a read does not overwrite what the store says now", async () => {
@@ -2852,7 +3210,7 @@ describe("pending permission recovery", () => {
     await pump;
   });
 
-  test("removing a grandchild's message takes its spend off the top-level row", async () => {
+  test("removing a grandchild's message takes its spend off its line", async () => {
     const provider = new FakeProvider();
     provider.sessions = [fixtureSession("parent"), { ...fixtureSession("child"), parentId: "parent" }, { ...fixtureSession("grandchild"), parentId: "child" }];
     const launcher = (id: string, target: string) => ({
@@ -2867,15 +3225,18 @@ describe("pending permission recovery", () => {
       return listMessages(sessionId, options);
     };
     const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g", coalesceWindowMs: 1 });
-    const row = () => adapter.projectionForTests("parent").items().find(item => item.type === "tool") as { usage?: { input?: number; output?: number; costUsd?: number } } | undefined;
+    const row = () => adapter.projectionForTests("parent").items().find(item => item.type === "tool") as ToolItem | undefined;
     await adapter.history("parent");
-    expect(row()?.usage).toEqual({ input: 100, output: 10, costUsd: 0.25 });
-    // The grandchild's only priced message is removed (a revert below):
-    // the child's inclusive tally shrinks to nothing, and so does the row.
+    // The child spent nothing itself: the row asserts no figure, the line does.
+    expect(row()).not.toHaveProperty("usage");
+    expect(row()?.descendants?.[0]?.usage).toEqual({ input: 100, output: 10, costUsd: 0.25 });
+    // The grandchild's only priced message is removed (a revert below): its
+    // line stays — the subagent did run — but states no spend any more.
     const pump = adapter.startEventPump();
     provider.eventQueue.push({ id: "remove", type: "message.removed", properties: { sessionID: "grandchild", messageID: "grandchild_msg" } } as never);
-    while (row()?.usage !== undefined) await Bun.sleep(1);
-    expect(row()).not.toHaveProperty("usage");
+    await waitUntil(() => row()?.descendants?.[0]?.usage === undefined);
+    // Its model went with it: the message that named it is gone.
+    expect(row()?.descendants).toEqual([{ id: "tool:prt_launch_grandchild", parentId: "tool:prt_launch_child", description: "Run grandchild", subagent: "explore", conversationId: "grandchild" }]);
     await adapter.stopEventPump();
     await pump;
   });
@@ -2912,6 +3273,38 @@ describe("pending permission recovery", () => {
     expect(row()?.usage).toEqual({ input: 100, output: 10, costUsd: 0.5 });
     // Squared against the rewritten store: a reopen reads the same figure.
     expect((await adapter.history("parent")).items.find(item => item.type === "tool")).toEqual(expect.objectContaining({ usage: { input: 100, output: 10, costUsd: 0.5 } }));
+    await adapter.stopEventPump();
+    await pump;
+  });
+
+  test("a revert inside a subagent given two tasks withdraws only the reverted task's spend", async () => {
+    const provider = new FakeProvider();
+    provider.agent.capabilities.push("reversible-history");
+    provider.sessions = [fixtureSession("parent"), { ...fixtureSession("child"), parentId: "parent" }];
+    const historyState = { staged: true, canUndo: false, canRedo: true, revertedMessages: [] };
+    provider.getReversibleHistoryState = async () => historyState;
+    provider.undo = async () => ({ outcome: "changed", state: historyState });
+    provider.redo = async () => ({ outcome: "changed", state: historyState });
+    provider.revert = async () => ({ outcome: "changed", state: historyState });
+    provider.restore = async () => ({ outcome: "changed", state: historyState });
+    provider.pages.set("first", { items: [taskRow("prt_t1", 1, "First task"), taskRow("prt_t2", 5, "Second task", "child", true)] });
+    let childVisible: unknown[] = [prompt("p1", 2), reply("m1", 3, 1_000, 0.5), prompt("p2", 6), reply("m2", 7, 400, 0.2)];
+    const listMessages = provider.readMessages.bind(provider);
+    provider.readMessages = async (sessionId, options) => (sessionId === "child" ? { items: childVisible as never[] } : listMessages(sessionId, options));
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g", coalesceWindowMs: 1 });
+    const rows = () => rowsOf(adapter.projectionForTests("parent").items());
+    await adapter.history("parent");
+    expect(rows().map(row => row.usage?.costUsd)).toEqual([0.5, 0.2]);
+
+    // The second task is reverted out of the child's store. Its row stays —
+    // the parent still launched it — but states no spend; the first is whole.
+    const pump = adapter.startEventPump();
+    childVisible = [prompt("p1", 2), reply("m1", 3, 1_000, 0.5)];
+    provider.eventQueue.push({ type: "session.next.revert.staged", data: { sessionID: "child" } } as never);
+    await waitUntil(() => rows()[1]?.usage === undefined);
+    expect(rows()[0]?.usage).toEqual({ input: 1_000, output: 10, costUsd: 0.5 });
+    expect(rows()[1]).not.toHaveProperty("usage");
+    expect(rowsOf((await adapter.history("parent")).items).map(row => row.usage?.costUsd)).toEqual([0.5, undefined]);
     await adapter.stopEventPump();
     await pump;
   });

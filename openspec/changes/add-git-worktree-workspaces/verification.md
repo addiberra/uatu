@@ -146,9 +146,23 @@ touch emulation, not verification on a physical phone.
 
 ## Branch integration
 
-The feature branch base is `8a524297d367621ffe0116eea906c82318695b98`.
-Compatibility was checked against that base. `origin/main` has since advanced
-through workspace API revision 20 and separate chat/tree changes. Before merging
-the PR, synchronize with main, preserve its newer workspace revision alongside
-this feature's Hub revision 7, and run CI on the combined result. This report
-does not claim validation of that future merge.
+The full browser and provider results above were recorded before synchronizing
+the branch, against original base `8a524297d367621ffe0116eea906c82318695b98`.
+
+Before pushing for testing, merged main at
+`3a76a6dc0e8f128ad1a1b9d4cd5f797ce538341a`. Resolved the four API metadata conflicts
+by retaining Hub revision 7 and main's workspace revision 20, including its chat
+receipt schemas and migration notes. Installed the merged frozen lockfile.
+
+Post-integration checks on 2026-09-18:
+
+- Clean-environment `bun test`: 3,746 pass, 9 skip, 0 fail, 28,380 assertions
+  across 235 files in 136.98 seconds.
+- `bun run test:e2e tests/e2e/worktree-integration.e2e.ts tests/e2e/hub-switcher.e2e.ts --workers=1`:
+  all four desktop/touch journeys passed without retries in 23.6 seconds.
+- Root and worktree-dedicated typechecks, API lint/structure and compatibility
+  against current main passed. Only the Hub domain changes relative to main.
+- All 53 strict OpenSpec validations passed.
+
+The earlier full-browser results remain identified above; CI will run the full
+suite on the pushed combined branch.

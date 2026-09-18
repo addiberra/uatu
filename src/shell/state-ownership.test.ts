@@ -11,6 +11,7 @@ import path from "node:path";
 
 const FIELD_OWNERS: Record<string, string> = {
   selectedId: "src/shell/selection.ts",
+  selectionCleared: "src/shell/selection.ts",
   previewMode: "src/shell/selection.ts",
   followEnabled: "src/shell/follow.ts",
   roots: "src/shell/events.ts",

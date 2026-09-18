@@ -20,7 +20,8 @@ import { composerRoutineState, formatUsd, latestPlanReport, latestRateLimit, pla
 import { buildPlanRowNodes, noteUsageReport, revealUsagePane } from "./usage-pane";
 import { isLiveConversationStatus } from "./types";
 import { contextReadout } from "./context-readout";
-import { totalTokens } from "./usage";
+import { buildReceiptRows, buildReceiptTotal, parseReceiptView, receiptHeading, subagentTrackSummary, subagentTranscriptTitle, type ReceiptView } from "./receipt-view";
+import { formatTokens, totalTokens } from "./usage";
 import { resolveSessionTotals, type ConversationTotals } from "./conversation-totals";
 import {
   addAcceptedDraft,
@@ -58,6 +59,9 @@ type Presentation = {
   // The agent the user last conversed with; the default for the next
   // creation (spec: last used, then the server default).
   lastAgentId?: string;
+  // How the cost receipt is itemized. A reading preference, not a fact about
+  // any one conversation, so it holds across conversations and reloads.
+  receiptView?: ReceiptView;
 };
 
 // A status line that also reports what it is currently saying, so an owner of
@@ -126,7 +130,9 @@ export function initChat(api = new ChatApiClient()): void {
   const planSessionTitle = document.querySelector<HTMLElement>("#chat-plan-session-title");
   const planSessionCost = document.querySelector<HTMLElement>("#chat-plan-session-cost");
   const planSessionModels = document.querySelector<HTMLElement>("#chat-plan-session-models");
-  const planSessionAgents = document.querySelector<HTMLElement>("#chat-plan-session-agents");
+  const planSessionViews = document.querySelector<HTMLElement>("#chat-plan-session-views");
+  const planSessionHeading = document.querySelector<HTMLElement>("#chat-plan-session-heading");
+  const planSessionTotal = document.querySelector<HTMLElement>("#chat-plan-session-total");
   const composerChips = document.querySelector<HTMLElement>("#chat-composer-chips");
   // The reason the latest status event carried (a retry's attempt and HTTP
   // status), shown with the named state — per conversation, so a switch
@@ -228,6 +234,20 @@ export function initChat(api = new ChatApiClient()): void {
   let stream: ChatEventStream | null = null;
   let inventoryStream: ChatEventStream | null = null;
   let selectionGeneration = 0;
+  // A stored reference is not an opened selection. Keep it inert across
+  // missing inventories, even if creation cancels startup before it finishes.
+  let hasSelectedConversation = false;
+  // A consumed startup restore is not deletion-recovery eligible until its
+  // opening read succeeds. Keep this scoped to its current selection epoch.
+  let unestablishedStartup: { conversationId: string; generation: number } | null = null;
+  const isUnestablishedStartup = (id: string | null | undefined) =>
+    unestablishedStartup?.generation === selectionGeneration && unestablishedStartup.conversationId === id;
+  let startupOwnsSelection = true;
+  let pendingStartupId: string | null = null;
+  const supersedeStartupSelection = () => {
+    startupOwnsSelection = false;
+    pendingStartupId = null;
+  };
   let selectedConversationDeleted = false;
   type ConversationRefreshRecovery = {
     conversationId: string;
@@ -642,6 +662,9 @@ export function initChat(api = new ChatApiClient()): void {
       projection?.conversationId ?? null,
       selectedConversationDeleted ? presentation.selectedId ?? null : null,
     );
+    if ((!hasSelectedConversation || isUnestablishedStartup(presentation.selectedId)) && presentation.selectedId) {
+      known.add(presentation.selectedId);
+    }
     // Prune only once the inventory has actually loaded — an empty list at
     // boot must not wipe every stored draft.
     if (conversations.length > 0) {
@@ -794,11 +817,10 @@ export function initChat(api = new ChatApiClient()): void {
   // entries rather than scraped from whichever markup happens to carry the
   // text — the track row and the timeline row must produce the same title.
   const subagentLabelFor = (conversationId: string, source: ChatProjection | null): string => {
-    const entry = source ? subagentEntries(source.items).find(candidate => candidate.conversationId === conversationId) : undefined;
-    if (!entry) return "Subagent";
-    // What the child session cost, beside its name, once it has reported a
-    // price — the same figure its timeline row and the Agents table state.
-    return entry.usage?.costUsd ? `${subagentLabel(entry)} · ${formatUsd(entry.usage.costUsd)}` : subagentLabel(entry);
+    // What the subagent itself spent, beside its name, once it has reported a
+    // price: every task it was given, and nothing it launched. A row states
+    // one task; the transcript is the whole agent.
+    return source ? subagentTranscriptTitle(subagentEntries(source.items), source.items, conversationId) : "Subagent";
   };
   subagentsItems?.addEventListener("click", event => {
     const open = (event.target as Element).closest<HTMLElement>("[data-open-conversation]");
@@ -919,11 +941,7 @@ export function initChat(api = new ChatApiClient()): void {
       subagentsItems.replaceChildren();
       return;
     }
-    const running = entries.filter(entry => entry.status === "running" || entry.status === "pending");
-    const noun = entries.length === 1 ? "subagent" : "subagents";
-    subagentsLabel.textContent = running.length > 0
-      ? `${running.length} of ${entries.length} ${noun} working · ${running[0]!.description}`
-      : `${entries.length} ${noun} finished`;
+    subagentsLabel.textContent = subagentTrackSummary(entries);
     subagentsItems.replaceChildren(...entries.map(entry => {
       const row = document.createElement("li");
       row.className = `is-${entry.status}`;
@@ -1776,46 +1794,15 @@ export function initChat(api = new ChatApiClient()): void {
     const family = exact ?? models.find(model => !model.default && ids(model).some(candidate => bare.includes(strip(candidate))));
     return family?.name ?? id;
   };
-  // The per-agent split, when the conversation launched subagents: the main
-  // agent's own spend, then each subagent with the model it ran. An agent
-  // that reported no price is listed with a dash, not a zero.
-  const paintPlanAgents = (agents: ConversationTotals["agents"]) => {
-    const table = planSessionAgents?.closest("table");
-    if (!planSessionAgents || !table) return;
-    const shown = agents !== undefined && agents.some(agent => !agent.main);
-    table.hidden = !shown;
-    if (!shown) {
-      planSessionAgents.replaceChildren();
-      return;
-    }
-    planSessionAgents.replaceChildren(...agents.map(agent => {
-      const row = document.createElement("tr");
-      const name = document.createElement("td");
-      name.textContent = agent.label;
-      name.title = agent.label;
-      if (agent.model) {
-        const model = document.createElement("span");
-        model.className = "chat-plan-session-agent-model";
-        model.textContent = sessionModelName(agent.model);
-        name.append(model);
-      }
-      row.append(name);
-      for (const [text, title] of [
-        [formatTokens(agent.input + agent.cacheRead + agent.cacheWrite), `${agent.input.toLocaleString()} input · ${agent.cacheRead.toLocaleString()} cache read · ${agent.cacheWrite.toLocaleString()} cache write`],
-        [formatTokens(agent.output), `${agent.output.toLocaleString()} output`],
-        [agent.costUsd ? formatUsd(agent.costUsd) : "—", agent.costUsd ? "" : "No price reported"],
-      ]) {
-        const cell = document.createElement("td");
-        cell.textContent = text!;
-        if (title) cell.title = title;
-        row.append(cell);
-      }
-      return row;
-    }));
-  };
+  // The conversation block is a receipt: lines that sum to a total, itemized
+  // by agent, by kind of agent, or by model — one at a time, the reader's
+  // choice, remembered. Totals the agent tallies itself (Claude Code) come per
+  // model only: no control, no total line, the block as it has always read.
+  let paintedSession: { session: ConversationTotals; items: readonly ConversationItem[] } | undefined;
+  const receiptView = (session: ConversationTotals): ReceiptView => session.receipt ? presentation.receiptView ?? "agents" : "models";
   const paintPlanSession = (session: ConversationTotals | undefined, items: readonly ConversationItem[]) => {
     if (!planSession || !planSessionCost || !planSessionModels) return;
-    paintPlanAgents(session?.agents);
+    paintedSession = session ? { session, items } : undefined;
     planSession.hidden = !session;
     if (!session) return;
     // "This conversation", or "since HH:MM" when the tally began after the
@@ -1827,25 +1814,41 @@ export function initChat(api = new ChatApiClient()): void {
     if (session.apiDurationMs > 0) parts.push(`${formatApiTime(session.apiDurationMs)} of API time`);
     if (session.linesAdded > 0 || session.linesRemoved > 0) parts.push(`+${session.linesAdded} −${session.linesRemoved} lines`);
     planSessionCost.textContent = parts.join(" · ");
-    planSessionModels.replaceChildren(...session.models.map(model => {
-      const row = document.createElement("tr");
-      const cells = [
-        [sessionModelName(model.id), model.id],
-        [formatTokens(model.input + model.cacheRead + model.cacheWrite), `${model.input.toLocaleString()} input · ${model.cacheRead.toLocaleString()} cache read · ${model.cacheWrite.toLocaleString()} cache write`],
-        [formatTokens(model.output), `${model.output.toLocaleString()} output`],
-        // A row whose every contribution came unpriced says so rather
-        // than asserting the model was free.
-        ["unpriced" in model && model.unpriced ? "—" : formatUsd(model.costUsd), "unpriced" in model && model.unpriced ? "No price reported" : ""],
-      ];
-      for (const [text, title] of cells) {
-        const cell = document.createElement("td");
-        cell.textContent = text!;
-        if (title) cell.title = title;
-        row.append(cell);
+    const view = receiptView(session);
+    if (planSessionViews) {
+      planSessionViews.hidden = !session.receipt;
+      for (const button of planSessionViews.querySelectorAll<HTMLElement>("[data-receipt-view]")) {
+        const active = button.dataset.receiptView === view;
+        button.classList.toggle("is-active", active);
+        button.setAttribute("aria-checked", String(active));
+        button.tabIndex = active ? 0 : -1;
       }
-      return row;
-    }));
+    }
+    if (planSessionHeading) planSessionHeading.textContent = receiptHeading(view);
+    planSessionModels.replaceChildren(...buildReceiptRows(document, session, view, sessionModelName));
+    if (planSessionTotal) {
+      planSessionTotal.hidden = !session.receipt;
+      planSessionTotal.replaceChildren(...(session.receipt ? [buildReceiptTotal(document, session.receipt.total)] : []));
+    }
   };
+  const chooseReceiptView = (view: ReceiptView, focus: boolean) => {
+    presentation.receiptView = view;
+    save();
+    if (paintedSession) paintPlanSession(paintedSession.session, paintedSession.items);
+    if (focus) planSessionViews?.querySelector<HTMLElement>(`[data-receipt-view="${view}"]`)?.focus();
+  };
+  planSessionViews?.addEventListener("click", event => {
+    const view = parseReceiptView((event.target as Element).closest<HTMLElement>("[data-receipt-view]")?.dataset.receiptView);
+    if (view) chooseReceiptView(view, false);
+  });
+  // A radiogroup moves its selection with the arrow keys, not Tab.
+  planSessionViews?.addEventListener("keydown", event => {
+    const step = event.key === "ArrowRight" || event.key === "ArrowDown" ? 1 : event.key === "ArrowLeft" || event.key === "ArrowUp" ? -1 : 0;
+    if (step === 0 || !paintedSession) return;
+    event.preventDefault();
+    const views: readonly ReceiptView[] = ["agents", "types", "models"];
+    chooseReceiptView(views[(views.indexOf(receiptView(paintedSession.session)) + step + views.length) % views.length]!, true);
+  });
   // A login without plan limits (API key, Bedrock, Vertex) reports an empty
   // plan beside real session totals. The chip then carries the conversation's
   // cost — the figure that login budgets by — and the readout is only the
@@ -1892,7 +1895,7 @@ export function initChat(api = new ChatApiClient()): void {
     // Folded totals are a fresh object per fold, so they are keyed by what
     // they say: a restated carrier that moved the cost repaints, one that
     // did not is a no-op.
-    const totalsKey = totals ? `${totals.costUsd}\u0001${totals.models.map(model => `${model.id}:${model.costUsd}:${model.input}:${model.output}:${model.cacheRead}:${model.cacheWrite}`).join(",")}\u0001${(totals.agents ?? []).map(agent => `${agent.id}:${agent.label}:${agent.model ?? ""}:${agent.costUsd ?? ""}:${agent.input}:${agent.output}:${agent.cacheRead}:${agent.cacheWrite}`).join(",")}` : undefined;
+    const totalsKey = totals ? JSON.stringify([totals.costUsd, totals.models, totals.receipt?.lines]) : undefined;
     if (report === paintedPlanReport && totalsKey === paintedTotalsKey && sameStanding) return;
     paintedPlanReport = report;
     paintedTotalsKey = totalsKey;
@@ -2247,7 +2250,10 @@ export function initChat(api = new ChatApiClient()): void {
     }
   }
 
-  const selectConversation = async (id: string): Promise<boolean> => {
+  const selectConversation = async (id: string, deferredStartup = false): Promise<boolean> => {
+    const openingStartup = deferredStartup || isUnestablishedStartup(id);
+    supersedeStartupSelection();
+    hasSelectedConversation = true;
     if (projection?.conversationId === id && stream && !historyRefreshRequired.has(id) && !selectedConversationDeleted) return true;
     renderer.closeShellOutputWindow();
     childRenderer.closeShellOutputWindow();
@@ -2260,6 +2266,7 @@ export function initChat(api = new ChatApiClient()): void {
     closeChildConversation();
     if (renameForm) renameForm.hidden = true;
     const token = ++selectionGeneration;
+    unestablishedStartup = openingStartup ? { conversationId: id, generation: token } : null;
     stream?.close();
     stream = null;
     const acceptedDrafts = projection?.conversationId === id ? projection.acceptedDrafts : [];
@@ -2302,6 +2309,7 @@ export function initChat(api = new ChatApiClient()): void {
         const snapshot = await api.snapshot(id, undefined, signal);
         if (token !== selectionGeneration) return false;
         installConversationSnapshot(snapshot, acceptedDrafts, token);
+        unestablishedStartup = null;
         // The selection is settled; a ready agent stops polling, so this is
         // the moment mid-session command discoveries reach the completion
         // menu (background, after the chooser is done).
@@ -2315,10 +2323,17 @@ export function initChat(api = new ChatApiClient()): void {
 
   const patchChooser = (selectedId: string | null, deleted = false) => {
     renderSelectedConversationDeleted(document, deleted);
+    // Keep only the unresolved startup selection across a transient omission;
+    // all other options must continue to reflect the latest inventory.
+    const retainedStartupOption = isUnestablishedStartup(selectedId)
+      && selectedId && !conversations.some(conversation => conversation.id === selectedId)
+      ? Array.from(select.options).find(option => option.value === selectedId)
+      : undefined;
     patchConversationOptions(select, conversations, conversation =>
       agentStatuses.length > 1 && conversation.agent
         ? `${displayConversationTitle(conversation)} · ${conversation.agent.name}`
         : displayConversationTitle(conversation));
+    if (retainedStartupOption) select.append(retainedStartupOption);
     const genericPlaceholder = select.querySelector<HTMLOptionElement>("option[data-chat-inventory-placeholder]");
     if (deleted || selectedId) {
       genericPlaceholder?.remove();
@@ -2335,7 +2350,7 @@ export function initChat(api = new ChatApiClient()): void {
       select.disabled = false;
     } else {
       select.value = selectedId ?? "";
-      select.disabled = conversations.length === 0;
+      select.disabled = conversations.length === 0 && !retainedStartupOption;
     }
   };
 
@@ -2345,6 +2360,7 @@ export function initChat(api = new ChatApiClient()): void {
       : conversations[0]?.id ?? null;
     patchChooser(selected);
     if (!selected) {
+      if (startupOwnsSelection) pendingStartupId = presentation.selectedId ?? null;
       form.hidden = true;
       if (chatTitle) chatTitle.textContent = chatHeading();
       return;
@@ -2393,9 +2409,25 @@ export function initChat(api = new ChatApiClient()): void {
 
   const applyConversationInventory = (next: ConversationSummary[]) => {
     const tracked = inventoryTracker.reconcile(next);
-    const selectedId = presentation.selectedId ?? null;
+    // Consume before starting any asynchronous read. Inventory is discovery,
+    // not a retry mechanism for a failed opening read.
+    if (pendingStartupId && startupOwnsSelection && next.some(item => item.id === pendingStartupId)) {
+      const id = pendingStartupId;
+      pendingStartupId = null;
+      conversations = next;
+      patchChooser(id);
+      void selectConversation(id, true);
+      syncInventoryAwareness(tracked.increased);
+      syncControls();
+      save();
+      return;
+    }
+    const selectedId = hasSelectedConversation ? presentation.selectedId ?? null : null;
     const selectedMissing = selectedId !== null && !next.some(conversation => conversation.id === selectedId);
-    if (selectedMissing) enterSelectedConversationDeleted();
+    // A transient omission cannot invalidate this one-shot read or turn its
+    // failure into an automatic retry. Preserve its chooser and draft too.
+    const startupOpeningMissing = selectedMissing && isUnestablishedStartup(selectedId);
+    if (selectedMissing && !startupOpeningMissing) enterSelectedConversationDeleted();
 
     // The successful response replaces inventory truth. It does not install a
     // snapshot or touch the selected projection unless an unavailable
@@ -2564,6 +2596,7 @@ export function initChat(api = new ChatApiClient()): void {
   newButton.addEventListener("click", async () => {
     const chosenAgent = await chooseAgentForCreation();
     if (chosenAgent === null) return;
+    supersedeStartupSelection();
     newButton.disabled = true;
     announce("Creating conversation...");
     try {
@@ -3990,8 +4023,8 @@ export function initChat(api = new ChatApiClient()): void {
       announce(conversations.length ? "" : "No conversations yet. Create one to start.");
       // A selection made mid-bootstrap is the user's; the initial chooser
       // pass must not replace it with this snapshot's newest entry.
-      if (selectionGeneration === selectionAtStart) installInitialChooser();
-      else patchChooser(presentation.selectedId ?? null);
+      if (startupOwnsSelection && selectionGeneration === selectionAtStart) installInitialChooser();
+      else patchChooser(hasSelectedConversation ? presentation.selectedId ?? null : null);
       void contextReady;
       bootstrapped = true;
       // The enumeration above probed every agent; the pre-probe snapshot
@@ -4133,6 +4166,7 @@ function readPresentation(): Presentation {
     return {
       selectedId: typeof value.selectedId === "string" ? value.selectedId : undefined,
       lastAgentId: typeof value.lastAgentId === "string" ? value.lastAgentId : undefined,
+      receiptView: parseReceiptView(value.receiptView),
       drafts: value.drafts && typeof value.drafts === "object" ? value.drafts : {},
       expanded: Array.isArray(value.expanded) ? value.expanded.filter(item => typeof item === "string") : [],
       anchors: value.anchors && typeof value.anchors === "object" ? value.anchors : {},
@@ -4153,17 +4187,6 @@ function parseStoredTimestamps(value: unknown): Record<string, number> {
   if (!value || typeof value !== "object" || Array.isArray(value)) return {};
   return Object.fromEntries(Object.entries(value).filter((entry): entry is [string, number] =>
     typeof entry[1] === "number" && Number.isFinite(entry[1]) && entry[1] >= 0));
-}
-
-/**
- * Token counts at a glance: `840`, `12.4k`, `1.2M`. The exact figure is always
- * one hover or one expansion away (the title attribute and the breakdown), so
- * the compact form never has to be the only statement.
- */
-function formatTokens(value: number): string {
-  if (value < 1_000) return String(value);
-  if (value < 1_000_000) return `${(value / 1_000).toFixed(value < 10_000 ? 1 : 0)}k`;
-  return `${(value / 1_000_000).toFixed(1)}M`;
 }
 
 function modelValue(model: ModelSelection): string {
