@@ -44,6 +44,9 @@ import { HubPreferencesStore } from "./preferences";
 import { WorkspaceOnboardingCoordinator } from "./onboarding";
 import { startHubServer } from "./server";
 import { SessionManager } from "./sessions";
+import { NotificationStore } from "./notification-store";
+import { HubNotifications } from "./notifications";
+import { createHubUpstreamSource } from "./live-source";
 
 export type RunHubOptions = {
   configPath?: string;
@@ -104,7 +107,7 @@ export async function stopHubRuntime(parts: {
 }
 
 export async function shutdownHub(parts: {
-  stopServer(): void;
+  stopServer(): void | Promise<void>;
   stateLease: { release(): Promise<void> };
   cloneJobs: { close(): Promise<void> };
   credentialTools?: { shutdown(): Promise<void> } | null;
@@ -116,7 +119,9 @@ export async function shutdownHub(parts: {
   const report = parts.reportError ?? (message => console.error(message));
   let serverStopped = true;
   try {
-    parts.stopServer();
+    // Awaited: the lease must not be released while the server's own
+    // teardown (in-flight pushes, notification state writes) is still running.
+    await parts.stopServer();
   } catch {
     serverStopped = false;
     report("uatu hub: server shutdown failed");
@@ -513,12 +518,25 @@ export async function runHub(options: RunHubOptions): Promise<void> {
     },
     reservations,
   });
+  const notificationStore = new NotificationStore(path.join(stateRoot, "notifications.json"));
+  await notificationStore.load();
+  const notifications = new HubNotifications({
+    store: notificationStore,
+    contact: config.notifications?.contact,
+    source: createHubUpstreamSource({ sessions, registry }),
+    authorized: (principal, workspaceId) => {
+      const session = sessionStore.resolve(principal.sessionId);
+      return session?.user === principal.user && config.users.some(user => user.name === principal.user) && Boolean(registry.byId(workspaceId));
+    },
+    workspaceName: id => registry.byId(id)?.displayName ?? id,
+  });
   const server = startHubServer({
     config,
     registry,
     sessions,
     sessionStore,
     personalState,
+    notifications,
     preferences,
     onboarding,
     gitCommand: () => activePaths.get("git") ?? path.join(stateRoot, ".unavailable-git"),
@@ -536,6 +554,7 @@ export async function runHub(options: RunHubOptions): Promise<void> {
     },
   });
 
+  notifications.start();
   const scheme = config.tls ? "https" : "http";
   console.log(`${scheme}://${config.host}:${server.port}/`);
   console.error(
@@ -549,13 +568,14 @@ export async function runHub(options: RunHubOptions): Promise<void> {
       // credential operation could otherwise restart the SSH agent after
       // shutdown observed it stopped, orphaning its socket past exit.
       return await shutdownHub({
-        stopServer: () => {
+        stopServer: async () => {
           // End brokered client streams and abort their child upstreams
           // before the socket-level stop, so the cancellation reaches the
           // children the runtime is about to stop.
           server.live.endAll();
           server.liveBroker.dispose();
           server.stop(true);
+          await notifications.dispose();
         },
         stateLease,
         cloneJobs: server.cloneJobs,

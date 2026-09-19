@@ -11,6 +11,7 @@ import logoAssetPath from "../assets/uatu-logo.svg" with { type: "file" };
 import { Buffer } from "node:buffer";
 
 import { escapeHtml } from "../shared/html";
+import { PWA_ICON_VERSION } from "../pwa/icons";
 import { LOCAL_CREDENTIAL_ASSIGNMENT_WARNING, SCP_REMOTE_PATTERN } from "./credential-context";
 
 // Inline the brand SVG (the file ships a fixed navy fill; the dark-scheme
@@ -384,11 +385,13 @@ function page(title: string, body: string): string {
 <html lang="en">
 <head>
 <meta charset="utf-8" />
+<meta name="uatu-hub" content="true" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)" />
 <meta name="theme-color" content="#0d1117" media="(prefers-color-scheme: dark)" />
 <link rel="manifest" href="/manifest.webmanifest" />
-<link rel="icon" type="image/png" sizes="192x192" href="/hub-assets/icon-192.png" />
+<link rel="icon" type="image/png" sizes="192x192" href="/hub-assets/icon-192.png?v=${PWA_ICON_VERSION}" />
+<link rel="apple-touch-icon" sizes="192x192" href="/hub-assets/icon-192.png?v=${PWA_ICON_VERSION}" />
 <title>${escapeHtml(title)}</title>
 <style>${SHARED_STYLE}</style>
 </head>
@@ -418,7 +421,10 @@ function authenticatedChrome(current: AuthenticatedPage): string {
   ${link("clone", "/clone", "Add workspace")}
   ${link("settings", "/settings", "Settings")}
   <form class="sign-out" method="post" action="/logout"><button type="submit">Sign out</button></form>
-</nav>`;
+</nav><script type="module">
+import { mountNotifications } from "/hub-assets/notifications.js";
+mountNotifications({ apiUrl: "/api/hub/notifications", stateUrl: "/api/hub/state", workerUrl: "/push-worker.js", hosts: ".hub-nav" });
+</script>`;
 }
 
 export function loginPage(options: { error?: string; next?: string } = {}): string {
