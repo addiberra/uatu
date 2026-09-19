@@ -48,8 +48,11 @@ src/
 │                   follow-rules, state, storage, freshness (client/server
 │                   build-identity handshake), ui-mode (per-device
 │                   touch/desktop mode on <html>), tab-bar (touch mode's
-│                   bottom Files/Preview/Terminal tabs) — the app-wide
-│                   chrome and the appState singleton
+│                   bottom Files/Preview/Terminal tabs), worktree-dialog
+│                   (the one client worktree dialog, embedded in both
+│                   hub-nav's picker and the Hub dashboard) + worktree-live
+│                   (its `worktrees` live-invalidation subscription) — the
+│                   app-wide chrome and the appState singleton
 ├── preview/        the right pane — mounting rendered HTML, view-mode
 │                   chooser, layout (split/stacked), diff view,
 │                   mermaid trigger, anchors, image/binary fallbacks,
@@ -83,11 +86,17 @@ src/
 │                   child-topic subscriptions fanned out to every page's
 │                   one `/api/hub/live` stream), auth (users + the
 │                   server-side session store, one id over cookie/bearer
-│                   transports + rate limit + CSRF), pages, server, main
+│                   transports + rate limit + CSRF), worktree-* (the linked
+│                   Git worktree service — git probes, journal, reconciler,
+│                   rename/delete guards — and its published JSON family at
+│                   `worktree-api.ts`, `/api/hub/worktrees`), pages, server,
+│                   main
 ├── watchdog/       main + capture — heartbeat-driven hang recovery
 ├── debug/          cache + metrics + the heartbeat integration test
 ├── pwa/            PWA install affordance (asset references only)
-└── shared/         html, types, license-check, version
+└── shared/         html, types, license-check, version, worktree-contract
+                    + worktree-branches (the worktree wire DTOs/errors and
+                    branch/destination rules shared by client and Hub)
 ```
 
 Outside `src/`: `desktop/macos/` is **UatuCode Desktop**, the SwiftUI macOS
