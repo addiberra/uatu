@@ -754,6 +754,90 @@ describe("plan usage on demand", () => {
   });
 });
 
+describe("chat question anchoring", () => {
+  test("revealing a free-form answer hands its timeline's anchor to the question card", async () => {
+    const { document, window } = parseHTML(html);
+    installDomGlobals(document, window);
+    document.documentElement.setAttribute("data-ui-mode", "desktop");
+    document.documentElement.setAttribute("data-chat-panel", "open");
+    const select = document.querySelector<HTMLSelectElement>("#chat-conversation-select")!;
+    let selectedConversation = "";
+    Object.defineProperty(select, "value", {
+      configurable: true,
+      get: () => selectedConversation,
+      set: value => { selectedConversation = String(value); },
+    });
+    const pending = {
+      id: "question:q1", type: "question" as const, createdAt: 2, requestId: "q1", status: "pending" as const,
+      questions: [{
+        prompt: "Which branch?", header: "Branch", multiple: false, allowFreeForm: true,
+        options: [{ label: "main", description: "" }],
+      }],
+    };
+    const api = {
+      status: async () => ([{
+        agent: { id: "test", name: "Test" },
+        availability: { state: "ready", version: "test", agent: { id: "test", name: "Test", capabilities: ["questions"] } },
+      }]),
+      conversations: async () => [conversation("one")],
+      commands: async () => [],
+      snapshot: async (id: string) => ({ ...snapshot(id), items: [{ id: "message:u", type: "user_message", createdAt: 1, text: "which branch?" }, pending] }),
+      stream: () => ({ close() {} }),
+      inventoryStream: () => ({ close() {} }),
+      attachmentUrl: (id: string) => `/api/chat/attachments/${id}`,
+      question: async () => ({ outcome: "answered" }),
+    } as unknown as ChatApiClient;
+
+    // The seam under test is the hand-off itself: which owner is asked to
+    // hold which item. linkedom has no layout, so the owner's own pinned/
+    // unpinned decision cannot be exercised here — the e2e suite does that.
+    const { CoordinatedScrollOwner } = await import("./coordinated-scroll");
+    const handoffs: Array<{ scroller: string; preferredItemId: string | undefined }> = [];
+    const beforeMutation = CoordinatedScrollOwner.prototype.beforeMutation;
+    CoordinatedScrollOwner.prototype.beforeMutation = function (this: InstanceType<typeof CoordinatedScrollOwner>, preferredItemId?: string) {
+      handoffs.push({ scroller: this.scroller.id, preferredItemId });
+      beforeMutation.call(this, preferredItemId);
+    };
+
+    try {
+      const { initChat } = await import(`./ui.ts?question-anchor-ui-test=${Date.now()}`);
+      initChat(api);
+      const card = () => document.querySelector<HTMLElement>('[data-chat-item-id="question:q1"]');
+      await waitUntil(
+        () => card()?.querySelector("[data-question-custom-toggle]") != null,
+        () => document.querySelector("#chat-state")?.textContent ?? "no question card",
+      );
+      const toggle = card()!.querySelector<HTMLInputElement>("[data-question-custom-toggle]")!;
+      const editor = card()!.querySelector<HTMLElement>("[data-question-custom-editor]")!;
+      expect(editor.hidden).toBe(true);
+
+      // linkedom implements no `form` IDL attribute; the handler reads it.
+      Object.defineProperty(toggle, "form", { configurable: true, value: card()!.querySelector("form[data-question-form]") });
+      toggle.checked = true;
+      handoffs.length = 0;
+      toggle.dispatchEvent(new Event("change", { bubbles: true }));
+
+      expect(handoffs).toEqual([{ scroller: "chat-timeline", preferredItemId: "question:q1" }]);
+      expect(editor.hidden).toBe(false);
+
+      // No resolvable card: today's behavior, which is no hand-off at all.
+      const stray = document.createElement("form");
+      stray.setAttribute("data-question-form", "");
+      stray.innerHTML = '<fieldset data-question-panel="0"><input type="radio" data-question-custom-toggle></fieldset>';
+      document.querySelector<HTMLElement>("#chat-items")!.append(stray);
+      const strayToggle = stray.querySelector<HTMLInputElement>("[data-question-custom-toggle]")!;
+      Object.defineProperty(strayToggle, "form", { configurable: true, value: stray });
+      handoffs.length = 0;
+      strayToggle.dispatchEvent(new Event("change", { bubbles: true }));
+      expect(handoffs).toEqual([]);
+    } finally {
+      CoordinatedScrollOwner.prototype.beforeMutation = beforeMutation;
+      await Bun.sleep(20);
+      window.dispatchEvent(new Event("pagehide"));
+    }
+  });
+});
+
 afterAll(() => {
   for (const [key, value] of savedGlobals) Reflect.set(globalThis, key, value);
 });

@@ -30,13 +30,16 @@ function fixture() {
   };
   const owner = new CoordinatedScrollOwner(element, options);
   disposals.push(() => owner.dispose());
-  return { element, owner, anchor, frames, writes, options,
+  return { element, owner, anchor, frames, writes, options, document,
     grow: (height: number) => { extent = height; top = Math.min(top, extent - 300); },
     move: (value: number) => { top = value; },
     shift: (value: number) => { itemTop = value; },
     hide: () => { active = false; },
     show: () => { active = true; },
     event: (name: string, fields = {}) => { element.dispatchEvent(Object.assign(new window.Event(name, { bubbles: true }), fields) as unknown as Event); },
+    eventAt: (target: { dispatchEvent(event: Event): boolean }, name: string, fields = {}) => {
+      target.dispatchEvent(Object.assign(new window.Event(name, { bubbles: true }), fields) as unknown as Event);
+    },
     flush: () => { const pending = [...frames.values()]; frames.clear(); for (const callback of pending) callback(sequence); },
   };
 }
@@ -116,6 +119,21 @@ describe("coordinated scrolling", () => {
     expect(f.anchor.isPinned()).toBe(false);
     expect(f.frames.size).toBe(0);
     f.owner.latest(); f.event("keydown", { key: "PageUp" });
+    expect(f.anchor.isPinned()).toBe(false);
+    expect(f.frames.size).toBe(0);
+  });
+  test("a touch gesture inside a text control does not move the conversation", () => {
+    const f = fixture();
+    const input = f.document.createElement("input");
+    f.element.append(input);
+    f.owner.latest();
+    expect(f.anchor.isPinned()).toBe(true);
+    f.eventAt(input as unknown as { dispatchEvent(event: Event): boolean }, "touchstart", { touches: [{ clientY: 100 }] });
+    f.eventAt(input as unknown as { dispatchEvent(event: Event): boolean }, "touchmove", { touches: [{ clientY: 140 }] });
+    expect(f.anchor.isPinned()).toBe(true);
+    expect(f.frames.size).toBe(1);
+    f.event("touchstart", { touches: [{ clientY: 100 }] });
+    f.event("touchmove", { touches: [{ clientY: 140 }] });
     expect(f.anchor.isPinned()).toBe(false);
     expect(f.frames.size).toBe(0);
   });

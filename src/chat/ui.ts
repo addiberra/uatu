@@ -2881,7 +2881,7 @@ export function initChat(api = new ChatApiClient()): void {
    * the parent's against the parent — which is what keeps the parent
    * answerable while a child is open.
    */
-  const wireItemInteractions = (container: HTMLElement, sourceProjection: () => ChatProjection | null, stage: { renderer: TimelineRenderer; rerender: () => void }) => {
+  const wireItemInteractions = (container: HTMLElement, sourceProjection: () => ChatProjection | null, stage: { renderer: TimelineRenderer; rerender: () => void }, scroll: CoordinatedScrollOwner) => {
     // "Allow always" is confirmed one step deeper, on the same card, where
     // it shows the rule the agent will actually install. The stage is this
     // timeline's own (the drill-down keeps its own renderer), and nothing
@@ -2966,6 +2966,14 @@ export function initChat(api = new ChatApiClient()): void {
       const input = event.target as HTMLInputElement;
       const form = input.form;
       if (!form?.matches("form[data-question-form]")) return;
+      // Choosing "Type your own answer" reveals and focuses the editor, which
+      // resizes the card and pans the visible viewport under the keyboard. The
+      // correction that follows must hold the request being answered rather
+      // than whatever is topmost, or the question scrolls away as the user
+      // starts to answer it. This timeline's own owner: the same card can be
+      // shown in the parent transcript or in a subagent drill-down.
+      const itemId = input.closest<HTMLElement>("[data-chat-item-id]")?.dataset.chatItemId;
+      if (itemId !== undefined) scroll.beforeMutation(itemId);
       syncQuestionControl(input, true);
     });
     container.addEventListener("input", event => {
@@ -3278,10 +3286,10 @@ export function initChat(api = new ChatApiClient()): void {
   });
 
   wireExpansionToggle(items, parentScroll);
-  wireItemInteractions(items, () => projection, { renderer, rerender: () => scheduleRender(false) });
+  wireItemInteractions(items, () => projection, { renderer, rerender: () => scheduleRender(false) }, parentScroll);
   if (drilldownItems && drilldownTimeline) {
     wireExpansionToggle(drilldownItems, childScroll!);
-    wireItemInteractions(drilldownItems, () => child?.projection ?? null, { renderer: childRenderer, rerender: () => renderChild(false) });
+    wireItemInteractions(drilldownItems, () => child?.projection ?? null, { renderer: childRenderer, rerender: () => renderChild(false) }, childScroll!);
   }
 
   const closeCommandMenu = () => {

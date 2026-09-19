@@ -1,4 +1,4 @@
-import type { APIRequestContext, Page } from "@playwright/test";
+import type { APIRequestContext, Locator, Page } from "@playwright/test";
 
 import type { ConversationItem } from "../../src/chat/types";
 import { chooseChatModel, installClipboardMock, openChatConfiguration, openChatPanel, readClipboardMock } from "./chat-helpers";
@@ -33,6 +33,105 @@ const messages = (prefix: string, count: number, start = 0): ConversationItem[] 
   createdAt: start + index,
   text: `${prefix} message ${index} ${"content ".repeat(12)}`,
 }));
+
+/** The fake `visualViewport` the software-keyboard cases drive: a plain
+ *  EventTarget whose height and offset the test moves, so keyboard geometry —
+ *  including geometry no desktop browser will ever produce — can be fed to the
+ *  controller exactly as iOS reports it. Must run before `boot` navigates. */
+async function installFakeVisualViewport(page: Page): Promise<void> {
+  await page.addInitScript(() => {
+    const viewport = new EventTarget() as EventTarget & { height: number; offsetTop: number };
+    viewport.height = 844;
+    viewport.offsetTop = 0;
+    Object.defineProperty(window, "visualViewport", { configurable: true, value: viewport });
+  });
+}
+
+/** Move the fake viewport. `notify: false` is the transition this change is
+ *  about: the geometry is different and the platform announced nothing. */
+function setVisualViewport(page: Page, geometry: { height?: number; offsetTop?: number; notify?: boolean }): Promise<void> {
+  return page.evaluate(next => {
+    const viewport = window.visualViewport as VisualViewport & { height: number; offsetTop: number };
+    if (next.height !== undefined) viewport.height = next.height;
+    if (next.offsetTop !== undefined) viewport.offsetTop = next.offsetTop;
+    if (next.notify !== false) viewport.dispatchEvent(new Event("resize"));
+  }, geometry);
+}
+
+/** What is actually painted at an element's centre. `toBeVisible` answers from
+ *  boxes and CSS, which calls a control reachable while something floats over
+ *  it — the distinction these cases exist to make. */
+function paintedAtCentre(locator: Locator): Promise<{ reachable: boolean; painted: string }> {
+  return locator.evaluate(element => {
+    const box = element.getBoundingClientRect();
+    const painted = document.elementFromPoint(box.x + box.width / 2, box.y + box.height / 2);
+    return {
+      reachable: painted !== null && (painted === element || element.contains(painted)),
+      painted: painted ? painted.id || painted.className || painted.tagName.toLowerCase() : "nothing",
+    };
+  });
+}
+
+/** A touch conversation with all three pinned tracks populated and expanded.
+ *  It runs on the Claude-shaped fixture agent because that is the one that
+ *  declares `background-tasks`; the other two tracks are agent-neutral. */
+async function bootWithPinnedTracks(page: Page, request: APIRequestContext): Promise<string> {
+  await request.post("/__e2e/reset");
+  await control(request, { action: "agents", count: 2 });
+  const parent = await control(request, { action: "seed", agent: "claude", title: "Touch tracks", items: [
+    { id: "message:u1", type: "user_message", createdAt: 1, text: "work through the list" },
+  ] });
+  const child = await control(request, { action: "seed", agent: "claude", title: "Child transcript", child: true, items: [
+    { id: "part:child", type: "assistant_message", createdAt: 2, markdown: "child findings" },
+  ] });
+  const token = await request.get("/__e2e/terminal-token").then(response => response.json()) as { token: string };
+  await page.goto(`/?t=${encodeURIComponent(token.token)}`);
+  await expect(page.locator("html")).toHaveAttribute("data-ui-mode", "touch");
+  await page.locator("#touch-tab-chat").click();
+  await expect(page.locator("#chat-surface")).toBeVisible();
+  await page.locator("#chat-conversation-select").selectOption(parent.conversation.id);
+  await expect(page.locator("#chat-items")).toContainText("work through the list");
+
+  const id = parent.conversation.id as string;
+  // The pinned task list reads the newest `todowrite` snapshot, not the
+  // `task_progress` block the timeline renders.
+  await control(request, { action: "item", conversationId: id, item: {
+    id: "tool:todos", type: "tool", createdAt: 3, name: "todowrite", status: "completed",
+    input: JSON.stringify({ todos: [
+      { content: "Read the code", status: "completed" },
+      { content: "Fix the layout", status: "in_progress" },
+      { content: "Write the tests", status: "pending" },
+      { content: "Run the suite", status: "pending" },
+      { content: "Prepare the PR", status: "pending" },
+      { content: "Record the evidence", status: "pending" },
+    ] }),
+  } });
+  await control(request, { action: "item", conversationId: id, item: {
+    id: "tool:agent1", type: "tool", createdAt: 4, name: "task", status: "completed",
+    input: JSON.stringify({ description: "Review renderer", subagent_type: "explore", prompt: "go" }),
+    childConversationId: child.conversation.id,
+  } });
+  await control(request, { action: "item", conversationId: id, item: {
+    id: "task:b2f6", type: "background_task", createdAt: 5, taskId: "b2f6",
+    description: "Sleep then report", taskType: "local_bash", toolUseId: "tool:bg", status: "running",
+  } });
+
+  await expect(page.locator("#chat-task-list")).toBeVisible();
+  await expect(page.locator("#chat-subagents")).toBeVisible();
+  await expect(page.locator("#chat-background-tasks")).toBeVisible();
+  // Expanded, so "hidden" in these cases is about the keyboard rule rather
+  // than about a closed <details>. Set rather than tapped: a tap lands on a
+  // track row, and the point here is the geometry, not the summary's hit area.
+  await page.evaluate(() => {
+    for (const id of ["chat-task-list", "chat-subagents", "chat-background-tasks"]) {
+      document.querySelector<HTMLDetailsElement>(`#${id}`)!.open = true;
+    }
+  });
+  await expect(page.locator("#chat-task-list-items li")).toHaveCount(6);
+  await expect(page.locator("#chat-subagents-items li")).toHaveCount(1);
+  await expect(page.locator("#chat-background-tasks-items li")).toHaveCount(1);
+  return id;
+}
 
 test("keeps workspace identity above full-width conversation controls", async ({ page, request }) => {
   await boot(page, request);
@@ -260,12 +359,7 @@ test("a request the parent is waiting on stays reachable over the pushed screen"
 });
 
 test("software-keyboard geometry keeps the composer in the visual viewport", async ({ page, request }) => {
-  await page.addInitScript(() => {
-    const viewport = new EventTarget() as EventTarget & { height: number; offsetTop: number };
-    viewport.height = 844;
-    viewport.offsetTop = 0;
-    Object.defineProperty(window, "visualViewport", { configurable: true, value: viewport });
-  });
+  await installFakeVisualViewport(page);
   await boot(page, request);
   await openChatConfiguration(page);
   await expect(page.locator("#chat-configuration-done")).toBeFocused();
@@ -316,6 +410,152 @@ test("software-keyboard geometry keeps the composer in the visual viewport", asy
   });
   expect(geometry.bottom).toBeLessThanOrEqual(geometry.visualHeight + 1);
   expect(geometry.marginBottom).toBe("0px");
+});
+
+test("the surface recovers its height when the page returns with no viewport event", async ({ page, request }) => {
+  // iOS restores a backgrounded page with the keyboard already dismissed and
+  // fires no visual-viewport `resize`: the surface stayed the keyboard's size,
+  // with a dead strip below it, until the user opened and dismissed the
+  // keyboard again. The page-lifecycle transition is the only notification.
+  await installFakeVisualViewport(page);
+  await boot(page, request, { items: messages("loaded", 12) });
+  await page.locator("#chat-input").focus();
+  // Editing, so the bar contributes no inset: every `--chat-visual-height`
+  // below is the whole visual viewport, which is the tabBarInset = 0 assertion.
+  await expect(page.locator("html")).toHaveAttribute("data-chat-editing", "");
+
+  await setVisualViewport(page, { height: 460 });
+  await expect(page.locator("#chat-surface")).toHaveCSS("--chat-visual-height", "460px");
+  await expect(page.locator("html")).toHaveAttribute("data-chat-keyboard", "");
+
+  // The keyboard goes away while the app is in the background: the height is
+  // simply different, and nothing announced it. Read back in the same turn as
+  // the write, so the silence is observed rather than raced against.
+  const afterSilentChange = await page.evaluate(() => {
+    (window.visualViewport as VisualViewport & { height: number }).height = 844;
+    return getComputedStyle(document.querySelector("#chat-surface")!).getPropertyValue("--chat-visual-height").trim();
+  });
+  expect(afterSilentChange).toBe("460px");
+
+  await page.evaluate(() => document.dispatchEvent(new Event("visibilitychange")));
+  // The resync applies across a frame and a settle timer, so this is polled.
+  await expect(page.locator("#chat-surface")).toHaveCSS("--chat-visual-height", "844px");
+  await expect(page.locator("html")).not.toHaveAttribute("data-chat-keyboard", "");
+  await expect.poll(() => page.evaluate(() => {
+    const composer = document.querySelector("#chat-composer")!.getBoundingClientRect();
+    return Math.round(composer.bottom - window.visualViewport!.height);
+  })).toBeLessThanOrEqual(1);
+});
+
+test("a keyboard the platform pans for is still a keyboard", async ({ page, request }) => {
+  // The reported iPhone geometry: an 844 layout, a 508 visual viewport panned
+  // 266 up under the keyboard. Only 70px is occluded below the visible
+  // rectangle, so an occlusion-based predicate called the keyboard absent and
+  // left the pinned tracks holding their rows.
+  await installFakeVisualViewport(page);
+  await bootWithPinnedTracks(page, request);
+  await page.locator("#chat-input").focus();
+  // Editing, so the bar contributes no inset and `--chat-visual-height` below
+  // is the whole visual viewport — the tabBarInset = 0 assertion.
+  await expect(page.locator("html")).toHaveAttribute("data-chat-editing", "");
+
+  await setVisualViewport(page, { height: 508, offsetTop: 266 });
+  await expect(page.locator("html")).toHaveAttribute("data-chat-keyboard", "");
+  await expect(page.locator("#chat-surface")).toHaveCSS("--chat-visual-height", "508px");
+  await expect(page.locator("#chat-surface")).toHaveCSS("--chat-visual-top", "266px");
+  await expect(page.locator("#chat-task-list-items")).toBeHidden();
+  await expect(page.locator("#chat-subagents-items")).toBeHidden();
+  await expect(page.locator("#chat-background-tasks-items")).toBeHidden();
+  // The rows yield; what each track reports does not.
+  await expect(page.locator("#chat-task-list summary")).toBeVisible();
+  await expect(page.locator("#chat-subagents summary")).toBeVisible();
+  await expect(page.locator("#chat-background-tasks summary")).toBeVisible();
+});
+
+test("every pinned track expanded cannot displace the composer", async ({ page, request }) => {
+  // The column is fixed-height and the transcript is its only shrinkable
+  // child, so an unbounded track pushes the composer off the bottom edge
+  // rather than clipping itself.
+  await installFakeVisualViewport(page);
+  await bootWithPinnedTracks(page, request);
+  await page.locator("#chat-input").focus();
+  // Editing, so the bar contributes no inset and `--chat-visual-height` below
+  // is the whole visual viewport — the tabBarInset = 0 assertion.
+  await expect(page.locator("html")).toHaveAttribute("data-chat-editing", "");
+
+  await setVisualViewport(page, { height: 460 });
+  await expect(page.locator("#chat-surface")).toHaveCSS("--chat-visual-height", "460px");
+  await expect(page.locator("#chat-task-list-items")).toBeHidden();
+  await expect(page.locator("#chat-subagents-items")).toBeHidden();
+  await expect(page.locator("#chat-background-tasks-items")).toBeHidden();
+
+  const geometry = await page.evaluate(() => {
+    const composer = document.querySelector("#chat-composer")!.getBoundingClientRect();
+    const send = document.querySelector("#chat-send")!.getBoundingClientRect();
+    const timeline = document.querySelector("#chat-timeline")!.getBoundingClientRect();
+    return { composerBottom: composer.bottom, sendBottom: send.bottom, timelineHeight: timeline.height, visualHeight: window.visualViewport!.height };
+  });
+  expect(geometry.composerBottom).toBeLessThanOrEqual(geometry.visualHeight + 1);
+  expect(geometry.sendBottom).toBeLessThanOrEqual(geometry.visualHeight + 1);
+  // The transcript is what absorbed the reduction, and it still has room.
+  expect(geometry.timelineHeight).toBeGreaterThan(0);
+});
+
+test("the outstanding-request pill leaves an answer field and its controls reachable", async ({ page, request }) => {
+  // The pill floats over the transcript's lower right. A request at the end of
+  // a long conversation put its free-form field and its Answer/Reject controls
+  // exactly there, and `toBeVisible` says nothing about what is painted on top.
+  const question: ConversationItem = {
+    id: "question:clearance", type: "question", createdAt: 100, requestId: "clearance", status: "pending",
+    questions: [{
+      header: "Approach", prompt: "Which approach?", multiple: false, allowFreeForm: true,
+      options: [{ label: "Minimal", description: "Small change" }],
+    }],
+  };
+  await boot(page, request, { items: [...messages("loaded", 28), question] });
+  const card = page.locator('[data-chat-item-id="question:clearance"]');
+  const jump = page.locator("#chat-requests-jump");
+  await expect(card).toBeVisible();
+  await expect(jump).toBeVisible();
+
+  await card.getByRole("radio", { name: "Type your own answer" }).check();
+  const customInput = card.locator("[data-question-custom-input]");
+  await expect(customInput).toBeVisible();
+  await expect(customInput).toBeFocused();
+  // The answer field is a text control, so this is the same editing state —
+  // and the same tabBarInset = 0 geometry — as the keyboard cases.
+  await expect(page.locator("html")).toHaveAttribute("data-chat-editing", "");
+  await customInput.fill("Touch-friendly");
+
+  const primary = card.locator("[data-question-primary]");
+  const reject = card.locator("[data-question-reject]");
+  await expect(primary).toBeEnabled();
+  await expect(jump).toBeVisible();
+  expect(await paintedAtCentre(customInput)).toMatchObject({ reachable: true });
+  expect(await paintedAtCentre(primary)).toMatchObject({ reachable: true });
+  expect(await paintedAtCentre(reject)).toMatchObject({ reachable: true });
+
+  // Reachable at the centre is the floor, not the requirement: the pill is
+  // wide and the controls are narrow, so a centre that clears it says nothing
+  // about the rest. The spec asks for no overlap at all — and the Reject
+  // control clipped the pill's left edge before the timeline reserved the strip.
+  const overlaps = await page.evaluate(() => {
+    const rect = (selector: string) => document.querySelector(`[data-chat-item-id="question:clearance"] ${selector}`)!.getBoundingClientRect();
+    const pill = document.querySelector("#chat-requests-jump")!.getBoundingClientRect();
+    const hits = (other: DOMRect) => other.left < pill.right && other.right > pill.left && other.top < pill.bottom && other.bottom > pill.top;
+    return { field: hits(rect("[data-question-custom-input]")), answer: hits(rect("[data-question-primary]")), reject: hits(rect("[data-question-reject]")) };
+  });
+  expect(overlaps).toEqual({ field: false, answer: false, reject: false });
+
+  // And revealing the field held the conversation on the card being answered
+  // rather than on whatever was topmost.
+  const held = await card.evaluate(element => {
+    const timeline = document.querySelector("#chat-timeline")!.getBoundingClientRect();
+    const bounds = element.getBoundingClientRect();
+    return { cardTop: bounds.top, cardBottom: bounds.bottom, timelineTop: timeline.top, timelineBottom: timeline.bottom };
+  });
+  expect(held.cardTop).toBeGreaterThanOrEqual(held.timelineTop - 1);
+  expect(held.cardBottom).toBeLessThanOrEqual(held.timelineBottom + 1);
 });
 
 test("pinned streaming follows while unpinned streaming offers jump to latest", async ({ page, request }) => {

@@ -1,0 +1,35 @@
+## Why
+
+Three reported iPhone defects — #410, #382, #354 — all come down to the touch chat surface believing a visual viewport that is no longer true, or writing a scroll position the user did not ask for. All three reproduce in `v0.7.0`, so they are stable-release regressions and their notes stay visible `fix(chat)` entries.
+
+## What Changes
+
+- **Recover the viewport after the app returns from the background (#410).** `ChatViewportController` observes only visual-viewport resize/scroll, window resize, a `ResizeObserver` on composer plus surface, and UI-mode changes. iOS dismisses the software keyboard while backgrounding without firing a visual-viewport resize, so `--chat-visual-top` / `--chat-visual-height` — which pin the fixed touch chat surface — stay keyboard-sized on return until the keyboard is opened and closed again. Add a resync on `visibilitychange`, `pageshow`, and window `focus` that applies immediately, again on the next frame, and once more after a short settle delay. Secondary: `apply()` suppresses only the scroll correction while the page is hidden and never replays it, so the first visible frame keeps a stale reading position — record the suppressed correction and replay it once when the page is next visible.
+- **Detect the keyboard from the layout/visual height difference, not the occluded strip (#354, #382).** `chatViewportMetrics` derives `keyboardVisible` from `layoutHeight − visualTop − visualHeight`. Subtracting the iOS pan is correct for the tab-bar inset but wrong for keyboard detection: on an iPhone that pans the page (layout 844, keyboard 336, visual 508, pan 266, no tab bar) the occluded strip is 70px, below the 80px threshold, so `data-chat-keyboard` is dropped while the keyboard is up and the pinned tracks re-expand. Compare `layoutHeight − visualHeight` against the same threshold instead, and keep the occluded strip for the tab-bar inset it already serves.
+- **Include the background-task list in the pinned-track budget (#354).** `#chat-background-tasks-items` is in neither the `max-height` cap that bounds the task list and subagent list nor the keyboard-time hide rule, so an expanded background-task list pushes the composer out of the fixed chat column, whose only shrinkable child is the transcript area.
+- **Hand the scroll anchor to the question card before focusing a custom answer (#382).** Revealing and focusing a question's custom-answer editor performs no anchor hand-off, so the next coordinated-scroll flush repositions to the topmost visible item and the question the user is answering scrolls away. Capture the card's item id through the existing preferred-item seam before focus.
+- **Reserve timeline space under the outstanding-requests pill (#354).** The `N requests need your answer` pill floats over the bottom-right of the transcript area and the timeline reserves no space for it, so it covers the custom-answer input and the Answer/Cancel controls of a request at the end of the conversation. Pad the timeline (and its scroll padding) while the pill is shown.
+- **Stop caret movement from scrolling the conversation (#354).** Visual-viewport `scroll` is bound straight to `apply()` with no frame coalescing and no unchanged-value guard, so each caret-tracking pan writes CSS variables and requests a scroll correction; the surface height it writes is then observed by the controller's own `ResizeObserver`, re-entering `apply()`. Separately, coordinated scroll treats a touch inside a text control as a scroll gesture and unpins, while its keyboard handler already excludes text controls. Coalesce into one frame, skip unchanged writes, do not request a correction while editing when only the pan offset moved, and exclude text controls from the touch handlers as the key handler does.
+- Out of scope: hiding the requests pill while its target card is already on screen (noted as a follow-up), the same visibility blind spot in `src/shell/desktop-viewport.ts` and the terminal panel's viewport sizer, and anything under the keyboard tab-bar rules being rewritten by draft PR #358.
+
+## Capabilities
+
+### New Capabilities
+
+_None._
+
+### Modified Capabilities
+
+- `opencode-chat`: "Chat adapts to the desktop split, touch, and software-keyboard viewports" gains the requirement that the touch surface re-measures when the page returns to the foreground, that keyboard detection survives a panned viewport, that the composer stays reachable with every pinned track populated and expanded, and that caret movement inside a text control does not move the conversation. "Users can resolve agent interaction requests in context" gains the requirement that a request's own answer controls stay unobstructed and that the surface holds position on the request being answered.
+
+`touch-navigation` is unchanged: the tab bar, its keyboard rules, and desktop-mode geometry are all out of scope here, and the behavior being corrected is the chat surface's own.
+
+## Impact
+
+- `src/chat/viewport.ts` — foreground resync, pending-correction replay, frame coalescing, unchanged-value guard, editing-time pan suppression, and the `chatViewportMetrics` keyboard predicate.
+- `src/chat/coordinated-scroll.ts` — `touchStart` / `touchMove` gain the text-control exclusion `keyDown` already applies.
+- `src/chat/ui.ts` — the question `change` handler captures the card's anchor before `syncQuestionControl(input, true)` focuses the custom editor.
+- `src/styles.css` — the background-task list joins the pinned-track cap and the keyboard hide rule; the timeline reserves space while the requests pill is shown.
+- `src/chat/viewport.test.ts`, `src/chat/coordinated-scroll.test.ts`, `tests/e2e/chat-touch.e2e.ts` — new cases; the e2e file already fakes `visualViewport`.
+- No server, protocol, or stored-state change. iOS behavior is the real subject, so manual iPhone Safari and installed-PWA verification is part of acceptance.
+- Release notes: all three issues reproduce in `v0.7.0`, so the PR keeps visible `fix(chat)` entries and carries no Release Please override.

@@ -6579,6 +6579,17 @@ html[data-ui-mode="desktop"][data-notification-chat] .chat-expand-strip {
   bottom: 3.5rem;
 }
 
+/* The pill floats over the transcript's lower right, so a request sitting at
+   the end of the conversation had its answer field and its Answer/Cancel
+   controls underneath it. The timeline reserves the strip instead of the pill
+   moving into the flow — in the touch layout there is no room to push the
+   composer down. The scroll padding matters as much as the padding: scrolling
+   a request into view must not park it under the pill either. */
+.chat-transcript-area:has(> #chat-requests-jump:not([hidden])) .chat-timeline {
+  padding-bottom: 3.5rem;
+  scroll-padding-bottom: 3.5rem;
+}
+
 .chat-composer {
   position: relative;
   flex: 0 0 auto;
@@ -8893,7 +8904,8 @@ html[data-ui-mode="touch"] .chat-task-list {
 }
 
 #chat-task-list-items,
-#chat-subagents-items {
+#chat-subagents-items,
+#chat-background-tasks-items {
   max-height: 8.5rem;
   overflow-y: auto;
   overscroll-behavior: contain;
@@ -8901,6 +8913,7 @@ html[data-ui-mode="touch"] .chat-task-list {
 
 html[data-chat-keyboard] #chat-task-list-items,
 html[data-chat-keyboard] #chat-subagents-items,
+html[data-chat-keyboard] #chat-background-tasks-items,
 html[data-chat-keyboard] .chat-reverted-items,
 html[data-chat-keyboard] .chat-queue {
   display: none;

@@ -157,15 +157,23 @@ export class CoordinatedScrollOwner {
     }
     return false;
   }
+  /** A caret placement or selection drag inside a text control is not a request
+   * to move the conversation. */
+  private inTextControl(event: Event): boolean {
+    const target = event.target as Element | null;
+    return Boolean(target?.closest?.("input, textarea, select, [contenteditable=true]"));
+  }
   private wheel = (event: WheelEvent): void => { if (event.deltaY < 0 && this.ownsInput(event)) this.pause(); };
-  private touchStart = (event: TouchEvent): void => { this.touchY = this.ownsInput(event) ? event.touches[0]?.clientY ?? null : null; };
+  private touchStart = (event: TouchEvent): void => {
+    this.touchY = this.ownsInput(event) && !this.inTextControl(event) ? event.touches[0]?.clientY ?? null : null;
+  };
   private touchMove = (event: TouchEvent): void => {
     const y = event.touches[0]?.clientY;
-    if (y !== undefined && this.touchY !== null && y > this.touchY && this.ownsInput(event)) this.pause();
+    if (y !== undefined && this.touchY !== null && y > this.touchY && this.ownsInput(event) && !this.inTextControl(event)) this.pause();
     this.touchY = y ?? null;
   };
   private keyDown = (event: KeyboardEvent): void => {
-    if (!this.ownsInput(event) || (event.target as Element).closest("input, textarea, select, [contenteditable=true]")) return;
+    if (!this.ownsInput(event) || this.inTextControl(event)) return;
     if (["ArrowUp", "PageUp", "Home"].includes(event.key) || (event.key === " " && event.shiftKey)) this.pause();
   };
 
