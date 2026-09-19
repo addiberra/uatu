@@ -237,6 +237,17 @@ export class ChatAdapter {
   private readonly questionRefreshes = new Set<string>();
   private readonly questionCreatedAt = new Map<string, number>();
   private readonly permissionCreatedAt = new Map<string, number>();
+  // What each pending question/permission was announced as, by item id: the
+  // owning conversation and the launching conversation it appeared under. A
+  // removal has no item to read these from, and the conversation reporting it
+  // may be the parent — a subagent's request is answered from the parent's
+  // transcript, or retired by a reconciliation — so the resolution is built
+  // from this record, with no provider lookup that could fail and drop it.
+  // The tick orders an announcement against an authoritative pending read: a
+  // request announced after the read began is pending now whatever the older
+  // snapshot lists.
+  private interactionClock = 0;
+  private readonly announced = new Map<string, { owner: string; destination: string; tick: number }>();
   private readonly sessionParents = new Map<string, string | null>();
   private readonly inventorySessions = new Map<string, InventorySessionMetadata>();
   private readonly inventory = new ConversationInventoryBroadcaster();
@@ -530,6 +541,7 @@ export class ChatAdapter {
     // rewrite the published set — that would erase live questions.
     let questionsReconciled = false;
     try {
+      const questionTick = this.interactionClock;
       const pendingNow = await this.pendingQuestions(id);
       for (const pending of pendingNow) {
         if (items.some(item => item.id === pending.id)) continue;
@@ -544,8 +556,12 @@ export class ChatAdapter {
         const projection = this.projection(id);
         for (const existing of projection.items()) {
           if (existing.type !== "question" || existing.status !== "pending" || live.has(existing.id)) continue;
+          // Announced after the read began: the snapshot predates it, so it
+          // stays on the timeline and its notification stays pending.
+          if ((this.announced.get(existing.id)?.tick ?? 0) > questionTick) { if (!items.some(item => item.id === existing.id)) items.push(existing); continue; }
           projection.apply({ kind: "remove", itemId: existing.id });
           this.questionCreatedAt.delete(existing.id);
+          this.resolveAnnounced(existing.id);
         }
       }
       if (pendingNow.length > 0) {
@@ -576,6 +592,7 @@ export class ChatAdapter {
     // answerable. Ids match the event path's, so a request that also arrives
     // live converges on one entry instead of rendering twice.
     try {
+      const permissionTick = this.interactionClock;
       const pendingNow = await this.pendingPermissions(id);
       for (const pending of pendingNow) {
         if (items.some(item => item.id === pending.id)) continue;
@@ -593,8 +610,10 @@ export class ChatAdapter {
         const projection = this.projection(id);
         for (const existing of projection.items()) {
           if (existing.type !== "permission" || existing.status !== "pending" || live.has(existing.id)) continue;
+          if ((this.announced.get(existing.id)?.tick ?? 0) > permissionTick) { if (!items.some(item => item.id === existing.id)) items.push(existing); continue; }
           projection.apply({ kind: "remove", itemId: existing.id });
           this.permissionCreatedAt.delete(existing.id);
+          this.resolveAnnounced(existing.id);
         }
       }
     } catch {
@@ -701,6 +720,10 @@ export class ChatAdapter {
     this.activityMayHaveChanged();
   }
 
+  // Also reached when a timeline is rewritten (undo, redo, revert, restore).
+  // Announcement records outlive that: the request is still pending for the
+  // agent and the hub, and only an explicit resolution — or the
+  // conversation's loss below — settles what was announced.
   private forgetInteractions(conversationId: string): void {
     this.pendingInteractions.delete(conversationId);
     this.activityMayHaveChanged();
@@ -711,6 +734,10 @@ export class ChatAdapter {
   // nothing else would ever settle its adapter-level records. If it returns,
   // its activity is re-derived from new events.
   private forgetActivity(conversationId: string): void {
+    // Owned by it, or announced under it: a child's request appears in its
+    // launching conversation, and that conversation's loss settles it too —
+    // no child event is guaranteed to follow.
+    for (const [itemId, record] of this.announced) if (record.owner === conversationId || record.destination === conversationId) this.resolveAnnounced(itemId);
     for (const notification of this.notifications.pendingSnapshot()) {
       try {
         if (JSON.parse(notification.sourceId)[0] !== conversationId || notification.kind === "turn-completed") continue;
@@ -2424,6 +2451,27 @@ export class ChatAdapter {
     })();
   }
 
+  /**
+   * Resolves a request exactly as it was announced — same owner, same
+   * launching conversation — from the record kept at announcement, so a
+   * removal reported by the parent, or by a reconciliation that retires the
+   * card, needs no provider lookup. False when nothing was announced under
+   * this id: there is then nothing pending to resolve.
+   */
+  private resolveAnnounced(itemId: string): boolean {
+    const match = /^(question|permission):(.+)$/.exec(itemId);
+    const known = match ? this.announced.get(itemId) : undefined;
+    if (!match || !known) return false;
+    this.announced.delete(itemId);
+    this.notifications.observe({
+      type: "interaction", origin: "live", conversationId: known.destination,
+      sourceId: JSON.stringify([known.owner, match[2]]),
+      kind: match[1] === "question" ? "question-pending" : "permission-pending",
+      pending: false, createdAt: Date.now(),
+    });
+    return true;
+  }
+
   private async observeNotifications(event: NormalizedProviderEvent): Promise<void> {
     if (!event.conversationId) return;
     if (!event.notificationTurns?.length && !event.updates.some(update =>
@@ -2444,15 +2492,21 @@ export class ChatAdapter {
     for (const update of event.updates) {
       if (update.kind === "upsert" && (update.item.type === "question" || update.item.type === "permission")) {
         const item = update.item;
+        const owner = item.conversationId ?? session.id;
+        if (item.status !== "pending" && this.resolveAnnounced(item.id)) continue;
+        if (item.status === "pending") this.announced.set(item.id, { owner, destination: destination.id, tick: ++this.interactionClock });
         this.notifications.observe({
           type: "interaction", origin: "live", conversationId: destination.id,
-          sourceId: JSON.stringify([item.conversationId ?? session.id, item.requestId]),
+          sourceId: JSON.stringify([owner, item.requestId]),
           kind: item.type === "question" ? "question-pending" : "permission-pending",
           pending: item.status === "pending", createdAt: item.createdAt,
         });
       } else if (update.kind === "remove") {
         const match = /^(question|permission):(.+)$/.exec(update.itemId);
-        if (match) this.notifications.observe({
+        if (!match || this.resolveAnnounced(update.itemId)) continue;
+        // Never announced here — nothing is pending under it, but a resolution
+        // after a lost pending frame must still reach the hub.
+        this.notifications.observe({
           type: "interaction", origin: "live", conversationId: destination.id,
           sourceId: JSON.stringify([session.id, match[2]]),
           kind: match[1] === "question" ? "question-pending" : "permission-pending",
