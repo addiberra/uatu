@@ -12,7 +12,9 @@ import { Buffer } from "node:buffer";
 
 import { escapeHtml } from "../shared/html";
 import { PWA_ICON_VERSION } from "../pwa/icons";
-import { LOCAL_CREDENTIAL_ASSIGNMENT_WARNING, SCP_REMOTE_PATTERN } from "./credential-context";
+import { worktreeDialogScript } from "../shell/worktree-dialog";
+import { createDashboardGroups, dashboardGroupsStyle } from "./dashboard-groups";
+import { LOCAL_CREDENTIAL_ASSIGNMENT_WARNING, SCP_REMOTE_PATTERN } from "./credential-presentation";
 
 // Inline the brand SVG (the file ships a fixed navy fill; the dark-scheme
 // retint below only reaches presentation attributes when the markup is
@@ -48,6 +50,10 @@ const SHARED_STYLE = `
     --surface-subtle: light-dark(#f6f8fa, #161b22);
     --surface-muted: light-dark(#f3f5f7, #161b22);
     --success: light-dark(#2da44e, #3fb950);
+    /* Matches src/styles.css: the worktree confirmation is rendered by the
+       same inlined module on both surfaces, so both define its tint. */
+    --success-soft: light-dark(#dafbe1, #12261e);
+    --success-strong: light-dark(#1a7f37, #3fb950);
     --danger: light-dark(#cf222e, #f85149);
     --attention: light-dark(#bf8700, #d29922);
     --pane-header-bg: light-dark(#fbfcfd, #161b22);
@@ -68,10 +74,15 @@ const SHARED_STYLE = `
      --titlebar-inset on <html>; pad below it so nothing renders under the
      native chrome. Plain browsers see the 0px default. */
   main { position: relative; max-width: 680px; margin: 0 auto; padding: calc(2.5rem + var(--titlebar-inset, 0px)) 1.25rem 4rem; }
-  .hub-nav { display: flex; align-items: center; justify-content: center; gap: 0.35rem; margin: -1.25rem 0 1.5rem; }
+  .hub-nav { display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 0.35rem; margin: -1.25rem 0 1.5rem; }
   .hub-nav a { padding: 0.3rem 0.65rem; border-radius: 0.375rem; color: var(--text-subtle); font-size: 0.78rem; font-weight: 600; }
   .hub-nav a:hover { background: var(--surface-muted); color: var(--text-strong); text-decoration: none; }
   .hub-nav a[aria-current="page"] { background: var(--accent-soft); color: var(--accent); }
+  /* Notification enrollment mounts another action at runtime. Wrap rather
+     than widening the page (and shifting fixed dialogs off phone screens). */
+  @media (max-width: 600px) {
+    .hub-nav a, .hub-nav button { display: inline-flex; align-items: center; justify-content: center; min-height: 44px; }
+  }
   .sign-out { margin: 0; }
   .sign-out button {
     background: transparent;
@@ -164,6 +175,8 @@ const SHARED_STYLE = `
   }
   .row-detail { color: var(--text-subtle); font-size: 0.72rem; }
   .row-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 0.4rem; }
+  .row[data-workspace] .row-title a, .row[data-workspace] .row-title strong { white-space: normal; overflow-wrap: anywhere; overflow: visible; }
+  @media(max-width:600px) { .row[data-workspace] { flex-wrap: wrap; } .row[data-workspace] .row-main { flex-basis: calc(100% - 2rem); } .row[data-workspace] .row-actions { flex: 1 0 100%; } }
 
   /* Indicator dot — mirrors .indicator-dot/.connection-state. */
   .indicator-dot {
@@ -425,6 +438,11 @@ function authenticatedChrome(current: AuthenticatedPage): string {
 import { mountNotifications } from "/hub-assets/notifications.js";
 mountNotifications({ apiUrl: "/api/hub/notifications", stateUrl: "/api/hub/state", workerUrl: "/push-worker.js", hosts: ".hub-nav" });
 </script>`;
+}
+
+/** Shared server-rendered Hub shell; callers supply trusted presentation markup. */
+export function hubPresentationPage(title: string, body: string, current: AuthenticatedPage = "dashboard"): string {
+  return page(title, authenticatedChrome(current) + body);
 }
 
 export function loginPage(options: { error?: string; next?: string } = {}): string {
@@ -691,6 +709,11 @@ function authenticatedPage(pageName: AuthenticatedPage, authenticatedUser: strin
 ${content}
 </div>
 <script>
+${worktreeDialogScript}
+const renderDashboardGroups = (${createDashboardGroups.toString()})();
+const dashboardGroupsStyle = document.createElement("style");
+dashboardGroupsStyle.textContent = ${JSON.stringify(dashboardGroupsStyle)};
+document.head.append(dashboardGroupsStyle);
 const pageMode = document.querySelector("[data-hub-page]").dataset.hubPage;
 const errorEl = document.getElementById("action-error");
 const sharedUidDismissalKey = ${sharedUidDismissalKey};
@@ -776,6 +799,7 @@ function row({ title, href, titleClick, path, detail, live, chip, chipWarn, butt
   const actions = el("div", "row-actions");
   for (const spec of specs) {
     const action = el("button", spec.className || null, spec.label);
+    if (spec.icon === "fork") action.innerHTML = worktreeForkIcon;
     if (spec.ariaLabel) action.setAttribute("aria-label", spec.ariaLabel);
     action.onclick = () => spec.onClick(action);
     actions.appendChild(action);
@@ -1022,7 +1046,9 @@ function workspaceAssignmentForm(actionError) {
   form.appendChild(el("h4", null, "Assign workspace credentials"));
   const workspaceLabel = el("label", null, "Workspace");
   const workspace = document.createElement("select");
-  for (const item of dashboardWorkspaces) workspace.appendChild(new Option((item.displayName || item.id) + " · " + item.path, item.id));
+  // A linked worktree inherits its parent's credentials live and holds no
+  // assignments of its own, so it is not offered here.
+  for (const item of dashboardWorkspaces.filter(item => !item.parentId)) workspace.appendChild(new Option((item.displayName || item.id) + " · " + item.path, item.id));
   workspaceLabel.appendChild(workspace);
   const authenticationLabel = el("label", null, "🔑 Authentication");
   const authentication = document.createElement("select");
@@ -1324,10 +1350,13 @@ async function prepareWorkspaceResume(workspace, errorTarget) {
     setLocalError(errorTarget, error.message);
     return false;
   }
-  const locked = lockedWorkspaceCredentials(workspace.id);
+  const locked = lockedWorkspaceCredentials(workspacePolicyOwner(workspace).id);
   return !locked.length || await unlockForWorkspace(workspace, locked);
 }
-function workspaceLabel(w) { return w.displayName || w.id; }
+function workspaceLabel(w) { return (w.parentId && w.branch) || w.displayName || w.id; }
+function workspacePolicyOwner(workspace) {
+  return dashboardWorkspaces.find(entry => entry.id === (workspace.parentId || workspace.id)) || workspace;
+}
 function workspaceById(id) {
   return dashboardWorkspaces.find(entry => entry.id === id)
     || { id, displayName: id, credentialAssignments: { authentication: [], signing: [] } };
@@ -1338,7 +1367,7 @@ function workspaceById(id) {
 // directory browser's Start rows. On success the button STAYS busy — the
 // overlay owns the screen until the session page replaces us.
 async function startRegisteredWorkspace(w, button, errorTarget) {
-  if (!hasCredentialAssignments(w.credentialAssignments) && !confirm(
+  if (!hasCredentialAssignments(workspacePolicyOwner(w).credentialAssignments) && !confirm(
     'No credentials are assigned to "' + workspaceLabel(w) + '". Git authentication and commit signing may be unavailable, but the workspace can still start. Continue?'
   )) return;
   const target = errorTarget || actionErrorFor(button);
@@ -1568,14 +1597,91 @@ async function loadBrowser({ fallbackToParent = false } = {}) {
   renderInto(document.getElementById("browser"), rows, "No subfolders here.");
   return true;
 }
+// The dashboard has no session channel. While a worktree dialog is open,
+// its source owns the page's one brokered stream (never one per repository).
+// Reconnect with the same cursor-free subscription; every attach brings fresh
+// invalidation. The dialog alone decides whether its view is idle.
+function initDashboardWorktreeLive() {
+  let active = null;
+  let stream = null;
+  let retryTimer = null;
+  let failures = 0;
+  let pageHidden = false;
+  const suspend = () => {
+    if (retryTimer !== null) clearTimeout(retryTimer);
+    retryTimer = null;
+    if (stream) stream.close();
+    stream = null;
+  };
+  const resume = () => {
+    if (!active || active.signal.aborted || pageHidden || document.visibilityState === "hidden" || retryTimer !== null) return;
+    if (stream?.readyState === 2) { stream.close(); stream = null; }
+    if (stream) return;
+    const source = active.source;
+    const current = new EventSource("/api/hub/live?ws=" + encodeURIComponent(source) + "&subs=" + encodeURIComponent(JSON.stringify([{ topic: "worktrees" }])));
+    stream = current;
+    current.addEventListener("open", () => { if (stream === current) failures = 0; });
+    current.addEventListener("error", () => {
+      if (stream !== current) return;
+      // Match live-channel's capped exponential retry. Close first so the
+      // browser's native retry cannot race ours, including terminal CLOSED.
+      current.close();
+      stream = null;
+      if (!active || active.signal.aborted || pageHidden || document.visibilityState === "hidden") return;
+      failures = Math.min(failures + 1, 5);
+      retryTimer = setTimeout(() => { retryTimer = null; resume(); }, Math.min(1000 * 2 ** (failures - 1), 15000));
+    });
+    current.addEventListener("live", event => {
+      if (stream !== current || active?.source !== source) return;
+      let envelope;
+      try { envelope = JSON.parse(event.data); } catch { return; }
+      if (envelope?.ws === source && envelope.topic === "worktrees" && envelope.event?.kind === "data") {
+        window.dispatchEvent(new Event("uatu:worktrees-invalidated"));
+      }
+    });
+  };
+  window.addEventListener("uatu:worktree-dialog-opened", event => {
+    suspend();
+    const scope = event.detail;
+    active = scope;
+    failures = 0;
+    scope.signal.addEventListener("abort", () => {
+      if (active !== scope) return;
+      active = null;
+      suspend();
+    }, { once: true });
+    resume();
+  });
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") { suspend(); return; }
+    // Standalone iOS can wake after pagehide without emitting pageshow.
+    // Visible is itself a return signal, even if no dialog was open before it.
+    pageHidden = false;
+    resume();
+  });
+  window.addEventListener("pagehide", () => { pageHidden = true; suspend(); });
+  window.addEventListener("pageshow", () => { pageHidden = false; resume(); });
+  window.addEventListener("online", resume);
+}
 async function refresh(force) {
   if (!force && uiBusy > 0) return;
+  if (!force && document.querySelector('dialog[open], [role="menu"][aria-label="Create worktree"]')) return;
   let state;
   try {
     const stateResponse = await fetch("/api/hub/state");
     if (!stateResponse.ok) return;
     state = await stateResponse.json();
   } catch { return; }
+
+  // Capture at render time, not before the request: the user may have moved
+  // focus while it was in flight. Rebuilt rows are matched by owner + action.
+  const focused = document.activeElement;
+  const dashboardFocus = focused instanceof HTMLElement && focused.closest('#sessions, #workspaces');
+  const focusOwner = dashboardFocus && focused.closest('[data-workspace], [data-disclosure], [data-repository]');
+  const ownerAttribute = focusOwner && ['data-workspace', 'data-disclosure', 'data-repository'].find(key => focusOwner.hasAttribute(key));
+  const ownerValue = ownerAttribute && focusOwner.getAttribute(ownerAttribute);
+  const focusLabel = dashboardFocus && (focused.getAttribute('aria-label') || focused.textContent);
+  const focusTag = dashboardFocus && focused.tagName;
 
   document.getElementById("hub-version").textContent = state.version || "";
   dashboardWorkspaces = state.workspaces || [];
@@ -1653,6 +1759,113 @@ async function refresh(force) {
     rows,
     "No stopped workspaces — use Add workspace to configure one.",
   );
+  if (state.worktreeApi) {
+    const nodes = new Map();
+    for (const [container, entries] of [["sessions", running], ["workspaces", stopped]]) {
+      const rendered = document.getElementById(container).querySelectorAll(".row");
+      entries.forEach((w, index) => {
+        const node = rendered[index]; if (!node) return;
+        nodes.set(w.id, node); node.dataset.workspace = w.id;
+        // The JSON family's presence AND value: state.worktreeApi is both
+        // the capability signal and the family's base path. Every worktree
+        // view is rendered here by the same client module the in-workspace
+        // picker embeds; nothing navigates to a server-rendered page.
+        const parent = dashboardWorkspaces.find(entry => entry.id === (w.parentId || w.id)) || w;
+        const target = {
+          api: state.worktreeApi,
+          source: {
+            id: parent.id,
+            name: workspaceLabel(parent),
+            authentication: ((parent.credentialAssignments || {}).authentication || []).join(", ") || undefined,
+            signing: ((parent.credentialAssignments || {}).signing || []).join(", ") || undefined,
+          },
+        };
+        const actions = node.querySelector(".row-actions");
+        // Bug 2: a running workspace (main checkout or worktree child) must
+        // offer Open — the same openSession() path the folder browser's
+        // running rows use (around L1558) — not just an implicit
+        // title-link click. dashboard-groups.ts also stopped destroying the
+        // main row's own title link (which carried this same navigation),
+        // but the explicit button is what the spec (hub-dashboard spec:
+        // 'a running workspace SHALL offer Open') and the folder browser's
+        // own precedent both call for, and it is unambiguous for touch and
+        // keyboard users.
+        if (w.running) {
+          const open = el("button", null, "Open");
+          open.setAttribute("aria-label", "Open " + workspaceLabel(w));
+          open.onclick = () => openSession(w.id);
+          actions.prepend(open);
+        }
+        if (!w.parentId && w.branch) node.querySelector(".row-title").append(el("span", "chip", w.branch));
+        const action = (label, view) => {
+          const button = el("button", null, label);
+          button.onclick = () => openWorktreeDialog({ ...target, view, id: w.id }, button);
+          actions.append(button); return button;
+        };
+        // F9: no per-repository Configure button. It only ever navigated to
+        // the Hub's own Settings page, which the site navigation already
+        // reaches; parent credentials and shared policy are managed there,
+        // for every repository, as they always were.
+        const forget = actions.querySelector('[aria-label^="Remove "]');
+        // Capability is Hub-wide, not proof that this row is a repository.
+        // Docs folders must keep the ordinary unregister path, which needs
+        // no Git inventory. Repository families retain the guarded dialog.
+        if (forget && (w.parentId || w.createWorktree === true || dashboardWorkspaces.some(child => child.parentId === w.id))) {
+          forget.textContent = "Remove from Uatu";
+          forget.setAttribute("aria-label", "Remove " + workspaceLabel(w) + " from Uatu");
+          forget.onclick = () => openWorktreeDialog({ ...target, view: "forget", id: w.id }, forget);
+        }
+        if (w.availability) {
+          const warning = el("p", "action-error", (w.availability === "missing" ? "Missing checkout" : "Identity conflict — path replaced") + ". Restore the original checkout externally, then retry. Nothing will be recreated.");
+          warning.setAttribute("role", "alert");
+          // W3: appended to .row directly, the warning took width as a flex
+          // item in .row's row-direction flexbox and squeezed .row-main
+          // (min-width:0) to min-content, breaking the title/path down to
+          // one character per line. .row-main is itself a column flexbox,
+          // so a paragraph appended there takes the full width for free and
+          // the title/path column keeps its size.
+          node.querySelector(".row-main").append(warning);
+          const start = actions.querySelector('[aria-label^="Start "]'); if (start) start.remove();
+          const openAction = actions.querySelector('[aria-label^="Open "]'); if (openAction) openAction.remove();
+          // Drive-by: the selector below used to be "a.row-title" (an <a>
+          // carrying its own "row-title" class), which never matches —
+          // row()'s <a> is unclassed, nested inside a *div* with that
+          // class (see this file's own SHARED_STYLE selectors, e.g.
+          // '.row-title a, .row-title strong'). A missing/replaced
+          // checkout's title link was therefore never actually defused;
+          // fix the selector so it is.
+          const title = node.querySelector(".row-title a"); if (title) title.removeAttribute("href");
+          const retry = el("button", null, "Retry refresh"); retry.onclick = () => refresh(true); actions.append(retry);
+        }
+        if (w.parentId) {
+          // The same muted provenance rule the picker and the register list
+          // use (worktreeProvenanceLabel, from the inlined dialog module):
+          // a tree Uatu did not create reads "External worktree", never
+          // "origin unknown".
+          const provenance = el("span", "worktree-provenance", worktreeProvenanceLabel(w));
+          provenance.style.cssText = "font-size:11px;font-weight:400;color:var(--text-subtle);overflow-wrap:anywhere";
+          node.querySelector(".row-title").append(provenance);
+          // F8: no inset. The Active-groups repository heading and the
+          // main checkout's own row already place a child, exactly as
+          // the picker's group header does since F4, so every row in a
+          // group shares one left edge and nothing is drawn as a tree.
+          node.dataset.parent = w.parentId;
+          const rename = actions.querySelector('[aria-label^="Rename workspace"]'); if (rename) rename.remove();
+          if (w.ownership === "uatu" && !w.availability) action("Delete worktree", "delete");
+        } else if (w.createWorktree === true) {
+          const fork = el("button"); fork.setAttribute("aria-label", "Add worktree to " + workspaceLabel(w)); fork.setAttribute("aria-haspopup", "menu");
+          fork.innerHTML = worktreeForkIcon;
+          fork.onclick = () => openWorktreeFork(target, fork); actions.append(fork);
+        }
+      });
+    }
+    renderDashboardGroups(dashboardWorkspaces, nodes);
+  }
+  if (ownerAttribute && !focused.isConnected && document.activeElement === document.body && !document.querySelector('dialog[open], [role="menu"]')) {
+    const owner = Array.from(document.querySelectorAll('[' + ownerAttribute + ']')).find(node => node.getAttribute(ownerAttribute) === ownerValue);
+    const replacement = owner && Array.from(owner.querySelectorAll('button, a, summary')).find(node => node.tagName === focusTag && (focusTag === 'SUMMARY' || (node.getAttribute('aria-label') || node.textContent) === focusLabel));
+    if (replacement) replacement.focus({ preventScroll: true });
+  }
 }
 // The device-session list: every active session of the signed-in user,
 // with per-session revocation. Revoking the current session IS sign-out and
@@ -2525,6 +2738,7 @@ function initSettingsPage() {
   loadTools();
 }
 if (pageMode === "dashboard") {
+  initDashboardWorktreeLive();
   window.addEventListener("pageshow", event => {
     if (!event.persisted) return;
     for (const overlay of document.querySelectorAll(".nav-overlay")) overlay.remove();
@@ -2533,6 +2747,7 @@ if (pageMode === "dashboard") {
   });
   loadDashboardCredentials().catch(() => {});
   refresh();
+  window.addEventListener("uatu:worktrees-changed", () => refresh(true));
   setInterval(refresh, 5000);
 } else if (pageMode === "settings") {
   initSettingsPage();

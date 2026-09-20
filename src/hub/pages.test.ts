@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { parseHTML } from "linkedom";
 
 import { LOCAL_CREDENTIAL_ASSIGNMENT_WARNING, parseCloneRemote } from "./credential-context";
+import { createDashboardGroups, dashboardGroupsStyle } from "./dashboard-groups";
 import { clonePage, dashboardPage, loginPage, settingsPage, stoppedSessionPage } from "./pages";
 
 const htmlFor = {
@@ -10,15 +11,180 @@ const htmlFor = {
   settings: () => settingsPage("alice"),
 };
 
+test("authenticated navigation wraps dynamic notifications without losing labelled actions", () => {
+  for (const render of Object.values(htmlFor)) {
+    const html = render();
+    expect(html).toMatch(/\.hub-nav \{[^}]*flex-wrap: wrap/);
+    expect(html).toContain('.hub-nav a, .hub-nav button { display: inline-flex; align-items: center; justify-content: center; min-height: 44px; }');
+    expect(html).toContain('hosts: ".hub-nav"');
+    const nav = parseHTML(html).document.querySelector(".hub-nav")!;
+    expect([...nav.querySelectorAll("a, button")].map(node => node.textContent)).toEqual(["Dashboard", "Add workspace", "Settings", "Sign out"]);
+  }
+});
+
 function documentFor(page: keyof typeof htmlFor) {
   return parseHTML(htmlFor[page]()).document;
 }
+
+test("dashboard child startup checks and unlocks parent policy but starts the child", async () => {
+  const script = clientScript(htmlFor.dashboard());
+  const source = script.slice(script.indexOf("async function prepareWorkspaceResume"), script.indexOf("// Rename workspace changes"));
+  const parent = { id: "parent", credentialAssignments: { authentication: ["key"], signing: [] } };
+  const child = { id: "child", parentId: "parent", credentialAssignments: { authentication: [], signing: [] } };
+  const checked: string[] = [], started: string[] = [], opened: string[] = [];
+  let confirmations = 0, unlocks = 0, allowUnlock = true;
+  const start = new Function("dashboardWorkspaces", "loadDashboardCredentials", "lockedWorkspaceCredentials", "unlockForWorkspace", "hasCredentialAssignments", "confirm", "setLocalError", "api", "openSession", `let uiBusy = 0; ${source}; return startRegisteredWorkspace;`)(
+    [parent, child], async () => {}, (id: string) => { checked.push(id); return id === "parent" ? [{}] : []; },
+    async () => { unlocks++; return allowUnlock; }, (a: typeof parent.credentialAssignments) => a.authentication.length > 0,
+    () => { confirmations++; return true; }, () => {}, async (url: string) => started.push(url), (id: string) => opened.push(id),
+  );
+  await start(child, { textContent: "Start" }, {});
+  expect({ confirmations, checked, unlocks, started, opened }).toEqual({ confirmations: 0, checked: ["parent"], unlocks: 1, started: ["/api/hub/sessions/child/start"], opened: ["child"] });
+  allowUnlock = false;
+  await start(child, { textContent: "Start" }, {});
+  expect(unlocks).toBe(2);
+  expect(started).toHaveLength(1);
+  expect(opened).toHaveLength(1);
+});
+
+test("dashboard preserves ordinary-folder removal and routes repository removal safely", async () => {
+  const script = clientScript(htmlFor.dashboard());
+  const source = script.slice(script.indexOf("async function refresh(force)"), script.indexOf("// The device-session list"));
+  const { document, window } = parseHTML('<html><body><div id="hub-version"></div><div id="sessions"></div><div id="workspaces"></div></body></html>');
+  const entries = [{ id: "docs" }, { id: "main", createWorktree: true }, { id: "child", parentId: "main" }];
+  const calls: string[] = [];
+  const makeRow = (spec: any) => {
+    const node = document.createElement("div"); node.className = "row";
+    node.innerHTML = '<div class="row-main"><div class="row-title"></div></div><div class="row-actions"></div>';
+    for (const action of spec.buttons) { const button = document.createElement("button"); button.textContent = action.label; button.setAttribute("aria-label", action.ariaLabel || ""); button.onclick = () => action.onClick(button); node.querySelector(".row-actions")!.append(button); }
+    return node;
+  };
+  const bindings: Record<string, unknown> = { document, HTMLElement: window.HTMLElement, fetch: async () => ({ ok: true, json: async () => ({ worktreeApi: "/api/hub/worktrees", workspaces: entries }) }), row: makeRow, renderInto: (container: Element, rows: Element[]) => container.replaceChildren(...rows), workspaceLabel: (w: any) => w.id, credentialAssignmentSummary: () => "", actionErrorFor: () => ({}), setLocalError: () => {}, api: async (url: string) => calls.push(url), el: (tag: string) => document.createElement(tag), worktreeProvenanceLabel: () => "", worktreeForkIcon: "", renderDashboardGroups: () => {}, openWorktreeDialog: (options: any) => calls.push(options.view + ":" + options.id) };
+  const refresh = new Function(...Object.keys(bindings), `let uiBusy=0, dashboardWorkspaces=[]; ${source}; return refresh;`)(...Object.values(bindings));
+  await refresh();
+  for (const id of ["docs", "main", "child"]) await (document.querySelector(`[data-workspace="${id}"] [aria-label^="Remove "]`) as any).onclick();
+  expect(calls).toEqual(["/api/hub/workspaces/docs/forget", "forget:main", "forget:child"]);
+});
+
+test("dashboard worktree live subscription recovers on visibility-only return before and during a dialog", () => {
+  const script = clientScript(htmlFor.dashboard());
+  const start = script.indexOf("function initDashboardWorktreeLive()");
+  expect(start).toBeGreaterThan(-1);
+  const source = script.slice(start, script.indexOf("async function refresh(force)", start));
+  const window = new EventTarget();
+  const document = Object.assign(new EventTarget(), { visibilityState: "visible" });
+  const streams: FakeStream[] = [];
+  class FakeStream extends EventTarget {
+    closed = false;
+    constructor(readonly url: string) { super(); streams.push(this); }
+    close() { this.closed = true; }
+    send(ws: string) { this.dispatchEvent(Object.assign(new Event("live"), { data: JSON.stringify({ ws, topic: "worktrees", event: { kind: "data" } }) })); }
+  }
+  let invalidations = 0;
+  window.addEventListener("uatu:worktrees-invalidated", () => invalidations++);
+  new Function("window", "document", "EventSource", `${source}; initDashboardWorktreeLive();`)(window, document, FakeStream);
+  const open = (source: string) => {
+    const controller = new AbortController();
+    window.dispatchEvent(Object.assign(new Event("uatu:worktree-dialog-opened"), { detail: { source, signal: controller.signal } }));
+    return controller;
+  };
+  // Standalone iOS can return from an unpersisted pagehide with only a
+  // visibilitychange. It must not permanently disable dialogs opened later.
+  document.visibilityState = "hidden"; document.dispatchEvent(new Event("visibilitychange"));
+  window.dispatchEvent(Object.assign(new Event("pagehide"), { persisted: false }));
+  document.visibilityState = "visible"; document.dispatchEvent(new Event("visibilitychange"));
+  const first = open("main");
+  expect(streams).toHaveLength(1);
+  expect(new URL(streams[0]!.url, "http://hub").searchParams.get("subs")).toBe('[{"topic":"worktrees"}]');
+  streams[0]!.send("other"); streams[0]!.send("main");
+  expect(invalidations).toBe(1);
+  window.dispatchEvent(new Event("pageshow"));
+  expect(streams).toHaveLength(1);
+  document.visibilityState = "hidden"; document.dispatchEvent(new Event("visibilitychange"));
+  expect(streams[0]!.closed).toBe(true);
+  window.dispatchEvent(Object.assign(new Event("pagehide"), { persisted: false }));
+  document.visibilityState = "visible"; document.dispatchEvent(new Event("visibilitychange"));
+  expect(streams).toHaveLength(2);
+  window.dispatchEvent(new Event("pageshow"));
+  expect(streams).toHaveLength(2);
+  const second = open("second");
+  first.abort(); streams[1]!.send("main"); streams[2]!.send("second");
+  expect(invalidations).toBe(2);
+  expect(streams.filter(stream => !stream.closed)).toHaveLength(1);
+  second.abort(); window.dispatchEvent(new Event("online"));
+  expect(streams.filter(stream => !stream.closed)).toHaveLength(0);
+  const reopened = open("main");
+  streams[3]!.send("main");
+  expect(invalidations).toBe(3);
+  expect(streams.filter(stream => !stream.closed)).toHaveLength(1);
+  reopened.abort();
+});
 
 function clientScript(html: string): string {
   const start = html.indexOf("<script>");
   const end = html.lastIndexOf("</script>");
   return start >= 0 && end > start ? html.slice(start + "<script>".length, end) : "";
 }
+
+test("dashboard retries failed live streams with capped backoff and cancels recovery on lifecycle teardown", () => {
+  const script = clientScript(htmlFor.dashboard());
+  const start = script.indexOf("function initDashboardWorktreeLive()");
+  const source = script.slice(start, script.indexOf("async function refresh(force)", start));
+  const window = new EventTarget();
+  const document = Object.assign(new EventTarget(), { visibilityState: "visible" });
+  const timers = new Map<number, { callback: () => void; delay: number }>();
+  let nextTimer = 0;
+  const streams: FakeStream[] = [];
+  class FakeStream extends EventTarget {
+    readyState = 0;
+    constructor(_url: string) { super(); streams.push(this); }
+    close() { this.readyState = 2; }
+    fail() { this.readyState = 2; this.dispatchEvent(new Event("error")); }
+  }
+  new Function("window", "document", "EventSource", "setTimeout", "clearTimeout", `${source}; initDashboardWorktreeLive();`)(
+    window, document, FakeStream,
+    (callback: () => void, delay: number) => { const id = ++nextTimer; timers.set(id, { callback, delay }); return id; },
+    (id: number) => timers.delete(id),
+  );
+  const controller = new AbortController();
+  window.dispatchEvent(Object.assign(new Event("uatu:worktree-dialog-opened"), { detail: { source: "main", signal: controller.signal } }));
+  const tick = (delay: number) => {
+    expect(timers.size).toBe(1);
+    const [id, timer] = [...timers][0]!;
+    expect(timer.delay).toBe(delay);
+    timers.delete(id); timer.callback();
+    expect(streams.filter(stream => stream.readyState !== 2)).toHaveLength(1);
+  };
+  for (const delay of [1000, 2000, 4000, 8000, 15000, 15000]) {
+    streams.at(-1)!.fail(); streams.at(-1)!.dispatchEvent(new Event("error"));
+    window.dispatchEvent(new Event("online")); window.dispatchEvent(new Event("pageshow"));
+    tick(delay);
+  }
+  streams.at(-1)!.dispatchEvent(new Event("open"));
+  streams.at(-1)!.fail(); tick(1000);
+  streams.at(-1)!.fail();
+  document.visibilityState = "hidden"; document.dispatchEvent(new Event("visibilitychange"));
+  expect(timers.size).toBe(0);
+  expect(streams.every(stream => stream.readyState === 2)).toBe(true);
+  document.visibilityState = "visible"; document.dispatchEvent(new Event("visibilitychange"));
+  streams.at(-1)!.fail(); window.dispatchEvent(new Event("pagehide"));
+  expect(timers.size).toBe(0);
+  const count = streams.length;
+  window.dispatchEvent(new Event("online"));
+  expect(streams).toHaveLength(count);
+  document.dispatchEvent(new Event("visibilitychange"));
+  expect(streams).toHaveLength(count + 1);
+  window.dispatchEvent(new Event("pageshow"));
+  expect(streams).toHaveLength(count + 1);
+  // A terminal CLOSED source without another error must not block wake-up.
+  streams.at(-1)!.readyState = 2;
+  window.dispatchEvent(new Event("online"));
+  expect(streams).toHaveLength(count + 2);
+  streams.at(-1)!.fail(); controller.abort();
+  expect(timers.size).toBe(0);
+  window.dispatchEvent(new Event("pageshow"));
+  expect(streams.every(stream => stream.readyState === 2)).toBe(true);
+});
 
 function folderMutationFunction(html: string) {
   const script = clientScript(html);
@@ -150,7 +316,7 @@ describe("authenticated Hub pages", () => {
     expect(html).toContain('return parts.join(" · ") || "⊘ No credentials assigned"');
     expect(html).toContain('parts.push("🔑 Auth: " + authentication.join(", "))');
     expect(html).toContain('parts.push("✎ Signing: " + signing.join(", "))');
-    expect(html).toContain("if (!hasCredentialAssignments(w.credentialAssignments) && !confirm(");
+    expect(html).toContain("if (!hasCredentialAssignments(workspacePolicyOwner(w).credentialAssignments) && !confirm(");
     expect(html).toContain("Git authentication and commit signing may be unavailable, but the workspace can still start. Continue?");
     const startFlow = html.indexOf("async function startRegisteredWorkspace");
     expect(startFlow).toBeGreaterThan(0);
@@ -168,6 +334,140 @@ describe("authenticated Hub pages", () => {
     expect(html).toContain("Unlock and resume");
     expect(html).toContain('field.credential.id) + "/unlock"');
     expect(refreshBody).not.toContain("renderCredentialCatalog()");
+  });
+});
+
+describe("worktree dashboard integration (Section 11 UX review)", () => {
+  test("W3 the missing/replaced-checkout warning goes into .row-main, keeping the title/path column width", () => {
+    const html = htmlFor.dashboard();
+    // .row is a row-direction flexbox; .row-main is itself a column
+    // flexbox with min-width:0. Appending the warning to .row directly (the
+    // bug) makes it a flex item that squeezes .row-main to min-content,
+    // breaking the title down to one character per line. Appending it
+    // inside .row-main keeps the row's existing columns their size.
+    expect(html).toContain('node.querySelector(".row-main").append(warning);');
+    expect(html).not.toContain("node.append(warning);");
+  });
+
+  test("W9 the parent fork button opens the shared three-item menu (New branch, Existing branch, Register worktree…)", () => {
+    const html = htmlFor.dashboard();
+    // The dashboard's own fork button calls the exact same openWorktreeFork
+    // the picker calls — inlined once as worktreeDialogScript, not
+    // reimplemented — so the menu shape (including W1's third item) is
+    // identical on both surfaces by construction.
+    expect(html).toContain('fork.onclick = () => openWorktreeFork(target, fork); actions.append(fork);');
+    // The trailing ellipsis survives bundling as either the literal
+    // character or its \u escape, so match just the stable label prefix.
+    expect(html).toMatch(/label: "Register worktree/);
+    expect(html).not.toMatch(/label: "Repository worktrees/);
+  });
+
+  // Item A (2026-09-19 live-test decision): a dashboard child row labels a
+  // tree Uatu did not create "External worktree" — the same rule the picker
+  // and the register list apply, from the one inlined helper rather than a
+  // second spelling of it here.
+  test("child rows take their muted provenance label from the shared ownership rule", () => {
+    const html = htmlFor.dashboard();
+    expect(html).toContain('el("span", "worktree-provenance", worktreeProvenanceLabel(w))');
+    expect(html).not.toContain('w.sourceRef ? "from " + w.sourceRef : "origin unknown"');
+    // The helper it calls is part of the inlined module's public surface.
+    expect(html).toContain("function worktreeProvenanceLabel(");
+    expect(html).toContain("worktreeProvenanceLabel,");
+  });
+
+  // Decision F8 (2026-09-19, second round): the Active-groups heading and the
+  // main checkout's own row already say which rows belong to which
+  // repository, so a child shares the main row's left edge — exactly as the
+  // picker's menu does since F4. No inset, no tree line.
+  test("child rows are not indented under the repository heading", () => {
+    const html = htmlFor.dashboard();
+    // The parent link itself is what grouping reads; only the inset is gone.
+    expect(html).toContain("node.dataset.parent = w.parentId;");
+    expect(html).not.toContain("marginInlineStart");
+    expect(html).not.toContain("paddingInlineStart");
+    expect(html).not.toContain("padding-inline-start");
+    expect(html).not.toContain("border-inline-start");
+    // The dashboard's styles carry exactly one inline-start rule, and it is
+    // F10's heading-actions alignment — nothing insets a workspace row.
+    expect(html.match(/inline-start/g) ?? []).toHaveLength(1);
+    expect(dashboardGroupsStyle).toContain(".dashboard-group-heading .row-actions{margin-inline-start:auto}");
+  });
+
+  // Decision F9 (2026-09-19, second round): the per-repository Configure
+  // button only navigated to the global Settings page, which the Hub's own
+  // navigation already reaches, so it is gone. Parent credentials and shared
+  // policy are still managed there; the heading keeps Rename workspace and
+  // the fork control.
+  test("a repository heading carries no Configure button, and no state field points one at Settings", () => {
+    const html = htmlFor.dashboard();
+    expect(html).not.toContain("worktreeConfigureNavigation");
+    expect(html).not.toContain('" credentials and shared settings"');
+    expect(html).not.toContain('el("button", null, "Configure")');
+    // The heading still collects what remains.
+    expect(html).toContain('button.getAttribute("aria-label")?.startsWith("Rename workspace")');
+    expect(html).toContain('button.getAttribute("aria-label")?.startsWith("Add worktree")');
+  });
+
+  // Decision F10 (2026-09-19): the repository heading's actions sit at the
+  // row's right edge, where Open/Stop end on the rows beneath — the same
+  // treatment F2 gave the picker's group header.
+  test("the repository heading pushes its actions to the row's trailing edge", () => {
+    expect(dashboardGroupsStyle).toContain(".dashboard-group-heading .row-actions{margin-inline-start:auto}");
+    expect(dashboardGroupsStyle).toContain(".dashboard-group-heading .row-title{flex:1 1 auto;min-width:0}");
+    // Narrow viewports wrap the actions under the name, still right-aligned.
+    expect(dashboardGroupsStyle).toContain(".dashboard-group-heading .row-actions{flex:1 0 100%}");
+    // The heading collects the name first, then its actions, fork last.
+    const source = createDashboardGroups.toString();
+    expect(source.indexOf('heading.append(make("h3"')).toBeLessThan(source.indexOf("heading.append(actions)"));
+    expect(source.indexOf('startsWith("Rename workspace")')).toBeLessThan(source.indexOf('startsWith("Add worktree")'));
+  });
+
+  // Decision F11 (2026-09-19): one sideways fork glyph, defined once on the
+  // dialog module's public surface so the SPA's picker and the dashboard's
+  // inlined script cannot drift apart.
+  test("both dashboard fork controls draw the one shared fork icon", () => {
+    const html = htmlFor.dashboard();
+    expect(html).toContain("fork.innerHTML = worktreeForkIcon;");
+    expect(html).toContain("action.innerHTML = worktreeForkIcon;");
+    // Exactly one definition of the glyph, inside the inlined module.
+    expect(html.split('viewBox="0 0 32 20"').length - 1).toBe(1);
+    expect(html).toContain("M6.4 6h19.2M6.4 6.8c7 1.5 8 8.2 15 8.2h4.2");
+    // The old three-node glyph is gone from every surface.
+    expect(html).not.toContain("M6 7.5v9M18 7.5v1a4 4 0 0 1-4 4H6");
+  });
+
+  test("the worktree dialog module is inlined once and the dashboard groups renderer is wired to it", () => {
+    const html = htmlFor.dashboard();
+    expect(html).toContain("function openWorktreeDialog(");
+    expect(html).toContain("function openWorktreeFork(");
+    expect(html).toContain("const renderDashboardGroups = (");
+    expect(html).toContain("renderDashboardGroups(dashboardWorkspaces, nodes);");
+  });
+
+  // Bug 2: a running workspace (main checkout or worktree child) must offer
+  // Open, not just Stop; a stopped one keeps Start. hub-dashboard/spec.md:
+  // "A stopped registered directory SHALL offer Start rather than Open; a
+  // running workspace SHALL offer Open."
+  test("Bug 2 a running row gets an explicit Open action alongside the openSession() the folder browser already uses", () => {
+    const html = htmlFor.dashboard();
+    expect(html).toContain('if (w.running) {');
+    expect(html).toContain('open.setAttribute("aria-label", "Open " + workspaceLabel(w));');
+    expect(html).toContain("open.onclick = () => openSession(w.id);");
+    expect(html).toContain("actions.prepend(open);");
+    // The availability branch (missing/replaced checkout) removes both
+    // Start and this same Open action — an unreachable checkout offers
+    // neither.
+    expect(html).toContain('const openAction = actions.querySelector(\'[aria-label^="Open "]\'); if (openAction) openAction.remove();');
+  });
+
+  // Drive-by fix alongside Bug 2: `a.row-title` never matched row()'s
+  // actual markup (an unclassed <a> nested inside a *div* with that class),
+  // so a missing/replaced checkout's title link was never actually
+  // defused.
+  test("the missing/replaced-checkout branch defuses the real title link selector, not the always-empty a.row-title", () => {
+    const html = htmlFor.dashboard();
+    expect(html).toContain('node.querySelector(".row-title a")');
+    expect(html).not.toContain('node.querySelector("a.row-title")');
   });
 });
 
@@ -620,5 +920,18 @@ describe("stopped session page", () => {
   test("escapes display names and ids", () => {
     const html = stoppedSessionPage("x", true, "<script>alert(1)</script>");
     expect(html).not.toContain("<script>alert(1)</script>");
+  });
+});
+
+// Item D: the worktree confirmation is rendered by the inlined dialog module
+// on the dashboard exactly as in the SPA, so the Hub's own pages must define
+// the success tint it uses — otherwise the dashboard falls back to a literal
+// light green in dark mode.
+describe("the Hub's shared style carries the success palette the confirmation uses", () => {
+  test("--success-soft and --success-strong are defined for both colour schemes", () => {
+    const html = htmlFor.dashboard();
+    expect(html).toContain("--success-soft: light-dark(#dafbe1, #12261e);");
+    expect(html).toContain("--success-strong: light-dark(#1a7f37, #3fb950);");
+    expect(html).toContain("background:var(--success-soft,#dafbe1)");
   });
 });

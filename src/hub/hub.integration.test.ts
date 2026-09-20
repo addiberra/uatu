@@ -33,6 +33,10 @@ import { HubPreferencesStore } from "./preferences";
 import { WorkspaceRegistry } from "./registry";
 import { startHubServer } from "./server";
 import { SessionManager } from "./sessions";
+import { WorktreeOperationCoordinator } from "./worktree-coordinator";
+import { WorktreeJournal, WorktreeProvenanceStore } from "./worktree-journal";
+import { createOnboardingWorktreeRegistrar } from "./worktree-registrar";
+import { WorktreeService } from "./worktree-service";
 import {
   assertOpenApiResponse,
   assertSchema,
@@ -223,6 +227,22 @@ beforeAll(async () => {
     authorized: (principal, ws) => sessionStore.resolve(principal.sessionId)?.user === principal.user && (ws === undefined || Boolean(registry.byId(ws))),
     workspaceName: id => id,
   });
+  // The published worktree JSON family, over a Hub session. The workspace
+  // is a real Git repository, so the inventory is real; these tests
+  // exercise the family's authorization and its refusals without mutating
+  // anything.
+  const worktrees = new WorktreeService({
+    registry,
+    sessions,
+    journal: new WorktreeJournal(path.join(tempRoot, "pending-worktree-operation.json")),
+    provenance: new WorktreeProvenanceStore(path.join(tempRoot, "worktree-provenance.json")),
+    registrar: createOnboardingWorktreeRegistrar({ onboarding, registry }),
+    // Same shared `reservations` as onboarding/folderManager/cloneJobs above
+    // — exactly like main.ts composes them (Bug 3: a separate coordinator
+    // here hid the fact that onboarding.configureWorktree() self-conflicts
+    // when its own path reservation nests inside a create's already-held one).
+    coordinator: new WorktreeOperationCoordinator(reservations),
+  });
   server = startHubServer({
     config,
     registry,
@@ -235,6 +255,7 @@ beforeAll(async () => {
     cloneJobs,
     folderManager,
     reservations,
+    worktrees,
   });
   origin = `http://127.0.0.1:${server.port}`;
 }, 30_000);
@@ -576,6 +597,15 @@ describe("hub end to end", () => {
       credentialRestartRequired: false,
       credentialAssignments: { authentication: [], signing: [] },
     })]);
+    // This Hub serves worktree operations: worktreeApi names the published
+    // JSON family (never a server-rendered worktree URL), and the real Git
+    // main checkout gets the boolean fork affordance.
+    expect((payload as Record<string, unknown>).worktreeApi).toBe("/api/hub/worktrees");
+    // F9: the state carries no Configure navigation any more — the
+    // dashboard had no button for it, and Settings is reached from the
+    // Hub's own navigation.
+    expect((payload as Record<string, unknown>).worktreeConfigureNavigation).toBeUndefined();
+    expect((payload.workspaces[0] as Record<string, unknown>).createWorktree).toBe(true);
     // The authenticated state API reports the hub's uatu version.
     expect(typeof payload.version).toBe("string");
     expect(payload.version.length).toBeGreaterThan(0);
@@ -3268,6 +3298,60 @@ describe("hub end to end", () => {
     expect(await running!.exited).not.toBeUndefined();
     expect(sessions.runningIds()).toEqual([]);
   }, 60_000);
+
+  test("the worktree JSON family answers a Hub session and refuses without force", async () => {
+    // A Hub session lists the family.
+    const listed = await fetch(`${origin}/api/hub/worktrees?source=myproject`, { headers: { cookie } });
+    expect(listed.status).toBe(200);
+    await assertContract("GET", "/api/hub/worktrees", listed);
+    const body = await listed.json() as { inventory: { checkouts: Array<{ main: boolean }> } };
+    expect(body.inventory.checkouts.some(checkout => checkout.main)).toBe(true);
+
+    const post = (action: string, payload: unknown) => fetch(`${origin}/api/hub/worktrees/${action}`, {
+      method: "POST",
+      headers: { cookie, origin, "content-type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    // An option-shaped branch never reaches Git: it is refused as input.
+    const created = await post("create", { sourceWorkspaceId: "myproject", mode: "new-branch", branch: "--force", baseRef: "main" });
+    expect(created.status).toBe(200);
+    await assertContract("POST", "/api/hub/worktrees/create", created);
+    expect(await created.clone().json()).toMatchObject({ ok: false, kind: "create", error: { code: "invalid-input" } });
+
+    const opened = await post("open", { sourceWorkspaceId: "myproject", reference: "no-such-branch" });
+    expect(opened.status).toBe(200);
+    await assertContract("POST", "/api/hub/worktrees/open", opened);
+    expect(await opened.clone().json()).toMatchObject({ ok: false, error: { code: "not-found" } });
+
+    // Deletion without the explicit confirmation removes nothing.
+    const deleted = await post("delete", { sourceWorkspaceId: "myproject", reference: "no-such-branch" });
+    expect(deleted.status).toBe(200);
+    await assertContract("POST", "/api/hub/worktrees/delete", deleted);
+    const refusal = await deleted.clone().json() as { ok: boolean; error: { message: string } };
+    expect(refusal.ok).toBe(false);
+    expect(refusal.error.message).toContain("Nothing was removed");
+
+    // The rest of the family, exercised the same way: real requests that
+    // change nothing, against a reference that does not exist.
+    const fetched = await post("fetch", { sourceWorkspaceId: "myproject" });
+    expect(fetched.status).toBe(200);
+    await assertContract("POST", "/api/hub/worktrees/fetch", fetched);
+
+    const checked = await post("preflight-delete", { sourceWorkspaceId: "myproject", reference: "no-such-branch" });
+    expect(checked.status).toBe(200);
+    await assertContract("POST", "/api/hub/worktrees/preflight-delete", checked);
+    expect(await checked.clone().json()).toMatchObject({ ok: false, error: { code: "not-found" } });
+
+    const registered = await post("register", { sourceWorkspaceId: "myproject", reference: "no-such-branch" });
+    expect(registered.status).toBe(200);
+    await assertContract("POST", "/api/hub/worktrees/register", registered);
+    expect(await registered.clone().json()).toMatchObject({ ok: false, kind: "register", error: { code: "not-found" } });
+
+    const forgotten = await post("forget", { sourceWorkspaceId: "myproject", reference: "no-such-branch" });
+    expect(forgotten.status).toBe(200);
+    await assertContract("POST", "/api/hub/worktrees/forget", forgotten);
+    expect(await forgotten.clone().json()).toMatchObject({ ok: false, kind: "forget", error: { code: "not-found" } });
+  }, 30_000);
 
   test("every documented HTTP operation was black-box validated", () => {
     const documented = new Set<string>();

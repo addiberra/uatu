@@ -107,6 +107,17 @@ test("Hub dispatch families are public or explicitly excluded", async () => {
     ["hubCancelCloneJob", "cloneJobAction"],
     ["hubStreamLive", "pathname === LIVE_STREAM_PATH"],
     ["hubUpdateLiveSubscriptions", "LIVE_SUBSCRIPTIONS_PATH.exec(pathname)"],
+    // The JSON worktree family dispatches on a shared predicate rather than
+    // a path literal, so the marker is that predicate — the one call site,
+    // gated behind the Hub session check like every other operation below.
+    ["hubListWorktrees", "if (worktreeApi && isWorktreeApiPath(pathname))"],
+    ["hubFetchWorktreeRefs", "if (worktreeApi && isWorktreeApiPath(pathname))"],
+    ["hubCreateWorktree", "if (worktreeApi && isWorktreeApiPath(pathname))"],
+    ["hubOpenWorktree", "if (worktreeApi && isWorktreeApiPath(pathname))"],
+    ["hubPreflightDeleteWorktree", "if (worktreeApi && isWorktreeApiPath(pathname))"],
+    ["hubDeleteWorktree", "worktreeApi.handle(request, url, { user: session.user })"],
+    ["hubRegisterWorktree", "if (worktreeApi && isWorktreeApiPath(pathname))"],
+    ["hubForgetWorktree", "if (worktreeApi && isWorktreeApiPath(pathname))"],
     ["hubStartWorkspace", "const action ="],
     ["hubStopWorkspace", "const action ="],
     ["hubForgetWorkspace", "const forget ="],

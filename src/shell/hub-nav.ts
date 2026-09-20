@@ -23,6 +23,8 @@ import { appBasePath, workspaceIdFromBasePath } from "../shared/app-url";
 import type { WorkspaceActivity } from "../shared/live-protocol";
 import { awaitConfirmedLive, holdManualReload, liveChannel } from "./live";
 import { setCurrentSessionRunning } from "./session-running";
+import { openWorktreeFork, worktreeForkIcon, worktreeProvenanceLabel } from "./worktree-dialog";
+import { watchWorktreeInventory, WORKTREES_CHANGED_EVENT } from "./worktree-live";
 
 export type HubWorkspaceSummary = {
   id: string;
@@ -31,10 +33,26 @@ export type HubWorkspaceSummary = {
   displayName: string;
   path: string;
   running: boolean;
+  parentId?: string;
+  repositoryId?: string;
+  branch?: string;
+  detached?: boolean;
+  availability?: "missing" | "replaced";
+  readonly sourceRef?: string;
+  // Verified provenance of a registered child checkout, as the Hub decided
+  // it: never inferred from names or paths here.
+  ownership?: "main" | "uatu" | "external" | "uncertain";
+  // Present and true on a main checkout that can host linked worktrees.
+  createWorktree?: boolean;
+  // The workspace's own credential assignments, flattened for display. On a
+  // main checkout these ARE the policy its children inherit live, which the
+  // worktree dialog discloses at registration.
+  authentication?: string;
+  signing?: string;
 };
 
 export function workspaceMenuLabel(workspace: HubWorkspaceSummary): string {
-  return workspace.displayName || workspace.id;
+  return (workspace.parentId && workspace.branch) || workspace.displayName || workspace.id;
 }
 
 // Duplicate display names are legal; the menu disambiguates them with the
@@ -44,7 +62,8 @@ export function workspaceMenuDetail(
   workspace: HubWorkspaceSummary,
 ): string | null {
   const label = workspaceMenuLabel(workspace);
-  const duplicates = workspaces.filter(candidate => workspaceMenuLabel(candidate) === label);
+  const duplicates = workspaces.filter(candidate => workspaceMenuLabel(candidate) === label
+    && (!workspace.parentId || (candidate.parentId === workspace.parentId && candidate.repositoryId === workspace.repositoryId)));
   if (duplicates.length < 2) return null;
   return workspace.path || workspace.id;
 }
@@ -118,6 +137,8 @@ export function switcherBadgeLabel(badge: SwitcherBadge): string {
 export type WorkspaceMenuState = { text: string; tone: "stopped" | "working" | "awaiting" } | null;
 
 export function workspaceMenuState(workspace: HubWorkspaceSummary, activity: WorkspaceActivityMap): WorkspaceMenuState {
+  if (workspace.availability === "missing") return { text: "Missing checkout", tone: "stopped" };
+  if (workspace.availability === "replaced") return { text: "Identity conflict", tone: "stopped" };
   if (!workspace.running) return { text: "stopped", tone: "stopped" };
   const facts = activity.get(workspace.id);
   if (!facts?.running) return null;
@@ -136,9 +157,22 @@ export function chipDotClass(workspaces: HubWorkspaceSummary[], currentId: strin
   return current?.running ? "indicator-dot is-live" : "indicator-dot";
 }
 
+// The chip names the checkout in two parts, the same way for EVERY checkout
+// in a repository family: the repository (a child's parent, a main
+// checkout's own name) and then that checkout's branch — a child reads
+// `atlas probe/first-attempt` exactly as its main checkout reads
+// `atlas main`. A workspace outside any repository family has no repository
+// and no branch to name, so it keeps its display name alone.
 export function chipLabel(workspaces: HubWorkspaceSummary[], currentId: string): string {
   const current = workspaces.find(workspace => workspace.id === currentId);
-  return current ? workspaceMenuLabel(current) : currentId;
+  if (!current) return currentId;
+  return repositoryTitle(workspaces, currentId) ?? workspaceMenuLabel(current);
+}
+
+export function chipBranchLabel(workspaces: HubWorkspaceSummary[], currentId: string): string | null {
+  const current = workspaces.find(workspace => workspace.id === currentId);
+  if (!current || repositoryTitle(workspaces, currentId) === null) return null;
+  return checkoutBranchLabel(current);
 }
 
 // Whether the hub's list says the current session runs. Unlisted is
@@ -159,10 +193,83 @@ export function sortHubWorkspaces(
     if (workspace.id === currentId) return 0;
     return workspace.running ? 1 : 2;
   };
-  return [...workspaces].sort((a, b) =>
+  const sorted = [...workspaces].sort((a, b) =>
     rank(a) - rank(b)
     || workspaceMenuLabel(a).localeCompare(workspaceMenuLabel(b))
-    || a.id.localeCompare(b.id));
+     || a.id.localeCompare(b.id));
+  const children = new Map<string, HubWorkspaceSummary[]>();
+  for (const workspace of sorted) {
+    if (!workspace.parentId || !workspace.repositoryId) continue;
+    const parent = workspaces.find(candidate => candidate.id === workspace.parentId && !candidate.parentId && candidate.repositoryId === workspace.repositoryId);
+    if (parent) children.set(parent.id, [...(children.get(parent.id) ?? []), workspace]);
+  }
+  const nested = new Set([...children.values()].flat().map(workspace => workspace.id));
+  return sorted.filter(workspace => !nested.has(workspace.id)).flatMap(workspace => [workspace, ...(children.get(workspace.id) ?? [])]);
+}
+
+// The repository family the selector groups by, in the order
+// sortHubWorkspaces already produced: a main checkout that owns a Git
+// repository (the Hub sets createWorktree only for a real `.git` directory)
+// with its registered children beneath it. A workspace with no repository
+// family — no `.git` directory of its own and no parent — stays a plain row,
+// exactly as before.
+export type HubMenuEntry =
+  | { kind: "repository"; main: HubWorkspaceSummary; children: HubWorkspaceSummary[] }
+  | { kind: "plain"; workspace: HubWorkspaceSummary };
+
+export function groupHubWorkspaces(
+  workspaces: HubWorkspaceSummary[],
+  currentId: string | null,
+): HubMenuEntry[] {
+  const sorted = sortHubWorkspaces(workspaces, currentId);
+  const nested = new Set<string>();
+  const entries: HubMenuEntry[] = [];
+  for (const workspace of sorted) {
+    if (nested.has(workspace.id)) continue;
+    const children = workspace.parentId
+      ? []
+      : sorted.filter(candidate => candidate.parentId === workspace.id && candidate.repositoryId === workspace.repositoryId);
+    if (!workspace.parentId && (workspace.createWorktree === true || children.length > 0)) {
+      for (const child of children) nested.add(child.id);
+      entries.push({ kind: "repository", main: workspace, children });
+      continue;
+    }
+    entries.push({ kind: "plain", workspace });
+  }
+  return entries;
+}
+
+// The repository a workspace belongs to: for a child checkout its parent's
+// display name, for a main checkout its own. A workspace outside any
+// repository family has none — which is also what tells the chip it has no
+// branch to name. This is what the chip's leading half reads.
+export function repositoryTitle(
+  workspaces: HubWorkspaceSummary[],
+  currentId: string | null,
+): string | null {
+  const current = workspaces.find(workspace => workspace.id === currentId);
+  if (!current) return null;
+  if (current.parentId) {
+    const parent = workspaces.find(candidate => candidate.id === current.parentId);
+    return parent ? parent.displayName || parent.id : null;
+  }
+  return current.createWorktree === true ? current.displayName || current.id : null;
+}
+
+// A checkout's current branch, as a label. Detached and unknown are explicit;
+// neither is ever guessed to be main.
+export function checkoutBranchLabel(workspace: HubWorkspaceSummary): string {
+  return workspace.detached ? "Detached HEAD" : workspace.branch || "Branch unknown";
+}
+
+// The one muted provenance line a child row carries, in the picker exactly as
+// in the dashboard and the register list: the shared rule in
+// worktree-dialog.ts, so "External worktree" never reads as "origin unknown".
+export function childProvenanceLabel(workspace: HubWorkspaceSummary): string {
+  return worktreeProvenanceLabel({
+    ...(workspace.ownership === undefined ? {} : { ownership: workspace.ownership }),
+    ...(workspace.sourceRef === undefined ? {} : { sourceRef: workspace.sourceRef }),
+  });
 }
 
 // Signs out by submitting a real form POST, exactly as the hub dashboard's
@@ -270,18 +377,35 @@ export function submitHubSignOut(doc: Document): void {
 
 export type HubStateSummary = {
   workspaces: HubWorkspaceSummary[];
+  worktreeApi?: string;
 };
 
+// The Hub publishes assignment names per role; the dialog shows them as one
+// readable value, or omits the field so it reads "none".
+function credentialSummary(value: unknown): { authentication?: string; signing?: string } {
+  const record = value as { authentication?: unknown; signing?: unknown } | null | undefined;
+  const join = (list: unknown) => Array.isArray(list)
+    ? list.filter((name): name is string => typeof name === "string" && name !== "").join(", ")
+    : "";
+  const authentication = join(record?.authentication);
+  const signing = join(record?.signing);
+  return {
+    ...(authentication === "" ? {} : { authentication }),
+    ...(signing === "" ? {} : { signing }),
+  };
+}
+
 export function parseHubState(payload: unknown): HubStateSummary | null {
-  const record = payload as { workspaces?: unknown } | null;
+  const record = payload as { workspaces?: unknown; worktreeApi?: unknown } | null;
   const workspaces = record?.workspaces;
   if (!Array.isArray(workspaces)) {
     return null;
   }
   return {
+    ...(typeof record?.worktreeApi === "string" ? { worktreeApi: record.worktreeApi } : {}),
     workspaces: workspaces
       .filter(
-        (entry): entry is { id: string; running: boolean; displayName?: unknown; path?: unknown } =>
+        (entry): entry is { id: string; running: boolean; displayName?: unknown; path?: unknown; parentId?: unknown; repositoryId?: unknown; branch?: unknown; detached?: unknown; availability?: unknown; sourceRef?: unknown; ownership?: unknown; createWorktree?: unknown; credentialAssignments?: unknown } =>
           typeof entry === "object" &&
           entry !== null &&
           typeof (entry as { id?: unknown }).id === "string" &&
@@ -292,6 +416,17 @@ export function parseHubState(payload: unknown): HubStateSummary | null {
         displayName: typeof entry.displayName === "string" && entry.displayName !== "" ? entry.displayName : entry.id,
         path: typeof entry.path === "string" ? entry.path : "",
         running: entry.running,
+        ...(typeof entry.parentId === "string" ? { parentId: entry.parentId } : {}),
+        ...(typeof entry.repositoryId === "string" ? { repositoryId: entry.repositoryId } : {}),
+        ...(typeof entry.branch === "string" ? { branch: entry.branch } : {}),
+        ...(typeof entry.sourceRef === "string" && entry.sourceRef !== "" ? { sourceRef: entry.sourceRef } : {}),
+        ...(entry.ownership === "main" || entry.ownership === "uatu" || entry.ownership === "external" || entry.ownership === "uncertain"
+          ? { ownership: entry.ownership }
+          : {}),
+        ...(entry.detached === true ? { detached: true } : {}),
+        ...(entry.availability === "missing" || entry.availability === "replaced" ? { availability: entry.availability } : {}),
+        ...(entry.createWorktree === true ? { createWorktree: true } : {}),
+        ...credentialSummary(entry.credentialAssignments),
       })),
   };
 }
@@ -323,6 +458,7 @@ export function initHubNav(): void {
   }
 
   let latest: HubWorkspaceSummary[] = [];
+  let worktreeApi: string | undefined;
   const activity = new Map<string, WorkspaceActivity>();
   // What the hub's list last said about the current session, apart from
   // `latest`, which folds the stream's activity in. `Stopped` is asserted
@@ -338,6 +474,17 @@ export function initHubNav(): void {
   const baseToggleLabel = toggle.getAttribute("aria-label") ?? "Switch workspace or open the hub dashboard";
   const updateChip = () => {
     label.textContent = chipLabel(latest, currentId);
+    // The chip is the only place the repository is named: it says the
+    // repository, then this checkout's branch. A child reads the same shape
+    // as its main checkout, so one line answers both "which repository" and
+    // "which checkout" — a separate title line above would only repeat it.
+    const branchText = chipBranchLabel(latest, currentId);
+    if (branchText !== null) {
+      const branch = document.createElement("span");
+      branch.className = "hub-toggle-branch";
+      branch.textContent = branchText;
+      label.appendChild(branch);
+    }
     if (chipDot) {
       chipDot.className = chipDotClass(latest, currentId);
     }
@@ -361,6 +508,10 @@ export function initHubNav(): void {
   const rowStartWords = { starting: "starting…", unlock: "unlock in Hub…", failed: "start failed" } as const;
 
   const renderMenu = () => {
+    // Background inventory/activity refresh must not discard keyboard focus or
+    // the anchor of an open fork menu.
+    if (document.querySelector('[role="menu"][aria-label="Create worktree"]')) return;
+    const focusedLabel = menu.contains(document.activeElement) ? document.activeElement?.getAttribute("aria-label") : null;
     menu.replaceChildren();
 
     const dashboard = document.createElement("a");
@@ -376,9 +527,45 @@ export function initHubNav(): void {
       menu.appendChild(Object.assign(document.createElement("hr"), { className: "hub-menu-divider" }));
     }
 
-    for (const workspace of sortHubWorkspaces(latest, currentId)) {
+    // The fork control of ONE main checkout, which is what a repository's
+    // group header owns: children never have one.
+    const forkButton = (workspace: HubWorkspaceSummary): HTMLButtonElement => {
+      const fork = document.createElement("button");
+      fork.className = "hub-menu-fork";
+      // The one shared glyph (F11), never a second spelling of it here.
+      fork.innerHTML = worktreeForkIcon;
+      fork.setAttribute("aria-label", `Add worktree to ${workspaceMenuLabel(workspace)}`);
+      fork.title = `Add worktree to ${workspaceMenuLabel(workspace)}`;
+      fork.setAttribute("aria-haspopup", "menu");
+      fork.addEventListener("click", () => openWorktreeFork(
+        {
+          // The published family's base path, straight from Hub state —
+          // never a literal, and never relocated under the session's base
+          // path, because the Hub API lives outside it.
+          api: worktreeApi!,
+          source: {
+            id: workspace.id,
+            name: workspaceMenuLabel(workspace),
+            ...(workspace.authentication === undefined ? {} : { authentication: workspace.authentication }),
+            ...(workspace.signing === undefined ? {} : { signing: workspace.signing }),
+          },
+        },
+        fork,
+        toggle,
+      ));
+      return fork;
+    };
+
+    // One workspace row. `label` lets a repository's own main checkout read
+    // as `main checkout` under the group header that already names the
+    // repository, instead of repeating that name.
+    // A child is NOT indented: the group header above already says which
+    // repository these rows belong to, so every row in the menu shares one
+    // left edge and the eye reads the header, not a tree.
+    const appendWorkspace = (workspace: HubWorkspaceSummary, options: { label?: string } = {}): void => {
       const item = document.createElement("a");
       item.className = "hub-menu-item";
+      item.dataset.workspaceId = workspace.id;
       item.href = `/s/${encodeURIComponent(workspace.id)}/`;
       if (workspace.id === currentId) {
         item.setAttribute("aria-current", "true");
@@ -389,7 +576,23 @@ export function initHubNav(): void {
       item.appendChild(dot);
       const itemLabel = document.createElement("span");
       itemLabel.className = "hub-menu-label";
-      itemLabel.textContent = workspaceMenuLabel(workspace);
+      itemLabel.textContent = options.label ?? workspaceMenuLabel(workspace);
+      if (!workspace.parentId && workspace.createWorktree) {
+        const branch = document.createElement("span");
+        branch.className = "hub-menu-branch";
+        branch.textContent = checkoutBranchLabel(workspace);
+        branch.title = `Current checkout: ${branch.textContent}`;
+        itemLabel.appendChild(branch);
+      }
+      if (workspace.parentId) {
+        // Ownership first: a tree Uatu did not create says so, instead of
+        // claiming an unknown origin for a branch it never created.
+        const provenance = document.createElement("span");
+        provenance.className = "hub-menu-provenance";
+        provenance.textContent = childProvenanceLabel(workspace);
+        provenance.title = provenance.textContent;
+        itemLabel.appendChild(provenance);
+      }
       item.appendChild(itemLabel);
       const detail = workspaceMenuDetail(latest, workspace);
       if (detail !== null) {
@@ -410,7 +613,13 @@ export function initHubNav(): void {
         state.textContent = menuState.text;
         item.appendChild(state);
       }
-      if (!stopped) {
+      if (workspace.availability) {
+        item.setAttribute("aria-disabled", "true");
+        item.title = workspace.availability === "missing"
+          ? "Checkout missing. Restore it externally, then reopen the picker to refresh."
+          : "A different checkout occupies this path. Resolve the identity conflict before opening.";
+        item.addEventListener("click", event => event.preventDefault());
+      } else if (!stopped) {
         rowStart.delete(workspace.id);
       } else {
         const state = item.querySelector<HTMLSpanElement>(".hub-menu-state.is-stopped")!;
@@ -440,7 +649,34 @@ export function initHubNav(): void {
         });
       }
       menu.appendChild(item);
-    }
+    };
+
+    groupHubWorkspaces(latest, currentId).forEach((entry, index) => {
+      if (entry.kind === "plain") {
+        appendWorkspace(entry.workspace);
+        return;
+      }
+      // A repository: a non-interactive header naming it (and owning its one
+      // fork control, at its trailing edge), then its main checkout, then its
+      // children — all on the same left edge. Grouping is explicit
+      // parent/repository identity from Hub state, never a display-name
+      // match. A group that follows anything else is preceded by its own
+      // divider, so the eye lands on the repository boundary before the
+      // rows; the menu's first entry needs none, because the divider under
+      // Hub dashboard is already there.
+      if (index > 0) menu.appendChild(Object.assign(document.createElement("hr"), { className: "hub-menu-divider is-group" }));
+      const header = document.createElement("div");
+      header.className = "hub-menu-group";
+      header.dataset.repository = entry.main.id;
+      const name = document.createElement("span");
+      name.className = "hub-menu-label";
+      name.textContent = entry.main.displayName || entry.main.id;
+      header.appendChild(name);
+      if (worktreeApi && entry.main.createWorktree) header.appendChild(forkButton(entry.main));
+      menu.appendChild(header);
+      appendWorkspace(entry.main, { label: "main checkout" });
+      for (const child of entry.children) appendWorkspace(child);
+    });
 
     menu.appendChild(Object.assign(document.createElement("hr"), { className: "hub-menu-divider" }));
     const signOut = document.createElement("a");
@@ -455,12 +691,48 @@ export function initHubNav(): void {
       submitHubSignOut(document);
     });
     menu.appendChild(signOut);
+    if (focusedLabel) [...menu.querySelectorAll<HTMLElement>("[aria-label]")].find(item => item.getAttribute("aria-label") === focusedLabel)?.focus();
+  };
+
+  // The menu grows with the number of checkouts, and in touch mode it lives
+  // inside a fullscreen, `overflow: hidden` Files pane pinned above the tab
+  // bar — so a repository or two was enough to push its last rows, Sign out
+  // among them, below the visible area with no way to reach them. Bound the
+  // open menu to what is actually visible BELOW its own top edge (which
+  // depends on the header above it, so it is measured rather than guessed)
+  // and let it scroll; the stylesheet owns the scrolling itself, with a
+  // viewport-based fallback for the moment before this runs.
+  const sizeMenu = () => {
+    if (menu.hidden || typeof menu.getBoundingClientRect !== "function") return;
+    const top = menu.getBoundingClientRect().top;
+    // The pane the menu is clipped by, when there is one: in touch mode the
+    // sidebar is fixed above the tab bar, so its bottom is the real limit.
+    const pane = control.closest(".sidebar")?.getBoundingClientRect().bottom;
+    const viewport = window.innerHeight || 0;
+    const bottom = Math.min(viewport || Number.POSITIVE_INFINITY, pane ?? Number.POSITIVE_INFINITY);
+    if (!Number.isFinite(bottom) || !Number.isFinite(top)) return;
+    // Never smaller than a few rows: an unreadable sliver would be worse
+    // than a scroll.
+    menu.style.setProperty("--hub-menu-max-height", `${Math.round(Math.max(160, bottom - top - 16))}px`);
   };
 
   const close = () => {
     toggle.setAttribute("aria-expanded", "false");
     menu.hidden = true;
   };
+
+  // Tab (and the focus restored after a background re-render) must bring its
+  // target into the scrolled menu rather than leave it just out of sight.
+  menu.addEventListener("focusin", event => {
+    const target = event.target;
+    if (target instanceof HTMLElement && typeof target.scrollIntoView === "function") {
+      target.scrollIntoView({ block: "nearest" });
+    }
+  });
+
+  // A rotation or a software keyboard changes what is visible under the menu
+  // while it is open.
+  window.addEventListener("resize", sizeMenu);
 
   // Every refresh of the hub list goes through here. The list is the
   // authority on which workspaces exist, so activity for any it no longer
@@ -518,6 +790,7 @@ export function initHubNav(): void {
     }
     applied = request;
     latest = foldCurrent(fresh.workspaces, reportsBefore);
+    worktreeApi = fresh.worktreeApi;
     for (const ws of [...activity.keys()]) {
       if (!isListed(ws) && (reportedAt.get(ws) ?? 0) <= reportsBefore) {
         activity.delete(ws);
@@ -537,6 +810,7 @@ export function initHubNav(): void {
   // last read): read the list again, and again while an answer still lacks
   // one reported after that request went out. The next answer lists it or,
   // no longer predating the report, prunes it.
+  window.addEventListener(WORKTREES_CHANGED_EVENT, () => { void refreshHubState(); });
   let refreshPending = false;
   const refreshForUnlisted = () => {
     if (refreshPending || [...activity.keys()].every(isListed)) return;
@@ -604,8 +878,15 @@ export function initHubNav(): void {
     }
     latest = state.workspaces;
     applyListedRunning(state.workspaces);
+    worktreeApi = state.worktreeApi;
     updateChip();
     control.hidden = false;
+
+    // A Hub that serves worktree operations publishes inventory
+    // invalidations on the page's existing live stream. The real Hub and the
+    // isolated review host are told apart by nothing but this state field:
+    // the same picker code runs against both.
+    if (worktreeApi) watchWorktreeInventory(liveChannel(), window);
 
     // Live facts from the stream. The channel replays the latest facts per
     // workspace as this registers, so the snapshot the hub sent while the
@@ -670,6 +951,8 @@ export function initHubNav(): void {
       renderMenu();
       toggle.setAttribute("aria-expanded", "true");
       menu.hidden = false;
+      menu.scrollTop = 0;
+      sizeMenu();
       // Refresh in the background so the open menu reflects sessions
       // started or stopped elsewhere; re-render only while still open.
       void refreshHubState();

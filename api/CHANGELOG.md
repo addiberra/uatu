@@ -2,6 +2,19 @@
 
 Entries are ordered newest first. Every entry has Hub and workspace revisions, a compatibility classification, and migration guidance. Use `None` when no migration is required. An entry is headed `Unreleased` until the release that ships it; the release-prep step replaces that with the version tag (`v0.7.0`), so a consumer can tell which revision pair a given uatu version speaks. An additive change that lands after a pair has shipped gets its own entry under the same pair, stamped with its own release, rather than being appended to the shipped entry.
 
+## Hub 8 / Workspace 20 - Unreleased
+
+Compatibility: breaking (Hub)
+
+### Changes
+
+- A published worktree operation family serves the complete Git worktree lifecycle as JSON: `GET /api/hub/worktrees` (inventory) and `POST /api/hub/worktrees/{fetch,create,open,preflight-delete,delete,register,forget}`. It is the Hub's only worktree transport — the in-workspace picker and the Hub dashboard both drive it through one client dialog — so every caller, browser or not, runs over the same service and the same safety rules and no client can reach a weaker check. A refusal is a completed request and answers 200 with `ok: false` and a sanitized error; HTTP statuses report transport problems only. Creation never takes a destination — the Hub computes `<main-folder>.worktrees/<safe-branch-folder>` — deletion requires `confirm: true`, forgetting a workspace is itself the authorization to stop its own Uatu sessions first (there is no `stop: false` variant), the branch is always kept, there is no force anywhere in the family, and there is no operation-progress poll in this contract. `fetch` is one explicit, credential-aware remote fetch that reports refs whether or not it succeeded, carrying no server-side draft. `preflight-delete` is a read-only check of the one blocker that would refuse a deletion, or whether proceeding needs the caller's explicit stop authorization. `register` covers both retrying a Uatu-created checkout that outlived a failed registration and registering an external tree for the first time, told apart by the service's own pending state rather than anything the caller says.
+- Hub state adds optional repository, parent, branch, provenance and availability fields, plus `worktreeApi` — the origin-rooted path of the published JSON family, present only when the Hub serves worktree operations — and a boolean `createWorktree` on a main checkout that can host linked worktrees. Neither publishes a server-rendered worktree URL; the picker and dashboard derive their behavior from the field's presence and the JSON family alone. The live stream adds the cursor-free `worktrees` topic, with an inventory invalidation on subscription, reconnect and committed changes.
+
+### Migration
+
+Strict Hub clients must regenerate against Hub revision 8. The state objects are closed, so revision 7 validators reject the new optional fields. Accept the new `worktrees` envelope topic and subscription variant. On invalidation, fetch authoritative inventory without changing the selected workspace or conversation. The workspace payload revision remains 20.
+
 ## Hub 7 / Workspace 20 - Unreleased
 
 Compatibility: breaking (Hub)

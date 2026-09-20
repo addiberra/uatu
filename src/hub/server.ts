@@ -54,6 +54,11 @@ import {
 } from "./proxy";
 import { LiveBroker } from "./live-broker";
 import { NotificationRequestError, type HubNotifications } from "./notifications";
+import { createWorktreeApi, isWorktreeApiPath, WORKTREE_API_PATH, type WorktreeStartOutcome } from "./worktree-api";
+import { assertNoRegisteredWorktreeDependents, type WorktreeService } from "./worktree-service";
+import { WorktreeReconciler } from "./worktree-reconciler";
+import { checkoutGitLink, readCheckoutHead } from "./worktree-git";
+import { WorktreeOperationError } from "../shared/worktree-contract";
 import { LiveEndpoint } from "./live-endpoint";
 import { createHubUpstreamSource } from "./live-source";
 import { defaultWorkspaceDisplayName, validateWorkspaceDisplayName, type WorkspaceRegistry } from "./registry";
@@ -83,6 +88,9 @@ export type HubDeps = {
   folderManager?: Pick<FolderManager, "create" | "rename" | "remove" | "assertNoPendingMutation">;
   reservations?: PathReservationCoordinator;
   cloneJobs?: CloneJobManager;
+  // The worktree operation service. Absent (tests, the e2e harness) leaves
+  // the worktree routes unmounted rather than half-answering.
+  worktrees?: WorktreeService;
   cloneCredentials?: CloneCredentialResolver;
   credentialApi?: CredentialApiServices;
   gitCommand?: () => string;
@@ -90,9 +98,46 @@ export type HubDeps = {
   // a handler built directly gets its own pair.
   live?: LiveEndpoint;
   liveBroker?: LiveBroker;
+  // Git reconciliation for the worktree inventory. startHubServer assembles
+  // one when `worktrees` is present.
+  worktreeReconciler?: WorktreeReconciler;
+  // Test seam for the reconciler's cadence.
+  worktreeReconcilerOptions?: Pick<ConstructorParameters<typeof WorktreeReconciler>[0], "minIntervalMs" | "periodMs" | "now" | "timers">;
   metrics?: MetricsRegistry;
   notifications?: HubNotifications;
 };
+
+// The Hub-side worktree invalidation loop (tasks 5.1–5.2): the reconciler
+// reads Git when a page opens the topic, when observed activity or a
+// session start/stop suggests something changed, and on a bounded cadence
+// while any page holds the topic; a changed inventory — or a committed Uatu
+// operation — invalidates every page showing that repository over the
+// existing live stream.
+function assembleWorktreeReconciler(deps: HubDeps, liveBroker: LiveBroker): WorktreeReconciler | undefined {
+  const service = deps.worktrees;
+  if (!service) return undefined;
+  if (deps.worktreeReconciler) return deps.worktreeReconciler;
+  const reconciler = new WorktreeReconciler({
+    inventory: source => service.inventory(source),
+    sourceFor: workspaceId => service.sourceFor(workspaceId),
+    onChange: source => liveBroker.publishWorktrees(service.familyOf(source)),
+    onError: error => console.error(`uatu hub: worktree reconciliation failed: ${error instanceof Error ? error.message : String(error)}`),
+    ...deps.worktreeReconcilerOptions,
+  });
+  const retained = new Map<string, () => void>();
+  liveBroker.observeWorktrees({
+    attached: workspaceId => { void reconciler.request(workspaceId, "subscribe").catch(() => undefined); },
+    interest: (workspaceId, interested) => {
+      retained.get(workspaceId)?.();
+      retained.delete(workspaceId);
+      if (interested) retained.set(workspaceId, reconciler.retain(workspaceId));
+    },
+    // An agent that started or finished working may have run `git worktree`.
+    activity: workspaceId => { void reconciler.request(workspaceId, "activity").catch(() => undefined); },
+  });
+  deps.sessions.onChange(change => { void reconciler.request(change.workspaceId, "activity").catch(() => undefined); });
+  return reconciler;
+}
 
 type HubServer = UpgradableServer & {
   requestIP?(request: Request): { address: string } | null;
@@ -193,7 +238,8 @@ export function createHubFetchHandler(deps: HubDeps) {
     credentials: deps.cloneCredentials,
     reservations: deps.reservations,
   });
-  const { live } = assembleLive(deps);
+  const { live, liveBroker } = assembleLive(deps);
+  const worktreeReconciler = assembleWorktreeReconciler(deps, liveBroker);
   const limiter = new LoginRateLimiter();
   const credentialLimiter = new CredentialOperationRateLimiter();
   const credentialApi = deps.credentialApi ? new CredentialApi(deps.credentialApi) : null;
@@ -434,7 +480,50 @@ export function createHubFetchHandler(deps: HubDeps) {
     });
   };
 
+  // The worktree presentation facts for the state list, read WITHOUT running
+  // Git: this endpoint is polled. `repositoryId` comes from the registry's
+  // worktree links (a main workspace takes its children's shared identity),
+  // the branch from the checkout's HEAD file, and `sourceRef` only from
+  // recorded creation history. `createWorktree` marks a main checkout that
+  // can host worktrees (a `.git` directory) — it is the fork entry point.
+  const worktreeStateFacts = async (): Promise<Map<string, Record<string, unknown>>> => {
+    const facts = new Map<string, Record<string, unknown>>();
+    const service = deps.worktrees;
+    if (!service) return facts;
+    const entries = registry.list();
+    const familyRepository = new Map<string, string>();
+    for (const entry of entries) {
+      if (entry.worktree) familyRepository.set(entry.worktree.parentWorkspaceId, entry.worktree.repositoryId);
+    }
+    await Promise.all(entries.map(async entry => {
+      const head = await readCheckoutHead(entry.path);
+      const link = entry.worktree;
+      const repositoryId = link?.repositoryId ?? familyRepository.get(entry.id);
+      const fact: Record<string, unknown> = {
+        ...(repositoryId === undefined ? {} : { repositoryId }),
+        ...(head.kind === "branch" ? { branch: head.branch } : {}),
+        ...(head.kind === "detached" ? { detached: true } : {}),
+      };
+      if (link) {
+        fact.parentId = link.parentWorkspaceId;
+        fact.ownership = await service.registeredOwnership(entry.id);
+        // A child is named by the branch it was registered on; its current
+        // HEAD, when readable, is the truthful label.
+        fact.branch = head.kind === "branch" ? head.branch : entry.displayName;
+        const origin = await service.branchOrigin(link.repositoryId, String(fact.branch));
+        if (origin !== undefined) fact.sourceRef = origin;
+        const availability = await service.registeredAvailability(entry.id);
+        if (availability !== "present") fact.availability = availability;
+      } else if (await checkoutGitLink(entry.path) === "directory") {
+        fact.createWorktree = true;
+      }
+      facts.set(entry.id, fact);
+    }));
+    return facts;
+  };
+
   const hubState = async (): Promise<Response> => {
+    const worktreeFacts = await worktreeStateFacts();
     const credentialState = deps.credentialApi?.metadata.snapshot();
     const credentialNames = new Map(credentialState?.credentials.map(credential => [credential.id, credential.name]));
     const workspaces = await Promise.all(
@@ -470,10 +559,17 @@ export function createHubFetchHandler(deps: HubDeps) {
           backend: entry.backend,
           running: running !== undefined,
           credentialRestartRequired: sessions.credentialRestartRequired(entry.id),
+          // A linked worktree's OWN assignment rows — normally none. Its
+          // effective credentials are its parent's, inherited live through
+          // `parentId` (credential-context's policyWorkspaceId); they are
+          // deliberately NOT substituted here, so this field never claims
+          // the child holds assignments it does not, and clients show the
+          // inherited policy by reading the parent named in `parentId`.
           credentialAssignments: {
             authentication: [...authentication],
             signing: [...signing],
           },
+          ...(worktreeFacts.get(entry.id) ?? {}),
           // The local-process backend always spawns this build's binary, so
           // every child speaks this constant. A backend that runs children
           // of other builds (the deferred container backend) must report
@@ -493,6 +589,11 @@ export function createHubFetchHandler(deps: HubDeps) {
       ...compatibility,
       workspaces,
       ...(workspaceDefaults === undefined ? {} : { workspaceDefaults }),
+      // Present only when this Hub serves worktree operations: the picker
+      // and dashboard read `worktreeApi`'s presence to mount their worktree
+      // affordances. Its value is the published JSON family, not a page —
+      // no server-rendered worktree URL is published here.
+      ...(deps.worktrees === undefined ? {} : { worktreeApi: WORKTREE_API_PATH }),
     });
   };
 
@@ -1202,6 +1303,73 @@ export function createHubFetchHandler(deps: HubDeps) {
     });
   };
 
+  // One workspace start, with the recovery fences that must run before a
+  // child can spawn. Shared by POST /api/hub/sessions/<id>/start and the
+  // worktree flow's Open action, so neither of them can drift from the
+  // other's safety checks.
+  const startWorkspaceSession = async (workspaceId: string): Promise<{ ok: true } | { ok: false; response: Response }> => {
+    // A pending onboarding journal can cover a partially configured
+    // registration (an assignment commit whose rollback also failed);
+    // starting it would project the previous or empty assignment set.
+    // Frozen until recovery, like assignment mutations and folder changes.
+    if (deps.onboarding && await deps.onboarding.hasPendingRecovery()) {
+      return { ok: false, response: json(409, { error: "a pending onboarding requires Hub recovery before session starts" }, NO_STORE_HEADERS) };
+    }
+    // A pending folder mutation freezes starts for the mirror-image reason:
+    // a registered rename or removal whose filesystem and registry halves
+    // diverged leaves the registry pointing at the journaled source path.
+    // Starting now either fails against a directory that is gone or — if
+    // something recreated that path — serves the workspace from unrelated
+    // content. Failing closed on an uninspectable journal, as the mutation
+    // routes do.
+    try {
+      await deps.folderManager?.assertNoPendingMutation();
+    } catch (error) {
+      return { ok: false, response: folderError(error) };
+    }
+    try {
+      // Starting is fenced by the folder-mutation journal from inside the
+      // workspace's lifecycle operation (see SessionManager.start): a
+      // journal that outlived its mutation means the registry may still
+      // point at a path recovery has to move or restore, and a child
+      // spawned there would carry this workspace's credentials and personal
+      // identity into unrelated content. The refusal arrives as a
+      // FolderManagerError and answers 409.
+      await sessions.start(workspaceId);
+      return { ok: true };
+    } catch (error) {
+      if (error instanceof FolderManagerError) return { ok: false, response: folderError(error) };
+      // A worktree whose checkout is missing or replaced is refused before
+      // any spawn; the sanitized reason is the answer.
+      if (error instanceof WorktreeOperationError) return { ok: false, response: json(409, { error: error.detail.message }) };
+      return { ok: false, response: json(500, { error: error instanceof Error ? error.message : String(error) }) };
+    }
+  };
+
+  const worktreeService = deps.worktrees;
+
+  // The Hub's whole worktree surface: one published JSON family, rendered by
+  // src/shell/worktree-dialog.ts in both the in-workspace picker and the
+  // dashboard. The retired server-rendered `/worktrees` flow had a second
+  // dependency object here; there is only this one now.
+  const worktreeApi = worktreeService === undefined ? undefined : createWorktreeApi({
+    service: worktreeService,
+    registry,
+    async inventory(sourceWorkspaceId, reason) {
+      return (await worktreeReconciler?.request(sourceWorkspaceId, reason)) ?? worktreeService.inventory(sourceWorkspaceId);
+    },
+    changed(sourceWorkspaceId, also = []) {
+      liveBroker.publishWorktrees([...worktreeService.familyOf(sourceWorkspaceId), ...also]);
+      void worktreeReconciler?.rebaseline(sourceWorkspaceId).catch(() => undefined);
+    },
+    async startWorkspace(workspaceId): Promise<WorktreeStartOutcome> {
+      const outcome = await startWorkspaceSession(workspaceId);
+      if (outcome.ok) return { ok: true };
+      const body = await outcome.response.clone().json().catch(() => ({})) as { error?: string };
+      return { ok: false, message: body.error ?? "The workspace could not be started." };
+    },
+  });
+
   const mutateFolder = async (
     request: Request,
     operation: "create" | "rename" | "remove",
@@ -1485,6 +1653,15 @@ export function createHubFetchHandler(deps: HubDeps) {
     if (pathname === "/settings" && request.method === "GET") {
       return htmlResponse(settingsPage(session.user));
     }
+    // The published JSON worktree family, behind the same gate as the
+    // dashboard. A cookie transport keeps the same-origin rule on every
+    // mutation; refusals are ordinary 200 answers the dialog renders.
+    if (worktreeApi && isWorktreeApiPath(pathname)) {
+      if (request.method !== "GET" && !csrfOk(request, session.transport)) {
+        return json(403, { error: "cross-origin request rejected" }, NO_STORE_HEADERS);
+      }
+      return worktreeApi.handle(request, url, { user: session.user });
+    }
     if (pathname === "/api/hub/state" && request.method === "GET") {
       return hubState();
     }
@@ -1750,40 +1927,9 @@ export function createHubFetchHandler(deps: HubDeps) {
           return json(404, { error: `unknown workspace: ${workspaceId}` });
         }
         if (action[2] === "start") {
-          // A pending onboarding journal can cover a partially configured
-          // registration (an assignment commit whose rollback also
-          // failed); starting it would project the previous or empty
-          // assignment set. Frozen until recovery, like assignment
-          // mutations and folder changes.
-          if (deps.onboarding && await deps.onboarding.hasPendingRecovery()) {
-            return json(409, { error: "a pending onboarding requires Hub recovery before session starts" }, NO_STORE_HEADERS);
-          }
-          // A pending folder mutation freezes starts for the mirror-image
-          // reason: a registered rename or removal whose filesystem and
-          // registry halves diverged leaves the registry pointing at the
-          // journaled source path. Starting now either fails against a
-          // directory that is gone or — if something recreated that path —
-          // serves the workspace from unrelated content. Failing closed on
-          // an uninspectable journal, as the mutation routes do.
-          try {
-            await deps.folderManager?.assertNoPendingMutation();
-          } catch (error) {
-            return folderError(error);
-          }
-          try {
-            // Starting is fenced by the folder-mutation journal from inside
-            // the workspace's lifecycle operation (see SessionManager.start):
-            // a journal that outlived its mutation means the registry may
-            // still point at a path recovery has to move or restore, and a
-            // child spawned there would carry this workspace's credentials
-            // and personal identity into unrelated content. The refusal
-            // arrives as a FolderManagerError and answers 409.
-            await sessions.start(workspaceId);
-            return json(200, { id: workspaceId, running: true });
-          } catch (error) {
-            if (error instanceof FolderManagerError) return folderError(error);
-            return json(500, { error: error instanceof Error ? error.message : String(error) });
-          }
+          const outcome = await startWorkspaceSession(workspaceId);
+          if (!outcome.ok) return outcome.response;
+          return json(200, { id: workspaceId, running: true });
         }
         const stopped = await sessions.stop(workspaceId);
         return json(200, { id: workspaceId, running: false, wasRunning: stopped });
@@ -1861,6 +2007,10 @@ export function createHubFetchHandler(deps: HubDeps) {
               // is gone either way.
               return "reused";
             }
+            // Child onboarding holds this same parent lifecycle queue through
+            // its commit. Keep the dependent check AND all cleanup under it:
+            // no child may appear while personal-state persistence yields.
+            assertNoRegisteredWorktreeDependents(registry, workspaceId);
             await personalState.forgetWorkspace(
               workspaceId,
               () => registry.remove(workspaceId),
@@ -1875,6 +2025,7 @@ export function createHubFetchHandler(deps: HubDeps) {
           return json(200, { id: workspaceId, forgotten: true });
         } catch (error) {
           if (error instanceof FolderManagerError) return folderError(error);
+          if (error instanceof WorktreeOperationError) return json(409, { error: error.detail.message });
           const message = error instanceof Error ? error.message : String(error);
           if (message.includes("before forgetting")) return json(409, { error: message });
           return json(500, { error: "failed to forget workspace" });
@@ -1919,7 +2070,8 @@ export function startHubServer(deps: HubDeps) {
     reservations: deps.reservations,
   });
   const { live, liveBroker } = assembleLive(deps);
-  const handler = createHubFetchHandler({ ...deps, cloneJobs, live, liveBroker });
+  const worktreeReconciler = assembleWorktreeReconciler(deps, liveBroker);
+  const handler = createHubFetchHandler({ ...deps, cloneJobs, live, liveBroker, ...(worktreeReconciler ? { worktreeReconciler } : {}) });
   const server = Bun.serve<BridgeData>({
     hostname: deps.config.host,
     port: deps.config.port,
@@ -1941,5 +2093,5 @@ export function startHubServer(deps: HubDeps) {
       },
     },
   });
-  return Object.assign(server, { cloneJobs, live, liveBroker });
+  return Object.assign(server, { cloneJobs, live, liveBroker, worktreeReconciler });
 }

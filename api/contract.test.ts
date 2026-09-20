@@ -23,7 +23,19 @@ import {
   parseLiveHello,
   parseLiveSubscriptionChange,
   sanitizeWorkspaceActivity,
+  WORKTREE_INVALIDATION,
 } from "../src/shared/live-protocol";
+import {
+  WORKTREE_AVAILABILITIES,
+  WORKTREE_CREATE_MODES,
+  WORKTREE_CREATE_PHASES,
+  WORKTREE_DELETE_PHASES,
+  WORKTREE_ERROR_CODES,
+  WORKTREE_INVENTORY_STATUSES,
+  WORKTREE_OPERATION_KINDS,
+  WORKTREE_OWNERSHIPS,
+  WORKTREE_RETRY_ACTIONS,
+} from "../src/shared/worktree-contract";
 
 type Inventory = { operations: Array<{ operationId: string; domain: string; method: string; path: string; childPath?: string; transport?: string; runtime: string }> };
 type Streaming = { channels: Record<string, unknown>; schemas: Record<string, object> };
@@ -117,6 +129,30 @@ describe("API contract structure", () => {
       expect(typeof item.reason).toBe("string");
       expect("path" in item || "pathPattern" in item).toBe(true);
       expect(Array.isArray(item.methods)).toBe(true);
+    }
+  });
+});
+
+describe("worktree contract agrees with the shared wire protocol", () => {
+  test("published enum families exactly match the runtime vocabulary", async () => {
+    type Schema = { enum?: string[]; properties?: Record<string, Schema> };
+    const openapi = await readYaml<{ components: { schemas: Record<string, Schema> } }>("api/openapi.yaml");
+    const schemas = openapi.components.schemas;
+    const families: Array<[Schema, readonly string[]]> = [
+      [schemas.WorktreeOwnership!, WORKTREE_OWNERSHIPS],
+      [schemas.WorktreeAvailability!, WORKTREE_AVAILABILITIES],
+      [schemas.WorktreeErrorCode!, WORKTREE_ERROR_CODES],
+      [schemas.WorktreeRetryAction!, WORKTREE_RETRY_ACTIONS],
+      // Create and delete share `complete`; the wire schema is their union,
+      // not an ordering of either operation's phase transitions.
+      [schemas.WorktreePhase!, [...new Set([...WORKTREE_CREATE_PHASES, ...WORKTREE_DELETE_PHASES])]],
+      [schemas.WorktreeInventoryResponse!.properties!.inventory!.properties!.status!, WORKTREE_INVENTORY_STATUSES],
+      [schemas.WorktreeOperationResult!.properties!.kind!, WORKTREE_OPERATION_KINDS],
+      [schemas.CreateWorktreeRequest!.properties!.mode!, WORKTREE_CREATE_MODES],
+    ];
+    for (const [schema, values] of families) {
+      expect(schema.enum).toBeDefined();
+      expect([...schema.enum!].sort()).toEqual([...values].sort());
     }
   });
 });
@@ -249,6 +285,8 @@ describe("live stream contract agrees with the shared wire protocol", () => {
       { add: [{ topic: "inventory", cursor: "7" }] },
       { add: [{ topic: "conversation", key: "opencode:conversation-1", cursor: "eyJ2IjoxfQ" }], remove: [{ topic: "conversation", key: "opencode:conversation-0" }] },
       { remove: [{ topic: "document", key: "" }, { topic: "inventory" }] },
+      { add: [{ topic: "worktrees" }] },
+      { add: [{ topic: "worktrees", cursor: "ignored" }], remove: [{ topic: "worktrees" }] },
     ];
     for (const body of valid) {
       expect(validate(body)).toBe(true);
@@ -259,6 +297,7 @@ describe("live stream contract agrees with the shared wire protocol", () => {
       { add: [{ topic: "conversation" }] },
       { add: [{ topic: "conversation", key: "" }] },
       { add: [{ topic: "inventory", key: "x" }] },
+      { add: [{ topic: "worktrees", key: "x" }] },
       { add: Array.from({ length: LIVE_MAX_SUBSCRIPTIONS + 1 }, (_, index) => ({ topic: "conversation", key: `opencode:${index}` })) },
       { replace: [] },
       [],
@@ -290,7 +329,11 @@ describe("live stream contract agrees with the shared wire protocol", () => {
       { ws: "uatu", topic: "conversation", key: "opencode:c", cursor: "", event: { kind: "resync" } },
       { ws: "uatu", topic: "conversation", key: "opencode:c", cursor: "x", event: { kind: "unavailable" } },
       { ws: "payments-api", topic: "activity", cursor: "3", event: { kind: "data", data: { running: false, working: false, awaiting: false } } },
+      { ws: "uatu", topic: "worktrees", cursor: "", event: { kind: "data", data: WORKTREE_INVALIDATION } },
+      { ws: "uatu", topic: "worktrees", cursor: "", event: { kind: "ready" } },
     ];
+    expect(compile("WorktreeInventoryEvent")(WORKTREE_INVALIDATION)).toBe(true);
+    expect(compile("WorktreeInventoryEvent")({ type: "worktree.inventory", path: "/secret" })).toBe(false);
     for (const value of envelopes) {
       const frame = formatLiveEnvelope(value);
       expect(frame.startsWith(`event: ${LIVE_ENVELOPE_EVENT}\n`)).toBe(true);
