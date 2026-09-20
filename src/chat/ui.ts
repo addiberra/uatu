@@ -3493,7 +3493,7 @@ export function initChat(api = new ChatApiClient()): void {
   // Answering is editing inside a request card. It is derived here rather
   // than in CSS because only the focus path knows which control took focus,
   // and it is the one state that hands the transcript the whole visible band.
-  let answeringRequest = false;
+  let heldAnswerField: HTMLElement | null = null;
   const syncEditingFocus = () => {
     const active = document.activeElement;
     const editing = surface.contains(active) && isTextEditingControl(active);
@@ -3501,12 +3501,16 @@ export function initChat(api = new ChatApiClient()): void {
     document.documentElement.toggleAttribute("data-chat-input-focused", active === input);
     const answering = editing && Boolean((active as Element).closest?.(".chat-request, [data-question-form]"));
     document.documentElement.toggleAttribute("data-chat-answering", answering);
-    // Only on the transitions: the chrome collapses once, the field is brought
-    // inside the band that collapse just freed, and its timeline is held there
-    // until focus leaves the request again.
-    if (answering && !answeringRequest && active instanceof HTMLElement) holdInOwningTimeline(active);
-    else if (!answering && answeringRequest) releaseHeldTimelines();
-    answeringRequest = answering;
+    // Focus identity, not the answering boolean, owns the hold: two request
+    // fields can hand focus directly to one another, including across owners.
+    // Ordinary viewport corrections only reveal; they must not renew a hold
+    // that an explicit gesture released.
+    const next = answering && chatSurfaceActive() && active instanceof HTMLElement ? active : null;
+    if (next !== heldAnswerField) {
+      if (heldAnswerField) releaseHeldTimelines();
+      heldAnswerField = next;
+      if (next) holdInOwningTimeline(next);
+    }
     viewport.apply();
   };
   surface.addEventListener("focusin", syncEditingFocus);
@@ -4372,6 +4376,7 @@ export function initChat(api = new ChatApiClient()): void {
       childRenderer.setShellOutputsHidden(true);
       parentScroll.cancel();
       childScroll?.cancel();
+      heldAnswerField = null;
       readSignal.cancel();
       childReadSignal?.cancel();
       if (incrementalTimer !== null) { clearTimeout(incrementalTimer); incrementalTimer = null; }
@@ -4381,6 +4386,9 @@ export function initChat(api = new ChatApiClient()): void {
       return;
     }
     if (becameActive) {
+      // Backgrounding cancels owners but may retain DOM focus without another
+      // focusin. Restore only the currently valid request field on return.
+      syncEditingFocus();
       if (readLane) readLane.token = readSignal.start(readLane.label);
       else if (bootstrapping) bootstrapRead = readSignal.start("Loading conversations...");
       if (child?.read) child.read.token = childReadSignal?.start(child.read.label) ?? 0;

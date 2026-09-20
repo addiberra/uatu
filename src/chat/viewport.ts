@@ -13,6 +13,7 @@ export class ChatViewportController {
   private correctionPending = false;
   private lastTop: number | null = null;
   private lastHeight: number | null = null;
+  private lastVisualHeight: number | null = null;
   private lastCovered: number | null = null;
 
   /** Every listener shares one frame: a pan must cost one write, not one per event. */
@@ -90,7 +91,10 @@ export class ChatViewportController {
     // the surface that lies below the visible band. Independent of the pan,
     // because the surface's top tracks it.
     const covered = answering ? Math.max(0, window.innerHeight - height) : 0;
-    const pannedOnly = this.lastTop !== null && this.lastTop !== top && this.lastHeight === surfaceHeight;
+    // The answering surface keeps its layout height even when the visible
+    // band shrinks. Only suppress a pan if that band is unchanged too.
+    const pannedOnly = this.lastTop !== null && this.lastTop !== top
+      && this.lastHeight === surfaceHeight && this.lastVisualHeight === height;
     if (touch) {
       // Rewriting a value the surface already carries re-enters through our own
       // ResizeObserver, so each write has to be a real change.
@@ -99,6 +103,7 @@ export class ChatViewportController {
       if (this.lastCovered !== covered) this.surface.style.setProperty("--chat-keyboard-inset", `${covered}px`);
       this.lastTop = top;
       this.lastHeight = surfaceHeight;
+      this.lastVisualHeight = height;
       this.lastCovered = covered;
     } else {
       // The desktop shell owns this rectangle, including its safe areas.
@@ -107,6 +112,7 @@ export class ChatViewportController {
       this.surface.style.removeProperty("--chat-keyboard-inset");
       this.lastTop = null;
       this.lastHeight = null;
+      this.lastVisualHeight = null;
       this.lastCovered = null;
     }
     const visible = document.visibilityState !== "hidden" && (touch

@@ -749,6 +749,93 @@ test("the transcript holds still while an answer is typed", async ({ page, reque
   expect(await timeline.evaluate(element => element.scrollTop)).toBe(0);
 });
 
+async function expectAnswerAtKeyboard(card: Locator, timeline: Locator): Promise<void> {
+  const padding = await timeline.evaluate(element => Number.parseFloat(getComputedStyle(element).scrollPaddingBottom) || 0);
+  await expect.poll(() => card.evaluate((element, pad) => {
+    const viewport = window.visualViewport!;
+    const edge = viewport.offsetTop + viewport.height;
+    const field = element.querySelector("[data-question-custom-input]")!.getBoundingClientRect();
+    const actions = element.querySelector(".chat-request-actions")!.getBoundingClientRect();
+    return field.top >= viewport.offsetTop && field.bottom <= edge + 1
+      && actions.bottom <= edge + 1 && actions.bottom >= edge - pad - 4;
+  }, padding)).toBe(true);
+}
+
+for (const drilldown of [false, true]) {
+  test(`answer hold follows direct field transfer and retained foreground focus (${drilldown ? "drill-down" : "parent"})`, async ({ page, request }) => {
+    await installFakeVisualViewport(page);
+    const parent = await boot(page, request);
+    const owner = drilldown
+      ? (await control(request, { action: "seed", title: "Answer owner", child: true, items: [] })).conversation.id as string
+      : parent;
+    const other = await control(request, { action: "seed", title: "Independent request owner", child: true, items: [] });
+    for (const item of [...messages("answer-history", 28), freeFormQuestion("transfer-a", 100),
+      { ...freeFormQuestion("transfer-b", 101), conversationId: other.conversation.id }]) {
+      await control(request, { action: "item", conversationId: owner, item });
+    }
+    if (drilldown) {
+      await control(request, { action: "item", conversationId: parent, item: {
+        id: "tool:answer-owner", type: "tool", createdAt: 200, name: "task", status: "completed",
+        input: JSON.stringify({ description: "Answer owner", subagent_type: "explore", prompt: "go" }), childConversationId: owner,
+      } });
+      await page.locator("#chat-subagents summary").click();
+      await page.getByRole("button", { name: "explore · Answer owner" }).click();
+      await expect(page.locator("#chat-drilldown")).toBeVisible();
+    }
+    const timeline = page.locator(drilldown ? "#chat-drilldown-timeline" : "#chat-timeline");
+    const a = timeline.locator('[data-chat-item-id="question:transfer-a"]');
+    const b = timeline.locator('[data-chat-item-id="question:transfer-b"]');
+    // Open both editors first. The regression is a direct input-to-input
+    // transfer, not clicking a radio (which would blur out of answering).
+    for (const card of [a, b]) {
+      await card.getByRole("radio", { name: "Type your own answer" }).check();
+      // Release setup focus before Playwright scrolls the next radio into
+      // view; the direct field-to-field transfer is exercised below.
+      await card.locator("[data-question-custom-input]").evaluate(element => (element as HTMLElement).blur());
+    }
+    await a.locator("[data-question-custom-input]").evaluate(element => (element as HTMLElement).focus({ preventScroll: true }));
+    await setVisualViewport(page, { height: 460 });
+    await expectAnswerAtKeyboard(a, timeline);
+    await b.locator("[data-question-custom-input]").evaluate(element => (element as HTMLElement).focus({ preventScroll: true }));
+    await expectAnswerAtKeyboard(b, timeline);
+    await expect.poll(stillScrollTop(timeline)).toBe(true);
+    await timeline.evaluate(element => { element.scrollTop -= 150; element.dispatchEvent(new Event("scroll")); });
+    await expectAnswerAtKeyboard(b, timeline);
+
+    await page.evaluate(() => {
+      Object.defineProperty(document, "visibilityState", { configurable: true, value: "hidden" });
+      document.dispatchEvent(new Event("visibilitychange"));
+      Object.defineProperty(document, "visibilityState", { configurable: true, value: "visible" });
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+    await expect(b.locator("[data-question-custom-input]")).toBeFocused();
+    // Let lifecycle reveal/settle work finish before injecting caret scroll;
+    // a pending one-shot reveal must not disguise a missing standing hold.
+    await page.waitForTimeout(500);
+    await expect.poll(stillScrollTop(timeline)).toBe(true);
+    await timeline.evaluate(element => { element.scrollTop -= 150; element.dispatchEvent(new Event("scroll")); });
+    await expectAnswerAtKeyboard(b, timeline);
+  });
+}
+
+test("answering corrects a combined resize and pan with an unchanged visible bottom", async ({ page, request }) => {
+  await installFakeVisualViewport(page);
+  await boot(page, request, { items: [...messages("pan-history", 28), freeFormQuestion("resize-pan", 100)] });
+  const card = page.locator('[data-chat-item-id="question:resize-pan"]');
+  const timeline = page.locator("#chat-timeline");
+  await card.getByRole("radio", { name: "Type your own answer" }).check();
+  await setVisualViewport(page, { height: 460, offsetTop: 0 });
+  await expectAnswerAtKeyboard(card, timeline);
+  await page.waitForTimeout(500);
+  await expect.poll(stillScrollTop(timeline)).toBe(true);
+  // Exactly one geometry notification, no later focus, item or resize to
+  // mask the missed correction. Layout height and visible bottom stay fixed.
+  await setVisualViewport(page, { height: 360, offsetTop: 100 });
+  await expect(page.locator("#chat-surface")).toHaveCSS("--chat-visual-height", "844px");
+  await expect(page.locator("#chat-surface")).toHaveCSS("--chat-visual-top", "100px");
+  await expectAnswerAtKeyboard(card, timeline);
+});
+
 test("focusing a request's answer field does not zoom the page", async ({ page, request }) => {
   // iOS zooms the page on focus for any text control under 16px, and the
   // free-form answer field is the one that takes focus mid-conversation —

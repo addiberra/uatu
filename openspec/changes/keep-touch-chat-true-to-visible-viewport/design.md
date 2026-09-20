@@ -46,6 +46,7 @@ Coalesce every listener into a single `requestAnimationFrame`-scheduled apply, c
 
 **D5 — While editing, a pan alone does not request a correction.**
 When `html[data-chat-editing]` is set and only `visualTop` changed between applies, write the geometry but do not call `requestCorrection()`. A caret-tracking pan is the platform moving the window over an unchanged document; the reader did not ask for a new position. Height changes still request a correction while editing, because those genuinely resize the transcript. `data-chat-editing` is read here only as controller state — per the constraint it is not used as a CSS trigger.
+Compare the actual visual height as well as the applied surface height: D10 keeps the latter fixed while answering, so it cannot distinguish a pure pan from a simultaneous keyboard resize and pan.
 
 **D6 — The question card claims the anchor before focus.**
 The question `change` handler in `src/chat/ui.ts` calls `syncQuestionControl(input, true)`, which un-hides and focuses the custom editor. Call the coordinated owner's `beforeMutation(<card's `data-chat-item-id`>)` before that, so the pending correction holds the card being answered instead of the topmost visible item. This reuses the existing `preferredItemId` seam — the same one `ui.ts` already uses when expanding a `<details>` — rather than adding a new suppression path around focus. Pairs with D7: the touch fix stops the gesture from unpinning, the anchor hand-off makes the resulting correction land on the right card.
@@ -95,6 +96,12 @@ of what it does rather than a new mechanism. It is a standing mode
 (`hold(element)` / `release()`) rather than an option on the one-shot
 `reveal(element)`, because a reveal is consumed by the frame that serves it
 while a hold outlives it and has to be ended by name.
+The hold follows the focused element's identity, not just the answering boolean:
+a direct transfer between request fields releases the old owner and holds the
+new field. Hiding the surface cancels the hold and clears its tracked identity;
+on foreground return, retained request focus reinstalls the hold even without a
+new focus event. Ordinary viewport corrections remain one-shot reveals, so they
+do not reinstate a hold released by an explicit scroll gesture.
 
 **D14 — The held field sits at the bottom of the band.**
 While the hold is in force the reveal does not merely put the field *inside*

@@ -97,6 +97,27 @@ leaves the request, the surface SHALL return to its normal arrangement.
 - **THEN** the transcript returns to the position that keeps the field in view
 - **AND** it scrolls freely again once the field loses focus
 
+#### Scenario: A keyboard resize and pan together keep the answer visible
+- **WHEN** a touch user is answering a request and the visual viewport's height
+  and offset change together while the chat surface retains its layout height
+- **THEN** the focused field and its submit and cancel controls are repositioned
+  inside the new visible band without waiting for another viewport notification
+- **AND** a subsequent pan with no height change does not reposition the transcript
+
+#### Scenario: A direct focus transfer holds the new answer field
+- **WHEN** focus moves directly between two independently answerable request
+  fields without leaving the answering state
+- **THEN** subsequent platform autoscroll is corrected for the newly focused
+  field rather than the previous field
+- **AND** the previous field's timeline hold is released
+
+#### Scenario: Returning with retained answer focus restores the hold
+- **WHEN** the app returns from the background with a request's answer field
+  still focused and without a new focus event
+- **THEN** the field's timeline hold is restored in its parent or drill-down
+  transcript
+- **AND** later caret autoscroll is corrected after foreground recovery settles
+
 #### Scenario: Answering a request on touch puts the chrome under the keyboard
 - **WHEN** a touch user focuses a request's free-form answer field and the
   software keyboard opens while the task, subagent and background-task tracks
@@ -265,4 +286,3 @@ A pending request SHALL remain discoverable and answerable even when the server 
 #### Scenario: Reconciliation failure preserves what is already shown
 - **WHEN** the server cannot read OpenCode's pending set while loading a conversation
 - **THEN** requests already known to the conversation remain visible and answerable
-

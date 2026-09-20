@@ -961,6 +961,69 @@ describe("chat answering state", () => {
     }
   });
 
+  for (const lifecycle of ["transfer", "resume"] as const) test(`answer hold follows ${lifecycle} in parent and drill-down`, async () => {
+    const { document, window } = parseHTML(html);
+    installDomGlobals(document, window);
+    document.documentElement.setAttribute("data-ui-mode", "touch");
+    document.documentElement.setAttribute("data-active-tab", "chat");
+    stubConversationSelect(document);
+    let active: Element | null = null;
+    let visibility = "visible";
+    Object.defineProperty(document, "activeElement", { configurable: true, get: () => active });
+    Object.defineProperty(document, "visibilityState", { configurable: true, get: () => visibility });
+    const focus = (element: Element) => { active = element; element.dispatchEvent(new window.Event("focusin", { bubbles: true })); };
+    const { CoordinatedScrollOwner } = await import("./coordinated-scroll");
+    const calls: Array<{ kind: string; scroller: string; element?: Element }> = [];
+    const hold = CoordinatedScrollOwner.prototype.hold;
+    const release = CoordinatedScrollOwner.prototype.release;
+    CoordinatedScrollOwner.prototype.hold = function (element, options) {
+      calls.push({ kind: "hold", scroller: this.scroller.id, element });
+      hold.call(this, element, options);
+    };
+    CoordinatedScrollOwner.prototype.release = function () {
+      calls.push({ kind: "release", scroller: this.scroller.id });
+      release.call(this);
+    };
+    try {
+      const { initChat } = await import(`./ui.ts?answer-lifecycle=${lifecycle}-${Date.now()}`);
+      initChat(questionApi(document));
+      await waitForQuestionCard(document);
+      // Synthetic request controls isolate focus ownership from rendering and
+      // provider request ordering; real independently-owned requests are E2E.
+      for (const id of ["chat-timeline", "chat-drilldown-timeline"]) {
+        const request = document.createElement("div");
+        request.className = "chat-request";
+        const first = document.createElement("input");
+        const second = document.createElement("input");
+        request.append(first, second);
+        document.getElementById(id)!.append(request);
+        focus(first);
+        calls.length = 0;
+        if (lifecycle === "transfer") {
+          focus(second);
+          expect(calls.filter(call => call.kind === "hold").map(call => ({ scroller: call.scroller, correctField: call.element === second }))).toEqual([{ scroller: id, correctField: true }]);
+          expect(calls.findIndex(call => call.kind === "release")).toBeLessThan(calls.findIndex(call => call.kind === "hold"));
+        } else {
+          visibility = "hidden";
+          document.dispatchEvent(new window.Event("visibilitychange"));
+          visibility = "visible";
+          document.dispatchEvent(new window.Event("visibilitychange"));
+          expect(calls.filter(call => call.kind === "hold").map(call => ({ scroller: call.scroller, correctField: call.element === first }))).toEqual([{ scroller: id, correctField: true }]);
+        }
+        calls.length = 0;
+        // Repeated focus sync/viewport corrections must not undo a gesture's
+        // release by installing the same hold again.
+        focus(active!);
+        expect(calls.filter(call => call.kind === "hold")).toEqual([]);
+      }
+    } finally {
+      CoordinatedScrollOwner.prototype.hold = hold;
+      CoordinatedScrollOwner.prototype.release = release;
+      await Bun.sleep(20);
+      window.dispatchEvent(new Event("pagehide"));
+    }
+  });
+
   test("on desktop the answered field is held with the minimal move", async () => {
     // The end alignment exists because a keyboard covers the chrome and the
     // question has to be pressed against what is left. Nothing covers it on

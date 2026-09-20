@@ -247,6 +247,37 @@ describe("chat visual viewport geometry", () => {
     }
   });
 
+  test("a simultaneous resize and pan while answering still corrects the focused field", () => {
+    const f = harness();
+    try {
+      Object.defineProperty(window, "innerHeight", { configurable: true, value: 844 });
+      f.root.setAttribute("data-chat-answering", "");
+      f.root.setAttribute("data-chat-editing", "");
+      f.viewport.height = 460;
+      f.controller.start();
+      expect(f.requests()).toBe(1);
+
+      f.viewport.height = 360;
+      f.viewport.offsetTop = 100;
+      f.viewportEvent("resize");
+      f.viewportEvent("scroll");
+      expect(f.frames.size).toBe(1);
+      f.runFrames();
+      expect(f.requests()).toBe(2);
+      expect(f.style("--chat-visual-height")).toBe("844px");
+      expect(f.style("--chat-visual-top")).toBe("100px");
+      expect(f.style("--chat-keyboard-inset")).toBe("484px");
+
+      // A real pan-only caret movement must still leave the transcript alone.
+      f.viewport.offsetTop = 120;
+      f.viewportEvent("scroll");
+      f.runFrames();
+      expect(f.requests()).toBe(2);
+    } finally {
+      f.restore();
+    }
+  });
+
   test("a pan while editing moves the surface without moving the conversation", () => {
     const f = harness();
     try {
