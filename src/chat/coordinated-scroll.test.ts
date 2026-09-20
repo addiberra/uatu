@@ -61,6 +61,72 @@ function withVisibleBand(band: { height: number; offsetTop: number }, run: () =>
 }
 
 describe("coordinated scrolling", () => {
+  for (const end of ["release", "cancel", "latest", "pause", "detach"] as const) test(`hold identity query after ${end}`, () => {
+    const f = fixture();
+    const field = f.document.createElement("input") as unknown as HTMLElement;
+    const other = f.document.createElement("input") as unknown as HTMLElement;
+    f.element.append(field, other);
+    expect(f.owner.isHolding(field)).toBe(false);
+    f.owner.hold(field);
+    expect(f.owner.isHolding(field)).toBe(true);
+    expect(f.owner.isHolding(other)).toBe(false);
+    if (end === "detach") field.remove();
+    else f.owner[end]();
+    expect(f.owner.isHolding(field)).toBe(false);
+  });
+  for (const pinned of [true, false]) test(`answer release preserves original following=${pinned}`, () => {
+    const f = fixture();
+    if (!pinned) f.owner.pause();
+    stubRect(f.element, () => ({ top: 0, bottom: 300 }));
+    const field = f.document.createElement("input"); f.element.append(field);
+    stubRect(field, () => ({ top: 450 - f.element.scrollTop, bottom: 470 - f.element.scrollTop }));
+    f.owner.hold(field as unknown as HTMLElement); f.flush();
+    expect(f.element.scrollTop).toBe(170);
+    f.owner.release();
+    f.grow(470); f.event("scroll"); f.owner.request(); f.flush();
+    f.grow(800); f.owner.request(true); f.flush();
+    expect(f.anchor.isPinned()).toBe(pinned);
+    expect(f.element.scrollTop).toBe(pinned ? 500 : 170);
+  });
+  for (const type of ["radio", "checkbox"]) test(`${type} drags pause following`, () => {
+    const f = fixture();
+    const field = f.document.createElement("input"); field.setAttribute("type", type); f.element.append(field);
+    f.owner.latest();
+    f.eventAt(field, "touchstart", { touches: [{ clientY: 100 }] });
+    f.eventAt(field, "touchmove", { touches: [{ clientY: 140 }] });
+    expect(f.anchor.isPinned()).toBe(false);
+    expect(f.frames.size).toBe(0);
+  });
+  for (const action of ["cancel", "pause"] as const) test(`${action} ends the hold without stale follow restoration`, () => {
+    const f = fixture();
+    stubRect(f.element, () => ({ top: 0, bottom: 300 }));
+    const field = f.document.createElement("input"); f.element.append(field);
+    stubRect(field, () => ({ top: 450 - f.element.scrollTop, bottom: 470 - f.element.scrollTop }));
+    f.owner.hold(field as unknown as HTMLElement); f.flush();
+    f.owner[action]();
+    expect(f.frames.size).toBe(0);
+    f.owner.beforeMutation("line");
+    f.owner.release();
+    f.grow(800); f.owner.request(true); f.flush();
+    expect(f.anchor.isPinned()).toBe(action === "cancel");
+    expect(f.element.scrollTop).toBe(action === "cancel" ? 500 : 170);
+  });
+  for (const end of ["latest", "detach", "release"] as const) test(`${end} retires the held target and pending reveal`, () => {
+    const f = fixture();
+    stubRect(f.element, () => ({ top: 0, bottom: 300 }));
+    const field = f.document.createElement("input"); f.element.append(field);
+    stubRect(field, () => ({ top: 450 - f.element.scrollTop, bottom: 470 - f.element.scrollTop }));
+    f.owner.hold(field as unknown as HTMLElement); f.flush();
+    f.move(100); f.event("scroll");
+    if (end === "detach") field.remove();
+    else f.owner[end]();
+    f.flush();
+    expect(f.element.scrollTop).toBe(300);
+    f.move(80); f.event("scroll");
+    expect(f.anchor.isPinned()).toBe(false);
+    expect(f.frames.size).toBe(0);
+    expect(f.element.scrollTop).toBe(80);
+  });
   test("upward scrolling without a wheel event still pauses when revealing content changes the extent", () => {
     const f = fixture();
     f.grow(800);

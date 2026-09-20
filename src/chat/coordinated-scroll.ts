@@ -46,6 +46,7 @@ export class CoordinatedScrollOwner {
   private heldTarget: HTMLElement | null = null;
   private heldOptions: RevealOptions | undefined;
   private heldTop: number | null = null;
+  private resumeFollowing = false;
   private disposed = false;
   private previous: AnchorGeometry;
   private touchY: number | null = null;
@@ -93,6 +94,8 @@ export class CoordinatedScrollOwner {
   flush(timestamp: number): void {
     if (!this.active()) { this.cancel(); return; }
     if (this.lastCorrectionFrame === timestamp) { this.request(); return; }
+    // Retire stale DOM ownership before the anchor chooses this frame's top.
+    if (this.heldTarget && !this.scroller.contains(this.heldTarget)) this.release();
     if (this.frame !== null) this.cancelFrame(this.frame);
     this.frame = null;
     const geometry = this.measure();
@@ -146,6 +149,7 @@ export class CoordinatedScrollOwner {
    */
   hold(element: HTMLElement, options?: RevealOptions): void {
     if (!this.active()) return;
+    if (!this.heldTarget) this.resumeFollowing = this.options.anchor.isPinned();
     this.heldTarget = element;
     // A hold ends at the bottom of the band unless its caller says otherwise:
     // a held control is one the reader is typing into under a keyboard, and
@@ -156,11 +160,30 @@ export class CoordinatedScrollOwner {
     this.reveal(element, this.heldOptions);
   }
 
-  /** End the hold, leaving the scroller exactly where it stands. */
+  /** Whether this exact, still-contained control owns the standing hold. */
+  isHolding(element: HTMLElement): boolean {
+    return this.heldTarget === element && this.scroller.contains(element);
+  }
+
+  /** End temporary answer positioning and resume only the original follow intent.
+   * Position writes still wait for a coordinated frame and its final geometry. */
   release(): void {
+    const resume = this.resumeFollowing;
+    this.clearHold();
+    if (resume) {
+      this.options.anchor.jumpToLatest(this.options.measure(false));
+      this.request();
+      this.options.onChange?.();
+    }
+  }
+
+  private clearHold(): void {
+    this.resumeFollowing = false;
     this.heldTarget = null;
     this.heldOptions = undefined;
     this.heldTop = null;
+    this.revealTarget = null;
+    this.revealOptions = undefined;
   }
 
   /**
@@ -177,6 +200,10 @@ export class CoordinatedScrollOwner {
    * leaves the anchor alone, so following is not lost for nothing.
    */
   private applyReveal(timestamp: number): void {
+    if (this.heldTarget && !this.scroller.contains(this.heldTarget)) {
+      this.release();
+      return;
+    }
     const target = this.revealTarget;
     const options = this.revealOptions;
     this.revealTarget = null;
@@ -244,6 +271,7 @@ export class CoordinatedScrollOwner {
   /** Immediate positioning, on the next coordinated frame, never a smooth animation. */
   latest(): void {
     if (!this.active()) return;
+    this.clearHold();
     this.upwardPending = false;
     // An explicit jump to the end outranks a reveal still waiting for a frame.
     this.revealTarget = null;
@@ -263,9 +291,11 @@ export class CoordinatedScrollOwner {
     this.revealOptions = undefined;
     // A hold is transient input too: the gestures and teardowns that cancel
     // pending work are the reader, or the surface, taking the scroller back.
-    this.heldTarget = null;
-    this.heldOptions = undefined;
-    this.heldTop = null;
+    // Cancelling a temporary hold restores its follow choice, but schedules
+    // nothing. pause() immediately replaces that choice with explicit intent.
+    const resume = this.resumeFollowing;
+    this.clearHold();
+    if (resume) this.options.anchor.jumpToLatest(this.options.measure(false));
     this.touchY = null;
   }
 
@@ -334,7 +364,12 @@ export class CoordinatedScrollOwner {
    * to move the conversation. */
   private inTextControl(event: Event): boolean {
     const target = event.target as Element | null;
-    return Boolean(target?.closest?.("input, textarea, select, [contenteditable=true]"));
+    const control = target?.closest?.("input, textarea, [contenteditable]");
+    if (!control) return false;
+    if (control.tagName === "TEXTAREA") return true;
+    if (control.tagName === "INPUT") return !["button", "checkbox", "color", "file", "hidden", "image", "radio", "range", "reset", "submit"]
+      .includes((control.getAttribute("type") ?? "text").toLowerCase());
+    return (control as HTMLElement).isContentEditable || ["", "true", "plaintext-only"].includes(control.getAttribute("contenteditable") ?? "false");
   }
   private wheel = (event: WheelEvent): void => { if (event.deltaY < 0 && this.ownsInput(event)) this.pause(); };
   private touchStart = (event: TouchEvent): void => {
@@ -346,7 +381,9 @@ export class CoordinatedScrollOwner {
     this.touchY = y ?? null;
   };
   private keyDown = (event: KeyboardEvent): void => {
-    if (!this.ownsInput(event) || this.inTextControl(event)) return;
+    // Choice controls consume navigation keys too (e.g. radio ArrowUp).
+    const target = event.target as Element | null;
+    if (!this.ownsInput(event) || target?.closest?.("input, textarea, select") || this.inTextControl(event)) return;
     if (["ArrowUp", "PageUp", "Home"].includes(event.key) || (event.key === " " && event.shiftKey)) this.pause();
   };
 

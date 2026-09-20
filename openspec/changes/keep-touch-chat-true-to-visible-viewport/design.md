@@ -40,6 +40,7 @@ Add a `resync` handler bound to `document` `visibilitychange`, window `pageshow`
 **D3 — Keyboard detection uses the layout/visual height difference.**
 `keyboardVisible = (layoutHeight − visualHeight) > max(80, tabBarInset)`. `occluded` keeps its existing role in `tabInset` unchanged. The pan offset tells us where the visible viewport sits, which matters for the inset; it tells us nothing about whether a keyboard exists. On the reported iPhone geometry (layout 844, visual 508, pan 266, tab bar hidden) the old predicate saw 70px and dropped `data-chat-keyboard` while the keyboard was up; the new one sees 336px. The existing unit assertions are all cases where `visualTop` is 0 or the tab bar is present, so they hold unchanged.
 *Alternative:* lower the 80px threshold — rejected: the threshold exists to keep accessory bars and URL-bar collapse from being read as keyboards, and the pan can be arbitrarily large.
+Pinch zoom is browser-owned, as in the desktop viewport controller: while the visual viewport scale differs from 1 by more than 0.01, retain the last normal-scale geometry and keyboard state and request no correction. A zoomed viewport is not evidence of a keyboard. Normal-scale measurements resume when zoom ends.
 
 **D4 — One frame, and no write when nothing changed.**
 Coalesce every listener into a single `requestAnimationFrame`-scheduled apply, cache the last written height and top, and skip `setProperty` when the value is unchanged. This closes the re-entrant loop directly: the controller observes the surface it resizes, so a write that changes nothing must produce no ResizeObserver callback with new values, and a write that does change something is one write per frame rather than one per pan event.
@@ -57,6 +58,7 @@ The question `change` handler in `src/chat/ui.ts` calls `syncQuestionControl(inp
 
 **D8 — The pill's clearance is reserved by the timeline, in CSS only.**
 `.chat-transcript-area:has(> #chat-requests-jump:not([hidden])) .chat-timeline { padding-bottom: 3.5rem; scroll-padding-bottom: 3.5rem; }`, placed beside the existing `.chat-latest:not([hidden]) + .chat-requests-jump` offset rule. `:has()` is already used in this stylesheet. The `scroll-padding-bottom` matters as much as the padding: scrolling a request into view must not park it under the pill either. Reserving space rather than moving the pill keeps the pill where it is documented to be — pinned at the right edge so the count cannot scroll away.
+The implemented selector wraps the pill id in `:where()` so its specificity cannot override D10's answering keyboard inset. This matters when a parent pill lacks `[hidden]` above a pushed drill-down but is visually suppressed by answering CSS.
 *Alternative:* make the pill part of the flow — rejected: it would push the composer in exactly the layout that has no room for it.
 
 **D9 — The background-task list joins the pinned-track budget.**
@@ -65,6 +67,7 @@ The question `change` handler in `src/chat/ui.ts` calls `syncQuestionControl(inp
 **D10 — The keyboard covers the chrome while a request is answered.**
 `syncEditingFocus` also toggles `data-chat-answering` on `<html>` when the focused text control sits inside a request card (`.chat-request` / `[data-question-form]`). While it is set on touch, the chat surface keeps the *layout* viewport height (`window.innerHeight`) instead of shrinking to the visual viewport; its top still follows the visual viewport's offset. The composer, the five pinned tracks (`#chat-task-list`, `#chat-subagents`, `#chat-background-tasks`, `#chat-reverted`, `#chat-queue`) and the Latest button therefore stay laid out where they are and the software keyboard slides up over them — they are literally under the keyboard, and they reappear as it dismisses. If the keyboard is already open when the request field takes focus (the user was in the composer), the surface's height transitions (~250 ms) so the bottom chrome visibly slides down under the keyboard rather than jumping. The header stays visible at the top. Only `#chat-requests-jump` — the outstanding-request pill, which yields anyway under D12 — and the prompt rail, which captures touches beside the field, are hidden while answering; nothing else is taken out of the layout. No tab-bar rule is needed (already hidden under `data-chat-editing`), and nothing in `styles.css` ~8020–8045 or `src/shell/tab-bar.ts` is touched. Once the keyboard geometry settles, the focused control is brought inside the visible viewport through the coordinated owner — it is the only automatic position writer, so no raw `scrollTop` or `scrollIntoView` on the nested timeline. *Tap safety:* the request's submit and cancel controls get the touch `pointerdown` `preventDefault()` the send button already has, so tapping them does not blur the field first and reflow the chrome back under the finger.
 Because the timeline now runs on under the keyboard and a scroller cannot be scrolled past its own bottom edge, the timeline reserves the covered strip (`--chat-keyboard-inset`, written by the viewport controller as the surface height below the visible band) as bottom padding while answering — otherwise a request at the very end of the conversation could never be lifted into the band.
+**Tap-safety correction after browser review:** the `pointerdown` guard described above is superseded by a `mousedown` guard. WebKit suppresses the touch-generated click when pointerdown is cancelled, so the earlier guard prevented Answer/Reject from activating. Keep focus stable without cancelling the touch pointer event.
 *Alternative:* hide the chrome outright — rejected after the field test: the disappearance reads as loss, not as making room. Letting the keyboard cover it says where the chrome went, and dismissing the keyboard brings it back by itself.
 
 **D11 — 16 px on the custom-answer input in touch mode.**
@@ -103,6 +106,17 @@ new field. Hiding the surface cancels the hold and clears its tracked identity;
 on foreground return, retained request focus reinstalls the hold even without a
 new focus event. Ordinary viewport corrections remain one-shot reveals, so they
 do not reinstate a hold released by an explicit scroll gesture.
+After parent and child paints, reconcile a removed focused answer control even
+when WebKit emits no `focusout`. The scroll owner also rejects a held target
+outside its scroller. Holds remember the reader's previous follow intent and
+restore it on release/cancellation; a reader who was unpinned remains unpinned,
+and an explicit pause or Latest action ends the hold. Automatic snapshot refresh
+reinstates a hold only if that field actually held its owner before cancellation,
+not merely because the same input still has focus. Touch drags from question
+radio/checkbox choices remain transcript gestures; only text-editing controls
+are excluded. The request action focus guard runs on `mousedown`, not
+`pointerdown`: cancelling touch pointerdown suppresses WebKit's compatibility
+click and prevents Answer/Reject activation.
 
 **D14 — The held field sits at the bottom of the band.**
 While the hold is in force the reveal does not merely put the field *inside*
@@ -151,7 +165,7 @@ conversation to fix the resting place of one, and it cannot pull a field
 
 ## Migration Plan
 
-None — no stored state, no protocol, no configuration. All three issues reproduce in `v0.7.0`, so per the repository's release-note discipline the PR keeps its visible `fix(chat)` title and carries no Release Please override. Rollback is a revert of the change.
+None — no stored state, no protocol, no configuration. The `fix(chat)` title describes the correction, but the stable-to-stable release-note decision is pending the per-issue verification in [release-evidence.md](release-evidence.md) and task 6.5; the prior blanket `v0.7.0` reproduction claim was unsupported. Rollback is a revert of the change.
 
 ## Open Questions
 

@@ -74,6 +74,10 @@ export class ChatViewportController {
 
   apply(): void {
     const viewport = window.visualViewport;
+    // Pinch zoom is browser-owned, as in the desktop viewport controller.
+    // Retain normal-scale geometry/state instead of mistaking magnification
+    // for a software keyboard or fighting its pan with a scroll correction.
+    if (viewport && Math.abs((viewport.scale ?? 1) - 1) > 0.01) return;
     const height = viewport?.height ?? window.innerHeight;
     const top = viewport?.offsetTop ?? 0;
     const metrics = chatViewportMetrics(height, top, window.innerHeight, tabBarBottomInset());

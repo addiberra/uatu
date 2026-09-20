@@ -22,7 +22,7 @@ function harness(markup = TOUCH_MARKUP) {
   let visibility = "visible";
   Object.defineProperty(document, "visibilityState", { configurable: true, get: () => visibility });
   Object.defineProperty(window, "innerHeight", { configurable: true, writable: true, value: 800 });
-  const viewport = Object.assign(new EventTarget(), { height: 800, offsetTop: 0 });
+  const viewport = Object.assign(new EventTarget(), { height: 800, offsetTop: 0, scale: 1 });
   Object.defineProperty(window, "visualViewport", { configurable: true, value: viewport });
   const surface = document.querySelector("section")! as unknown as HTMLElement;
   let requests = 0;
@@ -123,6 +123,42 @@ describe("chat visual viewport geometry", () => {
       f.viewport.offsetTop = 140;
       f.controller.apply();
       expect(f.requests()).toBe(3);
+    } finally {
+      f.restore();
+    }
+  });
+
+  for (const mode of ["touch", "desktop"]) test(`pinch zoom leaves ${mode} geometry and keyboard state browser-owned`, () => {
+    const f = harness();
+    try {
+      f.root.setAttribute("data-ui-mode", mode);
+      f.root.setAttribute("data-chat-panel", "open");
+      f.controller.apply();
+      const normalHeight = f.style("--chat-visual-height");
+      const normalTop = f.style("--chat-visual-top");
+      expect(f.root.hasAttribute("data-chat-keyboard")).toBe(false);
+
+      f.viewport.scale = 2;
+      f.viewport.height = 400;
+      f.viewport.offsetTop = 100;
+      f.controller.apply();
+      expect(f.root.hasAttribute("data-chat-keyboard")).toBe(false);
+      expect(f.style("--chat-visual-height")).toBe(normalHeight);
+      expect(f.style("--chat-visual-top")).toBe(normalTop);
+      expect(f.requests()).toBe(1);
+
+      // Return to normal scale with a real keyboard present. Its smaller
+      // viewport is application-owned again and must not be ignored.
+      f.viewport.scale = 1;
+      f.viewport.height = 500;
+      f.controller.apply();
+      expect(f.root.hasAttribute("data-chat-keyboard")).toBe(true);
+      expect(f.requests()).toBe(2);
+      f.viewport.scale = 2;
+      f.viewport.height = 250;
+      f.controller.apply();
+      expect(f.root.hasAttribute("data-chat-keyboard")).toBe(true);
+      expect(f.requests()).toBe(2);
     } finally {
       f.restore();
     }

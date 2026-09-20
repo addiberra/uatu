@@ -40,20 +40,22 @@ const messages = (prefix: string, count: number, start = 0): ConversationItem[] 
  *  controller exactly as iOS reports it. Must run before `boot` navigates. */
 async function installFakeVisualViewport(page: Page): Promise<void> {
   await page.addInitScript(() => {
-    const viewport = new EventTarget() as EventTarget & { height: number; offsetTop: number };
+    const viewport = new EventTarget() as EventTarget & { height: number; offsetTop: number; scale: number };
     viewport.height = 844;
     viewport.offsetTop = 0;
+    viewport.scale = 1;
     Object.defineProperty(window, "visualViewport", { configurable: true, value: viewport });
   });
 }
 
 /** Move the fake viewport. `notify: false` is the transition this change is
  *  about: the geometry is different and the platform announced nothing. */
-function setVisualViewport(page: Page, geometry: { height?: number; offsetTop?: number; notify?: boolean }): Promise<void> {
+function setVisualViewport(page: Page, geometry: { height?: number; offsetTop?: number; scale?: number; notify?: boolean }): Promise<void> {
   return page.evaluate(next => {
-    const viewport = window.visualViewport as VisualViewport & { height: number; offsetTop: number };
+    const viewport = window.visualViewport as VisualViewport & { height: number; offsetTop: number; scale: number };
     if (next.height !== undefined) viewport.height = next.height;
     if (next.offsetTop !== undefined) viewport.offsetTop = next.offsetTop;
+    if (next.scale !== undefined) viewport.scale = next.scale;
     if (next.notify !== false) viewport.dispatchEvent(new Event("resize"));
   }, geometry);
 }
@@ -494,6 +496,23 @@ test("a keyboard the platform pans for is still a keyboard", async ({ page, requ
   await expect(page.locator("#chat-background-tasks summary")).toBeVisible();
 });
 
+test("pinch zoom does not collapse progress tracks as a keyboard", async ({ page, request }) => {
+  await installFakeVisualViewport(page);
+  await bootWithPinnedTracks(page, request);
+  const surface = page.locator("#chat-surface");
+  const normalHeight = await surface.evaluate(element => element.style.getPropertyValue("--chat-visual-height"));
+  await setVisualViewport(page, { height: 422, offsetTop: 100, scale: 2 });
+  // Observe beyond the coalesced viewport callback, not just the old frame.
+  await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+  await expect(page.locator("html")).not.toHaveAttribute("data-chat-keyboard");
+  await expect(surface).toHaveCSS("--chat-visual-height", normalHeight);
+  await expect(page.locator("#chat-task-list-items")).toBeVisible();
+  await expect(page.locator("#chat-background-tasks-items")).toBeVisible();
+  await setVisualViewport(page, { height: 460, offsetTop: 0, scale: 1 });
+  await expect(page.locator("html")).toHaveAttribute("data-chat-keyboard", "");
+  await expect(page.locator("#chat-task-list-items")).toBeHidden();
+});
+
 test("every pinned track expanded cannot displace the composer", async ({ page, request }) => {
   // The column is fixed-height and the transcript is its only shrinkable
   // child, so an unbounded track pushes the composer off the bottom edge
@@ -761,6 +780,122 @@ async function expectAnswerAtKeyboard(card: Locator, timeline: Locator): Promise
   }, padding)).toBe(true);
 }
 
+/** Seed through the actual fixture service and enter the same drill-down the
+ * subagent row opens in production. No synthetic request DOM or focus events. */
+async function bootAnswerOwner(page: Page, request: APIRequestContext, drilldown: boolean, questionId: string): Promise<{ parent: string; owner: string; timeline: Locator; card: Locator }> {
+  const parent = await boot(page, request, { items: drilldown ? [freeFormQuestion("parent-waiting", 1)] : [...messages("answer-history", 28), freeFormQuestion(questionId, 100)] });
+  let owner = parent;
+  if (drilldown) {
+    owner = (await control(request, { action: "seed", title: "Answer owner", child: true, items: [...messages("answer-history", 28), freeFormQuestion(questionId, 100)] })).conversation.id as string;
+    await control(request, { action: "item", conversationId: parent, item: {
+      id: "tool:answer-owner", type: "tool", createdAt: 200, name: "task", status: "completed",
+      input: JSON.stringify({ description: "Answer owner", subagent_type: "explore", prompt: "go" }), childConversationId: owner,
+    } });
+    await page.locator("#chat-subagents summary").click();
+    await page.getByRole("button", { name: "explore · Answer owner" }).click();
+    await expect(page.locator("#chat-drilldown")).toBeVisible();
+  }
+  const timeline = page.locator(drilldown ? "#chat-drilldown-timeline" : "#chat-timeline");
+  const card = timeline.locator(`[data-chat-item-id="question:${questionId}"]`);
+  await card.getByRole("radio", { name: "Type your own answer" }).check();
+  await card.locator("[data-question-custom-input]").fill("Keep it minimal");
+  await expect(card.locator("[data-question-custom-input]")).toBeFocused();
+  await setVisualViewport(page, { height: 460 });
+  await expectAnswerAtKeyboard(card, timeline);
+  await expect.poll(stillScrollTop(timeline)).toBe(true);
+  return { parent, owner, timeline, card };
+}
+
+for (const drilldown of [false, true]) {
+  for (const resolution of ["answer", "reject", "remote-remove"] as const) {
+    test(`resolved answer clears editing and releases scroll without focusout (${drilldown ? "drill-down" : "parent"}, ${resolution})`, async ({ page, request }) => {
+      await installFakeVisualViewport(page);
+      const { owner, timeline, card } = await bootAnswerOwner(page, request, drilldown, "resolve-focus");
+      await expect(page.locator("html")).toHaveAttribute("data-chat-answering", "");
+      await expect(page.locator("#touch-tab-bar")).toBeHidden();
+      // A real tap must retain WebKit's compatibility click while preventing
+      // premature focus transfer; do not blur the input as test setup.
+      if (resolution === "remote-remove") {
+        await control(request, { action: "removeItem", conversationId: owner, itemId: "question:resolve-focus" });
+      } else {
+        await card.locator(resolution === "answer" ? "[data-question-primary]" : "[data-question-reject]").tap();
+        await expect(card).toContainText(resolution === "answer" ? "Answered" : "Rejected");
+      }
+      await expect(card.locator("[data-question-custom-input]")).toHaveCount(0);
+      await expect(page.locator("html")).not.toHaveAttribute("data-chat-answering", "");
+      await expect(page.locator("html")).not.toHaveAttribute("data-chat-editing", "");
+      await setVisualViewport(page, { height: 844 });
+      await expect(page.locator("#touch-tab-bar")).toBeVisible();
+      await expect.poll(stillScrollTop(timeline)).toBe(true);
+
+      // Originally at the live end: answering is a temporary positioning
+      // override, not an instruction to stop following subsequent output.
+      const heightBeforeAppend = await timeline.evaluate(element => element.scrollHeight);
+      await control(request, { action: "item", conversationId: owner, item: {
+        id: "part:after-answer", type: "assistant_message", createdAt: 300,
+        markdown: "After the answer\n\n" + "Fresh assistant output.\n\n".repeat(24),
+      } });
+      await expect(timeline.locator('[data-chat-item-id="part:after-answer"]')).toBeAttached();
+      await expect.poll(() => timeline.evaluate(element => element.scrollHeight)).toBeGreaterThan(heightBeforeAppend + 100);
+      await expect.poll(() => timeline.evaluate(element => element.scrollHeight - element.clientHeight - element.scrollTop)).toBeLessThan(50);
+
+      // A raw platform scroll after resolution must not be corrected back to
+      // the now-detached field's stale position. No wheel/key release masks it.
+      await timeline.evaluate(element => { element.scrollTop = 0; element.dispatchEvent(new Event("scroll")); });
+      await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve(null)))));
+      expect(await timeline.evaluate(element => element.scrollTop)).toBe(0);
+    });
+  }
+
+  test(`live snapshot refresh retains an active answer hold (${drilldown ? "drill-down" : "parent"})`, async ({ page, request }) => {
+    await installFakeVisualViewport(page);
+    const { owner, timeline, card } = await bootAnswerOwner(page, request, drilldown, "refresh-focus");
+    const snapshot = page.waitForResponse(response => response.url().includes(`/conversations/${encodeURIComponent(owner)}`)
+      && response.request().method() === "GET" && !response.url().includes("/events"));
+    await control(request, { action: "resync" });
+    expect((await snapshot).ok()).toBe(true);
+    await expect(card.locator("[data-question-custom-input]")).toBeFocused();
+    await expect(card.locator("[data-question-custom-input]")).toHaveValue("Keep it minimal");
+    // Wait past one-shot layout/reveal work, so it cannot hide a lost hold.
+    await page.waitForTimeout(500);
+    await expect.poll(stillScrollTop(timeline)).toBe(true);
+    await timeline.evaluate(element => { element.scrollTop -= 200; element.dispatchEvent(new Event("scroll")); });
+    await expectAnswerAtKeyboard(card, timeline);
+    await card.locator("[data-question-primary]").tap();
+    await expect(card.locator("[data-question-custom-input]")).toHaveCount(0);
+    await setVisualViewport(page, { height: 844 });
+    await expect(page.locator("#touch-tab-bar")).toBeVisible();
+    await expect.poll(stillScrollTop(timeline)).toBe(true);
+    const heightBeforeAppend = await timeline.evaluate(element => element.scrollHeight);
+    await control(request, { action: "item", conversationId: owner, item: {
+      id: "part:after-refresh-answer", type: "assistant_message", createdAt: 300,
+      markdown: "Refreshed answer continuation\n\n" + "Fresh assistant output.\n\n".repeat(24),
+    } });
+    await expect(timeline.locator('[data-chat-item-id="part:after-refresh-answer"]')).toBeAttached();
+    await expect.poll(() => timeline.evaluate(element => element.scrollHeight)).toBeGreaterThan(heightBeforeAppend + 100);
+    await expect.poll(() => timeline.evaluate(element => element.scrollHeight - element.clientHeight - element.scrollTop)).toBeLessThan(50);
+  });
+}
+
+test("child answer clearance wins over a pending parent request pill", async ({ page, request }) => {
+  await installFakeVisualViewport(page);
+  const { card, timeline } = await bootAnswerOwner(page, request, true, "child-clearance");
+  const parentPill = page.locator("#chat-requests-jump");
+  // The child hides the parent request, so the pill is eligible in DOM state;
+  // answering hides it only through CSS. Its :has selector must not steal
+  // precedence from the child's keyboard inset and scroll-padding rules.
+  await expect(parentPill).not.toHaveAttribute("hidden", "");
+  await expect(parentPill).toBeHidden();
+  await expect.poll(() => timeline.evaluate(element => {
+    const style = getComputedStyle(element);
+    const clearance = 0.6 * Number.parseFloat(getComputedStyle(document.documentElement).fontSize);
+    return Math.abs(Number.parseFloat(style.scrollPaddingBottom) - clearance) < 0.1
+      && Math.abs(Number.parseFloat(style.paddingBottom) - clearance - 384) < 0.1;
+  })).toBe(true);
+  await expectAnswerAtKeyboard(card, timeline);
+  await expect.poll(() => paintedAtCentre(card.locator("[data-question-primary]"))).toMatchObject({ reachable: true });
+});
+
 for (const drilldown of [false, true]) {
   test(`answer hold follows direct field transfer and retained foreground focus (${drilldown ? "drill-down" : "parent"})`, async ({ page, request }) => {
     await installFakeVisualViewport(page);
@@ -792,7 +927,17 @@ for (const drilldown of [false, true]) {
       // Release setup focus before Playwright scrolls the next radio into
       // view; the direct field-to-field transfer is exercised below.
       await card.locator("[data-question-custom-input]").evaluate(element => (element as HTMLElement).blur());
+      // Blur resumes following and restores the tab bar through a height
+      // transition. Let both settle before Playwright scrolls the next radio
+      // into view; otherwise WebKit can scroll the outer chat surface during
+      // setup, displacing the entire timeline before the transfer is tested.
+      await expect(page.locator("html")).not.toHaveAttribute("data-chat-answering", "");
+      await expect.poll(() => page.locator("#chat-surface").evaluate(element => Math.abs(
+        element.getBoundingClientRect().bottom - document.querySelector("#touch-tab-bar")!.getBoundingClientRect().top,
+      ))).toBeLessThan(0.5);
+      await expect.poll(stillScrollTop(timeline)).toBe(true);
     }
+    expect(await page.locator("#chat-surface").evaluate(element => element.scrollTop)).toBe(0);
     await a.locator("[data-question-custom-input]").evaluate(element => (element as HTMLElement).focus({ preventScroll: true }));
     await setVisualViewport(page, { height: 460 });
     await expectAnswerAtKeyboard(a, timeline);

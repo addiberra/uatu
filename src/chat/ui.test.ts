@@ -840,6 +840,139 @@ describe("chat question anchoring", () => {
 });
 
 describe("chat answering state", () => {
+  test("explicit selection cannot carry an outgoing answer hold into an incoming paused conversation", async () => {
+    const { document, window } = parseHTML(html);
+    installDomGlobals(document, window);
+    document.documentElement.setAttribute("data-ui-mode", "touch");
+    document.documentElement.setAttribute("data-active-tab", "chat");
+    stubConversationSelect(document);
+    let active: Element | null = null;
+    Object.defineProperty(document, "activeElement", { configurable: true, get: () => active });
+    const values = new Map<string, string>();
+    Object.defineProperty(window, "localStorage", { configurable: true, value: {
+      getItem: (key: string) => values.get(key) ?? null,
+      setItem: (key: string, value: string) => { values.set(key, value); },
+    } });
+    const { presentationLocalStorage } = await import("../shell/presentation-storage");
+    const paused = { itemId: "message:b", offset: -20 };
+    presentationLocalStorage()!.setItem("uatu:chat-presentation", JSON.stringify({ selectedId: "one", anchors: { two: paused } }));
+    let opened = "";
+    const api = questionApi(document);
+    Object.assign(api, {
+      conversations: async () => [conversation("one"), conversation("two")],
+      snapshot: async (id: string) => ({ ...snapshot(id), items: id === "one" ? [pendingQuestion("q1", 1)] : [
+        { id: "message:b", type: "user_message", createdAt: 1, text: "Incoming paused conversation" },
+      ] }),
+      stream: (id: string) => { opened = id; return { close() {} }; },
+    });
+    const { TimelineAnchorController } = await import("./anchor");
+    const restore = TimelineAnchorController.prototype.restore;
+    let parentAnchor: InstanceType<typeof TimelineAnchorController> | null = null;
+    TimelineAnchorController.prototype.restore = function (value) { parentAnchor = this; restore.call(this, value); };
+    const { CoordinatedScrollOwner } = await import("./coordinated-scroll");
+    const hold = CoordinatedScrollOwner.prototype.hold;
+    let holds = 0;
+    CoordinatedScrollOwner.prototype.hold = function (element, options) { holds += 1; hold.call(this, element, options); };
+    const requestFrame = globalThis.requestAnimationFrame;
+    const cancelFrame = globalThis.cancelAnimationFrame;
+    const frames = new Map<number, FrameRequestCallback>();
+    let frameId = 100_000;
+    try {
+      const { initChat } = await import(`./ui.ts?answer-selection=${Date.now()}`);
+      initChat(api);
+      const card = await waitForQuestionCard(document);
+      card.querySelector<HTMLElement>("[data-question-custom-toggle]")!.dispatchEvent(new window.Event("click", { bubbles: true }));
+      const field = card.querySelector<HTMLInputElement>("[data-question-custom-input]")!;
+      expect(parentAnchor!.isPinned()).toBe(true);
+      active = field;
+      field.dispatchEvent(new window.Event("focusin", { bubbles: true }));
+      await Bun.sleep(20);
+      expect(holds).toBe(1);
+      holds = 0;
+      // A notification/selection can arrive without blurring A. Let B's fast
+      // snapshot complete while A's clearing paint is still queued in rAF.
+      globalThis.requestAnimationFrame = callback => { frames.set(++frameId, callback); return frameId; };
+      globalThis.cancelAnimationFrame = id => { if (!frames.delete(id)) cancelFrame(id); };
+      const select = document.querySelector<HTMLSelectElement>("#chat-conversation-select")!;
+      select.value = "two";
+      select.dispatchEvent(new window.Event("change", { bubbles: true }));
+      await waitUntil(() => opened === "two");
+      expect(field.isConnected).toBe(true);
+      expect(parentAnchor!.currentAnchor()).toEqual(paused);
+      expect(parentAnchor!.isPinned()).toBe(false);
+      // Run the real render and post-paint focus cleanup, then its coordinated
+      // scroll work. An outgoing hold must not repin B when A is removed.
+      for (let pass = 0; pass < 10 && frames.size > 0; pass += 1) {
+        const pending = [...frames];
+        for (const [id, callback] of pending) if (frames.delete(id)) callback(performance.now() + pass * 16);
+        await Promise.resolve();
+      }
+      expect(field.isConnected).toBe(false);
+      expect(parentAnchor!.isPinned()).toBe(false);
+      expect(parentAnchor!.currentAnchor()).toEqual(paused);
+      expect(holds).toBe(0);
+    } finally {
+      globalThis.requestAnimationFrame = requestFrame;
+      globalThis.cancelAnimationFrame = cancelFrame;
+      TimelineAnchorController.prototype.restore = restore;
+      CoordinatedScrollOwner.prototype.hold = hold;
+      frames.clear();
+      window.dispatchEvent(new Event("pagehide"));
+      delete (window as unknown as { localStorage?: Storage }).localStorage;
+    }
+  });
+
+  for (const change of ["remove", "refresh", "released-refresh"] as const) test(`focused answer reconciles after snapshot ${change} without focusout`, async () => {
+    const { document, window } = parseHTML(html);
+    installDomGlobals(document, window);
+    document.documentElement.setAttribute("data-ui-mode", "touch");
+    document.documentElement.setAttribute("data-active-tab", "chat");
+    stubConversationSelect(document);
+    let active: Element | null = null;
+    Object.defineProperty(document, "activeElement", { configurable: true, get: () => active });
+    let items: unknown[] = [{ id: "message:u", type: "user_message", createdAt: 1, text: "which branch?" }, pendingQuestion("q1", 2)];
+    let handlers: { resync(): void } | null = null;
+    const api = questionApi(document, { items: () => items, stream: value => { handlers = value; } });
+    const { CoordinatedScrollOwner } = await import("./coordinated-scroll");
+    const hold = CoordinatedScrollOwner.prototype.hold;
+    const release = CoordinatedScrollOwner.prototype.release;
+    const holds: Element[] = [];
+    const releases: string[] = [];
+    let answerOwner: InstanceType<typeof CoordinatedScrollOwner> | null = null;
+    CoordinatedScrollOwner.prototype.hold = function (element, options) { answerOwner = this; holds.push(element); hold.call(this, element, options); };
+    CoordinatedScrollOwner.prototype.release = function () { releases.push(this.scroller.id); release.call(this); };
+    try {
+      const { initChat } = await import(`./ui.ts?answer-snapshot=${change}-${Date.now()}`);
+      initChat(api);
+      const card = await waitForQuestionCard(document);
+      card.querySelector<HTMLElement>("[data-question-custom-toggle]")!.dispatchEvent(new window.Event("click", { bubbles: true }));
+      const field = card.querySelector<HTMLInputElement>("[data-question-custom-input]")!;
+      active = field;
+      field.dispatchEvent(new window.Event("focusin", { bubbles: true }));
+      expect(document.documentElement.hasAttribute("data-chat-answering")).toBe(true);
+      if (change === "released-refresh") answerOwner!.pause();
+      holds.length = 0;
+      releases.length = 0;
+      if (change === "remove") items = items.slice(0, 1);
+      handlers!.resync();
+      await Bun.sleep(80);
+      if (change === "remove") {
+        expect(field.isConnected).toBe(false);
+        expect(document.documentElement.hasAttribute("data-chat-answering")).toBe(false);
+        expect(document.documentElement.hasAttribute("data-chat-editing")).toBe(false);
+        expect(releases).toContain("chat-timeline");
+      } else {
+        expect(field.isConnected).toBe(true);
+        expect(holds.length).toBe(change === "refresh" ? 1 : 0);
+        if (change === "refresh") expect(holds[0] === field).toBe(true);
+      }
+    } finally {
+      CoordinatedScrollOwner.prototype.hold = hold;
+      CoordinatedScrollOwner.prototype.release = release;
+      window.dispatchEvent(new Event("pagehide"));
+    }
+  });
+
   test("a request's answer field puts the surface in the answering state; the composer does not", async () => {
     const { document, window } = parseHTML(html);
     installDomGlobals(document, window);
@@ -1089,7 +1222,7 @@ describe("chat answering state", () => {
       stream: (streamHandlers: { resync(): void }) => { handlers = streamHandlers; },
     });
     const press = (element: Element, pointerType: string) => {
-      const event = Object.assign(new window.Event("pointerdown", { bubbles: true, cancelable: true }), { pointerType });
+      const event = Object.assign(new window.Event("mousedown", { bubbles: true, cancelable: true }), { pointerType });
       element.dispatchEvent(event as unknown as Event);
       return event.defaultPrevented;
     };
@@ -1108,6 +1241,12 @@ describe("chat answering state", () => {
       expect(press(card.querySelector("[data-question-primary]")!, "mouse")).toBe(false);
 
       answering(true);
+      // Cancelling touch pointerdown suppresses the compatibility click in
+      // WebKit. Let the pointer sequence through; only its mousedown default
+      // (the focus transfer) is prevented.
+      const touchDown = Object.assign(new window.Event("pointerdown", { bubbles: true, cancelable: true }), { pointerType: "touch" });
+      card.querySelector("[data-question-primary]")!.dispatchEvent(touchDown);
+      expect(touchDown.defaultPrevented).toBe(false);
       // The controls that resolve a request: pressing them must not take
       // focus off an open answer field and reflow the card under the pointer.
       // The pointer type is not the question — a trackpad on an iPad's
@@ -1121,7 +1260,7 @@ describe("chat answering state", () => {
       expect(press(card.querySelector("[data-question-custom-toggle]")!, "touch")).toBe(false);
       expect(press(card.querySelector("summary")!, "touch")).toBe(false);
 
-      // Preventing the default on pointerdown does not cancel the click the
+      // Preventing the default on mousedown does not cancel the click the
       // card resolves on: rejecting the question still reaches the agent.
       const rejects: string[] = [];
       Object.assign(api, { question: async (_conversationId: string, itemId: string) => { rejects.push(itemId); return { outcome: "rejected" }; } });

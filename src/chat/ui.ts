@@ -177,6 +177,9 @@ export function initChat(api = new ChatApiClient()): void {
   if (!surface || !timeline || !items || !state || !select || !newButton || !olderButton || !latestButton || !queueDockElement || !form || !input || !commandMenu || !send || !sendLabel || !configurationTrigger || !configurationSummary || !configurationDetails || !configurationModeSummary || !configurationVariantSummary || !configurationVariantValue || !configurationDialog || !configurationSearch || !configurationModelsSection || !configurationModels || !configurationResultStatus || !configurationEmpty || !configurationDone || !composerStatus || !composerStatusLive || !composerError || !copyStatus) return;
 
   const anchor = new TimelineAnchorController();
+  // Initial renders can run before focus wiring is installed. Later paints
+  // reconcile removals too: WebKit does not send focusout for a removed input.
+  let reconcileAnswerAfterPaint = () => {};
   const renderer = new TimelineRenderer();
   renderer.deferClosedActivity = true;
   const readSignal = createLoadingSignal({ segment: null, barHost: timeline, busyHost: timeline, visibleLabel: true });
@@ -683,7 +686,8 @@ export function initChat(api = new ChatApiClient()): void {
   };
   /** Both owners on release: by the time focus has left, the field that was
    *  held may no longer be in the timeline that held it. Releasing an owner
-   *  that holds nothing does nothing, and neither release scrolls. */
+   *  that holds nothing does nothing; the holder resumes its prior follow
+   *  intent through the next coordinated frame. */
   const releaseHeldTimelines = (): void => { parentScroll.release(); childScroll?.release(); };
   /** The focused control, while it is a text control this surface owns. */
   const focusedChatTextControl = (): HTMLElement | null => {
@@ -1378,6 +1382,7 @@ export function initChat(api = new ChatApiClient()): void {
       node.querySelectorAll<HTMLFormElement>("form[data-question-form]").forEach(syncQuestionForm);
     }
     applyFocusAfterPaint(renderer, items);
+    reconcileAnswerAfterPaint();
   };
 
   const scheduleRender = (newContent = false, captureCurrent = true, incremental = false) => {
@@ -2353,7 +2358,7 @@ export function initChat(api = new ChatApiClient()): void {
     renderConfiguration();
     renderAttachments();
     announce(snapshot.items.length ? "" : "Start this conversation by sending a message.");
-    parentScroll.cancel();
+    cancelForSnapshot(parentScroll);
     anchor.restore(presentation.anchors[snapshot.conversation.id] ?? null);
     scheduleRender(false, false);
     stream = openConversationStream(snapshot.conversation.id, snapshot.cursor, token);
@@ -2434,6 +2439,10 @@ export function initChat(api = new ChatApiClient()): void {
     supersedeStartupSelection();
     hasSelectedConversation = true;
     if (projection?.conversationId === id && stream && !historyRefreshRequired.has(id) && !selectedConversationDeleted) return true;
+    // Navigation ends the outgoing hold before a fast snapshot can arrive
+    // ahead of its clearing paint. Only an in-place refresh may renew it;
+    // otherwise removing A's field could resume A's follow intent over B.
+    parentScroll.cancel();
     renderer.closeShellOutputWindow();
     childRenderer.closeShellOutputWindow();
     readLane?.controller.abort();
@@ -3011,17 +3020,12 @@ export function initChat(api = new ChatApiClient()): void {
       stage.renderer.focusAfterPaint = `[data-chat-item-id="${CSS.escape(itemId)}"] [data-permission-outcome="approved-session"]`;
       stage.rerender();
     };
-    // The send button's treatment, for the controls that resolve a request.
-    // A pointerdown on them would otherwise blur the answer field first,
-    // which restores the chrome and reflows the card out from under the
-    // pointer before the press lands. The guard is the answering state, not
-    // the pointer type: that state is the only one in which a blur reflows
-    // anything, and a mouse or trackpad press on an iPad's keyboard case
-    // moves the card exactly as a finger would. Preventing the default here
-    // does not cancel the click, and the selector is the action row only —
-    // checkboxes, radios, links and the card's own summary keep ordinary
-    // pointer behavior.
-    container.addEventListener("pointerdown", event => {
+    // Prevent only the focus default of the native/compatibility mousedown:
+    // blurring an answer restores the chrome and moves the action row before
+    // the click lands. Cancelling touch pointerdown instead suppresses the
+    // compatibility click altogether in WebKit. Mouse, pen and touch still
+    // activate normally; radios, links and summaries keep ordinary focus.
+    container.addEventListener("mousedown", event => {
       if (!document.documentElement.hasAttribute("data-chat-answering")) return;
       if (!(event.target as Element).closest?.(REQUEST_ANSWER_CONTROLS)) return;
       event.preventDefault();
@@ -3190,6 +3194,7 @@ export function initChat(api = new ChatApiClient()): void {
       node.querySelectorAll<HTMLFormElement>("form[data-question-form]").forEach(syncQuestionForm);
     }
     applyFocusAfterPaint(childRenderer, drilldownItems);
+    reconcileAnswerAfterPaint();
   };
 
   /**
@@ -3240,6 +3245,7 @@ export function initChat(api = new ChatApiClient()): void {
     releaseChildBack = null;
     if (drilldownItems && chatSurfaceActive()) childRenderer.render(drilldownItems, null, expanded, declares("subagents"));
     else childRenderDirty = true;
+    reconcileAnswerAfterPaint();
     syncWorkingTimer();
     if (drilldownOlder) {
       drilldownOlder.hidden = true;
@@ -3293,18 +3299,18 @@ export function initChat(api = new ChatApiClient()): void {
         // A gap in a drill-down is refetched in place; it is a view over a
         // turn, so there is no selection to re-run.
         if (result.outcome === "gap" || result.outcome === "resync") {
-          openChildConversation(id, label);
+          openChildConversation(id, label, true);
           return;
         }
         entry.projection = result.projection;
         if (result.outcome === "applied") { announceChild(""); renderChild(true); }
       },
-      resync: () => { if (generation === childGeneration) openChildConversation(id, label); },
+      resync: () => { if (generation === childGeneration) openChildConversation(id, label, true); },
       error: error => { if (generation === childGeneration) childInterruptions.report("child", error); },
       recovered: () => { if (generation === childGeneration) childInterruptions.clear("child"); },
     });
 
-  const openChildConversation = (id: string, label: string) => {
+  const openChildConversation = (id: string, label: string, automaticRefresh = false) => {
     if (!drilldown || !drilldownItems || !drilldownTimeline) return;
     const generation = ++childGeneration;
     drilldownClosePending = false;
@@ -3361,6 +3367,7 @@ export function initChat(api = new ChatApiClient()): void {
     syncRequestsJumpVisibility();
     if (!retainedProjection && chatSurfaceActive()) childRenderer.render(drilldownItems, null, expanded, declares("subagents"));
     else childRenderDirty = true;
+    reconcileAnswerAfterPaint();
     // Hidden until this child's own first page says whether more exists —
     // otherwise a previous subagent's cursor would offer paging for a
     // transcript that has none.
@@ -3368,11 +3375,12 @@ export function initChat(api = new ChatApiClient()): void {
       drilldownOlder.hidden = true;
       drilldownOlder.disabled = false;
     }
-    childScroll?.cancel();
+    if (automaticRefresh && retainedProjection && childScroll) cancelForSnapshot(childScroll);
+    else childScroll?.cancel();
     childAnchor.restore(retainedAnchor);
     announceChild("");
-    drilldownBack?.focus();
-    void runChildRead(next, "Loading conversation...", () => openChildConversation(id, label), async signal => {
+    if (!automaticRefresh) drilldownBack?.focus();
+    void runChildRead(next, "Loading conversation...", () => openChildConversation(id, label, automaticRefresh), async signal => {
       const snapshot = await api.snapshot(id, undefined, signal);
       if (signal.aborted || generation !== childGeneration || child !== next) return;
       next.projection = projectionFromSnapshot(snapshot, []);
@@ -3500,6 +3508,19 @@ export function initChat(api = new ChatApiClient()): void {
   // than in CSS because only the focus path knows which control took focus,
   // and it is the one state that hands the transcript the whole visible band.
   let heldAnswerField: HTMLElement | null = null;
+  // A snapshot replaces automatic work, not the reader's focus intent. By
+  // contrast pause/latest/navigation intentionally release that intent and
+  // must keep the focus identity latched until focus actually changes.
+  const cancelForSnapshot = (owner: CoordinatedScrollOwner) => {
+    const field = heldAnswerField;
+    const restore = field && owner.isHolding(field);
+    // cancel restores the hold's original follow intent without scheduling;
+    // the replacement hold must inherit that rather than a reveal's pause.
+    owner.cancel();
+    if (restore && field.isConnected && document.activeElement === field && chatSurfaceActive()) {
+      holdInOwningTimeline(field);
+    }
+  };
   const syncEditingFocus = () => {
     const active = document.activeElement;
     const editing = surface.contains(active) && isTextEditingControl(active);
@@ -3518,6 +3539,9 @@ export function initChat(api = new ChatApiClient()): void {
       if (next) holdInOwningTimeline(next);
     }
     viewport.apply();
+  };
+  reconcileAnswerAfterPaint = () => {
+    if (heldAnswerField && !surface.contains(heldAnswerField)) syncEditingFocus();
   };
   surface.addEventListener("focusin", syncEditingFocus);
   surface.addEventListener("focusout", () => queueMicrotask(syncEditingFocus));

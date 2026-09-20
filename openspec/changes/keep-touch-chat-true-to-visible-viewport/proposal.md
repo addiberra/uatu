@@ -1,6 +1,6 @@
 ## Why
 
-Three reported iPhone defects — #410, #382, #354 — all come down to the touch chat surface believing a visual viewport that is no longer true, or writing a scroll position the user did not ask for. All three reproduce in `v0.7.0`, so they are stable-release regressions and their notes stay visible `fix(chat)` entries.
+Three reported iPhone defects — #410, #382, #354 — all come down to the touch chat surface believing a visual viewport that is no longer true, or writing a scroll position the user did not ask for. The earlier claim that all three reproduce in `v0.7.0` was not backed by a recorded tagged-build reproduction and is withdrawn. See [release evidence](release-evidence.md) for the distinction between stable source inspection, current-branch reproduction, and still-unverified device behavior.
 
 ## What Changes
 
@@ -35,4 +35,4 @@ _None._
 - `src/styles.css` — the background-task list joins the pinned-track cap and the keyboard hide rule; the timeline reserves space while the requests pill is shown; answering-state rules hide only the requests pill and the prompt rail and transition the chat surface's height so the remaining chrome slides under the keyboard; the custom-answer input is pinned at 16 px on touch.
 - `src/chat/viewport.test.ts`, `src/chat/coordinated-scroll.test.ts`, `src/chat/ui.test.ts`, `tests/e2e/chat-touch.e2e.ts` — new cases; the e2e file already fakes `visualViewport`.
 - No server, protocol, or stored-state change. iOS behavior is the real subject, so manual iPhone Safari and installed-PWA verification is part of acceptance.
-- Release notes: all three issues reproduce in `v0.7.0`, so the PR keeps visible `fix(chat)` entries and carries no Release Please override.
+- Release notes: retain the truthful `fix(chat)` title, but confirm stable impact before squash merge. No tagged-build device reproduction is recorded for any of the three issues; do not claim otherwise. If the user-visible correction is confirmed to affect only unreleased functionality, add the repository's Release Please override before merge. The evidence and decision remain open in task 6.5.

@@ -76,6 +76,13 @@ leaves the request, the surface SHALL return to its normal arrangement.
 - **AND** the pinned progress tracks give up their rows as they do when the
   keyboard shrinks the viewport without panning
 
+#### Scenario: Pinch zoom is not a software keyboard
+- **WHEN** the browser magnifies the page and reduces the visual viewport at a
+  non-default scale
+- **THEN** Chat retains its last normal-scale layout and keyboard state without
+  treating the zoom as a keyboard or correcting the browser's zoom pan
+- **AND** normal viewport measurement resumes when the scale returns to normal
+
 #### Scenario: Expanded progress tracks cannot displace the composer
 - **WHEN** the task list, the subagent list, and the background-task list are
   all populated and expanded while the keyboard is open
@@ -96,6 +103,31 @@ leaves the request, the surface SHALL return to its normal arrangement.
   autoscrolls the transcript while the caret is dragged
 - **THEN** the transcript returns to the position that keeps the field in view
 - **AND** it scrolls freely again once the field loses focus
+
+#### Scenario: Resolving a focused answer removes the answering state
+- **WHEN** answering, rejecting, or a remote update removes a focused request
+  field, including on a browser that emits no focusout for a removed node
+- **THEN** the editing and answering state is cleared and the detached field no
+  longer holds the transcript
+- **AND** the normal tabs and chrome return and the transcript can scroll freely
+
+#### Scenario: Answering temporarily preserves the reader's follow choice
+- **WHEN** a reader following the newest content answers a request and its
+  temporary positioning hold ends
+- **THEN** following resumes for the agent's next message
+- **AND** a reader who was already reading older content is not forced to follow
+- **AND** an explicit transcript gesture or Latest action ends the answer hold
+
+#### Scenario: A live refresh preserves an actual answer hold
+- **WHEN** an authoritative snapshot refresh cancels pending scroll work while a
+  focused request field is held in its parent or drill-down timeline
+- **THEN** the retained field is held again after the refresh
+- **AND** a hold already ended by explicit reader action is not resurrected
+
+#### Scenario: Dragging a question choice scrolls the conversation
+- **WHEN** an upward transcript drag starts on a radio or checkbox choice
+- **THEN** following pauses as it does for the same drag starting on its label
+- **AND** caret gestures inside text-editing controls do not pause following
 
 #### Scenario: A keyboard resize and pan together keep the answer visible
 - **WHEN** a touch user is answering a request and the visual viewport's height
@@ -131,6 +163,13 @@ leaves the request, the surface SHALL return to its normal arrangement.
   keyboard's edge, with the conversation filling the band above them
 - **AND** the composer and the pinned tracks are back above the keyboard's
   former edge once it dismisses
+
+#### Scenario: A parent request pill cannot override child answer clearance
+- **WHEN** a parent request is outstanding while a child request is answered in
+  the pushed drill-down with the keyboard open
+- **THEN** the answering keyboard inset takes precedence over the pill's normal
+  reservation even if the pill's hidden attribute is unset
+- **AND** the child's field and action row remain above the keyboard
 
 #### Scenario: Focusing the answer field does not zoom the page
 - **WHEN** a touch user focuses a request's free-form answer field

@@ -6585,7 +6585,7 @@ html[data-ui-mode="desktop"][data-notification-chat] .chat-expand-strip {
    moving into the flow — in the touch layout there is no room to push the
    composer down. The scroll padding matters as much as the padding: scrolling
    a request into view must not park it under the pill either. */
-.chat-transcript-area:has(> #chat-requests-jump:not([hidden])) .chat-timeline {
+.chat-transcript-area:has(> :where(#chat-requests-jump):not([hidden])) .chat-timeline {
   padding-bottom: 3.5rem;
   scroll-padding-bottom: 3.5rem;
 }
@@ -8960,10 +8960,9 @@ html[data-ui-mode="touch"][data-chat-answering] #chat-requests-jump {
    by the viewport controller and 0 whenever no keyboard is up. The reveal's
    own clearance is `scroll-padding-bottom`, which stays the ordinary touch
    inset — it is measured against the visible band, not against this strip.
-   Both timelines are named by id because the pill's `:has(>
-   #chat-requests-jump…)` reservation carries id specificity, and that
-   reservation keys on the pill's `hidden` attribute, which the answering
-   state does not set. */
+   The pill reservation uses :where() to keep its id out of specificity:
+   this keyboard inset must win even when the pill lacks [hidden] (for
+   example over a pushed drill-down) but is hidden by the answering rule. */
 html[data-ui-mode="touch"][data-chat-answering] #chat-timeline,
 html[data-ui-mode="touch"][data-chat-answering] #chat-drilldown-timeline {
   padding-bottom: calc(0.6rem + var(--chat-keyboard-inset, 0px));
