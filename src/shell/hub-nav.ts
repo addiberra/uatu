@@ -21,7 +21,8 @@
 
 import { appBasePath, workspaceIdFromBasePath } from "../shared/app-url";
 import type { WorkspaceActivity } from "../shared/live-protocol";
-import { liveChannel } from "./live";
+import { awaitConfirmedLive, holdManualReload, liveChannel } from "./live";
+import { setCurrentSessionRunning } from "./session-running";
 
 export type HubWorkspaceSummary = {
   id: string;
@@ -140,6 +141,14 @@ export function chipLabel(workspaces: HubWorkspaceSummary[], currentId: string):
   return current ? workspaceMenuLabel(current) : currentId;
 }
 
+// Whether the hub's list says the current session runs. Unlisted is
+// unknown, not stopped: a forgotten workspace has no session to start, and
+// the indicator must not offer one.
+export function currentSessionRunning(workspaces: HubWorkspaceSummary[], currentId: string | null): boolean | null {
+  const current = workspaces.find(workspace => workspace.id === currentId);
+  return current ? current.running : null;
+}
+
 // Menu order: the current workspace first, then other running sessions,
 // then stopped workspaces, alphabetical within each group.
 export function sortHubWorkspaces(
@@ -171,6 +180,83 @@ export function sortHubWorkspaces(
 // credential-aware start flow instead of dead-ending at "start failed".
 export function startFailureNeedsHubUnlock(message: string): boolean {
   return /locked|unlock/i.test(message);
+}
+
+// One start, shared by the switcher's rows and the connection indicator.
+// Asks the hub to start the workspace's session; the caller decides what
+// happens after. A locked-credential refusal is handed to the dashboard's
+// credential-aware start flow, which has the passphrase surface this page
+// lacks — the navigation happens here so both callers behave alike.
+//
+// A start of the CURRENT workspace also owns the page's way back to
+// `Connected`: the wait for the channel to confirm live is armed before the
+// hub is asked (a quick start confirms before the answer lands), and the
+// manual recovery's reload fallback is held until that wait settles, so a
+// recovery requested meanwhile — from the indicator, from Chat's Reconnect —
+// cannot reload the page whose state the in-place start preserves. Both
+// live here so every caller gets them. `confirmed` is that wait.
+export type WorkspaceStartOutcome =
+  | { ok: true; confirmed: Promise<"live" | "timeout" | "cancelled"> }
+  | { ok: false; unlock: true }
+  | { ok: false; unlock: false; message: string };
+
+// Every navigation the switcher performs goes through here, so a test can
+// observe one without a `window.location`.
+let hubNavigation = (href: string): void => { window.location.href = href; };
+
+// Test seam: an injected navigation. `null` restores the default.
+export function installHubNavigationForTests(navigate: ((href: string) => void) | null): void {
+  hubNavigation = navigate ?? (href => { window.location.href = href; });
+}
+
+// How long the switcher waits between re-reads of the hub list while the
+// stream says the current session is not running but the list still says it
+// is (see `reconcileStop` in initHubNav). The first read is immediate.
+export const STOP_RECONCILE_DELAYS_MS: readonly number[] = [0, 500, 1_000, 2_000, 4_000, 8_000];
+
+let reconcileDelays: readonly number[] = STOP_RECONCILE_DELAYS_MS;
+let reconcileTimer: ReturnType<typeof setTimeout> | null = null;
+
+// Test seam: a faster schedule, and a way to cancel a pending re-read so
+// one test's timer cannot read another test's hub. `null` restores defaults.
+export function installStopReconcileForTests(delays: readonly number[] | null): void {
+  reconcileDelays = delays ?? STOP_RECONCILE_DELAYS_MS;
+  if (reconcileTimer !== null) {
+    clearTimeout(reconcileTimer);
+    reconcileTimer = null;
+  }
+}
+
+export async function startWorkspaceSession(workspaceId: string): Promise<WorkspaceStartOutcome> {
+  const current = workspaceId === workspaceIdFromBasePath(appBasePath());
+  const wait = current ? awaitConfirmedLive() : null;
+  // The hold lasts exactly as long as the wait, however the request fares:
+  // a stalled answer must not keep the page's recovery from reloading once
+  // the wait has run out, and a refusal cancels the wait.
+  if (wait) {
+    const releaseReload = holdManualReload();
+    void wait.outcome.finally(releaseReload);
+  }
+  const refuse = (outcome: Exclude<WorkspaceStartOutcome, { ok: true }>): WorkspaceStartOutcome => {
+    wait?.cancel();
+    return outcome;
+  };
+  let response: Response;
+  try {
+    response = await fetch(`/api/hub/sessions/${encodeURIComponent(workspaceId)}/start`, { method: "POST" });
+  } catch {
+    return refuse({ ok: false, unlock: false, message: "start failed" });
+  }
+  if (response.ok) {
+    return { ok: true, confirmed: wait ? wait.outcome : Promise.resolve("live" as const) };
+  }
+  const body = (await response.json().catch(() => ({}))) as { error?: unknown };
+  const message = typeof body.error === "string" && body.error !== "" ? body.error : `start failed (${response.status})`;
+  if (startFailureNeedsHubUnlock(message)) {
+    hubNavigation("/");
+    return refuse({ ok: false, unlock: true });
+  }
+  return refuse({ ok: false, unlock: false, message });
 }
 
 export function submitHubSignOut(doc: Document): void {
@@ -238,6 +324,14 @@ export function initHubNav(): void {
 
   let latest: HubWorkspaceSummary[] = [];
   const activity = new Map<string, WorkspaceActivity>();
+  // What the hub's list last said about the current session, apart from
+  // `latest`, which folds the stream's activity in. `Stopped` is asserted
+  // from this, never from a fold.
+  let listedRunning: boolean | null = null;
+  // Activity reports, counted, and the count each workspace was last
+  // reported at: what tells a list answer from a report newer than it.
+  let reports = 0;
+  const reportedAt = new Map<string, number>();
 
   const chipDot = toggle.querySelector<HTMLSpanElement>(".indicator-dot");
   const chipBadge = toggle.querySelector<HTMLSpanElement>("#hub-activity-badge");
@@ -259,6 +353,12 @@ export function initHubNav(): void {
     toggle.setAttribute("aria-label", spoken ? `${baseToggleLabel}. ${spoken}.` : baseToggleLabel);
     toggle.title = spoken ? `${baseToggleLabel} — ${spoken}` : baseToggleLabel;
   };
+
+  // What a stopped row's start is up to, by workspace id: the menu is
+  // re-rendered whenever the list or the stream changes, so a row's own
+  // node cannot carry it. Cleared once the workspace runs.
+  const rowStart = new Map<string, "starting" | "unlock" | "failed">();
+  const rowStartWords = { starting: "starting…", unlock: "unlock in Hub…", failed: "start failed" } as const;
 
   const renderMenu = () => {
     menu.replaceChildren();
@@ -298,44 +398,46 @@ export function initHubNav(): void {
         detailSpan.textContent = detail;
         item.appendChild(detailSpan);
       }
-      const menuState = workspaceMenuState(workspace, activity);
+      // For the current workspace the word "stopped" and its Start follow
+      // the hub's list, as the connection indicator does — the folded
+      // value (the dot) also goes dark for an unreachable child of a
+      // running session, which a start cannot help.
+      const stopped = workspace.id === currentId ? listedRunning === false : !workspace.running;
+      const menuState = workspaceMenuState(stopped ? { ...workspace, running: false } : { ...workspace, running: true }, activity);
       if (menuState !== null) {
         const state = document.createElement("span");
         state.className = `hub-menu-state is-${menuState.tone}`;
         state.textContent = menuState.text;
         item.appendChild(state);
       }
-      if (!workspace.running) {
+      if (!stopped) {
+        rowStart.delete(workspace.id);
+      } else {
         const state = item.querySelector<HTMLSpanElement>(".hub-menu-state.is-stopped")!;
+        const pending = rowStart.get(workspace.id);
+        if (pending) state.textContent = rowStartWords[pending];
         // A stopped target's session URL answers 503; Start it instead of
-        // navigating into an unavailable page. Only a successful start
-        // navigates.
-        if (workspace.id !== currentId) {
-          item.addEventListener("click", event => {
-            event.preventDefault();
-            state.textContent = "starting…";
-            void fetch(`/api/hub/sessions/${encodeURIComponent(workspace.id)}/start`, { method: "POST" })
-              .then(async response => {
-                if (response.ok) {
-                  window.location.href = item.href;
-                  return;
-                }
-                const body = (await response.json().catch(() => ({}))) as { error?: unknown };
-                const message = typeof body.error === "string" ? body.error : "";
-                if (startFailureNeedsHubUnlock(message)) {
-                  // The switcher has no passphrase surface; the dashboard's
-                  // credential-aware start flow collects it.
-                  state.textContent = "unlock in Hub…";
-                  window.location.href = "/";
-                  return;
-                }
-                state.textContent = "start failed";
-              })
-              .catch(() => {
-                state.textContent = "start failed";
-              });
+        // navigating into an unavailable page. Only a successful start of
+        // ANOTHER workspace navigates: the current one is already on
+        // screen, and its page recovers from the stream once the session
+        // is back (the connection indicator offers the same start).
+        item.addEventListener("click", event => {
+          event.preventDefault();
+          if (rowStart.get(workspace.id) === "starting") return;
+          rowStart.set(workspace.id, "starting");
+          state.textContent = rowStartWords.starting;
+          void startWorkspaceSession(workspace.id).then(outcome => {
+            if (outcome.ok) {
+              rowStart.delete(workspace.id);
+              if (workspace.id !== currentId) hubNavigation(item.href);
+              return;
+            }
+            rowStart.set(workspace.id, outcome.unlock ? "unlock" : "failed");
+            // The row may have been re-rendered meanwhile; say it on
+            // whichever node the menu shows now.
+            if (!menu.hidden) renderMenu();
           });
-        }
+        });
       }
       menu.appendChild(item);
     }
@@ -370,28 +472,64 @@ export function initHubNav(): void {
   // does not list the workspace: that answer may predate it.
   let requested = 0;
   let applied = 0;
-  let reports = 0;
-  const reportedAt = new Map<string, number>();
+  let outstanding = 0;
   const isListed = (ws: string) => latest.some(workspace => workspace.id === ws);
+  // The list is the authority on whether the current session runs: it is
+  // what the shell's `Stopped` state and the manual recovery's no-reload
+  // rule are keyed on, so it is published only from the hub's own answer
+  // (and from a running report, which is never stale the wrong way).
+  // A list answer speaks for the moment it was asked. A running report for
+  // the current workspace that arrived after that (`reportsBefore` is the
+  // report count when the request went out) is newer than the answer, and
+  // the hub only reports running for a session in its table: the answer
+  // must not put the fact back to stopped. Boot's probe has no earlier
+  // reports to defer to.
+  const applyListedRunning = (workspaces: HubWorkspaceSummary[], reportsBefore = -1) => {
+    const listed = currentSessionRunning(workspaces, currentId);
+    const facts = activity.get(currentId);
+    const newerRunning = facts?.running === true && (reportedAt.get(currentId) ?? 0) > reportsBefore;
+    listedRunning = listed === false && newerRunning ? true : listed;
+    setCurrentSessionRunning(listedRunning);
+  };
+  // A list answer replaces the folded list, but the stream's word on the
+  // current workspace can outlive it: that the child is gone (the list says
+  // running for as long as a stop is in progress, and the chip must not
+  // blink live meanwhile), or that the session runs again, reported after
+  // the answer was asked for.
+  const foldCurrent = (workspaces: HubWorkspaceSummary[], reportsBefore: number): HubWorkspaceSummary[] => {
+    const facts = activity.get(currentId);
+    if (!facts) return workspaces;
+    const keep = !facts.running || (reportedAt.get(currentId) ?? 0) > reportsBefore;
+    return keep ? applyWorkspaceActivity(workspaces, currentId, facts) : workspaces;
+  };
   // Resolves whether the hub answered.
   const refreshHubState = async (): Promise<boolean> => {
     const request = ++requested;
     const reportsBefore = reports;
-    const fresh = await fetchHubState();
-    if (fresh === null) return false;
-    if (request < applied) return true;
+    outstanding += 1;
+    const fresh = await fetchHubState().finally(() => { outstanding -= 1; });
+    if (fresh === null) {
+      resumeReconcile();
+      return false;
+    }
+    if (request < applied) {
+      resumeReconcile();
+      return true;
+    }
     applied = request;
-    latest = fresh.workspaces;
+    latest = foldCurrent(fresh.workspaces, reportsBefore);
     for (const ws of [...activity.keys()]) {
       if (!isListed(ws) && (reportedAt.get(ws) ?? 0) <= reportsBefore) {
         activity.delete(ws);
         reportedAt.delete(ws);
       }
     }
+    applyListedRunning(fresh.workspaces, reportsBefore);
     updateChip();
     if (!menu.hidden) {
       renderMenu();
     }
+    resumeReconcile();
     return true;
   };
 
@@ -409,12 +547,63 @@ export function initHubNav(): void {
     });
   };
 
+  // The stream said the current workspace is not running. That is also what
+  // it says for a running session whose child is momentarily unreachable,
+  // so `Stopped` is asserted only from the list — and the list lags a stop:
+  // the child is gone (and the stream says so) before the hub's session
+  // table records the stop, so a read in that window still says running,
+  // and the table's later change repeats a value the stream already sent.
+  // While the two disagree the list is re-read on a short backoff, until it
+  // says stopped, the stream says running again, or the schedule runs out
+  // (an unreachable child of a running session: `Reconnecting` is right,
+  // and the next reconnect, menu open, or page-cache restore reads again).
+  // An answer already on its way counts as a read.
+  let reconcileAttempt = 0;
+  // Set while the reconcile is waiting for a read it did not issue; that
+  // read's settling resumes it, whatever it answered.
+  let reconcileWaiting = false;
+  const disagree = () => activity.get(currentId)?.running === false && listedRunning === true;
+  const reconcileStop = () => {
+    if (reconcileTimer !== null || reconcileWaiting) return;
+    if (!disagree()) {
+      reconcileAttempt = 0;
+      return;
+    }
+    const delay = reconcileDelays[reconcileAttempt];
+    if (delay === undefined) {
+      reconcileAttempt = 0;
+      return;
+    }
+    reconcileAttempt += 1;
+    reconcileTimer = setTimeout(() => {
+      reconcileTimer = null;
+      if (!disagree()) {
+        reconcileAttempt = 0;
+        return;
+      }
+      if (outstanding > 0) {
+        // A read is on its way: its answer counts as this attempt's. The
+        // slot is given back so a slow answer does not use up the schedule.
+        reconcileAttempt -= 1;
+        reconcileWaiting = true;
+        return;
+      }
+      void refreshHubState().then(reconcileStop);
+    }, delay);
+  };
+  const resumeReconcile = () => {
+    if (!reconcileWaiting) return;
+    reconcileWaiting = false;
+    reconcileStop();
+  };
+
   // One probe decides hub-ness; only a hub origin answers this at the root.
   void fetchHubState().then(state => {
     if (state === null) {
       return;
     }
     latest = state.workspaces;
+    applyListedRunning(state.workspaces);
     updateChip();
     control.hidden = false;
 
@@ -428,6 +617,17 @@ export function initHubNav(): void {
       reportedAt.set(ws, reports);
       activity.set(ws, facts);
       latest = applyWorkspaceActivity(latest, ws, facts);
+      // Before the chip and menu render: the current row reads the fact.
+      if (ws === currentId) {
+        // A running report is the hub's own: the feed only says so for a
+        // session in its table.
+        if (facts.running) {
+          listedRunning = true;
+          setCurrentSessionRunning(true);
+        } else {
+          reconcileStop();
+        }
+      }
       updateChip();
       if (!menu.hidden) {
         renderMenu();
