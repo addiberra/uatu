@@ -335,6 +335,10 @@ test("a request the parent is waiting on stays reachable over the pushed screen"
   } });
 
   await expect(page.locator("#chat-subagents")).toBeVisible();
+  // The request card is on screen in the parent transcript — where the pill
+  // yields to it — so this also proves the pill returns once the drill-down
+  // is pushed over it and the card can no longer be reached.
+  await expect(page.locator('[data-chat-item-id="permission:p1"]')).toBeVisible();
   await page.locator("#chat-subagents summary").click({ position: { x: 8, y: 8 } });
   await page.getByRole("button", { name: "explore · Review renderer" }).click();
   await expect(page.locator("#chat-drilldown")).toBeVisible();
@@ -516,7 +520,10 @@ test("the outstanding-request pill leaves an answer field and its controls reach
   const card = page.locator('[data-chat-item-id="question:clearance"]');
   const jump = page.locator("#chat-requests-jump");
   await expect(card).toBeVisible();
-  await expect(jump).toBeVisible();
+  // The card is the pill's own target and it is on screen, so the pill yields
+  // to it — the count is still one, and it returns the moment the card is
+  // scrolled away (covered by the report-yields case below).
+  await expect(jump).toBeHidden();
 
   await card.getByRole("radio", { name: "Type your own answer" }).check();
   const customInput = card.locator("[data-question-custom-input]");
@@ -530,19 +537,24 @@ test("the outstanding-request pill leaves an answer field and its controls reach
   const primary = card.locator("[data-question-primary]");
   const reject = card.locator("[data-question-reject]");
   await expect(primary).toBeEnabled();
-  await expect(jump).toBeVisible();
+  await expect(jump).toBeHidden();
   expect(await paintedAtCentre(customInput)).toMatchObject({ reachable: true });
   expect(await paintedAtCentre(primary)).toMatchObject({ reachable: true });
   expect(await paintedAtCentre(reject)).toMatchObject({ reachable: true });
 
-  // Reachable at the centre is the floor, not the requirement: the pill is
-  // wide and the controls are narrow, so a centre that clears it says nothing
-  // about the rest. The spec asks for no overlap at all — and the Reject
-  // control clipped the pill's left edge before the timeline reserved the strip.
+  // Reachable at the centre is the floor, not the requirement: the floats are
+  // wide and the controls are narrow, so a centre that clears them says nothing
+  // about the rest. The spec asks for no overlap at all, from the report or
+  // from anything else the surface floats over the conversation — and the
+  // Reject control clipped the pill's left edge before the timeline reserved
+  // the strip. Rendered floats only: a display:none float has no box to hit.
   const overlaps = await page.evaluate(() => {
     const rect = (selector: string) => document.querySelector(`[data-chat-item-id="question:clearance"] ${selector}`)!.getBoundingClientRect();
-    const pill = document.querySelector("#chat-requests-jump")!.getBoundingClientRect();
-    const hits = (other: DOMRect) => other.left < pill.right && other.right > pill.left && other.top < pill.bottom && other.bottom > pill.top;
+    const floats = ["#chat-requests-jump", "#chat-latest", "#chat-prompt-rail"]
+      .map(selector => document.querySelector(selector)?.getBoundingClientRect())
+      .filter((box): box is DOMRect => Boolean(box && box.width > 0 && box.height > 0));
+    const hits = (other: DOMRect) => floats.some(float =>
+      other.left < float.right && other.right > float.left && other.top < float.bottom && other.bottom > float.top);
     return { field: hits(rect("[data-question-custom-input]")), answer: hits(rect("[data-question-primary]")), reject: hits(rect("[data-question-reject]")) };
   });
   expect(overlaps).toEqual({ field: false, answer: false, reject: false });
@@ -556,6 +568,143 @@ test("the outstanding-request pill leaves an answer field and its controls reach
   });
   expect(held.cardTop).toBeGreaterThanOrEqual(held.timelineTop - 1);
   expect(held.cardBottom).toBeLessThanOrEqual(held.timelineBottom + 1);
+});
+
+/** The free-form question the answering cases put at the end of a
+ *  conversation: one option beside "Type your own answer", so checking the
+ *  custom choice reveals and focuses the field the keyboard opens for. */
+const freeFormQuestion = (id: string, createdAt: number): ConversationItem => ({
+  id: `question:${id}`, type: "question", createdAt, requestId: id, status: "pending",
+  questions: [{
+    header: "Approach", prompt: "Which approach?", multiple: false, allowFreeForm: true,
+    options: [{ label: "Minimal", description: "Small change" }],
+  }],
+});
+
+test("answering a request on touch clears the stage and restores it on blur", async ({ page, request }) => {
+  // With the keyboard up the visible band is about a third of the screen, and
+  // none of the header, the pinned tracks, the composer or the request pill
+  // can be acted on until the answer is sent — they only push the field and
+  // its Answer/Reject controls under the keyboard. So they step aside whole,
+  // summaries included, which is what separates this from the keyboard rule:
+  // there the tracks keep their summary lines and give up only their rows.
+  await installFakeVisualViewport(page);
+  const id = await bootWithPinnedTracks(page, request);
+  await control(request, { action: "item", conversationId: id, item: freeFormQuestion("answering", 6) });
+
+  const card = page.locator('[data-chat-item-id="question:answering"]');
+  const customInput = card.locator("[data-question-custom-input]");
+  await expect(card).toBeVisible();
+  await card.getByRole("radio", { name: "Type your own answer" }).check();
+  await expect(customInput).toBeFocused();
+  await expect(page.locator("html")).toHaveAttribute("data-chat-answering", "");
+
+  // Editing, so the tab bar contributes no inset: `--chat-visual-height` is
+  // the whole visual viewport — the tabBarInset = 0 geometry.
+  await setVisualViewport(page, { height: 460 });
+  await expect(page.locator("#chat-surface")).toHaveCSS("--chat-visual-height", "460px");
+  await expect(page.locator(".chat-header")).toBeHidden();
+  await expect(page.locator("#chat-task-list")).toBeHidden();
+  await expect(page.locator("#chat-subagents")).toBeHidden();
+  await expect(page.locator("#chat-background-tasks")).toBeHidden();
+  await expect(page.locator("#chat-composer")).toBeHidden();
+  await expect(page.locator("#chat-requests-jump")).toBeHidden();
+
+  // Polled: the reveal that brings the field back inside the band runs on the
+  // coordinated frame after the resize, not in the same turn as it.
+  await expect.poll(() => page.evaluate(() => {
+    const bottom = (selector: string) => document.querySelector(selector)!.getBoundingClientRect().bottom;
+    return Math.round(Math.max(bottom("[data-question-custom-input]"), bottom("[data-question-primary]")) - window.visualViewport!.height);
+  })).toBeLessThanOrEqual(1);
+
+  // Blur is what clears the state — `blur()` fires the `focusout` the surface
+  // listens to, and the sync it schedules runs in a microtask.
+  await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
+  await expect(page.locator("html")).not.toHaveAttribute("data-chat-answering", "");
+  await expect(page.locator(".chat-header")).toBeVisible();
+  await expect(page.locator("#chat-composer")).toBeVisible();
+  await expect(page.locator("#chat-task-list")).toBeVisible();
+  await expect(page.locator("#chat-subagents")).toBeVisible();
+  await expect(page.locator("#chat-background-tasks")).toBeVisible();
+});
+
+test("the transcript holds still while an answer is typed", async ({ page, request }) => {
+  // iOS autoscrolls a scroller natively while a caret or selection handle is
+  // dragged near its edge, and it honours neither `overflow: hidden` nor
+  // `touch-action: none` while it does. With the answer field focused that
+  // runs the conversation away and takes the field off screen. The owner
+  // holds the position its reveal established instead: a scroll it did not
+  // write is undone on the next coordinated frame. Driven here as the
+  // platform delivers it — a `scrollTop` the page never asked for, followed
+  // by the `scroll` event that announces it.
+  await installFakeVisualViewport(page);
+  await boot(page, request, { items: [...messages("loaded", 28), freeFormQuestion("held", 100)] });
+  const card = page.locator('[data-chat-item-id="question:held"]');
+  const customInput = card.locator("[data-question-custom-input]");
+  const timeline = page.locator("#chat-timeline");
+  await card.getByRole("radio", { name: "Type your own answer" }).check();
+  await expect(customInput).toBeFocused();
+  await expect(page.locator("html")).toHaveAttribute("data-chat-answering", "");
+
+  await setVisualViewport(page, { height: 460 });
+  await expect(page.locator("#chat-surface")).toHaveCSS("--chat-visual-height", "460px");
+  const fieldOvershoot = () => page.evaluate(() => Math.round(
+    document.querySelector("[data-question-custom-input]")!.getBoundingClientRect().bottom - window.visualViewport!.height));
+  await expect.poll(fieldOvershoot).toBeLessThanOrEqual(1);
+  const held = await timeline.evaluate(element => element.scrollTop);
+  expect(held).toBeGreaterThan(300);
+
+  await timeline.evaluate(element => { element.scrollTop -= 300; element.dispatchEvent(new Event("scroll")); });
+  await expect.poll(fieldOvershoot).toBeLessThanOrEqual(1);
+  await expect.poll(() => timeline.evaluate(element => element.scrollTop)).toBeGreaterThan(held - 2);
+  expect(await timeline.evaluate(element => element.scrollTop)).toBeLessThan(held + 2);
+
+  // Blur releases the hold: the transcript is the reader's again, and nothing
+  // pulls it back to where the answer was being typed.
+  await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
+  await expect(page.locator("html")).not.toHaveAttribute("data-chat-answering", "");
+  await expect(page.locator("#chat-composer")).toBeVisible();
+  await timeline.evaluate(element => { element.scrollTop = 0; element.dispatchEvent(new Event("scroll")); });
+  await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve(null)))));
+  expect(await timeline.evaluate(element => element.scrollTop)).toBe(0);
+});
+
+test("focusing a request's answer field does not zoom the page", async ({ page, request }) => {
+  // iOS zooms the page on focus for any text control under 16px, and the
+  // free-form answer field is the one that takes focus mid-conversation —
+  // the same rule the composer and the configuration dialog already carry.
+  await boot(page, request, { items: [freeFormQuestion("zoom", 1)] });
+  const card = page.locator('[data-chat-item-id="question:zoom"]');
+  const customInput = card.locator("[data-question-custom-input]");
+  await card.getByRole("radio", { name: "Type your own answer" }).check();
+  await expect(customInput).toBeFocused();
+  await expect(customInput).toHaveCSS("font-size", "16px");
+});
+
+test("the outstanding-request report yields to a visible request", async ({ page, request }) => {
+  // The pill leads to a request; while that request is already on screen it
+  // has nothing to offer, and it floats over the very card the reader would
+  // be answering. It comes back — with the same count — once the card is
+  // scrolled away and the report is the only way back to it.
+  await boot(page, request, { items: [...messages("loaded", 28), freeFormQuestion("yields", 100)] });
+  const card = page.locator('[data-chat-item-id="question:yields"]');
+  const timeline = page.locator("#chat-timeline");
+  const jump = page.locator("#chat-requests-jump");
+  await expect(card).toBeVisible();
+
+  await timeline.evaluate(element => { element.scrollTop = element.scrollHeight; element.dispatchEvent(new Event("scroll")); });
+  await expect(card).toBeInViewport();
+  // Asserted by retrying: the observer answers off the scroll path, a frame
+  // or more after the position it is answering about.
+  await expect(jump).toBeHidden();
+
+  await timeline.evaluate(element => { element.scrollTop = 0; element.dispatchEvent(new Event("scroll")); });
+  await expect(jump).toBeVisible();
+  // Yielding is about whether the report shows, never about what it counts.
+  await expect(jump).toHaveText("1 request needs your answer");
+  // And while it is shown the timeline reserves its strip, so the request it
+  // leads to is not parked underneath it on arrival.
+  await expect(timeline).toHaveCSS("padding-bottom", "56px");
 });
 
 test("pinned streaming follows while unpinned streaming offers jump to latest", async ({ page, request }) => {

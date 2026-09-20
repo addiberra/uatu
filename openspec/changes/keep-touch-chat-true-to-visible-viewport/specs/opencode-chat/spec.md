@@ -28,6 +28,13 @@ platform pans the viewport to follow the caret. A reading-position correction
 withheld while the page is hidden SHALL be applied once the page is visible
 again rather than dropped.
 
+While a text control that belongs to a request has focus on a touch device,
+the surface SHALL give the transcript the visible band: chrome that cannot be
+used while the keyboard is open MUST NOT hold space in it, and the focused
+control SHALL be kept inside the visible viewport once the keyboard geometry
+has settled. Focusing that control MUST NOT change the page's scale. When
+focus leaves the request, the surface SHALL return to its normal arrangement.
+
 #### Scenario: Preview updates while the conversation stays visible
 - **WHEN** a desktop user prompts the agent and it modifies the currently
   previewed document
@@ -82,6 +89,27 @@ again rather than dropped.
 - **AND** repeated pans during one caret movement do not each reposition the
   transcript
 
+#### Scenario: The transcript holds still while an answer is typed
+- **WHEN** a touch user has a request's answer field focused and the platform
+  autoscrolls the transcript while the caret is dragged
+- **THEN** the transcript returns to the position that keeps the field in view
+- **AND** it scrolls freely again once the field loses focus
+
+#### Scenario: Answering a request on touch clears the stage
+- **WHEN** a touch user focuses a request's free-form answer field and the
+  software keyboard opens while the task, subagent and background-task tracks
+  are populated and the conversation has a header and composer
+- **THEN** the header, the pinned tracks, the composer and the outstanding-request
+  report are not shown
+- **AND** the answer field and the request's submit and cancel controls are
+  inside the visible viewport
+- **AND** they return when the field loses focus
+
+#### Scenario: Focusing the answer field does not zoom the page
+- **WHEN** a touch user focuses a request's free-form answer field
+- **THEN** the page's scale is unchanged
+- **AND** the field's text renders at the same size as the composer's
+
 ### Requirement: Users can resolve agent interaction requests in context
 An unresolved OpenCode permission request SHALL appear in the conversation that raised it with the approval and rejection choices OpenCode supports for it: approving the single occurrence, approving persistently, and rejecting. Where a permission would change a file, the request SHALL show what it would change — the pending diff — where the choice is made, so the user sees the change before allowing it. A permission with nothing to show a diff for is unaffected. A structured OpenCode question SHALL render its prompt, options, multi-selection behavior, and free-form response when supported. A resolved request SHALL become non-interactive and record its outcome. A resolved request SHALL also recede: its outcome stays legible where the request was raised, but it MUST NOT keep the footprint it held while it needed an answer, and what it named SHALL stay reachable from the receded form. Submitting a response more than once MUST NOT produce multiple provider replies.
 
@@ -93,7 +121,7 @@ Only the active unresolved request of a given conversation MAY accept a response
 
 A request's state SHALL be distinguishable without reading its body — whether it awaits the user now, awaits its turn behind another request of the same conversation, or is resolved. That distinction MUST NOT rely on colour alone. A request awaiting its turn MUST NOT be presented as obsolete, superseded, or otherwise not needing an answer, because it will require one.
 
-The surface SHALL report how many requests are outstanding across everything it is showing, and SHALL offer a way to reach an outstanding request without hunting for it. That report, and any other control the surface floats over the conversation, MUST NOT cover a request's own answer field or its submit and cancel controls; the conversation SHALL reserve room for them so an outstanding request shown at the end of the transcript stays fully operable.
+The surface SHALL report how many requests are outstanding across everything it is showing, and SHALL offer a way to reach an outstanding request without hunting for it. That report, and any other control the surface floats over the conversation, MUST NOT cover a request's own answer field or its submit and cancel controls; the conversation SHALL reserve room for them so an outstanding request shown at the end of the transcript stays fully operable. The report SHALL NOT be shown while a request it would lead to is already on screen; when it is shown, its count remains that of every outstanding request.
 
 Revealing a request's free-form answer field SHALL hold the conversation's position on the request being answered, so the request does not scroll out of view as the user starts to answer it.
 
@@ -177,6 +205,11 @@ A pending request SHALL remain discoverable and answerable even when the server 
 - **WHEN** a request at the end of the conversation shows its answer field and submit and cancel controls while the surface reports outstanding requests
 - **THEN** the report does not overlap that field or those controls
 - **AND** each of them can be activated directly where it appears
+
+#### Scenario: The outstanding-request report yields to a visible request
+- **WHEN** the only outstanding request's card is within the visible part of the conversation
+- **THEN** the report is not shown
+- **AND** it reappears once the card is scrolled out of view while the request is still outstanding
 
 #### Scenario: Revealing a free-form answer holds the request in view
 - **WHEN** the user chooses a request's free-form answer and its field is revealed and focused

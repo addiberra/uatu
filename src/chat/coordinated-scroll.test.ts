@@ -44,6 +44,10 @@ function fixture() {
   };
 }
 
+function stubRect(element: object, rect: () => { top: number; bottom: number }): void {
+  Object.defineProperty(element, "getBoundingClientRect", { configurable: true, value: rect });
+}
+
 describe("coordinated scrolling", () => {
   test("upward scrolling without a wheel event still pauses when revealing content changes the extent", () => {
     const f = fixture();
@@ -206,6 +210,82 @@ describe("coordinated scrolling", () => {
     expect(f.frames.size).toBe(1);
     f.owner.flush(116);
     expect(f.writes).toEqual([400, 500]);
+  });
+  test("revealing a focused control is one write, and the anchor then holds it", () => {
+    const f = fixture();
+    // linkedom lays nothing out, so the two rectangles this reveal reasons
+    // about are stubbed: a 300px client box at the top of the page, and a
+    // field sitting 60px below its bottom edge.
+    stubRect(f.element, () => ({ top: 0, bottom: 300 }));
+    const field = f.document.createElement("input");
+    f.element.append(field);
+    let fieldTop = 340;
+    stubRect(field, () => ({ top: fieldTop, bottom: fieldTop + 20 }));
+    // A reader parked mid-transcript: the anchor's own correction is a no-op,
+    // so any write in this frame is the reveal's.
+    f.grow(900); f.move(300); f.owner.pause();
+
+    f.owner.reveal(field as unknown as HTMLElement);
+    expect(f.frames.size).toBe(1);
+    f.flush();
+    expect(f.writes).toEqual([360]);
+
+    // The reveal re-captured through the anchor, so the next correction holds
+    // the revealed position instead of snapping back to where it was.
+    f.owner.request(); f.flush();
+    expect(f.writes).toEqual([360]);
+    expect(f.element.scrollTop).toBe(360);
+    expect(f.anchor.isPinned()).toBe(false);
+
+    // Already inside the box: nothing to reveal, nothing written.
+    fieldTop = 100;
+    f.owner.reveal(field as unknown as HTMLElement);
+    f.flush();
+    expect(f.writes).toEqual([360]);
+  });
+  test("a held control is put back after a scroll the owner did not write", () => {
+    const f = fixture();
+    // As in the reveal case above: a 300px client box at the top of the page.
+    // This field's rectangle moves with the scroller, as a laid-out element
+    // does — which is what makes the re-reveal after a foreign scroll a real
+    // measurement rather than a replay of the first one.
+    stubRect(f.element, () => ({ top: 0, bottom: 300 }));
+    const field = f.document.createElement("input");
+    f.element.append(field);
+    stubRect(field, () => ({ top: 640 - f.element.scrollTop, bottom: 660 - f.element.scrollTop }));
+    f.grow(900); f.move(300); f.owner.pause();
+
+    f.owner.hold(field as unknown as HTMLElement);
+    f.flush();
+    expect(f.writes).toEqual([360]);
+    // The echo of our own write: the held position is the one we are at, so
+    // there is nothing to undo and no frame to spend.
+    f.event("scroll");
+    expect(f.frames.size).toBe(0);
+    expect(f.writes).toEqual([360]);
+
+    // WebKit autoscrolling the transcript while the caret is dragged: one
+    // frame, one write, and the field is inside the box again.
+    f.move(60);
+    f.event("scroll");
+    expect(f.frames.size).toBe(1);
+    expect(f.anchor.isPinned()).toBe(false);
+    f.flush();
+    expect(f.writes).toEqual([360, 360]);
+    expect(f.element.scrollTop).toBe(360);
+    f.event("scroll");
+    expect(f.frames.size).toBe(0);
+    expect(f.writes).toEqual([360, 360]);
+
+    // Released on blur: the scroller is left where it stands, and a foreign
+    // scroll is the reader's again.
+    f.owner.release();
+    expect(f.element.scrollTop).toBe(360);
+    f.move(60);
+    f.event("scroll");
+    expect(f.frames.size).toBe(0);
+    expect(f.element.scrollTop).toBe(60);
+    expect(f.writes).toEqual([360, 360]);
   });
   test("upward input with concurrent layout growth captures the actual reader position", () => {
     const f = fixture();

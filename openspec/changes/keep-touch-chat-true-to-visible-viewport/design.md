@@ -26,7 +26,6 @@ Constraints that bound this work:
 
 - Any change to the tab bar, its keyboard rules, or `tabBarBottomInset()` (#358 owns them).
 - The same page-lifecycle blind spot in `src/shell/desktop-viewport.ts` and the terminal panel's `viewportSizer` — real, but out of scope; recorded as a follow-up.
-- Auto-hiding the outstanding-requests pill while its target card is on screen — a behavior change beyond these three issues; recorded as a follow-up.
 - Rewriting the anchor model, the pinned-track markup, or the question form's structure.
 
 ## Decisions
@@ -61,6 +60,41 @@ The question `change` handler in `src/chat/ui.ts` calls `syncQuestionControl(inp
 **D9 — The background-task list joins the pinned-track budget.**
 `#chat-background-tasks-items` is added to the `max-height: 8.5rem; overflow-y: auto` cap and to the `html[data-chat-keyboard]` hide rule, alongside the task list and subagent list. It is a pinned track by construction and was simply missed; leaving it out means a track that can grow without bound in a column whose only shrinkable child is the transcript.
 
+**D10 — The keyboard covers the chrome while a request is answered.**
+`syncEditingFocus` also toggles `data-chat-answering` on `<html>` when the focused text control sits inside a request card (`.chat-request` / `[data-question-form]`). While it is set on touch, the chat surface keeps the *layout* viewport height (`window.innerHeight`) instead of shrinking to the visual viewport; its top still follows the visual viewport's offset. The composer, the five pinned tracks (`#chat-task-list`, `#chat-subagents`, `#chat-background-tasks`, `#chat-reverted`, `#chat-queue`) and the Latest button therefore stay laid out where they are and the software keyboard slides up over them — they are literally under the keyboard, and they reappear as it dismisses. If the keyboard is already open when the request field takes focus (the user was in the composer), the surface's height transitions (~250 ms) so the bottom chrome visibly slides down under the keyboard rather than jumping. The header stays visible at the top. Only `#chat-requests-jump` — the outstanding-request pill, which yields anyway under D12 — and the prompt rail, which captures touches beside the field, are hidden while answering; nothing else is taken out of the layout. No tab-bar rule is needed (already hidden under `data-chat-editing`), and nothing in `styles.css` ~8020–8045 or `src/shell/tab-bar.ts` is touched. Once the keyboard geometry settles, the focused control is brought inside the visible viewport through the coordinated owner — it is the only automatic position writer, so no raw `scrollTop` or `scrollIntoView` on the nested timeline. *Tap safety:* the request's submit and cancel controls get the touch `pointerdown` `preventDefault()` the send button already has, so tapping them does not blur the field first and reflow the chrome back under the finger.
+*Alternative:* hide the chrome outright — rejected after the field test: the disappearance reads as loss, not as making room. Letting the keyboard cover it says where the chrome went, and dismissing the keyboard brings it back by itself.
+
+**D11 — 16 px on the custom-answer input in touch mode.**
+The same rule family as `#chat-input` and the configuration dialog: iOS zooms on focus for any text control under 16 px; pinning the size is the only reliable opt-out.
+
+**D12 — The pill yields to intersection.**
+`syncOutstandingRequests` keeps an `IntersectionObserver` rooted at the timeline on the current target card and sets `hidden` only while the card is genuinely on screen: at least half of it showing, or — for a card taller than the band — at least half the visible band filled by it. A sliver crossing the edge leaves the answer field and the Answer/Reject controls unreachable, and the pill is the way back to them, so intersection alone is the wrong test; the observer is given dense thresholds (`0`…`1` in twentieths) so the rule is re-evaluated as the card scrolls rather than only as it enters and leaves. While a subagent drill-down is pushed the parent card still intersects the parent timeline underneath it but cannot be reached there, so the pill does not yield to it — that is what keeps a parent request visible over the pushed screen. The count is unchanged when the pill does show, and the reservation from D8 stays for the case where it is shown over a different request.
+
+**D13 — The revealed position is held while answering.**
+While `data-chat-answering` is set, the coordinated owner holds the timeline
+at the position the reveal established: any scroll it did not write itself —
+WebKit's own autoscroll as a caret or selection handle is dragged to the edge
+of the answer field, an accidental pan — is undone on the next coordinated
+frame, and the hold is released when focus leaves the request. The undo
+re-runs the reveal rather than restoring the recorded `scrollTop`, so the
+minimal move is recomputed against the current layout — with the band's bottom
+clamped to the visual viewport's bottom (`offsetTop + height`) rather than the
+timeline's own, which under D10 now extends beneath the keyboard — and the
+field lands in view even when content above it changed height; a new reveal — the one the
+viewport controller asks for when the keyboard height changes — re-establishes
+the held position the same way. A held scroll speaks for nobody: it must not
+pause following or re-anchor, so it takes none of the unpinning path an
+upward gesture takes.
+*Alternative:* `overflow: hidden` or `touch-action: none` on the timeline
+while answering — rejected: WebKit's selection autoscroll ignores both, it
+scrolls the container while the caret is dragged regardless. A JS hold is also
+the smaller idea here: this owner is already the only automatic position
+writer for the scroller, so defending a position it just wrote is an extension
+of what it does rather than a new mechanism. It is a standing mode
+(`hold(element)` / `release()`) rather than an option on the one-shot
+`reveal(element)`, because a reveal is consumed by the frame that serves it
+while a hold outlives it and has to be ended by name.
+
 ## Risks / Trade-offs
 
 - [The two iOS mechanisms are hypotheses that browser tests cannot confirm — that iOS suppresses the visual-viewport `resize` across a background transition, and that the fixed-top surface and the pan form a feedback loop] → the e2e tests fake `visualViewport` and drive the exact event sequences, which proves the code responds correctly to that sequence; only the manual iPhone Safari and installed-PWA checklist confirms the sequence is the one iOS produces. Both are flagged in tasks.md as device-only.
@@ -69,6 +103,9 @@ The question `change` handler in `src/chat/ui.ts` calls `syncQuestionControl(inp
 - [Hiding the background-task list while the keyboard is up removes visible state] → identical to the treatment the task list and subagent list already receive, and the track's summary line remains.
 - [`:has()` support] → already relied on elsewhere in this stylesheet, including in the touch keyboard rules; no new baseline.
 - [D3 changes a predicate other rules depend on] → `data-chat-keyboard` gates the pinned-track hide rules and the tab-bar rules #358 is rewriting. Making the predicate fire in a case where it previously did not is the fix; tests pin `tabBarInset = 0` so they do not encode the inset behavior #358 removes.
+- [Changing the surface's height on focus is a layout move] → the height is transitioned (~250 ms) rather than switched, so the bottom chrome slides under the keyboard instead of jumping, and a reveal measured mid-transition is re-run by the resize path once the transition settles; the transcript's own scroll position is held by D6's anchor hand-off, and D10's tap safety keeps submit/cancel taps where the finger is.
+- [Intersection gating flickers as the card scrolls past the edge] → observe with a small threshold and switch on the observer's boolean, not per-frame geometry.
+- [While the answer field has focus the reader cannot scroll the transcript: the hold undoes their scroll along with the platform's] → blurring the field, which a tap outside it does, releases the hold, and while answering the visible band is the card being answered anyway. An explicit upward gesture on the transcript still reaches `pause()`, which cancels pending work and ends the hold with it.
 
 ## Migration Plan
 

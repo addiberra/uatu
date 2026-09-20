@@ -20,6 +20,9 @@ const owners = new WeakMap<HTMLElement, CoordinatedScrollOwner>();
 export class CoordinatedScrollOwner {
   private frame: number | null = null;
   private newContent = false;
+  private revealTarget: HTMLElement | null = null;
+  private heldTarget: HTMLElement | null = null;
+  private heldTop: number | null = null;
   private disposed = false;
   private previous: AnchorGeometry;
   private touchY: number | null = null;
@@ -81,7 +84,103 @@ export class CoordinatedScrollOwner {
     // Any later scroll echo belongs to this correction, not an earlier
     // wheel/key gesture whose native movement never arrived.
     this.upwardPending = false;
+    // After the anchor has had its say, so the reveal is the last word on
+    // where this frame leaves the scroller.
+    this.applyReveal(timestamp);
+    // Whatever this frame settled on — the anchor's correction, the reveal's
+    // refinement of it, or neither — is the position the hold now defends.
+    if (this.heldTarget) this.heldTop = this.scroller.scrollTop;
     this.options.onChange?.();
+  }
+
+  /**
+   * Bring an element inside the scroller's client box on the next coordinated
+   * frame. Focus is the caller here — a request's answer field under the
+   * software keyboard — and this owner is the only automatic position writer,
+   * so the alternative would be a raw `scrollIntoView` on a scroller it
+   * manages, which the anchor would then correct straight back.
+   */
+  reveal(element: HTMLElement): void {
+    if (!this.active()) return;
+    this.revealTarget = element;
+    this.request();
+  }
+
+  /**
+   * Reveal the element and then keep it there: while a hold is in force, a
+   * scroll this owner did not write is undone on the next coordinated frame.
+   *
+   * A standing mode rather than `reveal(element, { hold: true })`: a reveal is
+   * consumed by the frame it is served in, a hold outlives it and has to be
+   * ended by name, so an option on the one-shot call would give the mode a
+   * beginning and no matching end. `overflow: hidden` or `touch-action: none`
+   * would be the platform's way to say the same thing, and WebKit's selection
+   * autoscroll honours neither — it moves the scroller while a caret is
+   * dragged near its edge regardless. This owner is already the only
+   * automatic position writer for the scroller, so defending a position it
+   * wrote is its own job rather than a new one.
+   */
+  hold(element: HTMLElement): void {
+    if (!this.active()) return;
+    this.heldTarget = element;
+    this.heldTop = null;
+    this.reveal(element);
+  }
+
+  /** End the hold, leaving the scroller exactly where it stands. */
+  release(): void {
+    this.heldTarget = null;
+    this.heldTop = null;
+  }
+
+  /**
+   * The minimal move that puts the target inside the client box, honouring
+   * the scroller's own scroll padding so a revealed control does not park
+   * under a floating overlay.
+   *
+   * A reveal that actually moves the scroller re-captures through the
+   * anchor's `pause()`: the reader was deliberately given this position, and
+   * an anchor left as it was — pinned to the end, or holding an item further
+   * up — would snap off it on the very next correction. `pause()` rather than
+   * `beforeMutation()` because unpinning is part of what must happen; it is
+   * the same treatment an upward gesture gets. A reveal that needs no move
+   * leaves the anchor alone, so following is not lost for nothing.
+   */
+  private applyReveal(timestamp: number): void {
+    const target = this.revealTarget;
+    this.revealTarget = null;
+    if (!target || !this.scroller.contains(target)) return;
+    const delta = this.revealDelta(target);
+    if (Math.abs(delta) < 0.5) return;
+    const limit = Math.max(0, this.scroller.scrollHeight - this.scroller.clientHeight);
+    const top = Math.max(0, Math.min(this.scroller.scrollTop + delta, limit));
+    if (Math.abs(this.scroller.scrollTop - top) <= 0.5) return;
+    this.lastCorrectionFrame = timestamp;
+    this.scroller.scrollTop = top;
+    const geometry = this.options.measure(true);
+    this.options.anchor.pause(geometry);
+    this.previous = geometry;
+    // The reveal is our own assignment, not a gesture awaiting native
+    // movement: its scroll echo must not be read as the reader moving.
+    this.upwardPending = false;
+  }
+
+  private revealDelta(target: HTMLElement): number {
+    if (typeof target.getBoundingClientRect !== "function") return 0;
+    const box = this.scroller.getBoundingClientRect();
+    const rect = target.getBoundingClientRect();
+    // No computed style (or none declared) means no reserved band: 0.
+    const style = typeof getComputedStyle === "function" ? getComputedStyle(this.scroller) : null;
+    const padTop = Number.parseFloat(style?.scrollPaddingTop ?? "") || 0;
+    const padBottom = Number.parseFloat(style?.scrollPaddingBottom ?? "") || 0;
+    const top = box.top + padTop;
+    const bottom = box.top + this.scroller.clientHeight - padBottom;
+    if (bottom <= top) return 0;
+    if (rect.top < top) return rect.top - top;
+    // A target taller than the band aligns to its top rather than scrolling
+    // its own top out of view to chase its bottom.
+    if (rect.bottom > bottom) return Math.min(rect.bottom - bottom, rect.top - top);
+    return 0;
   }
 
   beforeMutation(preferredItemId?: string): void {
@@ -95,6 +194,8 @@ export class CoordinatedScrollOwner {
   latest(): void {
     if (!this.active()) return;
     this.upwardPending = false;
+    // An explicit jump to the end outranks a reveal still waiting for a frame.
+    this.revealTarget = null;
     this.options.anchor.jumpToLatest(this.options.measure(false));
     this.request();
     this.options.onChange?.();
@@ -106,6 +207,11 @@ export class CoordinatedScrollOwner {
     this.frame = null;
     this.newContent = false;
     this.upwardPending = false;
+    this.revealTarget = null;
+    // A hold is transient input too: the gestures and teardowns that cancel
+    // pending work are the reader, or the surface, taking the scroller back.
+    this.heldTarget = null;
+    this.heldTop = null;
     this.touchY = null;
   }
 
@@ -126,6 +232,19 @@ export class CoordinatedScrollOwner {
     const changedExtent = geometry.scrollHeight !== previous.scrollHeight || geometry.clientHeight !== previous.clientHeight;
     const movement = geometry.scrollTop < previous.scrollTop - 0.5 ? "up"
       : geometry.scrollTop > previous.scrollTop + 0.5 ? "down" : "none";
+    if (this.heldTarget) {
+      // The held control's position is the one this scroller has. A scroll we
+      // did not write — WebKit's autoscroll as the caret is dragged to the
+      // edge of the field, a stray pan — is undone on the next coordinated
+      // frame by re-running the reveal, which recomputes the minimal move for
+      // the held control, so it lands in view even when the content above it
+      // changed height in between. None of this speaks for the reader: a held
+      // scroll must not pause following or re-anchor.
+      const moved = this.heldTop === null || Math.abs(geometry.scrollTop - this.heldTop) > 0.5;
+      if (moved || changedExtent) this.reveal(this.heldTarget);
+      this.previous = geometry;
+      return;
+    }
     const bottom = Math.max(0, geometry.scrollHeight - geometry.clientHeight);
     const clamped = changedExtent && bottom < previous.scrollTop - 0.5 && Math.abs(geometry.scrollTop - bottom) <= 1;
     if (clamped) {

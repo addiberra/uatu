@@ -8122,6 +8122,13 @@ html[data-ui-mode="touch"] .chat-configuration-dialog select {
   font-size: 16px;
 }
 
+/* Same reason as the composer and the dialog above: iOS zooms the page on
+   focus for any text control under 16px, and the free-form answer field is
+   the one that takes focus mid-conversation. */
+html[data-ui-mode="touch"] .chat-question-custom-editor input {
+  font-size: 16px;
+}
+
 html[data-ui-mode="touch"] .chat-composer-actions {
   grid-template-columns: auto minmax(0, 1fr) 2.25rem 2.55rem;
   align-items: center;
@@ -8917,6 +8924,43 @@ html[data-chat-keyboard] #chat-background-tasks-items,
 html[data-chat-keyboard] .chat-reverted-items,
 html[data-chat-keyboard] .chat-queue {
   display: none;
+}
+
+/* Answering a request is the one state where the chrome costs more than it
+   carries. With the keyboard up the visible band is about 330px, and none of
+   the header, the pinned tracks, the composer or the outstanding-request pill
+   can be acted on until the answer is sent — they only push the question's
+   field and its Answer/Reject controls under the keyboard. So they step aside
+   whole, summaries included, unlike the keyboard rule above which keeps the
+   summary lines: a line the reader cannot reach is the same tax in a tighter
+   band. The transcript area is the surface's only flex-shrinkable child, so
+   with these gone it simply takes all of --chat-visual-height. The prompt
+   rail and the Latest button go with them: they float over the transcript's
+   right and lower-right edges, the exact corner the answer field and its
+   Answer/Reject controls now occupy, and the rail claims its touches
+   outright. Everything returns when the state clears on blur. */
+html[data-ui-mode="touch"][data-chat-answering] .chat-header,
+html[data-ui-mode="touch"][data-chat-answering] #chat-prompt-rail,
+html[data-ui-mode="touch"][data-chat-answering] #chat-task-list,
+html[data-ui-mode="touch"][data-chat-answering] #chat-subagents,
+html[data-ui-mode="touch"][data-chat-answering] #chat-background-tasks,
+html[data-ui-mode="touch"][data-chat-answering] #chat-reverted,
+html[data-ui-mode="touch"][data-chat-answering] #chat-queue,
+html[data-ui-mode="touch"][data-chat-answering] #chat-composer,
+html[data-ui-mode="touch"][data-chat-answering] #chat-latest,
+html[data-ui-mode="touch"][data-chat-answering] #chat-requests-jump {
+  display: none;
+}
+
+/* The pill's 3.5rem reservation keys on its `hidden` attribute, which the
+   answering state does not set — without this the strip stays held while the
+   pill is gone. Both timelines are named by id because that reservation's
+   `:has(> #chat-requests-jump…)` carries id specificity; the value is the
+   ordinary touch inset, so the last card keeps its normal breathing room. */
+html[data-ui-mode="touch"][data-chat-answering] #chat-timeline,
+html[data-ui-mode="touch"][data-chat-answering] #chat-drilldown-timeline {
+  padding-bottom: 0.6rem;
+  scroll-padding-bottom: 0.6rem;
 }
 
 /* Rows of the background-task list: the task's description leads, its

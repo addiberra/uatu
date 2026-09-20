@@ -641,6 +641,33 @@ export function initChat(api = new ChatApiClient()): void {
     onChange: () => { if (childLatest) childLatest.hidden = !childAnchor.hasUnseen(); },
   }) : null;
   childLatest?.addEventListener("click", () => childScroll?.latest());
+  /**
+   * A control is revealed by the owner of the timeline it sits in — the same
+   * card can be shown in the parent transcript or in a subagent drill-down,
+   * and each timeline scrolls itself.
+   */
+  const revealInOwningTimeline = (element: HTMLElement): void => {
+    if (drilldownTimeline?.contains(element)) childScroll?.reveal(element);
+    else if (timeline.contains(element)) parentScroll.reveal(element);
+  };
+  /**
+   * The same choice of owner, for the standing version: while the field is
+   * focused its timeline is held at the revealed position, so the platform's
+   * own autoscroll as the caret is dragged cannot run the conversation away.
+   */
+  const holdInOwningTimeline = (element: HTMLElement): void => {
+    if (drilldownTimeline?.contains(element)) childScroll?.hold(element);
+    else if (timeline.contains(element)) parentScroll.hold(element);
+  };
+  /** Both owners on release: by the time focus has left, the field that was
+   *  held may no longer be in the timeline that held it. Releasing an owner
+   *  that holds nothing does nothing, and neither release scrolls. */
+  const releaseHeldTimelines = (): void => { parentScroll.release(); childScroll?.release(); };
+  /** The focused control, while it is a text control this surface owns. */
+  const focusedChatTextControl = (): HTMLElement | null => {
+    const active = document.activeElement;
+    return active instanceof HTMLElement && surface.contains(active) && isTextEditingControl(active) ? active : null;
+  };
   renderer.shellMutationHooks = {
     beforeMutation: () => parentScroll.beforeMutation(),
     afterMutation: () => parentScroll.request(),
@@ -654,6 +681,13 @@ export function initChat(api = new ChatApiClient()): void {
   const viewport = new ChatViewportController(surface, form, () => {
     parentScroll.request();
     childScroll?.request();
+    // While a request is being answered, the geometry that changed is the
+    // keyboard's: the correction that matters is keeping the field the user
+    // is typing into inside what is left of the viewport. It rides the frame
+    // the corrections above already asked for, and has the last word in it.
+    if (!document.documentElement.hasAttribute("data-chat-answering")) return;
+    const focused = focusedChatTextControl();
+    if (focused) revealInOwningTimeline(focused);
   });
 
   const flushSave = () => {
@@ -858,6 +892,56 @@ export function initChat(api = new ChatApiClient()): void {
    * have to scroll and count. This says how many and takes you to one.
    */
   let paintedRequests = "";
+  let outstandingCount = 0;
+  // The pill leads to a request; while that request is already on screen it
+  // has nothing to offer, and it is floating over the very card the user is
+  // answering. Intersection is the right question to ask, and an observer
+  // answers it off the scroll path — reading geometry per frame here would
+  // both force a layout and flicker as the card crosses the edge.
+  let requestObserver: IntersectionObserver | null = null;
+  let observedRequestCard: Element | null = null;
+  let requestTargetVisible = false;
+  const syncRequestsJumpVisibility = () => {
+    if (!requestsJump) return;
+    // A parent card keeps intersecting the parent timeline while the
+    // drill-down is pushed over it, but the reader cannot reach it there —
+    // and the pill is layered above the pushed screen precisely so a request
+    // the parent is waiting on stays visible from inside a subagent. So the
+    // target does not count as on screen while the layer is up. A card
+    // observed in the drill-down's own timeline is the layer's own business
+    // and is unaffected.
+    const buried = Boolean(drilldown && !drilldown.hidden) && Boolean(observedRequestCard && items.contains(observedRequestCard));
+    requestsJump.hidden = outstandingCount === 0 || (requestTargetVisible && !buried);
+  };
+  /**
+   * One observer, on the card the pill currently points at. It is torn down
+   * and rebuilt whenever that element changes — a new target, a re-rendered
+   * card, another conversation, or no outstanding request at all — so nothing
+   * is left observing a node the timeline has dropped.
+   */
+  const observeRequestTarget = (id: string | undefined) => {
+    const card = id ? items.querySelector(`[data-chat-item-id="${CSS.escape(id)}"]`) : null;
+    if (card === observedRequestCard) return;
+    observedRequestCard = card;
+    requestObserver?.disconnect();
+    requestObserver = null;
+    requestTargetVisible = false;
+    if (!card || typeof IntersectionObserver !== "function") return;
+    requestObserver = new IntersectionObserver(entries => {
+      const entry = entries.at(-1);
+      if (!entry) return;
+      // Half the card, or half of what the timeline can show — a sliver of a
+      // card crossing the edge leaves its answer field and its Answer/Reject
+      // controls off screen, and the pill is the only way back to them. The
+      // dense threshold list is what has the rule re-evaluated as the card
+      // scrolls rather than only as it enters and leaves.
+      requestTargetVisible = entry.isIntersecting
+        && (entry.intersectionRatio >= 0.5
+          || (entry.rootBounds ? entry.intersectionRect.height >= entry.rootBounds.height / 2 : false));
+      syncRequestsJumpVisibility();
+    }, { root: timeline, threshold: Array.from({ length: 21 }, (_, index) => index / 20) });
+    requestObserver.observe(card);
+  };
   const syncOutstandingRequests = () => {
     if (!requestsJump) return;
     const outstanding = projection
@@ -868,20 +952,24 @@ export function initChat(api = new ChatApiClient()): void {
     // Skipped when nothing changed: rewriting the pill's text every frame
     // replaces the text node a finger may be resting on.
     const signature = `${outstanding.length}\u0001${target?.id ?? ""}`;
-    if (signature === paintedRequests) return;
-    paintedRequests = signature;
-    if (outstanding.length === 0) {
-      requestsJump.hidden = true;
-      requestsJump.textContent = "";
-      delete requestsJump.dataset.requestTarget;
-      return;
+    if (signature !== paintedRequests) {
+      paintedRequests = signature;
+      if (outstanding.length === 0) {
+        requestsJump.textContent = "";
+        delete requestsJump.dataset.requestTarget;
+      } else {
+        const noun = outstanding.length === 1 ? "request needs" : "requests need";
+        requestsJump.textContent = `${outstanding.length} ${noun} your answer`;
+        // The answerable one is the newest; that is where the jump lands,
+        // because it is the only one a user can act on right now.
+        requestsJump.dataset.requestTarget = target!.id;
+      }
     }
-    const noun = outstanding.length === 1 ? "request needs" : "requests need";
-    requestsJump.hidden = false;
-    requestsJump.textContent = `${outstanding.length} ${noun} your answer`;
-    // The answerable one is the newest; that is where the jump lands, because
-    // it is the only one a user can act on right now.
-    requestsJump.dataset.requestTarget = target!.id;
+    // The count is the text's business; whether the pill shows is the
+    // observer's, so these run on every sync even when the text did not move.
+    outstandingCount = outstanding.length;
+    observeRequestTarget(target?.id);
+    syncRequestsJumpVisibility();
   };
 
   // A jump parked while the drill-down closes. Closing can be asynchronous —
@@ -2898,6 +2986,21 @@ export function initChat(api = new ChatApiClient()): void {
       stage.renderer.focusAfterPaint = `[data-chat-item-id="${CSS.escape(itemId)}"] [data-permission-outcome="approved-session"]`;
       stage.rerender();
     };
+    // The send button's treatment, for the controls that resolve a request.
+    // A pointerdown on them would otherwise blur the answer field first,
+    // which restores the chrome and reflows the card out from under the
+    // pointer before the press lands. The guard is the answering state, not
+    // the pointer type: that state is the only one in which a blur reflows
+    // anything, and a mouse or trackpad press on an iPad's keyboard case
+    // moves the card exactly as a finger would. Preventing the default here
+    // does not cancel the click, and the selector is the action row only —
+    // checkboxes, radios, links and the card's own summary keep ordinary
+    // pointer behavior.
+    container.addEventListener("pointerdown", event => {
+      if (!document.documentElement.hasAttribute("data-chat-answering")) return;
+      if (!(event.target as Element).closest?.(REQUEST_ANSWER_CONTROLS)) return;
+      event.preventDefault();
+    });
     container.addEventListener("click", event => {
       const target = (event.target as Element).closest<HTMLElement>("[data-file-ref], [data-permission-outcome], [data-permission-choice], [data-permission-confirm], [data-permission-cancel], [data-question-reject], [data-open-conversation], [data-chat-copy], [data-history-revert]");
       if (!target) return;
@@ -3119,6 +3222,9 @@ export function initChat(api = new ChatApiClient()): void {
     }
     if (drilldown) drilldown.hidden = true;
     if (drilldownTitle) drilldownTitle.textContent = "";
+    // The parent's cards are reachable again, so the pill returns to
+    // deferring to the one it leads to.
+    syncRequestsJumpVisibility();
     announceChild("");
     surface.removeAttribute("data-chat-drilldown");
     // Back to the parent at its live position: it never unmounted, so this is
@@ -3225,6 +3331,9 @@ export function initChat(api = new ChatApiClient()): void {
     if (drilldownTitle) drilldownTitle.textContent = label;
     drilldown.hidden = false;
     surface.setAttribute("data-chat-drilldown", "open");
+    // A request the parent is waiting on is no longer reachable behind the
+    // pushed screen, so the pill stops deferring to it.
+    syncRequestsJumpVisibility();
     if (!retainedProjection && chatSurfaceActive()) childRenderer.render(drilldownItems, null, expanded, declares("subagents"));
     else childRenderDirty = true;
     // Hidden until this child's own first page says whether more exists —
@@ -3362,10 +3471,23 @@ export function initChat(api = new ChatApiClient()): void {
       form.requestSubmit();
     }
   });
+  // Answering is editing inside a request card. It is derived here rather
+  // than in CSS because only the focus path knows which control took focus,
+  // and it is the one state that hands the transcript the whole visible band.
+  let answeringRequest = false;
   const syncEditingFocus = () => {
-    const editing = surface.contains(document.activeElement) && isTextEditingControl(document.activeElement);
+    const active = document.activeElement;
+    const editing = surface.contains(active) && isTextEditingControl(active);
     document.documentElement.toggleAttribute("data-chat-editing", editing);
-    document.documentElement.toggleAttribute("data-chat-input-focused", document.activeElement === input);
+    document.documentElement.toggleAttribute("data-chat-input-focused", active === input);
+    const answering = editing && Boolean((active as Element).closest?.(".chat-request, [data-question-form]"));
+    document.documentElement.toggleAttribute("data-chat-answering", answering);
+    // Only on the transitions: the chrome collapses once, the field is brought
+    // inside the band that collapse just freed, and its timeline is held there
+    // until focus leaves the request again.
+    if (answering && !answeringRequest && active instanceof HTMLElement) holdInOwningTimeline(active);
+    else if (!answering && answeringRequest) releaseHeldTimelines();
+    answeringRequest = answering;
     viewport.apply();
   };
   surface.addEventListener("focusin", syncEditingFocus);
@@ -4300,6 +4422,20 @@ export function initChat(api = new ChatApiClient()): void {
   if (notificationTarget) revealNotificationChat();
   handleChatSurfaceState();
 }
+
+/**
+ * The controls that resolve a request: a question's submit and reject, and a
+ * permission's choices, outcomes and confirmation pair. All of them can be
+ * tapped while a free-form answer field holds focus.
+ */
+const REQUEST_ANSWER_CONTROLS = [
+  "[data-question-primary]",
+  "[data-question-reject]",
+  ".chat-request-actions [data-permission-choice]",
+  ".chat-request-actions [data-permission-outcome]",
+  ".chat-request-actions [data-permission-confirm]",
+  ".chat-request-actions [data-permission-cancel]",
+].join(", ");
 
 function isTextEditingControl(value: Element | null): boolean {
   if (value instanceof HTMLTextAreaElement) return true;

@@ -838,9 +838,414 @@ describe("chat question anchoring", () => {
   });
 });
 
+describe("chat answering state", () => {
+  test("a request's answer field puts the surface in the answering state; the composer does not", async () => {
+    const { document, window } = parseHTML(html);
+    installDomGlobals(document, window);
+    document.documentElement.setAttribute("data-ui-mode", "desktop");
+    document.documentElement.setAttribute("data-chat-panel", "open");
+    stubConversationSelect(document);
+    // linkedom tracks no focus at all, so the state the handler reads is
+    // supplied here and the events that drive it are dispatched directly.
+    let active: Element | null = null;
+    Object.defineProperty(document, "activeElement", { configurable: true, get: () => active });
+    const focus = (element: Element) => { active = element; element.dispatchEvent(new window.Event("focusin", { bubbles: true })); };
+    const blur = async (element: Element) => {
+      active = document.body;
+      element.dispatchEvent(new window.Event("focusout", { bubbles: true }));
+      await Bun.sleep(1);
+    };
+    const api = questionApi(document);
+    try {
+      const { initChat } = await import(`./ui.ts?answering-ui-test=${Date.now()}`);
+      initChat(api);
+      const card = await waitForQuestionCard(document);
+      const toggle = card.querySelector<HTMLInputElement>("[data-question-custom-toggle]")!;
+      Object.defineProperty(toggle, "form", { configurable: true, value: card.querySelector("form[data-question-form]") });
+      toggle.checked = true;
+      toggle.dispatchEvent(new Event("change", { bubbles: true }));
+      const answerField = card.querySelector<HTMLInputElement>("[data-question-custom-input]")!;
+
+      focus(answerField);
+      expect(document.documentElement.hasAttribute("data-chat-answering")).toBe(true);
+      expect(document.documentElement.hasAttribute("data-chat-editing")).toBe(true);
+
+      await blur(answerField);
+      expect(document.documentElement.hasAttribute("data-chat-answering")).toBe(false);
+      expect(document.documentElement.hasAttribute("data-chat-editing")).toBe(false);
+
+      // The composer is editing, but it is not answering a request: the
+      // chrome that the answering state clears includes the composer itself.
+      focus(document.querySelector<HTMLTextAreaElement>("#chat-input")!);
+      expect(document.documentElement.hasAttribute("data-chat-editing")).toBe(true);
+      expect(document.documentElement.hasAttribute("data-chat-answering")).toBe(false);
+    } finally {
+      document.documentElement.removeAttribute("data-chat-answering");
+      document.documentElement.removeAttribute("data-chat-editing");
+      document.documentElement.removeAttribute("data-chat-input-focused");
+      await Bun.sleep(20);
+      window.dispatchEvent(new Event("pagehide"));
+    }
+  });
+
+  test("the answered field's timeline is held while it has focus and released when it loses it", async () => {
+    const { document, window } = parseHTML(html);
+    installDomGlobals(document, window);
+    document.documentElement.setAttribute("data-ui-mode", "touch");
+    document.documentElement.setAttribute("data-active-tab", "chat");
+    stubConversationSelect(document);
+    let active: Element | null = null;
+    Object.defineProperty(document, "activeElement", { configurable: true, get: () => active });
+    const focus = (element: Element) => { active = element; element.dispatchEvent(new window.Event("focusin", { bubbles: true })); };
+    const blur = async (element: Element) => {
+      active = document.body;
+      element.dispatchEvent(new window.Event("focusout", { bubbles: true }));
+      await Bun.sleep(1);
+    };
+    // The seam is which owner is asked to hold what: the hold's own defence
+    // of the position is the coordinated owner's unit case, and the platform
+    // autoscroll it defends against is the browser suite's.
+    const { CoordinatedScrollOwner } = await import("./coordinated-scroll");
+    const holds: Array<{ scroller: string; element: Element }> = [];
+    const releases: string[] = [];
+    const hold = CoordinatedScrollOwner.prototype.hold;
+    const release = CoordinatedScrollOwner.prototype.release;
+    CoordinatedScrollOwner.prototype.hold = function (this: InstanceType<typeof CoordinatedScrollOwner>, element: HTMLElement) {
+      holds.push({ scroller: this.scroller.id, element });
+      hold.call(this, element);
+    };
+    CoordinatedScrollOwner.prototype.release = function (this: InstanceType<typeof CoordinatedScrollOwner>) {
+      releases.push(this.scroller.id);
+      release.call(this);
+    };
+    try {
+      const { initChat } = await import(`./ui.ts?answer-hold-ui-test=${Date.now()}`);
+      initChat(questionApi(document));
+      const card = await waitForQuestionCard(document);
+      const toggle = card.querySelector<HTMLInputElement>("[data-question-custom-toggle]")!;
+      Object.defineProperty(toggle, "form", { configurable: true, value: card.querySelector("form[data-question-form]") });
+      toggle.checked = true;
+      toggle.dispatchEvent(new Event("change", { bubbles: true }));
+      const answerField = card.querySelector<HTMLInputElement>("[data-question-custom-input]")!;
+      holds.length = 0;
+      releases.length = 0;
+
+      focus(answerField);
+      expect(holds).toEqual([{ scroller: "chat-timeline", element: answerField }]);
+      expect(releases).toEqual([]);
+
+      await blur(answerField);
+      // Both owners: by now the field may not be in the timeline that held it,
+      // and releasing an owner that holds nothing does nothing.
+      expect(releases).toContain("chat-timeline");
+      expect(holds).toHaveLength(1);
+
+      // The composer is editing, not answering: nothing is held for it.
+      focus(document.querySelector<HTMLTextAreaElement>("#chat-input")!);
+      expect(holds).toHaveLength(1);
+    } finally {
+      CoordinatedScrollOwner.prototype.hold = hold;
+      CoordinatedScrollOwner.prototype.release = release;
+      document.documentElement.removeAttribute("data-chat-answering");
+      document.documentElement.removeAttribute("data-chat-editing");
+      document.documentElement.removeAttribute("data-chat-input-focused");
+      await Bun.sleep(20);
+      window.dispatchEvent(new Event("pagehide"));
+    }
+  });
+
+  test("a press on a request's answer controls does not blur the field first, whatever the pointer", async () => {
+    const { document, window } = parseHTML(html);
+    installDomGlobals(document, window);
+    document.documentElement.setAttribute("data-ui-mode", "touch");
+    document.documentElement.setAttribute("data-active-tab", "chat");
+    stubConversationSelect(document);
+    const permission = {
+      id: "permission:p1", type: "permission" as const, createdAt: 3, requestId: "p1", status: "pending" as const,
+      action: "Run git status", resources: ["git status"],
+    };
+    const prompt = { id: "message:u", type: "user_message" as const, createdAt: 1, text: "which branch?" };
+    // Only a conversation's newest request is answerable, so the question and
+    // the permission are shown in turn rather than together.
+    let items: unknown[] = [prompt, pendingQuestion("q1", 2)];
+    let handlers: { resync(): void } | null = null;
+    const api = questionApi(document, {
+      items: () => items,
+      stream: (streamHandlers: { resync(): void }) => { handlers = streamHandlers; },
+    });
+    const press = (element: Element, pointerType: string) => {
+      const event = Object.assign(new window.Event("pointerdown", { bubbles: true, cancelable: true }), { pointerType });
+      element.dispatchEvent(event as unknown as Event);
+      return event.defaultPrevented;
+    };
+    try {
+      const { initChat } = await import(`./ui.ts?answer-press-ui-test=${Date.now()}`);
+      initChat(api);
+      const card = await waitForQuestionCard(document);
+      // The state the guard reads, derived by `syncEditingFocus` and pinned
+      // by the answering-state case above; set here so this case is about
+      // which presses the guard intercepts.
+      const answering = (on: boolean) => document.documentElement.toggleAttribute("data-chat-answering", on);
+
+      // Nothing is being answered, so no press can blur a field and reflow
+      // the card: every pointer keeps ordinary behavior.
+      expect(press(card.querySelector("[data-question-primary]")!, "touch")).toBe(false);
+      expect(press(card.querySelector("[data-question-primary]")!, "mouse")).toBe(false);
+
+      answering(true);
+      // The controls that resolve a request: pressing them must not take
+      // focus off an open answer field and reflow the card under the pointer.
+      // The pointer type is not the question — a trackpad on an iPad's
+      // keyboard case moves the card exactly as a finger does.
+      expect(press(card.querySelector("[data-question-primary]")!, "touch")).toBe(true);
+      expect(press(card.querySelector("[data-question-reject]")!, "touch")).toBe(true);
+      expect(press(card.querySelector("[data-question-primary]")!, "mouse")).toBe(true);
+      expect(press(card.querySelector("[data-question-reject]")!, "pen")).toBe(true);
+
+      // Ordinary targets keep ordinary behavior even while answering.
+      expect(press(card.querySelector("[data-question-custom-toggle]")!, "touch")).toBe(false);
+      expect(press(card.querySelector("summary")!, "touch")).toBe(false);
+
+      // Preventing the default on pointerdown does not cancel the click the
+      // card resolves on: rejecting the question still reaches the agent.
+      const rejects: string[] = [];
+      Object.assign(api, { question: async (_conversationId: string, itemId: string) => { rejects.push(itemId); return { outcome: "rejected" }; } });
+      card.querySelector<HTMLButtonElement>("[data-question-reject]")!.dispatchEvent(new window.Event("click", { bubbles: true }) as unknown as Event);
+      await waitUntil(() => rejects.length === 1, () => `rejects ${rejects.join(",")}`);
+
+      items = [prompt, permission];
+      handlers!.resync();
+      await waitUntil(
+        () => document.querySelector('[data-chat-item-id="permission:p1"] [data-permission-outcome]') != null,
+        () => document.querySelector("#chat-items")?.textContent ?? "no permission card",
+      );
+      const permissionCard = document.querySelector<HTMLElement>('[data-chat-item-id="permission:p1"]')!;
+      expect(press(permissionCard.querySelector('[data-permission-outcome="approved-session"]')!, "touch")).toBe(true);
+      expect(press(permissionCard.querySelector('[data-permission-outcome="approved-session"]')!, "mouse")).toBe(true);
+      expect(press(permissionCard.querySelector("summary")!, "touch")).toBe(false);
+    } finally {
+      document.documentElement.removeAttribute("data-chat-answering");
+      document.documentElement.removeAttribute("data-chat-editing");
+      document.documentElement.removeAttribute("data-chat-input-focused");
+      await Bun.sleep(20);
+      window.dispatchEvent(new Event("pagehide"));
+    }
+  });
+});
+
+describe("chat outstanding-request pill", () => {
+  test("yields while its request is on screen and re-targets when the request changes", async () => {
+    const { document, window } = parseHTML(html);
+    installDomGlobals(document, window);
+    document.documentElement.setAttribute("data-ui-mode", "desktop");
+    document.documentElement.setAttribute("data-chat-panel", "open");
+    stubConversationSelect(document);
+    const { observers, restore: restoreObservers } = stubIntersectionObservers();
+    const later = { ...pendingQuestion("q2", 3), questions: [{ prompt: "Which remote?", header: "Remote", multiple: false, allowFreeForm: true, options: [{ label: "origin", description: "" }] }] };
+    let items: unknown[] = [{ id: "message:u", type: "user_message", createdAt: 1, text: "which branch?" }, pendingQuestion("q1", 2)];
+    let handlers: { resync(): void } | null = null;
+    const api = questionApi(document, {
+      items: () => items,
+      stream: (streamHandlers: { resync(): void }) => { handlers = streamHandlers; },
+    });
+    const pill = document.querySelector<HTMLButtonElement>("#chat-requests-jump")!;
+    const latest = () => observers.at(-1)!;
+    // linkedom measures nothing, so what the timeline shows of the card is
+    // supplied: a 600px band, and a card of `cardHeight` with `visible` of it
+    // on screen.
+    const fire = (visible: number, cardHeight = 200) => latest().callback([seen(visible, cardHeight)]);
+    try {
+      const { initChat } = await import(`./ui.ts?requests-pill-ui-test=${Date.now()}`);
+      initChat(api);
+      await waitUntil(() => pill.textContent === "1 request needs your answer", () => `pill ${pill.textContent}`);
+      // Rooted at the timeline, on the card the pill points at.
+      expect(latest().options.root).toBe(document.querySelector("#chat-timeline"));
+      expect(latest().observed).toEqual([document.querySelector('[data-chat-item-id="question:q1"]')!]);
+      // Dense thresholds: the rule is re-evaluated as the card scrolls, not
+      // only as it enters and leaves.
+      expect(latest().options.threshold).toEqual(Array.from({ length: 21 }, (_, index) => index / 20));
+      expect(pill.hidden).toBe(false);
+
+      // Half the card showing is enough to yield to it.
+      fire(200);
+      expect(pill.hidden).toBe(true);
+      fire(100);
+      expect(pill.hidden).toBe(true);
+      // A sliver is not: the field and the controls are still off screen, and
+      // the pill is the way back to them.
+      fire(40);
+      expect(pill.hidden).toBe(false);
+      fire(0);
+      expect(pill.hidden).toBe(false);
+      // A card taller than the band can never show half of itself, so half
+      // the band showing is the other way to qualify.
+      fire(300, 2_000);
+      expect(pill.hidden).toBe(true);
+      fire(200, 2_000);
+      expect(pill.hidden).toBe(false);
+      expect(pill.textContent).toBe("1 request needs your answer");
+
+      items = [...items, later];
+      handlers!.resync();
+      await waitUntil(() => pill.textContent === "2 requests need your answer", () => `pill ${pill.textContent}`);
+      // The newest request is the answerable one, so the observer moves to it
+      // and every observer it replaced is released.
+      expect(latest().observed).toEqual([document.querySelector('[data-chat-item-id="question:q2"]')!]);
+      expect(observers.slice(0, -1).every(observer => observer.disconnected)).toBe(true);
+      fire(200);
+      expect(pill.hidden).toBe(true);
+      // The count is the count of everything outstanding, unchanged by the gate.
+      expect(pill.textContent).toBe("2 requests need your answer");
+    } finally {
+      restoreObservers();
+      await Bun.sleep(20);
+      window.dispatchEvent(new Event("pagehide"));
+    }
+  });
+
+  test("returns while a subagent drill-down is pushed over the request it leads to", async () => {
+    const { document, window } = parseHTML(html);
+    installDomGlobals(document, window);
+    document.documentElement.setAttribute("data-ui-mode", "touch");
+    document.documentElement.setAttribute("data-active-tab", "chat");
+    stubConversationSelect(document);
+    const { observers, restore: restoreObservers } = stubIntersectionObservers();
+    const items: unknown[] = [
+      { id: "message:u", type: "user_message", createdAt: 1, text: "review the docs" },
+      {
+        id: "tool:agent1", type: "tool", createdAt: 2, name: "task", status: "completed",
+        input: JSON.stringify({ description: "Review renderer", subagent_type: "explore", prompt: "go" }),
+        childConversationId: "child",
+      },
+      pendingQuestion("q1", 3),
+    ];
+    const api = questionApi(document, { items: () => items, capabilities: ["questions", "subagents"] });
+    const pill = document.querySelector<HTMLButtonElement>("#chat-requests-jump")!;
+    const drilldown = document.querySelector<HTMLElement>("#chat-drilldown")!;
+    const click = (element: Element) => element.dispatchEvent(new window.Event("click", { bubbles: true }) as unknown as Event);
+    try {
+      const { initChat } = await import(`./ui.ts?requests-pill-drilldown-ui-test=${Date.now()}`);
+      initChat(api);
+      await waitUntil(() => pill.textContent === "1 request needs your answer", () => `pill ${pill.textContent}`);
+      // The card is on screen in the parent transcript, so the pill yields.
+      observers.at(-1)!.callback([seen(200)]);
+      expect(pill.hidden).toBe(true);
+
+      const openTranscript = () => document.querySelector<HTMLButtonElement>('#chat-subagents [data-open-conversation]');
+      await waitUntil(() => openTranscript() != null, () => document.querySelector("#chat-items")?.textContent ?? "no subagent card");
+      click(openTranscript()!);
+      expect(drilldown.hidden).toBe(false);
+      // The card still intersects the parent timeline under the pushed
+      // screen, but it cannot be reached there: the pill is what carries a
+      // request the parent is waiting on over the layer.
+      expect(pill.hidden).toBe(false);
+
+      click(document.querySelector<HTMLButtonElement>("#chat-drilldown-back")!);
+      expect(drilldown.hidden).toBe(true);
+      expect(pill.hidden).toBe(true);
+    } finally {
+      restoreObservers();
+      await Bun.sleep(20);
+      window.dispatchEvent(new Event("pagehide"));
+    }
+  });
+});
+
 afterAll(() => {
   for (const [key, value] of savedGlobals) Reflect.set(globalThis, key, value);
 });
+
+function stubConversationSelect(document: Document): void {
+  const select = document.querySelector<HTMLSelectElement>("#chat-conversation-select")!;
+  let selected = "";
+  Object.defineProperty(select, "value", { configurable: true, get: () => selected, set: value => { selected = String(value); } });
+}
+
+function pendingQuestion(requestId: string, createdAt: number) {
+  return {
+    id: `question:${requestId}`, type: "question" as const, createdAt, requestId, status: "pending" as const,
+    questions: [{
+      prompt: "Which branch?", header: "Branch", multiple: false, allowFreeForm: true,
+      options: [{ label: "main", description: "" }],
+    }],
+  };
+}
+
+function questionApi(document: Document, options: { items?: () => unknown[]; stream?: (handlers: { resync(): void }) => void; capabilities?: string[] } = {}): ChatApiClient {
+  const items = options.items ?? (() => [{ id: "message:u", type: "user_message", createdAt: 1, text: "which branch?" }, pendingQuestion("q1", 2)]);
+  return {
+    status: async () => ([{
+      agent: { id: "test", name: "Test" },
+      availability: { state: "ready", version: "test", agent: { id: "test", name: "Test", capabilities: options.capabilities ?? ["questions"] } },
+    }]),
+    conversations: async () => [conversation("one")],
+    commands: async () => [],
+    snapshot: async (id: string) => ({ ...snapshot(id), items: items() }),
+    stream: (_conversationId: string, _cursor: string, handlers: { resync(): void }) => {
+      options.stream?.(handlers);
+      return { close() {} };
+    },
+    inventoryStream: () => ({ close() {} }),
+    attachmentUrl: (id: string) => `/api/chat/attachments/${id}`,
+    question: async () => ({ outcome: "answered" }),
+  } as unknown as ChatApiClient;
+}
+
+/** What the page's IntersectionObserver reports, as the pill reads it. */
+type ObservedVisibility = {
+  isIntersecting: boolean;
+  intersectionRatio: number;
+  intersectionRect: { height: number };
+  rootBounds: { height: number } | null;
+};
+
+type StubObserver = {
+  observed: Element[];
+  disconnected: boolean;
+  callback: (entries: ObservedVisibility[]) => void;
+  options: { root?: Element | null; threshold?: number | number[] };
+};
+
+/**
+ * The page's IntersectionObserver, replaced by one the test drives: linkedom
+ * has no layout, so what a card shows of itself is supplied rather than
+ * measured. Every constructed observer is collected, which is also how the
+ * tests check that replaced ones are released.
+ */
+function stubIntersectionObservers(): { observers: StubObserver[]; restore(): void } {
+  const observers: StubObserver[] = [];
+  const saved = Reflect.get(globalThis, "IntersectionObserver");
+  class Stub {
+    readonly observed: Element[] = [];
+    disconnected = false;
+    constructor(readonly callback: (entries: ObservedVisibility[]) => void, readonly options: { root?: Element | null; threshold?: number | number[] }) {
+      observers.push(this as unknown as StubObserver);
+    }
+    observe(element: Element): void { this.observed.push(element); }
+    unobserve(): void {}
+    disconnect(): void { this.disconnected = true; }
+  }
+  Reflect.set(globalThis, "IntersectionObserver", Stub);
+  return { observers, restore: () => { Reflect.set(globalThis, "IntersectionObserver", saved); } };
+}
+
+/** `visible` pixels of a `cardHeight` card, inside a 600px visible band. */
+function seen(visible: number, cardHeight = 200, bandHeight = 600): ObservedVisibility {
+  return {
+    isIntersecting: visible > 0,
+    intersectionRatio: visible / cardHeight,
+    intersectionRect: { height: visible },
+    rootBounds: { height: bandHeight },
+  };
+}
+
+async function waitForQuestionCard(document: Document): Promise<HTMLElement> {
+  await waitUntil(
+    () => document.querySelector('[data-chat-item-id="question:q1"] [data-question-custom-toggle]') != null,
+    () => document.querySelector("#chat-state")?.textContent ?? "no question card",
+  );
+  return document.querySelector<HTMLElement>('[data-chat-item-id="question:q1"]')!;
+}
 }
 
 // The chat surface owns no connection: every EventSource the page holds is
