@@ -21,7 +21,12 @@ function syncCustomEditor(panel: HTMLElement, focus: boolean): void {
   if (!toggle || !input || !editor) return;
   editor.hidden = !toggle.checked;
   toggle.setAttribute("aria-expanded", String(toggle.checked));
-  if (toggle.checked && focus) input.focus();
+  // `preventScroll` because the reveal is not ours to leave to the platform:
+  // on touch the coordinated scroll owner brings this field — and the row
+  // holding Answer and Reject with it — to the bottom of the band above the
+  // keyboard. WebKit's own focus scroll only lands it somewhere else first,
+  // which the owner then has to correct in view of the reader.
+  if (toggle.checked && focus) input.focus({ preventScroll: true });
 }
 
 export function syncQuestionControl(input: HTMLInputElement, focusCustom = false): void {

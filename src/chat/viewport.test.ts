@@ -208,6 +208,45 @@ describe("chat visual viewport geometry", () => {
     }
   });
 
+  test("while a request is answered the surface keeps the layout height the keyboard covers", () => {
+    const f = harness();
+    try {
+      Object.defineProperty(window, "innerHeight", { configurable: true, writable: true, value: 844 });
+      f.viewport.height = 460;
+      f.controller.apply();
+      // Not answering: the surface is the visible band, as it always was.
+      expect(f.style("--chat-visual-height")).toBe("460px");
+      expect(f.style("--chat-keyboard-inset")).toBe("0px");
+      expect(f.root.hasAttribute("data-chat-keyboard")).toBe(true);
+
+      // Answering: the surface keeps the layout height, so the composer and
+      // the pinned tracks are under the keyboard rather than gone, and the
+      // 384px it covers is what the transcript reserves as scroll room. The
+      // keyboard is still read from the real metrics.
+      f.root.setAttribute("data-chat-answering", "");
+      f.controller.apply();
+      expect(f.style("--chat-visual-height")).toBe("844px");
+      expect(f.style("--chat-keyboard-inset")).toBe("384px");
+      expect(f.root.hasAttribute("data-chat-keyboard")).toBe(true);
+
+      // A platform that pans instead of occluding: the top still tracks the
+      // visible band, and what the keyboard covers is unchanged by the pan.
+      f.viewport.height = 508;
+      f.viewport.offsetTop = 266;
+      f.controller.apply();
+      expect(f.style("--chat-visual-top")).toBe("266px");
+      expect(f.style("--chat-visual-height")).toBe("844px");
+      expect(f.style("--chat-keyboard-inset")).toBe("336px");
+
+      f.root.removeAttribute("data-chat-answering");
+      f.controller.apply();
+      expect(f.style("--chat-visual-height")).toBe("508px");
+      expect(f.style("--chat-keyboard-inset")).toBe("0px");
+    } finally {
+      f.restore();
+    }
+  });
+
   test("a pan while editing moves the surface without moving the conversation", () => {
     const f = harness();
     try {

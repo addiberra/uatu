@@ -14,6 +14,27 @@ export interface CoordinatedScrollOptions {
   cancelFrame?: (id: number) => void;
 }
 
+/** How a reveal places its target inside the visible band. */
+export interface RevealOptions {
+  /**
+   * A second element that has to land in the band with the target. A request's
+   * answer field is answered with the row that carries its submit and cancel
+   * controls, so the two are placed as one block: revealing the field alone
+   * would be free to leave the buttons under the keyboard.
+   */
+  extent?: HTMLElement;
+  /**
+   * `nearest` — the minimal move that puts the target inside the band, which
+   * is what an ordinary reveal wants: it disturbs the reader least.
+   * `end` — the target's extent sits at the bottom of the band. A held answer
+   * field needs this: `nearest` asks for no move at all when the platform's
+   * own focus scroll already left the field high in the band, which is how a
+   * strip of empty conversation ends up between the answer controls and the
+   * keyboard's edge.
+   */
+  align?: "nearest" | "end";
+}
+
 const owners = new WeakMap<HTMLElement, CoordinatedScrollOwner>();
 
 /** The only automatic position writer for a managed scroller. */
@@ -21,7 +42,9 @@ export class CoordinatedScrollOwner {
   private frame: number | null = null;
   private newContent = false;
   private revealTarget: HTMLElement | null = null;
+  private revealOptions: RevealOptions | undefined;
   private heldTarget: HTMLElement | null = null;
+  private heldOptions: RevealOptions | undefined;
   private heldTop: number | null = null;
   private disposed = false;
   private previous: AnchorGeometry;
@@ -100,9 +123,10 @@ export class CoordinatedScrollOwner {
    * so the alternative would be a raw `scrollIntoView` on a scroller it
    * manages, which the anchor would then correct straight back.
    */
-  reveal(element: HTMLElement): void {
+  reveal(element: HTMLElement, options?: RevealOptions): void {
     if (!this.active()) return;
     this.revealTarget = element;
+    this.revealOptions = options;
     this.request();
   }
 
@@ -120,16 +144,22 @@ export class CoordinatedScrollOwner {
    * automatic position writer for the scroller, so defending a position it
    * wrote is its own job rather than a new one.
    */
-  hold(element: HTMLElement): void {
+  hold(element: HTMLElement, options?: RevealOptions): void {
     if (!this.active()) return;
     this.heldTarget = element;
+    // A hold ends at the bottom of the band unless its caller says otherwise:
+    // a held control is one the reader is typing into under a keyboard, and
+    // the band's bottom is the only place that is stable whether the platform
+    // scrolled the control too high or not at all.
+    this.heldOptions = { align: "end", ...options };
     this.heldTop = null;
-    this.reveal(element);
+    this.reveal(element, this.heldOptions);
   }
 
   /** End the hold, leaving the scroller exactly where it stands. */
   release(): void {
     this.heldTarget = null;
+    this.heldOptions = undefined;
     this.heldTop = null;
   }
 
@@ -148,9 +178,11 @@ export class CoordinatedScrollOwner {
    */
   private applyReveal(timestamp: number): void {
     const target = this.revealTarget;
+    const options = this.revealOptions;
     this.revealTarget = null;
+    this.revealOptions = undefined;
     if (!target || !this.scroller.contains(target)) return;
-    const delta = this.revealDelta(target);
+    const delta = this.revealDelta(target, options);
     if (Math.abs(delta) < 0.5) return;
     const limit = Math.max(0, this.scroller.scrollHeight - this.scroller.clientHeight);
     const top = Math.max(0, Math.min(this.scroller.scrollTop + delta, limit));
@@ -165,21 +197,40 @@ export class CoordinatedScrollOwner {
     this.upwardPending = false;
   }
 
-  private revealDelta(target: HTMLElement): number {
+  private revealDelta(target: HTMLElement, options?: RevealOptions): number {
     if (typeof target.getBoundingClientRect !== "function") return 0;
     const box = this.scroller.getBoundingClientRect();
     const rect = target.getBoundingClientRect();
+    // The extent is placed with the target, as one block: for an answer field
+    // that is the field plus the row holding its submit and cancel controls.
+    let unionTop = rect.top;
+    let unionBottom = rect.bottom;
+    const extent = options?.extent;
+    if (extent && typeof extent.getBoundingClientRect === "function" && this.scroller.contains(extent)) {
+      const extra = extent.getBoundingClientRect();
+      unionTop = Math.min(unionTop, extra.top);
+      unionBottom = Math.max(unionBottom, extra.bottom);
+    }
     // No computed style (or none declared) means no reserved band: 0.
     const style = typeof getComputedStyle === "function" ? getComputedStyle(this.scroller) : null;
     const padTop = Number.parseFloat(style?.scrollPaddingTop ?? "") || 0;
     const padBottom = Number.parseFloat(style?.scrollPaddingBottom ?? "") || 0;
-    const top = box.top + padTop;
-    const bottom = box.top + this.scroller.clientHeight - padBottom;
+    // While a request is answered the software keyboard covers the lower part
+    // of this scroller rather than shortening it, so its client box is not the
+    // band the reader can see. Revealing into the box alone would park the
+    // control under the keyboard — exactly where it must not be.
+    const visual = typeof window !== "undefined" ? window.visualViewport : null;
+    const visualBottom = visual ? visual.offsetTop + visual.height : Infinity;
+    const top = Math.max(box.top, visual?.offsetTop ?? -Infinity) + padTop;
+    const bottom = Math.min(box.top + this.scroller.clientHeight, visualBottom) - padBottom;
     if (bottom <= top) return 0;
-    if (rect.top < top) return rect.top - top;
     // A target taller than the band aligns to its top rather than scrolling
-    // its own top out of view to chase its bottom.
-    if (rect.bottom > bottom) return Math.min(rect.bottom - bottom, rect.top - top);
+    // its own top out of view to chase its bottom — under either rule, since
+    // showing the buttons by hiding the question answers nothing.
+    const taller = unionBottom - unionTop > bottom - top;
+    if (options?.align === "end") return taller ? unionTop - top : unionBottom - bottom;
+    if (unionTop < top) return unionTop - top;
+    if (unionBottom > bottom) return Math.min(unionBottom - bottom, unionTop - top);
     return 0;
   }
 
@@ -196,6 +247,7 @@ export class CoordinatedScrollOwner {
     this.upwardPending = false;
     // An explicit jump to the end outranks a reveal still waiting for a frame.
     this.revealTarget = null;
+    this.revealOptions = undefined;
     this.options.anchor.jumpToLatest(this.options.measure(false));
     this.request();
     this.options.onChange?.();
@@ -208,9 +260,11 @@ export class CoordinatedScrollOwner {
     this.newContent = false;
     this.upwardPending = false;
     this.revealTarget = null;
+    this.revealOptions = undefined;
     // A hold is transient input too: the gestures and teardowns that cancel
     // pending work are the reader, or the surface, taking the scroller back.
     this.heldTarget = null;
+    this.heldOptions = undefined;
     this.heldTop = null;
     this.touchY = null;
   }
@@ -241,7 +295,7 @@ export class CoordinatedScrollOwner {
       // changed height in between. None of this speaks for the reader: a held
       // scroll must not pause following or re-anchor.
       const moved = this.heldTop === null || Math.abs(geometry.scrollTop - this.heldTop) > 0.5;
-      if (moved || changedExtent) this.reveal(this.heldTarget);
+      if (moved || changedExtent) this.reveal(this.heldTarget, this.heldOptions);
       this.previous = geometry;
       return;
     }

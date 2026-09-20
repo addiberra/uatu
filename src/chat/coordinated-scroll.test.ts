@@ -48,6 +48,18 @@ function stubRect(element: object, rect: () => { top: number; bottom: number }):
   Object.defineProperty(element, "getBoundingClientRect", { configurable: true, value: rect });
 }
 
+/** The band the platform leaves above the software keyboard. While a request
+ *  is answered the scroller keeps its full height and the keyboard covers its
+ *  lower part, so this is the only thing that says where the reader can see. */
+function withVisibleBand(band: { height: number; offsetTop: number }, run: () => void): void {
+  const previous = Object.getOwnPropertyDescriptor(globalThis, "window");
+  Object.defineProperty(globalThis, "window", { configurable: true, writable: true, value: { visualViewport: band } });
+  try { run(); } finally {
+    if (previous) Object.defineProperty(globalThis, "window", previous);
+    else Reflect.deleteProperty(globalThis, "window");
+  }
+}
+
 describe("coordinated scrolling", () => {
   test("upward scrolling without a wheel event still pauses when revealing content changes the extent", () => {
     const f = fixture();
@@ -242,6 +254,80 @@ describe("coordinated scrolling", () => {
     f.owner.reveal(field as unknown as HTMLElement);
     f.flush();
     expect(f.writes).toEqual([360]);
+  });
+  test("a reveal clears the software keyboard, not just the scroller's own box", () => {
+    const f = fixture();
+    // The same 300px client box as above, with the field 30px above its
+    // bottom edge — inside the box, so the box alone asks for no move. The
+    // keyboard covers everything below 200: that is where the field really is.
+    stubRect(f.element, () => ({ top: 0, bottom: 300 }));
+    const field = f.document.createElement("input");
+    f.element.append(field);
+    stubRect(field, () => ({ top: 250, bottom: 270 }));
+    f.grow(900); f.move(300); f.owner.pause();
+
+    f.owner.reveal(field as unknown as HTMLElement);
+    f.flush();
+    expect(f.writes).toEqual([]);
+
+    withVisibleBand({ height: 200, offsetTop: 0 }, () => {
+      f.owner.reveal(field as unknown as HTMLElement);
+      f.flush();
+    });
+    expect(f.writes).toEqual([370]);
+  });
+  test("an end-aligned reveal puts the field and its answer controls at the bottom of the band", () => {
+    const f = fixture();
+    // The 300px client box again, with the keyboard covering everything below
+    // 200. The field is already inside that band — high in it, where WebKit's
+    // own focus scroll tends to leave it — so the minimal move has nothing to
+    // do and the strip below the answer controls stays empty.
+    stubRect(f.element, () => ({ top: 0, bottom: 300 }));
+    const field = f.document.createElement("input");
+    const actions = f.document.createElement("div");
+    f.element.append(field, actions);
+    stubRect(field, () => ({ top: 50, bottom: 70 }));
+    stubRect(actions, () => ({ top: 80, bottom: 110 }));
+    f.grow(900); f.move(300); f.owner.pause();
+
+    withVisibleBand({ height: 200, offsetTop: 0 }, () => {
+      f.owner.reveal(field as unknown as HTMLElement, { extent: actions as unknown as HTMLElement });
+      f.flush();
+      expect(f.writes).toEqual([]);
+
+      // Held: field and answer controls are placed as one block, with the
+      // block's bottom on the band's bottom, so the conversation fills
+      // everything above it and nothing is left under the buttons.
+      f.owner.hold(field as unknown as HTMLElement, { extent: actions as unknown as HTMLElement });
+      f.flush();
+      expect(f.writes).toEqual([210]);
+
+      // Clamped by the scroller's own range: with only 40px of conversation
+      // above it the scroller stops where it runs out rather than overscrolling.
+      f.move(40); f.owner.pause();
+      f.owner.hold(field as unknown as HTMLElement, { extent: actions as unknown as HTMLElement });
+      f.flush();
+      expect(f.writes).toEqual([210, 0]);
+    });
+  });
+  test("an extent taller than the band aligns to its top instead", () => {
+    const f = fixture();
+    // A question whose field and answer controls together outrun the band:
+    // putting the buttons on the band's bottom would scroll the question
+    // itself out of view, so the block's top is what is aligned.
+    stubRect(f.element, () => ({ top: 0, bottom: 300 }));
+    const field = f.document.createElement("input");
+    const actions = f.document.createElement("div");
+    f.element.append(field, actions);
+    stubRect(field, () => ({ top: 50, bottom: 70 }));
+    stubRect(actions, () => ({ top: 80, bottom: 400 }));
+    f.grow(900); f.move(300); f.owner.pause();
+
+    withVisibleBand({ height: 200, offsetTop: 0 }, () => {
+      f.owner.hold(field as unknown as HTMLElement, { extent: actions as unknown as HTMLElement });
+      f.flush();
+    });
+    expect(f.writes).toEqual([350]);
   });
   test("a held control is put back after a scroll the owner did not write", () => {
     const f = fixture();

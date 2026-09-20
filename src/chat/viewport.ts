@@ -13,6 +13,7 @@ export class ChatViewportController {
   private correctionPending = false;
   private lastTop: number | null = null;
   private lastHeight: number | null = null;
+  private lastCovered: number | null = null;
 
   /** Every listener shares one frame: a pan must cost one write, not one per event. */
   private readonly schedule = () => {
@@ -78,20 +79,35 @@ export class ChatViewportController {
     const root = document.documentElement;
     root.toggleAttribute("data-chat-keyboard", metrics.keyboardVisible);
     const touch = root.getAttribute("data-ui-mode") === "touch";
-    const pannedOnly = this.lastTop !== null && this.lastTop !== top && this.lastHeight === metrics.height;
+    // While a request is being answered the keyboard covers the chrome rather
+    // than removing it: the surface keeps its LAYOUT height, so the composer
+    // and the pinned tracks slide down underneath the keyboard, still there
+    // and back the moment it is dismissed. No tab-bar inset is netted off —
+    // the bar is already hidden while a text control has focus.
+    const answering = touch && root.hasAttribute("data-chat-answering");
+    const surfaceHeight = answering ? window.innerHeight : metrics.height;
+    // What the keyboard covers, so the transcript can reserve it: the part of
+    // the surface that lies below the visible band. Independent of the pan,
+    // because the surface's top tracks it.
+    const covered = answering ? Math.max(0, window.innerHeight - height) : 0;
+    const pannedOnly = this.lastTop !== null && this.lastTop !== top && this.lastHeight === surfaceHeight;
     if (touch) {
       // Rewriting a value the surface already carries re-enters through our own
       // ResizeObserver, so each write has to be a real change.
       if (this.lastTop !== top) this.surface.style.setProperty("--chat-visual-top", `${top}px`);
-      if (this.lastHeight !== metrics.height) this.surface.style.setProperty("--chat-visual-height", `${metrics.height}px`);
+      if (this.lastHeight !== surfaceHeight) this.surface.style.setProperty("--chat-visual-height", `${surfaceHeight}px`);
+      if (this.lastCovered !== covered) this.surface.style.setProperty("--chat-keyboard-inset", `${covered}px`);
       this.lastTop = top;
-      this.lastHeight = metrics.height;
+      this.lastHeight = surfaceHeight;
+      this.lastCovered = covered;
     } else {
       // The desktop shell owns this rectangle, including its safe areas.
       this.surface.style.removeProperty("--chat-visual-top");
       this.surface.style.removeProperty("--chat-visual-height");
+      this.surface.style.removeProperty("--chat-keyboard-inset");
       this.lastTop = null;
       this.lastHeight = null;
+      this.lastCovered = null;
     }
     const visible = document.visibilityState !== "hidden" && (touch
       ? root.getAttribute("data-active-tab") === "chat" : root.getAttribute("data-chat-panel") === "open" || root.hasAttribute("data-notification-chat"));

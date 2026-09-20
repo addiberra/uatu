@@ -2,6 +2,7 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { parseHTML } from "linkedom";
 
 import type { ChatApiClient } from "./client";
+import type { RevealOptions } from "./coordinated-scroll";
 import { resetUsagePaneForTests } from "./usage-pane";
 import type { ChatCommand, ConversationSnapshot, ReversibleHistoryResult } from "./types";
 
@@ -906,13 +907,15 @@ describe("chat answering state", () => {
     // of the position is the coordinated owner's unit case, and the platform
     // autoscroll it defends against is the browser suite's.
     const { CoordinatedScrollOwner } = await import("./coordinated-scroll");
-    const holds: Array<{ scroller: string; element: Element }> = [];
+    const holds: Array<{ scroller: string; element: Element; align: string | undefined }> = [];
+    const placements: Array<RevealOptions | undefined> = [];
     const releases: string[] = [];
     const hold = CoordinatedScrollOwner.prototype.hold;
     const release = CoordinatedScrollOwner.prototype.release;
-    CoordinatedScrollOwner.prototype.hold = function (this: InstanceType<typeof CoordinatedScrollOwner>, element: HTMLElement) {
-      holds.push({ scroller: this.scroller.id, element });
-      hold.call(this, element);
+    CoordinatedScrollOwner.prototype.hold = function (this: InstanceType<typeof CoordinatedScrollOwner>, element: HTMLElement, options?: RevealOptions) {
+      holds.push({ scroller: this.scroller.id, element, align: options?.align });
+      placements.push(options);
+      hold.call(this, element, options);
     };
     CoordinatedScrollOwner.prototype.release = function (this: InstanceType<typeof CoordinatedScrollOwner>) {
       releases.push(this.scroller.id);
@@ -931,7 +934,11 @@ describe("chat answering state", () => {
       releases.length = 0;
 
       focus(answerField);
-      expect(holds).toEqual([{ scroller: "chat-timeline", element: answerField }]);
+      // On touch the field is held against the bottom of the band left above
+      // the keyboard, and the row carrying Answer and Reject is held with it:
+      // placing the field alone could leave its own buttons covered.
+      expect(holds).toEqual([{ scroller: "chat-timeline", element: answerField, align: "end" }]);
+      expect(placements[0]?.extent).toBe(card.querySelector<HTMLElement>("form[data-question-form] .chat-request-actions")!);
       expect(releases).toEqual([]);
 
       await blur(answerField);
@@ -946,6 +953,51 @@ describe("chat answering state", () => {
     } finally {
       CoordinatedScrollOwner.prototype.hold = hold;
       CoordinatedScrollOwner.prototype.release = release;
+      document.documentElement.removeAttribute("data-chat-answering");
+      document.documentElement.removeAttribute("data-chat-editing");
+      document.documentElement.removeAttribute("data-chat-input-focused");
+      await Bun.sleep(20);
+      window.dispatchEvent(new Event("pagehide"));
+    }
+  });
+
+  test("on desktop the answered field is held with the minimal move", async () => {
+    // The end alignment exists because a keyboard covers the chrome and the
+    // question has to be pressed against what is left. Nothing covers it on
+    // desktop, so there is no band to press against and moving a card the
+    // reader can already see would be a jump bought for nothing. What the
+    // field is held *with* is unchanged: the extent is not device-dependent.
+    const { document, window } = parseHTML(html);
+    installDomGlobals(document, window);
+    document.documentElement.setAttribute("data-ui-mode", "desktop");
+    document.documentElement.setAttribute("data-chat-panel", "open");
+    stubConversationSelect(document);
+    let active: Element | null = null;
+    Object.defineProperty(document, "activeElement", { configurable: true, get: () => active });
+    const focus = (element: Element) => { active = element; element.dispatchEvent(new window.Event("focusin", { bubbles: true })); };
+    const { CoordinatedScrollOwner } = await import("./coordinated-scroll");
+    const placements: Array<RevealOptions | undefined> = [];
+    const hold = CoordinatedScrollOwner.prototype.hold;
+    CoordinatedScrollOwner.prototype.hold = function (this: InstanceType<typeof CoordinatedScrollOwner>, element: HTMLElement, options?: RevealOptions) {
+      placements.push(options);
+      hold.call(this, element, options);
+    };
+    try {
+      const { initChat } = await import(`./ui.ts?answer-hold-desktop-ui-test=${Date.now()}`);
+      initChat(questionApi(document));
+      const card = await waitForQuestionCard(document);
+      const toggle = card.querySelector<HTMLInputElement>("[data-question-custom-toggle]")!;
+      Object.defineProperty(toggle, "form", { configurable: true, value: card.querySelector("form[data-question-form]") });
+      toggle.checked = true;
+      toggle.dispatchEvent(new Event("change", { bubbles: true }));
+      const answerField = card.querySelector<HTMLInputElement>("[data-question-custom-input]")!;
+      placements.length = 0;
+
+      focus(answerField);
+      expect(placements.map(placement => placement?.align)).toEqual(["nearest"]);
+      expect(placements[0]?.extent).toBe(card.querySelector<HTMLElement>("form[data-question-form] .chat-request-actions")!);
+    } finally {
+      CoordinatedScrollOwner.prototype.hold = hold;
       document.documentElement.removeAttribute("data-chat-answering");
       document.documentElement.removeAttribute("data-chat-editing");
       document.documentElement.removeAttribute("data-chat-input-focused");

@@ -72,13 +72,31 @@ function paintedAtCentre(locator: Locator): Promise<{ reachable: boolean; painte
   });
 }
 
+/** A poll predicate that answers true once a scroller has stopped moving. The
+ *  coordinated owner settles a reveal over several frames — the strip the
+ *  keyboard covers and the floats over the transcript both change the extent
+ *  it measures against — and the position it defends is the settled one. */
+function stillScrollTop(locator: Locator): () => Promise<boolean> {
+  let previous = Number.NaN;
+  return async () => {
+    const current = await locator.evaluate(element => element.scrollTop);
+    const still = Math.abs(current - previous) < 0.5;
+    previous = current;
+    return still;
+  };
+}
+
 /** A touch conversation with all three pinned tracks populated and expanded.
  *  It runs on the Claude-shaped fixture agent because that is the one that
  *  declares `background-tasks`; the other two tracks are agent-neutral. */
-async function bootWithPinnedTracks(page: Page, request: APIRequestContext): Promise<string> {
+/** `history` seeds the conversation ahead of its own first message: a case
+ *  that asks where a request settles needs a transcript long enough to scroll,
+ *  because a conversation that cannot move cannot lift a card anywhere. */
+async function bootWithPinnedTracks(page: Page, request: APIRequestContext, history: ConversationItem[] = []): Promise<string> {
   await request.post("/__e2e/reset");
   await control(request, { action: "agents", count: 2 });
   const parent = await control(request, { action: "seed", agent: "claude", title: "Touch tracks", items: [
+    ...history,
     { id: "message:u1", type: "user_message", createdAt: 1, text: "work through the list" },
   ] });
   const child = await control(request, { action: "seed", agent: "claude", title: "Child transcript", child: true, items: [
@@ -561,13 +579,18 @@ test("the outstanding-request pill leaves an answer field and its controls reach
 
   // And revealing the field held the conversation on the card being answered
   // rather than on whatever was topmost.
+  // Measured at the controls rather than at the card's own border box: the
+  // reveal places the question and its Answer/Reject row against the bottom of
+  // the band, so the card's trailing padding is free to pass below the fold.
+  // What must not happen is the conversation moving off this card.
   const held = await card.evaluate(element => {
     const timeline = document.querySelector("#chat-timeline")!.getBoundingClientRect();
     const bounds = element.getBoundingClientRect();
-    return { cardTop: bounds.top, cardBottom: bounds.bottom, timelineTop: timeline.top, timelineBottom: timeline.bottom };
+    const controls = element.querySelector("[data-question-reject]")!.getBoundingClientRect();
+    return { cardTop: bounds.top, controlsBottom: controls.bottom, timelineTop: timeline.top, timelineBottom: timeline.bottom };
   });
   expect(held.cardTop).toBeGreaterThanOrEqual(held.timelineTop - 1);
-  expect(held.cardBottom).toBeLessThanOrEqual(held.timelineBottom + 1);
+  expect(held.controlsBottom).toBeLessThanOrEqual(held.timelineBottom + 1);
 });
 
 /** The free-form question the answering cases put at the end of a
@@ -581,16 +604,18 @@ const freeFormQuestion = (id: string, createdAt: number): ConversationItem => ({
   }],
 });
 
-test("answering a request on touch clears the stage and restores it on blur", async ({ page, request }) => {
-  // With the keyboard up the visible band is about a third of the screen, and
-  // none of the header, the pinned tracks, the composer or the request pill
-  // can be acted on until the answer is sent — they only push the field and
-  // its Answer/Reject controls under the keyboard. So they step aside whole,
-  // summaries included, which is what separates this from the keyboard rule:
-  // there the tracks keep their summary lines and give up only their rows.
+test("answering a request on touch puts the chrome under the keyboard and brings it back on blur", async ({ page, request }) => {
+  // The chrome that cannot be acted on while the answer is being typed is not
+  // taken away for it: the surface keeps its layout height, so the keyboard
+  // simply covers the composer and the pinned tracks. They are under it rather
+  // than gone — no reflow of the conversation on the way in, and dismissing
+  // the keyboard is what brings them back. What the band above the keyboard
+  // has to hold is the question: its field and its Answer/Reject controls.
   await installFakeVisualViewport(page);
-  const id = await bootWithPinnedTracks(page, request);
-  await control(request, { action: "item", conversationId: id, item: freeFormQuestion("answering", 6) });
+  // Long enough to scroll: where the request settles is only a question the
+  // transcript can answer if it has somewhere to move.
+  const id = await bootWithPinnedTracks(page, request, messages("loaded", 28, 10));
+  await control(request, { action: "item", conversationId: id, item: freeFormQuestion("answering", 100) });
 
   const card = page.locator('[data-chat-item-id="question:answering"]');
   const customInput = card.locator("[data-question-custom-input]");
@@ -599,35 +624,72 @@ test("answering a request on touch clears the stage and restores it on blur", as
   await expect(customInput).toBeFocused();
   await expect(page.locator("html")).toHaveAttribute("data-chat-answering", "");
 
-  // Editing, so the tab bar contributes no inset: `--chat-visual-height` is
-  // the whole visual viewport — the tabBarInset = 0 geometry.
+  // The keyboard takes the lower 384px; the surface keeps all 844 of the
+  // layout height, which is what puts the chrome underneath it.
   await setVisualViewport(page, { height: 460 });
-  await expect(page.locator("#chat-surface")).toHaveCSS("--chat-visual-height", "460px");
-  await expect(page.locator(".chat-header")).toBeHidden();
-  await expect(page.locator("#chat-task-list")).toBeHidden();
-  await expect(page.locator("#chat-subagents")).toBeHidden();
-  await expect(page.locator("#chat-background-tasks")).toBeHidden();
-  await expect(page.locator("#chat-composer")).toBeHidden();
+  await expect(page.locator("#chat-surface")).toHaveCSS("--chat-visual-height", "844px");
+  // The timeline runs on under the keyboard too, so the strip it covers is
+  // reserved as scroll room — without it a request at the end of the
+  // conversation could never be lifted into the band above the keyboard.
+  await expect(page.locator("#chat-surface")).toHaveCSS("--chat-keyboard-inset", "384px");
+  await expect(page.locator(".chat-header")).toBeVisible();
   await expect(page.locator("#chat-requests-jump")).toBeHidden();
+  await expect(page.locator("#chat-prompt-rail")).toBeHidden();
 
-  // Polled: the reveal that brings the field back inside the band runs on the
-  // coordinated frame after the resize, not in the same turn as it.
+  // Below the keyboard's edge, not above it: still laid out, still there to
+  // come back to. Polled with the field's own position, because the reveal
+  // and the surface's height transition settle over the following frames.
+  // `answerAtBandBottom` is the field-test regression: the Answer control has
+  // to sit *directly* above the keyboard, not merely somewhere inside the
+  // band — the reveal aligns the field and its Answer/Reject row to the
+  // visible bottom less the timeline's scroll padding, so a strip wider than
+  // that padding between the buttons and the keyboard is the bug.
   await expect.poll(() => page.evaluate(() => {
-    const bottom = (selector: string) => document.querySelector(selector)!.getBoundingClientRect().bottom;
-    return Math.round(Math.max(bottom("[data-question-custom-input]"), bottom("[data-question-primary]")) - window.visualViewport!.height);
-  })).toBeLessThanOrEqual(1);
+    const box = (selector: string) => document.querySelector(selector)!.getBoundingClientRect();
+    const edge = window.visualViewport!.height;
+    const pad = Number.parseFloat(getComputedStyle(document.querySelector("#chat-timeline")!).scrollPaddingBottom) || 0;
+    const answerGap = box("[data-question-primary]").bottom - edge;
+    return {
+      composerTop: Math.round(box("#chat-composer").top - edge) >= -1,
+      tasksTop: Math.round(box("#chat-task-list").top - edge) >= -1,
+      fieldBottom: Math.round(box("[data-question-custom-input]").bottom - edge) <= 1,
+      answerBottom: Math.round(answerGap) <= 1,
+      answerAtBandBottom: answerGap >= -(pad + 4),
+    };
+  })).toEqual({ composerTop: true, tasksTop: true, fieldBottom: true, answerBottom: true, answerAtBandBottom: true });
 
   // Blur is what clears the state — `blur()` fires the `focusout` the surface
-  // listens to, and the sync it schedules runs in a microtask.
+  // listens to, and the sync it schedules runs in a microtask. The fake
+  // keyboard is still up, so the surface returns to the visible band and the
+  // chrome lands above the keyboard's edge rather than back under it.
   await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
   await expect(page.locator("html")).not.toHaveAttribute("data-chat-answering", "");
-  await expect(page.locator(".chat-header")).toBeVisible();
+  await expect(page.locator("#chat-surface")).toHaveCSS("--chat-visual-height", "460px");
+  await expect(page.locator("#chat-composer")).toBeVisible();
+  await expect.poll(() => page.evaluate(() => {
+    const box = (selector: string) => document.querySelector(selector)!.getBoundingClientRect();
+    const edge = window.visualViewport!.height;
+    return {
+      composerBottom: Math.round(box("#chat-composer").bottom - edge) <= 1,
+      tasksBottom: Math.round(box("#chat-task-list").bottom - edge) <= 1,
+    };
+  })).toEqual({ composerBottom: true, tasksBottom: true });
+
+  // And with the keyboard gone the surface is the whole screen again, minus
+  // the tab bar the blur brought back — so the height is read against the bar
+  // rather than pinned to 844.
+  await setVisualViewport(page, { height: 844 });
+  await expect(page.locator("#touch-tab-bar")).toBeVisible();
+  await expect.poll(() => page.evaluate(() => {
+    const composer = document.querySelector("#chat-composer")!.getBoundingClientRect();
+    const tabs = document.querySelector("#touch-tab-bar")!.getBoundingClientRect();
+    return Math.round(composer.bottom - tabs.top);
+  })).toBeLessThanOrEqual(1);
   await expect(page.locator("#chat-composer")).toBeVisible();
   await expect(page.locator("#chat-task-list")).toBeVisible();
   await expect(page.locator("#chat-subagents")).toBeVisible();
   await expect(page.locator("#chat-background-tasks")).toBeVisible();
 });
-
 test("the transcript holds still while an answer is typed", async ({ page, request }) => {
   // iOS autoscrolls a scroller natively while a caret or selection handle is
   // dragged near its edge, and it honours neither `overflow: hidden` nor
@@ -646,16 +708,34 @@ test("the transcript holds still while an answer is typed", async ({ page, reque
   await expect(customInput).toBeFocused();
   await expect(page.locator("html")).toHaveAttribute("data-chat-answering", "");
 
+  // The surface keeps its layout height while answering — the keyboard covers
+  // its lower part — so the field's position is read against the visible band
+  // rather than against the surface.
   await setVisualViewport(page, { height: 460 });
-  await expect(page.locator("#chat-surface")).toHaveCSS("--chat-visual-height", "460px");
+  await expect(page.locator("#chat-surface")).toHaveCSS("--chat-visual-height", "844px");
   const fieldOvershoot = () => page.evaluate(() => Math.round(
     document.querySelector("[data-question-custom-input]")!.getBoundingClientRect().bottom - window.visualViewport!.height));
   await expect.poll(fieldOvershoot).toBeLessThanOrEqual(1);
+  // Read once it has stopped moving: the field is inside the band a frame or
+  // two before the extent the reveal measures against has finished settling,
+  // and the position the hold defends is the settled one.
+  await expect.poll(stillScrollTop(timeline)).toBe(true);
+  // And it settles directly above the keyboard: the held reveal aligns the
+  // field together with its Answer/Reject row to the band's bottom, so what
+  // separates the buttons from the keyboard's edge is the timeline's scroll
+  // padding and nothing more.
+  const answerAtBandBottom = () => page.evaluate(() => {
+    const pad = Number.parseFloat(getComputedStyle(document.querySelector("#chat-timeline")!).scrollPaddingBottom) || 0;
+    const gap = document.querySelector("[data-question-primary]")!.getBoundingClientRect().bottom - window.visualViewport!.height;
+    return gap <= 1 && gap >= -(pad + 4);
+  });
+  await expect.poll(answerAtBandBottom).toBe(true);
   const held = await timeline.evaluate(element => element.scrollTop);
   expect(held).toBeGreaterThan(300);
 
   await timeline.evaluate(element => { element.scrollTop -= 300; element.dispatchEvent(new Event("scroll")); });
   await expect.poll(fieldOvershoot).toBeLessThanOrEqual(1);
+  await expect.poll(answerAtBandBottom).toBe(true);
   await expect.poll(() => timeline.evaluate(element => element.scrollTop)).toBeGreaterThan(held - 2);
   expect(await timeline.evaluate(element => element.scrollTop)).toBeLessThan(held + 2);
 

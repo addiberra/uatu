@@ -30,10 +30,12 @@ again rather than dropped.
 
 While a text control that belongs to a request has focus on a touch device,
 the surface SHALL give the transcript the visible band: chrome that cannot be
-used while the keyboard is open MUST NOT hold space in it, and the focused
-control SHALL be kept inside the visible viewport once the keyboard geometry
-has settled. Focusing that control MUST NOT change the page's scale. When
-focus leaves the request, the surface SHALL return to its normal arrangement.
+used while the keyboard is open SHALL sit beneath the keyboard rather than
+above it, so the band above the keyboard belongs to the transcript and the
+request; it SHALL reappear as the keyboard dismisses; the transcript SHALL keep enough scroll room below its last entry that a request at the end of the conversation can still be lifted above the keyboard. The focused control
+SHALL be kept inside the visible viewport once the keyboard geometry has
+settled. Focusing that control MUST NOT change the page's scale. When focus
+leaves the request, the surface SHALL return to its normal arrangement.
 
 #### Scenario: Preview updates while the conversation stays visible
 - **WHEN** a desktop user prompts the agent and it modifies the currently
@@ -95,15 +97,19 @@ focus leaves the request, the surface SHALL return to its normal arrangement.
 - **THEN** the transcript returns to the position that keeps the field in view
 - **AND** it scrolls freely again once the field loses focus
 
-#### Scenario: Answering a request on touch clears the stage
+#### Scenario: Answering a request on touch puts the chrome under the keyboard
 - **WHEN** a touch user focuses a request's free-form answer field and the
   software keyboard opens while the task, subagent and background-task tracks
-  are populated and the conversation has a header and composer
-- **THEN** the header, the pinned tracks, the composer and the outstanding-request
-  report are not shown
+  are populated and the conversation has a composer
+- **THEN** the composer and the pinned tracks lie beneath the keyboard's edge
+  rather than above it
+- **AND** the chat header remains visible
 - **AND** the answer field and the request's submit and cancel controls are
   inside the visible viewport
-- **AND** they return when the field loses focus
+- **AND** the field and its submit and cancel controls sit directly above the
+  keyboard's edge, with the conversation filling the band above them
+- **AND** the composer and the pinned tracks are back above the keyboard's
+  former edge once it dismisses
 
 #### Scenario: Focusing the answer field does not zoom the page
 - **WHEN** a touch user focuses a request's free-form answer field

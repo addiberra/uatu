@@ -9,7 +9,7 @@ import { onManualRecovery, registerRecoveryWork, requestManualRecovery } from ".
 import { onWorkspaceCredentialRefresh } from "../terminal/client";
 import { ChatApiClient, ChatConnectionInterruptedError, ChatTransportError, type ChatEventStream } from "./client";
 import { TimelineAnchorController, type AnchorGeometry, type TimelineAnchor } from "./anchor";
-import { CoordinatedScrollOwner } from "./coordinated-scroll";
+import { CoordinatedScrollOwner, type RevealOptions } from "./coordinated-scroll";
 import { ChatViewportController } from "./viewport";
 import { notificationConversation } from "./notification-navigation";
 import { setActiveTab } from "../shell/tab-bar";
@@ -642,13 +642,31 @@ export function initChat(api = new ChatApiClient()): void {
   }) : null;
   childLatest?.addEventListener("click", () => childScroll?.latest());
   /**
+   * Where an answering reveal has to leave the field. The extent is the row
+   * carrying Answer and Reject, so the two are placed as one block: the field
+   * alone could be brought into the band with its own buttons still under the
+   * keyboard. `end` because the band's bottom is the only position that is
+   * stable whether or not the platform's focus scroll already moved the card —
+   * a minimal move leaves whatever height WebKit happened to give it as a
+   * strip of empty conversation between the buttons and the keyboard's edge.
+   * Touch only: nothing covers the chrome on desktop, so there is no band to
+   * be pressed against and the minimal move is the one that disturbs the
+   * reader least. The extent travels either way — which row has to land with
+   * the field is not a property of the device.
+   */
+  const answerPlacement = (element: HTMLElement): RevealOptions => ({
+    extent: element.closest("form[data-question-form]")?.querySelector<HTMLElement>(".chat-request-actions") ?? undefined,
+    align: document.documentElement.getAttribute("data-ui-mode") === "touch" ? "end" : "nearest",
+  });
+  /**
    * A control is revealed by the owner of the timeline it sits in — the same
    * card can be shown in the parent transcript or in a subagent drill-down,
    * and each timeline scrolls itself.
    */
   const revealInOwningTimeline = (element: HTMLElement): void => {
-    if (drilldownTimeline?.contains(element)) childScroll?.reveal(element);
-    else if (timeline.contains(element)) parentScroll.reveal(element);
+    const placement = answerPlacement(element);
+    if (drilldownTimeline?.contains(element)) childScroll?.reveal(element, placement);
+    else if (timeline.contains(element)) parentScroll.reveal(element, placement);
   };
   /**
    * The same choice of owner, for the standing version: while the field is
@@ -656,8 +674,9 @@ export function initChat(api = new ChatApiClient()): void {
    * own autoscroll as the caret is dragged cannot run the conversation away.
    */
   const holdInOwningTimeline = (element: HTMLElement): void => {
-    if (drilldownTimeline?.contains(element)) childScroll?.hold(element);
-    else if (timeline.contains(element)) parentScroll.hold(element);
+    const placement = answerPlacement(element);
+    if (drilldownTimeline?.contains(element)) childScroll?.hold(element, placement);
+    else if (timeline.contains(element)) parentScroll.hold(element, placement);
   };
   /** Both owners on release: by the time focus has left, the field that was
    *  held may no longer be in the timeline that held it. Releasing an owner

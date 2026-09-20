@@ -62,6 +62,7 @@ The question `change` handler in `src/chat/ui.ts` calls `syncQuestionControl(inp
 
 **D10 — The keyboard covers the chrome while a request is answered.**
 `syncEditingFocus` also toggles `data-chat-answering` on `<html>` when the focused text control sits inside a request card (`.chat-request` / `[data-question-form]`). While it is set on touch, the chat surface keeps the *layout* viewport height (`window.innerHeight`) instead of shrinking to the visual viewport; its top still follows the visual viewport's offset. The composer, the five pinned tracks (`#chat-task-list`, `#chat-subagents`, `#chat-background-tasks`, `#chat-reverted`, `#chat-queue`) and the Latest button therefore stay laid out where they are and the software keyboard slides up over them — they are literally under the keyboard, and they reappear as it dismisses. If the keyboard is already open when the request field takes focus (the user was in the composer), the surface's height transitions (~250 ms) so the bottom chrome visibly slides down under the keyboard rather than jumping. The header stays visible at the top. Only `#chat-requests-jump` — the outstanding-request pill, which yields anyway under D12 — and the prompt rail, which captures touches beside the field, are hidden while answering; nothing else is taken out of the layout. No tab-bar rule is needed (already hidden under `data-chat-editing`), and nothing in `styles.css` ~8020–8045 or `src/shell/tab-bar.ts` is touched. Once the keyboard geometry settles, the focused control is brought inside the visible viewport through the coordinated owner — it is the only automatic position writer, so no raw `scrollTop` or `scrollIntoView` on the nested timeline. *Tap safety:* the request's submit and cancel controls get the touch `pointerdown` `preventDefault()` the send button already has, so tapping them does not blur the field first and reflow the chrome back under the finger.
+Because the timeline now runs on under the keyboard and a scroller cannot be scrolled past its own bottom edge, the timeline reserves the covered strip (`--chat-keyboard-inset`, written by the viewport controller as the surface height below the visible band) as bottom padding while answering — otherwise a request at the very end of the conversation could never be lifted into the band.
 *Alternative:* hide the chrome outright — rejected after the field test: the disappearance reads as loss, not as making room. Letting the keyboard cover it says where the chrome went, and dismissing the keyboard brings it back by itself.
 
 **D11 — 16 px on the custom-answer input in touch mode.**
@@ -94,6 +95,39 @@ of what it does rather than a new mechanism. It is a standing mode
 (`hold(element)` / `release()`) rather than an option on the one-shot
 `reveal(element)`, because a reveal is consumed by the frame that serves it
 while a hold outlives it and has to be ended by name.
+
+**D14 — The held field sits at the bottom of the band.**
+While the hold is in force the reveal does not merely put the field *inside*
+the band, it aligns the whole *extent* to the band's bottom. The extent is the
+answer field together with the row that carries its submit and cancel controls
+(the `.chat-request-actions` of the same `form[data-question-form]`), and the
+band's bottom is the visible viewport's bottom less the timeline's
+`scroll-padding-bottom`; the move is clamped by the scroller's range like every
+other correction, so a conversation with nothing left to scroll simply stops
+where it stops. The transcript therefore fills everything above the question
+and no empty strip is left between the Answer/Reject row and the keyboard's
+edge. If the extent is taller than the band its *top* is aligned instead:
+scrolling the question's own top out of view to chase its buttons would hide
+what is being answered in order to show how to answer it. `reveal(element,
+{ extent, align })` carries both as options — `align: "nearest"`, today's
+minimal move, stays the default for every other caller, and `hold()` passes
+`align: "end"`. The end alignment is touch-only — the caller passes `nearest`
+in desktop mode — because nothing covers the chrome there: without a keyboard
+there is no band to press the question against, and moving a card the reader
+can already see would be a jump bought for nothing. The custom editor is focused with `preventScroll: true`,
+because this owner reveals it itself: WebKit's own focus scroll only adds a
+jump the owner then has to correct.
+*Why D13's minimal move is not enough:* it moves only as far as it must, so a
+field that WebKit's focus scroll — or the user's own pan — already left high in
+the band asks for no move at all, and the hold has no reason to move it either.
+That is the ~200 CSS px gap between the Answer/Reject row and the keyboard
+reported from the iPhone field test. The bottom of the band is the one position
+that is stable under both the platform's initial scroll and the hold's later
+defence of it.
+*Alternative:* keep `nearest` and pad the timeline so the minimal move lands
+lower — rejected: padding moves the resting place of every card in the
+conversation to fix the resting place of one, and it cannot pull a field
+*down* that the platform already scrolled too far up.
 
 ## Risks / Trade-offs
 

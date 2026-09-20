@@ -56,14 +56,19 @@ describe("question form interactions", () => {
     const editor = form.querySelector<HTMLElement>("[data-question-custom-editor]")!;
     const input = form.querySelector<HTMLInputElement>("[data-question-custom-input]")!;
     const primary = form.querySelector<HTMLButtonElement>("[data-question-primary]")!;
+    // Recorded with its options: on touch the coordinated scroll owner is the
+    // one that brings this field above the keyboard, so the focus must not
+    // scroll as well — `preventScroll` is what keeps WebKit from jumping first.
+    let focusOptions: FocusOptions | null | undefined;
     let focused = false;
-    input.focus = () => { focused = true; };
+    input.focus = (options?: FocusOptions) => { focused = true; focusOptions = options; };
 
     toggle.checked = true;
     syncQuestionControl(toggle, true);
     expect(editor.hidden).toBe(false);
     expect(toggle.getAttribute("aria-expanded")).toBe("true");
     expect(focused).toBe(true);
+    expect(focusOptions).toEqual({ preventScroll: true });
     expect(primary.disabled).toBe(true);
 
     input.value = "   ";
