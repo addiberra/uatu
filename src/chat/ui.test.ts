@@ -1211,6 +1211,22 @@ describe("chat outstanding-request pill", () => {
       expect(pill.hidden).toBe(true);
       // The count is the count of everything outstanding, unchanged by the gate.
       expect(pill.textContent).toBe("2 requests need your answer");
+
+      // pagehide can retain this document on iOS: its existing surface and
+      // observer must keep working rather than wait for a nonexistent remount.
+      const retainedObserver = latest();
+      window.dispatchEvent(new Event("pagehide"));
+      expect(retainedObserver.disconnected).toBe(false);
+      fire(0);
+      expect(pill.hidden).toBe(false);
+
+      // No outstanding request means there is no node left to observe, even
+      // though the chat surface itself continues to live with the document.
+      items = [];
+      handlers!.resync();
+      await waitUntil(() => pill.textContent === "", () => `pill ${pill.textContent}`);
+      expect(retainedObserver.disconnected).toBe(true);
+      expect(pill.hidden).toBe(true);
     } finally {
       restoreObservers();
       await Bun.sleep(20);

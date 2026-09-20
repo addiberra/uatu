@@ -653,6 +653,9 @@ export function initChat(api = new ChatApiClient()): void {
    * be pressed against and the minimal move is the one that disturbs the
    * reader least. The extent travels either way — which row has to land with
    * the field is not a property of the device.
+   * Only question forms currently pair a text field with an action row. A
+   * future permission text editor must supply its own extent here; do not
+   * accidentally borrow an action row from another request or enclosing UI.
    */
   const answerPlacement = (element: HTMLElement): RevealOptions => ({
     extent: element.closest("form[data-question-form]")?.querySelector<HTMLElement>(".chat-request-actions") ?? undefined,
@@ -937,6 +940,9 @@ export function initChat(api = new ChatApiClient()): void {
    * and rebuilt whenever that element changes — a new target, a re-rendered
    * card, another conversation, or no outstanding request at all — so nothing
    * is left observing a node the timeline has dropped.
+   * The current observer shares the document lifetime of initChat. Do not
+   * disconnect it on pagehide: iOS can retain the page (see the save handler).
+   * If this surface gains a dispose path, release this observer there too.
    */
   const observeRequestTarget = (id: string | undefined) => {
     const card = id ? items.querySelector(`[data-chat-item-id="${CSS.escape(id)}"]`) : null;

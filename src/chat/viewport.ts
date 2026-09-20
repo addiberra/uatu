@@ -93,7 +93,7 @@ export class ChatViewportController {
     const covered = answering ? Math.max(0, window.innerHeight - height) : 0;
     // The answering surface keeps its layout height even when the visible
     // band shrinks. Only suppress a pan if that band is unchanged too.
-    const pannedOnly = this.lastTop !== null && this.lastTop !== top
+    const pannedOnly = touch && this.lastTop !== null && this.lastTop !== top
       && this.lastHeight === surfaceHeight && this.lastVisualHeight === height;
     if (touch) {
       // Rewriting a value the surface already carries re-enters through our own

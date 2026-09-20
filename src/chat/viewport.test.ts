@@ -95,6 +95,39 @@ describe("chat visual viewport geometry", () => {
     }
   });
 
+  test("switching from touch to desktop while editing corrects even with a simultaneous pan", () => {
+    const f = harness();
+    try {
+      f.root.setAttribute("data-chat-editing", "");
+      f.viewport.height = 500;
+      f.controller.apply();
+      expect(f.requests()).toBe(1);
+
+      f.root.setAttribute("data-ui-mode", "desktop");
+      f.root.setAttribute("data-chat-panel", "open");
+      f.viewport.offsetTop = 100;
+      f.controller.apply();
+      expect(f.requests()).toBe(2);
+      for (const property of ["--chat-visual-height", "--chat-visual-top", "--chat-keyboard-inset"]) {
+        expect(f.style(property)).toBe("");
+      }
+
+      // Returning to touch establishes fresh geometry; only later pure pans
+      // should be suppressed, not the mode transition itself.
+      f.root.setAttribute("data-ui-mode", "touch");
+      f.viewport.offsetTop = 120;
+      f.controller.apply();
+      expect(f.requests()).toBe(3);
+      expect(f.style("--chat-visual-height")).toBe("500px");
+      expect(f.style("--chat-visual-top")).toBe("120px");
+      f.viewport.offsetTop = 140;
+      f.controller.apply();
+      expect(f.requests()).toBe(3);
+    } finally {
+      f.restore();
+    }
+  });
+
   test("a foreground return re-derives geometry the platform never announced", () => {
     const f = harness();
     try {
