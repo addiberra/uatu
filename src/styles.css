@@ -6579,6 +6579,17 @@ html[data-ui-mode="desktop"][data-notification-chat] .chat-expand-strip {
   bottom: 3.5rem;
 }
 
+/* The pill floats over the transcript's lower right, so a request sitting at
+   the end of the conversation had its answer field and its Answer/Cancel
+   controls underneath it. The timeline reserves the strip instead of the pill
+   moving into the flow — in the touch layout there is no room to push the
+   composer down. The scroll padding matters as much as the padding: scrolling
+   a request into view must not park it under the pill either. */
+.chat-transcript-area:has(> :where(#chat-requests-jump):not([hidden])) .chat-timeline {
+  padding-bottom: 3.5rem;
+  scroll-padding-bottom: 3.5rem;
+}
+
 .chat-composer {
   position: relative;
   flex: 0 0 auto;
@@ -7951,6 +7962,15 @@ html[data-ui-mode="touch"][data-active-tab="chat"] .chat-surface {
   padding-right: env(safe-area-inset-right);
 }
 
+/* Answering while the keyboard is already open: the surface grows to the
+   layout height, and that growth is what slides the composer and the pinned
+   tracks down under the keyboard. Animated so they are seen to move there
+   rather than to vanish. Only in this state — keyboard open and close geometry
+   must stay immediate, or the surface would lag the band it is tracking. */
+html[data-ui-mode="touch"][data-active-tab="chat"][data-chat-answering] .chat-surface {
+  transition: height 250ms ease-out;
+}
+
 /* Touch navigates as a stack, so the same drill-down state renders as a
    pushed screen rather than an inline layer: it takes the chat surface's own
    fixed box (one z-index above it, so the tab bar below is untouched and Chat
@@ -8111,6 +8131,13 @@ html[data-ui-mode="touch"] .chat-configuration-dialog select {
   font-size: 16px;
 }
 
+/* Same reason as the composer and the dialog above: iOS zooms the page on
+   focus for any text control under 16px, and the free-form answer field is
+   the one that takes focus mid-conversation. */
+html[data-ui-mode="touch"] .chat-question-custom-editor input {
+  font-size: 16px;
+}
+
 html[data-ui-mode="touch"] .chat-composer-actions {
   grid-template-columns: auto minmax(0, 1fr) 2.25rem 2.55rem;
   align-items: center;
@@ -8170,6 +8197,9 @@ html[data-ui-mode="touch"]:has(#chat-input:focus) .touch-tab-bar {
     animation: none;
   }
 
+  /* The surface itself, not only its descendants: the answering state gives
+     it a height transition, and that is motion like any other. */
+  .chat-surface,
   .chat-surface *,
   .touch-tab { scroll-behavior: auto !important; transition: none !important; animation: none !important; }
 
@@ -8893,7 +8923,8 @@ html[data-ui-mode="touch"] .chat-task-list {
 }
 
 #chat-task-list-items,
-#chat-subagents-items {
+#chat-subagents-items,
+#chat-background-tasks-items {
   max-height: 8.5rem;
   overflow-y: auto;
   overscroll-behavior: contain;
@@ -8901,9 +8932,41 @@ html[data-ui-mode="touch"] .chat-task-list {
 
 html[data-chat-keyboard] #chat-task-list-items,
 html[data-chat-keyboard] #chat-subagents-items,
+html[data-chat-keyboard] #chat-background-tasks-items,
 html[data-chat-keyboard] .chat-reverted-items,
 html[data-chat-keyboard] .chat-queue {
   display: none;
+}
+
+/* Answering a request is the one state where the chrome cannot be acted on
+   until the answer is sent. It is not removed for that: while the surface
+   keeps its layout height (viewport.ts) the keyboard simply covers it, so the
+   composer and the pinned tracks are under the keyboard rather than gone, and
+   dismissing it brings them straight back — no reflow of the conversation on
+   the way in or out. Two float over the band that stays visible and do step
+   aside: the prompt rail claims the touches beside the answer field outright,
+   and the outstanding-request pill sits on the Answer/Reject controls while
+   yielding to the card being answered anyway. */
+html[data-ui-mode="touch"][data-chat-answering] #chat-prompt-rail,
+html[data-ui-mode="touch"][data-chat-answering] #chat-requests-jump {
+  display: none;
+}
+
+/* The timeline runs on under the keyboard too, and a card can be scrolled no
+   further than the timeline's own bottom edge — which is beneath it. So the
+   covered strip is reserved as scroll room while answering: without it a
+   request at the end of the conversation can never be lifted into the band
+   above the keyboard. `--chat-keyboard-inset` is the covered height, written
+   by the viewport controller and 0 whenever no keyboard is up. The reveal's
+   own clearance is `scroll-padding-bottom`, which stays the ordinary touch
+   inset — it is measured against the visible band, not against this strip.
+   The pill reservation uses :where() to keep its id out of specificity:
+   this keyboard inset must win even when the pill lacks [hidden] (for
+   example over a pushed drill-down) but is hidden by the answering rule. */
+html[data-ui-mode="touch"][data-chat-answering] #chat-timeline,
+html[data-ui-mode="touch"][data-chat-answering] #chat-drilldown-timeline {
+  padding-bottom: calc(0.6rem + var(--chat-keyboard-inset, 0px));
+  scroll-padding-bottom: 0.6rem;
 }
 
 /* Rows of the background-task list: the task's description leads, its

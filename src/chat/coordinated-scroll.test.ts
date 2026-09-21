@@ -30,18 +30,103 @@ function fixture() {
   };
   const owner = new CoordinatedScrollOwner(element, options);
   disposals.push(() => owner.dispose());
-  return { element, owner, anchor, frames, writes, options,
+  return { element, owner, anchor, frames, writes, options, document,
     grow: (height: number) => { extent = height; top = Math.min(top, extent - 300); },
     move: (value: number) => { top = value; },
     shift: (value: number) => { itemTop = value; },
     hide: () => { active = false; },
     show: () => { active = true; },
     event: (name: string, fields = {}) => { element.dispatchEvent(Object.assign(new window.Event(name, { bubbles: true }), fields) as unknown as Event); },
+    eventAt: (target: { dispatchEvent(event: Event): boolean }, name: string, fields = {}) => {
+      target.dispatchEvent(Object.assign(new window.Event(name, { bubbles: true }), fields) as unknown as Event);
+    },
     flush: () => { const pending = [...frames.values()]; frames.clear(); for (const callback of pending) callback(sequence); },
   };
 }
 
+function stubRect(element: object, rect: () => { top: number; bottom: number }): void {
+  Object.defineProperty(element, "getBoundingClientRect", { configurable: true, value: rect });
+}
+
+/** The band the platform leaves above the software keyboard. While a request
+ *  is answered the scroller keeps its full height and the keyboard covers its
+ *  lower part, so this is the only thing that says where the reader can see. */
+function withVisibleBand(band: { height: number; offsetTop: number }, run: () => void): void {
+  const previous = Object.getOwnPropertyDescriptor(globalThis, "window");
+  Object.defineProperty(globalThis, "window", { configurable: true, writable: true, value: { visualViewport: band } });
+  try { run(); } finally {
+    if (previous) Object.defineProperty(globalThis, "window", previous);
+    else Reflect.deleteProperty(globalThis, "window");
+  }
+}
+
 describe("coordinated scrolling", () => {
+  for (const end of ["release", "cancel", "latest", "pause", "detach"] as const) test(`hold identity query after ${end}`, () => {
+    const f = fixture();
+    const field = f.document.createElement("input") as unknown as HTMLElement;
+    const other = f.document.createElement("input") as unknown as HTMLElement;
+    f.element.append(field, other);
+    expect(f.owner.isHolding(field)).toBe(false);
+    f.owner.hold(field);
+    expect(f.owner.isHolding(field)).toBe(true);
+    expect(f.owner.isHolding(other)).toBe(false);
+    if (end === "detach") field.remove();
+    else f.owner[end]();
+    expect(f.owner.isHolding(field)).toBe(false);
+  });
+  for (const pinned of [true, false]) test(`answer release preserves original following=${pinned}`, () => {
+    const f = fixture();
+    if (!pinned) f.owner.pause();
+    stubRect(f.element, () => ({ top: 0, bottom: 300 }));
+    const field = f.document.createElement("input"); f.element.append(field);
+    stubRect(field, () => ({ top: 450 - f.element.scrollTop, bottom: 470 - f.element.scrollTop }));
+    f.owner.hold(field as unknown as HTMLElement); f.flush();
+    expect(f.element.scrollTop).toBe(170);
+    f.owner.release();
+    f.grow(470); f.event("scroll"); f.owner.request(); f.flush();
+    f.grow(800); f.owner.request(true); f.flush();
+    expect(f.anchor.isPinned()).toBe(pinned);
+    expect(f.element.scrollTop).toBe(pinned ? 500 : 170);
+  });
+  for (const type of ["radio", "checkbox"]) test(`${type} drags pause following`, () => {
+    const f = fixture();
+    const field = f.document.createElement("input"); field.setAttribute("type", type); f.element.append(field);
+    f.owner.latest();
+    f.eventAt(field, "touchstart", { touches: [{ clientY: 100 }] });
+    f.eventAt(field, "touchmove", { touches: [{ clientY: 140 }] });
+    expect(f.anchor.isPinned()).toBe(false);
+    expect(f.frames.size).toBe(0);
+  });
+  for (const action of ["cancel", "pause"] as const) test(`${action} ends the hold without stale follow restoration`, () => {
+    const f = fixture();
+    stubRect(f.element, () => ({ top: 0, bottom: 300 }));
+    const field = f.document.createElement("input"); f.element.append(field);
+    stubRect(field, () => ({ top: 450 - f.element.scrollTop, bottom: 470 - f.element.scrollTop }));
+    f.owner.hold(field as unknown as HTMLElement); f.flush();
+    f.owner[action]();
+    expect(f.frames.size).toBe(0);
+    f.owner.beforeMutation("line");
+    f.owner.release();
+    f.grow(800); f.owner.request(true); f.flush();
+    expect(f.anchor.isPinned()).toBe(action === "cancel");
+    expect(f.element.scrollTop).toBe(action === "cancel" ? 500 : 170);
+  });
+  for (const end of ["latest", "detach", "release"] as const) test(`${end} retires the held target and pending reveal`, () => {
+    const f = fixture();
+    stubRect(f.element, () => ({ top: 0, bottom: 300 }));
+    const field = f.document.createElement("input"); f.element.append(field);
+    stubRect(field, () => ({ top: 450 - f.element.scrollTop, bottom: 470 - f.element.scrollTop }));
+    f.owner.hold(field as unknown as HTMLElement); f.flush();
+    f.move(100); f.event("scroll");
+    if (end === "detach") field.remove();
+    else f.owner[end]();
+    f.flush();
+    expect(f.element.scrollTop).toBe(300);
+    f.move(80); f.event("scroll");
+    expect(f.anchor.isPinned()).toBe(false);
+    expect(f.frames.size).toBe(0);
+    expect(f.element.scrollTop).toBe(80);
+  });
   test("upward scrolling without a wheel event still pauses when revealing content changes the extent", () => {
     const f = fixture();
     f.grow(800);
@@ -119,6 +204,21 @@ describe("coordinated scrolling", () => {
     expect(f.anchor.isPinned()).toBe(false);
     expect(f.frames.size).toBe(0);
   });
+  test("a touch gesture inside a text control does not move the conversation", () => {
+    const f = fixture();
+    const input = f.document.createElement("input");
+    f.element.append(input);
+    f.owner.latest();
+    expect(f.anchor.isPinned()).toBe(true);
+    f.eventAt(input as unknown as { dispatchEvent(event: Event): boolean }, "touchstart", { touches: [{ clientY: 100 }] });
+    f.eventAt(input as unknown as { dispatchEvent(event: Event): boolean }, "touchmove", { touches: [{ clientY: 140 }] });
+    expect(f.anchor.isPinned()).toBe(true);
+    expect(f.frames.size).toBe(1);
+    f.event("touchstart", { touches: [{ clientY: 100 }] });
+    f.event("touchmove", { touches: [{ clientY: 140 }] });
+    expect(f.anchor.isPinned()).toBe(false);
+    expect(f.frames.size).toBe(0);
+  });
   test("delayed and repeated programmatic echoes retain a paused near-end anchor", () => {
     const f = fixture();
     f.anchor.restore({ itemId: "line", offset: -280 });
@@ -188,6 +288,156 @@ describe("coordinated scrolling", () => {
     expect(f.frames.size).toBe(1);
     f.owner.flush(116);
     expect(f.writes).toEqual([400, 500]);
+  });
+  test("revealing a focused control is one write, and the anchor then holds it", () => {
+    const f = fixture();
+    // linkedom lays nothing out, so the two rectangles this reveal reasons
+    // about are stubbed: a 300px client box at the top of the page, and a
+    // field sitting 60px below its bottom edge.
+    stubRect(f.element, () => ({ top: 0, bottom: 300 }));
+    const field = f.document.createElement("input");
+    f.element.append(field);
+    let fieldTop = 340;
+    stubRect(field, () => ({ top: fieldTop, bottom: fieldTop + 20 }));
+    // A reader parked mid-transcript: the anchor's own correction is a no-op,
+    // so any write in this frame is the reveal's.
+    f.grow(900); f.move(300); f.owner.pause();
+
+    f.owner.reveal(field as unknown as HTMLElement);
+    expect(f.frames.size).toBe(1);
+    f.flush();
+    expect(f.writes).toEqual([360]);
+
+    // The reveal re-captured through the anchor, so the next correction holds
+    // the revealed position instead of snapping back to where it was.
+    f.owner.request(); f.flush();
+    expect(f.writes).toEqual([360]);
+    expect(f.element.scrollTop).toBe(360);
+    expect(f.anchor.isPinned()).toBe(false);
+
+    // Already inside the box: nothing to reveal, nothing written.
+    fieldTop = 100;
+    f.owner.reveal(field as unknown as HTMLElement);
+    f.flush();
+    expect(f.writes).toEqual([360]);
+  });
+  test("a reveal clears the software keyboard, not just the scroller's own box", () => {
+    const f = fixture();
+    // The same 300px client box as above, with the field 30px above its
+    // bottom edge — inside the box, so the box alone asks for no move. The
+    // keyboard covers everything below 200: that is where the field really is.
+    stubRect(f.element, () => ({ top: 0, bottom: 300 }));
+    const field = f.document.createElement("input");
+    f.element.append(field);
+    stubRect(field, () => ({ top: 250, bottom: 270 }));
+    f.grow(900); f.move(300); f.owner.pause();
+
+    f.owner.reveal(field as unknown as HTMLElement);
+    f.flush();
+    expect(f.writes).toEqual([]);
+
+    withVisibleBand({ height: 200, offsetTop: 0 }, () => {
+      f.owner.reveal(field as unknown as HTMLElement);
+      f.flush();
+    });
+    expect(f.writes).toEqual([370]);
+  });
+  test("an end-aligned reveal puts the field and its answer controls at the bottom of the band", () => {
+    const f = fixture();
+    // The 300px client box again, with the keyboard covering everything below
+    // 200. The field is already inside that band — high in it, where WebKit's
+    // own focus scroll tends to leave it — so the minimal move has nothing to
+    // do and the strip below the answer controls stays empty.
+    stubRect(f.element, () => ({ top: 0, bottom: 300 }));
+    const field = f.document.createElement("input");
+    const actions = f.document.createElement("div");
+    f.element.append(field, actions);
+    stubRect(field, () => ({ top: 50, bottom: 70 }));
+    stubRect(actions, () => ({ top: 80, bottom: 110 }));
+    f.grow(900); f.move(300); f.owner.pause();
+
+    withVisibleBand({ height: 200, offsetTop: 0 }, () => {
+      f.owner.reveal(field as unknown as HTMLElement, { extent: actions as unknown as HTMLElement });
+      f.flush();
+      expect(f.writes).toEqual([]);
+
+      // Held: field and answer controls are placed as one block, with the
+      // block's bottom on the band's bottom, so the conversation fills
+      // everything above it and nothing is left under the buttons.
+      f.owner.hold(field as unknown as HTMLElement, { extent: actions as unknown as HTMLElement });
+      f.flush();
+      expect(f.writes).toEqual([210]);
+
+      // Clamped by the scroller's own range: with only 40px of conversation
+      // above it the scroller stops where it runs out rather than overscrolling.
+      f.move(40); f.owner.pause();
+      f.owner.hold(field as unknown as HTMLElement, { extent: actions as unknown as HTMLElement });
+      f.flush();
+      expect(f.writes).toEqual([210, 0]);
+    });
+  });
+  test("an extent taller than the band aligns to its top instead", () => {
+    const f = fixture();
+    // A question whose field and answer controls together outrun the band:
+    // putting the buttons on the band's bottom would scroll the question
+    // itself out of view, so the block's top is what is aligned.
+    stubRect(f.element, () => ({ top: 0, bottom: 300 }));
+    const field = f.document.createElement("input");
+    const actions = f.document.createElement("div");
+    f.element.append(field, actions);
+    stubRect(field, () => ({ top: 50, bottom: 70 }));
+    stubRect(actions, () => ({ top: 80, bottom: 400 }));
+    f.grow(900); f.move(300); f.owner.pause();
+
+    withVisibleBand({ height: 200, offsetTop: 0 }, () => {
+      f.owner.hold(field as unknown as HTMLElement, { extent: actions as unknown as HTMLElement });
+      f.flush();
+    });
+    expect(f.writes).toEqual([350]);
+  });
+  test("a held control is put back after a scroll the owner did not write", () => {
+    const f = fixture();
+    // As in the reveal case above: a 300px client box at the top of the page.
+    // This field's rectangle moves with the scroller, as a laid-out element
+    // does — which is what makes the re-reveal after a foreign scroll a real
+    // measurement rather than a replay of the first one.
+    stubRect(f.element, () => ({ top: 0, bottom: 300 }));
+    const field = f.document.createElement("input");
+    f.element.append(field);
+    stubRect(field, () => ({ top: 640 - f.element.scrollTop, bottom: 660 - f.element.scrollTop }));
+    f.grow(900); f.move(300); f.owner.pause();
+
+    f.owner.hold(field as unknown as HTMLElement);
+    f.flush();
+    expect(f.writes).toEqual([360]);
+    // The echo of our own write: the held position is the one we are at, so
+    // there is nothing to undo and no frame to spend.
+    f.event("scroll");
+    expect(f.frames.size).toBe(0);
+    expect(f.writes).toEqual([360]);
+
+    // WebKit autoscrolling the transcript while the caret is dragged: one
+    // frame, one write, and the field is inside the box again.
+    f.move(60);
+    f.event("scroll");
+    expect(f.frames.size).toBe(1);
+    expect(f.anchor.isPinned()).toBe(false);
+    f.flush();
+    expect(f.writes).toEqual([360, 360]);
+    expect(f.element.scrollTop).toBe(360);
+    f.event("scroll");
+    expect(f.frames.size).toBe(0);
+    expect(f.writes).toEqual([360, 360]);
+
+    // Released on blur: the scroller is left where it stands, and a foreign
+    // scroll is the reader's again.
+    f.owner.release();
+    expect(f.element.scrollTop).toBe(360);
+    f.move(60);
+    f.event("scroll");
+    expect(f.frames.size).toBe(0);
+    expect(f.element.scrollTop).toBe(60);
+    expect(f.writes).toEqual([360, 360]);
   });
   test("upward input with concurrent layout growth captures the actual reader position", () => {
     const f = fixture();

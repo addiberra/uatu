@@ -14,12 +14,39 @@ export interface CoordinatedScrollOptions {
   cancelFrame?: (id: number) => void;
 }
 
+/** How a reveal places its target inside the visible band. */
+export interface RevealOptions {
+  /**
+   * A second element that has to land in the band with the target. A request's
+   * answer field is answered with the row that carries its submit and cancel
+   * controls, so the two are placed as one block: revealing the field alone
+   * would be free to leave the buttons under the keyboard.
+   */
+  extent?: HTMLElement;
+  /**
+   * `nearest` — the minimal move that puts the target inside the band, which
+   * is what an ordinary reveal wants: it disturbs the reader least.
+   * `end` — the target's extent sits at the bottom of the band. A held answer
+   * field needs this: `nearest` asks for no move at all when the platform's
+   * own focus scroll already left the field high in the band, which is how a
+   * strip of empty conversation ends up between the answer controls and the
+   * keyboard's edge.
+   */
+  align?: "nearest" | "end";
+}
+
 const owners = new WeakMap<HTMLElement, CoordinatedScrollOwner>();
 
 /** The only automatic position writer for a managed scroller. */
 export class CoordinatedScrollOwner {
   private frame: number | null = null;
   private newContent = false;
+  private revealTarget: HTMLElement | null = null;
+  private revealOptions: RevealOptions | undefined;
+  private heldTarget: HTMLElement | null = null;
+  private heldOptions: RevealOptions | undefined;
+  private heldTop: number | null = null;
+  private resumeFollowing = false;
   private disposed = false;
   private previous: AnchorGeometry;
   private touchY: number | null = null;
@@ -67,6 +94,8 @@ export class CoordinatedScrollOwner {
   flush(timestamp: number): void {
     if (!this.active()) { this.cancel(); return; }
     if (this.lastCorrectionFrame === timestamp) { this.request(); return; }
+    // Retire stale DOM ownership before the anchor chooses this frame's top.
+    if (this.heldTarget && !this.scroller.contains(this.heldTarget)) this.release();
     if (this.frame !== null) this.cancelFrame(this.frame);
     this.frame = null;
     const geometry = this.measure();
@@ -81,7 +110,155 @@ export class CoordinatedScrollOwner {
     // Any later scroll echo belongs to this correction, not an earlier
     // wheel/key gesture whose native movement never arrived.
     this.upwardPending = false;
+    // After the anchor has had its say, so the reveal is the last word on
+    // where this frame leaves the scroller.
+    this.applyReveal(timestamp);
+    // Whatever this frame settled on — the anchor's correction, the reveal's
+    // refinement of it, or neither — is the position the hold now defends.
+    if (this.heldTarget) this.heldTop = this.scroller.scrollTop;
     this.options.onChange?.();
+  }
+
+  /**
+   * Bring an element inside the scroller's client box on the next coordinated
+   * frame. Focus is the caller here — a request's answer field under the
+   * software keyboard — and this owner is the only automatic position writer,
+   * so the alternative would be a raw `scrollIntoView` on a scroller it
+   * manages, which the anchor would then correct straight back.
+   */
+  reveal(element: HTMLElement, options?: RevealOptions): void {
+    if (!this.active()) return;
+    this.revealTarget = element;
+    this.revealOptions = options;
+    this.request();
+  }
+
+  /**
+   * Reveal the element and then keep it there: while a hold is in force, a
+   * scroll this owner did not write is undone on the next coordinated frame.
+   *
+   * A standing mode rather than `reveal(element, { hold: true })`: a reveal is
+   * consumed by the frame it is served in, a hold outlives it and has to be
+   * ended by name, so an option on the one-shot call would give the mode a
+   * beginning and no matching end. `overflow: hidden` or `touch-action: none`
+   * would be the platform's way to say the same thing, and WebKit's selection
+   * autoscroll honours neither — it moves the scroller while a caret is
+   * dragged near its edge regardless. This owner is already the only
+   * automatic position writer for the scroller, so defending a position it
+   * wrote is its own job rather than a new one.
+   */
+  hold(element: HTMLElement, options?: RevealOptions): void {
+    if (!this.active()) return;
+    if (!this.heldTarget) this.resumeFollowing = this.options.anchor.isPinned();
+    this.heldTarget = element;
+    // A hold ends at the bottom of the band unless its caller says otherwise:
+    // a held control is one the reader is typing into under a keyboard, and
+    // the band's bottom is the only place that is stable whether the platform
+    // scrolled the control too high or not at all.
+    this.heldOptions = { align: "end", ...options };
+    this.heldTop = null;
+    this.reveal(element, this.heldOptions);
+  }
+
+  /** Whether this exact, still-contained control owns the standing hold. */
+  isHolding(element: HTMLElement): boolean {
+    return this.heldTarget === element && this.scroller.contains(element);
+  }
+
+  /** End temporary answer positioning and resume only the original follow intent.
+   * Position writes still wait for a coordinated frame and its final geometry. */
+  release(): void {
+    const resume = this.resumeFollowing;
+    this.clearHold();
+    if (resume) {
+      this.options.anchor.jumpToLatest(this.options.measure(false));
+      this.request();
+      this.options.onChange?.();
+    }
+  }
+
+  private clearHold(): void {
+    this.resumeFollowing = false;
+    this.heldTarget = null;
+    this.heldOptions = undefined;
+    this.heldTop = null;
+    this.revealTarget = null;
+    this.revealOptions = undefined;
+  }
+
+  /**
+   * The minimal move that puts the target inside the client box, honouring
+   * the scroller's own scroll padding so a revealed control does not park
+   * under a floating overlay.
+   *
+   * A reveal that actually moves the scroller re-captures through the
+   * anchor's `pause()`: the reader was deliberately given this position, and
+   * an anchor left as it was — pinned to the end, or holding an item further
+   * up — would snap off it on the very next correction. `pause()` rather than
+   * `beforeMutation()` because unpinning is part of what must happen; it is
+   * the same treatment an upward gesture gets. A reveal that needs no move
+   * leaves the anchor alone, so following is not lost for nothing.
+   */
+  private applyReveal(timestamp: number): void {
+    if (this.heldTarget && !this.scroller.contains(this.heldTarget)) {
+      this.release();
+      return;
+    }
+    const target = this.revealTarget;
+    const options = this.revealOptions;
+    this.revealTarget = null;
+    this.revealOptions = undefined;
+    if (!target || !this.scroller.contains(target)) return;
+    const delta = this.revealDelta(target, options);
+    if (Math.abs(delta) < 0.5) return;
+    const limit = Math.max(0, this.scroller.scrollHeight - this.scroller.clientHeight);
+    const top = Math.max(0, Math.min(this.scroller.scrollTop + delta, limit));
+    if (Math.abs(this.scroller.scrollTop - top) <= 0.5) return;
+    this.lastCorrectionFrame = timestamp;
+    this.scroller.scrollTop = top;
+    const geometry = this.options.measure(true);
+    this.options.anchor.pause(geometry);
+    this.previous = geometry;
+    // The reveal is our own assignment, not a gesture awaiting native
+    // movement: its scroll echo must not be read as the reader moving.
+    this.upwardPending = false;
+  }
+
+  private revealDelta(target: HTMLElement, options?: RevealOptions): number {
+    if (typeof target.getBoundingClientRect !== "function") return 0;
+    const box = this.scroller.getBoundingClientRect();
+    const rect = target.getBoundingClientRect();
+    // The extent is placed with the target, as one block: for an answer field
+    // that is the field plus the row holding its submit and cancel controls.
+    let unionTop = rect.top;
+    let unionBottom = rect.bottom;
+    const extent = options?.extent;
+    if (extent && typeof extent.getBoundingClientRect === "function" && this.scroller.contains(extent)) {
+      const extra = extent.getBoundingClientRect();
+      unionTop = Math.min(unionTop, extra.top);
+      unionBottom = Math.max(unionBottom, extra.bottom);
+    }
+    // No computed style (or none declared) means no reserved band: 0.
+    const style = typeof getComputedStyle === "function" ? getComputedStyle(this.scroller) : null;
+    const padTop = Number.parseFloat(style?.scrollPaddingTop ?? "") || 0;
+    const padBottom = Number.parseFloat(style?.scrollPaddingBottom ?? "") || 0;
+    // While a request is answered the software keyboard covers the lower part
+    // of this scroller rather than shortening it, so its client box is not the
+    // band the reader can see. Revealing into the box alone would park the
+    // control under the keyboard — exactly where it must not be.
+    const visual = typeof window !== "undefined" ? window.visualViewport : null;
+    const visualBottom = visual ? visual.offsetTop + visual.height : Infinity;
+    const top = Math.max(box.top, visual?.offsetTop ?? -Infinity) + padTop;
+    const bottom = Math.min(box.top + this.scroller.clientHeight, visualBottom) - padBottom;
+    if (bottom <= top) return 0;
+    // A target taller than the band aligns to its top rather than scrolling
+    // its own top out of view to chase its bottom — under either rule, since
+    // showing the buttons by hiding the question answers nothing.
+    const taller = unionBottom - unionTop > bottom - top;
+    if (options?.align === "end") return taller ? unionTop - top : unionBottom - bottom;
+    if (unionTop < top) return unionTop - top;
+    if (unionBottom > bottom) return Math.min(unionBottom - bottom, unionTop - top);
+    return 0;
   }
 
   beforeMutation(preferredItemId?: string): void {
@@ -94,7 +271,11 @@ export class CoordinatedScrollOwner {
   /** Immediate positioning, on the next coordinated frame, never a smooth animation. */
   latest(): void {
     if (!this.active()) return;
+    this.clearHold();
     this.upwardPending = false;
+    // An explicit jump to the end outranks a reveal still waiting for a frame.
+    this.revealTarget = null;
+    this.revealOptions = undefined;
     this.options.anchor.jumpToLatest(this.options.measure(false));
     this.request();
     this.options.onChange?.();
@@ -106,6 +287,15 @@ export class CoordinatedScrollOwner {
     this.frame = null;
     this.newContent = false;
     this.upwardPending = false;
+    this.revealTarget = null;
+    this.revealOptions = undefined;
+    // A hold is transient input too: the gestures and teardowns that cancel
+    // pending work are the reader, or the surface, taking the scroller back.
+    // Cancelling a temporary hold restores its follow choice, but schedules
+    // nothing. pause() immediately replaces that choice with explicit intent.
+    const resume = this.resumeFollowing;
+    this.clearHold();
+    if (resume) this.options.anchor.jumpToLatest(this.options.measure(false));
     this.touchY = null;
   }
 
@@ -126,6 +316,19 @@ export class CoordinatedScrollOwner {
     const changedExtent = geometry.scrollHeight !== previous.scrollHeight || geometry.clientHeight !== previous.clientHeight;
     const movement = geometry.scrollTop < previous.scrollTop - 0.5 ? "up"
       : geometry.scrollTop > previous.scrollTop + 0.5 ? "down" : "none";
+    if (this.heldTarget) {
+      // The held control's position is the one this scroller has. A scroll we
+      // did not write — WebKit's autoscroll as the caret is dragged to the
+      // edge of the field, a stray pan — is undone on the next coordinated
+      // frame by re-running the reveal, which recomputes the minimal move for
+      // the held control, so it lands in view even when the content above it
+      // changed height in between. None of this speaks for the reader: a held
+      // scroll must not pause following or re-anchor.
+      const moved = this.heldTop === null || Math.abs(geometry.scrollTop - this.heldTop) > 0.5;
+      if (moved || changedExtent) this.reveal(this.heldTarget, this.heldOptions);
+      this.previous = geometry;
+      return;
+    }
     const bottom = Math.max(0, geometry.scrollHeight - geometry.clientHeight);
     const clamped = changedExtent && bottom < previous.scrollTop - 0.5 && Math.abs(geometry.scrollTop - bottom) <= 1;
     if (clamped) {
@@ -157,15 +360,30 @@ export class CoordinatedScrollOwner {
     }
     return false;
   }
+  /** A caret placement or selection drag inside a text control is not a request
+   * to move the conversation. */
+  private inTextControl(event: Event): boolean {
+    const target = event.target as Element | null;
+    const control = target?.closest?.("input, textarea, [contenteditable]");
+    if (!control) return false;
+    if (control.tagName === "TEXTAREA") return true;
+    if (control.tagName === "INPUT") return !["button", "checkbox", "color", "file", "hidden", "image", "radio", "range", "reset", "submit"]
+      .includes((control.getAttribute("type") ?? "text").toLowerCase());
+    return (control as HTMLElement).isContentEditable || ["", "true", "plaintext-only"].includes(control.getAttribute("contenteditable") ?? "false");
+  }
   private wheel = (event: WheelEvent): void => { if (event.deltaY < 0 && this.ownsInput(event)) this.pause(); };
-  private touchStart = (event: TouchEvent): void => { this.touchY = this.ownsInput(event) ? event.touches[0]?.clientY ?? null : null; };
+  private touchStart = (event: TouchEvent): void => {
+    this.touchY = this.ownsInput(event) && !this.inTextControl(event) ? event.touches[0]?.clientY ?? null : null;
+  };
   private touchMove = (event: TouchEvent): void => {
     const y = event.touches[0]?.clientY;
-    if (y !== undefined && this.touchY !== null && y > this.touchY && this.ownsInput(event)) this.pause();
+    if (y !== undefined && this.touchY !== null && y > this.touchY && this.ownsInput(event) && !this.inTextControl(event)) this.pause();
     this.touchY = y ?? null;
   };
   private keyDown = (event: KeyboardEvent): void => {
-    if (!this.ownsInput(event) || (event.target as Element).closest("input, textarea, select, [contenteditable=true]")) return;
+    // Choice controls consume navigation keys too (e.g. radio ArrowUp).
+    const target = event.target as Element | null;
+    if (!this.ownsInput(event) || target?.closest?.("input, textarea, select") || this.inTextControl(event)) return;
     if (["ArrowUp", "PageUp", "Home"].includes(event.key) || (event.key === " " && event.shiftKey)) this.pause();
   };
 

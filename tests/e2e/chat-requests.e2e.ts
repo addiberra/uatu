@@ -20,7 +20,29 @@ test("outstanding requests are counted, reachable, and clear at zero", async ({ 
   await openChatPanel(page);
   const id = seeded.conversation.id;
   const jump = page.locator("#chat-requests-jump");
+  const timeline = page.locator("#chat-timeline");
+  const target = page.locator('[data-chat-item-id="permission:p2"]');
+  // How much of the answerable card the timeline is actually showing. The
+  // pill's rule is about that band, not about the window, so a card clipped
+  // by the scroller is measured here rather than with toBeInViewport.
+  const shownHeight = () => timeline.evaluate(element => {
+    const card = element.querySelector('[data-chat-item-id="permission:p2"]')?.getBoundingClientRect();
+    if (!card) return -1;
+    const band = element.getBoundingClientRect();
+    return Math.max(0, Math.min(card.bottom, band.bottom) - Math.max(card.top, band.top));
+  });
   await expect(jump).toBeHidden();
+
+  // Transcript above the requests, so the newest one can be scrolled out of
+  // the band. Without it the conversation never scrolls and the two halves of
+  // the rule below cannot be told apart.
+  for (const i of [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]) {
+    const filler: ConversationItem = {
+      id: `part:filler-${i}`, type: "assistant_message", createdAt: i,
+      markdown: `Filler ${i}\n\n${"The renderer walked the tree and reported what it found. ".repeat(12)}`,
+    };
+    await request.post("/__e2e/chat", { data: { action: "item", conversationId: id, item: filler } });
+  }
 
   for (const i of [0, 1, 2]) {
     const item: ConversationItem = {
@@ -29,10 +51,29 @@ test("outstanding requests are counted, reachable, and clear at zero", async ({ 
     };
     await request.post("/__e2e/chat", { data: { action: "item", conversationId: id, item } });
   }
+
+  // The answerable request is on screen, so the pill has nothing to offer and
+  // yields — but it is still counting, which is the half of the report that
+  // answers "did I miss one?".
+  await expect(jump).toHaveText("3 requests need your answer");
+  await expect.poll(shownHeight).toBeGreaterThan(0);
+  await expect(jump).toBeHidden();
+  await expect(jump).toHaveText("3 requests need your answer");
+
+  // Scrolled off the card, the count is unchanged and the pill comes back as
+  // the way to reach it.
+  await expect.poll(() => timeline.evaluate(element => element.scrollHeight - element.clientHeight)).toBeGreaterThan(200);
+  await timeline.evaluate(element => {
+    element.scrollTop = 0;
+    element.dispatchEvent(new Event("scroll"));
+  });
+  await expect.poll(shownHeight).toBe(0);
+  await expect(jump).toBeVisible();
   await expect(jump).toHaveText("3 requests need your answer");
 
   await jump.click();
-  await expect(page.locator('[data-chat-item-id="permission:p2"]')).toBeInViewport();
+  await expect(target).toBeInViewport();
+  await expect.poll(shownHeight).toBeGreaterThan(0);
 
   for (const i of [0, 1, 2]) {
     await request.post("/__e2e/chat", { data: { action: "item", conversationId: id, item: {
@@ -40,7 +81,10 @@ test("outstanding requests are counted, reachable, and clear at zero", async ({ 
       action: "bash", resources: [`cmd-${i}`], status: "resolved", outcome: "approved-once",
     } } });
   }
+  // Zero is reported by the pill going away with nothing left to say — not by
+  // the same hiding the yield rule performs while a count still stands.
   await expect(jump).toBeHidden();
+  await expect(jump).toHaveText("");
 
   // Recovered requests can share a timestamp and arrive in provider order.
   // Admission breaks that tie by greatest id, not by whichever arrived last.
