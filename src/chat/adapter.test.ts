@@ -2114,9 +2114,15 @@ describe("prompt, abort, permission, and question mutations", () => {
     const stops: Array<{ sessionId: string; taskId: string }> = [];
     (provider as unknown as { stopTask: (sessionId: string, taskId: string) => Promise<void> }).stopTask = async (sessionId, taskId) => { stops.push({ sessionId, taskId }); };
     (provider as unknown as { listBackgroundTasks: () => Promise<unknown[]> }).listBackgroundTasks = async () => [
-      { conversationId: "session", taskId: "b1", description: "Sleep then echo", taskType: "local_bash", toolUseId: "toolu_1", startedAt: 5 },
+      { conversationId: "session", taskId: "b1", description: "Sleep then echo", taskType: "local_bash", toolUseId: "toolu_1", startedAt: 5, outputFile: "/tmp/claude-501/-w/s/tasks/b1.output" },
+      { conversationId: "session", taskId: "ada2", description: "Explore", taskType: "local_agent", toolUseId: "toolu_2", startedAt: 6, subagentType: "Explore", prompt: "look around", usage: { totalTokens: 10, toolUses: 1, durationMs: 100 }, childConversationId: "sub:session:ada2" },
       { conversationId: "other", taskId: "b2", description: "Elsewhere", startedAt: 6 },
     ];
+    const outputReads: Array<{ sessionId: string; taskId: string; tailBytes: number }> = [];
+    (provider as unknown as { taskOutput: (sessionId: string, taskId: string, options: { tailBytes: number }) => Promise<unknown> }).taskOutput = async (sessionId, taskId, options) => {
+      outputReads.push({ sessionId, taskId, tailBytes: options.tailBytes });
+      return taskId === "b1" ? { text: "so far", truncated: false, settled: false } : null;
+    };
     const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g" });
     const projection = adapter.projectionForTests("session");
     projection.statusUpdate("running");
@@ -2134,7 +2140,17 @@ describe("prompt, abort, permission, and question mutations", () => {
     // this conversation's only.
     const snapshot = await adapter.history("session");
     const tasks = snapshot.items.filter(item => item.type === "background_task");
-    expect(tasks).toEqual([expect.objectContaining({ id: "task:b1", status: "running", description: "Sleep then echo", toolUseId: "toolu_1", createdAt: 5 })]);
+    // The seeded rows carry the facts the live ones would have.
+    expect(tasks).toEqual([
+      expect.objectContaining({ id: "task:b1", status: "running", description: "Sleep then echo", toolUseId: "toolu_1", createdAt: 5, outputFile: "/tmp/claude-501/-w/s/tasks/b1.output" }),
+      expect.objectContaining({ id: "task:ada2", status: "running", subagentType: "Explore", prompt: "look around", usage: { totalTokens: 10, toolUses: 1, durationMs: 100 }, childConversationId: "sub:session:ada2" }),
+    ]);
+    // The output read reaches the provider for the owning session; a task
+    // with no output yet is null, not an error.
+    expect(await adapter.taskOutput("session", "b1", { tailBytes: 512 })).toEqual({ text: "so far", truncated: false, settled: false });
+    expect(await adapter.taskOutput("session", "ada2", { tailBytes: 512 })).toBeNull();
+    expect(outputReads).toEqual([{ sessionId: "session", taskId: "b1", tailBytes: 512 }, { sessionId: "session", taskId: "ada2", tailBytes: 512 }]);
+    await expect(adapter.taskOutput("missing", "b1", { tailBytes: 512 })).rejects.toBeInstanceOf(ConversationNotFoundError);
     await adapter.dispose();
   });
 
@@ -2273,6 +2289,7 @@ describe("prompt, abort, permission, and question mutations", () => {
     provider.sessions = [fixtureSession("session")];
     const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g" });
     await expect(adapter.stopTask("session", "b1", "req-1")).rejects.toBeInstanceOf(BackgroundTasksUnsupportedError);
+    await expect(adapter.taskOutput("session", "b1", { tailBytes: 512 })).rejects.toBeInstanceOf(BackgroundTasksUnsupportedError);
     await adapter.dispose();
   });
 
@@ -4798,10 +4815,50 @@ describe("workspace activity summary", () => {
     adapter.projectionForTests("a").apply({ kind: "status", status: "completed" });
     expect(adapter.activity()).toEqual({ working: true, awaiting: false });
     expect(changes()).toBe(1);
-    // Background work alone is not a turn in flight.
-    adapter.projectionForTests("b").apply({ kind: "status", status: "background" });
+    adapter.projectionForTests("b").apply({ kind: "status", status: "idle" });
     expect(adapter.activity()).toEqual({ working: false, awaiting: false });
     expect(changes()).toBe(2);
+  });
+
+  test("a turn that ends into live background work keeps the workspace working without a change", () => {
+    const { adapter, changes } = activityAdapter();
+    adapter.projectionForTests("a").apply({ kind: "status", status: "running" });
+    expect(adapter.activity()).toEqual({ working: true, awaiting: false });
+    expect(changes()).toBe(1);
+    // The turn ended but the agent still holds a backgrounded task: the
+    // summary reads the same, so nothing is reported.
+    adapter.projectionForTests("a").apply({ kind: "status", status: "background" });
+    expect(adapter.activity()).toEqual({ working: true, awaiting: false });
+    expect(changes()).toBe(1);
+  });
+
+  test("background work going quiet stops working with exactly one change", () => {
+    const { adapter, changes } = activityAdapter();
+    adapter.projectionForTests("a").apply({ kind: "status", status: "running" });
+    adapter.projectionForTests("a").apply({ kind: "status", status: "background" });
+    expect(changes()).toBe(1);
+    adapter.projectionForTests("a").apply({ kind: "status", status: "idle" });
+    expect(adapter.activity()).toEqual({ working: false, awaiting: false });
+    expect(changes()).toBe(2);
+  });
+
+  test("a conversation deleted while in background stops counting as working", async () => {
+    const { adapter, provider, changes } = activityAdapter();
+    const local = fixtureSession("a");
+    provider.sessions = [local];
+    const pump = adapter.startEventPump();
+    adapter.projectionForTests("a").apply({ kind: "status", status: "running" });
+    adapter.projectionForTests("a").apply({ kind: "status", status: "background" });
+    expect(adapter.activity()).toEqual({ working: true, awaiting: false });
+    const before = changes();
+    provider.sessions = [];
+    provider.eventQueue.push({ type: "session.deleted", data: { info: local } });
+    await waitUntil(() => changes() > before);
+    await Bun.sleep(20);
+    expect(adapter.activity()).toEqual({ working: false, awaiting: false });
+    expect(changes() - before).toBe(1);
+    await adapter.dispose();
+    await pump;
   });
 
   test("a pending permission or question awaits the user until it settles or is withdrawn", () => {

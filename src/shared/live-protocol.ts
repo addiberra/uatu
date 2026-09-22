@@ -151,7 +151,12 @@ export type LiveSubscriptionKey = { topic: LiveSubscribableTopic; key?: string }
 export type LiveSubscription = LiveSubscriptionKey & { cursor?: string };
 export type LiveSubscriptionChange = { add?: LiveSubscription[]; remove?: LiveSubscriptionKey[] };
 
-export type WorkspaceActivity = { running: boolean; working: boolean; awaiting: boolean };
+// Four facts per workspace. `running` is the hub's own; `working` and
+// `awaiting` are the child's; `finished` is composed at the hub per user —
+// work the hub observed running there went quiet and this user has not
+// viewed the workspace's chat since. A workspace that is not running is
+// never finished.
+export type WorkspaceActivity = { running: boolean; working: boolean; awaiting: boolean; finished: boolean };
 
 // The `worktrees` topic's whole payload. Deliberately content-free: it says
 // "this source workspace's worktree inventory may have changed", and the
@@ -313,7 +318,10 @@ export function parseLiveSubscriptionChange(value: unknown): LiveSubscriptionCha
 
 // Fixed shape, validated before fan-out: any other field is dropped so the
 // activity topic can never become a side channel for content. Not running
-// implies neither working nor awaiting.
+// implies neither working, awaiting, nor finished. A missing `finished` (an
+// older hub, or the child's two-fact summary before the hub composes it)
+// reads as false, so an old/new pairing degrades to the three-fact
+// behaviour rather than failing.
 export function sanitizeWorkspaceActivity(value: unknown): WorkspaceActivity {
   const record = (typeof value === "object" && value !== null ? value : {}) as Record<string, unknown>;
   const running = record.running === true;
@@ -321,6 +329,7 @@ export function sanitizeWorkspaceActivity(value: unknown): WorkspaceActivity {
     running,
     working: running && record.working === true,
     awaiting: running && record.awaiting === true,
+    finished: running && record.finished === true,
   };
 }
 

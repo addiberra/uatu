@@ -940,6 +940,26 @@ paths:
         '403': { $ref: '#/components/responses/Error' }
         '404': { $ref: '#/components/responses/Error' }
         '500': { $ref: '#/components/responses/Error' }
+  /s/{workspaceId}/api/activity-viewed:
+    parameters: [{ $ref: '#/components/parameters/WorkspaceId' }]
+    post:
+      operationId: hubAcknowledgeWorkspaceActivity
+      tags: [Hub]
+      summary: Report that the caller has the workspace's chat in view
+      description: |
+        Clears the `finished` fact the live stream's activity topic reports
+        for this workspace, for the calling user on every device. The Hub
+        answers it itself, without proxying to the workspace child, and
+        re-emits the user's activity summary when the fact changes. Other
+        users' summaries are unaffected. Idempotent: acknowledging a
+        workspace that is not finished changes nothing. The web client sends
+        it whenever the workspace's summary reads finished while its chat
+        surface is visible.
+      responses:
+        '204': { description: Acknowledged. No body. }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
   /api/hub/worktrees:
     get:
       operationId: hubListWorktrees

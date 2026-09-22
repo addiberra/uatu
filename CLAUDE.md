@@ -30,7 +30,12 @@ src/
 │                   ansi renders tool output as terminal text against the
 │                   terminal's palette; conversation-totals folds priced
 │                   usage carriers and task rows into the cost receipt, which
-│                   receipt-view itemizes by agent, type, or model);
+│                   receipt-view itemizes by agent, type, or model;
+│                   task-inspection drives the running-task drill-down —
+│                   an agent task's live child transcript, a shell task's
+│                   output tail; surface says whether the chat is the
+│                   surface in front, which the hub switcher's viewed
+│                   acknowledgement also reads);
 │                   agent-specific stacks below the seam in
 │                   chat/opencode/ (the loopback server runtime, which
 │                   decides the spawned server's generation from its

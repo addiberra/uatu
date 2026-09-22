@@ -240,11 +240,11 @@ function parseJson(text: string): unknown {
   }
 }
 
-const NOT_RUNNING: WorkspaceActivity = { running: false, working: false, awaiting: false };
-const RUNNING_UNKNOWN: WorkspaceActivity = { running: true, working: false, awaiting: false };
+const NOT_RUNNING: WorkspaceActivity = { running: false, working: false, awaiting: false, finished: false };
+const RUNNING_UNKNOWN: WorkspaceActivity = { running: true, working: false, awaiting: false, finished: false };
 
 function sameActivity(a: WorkspaceActivity, b: WorkspaceActivity): boolean {
-  return a.running === b.running && a.working === b.working && a.awaiting === b.awaiting;
+  return a.running === b.running && a.working === b.working && a.awaiting === b.awaiting && a.finished === b.finished;
 }
 
 // One user's activity feed: the set of that user's streams that asked for
@@ -261,6 +261,18 @@ class ActivityFeed {
 export class LiveBroker {
   private readonly upstreams = new Map<string, Upstream>();
   private readonly feeds = new Map<string, ActivityFeed>();
+  // The `finished` fact's ingredients, held at the broker rather than in a
+  // feed: a user's feed is discarded when their last page closes, and
+  // "switched away and came back later" is exactly the case the fact is
+  // for. `observed` is the last value the workspace's shared activity
+  // upstream delivered (whichever user's attachment saw it); `finishedAt`
+  // is stamped when that value goes from working to quiet; `viewedAt` is
+  // stamped per user by acknowledgeViewed. Stamps come from one broker
+  // counter, so a finish after the last view outranks it without clocks.
+  private readonly observed = new Map<string, WorkspaceActivity>();
+  private readonly finishedAt = new Map<string, number>();
+  private readonly viewedAt = new Map<string, Map<string, number>>();
+  private stamp = 0;
   private readonly lingerMs: number;
   private readonly replayBufferBytes: number;
   private readonly retryMinMs: number;
@@ -333,6 +345,22 @@ export class LiveBroker {
         feed.attachments.clear();
       },
     };
+  }
+
+  // The user has the workspace's chat in view: whatever finished there is
+  // seen. Re-derives that user's feed value alone — the mark and the other
+  // users' views are untouched — and emits only if it changed.
+  acknowledgeViewed(user: string, workspaceId: string): void {
+    let marks = this.viewedAt.get(user);
+    if (!marks) {
+      marks = new Map();
+      this.viewedAt.set(user, marks);
+    }
+    marks.set(workspaceId, this.nextStamp());
+    const feed = this.feeds.get(user);
+    const last = feed?.last.get(workspaceId);
+    if (!feed || !last) return;
+    this.setFeedValue(feed, workspaceId, this.composeActivity(user, workspaceId, last));
   }
 
   observeWorktrees(observer: WorktreeTopicObserver | null): void {
@@ -1001,6 +1029,11 @@ export class LiveBroker {
     upstream.catchUpOwner = null;
     if (this.upstreams.get(upstream.id) === upstream) this.upstreams.delete(upstream.id);
     if (upstream.topic === "worktrees") this.notifyWorktrees(observer => observer.interest(upstream.workspaceId, false));
+    // A finish is detected only between values one attached upstream
+    // delivered. Once the upstream is gone the next value has no
+    // predecessor: what happened while nobody watched is not invented from
+    // a stale last sight. The finished mark itself outlives the upstream.
+    if (upstream.topic === "activity") this.observed.delete(upstream.workspaceId);
     const metricTopic = childUpstreamTopic(upstream.topic);
     if (released && upstream.counted && metricTopic) this.metrics.released(metricTopic);
   }
@@ -1022,6 +1055,9 @@ export class LiveBroker {
         this.fail(upstream, "unreachable");
       }
     }
+    // Here rather than only in refreshFeed: a stop with no feed open must
+    // still clear the marks, or a later page would inherit them.
+    if (!change.running) this.forgetMarks(change.workspaceId);
     for (const [user, feed] of this.feeds) this.refreshFeed(user, feed);
   }
 
@@ -1043,25 +1079,40 @@ export class LiveBroker {
       feed.attachments.get(workspaceId)?.detach();
       feed.attachments.delete(workspaceId);
     }
+    // Marks for a workspace the registry no longer names: forgotten here,
+    // since the registry announces nothing on its own.
+    for (const workspaceId of [...this.finishedAt.keys(), ...this.observed.keys()]) {
+      if (!known.has(workspaceId)) this.forgetMarks(workspaceId);
+    }
     for (const workspaceId of known) {
       const running = this.source.isRunning(workspaceId);
       if (!running) {
         feed.attachments.get(workspaceId)?.detach();
         feed.attachments.delete(workspaceId);
+        this.forgetMarks(workspaceId);
         this.setFeedValue(feed, workspaceId, NOT_RUNNING);
         continue;
       }
       if (feed.attachments.has(workspaceId)) continue;
-      // Running, activity not yet known: the dot shows, the badge waits.
-      this.setFeedValue(feed, workspaceId, RUNNING_UNKNOWN);
+      // Running, activity not yet known: the dot shows, the badge waits —
+      // unless a finish is already on record for this user, which a
+      // re-created feed must show at once.
+      this.setFeedValue(feed, workspaceId, this.composeActivity(user, workspaceId, RUNNING_UNKNOWN));
       const sink: LiveSink = {
         write: envelope => {
           if (this.feeds.get(user) !== feed) return;
           switch (envelope.event.kind) {
-            case "data":
-              this.setFeedValue(feed, workspaceId, sanitizeWorkspaceActivity(envelope.event.data));
+            case "data": {
+              const facts = sanitizeWorkspaceActivity(envelope.event.data);
+              this.observeActivity(workspaceId, facts);
+              // Explicitly for this feed too: attachSink replays the
+              // upstream's latest frame before the attachment is recorded,
+              // so observeActivity's sweep does not see this feed yet.
+              this.setFeedValue(feed, workspaceId, this.composeActivity(user, workspaceId, facts));
               return;
+            }
             case "unavailable":
+              this.forgetMarks(workspaceId);
               this.setFeedValue(feed, workspaceId, NOT_RUNNING);
               return;
             case "ready":
@@ -1071,6 +1122,60 @@ export class LiveBroker {
         },
       };
       feed.attachments.set(workspaceId, this.attachSink(sink, workspaceId, "activity", undefined, undefined));
+    }
+  }
+
+  // One upstream value, seen through some user's attachment. The transition
+  // is judged against the workspace-level `observed`, never against a feed's
+  // last value: the upstream is shared, so a second user's fresh attachment
+  // replays the latest frame and must not read that replay as a change. The
+  // facts are the same for every user, so every feed holding the workspace
+  // is re-derived; the per-user part is only `viewedAt`.
+  private observeActivity(workspaceId: string, activity: WorkspaceActivity): void {
+    const previous = this.observed.get(workspaceId);
+    this.observed.set(workspaceId, activity);
+    if (activity.working || activity.awaiting) {
+      // Work resumed, or an interaction awaits: whatever finished before
+      // is superseded by what the user will look at now.
+      this.finishedAt.delete(workspaceId);
+    } else if (previous?.working && !previous.awaiting) {
+      // Working → quiet. Not from unknown (a page opening onto an idle
+      // workspace invents nothing), not from awaiting (the answer was given
+      // from somewhere the user was looking — a pending question keeps the
+      // turn in flight, so "working and awaiting" is the awaiting case).
+      this.finishedAt.set(workspaceId, this.nextStamp());
+    }
+    for (const [user, feed] of this.feeds) {
+      if (!feed.attachments.has(workspaceId)) continue;
+      this.setFeedValue(feed, workspaceId, this.composeActivity(user, workspaceId, activity));
+    }
+  }
+
+  private composeActivity(user: string, workspaceId: string, facts: WorkspaceActivity): WorkspaceActivity {
+    const quiet = facts.running && !facts.working && !facts.awaiting;
+    const finishedAt = this.finishedAt.get(workspaceId);
+    const viewedAt = this.viewedAt.get(user)?.get(workspaceId) ?? -Infinity;
+    return {
+      running: facts.running,
+      working: facts.working,
+      awaiting: facts.awaiting,
+      finished: quiet && finishedAt !== undefined && finishedAt > viewedAt,
+    };
+  }
+
+  private nextStamp(): number {
+    this.stamp += 1;
+    return this.stamp;
+  }
+
+  // The workspace stopped, lost its child, or left the registry: nothing it
+  // did before is finished any more, and nobody's view of it needs keeping.
+  private forgetMarks(workspaceId: string): void {
+    this.observed.delete(workspaceId);
+    this.finishedAt.delete(workspaceId);
+    for (const [user, marks] of this.viewedAt) {
+      marks.delete(workspaceId);
+      if (marks.size === 0) this.viewedAt.delete(user);
     }
   }
 

@@ -36,7 +36,11 @@ export function composerRoutineState(input: {
   // stall; a compaction in progress shows as compacting).
   if (status === "retrying") return { stateName: "retrying", label: input.statusMessage ? `Retrying (${input.statusMessage})` : "Retrying" };
   if (status === "compacting") return { stateName: "compacting", label: statusLabel(status) };
-  if (status === "background" && input.backgroundDeclared) return { stateName: "background", label: backgroundStatusLabel(input.backgroundTasks) };
+  // The background state is the list's state: the status is raised because a
+  // task is running and is only lowered when the agent says the turn moved on,
+  // so between a task settling and that word the status would name background
+  // work with no task left to name. An empty list falls back to ready.
+  if (status === "background" && input.backgroundDeclared && input.backgroundTasks.length > 0) return { stateName: "background", label: backgroundStatusLabel(input.backgroundTasks) };
   // Nothing runs, but the session is held for the agent's own future turns
   // (spec: the composer names the state, the pending count, and the next fire).
   if (status === "scheduled" && input.scheduledDeclared) return { stateName: "scheduled", label: scheduledStatusLabel(input.scheduledWakeups ?? [], input.now) };

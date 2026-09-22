@@ -13,6 +13,7 @@ import { ConversationReplay, type ReplaySubscription } from "./replay";
 import { ProviderTextReconciler } from "./text-reconciler";
 import { isLiveConversationStatus } from "./types";
 import type {
+  BackgroundTaskOutput,
   ChatActivity,
   ChatAgent,
   ChatMode,
@@ -266,6 +267,12 @@ export class ChatAdapter {
   // survives projection eviction. This is what distinguishes "the store says
   // running because OpenCode died mid-turn" from "running right now".
   private readonly liveTurns = new Set<string>();
+  // Conversations holding live background work (`background` status) with no
+  // turn in flight. Kept apart from liveTurns on purpose: liveTurns gates the
+  // composer's Cancel and held prompts, and a background conversation must
+  // still accept a prompt — while the hub's activity summary, by spec, counts
+  // live background work as working.
+  private readonly backgroundWork = new Set<string>();
   // Pending permission and question item ids per conversation, adapter-level
   // like liveTurns: a conversation blocked on the user goes quiet and is
   // exactly the one an LRU pass evicts, and its request must still count.
@@ -745,12 +752,13 @@ export class ChatAdapter {
 
   /**
    * This agent's slice of the workspace activity summary: whether any
-   * conversation has a turn in flight, and whether any permission request or
-   * question awaits the user. Read from the adapter-level records, never from
-   * the provider, so it is cheap enough to answer on every change.
+   * conversation has a turn in flight or live background work, and whether
+   * any permission request or question awaits the user. Read from the
+   * adapter-level records, never from the provider, so it is cheap enough to
+   * answer on every change.
    */
   activity(): ChatActivity {
-    return { working: this.liveTurns.size > 0, awaiting: this.pendingInteractions.size > 0 };
+    return { working: this.liveTurns.size > 0 || this.backgroundWork.size > 0, awaiting: this.pendingInteractions.size > 0 };
   }
 
   pendingNotifications() { return this.notifications.pendingSnapshot(); }
@@ -803,6 +811,7 @@ export class ChatAdapter {
     }
     this.notifications.forgetConversation(conversationId);
     this.liveTurns.delete(conversationId);
+    this.backgroundWork.delete(conversationId);
     this.forgetInteractions(conversationId);
   }
 
@@ -1704,6 +1713,17 @@ export class ChatAdapter {
     }));
   }
 
+  /**
+   * The output a task has produced so far: a read, not a mutation, so no
+   * receipt. Gated like stop — only an agent with background work can be
+   * asked — and the provider decides whether this task has an output file.
+   */
+  async taskOutput(conversationId: string, taskId: string, options: { tailBytes: number }): Promise<BackgroundTaskOutput | null> {
+    await this.requireSession(conversationId);
+    if (!this.provider.taskOutput || !this.provider.describe().capabilities.includes("background-tasks")) throw new BackgroundTasksUnsupportedError();
+    return this.provider.taskOutput(conversationId, taskId, options);
+  }
+
   respondQuestion(conversationId: string, requestId: string, clientRequestId: string, outcome: QuestionOutcome): Promise<{ outcome: QuestionOutcome }> {
     return this.receipts.run(`question:${conversationId}:${requestId}:${clientRequestId}`, async () => {
       const session = await this.requireSession(conversationId);
@@ -2463,6 +2483,11 @@ export class ChatAdapter {
           ...(task.taskType === undefined ? {} : { taskType: task.taskType }),
           ...(task.toolUseId === undefined ? {} : { toolUseId: task.toolUseId }),
           status: "running" as const,
+          ...(task.subagentType === undefined ? {} : { subagentType: task.subagentType }),
+          ...(task.prompt === undefined ? {} : { prompt: task.prompt }),
+          ...(task.usage === undefined ? {} : { usage: task.usage }),
+          ...(task.outputFile === undefined ? {} : { outputFile: task.outputFile }),
+          ...(task.childConversationId === undefined ? {} : { childConversationId: task.childConversationId }),
         }));
     } catch {
       return null;
@@ -2734,6 +2759,10 @@ export class ChatAdapter {
       // but the conversation accepts a prompt. Retrying and compacting are.
       if (isLiveConversationStatus(status)) this.liveTurns.add(id);
       else this.liveTurns.delete(id);
+      // Background work still counts as working for the workspace summary,
+      // through its own set so the composer rules above stay untouched.
+      if (status === "background") this.backgroundWork.add(id);
+      else this.backgroundWork.delete(id);
       // A turn that ended on its own releases the next held message. Only
       // these two: an interruption leaves the queue dormant by decision, and
       // a failure must not restart a failing conversation by itself.

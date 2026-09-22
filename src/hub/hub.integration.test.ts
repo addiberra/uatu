@@ -2928,6 +2928,13 @@ describe("hub end to end", () => {
     const unknownPersonal = await fetch(`${origin}/s/no-such-workspace/api/personal-state`, { headers: { cookie } });
     expect(unknownPersonal.status).toBe(404);
     await assertContract("GET", "/s/{workspaceId}/api/personal-state", unknownPersonal);
+    // So is the activity acknowledgement: 204 with no body, 404 unknown.
+    const viewed = await fetch(`${origin}/s/myproject/api/activity-viewed`, { method: "POST", headers: { cookie, origin } });
+    expect(viewed.status).toBe(204);
+    await assertContract("POST", "/s/{workspaceId}/api/activity-viewed", viewed);
+    const unknownViewed = await fetch(`${origin}/s/no-such-workspace/api/activity-viewed`, { method: "POST", headers: { cookie, origin } });
+    expect(unknownViewed.status).toBe(404);
+    await assertContract("POST", "/s/{workspaceId}/api/activity-viewed", unknownViewed);
     const unknownPatch = await fetch(`${origin}/s/no-such-workspace/api/personal-state`, {
       method: "PATCH",
       headers: { "content-type": "application/json", cookie, origin },

@@ -9,6 +9,9 @@ beforeAll(() => {
 });
 
 const { QueueDockRenderer, RevertedMessagesDockRenderer, TimelineRenderer, materializeChatActivity, awaitingFirstResponse, formatElapsed, subagentEntries, workingLabel } = await import("./timeline-renderer");
+// The track's one-line summary reads the same entries, so what the entries
+// say about a running run is checked where the entries are built.
+const { subagentTrackSummary } = await import("./receipt-view");
 
 test("closed activity defers its body and find materializes current sanitized content", () => {
   const previousFilter = Reflect.get(globalThis, "NodeFilter");
@@ -1050,6 +1053,46 @@ describe("subagent entries", () => {
     const [entry] = subagentEntries([task("c", { status: "running", model: "gpt-5" })]);
     expect(entry).toEqual(expect.objectContaining({ status: "running", model: "gpt-5" }));
     expect(entry).not.toHaveProperty("usage");
+  });
+
+  test("a running subagent takes its child id and progress note from the task that runs it", () => {
+    // The launching row learns its child only from the tool result, at the
+    // end; the background task names it from the start edge, keyed by the
+    // tool use that launched it.
+    const running: ConversationItem = {
+      id: "task:ada2b", type: "background_task", createdAt: 2, taskId: "ada2b", description: "Review renderer", taskType: "local_agent",
+      toolUseId: "d", status: "running", childConversationId: "sub:parent:ada2b", progress: "Reading the renderer tests", subagentType: "explore",
+    };
+    const [entry] = subagentEntries([task("d", { status: "running" }), running]);
+    expect(entry).toEqual({ id: "tool:d", description: "Review renderer", subagent: "explore", status: "running", conversationId: "sub:parent:ada2b", progress: "Reading the renderer tests" });
+    // Once the row has its own child id it is the one that counts; a settled
+    // task no longer supplies a progress note.
+    const [settled] = subagentEntries([task("d", { childConversationId: "sub:parent:ada2b" }), { ...running, status: "completed", summary: "done" }]);
+    expect(settled).toEqual({ id: "tool:d", description: "Review renderer", subagent: "explore", status: "completed", conversationId: "sub:parent:ada2b" });
+    expect(settled).not.toHaveProperty("progress");
+    // A task launched by some other tool use says nothing about this row.
+    const [unrelated] = subagentEntries([task("d", { status: "running" }), { ...running, toolUseId: "other" }]);
+    expect(unrelated).not.toHaveProperty("conversationId");
+    expect(unrelated).not.toHaveProperty("progress");
+  });
+
+  test("a backgrounded subagent reads as running while its task runs, though its launching row completed at launch", () => {
+    // The async AgentOutput arrives with `status: "async_launched"`, so the
+    // launching row is `completed` seconds into a run that may last minutes.
+    // Read from the row alone the track would announce the live run finished.
+    const running: ConversationItem = {
+      id: "task:ada2b9582caa230c5", type: "background_task", createdAt: 2, taskId: "ada2b9582caa230c5", description: "Review renderer",
+      taskType: "local_agent", toolUseId: "e", status: "running", childConversationId: "sub:parent:ada2b9582caa230c5",
+      progress: "Counting files in the working tree", subagentType: "general-purpose",
+    };
+    const launched = task("e", { status: "completed", childConversationId: "sub:parent:ada2b9582caa230c5", output: "Async agent launched successfully." });
+    const [entry] = subagentEntries([launched, running]);
+    expect(entry).toEqual(expect.objectContaining({ id: "tool:e", status: "running", conversationId: "sub:parent:ada2b9582caa230c5", progress: "Counting files in the working tree" }));
+    expect(subagentTrackSummary(subagentEntries([launched, running]))).toBe("1 of 1 subagent working · Review renderer");
+    // Once the task settles the row speaks for itself again.
+    const [settled] = subagentEntries([launched, { ...running, status: "completed", summary: "done" }]);
+    expect(settled.status).toBe("completed");
+    expect(settled).not.toHaveProperty("progress");
   });
 
   test("a long completed report renders spanning Markdown once behind a visual bound", () => {

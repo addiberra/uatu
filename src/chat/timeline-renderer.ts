@@ -511,6 +511,10 @@ export type SubagentEntry = {
   conversationId?: string;
   model?: string;
   usage?: TokenUsage;
+  // The agent's latest progress note for a still-running subagent, from the
+  // background task that runs it. Absent once settled, or where the agent
+  // reports none.
+  progress?: string;
 };
 
 export function subagentLabel(entry: SubagentEntry): string {
@@ -523,19 +527,38 @@ export function subagentLabel(entry: SubagentEntry): string {
  * so every item counts — a fan-out of three is three entries.
  */
 export function subagentEntries(items: readonly ConversationItem[]): SubagentEntry[] {
+  // The running task behind each launching row, by the tool use that launched
+  // it. The task item knows the child from its start edge — the launching row
+  // only learns it from the tool result, at the end — so while the run is
+  // going, the task is what makes the row openable and names its progress.
+  const runningTasks = new Map<string, Extract<ConversationItem, { type: "background_task" }>>();
+  for (const item of items) {
+    if (item.type === "background_task" && item.status === "running" && item.toolUseId) runningTasks.set(`tool:${item.toolUseId}`, item);
+  }
   const entries: SubagentEntry[] = [];
   for (const item of items) {
     if (item.type !== "tool") continue;
     const detail = describeToolDetail(item);
     if (detail.kind !== "agent") continue;
+    const task = runningTasks.get(item.id);
+    const conversationId = detail.conversationId ?? task?.childConversationId;
+    // A live task outranks the launching row's own status. A backgrounded
+    // Agent's tool result arrives at LAUNCH (`status: "async_launched"`), so
+    // the row completes while the agent is still working — read literally it
+    // would announce a running subagent as finished. The task row is the one
+    // that knows the run is still going, so while it runs the entry reads as
+    // running and carries the agent's latest progress note. A settled task,
+    // or none at all, leaves the row to speak for itself.
+    const progress = task?.progress;
     entries.push({
       id: item.id,
       description: detail.description,
       ...(detail.subagent === undefined ? {} : { subagent: detail.subagent }),
-      status: item.status,
-      ...(detail.conversationId === undefined ? {} : { conversationId: detail.conversationId }),
+      status: task ? "running" : item.status,
+      ...(conversationId === undefined ? {} : { conversationId }),
       ...(item.model === undefined ? {} : { model: item.model }),
       ...(item.usage === undefined ? {} : { usage: item.usage }),
+      ...(progress === undefined ? {} : { progress }),
     });
   }
   return entries;

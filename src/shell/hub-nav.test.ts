@@ -275,7 +275,7 @@ describe("parseHubState", () => {
       { ...summary("missing", true), availability: "missing" },
       { ...summary("replaced", true), availability: "replaced" },
     ] })!;
-    const activity = new Map(state.workspaces.map(row => [row.id, { running: true, working: true, awaiting: false }]));
+    const activity = new Map(state.workspaces.map(row => [row.id, { running: true, working: true, awaiting: false, finished: false }]));
     expect(state.workspaces.map(row => workspaceMenuState(row, activity)?.text)).toEqual(["Missing checkout", "Identity conflict"]);
   });
 
@@ -395,7 +395,7 @@ describe("submitHubSignOut", () => {
 });
 
 describe("switcher activity", () => {
-  const facts = (running: boolean, working = false, awaiting = false) => ({ running, working, awaiting });
+  const facts = (running: boolean, working = false, awaiting = false, finished = false) => ({ running, working, awaiting, finished });
 
   test("a question in another workspace badges the chip; agents merely working are a quieter note; the current workspace never counts", () => {
     const list = [summary("uatu", true), summary("two", true), summary("three", true)];
@@ -427,20 +427,51 @@ describe("switcher activity", () => {
     expect(switcherBadge([], activity, "uatu")).toBeNull();
   });
 
+  test("finished work elsewhere badges the chip below awaiting and above working; the current workspace never counts", () => {
+    const list = [summary("uatu", true), summary("two", true), summary("three", true), summary("four", true)];
+    const activity = new Map([
+      ["uatu", facts(true, false, false, true)],
+      ["two", facts(true, true, false)],
+      ["three", facts(true, false, false, true)],
+      ["four", facts(true, false, true)],
+    ]);
+    // All three present: awaiting wins.
+    expect(switcherBadge(list, activity, "uatu")).toEqual({ kind: "awaiting", count: 1 });
+    // Answered: finished outranks the working dot.
+    activity.set("four", facts(true, true, false));
+    expect(switcherBadge(list, activity, "uatu")).toEqual({ kind: "finished", count: 1 });
+    activity.set("two", facts(true, false, false, true));
+    expect(switcherBadge(list, activity, "uatu")).toEqual({ kind: "finished", count: 2 });
+    // Viewed: back to the quieter note. The current workspace's own finish
+    // is never a badge — the user is looking at it.
+    activity.set("two", facts(true));
+    activity.set("three", facts(true));
+    expect(switcherBadge(list, activity, "uatu")).toEqual({ kind: "working", count: 1 });
+    activity.set("four", facts(true));
+    expect(switcherBadge(list, activity, "uatu")).toBeNull();
+    // A stopped workspace cannot be finished, whatever stale facts say.
+    activity.set("three", facts(false, false, false, true));
+    expect(switcherBadge(list, activity, "uatu")).toBeNull();
+  });
+
   test("the badge is spoken, never colour alone", () => {
     expect(switcherBadgeLabel({ kind: "awaiting", count: 1 })).toBe("1 workspace awaiting your reply");
     expect(switcherBadgeLabel({ kind: "awaiting", count: 2 })).toBe("2 workspaces awaiting your reply");
+    expect(switcherBadgeLabel({ kind: "finished", count: 1 })).toBe("Work finished in 1 workspace");
+    expect(switcherBadgeLabel({ kind: "finished", count: 3 })).toBe("Work finished in 3 workspaces");
     expect(switcherBadgeLabel({ kind: "working", count: 1 })).toBe("Agents working in 1 workspace");
     expect(switcherBadgeLabel(null)).toBe("");
   });
 
-  test("menu entries name stopped, awaiting, and working; idle running entries stay quiet", () => {
-    const activity = new Map([["a", facts(true, true, true)], ["b", facts(true, true, false)], ["c", facts(true)]]);
+  test("menu entries name stopped, awaiting, working, and finished; idle running entries stay quiet", () => {
+    const activity = new Map([["a", facts(true, true, true)], ["b", facts(true, true, false)], ["c", facts(true)], ["e", facts(true, false, false, true)]]);
     expect(workspaceMenuState(summary("a", true), activity)).toEqual({ text: "awaiting you", tone: "awaiting" });
     expect(workspaceMenuState(summary("b", true), activity)).toEqual({ text: "working", tone: "working" });
     expect(workspaceMenuState(summary("c", true), activity)).toBeNull();
     expect(workspaceMenuState(summary("d", true), activity)).toBeNull();
+    expect(workspaceMenuState(summary("e", true), activity)).toEqual({ text: "finished", tone: "finished" });
     expect(workspaceMenuState(summary("a", false), activity)).toEqual({ text: "stopped", tone: "stopped" });
+    expect(workspaceMenuState(summary("e", false), activity)).toEqual({ text: "stopped", tone: "stopped" });
   });
 
   test("an activity update folds its running fact into the hub list without touching other entries", () => {
@@ -494,7 +525,7 @@ describe("initHubNav with the live activity topic", () => {
       }
       return Response.json({ error: "unexpected" }, { status: 404 });
     });
-    let deliver: ((ws: string, activity: { running: boolean; working: boolean; awaiting: boolean }) => void) | null = null;
+    let deliver: ((ws: string, activity: { running: boolean; working: boolean; awaiting: boolean; finished?: boolean }) => void) | null = null;
     installLiveChannelForTests({
       onActivity(listener: typeof deliver) { deliver = listener; return () => {}; },
       onStreamOpened() { return () => {}; },
@@ -541,6 +572,19 @@ describe("initHubNav with the live activity topic", () => {
     expect(toggle.getAttribute("aria-label")).toBe("Switch workspace or open the hub dashboard");
     expect(entryState()).toBeNull();
 
+    // Work finished there unviewed: an accent count pill, the entry named,
+    // and the spoken form on the chip. Viewed from another device: gone.
+    deliver!("two", { running: true, working: false, awaiting: false, finished: true });
+    expect(badge.hidden).toBe(false);
+    expect(badge.className).toBe("hub-activity-badge is-finished");
+    expect(badge.textContent).toBe("1");
+    expect(toggle.getAttribute("aria-label")).toContain("Work finished in 1 workspace");
+    expect(entryState()).toBe("finished");
+    expect([...menu.querySelectorAll<HTMLElement>(".hub-menu-state.is-finished")]).toHaveLength(1);
+    deliver!("two", { running: true, working: false, awaiting: false, finished: false });
+    expect(badge.hidden).toBe(true);
+    expect(entryState()).toBeNull();
+
     // The current workspace stopping elsewhere turns the chip's dot off —
     // and, the list still saying it runs, asks the list once more (one
     // read here; the schedule is the reconcile test's concern).
@@ -564,7 +608,7 @@ describe("initHubNav with the live activity topic", () => {
     expect(badge.textContent).toBe("1");
   });
 
-  type Facts = { running: boolean; working: boolean; awaiting: boolean };
+  type Facts = { running: boolean; working: boolean; awaiting: boolean; finished: boolean };
   type Workspace = { id: string; displayName: string; path: string; running: boolean };
   type FakeStream = {
     closed: boolean;
@@ -576,10 +620,10 @@ describe("initHubNav with the live activity topic", () => {
     addEventListener(type: string, listener: (event: Event) => void): void;
     close(): void;
   };
-  const idle: Facts = { running: true, working: false, awaiting: false };
-  const working: Facts = { running: true, working: true, awaiting: false };
-  const awaiting: Facts = { running: true, working: true, awaiting: true };
-  const stopped: Facts = { running: false, working: false, awaiting: false };
+  const idle: Facts = { running: true, working: false, awaiting: false, finished: false };
+  const working: Facts = { running: true, working: true, awaiting: false, finished: false };
+  const awaiting: Facts = { running: true, working: true, awaiting: true, finished: false };
+  const stopped: Facts = { running: false, working: false, awaiting: false, finished: false };
   const workspace = (id: string, displayName: string, running = true): Workspace =>
     ({ id, displayName, path: `/src/${id}`, running });
   const waitFor = async (condition: () => boolean) => {
@@ -1120,7 +1164,7 @@ describe("initHubNav with the live activity topic", () => {
       if (gate) await gate;
       return answer;
     });
-    let deliver: ((ws: string, activity: { running: boolean; working: boolean; awaiting: boolean }) => void) | null = null;
+    let deliver: ((ws: string, activity: { running: boolean; working: boolean; awaiting: boolean; finished?: boolean }) => void) | null = null;
     installLiveChannelForTests({
       onActivity(listener: typeof deliver) { deliver = listener; return () => {}; },
       onStreamOpened() { return () => {}; },
@@ -1217,6 +1261,137 @@ describe("initHubNav with the live activity topic", () => {
 // Items A and E of the 2026-09-19 live-test decisions: the selector says
 // which repository the current checkout belongs to, groups the menu by
 // repository, and labels a checkout Uatu did not create for what it is.
+describe("the viewed acknowledgement", () => {
+  const savedGlobals = new Map<string, unknown>();
+  const setGlobal = (key: string, value: unknown) => {
+    if (!savedGlobals.has(key)) savedGlobals.set(key, Reflect.get(globalThis, key));
+    Reflect.set(globalThis, key, value);
+  };
+
+  afterEach(() => {
+    disposeLiveChannel();
+    installLiveChannelForTests(null);
+    resetCurrentSessionRunningForTests();
+    for (const [key, value] of savedGlobals) Reflect.set(globalThis, key, value);
+    savedGlobals.clear();
+    resetAppBasePathForTests();
+  });
+
+  type Facts = { running: boolean; working: boolean; awaiting: boolean; finished: boolean };
+  const idle: Facts = { running: true, working: false, awaiting: false, finished: false };
+  const working: Facts = { running: true, working: true, awaiting: false, finished: false };
+  const finished: Facts = { running: true, working: false, awaiting: false, finished: true };
+
+  // A session page at /s/uatu/ whose hub probe answers (or, without a hub,
+  // 404s), recording every POST the switcher makes.
+  async function mountPage(options: { hub?: boolean } = {}) {
+    const html = await Bun.file(`${import.meta.dir}/../index.html`).text();
+    const { document, window } = parseHTML(html);
+    const meta = document.createElement("meta");
+    meta.setAttribute("name", "uatu-base-path");
+    meta.setAttribute("content", "/s/uatu/");
+    document.head.appendChild(meta);
+    let visibility = "visible";
+    Object.defineProperty(document, "visibilityState", { get: () => visibility, configurable: true });
+    setGlobal("document", document);
+    setGlobal("window", window);
+    setGlobal("Node", (window as unknown as Record<string, unknown>).Node);
+    resetAppBasePathForTests();
+
+    const posts: string[] = [];
+    let probes = 0;
+    setGlobal("fetch", async (url: string, init?: RequestInit) => {
+      if (url === "/api/hub/state") {
+        probes += 1;
+        if (options.hub === false) return Response.json({ error: "not a hub" }, { status: 404 });
+        return Response.json({ workspaces: [
+          { id: "uatu", displayName: "Uatu", path: "/src/uatu", running: true },
+          { id: "two", displayName: "Payments", path: "/src/two", running: true },
+        ] });
+      }
+      if (init?.method === "POST") {
+        posts.push(url);
+        return new Response(null, { status: 204 });
+      }
+      return Response.json({ error: "unexpected" }, { status: 404 });
+    });
+    let deliver: ((ws: string, activity: Facts) => void) | null = null;
+    installLiveChannelForTests({
+      onActivity(listener: typeof deliver) { deliver = listener; return () => {}; },
+      onStreamOpened() { return () => {}; },
+      dispose() {},
+    } as unknown as LiveChannel);
+    initHubNav();
+    for (let attempt = 0; attempt < 100 && probes === 0; attempt += 1) await Bun.sleep(1);
+    await Bun.sleep(2);
+    return {
+      document,
+      posts,
+      deliver: (ws: string, facts: Facts) => deliver!(ws, facts),
+      delivered: () => deliver !== null,
+      chatInView: (open: boolean) => document.documentElement.setAttribute("data-chat-panel", open ? "open" : "collapsed"),
+      hide: () => { visibility = "hidden"; },
+      surfaceActive: () => document.dispatchEvent(new window.Event("uatu:chat-surface-active")),
+      // Lets the POST's promise chain settle, as the page would between
+      // the hub's 204 and the next activity update.
+      settle: () => Bun.sleep(2),
+    };
+  }
+
+  test("posts once when this workspace reads finished while the chat is in view, and not again until the state cycles", async () => {
+    const page = await mountPage();
+    page.chatInView(true);
+    page.deliver("uatu", finished);
+    expect(page.posts).toEqual(["/s/uatu/api/activity-viewed"]);
+    // Neither a repeat of the same fact nor the surface cue posts again.
+    page.deliver("uatu", finished);
+    page.surfaceActive();
+    await page.settle();
+    expect(page.posts).toHaveLength(1);
+    // The hub's answer clears it; work runs and finishes once more: posted
+    // again.
+    page.deliver("uatu", idle);
+    page.deliver("uatu", working);
+    page.deliver("uatu", finished);
+    expect(page.posts).toHaveLength(2);
+  });
+
+  test("an idle workspace, another workspace's finish, and a hidden chat post nothing; the surface coming into view posts", async () => {
+    const page = await mountPage();
+    page.chatInView(true);
+    page.deliver("uatu", idle);
+    page.deliver("uatu", working);
+    page.deliver("two", finished);
+    page.surfaceActive();
+    expect(page.posts).toEqual([]);
+    // The chat panel is collapsed: the user cannot see the chat.
+    page.chatInView(false);
+    page.deliver("uatu", finished);
+    expect(page.posts).toEqual([]);
+    // Opening the panel is the cue.
+    page.chatInView(true);
+    page.surfaceActive();
+    expect(page.posts).toEqual(["/s/uatu/api/activity-viewed"]);
+  });
+
+  test("a hidden page never posts, whatever the panel says", async () => {
+    const page = await mountPage();
+    page.chatInView(true);
+    page.hide();
+    page.deliver("uatu", finished);
+    page.surfaceActive();
+    expect(page.posts).toEqual([]);
+  });
+
+  test("a page without a hub never posts", async () => {
+    const page = await mountPage({ hub: false });
+    page.document.documentElement.setAttribute("data-chat-panel", "open");
+    page.surfaceActive();
+    expect(page.delivered()).toBe(false);
+    expect(page.posts).toEqual([]);
+  });
+});
+
 describe("repository identity around the workspace selector", () => {
   const atlas = {
     id: "atlas", displayName: "atlas", path: "/src/atlas", running: true,

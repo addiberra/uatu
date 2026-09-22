@@ -1021,6 +1021,30 @@ function buildChatRoutes(deps: BuildRoutesDeps, p: (path: string) => string) {
         return run(() => deps.chatService.release(id, requestId));
       }),
     },
+    // The output a shell task has written so far, as a bounded tail. A read
+    // (no CSRF gate) that names only the task: the child reads the path the
+    // agent reported for it, never one the client supplies. 404 until the
+    // agent has named where the output goes.
+    [p("/api/chat/conversations/:conversationId/tasks/:taskId/output")]: {
+      GET: async (request: RouteRequest) => {
+        const rejected = authenticated(request);
+        if (rejected) return rejected;
+        const id = routeIdentity(request, "conversationId");
+        if (id instanceof Response) return id;
+        const taskId = routeIdentity(request, "taskId");
+        if (taskId instanceof Response) return taskId;
+        const rawTail = new URL(request.url).searchParams.get("tail");
+        const tail = rawTail === null ? TASK_OUTPUT_TAIL_DEFAULT_BYTES : Number(rawTail);
+        if (!Number.isInteger(tail) || tail < 1) return chatError(400, "invalid tail");
+        const tailBytes = Math.min(tail, TASK_OUTPUT_TAIL_MAX_BYTES);
+        try {
+          const output = await deps.chatService.taskOutput(id, taskId, { tailBytes });
+          return output ? Response.json(output, { headers: { "cache-control": "no-store" } }) : chatError(404, "task output is not available");
+        } catch (error) {
+          return normalizedChatError(error);
+        }
+      },
+    },
     [p("/api/chat/conversations/:conversationId/questions/:interactionId")]: {
       POST: async (request: RouteRequest) => chatMutation(request, ["requestId", "outcome"], async (id, body) => {
         const interactionId = routeIdentity(request, "interactionId");
@@ -1208,6 +1232,11 @@ function nextChatEvent<T>(
     });
   });
 }
+
+// How much of a task's output one read returns: enough for a scrolled
+// pane, never the whole file of a chatty command.
+const TASK_OUTPUT_TAIL_DEFAULT_BYTES = 16 * 1024;
+const TASK_OUTPUT_TAIL_MAX_BYTES = 64 * 1024;
 
 function chatError(status: number, error: string): Response {
   return Response.json({ error }, { status, headers: { "cache-control": "no-store" } });

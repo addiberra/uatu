@@ -1,9 +1,10 @@
 import { describe, expect, test } from "bun:test";
 
 import { backgroundStatusLabel, runningBackgroundTasks } from "./background-tasks";
-import type { ConversationItem } from "./types";
+import { taskInspection } from "./task-inspection";
+import type { BackgroundTaskItem, ConversationItem } from "./types";
 
-const task = (taskId: string, status: "running" | "completed" | "failed" | "stopped", description = `Task ${taskId}`): ConversationItem => ({
+const task = (taskId: string, status: "running" | "completed" | "failed" | "stopped", description = `Task ${taskId}`): BackgroundTaskItem => ({
   id: `task:${taskId}`, type: "background_task", createdAt: 1, taskId, description, status,
 });
 
@@ -19,5 +20,24 @@ describe("background work in the composer", () => {
     // A background state reported without a listed task still says what
     // the conversation is doing, without inventing a count.
     expect(backgroundStatusLabel([])).toBe("Background work running");
+  });
+
+  test("every listed row is inspectable: an agent task opens its child transcript, a shell task its output", () => {
+    const items: ConversationItem[] = [
+      { ...task("agent", "running", "Review the renderer"), taskType: "local_agent", childConversationId: "sub:parent:agent", subagentType: "explore" },
+      { ...task("shell", "running", "bun test"), taskType: "local_bash", outputFile: "/tmp/tasks/shell.output" },
+      // An agent whose child is not yet named still opens: as a task view,
+      // since there is no transcript to ask for.
+      { ...task("early", "running", "Search the docs"), taskType: "local_agent" },
+      task("done", "completed"),
+    ];
+    const rows = runningBackgroundTasks(items).map(entry => [entry.taskId, taskInspection(entry)]);
+    expect(rows).toEqual([
+      ["agent", { view: "transcript", conversationId: "sub:parent:agent" }],
+      ["shell", { view: "output" }],
+      ["early", { view: "output" }],
+    ]);
+    // A settled task has left the list, and is not inspectable from it.
+    expect(taskInspection(task("done", "completed"))).toBeUndefined();
   });
 });

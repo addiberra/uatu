@@ -801,9 +801,10 @@ html.uatu-desktop-host
 
 /* Other workspaces' live activity (hub-nav's activity consumer). In the
    menu, the state column names it; on the collapsed chip, a badge summarizes
-   it — a warm count pill when an interaction awaits the user, a quiet accent
-   dot while agents merely work — so the two never read alike. The chip
-   button's aria-label carries the same words. */
+   it — a warm count pill when an interaction awaits the user, an accent
+   count pill when work finished unviewed, a quiet accent dot while agents
+   merely work — so the three read as three levels. The chip button's
+   aria-label carries the same words. */
 .hub-menu-item .hub-menu-state.is-awaiting {
   color: var(--attention);
   font-weight: 600;
@@ -811,6 +812,11 @@ html.uatu-desktop-host
 
 .hub-menu-item .hub-menu-state.is-working {
   color: var(--accent);
+}
+
+.hub-menu-item .hub-menu-state.is-finished {
+  color: var(--accent);
+  font-weight: 400;
 }
 
 .hub-activity-badge {
@@ -836,6 +842,22 @@ html.uatu-desktop-host
   border-radius: 999px;
   background: var(--notice-warn-bg);
   color: var(--attention);
+  font-size: 0.68rem;
+  font-weight: 700;
+}
+
+/* The finished pill shares the awaiting pill's box, so the chip does not
+   change height as one badge gives way to the other; only the tone differs,
+   and it never pulses — nothing is waiting on the user. */
+.hub-activity-badge.is-finished {
+  min-width: 1.15rem;
+  height: 1.15rem;
+  margin-block: -0.25rem;
+  padding: 0 0.35rem;
+  border: 1px solid var(--accent);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--accent);
   font-size: 0.68rem;
   font-weight: 700;
 }
@@ -5924,6 +5946,122 @@ html[data-ui-mode="desktop"][data-notification-chat] .chat-expand-strip {
   border-radius: 0;
 }
 
+/* The running-task strip under the drill-down header: what the task is and
+   the Stop control on the first line, its live facts on the second. It reads
+   as part of the header — same raised surface — because it describes the
+   layer, not an entry in it. */
+.chat-drilldown-task {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  padding: 0.4rem 0.75rem;
+  border-bottom: 1px solid var(--border-soft);
+  background: var(--surface-raised);
+  font-size: 0.8125em;
+}
+
+.chat-drilldown-task[hidden] {
+  display: none;
+}
+
+.chat-drilldown-task-line {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  min-width: 0;
+}
+
+.chat-drilldown-task-description {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-strong);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-drilldown-task-type {
+  flex: 0 0 auto;
+  color: var(--text-subtle);
+  font-family: var(--mono-font-family);
+  font-size: 0.9em;
+}
+
+/* Elapsed leads because it is the one fact every task has; the progress note
+   takes the slack and truncates, the spend keeps its figures whole. */
+.chat-drilldown-task-facts {
+  display: flex;
+  align-items: baseline;
+  gap: 0.6rem;
+  min-width: 0;
+  color: var(--text-subtle);
+}
+
+.chat-drilldown-task-elapsed,
+.chat-drilldown-task-usage {
+  flex: 0 0 auto;
+  font-variant-numeric: tabular-nums;
+}
+
+.chat-drilldown-task-progress,
+.chat-drilldown-task-settled {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-drilldown-task.is-settled .chat-drilldown-task-settled {
+  color: var(--text-muted, inherit);
+}
+
+/* A shell task's output pane, in the timeline's place: the tail of the file
+   as a scrolling block in the terminal's face, with the trimmed note above
+   it so the reader knows the top is not the start. */
+.chat-drilldown-output {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.chat-drilldown-output[hidden] {
+  display: none;
+}
+
+.chat-drilldown-output-note {
+  flex: 0 0 auto;
+  margin: 0;
+  padding: 0.35rem 0.75rem;
+  color: var(--text-subtle);
+  font-size: 0.8125em;
+}
+
+.chat-drilldown-output-note[hidden] {
+  display: none;
+}
+
+.chat-drilldown-output-text {
+  flex: 1 1 auto;
+  min-height: 0;
+  margin: 0;
+  padding: 0.6rem 0.75rem;
+  overflow: auto;
+  overscroll-behavior: contain;
+  font-family: var(--mono-font-family);
+  font-size: 0.8125em;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.chat-drilldown-output-text:focus-visible {
+  outline: none;
+  box-shadow: inset 0 0 0 2px var(--accent);
+}
+
 /* The rail and the Latest button read the parent's timeline, which the child
    is covering — they would be pointing at content that is not on screen. The
    request pill is the opposite case: it is how the parent stays answerable,
@@ -9091,6 +9229,19 @@ html[data-ui-mode="touch"] .chat-task-list {
   white-space: nowrap;
 }
 
+/* What a running subagent is doing now, between the description and the
+   attribution: it yields first, since the row still leads with the task. */
+.chat-subagent-progress {
+  flex: 0 1 auto;
+  overflow: hidden;
+  min-width: 0;
+  max-width: 45%;
+  color: var(--text-subtle);
+  font-size: 0.85em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .chat-subagent-attribution {
   flex: 0 0 auto;
   overflow: hidden;
@@ -9197,6 +9348,33 @@ html[data-ui-mode="touch"][data-chat-answering] #chat-drilldown-timeline {
 .chat-background-task-progress {
   color: var(--text-subtle);
   font-size: 0.9em;
+}
+
+/* The elapsed readout stands in for the progress note a shell task never
+   reports: fixed width so the second hand does not shuffle the row. */
+.chat-background-task-elapsed {
+  flex: 0 0 auto;
+  font-variant-numeric: tabular-nums;
+}
+
+/* A running task's description is the way into its transcript or output:
+   a button in the row's own words, underlined like the subagent rows. */
+.chat-background-task-inspect {
+  border: 0;
+  padding: 0;
+  min-height: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  text-decoration: underline;
+  text-decoration-color: var(--border-medium);
+}
+
+.chat-background-task-inspect:hover,
+.chat-background-task-inspect:focus-visible {
+  text-decoration-color: var(--accent);
 }
 
 .chat-task-stop {

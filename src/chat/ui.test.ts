@@ -25,7 +25,10 @@ if (process.env[CHILD_PROCESS_FLAG] !== "1") {
         child.exited,
       ]);
       expect(exitCode, `${stdout}\n${stderr}`).toBe(0);
-    });
+      // The child runs this whole file, including a case that waits on the
+      // surface's one-second clock; the default five seconds leaves it no
+      // room, and a timeout here reports as the wrong test failing.
+    }, 30_000);
   });
 } else {
 describe("chat reversible-history composer", () => {
@@ -1554,6 +1557,163 @@ describe("chat outstanding-request pill", () => {
     }
   });
 });
+
+describe("chat running-task inspection", () => {
+  const runningAgentItems = () => [
+    { id: "message:u", type: "user_message", createdAt: 1, text: "review the renderer" },
+    {
+      id: "tool:toolu_1", type: "tool", createdAt: 2, name: "task", status: "running",
+      input: JSON.stringify({ description: "Review renderer", subagent_type: "explore", prompt: "go" }),
+    },
+    {
+      id: "task:ada2b", type: "background_task", createdAt: 2, taskId: "ada2b", description: "Review renderer", taskType: "local_agent",
+      toolUseId: "toolu_1", status: "running", childConversationId: "child", subagentType: "explore", progress: "Reading the tests",
+      usage: { totalTokens: 13_122, toolUses: 1, durationMs: 4_000 },
+    },
+  ];
+
+  test("a running agent task's row and its subagents-track row open the child transcript under a strip that stops the task", async () => {
+    const { document, window } = parseHTML(html);
+    installDomGlobals(document, window);
+    document.documentElement.setAttribute("data-ui-mode", "desktop");
+    document.documentElement.setAttribute("data-chat-panel", "open");
+    stubConversationSelect(document);
+    const stops: string[] = [];
+    const api = taskApi(document, { items: id => id === "one" ? runningAgentItems() : [{ id: "message:c", type: "assistant_message", createdAt: 3, markdown: "Looking at the tests" }], stop: taskId => { stops.push(taskId); } });
+    const drilldown = document.querySelector<HTMLElement>("#chat-drilldown")!;
+    const strip = document.querySelector<HTMLElement>("#chat-drilldown-task")!;
+    const click = (element: Element) => element.dispatchEvent(new window.Event("click", { bubbles: true }) as unknown as Event);
+    try {
+      const { initChat } = await import(`./ui.ts?task-inspection-agent-ui-test=${Date.now()}`);
+      initChat(api);
+      const inspect = () => document.querySelector<HTMLButtonElement>('#chat-background-tasks [data-inspect-task="ada2b"]');
+      await waitUntil(() => inspect() != null, () => document.querySelector("#chat-background-tasks")?.textContent ?? "no task list");
+      expect(inspect()!.dataset.inspectView).toBe("transcript");
+      // The subagents track already offers the running run, with its progress.
+      const trackRow = document.querySelector<HTMLButtonElement>('#chat-subagents [data-open-conversation="child"]')!;
+      expect(trackRow).not.toBeNull();
+      expect(document.querySelector("#chat-subagents .chat-subagent-progress")?.textContent).toBe("Reading the tests");
+
+      click(inspect()!);
+      expect(drilldown.hidden).toBe(false);
+      expect(document.querySelector("#chat-drilldown-timeline")!.hasAttribute("hidden")).toBe(false);
+      expect(document.querySelector("#chat-drilldown-output")!.hasAttribute("hidden")).toBe(true);
+      expect(document.querySelector("#chat-drilldown-title")?.textContent).toBe("explore · Review renderer");
+      expect(strip.hidden).toBe(false);
+      expect(strip.querySelector(".chat-drilldown-task-description")?.textContent).toBe("Review renderer");
+      expect(strip.querySelector(".chat-drilldown-task-type")?.textContent).toBe("explore");
+      expect(strip.querySelector(".chat-drilldown-task-progress")?.textContent).toBe("Reading the tests");
+      expect(strip.querySelector(".chat-drilldown-task-usage")?.textContent).toBe("13k tokens · 1 tool use");
+      expect(strip.querySelector("[data-task-elapsed]")?.textContent).toMatch(/^\d+:\d\d(:\d\d)?$/);
+      await waitUntil(() => document.querySelector("#chat-drilldown-items")?.textContent?.includes("Looking at the tests") ?? false, () => document.querySelector("#chat-drilldown-state")?.textContent ?? "no child");
+
+      // Stop from the strip goes through the one stop path and holds the control.
+      click(strip.querySelector('[data-stop-task="ada2b"]')!);
+      expect(stops).toEqual(["ada2b"]);
+      expect(strip.querySelector<HTMLButtonElement>("[data-stop-task]")!.disabled).toBe(true);
+
+      click(document.querySelector<HTMLButtonElement>("#chat-drilldown-back")!);
+      expect(drilldown.hidden).toBe(true);
+      expect(strip.hidden).toBe(true);
+
+      // The track row leads to the same transcript with the same strip.
+      click(document.querySelector<HTMLButtonElement>('#chat-subagents [data-open-conversation="child"]')!);
+      expect(drilldown.hidden).toBe(false);
+      expect(strip.hidden).toBe(false);
+      expect(strip.dataset.taskId).toBe("ada2b");
+      click(document.querySelector<HTMLButtonElement>("#chat-drilldown-back")!);
+    } finally {
+      await Bun.sleep(20);
+      window.dispatchEvent(new Event("pagehide"));
+    }
+  });
+
+  test("a running shell task's row opens the output view in the drill-down and reads the task's output", async () => {
+    const { document, window } = parseHTML(html);
+    installDomGlobals(document, window);
+    document.documentElement.setAttribute("data-ui-mode", "desktop");
+    document.documentElement.setAttribute("data-chat-panel", "open");
+    stubConversationSelect(document);
+    const outputs: Array<[string, string]> = [];
+    const snapshots: string[] = [];
+    const api = taskApi(document, {
+      items: () => [
+        { id: "message:u", type: "user_message", createdAt: 1, text: "run the tests" },
+        { id: "task:bgjpa", type: "background_task", createdAt: 2, taskId: "bgjpa", description: "bun test", taskType: "local_bash", toolUseId: "toolu_2", status: "running", outputFile: "/tmp/tasks/bgjpa.output" },
+      ],
+      output: (conversationId, taskId) => { outputs.push([conversationId, taskId]); return { text: "1 pass\n", truncated: false, settled: false }; },
+      onSnapshot: id => { snapshots.push(id); },
+    });
+    const drilldown = document.querySelector<HTMLElement>("#chat-drilldown")!;
+    const click = (element: Element) => element.dispatchEvent(new window.Event("click", { bubbles: true }) as unknown as Event);
+    try {
+      const { initChat } = await import(`./ui.ts?task-inspection-shell-ui-test=${Date.now()}`);
+      initChat(api);
+      const inspect = () => document.querySelector<HTMLButtonElement>('#chat-background-tasks [data-inspect-task="bgjpa"]');
+      await waitUntil(() => inspect() != null, () => document.querySelector("#chat-background-tasks")?.textContent ?? "no task list");
+      expect(inspect()!.dataset.inspectView).toBe("output");
+      // A shell task reports no progress at all, so the elapsed readout is
+      // the row's only live signal (D6) — without it the row says nothing
+      // about the task between launch and settle.
+      const elapsed = document.querySelector<HTMLElement>('#chat-background-tasks [data-background-task="bgjpa"] .chat-background-task-elapsed');
+      expect(elapsed).not.toBeNull();
+      expect(elapsed!.textContent).toMatch(/^\d+:\d\d(:\d\d)?$/);
+      expect(elapsed!.dataset.elapsedSince).toBe("2");
+      // And it ticks: the row is rebuilt only when what it SAYS changes, so a
+      // readout painted once would stand still for the whole run. The clock
+      // is the working lines' own second tick, which the background state has
+      // to keep alive even though the turn has ended.
+      const firstReading = elapsed!.textContent;
+      for (let attempt = 0; attempt < 12 && elapsed!.textContent === firstReading; attempt += 1) await Bun.sleep(200);
+      expect(elapsed!.textContent).not.toBe(firstReading);
+      const snapshotsBefore = snapshots.length;
+
+      click(inspect()!);
+      expect(drilldown.hidden).toBe(false);
+      expect(document.querySelector("#chat-drilldown-title")?.textContent).toBe("bun test");
+      expect(document.querySelector("#chat-drilldown-timeline")!.hasAttribute("hidden")).toBe(true);
+      expect(document.querySelector("#chat-drilldown-output")!.hasAttribute("hidden")).toBe(false);
+      expect(document.querySelector("#chat-drilldown-task [data-stop-task]")).not.toBeNull();
+      await waitUntil(() => document.querySelector("#chat-drilldown-output-text")?.textContent === "1 pass\n", () => document.querySelector("#chat-drilldown-output-note")?.textContent ?? "no output");
+      expect(outputs).toEqual([["one", "bgjpa"]]);
+      // No transcript was asked for: the view is the task's, not a child's.
+      expect(snapshots.length).toBe(snapshotsBefore);
+
+      click(document.querySelector<HTMLButtonElement>("#chat-drilldown-back")!);
+      expect(drilldown.hidden).toBe(true);
+      expect(document.querySelector("#chat-drilldown-timeline")!.hasAttribute("hidden")).toBe(false);
+      expect(document.querySelector("#chat-drilldown-output")!.hasAttribute("hidden")).toBe(true);
+    } finally {
+      await Bun.sleep(20);
+      window.dispatchEvent(new Event("pagehide"));
+    }
+  });
+});
+
+function taskApi(document: Document, options: {
+  items: (conversationId: string) => unknown[];
+  stop?: (taskId: string) => void;
+  output?: (conversationId: string, taskId: string) => { text: string; truncated: boolean; settled: boolean } | null;
+  onSnapshot?: (conversationId: string) => void;
+}): ChatApiClient {
+  return {
+    status: async () => ([{
+      agent: { id: "test", name: "Test" },
+      availability: { state: "ready", version: "test", agent: { id: "test", name: "Test", capabilities: ["background-tasks", "subagents"] } },
+    }]),
+    conversations: async () => [{ ...conversation("one"), status: "background" }],
+    commands: async () => [],
+    snapshot: async (id: string) => {
+      options.onSnapshot?.(id);
+      return { ...snapshot(id), conversation: { ...conversation(id), status: id === "one" ? "background" : "running" }, items: options.items(id) };
+    },
+    stream: () => ({ close() {} }),
+    inventoryStream: () => ({ close() {} }),
+    attachmentUrl: (id: string) => `/api/chat/attachments/${id}`,
+    stopTask: async (_conversationId: string, taskId: string) => { options.stop?.(taskId); await new Promise(() => {}); },
+    taskOutput: async (conversationId: string, taskId: string) => options.output?.(conversationId, taskId) ?? null,
+  } as unknown as ChatApiClient;
+}
 
 afterAll(() => {
   for (const [key, value] of savedGlobals) Reflect.set(globalThis, key, value);

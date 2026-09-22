@@ -5,7 +5,7 @@ import { ConversationReplay, encodeReplayCursor } from "../chat/replay";
 import { AttachmentStoreError, sniffImageMime, type StoredAttachment } from "../chat/attachment-store";
 import { ConversationInventoryBroadcaster } from "../chat/inventory-broadcaster";
 import type { WorkspaceChatService } from "../chat/service";
-import { isLiveConversationStatus, type AgentUsageReport, type UsageReadMode, type UsageReadResult, type ChatActivity, type ChatAvailability, type ConversationSnapshot, type ConversationStatus, type ConversationSummary, type MessageAttachment, type ModelSelection, type PermissionOutcome, type QuestionOutcome, type ReversibleHistoryResult } from "../chat/types";
+import { isLiveConversationStatus, type AgentUsageReport, type BackgroundTaskOutput, type UsageReadMode, type UsageReadResult, type ChatActivity, type ChatAvailability, type ConversationSnapshot, type ConversationStatus, type ConversationSummary, type MessageAttachment, type ModelSelection, type PermissionOutcome, type QuestionOutcome, type ReversibleHistoryResult } from "../chat/types";
 import { ConversationNotFoundError } from "../chat/workspace";
 import { ConversationRenameUnsupportedError, QueuedMessageNotHeldError, ReversibleHistoryUnsupportedError, ScheduledWakeupsUnsupportedError } from "../chat/adapter";
 import { ReversibleHistoryTargetError, InvalidQuestionAnswerError, ReleaseUnavailableError, ScheduledWakeupUnavailableError } from "../chat/provider";
@@ -189,6 +189,15 @@ class FakeChatService implements WorkspaceChatService {
     this.require(id);
     this.released.push(id);
     return { released: true as const };
+  }
+  // What each task's output read returns, keyed by task id; the tail asked
+  // for is recorded so the route's clamp can be asserted.
+  taskOutputs = new Map<string, BackgroundTaskOutput>();
+  taskOutputReads: Array<{ taskId: string; tailBytes: number }> = [];
+  async taskOutput(id: string, taskId: string, options: { tailBytes: number }) {
+    this.require(id);
+    this.taskOutputReads.push({ taskId, tailBytes: options.tailBytes });
+    return this.taskOutputs.get(taskId) ?? null;
   }
   private require(id: string) { if (id !== "local") throw new ConversationNotFoundError(); }
 }
@@ -818,6 +827,33 @@ describe("workspace chat routes", () => {
     expect((await send({})).status).toBe(400);
     service.cancelWakeup = async () => { throw new ScheduledWakeupUnavailableError("that wakeup is no longer scheduled"); };
     expect((await send({ requestId: crypto.randomUUID() })).status).toBe(409);
+  });
+
+  test("reads a task's output tail through the chat service, clamps the tail, and answers 404 until a path is known", async () => {
+    const service = new FakeChatService();
+    const handler = routes(service)["/api/chat/conversations/:conversationId/tasks/:taskId/output"] as {
+      GET(request: Request & { params: Record<string, string> }): Promise<Response>;
+    };
+    const read = (taskId: string, query = "") => handler.GET(request(`/api/chat/conversations/opencode:local/tasks/${taskId}/output${query}`, {}, { conversationId: "opencode:local", taskId }) as never);
+    service.taskOutputs.set("bgjpa5uwy", { text: "spike-done\n[exited with code 0]", truncated: false, settled: false });
+    const response = await read("bgjpa5uwy");
+    expect(response.status).toBe(200);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    expect(await response.json()).toEqual({ text: "spike-done\n[exited with code 0]", truncated: false, settled: false });
+    // Default tail, an explicit one, and one clamped to the route's maximum.
+    await read("bgjpa5uwy", "?tail=4096");
+    await read("bgjpa5uwy", "?tail=10000000");
+    expect(service.taskOutputReads.map(entry => entry.tailBytes)).toEqual([16 * 1024, 4096, 64 * 1024]);
+    for (const bad of ["?tail=0", "?tail=-5", "?tail=abc", "?tail=1.5"]) expect((await read("bgjpa5uwy", bad)).status).toBe(400);
+    // Unknown task, or output not yet named: 404, not an empty tail.
+    const missing = await read("nope");
+    expect(missing.status).toBe(404);
+    expect(await missing.json()).toEqual({ error: "task output is not available" });
+    // A read needs the child credential like every other read.
+    const unauthenticated = await handler.GET(Object.assign(new Request("http://127.0.0.1:4711/api/chat/conversations/opencode:local/tasks/bgjpa5uwy/output"), { params: { conversationId: "opencode:local", taskId: "bgjpa5uwy" } }) as never);
+    expect(unauthenticated.status).toBe(401);
+    // An unknown conversation is the service's 404.
+    expect((await handler.GET(request("/api/chat/conversations/opencode:other/tasks/bgjpa5uwy/output", {}, { conversationId: "opencode:other", taskId: "bgjpa5uwy" }) as never)).status).toBe(404);
   });
 
   test("rejects empty and whitespace-only question answers before calling the service", async () => {

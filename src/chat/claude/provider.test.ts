@@ -320,10 +320,99 @@ describe("background tasks and tool progress normalize into in-place rows (D8)",
     const started = normalizeClaudeMessage({ type: "system", subtype: "task_started", uuid: "ts1", timestamp: at(0), task_id: "b2f6", tool_use_id: "toolu_1", description: "Sleep for 8 seconds then echo done", task_type: "local_bash", is_backgrounded: true }, memory, "live");
     expect(started.outcome).toBe("handled");
     expect(started.updates).toEqual([{ kind: "upsert", item: { id: "task:b2f6", type: "background_task", createdAt: Date.parse(at(0)), taskId: "b2f6", description: "Sleep for 8 seconds then echo done", taskType: "local_bash", toolUseId: "toolu_1", status: "running" } }]);
+    // A shell task reports no progress in practice (spike); should an edge
+    // arrive anyway, its usage is kept but the last tool is never the
+    // progress line — the reader sees elapsed time instead.
     const progress = normalizeClaudeMessage({ type: "system", subtype: "task_progress", uuid: "tp1", timestamp: at(3), task_id: "b2f6", description: "Sleep for 8 seconds then echo done", usage: { total_tokens: 0, tool_uses: 1, duration_ms: 3000 }, last_tool_name: "Bash" }, memory, "live");
-    expect(progress.updates[0]).toEqual({ kind: "upsert", item: expect.objectContaining({ id: "task:b2f6", createdAt: Date.parse(at(0)), status: "running", progress: "Using Bash" }) });
+    expect(progress.updates[0]).toEqual({ kind: "upsert", item: expect.objectContaining({ id: "task:b2f6", createdAt: Date.parse(at(0)), status: "running", usage: { totalTokens: 0, toolUses: 1, durationMs: 3000 } }) });
+    expect((progress.updates[0] as { item: object }).item).not.toHaveProperty("progress");
     const notified = normalizeClaudeMessage({ type: "system", subtype: "task_notification", uuid: "tn1", timestamp: at(8), task_id: "b2f6", tool_use_id: "toolu_1", status: "completed", output_file: "/tmp/out", summary: "done" }, memory, "live");
-    expect(notified.updates[0]).toEqual({ kind: "upsert", item: { id: "task:b2f6", type: "background_task", createdAt: Date.parse(at(0)), taskId: "b2f6", description: "Sleep for 8 seconds then echo done", taskType: "local_bash", toolUseId: "toolu_1", status: "completed", summary: "done" } });
+    expect(notified.updates[0]).toEqual({ kind: "upsert", item: { id: "task:b2f6", type: "background_task", createdAt: Date.parse(at(0)), taskId: "b2f6", description: "Sleep for 8 seconds then echo done", taskType: "local_bash", toolUseId: "toolu_1", status: "completed", summary: "done", usage: { totalTokens: 0, toolUses: 1, durationMs: 3000 }, outputFile: "/tmp/out" } });
+  });
+
+  // The frames below are the spike's (spike-background-tasks.md, probes a2
+  // and b), shapes verbatim.
+  const spikeOutputFile = "/private/tmp/claude-501/-private-tmp-uatu-spike-work/57489e13/tasks/ada2b9582caa230c5.output";
+  const spikePrompt = "List the files in the current directory and count them.";
+
+  test("a backgrounded agent task carries its type, prompt, child id, usage, and progress summary from the edges", () => {
+    const memory = createClaudeEventMemory();
+    normalizeClaudeMessage({ type: "assistant", uuid: "a1", timestamp: at(0), message: { role: "assistant", model: "claude-haiku-4-5-20251001", content: [{ type: "tool_use", id: "toolu_013s2jZsDCiw3cAHYTqFeSpc", name: "Agent", input: { description: "List files and count them", prompt: spikePrompt, run_in_background: true } }] } }, memory, "live", "57489e13");
+    const started = normalizeClaudeMessage({ type: "system", subtype: "task_started", uuid: "ts1", timestamp: at(0), task_id: "ada2b9582caa230c5", tool_use_id: "toolu_013s2jZsDCiw3cAHYTqFeSpc", description: "List files and count them", subagent_type: "general-purpose", is_backgrounded: true, spawn_depth: 1, task_type: "local_agent", prompt: spikePrompt }, memory, "live", "57489e13");
+    // The task id is the agent id (D8): the child is addressable at start —
+    // by the task row and, from the same edge, by the row that launched it.
+    expect(started.updates).toEqual([
+      { kind: "upsert", item: expect.objectContaining({ id: "tool:toolu_013s2jZsDCiw3cAHYTqFeSpc", name: "Agent", status: "running", childConversationId: "sub:57489e13:ada2b9582caa230c5" }) },
+      { kind: "upsert", item: { id: "task:ada2b9582caa230c5", type: "background_task", createdAt: Date.parse(at(0)), taskId: "ada2b9582caa230c5", description: "List files and count them", taskType: "local_agent", toolUseId: "toolu_013s2jZsDCiw3cAHYTqFeSpc", status: "running", subagentType: "general-purpose", prompt: spikePrompt, childConversationId: "sub:57489e13:ada2b9582caa230c5" } },
+    ]);
+    // The async AgentOutput is complete at launch: the launching row is
+    // openable now, and the task learns where its output goes.
+    const launched = normalizeClaudeMessage({ type: "user", uuid: "u1", timestamp: at(0), message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_013s2jZsDCiw3cAHYTqFeSpc", content: "Async agent launched successfully." }] },
+      tool_use_result: { isAsync: true, status: "async_launched", agentId: "ada2b9582caa230c5", description: "List files and count them", resolvedModel: "claude-haiku-4-5-20251001", prompt: spikePrompt, outputFile: spikeOutputFile, canReadOutputFile: true } }, memory, "live", "57489e13");
+    expect(launched.updates).toEqual([
+      { kind: "upsert", item: expect.objectContaining({ id: "tool:toolu_013s2jZsDCiw3cAHYTqFeSpc", name: "Agent", status: "completed", childConversationId: "sub:57489e13:ada2b9582caa230c5", model: "claude-haiku-4-5-20251001" }) },
+      { kind: "upsert", item: expect.objectContaining({ id: "task:ada2b9582caa230c5", status: "running", outputFile: spikeOutputFile, prompt: spikePrompt, subagentType: "general-purpose", childConversationId: "sub:57489e13:ada2b9582caa230c5" }) },
+    ]);
+    // Progress: the last tool until the model writes a summary, which then
+    // replaces it; usage is cumulative and rides every edge from here.
+    const progress = normalizeClaudeMessage({ type: "system", subtype: "task_progress", uuid: "tp1", timestamp: at(4), task_id: "ada2b9582caa230c5", tool_use_id: "toolu_013s2jZsDCiw3cAHYTqFeSpc", description: "List files and count them", usage: { total_tokens: 13122, tool_uses: 1, duration_ms: 4751 }, last_tool_name: "Bash" }, memory, "live", "57489e13");
+    expect(progress.updates[0]).toEqual({ kind: "upsert", item: expect.objectContaining({ id: "task:ada2b9582caa230c5", status: "running", progress: "Using Bash", usage: { totalTokens: 13122, toolUses: 1, durationMs: 4751 }, outputFile: spikeOutputFile, subagentType: "general-purpose" }) });
+    const summarized = normalizeClaudeMessage({ type: "system", subtype: "task_progress", uuid: "tp2", timestamp: at(30), task_id: "ada2b9582caa230c5", tool_use_id: "toolu_013s2jZsDCiw3cAHYTqFeSpc", description: "List files and count them", usage: { total_tokens: 20000, tool_uses: 2, duration_ms: 30000 }, last_tool_name: "Read", summary: "Counting files in the working tree" }, memory, "live", "57489e13");
+    expect(summarized.updates[0]).toEqual({ kind: "upsert", item: expect.objectContaining({ progress: "Counting files in the working tree", usage: { totalTokens: 20000, toolUses: 2, durationMs: 30000 } }) });
+    const notified = normalizeClaudeMessage({ type: "system", subtype: "task_notification", uuid: "tn1", timestamp: at(35), task_id: "ada2b9582caa230c5", tool_use_id: "toolu_013s2jZsDCiw3cAHYTqFeSpc", status: "completed", output_file: spikeOutputFile, summary: "There is **1 file** in the directory.", usage: { total_tokens: 21000, tool_uses: 2, duration_ms: 34000 } }, memory, "live", "57489e13");
+    expect(notified.updates[0]).toEqual({ kind: "upsert", item: { id: "task:ada2b9582caa230c5", type: "background_task", createdAt: Date.parse(at(0)), taskId: "ada2b9582caa230c5", description: "List files and count them", taskType: "local_agent", toolUseId: "toolu_013s2jZsDCiw3cAHYTqFeSpc", status: "completed", summary: "There is **1 file** in the directory.", subagentType: "general-purpose", prompt: spikePrompt, usage: { totalTokens: 21000, toolUses: 2, durationMs: 34000 }, outputFile: spikeOutputFile, childConversationId: "sub:57489e13:ada2b9582caa230c5" } });
+    // Without a session id there is no child id to derive; nothing else changes.
+    const anonymous = createClaudeEventMemory();
+    const unscoped = normalizeClaudeMessage({ type: "system", subtype: "task_started", uuid: "ts2", timestamp: at(0), task_id: "b0b0", description: "Explore", subagent_type: "Explore", is_backgrounded: true, task_type: "local_agent" }, anonymous, "live");
+    expect((unscoped.updates[0] as { item: object }).item).not.toHaveProperty("childConversationId");
+  });
+
+  test("a backgrounded shell command's output file is learned from its launch text, whichever wording the CLI used", () => {
+    const outputFile = "/private/tmp/claude-501/-private-tmp-uatu-spike-work/57489e13/tasks/bgjpa5uwy.output";
+    const launchText = `Command running in background with ID: bgjpa5uwy. Output is being written to: ${outputFile}. You will be notified when it completes.\nTo check interim output, use Read on that file path.`;
+    const bashOutput = { stdout: "", stderr: "", interrupted: false, isImage: false, noOutputExpected: false, backgroundTaskId: "bgjpa5uwy" };
+    const memory = createClaudeEventMemory();
+    normalizeClaudeMessage({ type: "assistant", uuid: "a1", timestamp: at(0), message: { role: "assistant", content: [{ type: "tool_use", id: "toolu_01E1fJ", name: "Bash", input: { command: "sleep 25; echo spike-done", run_in_background: true } }] } }, memory, "live", "57489e13");
+    normalizeClaudeMessage({ type: "system", subtype: "task_started", uuid: "ts1", timestamp: at(0), task_id: "bgjpa5uwy", tool_use_id: "toolu_01E1fJ", description: "sleep 25; echo spike-done", is_backgrounded: true, task_type: "local_bash" }, memory, "live", "57489e13");
+    const launched = normalizeClaudeMessage({ type: "user", uuid: "u1", timestamp: at(0), message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_01E1fJ", content: launchText }] }, tool_use_result: bashOutput }, memory, "live", "57489e13");
+    expect(launched.updates).toEqual([
+      { kind: "upsert", item: expect.objectContaining({ id: "tool:toolu_01E1fJ", name: "Bash", status: "completed" }) },
+      { kind: "upsert", item: { id: "task:bgjpa5uwy", type: "background_task", createdAt: Date.parse(at(0)), taskId: "bgjpa5uwy", description: "sleep 25; echo spike-done", taskType: "local_bash", toolUseId: "toolu_01E1fJ", status: "running", outputFile } },
+    ]);
+    expect((launched.updates[0] as { item: object }).item).not.toHaveProperty("childConversationId");
+    // The notification only confirms the path; the row keeps it.
+    const notified = normalizeClaudeMessage({ type: "system", subtype: "task_notification", uuid: "tn1", timestamp: at(25), task_id: "bgjpa5uwy", tool_use_id: "toolu_01E1fJ", status: "completed", output_file: outputFile, summary: "Background command \"sleep 25; echo spike-done\" completed (exit code 0)" }, memory, "live", "57489e13");
+    expect(notified.updates[0]).toEqual({ kind: "upsert", item: expect.objectContaining({ id: "task:bgjpa5uwy", status: "completed", outputFile }) });
+    // A command moved to the background on timeout says it differently but
+    // names the file the same way; content as text blocks reads the same.
+    const moved = createClaudeEventMemory();
+    normalizeClaudeMessage({ type: "system", subtype: "task_started", uuid: "ts2", timestamp: at(0), task_id: "bgq1w2e3r", tool_use_id: "toolu_02", description: "make test", is_backgrounded: true, task_type: "local_bash" }, moved, "live");
+    const timedOut = normalizeClaudeMessage({ type: "user", uuid: "u2", timestamp: at(120), message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_02", content: [{ type: "text", text: "Command did not complete within its 120s timeout and was moved to the background (ID: bgq1w2e3r). Output is being written to: /tmp/claude-501/-work/s/tasks/bgq1w2e3r.output. You will be notified when it completes." }] }] }, tool_use_result: { ...bashOutput, backgroundTaskId: "bgq1w2e3r" } }, moved, "live");
+    expect(timedOut.updates.at(-1)).toEqual({ kind: "upsert", item: expect.objectContaining({ id: "task:bgq1w2e3r", status: "running", outputFile: "/tmp/claude-501/-work/s/tasks/bgq1w2e3r.output" }) });
+    // A launch result that beats its start edge says nothing yet; the edge
+    // then names the task and carries the file.
+    const early = createClaudeEventMemory();
+    const silent = normalizeClaudeMessage({ type: "user", uuid: "u3", timestamp: at(0), message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_03", content: launchText.replaceAll("bgjpa5uwy", "bgearly01") }] }, tool_use_result: { ...bashOutput, backgroundTaskId: "bgearly01" } }, early, "live");
+    expect(silent.updates.map(update => update.kind === "upsert" ? update.item.type : update.kind)).toEqual(["tool"]);
+    const late = normalizeClaudeMessage({ type: "system", subtype: "task_started", uuid: "ts3", timestamp: at(0), task_id: "bgearly01", tool_use_id: "toolu_03", description: "late job", is_backgrounded: true, task_type: "local_bash" }, early, "live");
+    expect(late.updates[0]).toEqual({ kind: "upsert", item: expect.objectContaining({ id: "task:bgearly01", description: "late job", outputFile: outputFile.replace("bgjpa5uwy", "bgearly01") }) });
+    // A result without the sentence changes nothing.
+    const plain = normalizeClaudeMessage({ type: "user", uuid: "u4", timestamp: at(1), message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_03", content: "done" }] }, tool_use_result: { ...bashOutput, backgroundTaskId: "bgearly01" } }, early, "live");
+    expect(plain.updates).toHaveLength(1);
+  });
+
+  test("a subagent's forwarded text and thinking stay out of the parent's timeline; its tool blocks land as before", () => {
+    const memory = createClaudeEventMemory();
+    const frame = (uuid: string, content: unknown[]) => ({ type: "assistant", uuid, timestamp: at(1), parent_tool_use_id: "toolu_013s2jZsDCiw3cAHYTqFeSpc", message: { role: "assistant", model: "claude-haiku-4-5-20251001", content } });
+    const mixed = normalizeClaudeMessage(frame("sub1", [{ type: "thinking", thinking: "Let me list the files." }, { type: "text", text: "Listing now." }, { type: "tool_use", id: "toolu_inner", name: "Bash", input: { command: "ls" } }]), memory, "live", "57489e13");
+    expect(mixed.outcome).toBe("handled");
+    expect(mixed.updates).toEqual([{ kind: "upsert", item: expect.objectContaining({ id: "tool:toolu_inner", type: "tool", name: "Bash", status: "running" }) }]);
+    const textOnly = normalizeClaudeMessage(frame("sub2", [{ type: "text", text: "There is 1 file." }]), memory, "live", "57489e13");
+    expect(textOnly.outcome).toBe("ignored");
+    expect(textOnly.updates).toEqual([]);
+    // The subagent's own tool result still completes the row it opened.
+    const result = normalizeClaudeMessage({ type: "user", uuid: "sub3", timestamp: at(2), parent_tool_use_id: "toolu_013s2jZsDCiw3cAHYTqFeSpc", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_inner", content: "README.md" }] }, tool_use_result: null }, memory, "live", "57489e13");
+    expect(result.updates).toEqual([{ kind: "upsert", item: expect.objectContaining({ id: "tool:toolu_inner", status: "completed", output: "README.md" }) }]);
   });
 
   test("failure, stop, and a killed patch settle the row with their outcome", () => {
@@ -361,6 +450,35 @@ describe("background tasks and tool progress normalize into in-place rows (D8)",
     // A foreground task that completes in the foreground never shows.
     normalizeClaudeMessage({ type: "system", subtype: "task_started", uuid: "ts2", timestamp: at(6), task_id: "fg2", description: "Quick check", is_backgrounded: false }, memory, "live");
     expect(normalizeClaudeMessage({ type: "system", subtype: "task_notification", uuid: "tn2", timestamp: at(7), task_id: "fg2", status: "completed", output_file: "/tmp/o", summary: "ok" }, memory, "live").outcome).toBe("ignored");
+  });
+
+  // Spike probe c, shapes verbatim: a foreground agent gets the same
+  // task_started as a backgrounded one, with `is_backgrounded: false`.
+  test("a foreground agent run opens its launching row at task_started, not only when the run ends", () => {
+    const memory = createClaudeEventMemory();
+    const agentId = "adcea0e635b291813";
+    normalizeClaudeMessage({ type: "assistant", uuid: "a1", timestamp: at(0), message: { role: "assistant", model: "claude-haiku-4-5-20251001", content: [{ type: "tool_use", id: "toolu_fg", name: "Agent", input: { description: "List files and count them", prompt: spikePrompt } }] } }, memory, "live", "57489e13");
+    const started = normalizeClaudeMessage({ type: "system", subtype: "task_started", uuid: "ts1", timestamp: at(0), task_id: agentId, tool_use_id: "toolu_fg", description: "List files and count them", subagent_type: "general-purpose", is_backgrounded: false, spawn_depth: 1, task_type: "local_agent", prompt: spikePrompt }, memory, "live", "57489e13");
+    // No background row — the run is in the foreground, and its tool row
+    // already shows the work — but that row is now openable, which is what
+    // makes a running subagent reachable from the track before it finishes.
+    expect(started.outcome).toBe("handled");
+    expect(started.updates).toEqual([{ kind: "upsert", item: {
+      id: "tool:toolu_fg", type: "tool", createdAt: Date.parse(at(0)), name: "Agent", status: "running",
+      input: JSON.stringify({ description: "List files and count them", prompt: spikePrompt }, null, 1),
+      childConversationId: `sub:57489e13:${agentId}`,
+    } }]);
+    // The result at the end of the run still carries the row's attribution,
+    // and the child id survives the re-upsert.
+    const result = normalizeClaudeMessage({ type: "user", uuid: "u1", timestamp: at(9), message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_fg", content: "There is 1 file." }] },
+      tool_use_result: { agentId, agentType: "general-purpose", content: "There is 1 file.", resolvedModel: "claude-haiku-4-5-20251001" } }, memory, "live", "57489e13");
+    expect(result.updates[0]).toEqual({ kind: "upsert", item: expect.objectContaining({ id: "tool:toolu_fg", name: "Agent", status: "completed", childConversationId: `sub:57489e13:${agentId}`, model: "claude-haiku-4-5-20251001" }) });
+    // A tool use this normalizer never saw gets no invented row: an upsert
+    // replaces the item, and a bare row would be a tool call with no name.
+    const blind = createClaudeEventMemory();
+    const orphan = normalizeClaudeMessage({ type: "system", subtype: "task_started", uuid: "ts2", timestamp: at(0), task_id: agentId, tool_use_id: "toolu_unseen", description: "List files and count them", subagent_type: "general-purpose", is_backgrounded: false, task_type: "local_agent" }, blind, "live", "57489e13");
+    expect(orphan.updates).toEqual([]);
+    expect(orphan.outcome).toBe("ignored");
   });
 
   test("ambient housekeeping tasks never become rows, start to finish", () => {
@@ -1096,6 +1214,61 @@ describe("ClaudeProvider sessions", () => {
     await provider.dispose();
   });
 
+  test("the query asks for progress summaries and subagent text, and a task's facts reach the live list and the output read", async () => {
+    const { provider, queries, workspace } = fixture();
+    const { events, stop } = collect(provider);
+    const session = await provider.createSession("x");
+    await provider.prompt(session.id, { id: "r1", text: "run it in the background", delivery: "queue" });
+    const query = queries[0]!;
+    expect(query.input.options.agentProgressSummaries).toBe(true);
+    expect(query.input.options.forwardSubagentText).toBe(true);
+    // The CLI's own layout: <root>/tasks/<taskId>.output, with interim output.
+    const tasksDir = path.join(workspace, "tasks");
+    mkdirSync(tasksDir, { recursive: true });
+    const outputFile = path.join(tasksDir, "bgjpa5uwy.output");
+    writeFileSync(outputFile, "line one\nline two\n");
+    query.push({ type: "system", subtype: "init", uuid: "i1", session_id: session.id, model: "claude-haiku-4-5-20251001" });
+    query.push({ type: "assistant", uuid: "a1", session_id: session.id, timestamp: "2026-09-02T10:00:02.000Z", message: { role: "assistant", content: [{ type: "tool_use", id: "toolu_01E1fJ", name: "Bash", input: { command: "sleep 25; echo spike-done", run_in_background: true } }] } });
+    query.push({ type: "system", subtype: "background_tasks_changed", uuid: "bg1", session_id: session.id, tasks: [{ task_id: "bgjpa5uwy", task_type: "local_bash", description: "sleep 25; echo spike-done" }] });
+    query.push({ type: "system", subtype: "task_started", uuid: "ts1", session_id: session.id, timestamp: "2026-09-02T10:00:03.000Z", task_id: "bgjpa5uwy", tool_use_id: "toolu_01E1fJ", description: "sleep 25; echo spike-done", task_type: "local_bash", is_backgrounded: true });
+    query.push({ type: "user", uuid: "u1", session_id: session.id, timestamp: "2026-09-02T10:00:03.000Z", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_01E1fJ", content: `Command running in background with ID: bgjpa5uwy. Output is being written to: ${outputFile}. You will be notified when it completes.` }] }, tool_use_result: { stdout: "", stderr: "", interrupted: false, isImage: false, noOutputExpected: false, backgroundTaskId: "bgjpa5uwy" } });
+    await waitFor(() => events.some(event => event.updates.some(update => update.kind === "upsert" && update.item.type === "background_task" && update.item.outputFile === outputFile)));
+    expect(await provider.listBackgroundTasks()).toEqual([expect.objectContaining({ conversationId: session.id, taskId: "bgjpa5uwy", taskType: "local_bash", toolUseId: "toolu_01E1fJ", outputFile })]);
+    // The tail is read from the end, bounded, and says the task still runs.
+    expect(await provider.taskOutput(session.id, "bgjpa5uwy", { tailBytes: 9 })).toEqual({ text: "line two\n", truncated: true, settled: false });
+    expect(await provider.taskOutput(session.id, "bgjpa5uwy", { tailBytes: 1024 })).toEqual({ text: "line one\nline two\n", truncated: false, settled: false });
+    // More output while running is what the next refresh sees.
+    appendFileSync(outputFile, "spike-done\n[exited with code 0]");
+    expect((await provider.taskOutput(session.id, "bgjpa5uwy", { tailBytes: 1024 }))?.text).toBe("line one\nline two\nspike-done\n[exited with code 0]");
+    // Unknown task, or a task whose file is not yet named: nothing to read.
+    expect(await provider.taskOutput(session.id, "nope", { tailBytes: 1024 })).toBeNull();
+    expect(await provider.taskOutput("other-session", "bgjpa5uwy", { tailBytes: 1024 })).toBeNull();
+    // A named path that does not resolve to tasks/<taskId>.output is refused:
+    // an agent task's "output" is a symlink to its subagent transcript.
+    const subagentsDir = path.join(workspace, "subagents");
+    mkdirSync(subagentsDir, { recursive: true });
+    writeFileSync(path.join(subagentsDir, "agent-ada2b9582caa230c5.jsonl"), "{}\n");
+    symlinkSync(path.join(subagentsDir, "agent-ada2b9582caa230c5.jsonl"), path.join(tasksDir, "ada2b9582caa230c5.output"));
+    query.push({ type: "system", subtype: "background_tasks_changed", uuid: "bg2", session_id: session.id, tasks: [{ task_id: "bgjpa5uwy", task_type: "local_bash", description: "sleep 25; echo spike-done" }, { task_id: "ada2b9582caa230c5", task_type: "local_agent", description: "List files" }] });
+    query.push({ type: "system", subtype: "task_started", uuid: "ts2", session_id: session.id, timestamp: "2026-09-02T10:00:04.000Z", task_id: "ada2b9582caa230c5", tool_use_id: "toolu_agent", description: "List files", subagent_type: "general-purpose", is_backgrounded: true, task_type: "local_agent", prompt: "List the files" });
+    query.push({ type: "system", subtype: "task_notification", uuid: "tn0", session_id: session.id, timestamp: "2026-09-02T10:00:05.000Z", task_id: "ada2b9582caa230c5", tool_use_id: "toolu_agent", status: "completed", output_file: path.join(tasksDir, "ada2b9582caa230c5.output"), summary: "1 file" });
+    await waitFor(() => events.some(event => event.updates.some(update => update.kind === "upsert" && update.item.type === "background_task" && update.item.taskId === "ada2b9582caa230c5" && update.item.status === "completed")));
+    expect(await provider.taskOutput(session.id, "ada2b9582caa230c5", { tailBytes: 1024 })).toBeNull();
+    // A path the CLI named elsewhere (not the tasks layout) is refused too.
+    writeFileSync(path.join(workspace, "elsewhere.output"), "x");
+    query.push({ type: "system", subtype: "task_started", uuid: "ts3", session_id: session.id, timestamp: "2026-09-02T10:00:06.000Z", task_id: "bgother", tool_use_id: "toolu_other", description: "other", task_type: "local_bash", is_backgrounded: true });
+    query.push({ type: "user", uuid: "u2", session_id: session.id, timestamp: "2026-09-02T10:00:06.000Z", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_other", content: `Command running in background with ID: bgother. Output is being written to: ${path.join(workspace, "elsewhere.output")}. You will be notified when it completes.` }] }, tool_use_result: { stdout: "", stderr: "", interrupted: false, isImage: false, noOutputExpected: false, backgroundTaskId: "bgother" } });
+    await waitFor(() => events.some(event => event.updates.some(update => update.kind === "upsert" && update.item.type === "background_task" && update.item.taskId === "bgother" && update.item.outputFile !== undefined)));
+    expect(await provider.taskOutput(session.id, "bgother", { tailBytes: 1024 })).toBeNull();
+    // The shell task settles: the read still answers, and says so.
+    query.push({ type: "system", subtype: "task_notification", uuid: "tn1", session_id: session.id, timestamp: "2026-09-02T10:00:30.000Z", task_id: "bgjpa5uwy", tool_use_id: "toolu_01E1fJ", status: "completed", output_file: outputFile, summary: "Background command completed (exit code 0)" });
+    query.push({ type: "system", subtype: "background_tasks_changed", uuid: "bg3", session_id: session.id, tasks: [] });
+    await waitFor(() => events.some(event => event.updates.some(update => update.kind === "upsert" && update.item.type === "background_task" && update.item.taskId === "bgjpa5uwy" && update.item.status === "completed")));
+    expect(await provider.taskOutput(session.id, "bgjpa5uwy", { tailBytes: 12 })).toEqual({ text: "with code 0]", truncated: true, settled: true });
+    stop();
+    await provider.dispose();
+  });
+
   test("duplicate result frames leave the next accepted notification turn running", async () => {
     const { provider, queries } = fixture();
     const { events, stop } = collect(provider);
@@ -1133,6 +1306,166 @@ describe("ClaudeProvider sessions", () => {
     query.push({ type: "system", subtype: "task_notification", uuid: "tn1", session_id: session.id, timestamp: "2026-09-02T10:00:08.000Z", task_id: "agent1", status: "completed", output_file: "/tmp/o", summary: "done" });
     stop();
     await provider.dispose();
+  });
+
+  // Design D8: a run known from its start edge streams into its own child
+  // conversation; the parent's timeline keeps only the row that launched it.
+  describe("subagent frames route to the child conversation", () => {
+    const stamp = (seconds: number) => new Date(Date.UTC(2026, 8, 22, 12, 0, seconds)).toISOString();
+    const AGENT_ID = "ada2b9582caa230c5";
+    const LAUNCHER = "toolu_013s2jZsDCiw3cAHYTqFeSpc";
+    const upsertIds = (events: NormalizedProviderEvent[], conversationId: string) =>
+      events.filter(event => event.conversationId === conversationId).flatMap(event => event.updates).flatMap(update => update.kind === "upsert" ? [update.item.id] : []);
+    // The run's own frames, tagged with the launching tool use as the CLI
+    // forwards them (spike probe b): thinking + a tool call, a heartbeat,
+    // the tool's result, then text.
+    const runFrames = (sessionId: string, launcher: string) => {
+      const tagged = { session_id: sessionId, parent_tool_use_id: launcher };
+      return [
+        { type: "assistant", uuid: "a202b083", timestamp: stamp(2), ...tagged, message: { role: "assistant", model: "claude-haiku-4-5-20251001", content: [{ type: "thinking", thinking: "Let me list the files." }, { type: "tool_use", id: "toolu_inner", name: "Bash", input: { command: "ls" } }], usage: { input_tokens: 10, output_tokens: 5 } } },
+        { type: "tool_progress", uuid: "hb1", timestamp: stamp(3), ...tagged, tool_use_id: "toolu_inner", tool_name: "Bash", elapsed_time_seconds: 1.5 },
+        { type: "user", uuid: "eb64650b", timestamp: stamp(3), ...tagged, message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_inner", content: "README.md" }] }, tool_use_result: null },
+        { type: "assistant", uuid: "f28f8ec7", timestamp: stamp(4), ...tagged, message: { role: "assistant", model: "claude-haiku-4-5-20251001", content: [{ type: "text", text: "There is 1 file." }], usage: { input_tokens: 20, output_tokens: 8 } } },
+      ];
+    };
+
+    test("a backgrounded agent's text, thinking, and tool frames reach its child; the parent keeps only its launching row", async () => {
+      const { provider, queries } = fixture();
+      const { events, stop } = collect(provider);
+      const session = await provider.createSession("x");
+      const childId = `sub:${session.id}:${AGENT_ID}`;
+      await provider.prompt(session.id, { id: "r1", text: "spawn", delivery: "queue" });
+      const query = queries[0]!;
+      query.push({ type: "assistant", uuid: "launch", timestamp: stamp(1), session_id: session.id, parent_tool_use_id: null, message: { role: "assistant", model: "claude-haiku-4-5-20251001", content: [{ type: "tool_use", id: LAUNCHER, name: "Agent", input: { description: "List files", prompt: "List the files", run_in_background: true } }] } });
+      query.push({ type: "system", subtype: "background_tasks_changed", uuid: "bg1", session_id: session.id, tasks: [{ task_id: AGENT_ID, task_type: "local_agent", description: "List files" }] });
+      query.push({ type: "system", subtype: "task_started", uuid: "ts1", timestamp: stamp(1), session_id: session.id, task_id: AGENT_ID, tool_use_id: LAUNCHER, description: "List files", subagent_type: "general-purpose", is_backgrounded: true, task_type: "local_agent", prompt: "List the files" });
+      query.push({ type: "user", uuid: "launched", timestamp: stamp(1), session_id: session.id, parent_tool_use_id: null, message: { role: "user", content: [{ type: "tool_result", tool_use_id: LAUNCHER, content: "Async agent launched" }] }, tool_use_result: { isAsync: true, status: "async_launched", agentId: AGENT_ID, description: "List files", prompt: "List the files", outputFile: `/tmp/t/${AGENT_ID}.output` } });
+      // The turn ends with the agent still running: the D9 situation, where
+      // the run's frames must not read as a turn the CLI started by itself.
+      query.push({ type: "result", subtype: "success", uuid: "res1", timestamp: stamp(1), session_id: session.id, is_error: false });
+      await waitFor(() => events.some(event => event.eventType === "turn.background"));
+      for (const frame of runFrames(session.id, LAUNCHER)) query.push(frame);
+      query.push({ type: "system", subtype: "task_progress", uuid: "tp1", timestamp: stamp(4), session_id: session.id, task_id: AGENT_ID, tool_use_id: LAUNCHER, usage: { total_tokens: 13122, tool_uses: 1, duration_ms: 4751 }, last_tool_name: "Bash" });
+      query.push({ type: "system", subtype: "task_notification", uuid: "tn1", timestamp: stamp(5), session_id: session.id, task_id: AGENT_ID, tool_use_id: LAUNCHER, status: "completed", output_file: `/tmp/t/${AGENT_ID}.output`, summary: "There is 1 file." });
+      await waitFor(() => events.some(event => event.conversationId === childId && event.updates.some(update => update.kind === "status" && update.status === "completed")));
+
+      const childEvents = events.filter(event => event.conversationId === childId);
+      const childUpdates = childEvents.flatMap(event => event.updates);
+      // Running from the start edge, settled by the notification.
+      expect(childUpdates[0]).toEqual({ kind: "status", status: "running" });
+      expect(childUpdates.at(-1)).toEqual({ kind: "status", status: "completed" });
+      const childItems = childUpdates.flatMap(update => update.kind === "upsert" ? [update.item] : []);
+      expect(childItems.map(item => item.id)).toEqual(["reasoning:a202b083:0", "tool:toolu_inner", "usage:a202b083", "tool:toolu_inner", "tool:toolu_inner", "message:f28f8ec7", "usage:f28f8ec7"]);
+      // The heartbeat found the tool in the child's own memory; the result
+      // completed the row it opened.
+      expect(childItems[3]).toEqual(expect.objectContaining({ type: "tool", status: "running", elapsedMs: 1500 }));
+      expect(childItems[4]).toEqual(expect.objectContaining({ type: "tool", status: "completed", output: "README.md" }));
+      expect(childItems[5]).toEqual(expect.objectContaining({ type: "assistant_message", markdown: "There is 1 file." }));
+      // The routed events carry no attribution: the launching row's figure
+      // comes from the tool result and the child transcript read, as before.
+      expect(childEvents.every(event => event.assistantUsage === undefined && event.assistantModel === undefined)).toBe(true);
+      // The parent: its launching row and the task row, nothing of the run.
+      const parentIds = upsertIds(events, session.id);
+      expect(parentIds).toContain(`tool:${LAUNCHER}`);
+      expect(parentIds).toContain(`task:${AGENT_ID}`);
+      expect(parentIds.filter(id => id.startsWith("reasoning:") || id === "tool:toolu_inner" || id === "message:f28f8ec7" || id === "usage:a202b083" || id === "usage:f28f8ec7")).toEqual([]);
+      const launcher = events.filter(event => event.conversationId === session.id).flatMap(event => event.updates).flatMap(update => update.kind === "upsert" && update.item.id === `tool:${LAUNCHER}` ? [update.item] : []).at(-1);
+      expect(launcher).toEqual(expect.objectContaining({ type: "tool", status: "completed", childConversationId: childId }));
+      expect(events.some(event => event.eventType === "turn.unprompted")).toBe(false);
+      // Live, the child is a session of its parent before the CLI has
+      // written its transcript, and reads as empty rather than unknown.
+      expect(await provider.getSession(childId)).toEqual(expect.objectContaining({ id: childId, parentId: session.id, title: "Subagent" }));
+      expect((await provider.listMessages(childId, { limit: 50 })).items).toEqual([]);
+      stop();
+      await provider.dispose();
+    });
+
+    test("a foreground agent routes the same way and settles on its sync result; the launching row keeps the result's attribution", async () => {
+      const { provider, queries } = fixture();
+      const { events, stop } = collect(provider);
+      const session = await provider.createSession("x");
+      const agentId = "adcea0e635b291813";
+      const childId = `sub:${session.id}:${agentId}`;
+      await provider.prompt(session.id, { id: "r1", text: "spawn", delivery: "queue" });
+      const query = queries[0]!;
+      query.push({ type: "assistant", uuid: "launch", timestamp: stamp(1), session_id: session.id, parent_tool_use_id: null, message: { role: "assistant", model: "claude-haiku-4-5-20251001", content: [{ type: "tool_use", id: "toolu_fg", name: "Agent", input: { description: "List files", prompt: "List the files" } }] } });
+      query.push({ type: "system", subtype: "task_started", uuid: "ts1", timestamp: stamp(1), session_id: session.id, task_id: agentId, tool_use_id: "toolu_fg", description: "List files", subagent_type: "general-purpose", is_backgrounded: false, task_type: "local_agent", prompt: "List the files" });
+      for (const frame of runFrames(session.id, "toolu_fg")) query.push(frame);
+      await waitFor(() => upsertIds(events, childId).includes("message:f28f8ec7"));
+      expect(events.filter(event => event.conversationId === childId).flatMap(event => event.updates)[0]).toEqual({ kind: "status", status: "running" });
+      // No task frames this time (an older CLI): the sync result ends the run.
+      query.push({ type: "user", uuid: "done", timestamp: stamp(6), session_id: session.id, parent_tool_use_id: null, message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_fg", content: [{ type: "text", text: "There is 1 file." }] }] }, tool_use_result: { agentId, agentType: "general-purpose", content: [{ type: "text", text: "There is 1 file." }], resolvedModel: "claude-haiku-4-5-20251001", usage: { input_tokens: 100, output_tokens: 20 }, totalDurationMs: 4000, totalTokens: 120, totalToolUseCount: 1 } });
+      await waitFor(() => events.some(event => event.conversationId === childId && event.updates.some(update => update.kind === "status" && update.status === "completed")));
+      const parentIds = upsertIds(events, session.id);
+      // A foreground run has no task row; its launching row carries the
+      // result's model and usage, and nothing of the run itself.
+      expect(parentIds.filter(id => id.startsWith("task:") || id === "tool:toolu_inner" || id === "message:f28f8ec7" || id.startsWith("reasoning:"))).toEqual([]);
+      const launcher = events.filter(event => event.conversationId === session.id).flatMap(event => event.updates).flatMap(update => update.kind === "upsert" && update.item.id === "tool:toolu_fg" ? [update.item] : []).at(-1);
+      expect(launcher).toEqual(expect.objectContaining({ status: "completed", childConversationId: childId, model: "claude-haiku-4-5-20251001", usage: expect.objectContaining({ input: 100, output: 20 }) }));
+      stop();
+      await provider.dispose();
+    });
+
+    test("frames of a run the provider does not know keep landing in the parent as before; its ending result still names the child", async () => {
+      const { provider, queries } = fixture();
+      const { events, stop } = collect(provider);
+      const session = await provider.createSession("x");
+      await provider.prompt(session.id, { id: "r1", text: "review", delivery: "queue" });
+      const query = queries[0]!;
+      // A Skill fork (spike Q3): frames under the Skill tool use, no task
+      // edge, the agent id only in the tool result that ends the fork.
+      query.push({ type: "assistant", uuid: "skill", timestamp: stamp(1), session_id: session.id, parent_tool_use_id: null, message: { role: "assistant", model: "claude-haiku-4-5-20251001", content: [{ type: "tool_use", id: "toolu_skill", name: "Skill", input: { skill: "code-review" } }] } });
+      query.push({ type: "assistant", uuid: "fork1", timestamp: stamp(2), session_id: session.id, parent_tool_use_id: "toolu_skill", message: { role: "assistant", model: "claude-haiku-4-5-20251001", content: [{ type: "thinking", thinking: "Reading the diff." }, { type: "text", text: "Reviewing." }, { type: "tool_use", id: "toolu_diff", name: "Bash", input: { command: "git diff HEAD" } }] } });
+      query.push({ type: "user", uuid: "fork2", timestamp: stamp(3), session_id: session.id, parent_tool_use_id: "toolu_skill", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_diff", content: "+1 -1" }] }, tool_use_result: null });
+      await waitFor(() => upsertIds(events, session.id).filter(id => id === "tool:toolu_diff").length === 2);
+      // The fork's tool row is the parent's, completed by its result; its
+      // text and thinking are dropped; no child conversation heard of it.
+      expect(upsertIds(events, session.id).filter(id => id === "message:fork1" || id.startsWith("reasoning:"))).toEqual([]);
+      expect(events.some(event => event.conversationId?.startsWith("sub:"))).toBe(false);
+      const forkChildId = `sub:${session.id}:aaeeab292f002e3d7`;
+      expect(await provider.getSession(forkChildId)).toBeNull();
+      query.push({ type: "user", uuid: "forked", timestamp: stamp(4), session_id: session.id, parent_tool_use_id: null, message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_skill", content: "Based on my analysis..." }] }, tool_use_result: { success: true, commandName: "code-review", status: "forked", agentId: "aaeeab292f002e3d7", result: "Based on my analysis..." } });
+      await waitFor(() => upsertIds(events, session.id).includes("tool:toolu_skill"));
+      // Known now, and over: resolvable as the parent's child (its
+      // transcript is on disk by then), never reported running.
+      expect(await provider.getSession(forkChildId)).toEqual(expect.objectContaining({ parentId: session.id }));
+      expect(events.some(event => event.conversationId === forkChildId)).toBe(false);
+      stop();
+      await provider.dispose();
+    });
+
+    test("a child filled from its transcript and then fed live upserts the same item ids", async () => {
+      const { provider, queries, configDir, workspace } = fixture();
+      const { events, stop } = collect(provider);
+      const session = await provider.createSession("x");
+      const childId = `sub:${session.id}:${AGENT_ID}`;
+      // The transcript as the CLI writes it, record for record the frames
+      // it forwards (same uuids and tool-use ids; spike probe b), plus the
+      // run's prompt, which is never forwarded.
+      const subagentDir = path.join(claudeProjectDir(workspace, configDir), session.id, "subagents");
+      mkdirSync(subagentDir, { recursive: true });
+      const stored = (frame: Record<string, unknown>) => {
+        const { session_id: _session, parent_tool_use_id: _parent, tool_use_result, ...rest } = frame as Record<string, unknown> & { tool_use_result?: unknown };
+        return JSON.stringify({ ...rest, parentUuid: null, isSidechain: true, agentId: AGENT_ID, ...(tool_use_result ? { toolUseResult: tool_use_result } : {}) });
+      };
+      writeFileSync(path.join(subagentDir, `agent-${AGENT_ID}.jsonl`), [
+        JSON.stringify({ type: "user", uuid: "cc451df4", parentUuid: null, isSidechain: true, agentId: AGENT_ID, timestamp: stamp(1), message: { role: "user", content: "List the files" } }),
+        ...runFrames(session.id, LAUNCHER).filter(frame => frame.type !== "tool_progress").map(stored),
+      ].join("\n") + "\n");
+      const snapshot = new Set((await provider.listMessages(childId, { limit: 50 })).items.map(item => item.id));
+      expect(snapshot).toEqual(new Set(["message:cc451df4", "reasoning:a202b083:0", "tool:toolu_inner", "usage:a202b083", "message:f28f8ec7", "usage:f28f8ec7"]));
+
+      await provider.prompt(session.id, { id: "r1", text: "spawn", delivery: "queue" });
+      const query = queries[0]!;
+      query.push({ type: "system", subtype: "task_started", uuid: "ts1", timestamp: stamp(1), session_id: session.id, task_id: AGENT_ID, tool_use_id: LAUNCHER, description: "List files", subagent_type: "general-purpose", is_backgrounded: true, task_type: "local_agent" });
+      for (const frame of runFrames(session.id, LAUNCHER)) query.push(frame);
+      await waitFor(() => upsertIds(events, childId).includes("usage:f28f8ec7"));
+      // Every live item is one the snapshot already holds: no second row
+      // for a tool call, a thought, or a message the file replayed.
+      for (const id of upsertIds(events, childId)) expect(snapshot.has(id)).toBe(true);
+      stop();
+      await provider.dispose();
+    });
   });
 
   test("a prompt the CLI reports queued behind its follow-up keeps the session until it runs", async () => {

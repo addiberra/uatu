@@ -6,6 +6,7 @@ import type { WorkspaceChatService } from "./service";
 import { ConversationNotFoundError } from "./workspace";
 import type {
   AgentChatStatus,
+  BackgroundTaskOutput,
   ChatActivity,
   ChatAgentDescriptor,
   ChatAvailability,
@@ -119,6 +120,7 @@ export interface MultiAgentWorkspaceChatService {
   stopTask(id: string, taskId: string, requestId: string): Promise<{ stopped: true }>;
   release(id: string, requestId: string): Promise<{ released: true }>;
   cancelWakeup(id: string, wakeupId: string, requestId: string): Promise<{ cancelled: true }>;
+  taskOutput(id: string, taskId: string, options: { tailBytes: number }): Promise<BackgroundTaskOutput | null>;
   usage(agentId: string): Promise<AgentUsageReport | null>;
   readUsage(agentId: string, requestId: string, mode: UsageReadMode): Promise<UsageReadResult>;
   dispose(): Promise<void>;
@@ -396,6 +398,11 @@ export class MultiAgentChatService implements MultiAgentWorkspaceChatService {
     return agent.service.cancelWakeup(conversationId, wakeupId, requestId);
   }
 
+  async taskOutput(id: string, taskId: string, options: { tailBytes: number }) {
+    const { agent, conversationId } = this.resolve(id);
+    return agent.service.taskOutput(conversationId, taskId, options);
+  }
+
   async usage(agentId: string): Promise<AgentUsageReport | null> { return this.requireAgent(agentId).service.usage(); }
   async readUsage(agentId: string, requestId: string, mode: UsageReadMode): Promise<UsageReadResult> { return this.requireAgent(agentId).service.readUsage(requestId, mode); }
 
@@ -436,9 +443,12 @@ export class MultiAgentChatService implements MultiAgentWorkspaceChatService {
     if ((next.type === "permission" || next.type === "question") && next.conversationId) {
       next = { ...next, conversationId: qualifyConversationId(descriptor.id, next.conversationId) };
     }
-    if (next.type === "tool" && next.childConversationId) {
+    if ((next.type === "tool" || next.type === "background_task") && next.childConversationId) {
       // A subagent child belongs to the same agent as its parent; the
-      // drill-down opens it through the same qualified addressing.
+      // drill-down opens it through the same qualified addressing. A
+      // background task names the same child as its launching tool row —
+      // and names it first, from the start edge, which is what makes a
+      // still-running run openable — so it must be qualified alike.
       next = { ...next, childConversationId: qualifyConversationId(descriptor.id, next.childConversationId) };
     }
     return next;

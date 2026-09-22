@@ -789,12 +789,25 @@
                 <p id="chat-drilldown-title" class="chat-drilldown-title"></p>
               </header>
               <div id="chat-drilldown-state" class="chat-state chat-drilldown-state" role="status" aria-live="polite" hidden></div>
+              <!-- A running background task's facts, over the transcript it
+                   runs as (an agent task) or over its output (a shell task):
+                   description, progress, elapsed, spend, and Stop. Filled and
+                   kept current by the same repaint as the composer's task
+                   list; it settles into one line when the task does. -->
+              <div id="chat-drilldown-task" class="chat-drilldown-task" hidden></div>
               <div id="chat-drilldown-timeline" class="chat-timeline chat-drilldown-timeline" role="log" aria-live="polite" aria-relevant="additions text" tabindex="0">
                 <!-- A subagent can outrun one page like any conversation; without
                      this its earlier messages are simply absent, with nothing
                      saying so. -->
                 <button id="chat-drilldown-older" class="chat-secondary-button chat-load-older" type="button" hidden>Load older messages</button>
                 <div id="chat-drilldown-items"></div>
+              </div>
+              <!-- A shell task's view: the tail of its output file, re-read
+                   while it runs. Takes the timeline's place; there is no
+                   transcript to show for a command. -->
+              <div id="chat-drilldown-output" class="chat-drilldown-output" hidden>
+                <p id="chat-drilldown-output-note" class="chat-drilldown-output-note" role="status" hidden></p>
+                <pre id="chat-drilldown-output-text" class="chat-drilldown-output-text" aria-label="Task output" tabindex="0"></pre>
               </div>
             </section>
             <!-- Both pin to the transcript's lower edge rather than to a

@@ -1,0 +1,329 @@
+// Inspecting a running background task (design D7). Two views share the
+// drill-down chrome: an agent task opens its child transcript with a header
+// strip stating the task's facts, and a shell task opens a task view whose
+// body is a bounded tail of the output file, re-read on a timer. The strip
+// and the pane are one panel here, kept in sync by the same repaint that
+// redraws the composer's task list — the task item changes in place, so the
+// panel only ever needs the current item and whether a stop is in flight.
+//
+// The pure helpers decide where a row leads and how the facts read; the
+// panel owns the DOM and the two timers (the elapsed clock, the output poll).
+// Timers are injected so the lifecycle can be tested without waiting.
+
+import { formatTokens } from "./usage";
+import type { BackgroundTaskItem, BackgroundTaskOutput, BackgroundTaskUsage, ConversationItem } from "./types";
+
+/** Where selecting a running task's row leads. */
+export type TaskInspection =
+  | { view: "transcript"; conversationId: string }
+  | { view: "output" };
+
+/**
+ * A running agent task opens the subagent's transcript, which the normalizer
+ * names from the start edge; anything else — a shell task, or an agent whose
+ * child is not (yet) known — opens the task view, which needs no child.
+ * A settled task is not inspectable from the list: it has left the list and
+ * taken a timeline row.
+ */
+export function taskInspection(task: BackgroundTaskItem): TaskInspection | undefined {
+  if (task.status !== "running") return undefined;
+  if (task.childConversationId) return { view: "transcript", conversationId: task.childConversationId };
+  return { view: "output" };
+}
+
+/** The running task that a child transcript belongs to, if any. */
+export function runningTaskForChild(items: readonly ConversationItem[], conversationId: string): BackgroundTaskItem | undefined {
+  return items.find((item): item is BackgroundTaskItem => item.type === "background_task" && item.status === "running" && item.childConversationId === conversationId);
+}
+
+export function taskById(items: readonly ConversationItem[], taskId: string): BackgroundTaskItem | undefined {
+  return items.find((item): item is BackgroundTaskItem => item.type === "background_task" && item.taskId === taskId);
+}
+
+/** "0:07" / "1:05" / "1:02:03" — a clock, since the strip is watched rather than read once. */
+export function formatTaskElapsed(ms: number): string {
+  const seconds = Math.max(0, Math.floor(ms / 1000));
+  const minutes = Math.floor(seconds / 60) % 60;
+  const hours = Math.floor(seconds / 3600);
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return hours > 0 ? `${hours}:${pad(minutes)}:${pad(seconds % 60)}` : `${minutes}:${pad(seconds % 60)}`;
+}
+
+/** "13.1k tokens · 1 tool use", as the agent's progress reports it. */
+export function taskUsageLabel(usage: BackgroundTaskUsage): string {
+  const uses = usage.toolUses === 1 ? "1 tool use" : `${usage.toolUses} tool uses`;
+  return `${formatTokens(usage.totalTokens)} tokens · ${uses}`;
+}
+
+/** "finished · <summary>" / "failed" / "stopped": the strip's last line once the task settles. */
+export function taskSettledLabel(task: BackgroundTaskItem): string {
+  const word = task.status === "completed" ? "finished" : task.status === "failed" ? "failed" : task.status === "stopped" ? "stopped" : "running";
+  const summary = task.summary?.trim();
+  return summary ? `${word} · ${summary}` : word;
+}
+
+// How often the output pane re-reads the tail while the task runs. The file
+// is what the model itself reads through TaskOutput, so a two-second cadence
+// keeps the view honest without a stream (design D7, non-goal: streaming).
+export const TASK_OUTPUT_REFRESH_MS = 2_000;
+
+export type TaskInspectionTimers = {
+  setInterval: (fn: () => void, ms: number) => unknown;
+  clearInterval: (handle: unknown) => void;
+  setTimeout: (fn: () => void, ms: number) => unknown;
+  clearTimeout: (handle: unknown) => void;
+};
+
+export type TaskInspectionHosts = {
+  // The header strip above the transcript or the output pane.
+  strip: HTMLElement;
+  // The output pane and its parts; the pane is shown for the output view only.
+  output: HTMLElement;
+  outputText: HTMLElement;
+  outputNote: HTMLElement;
+};
+
+export type TaskInspectionOptions = {
+  hosts: TaskInspectionHosts;
+  fetchOutput: (conversationId: string, taskId: string, signal: AbortSignal) => Promise<BackgroundTaskOutput | null>;
+  // Whether the surface is on screen; a hidden page skips the read and lets
+  // the next tick try again.
+  active?: () => boolean;
+  onError?: (error: unknown) => void;
+  now?: () => number;
+  timers?: TaskInspectionTimers;
+};
+
+export type OpenTaskInspection = { conversationId: string; taskId: string; view: TaskInspection["view"] };
+
+export class TaskInspectionPanel {
+  private readonly hosts: TaskInspectionHosts;
+  private readonly fetchOutput: TaskInspectionOptions["fetchOutput"];
+  private readonly active: () => boolean;
+  private readonly onError: (error: unknown) => void;
+  private readonly now: () => number;
+  private readonly timers: TaskInspectionTimers;
+  private current: OpenTaskInspection | null = null;
+  private task: BackgroundTaskItem | undefined;
+  private painted = "";
+  private elapsedTimer: unknown = null;
+  private outputTimer: unknown = null;
+  private outputRead: AbortController | null = null;
+  // Whether the reader is at the end of the output: the pane follows new
+  // output only while they are, so scrolling up to read holds still.
+  private following = true;
+
+  constructor(options: TaskInspectionOptions) {
+    this.hosts = options.hosts;
+    this.fetchOutput = options.fetchOutput;
+    this.active = options.active ?? (() => true);
+    this.onError = options.onError ?? (() => {});
+    this.now = options.now ?? (() => Date.now());
+    this.timers = options.timers ?? {
+      setInterval: (fn, ms) => setInterval(fn, ms),
+      clearInterval: handle => clearInterval(handle as ReturnType<typeof setInterval>),
+      setTimeout: (fn, ms) => setTimeout(fn, ms),
+      clearTimeout: handle => clearTimeout(handle as ReturnType<typeof setTimeout>),
+    };
+    this.hosts.outputText.addEventListener("scroll", () => {
+      const pane = this.hosts.outputText;
+      this.following = pane.scrollHeight - pane.scrollTop - pane.clientHeight <= 1;
+    });
+  }
+
+  /** The task the panel is showing, or null while closed. */
+  get open(): OpenTaskInspection | null {
+    return this.current;
+  }
+
+  /** Shows the panel for a task; `sync` then keeps it current. */
+  show(link: OpenTaskInspection, task: BackgroundTaskItem | undefined, stopping = false): void {
+    if (this.current && (this.current.taskId !== link.taskId || this.current.view !== link.view)) this.close();
+    this.current = link;
+    this.following = true;
+    this.hosts.output.hidden = link.view !== "output";
+    if (link.view === "output") {
+      this.hosts.outputText.textContent = "";
+      this.hosts.outputNote.textContent = "Output not yet available";
+      this.hosts.outputNote.hidden = false;
+    }
+    this.sync(task, stopping);
+    if (link.view === "output") this.refreshOutput();
+  }
+
+  /**
+   * The repaint hook: the task item as it now stands (undefined when it is
+   * gone from the projection) and whether a stop is in flight. Rebuilds the
+   * strip only when what it says changed; the elapsed clock ticks on its own.
+   */
+  sync(task: BackgroundTaskItem | undefined, stopping = false): void {
+    if (!this.current) return;
+    const wasRunning = this.task?.status === "running";
+    this.task = task;
+    const running = task?.status === "running";
+    const signature = task
+      ? [task.taskId, task.status, task.description, task.subagentType ?? "", task.progress ?? "", task.summary ?? "", task.usage ? `${task.usage.totalTokens}/${task.usage.toolUses}` : "", stopping ? "stopping" : ""].join("")
+      : "";
+    if (signature !== this.painted) {
+      this.painted = signature;
+      this.paintStrip(task, stopping);
+    }
+    if (running && this.elapsedTimer === null) {
+      this.elapsedTimer = this.timers.setInterval(() => this.tickElapsed(), 1_000);
+    }
+    if (!running && this.elapsedTimer !== null) {
+      this.timers.clearInterval(this.elapsedTimer);
+      this.elapsedTimer = null;
+    }
+    // Settling ends the poll and reads once more: the file gains its
+    // `[exited with code N]` line at the end, and the last poll may have
+    // missed the final output.
+    if (wasRunning && !running && this.current.view === "output") {
+      this.stopOutputTimer();
+      this.refreshOutput();
+    }
+  }
+
+  close(): void {
+    if (this.elapsedTimer !== null) {
+      this.timers.clearInterval(this.elapsedTimer);
+      this.elapsedTimer = null;
+    }
+    this.stopOutputTimer();
+    this.outputRead?.abort();
+    this.outputRead = null;
+    this.current = null;
+    this.task = undefined;
+    this.painted = "";
+    this.hosts.strip.hidden = true;
+    this.hosts.strip.replaceChildren();
+    this.hosts.output.hidden = true;
+    this.hosts.outputText.textContent = "";
+    this.hosts.outputNote.textContent = "";
+    this.hosts.outputNote.hidden = true;
+  }
+
+  private paintStrip(task: BackgroundTaskItem | undefined, stopping: boolean): void {
+    const strip = this.hosts.strip;
+    if (!task) {
+      strip.hidden = true;
+      strip.replaceChildren();
+      return;
+    }
+    strip.dataset.taskId = task.taskId;
+    strip.dataset.taskState = task.status === "running" ? "running" : "settled";
+    strip.classList.toggle("is-settled", task.status !== "running");
+    const line = document.createElement("div");
+    line.className = "chat-drilldown-task-line";
+    const description = document.createElement("span");
+    description.className = "chat-drilldown-task-description";
+    description.textContent = task.description;
+    description.title = task.description;
+    line.append(description);
+    if (task.subagentType) {
+      const type = document.createElement("code");
+      type.className = "chat-drilldown-task-type";
+      type.textContent = task.subagentType;
+      line.append(type);
+    }
+    if (task.status === "running") {
+      const stop = document.createElement("button");
+      stop.type = "button";
+      stop.className = "chat-task-stop";
+      stop.dataset.stopTask = task.taskId;
+      stop.textContent = stopping ? "Stopping…" : "Stop";
+      stop.disabled = stopping;
+      stop.setAttribute("aria-label", `Stop ${task.description}`);
+      line.append(stop);
+    }
+    const facts = document.createElement("div");
+    facts.className = "chat-drilldown-task-facts";
+    if (task.status === "running") {
+      const elapsed = document.createElement("span");
+      elapsed.className = "chat-drilldown-task-elapsed";
+      elapsed.dataset.taskElapsed = "";
+      elapsed.textContent = formatTaskElapsed(this.now() - task.createdAt);
+      facts.append(elapsed);
+      if (task.progress) {
+        const progress = document.createElement("span");
+        progress.className = "chat-drilldown-task-progress";
+        progress.textContent = task.progress;
+        facts.append(progress);
+      }
+      if (task.usage) {
+        const usage = document.createElement("span");
+        usage.className = "chat-drilldown-task-usage";
+        usage.textContent = taskUsageLabel(task.usage);
+        facts.append(usage);
+      }
+    } else {
+      const settled = document.createElement("span");
+      settled.className = "chat-drilldown-task-settled";
+      settled.textContent = taskSettledLabel(task);
+      facts.append(settled);
+    }
+    strip.replaceChildren(line, facts);
+    strip.hidden = false;
+  }
+
+  private tickElapsed(): void {
+    const task = this.task;
+    if (!task || task.status !== "running") return;
+    const readout = this.hosts.strip.querySelector<HTMLElement>("[data-task-elapsed]");
+    if (readout) readout.textContent = formatTaskElapsed(this.now() - task.createdAt);
+  }
+
+  private stopOutputTimer(): void {
+    if (this.outputTimer !== null) {
+      this.timers.clearTimeout(this.outputTimer);
+      this.outputTimer = null;
+    }
+  }
+
+  // One read at a time, and the next scheduled only after this one answers,
+  // so a slow read never stacks requests behind it.
+  private refreshOutput(): void {
+    const link = this.current;
+    if (!link || link.view !== "output") return;
+    this.stopOutputTimer();
+    if (!this.active()) {
+      this.scheduleOutputRefresh();
+      return;
+    }
+    this.outputRead?.abort();
+    const read = new AbortController();
+    this.outputRead = read;
+    void this.fetchOutput(link.conversationId, link.taskId, read.signal).then(output => {
+      if (read.signal.aborted || this.current !== link) return;
+      this.paintOutput(output);
+    }, error => {
+      if (read.signal.aborted || this.current !== link) return;
+      this.onError(error);
+    }).finally(() => {
+      if (this.outputRead === read) this.outputRead = null;
+      if (read.signal.aborted || this.current !== link) return;
+      if (this.task?.status === "running") this.scheduleOutputRefresh();
+    });
+  }
+
+  private scheduleOutputRefresh(): void {
+    this.stopOutputTimer();
+    this.outputTimer = this.timers.setTimeout(() => {
+      this.outputTimer = null;
+      this.refreshOutput();
+    }, TASK_OUTPUT_REFRESH_MS);
+  }
+
+  private paintOutput(output: BackgroundTaskOutput | null): void {
+    const { outputText, outputNote } = this.hosts;
+    if (!output) {
+      outputNote.textContent = "Output not yet available";
+      outputNote.hidden = false;
+      return;
+    }
+    if (outputText.textContent !== output.text) outputText.textContent = output.text;
+    outputNote.textContent = output.truncated ? "Showing the end of the output; earlier lines are trimmed." : "";
+    outputNote.hidden = !output.truncated;
+    if (this.following) outputText.scrollTop = outputText.scrollHeight;
+  }
+}

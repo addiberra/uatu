@@ -724,9 +724,9 @@ describe("activity (2.4)", () => {
       expect(envelope.event.kind).toBe("data");
       latest.set(envelope.ws, (envelope.event as { data: unknown }).data);
     }
-    expect(latest.get("stopped")).toEqual({ running: false, working: false, awaiting: false });
-    expect(latest.get("broken")).toEqual({ running: false, working: false, awaiting: false });
-    expect(latest.get("alive")).toEqual({ running: true, working: true, awaiting: false });
+    expect(latest.get("stopped")).toEqual({ running: false, working: false, awaiting: false, finished: false });
+    expect(latest.get("broken")).toEqual({ running: false, working: false, awaiting: false, finished: false });
+    expect(latest.get("alive")).toEqual({ running: true, working: true, awaiting: false, finished: false });
     expect(JSON.stringify(s.envelopes)).not.toContain("secret plans");
   });
 
@@ -747,7 +747,7 @@ describe("activity (2.4)", () => {
     expect(tab2.envelopes).toHaveLength(1);
     child.opened[0]!.push('event: activity\ndata: {"working":true,"awaiting":true}\n\n');
     await waitFor(() => tab1.envelopes.length === 2 && tab2.envelopes.length === 2, "change on both");
-    expect(tab1.envelopes[1]!.event).toEqual({ kind: "data", data: { running: true, working: true, awaiting: true } });
+    expect(tab1.envelopes[1]!.event).toEqual({ kind: "data", data: { running: true, working: true, awaiting: true, finished: false } });
     child.opened[0]!.push('event: activity\ndata: {"working":true,"awaiting":true}\n\n');
     await Bun.sleep(30);
     expect(tab1.envelopes).toHaveLength(2);
@@ -764,10 +764,10 @@ describe("activity (2.4)", () => {
     live.subscribeActivity(s, "u");
     await Bun.sleep(40);
     expect(s.envelopes).toHaveLength(1);
-    expect(s.envelopes[0]!.event).toEqual({ kind: "data", data: { running: true, working: false, awaiting: false } });
+    expect(s.envelopes[0]!.event).toEqual({ kind: "data", data: { running: true, working: false, awaiting: false, finished: false } });
     child.setRunning("old", false);
     await waitFor(() => s.envelopes.length === 2, "stop reported");
-    expect(s.envelopes[1]!.event).toEqual({ kind: "data", data: { running: false, working: false, awaiting: false } });
+    expect(s.envelopes[1]!.event).toEqual({ kind: "data", data: { running: false, working: false, awaiting: false, finished: false } });
   });
 
   test("the activity upstream is refcounted per user and released after the last feed leaves", async () => {
@@ -781,6 +781,147 @@ describe("activity (2.4)", () => {
     expect(child.opened[0]!.cancelled).toBe(false);
     two.detach();
     await waitFor(() => child.opened[0]!.cancelled, "released after linger");
+  });
+});
+
+describe("finished (fix-workspace-activity-states D2/D3)", () => {
+  const facts = (envelope: LiveEnvelope) => (envelope.event as { data: { running: boolean; working: boolean; awaiting: boolean; finished: boolean } }).data;
+  const latestFor = (s: ReturnType<typeof sink>, ws: string) => facts(s.envelopes.filter(e => e.ws === ws).at(-1)!);
+  const push = (child: ReturnType<typeof fakeSource>, working: boolean, awaiting: boolean) =>
+    child.opened[0]!.push(`event: activity\ndata: {"working":${working},"awaiting":${awaiting}}\n\n`);
+
+  // Two users with feeds, the child open and confirmed working.
+  async function workingWorkspace() {
+    const child = fakeSource({ running: new Set(["a"]), workspaces: ["a"] });
+    const live = broker(child.source);
+    const alice = sink();
+    const bob = sink();
+    const attachments = { alice: live.subscribeActivity(alice, "alice"), bob: live.subscribeActivity(bob, "bob") };
+    await waitFor(() => child.opened.length === 1, "one shared activity upstream");
+    child.opened[0]!.push(": open\n\n");
+    push(child, true, false);
+    await waitFor(() => latestFor(alice, "a").working && latestFor(bob, "a").working, "both see working");
+    return { child, live, alice, bob, attachments };
+  }
+
+  test("working → quiet marks the workspace finished for every user holding a feed", async () => {
+    const { child, alice, bob } = await workingWorkspace();
+    push(child, false, false);
+    await waitFor(() => latestFor(alice, "a").finished && latestFor(bob, "a").finished, "both see finished");
+    expect(latestFor(alice, "a")).toEqual({ running: true, working: false, awaiting: false, finished: true });
+    // Unchanged facts re-sent by the child are not a second emit.
+    const count = alice.envelopes.length;
+    push(child, false, false);
+    await Bun.sleep(30);
+    expect(alice.envelopes).toHaveLength(count);
+  });
+
+  test("a workspace first seen quiet is not finished: unknown → idle invents nothing", async () => {
+    const child = fakeSource({ running: new Set(["a"]), workspaces: ["a"] });
+    const live = broker(child.source);
+    const alice = sink();
+    live.subscribeActivity(alice, "alice");
+    await waitFor(() => child.opened.length === 1, "upstream");
+    child.opened[0]!.push(": open\n\n");
+    push(child, false, false);
+    await Bun.sleep(30);
+    expect(latestFor(alice, "a")).toEqual({ running: true, working: false, awaiting: false, finished: false });
+    // Nor does a hub-invented unknown (an old child without the route).
+    const old = fakeSource({ running: new Set(["o"]), workspaces: ["o"], refuse: path => (path === "/api/activity" ? new Response("not found", { status: 404 }) : null) });
+    const oldLive = broker(old.source);
+    const carol = sink();
+    oldLive.subscribeActivity(carol, "carol");
+    await Bun.sleep(40);
+    expect(carol.envelopes.map(facts).every(value => !value.finished)).toBe(true);
+  });
+
+  test("working → awaiting is not a finish, and neither is awaiting → idle without working in between", async () => {
+    const { child, alice } = await workingWorkspace();
+    push(child, true, true);
+    await waitFor(() => latestFor(alice, "a").awaiting, "awaiting");
+    expect(latestFor(alice, "a").finished).toBe(false);
+    push(child, false, false);
+    await Bun.sleep(30);
+    expect(latestFor(alice, "a")).toEqual({ running: true, working: false, awaiting: false, finished: false });
+    // Answered, the agent works on, then finishes: that finish counts.
+    push(child, true, false);
+    await waitFor(() => latestFor(alice, "a").working, "working again");
+    push(child, false, false);
+    await waitFor(() => latestFor(alice, "a").finished, "finished after the answer's work");
+  });
+
+  test("acknowledging clears finished for that user only, emitting exactly once, and is idempotent", async () => {
+    const { child, live, alice, bob } = await workingWorkspace();
+    push(child, false, false);
+    await waitFor(() => latestFor(alice, "a").finished && latestFor(bob, "a").finished, "both finished");
+    const aliceCount = alice.envelopes.length;
+    const bobCount = bob.envelopes.length;
+    live.acknowledgeViewed("alice", "a");
+    expect(alice.envelopes).toHaveLength(aliceCount + 1);
+    expect(latestFor(alice, "a")).toEqual({ running: true, working: false, awaiting: false, finished: false });
+    expect(bob.envelopes).toHaveLength(bobCount);
+    expect(latestFor(bob, "a").finished).toBe(true);
+    live.acknowledgeViewed("alice", "a");
+    live.acknowledgeViewed("alice", "unknown-workspace");
+    expect(alice.envelopes).toHaveLength(aliceCount + 1);
+    // A later finish outranks the earlier view.
+    push(child, true, false);
+    await waitFor(() => latestFor(alice, "a").working, "working again");
+    push(child, false, false);
+    await waitFor(() => latestFor(alice, "a").finished, "finished again for alice");
+  });
+
+  test("a stop clears finished; so does work starting again", async () => {
+    const { child, live, alice } = await workingWorkspace();
+    push(child, false, false);
+    await waitFor(() => latestFor(alice, "a").finished, "finished");
+    push(child, true, false);
+    await waitFor(() => latestFor(alice, "a").working, "working");
+    expect(latestFor(alice, "a").finished).toBe(false);
+    push(child, false, false);
+    await waitFor(() => latestFor(alice, "a").finished, "finished once more");
+    child.setRunning("a", false);
+    await waitFor(() => !latestFor(alice, "a").running, "stopped");
+    expect(latestFor(alice, "a")).toEqual({ running: false, working: false, awaiting: false, finished: false });
+    // Restarted: the child is seen fresh, nothing finished carries over.
+    child.setRunning("a", true);
+    await waitFor(() => child.opened.length === 2, "reopened");
+    child.opened[1]!.push(": open\n\nevent: activity\ndata: {\"working\":false,\"awaiting\":false}\n\n");
+    await Bun.sleep(30);
+    expect(latestFor(alice, "a")).toEqual({ running: true, working: false, awaiting: false, finished: false });
+    void live;
+  });
+
+  test("a user whose feed was dropped and re-created still sees finished; the shared upstream's replay is not a transition", async () => {
+    const { child, live, alice, bob, attachments } = await workingWorkspace();
+    push(child, false, false);
+    await waitFor(() => latestFor(alice, "a").finished && latestFor(bob, "a").finished, "both finished");
+    // Alice closes her last page: her feed goes; bob's keeps the upstream.
+    attachments.alice.detach();
+    // A frame arrives meanwhile — still quiet — and bob is unchanged.
+    push(child, false, false);
+    await Bun.sleep(20);
+    const again = sink();
+    live.subscribeActivity(again, "alice");
+    expect(latestFor(again, "a")).toEqual({ running: true, working: false, awaiting: false, finished: true });
+    expect(latestFor(bob, "a").finished).toBe(true);
+    // Bob acknowledged nothing, alice's new feed did not invent a second
+    // finish from the replayed frame either: acknowledging clears it for
+    // good until real work happens again.
+    live.acknowledgeViewed("alice", "a");
+    expect(latestFor(again, "a").finished).toBe(false);
+    push(child, false, false);
+    await Bun.sleep(20);
+    expect(latestFor(again, "a").finished).toBe(false);
+  });
+
+  test("every activity payload carries exactly the four facts", async () => {
+    const { child, alice } = await workingWorkspace();
+    push(child, false, false);
+    await waitFor(() => latestFor(alice, "a").finished, "finished");
+    for (const envelope of alice.envelopes) {
+      expect(Object.keys(facts(envelope)).sort()).toEqual(["awaiting", "finished", "running", "working"]);
+    }
   });
 });
 
@@ -881,7 +1022,7 @@ describe("worktrees topic (worktree 5.2)", () => {
     live.publishWorktrees(["ws"]);
     expect(client.envelopes.every(envelope => envelope.topic === "activity")).toBe(true);
     for (const envelope of client.envelopes) {
-      if (envelope.event.kind === "data") expect(Object.keys(envelope.event.data as object).sort()).toEqual(["awaiting", "running", "working"]);
+      if (envelope.event.kind === "data") expect(Object.keys(envelope.event.data as object).sort()).toEqual(["awaiting", "finished", "running", "working"]);
     }
   });
 

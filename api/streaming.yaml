@@ -181,11 +181,12 @@ schemas:
     description: A content-free invalidation of the worktree inventory. Read the inventory again.
   WorkspaceActivity:
     type: object
-    required: [running, working, awaiting]
+    required: [running, working, awaiting, finished]
     properties:
       running: { type: boolean, description: The workspace's session is running and its child answers. }
-      working: { type: boolean, description: An agent conversation is working. Always false when not running. }
+      working: { type: boolean, description: An agent conversation is working, whether a turn is in flight or the agent still holds live background work. Always false when not running. }
       awaiting: { type: boolean, description: A permission request or question awaits the user. Always false when not running. }
+      finished: { type: boolean, description: "Held per caller: the Hub observed the workspace working, it has since gone quiet (not working, nothing awaiting), and the caller has not acknowledged viewing it since (POST /s/{workspaceId}/api/activity-viewed). Cleared by that acknowledgement, by the session stopping, or by work starting again. A workspace first seen quiet is not finished. Always false when not running." }
     additionalProperties: false
   CloneOutput:
     type: object

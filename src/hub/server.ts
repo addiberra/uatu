@@ -1636,6 +1636,23 @@ export function createHubFetchHandler(deps: HubDeps) {
           return json(500, { error: "failed to persist personal state" });
         }
       }
+      // The viewing page says the user has this workspace's chat in view:
+      // whatever finished there is seen for this user, on every device.
+      // Hub-served like personal state — the fact is composed at the hub's
+      // live broker, and the child knows nothing of it.
+      if (suffix === "/api/activity-viewed") {
+        if (!registry.byId(workspaceId)) {
+          return json(404, { error: `unknown workspace: ${workspaceId}` });
+        }
+        if (request.method !== "POST") {
+          return new Response(JSON.stringify({ error: "method not allowed" }), {
+            status: 405,
+            headers: { "content-type": "application/json", allow: "POST" },
+          });
+        }
+        liveBroker.acknowledgeViewed(session.user, workspaceId);
+        return new Response(null, { status: 204, headers: NO_STORE_HEADERS });
+      }
       if (REFUSED_CHILD_STREAM_SUFFIXES.test(suffix)) {
         // Gone, not proxied: no request reaches the child for these. The
         // body names the replacement so an old client or integration knows

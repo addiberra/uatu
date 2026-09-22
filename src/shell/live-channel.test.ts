@@ -992,8 +992,8 @@ describe("createLiveChannel — recovery and status", () => {
     h.latest().live(envelope("activity", { kind: "data", data: { running: false, working: true, awaiting: true } }, { ws: "three" }));
     h.latest().live(envelope("activity", { kind: "ready" }, { ws: "two" }));
     expect(seen).toEqual([
-      ["two", { running: true, working: true, awaiting: false }],
-      ["three", { running: false, working: false, awaiting: false }],
+      ["two", { running: true, working: true, awaiting: false, finished: false }],
+      ["three", { running: false, working: false, awaiting: false, finished: false }],
     ]);
     off();
     h.latest().live(envelope("activity", { kind: "data", data: { running: true, working: false, awaiting: false } }, { ws: "two" }));
@@ -1013,16 +1013,16 @@ describe("createLiveChannel — recovery and status", () => {
     h.channel.onActivity((ws, activity) => seen.push([ws, activity]));
     // Synchronously, during registration.
     expect(seen).toEqual([
-      ["two", { running: true, working: true, awaiting: true }],
-      ["three", { running: false, working: false, awaiting: false }],
+      ["two", { running: true, working: true, awaiting: true, finished: false }],
+      ["three", { running: false, working: false, awaiting: false, finished: false }],
     ]);
 
     // After that, live as before and without a repeat of the replay.
     h.latest().live(envelope("activity", { kind: "data", data: { running: true, working: false, awaiting: false } }, { ws: "two" }));
     expect(seen).toEqual([
-      ["two", { running: true, working: true, awaiting: true }],
-      ["three", { running: false, working: false, awaiting: false }],
-      ["two", { running: true, working: false, awaiting: false }],
+      ["two", { running: true, working: true, awaiting: true, finished: false }],
+      ["three", { running: false, working: false, awaiting: false, finished: false }],
+      ["two", { running: true, working: false, awaiting: false, finished: false }],
     ]);
   });
 
@@ -1042,10 +1042,10 @@ describe("createLiveChannel — recovery and status", () => {
     // The replacement's snapshot no longer mentions "gone" (forgotten meanwhile).
     h.channel.connect({ resumed: true });
     h.latest().live(envelope("activity", { kind: "data", data: { running: true, working: false, awaiting: false } }, { ws: "two" }));
-    expect(whileReleased).toEqual([["two", { running: true, working: false, awaiting: false }]]);
+    expect(whileReleased).toEqual([["two", { running: true, working: false, awaiting: false, finished: false }]]);
     const late: [string, unknown][] = [];
     h.channel.onActivity((ws, activity) => late.push([ws, activity]));
-    expect(late).toEqual([["two", { running: true, working: false, awaiting: false }]]);
+    expect(late).toEqual([["two", { running: true, working: false, awaiting: false, finished: false }]]);
 
     // A reconnect after a lost stream starts from a clean slate the same way.
     h.latest().fail();

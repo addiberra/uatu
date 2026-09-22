@@ -9,7 +9,7 @@ import { ConversationInventoryBroadcaster, type ConversationInventorySubscriptio
 import { ReversibleHistoryTargetError } from "../../src/chat/provider";
 import type { WorkspaceChatService } from "../../src/chat/service";
 import { ConversationNotFoundError } from "../../src/chat/workspace";
-import { isLiveConversationStatus, type AgentUsageReport, type UsageReadMode, type UsageReadResult } from "../../src/chat/types";
+import { isLiveConversationStatus, type AgentUsageReport, type BackgroundTaskOutput, type UsageReadMode, type UsageReadResult } from "../../src/chat/types";
 import type {
   ChatActivity,
   ChatCapability,
@@ -271,12 +271,14 @@ export class FakeE2EChatService implements WorkspaceChatService {
   }
 
   // Workspace activity (hub-brokered-live-stream D5), read from the same
-  // state the fixture's conversations publish — a live status is working, a
-  // pending permission or question awaits the user — so a spec that drives a
-  // conversation drives the summary with it. Every mutation below ticks;
-  // the route drops ticks that leave the summary unchanged.
+  // state the fixture's conversations publish — a live status or live
+  // background work is working, a pending permission or question awaits the
+  // user — so a spec that drives a conversation drives the summary with it.
+  // Every mutation below ticks; the route drops ticks that leave the summary
+  // unchanged.
   async activity(): Promise<ChatActivity> {
-    const working = [...this.conversations.values()].some(conversation => isLiveConversationStatus(conversation.status));
+    const working = [...this.conversations.values()].some(conversation =>
+      isLiveConversationStatus(conversation.status) || conversation.status === "background");
     const awaiting = [...this.items.values()].some(items => [...items.values()].some(item =>
       (item.type === "permission" || item.type === "question") && item.status === "pending"));
     return { working, awaiting };
@@ -543,6 +545,31 @@ export class FakeE2EChatService implements WorkspaceChatService {
   readonly stoppedTasks: string[] = [];
   readonly releasedConversations: string[] = [];
 
+  // A fake output per task id, set by a control action: what the shell task
+  // view's output pane reads. Absent means the agent has not named the
+  // output yet, which the route answers as 404.
+  readonly taskOutputs = new Map<string, string>();
+  async taskOutput(id: string, taskId: string, options: { tailBytes: number }): Promise<BackgroundTaskOutput | null> {
+    this.require(id);
+    const text = this.taskOutputs.get(taskId);
+    if (text === undefined) return null;
+    const item = this.items.get(id)?.get(`task:${taskId}`);
+    const settled = item?.type === "background_task" ? item.status !== "running" : true;
+    const truncated = text.length > options.tailBytes;
+    return { text: truncated ? text.slice(text.length - options.tailBytes) : text, truncated, settled };
+  }
+
+  /**
+   * What a shell task has written so far, as the `taskOutput` control action
+   * sets it. Appending is the interesting shape: a spec proves the open
+   * output pane picks the new bytes up on its own poll, the way the real
+   * file grows under the running command. Absent (never set) leaves the read
+   * answering 404, which is the "output not yet available" state.
+   */
+  setTaskOutput(taskId: string, text: string, append = false): void {
+    this.taskOutputs.set(taskId, append ? (this.taskOutputs.get(taskId) ?? "") + text : text);
+  }
+
   // The workspace's last-known plan usage and how the next read answers,
   // both set by control actions (design D9).
   usageReport: AgentUsageReport | null = null;
@@ -672,6 +699,10 @@ export class FakeE2EChatService implements WorkspaceChatService {
     this.promptConfigurations = [];
     this.reversibleAttempts = [];
     this.permissionChoices.length = 0;
+    // A fake task output and the stops one spec staged are that spec's setup:
+    // left behind they reach whichever test boots against this worker next.
+    this.taskOutputs.clear();
+    this.stoppedTasks.length = 0;
     this.failNextPrompt = false;
     this.failNextReversible = null;
     this.failNextHistory = false;

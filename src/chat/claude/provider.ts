@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { boundedSet } from "../../shared/bounded-map";
 import { HistoryReuse, historyPageCursor, historyPageEnd, historyVersion } from "../history-reuse";
 
 import type {
@@ -19,11 +20,11 @@ import type {
 } from "../provider";
 import type { ConversationItem, ScheduledWakeupItem } from "../types";
 import { ScheduledWakeupUnavailableError } from "../provider";
-import type { AgentUsageReport, ChatAgent, ChatCommand, ChatMode, ChatModel, ConversationConfiguration, ModelSelection, PermissionRequest, PlanExtraUsage, PlanModelWindow, PlanUtilization, PlanUtilizationWindow, QuestionRequest, ReversibleHistoryResult, ReversibleHistoryState, SessionModelTotals, SessionTotals, StructuredQuestion, UsageReadMode, UsageReadResult } from "../types";
+import type { AgentUsageReport, BackgroundTaskOutput, ChatAgent, ChatCommand, ChatMode, ChatModel, ConversationConfiguration, ModelSelection, PermissionRequest, PlanExtraUsage, PlanModelWindow, PlanUtilization, PlanUtilizationWindow, QuestionRequest, ReversibleHistoryResult, ReversibleHistoryState, SessionModelTotals, SessionTotals, StructuredQuestion, UsageReadMode, UsageReadResult } from "../types";
 import { BackgroundTaskUnavailableError, InvalidQuestionAnswerError, ReleaseUnavailableError, ReversibleHistoryTargetError, UnsupportedVariantSelectionError } from "../provider";
 import { nextCronFire } from "./cron";
 import { CLAUDE_MODELS, claudeContextWindow, findClaudeModel, stripWindowMarker, versionedModelName, withMoreModels } from "./models";
-import { claudeToolInteraction, createClaudeEventMemory, describeSessionScopedUpdates, markTasksBackgrounded, normalizeClaudeMessage, normalizeContextUsage, normalizeTranscriptEntries, claudeModelSelection, sessionScopedSuggestions, type ClaudeEventMemory } from "./normalization";
+import { claudeToolInteraction, createClaudeEventMemory, describeSessionScopedUpdates, markTasksBackgrounded, normalizeClaudeMessage, normalizeContextUsage, normalizeTranscriptEntries, claudeModelSelection, sessionScopedSuggestions, type BackgroundTaskFacts, type ClaudeEventMemory } from "./normalization";
 import { ClaudeNotificationLifecycle } from "./notification-lifecycle";
 import { listTranscriptSessions, readSessionTranscript, readTranscriptTitles, sessionTranscriptPath, subagentTranscriptPath, claudeConfigDir, transcriptCrons, type TranscriptCron } from "./transcript";
 
@@ -105,6 +106,17 @@ export type ClaudeQueryInput = {
      * the CLI submits by itself (scheduled wakeups, D1/D4).
      */
     hooks?: Partial<Record<"Stop" | "UserPromptSubmit", Array<{ hooks: Array<(input: Record<string, unknown>, toolUseID: string | undefined, options: { signal: AbortSignal }) => Promise<{ continue: true } | { decision: "block"; reason: string }>> }>>>;
+    /**
+     * A model-written one-line progress summary on an agent task's
+     * `task_progress` (~30 s cadence), so a running subagent's row can say
+     * what it is doing rather than only which tool it last used.
+     */
+    agentProgressSummaries?: boolean;
+    /**
+     * Subagent text and thinking frames, not only tool blocks, tagged with
+     * `parent_tool_use_id` — what a live child transcript is rendered from.
+     */
+    forwardSubagentText?: boolean;
   };
 };
 
@@ -247,7 +259,7 @@ type LiveSession = {
   // Live background work, replaced on every background_tasks_changed level
   // signal (ambient ids excluded) and reset when the process starts (D7).
   // A non-empty set keeps the session alive past its turn's result.
-  backgroundTasks: Map<string, { description: string; taskType?: string; toolUseId?: string; startedAt: number }>;
+  backgroundTasks: Map<string, LiveBackgroundTask>;
   // A turn the CLI started by itself — the follow-up after a settled
   // background task (D9) — so its messages report running/completed like an
   // accepted prompt's, and retirement waits for its result.
@@ -288,6 +300,11 @@ type LiveSession = {
   // conversation's ledger when the query retires, since a resumed query
   // starts its counters fresh (SDK: "resumed sessions start fresh").
   lastTotals?: SessionTotals;
+  // The subagent runs this query launched, by the tool use that launched
+  // each: where a frame tagged `parent_tool_use_id` is routed (design D8).
+  // Kept for the query's life — a settled run's transcript is on disk, but
+  // a late frame still has a home, and the drill-down keeps resolving it.
+  children: Map<string, LiveChild>;
 };
 
 type SessionWakeup = { prompt: string; recurring: boolean; schedule: string; createdAt: number; nextFireAt?: number };
@@ -319,6 +336,55 @@ const CANCELLED_FIRE_REASON = "Cancelled in uatu: this scheduled wakeup no longe
 export const WAKEUP_PAUSED_MESSAGE = "Paused: the agent's session ended. Claude Code restores this schedule when the conversation runs again.";
 const WAKEUP_NOT_RESTORED_MESSAGE = "Claude Code did not restore this schedule when the conversation ran again.";
 export const WAKEUP_PAUSED_ONCE_MESSAGE = "Paused: the agent's session ended. It fires only if the conversation is running again by its time.";
+
+/**
+ * One subagent run of a live session: its child conversation id
+ * (`sub:<parentSessionId>:<agentId>`) and the normalizer memory its frames
+ * are folded with. The memory is the child's own, not the parent's: a
+ * subagent's tool results, streams, and model are its transcript's, and
+ * within it a frame is untagged — the same shape the stored transcript
+ * replays, so the ids agree (`message:<uuid>`, `tool:<toolUseId>`).
+ */
+type LiveChild = {
+  id: string;
+  agentId: string;
+  memory: ClaudeEventMemory;
+  startedAt: number;
+  // The run reported its end (task frame, sync tool result, or the
+  // session's own end): the child read as running until then.
+  settled: boolean;
+};
+
+// Frames the CLI forwards from inside a subagent run carry the launching
+// tool use as `parent_tool_use_id`. Only these kinds are the run's own;
+// session-level frames (`system` task edges, `result`, rate limits) stay
+// the parent's whatever tag they carry (task 5.1, requirement f).
+const SUBAGENT_FRAME_TYPES = new Set(["assistant", "user", "stream_event", "tool_progress"]);
+const CHILDREN_LIMIT = 512;
+
+// One live background task as the session holds it: the level signal's
+// identity plus the facts the edges and the launching tool result added
+// (mirrored from the normalizer's rows, see readSession), so a reopened
+// conversation's seeded row says what the live one said.
+type LiveBackgroundTask = BackgroundTaskFacts & { description: string; taskType?: string; toolUseId?: string; startedAt: number };
+
+/** The facts an entry (live or normalizer memory) holds, as spread-ready fields. */
+function liveTaskFacts(entry: Partial<BackgroundTaskFacts> | undefined): BackgroundTaskFacts {
+  if (!entry) return {};
+  return {
+    ...(entry.subagentType ? { subagentType: entry.subagentType } : {}),
+    ...(entry.prompt ? { prompt: entry.prompt } : {}),
+    ...(entry.usage ? { usage: entry.usage } : {}),
+    ...(entry.outputFile ? { outputFile: entry.outputFile } : {}),
+    ...(entry.childConversationId ? { childConversationId: entry.childConversationId } : {}),
+  };
+}
+
+// The output tail a reader may ask for is bounded here, whatever the route
+// asks: the file is a shell command's live output and can be arbitrarily
+// large.
+const TASK_OUTPUT_TAIL_MAX_BYTES = 64 * 1024;
+const TASK_OUTPUTS_LIMIT = 512;
 
 // What retired queries of one conversation spent, and when this process began
 // observing it. The SDK's `/usage` session counters cover the current query
@@ -470,6 +536,11 @@ export class ClaudeProvider implements ChatProvider {
   // enforced here, durably: a cancelled wakeup never holds a session and
   // its fires are blocked at the UserPromptSubmit hook (D12).
   private readonly cancelledWakeups = new Map<string, Map<string, string>>();
+  // Where each task's output file is, by `<session>:<task>`, kept past the
+  // task's settling and the session's retirement (bounded): the reader's
+  // last refresh after a settle must still find it. Never a client's path:
+  // only what a CLI frame or the launching tool result named.
+  private readonly taskOutputs = new Map<string, { outputFile: string; settled: boolean }>();
   private readonly titleRefreshTimers = new Map<string, ReturnType<typeof setTimeout>>();
   // The login's plan usage as last read on this workspace — after a turn or
   // on demand, through any conversation. Per login, not per conversation,
@@ -685,6 +756,14 @@ export class ClaudeProvider implements ChatProvider {
     // from where Claude actually stored them.
     const child = parseSubagentId(id);
     if (child) {
+      // A run this process launched is known from its start edge, before
+      // the CLI has written a line of its transcript: the drill-down opens
+      // it live, and its routed frames pass the adapter's confinement check
+      // (design D8). The parent is a live session, so it is accepted.
+      const live = this.liveChild(id);
+      if (live) {
+        return { id, title: "Subagent", directory: this.workspacePath, createdAt: live.child.startedAt, updatedAt: this.now(), parentId: live.parentSessionId };
+      }
       // Synthetic and read-only: a subagent run is reached from its parent's
       // row, never started or listed on its own. `parentId` is what keeps it
       // out of the picker and routes its interactions to the parent. The
@@ -758,8 +837,11 @@ export class ClaudeProvider implements ChatProvider {
       } catch (error) {
         this.historyReuse.invalidate(sessionId);
         if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-        if (child) throw new Error(`unknown Claude subagent transcript: ${sessionId}`);
-        if (!this.pending.has(sessionId) && !this.live.has(sessionId)) throw new Error(`unknown Claude conversation: ${sessionId}`);
+        // A live run whose transcript is not on disk yet is empty, not
+        // unknown: the drill-down's snapshot is empty and the routed frames
+        // fill it (design D8).
+        if (child && !this.liveChild(sessionId)) throw new Error(`unknown Claude subagent transcript: ${sessionId}`);
+        if (!child && !this.pending.has(sessionId) && !this.live.has(sessionId)) throw new Error(`unknown Claude conversation: ${sessionId}`);
         normalized = { items: [], accounting: [] };
         version = "empty";
         break;
@@ -1178,9 +1260,18 @@ export class ClaudeProvider implements ChatProvider {
             return { continue: true as const };
           }] }],
         },
+        // A running agent task's row shows the model's own progress line
+        // (spec: the model-written progress summary Claude Code produces
+        // when asked); the cost is a short fork per running agent task.
+        agentProgressSummaries: true,
+        // A running subagent's text and thinking arrive under its parent
+        // tool use, so an open child transcript can be live (design D8):
+        // readSession routes every frame so tagged to the run's child
+        // conversation once the run is known (routeSubagentFrame).
+        forwardSubagentText: true,
       },
     });
-    const session: LiveSession = { id: sessionId, notificationLifecycle: new ClaudeNotificationLifecycle(), queue, query, reader: Promise.resolve(), pendingTurns: 0, backgroundTasks: new Map(), wakeups: new Map(), firedSinceStop: new Map(), cronIds: new Set(), selfPacedPrompts: new Set(), blockedFires: 0, revived: new Map(), revivedSettled: false, revivedReady: Promise.resolve(), unpromptedTurn: false, resultsSeen: 0, queuedTurns: 0, usageReads: 0, usageSeq: 0, usageAdopted: 0 };
+    const session: LiveSession = { id: sessionId, notificationLifecycle: new ClaudeNotificationLifecycle(), queue, query, reader: Promise.resolve(), pendingTurns: 0, backgroundTasks: new Map(), wakeups: new Map(), firedSinceStop: new Map(), cronIds: new Set(), selfPacedPrompts: new Set(), blockedFires: 0, revived: new Map(), revivedSettled: false, revivedReady: Promise.resolve(), unpromptedTurn: false, resultsSeen: 0, queuedTurns: 0, usageReads: 0, usageSeq: 0, usageAdopted: 0, children: new Map() };
     owner = session;
     session.reader = this.readSession(session);
     this.live.set(sessionId, session);
@@ -1220,9 +1311,14 @@ export class ClaudeProvider implements ChatProvider {
           ? (message as { uuid: string }).uuid : undefined;
         if (resultId && session.notificationLifecycle.hasResult(resultId)) continue;
         this.captureCommands(message);
+        // A frame from inside a known subagent run is the child's, whole:
+        // it never reaches the parent's normalizer, turn accounting, or the
+        // unprompted-turn guard below (design D8).
+        if (this.routeSubagentFrame(session, message)) continue;
         this.trackSessionLevel(session, message, memory);
         this.trackSchedulingCalls(session, message, memory);
         const normalized = normalizeClaudeMessage(message, memory, "live", session.id);
+        this.learnSubagentRuns(session, message, normalized);
         if (memory.rateLimit) this.rateLimitedSessions.set(session.id, memory.rateLimit); else this.rateLimitedSessions.delete(session.id);
         this.adoptRefusalFallback(session.id, message);
         // A retry or a compaction names a state of the conversation's own
@@ -1240,6 +1336,12 @@ export class ClaudeProvider implements ChatProvider {
           const entry = typeof started.task_id === "string" ? session.backgroundTasks.get(started.task_id) : undefined;
           if (entry && typeof started.tool_use_id === "string" && started.tool_use_id) entry.toolUseId = started.tool_use_id;
         }
+        // Whatever a task's row learned (its type, prompt, usage, output
+        // file, child id) is mirrored onto the live entry, so the list a
+        // reopened conversation is seeded from carries it too; the output
+        // file is kept past the row's settling for the one read that
+        // follows it (taskOutput).
+        this.mirrorTaskRows(session, normalized.updates);
         // A turn the CLI started by itself (the follow-up after a settled
         // background task, D9): report it running so the composer and the
         // held-message queue treat it like any turn.
@@ -1341,6 +1443,9 @@ export class ClaudeProvider implements ChatProvider {
           // The crons were inside the process; they end with it (D6).
           ...this.settleWakeups(session, "ended"),
         ];
+        // Subagent runs died with it too: their child transcripts stop
+        // reading as running.
+        this.settleChildren(session, "interrupted");
         // A turn the CLI reported queued behind its follow-up is lost with
         // the process too: it was accepted, so it fails rather than vanishes.
         if (session.pendingTurns > 0 || session.unpromptedTurn || session.queuedTurns > 0) {
@@ -1359,6 +1464,7 @@ export class ClaudeProvider implements ChatProvider {
       this.foldSessionTotals(session);
       this.clearIdleTimer(session);
       this.abandonInteractions(session.id, "The session failed before the user answered.");
+      this.settleChildren(session, "failed");
       this.emit(session.id, {
         updates: [
           ...this.settleBackgroundTasks(session, "The Claude Code session failed before this task finished.", memory),
@@ -2015,7 +2121,7 @@ export class ClaudeProvider implements ChatProvider {
     // add a second, unobserved path to retirement. Results and the
     // background set decide.
     if (record.subtype !== "background_tasks_changed" || !Array.isArray(record.tasks)) return;
-    const next = new Map<string, { description: string; taskType?: string; toolUseId?: string; startedAt: number }>();
+    const next = new Map<string, LiveBackgroundTask>();
     // Every id the payload names, ambient ones included: a task that turned
     // ambient is still running and must not read as dropped.
     const named = new Set<string>();
@@ -2032,6 +2138,7 @@ export class ClaudeProvider implements ChatProvider {
         ...(typeof task.task_type === "string" && task.task_type ? { taskType: task.task_type } : known?.taskType ? { taskType: known.taskType } : {}),
         ...(known?.toolUseId ? { toolUseId: known.toolUseId } : {}),
         startedAt: known && "startedAt" in known ? (known as { startedAt: number }).startedAt : (known as { createdAt?: number } | undefined)?.createdAt ?? this.now(),
+        ...liveTaskFacts(known),
       });
     }
     const previous = session.backgroundTasks;
@@ -2047,7 +2154,7 @@ export class ClaudeProvider implements ChatProvider {
     const reconciled: NormalizedProviderUpdate[] = [];
     for (const [taskId, task] of next) {
       if (previous.has(taskId) || memory.tasks.get(taskId)?.announced) continue;
-      reconciled.push({ kind: "upsert", item: { id: `task:${taskId}`, type: "background_task", createdAt: task.startedAt, taskId, description: task.description, ...(task.taskType ? { taskType: task.taskType } : {}), ...(task.toolUseId ? { toolUseId: task.toolUseId } : {}), status: "running" } });
+      reconciled.push({ kind: "upsert", item: { id: `task:${taskId}`, type: "background_task", createdAt: task.startedAt, taskId, description: task.description, ...(task.taskType ? { taskType: task.taskType } : {}), ...(task.toolUseId ? { toolUseId: task.toolUseId } : {}), status: "running", ...liveTaskFacts(task) } });
     }
     for (const taskId of ambient) {
       // Ambient is not user work, whether the task turned so or its start
@@ -2067,7 +2174,8 @@ export class ClaudeProvider implements ChatProvider {
       // The level says only that the task ended, not how: the row closes as
       // stopped and says so, and the notification (when it comes) supplies
       // the real outcome and summary — a terminal row takes any but running.
-      reconciled.push({ kind: "upsert", item: { id: `task:${taskId}`, type: "background_task", createdAt: task.startedAt, taskId, description: task.description, ...(task.taskType ? { taskType: task.taskType } : {}), ...(task.toolUseId ? { toolUseId: task.toolUseId } : {}), status: "stopped", summary: "The task left Claude Code's task list without reporting an outcome." } });
+      reconciled.push({ kind: "upsert", item: { id: `task:${taskId}`, type: "background_task", createdAt: task.startedAt, taskId, description: task.description, ...(task.taskType ? { taskType: task.taskType } : {}), ...(task.toolUseId ? { toolUseId: task.toolUseId } : {}), status: "stopped", summary: "The task left Claude Code's task list without reporting an outcome.", ...liveTaskFacts(task) } });
+      this.settleTaskOutput(session.id, taskId);
     }
     if (reconciled.length > 0) this.emit(session.id, { updates: reconciled, outcome: "handled", eventType: "background.reconciled" });
     if (next.size === 0 && session.pendingTurns === 0 && !session.unpromptedTurn) {
@@ -2102,11 +2210,12 @@ export class ClaudeProvider implements ChatProvider {
     // row the level set never held: it died with the process all the same.
     for (const [taskId, task] of memory.tasks) {
       if (live.has(taskId) || !task.announced || task.settled || memory.ambientTasks.has(taskId)) continue;
-      live.set(taskId, { description: task.description, ...(task.taskType ? { taskType: task.taskType } : {}), ...(task.toolUseId ? { toolUseId: task.toolUseId } : {}), startedAt: task.createdAt });
+      live.set(taskId, { description: task.description, ...(task.taskType ? { taskType: task.taskType } : {}), ...(task.toolUseId ? { toolUseId: task.toolUseId } : {}), startedAt: task.createdAt, ...liveTaskFacts(task) });
     }
     for (const [taskId, task] of live) {
       const known = memory.tasks.get(taskId);
       if (known) known.settled = true;
+      this.settleTaskOutput(session.id, taskId);
       updates.push({ kind: "upsert", item: {
         id: `task:${taskId}`,
         type: "background_task",
@@ -2117,6 +2226,7 @@ export class ClaudeProvider implements ChatProvider {
         ...(task.toolUseId ? { toolUseId: task.toolUseId } : {}),
         status: "stopped",
         summary,
+        ...liveTaskFacts(task),
       } });
     }
     session.backgroundTasks = new Map();
@@ -2485,7 +2595,7 @@ export class ClaudeProvider implements ChatProvider {
     const tasks: PendingBackgroundTask[] = [];
     for (const session of this.live.values()) {
       for (const [taskId, task] of session.backgroundTasks) {
-        tasks.push({ conversationId: session.id, taskId, description: task.description, ...(task.taskType ? { taskType: task.taskType } : {}), ...(task.toolUseId ? { toolUseId: task.toolUseId } : {}), startedAt: task.startedAt });
+        tasks.push({ conversationId: session.id, taskId, description: task.description, ...(task.taskType ? { taskType: task.taskType } : {}), ...(task.toolUseId ? { toolUseId: task.toolUseId } : {}), startedAt: task.startedAt, ...liveTaskFacts(task) });
       }
     }
     return tasks;
@@ -2499,6 +2609,201 @@ export class ClaudeProvider implements ChatProvider {
     if (!session || !session.backgroundTasks.has(taskId)) throw new BackgroundTaskUnavailableError("that background task is no longer running");
     if (!session.query.stopTask) throw new BackgroundTaskUnavailableError("this Claude Code install cannot stop background tasks");
     await session.query.stopTask(taskId);
+  }
+
+  /**
+   * A bounded tail of a shell task's output file (design D7). Null when the
+   * task is unknown, when nothing has named its output yet, or when the
+   * named file does not resolve to `…/tasks/<taskId>.output` — the CLI's own
+   * layout for a task's output; an agent task's "output" is a symlink to its
+   * subagent transcript and is refused here, its drill-down reads that. Only
+   * the tail is read (no whole-file reads), from the end of the file.
+   */
+  async taskOutput(sessionId: string, taskId: string, options: { tailBytes: number }): Promise<BackgroundTaskOutput | null> {
+    const entry = this.taskOutputs.get(`${sessionId}:${taskId}`);
+    if (!entry) return null;
+    const tailBytes = Math.max(1, Math.min(Math.floor(options.tailBytes), TASK_OUTPUT_TAIL_MAX_BYTES));
+    let real: string;
+    try {
+      real = await fs.realpath(entry.outputFile);
+    } catch {
+      return null;
+    }
+    if (path.basename(real) !== `${taskId}.output` || path.basename(path.dirname(real)) !== "tasks") return null;
+    const running = this.live.get(sessionId)?.backgroundTasks.has(taskId) === true && !entry.settled;
+    let handle: fs.FileHandle;
+    try {
+      handle = await fs.open(real, "r");
+    } catch {
+      return null;
+    }
+    try {
+      const { size } = await handle.stat();
+      const start = Math.max(0, size - tailBytes);
+      const length = size - start;
+      const buffer = Buffer.alloc(length);
+      let read = 0;
+      while (read < length) {
+        const chunk = await handle.read(buffer, read, length - read, start + read);
+        if (chunk.bytesRead === 0) break;
+        read += chunk.bytesRead;
+      }
+      return { text: buffer.subarray(0, read).toString("utf8"), truncated: start > 0, settled: !running };
+    } finally {
+      await handle.close();
+    }
+  }
+
+  /**
+   * What the normalizer's task rows say, mirrored onto the session's live
+   * entry and the output-file index: the rows are the one place every
+   * source of a task's facts (edges, launching tool result, stored
+   * notification) converges.
+   */
+  private mirrorTaskRows(session: LiveSession, updates: NormalizedProviderUpdate[]): void {
+    for (const update of updates) {
+      if (update.kind !== "upsert" || update.item.type !== "background_task") continue;
+      const row = update.item;
+      const live = session.backgroundTasks.get(row.taskId);
+      if (live) Object.assign(live, liveTaskFacts(row));
+      if (row.outputFile) {
+        const key = `${session.id}:${row.taskId}`;
+        const known = this.taskOutputs.get(key);
+        boundedSet(this.taskOutputs, key, { outputFile: row.outputFile, settled: known?.settled === true || row.status !== "running" }, TASK_OUTPUTS_LIMIT);
+      } else if (row.status !== "running") {
+        this.settleTaskOutput(session.id, row.taskId);
+      }
+    }
+  }
+
+  /**
+   * A frame tagged with the tool use of a known subagent run is the child
+   * conversation's (design D8): it is normalized with the child's own memory
+   * and emitted under `sub:<parentSessionId>:<agentId>`, where the adapter's
+   * `parentId` routing publishes it on the child's topic — text, thinking,
+   * tool calls, tool results, streams, and tool heartbeats alike. Nothing of
+   * it lands in the parent: its tool rows too are the run's own, and the
+   * parent's picture of the run is its launching row (the renderer's
+   * subagent entries derive from that row, not from the run's tool rows;
+   * the adapter's launcher tracking reads rows with a child id, which the
+   * run's own rows never carry). A tagged frame whose run is unknown — a
+   * Skill fork, whose agent id only the ending tool result names, or a CLI
+   * that emits no task edges — falls through to the parent's normalizer,
+   * which keeps its tool blocks and drops its text as before.
+   *
+   * The launching row's attribution stays the tool result's and the child
+   * transcript read's (`reconstructAttributionRead`): the routed events
+   * carry no `assistantUsage`/`assistantModel`, so the adapter does not
+   * grow the row's figure live from a third source. The child's own usage
+   * carriers still ride its timeline, as the stored replay's do.
+   *
+   * @returns whether the frame was the child's and has been emitted.
+   */
+  private routeSubagentFrame(session: LiveSession, message: unknown): boolean {
+    if (!message || typeof message !== "object") return false;
+    const record = message as Record<string, unknown>;
+    const parentToolUseId = typeof record.parent_tool_use_id === "string" && record.parent_tool_use_id ? record.parent_tool_use_id : undefined;
+    if (!parentToolUseId || typeof record.type !== "string" || !SUBAGENT_FRAME_TYPES.has(record.type)) return false;
+    const child = session.children.get(parentToolUseId);
+    if (!child) return false;
+    // Untagged for the child's normalizer: within its own conversation the
+    // frame is the conversation's, which is also how the stored transcript
+    // replays it — the same uuids and tool-use ids, so a projection filled
+    // from the file and then fed live upserts the same items (task 5.1 c).
+    // "live", as for the parent: the CLI does not forward the run's prompt,
+    // and the stored replay supplies that bubble.
+    const { assistantUsage: _usage, assistantModel: _model, ...normalized } = normalizeClaudeMessage({ ...record, parent_tool_use_id: null }, child.memory, "live");
+    if (normalized.updates.length === 0 && !normalized.configuration) return true;
+    this.emit(child.id, normalized);
+    return true;
+  }
+
+  /**
+   * Where the runs are learned (design D8, spike Q1): a `local_agent` task's
+   * `task_id` IS the subagent's agent id, so the start edge names the child
+   * before the first forwarded frame; a launching tool result's `agentId`
+   * (the async launch, or the sync result that ends a foreground run) is
+   * the fallback. The run's end — task frames, the sync result — settles
+   * the child's status. All from the parent's own frames.
+   */
+  private learnSubagentRuns(session: LiveSession, message: unknown, normalized: Omit<NormalizedProviderEvent, "conversationId">): void {
+    if (!message || typeof message !== "object") return;
+    const record = message as Record<string, unknown>;
+    if (record.type === "system") {
+      const taskId = typeof record.task_id === "string" && record.task_id ? record.task_id : undefined;
+      if (!taskId) return;
+      if (record.subtype === "task_started") {
+        const toolUseId = typeof record.tool_use_id === "string" && record.tool_use_id ? record.tool_use_id : undefined;
+        const agentTask = record.task_type === "local_agent" || typeof record.subagent_type === "string";
+        // Ambient work is not the user's (spec): no child that would read
+        // as running for it.
+        if (toolUseId && agentTask && record.ambient !== true && record.skip_transcript !== true) this.openChild(session, toolUseId, taskId, true);
+        return;
+      }
+      const child = [...session.children.values()].find(candidate => candidate.agentId === taskId);
+      if (!child) return;
+      if (record.subtype === "task_notification") {
+        this.settleChild(child, record.status === "failed" ? "failed" : record.status === "stopped" || record.status === "killed" ? "interrupted" : "completed");
+      } else if (record.subtype === "task_updated") {
+        const status = (record.patch as Record<string, unknown> | undefined)?.status;
+        if (status === "completed") this.settleChild(child, "completed");
+        else if (status === "failed") this.settleChild(child, "failed");
+        else if (status === "killed") this.settleChild(child, "interrupted");
+      }
+      return;
+    }
+    if (record.type !== "user") return;
+    const raw = record.toolUseResult ?? record.tool_use_result;
+    const outcome = raw && typeof raw === "object" ? raw as Record<string, unknown> : undefined;
+    const agentId = outcome && typeof outcome.agentId === "string" && outcome.agentId ? outcome.agentId : undefined;
+    if (!agentId || !outcome) return;
+    // The result's tool use is the row the normalizer just completed.
+    const row = normalized.updates.find(update => update.kind === "upsert" && update.item.type === "tool");
+    const toolUseId = row?.kind === "upsert" ? row.item.id.replace(/^tool:/, "") : undefined;
+    if (!toolUseId) return;
+    const launched = outcome.isAsync === true || outcome.status === "async_launched";
+    const child = this.openChild(session, toolUseId, agentId, launched);
+    // A sync result means the run is over; the task notification usually
+    // said so already, and a Skill fork (`status: "forked"`) only ends here.
+    if (!launched) this.settleChild(child, row?.kind === "upsert" && row.item.type === "tool" && row.item.status === "failed" ? "failed" : "completed");
+  }
+
+  /** The child for a launching tool use, opened on first sight; a live run reads as running from here. */
+  private openChild(session: LiveSession, parentToolUseId: string, agentId: string, running: boolean): LiveChild {
+    const known = session.children.get(parentToolUseId);
+    if (known) return known;
+    const child: LiveChild = { id: `sub:${session.id}:${agentId}`, agentId, memory: createClaudeEventMemory(), startedAt: this.now(), settled: !running };
+    child.memory.resolveModel = id => this.modelAliases.get(id) ?? id;
+    boundedSet(session.children, parentToolUseId, child, CHILDREN_LIMIT);
+    if (running) this.emit(child.id, { updates: [{ kind: "status", status: "running" }], outcome: "handled", eventType: "subagent.started" });
+    return child;
+  }
+
+  private settleChild(child: LiveChild, status: "completed" | "failed" | "interrupted"): void {
+    if (child.settled) return;
+    child.settled = true;
+    this.emit(child.id, { updates: [{ kind: "status", status }], outcome: "handled", eventType: "subagent.settled" });
+  }
+
+  /** Every run still reading as running when the query ends: settled with the query's own outcome. */
+  private settleChildren(session: LiveSession, status: "failed" | "interrupted"): void {
+    for (const child of session.children.values()) this.settleChild(child, status);
+  }
+
+  /** A run of a live session, by its child conversation id. */
+  private liveChild(childId: string): { parentSessionId: string; child: LiveChild } | undefined {
+    for (const session of this.live.values()) {
+      for (const child of session.children.values()) {
+        if (child.id === childId) return { parentSessionId: session.id, child };
+      }
+    }
+    return undefined;
+  }
+
+  /** The task is over, however it ended: its next output read says so. */
+  private settleTaskOutput(sessionId: string, taskId: string): void {
+    const entry = this.taskOutputs.get(`${sessionId}:${taskId}`);
+    if (entry) entry.settled = true;
   }
 
   /**
@@ -2868,6 +3173,10 @@ export class ClaudeProvider implements ChatProvider {
   private async retireSession(session: LiveSession): Promise<void> {
     if (this.live.get(session.id) !== session) return;
     this.clearIdleTimer(session);
+    // A run that never reported its end does not outlive the query that
+    // ran it; settled before the session leaves the live map, so the
+    // child's status is the last thing this query says about it.
+    this.settleChildren(session, "interrupted");
     this.live.delete(session.id);
     this.foldSessionTotals(session);
     this.abandonInteractions(session.id, "The turn ended before the user answered.");

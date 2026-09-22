@@ -72,7 +72,7 @@ describe("worktree inventory invalidation", () => {
     channel.connect();
     emit(0, "hello", { streamId: "s1" });
     emit(0, "live", { ws: "beacon", topic: "activity", cursor: "1", event: { kind: "data", data: { running: true, working: true, awaiting: false } } });
-    expect(activity).toEqual([["beacon", { running: true, working: true, awaiting: false }]]);
+    expect(activity).toEqual([["beacon", { running: true, working: true, awaiting: false, finished: false }]]);
     channel.dispose();
   });
 });

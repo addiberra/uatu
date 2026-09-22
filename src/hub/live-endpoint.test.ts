@@ -303,7 +303,7 @@ describe("LiveEndpoint (in-process)", () => {
     await stream.waitFor(() => child.byPath("/api/activity").length === 1, "activity upstream");
     child.byPath("/api/activity")[0]!.push(": open\n\nevent: activity\ndata: {\"working\":true,\"awaiting\":false}\n\n");
     await stream.waitFor(r => r.envelopes.length === 2, "activity change");
-    expect(dataOf(stream.envelopes[1]!)).toEqual({ running: true, working: true, awaiting: false });
+    expect(dataOf(stream.envelopes[1]!)).toEqual({ running: true, working: true, awaiting: false, finished: false });
     await stream.cancel();
   });
 

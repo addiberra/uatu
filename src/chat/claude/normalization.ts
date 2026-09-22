@@ -1,7 +1,7 @@
 import { boundedSet } from "../../shared/bounded-map";
 import { measureChatWork } from "../performance";
 import type { NormalizedProviderEvent, NormalizedProviderUpdate } from "../provider";
-import { RATE_LIMIT_ITEM_ID, type ContextReportItem, type ConversationItem, type MessageAttachment, type ModelSelection, type StructuredQuestion, type TokenUsage } from "../types";
+import { RATE_LIMIT_ITEM_ID, type BackgroundTaskUsage, type ContextReportItem, type ConversationItem, type MessageAttachment, type ModelSelection, type StructuredQuestion, type TokenUsage } from "../types";
 import { foldCommandMarkup, parseTaskNotification, readsAsTaskNotification, readsAsWakeupPrompt, scheduledWakeupPrompt, type TranscriptEntry } from "./transcript";
 
 type RecordValue = Record<string, unknown>;
@@ -25,7 +25,11 @@ export type ClaudeNormalizationSource = "live" | "stored";
  * `tool_use` block knows the tool's name, input, and start time.
  */
 export type ClaudeEventMemory = {
-  tools: Map<string, { name: string; input?: string; createdAt: number }>;
+  // `childConversationId`: the subagent run a launching tool use started,
+  // learned from the task's start edge before the tool result names it, so a
+  // later re-upsert of the row cannot drop it. `resultSeen` says the result
+  // has already replaced the row, so nothing may re-emit its launch shape.
+  tools: Map<string, { name: string; input?: string; createdAt: number; childConversationId?: string; resultSeen?: boolean }>;
   lastModel?: string;
   // Translates a session-reported resolved model id to the catalog's alias
   // id, once the provider has captured the catalog. Identity until then.
@@ -39,7 +43,7 @@ export type ClaudeEventMemory = {
   // the settling notification re-upsert the same row with its description
   // and launch time. Ambient (housekeeping) ids are remembered so their
   // later edges stay out of the timeline too.
-  tasks: Map<string, { description: string; taskType?: string; toolUseId?: string; createdAt: number; progress?: string; backgrounded?: boolean; announced?: boolean; settled?: boolean }>;
+  tasks: Map<string, BackgroundTaskMemory>;
   ambientTasks: Set<string>;
   // Partial-message streams by API message id: which content block index
   // holds text (from content_block_start), and how many of those the
@@ -63,6 +67,32 @@ export type ClaudeEventMemory = {
   // be woken with: how a stored fired wakeup is told from other injected
   // records where the store names no turn origin (D8).
   wakeupPrompts?: Set<string>;
+};
+
+/**
+ * What a background task is and has done, as the CLI's edges and the
+ * launching tool's result report it. Kept on the memory entry so every
+ * later edge re-upserts the row with all of it, and mirrored by the
+ * provider onto its live list so a reopened conversation's seeded row is
+ * as complete as the live one.
+ */
+export type BackgroundTaskFacts = {
+  subagentType?: string;
+  prompt?: string;
+  usage?: BackgroundTaskUsage;
+  outputFile?: string;
+  childConversationId?: string;
+};
+
+export type BackgroundTaskMemory = BackgroundTaskFacts & {
+  description: string;
+  taskType?: string;
+  toolUseId?: string;
+  createdAt: number;
+  progress?: string;
+  backgrounded?: boolean;
+  announced?: boolean;
+  settled?: boolean;
 };
 
 export function createClaudeEventMemory(): ClaudeEventMemory {
@@ -358,7 +388,7 @@ function normalizeMessage(
     // Background work: one row per task, re-upserted in place from start to
     // settling (D8). Ambient housekeeping tasks never become rows (spec).
     if (record.subtype === "task_started" || record.subtype === "task_progress" || record.subtype === "task_updated" || record.subtype === "task_notification") {
-      return backgroundTaskUpdate(record, memory, base);
+      return backgroundTaskUpdate(record, memory, base, parentSessionId);
     }
     // A subtype with no case is dropped on purpose only when the ignore list
     // names it; anything else is new vocabulary, counted under its subtype so
@@ -391,7 +421,9 @@ function normalizeMessage(
   // A streamed frame: text deltas grow the current block's item in place
   // (D10). Thinking deltas are deliberately not streamed — the reasoning row
   // appears when its block completes — and a subagent's stream (parent tool
-  // use set) stays out of the parent's timeline.
+  // use set) stays out of the parent's timeline. A known run's stream never
+  // gets here: the provider normalizes it, untagged, with the child's own
+  // memory (design D8); only an unknown run's reaches this frame.
   if (type === "stream_event") {
     const envelope = envelopeIdentity(record);
     if (!envelope) return { ...base, outcome: "unparseable" };
@@ -496,8 +528,22 @@ function normalizeMessage(
         updates.push({ kind: "remove", itemId: `message:stream:${message.id}:${index}` });
       }
     }
-    const skippedBlocks: string[] = [];
-    updates.push(...contentBlockUpdates(asArray(message.content), envelope, memory, skippedBlocks));
+    // A subagent's frame that still reaches the parent's normalizer is one
+    // whose run the provider does not know (no task edge named its agent
+    // id: a Skill fork, an older CLI) — a known run's frames are normalized
+    // untagged with the child's own memory and never come here (design D8,
+    // provider `routeSubagentFrame`). Such a frame contributes only its
+    // tool blocks, as it did before the query asked for subagent text
+    // (forwardSubagentText): its text and thinking are the child
+    // transcript's, not the parent's, and are dropped, not shown twice.
+    // Dropping a known run's text and thinking is deliberate, not a skip;
+    // a block type no walker reads is still counted, whoever's frame it is.
+    const content = asArray(message.content);
+    const blocks = subagentFrame
+      ? content.filter(block => asRecord(block).type === "tool_use")
+      : content;
+    const skippedBlocks: string[] = subagentFrame ? skippedBlockTypes(content, ASSISTANT_BLOCKS) : [];
+    updates.push(...contentBlockUpdates(blocks, envelope, memory, skippedBlocks));
     const usage = subagentFrame ? undefined : tokensToUsage(message.usage);
     // Each assistant message's usage is ONE API call's accounting, and its
     // input + cache read + cache write is the window occupancy after that
@@ -522,7 +568,7 @@ function normalizeMessage(
     rememberFrameItems(memory, envelope.uuid, updates);
     return {
       ...base,
-      outcome: "handled",
+      outcome: subagentFrame && updates.length === 0 ? "ignored" : "handled",
       updates,
       ...(usage ? { assistantUsage: { messageId: envelope.uuid, usage } } : {}),
       ...(model ? { assistantModel: { messageId: envelope.uuid, model, createdAt: envelope.createdAt } } : {}),
@@ -543,9 +589,7 @@ function normalizeMessage(
     const results = blocks.filter(block => block.type === "tool_result");
     if (results.length > 0) {
       const toolOutcome = asRecord(record.toolUseResult ?? record.tool_use_result);
-      const updates = results
-        .map(block => toolResultUpdate(block, envelope, memory, toolOutcome, parentSessionId))
-        .filter((update): update is NormalizedProviderUpdate => update !== null);
+      const updates = results.flatMap(block => toolResultUpdate(block, envelope, memory, toolOutcome, parentSessionId));
       rememberFrameItems(memory, envelope.uuid, updates);
       return { ...frame, outcome: updates.length > 0 ? "handled" : "ignored", updates };
     }
@@ -584,7 +628,7 @@ function normalizeMessage(
       const notification = parseTaskNotification(rawText);
       // A notification that fails to parse shows nothing rather than its markup.
       if (!notification) return { ...frame, outcome: "ignored" };
-      return backgroundTaskUpdate(storedNotificationRecord(notification, record, memory), memory, frame);
+      return backgroundTaskUpdate(storedNotificationRecord(notification, record, memory), memory, frame, parentSessionId);
     }
     // A slash command is stored as tag markup; the bubble shows what was
     // typed, the same fold the session title reads.
@@ -816,23 +860,30 @@ function todoEntries(input: RecordValue): ConversationItem extends never ? never
   return entries;
 }
 
-function toolResultUpdate(block: Block, envelope: Envelope, memory: ClaudeEventMemory, toolOutcome: RecordValue = {}, parentSessionId?: string): NormalizedProviderUpdate | null {
+function toolResultUpdate(block: Block, envelope: Envelope, memory: ClaudeEventMemory, toolOutcome: RecordValue = {}, parentSessionId?: string): NormalizedProviderUpdate[] {
   const toolUseId = typeof block.tool_use_id === "string" ? block.tool_use_id : "";
-  if (!toolUseId) return null;
+  if (!toolUseId) return [];
   // A TodoWrite result confirms a surface the task-progress item already
   // shows; a row for it would be exactly the per-update spam D9 forbids.
-  if (memory.todoTools.has(toolUseId)) return null;
+  if (memory.todoTools.has(toolUseId)) return [];
   const known = memory.tools.get(toolUseId);
   const failed = block.is_error === true;
   const output = block.content === undefined ? undefined : stringify(block.content);
   // A Task completion names its subagent run: the child transcript becomes
   // an openable drill-down, and the store's own accounting lands as the
   // launching row's attribution (spec: the row states model and tokens).
+  // A backgrounded Agent's result is complete at launch (spike): the same
+  // `agentId` arrives with `isAsync`, so the row is openable from the start.
+  // The task's start edge may already have named the run (see
+  // `launchingRowUpdate`); this result re-upserts the whole row, so it takes
+  // the id from memory where its own payload does not carry one — a foreground
+  // Agent result that reports no `agentId` must not un-open the row.
   const agentId = typeof toolOutcome.agentId === "string" && toolOutcome.agentId ? toolOutcome.agentId : undefined;
-  const childConversationId = agentId && parentSessionId ? `sub:${parentSessionId}:${agentId}` : undefined;
+  const childConversationId = (agentId && parentSessionId ? `sub:${parentSessionId}:${agentId}` : undefined) ?? known?.childConversationId;
+  if (known) boundedSet(memory.tools, toolUseId, { ...known, resultSeen: true, ...(childConversationId ? { childConversationId } : {}) }, MEMORY_LIMIT);
   const attributedModel = typeof toolOutcome.resolvedModel === "string" && toolOutcome.resolvedModel ? toolOutcome.resolvedModel : undefined;
   const attributedUsage = tokensToUsage(toolOutcome.usage);
-  return { kind: "upsert", item: {
+  const updates: NormalizedProviderUpdate[] = [{ kind: "upsert", item: {
     id: `tool:${toolUseId}`,
     type: "tool",
     // The launch time, when remembered: a completion re-upserts the whole
@@ -848,7 +899,90 @@ function toolResultUpdate(block: Block, envelope: Envelope, memory: ClaudeEventM
     ...(childConversationId ? { childConversationId } : {}),
     ...(attributedModel ? { model: attributedModel } : {}),
     ...(attributedUsage ? { usage: attributedUsage } : {}),
+  } }];
+  // The launching result is the first thing to name where a background
+  // task's output goes: a backgrounded shell command says so in its text
+  // (the structured BashOutput carries only the id), a backgrounded Agent in
+  // its async AgentOutput (`outputFile`, `prompt`, `agentId` = task id).
+  const launched = launchedTaskFacts(block, toolOutcome, parentSessionId);
+  if (launched) updates.push(...rememberLaunchedTask(launched.taskId, launched.facts, known?.input, toolUseId, envelope, memory));
+  return updates;
+}
+
+// The wording the CLI uses at launch, and when a timed-out or manually
+// backgrounded command is moved to the background: "Output is being written
+// to: <path>. You will be notified…". The path ends at the sentence's
+// period, so a dot inside the path (its `.output` suffix) is not a stop.
+const OUTPUT_PATH_SENTENCE = /Output is being written to:\s*(.+?)\.(?:\s|$)/;
+
+/** What a tool result says about the background task it launched, if it launched one. */
+function launchedTaskFacts(block: Block, toolOutcome: RecordValue, parentSessionId?: string): { taskId: string; facts: BackgroundTaskFacts } | null {
+  const backgroundTaskId = typeof toolOutcome.backgroundTaskId === "string" && toolOutcome.backgroundTaskId ? toolOutcome.backgroundTaskId : undefined;
+  if (backgroundTaskId) {
+    const outputFile = OUTPUT_PATH_SENTENCE.exec(resultText(block.content))?.[1]?.trim();
+    return { taskId: backgroundTaskId, facts: outputFile ? { outputFile } : {} };
+  }
+  const agentId = typeof toolOutcome.agentId === "string" && toolOutcome.agentId ? toolOutcome.agentId : undefined;
+  if (!agentId || (toolOutcome.isAsync !== true && toolOutcome.status !== "async_launched")) return null;
+  const outputFile = typeof toolOutcome.outputFile === "string" && toolOutcome.outputFile ? toolOutcome.outputFile : undefined;
+  const prompt = typeof toolOutcome.prompt === "string" && toolOutcome.prompt ? toolOutcome.prompt : undefined;
+  return { taskId: agentId, facts: {
+    ...(outputFile ? { outputFile } : {}),
+    ...(prompt ? { prompt } : {}),
+    ...(parentSessionId ? { childConversationId: `sub:${parentSessionId}:${agentId}` } : {}),
   } };
+}
+
+/**
+ * Facts learned from a launching tool result land on the task's memory
+ * entry, so every later edge carries them; a row already announced is
+ * re-upserted with them now. A result that beats its start edge leaves a
+ * silent entry the edge then names and shows.
+ */
+function rememberLaunchedTask(taskId: string, facts: BackgroundTaskFacts, launcherInput: string | undefined, toolUseId: string, envelope: Envelope, memory: ClaudeEventMemory): NormalizedProviderUpdate[] {
+  if (Object.keys(facts).length === 0 || memory.ambientTasks.has(taskId)) return [];
+  const known = memory.tasks.get(taskId);
+  const entry: BackgroundTaskMemory = known
+    ? { ...known, ...facts }
+    : { description: toolDescription(launcherInput) ?? "Background task", toolUseId, createdAt: envelope.createdAt, ...facts };
+  boundedSet(memory.tasks, taskId, entry, MEMORY_LIMIT);
+  if (!entry.backgrounded || !entry.announced || entry.settled) return [];
+  return [{ kind: "upsert", item: backgroundTaskItem(taskId, entry, "running") }];
+}
+
+/** The text of a tool result's content: a string as is, text blocks joined. */
+function resultText(content: unknown): string {
+  if (typeof content === "string") return content;
+  return contentBlocks(content).filter(block => block.type === "text" && typeof block.text === "string").map(block => block.text as string).join("\n");
+}
+
+/** The optional facts an entry holds, as spread-ready item fields. */
+function taskFacts(entry: Partial<BackgroundTaskFacts> | undefined): BackgroundTaskFacts {
+  if (!entry) return {};
+  return {
+    ...(entry.subagentType ? { subagentType: entry.subagentType } : {}),
+    ...(entry.prompt ? { prompt: entry.prompt } : {}),
+    ...(entry.usage ? { usage: entry.usage } : {}),
+    ...(entry.outputFile ? { outputFile: entry.outputFile } : {}),
+    ...(entry.childConversationId ? { childConversationId: entry.childConversationId } : {}),
+  };
+}
+
+/** The one `task:<id>` row, built from what memory holds about the task. */
+function backgroundTaskItem(taskId: string, entry: BackgroundTaskMemory, status: "running" | "completed" | "failed" | "stopped", summary?: string): ConversationItem {
+  return {
+    id: `task:${taskId}`,
+    type: "background_task",
+    createdAt: entry.createdAt,
+    taskId,
+    description: entry.description,
+    ...(entry.taskType ? { taskType: entry.taskType } : {}),
+    ...(entry.toolUseId ? { toolUseId: entry.toolUseId } : {}),
+    status,
+    ...(status === "running" && entry.progress ? { progress: entry.progress } : {}),
+    ...(summary ? { summary } : {}),
+    ...taskFacts(entry),
+  };
 }
 
 /** The turn moved on from a retry or a compaction: back to plain running. */
@@ -906,7 +1040,7 @@ function normalizeEpoch(value: number): number {
  * memory never saw start (a level-only CLI, a reopen) still gets a row from
  * what the edge itself carries.
  */
-function backgroundTaskUpdate(record: RecordValue, memory: ClaudeEventMemory, base: { updates: NormalizedProviderUpdate[]; eventType: string }): Omit<NormalizedProviderEvent, "conversationId"> {
+function backgroundTaskUpdate(record: RecordValue, memory: ClaudeEventMemory, base: { updates: NormalizedProviderUpdate[]; eventType: string }, parentSessionId?: string): Omit<NormalizedProviderEvent, "conversationId"> {
   const taskId = typeof record.task_id === "string" && record.task_id ? record.task_id : "";
   if (!taskId) return { ...base, outcome: "unparseable" };
   const envelope = envelopeIdentity(record) ?? { uuid: taskId, createdAt: Date.now() };
@@ -934,16 +1068,45 @@ function backgroundTaskUpdate(record: RecordValue, memory: ClaudeEventMemory, ba
   // An unnamed edge for work never known to run in the background says
   // nothing (a stray notification); an unnamed background edge is malformed.
   if (!finalDescription) return { ...base, outcome: backgrounded ? "unparseable" : "ignored" };
+  // What the edges say the task is and has done, kept from edge to edge:
+  // the start names the subagent type and prompt, progress and the
+  // notification carry cumulative usage, the notification names the output
+  // file (a shell task's was already learned from its launch result).
+  const subagentType = typeof record.subagent_type === "string" && record.subagent_type ? record.subagent_type : known?.subagentType;
+  const prompt = typeof record.prompt === "string" && record.prompt ? record.prompt : known?.prompt;
+  const usage = taskUsage(record.usage) ?? known?.usage;
+  const outputFile = typeof record.output_file === "string" && record.output_file ? record.output_file : known?.outputFile;
+  // An agent task's id IS its subagent's agent id (spike, D8), so the child
+  // transcript is addressable from the start edge, not only from the tool
+  // result that ends the run.
+  const agentTask = taskType === "local_agent" || subagentType !== undefined;
+  const childConversationId = known?.childConversationId ?? (agentTask && parentSessionId ? `sub:${parentSessionId}:${taskId}` : undefined);
+  const facts = taskFacts({ subagentType, prompt, usage, outputFile, childConversationId });
+  const identity = { description: finalDescription, ...(taskType ? { taskType } : {}), ...(toolUseId ? { toolUseId } : {}), createdAt, ...facts };
+  // The launching tool row is where the timeline and the subagents track look
+  // for a run's child transcript, and until now it learned the child only from
+  // the tool result — which for a FOREGROUND agent arrives when the run is
+  // over, so the run was openable only after it ended. The start edge already
+  // knows it: a `local_agent` task's id IS its subagent's agent id (spike, D8),
+  // backgrounded or not. So the row is opened here for both kinds at once,
+  // which is also why this runs before the foreground branch below.
+  const launchingRow = record.subtype === "task_started" && agentTask && toolUseId && childConversationId
+    ? launchingRowUpdate(memory, toolUseId, childConversationId)
+    : [];
   if (!backgrounded) {
     // Foreground so far: keep what the edge said so a later promotion or
-    // the level signal can name the task, but show nothing.
-    boundedSet(memory.tasks, taskId, { description: finalDescription, ...(taskType ? { taskType } : {}), ...(toolUseId ? { toolUseId } : {}), createdAt }, MEMORY_LIMIT);
-    return { ...base, outcome: "ignored" };
+    // the level signal can name the task, but show nothing of the task
+    // itself — only the launching row's new child id, where there is one.
+    boundedSet(memory.tasks, taskId, identity, MEMORY_LIMIT);
+    return { ...base, outcome: launchingRow.length > 0 ? "handled" : "ignored", updates: launchingRow };
   }
-  // Progress note: a summary while running, else the last tool it used.
+  // Progress note: the model-written summary while running (asked for with
+  // agentProgressSummaries), else the last tool an agent task used. A shell
+  // task reports no progress at all (spike): its row keeps whatever it had,
+  // and the reader sees elapsed time instead of a tool it never named.
   const progress = record.subtype === "task_progress"
     ? (typeof record.summary === "string" && record.summary ? record.summary
-      : typeof record.last_tool_name === "string" && record.last_tool_name ? `Using ${record.last_tool_name}` : known?.progress)
+      : taskType !== "local_bash" && typeof record.last_tool_name === "string" && record.last_tool_name ? `Using ${record.last_tool_name}` : known?.progress)
     : known?.progress;
   let status: "running" | "completed" | "failed" | "stopped" = "running";
   let summary: string | undefined;
@@ -958,19 +1121,42 @@ function backgroundTaskUpdate(record: RecordValue, memory: ClaudeEventMemory, ba
   }
   // `announced`: a row for this task has been emitted, so the level signal
   // need not mint one.
-  boundedSet(memory.tasks, taskId, { description: finalDescription, ...(taskType ? { taskType } : {}), ...(toolUseId ? { toolUseId } : {}), createdAt, ...(progress ? { progress } : {}), backgrounded: true, announced: true, ...(status !== "running" ? { settled: true } : {}) }, MEMORY_LIMIT);
-  return { ...base, outcome: "handled", updates: [{ kind: "upsert", item: {
-    id: `task:${taskId}`,
-    type: "background_task",
-    createdAt,
-    taskId,
-    description: finalDescription,
-    ...(taskType ? { taskType } : {}),
-    ...(toolUseId ? { toolUseId } : {}),
-    status,
-    ...(status === "running" && progress ? { progress } : {}),
-    ...(summary ? { summary } : {}),
-  } }] };
+  const entry: BackgroundTaskMemory = { ...identity, ...(progress ? { progress } : {}), backgrounded: true, announced: true, ...(status !== "running" ? { settled: true } : {}) };
+  boundedSet(memory.tasks, taskId, entry, MEMORY_LIMIT);
+  return { ...base, outcome: "handled", updates: [...launchingRow, { kind: "upsert", item: backgroundTaskItem(taskId, entry, status, summary) }] };
+}
+
+/**
+ * The launching tool row, re-upserted with the child conversation its task
+ * just named. Everything but that id is what the `tool_use` block itself
+ * emitted, held in this memory — a row is never invented here: a tool use
+ * the timeline has no record of gets nothing, because an upsert replaces the
+ * item and a bare row would be a tool call with no name, input, or place.
+ * Nor is a row that its result has already settled re-opened: that result
+ * carried the same `agentId`, so the row is openable already.
+ */
+function launchingRowUpdate(memory: ClaudeEventMemory, toolUseId: string, childConversationId: string): NormalizedProviderUpdate[] {
+  const known = memory.tools.get(toolUseId);
+  if (!known || known.childConversationId === childConversationId) return [];
+  boundedSet(memory.tools, toolUseId, { ...known, childConversationId }, MEMORY_LIMIT);
+  if (known.resultSeen) return [];
+  return [{ kind: "upsert", item: {
+    id: `tool:${toolUseId}`,
+    type: "tool",
+    createdAt: known.createdAt,
+    name: known.name,
+    status: "running",
+    ...(known.input === undefined ? {} : { input: known.input }),
+    childConversationId,
+  } }];
+}
+
+/** The CLI's cumulative task usage (`total_tokens`, `tool_uses`, `duration_ms`), when the edge carries a complete one. */
+function taskUsage(value: unknown): BackgroundTaskUsage | undefined {
+  const usage = asRecord(value);
+  const figures = [usage.total_tokens, usage.tool_uses, usage.duration_ms];
+  if (!figures.every(figure => typeof figure === "number" && Number.isFinite(figure) && figure >= 0)) return undefined;
+  return { totalTokens: usage.total_tokens as number, toolUses: usage.tool_uses as number, durationMs: usage.duration_ms as number };
 }
 
 /** A notification's reported status as the row's outcome: anything not a failure or a stop settled as completed. */
@@ -1036,6 +1222,7 @@ export function markTasksBackgrounded(memory: ClaudeEventMemory, tasks: Array<{ 
       backgrounded: true,
       ...(known?.announced ? { announced: true } : {}),
       ...(known?.settled ? { settled: true } : {}),
+      ...taskFacts(known),
     }, MEMORY_LIMIT);
   }
 }

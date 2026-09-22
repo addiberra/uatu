@@ -51,6 +51,10 @@ describe("composer routine state", () => {
     const task: ConversationItem = { id: "task:1", type: "background_task", createdAt: 1, taskId: "1", description: "Sleep then report", status: "running" };
     expect(composerRoutineState({ ...base, status: "background", backgroundTasks: [task] as never })).toEqual({ stateName: "background", label: "1 background task running · Sleep then report" });
     expect(composerRoutineState({ ...base, status: "background", backgroundDeclared: false })).toEqual({ stateName: "ready", label: "Ready" });
+    // The status outlives the last task by the moment it takes the agent to
+    // say the turn moved on; with nothing left to name, the composer reads
+    // ready rather than announcing background work that has none.
+    expect(composerRoutineState({ ...base, status: "background" })).toEqual({ stateName: "ready", label: "Ready" });
   });
 
   test("the scheduled state names the pending count and the next fire time, only where the agent declares it", () => {
