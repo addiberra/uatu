@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
 import { BackgroundTasksUnsupportedError, ChatQueueFullError, CommandAttachmentsError, ConversationRenameUnsupportedError, deriveConversationTitle, InteractionConflictError, InvalidConversationTitleError, InvalidModeSelectionError, InvalidModelSelectionError, InvalidVariantSelectionError, ChatAdapter, parseSlashCommand, QueuedMessageNotHeldError, ReversibleHistoryUnsupportedError, UnknownAttachmentError, UsageUnsupportedError } from "./adapter";
-import { createProviderEventMemory, normalizeProviderEvent, normalizeProviderMessage, storedMessageUsage, storedPromptId, type ProviderEvent, type ProviderMessage } from "./opencode/normalization";
+import { createProviderEventMemory, normalizeProviderEvent, normalizeProviderMessage, storedMessageUsage, storedPromptId, type ProviderEvent, type ProviderMessage } from "./opencode/v1/normalization";
 import type { ChatAgent } from "./types";
 import type {
   NormalizedProviderEvent,
@@ -107,6 +107,10 @@ class FakeProvider implements ChatProvider {
     signal.addEventListener("abort", () => this.eventQueue.close(), { once: true });
     const memory = createProviderEventMemory();
     for await (const event of this.eventQueue) {
+      // A pre-normalized event, for shapes only another generation's mapper
+      // produces (a sparse 2.x lifecycle update).
+      const passthrough = (event as { normalized?: NormalizedProviderEvent }).normalized;
+      if (passthrough) { yield passthrough; continue; }
       try {
         const normalized = normalizeProviderEvent(event, memory);
         const turns = this.notificationLifecycle.observe(event, normalized);
@@ -595,6 +599,35 @@ describe("filtered provider event pump", () => {
     await pump;
   });
 
+  test("a sparse lifecycle update keeps a child's parent; a full record without one promotes it", async () => {
+    const provider = new FakeProvider();
+    const local = fixtureSession("local");
+    const child = { ...fixtureSession("child"), parentId: "local" };
+    provider.sessions = [local, child];
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g" });
+    expect((await adapter.listConversations()).map(conversation => conversation.id)).toEqual(["local"]);
+    const inventory = adapter.subscribeInventory();
+    await expectInventorySignal(inventory);
+    const pump = adapter.startEventPump();
+    await expectInventorySignal(inventory);
+
+    // 2.x's rename names the id and the title only. The child stays a child:
+    // nothing to list, so nothing to invalidate.
+    let settled = false;
+    const afterSparse = inventory.next().then(result => { settled = true; return result; });
+    provider.eventQueue.push({ normalized: { conversationId: "child", updates: [], outcome: "handled", eventType: "session.renamed", sessionLifecycle: { kind: "updated", id: "child", directory: process.cwd(), title: "Child renamed", sparse: true } } });
+    await Bun.sleep(20);
+    expect(settled).toBe(false);
+    expect((await adapter.listConversations()).map(conversation => conversation.id)).toEqual(["local"]);
+
+    // A full record with no parent is the promotion it says it is.
+    provider.eventQueue.push({ type: "session.updated", data: { info: { ...child, parentId: undefined, title: "Child promoted" } } });
+    expect((await afterSparse).done).toBe(false);
+
+    await adapter.dispose();
+    await pump;
+  });
+
   test("classifies deleted sessions from event metadata without looking them up", async () => {
     const provider = new FakeProvider();
     let lookups = 0;
@@ -607,6 +640,36 @@ describe("filtered provider event pump", () => {
 
     provider.eventQueue.push({ type: "session.deleted", data: { info: fixtureSession("deleted") } });
     await expectInventorySignal(inventory);
+    expect(lookups).toBe(0);
+
+    await adapter.dispose();
+    await pump;
+  });
+
+  test("a sparse deletion invalidates only for a session the adapter listed, and never looks it up", async () => {
+    const provider = new FakeProvider();
+    let lookups = 0;
+    provider.getSession = async () => { lookups += 1; return null; };
+    const listed = fixtureSession("listed");
+    provider.sessions = [listed];
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g" });
+    await adapter.listConversations();
+    const inventory = adapter.subscribeInventory();
+    await expectInventorySignal(inventory);
+    const pump = adapter.startEventPump();
+    await expectInventorySignal(inventory);
+
+    // 2.x's deletion names an id and nothing else. Unknown here, it may be
+    // another directory's on a shared server: nothing listed can have gone.
+    let settled = false;
+    const afterUnknown = inventory.next().then(result => { settled = true; return result; });
+    provider.eventQueue.push({ normalized: { conversationId: "elsewhere", updates: [], outcome: "handled", eventType: "session.deleted", sessionLifecycle: { kind: "deleted", id: "elsewhere", directory: process.cwd(), title: "", sparse: true } } });
+    await Bun.sleep(20);
+    expect(settled).toBe(false);
+
+    // A listed session's deletion is a change to the list.
+    provider.eventQueue.push({ normalized: { conversationId: "listed", updates: [], outcome: "handled", eventType: "session.deleted", sessionLifecycle: { kind: "deleted", id: "listed", directory: process.cwd(), title: "", sparse: true } } });
+    expect((await afterUnknown).done).toBe(false);
     expect(lookups).toBe(0);
 
     await adapter.dispose();
@@ -1633,6 +1696,39 @@ describe("prompt, abort, permission, and question mutations", () => {
     expect(deriveConversationTitle("123 investigate flaky model routing")).toBe("123 investigate flaky model routing");
     expect(deriveConversationTitle("# Implement a deliberately long model selection request that should be shortened at a word boundary for the chooser"))
       .toBe("Implement a deliberately long model selection request that...");
+  });
+
+  test("a command's placeholder is published at acceptance, so a retirement during the first-prompt rename still finds it", async () => {
+    const provider = new FakeProvider();
+    provider.sessions = [{ ...fixtureSession("session"), title: "New session - 2026-08-15T12:00:00Z" }];
+    provider.renameSession = async (id, title) => {
+      await Bun.sleep(40);
+      const session = provider.sessions.find(candidate => candidate.id === id)!;
+      const renamed = { ...session, title };
+      provider.sessions[0] = renamed;
+      return renamed;
+    };
+    // The provider reports the local id (window closed), and the server's
+    // row lands, with the placeholder's retirement, while the rename runs.
+    provider.command = async () => {
+      setTimeout(() => provider.eventQueue.push({ normalized: { conversationId: "session", outcome: "handled", eventType: "session.inbox.enqueued", updates: [
+        { kind: "upsert", item: { id: "message:msg_server", type: "user_message", createdAt: 2, text: "Review focus", requestId: "msg_server" } },
+        { kind: "remove", itemId: "message:msg_local" },
+      ] } }), 10);
+      return { messageId: "msg_local" };
+    };
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g" });
+    const pump = adapter.startEventPump();
+    await Bun.sleep(10);
+    await adapter.prompt("session", "request", "/review focus");
+    await Bun.sleep(60);
+    // The live projection, which is what a client renders between events.
+    const live = await adapter.subscribe("session");
+    const ids = live.snapshot.items.filter(item => item.type === "user_message").map(item => item.id);
+    expect(ids).toEqual(["message:msg_server"]);
+    live.events.cancel();
+    await adapter.dispose();
+    await pump;
   });
 
   test("strictly selects a model and gives the first prompt a provider-owned title", async () => {

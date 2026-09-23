@@ -60,6 +60,12 @@ export type NormalizedSessionLifecycle = {
   directory: string;
   title: string;
   parentId?: string;
+  // The wire event named only the fields it carries (2.x `session.renamed`:
+  // id and title; 2.x `session.deleted`: id alone). Parentage it omits is
+  // unchanged, not cleared, and a directory it omits is the workspace by
+  // assumption, vouching for nothing the adapter has not seen. A full
+  // record (1.x `session.updated`) without a parent means top-level.
+  sparse?: true;
 };
 
 // Why an event produced no updates. Without this an unrecognized event and one
