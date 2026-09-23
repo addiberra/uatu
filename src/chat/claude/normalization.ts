@@ -913,13 +913,29 @@ function toolResultUpdate(block: Block, envelope: Envelope, memory: ClaudeEventM
 // backgrounded command is moved to the background: "Output is being written
 // to: <path>. You will be notified…". The path ends at the sentence's
 // period, so a dot inside the path (its `.output` suffix) is not a stop.
-const OUTPUT_PATH_SENTENCE = /Output is being written to:\s*(.+?)\.(?:\s|$)/;
+const OUTPUT_PATH_SENTENCE = /Output is being written to:\s*(.+?)\.(?:\s|$)/g;
+
+/**
+ * The output file the CLI's own launch sentence names for `taskId`, if it
+ * names one. A result moved to the background can carry the command's
+ * stdout ahead of that sentence, and a command can print anything — so the
+ * sentence that counts is the LAST one (the CLI appends its own after any
+ * output), and only if it names this task's file (`<taskId>.output`, the
+ * CLI's layout). A sentence naming another file is not this task's; the
+ * notification's structured `output_file` can still name it later.
+ */
+function launchOutputFile(text: string, taskId: string): string | undefined {
+  const named = [...text.matchAll(OUTPUT_PATH_SENTENCE)].at(-1)?.[1]?.trim();
+  if (!named) return undefined;
+  const basename = named.slice(Math.max(named.lastIndexOf("/"), named.lastIndexOf("\\")) + 1);
+  return basename === `${taskId}.output` ? named : undefined;
+}
 
 /** What a tool result says about the background task it launched, if it launched one. */
 function launchedTaskFacts(block: Block, toolOutcome: RecordValue, parentSessionId?: string): { taskId: string; facts: BackgroundTaskFacts } | null {
   const backgroundTaskId = typeof toolOutcome.backgroundTaskId === "string" && toolOutcome.backgroundTaskId ? toolOutcome.backgroundTaskId : undefined;
   if (backgroundTaskId) {
-    const outputFile = OUTPUT_PATH_SENTENCE.exec(resultText(block.content))?.[1]?.trim();
+    const outputFile = launchOutputFile(resultText(block.content), backgroundTaskId);
     return { taskId: backgroundTaskId, facts: outputFile ? { outputFile } : {} };
   }
   const agentId = typeof toolOutcome.agentId === "string" && toolOutcome.agentId ? toolOutcome.agentId : undefined;
@@ -975,8 +991,11 @@ function resultText(content: unknown): string {
   return contentBlocks(content).filter(block => block.type === "text" && typeof block.text === "string").map(block => block.text as string).join("\n");
 }
 
-/** The optional facts an entry holds, as spread-ready item fields. */
-function taskFacts(entry: Partial<BackgroundTaskFacts> | undefined): BackgroundTaskFacts {
+/**
+ * The optional facts an entry holds, as spread-ready item fields — from
+ * normalizer memory, a session's live task, or a task row alike.
+ */
+export function taskFacts(entry: Partial<BackgroundTaskFacts> | undefined): BackgroundTaskFacts {
   if (!entry) return {};
   return {
     ...(entry.subagentType ? { subagentType: entry.subagentType } : {}),

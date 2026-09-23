@@ -1281,8 +1281,9 @@ function toolBody(detail: ToolDetail, item: ToolItem, allowSubagents: boolean): 
       return `<p class="chat-tool-meta">${detail.subagent ? `<code>${escapeHtml(detail.subagent)}</code> ` : ""}${escapeHtml(detail.description)}${allowSubagents && detail.conversationId ? ` <button type="button" data-open-conversation="${escapeHtmlAttribute(detail.conversationId)}">Open transcript</button>` : ""}</p><pre>${escapeHtml(detail.prompt)}</pre>${detail.result ? renderSubagentResult(detail.result) : ""}${error}`;
     case "skill":
       // A skill Claude Code ran as a fork is a conversation of its own. The
-      // subagents track lists agent launches, and a Skill call is not one, so
-      // this row is the only place its transcript is offered.
+      // subagents track lists the fork too (as a fork entry, beside the agent
+      // launches), so this row is one of two ways into its transcript — the
+      // one that sits where the skill ran.
       return `${allowSubagents && detail.conversationId ? `<p class="chat-tool-meta"><button type="button" data-open-conversation="${escapeHtmlAttribute(detail.conversationId)}">Open transcript</button></p>` : ""}${outputBlock(item)}${error}`;
     case "bash":
       // The command in full (the summary showed its first line), what the

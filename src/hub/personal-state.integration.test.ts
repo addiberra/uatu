@@ -3,6 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
+import type { ActivityMarks, ActivityMarkSink } from "./activity-marks";
 import type { SessionBackend } from "./backend";
 import { EMPTY_CREDENTIAL_CONTEXT_RESOLVER } from "./credential-context";
 import { HubSessionStore, hubCookieName } from "./auth";
@@ -20,7 +21,7 @@ afterEach(async () => {
   await Promise.all(tempDirectories.splice(0).map(dir => rm(dir, { recursive: true, force: true })));
 });
 
-async function startFixture() {
+async function startFixture(options: { activityMarks?: ActivityMarkSink } = {}) {
   const dir = await mkdtemp(path.join(os.tmpdir(), "uatu-personal-api-"));
   tempDirectories.push(dir);
   const registry = new WorkspaceRegistry(path.join(dir, "registry.json"));
@@ -45,7 +46,7 @@ async function startFixture() {
       { name: "bob", passwordHash: "unused" },
     ],
   };
-  const server = startHubServer({ config, registry, sessions, sessionStore, personalState });
+  const server = startHubServer({ config, registry, sessions, sessionStore, personalState, ...(options.activityMarks ? { activityMarks: options.activityMarks } : {}) });
   servers.push(server);
   const cookies = new Map<string, string>();
   const cookie = async (user: string): Promise<string> => {
@@ -139,5 +140,26 @@ describe("Hub personal workspace state API", () => {
     expect(fixture.registry.byId("project")).toBeUndefined();
     expect(fixture.personalState.get("alice", "project")).toEqual({ version: 1 });
     expect(fixture.personalState.get("bob", "project")).toEqual({ version: 1 });
+  });
+
+  test("forget also drops the workspace's finished and viewed marks, so a folder that takes the freed slug starts clean", async () => {
+    // What a previous hub left: an unviewed finish in the stopped workspace
+    // and bob's view of an earlier one.
+    const writes: ActivityMarks[] = [];
+    const activityMarks: ActivityMarkSink = {
+      read: () => ({ finishedAt: new Map([["project", 5]]), viewedAt: new Map([["bob", new Map([["project", 3]])]]) }),
+      write: marks => { writes.push({ finishedAt: new Map(marks.finishedAt), viewedAt: new Map([...marks.viewedAt].map(([user, entries]) => [user, new Map(entries)])) }); },
+    };
+    const fixture = await startFixture({ activityMarks });
+    const response = await fetch(`${fixture.origin}/api/hub/workspaces/project/forget`, {
+      method: "POST",
+      headers: { cookie: await fixture.cookie("alice"), origin: fixture.origin },
+    });
+    expect(response.status).toBe(200);
+    expect(writes.at(-1)!.finishedAt.has("project")).toBe(false);
+    expect(writes.at(-1)!.viewedAt.has("bob")).toBe(false);
+    // A different folder mints the same slug and inherits nothing.
+    expect((await fixture.registry.register("/srv/elsewhere/project")).id).toBe("project");
+    expect(writes.at(-1)!.finishedAt.size).toBe(0);
   });
 });

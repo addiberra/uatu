@@ -27,6 +27,7 @@ function fakeSource(options: { running?: Set<string>; workspaces?: string[]; ref
   const running = options.running ?? new Set(["ws"]);
   const opened: FakeUpstream[] = [];
   const listeners = new Set<(change: LiveSessionChange) => void>();
+  const removals = new Set<(workspaceId: string) => void>();
   const encoder = new TextEncoder();
   const source: LiveUpstreamSource = {
     isRunning: id => running.has(id),
@@ -79,11 +80,21 @@ function fakeSource(options: { running?: Set<string>; workspaces?: string[]; ref
       listeners.add(listener);
       return () => listeners.delete(listener);
     },
+    onWorkspaceRemoved(listener) {
+      removals.add(listener);
+      return () => removals.delete(listener);
+    },
   };
   return {
     source,
     opened,
     running,
+    // The registry lets go of a stopped workspace, as the hub's forget does.
+    unregister(id: string) {
+      const index = options.workspaces?.indexOf(id) ?? -1;
+      if (index !== -1) options.workspaces!.splice(index, 1);
+      for (const listener of removals) listener(id);
+    },
     setRunning(id: string, value: boolean) {
       if (value) running.add(id);
       else running.delete(id);
@@ -954,6 +965,138 @@ describe("finished (fix-workspace-activity-states D2/D3)", () => {
     child.opened[1]!.push(": open\n\nevent: activity\ndata: {\"working\":false,\"awaiting\":false}\n\n");
     await Bun.sleep(30);
     expect(latestFor(later, "a")).toEqual({ running: true, working: false, awaiting: false, finished: false });
+  });
+
+  // The marks as the broker last handed them to its store.
+  function recordingMarks(restored: { finishedAt?: [string, number][]; viewedAt?: [string, [string, number][]][] } = {}) {
+    const writes: { finishedAt: Map<string, number>; viewedAt: Map<string, Map<string, number>> }[] = [];
+    return {
+      writes,
+      last: () => writes.at(-1),
+      sink: {
+        read: () => ({
+          finishedAt: new Map(restored.finishedAt ?? []),
+          viewedAt: new Map((restored.viewedAt ?? []).map(([user, entries]) => [user, new Map(entries)])),
+        }),
+        write: (marks: { finishedAt: Map<string, number>; viewedAt: Map<string, Map<string, number>> }) => {
+          const viewedAt = new Map<string, Map<string, number>>();
+          for (const [user, workspaces] of marks.viewedAt) viewedAt.set(user, new Map(workspaces));
+          writes.push({ finishedAt: new Map(marks.finishedAt), viewedAt });
+        },
+      },
+    };
+  }
+
+  test("a finish survives a single upstream stream end and its retry, and stays persisted", async () => {
+    const child = fakeSource({ running: new Set(["a"]), workspaces: ["a"] });
+    const marks = recordingMarks();
+    const live = broker(child.source, { marks: marks.sink });
+    const alice = sink();
+    live.subscribeActivity(alice, "alice");
+    await waitFor(() => child.opened.length === 1, "the watch");
+    child.opened[0]!.push(": open\n\n");
+    push(child, true, false);
+    await waitFor(() => latestFor(alice, "a").working, "working");
+    push(child, false, false);
+    await waitFor(() => latestFor(alice, "a").finished, "finished");
+    // bob viewed an earlier finish; that view is not the drop's to erase.
+    live.acknowledgeViewed("bob", "a");
+    // One transient end of the child's stream: the upstream signals
+    // unavailable on this first failure of the episode.
+    child.opened[0]!.end();
+    await waitFor(() => !latestFor(alice, "a").running, "unreachable reads as not running");
+    expect(latestFor(alice, "a").finished).toBe(false);
+    expect(marks.last()!.finishedAt.has("a")).toBe(true);
+    expect(marks.last()!.viewedAt.get("bob")?.has("a")).toBe(true);
+    // The retry reaches the child, which is still quiet: the unviewed
+    // finish shows again.
+    await waitFor(() => child.opened.length === 2, "the retry");
+    child.opened[1]!.push(": open\n\nevent: activity\ndata: {\"working\":false,\"awaiting\":false}\n\n");
+    await waitFor(() => latestFor(alice, "a").running, "reachable again");
+    expect(latestFor(alice, "a")).toEqual({ running: true, working: false, awaiting: false, finished: true });
+    expect(marks.last()!.finishedAt.has("a")).toBe(true);
+  });
+
+  test("an unreachable child stays not running for a new page and another workspace's change; recovery restores the real value without inventing a finish", async () => {
+    const child = fakeSource({ running: new Set(["a", "b"]), workspaces: ["a", "b"] });
+    let refusing = false;
+    const source: LiveUpstreamSource = {
+      ...child.source,
+      open: request => refusing && request.workspaceId === "a" ? Promise.reject(new Error("refused")) : child.source.open(request),
+    };
+    const live = broker(source);
+    const alice = sink();
+    live.subscribeActivity(alice, "alice");
+    const watchOf = () => child.opened.filter(entry => entry.workspaceId === "a");
+    await waitFor(() => watchOf().length === 1, "the watch on a");
+    watchOf()[0]!.push(": open\n\n");
+    watchOf()[0]!.push('event: activity\ndata: {"working":true,"awaiting":false}\n\n');
+    await waitFor(() => latestFor(alice, "a").working, "working");
+    // The child goes away mid-run and every retry is refused.
+    refusing = true;
+    watchOf()[0]!.end();
+    await waitFor(() => !latestFor(alice, "a").running, "unreachable");
+    // A second page opens: the seed must not resurrect it as running.
+    const again = sink();
+    live.subscribeActivity(again, "alice");
+    expect(latestFor(again, "a").running).toBe(false);
+    expect(latestFor(alice, "a").running).toBe(false);
+    // Another workspace's session change refreshes every feed: same answer.
+    child.setRunning("b", false);
+    await waitFor(() => !latestFor(alice, "b").running, "b stopped");
+    await Bun.sleep(150);
+    expect(latestFor(alice, "a").running).toBe(false);
+    expect(latestFor(again, "a").running).toBe(false);
+    // The child answers again, quiet. Its last reading before the drop was
+    // working, but the drop is not a finish: nothing was seen to end.
+    refusing = false;
+    await waitFor(() => watchOf().length === 2, "the recovered watch");
+    watchOf()[1]!.push(": open\n\n");
+    watchOf()[1]!.push('event: activity\ndata: {"working":false,"awaiting":false}\n\n');
+    await waitFor(() => latestFor(alice, "a").running && latestFor(again, "a").running, "recovered");
+    expect(latestFor(alice, "a")).toEqual({ running: true, working: false, awaiting: false, finished: false });
+    expect(latestFor(again, "a")).toEqual({ running: true, working: false, awaiting: false, finished: false });
+    watchOf()[1]!.push('event: activity\ndata: {"working":true,"awaiting":false}\n\n');
+    await waitFor(() => latestFor(alice, "a").working, "working after recovery");
+    expect(latestFor(alice, "a")).toEqual({ running: true, working: true, awaiting: false, finished: false });
+  });
+
+  test("a workspace that leaves the registry takes its marks with it; a new one under the freed slug is not finished", async () => {
+    const workspaces = ["a", "other"];
+    const child = fakeSource({ running: new Set(), workspaces });
+    // What the previous hub left: an unviewed finish in "a", stopped by the
+    // restart, and a view of it by bob.
+    const marks = recordingMarks({ finishedAt: [["a", 5]], viewedAt: [["bob", [["a", 3]]]] });
+    const live = broker(child.source, { marks: marks.sink });
+    const alice = sink();
+    live.subscribeActivity(alice, "alice");
+    // Forgotten while stopped: no session change announces it.
+    child.unregister("a");
+    expect(marks.last()!.finishedAt.has("a")).toBe(false);
+    expect(marks.last()!.viewedAt.has("bob")).toBe(false);
+    // A different folder is registered and takes the freed slug.
+    workspaces.push("a");
+    child.setRunning("a", true);
+    await waitFor(() => child.opened.length === 1, "the new workspace's watch");
+    child.opened[0]!.push(": open\n\nevent: activity\ndata: {\"working\":false,\"awaiting\":false}\n\n");
+    await Bun.sleep(30);
+    expect(latestFor(alice, "a")).toEqual({ running: true, working: false, awaiting: false, finished: false });
+  });
+
+  test("restored marks for a workspace the registry no longer names are dropped at load, before any page asks", () => {
+    const child = fakeSource({ running: new Set(), workspaces: ["kept"] });
+    const marks = recordingMarks({
+      finishedAt: [["kept", 4], ["gone", 6]],
+      viewedAt: [["alice", [["kept", 2], ["gone", 7]]], ["bob", [["gone", 8]]]],
+    });
+    const live = broker(child.source, { marks: marks.sink });
+    expect(marks.writes).toHaveLength(1);
+    expect([...marks.last()!.finishedAt]).toEqual([["kept", 4]]);
+    expect([...marks.last()!.viewedAt.keys()]).toEqual(["alice"]);
+    expect([...marks.last()!.viewedAt.get("alice")!]).toEqual([["kept", 2]]);
+    // The counter still resumes above every stamp read back.
+    live.acknowledgeViewed("alice", "kept");
+    expect(marks.last()!.viewedAt.get("alice")!.get("kept")).toBe(9);
   });
 
   test("every activity payload carries exactly the four facts", async () => {

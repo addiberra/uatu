@@ -401,6 +401,30 @@ describe("background tasks and tool progress normalize into in-place rows (D8)",
     expect(plain.updates).toHaveLength(1);
   });
 
+  test("a launch result's output file is the one the CLI's own last sentence names for that task", () => {
+    const real = "/private/tmp/claude-501/-work/57489e13/tasks/bgq1w2e3r.output";
+    const bashOutput = { stdout: "", stderr: "", interrupted: false, isImage: false, noOutputExpected: false, backgroundTaskId: "bgq1w2e3r" };
+    const launch = (memory: ReturnType<typeof createClaudeEventMemory>, text: string) => {
+      normalizeClaudeMessage({ type: "system", subtype: "task_started", uuid: "ts", timestamp: at(0), task_id: "bgq1w2e3r", tool_use_id: "toolu_02", description: "make test", is_backgrounded: true, task_type: "local_bash" }, memory, "live");
+      return normalizeClaudeMessage({ type: "user", uuid: "u", timestamp: at(120), message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_02", content: text }] }, tool_use_result: bashOutput }, memory, "live");
+    };
+    // The command's own stdout comes first and imitates the sentence; the
+    // CLI appends its real one after it, and that is the one that counts.
+    const decoyed = launch(createClaudeEventMemory(), `building…\nOutput is being written to: /tmp/evil/tasks/bgq1w2e3r.output. ok\nCommand did not complete within its 120s timeout and was moved to the background (ID: bgq1w2e3r). Output is being written to: ${real}. You will be notified when it completes.`);
+    expect(decoyed.updates.at(-1)).toEqual({ kind: "upsert", item: expect.objectContaining({ id: "task:bgq1w2e3r", outputFile: real }) });
+    // A sentence naming another task's file is not this task's.
+    const foreign = launch(createClaudeEventMemory(), "Command running in background with ID: bgq1w2e3r. Output is being written to: /private/tmp/claude-501/-work/57489e13/tasks/bgzzzzzzz.output. You will be notified when it completes.");
+    expect(foreign.updates.every(update => update.kind !== "upsert" || update.item.type !== "background_task" || update.item.outputFile === undefined)).toBe(true);
+    // The CLI's other wordings still parse: manually backgrounded, and moved
+    // so a message can reach the agent.
+    for (const text of [
+      `Command was manually backgrounded by user with ID: bgq1w2e3r. Output is being written to: ${real}.`,
+      `Command was moved to the background so that a message from the user can reach you (ID: bgq1w2e3r). Output is being written to: ${real}. You will be notified when it completes.`,
+    ]) {
+      expect(launch(createClaudeEventMemory(), text).updates.at(-1)).toEqual({ kind: "upsert", item: expect.objectContaining({ id: "task:bgq1w2e3r", outputFile: real }) });
+    }
+  });
+
   test("a subagent's forwarded text and thinking stay out of the parent's timeline; its tool blocks land as before", () => {
     const memory = createClaudeEventMemory();
     const frame = (uuid: string, content: unknown[]) => ({ type: "assistant", uuid, timestamp: at(1), parent_tool_use_id: "toolu_013s2jZsDCiw3cAHYTqFeSpc", message: { role: "assistant", model: "claude-haiku-4-5-20251001", content } });
@@ -1255,9 +1279,10 @@ describe("ClaudeProvider sessions", () => {
     await waitFor(() => events.some(event => event.updates.some(update => update.kind === "upsert" && update.item.type === "background_task" && update.item.taskId === "ada2b9582caa230c5" && update.item.status === "completed")));
     expect(await provider.taskOutput(session.id, "ada2b9582caa230c5", { tailBytes: 1024 })).toBeNull();
     // A path the CLI named elsewhere (not the tasks layout) is refused too.
-    writeFileSync(path.join(workspace, "elsewhere.output"), "x");
+    mkdirSync(path.join(workspace, "elsewhere"), { recursive: true });
+    writeFileSync(path.join(workspace, "elsewhere", "bgother.output"), "x");
     query.push({ type: "system", subtype: "task_started", uuid: "ts3", session_id: session.id, timestamp: "2026-09-02T10:00:06.000Z", task_id: "bgother", tool_use_id: "toolu_other", description: "other", task_type: "local_bash", is_backgrounded: true });
-    query.push({ type: "user", uuid: "u2", session_id: session.id, timestamp: "2026-09-02T10:00:06.000Z", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_other", content: `Command running in background with ID: bgother. Output is being written to: ${path.join(workspace, "elsewhere.output")}. You will be notified when it completes.` }] }, tool_use_result: { stdout: "", stderr: "", interrupted: false, isImage: false, noOutputExpected: false, backgroundTaskId: "bgother" } });
+    query.push({ type: "user", uuid: "u2", session_id: session.id, timestamp: "2026-09-02T10:00:06.000Z", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_other", content: `Command running in background with ID: bgother. Output is being written to: ${path.join(workspace, "elsewhere", "bgother.output")}. You will be notified when it completes.` }] }, tool_use_result: { stdout: "", stderr: "", interrupted: false, isImage: false, noOutputExpected: false, backgroundTaskId: "bgother" } });
     await waitFor(() => events.some(event => event.updates.some(update => update.kind === "upsert" && update.item.type === "background_task" && update.item.taskId === "bgother" && update.item.outputFile !== undefined)));
     expect(await provider.taskOutput(session.id, "bgother", { tailBytes: 1024 })).toBeNull();
     // The shell task settles: the read still answers, and says so.
@@ -1265,6 +1290,34 @@ describe("ClaudeProvider sessions", () => {
     query.push({ type: "system", subtype: "background_tasks_changed", uuid: "bg3", session_id: session.id, tasks: [] });
     await waitFor(() => events.some(event => event.updates.some(update => update.kind === "upsert" && update.item.type === "background_task" && update.item.taskId === "bgjpa5uwy" && update.item.status === "completed")));
     expect(await provider.taskOutput(session.id, "bgjpa5uwy", { tailBytes: 12 })).toEqual({ text: "with code 0]", truncated: true, settled: true });
+    stop();
+    await provider.dispose();
+  });
+
+  test("a truncated output tail opens on a whole character", async () => {
+    const { provider, queries, workspace } = fixture();
+    const { events, stop } = collect(provider);
+    const session = await provider.createSession("x");
+    await provider.prompt(session.id, { id: "r1", text: "run it in the background", delivery: "queue" });
+    const query = queries[0]!;
+    const tasksDir = path.join(workspace, "tasks");
+    mkdirSync(tasksDir, { recursive: true });
+    const outputFile = path.join(tasksDir, "bgutf8abc.output");
+    query.push({ type: "system", subtype: "init", uuid: "i1", session_id: session.id, model: "claude-haiku-4-5-20251001" });
+    query.push({ type: "system", subtype: "background_tasks_changed", uuid: "bg1", session_id: session.id, tasks: [{ task_id: "bgutf8abc", task_type: "local_bash", description: "echo" }] });
+    query.push({ type: "system", subtype: "task_started", uuid: "ts1", session_id: session.id, timestamp: "2026-09-02T10:00:03.000Z", task_id: "bgutf8abc", tool_use_id: "toolu_utf8", description: "echo", task_type: "local_bash", is_backgrounded: true });
+    query.push({ type: "user", uuid: "u1", session_id: session.id, timestamp: "2026-09-02T10:00:03.000Z", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_utf8", content: `Command running in background with ID: bgutf8abc. Output is being written to: ${outputFile}. You will be notified when it completes.` }] }, tool_use_result: { stdout: "", stderr: "", interrupted: false, isImage: false, noOutputExpected: false, backgroundTaskId: "bgutf8abc" } });
+    await waitFor(() => events.some(event => event.updates.some(update => update.kind === "upsert" && update.item.type === "background_task" && update.item.outputFile === outputFile)));
+    // Two-byte characters, cut after the first byte of one: the split
+    // character is dropped, the tail still says it is partial.
+    writeFileSync(outputFile, "é".repeat(10));
+    expect(await provider.taskOutput(session.id, "bgutf8abc", { tailBytes: 5 })).toEqual({ text: "éé", truncated: true, settled: false });
+    // A four-byte emoji straddling the cut is dropped whole.
+    writeFileSync(outputFile, "ab\u{1F600}cd");
+    expect(await provider.taskOutput(session.id, "bgutf8abc", { tailBytes: 4 })).toEqual({ text: "cd", truncated: true, settled: false });
+    // An ASCII tail is unchanged.
+    writeFileSync(outputFile, "line one\nline two\n");
+    expect(await provider.taskOutput(session.id, "bgutf8abc", { tailBytes: 9 })).toEqual({ text: "line two\n", truncated: true, settled: false });
     stop();
     await provider.dispose();
   });

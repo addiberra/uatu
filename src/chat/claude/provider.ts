@@ -20,11 +20,11 @@ import type {
 } from "../provider";
 import type { ConversationItem, ScheduledWakeupItem } from "../types";
 import { ScheduledWakeupUnavailableError } from "../provider";
-import type { AgentUsageReport, BackgroundTaskOutput, ChatAgent, ChatCommand, ChatMode, ChatModel, ConversationConfiguration, ModelSelection, PermissionRequest, PlanExtraUsage, PlanModelWindow, PlanUtilization, PlanUtilizationWindow, QuestionRequest, ReversibleHistoryResult, ReversibleHistoryState, SessionModelTotals, SessionTotals, StructuredQuestion, UsageReadMode, UsageReadResult } from "../types";
+import { TASK_OUTPUT_TAIL_MAX_BYTES, type AgentUsageReport, type BackgroundTaskOutput, type ChatAgent, type ChatCommand, type ChatMode, type ChatModel, type ConversationConfiguration, type ModelSelection, type PermissionRequest, type PlanExtraUsage, type PlanModelWindow, type PlanUtilization, type PlanUtilizationWindow, type QuestionRequest, type ReversibleHistoryResult, type ReversibleHistoryState, type SessionModelTotals, type SessionTotals, type StructuredQuestion, type UsageReadMode, type UsageReadResult } from "../types";
 import { BackgroundTaskUnavailableError, InvalidQuestionAnswerError, ReleaseUnavailableError, ReversibleHistoryTargetError, UnsupportedVariantSelectionError } from "../provider";
 import { nextCronFire } from "./cron";
 import { CLAUDE_MODELS, claudeContextWindow, findClaudeModel, stripWindowMarker, versionedModelName, withMoreModels } from "./models";
-import { claudeToolInteraction, createClaudeEventMemory, describeSessionScopedUpdates, markTasksBackgrounded, normalizeClaudeMessage, normalizeContextUsage, normalizeTranscriptEntries, claudeModelSelection, sessionScopedSuggestions, type BackgroundTaskFacts, type ClaudeEventMemory } from "./normalization";
+import { claudeToolInteraction, createClaudeEventMemory, describeSessionScopedUpdates, markTasksBackgrounded, normalizeClaudeMessage, normalizeContextUsage, normalizeTranscriptEntries, claudeModelSelection, sessionScopedSuggestions, taskFacts, type BackgroundTaskFacts, type ClaudeEventMemory } from "./normalization";
 import { ClaudeNotificationLifecycle } from "./notification-lifecycle";
 import { listTranscriptSessions, readSessionTranscript, readTranscriptTitles, sessionTranscriptPath, subagentTranscriptPath, claudeConfigDir, transcriptCrons, type TranscriptCron } from "./transcript";
 
@@ -380,22 +380,6 @@ const FORK_BUFFER_FRAMES = 256;
 // conversation's seeded row says what the live one said.
 type LiveBackgroundTask = BackgroundTaskFacts & { description: string; taskType?: string; toolUseId?: string; startedAt: number };
 
-/** The facts an entry (live or normalizer memory) holds, as spread-ready fields. */
-function liveTaskFacts(entry: Partial<BackgroundTaskFacts> | undefined): BackgroundTaskFacts {
-  if (!entry) return {};
-  return {
-    ...(entry.subagentType ? { subagentType: entry.subagentType } : {}),
-    ...(entry.prompt ? { prompt: entry.prompt } : {}),
-    ...(entry.usage ? { usage: entry.usage } : {}),
-    ...(entry.outputFile ? { outputFile: entry.outputFile } : {}),
-    ...(entry.childConversationId ? { childConversationId: entry.childConversationId } : {}),
-  };
-}
-
-// The output tail a reader may ask for is bounded here, whatever the route
-// asks: the file is a shell command's live output and can be arbitrarily
-// large.
-const TASK_OUTPUT_TAIL_MAX_BYTES = 64 * 1024;
 const TASK_OUTPUTS_LIMIT = 512;
 
 // What retired queries of one conversation spent, and when this process began
@@ -2150,7 +2134,7 @@ export class ClaudeProvider implements ChatProvider {
         ...(typeof task.task_type === "string" && task.task_type ? { taskType: task.task_type } : known?.taskType ? { taskType: known.taskType } : {}),
         ...(known?.toolUseId ? { toolUseId: known.toolUseId } : {}),
         startedAt: known && "startedAt" in known ? (known as { startedAt: number }).startedAt : (known as { createdAt?: number } | undefined)?.createdAt ?? this.now(),
-        ...liveTaskFacts(known),
+        ...taskFacts(known),
       });
     }
     const previous = session.backgroundTasks;
@@ -2166,7 +2150,7 @@ export class ClaudeProvider implements ChatProvider {
     const reconciled: NormalizedProviderUpdate[] = [];
     for (const [taskId, task] of next) {
       if (previous.has(taskId) || memory.tasks.get(taskId)?.announced) continue;
-      reconciled.push({ kind: "upsert", item: { id: `task:${taskId}`, type: "background_task", createdAt: task.startedAt, taskId, description: task.description, ...(task.taskType ? { taskType: task.taskType } : {}), ...(task.toolUseId ? { toolUseId: task.toolUseId } : {}), status: "running", ...liveTaskFacts(task) } });
+      reconciled.push({ kind: "upsert", item: { id: `task:${taskId}`, type: "background_task", createdAt: task.startedAt, taskId, description: task.description, ...(task.taskType ? { taskType: task.taskType } : {}), ...(task.toolUseId ? { toolUseId: task.toolUseId } : {}), status: "running", ...taskFacts(task) } });
     }
     for (const taskId of ambient) {
       // Ambient is not user work, whether the task turned so or its start
@@ -2186,7 +2170,7 @@ export class ClaudeProvider implements ChatProvider {
       // The level says only that the task ended, not how: the row closes as
       // stopped and says so, and the notification (when it comes) supplies
       // the real outcome and summary — a terminal row takes any but running.
-      reconciled.push({ kind: "upsert", item: { id: `task:${taskId}`, type: "background_task", createdAt: task.startedAt, taskId, description: task.description, ...(task.taskType ? { taskType: task.taskType } : {}), ...(task.toolUseId ? { toolUseId: task.toolUseId } : {}), status: "stopped", summary: "The task left Claude Code's task list without reporting an outcome.", ...liveTaskFacts(task) } });
+      reconciled.push({ kind: "upsert", item: { id: `task:${taskId}`, type: "background_task", createdAt: task.startedAt, taskId, description: task.description, ...(task.taskType ? { taskType: task.taskType } : {}), ...(task.toolUseId ? { toolUseId: task.toolUseId } : {}), status: "stopped", summary: "The task left Claude Code's task list without reporting an outcome.", ...taskFacts(task) } });
       this.settleTaskOutput(session.id, taskId);
     }
     if (reconciled.length > 0) this.emit(session.id, { updates: reconciled, outcome: "handled", eventType: "background.reconciled" });
@@ -2222,7 +2206,7 @@ export class ClaudeProvider implements ChatProvider {
     // row the level set never held: it died with the process all the same.
     for (const [taskId, task] of memory.tasks) {
       if (live.has(taskId) || !task.announced || task.settled || memory.ambientTasks.has(taskId)) continue;
-      live.set(taskId, { description: task.description, ...(task.taskType ? { taskType: task.taskType } : {}), ...(task.toolUseId ? { toolUseId: task.toolUseId } : {}), startedAt: task.createdAt, ...liveTaskFacts(task) });
+      live.set(taskId, { description: task.description, ...(task.taskType ? { taskType: task.taskType } : {}), ...(task.toolUseId ? { toolUseId: task.toolUseId } : {}), startedAt: task.createdAt, ...taskFacts(task) });
     }
     for (const [taskId, task] of live) {
       const known = memory.tasks.get(taskId);
@@ -2238,7 +2222,7 @@ export class ClaudeProvider implements ChatProvider {
         ...(task.toolUseId ? { toolUseId: task.toolUseId } : {}),
         status: "stopped",
         summary,
-        ...liveTaskFacts(task),
+        ...taskFacts(task),
       } });
     }
     session.backgroundTasks = new Map();
@@ -2607,7 +2591,7 @@ export class ClaudeProvider implements ChatProvider {
     const tasks: PendingBackgroundTask[] = [];
     for (const session of this.live.values()) {
       for (const [taskId, task] of session.backgroundTasks) {
-        tasks.push({ conversationId: session.id, taskId, description: task.description, ...(task.taskType ? { taskType: task.taskType } : {}), ...(task.toolUseId ? { toolUseId: task.toolUseId } : {}), startedAt: task.startedAt, ...liveTaskFacts(task) });
+        tasks.push({ conversationId: session.id, taskId, description: task.description, ...(task.taskType ? { taskType: task.taskType } : {}), ...(task.toolUseId ? { toolUseId: task.toolUseId } : {}), startedAt: task.startedAt, ...taskFacts(task) });
       }
     }
     return tasks;
@@ -2629,7 +2613,8 @@ export class ClaudeProvider implements ChatProvider {
    * named file does not resolve to `…/tasks/<taskId>.output` — the CLI's own
    * layout for a task's output; an agent task's "output" is a symlink to its
    * subagent transcript and is refused here, its drill-down reads that. Only
-   * the tail is read (no whole-file reads), from the end of the file.
+   * the tail is read (no whole-file reads), from the end of the file, and it
+   * opens on a whole UTF-8 character.
    */
   async taskOutput(sessionId: string, taskId: string, options: { tailBytes: number }): Promise<BackgroundTaskOutput | null> {
     const entry = this.taskOutputs.get(`${sessionId}:${taskId}`);
@@ -2660,7 +2645,12 @@ export class ClaudeProvider implements ChatProvider {
         if (chunk.bytesRead === 0) break;
         read += chunk.bytesRead;
       }
-      return { text: buffer.subarray(0, read).toString("utf8"), truncated: start > 0, settled: !running };
+      // A tail cut mid-character would open on a replacement character, so
+      // one that starts past the beginning skips the continuation bytes of
+      // the character the cut split and opens on the next whole one.
+      let first = 0;
+      if (start > 0) while (first < read && (buffer[first]! & 0xC0) === 0x80) first += 1;
+      return { text: buffer.subarray(first, read).toString("utf8"), truncated: start > 0, settled: !running };
     } finally {
       await handle.close();
     }
@@ -2677,7 +2667,7 @@ export class ClaudeProvider implements ChatProvider {
       if (update.kind !== "upsert" || update.item.type !== "background_task") continue;
       const row = update.item;
       const live = session.backgroundTasks.get(row.taskId);
-      if (live) Object.assign(live, liveTaskFacts(row));
+      if (live) Object.assign(live, taskFacts(row));
       if (row.outputFile) {
         const key = `${session.id}:${row.taskId}`;
         const known = this.taskOutputs.get(key);

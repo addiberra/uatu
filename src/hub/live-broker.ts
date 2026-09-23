@@ -89,6 +89,9 @@ export type LiveUpstreamSource = {
   // Rejects when the workspace has no running child.
   open(request: LiveUpstreamRequest): Promise<Response>;
   onSessionChange?(listener: (change: LiveSessionChange) => void): () => void;
+  // A workspace left the registry. Its id is free to be minted again for a
+  // different folder, so the broker forgets everything it keyed by it.
+  onWorkspaceRemoved?(listener: (workspaceId: string) => void): () => void;
 };
 
 export type LiveSink = {
@@ -302,6 +305,7 @@ export class LiveBroker {
   private readonly inventoryOpenGraceMs: number;
   private readonly metrics: UpstreamSubscriptionMetrics;
   private readonly unsubscribeSessions: (() => void) | null;
+  private readonly unsubscribeRemovals: (() => void) | null;
   private disposed = false;
   private worktreeObserver: WorktreeTopicObserver | null = null;
 
@@ -315,6 +319,7 @@ export class LiveBroker {
     this.marks = options.marks ?? null;
     this.restoreMarks();
     this.unsubscribeSessions = source.onSessionChange?.(change => this.onSessionChange(change)) ?? null;
+    this.unsubscribeRemovals = source.onWorkspaceRemoved?.(workspaceId => this.forgetWorkspace(workspaceId)) ?? null;
   }
 
   // What the previous hub left behind. `observed` is deliberately not among
@@ -322,20 +327,34 @@ export class LiveBroker {
   // no predecessor and cannot be read as a transition (D3/D12). The stamp
   // counter resumes above everything restored, so a view taken now outranks
   // a finish recorded before the restart, and vice versa.
+  //
+  // Marks for a workspace the registry no longer names are dropped here,
+  // at load (D12): it may have been forgotten while the hub was down, and
+  // its freed slug can be minted again for a different folder, which must
+  // not inherit a stranger's finish. The stamps still count towards the
+  // counter's resume point — that costs nothing and keeps it monotonic.
   private restoreMarks(): void {
     const restored = this.marks?.read();
     if (!restored) return;
+    const known = new Set(this.source.workspaceIds());
     let highest = 0;
+    let dropped = false;
     for (const [workspaceId, stamp] of restored.finishedAt) {
-      this.finishedAt.set(workspaceId, stamp);
       highest = Math.max(highest, stamp);
+      if (known.has(workspaceId)) this.finishedAt.set(workspaceId, stamp);
+      else dropped = true;
     }
     for (const [user, workspaces] of restored.viewedAt) {
-      if (workspaces.size === 0) continue;
-      this.viewedAt.set(user, new Map(workspaces));
-      for (const stamp of workspaces.values()) highest = Math.max(highest, stamp);
+      const kept = new Map<string, number>();
+      for (const [workspaceId, stamp] of workspaces) {
+        highest = Math.max(highest, stamp);
+        if (known.has(workspaceId)) kept.set(workspaceId, stamp);
+        else dropped = true;
+      }
+      if (kept.size > 0) this.viewedAt.set(user, kept);
     }
     this.stamp = highest;
+    if (dropped) this.persistMarks();
   }
 
   private persistMarks(): void {
@@ -418,6 +437,19 @@ export class LiveBroker {
     this.setFeedValue(feed, workspaceId, this.composeActivity(user, workspaceId, last));
   }
 
+  // The workspace left the registry (the hub wires this to every removal,
+  // through LiveUpstreamSource.onWorkspaceRemoved). The session is already
+  // stopped — a forget requires it — but nothing else would announce the
+  // removal: syncActivityWatches prunes only when a session changes or a
+  // feed opens, and a new registration can take the freed slug before
+  // either happens, inheriting the old workspace's finish.
+  forgetWorkspace(workspaceId: string): void {
+    if (this.disposed) return;
+    this.unwatchActivity(workspaceId);
+    this.forgetMarks(workspaceId);
+    for (const feed of this.feeds.values()) feed.last.delete(workspaceId);
+  }
+
   observeWorktrees(observer: WorktreeTopicObserver | null): void {
     this.worktreeObserver = observer;
   }
@@ -462,6 +494,7 @@ export class LiveBroker {
     if (this.disposed) return;
     this.disposed = true;
     this.unsubscribeSessions?.();
+    this.unsubscribeRemovals?.();
     // Release the broker's own attachments before the upstreams go, so no
     // watch outlives the broker holding it. The marks themselves are left
     // alone: the hub is going down, not the workspaces.
@@ -1092,9 +1125,9 @@ export class LiveBroker {
     // delivered. Once the upstream is gone the next value has no
     // predecessor: what happened while nobody watched is not invented from
     // a stale last sight. The upstream now goes only when the workspace
-    // stops, is unregistered, or the broker closes, so this is the same
-    // clearing forgetMarks does — kept because the upstream's end is the
-    // point after which nothing it said is current.
+    // stops, is unregistered, or the broker closes, each of which also
+    // forgets the marks — kept because the upstream's end is the point
+    // after which nothing it said is current.
     if (upstream.topic === "activity") this.observed.delete(upstream.workspaceId);
     const metricTopic = childUpstreamTopic(upstream.topic);
     if (released && upstream.counted && metricTopic) this.metrics.released(metricTopic);
@@ -1145,9 +1178,11 @@ export class LiveBroker {
       this.unwatchActivity(workspaceId);
       this.forgetMarks(workspaceId);
     }
-    // Marks for a workspace the registry no longer names — including ones
-    // restored from disk — are forgotten here, since the registry announces
-    // nothing on its own. A registered workspace that is merely not running
+    // Marks for a workspace the registry no longer names are forgotten
+    // here too. The hub's registry announces every removal
+    // (forgetWorkspace) and restoreMarks drops what it no longer names at
+    // load, so this is the backstop for a source that cannot announce
+    // removals. A registered workspace that is merely not running
     // keeps its marks: after a restart every session is stopped, and
     // dropping them then would be the amnesia the persistence exists to
     // prevent. A stop the hub actually observes clears them above and in
@@ -1183,9 +1218,20 @@ export class LiveBroker {
             return;
           case "unavailable":
             // The child is unreachable although the session table still
-            // names it running: report it as not running, and drop what it
-            // told us so recovery's first frame has no predecessor.
-            this.forgetMarks(workspaceId);
+            // names it running. The upstream says this on the FIRST failure
+            // of any episode — a single stream end the retry recovers from
+            // included — so it is not a stop and the marks stay: erasing an
+            // unviewed finish on a transient drop is the loss persisting them
+            // exists to prevent (D2). What changes is the reading. Recorded
+            // as not running, so a feed refresh — which cannot see the
+            // upstream's state — seeds the workspace as not running rather
+            // than resurrecting it from a missing reading as running; a
+            // failed upstream never repeats this signal to correct it. And
+            // the recovered upstream's first frame then has a predecessor
+            // that is not working, so recovery is never read as a finish
+            // (observeActivity); the mark shows again once the child answers
+            // quiet, and work resuming clears it as usual.
+            this.observed.set(workspaceId, NOT_RUNNING);
             this.publishActivity(workspaceId, NOT_RUNNING);
             return;
           case "ready":
@@ -1217,7 +1263,9 @@ export class LiveBroker {
   // workspace has a value, and a running one whose activity has not been
   // heard yet reads as running-unknown — the dot shows, the badge waits —
   // unless a finish is already on record for this user, which a feed opened
-  // after the fact must show at once.
+  // after the fact must show at once. One whose child the watch found
+  // unreachable reads as the not-running the watch recorded, so opening a
+  // page does not bring it back as running.
   private refreshFeed(user: string, feed: ActivityFeed): void {
     const known = new Set(this.source.workspaceIds());
     for (const workspaceId of [...feed.last.keys()]) {
@@ -1281,8 +1329,11 @@ export class LiveBroker {
     return this.stamp;
   }
 
-  // The workspace stopped, lost its child, or left the registry: nothing it
+  // The hub observed the workspace stop, or it left the registry: nothing it
   // did before is finished any more, and nobody's view of it needs keeping.
+  // NOT called when its child is merely unreachable (the watch's
+  // `unavailable`): that may be a transient drop the retry recovers from,
+  // and the session it describes is still the same one.
   private forgetMarks(workspaceId: string): void {
     this.observed.delete(workspaceId);
     let changed = this.finishedAt.delete(workspaceId);

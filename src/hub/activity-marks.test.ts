@@ -247,4 +247,16 @@ describe("marks across a hub restart (fix-workspace-activity-states D12)", () =>
     expect(reloaded.read().finishedAt.size).toBe(0);
     expect(reloaded.read().viewedAt.size).toBe(0);
   });
+
+  test("the drop happens at load itself, with no page ever asking for activity", async () => {
+    const file = path.join(await stateDir(), "activity-marks.json");
+    await writeFile(file, JSON.stringify({ version: 1, finished: { a: 4, gone: 6 }, viewed: { bob: { a: 2, gone: 7 }, carol: { gone: 8 } } }), "utf8");
+    // Only "a" is still registered. No feed is opened on this hub, so the
+    // watches never arm and nothing but the load itself can prune.
+    const second = await hub(file, { registered: ["a"] });
+    await second.shutdown();
+    const persisted = JSON.parse(await Bun.file(file).text()) as { finished: Record<string, number>; viewed: Record<string, Record<string, number>> };
+    expect(persisted.finished).toEqual({ a: 4 });
+    expect(persisted.viewed).toEqual({ bob: { a: 2 } });
+  });
 });

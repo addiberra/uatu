@@ -729,6 +729,13 @@ export type BackgroundTaskUsage = { totalTokens: number; toolUses: number; durat
  */
 export type BackgroundTaskOutput = { text: string; truncated: boolean; settled: boolean };
 
+// How much of a task's output one read returns: by default enough for a
+// scrolled pane, and never more than the maximum, whatever a reader asks —
+// the file is a shell command's live output and can be arbitrarily large.
+// The route applies the default and the provider enforces the maximum.
+export const TASK_OUTPUT_TAIL_DEFAULT_BYTES = 16 * 1024;
+export const TASK_OUTPUT_TAIL_MAX_BYTES = 64 * 1024;
+
 export type ConversationItem =
   | UserMessageItem
   | AssistantMessageItem
