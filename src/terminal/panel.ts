@@ -7,6 +7,7 @@
 import { appUrl } from "../shared/app-url";
 import { mountTerminalPanel, persistTerminalToken, type TerminalPanelHandle } from "./client";
 import { initTerminalKeybar, selectionSheetKeyRoute } from "./keybar";
+import { createPanelLifecycle, type PanelLifecycle } from "./lifecycle";
 import { pasteToActiveTerminal } from "./panel-paste";
 import { refreshFindTarget } from "../find/find-bar";
 import { registerTerminalFind } from "../find/shortcut";
@@ -271,6 +272,12 @@ export function setupTerminalPanel(
   // Suppresses per-pane activation, focus and refit while a planned batch
   // attaches; the batch performs each once when it finishes.
   let batchingAttach = false;
+  // The page lifecycle, consulted by every pane addition: a create or
+  // inventory request that resolves after pagehide must not attach a pane
+  // on a document that is suspended — the replacement page is attaching to
+  // the same shells — so the pane is added suspended and resumes with the
+  // rest when the document runs again.
+  let lifecycle: PanelLifecycle | null = null;
   // Whether the touch terminal switcher is up. Tracked here rather than read
   // off the element because the sheet's content arrives from an async
   // inventory read: between the tap and the first paint the element is still
@@ -569,7 +576,12 @@ export function setupTerminalPanel(
     }
   }
 
-  function setActivePane(id: string | null) {
+  // `focus: false` activates without moving keyboard focus: the boot
+  // restore of saved panes selects its active pane, but focus belongs to
+  // whatever the user was doing — restoring the panel at page load MUST
+  // NOT steal it (see the embedded-terminal spec). Every user-initiated
+  // activation (split, close, New shell, a picker choice) keeps the default.
+  function setActivePane(id: string | null, options: { focus?: boolean } = {}) {
     const paneChanged = activePaneId !== id;
     activePaneId = id;
     const activeSessionId = id === null ? undefined : panes.get(id)?.record.sessionId;
@@ -601,10 +613,10 @@ export function setupTerminalPanel(
       if (touchModeNow()) requestAnimationFrame(() => fitAll());
     }
     // Move keyboard focus into the active pane's xterm so the user can
-    // type immediately after a split, restore, or close. requestAnimationFrame
+    // type immediately after a split, New shell, or close. requestAnimationFrame
     // gives xterm.js a tick to finish opening when this runs in the same
     // frame as `addPane()`.
-    if (activeEntry) {
+    if (activeEntry && options.focus !== false) {
       const entry = activeEntry;
       requestAnimationFrame(() => {
         try {
@@ -623,6 +635,7 @@ export function setupTerminalPanel(
     const element = document.createElement("div");
     element.className = "terminal-pane";
     element.dataset.sessionId = record.sessionId;
+    element.dataset.state = "idle";
 
     const host = document.createElement("div");
     host.className = "terminal-pane-host";
@@ -658,16 +671,19 @@ export function setupTerminalPanel(
           setTerminalTabBadge(true);
         }
       },
-      // Server-initiated disconnect (shell exited via `exit`, server
-      // gone, network drop) → tear the dead pane down automatically.
-      // No confirmation modal — there's nothing left to confirm losing.
-      onClose: () => {
-        if (panes.has(record.id)) removePane(record.id);
+      // The mount owns every outcome of its attachment: a lost or refused
+      // connection is reconciled inside the pane (reconnecting note, then
+      // an occupied / ended / unreachable card with explicit actions), never
+      // reported up as a pane closure. The one thing it asks of the panel
+      // is a replacement shell when the user chooses one.
+      onNewShell: () => {
+        void replacePaneWithFreshShell(record.id);
       },
-      // A valid credential with a refused upgrade means this reference is
-      // stale or attached elsewhere. Reconcile it through inventory so any
-      // takeover remains an explicit user action.
-      onCollision: () => handlePaneUnavailable(record.id),
+      // The pane's lifecycle state, on the element: what the stylesheet and
+      // the tests read.
+      onStateChange: state => {
+        element.dataset.state = state;
+      },
       takeover: options.takeover === true,
       // Sticky Ctrl: compose the next single keystroke while the latch is
       // armed. Identity pass-through when unarmed (composeStickyCtrl's
@@ -798,9 +814,13 @@ export function setupTerminalPanel(
     });
   }
 
+  // `focus: false` is the boot restore's: saved records come back selected
+  // but keyboard focus stays where the user has it. Every other addition —
+  // a fresh pane, a picker or switcher choice, a replacement — is a user
+  // action and focuses the pane it adds.
   async function addPane(
     record?: Partial<TerminalPaneRecord>,
-    options: { takeover?: boolean } = {},
+    options: { takeover?: boolean; focus?: boolean } = {},
   ): Promise<TerminalPaneEntry | null> {
     if (panes.size >= TERMINAL_MAX_PANES) return null;
     const created = record?.sessionId ? null : await createSessionRemote();
@@ -816,13 +836,14 @@ export function setupTerminalPanel(
     const entry = buildPaneElement(fullRecord, { takeover: options.takeover });
     panes.set(id, entry);
     rebuildPanesContainer();
-    entry.handle.attach();
+    if (lifecycle?.suspended()) entry.handle.release();
+    else entry.handle.attach();
     // Inside a batch attach, activation, focus and the refit all belong to the
     // batch, which performs them once against the pane it picked. Activating
     // here would also overwrite the saved last-active PTY the batch is about
     // to consult. See `attachSessionBatch`.
     if (!batchingAttach) {
-      setActivePane(id);
+      setActivePane(id, { focus: options.focus !== false });
       if (focusPaneWhenReady) {
         focusPaneWhenReady = false;
         entry.handle.focus();
@@ -859,7 +880,10 @@ export function setupTerminalPanel(
     }
   }
 
-  async function createSessionRemote(): Promise<TerminalSessionInfo | null> {
+  // `onReauth` is what a stale credential's accepted token resumes: the
+  // action this create was part of, so reauthentication finishes that
+  // action rather than adding an unrelated pane.
+  async function createSessionRemote(onReauth?: () => void): Promise<TerminalSessionInfo | null> {
     try {
       const token = getToken();
       const url = token
@@ -870,7 +894,7 @@ export function setupTerminalPanel(
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ cols: 80, rows: 24 }),
       });
-      if (response.status === 401) renderTerminalAuth();
+      if (response.status === 401) renderTerminalAuth(onReauth);
       if (response.status === 403) renderTerminalOriginRejected();
       return response.ok ? await response.json() as TerminalSessionInfo : null;
     } catch {
@@ -878,7 +902,10 @@ export function setupTerminalPanel(
     }
   }
 
-  function renderTerminalAuth(): void {
+  // `resume` runs once a token is accepted: the pane-specific action the
+  // stale credential interrupted, else a fresh pane. A form already showing
+  // keeps its own resume; the later caller's action is simply not retried.
+  function renderTerminalAuth(resume: () => void = () => void addPaneInteractive()): void {
     if (panesContainer!.querySelector(".terminal-auth")) return;
     const wrap = document.createElement("div");
     wrap.className = "terminal-pane terminal-auth";
@@ -926,7 +953,7 @@ export function setupTerminalPanel(
         // The HttpOnly cookie is sufficient when sessionStorage is unavailable.
       }
       wrap.remove();
-      void addPaneInteractive();
+      resume();
     });
   }
 
@@ -1524,60 +1551,77 @@ export function setupTerminalPanel(
     if (accepted && handler) handler();
   }
 
-  // Reconcile a stale or occupied saved reference against live inventory.
-  // Takeover stays an explicit user action throughout.
-  //
-  // The reconcile is self-limiting: inventory's `attached` flag and the
-  // upgrade gate's collision check read the same holder state server-side, so
-  // the session that just refused this window comes back from the GET as
-  // attached-elsewhere and lands in the decision set rather than being
-  // auto-attached into the same collision. If the winner released it in the
-  // meantime, re-attaching is the right answer anyway.
-  function handlePaneUnavailable(id: string) {
-    const entry = panes.get(id);
-    if (!entry) return;
+  // "New shell" on a parked pane (its shell ended, or its PTY is held by
+  // another window): a fresh PTY takes the pane's place — same position,
+  // same slot — and the parked pane goes. Order matters, as in
+  // `acquireSession`: the replacement lands BEFORE the old pane is removed,
+  // because removing the last pane hides the panel and the add would then
+  // bail on a hidden panel. At the cap the parked pane IS the slot the
+  // replacement needs, so it is freed there before the add — but only once
+  // the remote shell exists: a create that fails (network, 401, 403) leaves
+  // the parked pane, its saved PTY reference and its Take over action in
+  // place. Freeing the slot never empties the panel: a window at the cap
+  // holds eight panes. The parked pane is re-checked after the create: a
+  // second New shell while the first is in flight, or a close meanwhile,
+  // means the pane this action stood for is gone — its shell is killed
+  // rather than added as an extra pane nobody asked for.
+  async function replacePaneWithFreshShell(id: string): Promise<void> {
+    const parked = panes.get(id);
+    if (!parked) return;
+    const created = await createSessionRemote(() => void replacePaneWithFreshShell(id));
+    if (!created) return;
+    if (panes.get(id) !== parked || panel!.hasAttribute("hidden")) {
+      void killSessionRemote(created.id);
+      return;
+    }
+    if (panes.size >= TERMINAL_MAX_PANES) removePane(id);
+    const entry = await addPane({ sessionId: created.id, createdAt: parked.record.createdAt });
+    if (!entry) {
+      void killSessionRemote(created.id);
+      return;
+    }
+    if (panes.get(id) === parked) removePane(id);
+    setActivePane(entry.record.id);
+  }
+
+  // Whether closing this pane can cost the user a shell: the pane holds (or
+  // is working to hold) its PTY, or it could not reach a PTY that may well
+  // still be running. Parked panes whose PTY is gone or held by another
+  // window have nothing of this window's to lose.
+  function closeNeedsConfirmation(entry: TerminalPaneEntry): boolean {
+    return entry.handle.isAttached() || entry.handle.state() === "unreachable";
+  }
+
+  // The user accepted losing the session: terminate() closes with the
+  // user-terminate code so the server kills the PTY — a plain detach would
+  // leave the shell running forever with its pane record gone. A pane
+  // without an established connection (mid-recovery, unreachable) has no
+  // socket the server would act on, so the PTY is killed through the
+  // inventory route instead; best-effort, as the server may be the very
+  // thing that is unreachable.
+  function terminatePane(entry: TerminalPaneEntry): void {
+    let sent = false;
     try {
-      entry.handle.detach();
+      sent = entry.handle.terminate();
     } catch {
-      // Mount already tore itself down.
+      // Already torn down.
     }
-    panes.delete(id);
-    rebuildPanesContainer();
-    // Hand the active slot to a survivor rather than nulling it. Touch mode
-    // shows the pane carrying `data-active` and hides the rest, so leaving no
-    // pane active blanks the Terminal tab while live terminals sit hidden
-    // behind it — reachable whenever a restore collides on the pane that
-    // happened to be active.
-    if (activePaneId === id) {
-      const survivor = Array.from(panes.values()).sort(
-        (a, b) => a.record.createdAt - b.record.createdAt,
-      )[0];
-      setActivePane(survivor ? survivor.record.id : null);
-    }
-    persistState();
-    void addPaneInteractive();
+    if (!sent) void killSessionRemote(entry.record.sessionId);
+    clearLastPty(entry.record.sessionId);
   }
 
   function requestClosePane(id: string) {
     const entry = panes.get(id);
     if (!entry) return;
-    if (!entry.handle.isAttached()) {
-      // The shell already exited (or the pane never attached). No session
-      // to lose, so close silently.
+    if (!closeNeedsConfirmation(entry)) {
+      // Nothing of this window's to lose: the shell ended, another window
+      // holds it, or the pane never attached. Close silently.
       removePane(id);
       return;
     }
     openConfirmModal("pane", () => {
-      // The user accepted losing the session: terminate() closes with the
-      // user-terminate code so the server kills the PTY — a plain detach
-      // would leave the shell running forever with its pane record gone.
       const current = panes.get(id);
-      try {
-        current?.handle.terminate();
-      } catch {
-        // Already torn down.
-      }
-      if (current) clearLastPty(current.record.sessionId);
+      if (current) terminatePane(current);
       removePane(id);
     });
   }
@@ -1590,19 +1634,23 @@ export function setupTerminalPanel(
   // non-destructive: it's symmetric with hide, and the user can re-toggle to
   // reattach to the still-live PTYs.
   function closeAllPanes() {
-    const attachedSessionIds = Array.from(panes.values(), pane => pane.record.sessionId);
+    const closedSessionIds = Array.from(panes.values(), pane => pane.record.sessionId);
     for (const id of Array.from(panes.keys())) {
       const entry = panes.get(id);
       if (entry) {
-        try {
-          entry.handle.terminate();
-        } catch {
-          // Already torn down.
+        if (closeNeedsConfirmation(entry)) {
+          terminatePane(entry);
+        } else {
+          try {
+            entry.handle.detach();
+          } catch {
+            // Already torn down.
+          }
         }
       }
       panes.delete(id);
     }
-    if (attachedSessionIds.some(id => id === lastPtyId)) {
+    if (closedSessionIds.some(id => id === lastPtyId)) {
       lastPtyId = undefined;
       persistPersonalWorkspaceState({ lastPtyId: null });
     }
@@ -1629,7 +1677,7 @@ export function setupTerminalPanel(
       if (panes.size === 0) {
         if (state.panes.length > 0) {
           for (const record of state.panes.slice(0, TERMINAL_MAX_PANES)) {
-            void addPane(record);
+            void addPane(record, { focus: false });
           }
         } else {
           // Nothing to restore: offer existing sessions (orphans, other
@@ -1754,8 +1802,8 @@ export function setupTerminalPanel(
       return;
     }
     // Closing the panel via the panel-level × is treated as closing every
-    // pane; if any are attached, confirm once.
-    const anyAttached = Array.from(panes.values()).some(p => p.handle.isAttached());
+    // pane; if any could cost a shell, confirm once.
+    const anyAttached = Array.from(panes.values()).some(closeNeedsConfirmation);
     if (!anyAttached) {
       closeAllPanes();
       return;
@@ -1981,6 +2029,37 @@ export function setupTerminalPanel(
     applyDockToDom();
     applyDisplayModeToDom();
     requestAnimationFrame(() => fitAll());
+  });
+
+  // Page departure and return. `pagehide` releases every pane's transport
+  // — a plain detach the child processes at once, so the PTY is free for
+  // whichever document comes next (this one restored from the history
+  // cache, or a fresh one reading the same workspace-scoped records) —
+  // while visibility, pane records and layout stay exactly as they are.
+  // The return resumes each released pane once. Nothing here persists
+  // anything: leaving a page is not hiding the terminal.
+  lifecycle = createPanelLifecycle({
+    win: window,
+    doc: document,
+    release() {
+      for (const entry of panes.values()) {
+        try {
+          entry.handle.release();
+        } catch {
+          // Pane torn down mid-iteration.
+        }
+      }
+    },
+    resume() {
+      for (const entry of panes.values()) {
+        try {
+          entry.handle.resume();
+        } catch {
+          // Pane torn down mid-iteration.
+        }
+      }
+      requestAnimationFrame(() => fitAll());
+    },
   });
 
   // First paint: apply persisted dock + display mode even before any panes

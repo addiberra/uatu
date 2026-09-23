@@ -136,21 +136,17 @@ test.describe("terminal close confirmation", () => {
     await expect(page.locator(".terminal-pane-host .xterm")).toHaveCount(0);
   });
 
-  test("server-initiated disconnect (exit) auto-closes the pane", async ({ page }) => {
+  test("a shell that exits leaves an ended pane whose close needs no confirmation", async ({ page }) => {
     await page.locator("#terminal-toggle").click();
     await expect(page.locator(".terminal-pane-host .xterm").first()).toBeVisible({ timeout: 5000 });
     await expect(page.locator(".terminal-pane")).toHaveCount(1);
 
-    // Simulate the WebSocket dropping (shell exit / connection drop) by
-    // closing it from the page side. The terminal handle's close listener
-    // should treat this as server-initiated and tell the controller to
-    // tear the pane down — no confirmation modal.
+    // Type `exit` + Enter into the terminal so the real PTY exits: the
+    // server sends `{type:"exit"}`, then closes the socket. An explicit exit
+    // is the one close the pane reports as the shell ending — it parks on
+    // the ended card rather than vanishing, and a transport drop would not
+    // even do that (it reconciles through inventory instead).
     await page.evaluate(() => {
-      // The xterm helper-textarea's parent contains the terminal; the
-      // socket itself isn't directly exposed, but dispatching a close on
-      // the underlying connection is awkward in the page context. Use a
-      // shortcut: type `exit` + Enter into the terminal so the real PTY
-      // exits, the server sends `{type:"exit"}`, then closes the socket.
       const host = document.querySelector(".terminal-pane-host") as HTMLElement;
       const xtermHelper = host?.querySelector(".xterm-helper-textarea") as HTMLTextAreaElement | null;
       xtermHelper?.focus();
@@ -158,11 +154,16 @@ test.describe("terminal close confirmation", () => {
     await page.keyboard.type("exit");
     await page.keyboard.press("Enter");
 
-    // Pane disappears once the server's exit/close cascade completes.
-    await expect(page.locator(".terminal-pane")).toHaveCount(0, { timeout: 5000 });
-    // Panel hides because there are no panes left.
+    await expect(page.locator(".terminal-ended")).toBeVisible({ timeout: 5000 });
+    await expect(page.locator(".terminal-ended-new")).toBeVisible();
+    await expect(page.locator(".terminal-pane")).toHaveCount(1);
+    await expect(page.locator("#terminal-panel")).toBeVisible();
+
+    // Nothing left to lose: the pane closes without the confirmation modal,
+    // and the panel hides because there are no panes left.
+    await page.locator(".terminal-pane-close").click();
+    await expect(page.locator(".terminal-pane")).toHaveCount(0);
     await expect(page.locator("#terminal-panel")).toBeHidden();
-    // No confirmation modal should ever have appeared.
     await expect(page.locator("#terminal-confirm")).toBeHidden();
   });
 
@@ -174,6 +175,117 @@ test.describe("terminal close confirmation", () => {
     // Panel hidden directly, no modal interaction.
     await expect(page.locator("#terminal-panel")).toBeHidden();
     await expect(page.locator("#terminal-confirm")).toBeHidden();
+  });
+});
+
+test.describe("terminal page lifecycle", () => {
+  // Restoring saved panes at page load selects the active pane but must not
+  // move keyboard focus into the shell: the user did not ask for a terminal,
+  // and keystrokes meant for the document would reach the PTY.
+  test("a reload that restores a visible terminal does not move focus into the shell", async ({ page }) => {
+    await page.locator("#terminal-toggle").click();
+    await expect(page.locator(".terminal-pane[data-state=\"ready\"]")).toHaveCount(1, { timeout: 5000 });
+    // The user-initiated show does land focus in xterm (the fit suite pins that).
+    await expect.poll(() => page.evaluate(() => document.activeElement?.classList.contains("xterm-helper-textarea") ?? false)).toBe(true);
+
+    await page.reload();
+    await expect(page.locator("#connection-state .connection-label")).toHaveText("Connected");
+    await expect(page.locator(".terminal-pane[data-state=\"ready\"]")).toHaveCount(1, { timeout: 5000 });
+    await expect(page.locator(".terminal-pane-host .xterm").first()).toBeVisible();
+    // Focus is deferred until xterm opens, so give it every chance to land
+    // before asserting it did not.
+    await page.waitForTimeout(500);
+    expect(await page.evaluate(() => document.activeElement?.classList.contains("xterm-helper-textarea") ?? false)).toBe(false);
+  });
+
+  // A pane whose create resolves after pagehide must not attach: the
+  // departing document may live on in the history cache while its
+  // replacement is already attaching to the same shells. The first opening's
+  // inventory read is held server-side so the departure lands mid-request;
+  // the pane is then added suspended and resumes with the return.
+  test("a pane whose creation resolves after pagehide is added suspended, and attaches on pageshow", async ({ page, request }) => {
+    await request.post("/__e2e/terminal-sessions-delay", { data: { ms: 1500 } });
+    await page.locator("#terminal-toggle").click();
+    await expect
+      .poll(async () => (await (await request.get("/__e2e/terminal-sessions-delay")).json()).pending, { timeout: 5000 })
+      .toBe(true);
+    await page.evaluate(() => window.dispatchEvent(new PageTransitionEvent("pagehide", { persisted: true })));
+
+    await expect(page.locator(".terminal-pane[data-state=\"suspended\"]")).toHaveCount(1, { timeout: 10000 });
+    const attached = () => page.evaluate(() =>
+      fetch("/api/terminal/sessions").then(r => r.json()).then((b: { sessions: { attached: boolean }[] }) => b.sessions.map(s => s.attached)));
+    await expect.poll(attached).toEqual([false]);
+    // Nothing attaches while the document stays suspended.
+    await page.waitForTimeout(1000);
+    await expect(page.locator(".terminal-pane[data-state=\"suspended\"]")).toHaveCount(1);
+    await expect.poll(attached).toEqual([false]);
+
+    await page.evaluate(() => window.dispatchEvent(new PageTransitionEvent("pageshow", { persisted: true })));
+    await expect(page.locator(".terminal-pane[data-state=\"ready\"]")).toHaveCount(1, { timeout: 5000 });
+    await expect.poll(attached).toEqual([true]);
+  });
+});
+
+test.describe("terminal parked cards", () => {
+  // A parked card is the pane's whole surface until its action starts a new
+  // attach cycle; the terminal that cycle mounts must replace the card, not
+  // sit clipped underneath it. The token form is the parked state reachable
+  // without a second window: strip the credentials, reload onto the saved
+  // pane, paste the real token, and the pane must show xterm alone.
+  test("a token pasted into the parked form replaces the form with the terminal", async ({ page, context, request }) => {
+    await page.locator("#terminal-toggle").click();
+    await expect(page.locator(".terminal-pane[data-state=\"ready\"]")).toHaveCount(1, { timeout: 5000 });
+    const { token } = await (await request.get("/__e2e/terminal-token")).json();
+
+    await context.clearCookies();
+    await page.evaluate(() => {
+      try { window.sessionStorage.removeItem("uatu:terminal-token"); } catch { /* best-effort */ }
+    });
+    await page.reload();
+    await expect(page.locator(".terminal-auth")).toBeVisible({ timeout: 10000 });
+    await expect(page.locator(".terminal-pane[data-state=\"auth-required\"]")).toHaveCount(1);
+
+    await page.locator(".terminal-auth-input").fill(token);
+    await page.locator(".terminal-auth-submit").click();
+    await expect(page.locator(".terminal-pane[data-state=\"ready\"]")).toHaveCount(1, { timeout: 10000 });
+    await expect(page.locator(".terminal-auth")).toHaveCount(0);
+    await expect(page.locator(".terminal-pane-host .xterm").first()).toBeVisible();
+    // The terminal is the host's only surface: nothing of the card remains.
+    expect(await page.locator(".terminal-pane-host > *").evaluateAll(nodes => nodes.map(n => (n as HTMLElement).classList.contains("xterm")))).toEqual([true]);
+  });
+});
+
+test.describe("terminal reauthentication across a page suspend", () => {
+  // The token form is a parked card, so pagehide leaves it in place; the
+  // token the user pastes afterwards (or a validation that settles after the
+  // departure) must not attach the shell on the suspended document. The
+  // attach is deferred to the resume.
+  test("a token accepted while the document is suspended attaches on pageshow, not before", async ({ page, context, request }) => {
+    await page.locator("#terminal-toggle").click();
+    await expect(page.locator(".terminal-pane[data-state=\"ready\"]")).toHaveCount(1, { timeout: 5000 });
+    const { token } = await (await request.get("/__e2e/terminal-token")).json();
+    await context.clearCookies();
+    await page.evaluate(() => {
+      try { window.sessionStorage.removeItem("uatu:terminal-token"); } catch { /* best-effort */ }
+    });
+    await page.reload();
+    await expect(page.locator(".terminal-auth")).toBeVisible({ timeout: 10000 });
+    const attached = () => page.evaluate(() =>
+      fetch("/api/terminal/sessions").then(r => r.json()).then((b: { sessions: { attached: boolean }[] }) => b.sessions.map(s => s.attached)));
+
+    await page.evaluate(() => window.dispatchEvent(new PageTransitionEvent("pagehide", { persisted: true })));
+    await expect(page.locator(".terminal-auth")).toBeVisible();
+    await page.locator(".terminal-auth-input").fill(token);
+    await page.locator(".terminal-auth-submit").click();
+    await expect(page.locator(".terminal-pane[data-state=\"suspended\"]")).toHaveCount(1, { timeout: 5000 });
+    await page.waitForTimeout(750);
+    await expect(page.locator(".terminal-pane[data-state=\"suspended\"]")).toHaveCount(1);
+    await expect.poll(attached).toEqual([false]);
+
+    await page.evaluate(() => window.dispatchEvent(new PageTransitionEvent("pageshow", { persisted: true })));
+    await expect(page.locator(".terminal-pane[data-state=\"ready\"]")).toHaveCount(1, { timeout: 5000 });
+    await expect(page.locator(".terminal-auth")).toHaveCount(0);
+    await expect.poll(attached).toEqual([true]);
   });
 });
 
@@ -191,6 +303,62 @@ test.describe("terminal display modes", () => {
     await page.locator("#terminal-minimize").click();
     await expect(page.locator("#terminal-panel")).toHaveAttribute("data-display", "normal");
     await expect(page.locator("#terminal-panes")).toBeVisible();
+  });
+
+  // A page suspend (pagehide) releases the shell; the return resumes it.
+  // With the panel minimized the pane has no layout, so the resume attaches
+  // at the grid the pane had before — the shell is held again at once, as it
+  // is across a plain minimize — and the screen paints when the panel is
+  // expanded.
+  test("a page suspend while minimized resumes with the shell held; restore paints it", async ({ page }) => {
+    await page.locator("#terminal-toggle").click();
+    await expect(page.locator(".terminal-pane-host .xterm").first()).toBeVisible({ timeout: 5000 });
+    await expect(page.locator(".terminal-pane[data-state=\"ready\"]")).toHaveCount(1, { timeout: 5000 });
+
+    await page.locator("#terminal-minimize").click();
+    await expect(page.locator("#terminal-panes")).toBeHidden();
+
+    await page.evaluate(() => window.dispatchEvent(new PageTransitionEvent("pagehide", { persisted: true })));
+    await expect(page.locator(".terminal-pane[data-state=\"suspended\"]")).toHaveCount(1);
+    await expect.poll(async () =>
+      (await page.evaluate(() => fetch("/api/terminal/sessions").then(r => r.json()))).sessions.map((s: { attached: boolean }) => s.attached),
+    ).toEqual([false]);
+
+    await page.evaluate(() => window.dispatchEvent(new PageTransitionEvent("pageshow", { persisted: true })));
+    await expect(page.locator(".terminal-pane[data-state=\"ready\"]")).toHaveCount(1, { timeout: 5000 });
+    await expect(page.locator("#terminal-panel")).toHaveAttribute("data-display", "minimized");
+    await expect.poll(async () =>
+      (await page.evaluate(() => fetch("/api/terminal/sessions").then(r => r.json()))).sessions.map((s: { attached: boolean }) => s.attached),
+    ).toEqual([true]);
+
+    await page.locator("#terminal-minimize").click();
+    await expect(page.locator("#terminal-panel")).toHaveAttribute("data-display", "normal");
+    await expect(page.locator(".terminal-pane-host .xterm").first()).toBeVisible({ timeout: 5000 });
+    await expect(page.locator(".terminal-pane[data-state=\"ready\"]")).toHaveCount(1);
+  });
+
+  // A reload into a minimized panel restores panes that have never measured
+  // a grid and cannot be laid out: they attach at xterm's default grid
+  // rather than waiting for an expand, so the shell is held — and its
+  // output kept — while the panel stays collapsed.
+  test("a reload into a minimized panel restores the shell attached without waiting for layout", async ({ page }) => {
+    await page.locator("#terminal-toggle").click();
+    await expect(page.locator(".terminal-pane[data-state=\"ready\"]")).toHaveCount(1, { timeout: 5000 });
+    await page.locator("#terminal-minimize").click();
+    await expect(page.locator("#terminal-panel")).toHaveAttribute("data-display", "minimized");
+
+    await page.reload();
+    await expect(page.locator("#connection-state .connection-label")).toHaveText("Connected");
+    await expect(page.locator("#terminal-panel")).toHaveAttribute("data-display", "minimized");
+    await expect(page.locator("#terminal-panes")).toBeHidden();
+    await expect(page.locator(".terminal-pane[data-state=\"ready\"]")).toHaveCount(1, { timeout: 5000 });
+    await expect.poll(async () =>
+      (await page.evaluate(() => fetch("/api/terminal/sessions").then(r => r.json()))).sessions.map((s: { attached: boolean }) => s.attached),
+    ).toEqual([true]);
+
+    await page.locator("#terminal-minimize").click();
+    await expect(page.locator(".terminal-pane-host .xterm").first()).toBeVisible({ timeout: 5000 });
+    await expect(page.locator(".terminal-pane[data-state=\"ready\"]")).toHaveCount(1);
   });
 
   test("minimize while right-docked rotates the header into a vertical strip", async ({ page }) => {
