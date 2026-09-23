@@ -1690,24 +1690,121 @@ describe("chat running-task inspection", () => {
   });
 });
 
+describe("chat running work reachable without a disclosure", () => {
+  const shellTask = (taskId: string, status: "running" | "completed", createdAt = 2) => ({
+    id: `task:${taskId}`, type: "background_task", createdAt, taskId, description: `Task ${taskId}`, taskType: "local_bash",
+    toolUseId: `toolu_${taskId}`, status, outputFile: `/tmp/tasks/${taskId}.output`,
+  });
+
+  test("both lists open on their first running work; a user collapse holds until the work is over, and a new conversation opens them afresh", async () => {
+    const { document, window } = parseHTML(html);
+    installDomGlobals(document, window);
+    document.documentElement.setAttribute("data-ui-mode", "desktop");
+    document.documentElement.setAttribute("data-chat-panel", "open");
+    stubConversationSelect(document);
+    const streams = new Map<string, { event(event: unknown, cursor: string): void }>();
+    const sequences = new Map<string, number>();
+    const api = taskApi(document, {
+      conversations: ["one", "two"],
+      items: id => id === "one"
+        ? [{ id: "message:u", type: "user_message", createdAt: 1, text: "run it" }, shellTask("a", "running"),
+          { id: "tool:toolu_s", type: "tool", createdAt: 2, name: "task", status: "running", input: JSON.stringify({ description: "Read the tree", subagent_type: "explore", prompt: "go" }) }]
+        : [{ id: "message:u2", type: "user_message", createdAt: 1, text: "and here" }, shellTask("z", "running")],
+      onStream: (id, handlers) => { streams.set(id, handlers); sequences.set(id, 0); },
+    });
+    const upsert = (conversationId: string, item: unknown) => {
+      const sequence = (sequences.get(conversationId) ?? 0) + 1;
+      sequences.set(conversationId, sequence);
+      streams.get(conversationId)!.event({ type: "item.upsert", generation: "g", sequence, conversationId, item }, `cursor-${conversationId}-${sequence}`);
+    };
+    const tasks = document.querySelector<HTMLDetailsElement>("#chat-background-tasks")!;
+    const track = document.querySelector<HTMLDetailsElement>("#chat-subagents")!;
+    // What the browser does after `open` changes, a task later: linkedom
+    // fires no `toggle`, so the tests deliver it as the page would see it.
+    const toggle = (list: HTMLDetailsElement) => list.dispatchEvent(new window.Event("toggle") as unknown as Event);
+    const collapse = (list: HTMLDetailsElement) => { list.open = false; toggle(list); };
+    const settle = () => Bun.sleep(30);
+    try {
+      const { initChat } = await import(`./ui.ts?running-work-disclosure-ui-test=${Date.now()}`);
+      initChat(api);
+      await waitUntil(() => !tasks.hidden && streams.has("one"), () => tasks.textContent ?? "no task list");
+      // Reachable at once: no disclosure click stands between the running
+      // task and its inspect and Stop controls.
+      expect(tasks.open).toBe(true);
+      expect(track.hidden).toBe(false);
+      expect(track.open).toBe(true);
+      expect(tasks.querySelector('[data-inspect-task="a"]')).not.toBeNull();
+      expect(tasks.querySelector('[data-stop-task="a"]')).not.toBeNull();
+      // The open's own event lands afterwards; it is not a choice the user made.
+      toggle(tasks);
+      toggle(track);
+
+      // The user collapses both; more running work does not reopen them.
+      collapse(tasks);
+      collapse(track);
+      upsert("one", shellTask("b", "running", 3));
+      upsert("one", { id: "tool:toolu_t", type: "tool", createdAt: 3, name: "task", status: "running", input: JSON.stringify({ description: "Audit docs", subagent_type: "explore", prompt: "go" }) });
+      await waitUntil(() => tasks.querySelector('[data-background-task="b"]') != null, () => tasks.textContent ?? "no task list");
+      await settle();
+      expect(tasks.open).toBe(false);
+      expect(track.open).toBe(false);
+
+      // The work ends: the collapse ends with it, and the next work opens.
+      upsert("one", shellTask("a", "completed"));
+      upsert("one", shellTask("b", "completed", 3));
+      upsert("one", { id: "tool:toolu_s", type: "tool", createdAt: 2, name: "task", status: "completed", input: JSON.stringify({ description: "Read the tree", subagent_type: "explore", prompt: "go" }) });
+      upsert("one", { id: "tool:toolu_t", type: "tool", createdAt: 3, name: "task", status: "completed", input: JSON.stringify({ description: "Audit docs", subagent_type: "explore", prompt: "go" }) });
+      await waitUntil(() => tasks.hidden === true, () => tasks.textContent ?? "task list");
+      // Finished subagents stay listed until dismissed, but are not running
+      // work: they neither open the track nor keep a collapse alive.
+      expect(track.hidden).toBe(false);
+      expect(track.open).toBe(false);
+      upsert("one", shellTask("c", "running", 4));
+      upsert("one", { id: "tool:toolu_u", type: "tool", createdAt: 4, name: "task", status: "running", input: JSON.stringify({ description: "Check links", subagent_type: "explore", prompt: "go" }) });
+      await waitUntil(() => !tasks.hidden, () => "no task list");
+      await settle();
+      expect(tasks.open).toBe(true);
+      expect(track.open).toBe(true);
+      toggle(tasks);
+
+      // A collapse is a choice about this conversation's work: the next
+      // conversation's running work is shown open.
+      collapse(tasks);
+      const select = document.querySelector<HTMLSelectElement>("#chat-conversation-select")!;
+      select.value = "two";
+      select.dispatchEvent(new window.Event("change") as unknown as Event);
+      await waitUntil(() => tasks.querySelector('[data-background-task="z"]') != null, () => tasks.textContent ?? "no task list");
+      expect(tasks.open).toBe(true);
+    } finally {
+      await Bun.sleep(20);
+      window.dispatchEvent(new Event("pagehide"));
+    }
+  });
+});
+
 function taskApi(document: Document, options: {
   items: (conversationId: string) => unknown[];
   stop?: (taskId: string) => void;
   output?: (conversationId: string, taskId: string) => { text: string; truncated: boolean; settled: boolean } | null;
   onSnapshot?: (conversationId: string) => void;
+  onStream?: (conversationId: string, handlers: { event(event: unknown, cursor: string): void }) => void;
+  conversations?: string[];
 }): ChatApiClient {
   return {
     status: async () => ([{
       agent: { id: "test", name: "Test" },
       availability: { state: "ready", version: "test", agent: { id: "test", name: "Test", capabilities: ["background-tasks", "subagents"] } },
     }]),
-    conversations: async () => [{ ...conversation("one"), status: "background" }],
+    conversations: async () => (options.conversations ?? ["one"]).map(id => ({ ...conversation(id), status: "background" })),
     commands: async () => [],
     snapshot: async (id: string) => {
       options.onSnapshot?.(id);
       return { ...snapshot(id), conversation: { ...conversation(id), status: id === "one" ? "background" : "running" }, items: options.items(id) };
     },
-    stream: () => ({ close() {} }),
+    stream: (conversationId: string, _cursor: string, handlers: { event(event: unknown, cursor: string): void }) => {
+      options.onStream?.(conversationId, handlers);
+      return { close() {} };
+    },
     inventoryStream: () => ({ close() {} }),
     attachmentUrl: (id: string) => `/api/chat/attachments/${id}`,
     stopTask: async (_conversationId: string, taskId: string) => { options.stop?.(taskId); await new Promise(() => {}); },

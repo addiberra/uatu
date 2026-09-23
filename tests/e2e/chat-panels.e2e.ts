@@ -305,7 +305,8 @@ test.describe("chat panels and navigation", () => {
     await expect(track.locator("summary")).toContainText("1 of 2 subagents working · Audit styles");
     await expect(page.locator('[data-chat-item-id="part:parent"] [data-chat-copy="answer"]')).toHaveCount(0);
 
-    await track.locator("summary").click();
+    // Open already: it holds a running subagent.
+    await expect(track).toHaveAttribute("open", "");
     await expect(track.locator("li")).toHaveCount(2);
     await track.getByRole("button", { name: "explore · Review renderer" }).click();
 
@@ -373,7 +374,8 @@ test.describe("chat panels and navigation", () => {
       id: "tool:agent-question", type: "tool", createdAt: 2, name: "task", status: "running", childConversationId: child.conversation.id,
       input: JSON.stringify({ description: "Ask reader", subagent_type: "explore", prompt: "go" }),
     }]);
-    await page.locator("#chat-subagents summary").click();
+    // Open already: it holds a running subagent.
+    await expect(page.locator("#chat-subagents")).toHaveAttribute("open", "");
     await page.getByRole("button", { name: "explore · Ask reader" }).click();
     const drilldown = page.locator("#chat-drilldown");
     await expect(drilldown).toBeVisible();

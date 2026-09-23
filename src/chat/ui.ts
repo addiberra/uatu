@@ -21,6 +21,7 @@ import { navigateWorkspaceFileReference, resolveWorkspaceFileReference } from ".
 import { READER_CLOSED, QueueDockRenderer, RevertedMessagesDockRenderer, TimelineRenderer, decorateAttachmentImages, decorateFileLinks, formatElapsed, latestTodoEntries, statusLabel, subagentEntries, subagentLabel, workingLabel } from "./timeline-renderer";
 import { backgroundStatusLabel, runningBackgroundTasks } from "./background-tasks";
 import { pausedStatusLabel, pausedWakeups, pendingWakeups, scheduledStatusLabel, wakeupFireTime } from "./scheduled-wakeups";
+import { RunningWorkDisclosure } from "./running-work-disclosure";
 import { TaskInspectionPanel, formatTaskElapsed, runningTaskForChild, taskById, taskInspection, type OpenTaskInspection } from "./task-inspection";
 import { composerRoutineState, formatUsd, latestPlanReport, latestRateLimit, planChip, planHasRows, planName, planReadoutRows, sessionTotalsTitle, usageAsOf, usageStale, type RateLimitStanding } from "./composer-status";
 import { buildPlanRowNodes, currentUsageReport, initUsagePaneControls, noteUsageReport, onUsageChange, onUsageRead, readStatusText, readUsageNow, refreshUsageIfStale, revealUsagePane, usageReadState, usageReadable } from "./usage-pane";
@@ -831,6 +832,24 @@ export function initChat(api = new ChatApiClient()): void {
   const backgroundTasksItems = document.querySelector<HTMLElement>("#chat-background-tasks-items");
 
   /**
+   * Both pinned lists of running work open when running work first appears
+   * in them, so a task's inspect and Stop controls are a tap away rather
+   * than behind a disclosure; a user's collapse of running work is held
+   * until that work is over (see running-work-disclosure.ts). Opening sets
+   * `open` and nothing else — no focus moves and the timeline is not
+   * scrolled; the list's rows are height-bounded, so the composer's
+   * displacement stays capped.
+   */
+  const trackRunningWork = (list: HTMLDetailsElement | null) => {
+    const disclosure = new RunningWorkDisclosure(list?.open ?? false);
+    list?.addEventListener("toggle", () => disclosure.toggled(list.open));
+    return (runningCount: number) => {
+      if (list && disclosure.paint(projection?.conversationId ?? null, runningCount) && !list.open) list.open = true;
+    };
+  };
+  const discloseBackgroundTasks = trackRunningWork(backgroundTasks);
+
+  /**
    * Work the agent left running in the background, pinned above the
    * composer with a stop control per task (spec: each task is listed with a
    * stop action). Settled tasks leave the list and take a timeline row.
@@ -848,6 +867,9 @@ export function initChat(api = new ChatApiClient()): void {
     // change check, so it is asked before this list's early return.
     syncTaskInspection();
     const entries = projection && declares("background-tasks") ? runningBackgroundTasks(projection.items) : [];
+    // Ahead of the unchanged-signature return: the rule reads every paint,
+    // since the conversation it is keyed on can change under one signature.
+    discloseBackgroundTasks(entries.length);
     const signature = entries.map(entry => [entry.taskId, entry.description, entry.progress ?? "", entry.childConversationId ?? "", stoppingTasks.has(entry.taskId) ? "stopping" : ""].join("\u0001")).join("\u0002");
     if (signature === paintedBackgroundTasks) return;
     paintedBackgroundTasks = signature;
@@ -1093,6 +1115,7 @@ export function initChat(api = new ChatApiClient()): void {
   const subagentsLabel = document.querySelector<HTMLElement>("#chat-subagents-label");
   const subagentsItems = document.querySelector<HTMLElement>("#chat-subagents-items");
   const dismissButton = document.querySelector<HTMLButtonElement>("#chat-subagents-dismiss");
+  const discloseSubagents = trackRunningWork(subagents);
   const requestsJump = document.querySelector<HTMLButtonElement>("#chat-requests-jump");
   // Finished subagents stay until explicitly dismissed — nothing retires
   // them on a timer. Dismissals persist with the rest of the per-conversation
@@ -1253,6 +1276,7 @@ export function initChat(api = new ChatApiClient()): void {
   const syncSubagents = () => {
     if (!subagents || !subagentsLabel || !subagentsItems) return;
     if (!declares("subagents")) {
+      discloseSubagents(0);
       paintedSubagents = "";
       subagents.hidden = true;
       subagentsItems.replaceChildren();
@@ -1261,6 +1285,9 @@ export function initChat(api = new ChatApiClient()): void {
     const all = projection ? subagentEntries(projection.items) : [];
     const dismissed = projection ? dismissedSubagents(projection.conversationId) : new Set<string>();
     const entries = all.filter(entry => !dismissed.has(entry.id));
+    // Finished entries stay listed until dismissed, but they are not running
+    // work: only a run that has not settled opens the track.
+    discloseSubagents(entries.filter(entry => entry.status === "running" || entry.status === "pending").length);
     const signature = entries
       .map(entry => [entry.id, entry.status, entry.subagent ?? "", entry.description, entry.conversationId ?? "", entry.model ?? "", entry.usage ? String(totalTokens(entry.usage)) : "", entry.usage?.costUsd ?? "", entry.progress ?? ""].join("\u0001"))
       .join("\u0002");

@@ -16,7 +16,11 @@ progress, and — from the moment Claude Code makes the task's output
 location known — the output produced so far, refreshed while the task
 runs. Stop SHALL remain available from the inspection view. Tasks that
 start while a turn is still running SHALL be listed at once, not only
-after the turn ends. A task's completion, failure, or stop SHALL appear
+after the turn ends. The lists of running background tasks and running
+subagents SHALL be shown expanded when running work first appears in
+them, so a task can be inspected or stopped without first disclosing the
+list; a list the user collapses SHALL stay collapsed until the work it
+holds is over, so the surface never reopens against the user's choice. A task's completion, failure, or stop SHALL appear
 in the timeline with its summary, live and when the conversation is
 reopened from storage alike: the notification Claude Code stored for the
 model SHALL replay as the settled task row, linked to the step that
@@ -40,6 +44,15 @@ work.
 #### Scenario: Work that starts mid-turn is listed while the turn runs
 - **WHEN** a running turn launches a backgrounded task and a subagent
 - **THEN** the task is listed as running background work and the subagent appears in the subagents track before the turn ends
+
+#### Scenario: Running work is reachable without disclosing the list
+- **WHEN** a backgrounded task or a subagent starts in a conversation whose lists held no running work
+- **THEN** its list is shown expanded, with the entry's inspect and Stop controls reachable directly
+
+#### Scenario: A list the user collapsed stays collapsed
+- **WHEN** the user collapses a list while it holds running work, and further work starts in it
+- **THEN** the list stays collapsed
+- **AND** it expands again for work that starts after everything it held is over
 
 #### Scenario: A running agent task is inspected
 - **WHEN** the user selects a running background agent task

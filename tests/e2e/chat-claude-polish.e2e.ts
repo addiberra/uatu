@@ -84,11 +84,16 @@ const skillTool = (id: string, createdAt: number, skill: string, status: "runnin
   ...(childConversationId === undefined ? {} : { childConversationId }),
   ...(output === undefined ? {} : { output }),
 });
-/** The composer's task list, opened so its rows can be read and clicked. */
+/**
+ * The composer's task list, open so its rows can be read and clicked. It
+ * opens itself when running work first appears in it — no disclosure click —
+ * so this asserts that rather than clicking: a click on an open list would
+ * collapse it.
+ */
 async function openTaskList(page: Page) {
   const list = page.locator("#chat-background-tasks");
   await expect(list).toBeVisible();
-  if (await list.getAttribute("open") === null) await list.locator("summary").click();
+  await expect(list).toHaveAttribute("open", "");
   return list;
 }
 
@@ -336,7 +341,8 @@ test.describe("Claude Code chat polish (fixture-driven)", () => {
     await expect(page.locator('[data-chat-item-id="task:b2f6"]')).toHaveCount(0);
     await capture(page, testInfo, "phase2-background-state-composer");
     await control(request, { action: "item", conversationId: id, item: { ...task, progress: "Using Bash" } });
-    await list.locator("summary").click();
+    // Open already: running work is reachable without disclosing the list.
+    await expect(list).toHaveAttribute("open", "");
     await expect(list.locator("li")).toHaveCount(1);
     await expect(list.locator("li .chat-background-task-progress")).toHaveText("Using Bash");
     await capture(page, testInfo, "phase2-task-list-stop");
@@ -384,6 +390,41 @@ test.describe("Claude Code chat polish (fixture-driven)", () => {
     await expect(page.locator("#chat-background-tasks-label")).toHaveText("1 background task running · Watch the build");
   });
 
+  test("running work is reachable without disclosing its list, and a list the user collapsed stays collapsed", async ({ page, request }) => {
+    // Spec: "Running work is reachable without disclosing the list" and "A
+    // list the user collapsed stays collapsed".
+    const id = await bootClaude(page, request, "Reachable running work", [
+      { id: "message:u1", type: "user_message", createdAt: 1, text: "Run the suite and have an explorer read the tree" },
+    ]);
+    await control(request, { action: "status", conversationId: id, status: "background" });
+    const focusedBefore = await page.evaluate(() => document.activeElement?.id ?? "");
+    await control(request, { action: "item", conversationId: id, item: runningTask("bgjpa", "bun test", { taskType: "local_bash", toolUseId: "toolu_2", outputFile: "/tmp/tasks/bgjpa.output" }) });
+    await control(request, { action: "item", conversationId: id, item: agentTool("tool:toolu_1", "Read the tree", "explore") });
+
+    // No disclosure click: the task's inspect and Stop controls are on screen.
+    const list = page.locator("#chat-background-tasks");
+    await expect(list.locator('[data-inspect-task="bgjpa"]')).toBeVisible();
+    await expect(list.getByRole("button", { name: "Stop bun test" })).toBeVisible();
+    const track = page.locator("#chat-subagents");
+    await expect(track.locator("li")).toContainText("explore · Read the tree");
+    await expect(track.locator("li")).toBeVisible();
+    // Opening moved no focus.
+    expect(await page.evaluate(() => document.activeElement?.id ?? "")).toBe(focusedBefore);
+
+    // The user collapses both; new running work does not reopen them.
+    await list.locator("summary").click();
+    await track.locator("summary").click();
+    await expect(list).not.toHaveAttribute("open", "");
+    await expect(track).not.toHaveAttribute("open", "");
+    await control(request, { action: "item", conversationId: id, item: runningTask("c1", "Build the docs", { taskType: "local_bash", toolUseId: "toolu_3" }) });
+    await control(request, { action: "item", conversationId: id, item: agentTool("tool:toolu_4", "Audit the links", "explore") });
+    await expect(list.locator("#chat-background-tasks-label")).toHaveText("2 background tasks running");
+    await expect(track.locator("summary")).toContainText("2 of 2 subagents working");
+    await expect(list).not.toHaveAttribute("open", "");
+    await expect(track).not.toHaveAttribute("open", "");
+    await expect(list.locator('[data-inspect-task="c1"]')).toBeHidden();
+  });
+
   test("work that starts mid-turn is listed while the turn is still running", async ({ page, request }) => {
     // Spec: a task and a subagent launched by a running turn are listed at
     // once, not only once the turn ends. The composer is still `working`.
@@ -407,7 +448,7 @@ test.describe("Claude Code chat polish (fixture-driven)", () => {
     await expect(list.locator('li[data-background-task="bgjpa"]')).toContainText("Build the docs");
     const track = page.locator("#chat-subagents");
     await expect(track).toBeVisible();
-    await track.locator("summary").click();
+    await expect(track).toHaveAttribute("open", "");
     // No child id has been reported for this run yet, so the row names it
     // without offering a transcript — it is still listed, with its progress.
     await expect(track.locator("li")).toContainText("explore · Read the tree");
@@ -468,7 +509,7 @@ test.describe("Claude Code chat polish (fixture-driven)", () => {
     await page.locator("#chat-drilldown-back").click();
     await expect(drilldown).toBeHidden();
     const track = page.locator("#chat-subagents");
-    await track.locator("summary").click();
+    await expect(track).toHaveAttribute("open", "");
     await expect(track.locator(".chat-subagent-progress")).toHaveText("Writing the findings");
     await track.getByRole("button", { name: "explore · Review renderer" }).click();
     await expect(drilldown).toBeVisible();
@@ -574,7 +615,7 @@ test.describe("Claude Code chat polish (fixture-driven)", () => {
     const track = page.locator("#chat-subagents");
     await expect(track).toBeVisible();
     await expect(track.locator("summary")).toContainText("code-review");
-    await track.locator("summary").click();
+    await expect(track).toHaveAttribute("open", "");
     await expect(track.locator("li")).toHaveCount(1);
     await expect(track.locator(".chat-subagent-label")).toHaveText("Skill · code-review");
     await expect(track.locator("[data-open-conversation]")).toHaveCount(0);
@@ -640,7 +681,7 @@ test.describe("Claude Code chat polish (fixture-driven)", () => {
     await control(request, { action: "item", conversationId: id, item: skillTool("tool:toolu_skill", 10, "run", "running") });
     const track = page.locator("#chat-subagents");
     await expect(track).toBeVisible();
-    await track.locator("summary").click();
+    await expect(track).toHaveAttribute("open", "");
     await expect(track.locator(".chat-subagent-label")).toHaveText("Skill · run");
 
     // It settles without ever naming a child: an ordinary skill load, a
