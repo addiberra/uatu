@@ -1406,30 +1406,74 @@ describe("ClaudeProvider sessions", () => {
       await provider.dispose();
     });
 
-    test("frames of a run the provider does not know keep landing in the parent as before; its ending result still names the child", async () => {
+    // A Skill fork (spike Q3, Surprise 5): frames under the Skill tool use
+    // from the first moment, no task edge, and the fork's agent id only in
+    // the tool result that ends it.
+    const FORK_AGENT = "aaeeab292f002e3d7";
+    const forkFrames = (sessionId: string) => [
+      { type: "assistant", uuid: "fork1", timestamp: stamp(2), session_id: sessionId, parent_tool_use_id: "toolu_skill", message: { role: "assistant", model: "claude-haiku-4-5-20251001", content: [{ type: "thinking", thinking: "Reading the diff." }, { type: "text", text: "Reviewing." }, { type: "tool_use", id: "toolu_diff", name: "Bash", input: { command: "git diff HEAD" } }] } },
+      { type: "user", uuid: "fork2", timestamp: stamp(3), session_id: sessionId, parent_tool_use_id: "toolu_skill", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_diff", content: "+1 -1" }] }, tool_use_result: null },
+    ];
+    const skillCall = (sessionId: string) => ({ type: "assistant", uuid: "skill", timestamp: stamp(1), session_id: sessionId, parent_tool_use_id: null, message: { role: "assistant", model: "claude-haiku-4-5-20251001", content: [{ type: "tool_use", id: "toolu_skill", name: "Skill", input: { skill: "code-review" } }] } });
+
+    test("a skill fork's frames are held until its result names it, then fill the child in arrival order", async () => {
       const { provider, queries } = fixture();
       const { events, stop } = collect(provider);
       const session = await provider.createSession("x");
       await provider.prompt(session.id, { id: "r1", text: "review", delivery: "queue" });
       const query = queries[0]!;
-      // A Skill fork (spike Q3): frames under the Skill tool use, no task
-      // edge, the agent id only in the tool result that ends the fork.
-      query.push({ type: "assistant", uuid: "skill", timestamp: stamp(1), session_id: session.id, parent_tool_use_id: null, message: { role: "assistant", model: "claude-haiku-4-5-20251001", content: [{ type: "tool_use", id: "toolu_skill", name: "Skill", input: { skill: "code-review" } }] } });
-      query.push({ type: "assistant", uuid: "fork1", timestamp: stamp(2), session_id: session.id, parent_tool_use_id: "toolu_skill", message: { role: "assistant", model: "claude-haiku-4-5-20251001", content: [{ type: "thinking", thinking: "Reading the diff." }, { type: "text", text: "Reviewing." }, { type: "tool_use", id: "toolu_diff", name: "Bash", input: { command: "git diff HEAD" } }] } });
-      query.push({ type: "user", uuid: "fork2", timestamp: stamp(3), session_id: session.id, parent_tool_use_id: "toolu_skill", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_diff", content: "+1 -1" }] }, tool_use_result: null });
+      const forkChildId = `sub:${session.id}:${FORK_AGENT}`;
+      query.push(skillCall(session.id));
+      for (const frame of forkFrames(session.id)) query.push(frame);
       await waitFor(() => upsertIds(events, session.id).filter(id => id === "tool:toolu_diff").length === 2);
-      // The fork's tool row is the parent's, completed by its result; its
-      // text and thinking are dropped; no child conversation heard of it.
+      // While the fork has no name the parent's rows are exactly what they
+      // were before D10 — its tool row, opened and completed, its text and
+      // thinking dropped — and no child has been heard of.
       expect(upsertIds(events, session.id).filter(id => id === "message:fork1" || id.startsWith("reasoning:"))).toEqual([]);
       expect(events.some(event => event.conversationId?.startsWith("sub:"))).toBe(false);
-      const forkChildId = `sub:${session.id}:aaeeab292f002e3d7`;
       expect(await provider.getSession(forkChildId)).toBeNull();
-      query.push({ type: "user", uuid: "forked", timestamp: stamp(4), session_id: session.id, parent_tool_use_id: null, message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_skill", content: "Based on my analysis..." }] }, tool_use_result: { success: true, commandName: "code-review", status: "forked", agentId: "aaeeab292f002e3d7", result: "Based on my analysis..." } });
-      await waitFor(() => upsertIds(events, session.id).includes("tool:toolu_skill"));
-      // Known now, and over: resolvable as the parent's child (its
-      // transcript is on disk by then), never reported running.
-      expect(await provider.getSession(forkChildId)).toEqual(expect.objectContaining({ parentId: session.id }));
-      expect(events.some(event => event.conversationId === forkChildId)).toBe(false);
+      const parentBefore = upsertIds(events, session.id);
+
+      query.push({ type: "user", uuid: "forked", timestamp: stamp(4), session_id: session.id, parent_tool_use_id: null, message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_skill", content: "Based on my analysis..." }] }, tool_use_result: { success: true, commandName: "code-review", status: "forked", agentId: FORK_AGENT, result: "Based on my analysis..." } });
+      await waitFor(() => events.some(event => event.conversationId === forkChildId && event.updates.some(update => update.kind === "status" && update.status === "completed")));
+
+      const childUpdates = events.filter(event => event.conversationId === forkChildId).flatMap(event => event.updates);
+      // Running, then everything the fork streamed while nameless, then the
+      // settle: the transcript is complete before the status closes it.
+      expect(childUpdates[0]).toEqual({ kind: "status", status: "running" });
+      expect(childUpdates.at(-1)).toEqual({ kind: "status", status: "completed" });
+      expect(childUpdates.flatMap(update => update.kind === "upsert" ? [update.item.id] : []))
+        .toEqual(["reasoning:fork1:0", "tool:toolu_diff", "message:fork1", "tool:toolu_diff"]);
+      expect(childUpdates.flatMap(update => update.kind === "upsert" && update.item.id === "tool:toolu_diff" ? [update.item] : []).at(-1))
+        .toEqual(expect.objectContaining({ type: "tool", name: "Bash", status: "completed", output: "+1 -1" }));
+      // Replayed into the child only: the parent gained nothing but the
+      // launching row this result completes.
+      expect(upsertIds(events, session.id)).toEqual([...parentBefore, "tool:toolu_skill"]);
+      const launcher = events.filter(event => event.conversationId === session.id).flatMap(event => event.updates).flatMap(update => update.kind === "upsert" && update.item.id === "tool:toolu_skill" ? [update.item] : []).at(-1);
+      expect(launcher).toEqual(expect.objectContaining({ type: "tool", name: "Skill", status: "completed", childConversationId: forkChildId }));
+      expect(await provider.getSession(forkChildId)).toEqual(expect.objectContaining({ id: forkChildId, parentId: session.id }));
+      stop();
+      await provider.dispose();
+    });
+
+    test("frames held for a tool use that never forks are dropped unsent", async () => {
+      const { provider, queries } = fixture();
+      const { events, stop } = collect(provider);
+      const session = await provider.createSession("x");
+      await provider.prompt(session.id, { id: "r1", text: "review", delivery: "queue" });
+      const query = queries[0]!;
+      query.push(skillCall(session.id));
+      for (const frame of forkFrames(session.id)) query.push(frame);
+      await waitFor(() => upsertIds(events, session.id).filter(id => id === "tool:toolu_diff").length === 2);
+      // An ordinary skill load: the result names no agent, so there is no
+      // child the held frames could belong to.
+      query.push({ type: "user", uuid: "loaded", timestamp: stamp(4), session_id: session.id, parent_tool_use_id: null, message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_skill", content: "Skill loaded." }] }, tool_use_result: { success: true, commandName: "code-review" } });
+      await waitFor(() => upsertIds(events, session.id).filter(id => id === "tool:toolu_skill").length === 2);
+      await query.return();
+      await Bun.sleep(10);
+      expect(events.some(event => event.conversationId?.startsWith("sub:"))).toBe(false);
+      // The parent kept the fork's tool row, as it does today.
+      expect(upsertIds(events, session.id).filter(id => id === "tool:toolu_diff").length).toBe(2);
       stop();
       await provider.dispose();
     });

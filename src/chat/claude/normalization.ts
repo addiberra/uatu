@@ -868,7 +868,7 @@ function toolResultUpdate(block: Block, envelope: Envelope, memory: ClaudeEventM
   if (memory.todoTools.has(toolUseId)) return [];
   const known = memory.tools.get(toolUseId);
   const failed = block.is_error === true;
-  const output = block.content === undefined ? undefined : stringify(block.content);
+  const output = block.content === undefined ? undefined : resultOutput(block.content);
   // A Task completion names its subagent run: the child transcript becomes
   // an openable drill-down, and the store's own accounting lands as the
   // launching row's attribution (spec: the row states model and tokens).
@@ -948,6 +948,25 @@ function rememberLaunchedTask(taskId: string, facts: BackgroundTaskFacts, launch
   boundedSet(memory.tasks, taskId, entry, MEMORY_LIMIT);
   if (!entry.backgrounded || !entry.announced || entry.settled) return [];
   return [{ kind: "upsert", item: backgroundTaskItem(taskId, entry, "running") }];
+}
+
+/**
+ * What a tool result shows as its output. The API gives a result's content
+ * either as a string or as the content-block array the model is sent, and
+ * stringifying the array printed the envelope — `[ { "type": "text", "text":
+ * "…" } ]` — where a settled Agent row should read as the subagent's prose.
+ * An all-text array is that prose with a wrapper around it, so it is unwrapped;
+ * anything else (an image block, a shape we do not know) keeps the JSON view,
+ * where nothing is lost. A result whose text IS JSON — a tool that answers in
+ * it — is a string either way and reads exactly as before.
+ */
+function resultOutput(content: unknown): string {
+  if (typeof content === "string") return content;
+  const blocks = contentBlocks(content);
+  if (blocks.length > 0 && blocks.every(block => block.type === "text" && typeof block.text === "string")) {
+    return blocks.map(block => block.text as string).join("\n");
+  }
+  return stringify(content);
 }
 
 /** The text of a tool result's content: a string as is, text blocks joined. */

@@ -305,6 +305,13 @@ type LiveSession = {
   // Kept for the query's life — a settled run's transcript is on disk, but
   // a late frame still has a home, and the drill-down keeps resolving it.
   children: Map<string, LiveChild>;
+  // Frames tagged with a tool use no run is known for, held in arrival
+  // order against that tool use (design D10). A skill fork streams from its
+  // first moment but names its agent id only in the result that ends it, so
+  // this is what the child is filled from when the id lands. Bounded in
+  // entries and in frames per entry; dropped when the tool use settles or
+  // the query ends.
+  forkBuffers: Map<string, Record<string, unknown>[]>;
 };
 
 type SessionWakeup = { prompt: string; recurring: boolean; schedule: string; createdAt: number; nextFireAt?: number };
@@ -361,6 +368,11 @@ type LiveChild = {
 // the parent's whatever tag they carry (task 5.1, requirement f).
 const SUBAGENT_FRAME_TYPES = new Set(["assistant", "user", "stream_event", "tool_progress"]);
 const CHILDREN_LIMIT = 512;
+// A fork's held frames: how many tool uses may be waiting for an id at once,
+// and how many frames each may hold. Both bounds exist so a chatty fork — or
+// a run whose result never arrives — cannot grow the session without limit.
+const FORK_BUFFERS_LIMIT = 32;
+const FORK_BUFFER_FRAMES = 256;
 
 // One live background task as the session holds it: the level signal's
 // identity plus the facts the edges and the launching tool result added
@@ -1271,7 +1283,7 @@ export class ClaudeProvider implements ChatProvider {
         forwardSubagentText: true,
       },
     });
-    const session: LiveSession = { id: sessionId, notificationLifecycle: new ClaudeNotificationLifecycle(), queue, query, reader: Promise.resolve(), pendingTurns: 0, backgroundTasks: new Map(), wakeups: new Map(), firedSinceStop: new Map(), cronIds: new Set(), selfPacedPrompts: new Set(), blockedFires: 0, revived: new Map(), revivedSettled: false, revivedReady: Promise.resolve(), unpromptedTurn: false, resultsSeen: 0, queuedTurns: 0, usageReads: 0, usageSeq: 0, usageAdopted: 0, children: new Map() };
+    const session: LiveSession = { id: sessionId, notificationLifecycle: new ClaudeNotificationLifecycle(), queue, query, reader: Promise.resolve(), pendingTurns: 0, backgroundTasks: new Map(), wakeups: new Map(), firedSinceStop: new Map(), cronIds: new Set(), selfPacedPrompts: new Set(), blockedFires: 0, revived: new Map(), revivedSettled: false, revivedReady: Promise.resolve(), unpromptedTurn: false, resultsSeen: 0, queuedTurns: 0, usageReads: 0, usageSeq: 0, usageAdopted: 0, children: new Map(), forkBuffers: new Map() };
     owner = session;
     session.reader = this.readSession(session);
     this.live.set(sessionId, session);
@@ -2705,17 +2717,60 @@ export class ClaudeProvider implements ChatProvider {
     const parentToolUseId = typeof record.parent_tool_use_id === "string" && record.parent_tool_use_id ? record.parent_tool_use_id : undefined;
     if (!parentToolUseId || typeof record.type !== "string" || !SUBAGENT_FRAME_TYPES.has(record.type)) return false;
     const child = session.children.get(parentToolUseId);
-    if (!child) return false;
-    // Untagged for the child's normalizer: within its own conversation the
-    // frame is the conversation's, which is also how the stored transcript
-    // replays it — the same uuids and tool-use ids, so a projection filled
-    // from the file and then fed live upserts the same items (task 5.1 c).
-    // "live", as for the parent: the CLI does not forward the run's prompt,
-    // and the stored replay supplies that bubble.
-    const { assistantUsage: _usage, assistantModel: _model, ...normalized } = normalizeClaudeMessage({ ...record, parent_tool_use_id: null }, child.memory, "live");
-    if (normalized.updates.length === 0 && !normalized.configuration) return true;
-    this.emit(child.id, normalized);
+    // No run for this tool use yet: held for the id the ending result will
+    // name (design D10), and still the parent's frame until then, so its
+    // rows read exactly as they do today.
+    if (!child) {
+      this.bufferForkFrame(session, parentToolUseId, record);
+      return false;
+    }
+    this.emitChildFrame(child, record);
     return true;
+  }
+
+  /**
+   * One forwarded frame as the child's own. Untagged for the child's
+   * normalizer: within its own conversation the frame is the conversation's,
+   * which is also how the stored transcript replays it — the same uuids and
+   * tool-use ids, so a projection filled from the file and then fed live
+   * upserts the same items (task 5.1 c). "live", as for the parent: the CLI
+   * does not forward the run's prompt, and the stored replay supplies that
+   * bubble.
+   *
+   * Shared with the replay a fork's buffer gets (D10), so a frame held and
+   * a frame routed straight through fold into the same child memory and
+   * produce the same item ids.
+   */
+  private emitChildFrame(child: LiveChild, record: Record<string, unknown>): void {
+    const { assistantUsage: _usage, assistantModel: _model, ...normalized } = normalizeClaudeMessage({ ...record, parent_tool_use_id: null }, child.memory, "live");
+    if (normalized.updates.length === 0 && !normalized.configuration) return;
+    this.emit(child.id, normalized);
+  }
+
+  /**
+   * A frame whose run the session cannot name yet, held against its tool use
+   * (design D10). A skill fork's frames stream under the Skill tool use from
+   * the first moment, but the fork's `agentId` appears only in the tool
+   * result, when the run ends — the opposite of an agent task, whose id its
+   * start edge already carries.
+   *
+   * Bounded twice: FORK_BUFFERS_LIMIT tool uses may be waiting at once, and
+   * each holds at most FORK_BUFFER_FRAMES frames. The overflow is dropped
+   * rather than shifted out of the front, so a `tool_use` never loses the
+   * frame that named it and a replayed transcript stays readable from its
+   * start; the fork's own `.jsonl` is the complete record the drill-down
+   * reads once the child is openable. Stream deltas are not held at all:
+   * the complete `assistant` frame that follows says the same thing, and
+   * holding partials would spend the whole bound on text that arrives again.
+   */
+  private bufferForkFrame(session: LiveSession, parentToolUseId: string, record: Record<string, unknown>): void {
+    if (record.type === "stream_event") return;
+    const held = session.forkBuffers.get(parentToolUseId) ?? [];
+    if (held.length < FORK_BUFFER_FRAMES) held.push(record);
+    // Re-inserted on every frame, so the entry the ceiling evicts is the
+    // tool use nothing has streamed under for longest — never the fork
+    // still running.
+    boundedSet(session.forkBuffers, parentToolUseId, held, FORK_BUFFERS_LIMIT);
   }
 
   /**
@@ -2755,16 +2810,33 @@ export class ClaudeProvider implements ChatProvider {
     if (record.type !== "user") return;
     const raw = record.toolUseResult ?? record.tool_use_result;
     const outcome = raw && typeof raw === "object" ? raw as Record<string, unknown> : undefined;
-    const agentId = outcome && typeof outcome.agentId === "string" && outcome.agentId ? outcome.agentId : undefined;
-    if (!agentId || !outcome) return;
     // The result's tool use is the row the normalizer just completed.
     const row = normalized.updates.find(update => update.kind === "upsert" && update.item.type === "tool");
     const toolUseId = row?.kind === "upsert" ? row.item.id.replace(/^tool:/, "") : undefined;
     if (!toolUseId) return;
+    // Whatever this tool use was, it is over: frames held for it either
+    // become the fork's transcript just below, or are dropped unsent — a
+    // tool use that never forked has no child to replay them into (D10).
+    const held = session.forkBuffers.get(toolUseId);
+    session.forkBuffers.delete(toolUseId);
+    const agentId = outcome && typeof outcome.agentId === "string" && outcome.agentId ? outcome.agentId : undefined;
+    if (!agentId || !outcome) return;
     const launched = outcome.isAsync === true || outcome.status === "async_launched";
-    const child = this.openChild(session, toolUseId, agentId, launched);
+    const buffered = held && held.length > 0 ? held : undefined;
+    // A fork (`status: "forked"`) is named only here. Held frames are the
+    // sign that this result names a run that was already streaming, so its
+    // child opens running rather than silently settled: running first, then
+    // the frames it streamed while nameless, in arrival order and once each.
+    // They land BEFORE the settle below, so the status is the last thing the
+    // child hears and the transcript is complete when it is read. A result
+    // that names a run nothing streamed under keeps today's behaviour — the
+    // child is registered so the drill-down resolves it, and says nothing.
+    const child = this.openChild(session, toolUseId, agentId, launched || buffered !== undefined);
+    if (buffered) for (const frame of buffered) this.emitChildFrame(child, frame);
     // A sync result means the run is over; the task notification usually
-    // said so already, and a Skill fork (`status: "forked"`) only ends here.
+    // said so already, and a fork only ends here — unlike an async agent
+    // launch, whose result is the run's START, a fork's result IS its end
+    // (spec: a fork's identity "is only confirmed when it ends").
     if (!launched) this.settleChild(child, row?.kind === "upsert" && row.item.type === "tool" && row.item.status === "failed" ? "failed" : "completed");
   }
 
@@ -2772,6 +2844,10 @@ export class ClaudeProvider implements ChatProvider {
   private openChild(session: LiveSession, parentToolUseId: string, agentId: string, running: boolean): LiveChild {
     const known = session.children.get(parentToolUseId);
     if (known) return known;
+    // A run that becomes known routes its frames from here on: nothing held
+    // against this tool use outlives the moment (the caller that wanted the
+    // buffer took it first).
+    session.forkBuffers.delete(parentToolUseId);
     const child: LiveChild = { id: `sub:${session.id}:${agentId}`, agentId, memory: createClaudeEventMemory(), startedAt: this.now(), settled: !running };
     child.memory.resolveModel = id => this.modelAliases.get(id) ?? id;
     boundedSet(session.children, parentToolUseId, child, CHILDREN_LIMIT);
@@ -2788,6 +2864,9 @@ export class ClaudeProvider implements ChatProvider {
   /** Every run still reading as running when the query ends: settled with the query's own outcome. */
   private settleChildren(session: LiveSession, status: "failed" | "interrupted"): void {
     for (const child of session.children.values()) this.settleChild(child, status);
+    // The query that would have named the held frames' run is gone; nothing
+    // can replay them, so they go with it (design D10).
+    session.forkBuffers.clear();
   }
 
   /** A run of a live session, by its child conversation id. */

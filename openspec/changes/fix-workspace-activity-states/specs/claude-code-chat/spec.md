@@ -85,7 +85,17 @@ Claude Code reports it. Subagent runs MUST NOT appear in the
 conversation inventory. The launching row SHALL be attributable with the
 subagent's model and consumed tokens as Claude Code reports them, and a
 run without reported usage SHALL stay readable without asserting
-figures.
+figures. A skill the agent runs as a fork of itself — Claude Code's
+forked skills, such as a review command — SHALL be openable as a child
+transcript from the row that launched it, once the run names itself,
+which Claude Code does only when the fork ends. That transcript SHALL be
+complete: the work the fork streamed while it was still nameless SHALL
+be present in it, not lost. While such a fork runs it SHALL be named as
+work in progress alongside the conversation's subagent runs, carrying
+the skill it is running and its latest tool activity where Claude Code
+reports it, and its tool activity SHALL remain visible in the parent
+timeline — so the conversation is never silent about work it cannot yet
+name. Such an entry SHALL become openable once the run names itself.
 
 #### Scenario: A subagent transcript is reachable from its row
 - **WHEN** a Claude Code turn runs a subagent and the user opens its row
@@ -96,6 +106,17 @@ figures.
 - **WHEN** the user opens a subagent that is still running, from its row or the subagents track
 - **THEN** its transcript shows the activity so far and continues to update until the run ends
 - **AND** the run's completion is reflected in the open transcript and on the launching row
+
+#### Scenario: A forked skill's transcript is complete when it opens
+- **WHEN** the agent runs a skill as a fork of itself and the user opens its launching row after it ends
+- **THEN** the fork's whole run is presented as a child transcript, including the work it streamed before it named itself
+- **AND** the conversation picker still lists only the parent
+
+#### Scenario: A running fork is not silent
+- **WHEN** a forked skill is still running
+- **THEN** it is listed as work in progress, named by the skill it runs, with its latest tool activity where reported
+- **AND** its tool activity appears in the parent timeline as it happens
+- **AND** the listed entry becomes openable once the run ends and names itself
 
 #### Scenario: A replayed conversation retains its subagent transcripts
 - **WHEN** a conversation with completed subagent runs is opened from native session storage

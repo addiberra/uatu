@@ -770,17 +770,22 @@ describe("activity (2.4)", () => {
     expect(s.envelopes[1]!.event).toEqual({ kind: "data", data: { running: false, working: false, awaiting: false, finished: false } });
   });
 
-  test("the activity upstream is refcounted per user and released after the last feed leaves", async () => {
+  test("two users share one upstream; it follows the workspace, not the feeds, and is released when it stops", async () => {
     const child = fakeSource({ running: new Set(["a"]), workspaces: ["a"] });
     const live = broker(child.source, { lingerMs: 30 });
     const one = live.subscribeActivity(sink(), "u1");
     const two = live.subscribeActivity(sink(), "u2");
     await waitFor(() => child.opened.length === 1, "one child upstream for two users");
     one.detach();
+    two.detach();
+    // Every feed is gone and the workspace still runs: the broker keeps
+    // watching, which is what lets it see a finish nobody is there for.
     await Bun.sleep(60);
     expect(child.opened[0]!.cancelled).toBe(false);
-    two.detach();
-    await waitFor(() => child.opened[0]!.cancelled, "released after linger");
+    expect(live.upstreamCount("activity")).toBe(1);
+    child.setRunning("a", false);
+    await waitFor(() => child.opened[0]!.cancelled, "the stop cancels the child fetch");
+    await waitFor(() => live.upstreamCount("activity") === 0, "released after the stop's linger");
   });
 });
 
@@ -913,6 +918,42 @@ describe("finished (fix-workspace-activity-states D2/D3)", () => {
     push(child, false, false);
     await Bun.sleep(20);
     expect(latestFor(again, "a").finished).toBe(false);
+  });
+
+  test("work finishing with no feed open at all is reported to the first feed that appears afterwards (D11)", async () => {
+    const { child, live, attachments } = await workingWorkspace();
+    // Both users close their last page. The broker's own watch stays.
+    attachments.alice.detach();
+    attachments.bob.detach();
+    await Bun.sleep(40);
+    expect(child.opened[0]!.cancelled).toBe(false);
+    // The agent finishes with nobody watching.
+    push(child, false, false);
+    await Bun.sleep(30);
+    const later = sink();
+    live.subscribeActivity(later, "alice");
+    expect(latestFor(later, "a")).toEqual({ running: true, working: false, awaiting: false, finished: true });
+    // Still one upstream: the page that returned did not open a second.
+    expect(child.opened).toHaveLength(1);
+  });
+
+  test("a stop with no feed open releases the watch and clears the marks", async () => {
+    const { child, live, attachments } = await workingWorkspace();
+    push(child, false, false);
+    await Bun.sleep(30);
+    attachments.alice.detach();
+    attachments.bob.detach();
+    child.setRunning("a", false);
+    await waitFor(() => child.opened[0]!.cancelled, "watch released by the stop");
+    const later = sink();
+    live.subscribeActivity(later, "alice");
+    expect(latestFor(later, "a")).toEqual({ running: false, working: false, awaiting: false, finished: false });
+    // Restarted and quiet from the first frame: nothing carries over.
+    child.setRunning("a", true);
+    await waitFor(() => child.opened.length === 2, "reopened");
+    child.opened[1]!.push(": open\n\nevent: activity\ndata: {\"working\":false,\"awaiting\":false}\n\n");
+    await Bun.sleep(30);
+    expect(latestFor(later, "a")).toEqual({ running: true, working: false, awaiting: false, finished: false });
   });
 
   test("every activity payload carries exactly the four facts", async () => {

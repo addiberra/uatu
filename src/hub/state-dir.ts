@@ -37,6 +37,12 @@ export function personalWorkspaceStatePath(stateRoot: string): string {
   return path.join(stateRoot, "personal-workspace-state.json");
 }
 
+// What finished where, and who has seen it: the live broker's finished and
+// viewed marks, kept so a restart does not forget them (src/hub/activity-marks.ts).
+export function activityMarksPath(stateRoot: string): string {
+  return path.join(stateRoot, "activity-marks.json");
+}
+
 export function folderMutationJournalPath(stateRoot: string): string {
   return path.join(stateRoot, "pending-folder-mutation.json");
 }

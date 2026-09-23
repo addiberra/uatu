@@ -72,6 +72,18 @@ const agentTool = (id: string, description: string, subagent: string): Conversat
   id, type: "tool", createdAt: 2, name: "task", status: "running",
   input: JSON.stringify({ description, subagent_type: subagent, prompt: "go" }),
 });
+/**
+ * The `Skill` tool call a forked skill runs under (design D10, spike Q3).
+ * A fork emits no task edge at all: its frames stream under this tool use
+ * and only its result names the run, so `childConversationId` arrives with
+ * the completed row and never before it.
+ */
+const skillTool = (id: string, createdAt: number, skill: string, status: "running" | "completed", childConversationId?: string, output?: string): ConversationItem => ({
+  id, type: "tool", createdAt, name: "Skill", status,
+  input: JSON.stringify({ skill }),
+  ...(childConversationId === undefined ? {} : { childConversationId }),
+  ...(output === undefined ? {} : { output }),
+});
 /** The composer's task list, opened so its rows can be read and clicked. */
 async function openTaskList(page: Page) {
   const list = page.locator("#chat-background-tasks");
@@ -543,6 +555,104 @@ test.describe("Claude Code chat polish (fixture-driven)", () => {
     await page.locator("#chat-drilldown-back").click();
     await expect(page.locator("#chat-background-tasks")).toBeHidden();
     await expect(page.locator('[data-chat-item-id="task:tailer"]')).toContainText("Background task stopped");
+  });
+
+  test("a running fork is named in the track and opens a complete transcript once its result names it", async ({ page, request }, testInfo) => {
+    // Spec: "A running fork is not silent" and "A forked skill's transcript
+    // is complete when it opens". The surface is driven with the items the
+    // provider produces for a fork (design D10): a Skill row that runs while
+    // its work streams into the parent timeline, then completes carrying the
+    // child it forked into — which by then holds the whole run.
+    const id = await bootClaude(page, request, "Forked skill", [
+      { id: "message:u1", type: "user_message", createdAt: 1, text: "Review the diff" },
+    ]);
+    await control(request, { action: "status", conversationId: id, status: "running" });
+    await control(request, { action: "item", conversationId: id, item: skillTool("tool:toolu_skill", 10, "code-review", "running") });
+
+    // Listed as work in progress, named by the skill it runs. There is no id
+    // to click yet, so the entry is a label rather than a button.
+    const track = page.locator("#chat-subagents");
+    await expect(track).toBeVisible();
+    await expect(track.locator("summary")).toContainText("code-review");
+    await track.locator("summary").click();
+    await expect(track.locator("li")).toHaveCount(1);
+    await expect(track.locator(".chat-subagent-label")).toHaveText("Skill · code-review");
+    await expect(track.locator("[data-open-conversation]")).toHaveCount(0);
+
+    // The fork's tool activity streams into the parent timeline under the
+    // Skill row, and the track reads its latest step off exactly that.
+    await control(request, { action: "item", conversationId: id, item: bash("tool:fork-bash", 11, "git diff HEAD", "completed", "diff --git a/README.md b/README.md") });
+    await expect(track.locator(".chat-subagent-progress")).toHaveText("Bash · git diff HEAD");
+    await page.locator(".chat-activity-group > summary").first().click();
+    await expect(page.locator('[data-chat-item-id="tool:fork-bash"] .chat-activity-subject')).toHaveText("git diff HEAD");
+    await capture(page, testInfo, "phase5-running-fork-in-the-track");
+
+    // The result names the run. The child it names holds what the fork
+    // streamed while it was still nameless — the provider's buffer, replayed
+    // — as well as what it said at the end.
+    const child = await control(request, {
+      action: "seed", agent: "claude", title: "code-review", child: true,
+      items: [
+        { id: "part:fork-1", type: "assistant_message", createdAt: 3, markdown: "Reading the diff before it had a name." },
+        { id: "tool:fork-child-bash", type: "tool", createdAt: 4, name: "Bash", status: "completed", input: JSON.stringify({ command: "git diff HEAD" }), output: "diff --git a/README.md b/README.md" },
+        { id: "part:fork-2", type: "assistant_message", createdAt: 5, markdown: "One high finding in README.md." },
+      ],
+    }) as { conversation: { id: string } };
+    await control(request, { action: "item", conversationId: id, item: skillTool("tool:toolu_skill", 10, "code-review", "completed", child.conversation.id, "Based on my analysis …") });
+    await control(request, { action: "status", conversationId: id, status: "completed" });
+
+    // The same entry, in place, now openable.
+    await expect(track.locator("li")).toHaveCount(1);
+    const open = track.getByRole("button", { name: "Skill · code-review" });
+    await expect(open).toHaveAttribute("data-open-conversation", child.conversation.id);
+    await open.click();
+    const drilldown = page.locator("#chat-drilldown");
+    const items = page.locator("#chat-drilldown-items");
+    await expect(drilldown).toBeVisible();
+    await expect(page.locator("#chat-drilldown-title")).toHaveText("Skill · code-review");
+    await expect(items).toContainText("Reading the diff before it had a name.");
+    await expect(items).toContainText("git diff HEAD");
+    await expect(items).toContainText("One high finding in README.md.");
+    // A drill-down, not a conversation switch: the picker never moves and
+    // never lists the fork.
+    await expect(page.locator("#chat-conversation-select")).toHaveValue(id);
+    await expect(page.locator(`#chat-conversation-select option[value="${child.conversation.id}"]`)).toHaveCount(0);
+    await capture(page, testInfo, "phase5-forked-skill-transcript");
+
+    // And the same transcript from the row that launched it: one run, one
+    // child, two ways in.
+    await page.locator("#chat-drilldown-back").click();
+    await expect(drilldown).toBeHidden();
+    const row = page.locator('[data-chat-item-id="tool:toolu_skill"]');
+    await expect(row.locator(".chat-activity-subject")).toHaveText("code-review");
+    await row.locator(":scope > summary").click();
+    await row.getByRole("button", { name: "Open transcript" }).click();
+    await expect(drilldown).toBeVisible();
+    await expect(items).toContainText("Reading the diff before it had a name.");
+    await expect(items).toContainText("One high finding in README.md.");
+  });
+
+  test("a skill that names no child was no fork and leaves nothing in the track", async ({ page, request }) => {
+    const id = await bootClaude(page, request, "Plain skill", [
+      { id: "message:u1", type: "user_message", createdAt: 1, text: "Load the run skill" },
+    ]);
+    await control(request, { action: "status", conversationId: id, status: "running" });
+    await control(request, { action: "item", conversationId: id, item: skillTool("tool:toolu_skill", 10, "run", "running") });
+    const track = page.locator("#chat-subagents");
+    await expect(track).toBeVisible();
+    await track.locator("summary").click();
+    await expect(track.locator(".chat-subagent-label")).toHaveText("Skill · run");
+
+    // It settles without ever naming a child: an ordinary skill load, a
+    // moment's work, no run to follow. The track drops it rather than
+    // keeping a finished entry for a fork that never was, and the row itself
+    // offers no transcript.
+    await control(request, { action: "item", conversationId: id, item: skillTool("tool:toolu_skill", 10, "run", "completed", undefined, "Loaded.") });
+    await control(request, { action: "status", conversationId: id, status: "completed" });
+    await expect(track).toBeHidden();
+    const row = page.locator('[data-chat-item-id="tool:toolu_skill"]');
+    await row.locator(":scope > summary").click();
+    await expect(row.getByRole("button", { name: "Open transcript" })).toHaveCount(0);
   });
 
   test("assistant text grows in place as it streams and the completed block matches it", async ({ page, request }, testInfo) => {

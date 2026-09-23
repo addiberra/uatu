@@ -98,13 +98,15 @@ src/
 │                   (SessionBackend seam + local-process impl), proxy
 │                   (HTTP/WS + token brokering), live-broker (refcounted
 │                   child-topic subscriptions fanned out to every page's
-│                   one `/api/hub/live` stream), auth (users + the
-│                   server-side session store, one id over cookie/bearer
-│                   transports + rate limit + CSRF), worktree-* (the linked
-│                   Git worktree service — git probes, journal, reconciler,
-│                   rename/delete guards — and its published JSON family at
-│                   `worktree-api.ts`, `/api/hub/worktrees`), pages, server,
-│                   main
+│                   one `/api/hub/live` stream, plus one hub-lifetime
+│                   activity watch per running workspace) + activity-marks
+│                   (its finished/viewed marks, persisted in the state dir),
+│                   auth (users + the server-side session store, one id over
+│                   cookie/bearer transports + rate limit + CSRF),
+│                   worktree-* (the linked Git worktree service — git
+│                   probes, journal, reconciler, rename/delete guards — and
+│                   its published JSON family at `worktree-api.ts`,
+│                   `/api/hub/worktrees`), pages, server, main
 ├── watchdog/       main + capture — heartbeat-driven hang recovery
 ├── debug/          cache + metrics + the heartbeat integration test
 ├── pwa/            PWA assets, shared browser notification enrollment UI,

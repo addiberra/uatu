@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { deriveTodoActivities, describeToolDetail, formatDelay, humanizeToolName, naiveLineDiff, patchDiffLines, patchFiles, taskResultText, todoActivitySummary, toolSubject } from "./tool-detail";
+import { createClaudeEventMemory, normalizeClaudeMessage } from "./claude/normalization";
+import type { ToolItem } from "./types";
 
 describe("describeToolDetail", () => {
   test("classifies edit calls and diffs only the changed region", () => {
@@ -231,6 +233,39 @@ describe("OpenCode-native tool payloads", () => {
     expect(taskResultText("")).toBeUndefined();
     expect(taskResultText(undefined)).toBeUndefined();
     expect(taskResultText("<task id='x'><task_result>  </task_result></task>")).toBeUndefined();
+  });
+
+  // A settled Agent row read as `[ { "type": "text", "text": "…" } ]`: the
+  // Claude tool result carries its content as the API's content-block array,
+  // and the normalizer stringified it instead of taking the text out. The row
+  // shows the subagent's report, so the chain from frame to detail is pinned
+  // here rather than the detail alone.
+  test("a settled Agent row shows the subagent's prose, not the result envelope", () => {
+    const memory = createClaudeEventMemory();
+    normalizeClaudeMessage({ type: "assistant", uuid: "a1", timestamp: "2026-09-22T12:00:00.000Z", message: { role: "assistant", model: "claude-opus-5", content: [
+      { type: "tool_use", id: "toolu_agent", name: "Agent", input: { description: "Summarize the files", subagent_type: "Explore", prompt: "Summarize each file." } },
+    ] } }, memory, "live");
+    const report = "Here are summaries of four files…";
+    const settled = normalizeClaudeMessage({ type: "user", uuid: "u1", timestamp: "2026-09-22T12:04:00.000Z", message: { role: "user", content: [
+      { type: "tool_result", tool_use_id: "toolu_agent", content: [{ type: "text", text: report }] },
+    ] } }, memory, "live", "57489e13");
+    const item = settled.updates.flatMap(update => update.kind === "upsert" && update.item.type === "tool" ? [update.item as ToolItem] : [])[0]!;
+    expect(item.output).toBe(report);
+    expect(describeToolDetail(item)).toMatchObject({ kind: "agent", description: "Summarize the files", result: report });
+  });
+
+  // Anything that is not an all-text array keeps its JSON view: a tool whose
+  // result is a shape rather than prose must not lose it to an unwrap.
+  test("a result that is not plain text blocks still reads as JSON", () => {
+    const memory = createClaudeEventMemory();
+    normalizeClaudeMessage({ type: "assistant", uuid: "a1", timestamp: "2026-09-22T12:00:00.000Z", message: { role: "assistant", content: [
+      { type: "tool_use", id: "toolu_shot", name: "Screenshot", input: {} },
+    ] } }, memory, "live");
+    const settled = normalizeClaudeMessage({ type: "user", uuid: "u1", timestamp: "2026-09-22T12:00:01.000Z", message: { role: "user", content: [
+      { type: "tool_result", tool_use_id: "toolu_shot", content: [{ type: "image", source: { type: "base64", media_type: "image/png", data: "iVBOR" } }] },
+    ] } }, memory, "live");
+    const item = settled.updates.flatMap(update => update.kind === "upsert" && update.item.type === "tool" ? [update.item as ToolItem] : [])[0]!;
+    expect(item.output).toContain("\"type\": \"image\"");
   });
 
   test("a skill load is one fact: which skill", () => {

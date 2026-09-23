@@ -66,6 +66,7 @@ import { defaultWorkspaceDisplayName, validateWorkspaceDisplayName, type Workspa
 import { OnboardingError, resolveOnboardingAssignments, type WorkspaceOnboardingCoordinator } from "./onboarding";
 import { HubPreferencesError, type HubPreferencesStore } from "./preferences";
 import type { PersonalWorkspaceStateStore } from "./personal-state";
+import type { ActivityMarkSink } from "./activity-marks";
 import type { SessionManager } from "./sessions";
 import { PAGE_ORIGIN_HEADER } from "../terminal/auth";
 import type { TerminalSessionInfo } from "../terminal/server";
@@ -85,6 +86,9 @@ export type HubDeps = {
   sessions: SessionManager;
   sessionStore: HubSessionStore;
   personalState: PersonalWorkspaceStateStore;
+  // Where the live broker's finished/viewed marks survive a restart. Absent
+  // (tests, the e2e harness) they live for the broker's lifetime only.
+  activityMarks?: ActivityMarkSink;
   preferences?: HubPreferencesStore;
   onboarding?: WorkspaceOnboardingCoordinator;
   folderManager?: Pick<FolderManager, "create" | "rename" | "remove" | "assertNoPendingMutation">;
@@ -2072,7 +2076,7 @@ function assembleLive(deps: HubDeps): { live: LiveEndpoint; liveBroker: LiveBrok
   const metrics = deps.metrics ?? new MetricsRegistry();
   const liveBroker = deps.liveBroker ?? new LiveBroker(
     createHubUpstreamSource({ sessions: deps.sessions, registry: deps.registry }),
-    { metrics },
+    { metrics, marks: deps.activityMarks },
   );
   const live = deps.live ?? new LiveEndpoint({
     broker: liveBroker,

@@ -52,6 +52,41 @@ describe("Claude tool result completion timestamps", () => {
   });
 });
 
+// A skill Claude Code ran as a fork (spike Q3, probe d2): the launching
+// Skill row is where the fork's transcript is opened from, and the id it
+// opens is named only by the result that ends the fork (design D10).
+describe("a forked skill's launching row", () => {
+  const skillCall = { type: "assistant", uuid: "a1", timestamp: "2026-09-22T12:00:00.000Z", message: { role: "assistant", content: [
+    { type: "tool_use", id: "toolu_skill", name: "Skill", input: { skill: "code-review" } },
+  ] } };
+  const forkedResult = (outcome: Record<string, unknown>) => ({ type: "user", uuid: "u1", timestamp: "2026-09-22T12:02:00.000Z", message: { role: "user", content: [
+    { type: "tool_result", tool_use_id: "toolu_skill", content: "Based on my analysis..." },
+  ] }, tool_use_result: outcome });
+
+  test("the forked result names the child conversation the row opens", () => {
+    const memory = createClaudeEventMemory();
+    normalizeClaudeMessage(skillCall, memory, "live");
+    const settled = normalizeClaudeMessage(forkedResult({ success: true, commandName: "code-review", status: "forked", agentId: "aaeeab292f002e3d7", result: "Based on my analysis..." }), memory, "live", "57489e13");
+    expect(settled.updates).toEqual([{ kind: "upsert", item: expect.objectContaining({
+      id: "tool:toolu_skill",
+      type: "tool",
+      name: "Skill",
+      status: "completed",
+      childConversationId: "sub:57489e13:aaeeab292f002e3d7",
+    }) }]);
+    // A fork is not a background task: it announces none and needs no row.
+    expect(settled.updates.every(update => update.kind !== "upsert" || update.item.type !== "background_task")).toBe(true);
+  });
+
+  test("a skill that never forked leaves the row with no transcript to open", () => {
+    const memory = createClaudeEventMemory();
+    normalizeClaudeMessage(skillCall, memory, "live");
+    const settled = normalizeClaudeMessage(forkedResult({ success: true, commandName: "code-review" }), memory, "live", "57489e13");
+    const item = settled.updates.flatMap(update => update.kind === "upsert" ? [update.item] : [])[0]!;
+    expect(item).not.toHaveProperty("childConversationId");
+  });
+});
+
 // What "Allow always" lists must be what the reply forwards. One filter
 // feeds both, and these pin what that filter keeps and drops.
 describe("Claude Code session-scoped permission updates", () => {

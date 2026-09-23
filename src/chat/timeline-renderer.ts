@@ -515,16 +515,39 @@ export type SubagentEntry = {
   // background task that runs it. Absent once settled, or where the agent
   // reports none.
   progress?: string;
+  // A skill Claude Code ran as a fork of itself rather than a subagent
+  // launch (design D10). It belongs in the same track — it is a run of its
+  // own with a transcript of its own — but it is named by the skill it runs,
+  // not by a subagent type and a task description, so the label says so.
+  kind?: "fork";
 };
 
 export function subagentLabel(entry: SubagentEntry): string {
+  if (entry.kind === "fork") return `Skill · ${entry.description}`;
   return entry.subagent ? `${entry.subagent} · ${entry.description}` : entry.description;
+}
+
+/**
+ * What a fork is doing right now, read off one of its tool rows in the
+ * parent timeline: the tool and what it is working on ("Bash · git diff
+ * HEAD"). The same two facts the row itself leads with.
+ */
+function toolActivityNote(detail: ToolDetail): string {
+  const subject = toolSubject(detail);
+  return subject ? `${detail.label} · ${subject}` : detail.label;
 }
 
 /**
  * Subagents launched in this conversation, in the order they started. Unlike
  * todos, each `task` call is its own agent rather than a snapshot of one list,
  * so every item counts — a fan-out of three is three entries.
+ *
+ * A skill Claude Code ran as a fork of itself counts too, from the moment it
+ * starts: a fork emits no task edge and cannot be named until it ends
+ * (design D10), so without an entry here the track — and the reader — would
+ * have nothing at all to say about a run that may go on for minutes. A skill
+ * that settles without ever naming a child was no fork but an ordinary skill
+ * load, a moment's work, and leaves no entry behind.
  */
 export function subagentEntries(items: readonly ConversationItem[]): SubagentEntry[] {
   // The running task behind each launching row, by the tool use that launched
@@ -536,10 +559,42 @@ export function subagentEntries(items: readonly ConversationItem[]): SubagentEnt
     if (item.type === "background_task" && item.status === "running" && item.toolUseId) runningTasks.set(`tool:${item.toolUseId}`, item);
   }
   const entries: SubagentEntry[] = [];
+  // The fork currently running, if any, and when its launching row was
+  // created. Nothing in a tool item says which run produced it, so the
+  // attribution is positional: while a Skill row is running the turn is
+  // blocked on that tool call, and the only frames that can arrive are the
+  // fork's own (a tool the parent started alongside the skill shares the
+  // launching frame's timestamp, which is why the note takes rows created
+  // strictly later). Two forks running at once are indistinguishable this
+  // way — the later one takes the note — which is the price of a signal
+  // that is otherwise not reported at all.
+  let fork: { entry: SubagentEntry; createdAt: number } | undefined;
   for (const item of items) {
     if (item.type !== "tool") continue;
     const detail = describeToolDetail(item);
-    if (detail.kind !== "agent") continue;
+    if (detail.kind === "skill") {
+      const running = item.status === "running" || item.status === "pending";
+      fork = undefined;
+      // Running, or ended having named its child: either is a fork the
+      // reader may want to follow. A settled skill with no child named
+      // nothing and ran nothing — it stays out rather than lingering as a
+      // finished run that never was.
+      if (!running && detail.conversationId === undefined) continue;
+      const entry: SubagentEntry = {
+        id: item.id,
+        description: detail.name,
+        status: item.status,
+        kind: "fork",
+        ...(detail.conversationId === undefined ? {} : { conversationId: detail.conversationId }),
+      };
+      entries.push(entry);
+      if (running) fork = { entry, createdAt: item.createdAt };
+      continue;
+    }
+    if (detail.kind !== "agent") {
+      if (fork && item.createdAt > fork.createdAt) fork.entry.progress = toolActivityNote(detail);
+      continue;
+    }
     const task = runningTasks.get(item.id);
     const conversationId = detail.conversationId ?? task?.childConversationId;
     // A live task outranks the launching row's own status. A backgrounded
@@ -1225,7 +1280,10 @@ function toolBody(detail: ToolDetail, item: ToolItem, allowSubagents: boolean): 
       // markdown rather than dumped as the raw task envelope.
       return `<p class="chat-tool-meta">${detail.subagent ? `<code>${escapeHtml(detail.subagent)}</code> ` : ""}${escapeHtml(detail.description)}${allowSubagents && detail.conversationId ? ` <button type="button" data-open-conversation="${escapeHtmlAttribute(detail.conversationId)}">Open transcript</button>` : ""}</p><pre>${escapeHtml(detail.prompt)}</pre>${detail.result ? renderSubagentResult(detail.result) : ""}${error}`;
     case "skill":
-      return `${outputBlock(item)}${error}`;
+      // A skill Claude Code ran as a fork is a conversation of its own. The
+      // subagents track lists agent launches, and a Skill call is not one, so
+      // this row is the only place its transcript is offered.
+      return `${allowSubagents && detail.conversationId ? `<p class="chat-tool-meta"><button type="button" data-open-conversation="${escapeHtmlAttribute(detail.conversationId)}">Open transcript</button></p>` : ""}${outputBlock(item)}${error}`;
     case "bash":
       // The command in full (the summary showed its first line), what the
       // agent said it was for, then the bounded output.
