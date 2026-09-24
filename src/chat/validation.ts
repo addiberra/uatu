@@ -481,7 +481,7 @@ export function parseConversationItem(value: unknown): ConversationItem {
       break;
     }
     case "background_task":
-      expectKeys(record, ["id", "type", "createdAt", "taskId", "description", "taskType", "toolUseId", "status", "progress", "summary", "subagentType", "prompt", "usage", "outputFile", "childConversationId"], type);
+      expectKeys(record, ["id", "type", "createdAt", "taskId", "description", "taskType", "toolUseId", "status", "progress", "summary", "subagentType", "prompt", "usage", "outputFile", "childConversationId", "foreground"], type);
       expectIdentity(record.taskId, "background task id");
       expectNonEmptyString(record.description, "background task description");
       expectOptionalString(record.taskType, "background task type");
@@ -497,6 +497,8 @@ export function parseConversationItem(value: unknown): ConversationItem {
       stripUnless(record, "outputFile", value => typeof value === "string" && value.length > 0);
       stripUnless(record, "childConversationId", value => typeof value === "string" && value.length > 0 && value.length <= 512 && !/[\u0000-\u001f\u007f]/.test(value));
       stripUnless(record, "usage", isBackgroundTaskUsage);
+      // Only `true` means anything; anything else is a background row as before.
+      stripUnless(record, "foreground", value => value === true);
       break;
     case "scheduled_wakeup":
       expectKeys(record, ["id", "type", "createdAt", "wakeupId", "prompt", "recurring", "schedule", "nextFireAt", "status", "firedTurnId", "message"], type);

@@ -1690,6 +1690,73 @@ describe("chat running-task inspection", () => {
   });
 });
 
+// Design D13/D14: the run a typed command launches streams nothing; its
+// drill-down follows the transcript Claude Code writes to disk.
+describe("a typed command's silent run", () => {
+  test("is listed with the subagents, not as background work, and its open transcript fills in from re-read snapshots without reopening the view", async () => {
+    const { document, window } = parseHTML(html);
+    installDomGlobals(document, window);
+    document.documentElement.setAttribute("data-ui-mode", "desktop");
+    document.documentElement.setAttribute("data-chat-panel", "open");
+    stubConversationSelect(document);
+    const childReads: number[] = [];
+    const streams: string[] = [];
+    const record = (index: number) => ({ id: `message:r${index}`, type: "assistant_message", createdAt: 10 + index, markdown: `Review step ${index}` });
+    const api = taskApi(document, {
+      items: id => id === "one"
+        ? [
+          { id: "message:u", type: "user_message", createdAt: 1, text: "/code-review low" },
+          { id: "task:rv", type: "background_task", createdAt: 2, taskId: "rv", description: "/code-review", taskType: "local_agent", status: "running", subagentType: "general-purpose", childConversationId: "child", foreground: true },
+        ]
+        // The transcript on disk grows by one record per read.
+        : Array.from({ length: childReads.length }, (_, index) => record(index + 1)),
+      onSnapshot: id => { if (id === "child") childReads.push(Date.now()); },
+      onStream: id => { streams.push(id); },
+    });
+    const drilldown = document.querySelector<HTMLElement>("#chat-drilldown")!;
+    const strip = document.querySelector<HTMLElement>("#chat-drilldown-task")!;
+    const click = (element: Element) => element.dispatchEvent(new window.Event("click", { bubbles: true }) as unknown as Event);
+    try {
+      const { initChat } = await import(`./ui.ts?silent-run-ui-test=${Date.now()}`);
+      initChat(api);
+      const trackRow = () => document.querySelector<HTMLButtonElement>('#chat-subagents [data-open-conversation="child"]');
+      await waitUntil(() => trackRow() != null, () => document.querySelector("#chat-subagents")?.textContent ?? "no track");
+      expect(trackRow()!.textContent).toBe("/code-review");
+      // Not background work: no composer list, and no row in the timeline.
+      expect(document.querySelector<HTMLElement>("#chat-background-tasks")!.hidden).toBe(true);
+      expect(document.querySelector('#chat-items [data-chat-item-id="task:rv"]')).toBeNull();
+
+      click(trackRow()!);
+      expect(drilldown.hidden).toBe(false);
+      expect(document.querySelector("#chat-drilldown-title")?.textContent).toBe("/code-review");
+      expect(strip.querySelector(".chat-drilldown-task-description")?.textContent).toBe("/code-review");
+      // The turn's own Cancel stops a command; the strip offers no Stop.
+      expect(strip.querySelector("[data-stop-task]")).toBeNull();
+      await waitUntil(() => document.querySelector("#chat-drilldown-items")?.textContent?.includes("Review step 1") ?? false, () => document.querySelector("#chat-drilldown-items")?.textContent ?? "empty");
+      const description = strip.querySelector(".chat-drilldown-task-description");
+      // Silent for two seconds: the snapshot is read again, and what the run
+      // wrote since arrives in place.
+      for (let attempt = 0; attempt < 40 && !(document.querySelector("#chat-drilldown-items")?.textContent?.includes("Review step 2")); attempt += 1) await Bun.sleep(100);
+      expect(document.querySelector("#chat-drilldown-items")?.textContent).toContain("Review step 2");
+      expect(childReads.length).toBe(2);
+      expect(childReads[1]! - childReads[0]!).toBeGreaterThanOrEqual(1_900);
+      // Folded in, never reopened: one stream for the child, the same strip.
+      expect(streams.filter(id => id === "child")).toEqual(["child"]);
+      expect(strip.querySelector(".chat-drilldown-task-description")).toBe(description);
+      expect(document.querySelector("#chat-drilldown-title")?.textContent).toBe("/code-review");
+
+      click(document.querySelector<HTMLButtonElement>("#chat-drilldown-back")!);
+      expect(drilldown.hidden).toBe(true);
+      const readsAtClose = childReads.length;
+      await Bun.sleep(2_300);
+      expect(childReads.length).toBe(readsAtClose);
+    } finally {
+      await Bun.sleep(20);
+      window.dispatchEvent(new Event("pagehide"));
+    }
+  }, 15_000);
+});
+
 describe("chat running work reachable without a disclosure", () => {
   const shellTask = (taskId: string, status: "running" | "completed", createdAt = 2) => ({
     id: `task:${taskId}`, type: "background_task", createdAt, taskId, description: `Task ${taskId}`, taskType: "local_bash",

@@ -33,7 +33,11 @@ workspace idle while a task runs. When a background task settles and the
 model is not mid-turn, the workspace SHALL wake the session so the agent
 can act on the notification, as Claude Code's own terminal client does.
 Housekeeping tasks the CLI marks as ambient MUST NOT count as background
-work.
+work. An agent run the CLI marks ambient — a forked skill, or the run a
+typed command such as a review command launches — is not housekeeping:
+it SHALL be treated as a run (listed and openable, see "Subagent runs
+open as child transcripts"), and the ambient mark SHALL only keep it out
+of the background-work state.
 
 #### Scenario: Backgrounded work is visible after the turn ends
 - **WHEN** a turn ends while a backgrounded command is still running
@@ -98,17 +102,22 @@ Claude Code reports it. Subagent runs MUST NOT appear in the
 conversation inventory. The launching row SHALL be attributable with the
 subagent's model and consumed tokens as Claude Code reports them, and a
 run without reported usage SHALL stay readable without asserting
-figures. A skill the agent runs as a fork of itself — Claude Code's
-forked skills, such as a review command — SHALL be openable as a child
-transcript from the row that launched it, once the run names itself,
-which Claude Code does only when the fork ends. That transcript SHALL be
-complete: the work the fork streamed while it was still nameless SHALL
-be present in it, not lost. While such a fork runs it SHALL be named as
-work in progress alongside the conversation's subagent runs, carrying
-the skill it is running and its latest tool activity where Claude Code
-reports it, and its tool activity SHALL remain visible in the parent
-timeline — so the conversation is never silent about work it cannot yet
-name. Such an entry SHALL become openable once the run names itself.
+figures. The same SHALL hold for every other agent run Claude Code
+forks from the conversation, however it was started: a skill the agent
+runs as a fork of itself, and the run a typed command launches — such
+as a review command — which has no launching step in the timeline at
+all. Each such run SHALL be named as work in progress alongside the
+conversation's subagent runs from the moment Claude Code names it,
+carrying what it is running and, where reported, its latest activity,
+and SHALL be openable as a child transcript from then on. Where Claude
+Code streams the run's activity the open transcript SHALL update as it
+arrives; where it does not, the open transcript SHALL still follow the
+run from Claude Code's own record of it, refreshed while the run lasts,
+so no run is opaque while it works. A fork Claude Code names only when
+it ends SHALL still open with its complete transcript then, including
+the work it streamed before it was named. The output a typed command
+returns SHALL be shown in the timeline, live and when the conversation
+is reopened alike.
 
 #### Scenario: A subagent transcript is reachable from its row
 - **WHEN** a Claude Code turn runs a subagent and the user opens its row
@@ -120,16 +129,20 @@ name. Such an entry SHALL become openable once the run names itself.
 - **THEN** its transcript shows the activity so far and continues to update until the run ends
 - **AND** the run's completion is reflected in the open transcript and on the launching row
 
-#### Scenario: A forked skill's transcript is complete when it opens
-- **WHEN** the agent runs a skill as a fork of itself and the user opens its launching row after it ends
-- **THEN** the fork's whole run is presented as a child transcript, including the work it streamed before it named itself
+#### Scenario: A forked skill is followed while it runs
+- **WHEN** the agent runs a skill as a fork of itself and Claude Code names the run as it starts
+- **THEN** the run is listed as work in progress, named by the skill it runs, and opens as a child transcript that updates as it works
 - **AND** the conversation picker still lists only the parent
 
-#### Scenario: A running fork is not silent
-- **WHEN** a forked skill is still running
-- **THEN** it is listed as work in progress, named by the skill it runs, with its latest tool activity where reported
-- **AND** its tool activity appears in the parent timeline as it happens
-- **AND** the listed entry becomes openable once the run ends and names itself
+#### Scenario: A run started by a typed command is followed while it runs
+- **WHEN** the user types a command that launches a forked run, such as a review command
+- **THEN** the run is listed as work in progress while it lasts, named by the command
+- **AND** opening it shows the run's transcript, which keeps filling in while the run works even though Claude Code streams none of it
+- **AND** the command's output appears in the timeline when it ends, and is still there when the conversation is reopened
+
+#### Scenario: A fork named only at its end is complete when it opens
+- **WHEN** Claude Code names a forked run only when it ends
+- **THEN** the run's whole transcript is presented when it is opened, including the work it streamed before it was named
 
 #### Scenario: A replayed conversation retains its subagent transcripts
 - **WHEN** a conversation with completed subagent runs is opened from native session storage

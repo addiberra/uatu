@@ -67,6 +67,47 @@ export function prependSnapshot(current: ChatProjection, page: ConversationSnaps
   return { ...current, items, olderCursor: page.olderCursor };
 }
 
+/**
+ * A fresh first page of a conversation the reader already holds, folded in
+ * place — the silent-run re-read (design D14): the drill-down of a run that
+ * streams nothing re-reads its snapshot while it works, and the reader must
+ * see new records arrive the way live ones would, not a reload.
+ *
+ * Null when the page cannot be folded — another conversation or generation,
+ * or a page older than what the live stream already applied (the stream is
+ * ahead, and owns the view until the next read). Otherwise the page's items
+ * win where both hold one, items only the reader holds (an older page it
+ * paged in) stay, and the page's cursor, status, and summary are adopted, so
+ * the stream resumes from the page. `changed` says whether any of that
+ * differs from what the reader holds, so an identical read repaints nothing.
+ */
+export function refreshFromSnapshot(current: ChatProjection, page: ConversationSnapshot): { projection: ChatProjection; changed: boolean } | null {
+  if (page.conversation.id !== current.conversationId || page.generation !== current.generation) return null;
+  const sequence = decodeCursorSequence(page.cursor) ?? 0;
+  if (sequence < current.sequence) return null;
+  const fresh = deduplicate(page.items);
+  const fromPage = new Set(fresh.map(item => item.id));
+  const kept = current.items.filter(item => !fromPage.has(item.id));
+  const items = [...kept, ...fresh].sort((left, right) => left.createdAt - right.createdAt);
+  const held = new Map(current.items.map(item => [item.id, item]));
+  const changed = page.conversation.status !== current.status
+    || fresh.some(item => { const before = held.get(item.id); return !before || JSON.stringify(before) !== JSON.stringify(item); });
+  return {
+    projection: {
+      ...current,
+      sequence,
+      cursor: page.cursor,
+      conversation: page.conversation,
+      status: page.conversation.status,
+      items,
+      // Paging continues from what the reader already reached when it has
+      // gone past the page's own start.
+      olderCursor: kept.length > 0 ? current.olderCursor : page.olderCursor,
+    },
+    changed,
+  };
+}
+
 export function addAcceptedDraft(current: ChatProjection, draft: AcceptedDraft): ChatProjection {
   return {
     ...current,

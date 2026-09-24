@@ -6,6 +6,7 @@ import path from "node:path";
 
 import spike from "../../../tests/fixtures/claude-sdk/spike-messages.json";
 import spikeRevival from "../../../tests/fixtures/claude-sdk/spike-cron-revival.json";
+import forkedRuns from "../../../tests/fixtures/claude-sdk/forked-runs-2.1.280.json";
 import type { NormalizedProviderEvent } from "../provider";
 import { createClaudeEventMemory, markTasksBackgrounded, normalizeClaudeMessage, normalizeContextUsage, normalizeTranscriptEntries } from "./normalization";
 import { ClaudeProvider, normalizePlanUtilization, normalizeSessionTotals, wakeupPromptMatches, WAKEUP_PAUSED_MESSAGE, WAKEUP_PAUSED_ONCE_MESSAGE, type ClaudeQueryHandle, type ClaudeQueryInput, type ClaudeUserEnvelope } from "./provider";
@@ -1560,6 +1561,169 @@ describe("ClaudeProvider sessions", () => {
       // Every live item is one the snapshot already holds: no second row
       // for a tool call, a thought, or a message the file replayed.
       for (const id of upsertIds(events, childId)) expect(snapshot.has(id)).toBe(true);
+      stop();
+      await provider.dispose();
+    });
+  });
+
+  // Design D13, against the CLI Uatu actually runs (spike Q4/Q5, frames
+  // verbatim): Claude Code marks two kinds of agent run ambient — a skill the
+  // model forks and the run a typed command launches — and both are runs.
+  describe("ambient agent runs are runs, never background work (D13)", () => {
+    type Frame = Record<string, unknown>;
+    const fork = forkedRuns.skillFork.live as Frame[];
+    const typed = forkedRuns.typedCodeReview.live as Frame[];
+    const FORK_AGENT = "afd1c64a374700d34";
+    const SKILL_USE = "toolu_01CS76rQV6QvfD4HfdsJmk1r";
+    const REVIEW_AGENT = "ad53ca64bd188affb";
+    const upserts = (events: NormalizedProviderEvent[], conversationId: string) =>
+      events.filter(event => event.conversationId === conversationId).flatMap(event => event.updates).flatMap(update => update.kind === "upsert" ? [update.item] : []);
+    const statuses = (events: NormalizedProviderEvent[], conversationId: string) =>
+      events.filter(event => event.conversationId === conversationId).flatMap(event => event.updates).flatMap(update => update.kind === "status" ? [update.status] : []);
+    const neverBackground = async (provider: ClaudeProvider, events: NormalizedProviderEvent[], sessionId: string) => {
+      expect(statuses(events, sessionId)).not.toContain("background");
+      expect(events.some(event => event.eventType === "turn.background" || event.eventType === "background.reconciled")).toBe(false);
+      expect(await provider.listBackgroundTasks()).toEqual([]);
+    };
+
+    test("a model-invoked code-review fork opens its child at task_started, and its tagged frames reach it live", async () => {
+      const { provider, queries } = fixture();
+      const { events, stop } = collect(provider);
+      const session = await provider.createSession("x");
+      const childId = `sub:${session.id}:${FORK_AGENT}`;
+      await provider.prompt(session.id, { id: "r1", text: "review my change", delivery: "queue" });
+      const query = queries[0]!;
+      const [skillCall, started, ...rest] = fork;
+      const notificationAt = rest.findIndex(frame => frame.subtype === "task_notification");
+      const run = rest.slice(0, notificationAt);
+      const [notification, forked] = rest.slice(notificationAt);
+      query.push(skillCall);
+      query.push(started);
+      // Named at its start edge, running, before a single frame of it arrives.
+      await waitFor(() => statuses(events, childId).includes("running"));
+      expect(await provider.getSession(childId)).toEqual(expect.objectContaining({ id: childId, parentId: session.id }));
+      expect(upserts(events, session.id).filter(item => item.id === `tool:${SKILL_USE}`).at(-1))
+        .toEqual(expect.objectContaining({ type: "tool", name: "Skill", status: "running", childConversationId: childId }));
+      for (const frame of run) query.push(frame);
+      const lastText = run.filter(frame => frame.type === "assistant").at(-1)!.uuid as string;
+      await waitFor(() => upserts(events, childId).some(item => item.id === `message:${lastText}`));
+      // Live in the child: its text and its own tool call, completed by its
+      // result. The parent holds nothing of the run but the Skill row.
+      const childItems = upserts(events, childId);
+      expect(childItems.filter(item => item.id === "tool:toolu_01UkPeqpEx1YUWZD1uAqPm6s").at(-1)).toEqual(expect.objectContaining({ type: "tool", name: "Bash", status: "completed" }));
+      expect(childItems.some(item => item.type === "assistant_message" && item.markdown.startsWith("I'll run a high-effort review."))).toBe(true);
+      const parentIds = new Set(upserts(events, session.id).map(item => item.id));
+      expect(childItems.filter(item => parentIds.has(item.id))).toEqual([]);
+      expect([...parentIds].filter(id => id.startsWith("tool:") || id.startsWith("reasoning:"))).toEqual([`tool:${SKILL_USE}`]);
+      query.push(notification);
+      query.push(forked);
+      await waitFor(() => statuses(events, childId).includes("completed"));
+      expect(upserts(events, session.id).filter(item => item.id === `tool:${SKILL_USE}`).at(-1))
+        .toEqual(expect.objectContaining({ status: "completed", childConversationId: childId }));
+      await neverBackground(provider, events, session.id);
+      expect(upserts(events, session.id).some(item => item.type === "background_task")).toBe(false);
+      stop();
+      await provider.dispose();
+    });
+
+    test("a fork frame that beats its start edge still opens the child's transcript", async () => {
+      const { provider, queries } = fixture();
+      const { events, stop } = collect(provider);
+      const session = await provider.createSession("x");
+      const childId = `sub:${session.id}:${FORK_AGENT}`;
+      await provider.prompt(session.id, { id: "r1", text: "review my change", delivery: "queue" });
+      const query = queries[0]!;
+      const [skillCall, started, ...rest] = fork;
+      const early = rest.find(frame => frame.type === "assistant" && JSON.stringify(frame).includes("toolu_01UkPeqpEx1YUWZD1uAqPm6s"))!;
+      query.push(skillCall);
+      query.push(early);
+      query.push(started);
+      await waitFor(() => statuses(events, childId).includes("running"));
+      await waitFor(() => upserts(events, childId).some(item => item.id === "tool:toolu_01UkPeqpEx1YUWZD1uAqPm6s"));
+      stop();
+      await provider.dispose();
+    });
+
+    test("a typed /code-review emits a foreground run row openable as its child, settled by the notification", async () => {
+      const { provider, queries, configDir, workspace } = fixture();
+      const { events, stop } = collect(provider);
+      const session = await provider.createSession("x");
+      const childId = `sub:${session.id}:${REVIEW_AGENT}`;
+      await provider.prompt(session.id, { id: "r1", text: "/code-review low", delivery: "queue" });
+      const query = queries[0]!;
+      const [started, rateLimit, notification, synthetic, result] = typed;
+      query.push(started);
+      await waitFor(() => upserts(events, session.id).some(item => item.id === `task:${REVIEW_AGENT}`));
+      expect(upserts(events, session.id).find(item => item.id === `task:${REVIEW_AGENT}`)).toEqual({
+        id: `task:${REVIEW_AGENT}`, type: "background_task", createdAt: expect.any(Number), taskId: REVIEW_AGENT,
+        description: "/code-review", taskType: "local_agent", status: "running", subagentType: "general-purpose",
+        childConversationId: childId, foreground: true,
+      });
+      expect(statuses(events, childId)).toEqual(["running"]);
+      // Openable at once, before the CLI has written a line of its transcript,
+      // and readable while the CLI is still writing it (spike Q4e: live).
+      expect(await provider.getSession(childId)).toEqual(expect.objectContaining({ id: childId, parentId: session.id }));
+      expect((await provider.listMessages(childId, { limit: 50 })).items).toEqual([]);
+      const subagents = path.join(claudeProjectDir(workspace, configDir), session.id, "subagents");
+      mkdirSync(subagents, { recursive: true });
+      const file = path.join(subagents, `agent-${REVIEW_AGENT}.jsonl`);
+      const record = (uuid: string, second: number, message: Record<string, unknown>, type = "assistant") =>
+        JSON.stringify({ type, uuid, parentUuid: null, isSidechain: true, agentId: REVIEW_AGENT, timestamp: `2026-09-24T17:08:1${second}.000Z`, message }) + "\n";
+      writeFileSync(file, record("rv-1", 1, { role: "user", content: "Review the diff." }, "user"));
+      expect((await provider.listMessages(childId, { limit: 50 })).items.map(item => item.id)).toEqual(["message:rv-1"]);
+      appendFileSync(file, record("rv-2", 2, { role: "assistant", model: "claude-haiku-4-5-20251001", content: [{ type: "text", text: "Reading the diff." }] }));
+      expect((await provider.listMessages(childId, { limit: 50 })).items.map(item => item.id)).toEqual(["message:rv-1", "message:rv-2"]);
+
+      query.push(rateLimit);
+      query.push(notification);
+      await waitFor(() => statuses(events, childId).includes("completed"));
+      expect(upserts(events, session.id).filter(item => item.id === `task:${REVIEW_AGENT}`).at(-1))
+        .toEqual(expect.objectContaining({ status: "completed", foreground: true, childConversationId: childId }));
+      query.push(synthetic);
+      query.push(result);
+      await waitFor(() => statuses(events, session.id).includes("completed"));
+      // The command's output is the timeline's record of the run (D15): its
+      // text as it arrived, naming no model and spending nothing.
+      const output = upserts(events, session.id).find(item => item.id === `message:${synthetic.uuid as string}`);
+      expect(output).toEqual(expect.objectContaining({ type: "assistant_message", markdown: expect.stringContaining("math.ts:2") }));
+      expect(upserts(events, session.id).some(item => item.id === `usage:${synthetic.uuid as string}`)).toBe(false);
+      expect(events.some(event => event.assistantModel !== undefined || event.assistantUsage !== undefined)).toBe(false);
+      await neverBackground(provider, events, session.id);
+      stop();
+      await provider.dispose();
+    });
+
+    test("a foreground run that never reports its end is settled by the turn's result", async () => {
+      const { provider, queries } = fixture();
+      const { events, stop } = collect(provider);
+      const session = await provider.createSession("x");
+      await provider.prompt(session.id, { id: "r1", text: "/code-review low", delivery: "queue" });
+      const query = queries[0]!;
+      const [started, , , synthetic, result] = typed;
+      query.push(started);
+      query.push(synthetic);
+      query.push(result);
+      await waitFor(() => statuses(events, session.id).includes("completed"));
+      expect(upserts(events, session.id).filter(item => item.id === `task:${REVIEW_AGENT}`).at(-1))
+        .toEqual(expect.objectContaining({ status: "stopped", foreground: true }));
+      stop();
+      await provider.dispose();
+    });
+
+    test("an ambient task that is not an agent run stays ignored: no row, no child", async () => {
+      const { provider, queries } = fixture();
+      const { events, stop } = collect(provider);
+      const session = await provider.createSession("x");
+      await provider.prompt(session.id, { id: "r1", text: "go", delivery: "queue" });
+      const query = queries[0]!;
+      query.push({ type: "system", subtype: "task_started", uuid: "w1", session_id: session.id, task_id: "watch1", description: "Live update watcher", task_type: "local_monitor", subagent_type: "general-purpose", ambient: true, skip_transcript: true });
+      query.push({ type: "system", subtype: "task_notification", uuid: "w2", session_id: session.id, task_id: "watch1", status: "completed", summary: "x", ambient: true });
+      query.push({ type: "result", subtype: "success", uuid: "res1", timestamp: "2026-09-24T17:08:20.000Z", session_id: session.id, is_error: false });
+      await waitFor(() => statuses(events, session.id).includes("completed"));
+      expect(events.filter(event => event.eventType === "system").every(event => event.outcome === "ignored" && event.updates.length === 0)).toBe(true);
+      expect(events.some(event => event.conversationId?.startsWith("sub:"))).toBe(false);
+      expect(await provider.getSession(`sub:${session.id}:watch1`)).toBeNull();
+      await neverBackground(provider, events, session.id);
       stop();
       await provider.dispose();
     });

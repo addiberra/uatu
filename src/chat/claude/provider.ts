@@ -24,7 +24,7 @@ import { TASK_OUTPUT_TAIL_MAX_BYTES, type AgentUsageReport, type BackgroundTaskO
 import { BackgroundTaskUnavailableError, InvalidQuestionAnswerError, ReleaseUnavailableError, ReversibleHistoryTargetError, UnsupportedVariantSelectionError } from "../provider";
 import { nextCronFire } from "./cron";
 import { CLAUDE_MODELS, claudeContextWindow, findClaudeModel, stripWindowMarker, versionedModelName, withMoreModels } from "./models";
-import { claudeToolInteraction, createClaudeEventMemory, describeSessionScopedUpdates, markTasksBackgrounded, normalizeClaudeMessage, normalizeContextUsage, normalizeTranscriptEntries, claudeModelSelection, sessionScopedSuggestions, taskFacts, type BackgroundTaskFacts, type ClaudeEventMemory } from "./normalization";
+import { claudeToolInteraction, createClaudeEventMemory, describeSessionScopedUpdates, markTasksBackgrounded, normalizeClaudeMessage, normalizeContextUsage, normalizeTranscriptEntries, claudeModelSelection, sessionScopedSuggestions, settleForegroundRuns, startsAgentRun, taskFacts, type BackgroundTaskFacts, type ClaudeEventMemory } from "./normalization";
 import { ClaudeNotificationLifecycle } from "./notification-lifecycle";
 import { listTranscriptSessions, readSessionTranscript, readTranscriptTitles, sessionTranscriptPath, subagentTranscriptPath, claudeConfigDir, transcriptCrons, type TranscriptCron } from "./transcript";
 
@@ -300,10 +300,13 @@ type LiveSession = {
   // conversation's ledger when the query retires, since a resumed query
   // starts its counters fresh (SDK: "resumed sessions start fresh").
   lastTotals?: SessionTotals;
-  // The subagent runs this query launched, by the tool use that launched
-  // each: where a frame tagged `parent_tool_use_id` is routed (design D8).
-  // Kept for the query's life — a settled run's transcript is on disk, but
-  // a late frame still has a home, and the drill-down keeps resolving it.
+  // The subagent runs this query launched, by `runKey`: the tool use that
+  // launched each, which is where a frame tagged `parent_tool_use_id` is
+  // routed (design D8), or — for a run no tool use launched, the review a
+  // typed command starts (design D13) — `task:<taskId>`, which no frame is
+  // ever tagged with. Kept for the query's life — a settled run's transcript
+  // is on disk, but a late frame still has a home, and the drill-down keeps
+  // resolving it.
   children: Map<string, LiveChild>;
   // Frames tagged with a tool use no run is known for, held in arrival
   // order against that tool use (design D10). A skill fork streams from its
@@ -367,6 +370,17 @@ type LiveChild = {
 // session-level frames (`system` task edges, `result`, rate limits) stay
 // the parent's whatever tag they carry (task 5.1, requirement f).
 const SUBAGENT_FRAME_TYPES = new Set(["assistant", "user", "stream_event", "tool_progress"]);
+
+/**
+ * A run's key in `LiveSession.children`. A run launched by a tool use is
+ * keyed by that tool use's id as is, since that is what its forwarded frames
+ * name. A run with no launching tool use is keyed by its task id under a
+ * prefix of its own: a tool use id never takes that shape, so the two can
+ * never collide, and no tagged frame can be routed to such a run by accident.
+ */
+function runKey(launch: { toolUseId: string } | { taskId: string }): string {
+  return "toolUseId" in launch ? launch.toolUseId : `task:${launch.taskId}`;
+}
 const CHILDREN_LIMIT = 512;
 // A fork's held frames: how many tool uses may be waiting for an id at once,
 // and how many frames each may hold. Both bounds exist so a chatty fork — or
@@ -1362,6 +1376,11 @@ export class ClaudeProvider implements ChatProvider {
           normalized.updates = normalized.updates.map(update =>
             update.kind === "status" ? { kind: "status", status: "interrupted" } : update);
         }
+        // A foreground run (design D13) belongs to the turn that ran it: one
+        // that has not reported its end by the turn's result never will.
+        if (resultId && normalized.outcome === "handled") {
+          normalized.updates = [...settleForegroundRuns(memory, "The command ended without this run reporting its outcome."), ...normalized.updates];
+        }
         if (resultId && normalized.outcome === "handled") {
           const failed = normalized.updates.some(update => update.kind === "status" && update.status === "failed");
           normalized.notificationTurns = session.notificationLifecycle.finish(resultId,
@@ -1436,6 +1455,7 @@ export class ClaudeProvider implements ChatProvider {
         // work died with the process: its rows settle and the state clears.
         const settled = [
           ...this.settleBackgroundTasks(session, "The Claude Code session ended before this task finished.", memory),
+          ...settleForegroundRuns(memory, "The Claude Code session ended before this run finished."),
           // The crons were inside the process; they end with it (D6).
           ...this.settleWakeups(session, "ended"),
         ];
@@ -1464,6 +1484,7 @@ export class ClaudeProvider implements ChatProvider {
       this.emit(session.id, {
         updates: [
           ...this.settleBackgroundTasks(session, "The Claude Code session failed before this task finished.", memory),
+          ...settleForegroundRuns(memory, "The Claude Code session failed before this run finished."),
           ...this.settleWakeups(session, "ended"),
           { kind: "upsert", item: { id: `notice:session-error:${this.now()}`, type: "notice", createdAt: this.now(), level: "error", message: error instanceof Error ? error.message : "Claude Code session failed" } },
           { kind: "status", status: "failed", message: "Claude Code session ended unexpectedly" },
@@ -2689,9 +2710,10 @@ export class ClaudeProvider implements ChatProvider {
    * subagent entries derive from that row, not from the run's tool rows;
    * the adapter's launcher tracking reads rows with a child id, which the
    * run's own rows never carry). A tagged frame whose run is unknown — a
-   * Skill fork, whose agent id only the ending tool result names, or a CLI
-   * that emits no task edges — falls through to the parent's normalizer,
-   * which keeps its tool blocks and drops its text as before.
+   * Skill fork on a CLI that names it only in the ending tool result (a
+   * current one names it at its start edge, design D13), or a CLI that emits
+   * no task edges — falls through to the parent's normalizer, which keeps
+   * its tool blocks and drops its text as before.
    *
    * The launching row's attribution stays the tool result's and the child
    * transcript read's (`reconstructAttributionRead`): the routed events
@@ -2779,10 +2801,22 @@ export class ClaudeProvider implements ChatProvider {
       if (!taskId) return;
       if (record.subtype === "task_started") {
         const toolUseId = typeof record.tool_use_id === "string" && record.tool_use_id ? record.tool_use_id : undefined;
-        const agentTask = record.task_type === "local_agent" || typeof record.subagent_type === "string";
-        // Ambient work is not the user's (spec): no child that would read
-        // as running for it.
-        if (toolUseId && agentTask && record.ambient !== true && record.skip_transcript !== true) this.openChild(session, toolUseId, taskId, true);
+        // An agent run is a run whatever the ambient flag says (design D13):
+        // a skill the model forks is marked ambient and streams under its
+        // Skill tool use from its first moment, so opening it here is what
+        // routes those frames live rather than holding them for the result
+        // (D10). The run a typed command launches is ambient too and has no
+        // tool use at all; it is keyed by its task id, and followed from its
+        // transcript on disk, since none of it streams (D14). Ambient work
+        // that is not an agent run — a monitor, a watcher — is still no one's
+        // run and gets no child that would read as running.
+        if (!startsAgentRun(record)) return;
+        // Anything the run streamed before its start edge was held against
+        // its tool use (D10); it opens the child's transcript, in order.
+        const held = toolUseId ? session.forkBuffers.get(toolUseId) : undefined;
+        if (toolUseId) session.forkBuffers.delete(toolUseId);
+        const child = this.openChild(session, runKey(toolUseId ? { toolUseId } : { taskId }), taskId, true);
+        for (const frame of held ?? []) this.emitChildFrame(child, frame);
         return;
       }
       const child = [...session.children.values()].find(candidate => candidate.agentId === taskId);
@@ -2821,7 +2855,7 @@ export class ClaudeProvider implements ChatProvider {
     // child hears and the transcript is complete when it is read. A result
     // that names a run nothing streamed under keeps today's behaviour — the
     // child is registered so the drill-down resolves it, and says nothing.
-    const child = this.openChild(session, toolUseId, agentId, launched || buffered !== undefined);
+    const child = this.openChild(session, runKey({ toolUseId }), agentId, launched || buffered !== undefined);
     if (buffered) for (const frame of buffered) this.emitChildFrame(child, frame);
     // A sync result means the run is over; the task notification usually
     // said so already, and a fork only ends here — unlike an async agent
@@ -2830,17 +2864,17 @@ export class ClaudeProvider implements ChatProvider {
     if (!launched) this.settleChild(child, row?.kind === "upsert" && row.item.type === "tool" && row.item.status === "failed" ? "failed" : "completed");
   }
 
-  /** The child for a launching tool use, opened on first sight; a live run reads as running from here. */
-  private openChild(session: LiveSession, parentToolUseId: string, agentId: string, running: boolean): LiveChild {
-    const known = session.children.get(parentToolUseId);
+  /** The child for a run (by `runKey`), opened on first sight; a live run reads as running from here. */
+  private openChild(session: LiveSession, key: string, agentId: string, running: boolean): LiveChild {
+    const known = session.children.get(key);
     if (known) return known;
     // A run that becomes known routes its frames from here on: nothing held
     // against this tool use outlives the moment (the caller that wanted the
-    // buffer took it first).
-    session.forkBuffers.delete(parentToolUseId);
+    // buffer took it first). A task-keyed run has no buffer to drop.
+    session.forkBuffers.delete(key);
     const child: LiveChild = { id: `sub:${session.id}:${agentId}`, agentId, memory: createClaudeEventMemory(), startedAt: this.now(), settled: !running };
     child.memory.resolveModel = id => this.modelAliases.get(id) ?? id;
-    boundedSet(session.children, parentToolUseId, child, CHILDREN_LIMIT);
+    boundedSet(session.children, key, child, CHILDREN_LIMIT);
     if (running) this.emit(child.id, { updates: [{ kind: "status", status: "running" }], outcome: "handled", eventType: "subagent.started" });
     return child;
   }

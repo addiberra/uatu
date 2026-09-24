@@ -141,10 +141,12 @@ export class TimelineRenderer {
     // drawn as rows it would bury the work the reader came for — the one
     // place it belongs is the chip, which says it once and opens.
     // A running background task is presented in the composer's live list;
-    // only a settled one takes a place in the timeline (D8).
+    // only a settled one takes a place in the timeline (D8). A foreground
+    // run's row never does: it is listed with the subagents, and the command
+    // that ran it prints its own output into the timeline (D13).
     const visible = projection.items.filter(item => !(item.type === "assistant_message" && item.markdown === "") && item.type !== "context_report"
       && !isRateLimitStanding(item)
-      && !(item.type === "background_task" && item.status === "running"));
+      && !(item.type === "background_task" && (item.status === "running" || item.foreground === true)));
 
     const nodes = new Map<string, HTMLElement>();
     for (const [visibleIndex, item] of visible.entries()) {
@@ -543,11 +545,15 @@ function toolActivityNote(detail: ToolDetail): string {
  * so every item counts — a fan-out of three is three entries.
  *
  * A skill Claude Code ran as a fork of itself counts too, from the moment it
- * starts: a fork emits no task edge and cannot be named until it ends
- * (design D10), so without an entry here the track — and the reader — would
- * have nothing at all to say about a run that may go on for minutes. A skill
- * that settles without ever naming a child was no fork but an ordinary skill
- * load, a moment's work, and leaves no entry behind.
+ * starts. A current CLI names the fork at its start edge, so its Skill row is
+ * openable from then on (design D13); an older one names it only when it
+ * ends (design D10), and without an entry here the track — and the reader —
+ * would have nothing at all to say about a run that may go on for minutes. A
+ * skill that settles without ever naming a child was no fork but an ordinary
+ * skill load, a moment's work, and leaves no entry behind.
+ *
+ * The run a typed command launches has no launching row at all; its own
+ * foreground task row is its entry.
  */
 export function subagentEntries(items: readonly ConversationItem[]): SubagentEntry[] {
   // The running task behind each launching row, by the tool use that launched
@@ -567,9 +573,25 @@ export function subagentEntries(items: readonly ConversationItem[]): SubagentEnt
   // launching frame's timestamp, which is why the note takes rows created
   // strictly later). Two forks running at once are indistinguishable this
   // way — the later one takes the note — which is the price of a signal
-  // that is otherwise not reported at all.
+  // that is otherwise not reported at all. A fork named at its start routes
+  // its rows into its own transcript instead (design D13), so it leaves the
+  // parent nothing to take a note from: its activity is in the transcript.
   let fork: { entry: SubagentEntry; createdAt: number } | undefined;
   for (const item of items) {
+    // A run with no launching row of its own — the review a typed command
+    // launches (design D13) — is listed from its own row, named by the
+    // command, and openable from the moment Claude Code names it. There is
+    // no tool row to merge it with, and it is no subagent type's launch.
+    if (item.type === "background_task" && item.foreground === true) {
+      entries.push({
+        id: item.id,
+        description: item.description,
+        status: item.status,
+        ...(item.childConversationId === undefined ? {} : { conversationId: item.childConversationId }),
+        ...(item.status === "running" && item.progress !== undefined ? { progress: item.progress } : {}),
+      });
+      continue;
+    }
     if (item.type !== "tool") continue;
     const detail = describeToolDetail(item);
     if (detail.kind === "skill") {

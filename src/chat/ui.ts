@@ -22,7 +22,7 @@ import { READER_CLOSED, QueueDockRenderer, RevertedMessagesDockRenderer, Timelin
 import { backgroundStatusLabel, runningBackgroundTasks } from "./background-tasks";
 import { pausedStatusLabel, pausedWakeups, pendingWakeups, scheduledStatusLabel, wakeupFireTime } from "./scheduled-wakeups";
 import { RunningWorkDisclosure } from "./running-work-disclosure";
-import { TaskInspectionPanel, formatTaskElapsed, runningTaskForChild, taskById, taskInspection, type OpenTaskInspection } from "./task-inspection";
+import { SilentRunFollower, TaskInspectionPanel, formatTaskElapsed, runningTaskForChild, taskById, taskInspection, type OpenTaskInspection } from "./task-inspection";
 import { composerRoutineState, formatUsd, latestPlanReport, latestRateLimit, planChip, planHasRows, planName, planReadoutRows, sessionTotalsTitle, usageAsOf, usageStale, type RateLimitStanding } from "./composer-status";
 import { buildPlanRowNodes, currentUsageReport, initUsagePaneControls, noteUsageReport, onUsageChange, onUsageRead, readStatusText, readUsageNow, refreshUsageIfStale, revealUsagePane, usageReadState, usageReadable } from "./usage-pane";
 import { isLiveConversationStatus } from "./types";
@@ -38,6 +38,7 @@ import {
   noteQueuedMessage,
   prependSnapshot,
   projectionFromSnapshot,
+  refreshFromSnapshot,
   removeAcceptedDraft,
   type ChatProjection,
 } from "./projection";
@@ -318,6 +319,27 @@ export function initChat(api = new ChatApiClient()): void {
     taskPanel.sync(owner ? taskById(owner.items, child.task.taskId) : undefined, stoppingTasks.has(child.task.taskId));
   };
   let childGeneration = 0;
+  // A run that streams nothing — the review a typed command launches — or
+  // whose stream has stalled is followed from its transcript on disk while
+  // its drill-down is open (design D14). The re-read folds into the open
+  // projection the way live events do, and repaints as new content does:
+  // it never goes through the open path, so the reader's place, the follow
+  // state, the stream, and the task strip are all left as they are.
+  const silentRun = new SilentRunFollower({
+    refresh: async signal => {
+      const open = child;
+      const generation = childGeneration;
+      if (!open?.projection) return;
+      const page = await api.snapshot(open.conversationId, undefined, signal);
+      if (signal.aborted || generation !== childGeneration || child !== open || !open.projection) return;
+      const refreshed = refreshFromSnapshot(open.projection, page);
+      if (!refreshed) return;
+      open.projection = refreshed.projection;
+      if (refreshed.changed) { announceChild(""); renderChild(true); }
+      silentRun.follow(isLiveConversationStatus(open.projection.status));
+    },
+    active: () => chatSurfaceActive(),
+  });
   const childRenderer = new TimelineRenderer();
   childRenderer.deferClosedActivity = true;
   const childAnchor = new TimelineAnchorController();
@@ -3522,6 +3544,7 @@ export function initChat(api = new ChatApiClient()): void {
     child = null;
     drilldownHistoryToken = null;
     childGeneration += 1;
+    silentRun.stop();
     open.stream?.close();
     open.read?.controller.abort();
     childReadSignal?.cancel();
@@ -3590,7 +3613,13 @@ export function initChat(api = new ChatApiClient()): void {
           return;
         }
         entry.projection = result.projection;
-        if (result.outcome === "applied") { announceChild(""); renderChild(true); }
+        if (result.outcome === "applied") {
+          announceChild("");
+          renderChild(true);
+          // The run spoke: it is not silent, and its status may have settled.
+          silentRun.heard();
+          silentRun.follow(isLiveConversationStatus(entry.projection.status));
+        }
       },
       resync: () => { if (generation === childGeneration) openChildConversation(id, label, true, entry.task); },
       error: error => { if (generation === childGeneration) childInterruptions.report("child", error); },
@@ -3601,6 +3630,7 @@ export function initChat(api = new ChatApiClient()): void {
     if (!drilldown || !drilldownItems || !drilldownTimeline) return;
     const generation = ++childGeneration;
     drilldownClosePending = false;
+    silentRun.stop();
     const previous = child;
     previous?.stream?.close();
     previous?.read?.controller.abort();
@@ -3692,6 +3722,7 @@ export function initChat(api = new ChatApiClient()): void {
       announceChild(snapshot.items.length ? "" : "This subagent has not reported anything yet.");
       renderChild(false);
       next.stream = openChildStream(next, id, label, snapshot.cursor, generation);
+      silentRun.follow(isLiveConversationStatus(next.projection.status));
     });
   };
 

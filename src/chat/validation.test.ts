@@ -363,6 +363,14 @@ describe("chat domain validation", () => {
     expect(() => parseConversationItem({ ...turn, origin: "cron" })).toThrow(/user message origin/);
   });
 
+  test("a foreground run row is accepted; any foreground value but true is dropped, not refused", () => {
+    const row: ConversationItem = { id: "task:rv", type: "background_task", createdAt: 1, taskId: "ad53ca64bd188affb", description: "/code-review", taskType: "local_agent", status: "running", childConversationId: "sub:s1:ad53ca64bd188affb", foreground: true };
+    expect(parseConversationItem(row)).toEqual(row);
+    const { foreground: _foreground, ...background } = row;
+    expect(parseConversationItem({ ...row, foreground: false })).toEqual(background);
+    expect(parseConversationItem({ ...row, foreground: "yes" })).toEqual(background);
+  });
+
   test("a running task's facts are accepted when well-formed and stripped, not refused, when malformed", () => {
     const row: ConversationItem = { id: "task:a", type: "background_task", createdAt: 1, taskId: "ada2b9582caa230c5", description: "List files and count them", taskType: "local_agent", toolUseId: "toolu_013s2jZs", status: "running" };
     const facts = {

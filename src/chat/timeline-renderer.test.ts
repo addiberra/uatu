@@ -1413,6 +1413,41 @@ describe("recalled memory rows and coded notices", () => {
   });
 });
 
+// Design D13: the run a typed command launches has no launching row; its
+// own foreground row is what lists it with the subagents.
+describe("a foreground run row", () => {
+  const review = (status: "running" | "completed" | "stopped"): ConversationItem => ({
+    id: "task:ad53ca64bd188affb", type: "background_task", createdAt: 5, taskId: "ad53ca64bd188affb", description: "/code-review",
+    taskType: "local_agent", status, subagentType: "general-purpose", childConversationId: "sub:parent:ad53ca64bd188affb", foreground: true,
+    ...(status === "running" ? {} : { summary: "/code-review" }),
+  });
+  const typed: ConversationItem = { id: "message:u1", type: "user_message", createdAt: 1, text: "/code-review low" };
+
+  test("is listed as its own entry, named by the command and openable, running while its row runs", () => {
+    const entries = subagentEntries([typed, review("running")]);
+    expect(entries).toEqual([{ id: "task:ad53ca64bd188affb", description: "/code-review", status: "running", conversationId: "sub:parent:ad53ca64bd188affb" }]);
+    expect(subagentLabel(entries[0]!)).toBe("/code-review");
+    expect(subagentTrackSummary(entries)).toBe("1 of 1 subagent working · /code-review");
+    // Settled, it stays listed and openable, as a finished subagent does.
+    expect(subagentEntries([typed, review("completed")])).toEqual([expect.objectContaining({ status: "completed", conversationId: "sub:parent:ad53ca64bd188affb" })]);
+  });
+
+  test("keeps its place among the conversation's other runs", () => {
+    const agent: ConversationItem = { id: "tool:a", type: "tool", createdAt: 9, name: "task", status: "running", input: JSON.stringify({ description: "Explore", prompt: "p", subagent_type: "explore" }) };
+    expect(subagentEntries([typed, review("running"), agent]).map(entry => entry.id)).toEqual(["task:ad53ca64bd188affb", "tool:a"]);
+  });
+
+  test("adds no timeline row, running or settled: the command's output is the record", () => {
+    const renderer = new TimelineRenderer();
+    for (const status of ["running", "completed", "stopped"] as const) {
+      const host = target();
+      renderer.render(host, projectionWith([typed, review(status)], { status: "completed" }), new Set());
+      expect(host.querySelector('[data-chat-item-id="task:ad53ca64bd188affb"]')).toBeNull();
+      expect(host.querySelector('[data-chat-item-id="message:u1"]')).not.toBeNull();
+    }
+  });
+});
+
 describe("background task rows and tool elapsed time", () => {
   const settled = (status: "completed" | "failed" | "stopped", createdAt: number): ConversationItem => ({
     id: `task:${status}`, type: "background_task", createdAt, taskId: status, description: "Sleep for 20 seconds then echo done", taskType: "local_bash", toolUseId: "toolu_1", status, summary: status === "completed" ? "done" : status === "failed" ? "exit 1" : undefined,

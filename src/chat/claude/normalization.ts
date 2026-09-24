@@ -45,6 +45,11 @@ export type ClaudeEventMemory = {
   // later edges stay out of the timeline too.
   tasks: Map<string, BackgroundTaskMemory>;
   ambientTasks: Set<string>;
+  // Agent runs the CLI marks ambient — a skill the model forks, the run a
+  // typed command launches — by task id (design D13). They are runs, not
+  // housekeeping, but not background work either, so they are kept apart
+  // from `tasks`: nothing that reads the background set can see them.
+  ambientRuns: Map<string, AmbientRunMemory>;
   // Partial-message streams by API message id: which content block index
   // holds text (from content_block_start), and how many of those the
   // completed per-block assistant messages have consumed, so the completed
@@ -95,8 +100,37 @@ export type BackgroundTaskMemory = BackgroundTaskFacts & {
   settled?: boolean;
 };
 
+/**
+ * What an ambient agent run's start edge said, so its later edges (which
+ * may not repeat the task type) are still recognised as the run's.
+ * `toolUseId` is the launching tool use a forked skill has; a typed
+ * command's run has none, and is the one that gets a row of its own.
+ */
+export type AmbientRunMemory = {
+  description: string;
+  taskType?: string;
+  toolUseId?: string;
+  subagentType?: string;
+  childConversationId?: string;
+  createdAt: number;
+  progress?: string;
+  settled?: boolean;
+};
+
 export function createClaudeEventMemory(): ClaudeEventMemory {
-  return { tools: new Map(), todoTools: new Set(), tasks: new Map(), ambientTasks: new Set(), streams: new Map(), frameItems: new Map() };
+  return { tools: new Map(), todoTools: new Set(), tasks: new Map(), ambientTasks: new Set(), ambientRuns: new Map(), streams: new Map(), frameItems: new Map() };
+}
+
+/**
+ * Whether a `task_started` edge starts an agent run: a `local_agent` task,
+ * or — for a task the CLI does not mark ambient — one that names a subagent
+ * type. An ambient task must say `local_agent` outright; every other ambient
+ * task (a monitor, a watcher) is housekeeping (design D13).
+ */
+export function startsAgentRun(record: Record<string, unknown>): boolean {
+  if (record.task_type === "local_agent") return true;
+  const ambient = record.ambient === true || record.skip_transcript === true;
+  return !ambient && typeof record.subagent_type === "string" && record.subagent_type !== "";
 }
 
 const MEMORY_LIMIT = 2_048;
@@ -385,6 +419,23 @@ function normalizeMessage(
       }
       return { ...base, outcome: "handled", updates };
     }
+    // A typed command's output, as the store keeps it (design D15). Live,
+    // the same output arrived as a `<synthetic>` assistant frame carrying
+    // `local_command_source` under this very uuid, so the reopened row is
+    // the live one: same id, same text, no model and no usage.
+    if (record.subtype === "local_command") {
+      const envelope = envelopeIdentity(record);
+      if (!envelope) return { ...base, outcome: "unparseable" };
+      const output = localCommandOutput(record.content);
+      if (!output) return { ...base, outcome: "ignored" };
+      return { ...base, outcome: "handled", updates: [{ kind: "upsert", item: {
+        id: `message:${envelope.uuid}`,
+        type: "assistant_message",
+        createdAt: envelope.createdAt,
+        markdown: output,
+        completedAt: envelope.createdAt,
+      } }] };
+    }
     // Background work: one row per task, re-upserted in place from start to
     // settling (D8). Ambient housekeeping tasks never become rows (spec).
     if (record.subtype === "task_started" || record.subtype === "task_progress" || record.subtype === "task_updated" || record.subtype === "task_notification") {
@@ -501,15 +552,22 @@ function normalizeMessage(
     // neither moves the remembered model nor carries the parent's window
     // fill. Its content still lands where it did before.
     const subagentFrame = typeof record.parent_tool_use_id === "string" && record.parent_tool_use_id !== "";
+    // A frame the CLI wrote rather than a model: a typed command's output
+    // (`local_command_source`, design D15) or any other `<synthetic>`
+    // message. Its text is shown as it always was, but it names no model and
+    // spends nothing — its zeroed usage is no API call's accounting, and as
+    // a carrier it would read as an empty context window.
+    const synthetic = typeof record.local_command_source === "string" || raw === "<synthetic>";
     // The init message names the session's model in its full variant form
     // ("...[1m]"); assistant messages report the resolved base id. Keep the
     // variant id — it is what the catalog keys context windows by, so the
     // usage gauge measures against the window actually in effect.
     // A message that names no model belongs to the session's current one —
     // after a refusal fallback, the fallback model (D11).
-    const model = reported === undefined
-      ? memory.lastModel
-      : memory.lastModel?.startsWith(`${reported}[`) ? memory.lastModel : reported;
+    const model = synthetic ? undefined
+      : reported === undefined
+        ? memory.lastModel
+        : memory.lastModel?.startsWith(`${reported}[`) ? memory.lastModel : reported;
     if (model && !subagentFrame) memory.lastModel = model;
     const updates: NormalizedProviderUpdate[] = resumeAfterTransient(memory);
     // A frame that supersedes earlier messages (a refusal fallback's
@@ -530,13 +588,14 @@ function normalizeMessage(
     }
     // A subagent's frame that still reaches the parent's normalizer is one
     // whose run the provider does not know (no task edge named its agent
-    // id: a Skill fork, an older CLI) — a known run's frames are normalized
+    // id: a Skill fork on a CLI that names it only at its end, an older
+    // CLI) — a known run's frames are normalized
     // untagged with the child's own memory and never come here (design D8,
     // provider `routeSubagentFrame`). Such a frame contributes only its
     // tool blocks, as it did before the query asked for subagent text
     // (forwardSubagentText): its text and thinking are the child
     // transcript's, not the parent's, and are dropped, not shown twice.
-    // Dropping a known run's text and thinking is deliberate, not a skip;
+    // Dropping this frame's text and thinking is deliberate, not a skip;
     // a block type no walker reads is still counted, whoever's frame it is.
     const content = asArray(message.content);
     const blocks = subagentFrame
@@ -544,7 +603,7 @@ function normalizeMessage(
       : content;
     const skippedBlocks: string[] = subagentFrame ? skippedBlockTypes(content, ASSISTANT_BLOCKS) : [];
     updates.push(...contentBlockUpdates(blocks, envelope, memory, skippedBlocks));
-    const usage = subagentFrame ? undefined : tokensToUsage(message.usage);
+    const usage = subagentFrame || synthetic ? undefined : tokensToUsage(message.usage);
     // Each assistant message's usage is ONE API call's accounting, and its
     // input + cache read + cache write is the window occupancy after that
     // call. It rides a dedicated empty-markdown carrier (same contract as
@@ -711,6 +770,7 @@ export function normalizeTranscriptEntries(entries: TranscriptEntry[], parentSes
         message: entry.message,
         ...(entry.subtype ? { subtype: entry.subtype } : {}),
         ...(entry.compactMetadata ? { compactMetadata: entry.compactMetadata } : {}),
+        ...(entry.content !== undefined ? { content: entry.content } : {}),
         ...(entry.toolUseResult ? { toolUseResult: entry.toolUseResult } : {}),
         ...(entry.origin ? { origin: entry.origin } : {}),
         ...(entry.isMeta ? { isMeta: true } : {}),
@@ -956,7 +1016,7 @@ function launchedTaskFacts(block: Block, toolOutcome: RecordValue, parentSession
  * silent entry the edge then names and shows.
  */
 function rememberLaunchedTask(taskId: string, facts: BackgroundTaskFacts, launcherInput: string | undefined, toolUseId: string, envelope: Envelope, memory: ClaudeEventMemory): NormalizedProviderUpdate[] {
-  if (Object.keys(facts).length === 0 || memory.ambientTasks.has(taskId)) return [];
+  if (Object.keys(facts).length === 0 || memory.ambientTasks.has(taskId) || memory.ambientRuns.has(taskId)) return [];
   const known = memory.tasks.get(taskId);
   const entry: BackgroundTaskMemory = known
     ? { ...known, ...facts }
@@ -1082,6 +1142,11 @@ function backgroundTaskUpdate(record: RecordValue, memory: ClaudeEventMemory, ba
   const taskId = typeof record.task_id === "string" && record.task_id ? record.task_id : "";
   if (!taskId) return { ...base, outcome: "unparseable" };
   const envelope = envelopeIdentity(record) ?? { uuid: taskId, createdAt: Date.now() };
+  // An agent run the CLI marks ambient is a run all the same (design D13):
+  // its edges take their own path, and never reach the background state.
+  if (memory.ambientRuns.has(taskId) || ((record.ambient === true || record.skip_transcript === true) && startsAgentRun(record))) {
+    return ambientRunUpdate(taskId, record, envelope, memory, base, parentSessionId);
+  }
   if (record.ambient === true || record.skip_transcript === true) {
     memory.ambientTasks.add(taskId);
     if (memory.ambientTasks.size > MEMORY_LIMIT) memory.ambientTasks.clear();
@@ -1165,6 +1230,104 @@ function backgroundTaskUpdate(record: RecordValue, memory: ClaudeEventMemory, ba
 }
 
 /**
+ * An ambient agent run's edges (design D13). The run is followed like any
+ * subagent — its child `sub:<parent>:<taskId>` is named at the start edge,
+ * since a `local_agent` task's id is its agent id — but it is not background
+ * work, so nothing here touches `memory.tasks` or mints a background row.
+ *
+ * A run with a launching tool use (a skill the model forked) is that tool
+ * row's run: the row gains its child id at the start edge, exactly as a
+ * foreground Agent's does, and the row speaks for the run from there. A run
+ * with none (the review a typed command launches) has no row in the
+ * timeline at all, so it gets one of its own: a `foreground` task row,
+ * running from the start edge and settled by the notification, which the
+ * subagents track lists and opens.
+ */
+function ambientRunUpdate(taskId: string, record: RecordValue, envelope: Envelope, memory: ClaudeEventMemory, base: { updates: NormalizedProviderUpdate[]; eventType: string }, parentSessionId?: string): Omit<NormalizedProviderEvent, "conversationId"> {
+  const known = memory.ambientRuns.get(taskId);
+  const description = typeof record.description === "string" && record.description ? record.description : known?.description;
+  // A stray edge for a run never seen to start, naming nothing: nothing to show.
+  if (!description) return { ...base, outcome: "ignored" };
+  const taskType = typeof record.task_type === "string" && record.task_type ? record.task_type : known?.taskType;
+  const toolUseId = typeof record.tool_use_id === "string" && record.tool_use_id ? record.tool_use_id : known?.toolUseId;
+  const subagentType = typeof record.subagent_type === "string" && record.subagent_type ? record.subagent_type : known?.subagentType;
+  const childConversationId = known?.childConversationId ?? (parentSessionId ? `sub:${parentSessionId}:${taskId}` : undefined);
+  const progress = record.subtype === "task_progress"
+    ? (typeof record.summary === "string" && record.summary ? record.summary
+      : typeof record.last_tool_name === "string" && record.last_tool_name ? `Using ${record.last_tool_name}` : known?.progress)
+    : known?.progress;
+  let status: "running" | "completed" | "failed" | "stopped" = "running";
+  if (record.subtype === "task_notification") status = settledTaskStatus(record.status);
+  else if (record.subtype === "task_updated") {
+    const patch = asRecord(record.patch);
+    if (patch.status === "failed") status = "failed";
+    else if (patch.status === "killed") status = "stopped";
+    else if (patch.status === "completed") status = "completed";
+  }
+  // A settled run stays settled: a late edge must not reopen it.
+  if (known?.settled && status === "running") return { ...base, outcome: "ignored" };
+  const entry: AmbientRunMemory = {
+    description,
+    ...(taskType ? { taskType } : {}),
+    ...(toolUseId ? { toolUseId } : {}),
+    ...(subagentType ? { subagentType } : {}),
+    ...(childConversationId ? { childConversationId } : {}),
+    createdAt: known?.createdAt ?? envelope.createdAt,
+    ...(progress ? { progress } : {}),
+    ...(status !== "running" ? { settled: true } : {}),
+  };
+  boundedSet(memory.ambientRuns, taskId, entry, MEMORY_LIMIT);
+  if (toolUseId) {
+    const updates = record.subtype === "task_started" && childConversationId ? launchingRowUpdate(memory, toolUseId, childConversationId) : [];
+    return { ...base, outcome: updates.length > 0 ? "handled" : "ignored", updates };
+  }
+  const summary = status !== "running" && typeof record.summary === "string" && record.summary ? record.summary : undefined;
+  return { ...base, outcome: "handled", updates: [{ kind: "upsert", item: {
+    id: `task:${taskId}`,
+    type: "background_task",
+    createdAt: entry.createdAt,
+    taskId,
+    description,
+    ...(taskType ? { taskType } : {}),
+    status,
+    ...(status === "running" && progress ? { progress } : {}),
+    ...(summary ? { summary } : {}),
+    ...(subagentType ? { subagentType } : {}),
+    ...(childConversationId ? { childConversationId } : {}),
+    foreground: true,
+  } }] };
+}
+
+/**
+ * Every foreground run row still running, settled: the turn that ran it has
+ * ended, or the process has, without the run reporting its own end. A
+ * typed command's run cannot outlive the command — its notification comes
+ * before the command's result — so a row still running past that point would
+ * only ever read as work that is not happening.
+ */
+export function settleForegroundRuns(memory: ClaudeEventMemory, summary: string): NormalizedProviderUpdate[] {
+  const updates: NormalizedProviderUpdate[] = [];
+  for (const [taskId, run] of memory.ambientRuns) {
+    if (run.settled || run.toolUseId) continue;
+    run.settled = true;
+    updates.push({ kind: "upsert", item: {
+      id: `task:${taskId}`,
+      type: "background_task",
+      createdAt: run.createdAt,
+      taskId,
+      description: run.description,
+      ...(run.taskType ? { taskType: run.taskType } : {}),
+      status: "stopped",
+      summary,
+      ...(run.subagentType ? { subagentType: run.subagentType } : {}),
+      ...(run.childConversationId ? { childConversationId: run.childConversationId } : {}),
+      foreground: true,
+    } });
+  }
+  return updates;
+}
+
+/**
  * The launching tool row, re-upserted with the child conversation its task
  * just named. Everything but that id is what the `tool_use` block itself
  * emitted, held in this memory — a row is never invented here: a tool use
@@ -1187,6 +1350,22 @@ function launchingRowUpdate(memory: ClaudeEventMemory, toolUseId: string, childC
     ...(known.input === undefined ? {} : { input: known.input }),
     childConversationId,
   } }];
+}
+
+/**
+ * The output a stored local command record holds: the text inside its
+ * `<local-command-stdout>` (and `<local-command-stderr>`) markup, which is
+ * what the live frame's text carries unwrapped. A record that holds no
+ * output markup — the TUI also files the command's own invocation under
+ * this subtype — shows nothing, and neither does anything outside the
+ * markup (a forked skill's launch note, say).
+ */
+function localCommandOutput(content: unknown): string | undefined {
+  if (typeof content !== "string") return undefined;
+  const parts = [...content.matchAll(/<local-command-(?:stdout|stderr)>([\s\S]*?)<\/local-command-(?:stdout|stderr)>/g)]
+    .map(match => match[1]!.trim())
+    .filter(Boolean);
+  return parts.length > 0 ? parts.join("\n\n") : undefined;
 }
 
 /** The CLI's cumulative task usage (`total_tokens`, `tool_uses`, `duration_ms`), when the edge carries a complete one. */

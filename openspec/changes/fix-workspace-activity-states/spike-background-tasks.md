@@ -85,3 +85,90 @@ No `task_started`, `task_progress`, `task_updated`, `task_notification`, or `bac
 - **D7 agent tasks:** the agent `output_file` is just the subagent `.jsonl`; the child drill-down already reads it, so no output pane is needed for agents (as designed).
 - **Skill forks (D8):** a `Skill` tool result with `status:"forked"` carries an `agentId` whose frames stream under the Skill tool_use's `parent_tool_use_id` but never announce a task; if a live child is wanted for forked skills too, the provider needs the same `tool_use_id → sub:<sessionId>:<agentId>` mapping from that tool result (only available when the fork ends) or a `parent_tool_use_id`-keyed buffer. Out of scope unless the drill-down should cover skill forks.
 - **Provider lifecycle:** the `init` frame that opens the CLI's own follow-up turn after a notification must not be treated as a new session/reset (it carries the same `session_id`).
+
+## Q4 — `/code-review` typed as a slash command (local command)
+
+Setup: streaming `AsyncIterable` prompt kept open, Uatu's `query()` options (`includePartialMessages`, `enableFileCheckpointing`, `perTaskStopAffordance`, `agentProgressSummaries`, `forwardSubagentText`), `bypassPermissions`, `claude-haiku-4-5`, one user message `/code-review low` (and a second run `/code-review high`), scratch repo with an uncommitted `add` returning `a - b`. **Executable matters:** Uatu passes the discovered `claude` (`~/.local/bin/claude` → CLI 2.1.280), not the SDK-bundled 2.1.261; the Q3 probe used the bundled CLI, which did not expand the slash command. With 2.1.280 `/code-review` runs as a local command. Three runs: low 8 s, high 64 s (Bash + Read inside the reviewer), low again 24 s. All produced the same frame sequence.
+
+**a. Every non-stream frame (low run; high run identical, times in brackets)** — nothing else arrived, not even `stream_event`:
+```
++0.50 s (0.43)  system/task_started      1
++4.8 s  (4.9)   rate_limit_event         1
++8.4 s  (63.9)  system/task_notification 1
++8.4 s  (63.9)  system/init              1   <- the first init comes AFTER the command, not before it
++8.4 s  (63.9)  assistant                1
++8.4 s  (63.9)  result/success           1
+```
+No `task_progress` (even at 64 s with two reviewer tool uses, so no `agentProgressSummaries` line), no `task_updated`, no `background_tasks_changed`, no `tool_progress`, no `session_state_changed`. The run is announced once, at +0.5 s, with no `tool_use_id`:
+```json
+{"type":"system","subtype":"task_started","task_id":"ad53ca64bd188affb","description":"/code-review",
+ "subagent_type":"general-purpose","is_backgrounded":false,"spawn_depth":1,"task_type":"local_agent",
+ "prompt":"`low effort → 1 diff pass → no verify → ≤4 findings` ## Turn 1 — read …",
+ "skip_transcript":true,"ambient":true,"uuid":"8848…","session_id":"0058…"}
+```
+**b. Reviewer frames:** none reach the SDK stream — no assistant/user frames, no thinking/text, no Bash tool_use, with any `parent_tool_use_id`. `forwardSubagentText` does not apply to this run. They exist only on disk (`isSidechain:true`, `agentId:"ad53ca64bd188affb"` on every record).
+
+**c. How the review arrives:** as one `assistant` frame with `model:"<synthetic>"`, zeroed `usage`, `parent_tool_use_id:null`, and a top-level `local_command_source` field, then a `result` that repeats the text:
+```json
+{"type":"assistant","message":{"id":"4c59…","model":"<synthetic>","role":"assistant","stop_reason":"end_turn",
+ "usage":{"input_tokens":0,"output_tokens":0,…},"content":[{"type":"text","text":"math.ts:2 — function named `add` now returns subtraction (`a - b`) …"}]},
+ "parent_tool_use_id":null,"local_command_source":"<local-command-stdout>math.ts:2 — …</local-command-stdout>","session_id":"0058…"}
+{"type":"result","subtype":"success","is_error":false,"num_turns":0,"duration_ms":7984,"duration_api_ms":0,
+ "local_command":"code_review","result":"math.ts:2 — …","total_cost_usd":0.0229,"result_index":0,"queued_turn_count":0}
+```
+It is not a `system/local_command` frame live; that subtype exists only in the stored transcript (parent `.jsonl`: `user` isMeta caveat, `user` `/code-review low`, `system` `local_command` `<local-command-stdout>…`).
+
+**d. Turn shape:** a `result` does end the command (`local_command:"code_review"`, `num_turns:0`). Nothing marks its start except `task_started`: no `init`, no stream events, no assistant frame for 8–64 s. Uatu's own dispatch (`provider.command()` → `prompt()`) emits `status:"running"` at acceptance and bumps `pendingTurns`, so the conversation **status** is `running` the whole time and turns `completed` at the result. The dead air is in the **timeline**: nothing is added between the user's message and the final text.
+
+**e. Agent id:** `task_started.task_id` (+0.5 s) and `task_notification.task_id` are the agent id: `~/.claude/projects/<cwdSlug>/<sessionId>/subagents/agent-ad53ca64bd188affb.jsonl` (meta `{"agentType":"general-purpose","requestShape":"foreground","requestNonInteractive":true}`, no `toolUseId`). `task_notification.output_file` = `/private/tmp/claude-501/<cwdSlug>/<sessionId>/tasks/<task_id>.output`, a symlink to that `.jsonl` (the same convention as Q1). The file is written **live**: polled at 0.5 s intervals, it existed about 1.5 s after the prompt with 10 lines and grew to 19 while the reviewer ran.
+
+**Why Uatu showed nothing, frame by frame**
+- `task_started`: `normalization.ts` `backgroundTaskUpdate` sees `ambient:true`/`skip_transcript:true`, adds the id to `memory.ambientTasks`, and returns `ignored`. Even without that flag, `is_backgrounded:false` would take the "remembered but silent" branch, and `launchingRowUpdate` requires a `tool_use_id`, which is absent. `provider.ts` `learnSubagentRuns` opens a child only when there is a `toolUseId` and the task is not ambient, so no child is opened. No `backgroundTasks` entry is created, so there is no row and no drill-down.
+- Reviewer activity: never streamed, so `routeSubagentFrame`/`bufferForkFrame`, which key on `parent_tool_use_id`, have nothing to route.
+- `task_notification`: ambient id → `ignored`; there is no child to settle.
+- `init` (post-command): `pendingTurns` is 1, so it is not read as an unprompted turn. Harmless.
+- `assistant` `<synthetic>`: normalized as ordinary assistant text, so the review does appear at the end. Side effect: `memory.lastModel` becomes `"<synthetic>"` (there is no guard for it), and its zero `usage` is a per-message carrier. Both may disturb the model/context readout. Not verified in the UI.
+- `result`: ends the turn normally. Replay: the stored `system/local_command` record falls to the `system` branch's final `ignored`, and `local_command_output` is on the `INTENTIONALLY_IGNORED` list. The review text therefore likely **disappears on reopen** from transcript (inferred from code, not run).
+
+**What Uatu could key on**
+- (i) Show a running review: treat `system/task_started` with `ambient:true` + `task_type:"local_agent"` + `description` starting with `/` (here `"/code-review"`) as a user-initiated command run, not housekeeping. It needs a row keyed `task:<task_id>` from `task_started` (+0.5 s) to `task_notification` (`status`), with `prompt` (the level recipe) available. `result.local_command:"code_review"` confirms at the end. Elapsed time is the only live signal the stream gives. "What it is doing" must come from tailing the subagent `.jsonl` (the stream has no `task_progress`).
+- (ii) Open the live transcript: child id `sub:<sessionId>:<task_id>` from `task_started.task_id`. Its transcript is the file at `<configDir>/projects/<cwdSlug>/<sessionId>/subagents/agent-<task_id>.jsonl` (or `realpath` of `tasks/<task_id>.output`), and must be **read from disk incrementally**, because no frames are forwarded. There is no `tool_use_id`, so the D8 `tool_use_id → child` map cannot be used. Key the child by `task_id` instead.
+- Final text: take the `assistant` frame carrying `local_command_source` (model `<synthetic>`) as the command's output. Skip it for model/usage bookkeeping. On replay, render stored `system/local_command` `<local-command-stdout>` content.
+
+## Q5 — forked runs on CLI 2.1.280: census and skill forks
+
+**Part A — census of `~/.claude/projects/*/*/subagents/` on this machine (141 runs, every `agent-*.jsonl` has a `.meta.json`; transcripts from CLI 2.1.236–2.1.280).**
+
+| launch | n | `agentType` | `requestShape` | `toolUseId` | other meta keys |
+|---|---|---|---|---|---|
+| `Agent` tool in the parent session | 78 | general-purpose 71, Explore 5 (+2 older, no shape) | background 57, foreground 19 | yes | `description`, `model`, `spawnDepth:1` |
+| `Agent` tool inside a subagent (nested) | 49 | general-purpose 31, `fork` 18 | background 26, foreground 23 | yes (a tool use in the sibling subagent's `.jsonl`) | `parentAgentId`; the `fork` runs also `isFork:true`; `spawnDepth:2` |
+| model-invoked `Skill` fork (`code-review`) | 5 | general-purpose | foreground 3, none 2 (CLI ≤2.1.261) | **no** | `spawnDepth:1`, no `description` |
+| typed `/code-review` (local command) | 9 | general-purpose | foreground 7, background 1, none 1 (2.1.261) | **no** | the background one (CLI 2.1.267, TUI session) also has `name:"code-review"`, `description:"/code-review"` and two side files, `agent-<id>.forked-skill.json` `{skillName, attributionName, effort}` and `.forked-skill.marker.json` `{forkedSkill:true, skillName}` |
+
+`requestNonInteractive` is `true` on every run that has the key (136). All 14 runs without a `toolUseId` were classified from the parent transcript at the run's first timestamp. Nine sit directly after a `user` record that begins `/code-review`, preceded by `queue-operation` enqueue/dequeue, or by a `<local-command-caveat>` in the TUI. The other five sit directly after an `assistant` `tool_use: Skill(code-review)` whose `tool_result` has `toolUseResult.status:"forked"` + `agentId` = the run. **No housekeeping runs were found:** no compaction, hook, auto-memory, or title/summary run left a transcript under `subagents/`. Every run there is either an `Agent` launch or a `code-review` fork, typed or model-invoked. A UI that lists every run there would see no noise on this machine's history. This proves only that such runs are absent from this sample, not that the CLI never writes them. Caveat: in the model-invoked fork, the fork's `meta.json` never carries the Skill `toolUseId`; the only on-disk link is the parent `tool_result.toolUseResult.agentId`, written when the fork ends.
+
+**Part B — model-invoked `Skill` fork on 2.1.280 (live; Uatu's options, `~/.local/bin/claude`, haiku, a one-line uncommitted diff; 46 s fork)**
+1. **Still a fork.** `tool_result` `tool_use_result: {success:true, commandName:"code-review", status:"forked", agentId:"afd1c64a374700d34", result:"## Findings …"}` at +45.9 s.
+2. **Task frames now appear, at the start.** Q3 (bundled 2.1.261) had none. `task_started` arrives 12 ms after the Skill `tool_use`, now **with** a `tool_use_id`, but still ambient:
+   ```
+   +4.798 assistant tool_use Skill {skill:"code-review"}   id=toolu_…Jmk1r
+   +4.810 system/task_started {task_id:"afd1c64a374700d34", tool_use_id:"toolu_…Jmk1r", description:"/code-review",
+          subagent_type:"general-purpose", is_backgrounded:false, spawn_depth:1, task_type:"local_agent",
+          prompt:"(No effort level given — reusing high …", skip_transcript:true, ambient:true}
+   +34.8  tool_progress {tool_use_id:"toolu_…Jmk1r-heartbeat-0", tool_name:"Skill", parent_tool_use_id:"toolu_…Jmk1r", elapsed_time_seconds:30, heartbeat:true}
+   +45.93 system/task_notification {task_id:"afd1c64a374700d34", tool_use_id:"toolu_…Jmk1r", status:"completed",
+          output_file:"/private/tmp/claude-501/<cwdSlug>/<sessionId>/tasks/<task_id>.output", summary:"/code-review", ambient:true}
+   +45.93 user tool_result (status:"forked", as above)
+   ```
+   No `task_progress`, `task_updated`, or `background_tasks_changed` arrived.
+3. **The fork streams.** 21 `assistant` + 10 `user` frames arrived tagged `parent_tool_use_id` = the Skill tool use, from +4.81 s (the fork's prompt as a `user` frame) to +45.9 s: thinking, text, eight `Bash`, one `Read`, and the paired tool_results. No `stream_event` partials came from the fork.
+4. **The file is live on disk.** `subagents/agent-afd1c64a374700d34.meta.json` appeared at +4.85 s (40 ms after `task_started`) and the `.jsonl` at +5.10 s with 10 lines. The `.jsonl` grew in step with the streamed frames to 53 lines at +46.2 s. `meta.json` = `{"agentType":"general-purpose","spawnDepth":1,"requestShape":"foreground","requestNonInteractive":true}`, with **no `toolUseId`** and no `description`. No `forked-skill*.json` was written. The fork's records carry `isSidechain:true, agentId`.
+
+`simplify` (model-invoked, same setup) is **not** a fork. Its Skill result is `{success:true, commandName:"simplify"}` with no status or agentId. The skill expands inline, and the main model then launches four ordinary `Agent` tool uses (`run_in_background`). Each gets `background_tasks_changed` + `task_started` (`tool_use_id`, `is_backgrounded:true`, not ambient) and a `meta.json` with `toolUseId`, which is the Q1 pattern. Among the bundled skills, only `code-review` was seen forking, both in the probe and in the census.
+
+**Signals a general mechanism can key on**
+- *Agent tool, foreground or background:* the earliest signal is `task_started` (`tool_use_id`, `task_id` = agent id, not ambient; bg preceded by `background_tasks_changed`). It streams with `parent_tool_use_id` = the Agent tool use. The `.jsonl` is live, and `meta.json.toolUseId` links it back.
+- *Model-invoked Skill fork (`code-review`):* the earliest signal is `task_started` at launch, with `tool_use_id` = the Skill tool use and `task_id` = agent id, but **`ambient:true`**. Only the tool_result `agentId` confirms it at the end. It streams with `parent_tool_use_id` = the Skill tool use, and Skill `tool_progress` heartbeats every 30 s. The `.jsonl` is live, and its `meta.json` has no `toolUseId`.
+- *Typed `/code-review` (local command, Q4):* the earliest signal is `task_started` with `ambient:true`, **no `tool_use_id`**, and `description:"/code-review"`. It does **not** stream; the only live source is the `.jsonl`, polled from disk. The `meta.json` has no `toolUseId`, and older TUI runs have `forked-skill*.json` side files.
+- *Housekeeping:* none found in `subagents/`, so there is nothing to filter. The practical rule is: `ambient` + `local_agent` means a forked skill or typed command; open it by `task_id`, and route its frames by `tool_use_id` when one is present.

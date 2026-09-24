@@ -226,7 +226,10 @@ export class TaskInspectionPanel {
       type.textContent = task.subagentType;
       line.append(type);
     }
-    if (task.status === "running") {
+    // A foreground run (a typed command's) is the turn's own work: the turn's
+    // Cancel stops it, and the per-task stop the CLI offers is for background
+    // work only, so the strip offers none.
+    if (task.status === "running" && task.foreground !== true) {
       const stop = document.createElement("button");
       stop.type = "button";
       stop.className = "chat-task-stop";
@@ -325,5 +328,121 @@ export class TaskInspectionPanel {
     outputNote.textContent = output.truncated ? "Showing the end of the output; earlier lines are trimmed." : "";
     outputNote.hidden = !output.truncated;
     if (this.following) outputText.scrollTop = outputText.scrollHeight;
+  }
+}
+
+// A run that is still working but has said nothing on its live stream for
+// this long is read from its transcript on disk instead (design D14), and
+// re-read at the same cadence for as long as it stays silent. Two seconds:
+// the CLI writes a forked run's transcript live, and a typed command's run
+// streams nothing at all, so this is the only way its drill-down moves.
+export const SILENT_RUN_QUIET_MS = 2_000;
+export const SILENT_RUN_REFRESH_MS = 2_000;
+
+export type SilentRunFollowerOptions = {
+  // One snapshot re-read of the open run; the follower never starts a second
+  // before the first has answered.
+  refresh: (signal: AbortSignal) => Promise<void>;
+  // Whether the surface is on screen; a hidden page skips the read and lets
+  // the next tick try again.
+  active?: () => boolean;
+  onError?: (error: unknown) => void;
+  timers?: Pick<TaskInspectionTimers, "setTimeout" | "clearTimeout">;
+  quietMs?: number;
+  refreshMs?: number;
+};
+
+/**
+ * Follows a silent run from its transcript on disk (design D14). The drill-
+ * down says what the open run is doing — `follow(running)` on every change of
+ * its status — and that its live stream just spoke (`heard()`); the follower
+ * re-reads the run's snapshot once the run has been running and silent for
+ * `quietMs`, then every `refreshMs` while it stays so. A live event puts the
+ * clock back to a full quiet period, so a run that streams never trips it; a
+ * run that settles, or a drill-down that closes (`stop()`), ends it.
+ */
+export class SilentRunFollower {
+  private readonly refresh: SilentRunFollowerOptions["refresh"];
+  private readonly active: () => boolean;
+  private readonly onError: (error: unknown) => void;
+  private readonly timers: Pick<TaskInspectionTimers, "setTimeout" | "clearTimeout">;
+  private readonly quietMs: number;
+  private readonly refreshMs: number;
+  private running = false;
+  private timer: unknown = null;
+  private read: AbortController | null = null;
+
+  constructor(options: SilentRunFollowerOptions) {
+    this.refresh = options.refresh;
+    this.active = options.active ?? (() => true);
+    this.onError = options.onError ?? (() => {});
+    this.timers = options.timers ?? {
+      setTimeout: (fn, ms) => setTimeout(fn, ms),
+      clearTimeout: handle => clearTimeout(handle as ReturnType<typeof setTimeout>),
+    };
+    this.quietMs = options.quietMs ?? SILENT_RUN_QUIET_MS;
+    this.refreshMs = options.refreshMs ?? SILENT_RUN_REFRESH_MS;
+  }
+
+  /** Whether a re-read is scheduled or in flight. */
+  get following(): boolean {
+    return this.timer !== null || this.read !== null;
+  }
+
+  /**
+   * The open run's state. Running starts the quiet clock if it is not
+   * already going; anything else ends the follow, in-flight read included —
+   * the settled run's last word arrives on its own stream.
+   */
+  follow(running: boolean): void {
+    if (running === this.running) return;
+    this.running = running;
+    if (running) this.schedule(this.quietMs);
+    else this.stop();
+  }
+
+  /** The run's live stream spoke: it is not silent, so the quiet clock starts over. */
+  heard(): void {
+    if (!this.running || this.read) return;
+    this.schedule(this.quietMs);
+  }
+
+  /** The drill-down closed or moved to another run. */
+  stop(): void {
+    this.running = false;
+    this.clearTimer();
+    this.read?.abort();
+    this.read = null;
+  }
+
+  private clearTimer(): void {
+    if (this.timer === null) return;
+    this.timers.clearTimeout(this.timer);
+    this.timer = null;
+  }
+
+  private schedule(ms: number): void {
+    this.clearTimer();
+    this.timer = this.timers.setTimeout(() => {
+      this.timer = null;
+      this.tick();
+    }, ms);
+  }
+
+  private tick(): void {
+    if (!this.running) return;
+    if (!this.active()) {
+      this.schedule(this.refreshMs);
+      return;
+    }
+    const read = new AbortController();
+    this.read = read;
+    void this.refresh(read.signal).catch(error => {
+      if (!read.signal.aborted) this.onError(error);
+    }).finally(() => {
+      if (this.read !== read) return;
+      this.read = null;
+      if (this.running && !read.signal.aborted) this.schedule(this.refreshMs);
+    });
   }
 }

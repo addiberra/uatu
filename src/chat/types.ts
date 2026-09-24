@@ -659,7 +659,8 @@ export type CompactionItem = TimelineItemBase & {
  * settles (D8). Running tasks are presented in the composer's live list;
  * settled ones as timeline rows with their outcome and summary. `toolUseId`
  * links the task to the tool row that launched it. Ambient housekeeping
- * tasks never become items.
+ * tasks never become items; an ambient agent run with no launching tool use
+ * becomes a `foreground` item (see the field).
  */
 export type BackgroundTaskItem = TimelineItemBase & {
   type: "background_task";
@@ -688,6 +689,12 @@ export type BackgroundTaskItem = TimelineItemBase & {
   // The child conversation an agent task runs as (`sub:<parent>:<agentId>`),
   // known from the start edge — what makes a running subagent openable.
   childConversationId?: string;
+  // A run Claude Code forked in the foreground with no launching tool use of
+  // its own — the review a typed command starts (design D13). It is a run,
+  // not background work: the subagents track lists it and opens it, while the
+  // composer's background list and the timeline's settled rows skip it (the
+  // command's own output is the timeline's record of it).
+  foreground?: boolean;
 };
 
 /**

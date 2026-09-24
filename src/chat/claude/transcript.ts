@@ -53,9 +53,11 @@ function hashSuffix(input: string): string {
 }
 
 export type TranscriptEntry = {
-  // `system` is admitted for one subtype only: the compaction boundary,
+  // `system` is admitted for two subtypes only: the compaction boundary,
   // which the timeline marks (spec: the timeline marks where compaction
-  // happened) and the readout resets on, live and on reload alike.
+  // happened) and the readout resets on, live and on reload alike; and a
+  // local command's output (`local_command`), which is the store's only
+  // record of what a typed command such as a review printed (design D15).
   kind: "user" | "assistant" | "system";
   uuid: string;
   parentUuid: string | null;
@@ -72,6 +74,10 @@ export type TranscriptEntry = {
   // own figures (camelCase on disk, unlike the live message's snake_case).
   subtype?: string;
   compactMetadata?: { trigger?: string; preTokens?: number; postTokens?: number };
+  // A local command record's own text, as stored: the command's output in
+  // `<local-command-stdout>` markup. The normalizer reads the output out of
+  // it; nothing else of the record is kept.
+  content?: string;
   // The store's own record of a tool's outcome, when present. A Task
   // completion carries the subagent linkage here: agentId, resolvedModel,
   // usage.
@@ -126,9 +132,10 @@ function validateEntry(value: unknown): TranscriptEntry | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const record = value as Record<string, unknown>;
   const compaction = record.type === "system" && record.subtype === "compact_boundary";
-  if (record.type !== "user" && record.type !== "assistant" && !compaction) return null;
+  const localCommand = record.type === "system" && record.subtype === "local_command" && typeof record.content === "string";
+  if (record.type !== "user" && record.type !== "assistant" && !compaction && !localCommand) return null;
   if (typeof record.uuid !== "string" || !record.uuid) return null;
-  const message = compaction ? (record.message ?? {}) : record.message;
+  const message = compaction || localCommand ? (record.message ?? {}) : record.message;
   if (!message || typeof message !== "object" || Array.isArray(message)) return null;
   const timestamp = typeof record.timestamp === "string" ? Date.parse(record.timestamp) : NaN;
   if (Number.isNaN(timestamp)) return null;
@@ -145,6 +152,7 @@ function validateEntry(value: unknown): TranscriptEntry | null {
         ...(typeof metadata?.postTokens === "number" ? { postTokens: metadata.postTokens } : {}),
       },
     } : {}),
+    ...(localCommand ? { subtype: "local_command", content: record.content as string } : {}),
     uuid: record.uuid,
     parentUuid: typeof record.parentUuid === "string" ? record.parentUuid : null,
     timestamp,

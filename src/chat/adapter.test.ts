@@ -2284,6 +2284,30 @@ describe("prompt, abort, permission, and question mutations", () => {
     await adapter.dispose();
   });
 
+  // Design D13: a typed command's run row is the turn's, not background work
+  // the provider lists — the snapshot must neither stop it mid-command nor
+  // lose it, nor read it as background work.
+  test("a foreground run row rides a mid-command snapshot, running, and closes once no turn runs", async () => {
+    const provider = new FakeProvider();
+    provider.agent = { ...provider.agent, capabilities: [...provider.agent.capabilities, "background-tasks"] };
+    provider.sessions = [fixtureSession("session")];
+    (provider as unknown as { listBackgroundTasks: () => Promise<unknown[]> }).listBackgroundTasks = async () => [];
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g" });
+    const projection = adapter.projectionForTests("session");
+    projection.statusUpdate("running");
+    projection.apply({ kind: "upsert", item: { id: "task:rv", type: "background_task", createdAt: 5, taskId: "rv", description: "/code-review", taskType: "local_agent", status: "running", childConversationId: "sub:session:rv", foreground: true } });
+    const during = await adapter.history("session");
+    expect(during.items.filter(item => item.type === "background_task")).toEqual([expect.objectContaining({ id: "task:rv", status: "running", foreground: true })]);
+    expect(during.conversation.status).toBe("running");
+    // The command ended without the run's notification: no turn is live, so
+    // the row is over, and it never made the conversation background work.
+    projection.statusUpdate("completed");
+    const after = await adapter.history("session");
+    expect(after.items.filter(item => item.type === "background_task")).toEqual([expect.objectContaining({ id: "task:rv", status: "stopped" })]);
+    expect(after.conversation.status).toBe("completed");
+    await adapter.dispose();
+  });
+
   test("an agent without the background-tasks capability cannot stop tasks", async () => {
     const provider = new FakeProvider();
     provider.sessions = [fixtureSession("session")];

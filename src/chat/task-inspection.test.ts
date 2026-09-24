@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { parseHTML } from "linkedom";
 
-import { TASK_OUTPUT_REFRESH_MS, TaskInspectionPanel, formatTaskElapsed, runningTaskForChild, taskInspection, taskSettledLabel, taskUsageLabel, type TaskInspectionTimers } from "./task-inspection";
+import { SILENT_RUN_QUIET_MS, SILENT_RUN_REFRESH_MS, SilentRunFollower, TASK_OUTPUT_REFRESH_MS, TaskInspectionPanel, formatTaskElapsed, runningTaskForChild, taskInspection, taskSettledLabel, taskUsageLabel, type TaskInspectionTimers } from "./task-inspection";
 import type { BackgroundTaskItem, BackgroundTaskOutput } from "./types";
 
 describe("task inspection facts", () => {
@@ -217,6 +217,15 @@ describe("task inspection panel", () => {
     view.close();
   });
 
+  test("a foreground run's strip offers no Stop: the turn's own Cancel is its stop", () => {
+    const view = panel();
+    view.show({ conversationId: "one", taskId: "rv", view: "transcript" }, item({ taskId: "rv", description: "/code-review", taskType: "local_agent", childConversationId: "sub:p:rv", foreground: true, createdAt: now - 4_000 }));
+    expect(text("#strip .chat-drilldown-task-description")).toBe("/code-review");
+    expect(text("#strip [data-task-elapsed]")).toBe("0:04");
+    expect(dom.document.querySelector("#strip [data-stop-task]")).toBeNull();
+    view.close();
+  });
+
   test("a task gone from the projection leaves an empty strip rather than a stale one", () => {
     const view = panel();
     view.show({ conversationId: "one", taskId: "x", view: "transcript" }, item({ taskId: "x" }));
@@ -225,6 +234,132 @@ describe("task inspection panel", () => {
     expect(hosts().strip.hidden).toBe(true);
     expect(live()).toHaveLength(0);
     view.close();
+  });
+});
+
+// Design D14: a run that is running and silent is followed from its
+// transcript on disk; a live event, a settle, or a close ends the silence.
+describe("following a silent run", () => {
+  let clock = 0;
+  let pending: Array<{ at: number; fn: () => void; cleared: boolean }> = [];
+  const timers = {
+    setTimeout: (fn: () => void, ms: number) => { const entry = { at: clock + ms, fn, cleared: false }; pending.push(entry); return entry; },
+    clearTimeout: (handle: unknown) => { (handle as { cleared: boolean }).cleared = true; },
+  };
+  // Advances the fake clock, firing each timer that falls due in order.
+  const advance = async (ms: number) => {
+    const until = clock + ms;
+    for (;;) {
+      const next = pending.filter(entry => !entry.cleared && entry.at <= until).sort((a, b) => a.at - b.at)[0];
+      if (!next) break;
+      clock = next.at;
+      next.cleared = true;
+      next.fn();
+      await settle();
+    }
+    clock = until;
+  };
+  let reads: Array<{ at: number; signal: AbortSignal; resolve: () => void; reject: (error: unknown) => void }> = [];
+  let visible = true;
+  let errors: unknown[] = [];
+  const follower = () => new SilentRunFollower({
+    refresh: signal => new Promise<void>((resolve, reject) => { reads.push({ at: clock, signal, resolve, reject }); }),
+    active: () => visible,
+    onError: error => { errors.push(error); },
+    timers,
+  });
+  // Every read answers at once, as a quick snapshot would.
+  const answering = async (ms: number) => {
+    const until = clock + ms;
+    while (clock < until) {
+      await advance(Math.min(250, until - clock));
+      for (const read of reads) read.resolve();
+      await settle();
+    }
+  };
+  beforeEach(() => { clock = 0; pending = []; reads = []; visible = true; errors = []; });
+
+  test("reads only once the run has been running and silent for the quiet period, then on the refresh interval", async () => {
+    expect(SILENT_RUN_QUIET_MS).toBe(2_000);
+    expect(SILENT_RUN_REFRESH_MS).toBe(2_000);
+    const run = follower();
+    // Not running: nothing to follow.
+    run.follow(false);
+    await answering(10_000);
+    expect(reads).toHaveLength(0);
+    run.follow(true);
+    await answering(1_999);
+    expect(reads).toHaveLength(0);
+    await answering(1);
+    expect(reads.map(read => read.at)).toEqual([12_000]);
+    await answering(6_000);
+    expect(reads.map(read => read.at)).toEqual([12_000, 14_000, 16_000, 18_000]);
+    run.stop();
+  });
+
+  test("a live event resets the silence, so a run that streams is never read", async () => {
+    const run = follower();
+    run.follow(true);
+    for (let second = 0; second < 10; second += 1) {
+      await answering(1_500);
+      run.heard();
+    }
+    expect(reads).toHaveLength(0);
+    // It falls silent: the quiet period runs from the last event.
+    await answering(2_000);
+    expect(reads.map(read => read.at)).toEqual([17_000]);
+    run.stop();
+  });
+
+  test("stops when the run settles, in-flight read included", async () => {
+    const run = follower();
+    run.follow(true);
+    await advance(2_000);
+    expect(reads).toHaveLength(1);
+    run.follow(false);
+    expect(reads[0]!.signal.aborted).toBe(true);
+    reads[0]!.resolve();
+    await answering(10_000);
+    expect(reads).toHaveLength(1);
+    expect(run.following).toBe(false);
+  });
+
+  test("stops when the drill-down closes; reopening starts a fresh quiet period", async () => {
+    const run = follower();
+    run.follow(true);
+    await answering(3_000);
+    expect(reads).toHaveLength(1);
+    run.stop();
+    await answering(10_000);
+    expect(reads).toHaveLength(1);
+    expect(run.following).toBe(false);
+    run.follow(true);
+    await answering(2_000);
+    expect(reads.map(read => read.at)).toEqual([2_000, 15_000]);
+    run.stop();
+  });
+
+  test("one read at a time; a failed read is reported and the next tick tries again; a hidden page skips the read", async () => {
+    const run = follower();
+    run.follow(true);
+    await advance(2_000);
+    await advance(10_000);
+    // The first read has not answered: no second one stacks behind it.
+    expect(reads).toHaveLength(1);
+    reads[0]!.reject(new Error("snapshot failed"));
+    await settle();
+    expect(errors).toEqual([new Error("snapshot failed")]);
+    await advance(2_000);
+    expect(reads).toHaveLength(2);
+    reads[1]!.resolve();
+    await settle();
+    visible = false;
+    await answering(6_000);
+    expect(reads).toHaveLength(2);
+    visible = true;
+    await answering(2_000);
+    expect(reads).toHaveLength(3);
+    run.stop();
   });
 });
 
