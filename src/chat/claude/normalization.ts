@@ -1,7 +1,7 @@
 import { boundedSet } from "../../shared/bounded-map";
 import { measureChatWork } from "../performance";
 import type { NormalizedProviderEvent, NormalizedProviderUpdate } from "../provider";
-import { RATE_LIMIT_ITEM_ID, type ContextReportItem, type ConversationItem, type MessageAttachment, type ModelSelection, type TokenUsage } from "../types";
+import { RATE_LIMIT_ITEM_ID, type ContextReportItem, type ConversationItem, type MessageAttachment, type ModelSelection, type StructuredQuestion, type TokenUsage } from "../types";
 import { foldCommandMarkup, parseTaskNotification, readsAsTaskNotification, type TranscriptEntry } from "./transcript";
 
 type RecordValue = Record<string, unknown>;
@@ -67,31 +67,23 @@ export function createClaudeEventMemory(): ClaudeEventMemory {
 
 const MEMORY_LIMIT = 2_048;
 
-// Message types the SDK emits that deliberately carry nothing for the
-// timeline: progress, telemetry, and control chatter whose terminal states
-// are carried elsewhere.
-const INTENTIONALLY_IGNORED = new Set([
+// Message types, and `system` subtypes, the SDK emits that deliberately
+// carry nothing for the timeline: progress, telemetry, and control chatter
+// whose terminal states are carried elsewhere.
+export const INTENTIONALLY_IGNORED: ReadonlySet<string> = new Set([
   "control_request_progress",
-  "local_command_output",
   "hook_started",
   "hook_progress",
   "hook_response",
   "plugin_install",
-  "auth_status",
   "background_tasks_changed",
   "thinking_tokens",
   "session_state_changed",
   "worker_shutting_down",
   "commands_changed",
-  "notification",
-  "files_persisted",
   "tool_use_summary",
-  "elicitation_complete",
-  "permission_denied",
   "prompt_suggestion",
   "mirror_error",
-  "informational",
-  "conversation_reset",
   "user_message_replay",
 ]);
 
@@ -169,6 +161,52 @@ function describeRules(value: unknown): string | null {
   return rules.join(", ");
 }
 
+/**
+ * What a tool-approval request becomes (D5): `AskUserQuestion` a structured
+ * question card, a completed plan (`ExitPlanMode`) its own review card, and
+ * every other tool the generic permission card.
+ */
+export type ClaudeToolInteraction =
+  | { kind: "question"; questions: StructuredQuestion[] }
+  | { kind: "plan"; plan: string }
+  | { kind: "permission" };
+
+export function claudeToolInteraction(toolName: string, input: Record<string, unknown>): ClaudeToolInteraction {
+  const questions = toolName === "AskUserQuestion" ? normalizeAskUserQuestions(input) : null;
+  if (questions) return { kind: "question", questions };
+  if (toolName === "ExitPlanMode" && typeof input.plan === "string") return { kind: "plan", plan: input.plan };
+  return { kind: "permission" };
+}
+
+/** AskUserQuestion input → the shared structured-question shape. */
+export function normalizeAskUserQuestions(input: Record<string, unknown>): StructuredQuestion[] | null {
+  if (!Array.isArray(input.questions) || input.questions.length === 0) return null;
+  const questions: StructuredQuestion[] = [];
+  for (const value of input.questions) {
+    if (!value || typeof value !== "object") return null;
+    const record = value as Record<string, unknown>;
+    if (typeof record.question !== "string") return null;
+    const options = Array.isArray(record.options)
+      ? record.options.flatMap(option => {
+        if (!option || typeof option !== "object") return [];
+        const optionRecord = option as Record<string, unknown>;
+        if (typeof optionRecord.label !== "string") return [];
+        return [{ label: optionRecord.label, description: typeof optionRecord.description === "string" ? optionRecord.description : "" }];
+      })
+      : [];
+    questions.push({
+      prompt: record.question,
+      header: typeof record.header === "string" ? record.header : "",
+      options,
+      multiple: record.multiSelect === true,
+      // Claude Code's "Other" free-form entry is host-provided, not an
+      // option in the schema — the host always offers it.
+      allowFreeForm: true,
+    });
+  }
+  return questions;
+}
+
 export function claudeModelSelection(modelId: string): ModelSelection {
   return { providerId: "anthropic", modelId };
 }
@@ -176,6 +214,10 @@ export function claudeModelSelection(modelId: string): ModelSelection {
 /**
  * One SDK stream message → the shared provider-event envelope, minus the
  * conversation id (the owning session stamps it).
+ *
+ * Public boundary: every failure mode resolves to an outcome rather than an
+ * exception, so a recognized message whose payload breaks its case costs one
+ * message instead of the session's pump (the OpenCode boundary's rule).
  */
 export function normalizeClaudeMessage(
   value: unknown,
@@ -184,6 +226,20 @@ export function normalizeClaudeMessage(
   // The owning native session, when known: what a Task completion's child
   // conversation id is derived from (`sub:<parent>:<agentId>`).
   parentSessionId?: string,
+): Omit<NormalizedProviderEvent, "conversationId"> {
+  try {
+    return normalizeMessage(value, memory, source, parentSessionId);
+  } catch {
+    const type = asRecord(value).type;
+    return { updates: [], eventType: typeof type === "string" ? type : "", outcome: "unparseable" };
+  }
+}
+
+function normalizeMessage(
+  value: unknown,
+  memory: ClaudeEventMemory,
+  source: ClaudeNormalizationSource,
+  parentSessionId: string | undefined,
 ): Omit<NormalizedProviderEvent, "conversationId"> {
   const record = asRecord(value);
   const type = typeof record.type === "string" ? record.type : "";
@@ -195,7 +251,9 @@ export function normalizeClaudeMessage(
     // attribution and report it as the conversation's configuration.
     const reportedInit = typeof record.model === "string" ? record.model : undefined;
     const model = reportedInit !== undefined ? (memory.resolveModel?.(reportedInit) ?? reportedInit) : undefined;
-    if (record.subtype === "init" && model) {
+    if (record.subtype === "init") {
+      // An init that names no model has nothing to configure.
+      if (!model) return { ...base, outcome: "ignored" };
       memory.lastModel = model;
       return { ...base, outcome: "handled", configuration: { model: claudeModelSelection(model) } };
     }
@@ -294,7 +352,12 @@ export function normalizeClaudeMessage(
     if (record.subtype === "task_started" || record.subtype === "task_progress" || record.subtype === "task_updated" || record.subtype === "task_notification") {
       return backgroundTaskUpdate(record, memory, base);
     }
-    return { ...base, outcome: "ignored" };
+    // A subtype with no case is dropped on purpose only when the ignore list
+    // names it; anything else is new vocabulary, counted under its subtype so
+    // the discard metric says which one.
+    const subtype = typeof record.subtype === "string" && record.subtype ? record.subtype : "";
+    if (INTENTIONALLY_IGNORED.has(subtype)) return { ...base, outcome: "ignored" };
+    return { ...base, outcome: "unrecognized", eventType: subtype ? `system.${subtype}` : "system" };
   }
 
   // A heartbeat for a tool still running without output: the row gains an
@@ -425,7 +488,8 @@ export function normalizeClaudeMessage(
         updates.push({ kind: "remove", itemId: `message:stream:${message.id}:${index}` });
       }
     }
-    updates.push(...contentBlockUpdates(asArray(message.content), envelope, memory));
+    const skippedBlocks: string[] = [];
+    updates.push(...contentBlockUpdates(asArray(message.content), envelope, memory, skippedBlocks));
     const usage = subagentFrame ? undefined : tokensToUsage(message.usage);
     // Each assistant message's usage is ONE API call's accounting, and its
     // input + cache read + cache write is the window occupancy after that
@@ -454,6 +518,7 @@ export function normalizeClaudeMessage(
       updates,
       ...(usage ? { assistantUsage: { messageId: envelope.uuid, usage } } : {}),
       ...(model ? { assistantModel: { messageId: envelope.uuid, model, createdAt: envelope.createdAt } } : {}),
+      ...(skippedBlocks.length ? { skippedBlocks } : {}),
     };
   }
 
@@ -462,6 +527,11 @@ export function normalizeClaudeMessage(
     if (!envelope) return { ...base, outcome: "unparseable" };
     const message = asRecord(record.message);
     const blocks = contentBlocks(message.content);
+    // Unknown blocks are reported whatever becomes of the frame — a live
+    // echo or an otherwise empty record is dropped, but what it carried
+    // that no reader handles is still counted.
+    const skipped = skippedBlockTypes(blocks, USER_BLOCKS);
+    const frame = { ...base, ...(skipped.length ? { skippedBlocks: skipped } : {}) };
     const results = blocks.filter(block => block.type === "tool_result");
     if (results.length > 0) {
       const toolOutcome = asRecord(record.toolUseResult ?? record.tool_use_result);
@@ -469,17 +539,17 @@ export function normalizeClaudeMessage(
         .map(block => toolResultUpdate(block, envelope, memory, toolOutcome, parentSessionId))
         .filter((update): update is NormalizedProviderUpdate => update !== null);
       rememberFrameItems(memory, envelope.uuid, updates);
-      return { ...base, outcome: updates.length > 0 ? "handled" : "ignored", updates };
+      return { ...frame, outcome: updates.length > 0 ? "handled" : "ignored", updates };
     }
     if (source === "live") {
       // The provider minted this user message when it accepted the prompt.
-      return { ...base, outcome: "ignored" };
+      return { ...frame, outcome: "ignored" };
     }
     // A record the CLI wrote on the person's behalf — a skill's preamble,
     // a local-command caveat, an image caption — is not the person's words
     // and gets no bubble (spec: harness-authored records are never
     // presented as the user's messages).
-    if (record.isMeta === true) return { ...base, outcome: "ignored" };
+    if (record.isMeta === true) return { ...frame, outcome: "ignored" };
     const rawText = typeof message.content === "string"
       ? message.content
       : blocks.filter(block => block.type === "text" && typeof block.text === "string").map(block => block.text as string).join("\n");
@@ -497,8 +567,8 @@ export function normalizeClaudeMessage(
     if (readsAsTaskNotification(authored, rawText)) {
       const notification = parseTaskNotification(rawText);
       // A notification that fails to parse shows nothing rather than its markup.
-      if (!notification) return { ...base, outcome: "ignored" };
-      return backgroundTaskUpdate(storedNotificationRecord(notification, record, memory), memory, base);
+      if (!notification) return { ...frame, outcome: "ignored" };
+      return backgroundTaskUpdate(storedNotificationRecord(notification, record, memory), memory, frame);
     }
     // A slash command is stored as tag markup; the bubble shows what was
     // typed, the same fold the session title reads.
@@ -513,9 +583,9 @@ export function normalizeClaudeMessage(
         const mimeType = typeof media === "string" ? media : "image/png";
         return { name: `attachment-${index + 1}.${mimeType.split("/")[1] ?? "png"}`, mimeType };
       });
-    if (!text && attachments.length === 0) return { ...base, outcome: "ignored" };
+    if (!text && attachments.length === 0) return { ...frame, outcome: "ignored" };
     return {
-      ...base,
+      ...frame,
       outcome: "handled",
       updates: [{ kind: "upsert", item: {
         id: `message:${envelope.uuid}`,
@@ -628,10 +698,25 @@ function contentBlocks(content: unknown): Block[] {
   return asArray(content).filter((block): block is Block => Boolean(block) && typeof block === "object");
 }
 
-function contentBlockUpdates(content: unknown[], envelope: Envelope, memory: ClaudeEventMemory): NormalizedProviderUpdate[] {
+// Block types each role's walker reads. Anything else inside a recognized
+// message is skipped and reported by type (never payload), so an unknown
+// block is measured the way an unknown message is.
+const ASSISTANT_BLOCKS: ReadonlySet<string> = new Set(["text", "thinking", "tool_use"]);
+const USER_BLOCKS: ReadonlySet<string> = new Set(["text", "image", "tool_result"]);
+
+function skippedBlockTypes(blocks: unknown[], known: ReadonlySet<string>): string[] {
+  return blocks.flatMap(value => {
+    const type = asRecord(value).type;
+    const name = typeof type === "string" && type ? type : "unknown";
+    return known.has(name) ? [] : [name];
+  });
+}
+
+function contentBlockUpdates(content: unknown[], envelope: Envelope, memory: ClaudeEventMemory, skipped: string[]): NormalizedProviderUpdate[] {
   const updates: NormalizedProviderUpdate[] = [];
   const texts: string[] = [];
   let reasoningIndex = 0;
+  skipped.push(...skippedBlockTypes(content, ASSISTANT_BLOCKS));
   for (const value of content) {
     const block = asRecord(value);
     if (block.type === "text" && typeof block.text === "string") {
