@@ -960,7 +960,9 @@ function credentialCard(credential) {
   overview.appendChild(readinessText);
   body.appendChild(overview);
   const assignments = credential.assignments || [];
-  if (assignments.some(item => dashboardWorkspaces.some(workspace => workspace.id === item.workspaceId && workspace.credentialRestartRequired))) {
+  // The server flags credentialRestartRequired on the RUNNING row, which for a
+  // linked worktree is the child while the assignment names its parent.
+  if (assignments.some(item => dashboardWorkspaces.some(workspace => workspace.credentialRestartRequired && workspacePolicyOwner(workspace).id === item.workspaceId))) {
     overview.appendChild(el("p", "credential-summary restart-required", "Restart required: assignment changes apply fully when the running workspace session restarts."));
   }
   const actionSection = el("section", "credential-section");
@@ -1354,8 +1356,23 @@ async function prepareWorkspaceResume(workspace, errorTarget) {
   return !locked.length || await unlockForWorkspace(workspace, locked);
 }
 function workspaceLabel(w) { return (w.parentId && w.branch) || w.displayName || w.id; }
+// The workspace whose credentialAssignments are a row's EFFECTIVE policy: a
+// linked worktree's parent (the server resolves policy the same way), else
+// the workspace itself. The server never lists a child without its parent; if
+// the list is ever inconsistent the row falls back to itself rather than to a
+// fabricated owner.
 function workspacePolicyOwner(workspace) {
   return dashboardWorkspaces.find(entry => entry.id === (workspace.parentId || workspace.id)) || workspace;
+}
+// Row summary of a workspace's effective credential policy. A linked
+// worktree's own credentialAssignments field is empty by design (the state API
+// never claims a child holds assignments), so its row summarises the parent's
+// assignments and discloses the inheritance rather than reporting "no
+// credentials" on a working checkout.
+function workspaceCredentialSummary(w) {
+  const owner = workspacePolicyOwner(w);
+  const summary = credentialAssignmentSummary(owner.credentialAssignments);
+  return owner === w ? summary : summary + " · inherited from " + workspaceLabel(owner);
 }
 function workspaceById(id) {
   return dashboardWorkspaces.find(entry => entry.id === id)
@@ -1693,7 +1710,7 @@ async function refresh(force) {
       title: workspaceLabel(w),
       href: sessionUrl(w.id),
       path: w.path,
-      detail: credentialAssignmentSummary(w.credentialAssignments) + " · " + shellSummary(w.shells),
+      detail: workspaceCredentialSummary(w) + " · " + shellSummary(w.shells),
       live: true,
       buttons: [
         {
@@ -1724,7 +1741,7 @@ async function refresh(force) {
     ...stopped.map(w => row({
       title: workspaceLabel(w),
       path: w.path,
-      detail: credentialAssignmentSummary(w.credentialAssignments),
+      detail: workspaceCredentialSummary(w),
       live: false,
       buttons: [
         {
@@ -1770,7 +1787,7 @@ async function refresh(force) {
         // the capability signal and the family's base path. Every worktree
         // view is rendered here by the same client module the in-workspace
         // picker embeds; nothing navigates to a server-rendered page.
-        const parent = dashboardWorkspaces.find(entry => entry.id === (w.parentId || w.id)) || w;
+        const parent = workspacePolicyOwner(w);
         const target = {
           api: state.worktreeApi,
           source: {
