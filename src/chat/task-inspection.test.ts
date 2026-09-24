@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { parseHTML } from "linkedom";
 
-import { SILENT_RUN_QUIET_MS, SILENT_RUN_REFRESH_MS, SilentRunFollower, TASK_OUTPUT_REFRESH_MS, TaskInspectionPanel, formatTaskElapsed, runningTaskForChild, taskInspection, taskSettledLabel, taskUsageLabel, type TaskInspectionTimers } from "./task-inspection";
+import { SILENT_RUN_QUIET_MS, SILENT_RUN_REFRESH_MS, SILENT_RUN_SETTLE_READS, SilentRunFollower, TASK_OUTPUT_REFRESH_MS, TaskInspectionPanel, formatTaskElapsed, runningTaskForChild, taskInspection, taskSettledLabel, taskUsageLabel, type TaskInspectionTimers } from "./task-inspection";
 import type { BackgroundTaskItem, BackgroundTaskOutput } from "./types";
 
 describe("task inspection facts", () => {
@@ -259,11 +259,13 @@ describe("following a silent run", () => {
     }
     clock = until;
   };
-  let reads: Array<{ at: number; signal: AbortSignal; resolve: () => void; reject: (error: unknown) => void }> = [];
+  // A read resolves to whether it found the run still running, as the
+  // drill-down's re-read does; undefined is a read that did not apply.
+  let reads: Array<{ at: number; signal: AbortSignal; resolve: (running?: boolean) => void; reject: (error: unknown) => void }> = [];
   let visible = true;
   let errors: unknown[] = [];
   const follower = () => new SilentRunFollower({
-    refresh: signal => new Promise<void>((resolve, reject) => { reads.push({ at: clock, signal, resolve, reject }); }),
+    refresh: signal => new Promise<boolean | undefined>((resolve, reject) => { reads.push({ at: clock, signal, resolve, reject }); }),
     active: () => visible,
     onError: error => { errors.push(error); },
     timers,
@@ -311,16 +313,123 @@ describe("following a silent run", () => {
     run.stop();
   });
 
-  test("stops when the run settles, in-flight read included", async () => {
+  test("a run whose stream spoke stops when it settles, in-flight read included, and is not read again", async () => {
     const run = follower();
     run.follow(true);
+    // It stalled long enough to be read, then its stream carried its last word.
     await advance(2_000);
     expect(reads).toHaveLength(1);
+    run.heard();
     run.follow(false);
     expect(reads[0]!.signal.aborted).toBe(true);
     reads[0]!.resolve();
     await answering(10_000);
     expect(reads).toHaveLength(1);
+    expect(run.following).toBe(false);
+    // A streamed run that never stalled pays nothing at its settle.
+    const streamed = follower();
+    streamed.follow(true);
+    for (let second = 0; second < 5; second += 1) {
+      await answering(1_500);
+      streamed.heard();
+    }
+    streamed.follow(false);
+    await answering(10_000);
+    expect(reads).toHaveLength(1);
+    expect(streamed.following).toBe(false);
+  });
+
+  // The typed command's run: nothing streams, so its last records reach the
+  // open view only through a read made after the settle.
+  test("a run that settles while silent is read at once and once more a refresh period later, then never", async () => {
+    expect(SILENT_RUN_SETTLE_READS).toBe(2);
+    const run = follower();
+    run.follow(true);
+    await answering(2_000);
+    await advance(2_000);
+    expect(reads.map(read => read.at)).toEqual([2_000, 4_000]);
+    // The settle lands while a read is in flight: that read may predate the
+    // last records, so a fresh one replaces it rather than being dropped.
+    run.follow(false);
+    expect(reads[1]!.signal.aborted).toBe(true);
+    expect(reads.map(read => read.at)).toEqual([2_000, 4_000, 4_000]);
+    expect(reads[2]!.signal.aborted).toBe(false);
+    reads[1]!.resolve(true);
+    reads[2]!.resolve(false);
+    await settle();
+    await answering(2_000);
+    expect(reads.map(read => read.at)).toEqual([2_000, 4_000, 4_000, 6_000]);
+    await answering(20_000);
+    expect(reads).toHaveLength(4);
+    expect(run.following).toBe(false);
+    // Nothing the run says after its settle starts the follow again.
+    run.heard();
+    await answering(10_000);
+    expect(reads).toHaveLength(4);
+  });
+
+  test("a run that settles before its first silent read still gets its settle reads", async () => {
+    const run = follower();
+    run.follow(true);
+    await answering(1_000);
+    expect(reads).toHaveLength(0);
+    run.follow(false);
+    reads[0]!.resolve(false);
+    await settle();
+    await answering(20_000);
+    expect(reads.map(read => read.at)).toEqual([1_000, 3_000]);
+    expect(run.following).toBe(false);
+  });
+
+  test("a read that itself finds the run settled counts as the first settle read", async () => {
+    const run = follower();
+    run.follow(true);
+    await advance(2_000);
+    expect(reads).toHaveLength(1);
+    reads[0]!.resolve(false);
+    await settle();
+    await answering(20_000);
+    expect(reads.map(read => read.at)).toEqual([2_000, 4_000]);
+    expect(run.following).toBe(false);
+    // The view's own settle, arriving afterwards, finds the follow over.
+    run.follow(false);
+    await answering(10_000);
+    expect(reads).toHaveLength(2);
+  });
+
+  test("closing the drill-down cancels the settle reads, in flight or still due", async () => {
+    const run = follower();
+    run.follow(true);
+    run.follow(false);
+    expect(reads).toHaveLength(1);
+    run.stop();
+    expect(reads[0]!.signal.aborted).toBe(true);
+    reads[0]!.resolve();
+    await answering(20_000);
+    expect(reads).toHaveLength(1);
+    expect(run.following).toBe(false);
+    // Closed between the two: the second never comes.
+    run.follow(true);
+    run.follow(false);
+    await answering(1_000);
+    expect(reads).toHaveLength(2);
+    run.stop();
+    await answering(20_000);
+    expect(reads).toHaveLength(2);
+    expect(run.following).toBe(false);
+  });
+
+  test("a hidden page holds the settle reads until it is shown, without spending them", async () => {
+    const run = follower();
+    run.follow(true);
+    visible = false;
+    run.follow(false);
+    await answering(10_000);
+    expect(reads).toHaveLength(0);
+    expect(run.following).toBe(true);
+    visible = true;
+    await answering(20_000);
+    expect(reads.map(read => read.at)).toEqual([12_000, 14_000]);
     expect(run.following).toBe(false);
   });
 

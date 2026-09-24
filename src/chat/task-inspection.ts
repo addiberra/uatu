@@ -339,10 +339,28 @@ export class TaskInspectionPanel {
 export const SILENT_RUN_QUIET_MS = 2_000;
 export const SILENT_RUN_REFRESH_MS = 2_000;
 
+// The reads a run gets when it settles while silent: one as soon as the
+// settle is known, and one more a refresh period later. A typed command's run
+// never streams, so its last records (the closing thought, then the review
+// itself) reach an open drill-down only through a read made after the settle.
+// The CLI appends a run's records as they arrive and announces the settle
+// once the run has returned; the re-check on CLI 2.1.280 found the final text
+// on disk by the time the settle showed, so the first read is the one that
+// matters. The second is a bounded guard against a transcript flushed just
+// behind the announcement. A read that brought nothing new cannot tell a
+// complete transcript from a late one, and a read that did bring something
+// may hold the thought without the text, since they are separate records, so
+// the guard does not depend on what the first read found. Then nothing more:
+// a settled run is never polled.
+export const SILENT_RUN_SETTLE_READS = 2;
+
 export type SilentRunFollowerOptions = {
-  // One snapshot re-read of the open run; the follower never starts a second
-  // before the first has answered.
-  refresh: (signal: AbortSignal) => Promise<void>;
+  // One snapshot re-read of the open run, folded into the view. It resolves
+  // to whether the read found the run still running, or to undefined when
+  // the read did not apply (the drill-down moved on, or the page was older
+  // than what the view already holds). The follower never starts a second
+  // read before the first has answered.
+  refresh: (signal: AbortSignal) => Promise<boolean | undefined>;
   // Whether the surface is on screen; a hidden page skips the read and lets
   // the next tick try again.
   active?: () => boolean;
@@ -355,11 +373,14 @@ export type SilentRunFollowerOptions = {
 /**
  * Follows a silent run from its transcript on disk (design D14). The drill-
  * down says what the open run is doing — `follow(running)` on every change of
- * its status — and that its live stream just spoke (`heard()`); the follower
- * re-reads the run's snapshot once the run has been running and silent for
- * `quietMs`, then every `refreshMs` while it stays so. A live event puts the
- * clock back to a full quiet period, so a run that streams never trips it; a
- * run that settles, or a drill-down that closes (`stop()`), ends it.
+ * its status — and that its live stream just carried the run's words
+ * (`heard()`); the follower re-reads the run's snapshot once the run has been
+ * running and silent for `quietMs`, then every `refreshMs` while it stays so.
+ * A live event puts the clock back to a full quiet period, so a run that
+ * streams never trips it. A run that settles after streaming ends the follow,
+ * since its last word came the same way; a run that settles while silent gets
+ * its settle reads (`SILENT_RUN_SETTLE_READS`) first. A drill-down that closes
+ * (`stop()`) ends everything, settle reads included.
  */
 export class SilentRunFollower {
   private readonly refresh: SilentRunFollowerOptions["refresh"];
@@ -369,6 +390,12 @@ export class SilentRunFollower {
   private readonly quietMs: number;
   private readonly refreshMs: number;
   private running = false;
+  // Whether the live stream has carried the run's words since the last read
+  // began, or since the follow began: when it has at the settle, the run's
+  // last word arrived that way and the disk has nothing to add.
+  private spoke = false;
+  // The reads still owed to a run that settled while silent.
+  private settleReads = 0;
   private timer: unknown = null;
   private read: AbortController | null = null;
 
@@ -391,25 +418,45 @@ export class SilentRunFollower {
 
   /**
    * The open run's state. Running starts the quiet clock if it is not
-   * already going; anything else ends the follow, in-flight read included —
-   * the settled run's last word arrives on its own stream.
+   * already going. Settling after the stream spoke ends the follow, in-flight
+   * read included. Settling while silent starts the settle reads at once; a
+   * read already in flight is superseded, since it may have been made before
+   * the run's last records were written.
    */
   follow(running: boolean): void {
     if (running === this.running) return;
-    this.running = running;
-    if (running) this.schedule(this.quietMs);
-    else this.stop();
+    if (running) {
+      this.running = true;
+      this.spoke = false;
+      this.settleReads = 0;
+      // A settle read still in flight schedules the next read when it answers.
+      if (!this.read) this.schedule(this.quietMs);
+      return;
+    }
+    const spoke = this.spoke;
+    this.stop();
+    if (spoke) return;
+    this.settleReads = SILENT_RUN_SETTLE_READS;
+    this.tick();
   }
 
-  /** The run's live stream spoke: it is not silent, so the quiet clock starts over. */
+  /**
+   * The run's live stream carried its words (a record, or text arriving): it
+   * is not silent, so the quiet clock starts over. A status change alone is
+   * not the run speaking, and the caller does not report one.
+   */
   heard(): void {
-    if (!this.running || this.read) return;
+    if (!this.running) return;
+    this.spoke = true;
+    if (this.read) return;
     this.schedule(this.quietMs);
   }
 
   /** The drill-down closed or moved to another run. */
   stop(): void {
     this.running = false;
+    this.spoke = false;
+    this.settleReads = 0;
     this.clearTimer();
     this.read?.abort();
     this.read = null;
@@ -430,19 +477,35 @@ export class SilentRunFollower {
   }
 
   private tick(): void {
-    if (!this.running) return;
+    if (this.read || (!this.running && this.settleReads === 0)) return;
+    // A hidden page makes no read, and a settle read waits for the page to
+    // come back rather than being spent.
     if (!this.active()) {
       this.schedule(this.refreshMs);
       return;
     }
+    if (!this.running) this.settleReads -= 1;
+    this.spoke = false;
     const read = new AbortController();
     this.read = read;
     void this.refresh(read.signal).catch(error => {
       if (!read.signal.aborted) this.onError(error);
-    }).finally(() => {
+      return undefined;
+    }).then(stillRunning => {
+      // Superseded or stopped: whoever did that owns what happens next.
       if (this.read !== read) return;
       this.read = null;
-      if (this.running && !read.signal.aborted) this.schedule(this.refreshMs);
+      if (stillRunning === false && this.running) {
+        // The read itself found the run settled. It read the transcript after
+        // the settle, as a settle read would, so it counts as the first one.
+        this.running = false;
+        this.settleReads = this.spoke ? 0 : SILENT_RUN_SETTLE_READS - 1;
+      } else if (stillRunning === true && !this.running) {
+        // The view now holds the run as running again: follow it as such.
+        this.follow(true);
+        return;
+      }
+      if (this.running || this.settleReads > 0) this.schedule(this.refreshMs);
     });
   }
 }

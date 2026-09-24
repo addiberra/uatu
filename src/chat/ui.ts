@@ -329,14 +329,16 @@ export function initChat(api = new ChatApiClient()): void {
     refresh: async signal => {
       const open = child;
       const generation = childGeneration;
-      if (!open?.projection) return;
+      if (!open?.projection) return undefined;
       const page = await api.snapshot(open.conversationId, undefined, signal);
-      if (signal.aborted || generation !== childGeneration || child !== open || !open.projection) return;
+      if (signal.aborted || generation !== childGeneration || child !== open || !open.projection) return undefined;
       const refreshed = refreshFromSnapshot(open.projection, page);
-      if (!refreshed) return;
+      if (!refreshed) return undefined;
       open.projection = refreshed.projection;
       if (refreshed.changed) { announceChild(""); renderChild(true); }
-      silentRun.follow(isLiveConversationStatus(open.projection.status));
+      // The follower applies the status the read found itself: a read that
+      // finds the run settled is already a read made after the settle.
+      return isLiveConversationStatus(open.projection.status);
     },
     active: () => chatSurfaceActive(),
   });
@@ -3616,8 +3618,11 @@ export function initChat(api = new ChatApiClient()): void {
         if (result.outcome === "applied") {
           announceChild("");
           renderChild(true);
-          // The run spoke: it is not silent, and its status may have settled.
-          silentRun.heard();
+          // A record or its text arriving is the run speaking, so it is not
+          // silent. A status change is not: a run that never streams must
+          // still read as silent when it settles, so that it gets the reads
+          // that bring in its last records.
+          if (event.type === "item.upsert" || event.type === "item.text_delta" || event.type === "item.remove") silentRun.heard();
           silentRun.follow(isLiveConversationStatus(entry.projection.status));
         }
       },

@@ -33,9 +33,10 @@ src/
 │                   receipt-view itemizes by agent, type, or model;
 │                   task-inspection drives the running-task drill-down —
 │                   an agent task's live child transcript, a shell task's
-│                   output tail; surface says whether the chat is the
-│                   surface in front, which the hub switcher's viewed
-│                   acknowledgement also reads);
+│                   output tail, and the re-read from disk that follows a
+│                   run which streams nothing; surface says whether the
+│                   chat is the surface in front, which the hub switcher's
+│                   viewed acknowledgement also reads);
 │                   agent-specific stacks below the seam in
 │                   chat/opencode/ (the loopback server runtime, which
 │                   decides the spawned server's generation from its

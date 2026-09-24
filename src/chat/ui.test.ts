@@ -1755,6 +1755,68 @@ describe("a typed command's silent run", () => {
       window.dispatchEvent(new Event("pagehide"));
     }
   }, 15_000);
+  test("a drill-down left open through the settle shows the run's last records, and closing it cancels the reads still due", async () => {
+    const { document, window } = parseHTML(html);
+    installDomGlobals(document, window);
+    document.documentElement.setAttribute("data-ui-mode", "desktop");
+    document.documentElement.setAttribute("data-chat-panel", "open");
+    stubConversationSelect(document);
+    const childReads: number[] = [];
+    let streamed: { event(event: unknown, cursor: string): void } | undefined;
+    // The child's replay position and what its transcript on disk holds. The
+    // run's last record is written before its settle is announced, and only
+    // to disk: a typed command's run streams nothing.
+    let sequence = 0;
+    let settled = false;
+    const cursorAt = (at: number) => Buffer.from(JSON.stringify({ v: 1, g: "g", s: at })).toString("base64url");
+    const api = taskApi(document, {
+      items: id => id === "one"
+        ? [
+          { id: "message:u", type: "user_message", createdAt: 1, text: "/code-review low" },
+          { id: "task:rv", type: "background_task", createdAt: 2, taskId: "rv", description: "/code-review", taskType: "local_agent", status: "running", subagentType: "general-purpose", childConversationId: "child", foreground: true },
+        ]
+        : [
+          { id: "message:r1", type: "assistant_message", createdAt: 11, markdown: "Review step 1" },
+          ...(settled ? [{ id: "message:r2", type: "assistant_message", createdAt: 12, markdown: "Final review text" }] : []),
+        ],
+      onSnapshot: id => { if (id === "child") childReads.push(Date.now()); },
+      onStream: (id, handlers) => { if (id === "child") streamed = handlers; },
+      childSnapshot: () => ({ cursor: cursorAt(sequence), status: settled ? "completed" : "running" }),
+    });
+    const drilldown = document.querySelector<HTMLElement>("#chat-drilldown")!;
+    const items = () => document.querySelector("#chat-drilldown-items")?.textContent ?? "";
+    const click = (element: Element) => element.dispatchEvent(new window.Event("click", { bubbles: true }) as unknown as Event);
+    try {
+      const { initChat } = await import(`./ui.ts?silent-run-settle-ui-test=${Date.now()}`);
+      initChat(api);
+      const trackRow = () => document.querySelector<HTMLButtonElement>('#chat-subagents [data-open-conversation="child"]');
+      await waitUntil(() => trackRow() != null, () => document.querySelector("#chat-subagents")?.textContent ?? "no track");
+      click(trackRow()!);
+      await waitUntil(() => items().includes("Review step 1") && streamed != null, items);
+      expect(childReads.length).toBe(1);
+
+      // The run finishes: its last record lands on disk, then the settle
+      // arrives on the child's stream as a status change and nothing else.
+      settled = true;
+      sequence = 1;
+      const settledAt = Date.now();
+      streamed!.event({ type: "conversation.status", generation: "g", sequence: 1, conversationId: "child", status: "completed" }, cursorAt(1));
+      // Read at the settle, not a quiet period later.
+      await waitUntil(() => items().includes("Final review text"), () => `the run's last record; the drill-down holds "${items()}"`);
+      expect(Date.now() - settledAt).toBeLessThan(1_000);
+      expect(childReads.length).toBe(2);
+      expect(drilldown.hidden).toBe(false);
+
+      // Closed before the guard read falls due: it never comes.
+      click(document.querySelector<HTMLButtonElement>("#chat-drilldown-back")!);
+      expect(drilldown.hidden).toBe(true);
+      await Bun.sleep(2_500);
+      expect(childReads.length).toBe(2);
+    } finally {
+      await Bun.sleep(20);
+      window.dispatchEvent(new Event("pagehide"));
+    }
+  }, 15_000);
 });
 
 describe("chat running work reachable without a disclosure", () => {
@@ -1856,6 +1918,8 @@ function taskApi(document: Document, options: {
   onSnapshot?: (conversationId: string) => void;
   onStream?: (conversationId: string, handlers: { event(event: unknown, cursor: string): void }) => void;
   conversations?: string[];
+  // A child's snapshot as the server would state it: its cursor and status.
+  childSnapshot?: () => { cursor: string; status: string };
 }): ChatApiClient {
   return {
     status: async () => ([{
@@ -1866,7 +1930,8 @@ function taskApi(document: Document, options: {
     commands: async () => [],
     snapshot: async (id: string) => {
       options.onSnapshot?.(id);
-      return { ...snapshot(id), conversation: { ...conversation(id), status: id === "one" ? "background" : "running" }, items: options.items(id) };
+      const stated = id === "one" ? undefined : options.childSnapshot?.();
+      return { ...snapshot(id), ...(stated ? { cursor: stated.cursor } : {}), conversation: { ...conversation(id), status: id === "one" ? "background" : stated?.status ?? "running" }, items: options.items(id) };
     },
     stream: (conversationId: string, _cursor: string, handlers: { event(event: unknown, cursor: string): void }) => {
       options.onStream?.(conversationId, handlers);
