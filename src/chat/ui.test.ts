@@ -26,9 +26,10 @@ if (process.env[CHILD_PROCESS_FLAG] !== "1") {
       ]);
       expect(exitCode, `${stdout}\n${stderr}`).toBe(0);
       // The child runs this whole file, including a case that waits on the
-      // surface's one-second clock; the default five seconds leaves it no
-      // room, and a timeout here reports as the wrong test failing.
-    }, 30_000);
+      // surface's one-second clock and two that wait out the output view's
+      // four-second retry; the default five seconds leaves it no room, and a
+      // timeout here reports as the wrong test failing.
+    }, 60_000);
   });
 } else {
 describe("chat reversible-history composer", () => {
@@ -1688,6 +1689,73 @@ describe("chat running-task inspection", () => {
       window.dispatchEvent(new Event("pagehide"));
     }
   });
+
+  // The output view has no child stream whose next event would take a read
+  // error down, so the recovery the panel reports is what clears the line.
+  // Real timers: the retry after one failure is four seconds out.
+  const openFailingOutputView = async (label: string, reads: Array<() => { text: string; truncated: boolean; settled: boolean } | null>) => {
+    const { document, window } = parseHTML(html);
+    installDomGlobals(document, window);
+    document.documentElement.setAttribute("data-ui-mode", "desktop");
+    document.documentElement.setAttribute("data-chat-panel", "open");
+    stubConversationSelect(document);
+    let read = 0;
+    const api = taskApi(document, {
+      items: () => [
+        { id: "message:u", type: "user_message", createdAt: 1, text: "run the tests" },
+        { id: "task:bgjpa", type: "background_task", createdAt: 2, taskId: "bgjpa", description: "bun test", taskType: "local_bash", toolUseId: "toolu_2", status: "running", outputFile: "/tmp/tasks/bgjpa.output" },
+      ],
+      output: () => { const answer = reads[Math.min(read, reads.length - 1)]!; read += 1; return answer(); },
+    });
+    const { initChat } = await import(`./ui.ts?${label}=${Date.now()}`);
+    initChat(api);
+    const inspect = () => document.querySelector<HTMLButtonElement>('#chat-background-tasks [data-inspect-task="bgjpa"]');
+    await waitUntil(() => inspect() != null, () => document.querySelector("#chat-background-tasks")?.textContent ?? "no task list");
+    inspect()!.dispatchEvent(new window.Event("click", { bubbles: true }) as unknown as Event);
+    const line = document.querySelector<HTMLElement>("#chat-drilldown-state")!;
+    await waitUntil(() => line.textContent === "workspace did not answer", () => line.textContent ?? "no drill-down line");
+    expect(line.classList.contains("is-error")).toBe(true);
+    expect(line.hidden).toBe(false);
+    return { document, window, line, reads: () => read };
+  };
+  const eventually = async (predicate: () => boolean, describe: () => string, ms = 8_000) => {
+    const deadline = Date.now() + ms;
+    while (!predicate()) {
+      if (Date.now() > deadline) throw new Error(`timed out waiting for ${describe()}`);
+      await Bun.sleep(50);
+    }
+  };
+  const fail = () => { throw new Error("workspace did not answer"); };
+
+  test("a shell task's output read that fails shows its error, and the next read that answers takes it down", async () => {
+    const { document, window, line } = await openFailingOutputView("task-output-recovery-ui-test", [fail, () => ({ text: "1 pass\n", truncated: false, settled: false })]);
+    try {
+      await eventually(() => document.querySelector("#chat-drilldown-output-text")?.textContent === "1 pass\n", () => line.textContent ?? "no output");
+      expect(line.textContent).toBe("");
+      expect(line.classList.contains("is-error")).toBe(false);
+      expect(line.hidden).toBe(true);
+    } finally {
+      await Bun.sleep(20);
+      window.dispatchEvent(new Event("pagehide"));
+    }
+  }, 15_000);
+
+  test("a recovered output read leaves standing a message spoken on the line after its error", async () => {
+    const { document, window, line, reads } = await openFailingOutputView("task-output-recovery-guard-ui-test", [fail, () => ({ text: "1 pass\n", truncated: false, settled: false })]);
+    try {
+      // No path in the product speaks on this line while an output view is
+      // open, so another speaker is stood in for at the announcer's own text
+      // node — the one whose content the guard compares against.
+      const spoken = [...line.childNodes].find(node => node.nodeType === 3)!;
+      spoken.textContent = "Something else went wrong";
+      await eventually(() => reads() >= 2 && document.querySelector("#chat-drilldown-output-text")?.textContent === "1 pass\n", () => line.textContent ?? "no output");
+      expect(line.textContent).toBe("Something else went wrong");
+      expect(line.hidden).toBe(false);
+    } finally {
+      await Bun.sleep(20);
+      window.dispatchEvent(new Event("pagehide"));
+    }
+  }, 15_000);
 });
 
 // Design D13/D14: the run a typed command launches streams nothing; its

@@ -302,12 +302,24 @@ export function initChat(api = new ChatApiClient()): void {
     task?: OpenTaskInspection;
   };
   let child: Drilldown | null = null;
+  // The error line the output view last put up. When a later read answers,
+  // the panel says so and the line comes down — but only if it still says
+  // what the panel put there, so a message something else has since spoken
+  // is left standing.
+  let taskOutputError = "";
   const taskPanel = drilldownTask && drilldownOutput && drilldownOutputText && drilldownOutputNote
     ? new TaskInspectionPanel({
       hosts: { strip: drilldownTask, output: drilldownOutput, outputText: drilldownOutputText, outputNote: drilldownOutputNote },
       fetchOutput: (conversationId, taskId, signal) => api.taskOutput(conversationId, taskId, undefined, signal),
       active: () => chatSurfaceActive(),
-      onError: error => announceChild(messageOf(error), true),
+      onError: error => {
+        taskOutputError = messageOf(error);
+        announceChild(taskOutputError, true);
+      },
+      onRecovered: () => {
+        if (taskOutputError && announceChild.current() === taskOutputError) announceChild("");
+        taskOutputError = "";
+      },
     })
     : null;
   // The drill-down's task, as the parent's projection now has it — the strip
@@ -3645,9 +3657,10 @@ export function initChat(api = new ChatApiClient()): void {
     // from the layer being refreshed, or — for a transcript opened from the
     // subagents track or the launching row — found by the child id on a
     // running task, so a running subagent gets the strip whichever way in.
+    const owningTask = projection ? runningTaskForChild(projection.items, id) : undefined;
     const link = task
       ?? (previous?.conversationId === id ? previous.task : undefined)
-      ?? (projection && runningTaskForChild(projection.items, id) ? { conversationId: projection.conversationId, taskId: runningTaskForChild(projection.items, id)!.taskId, view: "transcript" as const } : undefined);
+      ?? (projection && owningTask ? { conversationId: projection.conversationId, taskId: owningTask.taskId, view: "transcript" as const } : undefined);
     const next: Drilldown = { conversationId: id, label, projection: retainedProjection, stream: null, ...(link ? { task: link } : {}) };
     const nested = previous !== null;
     child = next;

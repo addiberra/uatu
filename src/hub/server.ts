@@ -89,6 +89,11 @@ export type HubDeps = {
   // Where the live broker's finished/viewed marks survive a restart. Absent
   // (tests, the e2e harness) they live for the broker's lifetime only.
   activityMarks?: ActivityMarkSink;
+  // Whether the assembled live broker watches every running workspace's
+  // activity from the start, so a finish is recorded even for a session no
+  // page ever opened (D11). The production hub sets it; tests and the e2e
+  // harness leave the broker lazy, watching from its first activity feed.
+  watchActivityFromStart?: boolean;
   preferences?: HubPreferencesStore;
   onboarding?: WorkspaceOnboardingCoordinator;
   folderManager?: Pick<FolderManager, "create" | "rename" | "remove" | "assertNoPendingMutation">;
@@ -2076,7 +2081,7 @@ function assembleLive(deps: HubDeps): { live: LiveEndpoint; liveBroker: LiveBrok
   const metrics = deps.metrics ?? new MetricsRegistry();
   const liveBroker = deps.liveBroker ?? new LiveBroker(
     createHubUpstreamSource({ sessions: deps.sessions, registry: deps.registry }),
-    { metrics, marks: deps.activityMarks },
+    { metrics, marks: deps.activityMarks, watchActivityFromStart: deps.watchActivityFromStart ?? false },
   );
   const live = deps.live ?? new LiveEndpoint({
     broker: liveBroker,

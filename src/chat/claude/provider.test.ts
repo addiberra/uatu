@@ -1434,6 +1434,47 @@ describe("ClaudeProvider sessions", () => {
       await provider.dispose();
     });
 
+    test("a live run is resolved from its own parent session, not by searching every live session's runs", async () => {
+      const { provider, queries } = fixture();
+      const { events, stop } = collect(provider);
+      const first = await provider.createSession("x");
+      const second = await provider.createSession("y");
+      await provider.prompt(first.id, { id: "r1", text: "spawn", delivery: "queue" });
+      await provider.prompt(second.id, { id: "r2", text: "spawn", delivery: "queue" });
+      const runs = [[first.id, queries[0]!, "a1111111111111111"], [second.id, queries[1]!, "a2222222222222222"]] as const;
+      for (const [sessionId, query, agentId] of runs) {
+        query.push({ type: "system", subtype: "task_started", uuid: `ts-${agentId}`, timestamp: stamp(1), session_id: sessionId, task_id: agentId, description: "List files", subagent_type: "general-purpose", task_type: "local_agent", prompt: "List the files" });
+      }
+      const childOf = (sessionId: string, agentId: string) => `sub:${sessionId}:${agentId}`;
+      for (const [sessionId, , agentId] of runs) {
+        await waitFor(() => events.some(event => event.conversationId === childOf(sessionId, agentId) && event.eventType === "subagent.started"));
+      }
+      const internals = provider as unknown as {
+        live: Map<string, { children: Map<string, unknown> }>;
+        liveChild(id: string): { parentSessionId: string; child: { id: string } } | undefined;
+      };
+      // The first session's runs must not be consulted to find the second's.
+      const firstRuns = internals.live.get(first.id)!.children;
+      let consulted = 0;
+      const values = firstRuns.values.bind(firstRuns);
+      firstRuns.values = () => { consulted += 1; return values(); };
+      const secondChild = childOf(second.id, runs[1][2]);
+      expect(internals.liveChild(secondChild)).toEqual({ parentSessionId: second.id, child: expect.objectContaining({ id: secondChild }) });
+      expect(consulted).toBe(0);
+      expect(await provider.getSession(secondChild)).toEqual(expect.objectContaining({ id: secondChild, parentId: second.id }));
+      firstRuns.values = values;
+      expect(internals.liveChild(childOf(first.id, runs[0][2]))?.parentSessionId).toBe(first.id);
+      // Malformed, of an unknown session, or of a run the session never
+      // started: none of them names a live run.
+      expect(internals.liveChild(`sub:${first.id}`)).toBeUndefined();
+      expect(internals.liveChild(`${first.id}:${runs[0][2]}`)).toBeUndefined();
+      expect(internals.liveChild(`sub:${first.id}:${runs[0][2]}:extra`)).toBeUndefined();
+      expect(internals.liveChild(childOf("00000000-0000-0000-0000-000000000000", runs[0][2]))).toBeUndefined();
+      expect(internals.liveChild(childOf(first.id, runs[1][2]))).toBeUndefined();
+      stop();
+      await provider.dispose();
+    });
+
     test("a foreground agent routes the same way and settles on its sync result; the launching row keeps the result's attribution", async () => {
       const { provider, queries } = fixture();
       const { events, stop } = collect(provider);

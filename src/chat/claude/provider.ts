@@ -2893,12 +2893,20 @@ export class ClaudeProvider implements ChatProvider {
     session.forkBuffers.clear();
   }
 
-  /** A run of a live session, by its child conversation id. */
+  /**
+   * A run of a live session, by its child conversation id. The id names its
+   * parent (`sub:<sessionId>:<agentId>`, as `openChild` builds it), so only
+   * that session's runs are searched: the silent-run follower resolves an
+   * open drill-down every couple of seconds, and a scan of every run of
+   * every live session would grow with work that has nothing to do with it.
+   * An id that does not parse names no run.
+   */
   private liveChild(childId: string): { parentSessionId: string; child: LiveChild } | undefined {
-    for (const session of this.live.values()) {
-      for (const child of session.children.values()) {
-        if (child.id === childId) return { parentSessionId: session.id, child };
-      }
+    const parsed = parseSubagentId(childId);
+    const session = parsed ? this.live.get(parsed.parentSessionId) : undefined;
+    if (!session) return undefined;
+    for (const child of session.children.values()) {
+      if (child.id === childId) return { parentSessionId: session.id, child };
     }
     return undefined;
   }

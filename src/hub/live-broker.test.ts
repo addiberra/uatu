@@ -1099,6 +1099,49 @@ describe("finished (fix-workspace-activity-states D2/D3)", () => {
     expect(marks.last()!.viewedAt.get("alice")!.get("kept")).toBe(9);
   });
 
+  test("an acknowledgement with nothing to clear stamps and persists nothing; one that clears a finish does", async () => {
+    const child = fakeSource({ running: new Set(["a"]), workspaces: ["a"] });
+    const marks = recordingMarks();
+    const live = broker(child.source, { marks: marks.sink });
+    const alice = sink();
+    live.subscribeActivity(alice, "alice");
+    await waitFor(() => child.opened.length === 1, "the watch");
+    child.opened[0]!.push(": open\n\n");
+    push(child, true, false);
+    await waitFor(() => latestFor(alice, "a").working, "working");
+    // Nothing has finished: a page (or any client) posting now changes
+    // nothing and costs no write.
+    const before = marks.writes.length;
+    const emitted = alice.envelopes.length;
+    live.acknowledgeViewed("alice", "a");
+    live.acknowledgeViewed("alice", "unknown-workspace");
+    expect(marks.writes).toHaveLength(before);
+    expect(alice.envelopes).toHaveLength(emitted);
+    push(child, false, false);
+    await waitFor(() => latestFor(alice, "a").finished, "finished");
+    // Clearing a finish is stamped and persisted.
+    const finishedWrites = marks.writes.length;
+    live.acknowledgeViewed("alice", "a");
+    expect(marks.writes).toHaveLength(finishedWrites + 1);
+    expect(latestFor(alice, "a").finished).toBe(false);
+    const viewed = marks.last()!.viewedAt.get("alice")!.get("a")!;
+    // The same finish acknowledged again — another page of hers, say — is
+    // already seen: no new stamp, no write.
+    live.acknowledgeViewed("alice", "a");
+    expect(marks.writes).toHaveLength(finishedWrites + 1);
+    // Bob has not seen it, so his acknowledgement still counts.
+    live.acknowledgeViewed("bob", "a");
+    expect(marks.writes).toHaveLength(finishedWrites + 2);
+    // A later finish outranks alice's view and is hers to clear again.
+    push(child, true, false);
+    await waitFor(() => latestFor(alice, "a").working, "working again");
+    push(child, false, false);
+    await waitFor(() => latestFor(alice, "a").finished, "finished again");
+    live.acknowledgeViewed("alice", "a");
+    expect(marks.last()!.viewedAt.get("alice")!.get("a")!).toBeGreaterThan(viewed);
+    expect(latestFor(alice, "a").finished).toBe(false);
+  });
+
   test("every activity payload carries exactly the four facts", async () => {
     const { child, alice } = await workingWorkspace();
     push(child, false, false);
@@ -1106,6 +1149,69 @@ describe("finished (fix-workspace-activity-states D2/D3)", () => {
     for (const envelope of alice.envelopes) {
       expect(Object.keys(facts(envelope)).sort()).toEqual(["awaiting", "finished", "running", "working"]);
     }
+  });
+});
+
+describe("watching activity from the start (fix-workspace-activity-states D11)", () => {
+  const facts = (envelope: LiveEnvelope) => (envelope.event as { data: { running: boolean; working: boolean; awaiting: boolean; finished: boolean } }).data;
+  const latestFor = (s: ReturnType<typeof sink>, ws: string) => facts(s.envelopes.filter(e => e.ws === ws).at(-1)!);
+  const activityFrame = (working: boolean) => `event: activity\ndata: {"working":${working},"awaiting":false}\n\n`;
+
+  test("a session driven without any page records its finish, which the first later feed sees", async () => {
+    const child = fakeSource({ running: new Set(["a"]), workspaces: ["a"] });
+    const live = broker(child.source, { watchActivityFromStart: true });
+    // No feed has ever been asked for: the broker opened the watch itself.
+    await waitFor(() => child.opened.length === 1, "the watch opened at construction");
+    expect(child.opened[0]!.path).toContain("/api/activity");
+    // An API client drives a turn through the proxy; it runs and finishes.
+    child.opened[0]!.push(": open\n\n" + activityFrame(true));
+    await Bun.sleep(20);
+    child.opened[0]!.push(activityFrame(false));
+    await Bun.sleep(20);
+    const later = sink();
+    live.subscribeActivity(later, "alice");
+    expect(latestFor(later, "a")).toEqual({ running: true, working: false, awaiting: false, finished: true });
+    expect(child.opened).toHaveLength(1);
+  });
+
+  test("a session started later with no page open is watched from its start", async () => {
+    const child = fakeSource({ running: new Set(), workspaces: ["a"] });
+    const live = broker(child.source, { watchActivityFromStart: true });
+    await Bun.sleep(20);
+    expect(child.opened).toHaveLength(0);
+    child.setRunning("a", true);
+    await waitFor(() => child.opened.length === 1, "the watch opened by the start");
+    child.opened[0]!.push(": open\n\n" + activityFrame(true));
+    await Bun.sleep(20);
+    child.opened[0]!.push(activityFrame(false));
+    await Bun.sleep(20);
+    const later = sink();
+    live.subscribeActivity(later, "alice");
+    expect(latestFor(later, "a").finished).toBe(true);
+  });
+
+  test("the marks are restored before the watches opened at construction can compose against them", async () => {
+    const child = fakeSource({ running: new Set(["a"]), workspaces: ["a"] });
+    // What the previous hub left: an unviewed finish in "a" and nothing
+    // else. The watch's first frame has no predecessor, so it must neither
+    // invent a finish nor lose the restored one.
+    const restored = { finishedAt: new Map([["a", 5]]), viewedAt: new Map<string, Map<string, number>>() };
+    const live = broker(child.source, { watchActivityFromStart: true, marks: { read: () => restored, write: () => undefined } });
+    await waitFor(() => child.opened.length === 1, "the watch opened at construction");
+    child.opened[0]!.push(": open\n\n" + activityFrame(false));
+    await Bun.sleep(20);
+    const later = sink();
+    live.subscribeActivity(later, "alice");
+    expect(latestFor(later, "a")).toEqual({ running: true, working: false, awaiting: false, finished: true });
+  });
+
+  test("by default the broker stays lazy: nothing is watched until the first activity feed", async () => {
+    const child = fakeSource({ running: new Set(["a"]), workspaces: ["a"] });
+    const live = broker(child.source);
+    await Bun.sleep(30);
+    expect(child.opened).toHaveLength(0);
+    live.subscribeActivity(sink(), "alice");
+    await waitFor(() => child.opened.length === 1, "the watch opened by the first feed");
   });
 });
 

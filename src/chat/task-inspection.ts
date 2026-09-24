@@ -67,6 +67,17 @@ export function taskSettledLabel(task: BackgroundTaskItem): string {
 // keeps the view honest without a stream (design D7, non-goal: streaming).
 export const TASK_OUTPUT_REFRESH_MS = 2_000;
 
+// A read that fails is not retried at the full cadence for as long as the
+// task runs: each consecutive failure doubles the wait, up to this cap, and
+// the next read that answers puts the cadence back. A workspace that has gone
+// away is then asked about twice a minute rather than every two seconds.
+export const TASK_OUTPUT_BACKOFF_MAX_MS = 30_000;
+
+/** The wait before the next output read after `failures` consecutive failed reads. */
+export function taskOutputRefreshDelay(failures: number): number {
+  return Math.min(TASK_OUTPUT_REFRESH_MS * 2 ** Math.max(0, failures), TASK_OUTPUT_BACKOFF_MAX_MS);
+}
+
 export type TaskInspectionTimers = {
   setInterval: (fn: () => void, ms: number) => unknown;
   clearInterval: (handle: unknown) => void;
@@ -90,6 +101,10 @@ export type TaskInspectionOptions = {
   // the next tick try again.
   active?: () => boolean;
   onError?: (error: unknown) => void;
+  // A read answered after one or more failed: the error `onError` reported
+  // is no longer true. The output view has no child stream whose next event
+  // would take the error line down, so the panel says when it can go.
+  onRecovered?: () => void;
   now?: () => number;
   timers?: TaskInspectionTimers;
 };
@@ -101,6 +116,7 @@ export class TaskInspectionPanel {
   private readonly fetchOutput: TaskInspectionOptions["fetchOutput"];
   private readonly active: () => boolean;
   private readonly onError: (error: unknown) => void;
+  private readonly onRecovered: () => void;
   private readonly now: () => number;
   private readonly timers: TaskInspectionTimers;
   private current: OpenTaskInspection | null = null;
@@ -109,6 +125,12 @@ export class TaskInspectionPanel {
   private elapsedTimer: unknown = null;
   private outputTimer: unknown = null;
   private outputRead: AbortController | null = null;
+  // Consecutive failed output reads, which set the backoff; zero once a read
+  // answers.
+  private outputFailures = 0;
+  // Whether the server said the output is final: the file will not grow, so
+  // the poll ends even if the task item's own settle has not arrived.
+  private outputFinal = false;
   // Whether the reader is at the end of the output: the pane follows new
   // output only while they are, so scrolling up to read holds still.
   private following = true;
@@ -118,6 +140,7 @@ export class TaskInspectionPanel {
     this.fetchOutput = options.fetchOutput;
     this.active = options.active ?? (() => true);
     this.onError = options.onError ?? (() => {});
+    this.onRecovered = options.onRecovered ?? (() => {});
     this.now = options.now ?? (() => Date.now());
     this.timers = options.timers ?? {
       setInterval: (fn, ms) => setInterval(fn, ms),
@@ -141,6 +164,8 @@ export class TaskInspectionPanel {
     if (this.current && (this.current.taskId !== link.taskId || this.current.view !== link.view)) this.close();
     this.current = link;
     this.following = true;
+    this.outputFailures = 0;
+    this.outputFinal = false;
     this.hosts.output.hidden = link.view !== "output";
     if (link.view === "output") {
       this.hosts.outputText.textContent = "";
@@ -192,6 +217,8 @@ export class TaskInspectionPanel {
     this.stopOutputTimer();
     this.outputRead?.abort();
     this.outputRead = null;
+    this.outputFailures = 0;
+    this.outputFinal = false;
     this.current = null;
     this.task = undefined;
     this.painted = "";
@@ -284,7 +311,11 @@ export class TaskInspectionPanel {
   }
 
   // One read at a time, and the next scheduled only after this one answers,
-  // so a slow read never stacks requests behind it.
+  // so a slow read never stacks requests behind it. A read that fails waits
+  // longer before the next (`taskOutputRefreshDelay`); one that answers —
+  // "not yet available" included, which is an answer — resets the wait and
+  // takes down the error the failures reported. A read the server marks
+  // settled is the last: the output is final, whatever the task item says.
   private refreshOutput(): void {
     const link = this.current;
     if (!link || link.view !== "output") return;
@@ -299,13 +330,19 @@ export class TaskInspectionPanel {
     void this.fetchOutput(link.conversationId, link.taskId, read.signal).then(output => {
       if (read.signal.aborted || this.current !== link) return;
       this.paintOutput(output);
+      if (output?.settled) this.outputFinal = true;
+      if (this.outputFailures > 0) {
+        this.outputFailures = 0;
+        this.onRecovered();
+      }
     }, error => {
       if (read.signal.aborted || this.current !== link) return;
+      this.outputFailures += 1;
       this.onError(error);
     }).finally(() => {
       if (this.outputRead === read) this.outputRead = null;
       if (read.signal.aborted || this.current !== link) return;
-      if (this.task?.status === "running") this.scheduleOutputRefresh();
+      if (this.task?.status === "running" && !this.outputFinal) this.scheduleOutputRefresh();
     });
   }
 
@@ -314,7 +351,7 @@ export class TaskInspectionPanel {
     this.outputTimer = this.timers.setTimeout(() => {
       this.outputTimer = null;
       this.refreshOutput();
-    }, TASK_OUTPUT_REFRESH_MS);
+    }, taskOutputRefreshDelay(this.outputFailures));
   }
 
   private paintOutput(output: BackgroundTaskOutput | null): void {

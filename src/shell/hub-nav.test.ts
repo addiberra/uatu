@@ -1283,8 +1283,9 @@ describe("the viewed acknowledgement", () => {
   const finished: Facts = { running: true, working: false, awaiting: false, finished: true };
 
   // A session page at /s/uatu/ whose hub probe answers (or, without a hub,
-  // 404s), recording every POST the switcher makes.
-  async function mountPage(options: { hub?: boolean } = {}) {
+  // 404s), recording every POST the switcher makes. `answer` stands in for
+  // the hub's reply to each POST; it defaults to an immediate 204.
+  async function mountPage(options: { hub?: boolean; answer?: () => Promise<Response> } = {}) {
     const html = await Bun.file(`${import.meta.dir}/../index.html`).text();
     const { document, window } = parseHTML(html);
     const meta = document.createElement("meta");
@@ -1311,7 +1312,7 @@ describe("the viewed acknowledgement", () => {
       }
       if (init?.method === "POST") {
         posts.push(url);
-        return new Response(null, { status: 204 });
+        return options.answer ? options.answer() : new Response(null, { status: 204 });
       }
       return Response.json({ error: "unexpected" }, { status: 404 });
     });
@@ -1353,6 +1354,44 @@ describe("the viewed acknowledgement", () => {
     page.deliver("uatu", idle);
     page.deliver("uatu", working);
     page.deliver("uatu", finished);
+    expect(page.posts).toHaveLength(2);
+  });
+
+  test("a finish that arrives while the POST is in flight is acknowledged once the POST succeeds", async () => {
+    const held: Array<() => void> = [];
+    const page = await mountPage({
+      answer: () => new Promise<Response>(resolve => held.push(() => resolve(new Response(null, { status: 204 })))),
+    });
+    page.chatInView(true);
+    page.deliver("uatu", finished);
+    expect(page.posts).toHaveLength(1);
+    // The hub clears the mark and the next turn runs and finishes, all
+    // before the first POST's answer reaches the page.
+    page.deliver("uatu", idle);
+    page.deliver("uatu", working);
+    page.deliver("uatu", finished);
+    expect(page.posts).toHaveLength(1);
+    // The answer lands; the user is still looking at a finished chat, and
+    // nothing else will cue.
+    held.shift()!();
+    await page.settle();
+    expect(page.posts).toHaveLength(2);
+    held.shift()!();
+    await page.settle();
+    // The second answer finds that finish already acknowledged.
+    expect(page.posts).toHaveLength(2);
+  });
+
+  test("a failing POST re-arms for the next cue without retrying on its own", async () => {
+    const page = await mountPage({ answer: async () => new Response(null, { status: 500 }) });
+    page.chatInView(true);
+    page.deliver("uatu", finished);
+    await page.settle();
+    await page.settle();
+    expect(page.posts).toHaveLength(1);
+    // The next cue retries, once.
+    page.surfaceActive();
+    await page.settle();
     expect(page.posts).toHaveLength(2);
   });
 

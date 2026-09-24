@@ -309,7 +309,8 @@ export async function runHub(options: RunHubOptions): Promise<void> {
   const personalState = new PersonalWorkspaceStateStore(personalWorkspaceStatePath(stateRoot));
   // What finished where, and who has seen it. Read before the live broker is
   // assembled: the broker adopts the marks at construction and resumes its
-  // stamp counter above them.
+  // stamp counter above them, and this hub's broker starts watching there
+  // too, before any page connects.
   const activityMarks = new ActivityMarkStore(activityMarksPath(stateRoot));
   const credentialMetadata = new CredentialMetadataStore(credentialsPath(stateRoot));
   await Promise.all([personalState.load(), credentialMetadata.load(), activityMarks.load()]);
@@ -612,6 +613,7 @@ export async function runHub(options: RunHubOptions): Promise<void> {
     sessionStore,
     personalState,
     activityMarks,
+    watchActivityFromStart: true,
     notifications,
     preferences,
     onboarding,

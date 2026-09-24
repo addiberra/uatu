@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { parseHTML } from "linkedom";
 
-import { SILENT_RUN_QUIET_MS, SILENT_RUN_REFRESH_MS, SILENT_RUN_SETTLE_READS, SilentRunFollower, TASK_OUTPUT_REFRESH_MS, TaskInspectionPanel, formatTaskElapsed, runningTaskForChild, taskInspection, taskSettledLabel, taskUsageLabel, type TaskInspectionTimers } from "./task-inspection";
+import { SILENT_RUN_QUIET_MS, SILENT_RUN_REFRESH_MS, SILENT_RUN_SETTLE_READS, SilentRunFollower, TASK_OUTPUT_BACKOFF_MAX_MS, TASK_OUTPUT_REFRESH_MS, TaskInspectionPanel, formatTaskElapsed, runningTaskForChild, taskInspection, taskSettledLabel, taskUsageLabel, type TaskInspectionTimers } from "./task-inspection";
 import type { BackgroundTaskItem, BackgroundTaskOutput } from "./types";
 
 describe("task inspection facts", () => {
@@ -46,6 +46,7 @@ describe("task inspection panel", () => {
   const live = () => scheduled.filter(entry => !entry.cleared);
   let reads: Array<{ conversationId: string; taskId: string; signal: AbortSignal; resolve: (output: BackgroundTaskOutput | null) => void; reject: (error: unknown) => void }> = [];
   let errors: unknown[] = [];
+  let recoveries = 0;
 
   beforeEach(() => {
     dom = parseHTML('<!doctype html><html><body><div id="strip" hidden></div><div id="output" hidden><p id="note" hidden></p><pre id="text"></pre></div></body></html>');
@@ -56,6 +57,7 @@ describe("task inspection panel", () => {
     scheduled = [];
     reads = [];
     errors = [];
+    recoveries = 0;
   });
   afterEach(() => { restore.forEach(fn => fn()); restore = []; });
 
@@ -69,6 +71,7 @@ describe("task inspection panel", () => {
     hosts: hosts(),
     fetchOutput: (conversationId, taskId, signal) => new Promise((resolve, reject) => { reads.push({ conversationId, taskId, signal, resolve, reject }); }),
     onError: error => { errors.push(error); },
+    onRecovered: () => { recoveries += 1; },
     now: () => now,
     timers,
   });
@@ -196,6 +199,72 @@ describe("task inspection panel", () => {
     await settle();
     expect(text("#text")).toBe("");
     expect(hosts().output.hidden).toBe(true);
+  });
+
+  test("consecutive failed reads lengthen the wait up to the cap; a read that answers resets it and takes the error down", async () => {
+    const view = panel();
+    view.show({ conversationId: "one", taskId: "bgjpa", view: "output" }, item({ taskId: "bgjpa", taskType: "local_bash", createdAt: now }));
+    const nextPoll = () => {
+      const polls = live().filter(entry => entry.kind === "timeout");
+      expect(polls).toHaveLength(1);
+      return polls[0]!;
+    };
+    const waits: number[] = [];
+    for (let failure = 0; failure < 6; failure += 1) {
+      reads.at(-1)!.reject(new Error("workspace did not answer"));
+      await settle();
+      const poll = nextPoll();
+      waits.push(poll.ms);
+      poll.fn();
+    }
+    expect(waits).toEqual([4_000, 8_000, 16_000, TASK_OUTPUT_BACKOFF_MAX_MS, TASK_OUTPUT_BACKOFF_MAX_MS, TASK_OUTPUT_BACKOFF_MAX_MS]);
+    expect(errors).toHaveLength(6);
+    expect(recoveries).toBe(0);
+
+    // "Not yet available" is an answer, not a failure: the cadence is back
+    // and the error the failures reported is no longer true.
+    reads.at(-1)!.resolve(null);
+    await settle();
+    expect(text("#note")).toBe("Output not yet available");
+    expect(recoveries).toBe(1);
+    expect(nextPoll().ms).toBe(TASK_OUTPUT_REFRESH_MS);
+
+    // A read that answers after answers has nothing to take down.
+    nextPoll().fn();
+    reads.at(-1)!.resolve({ text: "one\n", truncated: false, settled: false });
+    await settle();
+    expect(recoveries).toBe(1);
+    expect(nextPoll().ms).toBe(TASK_OUTPUT_REFRESH_MS);
+
+    // The backoff starts over from the first failure, and the next answer
+    // takes the new error down in turn.
+    nextPoll().fn();
+    reads.at(-1)!.reject(new Error("again"));
+    await settle();
+    expect(nextPoll().ms).toBe(4_000);
+    nextPoll().fn();
+    reads.at(-1)!.resolve({ text: "one\ntwo\n", truncated: false, settled: false });
+    await settle();
+    expect(text("#text")).toBe("one\ntwo\n");
+    expect(recoveries).toBe(2);
+    expect(nextPoll().ms).toBe(TASK_OUTPUT_REFRESH_MS);
+    view.close();
+  });
+
+  test("a read the server marks settled ends the poll, even while the task item still says running", async () => {
+    const view = panel();
+    const task = item({ taskId: "bgjpa", taskType: "local_bash", createdAt: now });
+    view.show({ conversationId: "one", taskId: "bgjpa", view: "output" }, task);
+    reads[0]!.resolve({ text: "done\n[exited with code 0]\n", truncated: false, settled: true });
+    await settle();
+    expect(text("#text")).toBe("done\n[exited with code 0]\n");
+    expect(live().filter(entry => entry.kind === "timeout")).toHaveLength(0);
+    // The strip still follows the item, whose own settle has not arrived.
+    view.sync(task);
+    expect(live().filter(entry => entry.kind === "timeout")).toHaveLength(0);
+    expect(reads).toHaveLength(1);
+    expect(text("#strip [data-task-elapsed]")).toBe("0:00");
+    view.close();
   });
 
   test("a hidden surface skips the read and tries again on the next tick", async () => {

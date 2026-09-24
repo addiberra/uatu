@@ -122,6 +122,13 @@ export type LiveBrokerOptions = {
   // back on change (src/hub/activity-marks.ts). Absent — unit fixtures, the
   // e2e harness — the marks live for the broker's lifetime only.
   marks?: ActivityMarkSink;
+  // Watch every running workspace's activity from construction rather than
+  // from the first activity subscription (D11). The production hub sets it:
+  // a client that starts a session and drives its chat through the proxy
+  // without ever opening a page still has its finishes recorded. Brokers
+  // built for tests leave it off, so fixtures for other topics and the e2e
+  // harness open no activity upstream nobody asked for.
+  watchActivityFromStart?: boolean;
 };
 
 // What the worktree reconciler learns from the broker: a page attached to a
@@ -293,10 +300,12 @@ export class LiveBroker {
   // not one per feed, so what finishes while every page is closed is still
   // seen (D11).
   private readonly activityWatches = new Map<string, LiveAttachment>();
-  // Set by the first activity subscription of this broker's lifetime and
-  // never cleared: from then on the watches are held regardless of feeds.
-  // A broker nobody has ever asked for activity — the e2e harness, the unit
-  // fixtures for other topics — opens no activity upstream at all.
+  // Set at construction when the broker watches from the start (the
+  // production hub), otherwise by the first activity subscription of this
+  // broker's lifetime; never cleared: from then on the watches are held
+  // regardless of feeds. A lazy broker nobody has ever asked for activity —
+  // the e2e harness, the unit fixtures for other topics — opens no activity
+  // upstream at all.
   private watchingActivity = false;
   private readonly lingerMs: number;
   private readonly replayBufferBytes: number;
@@ -320,6 +329,15 @@ export class LiveBroker {
     this.restoreMarks();
     this.unsubscribeSessions = source.onSessionChange?.(change => this.onSessionChange(change)) ?? null;
     this.unsubscribeRemovals = source.onWorkspaceRemoved?.(workspaceId => this.forgetWorkspace(workspaceId)) ?? null;
+    // Last, so the marks are restored before any watch can observe a frame
+    // and compose a value against them, and the session listener is already
+    // in place for a start that lands while the watches open. What is
+    // running now is watched now; what starts later is picked up by
+    // onSessionChange.
+    if (options.watchActivityFromStart) {
+      this.watchingActivity = true;
+      this.syncActivityWatches();
+    }
   }
 
   // What the previous hub left behind. `observed` is deliberately not among
@@ -397,9 +415,10 @@ export class LiveBroker {
       feed = new ActivityFeed();
       this.feeds.set(user, feed);
     }
-    // The first feed of this broker's lifetime turns the watches on; from
-    // then on they are the broker's, so this feed's arrival or departure
-    // changes nothing about what is observed.
+    // A lazy broker's first feed turns the watches on (one built to watch
+    // from the start already has them); from then on they are the broker's,
+    // so this feed's arrival or departure changes nothing about what is
+    // observed.
     this.watchingActivity = true;
     this.syncActivityWatches();
     // Reconcile before adding the sink: changes reach the feed's existing
@@ -423,8 +442,18 @@ export class LiveBroker {
   // The user has the workspace's chat in view: whatever finished there is
   // seen. Re-derives that user's feed value alone — the mark and the other
   // users' views are untouched — and emits only if it changed.
+  //
+  // With no finish on record, or one this user has already seen, there is
+  // nothing to clear and nothing is stamped or written: each of a user's
+  // pages posts for the same finish, and any client may post at any time,
+  // so each would otherwise cost a stamp and a persist. Skipping
+  // is safe because the composed value already reads not finished in both
+  // cases, and a later finish always takes a higher stamp than any view.
   acknowledgeViewed(user: string, workspaceId: string): void {
+    const finishedAt = this.finishedAt.get(workspaceId);
+    if (finishedAt === undefined) return;
     let marks = this.viewedAt.get(user);
+    if (finishedAt <= (marks?.get(workspaceId) ?? -Infinity)) return;
     if (!marks) {
       marks = new Map();
       this.viewedAt.set(user, marks);

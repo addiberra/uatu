@@ -945,6 +945,14 @@ export function initHubNav(): void {
     // cleared, which re-arms it; a failed POST re-arms it too, so the next
     // cue retries. Never more than one in flight. Only a hub page reaches
     // here, so a page without a hub never posts.
+    //
+    // A cue that lands while a POST is in flight is not dropped: the hub's
+    // clearing update can arrive before the POST's own answer, and a new
+    // turn can finish in that gap too, after which nothing else would cue
+    // while the user simply keeps looking. So a successful POST checks once
+    // more on settling. A failed one does not: it has re-armed for the next
+    // cue, and checking at once would turn a hub that keeps refusing into a
+    // tight loop of POSTs.
     let viewedPosted = false;
     let viewedInFlight = false;
     const maybeAcknowledgeViewed = () => {
@@ -954,9 +962,15 @@ export function initHubNav(): void {
       viewedPosted = true;
       viewedInFlight = true;
       void fetch(appUrl("/api/activity-viewed"), { method: "POST" })
-        .then(response => { if (!response.ok) viewedPosted = false; })
-        .catch(() => { viewedPosted = false; })
-        .finally(() => { viewedInFlight = false; });
+        .then(response => response.ok, () => false)
+        .then(ok => {
+          viewedInFlight = false;
+          if (!ok) {
+            viewedPosted = false;
+            return;
+          }
+          maybeAcknowledgeViewed();
+        });
     };
     document.addEventListener(CHAT_SURFACE_ACTIVE_EVENT, maybeAcknowledgeViewed);
 
