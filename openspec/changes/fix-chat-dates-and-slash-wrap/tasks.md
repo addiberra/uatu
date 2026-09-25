@@ -1,0 +1,26 @@
+## 1. Rate-limit reset names its day (#429)
+
+- [x] 1.1 In `src/chat/dates.ts` (a new leaf module that `composer-status.ts` re-exports from, which avoids a composer-status ↔ timeline-renderer import cycle), switch `resetClock` to the local calendar-day rule (same day → `HH:MM`; 1–6 days → weekday + time; ≥7 days → weekday + day + month + time) and add `resetMoment(resetsAt, now)` (`<clock> · <relative>`) and `standingSentence(standing, now)`; verify with new `composer-status.test.ts` cases for later-today, 23:30→06:00 next day, 3 days out, 7+ days out, past reset, and a DST-boundary day, all with an injected `now`
+- [x] 1.2 Make `rateLimitBadgeLabel` use `resetClock` and update `planReadoutRows` expectations; verify `bun test src/chat/composer-status.test.ts` passes, including a chip label that names the weekday for a next-day reset
+- [x] 1.3 In `src/chat/ui.ts`, replace the inline `toLocaleTimeString` reset text in the readout standing line (~2048) and the `rateLimitLive` announcement (~2171) with `standingSentence`; verify by grep that no `Resets ${new Date(` remains in `src/chat/ui.ts`
+- [x] 1.4 In `src/chat/timeline-renderer.ts`, format the notice renderer's reset (~997) with `resetClock` + `relativeReset`; verify a `timeline-renderer.test.ts` case for a notice with a next-day `resetsAt` renders the weekday
+- [x] 1.5 Extend `tests/e2e/chat-claude-polish.e2e.ts` with a standing whose reset is on a later day and assert the readout standing line and chip name the weekday and the relative time; verify the spec scenarios under "A rate-limit reset names its day when it is not today" pass
+
+## 2. Day separators in the timeline (#427)
+
+- [x] 2.1 Add local-day helpers (day key, "Today"/"Yesterday"/weekday-date label with year when not current) in `src/chat/timeline-renderer.ts` or a small colocated module; verify unit tests for today, yesterday, same year, previous year, and 23:50/00:10 straddling midnight with an injected `now`
+- [x] 2.2 Add an injectable `now` to `TimelineRenderer`, and emit keyed `.chat-day-separator` nodes (`dayEntries`, reconciled like `groupEntries`) during top-level assembly per design D2 (flat item / group first member / draft = now / awaiting never; unknown `createdAt` inherits; recurring day skipped); verify new renderer tests: multi-day conversation, single past day, group spanning a boundary, unknown timestamps, no duplicate label, separators removed when their items leave
+- [x] 2.3 Update existing `timeline-renderer.test.ts` assertions that map `host.children` so they ignore or expect separators; verify `bun test src/chat/timeline-renderer.test.ts src/chat/question-form.test.ts` passes
+- [x] 2.4 Arm a single next-local-midnight relabel timer per renderer (cleared on reset, re-armed per render) that updates separator text and aria-label in place; verify a unit test with fake timers that "Today" becomes "Yesterday" without a render
+- [x] 2.5 Style `.chat-day-separator` in `src/styles.css` (sticky `top: 0` in the timeline scroller, opaque surface background, compact, z-index below overlays; desktop and touch); verify visually via the e2e in 2.6 and that the scroll-anchoring suite (`tests/e2e/chat-follow-stability.e2e.ts`) still passes
+- [x] 2.6 Add an e2e in `tests/e2e/chat.e2e.ts` (fixture with items across three days, including a replayed conversation) asserting separator labels and order, and that after scrolling up inside a long day its separator stays visible at the top of the timeline; verify it passes on desktop, plus a touch-layout case in `tests/e2e/chat-touch.e2e.ts`
+
+## 3. Wrapped slash-command descriptions (#424)
+
+- [x] 3.1 In `src/styles.css`, make `.chat-command-hint`/`.chat-command-description` wrap in full (`white-space: normal; overflow-wrap: anywhere`, no clamp, no ellipsis) and let the name column shrink (`minmax(0, max-content)`, name `overflow-wrap: anywhere`); verify via 3.2
+- [x] 3.2 Extend the slash-command e2e in `tests/e2e/chat.e2e.ts` with commands whose descriptions span several lines: assert each description is taller than one line and fully shown (`scrollHeight <= clientHeight`, `scrollWidth <= clientWidth`), the menu does not scroll horizontally, and moving the highlight with ArrowDown/ArrowUp keeps the active option inside the menu's visible area; verify it passes
+
+## 4. Verification
+
+- [x] 4.1 Run `bun test` and `bun test:e2e` (or the touched chat e2e files) and verify both pass; capture PR screenshots with `UATU_E2E_SCREENSHOTS_DIR=openspec/changes/fix-chat-dates-and-slash-wrap/screenshots`
+- [x] 4.2 Run `openspec validate fix-chat-dates-and-slash-wrap --strict` and verify it reports the change as valid
