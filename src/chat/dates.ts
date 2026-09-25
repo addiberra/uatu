@@ -1,7 +1,10 @@
 // Chat's reader-local date wording: when a rate limit resets and which day a
 // run of the timeline happened. Everything is decided by the reader's local
-// calendar day, in the browser's locale and zone — never by a millisecond
-// distance, which misreads "06:00 tomorrow" as today and miscounts DST days.
+// calendar day and zone — never by a millisecond distance, which misreads
+// "06:00 tomorrow" as today and miscounts DST days. Clock times are always
+// 24-hour "HH:MM" and dates ISO "YYYY-MM-DD", whatever the locale; only
+// weekday names (and the long dates given to assistive technology) follow
+// the browser's locale.
 // A leaf module (no chat imports) so the timeline renderer and the composer
 // status can both use it without an import cycle.
 
@@ -16,9 +19,22 @@ export function knownTime(at: number): boolean {
   return Number.isFinite(at) && at >= 1e12;
 }
 
-/** The reader-local clock time, "14:32" (or the locale's 12-hour form). */
+const pad = (value: number) => String(value).padStart(2, "0");
+
+/** The reader-local clock time, 24-hour and zero-padded: "14:32", "02:06". */
 export function clockTime(at: number): string {
-  return new Date(at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  const date = new Date(at);
+  return `${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+/** The locale's short weekday name, "Mon". */
+function weekday(at: number): string {
+  return new Date(at).toLocaleDateString([], { weekday: "short" });
+}
+
+/** Weekday and clock time, "Mon 23:00". */
+export function weekdayClock(at: number): string {
+  return `${weekday(at)} ${clockTime(at)}`;
 }
 
 /** Whole local calendar days from `from` to `to` (negative when earlier). */
@@ -30,10 +46,13 @@ export function localDaysBetween(from: number, to: number): number {
   return Math.round((Date.UTC(b.getFullYear(), b.getMonth(), b.getDate()) - Date.UTC(a.getFullYear(), a.getMonth(), a.getDate())) / DAY_MS);
 }
 
-/** The local calendar day as `YYYY-MM-DD`. */
+/**
+ * The local calendar day as ISO `YYYY-MM-DD`, from local fields (not
+ * `toISOString`, which is the UTC day).
+ */
 export function localDayKey(at: number): string {
   const date = new Date(at);
-  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
 }
 
 /** The next local midnight after `now`, as epoch ms. */
@@ -59,29 +78,13 @@ export function relativeReset(resetsAt: number, now = Date.now()): string {
 }
 
 /**
- * The reset as a clock time — bare on the reader's current day ("14:00"),
- * with the weekday on another day ("Sat 21:00"), and with the date too a
- * week or more out ("Fri 2 Oct 21:00"), where the weekday alone would be
- * today's and read as today.
+ * The reset as a clock time: bare on the reader's current day ("14:00"),
+ * with the weekday on any other day ("Sat 21:00"). No date: a rate-limit
+ * window is at most a week, and where a reset is stated alongside, the
+ * time remaining says how far off it is.
  */
 export function resetClock(resetsAt: number, now = Date.now()): string {
-  const date = new Date(resetsAt);
-  const time = date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-  const days = Math.abs(localDaysBetween(now, resetsAt));
-  if (days === 0) return time;
-  if (days < 7) return `${date.toLocaleDateString([], { weekday: "short" })} ${time}`;
-  return `${date.toLocaleDateString([], { weekday: "short", day: "numeric", month: "short" })} ${time}`;
-}
-
-/**
- * The reset as an absolute moment — weekday, date, and clock ("Mon 28 Sep
- * 14:00") — for a statement that stays in the transcript after it is made.
- * Nothing in it is relative to when it is read, so a notice replayed a week
- * later cannot say "today" or "now" about a moment long gone.
- */
-export function resetDate(resetsAt: number): string {
-  const date = new Date(resetsAt);
-  return `${date.toLocaleDateString([], { weekday: "short", day: "numeric", month: "short" })} ${date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
+  return localDaysBetween(now, resetsAt) === 0 ? clockTime(resetsAt) : weekdayClock(resetsAt);
 }
 
 /** "Thu 23:00 · in 3d 4h": the clock that survives a glance away, and whether to wait. */
@@ -89,15 +92,15 @@ export function resetMoment(resetsAt: number, now = Date.now()): string {
   return `${resetClock(resetsAt, now)} · ${relativeReset(resetsAt, now)}`;
 }
 
-/** The day separator's visible label: "Today", "Yesterday", else the weekday and date (with the year when not this year). */
+/** A day's visible label: "Today", "Yesterday", else the short weekday and ISO date, "Sun 2026-09-20". */
 export function dayLabel(at: number, now = Date.now()): string {
   const days = localDaysBetween(at, now);
   if (days === 0) return "Today";
   if (days === 1) return "Yesterday";
-  return fullDate(at, now);
+  return `${weekday(at)} ${localDayKey(at)}`;
 }
 
-/** The full day for assistive technology and the visible label beyond yesterday. */
+/** The full day in the locale's long form, with the year when not this year: for assistive technology. */
 export function fullDate(at: number, now = Date.now()): string {
   const sameYear = new Date(at).getFullYear() === new Date(now).getFullYear();
   return new Date(at).toLocaleDateString([], { weekday: "long", day: "numeric", month: "long", ...(sameYear ? {} : { year: "numeric" }) });

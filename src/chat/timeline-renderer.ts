@@ -10,7 +10,7 @@ import { commandSubject, describeToolDetail, deriveTodoActivities, patchDiffLine
 import type { AcceptedDraft, ChatProjection } from "./projection";
 import { formatUsd } from "./usage";
 import { wakeupRowLabel } from "./scheduled-wakeups";
-import { dayLabel, fullDate, knownTime, localDayKey, nextLocalMidnight, resetDate } from "./dates";
+import { dayLabel, fullDate, knownTime, localDayKey, localDaysBetween, nextLocalMidnight, weekdayClock } from "./dates";
 import { isLiveConversationStatus, isRateLimitStanding, type ActivityStatus, type ConversationItem, type ConversationStatus, type MessageAttachment, type PermissionOutcome, type QueuedMessage, type QuestionRequest, type RevertedUserMessage, type TokenUsage, type ToolItem } from "./types";
 
 type RenderedEntry = { node: HTMLElement; item: ConversationItem; active: boolean; variant: string; shellVariant?: string };
@@ -1198,10 +1198,11 @@ export function renderItem(item: ConversationItem, open: boolean, activeRequest:
   }
   if (item.type === "notice") {
     // A reset time is formatted here, in the reader's zone, never on the server.
-    // Absolute (weekday, date, clock) and never relative: the notice stays in
-    // the transcript and is not re-rendered as time passes, so "in 2h" or a
-    // bare "14:00" would be wrong the moment it is read later or replayed.
-    const resets = item.resetsAt === undefined ? "" : ` Resets ${resetDate(item.resetsAt)}.`;
+    // Weekday and clock, never relative: the notice stays in the transcript
+    // and is not re-rendered as time passes, so "in 2h" or a bare "14:00"
+    // would be wrong the moment it is read later or replayed. The day marker
+    // above it gives the date.
+    const resets = item.resetsAt === undefined ? "" : ` Resets ${weekdayClock(item.resetsAt)}.`;
     return `<aside class="chat-item chat-notice is-${item.level}" data-chat-item-id="${id}"${stamp}${item.code ? ` data-notice-code="${escapeHtmlAttribute(item.code)}"` : ""} role="${item.level === "error" ? "alert" : "status"}">${escapeHtml(item.message + resets)}</aside>`;
   }
   // Compaction is a boundary, not a step: a quiet rule across the timeline
@@ -1727,10 +1728,12 @@ function counts(additions?: number, deletions?: number): string {
   return additions === undefined && deletions === undefined ? "" : ` <span class="chat-change-counts">+${additions ?? 0} -${deletions ?? 0}</span>`;
 }
 
+// The locale's long date, which reads better aloud than the ISO label;
+// "Today, Friday 25 September" keeps the relative word as well.
 function daySeparatorAriaLabel(at: number, now: number): string {
-  const label = dayLabel(at, now);
+  const days = localDaysBetween(at, now);
   const full = fullDate(at, now);
-  return label === full ? full : `${label}, ${full}`;
+  return days === 0 || days === 1 ? `${dayLabel(at, now)}, ${full}` : full;
 }
 
 // Not an item: no data-chat-item-id, so anchoring, item actions, copy, and

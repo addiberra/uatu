@@ -1,10 +1,9 @@
 import { describe, expect, test } from "bun:test";
 
-import { clockTime, dayLabel, fullDate, knownTime, localDayKey, localDaysBetween, nextLocalMidnight, relativeReset, resetClock, resetDate, resetMoment } from "./dates";
+import { clockTime, dayLabel, fullDate, knownTime, localDayKey, localDaysBetween, nextLocalMidnight, relativeReset, resetClock, resetMoment, weekdayClock } from "./dates";
 
 // Local wall-clock instants, so every case holds in whatever zone runs it.
 const at = (month: number, day: number, hour = 12, minute = 0, year = 2026) => new Date(year, month - 1, day, hour, minute).getTime();
-const clock = (value: number) => new Date(value).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 const weekday = (value: number) => new Date(value).toLocaleDateString([], { weekday: "short" });
 
 describe("local calendar days", () => {
@@ -26,61 +25,67 @@ describe("local calendar days", () => {
 });
 
 describe("reset wording", () => {
-  test("a reset later today is a bare clock time", () => {
+  test("a reset later today is a bare 24-hour clock time", () => {
     const now = at(9, 25, 14);
-    expect(resetClock(at(9, 25, 23), now)).toBe(clock(at(9, 25, 23)));
+    expect(resetClock(at(9, 25, 23), now)).toBe("23:00");
   });
 
   test("a reset early tomorrow names the day although it is under 24 hours away", () => {
     const now = at(9, 25, 23, 30);
     const reset = at(9, 26, 6);
-    expect(resetClock(reset, now)).toBe(`${weekday(reset)} ${clock(reset)}`);
+    expect(resetClock(reset, now)).toBe(`${weekday(reset)} 06:00`);
   });
 
-  test("a reset later this week names its weekday; a week out, its date too", () => {
+  test("a reset on any later day names its weekday, never its date", () => {
     const now = at(9, 21, 9);
     const thursday = at(9, 24, 23);
-    expect(resetClock(thursday, now)).toBe(`${weekday(thursday)} ${clock(thursday)}`);
-    const nextMonday = at(9, 28, 9);
-    const dated = new Date(nextMonday).toLocaleDateString([], { weekday: "short", day: "numeric", month: "short" });
-    expect(resetClock(nextMonday, now)).toBe(`${dated} ${clock(nextMonday)}`);
+    expect(resetClock(thursday, now)).toBe(`${weekday(thursday)} 23:00`);
+    const nextWeek = at(10, 5, 23);
+    expect(resetClock(nextWeek, now)).toBe(`${weekday(nextWeek)} 23:00`);
+    expect(resetClock(nextWeek, now)).not.toContain("2026");
   });
 
   test("a reset already passed keeps its day and reads as now", () => {
     const now = at(9, 25, 9);
     const yesterday = at(9, 24, 23);
-    expect(resetMoment(yesterday, now)).toBe(`${weekday(yesterday)} ${clock(yesterday)} · now`);
+    expect(resetMoment(yesterday, now)).toBe(`${weekday(yesterday)} 23:00 · now`);
   });
 
-  test("an absolute reset always carries weekday and date, whatever day it is read", () => {
-    const reset = at(9, 25, 14);
-    const dated = new Date(reset).toLocaleDateString([], { weekday: "short", day: "numeric", month: "short" });
-    expect(resetDate(reset)).toBe(`${dated} ${clock(reset)}`);
-    expect(resetDate(reset)).not.toContain("now");
+  test("the weekday clock names the weekday whatever day it is read", () => {
+    const reset = at(9, 28, 14, 5);
+    expect(weekdayClock(reset)).toBe(`${weekday(reset)} 14:05`);
+    expect(weekdayClock(reset)).not.toContain("now");
   });
 
   test("the moment pairs the clock with the time remaining", () => {
     const now = at(9, 21, 19);
     const reset = at(9, 24, 23);
-    expect(resetMoment(reset, now)).toBe(`${weekday(reset)} ${clock(reset)} · ${relativeReset(reset, now)}`);
-    expect(relativeReset(reset, now)).toBe("in 3d 4h");
+    expect(resetMoment(reset, now)).toBe(`${weekday(reset)} 23:00 · in 3d 4h`);
+    const later = at(10, 1, 23);
+    expect(resetMoment(later, now)).toBe(`${weekday(later)} 23:00 · in 10d 4h`);
   });
 });
 
 describe("day labels", () => {
-  test("today and yesterday are named; older days read their weekday and date", () => {
+  test("today and yesterday are named; older days read their short weekday and ISO date", () => {
     const now = at(9, 25, 10);
     expect(dayLabel(at(9, 25, 0, 1), now)).toBe("Today");
     expect(dayLabel(at(9, 24, 23, 59), now)).toBe("Yesterday");
     const older = at(9, 20);
-    expect(dayLabel(older, now)).toBe(new Date(older).toLocaleDateString([], { weekday: "long", day: "numeric", month: "long" }));
+    expect(dayLabel(older, now)).toBe(`${weekday(older)} 2026-09-20`);
   });
 
-  test("a day in another year carries the year", () => {
+  test("the ISO date is the local day, not the UTC one", () => {
+    const now = at(9, 25, 10);
+    expect(dayLabel(at(9, 5, 0, 5), now)).toEndWith(" 2026-09-05");
+    expect(dayLabel(at(9, 5, 23, 55), now)).toEndWith(" 2026-09-05");
+  });
+
+  test("a day in another year carries its year; the long form for assistive technology adds it only then", () => {
     const now = at(1, 3, 10, 0, 2027);
     const lastYear = at(12, 20, 10, 0, 2026);
-    expect(dayLabel(lastYear, now)).toBe(new Date(lastYear).toLocaleDateString([], { weekday: "long", day: "numeric", month: "long", year: "numeric" }));
-    expect(fullDate(lastYear, now)).toContain("2026");
+    expect(dayLabel(lastYear, now)).toBe(`${weekday(lastYear)} 2026-12-20`);
+    expect(fullDate(lastYear, now)).toBe(new Date(lastYear).toLocaleDateString([], { weekday: "long", day: "numeric", month: "long", year: "numeric" }));
     expect(fullDate(at(1, 1, 10, 0, 2027), now)).not.toContain("2027");
   });
 
@@ -97,7 +102,10 @@ describe("usable times", () => {
     expect(knownTime(at(9, 25))).toBe(true);
   });
 
-  test("the clock time is the reader-local hour and minute", () => {
-    expect(clockTime(at(9, 25, 14, 32))).toBe(clock(at(9, 25, 14, 32)));
+  test("the clock time is the reader-local hour and minute, 24-hour and zero-padded", () => {
+    expect(clockTime(at(9, 25, 14, 32))).toBe("14:32");
+    expect(clockTime(at(9, 25, 2, 6))).toBe("02:06");
+    expect(clockTime(at(9, 25, 0, 0))).toBe("00:00");
+    expect(clockTime(at(9, 25, 19, 43))).not.toMatch(/AM|PM/i);
   });
 });

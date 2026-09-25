@@ -10,9 +10,9 @@ belonging to the day of the content before it and SHALL NOT start a
 separator. Content whose reported time is later than the reader's clock
 SHALL be treated as happening now, so that no separator names a day after
 the reader's current day. A separator SHALL read "Today" or "Yesterday" for those days,
-and otherwise the weekday and date, adding the year when it is not the
-current year; dates and weekdays SHALL be formatted in the reader's locale
-and time zone. Replayed or paged-in history SHALL be separated by the same
+and otherwise the short weekday and the ISO date (`YYYY-MM-DD`), such as
+"Sun 2026-09-20"; days SHALL be those of the reader's time zone, and only
+the weekday name MAY follow the reader's locale. Replayed or paged-in history SHALL be separated by the same
 rule as live content, from the times each agent reports for it. While the
 reader scrolls through a day's content, that day's separator SHALL remain
 visible at the top of the transcript until the next day's separator
@@ -30,7 +30,7 @@ existing separators SHALL be relabelled without waiting for new content.
 
 #### Scenario: Messages on different days are separated
 - **WHEN** a conversation has messages from two days ago, yesterday, and today
-- **THEN** the timeline shows a separator with the weekday and date before the first of the oldest day's content
+- **THEN** the timeline shows a separator with the short weekday and ISO date, such as "Wed 2026-09-23", before the first of the oldest day's content
 - **AND** a "Yesterday" separator before yesterday's first content
 - **AND** a "Today" separator before today's first content
 
@@ -72,7 +72,7 @@ existing separators SHALL be relabelled without waiting for new content.
 
 #### Scenario: Labels roll over at midnight
 - **WHEN** a conversation stays open across the reader's local midnight
-- **THEN** the separator that read "Today" reads "Yesterday" and the one that read "Yesterday" reads the weekday and date, without new content arriving
+- **THEN** the separator that read "Today" reads "Yesterday" and the one that read "Yesterday" reads the short weekday and ISO date, without new content arriving
 
 #### Scenario: Separators do not disturb reading position
 - **WHEN** a new day's first content arrives while the reader is paused above the end of the timeline
@@ -86,7 +86,9 @@ not it is highlighted. The suggestion list SHALL remain scrollable, SHALL
 NOT scroll horizontally in desktop or touch layouts, and SHALL keep the
 highlighted suggestion in view as the highlight moves. When a long command
 name leaves too little room beside it, the argument hint SHALL move onto
-its own line rather than wrapping into a narrow column.
+its own line rather than wrapping into a narrow column. An argument hint
+SHALL wrap only at its spaces, keeping each space-separated token whole,
+unless a single token is wider than the whole suggestion list.
 
 #### Scenario: A long description wraps
 - **WHEN** the user types `/code` and the agent offers `/code-review` with a description longer than one line of the suggestion list
@@ -107,3 +109,8 @@ its own line rather than wrapping into a narrow column.
 #### Scenario: A long name does not squeeze the argument hint
 - **WHEN** a narrow touch layout offers a command whose name is nearly as wide as the suggestion list, with an argument hint
 - **THEN** the argument hint is shown on its own line at a readable width rather than wrapping one character per line
+
+#### Scenario: An argument hint wraps only at its spaces
+- **WHEN** a narrow touch layout offers a command whose argument hint, such as `[path/to/a/long/argument] [--comment]`, does not fit on one line
+- **THEN** the hint wraps between its tokens, so `[--comment]` stays whole and no `]` is left on a line of its own
+- **AND** only a token wider than the whole suggestion list is broken inside

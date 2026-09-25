@@ -257,7 +257,8 @@ test.describe("desktop OpenCode chat", () => {
       const today = new Date();
       const at = (offset: number, hour: number) => new Date(today.getFullYear(), today.getMonth(), today.getDate() - offset, hour, 0).getTime();
       const older = new Date(at(2, 9));
-      return { older: at(2, 9), yesterday: at(1, 9), today: at(0, 0) + 60_000, olderLabel: older.toLocaleDateString([], { weekday: "long", day: "numeric", month: "long", ...(older.getFullYear() === today.getFullYear() ? {} : { year: "numeric" }) }) };
+      const iso = `${older.getFullYear()}-${String(older.getMonth() + 1).padStart(2, "0")}-${String(older.getDate()).padStart(2, "0")}`;
+      return { older: at(2, 9), yesterday: at(1, 9), today: at(0, 0) + 60_000, olderLabel: `${older.toLocaleDateString([], { weekday: "short" })} ${iso}` };
     });
     // Prompts alternate with full-width replies, so there is transcript text
     // beside a pinned label as well as under it.

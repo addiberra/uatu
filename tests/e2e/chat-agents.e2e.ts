@@ -66,9 +66,12 @@ test.describe("multi-agent chat", () => {
     await expect(select.locator("option", { hasText: "OpenCode earlier" })).toHaveCount(1);
 
     const expected = await page.evaluate(([older, yesterdayClaude, yesterdayOpen, today]) => {
-      const clock = (value: number) => new Date(value).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+      // 24-hour clock and ISO date whatever the locale; only the weekday is the locale's.
+      const pad = (value: number) => String(value).padStart(2, "0");
+      const clock = (value: number) => `${pad(new Date(value).getHours())}:${pad(new Date(value).getMinutes())}`;
+      const day = new Date(older);
       return {
-        older: new Date(older).toLocaleDateString([], { weekday: "long", day: "numeric", month: "long", ...(new Date(older).getFullYear() === new Date().getFullYear() ? {} : { year: "numeric" }) }),
+        older: `${day.toLocaleDateString([], { weekday: "short" })} ${day.getFullYear()}-${pad(day.getMonth() + 1)}-${pad(day.getDate())}`,
         times: [clock(today), clock(yesterdayClaude), clock(yesterdayOpen), clock(older)],
       };
     }, [olderDay, at(1, 18, 5), at(1, 9, 30), at(0, 0, 1)]);

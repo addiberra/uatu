@@ -88,14 +88,19 @@ pass them through whole. The same menu serves both agents.
 Change `resetClock` to decide by the reader's **local calendar day**
 instead of "under 24 hours". The rule:
 - Same local day as `now`: `HH:MM`.
-- 1–6 local days ahead: `<short weekday> HH:MM` (`Thu 23:00`). This is the
-  existing shape, so the plan rows look the same.
-- 7 or more local days ahead: `<short weekday> <day> <short month> HH:MM`
-  via `toLocaleDateString([], { weekday: "short", day: "numeric", month: "short" })`.
-  Without the date, the weekday would be today's weekday and could be
-  read as today.
+- Any other local day: `<short weekday> HH:MM` (`Thu 23:00`). This is the
+  existing shape, so the plan rows look the same. No date is added, however
+  far out: rate-limit windows are at most a week long, and wherever the
+  reset is stated at length the time remaining (`in 10d 4h`) says how far
+  off it is.
 - In the past (the standing is stale): the same day rule. `relativeReset`
   already says `now`.
+
+Every clock time on these surfaces is 24-hour and zero-padded (`19:43`,
+`02:06`) whatever the browser locale, built from the local hour and minute
+(`clockTime`), never `toLocaleTimeString`, which gives `7:43 PM` in a
+12-hour locale. Only the weekday name follows the locale
+(`toLocaleDateString([], { weekday: "short" })`).
 
 Add `resetMoment(resetsAt, now)` next to it, returning
 `"<resetClock> · <relativeReset>"`. Then:
@@ -106,14 +111,15 @@ Add `resetMoment(resetsAt, now)` next to it, returning
   `composer-status.ts`, which replaces the two inline copies in `ui.ts`.
 - Chip (`rateLimitBadgeLabel`): `resets ${resetClock}` only. The chip is
   space-constrained, and the day is the part that removes the ambiguity.
-- Timeline notice renderer: an absolute `resetDate(resetsAt)` —
-  `"<short weekday> <day> <short month> HH:MM"` — with no relative part and
-  no bare same-day clock. A notice is a durable timeline item: it is
-  rendered once and kept (and replayed with history), so a relative "in 2h
-  05m" or a bare "14:00" baked at render time would read wrongly later
-  ("Resets Mon 14:00 · now" on a week-old notice). Refreshing it on a tick
-  was rejected as more machinery for a path that rate-limit standings,
-  filtered from the timeline, mostly do not reach.
+- Timeline notice renderer: `weekdayClock(resetsAt)` — `"<short weekday>
+  HH:MM"` (`Mon 23:00`) — with no relative part and no bare same-day
+  clock. A notice is a durable timeline item: it is rendered once and kept
+  (and replayed with history), so a relative "in 2h 05m" or a bare "14:00"
+  baked at render time would read wrongly later ("Resets Mon 14:00 · now"
+  on a week-old notice). The day separator above the notice (D2) gives its
+  date, so the weekday is enough. Refreshing it on a tick was rejected as
+  more machinery for a path that rate-limit standings, filtered from the
+  timeline, mostly do not reach.
 
 Local-day comparison compares `new Date(x)` year/month/date in the local
 zone. It does not use the difference in ms, so DST days (23/25 h) are
@@ -167,11 +173,16 @@ day and never starts a separator.
   not "Today", and a midnight relabel cannot shift the match count under an
   open find bar.
 - Label: "Today" / "Yesterday" by local-day difference from `now`.
-  Otherwise `toLocaleDateString([], { weekday: "long", day: "numeric", month: "long" })`,
-  with `year: "numeric"` added when the year differs from `now`'s. The
-  English words match the rest of the UI's copy. Dates follow the browser
-  locale (`[]`), as the existing reset and tooltip code do. The time zone
-  is the browser's.
+  Otherwise the short weekday and the ISO date, `Sun 2026-09-20`: the
+  weekday name from `toLocaleDateString([], { weekday: "short" })`, the
+  date as `YYYY-MM-DD` from the local calendar fields (`localDayKey`, not
+  `toISOString`, which is the UTC day). The ISO date always carries its
+  year and reads the same in every locale. The English words match the
+  rest of the UI's copy. The time zone is the browser's.
+- The `aria-label` keeps the locale's long form, which reads better aloud
+  than an ISO date: "Today, Friday 25 September" for today and yesterday,
+  and the long date alone ("Sunday 20 September", with the year when not
+  the current one) for older days.
 - Clock injection: the renderer takes `now: () => number` (default
   `Date.now`) so unit tests control "today".
 - **Day rollover:** after a render that emitted separators, the renderer
@@ -259,16 +270,27 @@ describe for the preview. The drill-down needs the same check.
 This is a CSS-only change in `src/styles.css`, based on the user's
 decision: always wrap fully, with no clamp.
 - `.chat-command-hint, .chat-command-description`: remove `nowrap`,
-  `overflow: hidden` and `text-overflow: ellipsis`. Add `white-space:
-  normal; overflow-wrap: anywhere` so long unbroken paths and URLs also
-  wrap.
+  `overflow: hidden` and `text-overflow: ellipsis`, for `white-space:
+  normal`. The description also gets `overflow-wrap: anywhere` so long
+  unbroken paths and URLs wrap.
 - The option's two-column grid (`minmax(max-content, auto) 1fr`) let a very
   long command name force horizontal overflow on a narrow touch panel, and
   a shrinkable name column would instead squeeze the argument hint into a
   sliver wrapping one character per line. The option becomes a wrapping
   flex row: the name shrinks and wraps (`overflow-wrap: anywhere`), the
-  hint has an 8rem flex basis so it drops onto its own line when less is
-  left beside the name, and the description takes a full line.
+  hint drops onto its own line when it does not fit whole beside the name,
+  and the description takes a full line.
+- An argument hint wraps only at its spaces. `overflow-wrap: anywhere` on
+  the hint split tokens such as `[--comment]` and left a lone `]` on a
+  line, and even normal line breaking may break after a hyphen or slash.
+  `renderCommandMenu` therefore wraps each space-separated token in a
+  `span.chat-command-hint-token`, an `inline-block` with `max-width: 100%`
+  and `overflow-wrap: anywhere`: an atomic box on the hint's lines, broken
+  inside only when the token alone is wider than the whole line. The hint
+  itself has `flex: 1 1 auto; max-width: 100%`, so its basis is its whole
+  width and it shares the name's line only when it fits there entire.
+  A word joiner between characters was considered instead of spans; it
+  changes the hint's text for no gain.
 - Keyboard highlight: the existing
   `scrollIntoView({ block: "nearest" })` on the active option already
   keeps a tall highlighted option in view inside the scrolling menu
@@ -312,7 +334,7 @@ user asked for each conversation's time as well.
   with today's work, and grouping by creation would break the newest-first
   order into out-of-order days.
 - Headings use the timeline separators' `dayLabel` ("Today", "Yesterday",
-  otherwise weekday and date, with the year when not current). The chat
+  otherwise short weekday and ISO date, `Sun 2026-09-20`). The chat
   surface then states a day one way everywhere, rather than OpenCode's
   `toDateString` form.
 - Keep the native `<select>` and file options into
@@ -325,7 +347,8 @@ user asked for each conversation's time as well.
   deleted-conversation, and startup-placeholder code that works on the
   select. Rejected.
 - Each option's label is `title[ · agent] · HH:MM`, the clock time of the
-  last activity (`clockTime`, the reader's locale). The heading gives the
+  last activity (`clockTime`: 24-hour, zero-padded, in every locale), for
+  example `Tick · OpenCode · 19:43`. The heading gives the
   day, so the time alone is unambiguous. One `conversationOptionLabel`
   function serves `patchChooser` and the three direct relabel paths. As a
   side effect, those paths keep the agent suffix too.

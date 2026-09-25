@@ -3870,6 +3870,12 @@ export function initChat(api = new ChatApiClient()): void {
     input.focus();
   };
 
+  // Each space-separated token of an argument hint is one unit, so the hint
+  // wraps only between tokens: "[--comment]" never splits after "--", and a
+  // lone "]" never lands on a line of its own (styles.css).
+  const hintTokens = (hint: string) => hint.split(/\s+/).filter(Boolean)
+    .map(token => `<span class="chat-command-hint-token">${escapeHtml(token)}</span>`).join(" ");
+
   const renderCommandMenu = () => {
     const next = matchingCommands(input.value, input.selectionStart ?? input.value.length, commands);
     if (!next) { closeCommandMenu(); return; }
@@ -3882,7 +3888,7 @@ export function initChat(api = new ChatApiClient()): void {
       option.className = `chat-command-option${index === commandIndex ? " is-active" : ""}`;
       option.setAttribute("role", "option");
       option.setAttribute("aria-selected", String(index === commandIndex));
-      option.innerHTML = `<span class="chat-command-name">/${escapeHtml(command.name)}</span><span class="chat-command-hint">${escapeHtml(command.argumentHint)}</span><span class="chat-command-description">${escapeHtml(command.description)}</span>`;
+      option.innerHTML = `<span class="chat-command-name">/${escapeHtml(command.name)}</span><span class="chat-command-hint">${hintTokens(command.argumentHint)}</span><span class="chat-command-description">${escapeHtml(command.description)}</span>`;
       option.addEventListener("pointerdown", event => event.preventDefault());
       option.addEventListener("click", () => chooseCommand(index));
       return option;

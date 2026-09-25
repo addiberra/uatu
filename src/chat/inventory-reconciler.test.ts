@@ -20,7 +20,6 @@ function conversation(id: string, title = id, updatedAt = 1): ConversationSummar
 
 // Local wall-clock instants, so every case holds in whatever zone runs it.
 const at = (month: number, day: number, hour = 12, minute = 0, year = 2026) => new Date(year, month - 1, day, hour, minute).getTime();
-const clock = (value: number) => new Date(value).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 const layout = (select: HTMLSelectElement) => Array.from(select.children).map(child => child.tagName === "OPTGROUP"
   ? [(child as HTMLOptGroupElement).label, Array.from(child.children).map(option => (option as HTMLOptionElement).value)]
   : (child as HTMLOptionElement).value);
@@ -219,17 +218,17 @@ describe("conversation inventory reconciliation", () => {
     expect(conversationDayGroup(conversation("b", "b", at(9, 24, 23, 55)), now)).toEqual({ key: "2026-09-24", label: "Yesterday" });
     const older = conversationDayGroup(conversation("c", "c", at(9, 20)), now);
     expect(older.key).toBe("2026-09-20");
-    expect(older.label).toBe(new Date(at(9, 20)).toLocaleDateString([], { weekday: "long", day: "numeric", month: "long" }));
-    expect(conversationDayGroup(conversation("d", "d", at(12, 30, 12, 0, 2025)), now).label).toContain("2025");
+    expect(older.label).toBe(`${new Date(at(9, 20)).toLocaleDateString([], { weekday: "short" })} 2026-09-20`);
+    expect(conversationDayGroup(conversation("d", "d", at(12, 30, 12, 0, 2025)), now).label).toEndWith(" 2025-12-30");
   });
 
   test("an agent clock ahead of the reader is today, and a missing time is undated", () => {
     const now = at(9, 25, 23, 59);
     expect(conversationDayGroup(conversation("ahead", "ahead", at(9, 26, 0, 1)), now)).toEqual({ key: "2026-09-25", label: "Today" });
-    expect(conversationActivitySuffix(conversation("ahead", "ahead", at(9, 26, 0, 1)), now)).toBe(` · ${clock(now)}`);
+    expect(conversationActivitySuffix(conversation("ahead", "ahead", at(9, 26, 0, 1)), now)).toBe(" · 23:59");
     expect(conversationDayGroup(conversation("zero", "zero", 0), now)).toBe(UNDATED_GROUP);
     expect(conversationActivitySuffix(conversation("zero", "zero", 0), now)).toBe("");
-    expect(conversationActivitySuffix(conversation("t", "t", at(9, 24, 14, 32)), now)).toBe(` · ${clock(at(9, 24, 14, 32))}`);
+    expect(conversationActivitySuffix(conversation("t", "t", at(9, 24, 14, 32)), now)).toBe(" · 14:32");
   });
 
   test("groups options under one heading per day, newest first, and keeps option elements", () => {

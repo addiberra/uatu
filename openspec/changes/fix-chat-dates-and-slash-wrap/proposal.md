@@ -21,29 +21,30 @@ OpenCode's own session list groups sessions by day.
   label, and the assistive-technology announcement — uses one shared reset
   formatter. The reset is a bare clock time
   only when it falls on the reader's current local calendar day; otherwise
-  it carries the weekday (and the date when the weekday alone would be
-  ambiguous). The readout's standing line and the announcement also state
+  it carries the weekday. Times are 24-hour `HH:MM` in every locale. The readout's standing line and the announcement also state
   the relative time until the reset, matching the plan rows. The plan rows'
   existing `resetClock` switches from a "within 24 hours" rule to the same
   calendar-day rule, so a reset tomorrow evening is no longer shown as a bare
   time that reads as today. A notice kept in the timeline states its reset
-  absolutely (weekday, date, and clock time, nothing relative), so it stays
-  true when read or replayed later.
+  by weekday and clock time, nothing relative, so it stays true when read
+  or replayed later; the day separator above it gives the date.
 - **Day separators in conversation history (#427).** The timeline (main
   conversation and subagent drill-down, every agent) places a day separator
   at the start of each local calendar day's run of content — "Today",
-  "Yesterday", or a weekday-and-date label — including the first day shown.
+  "Yesterday", or a short weekday and ISO date such as "Sun 2026-09-20" —
+  including the first day shown.
   Separators stick to the top of the transcript while their day is being
   read, so date context survives scrolling back through long conversations.
-  Labels are computed in the reader's locale and time zone and are refreshed
+  Labels are computed in the reader's time zone (weekday names in the
+  reader's locale) and are refreshed
   when the local day rolls over.
 - **Wrapped slash-command descriptions (#424).** Slash-command suggestions
-  wrap their description (and argument hint) onto further lines instead of
-  truncating to one ellipsized line; every suggestion shows its whole
+  wrap their description (and argument hint, at its spaces only) onto
+  further lines instead of truncating to one ellipsized line; every suggestion shows its whole
   description, and the list scrolls to keep the keyboard highlight in view.
 - **A conversation chooser grouped by date.** The chooser files every
   agent's conversations under headings for the local day of their last
-  activity ("Today", "Yesterday", or a weekday-and-date label), newest
+  activity ("Today", "Yesterday", or "Sun 2026-09-20"), newest
   first, like OpenCode's session list. Each entry also shows its
   last-activity time. The native select keeps working on desktop and
   touch; the headings are its option groups.

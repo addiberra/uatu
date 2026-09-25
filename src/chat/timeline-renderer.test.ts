@@ -2298,24 +2298,29 @@ describe("day separators", () => {
   const renderer = () => { const value = new TimelineRenderer(); value.now = () => now; return value; };
   const outline = (element: HTMLElement) => Array.from(element.children).map(child => child.classList.contains("chat-day-separator") ? `day:${child.textContent}` : child.getAttribute("data-chat-item-id"));
   const longDate = (at: number) => new Date(at).toLocaleDateString([], { weekday: "long", day: "numeric", month: "long" });
+  // The visible label beyond yesterday: short weekday and ISO date.
+  const isoLabel = (at: number) => `${new Date(at).toLocaleDateString([], { weekday: "short" })} 2026-09-${String(new Date(at).getDate()).padStart(2, "0")}`;
 
   test("each local day's run starts with its separator, the first day included", () => {
     const element = host();
     const older = local(23, 9);
     renderer().render(element, projectionWith([user("a", older), answer("a", older + 60_000), user("b", local(24, 18)), user("c", local(25, 8)), answer("c", local(25, 8, 1))], { status: "idle" }), new Set());
-    expect(outline(element)).toEqual([`day:${longDate(older)}`, "message:a", "part:a", "day:Yesterday", "message:b", "day:Today", "message:c", "part:c"]);
+    expect(outline(element)).toEqual([`day:${isoLabel(older)}`, "message:a", "part:a", "day:Yesterday", "message:b", "day:Today", "message:c", "part:c"]);
     const separator = element.querySelector<HTMLElement>(".chat-day-separator")!;
     expect(separator.getAttribute("role")).toBe("separator");
     expect(separator.hasAttribute("data-chat-item-id")).toBe(false);
     expect(separator.getAttribute("data-chat-day")).toBe("2026-09-23");
     expect(separator.querySelector("time")!.getAttribute("datetime")).toBe("2026-09-23");
     expect(element.querySelectorAll(".chat-day-separator")[2]!.getAttribute("aria-label")).toBe(`Today, ${longDate(local(25))}`);
+    // An older day is read aloud in the locale's long form rather than as ISO.
+    expect(separator.getAttribute("aria-label")).toBe(longDate(older));
+    expect(separator.textContent).toBe(`${new Date(older).toLocaleDateString([], { weekday: "short" })} 2026-09-23`);
   });
 
   test("a single past day is still dated", () => {
     const element = host();
     renderer().render(element, projectionWith([user("a", local(18)), answer("a", local(18, 13))], { status: "idle" }), new Set());
-    expect(outline(element)).toEqual([`day:${longDate(local(18))}`, "message:a", "part:a"]);
+    expect(outline(element)).toEqual([`day:${isoLabel(local(18))}`, "message:a", "part:a"]);
   });
 
   test("23:50 and 00:10 are separated", () => {
@@ -2371,7 +2376,7 @@ describe("day separators", () => {
       expect(armed.delay).toBe(30 * 60_000 + 1_000);
       clock = local(26, 0, 0) + 1_000;
       armed.callback();
-      expect(outline(element)).toEqual([`day:${longDate(local(24))}`, "message:a", "day:Yesterday", "message:b"]);
+      expect(outline(element)).toEqual([`day:${isoLabel(local(24))}`, "message:a", "day:Yesterday", "message:b"]);
       expect(element.querySelectorAll(".chat-day-separator")[1]!.getAttribute("aria-label")).toBe(`Yesterday, ${longDate(local(25))}`);
     } finally {
       Reflect.set(globalThis, "setTimeout", realSetTimeout);
@@ -2379,15 +2384,14 @@ describe("day separators", () => {
     }
   });
 
-  test("a notice's reset is stated absolutely, so it is still true when replayed later", () => {
+  test("a notice's reset is stated by weekday and clock, so it is still true when replayed later", () => {
     const element = host();
     // Rendered long after the reset: nothing relative ("now", "in 2h", a bare
     // "today" clock) may be baked into the durable notice.
     const reset = local(21, 14);
     renderer().render(element, projectionWith([{ id: "notice:x", type: "notice", createdAt: local(21, 9), level: "warning", message: "Heads up.", resetsAt: reset }], { status: "idle" }), new Set());
-    const date = new Date(reset).toLocaleDateString([], { weekday: "short", day: "numeric", month: "short" });
-    const clock = new Date(reset).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-    expect(element.querySelector(".chat-notice")!.textContent).toBe(`Heads up. Resets ${date} ${clock}.`);
+    const weekday = new Date(reset).toLocaleDateString([], { weekday: "short" });
+    expect(element.querySelector(".chat-notice")!.textContent).toBe(`Heads up. Resets ${weekday} 14:00.`);
   });
 
   test("separators are skipped by find", () => {
@@ -2435,7 +2439,7 @@ describe("day separators", () => {
       // render relabels and aims at the following midnight.
       clock = local(26, 8);
       view.render(element, projectionWith([...items, answer("b", local(25, 10))], { status: "idle" }), new Set());
-      expect(outline(element)).toEqual([`day:${longDate(local(24))}`, "message:a", "day:Yesterday", "message:b", "part:b"]);
+      expect(outline(element)).toEqual([`day:${isoLabel(local(24))}`, "message:a", "day:Yesterday", "message:b", "part:b"]);
       expect(timers).toHaveLength(2);
       expect(timers.at(-1)!.delay).toBe(16 * 3_600_000 + 1_000);
     } finally {
