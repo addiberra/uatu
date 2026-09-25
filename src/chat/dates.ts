@@ -37,6 +37,11 @@ export function weekdayClock(at: number): string {
   return `${weekday(at)} ${clockTime(at)}`;
 }
 
+/** A full moment for a tooltip or a record: "Sun 2026-09-20 19:43". */
+export function dateTime(at: number): string {
+  return `${weekday(at)} ${localDayKey(at)} ${clockTime(at)}`;
+}
+
 /** Whole local calendar days from `from` to `to` (negative when earlier). */
 export function localDaysBetween(from: number, to: number): number {
   const a = new Date(from);

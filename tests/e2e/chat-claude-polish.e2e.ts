@@ -867,7 +867,7 @@ test.describe("Claude Code chat polish (fixture-driven)", () => {
     await expect(page.locator("#chat-plan-readout-standing")).toHaveText(/^Approaching your 5-hour rate limit \(91% used\)\. Resets /);
     await expect(page.locator("#chat-plan-readout-head")).toBeVisible();
     await expect(page.locator("#chat-plan-readout-name")).toHaveText("Pro plan");
-    await expect(page.locator("#chat-plan-readout-age")).toHaveText(/^as of \d{1,2}:\d{2}(?: [AP]M)? · 12 min ago$/);
+    await expect(page.locator("#chat-plan-readout-age")).toHaveText(/^as of \d{2}:\d{2} · 12 min ago$/);
     await expect(page.locator("#chat-plan-readout-rows .plan-row-label")).toHaveText(["Session", "Week"]);
     await capture(page, testInfo, "standing-beside-last-known-plan");
     // No session was live: the stale figures stand, nothing was started, nothing is called a failure.
@@ -1279,7 +1279,8 @@ test.describe("Claude Code plan readout at phone width", () => {
 test.describe("Claude Code scheduled wakeups (fixture-driven)", () => {
   test.use({ viewport: { width: 1400, height: 1000 } });
 
-  const clock = (time: number) => new Date(time).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  // 24-hour and zero-padded in every locale.
+  const clock = (time: number) => `${String(new Date(time).getHours()).padStart(2, "0")}:${String(new Date(time).getMinutes()).padStart(2, "0")}`;
 
   test("schedule → scheduled state → fire → wakeup turn → release", async ({ page, request }, testInfo) => {
     const id = await bootClaude(page, request, "Scheduled wakeups", [

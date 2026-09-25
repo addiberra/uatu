@@ -6,7 +6,7 @@
 import { backgroundStatusLabel } from "./background-tasks";
 import { scheduledStatusLabel } from "./scheduled-wakeups";
 import { statusLabel } from "./timeline-renderer";
-import { relativeReset, resetClock, resetMoment } from "./dates";
+import { clockTime, relativeReset, resetClock, resetMoment, weekdayClock } from "./dates";
 import { isRateLimitStanding, type BackgroundTaskItem, type ScheduledWakeupItem, type ContextReportItem, type ConversationItem, type ConversationStatus, type NoticeItem, type PlanUtilization, type PlanUtilizationWindow, type SessionTotals, type UsageReadFailure } from "./types";
 
 export type ComposerRoutineState = {
@@ -189,9 +189,7 @@ export function sessionTotalsTitle(session: Pick<SessionTotals, "since">, items:
     if (item.type === "user_message" && (firstMessageAt === undefined || item.createdAt < firstMessageAt)) firstMessageAt = item.createdAt;
   }
   if (session.since === undefined || firstMessageAt === undefined || session.since <= firstMessageAt) return "This conversation";
-  const date = new Date(session.since);
-  const time = date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-  return `This conversation · since ${now - session.since < 86_400_000 ? time : `${date.toLocaleDateString([], { weekday: "short" })} ${time}`}`;
+  return `This conversation · since ${now - session.since < 86_400_000 ? clockTime(session.since) : weekdayClock(session.since)}`;
 }
 
 /**
@@ -321,7 +319,7 @@ export function usageAge(readAt: number, now = Date.now()): string {
 
 /** "as of 21:33 · 12 min ago" — the read's clock time and its age together. */
 export function usageAsOf(readAt: number, now = Date.now()): string {
-  return `as of ${new Date(readAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })} · ${usageAge(readAt, now)}`;
+  return `as of ${clockTime(readAt)} · ${usageAge(readAt, now)}`;
 }
 
 /** Why a read did not answer, as the readout says it. */

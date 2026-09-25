@@ -75,7 +75,7 @@ pass them through whole. The same menu serves both agents.
 
 **Non-Goals:**
 - No per-message time labels in the timeline. The existing hover tooltip
-  stays.
+  stays (in the D5 format).
 - No change to how agents stamp `createdAt`. Improving the live Claude
   fallback to `Date.now()` is out of scope.
 - No change to the normalized standing message text or to the wire.
@@ -374,6 +374,31 @@ user asked for each conversation's time as well.
 *Trade-off:* the collapsed select shows the selected option's label, so
 the header now shows the selected conversation's last-activity time after
 its title. The header truncates long labels as before.
+
+### D5. One 24-hour clock across the chat surface
+
+D1, D2 and D4 made the reset, day, and picker times 24-hour and ISO; the
+rest of the chat surface still used `toLocaleTimeString` /
+`toLocaleString`, so a 12-hour locale showed "as of 7:43 PM" beside
+"Resets 23:00". Every user-visible time in `src/chat` now goes through the
+`dates.ts` helpers:
+- `clockTime` ("19:43"): the plan readout's and usage pane's "as of"
+  (`usageAsOf`), the cost tally's "since" on the same day
+  (`sessionTotalsTitle`), and a wakeup firing today.
+- `weekdayClock` ("Mon 19:43"): the cost tally's "since" after a day has
+  passed, and a wakeup firing within the coming six days.
+- `dateTime` ("Sun 2026-09-20 19:43", new): a wakeup a week or more out
+  (replacing "1 Oct 09:00", with the ISO date for the same reason D1's
+  weekday alone would be ambiguous there), the wakeup row's tooltip, the
+  timeline items' hover tooltip, and the floating shell window's
+  completion time. These replace `toLocaleString()`, which also showed
+  seconds; a tooltip to the minute matches everything else.
+
+The composer's scheduled status and the wakeup rows reuse
+`wakeupFireTime`, so they change with it. Number formatting
+(`toLocaleString()` on token counts and currency) is not a time and stays
+locale-formatted. Aria-labels that carry these times use the same text,
+which reads unambiguously aloud.
 
 ## Risks / Trade-offs
 

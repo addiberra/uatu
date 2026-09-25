@@ -1513,7 +1513,7 @@ describe("scheduled wakeup rows and wakeup turns", () => {
   test("a pending wakeup is a timeline row with its prompt and fire time", () => {
     const host = render([row("pending")], "scheduled");
     const node = host.querySelector('[data-chat-item-id="wakeup:w1"]')!;
-    const time = new Date(fireAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    const time = "20:03";
     expect(node.className).toContain("chat-wakeup is-pending");
     expect(node.querySelector(".chat-wakeup-label")?.textContent).toContain(`Wakeup scheduled · about ${time}`);
     expect(node.querySelector(".chat-wakeup-subject")?.textContent).toBe("check the build");
@@ -2315,6 +2315,12 @@ describe("day separators", () => {
     // An older day is read aloud in the locale's long form rather than as ISO.
     expect(separator.getAttribute("aria-label")).toBe(longDate(older));
     expect(separator.textContent).toBe(`${new Date(older).toLocaleDateString([], { weekday: "short" })} 2026-09-23`);
+  });
+
+  test("an item's hover time is weekday, ISO date, and 24-hour clock", () => {
+    const element = host();
+    renderer().render(element, projectionWith([user("a", local(20, 19, 43))], { status: "idle" }), new Set());
+    expect(element.querySelector('[data-chat-item-id="message:a"]')!.getAttribute("title")).toBe(`${new Date(local(20)).toLocaleDateString([], { weekday: "short" })} 2026-09-20 19:43`);
   });
 
   test("a single past day is still dated", () => {

@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { clockTime, dayLabel, fullDate, knownTime, localDayKey, localDaysBetween, nextLocalMidnight, relativeReset, resetClock, resetMoment, weekdayClock } from "./dates";
+import { clockTime, dateTime, dayLabel, fullDate, knownTime, localDayKey, localDaysBetween, nextLocalMidnight, relativeReset, resetClock, resetMoment, weekdayClock } from "./dates";
 
 // Local wall-clock instants, so every case holds in whatever zone runs it.
 const at = (month: number, day: number, hour = 12, minute = 0, year = 2026) => new Date(year, month - 1, day, hour, minute).getTime();
@@ -107,5 +107,11 @@ describe("usable times", () => {
     expect(clockTime(at(9, 25, 2, 6))).toBe("02:06");
     expect(clockTime(at(9, 25, 0, 0))).toBe("00:00");
     expect(clockTime(at(9, 25, 19, 43))).not.toMatch(/AM|PM/i);
+  });
+
+  test("a full moment is short weekday, local ISO date, and 24-hour clock", () => {
+    const moment = at(9, 20, 19, 43);
+    expect(dateTime(moment)).toBe(`${weekday(moment)} 2026-09-20 19:43`);
+    expect(dateTime(at(9, 5, 0, 5))).toEndWith(" 2026-09-05 00:05");
   });
 });

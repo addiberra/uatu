@@ -49,7 +49,7 @@ import { configurationOptionLabel, createChatConfigurationPicker, type ChatConfi
 import { copyChatText } from "./copy-actions";
 import { announceConversationInventory, renderConversationInventoryAwareness, renderSelectedConversationDeleted } from "./inventory-presentation";
 import { ConversationInventoryTracker, SerializedInventoryReconciler, conversationActivitySuffix, conversationDayGroup, dedupeConversationInventory, isConversationChooserActivationKey, patchConversationOptions, retainedPresentationConversationIds } from "./inventory-reconciler";
-import { nextLocalMidnight } from "./dates";
+import { dateTime, nextLocalMidnight } from "./dates";
 import { watchPinnedDayLabels } from "./pinned-day";
 
 const PRESENTATION_KEY = "uatu:chat-presentation";
@@ -1109,7 +1109,7 @@ export function initChat(api = new ChatApiClient()): void {
       } else {
         // An expression the workspace cannot read is still stated, as written.
         when.textContent = wakeupFireTime(entry.nextFireAt) ?? entry.schedule;
-        if (entry.nextFireAt !== undefined) when.title = new Date(entry.nextFireAt).toLocaleString();
+        if (entry.nextFireAt !== undefined) when.title = dateTime(entry.nextFireAt);
       }
       row.append(when);
       const cancel = document.createElement("button");

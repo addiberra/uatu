@@ -54,3 +54,26 @@ change which conversation is selected.
 #### Scenario: The touch layout groups alike
 - **WHEN** the chooser is opened in the touch layout
 - **THEN** it shows the same day headings and entries as on desktop
+
+### Requirement: Chat times are 24-hour and chat dates are ISO in every locale
+Every time the chat surface shows, for every agent — including the usage
+readout's "as of" time, the conversation cost's "since" time, a scheduled
+wakeup's fire time in the composer, its list and the timeline, the hover
+time of a timeline item, and a shell output window's completion time —
+SHALL be a 24-hour clock time (`HH:MM`, zero-padded, never AM/PM) in the
+reader's time zone, whatever the reader's locale. Where a date is shown
+with it, the date SHALL be the ISO date (`YYYY-MM-DD`) after the short
+weekday, such as "Sun 2026-09-20 19:43"; only weekday names MAY follow the
+reader's locale.
+
+#### Scenario: The usage readout's time is 24-hour
+- **WHEN** the reader's browser locale uses a 12-hour clock and the plan usage was read at 7:43 in the evening
+- **THEN** the readout states "as of 19:43", never "7:43 PM"
+
+#### Scenario: A scheduled wakeup's fire time is 24-hour
+- **WHEN** a wakeup is scheduled to fire at 20:03 today, and another eight days from now at 09:00
+- **THEN** the first is stated as "about 20:03" and the second with its weekday and ISO date, such as "about Mon 2026-10-05 09:00"
+
+#### Scenario: A hover time states the date and 24-hour time
+- **WHEN** the reader hovers a timeline item created at 19:43 on 20 September 2026
+- **THEN** its hover text reads the short weekday, "2026-09-20", and "19:43", such as "Sun 2026-09-20 19:43"

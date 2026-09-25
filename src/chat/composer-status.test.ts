@@ -9,8 +9,6 @@ const base = { cancelling: false, submitting: false, backgroundDeclared: true, b
 
 describe("session totals title", () => {
   const user = (createdAt: number): ConversationItem => ({ id: `m${createdAt}`, type: "user_message", createdAt, text: "hi" });
-  const clock = (at: number) => new Date(at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-
   test("a tally that began at or before the first message is the whole conversation", () => {
     expect(sessionTotalsTitle({}, [user(10)])).toBe("This conversation");
     expect(sessionTotalsTitle({ since: 5 }, [user(10)])).toBe("This conversation");
@@ -23,9 +21,9 @@ describe("session totals title", () => {
   test("a tally that began after the first message is stated since when, with the weekday once a day has passed", () => {
     const since = Date.parse("2026-09-02T21:33:00");
     const items = [user(since - 3_600_000), user(since + 60_000)];
-    expect(sessionTotalsTitle({ since }, items, since + 5_000)).toBe(`This conversation · since ${clock(since)}`);
+    expect(sessionTotalsTitle({ since }, items, since + 5_000)).toBe("This conversation · since 21:33");
     const weekday = new Date(since).toLocaleDateString([], { weekday: "short" });
-    expect(sessionTotalsTitle({ since }, items, since + 2 * 86_400_000)).toBe(`This conversation · since ${weekday} ${clock(since)}`);
+    expect(sessionTotalsTitle({ since }, items, since + 2 * 86_400_000)).toBe(`This conversation · since ${weekday} 21:33`);
   });
 });
 
@@ -62,7 +60,7 @@ describe("composer routine state", () => {
     const now = new Date(2026, 8, 24, 20, 1).getTime();
     const wakeup = (id: string, nextFireAt?: number): ScheduledWakeupItem => ({ id: `wakeup:${id}`, type: "scheduled_wakeup", createdAt: 1, wakeupId: id, prompt: "check", recurring: false, schedule: "3 20 * * *", ...(nextFireAt === undefined ? {} : { nextFireAt }), status: "pending" });
     const soon = new Date(2026, 8, 24, 20, 3).getTime();
-    const time = new Date(soon).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    const time = "20:03";
     expect(composerRoutineState({ ...base, status: "scheduled", scheduledDeclared: true, scheduledWakeups: [wakeup("a", soon)], now })).toEqual({ stateName: "scheduled", label: `1 wakeup scheduled · next about ${time}` });
     expect(composerRoutineState({ ...base, status: "scheduled", scheduledDeclared: true, scheduledWakeups: [wakeup("a", soon), wakeup("b")], now }).label).toBe(`2 wakeups scheduled · next about ${time}`);
     // A schedule the workspace could not read still names the state.

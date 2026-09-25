@@ -10,7 +10,7 @@ import { commandSubject, describeToolDetail, deriveTodoActivities, patchDiffLine
 import type { AcceptedDraft, ChatProjection } from "./projection";
 import { formatUsd } from "./usage";
 import { wakeupRowLabel } from "./scheduled-wakeups";
-import { dayLabel, fullDate, knownTime, localDayKey, localDaysBetween, nextLocalMidnight, weekdayClock } from "./dates";
+import { dateTime, dayLabel, fullDate, knownTime, localDayKey, localDaysBetween, nextLocalMidnight, weekdayClock } from "./dates";
 import { isLiveConversationStatus, isRateLimitStanding, type ActivityStatus, type ConversationItem, type ConversationStatus, type MessageAttachment, type PermissionOutcome, type QueuedMessage, type QuestionRequest, type RevertedUserMessage, type TokenUsage, type ToolItem } from "./types";
 
 type RenderedEntry = { node: HTMLElement; item: ConversationItem; active: boolean; variant: string; shellVariant?: string };
@@ -1755,5 +1755,5 @@ function labelDaySeparator(node: HTMLElement, at: number, now: number): void {
 
 function timestampAttribute(createdAt: number): string {
   if (!createdAt) return "";
-  return ` title="${escapeHtmlAttribute(new Date(createdAt).toLocaleString())}"`;
+  return ` title="${escapeHtmlAttribute(dateTime(createdAt))}"`;
 }
