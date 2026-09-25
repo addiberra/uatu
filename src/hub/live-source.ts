@@ -10,8 +10,9 @@ import type { LiveUpstreamSource } from "./live-broker";
 
 export function createHubUpstreamSource(deps: {
   sessions: Pick<SessionManager, "get" | "isRunning" | "onChange">;
-  registry: Pick<WorkspaceRegistry, "list">;
+  registry: Pick<WorkspaceRegistry, "list"> & Partial<Pick<WorkspaceRegistry, "onRemoved">>;
 }): LiveUpstreamSource {
+  const onRemoved = deps.registry.onRemoved?.bind(deps.registry);
   return {
     isRunning: workspaceId => deps.sessions.isRunning(workspaceId),
     workspaceIds: () => deps.registry.list().map(entry => entry.id),
@@ -24,5 +25,6 @@ export function createHubUpstreamSource(deps: {
       return fetch(target, { headers: childRequestHeaders(session), signal, redirect: "manual" });
     },
     onSessionChange: listener => deps.sessions.onChange(listener),
+    ...(onRemoved ? { onWorkspaceRemoved: (listener: (workspaceId: string) => void) => onRemoved(listener) } : {}),
   };
 }

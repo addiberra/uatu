@@ -3,6 +3,7 @@ import { liveChannel } from "../shell/live";
 import type { LiveChannel } from "../shell/live-channel";
 import type {
   AgentChatStatus,
+  BackgroundTaskOutput,
   ChatMode,
   ChatCommand,
   ChatEvent,
@@ -26,7 +27,7 @@ import {
   parseConversationSnapshot,
   parseConversationConfiguration,
   parseConversationSummary,
-  parseReversibleHistoryResult, parseUsageReadResult, parseUsageReportResponse } from "./validation";
+  parseBackgroundTaskOutput, parseReversibleHistoryResult, parseUsageReadResult, parseUsageReportResponse } from "./validation";
 
 export class ChatTransportError extends Error {
   constructor(message: string, readonly status?: number) {
@@ -272,6 +273,20 @@ export class ChatApiClient {
 
   release(conversationId: string, requestId: string): Promise<unknown> {
     return this.mutate(appUrl(`/api/chat/conversations/${encodeURIComponent(conversationId)}/release`), { requestId }, value => value);
+  }
+
+  /**
+   * A bounded tail of a running shell task's output; null while the agent
+   * has not yet named where the output goes (the child answers 404).
+   */
+  async taskOutput(conversationId: string, taskId: string, tailBytes?: number, signal?: AbortSignal): Promise<BackgroundTaskOutput | null> {
+    const query = tailBytes === undefined ? "" : `?tail=${encodeURIComponent(String(tailBytes))}`;
+    try {
+      return await this.get(appUrl(`/api/chat/conversations/${encodeURIComponent(conversationId)}/tasks/${encodeURIComponent(taskId)}/output${query}`), parseBackgroundTaskOutput, signal);
+    } catch (error) {
+      if (error instanceof ChatTransportError && error.status === 404) return null;
+      throw error;
+    }
   }
 
   inventoryStream(handlers: InventoryStreamHandlers): ChatEventStream {

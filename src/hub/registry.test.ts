@@ -390,11 +390,33 @@ describe("registry rollback on persistence failure", () => {
     const registry = new WorkspaceRegistry(path.join(stateDir, "registry.json"));
     await registry.load();
     await registry.register("/srv/workspaces/keeper");
+    const removed: string[] = [];
+    registry.onRemoved(id => removed.push(id));
 
     // Make subsequent saves fail by removing the directory.
     await rm(stateDir, { recursive: true, force: true });
     await expect(registry.remove("keeper")).rejects.toThrow();
     expect(registry.byId("keeper")).toBeDefined();
+    // Nothing was removed, so nobody is told it was.
+    expect(removed).toEqual([]);
+  });
+
+  test("a committed removal is announced once, after it lands; an unknown id and a throwing listener change nothing", async () => {
+    const registry = await tempRegistry();
+    await registry.register("/a/docs");
+    const heard: { id: string; stillListed: boolean }[] = [];
+    registry.onRemoved(() => {
+      throw new Error("a listener's failure is its own");
+    });
+    const stop = registry.onRemoved(id => heard.push({ id, stillListed: registry.byId(id) !== undefined }));
+    expect(await registry.remove("docs")).toBe(true);
+    expect(heard).toEqual([{ id: "docs", stillListed: false }]);
+    expect(await registry.remove("docs")).toBe(false);
+    expect(heard).toHaveLength(1);
+    stop();
+    await registry.register("/b/docs");
+    expect(await registry.remove("docs")).toBe(true);
+    expect(heard).toHaveLength(1);
   });
 
   test("a failed bulk replacement restores every old path", async () => {

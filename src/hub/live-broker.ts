@@ -19,8 +19,13 @@
 //                 that merges into the shared upstream; a cursor the child
 //                 cannot replay arrives as the child's `resync`.
 //   activity      child /api/activity, one upstream per running workspace
-//                 shared by every user's feed (D5). Feeds merge hub session
-//                 state (`running`) with the child's {working, awaiting}.
+//                 (D5). The upstream is the BROKER's, not a feed's: it is
+//                 opened while the workspace runs whether or not anyone is
+//                 watching, because "work finished while you were away" is
+//                 a fact no page-scoped subscription can see
+//                 (fix-workspace-activity-states D11). Feeds merge hub
+//                 session state (`running`) with the child's
+//                 {working, awaiting} and only read what the broker observed.
 //   worktrees     NO child upstream at all. The worktree inventory is the
 //                 hub's own knowledge (src/hub/worktree-service.ts), so this
 //                 topic is a hub-local fan-out: attaching writes one fresh
@@ -42,6 +47,7 @@
 // notification retries or fails at once instead of at the next tick.
 
 import { decodeReplayCursor, type ReplayCursor } from "../chat/replay";
+import type { ActivityMarkSink } from "./activity-marks";
 import type { MetricsRegistry } from "../debug/metrics";
 import { UpstreamSubscriptionMetrics, type UpstreamTopic } from "../debug/stream-metrics";
 import {
@@ -83,6 +89,9 @@ export type LiveUpstreamSource = {
   // Rejects when the workspace has no running child.
   open(request: LiveUpstreamRequest): Promise<Response>;
   onSessionChange?(listener: (change: LiveSessionChange) => void): () => void;
+  // A workspace left the registry. Its id is free to be minted again for a
+  // different folder, so the broker forgets everything it keyed by it.
+  onWorkspaceRemoved?(listener: (workspaceId: string) => void): () => void;
 };
 
 export type LiveSink = {
@@ -109,6 +118,17 @@ export type LiveBrokerOptions = {
   // rejected; a later rejection still signals `unavailable`.
   inventoryOpenGraceMs?: number;
   metrics?: MetricsRegistry;
+  // Where the finished/viewed marks are read from at startup and written
+  // back on change (src/hub/activity-marks.ts). Absent — unit fixtures, the
+  // e2e harness — the marks live for the broker's lifetime only.
+  marks?: ActivityMarkSink;
+  // Watch every running workspace's activity from construction rather than
+  // from the first activity subscription (D11). The production hub sets it:
+  // a client that starts a session and drives its chat through the proxy
+  // without ever opening a page still has its finishes recorded. Brokers
+  // built for tests leave it off, so fixtures for other topics and the e2e
+  // harness open no activity upstream nobody asked for.
+  watchActivityFromStart?: boolean;
 };
 
 // What the worktree reconciler learns from the broker: a page attached to a
@@ -240,20 +260,20 @@ function parseJson(text: string): unknown {
   }
 }
 
-const NOT_RUNNING: WorkspaceActivity = { running: false, working: false, awaiting: false };
-const RUNNING_UNKNOWN: WorkspaceActivity = { running: true, working: false, awaiting: false };
+const NOT_RUNNING: WorkspaceActivity = { running: false, working: false, awaiting: false, finished: false };
+const RUNNING_UNKNOWN: WorkspaceActivity = { running: true, working: false, awaiting: false, finished: false };
 
 function sameActivity(a: WorkspaceActivity, b: WorkspaceActivity): boolean {
-  return a.running === b.running && a.working === b.working && a.awaiting === b.awaiting;
+  return a.running === b.running && a.working === b.working && a.awaiting === b.awaiting && a.finished === b.finished;
 }
 
 // One user's activity feed: the set of that user's streams that asked for
-// the topic, the last value emitted per workspace, and one broker
-// subscription per running workspace's activity upstream.
+// the topic and the last value emitted per workspace. It holds no upstream
+// subscription of its own — the broker watches every running workspace — so
+// it is purely a reader of what the broker knows, composed for this user.
 class ActivityFeed {
   readonly sinks = new Set<LiveSink>();
   readonly last = new Map<string, WorkspaceActivity>();
-  readonly attachments = new Map<string, LiveAttachment>();
   readonly epoch = newEpoch();
   seq = 0;
 }
@@ -261,6 +281,32 @@ class ActivityFeed {
 export class LiveBroker {
   private readonly upstreams = new Map<string, Upstream>();
   private readonly feeds = new Map<string, ActivityFeed>();
+  // The `finished` fact's ingredients, held at the broker rather than in a
+  // feed: a user's feed is discarded when their last page closes, and
+  // "switched away and came back later" is exactly the case the fact is
+  // for. `observed` is the last value the workspace's activity upstream
+  // delivered; `finishedAt` is stamped when that value goes from working to
+  // quiet; `viewedAt` is stamped per user by acknowledgeViewed. Stamps come
+  // from one broker counter, so a finish after the last view outranks it
+  // without clocks; a restart resumes the counter above the highest stamp
+  // read back, which is what keeps that comparison meaningful across one.
+  private readonly observed = new Map<string, WorkspaceActivity>();
+  private readonly finishedAt = new Map<string, number>();
+  private readonly viewedAt = new Map<string, Map<string, number>>();
+  private stamp = 0;
+  private readonly marks: ActivityMarkSink | null;
+  // The broker's own activity attachment per running workspace. One per
+  // workspace, opened when the session starts and released when it stops —
+  // not one per feed, so what finishes while every page is closed is still
+  // seen (D11).
+  private readonly activityWatches = new Map<string, LiveAttachment>();
+  // Set at construction when the broker watches from the start (the
+  // production hub), otherwise by the first activity subscription of this
+  // broker's lifetime; never cleared: from then on the watches are held
+  // regardless of feeds. A lazy broker nobody has ever asked for activity —
+  // the e2e harness, the unit fixtures for other topics — opens no activity
+  // upstream at all.
+  private watchingActivity = false;
   private readonly lingerMs: number;
   private readonly replayBufferBytes: number;
   private readonly retryMinMs: number;
@@ -268,6 +314,7 @@ export class LiveBroker {
   private readonly inventoryOpenGraceMs: number;
   private readonly metrics: UpstreamSubscriptionMetrics;
   private readonly unsubscribeSessions: (() => void) | null;
+  private readonly unsubscribeRemovals: (() => void) | null;
   private disposed = false;
   private worktreeObserver: WorktreeTopicObserver | null = null;
 
@@ -278,7 +325,58 @@ export class LiveBroker {
     this.retryMaxMs = options.retryMaxMs ?? RETRY_MAX_MS;
     this.inventoryOpenGraceMs = options.inventoryOpenGraceMs ?? INVENTORY_OPEN_GRACE_MS;
     this.metrics = new UpstreamSubscriptionMetrics(options.metrics);
+    this.marks = options.marks ?? null;
+    this.restoreMarks();
     this.unsubscribeSessions = source.onSessionChange?.(change => this.onSessionChange(change)) ?? null;
+    this.unsubscribeRemovals = source.onWorkspaceRemoved?.(workspaceId => this.forgetWorkspace(workspaceId)) ?? null;
+    // Last, so the marks are restored before any watch can observe a frame
+    // and compose a value against them, and the session listener is already
+    // in place for a start that lands while the watches open. What is
+    // running now is watched now; what starts later is picked up by
+    // onSessionChange.
+    if (options.watchActivityFromStart) {
+      this.watchingActivity = true;
+      this.syncActivityWatches();
+    }
+  }
+
+  // What the previous hub left behind. `observed` is deliberately not among
+  // it: the hub has heard nothing yet, so the first frame after startup has
+  // no predecessor and cannot be read as a transition (D3/D12). The stamp
+  // counter resumes above everything restored, so a view taken now outranks
+  // a finish recorded before the restart, and vice versa.
+  //
+  // Marks for a workspace the registry no longer names are dropped here,
+  // at load (D12): it may have been forgotten while the hub was down, and
+  // its freed slug can be minted again for a different folder, which must
+  // not inherit a stranger's finish. The stamps still count towards the
+  // counter's resume point — that costs nothing and keeps it monotonic.
+  private restoreMarks(): void {
+    const restored = this.marks?.read();
+    if (!restored) return;
+    const known = new Set(this.source.workspaceIds());
+    let highest = 0;
+    let dropped = false;
+    for (const [workspaceId, stamp] of restored.finishedAt) {
+      highest = Math.max(highest, stamp);
+      if (known.has(workspaceId)) this.finishedAt.set(workspaceId, stamp);
+      else dropped = true;
+    }
+    for (const [user, workspaces] of restored.viewedAt) {
+      const kept = new Map<string, number>();
+      for (const [workspaceId, stamp] of workspaces) {
+        highest = Math.max(highest, stamp);
+        if (known.has(workspaceId)) kept.set(workspaceId, stamp);
+        else dropped = true;
+      }
+      if (kept.size > 0) this.viewedAt.set(user, kept);
+    }
+    this.stamp = highest;
+    if (dropped) this.persistMarks();
+  }
+
+  private persistMarks(): void {
+    this.marks?.write({ finishedAt: this.finishedAt, viewedAt: this.viewedAt });
   }
 
   // ---------------------------------------------------------------------
@@ -317,6 +415,12 @@ export class LiveBroker {
       feed = new ActivityFeed();
       this.feeds.set(user, feed);
     }
+    // A lazy broker's first feed turns the watches on (one built to watch
+    // from the start already has them); from then on they are the broker's,
+    // so this feed's arrival or departure changes nothing about what is
+    // observed.
+    this.watchingActivity = true;
+    this.syncActivityWatches();
     // Reconcile before adding the sink: changes reach the feed's existing
     // sinks, and the new one gets the whole picture below.
     this.refreshFeed(user, feed);
@@ -328,11 +432,51 @@ export class LiveBroker {
       detach: () => {
         feed.sinks.delete(sink);
         if (feed.sinks.size > 0 || this.feeds.get(user) !== feed) return;
+        // The feed goes; the watches stay. What finishes now is still
+        // recorded, and the next feed this user opens reads it.
         this.feeds.delete(user);
-        for (const attachment of feed.attachments.values()) attachment.detach();
-        feed.attachments.clear();
       },
     };
+  }
+
+  // The user has the workspace's chat in view: whatever finished there is
+  // seen. Re-derives that user's feed value alone — the mark and the other
+  // users' views are untouched — and emits only if it changed.
+  //
+  // With no finish on record, or one this user has already seen, there is
+  // nothing to clear and nothing is stamped or written: each of a user's
+  // pages posts for the same finish, and any client may post at any time,
+  // so each would otherwise cost a stamp and a persist. Skipping
+  // is safe because the composed value already reads not finished in both
+  // cases, and a later finish always takes a higher stamp than any view.
+  acknowledgeViewed(user: string, workspaceId: string): void {
+    const finishedAt = this.finishedAt.get(workspaceId);
+    if (finishedAt === undefined) return;
+    let marks = this.viewedAt.get(user);
+    if (finishedAt <= (marks?.get(workspaceId) ?? -Infinity)) return;
+    if (!marks) {
+      marks = new Map();
+      this.viewedAt.set(user, marks);
+    }
+    marks.set(workspaceId, this.nextStamp());
+    this.persistMarks();
+    const feed = this.feeds.get(user);
+    const last = feed?.last.get(workspaceId);
+    if (!feed || !last) return;
+    this.setFeedValue(feed, workspaceId, this.composeActivity(user, workspaceId, last));
+  }
+
+  // The workspace left the registry (the hub wires this to every removal,
+  // through LiveUpstreamSource.onWorkspaceRemoved). The session is already
+  // stopped — a forget requires it — but nothing else would announce the
+  // removal: syncActivityWatches prunes only when a session changes or a
+  // feed opens, and a new registration can take the freed slug before
+  // either happens, inheriting the old workspace's finish.
+  forgetWorkspace(workspaceId: string): void {
+    if (this.disposed) return;
+    this.unwatchActivity(workspaceId);
+    this.forgetMarks(workspaceId);
+    for (const feed of this.feeds.values()) feed.last.delete(workspaceId);
   }
 
   observeWorktrees(observer: WorktreeTopicObserver | null): void {
@@ -379,6 +523,11 @@ export class LiveBroker {
     if (this.disposed) return;
     this.disposed = true;
     this.unsubscribeSessions?.();
+    this.unsubscribeRemovals?.();
+    // Release the broker's own attachments before the upstreams go, so no
+    // watch outlives the broker holding it. The marks themselves are left
+    // alone: the hub is going down, not the workspaces.
+    for (const workspaceId of [...this.activityWatches.keys()]) this.unwatchActivity(workspaceId);
     for (const upstream of [...this.upstreams.values()]) this.drop(upstream, false);
     this.feeds.clear();
   }
@@ -1001,6 +1150,14 @@ export class LiveBroker {
     upstream.catchUpOwner = null;
     if (this.upstreams.get(upstream.id) === upstream) this.upstreams.delete(upstream.id);
     if (upstream.topic === "worktrees") this.notifyWorktrees(observer => observer.interest(upstream.workspaceId, false));
+    // A finish is detected only between values one attached upstream
+    // delivered. Once the upstream is gone the next value has no
+    // predecessor: what happened while nobody watched is not invented from
+    // a stale last sight. The upstream now goes only when the workspace
+    // stops, is unregistered, or the broker closes, each of which also
+    // forgets the marks — kept because the upstream's end is the point
+    // after which nothing it said is current.
+    if (upstream.topic === "activity") this.observed.delete(upstream.workspaceId);
     const metricTopic = childUpstreamTopic(upstream.topic);
     if (released && upstream.counted && metricTopic) this.metrics.released(metricTopic);
   }
@@ -1022,6 +1179,11 @@ export class LiveBroker {
         this.fail(upstream, "unreachable");
       }
     }
+    // Here rather than only in a feed refresh: a stop with no feed open must
+    // still clear the marks, or a later page would inherit them.
+    if (!change.running) this.forgetMarks(change.workspaceId);
+    // A start opens this workspace's watch; a stop releases it.
+    this.syncActivityWatches();
     for (const [user, feed] of this.feeds) this.refreshFeed(user, feed);
   }
 
@@ -1032,46 +1194,183 @@ export class LiveBroker {
     return { ws: workspaceId, topic: "activity", cursor: `${feed.epoch}.${feed.seq}`, event: { kind: "data", data: activity } };
   }
 
-  // Reconciles the feed with the registry and the session table: every
-  // registered workspace has a value, running ones hold an activity upstream
-  // subscription, stopped ones do not.
+  // Reconciles the broker's own watches with the registry and the session
+  // table: one activity attachment per registered, running workspace, held
+  // for as long as it runs and regardless of who is looking.
+  private syncActivityWatches(): void {
+    if (this.disposed || !this.watchingActivity) return;
+    const known = new Set(this.source.workspaceIds());
+    for (const workspaceId of [...this.activityWatches.keys()]) {
+      if (known.has(workspaceId) && this.source.isRunning(workspaceId)) continue;
+      // The session this watch was following is gone — stopped, or the
+      // workspace left the registry. Nothing it did is finished any more.
+      this.unwatchActivity(workspaceId);
+      this.forgetMarks(workspaceId);
+    }
+    // Marks for a workspace the registry no longer names are forgotten
+    // here too. The hub's registry announces every removal
+    // (forgetWorkspace) and restoreMarks drops what it no longer names at
+    // load, so this is the backstop for a source that cannot announce
+    // removals. A registered workspace that is merely not running
+    // keeps its marks: after a restart every session is stopped, and
+    // dropping them then would be the amnesia the persistence exists to
+    // prevent. A stop the hub actually observes clears them above and in
+    // onSessionChange.
+    for (const workspaceId of this.markedWorkspaces()) {
+      if (!known.has(workspaceId)) this.forgetMarks(workspaceId);
+    }
+    for (const workspaceId of known) {
+      if (this.source.isRunning(workspaceId)) this.watchActivity(workspaceId);
+    }
+  }
+
+  private markedWorkspaces(): Set<string> {
+    const marked = new Set<string>([...this.finishedAt.keys(), ...this.observed.keys()]);
+    for (const workspaces of this.viewedAt.values()) {
+      for (const workspaceId of workspaces.keys()) marked.add(workspaceId);
+    }
+    return marked;
+  }
+
+  // The broker's own subscription to a running workspace's activity. It
+  // feeds observeActivity exactly as a feed's sink used to, and is the only
+  // activity subscriber there is: a feed reads what this records.
+  private watchActivity(workspaceId: string): void {
+    if (this.activityWatches.has(workspaceId)) return;
+    let released = false;
+    const sink: LiveSink = {
+      write: envelope => {
+        if (released) return;
+        switch (envelope.event.kind) {
+          case "data":
+            this.observeActivity(workspaceId, sanitizeWorkspaceActivity(envelope.event.data));
+            return;
+          case "unavailable":
+            // The child is unreachable although the session table still
+            // names it running. The upstream says this on the FIRST failure
+            // of any episode — a single stream end the retry recovers from
+            // included — so it is not a stop and the marks stay: erasing an
+            // unviewed finish on a transient drop is the loss persisting them
+            // exists to prevent (D2). What changes is the reading. Recorded
+            // as not running, so a feed refresh — which cannot see the
+            // upstream's state — seeds the workspace as not running rather
+            // than resurrecting it from a missing reading as running; a
+            // failed upstream never repeats this signal to correct it. And
+            // the recovered upstream's first frame then has a predecessor
+            // that is not working, so recovery is never read as a finish
+            // (observeActivity); the mark shows again once the child answers
+            // quiet, and work resuming clears it as usual.
+            this.observed.set(workspaceId, NOT_RUNNING);
+            this.publishActivity(workspaceId, NOT_RUNNING);
+            return;
+          case "ready":
+          case "resync":
+            return;
+        }
+      },
+    };
+    // attachSink can write synchronously (a live upstream replays its latest
+    // frame), so the guard is a flag rather than a lookup of the attachment
+    // this call is about to record.
+    const attachment = this.attachSink(sink, workspaceId, "activity", undefined, undefined);
+    this.activityWatches.set(workspaceId, {
+      detach: () => {
+        released = true;
+        attachment.detach();
+      },
+    });
+  }
+
+  private unwatchActivity(workspaceId: string): void {
+    const watch = this.activityWatches.get(workspaceId);
+    if (!watch) return;
+    this.activityWatches.delete(workspaceId);
+    watch.detach();
+  }
+
+  // Seeds the feed from what the broker already knows: every registered
+  // workspace has a value, and a running one whose activity has not been
+  // heard yet reads as running-unknown — the dot shows, the badge waits —
+  // unless a finish is already on record for this user, which a feed opened
+  // after the fact must show at once. One whose child the watch found
+  // unreachable reads as the not-running the watch recorded, so opening a
+  // page does not bring it back as running.
   private refreshFeed(user: string, feed: ActivityFeed): void {
     const known = new Set(this.source.workspaceIds());
     for (const workspaceId of [...feed.last.keys()]) {
-      if (known.has(workspaceId)) continue;
-      feed.last.delete(workspaceId);
-      feed.attachments.get(workspaceId)?.detach();
-      feed.attachments.delete(workspaceId);
+      if (!known.has(workspaceId)) feed.last.delete(workspaceId);
     }
     for (const workspaceId of known) {
-      const running = this.source.isRunning(workspaceId);
-      if (!running) {
-        feed.attachments.get(workspaceId)?.detach();
-        feed.attachments.delete(workspaceId);
+      if (!this.source.isRunning(workspaceId)) {
         this.setFeedValue(feed, workspaceId, NOT_RUNNING);
         continue;
       }
-      if (feed.attachments.has(workspaceId)) continue;
-      // Running, activity not yet known: the dot shows, the badge waits.
-      this.setFeedValue(feed, workspaceId, RUNNING_UNKNOWN);
-      const sink: LiveSink = {
-        write: envelope => {
-          if (this.feeds.get(user) !== feed) return;
-          switch (envelope.event.kind) {
-            case "data":
-              this.setFeedValue(feed, workspaceId, sanitizeWorkspaceActivity(envelope.event.data));
-              return;
-            case "unavailable":
-              this.setFeedValue(feed, workspaceId, NOT_RUNNING);
-              return;
-            case "ready":
-            case "resync":
-              return;
-          }
-        },
-      };
-      feed.attachments.set(workspaceId, this.attachSink(sink, workspaceId, "activity", undefined, undefined));
+      const facts = this.observed.get(workspaceId) ?? RUNNING_UNKNOWN;
+      this.setFeedValue(feed, workspaceId, this.composeActivity(user, workspaceId, facts));
     }
+  }
+
+  // One upstream value, seen through the broker's watch. The transition is
+  // judged against the workspace-level `observed`, never against a feed's
+  // last value: a feed can appear and disappear at any point in a run, and
+  // the fact is about the workspace, not about who happened to be looking.
+  // The facts are the same for every user, so every feed is re-derived; the
+  // per-user part is only `viewedAt`.
+  private observeActivity(workspaceId: string, activity: WorkspaceActivity): void {
+    const previous = this.observed.get(workspaceId);
+    this.observed.set(workspaceId, activity);
+    if (activity.working || activity.awaiting) {
+      // Work resumed, or an interaction awaits: whatever finished before
+      // is superseded by what the user will look at now.
+      if (this.finishedAt.delete(workspaceId)) this.persistMarks();
+    } else if (previous?.working && !previous.awaiting) {
+      // Working → quiet. Not from unknown (a page opening onto an idle
+      // workspace invents nothing), not from awaiting (the answer was given
+      // from somewhere the user was looking — a pending question keeps the
+      // turn in flight, so "working and awaiting" is the awaiting case).
+      this.finishedAt.set(workspaceId, this.nextStamp());
+      this.persistMarks();
+    }
+    this.publishActivity(workspaceId, activity);
+  }
+
+  // The same facts, composed per user, to every feed there is.
+  private publishActivity(workspaceId: string, facts: WorkspaceActivity): void {
+    for (const [user, feed] of this.feeds) {
+      this.setFeedValue(feed, workspaceId, this.composeActivity(user, workspaceId, facts));
+    }
+  }
+
+  private composeActivity(user: string, workspaceId: string, facts: WorkspaceActivity): WorkspaceActivity {
+    const quiet = facts.running && !facts.working && !facts.awaiting;
+    const finishedAt = this.finishedAt.get(workspaceId);
+    const viewedAt = this.viewedAt.get(user)?.get(workspaceId) ?? -Infinity;
+    return {
+      running: facts.running,
+      working: facts.working,
+      awaiting: facts.awaiting,
+      finished: quiet && finishedAt !== undefined && finishedAt > viewedAt,
+    };
+  }
+
+  private nextStamp(): number {
+    this.stamp += 1;
+    return this.stamp;
+  }
+
+  // The hub observed the workspace stop, or it left the registry: nothing it
+  // did before is finished any more, and nobody's view of it needs keeping.
+  // NOT called when its child is merely unreachable (the watch's
+  // `unavailable`): that may be a transient drop the retry recovers from,
+  // and the session it describes is still the same one.
+  private forgetMarks(workspaceId: string): void {
+    this.observed.delete(workspaceId);
+    let changed = this.finishedAt.delete(workspaceId);
+    for (const [user, marks] of this.viewedAt) {
+      if (marks.delete(workspaceId)) changed = true;
+      if (marks.size === 0) this.viewedAt.delete(user);
+    }
+    if (changed) this.persistMarks();
   }
 
   // Emits only on change — the badge must not flicker on every keepalive or

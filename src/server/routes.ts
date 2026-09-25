@@ -20,7 +20,7 @@ import { HistoryChangedError } from "../chat/history-reuse";
 import { resolveStartupTimeoutMs } from "../chat/opencode/opencode-service";
 import { ChatUnavailableError } from "../chat/service";
 import { UnknownAgentError, type MultiAgentWorkspaceChatService } from "../chat/agents";
-import { CHAT_ATTACHMENT_MAX_BYTES, CHAT_ATTACHMENT_MIME_TYPES, CHAT_ATTACHMENTS_PER_MESSAGE, type MessageAttachment, type ModelSelection, type PermissionOutcome, type QuestionOutcome, type UsageReadMode } from "../chat/types";
+import { CHAT_ATTACHMENT_MAX_BYTES, CHAT_ATTACHMENT_MIME_TYPES, CHAT_ATTACHMENTS_PER_MESSAGE, TASK_OUTPUT_TAIL_DEFAULT_BYTES, TASK_OUTPUT_TAIL_MAX_BYTES, type MessageAttachment, type ModelSelection, type PermissionOutcome, type QuestionOutcome, type UsageReadMode } from "../chat/types";
 import { ConversationNotFoundError } from "../chat/workspace";
 import { StreamLifecycleMetrics, type StreamOutcome } from "../debug/stream-metrics";
 import { getDocumentDiff } from "../document/diff";
@@ -1020,6 +1020,30 @@ function buildChatRoutes(deps: BuildRoutesDeps, p: (path: string) => string) {
         if (requestId instanceof Response) return requestId;
         return run(() => deps.chatService.release(id, requestId));
       }),
+    },
+    // The output a shell task has written so far, as a bounded tail. A read
+    // (no CSRF gate) that names only the task: the child reads the path the
+    // agent reported for it, never one the client supplies. 404 until the
+    // agent has named where the output goes.
+    [p("/api/chat/conversations/:conversationId/tasks/:taskId/output")]: {
+      GET: async (request: RouteRequest) => {
+        const rejected = authenticated(request);
+        if (rejected) return rejected;
+        const id = routeIdentity(request, "conversationId");
+        if (id instanceof Response) return id;
+        const taskId = routeIdentity(request, "taskId");
+        if (taskId instanceof Response) return taskId;
+        const rawTail = new URL(request.url).searchParams.get("tail");
+        const tail = rawTail === null ? TASK_OUTPUT_TAIL_DEFAULT_BYTES : Number(rawTail);
+        if (!Number.isInteger(tail) || tail < 1) return chatError(400, "invalid tail");
+        const tailBytes = Math.min(tail, TASK_OUTPUT_TAIL_MAX_BYTES);
+        try {
+          const output = await deps.chatService.taskOutput(id, taskId, { tailBytes });
+          return output ? Response.json(output, { headers: { "cache-control": "no-store" } }) : chatError(404, "task output is not available");
+        } catch (error) {
+          return normalizedChatError(error);
+        }
+      },
     },
     [p("/api/chat/conversations/:conversationId/questions/:interactionId")]: {
       POST: async (request: RouteRequest) => chatMutation(request, ["requestId", "outcome"], async (id, body) => {

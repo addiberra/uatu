@@ -79,12 +79,14 @@ describe("API contract structure", () => {
       readYaml<{ channels: Record<string, { path?: string }> }>("api/streaming.yaml"),
       readYaml<{ exclusions: Array<{ id: string; pathPattern?: string; reason?: string }> }>("api/exclusions.yaml"),
     ]);
-    // The Hub serves personal state itself under the workspace prefix, so it
-    // is a Hub operation. Nothing the Hub proxies to the child is public.
+    // The Hub serves personal state and the activity acknowledgement itself
+    // under the workspace prefix, so they are Hub operations. Nothing the
+    // Hub proxies to the child is public.
     const personalStatePath = "/s/{workspaceId}/api/personal-state";
-    expect(Object.keys(openapi.paths).filter(path => path.startsWith("/s/"))).toEqual([personalStatePath]);
+    const activityViewedPath = "/s/{workspaceId}/api/activity-viewed";
+    expect(Object.keys(openapi.paths).filter(path => path.startsWith("/s/")).sort()).toEqual([activityViewedPath, personalStatePath]);
     const hubServed = inventory.operations.filter(operation => operation.path.startsWith("/s/"));
-    expect(hubServed.map(operation => operation.operationId).sort()).toEqual(["workspaceGetPersonalState", "workspacePatchPersonalState"]);
+    expect(hubServed.map(operation => operation.operationId).sort()).toEqual(["hubAcknowledgeWorkspaceActivity", "workspaceGetPersonalState", "workspacePatchPersonalState"]);
     for (const operation of hubServed) {
       expect(operation).toMatchObject({ domain: "hub", runtime: "src/hub/server.ts" });
       expect(operation.childPath).toBeUndefined();
@@ -92,7 +94,8 @@ describe("API contract structure", () => {
     // The Hub tag is what makes the compatibility check charge a break here
     // to the Hub revision rather than the workspace revision.
     const personalState = openapi.paths[personalStatePath] as Record<"get" | "patch", { tags?: string[] }>;
-    expect([personalState.get.tags, personalState.patch.tags]).toEqual([["Hub"], ["Hub"]]);
+    const activityViewed = openapi.paths[activityViewedPath] as Record<"post", { tags?: string[] }>;
+    expect([personalState.get.tags, personalState.patch.tags, activityViewed.post.tags]).toEqual([["Hub"], ["Hub"], ["Hub"]]);
     // New operation IDs begin with `hub`. The personal-state IDs predate the
     // move to the Hub domain and are kept, since a rename breaks generated clients.
     const retainedIds = new Set(hubServed.map(operation => operation.operationId));
@@ -107,14 +110,19 @@ describe("API contract structure", () => {
 
   test("metadata revisions agree with OpenAPI and changelog", async () => {
     const [metadata, openapi, changelog] = await Promise.all([
-      readJson<{ hubApiRevision: number; workspaceApiRevision: number }>("api/contract.json"),
-      readYaml<{ info: { "x-uatu-revisions": { hubApiRevision: number; workspaceApiRevision: number } } }>("api/openapi.yaml"),
+      readJson<{ stability: "experimental" | "stable"; hubApiRevision: number; workspaceApiRevision: number }>("api/contract.json"),
+      readYaml<{ info: { version: string; "x-uatu-revisions": { hubApiRevision: number; workspaceApiRevision: number } } }>("api/openapi.yaml"),
       Bun.file(new URL("CHANGELOG.md", new URL("./", import.meta.url))).text(),
     ]);
     expect(openapi.info["x-uatu-revisions"]).toEqual({
       hubApiRevision: metadata.hubApiRevision,
       workspaceApiRevision: metadata.workspaceApiRevision,
     });
+    // `info.version` restates the pair as `<hub>.<workspace>.0`, tagged
+    // `-experimental` while the contract is, so a revision bump that misses it
+    // publishes a document whose version names the previous generation.
+    const tag = metadata.stability === "experimental" ? "-experimental" : "";
+    expect(openapi.info.version).toBe(`${metadata.hubApiRevision}.${metadata.workspaceApiRevision}.0${tag}`);
     expect(changelog).toContain(`## Hub ${metadata.hubApiRevision} / Workspace ${metadata.workspaceApiRevision}`);
     expect(changelog).toMatch(/Compatibility: (initial|additive|breaking)/);
     expect(changelog).toMatch(/### Migration\n\n\S/);
@@ -176,9 +184,10 @@ describe("streaming protocol is closed", () => {
     expect(envelope({ ...ready, id: "7" })).toBe(false);
 
     const activity = compile("WorkspaceActivity");
-    expect(activity({ running: true, working: false, awaiting: true })).toBe(true);
+    expect(activity({ running: true, working: false, awaiting: true, finished: false })).toBe(true);
+    expect(activity({ running: true, working: false, awaiting: true })).toBe(false);
     expect(activity({ running: true, working: false })).toBe(false);
-    expect(activity({ running: true, working: false, awaiting: true, title: "Fix the build" })).toBe(false);
+    expect(activity({ running: true, working: false, awaiting: true, finished: false, title: "Fix the build" })).toBe(false);
     expect(compile("LiveHello")({ streamId: "" })).toBe(false);
   });
 });
@@ -328,7 +337,7 @@ describe("live stream contract agrees with the shared wire protocol", () => {
       { ws: "uatu", topic: "inventory", cursor: "2", event: { kind: "ready" } },
       { ws: "uatu", topic: "conversation", key: "opencode:c", cursor: "", event: { kind: "resync" } },
       { ws: "uatu", topic: "conversation", key: "opencode:c", cursor: "x", event: { kind: "unavailable" } },
-      { ws: "payments-api", topic: "activity", cursor: "3", event: { kind: "data", data: { running: false, working: false, awaiting: false } } },
+      { ws: "payments-api", topic: "activity", cursor: "3", event: { kind: "data", data: { running: false, working: false, awaiting: false, finished: false } } },
       { ws: "uatu", topic: "worktrees", cursor: "", event: { kind: "data", data: WORKTREE_INVALIDATION } },
       { ws: "uatu", topic: "worktrees", cursor: "", event: { kind: "ready" } },
     ];

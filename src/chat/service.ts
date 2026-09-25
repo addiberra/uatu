@@ -8,6 +8,7 @@ import { createOpenCodeV2Provider } from "./opencode/v2/provider";
 import type { ChatProvider } from "./provider";
 import type { ReplaySubscription } from "./replay";
 import type {
+  BackgroundTaskOutput,
   ChatActivity,
   ChatMode,
   ChatAvailability,
@@ -74,6 +75,8 @@ export interface WorkspaceChatService {
   release(id: string, requestId: string): Promise<{ released: true }>;
   /** Cancel one scheduled wakeup, live or paused; it never fires again. */
   cancelWakeup(id: string, wakeupId: string, requestId: string): Promise<{ cancelled: true }>;
+  /** A bounded tail of a running (or just-settled) task's output; null until the agent has named where it goes. */
+  taskOutput(id: string, taskId: string, options: { tailBytes: number }): Promise<BackgroundTaskOutput | null>;
   /** The agent's last-known plan usage; null when nothing has been read. */
   usage(): Promise<AgentUsageReport | null>;
   /** Read plan usage now; the agent picks the session (design D3). */
@@ -289,6 +292,9 @@ export class LazyChatService implements WorkspaceChatService {
   }
   async cancelWakeup(id: string, wakeupId: string, requestId: string) {
     return (await this.requireAdapter()).cancelWakeup(id, wakeupId, requestId);
+  }
+  async taskOutput(id: string, taskId: string, options: { tailBytes: number }) {
+    return (await this.requireAdapter()).taskOutput(id, taskId, options);
   }
   async usage() { return (await this.requireAdapter()).usage(); }
   async readUsage(requestId: string, mode: UsageReadMode) { return (await this.requireAdapter()).readUsage(requestId, mode); }

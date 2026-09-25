@@ -1,4 +1,4 @@
-import type { AgentUsageReport, ChatAgent, ChatMode, ChatCommand, ChatModel, ConversationConfiguration, ConversationItem, ConversationStatus, ModelSelection, PermissionChoice, ReversibleHistoryResult, ReversibleHistoryState, ScheduledWakeupItem, StructuredQuestion, TokenUsage, UsageReadMode, UsageReadResult } from "./types";
+import type { AgentUsageReport, BackgroundTaskOutput, BackgroundTaskUsage, ChatAgent, ChatMode, ChatCommand, ChatModel, ConversationConfiguration, ConversationItem, ConversationStatus, ModelSelection, PermissionChoice, ReversibleHistoryResult, ReversibleHistoryState, ScheduledWakeupItem, StructuredQuestion, TokenUsage, UsageReadMode, UsageReadResult } from "./types";
 
 // `conversationId` is the owning session, like PendingPermission's: the global
 // list is filtered by the adapter, which is what lets a parent discover its
@@ -30,6 +30,13 @@ export type PendingBackgroundTask = {
   taskType?: string;
   toolUseId?: string;
   startedAt: number;
+  // The facts the live row carries (types.ts BackgroundTaskItem), so the
+  // seeded row is as complete as the one a reader who stayed would have.
+  subagentType?: string;
+  prompt?: string;
+  usage?: BackgroundTaskUsage;
+  outputFile?: string;
+  childConversationId?: string;
 };
 
 // One wakeup a live session holds, for a reader opening a conversation whose
@@ -327,6 +334,13 @@ export interface ChatProvider {
    * an agent declaring `scheduled-wakeups`.
    */
   cancelWakeup?(sessionId: string, wakeupId: string): Promise<void>;
+  /**
+   * A bounded tail of a background task's output so far — a shell task's
+   * output file, read from its end. Null when the task is unknown to the
+   * session or nothing has named its output yet. Optional: only an agent
+   * declaring `background-tasks`, and only one whose tasks write files.
+   */
+  taskOutput?(sessionId: string, taskId: string, options: { tailBytes: number }): Promise<BackgroundTaskOutput | null>;
   /**
    * The login's plan usage as last read, from memory: no I/O. Optional:
    * only an agent declaring `usage`.

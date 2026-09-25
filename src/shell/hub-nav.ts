@@ -8,18 +8,26 @@
 //
 // The chip and menu are live: the brokered stream's `activity` topic
 // (shell/live-channel.ts) says, for every workspace the user may access,
-// whether its session is running, whether an agent is working in it, and
-// whether an interaction awaits the user. The collapsed chip carries a badge
-// while another workspace is waiting on the user, distinct from mere agent
-// activity; the open menu names each workspace's state and updates in place.
-// Nothing here reveals conversation content or titles — the topic carries
-// three booleans and a workspace id.
+// whether its session is running, whether an agent is working in it,
+// whether an interaction awaits the user, and whether work there finished
+// since this user last viewed its chat. The collapsed chip carries a badge
+// while another workspace is waiting on the user, a distinct one while work
+// finished unviewed, both distinct from mere agent activity; the open menu
+// names each workspace's state and updates in place. Nothing here reveals
+// conversation content or titles — the topic carries four booleans and a
+// workspace id. The one write back is the viewed acknowledgement: while
+// this page has the chat in view and its own workspace reads finished, it
+// tells the hub, which clears the mark for this user on every device.
 //
 // The hub API URLs here are deliberately origin-rooted, NOT appUrl()-based:
 // they belong to the hub (outside the session's base path), which is why
-// this file is allowlisted in shared/app-url-discipline.test.ts.
+// this file is allowlisted in shared/app-url-discipline.test.ts. The viewed
+// acknowledgement is the exception: it is a session-path route the hub
+// answers itself (`/s/<ws>/api/activity-viewed`), so it goes through
+// appUrl() like any other session URL.
 
-import { appBasePath, workspaceIdFromBasePath } from "../shared/app-url";
+import { CHAT_SURFACE_ACTIVE_EVENT, chatSurfaceInView } from "../chat/surface-visibility";
+import { appBasePath, appUrl, workspaceIdFromBasePath } from "../shared/app-url";
 import type { WorkspaceActivity } from "../shared/live-protocol";
 import { awaitConfirmedLive, holdManualReload, liveChannel } from "./live";
 import { setCurrentSessionRunning } from "./session-running";
@@ -93,10 +101,12 @@ export function applyWorkspaceActivity(
 }
 
 // What the collapsed chip's badge says about OTHER workspaces. Awaiting
-// outranks working: a question the user has to answer is the thing worth a
-// glance; agents merely busy elsewhere are a quieter note.
+// outranks finished, which outranks working: a question the user has to
+// answer is the thing worth a glance; work done that they have not seen is
+// worth a look; agents merely busy elsewhere are a quieter note.
 export type SwitcherBadge =
   | { kind: "awaiting"; count: number }
+  | { kind: "finished"; count: number }
   | { kind: "working"; count: number }
   | null;
 
@@ -109,6 +119,7 @@ export function switcherBadge(
   currentId: string | null,
 ): SwitcherBadge {
   let awaiting = 0;
+  let finished = 0;
   let working = 0;
   for (const workspace of workspaces) {
     if (workspace.id === currentId) continue;
@@ -116,8 +127,10 @@ export function switcherBadge(
     if (!facts?.running) continue;
     if (facts.awaiting) awaiting += 1;
     else if (facts.working) working += 1;
+    else if (facts.finished) finished += 1;
   }
   if (awaiting > 0) return { kind: "awaiting", count: awaiting };
+  if (finished > 0) return { kind: "finished", count: finished };
   if (working > 0) return { kind: "working", count: working };
   return null;
 }
@@ -127,14 +140,23 @@ export function switcherBadge(
 export function switcherBadgeLabel(badge: SwitcherBadge): string {
   if (badge === null) return "";
   const plural = badge.count === 1 ? "workspace" : "workspaces";
-  return badge.kind === "awaiting"
-    ? `${badge.count} ${plural} awaiting your reply`
-    : `Agents working in ${badge.count} ${plural}`;
+  switch (badge.kind) {
+    case "awaiting":
+      return `${badge.count} ${plural} awaiting your reply`;
+    case "finished":
+      return `Work finished in ${badge.count} ${plural}`;
+    case "working":
+      return `Agents working in ${badge.count} ${plural}`;
+  }
 }
 
 // A menu entry's state text. Running and idle needs no word — the live dot
-// says it — so the column only speaks when there is something to say.
-export type WorkspaceMenuState = { text: string; tone: "stopped" | "working" | "awaiting" } | null;
+// says it — so the column only speaks when there is something to say. The
+// running states are exclusive by construction: finished requires neither
+// working nor awaiting. Within one workspace the order is awaiting, working,
+// finished — unlike the chip's ranking across workspaces — because work
+// starting again clears finished: a workspace that is both is working.
+export type WorkspaceMenuState = { text: string; tone: "stopped" | "working" | "awaiting" | "finished" } | null;
 
 export function workspaceMenuState(workspace: HubWorkspaceSummary, activity: WorkspaceActivityMap): WorkspaceMenuState {
   if (workspace.availability === "missing") return { text: "Missing checkout", tone: "stopped" };
@@ -144,6 +166,7 @@ export function workspaceMenuState(workspace: HubWorkspaceSummary, activity: Wor
   if (!facts?.running) return null;
   if (facts.awaiting) return { text: "awaiting you", tone: "awaiting" };
   if (facts.working) return { text: "working", tone: "working" };
+  if (facts.finished) return { text: "finished", tone: "finished" };
   return null;
 }
 
@@ -507,7 +530,7 @@ export function initHubNav(): void {
     if (chipBadge) {
       chipBadge.hidden = badge === null;
       chipBadge.className = `hub-activity-badge${badge ? ` is-${badge.kind}` : ""}`;
-      chipBadge.textContent = badge?.kind === "awaiting" ? String(badge.count) : "";
+      chipBadge.textContent = badge?.kind === "awaiting" || badge?.kind === "finished" ? String(badge.count) : "";
     }
     // The button's own name is what assistive technology reads; the badge
     // is decoration over it.
@@ -917,6 +940,42 @@ export function initHubNav(): void {
     // the same picker code runs against both.
     if (worktreeApi) watchWorktreeInventory(liveChannel(), window);
 
+    // The viewed acknowledgement. Posted when this workspace reads finished
+    // and the chat is in view — on the activity update that says so, or on
+    // the chat surface coming into view while it says so. Once per finished
+    // state: the hub's answer to the POST is an update with finished
+    // cleared, which re-arms it; a failed POST re-arms it too, so the next
+    // cue retries. Never more than one in flight. Only a hub page reaches
+    // here, so a page without a hub never posts.
+    //
+    // A cue that lands while a POST is in flight is not dropped: the hub's
+    // clearing update can arrive before the POST's own answer, and a new
+    // turn can finish in that gap too, after which nothing else would cue
+    // while the user simply keeps looking. So a successful POST checks once
+    // more on settling. A failed one does not: it has re-armed for the next
+    // cue, and checking at once would turn a hub that keeps refusing into a
+    // tight loop of POSTs.
+    let viewedPosted = false;
+    let viewedInFlight = false;
+    const maybeAcknowledgeViewed = () => {
+      if (viewedPosted || viewedInFlight) return;
+      if (!activity.get(currentId)?.finished) return;
+      if (!chatSurfaceInView()) return;
+      viewedPosted = true;
+      viewedInFlight = true;
+      void fetch(appUrl("/api/activity-viewed"), { method: "POST" })
+        .then(response => response.ok, () => false)
+        .then(ok => {
+          viewedInFlight = false;
+          if (!ok) {
+            viewedPosted = false;
+            return;
+          }
+          maybeAcknowledgeViewed();
+        });
+    };
+    document.addEventListener(CHAT_SURFACE_ACTIVE_EVENT, maybeAcknowledgeViewed);
+
     // Live facts from the stream. The channel replays the latest facts per
     // workspace as this registers, so the snapshot the hub sent while the
     // probe was in flight is not lost. A workspace the list does not know
@@ -937,6 +996,8 @@ export function initHubNav(): void {
         } else {
           reconcileStop();
         }
+        if (!facts.finished) viewedPosted = false;
+        maybeAcknowledgeViewed();
       }
       updateChip();
       if (!menu.hidden) {

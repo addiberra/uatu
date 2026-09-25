@@ -303,7 +303,7 @@ describe("LiveEndpoint (in-process)", () => {
     await stream.waitFor(() => child.byPath("/api/activity").length === 1, "activity upstream");
     child.byPath("/api/activity")[0]!.push(": open\n\nevent: activity\ndata: {\"working\":true,\"awaiting\":false}\n\n");
     await stream.waitFor(r => r.envelopes.length === 2, "activity change");
-    expect(dataOf(stream.envelopes[1]!)).toEqual({ running: true, working: true, awaiting: false });
+    expect(dataOf(stream.envelopes[1]!)).toEqual({ running: true, working: true, awaiting: false, finished: false });
     await stream.cancel();
   });
 
@@ -416,8 +416,11 @@ describe("LiveEndpoint (in-process)", () => {
     await Bun.sleep(100); // past the 30 ms linger
     expect(broker.upstreamCount("document")).toBe(0);
     expect(broker.upstreamCount("inventory")).toBe(0);
-    expect(broker.upstreamCount("activity")).toBe(0);
-    expect(broker.upstreamCount()).toBe(0);
+    // The activity upstream is the broker's, not a stream's: it follows the
+    // running workspace, so it is still held once every stream is gone
+    // (fix-workspace-activity-states D11). Nothing else is.
+    expect(broker.upstreamCount("activity")).toBe(1);
+    expect(broker.upstreamCount()).toBe(1);
     tiny.endAll();
   });
 

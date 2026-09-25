@@ -1,13 +1,17 @@
 // The workspace switcher's live activity through a real hub (task 4.5 of
-// hub-brokered-live-stream): the collapsed chip badges when another
+// hub-brokered-live-stream, extended by task 6.1 of
+// fix-workspace-activity-states): the collapsed chip badges when another
 // workspace awaits the user, the open menu names each workspace's state
-// (working / awaiting you / stopped), and answering the question clears the
-// badge — all from the brokered stream's activity topic, no reload. Each
-// state is captured as a screenshot under the change's screenshots folder
-// at desktop and phone sizes; the phone run is touch mode, where the
-// switcher lives in the Files tab.
+// (working / awaiting you / finished / stopped), answering the question
+// clears the awaiting badge, work ending elsewhere leaves a finished badge
+// until the user opens that workspace's chat, and a workspace holding only
+// a backgrounded task still reads working — all from the brokered stream's
+// activity topic, no reload. Each state is captured as a screenshot under
+// the change's screenshots folder at desktop and phone sizes; the phone run
+// is touch mode, where the switcher lives in the Files tab.
 
 
+import { openChatPanel } from "./chat-helpers";
 import { evidencePath, recordEvidence } from "./evidence";
 import { childChatControl, expect, openSessionTab, test, type HubE2EInfo, type HubE2EWorkspace } from "./hub-fixtures";
 import type { BrowserContext, Page, TestInfo } from "@playwright/test";
@@ -52,6 +56,13 @@ async function finishWork(staged: Staged): Promise<void> {
   await childChatControl(staged.gamma, { action: "status", conversationId: staged.gammaConversation, status: "completed" });
 }
 
+// The turn is over but the agent still holds a backgrounded task: the
+// conversation's status is `background`, which the child's activity counts
+// as working (design D1).
+async function backgroundWork(staged: Staged): Promise<void> {
+  await childChatControl(staged.gamma, { action: "status", conversationId: staged.gammaConversation, status: "background" });
+}
+
 // A clip-aware capture: the chip and its menu are small, and the review
 // wants them close up. Same evidence path as captureScreenshot otherwise.
 async function shot(page: Page, testInfo: TestInfo, name: string, clip?: { x: number; y: number; width: number; height: number }): Promise<void> {
@@ -91,10 +102,30 @@ async function chipHeight(page: Page): Promise<number> {
   return box?.height ?? 0;
 }
 
-async function openMenuAndExpectStates(page: Page): Promise<void> {
+async function openMenu(page: Page): Promise<void> {
   await page.locator("#hub-toggle").click();
+  await expect(page.locator("#hub-menu")).toBeVisible();
+}
+
+async function closeMenu(page: Page): Promise<void> {
+  await page.keyboard.press("Escape");
+  await expect(page.locator("#hub-menu")).toBeHidden();
+}
+
+// A menu row's state word and its tone class — the two are asserted
+// together so a state can never be named in one and coloured as another.
+function menuState(page: Page, id: string) {
+  return page.locator(`#hub-menu .hub-menu-item[href="/s/${id}/"] .hub-menu-state`);
+}
+
+async function expectMenuState(page: Page, id: string, text: string, tone: string): Promise<void> {
+  await expect(menuState(page, id)).toHaveText(text);
+  await expect(menuState(page, id)).toHaveClass(new RegExp(`is-${tone}`));
+}
+
+async function openMenuAndExpectStates(page: Page): Promise<void> {
+  await openMenu(page);
   const menu = page.locator("#hub-menu");
-  await expect(menu).toBeVisible();
   // These workspaces are plain folders: no `.git` directory, no parent, so no
   // repository family. They stay flat rows with no group header, and there is
   // no repository title line anywhere — the chip is the only place a
@@ -123,16 +154,30 @@ async function expectAnswered(page: Page, staged: Staged): Promise<void> {
   await expect(page.locator("#hub-toggle")).toHaveAttribute("title", /Agents working in 1 workspace/);
 }
 
-async function expectIdle(page: Page, staged: Staged): Promise<void> {
+// gamma's turn ends while the user is looking at alpha. The work is done
+// but unseen, so the chip does NOT go quiet: the working dot is replaced by
+// the finished pill, and it stays until the user opens gamma's chat. (Before
+// fix-workspace-activity-states this step expected the badge to disappear —
+// the very state the change exists to stop losing.)
+async function expectFinished(page: Page, staged: Staged): Promise<void> {
   await finishWork(staged);
-  await expect(page.locator("#hub-activity-badge")).toBeHidden();
-  await expect(page.locator("#hub-toggle")).not.toHaveAttribute("title", /awaiting|working/);
+  await expectFinishedBadge(page);
+}
+
+async function expectFinishedBadge(page: Page): Promise<void> {
+  const badge = page.locator("#hub-activity-badge");
+  await expect(badge).toBeVisible();
+  await expect(badge).toHaveClass(/is-finished/);
+  await expect(badge).toHaveText("1");
+  // Never colour alone: the chip's own name and tooltip say it too.
+  await expect(page.locator("#hub-toggle")).toHaveAttribute("title", /Work finished in 1 workspace/);
+  await expect(page.locator("#hub-toggle")).toHaveAttribute("aria-label", /Work finished in 1 workspace/);
 }
 
 test.describe("desktop", () => {
   test.use({ viewport: { width: 1400, height: 1000 } });
 
-  test("badges the chip for a question elsewhere, names states in the menu, clears when answered", async ({ hub, hubContext }, testInfo) => {
+  test("badges the chip for a question elsewhere, names states in the menu, clears when answered, then reads finished", async ({ hub, hubContext }, testInfo) => {
     const staged = await stageActivity(hub, hubContext);
     const page = await openSessionTab(hubContext, hub.workspaces[0]!);
 
@@ -144,16 +189,108 @@ test.describe("desktop", () => {
     await openMenuAndExpectStates(page);
     await shot(page, testInfo, "after-switcher-desktop-menu");
     await shot(page, testInfo, "after-switcher-desktop-menu-closeup", await switcherClip(page));
-    await page.keyboard.press("Escape");
-    await expect(page.locator("#hub-menu")).toBeHidden();
+    await closeMenu(page);
 
     await expectAnswered(page, staged);
     await shot(page, testInfo, "after-switcher-desktop-chip-answered");
     await shot(page, testInfo, "after-switcher-desktop-chip-answered-closeup", await switcherClip(page));
 
-    await expectIdle(page, staged);
-    await shot(page, testInfo, "after-switcher-desktop-chip-idle-closeup", await switcherClip(page));
+    await expectFinished(page, staged);
+    await shot(page, testInfo, "after-switcher-desktop-chip-finished");
+    await shot(page, testInfo, "after-switcher-desktop-chip-finished-closeup", await switcherClip(page));
+    await openMenu(page);
+    await expectMenuState(page, "gamma", "finished", "finished");
+    await shot(page, testInfo, "after-switcher-desktop-menu-finished-closeup", await switcherClip(page));
+    await closeMenu(page);
+    // Both count pills must sit inside the label's line box: a taller badge
+    // would shift every sidebar row below the chip each time a state changes.
     expect(Math.abs((await chipHeight(page)) - badgedHeight)).toBeLessThan(0.5);
+  });
+
+  test("a workspace holding only a backgrounded task still reads working, and reads finished once it is gone", async ({ hub, hubContext }, testInfo) => {
+    const staged = await stageActivity(hub, hubContext);
+    const page = await openSessionTab(hubContext, hub.workspaces[0]!);
+    // beta's question out of the way: the chip then speaks for gamma alone.
+    await expectAnswered(page, staged);
+
+    // The turn ends but a backgrounded task lives on. Work is still going on
+    // there, so the workspace must not read finished — and the user must not
+    // be told to go look at something that is not done.
+    await backgroundWork(staged);
+    const badge = page.locator("#hub-activity-badge");
+    await expect(badge).toHaveClass(/is-working/);
+    await expect(badge).toHaveText("");
+    await expect(page.locator("#hub-toggle")).toHaveAttribute("title", /Agents working in 1 workspace/);
+    await openMenu(page);
+    await expectMenuState(page, "gamma", "working", "working");
+    await shot(page, testInfo, "after-switcher-desktop-menu-background-closeup", await switcherClip(page));
+    await closeMenu(page);
+
+    // The background work is gone and no turn runs: now it is finished.
+    await expectFinished(page, staged);
+    await openMenu(page);
+    await expectMenuState(page, "gamma", "finished", "finished");
+    await closeMenu(page);
+  });
+
+  test("awaiting outranks finished on the chip while the menu names each state", async ({ hub, hubContext }, testInfo) => {
+    const staged = await stageActivity(hub, hubContext);
+    const page = await openSessionTab(hubContext, hub.workspaces[0]!);
+    await expectStaged(page);
+
+    // gamma finishes while beta still waits for an answer: two other
+    // workspaces, two different states, one chip.
+    await finishWork(staged);
+    const badge = page.locator("#hub-activity-badge");
+    await expect(badge).toHaveClass(/is-awaiting/);
+    await expect(badge).toHaveText("1");
+    await expect(page.locator("#hub-toggle")).toHaveAttribute("title", /1 workspace awaiting your reply/);
+    await openMenu(page);
+    await expectMenuState(page, "beta", "awaiting you", "awaiting");
+    await expectMenuState(page, "gamma", "finished", "finished");
+    await shot(page, testInfo, "after-switcher-desktop-menu-awaiting-over-finished-closeup", await switcherClip(page));
+    await closeMenu(page);
+
+    // With the question answered the finished workspace is what is left to
+    // say, so the chip demotes to the finished pill.
+    await answerQuestion(staged);
+    await expectFinishedBadge(page);
+  });
+
+  test("opening the finished workspace's chat clears its entry and the badge on another open page", async ({ hub, hubContext }, testInfo) => {
+    const staged = await stageActivity(hub, hubContext);
+    const page = await openSessionTab(hubContext, hub.workspaces[0]!);
+    // Only gamma's finish is left to report, so the badge clearing below can
+    // be nothing but the acknowledgement.
+    await expectAnswered(page, staged);
+    await expectFinished(page, staged);
+    const badgedHeight = await chipHeight(page);
+
+    // The user opens gamma on another device — here, another page of the
+    // same session — and its chat is in view. That page posts the viewed
+    // acknowledgement; the hub clears the mark for this user everywhere.
+    const gammaPage = await openSessionTab(hubContext, staged.gamma);
+    // A fresh context boots with the chat panel collapsed: the page is on
+    // gamma, but its chat is not in view, so nothing is acknowledged yet.
+    await expect(gammaPage.locator("html")).toHaveAttribute("data-chat-panel", "collapsed");
+    await gammaPage.waitForTimeout(500);
+    await expect(page.locator("#hub-activity-badge")).toHaveClass(/is-finished/);
+
+    await openChatPanel(gammaPage);
+
+    // No reload on the page left open: the brokered stream carries the
+    // cleared fact to it.
+    const badge = page.locator("#hub-activity-badge");
+    await expect(badge).toBeHidden();
+    await expect(page.locator("#hub-toggle")).not.toHaveAttribute("title", /awaiting|working|finished/);
+    await openMenu(page);
+    // Running and idle needs no word: the row's state column is gone.
+    await expect(menuState(page, "gamma")).toHaveCount(0);
+    await shot(page, testInfo, "after-switcher-desktop-menu-viewed-closeup", await switcherClip(page));
+    await closeMenu(page);
+    // The chip without a badge is the same height as the chip with one.
+    expect(Math.abs((await chipHeight(page)) - badgedHeight)).toBeLessThan(0.5);
+    await gammaPage.close();
   });
 });
 
@@ -174,12 +311,16 @@ test.describe("phone", () => {
 
     await openMenuAndExpectStates(page);
     await shot(page, testInfo, "after-switcher-phone-menu");
-    await page.keyboard.press("Escape");
-    await expect(page.locator("#hub-menu")).toBeHidden();
+    await closeMenu(page);
 
     await expectAnswered(page, staged);
     await shot(page, testInfo, "after-switcher-phone-chip-answered");
 
-    await expectIdle(page, staged);
+    await expectFinished(page, staged);
+    await shot(page, testInfo, "after-switcher-phone-chip-finished");
+    await openMenu(page);
+    await expectMenuState(page, "gamma", "finished", "finished");
+    await shot(page, testInfo, "after-switcher-phone-menu-finished");
+    await closeMenu(page);
   });
 });

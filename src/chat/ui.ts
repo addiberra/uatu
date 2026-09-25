@@ -14,12 +14,15 @@ import { ChatViewportController } from "./viewport";
 import { notificationConversation } from "./notification-navigation";
 import { setActiveTab } from "../shell/tab-bar";
 import { expandChatPanel, isChatPanelOpen } from "./surface";
+import { CHAT_SURFACE_ACTIVE_EVENT, chatSurfaceInView } from "./surface-visibility";
 import { newRequestId } from "./ids";
 import { insertCommand, localHistoryOperation, matchingCommands, type LocalHistoryOperation } from "./slash-commands";
 import { navigateWorkspaceFileReference, resolveWorkspaceFileReference } from "./file-references";
 import { READER_CLOSED, QueueDockRenderer, RevertedMessagesDockRenderer, TimelineRenderer, decorateAttachmentImages, decorateFileLinks, formatElapsed, latestTodoEntries, statusLabel, subagentEntries, subagentLabel, workingLabel } from "./timeline-renderer";
 import { backgroundStatusLabel, runningBackgroundTasks } from "./background-tasks";
 import { pausedStatusLabel, pausedWakeups, pendingWakeups, scheduledStatusLabel, wakeupFireTime } from "./scheduled-wakeups";
+import { RunningWorkDisclosure } from "./running-work-disclosure";
+import { SilentRunFollower, TaskInspectionPanel, formatTaskElapsed, runningTaskForChild, taskById, taskInspection, type OpenTaskInspection } from "./task-inspection";
 import { composerRoutineState, formatUsd, latestPlanReport, latestRateLimit, planChip, planHasRows, planName, planReadoutRows, sessionTotalsTitle, usageAsOf, usageStale, type RateLimitStanding } from "./composer-status";
 import { buildPlanRowNodes, currentUsageReport, initUsagePaneControls, noteUsageReport, onUsageChange, onUsageRead, readStatusText, readUsageNow, refreshUsageIfStale, revealUsagePane, usageReadState, usageReadable } from "./usage-pane";
 import { isLiveConversationStatus } from "./types";
@@ -35,6 +38,7 @@ import {
   noteQueuedMessage,
   prependSnapshot,
   projectionFromSnapshot,
+  refreshFromSnapshot,
   removeAcceptedDraft,
   type ChatProjection,
 } from "./projection";
@@ -175,6 +179,13 @@ export function initChat(api = new ChatApiClient()): void {
   const drilldownState = document.querySelector<HTMLElement>("#chat-drilldown-state");
   const drilldownBack = document.querySelector<HTMLButtonElement>("#chat-drilldown-back");
   const drilldownOlder = document.querySelector<HTMLButtonElement>("#chat-drilldown-older");
+  // The running-task panel inside the drill-down: the header strip over a
+  // subagent's transcript, and the output pane a shell task opens instead of
+  // a transcript (design D7).
+  const drilldownTask = document.querySelector<HTMLElement>("#chat-drilldown-task");
+  const drilldownOutput = document.querySelector<HTMLElement>("#chat-drilldown-output");
+  const drilldownOutputText = document.querySelector<HTMLElement>("#chat-drilldown-output-text");
+  const drilldownOutputNote = document.querySelector<HTMLElement>("#chat-drilldown-output-note");
   if (!surface || !timeline || !items || !state || !select || !newButton || !olderButton || !latestButton || !queueDockElement || !form || !input || !commandMenu || !send || !sendLabel || !configurationTrigger || !configurationSummary || !configurationDetails || !configurationModeSummary || !configurationVariantSummary || !configurationVariantValue || !configurationDialog || !configurationSearch || !configurationModelsSection || !configurationModels || !configurationResultStatus || !configurationEmpty || !configurationDone || !composerStatus || !composerStatusLive || !composerError || !copyStatus) return;
 
   const anchor = new TimelineAnchorController();
@@ -284,9 +295,65 @@ export function initChat(api = new ChatApiClient()): void {
     projection: ChatProjection | null;
     stream: ChatEventStream | null;
     read?: { controller: AbortController; token: number; label: string };
+    // The background task this layer inspects, when it was opened for one:
+    // the parent's item, found by id on every repaint so the strip follows
+    // it in place. A transcript view is a live child over it; an output view
+    // has no child at all and reads the task's output file instead.
+    task?: OpenTaskInspection;
   };
   let child: Drilldown | null = null;
+  // The error line the output view last put up. When a later read answers,
+  // the panel says so and the line comes down — but only if it still says
+  // what the panel put there, so a message something else has since spoken
+  // is left standing.
+  let taskOutputError = "";
+  const taskPanel = drilldownTask && drilldownOutput && drilldownOutputText && drilldownOutputNote
+    ? new TaskInspectionPanel({
+      hosts: { strip: drilldownTask, output: drilldownOutput, outputText: drilldownOutputText, outputNote: drilldownOutputNote },
+      fetchOutput: (conversationId, taskId, signal) => api.taskOutput(conversationId, taskId, undefined, signal),
+      active: () => chatSurfaceActive(),
+      onError: error => {
+        taskOutputError = messageOf(error);
+        announceChild(taskOutputError, true);
+      },
+      onRecovered: () => {
+        if (taskOutputError && announceChild.current() === taskOutputError) announceChild("");
+        taskOutputError = "";
+      },
+    })
+    : null;
+  // The drill-down's task, as the parent's projection now has it — the strip
+  // and the output view are re-synced from here by the background-task
+  // repaint, and by the stop control's own in-flight guard.
+  const syncTaskInspection = () => {
+    if (!taskPanel || !child?.task) return;
+    const owner = projection?.conversationId === child.task.conversationId ? projection : null;
+    taskPanel.sync(owner ? taskById(owner.items, child.task.taskId) : undefined, stoppingTasks.has(child.task.taskId));
+  };
   let childGeneration = 0;
+  // A run that streams nothing — the review a typed command launches — or
+  // whose stream has stalled is followed from its transcript on disk while
+  // its drill-down is open (design D14). The re-read folds into the open
+  // projection the way live events do, and repaints as new content does:
+  // it never goes through the open path, so the reader's place, the follow
+  // state, the stream, and the task strip are all left as they are.
+  const silentRun = new SilentRunFollower({
+    refresh: async signal => {
+      const open = child;
+      const generation = childGeneration;
+      if (!open?.projection) return undefined;
+      const page = await api.snapshot(open.conversationId, undefined, signal);
+      if (signal.aborted || generation !== childGeneration || child !== open || !open.projection) return undefined;
+      const refreshed = refreshFromSnapshot(open.projection, page);
+      if (!refreshed) return undefined;
+      open.projection = refreshed.projection;
+      if (refreshed.changed) { announceChild(""); renderChild(true); }
+      // The follower applies the status the read found itself: a read that
+      // finds the run settled is already a read made after the settle.
+      return isLiveConversationStatus(open.projection.status);
+    },
+    active: () => chatSurfaceActive(),
+  });
   const childRenderer = new TimelineRenderer();
   childRenderer.deferClosedActivity = true;
   const childAnchor = new TimelineAnchorController();
@@ -801,6 +868,24 @@ export function initChat(api = new ChatApiClient()): void {
   const backgroundTasksItems = document.querySelector<HTMLElement>("#chat-background-tasks-items");
 
   /**
+   * Both pinned lists of running work open when running work first appears
+   * in them, so a task's inspect and Stop controls are a tap away rather
+   * than behind a disclosure; a user's collapse of running work is held
+   * until that work is over (see running-work-disclosure.ts). Opening sets
+   * `open` and nothing else — no focus moves and the timeline is not
+   * scrolled; the list's rows are height-bounded, so the composer's
+   * displacement stays capped.
+   */
+  const trackRunningWork = (list: HTMLDetailsElement | null) => {
+    const disclosure = new RunningWorkDisclosure(list?.open ?? false);
+    list?.addEventListener("toggle", () => disclosure.toggled(list.open));
+    return (runningCount: number) => {
+      if (list && disclosure.paint(projection?.conversationId ?? null, runningCount) && !list.open) list.open = true;
+    };
+  };
+  const discloseBackgroundTasks = trackRunningWork(backgroundTasks);
+
+  /**
    * Work the agent left running in the background, pinned above the
    * composer with a stop control per task (spec: each task is listed with a
    * stop action). Settled tasks leave the list and take a timeline row.
@@ -814,12 +899,23 @@ export function initChat(api = new ChatApiClient()): void {
   const stoppingTasks = new Set<string>();
   const syncBackgroundTasks = () => {
     if (!backgroundTasks || !backgroundTasksLabel || !backgroundTasksItems) return;
+    // The open drill-down's strip reads the same items; it keeps its own
+    // change check, so it is asked before this list's early return.
+    syncTaskInspection();
     const entries = projection && declares("background-tasks") ? runningBackgroundTasks(projection.items) : [];
-    const signature = entries.map(entry => [entry.taskId, entry.description, entry.progress ?? "", stoppingTasks.has(entry.taskId) ? "stopping" : ""].join("\u0001")).join("\u0002");
+    // Ahead of the unchanged-signature return: the rule reads every paint,
+    // since the conversation it is keyed on can change under one signature.
+    discloseBackgroundTasks(entries.length);
+    const signature = entries.map(entry => [entry.taskId, entry.description, entry.progress ?? "", entry.childConversationId ?? "", stoppingTasks.has(entry.taskId) ? "stopping" : ""].join("\u0001")).join("\u0002");
     if (signature === paintedBackgroundTasks) return;
     paintedBackgroundTasks = signature;
     if (entries.length === 0) {
       backgroundTasks.hidden = true;
+      // Emptied as well as hidden: a summary kept from the last task is read
+      // out by anything that reaches the label without seeing the `hidden`
+      // attribute, and it comes back on the next open still naming work that
+      // has long finished.
+      backgroundTasksLabel.textContent = "";
       backgroundTasksItems.replaceChildren();
       return;
     }
@@ -828,16 +924,40 @@ export function initChat(api = new ChatApiClient()): void {
       const row = document.createElement("li");
       row.className = "is-running";
       row.dataset.backgroundTask = entry.taskId;
-      const text = document.createElement("span");
+      // A running task's description is the way in: an agent task opens its
+      // transcript, a shell task its output (spec: a running task is
+      // inspected). Settled tasks never reach this list.
+      const target = taskInspection(entry);
+      const text = document.createElement(target ? "button" : "span");
       text.className = "chat-background-task-text";
       text.textContent = entry.description;
       text.title = entry.description;
+      if (target && text instanceof HTMLButtonElement) {
+        text.type = "button";
+        text.classList.add("chat-background-task-inspect");
+        text.dataset.inspectTask = entry.taskId;
+        text.dataset.inspectView = target.view;
+        text.setAttribute("aria-label", `${target.view === "transcript" ? "Open the transcript of" : "Show the output of"} ${entry.description}`);
+      }
       row.append(text);
       if (entry.progress) {
         const progress = document.createElement("span");
         progress.className = "chat-background-task-progress";
         progress.textContent = entry.progress;
         row.append(progress);
+      } else {
+        // With no progress note the elapsed time IS the progress line (D6). A
+        // shell task never reports progress at all — the CLI emits no
+        // `task_progress` for `local_bash` — so without this the row has no
+        // live signal whatsoever, and a reader cannot tell a task that is
+        // working from one that is wedged. The readout is stamped with the
+        // launch time and ticked by the shared second clock, never a timer
+        // of its own: one row or ten, it is the same tick.
+        const elapsed = document.createElement("span");
+        elapsed.className = "chat-background-task-progress chat-background-task-elapsed";
+        elapsed.dataset.elapsedSince = String(entry.createdAt);
+        elapsed.textContent = formatTaskElapsed(Date.now() - entry.createdAt);
+        row.append(elapsed);
       }
       const stop = document.createElement("button");
       stop.type = "button";
@@ -851,12 +971,12 @@ export function initChat(api = new ChatApiClient()): void {
     }));
     backgroundTasks.hidden = false;
   };
-  backgroundTasksItems?.addEventListener("click", event => {
-    const button = (event.target as Element | null)?.closest<HTMLButtonElement>("[data-stop-task]");
-    if (!button || !projection) return;
+  // One stop path for every control that offers it: the composer row and the
+  // drill-down's strip both name the task, and the in-flight guard is shared
+  // so neither can send the stop twice.
+  const requestStopTask = (taskId: string) => {
+    if (!projection || stoppingTasks.has(taskId)) return;
     const source = projection;
-    const taskId = button.dataset.stopTask ?? "";
-    if (stoppingTasks.has(taskId)) return;
     // The agent reports the stop as the task settling, which is what moves
     // the row out of this list; until then the control stays inert.
     stoppingTasks.add(taskId);
@@ -869,6 +989,34 @@ export function initChat(api = new ChatApiClient()): void {
       paintedBackgroundTasks = null;
       syncBackgroundTasks();
     });
+  };
+  /**
+   * Opens a running task from its composer row: the child transcript for an
+   * agent task, titled as its subagents-track row is, and the task view for
+   * a shell task, titled by the command.
+   */
+  const inspectTask = (taskId: string) => {
+    if (!projection) return;
+    const source = projection;
+    const task = taskById(source.items, taskId);
+    const target = task ? taskInspection(task) : undefined;
+    if (!task || !target) return;
+    if (target.view === "transcript") {
+      const known = subagentEntries(source.items).some(entry => entry.conversationId === target.conversationId);
+      openChildConversation(target.conversationId, known ? subagentLabelFor(target.conversationId, source) : task.description, false, { conversationId: source.conversationId, taskId, view: "transcript" });
+      return;
+    }
+    openChildConversation(`task-output:${taskId}`, task.description, false, { conversationId: source.conversationId, taskId, view: "output" });
+  };
+  backgroundTasksItems?.addEventListener("click", event => {
+    const target = (event.target as Element | null)?.closest<HTMLButtonElement>("[data-stop-task], [data-inspect-task]");
+    if (!target) return;
+    if (target.dataset.stopTask !== undefined) requestStopTask(target.dataset.stopTask);
+    else if (target.dataset.inspectTask !== undefined) inspectTask(target.dataset.inspectTask);
+  });
+  drilldownTask?.addEventListener("click", event => {
+    const button = (event.target as Element | null)?.closest<HTMLButtonElement>("[data-stop-task]");
+    if (button?.dataset.stopTask !== undefined) requestStopTask(button.dataset.stopTask);
   });
 
   const scheduledWakeups = document.querySelector<HTMLDetailsElement>("#chat-scheduled-wakeups");
@@ -1003,6 +1151,7 @@ export function initChat(api = new ChatApiClient()): void {
   const subagentsLabel = document.querySelector<HTMLElement>("#chat-subagents-label");
   const subagentsItems = document.querySelector<HTMLElement>("#chat-subagents-items");
   const dismissButton = document.querySelector<HTMLButtonElement>("#chat-subagents-dismiss");
+  const discloseSubagents = trackRunningWork(subagents);
   const requestsJump = document.querySelector<HTMLButtonElement>("#chat-requests-jump");
   // Finished subagents stay until explicitly dismissed — nothing retires
   // them on a timer. Dismissals persist with the rest of the per-conversation
@@ -1163,6 +1312,7 @@ export function initChat(api = new ChatApiClient()): void {
   const syncSubagents = () => {
     if (!subagents || !subagentsLabel || !subagentsItems) return;
     if (!declares("subagents")) {
+      discloseSubagents(0);
       paintedSubagents = "";
       subagents.hidden = true;
       subagentsItems.replaceChildren();
@@ -1171,15 +1321,19 @@ export function initChat(api = new ChatApiClient()): void {
     const all = projection ? subagentEntries(projection.items) : [];
     const dismissed = projection ? dismissedSubagents(projection.conversationId) : new Set<string>();
     const entries = all.filter(entry => !dismissed.has(entry.id));
+    // Finished entries stay listed until dismissed, but they are not running
+    // work: only a run that has not settled opens the track.
+    discloseSubagents(entries.filter(entry => entry.status === "running" || entry.status === "pending").length);
     const signature = entries
-      .map(entry => [entry.id, entry.status, entry.subagent ?? "", entry.description, entry.conversationId ?? "", entry.model ?? "", entry.usage ? String(totalTokens(entry.usage)) : "", entry.usage?.costUsd ?? ""].join("\u0001"))
+      .map(entry => [entry.id, entry.status, entry.subagent ?? "", entry.description, entry.conversationId ?? "", entry.model ?? "", entry.usage ? String(totalTokens(entry.usage)) : "", entry.usage?.costUsd ?? "", entry.progress ?? ""].join("\u0001"))
       .join("\u0002");
     if (signature === paintedSubagents) return;
     paintedSubagents = signature;
     // The open transcript's title states the same cost as the row: a running
     // subagent's price moves while its transcript is open, and a title
-    // computed once at the click would keep the earlier figure.
-    if (child && drilldownTitle) {
+    // computed once at the click would keep the earlier figure. A task's
+    // output view is titled by its command and is no subagent's transcript.
+    if (child && drilldownTitle && child.task?.view !== "output") {
       const label = subagentLabelFor(child.conversationId, projection);
       if (label !== child.label) {
         child.label = label;
@@ -1211,6 +1365,15 @@ export function initChat(api = new ChatApiClient()): void {
         label.className = "chat-subagent-label";
         label.textContent = text;
         row.append(label);
+      }
+      // What the subagent is doing right now, where the agent reports it —
+      // the model-written summary, or the tool it is using.
+      if (entry.progress) {
+        const progress = document.createElement("span");
+        progress.className = "chat-subagent-progress";
+        progress.textContent = entry.progress;
+        progress.title = entry.progress;
+        row.append(progress);
       }
       // What it ran and what it cost, after the description so the row still
       // leads with what the subagent is doing. The model shows whenever the
@@ -1574,14 +1737,29 @@ export function initChat(api = new ChatApiClient()): void {
     }
   };
 
-  // The tick runs while anything on screen is working: the parent's turn, or
-  // the subagent in the drill-down. A child keeps running after its parent
-  // has gone background or idle, and its working line is stamped from the
-  // child's own status — so the parent's status alone cannot decide whether
-  // the clock is needed. Re-evaluated wherever either status can change.
+  // The composer task rows that carry an elapsed readout instead of a
+  // progress note, ticked by the same clock as the working lines: the rows
+  // are rebuilt only when what they SAY changes, and the elapsed time is not
+  // part of that, so the second hand writes into the row in place.
+  const tickBackgroundTaskElapsed = () => {
+    if (!chatSurfaceActive()) return;
+    for (const readout of backgroundTasksItems?.querySelectorAll<HTMLElement>("[data-elapsed-since]") ?? []) {
+      readout.textContent = formatTaskElapsed(Date.now() - Number(readout.dataset.elapsedSince));
+    }
+  };
+
+  // The tick runs while anything on screen is working: the parent's turn, the
+  // subagent in the drill-down, or a background task the turn left running. A
+  // child keeps running after its parent has gone background or idle, and its
+  // working line is stamped from the child's own status — so the parent's
+  // status alone cannot decide whether the clock is needed. Background work
+  // is its own case because the background state is not a live status: the
+  // turn has ended, and only the tasks are still going. Re-evaluated wherever
+  // any of those can change, so the last task settling stops the clock.
   const syncWorkingTimer = () => {
-    const working = chatSurfaceActive() && (isLiveConversationStatus(projection?.status) || isLiveConversationStatus(child?.projection?.status));
-    if (working && workingTimer === null) workingTimer = setInterval(() => { syncRoutineStatus(); tickWorkingLines(); }, 1_000);
+    const tasksRunning = declares("background-tasks") && runningBackgroundTasks(projection?.items ?? []).length > 0;
+    const working = chatSurfaceActive() && (isLiveConversationStatus(projection?.status) || isLiveConversationStatus(child?.projection?.status) || tasksRunning);
+    if (working && workingTimer === null) workingTimer = setInterval(() => { syncRoutineStatus(); tickWorkingLines(); tickBackgroundTaskElapsed(); }, 1_000);
     if (!working && workingTimer !== null) {
       clearInterval(workingTimer);
       workingTimer = null;
@@ -3380,12 +3558,15 @@ export function initChat(api = new ChatApiClient()): void {
     child = null;
     drilldownHistoryToken = null;
     childGeneration += 1;
+    silentRun.stop();
     open.stream?.close();
     open.read?.controller.abort();
     childReadSignal?.cancel();
     childReadError.hidden = true;
     releaseChildBack?.();
     releaseChildBack = null;
+    taskPanel?.close();
+    if (drilldownTimeline) drilldownTimeline.hidden = false;
     if (drilldownItems && chatSurfaceActive()) childRenderer.render(drilldownItems, null, expanded, declares("subagents"));
     else childRenderDirty = true;
     reconcileAnswerAfterPaint();
@@ -3442,29 +3623,57 @@ export function initChat(api = new ChatApiClient()): void {
         // A gap in a drill-down is refetched in place; it is a view over a
         // turn, so there is no selection to re-run.
         if (result.outcome === "gap" || result.outcome === "resync") {
-          openChildConversation(id, label, true);
+          openChildConversation(id, label, true, entry.task);
           return;
         }
         entry.projection = result.projection;
-        if (result.outcome === "applied") { announceChild(""); renderChild(true); }
+        if (result.outcome === "applied") {
+          announceChild("");
+          renderChild(true);
+          // A record or its text arriving is the run speaking, so it is not
+          // silent. A status change is not: a run that never streams must
+          // still read as silent when it settles, so that it gets the reads
+          // that bring in its last records.
+          if (event.type === "item.upsert" || event.type === "item.text_delta" || event.type === "item.remove") silentRun.heard();
+          silentRun.follow(isLiveConversationStatus(entry.projection.status));
+        }
       },
-      resync: () => { if (generation === childGeneration) openChildConversation(id, label, true); },
+      resync: () => { if (generation === childGeneration) openChildConversation(id, label, true, entry.task); },
       error: error => { if (generation === childGeneration) childInterruptions.report("child", error); },
       recovered: () => { if (generation === childGeneration) childInterruptions.clear("child"); },
     });
 
-  const openChildConversation = (id: string, label: string, automaticRefresh = false) => {
+  const openChildConversation = (id: string, label: string, automaticRefresh = false, task?: OpenTaskInspection) => {
     if (!drilldown || !drilldownItems || !drilldownTimeline) return;
     const generation = ++childGeneration;
     drilldownClosePending = false;
+    silentRun.stop();
     const previous = child;
     previous?.stream?.close();
     previous?.read?.controller.abort();
     const retainedProjection = previous?.conversationId === id ? previous.projection : null;
     const retainedAnchor = retainedProjection ? childAnchor.currentAnchor() : null;
-    const next: Drilldown = { conversationId: id, label, projection: retainedProjection, stream: null };
+    // The task behind this layer: named by the caller (a composer row), kept
+    // from the layer being refreshed, or — for a transcript opened from the
+    // subagents track or the launching row — found by the child id on a
+    // running task, so a running subagent gets the strip whichever way in.
+    const owningTask = projection ? runningTaskForChild(projection.items, id) : undefined;
+    const link = task
+      ?? (previous?.conversationId === id ? previous.task : undefined)
+      ?? (projection && owningTask ? { conversationId: projection.conversationId, taskId: owningTask.taskId, view: "transcript" as const } : undefined);
+    const next: Drilldown = { conversationId: id, label, projection: retainedProjection, stream: null, ...(link ? { task: link } : {}) };
     const nested = previous !== null;
     child = next;
+    const outputView = link?.view === "output";
+    if (taskPanel) {
+      if (link) {
+        const owner = projection?.conversationId === link.conversationId ? projection : null;
+        taskPanel.show(link, owner ? taskById(owner.items, link.taskId) : undefined, stoppingTasks.has(link.taskId));
+      } else taskPanel.close();
+    }
+    // A task's output view has no transcript: the timeline stays out of the
+    // way and the pane takes its place.
+    drilldownTimeline.hidden = outputView;
     // One entry per layer, in both chromes. Conditioning this on the ui mode
     // meant storing "was this touch when it opened" under a name that claimed
     // to answer "does an entry exist" — two facts that drift the moment the
@@ -3523,13 +3732,15 @@ export function initChat(api = new ChatApiClient()): void {
     childAnchor.restore(retainedAnchor);
     announceChild("");
     if (!automaticRefresh) drilldownBack?.focus();
-    void runChildRead(next, "Loading conversation...", () => openChildConversation(id, label, automaticRefresh), async signal => {
+    if (outputView) return;
+    void runChildRead(next, "Loading conversation...", () => openChildConversation(id, label, automaticRefresh, next.task), async signal => {
       const snapshot = await api.snapshot(id, undefined, signal);
       if (signal.aborted || generation !== childGeneration || child !== next) return;
       next.projection = projectionFromSnapshot(snapshot, []);
       announceChild(snapshot.items.length ? "" : "This subagent has not reported anything yet.");
       renderChild(false);
       next.stream = openChildStream(next, id, label, snapshot.cursor, generation);
+      silentRun.follow(isLiveConversationStatus(next.projection.status));
     });
   };
 
@@ -3545,7 +3756,7 @@ export function initChat(api = new ChatApiClient()): void {
     try {
       let changedHistory = false;
       await runChildRead(open, "Loading older messages...", () => {
-        if (changedHistory) openChildConversation(open.conversationId, open.label);
+        if (changedHistory) openChildConversation(open.conversationId, open.label, false, open.task);
         else drilldownOlder.click();
       }, async signal => {
         const page = await api.snapshot(open.conversationId, open.projection!.olderCursor, signal).catch(error => {
@@ -4512,12 +4723,7 @@ export function initChat(api = new ChatApiClient()): void {
     finally { bootstrapping = false; readSignal.settle(bootstrapRead ?? initialRead); bootstrapRead = null; }
   };
   function chatSurfaceActive() {
-    if (document.visibilityState === "hidden") return false;
-    const root = document.documentElement;
-    if (root.hasAttribute("data-notification-chat")) return true;
-    return root.getAttribute("data-ui-mode") === "touch"
-      ? root.getAttribute("data-active-tab") === "chat"
-      : root.getAttribute("data-chat-panel") === "open";
+    return chatSurfaceInView();
   }
   function syncChatAttention() {
     const pending = [projection, child?.projection].some(source => source?.items.some(item =>
@@ -4559,6 +4765,11 @@ export function initChat(api = new ChatApiClient()): void {
       return;
     }
     if (becameActive) {
+      // The surface just came into view — the render below clears the
+      // pending-content badge, and the hub switcher clears the workspace's
+      // finished mark on the same cue. Fires at bootstrap too when the
+      // surface is already in view (chatWasActive starts false).
+      document.dispatchEvent(new CustomEvent(CHAT_SURFACE_ACTIVE_EVENT));
       // Backgrounding cancels owners but may retain DOM focus without another
       // focusin. Restore only the currently valid request field on return.
       syncEditingFocus();

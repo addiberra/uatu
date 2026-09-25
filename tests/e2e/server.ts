@@ -359,6 +359,11 @@ async function handleE2EChat(request: Request): Promise<Response> {
     reversibleFiles?: ReversibleFileFixture[];
     agent?: "opencode" | "claude";
     count?: number;
+    // A shell task's fake output: what the task view's pane reads, set or
+    // appended to while the task runs (design D7).
+    taskId?: string;
+    text?: string;
+    append?: boolean;
     // Plan usage (design D9): the last-known report and how the next read answers.
     report?: AgentUsageReport | null;
     outcome?: UsageReadOutcome;
@@ -497,6 +502,12 @@ async function handleE2EChat(request: Request): Promise<Response> {
     case "usageRead":
       targetFake.setUsageReadOutcome({ ...(body.outcome ?? { outcome: "no-live-session" }), ...(body.outcome?.conversationId ? { conversationId: body.outcome.conversationId.replace(/^(?:opencode|claude):/, "") } : {}) });
       return Response.json({ ok: true });
+    case "taskOutput":
+      if (body.taskId) {
+        targetFake.setTaskOutput(body.taskId, body.text ?? "", body.append === true);
+        return Response.json({ ok: true });
+      }
+      break;
     case "models":
       targetFake.setModels(body.models ?? []);
       return Response.json({ ok: true });

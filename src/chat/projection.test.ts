@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { ChatEvent, ConversationSnapshot } from "./types";
 import { ConversationProjection } from "./adapter";
-import { addAcceptedDraft, applyChatEvent, dropQueuedMessage, noteQueuedMessage, prependSnapshot, projectionFromSnapshot } from "./projection";
+import { addAcceptedDraft, applyChatEvent, dropQueuedMessage, noteQueuedMessage, prependSnapshot, projectionFromSnapshot, refreshFromSnapshot } from "./projection";
 import { ConversationReplay } from "./replay";
 
 const snapshot = (items: ConversationSnapshot["items"] = []): ConversationSnapshot => ({
@@ -252,5 +252,47 @@ describe("a subagent row's nested lines", () => {
     // Withdrawn outright: the workspace publishes the row without them.
     const bare = applyChatEvent(shrunk.projection, { generation: "g1", sequence: 6, conversationId: "c1", type: "item.upsert", item: row });
     expect(bare.projection.items[0]).not.toHaveProperty("descendants");
+  });
+});
+
+// Design D14: a silent run's drill-down re-reads its snapshot and folds it in
+// the way live events land — never a reload of the view.
+describe("refreshing a held conversation from a fresh first page", () => {
+  const at = (sequence: number) => Buffer.from(JSON.stringify({ v: 1, g: "g1", s: sequence })).toString("base64url");
+  const page = (items: ConversationSnapshot["items"], sequence = 4, status: "running" | "completed" = "running"): ConversationSnapshot => ({
+    ...snapshot(items), cursor: at(sequence), conversation: { ...snapshot().conversation, status },
+  });
+  const message = (id: string, createdAt: number, markdown = id) => ({ id, type: "assistant_message" as const, createdAt, markdown });
+
+  test("new records arrive in order, and an identical read changes nothing", () => {
+    const held = projectionFromSnapshot(page([message("a", 1)]));
+    const refreshed = refreshFromSnapshot(held, page([message("a", 1), message("b", 2)]))!;
+    expect(refreshed.changed).toBe(true);
+    expect(refreshed.projection.items.map(item => item.id)).toEqual(["a", "b"]);
+    expect(refreshFromSnapshot(refreshed.projection, page([message("a", 1), message("b", 2)]))!.changed).toBe(false);
+  });
+
+  test("a settled status is adopted, and the stream resumes from the page's cursor", () => {
+    const held = projectionFromSnapshot(page([message("a", 1)]));
+    const refreshed = refreshFromSnapshot(held, page([message("a", 1)], 6, "completed"))!;
+    expect(refreshed.changed).toBe(true);
+    expect(refreshed.projection.status).toBe("completed");
+    expect(refreshed.projection.sequence).toBe(6);
+    const next = applyChatEvent(refreshed.projection, { generation: "g1", sequence: 7, conversationId: "c1", type: "item.upsert", item: message("c", 3) });
+    expect(next.outcome).toBe("applied");
+  });
+
+  test("an older page the reader paged in is kept, with its paging cursor", () => {
+    const held = { ...projectionFromSnapshot(page([message("old", 0), message("a", 1)])), olderCursor: "further" };
+    const refreshed = refreshFromSnapshot(held, page([message("a", 1), message("b", 2)]))!;
+    expect(refreshed.projection.items.map(item => item.id)).toEqual(["old", "a", "b"]);
+    expect(refreshed.projection.olderCursor).toBe("further");
+  });
+
+  test("a page behind the live stream, or from another conversation or generation, is not folded", () => {
+    const held = projectionFromSnapshot(page([message("a", 1)], 8));
+    expect(refreshFromSnapshot(held, page([message("a", 1)], 7))).toBeNull();
+    expect(refreshFromSnapshot(held, { ...page([], 9), conversation: { ...snapshot().conversation, id: "c2" } })).toBeNull();
+    expect(refreshFromSnapshot(held, { ...page([], 9), generation: "g2" })).toBeNull();
   });
 });

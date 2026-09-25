@@ -2,6 +2,20 @@
 
 Entries are ordered newest first. Every entry has Hub and workspace revisions, a compatibility classification, and migration guidance. Use `None` when no migration is required. An entry is headed `Unreleased` until the release that ships it; the release-prep step replaces that with the version tag (`v0.7.0`), so a consumer can tell which revision pair a given uatu version speaks. An additive change that lands after a pair has shipped gets its own entry under the same pair, stamped with its own release, rather than being appended to the shipped entry.
 
+## Hub 9 / Workspace 21 - Unreleased
+
+Compatibility: breaking (Hub)
+
+### Changes
+
+- The live stream's `WorkspaceActivity` gains a required `finished` boolean, held per caller: the Hub observed the workspace working, it has since gone quiet, and the caller has not viewed its chat since. The Hub watches every running workspace from the moment it starts, whether or not any page is open, and keeps the fact across a restart.
+- `WorkspaceActivity.working` now also covers an agent's live background work after its turn ended, not only a turn in flight.
+- A new Hub operation, `POST /s/{workspaceId}/api/activity-viewed` (`hubAcknowledgeWorkspaceActivity`, 204), reports that the caller has the workspace's chat in view and clears `finished` for that caller on every device.
+
+### Migration
+
+Strict Hub clients must regenerate against Hub revision 9: the `WorkspaceActivity` object is closed, so a revision 8 validator rejects the new `finished` field on every activity event. A client that shows the activity summary should send `hubAcknowledgeWorkspaceActivity` while it has a workspace's chat in view, or `finished` stays set for that user until the session stops or work starts there again. A client that read `working` as "a turn is in flight" should now read it as "the agent is doing something", since a workspace holding only background work also reports it. The workspace payload revision remains 21.
+
 ## Hub 8 / Workspace 21 - Unreleased
 
 Compatibility: breaking (workspace)

@@ -75,6 +75,7 @@ class StubAgentService implements WorkspaceChatService {
   async stopTask(id: string, taskId: string) { return this.record("stopTask", [id, taskId], { stopped: true as const }); }
   async release(id: string) { return this.record("release", [id], { released: true as const }); }
   async cancelWakeup(id: string, wakeupId: string) { return this.record("cancelWakeup", [id, wakeupId], { cancelled: true as const }); }
+  async taskOutput(id: string, taskId: string) { return this.record("taskOutput", [id, taskId], null); }
   async usage() { return this.record("usage", [], null); }
   async readUsage(requestId: string, mode: UsageReadMode) { return this.record("readUsage", [requestId, mode], { report: null, reason: "no-live-session" as const }); }
   async dispose() { this.calls.push({ method: "dispose", args: [] }); }
@@ -363,12 +364,16 @@ describe("qualification of snapshots and events", () => {
       items: [
         { id: "permission:p1", type: "permission", createdAt: 1, requestId: "p1", conversationId: "child", action: "edit", resources: [], status: "pending" },
         { id: "tool:t1", type: "tool", createdAt: 2, name: "task", status: "running", childConversationId: "child" },
+        { id: "task:k1", type: "background_task", createdAt: 3, taskId: "k1", description: "Review the diff", status: "running", childConversationId: "child" },
       ],
     });
     const qualified = await service.history("claude:parent");
     expect(qualified.conversation.id).toBe("claude:parent");
     expect(qualified.items[0]).toEqual(expect.objectContaining({ conversationId: "claude:child" }));
     expect(qualified.items[1]).toEqual(expect.objectContaining({ childConversationId: "claude:child" }));
+    // The task row names the run before its launching tool row settles: an
+    // unqualified id here is what would make a running agent task refuse to open.
+    expect(qualified.items[2]).toEqual(expect.objectContaining({ childConversationId: "claude:child" }));
   });
 
   test("subscribed events are re-qualified, including embedded summaries", async () => {

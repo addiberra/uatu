@@ -553,9 +553,9 @@ describe("the worktrees live topic (5.2)", () => {
       expect(envelope).toEqual({ ws: envelope.ws, topic: "worktrees", cursor: "", event: { kind: "data", data: { type: "worktree.inventory" } } });
     }
     expect(atlasPage.raw.join("\n")).not.toContain(root);
-    // The activity payload keeps its three booleans.
+    // The activity payload keeps its four booleans.
     for (const envelope of atlasPage.envelopes.filter(candidate => candidate.topic === "activity" && candidate.event.kind === "data")) {
-      expect(Object.keys((envelope.event as { data: object }).data).sort()).toEqual(["awaiting", "running", "working"]);
+      expect(Object.keys((envelope.event as { data: object }).data).sort()).toEqual(["awaiting", "finished", "running", "working"]);
     }
     for (const page of [atlasPage, beaconPage, childPage]) page.close();
     await sessions.stop(child);

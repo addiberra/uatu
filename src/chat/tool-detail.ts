@@ -12,7 +12,10 @@ export type ToolDetail =
   | { kind: "patch"; label: string; files: string[]; diff: DiffLine[] }
   | { kind: "question"; label: string; asked: Array<{ header: string; prompt: string }>; answer?: string }
   | { kind: "agent"; label: string; description: string; subagent?: string; prompt: string; conversationId?: string; result?: string }
-  | { kind: "skill"; label: string; name: string }
+  // A skill Claude Code ran as a fork has a transcript of its own:
+  // `conversationId` is the child it forked into, known only once the fork's
+  // result names it (design D10).
+  | { kind: "skill"; label: string; name: string; conversationId?: string }
   // A shell command: the command line is the subject, the agent's own
   // description of it the meta line, and `background` marks a launch the
   // agent sent to the background (Claude Code's `run_in_background`), which
@@ -158,7 +161,7 @@ function parseToolDetail(item: DetailInput): ToolDetail {
     case "skill": {
       const skillName = optionalText(input.name ?? input.skill);
       if (skillName === undefined) break;
-      return { kind: "skill", label: "Skill", name: skillName };
+      return { kind: "skill", label: "Skill", name: skillName, ...(item.childConversationId === undefined ? {} : { conversationId: item.childConversationId }) };
     }
     // The tool name alone says what the call does; the fields refine it.
     case "schedulewakeup": {

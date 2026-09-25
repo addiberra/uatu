@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 
 import {
   parseAgentUsageReport,
+  parseBackgroundTaskOutput,
   parseChatAvailability,
   parseChatCommand,
   parseChatEvent,
@@ -360,6 +361,48 @@ describe("chat domain validation", () => {
     const turn = { id: "message:wakeup:p1", type: "user_message", createdAt: 1, text: "check the build", origin: "wakeup", wakeupId: "a1" };
     expect(parseConversationItem(turn)).toBeTruthy();
     expect(() => parseConversationItem({ ...turn, origin: "cron" })).toThrow(/user message origin/);
+  });
+
+  test("a foreground run row is accepted; any foreground value but true is dropped, not refused", () => {
+    const row: ConversationItem = { id: "task:rv", type: "background_task", createdAt: 1, taskId: "ad53ca64bd188affb", description: "/code-review", taskType: "local_agent", status: "running", childConversationId: "sub:s1:ad53ca64bd188affb", foreground: true };
+    expect(parseConversationItem(row)).toEqual(row);
+    const { foreground: _foreground, ...background } = row;
+    expect(parseConversationItem({ ...row, foreground: false })).toEqual(background);
+    expect(parseConversationItem({ ...row, foreground: "yes" })).toEqual(background);
+  });
+
+  test("a running task's facts are accepted when well-formed and stripped, not refused, when malformed", () => {
+    const row: ConversationItem = { id: "task:a", type: "background_task", createdAt: 1, taskId: "ada2b9582caa230c5", description: "List files and count them", taskType: "local_agent", toolUseId: "toolu_013s2jZs", status: "running" };
+    const facts = {
+      subagentType: "general-purpose",
+      prompt: "List the files in the current directory ...",
+      usage: { totalTokens: 13122, toolUses: 1, durationMs: 4751 },
+      outputFile: "/private/tmp/claude-501/-private-tmp-uatu-spike-work/s1/tasks/ada2b9582caa230c5.output",
+      childConversationId: "sub:s1:ada2b9582caa230c5",
+    };
+    expect(parseConversationItem({ ...row, ...facts })).toEqual({ ...row, ...facts });
+    // Each fact is decoration on a row that stands without it: the bad value
+    // goes, the row and its other facts stay.
+    const malformed = {
+      subagentType: 7,
+      prompt: "",
+      usage: { totalTokens: -1, toolUses: 1, durationMs: 4751 },
+      outputFile: ["/tmp/x"],
+      childConversationId: "bad\u0000id",
+    };
+    expect(parseConversationItem({ ...row, ...malformed, progress: "Using Bash" })).toEqual({ ...row, progress: "Using Bash" });
+    expect(parseConversationItem({ ...row, usage: { totalTokens: 1, toolUses: 1 } })).toEqual(row);
+    expect(parseConversationItem({ ...row, usage: { totalTokens: 1, toolUses: 1, durationMs: 2, extra: 3 } })).toEqual(row);
+    expect(parseConversationItem({ ...row, usage: { totalTokens: 1, toolUses: 1, durationMs: 2 } })).toEqual({ ...row, usage: { totalTokens: 1, toolUses: 1, durationMs: 2 } });
+    // A field the row does not know is still a refusal.
+    expect(() => parseConversationItem({ ...row, spawnDepth: 1 })).toThrow(/unknown/);
+  });
+
+  test("a task output tail parses with its two flags and nothing else", () => {
+    expect(parseBackgroundTaskOutput({ text: "spike-done\n[exited with code 0]", truncated: false, settled: true })).toEqual({ text: "spike-done\n[exited with code 0]", truncated: false, settled: true });
+    expect(() => parseBackgroundTaskOutput({ text: "x", truncated: "no", settled: true })).toThrow(/booleans/);
+    expect(() => parseBackgroundTaskOutput({ text: 1, truncated: false, settled: false })).toThrow(/text/);
+    expect(() => parseBackgroundTaskOutput({ text: "x", truncated: false, settled: false, path: "/tmp/x" })).toThrow(/unknown/);
   });
 
   test("a usage report parses with the plan's own rules; a read result is a report or a named failure", () => {

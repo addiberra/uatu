@@ -21,11 +21,13 @@ import { hashPassword, HubSessionStore } from "./auth";
 import { loadHubConfig } from "./config";
 import { WorkspaceRegistry } from "./registry";
 import { PersonalWorkspaceStateStore } from "./personal-state";
+import { ActivityMarkStore } from "./activity-marks";
 import { PathReservationCoordinator } from "./path-reservations";
 import {
   ensureCredentialStateDirs,
   ensureCanonicalStateDir,
   acquireHubStateLease,
+  activityMarksPath,
   credentialGnuPgPath,
   credentialRuntimePath,
   credentialSecretsPath,
@@ -305,8 +307,13 @@ export async function runHub(options: RunHubOptions): Promise<void> {
   const preferences = new HubPreferencesStore(hubPreferencesPath(stateRoot));
   await preferences.load();
   const personalState = new PersonalWorkspaceStateStore(personalWorkspaceStatePath(stateRoot));
+  // What finished where, and who has seen it. Read before the live broker is
+  // assembled: the broker adopts the marks at construction and resumes its
+  // stamp counter above them, and this hub's broker starts watching there
+  // too, before any page connects.
+  const activityMarks = new ActivityMarkStore(activityMarksPath(stateRoot));
   const credentialMetadata = new CredentialMetadataStore(credentialsPath(stateRoot));
-  await Promise.all([personalState.load(), credentialMetadata.load()]);
+  await Promise.all([personalState.load(), credentialMetadata.load(), activityMarks.load()]);
   const credentialTokens = new CredentialTokenStore(credentialTokenStorePath(stateRoot));
   const credentialToolStore = new CredentialToolOverrideStore(credentialToolsPath(stateRoot));
   const credentialTools = new CredentialToolManager(
@@ -605,6 +612,8 @@ export async function runHub(options: RunHubOptions): Promise<void> {
     sessions,
     sessionStore,
     personalState,
+    activityMarks,
+    watchActivityFromStart: true,
     notifications,
     preferences,
     onboarding,
@@ -646,6 +655,10 @@ export async function runHub(options: RunHubOptions): Promise<void> {
           server.live.endAll();
           server.liveBroker.dispose();
           server.stop(true);
+          // Anything still inside the marks' debounce is owed to the next
+          // hub: write it before the process goes.
+          await activityMarks.flush();
+          activityMarks.close();
           await notifications.dispose();
         },
         stateLease,

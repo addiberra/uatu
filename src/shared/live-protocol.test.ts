@@ -103,18 +103,24 @@ describe("subscription control body", () => {
 });
 
 describe("activity summary", () => {
-  test("keeps exactly the three facts and drops everything else", () => {
-    expect(sanitizeWorkspaceActivity({ running: true, working: true, awaiting: false, title: "secret", conversationId: "c1" }))
-      .toEqual({ running: true, working: true, awaiting: false });
+  test("keeps exactly the four facts and drops everything else", () => {
+    expect(sanitizeWorkspaceActivity({ running: true, working: true, awaiting: false, finished: false, title: "secret", conversationId: "c1" }))
+      .toEqual({ running: true, working: true, awaiting: false, finished: false });
+    expect(sanitizeWorkspaceActivity({ running: true, working: false, awaiting: false, finished: true }))
+      .toEqual({ running: true, working: false, awaiting: false, finished: true });
   });
 
-  test("a workspace that is not running is neither working nor awaiting", () => {
-    expect(sanitizeWorkspaceActivity({ running: false, working: true, awaiting: true })).toEqual({ running: false, working: false, awaiting: false });
+  test("a missing finished fact reads as false, so a three-fact summary still parses", () => {
+    expect(sanitizeWorkspaceActivity({ running: true, working: true, awaiting: false })).toEqual({ running: true, working: true, awaiting: false, finished: false });
+  });
+
+  test("a workspace that is not running is neither working, awaiting, nor finished", () => {
+    expect(sanitizeWorkspaceActivity({ running: false, working: true, awaiting: true, finished: true })).toEqual({ running: false, working: false, awaiting: false, finished: false });
   });
 
   test("anything that is not a literal true reads as false", () => {
-    expect(sanitizeWorkspaceActivity({ running: "yes", working: 1 })).toEqual({ running: false, working: false, awaiting: false });
-    expect(sanitizeWorkspaceActivity(null)).toEqual({ running: false, working: false, awaiting: false });
+    expect(sanitizeWorkspaceActivity({ running: "yes", working: 1, finished: "true" })).toEqual({ running: false, working: false, awaiting: false, finished: false });
+    expect(sanitizeWorkspaceActivity(null)).toEqual({ running: false, working: false, awaiting: false, finished: false });
   });
 });
 

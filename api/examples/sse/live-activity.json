@@ -9,7 +9,8 @@
       "data": {
         "running": true,
         "working": false,
-        "awaiting": true
+        "awaiting": true,
+        "finished": false
       }
     }
   }

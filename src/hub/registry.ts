@@ -114,8 +114,21 @@ export class WorkspaceRegistry {
   // (temp file + rename) so a crash mid-write cannot corrupt the registry.
   private mutationChain: Promise<unknown> = Promise.resolve();
   private saveCounter = 0;
+  // Told after a removal has committed. A freed id can be minted again for
+  // a different folder, so whatever the hub keeps keyed by workspace id
+  // outside this file — the live broker's finished/viewed marks — must hear
+  // of every removal, whichever flow performed it (forget, a rolled-back
+  // registration, a folder removal, a worktree unregister).
+  private readonly removedListeners = new Set<(id: string) => void>();
 
   constructor(private readonly filePath: string) {}
+
+  onRemoved(listener: (id: string) => void): () => void {
+    this.removedListeners.add(listener);
+    return () => {
+      this.removedListeners.delete(listener);
+    };
+  }
 
   // Enqueues one mutation behind every earlier one; a failed predecessor
   // does not block successors.
@@ -383,6 +396,13 @@ export class WorkspaceRegistry {
       } catch (error) {
         this.workspaces = previous;
         throw error;
+      }
+      for (const listener of [...this.removedListeners]) {
+        try {
+          listener(id);
+        } catch {
+          // A listener never undoes or fails a committed removal.
+        }
       }
       return true;
     });

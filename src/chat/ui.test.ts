@@ -25,7 +25,11 @@ if (process.env[CHILD_PROCESS_FLAG] !== "1") {
         child.exited,
       ]);
       expect(exitCode, `${stdout}\n${stderr}`).toBe(0);
-    });
+      // The child runs this whole file, including a case that waits on the
+      // surface's one-second clock and two that wait out the output view's
+      // four-second retry; the default five seconds leaves it no room, and a
+      // timeout here reports as the wrong test failing.
+    }, 60_000);
   });
 } else {
 describe("chat reversible-history composer", () => {
@@ -1554,6 +1558,459 @@ describe("chat outstanding-request pill", () => {
     }
   });
 });
+
+describe("chat running-task inspection", () => {
+  const runningAgentItems = () => [
+    { id: "message:u", type: "user_message", createdAt: 1, text: "review the renderer" },
+    {
+      id: "tool:toolu_1", type: "tool", createdAt: 2, name: "task", status: "running",
+      input: JSON.stringify({ description: "Review renderer", subagent_type: "explore", prompt: "go" }),
+    },
+    {
+      id: "task:ada2b", type: "background_task", createdAt: 2, taskId: "ada2b", description: "Review renderer", taskType: "local_agent",
+      toolUseId: "toolu_1", status: "running", childConversationId: "child", subagentType: "explore", progress: "Reading the tests",
+      usage: { totalTokens: 13_122, toolUses: 1, durationMs: 4_000 },
+    },
+  ];
+
+  test("a running agent task's row and its subagents-track row open the child transcript under a strip that stops the task", async () => {
+    const { document, window } = parseHTML(html);
+    installDomGlobals(document, window);
+    document.documentElement.setAttribute("data-ui-mode", "desktop");
+    document.documentElement.setAttribute("data-chat-panel", "open");
+    stubConversationSelect(document);
+    const stops: string[] = [];
+    const api = taskApi(document, { items: id => id === "one" ? runningAgentItems() : [{ id: "message:c", type: "assistant_message", createdAt: 3, markdown: "Looking at the tests" }], stop: taskId => { stops.push(taskId); } });
+    const drilldown = document.querySelector<HTMLElement>("#chat-drilldown")!;
+    const strip = document.querySelector<HTMLElement>("#chat-drilldown-task")!;
+    const click = (element: Element) => element.dispatchEvent(new window.Event("click", { bubbles: true }) as unknown as Event);
+    try {
+      const { initChat } = await import(`./ui.ts?task-inspection-agent-ui-test=${Date.now()}`);
+      initChat(api);
+      const inspect = () => document.querySelector<HTMLButtonElement>('#chat-background-tasks [data-inspect-task="ada2b"]');
+      await waitUntil(() => inspect() != null, () => document.querySelector("#chat-background-tasks")?.textContent ?? "no task list");
+      expect(inspect()!.dataset.inspectView).toBe("transcript");
+      // The subagents track already offers the running run, with its progress.
+      const trackRow = document.querySelector<HTMLButtonElement>('#chat-subagents [data-open-conversation="child"]')!;
+      expect(trackRow).not.toBeNull();
+      expect(document.querySelector("#chat-subagents .chat-subagent-progress")?.textContent).toBe("Reading the tests");
+
+      click(inspect()!);
+      expect(drilldown.hidden).toBe(false);
+      expect(document.querySelector("#chat-drilldown-timeline")!.hasAttribute("hidden")).toBe(false);
+      expect(document.querySelector("#chat-drilldown-output")!.hasAttribute("hidden")).toBe(true);
+      expect(document.querySelector("#chat-drilldown-title")?.textContent).toBe("explore · Review renderer");
+      expect(strip.hidden).toBe(false);
+      expect(strip.querySelector(".chat-drilldown-task-description")?.textContent).toBe("Review renderer");
+      expect(strip.querySelector(".chat-drilldown-task-type")?.textContent).toBe("explore");
+      expect(strip.querySelector(".chat-drilldown-task-progress")?.textContent).toBe("Reading the tests");
+      expect(strip.querySelector(".chat-drilldown-task-usage")?.textContent).toBe("13k tokens · 1 tool use");
+      expect(strip.querySelector("[data-task-elapsed]")?.textContent).toMatch(/^\d+:\d\d(:\d\d)?$/);
+      await waitUntil(() => document.querySelector("#chat-drilldown-items")?.textContent?.includes("Looking at the tests") ?? false, () => document.querySelector("#chat-drilldown-state")?.textContent ?? "no child");
+
+      // Stop from the strip goes through the one stop path and holds the control.
+      click(strip.querySelector('[data-stop-task="ada2b"]')!);
+      expect(stops).toEqual(["ada2b"]);
+      expect(strip.querySelector<HTMLButtonElement>("[data-stop-task]")!.disabled).toBe(true);
+
+      click(document.querySelector<HTMLButtonElement>("#chat-drilldown-back")!);
+      expect(drilldown.hidden).toBe(true);
+      expect(strip.hidden).toBe(true);
+
+      // The track row leads to the same transcript with the same strip.
+      click(document.querySelector<HTMLButtonElement>('#chat-subagents [data-open-conversation="child"]')!);
+      expect(drilldown.hidden).toBe(false);
+      expect(strip.hidden).toBe(false);
+      expect(strip.dataset.taskId).toBe("ada2b");
+      click(document.querySelector<HTMLButtonElement>("#chat-drilldown-back")!);
+    } finally {
+      await Bun.sleep(20);
+      window.dispatchEvent(new Event("pagehide"));
+    }
+  });
+
+  test("a running shell task's row opens the output view in the drill-down and reads the task's output", async () => {
+    const { document, window } = parseHTML(html);
+    installDomGlobals(document, window);
+    document.documentElement.setAttribute("data-ui-mode", "desktop");
+    document.documentElement.setAttribute("data-chat-panel", "open");
+    stubConversationSelect(document);
+    const outputs: Array<[string, string]> = [];
+    const snapshots: string[] = [];
+    const api = taskApi(document, {
+      items: () => [
+        { id: "message:u", type: "user_message", createdAt: 1, text: "run the tests" },
+        { id: "task:bgjpa", type: "background_task", createdAt: 2, taskId: "bgjpa", description: "bun test", taskType: "local_bash", toolUseId: "toolu_2", status: "running", outputFile: "/tmp/tasks/bgjpa.output" },
+      ],
+      output: (conversationId, taskId) => { outputs.push([conversationId, taskId]); return { text: "1 pass\n", truncated: false, settled: false }; },
+      onSnapshot: id => { snapshots.push(id); },
+    });
+    const drilldown = document.querySelector<HTMLElement>("#chat-drilldown")!;
+    const click = (element: Element) => element.dispatchEvent(new window.Event("click", { bubbles: true }) as unknown as Event);
+    try {
+      const { initChat } = await import(`./ui.ts?task-inspection-shell-ui-test=${Date.now()}`);
+      initChat(api);
+      const inspect = () => document.querySelector<HTMLButtonElement>('#chat-background-tasks [data-inspect-task="bgjpa"]');
+      await waitUntil(() => inspect() != null, () => document.querySelector("#chat-background-tasks")?.textContent ?? "no task list");
+      expect(inspect()!.dataset.inspectView).toBe("output");
+      // A shell task reports no progress at all, so the elapsed readout is
+      // the row's only live signal (D6) — without it the row says nothing
+      // about the task between launch and settle.
+      const elapsed = document.querySelector<HTMLElement>('#chat-background-tasks [data-background-task="bgjpa"] .chat-background-task-elapsed');
+      expect(elapsed).not.toBeNull();
+      expect(elapsed!.textContent).toMatch(/^\d+:\d\d(:\d\d)?$/);
+      expect(elapsed!.dataset.elapsedSince).toBe("2");
+      // And it ticks: the row is rebuilt only when what it SAYS changes, so a
+      // readout painted once would stand still for the whole run. The clock
+      // is the working lines' own second tick, which the background state has
+      // to keep alive even though the turn has ended.
+      const firstReading = elapsed!.textContent;
+      for (let attempt = 0; attempt < 12 && elapsed!.textContent === firstReading; attempt += 1) await Bun.sleep(200);
+      expect(elapsed!.textContent).not.toBe(firstReading);
+      const snapshotsBefore = snapshots.length;
+
+      click(inspect()!);
+      expect(drilldown.hidden).toBe(false);
+      expect(document.querySelector("#chat-drilldown-title")?.textContent).toBe("bun test");
+      expect(document.querySelector("#chat-drilldown-timeline")!.hasAttribute("hidden")).toBe(true);
+      expect(document.querySelector("#chat-drilldown-output")!.hasAttribute("hidden")).toBe(false);
+      expect(document.querySelector("#chat-drilldown-task [data-stop-task]")).not.toBeNull();
+      await waitUntil(() => document.querySelector("#chat-drilldown-output-text")?.textContent === "1 pass\n", () => document.querySelector("#chat-drilldown-output-note")?.textContent ?? "no output");
+      expect(outputs).toEqual([["one", "bgjpa"]]);
+      // No transcript was asked for: the view is the task's, not a child's.
+      expect(snapshots.length).toBe(snapshotsBefore);
+
+      click(document.querySelector<HTMLButtonElement>("#chat-drilldown-back")!);
+      expect(drilldown.hidden).toBe(true);
+      expect(document.querySelector("#chat-drilldown-timeline")!.hasAttribute("hidden")).toBe(false);
+      expect(document.querySelector("#chat-drilldown-output")!.hasAttribute("hidden")).toBe(true);
+    } finally {
+      await Bun.sleep(20);
+      window.dispatchEvent(new Event("pagehide"));
+    }
+  });
+
+  // The output view has no child stream whose next event would take a read
+  // error down, so the recovery the panel reports is what clears the line.
+  // Real timers: the retry after one failure is four seconds out.
+  const openFailingOutputView = async (label: string, reads: Array<() => { text: string; truncated: boolean; settled: boolean } | null>) => {
+    const { document, window } = parseHTML(html);
+    installDomGlobals(document, window);
+    document.documentElement.setAttribute("data-ui-mode", "desktop");
+    document.documentElement.setAttribute("data-chat-panel", "open");
+    stubConversationSelect(document);
+    let read = 0;
+    const api = taskApi(document, {
+      items: () => [
+        { id: "message:u", type: "user_message", createdAt: 1, text: "run the tests" },
+        { id: "task:bgjpa", type: "background_task", createdAt: 2, taskId: "bgjpa", description: "bun test", taskType: "local_bash", toolUseId: "toolu_2", status: "running", outputFile: "/tmp/tasks/bgjpa.output" },
+      ],
+      output: () => { const answer = reads[Math.min(read, reads.length - 1)]!; read += 1; return answer(); },
+    });
+    const { initChat } = await import(`./ui.ts?${label}=${Date.now()}`);
+    initChat(api);
+    const inspect = () => document.querySelector<HTMLButtonElement>('#chat-background-tasks [data-inspect-task="bgjpa"]');
+    await waitUntil(() => inspect() != null, () => document.querySelector("#chat-background-tasks")?.textContent ?? "no task list");
+    inspect()!.dispatchEvent(new window.Event("click", { bubbles: true }) as unknown as Event);
+    const line = document.querySelector<HTMLElement>("#chat-drilldown-state")!;
+    await waitUntil(() => line.textContent === "workspace did not answer", () => line.textContent ?? "no drill-down line");
+    expect(line.classList.contains("is-error")).toBe(true);
+    expect(line.hidden).toBe(false);
+    return { document, window, line, reads: () => read };
+  };
+  const eventually = async (predicate: () => boolean, describe: () => string, ms = 8_000) => {
+    const deadline = Date.now() + ms;
+    while (!predicate()) {
+      if (Date.now() > deadline) throw new Error(`timed out waiting for ${describe()}`);
+      await Bun.sleep(50);
+    }
+  };
+  const fail = () => { throw new Error("workspace did not answer"); };
+
+  test("a shell task's output read that fails shows its error, and the next read that answers takes it down", async () => {
+    const { document, window, line } = await openFailingOutputView("task-output-recovery-ui-test", [fail, () => ({ text: "1 pass\n", truncated: false, settled: false })]);
+    try {
+      await eventually(() => document.querySelector("#chat-drilldown-output-text")?.textContent === "1 pass\n", () => line.textContent ?? "no output");
+      expect(line.textContent).toBe("");
+      expect(line.classList.contains("is-error")).toBe(false);
+      expect(line.hidden).toBe(true);
+    } finally {
+      await Bun.sleep(20);
+      window.dispatchEvent(new Event("pagehide"));
+    }
+  }, 15_000);
+
+  test("a recovered output read leaves standing a message spoken on the line after its error", async () => {
+    const { document, window, line, reads } = await openFailingOutputView("task-output-recovery-guard-ui-test", [fail, () => ({ text: "1 pass\n", truncated: false, settled: false })]);
+    try {
+      // No path in the product speaks on this line while an output view is
+      // open, so another speaker is stood in for at the announcer's own text
+      // node — the one whose content the guard compares against.
+      const spoken = [...line.childNodes].find(node => node.nodeType === 3)!;
+      spoken.textContent = "Something else went wrong";
+      await eventually(() => reads() >= 2 && document.querySelector("#chat-drilldown-output-text")?.textContent === "1 pass\n", () => line.textContent ?? "no output");
+      expect(line.textContent).toBe("Something else went wrong");
+      expect(line.hidden).toBe(false);
+    } finally {
+      await Bun.sleep(20);
+      window.dispatchEvent(new Event("pagehide"));
+    }
+  }, 15_000);
+});
+
+// Design D13/D14: the run a typed command launches streams nothing; its
+// drill-down follows the transcript Claude Code writes to disk.
+describe("a typed command's silent run", () => {
+  test("is listed with the subagents, not as background work, and its open transcript fills in from re-read snapshots without reopening the view", async () => {
+    const { document, window } = parseHTML(html);
+    installDomGlobals(document, window);
+    document.documentElement.setAttribute("data-ui-mode", "desktop");
+    document.documentElement.setAttribute("data-chat-panel", "open");
+    stubConversationSelect(document);
+    const childReads: number[] = [];
+    const streams: string[] = [];
+    const record = (index: number) => ({ id: `message:r${index}`, type: "assistant_message", createdAt: 10 + index, markdown: `Review step ${index}` });
+    const api = taskApi(document, {
+      items: id => id === "one"
+        ? [
+          { id: "message:u", type: "user_message", createdAt: 1, text: "/code-review low" },
+          { id: "task:rv", type: "background_task", createdAt: 2, taskId: "rv", description: "/code-review", taskType: "local_agent", status: "running", subagentType: "general-purpose", childConversationId: "child", foreground: true },
+        ]
+        // The transcript on disk grows by one record per read.
+        : Array.from({ length: childReads.length }, (_, index) => record(index + 1)),
+      onSnapshot: id => { if (id === "child") childReads.push(Date.now()); },
+      onStream: id => { streams.push(id); },
+    });
+    const drilldown = document.querySelector<HTMLElement>("#chat-drilldown")!;
+    const strip = document.querySelector<HTMLElement>("#chat-drilldown-task")!;
+    const click = (element: Element) => element.dispatchEvent(new window.Event("click", { bubbles: true }) as unknown as Event);
+    try {
+      const { initChat } = await import(`./ui.ts?silent-run-ui-test=${Date.now()}`);
+      initChat(api);
+      const trackRow = () => document.querySelector<HTMLButtonElement>('#chat-subagents [data-open-conversation="child"]');
+      await waitUntil(() => trackRow() != null, () => document.querySelector("#chat-subagents")?.textContent ?? "no track");
+      expect(trackRow()!.textContent).toBe("/code-review");
+      // Not background work: no composer list, and no row in the timeline.
+      expect(document.querySelector<HTMLElement>("#chat-background-tasks")!.hidden).toBe(true);
+      expect(document.querySelector('#chat-items [data-chat-item-id="task:rv"]')).toBeNull();
+
+      click(trackRow()!);
+      expect(drilldown.hidden).toBe(false);
+      expect(document.querySelector("#chat-drilldown-title")?.textContent).toBe("/code-review");
+      expect(strip.querySelector(".chat-drilldown-task-description")?.textContent).toBe("/code-review");
+      // The turn's own Cancel stops a command; the strip offers no Stop.
+      expect(strip.querySelector("[data-stop-task]")).toBeNull();
+      await waitUntil(() => document.querySelector("#chat-drilldown-items")?.textContent?.includes("Review step 1") ?? false, () => document.querySelector("#chat-drilldown-items")?.textContent ?? "empty");
+      const description = strip.querySelector(".chat-drilldown-task-description");
+      // Silent for two seconds: the snapshot is read again, and what the run
+      // wrote since arrives in place.
+      for (let attempt = 0; attempt < 40 && !(document.querySelector("#chat-drilldown-items")?.textContent?.includes("Review step 2")); attempt += 1) await Bun.sleep(100);
+      expect(document.querySelector("#chat-drilldown-items")?.textContent).toContain("Review step 2");
+      expect(childReads.length).toBe(2);
+      expect(childReads[1]! - childReads[0]!).toBeGreaterThanOrEqual(1_900);
+      // Folded in, never reopened: one stream for the child, the same strip.
+      expect(streams.filter(id => id === "child")).toEqual(["child"]);
+      expect(strip.querySelector(".chat-drilldown-task-description")).toBe(description);
+      expect(document.querySelector("#chat-drilldown-title")?.textContent).toBe("/code-review");
+
+      click(document.querySelector<HTMLButtonElement>("#chat-drilldown-back")!);
+      expect(drilldown.hidden).toBe(true);
+      const readsAtClose = childReads.length;
+      await Bun.sleep(2_300);
+      expect(childReads.length).toBe(readsAtClose);
+    } finally {
+      await Bun.sleep(20);
+      window.dispatchEvent(new Event("pagehide"));
+    }
+  }, 15_000);
+  test("a drill-down left open through the settle shows the run's last records, and closing it cancels the reads still due", async () => {
+    const { document, window } = parseHTML(html);
+    installDomGlobals(document, window);
+    document.documentElement.setAttribute("data-ui-mode", "desktop");
+    document.documentElement.setAttribute("data-chat-panel", "open");
+    stubConversationSelect(document);
+    const childReads: number[] = [];
+    let streamed: { event(event: unknown, cursor: string): void } | undefined;
+    // The child's replay position and what its transcript on disk holds. The
+    // run's last record is written before its settle is announced, and only
+    // to disk: a typed command's run streams nothing.
+    let sequence = 0;
+    let settled = false;
+    const cursorAt = (at: number) => Buffer.from(JSON.stringify({ v: 1, g: "g", s: at })).toString("base64url");
+    const api = taskApi(document, {
+      items: id => id === "one"
+        ? [
+          { id: "message:u", type: "user_message", createdAt: 1, text: "/code-review low" },
+          { id: "task:rv", type: "background_task", createdAt: 2, taskId: "rv", description: "/code-review", taskType: "local_agent", status: "running", subagentType: "general-purpose", childConversationId: "child", foreground: true },
+        ]
+        : [
+          { id: "message:r1", type: "assistant_message", createdAt: 11, markdown: "Review step 1" },
+          ...(settled ? [{ id: "message:r2", type: "assistant_message", createdAt: 12, markdown: "Final review text" }] : []),
+        ],
+      onSnapshot: id => { if (id === "child") childReads.push(Date.now()); },
+      onStream: (id, handlers) => { if (id === "child") streamed = handlers; },
+      childSnapshot: () => ({ cursor: cursorAt(sequence), status: settled ? "completed" : "running" }),
+    });
+    const drilldown = document.querySelector<HTMLElement>("#chat-drilldown")!;
+    const items = () => document.querySelector("#chat-drilldown-items")?.textContent ?? "";
+    const click = (element: Element) => element.dispatchEvent(new window.Event("click", { bubbles: true }) as unknown as Event);
+    try {
+      const { initChat } = await import(`./ui.ts?silent-run-settle-ui-test=${Date.now()}`);
+      initChat(api);
+      const trackRow = () => document.querySelector<HTMLButtonElement>('#chat-subagents [data-open-conversation="child"]');
+      await waitUntil(() => trackRow() != null, () => document.querySelector("#chat-subagents")?.textContent ?? "no track");
+      click(trackRow()!);
+      await waitUntil(() => items().includes("Review step 1") && streamed != null, items);
+      expect(childReads.length).toBe(1);
+
+      // The run finishes: its last record lands on disk, then the settle
+      // arrives on the child's stream as a status change and nothing else.
+      settled = true;
+      sequence = 1;
+      const settledAt = Date.now();
+      streamed!.event({ type: "conversation.status", generation: "g", sequence: 1, conversationId: "child", status: "completed" }, cursorAt(1));
+      // Read at the settle, not a quiet period later.
+      await waitUntil(() => items().includes("Final review text"), () => `the run's last record; the drill-down holds "${items()}"`);
+      expect(Date.now() - settledAt).toBeLessThan(1_000);
+      expect(childReads.length).toBe(2);
+      expect(drilldown.hidden).toBe(false);
+
+      // Closed before the guard read falls due: it never comes.
+      click(document.querySelector<HTMLButtonElement>("#chat-drilldown-back")!);
+      expect(drilldown.hidden).toBe(true);
+      await Bun.sleep(2_500);
+      expect(childReads.length).toBe(2);
+    } finally {
+      await Bun.sleep(20);
+      window.dispatchEvent(new Event("pagehide"));
+    }
+  }, 15_000);
+});
+
+describe("chat running work reachable without a disclosure", () => {
+  const shellTask = (taskId: string, status: "running" | "completed", createdAt = 2) => ({
+    id: `task:${taskId}`, type: "background_task", createdAt, taskId, description: `Task ${taskId}`, taskType: "local_bash",
+    toolUseId: `toolu_${taskId}`, status, outputFile: `/tmp/tasks/${taskId}.output`,
+  });
+
+  test("both lists open on their first running work; a user collapse holds until the work is over, and a new conversation opens them afresh", async () => {
+    const { document, window } = parseHTML(html);
+    installDomGlobals(document, window);
+    document.documentElement.setAttribute("data-ui-mode", "desktop");
+    document.documentElement.setAttribute("data-chat-panel", "open");
+    stubConversationSelect(document);
+    const streams = new Map<string, { event(event: unknown, cursor: string): void }>();
+    const sequences = new Map<string, number>();
+    const api = taskApi(document, {
+      conversations: ["one", "two"],
+      items: id => id === "one"
+        ? [{ id: "message:u", type: "user_message", createdAt: 1, text: "run it" }, shellTask("a", "running"),
+          { id: "tool:toolu_s", type: "tool", createdAt: 2, name: "task", status: "running", input: JSON.stringify({ description: "Read the tree", subagent_type: "explore", prompt: "go" }) }]
+        : [{ id: "message:u2", type: "user_message", createdAt: 1, text: "and here" }, shellTask("z", "running")],
+      onStream: (id, handlers) => { streams.set(id, handlers); sequences.set(id, 0); },
+    });
+    const upsert = (conversationId: string, item: unknown) => {
+      const sequence = (sequences.get(conversationId) ?? 0) + 1;
+      sequences.set(conversationId, sequence);
+      streams.get(conversationId)!.event({ type: "item.upsert", generation: "g", sequence, conversationId, item }, `cursor-${conversationId}-${sequence}`);
+    };
+    const tasks = document.querySelector<HTMLDetailsElement>("#chat-background-tasks")!;
+    const track = document.querySelector<HTMLDetailsElement>("#chat-subagents")!;
+    // What the browser does after `open` changes, a task later: linkedom
+    // fires no `toggle`, so the tests deliver it as the page would see it.
+    const toggle = (list: HTMLDetailsElement) => list.dispatchEvent(new window.Event("toggle") as unknown as Event);
+    const collapse = (list: HTMLDetailsElement) => { list.open = false; toggle(list); };
+    const settle = () => Bun.sleep(30);
+    try {
+      const { initChat } = await import(`./ui.ts?running-work-disclosure-ui-test=${Date.now()}`);
+      initChat(api);
+      await waitUntil(() => !tasks.hidden && streams.has("one"), () => tasks.textContent ?? "no task list");
+      // Reachable at once: no disclosure click stands between the running
+      // task and its inspect and Stop controls.
+      expect(tasks.open).toBe(true);
+      expect(track.hidden).toBe(false);
+      expect(track.open).toBe(true);
+      expect(tasks.querySelector('[data-inspect-task="a"]')).not.toBeNull();
+      expect(tasks.querySelector('[data-stop-task="a"]')).not.toBeNull();
+      // The open's own event lands afterwards; it is not a choice the user made.
+      toggle(tasks);
+      toggle(track);
+
+      // The user collapses both; more running work does not reopen them.
+      collapse(tasks);
+      collapse(track);
+      upsert("one", shellTask("b", "running", 3));
+      upsert("one", { id: "tool:toolu_t", type: "tool", createdAt: 3, name: "task", status: "running", input: JSON.stringify({ description: "Audit docs", subagent_type: "explore", prompt: "go" }) });
+      await waitUntil(() => tasks.querySelector('[data-background-task="b"]') != null, () => tasks.textContent ?? "no task list");
+      await settle();
+      expect(tasks.open).toBe(false);
+      expect(track.open).toBe(false);
+
+      // The work ends: the collapse ends with it, and the next work opens.
+      upsert("one", shellTask("a", "completed"));
+      upsert("one", shellTask("b", "completed", 3));
+      upsert("one", { id: "tool:toolu_s", type: "tool", createdAt: 2, name: "task", status: "completed", input: JSON.stringify({ description: "Read the tree", subagent_type: "explore", prompt: "go" }) });
+      upsert("one", { id: "tool:toolu_t", type: "tool", createdAt: 3, name: "task", status: "completed", input: JSON.stringify({ description: "Audit docs", subagent_type: "explore", prompt: "go" }) });
+      await waitUntil(() => tasks.hidden === true, () => tasks.textContent ?? "task list");
+      // Finished subagents stay listed until dismissed, but are not running
+      // work: they neither open the track nor keep a collapse alive.
+      expect(track.hidden).toBe(false);
+      expect(track.open).toBe(false);
+      upsert("one", shellTask("c", "running", 4));
+      upsert("one", { id: "tool:toolu_u", type: "tool", createdAt: 4, name: "task", status: "running", input: JSON.stringify({ description: "Check links", subagent_type: "explore", prompt: "go" }) });
+      await waitUntil(() => !tasks.hidden, () => "no task list");
+      await settle();
+      expect(tasks.open).toBe(true);
+      expect(track.open).toBe(true);
+      toggle(tasks);
+
+      // A collapse is a choice about this conversation's work: the next
+      // conversation's running work is shown open.
+      collapse(tasks);
+      const select = document.querySelector<HTMLSelectElement>("#chat-conversation-select")!;
+      select.value = "two";
+      select.dispatchEvent(new window.Event("change") as unknown as Event);
+      await waitUntil(() => tasks.querySelector('[data-background-task="z"]') != null, () => tasks.textContent ?? "no task list");
+      expect(tasks.open).toBe(true);
+    } finally {
+      await Bun.sleep(20);
+      window.dispatchEvent(new Event("pagehide"));
+    }
+  });
+});
+
+function taskApi(document: Document, options: {
+  items: (conversationId: string) => unknown[];
+  stop?: (taskId: string) => void;
+  output?: (conversationId: string, taskId: string) => { text: string; truncated: boolean; settled: boolean } | null;
+  onSnapshot?: (conversationId: string) => void;
+  onStream?: (conversationId: string, handlers: { event(event: unknown, cursor: string): void }) => void;
+  conversations?: string[];
+  // A child's snapshot as the server would state it: its cursor and status.
+  childSnapshot?: () => { cursor: string; status: string };
+}): ChatApiClient {
+  return {
+    status: async () => ([{
+      agent: { id: "test", name: "Test" },
+      availability: { state: "ready", version: "test", agent: { id: "test", name: "Test", capabilities: ["background-tasks", "subagents"] } },
+    }]),
+    conversations: async () => (options.conversations ?? ["one"]).map(id => ({ ...conversation(id), status: "background" })),
+    commands: async () => [],
+    snapshot: async (id: string) => {
+      options.onSnapshot?.(id);
+      const stated = id === "one" ? undefined : options.childSnapshot?.();
+      return { ...snapshot(id), ...(stated ? { cursor: stated.cursor } : {}), conversation: { ...conversation(id), status: id === "one" ? "background" : stated?.status ?? "running" }, items: options.items(id) };
+    },
+    stream: (conversationId: string, _cursor: string, handlers: { event(event: unknown, cursor: string): void }) => {
+      options.onStream?.(conversationId, handlers);
+      return { close() {} };
+    },
+    inventoryStream: () => ({ close() {} }),
+    attachmentUrl: (id: string) => `/api/chat/attachments/${id}`,
+    stopTask: async (_conversationId: string, taskId: string) => { options.stop?.(taskId); await new Promise(() => {}); },
+    taskOutput: async (conversationId: string, taskId: string) => options.output?.(conversationId, taskId) ?? null,
+  } as unknown as ChatApiClient;
+}
 
 afterAll(() => {
   for (const [key, value] of savedGlobals) Reflect.set(globalThis, key, value);

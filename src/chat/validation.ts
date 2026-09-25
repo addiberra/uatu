@@ -1,6 +1,7 @@
 import { TOKEN_USAGE_COMPONENTS } from "./usage";
 import type {
   AgentChatStatus,
+  BackgroundTaskOutput,
   ChatAgentDescriptor,
   ActivityStatus,
   ChatAgent,
@@ -480,7 +481,7 @@ export function parseConversationItem(value: unknown): ConversationItem {
       break;
     }
     case "background_task":
-      expectKeys(record, ["id", "type", "createdAt", "taskId", "description", "taskType", "toolUseId", "status", "progress", "summary"], type);
+      expectKeys(record, ["id", "type", "createdAt", "taskId", "description", "taskType", "toolUseId", "status", "progress", "summary", "subagentType", "prompt", "usage", "outputFile", "childConversationId", "foreground"], type);
       expectIdentity(record.taskId, "background task id");
       expectNonEmptyString(record.description, "background task description");
       expectOptionalString(record.taskType, "background task type");
@@ -488,6 +489,16 @@ export function parseConversationItem(value: unknown): ConversationItem {
       expectOneOf(record.status, ["running", "completed", "failed", "stopped"], "background task status");
       expectOptionalString(record.progress, "background task progress");
       expectOptionalString(record.summary, "background task summary");
+      // The facts a running task carries are decoration on a row that stands
+      // without them: a malformed one is dropped, and the row — its identity,
+      // status, and summary — is kept rather than refused whole.
+      stripUnless(record, "subagentType", value => typeof value === "string" && value.length > 0);
+      stripUnless(record, "prompt", value => typeof value === "string" && value.length > 0);
+      stripUnless(record, "outputFile", value => typeof value === "string" && value.length > 0);
+      stripUnless(record, "childConversationId", value => typeof value === "string" && value.length > 0 && value.length <= 512 && !/[\u0000-\u001f\u007f]/.test(value));
+      stripUnless(record, "usage", isBackgroundTaskUsage);
+      // Only `true` means anything; anything else is a background row as before.
+      stripUnless(record, "foreground", value => value === true);
       break;
     case "scheduled_wakeup":
       expectKeys(record, ["id", "type", "createdAt", "wakeupId", "prompt", "recurring", "schedule", "nextFireAt", "status", "firedTurnId", "message"], type);
@@ -725,6 +736,15 @@ export function parseUsageReportResponse(value: unknown): { report: AgentUsageRe
   return { report: parseAgentUsageReport(record.report) };
 }
 
+/** The bounded tail of a task's output as the child answers it. */
+export function parseBackgroundTaskOutput(value: unknown): BackgroundTaskOutput {
+  const record = expectRecord(value, "task output");
+  expectKeys(record, ["text", "truncated", "settled"], "task output");
+  expectString(record.text, "task output text");
+  if (typeof record.truncated !== "boolean" || typeof record.settled !== "boolean") throw new Error("task output flags must be booleans");
+  return value as BackgroundTaskOutput;
+}
+
 export function parseUsageReadResult(value: unknown): UsageReadResult {
   const record = expectRecord(value, "usage read");
   expectKeys(record, ["report", "reason"], "usage read");
@@ -734,6 +754,19 @@ export function parseUsageReadResult(value: unknown): UsageReadResult {
   }
   if (record.reason !== undefined) throw new Error("usage read with a report carries no reason");
   return { report: parseAgentUsageReport(record.report)! };
+}
+
+/** Drops an optional field whose value is not what it should be, leaving the record otherwise intact. */
+function stripUnless(record: Record<string, unknown>, key: string, accept: (value: unknown) => boolean): void {
+  if (record[key] !== undefined && !accept(record[key])) delete record[key];
+}
+
+function isBackgroundTaskUsage(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const usage = value as Record<string, unknown>;
+  const keys = Object.keys(usage);
+  if (keys.length !== 3 || !["totalTokens", "toolUses", "durationMs"].every(key => keys.includes(key))) return false;
+  return keys.every(key => typeof usage[key] === "number" && Number.isFinite(usage[key]) && (usage[key] as number) >= 0);
 }
 
 function expectRecord(value: unknown, field: string): Record<string, unknown> {

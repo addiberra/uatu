@@ -66,6 +66,7 @@ import { defaultWorkspaceDisplayName, validateWorkspaceDisplayName, type Workspa
 import { OnboardingError, resolveOnboardingAssignments, type WorkspaceOnboardingCoordinator } from "./onboarding";
 import { HubPreferencesError, type HubPreferencesStore } from "./preferences";
 import type { PersonalWorkspaceStateStore } from "./personal-state";
+import type { ActivityMarkSink } from "./activity-marks";
 import type { SessionManager } from "./sessions";
 import { PAGE_ORIGIN_HEADER } from "../terminal/auth";
 import type { TerminalSessionInfo } from "../terminal/server";
@@ -85,6 +86,14 @@ export type HubDeps = {
   sessions: SessionManager;
   sessionStore: HubSessionStore;
   personalState: PersonalWorkspaceStateStore;
+  // Where the live broker's finished/viewed marks survive a restart. Absent
+  // (tests, the e2e harness) they live for the broker's lifetime only.
+  activityMarks?: ActivityMarkSink;
+  // Whether the assembled live broker watches every running workspace's
+  // activity from the start, so a finish is recorded even for a session no
+  // page ever opened (D11). The production hub sets it; tests and the e2e
+  // harness leave the broker lazy, watching from its first activity feed.
+  watchActivityFromStart?: boolean;
   preferences?: HubPreferencesStore;
   onboarding?: WorkspaceOnboardingCoordinator;
   folderManager?: Pick<FolderManager, "create" | "rename" | "remove" | "assertNoPendingMutation">;
@@ -1636,6 +1645,23 @@ export function createHubFetchHandler(deps: HubDeps) {
           return json(500, { error: "failed to persist personal state" });
         }
       }
+      // The viewing page says the user has this workspace's chat in view:
+      // whatever finished there is seen for this user, on every device.
+      // Hub-served like personal state — the fact is composed at the hub's
+      // live broker, and the child knows nothing of it.
+      if (suffix === "/api/activity-viewed") {
+        if (!registry.byId(workspaceId)) {
+          return json(404, { error: `unknown workspace: ${workspaceId}` });
+        }
+        if (request.method !== "POST") {
+          return new Response(JSON.stringify({ error: "method not allowed" }), {
+            status: 405,
+            headers: { "content-type": "application/json", allow: "POST" },
+          });
+        }
+        liveBroker.acknowledgeViewed(session.user, workspaceId);
+        return new Response(null, { status: 204, headers: NO_STORE_HEADERS });
+      }
       if (REFUSED_CHILD_STREAM_SUFFIXES.test(suffix)) {
         // Gone, not proxied: no request reaches the child for these. The
         // body names the replacement so an old client or integration knows
@@ -2055,7 +2081,7 @@ function assembleLive(deps: HubDeps): { live: LiveEndpoint; liveBroker: LiveBrok
   const metrics = deps.metrics ?? new MetricsRegistry();
   const liveBroker = deps.liveBroker ?? new LiveBroker(
     createHubUpstreamSource({ sessions: deps.sessions, registry: deps.registry }),
-    { metrics },
+    { metrics, marks: deps.activityMarks, watchActivityFromStart: deps.watchActivityFromStart ?? false },
   );
   const live = deps.live ?? new LiveEndpoint({
     broker: liveBroker,

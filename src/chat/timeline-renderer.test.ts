@@ -8,7 +8,10 @@ beforeAll(() => {
   (globalThis as Record<string, unknown>).document = dom.document;
 });
 
-const { QueueDockRenderer, RevertedMessagesDockRenderer, TimelineRenderer, materializeChatActivity, awaitingFirstResponse, formatElapsed, subagentEntries, workingLabel } = await import("./timeline-renderer");
+const { QueueDockRenderer, RevertedMessagesDockRenderer, TimelineRenderer, materializeChatActivity, awaitingFirstResponse, formatElapsed, subagentEntries, subagentLabel, workingLabel } = await import("./timeline-renderer");
+// The track's one-line summary reads the same entries, so what the entries
+// say about a running run is checked where the entries are built.
+const { subagentTrackSummary } = await import("./receipt-view");
 
 test("closed activity defers its body and find materializes current sanitized content", () => {
   const previousFilter = Reflect.get(globalThis, "NodeFilter");
@@ -1052,6 +1055,46 @@ describe("subagent entries", () => {
     expect(entry).not.toHaveProperty("usage");
   });
 
+  test("a running subagent takes its child id and progress note from the task that runs it", () => {
+    // The launching row learns its child only from the tool result, at the
+    // end; the background task names it from the start edge, keyed by the
+    // tool use that launched it.
+    const running: ConversationItem = {
+      id: "task:ada2b", type: "background_task", createdAt: 2, taskId: "ada2b", description: "Review renderer", taskType: "local_agent",
+      toolUseId: "d", status: "running", childConversationId: "sub:parent:ada2b", progress: "Reading the renderer tests", subagentType: "explore",
+    };
+    const [entry] = subagentEntries([task("d", { status: "running" }), running]);
+    expect(entry).toEqual({ id: "tool:d", description: "Review renderer", subagent: "explore", status: "running", conversationId: "sub:parent:ada2b", progress: "Reading the renderer tests" });
+    // Once the row has its own child id it is the one that counts; a settled
+    // task no longer supplies a progress note.
+    const [settled] = subagentEntries([task("d", { childConversationId: "sub:parent:ada2b" }), { ...running, status: "completed", summary: "done" }]);
+    expect(settled).toEqual({ id: "tool:d", description: "Review renderer", subagent: "explore", status: "completed", conversationId: "sub:parent:ada2b" });
+    expect(settled).not.toHaveProperty("progress");
+    // A task launched by some other tool use says nothing about this row.
+    const [unrelated] = subagentEntries([task("d", { status: "running" }), { ...running, toolUseId: "other" }]);
+    expect(unrelated).not.toHaveProperty("conversationId");
+    expect(unrelated).not.toHaveProperty("progress");
+  });
+
+  test("a backgrounded subagent reads as running while its task runs, though its launching row completed at launch", () => {
+    // The async AgentOutput arrives with `status: "async_launched"`, so the
+    // launching row is `completed` seconds into a run that may last minutes.
+    // Read from the row alone the track would announce the live run finished.
+    const running: ConversationItem = {
+      id: "task:ada2b9582caa230c5", type: "background_task", createdAt: 2, taskId: "ada2b9582caa230c5", description: "Review renderer",
+      taskType: "local_agent", toolUseId: "e", status: "running", childConversationId: "sub:parent:ada2b9582caa230c5",
+      progress: "Counting files in the working tree", subagentType: "general-purpose",
+    };
+    const launched = task("e", { status: "completed", childConversationId: "sub:parent:ada2b9582caa230c5", output: "Async agent launched successfully." });
+    const [entry] = subagentEntries([launched, running]);
+    expect(entry).toEqual(expect.objectContaining({ id: "tool:e", status: "running", conversationId: "sub:parent:ada2b9582caa230c5", progress: "Counting files in the working tree" }));
+    expect(subagentTrackSummary(subagentEntries([launched, running]))).toBe("1 of 1 subagent working · Review renderer");
+    // Once the task settles the row speaks for itself again.
+    const [settled] = subagentEntries([launched, { ...running, status: "completed", summary: "done" }]);
+    expect(settled.status).toBe("completed");
+    expect(settled).not.toHaveProperty("progress");
+  });
+
   test("a long completed report renders spanning Markdown once behind a visual bound", () => {
     const renderer = new TimelineRenderer();
     const host = target();
@@ -1065,6 +1108,89 @@ describe("subagent entries", () => {
     const more = host.querySelector(".chat-subagent-result .chat-output-more") as HTMLDetailsElement;
     expect(more.querySelector(".chat-report-expand")?.textContent).toBe("Show full report");
     expect(more.hasAttribute("open")).toBe(false);
+  });
+
+  // A skill Claude Code ran as a fork is a conversation of its own, offered
+  // from its launching row as well as from the track (design D10).
+  test("a forked skill's row offers its transcript", () => {
+    const childId = "sub:parent:aaeeab292f002e3d7";
+    const skill: ConversationItem = {
+      id: "tool:toolu_skill", type: "tool", createdAt: 1, name: "Skill", status: "completed",
+      input: JSON.stringify({ skill: "code-review" }), output: "Based on my analysis...", childConversationId: childId,
+    };
+    const host = target();
+    new TimelineRenderer().render(host, projectionWith([skill]), new Set(["tool:toolu_skill"]));
+    expect(host.querySelector<HTMLButtonElement>("[data-open-conversation]")?.dataset.openConversation).toBe(childId);
+    expect(host.textContent).toContain("Based on my analysis...");
+    // A fork still running has no id yet: the row reads as it always has.
+    const running = target();
+    new TimelineRenderer().render(running, projectionWith([{ ...skill, status: "running", output: undefined, childConversationId: undefined }]), new Set(["tool:toolu_skill"]));
+    expect(running.querySelector("[data-open-conversation]")).toBeNull();
+    // And where subagents are unsupported, no navigation is offered at all.
+    const unsupported = target();
+    new TimelineRenderer().render(unsupported, projectionWith([skill]), new Set(["tool:toolu_skill"]), false);
+    expect(unsupported.querySelector("[data-open-conversation]")).toBeNull();
+  });
+
+  // A fork emits no task edge and names itself only when it ends, so while it
+  // runs these entries are the only thing that says the conversation is
+  // working at all (GitHub #385: "/code-review appears as if very little or
+  // nothing is happening").
+  describe("a forked skill", () => {
+    const skill = (extra: Partial<ToolItem> = {}): ConversationItem => ({
+      id: "tool:toolu_skill", type: "tool", createdAt: 1, name: "Skill", status: "running",
+      input: JSON.stringify({ skill: "code-review" }), ...extra,
+    });
+    const forkTool = (id: string, createdAt: number, input: Record<string, unknown>, name = "Bash"): ConversationItem =>
+      ({ id: `tool:${id}`, type: "tool", createdAt, name, status: "completed", input: JSON.stringify(input) });
+
+    test("is listed as work in progress while it runs, named by its skill and with nothing to open", () => {
+      const [entry, ...rest] = subagentEntries([skill(), forkTool("diff", 2, { command: "git diff HEAD" })]);
+      expect(rest).toEqual([]);
+      expect(entry).toEqual({ id: "tool:toolu_skill", description: "code-review", status: "running", kind: "fork", progress: "Bash · git diff HEAD" });
+      expect(entry).not.toHaveProperty("conversationId");
+      expect(subagentLabel(entry!)).toBe("Skill · code-review");
+      // The latest row wins: the note is what the fork is doing now.
+      const [later] = subagentEntries([skill(), forkTool("diff", 2, { command: "git diff HEAD" }), forkTool("read", 3, { path: "src/chat/ui.ts" }, "Read")]);
+      expect(later?.progress).toBe("Read · src/chat/ui.ts");
+    });
+
+    test("takes no note from a tool the parent started in the same frame as the skill", () => {
+      // Tool uses that share an assistant frame run alongside each other, and
+      // share its timestamp; only what arrives strictly later can be the
+      // fork's own work.
+      const [entry] = subagentEntries([skill(), forkTool("sibling", 1, { command: "git status" })]);
+      expect(entry).not.toHaveProperty("progress");
+    });
+
+    test("becomes openable, keeping its place in the track, once the result names the run", () => {
+      const childId = "sub:parent:aaeeab292f002e3d7";
+      const items = [skill({ status: "completed", output: "Based on my analysis...", childConversationId: childId }), forkTool("diff", 2, { command: "git diff HEAD" })];
+      const [entry] = subagentEntries(items);
+      expect(entry).toEqual({ id: "tool:toolu_skill", description: "code-review", status: "completed", kind: "fork", conversationId: childId });
+      // A settled run no longer says what it is doing, as a settled agent
+      // task does not either.
+      expect(entry).not.toHaveProperty("progress");
+      expect(subagentTrackSummary(subagentEntries(items))).toBe("1 subagent finished");
+    });
+
+    test("leaves no entry when the skill was only loaded and never forked", () => {
+      // An ordinary skill load settles naming no child: nothing ran, so
+      // nothing is listed as having run.
+      expect(subagentEntries([skill({ status: "completed", output: "Skill loaded." })])).toEqual([]);
+      // And a fork's tool rows that follow it belong to no run of its own.
+      expect(subagentEntries([skill({ status: "completed" }), forkTool("diff", 2, { command: "git diff HEAD" })])).toEqual([]);
+    });
+
+    test("reads alongside a running agent in the track's summary", () => {
+      const agent: ConversationItem = {
+        id: "tool:toolu_task", type: "tool", createdAt: 3, name: "task", status: "running",
+        input: JSON.stringify({ description: "Review renderer", subagent_type: "explore", prompt: "go" }),
+      };
+      const entries = subagentEntries([skill(), forkTool("diff", 2, { command: "git diff HEAD" }), agent]);
+      expect(entries.map(entry => subagentLabel(entry))).toEqual(["Skill · code-review", "explore · Review renderer"]);
+      expect(subagentTrackSummary(entries)).toBe("2 of 2 subagents working · code-review");
+    });
   });
 
   test("a task keeps its report but hides transcript navigation when subagents are unsupported", () => {
@@ -1284,6 +1410,41 @@ describe("recalled memory rows and coded notices", () => {
     expect(groups).toHaveLength(1);
     expect([...groups[0]!.querySelectorAll(".chat-group-items [data-chat-item-id]")].map(node => node.getAttribute("data-chat-item-id")))
       .toEqual(["tool:1", "tool:2", "tool:4"]);
+  });
+});
+
+// Design D13: the run a typed command launches has no launching row; its
+// own foreground row is what lists it with the subagents.
+describe("a foreground run row", () => {
+  const review = (status: "running" | "completed" | "stopped"): ConversationItem => ({
+    id: "task:ad53ca64bd188affb", type: "background_task", createdAt: 5, taskId: "ad53ca64bd188affb", description: "/code-review",
+    taskType: "local_agent", status, subagentType: "general-purpose", childConversationId: "sub:parent:ad53ca64bd188affb", foreground: true,
+    ...(status === "running" ? {} : { summary: "/code-review" }),
+  });
+  const typed: ConversationItem = { id: "message:u1", type: "user_message", createdAt: 1, text: "/code-review low" };
+
+  test("is listed as its own entry, named by the command and openable, running while its row runs", () => {
+    const entries = subagentEntries([typed, review("running")]);
+    expect(entries).toEqual([{ id: "task:ad53ca64bd188affb", description: "/code-review", status: "running", conversationId: "sub:parent:ad53ca64bd188affb" }]);
+    expect(subagentLabel(entries[0]!)).toBe("/code-review");
+    expect(subagentTrackSummary(entries)).toBe("1 of 1 subagent working · /code-review");
+    // Settled, it stays listed and openable, as a finished subagent does.
+    expect(subagentEntries([typed, review("completed")])).toEqual([expect.objectContaining({ status: "completed", conversationId: "sub:parent:ad53ca64bd188affb" })]);
+  });
+
+  test("keeps its place among the conversation's other runs", () => {
+    const agent: ConversationItem = { id: "tool:a", type: "tool", createdAt: 9, name: "task", status: "running", input: JSON.stringify({ description: "Explore", prompt: "p", subagent_type: "explore" }) };
+    expect(subagentEntries([typed, review("running"), agent]).map(entry => entry.id)).toEqual(["task:ad53ca64bd188affb", "tool:a"]);
+  });
+
+  test("adds no timeline row, running or settled: the command's output is the record", () => {
+    const renderer = new TimelineRenderer();
+    for (const status of ["running", "completed", "stopped"] as const) {
+      const host = target();
+      renderer.render(host, projectionWith([typed, review(status)], { status: "completed" }), new Set());
+      expect(host.querySelector('[data-chat-item-id="task:ad53ca64bd188affb"]')).toBeNull();
+      expect(host.querySelector('[data-chat-item-id="message:u1"]')).not.toBeNull();
+    }
   });
 });
 

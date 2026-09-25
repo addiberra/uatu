@@ -143,6 +143,7 @@ test("Hub dispatch families are public or explicitly excluded", async () => {
     ["hubDeleteCredential", "const action ="],
     ["workspaceGetPersonalState", 'suffix === "/api/personal-state"'],
     ["workspacePatchPersonalState", 'suffix === "/api/personal-state"'],
+    ["hubAcknowledgeWorkspaceActivity", 'suffix === "/api/activity-viewed"'],
   ] as const;
   expect(hub.map(item => item.operationId).sort()).toEqual(expected.map(item => item[0]).sort());
   for (const [, marker] of expected) expect(source).toContain(marker);

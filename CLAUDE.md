@@ -30,7 +30,13 @@ src/
 │                   ansi renders tool output as terminal text against the
 │                   terminal's palette; conversation-totals folds priced
 │                   usage carriers and task rows into the cost receipt, which
-│                   receipt-view itemizes by agent, type, or model);
+│                   receipt-view itemizes by agent, type, or model;
+│                   task-inspection drives the running-task drill-down —
+│                   an agent task's live child transcript, a shell task's
+│                   output tail, and the re-read from disk that follows a
+│                   run which streams nothing; surface says whether the
+│                   chat is the surface in front, which the hub switcher's
+│                   viewed acknowledgement also reads);
 │                   agent-specific stacks below the seam in
 │                   chat/opencode/ (the loopback server runtime, which
 │                   decides the spawned server's generation from its
@@ -93,13 +99,15 @@ src/
 │                   (SessionBackend seam + local-process impl), proxy
 │                   (HTTP/WS + token brokering), live-broker (refcounted
 │                   child-topic subscriptions fanned out to every page's
-│                   one `/api/hub/live` stream), auth (users + the
-│                   server-side session store, one id over cookie/bearer
-│                   transports + rate limit + CSRF), worktree-* (the linked
-│                   Git worktree service — git probes, journal, reconciler,
-│                   rename/delete guards — and its published JSON family at
-│                   `worktree-api.ts`, `/api/hub/worktrees`), pages, server,
-│                   main
+│                   one `/api/hub/live` stream, plus one hub-lifetime
+│                   activity watch per running workspace) + activity-marks
+│                   (its finished/viewed marks, persisted in the state dir),
+│                   auth (users + the server-side session store, one id over
+│                   cookie/bearer transports + rate limit + CSRF),
+│                   worktree-* (the linked Git worktree service — git
+│                   probes, journal, reconciler, rename/delete guards — and
+│                   its published JSON family at `worktree-api.ts`,
+│                   `/api/hub/worktrees`), pages, server, main
 ├── watchdog/       main + capture — heartbeat-driven hang recovery
 ├── debug/          cache + metrics + the heartbeat integration test
 ├── pwa/            PWA assets, shared browser notification enrollment UI,

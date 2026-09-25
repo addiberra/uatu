@@ -147,8 +147,9 @@ export function isLiveConversationStatus(status: ConversationStatus | undefined)
  * A workspace's chat activity at a glance, for surfaces that describe the
  * workspace rather than a conversation (the hub's cross-workspace badge).
  * Exactly two facts and never an id, a title, or a count: `working` — some
- * conversation has a turn in flight (isLiveConversationStatus); `awaiting` —
- * some permission request or question waits on the user.
+ * conversation has a turn in flight (isLiveConversationStatus) or live
+ * background work (`background`); `awaiting` — some permission request or
+ * question waits on the user.
  */
 export type ChatActivity = { working: boolean; awaiting: boolean };
 export type ActivityStatus = "pending" | "running" | "completed" | "failed" | "cancelled";
@@ -658,7 +659,8 @@ export type CompactionItem = TimelineItemBase & {
  * settles (D8). Running tasks are presented in the composer's live list;
  * settled ones as timeline rows with their outcome and summary. `toolUseId`
  * links the task to the tool row that launched it. Ambient housekeeping
- * tasks never become items.
+ * tasks never become items; an ambient agent run with no launching tool use
+ * becomes a `foreground` item (see the field).
  */
 export type BackgroundTaskItem = TimelineItemBase & {
   type: "background_task";
@@ -671,6 +673,28 @@ export type BackgroundTaskItem = TimelineItemBase & {
   progress?: string;
   // The agent's summary, once settled.
   summary?: string;
+  // What the task is, as the agent said at start: an agent task's subagent
+  // type and the prompt it was given. Absent for a shell task.
+  subagentType?: string;
+  prompt?: string;
+  // What the task has consumed, as the agent reports it on progress and on
+  // settling. A shell task reports no progress, so it carries none while
+  // running; elapsed time is derived from `createdAt` instead.
+  usage?: BackgroundTaskUsage;
+  // Where the agent writes the task's output, from the moment it names it —
+  // a shell task's output file at launch, an agent task's transcript on
+  // settling. Presence is what tells a reader an output view can be asked
+  // for; the read itself names the task, never this path.
+  outputFile?: string;
+  // The child conversation an agent task runs as (`sub:<parent>:<agentId>`),
+  // known from the start edge — what makes a running subagent openable.
+  childConversationId?: string;
+  // A run Claude Code forked in the foreground with no launching tool use of
+  // its own — the review a typed command starts (design D13). It is a run,
+  // not background work: the subagents track lists it and opens it, while the
+  // composer's background list and the timeline's settled rows skip it (the
+  // command's own output is the timeline's record of it).
+  foreground?: boolean;
 };
 
 /**
@@ -701,6 +725,23 @@ export type ScheduledWakeupItem = TimelineItemBase & {
   // Why it ended, when it did not fire: the notice a lost schedule carries.
   message?: string;
 };
+
+export type BackgroundTaskUsage = { totalTokens: number; toolUses: number; durationMs: number };
+
+/**
+ * A bounded tail of a background task's output file: what a shell task has
+ * written so far. `truncated` says the file holds more than the tail;
+ * `settled` says the task is no longer running, so the reader can stop
+ * refreshing.
+ */
+export type BackgroundTaskOutput = { text: string; truncated: boolean; settled: boolean };
+
+// How much of a task's output one read returns: by default enough for a
+// scrolled pane, and never more than the maximum, whatever a reader asks —
+// the file is a shell command's live output and can be arbitrarily large.
+// The route applies the default and the provider enforces the maximum.
+export const TASK_OUTPUT_TAIL_DEFAULT_BYTES = 16 * 1024;
+export const TASK_OUTPUT_TAIL_MAX_BYTES = 64 * 1024;
 
 export type ConversationItem =
   | UserMessageItem

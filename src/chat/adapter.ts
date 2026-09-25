@@ -13,6 +13,7 @@ import { ConversationReplay, type ReplaySubscription } from "./replay";
 import { ProviderTextReconciler } from "./text-reconciler";
 import { isLiveConversationStatus } from "./types";
 import type {
+  BackgroundTaskOutput,
   ChatActivity,
   ChatAgent,
   ChatMode,
@@ -266,6 +267,12 @@ export class ChatAdapter {
   // survives projection eviction. This is what distinguishes "the store says
   // running because OpenCode died mid-turn" from "running right now".
   private readonly liveTurns = new Set<string>();
+  // Conversations holding live background work (`background` status) with no
+  // turn in flight. Kept apart from liveTurns on purpose: liveTurns gates the
+  // composer's Cancel and held prompts, and a background conversation must
+  // still accept a prompt — while the hub's activity summary, by spec, counts
+  // live background work as working.
+  private readonly backgroundWork = new Set<string>();
   // Pending permission and question item ids per conversation, adapter-level
   // like liveTurns: a conversation blocked on the user goes quiet and is
   // exactly the one an LRU pass evicts, and its request must still count.
@@ -493,6 +500,17 @@ export class ChatAdapter {
         if (pricedCarrier || launcher) items.push(item);
       }
     }
+    // A foreground run's row (a typed command's review, design D13) exists
+    // only as a live row: the store keeps no record of it, and it is not
+    // background work the provider lists. A page opening mid-command must
+    // still see the run listed, so the row this process holds rides along;
+    // the liveness rule below closes one no turn is running any more.
+    if (!cursor) {
+      const held = new Set(items.map(item => item.id));
+      for (const existing of this.projection(id).filter(item => item.type === "background_task" && item.foreground === true)) {
+        if (!held.has(existing.id)) items.push(existing);
+      }
+    }
     // Stable sort with no id tiebreaker: parts of one message share the
     // message's timestamp, so ties must fall back to the provider's own part
     // order (the order `flatMap` already produced). Comparing ids instead
@@ -511,6 +529,12 @@ export class ChatAdapter {
         if ((item.type === "tool" || item.type === "command" || item.type === "reasoning") && (item.status === "running" || item.status === "pending")) {
           items[index] = { ...item, status: "cancelled" };
         }
+        // A foreground run (a typed command's) is part of the turn that ran
+        // it, not background work the provider lists: with no turn live, it
+        // is over whatever its row last said.
+        if (item.type === "background_task" && item.foreground && item.status === "running") {
+          items[index] = { ...item, status: "stopped" };
+        }
       }
     }
     // Live background work is held by the provider, not the transcript: a
@@ -527,10 +551,10 @@ export class ChatAdapter {
       // projection — would offer a Stop that errors.
       for (let index = 0; index < items.length; index += 1) {
         const item = items[index]!;
-        if (item.type === "background_task" && item.status === "running" && !live.has(item.id)) items[index] = { ...item, status: "stopped" };
+        if (item.type === "background_task" && !item.foreground && item.status === "running" && !live.has(item.id)) items[index] = { ...item, status: "stopped" };
       }
       for (const existing of this.projection(id).items()) {
-        if (existing.type === "background_task" && existing.status === "running" && !live.has(existing.id) && !items.some(item => item.id === existing.id)) {
+        if (existing.type === "background_task" && !existing.foreground && existing.status === "running" && !live.has(existing.id) && !items.some(item => item.id === existing.id)) {
           items.push({ ...existing, status: "stopped" });
         }
       }
@@ -695,7 +719,7 @@ export class ChatAdapter {
     projection.seed(items);
     // A reopened conversation whose agent still holds live work is in the
     // background state, not idle: the list and the status must agree.
-    if (items.some(item => item.type === "background_task" && item.status === "running") && !isLiveConversationStatus(projection.status) && projection.status !== "background") {
+    if (items.some(item => item.type === "background_task" && !item.foreground && item.status === "running") && !isLiveConversationStatus(projection.status) && projection.status !== "background") {
       projection.statusUpdate("background");
     } else if (items.some(item => item.type === "scheduled_wakeup" && item.status === "pending") && !isLiveConversationStatus(projection.status) && projection.status !== "background" && projection.status !== "scheduled") {
       // Likewise a session held for its wakeups is scheduled, not idle.
@@ -745,12 +769,13 @@ export class ChatAdapter {
 
   /**
    * This agent's slice of the workspace activity summary: whether any
-   * conversation has a turn in flight, and whether any permission request or
-   * question awaits the user. Read from the adapter-level records, never from
-   * the provider, so it is cheap enough to answer on every change.
+   * conversation has a turn in flight or live background work, and whether
+   * any permission request or question awaits the user. Read from the
+   * adapter-level records, never from the provider, so it is cheap enough to
+   * answer on every change.
    */
   activity(): ChatActivity {
-    return { working: this.liveTurns.size > 0, awaiting: this.pendingInteractions.size > 0 };
+    return { working: this.liveTurns.size > 0 || this.backgroundWork.size > 0, awaiting: this.pendingInteractions.size > 0 };
   }
 
   pendingNotifications() { return this.notifications.pendingSnapshot(); }
@@ -803,6 +828,7 @@ export class ChatAdapter {
     }
     this.notifications.forgetConversation(conversationId);
     this.liveTurns.delete(conversationId);
+    this.backgroundWork.delete(conversationId);
     this.forgetInteractions(conversationId);
   }
 
@@ -1594,6 +1620,12 @@ export class ChatAdapter {
         if ((item.type === "tool" || item.type === "command" || item.type === "reasoning") && (item.status === "running" || item.status === "pending")) {
           items[index] = { ...item, status: "cancelled" };
         }
+        // A foreground run (a typed command's) is part of the turn that ran
+        // it, not background work the provider lists: with no turn live, it
+        // is over whatever its row last said.
+        if (item.type === "background_task" && item.foreground && item.status === "running") {
+          items[index] = { ...item, status: "stopped" };
+        }
       }
     }
     items.sort((left, right) => left.createdAt - right.createdAt);
@@ -1702,6 +1734,17 @@ export class ChatAdapter {
       await this.provider.release(conversationId);
       return { released: true as const };
     }));
+  }
+
+  /**
+   * The output a task has produced so far: a read, not a mutation, so no
+   * receipt. Gated like stop — only an agent with background work can be
+   * asked — and the provider decides whether this task has an output file.
+   */
+  async taskOutput(conversationId: string, taskId: string, options: { tailBytes: number }): Promise<BackgroundTaskOutput | null> {
+    await this.requireSession(conversationId);
+    if (!this.provider.taskOutput || !this.provider.describe().capabilities.includes("background-tasks")) throw new BackgroundTasksUnsupportedError();
+    return this.provider.taskOutput(conversationId, taskId, options);
   }
 
   respondQuestion(conversationId: string, requestId: string, clientRequestId: string, outcome: QuestionOutcome): Promise<{ outcome: QuestionOutcome }> {
@@ -2463,6 +2506,11 @@ export class ChatAdapter {
           ...(task.taskType === undefined ? {} : { taskType: task.taskType }),
           ...(task.toolUseId === undefined ? {} : { toolUseId: task.toolUseId }),
           status: "running" as const,
+          ...(task.subagentType === undefined ? {} : { subagentType: task.subagentType }),
+          ...(task.prompt === undefined ? {} : { prompt: task.prompt }),
+          ...(task.usage === undefined ? {} : { usage: task.usage }),
+          ...(task.outputFile === undefined ? {} : { outputFile: task.outputFile }),
+          ...(task.childConversationId === undefined ? {} : { childConversationId: task.childConversationId }),
         }));
     } catch {
       return null;
@@ -2734,6 +2782,10 @@ export class ChatAdapter {
       // but the conversation accepts a prompt. Retrying and compacting are.
       if (isLiveConversationStatus(status)) this.liveTurns.add(id);
       else this.liveTurns.delete(id);
+      // Background work still counts as working for the workspace summary,
+      // through its own set so the composer rules above stay untouched.
+      if (status === "background") this.backgroundWork.add(id);
+      else this.backgroundWork.delete(id);
       // A turn that ended on its own releases the next held message. Only
       // these two: an interruption leaves the queue dormant by decision, and
       // a failure must not restart a failing conversation by itself.
