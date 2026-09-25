@@ -158,10 +158,13 @@ files inside an ignored folder that is already listed, are covered by the tick.
 Deletion still refuses Git locks, nested worktrees, submodules and nested Git
 repositories inside the checkout, Git operations in progress, external
 activity, and uncertain identity or ownership. Ticking the box never overrides
-any of these. Uatu looks for nested repositories in untracked folders, in
-folders that hold tracked files and at the top of each ignored folder. It does
-not search inside ignored folders, so a repository deeper inside an ignored
-folder such as `node_modules/` is deleted along with that folder. A checkout
+any of these. A nested repository here means an ordinary one (with a `.git`),
+a bare one (such as a `backup.git` made with `git clone --bare`, which Git
+itself would otherwise list as a pile of untracked files) or a Git
+administrative folder. Uatu looks for them in untracked folders, in folders
+that hold tracked files and at the top of each ignored folder. It does not
+search inside ignored folders, so a repository deeper inside an ignored folder
+such as `node_modules/` is deleted along with that folder. A checkout
 with file names Uatu cannot read reliably (not valid UTF-8), or with a folder
 Uatu is not allowed to read, is not deleted. There is no force option: the acknowledgement only lets Uatu pass
 Git a single force to remove exactly the listed uncommitted and untracked data,

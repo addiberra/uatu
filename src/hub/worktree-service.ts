@@ -55,6 +55,9 @@ import {
   type WorktreeRecord,
 } from "./worktree-git";
 import { inspectRemovalSafety, localDataRefusal, removalRequiresForce, runWorktreeRemove, toWireLocalData } from "./worktree-delete";
+
+// Leads every refusal from a check that runs after the fenced one passed.
+const CHANGED_WHILE_PREPARING = "The worktree changed while deletion was prepared. ";
 import {
   ownershipForCheckout,
   recoverWorktreeOperation,
@@ -725,6 +728,10 @@ export class WorktreeService {
     const preflight = await this.preflightIn(view, request.reference);
     if (!preflight.ok) return refuse(new WorktreeOperationError(preflight.error), "preflight");
     const checkout = preflight.checkout;
+    // No prefix here: without a fingerprint this check cannot tell data that
+    // appeared since the caller's preflight from a caller that never
+    // acknowledged it, so it states only what is there. A stale fingerprint
+    // already says the files changed.
     const unacknowledged = localDataRefusal(preflight.localData, request.localDataFingerprint, "preflight");
     if (unacknowledged) return refuse(unacknowledged, "preflight");
     if (preflight.requiresStop && request.stop !== true) {
@@ -774,7 +781,9 @@ export class WorktreeService {
         if (recheck.checkout.checkoutId !== checkout.checkoutId || recheck.checkout.path !== checkout.path) {
           throw WorktreeOperationError.of("identity-uncertain", "The worktree changed while deletion was prepared. Nothing was removed.", { retry: "refresh", phase: "rechecking" });
         }
-        const changed = localDataRefusal(recheck.localData, request.localDataFingerprint, "rechecking");
+        // The fenced check above already passed, so any refusal here is data
+        // that appeared while sessions stopped: say so, as the final check does.
+        const changed = localDataRefusal(recheck.localData, request.localDataFingerprint, "rechecking", CHANGED_WHILE_PREPARING);
         if (changed) throw changed;
         // Written into Git's administrative directory for this tree, which
         // `git worktree remove` deletes with it: its survival is what proves
@@ -801,7 +810,7 @@ export class WorktreeService {
         const safety = sameCheckout
           ? await inspectRemovalSafety({ run: this.run, checkoutPath: checkout.path, checkoutId: checkout.checkoutId, records: finalView.records })
           : undefined;
-        const changedPrefix = "The worktree changed while deletion was prepared. ";
+        const changedPrefix = CHANGED_WHILE_PREPARING;
         if (!safety || "blocked" in safety) {
           const blocker = safety?.blocked;
           throw WorktreeOperationError.of(blocker?.detail.code ?? "identity-uncertain", `${changedPrefix}${blocker?.detail.message ?? "Its identity could not be verified. Nothing was removed."}`, { retry: blocker?.detail.retry ?? "refresh", phase: "removing" });

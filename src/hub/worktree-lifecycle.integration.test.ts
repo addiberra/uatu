@@ -887,6 +887,11 @@ describe("deletion preflight (5.3)", () => {
   });
 });
 
+// Cases that read the shared repository's full inventory several times —
+// each read probes every checkout in it — outgrow the 5-second default on a
+// loaded machine; the in-flight start case below already allows 30 s.
+const INVENTORY_HEAVY_TIMEOUT = 30_000;
+
 describe("guarded removal (5.4) and branch preservation (5.5)", () => {
   test("a clean stopped worktree is removed, unregistered and forgotten; its branch and creation history stay", async () => {
     const child = await create("feature/clean", atlasId, "release");
@@ -930,7 +935,7 @@ describe("guarded removal (5.4) and branch preservation (5.5)", () => {
     expect(sessions.isRunning(child)).toBe(false);
     expect(existsSync(folder)).toBe(false);
     expect(await branchExists(atlas, "feature/running")).toBe(true);
-  });
+  }, INVENTORY_HEAVY_TIMEOUT);
 
   test("a failed stop removes nothing and keeps the registration", async () => {
     const child = await create("feature/stop-fails");
@@ -1017,7 +1022,7 @@ describe("guarded removal (5.4) and branch preservation (5.5)", () => {
     const refused = await act("delete", { source: atlasId, id: occupant.checkoutId, confirm: "1" });
     expect(failed(refused)).toBe(true);
     expect(existsSync(path.join(folder, "README.md"))).toBe(true);
-  });
+  }, INVENTORY_HEAVY_TIMEOUT);
 
   test("restart recovery of an interrupted removal cleans up without touching a new occupant", async () => {
     const child = await create("feature/interrupted");
@@ -1123,6 +1128,14 @@ describe("acknowledged local data (deletion with local data)", () => {
     ["an initialized submodule", addSubmodule, "nested-dependency", "initialized submodule"],
     ["an untracked nested repository", folder => git(cairn, ["init", path.join(folder, "nested")]).then(() => undefined), "nested-dependency", "another Git repository (nested)"],
     ["a repository nested in a tracked directory", nestRepositoryInTrackedDirectory, "nested-dependency", "another Git repository (lib)"],
+    // Git lists an untracked bare repository's files one by one, so its whole
+    // history would pass as ordinary untracked data.
+    ["an untracked bare repository", folder => git(cairn, ["clone", "--bare", cairn, path.join(folder, "backup.git")]).then(() => undefined), "nested-dependency", "another Git repository (backup.git)"],
+    ["an ignored bare repository", async folder => {
+      await writeFile(path.join(folder, ".gitignore"), "*.local\nbackup.git/\n");
+      await git(folder, ["commit", "-am", "ignore the backup"]);
+      await git(cairn, ["clone", "--bare", cairn, path.join(folder, "backup.git")]);
+    }, "nested-dependency", "another Git repository (backup.git)"],
     ["an operation marker", async folder => {
       const marker = (await git(folder, ["rev-parse", "--path-format=absolute", "--git-path", "MERGE_HEAD"])).trim();
       await writeFile(marker, `${(await git(folder, ["rev-parse", "HEAD"])).trim()}\n`);
@@ -1138,6 +1151,13 @@ describe("acknowledged local data (deletion with local data)", () => {
       await arrange(folder);
       const current = await currentLocalData(folder, checkoutId);
       if (!current) throw new Error("expected local data");
+      if (label === "an untracked bare repository") {
+        // What the acknowledgement would have covered: the repository's own
+        // files, one by one, as if they were ordinary untracked data.
+        expect(current.untracked!.entries).toContain("backup.git/HEAD");
+        expect(current.untracked!.count).toBeGreaterThan(5);
+      }
+      if (label === "an ignored bare repository") expect(current.ignored!.entries).toEqual(["backup.git/"]);
       const blocked = await preflight(child, cairnId);
       expect(blocked.ok).toBe(false);
       const deleted = await service.delete("reviewer", { sourceWorkspaceId: cairnId, reference: child, localDataFingerprint: current.fingerprint });
@@ -1146,6 +1166,7 @@ describe("acknowledged local data (deletion with local data)", () => {
       expect(deleted.error.code).toBe(code);
       expect(deleted.error.message).toContain(reason);
       expect(existsSync(path.join(folder, "scratch.txt"))).toBe(true);
+      if (label.includes("bare repository")) expect(existsSync(path.join(folder, "backup.git", "HEAD"))).toBe(true);
       expect(registry.byId(child)).toBeDefined();
       expect(removals(folder)).toHaveLength(0);
       expect(await journal.read()).toBeUndefined();
@@ -1173,6 +1194,31 @@ describe("acknowledged local data (deletion with local data)", () => {
       expect(registry.byId(child)).toBeDefined();
       expect(removals(folder)).toHaveLength(0);
       expect(await journal.read()).toBeUndefined();
+    } finally {
+      backendControl.onStop = null;
+    }
+  });
+
+  test("local data that appears while sessions stop, with no acknowledgement, says the worktree changed", async () => {
+    const child = await create("ack/appeared-during-stop", cairnId);
+    const folder = registry.byId(child)!.path;
+    await sessions.start(child);
+    const described = await preflight(child, cairnId);
+    if (!described.ok) throw new Error("expected a deletable checkout");
+    expect(described.localData).toBeUndefined();
+    backendControl.onStop = async workspaceId => {
+      if (workspaceId === child) await writeFile(path.join(folder, "appeared.txt"), "keep\n");
+    };
+    try {
+      const deleted = await service.delete("reviewer", { sourceWorkspaceId: cairnId, reference: child, stop: true });
+      expect(deleted.ok).toBe(false);
+      if (deleted.ok) return;
+      expect(deleted.phase).toBe("rechecking");
+      expect(deleted.error).toMatchObject({ code: "local-data", phase: "rechecking", retry: "retry-delete" });
+      expect(deleted.error.message).toBe("The worktree changed while deletion was prepared. It has untracked files (1 file). Commit, move or delete them, or confirm deleting them with the worktree. Nothing was removed.");
+      expect(existsSync(path.join(folder, "appeared.txt"))).toBe(true);
+      expect(registry.byId(child)).toBeDefined();
+      expect(removals(folder)).toHaveLength(0);
     } finally {
       backendControl.onStop = null;
     }

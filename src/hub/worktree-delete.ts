@@ -133,13 +133,47 @@ function plural(count: number, one: string, many: string): string {
 type PathState = "absent" | "present" | "unreadable";
 
 async function probePath(candidate: string): Promise<PathState> {
+  const kind = await entryKind(candidate);
+  return kind === "absent" || kind === "unreadable" ? kind : "present";
+}
+
+// The same three-way answer, keeping what kind of entry is present.
+type EntryKind = "absent" | "directory" | "other" | "unreadable";
+
+async function entryKind(candidate: string): Promise<EntryKind> {
   try {
-    await fs.lstat(candidate);
-    return "present";
+    return (await fs.lstat(candidate)).isDirectory() ? "directory" : "other";
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
     return code === "ENOENT" || code === "ENOTDIR" ? "absent" : "unreadable";
   }
+}
+
+// Whether `directory` holds a Git repository of its own, following Git's own
+// "is this a git directory" test closely enough to fail safe:
+//   * a `.git` entry, as a directory or a gitdir file (an ordinary nested
+//     repository, a submodule or a nested worktree);
+//   * a bare repository or administrative directory, which keeps its state
+//     at the top level: a `HEAD` that is not a directory, together with
+//     `objects/` and `refs/` directories (a packed-refs-only layout still
+//     has `refs/`), or with a `commondir` or `gitdir` file pointing
+//     elsewhere.
+// `HEAD` is looked up only after `.git` is absent, and the rest only when
+// `HEAD` exists, so an ordinary directory costs two `lstat` calls. Any
+// unreadable answer is `unreadable`, which callers refuse.
+async function repositoryAt(directory: string): Promise<PathState> {
+  const dotGit = await probePath(path.join(directory, ".git"));
+  if (dotGit !== "absent") return dotGit;
+  const head = await entryKind(path.join(directory, "HEAD"));
+  if (head === "unreadable") return "unreadable";
+  if (head !== "other") return "absent";
+  const [objects, refs, commondir, gitdir] = await Promise.all(
+    ["objects", "refs", "commondir", "gitdir"].map(name => entryKind(path.join(directory, name))),
+  );
+  if ([objects, refs, commondir, gitdir].includes("unreadable")) return "unreadable";
+  if (objects === "directory" && refs === "directory") return "present";
+  if (commondir === "other" || gitdir === "other") return "present";
+  return "absent";
 }
 
 function inside(parent: string, candidate: string): boolean {
@@ -196,8 +230,8 @@ export function collectAncestorDirectories(paths: Iterable<string>, into: Set<st
   return into;
 }
 
-// The first candidate, in the given order, whose `<candidate>/.git` is not
-// provably absent — with what was found there. Bounded concurrency: work is
+// The first candidate, in the given order, that is not provably free of a
+// repository of its own (`repositoryAt`) — with what was found there. Bounded concurrency: work is
 // handed out in order, so when a hit is found every earlier candidate has
 // already been started and is awaited before the answer is final.
 async function firstNestedRepository(checkoutPath: string, candidates: readonly string[]): Promise<{ readonly candidate: string; readonly state: "present" | "unreadable" } | undefined> {
@@ -208,7 +242,7 @@ async function firstNestedRepository(checkoutPath: string, candidates: readonly 
     for (;;) {
       const index = next++;
       if (index >= best) return;
-      const state = await probePath(path.join(checkoutPath, candidates[index]!, ".git"));
+      const state = await repositoryAt(path.join(checkoutPath, candidates[index]!));
       if (state !== "absent" && index < best) {
         best = index;
         bestState = state;
@@ -308,21 +342,22 @@ export async function inspectRemovalSafety(input: RemovalSafetyInput): Promise<R
   }
 
   // One pass over every place a nested repository could hide, each checked
-  // once, in a fixed order that decides which one a refusal names:
-  //   1. directory entries — where Git stopped descending. Under
-  //      `--untracked-files=all` an untracked one is always a nested
-  //      repository; an ignored one is checked at its root only (walking it
-  //      is unbounded);
-  //   2. gitlinks;
-  //   3. every ancestor directory of an index path or status entry, sorted.
-  const candidates = new Set<string>();
+  // once:
+  //   * directory entries — where Git stopped descending. Under
+  //     `--untracked-files=all` an untracked one with a `.git` is a nested
+  //     repository; an ignored one is checked at its root only (walking it
+  //     is unbounded);
+  //   * gitlinks;
+  //   * every ancestor directory of an index path or status entry. Git does
+  //     not recognize a bare repository as a nested one and lists its files
+  //     one by one (`?? backup.git/HEAD`, …), so its directory arrives here.
+  // Sorted, so the path a refusal names never depends on output order.
+  const candidates = collectAncestorDirectories(entries.map(entry => entry.path), collectAncestorDirectories(indexed));
   for (const entry of [...status.untracked, ...status.ignored]) {
     if (entry.path.endsWith("/")) candidates.add(entry.path.replace(/\/+$/, ""));
   }
   for (const gitlink of gitlinks) candidates.add(gitlink);
-  const ancestors = collectAncestorDirectories(entries.map(entry => entry.path), collectAncestorDirectories(indexed));
-  for (const directory of [...ancestors].sort(byCodeUnits)) candidates.add(directory);
-  const nested = await firstNestedRepository(checkoutPath, [...candidates]);
+  const nested = await firstNestedRepository(checkoutPath, [...candidates].sort(byCodeUnits));
   if (nested?.state === "unreadable") return { blocked: blocker("identity-uncertain", UNINSPECTABLE) };
   if (nested) return { blocked: nestedRepository(nested.candidate) };
 

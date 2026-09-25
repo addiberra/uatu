@@ -331,10 +331,15 @@ returns the first blocker in a fixed order — identity, Git lock, nested linked
 worktree, Git operation markers, then submodules and nested repositories: the
 checkout's own `<gitdir>/worktrees/<id>/modules` store, a `.git` at the root of
 any untracked or ignored directory entry, and, from `git ls-files --stage` on
-every inspection, populated gitlinks and a `.git` in any ancestor directory of
-a tracked path — Git removes a repository nested in tracked content even
-without force. Those candidates are de-duplicated in linear time and checked
-with at most 32 `lstat` calls in flight. The status and index listings run
+every inspection, populated gitlinks and any ancestor directory of a tracked
+path or status entry — Git removes a repository nested in tracked content even
+without force. A candidate holds a repository if it has a `.git` entry, or, as
+a bare repository or administrative directory, a non-directory `HEAD` with
+`objects/` and `refs/` directories or with a `commondir`/`gitdir` file; Git
+lists an untracked bare repository's files one by one, so this is what keeps
+its history from passing as ordinary untracked data. Those candidates are
+de-duplicated in linear time, sorted (so the path a refusal names is
+deterministic) and checked with at most 32 candidates in flight. The status and index listings run
 with a 60-second timeout and the index with a 64 MiB output bound (the
 runner's defaults are 10 seconds and 4 MiB). An unreadable status, index or
 folder, an exceeded bound, or a path that did not decode as UTF-8 fails closed

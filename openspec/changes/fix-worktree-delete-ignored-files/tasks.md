@@ -33,7 +33,7 @@
 - [x] 2.2 Add the submodule and nested-repository probe from design D5 to `inspectRemovalSafety`, in the D5 order:
   - add `modules` to the `rev-parse --git-path` batch, apart from the operation markers, and block with `nested-dependency` when it exists, failing closed on an unreadable path;
   - for each `??` or `!!` entry ending in `/`, block with `nested-dependency` when `<checkout>/<entry>.git` exists;
-  - on every inspection, run `git ls-files -z --stage` under its own larger bound (design D5 step 4), and block with `nested-dependency` when any mode `160000` entry has `<checkout>/<path>/.git`, or when any ancestor directory of an index path or status entry has `<dir>/.git`;
+  - on every inspection, run `git ls-files -z --stage` under its own larger bound (design D5 step 4), and block with `nested-dependency` when any mode `160000` entry has `<checkout>/<path>/.git`, or when any ancestor directory of an index path or status entry holds a repository — a `<dir>/.git`, or a bare repository or administrative directory (design D5 step 3) — checking directory entries and gitlinks the same way, in sorted order;
   - refuse as `identity-uncertain` ("could not be inspected") when the ls-files probe fails or exceeds its bound, or when any status or index path contains U+FFFD.
 
   Verify with `src/hub/worktree-delete.test.ts` and real-Git cases for:
@@ -45,6 +45,7 @@
   - a repository nested inside a tracked directory, for a clean tree and for one with local data;
   - a clean or ignored-only tree, where the `ls-files` probe runs with the larger bound and does not block;
   - synthetic status and ls-files output containing U+FFFD.
+  - a nested bare repository, untracked (listed file by file), with only packed refs, and ignored as a directory entry; a Git administrative directory; a lone file named `HEAD`; a refusal naming the same path whatever the output order.
 - [x] 2.3 Add the pure helper `checkLocalDataAcknowledgement(localData, fingerprint?)`. It passes when there is no local data, whatever was sent. When data exists and no fingerprint was sent, it returns `local-data` / `retry-delete` with the message for the first present category (tracked, untracked, ignored). Each message keeps today's advice and adds "or confirm deleting them with the worktree". When the fingerprint differs, it returns "The worktree's files changed while deletion was prepared. Review the deletion again." All messages end with "Nothing was removed." Verify with unit tests for each branch and each category's message.
 - [x] 2.4 Replace `REMOVE_ARGUMENTS` and the never-force guard with `buildWorktreeRemoveArguments(checkoutPath, { force })`. It emits `worktree remove -- <path>` or `worktree remove --force -- <path>`, and throws `internal` unless the arguments contain exactly `force ? 1 : 0` of `-f` / `--force`. Thread `{ force }` through `runWorktreeRemove`, and add the pure `removalRequiresForce(localData)`, which is true only for tracked or untracked entries. Verify with `src/hub/worktree-delete.test.ts`:
   - the non-force shape is unchanged;

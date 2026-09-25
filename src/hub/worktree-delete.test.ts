@@ -366,6 +366,46 @@ describe("submodules and nested repositories (real Git)", () => {
     });
   }, REAL_GIT_TIMEOUT);
 
+  // Git does not see a bare repository as a nested one: untracked, it lists
+  // every file inside it as ordinary data (`?? backup.git/HEAD`, …).
+  test.each([
+    ["untracked, listed file by file", false, false],
+    ["untracked, with only packed refs", false, true],
+    ["ignored, as a directory entry", true, false],
+  ])("a nested bare repository blocks (%s)", async (_label, ignored, packed) => {
+    await withRepository(async fixture => {
+      if (ignored) await writeFile(path.join(fixture.main, ".git", "info", "exclude"), "backup.git/\n");
+      const checkout = await addLinked(fixture);
+      const bare = path.join(checkout, "backup.git");
+      await fixture.git(["clone", "--bare", fixture.main, bare]);
+      if (packed) await fixture.git(["pack-refs", "--all", "--prune"], bare);
+      const status = await fixture.git(["status", "--porcelain=v1", "--untracked-files=all", "--ignored=matching"], checkout);
+      expect(status).toContain(ignored ? "!! backup.git/" : "?? backup.git/HEAD");
+      const recorded: string[][] = [];
+      const result = await inspect(fixture, checkout, recorded);
+      expect(blockedCode(result)).toBe("nested-dependency");
+      expect("blocked" in result && result.blocked.detail.message).toContain("(backup.git)");
+    });
+  }, REAL_GIT_TIMEOUT);
+
+  test("a Git administrative directory (HEAD with commondir) blocks, but a lone file named HEAD does not", async () => {
+    await withRepository(async fixture => {
+      const checkout = await addLinked(fixture);
+      await mkdir(path.join(checkout, "admin"));
+      await writeFile(path.join(checkout, "admin", "HEAD"), "ref: refs/heads/main\n");
+      await writeFile(path.join(checkout, "admin", "commondir"), "../..\n");
+      const blocked = await inspect(fixture, checkout);
+      expect(blockedCode(blocked)).toBe("nested-dependency");
+      expect("blocked" in blocked && blocked.blocked.detail.message).toContain("(admin)");
+      await rm(path.join(checkout, "admin"), { recursive: true });
+      await mkdir(path.join(checkout, "notes"));
+      await writeFile(path.join(checkout, "notes", "HEAD"), "just a note\n");
+      const clear = await inspect(fixture, checkout);
+      expect(blockedCode(clear)).toBeUndefined();
+      expect("clear" in clear && clear.localData?.untracked?.sample).toEqual(["notes/HEAD"]);
+    });
+  }, REAL_GIT_TIMEOUT);
+
   test("a repository at the root of an ignored directory blocks", async () => {
     await withRepository(async fixture => {
       const checkout = await addLinked(fixture);
@@ -517,6 +557,31 @@ describe("undecodable paths fail closed", () => {
       expect("blocked" in result && result.blocked.detail).toMatchObject(uninspectable);
     } finally {
       await chmod(locked, 0o755);
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("the repository a refusal names does not depend on output order", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "uatu-delete-order-"));
+    try {
+      for (const name of ["zeta", "alpha", "mid"]) await mkdir(path.join(root, name, ".git"), { recursive: true });
+      const inspectIn = (status: string) => inspectRemovalSafety({
+        checkoutPath: root,
+        checkoutId: "checkout-order",
+        records: [{ path: root, head: "abc", branch: "topic", bare: false, detached: false, locked: false, lockReason: null, prunable: false }],
+        run: async args => ({
+          exitCode: 0,
+          stdout: args[0] === "rev-parse"
+            ? args.flatMap((arg, index) => arg === "--git-path" ? [path.join(root, "gitdir", args[index + 1]!)] : []).join("\n") + "\n"
+            : args[0] === "status" ? status : "",
+          stderr: "", timedOut: false, outputExceeded: false,
+        }),
+      });
+      for (const status of ["?? zeta/\0?? mid/\0?? alpha/\0", "?? alpha/\0?? mid/\0?? zeta/\0", "!! mid/\0?? zeta/\0?? alpha/\0"]) {
+        const result = await inspectIn(status);
+        expect("blocked" in result && result.blocked.detail.message).toContain("(alpha)");
+      }
+    } finally {
       await rm(root, { recursive: true, force: true });
     }
   });
