@@ -1085,10 +1085,16 @@ paths:
       summary: Check whether a worktree may be deleted
       description: |
         Read-only. Reports the ONE blocker that would refuse a deletion —
-        ownership, identity, tracked, untracked or ignored data, Git locks,
-        nested worktrees or known activity — or, when none applies, whether
-        proceeding needs the caller's explicit stop authorization
-        (`requiresStop`). Nothing here mutates, and there is no force path
+        ownership, identity, Git locks, nested worktrees, initialized
+        submodules or nested Git repositories, a Git operation in progress or
+        known activity — or, when none applies, whether proceeding needs the
+        caller's explicit stop authorization (`requiresStop`) and which local
+        data would be deleted with the checkout (`localData`). Tracked
+        changes, untracked files and ignored files are not blockers here:
+        they are disclosed per category with a count, a short sorted sample
+        of checkout-relative paths and one `fingerprint` of the complete set,
+        which a deletion must echo back as `localDataFingerprint`. Nothing
+        here mutates, and no acknowledgement or client-supplied force gets
         past any blocker it finds.
       requestBody:
         required: true
@@ -1110,20 +1116,37 @@ paths:
       summary: Delete a worktree Uatu created
       description: |
         Removes a verified Uatu-created linked checkout after every safety
-        check — ownership, identity, tracked, untracked and ignored data,
-        Git locks, nested worktrees and known activity — and always keeps the
-        branch. `confirm: true` is required and is itself the authorization;
-        there is no force, no override of any blocker, and no branch
-        deletion. `stop: true` additionally authorizes stopping this
-        worktree's own Uatu sessions; activity Uatu does not own remains a
-        blocker. A blocked or failed deletion retains both the checkout and
-        its registration.
+        check — ownership, identity, Git locks, nested worktrees, initialized
+        submodules or nested Git repositories, Git operations in progress,
+        known activity and local data — and always keeps the branch.
+        `confirm: true` is required; for a checkout without local data it is
+        itself the authorization. When the checkout has local data (tracked
+        changes, untracked files or ignored files), `localDataFingerprint`
+        must also carry the preflight's `localData.fingerprint`: it
+        acknowledges deleting exactly that data with the checkout, and is
+        re-verified against the checkout at every recheck up to the moment
+        before Git runs. Without it the request is refused as `local-data`;
+        with a fingerprint that no longer matches, it is refused as
+        `local-data` and must be reviewed again. The acknowledgement never
+        overrides any other blocker. There is no client-facing force option;
+        the Hub may pass Git a single force only to remove acknowledged
+        tracked changes or untracked files, never the double force that
+        overrides a Git lock. `stop: true` additionally authorizes stopping
+        this worktree's own Uatu sessions; activity Uatu does not own remains
+        a blocker. A blocked or failed deletion retains both the checkout and
+        its registration, and no branch is ever deleted.
       requestBody:
         required: true
         content:
           application/json:
             schema: { $ref: '#/components/schemas/DeleteWorktreeRequest' }
-            example: { sourceWorkspaceId: atlas, reference: feature/login, confirm: true, stop: true }
+            examples:
+              clean:
+                summary: A checkout without local data, running
+                value: { sourceWorkspaceId: atlas, reference: feature/login, confirm: true, stop: true }
+              acknowledged:
+                summary: Acknowledging the local data preflight disclosed
+                value: { sourceWorkspaceId: atlas, reference: feature/login, confirm: true, localDataFingerprint: 3f9a1c0e7b52d4e86a0f1b2c3d4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5a6 }
       responses:
         '200': { $ref: '#/components/responses/WorktreeOperation' }
         '400': { $ref: '#/components/responses/NoStoreError' }
@@ -1349,11 +1372,22 @@ components:
                 ok: true
                 requiresStop: false
                 checkout: { checkoutId: 7c2d, repositoryId: 5f0c2a9d4e1b7a3c6d8e9f0a1b2c3d4e, workspaceId: feature-login, parentWorkspaceId: atlas, path: /src/atlas.worktrees/feature-login, branch: feature/login, detached: false, main: false, ownership: uatu, availability: present, registered: true, running: false, locked: false, sourceRef: main }
+            localData:
+              summary: Deletable once the listed local data is acknowledged
+              value:
+                ok: true
+                requiresStop: false
+                checkout: { checkoutId: 7c2d, repositoryId: 5f0c2a9d4e1b7a3c6d8e9f0a1b2c3d4e, workspaceId: feature-login, parentWorkspaceId: atlas, path: /src/atlas.worktrees/feature-login, branch: feature/login, detached: false, main: false, ownership: uatu, availability: present, registered: true, running: false, locked: false, sourceRef: main }
+                localData:
+                  tracked: { count: 2, sample: [README.md, src/app.ts] }
+                  untracked: { count: 7, sample: [notes/a.md, notes/b.md, notes/c.md, notes/d.md, scratch.txt] }
+                  ignored: { count: 2, sample: [.env, node_modules/] }
+                  fingerprint: 3f9a1c0e7b52d4e86a0f1b2c3d4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5a6
             blocked:
               summary: Refused by a blocker; nothing was removed
               value:
                 ok: false
-                error: { code: local-data, message: Uncommitted changes would be lost., retry: none }
+                error: { code: git-lock, message: "This worktree is locked in Git. Unlock it outside Uatu if it is safe, then retry. Nothing was removed.", retry: retry-delete }
   schemas:
     NotificationEnrollment:
       type: object
@@ -2204,8 +2238,9 @@ components:
       properties:
         sourceWorkspaceId: { $ref: '#/components/schemas/WorkspaceId' }
         reference: { $ref: '#/components/schemas/WorktreeReference' }
-        confirm: { type: boolean, const: true, description: "Required, and itself the authorization — the same role the destructive button plays in the Hub's dialog. It authorizes the stated operation; it does not override any blocker, and there is no force anywhere in this family." }
+        confirm: { type: boolean, const: true, description: "Required — the same role the destructive button plays in the Hub's dialog, and for a checkout without local data the whole authorization. It authorizes the stated operation and overrides no blocker. There is no client-facing force option in this family." }
         stop: { type: boolean, description: "Additionally authorizes stopping this worktree's own Uatu sessions before removal. Activity Uatu does not own stays a blocker: Uatu never claims it can stop an external application." }
+        localDataFingerprint: { type: string, pattern: '^[0-9a-f]{64}$', description: "The acknowledgement of local data: the `localData.fingerprint` the deletion preflight reported, echoed back. It authorizes deleting exactly the disclosed tracked changes, untracked files and ignored files with the checkout, and is re-verified at every recheck — a checkout whose local data changed since is refused as `local-data`. It never overrides a lock, a nested worktree, a submodule or nested repository, a Git operation in progress, external activity, uncertain identity or ownership. Only for acknowledged tracked or untracked data may the Hub pass Git a single force, never the double force that overrides a lock. Omitted for a checkout without local data." }
       additionalProperties: false
     WorktreeReference:
       type: string
@@ -2240,9 +2275,32 @@ components:
         ok: { type: boolean }
         checkout: { $ref: '#/components/schemas/WorktreeCheckout' }
         requiresStop: { type: boolean, description: "Present when ok is true: whether proceeding to delete needs the caller's explicit stop authorization." }
-        error: { $ref: '#/components/schemas/WorktreeError', description: "The ONE blocker that replaces deletion's normal consequences. There is no force path past it." }
+        localData: { $ref: '#/components/schemas/WorktreeLocalData', description: "Present only when ok is true and the checkout has local data: what deletion would permanently discard, and the fingerprint a deletion must echo back to acknowledge it." }
+        error: { $ref: '#/components/schemas/WorktreeError', description: "The ONE blocker that replaces deletion's normal consequences. No acknowledgement and no client-supplied force gets past it." }
       additionalProperties: false
-      description: "ok: true carries checkout and requiresStop; ok: false carries error and, when the checkout itself was identified before the blocker was found, checkout too."
+      description: "ok: true carries checkout and requiresStop, and localData when the checkout has local data; ok: false carries error and, when the checkout itself was identified before the blocker was found, checkout too."
+    WorktreeLocalData:
+      type: object
+      required: [fingerprint]
+      minProperties: 2
+      properties:
+        tracked: { $ref: '#/components/schemas/WorktreeLocalDataCategory', description: "Staged or unstaged changes to tracked files." }
+        untracked: { $ref: '#/components/schemas/WorktreeLocalDataCategory', description: "Untracked files." }
+        ignored: { $ref: '#/components/schemas/WorktreeLocalDataCategory', description: "Ignored entries; a wholly ignored directory is one entry, listed with its trailing `/`." }
+        fingerprint: { type: string, pattern: '^[0-9a-f]{64}$', description: "Opaque: identifies the complete set of local-data status entries across all three categories, bound to this checkout. Echo it back as the deletion's `localDataFingerprint`." }
+      additionalProperties: false
+      description: "Local data a deletion would permanently discard. A category is present only when it has at least one entry, and at least one is present."
+    WorktreeLocalDataCategory:
+      type: object
+      required: [count, sample]
+      properties:
+        count: { type: integer, minimum: 1, description: "Status entries in this category." }
+        sample:
+          type: array
+          maxItems: 5
+          items: { type: string, minLength: 1, pattern: '^[^/]', description: "A checkout-relative path, never absolute." }
+          description: "Up to five of this category's entries, sorted; never more than count."
+      additionalProperties: false
     RegisterWorktreeRequest:
       type: object
       required: [reference]

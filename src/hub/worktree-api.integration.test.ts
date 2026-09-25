@@ -746,3 +746,62 @@ describe("register recovers a retained checkout over the wire (8.1)", () => {
     expect(retryRegistry!.list().filter(entry => entry.worktree?.checkoutId === retainedId)).toHaveLength(1);
   });
 });
+
+describe("local-data acknowledgement over JSON", () => {
+  async function createWithLocalData(branch: string, folder: string) {
+    const created = await result(await post("create", {
+      sourceWorkspaceId: atlasId, mode: "new-branch", branch, base: { kind: "local", ref: "main" },
+    }));
+    expect(created.ok).toBe(true);
+    const checkout = path.join(root, "atlas.worktrees", folder);
+    await writeFile(path.join(checkout, "README.md"), "# changed\n");
+    await writeFile(path.join(checkout, "scratch.txt"), "scratch\n");
+    return checkout;
+  }
+
+  test("a malformed fingerprint is invalid input, answered with 200 and nothing removed", async () => {
+    const checkout = await createWithLocalData("feature/malformed-ack", "feature-malformed-ack");
+    for (const malformed of ["not-a-fingerprint", "F".repeat(64), true]) {
+      const refused = await result(await post("delete", {
+        sourceWorkspaceId: atlasId, reference: "feature/malformed-ack", confirm: true, localDataFingerprint: malformed,
+      }));
+      expect(refused.ok).toBe(false);
+      if (refused.ok) return;
+      expect(refused.error.code).toBe("invalid-input");
+    }
+    expect(existsSync(path.join(checkout, "scratch.txt"))).toBe(true);
+    expect((await inventory()).checkouts.some(candidate => candidate.branch === "feature/malformed-ack" && candidate.registered)).toBe(true);
+  });
+
+  test("preflight-delete describes local data, a matching fingerprint deletes it, a stale one is refused", async () => {
+    const checkout = await createWithLocalData("feature/local-data", "feature-local-data");
+    const checked = await preflight(await post("preflight-delete", { sourceWorkspaceId: atlasId, reference: "feature/local-data" }));
+    expect(checked.ok).toBe(true);
+    if (!checked.ok) return;
+    expect(checked.localData?.tracked).toEqual({ count: 1, sample: ["README.md"] });
+    expect(checked.localData?.untracked).toEqual({ count: 1, sample: ["scratch.txt"] });
+    expect(checked.localData?.ignored).toBeUndefined();
+    const fingerprint = checked.localData!.fingerprint;
+
+    // The data changes after review: the old fingerprint is stale.
+    await writeFile(path.join(checkout, "another.txt"), "new\n");
+    const stale = await result(await post("delete", {
+      sourceWorkspaceId: atlasId, reference: "feature/local-data", confirm: true, localDataFingerprint: fingerprint,
+    }));
+    expect(stale.ok).toBe(false);
+    if (stale.ok) return;
+    expect(stale.error.code).toBe("local-data");
+    expect(stale.error.message).toContain("Review the deletion again");
+    expect(existsSync(path.join(checkout, "another.txt"))).toBe(true);
+
+    const reviewed = await preflight(await post("preflight-delete", { sourceWorkspaceId: atlasId, reference: "feature/local-data" }));
+    if (!reviewed.ok) throw new Error("expected a deletable checkout");
+    expect(reviewed.localData?.untracked?.count).toBe(2);
+    const deleted = await result(await post("delete", {
+      sourceWorkspaceId: atlasId, reference: "feature/local-data", confirm: true, localDataFingerprint: reviewed.localData!.fingerprint,
+    }));
+    expect(deleted.ok).toBe(true);
+    expect(existsSync(checkout)).toBe(false);
+    expect(await git(path.join(root, "atlas"), ["branch", "--list", "feature/local-data"])).toContain("feature/local-data");
+  });
+});

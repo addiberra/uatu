@@ -42,7 +42,12 @@ export const WORKTREE_GIT_MINIMUM_VERSION = "2.36.0";
 const PROBE_TIMEOUT_MS = 10_000;
 const OUTPUT_LIMIT = 4 * 1024 * 1024;
 
-export type GitRunner = (args: readonly string[], cwd: string) => Promise<GitRun>;
+// Per-call overrides for one probe. Only a caller that knows its output is
+// legitimately large (the index listing deletion inspects) raises the bound;
+// it is still a bound, and exceeding it still fails closed.
+export type GitRunOptions = { readonly outputLimit?: number };
+
+export type GitRunner = (args: readonly string[], cwd: string, options?: GitRunOptions) => Promise<GitRun>;
 
 export type GitRun = {
   readonly exitCode: number;
@@ -127,9 +132,10 @@ async function readCapped(stream: ReadableStream<Uint8Array>, limit: number): Pr
 export function createGitRunner(options: WorktreeGitOptions = {}): GitRunner {
   const env = buildWorktreeProbeEnvironment(options.env);
   const timeoutMs = options.timeoutMs ?? PROBE_TIMEOUT_MS;
-  const limit = options.outputLimit ?? OUTPUT_LIMIT;
+  const defaultLimit = options.outputLimit ?? OUTPUT_LIMIT;
   const command = options.gitCommand ?? (() => "git");
-  return async (args, cwd) => {
+  return async (args, cwd, runOptions) => {
+    const limit = runOptions?.outputLimit ?? defaultLimit;
     let child: ReturnType<typeof Bun.spawn>;
     try {
       child = Bun.spawn([command(), ...args], {

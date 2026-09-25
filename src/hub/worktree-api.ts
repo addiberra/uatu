@@ -202,8 +202,9 @@ export function createWorktreeApi(deps: WorktreeApiDeps) {
     return json(200, { ok: true, refs: outcome.refs } satisfies WorktreeRefsResponse);
   };
 
-  // Read-only: "may this be deleted, and does proceeding need the caller's
-  // explicit stop authorization." Nothing here mutates.
+  // Read-only: "may this be deleted, does proceeding need the caller's
+  // explicit stop authorization, and which local data would go with it."
+  // Nothing here mutates.
   const preflightDelete = async (body: unknown, source: string): Promise<Response> => {
     const record = (body ?? {}) as Record<string, unknown>;
     let request;
@@ -381,9 +382,12 @@ export function createWorktreeApi(deps: WorktreeApiDeps) {
 
   const remove = async (body: unknown, source: string, principal: WorktreeApiPrincipal): Promise<Response> => {
     const record = (body ?? {}) as Record<string, unknown>;
-    // The explicit confirmation IS the authorization, exactly as the
-    // destructive button is in the dialog. There is no force path past any
-    // blocker, and no branch deletion anywhere.
+    // For a clean tree the explicit confirmation IS the authorization,
+    // exactly as the destructive button is in the dialog. Local data also
+    // needs `localDataFingerprint`, the acknowledgement of exactly the data
+    // preflight disclosed. No client-supplied force exists, the
+    // acknowledgement overrides no other blocker, and there is no branch
+    // deletion anywhere.
     if (record.confirm !== true) {
       return refusal("delete", worktreeError("invalid-input", "Confirm deletion to continue. Nothing was removed."));
     }
@@ -400,6 +404,7 @@ export function createWorktreeApi(deps: WorktreeApiDeps) {
         sourceWorkspaceId: source,
         reference: resolved.reference,
         ...(record.stop === undefined ? {} : { stop: record.stop }),
+        ...(record.localDataFingerprint === undefined ? {} : { localDataFingerprint: record.localDataFingerprint }),
       });
     } catch (error) {
       return refusal("delete", worktreeError("invalid-input", error instanceof Error ? error.message : "The request is not valid."));
