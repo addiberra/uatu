@@ -90,6 +90,27 @@ describe("a forked skill's launching row", () => {
     const item = settled.updates.flatMap(update => update.kind === "upsert" ? [update.item] : [])[0]!;
     expect(item).not.toHaveProperty("childConversationId");
   });
+
+  // The frame's one structured result names no tool use; the CLI gives each
+  // result a frame of its own, so a frame answering two cannot say whose it is.
+  test("a frame answering two tool uses lends its one structured result to neither", () => {
+    const memory = createClaudeEventMemory();
+    normalizeClaudeMessage(skillCall, memory, "live");
+    normalizeClaudeMessage({ type: "assistant", uuid: "a2", timestamp: "2026-09-22T12:00:01.000Z", message: { role: "assistant", content: [
+      { type: "tool_use", id: "toolu_other", name: "Bash", input: { command: "ls" } },
+    ] } }, memory, "live");
+    const settled = normalizeClaudeMessage({ type: "user", uuid: "u2", timestamp: "2026-09-22T12:02:00.000Z", message: { role: "user", content: [
+      { type: "tool_result", tool_use_id: "toolu_other", content: "README.md" },
+      { type: "tool_result", tool_use_id: "toolu_skill", content: "Based on my analysis..." },
+    ] }, tool_use_result: { success: true, commandName: "code-review", status: "forked", agentId: "aaeeab292f002e3d7", resolvedModel: "claude-haiku-4-5", usage: { input_tokens: 10, output_tokens: 5 } } }, memory, "live", "57489e13");
+    const items = settled.updates.flatMap(update => update.kind === "upsert" ? [update.item] : []);
+    expect(items.map(item => [item.id, item.type === "tool" ? item.status : undefined])).toEqual([["tool:toolu_other", "completed"], ["tool:toolu_skill", "completed"]]);
+    for (const item of items) {
+      expect(item).not.toHaveProperty("childConversationId");
+      expect(item).not.toHaveProperty("model");
+      expect(item).not.toHaveProperty("usage");
+    }
+  });
 });
 
 // What "Allow always" lists must be what the reply forwards. One filter

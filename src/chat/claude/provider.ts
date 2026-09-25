@@ -396,6 +396,16 @@ type LiveBackgroundTask = BackgroundTaskFacts & { description: string; taskType?
 
 const TASK_OUTPUTS_LIMIT = 512;
 
+/**
+ * The output index's key for one task of one session. Both ids are the CLI's
+ * (a UUID, an alphanumeric task id) and hold no separator today, but a key
+ * joined on one would let two different pairs meet if either ever did; the
+ * encoded pair cannot.
+ */
+export function taskOutputKey(sessionId: string, taskId: string): string {
+  return JSON.stringify([sessionId, taskId]);
+}
+
 // What retired queries of one conversation spent, and when this process began
 // observing it. The SDK's `/usage` session counters cover the current query
 // only, and an idle conversation's next turn resumes a fresh one, so "this
@@ -546,10 +556,10 @@ export class ClaudeProvider implements ChatProvider {
   // enforced here, durably: a cancelled wakeup never holds a session and
   // its fires are blocked at the UserPromptSubmit hook (D12).
   private readonly cancelledWakeups = new Map<string, Map<string, string>>();
-  // Where each task's output file is, by `<session>:<task>`, kept past the
-  // task's settling and the session's retirement (bounded): the reader's
-  // last refresh after a settle must still find it. Never a client's path:
-  // only what a CLI frame or the launching tool result named.
+  // Where each task's output file is, by session and task (`taskOutputKey`),
+  // kept past the task's settling and the session's retirement (bounded):
+  // the reader's last refresh after a settle must still find it. Never a
+  // client's path: only what a CLI frame or the launching tool result named.
   private readonly taskOutputs = new Map<string, { outputFile: string; settled: boolean }>();
   private readonly titleRefreshTimers = new Map<string, ReturnType<typeof setTimeout>>();
   // The login's plan usage as last read on this workspace — after a turn or
@@ -1328,7 +1338,7 @@ export class ClaudeProvider implements ChatProvider {
         this.trackSessionLevel(session, message, memory);
         this.trackSchedulingCalls(session, message, memory);
         const normalized = normalizeClaudeMessage(message, memory, "live", session.id);
-        this.learnSubagentRuns(session, message, normalized);
+        this.learnSubagentRuns(session, message);
         if (memory.rateLimit) this.rateLimitedSessions.set(session.id, memory.rateLimit); else this.rateLimitedSessions.delete(session.id);
         this.adoptRefusalFallback(session.id, message);
         // A retry or a compaction names a state of the conversation's own
@@ -2638,7 +2648,7 @@ export class ClaudeProvider implements ChatProvider {
    * opens on a whole UTF-8 character.
    */
   async taskOutput(sessionId: string, taskId: string, options: { tailBytes: number }): Promise<BackgroundTaskOutput | null> {
-    const entry = this.taskOutputs.get(`${sessionId}:${taskId}`);
+    const entry = this.taskOutputs.get(taskOutputKey(sessionId, taskId));
     if (!entry) return null;
     const tailBytes = Math.max(1, Math.min(Math.floor(options.tailBytes), TASK_OUTPUT_TAIL_MAX_BYTES));
     let real: string;
@@ -2690,7 +2700,7 @@ export class ClaudeProvider implements ChatProvider {
       const live = session.backgroundTasks.get(row.taskId);
       if (live) Object.assign(live, taskFacts(row));
       if (row.outputFile) {
-        const key = `${session.id}:${row.taskId}`;
+        const key = taskOutputKey(session.id, row.taskId);
         const known = this.taskOutputs.get(key);
         boundedSet(this.taskOutputs, key, { outputFile: row.outputFile, settled: known?.settled === true || row.status !== "running" }, TASK_OUTPUTS_LIMIT);
       } else if (row.status !== "running") {
@@ -2793,7 +2803,7 @@ export class ClaudeProvider implements ChatProvider {
    * the fallback. The run's end — task frames, the sync result — settles
    * the child's status. All from the parent's own frames.
    */
-  private learnSubagentRuns(session: LiveSession, message: unknown, normalized: Omit<NormalizedProviderEvent, "conversationId">): void {
+  private learnSubagentRuns(session: LiveSession, message: unknown): void {
     if (!message || typeof message !== "object") return;
     const record = message as Record<string, unknown>;
     if (record.type === "system") {
@@ -2832,21 +2842,36 @@ export class ClaudeProvider implements ChatProvider {
       return;
     }
     if (record.type !== "user") return;
+    // The tool uses this frame answers, read from its own result blocks.
+    const content = (record.message as { content?: unknown } | undefined)?.content;
+    const results = Array.isArray(content)
+      ? content.flatMap(block => {
+        const result = block as { type?: unknown; tool_use_id?: unknown; is_error?: unknown } | null;
+        return result?.type === "tool_result" && typeof result.tool_use_id === "string" && result.tool_use_id ? [{ toolUseId: result.tool_use_id, failed: result.is_error === true }] : [];
+      })
+      : [];
+    // Whatever these tool uses were, they are over: frames held for one
+    // either become the fork's transcript just below, or are dropped unsent —
+    // a tool use that never forked has no child to replay them into (D10).
+    const held = results.map(result => {
+      const frames = session.forkBuffers.get(result.toolUseId);
+      session.forkBuffers.delete(result.toolUseId);
+      return frames;
+    });
+    // The frame's structured result is one object and names no tool use, so
+    // it can only be read as the result of a frame that answers exactly one.
+    // Claude Code writes each result in a frame of its own, parallel calls
+    // included; a frame that answered several could not say whose `agentId`
+    // this is, and a run named on the wrong tool use would be worse than one
+    // not named here (a current CLI names it at its start edge anyway, D13).
+    if (results.length !== 1) return;
+    const [{ toolUseId, failed }] = results as [{ toolUseId: string; failed: boolean }];
     const raw = record.toolUseResult ?? record.tool_use_result;
     const outcome = raw && typeof raw === "object" ? raw as Record<string, unknown> : undefined;
-    // The result's tool use is the row the normalizer just completed.
-    const row = normalized.updates.find(update => update.kind === "upsert" && update.item.type === "tool");
-    const toolUseId = row?.kind === "upsert" ? row.item.id.replace(/^tool:/, "") : undefined;
-    if (!toolUseId) return;
-    // Whatever this tool use was, it is over: frames held for it either
-    // become the fork's transcript just below, or are dropped unsent — a
-    // tool use that never forked has no child to replay them into (D10).
-    const held = session.forkBuffers.get(toolUseId);
-    session.forkBuffers.delete(toolUseId);
     const agentId = outcome && typeof outcome.agentId === "string" && outcome.agentId ? outcome.agentId : undefined;
     if (!agentId || !outcome) return;
     const launched = outcome.isAsync === true || outcome.status === "async_launched";
-    const buffered = held && held.length > 0 ? held : undefined;
+    const buffered = held[0] && held[0].length > 0 ? held[0] : undefined;
     // A fork (`status: "forked"`) is named only here. Held frames are the
     // sign that this result names a run that was already streaming, so its
     // child opens running rather than silently settled: running first, then
@@ -2861,7 +2886,7 @@ export class ClaudeProvider implements ChatProvider {
     // said so already, and a fork only ends here — unlike an async agent
     // launch, whose result is the run's START, a fork's result IS its end
     // (spec: a fork's identity "is only confirmed when it ends").
-    if (!launched) this.settleChild(child, row?.kind === "upsert" && row.item.type === "tool" && row.item.status === "failed" ? "failed" : "completed");
+    if (!launched) this.settleChild(child, failed ? "failed" : "completed");
   }
 
   /** The child for a run (by `runKey`), opened on first sight; a live run reads as running from here. */
@@ -2913,7 +2938,7 @@ export class ClaudeProvider implements ChatProvider {
 
   /** The task is over, however it ended: its next output read says so. */
   private settleTaskOutput(sessionId: string, taskId: string): void {
-    const entry = this.taskOutputs.get(`${sessionId}:${taskId}`);
+    const entry = this.taskOutputs.get(taskOutputKey(sessionId, taskId));
     if (entry) entry.settled = true;
   }
 

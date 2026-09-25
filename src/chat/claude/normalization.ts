@@ -647,7 +647,12 @@ function normalizeMessage(
     const frame = { ...base, ...(skipped.length ? { skippedBlocks: skipped } : {}) };
     const results = blocks.filter(block => block.type === "tool_result");
     if (results.length > 0) {
-      const toolOutcome = asRecord(record.toolUseResult ?? record.tool_use_result);
+      // The frame's structured result is one object naming no tool use: it
+      // describes the frame's result only when there is exactly one. Claude
+      // Code writes each result in a frame of its own, parallel calls
+      // included; were several ever batched, lending one outcome to all of
+      // them would put one run's agent, model, and usage on every row.
+      const toolOutcome = results.length === 1 ? asRecord(record.toolUseResult ?? record.tool_use_result) : {};
       const updates = results.flatMap(block => toolResultUpdate(block, envelope, memory, toolOutcome, parentSessionId));
       rememberFrameItems(memory, envelope.uuid, updates);
       return { ...frame, outcome: updates.length > 0 ? "handled" : "ignored", updates };

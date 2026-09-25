@@ -153,7 +153,9 @@ export function switcherBadgeLabel(badge: SwitcherBadge): string {
 // A menu entry's state text. Running and idle needs no word — the live dot
 // says it — so the column only speaks when there is something to say. The
 // running states are exclusive by construction: finished requires neither
-// working nor awaiting.
+// working nor awaiting. Within one workspace the order is awaiting, working,
+// finished — unlike the chip's ranking across workspaces — because work
+// starting again clears finished: a workspace that is both is working.
 export type WorkspaceMenuState = { text: string; tone: "stopped" | "working" | "awaiting" | "finished" } | null;
 
 export function workspaceMenuState(workspace: HubWorkspaceSummary, activity: WorkspaceActivityMap): WorkspaceMenuState {

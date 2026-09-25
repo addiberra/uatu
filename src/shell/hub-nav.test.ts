@@ -454,6 +454,33 @@ describe("switcher activity", () => {
     expect(switcherBadge(list, activity, "uatu")).toBeNull();
   });
 
+  // The hub never sends finished alongside working or awaiting, but a payload
+  // that did must still read per the contract rather than by accident of
+  // branch order. Finished is cleared by work starting again, so for ONE
+  // workspace a live fact outranks it: working-and-finished is working,
+  // awaiting-and-finished is awaiting. The chip's awaiting > finished >
+  // working order ranks the kinds ACROSS workspaces, after each workspace
+  // has been read once.
+  test("a workspace reported both finished and busy reads as busy, in its entry and in the chip's count", () => {
+    const list = [summary("uatu", true), summary("two", true), summary("three", true), summary("four", true)];
+    const activity = new Map([
+      ["two", facts(true, true, false, true)],
+      ["three", facts(true, false, true, true)],
+      ["four", facts(true, true, true, true)],
+    ]);
+    expect(workspaceMenuState(summary("two", true), activity)).toEqual({ text: "working", tone: "working" });
+    expect(workspaceMenuState(summary("three", true), activity)).toEqual({ text: "awaiting you", tone: "awaiting" });
+    expect(workspaceMenuState(summary("four", true), activity)).toEqual({ text: "awaiting you", tone: "awaiting" });
+    expect(switcherBadge(list, activity, "uatu")).toEqual({ kind: "awaiting", count: 2 });
+    activity.delete("three");
+    activity.delete("four");
+    expect(switcherBadge(list, activity, "uatu")).toEqual({ kind: "working", count: 1 });
+    // Beside a genuinely finished workspace, the busy one is not counted as a
+    // second finish.
+    activity.set("three", facts(true, false, false, true));
+    expect(switcherBadge(list, activity, "uatu")).toEqual({ kind: "finished", count: 1 });
+  });
+
   test("the badge is spoken, never colour alone", () => {
     expect(switcherBadgeLabel({ kind: "awaiting", count: 1 })).toBe("1 workspace awaiting your reply");
     expect(switcherBadgeLabel({ kind: "awaiting", count: 2 })).toBe("2 workspaces awaiting your reply");

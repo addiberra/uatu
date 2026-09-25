@@ -9,7 +9,7 @@ import spikeRevival from "../../../tests/fixtures/claude-sdk/spike-cron-revival.
 import forkedRuns from "../../../tests/fixtures/claude-sdk/forked-runs-2.1.280.json";
 import type { NormalizedProviderEvent } from "../provider";
 import { createClaudeEventMemory, markTasksBackgrounded, normalizeClaudeMessage, normalizeContextUsage, normalizeTranscriptEntries } from "./normalization";
-import { ClaudeProvider, normalizePlanUtilization, normalizeSessionTotals, wakeupPromptMatches, WAKEUP_PAUSED_MESSAGE, WAKEUP_PAUSED_ONCE_MESSAGE, type ClaudeQueryHandle, type ClaudeQueryInput, type ClaudeUserEnvelope } from "./provider";
+import { ClaudeProvider, normalizePlanUtilization, normalizeSessionTotals, taskOutputKey, wakeupPromptMatches, WAKEUP_PAUSED_MESSAGE, WAKEUP_PAUSED_ONCE_MESSAGE, type ClaudeQueryHandle, type ClaudeQueryInput, type ClaudeUserEnvelope } from "./provider";
 import type { QuestionRequest } from "../types";
 import { BackgroundTaskUnavailableError, ReleaseUnavailableError, ScheduledWakeupUnavailableError } from "../provider";
 import { claudeProjectDir } from "./transcript";
@@ -1295,6 +1295,14 @@ describe("ClaudeProvider sessions", () => {
     await provider.dispose();
   });
 
+  // Hardening, not a reachable bug: the CLI's ids (a UUID, an alphanumeric
+  // task id) hold no colon today, but the index must not depend on that.
+  test("the output index keys a task by its session and id as a pair, whatever characters they hold", () => {
+    expect(taskOutputKey("a:b", "c")).not.toBe(taskOutputKey("a", "b:c"));
+    expect(taskOutputKey("8d4c5f1e-0b1a-4c2e-9f7a-1d2e3f4a5b6c", "bgjpa5uwy")).toBe(taskOutputKey("8d4c5f1e-0b1a-4c2e-9f7a-1d2e3f4a5b6c", "bgjpa5uwy"));
+    expect(taskOutputKey("s", "t")).not.toBe(taskOutputKey("t", "s"));
+  });
+
   test("a truncated output tail opens on a whole character", async () => {
     const { provider, queries, workspace } = fixture();
     const { events, stop } = collect(provider);
@@ -1569,6 +1577,41 @@ describe("ClaudeProvider sessions", () => {
       expect(events.some(event => event.conversationId?.startsWith("sub:"))).toBe(false);
       // The parent kept the fork's tool row, as it does today.
       expect(upsertIds(events, session.id).filter(id => id === "tool:toolu_diff").length).toBe(2);
+      stop();
+      await provider.dispose();
+    });
+
+    // Claude Code answers each tool use in a frame of its own, parallel calls
+    // included (a `/simplify` run's four parallel Agent launches settled in
+    // four frames); the frame's one structured result names no tool use, so
+    // a frame that answered several could not say whose run it names.
+    test("a frame answering several tool uses names no run from its one structured result", async () => {
+      const { provider, queries } = fixture();
+      const { events, stop } = collect(provider);
+      const session = await provider.createSession("x");
+      await provider.prompt(session.id, { id: "r1", text: "review", delivery: "queue" });
+      const query = queries[0]!;
+      const forkChildId = `sub:${session.id}:${FORK_AGENT}`;
+      query.push(skillCall(session.id));
+      query.push({ type: "assistant", uuid: "other", timestamp: stamp(1), session_id: session.id, parent_tool_use_id: null, message: { role: "assistant", model: "claude-haiku-4-5-20251001", content: [{ type: "tool_use", id: "toolu_other", name: "Bash", input: { command: "ls" } }] } });
+      for (const frame of forkFrames(session.id)) query.push(frame);
+      await waitFor(() => upsertIds(events, session.id).filter(id => id === "tool:toolu_diff").length === 2);
+      query.push({ type: "user", uuid: "both", timestamp: stamp(4), session_id: session.id, parent_tool_use_id: null, message: { role: "user", content: [
+        { type: "tool_result", tool_use_id: "toolu_other", content: "README.md" },
+        { type: "tool_result", tool_use_id: "toolu_skill", content: "Based on my analysis..." },
+      ] }, tool_use_result: { success: true, commandName: "code-review", status: "forked", agentId: FORK_AGENT, result: "Based on my analysis..." } });
+      const completed = (id: string) => events.filter(event => event.conversationId === session.id).flatMap(event => event.updates)
+        .flatMap(update => update.kind === "upsert" && update.item.id === id && update.item.type === "tool" && update.item.status === "completed" ? [update.item] : []).at(-1);
+      await waitFor(() => completed("tool:toolu_other") !== undefined && completed("tool:toolu_skill") !== undefined);
+      // Neither row is given the run, and no run is registered under either
+      // tool use while the session is live: the Bash call is not the fork,
+      // and nothing says the Skill is.
+      expect(completed("tool:toolu_other")).not.toHaveProperty("childConversationId");
+      expect(completed("tool:toolu_skill")).not.toHaveProperty("childConversationId");
+      expect(await provider.getSession(forkChildId)).toBeNull();
+      await query.return();
+      await Bun.sleep(10);
+      expect(events.some(event => event.conversationId?.startsWith("sub:"))).toBe(false);
       stop();
       await provider.dispose();
     });
