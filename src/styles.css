@@ -117,6 +117,11 @@
   --success-strong: light-dark(#1a7f37, #3fb950);
   --danger: light-dark(#cf222e, #f85149);
   --attention: light-dark(#bf8700, #d29922);
+  /* A workspace whose work finished and has not been viewed (the switcher's
+     finished entry and pill). Its own hue, GitHub's pink pair, so it reads
+     apart from blue working and amber awaiting at a glance; both values
+     clear 4.5:1 on the page and raised surfaces they sit on. */
+  --finished: light-dark(#bf3989, #db61a2);
   /* Warning-toned notice surfaces (config-warning, stale-client notice). */
   --notice-warn-border: light-dark(#f0cf7a, #9e6a03);
   --notice-warn-bg: light-dark(#fff8dc, #271d05);
@@ -801,7 +806,7 @@ html.uatu-desktop-host
 
 /* Other workspaces' live activity (hub-nav's activity consumer). In the
    menu, the state column names it; on the collapsed chip, a badge summarizes
-   it — a warm count pill when an interaction awaits the user, an accent
+   it — a warm count pill when an interaction awaits the user, a pink
    count pill when work finished unviewed, a quiet accent dot while agents
    merely work — so the three read as three levels. The chip button's
    aria-label carries the same words. */
@@ -815,7 +820,7 @@ html.uatu-desktop-host
 }
 
 .hub-menu-item .hub-menu-state.is-finished {
-  color: var(--accent);
+  color: var(--finished);
   font-weight: 400;
 }
 
@@ -854,10 +859,10 @@ html.uatu-desktop-host
   height: 1.15rem;
   margin-block: -0.25rem;
   padding: 0 0.35rem;
-  border: 1px solid var(--accent);
+  border: 1px solid var(--finished);
   border-radius: 999px;
   background: transparent;
-  color: var(--accent);
+  color: var(--finished);
   font-size: 0.68rem;
   font-weight: 700;
 }
