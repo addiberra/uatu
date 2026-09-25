@@ -66,12 +66,12 @@
 
 - [x] 4.1 In `src/hub/worktree-api.ts`, have `remove` pass `localDataFingerprint` through to `parseWorktreeDeleteRequest` when it is present, alongside `stop`, and update the "no force path" comment. Verify with a `src/hub/worktree-api.integration.test.ts` case where a malformed fingerprint yields an `ok: false` `invalid-input` answer with HTTP 200 and nothing removed.
 - [x] 4.2 In `api/openapi.yaml`, add `localDataFingerprint` to `DeleteWorktreeRequest` and `localData` to `WorktreeDeletionPreflight`, with new `WorktreeLocalData` / `WorktreeLocalDataCategory` component schemas closed by `additionalProperties: false`. Update the preflight-delete and delete path descriptions, and the `confirm` and `error` descriptions that say "no force anywhere" or "no force path past it". The new wording states that no client-facing force exists, that the acknowledgement never overrides other blockers, and that the Hub may pass Git a single force only for acknowledged tracked or untracked data. Add an `ok: true` preflight example carrying `localData` with several categories. Verify with `bun run api:validate` and `bun run test:api`.
-- [x] 4.3 Amend the unreleased "Hub 8 / Workspace 20" entry in `api/CHANGELOG.md` in place, with no revision bump:
-  - describe `localData` and the `localDataFingerprint` acknowledgement;
-  - replace "there is no force anywhere in the family" with the honest statement;
-  - add migration guidance: a client that omits the fingerprint is refused as before, and strict clients regenerate.
+- [x] 4.3 Publish the change as Hub revision 10 (workspace stays 21), because upstream published Hub revision 9 while this change was open (design, Migration Plan):
+  - add a "Hub 10 / Workspace 21 - Unreleased" entry to `api/CHANGELOG.md`, `Compatibility: breaking (Hub)`, describing `localData` and the `localDataFingerprint` acknowledgement with the honest force statement, and leave the earlier entries exactly as upstream publishes them;
+  - add migration guidance: strict clients regenerate against revision 10, and a client that omits the fingerprint is refused as before;
+  - raise the revision in `api/contract.json`, the OpenAPI `info.version` / `x-uatu-revisions` / examples and `HUB_API_REVISION`.
 
-  Confirm that `api/contract.json` and `api/operations.yaml` need no change. Verify with `bun run test:api`.
+  Confirm that `api/operations.yaml` and `api/streaming.yaml` need no change. Verify with the CI compatibility check (`scripts/api-contract/compatibility.ts` against the merge base), `bun run api:validate` and `bun run test:api`.
 
 ## 5. Client dialog
 

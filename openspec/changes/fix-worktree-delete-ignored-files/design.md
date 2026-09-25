@@ -164,13 +164,13 @@ The acknowledgement and the force decision are consumed within a single request,
 
 ## Migration Plan
 
-- The fields are additive and optional, inside the unreleased Hub 8 / Workspace 20 contract. Amend that `api/CHANGELOG.md` entry in place and do not bump the revision; `api/contract.json` stays as it is. Update the following in `api/openapi.yaml`:
+- The fields are optional, but `WorktreeDeletionPreflight` is closed, so `localData` is a breaking change for strict Hub clients. They are published as Hub revision 10 / workspace revision 21, with their own `api/CHANGELOG.md` entry and migration guidance, the revision raised in `api/contract.json`, the OpenAPI `info.version` (`10.21.0-experimental`) and `x-uatu-revisions`, and `HUB_API_REVISION`. *(Changed at rebase: the plan amended the unreleased Hub 8 / Workspace 20 entry in place. While this change was open, upstream published Hub revision 9 (#425), so the base already serves a closed preflight answer without `localData`; adding it is breaking for strict clients and needs a revision of its own rather than an amendment of an earlier entry. The Hub 8 entry is left exactly as upstream publishes it.)* Update the following in `api/openapi.yaml`:
   - the schemas;
   - the path descriptions;
   - the `confirm` and `error` descriptions, which currently say "no force anywhere" or "no force path past it";
   - examples, including an `ok: true` preflight with `localData`.
 
-  Also reword the changelog entry's "there is no force anywhere in the family" to the honest statement in the spec.
+  The Hub 10 entry states the honest force wording from the spec; the earlier entries stay as published.
 - No data migration is needed. Journals and registry files are unchanged.
 - Rollback is a code revert. Clients then lose the acknowledgement, local data blocks again, and Git is never forced. Nothing persisted depends on the new fields.
 - Release notes: the worktree feature is not in the latest stable tag (`v0.7.0`). The PR keeps a truthful `fix(worktrees): …` title and carries a `BEGIN_COMMIT_OVERRIDE` block with `chore(worktrees): stabilize the unreleased worktree feature before release`, so no user-visible fix entry is generated.
