@@ -291,6 +291,50 @@ test.describe("desktop OpenCode chat", () => {
     // Past yesterday's first message, the older day's separator takes over.
     await timeline.evaluate(element => { element.scrollTop = 0; });
     await expect.poll(pinned).toBe(days.olderLabel);
+
+    // An unstuck separator paints only its own box: it never reaches over
+    // the end of the previous day's last row.
+    await timeline.evaluate(element => { element.scrollTop = element.scrollHeight; });
+    const unstuck = await page.locator('#chat-items > .chat-day-separator[data-chat-day]').evaluateAll(nodes => nodes.map(node => {
+      const previous = node.previousElementSibling?.getBoundingClientRect();
+      return { gap: previous ? node.getBoundingClientRect().top - previous.bottom : 0, shadow: getComputedStyle(node).boxShadow };
+    }));
+    for (const separator of unstuck) {
+      expect(separator.gap).toBeGreaterThanOrEqual(0);
+      expect(separator.shadow).toBe("none");
+    }
+
+    // Whatever is scrolled to lands below the pinned band, not under it.
+    const clearOfBand = (id: string) => page.evaluate(target => {
+      const timeline = document.querySelector<HTMLElement>("#chat-timeline")!;
+      const top = timeline.getBoundingClientRect().top;
+      const bands = [...timeline.querySelectorAll<HTMLElement>(".chat-day-separator")].map(node => node.getBoundingClientRect()).filter(bounds => bounds.top <= top + 1 && bounds.bottom > top);
+      const bandBottom = Math.max(top, ...bands.map(bounds => bounds.bottom));
+      return document.querySelector(`[data-chat-item-id="${target}"]`)!.getBoundingClientRect().top - bandBottom;
+    }, id);
+    // A prompt jump from the rail.
+    await timeline.evaluate(element => { element.scrollTop = 0; });
+    await page.locator('#chat-prompt-rail [data-prompt-target="message:yesterday-16"]').click();
+    await expect.poll(() => clearOfBand("message:yesterday-16")).toBeGreaterThanOrEqual(0);
+    await expect.poll(() => clearOfBand("message:yesterday-16")).toBeLessThan(40);
+
+    // ⌘F: a match whose line sits under the pinned band is revealed below it,
+    // and the separators' own labels are not matches.
+    await page.locator('[data-chat-item-id="message:yesterday-20"]').evaluate(element => {
+      const timeline = element.closest<HTMLElement>("#chat-timeline")!;
+      timeline.scrollTop += element.getBoundingClientRect().top - timeline.getBoundingClientRect().top - 4;
+    });
+    expect(await clearOfBand("message:yesterday-20")).toBeLessThan(0);
+    await timeline.click({ position: { x: 5, y: 200 } });
+    await page.keyboard.press("ControlOrMeta+f");
+    await page.locator("#find-query").fill("yesterday message 20 ");
+    await expect(page.locator("#find-status")).toHaveText("1 of 1");
+    await expect.poll(() => clearOfBand("message:yesterday-20")).toBeGreaterThanOrEqual(-1);
+    await page.locator("#find-query").fill("Yesterday");
+    // 24 message texts say "yesterday"; the separator does not add a 25th.
+    await expect(page.locator("#find-status")).toHaveText(/ of 24$/);
+    await page.locator("#find-query").fill("Today");
+    await expect(page.locator("#find-status")).toHaveText(/ of 3$/);
   });
 
   test("keeps an active turn timer across conversation navigation", async ({ page }) => {

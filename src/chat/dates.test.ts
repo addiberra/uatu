@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { dayLabel, fullDate, localDayKey, localDaysBetween, nextLocalMidnight, relativeReset, resetClock, resetMoment } from "./dates";
+import { dayLabel, fullDate, localDayKey, localDaysBetween, nextLocalMidnight, relativeReset, resetClock, resetDate, resetMoment } from "./dates";
 
 // Local wall-clock instants, so every case holds in whatever zone runs it.
 const at = (month: number, day: number, hour = 12, minute = 0, year = 2026) => new Date(year, month - 1, day, hour, minute).getTime();
@@ -50,6 +50,13 @@ describe("reset wording", () => {
     const now = at(9, 25, 9);
     const yesterday = at(9, 24, 23);
     expect(resetMoment(yesterday, now)).toBe(`${weekday(yesterday)} ${clock(yesterday)} · now`);
+  });
+
+  test("an absolute reset always carries weekday and date, whatever day it is read", () => {
+    const reset = at(9, 25, 14);
+    const dated = new Date(reset).toLocaleDateString([], { weekday: "short", day: "numeric", month: "short" });
+    expect(resetDate(reset)).toBe(`${dated} ${clock(reset)}`);
+    expect(resetDate(reset)).not.toContain("now");
   });
 
   test("the moment pairs the clock with the time remaining", () => {

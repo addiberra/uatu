@@ -59,6 +59,17 @@ export function resetClock(resetsAt: number, now = Date.now()): string {
   return `${date.toLocaleDateString([], { weekday: "short", day: "numeric", month: "short" })} ${time}`;
 }
 
+/**
+ * The reset as an absolute moment — weekday, date, and clock ("Mon 28 Sep
+ * 14:00") — for a statement that stays in the transcript after it is made.
+ * Nothing in it is relative to when it is read, so a notice replayed a week
+ * later cannot say "today" or "now" about a moment long gone.
+ */
+export function resetDate(resetsAt: number): string {
+  const date = new Date(resetsAt);
+  return `${date.toLocaleDateString([], { weekday: "short", day: "numeric", month: "short" })} ${date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
+}
+
 /** "Thu 23:00 · in 3d 4h": the clock that survives a glance away, and whether to wait. */
 export function resetMoment(resetsAt: number, now = Date.now()): string {
   return `${resetClock(resetsAt, now)} · ${relativeReset(resetsAt, now)}`;

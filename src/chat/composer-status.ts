@@ -7,8 +7,6 @@ import { backgroundStatusLabel } from "./background-tasks";
 import { scheduledStatusLabel } from "./scheduled-wakeups";
 import { statusLabel } from "./timeline-renderer";
 import { relativeReset, resetClock, resetMoment } from "./dates";
-
-export { relativeReset, resetClock, resetMoment };
 import { isRateLimitStanding, type BackgroundTaskItem, type ScheduledWakeupItem, type ContextReportItem, type ConversationItem, type ConversationStatus, type NoticeItem, type PlanUtilization, type PlanUtilizationWindow, type SessionTotals, type UsageReadFailure } from "./types";
 
 export type ComposerRoutineState = {

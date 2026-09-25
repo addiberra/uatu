@@ -14,15 +14,17 @@ release (`v0.7.0`).
 
 - **Rate-limit reset wording (#429).** Every place a rate-limit standing
   states its reset — the plan readout's standing line, the composer chip
-  label, the assistive-technology announcement, and the timeline notice
-  renderer — uses one shared reset formatter. The reset is a bare clock time
+  label, and the assistive-technology announcement — uses one shared reset
+  formatter. The reset is a bare clock time
   only when it falls on the reader's current local calendar day; otherwise
   it carries the weekday (and the date when the weekday alone would be
   ambiguous). The readout's standing line and the announcement also state
   the relative time until the reset, matching the plan rows. The plan rows'
   existing `resetClock` switches from a "within 24 hours" rule to the same
   calendar-day rule, so a reset tomorrow evening is no longer shown as a bare
-  time that reads as today.
+  time that reads as today. A notice kept in the timeline states its reset
+  absolutely (weekday, date, and clock time, nothing relative), so it stays
+  true when read or replayed later.
 - **Day separators in conversation history (#427).** The timeline (main
   conversation and subagent drill-down, every agent) places a day separator
   at the start of each local calendar day's run of content — "Today",

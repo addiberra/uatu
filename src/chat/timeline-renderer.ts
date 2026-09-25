@@ -10,7 +10,7 @@ import { commandSubject, describeToolDetail, deriveTodoActivities, patchDiffLine
 import type { AcceptedDraft, ChatProjection } from "./projection";
 import { formatUsd } from "./usage";
 import { wakeupRowLabel } from "./scheduled-wakeups";
-import { dayLabel, fullDate, localDayKey, nextLocalMidnight, resetMoment } from "./dates";
+import { dayLabel, fullDate, localDayKey, nextLocalMidnight, resetDate } from "./dates";
 import { isLiveConversationStatus, isRateLimitStanding, type ActivityStatus, type ConversationItem, type ConversationStatus, type MessageAttachment, type PermissionOutcome, type QueuedMessage, type QuestionRequest, type RevertedUserMessage, type TokenUsage, type ToolItem } from "./types";
 
 type RenderedEntry = { node: HTMLElement; item: ConversationItem; active: boolean; variant: string; shellVariant?: string };
@@ -42,6 +42,10 @@ export class TimelineRenderer {
   // like the group lines: presentation of the items' own times, never an item.
   private readonly dayEntries = new Map<string, { node: HTMLElement; at: number }>();
   private dayRollover: ReturnType<typeof setTimeout> | undefined;
+  // The midnight the rollover timer is aimed at, and the reader's day the
+  // separators' labels were last written against.
+  private dayRolloverAt: number | undefined;
+  private labelledDay: string | undefined;
   private conversationId: string | null = null;
   // The reader's clock: "Today" is decided against it. Injectable for tests.
   now: () => number = () => Date.now();
@@ -266,12 +270,19 @@ export class TimelineRenderer {
     // member, a draft by now) that starts a new local day is preceded by that
     // day's separator — the first day included, so a reopened conversation
     // still says when it happened. An unknown time stays in the day before
-    // it; a day that recurs (clock skew) is not labelled twice.
+    // it; a day that recurs (clock skew) is not labelled twice. A time later
+    // than the reader's clock is an agent clock running ahead — nothing has
+    // happened in the future — so it is read as now: a message stamped
+    // 00:01 at the reader's 23:59 belongs under "Today", not under a
+    // separator dated tomorrow. Existing labels are only rewritten when the
+    // reader's day has changed since they were written (below), not on every
+    // streaming render.
     const renderNow = this.now();
     const liveDays = new Set<string>();
     let currentDay: string | undefined;
-    const place = (node: HTMLElement, at: number | undefined) => {
-      if (at !== undefined && knownTime(at)) {
+    const place = (node: HTMLElement, reported: number | undefined) => {
+      if (reported !== undefined && knownTime(reported)) {
+        const at = Math.min(reported, renderNow);
         const key = localDayKey(at);
         if (key !== currentDay && !liveDays.has(key)) {
           liveDays.add(key);
@@ -280,7 +291,7 @@ export class TimelineRenderer {
             day = { node: buildNode(renderDaySeparator(key, at, renderNow)), at };
             this.dayEntries.set(key, day);
             dirty.push(day.node);
-          } else labelDaySeparator(day.node, day.at, renderNow);
+          }
           ordered.push(day.node);
         }
         if (key !== currentDay) currentDay = key;
@@ -393,6 +404,12 @@ export class TimelineRenderer {
         this.dayEntries.delete(key);
       }
     }
+    // Labels are relative to the reader's day: rewrite them only when that
+    // day has changed since they were written (a tab that slept past
+    // midnight, before its timer ran), then keep one timer to the next
+    // midnight.
+    const today = localDayKey(renderNow);
+    if (today !== this.labelledDay) this.relabelDays(renderNow);
     this.armDayRollover(renderNow);
     for (const node of dirty) {
       const shell = this.shells.get(node.dataset.chatItemId ?? "");
@@ -404,19 +421,37 @@ export class TimelineRenderer {
   /**
    * "Today" becomes "Yesterday" at the reader's midnight whether or not
    * anything arrives: one timer to the next local midnight relabels the
-   * separators in place (text only), and re-arms itself. Any render also
-   * relabels, so a tab that slept past midnight is corrected either way.
+   * separators in place (text only), and re-arms itself. A render leaves a
+   * timer already aimed at the coming midnight alone, so streaming does not
+   * churn it; a render on a new day relabels (above) and re-aims it.
    */
   private armDayRollover(now: number): void {
-    if (this.dayRollover !== undefined) clearTimeout(this.dayRollover);
-    this.dayRollover = undefined;
-    if (!this.dayEntries.size) return;
+    if (!this.dayEntries.size) {
+      this.clearDayRollover();
+      return;
+    }
+    const midnight = nextLocalMidnight(now);
+    if (this.dayRollover !== undefined && this.dayRolloverAt === midnight) return;
+    this.clearDayRollover();
+    this.dayRolloverAt = midnight;
     this.dayRollover = setTimeout(() => {
       this.dayRollover = undefined;
+      this.dayRolloverAt = undefined;
       const at = this.now();
-      for (const day of this.dayEntries.values()) labelDaySeparator(day.node, day.at, at);
+      this.relabelDays(at);
       this.armDayRollover(at);
-    }, Math.max(1_000, nextLocalMidnight(now) - now + 1_000));
+    }, Math.max(1_000, midnight - now + 1_000));
+  }
+
+  private clearDayRollover(): void {
+    if (this.dayRollover !== undefined) clearTimeout(this.dayRollover);
+    this.dayRollover = undefined;
+    this.dayRolloverAt = undefined;
+  }
+
+  private relabelDays(now: number): void {
+    for (const day of this.dayEntries.values()) labelDaySeparator(day.node, day.at, now);
+    this.labelledDay = localDayKey(now);
   }
 
   private shellVariant(node: HTMLElement, itemId: string): string {
@@ -504,8 +539,8 @@ export class TimelineRenderer {
     this.draftEntries.clear();
     this.groupEntries.clear();
     this.dayEntries.clear();
-    if (this.dayRollover !== undefined) clearTimeout(this.dayRollover);
-    this.dayRollover = undefined;
+    this.clearDayRollover();
+    this.labelledDay = undefined;
     // A confirmation left open belongs to the conversation that was showing;
     // the next one starts every card at its pending choices, and a request
     // id reused elsewhere must not inherit the stage.
@@ -1163,7 +1198,10 @@ export function renderItem(item: ConversationItem, open: boolean, activeRequest:
   }
   if (item.type === "notice") {
     // A reset time is formatted here, in the reader's zone, never on the server.
-    const resets = item.resetsAt === undefined ? "" : ` Resets ${resetMoment(item.resetsAt)}.`;
+    // Absolute (weekday, date, clock) and never relative: the notice stays in
+    // the transcript and is not re-rendered as time passes, so "in 2h" or a
+    // bare "14:00" would be wrong the moment it is read later or replayed.
+    const resets = item.resetsAt === undefined ? "" : ` Resets ${resetDate(item.resetsAt)}.`;
     return `<aside class="chat-item chat-notice is-${item.level}" data-chat-item-id="${id}"${stamp}${item.code ? ` data-notice-code="${escapeHtmlAttribute(item.code)}"` : ""} role="${item.level === "error" ? "alert" : "status"}">${escapeHtml(item.message + resets)}</aside>`;
   }
   // Compaction is a boundary, not a step: a quiet rule across the timeline
@@ -1703,10 +1741,12 @@ function daySeparatorAriaLabel(at: number, now: number): string {
 }
 
 // Not an item: no data-chat-item-id, so anchoring, item actions, copy, and
-// find-reveal pass over it. Sticky in the scroller (styles), so the day being
+// find-reveal pass over it. Not searchable either (data-find-skip): ⌘F finds
+// what was said, and "Today" relabelling to "Yesterday" at midnight must not
+// shift the match count under an open find bar. Sticky in the scroller (styles), so the day being
 // read stays named while scrolling back through it.
 function renderDaySeparator(key: string, at: number, now: number): string {
-  return `<div class="chat-day-separator" data-chat-day="${escapeHtmlAttribute(key)}" role="separator" aria-label="${escapeHtmlAttribute(daySeparatorAriaLabel(at, now))}"><time datetime="${escapeHtmlAttribute(key)}">${escapeHtml(dayLabel(at, now))}</time></div>`;
+  return `<div class="chat-day-separator" data-find-skip data-chat-day="${escapeHtmlAttribute(key)}" role="separator" aria-label="${escapeHtmlAttribute(daySeparatorAriaLabel(at, now))}"><time datetime="${escapeHtmlAttribute(key)}">${escapeHtml(dayLabel(at, now))}</time></div>`;
 }
 
 function labelDaySeparator(node: HTMLElement, at: number, now: number): void {

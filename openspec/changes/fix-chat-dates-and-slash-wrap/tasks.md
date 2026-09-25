@@ -1,6 +1,6 @@
 ## 1. Rate-limit reset names its day (#429)
 
-- [x] 1.1 In `src/chat/dates.ts` (a new leaf module that `composer-status.ts` re-exports from, which avoids a composer-status ↔ timeline-renderer import cycle), switch `resetClock` to the local calendar-day rule (same day → `HH:MM`; 1–6 days → weekday + time; ≥7 days → weekday + day + month + time) and add `resetMoment(resetsAt, now)` (`<clock> · <relative>`) and `standingSentence(standing, now)`; verify with new `composer-status.test.ts` cases for later-today, 23:30→06:00 next day, 3 days out, 7+ days out, past reset, and a DST-boundary day, all with an injected `now`
+- [x] 1.1 In `src/chat/dates.ts` (a new leaf module that `composer-status.ts` imports from, which avoids a composer-status ↔ timeline-renderer import cycle), switch `resetClock` to the local calendar-day rule (same day → `HH:MM`; 1–6 days → weekday + time; ≥7 days → weekday + day + month + time) and add `resetMoment(resetsAt, now)` (`<clock> · <relative>`) and `standingSentence(standing, now)`; verify with new `composer-status.test.ts` cases for later-today, 23:30→06:00 next day, 3 days out, 7+ days out, past reset, and a DST-boundary day, all with an injected `now`
 - [x] 1.2 Make `rateLimitBadgeLabel` use `resetClock` and update `planReadoutRows` expectations; verify `bun test src/chat/composer-status.test.ts` passes, including a chip label that names the weekday for a next-day reset
 - [x] 1.3 In `src/chat/ui.ts`, replace the inline `toLocaleTimeString` reset text in the readout standing line (~2048) and the `rateLimitLive` announcement (~2171) with `standingSentence`; verify by grep that no `Resets ${new Date(` remains in `src/chat/ui.ts`
 - [x] 1.4 In `src/chat/timeline-renderer.ts`, format the notice renderer's reset (~997) with `resetClock` + `relativeReset`; verify a `timeline-renderer.test.ts` case for a notice with a next-day `resetsAt` renders the weekday
@@ -24,3 +24,14 @@
 
 - [x] 4.1 Run `bun test` and `bun test:e2e` (or the touched chat e2e files) and verify both pass; capture PR screenshots with `UATU_E2E_SCREENSHOTS_DIR=openspec/changes/fix-chat-dates-and-slash-wrap/screenshots`
 - [x] 4.2 Run `openspec validate fix-chat-dates-and-slash-wrap --strict` and verify it reports the change as valid
+
+## 5. Review follow-ups
+
+- [x] 5.1 State a timeline notice's reset absolutely (`resetDate`: weekday, date, clock; no relative part); verify `dates.test.ts` and the renderer notice test
+- [x] 5.2 Reserve the pinned separator as the timeline's `scroll-padding-top` and use it as the prompt rail's jump offset; verify in `chat.e2e.ts` that a rail jump and a ⌘F match land below the pinned band
+- [x] 5.3 Pin the separator band to the scroller's top edge (negative `top`, own top padding) with no shadow or negative margin reaching outside its box; verify in `chat.e2e.ts` that an unstuck separator does not overlap the previous row
+- [x] 5.4 Mark separators `data-find-skip`, skip them in the find text index, and ignore mutations confined to them; verify `text-index.test.ts`, `preview-engine.test.ts`, and the find counts in `chat.e2e.ts`
+- [x] 5.5 Lay slash options out as a wrapping flex row so the hint drops below a long name; verify the touch e2e hint width
+- [x] 5.6 Read a time ahead of the reader's clock as now; verify a renderer test at 23:59 with 00:01/00:04 items
+- [x] 5.7 Relabel separators and re-aim the midnight timer only when the reader's day changes; verify a renderer test over repeated streaming renders
+- [x] 5.8 Drop `composer-status.ts`'s re-export of the date helpers; point its test at `src/chat/dates.ts`

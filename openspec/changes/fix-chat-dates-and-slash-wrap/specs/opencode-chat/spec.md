@@ -7,15 +7,21 @@ each run of content that happened on one local calendar day of the reader,
 including the first day shown. Content with no known time — none
 reported, or a placeholder time before the year 2001 — SHALL be treated as
 belonging to the day of the content before it and SHALL NOT start a
-separator. A separator SHALL read "Today" or "Yesterday" for those days,
+separator. Content whose reported time is later than the reader's clock
+SHALL be treated as happening now, so that no separator names a day after
+the reader's current day. A separator SHALL read "Today" or "Yesterday" for those days,
 and otherwise the weekday and date, adding the year when it is not the
 current year; dates and weekdays SHALL be formatted in the reader's locale
 and time zone. Replayed or paged-in history SHALL be separated by the same
 rule as live content, from the times each agent reports for it. While the
 reader scrolls through a day's content, that day's separator SHALL remain
 visible at the top of the transcript until the next day's separator
-replaces it. Separators SHALL NOT be treated as timeline items: they SHALL
-NOT participate in scroll anchoring, activity grouping, or item actions.
+replaces it. Content scrolled to — by prompt navigation, by revealing an
+item, or by find — SHALL come to rest below the pinned separator rather
+than under it, and a separator that is not pinned SHALL NOT cover any part
+of the content before it. Separators SHALL NOT be treated as timeline
+items: they SHALL NOT participate in scroll anchoring, activity grouping,
+item actions, or find matches.
 When the reader's local day changes while a conversation is shown, the
 existing separators SHALL be relabelled without waiting for new content.
 
@@ -42,6 +48,20 @@ existing separators SHALL be relabelled without waiting for new content.
 - **WHEN** two messages were sent at 23:50 and 00:10 in the reader's time zone
 - **THEN** a day separator appears between them, regardless of the agent's or server's time zone
 
+#### Scenario: A time slightly ahead of the reader's clock is today
+- **WHEN** it is 23:59 for the reader and a message arrives stamped 00:01 of the next day by an agent whose clock runs ahead
+- **THEN** the message appears under the "Today" separator
+- **AND** no separator names the next day
+
+#### Scenario: Scrolled-to content is not hidden under the pinned day
+- **WHEN** the reader jumps to a prompt, or find reveals a match, inside a day whose separator is pinned at the top of the transcript
+- **THEN** the prompt or the match comes to rest below the pinned separator
+
+#### Scenario: Find does not match day separators
+- **WHEN** the reader searches the conversation for "Today" or "Yesterday"
+- **THEN** only occurrences in the conversation's content are counted, not the separators' labels
+- **AND** a separator relabelled at midnight does not change the count of an open search
+
 #### Scenario: Labels roll over at midnight
 - **WHEN** a conversation stays open across the reader's local midnight
 - **THEN** the separator that read "Today" reads "Yesterday" and the one that read "Yesterday" reads the weekday and date, without new content arriving
@@ -56,7 +76,9 @@ description, and argument hint onto further lines rather than truncating
 them, and every suggestion SHALL show its complete description whether or
 not it is highlighted. The suggestion list SHALL remain scrollable, SHALL
 NOT scroll horizontally in desktop or touch layouts, and SHALL keep the
-highlighted suggestion in view as the highlight moves.
+highlighted suggestion in view as the highlight moves. When a long command
+name leaves too little room beside it, the argument hint SHALL move onto
+its own line rather than wrapping into a narrow column.
 
 #### Scenario: A long description wraps
 - **WHEN** the user types `/code` and the agent offers `/code-review` with a description longer than one line of the suggestion list
@@ -73,3 +95,7 @@ highlighted suggestion in view as the highlight moves.
 #### Scenario: Both agents wrap alike
 - **WHEN** a Claude Code conversation and an OpenCode conversation each offer a command with a long description
 - **THEN** both suggestion lists wrap that description the same way
+
+#### Scenario: A long name does not squeeze the argument hint
+- **WHEN** a narrow touch layout offers a command whose name is nearly as wide as the suggestion list, with an argument hint
+- **THEN** the argument hint is shown on its own line at a readable width rather than wrapping one character per line

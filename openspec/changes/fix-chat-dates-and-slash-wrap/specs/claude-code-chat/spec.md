@@ -12,7 +12,10 @@ SHALL be stated as the clock time alone. The readout's standing line and
 the announcement SHALL also state the time remaining until the reset,
 phrased as the readout's plan windows phrase it. The plan windows' own
 reset times SHALL follow the same day rule, so that no reset on a later
-day is ever shown as a bare clock time that reads as today.
+day is ever shown as a bare clock time that reads as today. A reset stated
+in a notice kept in the conversation timeline SHALL be stated absolutely,
+with its weekday, date, and clock time, and SHALL NOT state a time
+remaining, so that it stays true when read or replayed later.
 
 #### Scenario: A reset later today is a bare time
 - **WHEN** a rate-limit warning stands whose reset falls later on the reader's current local day at 23:00
@@ -40,3 +43,8 @@ day is ever shown as a bare clock time that reads as today.
 #### Scenario: The announcement carries the day
 - **WHEN** a rate-limit standing whose reset falls on a later local day begins or changes level
 - **THEN** the announcement made to assistive technology names the reset's day, clock time, and the time remaining
+
+#### Scenario: A timeline notice's reset stays true later
+- **WHEN** the timeline shows a notice whose reset was stated earlier, and the reader reads or replays it after that reset has passed
+- **THEN** the notice states the reset's weekday, date, and clock time
+- **AND** it does not state a time remaining, such as "now" or "in 2h 05m"

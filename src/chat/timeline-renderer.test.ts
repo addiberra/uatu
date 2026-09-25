@@ -2379,14 +2379,68 @@ describe("day separators", () => {
     }
   });
 
-  test("a notice's reset on a later day names the weekday", () => {
+  test("a notice's reset is stated absolutely, so it is still true when replayed later", () => {
     const element = host();
-    // The notice reads against the real clock: three local days out, at noon.
-    const today = new Date();
-    const reset = new Date(today.getFullYear(), today.getMonth(), today.getDate() + 3, 12).getTime();
-    renderer().render(element, projectionWith([{ id: "notice:x", type: "notice", createdAt: local(25, 9), level: "warning", message: "Heads up.", resetsAt: reset }], { status: "idle" }), new Set());
-    const weekday = new Date(reset).toLocaleDateString([], { weekday: "short" });
+    // Rendered long after the reset: nothing relative ("now", "in 2h", a bare
+    // "today" clock) may be baked into the durable notice.
+    const reset = local(21, 14);
+    renderer().render(element, projectionWith([{ id: "notice:x", type: "notice", createdAt: local(21, 9), level: "warning", message: "Heads up.", resetsAt: reset }], { status: "idle" }), new Set());
+    const date = new Date(reset).toLocaleDateString([], { weekday: "short", day: "numeric", month: "short" });
     const clock = new Date(reset).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-    expect(element.querySelector(".chat-notice")!.textContent).toMatch(new RegExp(`^Heads up\\. Resets ${weekday} ${clock.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} · in \\d+d \\d+h\\.$`));
+    expect(element.querySelector(".chat-notice")!.textContent).toBe(`Heads up. Resets ${date} ${clock}.`);
+  });
+
+  test("separators are skipped by find", () => {
+    const element = host();
+    renderer().render(element, projectionWith([user("a", local(25, 9))], { status: "idle" }), new Set());
+    expect(element.querySelector(".chat-day-separator")!.hasAttribute("data-find-skip")).toBe(true);
+  });
+
+  test("a time ahead of the reader's clock is read as now, never as a later day", () => {
+    const element = host();
+    const view = renderer();
+    const late = local(25, 23, 59);
+    view.now = () => late;
+    // The agent's clock runs a few minutes ahead, past the reader's midnight.
+    view.render(element, projectionWith([user("a", local(25, 20)), answer("a", local(26, 0, 3)), user("b", local(26, 0, 4))], { status: "idle" }), new Set());
+    expect(outline(element)).toEqual(["day:Today", "message:a", "part:a", "message:b"]);
+  });
+
+  test("streaming renders neither rewrite labels nor re-aim the midnight timer; a new day does", () => {
+    const timers: Array<{ callback: () => void; delay: number }> = [];
+    let cleared = 0;
+    const realSetTimeout = globalThis.setTimeout;
+    const realClearTimeout = globalThis.clearTimeout;
+    Reflect.set(globalThis, "setTimeout", (callback: () => void, delay: number) => { timers.push({ callback, delay }); return timers.length as unknown as ReturnType<typeof setTimeout>; });
+    Reflect.set(globalThis, "clearTimeout", () => { cleared += 1; });
+    try {
+      const element = host();
+      const view = renderer();
+      let clock = local(25, 10);
+      view.now = () => clock;
+      const items = [user("a", local(24)), user("b", local(25))];
+      view.render(element, projectionWith(items, { status: "idle" }), new Set());
+      expect(timers).toHaveLength(1);
+      const today = element.querySelector<HTMLElement>('[data-chat-day="2026-09-25"] time')!;
+      // A marker text: any relabel on the next renders would overwrite it.
+      today.textContent = "untouched";
+      for (let tick = 1; tick <= 5; tick++) {
+        clock = local(25, 10) + tick * 50;
+        view.render(element, projectionWith([...items, answer("b", local(25, 10))], { status: "running" }), new Set());
+      }
+      expect(timers).toHaveLength(1);
+      expect(cleared).toBe(0);
+      expect(today.textContent).toBe("untouched");
+      // The tab slept past midnight and its timer has not run yet: the next
+      // render relabels and aims at the following midnight.
+      clock = local(26, 8);
+      view.render(element, projectionWith([...items, answer("b", local(25, 10))], { status: "idle" }), new Set());
+      expect(outline(element)).toEqual([`day:${longDate(local(24))}`, "message:a", "day:Yesterday", "message:b", "part:b"]);
+      expect(timers).toHaveLength(2);
+      expect(timers.at(-1)!.delay).toBe(16 * 3_600_000 + 1_000);
+    } finally {
+      Reflect.set(globalThis, "setTimeout", realSetTimeout);
+      Reflect.set(globalThis, "clearTimeout", realClearTimeout);
+    }
   });
 });

@@ -1197,7 +1197,13 @@ test("day separators and wrapped slash-command descriptions fit the touch layout
   await expect(menu.getByRole("option")).toHaveCount(1);
   const measured = await menu.evaluate(element => {
     const description = element.querySelector<HTMLElement>(".chat-command-description")!;
+    const hint = element.querySelector<HTMLElement>(".chat-command-hint")!;
+    const lineHeight = parseFloat(getComputedStyle(hint).fontSize) * 1.6;
     return {
+      // Beside a name too long to leave it room, the hint drops to its own
+      // line rather than wrapping a character per line in a sliver.
+      hintWidth: hint.getBoundingClientRect().width,
+      hintLines: Math.round(hint.getBoundingClientRect().height / lineHeight),
       horizontal: element.scrollWidth - element.clientWidth,
       text: description.textContent,
       clipped: description.scrollHeight > description.clientHeight + 1 || description.scrollWidth > description.clientWidth + 1,
@@ -1206,5 +1212,7 @@ test("day separators and wrapped slash-command descriptions fit the touch layout
   expect(measured.horizontal).toBeLessThanOrEqual(1);
   expect(measured.text).toContain("End of review.");
   expect(measured.clipped).toBe(false);
+  expect(measured.hintWidth).toBeGreaterThanOrEqual(120);
+  expect(measured.hintLines).toBeLessThanOrEqual(2);
   await captureScreenshot(page, testInfo, "touch-slash-command-descriptions-wrap");
 });

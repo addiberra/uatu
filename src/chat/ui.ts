@@ -1571,8 +1571,11 @@ export function initChat(api = new ChatApiClient()): void {
     if (!node) return null;
     parentScroll.pause();
     const bounds = timeline.getBoundingClientRect();
+    // Land below the scroller's reserved top band — the pinned day separator
+    // when there is one — rather than under it.
+    const reserved = items.querySelector(".chat-day-separator") ? Number.parseFloat(getComputedStyle(timeline).scrollPaddingTop) || 8 : 8;
     timeline.scrollTo({
-      top: timeline.scrollTop + node.getBoundingClientRect().top - bounds.top - 8,
+      top: timeline.scrollTop + node.getBoundingClientRect().top - bounds.top - reserved,
       behavior: smooth && !reducedMotion() ? "smooth" : "auto",
     });
     return node;

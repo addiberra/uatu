@@ -104,8 +104,14 @@ Add `resetMoment(resetsAt, now)` next to it, returning
   `composer-status.ts`, which replaces the two inline copies in `ui.ts`.
 - Chip (`rateLimitBadgeLabel`): `resets ${resetClock}` only. The chip is
   space-constrained, and the day is the part that removes the ambiguity.
-- Timeline notice renderer: same `resetClock` + `relativeReset` for
-  consistency.
+- Timeline notice renderer: an absolute `resetDate(resetsAt)` —
+  `"<short weekday> <day> <short month> HH:MM"` — with no relative part and
+  no bare same-day clock. A notice is a durable timeline item: it is
+  rendered once and kept (and replayed with history), so a relative "in 2h
+  05m" or a bare "14:00" baked at render time would read wrongly later
+  ("Resets Mon 14:00 · now" on a week-old notice). Refreshing it on a tick
+  was rejected as more machinery for a path that rate-limit standings,
+  filtered from the timeline, mostly do not reach.
 
 Local-day comparison compares `new Date(x)` year/month/date in the local
 zone. It does not use the difference in ms, so DST days (23/25 h) are
@@ -128,7 +134,14 @@ local day key (`YYYY-MM-DD` in the local zone) of each top-level unit:
 - the awaiting line uses no time and never starts a day
 
 When a unit's day differs from the previous unit's day, including the
-first unit, the renderer pushes a separator node before it. A time counts
+first unit, the renderer pushes a separator node before it. A time later
+than the reader's clock at render time is read as the render time: nothing
+has happened in the future, so it is an agent clock running ahead of the
+browser. Clamping every future time (rather than only a few minutes of it)
+is the simplest rule that never creates a separator dated after "Today";
+near midnight a message stamped 00:01 by an agent at the reader's 23:59
+stays under "Today" and moves to the new day on the first render after
+midnight. A time counts
 as unknown when it is non-finite or earlier than `1e12` ms
 (2001-09-09): missing times arrive as `0`, and anything that early is a
 placeholder or a seconds-for-milliseconds slip. Dating that content
@@ -143,10 +156,14 @@ day and never starts a separator.
   skew ever makes a day recur, the second occurrence is skipped, so a
   day is never labelled twice.
 - Markup:
-  `<div class="chat-day-separator" data-chat-day="2026-09-25" role="separator" aria-label="Today, Friday 25 September"><time datetime="2026-09-25">Today</time></div>`.
+  `<div class="chat-day-separator" data-find-skip data-chat-day="2026-09-25" role="separator" aria-label="Today, Friday 25 September"><time datetime="2026-09-25">Today</time></div>`.
   It has no `data-chat-item-id`, so anchoring, `[data-chat-item-id]`
   delegation, copy actions, and item find-reveal all ignore it
-  automatically.
+  automatically. `data-find-skip` is a generic marker the find text index
+  (`src/find/text-index.ts`) skips, and the find engine's mutation observer
+  ignores changes confined to such an element: ⌘F finds what was written,
+  not "Today", and a midnight relabel cannot shift the match count under an
+  open find bar.
 - Label: "Today" / "Yesterday" by local-day difference from `now`.
   Otherwise `toLocaleDateString([], { weekday: "long", day: "numeric", month: "long" })`,
   with `year: "numeric"` added when the year differs from `now`'s. The
@@ -159,18 +176,33 @@ day and never starts a separator.
   keeps one `setTimeout` to the next local midnight (+1 s). The timer
   relabels existing `dayEntries` in place, changing text and aria-label
   only, with no re-render and no layout change beyond the label. The timer
-  is cleared on `reset` and re-armed on each render. Any render also
-  relabels. A tab that sleeps past midnight gets a late timer or the next
-  render, both of which correct the labels.
+  is cleared on `reset` or when no separator is left. A render leaves a
+  timer already aimed at the coming midnight alone and does not relabel,
+  so streaming re-renders (~50 ms) neither rewrite labels nor churn the
+  timer; the renderer remembers the reader's day its labels were written
+  against, and a render on a different day (a tab that slept past midnight
+  before its timer ran) relabels and re-aims the timer.
 
-**Sticky vs. static separators.** Separators get
-`position: sticky; top: 0` inside the `.chat-timeline` scroller. All
-separators are siblings in `#chat-items` and share one containing block, so
-every separator already passed stays pinned. For that reason the separator
-row is a full-width opaque `var(--surface)` band, whose upward box-shadow
-also covers the scroller's top padding. The newest pinned separator then
-paints over the earlier ones entirely, and a wider earlier pill cannot peek
-out behind it. This gives the "which day am I reading" context
+**Sticky vs. static separators.** Separators are `position: sticky`
+inside the `.chat-timeline` scroller. All separators are siblings in
+`#chat-items` and share one containing block, so every separator already
+passed stays pinned. For that reason the separator row is a full-width
+opaque `var(--surface)` band of one fixed height; the newest pinned
+separator then paints over the earlier ones entirely, and a wider earlier
+pill cannot peek out behind it. A sticky box pins at the scroller's padding
+edge, which would leave the scroller's top padding as a strip where content
+shows through above the band. The band therefore pins that far higher
+(`top: calc(-1 * var(--chat-timeline-inset-top))`) and carries the same
+padding itself, so when stuck it reaches the scroller's top edge. It paints
+nothing outside its own box (no shadow, no negative margin), so an unstuck
+separator never covers the end of the previous day's last row; the cost is
+a little more space above an in-flow separator.
+
+Because the pinned band covers the top of the scroller, every scroll to a
+target must land below it: while separators exist the scroller's
+`scroll-padding-top` is the band's height plus a small gap. The coordinated
+scroll's reveal and the ⌘F match reveal already honour
+`scroll-padding-top`, and the prompt rail's jump uses it as its offset. This gives the "which day am I reading" context
 the issue asks for without a scroll listener or an extra floating element.
 The main timeline and the drill-down both get it, since both scroll
 `.chat-timeline`-like containers. The implementer must check the scroller's
@@ -198,10 +230,13 @@ decision: always wrap fully, with no clamp.
   `overflow: hidden` and `text-overflow: ellipsis`. Add `white-space:
   normal; overflow-wrap: anywhere` so long unbroken paths and URLs also
   wrap.
-- The grid's first column is `minmax(max-content, auto)`, which lets a very
-  long command name force horizontal overflow on a narrow touch panel.
-  Change it to `minmax(0, max-content)` and give the name
-  `overflow-wrap: anywhere`.
+- The option's two-column grid (`minmax(max-content, auto) 1fr`) let a very
+  long command name force horizontal overflow on a narrow touch panel, and
+  a shrinkable name column would instead squeeze the argument hint into a
+  sliver wrapping one character per line. The option becomes a wrapping
+  flex row: the name shrinks and wraps (`overflow-wrap: anywhere`), the
+  hint has an 8rem flex basis so it drops onto its own line when less is
+  left beside the name, and the description takes a full line.
 - Keyboard highlight: the existing
   `scrollIntoView({ block: "nearest" })` on the active option already
   keeps a tall highlighted option in view inside the scrolling menu
@@ -222,16 +257,18 @@ descriptions show fewer suggestions per screen, and the menu scrolls.
   assertions look past separators. The e2e order check in
   `chat-claude-polish.e2e.ts:167` already selects `[data-chat-item-id]`.
 - [A sticky separator may overlap the first line of content, or the
-  jump-to-latest / requests pill] → Give the separator a compact height
-  and an opaque background, and verify in both desktop split and touch
-  layouts in e2e screenshots.
-- [Find-in-surface would match "Today" / weekday text] → Acceptable, since
-  the text is visible. The separator is not an item, so reveal logic is
-  unaffected.
+  jump-to-latest / requests pill] → Give the separator a compact fixed
+  height and an opaque background, reserve it as `scroll-padding-top` so
+  scrolled-to targets land below it, and verify in both desktop split and
+  touch layouts in e2e screenshots.
+- [Find-in-surface would match "Today" / weekday text, and a midnight
+  relabel would shift the count under an open bar] → Separators carry
+  `data-find-skip` and are excluded from the chat find index.
 - [Clock skew between agent and client, or items with a fallback
   `Date.now()`, could put a live item on a different day than its
-  neighbours] → The separator reflects what the item claims. Skipping a
-  recurring day key prevents duplicate labels.
+  neighbours] → The separator reflects what the item claims, except that a
+  time ahead of the reader's clock is read as now. Skipping a recurring day
+  key prevents duplicate labels.
 - [Very long skill descriptions make each suggestion tall] → The menu is
   height-capped and scrolls, and the highlighted suggestion is scrolled
   into view. This was accepted by the user decision.
