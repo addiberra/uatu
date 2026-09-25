@@ -259,9 +259,14 @@ test.describe("desktop OpenCode chat", () => {
       const older = new Date(at(2, 9));
       return { older: at(2, 9), yesterday: at(1, 9), today: at(0, 0) + 60_000, olderLabel: older.toLocaleDateString([], { weekday: "long", day: "numeric", month: "long", ...(older.getFullYear() === today.getFullYear() ? {} : { year: "numeric" }) }) };
     });
-    const run = (prefix: string, start: number, count: number): ConversationItem[] => Array.from({ length: count }, (_, index) => ({
-      id: `message:${prefix}-${index}`, type: "user_message", createdAt: start + index * 60_000, text: `${prefix} message ${index} ${"content ".repeat(14)}`,
-    }));
+    // Prompts alternate with full-width replies, so there is transcript text
+    // beside a pinned label as well as under it.
+    const run = (prefix: string, start: number, count: number): ConversationItem[] => Array.from({ length: count }, (_, index) => {
+      const text = `${prefix} message ${index} ${"content ".repeat(14)}`;
+      return index % 2
+        ? { id: `message:${prefix}-${index}`, type: "assistant_message", createdAt: start + index * 60_000, markdown: text }
+        : { id: `message:${prefix}-${index}`, type: "user_message", createdAt: start + index * 60_000, text };
+    });
     const seeded = await control(request, { action: "seed", title: "Dated", items: [...run("older", days.older, 3), ...run("yesterday", days.yesterday, 24), ...run("today", days.today, 3)] }) as { conversation: { id: string } };
     await page.reload();
     await openChatPanel(page);
@@ -277,20 +282,73 @@ test.describe("desktop OpenCode chat", () => {
     // Scroll back into the middle of yesterday: its separator stays pinned at the top.
     const timeline = page.locator("#chat-timeline");
     await page.locator('[data-chat-item-id="message:yesterday-14"]').evaluate(element => element.scrollIntoView({ block: "center" }));
-    const pinned = async () => timeline.evaluate(element => {
+    // The labels a reader sees at the top of the transcript. Every day already
+    // passed is pinned there too, but only the latest one's label is shown.
+    const pinnedLabels = async () => timeline.evaluate(element => {
       const top = element.getBoundingClientRect().top;
-      const candidates = [...element.querySelectorAll<HTMLElement>(".chat-day-separator")].filter(separator => {
-        const bounds = separator.getBoundingClientRect();
-        return bounds.top >= top - 1 && bounds.top <= top + 24;
-      });
-      // Later separators paint over earlier ones; the last pinned one is what the reader sees.
-      return candidates.at(-1)?.textContent ?? null;
+      return [...element.querySelectorAll<HTMLElement>(".chat-day-separator time")].filter(label => {
+        const bounds = label.getBoundingClientRect();
+        return bounds.top >= top - 1 && bounds.top <= top + 60 && getComputedStyle(label).visibility === "visible";
+      }).map(label => label.textContent);
     });
-    await expect.poll(pinned).toBe("Yesterday");
+    await expect.poll(pinnedLabels).toEqual(["Yesterday"]);
+    await expect(separators.first()).toHaveAttribute("data-superseded", "");
+
+    // Only the label covers the transcript: beside it, the text scrolled under
+    // the pinned row is what a tap or a selection reaches.
+    // Scrolled and measured in one task, and retried, so a settling scroll
+    // cannot move the reply between the two.
+    const beside = () => separators.nth(1).evaluate(separator => {
+      const timeline = separator.closest<HTMLElement>("#chat-timeline")!;
+      const replyNode = document.querySelector<HTMLElement>('[data-chat-item-id="message:yesterday-15"]')!;
+      timeline.scrollTop += replyNode.getBoundingClientRect().top - timeline.getBoundingClientRect().top - 4;
+      const label = separator.querySelector("time")!.getBoundingClientRect();
+      const row = separator.getBoundingClientRect();
+      const reply = replyNode.getBoundingClientRect();
+      const y = label.top + label.height / 2;
+      const hit = (x: number) => {
+        const element = document.elementFromPoint(x, y);
+        return { separator: !!element?.closest(".chat-day-separator"), item: element?.closest<HTMLElement>("[data-chat-item-id]")?.dataset.chatItemId ?? null };
+      };
+      return {
+        background: getComputedStyle(separator).backgroundColor,
+        pointerEvents: getComputedStyle(separator).pointerEvents,
+        underRow: reply.top < y && reply.bottom > y && row.top <= y && row.bottom >= y,
+        left: hit(Math.max(row.left, reply.left) + 12),
+        right: hit(Math.min(row.right, reply.right) - 12),
+        label: hit(label.left + label.width / 2).separator,
+      };
+    });
+    await expect.poll(beside).toEqual({
+      background: "rgba(0, 0, 0, 0)",
+      pointerEvents: "none",
+      underRow: true,
+      left: { separator: false, item: "message:yesterday-15" },
+      right: { separator: false, item: "message:yesterday-15" },
+      label: true,
+    });
     await captureScreenshot(page, testInfo, "chat-day-separator-sticky");
+
+    // Two days' separators near the top at once: yesterday's arriving under the
+    // older day's pinned label. Only one label shows, never one behind another.
+    await timeline.evaluate(element => {
+      element.scrollTop = 0;
+      const arriving = element.querySelectorAll<HTMLElement>(".chat-day-separator")[1]!;
+      element.scrollTop += arriving.getBoundingClientRect().top - element.getBoundingClientRect().top - 8;
+    });
+    const nearTop = () => timeline.evaluate(element => {
+      const top = element.getBoundingClientRect().top;
+      const labels = [...element.querySelectorAll<HTMLElement>(".chat-day-separator time")].map(label => ({ label, bounds: label.getBoundingClientRect() }));
+      return {
+        near: labels.filter(({ bounds }) => bounds.top <= top + 60).length,
+        visible: labels.filter(({ label, bounds }) => bounds.top <= top + 60 && getComputedStyle(label).visibility === "visible").map(({ label }) => label.textContent),
+      };
+    });
+    await expect.poll(nearTop).toEqual({ near: 2, visible: ["Yesterday"] });
     // Past yesterday's first message, the older day's separator takes over.
     await timeline.evaluate(element => { element.scrollTop = 0; });
-    await expect.poll(pinned).toBe(days.olderLabel);
+    await expect.poll(pinnedLabels).toEqual([days.olderLabel]);
+    await expect(separators.first()).not.toHaveAttribute("data-superseded", /.*/);
 
     // An unstuck separator paints only its own box: it never reaches over
     // the end of the previous day's last row.
@@ -304,7 +362,7 @@ test.describe("desktop OpenCode chat", () => {
       expect(separator.shadow).toBe("none");
     }
 
-    // Whatever is scrolled to lands below the pinned band, not under it.
+    // Whatever is scrolled to lands below the pinned row, not under its label.
     const clearOfBand = (id: string) => page.evaluate(target => {
       const timeline = document.querySelector<HTMLElement>("#chat-timeline")!;
       const top = timeline.getBoundingClientRect().top;
@@ -318,7 +376,7 @@ test.describe("desktop OpenCode chat", () => {
     await expect.poll(() => clearOfBand("message:yesterday-16")).toBeGreaterThanOrEqual(0);
     await expect.poll(() => clearOfBand("message:yesterday-16")).toBeLessThan(40);
 
-    // ⌘F: a match whose line sits under the pinned band is revealed below it,
+    // ⌘F: a match whose line sits under the pinned row is revealed below it,
     // and the separators' own labels are not matches.
     await page.locator('[data-chat-item-id="message:yesterday-20"]').evaluate(element => {
       const timeline = element.closest<HTMLElement>("#chat-timeline")!;

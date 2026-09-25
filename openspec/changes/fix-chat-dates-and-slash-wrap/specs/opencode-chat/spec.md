@@ -16,7 +16,10 @@ and time zone. Replayed or paged-in history SHALL be separated by the same
 rule as live content, from the times each agent reports for it. While the
 reader scrolls through a day's content, that day's separator SHALL remain
 visible at the top of the transcript until the next day's separator
-replaces it. Content scrolled to — by prompt navigation, by revealing an
+replaces it. Only the pinned separator's label SHALL cover the
+transcript: content beside the label SHALL stay visible and reachable by
+taps and selection, and at most one day's label SHALL be visible at the top
+at a time. Content scrolled to — by prompt navigation, by revealing an
 item, or by find — SHALL come to rest below the pinned separator rather
 than under it, and a separator that is not pinned SHALL NOT cover any part
 of the content before it. Separators SHALL NOT be treated as timeline
@@ -43,6 +46,11 @@ existing separators SHALL be relabelled without waiting for new content.
 - **WHEN** the reader scrolls up through a long day of content so that its separator has scrolled out of view
 - **THEN** that day's separator remains visible at the top of the transcript
 - **AND** it is replaced by the earlier day's separator once the reader scrolls past that day's boundary
+
+#### Scenario: Only the day label covers the transcript
+- **WHEN** a day's separator is pinned at the top of the transcript while the reader scrolls through that day
+- **THEN** the transcript text to the left and right of the label stays visible and can be tapped or selected
+- **AND** when the next day's separator reaches the top, only one day's label is visible, never one behind the other
 
 #### Scenario: Separators follow the reader's time zone
 - **WHEN** two messages were sent at 23:50 and 00:10 in the reader's time zone

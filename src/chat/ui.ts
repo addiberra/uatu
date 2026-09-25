@@ -50,6 +50,7 @@ import { copyChatText } from "./copy-actions";
 import { announceConversationInventory, renderConversationInventoryAwareness, renderSelectedConversationDeleted } from "./inventory-presentation";
 import { ConversationInventoryTracker, SerializedInventoryReconciler, conversationActivitySuffix, conversationDayGroup, dedupeConversationInventory, isConversationChooserActivationKey, patchConversationOptions, retainedPresentationConversationIds } from "./inventory-reconciler";
 import { nextLocalMidnight } from "./dates";
+import { watchPinnedDayLabels } from "./pinned-day";
 
 const PRESENTATION_KEY = "uatu:chat-presentation";
 const SAVE_DEBOUNCE_MS = 400;
@@ -4408,6 +4409,9 @@ export function initChat(api = new ChatApiClient()): void {
   observer?.observe(timeline);
   if (drilldownItems) observer?.observe(drilldownItems);
   if (drilldownTimeline) observer?.observe(drilldownTimeline);
+  // Only the day being read keeps its pinned label; see pinned-day.ts.
+  watchPinnedDayLabels(timeline, items);
+  if (drilldownItems && drilldownTimeline) watchPinnedDayLabels(drilldownTimeline, drilldownItems);
   viewport.start();
   // The draft is saved on every hide, persisted or not: a frozen page can be
   // discarded later without ever running code again. Nothing else happens

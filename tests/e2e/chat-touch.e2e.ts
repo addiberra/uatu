@@ -1193,19 +1193,38 @@ test("day separators and wrapped slash-command descriptions fit the touch layout
   // which shares the browser's zone.
   const now = new Date();
   const at = (offset: number, hour: number) => new Date(now.getFullYear(), now.getMonth(), now.getDate() - offset, hour, 0).getTime();
+  // Each prompt gets a full-width reply, so there is transcript text beside
+  // the pinned label.
+  const withReplies = (prompts: ConversationItem[]): ConversationItem[] => prompts.flatMap(prompt => [prompt, {
+    id: `${prompt.id}-reply`, type: "assistant_message" as const, createdAt: prompt.createdAt, markdown: `Reply ${"to the prompt above, at full width ".repeat(3)}`,
+  }]);
   const items: ConversationItem[] = [
-    ...messages("yesterday", 6, at(1, 12)),
-    ...messages("today", 2, at(0, 0) + 60_000),
+    ...withReplies(messages("yesterday", 6, at(1, 12))),
+    ...withReplies(messages("today", 2, at(0, 0) + 60_000)),
   ];
   await boot(page, request, { items });
   const separators = page.locator("#chat-items > .chat-day-separator");
   await expect(separators).toHaveText(["Yesterday", "Today"]);
-  const band = await separators.first().evaluate(element => {
-    const timeline = element.closest(".chat-timeline")!.getBoundingClientRect();
-    const bounds = element.getBoundingClientRect();
-    return { withinWidth: bounds.left >= timeline.left - 1 && bounds.right <= timeline.right + 1 };
+  // Yesterday pinned over one of its replies: only the label covers it; the
+  // reply shows and takes taps on either side of the label.
+  await page.locator('[data-chat-item-id="message:yesterday-3-reply"]').evaluate(element => {
+    const timeline = element.closest<HTMLElement>(".chat-timeline")!;
+    timeline.scrollTop += element.getBoundingClientRect().top - timeline.getBoundingClientRect().top - 2;
   });
-  expect(band.withinWidth).toBe(true);
+  const pinned = () => separators.first().evaluate(element => {
+    const timeline = element.closest(".chat-timeline")!.getBoundingClientRect();
+    const row = element.getBoundingClientRect();
+    const label = element.querySelector("time")!.getBoundingClientRect();
+    const y = label.top + label.height / 2;
+    const hit = (x: number) => document.elementFromPoint(x, y)?.closest<HTMLElement>("[data-chat-item-id]")?.dataset.chatItemId ?? null;
+    return {
+      withinWidth: row.left >= timeline.left - 1 && row.right <= timeline.right + 1,
+      stuck: Math.abs(row.top - timeline.top) <= 1,
+      left: hit(label.left - 16),
+      right: hit(label.right + 16),
+    };
+  });
+  await expect.poll(pinned).toEqual({ withinWidth: true, stuck: true, left: "message:yesterday-3-reply", right: "message:yesterday-3-reply" });
   await captureScreenshot(page, testInfo, "touch-day-separators");
 
   await control(request, { action: "commands", commands: [{

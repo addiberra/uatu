@@ -35,6 +35,7 @@
 - [x] 5.6 Read a time ahead of the reader's clock as now; verify a renderer test at 23:59 with 00:01/00:04 items
 - [x] 5.7 Relabel separators and re-aim the midnight timer only when the reader's day changes; verify a renderer test over repeated streaming renders
 - [x] 5.8 Drop `composer-status.ts`'s re-export of the date helpers; point its test at `src/chat/dates.ts`
+- [x] 5.9 Pin only the day label, not a full-width band: make the separator row transparent and `pointer-events: none` with only the pill opaque, and add `src/chat/pinned-day.ts`, which marks a pinned separator `data-superseded` (its pill hidden) once the next day's pill reaches it, for the main timeline and the drill-down; verify `pinned-day.test.ts`, and in `chat.e2e.ts`/`chat-touch.e2e.ts` that text beside the pinned label is hit by `elementFromPoint`, that only one label shows when two days' separators are at the top, and that jump and ⌘F targets still land below the pinned row
 
 ## 6. Conversation chooser grouped by date
 

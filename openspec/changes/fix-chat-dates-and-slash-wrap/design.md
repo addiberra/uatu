@@ -186,26 +186,56 @@ day and never starts a separator.
   before its timer ran) relabels and re-aims the timer.
 
 **Sticky vs. static separators.** Separators are `position: sticky`
-inside the `.chat-timeline` scroller. All separators are siblings in
-`#chat-items` and share one containing block, so every separator already
-passed stays pinned. For that reason the separator row is a full-width
-opaque `var(--surface)` band of one fixed height; the newest pinned
-separator then paints over the earlier ones entirely, and a wider earlier
-pill cannot peek out behind it. A sticky box pins at the scroller's padding
-edge, which would leave the scroller's top padding as a strip where content
-shows through above the band. The band therefore pins that far higher
-(`top: calc(-1 * var(--chat-timeline-inset-top))`) and carries the same
-padding itself, so when stuck it reaches the scroller's top edge. It paints
-nothing outside its own box (no shadow, no negative margin), so an unstuck
-separator never covers the end of the previous day's last row; the cost is
-a little more space above an in-flow separator.
+inside the `.chat-timeline` scroller. Only the date pill covers the
+transcript: the separator row is transparent and `pointer-events: none`
+(the pill keeps its own hits), so the text beside a pinned label stays
+readable and can be tapped and selected. An earlier revision made the row a
+full-width opaque band; on a phone that hid a whole line of the transcript
+around a small label.
 
-Because the pinned band covers the top of the scroller, every scroll to a
-target must land below it: while separators exist the scroller's
-`scroll-padding-top` is the band's height plus a small gap. The coordinated
+All separators are siblings in `#chat-items` and share one containing
+block, so every separator already passed stays pinned, stacked at the top.
+With a transparent row, a wider earlier pill would show around a narrower
+newer one. A small watcher (`src/chat/pinned-day.ts`, one per scroller:
+main timeline and drill-down) marks a separator `data-superseded` once the
+next separator's pill reaches its pill, and the stylesheet hides a
+superseded pill (`visibility: hidden`). At most one label is visible at the
+top, and it is the day being read. The watcher is purely geometric (pill
+rects compared in order), runs at most once per animation frame on scroll,
+on resize of the scroller or its item list, and on a change to the list's
+children, and measures nothing while fewer than two separators exist.
+Scrolling back up past a day boundary clears the mark, so the earlier
+label returns.
+
+*Alternatives considered for the stacking:*
+- Wrapping each day's items in a day section, so each sticky separator is
+  bounded by its own day and pushed off by the next one: the natural CSS
+  answer, but it moves every item under a new parent. Scroll anchoring,
+  `[data-chat-item-id]` lookups, keyed reconciliation, the prompt rail,
+  copy, find, and the drill-down all assume items are direct children of
+  `#chat-items`. Rejected as too large and risky for a fix.
+- CSS only: scroll-driven animations could fade an older label, but
+  their behaviour on stuck elements is not dependable, and older iOS
+  Safari lacks them. A fixed pill width wide enough for any label wastes
+  space and still depends on the locale. Rejected.
+
+A sticky box pins at the scroller's padding edge. The row therefore pins
+that far higher (`top: calc(-1 * var(--chat-timeline-inset-top))`) and
+carries the same padding itself, so the stuck pill sits at the same height
+as a pill in flow, and the space reserved below stays one fixed band from
+the scroller's top edge. The row paints nothing outside its own box (no
+shadow, no negative margin), so an unstuck separator never covers the end
+of the previous day's last row; the cost is a little more space above an
+in-flow separator.
+
+Because the pinned label covers part of the top of the scroller, every
+scroll to a target must land below it: while separators exist the
+scroller's `scroll-padding-top` is the pinned row's height plus a small
+gap. The coordinated
 scroll's reveal and the ⌘F match reveal already honour
 `scroll-padding-top`, and the prompt rail's jump uses it as its offset. This gives the "which day am I reading" context
-the issue asks for without a scroll listener or an extra floating element.
+the issue asks for without an extra floating element; the only scroll
+work is the watcher's per-frame comparison of the few pill rects.
 The main timeline and the drill-down both get it, since both scroll
 `.chat-timeline`-like containers. The implementer must check the scroller's
 existing top padding/inset, which the header notes at `styles.css` ~437
@@ -332,9 +362,13 @@ its title. The header truncates long labels as before.
   `chat-claude-polish.e2e.ts:167` already selects `[data-chat-item-id]`.
 - [A sticky separator may overlap the first line of content, or the
   jump-to-latest / requests pill] → Give the separator a compact fixed
-  height and an opaque background, reserve it as `scroll-padding-top` so
-  scrolled-to targets land below it, and verify in both desktop split and
-  touch layouts in e2e screenshots.
+  height with only its pill opaque, reserve that height as
+  `scroll-padding-top` so scrolled-to targets land below it, and verify in
+  both desktop split and touch layouts in e2e screenshots.
+- [Pinned labels of earlier days stack behind the current one] → The
+  `pinned-day.ts` watcher hides a label once the next day's label reaches
+  it; e2e checks that only one label shows when two days' separators are
+  both at the top.
 - [Find-in-surface would match "Today" / weekday text, and a midnight
   relabel would shift the count under an open bar] → Separators carry
   `data-find-skip` and are excluded from the chat find index.
