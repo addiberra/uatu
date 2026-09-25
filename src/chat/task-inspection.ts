@@ -187,7 +187,7 @@ export class TaskInspectionPanel {
     this.task = task;
     const running = task?.status === "running";
     const signature = task
-      ? [task.taskId, task.status, task.description, task.subagentType ?? "", task.progress ?? "", task.summary ?? "", task.usage ? `${task.usage.totalTokens}/${task.usage.toolUses}` : "", stopping ? "stopping" : ""].join("")
+      ? [task.taskId, task.status, task.description, task.subagentType ?? "", task.progress ?? "", task.summary ?? "", task.usage ? `${task.usage.totalTokens}/${task.usage.toolUses}` : "", stopping ? "stopping" : ""].join("\u0001")
       : "";
     if (signature !== this.painted) {
       this.painted = signature;
@@ -202,10 +202,11 @@ export class TaskInspectionPanel {
     }
     // Settling ends the poll and reads once more: the file gains its
     // `[exited with code N]` line at the end, and the last poll may have
-    // missed the final output.
+    // missed the final output. A read the server already marked settled
+    // has shown that final output, so there is nothing left to catch.
     if (wasRunning && !running && this.current.view === "output") {
       this.stopOutputTimer();
-      this.refreshOutput();
+      if (!this.outputFinal) this.refreshOutput();
     }
   }
 

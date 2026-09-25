@@ -155,9 +155,15 @@ export class ActivityMarkStore implements ActivityMarkSink {
     // could publish them out of order.
     const next = this.chain.then(() => this.save(), () => this.save());
     this.chain = next.catch(() => undefined);
-    return next.catch(error => {
+    return next.then(() => {
+      // A write that lands ends the failure episode, so a later, separate
+      // one is reported rather than hidden behind the first.
+      this.reportedFailure = false;
+    }, error => {
       // Memory-only from here: the marks are still right for this hub's
-      // lifetime, only a restart would forget them.
+      // lifetime, only a restart would forget them. One line per episode:
+      // a failing disk is retried on every change, and repeating the same
+      // line for each would bury the log.
       if (this.reportedFailure) return;
       this.reportedFailure = true;
       const detail = error instanceof Error ? error.message : String(error);

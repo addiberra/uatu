@@ -264,6 +264,12 @@ describe("task inspection panel", () => {
     expect(live().filter(entry => entry.kind === "timeout")).toHaveLength(0);
     expect(reads).toHaveLength(1);
     expect(text("#strip [data-task-elapsed]")).toBe("0:00");
+    // Nor does the item's settle read again: the output was already known
+    // final, so there is nothing left for a last read to catch.
+    view.sync({ ...task, status: "completed", summary: "exit 0" });
+    expect(reads).toHaveLength(1);
+    expect(live()).toHaveLength(0);
+    expect(text("#strip .chat-drilldown-task-settled")).toBe("finished · exit 0");
     view.close();
   });
 
@@ -283,6 +289,19 @@ describe("task inspection panel", () => {
     active = true;
     poll[0]!.fn();
     expect(reads).toHaveLength(1);
+    view.close();
+  });
+
+  test("a change that only moves text across a field boundary still repaints the strip", () => {
+    const view = panel();
+    // Run together, "explore" + "ing tests" and "explor" + "eing tests" read
+    // the same; the strip must still show the second state.
+    const task = item({ taskId: "x", taskType: "local_agent", subagentType: "explore", progress: "ing tests", childConversationId: "sub:p:x", createdAt: now });
+    view.show({ conversationId: "one", taskId: "x", view: "transcript" }, task);
+    expect(text("#strip .chat-drilldown-task-type")).toBe("explore");
+    view.sync({ ...task, subagentType: "explor", progress: "eing tests" });
+    expect(text("#strip .chat-drilldown-task-type")).toBe("explor");
+    expect(text("#strip .chat-drilldown-task-progress")).toBe("eing tests");
     view.close();
   });
 

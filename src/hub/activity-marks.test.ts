@@ -174,6 +174,40 @@ describe("ActivityMarkStore", () => {
     expect(reported).toHaveLength(1);
     expect([...store.read().finishedAt]).toEqual([["a", 2]]);
   });
+
+  test("each failure episode is reported once, and a write that lands ends the episode", async () => {
+    const directory = path.join(await stateDir(), "state");
+    const file = path.join(directory, "activity-marks.json");
+    const store = new ActivityMarkStore(file, 5);
+    await store.load();
+    const reported: unknown[] = [];
+    const previous = console.error;
+    console.error = (...args: unknown[]) => { reported.push(args); };
+    try {
+      // The directory is missing: the first failure is reported, the ones
+      // that follow in the same episode are not.
+      store.write({ finishedAt: new Map([["a", 1]]), viewedAt: new Map() });
+      await store.flush();
+      store.write({ finishedAt: new Map([["a", 2]]), viewedAt: new Map() });
+      await store.flush();
+      expect(reported).toHaveLength(1);
+
+      // The directory appears and a write lands.
+      await mkdir(directory);
+      store.write({ finishedAt: new Map([["a", 3]]), viewedAt: new Map() });
+      await store.flush();
+      expect(reported).toHaveLength(1);
+      expect(JSON.parse(await Bun.file(file).text()).finished).toEqual({ a: 3 });
+
+      // A new, separate failure is reported again.
+      await rm(directory, { recursive: true, force: true });
+      store.write({ finishedAt: new Map([["a", 4]]), viewedAt: new Map() });
+      await store.flush();
+      expect(reported).toHaveLength(2);
+    } finally {
+      console.error = previous;
+    }
+  });
 });
 
 describe("marks across a hub restart (fix-workspace-activity-states D12)", () => {
