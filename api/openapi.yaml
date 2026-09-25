@@ -1127,7 +1127,10 @@ paths:
         re-verified against the checkout at every recheck up to the moment
         before Git runs. Without it the request is refused as `local-data`;
         with a fingerprint that no longer matches, it is refused as
-        `local-data` and must be reviewed again. The acknowledgement never
+        `local-data` with `retry: refresh`: resending the same request cannot
+        succeed, so run `preflight-delete` again and review the data it now
+        reports. Removal itself runs under a long bound of its own (ten
+        minutes), so a large checkout is not cut off part-way. The acknowledgement never
         overrides any other blocker. There is no client-facing force option;
         the Hub may pass Git a single force only to remove acknowledged
         tracked changes or untracked files, never the double force that
@@ -2286,7 +2289,7 @@ components:
       properties:
         tracked: { $ref: '#/components/schemas/WorktreeLocalDataCategory', description: "Staged or unstaged changes to tracked files." }
         untracked: { $ref: '#/components/schemas/WorktreeLocalDataCategory', description: "Untracked files." }
-        ignored: { $ref: '#/components/schemas/WorktreeLocalDataCategory', description: "Ignored entries; a wholly ignored directory is one entry, listed with its trailing `/`." }
+        ignored: { $ref: '#/components/schemas/WorktreeLocalDataCategory', description: "Ignored entries; a wholly ignored directory is one entry, listed with its trailing `/`, and stands for that folder and everything inside it." }
         fingerprint: { type: string, pattern: '^[0-9a-f]{64}$', description: "Opaque: identifies the complete set of local-data status entries across all three categories, bound to this checkout. Echo it back as the deletion's `localDataFingerprint`." }
       additionalProperties: false
       description: "Local data a deletion would permanently discard. A category is present only when it has at least one entry, and at least one is present."

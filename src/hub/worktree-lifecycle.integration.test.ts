@@ -375,6 +375,8 @@ test.each(Object.keys(lateChanges).flatMap(scenario => [[scenario, "prepared for
     if (acknowledged) {
       // Not doubled: the mismatch message already says so.
       expect(deleted.error.message).toBe("The worktree's files changed while deletion was prepared. Review the deletion again. Nothing was removed.");
+      // Only a new preflight can succeed now.
+      expect(deleted.error.retry).toBe("refresh");
     } else {
       expect(deleted.error.message).toStartWith("The worktree changed while deletion was prepared. It has ");
       expect(deleted.error.message).toContain("or confirm deleting them with the worktree");
@@ -802,31 +804,34 @@ describe("reconciliation (5.1)", () => {
 });
 
 describe("deletion preflight (5.3)", () => {
-  const blockers: Array<[string, (folder: string) => Promise<void>, string]> = [
+  // The nested-repository rows live in their own repository ("cairn"), so the
+  // shared one's inventory — read by every other case — stays small.
+  const blockers: Array<[string, (folder: string) => Promise<void>, string, ("atlas" | "cairn")?]> = [
     ["a Git lock", folder => git(folder, ["worktree", "lock", "--reason", "keep", folder]).then(() => undefined), "locked in Git"],
     ["a Git operation in progress", async folder => {
       const lock = (await git(folder, ["rev-parse", "--path-format=absolute", "--git-path", "index.lock"])).trim();
       await writeFile(lock, "");
     }, "Git operation appears to be running"],
     ["a nested worktree", folder => git(atlas, ["worktree", "add", "-b", `nested/${path.basename(folder)}`, path.join(folder, "inner")]).then(() => undefined), "Another worktree is inside"],
-    ["an initialized submodule", addSubmodule, "initialized submodule"],
-    ["an untracked nested repository", folder => git(atlas, ["init", path.join(folder, "nested")]).then(() => undefined), "another Git repository (nested)"],
+    ["an initialized submodule", addSubmodule, "initialized submodule", "cairn"],
+    ["an untracked nested repository", folder => git(cairn, ["init", path.join(folder, "nested")]).then(() => undefined), "another Git repository (nested)", "cairn"],
     // A clean status: non-force Git would delete `lib/.git` without a word.
-    ["a repository nested in a tracked directory", nestRepositoryInTrackedDirectory, "another Git repository (lib)"],
+    ["a repository nested in a tracked directory", nestRepositoryInTrackedDirectory, "another Git repository (lib)", "cairn"],
   ];
 
-  for (const [label, arrange, reason] of blockers) {
+  for (const [label, arrange, reason, repository = "atlas"] of blockers) {
     test(`${label} blocks deletion and retains checkout and registration`, async () => {
-      const child = await create(`block/${label.replaceAll(" ", "-")}`);
+      const source = repository === "cairn" ? cairnId : atlasId;
+      const child = await create(`block/${label.replaceAll(" ", "-")}`, source);
       const folder = registry.byId(child)!.path;
       await arrange(folder);
       // The blocker the dialog shows INSTEAD of its normal consequences; that
       // it replaces them, and shows no path, is worktree-dialog.test.ts's.
-      const blocked = await preflight(child);
+      const blocked = await preflight(child, source);
       expect(blocked.ok).toBe(false);
       if (blocked.ok) return;
       expect(blocked.error.message).toContain(reason);
-      const answer = await act("delete", { source: atlasId, id: child, confirm: "1" });
+      const answer = await act("delete", { source, id: child, confirm: "1" });
       expect(failed(answer)).toBe(true);
       expect(answer.completion).toBeUndefined();
       expect(messageOf(answer)).toContain(reason);
@@ -1163,7 +1168,7 @@ describe("acknowledged local data (deletion with local data)", () => {
       if (deleted.ok) return;
       // Caught by the recheck itself, not left to the final probe.
       expect(deleted.phase).toBe("rechecking");
-      expect(deleted.error).toMatchObject({ code: "local-data", phase: "rechecking", message: "The worktree's files changed while deletion was prepared. Review the deletion again. Nothing was removed." });
+      expect(deleted.error).toMatchObject({ code: "local-data", phase: "rechecking", retry: "refresh", message: "The worktree's files changed while deletion was prepared. Review the deletion again. Nothing was removed." });
       expect(existsSync(path.join(folder, "written-while-stopping.txt"))).toBe(true);
       expect(registry.byId(child)).toBeDefined();
       expect(removals(folder)).toHaveLength(0);

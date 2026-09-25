@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { createGitRunner, listWorktrees } from "./worktree-git";
@@ -49,13 +49,18 @@ test("a clean linked checkout paused at an interactive rebase edit cannot be rem
   }
 });
 
-import { buildWorktreeRemoveArguments, categorizePorcelainStatus, checkLocalDataAcknowledgement, classifyWorktreeRemoveFailure, countForceArguments, describeLocalData, INDEX_OUTPUT_LIMIT, localDataFingerprint, removalRequiresForce, summarizePorcelainStatus } from "./worktree-delete";
+import { buildWorktreeRemoveArguments, categorizePorcelainStatus, checkLocalDataAcknowledgement, classifyWorktreeRemoveFailure, collectAncestorDirectories, countForceArguments, describeLocalData, INDEX_OUTPUT_LIMIT, INSPECTION_PROBE_TIMEOUT_MS, localDataFingerprint, localDataRefusal, removalRequiresForce, runWorktreeRemove, WORKTREE_REMOVE_TIMEOUT_MS } from "./worktree-delete";
+import { parseWorktreeDeletionPreflight, WORKTREE_LOCAL_DATA_SAMPLE_LIMIT } from "../shared/worktree-contract";
 
-describe("status summary", () => {
-  test("counts tracked, untracked and ignored entries, skipping rename sources", () => {
+describe("status categories", () => {
+  test("sorts tracked, untracked and ignored entries into categories, skipping rename sources", () => {
     const output = [" M README.md", "R  new.md", "old.md", "?? scratch.txt", "!! .env.local", "!! build/", ""].join("\0");
-    expect(summarizePorcelainStatus(output)).toEqual({ tracked: 2, untracked: 1, ignored: 2 });
-    expect(summarizePorcelainStatus("")).toEqual({ tracked: 0, untracked: 0, ignored: 0 });
+    expect(categorizePorcelainStatus(output)).toEqual({
+      tracked: [{ code: " M", path: "README.md" }, { code: "R ", path: "new.md" }],
+      untracked: [{ code: "??", path: "scratch.txt" }],
+      ignored: [{ code: "!!", path: ".env.local" }, { code: "!!", path: "build/" }],
+    });
+    expect(categorizePorcelainStatus("")).toEqual({ tracked: [], untracked: [], ignored: [] });
   });
 });
 
@@ -183,7 +188,7 @@ describe("local-data acknowledgement", () => {
   test.each([
     ["tracked", { tracked: category(3), untracked: category(1), ignored: category(1) }, "It has uncommitted changes (3 files). Commit, stash or discard them, or confirm deleting them with the worktree. Nothing was removed."],
     ["untracked", { untracked: category(1), ignored: category(2) }, "It has untracked files (1 file). Commit, move or delete them, or confirm deleting them with the worktree. Nothing was removed."],
-    ["ignored", { ignored: category(2) }, "It has ignored files (2 files), such as build output or local settings, that would be lost. Move or delete them, or confirm deleting them with the worktree. Nothing was removed."],
+    ["ignored", { ignored: category(2) }, "It has ignored files or folders (2 items), such as build output or local settings, that would be lost. Move or delete them, or confirm deleting them with the worktree. Nothing was removed."],
   ])("unacknowledged %s data names the first category present", (_label, categories, message) => {
     const error = checkLocalDataAcknowledgement({ ...categories, fingerprint });
     expect(error?.detail).toMatchObject({ code: "local-data", retry: "retry-delete", message });
@@ -191,7 +196,89 @@ describe("local-data acknowledgement", () => {
 
   test("a different fingerprint says the files changed", () => {
     const error = checkLocalDataAcknowledgement({ ignored: category(1), fingerprint }, "1".repeat(64));
-    expect(error?.detail).toMatchObject({ code: "local-data", retry: "retry-delete", message: "The worktree's files changed while deletion was prepared. Review the deletion again. Nothing was removed." });
+    // Resending the same request cannot succeed: a new preflight is needed.
+    expect(error?.detail).toMatchObject({ code: "local-data", retry: "refresh", message: "The worktree's files changed while deletion was prepared. Review the deletion again. Nothing was removed." });
+  });
+
+  test("one refusal rule serves every check, differing only in phase and prefix", () => {
+    const data = { tracked: category(1), fingerprint };
+    const prefix = "The worktree changed while deletion was prepared. ";
+    for (const phase of ["preflight", "rechecking", "removing"] as const) {
+      expect(localDataRefusal(undefined, undefined, phase, prefix)).toBeUndefined();
+      expect(localDataRefusal(data, fingerprint, phase, prefix)).toBeUndefined();
+      const missing = localDataRefusal(data, undefined, phase, prefix)!.detail;
+      expect(missing).toMatchObject({ code: "local-data", retry: "retry-delete", phase });
+      expect(missing.message).toStartWith(`${prefix}It has uncommitted changes (1 file).`);
+      // A stale acknowledgement already says the files changed: no prefix.
+      expect(localDataRefusal(data, "1".repeat(64), phase, prefix)!.detail).toMatchObject({
+        code: "local-data", retry: "refresh", phase,
+        message: "The worktree's files changed while deletion was prepared. Review the deletion again. Nothing was removed.",
+      });
+    }
+    expect(localDataRefusal(data, undefined, "preflight")!.detail.message).toStartWith("It has uncommitted changes");
+  });
+});
+
+describe("one sample limit", () => {
+  test("the Hub's samples fill exactly the limit the shared parser accepts", () => {
+    const paths = Array.from({ length: WORKTREE_LOCAL_DATA_SAMPLE_LIMIT + 3 }, (_unused, index) => `?? file-${index}.txt`);
+    const described = describeLocalData("checkout-a", categorizePorcelainStatus([...paths, ""].join("\0")))!;
+    expect(described.untracked!.sample).toHaveLength(WORKTREE_LOCAL_DATA_SAMPLE_LIMIT);
+    const checkout = { checkoutId: "c", repositoryId: "r", workspaceId: "w", path: "/w/c", branch: "b", detached: false, main: false, ownership: "uatu", availability: "present", registered: true, running: false, locked: false };
+    const wire = { ok: true, checkout, requiresStop: false, localData: { untracked: { count: described.untracked!.count, sample: described.untracked!.sample }, fingerprint: described.fingerprint } };
+    expect(parseWorktreeDeletionPreflight(wire)).toMatchObject({ ok: true });
+    const oversized = { ...wire, localData: { untracked: { count: 99, sample: [...described.untracked!.entries].slice(0, WORKTREE_LOCAL_DATA_SAMPLE_LIMIT + 1) }, fingerprint: described.fingerprint } };
+    expect(() => parseWorktreeDeletionPreflight(oversized)).toThrow();
+  });
+
+  test("the published schema's maxItems is the same limit", async () => {
+    const { parse } = await import("yaml");
+    const openapi = parse(await Bun.file(path.join(import.meta.dir, "../../api/openapi.yaml")).text()) as { components: { schemas: { WorktreeLocalDataCategory: { properties: { sample: { maxItems: number } } } } } };
+    expect(openapi.components.schemas.WorktreeLocalDataCategory.properties.sample.maxItems).toBe(WORKTREE_LOCAL_DATA_SAMPLE_LIMIT);
+  });
+});
+
+describe("ancestor directories", () => {
+  test("every ancestor of every path, excluding the root, each once", () => {
+    const found = collectAncestorDirectories(["a/b/c.txt", "a/b/d.txt", "a/e/", "x.txt", "a/b/f/g/h", "build/"]);
+    // A directory entry (`a/e/`) contributes its ancestors, not itself.
+    expect([...found].sort()).toEqual(["a", "a/b", "a/b/f", "a/b/f/g"]);
+    // Accumulates into an existing set without re-walking what it holds.
+    expect([...collectAncestorDirectories(["a/b/z/q.txt"], new Set(["a", "a/b"]))].sort()).toEqual(["a", "a/b", "a/b/z"]);
+  });
+
+  test("scales linearly: about 200k synthetic index paths de-duplicate quickly", () => {
+    const paths: string[] = [];
+    for (let package_ = 0; package_ < 2_000; package_ += 1) {
+      for (let file = 0; file < 100; file += 1) paths.push(`packages/p${package_}/src/module-${file % 10}/file-${file}.ts`);
+    }
+    expect(paths).toHaveLength(200_000);
+    const started = performance.now();
+    const found = collectAncestorDirectories(paths);
+    const elapsed = performance.now() - started;
+    expect(found.size).toBe(1 + 2_000 * 2 + 2_000 * 10);
+    // Measured at roughly 20–40 ms; the bound only catches a quadratic regression.
+    expect(elapsed).toBeLessThan(2_000);
+  });
+});
+
+describe("the removal's own bound", () => {
+  test("git worktree remove runs with the long removal timeout, not the probe default", async () => {
+    const calls: Array<{ args: readonly string[]; timeoutMs?: number }> = [];
+    const outcome = await runWorktreeRemove(async (args, _cwd, options) => {
+      calls.push({ args, ...(options?.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }) });
+      return { exitCode: 0, stdout: "", stderr: "", timedOut: false, outputExceeded: false };
+    }, "/repos/atlas", "/repos/atlas.worktrees/feature-x", { force: true });
+    expect(outcome.ok).toBe(true);
+    expect(calls).toEqual([{ args: ["worktree", "remove", "--force", "--", "/repos/atlas.worktrees/feature-x"], timeoutMs: WORKTREE_REMOVE_TIMEOUT_MS }]);
+    expect(WORKTREE_REMOVE_TIMEOUT_MS).toBeGreaterThanOrEqual(5 * 60_000);
+  });
+
+  test("a removal that still times out says files may already be gone and asks for a refresh", async () => {
+    const outcome = await runWorktreeRemove(async () => ({ exitCode: -1, stdout: "", stderr: "", timedOut: true, outputExceeded: false }), "/r", "/r.worktrees/x", { force: false });
+    if (outcome.ok) throw new Error("expected a timeout");
+    expect(outcome.error.detail).toMatchObject({ code: "timeout", retry: "refresh", phase: "removing" });
+    expect(outcome.error.detail.message).toContain("some of its files may already be deleted");
   });
 });
 
@@ -227,12 +314,13 @@ describe("submodules and nested repositories (real Git)", () => {
     await fixture.git(["worktree", "add", "-b", branch, target], fixture.main);
     return (await fixture.git(["rev-parse", "--show-toplevel"], target)).trim();
   };
-  const inspect = async (fixture: Fixture, checkout: string, recorded: string[][] = [], limits: Array<number | undefined> = []) => {
+  const inspect = async (fixture: Fixture, checkout: string, recorded: string[][] = [], limits: Array<number | undefined> = [], timeouts: Array<number | undefined> = []) => {
     const inventory = await listWorktrees(fixture.main, { env: fixture.env });
     if (inventory.kind !== "inventory") throw new Error("missing inventory");
     const run: typeof fixture.run = async (args, cwd, options) => {
       recorded.push([...args]);
       limits.push(options?.outputLimit);
+      timeouts.push(options?.timeoutMs);
       return fixture.run(args, cwd, options);
     };
     return inspectRemovalSafety({ run, checkoutPath: checkout, checkoutId: "checkout-linked", records: inventory.records });
@@ -314,13 +402,18 @@ describe("submodules and nested repositories (real Git)", () => {
       await prepare(checkout);
       const recorded: string[][] = [];
       const limits: Array<number | undefined> = [];
-      const result = await inspect(fixture, checkout, recorded, limits);
+      const timeouts: Array<number | undefined> = [];
+      const result = await inspect(fixture, checkout, recorded, limits, timeouts);
       expect(blockedCode(result)).toBeUndefined();
       const probe = recorded.findIndex(args => args[0] === "ls-files");
+      const status = recorded.findIndex(args => args[0] === "status");
       expect(probe).toBeGreaterThanOrEqual(0);
       expect(limits[probe]).toBe(INDEX_OUTPUT_LIMIT);
-      // Every other probe keeps the runner's default bound.
+      // Every other probe keeps the runner's default output bound.
       expect(limits.filter((_limit, index) => index !== probe).every(limit => limit === undefined)).toBe(true);
+      // The two listings that grow with the checkout get the longer timeout.
+      expect([timeouts[status], timeouts[probe]]).toEqual([INSPECTION_PROBE_TIMEOUT_MS, INSPECTION_PROBE_TIMEOUT_MS]);
+      expect(timeouts.filter((_timeout, index) => index !== probe && index !== status).every(timeout => timeout === undefined)).toBe(true);
     });
   }, REAL_GIT_TIMEOUT);
 
@@ -397,6 +490,35 @@ describe("undecodable paths fail closed", () => {
   test("an index path with U+FFFD is refused even when the status is clean", async () => {
     const result = await inspectWith({ index: "100644 0123456789012345678901234567890123456789 0\tlib\uFFFD/a.txt\0" });
     expect("blocked" in result && result.blocked.detail).toMatchObject(uninspectable);
+  });
+
+  test("an unreadable tracked directory is refused as uninspectable, not as a nested repository", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "uatu-delete-unreadable-"));
+    const locked = path.join(root, "lib");
+    await mkdir(locked);
+    await writeFile(path.join(locked, "a.txt"), "a\n");
+    await chmod(locked, 0o000);
+    try {
+      // Running as root would read it anyway; the refusal needs a real EACCES.
+      const denied = await lstat(path.join(locked, ".git")).then(() => false, (error: NodeJS.ErrnoException) => error.code === "EACCES");
+      if (!denied) return;
+      const result = await inspectRemovalSafety({
+        checkoutPath: root,
+        checkoutId: "checkout-unreadable",
+        records: [{ path: root, head: "abc", branch: "topic", bare: false, detached: false, locked: false, lockReason: null, prunable: false }],
+        run: async args => ({
+          exitCode: 0,
+          stdout: args[0] === "rev-parse"
+            ? args.flatMap((arg, index) => arg === "--git-path" ? [path.join(root, "gitdir", args[index + 1]!)] : []).join("\n") + "\n"
+            : args[0] === "ls-files" ? "100644 0123456789012345678901234567890123456789 0\tlib/a.txt\0" : "",
+          stderr: "", timedOut: false, outputExceeded: false,
+        }),
+      });
+      expect("blocked" in result && result.blocked.detail).toMatchObject(uninspectable);
+    } finally {
+      await chmod(locked, 0o755);
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   test("well-formed synthetic output is described normally", async () => {

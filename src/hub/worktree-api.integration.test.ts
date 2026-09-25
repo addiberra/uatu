@@ -792,6 +792,7 @@ describe("local-data acknowledgement over JSON", () => {
     if (stale.ok) return;
     expect(stale.error.code).toBe("local-data");
     expect(stale.error.message).toContain("Review the deletion again");
+    expect(stale.error.retry).toBe("refresh");
     expect(existsSync(path.join(checkout, "another.txt"))).toBe(true);
 
     const reviewed = await preflight(await post("preflight-delete", { sourceWorkspaceId: atlasId, reference: "feature/local-data" }));

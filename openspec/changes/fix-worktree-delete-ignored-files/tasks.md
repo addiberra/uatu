@@ -86,10 +86,10 @@
   - truncation text;
   - HTML escaping of a sample path;
   - no checkbox for a clean tree.
-- [x] 5.2 In `submitDelete`, when `localData` is present and the checkbox is unchecked, show "Confirm to continue. Nothing changed." in place and send nothing, mirroring `submitForget`. When the box is ticked, send `localDataFingerprint`. Never send it for a clean tree. Show a server refusal, such as a changed fingerprint, in place as today. Verify with dialog tests that assert:
+- [x] 5.2 In `submitDelete`, when `localData` is present and the checkbox is unchecked, show "Confirm to continue. Nothing changed." in place and send nothing, mirroring `submitForget`. When the box is ticked, send `localDataFingerprint`. Never send it for a clean tree. Show any other server refusal in place as today. For a `local-data` refusal, such as a changed fingerprint, re-run the preflight and show the updated warning with an unticked checkbox and the refusal as an alert, or the blocker that preflight now finds (design D7). Verify with dialog tests that assert:
   - an unchecked submit sends no request;
   - the posted body with and without `localData`;
-  - a `local-data` refusal replaces the form with the alert and Cancel only.
+  - a `local-data` refusal re-runs preflight and shows the updated warning, unticked, with the reason; a new blocker from that preflight shows the alert and Cancel only; any other refusal replaces the form with the alert and Cancel only.
 - [x] 5.3 In `src/shell/worktree-dialog.test.ts`, update the "every preflight blocker replaces the consequences and offers only Cancel" table. Remove the tracked, untracked and ignored `local-data` preflight rows, because local data is no longer a preflight blocker. Keep a `local-data` delete-refusal case under 5.2, and add a `nested-dependency` submodule row. Verify with `bun test src/shell/worktree-dialog.test.ts`.
 
 ## 6. Documentation

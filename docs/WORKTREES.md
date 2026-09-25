@@ -142,13 +142,17 @@ branch and its commits are always kept, and so are the repository's stashes.
 If the checkout has local data — uncommitted changes (staged or not), untracked
 files or ignored files such as build output, `node_modules/` or a local `.env`
 — the confirmation lists it: for each kind, how many entries there are and a
-few of their paths. These files are permanently deleted with the worktree and
-cannot be recovered. To go ahead, tick **Permanently delete these files with the
+few of their paths. An entry ending in `/` is a whole folder, marked as such:
+Git reports a fully ignored folder like `node_modules/` as one entry however
+many files it holds, and it is deleted with everything inside it. These files
+and folders are permanently deleted with the worktree and cannot be
+recovered. To go ahead, tick **Permanently delete these files with the
 worktree**; without the tick nothing is deleted. Cancel leaves everything as it
 was. The tick covers exactly the entries listed, by path and Git status. If
 they change before Uatu removes the checkout — a file is created, deleted,
 staged or newly ignored, or the ignore rules change — deletion is refused and
-you review it again. Further edits to a file that is already listed, and new
+the confirmation shows the data as it is now, with the box unticked, for you to
+review again. Further edits to a file that is already listed, and new
 files inside an ignored folder that is already listed, are covered by the tick.
 
 Deletion still refuses Git locks, nested worktrees, submodules and nested Git
@@ -158,11 +162,15 @@ any of these. Uatu looks for nested repositories in untracked folders, in
 folders that hold tracked files and at the top of each ignored folder. It does
 not search inside ignored folders, so a repository deeper inside an ignored
 folder such as `node_modules/` is deleted along with that folder. A checkout
-with file names Uatu cannot read reliably (not valid UTF-8) is not deleted. There is no force option: the acknowledgement only lets Uatu pass
+with file names Uatu cannot read reliably (not valid UTF-8), or with a folder
+Uatu is not allowed to read, is not deleted. There is no force option: the acknowledgement only lets Uatu pass
 Git a single force to remove exactly the listed uncommitted and untracked data,
 never the double force that overrides a lock. Uatu cannot stop unknown external
 applications for you. A failed stop or removal keeps the checkout and its
-registration.
+registration. Removing a large checkout can take a while; if Git has not
+finished after ten minutes it is stopped, some files may already be gone, and
+the checkout stays registered so you can refresh and review the deletion
+again.
 
 **Remove from Uatu** forgets a workspace's registration and associated Hub
 personal state, stopping its Uatu sessions first if it is running as part of

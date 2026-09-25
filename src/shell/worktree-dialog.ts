@@ -325,15 +325,20 @@ export function installWorktreeDialog<T extends Record<string, unknown>>(
       // form validates in submitDelete (`novalidate`), so an unchecked
       // submit says why in place instead of a browser bubble.
       const data = m.localData;
+      // A path Git reports with a trailing `/` is a whole folder — one entry
+      // however much it holds — so it is labelled as such.
+      const sampleItem = (sample: string) => sample.endsWith("/")
+        ? `<li><code>${h(sample)}</code> <span class="wt-muted" data-folder>(folder, with everything in it)</span></li>`
+        : `<li><code>${h(sample)}</code></li>`;
       const category = (label: string, entry: { count: number; sample: readonly string[] } | undefined) => {
         if (!entry) return "";
         const more = entry.count - entry.sample.length;
-        return `<li>${label}<ul>${entry.sample.map(sample => `<li><code>${h(sample)}</code></li>`).join("")}</ul>${more > 0 ? `<span class="wt-muted">and ${more} more</span>` : ""}</li>`;
+        return `<li>${label}<ul>${entry.sample.map(sampleItem).join("")}</ul>${more > 0 ? `<span class="wt-muted">and ${more} more</span>` : ""}</li>`;
       };
-      const warning = data === undefined ? "" : `<div class="wt-notice error" data-local-data><p><strong>These files will be permanently deleted with the worktree and cannot be recovered.</strong> Commits on the branch are kept.</p><ul>`
+      const warning = data === undefined ? "" : `<div class="wt-notice error" data-local-data><p><strong>These files and folders will be permanently deleted with the worktree, including everything inside each listed folder, and cannot be recovered.</strong> Commits on the branch are kept.</p><ul>`
         + category(`Uncommitted changes (${data.tracked?.count ?? 0})`, data.tracked)
         + category(`Untracked files (${data.untracked?.count ?? 0})`, data.untracked)
-        + category(`Ignored files (${data.ignored?.count ?? 0}), such as build output or local settings like <code>.env</code>`, data.ignored)
+        + category(`Ignored files and folders (${data.ignored?.count ?? 0}), such as build output or local settings like <code>.env</code>`, data.ignored)
         + `</ul></div><label class="check"><input type="checkbox" name="acknowledge" required>Permanently delete these files with the worktree.</label>`;
       body = `<section data-compact><h2 class="wt-heading" tabindex="-1">Delete worktree?</h2>${identity}`
         + (m.loading ? pendingWith("Checking worktree…") : m.blocked
@@ -1011,7 +1016,23 @@ export function installWorktreeDialog<T extends Record<string, unknown>>(
           return;
         }
         endBusy();
-        message = outcome.error.message;
+        const refusal = outcome.error;
+        if (refusal.code === "local-data") {
+          // The local data is not what this dialog showed: review it again
+          // from a fresh preflight, which re-renders the updated warning with
+          // an unticked box — or the blocker it now finds instead.
+          message = undefined;
+          error = false;
+          await loadPreflight();
+          if (controller.signal.aborted) return;
+          if (!blocked) {
+            message = refusal.message;
+            error = true;
+          }
+          render();
+          return;
+        }
+        message = refusal.message;
         error = true;
         blocked = true;
         render();

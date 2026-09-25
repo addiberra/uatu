@@ -331,23 +331,30 @@ returns the first blocker in a fixed order — identity, Git lock, nested linked
 worktree, Git operation markers, then submodules and nested repositories: the
 checkout's own `<gitdir>/worktrees/<id>/modules` store, a `.git` at the root of
 any untracked or ignored directory entry, and, from `git ls-files --stage` on
-every inspection (under its own 64 MiB bound), populated gitlinks and a `.git`
-in any ancestor directory of a tracked path — Git removes a repository nested
-in tracked content even without force. An unreadable status or index, an
-exceeded bound, or a path that did not decode as UTF-8 fails closed. Tracked changes, untracked files and ignored files are not
-blockers: they come back as a local-data description — per-category counts and
-up to five sorted checkout-relative samples — plus a SHA-256 fingerprint over a
+every inspection, populated gitlinks and a `.git` in any ancestor directory of
+a tracked path — Git removes a repository nested in tracked content even
+without force. Those candidates are de-duplicated in linear time and checked
+with at most 32 `lstat` calls in flight. The status and index listings run
+with a 60-second timeout and the index with a 64 MiB output bound (the
+runner's defaults are 10 seconds and 4 MiB). An unreadable status, index or
+folder, an exceeded bound, or a path that did not decode as UTF-8 fails closed
+as "could not be inspected". Tracked changes, untracked files and ignored files
+are not blockers: they come back as a local-data description — per-category
+counts and up to `WORKTREE_LOCAL_DATA_SAMPLE_LIMIT` (shared with the contract
+parser) sorted checkout-relative samples — plus a SHA-256 fingerprint over a
 domain tag, the checkout id and every `XY` status/path entry sorted by path.
 Preflight publishes it as `localData`; a delete must echo the fingerprint as
-`localDataFingerprint`, and `checkLocalDataAcknowledgement` re-verifies it at
+`localDataFingerprint`, and one helper, `localDataRefusal`, re-verifies it at
 all three checks under the fence (the fenced re-preflight, the post-stop
 recheck, and the final probe immediately before Git), refusing a missing or
-stale acknowledgement as `local-data`. Nothing is stored between preflight and
+stale acknowledgement as `local-data` (a stale one with `retry: refresh`). Nothing is stored between preflight and
 delete, and the journal is unchanged. Removal is `git worktree remove` without
 force by default; `removalRequiresForce` adds a single `--force` only when the
 final, fingerprint-matched data has tracked or untracked entries (Git deletes
 ignored files without force), and `buildWorktreeRemoveArguments` refuses any
-argument list with more than that one force, so a lock is never overridden.
+argument list with more than that one force (`-ff` counts as two), so a lock
+is never overridden. The removal runs with its own ten-minute timeout, since
+deleting a large ignored `node_modules/` can take far longer than a probe.
 
 The session child is `uatu serve`, and it is no longer a user command. A
 user-shaped invocation (`uatu serve`, the removed `watch` alias, a bare

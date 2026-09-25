@@ -14,7 +14,7 @@
 
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { rm, writeFile } from "node:fs/promises";
+import { mkdir, rm, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import type { Page } from "@playwright/test";
@@ -427,13 +427,15 @@ for (const touch of [false, true]) test.describe(touch ? "worktree dialog on tou
     await expect(page.locator("[data-worktree-confirmation]")).toContainText(`Created ${branch}`);
     const checkout = await rowFor(page, parentId, branch);
     // A branch commit that ignores `.env`, then one entry of each kind.
-    await writeFile(path.join(checkout.path, ".gitignore"), ".env\n");
+    await writeFile(path.join(checkout.path, ".gitignore"), ".env\nnode_modules/\n");
     await git(checkout.path, ["add", ".gitignore"]);
     await git(checkout.path, ["commit", "-m", "ignore local settings"]);
     const head = await git(checkout.path, ["rev-parse", "HEAD"]);
     await writeFile(path.join(checkout.path, "README.md"), "# edited, not committed\n");
     await writeFile(path.join(checkout.path, "scratch.txt"), "untracked notes\n");
     await writeFile(path.join(checkout.path, ".env"), "API_TOKEN=local-only\n");
+    await mkdir(path.join(checkout.path, "node_modules", "left-pad"), { recursive: true });
+    await writeFile(path.join(checkout.path, "node_modules", "left-pad", "index.js"), "module.exports = 1;\n");
 
     await page.goto(`${hub.origin}/`);
     await dashboard(page);
@@ -445,13 +447,14 @@ for (const touch of [false, true]) test.describe(touch ? "worktree dialog on tou
     await deleteButton().click();
     await expect(dialog).toContainText("Delete worktree?");
     await expect(dialog).toContainText("The worktree’s files will be removed. The Git branch will be kept.");
-    await expect(dialog).toContainText("These files will be permanently deleted with the worktree and cannot be recovered.");
+    await expect(dialog).toContainText("These files and folders will be permanently deleted with the worktree, including everything inside each listed folder, and cannot be recovered.");
     await expect(dialog).toContainText("Uncommitted changes (1)");
     await expect(dialog).toContainText("README.md");
     await expect(dialog).toContainText("Untracked files (1)");
     await expect(dialog).toContainText("scratch.txt");
-    await expect(dialog).toContainText("Ignored files (1)");
-    await expect(dialog.locator("[data-local-data] li li code")).toHaveText(["README.md", "scratch.txt", ".env"]);
+    await expect(dialog).toContainText("Ignored files and folders (2)");
+    await expect(dialog.locator("[data-local-data] li li code")).toHaveText(["README.md", "scratch.txt", ".env", "node_modules/"]);
+    await expect(dialog).toContainText("node_modules/ (folder, with everything in it)");
     await expect(dialog).not.toContainText(checkout.path);
     await expect(acknowledgement).not.toBeChecked();
     await expect(dialog.getByRole("button", { name: "Delete", exact: true })).toBeVisible();

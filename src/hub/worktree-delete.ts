@@ -34,10 +34,8 @@ import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 
-import { WorktreeOperationError, type WorktreeLocalData, type WorktreeLocalDataCategory } from "../shared/worktree-contract";
+import { WORKTREE_LOCAL_DATA_SAMPLE_LIMIT, WorktreeOperationError, type WorktreeLocalData, type WorktreeLocalDataCategory, type WorktreePhase } from "../shared/worktree-contract";
 import { assertGitArgumentSafe, type GitRunner, type WorktreeRecord } from "./worktree-git";
-
-export type RemovalDataSummary = { tracked: number; untracked: number; ignored: number };
 
 export const LOCAL_DATA_CATEGORIES = ["tracked", "untracked", "ignored"] as const;
 export type LocalDataCategoryName = (typeof LOCAL_DATA_CATEGORIES)[number];
@@ -68,12 +66,6 @@ export function categorizePorcelainStatus(output: string): CategorizedStatus {
   return status;
 }
 
-export function summarizePorcelainStatus(output: string): RemovalDataSummary {
-  const status = categorizePorcelainStatus(output);
-  return { tracked: status.tracked.length, untracked: status.untracked.length, ignored: status.ignored.length };
-}
-
-export const LOCAL_DATA_SAMPLE_SIZE = 5;
 const FINGERPRINT_DOMAIN = "uatu-worktree-local-data-v1";
 
 // The server-side description: the wire categories plus every sorted entry
@@ -112,7 +104,7 @@ export function describeLocalData(checkoutId: string, status: CategorizedStatus)
   for (const category of LOCAL_DATA_CATEGORIES) {
     const entries = status[category].map(entry => entry.path).sort(byCodeUnits);
     if (entries.length === 0) continue;
-    categories[category] = { count: entries.length, sample: entries.slice(0, LOCAL_DATA_SAMPLE_SIZE), entries };
+    categories[category] = { count: entries.length, sample: entries.slice(0, WORKTREE_LOCAL_DATA_SAMPLE_LIMIT), entries };
   }
   return { ...categories, fingerprint: localDataFingerprint(checkoutId, all) };
 }
@@ -135,15 +127,18 @@ function plural(count: number, one: string, many: string): string {
   return `${count} ${count === 1 ? one : many}`;
 }
 
-async function exists(candidate: string): Promise<boolean> {
+// What `lstat` says about a location. Only ENOENT and ENOTDIR prove
+// absence; any other failure (a permission change, an I/O error) is
+// `unreadable`, which every caller refuses — never mistakes for absence.
+type PathState = "absent" | "present" | "unreadable";
+
+async function probePath(candidate: string): Promise<PathState> {
   try {
     await fs.lstat(candidate);
-    return true;
+    return "present";
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
-    if (code === "ENOENT" || code === "ENOTDIR") return false;
-    // An unreadable location is not proof of absence.
-    return true;
+    return code === "ENOENT" || code === "ENOTDIR" ? "absent" : "unreadable";
   }
 }
 
@@ -158,11 +153,22 @@ function nestedRepository(relative: string): WorktreeOperationError {
 }
 
 const UNINSPECTABLE = "The worktree's files could not be inspected, so it was not removed.";
+const UNINSPECTABLE_CHECKOUT = "The worktree could not be inspected, so it was not removed.";
 
 // The index listing is the one probe whose output grows with the repository
 // (about 90 bytes per tracked file), so it gets its own, larger bound —
 // roughly 700k tracked files — and still fails closed beyond it.
 export const INDEX_OUTPUT_LIMIT = 64 * 1024 * 1024;
+// The status and index listings scale with the checkout, so they get more
+// time than the runner's 10-second default; still bounded, still failing
+// closed as "could not be inspected".
+export const INSPECTION_PROBE_TIMEOUT_MS = 60_000;
+// `git worktree remove` deletes every file, including a large ignored
+// `node_modules/`. Killing it mid-way leaves a partly deleted checkout, so
+// it gets a long bound of its own (design D4).
+export const WORKTREE_REMOVE_TIMEOUT_MS = 10 * 60_000;
+// `lstat` calls in flight at once while looking for nested repositories.
+const NESTED_PROBE_CONCURRENCY = 32;
 
 // Probe output is decoded leniently, so bytes that are not UTF-8 arrive as
 // U+FFFD. Such a path cannot be checked on disk (the lookup would miss the
@@ -171,24 +177,46 @@ function undecodable(relative: string): boolean {
   return relative.includes("\uFFFD");
 }
 
-// Every ancestor directory of a checkout-relative path, excluding the root.
-function addAncestors(relative: string, into: Set<string>): void {
-  const parts = relative.replace(/\/+$/, "").split("/");
-  for (let depth = 1; depth < parts.length; depth += 1) into.add(parts.slice(0, depth).join("/"));
+// Adds every ancestor directory of each checkout-relative path (excluding
+// the root) to `into`. Linear: the walk up from a path stops at the first
+// ancestor already present, because that ancestor's own ancestors were
+// added when it was. Returns `into`.
+export function collectAncestorDirectories(paths: Iterable<string>, into: Set<string> = new Set()): Set<string> {
+  for (const raw of paths) {
+    let end = raw.length;
+    while (end > 0 && raw.charCodeAt(end - 1) === 47 /* "/" */) end -= 1;
+    let cut = raw.lastIndexOf("/", end - 1);
+    while (cut > 0) {
+      const ancestor = raw.slice(0, cut);
+      if (into.has(ancestor)) break;
+      into.add(ancestor);
+      cut = raw.lastIndexOf("/", cut - 1);
+    }
+  }
+  return into;
 }
 
-// The first candidate (in order) whose `<candidate>/.git` exists, checked in
-// small concurrent batches so a large index stays quick. `exists` fails
-// closed: an unreadable location counts as present.
-async function firstNestedRepository(checkoutPath: string, candidates: readonly string[]): Promise<string | undefined> {
-  const BATCH = 64;
-  for (let start = 0; start < candidates.length; start += BATCH) {
-    const batch = candidates.slice(start, start + BATCH);
-    const found = await Promise.all(batch.map(candidate => exists(path.join(checkoutPath, candidate, ".git"))));
-    const index = found.indexOf(true);
-    if (index >= 0) return batch[index];
-  }
-  return undefined;
+// The first candidate, in the given order, whose `<candidate>/.git` is not
+// provably absent — with what was found there. Bounded concurrency: work is
+// handed out in order, so when a hit is found every earlier candidate has
+// already been started and is awaited before the answer is final.
+async function firstNestedRepository(checkoutPath: string, candidates: readonly string[]): Promise<{ readonly candidate: string; readonly state: "present" | "unreadable" } | undefined> {
+  let next = 0;
+  let best = candidates.length;
+  let bestState: "present" | "unreadable" = "present";
+  const worker = async () => {
+    for (;;) {
+      const index = next++;
+      if (index >= best) return;
+      const state = await probePath(path.join(checkoutPath, candidates[index]!, ".git"));
+      if (state !== "absent" && index < best) {
+        best = index;
+        bestState = state;
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(NESTED_PROBE_CONCURRENCY, candidates.length) }, worker));
+  return best < candidates.length ? { candidate: candidates[best]!, state: bestState } : undefined;
 }
 
 export type RemovalSafetyInput = {
@@ -215,8 +243,8 @@ export async function inspectRemovalSafety(input: RemovalSafetyInput): Promise<R
   if (record.locked) {
     return { blocked: blocker("git-lock", "This worktree is locked in Git. Unlock it outside Uatu if it is safe, then retry. Nothing was removed.") };
   }
-  const nested = records.find(candidate => inside(checkoutPath, candidate.path));
-  if (nested) {
+  const nestedWorktree = records.find(candidate => inside(checkoutPath, candidate.path));
+  if (nestedWorktree) {
     return { blocked: blocker("nested-dependency", "Another worktree is inside this folder. Remove or move it first; nothing was removed.") };
   }
 
@@ -228,36 +256,31 @@ export async function inspectRemovalSafety(input: RemovalSafetyInput): Promise<R
   const resolved = await run(["rev-parse", "--path-format=absolute", ...gitPaths.flatMap(marker => ["--git-path", marker])], checkoutPath);
   const resolvedPaths = resolved.stdout.trimEnd().split("\n");
   if (resolved.exitCode !== 0 || resolved.timedOut || resolved.outputExceeded || resolvedPaths.length !== gitPaths.length || resolvedPaths.some(candidate => !path.isAbsolute(candidate))) {
-    return { blocked: blocker("identity-uncertain", "The worktree could not be inspected, so it was not removed.") };
+    return { blocked: blocker("identity-uncertain", UNINSPECTABLE_CHECKOUT) };
   }
   for (const marker of resolvedPaths.slice(0, markers.length)) {
-    if (await exists(marker)) {
+    const state = await probePath(marker);
+    if (state === "unreadable") return { blocked: blocker("identity-uncertain", UNINSPECTABLE_CHECKOUT) };
+    if (state === "present") {
       return { blocked: blocker("external-activity", "A Git operation appears to be running or paused in this worktree outside Uatu. Finish or abort it, then retry. Nothing was removed.") };
     }
   }
   // This tree's own submodule repositories (`<gitdir>/worktrees/<id>/modules`),
   // which a forced removal would delete with it. Git applies the same test
   // before a non-force removal.
-  if (await exists(resolvedPaths[markers.length]!)) {
+  const modules = await probePath(resolvedPaths[markers.length]!);
+  if (modules === "unreadable") return { blocked: blocker("identity-uncertain", UNINSPECTABLE_CHECKOUT) };
+  if (modules === "present") {
     return { blocked: blocker("nested-dependency", "This worktree contains an initialized submodule. Remove or move it outside Uatu first. Nothing was removed.") };
   }
 
-  const statusRun = await run(["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored=matching", "--no-renames"], checkoutPath);
+  const statusRun = await run(["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored=matching", "--no-renames"], checkoutPath, { timeoutMs: INSPECTION_PROBE_TIMEOUT_MS });
   if (statusRun.exitCode !== 0 || statusRun.timedOut || statusRun.outputExceeded) {
     return { blocked: blocker("identity-uncertain", UNINSPECTABLE) };
   }
   const status = categorizePorcelainStatus(statusRun.stdout);
   const entries = [...status.tracked, ...status.untracked, ...status.ignored];
   if (entries.some(entry => undecodable(entry.path))) return { blocked: blocker("identity-uncertain", UNINSPECTABLE) };
-
-  // A directory entry is where Git stopped descending. Under
-  // `--untracked-files=all` an untracked one is always a nested repository;
-  // an ignored one is checked at its root only (walking it is unbounded).
-  for (const entry of [...status.untracked, ...status.ignored]) {
-    if (entry.path.endsWith("/") && await exists(path.join(checkoutPath, entry.path, ".git"))) {
-      return { blocked: nestedRepository(entry.path) };
-    }
-  }
 
   // The index covers what status cannot show. Git lists tracked files even
   // inside a directory that has since become a repository of its own, and a
@@ -268,12 +291,12 @@ export async function inspectRemovalSafety(input: RemovalSafetyInput): Promise<R
   //     catches embedded repositories added without a `.gitmodules` entry;
   //   * a `.git` in any ancestor directory of a tracked path or of a status
   //     entry — a repository nested inside tracked content.
-  const index = await run(["ls-files", "-z", "--stage"], checkoutPath, { outputLimit: INDEX_OUTPUT_LIMIT });
+  const index = await run(["ls-files", "-z", "--stage"], checkoutPath, { outputLimit: INDEX_OUTPUT_LIMIT, timeoutMs: INSPECTION_PROBE_TIMEOUT_MS });
   if (index.exitCode !== 0 || index.timedOut || index.outputExceeded) {
     return { blocked: blocker("identity-uncertain", UNINSPECTABLE) };
   }
   const gitlinks: string[] = [];
-  const directories = new Set<string>();
+  const indexed: string[] = [];
   for (const record of index.stdout.split("\0")) {
     if (record === "") continue;
     const tab = record.indexOf("\t");
@@ -281,13 +304,27 @@ export async function inspectRemovalSafety(input: RemovalSafetyInput): Promise<R
     const relative = record.slice(tab + 1);
     if (relative === "" || undecodable(relative)) return { blocked: blocker("identity-uncertain", UNINSPECTABLE) };
     if (record.startsWith("160000 ")) gitlinks.push(relative);
-    addAncestors(relative, directories);
+    indexed.push(relative);
   }
-  for (const entry of entries) addAncestors(entry.path, directories);
-  const nestedGitlink = await firstNestedRepository(checkoutPath, gitlinks);
-  if (nestedGitlink !== undefined) return { blocked: nestedRepository(nestedGitlink) };
-  const nestedDirectory = await firstNestedRepository(checkoutPath, [...directories].sort(byCodeUnits));
-  if (nestedDirectory !== undefined) return { blocked: nestedRepository(nestedDirectory) };
+
+  // One pass over every place a nested repository could hide, each checked
+  // once, in a fixed order that decides which one a refusal names:
+  //   1. directory entries — where Git stopped descending. Under
+  //      `--untracked-files=all` an untracked one is always a nested
+  //      repository; an ignored one is checked at its root only (walking it
+  //      is unbounded);
+  //   2. gitlinks;
+  //   3. every ancestor directory of an index path or status entry, sorted.
+  const candidates = new Set<string>();
+  for (const entry of [...status.untracked, ...status.ignored]) {
+    if (entry.path.endsWith("/")) candidates.add(entry.path.replace(/\/+$/, ""));
+  }
+  for (const gitlink of gitlinks) candidates.add(gitlink);
+  const ancestors = collectAncestorDirectories(entries.map(entry => entry.path), collectAncestorDirectories(indexed));
+  for (const directory of [...ancestors].sort(byCodeUnits)) candidates.add(directory);
+  const nested = await firstNestedRepository(checkoutPath, [...candidates]);
+  if (nested?.state === "unreadable") return { blocked: blocker("identity-uncertain", UNINSPECTABLE) };
+  if (nested) return { blocked: nestedRepository(nested.candidate) };
 
   const localData = describeLocalData(checkoutId, status);
   return localData ? { clear: true, localData } : { clear: true };
@@ -307,13 +344,33 @@ export function checkLocalDataAcknowledgement(localData: LocalDataDescription | 
     if (untracked) {
       return blocker("local-data", `It has untracked files (${plural(untracked.count, "file", "files")}). Commit, move or delete them, or confirm deleting them with the worktree. Nothing was removed.`);
     }
+    // An ignored entry may be a whole folder, so it is counted as an item.
     const count = ignored?.count ?? 0;
-    return blocker("local-data", `It has ignored files (${plural(count, "file", "files")}), such as build output or local settings, that would be lost. Move or delete them, or confirm deleting them with the worktree. Nothing was removed.`);
+    return blocker("local-data", `It has ignored files or folders (${plural(count, "item", "items")}), such as build output or local settings, that would be lost. Move or delete them, or confirm deleting them with the worktree. Nothing was removed.`);
   }
   if (fingerprint !== localData.fingerprint) {
-    return blocker("local-data", "The worktree's files changed while deletion was prepared. Review the deletion again. Nothing was removed.");
+    // Resending the same request can never succeed: the acknowledged set is
+    // gone. `refresh` asks for a new preflight to review.
+    return blocker("local-data", "The worktree's files changed while deletion was prepared. Review the deletion again. Nothing was removed.", "refresh");
   }
   return undefined;
+}
+
+// The one acknowledgement rule every deletion check applies — the fenced
+// re-preflight, the post-stop recheck and the final probe before Git — with
+// only its phase and message prefix as parameters. A missing
+// acknowledgement gets `prefix` (the final probe explains that the tree
+// changed); a stale one already says so and never gets it.
+export function localDataRefusal(
+  localData: LocalDataDescription | WorktreeLocalData | undefined,
+  fingerprint: string | undefined,
+  phase: WorktreePhase,
+  prefix = "",
+): WorktreeOperationError | undefined {
+  const refusal = checkLocalDataAcknowledgement(localData, fingerprint);
+  if (!refusal) return undefined;
+  const message = fingerprint === undefined ? `${prefix}${refusal.detail.message}` : refusal.detail.message;
+  return new WorktreeOperationError({ ...refusal.detail, message, phase });
 }
 
 // Git refuses a non-force removal of tracked changes or untracked files;
@@ -369,10 +426,11 @@ export function classifyWorktreeRemoveFailure(stderr: string): WorktreeOperation
 export type WorktreeRemoveOutcome = { readonly ok: true } | { readonly ok: false; readonly error: WorktreeOperationError };
 
 export async function runWorktreeRemove(run: GitRunner, mainPath: string, checkoutPath: string, options: { readonly force: boolean }): Promise<WorktreeRemoveOutcome> {
-  const result = await run(buildWorktreeRemoveArguments(checkoutPath, options), mainPath);
+  const result = await run(buildWorktreeRemoveArguments(checkoutPath, options), mainPath, { timeoutMs: WORKTREE_REMOVE_TIMEOUT_MS });
   if (result.exitCode === 0 && !result.timedOut) return { ok: true };
   if (result.timedOut) {
-    return { ok: false, error: WorktreeOperationError.of("timeout", "Removing the worktree timed out. Refresh the inventory before retrying.", { retry: "refresh", phase: "removing" }) };
+    // Git was stopped part-way: some files may already be gone.
+    return { ok: false, error: WorktreeOperationError.of("timeout", "Removing the worktree timed out, so some of its files may already be deleted. Refresh the inventory and review the deletion again.", { retry: "refresh", phase: "removing" }) };
   }
   return { ok: false, error: classifyWorktreeRemoveFailure(result.stderr || result.stdout) };
 }

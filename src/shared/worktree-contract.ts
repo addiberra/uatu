@@ -178,8 +178,15 @@ export type WorktreeRegisterRequest = {
   readonly start?: boolean;
 };
 
+// How many sample paths a local-data category carries at most. The ONE
+// value the Hub's description, the closed parser (server, SPA and inline
+// dashboard alike, through the injected vocabulary) and the OpenAPI
+// `maxItems` agree on — worktree-contract.test.ts ties them together.
+export const WORKTREE_LOCAL_DATA_SAMPLE_LIMIT = 5;
+
 // One category of acknowledgeable local data: how many status entries it
-// has (a wholly ignored directory counts once) and up to five of them,
+// has (a wholly ignored directory counts once, and stands for everything
+// inside it) and up to WORKTREE_LOCAL_DATA_SAMPLE_LIMIT of them,
 // sorted, as checkout-relative paths — never absolute.
 export type WorktreeLocalDataCategory = {
   readonly count: number;
@@ -531,7 +538,7 @@ export function canDeleteWorktree(checkout: Pick<WorktreeCheckout, "ownership" |
 const parserVocabulary = {
   WORKTREE_OWNERSHIPS, WORKTREE_AVAILABILITIES, WORKTREE_INVENTORY_STATUSES,
   WORKTREE_UNKNOWN_REPOSITORY, WORKTREE_OPERATION_KINDS, WORKTREE_CREATE_MODES,
-  WORKTREE_ERROR_CODES, WORKTREE_RETRY_ACTIONS, PHASES,
+  WORKTREE_ERROR_CODES, WORKTREE_RETRY_ACTIONS, PHASES, WORKTREE_LOCAL_DATA_SAMPLE_LIMIT,
 };
 export function createWorktreeParsers(
   vocabulary: typeof parserVocabulary,
@@ -541,7 +548,7 @@ export function createWorktreeParsers(
 ) {
 const { WORKTREE_OWNERSHIPS, WORKTREE_AVAILABILITIES, WORKTREE_INVENTORY_STATUSES,
   WORKTREE_UNKNOWN_REPOSITORY, WORKTREE_OPERATION_KINDS, WORKTREE_CREATE_MODES,
-  WORKTREE_ERROR_CODES, WORKTREE_RETRY_ACTIONS, PHASES } = vocabulary;
+  WORKTREE_ERROR_CODES, WORKTREE_RETRY_ACTIONS, PHASES, WORKTREE_LOCAL_DATA_SAMPLE_LIMIT } = vocabulary;
 const { validWorktreeBranch } = branches;
 const { sanitizeWorktreeMessage } = messages;
 function isWorktreePhase(operation: WorktreePhasedOperation, value: unknown): value is WorktreePhase {
@@ -759,7 +766,7 @@ function parseWorktreeLocalDataCategory(value: unknown, label: string): Worktree
   const count = record.count;
   if (typeof count !== "number" || !Number.isInteger(count) || count < 1) fail(`${label} requires a positive count`);
   const sample = record.sample;
-  if (!Array.isArray(sample) || sample.length > 5 || sample.length > count) fail(`${label} has an invalid sample`);
+  if (!Array.isArray(sample) || sample.length > WORKTREE_LOCAL_DATA_SAMPLE_LIMIT || sample.length > count) fail(`${label} has an invalid sample`);
   if (sample.some(entry => typeof entry !== "string" || entry === "" || entry.startsWith("/"))) fail(`${label} sample must be checkout-relative paths`);
   return { count, sample: [...sample as string[]] };
 }

@@ -54,7 +54,7 @@ import {
   type WorktreeGitOptions,
   type WorktreeRecord,
 } from "./worktree-git";
-import { checkLocalDataAcknowledgement, inspectRemovalSafety, removalRequiresForce, runWorktreeRemove, toWireLocalData } from "./worktree-delete";
+import { inspectRemovalSafety, localDataRefusal, removalRequiresForce, runWorktreeRemove, toWireLocalData } from "./worktree-delete";
 import {
   ownershipForCheckout,
   recoverWorktreeOperation,
@@ -725,7 +725,7 @@ export class WorktreeService {
     const preflight = await this.preflightIn(view, request.reference);
     if (!preflight.ok) return refuse(new WorktreeOperationError(preflight.error), "preflight");
     const checkout = preflight.checkout;
-    const unacknowledged = checkLocalDataAcknowledgement(preflight.localData, request.localDataFingerprint);
+    const unacknowledged = localDataRefusal(preflight.localData, request.localDataFingerprint, "preflight");
     if (unacknowledged) return refuse(unacknowledged, "preflight");
     if (preflight.requiresStop && request.stop !== true) {
       return refuse(WorktreeOperationError.of("conflict", "This worktree is running. Choose Stop and delete to stop its Uatu sessions first. Nothing was removed.", { retry: "retry-delete", phase: "preflight" }), "preflight");
@@ -774,8 +774,8 @@ export class WorktreeService {
         if (recheck.checkout.checkoutId !== checkout.checkoutId || recheck.checkout.path !== checkout.path) {
           throw WorktreeOperationError.of("identity-uncertain", "The worktree changed while deletion was prepared. Nothing was removed.", { retry: "refresh", phase: "rechecking" });
         }
-        const changed = checkLocalDataAcknowledgement(recheck.localData, request.localDataFingerprint);
-        if (changed) throw new WorktreeOperationError({ ...changed.detail, phase: "rechecking" });
+        const changed = localDataRefusal(recheck.localData, request.localDataFingerprint, "rechecking");
+        if (changed) throw changed;
         // Written into Git's administrative directory for this tree, which
         // `git worktree remove` deletes with it: its survival is what proves
         // "not removed" even when a new tree reuses the same name.
@@ -801,18 +801,14 @@ export class WorktreeService {
         const safety = sameCheckout
           ? await inspectRemovalSafety({ run: this.run, checkoutPath: checkout.path, checkoutId: checkout.checkoutId, records: finalView.records })
           : undefined;
-        const finalData = safety && "clear" in safety ? safety.localData : undefined;
-        const unacknowledged = safety && "clear" in safety ? checkLocalDataAcknowledgement(finalData, request.localDataFingerprint) : undefined;
-        const blocker = safety && "blocked" in safety ? safety.blocked : unacknowledged;
-        if (!sameCheckout || blocker) {
-          // A fingerprint mismatch already says the files changed; every
-          // other refusal here gets that prefix.
-          const mismatch = unacknowledged !== undefined && request.localDataFingerprint !== undefined;
-          const message = mismatch
-            ? unacknowledged.detail.message
-            : `The worktree changed while deletion was prepared. ${blocker?.detail.message ?? "Its identity could not be verified. Nothing was removed."}`;
-          throw WorktreeOperationError.of(blocker?.detail.code ?? "identity-uncertain", message, { retry: blocker?.detail.retry ?? "refresh", phase: "removing" });
+        const changedPrefix = "The worktree changed while deletion was prepared. ";
+        if (!safety || "blocked" in safety) {
+          const blocker = safety?.blocked;
+          throw WorktreeOperationError.of(blocker?.detail.code ?? "identity-uncertain", `${changedPrefix}${blocker?.detail.message ?? "Its identity could not be verified. Nothing was removed."}`, { retry: blocker?.detail.retry ?? "refresh", phase: "removing" });
         }
+        const finalData = safety.localData;
+        const unacknowledged = localDataRefusal(finalData, request.localDataFingerprint, "removing", changedPrefix);
+        if (unacknowledged) throw unacknowledged;
         // Force is derived ONLY from the final, fingerprint-matched data —
         // never from the request — and is a single `--force`, which Git
         // does not let override a lock.
