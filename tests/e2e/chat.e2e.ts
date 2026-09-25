@@ -2,6 +2,7 @@ import type { APIRequestContext, Page } from "@playwright/test";
 
 import type { ConversationItem } from "../../src/chat/types";
 import { chooseChatModel, installClipboardMock, openChatConfiguration, openChatPanel, readClipboardMock } from "./chat-helpers";
+import { captureScreenshot } from "./evidence";
 import { expect, test } from "./fixtures";
 
 async function bootChat(page: Page, request: APIRequestContext): Promise<void> {
@@ -197,6 +198,99 @@ test.describe("desktop OpenCode chat", () => {
     await page.locator("#chat-send").click();
     expect((await response).request().postDataJSON()).toMatchObject({ text: "/review API routes" });
     await expect(page.locator("#chat-items")).toContainText("/review API routes");
+  });
+
+  test("wraps long slash-command descriptions in full and keeps the highlight in view", async ({ page, request }, testInfo) => {
+    const long = (topic: string) => `${topic}: ${"Review the diff for correctness bugs, reuse, simplification, and efficiency cleanups at the chosen effort level, then report ranked findings. ".repeat(3)}End of ${topic}.`;
+    await control(request, { action: "commands", commands: Array.from({ length: 6 }, (_, index) => ({
+      name: `code-lint-${index}`, description: long(`lint ${index}`), argumentHint: "[path/to/a/rather/long/argument/hint/that/also/wraps]", kind: "skill",
+    })) });
+    await page.reload();
+    await openChatPanel(page);
+    await page.getByRole("button", { name: "New conversation" }).click();
+    const input = page.locator("#chat-input");
+    await input.fill("/code-lint");
+    const menu = page.locator("#chat-command-menu");
+    await expect(menu.getByRole("option")).toHaveCount(6);
+    const measured = await menu.evaluate(element => ({
+      horizontal: element.scrollWidth - element.clientWidth,
+      descriptions: [...element.querySelectorAll<HTMLElement>(".chat-command-description")].map(description => ({
+        text: description.textContent,
+        // Line height is "normal" here; two font sizes is well past one line.
+        multiline: description.getBoundingClientRect().height > 2 * parseFloat(getComputedStyle(description).fontSize),
+        clipped: description.scrollHeight > description.clientHeight + 1 || description.scrollWidth > description.clientWidth + 1,
+        ellipsis: getComputedStyle(description).textOverflow,
+        whiteSpace: getComputedStyle(description).whiteSpace,
+      })),
+    }));
+    expect(measured.horizontal).toBeLessThanOrEqual(1);
+    for (const [index, description] of measured.descriptions.entries()) {
+      // Every suggestion, highlighted or not, shows its whole description.
+      expect(description.text).toContain(`End of lint ${index}.`);
+      expect(description.multiline).toBe(true);
+      expect(description.clipped).toBe(false);
+      expect(description.ellipsis).not.toBe("ellipsis");
+      expect(description.whiteSpace).not.toBe("nowrap");
+    }
+    await captureScreenshot(page, testInfo, "slash-command-descriptions-wrap");
+
+    // The highlight walks down through tall options and stays inside the menu.
+    const inView = () => menu.evaluate(element => {
+      const active = element.querySelector<HTMLElement>(".chat-command-option.is-active")!;
+      const bounds = element.getBoundingClientRect();
+      const option = active.getBoundingClientRect();
+      return { name: active.querySelector(".chat-command-name")!.textContent, visible: option.top >= bounds.top - 1 && option.bottom <= bounds.bottom + 1 };
+    });
+    for (let step = 1; step < 6; step++) {
+      await page.keyboard.press("ArrowDown");
+      await expect.poll(inView).toEqual({ name: `/code-lint-${step}`, visible: true });
+    }
+    for (let step = 4; step >= 0; step--) {
+      await page.keyboard.press("ArrowUp");
+      await expect.poll(inView).toEqual({ name: `/code-lint-${step}`, visible: true });
+    }
+  });
+
+  test("dates the conversation with sticky day separators", async ({ page, request }, testInfo) => {
+    // Local instants in the page's zone: two days ago, yesterday, and today.
+    const days = await page.evaluate(() => {
+      const today = new Date();
+      const at = (offset: number, hour: number) => new Date(today.getFullYear(), today.getMonth(), today.getDate() - offset, hour, 0).getTime();
+      const older = new Date(at(2, 9));
+      return { older: at(2, 9), yesterday: at(1, 9), today: at(0, 0) + 60_000, olderLabel: older.toLocaleDateString([], { weekday: "long", day: "numeric", month: "long", ...(older.getFullYear() === today.getFullYear() ? {} : { year: "numeric" }) }) };
+    });
+    const run = (prefix: string, start: number, count: number): ConversationItem[] => Array.from({ length: count }, (_, index) => ({
+      id: `message:${prefix}-${index}`, type: "user_message", createdAt: start + index * 60_000, text: `${prefix} message ${index} ${"content ".repeat(14)}`,
+    }));
+    const seeded = await control(request, { action: "seed", title: "Dated", items: [...run("older", days.older, 3), ...run("yesterday", days.yesterday, 24), ...run("today", days.today, 3)] }) as { conversation: { id: string } };
+    await page.reload();
+    await openChatPanel(page);
+    await expect(page.locator("#chat-conversation-select")).toHaveValue(seeded.conversation.id);
+    const separators = page.locator("#chat-items > .chat-day-separator");
+    await expect(separators).toHaveText([days.olderLabel, "Yesterday", "Today"]);
+    const order = await page.locator("#chat-items > *").evaluateAll(nodes => nodes.map(node => node.classList.contains("chat-day-separator") ? `day:${node.textContent}` : node.getAttribute("data-chat-item-id")));
+    expect(order.indexOf("day:Yesterday")).toBe(order.indexOf("message:yesterday-0") - 1);
+    expect(order.indexOf("day:Today")).toBe(order.indexOf("message:today-0") - 1);
+    await expect(separators.nth(1)).toHaveAttribute("role", "separator");
+    await expect(separators.nth(1)).not.toHaveAttribute("data-chat-item-id", /.*/);
+
+    // Scroll back into the middle of yesterday: its separator stays pinned at the top.
+    const timeline = page.locator("#chat-timeline");
+    await page.locator('[data-chat-item-id="message:yesterday-14"]').evaluate(element => element.scrollIntoView({ block: "center" }));
+    const pinned = async () => timeline.evaluate(element => {
+      const top = element.getBoundingClientRect().top;
+      const candidates = [...element.querySelectorAll<HTMLElement>(".chat-day-separator")].filter(separator => {
+        const bounds = separator.getBoundingClientRect();
+        return bounds.top >= top - 1 && bounds.top <= top + 24;
+      });
+      // Later separators paint over earlier ones; the last pinned one is what the reader sees.
+      return candidates.at(-1)?.textContent ?? null;
+    });
+    await expect.poll(pinned).toBe("Yesterday");
+    await captureScreenshot(page, testInfo, "chat-day-separator-sticky");
+    // Past yesterday's first message, the older day's separator takes over.
+    await timeline.evaluate(element => { element.scrollTop = 0; });
+    await expect.poll(pinned).toBe(days.olderLabel);
   });
 
   test("keeps an active turn timer across conversation navigation", async ({ page }) => {

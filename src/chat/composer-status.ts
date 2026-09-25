@@ -6,6 +6,9 @@
 import { backgroundStatusLabel } from "./background-tasks";
 import { scheduledStatusLabel } from "./scheduled-wakeups";
 import { statusLabel } from "./timeline-renderer";
+import { relativeReset, resetClock, resetMoment } from "./dates";
+
+export { relativeReset, resetClock, resetMoment };
 import { isRateLimitStanding, type BackgroundTaskItem, type ScheduledWakeupItem, type ContextReportItem, type ConversationItem, type ConversationStatus, type NoticeItem, type PlanUtilization, type PlanUtilizationWindow, type SessionTotals, type UsageReadFailure } from "./types";
 
 export type ComposerRoutineState = {
@@ -118,9 +121,20 @@ export function planChip(report: Pick<ContextReportItem, "plan" | "session"> | u
   return summary ? { text: summary, level: "normal", kind: "cost" } : undefined;
 }
 
-export function rateLimitBadgeLabel(standing: RateLimitStanding): string {
-  const resets = standing.resetsAt === undefined ? "" : ` · resets ${new Date(standing.resetsAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
+export function rateLimitBadgeLabel(standing: RateLimitStanding, now = Date.now()): string {
+  // The chip is tight for room: the clock, with its day when not today, is
+  // what removes the ambiguity; the readout carries the relative time.
+  const resets = standing.resetsAt === undefined ? "" : ` · resets ${resetClock(standing.resetsAt, now)}`;
   return standing.level === "rejected" ? `Rate limited${resets}` : `Near rate limit${resets}`;
+}
+
+/**
+ * The standing as one sentence — the readout's standing line and what is
+ * announced to assistive technology — with its reset phrased as the plan
+ * rows phrase theirs: "… Resets Thu 23:00 · in 3d 4h."
+ */
+export function standingSentence(standing: Pick<RateLimitStanding, "message" | "resetsAt">, now = Date.now()): string {
+  return standing.resetsAt === undefined ? standing.message : `${standing.message} Resets ${resetMoment(standing.resetsAt, now)}.`;
 }
 
 /**
@@ -283,33 +297,6 @@ export function planReadoutRows(plan: PlanUtilization, now = Date.now()): PlanRe
     rows.push({ key: "extra-usage", label: "Extra usage", ...(extra.utilization === undefined ? {} : { utilization: extra.utilization }), resetLabel: "", ...(note ? { note } : {}) });
   }
   return rows;
-}
-
-/**
- * "in 4d 11h" / "in 2h 05m" / "in 35m"; "now" once the reset has passed
- * and the next report has not yet said so. Minutes are dropped past a day
- * because a weekly window is not waited on to the minute.
- */
-export function relativeReset(resetsAt: number, now = Date.now()): string {
-  const remaining = resetsAt - now;
-  if (remaining < 30_000) return "now";
-  const minutes = Math.round(remaining / 60_000);
-  if (minutes < 60) return `in ${minutes}m`;
-  const hours = Math.floor(minutes / 60);
-  if (hours < 24) return `in ${hours}h ${String(minutes % 60).padStart(2, "0")}m`;
-  const days = Math.floor(hours / 24);
-  return `in ${days}d ${hours % 24}h`;
-}
-
-/**
- * The reset as a clock time — bare within the coming day ("14:00"), with
- * the weekday beyond it ("Sat 21:00"), since a bare time a week out would
- * read as today.
- */
-export function resetClock(resetsAt: number, now = Date.now()): string {
-  const date = new Date(resetsAt);
-  const time = date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-  return resetsAt - now < 86_400_000 ? time : `${date.toLocaleDateString([], { weekday: "short" })} ${time}`;
 }
 
 /**

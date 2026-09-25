@@ -1164,3 +1164,47 @@ test.describe("rate-limit standing in touch mode", () => {
     await captureScreenshot(page, testInfo, "touch-rate-limit-rejected");
   });
 });
+
+test("day separators and wrapped slash-command descriptions fit the touch layout", async ({ page, request }, testInfo) => {
+  // Seeded before the page exists, so the days are local to the test runner,
+  // which shares the browser's zone.
+  const now = new Date();
+  const at = (offset: number, hour: number) => new Date(now.getFullYear(), now.getMonth(), now.getDate() - offset, hour, 0).getTime();
+  const items: ConversationItem[] = [
+    ...messages("yesterday", 6, at(1, 12)),
+    ...messages("today", 2, at(0, 0) + 60_000),
+  ];
+  await boot(page, request, { items });
+  const separators = page.locator("#chat-items > .chat-day-separator");
+  await expect(separators).toHaveText(["Yesterday", "Today"]);
+  const band = await separators.first().evaluate(element => {
+    const timeline = element.closest(".chat-timeline")!.getBoundingClientRect();
+    const bounds = element.getBoundingClientRect();
+    return { withinWidth: bounds.left >= timeline.left - 1 && bounds.right <= timeline.right + 1 };
+  });
+  expect(band.withinWidth).toBe(true);
+  await captureScreenshot(page, testInfo, "touch-day-separators");
+
+  await control(request, { action: "commands", commands: [{
+    name: "code-review-with-a-rather-long-command-name", kind: "skill", argumentHint: "[path/to/a/long/argument]",
+    description: `${"Review the diff for correctness bugs, reuse, simplification, and efficiency cleanups at the chosen effort level. ".repeat(2)}End of review.`,
+  }] });
+  await page.reload();
+  await page.locator("#touch-tab-chat").click();
+  const input = page.locator("#chat-input");
+  await input.fill("/code-review-with");
+  const menu = page.locator("#chat-command-menu");
+  await expect(menu.getByRole("option")).toHaveCount(1);
+  const measured = await menu.evaluate(element => {
+    const description = element.querySelector<HTMLElement>(".chat-command-description")!;
+    return {
+      horizontal: element.scrollWidth - element.clientWidth,
+      text: description.textContent,
+      clipped: description.scrollHeight > description.clientHeight + 1 || description.scrollWidth > description.clientWidth + 1,
+    };
+  });
+  expect(measured.horizontal).toBeLessThanOrEqual(1);
+  expect(measured.text).toContain("End of review.");
+  expect(measured.clipped).toBe(false);
+  await captureScreenshot(page, testInfo, "touch-slash-command-descriptions-wrap");
+});

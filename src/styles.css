@@ -6412,6 +6412,38 @@ html[data-ui-mode="desktop"][data-notification-chat] .chat-expand-strip {
   font-size: 0.9em;
 }
 
+/* A day separator: where a local day's run of the conversation begins.
+   Sticky in the timeline scroller, so the day being read stays named while
+   scrolling back through it. Every separator shares one containing block,
+   so the ones already passed stay pinned too: the row is an opaque band
+   (and its shadow covers the scroller's top padding) so the latest one
+   paints over the earlier ones entirely rather than letting a wider pill
+   peek out behind it. Not an item: it carries no data-chat-item-id, so
+   anchoring and item actions pass over it. */
+.chat-day-separator {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  display: flex;
+  justify-content: center;
+  margin: 0 0 0.75rem;
+  padding: 0.25rem 0;
+  background: var(--surface);
+  box-shadow: 0 -1rem 0 var(--surface);
+}
+
+.chat-day-separator time {
+  padding: 0.12rem 0.65rem;
+  border: 1px solid var(--border-soft);
+  border-radius: 999px;
+  background: var(--surface-raised);
+  box-shadow: 0 1px 4px rgb(0 0 0 / 10%);
+  color: var(--text-subtle);
+  font-size: 0.78em;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
 .chat-request,
 .chat-file-change,
 .chat-notice,
@@ -7179,7 +7211,7 @@ html[data-ui-mode="desktop"]:not(.uatu-desktop-host) .chat-composer {
 
 .chat-command-option {
   display: grid;
-  grid-template-columns: minmax(max-content, auto) 1fr;
+  grid-template-columns: minmax(0, max-content) minmax(0, 1fr);
   gap: 0.15rem 0.65rem;
   width: 100%;
   border: 0;
@@ -7201,14 +7233,18 @@ html[data-ui-mode="desktop"]:not(.uatu-desktop-host) .chat-composer {
 
 .chat-command-name {
   font-weight: 600;
+  overflow-wrap: anywhere;
 }
 
+/* Shown in full, wrapped: a command is chosen by what it does, and a
+   one-line ellipsis hid exactly that for anything past a few words. The
+   menu is height-capped and scrolls; the highlight is scrolled into view. */
 .chat-command-hint,
 .chat-command-description {
-  overflow: hidden;
+  min-width: 0;
   color: var(--text-subtle);
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 .chat-command-description {

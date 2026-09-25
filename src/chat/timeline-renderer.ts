@@ -10,6 +10,7 @@ import { commandSubject, describeToolDetail, deriveTodoActivities, patchDiffLine
 import type { AcceptedDraft, ChatProjection } from "./projection";
 import { formatUsd } from "./usage";
 import { wakeupRowLabel } from "./scheduled-wakeups";
+import { dayLabel, fullDate, localDayKey, nextLocalMidnight, resetMoment } from "./dates";
 import { isLiveConversationStatus, isRateLimitStanding, type ActivityStatus, type ConversationItem, type ConversationStatus, type MessageAttachment, type PermissionOutcome, type QueuedMessage, type QuestionRequest, type RevertedUserMessage, type TokenUsage, type ToolItem } from "./types";
 
 type RenderedEntry = { node: HTMLElement; item: ConversationItem; active: boolean; variant: string; shellVariant?: string };
@@ -37,7 +38,13 @@ export class TimelineRenderer {
   private readonly entries = new Map<string, RenderedEntry>();
   private readonly draftEntries = new Map<string, { node: HTMLElement; draft: AcceptedDraft }>();
   private readonly groupEntries = new Map<string, HTMLElement>();
+  // One separator per local day shown, keyed by `YYYY-MM-DD` and reconciled
+  // like the group lines: presentation of the items' own times, never an item.
+  private readonly dayEntries = new Map<string, { node: HTMLElement; at: number }>();
+  private dayRollover: ReturnType<typeof setTimeout> | undefined;
   private conversationId: string | null = null;
+  // The reader's clock: "Today" is decided against it. Injectable for tests.
+  now: () => number = () => Date.now();
   private readonly shells = new Map<string, ShellOutputController>();
   private readonly shellPresentations = new Map<string, Map<string, { state: ShellPresentation; open: boolean; closed: boolean }>>();
   private shellsHidden = false;
@@ -255,11 +262,36 @@ export class TimelineRenderer {
     // is placed after the accepted drafts, not before them: the draft is the
     // prompt the agent is working on, and the line answers it.
     let awaitingNode: HTMLElement | null = null;
+    // Day separators: each top-level unit (a flat item, a group by its first
+    // member, a draft by now) that starts a new local day is preceded by that
+    // day's separator — the first day included, so a reopened conversation
+    // still says when it happened. An unknown time stays in the day before
+    // it; a day that recurs (clock skew) is not labelled twice.
+    const renderNow = this.now();
+    const liveDays = new Set<string>();
+    let currentDay: string | undefined;
+    const place = (node: HTMLElement, at: number | undefined) => {
+      if (at !== undefined && knownTime(at)) {
+        const key = localDayKey(at);
+        if (key !== currentDay && !liveDays.has(key)) {
+          liveDays.add(key);
+          let day = this.dayEntries.get(key);
+          if (!day) {
+            day = { node: buildNode(renderDaySeparator(key, at, renderNow)), at };
+            this.dayEntries.set(key, day);
+            dirty.push(day.node);
+          } else labelDaySeparator(day.node, day.at, renderNow);
+          ordered.push(day.node);
+        }
+        if (key !== currentDay) currentDay = key;
+      }
+      ordered.push(node);
+    };
     for (const segment of activitySegments(visible, projection.status, projection.acceptedDrafts.length > 0)) {
       if (!segment.group) {
         for (const item of segment.items) {
           const node = nodes.get(item.id);
-          if (node) ordered.push(node);
+          if (node) place(node, item.createdAt);
         }
         continue;
       }
@@ -302,19 +334,19 @@ export class TimelineRenderer {
           body.insertBefore(node, memberCursor);
         }
       }
-      ordered.push(groupNode);
+      place(groupNode, segment.items.find(item => knownTime(item.createdAt))?.createdAt);
     }
 
     for (const draft of projection.acceptedDrafts) {
       const entry = this.draftEntries.get(draft.requestId);
       if (entry && entry.draft.messageId === draft.messageId && entry.draft.text === draft.text) {
-        ordered.push(entry.node);
+        place(entry.node, renderNow);
         continue;
       }
       const node = buildNode(renderDraft(draft));
       entry?.node.remove();
       this.draftEntries.set(draft.requestId, { node, draft });
-      ordered.push(node);
+      place(node, renderNow);
       dirty.push(node);
     }
     if (awaitingNode) ordered.push(awaitingNode);
@@ -355,11 +387,36 @@ export class TimelineRenderer {
         this.groupEntries.delete(id);
       }
     }
+    for (const [key, day] of this.dayEntries) {
+      if (!liveDays.has(key)) {
+        day.node.remove();
+        this.dayEntries.delete(key);
+      }
+    }
+    this.armDayRollover(renderNow);
     for (const node of dirty) {
       const shell = this.shells.get(node.dataset.chatItemId ?? "");
       if (shell) shell.attach(node);
     }
     return dirty;
+  }
+
+  /**
+   * "Today" becomes "Yesterday" at the reader's midnight whether or not
+   * anything arrives: one timer to the next local midnight relabels the
+   * separators in place (text only), and re-arms itself. Any render also
+   * relabels, so a tab that slept past midnight is corrected either way.
+   */
+  private armDayRollover(now: number): void {
+    if (this.dayRollover !== undefined) clearTimeout(this.dayRollover);
+    this.dayRollover = undefined;
+    if (!this.dayEntries.size) return;
+    this.dayRollover = setTimeout(() => {
+      this.dayRollover = undefined;
+      const at = this.now();
+      for (const day of this.dayEntries.values()) labelDaySeparator(day.node, day.at, at);
+      this.armDayRollover(at);
+    }, Math.max(1_000, nextLocalMidnight(now) - now + 1_000));
   }
 
   private shellVariant(node: HTMLElement, itemId: string): string {
@@ -446,6 +503,9 @@ export class TimelineRenderer {
     this.entries.clear();
     this.draftEntries.clear();
     this.groupEntries.clear();
+    this.dayEntries.clear();
+    if (this.dayRollover !== undefined) clearTimeout(this.dayRollover);
+    this.dayRollover = undefined;
     // A confirmation left open belongs to the conversation that was showing;
     // the next one starts every card at its pending choices, and a request
     // id reused elsewhere must not inherit the stage.
@@ -1103,7 +1163,7 @@ export function renderItem(item: ConversationItem, open: boolean, activeRequest:
   }
   if (item.type === "notice") {
     // A reset time is formatted here, in the reader's zone, never on the server.
-    const resets = item.resetsAt === undefined ? "" : ` Resets ${new Date(item.resetsAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}.`;
+    const resets = item.resetsAt === undefined ? "" : ` Resets ${resetMoment(item.resetsAt)}.`;
     return `<aside class="chat-item chat-notice is-${item.level}" data-chat-item-id="${id}"${stamp}${item.code ? ` data-notice-code="${escapeHtmlAttribute(item.code)}"` : ""} role="${item.level === "error" ? "alert" : "status"}">${escapeHtml(item.message + resets)}</aside>`;
   }
   // Compaction is a boundary, not a step: a quiet rule across the timeline
@@ -1627,6 +1687,34 @@ export function statusLabel(status: ConversationStatus): string {
 
 function counts(additions?: number, deletions?: number): string {
   return additions === undefined && deletions === undefined ? "" : ` <span class="chat-change-counts">+${additions ?? 0} -${deletions ?? 0}</span>`;
+}
+
+// A time an agent actually reported. Missing times arrive as 0, and nothing
+// real predates 2001-09-09 (1e12 ms) — below it is a placeholder or a
+// seconds-for-milliseconds slip, and dating it "1 January 1970" would be a lie.
+function knownTime(at: number): boolean {
+  return Number.isFinite(at) && at >= 1e12;
+}
+
+function daySeparatorAriaLabel(at: number, now: number): string {
+  const label = dayLabel(at, now);
+  const full = fullDate(at, now);
+  return label === full ? full : `${label}, ${full}`;
+}
+
+// Not an item: no data-chat-item-id, so anchoring, item actions, copy, and
+// find-reveal pass over it. Sticky in the scroller (styles), so the day being
+// read stays named while scrolling back through it.
+function renderDaySeparator(key: string, at: number, now: number): string {
+  return `<div class="chat-day-separator" data-chat-day="${escapeHtmlAttribute(key)}" role="separator" aria-label="${escapeHtmlAttribute(daySeparatorAriaLabel(at, now))}"><time datetime="${escapeHtmlAttribute(key)}">${escapeHtml(dayLabel(at, now))}</time></div>`;
+}
+
+function labelDaySeparator(node: HTMLElement, at: number, now: number): void {
+  const label = dayLabel(at, now);
+  const time = node.querySelector("time");
+  if (time && time.textContent !== label) time.textContent = label;
+  const aria = daySeparatorAriaLabel(at, now);
+  if (node.getAttribute("aria-label") !== aria) node.setAttribute("aria-label", aria);
 }
 
 function timestampAttribute(createdAt: number): string {

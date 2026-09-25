@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { composerRoutineState, latestPlanUtilization, latestRateLimit, planChip, planHasRows, planName, planReadoutRows, planSummaryLabel, planUtilizationLabel, planUtilizationLevel, rateLimitBadgeLabel, relativeReset, sessionCostLabel, sessionTotalsTitle } from "./composer-status";
+import { composerRoutineState, latestPlanUtilization, latestRateLimit, planChip, planHasRows, planName, planReadoutRows, planSummaryLabel, planUtilizationLabel, planUtilizationLevel, rateLimitBadgeLabel, relativeReset, sessionCostLabel, sessionTotalsTitle, standingSentence } from "./composer-status";
 import { isRateLimitStanding, RATE_LIMIT_ITEM_ID, type ConversationItem, type ScheduledWakeupItem } from "./types";
 import type { RateLimitStanding } from "./composer-status";
 
@@ -230,6 +230,45 @@ describe("rate-limit badge and plan utilization", () => {
     expect(relativeReset(now + 4 * 86_400_000 + 11 * 3_600_000 + 40 * 60_000, now)).toBe("in 4d 11h");
     expect(relativeReset(now + 10_000, now)).toBe("now");
     expect(relativeReset(now - 60_000, now)).toBe("now");
+  });
+});
+
+describe("rate-limit reset wording", () => {
+  const local = (day: number, hour: number, minute = 0) => new Date(2026, 8, day, hour, minute).getTime();
+  const clock = (at: number) => new Date(at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  const weekday = (at: number) => new Date(at).toLocaleDateString([], { weekday: "short" });
+  const message = "Approaching your 7-day (overage included) rate limit (81% used).";
+
+  test("a reset later today reads as a bare time with the time remaining", () => {
+    const now = local(21, 20);
+    const reset = local(21, 23);
+    expect(standingSentence({ message, resetsAt: reset }, now)).toBe(`${message} Resets ${clock(reset)} · in 3h 00m.`);
+    expect(rateLimitBadgeLabel({ level: "warning", message, resetsAt: reset }, now)).toBe(`Near rate limit · resets ${clock(reset)}`);
+  });
+
+  test("a reset on another day names the weekday wherever the standing is stated", () => {
+    const now = local(21, 19);
+    const reset = local(24, 23);
+    expect(standingSentence({ message, resetsAt: reset }, now)).toBe(`${message} Resets ${weekday(reset)} ${clock(reset)} · in 3d 4h.`);
+    expect(rateLimitBadgeLabel({ level: "warning", message, resetsAt: reset }, now)).toBe(`Near rate limit · resets ${weekday(reset)} ${clock(reset)}`);
+    expect(rateLimitBadgeLabel({ level: "rejected", message, resetsAt: reset }, now)).toBe(`Rate limited · resets ${weekday(reset)} ${clock(reset)}`);
+  });
+
+  test("a reset early tomorrow is not read as today", () => {
+    const now = local(25, 23, 30);
+    const reset = local(26, 6);
+    expect(standingSentence({ message, resetsAt: reset }, now)).toContain(`Resets ${weekday(reset)} ${clock(reset)} · in 6h 30m.`);
+  });
+
+  test("a standing without a reset is just its message", () => {
+    expect(standingSentence({ message }, local(21, 9))).toBe(message);
+  });
+
+  test("plan rows follow the same day rule", () => {
+    const now = local(25, 23, 30);
+    const reset = local(26, 6);
+    const [row] = planReadoutRows({ fiveHour: { utilization: 40, resetsAt: reset } }, now);
+    expect(row!.resetLabel).toBe(`resets ${weekday(reset)} ${clock(reset)} · in 6h 30m`);
   });
 });
 

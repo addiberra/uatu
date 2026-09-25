@@ -50,7 +50,7 @@ import { LiveBroker, type LiveSessionChange, type LiveUpstreamSource } from "../
 import { LiveEndpoint } from "../../src/hub/live-endpoint";
 import { LIVE_STREAM_PATH } from "../../src/shared/live-protocol";
 import { FakeE2EChatService, type ReversibleFileFixture, type UsageReadOutcome } from "./chat-service";
-import type { ChatCapability, ChatModel, ConversationConfiguration, ConversationItem, ConversationStatus, AgentUsageReport } from "../../src/chat/types";
+import type { ChatCapability, ChatCommand, ChatModel, ConversationConfiguration, ConversationItem, ConversationStatus, AgentUsageReport } from "../../src/chat/types";
 
 // One-shot artificial latency for GET /api/terminal/sessions, armed by tests
 // that need two inventory reads to complete out of order (the switcher's
@@ -353,6 +353,7 @@ async function handleE2EChat(request: Request): Promise<Response> {
     message?: string;
     capabilities?: ChatCapability[];
     models?: ChatModel[];
+    commands?: ChatCommand[];
     child?: boolean;
     invalidate?: boolean;
     configuration?: ConversationConfiguration;
@@ -510,6 +511,9 @@ async function handleE2EChat(request: Request): Promise<Response> {
       break;
     case "models":
       targetFake.setModels(body.models ?? []);
+      return Response.json({ ok: true });
+    case "commands":
+      targetFake.setExtraCommands(body.commands ?? []);
       return Response.json({ ok: true });
     case "resync":
       fakeChatAgent.rotateGeneration();

@@ -23,7 +23,7 @@ import { backgroundStatusLabel, runningBackgroundTasks } from "./background-task
 import { pausedStatusLabel, pausedWakeups, pendingWakeups, scheduledStatusLabel, wakeupFireTime } from "./scheduled-wakeups";
 import { RunningWorkDisclosure } from "./running-work-disclosure";
 import { SilentRunFollower, TaskInspectionPanel, formatTaskElapsed, runningTaskForChild, taskById, taskInspection, type OpenTaskInspection } from "./task-inspection";
-import { composerRoutineState, formatUsd, latestPlanReport, latestRateLimit, planChip, planHasRows, planName, planReadoutRows, sessionTotalsTitle, usageAsOf, usageStale, type RateLimitStanding } from "./composer-status";
+import { composerRoutineState, formatUsd, latestPlanReport, latestRateLimit, planChip, planHasRows, planName, planReadoutRows, sessionTotalsTitle, standingSentence, usageAsOf, usageStale, type RateLimitStanding } from "./composer-status";
 import { buildPlanRowNodes, currentUsageReport, initUsagePaneControls, noteUsageReport, onUsageChange, onUsageRead, readStatusText, readUsageNow, refreshUsageIfStale, revealUsagePane, usageReadState, usageReadable } from "./usage-pane";
 import { isLiveConversationStatus } from "./types";
 import { contextReadout } from "./context-readout";
@@ -2225,6 +2225,8 @@ export function initChat(api = new ChatApiClient()): void {
   let planTick: ReturnType<typeof setInterval> | undefined;
   const paintPlanRows = () => {
     if (planReadoutRowsElement && paintedPlanReport?.plan) planReadoutRowsElement.replaceChildren(...buildPlanRowNodes(document, planReadoutRows(paintedPlanReport.plan)));
+    // The standing's reset reads relative to now, like the rows: ticked with them.
+    if (planReadoutStanding && paintedStanding) planReadoutStanding.textContent = standingSentence(paintedStanding);
     paintPlanAge();
     paintPlanReadControls();
   };
@@ -2377,9 +2379,8 @@ export function initChat(api = new ChatApiClient()): void {
     paintedTotalsKey = totalsKey;
     paintedStanding = standing;
     if (planReadoutStanding) {
-      const resets = standing?.resetsAt === undefined ? "" : ` Resets ${new Date(standing.resetsAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}.`;
       planReadoutStanding.hidden = !standing;
-      planReadoutStanding.textContent = standing ? `${standing.message}${resets}` : "";
+      planReadoutStanding.textContent = standing ? standingSentence(standing) : "";
     }
     const name = plan ? planName(plan) : undefined;
     if (planReadoutHead) planReadoutHead.hidden = !hasWindows;
@@ -2502,7 +2503,7 @@ export function initChat(api = new ChatApiClient()): void {
         // request. A standing that ended is worth saying too: the reader
         // was told it began, and the chip is about to go quiet.
         rateLimitLive.textContent = limit
-          ? `${limit.message}${limit.resetsAt === undefined ? "" : ` Resets ${new Date(limit.resetsAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}.`}`
+          ? standingSentence(limit)
           : previous ? "Rate limit cleared; requests are allowed again." : "";
         boundedSet(announcedStandings, projection.conversationId, limit?.level, ANNOUNCED_STANDING_LIMIT);
       }
