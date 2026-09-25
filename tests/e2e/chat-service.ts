@@ -751,13 +751,15 @@ export class FakeE2EChatService implements WorkspaceChatService {
     this.extraCommands = [];
   }
 
-  seed(title: string, items: ConversationItem[], older: ConversationItem[] = [], child = false, configuration: ConversationConfiguration = {}): ConversationSnapshot {
+  // `updatedAt` stamps a real last-activity time (epoch ms); without it the
+  // fixture's counter stands in, which the chooser treats as undated.
+  seed(title: string, items: ConversationItem[], older: ConversationItem[] = [], child = false, configuration: ConversationConfiguration = {}, updatedAt?: number): ConversationSnapshot {
     const id = `conversation-${this.nextId++}`;
     const conversation: ConversationSummary = {
       id,
       title,
-      createdAt: this.nextId,
-      updatedAt: this.nextId,
+      createdAt: updatedAt ?? this.nextId,
+      updatedAt: updatedAt ?? this.nextId,
       status: "idle",
     };
     this.conversations.set(id, conversation);

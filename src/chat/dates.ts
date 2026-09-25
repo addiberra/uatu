@@ -7,6 +7,20 @@
 
 const DAY_MS = 86_400_000;
 
+/**
+ * Whether a time is real enough to date: missing times arrive as `0`, and
+ * anything before 2001-09-09 (1e12 ms) is a placeholder or a
+ * seconds-for-milliseconds slip, which "1 January 1970" would misstate.
+ */
+export function knownTime(at: number): boolean {
+  return Number.isFinite(at) && at >= 1e12;
+}
+
+/** The reader-local clock time, "14:32" (or the locale's 12-hour form). */
+export function clockTime(at: number): string {
+  return new Date(at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
 /** Whole local calendar days from `from` to `to` (negative when earlier). */
 export function localDaysBetween(from: number, to: number): number {
   const a = new Date(from);

@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { dayLabel, fullDate, localDayKey, localDaysBetween, nextLocalMidnight, relativeReset, resetClock, resetDate, resetMoment } from "./dates";
+import { clockTime, dayLabel, fullDate, knownTime, localDayKey, localDaysBetween, nextLocalMidnight, relativeReset, resetClock, resetDate, resetMoment } from "./dates";
 
 // Local wall-clock instants, so every case holds in whatever zone runs it.
 const at = (month: number, day: number, hour = 12, minute = 0, year = 2026) => new Date(year, month - 1, day, hour, minute).getTime();
@@ -86,5 +86,18 @@ describe("day labels", () => {
 
   test("23:50 and 00:10 fall on different days", () => {
     expect(localDayKey(at(9, 24, 23, 50))).not.toBe(localDayKey(at(9, 25, 0, 10)));
+  });
+});
+
+describe("usable times", () => {
+  test("missing and placeholder times are not dated; real ones are", () => {
+    expect(knownTime(0)).toBe(false);
+    expect(knownTime(Number.NaN)).toBe(false);
+    expect(knownTime(1_727_000_000)).toBe(false);
+    expect(knownTime(at(9, 25))).toBe(true);
+  });
+
+  test("the clock time is the reader-local hour and minute", () => {
+    expect(clockTime(at(9, 25, 14, 32))).toBe(clock(at(9, 25, 14, 32)));
   });
 });

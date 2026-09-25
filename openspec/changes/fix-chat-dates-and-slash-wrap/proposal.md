@@ -1,6 +1,7 @@
 ## Why
 
-Three small Chat defects make the surface harder to read than it should be.
+Three small Chat defects make the surface harder to read than it should be,
+and the conversation chooser has the same missing-dates gap.
 The rate-limit standing says "Resets 23:00." even when the reset is days
 away (#429), while the plan rows beside it already say "resets Sat 21:00 ·
 in 4d 11h". A conversation's history carries no dates at all, so a
@@ -8,7 +9,10 @@ multi-day or reopened conversation has no temporal context beyond a hover
 tooltip per item (#427). The slash-command picker cuts every description to
 one ellipsized line, so commands like `/code-review` cannot be told apart
 from their descriptions (#424). All three are present in the latest stable
-release (`v0.7.0`).
+release (`v0.7.0`). The conversation chooser lists conversations with no
+dates or times either, so for both OpenCode and Claude Code the reader
+cannot tell last week's conversation from today's without opening it.
+OpenCode's own session list groups sessions by day.
 
 ## What Changes
 
@@ -37,6 +41,12 @@ release (`v0.7.0`).
   wrap their description (and argument hint) onto further lines instead of
   truncating to one ellipsized line; every suggestion shows its whole
   description, and the list scrolls to keep the keyboard highlight in view.
+- **A conversation chooser grouped by date.** The chooser files every
+  agent's conversations under headings for the local day of their last
+  activity ("Today", "Yesterday", or a weekday-and-date label), newest
+  first, like OpenCode's session list. Each entry also shows its
+  last-activity time. The native select keeps working on desktop and
+  touch; the headings are its option groups.
 
 ## Capabilities
 
@@ -45,6 +55,10 @@ release (`v0.7.0`).
 _None._
 
 ### Modified Capabilities
+
+- `chat-agents`: adds a requirement that the conversation chooser groups
+  every agent's conversations by the local day of their last activity and
+  shows each one's last-activity time.
 
 - `claude-code-chat`: adds a requirement that a rate-limit standing's reset
   names its day whenever the reset is not on the reader's current day, and
@@ -62,9 +76,15 @@ _None._
   `rateLimitBadgeLabel`), `src/chat/ui.ts` (readout standing line, live
   announcement, day-rollover relabel), `src/chat/timeline-renderer.ts`
   (notice reset text, day separators in top-level assembly),
+  `src/chat/inventory-reconciler.ts` and `src/chat/ui.ts` (chooser day
+  groups, labels, and the midnight regroup), `src/chat/dates.ts` (shared
+  `knownTime` and `clockTime`),
   `src/styles.css` (separator styling, command-menu wrapping).
 - Tests: colocated unit tests in `composer-status.test.ts`,
   `timeline-renderer.test.ts`; e2e additions in `tests/e2e/chat.e2e.ts`
   (slash menu, day separators) and `tests/e2e/chat-claude-polish.e2e.ts`
-  (rate-limit reset wording).
-- Release notes: visible `fix(chat)` entries; each defect exists in `v0.7.0`.
+  (rate-limit reset wording), `tests/e2e/chat-agents.e2e.ts` and
+  `tests/e2e/chat-touch.e2e.ts` (chooser day groups for both agents), with
+  the fixture's `seed` taking an optional `updatedAt`.
+- Release notes: visible `fix(chat)` entries; each defect exists in `v0.7.0`,
+  and the chooser has shown no dates since before `v0.7.0`.

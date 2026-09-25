@@ -357,6 +357,8 @@ async function handleE2EChat(request: Request): Promise<Response> {
     child?: boolean;
     invalidate?: boolean;
     configuration?: ConversationConfiguration;
+    // A seeded conversation's last activity (epoch ms).
+    updatedAt?: number;
     reversibleFiles?: ReversibleFileFixture[];
     agent?: "opencode" | "claude";
     count?: number;
@@ -410,7 +412,7 @@ async function handleE2EChat(request: Request): Promise<Response> {
       return Response.json({ agents: body.count === 2 ? 2 : 1 });
     }
     case "seed":
-      return controlJson(targetFake.seed(body.title ?? "Fixture conversation", body.items ?? [], body.older ?? [], body.child ?? false, body.configuration), body.agent ?? "opencode");
+      return controlJson(targetFake.seed(body.title ?? "Fixture conversation", body.items ?? [], body.older ?? [], body.child ?? false, body.configuration, body.updatedAt), body.agent ?? "opencode");
     case "externalCreate":
       return controlJson(targetFake.externalCreate(body.title ?? "External conversation", { child: body.child, invalidate: body.invalidate }), body.agent ?? "opencode");
     case "externalRename":

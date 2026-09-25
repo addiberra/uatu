@@ -35,3 +35,10 @@
 - [x] 5.6 Read a time ahead of the reader's clock as now; verify a renderer test at 23:59 with 00:01/00:04 items
 - [x] 5.7 Relabel separators and re-aim the midnight timer only when the reader's day changes; verify a renderer test over repeated streaming renders
 - [x] 5.8 Drop `composer-status.ts`'s re-export of the date helpers; point its test at `src/chat/dates.ts`
+
+## 6. Conversation chooser grouped by date
+
+- [x] 6.1 Move `knownTime` to `src/chat/dates.ts` and add `clockTime`; verify `dates.test.ts`
+- [x] 6.2 Add `conversationDayGroup` and `conversationActivitySuffix` and teach `patchConversationOptions` an optional day grouping into keyed `<optgroup data-chat-day>` headings (reuse by key, rebuild only when the layout differs, remove emptied headings, restore the selection, trailing "Undated" heading only beside dated days); verify `inventory-reconciler.test.ts` cases for today/yesterday/older/other year, a future time, undated, a move to today, a flat all-undated list, and a midnight relabel
+- [x] 6.3 In `src/chat/ui.ts`, use one `conversationOptionLabel` (title, agent when several, last-activity time) for `patchChooser` and the three direct relabel paths, group with `conversationDayGroup`, and re-patch at the next local midnight; verify `bun test src/chat/ui.test.ts src/chat/lifecycle.test.ts src/chat/inventory-presentation.test.ts`
+- [x] 6.4 Let the e2e fixture's `seed` take `updatedAt`; add a desktop test in `tests/e2e/chat-agents.e2e.ts` (OpenCode and Claude Code conversations over three days, headings, order, labels with times) that captures `conversation-picker-days`, and a touch test in `tests/e2e/chat-touch.e2e.ts`; verify both pass

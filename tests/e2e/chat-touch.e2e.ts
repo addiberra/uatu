@@ -1165,6 +1165,29 @@ test.describe("rate-limit standing in touch mode", () => {
   });
 });
 
+test("the touch chooser files both agents' conversations under their days", async ({ page, request }) => {
+  await request.post("/__e2e/reset");
+  await control(request, { action: "agents", count: 2 });
+  const now = new Date();
+  const at = (daysAgo: number, hour: number, minute = 0) => new Date(now.getFullYear(), now.getMonth(), now.getDate() - daysAgo, hour, minute).getTime();
+  await control(request, { action: "seed", agent: "opencode", title: "OpenCode yesterday", items: [], updatedAt: at(1, 9, 30) });
+  const today = await control(request, { action: "seed", agent: "claude", title: "Claude today", items: [], updatedAt: at(0, 0, 1) });
+  const token = await request.get("/__e2e/terminal-token").then(response => response.json()) as { token: string };
+  await page.goto(`/?t=${encodeURIComponent(token.token)}`);
+  await expect(page.locator("html")).toHaveAttribute("data-ui-mode", "touch");
+  await page.locator("#touch-tab-chat").click();
+  const select = page.locator("#chat-conversation-select");
+  await expect(select).toHaveValue(today.conversation.id);
+  await expect(select.locator("optgroup")).toHaveCount(2);
+  const groups = await select.locator("optgroup").evaluateAll(nodes => nodes.map(node => [
+    (node as HTMLOptGroupElement).label,
+    Array.from(node.querySelectorAll("option")).map(option => option.textContent),
+  ]));
+  expect(groups.map(([label]) => label)).toEqual(["Today", "Yesterday"]);
+  expect(groups[0]![1]).toEqual([expect.stringMatching(/^Claude today · Claude Code · \S/)]);
+  expect(groups[1]![1]).toEqual([expect.stringMatching(/^OpenCode yesterday · OpenCode · \S/)]);
+});
+
 test("day separators and wrapped slash-command descriptions fit the touch layout", async ({ page, request }, testInfo) => {
   // Seeded before the page exists, so the days are local to the test runner,
   // which shares the browser's zone.

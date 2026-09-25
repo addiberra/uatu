@@ -48,7 +48,8 @@ import { collectQuestionAnswers, showQuestionPanel, syncQuestionControl, syncQue
 import { configurationOptionLabel, createChatConfigurationPicker, type ChatConfigurationPickerController } from "./configuration-picker";
 import { copyChatText } from "./copy-actions";
 import { announceConversationInventory, renderConversationInventoryAwareness, renderSelectedConversationDeleted } from "./inventory-presentation";
-import { ConversationInventoryTracker, SerializedInventoryReconciler, dedupeConversationInventory, isConversationChooserActivationKey, patchConversationOptions, retainedPresentationConversationIds } from "./inventory-reconciler";
+import { ConversationInventoryTracker, SerializedInventoryReconciler, conversationActivitySuffix, conversationDayGroup, dedupeConversationInventory, isConversationChooserActivationKey, patchConversationOptions, retainedPresentationConversationIds } from "./inventory-reconciler";
+import { nextLocalMidnight } from "./dates";
 
 const PRESENTATION_KEY = "uatu:chat-presentation";
 const SAVE_DEBOUNCE_MS = 400;
@@ -2729,8 +2730,7 @@ export function initChat(api = new ChatApiClient()): void {
         }
         if (event.type === "conversation.updated") {
           conversations = conversations.map(conversation => conversation.id === event.conversation.id ? event.conversation : conversation);
-          const option = Array.from(select.options).find(candidate => candidate.value === event.conversation.id);
-          if (option) option.text = displayConversationTitle(event.conversation);
+          relabelConversationOption(event.conversation);
           if (chatTitle) chatTitle.textContent = displayConversationTitle(event.conversation);
           if (renameInput && renameForm && !renameForm.hidden && document.activeElement !== renameInput) renameInput.value = event.conversation.title;
         }
@@ -2852,6 +2852,32 @@ export function initChat(api = new ChatApiClient()): void {
     }
   };
 
+  // One chooser label for every path that writes it: the title, the owning
+  // agent when there is a choice of agents, and the last activity's clock
+  // time (its day is the option's heading).
+  const conversationOptionLabel = (conversation: ConversationSummary) => {
+    const title = agentStatuses.length > 1 && conversation.agent
+      ? `${displayConversationTitle(conversation)} · ${conversation.agent.name}`
+      : displayConversationTitle(conversation);
+    return `${title}${conversationActivitySuffix(conversation)}`;
+  };
+  const relabelConversationOption = (conversation: ConversationSummary) => {
+    const option = Array.from(select.options).find(candidate => candidate.value === conversation.id);
+    if (option) option.text = conversationOptionLabel(conversation);
+  };
+  // "Today" becomes "Yesterday" at the reader's midnight without any
+  // inventory change, so the headings are refiled then.
+  let chooserDayTimer: ReturnType<typeof setTimeout> | undefined;
+  const scheduleChooserDayRollover = () => {
+    if (chooserDayTimer !== undefined) clearTimeout(chooserDayTimer);
+    const now = Date.now();
+    chooserDayTimer = setTimeout(() => {
+      chooserDayTimer = undefined;
+      patchConversationOptions(select, conversations, conversationOptionLabel, conversationDayGroup);
+      scheduleChooserDayRollover();
+    }, nextLocalMidnight(now) - now + 1_000);
+  };
+
   const patchChooser = (selectedId: string | null, deleted = false) => {
     renderSelectedConversationDeleted(document, deleted);
     // Keep only the unresolved startup selection across a transient omission;
@@ -2860,10 +2886,8 @@ export function initChat(api = new ChatApiClient()): void {
       && selectedId && !conversations.some(conversation => conversation.id === selectedId)
       ? Array.from(select.options).find(option => option.value === selectedId)
       : undefined;
-    patchConversationOptions(select, conversations, conversation =>
-      agentStatuses.length > 1 && conversation.agent
-        ? `${displayConversationTitle(conversation)} · ${conversation.agent.name}`
-        : displayConversationTitle(conversation));
+    patchConversationOptions(select, conversations, conversationOptionLabel, conversationDayGroup);
+    scheduleChooserDayRollover();
     if (retainedStartupOption) select.append(retainedStartupOption);
     const genericPlaceholder = select.querySelector<HTMLOptionElement>("option[data-chat-inventory-placeholder]");
     if (deleted || selectedId) {
@@ -3199,8 +3223,7 @@ export function initChat(api = new ChatApiClient()): void {
       const { conversation } = await api.renameConversation(conversationId, newRequestId(), title);
       void inventoryReconciler.supersede();
       conversations = conversations.map(item => item.id === conversation.id ? conversation : item);
-      const option = Array.from(select.options).find(candidate => candidate.value === conversation.id);
-      if (option) option.text = displayConversationTitle(conversation);
+      relabelConversationOption(conversation);
       if (projection?.conversationId === conversation.id) {
         projection = { ...projection, conversation };
         if (chatTitle) chatTitle.textContent = displayConversationTitle(conversation);
@@ -4299,8 +4322,7 @@ export function initChat(api = new ChatApiClient()): void {
       stagedConfigurations.delete(conversationId);
       if (accepted.conversation) {
         conversations = conversations.map(conversation => conversation.id === accepted.conversation!.id ? accepted.conversation! : conversation);
-        const option = Array.from(select.options).find(candidate => candidate.value === accepted.conversation!.id);
-        if (option) option.text = displayConversationTitle(accepted.conversation);
+        relabelConversationOption(accepted.conversation);
         if (chatTitle) chatTitle.textContent = displayConversationTitle(accepted.conversation);
       }
       if (projection?.conversationId === conversationId) {

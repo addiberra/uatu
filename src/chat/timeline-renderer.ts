@@ -10,7 +10,7 @@ import { commandSubject, describeToolDetail, deriveTodoActivities, patchDiffLine
 import type { AcceptedDraft, ChatProjection } from "./projection";
 import { formatUsd } from "./usage";
 import { wakeupRowLabel } from "./scheduled-wakeups";
-import { dayLabel, fullDate, localDayKey, nextLocalMidnight, resetDate } from "./dates";
+import { dayLabel, fullDate, knownTime, localDayKey, nextLocalMidnight, resetDate } from "./dates";
 import { isLiveConversationStatus, isRateLimitStanding, type ActivityStatus, type ConversationItem, type ConversationStatus, type MessageAttachment, type PermissionOutcome, type QueuedMessage, type QuestionRequest, type RevertedUserMessage, type TokenUsage, type ToolItem } from "./types";
 
 type RenderedEntry = { node: HTMLElement; item: ConversationItem; active: boolean; variant: string; shellVariant?: string };
@@ -1725,13 +1725,6 @@ export function statusLabel(status: ConversationStatus): string {
 
 function counts(additions?: number, deletions?: number): string {
   return additions === undefined && deletions === undefined ? "" : ` <span class="chat-change-counts">+${additions ?? 0} -${deletions ?? 0}</span>`;
-}
-
-// A time an agent actually reported. Missing times arrive as 0, and nothing
-// real predates 2001-09-09 (1e12 ms) — below it is a placeholder or a
-// seconds-for-milliseconds slip, and dating it "1 January 1970" would be a lie.
-function knownTime(at: number): boolean {
-  return Number.isFinite(at) && at >= 1e12;
 }
 
 function daySeparatorAriaLabel(at: number, now: number): string {

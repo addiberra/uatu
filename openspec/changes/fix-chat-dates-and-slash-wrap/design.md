@@ -70,6 +70,8 @@ pass them through whole. The same menu serves both agents.
 - Day separators computed entirely client-side from existing `createdAt`,
   identical for every agent and for replayed or paged history.
 - Wrapping slash descriptions with a CSS-first change.
+- A conversation chooser grouped by day for every agent, from the
+  timestamps the inventory already carries.
 
 **Non-Goals:**
 - No per-message time labels in the timeline. The existing hover tooltip
@@ -248,6 +250,78 @@ rejected by the user decision: every description is visible without
 navigating. The trade-off is that large skill catalogs with very long
 descriptions show fewer suggestions per screen, and the menu scrolls.
 
+### D4. The conversation chooser is grouped by last-activity day
+
+**Context.** The chooser is the native `<select id="chat-conversation-select">`
+in the chat header, and the touch layout uses the same element with the
+platform's picker. `patchChooser` in `src/chat/ui.ts` fills it through
+`patchConversationOptions` (`src/chat/inventory-reconciler.ts`), which
+patches options by id so the selected option element survives. Three other
+paths rewrite one option's text directly (`conversation.updated`, rename,
+prompt acceptance), and they drop the agent suffix that `patchChooser` adds.
+Every `ConversationSummary` already carries `createdAt` and `updatedAt`
+(epoch ms), and the router's merged list is sorted newest `updatedAt` first
+(`src/chat/agents.ts`):
+- OpenCode v1 and v2 map `session.time.created` / `session.time.updated`
+  (v2 uses `0` when a time is missing).
+- Claude Code transcripts use the first and last mainline entry timestamps
+  (the file mtime for a transcript too large to read whole). Sessions not
+  yet written use their creation time and bump `updatedAt` on rename or
+  title change.
+So no server, wire, or provider change is needed.
+
+**OpenCode's rule.** The OpenCode 2.x TUI session list files top-level
+sessions by `new Date(time.updated).toDateString()` and heads today's group
+"Today" and the others with the date string. Its rows show no time; the
+user asked for each conversation's time as well.
+
+**Decision.**
+- Group by the reader-local day of `updatedAt` (last activity), matching
+  OpenCode and the order the list is already in. `createdAt` was rejected:
+  a long-running conversation from last week that is active today belongs
+  with today's work, and grouping by creation would break the newest-first
+  order into out-of-order days.
+- Headings use the timeline separators' `dayLabel` ("Today", "Yesterday",
+  otherwise weekday and date, with the year when not current). The chat
+  surface then states a day one way everywhere, rather than OpenCode's
+  `toDateString` form.
+- Keep the native `<select>` and file options into
+  `<optgroup label="…" data-chat-day="YYYY-MM-DD">`. Optgroup labels are
+  the platform's grouping for a select: they are announced by assistive
+  technology, rendered as headings by desktop browsers and by the iOS and
+  Android pickers, and are not selectable. Replacing the select with a custom
+  listbox would re-implement keyboard, touch, and accessibility behaviour
+  the native control already gives, and would touch the inventory-awareness,
+  deleted-conversation, and startup-placeholder code that works on the
+  select. Rejected.
+- Each option's label is `title[ · agent] · HH:MM`, the clock time of the
+  last activity (`clockTime`, the reader's locale). The heading gives the
+  day, so the time alone is unambiguous. One `conversationOptionLabel`
+  function serves `patchChooser` and the three direct relabel paths. As a
+  side effect, those paths keep the agent suffix too.
+- Shared rules with D2: a time later than the reader's clock is read as
+  now (`Math.min(updatedAt, now)`), and a time that is not `knownTime`
+  (non-finite or before `1e12`) is undated. Undated conversations follow the
+  dated days, under an "Undated" heading only when some conversation is
+  dated. A list with nothing dated stays flat, as before this change. The
+  e2e fixture's counter timestamps rely on this.
+- `patchConversationOptions` gains an optional `group` callback. It reuses
+  option and optgroup elements by key, rebuilds the layout only when the
+  order or membership differs, removes emptied headings, and restores the
+  select's value when a move would have changed it. Placeholders and a
+  retained startup option stay outside the groups, as before.
+- **Day rollover:** each chooser patch re-arms one timeout to the next
+  local midnight (+1 s), which re-runs the patch so "Today" becomes
+  "Yesterday" with no inventory change.
+- The direct relabel paths update only the option text. Moving a
+  conversation to another heading waits for the next inventory reconcile
+  (an inventory invalidation on the brokered stream, a lifecycle recovery,
+  or the next patch), so a heading can briefly lag a label.
+
+*Trade-off:* the collapsed select shows the selected option's label, so
+the header now shows the selected conversation's last-activity time after
+its title. The header truncates long labels as before.
+
 ## Risks / Trade-offs
 
 - [Existing renderer tests assert exact top-level children, and fixtures
@@ -275,6 +349,14 @@ descriptions show fewer suggestions per screen, and the menu scrolls.
 - [The calendar-day rule changes the plan rows for resets 0–24 h away that
   fall tomorrow] → This is intended, and the spec scenario covers it.
   Update `composer-status.test.ts` expectations.
+
+- [A native `<optgroup>` cannot be styled, and its popup cannot be
+  captured in an e2e screenshot] → The platform's heading style is
+  accepted. The e2e asserts the DOM structure, and the evidence screenshot
+  shows the same options as an in-page list box.
+- [Rewriting option labels as the last-activity time changes] → Options
+  are patched in place by id, and the selection is restored after any
+  move, so an open chooser keeps its selection.
 
 ## Migration Plan
 
