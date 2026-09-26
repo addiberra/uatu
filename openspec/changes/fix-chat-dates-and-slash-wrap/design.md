@@ -383,10 +383,12 @@ rest of the chat surface still used `toLocaleTimeString` /
 "Resets 23:00". Every user-visible time in `src/chat` now goes through the
 `dates.ts` helpers:
 - `clockTime` ("19:43"): the plan readout's and usage pane's "as of"
-  (`usageAsOf`), the cost tally's "since" on the same day
+  (`usageAsOf`), the cost tally's "since" on the same local day
   (`sessionTotalsTitle`), and a wakeup firing today.
-- `weekdayClock` ("Mon 19:43"): the cost tally's "since" after a day has
-  passed, and a wakeup firing within the coming six days.
+- `weekdayClock` ("Mon 19:43"): the cost tally's "since" on any earlier
+  local day (the reader's calendar day decides, as for the reset and day
+  labels, not 24 hours elapsed: a tally begun at 23:00 reads "since Fri
+  23:00" at 00:30), and a wakeup firing within the coming six days.
 - `dateTime` ("Sun 2026-09-20 19:43", new): a wakeup a week or more out
   (replacing "1 Oct 09:00", with the ISO date for the same reason D1's
   weekday alone would be ambiguous there), the wakeup row's tooltip, the

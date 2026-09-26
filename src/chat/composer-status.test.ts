@@ -18,12 +18,24 @@ describe("session totals title", () => {
     expect(sessionTotalsTitle({ since: 10 }, [user(20), user(30)])).toBe("This conversation");
   });
 
-  test("a tally that began after the first message is stated since when, with the weekday once a day has passed", () => {
+  test("a tally that began after the first message is stated since when, with the weekday once the local day has changed", () => {
     const since = Date.parse("2026-09-02T21:33:00");
     const items = [user(since - 3_600_000), user(since + 60_000)];
     expect(sessionTotalsTitle({ since }, items, since + 5_000)).toBe("This conversation · since 21:33");
     const weekday = new Date(since).toLocaleDateString([], { weekday: "short" });
     expect(sessionTotalsTitle({ since }, items, since + 2 * 86_400_000)).toBe(`This conversation · since ${weekday} 21:33`);
+  });
+
+  test("the local calendar day, not 24 hours elapsed, decides whether the weekday is shown", () => {
+    // Started 23:00, read 00:30 the next local day: 1.5 h later, but yesterday.
+    const lateStart = Date.parse("2026-09-25T23:00:00");
+    const lateWeekday = new Date(lateStart).toLocaleDateString([], { weekday: "short" });
+    const lateItems = [user(lateStart - 3_600_000), user(lateStart + 60_000)];
+    expect(sessionTotalsTitle({ since: lateStart }, lateItems, Date.parse("2026-09-26T00:30:00"))).toBe(`This conversation · since ${lateWeekday} 23:00`);
+    // Started 01:00, read 23:00 the same local day: 22 h later, but still today.
+    const earlyStart = Date.parse("2026-09-26T01:00:00");
+    const earlyItems = [user(earlyStart - 3_600_000), user(earlyStart + 60_000)];
+    expect(sessionTotalsTitle({ since: earlyStart }, earlyItems, Date.parse("2026-09-26T23:00:00"))).toBe("This conversation · since 01:00");
   });
 });
 

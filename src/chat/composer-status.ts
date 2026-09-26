@@ -6,7 +6,7 @@
 import { backgroundStatusLabel } from "./background-tasks";
 import { scheduledStatusLabel } from "./scheduled-wakeups";
 import { statusLabel } from "./timeline-renderer";
-import { clockTime, relativeReset, resetClock, resetMoment, weekdayClock } from "./dates";
+import { clockTime, localDaysBetween, relativeReset, resetClock, resetMoment, weekdayClock } from "./dates";
 import { isRateLimitStanding, type BackgroundTaskItem, type ScheduledWakeupItem, type ContextReportItem, type ConversationItem, type ConversationStatus, type NoticeItem, type PlanUtilization, type PlanUtilizationWindow, type SessionTotals, type UsageReadFailure } from "./types";
 
 export type ComposerRoutineState = {
@@ -180,8 +180,11 @@ export function sessionCostLabel(session: SessionTotals): string {
  * idle conversation resumes a fresh one, so the totals are summed by the
  * workspace process from `since`, when it first saw the conversation. A
  * conversation with a message older than that — one resumed after a restart
- * — is titled "since HH:MM" (with the weekday once a day has passed) rather
- * than claiming the whole conversation.
+ * — is titled "since HH:MM" rather than claiming the whole conversation.
+ * Like every other day decision in the chat, the reader's local calendar day
+ * decides the form: a start earlier today is the bare clock ("since 23:00"),
+ * one on any earlier local day gains its weekday ("since Fri 23:00") — even
+ * when less than 24 hours have passed.
  */
 export function sessionTotalsTitle(session: Pick<SessionTotals, "since">, items: readonly ConversationItem[], now = Date.now()): string {
   let firstMessageAt: number | undefined;
@@ -189,7 +192,7 @@ export function sessionTotalsTitle(session: Pick<SessionTotals, "since">, items:
     if (item.type === "user_message" && (firstMessageAt === undefined || item.createdAt < firstMessageAt)) firstMessageAt = item.createdAt;
   }
   if (session.since === undefined || firstMessageAt === undefined || session.since <= firstMessageAt) return "This conversation";
-  return `This conversation · since ${now - session.since < 86_400_000 ? clockTime(session.since) : weekdayClock(session.since)}`;
+  return `This conversation · since ${localDaysBetween(session.since, now) <= 0 ? clockTime(session.since) : weekdayClock(session.since)}`;
 }
 
 /**
