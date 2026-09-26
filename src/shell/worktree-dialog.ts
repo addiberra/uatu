@@ -26,7 +26,7 @@
 // passed through appUrl() (the same rule hub-nav.ts documents).
 
 import { createWorktreeBranchRules } from "../shared/worktree-branches";
-import { worktreeParsers, worktreeParsersScript, type WorktreeCheckout } from "../shared/worktree-contract";
+import { worktreeParsers, worktreeParsersScript, type WorktreeCheckout, type WorktreeLocalData } from "../shared/worktree-contract";
 
 /** One checkout as the inventory describes it, reduced to what the dialog
  *  renders. `id` is the registered workspace id when there is one and the
@@ -89,6 +89,9 @@ export type WorktreeDialogModel = {
   empty?: boolean;
   /** Delete: what a fresh preflight found. */
   requiresStop?: boolean;
+  /** Delete: local data the removal would discard, which the user must
+   *  acknowledge with the required checkbox. Absent for a clean tree. */
+  localData?: WorktreeLocalData;
   blocked?: boolean;
 };
 
@@ -317,10 +320,30 @@ export function installWorktreeDialog<T extends Record<string, unknown>>(
         + `</section>`;
     } else if (m.view === "delete") {
       const running = m.requiresStop === true;
+      // Local data is disclosed, never silently discarded: one entry per
+      // present category, in a fixed order, then a required checkbox. The
+      // form validates in submitDelete (`novalidate`), so an unchecked
+      // submit says why in place instead of a browser bubble.
+      const data = m.localData;
+      // A path Git reports with a trailing `/` is a whole folder — one entry
+      // however much it holds — so it is labelled as such.
+      const sampleItem = (sample: string) => sample.endsWith("/")
+        ? `<li><code>${h(sample)}</code> <span class="wt-muted" data-folder>(folder, with everything in it)</span></li>`
+        : `<li><code>${h(sample)}</code></li>`;
+      const category = (label: string, entry: { count: number; sample: readonly string[] } | undefined) => {
+        if (!entry) return "";
+        const more = entry.count - entry.sample.length;
+        return `<li>${label}<ul>${entry.sample.map(sampleItem).join("")}</ul>${more > 0 ? `<span class="wt-muted">and ${more} more</span>` : ""}</li>`;
+      };
+      const warning = data === undefined ? "" : `<div class="wt-notice error" data-local-data><p><strong>These files and folders will be permanently deleted with the worktree, including everything inside each listed folder, and cannot be recovered.</strong> Commits on the branch are kept.</p><ul>`
+        + category(`Uncommitted changes (${data.tracked?.count ?? 0})`, data.tracked)
+        + category(`Untracked files (${data.untracked?.count ?? 0})`, data.untracked)
+        + category(`Ignored files and folders (${data.ignored?.count ?? 0}), such as build output or local settings like <code>.env</code>`, data.ignored)
+        + `</ul></div><label class="check"><input type="checkbox" name="acknowledge" required>Permanently delete these files with the worktree.</label>`;
       body = `<section data-compact><h2 class="wt-heading" tabindex="-1">Delete worktree?</h2>${identity}`
         + (m.loading ? pendingWith("Checking worktree…") : m.blocked
           ? `<p role="alert" tabindex="-1">${h(m.message ?? "Only a verified Uatu-created checkout can be deleted. Restore or verify it outside Uatu.")}</p><div class="wt-actions" style="justify-content:flex-end">${cancel}</div>`
-          : `<form class="wt-form" data-operation="delete" data-pending="Rechecking worktree safety…"><p>${running ? "Its Uatu terminal and agent sessions will stop, then the worktree’s files will be removed. The Git branch will be kept." : "The worktree’s files will be removed. The Git branch will be kept."}</p><div class="wt-actions" style="justify-content:flex-end">${cancel}<button class="danger">${running ? "Stop and delete" : "Delete"}</button></div></form>`)
+          : `<form class="wt-form" data-operation="delete" data-pending="Rechecking worktree safety…" novalidate><p>${running ? "Its Uatu terminal and agent sessions will stop, then the worktree’s files will be removed. The Git branch will be kept." : "The worktree’s files will be removed. The Git branch will be kept."}</p>${warning}${notice}<div class="wt-actions" style="justify-content:flex-end">${cancel}<button class="danger">${running ? "Stop and delete" : "Delete"}</button></div></form>`)
         + `</section>`;
     } else if (m.view === "register") {
       const retry = m.selected?.ownership === "uatu";
@@ -619,6 +642,7 @@ export function installWorktreeDialog<T extends Record<string, unknown>>(
     let conflictId: string | undefined;
     let loading = true;
     let requiresStop = false;
+    let localData: WorktreeLocalData | undefined;
     let blocked = false;
 
     dialog.addEventListener("cancel", event => { if (busy) event.preventDefault(); });
@@ -649,6 +673,7 @@ export function installWorktreeDialog<T extends Record<string, unknown>>(
         loading,
         empty: rows.every(row => row.main),
         requiresStop,
+        ...(localData === undefined ? {} : { localData }),
         blocked,
       };
     }
@@ -726,12 +751,15 @@ export function installWorktreeDialog<T extends Record<string, unknown>>(
     async function loadPreflight(): Promise<void> {
       const row = model().selected;
       requiresStop = false;
+      localData = undefined;
       blocked = false;
       if (!row) { blocked = true; message = "No worktree of this repository matches that name."; error = true; return; }
       try {
         const outcome = await request(`${api}/preflight-delete`, parsers.parseWorktreeDeletionPreflight, { reference: row.id });
-        if (outcome.ok === true) requiresStop = outcome.requiresStop === true;
-        else { message = outcome.error.message; error = true; }
+        if (outcome.ok === true) {
+          requiresStop = outcome.requiresStop === true;
+          localData = outcome.localData;
+        } else { message = outcome.error.message; error = true; }
       } catch (failure) {
         if (controller.signal.aborted) return;
         message = failure instanceof Error ? failure.message : String(failure);
@@ -752,6 +780,7 @@ export function installWorktreeDialog<T extends Record<string, unknown>>(
         error = false;
         conflictId = undefined;
         requiresStop = false;
+        localData = undefined;
         blocked = false;
         await loadInventory();
         if (!controller.signal.aborted && view === "delete") await loadPreflight();
@@ -965,15 +994,45 @@ export function installWorktreeDialog<T extends Record<string, unknown>>(
     async function submitDelete(form: HTMLFormElement): Promise<void> {
       const row = model().selected;
       if (!row) return;
+      // Disclosed local data needs the explicit tick; the fingerprint that
+      // tick sends acknowledges exactly what was shown. A clean tree sends
+      // none, and the button alone authorizes it.
+      if (localData !== undefined && form.querySelector<HTMLInputElement>('[name="acknowledge"]')?.checked !== true) {
+        message = "Confirm to continue. Nothing changed.";
+        error = true;
+        render();
+        return;
+      }
       const status = startBusy(form.dataset.pending ?? "Working…");
       try {
-        const outcome = await request(`${api}/delete`, value => parsers.parseWorktreeEndpointResult(value, "delete"), { reference: row.id, confirm: true, stop: requiresStop });
+        const outcome = await request(`${api}/delete`, value => parsers.parseWorktreeEndpointResult(value, "delete"), {
+          reference: row.id,
+          confirm: true,
+          stop: requiresStop,
+          ...(localData === undefined ? {} : { localDataFingerprint: localData.fingerprint }),
+        });
         if (outcome.ok === true) {
           committed("Worktree deleted. Branch kept.", undefined, row.id);
           return;
         }
         endBusy();
-        message = outcome.error.message;
+        const refusal = outcome.error;
+        if (refusal.code === "local-data") {
+          // The local data is not what this dialog showed: review it again
+          // from a fresh preflight, which re-renders the updated warning with
+          // an unticked box — or the blocker it now finds instead.
+          message = undefined;
+          error = false;
+          await loadPreflight();
+          if (controller.signal.aborted) return;
+          if (!blocked) {
+            message = refusal.message;
+            error = true;
+          }
+          render();
+          return;
+        }
+        message = refusal.message;
         error = true;
         blocked = true;
         render();

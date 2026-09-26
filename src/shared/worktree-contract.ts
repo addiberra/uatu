@@ -135,10 +135,16 @@ export type WorktreeCreateRequest = {
 export type WorktreeDeleteRequest = {
   readonly sourceWorkspaceId: string;
   readonly reference: string;
-  // The destructive button IS the authorization. `stop` additionally
-  // authorizes stopping the KNOWN Uatu activity the dialog named; it never
-  // claims Uatu can stop an external application.
+  // For a clean tree the destructive button alone is the authorization.
+  // `stop` additionally authorizes stopping the KNOWN Uatu activity the
+  // dialog named; it never claims Uatu can stop an external application.
   readonly stop?: boolean;
+  // Local data (tracked changes, untracked or ignored files) additionally
+  // needs this acknowledgement: the preflight's `localData.fingerprint`,
+  // echoed back. It authorizes discarding exactly the disclosed entries and
+  // nothing else — it overrides no other blocker, and no client-supplied
+  // force exists anywhere in this family.
+  readonly localDataFingerprint?: string;
 };
 
 export type WorktreeForgetRequest = {
@@ -172,14 +178,44 @@ export type WorktreeRegisterRequest = {
   readonly start?: boolean;
 };
 
+// How many sample paths a local-data category carries at most. The ONE
+// value the Hub's description, the closed parser (server, SPA and inline
+// dashboard alike, through the injected vocabulary) and the OpenAPI
+// `maxItems` agree on — worktree-contract.test.ts ties them together.
+export const WORKTREE_LOCAL_DATA_SAMPLE_LIMIT = 5;
+
+// One category of acknowledgeable local data: how many status entries it
+// has (a wholly ignored directory counts once, and stands for everything
+// inside it) and up to WORKTREE_LOCAL_DATA_SAMPLE_LIMIT of them,
+// sorted, as checkout-relative paths — never absolute.
+export type WorktreeLocalDataCategory = {
+  readonly count: number;
+  readonly sample: readonly string[];
+};
+
+// The local data a deletion would discard. A category key is present only
+// when it has entries. `fingerprint` (64 lowercase hex) identifies the
+// complete set of status entries across all three categories; echoing it
+// back as `localDataFingerprint` is the acknowledgement.
+export type WorktreeLocalData = {
+  readonly tracked?: WorktreeLocalDataCategory;
+  readonly untracked?: WorktreeLocalDataCategory;
+  readonly ignored?: WorktreeLocalDataCategory;
+  readonly fingerprint: string;
+};
+
 // What preflight found. `ok: false` carries the ONE blocker that replaces
-// the dialog's normal consequences; there is no force path past it.
+// the dialog's normal consequences, and no acknowledgement or client-supplied
+// force gets past it. `ok: true` may still disclose local data, which a
+// delete then has to acknowledge with the fingerprint.
 export type WorktreeDeletionPreflight =
   | {
     readonly ok: true;
     readonly checkout: WorktreeCheckout;
     // Whether proceeding needs the caller's explicit stop authorization.
     readonly requiresStop: boolean;
+    // Present only when the checkout has local data.
+    readonly localData?: WorktreeLocalData;
   }
   | { readonly ok: false; readonly checkout?: WorktreeCheckout; readonly error: WorktreeError };
 
@@ -502,7 +538,7 @@ export function canDeleteWorktree(checkout: Pick<WorktreeCheckout, "ownership" |
 const parserVocabulary = {
   WORKTREE_OWNERSHIPS, WORKTREE_AVAILABILITIES, WORKTREE_INVENTORY_STATUSES,
   WORKTREE_UNKNOWN_REPOSITORY, WORKTREE_OPERATION_KINDS, WORKTREE_CREATE_MODES,
-  WORKTREE_ERROR_CODES, WORKTREE_RETRY_ACTIONS, PHASES,
+  WORKTREE_ERROR_CODES, WORKTREE_RETRY_ACTIONS, PHASES, WORKTREE_LOCAL_DATA_SAMPLE_LIMIT,
 };
 export function createWorktreeParsers(
   vocabulary: typeof parserVocabulary,
@@ -512,7 +548,7 @@ export function createWorktreeParsers(
 ) {
 const { WORKTREE_OWNERSHIPS, WORKTREE_AVAILABILITIES, WORKTREE_INVENTORY_STATUSES,
   WORKTREE_UNKNOWN_REPOSITORY, WORKTREE_OPERATION_KINDS, WORKTREE_CREATE_MODES,
-  WORKTREE_ERROR_CODES, WORKTREE_RETRY_ACTIONS, PHASES } = vocabulary;
+  WORKTREE_ERROR_CODES, WORKTREE_RETRY_ACTIONS, PHASES, WORKTREE_LOCAL_DATA_SAMPLE_LIMIT } = vocabulary;
 const { validWorktreeBranch } = branches;
 const { sanitizeWorktreeMessage } = messages;
 function isWorktreePhase(operation: WorktreePhasedOperation, value: unknown): value is WorktreePhase {
@@ -709,13 +745,39 @@ function parseWorktreeOperationResult(value: unknown): WorktreeOperationResult {
   };
 }
 
+function fingerprintField(record: Record<string, unknown>, field: string, label: string): string {
+  const value = record[field];
+  if (typeof value !== "string" || !/^[0-9a-f]{64}$/.test(value)) fail(`${label} has an invalid ${field}`);
+  return value;
+}
+
 function parseWorktreeDeleteRequest(value: unknown): WorktreeDeleteRequest {
-  const record = closed(value, ["sourceWorkspaceId", "reference", "stop"], "worktree delete request");
+  const record = closed(value, ["sourceWorkspaceId", "reference", "stop", "localDataFingerprint"], "worktree delete request");
   return {
     sourceWorkspaceId: requiredString(record, "sourceWorkspaceId", "worktree delete request"),
     reference: requiredString(record, "reference", "worktree delete request"),
     ...(record.stop === undefined ? {} : { stop: flag(record, "stop", "worktree delete request") }),
+    ...(record.localDataFingerprint === undefined ? {} : { localDataFingerprint: fingerprintField(record, "localDataFingerprint", "worktree delete request") }),
   };
+}
+
+function parseWorktreeLocalDataCategory(value: unknown, label: string): WorktreeLocalDataCategory {
+  const record = closed(value, ["count", "sample"], label);
+  const count = record.count;
+  if (typeof count !== "number" || !Number.isInteger(count) || count < 1) fail(`${label} requires a positive count`);
+  const sample = record.sample;
+  if (!Array.isArray(sample) || sample.length > WORKTREE_LOCAL_DATA_SAMPLE_LIMIT || sample.length > count) fail(`${label} has an invalid sample`);
+  if (sample.some(entry => typeof entry !== "string" || entry === "" || entry.startsWith("/"))) fail(`${label} sample must be checkout-relative paths`);
+  return { count, sample: [...sample as string[]] };
+}
+
+function parseWorktreeLocalData(value: unknown): WorktreeLocalData {
+  const record = closed(value, ["tracked", "untracked", "ignored", "fingerprint"], "worktree local data");
+  const categories = (["tracked", "untracked", "ignored"] as const).filter(category => record[category] !== undefined);
+  if (categories.length === 0) fail("worktree local data requires at least one category");
+  const parsed: { tracked?: WorktreeLocalDataCategory; untracked?: WorktreeLocalDataCategory; ignored?: WorktreeLocalDataCategory } = {};
+  for (const category of categories) parsed[category] = parseWorktreeLocalDataCategory(record[category], `worktree local data ${category}`);
+  return { ...parsed, fingerprint: fingerprintField(record, "fingerprint", "worktree local data") };
 }
 
 function parseWorktreeForgetRequest(value: unknown): WorktreeForgetRequest {
@@ -750,15 +812,21 @@ function parseWorktreeRegisterRequest(value: unknown): WorktreeRegisterRequest {
 }
 
 function parseWorktreeDeletionPreflight(value: unknown): WorktreeDeletionPreflight {
-  const record = closed(value, ["ok", "checkout", "requiresStop", "error"], "worktree deletion preflight");
+  const record = closed(value, ["ok", "checkout", "requiresStop", "localData", "error"], "worktree deletion preflight");
   const ok = flag(record, "ok", "worktree deletion preflight");
   const checkout = record.checkout === undefined ? undefined : parseWorktreeCheckout(record.checkout);
   if (ok) {
     if (record.error !== undefined) fail("a successful worktree deletion preflight cannot carry an error");
     if (checkout === undefined) fail("a successful worktree deletion preflight requires a checkout");
-    return { ok: true, checkout, requiresStop: flag(record, "requiresStop", "worktree deletion preflight") };
+    return {
+      ok: true,
+      checkout,
+      requiresStop: flag(record, "requiresStop", "worktree deletion preflight"),
+      ...(record.localData === undefined ? {} : { localData: parseWorktreeLocalData(record.localData) }),
+    };
   }
   if (record.requiresStop !== undefined) fail("a refused worktree deletion preflight cannot carry requiresStop");
+  if (record.localData !== undefined) fail("a refused worktree deletion preflight cannot carry localData");
   return { ok: false, ...(checkout === undefined ? {} : { checkout }), error: parseWorktreeError(record.error) };
 }
 

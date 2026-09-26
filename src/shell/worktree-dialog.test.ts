@@ -838,13 +838,13 @@ describe("guarded deletion", () => {
   });
 
   test("every preflight blocker replaces the consequences and offers only Cancel", async () => {
+    // Local data is not a preflight blocker any more: it is disclosed with
+    // a required acknowledgement (below). Everything here still blocks.
     const blockers = [
-      ["local-data", "Save or discard tracked changes outside Uatu, then try again. Files and registration retained."],
-      ["local-data", "Preserve or remove untracked files outside Uatu, then try again. Files and registration retained."],
-      ["local-data", "Preserve or remove ignored files outside Uatu, then try again. Files and registration retained."],
       ["git-lock", "Resolve the Git lock outside Uatu, then try again. Files and registration retained."],
       ["external-activity", "External activity is using this checkout. Stop it outside Uatu, then try again."],
       ["nested-dependency", "Resolve the nested checkout dependency outside Uatu, then try again."],
+      ["nested-dependency", "This worktree contains a submodule or another Git repository (mods/sub). Remove or move it outside Uatu first. Nothing was removed."],
       ["ownership-required", "Only a verified Uatu-created checkout can be deleted."],
     ];
     for (const [code, message] of blockers) {
@@ -902,6 +902,188 @@ describe("guarded deletion", () => {
     await settle();
     expect(h.navigations).toEqual(["/s/atlas/"]);
     expect(h.document.querySelector("[data-worktree-confirmation]")).toBeNull();
+  });
+});
+
+describe("deletion with local data", () => {
+  const rows = [mainCheckout(), checkout()];
+  const fingerprint = "c".repeat(64);
+  const deleted = () => ({ ok: true, operationId: "op", kind: "delete", phase: "complete", registered: false, started: false });
+  const withData = (localData: Json, running = false) => harness({
+    "/": () => inventory([mainCheckout(), checkout({ running })]),
+    "/preflight-delete": () => ({ ok: true, checkout: checkout({ running }), requiresStop: running, localData: { ...localData, fingerprint } }),
+    "/delete": deleted,
+  });
+  const buttons = (h: Harness) => [...h.main().querySelectorAll("button")].map(node => (node.textContent ?? "").trim());
+  const warning = (h: Harness) => h.main().querySelector("[data-local-data]");
+  const acknowledge = (h: Harness) => h.main().querySelector<HTMLInputElement>('input[name="acknowledge"]');
+
+  test.each([
+    ["tracked", "Uncommitted changes (2)", ["README.md", "src/app.ts"]],
+    ["untracked", "Untracked files (1)", ["scratch.txt"]],
+    ["ignored", "Ignored files and folders (2), such as build output or local settings like .env", [".env", "node_modules/"]],
+  ] as const)("%s data alone is disclosed with its count, sample and a required checkbox", async (category, label, sample) => {
+    const h = withData({ [category]: { count: sample.length, sample } });
+    await open(h, { view: "delete", id: "atlas-child" });
+    // The normal consequences stay; the warning is added to them.
+    expect(h.text()).toContain("The worktree’s files will be removed. The Git branch will be kept.");
+    expect(warning(h)!.textContent).toContain("These files and folders will be permanently deleted with the worktree, including everything inside each listed folder, and cannot be recovered.");
+    expect(warning(h)!.textContent).toContain("Commits on the branch are kept.");
+    expect(warning(h)!.textContent).toContain(label);
+    const listed = [...warning(h)!.querySelectorAll("li li code")].map(node => node.textContent);
+    expect(listed).toEqual([...sample]);
+    // Only an entry Git reports with a trailing `/` is labelled a folder.
+    const folders = [...warning(h)!.querySelectorAll("li li")].filter(item => item.querySelector("[data-folder]")).map(item => item.querySelector("code")!.textContent);
+    expect(folders).toEqual(sample.filter(entry => entry.endsWith("/")));
+    if (folders.length > 0) expect(warning(h)!.textContent).toContain("node_modules/ (folder, with everything in it)");
+    for (const other of ["Uncommitted changes", "Untracked files", "Ignored files"].filter(text => !label.startsWith(text))) {
+      expect(warning(h)!.textContent).not.toContain(other);
+    }
+    expect(warning(h)!.textContent).not.toContain("more");
+    expect(acknowledge(h)!.hasAttribute("required")).toBe(true);
+    expect(acknowledge(h)!.checked === true || acknowledge(h)!.hasAttribute("checked")).toBe(false);
+    expect(acknowledge(h)!.closest("label")!.textContent).toBe("Permanently delete these files with the worktree.");
+    expect(buttons(h)).toEqual(["Cancel", "Delete"]);
+  });
+
+  test("all three categories appear in a fixed order, and a running tree keeps Stop and delete", async () => {
+    const h = withData({
+      ignored: { count: 1, sample: [".env"] },
+      untracked: { count: 1, sample: ["scratch.txt"] },
+      tracked: { count: 1, sample: ["README.md"] },
+    }, true);
+    await open(h, { view: "delete", id: "atlas-child" });
+    const text = warning(h)!.textContent ?? "";
+    const order = ["Uncommitted changes (1)", "Untracked files (1)", "Ignored files and folders (1)"].map(label => text.indexOf(label));
+    expect(order.every(index => index >= 0)).toBe(true);
+    expect([...order].sort((a, b) => a - b)).toEqual(order);
+    expect(h.text()).toContain("Its Uatu terminal and agent sessions will stop, then the worktree’s files will be removed. The Git branch will be kept.");
+    expect(buttons(h)).toEqual(["Cancel", "Stop and delete"]);
+    expect(acknowledge(h)).not.toBeNull();
+  });
+
+  test("a truncated sample says how many more exist, and every path is escaped", async () => {
+    const h = withData({ untracked: { count: 12, sample: ["<img src=x onerror=alert(1)>.txt", "b.txt", "c.txt", "d.txt", "e.txt"] } });
+    await open(h, { view: "delete", id: "atlas-child" });
+    expect(warning(h)!.textContent).toContain("Untracked files (12)");
+    expect(warning(h)!.textContent).toContain("and 7 more");
+    expect(warning(h)!.querySelector("img")).toBeNull();
+    expect(warning(h)!.innerHTML).toContain("&lt;img src=x onerror=alert(1)&gt;.txt");
+  });
+
+  test("a clean tree shows no warning and no checkbox, and sends no fingerprint", async () => {
+    const h = harness({
+      "/": () => inventory(rows),
+      "/preflight-delete": () => ({ ok: true, checkout: checkout(), requiresStop: false }),
+      "/delete": deleted,
+    });
+    await open(h, { view: "delete", id: "atlas-child" });
+    expect(warning(h)).toBeNull();
+    expect(h.main().querySelector("input")).toBeNull();
+    h.submit();
+    await settle();
+    expect(h.requests.find(request => request.path === "/delete")!.body)
+      .toEqual({ sourceWorkspaceId: "atlas", reference: "atlas-child", confirm: true, stop: false });
+  });
+
+  test("an unchecked submit sends nothing and says so in place; a ticked one sends the fingerprint", async () => {
+    const h = withData({ tracked: { count: 1, sample: ["README.md"] }, ignored: { count: 1, sample: [".env"] } });
+    await open(h, { view: "delete", id: "atlas-child" });
+    h.submit();
+    await settle();
+    expect(h.requests.some(request => request.path === "/delete")).toBe(false);
+    expect(h.dialog()).not.toBeNull();
+    expect(h.main().querySelector("[role=alert]")!.textContent).toBe("Confirm to continue. Nothing changed.");
+    // The form, its warning and its checkbox stay; only the reason is added.
+    expect(warning(h)).not.toBeNull();
+    expect(buttons(h)).toEqual(["Cancel", "Delete"]);
+    acknowledge(h)!.checked = true;
+    h.submit();
+    await settle();
+    expect(h.requests.find(request => request.path === "/delete")!.body)
+      .toEqual({ sourceWorkspaceId: "atlas", reference: "atlas-child", confirm: true, stop: false, localDataFingerprint: fingerprint });
+    expect(h.document.querySelector("[data-worktree-confirmation]")!.textContent).toContain("Worktree deleted. Branch kept.");
+  });
+
+  test("a local-data refusal re-runs preflight and shows the updated warning, unticked, with the reason", async () => {
+    const updated = "d".repeat(64);
+    let preflights = 0;
+    const h = harness({
+      "/": () => inventory(rows),
+      "/preflight-delete": () => {
+        preflights += 1;
+        return preflights === 1
+          ? { ok: true, checkout: checkout(), requiresStop: false, localData: { untracked: { count: 1, sample: ["scratch.txt"] }, fingerprint } }
+          : { ok: true, checkout: checkout(), requiresStop: false, localData: { untracked: { count: 2, sample: ["late.txt", "scratch.txt"] }, fingerprint: updated } };
+      },
+      "/delete": body => body?.localDataFingerprint === updated
+        ? deleted()
+        : {
+          ok: false, operationId: "op", kind: "delete", phase: "rechecking",
+          error: { code: "local-data", message: "The worktree's files changed while deletion was prepared. Review the deletion again. Nothing was removed.", retry: "refresh", phase: "rechecking" },
+        },
+    });
+    await open(h, { view: "delete", id: "atlas-child" });
+    acknowledge(h)!.checked = true;
+    h.submit();
+    await settle();
+    expect(preflights).toBe(2);
+    expect(h.dialog()).not.toBeNull();
+    expect(h.main().querySelector("[role=alert]")!.textContent).toBe("The worktree's files changed while deletion was prepared. Review the deletion again. Nothing was removed.");
+    // The warning now lists what is there NOW, and must be acknowledged anew.
+    expect(warning(h)!.textContent).toContain("Untracked files (2)");
+    expect([...warning(h)!.querySelectorAll("li li code")].map(node => node.textContent)).toEqual(["late.txt", "scratch.txt"]);
+    expect(acknowledge(h)!.checked === true || acknowledge(h)!.hasAttribute("checked")).toBe(false);
+    expect(buttons(h)).toEqual(["Cancel", "Delete"]);
+    expect(h.changed).toEqual([]);
+    acknowledge(h)!.checked = true;
+    h.submit();
+    await settle();
+    expect(h.requests.filter(request => request.path === "/delete").map(request => request.body?.localDataFingerprint)).toEqual([fingerprint, updated]);
+    expect(h.document.querySelector("[data-worktree-confirmation]")!.textContent).toContain("Worktree deleted. Branch kept.");
+  });
+
+  test("a local-data refusal whose fresh preflight finds a blocker shows that blocker and Cancel only", async () => {
+    let preflights = 0;
+    const h = harness({
+      "/": () => inventory(rows),
+      "/preflight-delete": () => {
+        preflights += 1;
+        return preflights === 1
+          ? { ok: true, checkout: checkout(), requiresStop: false, localData: { untracked: { count: 1, sample: ["scratch.txt"] }, fingerprint } }
+          : { ok: false, checkout: checkout(), error: { code: "git-lock", message: "This worktree is locked in Git. Unlock it outside Uatu if it is safe, then retry. Nothing was removed.", retry: "retry-delete" } };
+      },
+      "/delete": () => ({
+        ok: false, operationId: "op", kind: "delete", phase: "rechecking",
+        error: { code: "local-data", message: "The worktree's files changed while deletion was prepared. Review the deletion again. Nothing was removed.", retry: "refresh", phase: "rechecking" },
+      }),
+    });
+    await open(h, { view: "delete", id: "atlas-child" });
+    acknowledge(h)!.checked = true;
+    h.submit();
+    await settle();
+    expect(h.main().querySelector("[role=alert]")!.textContent).toContain("locked in Git");
+    expect(warning(h)).toBeNull();
+    expect(acknowledge(h)).toBeNull();
+    expect(buttons(h)).toEqual(["Cancel"]);
+  });
+
+  test("any other refusal replaces the form with the alert and Cancel only", async () => {
+    const h = harness({
+      "/": () => inventory(rows),
+      "/preflight-delete": () => ({ ok: true, checkout: checkout(), requiresStop: false, localData: { untracked: { count: 1, sample: ["scratch.txt"] }, fingerprint } }),
+      "/delete": () => ({
+        ok: false, operationId: "op", kind: "delete", phase: "removing",
+        error: { code: "git-lock", message: "The worktree changed while deletion was prepared. This worktree is locked in Git. Unlock it outside Uatu if it is safe, then retry. Nothing was removed.", retry: "retry-delete", phase: "removing" },
+      }),
+    });
+    await open(h, { view: "delete", id: "atlas-child" });
+    acknowledge(h)!.checked = true;
+    h.submit();
+    await settle();
+    expect(h.main().querySelector("[role=alert]")!.textContent).toContain("locked in Git");
+    expect(warning(h)).toBeNull();
+    expect(buttons(h)).toEqual(["Cancel"]);
   });
 });
 

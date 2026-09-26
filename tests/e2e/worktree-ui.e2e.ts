@@ -7,13 +7,14 @@
 // embedded in both the in-workspace picker and the Hub dashboard, renders
 // every view from the published JSON family and performs every guarded
 // operation — creation in both modes, an explicit fetch, registration of a
-// tree Git already lists, guarded deletion with its blocker, Remove from
-// Uatu, a missing path that is never recreated, and live invalidation that
-// leaves the page's own selection alone.
+// tree Git already lists, guarded deletion with its blocker and its
+// local-data acknowledgement, Remove from Uatu, a missing path that is never
+// recreated, and live invalidation that leaves the page's own selection
+// alone.
 
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { rm, writeFile } from "node:fs/promises";
+import { mkdir, rm, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import type { Page } from "@playwright/test";
@@ -411,6 +412,80 @@ for (const touch of [false, true]) test.describe(touch ? "worktree dialog on tou
     await page.close();
   });
 
+  test("deletion with local data lists it and needs the explicit acknowledgement, from the dashboard", async ({ hub, hubContext }, info) => {
+    test.setTimeout(90_000);
+    const parent = hub.workspaces.find(workspace => workspace.id === parentId)!;
+    const page = await hubContext.newPage();
+    const errors: string[] = [];
+    page.on("pageerror", error => errors.push(error.message));
+    await page.goto(`${hub.origin}/s/${parentId}/`);
+    const branch = "delete/local-data";
+    await fork(page, parentId, "New branch / worktree");
+    await page.getByRole("dialog").getByLabel("Name", { exact: true }).fill(branch);
+    await page.getByRole("dialog").getByRole("button", { name: "Create", exact: true }).click();
+    await expect(page.getByRole("dialog")).toHaveCount(0);
+    await expect(page.locator("[data-worktree-confirmation]")).toContainText(`Created ${branch}`);
+    const checkout = await rowFor(page, parentId, branch);
+    // A branch commit that ignores `.env`, then one entry of each kind.
+    await writeFile(path.join(checkout.path, ".gitignore"), ".env\nnode_modules/\n");
+    await git(checkout.path, ["add", ".gitignore"]);
+    await git(checkout.path, ["commit", "-m", "ignore local settings"]);
+    const head = await git(checkout.path, ["rev-parse", "HEAD"]);
+    await writeFile(path.join(checkout.path, "README.md"), "# edited, not committed\n");
+    await writeFile(path.join(checkout.path, "scratch.txt"), "untracked notes\n");
+    await writeFile(path.join(checkout.path, ".env"), "API_TOKEN=local-only\n");
+    await mkdir(path.join(checkout.path, "node_modules", "left-pad"), { recursive: true });
+    await writeFile(path.join(checkout.path, "node_modules", "left-pad", "index.js"), "module.exports = 1;\n");
+
+    await page.goto(`${hub.origin}/`);
+    await dashboard(page);
+    const dialog = page.getByRole("dialog");
+    const deleteButton = () => page.locator(`[data-workspace="${checkout.workspaceId}"]`).getByRole("button", { name: "Delete worktree", exact: true });
+    const acknowledgement = dialog.getByRole("checkbox", { name: "Permanently delete these files with the worktree." });
+
+    // --- the warning, per category, with an unchecked required box ----------
+    await deleteButton().click();
+    await expect(dialog).toContainText("Delete worktree?");
+    await expect(dialog).toContainText("The worktree’s files will be removed. The Git branch will be kept.");
+    await expect(dialog).toContainText("These files and folders will be permanently deleted with the worktree, including everything inside each listed folder, and cannot be recovered.");
+    await expect(dialog).toContainText("Uncommitted changes (1)");
+    await expect(dialog).toContainText("README.md");
+    await expect(dialog).toContainText("Untracked files (1)");
+    await expect(dialog).toContainText("scratch.txt");
+    await expect(dialog).toContainText("Ignored files and folders (2)");
+    await expect(dialog.locator("[data-local-data] li li code")).toHaveText(["README.md", "scratch.txt", ".env", "node_modules/"]);
+    await expect(dialog).toContainText("node_modules/ (folder, with everything in it)");
+    await expect(dialog).not.toContainText(checkout.path);
+    await expect(acknowledgement).not.toBeChecked();
+    await expect(dialog.getByRole("button", { name: "Delete", exact: true })).toBeVisible();
+    await captureScreenshot(page, info, `worktree-ui-${label}-delete-local-data`);
+
+    // --- unchecked: nothing is sent, the reason is shown in place -----------
+    await dialog.getByRole("button", { name: "Delete", exact: true }).click();
+    await expect(dialog.getByRole("alert")).toHaveText("Confirm to continue. Nothing changed.");
+    await expect(acknowledgement).toBeVisible();
+    await captureScreenshot(page, info, `worktree-ui-${label}-delete-local-data-unconfirmed`);
+    expect(existsSync(path.join(checkout.path, "scratch.txt"))).toBe(true);
+
+    // --- Cancel keeps everything --------------------------------------------
+    await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
+    await expect(page.getByRole("dialog")).toHaveCount(0);
+    expect(existsSync(path.join(checkout.path, ".env"))).toBe(true);
+    expect(existsSync(path.join(checkout.path, "scratch.txt"))).toBe(true);
+    expect((await rowFor(page, parentId, branch)).registered).toBe(true);
+
+    // --- ticked: the listed data is deleted with the worktree ---------------
+    await deleteButton().click();
+    await acknowledgement.check();
+    await dialog.getByRole("button", { name: "Delete", exact: true }).click();
+    await expect(page.getByRole("dialog")).toHaveCount(0);
+    await expect(page.locator("[data-worktree-confirmation]")).toContainText("Worktree deleted. Branch kept.");
+    expect(existsSync(checkout.path)).toBe(false);
+    expect(await git(parent.path, ["rev-parse", branch])).toBe(head);
+    expect(errors).toEqual([]);
+    await page.close();
+  });
+
   test("guarded deletion, its blocker, and Remove from Uatu, from the dashboard", async ({ hub, hubContext }, info) => {
     test.setTimeout(90_000);
     const parent = hub.workspaces.find(workspace => workspace.id === parentId)!;
@@ -493,9 +568,13 @@ for (const touch of [false, true]) test.describe(touch ? "worktree dialog on tou
     await expect(page.getByRole("dialog")).toHaveCount(0);
 
     // --- a blocker replaces the consequences ------------------------------
+    // Local data is acknowledged, not blocked (see the local-data case
+    // below); a Git lock still blocks outright.
     await writeFile(path.join(dirty.path, "draft.txt"), "work in progress\n");
+    await git(dirty.path, ["worktree", "lock", "--reason", "keep", dirty.path]);
     await row(dirty.workspaceId!).getByRole("button", { name: "Delete worktree", exact: true }).click();
-    await expect(dialog.getByRole("alert")).toContainText("untracked files");
+    await expect(dialog.getByRole("alert")).toContainText("locked in Git");
+    await expect(dialog.getByRole("checkbox")).toHaveCount(0);
     await expect(dialog).not.toContainText("The Git branch will be kept.");
     await expect(dialog.getByRole("button", { name: "Delete", exact: true })).toHaveCount(0);
     await expect(dialog.getByRole("button", { name: "Cancel", exact: true })).toBeVisible();

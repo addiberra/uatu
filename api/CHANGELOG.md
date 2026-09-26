@@ -2,6 +2,20 @@
 
 Entries are ordered newest first. Every entry has Hub and workspace revisions, a compatibility classification, and migration guidance. Use `None` when no migration is required. An entry is headed `Unreleased` until the release that ships it; the release-prep step replaces that with the version tag (`v0.7.0`), so a consumer can tell which revision pair a given uatu version speaks. An additive change that lands after a pair has shipped gets its own entry under the same pair, stamped with its own release, rather than being appended to the shipped entry.
 
+## Hub 10 / Workspace 21 - Unreleased
+
+Compatibility: breaking (Hub)
+
+### Changes
+
+- `POST /api/hub/worktrees/preflight-delete` no longer refuses a checkout just because it has tracked changes, untracked files or ignored files. When nothing else blocks, its `ok: true` answer carries `localData`: for each category present (`tracked`, `untracked`, `ignored`), the entry count and up to five sorted checkout-relative sample paths, plus one `fingerprint` of the complete set of entries. A path with a trailing `/` is a whole folder and stands for everything inside it.
+- `POST /api/hub/worktrees/delete` accepts an optional `localDataFingerprint`, the preflight's fingerprint echoed back as the acknowledgement of exactly the disclosed data. The Hub re-verifies it at every recheck, up to the moment before Git runs. A missing acknowledgement while local data exists is refused as `local-data`; a set that changed since preflight is refused as `local-data` with `retry: refresh`, since only a new preflight can succeed; a malformed value is refused as `invalid-input`. Nothing is removed in any of these cases.
+- The acknowledgement never overrides a Git lock, a nested worktree, an initialized submodule or nested repository, a Git operation in progress, external activity, uncertain identity or ownership. There is no client-facing force: the Hub may pass Git at most a single force, only for acknowledged tracked or untracked data, never the double force that overrides a lock. The branch is always kept.
+
+### Migration
+
+Strict Hub clients must regenerate against Hub revision 10: `WorktreeDeletionPreflight` is closed, so a revision 9 validator rejects the new `localData` field. A client that does not send `localDataFingerprint` keeps today's behavior: a checkout with local data is refused as `local-data`, now at `delete` rather than at `preflight-delete`, so a preflight `ok: true` is not by itself a promise that deletion will proceed. To delete such a checkout, show the disclosed data, get the user's explicit acknowledgement and send the fingerprint; on a `local-data` refusal with `retry: refresh`, run the preflight again and review. The workspace payload revision remains 21.
+
 ## Hub 9 / Workspace 21 - Unreleased
 
 Compatibility: breaking (Hub)

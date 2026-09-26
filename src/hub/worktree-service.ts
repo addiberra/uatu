@@ -1,7 +1,8 @@
 // The Hub's worktree operation service: one place where inventory, refs,
 // fetch and creation happen, shared by the UI today and the agent-invoked
 // CLI later (design §2, §7). Every mutation is serialized per repository,
-// journaled before it runs, bounded, and non-force.
+// journaled before it runs, bounded, and non-force — except one removal
+// shape: a single `--force` for acknowledged tracked or untracked data.
 //
 // It owns no presentation and no HTTP: the routes hand it an authenticated
 // user and a validated request, and it answers with the shared contract
@@ -53,7 +54,10 @@ import {
   type WorktreeGitOptions,
   type WorktreeRecord,
 } from "./worktree-git";
-import { inspectRemovalSafety, runWorktreeRemove } from "./worktree-delete";
+import { inspectRemovalSafety, localDataRefusal, removalRequiresForce, runWorktreeRemove, toWireLocalData } from "./worktree-delete";
+
+// Leads every refusal from a check that runs after the fenced one passed.
+const CHANGED_WHILE_PREPARING = "The worktree changed while deletion was prepared. ";
 import {
   ownershipForCheckout,
   recoverWorktreeOperation,
@@ -633,8 +637,9 @@ export class WorktreeService {
     return undefined;
   }
 
-  // What the confirmation dialog shows: may this checkout be deleted, and
-  // does proceeding need the explicit "Stop and delete". Read-only.
+  // What the confirmation dialog shows: may this checkout be deleted, does
+  // proceeding need the explicit "Stop and delete", and which local data
+  // would be deleted with it (and must be acknowledged). Read-only.
   async preflightDelete(request: WorktreeDeleteRequest): Promise<WorktreeDeletionPreflight> {
     try {
       const unavailable = this.deletionUnavailable();
@@ -663,15 +668,18 @@ export class WorktreeService {
         : WorktreeOperationError.of("ownership-required", "Only a worktree Uatu created can be deleted. Remove it from Uatu instead; its files stay.");
       return { ok: false, checkout, error: error.detail };
     }
-    const blocker = await inspectRemovalSafety({ run: this.run, checkoutPath: checkout.path, records: view.records });
-    if (blocker) return { ok: false, checkout, error: blocker.detail };
+    const safety = await inspectRemovalSafety({ run: this.run, checkoutPath: checkout.path, checkoutId: checkout.checkoutId, records: view.records });
+    if ("blocked" in safety) return { ok: false, checkout, error: safety.blocked.detail };
     const workspaceId = checkout.workspaceId;
     const active = workspaceId !== undefined
       && (this.options.sessions.isRunning(workspaceId) || this.options.sessions.isStarting?.(workspaceId) === true);
-    return { ok: true, checkout, requiresStop: active };
+    return { ok: true, checkout, requiresStop: active, ...(safety.localData ? { localData: toWireLocalData(safety.localData) } : {}) };
   }
 
-  // confirm → fence → stop → recheck → non-force remove → verify → clean up.
+  // confirm → fence → stop → recheck → remove → verify → clean up. Local
+  // data must carry the caller's acknowledgement (the preflight fingerprint)
+  // and still match it at every recheck; removal is non-force unless that
+  // final, matched data has tracked or untracked entries.
   // Every failure before the removal leaves files AND registration exactly
   // as they were. The branch is never an argument to anything here.
   async delete(user: string, request: WorktreeDeleteRequest): Promise<WorktreeOperationResult> {
@@ -720,6 +728,12 @@ export class WorktreeService {
     const preflight = await this.preflightIn(view, request.reference);
     if (!preflight.ok) return refuse(new WorktreeOperationError(preflight.error), "preflight");
     const checkout = preflight.checkout;
+    // No prefix here: without a fingerprint this check cannot tell data that
+    // appeared since the caller's preflight from a caller that never
+    // acknowledged it, so it states only what is there. A stale fingerprint
+    // already says the files changed.
+    const unacknowledged = localDataRefusal(preflight.localData, request.localDataFingerprint, "preflight");
+    if (unacknowledged) return refuse(unacknowledged, "preflight");
     if (preflight.requiresStop && request.stop !== true) {
       return refuse(WorktreeOperationError.of("conflict", "This worktree is running. Choose Stop and delete to stop its Uatu sessions first. Nothing was removed.", { retry: "retry-delete", phase: "preflight" }), "preflight");
     }
@@ -767,6 +781,10 @@ export class WorktreeService {
         if (recheck.checkout.checkoutId !== checkout.checkoutId || recheck.checkout.path !== checkout.path) {
           throw WorktreeOperationError.of("identity-uncertain", "The worktree changed while deletion was prepared. Nothing was removed.", { retry: "refresh", phase: "rechecking" });
         }
+        // The fenced check above already passed, so any refusal here is data
+        // that appeared while sessions stopped: say so, as the final check does.
+        const changed = localDataRefusal(recheck.localData, request.localDataFingerprint, "rechecking", CHANGED_WHILE_PREPARING);
+        if (changed) throw changed;
         // Written into Git's administrative directory for this tree, which
         // `git worktree remove` deletes with it: its survival is what proves
         // "not removed" even when a new tree reuses the same name.
@@ -775,10 +793,13 @@ export class WorktreeService {
         progress.phase = "removing";
         await this.options.journal.advance(operationId, "removing");
         // Marker/journal persistence yields to external writers. Revalidate
-        // after those writes: non-force Git removal protects tracked and
-        // untracked changes, but WILL remove ignored files. This narrows the
-        // preparation race; it cannot atomically fence external writers after
-        // our final probe or during Git's removal.
+        // after those writes, including the acknowledged local data: Git
+        // removes ignored files even without force, and a forced removal
+        // also removes tracked and untracked changes, so this final probe is
+        // what binds the removal to exactly the data the user reviewed. It
+        // narrows the preparation race; it cannot atomically fence external
+        // writers after our final probe or during Git's removal (which, under
+        // force, would delete their writes too).
         const finalView = await this.repositoryView(request.sourceWorkspaceId);
         // Ownership/registration remain fenced; probe the already-resolved
         // path directly rather than inspecting every unrelated checkout again.
@@ -786,13 +807,21 @@ export class WorktreeService {
         const sameCheckout = finalIdentity.present && finalIdentity.identityReadable
           && finalIdentity.identity?.checkoutId === checkout.checkoutId
           && finalIdentity.identity.repositoryId === checkout.repositoryId;
-        const blocker = sameCheckout
-          ? await inspectRemovalSafety({ run: this.run, checkoutPath: checkout.path, records: finalView.records })
+        const safety = sameCheckout
+          ? await inspectRemovalSafety({ run: this.run, checkoutPath: checkout.path, checkoutId: checkout.checkoutId, records: finalView.records })
           : undefined;
-        if (!sameCheckout || blocker) {
-          throw WorktreeOperationError.of(blocker?.detail.code ?? "identity-uncertain", `The worktree changed while deletion was prepared. ${blocker?.detail.message ?? "Its identity could not be verified. Nothing was removed."}`, { retry: blocker?.detail.retry ?? "refresh", phase: "removing" });
+        const changedPrefix = CHANGED_WHILE_PREPARING;
+        if (!safety || "blocked" in safety) {
+          const blocker = safety?.blocked;
+          throw WorktreeOperationError.of(blocker?.detail.code ?? "identity-uncertain", `${changedPrefix}${blocker?.detail.message ?? "Its identity could not be verified. Nothing was removed."}`, { retry: blocker?.detail.retry ?? "refresh", phase: "removing" });
         }
-        const removed = await runWorktreeRemove(this.run, current.mainPath, checkout.path);
+        const finalData = safety.localData;
+        const unacknowledged = localDataRefusal(finalData, request.localDataFingerprint, "removing", changedPrefix);
+        if (unacknowledged) throw unacknowledged;
+        // Force is derived ONLY from the final, fingerprint-matched data —
+        // never from the request — and is a single `--force`, which Git
+        // does not let override a lock.
+        const removed = await runWorktreeRemove(this.run, current.mainPath, checkout.path, { force: removalRequiresForce(finalData) });
         const after = await inspectCheckout(checkout.path, { ...this.options.git, run: this.run });
         if (after.present && !after.identityReadable) {
           progress.retained = true;

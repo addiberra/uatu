@@ -20,8 +20,9 @@ import { WorktreeJournal, WorktreeProvenanceStore, removalMarkerPresent } from "
 import { createOnboardingWorktreeRegistrar } from "./worktree-registrar";
 import { WORKTREE_API_PATH } from "./worktree-api";
 import { WorktreeService } from "./worktree-service";
-import { CHECKOUT_IDENTITY_FILE } from "./worktree-git";
-import { parseWorktreeDeletionPreflight, parseWorktreeInventory, parseWorktreeOperationResult, type WorktreeInventory } from "../shared/worktree-contract";
+import { CHECKOUT_IDENTITY_FILE, createGitRunner, type GitRunner } from "./worktree-git";
+import { categorizePorcelainStatus, countForceArguments, describeLocalData } from "./worktree-delete";
+import { parseWorktreeDeletionPreflight, parseWorktreeInventory, parseWorktreeOperationResult, type WorktreeErrorCode, type WorktreeInventory } from "../shared/worktree-contract";
 import { parseLiveEnvelope, type LiveEnvelope } from "../shared/live-protocol";
 import { parseHubState } from "../shell/hub-nav";
 
@@ -49,14 +50,24 @@ let atlas = "";
 let atlasId = "";
 let beacon = "";
 let beaconId = "";
+// The local-data deletion cases create many worktrees; they live in their
+// own repository so every other case's inventory stays small.
+let cairn = "";
+let cairnId = "";
 
 const backendControl = {
   starts: [] as string[],
   stopFailures: new Set<string>(),
+  // Runs inside a session's stop, i.e. after deletion's fenced re-preflight
+  // and before its post-stop recheck.
+  onStop: null as ((workspaceId: string) => Promise<void>) | null,
   gate: null as Promise<void> | null,
   startedInMissingFolder: false,
 };
 let unregisterFailures = 0;
+// Every Git argument list the service runs, recorded so removal-mode
+// assertions (force or not, never twice) read what Git actually received.
+const gitCalls: string[][] = [];
 
 function cleanEnvironment(): Record<string, string> {
   return {
@@ -95,6 +106,55 @@ async function repository(name: string): Promise<string> {
   return folder;
 }
 
+function recordingRunner(): GitRunner {
+  const inner = createGitRunner({ env: cleanEnvironment() });
+  return async (args, cwd, options) => {
+    gitCalls.push([...args]);
+    return inner(args, cwd, options);
+  };
+}
+
+const removals = (checkoutPath: string) => gitCalls.filter(args => args[0] === "worktree" && args[1] === "remove" && args.at(-1) === checkoutPath);
+const forceCount = countForceArguments;
+
+// The fingerprint the Hub would compute for this checkout right now, from
+// the same probe it runs: lets a test present a MATCHING acknowledgement even
+// where preflight refuses to offer one.
+async function currentLocalData(folder: string, checkoutId: string) {
+  const status = await git(folder, ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored=matching", "--no-renames"]);
+  return describeLocalData(checkoutId, categorizePorcelainStatus(status));
+}
+
+// Tracked `lib/a.txt`, committed on the checkout's branch; then `lib/`
+// becomes a repository of its own. The outer status says nothing about it.
+async function nestRepositoryInTrackedDirectory(folder: string): Promise<void> {
+  await mkdir(path.join(folder, "lib"), { recursive: true });
+  await writeFile(path.join(folder, "lib", "a.txt"), "a\n");
+  await git(folder, ["add", "lib"]);
+  await git(folder, ["commit", "-m", "lib"]);
+  await git(path.join(folder, "lib"), ["init", "--initial-branch=main"]);
+  await git(path.join(folder, "lib"), ["add", "a.txt"]);
+  await git(path.join(folder, "lib"), ["commit", "-m", "inner"]);
+}
+
+// A repository to add as a submodule, created once.
+let submoduleOrigin = "";
+async function submoduleRepository(): Promise<string> {
+  if (submoduleOrigin) return submoduleOrigin;
+  const folder = path.join(root, "submodule-origin");
+  await mkdir(folder);
+  await git(folder, ["init", "--initial-branch=main"]);
+  await git(folder, ["commit", "--allow-empty", "-m", "submodule"]);
+  submoduleOrigin = folder;
+  return folder;
+}
+
+// Adds and initializes a submodule inside a linked checkout: its repository
+// lives in that checkout's own `<gitdir>/worktrees/<id>/modules`.
+async function addSubmodule(folder: string): Promise<void> {
+  await git(folder, ["-c", "protocol.file.allow=always", "submodule", "add", await submoduleRepository(), "mods/sub"]);
+}
+
 const onboardingGit: OnboardingGit = {
   async probe(folder) {
     const isRepository = await Bun.file(path.join(folder, ".git", "HEAD")).exists();
@@ -118,6 +178,7 @@ const backend: SessionBackend = {
       exited: new Promise<number | null>(() => {}),
       async stop() {
         if (backendControl.stopFailures.has(workspace.id)) throw new Error("simulated stop failure");
+        await backendControl.onStop?.(workspace.id);
       },
     };
   },
@@ -132,6 +193,7 @@ beforeAll(async () => {
   await mkdir(state);
   atlas = await repository("atlas");
   beacon = await repository("beacon");
+  cairn = await repository("cairn");
 
   const config: HubConfig = {
     port: 0,
@@ -165,6 +227,7 @@ beforeAll(async () => {
   });
   atlasId = (await onboarding.configureExisting({ path: atlas, displayName: "Atlas", authentication: [], signing: null, init: false, start: false })).entry.id;
   beaconId = (await onboarding.configureExisting({ path: beacon, displayName: "Beacon", authentication: [], signing: null, init: false, start: false })).entry.id;
+  cairnId = (await onboarding.configureExisting({ path: cairn, displayName: "Cairn", authentication: [], signing: null, init: false, start: false })).entry.id;
   journal = new WorktreeJournal(path.join(state, "pending-worktree-operation.json"));
   provenance = new WorktreeProvenanceStore(path.join(state, "worktree-provenance.json"));
   service = new WorktreeService({
@@ -174,7 +237,7 @@ beforeAll(async () => {
     provenance,
     registrar: createOnboardingWorktreeRegistrar({ onboarding, registry }),
     coordinator: new WorktreeOperationCoordinator(reservations),
-    git: { env: cleanEnvironment() },
+    git: { env: cleanEnvironment(), run: recordingRunner() },
     // The same Hub cleanup main.ts wires, with an injectable persistence failure.
     unregister: async workspaceId => {
       if (unregisterFailures > 0) {
@@ -252,48 +315,119 @@ test("stamp write failure retains an unverified checkout without ownership or re
   }
 });
 
-test.each(["ignored file", "changed ignore rules"])("ignored data appearing after the recheck (%s) refuses deletion prepared for a clean tree", async scenario => {
-  const branch = scenario === "ignored file" ? "late-ignored" : "late-ignore-rules";
-  const created = await service.create("reviewer", { sourceWorkspaceId: atlasId, mode: "new-branch", branch, base: { kind: "local", ref: "main" } });
+// Local data that appears or changes between the post-stop recheck and the
+// final pre-Git probe. Each variant runs twice: deletion prepared for a
+// clean tree (no acknowledgement sent), and deletion acknowledged for one
+// set of local data that has become another by the final check.
+type LateChange = { branch: string; filename: string; before?: (folder: string) => Promise<void>; inject: (folder: string) => Promise<void> };
+const lateChanges: Record<string, LateChange> = {
+  "ignored file": { branch: "late-ignored", filename: "precious.local", inject: folder => writeFile(path.join(folder, "precious.local"), "keep this data\n") },
+  "changed ignore rules": {
+    branch: "late-ignore-rules",
+    filename: "precious.scratch",
+    // Acknowledged as an untracked file; a new ignore rule turns it into an
+    // ignored one — a different set, even though no file changed.
+    before: folder => writeFile(path.join(folder, "precious.scratch"), "keep this data\n"),
+    inject: async folder => {
+      await writeFile(path.join(folder, "precious.scratch"), "keep this data\n");
+      await writeFile(path.join(cairn, ".git", "info", "exclude"), "precious.scratch\n");
+    },
+  },
+  "tracked modification": { branch: "late-tracked", filename: "README.md", inject: folder => writeFile(path.join(folder, "README.md"), "keep this data\n") },
+  "new untracked file": { branch: "late-untracked", filename: "late.txt", inject: folder => writeFile(path.join(folder, "late.txt"), "keep this data\n") },
+};
+
+test.each(Object.keys(lateChanges).flatMap(scenario => [[scenario, "prepared for a clean tree"], [scenario, "acknowledged for other data"]] as const))("local data appearing after the recheck (%s) refuses deletion %s", async (scenario, situation) => {
+  const change = lateChanges[scenario]!;
+  const acknowledged = situation === "acknowledged for other data";
+  const created = await service.create("reviewer", { sourceWorkspaceId: cairnId, mode: "new-branch", branch: `${change.branch}${acknowledged ? "-ack" : ""}`, base: { kind: "local", ref: "main" } });
   if (!created.ok || !created.checkout?.workspaceId) throw new Error("expected created workspace");
   const checkout = created.checkout;
+  const exclude = path.join(cairn, ".git", "info", "exclude");
+  const originalExclude = await Bun.file(exclude).text().catch(() => "");
   const originalAdvance = journal.advance.bind(journal);
   let injected = false;
   let administrativeDirectory = "";
-  const filename = scenario === "ignored file" ? "precious.local" : "precious.scratch";
+  let fingerprint: string | undefined;
+  if (acknowledged) {
+    // Set A: what the user reviewed and acknowledged.
+    await (change.before ?? (folder => writeFile(path.join(folder, "reviewed.txt"), "reviewed\n")))(checkout.path);
+    const reviewed = await service.preflightDelete({ sourceWorkspaceId: cairnId, reference: checkout.workspaceId! });
+    if (!reviewed.ok || !reviewed.localData) throw new Error("expected disclosed local data");
+    fingerprint = reviewed.localData.fingerprint;
+  }
   journal.advance = async (...args) => {
     const intent = await originalAdvance(...args);
     if (args[1] === "removing") {
       if (intent.kind !== "delete") throw new Error("expected deletion intent");
       administrativeDirectory = intent.administrativeDirectory;
-      await writeFile(path.join(checkout.path, filename), "keep this data\n");
-      if (scenario === "changed ignore rules") {
-        // The untracked change becomes ignored before Git can protect it.
-        await writeFile(path.join(atlas, ".git", "info", "exclude"), `${filename}\n`);
-      }
+      await change.inject(checkout.path);
       injected = true;
     }
     return intent;
   };
   try {
-    const deleted = await service.delete("reviewer", { sourceWorkspaceId: atlasId, reference: checkout.workspaceId! });
+    const deleted = await service.delete("reviewer", { sourceWorkspaceId: cairnId, reference: checkout.workspaceId!, ...(fingerprint ? { localDataFingerprint: fingerprint } : {}) });
     expect(injected).toBe(true);
     expect(deleted.ok).toBe(false);
-    if (deleted.ok) throw new Error("must not delete newly ignored data");
-    expect(deleted.error.message).toContain("changed while deletion was prepared");
-    expect(deleted.error.message).toContain("ignored files");
-    expect(deleted.error.message).toContain("Move or delete them");
+    if (deleted.ok) throw new Error("must not delete changed local data");
+    expect(deleted.error.code).toBe("local-data");
+    if (acknowledged) {
+      // Not doubled: the mismatch message already says so.
+      expect(deleted.error.message).toBe("The worktree's files changed while deletion was prepared. Review the deletion again. Nothing was removed.");
+      // Only a new preflight can succeed now.
+      expect(deleted.error.retry).toBe("refresh");
+    } else {
+      expect(deleted.error.message).toStartWith("The worktree changed while deletion was prepared. It has ");
+      expect(deleted.error.message).toContain("or confirm deleting them with the worktree");
+      if (scenario === "ignored file" || scenario === "changed ignore rules") expect(deleted.error.message).toContain("ignored files");
+    }
     expect(deleted.phase).toBe("removing");
     expect(deleted.error.phase).toBe(deleted.phase);
-    expect(await Bun.file(path.join(checkout.path, filename)).text()).toBe("keep this data\n");
+    expect(await Bun.file(path.join(checkout.path, change.filename)).text()).toBe("keep this data\n");
+    expect(removals(checkout.path)).toHaveLength(0);
     expect(registry.byId(checkout.workspaceId!)).toBeDefined();
     expect(await provenance.byCheckoutId(checkout.checkoutId)).toBeDefined();
     expect(await journal.read()).toBeUndefined();
     expect(await removalMarkerPresent(administrativeDirectory, deleted.operationId)).toBe(false);
   } finally {
     journal.advance = originalAdvance;
-    await rm(path.join(checkout.path, filename), { force: true });
-    await service.delete("reviewer", { sourceWorkspaceId: atlasId, reference: checkout.workspaceId! });
+    await writeFile(exclude, originalExclude);
+    const cleanup = await service.preflightDelete({ sourceWorkspaceId: cairnId, reference: checkout.workspaceId! });
+    await service.delete("reviewer", { sourceWorkspaceId: cairnId, reference: checkout.workspaceId!, ...(cleanup.ok && cleanup.localData ? { localDataFingerprint: cleanup.localData.fingerprint } : {}) });
+  }
+});
+
+// The documented status-level trade-off: the acknowledgement covers paths
+// and their status, not contents. More edits to a listed modified file, or
+// new files inside a listed ignored directory, leave the set unchanged.
+test.each([
+  ["a file added inside an acknowledged ignored directory", "late-inside-ignored", async (folder: string) => {
+    await mkdir(path.join(folder, "cache.local"));
+    await writeFile(path.join(folder, "cache.local", "first.bin"), "1");
+  }, (folder: string) => writeFile(path.join(folder, "cache.local", "second.bin"), "2"), false],
+  ["a further edit to an acknowledged modified file", "late-further-edit", (folder: string) => writeFile(path.join(folder, "README.md"), "first edit\n"),
+    (folder: string) => writeFile(path.join(folder, "README.md"), "second edit\n"), true],
+] as const)("%s still proceeds", async (_label, branch, before, inject, forced) => {
+  const created = await service.create("reviewer", { sourceWorkspaceId: cairnId, mode: "new-branch", branch, base: { kind: "local", ref: "main" } });
+  if (!created.ok || !created.checkout?.workspaceId) throw new Error("expected created workspace");
+  const checkout = created.checkout;
+  await before(checkout.path);
+  const reviewed = await service.preflightDelete({ sourceWorkspaceId: cairnId, reference: checkout.workspaceId! });
+  if (!reviewed.ok || !reviewed.localData) throw new Error("expected disclosed local data");
+  const originalAdvance = journal.advance.bind(journal);
+  journal.advance = async (...args) => {
+    const intent = await originalAdvance(...args);
+    if (args[1] === "removing") await inject(checkout.path);
+    return intent;
+  };
+  try {
+    const deleted = await service.delete("reviewer", { sourceWorkspaceId: cairnId, reference: checkout.workspaceId!, localDataFingerprint: reviewed.localData.fingerprint });
+    expect(deleted.ok).toBe(true);
+    expect(existsSync(checkout.path)).toBe(false);
+    expect(removals(checkout.path).map(forceCount)).toEqual([forced ? 1 : 0]);
+  } finally {
+    journal.advance = originalAdvance;
   }
 });
 
@@ -413,7 +547,11 @@ async function act(action: string, fields: Record<string, string>): Promise<Acti
     route = "open";
     body = { ...body, reference, start: true };
   } else if (action === "delete") {
-    body = { ...body, reference, confirm: fields.confirm === "1", ...(fields.stop === "1" ? { stop: true } : {}) };
+    body = {
+      ...body, reference, confirm: fields.confirm === "1",
+      ...(fields.stop === "1" ? { stop: true } : {}),
+      ...(fields.fingerprint === undefined ? {} : { localDataFingerprint: fields.fingerprint }),
+    };
   } else if (action === "register") {
     body = { ...body, reference, ...(fields.start === undefined ? {} : { start: true }) };
   } else {
@@ -666,33 +804,66 @@ describe("reconciliation (5.1)", () => {
 });
 
 describe("deletion preflight (5.3)", () => {
-  const blockers: Array<[string, (folder: string) => Promise<void>, string]> = [
-    ["tracked changes", folder => writeFile(path.join(folder, "README.md"), "changed\n"), "uncommitted changes"],
-    ["untracked files", folder => writeFile(path.join(folder, "notes.txt"), "draft\n"), "untracked files"],
-    ["ignored files", folder => writeFile(path.join(folder, "secrets.local"), "token\n"), "ignored files"],
+  // The nested-repository rows live in their own repository ("cairn"), so the
+  // shared one's inventory — read by every other case — stays small.
+  const blockers: Array<[string, (folder: string) => Promise<void>, string, ("atlas" | "cairn")?]> = [
     ["a Git lock", folder => git(folder, ["worktree", "lock", "--reason", "keep", folder]).then(() => undefined), "locked in Git"],
     ["a Git operation in progress", async folder => {
       const lock = (await git(folder, ["rev-parse", "--path-format=absolute", "--git-path", "index.lock"])).trim();
       await writeFile(lock, "");
     }, "Git operation appears to be running"],
     ["a nested worktree", folder => git(atlas, ["worktree", "add", "-b", `nested/${path.basename(folder)}`, path.join(folder, "inner")]).then(() => undefined), "Another worktree is inside"],
+    ["an initialized submodule", addSubmodule, "initialized submodule", "cairn"],
+    ["an untracked nested repository", folder => git(cairn, ["init", path.join(folder, "nested")]).then(() => undefined), "another Git repository (nested)", "cairn"],
+    // A clean status: non-force Git would delete `lib/.git` without a word.
+    ["a repository nested in a tracked directory", nestRepositoryInTrackedDirectory, "another Git repository (lib)", "cairn"],
   ];
 
-  for (const [label, arrange, reason] of blockers) {
+  for (const [label, arrange, reason, repository = "atlas"] of blockers) {
     test(`${label} blocks deletion and retains checkout and registration`, async () => {
-      const child = await create(`block/${label.replaceAll(" ", "-")}`);
+      const source = repository === "cairn" ? cairnId : atlasId;
+      const child = await create(`block/${label.replaceAll(" ", "-")}`, source);
       const folder = registry.byId(child)!.path;
       await arrange(folder);
       // The blocker the dialog shows INSTEAD of its normal consequences; that
       // it replaces them, and shows no path, is worktree-dialog.test.ts's.
-      const blocked = await preflight(child);
+      const blocked = await preflight(child, source);
       expect(blocked.ok).toBe(false);
       if (blocked.ok) return;
       expect(blocked.error.message).toContain(reason);
-      const answer = await act("delete", { source: atlasId, id: child, confirm: "1" });
+      const answer = await act("delete", { source, id: child, confirm: "1" });
       expect(failed(answer)).toBe(true);
       expect(answer.completion).toBeUndefined();
       expect(messageOf(answer)).toContain(reason);
+      expect(existsSync(folder)).toBe(true);
+      expect(registry.byId(child)).toBeDefined();
+      expect(await journal.read()).toBeUndefined();
+    });
+  }
+
+  // Local data no longer blocks preflight: it is disclosed, category by
+  // category, with the fingerprint a delete must echo back.
+  const localData: Array<[string, (folder: string) => Promise<void>, "tracked" | "untracked" | "ignored", string[], string]> = [
+    ["tracked changes", folder => writeFile(path.join(folder, "README.md"), "changed\n"), "tracked", ["README.md"], "uncommitted changes"],
+    ["untracked files", folder => writeFile(path.join(folder, "notes.txt"), "draft\n"), "untracked", ["notes.txt"], "untracked files"],
+    ["ignored files", folder => writeFile(path.join(folder, "secrets.local"), "token\n"), "ignored", ["secrets.local"], "ignored files"],
+  ];
+
+  for (const [label, arrange, category, sample, reason] of localData) {
+    test(`${label} are disclosed, and an unacknowledged delete retains checkout and registration`, async () => {
+      const child = await create(`data/${label.replaceAll(" ", "-")}`, cairnId);
+      const folder = registry.byId(child)!.path;
+      await arrange(folder);
+      const described = await preflight(child, cairnId);
+      expect(described.ok).toBe(true);
+      if (!described.ok) return;
+      const expected = await currentLocalData(folder, described.checkout.checkoutId);
+      expect(described.localData).toEqual({ [category]: { count: 1, sample }, fingerprint: expected!.fingerprint });
+      expect(described.localData!.fingerprint).toMatch(/^[0-9a-f]{64}$/);
+      const answer = await act("delete", { source: cairnId, id: child, confirm: "1" });
+      expect(failed(answer)).toBe(true);
+      expect(messageOf(answer)).toContain(reason);
+      expect(messageOf(answer)).toContain("or confirm deleting them with the worktree");
       expect(existsSync(folder)).toBe(true);
       expect(registry.byId(child)).toBeDefined();
       expect(await journal.read()).toBeUndefined();
@@ -715,6 +886,11 @@ describe("deletion preflight (5.3)", () => {
     expect(existsSync(atlas)).toBe(true);
   });
 });
+
+// Cases that read the shared repository's full inventory several times —
+// each read probes every checkout in it — outgrow the 5-second default on a
+// loaded machine; the in-flight start case below already allows 30 s.
+const INVENTORY_HEAVY_TIMEOUT = 30_000;
 
 describe("guarded removal (5.4) and branch preservation (5.5)", () => {
   test("a clean stopped worktree is removed, unregistered and forgotten; its branch and creation history stay", async () => {
@@ -759,7 +935,7 @@ describe("guarded removal (5.4) and branch preservation (5.5)", () => {
     expect(sessions.isRunning(child)).toBe(false);
     expect(existsSync(folder)).toBe(false);
     expect(await branchExists(atlas, "feature/running")).toBe(true);
-  });
+  }, INVENTORY_HEAVY_TIMEOUT);
 
   test("a failed stop removes nothing and keeps the registration", async () => {
     const child = await create("feature/stop-fails");
@@ -846,7 +1022,7 @@ describe("guarded removal (5.4) and branch preservation (5.5)", () => {
     const refused = await act("delete", { source: atlasId, id: occupant.checkoutId, confirm: "1" });
     expect(failed(refused)).toBe(true);
     expect(existsSync(path.join(folder, "README.md"))).toBe(true);
-  });
+  }, INVENTORY_HEAVY_TIMEOUT);
 
   test("restart recovery of an interrupted removal cleans up without touching a new occupant", async () => {
     const child = await create("feature/interrupted");
@@ -868,6 +1044,237 @@ describe("guarded removal (5.4) and branch preservation (5.5)", () => {
     expect(registry.byId(child)).toBeUndefined();
     expect(existsSync(path.join(folder, "their-work.txt"))).toBe(true);
     expect((await inventory()).checkouts.find(checkout => checkout.path === folder)).toMatchObject({ ownership: "external", registered: false });
+  });
+});
+
+describe("acknowledged local data (deletion with local data)", () => {
+  test("an acknowledged delete removes tracked, staged, untracked and ignored data with a single --force and keeps the branch", async () => {
+    const child = await create("ack/everything", cairnId);
+    const folder = registry.byId(child)!.path;
+    // The branch ignores `.env` and `node_modules/` in a commit of its own.
+    await writeFile(path.join(folder, ".gitignore"), "*.local\n.env\nnode_modules/\n");
+    await git(folder, ["commit", "-am", "ignore local settings"]);
+    const head = (await git(folder, ["rev-parse", "HEAD"])).trim();
+    await writeFile(path.join(folder, "README.md"), "modified\n");
+    await writeFile(path.join(folder, "staged.txt"), "staged\n");
+    await git(folder, ["add", "staged.txt"]);
+    await writeFile(path.join(folder, "scratch.txt"), "untracked\n");
+    await writeFile(path.join(folder, ".env"), "SECRET=1\n");
+    await mkdir(path.join(folder, "node_modules", "left-pad"), { recursive: true });
+    await writeFile(path.join(folder, "node_modules", "left-pad", "index.js"), "module.exports = 1;\n");
+    const described = await preflight(child, cairnId);
+    if (!described.ok || !described.localData) throw new Error("expected disclosed local data");
+    expect(described.localData.tracked).toEqual({ count: 2, sample: ["README.md", "staged.txt"] });
+    expect(described.localData.untracked).toEqual({ count: 1, sample: ["scratch.txt"] });
+    expect(described.localData.ignored).toEqual({ count: 2, sample: [".env", "node_modules/"] });
+    const answer = await act("delete", { source: cairnId, id: child, confirm: "1", fingerprint: described.localData.fingerprint });
+    expect(answer.completion?.deleted).toBe(child);
+    expect(existsSync(folder)).toBe(false);
+    expect(removals(described.checkout.path).map(forceCount)).toEqual([1]);
+    expect(registry.byId(child)).toBeUndefined();
+    expect((await git(cairn, ["rev-parse", "ack/everything"])).trim()).toBe(head);
+    expect(await journal.read()).toBeUndefined();
+  });
+
+  test("an acknowledged ignored-only delete removes the checkout without --force", async () => {
+    const child = await create("ack/ignored-only", cairnId);
+    const folder = registry.byId(child)!.path;
+    await writeFile(path.join(folder, "secrets.local"), "token\n");
+    const described = await preflight(child, cairnId);
+    if (!described.ok || !described.localData) throw new Error("expected disclosed local data");
+    expect(Object.keys(described.localData).sort()).toEqual(["fingerprint", "ignored"]);
+    const answer = await act("delete", { source: cairnId, id: child, confirm: "1", fingerprint: described.localData.fingerprint });
+    expect(answer.completion?.deleted).toBe(child);
+    expect(existsSync(folder)).toBe(false);
+    expect(removals(described.checkout.path).map(forceCount)).toEqual([0]);
+    expect(await branchExists(cairn, "ack/ignored-only")).toBe(true);
+  });
+
+  test("a delete without the acknowledgement is refused as local data, keeping checkout and registration", async () => {
+    const child = await create("ack/missing", cairnId);
+    const folder = registry.byId(child)!.path;
+    await writeFile(path.join(folder, "scratch.txt"), "untracked\n");
+    const deleted = await service.delete("reviewer", { sourceWorkspaceId: cairnId, reference: child });
+    expect(deleted.ok).toBe(false);
+    if (deleted.ok) return;
+    expect(deleted.error.code).toBe("local-data");
+    expect(deleted.phase).toBe("preflight");
+    expect(existsSync(path.join(folder, "scratch.txt"))).toBe(true);
+    expect(registry.byId(child)).toBeDefined();
+    expect(removals(folder)).toHaveLength(0);
+    expect(await journal.read()).toBeUndefined();
+  });
+
+  test("an acknowledged Stop and delete succeeds after the post-stop recheck", async () => {
+    const child = await create("ack/running", cairnId);
+    const folder = registry.byId(child)!.path;
+    await writeFile(path.join(folder, "README.md"), "modified\n");
+    await writeFile(path.join(folder, "secrets.local"), "token\n");
+    await sessions.start(child);
+    const described = await preflight(child, cairnId);
+    if (!described.ok || !described.localData) throw new Error("expected disclosed local data");
+    expect(described.requiresStop).toBe(true);
+    const answer = await act("delete", { source: cairnId, id: child, confirm: "1", stop: "1", fingerprint: described.localData.fingerprint });
+    expect(answer.completion?.deleted).toBe(child);
+    expect(sessions.isRunning(child)).toBe(false);
+    expect(existsSync(folder)).toBe(false);
+    expect(await branchExists(cairn, "ack/running")).toBe(true);
+  });
+
+  // A matching acknowledgement is not a force option: each of these refuses
+  // with its own blocker even though the fingerprint is exactly current.
+  const blockers: Array<[string, (folder: string) => Promise<void>, WorktreeErrorCode, string]> = [
+    ["a Git lock", folder => git(folder, ["worktree", "lock", "--reason", "keep", folder]).then(() => undefined), "git-lock", "locked in Git"],
+    ["an initialized submodule", addSubmodule, "nested-dependency", "initialized submodule"],
+    ["an untracked nested repository", folder => git(cairn, ["init", path.join(folder, "nested")]).then(() => undefined), "nested-dependency", "another Git repository (nested)"],
+    ["a repository nested in a tracked directory", nestRepositoryInTrackedDirectory, "nested-dependency", "another Git repository (lib)"],
+    // Git lists an untracked bare repository's files one by one, so its whole
+    // history would pass as ordinary untracked data.
+    ["an untracked bare repository", folder => git(cairn, ["clone", "--bare", cairn, path.join(folder, "backup.git")]).then(() => undefined), "nested-dependency", "another Git repository (backup.git)"],
+    ["an ignored bare repository", async folder => {
+      await writeFile(path.join(folder, ".gitignore"), "*.local\nbackup.git/\n");
+      await git(folder, ["commit", "-am", "ignore the backup"]);
+      await git(cairn, ["clone", "--bare", cairn, path.join(folder, "backup.git")]);
+    }, "nested-dependency", "another Git repository (backup.git)"],
+    ["an operation marker", async folder => {
+      const marker = (await git(folder, ["rev-parse", "--path-format=absolute", "--git-path", "MERGE_HEAD"])).trim();
+      await writeFile(marker, `${(await git(folder, ["rev-parse", "HEAD"])).trim()}\n`);
+    }, "external-activity", "Git operation appears to be running"],
+  ];
+
+  for (const [label, arrange, code, reason] of blockers) {
+    test(`${label} refuses even a matching acknowledgement, and Git removal never runs`, async () => {
+      const child = await create(`ack-blocked/${label.replaceAll(" ", "-")}`, cairnId);
+      const folder = registry.byId(child)!.path;
+      const checkoutId = registry.byId(child)!.worktree!.checkoutId;
+      await writeFile(path.join(folder, "scratch.txt"), "untracked\n");
+      await arrange(folder);
+      const current = await currentLocalData(folder, checkoutId);
+      if (!current) throw new Error("expected local data");
+      if (label === "an untracked bare repository") {
+        // What the acknowledgement would have covered: the repository's own
+        // files, one by one, as if they were ordinary untracked data.
+        expect(current.untracked!.entries).toContain("backup.git/HEAD");
+        expect(current.untracked!.count).toBeGreaterThan(5);
+      }
+      if (label === "an ignored bare repository") expect(current.ignored!.entries).toEqual(["backup.git/"]);
+      const blocked = await preflight(child, cairnId);
+      expect(blocked.ok).toBe(false);
+      const deleted = await service.delete("reviewer", { sourceWorkspaceId: cairnId, reference: child, localDataFingerprint: current.fingerprint });
+      expect(deleted.ok).toBe(false);
+      if (deleted.ok) return;
+      expect(deleted.error.code).toBe(code);
+      expect(deleted.error.message).toContain(reason);
+      expect(existsSync(path.join(folder, "scratch.txt"))).toBe(true);
+      if (label.includes("bare repository")) expect(existsSync(path.join(folder, "backup.git", "HEAD"))).toBe(true);
+      expect(registry.byId(child)).toBeDefined();
+      expect(removals(folder)).toHaveLength(0);
+      expect(await journal.read()).toBeUndefined();
+    });
+  }
+
+  test("local data that changes while sessions stop is refused at the post-stop recheck", async () => {
+    const child = await create("ack/changed-during-stop", cairnId);
+    const folder = registry.byId(child)!.path;
+    await writeFile(path.join(folder, "README.md"), "modified\n");
+    await sessions.start(child);
+    const described = await preflight(child, cairnId);
+    if (!described.ok || !described.localData) throw new Error("expected disclosed local data");
+    backendControl.onStop = async workspaceId => {
+      if (workspaceId === child) await writeFile(path.join(folder, "written-while-stopping.txt"), "keep\n");
+    };
+    try {
+      const deleted = await service.delete("reviewer", { sourceWorkspaceId: cairnId, reference: child, stop: true, localDataFingerprint: described.localData.fingerprint });
+      expect(deleted.ok).toBe(false);
+      if (deleted.ok) return;
+      // Caught by the recheck itself, not left to the final probe.
+      expect(deleted.phase).toBe("rechecking");
+      expect(deleted.error).toMatchObject({ code: "local-data", phase: "rechecking", retry: "refresh", message: "The worktree's files changed while deletion was prepared. Review the deletion again. Nothing was removed." });
+      expect(existsSync(path.join(folder, "written-while-stopping.txt"))).toBe(true);
+      expect(registry.byId(child)).toBeDefined();
+      expect(removals(folder)).toHaveLength(0);
+      expect(await journal.read()).toBeUndefined();
+    } finally {
+      backendControl.onStop = null;
+    }
+  });
+
+  test("local data that appears while sessions stop, with no acknowledgement, says the worktree changed", async () => {
+    const child = await create("ack/appeared-during-stop", cairnId);
+    const folder = registry.byId(child)!.path;
+    await sessions.start(child);
+    const described = await preflight(child, cairnId);
+    if (!described.ok) throw new Error("expected a deletable checkout");
+    expect(described.localData).toBeUndefined();
+    backendControl.onStop = async workspaceId => {
+      if (workspaceId === child) await writeFile(path.join(folder, "appeared.txt"), "keep\n");
+    };
+    try {
+      const deleted = await service.delete("reviewer", { sourceWorkspaceId: cairnId, reference: child, stop: true });
+      expect(deleted.ok).toBe(false);
+      if (deleted.ok) return;
+      expect(deleted.phase).toBe("rechecking");
+      expect(deleted.error).toMatchObject({ code: "local-data", phase: "rechecking", retry: "retry-delete" });
+      expect(deleted.error.message).toBe("The worktree changed while deletion was prepared. It has untracked files (1 file). Commit, move or delete them, or confirm deleting them with the worktree. Nothing was removed.");
+      expect(existsSync(path.join(folder, "appeared.txt"))).toBe(true);
+      expect(registry.byId(child)).toBeDefined();
+      expect(removals(folder)).toHaveLength(0);
+    } finally {
+      backendControl.onStop = null;
+    }
+  });
+
+  const lateBlockers: Array<[string, (folder: string) => Promise<void>, WorktreeErrorCode, string]> = [
+    ["a Git lock", folder => git(folder, ["worktree", "lock", "--reason", "keep", folder]).then(() => undefined), "git-lock", "locked in Git"],
+    ["a repository nested in a tracked directory", async folder => {
+      // `lib/` is tracked before review; it becomes a repository only after
+      // the recheck, without changing the outer status.
+      await git(path.join(folder, "lib"), ["init", "--initial-branch=main"]);
+    }, "nested-dependency", "another Git repository (lib)"],
+  ];
+
+  for (const [label, appear, code, reason] of lateBlockers) {
+    test(`${label} appearing after the recheck refuses an acknowledged delete at the final probe`, async () => {
+      const child = await create(`ack-late/${label.replaceAll(" ", "-")}`, cairnId);
+      const folder = registry.byId(child)!.path;
+      await mkdir(path.join(folder, "lib"), { recursive: true });
+      await writeFile(path.join(folder, "lib", "a.txt"), "a\n");
+      await git(folder, ["add", "lib"]);
+      await git(folder, ["commit", "-m", "lib"]);
+      await writeFile(path.join(folder, "README.md"), "modified\n");
+      const described = await preflight(child, cairnId);
+      if (!described.ok || !described.localData?.tracked) throw new Error("expected disclosed tracked data");
+      const originalAdvance = journal.advance.bind(journal);
+      journal.advance = async (...args) => {
+        const intent = await originalAdvance(...args);
+        if (args[1] === "removing") await appear(folder);
+        return intent;
+      };
+      try {
+        const deleted = await service.delete("reviewer", { sourceWorkspaceId: cairnId, reference: child, localDataFingerprint: described.localData.fingerprint });
+        expect(deleted.ok).toBe(false);
+        if (deleted.ok) return;
+        expect(deleted.phase).toBe("removing");
+        expect(deleted.error.code).toBe(code);
+        expect(deleted.error.message).toStartWith("The worktree changed while deletion was prepared.");
+        expect(deleted.error.message).toContain(reason);
+        expect(await Bun.file(path.join(folder, "README.md")).text()).toBe("modified\n");
+        expect(registry.byId(child)).toBeDefined();
+        expect(removals(folder)).toHaveLength(0);
+        expect(await journal.read()).toBeUndefined();
+      } finally {
+        journal.advance = originalAdvance;
+      }
+    });
+  }
+
+  test("no Git call the service made ever carried two force arguments", () => {
+    expect(gitCalls.length).toBeGreaterThan(0);
+    for (const args of gitCalls) {
+      // Only `worktree remove` may carry a force at all, and at most one.
+      if (args[0] === "worktree" && args[1] === "remove") expect(forceCount(args)).toBeLessThanOrEqual(1);
+      else if (args[0] === "worktree" || args[0] === "branch") expect(forceCount(args)).toBe(0);
+    }
   });
 });
 

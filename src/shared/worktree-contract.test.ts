@@ -8,6 +8,7 @@ import {
   parseWorktreeCheckout,
   parseWorktreeCreateRequest,
   parseWorktreeDeleteRequest,
+  parseWorktreeDeletionPreflight,
   parseWorktreeForgetRequest,
   parseWorktreeError,
   unknownWorktreeInventory,
@@ -379,5 +380,54 @@ describe("removal requests", () => {
     expect(() => parseWorktreeDeleteRequest({ sourceWorkspaceId: "atlas", reference: "x", deleteBranch: true })).toThrow();
     expect(() => parseWorktreeDeleteRequest({ sourceWorkspaceId: "atlas", reference: "", stop: false })).toThrow();
     expect(() => parseWorktreeForgetRequest({ sourceWorkspaceId: "atlas", reference: "x", stop: "yes" })).toThrow();
+  });
+});
+
+describe("local-data acknowledgement", () => {
+  const fingerprint = "a".repeat(64);
+  const preflight = (localData: unknown, ok = true): unknown => ok
+    ? { ok: true, checkout: checkout(), requiresStop: false, localData }
+    : { ok: false, checkout: checkout(), localData, error: { code: "local-data", message: "It has local data. Nothing was removed.", retry: "retry-delete" } };
+
+  test("a delete request accepts only a well-formed fingerprint", () => {
+    expect(parseWorktreeDeleteRequest({ sourceWorkspaceId: "atlas", reference: "x", stop: false, localDataFingerprint: fingerprint }))
+      .toEqual({ sourceWorkspaceId: "atlas", reference: "x", stop: false, localDataFingerprint: fingerprint });
+    for (const malformed of ["", "A".repeat(64), "a".repeat(63), "a".repeat(65), "g".repeat(64), true, 1]) {
+      expect(() => parseWorktreeDeleteRequest({ sourceWorkspaceId: "atlas", reference: "x", localDataFingerprint: malformed })).toThrow();
+    }
+  });
+
+  test("valid shapes with one or all three categories are accepted", () => {
+    const one = { ignored: { count: 1, sample: [".env"] }, fingerprint };
+    expect(parseWorktreeDeletionPreflight(preflight(one))).toEqual({ ok: true, checkout: checkout() as WorktreeCheckout, requiresStop: false, localData: one });
+    const all = {
+      tracked: { count: 7, sample: ["a.md", "b.md", "c.md", "d.md", "e.md"] },
+      untracked: { count: 1, sample: ["notes/scratch.txt"] },
+      ignored: { count: 2, sample: [".env", "node_modules/"] },
+      fingerprint,
+    };
+    expect(parseWorktreeDeletionPreflight(preflight(all))).toEqual({ ok: true, checkout: checkout() as WorktreeCheckout, requiresStop: false, localData: all });
+    // A clean tree carries no description at all.
+    expect(parseWorktreeDeletionPreflight({ ok: true, checkout: checkout(), requiresStop: true })).toEqual({ ok: true, checkout: checkout() as WorktreeCheckout, requiresStop: true });
+  });
+
+  test.each([
+    ["an empty description", { fingerprint }],
+    ["a zero count", { tracked: { count: 0, sample: [] }, fingerprint }],
+    ["a fractional count", { tracked: { count: 1.5, sample: ["a"] }, fingerprint }],
+    ["a malformed fingerprint", { tracked: { count: 1, sample: ["a"] }, fingerprint: "abc" }],
+    ["a missing fingerprint", { tracked: { count: 1, sample: ["a"] } }],
+    ["an absolute sample path", { untracked: { count: 1, sample: ["/home/someone/secret"] }, fingerprint }],
+    ["an empty sample path", { untracked: { count: 1, sample: [""] }, fingerprint }],
+    ["an oversized sample", { tracked: { count: 9, sample: ["a", "b", "c", "d", "e", "f"] }, fingerprint }],
+    ["a sample larger than its count", { tracked: { count: 1, sample: ["a", "b"] }, fingerprint }],
+    ["an unknown category key", { stashed: { count: 1, sample: ["a"] }, fingerprint }],
+    ["an unknown category field", { ignored: { count: 1, sample: ["a"], bytes: 3 }, fingerprint }],
+  ])("%s is refused", (_label, localData) => {
+    expect(() => parseWorktreeDeletionPreflight(preflight(localData))).toThrow();
+  });
+
+  test("a refused preflight cannot carry local data", () => {
+    expect(() => parseWorktreeDeletionPreflight(preflight({ ignored: { count: 1, sample: [".env"] }, fingerprint }, false))).toThrow();
   });
 });
