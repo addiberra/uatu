@@ -3446,6 +3446,60 @@ describe("pending permission recovery", () => {
     expect(rows.map(row => row.usage?.costUsd)).toEqual([expect.closeTo(0.53, 10), 0.02]);
   });
 
+  // OpenCode 2.x names the launcher `subagent` and the agent `agent`, and
+  // delivers a new child's first prompt behind its own preamble — so that
+  // prompt never equals the row's. Pairing must still see it as the task's.
+  test("a 2.x subagent that compacted during its first task bills the compaction to that task, not the next", async () => {
+    const subagentRow = (part: string, created: number, description: string, gave: string, resumed: boolean) => ({
+      id: `launch_${part}`, type: "assistant", time: { created },
+      content: [{ id: part, type: "tool", tool: "subagent", callID: part, state: {
+        status: "completed", input: { agent: "general", description, prompt: gave, ...(resumed ? { sessionID: "child" } : {}) },
+        metadata: { sessionID: "child", status: "completed" }, output: '<subagent sessionID="child" state="completed">\ndone\n</subagent>',
+      } }],
+    });
+    const provider = new FakeProvider();
+    provider.sessions = [fixtureSession("parent"), { ...fixtureSession("child"), parentId: "parent" }];
+    provider.pages.set("first", { items: [
+      subagentRow("prt_t1", 1, "Audit", "Read-only audit, do not edit.", false),
+      subagentRow("prt_t2", 9, "Re-audit", "Re-audit the current files after fixes.", true),
+    ] });
+    const listMessages = provider.readMessages.bind(provider);
+    provider.readMessages = async (sessionId, options) => (sessionId === "child" ? { items: [
+      asked("p1", 2, "You are a subagent spawned by another session.\nRead-only audit, do not edit."), answered("m1", 3, "p1", 270_923, 0.27),
+      compactionRequest("pc", 4), answered("mc", 5, "pc", 38_970, 0.04),
+      continued("ps", 6), answered("ms", 7, "ps", 218_840, 0.22),
+      asked("p2", 10, "Re-audit the current files after fixes."), answered("m2", 11, "p2", 23_000, 0.02),
+    ] as never[] } : listMessages(sessionId, options));
+    const rows = rowsOf((await new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g" }).history("parent")).items);
+    expect(rows.map(row => row.childConversationId)).toEqual(["child", "child"]);
+    expect(rows.map(row => row.usage?.input)).toEqual([528_733, 23_000]);
+    expect(rows.map(row => row.usage?.costUsd)).toEqual([expect.closeTo(0.53, 10), 0.02]);
+  });
+
+  // Only the prompt that creates the child carries the preamble. A message
+  // typed into the child during the first task that happens to end with the
+  // next task's prompt is still the first task's.
+  test("a 2.x child message that ends with a later task's prompt does not open that task early", async () => {
+    const subagentRow = (part: string, created: number, gave: string, resumed: boolean) => ({
+      id: `launch_${part}`, type: "assistant", time: { created },
+      content: [{ id: part, type: "tool", tool: "subagent", callID: part, state: {
+        status: "completed", input: { agent: "general", description: part, prompt: gave, ...(resumed ? { sessionID: "child" } : {}) },
+        metadata: { sessionID: "child", status: "completed" }, output: "done",
+      } }],
+    });
+    const provider = new FakeProvider();
+    provider.sessions = [fixtureSession("parent"), { ...fixtureSession("child"), parentId: "parent" }];
+    provider.pages.set("first", { items: [subagentRow("prt_t1", 1, "Audit the renderer.", false), subagentRow("prt_t2", 9, "Run tests", true)] });
+    const listMessages = provider.readMessages.bind(provider);
+    provider.readMessages = async (sessionId, options) => (sessionId === "child" ? { items: [
+      asked("p1", 2, "You are a subagent spawned by another session.\nAudit the renderer."), answered("m1", 3, "p1", 1_000, 0.1),
+      asked("pu", 4, "Before you finish:\nRun tests"), answered("mu", 5, "pu", 2_000, 0.2),
+      asked("p2", 10, "Run tests"), answered("m2", 11, "p2", 300, 0.03),
+    ] as never[] } : listMessages(sessionId, options));
+    const rows = rowsOf((await new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g" }).history("parent")).items);
+    expect(rows.map(row => row.usage?.input)).toEqual([3_000, 300]);
+  });
+
   test("live, a compaction between two tasks stays with the first as the second task's row and prompt arrive", async () => {
     const provider = new FakeProvider();
     provider.sessions = [fixtureSession("parent"), { ...fixtureSession("child"), parentId: "parent" }];
