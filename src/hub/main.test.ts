@@ -392,20 +392,25 @@ describe("Hub runtime shutdown", () => {
     expect(exits).toEqual([1]);
   });
 
-  test("a rejected shutdown also holds the process with the lease", async () => {
+  test("a rejected shutdown logs and force-exits without holding the process", async () => {
     let holds = 0;
     let retained = 0;
     const exits: number[] = [];
+    const failures: unknown[] = [];
+    const teardownError = new Error("teardown threw");
     const signal = createHubSignalShutdown({
-      shutdown: async () => { throw new Error("teardown threw"); },
+      shutdown: async () => { throw teardownError; },
       forceExit: code => { exits.push(code); },
       reportRetained: () => { retained += 1; },
       holdProcess: () => { holds += 1; },
+      reportFailure: error => { failures.push(error); },
     });
 
     signal();
     await Bun.sleep(0);
-    expect({ holds, retained, exits }).toEqual({ holds: 1, retained: 1, exits: [] });
+    // shutdownHub() never rejects, so a rejection carries no proof the lease
+    // is still held: nothing may claim it is retained or keep the process.
+    expect({ holds, retained, exits, failures }).toEqual({ holds: 0, retained: 0, exits: [1], failures: [teardownError] });
   });
 
   test("a clean shutdown exits without holding the process", async () => {
