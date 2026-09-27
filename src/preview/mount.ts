@@ -37,9 +37,9 @@ import { refreshOutline } from "./outline";
 import { clearUpdateSignal, syncFileFactsStrip } from "./file-facts-strip";
 import { attachMetadataCardToggleListener, renderMetadataCard } from "./metadata-card";
 import { syncViewToggle } from "./view-mode";
-import { getSelectedDestination, getSelectionGeneration, setPreviewMode } from "../shell/selection";
+import { getSelectedDestination, getSelectionActivation, getSelectionGeneration, setPreviewMode } from "../shell/selection";
 import { createDocumentLoadGuard } from "./load-generation";
-import { createDocumentLoadRetry, isTransientDocumentFailure } from "./load-retry";
+import { createDocumentLoadRetry, documentLoadRetryKey, isTransientDocumentFailure } from "./load-retry";
 
 export type RenderedDocumentAuthor = { name: string; email?: string };
 
@@ -369,6 +369,7 @@ async function executeLoadDocument(documentId: string) {
   const requestedView = appState.viewMode;
   const requestedLayout = appState.viewLayout;
   const loadToken = documentLoadGuard.begin(documentId, requestedView, requestedLayout);
+  const activation = getSelectionActivation();
   const isCurrent = () => documentLoadGuard.isCurrent(
     loadToken,
     appState.selectedId,
@@ -466,7 +467,11 @@ async function executeLoadDocument(documentId: string) {
     }
     // The server failed, not the file. Nothing else will ask again, so retry
     // while this is still the load the user is waiting on.
-    const retrying = documentLoadRetry.failed(`${loadToken.selectionGeneration}\u0000${documentId}`, () => {
+    const retrying = documentLoadRetry.failed(documentLoadRetryKey({
+      selectionGeneration: loadToken.selectionGeneration,
+      activation,
+      documentId,
+    }), () => {
       if (isCurrent()) void loadDocument(documentId);
     });
     renderUnavailableDocument(

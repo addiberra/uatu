@@ -17,6 +17,19 @@ export function isTransientDocumentFailure(status: number | null): boolean {
   return status === null || status >= 500;
 }
 
+// The retry schedule's key: one document within one selection *and* one user
+// activation. Folding the activation in means "select it again" — even the
+// row already selected, which leaves the selection generation unchanged —
+// starts a fresh schedule, while a watcher reconcile of the same selection
+// does not.
+export function documentLoadRetryKey(parts: {
+  selectionGeneration: number;
+  activation: number;
+  documentId: string;
+}): string {
+  return `${parts.selectionGeneration}\u0000${parts.activation}\u0000${parts.documentId}`;
+}
+
 export type DocumentLoadRetryTimers = {
   setTimeout(callback: () => void, delay: number): ReturnType<typeof setTimeout>;
   clearTimeout(timer: ReturnType<typeof setTimeout>): void;

@@ -1,6 +1,13 @@
 import { describe, expect, test } from "bun:test";
 
-import { createDocumentLoadRetry, isTransientDocumentFailure, type DocumentLoadRetryTimers } from "./load-retry";
+import { appState } from "../shell/state";
+import { getSelectionActivation, getSelectionGeneration, setSelectedId } from "../shell/selection";
+import {
+  createDocumentLoadRetry,
+  documentLoadRetryKey,
+  isTransientDocumentFailure,
+  type DocumentLoadRetryTimers,
+} from "./load-retry";
 
 function fakeTimers() {
   const pending = new Map<number, { callback: () => void; delay: number }>();
@@ -83,5 +90,48 @@ describe("createDocumentLoadRetry", () => {
 
     retry.failed("a", () => {});
     expect(clock.delays()).toEqual([10]);
+  });
+});
+
+describe("re-arming the schedule", () => {
+  // The key mount.ts builds for the load in flight right now.
+  const currentKey = (documentId: string) => documentLoadRetryKey({
+    selectionGeneration: getSelectionGeneration(),
+    activation: getSelectionActivation(),
+    documentId,
+  });
+
+  test("the user activating the same document again starts a fresh schedule; a watcher reconcile does not", () => {
+    const initialSelectedId = appState.selectedId;
+    const initialSelectionCleared = appState.selectionCleared;
+    try {
+      const documentId = "/watch/docs/retry-rearm.md";
+      const clock = fakeTimers();
+      const retry = createDocumentLoadRetry({ delays: [10, 20], timers: clock.timers });
+
+      setSelectedId(documentId, "navigation");
+      expect(retry.failed(currentKey(documentId), () => {})).toBe(true);
+      clock.fire();
+      expect(retry.failed(currentKey(documentId), () => {})).toBe(true);
+      clock.fire();
+      expect(retry.failed(currentKey(documentId), () => {})).toBe(false);
+
+      // A watcher frame re-confirms the same selection: still exhausted.
+      const generation = getSelectionGeneration();
+      setSelectedId(documentId, "reconcile");
+      expect(getSelectionGeneration()).toBe(generation);
+      expect(retry.failed(currentKey(documentId), () => {})).toBe(false);
+      expect(clock.delays()).toEqual([]);
+
+      // Selecting the same row again leaves the selection generation alone
+      // but is a new user activation, so the schedule starts over.
+      setSelectedId(documentId, "navigation");
+      expect(getSelectionGeneration()).toBe(generation);
+      expect(retry.failed(currentKey(documentId), () => {})).toBe(true);
+      expect(clock.delays()).toEqual([10]);
+    } finally {
+      appState.selectedId = initialSelectedId;
+      appState.selectionCleared = initialSelectionCleared;
+    }
   });
 });
