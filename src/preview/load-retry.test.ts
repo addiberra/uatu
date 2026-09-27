@@ -52,28 +52,28 @@ describe("createDocumentLoadRetry", () => {
     let runs = 0;
     const run = () => { runs += 1; };
 
-    expect(retry.failed("a", run)).toBe(true);
+    expect(retry.failed("a", run, "request")).toBe(true);
     expect(clock.delays()).toEqual([10]);
     clock.fire();
     expect(runs).toBe(1);
 
-    expect(retry.failed("a", run)).toBe(true);
+    expect(retry.failed("a", run, "retry")).toBe(true);
     expect(clock.delays()).toEqual([20]);
     clock.fire();
     expect(runs).toBe(2);
 
-    expect(retry.failed("a", run)).toBe(false);
+    expect(retry.failed("a", run, "retry")).toBe(false);
     expect(clock.delays()).toEqual([]);
   });
 
   test("a different document or selection starts over", () => {
     const clock = fakeTimers();
     const retry = createDocumentLoadRetry({ delays: [10, 20], timers: clock.timers });
-    retry.failed("a", () => {});
-    retry.failed("a", () => {});
+    retry.failed("a", () => {}, "request");
+    retry.failed("a", () => {}, "retry");
     expect(clock.delays()).toEqual([20]);
 
-    expect(retry.failed("b", () => {})).toBe(true);
+    expect(retry.failed("b", () => {}, "retry")).toBe(true);
     // The pending retry for "a" is replaced, not stacked.
     expect(clock.delays()).toEqual([10]);
   });
@@ -82,13 +82,13 @@ describe("createDocumentLoadRetry", () => {
     const clock = fakeTimers();
     const retry = createDocumentLoadRetry({ delays: [10, 20], timers: clock.timers });
     let runs = 0;
-    retry.failed("a", () => { runs += 1; });
+    retry.failed("a", () => { runs += 1; }, "request");
     retry.settle();
     expect(clock.delays()).toEqual([]);
     clock.fire();
     expect(runs).toBe(0);
 
-    retry.failed("a", () => {});
+    retry.failed("a", () => {}, "request");
     expect(clock.delays()).toEqual([10]);
   });
 });
@@ -110,25 +110,67 @@ describe("re-arming the schedule", () => {
       const retry = createDocumentLoadRetry({ delays: [10, 20], timers: clock.timers });
 
       setSelectedId(documentId, "navigation");
-      expect(retry.failed(currentKey(documentId), () => {})).toBe(true);
+      expect(retry.failed(currentKey(documentId), () => {}, "request")).toBe(true);
       clock.fire();
-      expect(retry.failed(currentKey(documentId), () => {})).toBe(true);
+      expect(retry.failed(currentKey(documentId), () => {}, "retry")).toBe(true);
       clock.fire();
-      expect(retry.failed(currentKey(documentId), () => {})).toBe(false);
+      expect(retry.failed(currentKey(documentId), () => {}, "retry")).toBe(false);
 
-      // A watcher frame re-confirms the same selection: still exhausted.
+      // A watcher frame re-confirms the same selection: the key is unchanged,
+      // so the schedule's own retries stay exhausted.
       const generation = getSelectionGeneration();
       setSelectedId(documentId, "reconcile");
       expect(getSelectionGeneration()).toBe(generation);
-      expect(retry.failed(currentKey(documentId), () => {})).toBe(false);
+      expect(retry.failed(currentKey(documentId), () => {}, "retry")).toBe(false);
       expect(clock.delays()).toEqual([]);
 
       // Selecting the same row again leaves the selection generation alone
       // but is a new user activation, so the schedule starts over.
       setSelectedId(documentId, "navigation");
       expect(getSelectionGeneration()).toBe(generation);
-      expect(retry.failed(currentKey(documentId), () => {})).toBe(true);
+      expect(retry.failed(currentKey(documentId), () => {}, "retry")).toBe(true);
       expect(clock.delays()).toEqual([10]);
+    } finally {
+      appState.selectedId = initialSelectedId;
+      appState.selectionCleared = initialSelectionCleared;
+    }
+  });
+
+  test("a live frame's reload that fails starts the schedule over; a failed retry never re-arms it", () => {
+    const initialSelectedId = appState.selectedId;
+    const initialSelectionCleared = appState.selectionCleared;
+    try {
+      const documentId = "/watch/docs/retry-live-frame.md";
+      const clock = fakeTimers();
+      const retry = createDocumentLoadRetry({ delays: [10, 20], timers: clock.timers });
+      let runs = 0;
+      const run = () => { runs += 1; };
+
+      setSelectedId(documentId, "navigation");
+      expect(retry.failed(currentKey(documentId), run, "request")).toBe(true);
+      clock.fire();
+      expect(retry.failed(currentKey(documentId), run, "retry")).toBe(true);
+      clock.fire();
+      expect(retry.failed(currentKey(documentId), run, "retry")).toBe(false);
+      expect(runs).toBe(2);
+
+      // A watcher frame for the same selection reloads it (same key, no new
+      // activation) and that reload fails: the frame is new evidence the file
+      // changed, so a fresh schedule starts at the first delay.
+      setSelectedId(documentId, "reconcile");
+      expect(retry.failed(currentKey(documentId), run, "request")).toBe(true);
+      expect(clock.delays()).toEqual([10]);
+
+      // The schedule's own retries continue it and give up again, without
+      // re-arming themselves.
+      clock.fire();
+      expect(retry.failed(currentKey(documentId), run, "retry")).toBe(true);
+      expect(clock.delays()).toEqual([20]);
+      clock.fire();
+      expect(retry.failed(currentKey(documentId), run, "retry")).toBe(false);
+      expect(retry.failed(currentKey(documentId), run, "retry")).toBe(false);
+      expect(clock.delays()).toEqual([]);
+      expect(runs).toBe(4);
     } finally {
       appState.selectedId = initialSelectedId;
       appState.selectionCleared = initialSelectionCleared;

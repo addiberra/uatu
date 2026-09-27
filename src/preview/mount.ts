@@ -39,7 +39,12 @@ import { attachMetadataCardToggleListener, renderMetadataCard } from "./metadata
 import { syncViewToggle } from "./view-mode";
 import { getSelectedDestination, getSelectionActivation, getSelectionGeneration, setPreviewMode } from "../shell/selection";
 import { createDocumentLoadGuard } from "./load-generation";
-import { createDocumentLoadRetry, documentLoadRetryKey, isTransientDocumentFailure } from "./load-retry";
+import {
+  createDocumentLoadRetry,
+  documentLoadRetryKey,
+  isTransientDocumentFailure,
+  type DocumentLoadTrigger,
+} from "./load-retry";
 
 export type RenderedDocumentAuthor = { name: string; email?: string };
 
@@ -354,18 +359,26 @@ export async function renderSplitPayloads(
   });
 }
 
-export async function loadDocument(documentId: string, onPresented?: () => void) {
+// `trigger` is "retry" only from the retry schedule's own timer. Every other
+// caller (navigation, a view change, a live frame reloading the selection) is
+// a "request", and a request that fails transiently starts the schedule over.
+export async function loadDocument(
+  documentId: string,
+  onPresented?: () => void,
+  trigger: DocumentLoadTrigger = "request",
+) {
   const selectionGeneration = getSelectionGeneration();
   if (deferHiddenPreview(() => {
     const current = appState.selectedId;
+    const same = current === documentId && selectionGeneration === getSelectionGeneration();
     if (current && appState.previewMode.kind === "document") void loadDocument(current,
-      current === documentId && selectionGeneration === getSelectionGeneration() ? onPresented : undefined);
+      same ? onPresented : undefined, same ? trigger : "request");
   })) return;
-  await executeLoadDocument(documentId);
+  await executeLoadDocument(documentId, trigger);
   if (selectionGeneration === getSelectionGeneration() && appState.selectedId === documentId) onPresented?.();
 }
 
-async function executeLoadDocument(documentId: string) {
+async function executeLoadDocument(documentId: string, trigger: DocumentLoadTrigger) {
   const requestedView = appState.viewMode;
   const requestedLayout = appState.viewLayout;
   const loadToken = documentLoadGuard.begin(documentId, requestedView, requestedLayout);
@@ -472,8 +485,8 @@ async function executeLoadDocument(documentId: string) {
       activation,
       documentId,
     }), () => {
-      if (isCurrent()) void loadDocument(documentId);
-    });
+      if (isCurrent()) void loadDocument(documentId, undefined, "retry");
+    }, trigger);
     renderUnavailableDocument(
       documentId,
       retrying

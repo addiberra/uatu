@@ -30,6 +30,15 @@ export function documentLoadRetryKey(parts: {
   return `${parts.selectionGeneration}\u0000${parts.activation}\u0000${parts.documentId}`;
 }
 
+// What started the load that failed. Only the schedule's own timer is a
+// "retry"; every other load is a "request" and counts as new evidence: a user
+// activation, a view change, or a live frame saying the file changed on disk.
+// A request that fails transiently starts the schedule over, even for a key
+// whose attempts are used up, so a watcher reload after the schedule gave up
+// is not one last try. A failed retry only continues the schedule, so the
+// timer can never re-arm itself.
+export type DocumentLoadTrigger = "request" | "retry";
+
 export type DocumentLoadRetryTimers = {
   setTimeout(callback: () => void, delay: number): ReturnType<typeof setTimeout>;
   clearTimeout(timer: ReturnType<typeof setTimeout>): void;
@@ -38,8 +47,9 @@ export type DocumentLoadRetryTimers = {
 export type DocumentLoadRetry = {
   // A transient failure loading `key` (one document within one selection).
   // Schedules `retry` after the next delay and returns true, or returns false
-  // once the attempts for `key` are used up. A different key starts over.
-  failed(key: string, retry: () => void): boolean;
+  // once the attempts for `key` are used up. A different key, or a failed
+  // load the schedule did not start itself (`trigger` "request"), starts over.
+  failed(key: string, retry: () => void, trigger: DocumentLoadTrigger): boolean;
   // The load settled another way (it succeeded, or failed for good): cancel
   // any pending retry and forget the attempt count.
   settle(): void;
@@ -64,9 +74,9 @@ export function createDocumentLoadRetry(options: {
   };
 
   return {
-    failed(key, retry) {
+    failed(key, retry, trigger) {
       cancel();
-      if (key !== currentKey) {
+      if (key !== currentKey || trigger === "request") {
         currentKey = key;
         attempts = 0;
       }
