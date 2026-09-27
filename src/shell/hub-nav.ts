@@ -569,12 +569,18 @@ export function reconcileMenuEntries(container: Element, next: Element[], signat
 }
 
 // What a focusable menu entry stands for, independent of its node: a
-// workspace row by its stable id, a fork control by its name, the dashboard
-// and sign-out links by their target.
+// workspace row by its stable id, a fork control by the stable id of the
+// main checkout it forks, the dashboard and sign-out links by their target.
+// Never a spoken name: display names may repeat across repositories, so two
+// fork controls can both read "Add worktree to docs", and a refresh would
+// hand focus (and the next Enter) to the wrong repository's control. A fork
+// control and its main checkout's row share an id, so they key apart by kind.
 function menuFocusKey(element: Element | null): string | null {
   if (!element) return null;
   const workspaceId = element.getAttribute("data-workspace-id");
   if (workspaceId !== null) return `workspace:${workspaceId}`;
+  const forkFor = element.getAttribute("data-fork-for");
+  if (forkFor !== null) return `fork:${forkFor}`;
   const label = element.getAttribute("aria-label");
   if (label !== null) return `label:${label}`;
   const href = element.getAttribute("href");
@@ -688,6 +694,7 @@ export function initHubNav(): void {
     const forkButton = (workspace: HubWorkspaceSummary): HTMLButtonElement => {
       const fork = document.createElement("button");
       fork.className = "hub-menu-fork";
+      fork.dataset.forkFor = workspace.id;
       // The one shared glyph (F11), never a second spelling of it here.
       fork.innerHTML = worktreeForkIcon;
       fork.setAttribute("aria-label", `Add worktree to ${workspaceMenuLabel(workspace)}`);

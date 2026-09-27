@@ -1989,3 +1989,124 @@ describe("activating the current workspace in the switcher", () => {
     expect(page.navigations).toEqual(["/s/cold/"]);
   });
 });
+
+describe("fork controls of main checkouts that share a display name", () => {
+  const savedGlobals = new Map<string, unknown>();
+  const setGlobal = (key: string, value: unknown) => {
+    if (!savedGlobals.has(key)) savedGlobals.set(key, Reflect.get(globalThis, key));
+    Reflect.set(globalThis, key, value);
+  };
+
+  afterEach(() => {
+    disposeLiveChannel();
+    installLiveChannelForTests(null);
+    for (const [key, value] of savedGlobals) Reflect.set(globalThis, key, value);
+    savedGlobals.clear();
+    resetAppBasePathForTests();
+  });
+
+  // Two registered repositories whose main checkouts are both named "docs":
+  // legal, and their fork controls both read "Add worktree to docs".
+  async function mountTwins() {
+    const html = await Bun.file(`${import.meta.dir}/../index.html`).text();
+    const { document, window } = parseHTML(html);
+    const meta = document.createElement("meta");
+    meta.setAttribute("name", "uatu-base-path");
+    meta.setAttribute("content", "/s/docs-a/");
+    document.head.appendChild(meta);
+    setGlobal("document", document);
+    setGlobal("window", window);
+    setGlobal("Node", (window as unknown as Record<string, unknown>).Node);
+    resetAppBasePathForTests();
+    const workspaces = [
+      { id: "docs-a", displayName: "docs", path: "/src/a/docs", running: true, repositoryId: "repo-a", branch: "main", createWorktree: true },
+      { id: "docs-b", displayName: "docs", path: "/src/b/docs", running: true, repositoryId: "repo-b", branch: "main", createWorktree: true },
+    ];
+    setGlobal("fetch", async (url: string) => {
+      if (url !== "/api/hub/state") return Response.json({ error: "unexpected" }, { status: 404 });
+      return Response.json({ worktreeApi: "/api/hub/worktrees", workspaces });
+    });
+    installLiveChannelForTests({
+      onActivity() { return () => {}; },
+      onStreamOpened() { return () => {}; },
+      subscribe() { return { close() {} }; },
+      dispose() {},
+    } as unknown as LiveChannel);
+
+    initHubNav();
+    const control = document.querySelector<HTMLElement>("#hub-control")!;
+    const toggle = document.querySelector<HTMLButtonElement>("#hub-toggle")!;
+    const menu = document.querySelector<HTMLElement>("#hub-menu")!;
+    for (let attempt = 0; attempt < 200 && control.hidden; attempt += 1) await Bun.sleep(1);
+    expect(control.hidden).toBe(false);
+    const open = () => {
+      toggle.dispatchEvent(new window.Event("click", { bubbles: true }));
+      expect(menu.hidden).toBe(false);
+    };
+    // Reopens the menu so its opening's refresh reads `workspaces` again, and
+    // resolves once the menu shows what `rendered` waits for.
+    const refresh = async (rendered: () => boolean) => {
+      toggle.dispatchEvent(new window.Event("click", { bubbles: true }));
+      expect(menu.hidden).toBe(true);
+      open();
+      for (let attempt = 0; attempt < 100 && !rendered(); attempt += 1) await Bun.sleep(1);
+      expect(rendered()).toBe(true);
+    };
+    const header = (id: string) => menu.querySelector<HTMLElement>(`.hub-menu-group[data-repository="${id}"]`)!;
+    const fork = (id: string) => header(id).querySelector<HTMLButtonElement>(".hub-menu-fork")!;
+    return { document, menu, open, refresh, fork, header, workspaces };
+  }
+
+  test("both controls speak the same name but carry their own checkout's id, apart from its row's", async () => {
+    const page = await mountTwins();
+    page.open();
+    expect(page.fork("docs-a").getAttribute("aria-label")).toBe("Add worktree to docs");
+    expect(page.fork("docs-b").getAttribute("aria-label")).toBe("Add worktree to docs");
+    expect(page.fork("docs-a").dataset.forkFor).toBe("docs-a");
+    expect(page.fork("docs-b").dataset.forkFor).toBe("docs-b");
+    // The control never takes its row's identity: the row is the workspace.
+    expect(page.fork("docs-b").hasAttribute("data-workspace-id")).toBe(false);
+  });
+
+  test("focus on the second repository's fork control stays on that repository's control when a refresh replaces both headers", async () => {
+    const page = await mountTwins();
+    page.open();
+    const first = page.fork("docs-a");
+    const second = page.fork("docs-b");
+    // linkedom tracks no focus: model activeElement, which falls back to the
+    // body once the focused node leaves the document.
+    let focused: Element | null = null;
+    Object.defineProperty(page.document, "activeElement", {
+      configurable: true,
+      get: () => (focused !== null && page.document.contains(focused) ? focused : page.document.body),
+    });
+    const buttonPrototype = Object.getPrototypeOf(second) as { focus: () => void };
+    const originalFocus = buttonPrototype.focus;
+    buttonPrototype.focus = function (this: Element) { focused = this; };
+    try {
+      second.focus();
+      page.workspaces[0] = { ...page.workspaces[0]!, path: "/src/a/docs-moved" };
+      page.workspaces[1] = { ...page.workspaces[1]!, path: "/src/b/docs-moved" };
+      await page.refresh(() => page.fork("docs-a") !== first && page.fork("docs-b") !== second);
+      // Both headers were rebuilt, so focus had to be put back by identity.
+      expect(page.document.activeElement === page.fork("docs-b")).toBe(true);
+      expect(page.document.activeElement === page.fork("docs-a")).toBe(false);
+    } finally {
+      buttonPrototype.focus = originalFocus;
+    }
+  });
+
+  test("a refresh that changes only the first repository's header keeps the second repository's fork control node", async () => {
+    const page = await mountTwins();
+    page.open();
+    const firstHeader = page.header("docs-a");
+    const secondHeader = page.header("docs-b");
+    const second = page.fork("docs-b");
+    page.workspaces[0] = { ...page.workspaces[0]!, path: "/src/a/docs-moved" };
+    await page.refresh(() => page.header("docs-a") !== firstHeader);
+    // Identity, compared as booleans: a linkedom node diff never finishes printing.
+    expect(page.header("docs-b") === secondHeader).toBe(true);
+    expect(page.fork("docs-b") === second).toBe(true);
+    expect(page.fork("docs-a").dataset.forkFor).toBe("docs-a");
+  });
+});
