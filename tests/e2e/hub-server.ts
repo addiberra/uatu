@@ -82,6 +82,7 @@ import { WorktreeOperationCoordinator } from "../../src/hub/worktree-coordinator
 import { WorktreeJournal, WorktreeProvenanceStore } from "../../src/hub/worktree-journal";
 import { createOnboardingWorktreeRegistrar } from "../../src/hub/worktree-registrar";
 import { WorktreeService } from "../../src/hub/worktree-service";
+import { waitForPortsFree } from "./ports";
 
 export const HUB_E2E_USER = { name: "e2e", password: "e2e-hub-password" };
 export const HUB_E2E_READY_PREFIX = "uatu-e2e-hub ";
@@ -120,6 +121,8 @@ const HARNESS_PATH = path.resolve(import.meta.dir, "server.ts");
 // step with the worker fixture's command in fixtures.ts.
 const HARNESS_BUNFIG = path.resolve(import.meta.dir, "bunfig.toml");
 const CHILD_START_TIMEOUT_MS = 30_000;
+const TERM_GRACE_MS = 2_000;
+const KILL_WAIT_MS = 3_000;
 const WORKTREES = process.env.UATU_E2E_HUB_WORKTREES === "1";
 const CREDENTIALS = process.env.UATU_E2E_HUB_CREDENTIALS === "1";
 const PUSH = process.env.UATU_E2E_HUB_PUSH === "1";
@@ -150,6 +153,9 @@ class HarnessBackend implements SessionBackend {
       }
       port = this.nextPort++;
       this.ports.set(workspace.id, port);
+    } else {
+      // A restart reuses the port; make sure the predecessor let go of it.
+      await waitForPortsFree([port]);
     }
     const child = spawn("bun", [`--config=${HARNESS_BUNFIG}`, "run", HARNESS_PATH], {
       cwd: path.resolve(import.meta.dir, "..", ".."),
@@ -208,19 +214,30 @@ class HarnessBackend implements SessionBackend {
   }
 }
 
+// Resolves once the child has exited, not merely once it was signalled: a
+// workspace's replacement reuses its predecessor's port, so returning while
+// a SIGKILLed child is still dying would hand the restart EADDRINUSE. The
+// wait after SIGKILL is bounded (a kernel-stuck process must not wedge the
+// reset); `start` then also waits for the port itself to be free.
 async function terminate(child: ChildProcess): Promise<void> {
   if (child.exitCode !== null || child.signalCode !== null) return;
+  const exited = new Promise<void>(resolve => child.once("exit", () => resolve()));
   child.kill("SIGTERM");
-  await new Promise<void>(resolve => {
-    const timeout = setTimeout(() => {
-      child.kill("SIGKILL");
-      resolve();
-    }, 2_000);
-    child.on("exit", () => {
-      clearTimeout(timeout);
-      resolve();
-    });
+  if (await settlesWithin(exited, TERM_GRACE_MS)) return;
+  child.kill("SIGKILL");
+  await settlesWithin(exited, KILL_WAIT_MS);
+}
+
+async function settlesWithin(promise: Promise<void>, ms: number): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timedOut = new Promise<false>(resolve => {
+    timer = setTimeout(() => resolve(false), ms);
   });
+  try {
+    return await Promise.race([promise.then(() => true as const), timedOut]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 const config: HubConfig = {
