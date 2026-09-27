@@ -81,6 +81,25 @@ let scrollRootElement: HTMLElement | null = null;
 let scrollEventTarget: EventTarget | null = null;
 let scrollListener: (() => void) | null = null;
 let scrollRafId: number | null = null;
+// The scroll root's computed `scroll-padding-top`, read once rather than on
+// every scroll frame: it only moves when the scroll root is re-resolved
+// (every remount, including a split/single layout switch, re-attaches), the
+// ≤900px breakpoint is crossed or the device safe area changes (both arrive
+// as a resize), the UI mode flips, or the desktop host re-announces its
+// `--titlebar-inset` on <html>. Each of those clears it (see
+// invalidateScrollPaddingTop's callers); null means "read on next use".
+let cachedScrollPaddingTop: number | null = null;
+
+function invalidateScrollPaddingTop(): void {
+  cachedScrollPaddingTop = null;
+}
+
+function scrollPaddingTopOf(scrollRoot: HTMLElement): number {
+  if (cachedScrollPaddingTop === null) {
+    cachedScrollPaddingTop = Number.parseFloat(getComputedStyle(scrollRoot).scrollPaddingTop);
+  }
+  return cachedScrollPaddingTop;
+}
 
 function mainStackElement(): HTMLElement {
   const el = document.querySelector<HTMLElement>(".main-stack");
@@ -557,6 +576,7 @@ function detachScrollSpy(): void {
 // position-based scan plus an explicit at-bottom rule fixes that tail.
 function attachScrollSpy(scrollRoot: HTMLElement, eventTarget: EventTarget): void {
   detachScrollSpy();
+  invalidateScrollPaddingTop();
   scrollRootElement = scrollRoot;
   scrollEventTarget = eventTarget;
   scrollListener = () => {
@@ -606,7 +626,7 @@ function updateActiveHeading(): void {
   const overlap = header
     ? Math.max(0, header.getBoundingClientRect().bottom - rootRect.top)
     : 0;
-  const triggerOffset = spyTriggerOffset(overlap, Number.parseFloat(getComputedStyle(scrollRoot).scrollPaddingTop));
+  const triggerOffset = spyTriggerOffset(overlap, scrollPaddingTopOf(scrollRoot));
   const scrollTop = scrollRoot.scrollTop;
   const maxScroll = Math.max(0, scrollRoot.scrollHeight - scrollRoot.clientHeight);
 
@@ -772,6 +792,7 @@ export function initOutline(): void {
   // rail/sheet threshold with the panel open. Re-laying out is what adopts the
   // new presentation; the panel deliberately stays open across the swap.
   const onViewportChange = (): void => {
+    invalidateScrollPaddingTop();
     resyncScrollSpy();
     if (open) {
       layoutPanel();
@@ -779,6 +800,14 @@ export function initOutline(): void {
   };
   onUiModeChange(onViewportChange);
   window.addEventListener("resize", onViewportChange, { passive: true });
+  // The macOS desktop host announces its titlebar inset (which feeds the
+  // shell's scroll-padding) as a class and a custom property on <html>, with
+  // no resize when only its native tab bar appears. data-ui-mode is already
+  // covered by onUiModeChange.
+  new MutationObserver(invalidateScrollPaddingTop).observe(document.documentElement, {
+    attributes: true,
+    attributeFilter: ["class", "style"],
+  });
 
   outlineToggleButton.addEventListener("click", () => {
     ensurePanel();
