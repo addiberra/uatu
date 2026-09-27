@@ -72,13 +72,45 @@ function readText(file: string): string | null {
 
 const OBJECT_ID = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/;
 
+// GIT_CEILING_DIRECTORIES as Git reads it: a path.delimiter-separated list
+// of absolute directories (relative entries are ignored), each resolved
+// through symlinks unless an empty entry precedes it (an unresolvable one is
+// dropped). Discovery never ascends into a ceiling; the starting directory is
+// searched even when it is one.
+function ceilingDirectories(list: string | undefined, path: NodePath): Set<string> {
+  const ceilings = new Set<string>();
+  if (!list) return ceilings;
+  const fs = builtin<NodeFs>("node:fs");
+  let resolveSymlinks = true;
+  for (const entry of list.split(path.delimiter)) {
+    if (entry === "") {
+      resolveSymlinks = false;
+      continue;
+    }
+    if (!path.isAbsolute(entry)) continue;
+    let ceiling = path.resolve(entry);
+    if (resolveSymlinks) {
+      try {
+        ceiling = fs?.realpathSync(ceiling) ?? ceiling;
+      } catch {
+        continue; // Git drops an entry it cannot resolve.
+      }
+    }
+    ceilings.add(ceiling);
+  }
+  return ceilings;
+}
+
 // Resolves what `git rev-parse --abbrev-ref HEAD` and `git rev-parse HEAD`
 // print, from the repository files alone: HEAD, loose refs, packed-refs, and
 // a linked worktree's or submodule's `.git` file. Returns null for anything
 // it does not model (an environment-directed repository, an unborn branch, a
-// symbolic ref outside refs/heads, a reftable store), and the caller asks
-// Git. Every module importing this one evaluates BUILD at load, so on the
-// common path this spares two synchronous Git processes per process start —
+// symbolic ref outside refs/heads, a reftable store, a walk stopped at a
+// GIT_CEILING_DIRECTORIES entry), and the caller asks Git, which applies the
+// same rules. GIT_DISCOVERY_ACROSS_FILESYSTEM is not modelled: the walk
+// crosses mount points where Git would stop without that variable. Every
+// module importing this one evaluates BUILD at load, so on the common path
+// this spares two synchronous Git processes per process start —
 // which also keeps test workers out of Bun.spawnSync, where Bun 1.4 can lose
 // a child's exit and spin forever (oven-sh/bun#34069).
 export function readGitHeadFromFiles(
@@ -88,6 +120,7 @@ export function readGitHeadFromFiles(
   if (env.GIT_DIR || env.GIT_COMMON_DIR || env.GIT_WORK_TREE) return null;
   const path = builtin<NodePath>("node:path");
   if (!path) return null;
+  const ceilings = ceilingDirectories(env.GIT_CEILING_DIRECTORIES, path);
   let gitDir: string | null = null;
   for (let directory = path.resolve(start); ; directory = path.dirname(directory)) {
     const dotGit = path.join(directory, ".git");
@@ -102,7 +135,8 @@ export function readGitHeadFromFiles(
       gitDir = dotGit;
       break;
     }
-    if (path.dirname(directory) === directory) return null;
+    const parent = path.dirname(directory);
+    if (parent === directory || ceilings.has(parent)) return null;
   }
   const commonPointer = readText(path.join(gitDir, "commondir"));
   const commonDir = commonPointer === null ? gitDir : path.resolve(gitDir, commonPointer.trim());

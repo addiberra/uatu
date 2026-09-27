@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, symlink } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
@@ -69,17 +69,25 @@ describe("readGitHeadFromFiles", () => {
   });
   // Asynchronous on purpose: Bun.spawnSync can lose a child's exit
   // (oven-sh/bun#34069), which is what the function under test avoids.
-  const git = async (cwd: string, home: string, ...args: string[]): Promise<string> => {
+  const spawnGit = async (
+    cwd: string,
+    env: Record<string, string>,
+    args: string[],
+  ): Promise<{ out: string; err: string; code: number }> => {
     const child = Bun.spawn(["git", "-c", "commit.gpgsign=false", "-c", "init.defaultBranch=main", ...args], {
-      cwd, env: gitEnv(home), stdout: "pipe", stderr: "pipe",
+      cwd, env, stdout: "pipe", stderr: "pipe",
     });
     const [out, err, code] = await Promise.all([
       new Response(child.stdout).text(),
       new Response(child.stderr).text(),
       child.exited,
     ]);
+    return { out: out.trim(), err, code };
+  };
+  const git = async (cwd: string, home: string, ...args: string[]): Promise<string> => {
+    const { out, err, code } = await spawnGit(cwd, gitEnv(home), args);
     if (code !== 0) throw new Error(`git ${args.join(" ")} failed: ${err}`);
-    return out.trim();
+    return out;
   };
   const temporary = async (): Promise<string> => {
     const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "uatu-version-")));
@@ -136,5 +144,54 @@ describe("readGitHeadFromFiles", () => {
     const { repo } = await repository();
     expect(readGitHeadFromFiles(repo, { GIT_DIR: path.join(repo, ".git") })).toBeNull();
     expect(readGitHeadFromFiles(await temporary(), {})).toBeNull();
+  });
+
+  test("stops at GIT_CEILING_DIRECTORIES where git rev-parse does", async () => {
+    const { root, home, repo } = await repository();
+    const nested = path.join(repo, "a", "b");
+    await mkdir(nested, { recursive: true });
+    const found = await revParse(repo, home);
+    const gitRefuses = async (cwd: string, ceilings: string): Promise<boolean> =>
+      (await spawnGit(cwd, { ...gitEnv(home), GIT_CEILING_DIRECTORIES: ceilings }, ["rev-parse", "HEAD"]))
+        .code !== 0;
+
+    // A ceiling above the repository leaves discovery alone.
+    expect(await gitRefuses(nested, root)).toBe(false);
+    expect(readGitHeadFromFiles(nested, { GIT_CEILING_DIRECTORIES: root })).toEqual(found);
+
+    // A ceiling at the repository root: the walk does not ascend into it...
+    expect(await gitRefuses(nested, repo)).toBe(true);
+    expect(readGitHeadFromFiles(nested, { GIT_CEILING_DIRECTORIES: repo })).toBeNull();
+    // ...nor past a nearer ceiling in a list (unresolvable and relative entries are dropped)...
+    const list = ["/nonexistent-uatu-ceiling", path.join(repo, "a"), "relative/ignored"].join(path.delimiter);
+    expect(await gitRefuses(nested, list)).toBe(true);
+    expect(readGitHeadFromFiles(nested, { GIT_CEILING_DIRECTORIES: list })).toBeNull();
+    // ...but the starting directory is searched even when it is a ceiling.
+    expect(await gitRefuses(repo, repo)).toBe(false);
+    expect(readGitHeadFromFiles(repo, { GIT_CEILING_DIRECTORIES: repo })).toEqual(found);
+
+    // Entries after an empty one are taken as written, not symlink-resolved.
+    const alias = path.join(root, "alias");
+    await symlink(repo, alias);
+    expect(await gitRefuses(nested, alias)).toBe(true);
+    expect(readGitHeadFromFiles(nested, { GIT_CEILING_DIRECTORIES: alias })).toBeNull();
+    const unresolved = `${path.delimiter}${alias}`;
+    expect(await gitRefuses(nested, unresolved)).toBe(false);
+    expect(readGitHeadFromFiles(nested, { GIT_CEILING_DIRECTORIES: unresolved })).toEqual(found);
+  });
+
+  test("reads the ceiling from the env parameter, not process.env", async () => {
+    const { home, repo } = await repository();
+    const nested = path.join(repo, "a");
+    await mkdir(nested);
+    const saved = process.env.GIT_CEILING_DIRECTORIES;
+    process.env.GIT_CEILING_DIRECTORIES = repo;
+    try {
+      expect(readGitHeadFromFiles(nested, {})).toEqual(await revParse(repo, home));
+      expect(readGitHeadFromFiles(nested, { GIT_CEILING_DIRECTORIES: repo })).toBeNull();
+    } finally {
+      if (saved === undefined) delete process.env.GIT_CEILING_DIRECTORIES;
+      else process.env.GIT_CEILING_DIRECTORIES = saved;
+    }
   });
 });
