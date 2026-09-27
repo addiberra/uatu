@@ -1,9 +1,17 @@
-// node:fs and node:path resolve to empty stubs in the browser bundle; the
-// reads below then fail into the same fallback a missing Git always had.
-import { readFileSync } from "node:fs";
-import path from "node:path";
-
 import { version as packageJsonVersion } from "../../package.json";
+
+// This module is also in the browser bundle, so it must not import Node
+// built-ins statically: `bun build --compile` keeps `import "node:fs"` as a
+// real import in the page's script, the browser cannot fetch `node:fs`, and
+// the whole script fails to load (the page never leaves "Connecting"). The
+// e2e server's bundler stubs such imports instead, which hides it there. The
+// modules are looked up at run time, and only where the runtime has them.
+type NodeFs = typeof import("node:fs");
+type NodePath = typeof import("node:path");
+function builtin<T>(name: string): T | undefined {
+  const proc = (globalThis as { process?: { getBuiltinModule?: (id: string) => unknown } }).process;
+  return proc?.getBuiltinModule?.(name) as T | undefined;
+}
 
 export type BuildInfo = {
   version: string;
@@ -56,7 +64,7 @@ function runGit(args: string[]): string | null {
 
 function readText(file: string): string | null {
   try {
-    return readFileSync(file, "utf8");
+    return builtin<NodeFs>("node:fs")?.readFileSync(file, "utf8") ?? null;
   } catch {
     return null;
   }
@@ -78,6 +86,8 @@ export function readGitHeadFromFiles(
   env: Record<string, string | undefined> = process.env,
 ): { branch: string; commitSha: string } | null {
   if (env.GIT_DIR || env.GIT_COMMON_DIR || env.GIT_WORK_TREE) return null;
+  const path = builtin<NodePath>("node:path");
+  if (!path) return null;
   let gitDir: string | null = null;
   for (let directory = path.resolve(start); ; directory = path.dirname(directory)) {
     const dotGit = path.join(directory, ".git");
