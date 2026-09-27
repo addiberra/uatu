@@ -201,7 +201,16 @@ describe("ManagedSshAgent", () => {
     expect((await lstat(first.socketPath)).isSocket()).toBe(true);
     expect((await lstat(first.controlSocketPath)).isSocket()).toBe(true);
 
+    // The failed recovery must not have told the guardian to stop: with the
+    // true record restored, the owner's authenticated status round trip still
+    // succeeds and its shutdown retires everything.
     await writeFile(ownershipPath, `${JSON.stringify(original)}\n`, { mode: 0o600 });
+    expect(await first.start()).toBe(first.socketPath);
+    expect(await ownership(runtime)).toEqual(original);
+    await first.shutdown();
+    guardianPids.delete(original.supervisorPid);
+    expect(await pathExists(first.socketPath)).toBe(false);
+    expect(await pathExists(first.controlSocketPath)).toBe(false);
   });
 
   test("a replaced control socket fails closed without touching the agent socket", async () => {

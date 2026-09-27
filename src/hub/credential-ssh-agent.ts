@@ -288,6 +288,14 @@ export class ManagedSshAgent {
     await this.assertNoGuardianQuarantines();
     await assertSocket(this.socketPath, record.agentSocket);
     await assertSocket(this.controlSocketPath, record.controlSocket);
+    // The guardian answers any well-formed request from its private socket,
+    // and a `stop` takes effect before we can check its reply. A record read
+    // from disk is not yet proven to belong to this guardian, so prove it
+    // with a harmless `status` round trip (whose reply is keyed by the
+    // nonce) before sending the irreversible `stop`.
+    await this.request(record, "status");
+    await assertSocket(this.socketPath, record.agentSocket);
+    await assertSocket(this.controlSocketPath, record.controlSocket);
     await this.request(record, "stop");
     await this.waitForAllArtifactsToDisappear(record);
     await this.assertNoGuardianQuarantines();
