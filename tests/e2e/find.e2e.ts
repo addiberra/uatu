@@ -4,6 +4,7 @@ import { promises as fs } from "node:fs";
 import { workspacePath } from "./config";
 import { revealTreeRow, treeRow } from "./tree-helpers";
 import { standardBeforeEach } from "./fixtures";
+import { attachPageDiagnosticsOnFailure, recordContextDiagnostics } from "./page-diagnostics";
 
 // Real-browser coverage for ⌘F. The matching, offset mapping, and counter
 // wording are unit-tested in `src/find/`; what needs a real engine is the
@@ -66,7 +67,15 @@ async function currentMatchText(page: import("@playwright/test").Page) {
   });
 }
 
+// Every test opens its document with a tree click straight after boot. Once
+// in several hundred runs under heavy load that click did not navigate; a
+// failing test attaches the page's console and request log, which shows
+// whether the click reached the app (a document request and a personal-state
+// save) or never did.
+attachPageDiagnosticsOnFailure(test);
+
 test.beforeEach(async ({ page, request }) => {
+  await recordContextDiagnostics(page.context(), "page");
   await standardBeforeEach(page, request);
   await request.post("/__e2e/reset", { data: { extras: FIXTURES } });
   await page.goto("/");
