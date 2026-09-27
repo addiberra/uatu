@@ -281,22 +281,21 @@ describe.skipIf(!backendOk)("terminal-server PTY round-trip", () => {
     const id = await createSession(ctx.terminal);
     const ws = await openSocket(ctx.port, id);
 
-    const closed = new Promise<void>((resolve, reject) => {
-      const timeout = setTimeout(() => reject(new Error("ws never closed after disposeAll")), 3000);
+    // The close is several real hops (SIGHUP, shell exit, reap, close
+    // handshake), so this waits for the event itself; the test's budget is
+    // the only bound. A three-second inner deadline here was overrun under
+    // `bun test --parallel` with nothing wrong.
+    const closed = new Promise<void>(resolve => {
       if (ws.readyState === WebSocket.CLOSED) {
-        clearTimeout(timeout);
         resolve();
         return;
       }
-      ws.addEventListener("close", () => {
-        clearTimeout(timeout);
-        resolve();
-      });
+      ws.addEventListener("close", () => resolve());
     });
     ctx.terminal.disposeAll();
     await closed;
     expect(ws.readyState).toBe(WebSocket.CLOSED);
-  }, 6000);
+  }, 15_000);
 });
 
 // Separate suite: spins up its own terminal-server with an explicit `/bin/sh`
