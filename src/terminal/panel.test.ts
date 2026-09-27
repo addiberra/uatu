@@ -55,6 +55,7 @@ let savedFetch: typeof fetch;
 let savedFocus: PropertyDescriptor | undefined;
 let focusPrototype: { focus?: () => void } | null = null;
 let disposePanel: (() => void) | undefined;
+let disposeTabBar: (() => void) | undefined;
 let savedMode: UiMode | null = null;
 const savedTab = appState.activeTab;
 const savedSurface = appState.activeSurface;
@@ -132,7 +133,10 @@ beforeAll(async () => {
 
 afterAll(async () => {
   // The panel and tab bar subscribe to shared module state; leave it as found.
+  // The tab bar also keeps its element at module level, which
+  // `tabBarBottomInset()` measures for every later suite in this process.
   disposePanel?.();
+  disposeTabBar?.();
   if (savedMode) {
     const { setUiMode } = await import("../shell/ui-mode");
     setUiMode(savedMode);
@@ -171,7 +175,7 @@ describe("touch tab bar keyboard focus with the terminal panel", () => {
     // UI mode; this case is about touch mode either way.
     savedMode = uiMode();
     setUiMode("touch");
-    initTabBar();
+    disposeTabBar = initTabBar();
     setActiveTab("chat");
     disposePanel = setupTerminalPanel(true, undefined, { mountPane: fakeMount as never });
     expect(disposePanel).toBeFunction();

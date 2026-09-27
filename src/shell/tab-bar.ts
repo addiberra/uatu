@@ -130,19 +130,24 @@ export function setTerminalTabBadge(on: boolean): void {
   terminalButton?.toggleAttribute("data-badge", on);
 }
 
-export function initTabBar(): void {
+/** Wires the touch tab bar. Returns a teardown that removes every listener
+ *  and forgets the bar, so a test that mounts one document does not leave
+ *  `tabBarBottomInset()` measuring a stale element for the rest of the
+ *  process. The app never calls it. */
+export function initTabBar(): () => void {
   barElement = document.getElementById("touch-tab-bar");
-  if (!barElement) return;
+  if (!barElement) return () => {};
   tabButtons = Array.from(barElement.querySelectorAll<HTMLButtonElement>("[data-tab]"));
+  const cleanups: (() => void)[] = [];
 
   for (const button of tabButtons) {
-    button.addEventListener("click", () => {
+    const onClick = () => {
       const tab = button.dataset.tab;
       if (tab === "files" || tab === "preview" || tab === "chat" || tab === "terminal") {
         setActiveTab(tab);
       }
-    });
-    button.addEventListener("keydown", event => {
+    };
+    const onKeydown = (event: KeyboardEvent) => {
       const enabled = tabButtons.filter(candidate => !candidate.disabled);
       const index = enabled.indexOf(button);
       let target: HTMLButtonElement | undefined;
@@ -159,6 +164,12 @@ export function initTabBar(): void {
       if (tab === "files" || tab === "preview" || tab === "chat" || tab === "terminal") {
         setActiveTab(tab, { holdFocus: true });
       }
+    };
+    button.addEventListener("click", onClick);
+    button.addEventListener("keydown", onKeydown);
+    cleanups.push(() => {
+      button.removeEventListener("click", onClick);
+      button.removeEventListener("keydown", onKeydown);
     });
   }
 
@@ -171,10 +182,12 @@ export function initTabBar(): void {
     document.getElementById("ui-mode-toggle"),
     document.getElementById("rail-ui-mode-toggle"),
   ];
+  const onToggleClick = () => {
+    setUiMode(uiMode() === "touch" ? "desktop" : "touch");
+  };
   for (const toggle of modeToggles) {
-    toggle?.addEventListener("click", () => {
-      setUiMode(uiMode() === "touch" ? "desktop" : "touch");
-    });
+    toggle?.addEventListener("click", onToggleClick);
+    cleanups.push(() => toggle?.removeEventListener("click", onToggleClick));
   }
   const syncModeToggleLabels = () => {
     const label = uiMode() === "touch" ? "Switch to desktop layout" : "Switch to touch layout";
@@ -183,19 +196,25 @@ export function initTabBar(): void {
       toggle?.setAttribute("title", label);
     }
   };
-  onUiModeChange(syncModeToggleLabels);
+  cleanups.push(onUiModeChange(syncModeToggleLabels));
   // Mode-switch normalization, desktop→touch half: touch presents one
   // surface at a time, so entering it lands on Chat only when the user was
   // last working in an open Chat panel; otherwise Preview. The touch→desktop
   // half (Chat tab opens the panel) lives in chat/surface.ts.
-  onUiModeChange(mode => {
+  cleanups.push(onUiModeChange(mode => {
     if (mode === "touch") {
       setActiveTab(appState.activeSurface === "chat" && isChatPanelOpen() ? "chat" : "preview");
     }
-  });
+  }));
   syncModeToggleLabels();
 
   // appState.activeTab was restored from storage at state-module init;
   // stamp it so the first paint lands on the persisted surface.
   applyActiveTabToDom();
+
+  return () => {
+    for (const cleanup of cleanups.splice(0).reverse()) cleanup();
+    barElement = null;
+    tabButtons = [];
+  };
 }
