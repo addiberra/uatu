@@ -19,6 +19,14 @@ describe("TreeView selection lifecycle with the real library", () => {
   let selections: string[];
   let deselections: number;
   let restoreGlobals: () => void;
+  // Animation-frame callbacks queue here and are flushed in afterEach before
+  // the globals go. Preact's effect flush schedules itself through
+  // requestAnimationFrame plus a 35 ms fallback timer, and it decides once,
+  // when preact/hooks first loads in the process, whether it may call
+  // cancelAnimationFrame. A stub that never fires leaves that timer to run
+  // after this file has removed cancelAnimationFrame, which throws as an
+  // unhandled error in whichever file runs next (seen on CI's serial order).
+  let frames: FrameRequestCallback[] = [];
   const leaf = "guides/deep/active.md";
   const other = "other/deep/next.md";
   const paths = [leaf, "guides/direct.md", "guides/deep/sibling.md", other, "kept/open.md"];
@@ -109,9 +117,10 @@ describe("TreeView selection lifecycle with the real library", () => {
       ShadowRoot: window.ShadowRoot,
       MutationObserver: window.MutationObserver,
       matchMedia: () => ({ matches: false }),
-      requestAnimationFrame: () => 0,
-      cancelAnimationFrame: () => {},
+      requestAnimationFrame: (callback: FrameRequestCallback) => frames.push(callback),
+      cancelAnimationFrame: (id: number) => { frames[id - 1] = () => {}; },
     };
+    frames = [];
     const previous = Object.entries(globals).map(([key]) => [key, Object.getOwnPropertyDescriptor(globalThis, key)] as const);
     // linkedom has no layout/scroll implementation. Supply browser defaults,
     // not a fake tree: all model mutations and callbacks remain Pierre's.
@@ -148,6 +157,9 @@ describe("TreeView selection lifecycle with the real library", () => {
       view.dispose();
       expect(selections).toEqual([]);
     } finally {
+      // Run what the render and the dispose scheduled while the stubs are
+      // still in place; preact's flush cancels its fallback timer here.
+      for (const frame of frames.splice(0)) frame(performance.now());
       restoreGlobals();
     }
   });

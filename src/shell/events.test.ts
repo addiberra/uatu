@@ -20,10 +20,18 @@ import type { RootGroup, StatePayload } from "../shared/types";
 const GLOBALS = ["document", "window", "Node", "Element", "HTMLElement", "HTMLTemplateElement", "customElements"] as const;
 // What the shell reads off `window`. linkedom's window forwards unknown
 // properties to `globalThis`, so these land there too, and are put back.
+// Frame callbacks queue here and are flushed in afterAll before the globals
+// go. Importing events.ts loads the sidebar tree and so preact/hooks, which
+// decides at that moment, from `typeof requestAnimationFrame`, that it may
+// call cancelAnimationFrame in its effect flush for the rest of the process;
+// a flush left pending by a stub that never fires would then throw after
+// this suite removed cancelAnimationFrame, in whichever file runs next.
+const frames: FrameRequestCallback[] = [];
 const WINDOW_STUBS = {
-  // Layout passes the sidebar schedules are irrelevant here and never run.
-  requestAnimationFrame: () => 0,
-  cancelAnimationFrame: () => {},
+  // Layout passes the sidebar schedules are irrelevant here; they run at
+  // teardown only so nothing stays pending.
+  requestAnimationFrame: (callback: FrameRequestCallback) => frames.push(callback),
+  cancelAnimationFrame: (id: number) => { frames[id - 1] = () => {}; },
   matchMedia: () => ({ matches: false, addEventListener() {}, removeEventListener() {} }),
 };
 const savedGlobals = new Map<string, PropertyDescriptor | undefined>();
@@ -58,6 +66,7 @@ beforeAll(async () => {
 afterAll(async () => {
   const { installLiveChannelForTests } = await import("./live");
   installLiveChannelForTests(null);
+  for (const frame of frames.splice(0)) frame(performance.now());
   for (const [name, descriptor] of savedGlobals) {
     if (descriptor) Object.defineProperty(globalThis, name, descriptor);
     else Reflect.deleteProperty(globalThis, name);
