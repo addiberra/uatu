@@ -372,10 +372,12 @@ describe("Hub runtime shutdown", () => {
     });
     const exits: number[] = [];
     let retained = 0;
+    let holds = 0;
     const signal = createHubSignalShutdown({
       shutdown: () => shutdownResult,
       forceExit: code => { exits.push(code); },
       reportRetained: () => { retained += 1; },
+      holdProcess: () => { holds += 1; },
     });
 
     signal();
@@ -383,8 +385,41 @@ describe("Hub runtime shutdown", () => {
     await Bun.sleep(0);
     expect(exits).toEqual([]);
     expect(retained).toBe(1);
+    // The server is already stopped: without a hold the process would drain
+    // and exit, dropping the lease it reported as retained.
+    expect(holds).toBe(1);
     signal();
     expect(exits).toEqual([1]);
+  });
+
+  test("a rejected shutdown also holds the process with the lease", async () => {
+    let holds = 0;
+    let retained = 0;
+    const exits: number[] = [];
+    const signal = createHubSignalShutdown({
+      shutdown: async () => { throw new Error("teardown threw"); },
+      forceExit: code => { exits.push(code); },
+      reportRetained: () => { retained += 1; },
+      holdProcess: () => { holds += 1; },
+    });
+
+    signal();
+    await Bun.sleep(0);
+    expect({ holds, retained, exits }).toEqual({ holds: 1, retained: 1, exits: [] });
+  });
+
+  test("a clean shutdown exits without holding the process", async () => {
+    let holds = 0;
+    const exits: number[] = [];
+    const signal = createHubSignalShutdown({
+      shutdown: async () => ({ exitCode: 0, stateLeaseHeld: false }),
+      forceExit: code => { exits.push(code); },
+      holdProcess: () => { holds += 1; },
+    });
+
+    signal();
+    await Bun.sleep(0);
+    expect({ holds, exits }).toEqual({ holds: 0, exits: [0] });
   });
 
   test("a contender stays blocked after failed shutdown until forced owner exit", async () => {
@@ -403,12 +438,19 @@ describe("Hub runtime shutdown", () => {
       while (!output.includes(text) && Date.now() < deadline) await Bun.sleep(10);
       if (!output.includes(text)) throw new Error(`fixture did not print ${text}: ${output}`);
     };
-    const waitForExit = () => new Promise<number | null>(resolve => child.once("exit", code => resolve(code)));
+    // Subscribed at spawn: an exit before the test asks for it (the fixture
+    // draining on its own) must surface as a wrong code, not a hang.
+    const exited = new Promise<number | null>(resolve => child.once("exit", code => resolve(code)));
+    const waitForExit = () => exited;
 
     try {
       await waitForOutput("locked\n");
       child.kill("SIGTERM");
       await waitForOutput("retained\n");
+      // However long this test takes to reach the next steps under load, the
+      // owner must still be alive and holding the lease: the product holds
+      // the process open after a retained shutdown, it does not merely
+      // happen to be still tearing down.
       await expect(acquireHubStateLease(stateRoot)).rejects.toThrow(/already in use/);
 
       child.kill("SIGTERM");
@@ -418,7 +460,7 @@ describe("Hub runtime shutdown", () => {
     } finally {
       if (child.exitCode === null && child.signalCode === null) {
         child.kill("SIGKILL");
-        await new Promise(resolve => child.once("exit", resolve));
+        await exited;
       }
       await rm(directory, { recursive: true, force: true });
     }

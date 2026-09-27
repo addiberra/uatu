@@ -158,9 +158,20 @@ export function createHubSignalShutdown(options: {
   shutdown(): Promise<HubShutdownResult>;
   forceExit?: (code: number) => void;
   reportRetained?: () => void;
+  // Keeps the process alive while it holds a retained lease. Shutdown has
+  // already stopped the server, so nothing else is guaranteed to hold the
+  // event loop open: without this the process would drain, exit 0, and let
+  // the OS drop the lease the contract says stays held until the next signal.
+  holdProcess?: () => void;
 }): () => void {
   const forceExit = options.forceExit ?? (code => process.exit(code));
+  const holdProcess = options.holdProcess ?? (() => { setInterval(() => {}, 2 ** 31 - 1); });
   let state: "running" | "shutting-down" | "lease-retained" = "running";
+  const retain = () => {
+    state = "lease-retained";
+    holdProcess();
+    options.reportRetained?.();
+  };
   return () => {
     if (state !== "running") {
       forceExit(1);
@@ -169,15 +180,11 @@ export function createHubSignalShutdown(options: {
     state = "shutting-down";
     void Promise.resolve().then(() => options.shutdown()).then(result => {
       if (result.stateLeaseHeld) {
-        state = "lease-retained";
-        options.reportRetained?.();
+        retain();
         return;
       }
       forceExit(result.exitCode);
-    }, () => {
-      state = "lease-retained";
-      options.reportRetained?.();
-    });
+    }, retain);
   };
 }
 
