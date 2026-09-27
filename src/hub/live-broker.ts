@@ -165,11 +165,20 @@ export const LIVE_DIAGNOSTIC_REPEAT_WINDOW_MS = 60_000;
 // counted, and when the window closes one line reports how many there were.
 // A failure after a quiet window logs at once again. Metrics are untouched:
 // the failed counter still moves once per episode.
+//
+// A sink that is replaced (setLiveUpstreamDiagnostics) is retired through
+// dispose(): its open windows' timers are cleared and their pending counts
+// dropped, and it never logs again. Dropping the counts is deliberate — a
+// summary is only meaningful from the sink that saw the first line, so the
+// replacement starts with no windows open rather than inheriting them.
+export type RepeatFoldingDiagnosticSink = LiveUpstreamDiagnosticSink & { dispose(): void };
+
 export function createRepeatFoldingDiagnosticSink(options: {
   log: (line: string) => void;
   windowMs?: number;
   setTimer?: (fn: () => void, ms: number) => unknown;
-}): LiveUpstreamDiagnosticSink {
+  clearTimer?: (timer: unknown) => void;
+}): RepeatFoldingDiagnosticSink {
   const windowMs = options.windowMs ?? LIVE_DIAGNOSTIC_REPEAT_WINDOW_MS;
   const setTimer = options.setTimer ?? ((fn: () => void, ms: number) => {
     const timer = setTimeout(fn, ms);
@@ -177,36 +186,58 @@ export function createRepeatFoldingDiagnosticSink(options: {
     (timer as { unref?: () => void }).unref?.();
     return timer;
   });
-  // Pairs inside an open window, with the repeats seen since it opened.
-  const open = new Map<string, number>();
-  return record => {
+  const clearTimer = options.clearTimer ?? ((timer: unknown) => clearTimeout(timer as ReturnType<typeof setTimeout>));
+  // Pairs inside an open window, with the repeats seen since it opened and
+  // the timer that closes the window.
+  const open = new Map<string, { repeats: number; timer: unknown }>();
+  let disposed = false;
+  const sink = (record: LiveUpstreamDiagnostic) => {
+    if (disposed) return;
     const key = `${record.topic}\u0000${record.status}`;
-    const repeats = open.get(key);
-    if (repeats !== undefined) {
-      open.set(key, repeats + 1);
+    const window = open.get(key);
+    if (window !== undefined) {
+      window.repeats += 1;
       return;
     }
-    open.set(key, 0);
+    const entry = { repeats: 0, timer: undefined as unknown };
+    open.set(key, entry);
     options.log(failureLine(record));
-    setTimer(() => {
-      const count = open.get(key) ?? 0;
+    entry.timer = setTimer(() => {
+      if (open.get(key) !== entry) return;
       open.delete(key);
-      if (count > 0) {
+      if (entry.repeats > 0) {
         const seconds = Math.round(windowMs / 1000);
-        options.log(`${failureLine(record)} ${count} more time${count === 1 ? "" : "s"} in the last ${seconds}s`);
+        options.log(`${failureLine(record)} ${entry.repeats} more time${entry.repeats === 1 ? "" : "s"} in the last ${seconds}s`);
       }
     }, windowMs);
   };
+  return Object.assign(sink, {
+    dispose(): void {
+      disposed = true;
+      for (const entry of open.values()) clearTimer(entry.timer);
+      open.clear();
+    },
+  });
 }
 
-const defaultDiagnosticSink: LiveUpstreamDiagnosticSink = createRepeatFoldingDiagnosticSink({
-  log: line => console.error(line),
-});
+function createDefaultDiagnosticSink(): RepeatFoldingDiagnosticSink {
+  return createRepeatFoldingDiagnosticSink({ log: line => console.error(line) });
+}
 
-let diagnosticSink: LiveUpstreamDiagnosticSink = defaultDiagnosticSink;
+let diagnosticSink: LiveUpstreamDiagnosticSink = createDefaultDiagnosticSink();
 
+// Replacing the sink retires the previous one (its pending fold summaries
+// never fire); null installs a fresh default sink.
 export function setLiveUpstreamDiagnostics(sink: LiveUpstreamDiagnosticSink | null): void {
-  diagnosticSink = sink ?? defaultDiagnosticSink;
+  const next = sink ?? createDefaultDiagnosticSink();
+  if (next === diagnosticSink) return;
+  const previous = diagnosticSink as { dispose?: () => void };
+  diagnosticSink = next;
+  try {
+    previous.dispose?.();
+  } catch {
+    // Retiring a sink never fails the replacement.
+  }
 }
 
 function recordUpstreamFailure(record: LiveUpstreamDiagnostic): void {

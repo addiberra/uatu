@@ -546,13 +546,43 @@ describe("failure log repeat folding", () => {
     const log = createRepeatFoldingDiagnosticSink({
       log: line => lines.push(line),
       windowMs,
-      setTimer: (fn, ms) => timers.push({ fn, ms }),
+      setTimer: (fn, ms) => {
+        const timer = { fn, ms };
+        timers.push(timer);
+        return timer;
+      },
+      clearTimer: timer => {
+        const index = timers.indexOf(timer as (typeof timers)[number]);
+        if (index >= 0) timers.splice(index, 1);
+      },
     });
     const fire = () => {
       for (const timer of timers.splice(0)) timer.fn();
     };
     return { lines, timers, log, fire };
   }
+
+  test("a replaced sink is retired: its pending summary timers are cleared and it never logs again", () => {
+    const retired = folding();
+    setLiveUpstreamDiagnostics(retired.log);
+    retired.log({ topic: "document", status: "unreachable" });
+    retired.log({ topic: "document", status: "unreachable" });
+    expect(retired.lines).toHaveLength(1);
+    expect(retired.timers).toHaveLength(1);
+    const current = folding();
+    setLiveUpstreamDiagnostics(current.log);
+    // The open window's timer was cleared, not left to fire later.
+    expect(retired.timers).toHaveLength(0);
+    // Advancing past the window changes nothing for either sink: the retired
+    // sink's pending count was dropped, not handed to its replacement.
+    retired.fire();
+    current.fire();
+    expect(retired.lines).toHaveLength(1);
+    expect(current.lines).toEqual([]);
+    // A retired sink stays silent even if something still holds it.
+    retired.log({ topic: "document", status: "unreachable" });
+    expect(retired.lines).toHaveLength(1);
+  });
 
   test("the first failure of a topic and status logs at once, exactly as before", () => {
     const { lines, log } = folding();
