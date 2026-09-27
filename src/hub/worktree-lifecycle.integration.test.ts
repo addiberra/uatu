@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, spyOn, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, setDefaultTimeout, spyOn, test } from "bun:test";
 import { existsSync, promises as fs } from "node:fs";
 import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
@@ -33,6 +33,15 @@ import { parseHubState } from "../shell/hub-nav";
 // "running", a failing stop and an in-flight start are Hub-side facts. The
 // Git environment is explicit, never inherited from a Hub-managed
 // development workspace.
+
+// Every case here drives real Git against one shared repository, and
+// inventory reads probe every checkout in it: 1–2 s each on an idle
+// machine, and past the 5-second default under `bun test --parallel=4`,
+// where the file shares the cores with three others. Nothing in these cases
+// waits on wall-clock time, so the whole file gets the budget the heaviest
+// cases already needed. setDefaultTimeout is scoped to this file.
+const INVENTORY_HEAVY_TIMEOUT = 30_000;
+setDefaultTimeout(INVENTORY_HEAVY_TIMEOUT);
 
 const temporaryDirectories: string[] = [];
 let root = "";
@@ -887,10 +896,6 @@ describe("deletion preflight (5.3)", () => {
   });
 });
 
-// Cases that read the shared repository's full inventory several times —
-// each read probes every checkout in it — outgrow the 5-second default on a
-// loaded machine; the in-flight start case below already allows 30 s.
-const INVENTORY_HEAVY_TIMEOUT = 30_000;
 
 describe("guarded removal (5.4) and branch preservation (5.5)", () => {
   test("a clean stopped worktree is removed, unregistered and forgotten; its branch and creation history stay", async () => {
