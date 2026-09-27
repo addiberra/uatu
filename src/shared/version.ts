@@ -1,3 +1,8 @@
+// node:fs and node:path resolve to empty stubs in the browser bundle; the
+// reads below then fail into the same fallback a missing Git always had.
+import { readFileSync } from "node:fs";
+import path from "node:path";
+
 import { version as packageJsonVersion } from "../../package.json";
 
 export type BuildInfo = {
@@ -49,9 +54,84 @@ function runGit(args: string[]): string | null {
   }
 }
 
+function readText(file: string): string | null {
+  try {
+    return readFileSync(file, "utf8");
+  } catch {
+    return null;
+  }
+}
+
+const OBJECT_ID = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/;
+
+// Resolves what `git rev-parse --abbrev-ref HEAD` and `git rev-parse HEAD`
+// print, from the repository files alone: HEAD, loose refs, packed-refs, and
+// a linked worktree's or submodule's `.git` file. Returns null for anything
+// it does not model (an environment-directed repository, an unborn branch, a
+// symbolic ref outside refs/heads, a reftable store), and the caller asks
+// Git. Every module importing this one evaluates BUILD at load, so on the
+// common path this spares two synchronous Git processes per process start —
+// which also keeps test workers out of Bun.spawnSync, where Bun 1.4 can lose
+// a child's exit and spin forever (oven-sh/bun#34069).
+export function readGitHeadFromFiles(
+  start: string = process.cwd(),
+  env: Record<string, string | undefined> = process.env,
+): { branch: string; commitSha: string } | null {
+  if (env.GIT_DIR || env.GIT_COMMON_DIR || env.GIT_WORK_TREE) return null;
+  let gitDir: string | null = null;
+  for (let directory = path.resolve(start); ; directory = path.dirname(directory)) {
+    const dotGit = path.join(directory, ".git");
+    const pointer = readText(dotGit);
+    if (pointer !== null) {
+      const match = /^gitdir: (.+)$/m.exec(pointer);
+      if (!match) return null;
+      gitDir = path.resolve(directory, match[1]!.trim());
+      break;
+    }
+    if (readText(path.join(dotGit, "HEAD")) !== null) {
+      gitDir = dotGit;
+      break;
+    }
+    if (path.dirname(directory) === directory) return null;
+  }
+  const commonPointer = readText(path.join(gitDir, "commondir"));
+  const commonDir = commonPointer === null ? gitDir : path.resolve(gitDir, commonPointer.trim());
+  const head = readText(path.join(gitDir, "HEAD"))?.trim();
+  if (!head) return null;
+  if (OBJECT_ID.test(head)) return { branch: "HEAD", commitSha: head };
+  const symbolic = /^ref: (refs\/heads\/.+)$/.exec(head);
+  if (!symbolic) return null;
+  const ref = symbolic[1]!;
+  let commitSha: string | null = null;
+  for (const directory of [gitDir, commonDir]) {
+    const loose = readText(path.join(directory, ref))?.trim();
+    if (loose && OBJECT_ID.test(loose)) {
+      commitSha = loose;
+      break;
+    }
+  }
+  if (commitSha === null) {
+    for (const line of (readText(path.join(commonDir, "packed-refs")) ?? "").split("\n")) {
+      const [id, name] = line.trim().split(" ");
+      if (name === ref && id && OBJECT_ID.test(id)) {
+        commitSha = id;
+        break;
+      }
+    }
+  }
+  if (commitSha === null) return null;
+  return { branch: ref.slice("refs/heads/".length), commitSha };
+}
+
 export function readGitBuildInfo(version: string = PACKAGE_VERSION): BuildInfo {
-  const branch = runGit(["rev-parse", "--abbrev-ref", "HEAD"]) ?? "main";
-  const commitSha = runGit(["rev-parse", "HEAD"]) ?? "unknown";
+  let fromFiles: ReturnType<typeof readGitHeadFromFiles> = null;
+  try {
+    fromFiles = readGitHeadFromFiles();
+  } catch {
+    // No filesystem (the browser bundle) or an unreadable tree: ask Git.
+  }
+  const branch = fromFiles?.branch ?? runGit(["rev-parse", "--abbrev-ref", "HEAD"]) ?? "main";
+  const commitSha = fromFiles?.commitSha ?? runGit(["rev-parse", "HEAD"]) ?? "unknown";
   const commitShort = commitSha === "unknown" ? "unknown" : commitSha.slice(0, 7);
 
   return {

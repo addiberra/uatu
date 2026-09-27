@@ -1,9 +1,13 @@
-import { describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, test } from "bun:test";
+import { mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 
 import {
   BUNDLED_WEB_REVISION,
   formatBuildIdentifier,
   HUB_API_REVISION,
+  readGitHeadFromFiles,
   type BuildInfo,
   WORKSPACE_API_REVISION,
 } from "./version";
@@ -42,5 +46,95 @@ describe("compatibility revisions", () => {
     expect(Number.isInteger(BUNDLED_WEB_REVISION)).toBe(true);
     expect(Number.isInteger(HUB_API_REVISION)).toBe(true);
     expect(Number.isInteger(WORKSPACE_API_REVISION)).toBe(true);
+  });
+});
+
+describe("readGitHeadFromFiles", () => {
+  const directories: string[] = [];
+  afterAll(async () => {
+    await Promise.all(directories.map(directory => rm(directory, { recursive: true, force: true })));
+  });
+
+  // A tool environment built from scratch: nothing from a Hub-managed
+  // workspace (projected config, signing, a wrapper's HOME) reaches Git.
+  const gitEnv = (home: string): Record<string, string> => ({
+    PATH: process.env.PATH ?? "/usr/bin:/bin",
+    HOME: home,
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_AUTHOR_NAME: "Test",
+    GIT_AUTHOR_EMAIL: "test@example.com",
+    GIT_COMMITTER_NAME: "Test",
+    GIT_COMMITTER_EMAIL: "test@example.com",
+  });
+  // Asynchronous on purpose: Bun.spawnSync can lose a child's exit
+  // (oven-sh/bun#34069), which is what the function under test avoids.
+  const git = async (cwd: string, home: string, ...args: string[]): Promise<string> => {
+    const child = Bun.spawn(["git", "-c", "commit.gpgsign=false", "-c", "init.defaultBranch=main", ...args], {
+      cwd, env: gitEnv(home), stdout: "pipe", stderr: "pipe",
+    });
+    const [out, err, code] = await Promise.all([
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+      child.exited,
+    ]);
+    if (code !== 0) throw new Error(`git ${args.join(" ")} failed: ${err}`);
+    return out.trim();
+  };
+  const temporary = async (): Promise<string> => {
+    const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "uatu-version-")));
+    directories.push(root);
+    await mkdir(path.join(root, "home"));
+    return root;
+  };
+  const repository = async (): Promise<{ root: string; home: string; repo: string }> => {
+    const root = await temporary();
+    const home = path.join(root, "home");
+    const repo = path.join(root, "repo");
+    await mkdir(repo);
+    await git(repo, home, "init", "-q");
+    await git(repo, home, "commit", "-q", "--allow-empty", "-m", "first");
+    return { root, home, repo };
+  };
+  const revParse = async (cwd: string, home: string) => ({
+    branch: await git(cwd, home, "rev-parse", "--abbrev-ref", "HEAD"),
+    commitSha: await git(cwd, home, "rev-parse", "HEAD"),
+  });
+
+  test("a branch with a loose ref, read from a subdirectory, matches git rev-parse", async () => {
+    const { home, repo } = await repository();
+    await git(repo, home, "checkout", "-q", "-b", "feature/nested");
+    const nested = path.join(repo, "a", "b");
+    await mkdir(nested, { recursive: true });
+    expect(readGitHeadFromFiles(nested, {})).toEqual(await revParse(repo, home));
+    expect(readGitHeadFromFiles(nested, {})?.branch).toBe("feature/nested");
+  });
+
+  test("a packed ref and a detached HEAD match git rev-parse", async () => {
+    const { home, repo } = await repository();
+    await git(repo, home, "pack-refs", "--all");
+    expect(await Bun.file(path.join(repo, ".git", "refs", "heads", "main")).exists()).toBe(false);
+    expect(readGitHeadFromFiles(repo, {})).toEqual(await revParse(repo, home));
+    await git(repo, home, "checkout", "-q", "--detach");
+    expect(readGitHeadFromFiles(repo, {})).toEqual(await revParse(repo, home));
+    expect(readGitHeadFromFiles(repo, {})?.branch).toBe("HEAD");
+  });
+
+  test("a linked worktree resolves through its .git file and the common directory", async () => {
+    const { root, home, repo } = await repository();
+    const linked = path.join(root, "linked");
+    await git(repo, home, "worktree", "add", "-q", "-b", "side", linked);
+    await git(linked, home, "commit", "-q", "--allow-empty", "-m", "on side");
+    expect(readGitHeadFromFiles(linked, {})).toEqual(await revParse(linked, home));
+    expect(readGitHeadFromFiles(linked, {})?.branch).toBe("side");
+  });
+
+  test("defers to Git for an unborn branch, an environment-directed repository, or no repository", async () => {
+    const unborn = await temporary();
+    await git(unborn, path.join(unborn, "home"), "init", "-q");
+    expect(readGitHeadFromFiles(unborn, {})).toBeNull();
+    const { repo } = await repository();
+    expect(readGitHeadFromFiles(repo, { GIT_DIR: path.join(repo, ".git") })).toBeNull();
+    expect(readGitHeadFromFiles(await temporary(), {})).toBeNull();
   });
 });
