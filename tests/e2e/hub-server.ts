@@ -101,8 +101,11 @@ export type HubE2EInfo = {
   origin: string;
   user: { name: string; password: string };
   workspaces: HubE2EWorkspace[];
-  // With UATU_E2E_HUB_PUSH: the file each recorded push is appended to.
+  // With UATU_E2E_HUB_PUSH: the file each recorded push is appended to, and
+  // the notification journal (src/hub/notification-store.ts), whose
+  // deliveries show what the hub decided — held, sent, or discarded.
   pushLog?: string;
+  notificationStore?: string;
 };
 
 const HUB_PORT = Number.parseInt(process.env.UATU_E2E_HUB_PORT ?? "21000", 10);
@@ -337,7 +340,8 @@ for (const workspace of workspaces) {
   workspace.childOrigin = `http://${running.endpoint.hostname}:${running.endpoint.port}`;
 }
 
-const notificationStore = new NotificationStore(path.join(tempRoot, "notifications.json"));
+const notificationStorePath = path.join(tempRoot, "notifications.json");
+const notificationStore = new NotificationStore(notificationStorePath);
 await notificationStore.load();
 const pushLog = path.join(tempRoot, "push-sends.jsonl");
 const notifications = new HubNotifications({ store: notificationStore,
@@ -362,7 +366,7 @@ for (const workspace of workspaces) {
 }
 
 if (PUSH) notifications.start();
-const info: HubE2EInfo = { origin, user: HUB_E2E_USER, workspaces, ...(PUSH ? { pushLog } : {}) };
+const info: HubE2EInfo = { origin, user: HUB_E2E_USER, workspaces, ...(PUSH ? { pushLog, notificationStore: notificationStorePath } : {}) };
 console.log(`${HUB_E2E_READY_PREFIX}${JSON.stringify(info)}`);
 
 // The per-test reset: hub-fixtures.ts writes `reset <serial>` to stdin and
