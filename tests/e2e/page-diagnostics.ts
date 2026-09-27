@@ -137,8 +137,14 @@ export function withEngineBrowsers<T extends {}, W extends {}>(test: TestType<T,
   return test.extend<EngineBrowserFixtures, EngineBrowserWorkerFixtures>({
     _webkitBrowser: [async ({ playwright }, use) => {
       let launched: Promise<Browser> | undefined;
-      await use(() => launched ??= playwright.webkit.launch());
-      if (launched) await (await launched).close();
+      // A failed launch is forgotten, so the worker's next test tries again
+      // instead of inheriting the same rejection for the worker's lifetime.
+      await use(() => launched ??= playwright.webkit.launch().catch(error => {
+        launched = undefined;
+        throw error;
+      }));
+      const browser = await launched?.catch(() => undefined);
+      await browser?.close();
     }, { scope: "worker" }],
 
     launchBrowser: async ({ browser: chromiumBrowser, _webkitBrowser }, use, testInfo) => {
