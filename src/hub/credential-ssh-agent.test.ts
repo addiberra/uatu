@@ -232,10 +232,8 @@ describe("ManagedSshAgent", () => {
     const replacement = Bun.listen({ unix: first.controlSocketPath, socket: { data() {} } });
     await chmod(first.controlSocketPath, 0o600);
     try {
-      // The replacement cannot answer the keyed `status` probe, so recovery
-      // fails before the socket-identity check that guards `stop`.
-      const recovery = manager(runtime, executable, { stopTimeoutMs: 200 });
-      await expect(recovery.start()).rejects.toThrow("SSH guardian request failed");
+      const recovery = manager(runtime, executable);
+      await expect(recovery.start()).rejects.toThrow("does not match its ownership record");
       expect((await lstat(first.socketPath)).isSocket()).toBe(true);
       expect(JSON.parse(await readFile(path.join(runtime, "ssh-agent.json"), "utf8"))).toEqual(record);
     } finally {
@@ -251,8 +249,8 @@ describe("ManagedSshAgent", () => {
     const record = await ownership(runtime);
     await rm(first.controlSocketPath);
 
-    const recovery = manager(runtime, executable, { stopTimeoutMs: 200 });
-    await expect(recovery.start()).rejects.toThrow("SSH guardian request failed");
+    const recovery = manager(runtime, executable);
+    await expect(recovery.start()).rejects.toThrow("ENOENT");
     expect((await lstat(first.socketPath)).isSocket()).toBe(true);
     expect(JSON.parse(await readFile(path.join(runtime, "ssh-agent.json"), "utf8"))).toEqual(record);
   });
