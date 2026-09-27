@@ -274,6 +274,10 @@ export function buildRoutes(deps: BuildRoutesDeps): Serve.Routes<unknown, string
           if (status === 404) {
             return Response.json({ error: "document not found" }, { status });
           }
+          // The server failing (a renderer throw, EMFILE, EACCES): the
+          // client retries, so the session log is the only place the cause
+          // shows up. The response body stays generic.
+          console.error(`uatu: /api/document render failed for ${documentId}:`, error);
           return Response.json({ error: "document render failed" }, { status });
         }
       },
