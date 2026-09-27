@@ -195,13 +195,18 @@ is path-filtered (`.github/workflows/desktop-ci.yml`); it builds with plain
 
 - `bun run dev` — dev hub at `http://127.0.0.1:4702/` (`dev/hub.json`, user
   `dev` / password `dev`) with `testdata/watch-docs` registered and opened
-- `bun test` — unit suite, one file at a time (about 3 min on a CI runner)
-- `bun run test:ci` — the same suite as CI runs it: `bun test --parallel=4`
+- `bun test` — unit suite, one file at a time (about 3 min on a CI runner);
+  this is what CI's required `unit` job runs
+- `bun run test:ci` — the same suite in parallel: `bun test --parallel=4`
   (four worker processes, each file isolated) with `tests/unit-timings.json`
   starting the slowest files first; the longest file,
   `src/hub/worktree-lifecycle.integration.test.ts`, sets the floor (on a
-  6-core laptop about 80 s, against about 280 s one file at a time). Refresh
-  the timings with `bun run test:ci --update-timings` when files move a lot
+  6-core laptop about 80 s, against about 280 s one file at a time). CI runs
+  it in the non-required `unit-parallel` job, because real-process tests
+  that are always green serially have failed one at a time under that
+  contention; it becomes the gate once it has stayed green for a stretch.
+  Refresh the timings with `bun run test:ci --update-timings` when files
+  move a lot
 - When developing Uatu inside a Hub-managed workspace, credential tests may
   discover Uatu's projected Git/SSH wrappers. Use a clean tool environment for
   those tests; do not change product behavior to accommodate nested projection.
