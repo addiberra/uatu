@@ -488,24 +488,84 @@ function menuEntrySignature(node: Element, source: unknown): string {
   return `${node.outerHTML}\u0000${JSON.stringify(source ?? null)}`;
 }
 
-// Brings `container`'s children to `next`, position by position, keeping
-// every existing child whose signature matches the entry built for its
-// place. The switcher re-renders on every list answer and activity report
-// while it is open, including the refresh its own opening starts; replacing
-// every node each time would drop a click, hover, or keyboard focus that
-// landed on an entry meanwhile.
-function reconcileMenuEntries(container: Element, next: Element[], signatures: WeakMap<Element, string>): void {
-  next.forEach((node, index) => {
-    const existing = container.children[index];
-    if (existing === undefined) {
-      container.appendChild(node);
-      return;
-    }
+// What a menu entry stands for, independent of its node and its place in the
+// list: a repository header by its main checkout's id, and otherwise what
+// `menuFocusKey` says. Dividers have none.
+function menuEntryKey(element: Element): string | null {
+  const repository = element.getAttribute("data-repository");
+  if (repository !== null) return `repository:${repository}`;
+  return menuFocusKey(element);
+}
+
+// Brings `container`'s children to `next`, keeping every existing child whose
+// signature matches the entry built for the same thing. Entries are matched
+// by identity (`menuEntryKey`), never by position: a background refresh that
+// inserts, removes or regroups a workspace above the row being pressed must
+// not replace that row between mousedown and mouseup, or the click is lost.
+// Entries without an identity (dividers) are matched by signature, and a
+// duplicated identity pairs off in document order. Kept entries already in
+// order stay where they are and only the rest are moved, so an insert or a
+// removal touches no kept node at all.
+// The switcher re-renders on every list answer and activity report while it
+// is open, including the refresh its own opening starts; replacing every
+// node each time would drop a click, hover, or keyboard focus that landed on
+// an entry meanwhile.
+export function reconcileMenuEntries(container: Element, next: Element[], signatures: WeakMap<Element, string>): void {
+  const matchKey = (node: Element): string | null => {
+    const key = menuEntryKey(node);
+    if (key !== null) return `key:${key}`;
     const signature = signatures.get(node);
-    if (signature !== undefined && signatures.get(existing) === signature) return;
-    existing.replaceWith(node);
+    return signature === undefined ? null : `signature:${signature}`;
+  };
+  const pool = new Map<string, Element[]>();
+  const oldIndex = new Map<Element, number>();
+  [...container.children].forEach((child, index) => {
+    oldIndex.set(child, index);
+    const key = matchKey(child);
+    if (key === null) return;
+    const bucket = pool.get(key);
+    if (bucket) bucket.push(child);
+    else pool.set(key, [child]);
   });
-  while (container.children.length > next.length) container.lastElementChild!.remove();
+  const resolved = next.map(node => {
+    const key = matchKey(node);
+    const existing = key === null ? undefined : pool.get(key)?.shift();
+    if (existing === undefined) return node;
+    const signature = signatures.get(node);
+    return signature !== undefined && signatures.get(existing) === signature ? existing : node;
+  });
+  const keep = new Set(resolved);
+  for (const child of [...container.children]) {
+    if (!keep.has(child)) child.remove();
+  }
+  // The kept children that may stay put: the longest run of them already in
+  // the new relative order (a longest increasing subsequence of their old
+  // indices). Everything else is inserted around them.
+  const kept = resolved.filter(node => oldIndex.has(node));
+  const tails: number[] = [];
+  const previous: number[] = [];
+  kept.forEach((node, index) => {
+    const value = oldIndex.get(node)!;
+    let low = 0;
+    let high = tails.length;
+    while (low < high) {
+      const middle = (low + high) >> 1;
+      if (oldIndex.get(kept[tails[middle]!]!)! < value) low = middle + 1;
+      else high = middle;
+    }
+    previous[index] = low > 0 ? tails[low - 1]! : -1;
+    tails[low] = index;
+  });
+  const stable = new Set<Element>();
+  for (let index = tails.length > 0 ? tails[tails.length - 1]! : -1; index >= 0; index = previous[index]!) {
+    stable.add(kept[index]!);
+  }
+  let anchor: Element | null = null;
+  for (let index = resolved.length - 1; index >= 0; index -= 1) {
+    const node = resolved[index]!;
+    if (!stable.has(node)) container.insertBefore(node, anchor);
+    anchor = node;
+  }
 }
 
 // What a focusable menu entry stands for, independent of its node: a
@@ -637,7 +697,10 @@ export function initHubNav(): void {
         {
           // The published family's base path, straight from Hub state —
           // never a literal, and never relocated under the session's base
-          // path, because the Hub API lives outside it.
+          // path, because the Hub API lives outside it. Read when clicked,
+          // not when built, so a kept header's control never holds a stale
+          // one; the header's signature covers `workspace`, and the
+          // control is only rendered while this is set.
           api: worktreeApi!,
           source: {
             id: workspace.id,
@@ -805,8 +868,9 @@ export function initHubNav(): void {
     });
     add(signOut);
     reconcileMenuEntries(menu, next, menuEntrySignatures);
-    // An entry that did change was replaced, and focus on it went with the
-    // old node: put it back on the entry that stands for the same thing.
+    // An entry that did change was replaced (or a kept one had to move), and
+    // focus on it went with the old node: put it back on the entry that
+    // stands for the same thing.
     if (focusedKey !== null && !menu.contains(document.activeElement)) {
       [...menu.querySelectorAll<HTMLElement>("a, button")].find(item => menuFocusKey(item) === focusedKey)?.focus();
     }

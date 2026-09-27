@@ -20,6 +20,7 @@ import {
   isPlainActivation,
   groupHubWorkspaces,
   parseHubState,
+  reconcileMenuEntries,
   repositoryTitle,
   sortHubWorkspaces,
   startFailureNeedsHubUnlock,
@@ -1458,6 +1459,58 @@ describe("the viewed acknowledgement", () => {
   });
 });
 
+describe("reconcileMenuEntries", () => {
+  // Builds entries as the switcher does: a node plus the signature it was
+  // rendered with.
+  function fixture() {
+    const { document } = parseHTML("<div id=menu></div>");
+    const container = document.querySelector("#menu")!;
+    const signatures = new WeakMap<Element, string>();
+    const row = (id: string, text = id) => {
+      const node = document.createElement("a");
+      node.setAttribute("data-workspace-id", id);
+      node.textContent = text;
+      signatures.set(node, node.outerHTML);
+      return node;
+    };
+    const header = (id: string) => {
+      const node = document.createElement("div");
+      node.setAttribute("data-repository", id);
+      signatures.set(node, node.outerHTML);
+      return node;
+    };
+    const divider = () => {
+      const node = document.createElement("hr");
+      signatures.set(node, node.outerHTML);
+      return node;
+    };
+    return { container, signatures, row, header, divider };
+  }
+  const same = (actual: Element[], expected: Element[]) =>
+    actual.length === expected.length && actual.every((node, index) => node === expected[index]);
+
+  test("a pure reorder keeps every node and ends in exactly the new order", () => {
+    const { container, signatures, row, header, divider } = fixture();
+    const initial = [header("r"), row("a"), row("b"), divider(), row("c"), row("d")];
+    initial.forEach(node => container.appendChild(node));
+    const [r, a, b, hr, c, d] = initial;
+    reconcileMenuEntries(container, [row("d"), divider(), row("b"), header("r"), row("a"), row("c")], signatures);
+    expect(same([...container.children], [d!, hr!, b!, r!, a!, c!])).toBe(true);
+  });
+
+  test("changed entries are replaced, vanished ones removed, new ones inserted, duplicates paired in order", () => {
+    const { container, signatures, row, divider } = fixture();
+    const initial = [row("a"), divider(), row("x", "first"), row("x", "second"), divider(), row("gone")];
+    initial.forEach(node => container.appendChild(node));
+    const [a, hr1, x1, x2, hr2] = initial;
+    const changed = row("a", "renamed");
+    const added = row("new");
+    reconcileMenuEntries(container, [added, changed, divider(), row("x", "first"), row("x", "second"), divider()], signatures);
+    expect(same([...container.children], [added, changed, hr1!, x1!, x2!, hr2!])).toBe(true);
+    expect([...container.children].includes(a!)).toBe(false);
+  });
+});
+
 describe("repository identity around the workspace selector", () => {
   const atlas = {
     id: "atlas", displayName: "atlas", path: "/src/atlas", running: true,
@@ -1793,6 +1846,91 @@ describe("activating the current workspace in the switcher", () => {
     expect(page.entry("twin") === twin).toBe(false);
     expect(page.entry("cold") === cold).toBe(true);
     expect(page.menu.children.length).toBe(shown.length);
+  });
+
+  // Reopens the menu so its opening's refresh reads `page.workspaces` again,
+  // and resolves once the menu shows what `rendered` waits for.
+  async function refresh(page: Awaited<ReturnType<typeof mountSwitcher>>, rendered: () => boolean) {
+    page.toggle.dispatchEvent(new page.window.Event("click", { bubbles: true }));
+    expect(page.menu.hidden).toBe(true);
+    page.open();
+    for (let attempt = 0; attempt < 100 && !rendered(); attempt += 1) await Bun.sleep(1);
+    expect(rendered()).toBe(true);
+  }
+  const rowOrder = (menu: HTMLElement) =>
+    [...menu.querySelectorAll(".hub-menu-item[data-workspace-id]")].map(node => node.getAttribute("data-workspace-id"));
+
+  test("a workspace inserted above the row being pressed leaves that row the same node", async () => {
+    const page = await mountSwitcher(true);
+    page.open();
+    const twin = page.entry("twin");
+    const cold = page.entry("cold");
+    page.workspaces.splice(1, 0, { id: "alpha", displayName: "Alpha", path: "/src/alpha", running: true });
+    await refresh(page, () => page.entry("alpha") !== null);
+    expect(rowOrder(page.menu)).toEqual(["uatu", "alpha", "twin", "cold"]);
+    // Identity, compared as booleans: a linkedom node diff never finishes printing.
+    expect(page.entry("twin") === twin).toBe(true);
+    expect(page.entry("cold") === cold).toBe(true);
+  });
+
+  test("a workspace removed above the row being pressed leaves that row the same node", async () => {
+    const page = await mountSwitcher(true);
+    page.workspaces.splice(1, 0, { id: "alpha", displayName: "Alpha", path: "/src/alpha", running: true });
+    page.open();
+    for (let attempt = 0; attempt < 100 && page.entry("alpha") === null; attempt += 1) await Bun.sleep(1);
+    const twin = page.entry("twin");
+    const cold = page.entry("cold");
+    page.workspaces.splice(1, 1);
+    await refresh(page, () => page.entry("alpha") === null);
+    expect(rowOrder(page.menu)).toEqual(["uatu", "twin", "cold"]);
+    expect(page.entry("twin") === twin).toBe(true);
+    expect(page.entry("cold") === cold).toBe(true);
+  });
+
+  test("a reordered list keeps every unchanged entry's node and ends in the new order", async () => {
+    const page = await mountSwitcher(true);
+    page.open();
+    const current = page.entry("uatu");
+    const twin = page.entry("twin");
+    const cold = page.entry("cold");
+    const dashboard = page.menu.querySelector('a[href="/"]');
+    const signOut = page.menu.querySelector('a[href="/login"]');
+    // Cold starts running and moves up among the running rows, above twin.
+    page.workspaces[2] = { ...page.workspaces[2]!, running: true };
+    await refresh(page, () => !page.entry("cold").textContent?.includes("stopped"));
+    expect(rowOrder(page.menu)).toEqual(["uatu", "cold", "twin"]);
+    expect(page.entry("cold") === cold).toBe(false);
+    expect(page.entry("uatu") === current).toBe(true);
+    expect(page.entry("twin") === twin).toBe(true);
+    expect(page.menu.querySelector('a[href="/"]') === dashboard).toBe(true);
+    expect(page.menu.querySelector('a[href="/login"]') === signOut).toBe(true);
+    expect(page.menu.firstElementChild === dashboard).toBe(true);
+    expect(page.menu.lastElementChild === signOut).toBe(true);
+  });
+
+  test("a changed entry is replaced and keyboard focus follows it to the new node", async () => {
+    const page = await mountSwitcher(true);
+    page.open();
+    const twin = page.entry("twin");
+    // linkedom tracks no focus: model activeElement, which falls back to the
+    // body once the focused node leaves the document.
+    let focused: Element | null = null;
+    Object.defineProperty(page.document, "activeElement", {
+      configurable: true,
+      get: () => (focused !== null && page.document.contains(focused) ? focused : page.document.body),
+    });
+    const anchorPrototype = Object.getPrototypeOf(twin) as { focus: () => void };
+    const originalFocus = anchorPrototype.focus;
+    anchorPrototype.focus = function (this: Element) { focused = this; };
+    try {
+      twin.focus();
+      page.workspaces[1] = { ...page.workspaces[1]!, path: "/src/twin-moved" };
+      await refresh(page, () => page.entry("twin").textContent?.includes("twin-moved") === true);
+      expect(page.entry("twin") === twin).toBe(false);
+      expect(page.document.activeElement === page.entry("twin")).toBe(true);
+    } finally {
+      anchorPrototype.focus = originalFocus;
+    }
   });
 
   test("an ordinary click on the current running workspace closes the menu without navigating; siblings and other gestures keep the link", async () => {
