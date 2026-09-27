@@ -246,15 +246,20 @@ describe("documentErrorStatus", () => {
     expect(await statusOf(renderDocument(roots, filePath))).toBe(415);
   });
 
-  test("a file that exists but cannot be read is a server failure, not a missing file", async () => {
-    const { filePath, roots } = await scannedMarkdown("uatu-render-unreadable-");
-    await chmod(filePath, 0o000);
-    try {
-      expect(await statusOf(renderDocument(roots, filePath))).toBe(500);
-    } finally {
-      await chmod(filePath, 0o644);
-    }
-  });
+  // chmod 0o000 cannot deny root a read, so as root this case would render
+  // the file and prove nothing.
+  test.skipIf(process.getuid?.() === 0)(
+    "a file that exists but cannot be read is a server failure, not a missing file (skipped as root: chmod cannot deny root a read)",
+    async () => {
+      const { filePath, roots } = await scannedMarkdown("uatu-render-unreadable-");
+      await chmod(filePath, 0o000);
+      try {
+        expect(await statusOf(renderDocument(roots, filePath))).toBe(500);
+      } finally {
+        await chmod(filePath, 0o644);
+      }
+    },
+  );
 
   test("errors that say nothing about the document's absence are server failures", () => {
     expect(documentErrorStatus(Object.assign(new Error("too many open files"), { code: "EMFILE" }))).toBe(500);

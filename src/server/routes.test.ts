@@ -236,8 +236,10 @@ describe("buildRoutes — /api/document failures", () => {
     expect(result.logged).toEqual([]);
   });
 
-  test(
-    "a file that exists but fails to render answers 500, not 404, and logs the document and cause",
+  // chmod 0o000 cannot deny root a read, so as root this case would render
+  // the file and prove nothing.
+  test.skipIf(process.getuid?.() === 0)(
+    "a file that exists but fails to render answers 500, not 404, and logs the document and cause (skipped as root: chmod cannot deny root a read)",
     async () => {
       const result = await documentStatus(filePath => chmod(filePath, 0o000));
       expect({ status: result.status, body: result.body }).toEqual({
