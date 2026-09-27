@@ -110,7 +110,7 @@ same core checks as CI should pass:
 ```bash
 bun run typecheck
 bun audit --audit-level=moderate
-bun test
+bun run test:ci
 bun run check:licenses
 bun run build
 bun run smoke

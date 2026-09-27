@@ -210,10 +210,12 @@ is path-filtered (`.github/workflows/desktop-ci.yml`); it builds with plain
 - When developing Uatu inside a Hub-managed workspace, credential tests may
   discover Uatu's projected Git/SSH wrappers. Use a clean tool environment for
   those tests; do not change product behavior to accommodate nested projection.
-- `bun run test:e2e` — the whole Playwright suite, both projects (848 tests,
-  4 workers, `fullyParallel`, retries only on CI; about 15–20 min on a
-  4-core runner). CI runs the `e2e` project in two shards and `perf` in its
-  own job, then merges their blob reports into one HTML report.
+- `bun run test:e2e` — the whole Playwright suite, both projects (about 870
+  tests, 4 workers, `fullyParallel`, retries only on CI). CI splits the `e2e`
+  project into two legs by file list (`UATU_E2E_LEG=1`/`2`, see
+  `playwright.config.ts`; each leg takes about 15–17 min on a 4-core runner)
+  and runs `perf` in its own job, then merges their blob reports into one
+  HTML report. Unset, `UATU_E2E_LEG` runs the whole project.
 - `bun run test:e2e:perf` — only the `perf` project: tests tagged `@perf`
   that hold a frame, interaction, or load budget (chat-follow-stability,
   the long-output shell test, hub-live-stream), at most 2 workers.
