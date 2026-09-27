@@ -32,6 +32,13 @@ class EventQueue implements AsyncIterable<ProviderEvent> {
     else this.values.push(event);
   }
 
+  // True while a consumer is parked on the queue. The adapter's pump asks
+  // for the next event only after it has fully handled the previous one, so
+  // after a push this turning true again means that event was processed.
+  get waiting(): boolean {
+    return this.waiters.length > 0;
+  }
+
   close(): void {
     this.closed = true;
     for (const waiter of this.waiters.splice(0)) waiter({ value: undefined, done: true });
@@ -177,6 +184,21 @@ function applyEvent(adapter: ChatAdapter, conversationId: string, event: Provide
 async function waitUntil(predicate: () => boolean): Promise<void> {
   for (let attempt = 0; attempt < 1_000 && !predicate(); attempt += 1) await Bun.sleep(1);
   expect(predicate()).toBe(true);
+}
+
+// Every live event pushed so far has been handled and its updates applied:
+// the pump has parked on the queue again (it asks for the next event only
+// after the previous one is fully handled) and the coalescer holds nothing
+// buffered or mid-flush. What a fixed sleep only hoped for, which a loaded
+// machine running `bun test --parallel` did not grant.
+async function liveEventsApplied(adapter: ChatAdapter, provider: FakeProvider): Promise<void> {
+  await waitUntil(() => provider.eventQueue.waiting);
+  const coalescer = (adapter as unknown as {
+    eventCoalescer: { timer: unknown; buffers: Map<string, unknown>; settled(): Promise<void> } | null;
+  }).eventCoalescer;
+  if (!coalescer) return;
+  await waitUntil(() => coalescer.timer === null && coalescer.buffers.size === 0);
+  await coalescer.settled();
 }
 
 async function expectInventorySignal(subscription: ConversationInventorySubscription): Promise<void> {
@@ -3750,7 +3772,9 @@ describe("pending permission recovery", () => {
     await waitUntil(() => childReads === 1);
     // The removal lands mid-read, when no launcher record exists to edit yet.
     provider.eventQueue.push({ id: "e-unlaunch", type: "message.part.removed", properties: { sessionID: "child", messageID: "mc", partID: "prt_g" } } as never);
-    await Bun.sleep(20);
+    // Release the read only once the pump has handled the removal; a fixed
+    // 20 ms sleep lost that race under `bun test --parallel`.
+    await liveEventsApplied(adapter, provider);
     releaseChild();
     const opened = rowsOf((await opening).items)[0];
     expect(opened?.usage?.costUsd).toBe(0.5);
@@ -3787,7 +3811,7 @@ describe("pending permission recovery", () => {
       id: "e-msg", type: "message.updated",
       data: { info: { id: "child_msg", sessionID: "child", role: "assistant", modelID: "gpt-5.6-sol", time: { created: 2 }, tokens: { input: 100, output: 10 }, cost: 0.25 } },
     } as never);
-    await Bun.sleep(30);
+    await liveEventsApplied(adapter, provider);
     // Opening the parent reads the store: its final figure stands, the
     // older live one does not overwrite it — and the tally is squared.
     const snapshot = await adapter.history("parent");
@@ -4017,7 +4041,7 @@ describe("pending permission recovery", () => {
       id: "e2", type: "message.part.updated",
       data: { part: { id: "prt_c", messageID: "msg", sessionID: "child", type: "text", text: "working" } },
     } as never);
-    await Bun.sleep(20);
+    await liveEventsApplied(adapter, provider);
     const row = adapter.projectionForTests("parent").items().find(item => item.type === "tool");
     // Still named, still carrying a status; simply nothing claimed about cost.
     expect(row).toEqual(expect.objectContaining({ id: "tool:prt_task", name: "task", input: JSON.stringify({ description: "Audit styles" }) }));
@@ -4106,9 +4130,11 @@ describe("pending permission recovery", () => {
     // snapshot it eventually returns is older than what the child reports
     // live while it is pending.
     let release: () => void = () => {};
+    let reconstructionReads = 0;
     const listMessages = provider.readMessages.bind(provider);
     provider.readMessages = async (sessionId, options) => {
       if (sessionId !== "child") return listMessages(sessionId, options);
+      reconstructionReads += 1;
       await new Promise<void>(resolve => { release = resolve; });
       return { items: [
         { id: "msg_a", type: "assistant", modelID: "claude-haiku", time: { created: 2 }, tokens: { input: 500, output: 5, cache: { read: 0, write: 0 } } },
@@ -4118,12 +4144,12 @@ describe("pending permission recovery", () => {
     const pump = adapter.startEventPump();
 
     const opening = adapter.history("parent");
-    await Bun.sleep(5); // the reconstruction is now blocked inside the read
+    await waitUntil(() => reconstructionReads === 1); // the reconstruction is now blocked inside the read
     provider.eventQueue.push({
       id: "e-live", type: "message.updated",
       data: { info: { id: "msg_a", sessionID: "child", role: "assistant", modelID: "gpt-5", time: { created: 3 }, tokens: { input: 900, output: 20, cache: { read: 0, write: 0 } } } },
     } as never);
-    await Bun.sleep(20); // let the live attribution land before the read returns
+    await liveEventsApplied(adapter, provider); // the live attribution lands before the read returns
     release();
 
     // Both the returned snapshot and later opens carry the live figure — the
@@ -4169,7 +4195,7 @@ describe("pending permission recovery", () => {
     const second = adapter.history("parent");
     while (childReads === 0) await Bun.sleep(1);
     provider.eventQueue.push({ id: "remove", type: "message.removed", properties: { sessionID: "child", messageID: "msg_removed" } } as never);
-    await Bun.sleep(20);
+    await liveEventsApplied(adapter, provider);
     release();
 
     for (const snapshot of await Promise.all([first, second])) {
@@ -4211,7 +4237,7 @@ describe("pending permission recovery", () => {
       id: "live", type: "message.updated",
       properties: { info: { id: "msg_live", sessionID: "child", role: "assistant", time: { created: 3 }, tokens: { input: 900 } } },
     } as never);
-    await Bun.sleep(20);
+    await liveEventsApplied(adapter, provider);
     adapter.projectionForTests("other-1");
     adapter.projectionForTests("other-2");
     childStore = [...childStore, { id: "msg_live", type: "assistant", time: { created: 3 }, tokens: { input: 900 } }];
@@ -4392,7 +4418,7 @@ describe("pending permission recovery", () => {
     adapter.projectionForTests("other-2");
 
     report("b", 700);
-    await Bun.sleep(20);
+    await liveEventsApplied(adapter, provider);
 
     // Reopened, the partial rebuild must not pass for the whole answer: the
     // pre-eviction 500 is recovered from the child's store and merged with
