@@ -23,6 +23,19 @@ function requiredTool(name: string): string {
   return executable;
 }
 
+function processExists(pid: number): boolean {
+  try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
+// A group SIGKILL is sent synchronously but lands asynchronously: the killed
+// descendant is an orphan until launchd/init reaps it, and until then
+// `kill(pid, 0)` still finds it. Wait for the reap instead of sampling once.
+async function waitForProcessGone(pid: number, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (processExists(pid) && Date.now() < deadline) await Bun.sleep(20);
+  return !processExists(pid);
+}
+
 afterEach(async () => {
   await Promise.all(tempDirectories.splice(0).map(directory => rm(directory, { recursive: true, force: true })));
 });
@@ -1126,8 +1139,11 @@ describe("local workspace credential projection", () => {
     expect(Date.now() - startedAt).toBeLessThan(5_000);
     expect(await readFile(projected.env.GIT_CONFIG_GLOBAL!, "utf8")).toBe("");
     const descendantPid = Number(await readFile(descendantPidPath, "utf8"));
-    expect(() => process.kill(descendantPid, 0)).toThrow();
-  }, 7_000);
+    expect(await waitForProcessGone(descendantPid, 5_000)).toBe(true);
+    // Real processes under `bun test --parallel`: the fixture's `git init`
+    // and the reap wait above can stretch well past the old seven seconds
+    // when test files share the cores.
+  }, 20_000);
 
   test("fails to an empty config when the effective query exceeds its output cap", async () => {
     const { root, home, workspace } = await fixture();
