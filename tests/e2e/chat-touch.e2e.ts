@@ -799,6 +799,17 @@ async function bootAnswerOwner(page: Page, request: APIRequestContext, drilldown
   }
   const timeline = page.locator(drilldown ? "#chat-drilldown-timeline" : "#chat-timeline");
   const card = timeline.locator(`[data-chat-item-id="question:${questionId}"]`);
+  // The premise of every caller is a reader at the live end when answering
+  // starts, so wait for the timeline to settle there before the first tap. A
+  // just-opened drill-down paints its first page and pins its end over the
+  // next frames, and Playwright retries an action on a target that is not yet
+  // stable with a forced `scrollIntoView({ block: "end" })`. That is a raw
+  // upward scroll the owner did not write — correctly read as the reader
+  // leaving the end — so the hold would start from paused intent and never
+  // resume following after the answer resolves.
+  await expect(card).toBeVisible();
+  await expect.poll(() => timeline.evaluate(element => element.scrollHeight - element.clientHeight - element.scrollTop)).toBeLessThanOrEqual(1);
+  await expect.poll(stillScrollTop(timeline)).toBe(true);
   await card.getByRole("radio", { name: "Type your own answer" }).check();
   await card.locator("[data-question-custom-input]").fill("Keep it minimal");
   await expect(card.locator("[data-question-custom-input]")).toBeFocused();
