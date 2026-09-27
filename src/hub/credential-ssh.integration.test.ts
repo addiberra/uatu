@@ -378,12 +378,23 @@ describe("managed SSH credential lifecycle", () => {
     const fifoAudit = path.join(root, "fifo-path");
     const fakeMkfifo = path.join(root, "mkfifo");
     const delayedArtifact = path.join(credentialRuntimePath(root), "delayed.pipe");
+    const descendantPidPath = path.join(root, "descendant.pid");
+    const release = path.join(root, "release-descendant");
+    // The descendant would leave an artifact behind only once the test
+    // releases it, after the timeout: an ordering by event, not by racing a
+    // `sleep` against the bound.
     await writeFile(fakeMkfifo, [
       "#!/bin/sh",
       `printf '%s\\n' "$3" > '${fifoAudit}'`,
-      `(sleep 1; touch '${delayedArtifact}') &`,
-      "/bin/sleep 5",
+      `(trap '' TERM; while [ ! -e '${release}' ]; do sleep 0.05; done; touch '${delayedArtifact}') &`,
+      `printf '%s' "$!" > '${descendantPidPath}'`,
+      "while :; do /bin/sleep 1; done",
     ].join("\n"), { mode: 0o700 });
+    // The bound must outlast the fake's own start, which under `bun test
+    // --parallel` load exceeded 500 ms before its first line ran; what it
+    // proves (a hanging mkfifo is abandoned and cleaned up) does not
+    // depend on how short it is.
+    const operationTimeoutMs = 2_000;
     const boundedService = new SshCredentialService({
       secretsDirectory: credentialSecretsPath(root),
       runtimeDirectory: credentialRuntimePath(root),
@@ -392,17 +403,23 @@ describe("managed SSH credential lifecycle", () => {
       sshKeygenPath: found.keygen,
       sshAddPath: found.add,
       mkfifoPath: fakeMkfifo,
-      operationTimeoutMs: 500,
+      operationTimeoutMs,
     });
 
     const started = Date.now();
     await expect(boundedService.unlock(credential.id, "fifo-timeout-secret"))
       .rejects.toThrow("passphrase channel could not be created");
-    expect(Date.now() - started).toBeLessThan(2_000);
+    expect(Date.now() - started).toBeLessThan(operationTimeoutMs + 1_500);
     expect(await readFile(fifoAudit, "utf8")).toStartWith(`${credentialRuntimePath(root)}/.`);
     expect((await readdir(credentialRuntimePath(root))).some(file => file.endsWith(".askpass") || file.endsWith(".pipe"))).toBe(false);
     expect((await readdir(credentialSecretsPath(root))).some(file => file.endsWith(".askpass") || file.endsWith(".pipe"))).toBe(false);
-    await Bun.sleep(1_200);
+    const descendantPid = Number(await readFile(descendantPidPath, "utf8"));
+    await writeFile(release, "");
+    // A group SIGKILL lands asynchronously; wait for the orphan's reap.
+    const deadline = Date.now() + 5_000;
+    const alive = () => { try { process.kill(descendantPid, 0); return true; } catch { return false; } };
+    while (alive() && Date.now() < deadline) await Bun.sleep(20);
+    expect(alive()).toBe(false);
     expect(await Bun.file(delayedArtifact).exists()).toBe(false);
   }, 30_000);
 
