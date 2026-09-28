@@ -195,10 +195,32 @@ is path-filtered (`.github/workflows/desktop-ci.yml`); it builds with plain
 
 - `bun run dev` — dev hub at `http://127.0.0.1:4702/` (`dev/hub.json`, user
   `dev` / password `dev`) with `testdata/watch-docs` registered and opened
-- `bun test` — unit suite (~18s)
+- `bun test` — unit suite, one file at a time (about 3 min on a CI runner)
+- `bun run test:ci` — the same suite in parallel, and what CI's required
+  `unit` job runs: `bun test --parallel=4` (four worker processes, each file
+  isolated) with `tests/unit-timings.json` starting the slowest files first;
+  the longest file, `src/hub/worktree-lifecycle.integration.test.ts`, sets
+  the floor (on a 6-core laptop about 70 s, against about 280 s one file at
+  a time). Under that contention a test must wait for the event it asserts
+  on (a process exit, a pump that has handled an event), never for a fixed
+  delay, and a test driving real processes or real Git may need a budget
+  above the 5 s default.
+  Refresh the timings with `bun run test:ci --update-timings` when files
+  move a lot
 - When developing Uatu inside a Hub-managed workspace, credential tests may
   discover Uatu's projected Git/SSH wrappers. Use a clean tool environment for
   those tests; do not change product behavior to accommodate nested projection.
-- `bun test:e2e` — Playwright suite (~5min, `workers: 1` serial)
+- `bun run test:e2e` — the whole Playwright suite, both projects (about 870
+  tests, 4 workers, `fullyParallel`, retries only on CI). CI splits the `e2e`
+  project into two legs by file list (`UATU_E2E_LEG=1`/`2`, see
+  `playwright.config.ts`; each leg takes about 15–17 min on a 4-core runner)
+  and runs `perf` in its own job, then merges their blob reports into one
+  HTML report. Unset, `UATU_E2E_LEG` runs the whole project.
+- `bun run test:e2e:perf` — only the `perf` project: tests tagged `@perf`
+  that hold a frame, interaction, or load budget (chat-follow-stability,
+  the long-output shell test, hub-live-stream), at most 2 workers.
+  `bun run test:e2e:no-perf` (the `e2e` project) skips them. Tag a new
+  budget test `@perf`; make deterministic work counters its pass criterion
+  and keep wall-clock time as evidence or a loose guard.
 - `bun run build` — compile the single-file `dist/uatu` binary
 - `bun run check:licenses` — license audit

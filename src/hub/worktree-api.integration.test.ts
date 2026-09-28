@@ -804,5 +804,7 @@ describe("local-data acknowledgement over JSON", () => {
     expect(deleted.ok).toBe(true);
     expect(existsSync(checkout)).toBe(false);
     expect(await git(path.join(root, "atlas"), ["branch", "--list", "feature/local-data"])).toContain("feature/local-data");
-  });
+    // Three preflights and a delete over real Git: past the 5-second default
+    // under `bun test --parallel=4`. Nothing here waits on wall-clock time.
+  }, 30_000);
 });

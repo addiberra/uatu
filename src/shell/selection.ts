@@ -11,11 +11,22 @@ import { writeSelectionCleared } from "./selection-storage";
 
 let selectedDestination: { id: string; name: string; relativePath: string } | null = null;
 let selectionGeneration = 0;
+// Counts user activations (navigation-origin selections), including the user
+// activating the document that is already selected — which leaves
+// `selectionGeneration` alone. Watcher reconciles never move it.
+let selectionActivation = 0;
 
 // Presentation requests capture this epoch, not just an id: close → reselect
 // of the same file must never make an old response current again.
 export function getSelectionGeneration(): number {
   return selectionGeneration;
+}
+
+// A user activation epoch: bumps on every navigation-origin `setSelectedId`,
+// so work keyed on it (the document load retry schedule) starts over when the
+// user selects the same document again.
+export function getSelectionActivation(): number {
+  return selectionActivation;
 }
 
 export function resumeDocumentSelection(): void {
@@ -40,8 +51,12 @@ export function setSelectedId(next: string | null, origin: "reconcile" | "naviga
   // Watcher frames still remember the destination through the existing Hub
   // preference, but must not erase a browser marker written by another tab.
   // Only explicit navigation (including same-file activation) resumes it.
-  if (origin === "navigation") resumeDocumentSelection();
-  if (next !== appState.selectedId) {
+  if (origin === "navigation") {
+    ++selectionActivation;
+    resumeDocumentSelection();
+  }
+  const changed = next !== appState.selectedId;
+  if (changed) {
     selectedDestination = null;
     ++selectionGeneration;
   }
@@ -51,7 +66,14 @@ export function setSelectedId(next: string | null, origin: "reconcile" | "naviga
       const document = root.docs.find(candidate => candidate.id === next);
       if (document) {
         selectedDestination = { id: document.id, name: document.name, relativePath: document.relativePath };
-        persistPersonalWorkspaceState({ documentPath: document.relativePath });
+        // Every watcher frame re-confirms the selection it already holds. That
+        // is not this client choosing a document: re-saving it would let an
+        // idle client overwrite the document the user last picked elsewhere,
+        // so a later browser resumes the wrong one. Save a move, or a user
+        // activating a document (even the one already shown).
+        if (changed || origin === "navigation") {
+          persistPersonalWorkspaceState({ documentPath: document.relativePath });
+        }
         break;
       }
     }

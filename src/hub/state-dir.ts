@@ -16,6 +16,14 @@ const LEASE_OPEN_FLAGS = sqlite.SQLITE_OPEN_READWRITE
   | sqlite.SQLITE_OPEN_PRIVATECACHE
   | sqlite.SQLITE_OPEN_NOFOLLOW
   | sqlite.SQLITE_OPEN_EXRESCODE;
+// A lock that stays busy for this long is a live owner's; anything shorter is
+// another contender mid-setup. It bounds how long a refused start waits.
+const LEASE_CONTENTION_WINDOW_MS = 500;
+// Per attempt, SQLite's own busy handler lets a writer holding PENDING drain
+// the other contenders' momentary SHARED reads instead of failing at once.
+const LEASE_ATTEMPT_BUSY_TIMEOUT_MS = 20;
+const LEASE_RETRY_MIN_DELAY_MS = 5;
+const LEASE_RETRY_JITTER_MS = 20;
 
 export type HubStateLease = {
   release(): Promise<void>;
@@ -160,7 +168,27 @@ function isSqliteBusy(error: unknown): boolean {
   return typeof errno === "number" && (errno & 0xff) === 5;
 }
 
-export async function acquireHubStateLease(stateRoot: string): Promise<HubStateLease> {
+// One acquisition attempt on a fresh connection: schema setup, then the
+// lifelong EXCLUSIVE transaction. Throws SQLITE_BUSY if any step meets a lock.
+function openLeaseAttempt(database: Database): void {
+  database.exec(`PRAGMA busy_timeout=${LEASE_ATTEMPT_BUSY_TIMEOUT_MS}`);
+  if (sqliteValue(database.query("PRAGMA busy_timeout").get(), "timeout") !== LEASE_ATTEMPT_BUSY_TIMEOUT_MS) {
+    throw new Error(`SQLite did not apply busy_timeout=${LEASE_ATTEMPT_BUSY_TIMEOUT_MS} to the Hub state-root lease`);
+  }
+  if (sqliteValue(database.query("PRAGMA journal_mode").get(), "journal_mode") !== "delete") {
+    throw new Error("Hub state-root lease requires journal_mode=DELETE");
+  }
+  database.exec("CREATE TABLE IF NOT EXISTS lease (id INTEGER PRIMARY KEY CHECK (id = 1)) WITHOUT ROWID");
+  if (sqliteValue(database.query("PRAGMA locking_mode=EXCLUSIVE").get(), "locking_mode") !== "exclusive") {
+    throw new Error("SQLite does not support locking_mode=EXCLUSIVE for the Hub state-root lease");
+  }
+  database.exec("BEGIN EXCLUSIVE");
+}
+
+export async function acquireHubStateLease(
+  stateRoot: string,
+  options: { contentionWindowMs?: number } = {},
+): Promise<HubStateLease> {
   await assertPrivateDirectory(stateRoot);
   const canonicalStateRoot = await fs.realpath(stateRoot);
   const leasePath = path.join(canonicalStateRoot, LEASE_FILE);
@@ -180,46 +208,51 @@ export async function acquireHubStateLease(stateRoot: string): Promise<HubStateL
   }
 
   const identity = await inspectLeaseFile(leasePath);
-  let database: Database | undefined;
-  try {
-    database = new Database(leasePath, LEASE_OPEN_FLAGS);
-    database.exec("PRAGMA busy_timeout=0");
-    if (sqliteValue(database.query("PRAGMA busy_timeout").get(), "timeout") !== 0) {
-      throw new Error("SQLite did not apply busy_timeout=0 to the Hub state-root lease");
-    }
-    if (sqliteValue(database.query("PRAGMA journal_mode").get(), "journal_mode") !== "delete") {
-      throw new Error("Hub state-root lease requires journal_mode=DELETE");
-    }
-    database.exec("CREATE TABLE IF NOT EXISTS lease (id INTEGER PRIMARY KEY CHECK (id = 1)) WITHOUT ROWID");
-    if (sqliteValue(database.query("PRAGMA locking_mode=EXCLUSIVE").get(), "locking_mode") !== "exclusive") {
-      throw new Error("SQLite does not support locking_mode=EXCLUSIVE for the Hub state-root lease");
-    }
-    database.exec("BEGIN EXCLUSIVE");
-
-    const lockedIdentity = await inspectLeaseFile(leasePath);
-    if (lockedIdentity.dev !== identity.dev || lockedIdentity.ino !== identity.ino) {
-      throw new Error(`Hub state-root lease was replaced while being acquired: ${leasePath}`);
-    }
-  } catch (error) {
+  const contentionWindowMs = options.contentionWindowMs ?? LEASE_CONTENTION_WINDOW_MS;
+  const deadline = Date.now() + contentionWindowMs;
+  let retainedDatabase: Database | undefined;
+  while (retainedDatabase === undefined) {
+    let database: Database | undefined;
     try {
-      database?.close(true);
-    } catch {
-      // Preserve the acquisition error.
+      database = new Database(leasePath, LEASE_OPEN_FLAGS);
+      openLeaseAttempt(database);
+      const lockedIdentity = await inspectLeaseFile(leasePath);
+      if (lockedIdentity.dev !== identity.dev || lockedIdentity.ino !== identity.ino) {
+        throw new Error(`Hub state-root lease was replaced while being acquired: ${leasePath}`);
+      }
+      retainedDatabase = database;
+    } catch (error) {
+      try {
+        database?.close(true);
+      } catch {
+        // Preserve the acquisition error.
+      }
+      if (isSqliteBusy(error)) {
+        // Busy is ambiguous: a live owner holds its EXCLUSIVE lock for life,
+        // but another contender's schema setup or lock upgrade holds a lock
+        // for only a moment — and with no retry, first-time contenders can
+        // each see the others' transient locks and all give up. Only a lock
+        // that stays held for the whole window is an owner.
+        if (Date.now() < deadline) {
+          await Bun.sleep(LEASE_RETRY_MIN_DELAY_MS + Math.random() * LEASE_RETRY_JITTER_MS);
+          continue;
+        }
+        throw new Error(`Hub state root is already in use: ${stateRoot}`, { cause: error });
+      }
+      const detail = error instanceof Error ? `: ${error.message}` : "";
+      throw new Error(`cannot safely acquire Hub state-root lease at ${leasePath}${detail}`, { cause: error });
     }
-    if (isSqliteBusy(error)) throw new Error(`Hub state root is already in use: ${stateRoot}`, { cause: error });
-    const detail = error instanceof Error ? `: ${error.message}` : "";
-    throw new Error(`cannot safely acquire Hub state-root lease at ${leasePath}${detail}`, { cause: error });
   }
 
-  const retainedDatabase = database;
+  const heldDatabase = retainedDatabase;
   let releasePromise: Promise<void> | undefined;
   return {
     release() {
       return releasePromise ??= Promise.resolve().then(() => {
         try {
-          retainedDatabase.exec("ROLLBACK");
+          heldDatabase.exec("ROLLBACK");
         } finally {
-          retainedDatabase.close(true);
+          heldDatabase.close(true);
         }
       });
     },

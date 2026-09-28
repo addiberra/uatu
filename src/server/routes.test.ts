@@ -1,7 +1,10 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
+import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 
 import { buildFetchFallback, buildRoutes } from "./routes";
+import { scanRoots } from "./roots";
 import { NotificationFeed, CHILD_NOTIFICATIONS_PATH } from "../chat/notification-feed";
 
 // Minimal stub: the asset routes never touch the session, so a thrown
@@ -201,6 +204,54 @@ describe("buildRoutes — watch context", () => {
     expect(receivedScope).toEqual({ kind: "file", documentId: "/removed/README.md" });
     expect(await response.json()).toEqual({ scope: { kind: "folder" } });
   });
+});
+
+describe("buildRoutes — /api/document failures", () => {
+  async function documentStatus(
+    prepare: (filePath: string) => Promise<void>,
+  ): Promise<{ status: number; body: unknown; logged: unknown[][]; filePath: string }> {
+    const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+    const directory = await mkdtemp(path.join(os.tmpdir(), "uatu-routes-document-"));
+    const filePath = path.join(directory, "notes.md");
+    try {
+      await writeFile(filePath, "# Notes\n");
+      const roots = await scanRoots([{ kind: "dir", absolutePath: directory }]);
+      await prepare(filePath);
+      const getSession = (() => ({ getRoots: () => roots })) as never;
+      const handler = buildFontTestRoutes(undefined, getSession)["/api/document"] as {
+        GET: (request: Request) => Promise<Response>;
+      };
+      const response = await handler.GET(new Request(`http://127.0.0.1/api/document?id=${encodeURIComponent(filePath)}`));
+      return { status: response.status, body: await response.json(), logged: [...errorSpy.mock.calls], filePath };
+    } finally {
+      errorSpy.mockRestore();
+      await chmod(filePath, 0o644).catch(() => undefined);
+      await rm(directory, { recursive: true, force: true });
+    }
+  }
+
+  test("a file removed after indexing answers 404 and logs nothing", async () => {
+    const result = await documentStatus(filePath => rm(filePath));
+    expect({ status: result.status, body: result.body }).toEqual({ status: 404, body: { error: "document not found" } });
+    expect(result.logged).toEqual([]);
+  });
+
+  // chmod 0o000 cannot deny root a read, so as root this case would render
+  // the file and prove nothing.
+  test.skipIf(process.getuid?.() === 0)(
+    "a file that exists but fails to render answers 500, not 404, and logs the document and cause (skipped as root: chmod cannot deny root a read)",
+    async () => {
+      const result = await documentStatus(filePath => chmod(filePath, 0o000));
+      expect({ status: result.status, body: result.body }).toEqual({
+        status: 500,
+        body: { error: "document render failed" },
+      });
+      expect(result.logged).toHaveLength(1);
+      const [message, cause] = result.logged[0]!;
+      expect(String(message)).toContain(result.filePath);
+      expect((cause as NodeJS.ErrnoException).code).toBe("EACCES");
+    },
+  );
 });
 
 describe("buildFetchFallback — base-path gating", () => {

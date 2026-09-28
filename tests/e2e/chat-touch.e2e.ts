@@ -205,10 +205,11 @@ test("questions wait for Answer and send a custom choice as text", async ({ page
   page.on("request", request => {
     if (new URL(request.url()).pathname.endsWith(`/questions/${question.requestId}`)) replies += 1;
   });
+  // Choosing an option only arms Answer. Whether it also sent a reply is
+  // settled below: requests leave in order, so once Answer's own reply has
+  // answered, any reply the choice had sent was already counted.
   await card.getByRole("radio", { name: "Minimal Small change" }).check();
   await expect(answer).toBeEnabled();
-  await page.waitForTimeout(100);
-  expect(replies).toBe(0);
 
   const custom = card.getByRole("radio", { name: "Type your own answer" });
   const customInput = card.locator("[data-question-custom-input]");
@@ -220,6 +221,7 @@ test("questions wait for Answer and send a custom choice as text", async ({ page
   const response = page.waitForResponse(candidate => new URL(candidate.url()).pathname.endsWith(`/questions/${question.requestId}`));
   await answer.click();
   const payload = (await response).request().postDataJSON();
+  expect(replies).toBe(1);
   expect(payload).toMatchObject({ outcome: { kind: "answered", answers: [["Touch-friendly"]] } });
   expect(payload.outcome.answers.flat()).not.toContain("Type your own answer");
   await expect(card).toContainText("Answered");
@@ -797,6 +799,17 @@ async function bootAnswerOwner(page: Page, request: APIRequestContext, drilldown
   }
   const timeline = page.locator(drilldown ? "#chat-drilldown-timeline" : "#chat-timeline");
   const card = timeline.locator(`[data-chat-item-id="question:${questionId}"]`);
+  // The premise of every caller is a reader at the live end when answering
+  // starts, so wait for the timeline to settle there before the first tap. A
+  // just-opened drill-down paints its first page and pins its end over the
+  // next frames, and Playwright retries an action on a target that is not yet
+  // stable with a forced `scrollIntoView({ block: "end" })`. That is a raw
+  // upward scroll the owner did not write — correctly read as the reader
+  // leaving the end — so the hold would start from paused intent and never
+  // resume following after the answer resolves.
+  await expect(card).toBeVisible();
+  await expect.poll(() => timeline.evaluate(element => element.scrollHeight - element.clientHeight - element.scrollTop)).toBeLessThanOrEqual(1);
+  await expect.poll(stillScrollTop(timeline)).toBe(true);
   await card.getByRole("radio", { name: "Type your own answer" }).check();
   await card.locator("[data-question-custom-input]").fill("Keep it minimal");
   await expect(card.locator("[data-question-custom-input]")).toBeFocused();
@@ -1103,8 +1116,10 @@ test("completed code copy stays reachable without hover or reflow", async ({ pag
   await expect(code).toHaveCSS("opacity", "1");
   const before = await message.boundingBox();
   await code.tap();
-  expect(await readClipboardMock(page)).toBe("const touch = true;\n");
+  // The copied state is set once the clipboard write has resolved, and it
+  // clears again after a moment: assert it first, then read the clipboard.
   await expect(code).toHaveAttribute("data-state", "copied");
+  expect(await readClipboardMock(page)).toBe("const touch = true;\n");
   const after = await message.boundingBox();
   expect(after?.width).toBeCloseTo(before?.width ?? 0, 1);
   expect(after?.height).toBeCloseTo(before?.height ?? 0, 1);

@@ -15,5 +15,12 @@ const handleSignal = createHubSignalShutdown({
   }),
   reportRetained: () => process.stdout.write("retained\n"),
 });
-process.on("SIGTERM", handleSignal);
+// Stand-in for the Hub's server, which holds the event loop open until
+// shutdown stops it. Released on the first signal, so what keeps the process
+// (and its lease) alive after a failed shutdown is the product's own hold.
+const serverStandIn = setInterval(() => {}, 2 ** 31 - 1);
+process.on("SIGTERM", () => {
+  clearInterval(serverStandIn);
+  handleSignal();
+});
 process.stdout.write("locked\n");

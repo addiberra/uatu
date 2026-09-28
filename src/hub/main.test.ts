@@ -372,10 +372,12 @@ describe("Hub runtime shutdown", () => {
     });
     const exits: number[] = [];
     let retained = 0;
+    let holds = 0;
     const signal = createHubSignalShutdown({
       shutdown: () => shutdownResult,
       forceExit: code => { exits.push(code); },
       reportRetained: () => { retained += 1; },
+      holdProcess: () => { holds += 1; },
     });
 
     signal();
@@ -383,8 +385,46 @@ describe("Hub runtime shutdown", () => {
     await Bun.sleep(0);
     expect(exits).toEqual([]);
     expect(retained).toBe(1);
+    // The server is already stopped: without a hold the process would drain
+    // and exit, dropping the lease it reported as retained.
+    expect(holds).toBe(1);
     signal();
     expect(exits).toEqual([1]);
+  });
+
+  test("a rejected shutdown logs and force-exits without holding the process", async () => {
+    let holds = 0;
+    let retained = 0;
+    const exits: number[] = [];
+    const failures: unknown[] = [];
+    const teardownError = new Error("teardown threw");
+    const signal = createHubSignalShutdown({
+      shutdown: async () => { throw teardownError; },
+      forceExit: code => { exits.push(code); },
+      reportRetained: () => { retained += 1; },
+      holdProcess: () => { holds += 1; },
+      reportFailure: error => { failures.push(error); },
+    });
+
+    signal();
+    await Bun.sleep(0);
+    // shutdownHub() never rejects, so a rejection carries no proof the lease
+    // is still held: nothing may claim it is retained or keep the process.
+    expect({ holds, retained, exits, failures }).toEqual({ holds: 0, retained: 0, exits: [1], failures: [teardownError] });
+  });
+
+  test("a clean shutdown exits without holding the process", async () => {
+    let holds = 0;
+    const exits: number[] = [];
+    const signal = createHubSignalShutdown({
+      shutdown: async () => ({ exitCode: 0, stateLeaseHeld: false }),
+      forceExit: code => { exits.push(code); },
+      holdProcess: () => { holds += 1; },
+    });
+
+    signal();
+    await Bun.sleep(0);
+    expect({ holds, exits }).toEqual({ holds: 0, exits: [0] });
   });
 
   test("a contender stays blocked after failed shutdown until forced owner exit", async () => {
@@ -396,16 +436,26 @@ describe("Hub runtime shutdown", () => {
     let output = "";
     child.stdout.on("data", chunk => { output += chunk.toString(); });
     const waitForOutput = async (text: string) => {
-      const deadline = Date.now() + 5_000;
+      // The fixture is a separate Bun process; its start alone can take
+      // seconds when test files share the cores, so this waits well past
+      // the old five seconds and the test's budget below matches.
+      const deadline = Date.now() + 20_000;
       while (!output.includes(text) && Date.now() < deadline) await Bun.sleep(10);
       if (!output.includes(text)) throw new Error(`fixture did not print ${text}: ${output}`);
     };
-    const waitForExit = () => new Promise<number | null>(resolve => child.once("exit", code => resolve(code)));
+    // Subscribed at spawn: an exit before the test asks for it (the fixture
+    // draining on its own) must surface as a wrong code, not a hang.
+    const exited = new Promise<number | null>(resolve => child.once("exit", code => resolve(code)));
+    const waitForExit = () => exited;
 
     try {
       await waitForOutput("locked\n");
       child.kill("SIGTERM");
       await waitForOutput("retained\n");
+      // However long this test takes to reach the next steps under load, the
+      // owner must still be alive and holding the lease: the product holds
+      // the process open after a retained shutdown, it does not merely
+      // happen to be still tearing down.
       await expect(acquireHubStateLease(stateRoot)).rejects.toThrow(/already in use/);
 
       child.kill("SIGTERM");
@@ -415,9 +465,12 @@ describe("Hub runtime shutdown", () => {
     } finally {
       if (child.exitCode === null && child.signalCode === null) {
         child.kill("SIGKILL");
-        await new Promise(resolve => child.once("exit", resolve));
+        await exited;
       }
       await rm(directory, { recursive: true, force: true });
     }
-  });
+    // Spawns a real child process: under `bun test --parallel` its start can
+    // exceed the default five seconds, and a timeout here reports as the
+    // wrong failure.
+  }, 30_000);
 });
