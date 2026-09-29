@@ -884,6 +884,8 @@ export class ChatAdapter {
     held: boolean;
     configuration: ConversationConfiguration;
     conversation?: ConversationSummary;
+    // What the provider actually ran, when it was not an ordinary turn.
+    operation?: "reload";
   }> {
     if (!text.trim() && !attachments?.length) throw new Error("prompt must not be empty");
     return this.receipts.run(`prompt:${conversationId}:${requestId}`, () =>
@@ -1087,7 +1089,7 @@ export class ChatAdapter {
     model?: ModelSelection;
     mode?: string;
     variant?: string;
-  }): Promise<{ messageId: string; configuration: ConversationConfiguration; conversation?: ConversationSummary }> {
+  }): Promise<{ messageId: string; configuration: ConversationConfiguration; conversation?: ConversationSummary; operation?: "reload" }> {
     let session = initialSession;
     const { text, mode, variant } = input;
     // Emptiness is checked before dispatch (afterwards the store already
@@ -1116,8 +1118,8 @@ export class ChatAdapter {
       // the queue holds references, and a reference that stopped resolving
       // while held fails the delivery like any provider refusal.
       const providerAttachments = await this.locateAttachments(input.attachments);
-      const accepted = slash
-        ? await this.provider.command(conversationId, { id: input.messageId, name: slash.name, arguments: slash.arguments, model: input.model, mode, variant })
+      const accepted: { messageId: string; text?: string; operation?: "reload" } = slash
+        ? await this.provider.command(conversationId, { id: input.messageId, name: slash.name, arguments: slash.arguments, listed: slash.command, model: input.model, mode, variant })
         : await this.provider.prompt(conversationId, { id: input.messageId, text, delivery: "queue", ...(providerAttachments.length ? { attachments: providerAttachments } : {}), model: input.model, mode, variant });
       // "sending" ends at acceptance, BEFORE the rename side-work below —
       // the dispatch is no longer in flight once the provider has accepted
@@ -1131,7 +1133,7 @@ export class ChatAdapter {
       // server-minted row arrived after its admission window) removes it by
       // id, and a removal that lands before the row exists is a no-op that
       // leaves the row beside the server's for good.
-      projection.upsert({ id: `message:${accepted.messageId}`, type: "user_message", createdAt: Date.now(), text, requestId: input.requestId, ...(input.attachments?.length ? { attachments: input.attachments } : {}) });
+      projection.upsert({ id: `message:${accepted.messageId}`, type: "user_message", createdAt: Date.now(), text: accepted.text ?? text, requestId: input.requestId, ...(input.attachments?.length ? { attachments: input.attachments } : {}) });
       if (renameToFirstPrompt) {
         try {
           // A manual rename can finish while prompt validation is still
@@ -1149,7 +1151,7 @@ export class ChatAdapter {
         } catch { /* cosmetic — listConversations repairs default titles later */ }
       }
       const configuration = this.commitConfiguration(conversationId, this.configurations.get(conversationId) ?? {}, input.model, mode, variant);
-      return { messageId: accepted.messageId, configuration, ...(conversation ? { conversation } : {}) };
+      return { messageId: accepted.messageId, configuration, ...(conversation ? { conversation } : {}), ...(accepted.operation ? { operation: accepted.operation } : {}) };
     } catch (error) {
       const mapped = error instanceof UnsupportedVariantSelectionError
         ? new InvalidVariantSelectionError(error.message)
@@ -2833,12 +2835,13 @@ function isQuestionToolUpdate(update: NormalizedProviderUpdate): boolean {
   return update.kind === "upsert" && update.item.type === "tool" && update.item.name.toLowerCase() === "question";
 }
 
-export function parseSlashCommand(text: string, commands: ChatCommand[]): { name: string; arguments: string } | undefined {
+export function parseSlashCommand(text: string, commands: ChatCommand[]): { name: string; arguments: string; command: ChatCommand } | undefined {
   if (!text.startsWith("/") || text.startsWith("//")) return undefined;
   const match = /^\/([^\s/]+)(?:\s+([\s\S]*))?$/.exec(text);
   if (!match || REVERSIBLE_HISTORY_COMMANDS.some(command => command.name === match[1])) return undefined;
-  if (!commands.some(command => command.name === match[1] && command.kind !== "local-operation")) return undefined;
-  return { name: match[1]!, arguments: match[2]?.trim() ?? "" };
+  const command = commands.find(candidate => candidate.name === match[1] && candidate.kind !== "local-operation");
+  if (!command) return undefined;
+  return { name: match[1]!, arguments: match[2]?.trim() ?? "", command };
 }
 
 const REVERSIBLE_HISTORY_COMMANDS: ChatCommand[] = [

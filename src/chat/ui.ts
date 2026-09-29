@@ -16,7 +16,8 @@ import { setActiveTab } from "../shell/tab-bar";
 import { expandChatPanel, isChatPanelOpen } from "./surface";
 import { CHAT_SURFACE_ACTIVE_EVENT, chatSurfaceInView } from "./surface-visibility";
 import { newRequestId } from "./ids";
-import { insertCommand, localHistoryOperation, matchingCommands, type LocalHistoryOperation } from "./slash-commands";
+import { insertCommand, localHistoryOperation, matchingCommands, slashCommandQuery, type LocalHistoryOperation } from "./slash-commands";
+import { LatestRefresh } from "./latest-refresh";
 import { navigateWorkspaceFileReference, resolveWorkspaceFileReference } from "./file-references";
 import { READER_CLOSED, QueueDockRenderer, RevertedMessagesDockRenderer, TimelineRenderer, decorateAttachmentImages, decorateFileLinks, formatElapsed, latestTodoEntries, statusLabel, subagentEntries, subagentLabel, workingLabel } from "./timeline-renderer";
 import { backgroundStatusLabel, runningBackgroundTasks } from "./background-tasks";
@@ -176,6 +177,26 @@ export function initChat(api = new ChatApiClient()): void {
   // status), shown with the named state — per conversation, so a switch
   // to another retrying conversation never borrows this one's reason.
   const statusMessages = new Map<string, string | undefined>();
+  // Whether the caret sits in a slash query, matches or not: starting one
+  // re-reads the catalogs, so a command added elsewhere — which the banked
+  // list cannot match yet — appears while the user is still typing it. Any
+  // programmatic write to the composer ends the query it was tracking, so
+  // the next `/` typed counts as a new one.
+  let slashQueryActive = false;
+  // Rows the stream removed, per conversation, carried across snapshot
+  // rebuilds (a resync, a switch away and back) so a late acceptance never
+  // recreates a row the stream already retired.
+  const removedRows = new Map<string, string[]>();
+  // A `/reload` this client sent, by conversation, with the agent whose
+  // catalogs it changes and — once accepted — its message id: when its turn
+  // completes, the palette and pickers re-read them. A reload held behind a
+  // running turn is still in the conversation's queue when THAT turn
+  // completes, so a completion arriving while it is queued is not its own.
+  // One arriving before the acceptance names the message cannot be told
+  // apart: it re-reads (harmlessly) and keeps the mark for the real one.
+  // A failed or interrupted reload changed nothing to re-read.
+  // Several can wait in one conversation's queue, oldest first.
+  const pendingReloads = new Map<string, Array<{ agentId: string; messageId?: string }>>();
   const composerStatusLive = document.querySelector<HTMLElement>("#chat-composer-status-live");
   const composerError = document.querySelector<HTMLElement>("#chat-composer-error");
   // Attachment surfaces. Guarded at use rather than joining the required
@@ -2692,6 +2713,8 @@ export function initChat(api = new ChatApiClient()): void {
 
   const installConversationSnapshot = (snapshot: ConversationSnapshot, acceptedDrafts: ChatProjection["acceptedDrafts"], token: number) => {
     projection = projectionFromSnapshot(snapshot, acceptedDrafts);
+    const carried = removedRows.get(snapshot.conversation.id);
+    if (carried) projection = { ...projection, removedIds: carried };
     historyRefreshRequired.delete(snapshot.conversation.id);
     projectionEpoch += 1;
     conversations = conversations.map(item => item.id === snapshot.conversation.id ? snapshot.conversation : item);
@@ -2723,8 +2746,23 @@ export function initChat(api = new ChatApiClient()): void {
           return;
         }
         projection = result.projection;
+        if (projection.removedIds) removedRows.set(conversationId, projection.removedIds);
         if (event.type === "conversation.configuration") renderConfiguration();
         if (event.type === "conversation.status") {
+          const reloads = pendingReloads.get(conversationId);
+          if (reloads && (event.status === "completed" || event.status === "failed" || event.status === "interrupted")) {
+            // The turn that ended is the oldest tracked reload no longer
+            // waiting in the queue; one not yet named by its acceptance
+            // cannot be told apart, so it re-reads and stays tracked.
+            const queued = new Set((projection?.queued ?? []).map(entry => entry.id));
+            const index = reloads.findIndex(entry => entry.messageId === undefined || !queued.has(entry.messageId));
+            const reload = index < 0 ? undefined : reloads[index];
+            if (reload) {
+              if (reload.messageId !== undefined) reloads.splice(index, 1);
+              if (reloads.length === 0) pendingReloads.delete(conversationId);
+              if (event.status === "completed") void refreshBankedCommands(reload.agentId);
+            }
+          }
           if (event.status === "failed") setComposerError(event.message || "The active turn failed.");
           else if (isLiveConversationStatus(event.status)) setComposerError(null);
           statusMessages.set(conversationId, event.message);
@@ -2832,6 +2870,7 @@ export function initChat(api = new ChatApiClient()): void {
     renderConfiguration();
     syncContextIndicator();
     input.value = presentation.drafts[id] ?? "";
+    slashQueryActive = false;
     autosize(input);
     renderAttachments();
     announce("");
@@ -3092,7 +3131,10 @@ export function initChat(api = new ChatApiClient()): void {
     onMode: stageMode,
     onVariant: stageVariant,
   });
-  configurationTrigger.addEventListener("click", () => configurationPicker?.open());
+  configurationTrigger.addEventListener("click", () => {
+    refreshCatalogsOnUse();
+    configurationPicker?.open();
+  });
   renderConfiguration();
   // With one agent there is no choice to offer; with more, creation asks.
   // The menu shows every offered agent with its availability, so an
@@ -3877,7 +3919,11 @@ export function initChat(api = new ChatApiClient()): void {
     .map(token => `<span class="chat-command-hint-token">${escapeHtml(token)}</span>`).join(" ");
 
   const renderCommandMenu = () => {
-    const next = matchingCommands(input.value, input.selectionStart ?? input.value.length, commands);
+    const caret = input.selectionStart ?? input.value.length;
+    const querying = slashCommandQuery(input.value, caret) !== null;
+    if (querying && !slashQueryActive) refreshCatalogsOnUse();
+    slashQueryActive = querying;
+    const next = matchingCommands(input.value, caret, commands);
     if (!next) { closeCommandMenu(); return; }
     commandMatch = next;
     commandIndex = Math.min(commandIndex, next.commands.length - 1);
@@ -3888,7 +3934,7 @@ export function initChat(api = new ChatApiClient()): void {
       option.className = `chat-command-option${index === commandIndex ? " is-active" : ""}`;
       option.setAttribute("role", "option");
       option.setAttribute("aria-selected", String(index === commandIndex));
-      option.innerHTML = `<span class="chat-command-name">/${escapeHtml(command.name)}</span><span class="chat-command-hint">${hintTokens(command.argumentHint)}</span><span class="chat-command-description">${escapeHtml(command.description)}</span>`;
+      option.innerHTML = `<span class="chat-command-name">/${escapeHtml(command.name)}</span>${command.kind === "skill" ? `<span class="chat-command-kind">skill</span>` : ""}<span class="chat-command-hint">${hintTokens(command.argumentHint)}</span><span class="chat-command-description">${escapeHtml(command.description)}</span>`;
       option.addEventListener("pointerdown", event => event.preventDefault());
       option.addEventListener("click", () => chooseCommand(index));
       return option;
@@ -4006,6 +4052,7 @@ export function initChat(api = new ChatApiClient()): void {
     save();
     if (!updateVisible) return unavailable.length;
     input.value = restored.text;
+    slashQueryActive = false;
     autosize(input);
     renderAttachments();
     syncControls();
@@ -4186,6 +4233,7 @@ export function initChat(api = new ChatApiClient()): void {
     const restoreDraftText = () => {
       if (!text.trim()) return;
       input.value = input.value.trim() ? `${text}\n${input.value}` : text;
+      slashQueryActive = false;
       autosize(input);
     };
     // The same rule for a submission that ends while another conversation is
@@ -4205,6 +4253,8 @@ export function initChat(api = new ChatApiClient()): void {
     // while the drain below waits, and anything typed then belongs to the
     // next message — an after-the-wait clear would erase it.
     input.value = "";
+    slashQueryActive = false;
+    closeCommandMenu();
     presentation.drafts[conversationId] = "";
     save();
     autosize(input);
@@ -4254,7 +4304,7 @@ export function initChat(api = new ChatApiClient()): void {
     // explained why on the composer error line.
     if (!text.trim() && (pendingAttachments.get(conversationId) ?? []).length === 0) {
       // Restore the (empty) capture only if the user typed nothing meanwhile.
-      if (!input.value.trim() && text) { input.value = text; autosize(input); }
+      if (!input.value.trim() && text) { input.value = text; slashQueryActive = false; autosize(input); }
       submitting = false;
       syncControls();
       return;
@@ -4324,7 +4374,32 @@ export function initChat(api = new ChatApiClient()): void {
     latestButton.hidden = true;
     scheduleRender(true);
     try {
-      const accepted = await api.prompt(conversationId, requestId, text, selectedModel, selectedMode, selectedVariant, attachmentRefs.length ? attachmentRefs : undefined);
+      // Marked before the send: the reload's outcome can reach the stream
+      // before the acceptance does. Only a guess from the text — the server
+      // decides whether `/reload` is the built-in or a shadowing config
+      // command or skill — so the acceptance's `operation` settles it; an
+      // extra catalog read from a wrong guess is harmless.
+      const reloading = Boolean(contextAgentId) && /^\/reload(?:\s|$)/.test(text.trim());
+      const reloadEntry = reloading ? { agentId: contextAgentId! } as { agentId: string; messageId?: string } : undefined;
+      if (reloadEntry) pendingReloads.set(conversationId, [...(pendingReloads.get(conversationId) ?? []), reloadEntry]);
+      const accepted = await api.prompt(conversationId, requestId, text, selectedModel, selectedMode, selectedVariant, attachmentRefs.length ? attachmentRefs : undefined).catch((error: unknown) => {
+        if (reloadEntry) {
+          const rest = (pendingReloads.get(conversationId) ?? []).filter(entry => entry !== reloadEntry);
+          if (rest.length) pendingReloads.set(conversationId, rest);
+          else pendingReloads.delete(conversationId);
+        }
+        throw error;
+      });
+      if (reloadEntry) {
+        reloadEntry.messageId = accepted.messageId;
+        // Dispatched and not the built-in: nothing to track. A held one is
+        // classified only at delivery, so it stays tracked.
+        if (!accepted.held && accepted.operation !== "reload") {
+          const rest = (pendingReloads.get(conversationId) ?? []).filter(entry => entry !== reloadEntry);
+          if (rest.length) pendingReloads.set(conversationId, rest);
+          else pendingReloads.delete(conversationId);
+        }
+      }
       retryRequests.delete(conversationId);
       stagedConfigurations.delete(conversationId);
       if (accepted.conversation) {
@@ -4358,7 +4433,11 @@ export function initChat(api = new ChatApiClient()): void {
           ? !retriedRequest && projectionEpoch === projectionEpochAtSubmit
             ? noteQueuedMessage(projection, { id: accepted.messageId, text, queuedAt: Date.now(), requestId, ...(attachmentRefs.length ? { attachments: attachmentRefs } : {}) }, queueRevisionAtSubmit)
             : removeAcceptedDraft(projection, requestId)
-          : confirmAcceptedDraft(projection, { requestId, messageId: accepted.messageId, text, ...(attachmentRefs.length ? { attachments: attachmentRefs } : {}) });
+          // A reload's row is published before its acceptance and retired
+          // with its outcome, which can precede the acceptance — even
+          // unobserved by this client, if it was away. It is the stream's
+          // to show, never recreated here.
+          : confirmAcceptedDraft(projection, { requestId, messageId: accepted.messageId, text, ...(attachmentRefs.length ? { attachments: attachmentRefs } : {}) }, { insert: accepted.operation !== "reload" });
         renderConfiguration();
         scheduleRender(true);
       }
@@ -4560,30 +4639,68 @@ export function initChat(api = new ChatApiClient()): void {
   // Refreshed in the background from the idle poll and after a conversation
   // selection settles — never inside the selection or creation path itself,
   // where an in-flight read has raced the chooser before.
-  const refreshBankedCommands = (agentId: string | undefined) => {
-    if (!agentId) return;
+  // The catalogs are re-read where they are used: a ready agent has no idle
+  // poll, so a page left open would otherwise keep the commands, models, and
+  // modes it banked while another client's `/reload` changed them. Opening
+  // a slash query or the configuration picker refreshes them in the
+  // background; the open surface re-renders when the lists land. Every
+  // open reads — they are user actions — and overlapping reads are safe:
+  // only the latest one's answers are installed (LatestRefresh below), so
+  // a read begun before another client's reload cannot outlast the one this
+  // open started after it.
+  const refreshCatalogsOnUse = () => {
+    const agentId = contextAgentId;
+    if (agentId) void refreshBankedCommands(agentId);
+  };
+
+  // Refreshes can overlap (a slash query's, then a reload's): only the
+  // latest one's answers are installed, or a pre-reload list landing late
+  // would overwrite the reloaded one.
+  const catalogRefreshes = new LatestRefresh();
+  // Settles once every read it started has landed or failed.
+  const refreshBankedCommands = (agentId: string | undefined): Promise<void> => {
+    if (!agentId) return Promise.resolve();
     const banked = agentCatalogs.get(agentId);
-    if (!banked) return;
+    if (!banked) return Promise.resolve();
+    const latest = catalogRefreshes.begin(agentId);
+    const current = () => agentCatalogs.get(agentId) === banked && latest();
+    const reads: Promise<unknown>[] = [];
     if (agent?.capabilities.includes("commands") || agent?.capabilities.includes("reversible-history")) {
-      void api.commands(agentId).then(list => {
-        if (agentCatalogs.get(agentId) !== banked) return;
+      reads.push(api.commands(agentId).then(list => {
+        if (!current()) return;
         banked.commands = list;
         banked.commandInventoryAvailable = true;
-        if (contextAgentId === agentId) commands = list;
-      }).catch(() => undefined);
+        if (contextAgentId === agentId) {
+          commands = list;
+          if (slashQueryActive) renderCommandMenu();
+        }
+      }).catch(() => undefined));
     }
     // Models change under a running page too — a Claude Code update ships
     // new entries — so the banked model list refreshes on the same cadence.
     if (agent?.capabilities.includes("models")) {
-      void api.models(agentId).then(list => {
-        if (agentCatalogs.get(agentId) !== banked || list.length === 0) return;
+      reads.push(api.models(agentId).then(list => {
+        if (!current() || list.length === 0) return;
         banked.models = list;
         if (contextAgentId === agentId) {
           models = list;
           renderConfiguration();
         }
-      }).catch(() => undefined);
+      }).catch(() => undefined));
     }
+    // Modes too: OpenCode's agents are its configuration, which a reload
+    // (or an edit picked up on restart) changes under a running page.
+    if (agent?.capabilities.includes("modes")) {
+      reads.push(api.modes(agentId).then(list => {
+        if (!current() || list.length === 0) return;
+        banked.modes = list;
+        if (contextAgentId === agentId) {
+          modes = list;
+          renderConfiguration();
+        }
+      }).catch(() => undefined));
+    }
+    return Promise.all(reads).then(() => undefined);
   };
 
   const refreshIdleAgentContext = () => {

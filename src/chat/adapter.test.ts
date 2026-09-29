@@ -13,7 +13,7 @@ import type {
   StoredMessageAccounting,
 } from "./provider";
 import { ReversibleHistoryTargetError, UnsupportedVariantSelectionError } from "./provider";
-import type { ChatEvent, ChatModel, ConversationItem, ToolItem, ModelSelection, ReversibleHistoryResult, ReversibleHistoryState } from "./types";
+import type { ChatCommand, ChatEvent, ChatModel, ConversationItem, ToolItem, ModelSelection, ReversibleHistoryResult, ReversibleHistoryState } from "./types";
 import { ConversationNotFoundError } from "./workspace";
 import { MetricsRegistry } from "../debug/metrics";
 import type { ConversationInventorySubscription } from "./inventory-broadcaster";
@@ -71,7 +71,8 @@ class FakeProvider implements ChatProvider {
   eventQueue = new EventQueue();
   notificationLifecycle = new OpenCodeNotificationLifecycle();
   prompts: Array<{ sessionId: string; id: string; text: string; delivery: "queue"; mode?: string; variant?: string; attachments?: import("./provider").ProviderAttachment[] }> = [];
-  commandCalls: Array<{ sessionId: string; id: string; name: string; arguments: string; model?: ModelSelection }> = [];
+  commandOperation?: "reload";
+  commandCalls: Array<{ sessionId: string; id: string; name: string; arguments: string; listed?: ChatCommand; model?: ModelSelection }> = [];
   permissionReplies: Array<{ sessionId: string; requestId: string; reply: ProviderPermissionReply }> = [];
   questionReplies: Array<{ sessionId: string; requestId: string; answers?: string[][]; rejected?: true }> = [];
   interrupts: string[] = [];
@@ -133,9 +134,11 @@ class FakeProvider implements ChatProvider {
     this.prompts.push({ sessionId, ...input });
     return { messageId: input.id };
   }
-  async command(sessionId: string, input: { id: string; name: string; arguments: string; model?: ModelSelection }) {
+  // What a command's row reads as when the provider sent something else.
+  commandText: string | undefined;
+  async command(sessionId: string, input: { id: string; name: string; arguments: string; listed?: ChatCommand; model?: ModelSelection }) {
     this.commandCalls.push({ sessionId, ...input });
-    return { messageId: input.id };
+    return { messageId: input.id, ...(this.commandText ? { text: this.commandText } : {}), ...(this.commandOperation ? { operation: this.commandOperation } : {}) };
   }
   async interrupt(sessionId: string) { this.interrupts.push(sessionId); }
   async replyPermission(sessionId: string, requestId: string, reply: ProviderPermissionReply) {
@@ -1720,10 +1723,19 @@ describe("prompt, abort, permission, and question mutations", () => {
 
   test("recognizes only well-formed listed slash commands and separates arguments", () => {
     const commands = new FakeProvider().commands;
-    expect(parseSlashCommand("/review   routing behavior ", commands)).toEqual({ name: "review", arguments: "routing behavior" });
+    expect(parseSlashCommand("/review   routing behavior ", commands)).toMatchObject({ name: "review", arguments: "routing behavior" });
     for (const text of ["/unknown args", "/ review", "//review", "prefix /review"]) {
       expect(parseSlashCommand(text, commands)).toBeUndefined();
     }
+  });
+
+  test("the acceptance carries the operation the provider says it ran", async () => {
+    const provider = new FakeProvider();
+    provider.sessions = [fixtureSession("session")];
+    provider.commandOperation = "reload";
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g", id: () => "message" });
+    const accepted = await adapter.prompt("session", "request", "/review");
+    expect(accepted).toMatchObject({ messageId: "message", held: false, operation: "reload" });
   });
 
   test("dispatches recognized slash commands without changing the prompt contract", async () => {
@@ -1734,12 +1746,26 @@ describe("prompt, abort, permission, and question mutations", () => {
 
     const accepted = await adapter.prompt("session", "request", "/review   API compatibility", model);
     expect(accepted).toEqual({ messageId: "message", held: false, configuration: { model } });
-    expect(provider.commandCalls).toEqual([{ sessionId: "session", id: "message", name: "review", arguments: "API compatibility", model }]);
+    // The listed entry the text matched rides along, so the provider dispatches what was classified.
+    expect(provider.commandCalls).toEqual([{ sessionId: "session", id: "message", name: "review", arguments: "API compatibility", listed: expect.objectContaining({ name: "review", kind: "command" }), model }]);
     expect(provider.prompts).toEqual([]);
 
     adapter.projectionForTests("session").statusUpdate("completed");
     await adapter.prompt("session", "ordinary", "/missing stays ordinary");
     expect(provider.prompts[0]).toEqual(expect.objectContaining({ text: "/missing stays ordinary" }));
+  });
+
+  test("a command's row reads as the text the provider says it sent, whichever row lands first", async () => {
+    const provider = new FakeProvider();
+    provider.sessions = [fixtureSession("session")];
+    provider.commandText = "@review focus";
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g", id: () => "message" });
+    // The provider's own row can land before the acceptance does.
+    adapter.projectionForTests("session").upsert({ id: "message:message", type: "user_message", createdAt: 1, text: "@review focus", requestId: "message" });
+    await adapter.prompt("session", "request", "/review focus");
+    const rows = adapter.projectionForTests("session").items().filter(item => item.type === "user_message");
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ id: "message:message", text: "@review focus" });
   });
 
   test("derives concise titles without reducing numeric prompts to a generic label", () => {

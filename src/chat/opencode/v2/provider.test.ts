@@ -27,7 +27,10 @@ type Handler = (call: Call) => unknown;
 // routes, a tagged JSON error for a missing session, SSE on `/api/event`.
 function fakeOpenCode(routes: Record<string, Handler>) {
   const calls: Call[] = [];
-  const patterns = Object.entries(routes).map(([pattern, handler]) => {
+  // Every slash dispatch reads both catalogs; a test that does not care
+  // about them serves empty ones.
+  const catalogs: Record<string, Handler> = { "GET /api/command": () => scoped([]), "GET /api/skill": () => scoped([]) };
+  const patterns = Object.entries({ ...catalogs, ...routes }).map(([pattern, handler]) => {
     const [method, route] = pattern.split(" ") as [string, string];
     const regex = new RegExp(`^${route.replace(/:[a-zA-Z]+/g, "[^/]+")}$`);
     return { method, regex, handler };
@@ -47,7 +50,7 @@ function fakeOpenCode(routes: Record<string, Handler>) {
     // list routes answer their own shapes, which it returns whole.
     return Response.json(ENVELOPED.some(pattern => pattern.test(`${request.method} ${url.pathname}`)) ? { data: result } : result);
   }) as typeof globalThis.fetch;
-  const provider = (directory = WORKSPACE, options: { commandAdmissionMs?: number } = {}) => createOpenCodeV2Provider({ endpoint: "http://opencode.test", password: "pw", directory, fetch, ...options }) as OpenCodeV2Provider;
+  const provider = (directory = WORKSPACE, options: { commandAdmissionMs?: number; reloadSettleMs?: number } = {}) => createOpenCodeV2Provider({ endpoint: "http://opencode.test", password: "pw", directory, fetch, ...options }) as OpenCodeV2Provider;
   const requests = (method: string, pathname: string) => calls.filter(call => call.method === method && call.path === pathname);
   return { calls, provider, requests };
 }
@@ -66,6 +69,7 @@ function session(id: string, overrides: Record<string, unknown> = {}) {
 }
 
 const scoped = <T>(data: T) => ({ location: { directory: WORKSPACE }, data });
+const skillInfo = (id: string, overrides: { name?: string; description?: string } = {}) => ({ id, name: overrides.name ?? id, ...(overrides.description ? { description: overrides.description } : {}), path: `/ws/.opencode/skills/${id}/SKILL.md`, content: `# ${id}` });
 const notFound = (sessionID: string) => Response.json({ _tag: "SessionNotFoundError", sessionID, message: `Session not found: ${sessionID}` }, { status: 404 });
 
 describe("OpenCode 2.x provider: identity and catalogs", () => {
@@ -79,6 +83,15 @@ describe("OpenCode 2.x provider: identity and catalogs", () => {
   test("every catalog call is scoped to the workspace directory and authenticated", async () => {
     const server = fakeOpenCode({
       "GET /api/command": () => scoped([{ name: "review", description: "review changes" }, { name: "bad name" }, { name: "review" }]),
+      // 2.x keeps skills apart from commands: listed under their id, a
+      // config command's name wins, and so does a skill's over a built-in.
+      "GET /api/skill": () => scoped([
+        skillInfo("openspec-apply-change", { description: "Apply a change" }),
+        skillInfo("review", { description: "shadowed by the config command" }),
+        skillInfo("pdf", { name: "PDF tools", description: "Work with PDFs" }),
+        skillInfo("compact", { description: "shadows the built-in" }),
+        skillInfo("bad id"),
+      ]),
       "GET /api/agent": () => scoped([
         { id: "build", name: "Build", description: "The default agent", mode: "primary", hidden: false },
         { id: "plan", name: "Plan", description: "Plans", mode: "primary", hidden: false },
@@ -89,7 +102,10 @@ describe("OpenCode 2.x provider: identity and catalogs", () => {
     const provider = server.provider();
     expect(await provider.listCommands()).toEqual([
       { name: "review", description: "review changes", argumentHint: "", kind: "command" },
-      { name: "compact", description: "Compact the conversation context", argumentHint: "", kind: "command" },
+      { name: "openspec-apply-change", description: "Apply a change", argumentHint: "", kind: "skill" },
+      { name: "pdf", description: "PDF tools — Work with PDFs", argumentHint: "", kind: "skill" },
+      { name: "compact", description: "shadows the built-in", argumentHint: "", kind: "skill" },
+      { name: "reload", description: "Reload OpenCode's configuration for this workspace", argumentHint: "", kind: "command" },
     ]);
     expect(await provider.listModes()).toEqual([
       { name: "build", description: "The default agent" },
@@ -327,6 +343,227 @@ describe("OpenCode 2.x provider: prompting and events", () => {
     expect(compaction.messageId).toMatch(/^msg_[0-9a-f]{26}$/);
     expect(compaction.messageId).not.toBe(command.messageId);
     expect(server.requests("POST", "/api/session/ses_1/interrupt")).toHaveLength(1);
+  });
+
+  test("a skill runs as a prompt carrying the skill, its text opening with the mention", async () => {
+    const server = fakeOpenCode({
+      "GET /api/skill": () => scoped([skillInfo("openspec-apply-change")]),
+      "POST /api/session/:id/prompt": ({ body }) => ({ id: (body as { id: string }).id, sessionID: "ses_1", time: { created: 1 }, type: "user", payload: {}, delivery: "queue" }),
+    });
+    const provider = server.provider();
+    const withArguments = await provider.command("ses_1", { id: "req-s1", name: "openspec-apply-change", arguments: "my-change" });
+    const bare = await provider.command("ses_1", { id: "req-s2", name: "openspec-apply-change", arguments: "" });
+    // The row reads as what was sent, so the adapter's acceptance agrees with the stream's.
+    expect(withArguments.text).toBe("@openspec-apply-change my-change");
+    expect(bare.text).toBe("@openspec-apply-change");
+    const prompts = server.requests("POST", "/api/session/ses_1/prompt");
+    const mention = { start: 0, end: 22, text: "@openspec-apply-change" };
+    expect(prompts[0]?.body).toEqual({ id: withArguments.messageId, text: "@openspec-apply-change my-change", skills: [{ id: "openspec-apply-change", mention }], delivery: "queue", resume: true });
+    expect(prompts[1]?.body).toEqual({ id: bare.messageId, text: "@openspec-apply-change", skills: [{ id: "openspec-apply-change", mention }], delivery: "queue", resume: true });
+    expect(server.requests("POST", "/api/session/ses_1/command")).toHaveLength(0);
+  });
+
+  test("a config command of the same name runs as a command, not the skill", async () => {
+    const server = fakeOpenCode({
+      "GET /api/command": () => scoped([{ name: "review" }]),
+      "GET /api/skill": () => scoped([skillInfo("review")]),
+      "POST /api/session/:id/command": () => undefined,
+    });
+    await server.provider().command("ses_1", { id: "req-r", name: "review", arguments: "branch" });
+    expect(server.requests("POST", "/api/session/ses_1/command")[0]?.body).toEqual({ name: "review", text: "branch", delivery: "queue" });
+    expect(server.requests("POST", "/api/session/ses_1/prompt")).toHaveLength(0);
+  });
+
+  test("a skill gone from the catalog at dispatch is refused by the server, never sent as prose", async () => {
+    const server = fakeOpenCode({
+      "POST /api/session/:id/command": () => Response.json({ _tag: "CommandNotFoundError", message: "Command not found: gone-skill" }, { status: 404 }),
+    });
+    await expect(server.provider().command("ses_1", { id: "req-g", name: "gone-skill", arguments: "" })).rejects.toThrow("gone-skill");
+    expect(server.requests("POST", "/api/session/ses_1/prompt")).toHaveLength(0);
+  });
+
+  // A reload as the pinned client sees it: the reply, then (as a real 2.x
+  // server does) the rebuilt location announcing its catalogs.
+  async function reloadHarness(reply: () => unknown, options: { reloadSettleMs?: number } = {}) {
+    const events = pushableEvents();
+    const server = fakeOpenCode({ "GET /api/event": events.route, "POST /api/location/reload": reply });
+    const provider = server.provider(WORKSPACE, options);
+    const controller = new AbortController();
+    const seen: string[] = [];
+    const pump = (async () => {
+      for await (const event of provider.events(controller.signal)) for (const update of event.updates) {
+        if (update.kind === "upsert" && update.item.type === "notice") seen.push(`notice ${update.item.level} ${update.item.message}`);
+        if (update.kind === "remove") seen.push(`remove ${update.itemId}`);
+        if (update.kind === "status") seen.push(`status ${update.status}`);
+      }
+    })();
+    await Bun.sleep(10); // the stream is live once its first frame has arrived
+    const announce = (type: string, directory = WORKSPACE) => events.frame({ id: `evt_${type}_${directory}`, created: 9, type, location: { directory }, data: {} });
+    const settle = async (count: number) => {
+      const deadline = Date.now() + 2_000;
+      while (seen.length < count && Date.now() < deadline) await Bun.sleep(5);
+    };
+    const stop = async () => { controller.abort(); await pump; };
+    return { server, provider, seen, announce, settle, stop };
+  }
+
+  test("/reload applies staged model and mode before reloading, since the adapter commits them", async () => {
+    const server = fakeOpenCode({
+      "POST /api/session/:id/model": () => undefined,
+      "POST /api/session/:id/agent": () => undefined,
+      "POST /api/location/reload": () => undefined,
+    });
+    const provider = server.provider(WORKSPACE, { reloadSettleMs: 20 });
+    await provider.command("ses_1", { id: "req-reload-staged", name: "reload", arguments: "", model: { providerId: "berget", modelId: "think" }, mode: "plan", variant: "high" });
+    const deadline = Date.now() + 2_000;
+    while (server.requests("POST", "/api/location/reload").length === 0 && Date.now() < deadline) await Bun.sleep(5);
+    expect(server.calls.map(call => `${call.method} ${call.path}`).filter(call => call.startsWith("POST"))).toEqual([
+      "POST /api/session/ses_1/model",
+      "POST /api/session/ses_1/agent",
+      "POST /api/location/reload",
+    ]);
+    expect(server.requests("POST", "/api/session/ses_1/agent")[0]?.body).toEqual({ agent: "plan" });
+  });
+
+  test("/reload reports success once the rebuilt location announces its catalogs", async () => {
+    const harness = await reloadHarness(() => undefined);
+    const accepted = await harness.provider.command("ses_1", { id: "req-reload", name: "reload", arguments: "" });
+    // The acceptance says what ran, so clients need not guess from their catalogs.
+    expect(accepted.operation).toBe("reload");
+    await harness.settle(1);
+    expect(harness.seen).toEqual(["notice info Reloading OpenCode configuration…"]);
+    // Another directory's rebuild, and this one's announcements before its
+    // shutdown, say nothing about this workspace's reload.
+    harness.announce("location.shutdown", "/elsewhere");
+    harness.announce("command.updated", "/elsewhere");
+    harness.announce("skill.updated", "/elsewhere");
+    harness.announce("skill.updated");
+    await Bun.sleep(40);
+    expect(harness.seen).toHaveLength(1);
+    harness.announce("location.shutdown");
+    harness.announce("command.updated");
+    harness.announce("skill.updated");
+    await Bun.sleep(40);
+    // Commands and skills alone are not the whole rebuild: models and modes too.
+    expect(harness.seen).toHaveLength(1);
+    harness.announce("model.updated");
+    harness.announce("agent.updated");
+    await harness.settle(4);
+    expect(harness.seen.slice(1)).toEqual([`remove message:${accepted.messageId}`, "notice info Configuration reloaded", "status completed"]);
+    expect(harness.server.requests("POST", "/api/location/reload")).toHaveLength(1);
+    // The server's configuration, not the conversation: no session route.
+    expect(harness.server.calls.filter(call => call.path.startsWith("/api/session/"))).toHaveLength(0);
+    await harness.stop();
+  });
+
+  test("concurrent /reloads run one at a time, each settled by its own rebuild", async () => {
+    const harness = await reloadHarness(() => undefined);
+    await harness.provider.command("ses_1", { id: "req-first", name: "reload", arguments: "" });
+    await harness.provider.command("ses_2", { id: "req-second", name: "reload", arguments: "" });
+    await Bun.sleep(40);
+    // The second waits for the first: its waiter must not see the first rebuild.
+    expect(harness.server.requests("POST", "/api/location/reload")).toHaveLength(1);
+    const done = () => harness.seen.filter(line => line === "notice info Configuration reloaded").length;
+    const rebuild = () => ["location.shutdown", "command.updated", "skill.updated", "model.updated", "agent.updated"].forEach(type => harness.announce(type));
+    rebuild();
+    const deadline = Date.now() + 2_000;
+    while (done() < 1 && Date.now() < deadline) await Bun.sleep(5);
+    expect(done()).toBe(1);
+    while (harness.server.requests("POST", "/api/location/reload").length < 2 && Date.now() < deadline) await Bun.sleep(5);
+    expect(harness.server.requests("POST", "/api/location/reload")).toHaveLength(2);
+    await Bun.sleep(40);
+    // Its reply alone does not settle it.
+    expect(done()).toBe(1);
+    rebuild();
+    while (done() < 2 && Date.now() < deadline + 2_000) await Bun.sleep(5);
+    expect(done()).toBe(2);
+    await harness.stop();
+  });
+
+  test("/reload that OpenCode never confirms is reported as unconfirmed, not reloaded", async () => {
+    const harness = await reloadHarness(() => undefined, { reloadSettleMs: 60 });
+    const started = Date.now();
+    await harness.provider.command("ses_1", { id: "req-quiet", name: "reload", arguments: "" });
+    await harness.settle(4);
+    expect(Date.now() - started).toBeGreaterThanOrEqual(55);
+    expect(harness.seen[2]).toStartWith("notice warning Reload sent, but OpenCode did not confirm its reloaded configuration");
+    // Not the success path: the invoking client must not bank catalogs mid-rebuild.
+    expect(harness.seen[3]).toBe("status failed");
+    expect(harness.seen).not.toContain("notice info Configuration reloaded");
+    await harness.stop();
+  });
+
+  test("/reload reports OpenCode's failure at once, with its message", async () => {
+    const harness = await reloadHarness(() => Response.json({ _tag: "ServiceUnavailableError", service: "location", message: "bad config: opencode.json" }, { status: 503 }));
+    const accepted = await harness.provider.command("ses_1", { id: "req-bad", name: "reload", arguments: "" });
+    await harness.settle(4);
+    expect(harness.seen).toEqual([
+      "notice info Reloading OpenCode configuration…",
+      `remove message:${accepted.messageId}`,
+      "notice error Reloading the configuration failed: bad config: opencode.json",
+      "status failed",
+    ]);
+    await harness.stop();
+  });
+
+  test("a skill or config command named compact runs as listed, not as compaction", async () => {
+    const skillServer = fakeOpenCode({
+      "GET /api/skill": () => scoped([skillInfo("compact")]),
+      "POST /api/session/:id/prompt": ({ body }) => ({ id: (body as { id: string }).id, sessionID: "ses_1", time: { created: 1 }, type: "user", payload: {}, delivery: "queue" }),
+    });
+    const accepted = await skillServer.provider().command("ses_1", { id: "req-cs", name: "compact", arguments: "" });
+    expect(accepted.text).toBe("@compact");
+    expect(skillServer.requests("POST", "/api/session/ses_1/compact")).toHaveLength(0);
+
+    const commandServer = fakeOpenCode({ "GET /api/command": () => scoped([{ name: "compact" }]), "POST /api/session/:id/command": () => undefined });
+    await commandServer.provider().command("ses_1", { id: "req-cc", name: "compact", arguments: "" });
+    expect(commandServer.requests("POST", "/api/session/ses_1/command")[0]?.body).toEqual({ name: "compact", text: "", delivery: "queue" });
+    expect(commandServer.requests("POST", "/api/session/ses_1/compact")).toHaveLength(0);
+  });
+
+  test("dispatch runs the entry the text was classified against, whatever a later listing says", async () => {
+    let skills = [skillInfo("compact")];
+    let commands: Array<{ name: string }> = [{ name: "reload" }];
+    const server = fakeOpenCode({
+      "GET /api/skill": () => scoped(skills),
+      "GET /api/command": () => scoped(commands),
+      "POST /api/session/:id/prompt": () => Response.json({ _tag: "SkillNotFoundError", skill: "compact", message: "Skill not found: compact" }, { status: 404 }),
+      "POST /api/session/:id/command": () => Response.json({ _tag: "CommandNotFoundError", message: "Command not found: reload" }, { status: 404 }),
+    });
+    const provider = server.provider();
+    const classified = await provider.listCommands();
+    const compactSkill = classified.find(entry => entry.name === "compact")!;
+    const reloadCommand = classified.find(entry => entry.name === "reload")!;
+    expect(compactSkill.kind).toBe("skill");
+    // Both entries vanish, and another dispatch's listing now names the built-ins.
+    skills = [];
+    commands = [];
+    const later = await provider.listCommands();
+    expect(later.filter(entry => entry.name === "compact" || entry.name === "reload").map(entry => entry.kind)).toEqual(["command", "command"]);
+    await expect(provider.command("ses_1", { id: "req-gone-skill", name: "compact", arguments: "", listed: compactSkill })).rejects.toThrow("Skill not found");
+    await expect(provider.command("ses_1", { id: "req-gone-command", name: "reload", arguments: "", listed: reloadCommand })).rejects.toThrow("Command not found");
+    // Sent as what the user chose, refused by OpenCode — never the built-ins.
+    expect(server.requests("POST", "/api/session/ses_1/compact")).toHaveLength(0);
+    expect(server.requests("POST", "/api/location/reload")).toHaveLength(0);
+    // Dispatch reads no catalogs of its own when handed the entry.
+    expect(server.requests("GET", "/api/skill")).toHaveLength(2);
+  });
+
+  test("a built-in entry handed back dispatches as the built-in", async () => {
+    const server = fakeOpenCode({ "POST /api/location/reload": () => undefined });
+    const provider = server.provider();
+    const builtin = (await provider.listCommands()).find(entry => entry.name === "reload")!;
+    await provider.command("ses_1", { id: "req-builtin", name: "reload", arguments: "", listed: builtin });
+    await Bun.sleep(20);
+    expect(server.requests("POST", "/api/location/reload")).toHaveLength(1);
+  });
+
+  test("a config command named reload shadows the built-in", async () => {
+    const server = fakeOpenCode({ "GET /api/command": () => scoped([{ name: "reload" }]), "POST /api/session/:id/command": () => undefined });
+    const accepted = await server.provider().command("ses_1", { id: "req-cr", name: "reload", arguments: "" });
+    expect(accepted.operation).toBeUndefined();
+    expect(server.requests("POST", "/api/session/ses_1/command")).toHaveLength(1);
+    expect(server.requests("POST", "/api/location/reload")).toHaveLength(0);
   });
 
   // The stream as the pinned client reads it, with a handle to push frames

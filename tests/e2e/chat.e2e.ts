@@ -200,6 +200,140 @@ test.describe("desktop OpenCode chat", () => {
     await expect(page.locator("#chat-items")).toContainText("/review API routes");
   });
 
+  test("labels skills in the palette and follows /reload with fresh catalogs", async ({ page, request }, testInfo) => {
+    const reload = { name: "reload", description: "Reload OpenCode's configuration for this workspace", argumentHint: "", kind: "command" };
+    await control(request, { action: "commands", commands: [reload] });
+    const seeded = await control(request, { action: "seed", title: "Reload", items: [] }) as { conversation: { id: string } };
+    await page.reload();
+    await openChatPanel(page);
+    const input = page.locator("#chat-input");
+    const menu = page.locator("#chat-command-menu");
+    // A skill carries its label; a command does not.
+    await input.fill("/");
+    await expect(menu.getByRole("option", { name: /openspec-archive-change/ }).locator(".chat-command-kind")).toHaveText("skill");
+    await expect(menu.getByRole("option", { name: /\/review/ }).locator(".chat-command-kind")).toHaveCount(0);
+    await input.fill("/openspec");
+    await captureScreenshot(page, testInfo, "slash-command-skill-label");
+
+    // The configuration changes behind the page; /reload brings it in
+    // without a page reload.
+    await control(request, { action: "commands", commands: [reload, { name: "fresh-skill", description: "Added after the page loaded", argumentHint: "", kind: "skill" }] });
+    await control(request, { action: "modes", modes: [{ name: "build", description: "Full read-write mode" }, { name: "plan", description: "Read-only planning mode" }, { name: "audit", description: "Added by the reload" }] });
+    // Arguments do not stop it being a reload; the completed turn re-reads
+    // the catalogs before the palette is opened again.
+    await input.fill("/reload now");
+    await page.keyboard.press("Escape");
+    await page.locator("#chat-send").click();
+    await expect(page.locator("#chat-items")).toContainText("/reload now");
+    const reread = page.waitForResponse(response => response.url().includes("/chat/commands"));
+    await control(request, { action: "status", conversationId: seeded.conversation.id, status: "completed" });
+    await reread;
+    await input.fill("/fresh");
+    await expect(menu.getByRole("option", { name: /fresh-skill/ })).toBeVisible();
+    await expect(menu.getByRole("option", { name: /fresh-skill/ }).locator(".chat-command-kind")).toHaveText("skill");
+    await page.keyboard.press("Escape");
+    await input.fill("");
+    await openChatConfiguration(page);
+    await expect(page.locator("#chat-configuration-mode")).toContainText(/audit/i);
+  });
+
+  test("a /reload queued behind a running turn re-reads the catalogs when it completes, not when that turn does", async ({ page, request }) => {
+    const reload = { name: "reload", description: "Reload OpenCode's configuration for this workspace", argumentHint: "", kind: "command" };
+    await control(request, { action: "commands", commands: [reload] });
+    await page.reload();
+    await openChatPanel(page);
+    await page.getByRole("button", { name: "New conversation" }).click();
+    await expect(page.locator("#chat-conversation-select")).not.toHaveValue("");
+    const conversationId = await page.locator("#chat-conversation-select").inputValue();
+    const input = page.locator("#chat-input");
+    const send = async (text: string) => {
+      await input.fill(text);
+      // A slash text opens the palette, whose Enter would choose rather than send.
+      if (await page.locator("#chat-command-menu").isVisible()) await page.keyboard.press("Escape");
+      const accepted = page.waitForResponse(response => response.url().endsWith("/prompts"));
+      await input.press("Enter");
+      await accepted;
+    };
+    await send("Start the work");
+    await expect(page.locator("#chat-send")).toHaveAttribute("aria-label", "Cancel response");
+    await send("/reload");
+    await expect(page.locator("#chat-queue .is-held")).toHaveCount(1);
+    // The running turn ends; the held /reload is delivered and starts.
+    await control(request, { action: "status", conversationId, status: "completed" });
+    await expect(page.locator("#chat-queue .is-held")).toHaveCount(0);
+    // Only the reload's own completion re-reads the catalogs.
+    const reread = page.waitForResponse(response => response.url().includes("/chat/commands"), { timeout: 5_000 });
+    await control(request, { action: "status", conversationId, status: "completed" });
+    await reread;
+  });
+
+  test("two /reloads queued in one conversation each count their own completion", async ({ page, request }) => {
+    const reload = { name: "reload", description: "Reload OpenCode's configuration for this workspace", argumentHint: "", kind: "command" };
+    await control(request, { action: "commands", commands: [reload] });
+    await page.reload();
+    await openChatPanel(page);
+    await page.getByRole("button", { name: "New conversation" }).click();
+    await expect(page.locator("#chat-conversation-select")).not.toHaveValue("");
+    const conversationId = await page.locator("#chat-conversation-select").inputValue();
+    const input = page.locator("#chat-input");
+    const send = async (text: string) => {
+      await input.fill(text);
+      if (await page.locator("#chat-command-menu").isVisible()) await page.keyboard.press("Escape");
+      const accepted = page.waitForResponse(response => response.url().endsWith("/prompts"));
+      await input.press("Enter");
+      await accepted;
+    };
+    await send("Start the work");
+    await expect(page.locator("#chat-send")).toHaveAttribute("aria-label", "Cancel response");
+    await send("/reload");
+    await send("/reload");
+    await expect(page.locator("#chat-queue .is-held")).toHaveCount(2);
+    // The running turn ends; the first reload is delivered, the second waits.
+    await control(request, { action: "status", conversationId, status: "completed" });
+    await expect(page.locator("#chat-queue .is-held")).toHaveCount(1);
+    // The first reload's own completion re-reads, though the second is still queued.
+    const reread = page.waitForResponse(response => response.url().includes("/chat/commands"), { timeout: 5_000 });
+    await control(request, { action: "status", conversationId, status: "completed" });
+    await reread;
+  });
+
+  test("the first / after sending a slash command starts a fresh catalog read", async ({ page }) => {
+    await page.getByRole("button", { name: "New conversation" }).click();
+    await expect(page.locator("#chat-conversation-select")).not.toHaveValue("");
+    const input = page.locator("#chat-input");
+    await input.fill("/review");
+    await expect(page.locator("#chat-command-menu")).toBeVisible();
+    await page.keyboard.press("Escape");
+    const accepted = page.waitForResponse(response => response.url().endsWith("/prompts"));
+    await input.press("Enter");
+    await accepted;
+    await expect(input).toHaveValue("");
+    // Sending cleared the composer mid-query; the next / is a new query.
+    const read = page.waitForRequest(request => request.url().includes("/chat/commands"), { timeout: 5_000 });
+    await input.pressSequentially("/");
+    await read;
+  });
+
+  test("a page left open picks up catalogs changed elsewhere when the palette or picker opens", async ({ page, request }) => {
+    await page.getByRole("button", { name: "New conversation" }).click();
+    const input = page.locator("#chat-input");
+    const menu = page.locator("#chat-command-menu");
+    await input.fill("/");
+    await expect(menu.getByRole("option", { name: /openspec-archive-change/ })).toBeVisible();
+    await page.keyboard.press("Escape");
+    await input.fill("");
+    // Another client's /reload changed the configuration; this page has no
+    // idle poll once the agent is ready.
+    await control(request, { action: "commands", commands: [{ name: "late-skill", description: "Loaded after this page", argumentHint: "", kind: "skill" }] });
+    await control(request, { action: "modes", modes: [{ name: "build", description: "Full read-write mode" }, { name: "plan", description: "Read-only planning mode" }, { name: "audit", description: "Loaded after this page" }] });
+    await input.fill("/late");
+    await expect(menu.getByRole("option", { name: /late-skill/ })).toBeVisible();
+    await page.keyboard.press("Escape");
+    await input.fill("");
+    await openChatConfiguration(page);
+    await expect(page.locator("#chat-configuration-mode")).toContainText(/audit/i);
+  });
+
   test("wraps long slash-command descriptions in full and keeps the highlight in view", async ({ page, request }, testInfo) => {
     const long = (topic: string) => `${topic}: ${"Review the diff for correctness bugs, reuse, simplification, and efficiency cleanups at the chosen effort level, then report ranked findings. ".repeat(3)}End of ${topic}.`;
     await control(request, { action: "commands", commands: Array.from({ length: 6 }, (_, index) => ({

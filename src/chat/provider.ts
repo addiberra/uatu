@@ -278,7 +278,24 @@ export interface ChatProvider {
    */
   dispose?(): Promise<void>;
   prompt(sessionId: string, input: { id: string; text: string; delivery: "queue"; attachments?: ProviderAttachment[]; model?: ModelSelection; mode?: string; variant?: string }): Promise<{ messageId: string }>;
-  command(sessionId: string, input: { id: string; name: string; arguments: string; model?: ModelSelection; mode?: string; variant?: string }): Promise<{ messageId: string }>;
+  /**
+   * `text`, when set, is what the user's row reads as because the provider
+   * sent something other than the typed command — a 2.x skill runs as a
+   * prompt reading `@<skill> <args>`. The adapter's acceptance row takes it,
+   * so the row agrees with the provider's own restatement whichever lands
+   * first.
+   */
+  //
+  // `listed`, when the caller classified the text, is the entry of this
+  // provider's own `listCommands()` answer it matched: the provider
+  // dispatches by it rather than re-reading its catalogs, so an entry that
+  // changed in between still runs as what the user chose.
+  //
+  // `operation` names what actually ran when it was not an ordinary command
+  // turn: "reload" when the provider reloaded its server's configuration.
+  // Only the provider knows — a config command or skill named `reload`
+  // shadows the built-in — so clients key reload behavior off this answer.
+  command(sessionId: string, input: { id: string; name: string; arguments: string; listed?: ChatCommand; model?: ModelSelection; mode?: string; variant?: string }): Promise<{ messageId: string; text?: string; operation?: "reload" }>;
   interrupt(sessionId: string): Promise<void>;
   replyPermission(sessionId: string, requestId: string, reply: ProviderPermissionReply, choiceId?: string): Promise<void>;
   /**

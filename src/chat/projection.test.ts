@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { ChatEvent, ConversationSnapshot } from "./types";
 import { ConversationProjection } from "./adapter";
-import { addAcceptedDraft, applyChatEvent, dropQueuedMessage, noteQueuedMessage, prependSnapshot, projectionFromSnapshot, refreshFromSnapshot } from "./projection";
+import { addAcceptedDraft, applyChatEvent, confirmAcceptedDraft, dropQueuedMessage, noteQueuedMessage, prependSnapshot, projectionFromSnapshot, refreshFromSnapshot } from "./projection";
 import { ConversationReplay } from "./replay";
 
 const snapshot = (items: ConversationSnapshot["items"] = []): ConversationSnapshot => ({
@@ -31,6 +31,43 @@ describe("chat projection", () => {
     expect(state.acceptedDrafts).toHaveLength(1);
     const result = applyChatEvent(state, { generation: "g1", sequence: 5, conversationId: "c1", type: "item.upsert", item: { id: "message", type: "user_message", createdAt: 2, text: "hello", requestId: "request" } });
     expect(result.projection.acceptedDrafts).toEqual([]);
+  });
+
+  test("confirming a draft keeps the text of a row the stream already delivered", () => {
+    // A 2.x skill: typed `/skill args`, sent and streamed as `@skill args`.
+    const streamed = projectionFromSnapshot(snapshot([
+      { id: "message:msg_skill", type: "user_message", createdAt: 2, text: "@openspec-apply-change my-change", requestId: "request" },
+    ]));
+    const confirmed = confirmAcceptedDraft(streamed, { requestId: "request", messageId: "msg_skill", text: "/openspec-apply-change my-change" });
+    expect(confirmed.items).toHaveLength(1);
+    expect(confirmed.items[0]).toMatchObject({ id: "message:msg_skill", text: "@openspec-apply-change my-change", requestId: "request" });
+    // A sparse streamed row (no text yet) takes the draft's.
+    const sparse = projectionFromSnapshot(snapshot([{ id: "message:msg_s", type: "user_message", createdAt: 2, text: "" }]));
+    expect(confirmAcceptedDraft(sparse, { requestId: "r", messageId: "msg_s", text: "hello" }).items[0]).toMatchObject({ text: "hello", requestId: "r" });
+  });
+
+  test("an acceptance answering after the stream retired its row does not recreate it", () => {
+    // `/reload`: its row is removed with the outcome, which can beat the POST response.
+    let state = addAcceptedDraft(projectionFromSnapshot(snapshot()), { requestId: "request", messageId: "pending:request", text: "/reload" });
+    state = applyChatEvent(state, { generation: "g1", sequence: 5, conversationId: "c1", type: "item.upsert", item: { id: "message:msg_reload", type: "user_message", createdAt: 2, text: "/reload", requestId: "request" }, conversation: { ...snapshot().conversation, status: "running" } } as ChatEvent).projection;
+    state = applyChatEvent(state, { generation: "g1", sequence: 6, conversationId: "c1", type: "item.remove", itemId: "message:msg_reload" } as ChatEvent).projection;
+    const confirmed = confirmAcceptedDraft(state, { requestId: "request", messageId: "msg_reload", text: "/reload" });
+    expect(confirmed.items.filter(item => item.type === "user_message")).toEqual([]);
+    expect(confirmed.acceptedDrafts).toEqual([]);
+    // A row the stream restores later is no longer treated as retired.
+    const restored = applyChatEvent(state, { generation: "g1", sequence: 7, conversationId: "c1", type: "item.upsert", item: { id: "message:msg_reload", type: "user_message", createdAt: 2, text: "/reload" }, conversation: { ...snapshot().conversation, status: "idle" } } as ChatEvent).projection;
+    expect(restored.removedIds ?? []).not.toContain("message:msg_reload");
+  });
+
+  test("a reload's acceptance never creates its row, even if the removal was never observed", () => {
+    // Switched back after the outcome: the snapshot omits the row and no removal was seen.
+    const state = addAcceptedDraft(projectionFromSnapshot(snapshot()), { requestId: "request", messageId: "pending:request", text: "/reload" });
+    const confirmed = confirmAcceptedDraft(state, { requestId: "request", messageId: "msg_reload", text: "/reload" }, { insert: false });
+    expect(confirmed.items).toEqual([]);
+    expect(confirmed.acceptedDrafts).toEqual([]);
+    // A row the stream already shows is still confirmed in place.
+    const shown = projectionFromSnapshot(snapshot([{ id: "message:msg_reload", type: "user_message", createdAt: 2, text: "/reload" }]));
+    expect(confirmAcceptedDraft(shown, { requestId: "request", messageId: "msg_reload", text: "/reload" }, { insert: false }).items[0]).toMatchObject({ id: "message:msg_reload", requestId: "request" });
   });
 
   test("does not add an accepted marker after the matching message arrived first", () => {
