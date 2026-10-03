@@ -13,6 +13,7 @@ import { ClaudeProvider, normalizePlanUtilization, normalizeSessionTotals, taskO
 import type { QuestionRequest } from "../types";
 import { BackgroundTaskUnavailableError, ReleaseUnavailableError, ScheduledWakeupUnavailableError } from "../provider";
 import { claudeProjectDir } from "./transcript";
+import { contextReadout } from "../context-readout";
 
 class FakeQuery implements ClaudeQueryHandle {
   readonly emitted: unknown[] = [];
@@ -26,7 +27,8 @@ class FakeQuery implements ClaudeQueryHandle {
   supportedModels?: () => Promise<unknown>;
   supportedCommands?: () => Promise<unknown>;
   applyFlagSettings?: (settings: Record<string, unknown>) => Promise<void>;
-  getContextUsage?: () => Promise<unknown>;
+  getContextUsage?: (options?: { detail?: "summary" | "full" }) => Promise<unknown>;
+  setModel?: (model?: string) => Promise<void>;
   stopTask?: (taskId: string) => Promise<void>;
   usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET?: () => Promise<unknown>;
 
@@ -749,7 +751,8 @@ describe("catalog hydration probe", () => {
     expect(models.find(model => model.selection.modelId === "fable[1m]")?.contextLimit).toBe(1_000_000);
     expect(models.find(model => model.selection.modelId === "claude-opus-4-8")?.contextLimit).toBe(1_000_000);
     expect(models.find(model => model.selection.modelId === "claude-opus-4-6")?.contextLimit).toBe(200_000);
-    expect(models.find(model => model.selection.modelId === "sonnet")?.contextLimit).toBe(200_000);
+    expect(models.find(model => model.selection.modelId === "sonnet")?.contextLimit).toBe(1_000_000);
+    expect(models.find(model => model.selection.modelId === "haiku")?.contextLimit).toBe(200_000);
     // The control channel's command list rode the same probe, with
     // descriptions init's bare names cannot carry.
     expect(await provider.listCommands()).toEqual([
@@ -2714,9 +2717,10 @@ describe("ClaudeProvider sessions", () => {
 
   test("the live catalog replaces the manifest with real windows and effort levels", async () => {
     const { provider, queries } = fixture();
-    // Cold: the static fallback answers (Opus 5 runs the enlarged window on its plain id).
+    // Cold: the static fallback answers (Opus 5 and Sonnet 5 run the enlarged window on their plain ids).
     expect((await provider.listModels()).find(model => model.selection.modelId === "claude-opus-5")?.contextLimit).toBe(1_000_000);
-    expect((await provider.listModels()).find(model => model.selection.modelId === "claude-sonnet-5")?.contextLimit).toBe(200_000);
+    expect((await provider.listModels()).find(model => model.selection.modelId === "claude-sonnet-5")?.contextLimit).toBe(1_000_000);
+    expect((await provider.listModels()).find(model => model.selection.modelId === "claude-haiku-4-5-20251001")?.contextLimit).toBe(200_000);
 
     const session = await provider.createSession("x");
     const catalog = [
@@ -4983,5 +4987,636 @@ describe("scheduled wakeups hold, fire, release, and lose (claude-scheduled-wake
     expect(wakeupPromptMatches("check the build and… [+120 chars]", "check the build and then the deploy")).toBe(true);
     expect(wakeupPromptMatches("check the build", "check the build twice")).toBe(false);
     expect(wakeupPromptMatches("… [+5 chars]", "anything")).toBe(false);
+  });
+});
+
+describe("windows and the default as Claude Code states them (claude-context-windows-from-cli)", () => {
+  // The catalog as CLI 2.1.281 served it on 2026-10-01: no window field, the
+  // default resolving to the account default (Sonnet 5.5).
+  const currentCatalog = [
+    { value: "default", resolvedModel: "claude-sonnet-5-5", displayName: "Default (recommended)", description: "Sonnet 5.5 · Efficient for routine tasks", supportedEffortLevels: ["low", "medium", "high", "xhigh", "max"] },
+    { value: "opus", resolvedModel: "claude-opus-5-5", displayName: "Opus 5.5", description: "For complex work and everyday tasks", supportedEffortLevels: ["low", "medium", "high", "xhigh", "max"] },
+    { value: "fable[1m]", resolvedModel: "claude-fable-5-1", displayName: "Fable 5.1", description: "For your toughest challenges", supportedEffortLevels: ["low", "medium", "high", "xhigh"] },
+    { value: "sonnet", resolvedModel: "claude-sonnet-5-5", displayName: "Sonnet 5.5", description: "Most efficient for simpler tasks", supportedEffortLevels: ["low", "medium", "high", "xhigh", "max"] },
+    { value: "haiku", resolvedModel: "claude-haiku-4-5-20251001", displayName: "Haiku 4.5", description: "Fastest for quick answers" },
+  ];
+  // What the CLI states per model: the resolved id and its window.
+  const stated: Record<string, { model: string; maxTokens: number }> = {
+    opus: { model: "claude-opus-5-5", maxTokens: 1_000_000 },
+    "fable[1m]": { model: "claude-fable-5-1", maxTokens: 1_000_000 },
+    sonnet: { model: "claude-sonnet-5-5", maxTokens: 1_000_000 },
+    haiku: { model: "claude-haiku-4-5-20251001", maxTokens: 200_000 },
+    "claude-fable-5": { model: "claude-fable-5", maxTokens: 1_000_000 },
+    "claude-opus-4-8": { model: "claude-opus-4-8", maxTokens: 1_000_000 },
+    "claude-opus-4-7": { model: "claude-opus-4-7", maxTokens: 1_000_000 },
+    "claude-opus-4-6": { model: "claude-opus-4-6", maxTokens: 200_000 },
+    "claude-sonnet-4-6": { model: "claude-sonnet-4-6", maxTokens: 200_000 },
+  };
+
+  type Cli = {
+    // What an unpinned session runs in the workspace (settings applied).
+    unpinned?: { model: string; maxTokens: number };
+    // Per-model overrides: a hang, a throw, or an answer naming another model.
+    behave?: (model: string) => "hang" | "throw" | { model: string; maxTokens: number } | undefined;
+    controls?: boolean;
+    contextFails?: boolean;
+  };
+
+  function windowFixture(cli: Cli = {}, options: { windowReadTimeoutMs?: number; windowWalkBudgetMs?: number; windowReprobeCooldownMs?: number; defaultReadWaitMs?: number } = {}) {
+    const root = realpathSync.native(mkdtempSync(path.join(tmpdir(), "uatu-claude-windows-")));
+    const workspace = path.join(root, "workspace");
+    mkdirSync(workspace, { recursive: true });
+    const configDir = path.join(root, "config");
+    mkdirSync(claudeProjectDir(workspace, configDir), { recursive: true });
+    const queries: Array<FakeQuery & { modelCalls: Array<string | undefined>; contextReads: Array<string | undefined> }> = [];
+    const provider = new ClaudeProvider({
+      workspacePath: workspace,
+      stateFile: path.join(workspace, ".uatu-test-state.json"),
+      executable: "/usr/local/bin/claude",
+      configDir,
+      ...options,
+      queryFactory: input => {
+        const query = Object.assign(new FakeQuery(input), { modelCalls: [] as Array<string | undefined>, contextReads: [] as Array<string | undefined> });
+        query.supportedModels = async () => currentCatalog;
+        if (cli.controls !== false) {
+          let current: string | undefined;
+          query.setModel = async model => {
+            query.modelCalls.push(model);
+            current = model;
+          };
+          query.getContextUsage = async opts => {
+            query.contextReads.push(opts?.detail);
+            if (cli.contextFails) throw new Error("control channel closed");
+            const unpinned = cli.unpinned ?? { model: "claude-sonnet-5-5", maxTokens: 1_000_000 };
+            if (current === undefined) return { totalTokens: 14_000, ...unpinned };
+            const behaviour = cli.behave?.(current);
+            if (behaviour === "hang") return new Promise(() => undefined);
+            if (behaviour === "throw") throw new Error("unavailable");
+            const answer = behaviour ?? stated[current];
+            return answer ? { totalTokens: 14_000, ...answer, rawMaxTokens: answer.maxTokens } : { totalTokens: 14_000 };
+          };
+        }
+        queries.push(query);
+        return query;
+      },
+    });
+    return { provider, queries, workspace, configDir };
+  }
+
+  const find = (models: Awaited<ReturnType<ClaudeProvider["listModels"]>>, id: string) => models.find(model => model.selection.modelId === id)!;
+  type Served = Awaited<ReturnType<ClaudeProvider["listModels"]>>;
+  // The walk runs behind the catalog: read again until it has landed.
+  async function settled(provider: ClaudeProvider, landed: (models: Served) => boolean): Promise<Served> {
+    for (let attempt = 0; attempt < 400; attempt += 1) {
+      const models = await provider.listModels();
+      if (landed(models)) return models;
+      await Bun.sleep(5);
+    }
+    throw new Error("the window walk never landed");
+  }
+
+  test("every offered model carries the window Claude Code states, read before any turn without spending a call", async () => {
+    // This login runs Opus 4.6 at the enlarged window, which the fallback
+    // figure does not know: only a read can say so.
+    const { provider, queries } = windowFixture({ behave: model => (model === "claude-opus-4-6" ? { model: "claude-opus-4-6", maxTokens: 1_000_000 } : undefined) });
+    const models = await settled(provider, served => find(served, "claude-opus-4-6").contextLimit === 1_000_000);
+    expect(queries).toHaveLength(1);
+    const probe = queries[0]!;
+    // The probe closes once its walk is done.
+    await waitFor(() => probe.returned);
+    // The probe never prompted: no turn ran, and every read was a summary.
+    expect(probe.contextReads.every(detail => detail === "summary")).toBe(true);
+    expect(probe.contextReads.length).toBeGreaterThan(1);
+    // Sonnet 5.5 and Opus 5.5 under alias ids with no window marker: 1M,
+    // as stated — not the 200k an id heuristic would guess.
+    expect(find(models, "sonnet").contextLimit).toBe(1_000_000);
+    expect(find(models, "opus").contextLimit).toBe(1_000_000);
+    expect(find(models, "haiku").contextLimit).toBe(200_000);
+    // The app-only set is read too, and its detail states the read window.
+    expect(find(models, "claude-opus-4-7").contextLimit).toBe(1_000_000);
+    expect(find(models, "claude-opus-4-7").detail).toBe("claude-opus-4-7 · 1M context · offered by the Claude apps");
+    expect(find(models, "claude-opus-4-6").contextLimit).toBe(1_000_000);
+    expect(find(models, "claude-opus-4-6").detail).toBe("claude-opus-4-6 · 1M context · offered by the Claude apps");
+    expect(find(models, "claude-sonnet-4-6").detail).toBe("claude-sonnet-4-6 · 200k context · offered by the Claude apps");
+    // The first read named the default before any setModel.
+    expect(probe.modelCalls[0]).toBe("opus");
+    await provider.dispose();
+  });
+
+  test("reading windows never touches a live conversation's model, and a refresh keeps what was stated", async () => {
+    const { provider, queries } = windowFixture({ unpinned: { model: "claude-fable-5-1", maxTokens: 1_000_000 } });
+    await provider.listModels();
+    const session = await provider.createSession("x");
+    await provider.prompt(session.id, { id: "r1", text: "hello", delivery: "queue" });
+    const live = queries[1]!;
+    // The live session's own catalog refresh lands (captureModels).
+    await waitFor(() => live.contextReads.length === 0 && queries.length === 2);
+    await Bun.sleep(10);
+    const models = await provider.listModels();
+    expect(live.modelCalls).toEqual([]);
+    expect(find(models, "sonnet").contextLimit).toBe(1_000_000);
+    expect(find(models, "default").resolvesTo).toEqual({ providerId: "anthropic", modelId: "fable[1m]" });
+    // Still one probe: windows were read, nothing re-probes.
+    expect(queries).toHaveLength(2);
+    await provider.dispose();
+  });
+
+  test("a live session that filled the catalog first still gets one probe for windows and the default", async () => {
+    const { provider, queries } = windowFixture();
+    const session = await provider.createSession("x");
+    await provider.prompt(session.id, { id: "r1", text: "hello", delivery: "queue" });
+    // Let the live session's catalog capture land before the first picker read.
+    await Bun.sleep(10);
+    const first = await provider.listModels();
+    expect(queries).toHaveLength(2);
+    expect(find(first, "default").resolvesTo).toEqual({ providerId: "anthropic", modelId: "sonnet" });
+    await settled(provider, served => find(served, "claude-opus-4-7").detail?.includes("1M") === true);
+    await waitFor(() => queries[1]!.returned);
+    expect(queries[0]!.modelCalls).toEqual([]);
+    await provider.listModels();
+    expect(queries).toHaveLength(2);
+    await provider.dispose();
+  });
+
+  test("settings that override the account default are what the default presents", async () => {
+    const { provider } = windowFixture({ unpinned: { model: "claude-fable-5-1", maxTokens: 1_000_000 } });
+    const entry = find(await provider.listModels(), "default");
+    expect(entry.name).toBe("Default (recommended)");
+    expect(entry.default).toBe(true);
+    expect(entry.resolvesTo).toEqual({ providerId: "anthropic", modelId: "fable[1m]" });
+    // Named as Claude Code names its default: the model first.
+    expect(entry.detail).toBe("Fable 5.1 · For your toughest challenges");
+    expect(entry.variants).toEqual(["low", "medium", "high", "xhigh"]);
+    expect(entry.contextLimit).toBe(1_000_000);
+    // Effort validation follows what the default runs: max is not Fable's here.
+    const session = await provider.createSession("x");
+    await expect(provider.switchModel(session.id, { providerId: "anthropic", modelId: "default" }, "max")).rejects.toThrow();
+    await provider.switchModel(session.id, { providerId: "anthropic", modelId: "default" }, "xhigh");
+    await provider.dispose();
+  });
+
+  test("a default the catalog already names keeps its own description, measured by its stated window", async () => {
+    const { provider } = windowFixture({ unpinned: { model: "claude-sonnet-5-5", maxTokens: 1_000_000 } });
+    const entry = find(await provider.listModels(), "default");
+    expect(entry.resolvesTo).toEqual({ providerId: "anthropic", modelId: "sonnet" });
+    expect(entry.detail).toBe("Sonnet 5.5 · Efficient for routine tasks");
+    expect(entry.contextLimit).toBe(1_000_000);
+    await provider.dispose();
+  });
+
+  test("among window variants the default resolves to the one whose window it runs", async () => {
+    const catalogWithVariants = [...currentCatalog, { value: "fable", resolvedModel: "claude-fable-5-1", displayName: "Fable 5.1", description: "Fable at the standard window" }];
+    const { provider, queries } = windowFixture({
+      unpinned: { model: "claude-fable-5-1", maxTokens: 1_000_000 },
+      behave: model => (model === "fable" ? { model: "claude-fable-5-1", maxTokens: 200_000 } : undefined),
+    });
+    void queries;
+    // Swap in the catalog with both spellings for this provider's probe.
+    const original = currentCatalog.slice();
+    currentCatalog.splice(0, currentCatalog.length, ...catalogWithVariants);
+    try {
+      const entry = find(await provider.listModels(), "default");
+      expect(entry.resolvesTo).toEqual({ providerId: "anthropic", modelId: "fable[1m]" });
+    } finally {
+      currentCatalog.splice(0, currentCatalog.length, ...original);
+      await provider.dispose();
+    }
+  });
+
+  test("a default running the standard window resolves to the standard variant even when the 1M one is listed first", async () => {
+    const original = currentCatalog.slice();
+    // fable[1m] sits before fable in the catalog; both resolve to claude-fable-5-1.
+    currentCatalog.push({ value: "fable", resolvedModel: "claude-fable-5-1", displayName: "Fable 5.1", description: "Fable at the standard window", supportedEffortLevels: ["low", "medium", "high"] } as typeof currentCatalog[number]);
+    const { provider } = windowFixture({
+      unpinned: { model: "claude-fable-5-1", maxTokens: 200_000 },
+      behave: model => (model === "fable" ? { model: "claude-fable-5-1", maxTokens: 200_000 } : undefined),
+    });
+    try {
+      const served = await settled(provider, models => find(models, "fable").contextLimit === 200_000);
+      const entry = find(served, "default");
+      expect(entry.resolvesTo).toEqual({ providerId: "anthropic", modelId: "fable" });
+      expect(entry.detail).toBe("Fable 5.1 · Fable at the standard window");
+      expect(entry.variants).toEqual(["low", "medium", "high"]);
+    } finally {
+      currentCatalog.splice(0, currentCatalog.length, ...original);
+      await provider.dispose();
+    }
+  });
+
+  test("before the walk lands the default already picks its variant by window marker", async () => {
+    for (const [runsWindow, listedFirst, expected] of [[200_000, "fable[1m]", "fable"], [1_000_000, "fable", "fable[1m]"]] as const) {
+      const original = currentCatalog.slice();
+      const plain = { value: "fable", resolvedModel: "claude-fable-5-1", displayName: "Fable 5.1", description: "Fable at the standard window", supportedEffortLevels: ["low", "medium", "high"] } as typeof currentCatalog[number];
+      if (listedFirst === "fable") currentCatalog.splice(currentCatalog.findIndex(row => row.value === "fable[1m]"), 0, plain);
+      else currentCatalog.push(plain);
+      const { provider, queries } = windowFixture({ unpinned: { model: "claude-fable-5-1", maxTokens: runsWindow } });
+      try {
+        // Hold every model switch: the first answer is served before any window is stated.
+        let release!: () => void;
+        const gate = new Promise<void>(resolve => (release = resolve));
+        const pending = provider.listModels();
+        await waitFor(() => queries.length === 1);
+        const original = queries[0]!.setModel!;
+        queries[0]!.setModel = async model => { await gate; return original(model); };
+        const first = await pending;
+        expect(find(first, "fable").contextLimit).toBe(find(first, "fable[1m]").contextLimit);
+        expect(find(first, "default").resolvesTo).toEqual({ providerId: "anthropic", modelId: expected });
+        release();
+      } finally {
+        currentCatalog.splice(0, currentCatalog.length, ...original);
+        await provider.dispose();
+      }
+    }
+  });
+
+  test("an unpinned conversation's usage is measured against the variant the default runs, live and reopened", async () => {
+    const original = currentCatalog.slice();
+    // fable[1m] first, fable second: the alias join would pick fable[1m].
+    currentCatalog.push({ value: "fable", resolvedModel: "claude-fable-5-1", displayName: "Fable 5.1", description: "Fable at the standard window" } as typeof currentCatalog[number]);
+    const { provider, queries, workspace, configDir } = windowFixture({
+      unpinned: { model: "claude-fable-5-1", maxTokens: 200_000 },
+      behave: model => (model === "fable" ? { model: "claude-fable-5-1", maxTokens: 200_000 } : undefined),
+    });
+    const { events, stop } = collect(provider);
+    try {
+      const served = await settled(provider, models => find(models, "fable").contextLimit === 200_000);
+      expect(find(served, "default").resolvesTo).toEqual({ providerId: "anthropic", modelId: "fable" });
+      const carriers = () => events.flatMap(event => event.updates)
+        .filter(update => update.kind === "upsert")
+        .map(update => (update as { item: { type: string; usage?: unknown; model?: { modelId: string } } }).item)
+        .filter(item => item.type === "assistant_message" && item.usage !== undefined);
+      // Unpinned: the default's variant.
+      const unpinned = await provider.createSession("x");
+      await provider.prompt(unpinned.id, { id: "r1", text: "hello", delivery: "queue" });
+      const live = queries.at(-1)!;
+      live.push({ type: "assistant", uuid: "a1", timestamp: "2026-10-01T10:00:00.000Z",
+        message: { role: "assistant", model: "claude-fable-5-1", content: [{ type: "text", text: "hi" }], usage: { input_tokens: 3, output_tokens: 1 } } });
+      await waitFor(() => carriers().length > 0);
+      expect(carriers().at(-1)!.model?.modelId).toBe("fable");
+      const readout = contextReadout(carriers() as never, await provider.listModels(), undefined);
+      expect(readout?.limit).toBe(200_000);
+      // Pinned to fable[1m]: the alias join, untouched.
+      const pinned = await provider.createSession("y", { model: { providerId: "anthropic", modelId: "fable[1m]" } });
+      await provider.prompt(pinned.id, { id: "r2", text: "hello", delivery: "queue" });
+      const pinnedLive = queries.at(-1)!;
+      pinnedLive.push({ type: "assistant", uuid: "a2", timestamp: "2026-10-01T10:01:00.000Z",
+        message: { role: "assistant", model: "claude-fable-5-1", content: [{ type: "text", text: "hi" }], usage: { input_tokens: 3, output_tokens: 1 } } });
+      await waitFor(() => carriers().length > 1);
+      expect(carriers().at(-1)!.model?.modelId).toBe("fable[1m]");
+      // Reopened from native storage, unpinned: the default's variant too.
+      writeFileSync(path.join(claudeProjectDir(workspace, configDir), "reopened-default.jsonl"), [
+        { type: "user", uuid: "u1", parentUuid: null, isSidechain: false, timestamp: "2026-10-01T09:00:00Z", message: { role: "user", content: "hello" } },
+        { type: "assistant", uuid: "a9", parentUuid: "u1", isSidechain: false, timestamp: "2026-10-01T09:00:01Z", message: { role: "assistant", model: "claude-fable-5-1", content: [{ type: "text", text: "hi" }], usage: { input_tokens: 5, cache_read_input_tokens: 150_000, output_tokens: 1 } } },
+      ].map(entry => JSON.stringify(entry)).join("\n") + "\n");
+      const page = await provider.listMessages("reopened-default", { limit: 10 });
+      const reopened = page.items.find(item => item.type === "assistant_message" && (item as { usage?: unknown }).usage) as { model?: { modelId: string } };
+      expect(reopened.model?.modelId).toBe("fable");
+      expect(contextReadout(page.items, await provider.listModels(), undefined)?.limit).toBe(200_000);
+    } finally {
+      stop();
+      currentCatalog.splice(0, currentCatalog.length, ...original);
+      await provider.dispose();
+    }
+  });
+
+  test("an unpinned conversation on a default no entry lists is measured against the default's stated window", async () => {
+    const { provider, queries, workspace, configDir } = windowFixture({ unpinned: { model: "claude-experimental-9", maxTokens: 400_000 } });
+    const { events, stop } = collect(provider);
+    try {
+      const models = await provider.listModels();
+      expect(find(models, "default").contextLimit).toBe(400_000);
+      const session = await provider.createSession("x");
+      await provider.prompt(session.id, { id: "r1", text: "hello", delivery: "queue" });
+      queries.at(-1)!.push({ type: "assistant", uuid: "a1", timestamp: "2026-10-01T10:00:00.000Z",
+        message: { role: "assistant", model: "claude-experimental-9", content: [{ type: "text", text: "hi" }], usage: { input_tokens: 3, cache_read_input_tokens: 100_000, output_tokens: 1 } } });
+      const carriers = () => events.flatMap(event => event.updates)
+        .filter(update => update.kind === "upsert")
+        .map(update => (update as { item: { type: string; usage?: unknown; model?: { modelId: string } } }).item)
+        .filter(item => item.type === "assistant_message" && item.usage !== undefined);
+      await waitFor(() => carriers().length > 0);
+      expect(carriers().at(-1)!.model?.modelId).toBe("default");
+      expect(contextReadout(carriers() as never, await provider.listModels(), undefined)?.limit).toBe(400_000);
+      // Reopened: the same attribution from native storage.
+      writeFileSync(path.join(claudeProjectDir(workspace, configDir), "reopened-unlisted.jsonl"), [
+        { type: "user", uuid: "u1", parentUuid: null, isSidechain: false, timestamp: "2026-10-01T09:00:00Z", message: { role: "user", content: "hello" } },
+        { type: "assistant", uuid: "a9", parentUuid: "u1", isSidechain: false, timestamp: "2026-10-01T09:00:01Z", message: { role: "assistant", model: "claude-experimental-9", content: [{ type: "text", text: "hi" }], usage: { input_tokens: 5, cache_read_input_tokens: 200_000, output_tokens: 1 } } },
+      ].map(entry => JSON.stringify(entry)).join("\n") + "\n");
+      const page = await provider.listMessages("reopened-unlisted", { limit: 10 });
+      const readout = contextReadout(page.items, await provider.listModels(), undefined);
+      expect(readout?.limit).toBe(400_000);
+      expect(readout?.fraction).toBeCloseTo(0.5, 2);
+    } finally {
+      stop();
+      await provider.dispose();
+    }
+  });
+
+  test("a reopened conversation read before the default is known is re-attributed once it is", async () => {
+    const { provider, workspace, configDir } = windowFixture({ unpinned: { model: "claude-experimental-9", maxTokens: 400_000 } });
+    try {
+      writeFileSync(path.join(claudeProjectDir(workspace, configDir), "early-reopen.jsonl"), [
+        { type: "user", uuid: "u1", parentUuid: null, isSidechain: false, timestamp: "2026-10-01T09:00:00Z", message: { role: "user", content: "hello" } },
+        { type: "assistant", uuid: "a9", parentUuid: "u1", isSidechain: false, timestamp: "2026-10-01T09:00:01Z", message: { role: "assistant", model: "claude-experimental-9", content: [{ type: "text", text: "hi" }], usage: { input_tokens: 5, output_tokens: 1 } } },
+      ].map(entry => JSON.stringify(entry)).join("\n") + "\n");
+      const carrierModel = (items: Array<{ type: string; usage?: unknown; model?: { modelId: string } }>) =>
+        items.find(item => item.type === "assistant_message" && item.usage)?.model?.modelId;
+      // A conversation started first fills the catalog (and its aliases)
+      // from its own session; the default is not known until the probe.
+      const session = await provider.createSession("x");
+      await provider.prompt(session.id, { id: "r1", text: "hello", delivery: "queue" });
+      await Bun.sleep(10);
+      expect(carrierModel((await provider.listMessages("early-reopen", { limit: 10 })).items as never)).toBe("claude-experimental-9");
+      await provider.listModels();
+      // The cached normalization is not reused across the default becoming known.
+      expect(carrierModel((await provider.listMessages("early-reopen", { limit: 10 })).items as never)).toBe("default");
+    } finally {
+      await provider.dispose();
+    }
+  });
+
+  test("a model a later refresh introduces is probed for its window, in the background and only once", async () => {
+    const original = currentCatalog.slice();
+    const { provider, queries } = windowFixture({
+      behave: model => (model === "claude-newer-7" ? { model: "claude-newer-7", maxTokens: 2_000_000 } : undefined),
+    }, { windowReprobeCooldownMs: 0 });
+    try {
+      await settled(provider, served => find(served, "claude-opus-4-7").detail?.includes("1M") === true);
+      await waitFor(() => queries[0]!.returned);
+      // Nothing new: no further probe.
+      await provider.listModels();
+      expect(queries).toHaveLength(1);
+      // A CLI update ships a model; a live session's refresh lists it.
+      currentCatalog.push({ value: "claude-newer-7", resolvedModel: "claude-newer-7", displayName: "Newer 7", description: "Newer 7 · Fresh" } as typeof currentCatalog[number]);
+      const session = await provider.createSession("x");
+      await provider.prompt(session.id, { id: "r1", text: "hello", delivery: "queue" });
+      await settled(provider, served => served.some(model => model.selection.modelId === "claude-newer-7"));
+      // The read that sees it answers at once, then a probe asks only about it.
+      const stated = await settled(provider, served => find(served, "claude-newer-7").contextLimit === 2_000_000);
+      expect(find(stated, "sonnet").contextLimit).toBe(1_000_000);
+      const reprobe = queries[2]!;
+      expect(reprobe.modelCalls).toEqual(["claude-newer-7"]);
+      expect(queries[1]!.modelCalls).toEqual([]);
+      await waitFor(() => reprobe.returned);
+      // Asked once: no probe after that.
+      await provider.listModels();
+      await Bun.sleep(10);
+      expect(queries).toHaveLength(3);
+    } finally {
+      currentCatalog.splice(0, currentCatalog.length, ...original);
+      await provider.dispose();
+    }
+  });
+
+  test("a model switch that outlasts its bound ends the walk; a later probe asks the rows it did not reach", async () => {
+    let slow = true;
+    const { provider, queries } = windowFixture({}, { windowReadTimeoutMs: 30, windowReprobeCooldownMs: 0 });
+    try {
+      const first = provider.listModels();
+      await waitFor(() => queries.length === 1);
+      const probe = queries[0]!;
+      const original = probe.setModel!;
+      // "sonnet" never finishes switching on the first probe.
+      probe.setModel = async model => { if (slow && model === "sonnet") return new Promise<void>(() => undefined); return original(model); };
+      await first;
+      await waitFor(() => probe.returned);
+      // Rows before it were read; the walk stopped at it, so a row after it was not asked.
+      expect(probe.modelCalls).not.toContain("haiku");
+      // The stalled switch never reached the recorder: the last recorded is the row before it.
+      expect(probe.modelCalls.at(-1)).toBe("fable[1m]");
+      slow = false;
+      // The next read sees unasked rows and probes again, asking only those.
+      const settledModels = await settled(provider, served => queries.length === 2 && queries[1]!.returned && find(served, "claude-opus-4-7").detail?.includes("1M") === true);
+      expect(queries[1]!.modelCalls).toContain("haiku");
+      expect(queries[1]!.modelCalls).not.toContain("opus");
+      expect(queries[1]!.modelCalls).not.toContain("sonnet");
+      expect(find(settledModels, "haiku").contextLimit).toBe(200_000);
+    } finally {
+      await provider.dispose();
+    }
+  });
+
+  test("a stalled default read does not hold the first catalog answer; it lands from a later read", async () => {
+    let answer!: () => void;
+    const late = new Promise<void>(resolve => (answer = resolve));
+    const { provider, queries } = windowFixture({ unpinned: { model: "claude-fable-5-1", maxTokens: 1_000_000 } }, { defaultReadWaitMs: 30 });
+    try {
+      const pending = provider.listModels();
+      await waitFor(() => queries.length === 1);
+      const probe = queries[0]!;
+      const original = probe.getContextUsage!;
+      // The unpinned read stalls until released; per-model reads are unaffected.
+      let first = true;
+      probe.getContextUsage = async opts => { if (first) { first = false; await late; } return original(opts); };
+      const started = performance.now();
+      const answered = await pending;
+      expect(performance.now() - started).toBeLessThan(1_000);
+      // The catalog's own resolution until Claude Code says otherwise.
+      expect(find(answered, "default").resolvesTo).toEqual({ providerId: "anthropic", modelId: "sonnet" });
+      // No model switch ran under the stalled unpinned read.
+      expect(probe.modelCalls).toEqual([]);
+      answer();
+      const later = await settled(provider, served => find(served, "default").resolvesTo?.modelId === "fable[1m]");
+      expect(find(later, "sonnet").contextLimit).toBe(1_000_000);
+      await waitFor(() => probe.returned);
+    } finally {
+      await provider.dispose();
+    }
+  });
+
+  test("a CLI without the window controls is not re-probed on later reads", async () => {
+    const { provider, queries } = windowFixture({ controls: false }, { windowReprobeCooldownMs: 0 });
+    try {
+      await provider.listModels();
+      await waitFor(() => queries[0]!.returned);
+      for (let read = 0; read < 3; read += 1) {
+        await provider.listModels();
+        await Bun.sleep(5);
+      }
+      expect(queries).toHaveLength(1);
+    } finally {
+      await provider.dispose();
+    }
+  });
+
+  test("probes for new models are throttled", async () => {
+    const original = currentCatalog.slice();
+    const { provider, queries } = windowFixture({}, { windowReprobeCooldownMs: 60_000 });
+    try {
+      await settled(provider, served => find(served, "claude-opus-4-7").detail?.includes("1M") === true);
+      currentCatalog.push({ value: "claude-newer-7", resolvedModel: "claude-newer-7", displayName: "Newer 7" } as typeof currentCatalog[number]);
+      const session = await provider.createSession("x");
+      await provider.prompt(session.id, { id: "r1", text: "hello", delivery: "queue" });
+      await settled(provider, served => served.some(model => model.selection.modelId === "claude-newer-7"));
+      await provider.listModels();
+      await Bun.sleep(10);
+      // Within the cooldown of the first probe: the derived figure, no probe.
+      expect(queries).toHaveLength(2);
+    } finally {
+      currentCatalog.splice(0, currentCatalog.length, ...original);
+      await provider.dispose();
+    }
+  });
+
+  test("an alias that moves to another model does not keep the old model's window", async () => {
+    const original = currentCatalog.slice();
+    const { provider } = windowFixture({ behave: model => (model === "haiku" ? { model: "claude-haiku-4-5-20251001", maxTokens: 640_000 } : undefined) });
+    try {
+      await settled(provider, served => find(served, "haiku").contextLimit === 640_000);
+      // A CLI update: "haiku" now resolves to a new generation nobody measured.
+      const index = currentCatalog.findIndex(row => row.value === "haiku");
+      currentCatalog[index] = { ...currentCatalog[index]!, resolvedModel: "claude-haiku-6", description: "Haiku 6 · Fastest" };
+      const session = await provider.createSession("x");
+      await provider.prompt(session.id, { id: "r1", text: "hello", delivery: "queue" });
+      const refreshed = await settled(provider, served => find(served, "haiku").resolvesTo?.modelId === "claude-haiku-6");
+      // The derived figure for the new model, not the 640k stated for the old one.
+      expect(find(refreshed, "haiku").contextLimit).toBe(200_000);
+    } finally {
+      currentCatalog.splice(0, currentCatalog.length, ...original);
+      await provider.dispose();
+    }
+  });
+
+  test("a default running a model no entry offers is named by its id", async () => {
+    const { provider } = windowFixture({ unpinned: { model: "claude-experimental-9", maxTokens: 400_000 } });
+    const entry = find(await provider.listModels(), "default");
+    expect(entry.resolvesTo).toEqual({ providerId: "anthropic", modelId: "claude-experimental-9" });
+    expect(entry.detail).toContain("claude-experimental-9");
+    expect(entry.contextLimit).toBe(400_000);
+    // No effort levels are known for it: none is offered, and none is accepted.
+    expect(entry.variants).toBeUndefined();
+    const session = await provider.createSession("x");
+    await expect(provider.switchModel(session.id, { providerId: "anthropic", modelId: "default" }, "high")).rejects.toThrow();
+    await provider.dispose();
+  });
+
+  test("without the controls the derived figures and the catalog's default stand", async () => {
+    const { provider, queries } = windowFixture({ controls: false });
+    const models = await provider.listModels();
+    expect(find(models, "default").resolvesTo).toEqual({ providerId: "anthropic", modelId: "sonnet" });
+    // Fallback figures (claudeContextWindow) for the current generation.
+    expect(find(models, "sonnet").contextLimit).toBe(1_000_000);
+    expect(find(models, "claude-opus-4-6").contextLimit).toBe(200_000);
+    await provider.listModels();
+    expect(queries).toHaveLength(1);
+    await provider.dispose();
+  });
+
+  test("a failed walk keeps the catalog with derived figures and is not re-probed", async () => {
+    const { provider, queries } = windowFixture({ contextFails: true });
+    const models = await provider.listModels();
+    expect(models.length).toBeGreaterThan(5);
+    expect(find(models, "default").resolvesTo).toEqual({ providerId: "anthropic", modelId: "sonnet" });
+    await provider.listModels();
+    expect(queries).toHaveLength(1);
+    await provider.dispose();
+  });
+
+  test("an answer naming another model lends no window; a stalled row does not stop the rows after it", async () => {
+    const { provider } = windowFixture({
+      behave: model => {
+        // The login cannot use Opus 4.8: setModel is ignored, the answer
+        // still names the model before it.
+        if (model === "claude-opus-4-8") return { model: "claude-fable-5", maxTokens: 777_000 };
+        if (model === "claude-fable-5") return "hang";
+        if (model === "haiku") return "throw";
+        if (model === "claude-opus-4-7") return { model: "claude-opus-4-7", maxTokens: 555_000 };
+        return undefined;
+      },
+    }, { windowReadTimeoutMs: 30, windowWalkBudgetMs: 2_000 });
+    const models = await settled(provider, served => find(served, "claude-opus-4-7").contextLimit === 555_000);
+    // Derived figures where nothing true was stated.
+    expect(find(models, "claude-opus-4-8").contextLimit).toBe(1_000_000);
+    expect(find(models, "claude-fable-5").contextLimit).toBe(1_000_000);
+    expect(find(models, "haiku").contextLimit).toBe(200_000);
+    // Rows after the stalled one were still read.
+    expect(find(models, "claude-opus-4-7").contextLimit).toBe(555_000);
+    expect(find(models, "claude-opus-4-7").detail).toContain("555k context");
+    await provider.dispose();
+  });
+
+  test("the first read answers before the walk; windows land on a later read; disposal stops the walk", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => (release = resolve));
+    const { provider, queries } = windowFixture({
+      unpinned: { model: "claude-fable-5-1", maxTokens: 1_000_000 },
+      behave: model => (model === "claude-opus-4-6" ? { model: "claude-opus-4-6", maxTokens: 333_000 } : undefined),
+    });
+    const probeSetModel = () => queries[0]!.setModel!;
+    // Hold every model switch until released, as a slow full-id switch would.
+    const first = await (async () => {
+      const pending = provider.listModels();
+      await waitFor(() => queries.length === 1);
+      const original = probeSetModel();
+      queries[0]!.setModel = async model => { await gate; return original(model); };
+      return pending;
+    })();
+    // The catalog and the default's real model answer at once; windows are
+    // still the fallback figures.
+    expect(find(first, "default").resolvesTo).toEqual({ providerId: "anthropic", modelId: "fable[1m]" });
+    expect(find(first, "claude-opus-4-6").contextLimit).toBe(200_000);
+    expect(queries[0]!.returned).toBe(false);
+    release();
+    const later = await settled(provider, served => find(served, "claude-opus-4-6").contextLimit === 333_000);
+    expect(find(later, "claude-opus-4-6").detail).toContain("333k context");
+    await waitFor(() => queries[0]!.returned);
+    await provider.dispose();
+  });
+
+  test("a stated window follows its model when a refresh offers it under another id", async () => {
+    const original = currentCatalog.slice();
+    const { provider, queries } = windowFixture({
+      behave: model => (model === "claude-opus-4-6" ? { model: "claude-opus-4-6", maxTokens: 1_000_000 } : undefined),
+    });
+    try {
+      await settled(provider, served => find(served, "claude-opus-4-6").contextLimit === 1_000_000);
+      // A CLI update: the catalog now lists Opus 4.6 under an alias, so the
+      // app-only full-id row drops out (never shadowing a catalog id).
+      currentCatalog.push({ value: "opus-legacy", resolvedModel: "claude-opus-4-6", displayName: "Opus 4.6", description: "Opus 4.6 · Previous generation" } as typeof currentCatalog[number]);
+      const session = await provider.createSession("x");
+      await provider.prompt(session.id, { id: "r1", text: "hello", delivery: "queue" });
+      const refreshed = await settled(provider, served => served.some(model => model.selection.modelId === "opus-legacy"));
+      expect(refreshed.some(model => model.selection.modelId === "claude-opus-4-6")).toBe(false);
+      // The window Claude Code stated for the model, not the 200k fallback.
+      expect(find(refreshed, "opus-legacy").contextLimit).toBe(1_000_000);
+      expect(queries[1]!.modelCalls).toEqual([]);
+    } finally {
+      currentCatalog.splice(0, currentCatalog.length, ...original);
+      await provider.dispose();
+    }
+  });
+
+  test("an id two rows resolve to at different windows lends neither", async () => {
+    const original = currentCatalog.slice();
+    currentCatalog.push({ value: "fable", resolvedModel: "claude-fable-5-1", displayName: "Fable 5.1", description: "Fable at the standard window" } as typeof currentCatalog[number]);
+    // Two rows, one resolved id, two stated windows (900k is distinct from
+    // the 1M fallback so a guess between them would show).
+    const { provider } = windowFixture({ behave: model => (model === "fable" ? { model: "claude-fable-5-1", maxTokens: 200_000 } : model === "fable[1m]" ? { model: "claude-fable-5-1", maxTokens: 900_000 } : undefined) });
+    try {
+      await settled(provider, served => find(served, "fable").contextLimit === 200_000);
+      // A refreshed row resolving to claude-fable-5-1 under a new id has two
+      // candidate windows: it keeps the derived figure rather than guess.
+      currentCatalog.push({ value: "fable-next", resolvedModel: "claude-fable-5-1", displayName: "Fable 5.1", description: "x" } as typeof currentCatalog[number]);
+      const session = await provider.createSession("x");
+      await provider.prompt(session.id, { id: "r1", text: "hello", delivery: "queue" });
+      const refreshed = await settled(provider, served => served.some(model => model.selection.modelId === "fable-next"));
+      expect(find(refreshed, "fable-next").contextLimit).toBe(1_000_000);
+      expect(find(refreshed, "fable").contextLimit).toBe(200_000);
+    } finally {
+      currentCatalog.splice(0, currentCatalog.length, ...original);
+      await provider.dispose();
+    }
+  });
+
+  test("disposal while the walk runs stops it and closes the probe", async () => {
+    const { provider, queries } = windowFixture({ behave: model => (model === "sonnet" ? "hang" : undefined) }, { windowReadTimeoutMs: 60_000 });
+    await provider.listModels();
+    await waitFor(() => queries[0]!.modelCalls.includes("sonnet"));
+    const disposing = provider.dispose();
+    // The stalled read is bounded by the probe's teardown, not by its 60 s.
+    await Promise.race([disposing, Bun.sleep(70_000).then(() => { throw new Error("disposal waited on the stalled walk"); })]);
+    expect(queries[0]!.returned).toBe(true);
+    const calls = queries[0]!.modelCalls.length;
+    await Bun.sleep(20);
+    expect(queries[0]!.modelCalls.length).toBe(calls);
   });
 });
