@@ -291,9 +291,12 @@ export function initChat(api = new ChatApiClient()): void {
   let agentStatuses: AgentChatStatus[] = [];
   // Catalogs are per agent; the bare lists below are the selected-agent view,
   // swapped whenever the conversation's owning agent changes.
-  type AgentCatalogs = { models: ChatModel[]; modes: ChatMode[]; commands: ChatCommand[]; commandInventoryAvailable: boolean };
+  type AgentCatalogs = { models: ChatModel[]; modes: ChatMode[]; commands: ChatCommand[]; commandInventoryAvailable: boolean; catalogRevision?: string };
   const agentCatalogs = new Map<string, AgentCatalogs>();
   const agentCatalogLoads = new Map<string, Promise<AgentCatalogs>>();
+  // Latest requested revision, including invalidations received before the
+  // initial catalog is banked. Each bank acknowledges only successful reads.
+  const catalogRevisions = new Map<string, string>();
   let catalogLoading = false;
   let contextAgentId: string | undefined;
   let models: ChatModel[] = [];
@@ -1555,15 +1558,18 @@ export function initChat(api = new ChatApiClient()): void {
   // breakdown rebuilds that would come out identical.
   let paintedSource: ConversationItem | undefined;
   let paintedUsageModel: string | undefined;
+  let paintedWindowKey: string | undefined;
   const syncContextIndicator = () => {
     if (!contextUsage?.isConnected || !contextUsageFill || !contextUsageLabel || !contextUsageBreakdown) return;
     // The newest report or carrier, scanned from the tail — it is almost
     // always right at the end of a long timeline (see context-readout.ts).
     const readout = contextReadout(projection?.items ?? [], models, displayedConfiguration().model);
     const reportingModel = readout?.model ? modelValue(readout.model) : "";
-    if (readout?.source === paintedSource && reportingModel === paintedUsageModel) return;
+    const windowKey = JSON.stringify([readout?.limit, readout?.window]);
+    if (readout?.source === paintedSource && reportingModel === paintedUsageModel && windowKey === paintedWindowKey) return;
     paintedSource = readout?.source;
     paintedUsageModel = reportingModel;
+    paintedWindowKey = windowKey;
     if (!readout || !declares("context")) {
       contextUsage.hidden = true;
       contextUsage.open = false;
@@ -1579,12 +1585,15 @@ export function initChat(api = new ChatApiClient()): void {
     // The figure states the fill in words as well as in width, so the tier
     // colouring below is emphasis on something already legible rather than
     // the only signal.
-    contextUsageLabel.textContent = fraction === undefined ? "?" : `${Math.round(fraction * 100)}%`;
+    const estimated = readout.window?.source === "estimate";
+    contextUsageLabel.textContent = fraction === undefined ? formatTokens(used) : `${estimated ? "~" : ""}${Math.round(fraction * 100)}%`;
     contextUsage.dataset.fill = fraction === undefined ? "unknown" : fraction >= 0.9 ? "full" : fraction >= 0.75 ? "high" : "normal";
     contextUsage.dataset.source = readout.source.type === "context_report" ? "report" : "usage";
+    contextUsage.dataset.windowSource = readout.window?.source ?? (limit === undefined ? "unknown" : "legacy");
+    contextUsage.dataset.windowFreshness = readout.window?.freshness ?? "current";
     contextUsage.title = fraction === undefined
-      ? `${used.toLocaleString()} tokens in the context window`
-      : `${used.toLocaleString()} of ${limit!.toLocaleString()} tokens in the context window`;
+      ? `${used.toLocaleString()} tokens used · Limit unavailable`
+      : `${used.toLocaleString()} of ${limit!.toLocaleString()} tokens in the context window${estimated ? " · Estimated limit" : readout.window?.freshness === "cached" ? " · Cached limit" : ""}`;
     contextUsageBreakdown.replaceChildren(...readout.rows.flatMap(([label, value]) => {
       const term = document.createElement("dt");
       term.textContent = label;
@@ -1592,6 +1601,13 @@ export function initChat(api = new ChatApiClient()): void {
       detail.textContent = value.toLocaleString();
       return [term, detail];
     }));
+    if (limit === undefined) {
+      const term = document.createElement("dt");
+      term.textContent = "Limit";
+      const detail = document.createElement("dd");
+      detail.textContent = "Limit unavailable";
+      contextUsageBreakdown.append(term, detail);
+    }
     contextUsage.hidden = false;
   };
 
@@ -4683,7 +4699,9 @@ export function initChat(api = new ChatApiClient()): void {
     catalogLoading = false;
     form.hidden = false;
     renderConfiguration();
+    syncContextIndicator();
     syncControls();
+    refreshCatalogRevision(status.agent.id);
   };
 
   // Plan usage is per login: the workspace's last-known report is fetched
@@ -4762,50 +4780,80 @@ export function initChat(api = new ChatApiClient()): void {
   // latest one's answers are installed, or a pre-reload list landing late
   // would overwrite the reloaded one.
   const catalogRefreshes = new LatestRefresh();
-  // Settles once every read it started has landed or failed.
+  const catalogRevisionReads = new Map<string, { bank: AgentCatalogs; revision: string; retryRequested: boolean }>();
+  // Settles once every read has landed or failed. Track revision demand on
+  // every refresh, including one started by a reconnect or picker action.
   const refreshBankedCommands = (agentId: string | undefined, options: { acceptEmpty?: boolean } = {}): Promise<void> => {
     if (!agentId) return Promise.resolve();
     const banked = agentCatalogs.get(agentId);
     if (!banked) return Promise.resolve();
+    const revision = catalogRevisions.get(agentId);
+    const revisionRead = revision === undefined ? undefined : { bank: banked, revision, retryRequested: false };
+    if (revisionRead) catalogRevisionReads.set(agentId, revisionRead);
+    const availability = agentStatusFor(agentId)?.availability;
+    const capabilities = availability?.state === "ready" ? availability.agent?.capabilities : undefined;
+    const has = (capability: ChatCapability) => capabilities?.includes(capability) ?? true;
     const latest = catalogRefreshes.begin(agentId);
     const current = () => agentCatalogs.get(agentId) === banked && latest();
+    let complete = true;
     const reads: Promise<unknown>[] = [];
-    if (agent?.capabilities.includes("commands") || agent?.capabilities.includes("reversible-history")) {
+    if (has("commands") || has("reversible-history")) {
       reads.push(api.commands(agentId).then(list => {
-        if (!current()) return;
+        if (!current()) { complete = false; return; }
         banked.commands = list;
         banked.commandInventoryAvailable = true;
         if (contextAgentId === agentId) {
           commands = list;
           if (slashQueryActive) renderCommandMenu();
         }
-      }).catch(() => undefined));
+      }).catch(() => { complete = false; }));
     }
     // Models change under a running page too — a Claude Code update ships
     // new entries — so the banked model list refreshes on the same cadence.
-    if (agent?.capabilities.includes("models")) {
+    if (has("models")) {
       reads.push(api.models(agentId).then(list => {
-        if (!current() || (list.length === 0 && !options.acceptEmpty)) return;
+        if (!current() || (list.length === 0 && !options.acceptEmpty)) { complete = false; return; }
         banked.models = list;
         if (contextAgentId === agentId) {
           models = list;
           renderConfiguration();
+          syncContextIndicator();
         }
-      }).catch(() => undefined));
+      }).catch(() => { complete = false; }));
     }
     // Modes too: OpenCode's agents are its configuration, which a reload
     // (or an edit picked up on restart) changes under a running page.
-    if (agent?.capabilities.includes("modes")) {
+    if (has("modes")) {
       reads.push(api.modes(agentId).then(list => {
-        if (!current() || list.length === 0) return;
+        if (!current() || list.length === 0) { complete = false; return; }
         banked.modes = list;
         if (contextAgentId === agentId) {
           modes = list;
           renderConfiguration();
         }
-      }).catch(() => undefined));
+      }).catch(() => { complete = false; }));
     }
-    return Promise.all(reads).then(() => undefined);
+    return Promise.all(reads).then(() => {
+      const stillCurrent = current();
+      if (stillCurrent && complete && reads.length > 0 && revision !== undefined) banked.catalogRevision = revision;
+      if (!revisionRead || catalogRevisionReads.get(agentId) !== revisionRead) return;
+      catalogRevisionReads.delete(agentId);
+      // One retry consumes all matching invalidations received during this
+      // attempt. Failure alone never creates more work or an automatic loop.
+      if (stillCurrent && !complete && revisionRead.retryRequested && catalogRevisions.get(agentId) === revision) refreshCatalogRevision(agentId);
+    });
+  };
+
+  const refreshCatalogRevision = (agentId: string): void => {
+    const bank = agentCatalogs.get(agentId);
+    const revision = catalogRevisions.get(agentId);
+    if (!bank || revision === undefined || bank.catalogRevision === revision) return;
+    const inflight = catalogRevisionReads.get(agentId);
+    if (inflight?.bank === bank && inflight.revision === revision) {
+      inflight.retryRequested = true;
+      return;
+    }
+    void refreshBankedCommands(agentId);
   };
 
   const refreshIdleAgentContext = () => {
@@ -4833,9 +4881,15 @@ export function initChat(api = new ChatApiClient()): void {
       inventoryStream = api.inventoryStream({
         // A tick may also mean a login changed (Agent accounts): status is
         // in-memory on the server, so it is re-read alongside the inventory.
-        invalidation: () => { void inventoryReconciler.request(); rereadStatuses(); },
+        invalidation: event => {
+          void inventoryReconciler.request(); rereadStatuses();
+          for (const [agentId, revision] of Object.entries(event.catalogs ?? {})) {
+            catalogRevisions.set(agentId, revision);
+            refreshCatalogRevision(agentId);
+          }
+        },
         error: error => interruptions.report("inventory", error),
-        recovered: () => interruptions.clear("inventory"),
+        recovered: () => { interruptions.clear("inventory"); refreshCatalogsOnUse(); },
       });
     } catch (error) {
       announce(messageOf(error), true);
