@@ -59,10 +59,10 @@ Notice text lives in the client, chosen from the failure kind. The server body s
 `loadDocument` builds one `DocumentLoadFailure`:
 
 - `{ kind: "no-answer" }`: `fetch()` threw, or `response.text()` threw because the body stream broke. **Transient.**
-- `{ kind: "status", status, error? }`: a non-OK response (`error` is read best-effort from a JSON body). Transient when `status >= 500`, final otherwise.
+- `{ kind: "status", status, error? }`: a non-OK response (`error` is read best-effort from a JSON body; a non-JSON body, such as a proxy's HTML error page, yields no tag). Transient when `status >= 500` or the status is 408 or 429 (D6), final otherwise.
 - `{ kind: "unreadable" }`: an OK response whose text fails `JSON.parse`, or whose parsed value is not an object with a string `html`. **Final.**
 
-`isTransientDocumentFailure(failure)` and a new `documentFailureMessage(failure, retrying)` live in `load-retry.ts` so both can be tested without a DOM. The interim and exhausted transient notices keep their current text.
+`isTransientDocumentFailure(failure)`, a new `documentFailureMessage(failure, retrying)`, and `classifyDocumentResponse(response, text)` (status plus body text → payload or failure) live in `load-retry.ts` so both can be tested without a DOM. The interim and exhausted transient notices keep their current text.
 
 The issue says "only a thrown `fetch()` maps to null". This design also treats a broken body stream as no answer, because that is a network failure that arrives after the headers, not a bad answer. Reading the body with `text()` and then parsing it apart from the read is what makes the distinction possible. `response.json()` would merge the two into one rejection.
 
@@ -70,9 +70,15 @@ The issue says "only a thrown `fetch()` maps to null". This design also treats a
 
 With stable conditions removed from the 5xx class, what remains is resource exhaustion, a session child restarting behind the hub (502), a broken connection, and renderer throws. The 14 s window covers a session restart and an `EMFILE` spike. The first retry at 250 ms covers a save race. A deterministic renderer bug costs five requests and five log lines per view, which the issue explicitly accepts so the bug stays visible. The key per selection and activation and the "a request restarts the schedule, a retry continues it" rule are unchanged. *Alternatives:* fewer attempts (shorter "Retrying…", but a session restart that takes longer than about 4 s would end on a failure) or an unbounded backoff (rejected in #462). Neither is needed once stable failures are final.
 
+### D6. 408 and 429 are transient; every other 4xx stays final
+
+A 408 (Request Timeout) or 429 (Too Many Requests) says nothing about the document. It says "not now", and Uatu's own server never sends either, so one reaching the preview comes from something in the path (a reverse proxy in front of the hub, a rate limiter). Each is the case the bounded schedule exists for: asking again a little later is the documented remedy. Treating them as final would leave a document unloaded behind a momentary proxy limit until the user clicked it again. They get the same schedule and text as a 5xx: "Retrying…" while attempts remain, then "Select it again to retry." once it is used up. Every other 4xx stays final, because it states something about the document or the request that asking again will not change.
+
+`Retry-After` is not read. The schedule's own delays (up to 10 s) apply regardless, which keeps the client one simple rule and bounds the cost at five requests. Honoring `Retry-After` (capping, clock-skew handling for the date form, how it combines with the key-per-activation rule) is out of scope for this change. *Alternative:* keep 408/429 final under "every 4xx is final". Rejected: the rule's reason (the server stated something about the document) does not hold for these two.
+
 ## Risks / Trade-offs
 
-- [A permission fix is not observed by the watcher] → The notice says "then select it again". A re-selection makes exactly one request.
+- [A permission fix is not observed by the watcher] → The notice says "then select it again". A re-selection makes exactly one request. Nothing remembers the failure: the client caches only successful payloads (`documentViewCache`, cleared at the start of every `loadDocument`), the server has no render cache, the error responses carry no cache validators, and the push worker intercepts no fetches.
 - [`chmod 000` cannot deny root a read, so tests running as root would render the file] → Unit and e2e permission tests use `skipIf(process.getuid?.() === 0)` (the existing pattern in `render-dispatch.test.ts`) and restore `0o644` in `finally` so fixture cleanup and the watcher are unaffected. CI runners are non-root `ubuntu-latest`. Windows is not a supported platform. On macOS the e2e also runs as the user.
 - [The watcher may react to the mode change] → The e2e changes the mode before the first selection, and it asserts on the settled request count (a poll that stays at 1 past the first retry delay), not on a fixed sleep.
 - [A stale tab from before the upgrade meets the new server] → An old client treats 403 as final (`< 500`) and shows its 404 text. That is acceptable, and the freshness handshake reloads the tab anyway.

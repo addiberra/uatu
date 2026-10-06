@@ -1,8 +1,8 @@
 // Bounded retry for a document load that failed for a reason that may clear
-// on its own: the server answered 5xx, or the request never got a complete
-// answer. A 4xx is the server stating something about the document (gone,
-// not readable, not viewable), and the live document topic reports when the
-// file changes; a transient failure has no such follow-up, so without a
+// on its own: the server answered 5xx, 408 or 429, or the request never got a
+// complete answer. Any other 4xx is the server stating something about the
+// document (gone, not readable, not viewable), and the live document topic
+// reports when the file changes; a transient failure has no such follow-up, so without a
 // retry the preview would say "couldn't be loaded" for a file that is fine
 // until the user happened to click it again.
 //
@@ -24,14 +24,51 @@ export type DocumentLoadFailure =
   | { kind: "status"; status: number; error?: string }
   | { kind: "unreadable" };
 
-// Whether a failed load is worth retrying: only no answer or a 5xx. Anything
-// the server stated about the document itself (404 gone, 403 not readable,
-// 415 not viewable, 400 malformed) and an OK answer that does not parse are
-// final.
+// The 4xx statuses that say "not now" rather than anything about the
+// document: 408 Request Timeout and 429 Too Many Requests (typically from a
+// proxy in front of the session). Retry-After is not read; the schedule's own
+// delays apply.
+const TRANSIENT_CLIENT_STATUSES: ReadonlySet<number> = new Set([408, 429]);
+
+// Whether a failed load is worth retrying: no answer, a 5xx, a 408 or a 429.
+// Anything the server stated about the document itself (404 gone, 403 not
+// readable, 415 not viewable, 400 malformed) and an OK answer that does not
+// parse are final.
 export function isTransientDocumentFailure(failure: DocumentLoadFailure): boolean {
   if (failure.kind === "no-answer") return true;
-  if (failure.kind === "status") return failure.status >= 500;
+  if (failure.kind === "status") return failure.status >= 500 || TRANSIENT_CLIENT_STATUSES.has(failure.status);
   return false;
+}
+
+// Classifies one complete `/api/document` answer (status plus the body read
+// as text). A non-OK answer is a `status` failure, with the body's `error`
+// tag when the body is JSON carrying a string one; a body from something else
+// in the path (a proxy's HTML error page, say) yields no tag. An OK answer
+// whose body does not parse, or has no string `html`, is `unreadable`.
+// `fetch()` or the body read throwing is the caller's "no-answer".
+export function classifyDocumentResponse(
+  response: { ok: boolean; status: number },
+  text: string,
+): { ok: true; payload: { html: string } } | { ok: false; failure: DocumentLoadFailure } {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    parsed = undefined;
+  }
+  if (!response.ok) {
+    const error = (parsed as { error?: unknown } | null | undefined)?.error;
+    return {
+      ok: false,
+      failure: typeof error === "string"
+        ? { kind: "status", status: response.status, error }
+        : { kind: "status", status: response.status },
+    };
+  }
+  if (typeof parsed !== "object" || parsed === null || typeof (parsed as { html?: unknown }).html !== "string") {
+    return { ok: false, failure: { kind: "unreadable" } };
+  }
+  return { ok: true, payload: parsed as { html: string } };
 }
 
 // The notice the preview shows for a failed load. `retrying` says whether the

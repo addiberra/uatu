@@ -42,6 +42,7 @@ import { createDocumentLoadGuard } from "./load-generation";
 import { documentRevisionKey } from "../shell/document-state";
 import { enrichDocumentFacts, forgetDocumentFacts } from "./facts-enrichment";
 import {
+  classifyDocumentResponse,
   createDocumentLoadRetry,
   documentFailureMessage,
   documentLoadRetryKey,
@@ -508,10 +509,10 @@ async function executeLoadDocument(documentId: string, trigger: DocumentLoadTrig
   await applyDocumentPayload(payload, isCurrent);
 }
 
-// One `/api/document` request, classified. The body is read as text and
-// parsed separately so a broken stream (no complete answer: transient) is
-// told apart from an OK answer that does not parse (final); `response.json()`
-// would merge the two into one rejection.
+// One `/api/document` request, classified (see classifyDocumentResponse).
+// The body is read as text and parsed separately so a broken stream (no
+// complete answer: transient) is told apart from an OK answer that does not
+// parse (final); `response.json()` would merge the two into one rejection.
 async function fetchDocumentPayload(
   documentId: string,
   view: "rendered" | "source",
@@ -527,25 +528,8 @@ async function fetchDocumentPayload(
   } catch {
     return { ok: false, failure: { kind: "no-answer" } };
   }
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(text);
-  } catch {
-    parsed = undefined;
-  }
-  if (!response.ok) {
-    const error = (parsed as { error?: unknown } | null | undefined)?.error;
-    return {
-      ok: false,
-      failure: typeof error === "string"
-        ? { kind: "status", status: response.status, error }
-        : { kind: "status", status: response.status },
-    };
-  }
-  if (typeof parsed !== "object" || parsed === null || typeof (parsed as { html?: unknown }).html !== "string") {
-    return { ok: false, failure: { kind: "unreadable" } };
-  }
-  return { ok: true, payload: parsed as RenderedDocument };
+  const result = classifyDocumentResponse(response, text);
+  return result.ok ? { ok: true, payload: result.payload as RenderedDocument } : result;
 }
 
 function renderUnavailableDocument(

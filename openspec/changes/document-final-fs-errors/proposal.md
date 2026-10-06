@@ -10,11 +10,11 @@
   - The server logs none of these, as it already does not log a 404.
 - Renderer throws and transient resource failures (`EMFILE`, `ENFILE`, `EAGAIN`, `EBUSY`, `EIO`, and any unrecognized error) stay **500**, are logged, and are retried. A broken renderer stays visible.
 - The preview's final notice depends on the status, so it explains the failure instead of saying "Retrying…". A 403 says the file cannot be read because of its permissions. A 404 keeps today's "may have been removed or excluded" text. Any other final failure gets a generic notice that tells the user to select the file again.
-- Only a request that gets no answer (a `fetch()` that throws, or a body stream that breaks before it finishes) counts as transient alongside 5xx. A `200` whose body fails to parse as JSON is final.
+- Only a request that gets no answer (a `fetch()` that throws, or a body stream that breaks before it finishes) counts as transient alongside 5xx, 408 (Request Timeout) and 429 (Too Many Requests). Every other 4xx is final, and so is a `200` whose body fails to parse as JSON.
 - The retry schedule (`[250, 1000, 3000, 10000]` ms, a key per selection and activation) stays as it is. The design records why.
 - `ARCHITECTURE.md`'s failure-path list is updated to match.
 
-Out of scope: keeping the last good render visible while the same document retries (tjakobsson/uatu#468), the `/api/document/diff` endpoint's error mapping, and how the preview handles a hub 401.
+Out of scope: honoring a `Retry-After` header on a 408 or 429, keeping the last good render visible while the same document retries (tjakobsson/uatu#468), the `/api/document/diff` endpoint's error mapping, and how the preview handles a hub 401.
 
 ## Capabilities
 

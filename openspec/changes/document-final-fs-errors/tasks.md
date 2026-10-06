@@ -19,5 +19,11 @@
 ## 4. Docs and full verification
 
 - [x] 4.1 Update the document failure-path list in `ARCHITECTURE.md` (around "File no longer exists → … 404" and "Anything else … 500"). Add the 403 permission path, the widened 404 set, and the rule that a parse failure on an OK response is final. Verify by reading that the text matches design D1 and D4.
-- [ ] 4.2 Run `bun run test:ci` and the e2e suite (`bun run test:e2e`), and confirm both are green. Run `openspec validate document-final-fs-errors --strict` and confirm it passes.
+- [x] 4.2 Run `bun run test:ci` and the e2e suite (`bun run test:e2e`), and confirm both are green. Run `openspec validate document-final-fs-errors --strict` and confirm it passes.
 - [x] 4.3 PR metadata: v0.7.0 does not contain #462, so title the PR `fix(preview): …` and add a `BEGIN_COMMIT_OVERRIDE` / `chore(preview): stabilize the unreleased document load retry before release` / `END_COMMIT_OVERRIDE` block to its body. Verify that the block is present in the PR body before squash merge, and reference tjakobsson/uatu#469 and the follow-up tjakobsson/uatu#468.
+
+## 5. Review follow-ups
+
+- [x] 5.1 Non-JSON 4xx bodies: move the response classification out of `fetchDocumentPayload` (`src/preview/mount.ts`) into `classifyDocumentResponse` in `src/preview/load-retry.ts`, and pin that an HTML-bodied 403 classifies as `{ kind: "status", status: 403 }` with no tag (generic final notice, not retried) and an HTML-bodied 404 gets the not-found notice. Verify with `bun test src/preview/load-retry.test.ts`.
+- [x] 5.2 Make 408 and 429 transient in `isTransientDocumentFailure` (same bounded schedule and "Retrying…" text, then "Select it again to retry."), keep every other 4xx final, and do not read `Retry-After`. Update design.md (D6), the delta spec (requirement text and scenarios), proposal.md, and `ARCHITECTURE.md`'s client-classification paragraph. Verify with `bun test src/preview/load-retry.test.ts`, `bun run typecheck`, and `openspec validate document-final-fs-errors --strict`.
+- [x] 5.3 Check whether anything remembers a final-failed document by id (client view/diff caches, a server render cache, HTTP caching, the service worker), so a re-selection after a permission fix could serve a stale failure. Verify by reading the code, and by the e2e "recovers on reselect" passing in `bunx playwright test tests/e2e/view-and-layout.e2e.ts --project=e2e`.

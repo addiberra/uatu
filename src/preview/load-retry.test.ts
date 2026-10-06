@@ -3,6 +3,7 @@ import { describe, expect, test } from "bun:test";
 import { appState } from "../shell/state";
 import { getSelectionActivation, getSelectionGeneration, setSelectedId } from "../shell/selection";
 import {
+  classifyDocumentResponse,
   createDocumentLoadRetry,
   documentFailureMessage,
   documentLoadRetryKey,
@@ -44,8 +45,13 @@ describe("isTransientDocumentFailure", () => {
     }
   });
 
+  test("408 Request Timeout and 429 Too Many Requests are transient", () => {
+    expect(isTransientDocumentFailure(status(408))).toBe(true);
+    expect(isTransientDocumentFailure(status(429))).toBe(true);
+  });
+
   test("what the server says about the document itself, or an unparseable OK answer, is final", () => {
-    for (const code of [400, 401, 403, 404, 415]) {
+    for (const code of [400, 401, 403, 404, 405, 409, 410, 413, 415, 418, 422, 428, 431, 451]) {
       expect(isTransientDocumentFailure(status(code))).toBe(false);
     }
     expect(isTransientDocumentFailure(status(403, "document not readable"))).toBe(false);
@@ -84,6 +90,56 @@ describe("documentFailureMessage", () => {
     expect(documentFailureMessage(status(500), true)).toBe(RETRYING);
     expect(documentFailureMessage({ kind: "no-answer" }, false)).toBe(FINAL);
     expect(documentFailureMessage(status(502), false)).toBe(FINAL);
+  });
+
+  test("a 408 or 429 retries like a server failure, then asks to select it again", () => {
+    for (const code of [408, 429]) {
+      expect(documentFailureMessage(status(code), true)).toBe(RETRYING);
+      expect(documentFailureMessage(status(code), false)).toBe(FINAL);
+    }
+  });
+
+  test("a 403 or 404 whose body is not JSON (a proxy's error page) gets the notice its status implies", () => {
+    const html = "<html><body><h1>403 Forbidden</h1></body></html>";
+    const forbidden = classifyDocumentResponse({ ok: false, status: 403 }, html);
+    expect(forbidden).toEqual({ ok: false, failure: { kind: "status", status: 403 } });
+    if (!forbidden.ok) {
+      expect(isTransientDocumentFailure(forbidden.failure)).toBe(false);
+      expect(documentFailureMessage(forbidden.failure, false)).toBe(FINAL);
+    }
+
+    const missing = classifyDocumentResponse({ ok: false, status: 404 }, "<html><body>Not Found</body></html>");
+    expect(missing).toEqual({ ok: false, failure: { kind: "status", status: 404 } });
+    if (!missing.ok) {
+      expect(isTransientDocumentFailure(missing.failure)).toBe(false);
+      expect(documentFailureMessage(missing.failure, false)).toBe(NOT_FOUND);
+    }
+  });
+});
+
+describe("classifyDocumentResponse", () => {
+  test("a non-OK answer carries the body's error tag only when it is a JSON string", () => {
+    expect(classifyDocumentResponse({ ok: false, status: 403 }, JSON.stringify({ error: "document not readable" })))
+      .toEqual({ ok: false, failure: { kind: "status", status: 403, error: "document not readable" } });
+    expect(classifyDocumentResponse({ ok: false, status: 403 }, "<html>Forbidden</html>"))
+      .toEqual({ ok: false, failure: { kind: "status", status: 403 } });
+    expect(classifyDocumentResponse({ ok: false, status: 403 }, JSON.stringify({ error: 403 })))
+      .toEqual({ ok: false, failure: { kind: "status", status: 403 } });
+    expect(classifyDocumentResponse({ ok: false, status: 502 }, ""))
+      .toEqual({ ok: false, failure: { kind: "status", status: 502 } });
+    expect(classifyDocumentResponse({ ok: false, status: 429 }, "null"))
+      .toEqual({ ok: false, failure: { kind: "status", status: 429 } });
+  });
+
+  test("an OK answer is a payload only when it parses and has a string html", () => {
+    expect(classifyDocumentResponse({ ok: true, status: 200 }, JSON.stringify({ id: "a", html: "<p>x</p>" })))
+      .toEqual({ ok: true, payload: { id: "a", html: "<p>x</p>" } as { html: string } });
+    expect(classifyDocumentResponse({ ok: true, status: 200 }, "not json"))
+      .toEqual({ ok: false, failure: { kind: "unreadable" } });
+    expect(classifyDocumentResponse({ ok: true, status: 200 }, JSON.stringify({ id: "a" })))
+      .toEqual({ ok: false, failure: { kind: "unreadable" } });
+    expect(classifyDocumentResponse({ ok: true, status: 200 }, "null"))
+      .toEqual({ ok: false, failure: { kind: "unreadable" } });
   });
 });
 
