@@ -1,20 +1,57 @@
-// Bounded retry for a document load that failed for a reason other than the
-// document being gone: the server answered 5xx, or the request never got an
-// answer at all. A 404 is the server saying the file is not there, and the
-// live document topic reports when that changes; a transient failure has no
-// such follow-up, so without a retry the preview would say "unavailable" for
-// a file that exists until the user happened to click it again.
+// Bounded retry for a document load that failed for a reason that may clear
+// on its own: the server answered 5xx, or the request never got a complete
+// answer. A 4xx is the server stating something about the document (gone,
+// not readable, not viewable), and the live document topic reports when the
+// file changes; a transient failure has no such follow-up, so without a
+// retry the preview would say "couldn't be loaded" for a file that is fine
+// until the user happened to click it again.
 //
-// Free of DOM and appState so the schedule can be tested directly; `mount.ts`
-// decides what a failure is and whether a retry is still wanted when it fires.
+// Free of DOM and appState so the schedule, the classification, and the
+// notice text can be tested directly; `mount.ts` builds the failure from the
+// response and decides whether a retry is still wanted when it fires.
 
 export const DOCUMENT_LOAD_RETRY_DELAYS_MS: readonly number[] = [250, 1_000, 3_000, 10_000];
 
-// Whether a `/api/document` answer (or a failed request, `null`) is worth
-// retrying. Anything the server stated about the document itself (404 gone,
-// 415 not viewable, 400 malformed) is final.
-export function isTransientDocumentFailure(status: number | null): boolean {
-  return status === null || status >= 500;
+// What went wrong loading a document from `/api/document`:
+// - "no-answer": the request got no complete answer (`fetch()` threw, or the
+//   body stream broke before it finished). A network failure.
+// - "status": the server answered with a non-OK status; `error` is the
+//   body's machine tag when it could be read.
+// - "unreadable": the server answered OK but the body is not a document
+//   payload. Asking again will not make it parse.
+export type DocumentLoadFailure =
+  | { kind: "no-answer" }
+  | { kind: "status"; status: number; error?: string }
+  | { kind: "unreadable" };
+
+// Whether a failed load is worth retrying: only no answer or a 5xx. Anything
+// the server stated about the document itself (404 gone, 403 not readable,
+// 415 not viewable, 400 malformed) and an OK answer that does not parse are
+// final.
+export function isTransientDocumentFailure(failure: DocumentLoadFailure): boolean {
+  if (failure.kind === "no-answer") return true;
+  if (failure.kind === "status") return failure.status >= 500;
+  return false;
+}
+
+// The notice the preview shows for a failed load. `retrying` says whether the
+// schedule has another attempt pending (only ever true for a transient
+// failure). The permission notice needs the server's tag as well as the
+// status, so a 403 from anywhere else (a hub refusal, say) is never
+// mislabeled as a file-permission problem.
+export function documentFailureMessage(failure: DocumentLoadFailure, retrying: boolean): string {
+  if (isTransientDocumentFailure(failure)) {
+    return retrying
+      ? "This file couldn't be loaded. Retrying…"
+      : "This file couldn't be loaded. Select it again to retry.";
+  }
+  if (failure.kind === "status" && failure.status === 403 && failure.error === "document not readable") {
+    return "Uatu doesn't have permission to read this file. Change its permissions, then select it again.";
+  }
+  if (failure.kind === "status" && failure.status === 404) {
+    return "File unavailable. It may have been removed or excluded from this workspace.";
+  }
+  return "This file couldn't be loaded. Select it again to retry.";
 }
 
 // The retry schedule's key: one document within one selection *and* one user

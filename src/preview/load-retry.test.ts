@@ -4,8 +4,10 @@ import { appState } from "../shell/state";
 import { getSelectionActivation, getSelectionGeneration, setSelectedId } from "../shell/selection";
 import {
   createDocumentLoadRetry,
+  documentFailureMessage,
   documentLoadRetryKey,
   isTransientDocumentFailure,
+  type DocumentLoadFailure,
   type DocumentLoadRetryTimers,
 } from "./load-retry";
 
@@ -31,17 +33,57 @@ function fakeTimers() {
   };
 }
 
+const status = (code: number, error?: string): DocumentLoadFailure =>
+  error === undefined ? { kind: "status", status: code } : { kind: "status", status: code, error };
+
 describe("isTransientDocumentFailure", () => {
   test("a server failure or no answer is transient", () => {
-    expect(isTransientDocumentFailure(null)).toBe(true);
-    expect(isTransientDocumentFailure(500)).toBe(true);
-    expect(isTransientDocumentFailure(503)).toBe(true);
+    expect(isTransientDocumentFailure({ kind: "no-answer" })).toBe(true);
+    for (const code of [500, 502, 503]) {
+      expect(isTransientDocumentFailure(status(code))).toBe(true);
+    }
   });
 
-  test("what the server says about the document itself is final", () => {
-    expect(isTransientDocumentFailure(404)).toBe(false);
-    expect(isTransientDocumentFailure(415)).toBe(false);
-    expect(isTransientDocumentFailure(400)).toBe(false);
+  test("what the server says about the document itself, or an unparseable OK answer, is final", () => {
+    for (const code of [400, 401, 403, 404, 415]) {
+      expect(isTransientDocumentFailure(status(code))).toBe(false);
+    }
+    expect(isTransientDocumentFailure(status(403, "document not readable"))).toBe(false);
+    expect(isTransientDocumentFailure({ kind: "unreadable" })).toBe(false);
+  });
+});
+
+describe("documentFailureMessage", () => {
+  const PERMISSION = "Uatu doesn't have permission to read this file. Change its permissions, then select it again.";
+  const NOT_FOUND = "File unavailable. It may have been removed or excluded from this workspace.";
+  const FINAL = "This file couldn't be loaded. Select it again to retry.";
+  const RETRYING = "This file couldn't be loaded. Retrying…";
+
+  test("a 403 tagged as not readable names the permission problem", () => {
+    expect(documentFailureMessage(status(403, "document not readable"), false)).toBe(PERMISSION);
+  });
+
+  test("a 403 without the tag gets the generic final notice", () => {
+    expect(documentFailureMessage(status(403), false)).toBe(FINAL);
+    expect(documentFailureMessage(status(403, "forbidden"), false)).toBe(FINAL);
+  });
+
+  test("a 404 keeps the not-found notice", () => {
+    expect(documentFailureMessage(status(404, "document not found"), false)).toBe(NOT_FOUND);
+  });
+
+  test("any other final failure gets the generic final notice", () => {
+    expect(documentFailureMessage(status(415, "document is not viewable"), false)).toBe(FINAL);
+    expect(documentFailureMessage(status(400), false)).toBe(FINAL);
+    expect(documentFailureMessage(status(401), false)).toBe(FINAL);
+    expect(documentFailureMessage({ kind: "unreadable" }, false)).toBe(FINAL);
+  });
+
+  test("a transient failure says it is retrying until the schedule is used up", () => {
+    expect(documentFailureMessage({ kind: "no-answer" }, true)).toBe(RETRYING);
+    expect(documentFailureMessage(status(500), true)).toBe(RETRYING);
+    expect(documentFailureMessage({ kind: "no-answer" }, false)).toBe(FINAL);
+    expect(documentFailureMessage(status(502), false)).toBe(FINAL);
   });
 });
 

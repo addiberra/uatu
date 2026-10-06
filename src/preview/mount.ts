@@ -43,8 +43,10 @@ import { documentRevisionKey } from "../shell/document-state";
 import { enrichDocumentFacts, forgetDocumentFacts } from "./facts-enrichment";
 import {
   createDocumentLoadRetry,
+  documentFailureMessage,
   documentLoadRetryKey,
   isTransientDocumentFailure,
+  type DocumentLoadFailure,
   type DocumentLoadTrigger,
 } from "./load-retry";
 
@@ -472,31 +474,23 @@ async function executeLoadDocument(documentId: string, trigger: DocumentLoadTrig
   // the viewMode is somehow "diff" we already short-circuited above; this
   // assertion narrows the param so the response stays well-typed.
   const apiView: "rendered" | "source" = appState.viewMode === "source" ? "source" : "rendered";
-  let payload: RenderedDocument | null = null;
-  let failedStatus: number | null = null;
-  try {
-    const response = await fetch(
-      contextualAppUrl(appUrl(`/api/document?id=${encodeURIComponent(documentId)}&view=${encodeURIComponent(apiView)}`)),
-      { cache: "no-store" },
-    );
-    if (response.ok) payload = (await response.json()) as RenderedDocument;
-    else failedStatus = response.status;
-  } catch {
-    // No answer (or an unreadable one): transient, like a 5xx.
-    failedStatus = null;
-  }
+  const result = await fetchDocumentPayload(documentId, apiView);
 
   if (!isCurrent()) return;
-  if (!payload) {
-    if (!isTransientDocumentFailure(failedStatus)) {
-      // The server says the file is not there (or not viewable). The live
-      // document topic re-fetches if that changes (see shouldRefreshPreview).
+  if (!result.ok) {
+    const { failure } = result;
+    if (!isTransientDocumentFailure(failure)) {
+      // The server stated something about the document (gone, not readable,
+      // not viewable), or answered OK with something that is not a document.
+      // Retrying would get the same answer; the live document topic
+      // re-fetches if the file changes (see shouldRefreshPreview), and
+      // selecting it again makes one new request.
       documentLoadRetry.settle();
-      renderUnavailableDocument(documentId);
+      renderUnavailableDocument(documentId, documentFailureMessage(failure, false));
       return;
     }
-    // The server failed, not the file. Nothing else will ask again, so retry
-    // while this is still the load the user is waiting on.
+    // The server failed, or no complete answer arrived. Nothing else will
+    // ask again, so retry while this is still the load the user is waiting on.
     const retrying = documentLoadRetry.failed(documentLoadRetryKey({
       selectionGeneration: loadToken.selectionGeneration,
       activation,
@@ -504,18 +498,54 @@ async function executeLoadDocument(documentId: string, trigger: DocumentLoadTrig
     }), () => {
       if (isCurrent()) void loadDocument(documentId, undefined, "retry");
     }, trigger);
-    renderUnavailableDocument(
-      documentId,
-      retrying
-        ? "This file couldn't be loaded. Retrying…"
-        : "This file couldn't be loaded. Select it again to retry.",
-    );
+    renderUnavailableDocument(documentId, documentFailureMessage(failure, retrying));
     return;
   }
 
+  const payload = result.payload;
   documentLoadRetry.settle();
   rememberDocumentPayload(payload);
   await applyDocumentPayload(payload, isCurrent);
+}
+
+// One `/api/document` request, classified. The body is read as text and
+// parsed separately so a broken stream (no complete answer: transient) is
+// told apart from an OK answer that does not parse (final); `response.json()`
+// would merge the two into one rejection.
+async function fetchDocumentPayload(
+  documentId: string,
+  view: "rendered" | "source",
+): Promise<{ ok: true; payload: RenderedDocument } | { ok: false; failure: DocumentLoadFailure }> {
+  let response: Response;
+  let text: string;
+  try {
+    response = await fetch(
+      contextualAppUrl(appUrl(`/api/document?id=${encodeURIComponent(documentId)}&view=${encodeURIComponent(view)}`)),
+      { cache: "no-store" },
+    );
+    text = await response.text();
+  } catch {
+    return { ok: false, failure: { kind: "no-answer" } };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    parsed = undefined;
+  }
+  if (!response.ok) {
+    const error = (parsed as { error?: unknown } | null | undefined)?.error;
+    return {
+      ok: false,
+      failure: typeof error === "string"
+        ? { kind: "status", status: response.status, error }
+        : { kind: "status", status: response.status },
+    };
+  }
+  if (typeof parsed !== "object" || parsed === null || typeof (parsed as { html?: unknown }).html !== "string") {
+    return { ok: false, failure: { kind: "unreadable" } };
+  }
+  return { ok: true, payload: parsed as RenderedDocument };
 }
 
 function renderUnavailableDocument(

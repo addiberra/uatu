@@ -283,9 +283,14 @@ export function buildRoutes(deps: BuildRoutesDeps): Serve.Routes<unknown, string
           if (status === 404) {
             return Response.json({ error: "document not found" }, { status });
           }
-          // The server failing (a renderer throw, EMFILE, EACCES): the
-          // client retries, so the session log is the only place the cause
-          // shows up. The response body stays generic.
+          if (status === 403) {
+            // Permission denied: about the document, not the server, and the
+            // client explains it, so it is not logged (like 404 and 415).
+            return Response.json({ error: "document not readable" }, { status });
+          }
+          // The server failing (a renderer throw, EMFILE, EIO, an unknown
+          // error): the client retries, so the session log is the only place
+          // the cause shows up. The response body stays generic.
           console.error(`uatu: /api/document render failed for ${documentId}:`, error);
           return Response.json({ error: "document render failed" }, { status });
         }
