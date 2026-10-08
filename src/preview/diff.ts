@@ -53,7 +53,12 @@ function loadingSignal(): LoadingSignal {
 // newest invocation may settle the signal, so a superseded fetch finishing
 // first (rapid file switching while Diff is active) cannot clear the busy
 // state out from under the request the user is actually waiting on.
+import { documentRevisionKey } from "../shell/document-state";
 let diffLoadGeneration = 0;
+
+function diffRevisionKey(documentId: string): string {
+  return `${documentRevisionKey(documentId)}:${appState.repositoryFreshness.generation}:${appState.compareTarget}`;
+}
 
 export function cancelDiffPresentation(): void {
   ++diffLoadGeneration;
@@ -64,8 +69,10 @@ export function cancelDiffPresentation(): void {
 export async function applyDiffForActiveDocument(documentId: string): Promise<void> {
   const selectionGeneration = getSelectionGeneration();
   const generation = ++diffLoadGeneration;
+  const revision = diffRevisionKey(documentId);
   const isCurrent = () => generation === diffLoadGeneration
     && selectionGeneration === getSelectionGeneration()
+    && revision === diffRevisionKey(documentId)
     && appState.previewMode.kind === "document"
     && appState.selectedId === documentId
     && appState.viewMode === "diff"
@@ -113,7 +120,7 @@ export async function applyDiffForActiveDocument(documentId: string): Promise<vo
 
 export async function fetchDocumentDiff(documentId: string): Promise<DocumentDiffPayload | null> {
   try {
-    const response = await fetch(contextualAppUrl(appUrl(`/api/document/diff?id=${encodeURIComponent(documentId)}`)));
+    const response = await fetch(contextualAppUrl(appUrl(`/api/document/diff?id=${encodeURIComponent(documentId)}`)), { cache: "no-store" });
     if (!response.ok) {
       return null;
     }
@@ -132,7 +139,9 @@ export async function renderDiffIntoPreview(
 ): Promise<void> {
   const selectionGeneration = getSelectionGeneration();
   const generation = ++diffRenderGeneration;
+  const revision = diffRevisionKey(documentId);
   const isCurrent = () => generation === diffRenderGeneration && ownsLoad()
+    && revision === diffRevisionKey(documentId)
     && selectionGeneration === getSelectionGeneration()
     && appState.previewMode.kind === "document"
     && appState.selectedId === documentId && appState.viewMode === "diff"

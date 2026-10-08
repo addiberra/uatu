@@ -3,8 +3,9 @@ import { mkdtemp, mkdir, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
-import { collectConfigWarnings, collectRepositorySnapshots, parseDiffPath, safeGit } from "./git-data";
+import { collectConfigWarnings, collectRepositorySnapshots, collectRepositorySnapshotsByTarget, parseDiffPath, safeGit, setGitMetricsSink } from "./git-data";
 import type { WatchEntry } from "../server/roots";
+import type { RepositorySnapshot } from "../shared/types";
 
 const tempDirectories: string[] = [];
 
@@ -13,6 +14,28 @@ afterEach(async () => {
 });
 
 describe("repository snapshots", () => {
+  test("both comparison targets share common Git work", async () => {
+    const repo = await createRepo();
+    const entries: WatchEntry[] = [{ kind: "dir", absolutePath: repo }];
+    let commands = 0;
+    setGitMetricsSink({ inc: name => { if (name === "git.execs_total") commands++; } });
+    try {
+      const base = await collectRepositorySnapshots(entries, [], "base");
+      const last = await collectRepositorySnapshots(entries, [], "last-commit");
+      const separate = commands;
+      commands = 0;
+      const combined = await collectRepositorySnapshotsByTarget(entries, []);
+      // Separate Git invocations can cross a second boundary. Compare the
+      // repository data without Git's wall-clock-relative display text.
+      const stable = (snapshots: RepositorySnapshot[]) => snapshots.map(snapshot => ({
+        ...snapshot,
+        commitLog: snapshot.commitLog.map(({ relativeTime, ...commit }) => commit),
+      }));
+      expect(stable(combined.base)).toEqual(stable(base));
+      expect(stable(combined["last-commit"])).toEqual(stable(last));
+      expect(commands).toBeLessThan(separate);
+    } finally { setGitMetricsSink(null); }
+  });
   test("reports an explicit non-git state for roots outside a repository", async () => {
     const tempDirectory = await mkdtemp(path.join(os.tmpdir(), "uatu-git-data-non-git-"));
     tempDirectories.push(tempDirectory);
