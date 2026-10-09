@@ -10,7 +10,7 @@ import { applyProjectIdentity } from "./identity";
 import { findDocumentById, findDocumentByRelativePath, syncStateGeneration } from "./storage";
 import { signalActiveDocumentUpdated } from "../preview/file-facts-strip";
 import { documentDiffCache, forgetDocumentCache, loadDocument } from "../preview/mount";
-import { applyDiffForActiveDocument } from "../preview/diff";
+import { applyDiffForActiveDocument, diffInputsMoved, dropStaleDiffs, forgetAllDiffs } from "../preview/diff";
 import { renderEmptyPreview } from "../preview/empty";
 import { renderSidebar, renderSidebarPatch } from "../sidebar/shell";
 import { documentIndex, resetDocumentIndex, documentRevisionKey } from "./document-state";
@@ -23,6 +23,7 @@ import {
   hasDocument,
   shouldRefreshPreview,
   type StatePayload,
+  type RootGroup,
 } from "../shared/types";
 import { applyChannelStatus } from "./connection";
 import type { LiveSubscriptionHandle, LiveTopicConsumer } from "./live-channel";
@@ -97,14 +98,39 @@ function hasNewRepositoryState(update: DocumentUpdate): boolean {
 // `scope`). The SSE reducer below is the ongoing writer; the boot path
 // (`shell/boot.ts`) applies its initial /api/state payload through
 // `adoptBootSnapshot`, which also records its freshness.
+// .gitattributes documents and their revisions: a change decides how Git
+// diffs files without touching them, so cached diffs are dropped.
+function attributesSignature(roots: readonly RootGroup[] | undefined): string {
+  return (roots ?? []).flatMap(root => root.docs)
+    .filter(doc => /(^|\/)\.gitattributes$/.test(doc.id))
+    .map(doc => `${doc.id}:${doc.revision}`).sort().join("\n");
+}
+// Set when a snapshot changed attributes, so the frame or reconciler path
+// that applied it re-fetches an open diff.
+let attributesRefetch = false;
+function takeAttributesRefetch(): boolean {
+  const value = attributesRefetch;
+  attributesRefetch = false;
+  return value;
+}
+
 function applyServerSnapshot(payload: StatePayload): boolean {
+  let repositoryUpdated = false;
   if ((payload as DocumentSnapshot).kind === "snapshot") {
     const snapshot = payload as DocumentSnapshot;
-    const repositoryChanged = hasNewRepositoryState(snapshot);
+    repositoryUpdated = hasNewRepositoryState(snapshot);
     const previous = documentIndex.view();
+    // A snapshot replaces patches missed while disconnected, including a
+    // .gitattributes edit.
+    if (previous && attributesSignature(previous.roots) !== attributesSignature(snapshot.roots)) {
+      forgetAllDiffs();
+      attributesRefetch = true;
+    }
     if (previous && !sameDocumentContext(previous, snapshot)) resetDocumentIndex();
     if (documentIndex.apply(snapshot) !== "applied") return false;
-    if (repositoryChanged) documentDiffCache.clear();
+    // A new epoch or compare target invalidates every diff; a repository
+    // update only those whose inputs moved (after repositories are applied).
+    if (snapshot.epoch !== previous?.epoch || snapshot.compareTarget !== previous?.compareTarget) documentDiffCache.clear();
     appState.discovery = snapshot.discovery;
     appState.repositoryFreshness = snapshot.repositoryState;
   }
@@ -113,6 +139,7 @@ function applyServerSnapshot(payload: StatePayload): boolean {
   checkBuildFreshness(payload.build);
   appState.roots = payload.roots;
   appState.repositories = payload.repositories ?? [];
+  if ((payload as DocumentSnapshot).kind === "snapshot" && repositoryUpdated) dropStaleDiffs();
   setClientScope(payload.scope);
   appState.unscopedFingerprint = payload.unscopedFingerprint ?? null;
   // The Search pane names the scope in effect; it has to hear about changes.
@@ -147,16 +174,10 @@ export function connectEvents() {
     installed = true;
     const unsubscribeStatus = liveChannel().onStatus(applyChannelStatus);
     const unregisterRecovery = registerRecoveryWork(() => stateReconciler.reconcile());
-    // Repository-only refresh covers edits outside a narrow document root.
-    // Hidden pages and pages without visible Git UI do not request it.
-    const repositoryRefresh = setInterval(() => {
-      if (document.visibilityState === "hidden") return;
-      const visible = ["change-overview", "git-log"] as const;
-      if (appState.viewMode !== "diff" && !visible.some(id => appState.panes[id].visible && !appState.panes[id].collapsed)) return;
-      void fetch(appUrl("/api/repositories/refresh"), { method: "POST", signal: AbortSignal.timeout(4000) }).catch(() => {});
-    }, 5000);
+    // Repository data arrives on the document topic. The server observes Git
+    // metadata, and for a narrow root its repository's working tree, so the
+    // page never polls for it.
     registerLiveTeardown(() => {
-      clearInterval(repositoryRefresh);
       unsubscribeStatus();
       unregisterRecovery();
       documentSubscription?.close();
@@ -199,10 +220,12 @@ async function applyDocumentPatch(patch: DocumentPatch, generation: number): Pro
   const result = documentIndex.apply(patch);
   if (result === "resync") { subscribeDocument(); return; }
   if (result === "ignored") { liveChannel().confirm(generation); return; }
-  if (repositoryChanged) documentDiffCache.clear();
   const payload = documentIndex.view()!;
   appState.roots = payload.roots;
   appState.repositories = payload.repositories;
+  if (repositoryChanged) dropStaleDiffs();
+  const attributesChanged = [...patch.upserts, ...patch.removals].some(doc => /(^|\/)\.gitattributes$/.test(doc.id));
+  if (attributesChanged) forgetAllDiffs();
   appState.discovery = payload.discovery;
   appState.repositoryFreshness = payload.repositoryState;
   appState.unscopedFingerprint = payload.unscopedFingerprint ?? null;
@@ -251,7 +274,7 @@ async function applyDocumentPatch(patch: DocumentPatch, generation: number): Pro
   if (next && reload) {
     await loadDocument(next);
     if (next === selected && appState.selectedId === next && current) signalActiveDocumentUpdated();
-  } else if (next && repositoryChanged && appState.viewMode === "diff") {
+  } else if (next && appState.viewMode === "diff" && (attributesChanged || repositoryChanged && diffInputsMoved(next))) {
     await applyDiffForActiveDocument(next);
   } else if (!next && !renderPendingDocument() && reload) renderEmptyPreview("No document selected", "Waiting for viewable files");
 }
@@ -367,7 +390,7 @@ async function applyDocumentFrame(payload: StatePayload, generation: number): Pr
 
   if (appState.selectedId && !hasDocument(payload.roots, appState.selectedId)) {
     await loadDocument(appState.selectedId);
-  } else if (appState.selectedId && repositoryChanged && appState.viewMode === "diff") {
+  } else if (appState.selectedId && appState.viewMode === "diff" && (takeAttributesRefetch() || repositoryChanged && diffInputsMoved(appState.selectedId))) {
     await applyDiffForActiveDocument(appState.selectedId);
   } else if (!appState.selectedId) {
     if (!renderPendingDocument()) renderEmptyPreview("No document selected", "Waiting for viewable files");
@@ -457,7 +480,7 @@ const stateReconciler = createStateReconciler<StatePayload>({
         // silent.
         if (appState.selectedId === selectedId && hasDocument(appState.roots, selectedId)) signalActiveDocumentUpdated();
       });
-    } else if (activeId && repositoryChanged && appState.viewMode === "diff") {
+    } else if (activeId && appState.viewMode === "diff" && (takeAttributesRefetch() || repositoryChanged && diffInputsMoved(activeId))) {
       void applyDiffForActiveDocument(activeId);
     } else if (!activeId && !renderPendingDocument() && reconcileFollow) renderEmptyPreview("No document selected", "Waiting for viewable files");
   },

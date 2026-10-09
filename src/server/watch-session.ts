@@ -118,7 +118,9 @@ export function createWatchSession(entries: WatchEntry[], initialFollow: boolean
   };
 
   const repositories = createRepositoryRefresh({ entries, roots: unscopedRoots, collect: options.collectRepositories,
-    onProbe: () => metrics?.inc("reconcile.ticks_total"),
+    usePolling: options.usePolling,
+    onObserverEvent: () => metrics?.inc("git_observer.events_total"),
+    onFallback: () => metrics?.inc("git_observer.fallback_total"),
     publish: (results, freshness) => {
       if (stopped) return;
       const changed = results !== publishedRepositories;
@@ -209,6 +211,14 @@ export function createWatchSession(entries: WatchEntry[], initialFollow: boolean
         return;
       }
       index.observe(event, file, stats);
+    });
+    // Every path the native watcher saw, excluded ones included. The content
+    // policy drops built-in folders (dist/, build/, node_modules) and
+    // .uatu.json excludes that Git may still track; the Git observer filters
+    // these by Git's own ignore rules. Accepted paths also arrive here and
+    // coalesce with the file batch's own repository request.
+    watcher.on("raw", (_event: string, file: string) => {
+      if (!stopped && owned.has(root)) repositories.noteWorkingTreeChange(file);
     });
     watcher.once("ready", () => {
       root.ready = true; index.markReady();

@@ -40,9 +40,16 @@ async function deliver(page: Page, state: StatePayload | DocumentUpdate) {
   await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
 }
 
+// A Git-only change as the server publishes it: a commit moves HEAD, and
+// the repository generation advances. (An identical result is never
+// republished, so a bare generation bump does not occur.)
 function repositoryPatch(state: DocumentSnapshot): DocumentPatch {
   const previousRevision = state.revision++;
   state.repositoryState = { status: "ready", generation: state.repositoryState.generation + 1 };
+  state.repositories = state.repositories.map(repository => ({
+    ...repository,
+    metadata: { ...repository.metadata, commitShort: `commit-${state.repositoryState.generation}` },
+  }));
   state.changedId = null;
   return {
     kind: "patch", epoch: state.epoch, previousRevision, revision: state.revision,
@@ -92,6 +99,29 @@ test.describe("repository preview updates", () => {
       await expect(page.locator("#follow-toggle")).toBeFocused();
     });
   }
+
+  test("a snapshot carrying a changed .gitattributes re-fetches the open diff", async ({ page, request }) => {
+    let baseRef = "before-attributes";
+    await page.route("**/api/document/diff?*", route => route.fulfill({ json: { kind: "unchanged", baseRef } }));
+    await page.goto("/README.md");
+    await expect(page.locator("#preview-path")).toHaveText("README.md");
+    const state: DocumentSnapshot = await request.get("/api/state").then(r => r.json());
+    // An attributes file in the corpus, as the content index lists it.
+    const root = state.roots[0]!;
+    const attributes = { id: `${root.id}/.gitattributes`, name: ".gitattributes", relativePath: ".gitattributes", mtimeMs: Date.now(), rootId: root.id, kind: "text" as const, revision: 1 };
+    root.docs.push(attributes as never);
+    state.revision++;
+    await deliver(page, state);
+    await page.locator("#view-diff").click();
+    await expect(page.locator(".uatu-diff-state")).toContainText("before-attributes");
+    baseRef = "after-attributes";
+    // Reconnecting after a missed .gitattributes edit delivers a snapshot,
+    // not the patch; nothing else about the repository changed.
+    attributes.revision = 2;
+    state.revision++;
+    await deliver(page, state);
+    await expect(page.locator(".uatu-diff-state")).toContainText("after-attributes");
+  });
 
   test("a repository update invalidates a cached diff while Rendered stays visible", async ({ page, request }) => {
     let baseRef = "cached-before-commit";
