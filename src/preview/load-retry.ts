@@ -10,13 +10,17 @@
 // notice text can be tested directly; `mount.ts` builds the failure from the
 // response and decides whether a retry is still wanted when it fires.
 
+import { DOCUMENT_NOT_READABLE_ERROR } from "../shared/document-errors";
+
 export const DOCUMENT_LOAD_RETRY_DELAYS_MS: readonly number[] = [250, 1_000, 3_000, 10_000];
 
 // What went wrong loading a document from `/api/document`:
 // - "no-answer": the request got no complete answer (`fetch()` threw, or the
-//   body stream broke before it finished). A network failure.
+//   body of an OK answer broke before it finished). A network failure.
 // - "status": the server answered with a non-OK status; `error` is the
-//   body's machine tag when it could be read.
+//   body's machine tag when it could be read. The status line alone decides
+//   whether it is final, so a non-OK body that breaks mid-read is still a
+//   `status` failure, just without a tag.
 // - "unreadable": the server answered OK but the body is not a document
 //   payload. Asking again will not make it parse.
 export type DocumentLoadFailure =
@@ -40,19 +44,23 @@ export function isTransientDocumentFailure(failure: DocumentLoadFailure): boolea
   return false;
 }
 
-// Classifies one complete `/api/document` answer (status plus the body read
-// as text). A non-OK answer is a `status` failure, with the body's `error`
-// tag when the body is JSON carrying a string one; a body from something else
-// in the path (a proxy's HTML error page, say) yields no tag. An OK answer
+// Classifies one `/api/document` answer: its status plus the body read as
+// text, or `null` when reading the body threw. A non-OK answer is a `status`
+// failure, with the body's `error` tag when the body is JSON carrying a
+// string one; a body from something else in the path (a proxy's HTML error
+// page, say) or a body that could not be read yields no tag, and the status
+// alone decides (a 404 stays final, a 503 stays transient). An OK answer whose
+// body could not be read got no complete answer: `no-answer`. An OK answer
 // whose body does not parse, or has no string `html`, is `unreadable`.
-// `fetch()` or the body read throwing is the caller's "no-answer".
+// `fetch()` itself throwing is the caller's "no-answer".
 export function classifyDocumentResponse(
   response: { ok: boolean; status: number },
-  text: string,
+  text: string | null,
 ): { ok: true; payload: { html: string } } | { ok: false; failure: DocumentLoadFailure } {
+  if (text === null && response.ok) return { ok: false, failure: { kind: "no-answer" } };
   let parsed: unknown;
   try {
-    parsed = JSON.parse(text);
+    parsed = text === null ? undefined : JSON.parse(text);
   } catch {
     parsed = undefined;
   }
@@ -82,7 +90,7 @@ export function documentFailureMessage(failure: DocumentLoadFailure, retrying: b
       ? "This file couldn't be loaded. Retrying…"
       : "This file couldn't be loaded. Select it again to retry.";
   }
-  if (failure.kind === "status" && failure.status === 403 && failure.error === "document not readable") {
+  if (failure.kind === "status" && failure.status === 403 && failure.error === DOCUMENT_NOT_READABLE_ERROR) {
     return "Uatu doesn't have permission to read this file. Change its permissions, then select it again.";
   }
   if (failure.kind === "status" && failure.status === 404) {

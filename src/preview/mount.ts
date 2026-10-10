@@ -510,23 +510,30 @@ async function executeLoadDocument(documentId: string, trigger: DocumentLoadTrig
 }
 
 // One `/api/document` request, classified (see classifyDocumentResponse).
-// The body is read as text and parsed separately so a broken stream (no
-// complete answer: transient) is told apart from an OK answer that does not
-// parse (final); `response.json()` would merge the two into one rejection.
+// `fetch()` throwing is no answer at all. Once the status line is in, the body
+// is read in its own `try` and parsed separately: a body that breaks mid-read
+// leaves a non-OK answer classified by its status (a 404 stays final) and an
+// OK answer as no complete answer (transient), and an OK answer that does not
+// parse is told apart from both (final); `response.json()` would merge them
+// into one rejection.
 async function fetchDocumentPayload(
   documentId: string,
   view: "rendered" | "source",
 ): Promise<{ ok: true; payload: RenderedDocument } | { ok: false; failure: DocumentLoadFailure }> {
   let response: Response;
-  let text: string;
   try {
     response = await fetch(
       contextualAppUrl(appUrl(`/api/document?id=${encodeURIComponent(documentId)}&view=${encodeURIComponent(view)}`)),
       { cache: "no-store" },
     );
-    text = await response.text();
   } catch {
     return { ok: false, failure: { kind: "no-answer" } };
+  }
+  let text: string | null;
+  try {
+    text = await response.text();
+  } catch {
+    text = null;
   }
   const result = classifyDocumentResponse(response, text);
   return result.ok ? { ok: true, payload: result.payload as RenderedDocument } : result;

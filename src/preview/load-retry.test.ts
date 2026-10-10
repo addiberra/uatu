@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
+import { DOCUMENT_NOT_READABLE_ERROR } from "../shared/document-errors";
 import { appState } from "../shell/state";
 import { getSelectionActivation, getSelectionGeneration, setSelectedId } from "../shell/selection";
 import {
@@ -54,19 +55,20 @@ describe("isTransientDocumentFailure", () => {
     for (const code of [400, 401, 403, 404, 405, 409, 410, 413, 415, 418, 422, 428, 431, 451]) {
       expect(isTransientDocumentFailure(status(code))).toBe(false);
     }
-    expect(isTransientDocumentFailure(status(403, "document not readable"))).toBe(false);
+    expect(isTransientDocumentFailure(status(403, DOCUMENT_NOT_READABLE_ERROR))).toBe(false);
     expect(isTransientDocumentFailure({ kind: "unreadable" })).toBe(false);
   });
 });
 
+const PERMISSION = "Uatu doesn't have permission to read this file. Change its permissions, then select it again.";
+const NOT_FOUND = "File unavailable. It may have been removed or excluded from this workspace.";
+const FINAL = "This file couldn't be loaded. Select it again to retry.";
+const RETRYING = "This file couldn't be loaded. Retrying…";
+
 describe("documentFailureMessage", () => {
-  const PERMISSION = "Uatu doesn't have permission to read this file. Change its permissions, then select it again.";
-  const NOT_FOUND = "File unavailable. It may have been removed or excluded from this workspace.";
-  const FINAL = "This file couldn't be loaded. Select it again to retry.";
-  const RETRYING = "This file couldn't be loaded. Retrying…";
 
   test("a 403 tagged as not readable names the permission problem", () => {
-    expect(documentFailureMessage(status(403, "document not readable"), false)).toBe(PERMISSION);
+    expect(documentFailureMessage(status(403, DOCUMENT_NOT_READABLE_ERROR), false)).toBe(PERMISSION);
   });
 
   test("a 403 without the tag gets the generic final notice", () => {
@@ -119,8 +121,8 @@ describe("documentFailureMessage", () => {
 
 describe("classifyDocumentResponse", () => {
   test("a non-OK answer carries the body's error tag only when it is a JSON string", () => {
-    expect(classifyDocumentResponse({ ok: false, status: 403 }, JSON.stringify({ error: "document not readable" })))
-      .toEqual({ ok: false, failure: { kind: "status", status: 403, error: "document not readable" } });
+    expect(classifyDocumentResponse({ ok: false, status: 403 }, JSON.stringify({ error: DOCUMENT_NOT_READABLE_ERROR })))
+      .toEqual({ ok: false, failure: { kind: "status", status: 403, error: DOCUMENT_NOT_READABLE_ERROR } });
     expect(classifyDocumentResponse({ ok: false, status: 403 }, "<html>Forbidden</html>"))
       .toEqual({ ok: false, failure: { kind: "status", status: 403 } });
     expect(classifyDocumentResponse({ ok: false, status: 403 }, JSON.stringify({ error: 403 })))
@@ -129,6 +131,30 @@ describe("classifyDocumentResponse", () => {
       .toEqual({ ok: false, failure: { kind: "status", status: 502 } });
     expect(classifyDocumentResponse({ ok: false, status: 429 }, "null"))
       .toEqual({ ok: false, failure: { kind: "status", status: 429 } });
+  });
+
+  test("a non-OK answer whose body read fails is classified by its status alone, with no tag", () => {
+    for (const code of [403, 404, 415]) {
+      const result = classifyDocumentResponse({ ok: false, status: code }, null);
+      expect(result).toEqual({ ok: false, failure: { kind: "status", status: code } });
+      if (!result.ok) expect(isTransientDocumentFailure(result.failure)).toBe(false);
+    }
+    const forbidden = classifyDocumentResponse({ ok: false, status: 403 }, null);
+    if (!forbidden.ok) expect(documentFailureMessage(forbidden.failure, false)).toBe(FINAL);
+    const missing = classifyDocumentResponse({ ok: false, status: 404 }, null);
+    if (!missing.ok) expect(documentFailureMessage(missing.failure, false)).toBe(NOT_FOUND);
+  });
+
+  test("a 503 whose body read fails stays transient through its status", () => {
+    const result = classifyDocumentResponse({ ok: false, status: 503 }, null);
+    expect(result).toEqual({ ok: false, failure: { kind: "status", status: 503 } });
+    if (!result.ok) expect(isTransientDocumentFailure(result.failure)).toBe(true);
+  });
+
+  test("an OK answer whose body read fails got no complete answer", () => {
+    const result = classifyDocumentResponse({ ok: true, status: 200 }, null);
+    expect(result).toEqual({ ok: false, failure: { kind: "no-answer" } });
+    if (!result.ok) expect(isTransientDocumentFailure(result.failure)).toBe(true);
   });
 
   test("an OK answer is a payload only when it parses and has a string html", () => {

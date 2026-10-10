@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { buildFetchFallback, buildRoutes } from "./routes";
+import { DOCUMENT_NOT_READABLE_ERROR } from "../shared/document-errors";
 import { scanRoots } from "./roots";
 import * as markdownRenderer from "../render/markdown";
 import { NotificationFeed, CHILD_NOTIFICATIONS_PATH } from "../chat/notification-feed";
@@ -265,7 +266,7 @@ describe("buildRoutes — /api/document failures", () => {
       const result = await documentStatus(filePath => chmod(filePath, 0o000));
       expect({ status: result.status, body: result.body }).toEqual({
         status: 403,
-        body: { error: "document not readable" },
+        body: { error: DOCUMENT_NOT_READABLE_ERROR },
       });
       expect(result.logged).toEqual([]);
     },
