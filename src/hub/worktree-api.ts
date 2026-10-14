@@ -263,14 +263,24 @@ export function createWorktreeApi(deps: WorktreeApiDeps) {
     } catch (error) {
       return refusal("forget", worktreeError("invalid-input", error instanceof Error ? error.message : "The request is not valid."));
     }
-    const inventory = await inventoryFor(source, "open");
-    if (inventory.status === "error") {
-      return refusal("forget", inventory.error ?? worktreeError("inventory-unavailable", "The worktree inventory is unavailable.", { retry: "refresh" }));
+    // A registered workspace id is the service's own vocabulary and needs no
+    // Git read: forgetting touches no files, and the service checks family
+    // membership against the registry. Reading the repository first would
+    // strand a registration whose files were deleted outside Uatu (#504):
+    // the inventory of a repository that no longer exists is an error. Only
+    // a branch name or a checkout id is resolved against the inventory.
+    let reference = request.reference;
+    if (!deps.registry.byId(reference)) {
+      const inventory = await inventoryFor(source, "open");
+      if (inventory.status === "error") {
+        return refusal("forget", inventory.error ?? worktreeError("inventory-unavailable", "The worktree inventory is unavailable.", { retry: "refresh" }));
+      }
+      const resolved = resolveWorktreeReference(inventory, reference);
+      if (!resolved.ok) return refusal("forget", resolved.error);
+      reference = resolved.reference;
     }
-    const resolved = resolveWorktreeReference(inventory, request.reference);
-    if (!resolved.ok) return refusal("forget", resolved.error);
-    const result = await deps.service.forget(principal.user, { sourceWorkspaceId: source, reference: resolved.reference, stop: true });
-    if (result.ok) committed(source, [resolved.reference]);
+    const result = await deps.service.forget(principal.user, { sourceWorkspaceId: source, reference, stop: true });
+    if (result.ok) committed(source, [reference]);
     return json(200, result);
   };
 

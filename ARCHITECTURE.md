@@ -357,7 +357,10 @@ session-authenticated JSON family, `worktree-api.ts` at
 /{fetch,create,open,preflight-delete,delete,register,forget}`), published
 like any other hub route with no separate progress poll: each call answers
 its own bounded outcome, and a safety refusal is an ordinary `{ok: false,
-error}` response rather than a transport failure. `src/shell/worktree-dialog.ts`
+error}` response rather than a transport failure. `forget` ("Remove from
+Uatu") touches no files and, given a registered workspace id, reads no Git,
+so a family whose checkouts were deleted outside Uatu is still removable:
+its worktrees first, then the main workspace. `src/shell/worktree-dialog.ts`
 is the one client for that family — a shadow-DOM dialog embedded both in
 the in-workspace picker (`shell/hub-nav.ts`) and the hub dashboard
 (`hub/pages.ts`) — and `shell/worktree-live.ts` refreshes an open

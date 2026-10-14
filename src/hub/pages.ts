@@ -1842,10 +1842,10 @@ async function refresh(force) {
         if (forget && (w.parentId || w.createWorktree === true || dashboardWorkspaces.some(child => child.parentId === w.id))) {
           forget.textContent = "Remove from Uatu";
           forget.setAttribute("aria-label", "Remove " + workspaceLabel(w) + " from Uatu");
-          forget.onclick = () => openWorktreeDialog({ ...target, view: "forget", id: w.id }, forget);
+          forget.onclick = () => openWorktreeDialog({ ...target, view: "forget", id: w.id, label: workspaceLabel(w) }, forget);
         }
         if (w.availability) {
-          const warning = el("p", "action-error", (w.availability === "missing" ? "Missing checkout" : "Identity conflict — path replaced") + ". Restore the original checkout externally, then retry. Nothing will be recreated.");
+          const warning = el("p", "action-error", (w.availability === "missing" ? "Missing checkout" : "Identity conflict — path replaced") + ". Restore the original checkout externally, then retry, or remove it from Uatu. Nothing will be recreated.");
           warning.setAttribute("role", "alert");
           // W3: appended to .row directly, the warning took width as a flex
           // item in .row's row-direction flexbox and squeezed .row-main

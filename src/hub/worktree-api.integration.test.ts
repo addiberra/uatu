@@ -42,6 +42,7 @@ let origin = "";
 let cookie = "";
 let server: ReturnType<typeof startHubServer>;
 let registry: WorkspaceRegistry;
+let onboarding: WorkspaceOnboardingCoordinator;
 let atlasId = "";
 
 function cleanEnvironment(): Record<string, string> {
@@ -137,7 +138,7 @@ beforeAll(async () => {
   // production): the create's own path fence and the registration step it
   // triggers never actually contended for the same reservation coordinator.
   const reservations = new PathReservationCoordinator();
-  const onboarding = new WorkspaceOnboardingCoordinator({
+  onboarding = new WorkspaceOnboardingCoordinator({
     journalPath: path.join(state, "pending-onboarding.json"),
     registry,
     credentials,
@@ -588,6 +589,108 @@ describe("fetch, preflight-delete, register and forget over JSON (8.1)", () => {
     expect(refused.ok).toBe(false);
     if (refused.ok) return;
     expect(refused.error.code).toBe("not-found");
+  });
+});
+
+// Issue #504: a repository workspace and its worktrees whose files were
+// deleted outside Uatu stay listed, and "Remove from Uatu" must still clear
+// them. Forgetting never touches the filesystem, so a repository Git can no
+// longer read must not block it; deletion's guards are unchanged.
+describe("removing registrations whose files were deleted outside Uatu (#504)", () => {
+  async function onboardFamily(name: string): Promise<{ folder: string; parentId: string; children: string[] }> {
+    const folder = await repository(name);
+    const parentId = (await onboarding.configureExisting({ path: folder, displayName: name, authentication: [], signing: null, init: false, start: false })).entry.id;
+    const children: string[] = [];
+    for (const branch of [`${name}/one`, `${name}/two`]) {
+      const created = await result(await post("create", { sourceWorkspaceId: parentId, mode: "new-branch", branch, base: { kind: "local", ref: "main" } }));
+      if (!created.ok || !created.checkout?.workspaceId) throw new Error(`expected ${branch} to be created`);
+      children.push(created.checkout.workspaceId);
+    }
+    return { folder, parentId, children };
+  }
+
+  async function hubWorkspaceIds(): Promise<string[]> {
+    const response = await fetch(`${origin}/api/hub/state`, withSession());
+    expect(response.status).toBe(200);
+    return (await response.json() as { workspaces: Array<{ id: string }> }).workspaces.map(workspace => workspace.id);
+  }
+
+  test("a repository whose main checkout and worktrees are all gone is removed child by child, then the repository", async () => {
+    const { folder, parentId, children } = await onboardFamily("derelict");
+    const childPaths = children.map(id => registry.byId(id)!.path);
+    await rm(folder, { recursive: true, force: true });
+    await rm(`${folder}.worktrees`, { recursive: true, force: true });
+    expect(await hubWorkspaceIds()).toEqual(expect.arrayContaining([parentId, ...children]));
+    // The inventory says what happened rather than blaming Git.
+    const unreadable = await fetch(`${origin}${WORKTREE_API_PATH}?source=${parentId}`, withSession());
+    const listing = parseWorktreeInventory((await unreadable.json() as { inventory: unknown }).inventory);
+    expect(listing.status).toBe("error");
+    expect(listing.error).toMatchObject({ code: "not-found" });
+    expect(listing.error!.message).toContain("folder no longer exists");
+
+    // The parent still governs its registered children, so it goes last.
+    const parentFirst = await result(await post("forget", { sourceWorkspaceId: parentId, reference: parentId }));
+    expect(parentFirst.ok).toBe(false);
+    if (parentFirst.ok) return;
+    expect(parentFirst.error.message).toContain("worktrees from Uatu first");
+    expect(registry.byId(parentId)).toBeDefined();
+
+    // A child's dashboard row names its own id; the API maps it to the parent.
+    const first = await result(await post("forget", { sourceWorkspaceId: children[0], reference: children[0] }));
+    expect(first.ok).toBe(true);
+    const second = await result(await post("forget", { sourceWorkspaceId: parentId, reference: children[1] }));
+    expect(second.ok).toBe(true);
+    // With no folder left there is no `.git` to fork from, so the dashboard
+    // offers the main row the plain unregister, which needs no Git either.
+    const state = await (await fetch(`${origin}/api/hub/state`, withSession())).json() as { workspaces: Array<Record<string, unknown>> };
+    expect(state.workspaces.find(workspace => workspace.id === parentId)!.createWorktree).toBeUndefined();
+    const parent = await fetch(`${origin}/api/hub/workspaces/${parentId}/forget`, withSession({ method: "POST", headers: { origin } }));
+    expect(parent.status).toBe(200);
+
+    for (const id of [parentId, ...children]) expect(registry.byId(id)).toBeUndefined();
+    expect((await hubWorkspaceIds()).some(id => id === parentId || children.includes(id))).toBe(false);
+    // Nothing was recreated on the way.
+    for (const gone of [folder, ...childPaths]) expect(existsSync(gone)).toBe(false);
+  });
+
+  test("the worktree API removes a deleted main workspace by id once no worktree depends on it", async () => {
+    const folder = await repository("vanished");
+    const parentId = (await onboarding.configureExisting({ path: folder, displayName: "vanished", authentication: [], signing: null, init: false, start: false })).entry.id;
+    await rm(folder, { recursive: true, force: true });
+    const forgotten = await result(await post("forget", { sourceWorkspaceId: parentId, reference: parentId }));
+    expect(forgotten.ok).toBe(true);
+    expect(registry.byId(parentId)).toBeUndefined();
+    // A name that only the inventory could resolve still needs it.
+    const byBranch = await result(await post("forget", { sourceWorkspaceId: atlasId, reference: "no-such-branch" }));
+    expect(byBranch.ok).toBe(false);
+  });
+
+  test("with the main checkout intact, a deleted worktree is removed from Uatu while its sibling stays guarded", async () => {
+    const { folder, parentId, children } = await onboardFamily("partial");
+    const [goneId, keptId] = children as [string, string];
+    const gonePath = registry.byId(goneId)!.path;
+    const keptPath = registry.byId(keptId)!.path;
+    await rm(gonePath, { recursive: true, force: true });
+
+    // Deletion still refuses a checkout it cannot verify.
+    const preflightGone = await preflight(await post("preflight-delete", { sourceWorkspaceId: parentId, reference: goneId }));
+    expect(preflightGone.ok).toBe(false);
+
+    const forgotten = await result(await post("forget", { sourceWorkspaceId: parentId, reference: goneId }));
+    expect(forgotten.ok).toBe(true);
+    expect(registry.byId(goneId)).toBeUndefined();
+    expect(existsSync(gonePath)).toBe(false);
+
+    // The sibling that still exists keeps every deletion guard: its local
+    // data must be acknowledged before anything is removed.
+    await writeFile(path.join(keptPath, "draft.txt"), "keep me\n");
+    const unacknowledged = await result(await post("delete", { sourceWorkspaceId: parentId, reference: keptId, confirm: true }));
+    expect(unacknowledged.ok).toBe(false);
+    if (unacknowledged.ok) return;
+    expect(unacknowledged.error.code).toBe("local-data");
+    expect(existsSync(path.join(keptPath, "draft.txt"))).toBe(true);
+    expect(registry.byId(keptId)).toBeDefined();
+    expect(existsSync(folder)).toBe(true);
   });
 });
 

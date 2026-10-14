@@ -1313,7 +1313,10 @@ paths:
         Uatu sessions first, if it is running — there is no `stop: false`
         variant, and activity Uatu does not own is never claimed to have
         been stopped. A main workspace with registered linked worktrees is
-        refused; remove those first.
+        refused; remove those first. A registered workspace id is resolved
+        without reading the repository, so a registration whose files were
+        deleted outside Uatu can still be removed; a branch name or checkout
+        id is resolved against the inventory.
       requestBody:
         required: true
         content:

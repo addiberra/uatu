@@ -70,6 +70,9 @@ export type WorktreeDialogOptions = {
   mode?: "new" | "existing";
   /** The checkout a non-inventory view acts on. */
   id?: string;
+  /** What the opener's own row calls `id`. Names the workspace in a forget
+   *  whose repository can no longer be read (#504), so has no row for it. */
+  label?: string;
   message?: string;
   error?: boolean;
 };
@@ -93,6 +96,10 @@ export type WorktreeDialogModel = {
    *  acknowledge with the required checkbox. Absent for a clean tree. */
   localData?: WorktreeLocalData;
   blocked?: boolean;
+  /** Forget: the repository could not be read (its files may have been
+   *  deleted outside Uatu), so `selected` stands in from the opener's row.
+   *  Removing a registration needs no Git and touches no files. */
+  unreadable?: boolean;
 };
 
 /** Defines every runtime helper the dialog needs, nested inside this one
@@ -244,7 +251,7 @@ export function installWorktreeDialog<T extends Record<string, unknown>>(
       ? ""
       : `<div class="wt-notice${m.error ? " error" : ""}" role="${m.error ? "alert" : "status"}" tabindex="-1">${h(m.message)}${conflict ? `<div class="wt-actions">${worktreeRowPrimary(conflict)}</div>` : ""}</div>`;
     const identity = m.selected
-      ? `<p style="overflow-wrap:anywhere"><strong>${h(m.source.name)} / ${h(m.selected.branch)}</strong></p>`
+      ? `<p style="overflow-wrap:anywhere"><strong>${h(m.source.name)}${m.selected.branch ? ` / ${h(m.selected.branch)}` : ""}</strong></p>`
       : "";
     const cancel = '<button type="button" data-cancel>Cancel</button>';
     // Until the first authoritative answer lands, a view shows its own title
@@ -353,9 +360,12 @@ export function installWorktreeDialog<T extends Record<string, unknown>>(
         + `<form class="wt-form" data-operation="register" data-pending="Verifying the same checkout → registering workspace…"><p>Register as ${h(m.selected?.branch ?? "")} at its existing path. Registration does not move files, transfer cleanup ownership or copy conversations.</p><label class="check"><input type="checkbox" name="start">Start after registration</label><div class="wt-actions">${cancel}<button class="primary">${retry ? "Retry registration" : "Register workspace"}</button></div></form>`)
         + `</section>`;
     } else if (m.view === "forget") {
+      const consequence = m.unreadable
+        ? "Uatu cannot read this repository, so its files may have been moved or deleted. Stop this workspace and remove Hub registration, assignments and personal state. <strong>No files are changed.</strong>"
+        : "Stop this workspace and remove Hub registration, assignments and personal state. <strong>Checkout, branch, files and creation provenance remain.</strong>";
       body = `<section data-compact><h2 class="wt-heading" tabindex="-1">Remove from Uatu</h2>${identity}`
         + (m.loading ? pendingWith("Loading checkout…") : !m.selected ? notFound("That workspace could not be found. Close and try again.")
-          : `<form class="wt-form" data-operation="forget" data-pending="Stopping workspace → removing Hub registration only…"><p>Stop this workspace and remove Hub registration, assignments and personal state. <strong>Checkout, branch, files and creation provenance remain.</strong></p><label class="check"><input type="checkbox" name="confirm" required>Stop Uatu activity and remove only the Hub registration.</label><div class="wt-actions"><button>Remove from Uatu</button><button type="button" data-cancel>Keep registration</button></div></form>`)
+          : `<form class="wt-form" data-operation="forget" data-pending="Stopping workspace → removing Hub registration only…"><p>${consequence}</p><label class="check"><input type="checkbox" name="confirm" required>Stop Uatu activity and remove only the Hub registration.</label><div class="wt-actions"><button>Remove from Uatu</button><button type="button" data-cancel>Keep registration</button></div></form>`)
         + `</section>`;
     } else {
       body = `<section data-compact><h2 class="wt-heading" tabindex="-1">Open worktree</h2>${identity}`
@@ -644,6 +654,9 @@ export function installWorktreeDialog<T extends Record<string, unknown>>(
     let requiresStop = false;
     let localData: WorktreeLocalData | undefined;
     let blocked = false;
+    // The last inventory answer was an error (not a transport failure): the
+    // repository itself could not be read.
+    let unreadable = false;
 
     dialog.addEventListener("cancel", event => { if (busy) event.preventDefault(); });
     const controller = new AbortController();
@@ -658,7 +671,25 @@ export function installWorktreeDialog<T extends Record<string, unknown>>(
     function model(): WorktreeDialogModel {
       const rows = checkouts.map(checkout => worktreeRowFrom(checkout, source.name));
       const mainRow = rows.find(row => row.main) ?? rows.find(row => row.id === source.id);
-      const selected = selectedId === undefined ? undefined : rows.find(row => row.id === selectedId);
+      const listed = selectedId === undefined ? undefined : rows.find(row => row.id === selectedId);
+      // A forget is the one view that needs no Git: when the repository
+      // cannot be read at all (#504), the opener's own row stands in, and the
+      // Hub still checks the id against its registry before removing it.
+      const standInId = listed === undefined && view === "forget" && unreadable ? selectedId : undefined;
+      const standIn = standInId !== undefined;
+      const isMain = standInId === source.id;
+      const selected: WorktreeDialogRow | undefined = standInId === undefined ? listed : {
+        id: standInId,
+        name: isMain ? source.name : options.label ?? standInId,
+        path: "",
+        branch: isMain ? "" : options.label ?? "",
+        ownership: isMain ? "main" : "uncertain",
+        registered: true,
+        running: false,
+        checkout: "",
+        ...(isMain ? {} : { workspaceId: standInId }),
+        main: isMain,
+      };
       return {
         view,
         source: { ...source, path: mainRow?.path ?? "" },
@@ -675,6 +706,7 @@ export function installWorktreeDialog<T extends Record<string, unknown>>(
         requiresStop,
         ...(localData === undefined ? {} : { localData }),
         blocked,
+        ...(standIn ? { unreadable: true } : {}),
       };
     }
 
@@ -730,6 +762,7 @@ export function installWorktreeDialog<T extends Record<string, unknown>>(
           local: [...listed.local],
           remote: [...listed.remote],
         };
+        unreadable = inventory.status === "error";
         if (inventory.status === "error") {
           message = inventory.error?.message ?? "Worktree inventory unavailable. Close and retry.";
           error = true;
@@ -737,6 +770,7 @@ export function installWorktreeDialog<T extends Record<string, unknown>>(
         return true;
       } catch (failure) {
         if (controller.signal.aborted || current !== revision) return false;
+        unreadable = false;
         message = failure instanceof Error ? failure.message : String(failure);
         error = true;
         return false;
@@ -1079,7 +1113,7 @@ export function installWorktreeDialog<T extends Record<string, unknown>>(
       try {
         const outcome = await request(`${api}/forget`, value => parsers.parseWorktreeEndpointResult(value, "forget"), { reference: row.id });
         if (outcome.ok === true) {
-          committed("Removed from Uatu. Checkout, branch and files were kept.", undefined, row.id);
+          committed(model().unreadable ? "Removed from Uatu. No files were changed." : "Removed from Uatu. Checkout, branch and files were kept.", undefined, row.id);
           return;
         }
         endBusy();

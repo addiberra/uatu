@@ -1359,6 +1359,56 @@ describe("W5 a failed inventory read disables destructive compact views instead 
   });
 });
 
+// Issue #504: a repository deleted outside Uatu answers its inventory with
+// an error and no rows. Removing a registration touches no files, so the
+// forget view must still let the user finish it, named by the row they
+// clicked, rather than dead-ending in "could not be found".
+describe("#504 Remove from Uatu when the repository can no longer be read", () => {
+  const unreadable = () => inventory([], { local: [], remote: [] }, {
+    repositoryId: "unknown",
+    status: "error",
+    error: { code: "not-found", message: "This repository's folder no longer exists. Restore it, or remove its workspaces from Uatu; that deletes no files.", retry: "none" },
+  });
+  const forgotten = () => ({ ok: true, operationId: "op", kind: "forget", phase: "complete", registered: false, started: false });
+
+  test("a worktree is removed from Uatu by the id and name its row showed", async () => {
+    const h = harness({ "/": unreadable, "/forget": forgotten });
+    await open(h, { view: "forget", id: "atlas-child", label: "feature/a" });
+    expect(h.text()).toContain("Atlas / feature/a");
+    expect(h.text()).toContain("folder no longer exists");
+    expect(h.text()).toContain("No files are changed.");
+    expect(h.text()).not.toContain("files and creation provenance remain");
+    h.main().querySelector<HTMLInputElement>("[name=confirm]")!.checked = true;
+    h.submit();
+    await settle();
+    expect(h.requests.find(request => request.path === "/forget")!.body)
+      .toEqual({ sourceWorkspaceId: "atlas", reference: "atlas-child" });
+    expect(h.document.querySelector("[data-worktree-confirmation]")!.textContent)
+      .toContain("Removed from Uatu. No files were changed.");
+  });
+
+  test("the repository itself is named by its own title, and a refusal stays in the form", async () => {
+    const h = harness({
+      "/": unreadable,
+      "/forget": () => ({ ok: false, operationId: "op", kind: "forget", error: { code: "conflict", message: "Remove this repository's worktrees from Uatu first; they inherit its settings.", retry: "none" } }),
+    });
+    await open(h, { view: "forget", id: "atlas" });
+    expect(h.main().querySelector("p strong")!.textContent).toBe("Atlas");
+    h.main().querySelector<HTMLInputElement>("[name=confirm]")!.checked = true;
+    h.submit();
+    await settle();
+    expect(h.main().querySelector("[role=alert]")!.textContent).toContain("worktrees from Uatu first");
+    expect(h.button("Remove from Uatu")).toBeTruthy();
+  });
+
+  test("a readable inventory without the row still refuses rather than guessing", async () => {
+    const h = harness({ "/": () => inventory([mainCheckout()]) });
+    await open(h, { view: "forget", id: "atlas-child", label: "feature/a" });
+    expect([...h.main().querySelectorAll("button")].map(node => (node.textContent ?? "").trim())).toEqual(["Cancel"]);
+    expect(h.main().querySelector("form")).toBeNull();
+  });
+});
+
 // W6: <main aria-live="polite"> used to re-announce the ENTIRE dialog body —
 // heading, every row, every button — on every transition, drowning the
 // targeted role=status/alert regions underneath it.

@@ -9,6 +9,8 @@
 // DTOs. Operations are scoped to the user who started them — the journal
 // records the initiator, and progress is only ever reported to them.
 
+import { stat } from "node:fs/promises";
+
 import {
   canDeleteWorktree,
   toWorktreeError,
@@ -127,6 +129,14 @@ function notFound(message: string): WorktreeOperationError {
   return WorktreeOperationError.of("not-found", message);
 }
 
+async function isDirectory(folder: string): Promise<boolean> {
+  try {
+    return (await stat(folder)).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
 export class WorktreeService {
   private readonly coordinator: WorktreeOperationCoordinator;
   private readonly run: GitRunner;
@@ -163,6 +173,11 @@ export class WorktreeService {
     if (!source) throw notFound("That workspace is not registered. Refresh and try again.");
     const capabilities = await probeGitCapabilities(source.path, { ...this.options.git, run: this.run });
     if (!capabilities.supported) {
+      // Git runs inside the repository, so a folder deleted outside Uatu
+      // fails the probe too; say which of the two it is (#504).
+      if (!capabilities.available && !(await isDirectory(source.path))) {
+        throw notFound("This repository's folder no longer exists. Restore it, or remove its workspaces from Uatu; that deletes no files.");
+      }
       throw WorktreeOperationError.of("git-unsupported", capabilities.reason ?? "Worktree operations are unavailable on this Hub.");
     }
     const context = await repositoryContext(source.path, { ...this.options.git, run: this.run });
