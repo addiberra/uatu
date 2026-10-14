@@ -505,6 +505,8 @@ export function createHubFetchHandler(deps: HubDeps) {
   // the branch from the checkout's HEAD file, and `sourceRef` only from
   // recorded creation history. `createWorktree` marks a main checkout that
   // can host worktrees (a `.git` directory) — it is the fork entry point.
+  // `availability: "missing"` marks any registration whose folder is gone,
+  // a top-level one included (#504), read with one stat and no Git.
   const worktreeStateFacts = async (): Promise<Map<string, Record<string, unknown>>> => {
     const facts = new Map<string, Record<string, unknown>>();
     const service = deps.worktrees;
@@ -533,8 +535,12 @@ export function createHubFetchHandler(deps: HubDeps) {
         if (origin !== undefined) fact.sourceRef = origin;
         const availability = await service.registeredAvailability(entry.id);
         if (availability !== "present") fact.availability = availability;
-      } else if (await checkoutGitLink(entry.path) === "directory") {
-        fact.createWorktree = true;
+      } else {
+        const gitLink = await checkoutGitLink(entry.path);
+        if (gitLink === "directory") fact.createWorktree = true;
+        else if (gitLink === "none" && !(await fs.stat(entry.path).then(stats => stats.isDirectory(), () => false))) {
+          fact.availability = "missing";
+        }
       }
       facts.set(entry.id, fact);
     }));

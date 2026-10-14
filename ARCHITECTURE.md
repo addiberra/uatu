@@ -360,7 +360,14 @@ its own bounded outcome, and a safety refusal is an ordinary `{ok: false,
 error}` response rather than a transport failure. `forget` ("Remove from
 Uatu") touches no files and, given a registered workspace id, reads no Git,
 so a family whose checkouts were deleted outside Uatu is still removable:
-its worktrees first, then the main workspace. `src/shell/worktree-dialog.ts`
+its worktrees first, then the main workspace. The dashboard learns which
+folders are gone from `/api/hub/state`'s `availability: "missing"`, which
+covers a top-level workspace as well as a linked worktree; it is read with a
+stat rather than Git, and the short cache of a worktree's Git probe never
+outlives its folder, so a deletion shows on the next state read. The forget
+dialog names that state instead of promising files "remain", and it explains
+a main workspace's registered worktrees up front rather than offering a
+confirmation the Hub would refuse. `src/shell/worktree-dialog.ts`
 is the one client for that family — a shadow-DOM dialog embedded both in
 the in-workspace picker (`shell/hub-nav.ts`) and the hub dashboard
 (`hub/pages.ts`) — and `shell/worktree-live.ts` refreshes an open

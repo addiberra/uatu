@@ -128,6 +128,68 @@ test("dashboard preserves ordinary-folder removal and routes repository removal 
   expect(calls).toEqual(["/api/hub/workspaces/docs/forget", "forget:main", "forget:child"]);
 });
 
+// Issue #504 (demo 04a/06a): a top-level row whose folder was deleted
+// outside Uatu answers `availability: "missing"` too. It gets the same
+// missing-checkout state a worktree row gets — warning, no Start, Remove from
+// Uatu through the guarded dialog — whether or not worktrees are left under
+// it, and the dialog is told what the row knows: its name, that its folder
+// is gone, and how many worktrees must go first.
+describe("#504 a top-level row whose folder is missing", () => {
+  const harness = (entries: unknown[]) => {
+    const opened: any[] = [];
+    const calls: string[] = [];
+    const page = dashboardRefreshHarness(entries, {
+      api: async (url: string) => calls.push(url),
+      openWorktreeDialog: (options: any) => opened.push(options),
+      el: (tag: string, className?: string, text?: string) => {
+        const node = page.document.createElement(tag);
+        if (className) node.className = className;
+        if (text) node.textContent = text;
+        return node;
+      },
+    });
+    return { ...page, opened, calls };
+  };
+  const actionsOf = (document: Document, id: string) =>
+    [...document.querySelectorAll(`[data-workspace="${id}"] .row-actions button`)].map(node => node.getAttribute("aria-label") || node.textContent);
+
+  test("with worktrees under it, it reads as a missing checkout and its removal names its dependents", async () => {
+    const { document, refresh, opened, calls } = harness([
+      { id: "atlas", displayName: "Atlas", repositoryId: "r", availability: "missing" },
+      { id: "atlas-a", parentId: "atlas", repositoryId: "r", branch: "feature/a", availability: "missing" },
+    ]);
+    await refresh();
+    const main = document.querySelector('[data-workspace="atlas"]')!;
+    expect(main.querySelector('[role="alert"]')!.textContent)
+      .toBe("Missing checkout. Restore the original checkout externally, then retry, or remove it from Uatu. Nothing will be recreated.");
+    expect(actionsOf(document, "atlas")).toEqual(["Rename workspace Atlas", "Remove Atlas from Uatu", "Retry refresh"]);
+    await (main.querySelector('[aria-label="Remove Atlas from Uatu"]') as any).onclick();
+    expect(calls).toEqual([]);
+    expect(opened).toEqual([expect.objectContaining({ view: "forget", id: "atlas", label: "Atlas", availability: "missing", dependents: 1 })]);
+  });
+
+  test("with nothing under it, it is still removed from Uatu through the confirmation, never unregistered on one click", async () => {
+    const { document, refresh, opened, calls } = harness([{ id: "docs", displayName: "Docs", availability: "missing" }]);
+    await refresh();
+    const row = document.querySelector('[data-workspace="docs"]')!;
+    expect(row.querySelector('[role="alert"]')!.textContent)
+      .toBe("Missing folder. Restore the original folder externally, then retry, or remove it from Uatu. Nothing will be recreated.");
+    expect(actionsOf(document, "docs")).toEqual(["Rename workspace Docs", "Remove Docs from Uatu", "Retry refresh"]);
+    await (row.querySelector('[aria-label="Remove Docs from Uatu"]') as any).onclick();
+    expect(calls).toEqual([]);
+    expect(opened).toEqual([expect.objectContaining({ view: "forget", id: "docs", label: "Docs", availability: "missing", dependents: 0 })]);
+  });
+
+  test("a present ordinary folder keeps its one-step Remove from Hub", async () => {
+    const { document, refresh, opened, calls } = harness([{ id: "docs", displayName: "Docs" }]);
+    await refresh();
+    expect(actionsOf(document, "docs")).toEqual(["Start Docs", "Rename workspace Docs", "Remove Docs from Hub"]);
+    await (document.querySelector('[aria-label="Remove Docs from Hub"]') as any).onclick();
+    expect(calls).toEqual(["/api/hub/workspaces/docs/forget"]);
+    expect(opened).toEqual([]);
+  });
+});
+
 test("dashboard rows disclose a linked worktree's inherited parent credentials", async () => {
   const none = { authentication: [], signing: [] };
   const { document, refresh } = dashboardRefreshHarness([

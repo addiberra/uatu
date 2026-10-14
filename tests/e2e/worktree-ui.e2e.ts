@@ -83,6 +83,12 @@ async function dashboard(page: Page): Promise<void> {
   }
 }
 
+async function hubIds(page: Page): Promise<string[]> {
+  const response = await page.request.get("/api/hub/state");
+  expect(response.ok()).toBe(true);
+  return ((await response.json()) as { workspaces: { id: string }[] }).workspaces.map(workspace => workspace.id);
+}
+
 const rowFor = async (page: Page, source: string, branch: string) =>
   (await inventoryOf(page, source)).checkouts.find(checkout => checkout.branch === branch)!;
 
@@ -684,14 +690,24 @@ for (const touch of [false, true]) test.describe(touch ? "worktree dialog on tou
     await rm(one.path, { recursive: true, force: true });
     await page.reload();
     await expand();
-    await expect(row(one.workspaceId)).toContainText("Missing checkout");
+    // The first state answer after the deletion already says so: well
+    // inside the dashboard's five-second refresh, so the row never shows as
+    // a healthy, startable checkout in between.
+    await expect(row(one.workspaceId)).toContainText("Missing checkout", { timeout: 2_000 });
     await expect(row(one.workspaceId)).toContainText("or remove it from Uatu");
     await expect(row(one.workspaceId).getByRole("button", { name: "Delete worktree", exact: true })).toHaveCount(0);
+    await expect(row(one.workspaceId).getByRole("button", { name: `Start ${one.branch}`, exact: true })).toHaveCount(0);
     await row(one.workspaceId).getByRole("button", { name: `Remove ${one.branch} from Uatu`, exact: true }).click();
     await expect(dialog).toContainText(`${parentId}-derelict / ${one.branch}`);
+    // Its folder is already gone: nothing on disk is promised to "remain".
+    await expect(dialog).toContainText("This checkout's folder is already gone.");
+    await expect(dialog).toContainText("Uatu changes nothing on disk.");
+    await expect(dialog).not.toContainText("files and creation provenance remain");
     await dialog.getByRole("checkbox").check();
+    await captureScreenshot(page, info, `worktree-ui-${label}-forget-missing-checkout`);
     await dialog.getByRole("button", { name: "Remove from Uatu", exact: true }).click();
     await expect(page.getByRole("dialog")).toHaveCount(0);
+    await expect(page.locator("[data-worktree-confirmation]")).toContainText("Removed from Uatu. Its folder was already gone; nothing on disk was changed.");
     await expect(row(one.workspaceId)).toHaveCount(0);
 
     // --- the main checkout and the other worktree are gone too ------------
@@ -699,35 +715,52 @@ for (const touch of [false, true]) test.describe(touch ? "worktree dialog on tou
     await rm(`${repository}.worktrees`, { recursive: true, force: true });
     await page.reload();
     await expand();
-    await expect(row(repositoryId)).toHaveCount(1);
-    await expect(row(two.workspaceId)).toContainText("Missing checkout");
+    await expect(row(two.workspaceId)).toContainText("Missing checkout", { timeout: 2_000 });
+    // The main row is still the main checkout of the worktree under it, and
+    // is just as missing: no Start, the same warning, Remove from Uatu.
+    await expect(row(repositoryId).locator(".chip")).toHaveText("Main checkout");
+    await expect(row(repositoryId)).not.toContainText("Linked checkout");
+    await expect(row(repositoryId)).toContainText("Missing checkout. Restore the original checkout externally, then retry, or remove it from Uatu.");
+    await expect(row(repositoryId).getByRole("button", { name: `Start ${parentId}-derelict`, exact: true })).toHaveCount(0);
 
-    // The repository goes last: its worktrees inherit its settings.
+    // The repository goes last: its worktrees inherit its settings. The
+    // dialog says so up front instead of offering a refused confirmation.
     await row(repositoryId).getByRole("button", { name: `Remove ${parentId}-derelict from Uatu`, exact: true }).click();
-    await expect(dialog).toContainText("folder no longer exists");
-    await dialog.getByRole("checkbox").check();
-    await dialog.getByRole("button", { name: "Remove from Uatu", exact: true }).click();
-    await expect(dialog.getByRole("alert").first()).toContainText("worktrees from Uatu first");
-    await dialog.getByRole("button", { name: "Keep registration", exact: true }).click();
+    await expect(dialog.getByRole("alert")).toHaveText("This repository still has 1 worktree registered in Uatu. Remove it from Uatu first; it inherits this repository's settings.");
+    await expect(dialog.getByRole("checkbox")).toHaveCount(0);
+    await expect(dialog.getByRole("button", { name: "Remove from Uatu", exact: true })).toHaveCount(0);
+    await captureScreenshot(page, info, `worktree-ui-${label}-forget-repository-with-worktrees`);
+    await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
     await expect(page.getByRole("dialog")).toHaveCount(0);
+    expect(await hubIds(page)).toContain(repositoryId);
 
     await row(two.workspaceId).getByRole("button", { name: `Remove ${two.branch} from Uatu`, exact: true }).click();
     await expect(dialog).toContainText(`${parentId}-derelict / ${two.branch}`);
-    await expect(dialog).toContainText("folder no longer exists");
+    // One message, in the body under the title: no error box repeating it.
+    await expect(dialog.getByRole("heading", { name: "Remove from Uatu" })).toBeVisible();
+    await expect(dialog).toContainText("This repository's folder no longer exists, so Uatu cannot read it.");
     await expect(dialog).toContainText("No files are changed.");
+    await expect(dialog.getByRole("alert")).toHaveCount(0);
     await dialog.getByRole("checkbox").check();
     await captureScreenshot(page, info, `worktree-ui-${label}-forget-deleted-repository`);
     await dialog.getByRole("button", { name: "Remove from Uatu", exact: true }).click();
     await expect(page.getByRole("dialog")).toHaveCount(0);
-    await expect(page.locator("[data-worktree-confirmation]")).toContainText("Removed from Uatu. No files were changed.");
+    await expect(page.locator("[data-worktree-confirmation]")).toContainText("Removed from Uatu. Its folder was already gone; nothing on disk was changed.");
     await expect(row(two.workspaceId)).toHaveCount(0);
 
-    // With no worktree left and no `.git` to fork from, the main row is an
-    // ordinary registration: Remove from Hub, which needs no files either.
+    // With no worktree left and no .git to tell what it was, the row is
+    // still a missing folder, removed through the same confirmation.
     await page.reload();
     await expand();
-    await row(repositoryId).getByRole("button", { name: `Remove ${parentId}-derelict from Hub`, exact: true }).click();
+    await expect(row(repositoryId)).toContainText("Missing folder", { timeout: 2_000 });
+    await expect(row(repositoryId).locator(".chip")).toHaveCount(0);
+    await row(repositoryId).getByRole("button", { name: `Remove ${parentId}-derelict from Uatu`, exact: true }).click();
+    await expect(dialog).toContainText("folder no longer exists");
+    await dialog.getByRole("checkbox").check();
+    await dialog.getByRole("button", { name: "Remove from Uatu", exact: true }).click();
+    await expect(page.getByRole("dialog")).toHaveCount(0);
     await expect(row(repositoryId)).toHaveCount(0);
+    expect(await hubIds(page)).not.toContain(repositoryId);
     expect(existsSync(repository)).toBe(false);
     expect(existsSync(two.path)).toBe(false);
 

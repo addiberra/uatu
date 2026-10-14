@@ -9,7 +9,7 @@
 // DTOs. Operations are scoped to the user who started them — the journal
 // records the initiator, and progress is only ever reported to them.
 
-import { stat } from "node:fs/promises";
+import { lstat, stat } from "node:fs/promises";
 
 import {
   canDeleteWorktree,
@@ -174,9 +174,11 @@ export class WorktreeService {
     const capabilities = await probeGitCapabilities(source.path, { ...this.options.git, run: this.run });
     if (!capabilities.supported) {
       // Git runs inside the repository, so a folder deleted outside Uatu
-      // fails the probe too; say which of the two it is (#504).
+      // fails the probe too; say which of the two it is (#504). One plain
+      // statement: the dialog that shows it says what removal does, and the
+      // dashboard rows say how to recover.
       if (!capabilities.available && !(await isDirectory(source.path))) {
-        throw notFound("This repository's folder no longer exists. Restore it, or remove its workspaces from Uatu; that deletes no files.");
+        throw notFound("This repository's folder no longer exists, so Uatu cannot read it.");
       }
       throw WorktreeOperationError.of("git-unsupported", capabilities.reason ?? "Worktree operations are unavailable on this Hub.");
     }
@@ -1002,7 +1004,14 @@ export class WorktreeService {
     if (!entry || !link) return { ownership: "external", value: "present" };
     const cached = this.availabilityCache.get(workspaceId);
     const now = this.now();
-    const matches = (item: typeof cached) => item?.path === entry.path && item.repositoryId === link.repositoryId && item.checkoutId === link.checkoutId;
+    // The cache spares the polled state list a Git probe per child; it never
+    // outlives the folder it describes. One stat says whether the folder is
+    // still there, so a checkout deleted outside Uatu reads as missing on
+    // the very next state answer rather than when the cache expires (#504).
+    // lstat, like inspectCheckout's own presence test, so the two agree.
+    const present = await lstat(entry.path).then(stats => stats.isDirectory(), () => false);
+    const matches = (item: typeof cached) => item?.path === entry.path && item.repositoryId === link.repositoryId && item.checkoutId === link.checkoutId
+      && (item.value === "missing") === !present;
     if (cached && now - cached.at < AVAILABILITY_CACHE_MS && matches(cached)) return cached;
     const inspection = await inspectCheckout(entry.path, { ...this.options.git, run: this.run });
     const resolved = await ownershipForCheckout({ provenance: this.options.provenance, inspection, checkoutPath: entry.path, registeredIdentity: link });

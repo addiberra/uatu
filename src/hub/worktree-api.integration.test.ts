@@ -609,6 +609,12 @@ describe("removing registrations whose files were deleted outside Uatu (#504)", 
     return { folder, parentId, children };
   }
 
+  async function stateOf(id: string): Promise<Record<string, unknown>> {
+    const response = await fetch(`${origin}/api/hub/state`, withSession());
+    expect(response.status).toBe(200);
+    return (await response.json() as { workspaces: Array<Record<string, unknown>> }).workspaces.find(workspace => workspace.id === id)!;
+  }
+
   async function hubWorkspaceIds(): Promise<string[]> {
     const response = await fetch(`${origin}/api/hub/state`, withSession());
     expect(response.status).toBe(200);
@@ -621,6 +627,12 @@ describe("removing registrations whose files were deleted outside Uatu (#504)", 
     await rm(folder, { recursive: true, force: true });
     await rm(`${folder}.worktrees`, { recursive: true, force: true });
     expect(await hubWorkspaceIds()).toEqual(expect.arrayContaining([parentId, ...children]));
+    // The main row is reported missing like its worktrees, and is still
+    // their parent: the dashboard keeps calling it the main checkout.
+    const missing = await stateOf(parentId);
+    expect(missing).toMatchObject({ availability: "missing" });
+    expect(missing.createWorktree).toBeUndefined();
+    for (const child of children) expect(await stateOf(child)).toMatchObject({ availability: "missing", parentId });
     // The inventory says what happened rather than blaming Git.
     const unreadable = await fetch(`${origin}${WORKTREE_API_PATH}?source=${parentId}`, withSession());
     const listing = parseWorktreeInventory((await unreadable.json() as { inventory: unknown }).inventory);
@@ -651,6 +663,28 @@ describe("removing registrations whose files were deleted outside Uatu (#504)", 
     expect((await hubWorkspaceIds()).some(id => id === parentId || children.includes(id))).toBe(false);
     // Nothing was recreated on the way.
     for (const gone of [folder, ...childPaths]) expect(existsSync(gone)).toBe(false);
+  });
+
+  // Demo 02/04a: a folder deleted moments after the dashboard last read the
+  // state stayed "present" for the rest of a two-second presentation cache,
+  // and a reload then showed it healthy until the next five-second poll.
+  test("a checkout deleted right after a state read is missing on the very next read", async () => {
+    const { children } = await onboardFamily("prompt");
+    const [childId] = children as [string, string];
+    expect((await stateOf(childId)).availability).toBeUndefined();
+    await rm(registry.byId(childId)!.path, { recursive: true, force: true });
+    expect(await stateOf(childId)).toMatchObject({ availability: "missing" });
+  });
+
+  test("a plain folder deleted outside Uatu is reported missing, and a present one is not", async () => {
+    const folder = path.join(path.dirname(registry.byId(atlasId)!.path), "plain-docs");
+    await mkdir(folder, { recursive: true });
+    const entry = await registry.register(folder);
+    expect((await stateOf(entry.id)).availability).toBeUndefined();
+    expect((await stateOf(atlasId)).availability).toBeUndefined();
+    await rm(folder, { recursive: true, force: true });
+    expect(await stateOf(entry.id)).toMatchObject({ availability: "missing" });
+    await registry.remove(entry.id);
   });
 
   test("the worktree API removes a deleted main workspace by id once no worktree depends on it", async () => {
