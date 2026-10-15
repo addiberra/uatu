@@ -441,12 +441,17 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`worker cont
     page.on("response", response => { if (response.status() >= 400 && response.url().includes("/api/chat/")) errors.push(`${response.status()} ${new URL(response.url()).pathname}`); });
     const conversationId = await boot(page, request);
     const worker = await control(request, { op: "launchWorker", conversationId });
+    const sibling = await control(request, { op: "launchWorker", conversationId });
     const row = page.locator(`[data-background-task="${worker.taskId}"]`);
     const inspect = row.locator("[data-inspect-task]");
     const stop = row.locator("[data-stop-task]");
     await expect(inspect).toBeVisible();
     const a = (await inspect.boundingBox())!;
     const b = (await stop.boundingBox())!;
+    const nextStop = page.locator(`[data-background-task="${sibling.taskId}"] [data-stop-task]`);
+    await expect(nextStop).toBeVisible();
+    const c = (await nextStop.boundingBox())!;
+    expect(c.y - (b.y + b.height)).toBeGreaterThanOrEqual(8);
     for (const box of [a, b]) { expect(box.width).toBeGreaterThanOrEqual(44); expect(box.height).toBeGreaterThanOrEqual(44); }
     expect(b.x - (a.x + a.width)).toBeGreaterThanOrEqual(8);
     await expect(page.locator("#chat-composer-status-live")).toHaveAttribute("aria-live", "polite");

@@ -7,7 +7,7 @@ Tests use existing UI/browser and normalization seams; test artifacts stay outsi
 - [x] Clear Continue feedback after parent/workers settle (browser regression red: action visible after settlement; green: 1/1).
 - [x] Explain queued Send now waking paused steers; retain resume semantics (browser red: ambiguous Send now; green: confirmation cancel/accept and remaining queue; renderer 184/184).
 - [x] Order terminal results after launchers without duplicating reports (agent/shell renderer cases red; 186/186 green; typecheck passes).
-- [ ] Separate vertically adjacent worker Stop targets by at least 0.5rem.
+- [x] Separate vertically adjacent worker Stop targets by at least 0.5rem (Chromium/WebKit touch red: 0px; green: 2/2 including existing target/gap/navigation assertions).
 - [ ] Diagnose and fix delayed Stop completion race without weakening assertions.
 
 ## Phase 2 — pending dock

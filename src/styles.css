@@ -9632,6 +9632,12 @@ html[data-ui-mode="touch"][data-chat-answering] #chat-drilldown-timeline {
 
 /* Rows of the background-task list: the task's description leads, its
    latest progress note follows, and the stop control sits at the end. */
+#chat-background-tasks-items {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
 #chat-background-tasks-items li::before {
   content: "◍";
   flex: 0 0 auto;
@@ -9641,7 +9647,7 @@ html[data-ui-mode="touch"][data-chat-answering] #chat-drilldown-timeline {
 .chat-background-tasks li {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 0.5rem;
   min-width: 0;
 }
 
@@ -9672,8 +9678,8 @@ html[data-ui-mode="touch"][data-chat-answering] #chat-drilldown-timeline {
 .chat-background-task-inspect {
   border: 0;
   padding: 0;
-  min-height: 44px;
-  min-width: 44px;
+  min-height: 2.75rem;
+  min-width: 2.75rem;
   background: transparent;
   color: inherit;
   font: inherit;
@@ -9698,8 +9704,8 @@ html[data-ui-mode="touch"][data-chat-answering] #chat-drilldown-timeline {
 .chat-background-action button,
 .chat-drilldown-task-facts [data-task-result],
 .chat-task-stop {
-  min-width: 44px;
-  min-height: 44px;
+  min-width: 2.75rem;
+  min-height: 2.75rem;
 }
 .chat-background-action button:focus-visible,
 .chat-drilldown-task-facts [data-task-result]:focus-visible,
