@@ -1,5 +1,5 @@
-// Isolated browser assembly only. Production routing stays on the existing
-// renderer until capability parity and the lead's release gate are satisfied.
+// Historical isolated adapter assembly. The mobile-live E2E suite now loads
+// production documents/assets instead; this entry is not a shipping module.
 import { mountMobileHub } from "../../src/hub/mobile/frontend";
 import { mobileHubDetail, mobileHubPath, mobileHubRoute } from "../../src/hub/mobile/coordinator";
 import { createLiveBackend } from "../../src/hub/mobile/live-backend";

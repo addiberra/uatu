@@ -18,19 +18,28 @@ export function eligibleMobileHub(): boolean {
 /** Direct Hub entry owns no workspace, stream, or fabricated Return target.
  * Canonical Open crosses a document boundary; its workspace entry owns retention. */
 export function mountLiveHub(root: HTMLElement) {
-  const { backend } = createLiveBackendRuntime();
+  const { backend, transport } = createLiveBackendRuntime();
   const tasks = createTaskHistory(history, () => location.href);
   let restoring = false, context: string | undefined, authenticated = true;
+  let disposed = false, navigationIntent = 0;
+  const navigateWorkspace = async (id: string) => {
+    const intent = ++navigationIntent, generation = transport.generation();
+    // Dismissal may already have scheduled an owned history.back(). Let it
+    // land before leaving this document, or it can abort/bounce the new entry.
+    await tasks.settled();
+    if (!disposed && authenticated && intent === navigationIntent && generation === transport.generation()) location.assign(`/s/${encodeURIComponent(id)}/`);
+  };
   const show = () => { const url = new URL(location.href); restoring = true; try { view.show(mobileHubRoute(url) ?? "hub", mobileHubDetail(url)); } finally { restoring = false; } };
   const view = mountMobileHub(root, backend, {
     brandLogoUrl: hubUrl("/hub-assets/logo.svg"),
-    authenticationLost: () => { authenticated = false; },
+    authenticationLost: () => { authenticated = false; navigationIntent++; },
     authenticated: () => { authenticated = true; },
     notifications: liveNotificationSettings(),
-    navigateWorkspace: id => location.assign(`/s/${encodeURIComponent(id)}/`),
-    returnToWorkspace: id => location.assign(`/s/${encodeURIComponent(id)}/`),
-    setRoute(route) { tasks.write({ mobileHub: { route } }, mobileHubPath(route), false); show(); },
+    navigateWorkspace: id => { void navigateWorkspace(id); },
+    returnToWorkspace: id => { void navigateWorkspace(id); },
+    setRoute(route) { navigationIntent++; tasks.write({ mobileHub: { route } }, mobileHubPath(route), false); show(); },
     detailChanged(detail) {
+      navigationIntent++;
       const route = mobileHubRoute(new URL(location.href)) ?? "settings", path = mobileHubPath(route, detail);
       if (detail && !mobileHubDetail(new URL(path, location.origin))) return;
       tasks.write({ mobileHub: { route } }, path, false);
@@ -43,6 +52,7 @@ export function mountLiveHub(root: HTMLElement) {
   });
   const pop = () => {
     if (tasks.consumePop()) return;
+    navigationIntent++;
     if (view.hasTask && context === location.href) {
       restoring = true;
       try { if (view.cancelTaskFromHistory() === "blocked" || view.hasTask) tasks.open({ route: mobileHubRoute(new URL(location.href)) ?? "hub" }); }
@@ -54,7 +64,7 @@ export function mountLiveHub(root: HTMLElement) {
   window.addEventListener("popstate", pop);
   window.addEventListener("online", refresh); document.addEventListener("visibilitychange", refresh);
   show();
-  return { ready: view.ready, destroy() { clearInterval(timer); tasks.destroy(); window.removeEventListener("popstate", pop); window.removeEventListener("online", refresh); document.removeEventListener("visibilitychange", refresh); view.destroy(); } };
+  return { ready: view.ready, destroy() { disposed = true; clearInterval(timer); tasks.destroy(); window.removeEventListener("popstate", pop); window.removeEventListener("online", refresh); document.removeEventListener("visibilitychange", refresh); view.destroy(); } };
 }
 
 /** Called before importing app.ts: all workspace URL/history/global-input

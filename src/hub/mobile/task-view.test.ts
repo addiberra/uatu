@@ -26,6 +26,22 @@ describe("task presentation", () => {
     const start = view.open("Start", "Consequences", { label: "Start", run() {} }, { kind: "confirmation", destructive: false });
     expect(start.querySelector('[data-action="commit-sheet"]')?.classList.contains("mh-destructive")).toBe(false);
   });
+  test("Tab from the busy confirmation container enters a safe control after failure", () => {
+    const { host } = setup(); const view = createTaskView(host, () => true, () => {});
+    const task = view.open("Stop?", "Consequences", { label: "Stop", run() {} }, { kind: "confirmation" });
+    const safe = task.querySelector<HTMLElement>('[data-action="cancel-sheet"]')!;
+    const consent = task.querySelector<HTMLElement>('[data-action="commit-sheet"]')!;
+    let active: Element = task;
+    Object.defineProperty(host.ownerDocument, "activeElement", { configurable: true, get: () => active });
+    safe.focus = () => { active = safe; }; consent.focus = () => { active = consent; };
+    const tab = (shiftKey = false) => { let prevented = false; view.key({ key: "Tab", shiftKey, stopPropagation() {}, preventDefault() { prevented = true; } } as unknown as KeyboardEvent); return prevented; };
+    view.busy(true); view.busy(false);
+    expect(tab()).toBe(true); expect(active).toBe(safe);
+    expect(tab()).toBe(true); expect(active).toBe(consent);
+    expect(tab()).toBe(true); expect(active).toBe(safe);
+    expect(tab(true)).toBe(true); expect(active).toBe(consent);
+    active = task; expect(tab(true)).toBe(true); expect(active).toBe(consent);
+  });
   test("a mutation cannot replace a newer task on the same detail", async () => {
     const { host } = setup(); const page = host.ownerDocument.createElement("div"), tasks = host.ownerDocument.createElement("div"); host.append(page, tasks);
     const view = createTaskView(tasks, () => true, () => {});

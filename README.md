@@ -177,6 +177,8 @@ keep that one workspace's live browser clients, surface and unfinished work in
 the same document. Opening another workspace, reloading, signing out, revocation
 or Stop are separate lifetime boundaries; browser termination cannot preserve
 memory-only drafts or uploads. Desktop and standalone navigation stay unchanged.
+Temporary connection loss asks for revalidation; it does not itself stop a
+workspace or discard a pending phone management command.
 
 ```text
 uatu hub [--config <PATH>] [--port <PORT>] [--exit-on-stdin-close]
@@ -185,8 +187,8 @@ uatu hub hash-password
 
 Login is required on every interface, localhost included. A hub started
 without a configured user prints these steps and exits. Sessions are
-server-side records, so signing out, or revoking a device from the
-dashboard's Devices pane, ends that session at once for every client holding
+server-side records, so signing out, or revoking a device in Settings
+(**Session Security → Devices** on phones), ends that session at once for every client holding
 it. Terminal sessions detach and reattach across connectivity blips: a shell,
 or an agent running in it, keeps working while your train is in a tunnel.
 

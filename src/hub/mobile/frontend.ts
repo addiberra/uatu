@@ -73,6 +73,7 @@ export function mountMobileHub(root: HTMLElement, backend: MobileHubBackend, cal
   let retryAt = 0;
   let loginTimer: ReturnType<typeof setTimeout> | undefined;
   let requestedDetail: MobileHubDetail | undefined;
+  let authenticationProblem = "";
   let lastInvalidationGeneration = -1;
   const scroll = { hub: 0, settings: 0 };
   const disclosures = new Map<string, boolean>();
@@ -186,7 +187,7 @@ export function mountMobileHub(root: HTMLElement, backend: MobileHubBackend, cal
     const folderNotice = defaultFolder.status === "ready" && defaultFolder.value.configured && !defaultFolder.value.configuredAvailable ? "Saved folder unavailable; using fallback" : "";
     const catalog = advisory(identity?.user ?? "") + `<div data-credential-catalog>${credentialCatalog()}</div>`;
     const accounts = section("Agent accounts", destination("agent-accounts", "Agent accounts", "device", "OpenCode and Claude Code · Shared by all Hub users"));
-    return `<h1>Settings</h1>${identity ? button("identity", `<img src="${esc(appUrl("/assets/uatu-logo.svg"))}" alt=""/><span><strong>${esc(identity.user)}</strong><small>${esc(identity.host)}</small><small class="mh-running">● Connected</small></span>`, "mh-identity") : ""}`
+    return `<h1>Settings</h1>${identity ? button("identity", `<img src="${esc(appUrl("/assets/uatu-logo.svg"))}" alt=""/><span><strong>${esc(identity.user)}</strong><small>${esc(identity.host)}</small><small class="mh-running">${authenticationProblem ? "Connection unconfirmed" : "● Connected"}</small></span>`, "mh-identity") : ""}`
       + section("Credentials", `${catalog}${button("add-credential", "Add Credential", "mh-text-action")}`) + note("Secure access for your workspaces. Stored only on this hub.") + accounts
       + section("Workspaces", destination("default-folder", "Default Folder", "folder", folderNotice, folderValue, "blue") + destination("preview-side", "Preview File Controls", "preview", "Placement on this device", prefs.previewSide === "left" ? "Left" : "Right") + destination("auto-hide", "Navigation Auto-hide", "hub", "", prefs.autoHide ? "After 7 seconds" : "Until I close it"))
       + section("Notifications", destination("notifications", "Notifications", "device", "This device and Hub login"))
@@ -195,7 +196,7 @@ export function mountMobileHub(root: HTMLElement, backend: MobileHubBackend, cal
   }
   function render() {
     if (disposed) return;
-    if (sheet) { renderDeferred = true; return; }
+    if (sheet) { renderDeferred = true; revalidationNotice(); return; }
     renderDeferred = false;
     const activeAction = page.contains(root.ownerDocument.activeElement) ? (root.ownerDocument.activeElement as HTMLElement)?.dataset.action : undefined;
     const previousScroll = page.scrollTop;
@@ -210,6 +211,16 @@ export function mountMobileHub(root: HTMLElement, backend: MobileHubBackend, cal
     if (loginBusy) page.querySelectorAll<HTMLInputElement>(".mh-login input").forEach(input => { input.disabled = true; });
     page.scrollTop = previousScroll;
     if (activeAction) [...page.querySelectorAll<HTMLElement>("[data-action]")].find(el => el.dataset.action === activeAction)?.focus();
+    revalidationNotice();
+  }
+  function revalidationNotice() {
+    const previous = root.querySelector<HTMLElement>('[data-hub-revalidation]');
+    if (!authenticationProblem) { previous?.remove(); return; }
+    const container = sheet?.querySelector('.mh-sheet-body') ?? (!flowRoot.hidden ? flowRoot.querySelector('.mh-flow-content') : page.querySelector('main'));
+    if (!container) return;
+    const notice = previous ?? root.ownerDocument.createElement('p'); notice.className = 'mh-note'; notice.dataset.hubRevalidation = ''; notice.setAttribute('role', 'status');
+    if (notice.textContent !== authenticationProblem) notice.textContent = authenticationProblem;
+    if (notice.parentElement !== container) container.prepend(notice);
   }
   function closeSheet(focus = true, replacing = false) {
     if (!sheet) return;
@@ -280,7 +291,7 @@ export function mountMobileHub(root: HTMLElement, backend: MobileHubBackend, cal
   }
   async function start(w: WorkspaceView, confirmed = false) {
     if (!confirmed && !w.assignments.length) {
-      openSheet("Start without credentials?", note(`Git authentication and signing may be unavailable for ${w.displayName}. The workspace can still start.`), { label: "Start", run: () => start(w, true) });
+      openSheet("Start without credentials?", note(`Git authentication and signing may be unavailable for ${w.displayName}. The workspace can still start.`), { label: "Start", run: () => start(w, true) }, undefined, { kind: "confirmation", destructive: false });
       workspaceTask = w.id;
       return;
     }
@@ -293,7 +304,7 @@ export function mountMobileHub(root: HTMLElement, backend: MobileHubBackend, cal
       busy(false);
       if (result.status !== "completed") { if (result.status === "rejected" && result.problem.kind === "unauthorized") { invalidateAuthentication(); return; } if (result.status === "indeterminate") uncertainStart(result.message); else sheetError(result.problem.message); return; }
       if (result.value.status === "running") { closeSheet(); suspend(); callbacks.navigateWorkspace(result.value.workspaceId); void refresh(); }
-      else if (result.value.status === "confirm-unassigned") { openSheet("Start without credentials?", note("Git authentication and signing may be unavailable. Continue without credentials?"), { label: "Start", run: () => start(w, true) }); workspaceTask = w.id; }
+      else if (result.value.status === "confirm-unassigned") { openSheet("Start without credentials?", note("Git authentication and signing may be unavailable. Continue without credentials?"), { label: "Start", run: () => start(w, true) }, undefined, { kind: "confirmation", destructive: false }); workspaceTask = w.id; }
       else unlock(w, result.value.credentials, confirmed);
     } catch { if (current()) { busy(false); uncertainStart("Start status is unknown."); } }
   }
@@ -365,7 +376,7 @@ export function mountMobileHub(root: HTMLElement, backend: MobileHubBackend, cal
     if (trigger && page.contains(trigger)) overviewTriggerAction = trigger.dataset.action;
   };
   const backdrop = (event: Event) => { if ((event.target as HTMLElement).classList.contains("mh-confirmation-backdrop")) cancelSheet(); };
-  function resetProtectedState() { generation++; credentialFacts.clear(); retryAt = 0; clearTimeout(loginTimer); loginTimer = undefined; loginError = ""; flows.invalidate(); requestedDetail = undefined; loginBusy = false; identity = null; authenticatedUser = null; target = null; workspaces = { status: "loading" }; credentials = { status: "loading" }; defaultFolder = { status: "loading" }; closeSheet(false); }
+  function resetProtectedState() { generation++; credentialFacts.clear(); retryAt = 0; clearTimeout(loginTimer); loginTimer = undefined; loginError = ""; authenticationProblem = ""; flows.invalidate(); requestedDetail = undefined; loginBusy = false; identity = null; authenticatedUser = null; target = null; workspaces = { status: "loading" }; credentials = { status: "loading" }; defaultFolder = { status: "loading" }; closeSheet(false); }
   function invalidateAuthentication() { resetProtectedState(); signedOut = true; render(); callbacks.authenticationLost?.(); }
   function login() {
     return `<h1>Sign in required</h1>${note("Sign in to access this hub.")}<form class="mh-login">${flowField("user", "Username", loginUser, "text", 'autocomplete="username" required')}${flowField("password", "Password", "", "password", 'autocomplete="current-password" required')}${flowField("device", "Device label (optional)", loginDevice, "text", 'autocomplete="off"')}<p role="alert" class="mh-sheet-error">${esc(loginError)}</p><button type="submit" class="mh-commit" ${loginBusy || Date.now() < retryAt ? "disabled" : ""}>${loginBusy ? "Signing in…" : "Sign in"}</button></form>`;
@@ -413,11 +424,16 @@ export function mountMobileHub(root: HTMLElement, backend: MobileHubBackend, cal
       const auth = await backend.readAuthentication(); if (!current()) return;
       if (auth.status === "unavailable") {
         if (auth.problem.kind === "unauthorized") { invalidateAuthentication(); return; }
+        // A failed revalidation is not loss of authentication. Keep the
+        // authenticated command/draft owner mounted; writes still meet the
+        // server's authorization boundary and can report their actual result.
+        if (identity) { authenticationProblem = auth.problem.message; workspaces = { status: "unavailable", problem: auth.problem }; render(); return; }
         if (flows.detail) requestedDetail = flows.detail;
         closeSheet(false); flows.leave(); identity = null;
         workspaces = { status: "unavailable", problem: auth.problem }; loginError = auth.problem.message; render(); return;
       }
       if (auth.value.status === "signed-out") { invalidateAuthentication(); return; }
+      authenticationProblem = "";
       if (authenticatedUser !== null && authenticatedUser !== auth.value.identity.user) { resetProtectedState(); lifecycle = generation; callbacks.authenticationLost?.(); }
       authenticatedUser = auth.value.identity.user;
       signedOut = false; identity = auth.value.identity;
@@ -437,7 +453,7 @@ export function mountMobileHub(root: HTMLElement, backend: MobileHubBackend, cal
         }),
         load(() => backend.readDefaultFolder(), value => { defaultFolder = value; }),
       ]);
-    } catch { if (current()) { if (flows.detail) requestedDetail = flows.detail; closeSheet(false); flows.leave(); identity = null; workspaces = { status: "unavailable", problem: { kind: "unavailable", message: "Could not connect to this hub." } }; loginError = "Could not connect to this hub."; render(); } }
+    } catch { if (current()) { authenticationProblem = "Could not connect to this hub."; workspaces = { status: "unavailable", problem: { kind: "unavailable", message: authenticationProblem } }; if (!identity) { if (flows.detail) requestedDetail = flows.detail; closeSheet(false); flows.leave(); loginError = authenticationProblem; } render(); } }
   }
   function show(next: MobileHubRoute, detail?: MobileHubDetail) { scroll[route] = page.scrollTop; closeSheet(false); flows.leave(); route = next; requestedDetail = identity ? undefined : detail; if (detail && identity) flows.show(detail); render(); page.scrollTop = scroll[route]; }
   /** Call before foregrounding a workspace through history/direct dispatch.

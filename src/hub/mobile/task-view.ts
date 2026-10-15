@@ -56,11 +56,16 @@ export function createTaskView(host: HTMLElement, foreground: () => boolean, can
       if (current.dataset.taskKind !== "confirmation" || event.key !== "Tab") return;
       event.stopPropagation();
       const controls = [...current.querySelectorAll<HTMLElement>('button:not([disabled]),input:not([disabled]),select:not([disabled]),textarea:not([disabled]),a[href],[tabindex="0"]')];
-      const first = controls[0], last = controls.at(-1), active = host.ownerDocument.activeElement;
-      if (!first) { event.preventDefault(); current.focus(); }
-      else if (!current.contains(active)) { event.preventDefault(); (event.shiftKey ? last! : first).focus(); }
-      else if (event.shiftKey && (active === first || active === current)) { event.preventDefault(); last!.focus(); }
-      else if (!event.shiftKey && active === last) { event.preventDefault(); first.focus(); }
+      const first = controls[0], last = controls.at(-1), index = controls.indexOf(host.ownerDocument.activeElement as HTMLElement);
+      // A busy confirmation can focus its container. Always re-enter through
+      // a control, and honor the modal boundary even when WebKit's native Tab
+      // preference skips buttons. Editors retain ordinary native traversal.
+      event.preventDefault();
+      if (!first) current.focus();
+      else if (index < 0) (event.shiftKey ? last! : first).focus();
+      else {
+        controls[(index + (event.shiftKey ? -1 : 1) + controls.length) % controls.length]!.focus();
+      }
     },
   };
 }

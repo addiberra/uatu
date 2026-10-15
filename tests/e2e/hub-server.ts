@@ -429,7 +429,7 @@ await preferences.load();
 const folders = new FolderManager({ journalPath: path.join(tempRoot, "folder-mutations.json"), registry, sessions, personalState, credentials, reservations, worktreeDependencies: createWorktreeRenameGuard({ env: { PATH: process.env.PATH, HOME: tempRoot, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" } }) });
 const cloneJobs = MOBILE_FLOWS ? new CloneJobManager({ processFactory: mobileCloneProcess, registry, sessions, reservations, onboarding: { configureCloned: options => onboarding.configureCloned(options), removeWorkspaceAssignments: id => credentials.removeWorkspaceAssignments(id) }, personalState }) : undefined;
 const server = startHubServer({ config, registry, sessions, sessionStore, personalState, notifications,
-  ...(MOBILE_FLOWS ? { preferences, folders, onboarding, cloneJobs, cloneAttempts: new CloneAttemptStore(path.join(tempRoot, "clone-attempts"), (owner, id) => cloneJobs!.has(owner, id)) } : {}),
+  ...(MOBILE_FLOWS ? { preferences, folderManager: folders, onboarding, cloneJobs, cloneAttempts: new CloneAttemptStore(path.join(tempRoot, "clone-attempts"), (owner, id) => cloneJobs!.has(owner, id)) } : {}),
   ...(agentAccounts ? { agentAccounts } : {}),
   ...(PUSH ? { presenceGraceMs: PRESENCE_GRACE_MS } : {}),
   ...(WORKTREES ? { onboarding, worktrees: worktreesService,

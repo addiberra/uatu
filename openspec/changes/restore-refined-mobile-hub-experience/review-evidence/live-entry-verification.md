@@ -134,10 +134,80 @@ The regression failed in Chromium/WebKit before this correction and now passes.
 - Reconnect behind Settings keeps the same workspace and one broker subscription;
   the injected transport loss is not treated as an authoritative Stop.
 
-The broader credential/onboarding/clone exceptional browser matrices, exact live
-scroll/geometry/reconnect coverage, complete current synthetic/regression suites,
-desktop/native comparison and final evidence reconciliation require their named
-checks. Tasks stay open until verified, not merely adapter-connected.
+### Additional command-owner investigation (2026-10-16)
+
+- Real disposable SSH/OpenPGP browser checks now generate, inspect public-only
+  facts, unlock, check, disable/enable, delete and re-import keys in a private
+  fixture HOME. Repository tokens still emit no Agent accounts writes. Tool and
+  separate authentication/signing assignment checks use the real routes too.
+  Earlier live iterations were partial, not green: the initial assignment check
+  read the wrong catalog level; subsequent runs found the history/folder issues
+  below. One WebKit OpenPGP result-view loss did not reproduce in instrumented
+  repeats (generation then took about 1.2–1.3s); its original cause is unproven.
+  A later 15/16 run still sampled workspace content before the real Start/entry
+  had settled. Current checks await the real Start response before boot content;
+  no transport deadline or existing boot/geometry tolerance was widened.
+- Direct-Hub Start exposed an owned task-history Back racing document navigation.
+  Direct entry now waits for that traversal, with intent/auth/disposal fences;
+  it does not change the server Start or manufacture another workspace realm.
+- A deterministic red unit regression also showed transient authentication-read
+  failure discarding a pending credential command. Failed revalidation now
+  preserves its owner and presents a connection-unconfirmed notice. Authoritative
+  unauthorized/session/user-change boundaries still invalidate it. A real-route
+  held-response/503 regression exercises the same ownership seam.
+- Start without assignments was incorrectly presented as an editor. Its explicit
+  confirmation now owns modal focus and a non-destructive Start action. WebKit
+  confirmation traversal explicitly cycles its controls after busy failure;
+  editors keep nonmodal native traversal. Unit regressions failed before each fix.
+- The fixture's folder manager was accidentally supplied under the unused
+  `folders` option. Wiring `folderManager` enables the actual folder routes; no
+  product route, authorization or refusal was bypassed.
+- The first expanded synthetic discovery was **294 passed / 48 failed** across
+  **342 cases**. Besides the Start presentation defect and local reference-page
+  focus recovery, failures identified retired selectors, old read-only fact prose,
+  old folder/Devices navigation, missing report-to-results Back, and capture-only
+  hardcoded port 4732. Updated checks retain facts, counts, masking, cancellation,
+  exact partial outcomes and isolation; port checks still refuse published
+  listeners and now verify the selected loopback synthetic server's health.
+- OpenPGP error scrolling was measured, not relaxed: the longer error needed
+  exactly six pixels to reveal its bottom in the short viewport. The regression
+  asserts that exact movement, the visible alert boundary and unchanged document
+  and underlying Settings scroll, rather than requiring the error to stay clipped.
+- Responsive discovery produced **1,102 PASS / 0 FAIL / 1 UNSUPPORTED**. A concurrent
+  Playwright startup cleared some ephemeral captures in the shared output tree;
+  that run is behavioral discovery, not a retained comparison set. The runner now
+  accepts `RESPONSIVE_OUTPUT_DIR` for separately retained captures. No reference,
+  approved golden or curated gallery was changed.
+
+Latest live rerun:
+
+```sh
+bun node_modules/@playwright/test/cli.js test -c playwright.mobile-live.config.ts --output=test-results/live-current
+```
+
+**66 passed**, both engines, production HTML/assets and real Hub/API owners.
+This includes the new actual SSH/OpenPGP lifecycle, tool override, separate
+assignment/no-op/host preservation, all-required-unlocks-before-one-Start, real
+folder maintenance/collision/fallback, held accepted credential plus failed
+revalidation, explicit B/reload boundaries, and all prior account/notification/
+worktree/clone/continuity cases. The stated account/platform/PTY/clone doubles
+remain doubles; no personal provider was tested. The focused ownership units
+passed **67/67** (597 assertions); both TypeScript projects pass. The subsequent
+last-test precondition tightening awaits its focused repeat.
+
+The current synthetic rerun, separate retained responsive captures,
+desktop/native comparison and final evidence reconciliation still require their
+named results. Tasks stay open until verified, not merely adapter-connected.
+
+Current historical Chat reproduction:
+
+```sh
+bun node_modules/@playwright/test/cli.js test --project=e2e tests/e2e/chat-touch.e2e.ts --workers=1 --output=test-results/chat-touch-current
+```
+
+**26 passed / 11 failed**, same categories as the prior evidence: eight hidden
+navigation-bar expectations, two Chat/bar boundary assumptions and one pinned-day
+message identity. The suite was not edited, waived or described as passing.
 
 The historical archive still has 25 files with digest
 `34055380d75c874bec9ca8d0cf34ec07ac5006e46103241dacecabdcbb6a1d23`, unchanged

@@ -66,9 +66,31 @@ function changeSelect(root: HTMLElement, value: string) {
   });
 }
 
-const overviewKey = (id = "key", enabled = true): PublicCredentialDto => ({ id, type: "ssh", name: `Identity ${id}`, enabled, createdAt: "2026-01-01", capabilities: ["ssh-authentication"], metadata: { fingerprint: "public-only", publicKey: "public-only" }, assignments: [], readiness: [{ layer: "credential", status: "ready", message: "Unlocked (prose is not a fact)" }] });
+const overviewKey = (id = "key", enabled = true): Extract<PublicCredentialDto, { type: "ssh" }> => ({ id, type: "ssh", name: `Identity ${id}`, enabled, createdAt: "2026-01-01", capabilities: ["ssh-authentication"], metadata: { fingerprint: "public-only", publicKey: "public-only" }, assignments: [], readiness: [{ layer: "credential", status: "ready", message: "Unlocked (prose is not a fact)" }] });
 const keyFacts = (id: string, lock: "locked" | "unlocked" | "unknown"): CredentialFacts => ({ id, type: "ssh", protection: { status: "known", value: "unprotected" }, lock: lock === "unknown" ? { status: "unknown" } : { status: "known", value: lock }, userId: { status: "not-applicable" } });
 describe("Settings overview explicit credential facts", () => {
+  test("a transient authentication read cannot discard a pending credential command or its result", async () => {
+    let authReads = 0, resolve!: (value: import("./backend").OperationResult<ReturnType<typeof overviewKey>>) => void;
+    let catalog: ReturnType<typeof overviewKey>[] = [];
+    const h = harness({
+      readAuthentication: async () => ++authReads === 2 ? { status: "unavailable", problem: { kind: "unavailable", message: "Temporary connection loss" } } : available({ status: "authenticated", identity: { user: "Reviewer", host: "synthetic.invalid", version: "test-version" } }),
+      readCredentials: async () => available(catalog), readCredentialFacts: async target => available(keyFacts(target.id, "locked")),
+      generateSsh: () => new Promise(done => { resolve = done; }),
+    });
+    await h.ui.ready; h.ui.show("settings", { kind: "add-credential" });
+    h.root.querySelector<HTMLButtonElement>('[data-flow="ssh"]')!.click(); h.root.querySelector<HTMLButtonElement>('[data-flow="ssh-generate"]')!.click();
+    const task = h.root.querySelector<HTMLElement>(".mh-task")!;
+    task.querySelector<HTMLInputElement>('[name="name"]')!.value = "Generated despite transient read loss";
+    task.querySelector<HTMLInputElement>('[name="passphrase"]')!.value = "disposable-only";
+    h.click("commit-sheet"); await settle();
+    expect(task.getAttribute("aria-busy")).toBe("true");
+    await h.ui.refresh();
+    expect(task.isConnected).toBe(true); expect(h.root.querySelector(".mh-task")).toBe(task);
+    expect(task.querySelector<HTMLInputElement>('[name="passphrase"]')!.value).toBe("");
+    catalog = [{ ...overviewKey(), name: "Generated despite transient read loss" }];
+    resolve({ status: "completed", value: catalog[0]! }); await settle();
+    expect(h.root.querySelector(".mh-flow-page h1")?.textContent).toBe("Generated despite transient read loss");
+  });
   test("late catalog Retry cannot cross authentication invalidation", async () => {
     let catalogs = 0;
     let finish!: (value: ReadResult<PublicCredentialDto[]>) => void;
@@ -301,6 +323,8 @@ describe("stable Return and explicit workspace intents", () => {
   });
   test("unassigned Start cancels without effects, confirms once, then navigates actual result", async () => {
     const h = harness(); await h.ui.ready; h.click("start:b");
+    expect(h.root.querySelector('[role="alertdialog"][data-task-kind="confirmation"]')?.getAttribute("aria-label")).toBe("Start without credentials?");
+    expect(h.root.querySelector('[data-action="commit-sheet"]')?.classList.contains("mh-destructive")).toBe(false);
     expect(h.starts).toEqual([]); h.click("cancel-sheet"); expect(h.starts).toEqual([]);
     h.click("start:b"); h.click("commit-sheet"); await settle();
     expect(h.starts).toEqual([{ workspaceId: "b", unassigned: "confirmed-without-credentials" }]);

@@ -77,6 +77,20 @@ test("retained workspace opens the sole focused Notifications owner, not a hidde
   await expect(page.locator(".mh-dock .mh-tab")).toHaveCount(2);
 });
 
+test("explicit B and reload are new document boundaries, never a second retained workspace", async ({ hubContext }) => {
+  const page = await hubContext.newPage();
+  await page.goto("/s/mobile-a/README.md"); await expect(page.locator("#preview-path")).toHaveText("README.md");
+  await page.evaluate(() => { (window as any).priorWorkspaceRealm = document.querySelector(".app-shell"); });
+  await hub(page); await page.locator('[data-action="open:mobile-b"]').click();
+  await expect(page).toHaveURL(/\/s\/mobile-b\/README.md$/); await expect(page.locator("#preview-path")).toHaveText("README.md");
+  expect(await page.evaluate(() => (window as any).priorWorkspaceRealm)).toBeUndefined();
+  await expect(page.locator("#mobile-workspace-root .app-shell")).toHaveCount(1);
+  await page.evaluate(() => { (window as any).priorWorkspaceRealm = document.querySelector(".app-shell"); });
+  await page.reload(); await expect(page.locator("#preview-path")).toHaveText("README.md");
+  expect(await page.evaluate(() => (window as any).priorWorkspaceRealm)).toBeUndefined();
+  await hub(page); await expect(page.locator('[data-action="return"]')).toContainText("mobile-b");
+});
+
 test("authoritative external Stop while Hub is foreground invalidates retained access without implicit Start", async ({ hubContext, hub: info }) => {
   const page = await hubContext.newPage(); let starts = 0;
   page.on("request", request => { if (new URL(request.url()).pathname.endsWith("/start")) starts++; });
