@@ -358,8 +358,9 @@ session-authenticated JSON family, `worktree-api.ts` at
 like any other hub route with no separate progress poll: each call answers
 its own bounded outcome, and a safety refusal is an ordinary `{ok: false,
 error}` response rather than a transport failure. `forget` ("Remove from
-Uatu") touches no files and, given a registered workspace id, reads no Git,
-so a family whose checkouts were deleted outside Uatu is still removable:
+Uatu") touches no files and, given a workspace id registered to that
+repository, reads no Git, so a family whose checkouts were deleted outside
+Uatu is still removable:
 its worktrees first, then the main workspace. The dashboard learns which
 folders are gone from `/api/hub/state`'s `availability: "missing"`, which
 covers a top-level workspace as well as a linked worktree; it is read with a

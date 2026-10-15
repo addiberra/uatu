@@ -43,6 +43,9 @@ export type WorktreeDialogRow = {
   availability?: "missing" | "replaced";
   checkout: string;
   workspaceId?: string;
+  /** The main workspace this registration inherits from. Absent for a main
+   *  checkout and for a linked checkout registered on its own. */
+  parentWorkspaceId?: string;
   main: boolean;
   /** Recorded branch-creation history, when the Hub has any. Never inferred. */
   sourceRef?: string;
@@ -209,6 +212,7 @@ export function installWorktreeDialog<T extends Record<string, unknown>>(
   function worktreeRowFrom(checkout: Record<string, unknown>, sourceName: string): WorktreeDialogRow {
     const branch = typeof checkout.branch === "string" ? checkout.branch : "";
     const workspaceId = typeof checkout.workspaceId === "string" ? checkout.workspaceId : undefined;
+    const parentWorkspaceId = typeof checkout.parentWorkspaceId === "string" ? checkout.parentWorkspaceId : undefined;
     const checkoutId = String(checkout.checkoutId ?? "");
     const main = checkout.main === true;
     return {
@@ -226,6 +230,7 @@ export function installWorktreeDialog<T extends Record<string, unknown>>(
         : {}),
       checkout: checkoutId,
       ...(workspaceId === undefined ? {} : { workspaceId }),
+      ...(parentWorkspaceId === undefined ? {} : { parentWorkspaceId }),
       main,
       ...(typeof checkout.sourceRef === "string" && checkout.sourceRef !== ""
         ? { sourceRef: checkout.sourceRef }
@@ -715,12 +720,15 @@ export function installWorktreeDialog<T extends Record<string, unknown>>(
         ...(options.availability === undefined ? {} : { availability: options.availability }),
         main: isMain,
       };
-      // Forget of a main workspace: the worktrees still registered under it.
-      // A readable inventory lists them itself; an unreadable one has no
-      // rows, so the opener's own count stands in.
+      // Forget of a main workspace: the worktrees still registered under it,
+      // by the Hub's own rule (assertNoRegisteredWorktreeDependents): a
+      // registration whose parent is this workspace. A linked checkout
+      // registered on its own through Add workspace inherits nothing and does
+      // not count. A readable inventory lists them itself; an unreadable one
+      // has no rows, so the opener's own count stands in.
       const dependents = view !== "forget" || !selected?.main ? 0
         : standIn ? options.dependents ?? 0
-          : rows.filter(row => !row.main && row.registered).length;
+          : rows.filter(row => row.registered && row.parentWorkspaceId === selected.id).length;
       // The stand-in's body states the inventory's reason itself.
       const shown = standIn && message === unreadable ? undefined : message;
       return {

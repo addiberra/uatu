@@ -1476,6 +1476,16 @@ describe("#504 a repository with registered worktrees explains that they go firs
     expect(h.main().querySelector("form")).toBeNull();
   });
 
+  // A linked checkout registered on its own through Add workspace has no
+  // parent: it inherits nothing, and the Hub's guard does not wait for it.
+  test("a linked checkout registered on its own is not counted as a dependent", async () => {
+    const independent = checkout({ checkoutId: "checkout-own", workspaceId: "own-checkout", parentWorkspaceId: undefined, branch: "own", ownership: "external" });
+    const h = harness({ "/": () => inventory([mainCheckout(), independent]) });
+    await open(h, { view: "forget", id: "atlas" });
+    expect(h.main().querySelector("[role=alert]")).toBeNull();
+    expect(h.main().querySelector("[name=confirm]")).toBeTruthy();
+  });
+
   test("a worktree, or a repository with none left, still offers the confirmation", async () => {
     for (const [id, checkouts] of [["atlas-child", [mainCheckout(), checkout()]], ["atlas", [mainCheckout()]]] as const) {
       const h = harness({ "/": () => inventory([...checkouts]) });

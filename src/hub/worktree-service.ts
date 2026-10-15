@@ -74,6 +74,14 @@ import {
   type WorktreeRegistrar,
 } from "./worktree-journal";
 
+// The repository a registration belongs to: a linked worktree's main
+// workspace, or the workspace itself. Two registrations are one repository's
+// exactly when these agree; the forget route's no-Git shortcut uses the same
+// rule, so it never takes another repository's id for its own.
+export function registeredFamilyOf(entry: Pick<WorkspaceEntry, "id" | "worktree">): string {
+  return entry.worktree?.parentWorkspaceId ?? entry.id;
+}
+
 // Shared by both unregister APIs, including Hubs without the worktree API
 // enabled. Check before deleting ANY Hub state, not merely in registry.remove:
 // registered children retain this id as their live credential/settings owner.
@@ -938,8 +946,7 @@ export class WorktreeService {
       const entry = this.options.registry.byId(request.reference);
       if (!entry) throw WorktreeOperationError.of("not-found", "That workspace is not registered. Refresh and try again.", { retry: "refresh" });
       const source = this.options.registry.byId(request.sourceWorkspaceId);
-      const family = entry.worktree?.parentWorkspaceId ?? entry.id;
-      if (!source || (source.worktree?.parentWorkspaceId ?? source.id) !== family) {
+      if (!source || registeredFamilyOf(source) !== registeredFamilyOf(entry)) {
         throw WorktreeOperationError.of("not-found", "That workspace does not belong to this repository.");
       }
       // A main workspace owns its children's live policy: removing it first

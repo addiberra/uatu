@@ -699,6 +699,26 @@ describe("removing registrations whose files were deleted outside Uatu (#504)", 
     expect(byBranch.ok).toBe(false);
   });
 
+  test("a branch named like another repository's workspace id is still forgotten by branch", async () => {
+    // Another repository owns a workspace whose id is also a branch name in
+    // this one. The id shortcut is for this repository's own registrations
+    // only; the branch still resolves through the inventory.
+    const foreign = await repository("lookalike-foreign");
+    const foreignId = (await onboarding.configureExisting({ path: foreign, displayName: "feature-login", authentication: [], signing: null, init: false, start: false })).entry.id;
+    const local = await repository("lookalike-local");
+    const localId = (await onboarding.configureExisting({ path: local, displayName: "lookalike-local", authentication: [], signing: null, init: false, start: false })).entry.id;
+    const created = await result(await post("create", { sourceWorkspaceId: localId, mode: "new-branch", branch: foreignId, base: { kind: "local", ref: "main" } }));
+    if (!created.ok || !created.checkout?.workspaceId) throw new Error("expected the lookalike branch to be created");
+    const childId = created.checkout.workspaceId;
+    expect(childId).not.toBe(foreignId);
+
+    const forgotten = await result(await post("forget", { sourceWorkspaceId: localId, reference: foreignId }));
+    expect(forgotten.ok).toBe(true);
+    expect(registry.byId(childId)).toBeUndefined();
+    expect(registry.byId(foreignId)).toBeDefined();
+    expect(registry.byId(localId)).toBeDefined();
+  });
+
   test("with the main checkout intact, a deleted worktree is removed from Uatu while its sibling stays guarded", async () => {
     const { folder, parentId, children } = await onboardFamily("partial");
     const [goneId, keptId] = children as [string, string];
