@@ -232,6 +232,7 @@ export type Unsubscribe = () => void;
  * with the existing surface clients, not this Hub management interface.
  */
 export interface MobileHubBackend {
+  worktrees?: import("./worktrees").MobileWorktrees;
   /** Absent on older/synthetic assemblies means unavailable, never fake login. */
   agentAccounts?: import("./agent-accounts").MobileAgentAccounts;
   readAuthentication(): Promise<ReadResult<AuthenticationState>>;

@@ -3,6 +3,7 @@ import { normalizeProviderHost, type AuthenticationCredentialAssignment, type Pu
 import { action, advisory, displayName, field, group, infoRows, listRow, required, select, text, value, type FlowEnvironment } from "./flow-ui";
 import { supportsRole } from "./credential-flows";
 import { branchLabel } from "./workspace-presentation";
+import { createWorktreeFlows } from "./worktree-flows";
 
 export type AssignmentDraft = { authentication: string; host: string; signing: string };
 export function assignmentIntent(workspace: WorkspaceView, mode: AssignWorkspaceIntent["mode"], draft: AssignmentDraft): AssignWorkspaceIntent | null {
@@ -41,6 +42,7 @@ export function assignmentReview(w: WorkspaceView, catalog: PublicCredentialDto[
 }
 export function createWorkspaceFlows(env: FlowEnvironment, start: (workspace: WorkspaceView) => void) {
   const { backend } = env;
+  const worktrees = createWorktreeFlows(env);
   function workspace(id: string) {
     env.page("Workspace", text("Loading workspace…"));
     void env.read(() => backend.readWorkspace(id), w => {
@@ -53,6 +55,7 @@ export function createWorkspaceFlows(env: FlowEnvironment, start: (workspace: Wo
           return env.mutate(() => backend.renameWorkspace({ workspaceId: id, displayName: name }), () => { env.sheet.close(); env.changed(); workspace(id); }, root);
         } }),
         assign: () => assignments(id),
+        worktrees: () => worktrees.show(w.parentId ?? id, () => workspace(id)),
         stop: () => env.confirm("Stop workspace?", text(`Stop ${w.displayName}? Its shells will be terminated. Registration and files remain.`), { label: "Stop", run: root => env.mutate(() => backend.stopWorkspace(id), result => { env.sheet.close(); env.changed(); env.task("Workspace stopped", text(result.status === "already-stopped" ? "This workspace was already stopped." : "Its session has stopped. Registration and files remain."), undefined, {}, () => workspace(id)); }, root) }),
         forget: () => env.confirm("Forget registration?", text(`Forget ${w.displayName}? This removes its registration and personal workspace state, not files on disk. Its folder remains at ${w.path}. A running workspace must be stopped separately.`), { label: "Forget", run: root => env.mutate(() => backend.forgetWorkspace(id), result => { env.sheet.close(); env.changed(); env.home(); env.task("Registration forgotten", text(result.status === "not-found" ? "This registration was already absent." : "The registration was removed. Workspace files were not deleted.")); }, root) }),
       };
@@ -62,7 +65,7 @@ export function createWorkspaceFlows(env: FlowEnvironment, start: (workspace: Wo
         const signing = w.assignments.find(a => a.role === "signing");
         return group("Git authentication", auths.length ? auths.map(a => infoRows([{ label: "Host", value: a.host, mono: true }, { label: "Credential", value: name(a.credentialId) }])).join("") : infoRows([{ label: "Credential", value: "None assigned" }])) + group("Commit signing", infoRows([{ label: "Credential", value: signing ? name(signing.credentialId) : "None assigned" }]));
       };
-      env.page(w.displayName, group("Workspace information", infoRows([{ label: "Folder", value: w.path, mono: true }, { label: "Status", value: w.runtime.status, tone: w.runtime.status === "running" ? "positive" : "neutral" }, { label: "Branch", value: branchLabel(w.branch) }, { label: "Stable ID", value: w.id, mono: true }])) + (w.credentialRestartRequired ? text("Credential changes require a workspace restart.") : "") + shellText + `<div data-workspace-assignments>${assignmentText("loading")}</div>` + text("Assignment presence is not credential readiness.") + action("assign", "Edit workspace credentials") + action("rename", "Rename display name") + action("open", w.runtime.status === "running" ? "Open" : "Start") + (w.runtime.status === "running" ? action("stop", "Stop workspace", true) : action("forget", "Forget registration", true)), actions, { primaryAction: "open" });
+      env.page(w.displayName, group("Workspace information", infoRows([{ label: "Folder", value: w.path, mono: true }, { label: "Status", value: w.runtime.status, tone: w.runtime.status === "running" ? "positive" : "neutral" }, { label: "Branch", value: branchLabel(w.branch) }, { label: "Stable ID", value: w.id, mono: true }])) + (w.credentialRestartRequired ? text("Credential changes require a workspace restart.") : "") + shellText + `<div data-workspace-assignments>${assignmentText("loading")}</div>` + text("Assignment presence is not credential readiness.") + action("assign", "Edit workspace credentials") + action("rename", "Rename display name") + (backend.worktrees && (w.createWorktree || w.parentId) ? listRow("worktrees", "Branches and worktrees", "Create, register and manage checkouts", "branch") : "") + (w.availability ? text(`Checkout ${w.availability}. Resolve its identity before Open or Start.`) : action("open", w.runtime.status === "running" ? "Open" : "Start")) + (w.runtime.status === "running" ? action("stop", "Stop workspace", true) : action("forget", "Forget registration", true)), actions, { primaryAction: "open" });
       // Name enrichment must not replace usable workspace facts with a catalog
       // error page, or rerender the page and disrupt a focused command/form.
       const region = env.root.querySelector<HTMLElement>("[data-workspace-assignments]")!;

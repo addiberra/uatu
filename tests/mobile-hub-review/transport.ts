@@ -12,7 +12,7 @@ export type ReviewMethod = typeof reviewMethods[number];
 // Agent accounts is a separate optional capability object, not an RPC method.
 // This reviewer deliberately leaves it unavailable; account integration tests
 // use the existing fake agent service through real Hub routes, never live login.
-type MissingReviewMethod = Exclude<keyof MobileHubBackend, ReviewMethod | "subscribeInvalidation" | "subscribeClone" | "agentAccounts">;
+type MissingReviewMethod = Exclude<keyof MobileHubBackend, ReviewMethod | "subscribeInvalidation" | "subscribeClone" | "agentAccounts" | "worktrees">;
 const exhaustiveReviewMethods: MissingReviewMethod extends never ? true : never = true;
 void exhaustiveReviewMethods;
 type Wire = null | boolean | number | string | Wire[] | { [key: string]: Wire };

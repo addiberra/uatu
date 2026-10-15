@@ -30,6 +30,9 @@ import {
 import { parseLiveEnvelope, type LiveEnvelope } from "../shared/live-protocol";
 import { createGitRunner, repositoryContext } from "./worktree-git";
 import { decodeHubState } from "./mobile/live-read-model";
+import { parseHTML } from "linkedom";
+import { createLiveTransport } from "./mobile/live-transport";
+import { createLiveWorktrees } from "./mobile/live-worktrees";
 import { assertOpenApiResponse, loadContract } from "../../tests/contracts/contract-harness";
 
 // Task 6.2 against the REAL Hub: Bun.serve, the registry, onboarding, the
@@ -39,6 +42,53 @@ import { assertOpenApiResponse, loadContract } from "../../tests/contracts/contr
 // inherited from a Hub-managed development workspace.
 
 const temporaryDirectories: string[] = [];
+
+test("mobile worktree adapter preserves HTTP-200 refusals, operation identity and exact local-data acknowledgement", async () => {
+  const saved = Object.getOwnPropertyDescriptor(globalThis, "document");
+  Object.defineProperty(globalThis, "document", { configurable: true, value: parseHTML('<html><head><meta name="uatu-hub" content="true"></head></html>').document });
+  try {
+    const source = (await registry.register(await repository("mobile-adapter-source"))).id;
+    const api = createLiveWorktrees(createLiveTransport({ fetch: (route, init) => fetch(`${origin}${route}`, { ...init, headers: { ...Object.fromEntries(new Headers(init?.headers)), cookie, origin } }) }));
+    const inventory = await api.inventory(source);
+    expect(inventory.status).toBe("available");
+    const invalid = await api.create({ sourceWorkspaceId: source, mode: "new-branch", branch: "../refused", base: { kind: "local", ref: "main" } });
+    expect(invalid).toMatchObject({ status: "completed", value: { ok: false, kind: "create", error: { code: "invalid-input" } } });
+    const created = await api.create({ sourceWorkspaceId: source, mode: "new-branch", branch: "mobile-adapter-test", base: { kind: "local", ref: "main" }, start: false });
+    expect(created.status).toBe("completed");
+    if (created.status !== "completed" || !created.value.ok || !created.value.checkout) throw new Error("Fixture worktree creation failed");
+    const checkout = created.value.checkout;
+    expect(created.value.started).toBe(false); expect(created.value.operationId).not.toBe("");
+    const target = { sourceWorkspaceId: source, reference: checkout.checkoutId };
+    expect(await api.open({ ...target, start: false })).toMatchObject({ status: "completed", value: { ok: true, kind: "start", started: false } });
+    expect(await api.fetch(source)).toMatchObject({ status: "completed", value: { ok: false, refs: { local: expect.arrayContaining(["main", "mobile-adapter-test"]) } } });
+    expect(await api.forget({ ...target, reference: checkout.workspaceId!, stop: true })).toMatchObject({ status: "completed", value: { ok: true, kind: "forget", registered: false } });
+    expect(existsSync(checkout.path)).toBe(true);
+    expect(await api.register({ ...target, start: false })).toMatchObject({ status: "completed", value: { ok: true, kind: "register", registered: true, checkout: { checkoutId: checkout.checkoutId, ownership: "uatu" } } });
+    await writeFile(path.join(checkout.path, "mobile-local.txt"), "disposable local data\n");
+    const preflight = await api.preflightDelete(target);
+    expect(preflight).toMatchObject({ status: "completed", value: { ok: true, localData: { untracked: { count: 1 } } } });
+    if (preflight.status !== "completed" || !preflight.value.ok || !preflight.value.localData) throw new Error("Fixture preflight failed");
+    const refused = await api.delete({ ...target, confirm: true });
+    expect(refused).toMatchObject({ status: "completed", value: { ok: false, kind: "delete" } });
+    expect(existsSync(checkout.path)).toBe(true);
+    expect(await api.delete({ ...target, confirm: true, localDataFingerprint: preflight.value.localData.fingerprint })).toMatchObject({ status: "completed", value: { ok: true, kind: "delete", registered: false, started: false } });
+    expect(existsSync(checkout.path)).toBe(false);
+    const externalPath = path.join(root, "mobile-external-checkout");
+    await git(registry.byId(source)!.path, ["worktree", "add", "-b", "external-mobile", externalPath, "main"]);
+    const externalInventory = await api.inventory(source);
+    if (externalInventory.status !== "available") throw new Error("Fixture inventory failed");
+    const external = externalInventory.value.checkouts.find(row => row.path === externalPath)!;
+    expect(external).toMatchObject({ ownership: "external", registered: false });
+    const externalTarget = { sourceWorkspaceId: source, reference: external.checkoutId };
+    const registered = await api.register(externalTarget);
+    expect(registered).toMatchObject({ status: "completed", value: { ok: true, checkout: { ownership: "external" } } });
+    expect(await api.preflightDelete(externalTarget)).toMatchObject({ status: "completed", value: { ok: false } });
+    if (registered.status !== "completed" || !registered.value.ok || !registered.value.checkout?.workspaceId) throw new Error("Fixture registration failed");
+    expect(await api.forget({ ...externalTarget, reference: registered.value.checkout.workspaceId, stop: true })).toMatchObject({ status: "completed", value: { ok: true, registered: false } });
+    expect(existsSync(externalPath)).toBe(true);
+    await registry.remove(source);
+  } finally { if (saved) Object.defineProperty(globalThis, "document", saved); else Reflect.deleteProperty(globalThis, "document"); }
+});
 let root = "";
 let home = "";
 let origin = "";

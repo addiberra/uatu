@@ -1,10 +1,10 @@
 import { execFileSync } from "node:child_process";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test, expect } from "./hub-fixtures";
 
-test.use({ hubAgentAccounts: true, hubCredentials: true, hubWorkspaces: ["mobile-accounts"] });
+test.use({ hubAgentAccounts: true, hubCredentials: true, hubWorktrees: true, hubWorkspaces: ["mobile-accounts"] });
 let directory: string, js: string, css: string;
 test.beforeAll(async () => {
   directory = await mkdtemp(path.join(process.env.UATU_TEST_TEMP_ROOT ?? tmpdir(), "mobile-live-browser-"));
@@ -72,4 +72,77 @@ test("phone login attempts expose code flow, clear a rejected code, cancel and r
   await page.getByRole("button", { name: "Cancel login", exact: true }).click();
   await expect(page.locator(".mh-flow-page")).toContainText("cancelled");
   expect(page.url()).not.toContain("disposable-wrong-code");
+});
+
+test("compact checkout More owns creation and clean deletion through real worktree routes", async ({ hubContext }) => {
+  const page = await hubContext.newPage(); await page.goto("/");
+  await expect(page.locator(".mh-workspace")).toHaveCount(1);
+  await expect(page.locator(".mh-workspace-family")).toHaveCount(0);
+  await expect(page.locator(".mh-page").getByRole("button", { name: /Rename|Create branch/ })).toHaveCount(0);
+  await page.locator(".mh-more").click();
+  await page.getByRole("button", { name: /Branches and worktrees/ }).click();
+  await page.getByRole("button", { name: "Create branch or worktree", exact: true }).click();
+  await page.getByLabel("New branch name").fill("phone-checkout");
+  await page.getByRole("button", { name: "Create worktree", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Worktree operation completed", exact: true })).toBeVisible();
+  await expect(page.locator(".mh-flow-page")).toContainText("Not started");
+  await expect(page.locator(".mh-flow-page")).toContainText("Operation identity");
+  await page.getByRole("button", { name: "Refresh checkouts", exact: true }).click();
+  await page.getByRole("button", { name: /^phone-checkout,/ }).click();
+  await page.getByRole("button", { name: "Check deletion safety", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Delete worktree?", exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Delete worktree", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Worktree operation completed", exact: true })).toBeVisible();
+  const response = await hubContext.request.get("/api/hub/worktrees?source=mobile-accounts");
+  const { inventory } = await response.json();
+  expect(inventory.checkouts).toHaveLength(1);
+  expect(inventory.refs.local).toContain("phone-checkout"); // deletion never deletes the branch
+});
+
+test("phone worktree deletion requires exact disclosed local-data acknowledgement", async ({ hubContext, hub }) => {
+  const response = await hubContext.request.post("/api/hub/worktrees/create", { headers: { origin: hub.origin }, data: { sourceWorkspaceId: "mobile-accounts", mode: "new-branch", branch: "phone-dirty", base: { kind: "local", ref: "main" } } });
+  const created = await response.json(); expect(created.ok).toBe(true);
+  await writeFile(path.join(created.checkout.path, "local-note.txt"), "disposable untracked file\n");
+  const writes: unknown[] = [];
+  const page = await hubContext.newPage();
+  page.on("request", request => { if (new URL(request.url()).pathname.endsWith("/worktrees/delete")) writes.push(request.postDataJSON()); });
+  await page.goto("/?detail=workspace&id=mobile-accounts");
+  await page.getByRole("button", { name: /Branches and worktrees/ }).click();
+  await page.getByRole("button", { name: /^phone-dirty,/ }).click();
+  await page.getByRole("button", { name: "Check deletion safety", exact: true }).click();
+  await expect(page.locator(".mh-sheet")).toContainText("local-note.txt");
+  await page.getByRole("button", { name: "Delete worktree", exact: true }).click();
+  await expect(page.locator(".mh-sheet-error")).toContainText("Acknowledge"); expect(writes).toHaveLength(0);
+  await page.getByRole("switch", { name: "Permanently delete these files with the worktree" }).check();
+  await page.getByRole("button", { name: "Delete worktree", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Worktree operation completed", exact: true })).toBeVisible();
+  expect(writes).toHaveLength(1);
+  expect(writes[0]).toMatchObject({ confirm: true, localDataFingerprint: expect.stringMatching(/^[0-9a-f]{64}$/) });
+  expect(writes[0]).not.toHaveProperty("force");
+});
+
+test("phone fetch refusal retains creation draft and forgotten owned checkout can be registered without recreation", async ({ hubContext, hub }) => {
+  const response = await hubContext.request.post("/api/hub/worktrees/create", { headers: { origin: hub.origin }, data: { sourceWorkspaceId: "mobile-accounts", mode: "new-branch", branch: "phone-register", base: { kind: "local", ref: "main" } } });
+  const created = await response.json(); expect(created.ok).toBe(true);
+  const page = await hubContext.newPage(); await page.goto("/?detail=workspace&id=mobile-accounts");
+  await page.getByRole("button", { name: /Branches and worktrees/ }).click();
+  await page.getByRole("button", { name: "Create branch or worktree", exact: true }).click();
+  await page.getByLabel("New branch name").fill("kept-draft");
+  await page.getByRole("button", { name: "Fetch remote branches", exact: true }).click();
+  await expect(page.locator(".mh-sheet-error")).not.toBeEmpty();
+  await expect(page.getByLabel("New branch name")).toHaveValue("kept-draft");
+  await page.getByRole("button", { name: "Cancel", exact: true }).click();
+  await page.getByRole("button", { name: /^phone-register,/ }).click();
+  await page.getByRole("button", { name: "Remove from Uatu", exact: true }).click();
+  await expect(page.locator(".mh-sheet")).toContainText("Checkout, branch, files and creation provenance remain");
+  await page.getByRole("button", { name: "Stop and remove registration", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Worktree operation completed", exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Refresh checkouts", exact: true }).click();
+  await page.getByRole("button", { name: /^phone-register,/ }).click();
+  await expect(page.locator(".mh-flow-page")).toContainText("Not registered");
+  await page.getByRole("button", { name: "Register workspace", exact: true }).click();
+  await page.locator('.mh-task').getByRole("button", { name: "Register workspace", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Worktree operation completed", exact: true })).toBeVisible();
+  const { inventory } = await (await hubContext.request.get("/api/hub/worktrees?source=mobile-accounts")).json();
+  expect(inventory.checkouts.find((row: any) => row.checkoutId === created.checkout.checkoutId)).toMatchObject({ registered: true, ownership: "uatu", path: created.checkout.path, running: false });
 });
