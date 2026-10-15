@@ -87,7 +87,7 @@ Each slice is written test first: write the named test and watch it fail, implem
   - actions depend on capability and state: Remove and Edit always; Steer or Send now on queued entries; Queue on steers; "Send now (all paused steers)" on paused steers; no Steer action on commands.
 
   Implement until the tests pass.
-- [ ] 6.3 Wire the composer in `src/chat/ui.ts`:
+- [x] 6.3 Wire the composer in `src/chat/ui.ts`:
   - Enter and ⌥Enter choose the delivery while a `steering` conversation is busy;
   - the delivery menu sits inside the Send/Cancel footprint (`src/index.html`, `src/styles.css`);
   - dock actions call the new client operations;
@@ -100,7 +100,7 @@ Each slice is written test first: write the named test and watch it fail, implem
 ## 7. End-to-end harness and scenarios
 
 - [x] 7.1 Build `tests/e2e/opencode-v2-fake.ts`: a scripted fake OpenCode 2.0.28 HTTP and SSE server implementing the routes the 2.x provider calls, including the inbox list and cancel, prompt with delivery and resume, and interrupt with resume. It is controlled through `/__e2e/chat`. Register it in `tests/e2e/server.ts` as an agent served by the real `ChatAdapter` and `OpenCodeV2Provider` (D13). Verify with a smoke test: a conversation is created, a prompt answers, and history reloads.
-- [ ] 7.2 Add `tests/e2e/chat-steering.e2e.ts` against the fake with these scenarios:
+- [x] 7.2 Add `tests/e2e/chat-steering.e2e.ts` against the fake with these scenarios:
   - Enter steers and the steer delivers at a scripted step boundary, entering the timeline only then;
   - ⌥Enter queues;
   - switch queued → steer, and steer → queue;
@@ -113,13 +113,26 @@ Each slice is written test first: write the named test and watch it fail, implem
   - the menu on a touch viewport.
 
   Capture screenshots through `tests/e2e/evidence.ts`. Verify that `bun run test:e2e -- chat-steering` passes.
-- [ ] 7.3 Extend `FakeE2EChatService` with `send-now`, and add a Claude Send now scenario to `tests/e2e/chat-queue.e2e.ts`: cancel leaves the queue dormant, Send now delivers the chosen message, and the others stay held. Verify that a running Claude conversation shows no Send now and no steer choice. Verify that the whole `chat-queue` suite passes.
+- [x] 7.3 Extend `FakeE2EChatService` with `send-now`, and add a Claude Send now scenario to `tests/e2e/chat-queue.e2e.ts`: cancel leaves the queue dormant, Send now delivers the chosen message, and the others stay held. Verify that a running Claude conversation shows no Send now and no steer choice. Verify that the whole `chat-queue` suite passes.
 
 ## 8. Coverage, docs, and final verification
 
 - [x] 8.1 Update `src/chat/opencode/sdk-coverage.ts` (D12) and run `bun run coverage:agents`. Verify that the report lists the inbox events and operations as mapped, with `session.inbox.update` as deliberately unused.
 - [x] 8.2 Update `ARCHITECTURE.md` where it describes the chat queue (steer ownership, dock), and the `src/chat/` entry in `CLAUDE.md` if the module map changes. Verify by review.
 - [ ] 8.3 Run `bun run test:ci`, `bun run test:e2e`, and `bun run build`. All must pass.
+
+  Verification (2026-10-15): the final steering/queue/panel browser selection
+  passed 49/49, including Undo and rail stability; build and typecheck passed.
+  The clean-tool-environment full CI run had 5087 passed, 16 skipped, and one
+  native file-observer deletion timeout (its isolated file recheck passed
+  14/14). Full E2E had 876 passed and 75 failed: 72 lacked the installed
+  WebKit executable; the other three (AsciiDoc nested TOC, chat lazy startup,
+  and document-tree Follow navigation) passed an isolated six-test recheck.
+  These rechecks do not constitute a passing full run; this task stays open.
+  Logs: `steering-targeted-conclusive.log`, `steering-test-ci-clean.log`,
+  `steering-full-e2e.log`, `steering-file-observer-recheck.log`, and
+  `steering-e2e-failure-recheck.log` in the session's approved temporary
+  `opencode/` directory. No browser installation was attempted.
 - [ ] 8.4 Do one manual pass against a real OpenCode 2.0.28 binary (`bun run dev`):
   - steer mid-turn;
   - steer → queue before the boundary;
@@ -128,3 +141,7 @@ Each slice is written test first: write the named test and watch it fail, implem
   - undo with a pending steer.
 
   Record the results in the PR body.
+
+  Verification blocker (2026-10-15): the installed `opencode --version` reports
+  `opencode v2.0.29`, not the required 2.0.28. No alternative binary was
+  installed, and scripted fake-server checks do not satisfy this manual pass.

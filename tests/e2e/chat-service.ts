@@ -79,7 +79,7 @@ export class FakeE2EChatService implements WorkspaceChatService {
   private readonly olderItems = new Map<string, ConversationItem[]>();
   // Mirrors the real adapter's workspace-held queue: busy submissions wait
   // here, deliver on the turn's own end, pause on cancellation.
-  private readonly queues = new Map<string, QueuedMessage[]>();
+  private readonly queues = new Map<string, Array<QueuedMessage & { configuration: ConversationConfiguration }>>();
   private readonly dormant = new Set<string>();
   private nextCreatedConfiguration: ConversationConfiguration = {};
   // Conversations a subagent runs as. The real adapter keeps them out of the
@@ -464,7 +464,7 @@ export class FakeE2EChatService implements WorkspaceChatService {
     // holds the message instead of delivering it, exactly like the adapter.
     const queue = this.queues.get(id) ?? [];
     if (conversation.status === "running" || conversation.status === "sending" || queue.length > 0) {
-      const held: QueuedMessage = { id: `held-${this.nextId++}`, text, queuedAt: Date.now(), delivery: "queue", requestId, ...(attachmentRefs.length ? { attachments: attachmentRefs } : {}) };
+      const held = { id: `held-${this.nextId++}`, text, queuedAt: Date.now(), delivery: "queue" as const, requestId, configuration: structuredClone(configuration), ...(attachmentRefs.length ? { attachments: attachmentRefs } : {}) };
       queue.push(held);
       this.queues.set(id, queue);
       this.dormant.delete(id);
@@ -520,6 +520,7 @@ export class FakeE2EChatService implements WorkspaceChatService {
     if (!queue || !held) return;
     queue.shift();
     if (queue.length === 0) this.queues.delete(id);
+    this.publishConfiguration(id, structuredClone(held.configuration));
     this.dispatch(id, held.text, held.requestId, held.attachments);
     this.publishQueue(id, { kind: "delivered", messageId: held.id });
   }
@@ -532,7 +533,7 @@ export class FakeE2EChatService implements WorkspaceChatService {
   // staged revert, as the adapter derives it (opencode-v2-steering D3).
   private dock(id: string): QueuedMessage[] {
     const paused = this.dormant.has(id) || this.revertBoundaries.has(id);
-    return (this.queues.get(id) ?? []).map(held => ({ ...structuredClone(held), ...(paused ? { paused: true as const } : {}) }));
+    return (this.queues.get(id) ?? []).map(({ configuration: _configuration, ...held }) => ({ ...structuredClone(held), ...(paused ? { paused: true as const } : {}) }));
   }
 
   // This fake never steers: it stands in for Claude Code and OpenCode 1.x,
@@ -561,6 +562,7 @@ export class FakeE2EChatService implements WorkspaceChatService {
     if (index < 0) throw new QueuedMessageNotHeldError();
     const [held] = queue.splice(index, 1);
     if (queue.length === 0) this.queues.delete(id);
+    this.publishConfiguration(id, structuredClone(held!.configuration));
     this.dispatch(id, held!.text, held!.requestId, held!.attachments);
     this.publishQueue(id, { kind: "delivered", messageId: held!.id });
     const result = { messageId: held!.id, delivery: "queue" as const };
@@ -590,6 +592,9 @@ export class FakeE2EChatService implements WorkspaceChatService {
     // Cancel pauses the queue before the status transition can deliver.
     if (this.queues.get(id)?.length) this.dormant.add(id);
     this.setStatus(id, "interrupted");
+    for (const held of this.queues.get(id) ?? []) {
+      this.publishQueue(id, { kind: "paused", messageId: held.id });
+    }
     const result = { cancelled: true } as const;
     this.receipts.set(key, result);
     return result;

@@ -1,6 +1,7 @@
 import type { APIRequestContext, Page } from "@playwright/test";
 
 import { openChatPanel } from "./chat-helpers";
+import { captureScreenshot } from "./evidence";
 import { expect, test } from "./fixtures";
 
 async function bootChat(page: Page, request: APIRequestContext): Promise<void> {
@@ -91,5 +92,49 @@ test.describe("chat message queue", () => {
     await expect(page.locator("#chat-items [data-chat-item-id]").last()).toContainText("Queued follow-up");
     await expect(page.locator("#chat-queue .is-held")).toHaveCount(1);
     await expect(page.locator("#chat-queue .is-held")).toContainText("Fresh instruction");
+  });
+
+  test("Claude Send now delivers the chosen dormant message and leaves the rest held; a running turn offers neither Send now nor steering", async ({ page, request }, testInfo) => {
+    await control(request, { action: "agents", count: 2 });
+    await page.reload();
+    await openChatPanel(page);
+    await page.getByRole("button", { name: "New conversation", exact: true }).click();
+    await page.locator("#chat-agent-menu .chat-agent-menu__item", { hasText: "Claude Code" }).click();
+    await expect(page.locator("#chat-context")).toContainText("Claude Code");
+    const conversationId = await page.locator("#chat-conversation-select").inputValue();
+    expect(conversationId).toMatch(/^claude:/);
+
+    await send(page, "Start Claude work");
+    await send(page, "Held first");
+    await send(page, "Send this now");
+    await send(page, "Held last");
+    const held = page.locator("#chat-queue .is-held");
+    await expect(held).toHaveText([/Held first/, /Send this now/, /Held last/]);
+    await expect(page.locator("#chat-delivery-toggle")).toBeHidden();
+    await expect(held.locator("[data-queue-steer], [data-queue-send-now]")).toHaveCount(0);
+
+    await page.locator("#chat-send").click();
+    await expect(page.locator("#chat-composer-status")).toHaveAttribute("aria-label", "Cancelled");
+    await expect(held.locator("[data-queue-send-now]")).toHaveCount(3);
+    await expect(page.locator("#chat-queue .is-held[data-paused]")).toHaveCount(3);
+    await captureScreenshot(page, testInfo, "claude-dormant-send-now");
+
+    const sent = page.waitForResponse(response => response.url().endsWith("/send-now"));
+    await held.filter({ hasText: "Send this now" }).getByRole("button", { name: "Send now", exact: true }).click();
+    expect((await sent).status()).toBe(200);
+    await expect(page.locator("#chat-items").getByText("Send this now", { exact: true })).toHaveCount(1);
+    await expect(held).toHaveText([/Held first/, /Held last/]);
+    await expect(page.locator("#chat-items")).not.toContainText("Held first");
+    await expect(page.locator("#chat-items")).not.toContainText("Held last");
+    await expect(held.locator("[data-queue-send-now], [data-queue-steer]")).toHaveCount(0);
+    await expect(page.locator("#chat-delivery-toggle")).toBeHidden();
+
+    // Ending the selected message's turn must not drain the dormant backlog.
+    await control(request, { action: "status", conversationId, status: "completed" });
+    await expect(page.locator("#chat-send")).toHaveAttribute("aria-label", "Send message");
+    await expect(held).toHaveText([/Held first/, /Held last/]);
+    await page.reload();
+    await openChatPanel(page);
+    await expect(held).toHaveText([/Held first/, /Held last/]);
   });
 });

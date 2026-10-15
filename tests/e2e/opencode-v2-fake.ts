@@ -143,6 +143,13 @@ export function startOpenCodeV2Fake(options: { directory: string; password?: str
   }
 
   function enqueue(session: SessionState, input: { id: string; text: string; files?: InboxFile[]; delivery: InboxDelivery; resume: boolean }): InboxEntry {
+    // A replacement prompt commits the staged branch before admission.
+    // Pending inbox entries are independent of that discarded history.
+    if (session.info.revert) {
+      const boundary = session.messages.findIndex(message => message.id === session.info.revert!.messageID);
+      if (boundary >= 0) session.messages.splice(boundary);
+      delete session.info.revert;
+    }
     const entry: InboxEntry = {
       id: input.id,
       sessionID: session.info.id,

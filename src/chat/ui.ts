@@ -3438,7 +3438,14 @@ export function initChat(api = new ChatApiClient()): void {
         projection = dropQueuedMessage(projection, messageId);
         scheduleRender();
       }
-      if (error.code === STEER_ALREADY_DELIVERED_CODE) { announce(TOO_LATE, true); noteComposer(TOO_LATE); return; }
+      if (error.code === STEER_ALREADY_DELIVERED_CODE) {
+        // Streamed delivery can land after this response and clear the
+        // transient announcement. Keep the refusal visible at the composer.
+        setComposerError(TOO_LATE, conversationId);
+        announce(TOO_LATE, true);
+        noteComposer(TOO_LATE);
+        return;
+      }
     }
     announce(messageOf(error), true);
   };
@@ -3509,7 +3516,7 @@ export function initChat(api = new ChatApiClient()): void {
     }
   };
   const onDeliveryMenuOutside = (event: Event) => {
-    if (deliveryMenu && !deliveryMenu.contains(event.target as Node) && event.target !== deliveryToggle) closeDeliveryMenu();
+    if (deliveryMenu && !deliveryMenu.contains(event.target as Node) && !deliveryToggle?.contains(event.target as Node)) closeDeliveryMenu();
   };
   const onDeliveryMenuKey = (event: KeyboardEvent) => {
     if (event.key === "Escape") { event.preventDefault(); closeDeliveryMenu(); deliveryToggle?.focus(); }
@@ -3521,15 +3528,28 @@ export function initChat(api = new ChatApiClient()): void {
     document.removeEventListener("pointerdown", onDeliveryMenuOutside, true);
     document.removeEventListener("keydown", onDeliveryMenuKey, true);
   }
-  deliveryToggle?.addEventListener("click", () => {
+  // Keep the touch rail in place until the click, as on Send: blurring the
+  // composer during pointerdown can otherwise move the disclosure away.
+  deliveryToggle?.addEventListener("pointerdown", event => {
+    if (event.pointerType === "touch") event.preventDefault();
+  });
+  deliveryToggle?.addEventListener("click", event => {
     if (!deliveryMenu) return;
     if (!deliveryMenu.hidden) { closeDeliveryMenu(); return; }
     syncDeliveryMenu();
     deliveryMenu.hidden = false;
     deliveryToggle.setAttribute("aria-expanded", "true");
-    deliveryMenu.querySelector<HTMLButtonElement>("[aria-checked='true']")?.focus();
+    // A touch choice keeps the composer (and keyboard) focused so opening
+    // the menu does not change the rail's layout. Keyboard users still land
+    // on the current choice.
+    if (event.detail === 0 || document.documentElement.dataset.uiMode !== "touch") {
+      deliveryMenu.querySelector<HTMLButtonElement>("[aria-checked='true']")?.focus();
+    }
     document.addEventListener("pointerdown", onDeliveryMenuOutside, true);
     document.addEventListener("keydown", onDeliveryMenuKey, true);
+  });
+  deliveryMenu?.addEventListener("pointerdown", event => {
+    if (event.pointerType === "touch") event.preventDefault();
   });
   deliveryMenu?.addEventListener("click", event => {
     const choice = (event.target as Element).closest<HTMLButtonElement>("[data-delivery-choice]");
