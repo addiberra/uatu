@@ -6,6 +6,7 @@ import { createLiveCredentials } from "./live-credentials";
 import { createLiveLifecycle } from "./live-lifecycle";
 import { createLiveOnboarding } from "./live-onboarding";
 import { createLiveClone } from "./live-clone";
+import { createLiveAgentAccounts } from "./live-agent-accounts";
 
 /** Browser-only assembly. The caller owns mounting, stream invalidation and
  * eligibility; no fixtures, personal configuration or independent polling. */
@@ -14,6 +15,7 @@ export function createLiveBackend(options: Parameters<typeof createLiveTransport
   const workspaces = createLiveWorkspaceReads(transport);
   const credentials = createLiveCredentials(transport, workspaces);
   return {
+    agentAccounts: createLiveAgentAccounts(transport),
     ...createLiveAuthentication(transport), ...workspaces, ...credentials,
     ...createLiveLifecycle(transport, { ...workspaces, ...credentials }),
     ...createLiveOnboarding(transport), ...createLiveClone(transport, credentials, options),

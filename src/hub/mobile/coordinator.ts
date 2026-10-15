@@ -10,18 +10,21 @@ export function mobileHubRoute(url: URL): MobileHubRoute | null {
   return null;
 }
 
-const detailKinds = new Set(["add-credential", "tools", "assignments", "default-folder", "devices", "security", "add-workspace", "clone", "folders"]);
+const detailKinds = new Set(["notifications", "agent-accounts", "add-credential", "tools", "assignments", "default-folder", "devices", "security", "add-workspace", "clone", "folders"]);
 /** Only frontend identities belong in route context, never filesystem authority
  * or form/secret drafts. Unknown/malformed queries fall back to the overview. */
 export function mobileHubDetail(url: URL): MobileHubDetail | undefined {
   if (!mobileHubRoute(url)) return;
   if (url.pathname === "/clone") return { kind: "clone" };
+  const legacyAgent = /^#agent-accounts\/(opencode|claude)$/.exec(url.hash)?.[1];
+  if (url.pathname === "/settings" && legacyAgent && !url.search) return { kind: "agent", id: legacyAgent as "opencode" | "claude" };
   if (url.searchParams.getAll("detail").length !== 1 || url.searchParams.getAll("id").length > 1) return;
   const kind = url.searchParams.get("detail")!;
+  if (kind === "agent") { const id = url.searchParams.get("id"); if (id === "opencode" || id === "claude") return { kind, id }; return; }
   if (kind === "credential" || kind === "workspace") {
     const id = url.searchParams.get("id");
     if (id && /^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,127}$/.test(id)) return { kind, id };
-  } else if (detailKinds.has(kind) && !url.searchParams.has("id")) return { kind: kind as Exclude<MobileHubDetail["kind"], "credential" | "workspace"> };
+  } else if (detailKinds.has(kind) && !url.searchParams.has("id")) return { kind: kind as Exclude<MobileHubDetail["kind"], "credential" | "workspace" | "agent"> };
 }
 export function mobileHubPath(route: MobileHubRoute, detail?: MobileHubDetail | null): string {
   if (detail?.kind === "clone") return "/clone";
@@ -39,6 +42,7 @@ export function mountMobileCoordinator(options: {
   workspaceId: string; basePath: string;
   bootWorkspace(): Promise<void>; revealNavigation(): void;
   eligible(): boolean;
+  notifications?: import("./notifications").MobileNotificationSettings;
 }) {
   const { hubRoot, workspaceRoot, backend, workspaceId, basePath } = options;
   workspaceRoot.classList.add("mh-coordinator-workspace");
@@ -179,6 +183,7 @@ export function mountMobileCoordinator(options: {
     return true;
   };
   const view = mountMobileHub(hubRoot, backend, {
+    notifications: options.notifications,
     navigateWorkspace: id => { void openWorkspace(id); },
     returnToWorkspace: id => { void openWorkspace(id); },
     setRoute: route => showHub(route), authenticationLost: loseAuthentication,
@@ -285,7 +290,7 @@ export function mountMobileCoordinator(options: {
     const url = new URL(link.href);
     const route = url.origin === location.origin ? mobileHubRoute(url) : null;
     if (!route) return;
-    event.preventDefault(); event.stopImmediatePropagation(); showHub(route); void view.refresh();
+    event.preventDefault(); event.stopImmediatePropagation(); showHub(route, true, mobileHubDetail(url)); void view.refresh();
   };
   document.addEventListener("click", click, true);
   const saveHubScroll = (event: Event) => {

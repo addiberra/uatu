@@ -7,6 +7,8 @@ import { sharedUidKey } from "./flow-ui";
 import { validateCloneDraft, emptyCloneDraft, cloneCredentialCompatible } from "./clone-flow";
 import type { CloneStreamEvent, Invalidation, MobileHubBackend, OperationResult, ReadResult, WorkspaceView } from "./backend";
 import type { PublicCredentialDto } from "../credential-types";
+import type { AgentAccountsSnapshot } from "../agent-account-types";
+import type { MobileAgentAccounts } from "./agent-accounts";
 
 const descriptors = new Map(["window", "document", "navigator"].map(name => [name, Object.getOwnPropertyDescriptor(globalThis, name)]));
 let document: Document, current: Element | null, cleanup: (() => void) | undefined;
@@ -54,7 +56,7 @@ function harness(overrides: Partial<MobileHubBackend> = {}) {
     subscribeClone: (_intent, fn) => { stream = fn; return () => {}; },
     ...overrides,
   };
-  const backend = new Proxy(methods, { get: (object, key) => (...args: unknown[]) => {
+  const backend = new Proxy(methods, { get: (object, key) => key === "agentAccounts" ? object.agentAccounts : (...args: unknown[]) => {
     calls.push({ operation: String(key), args });
     const method = Reflect.get(object, key); if (!method) throw new Error(`Unhandled backend operation ${String(key)}`);
     return method(...args);
@@ -77,6 +79,95 @@ function harness(overrides: Partial<MobileHubBackend> = {}) {
   };
   return { root, ui, click, chooseKey, input, set, calls, opens, region, invalidate: (e: Invalidation) => invalidate(e), stream: (e: CloneStreamEvent) => stream(e), mutations: (name: string) => calls.filter(c => c.operation === name) };
 }
+
+function accountFixture() {
+  const snapshot: AgentAccountsSnapshot = { agents: [{ agent: "opencode", name: "OpenCode", state: "ready", generation: 2, capabilities: { login: true, logout: true, activate: true }, methods: [], loginCommand: "opencode auth login", targets: [{ id: "disposable", name: "Disposable provider", connected: false, credentials: [], methods: [{ id: "key", kind: "key", label: "Connect API key", fields: [
+    { key: "deployment", label: "Deployment", kind: "select", valueType: "string", required: true, options: [{ value: "public", label: "Public" }, { value: "private", label: "Private" }] },
+    { key: "password", label: "Private password", kind: "text", valueType: "string", required: true, secret: true, when: [{ key: "deployment", op: "eq", value: "private" }] },
+  ] }, { id: "browser", kind: "oauth", label: "Browser login", fields: [], completion: "code" }, { id: "environment", kind: "env", label: "Environment", variables: ["DISPOSABLE_KEY"] }, { id: "command", kind: "command", label: "Local helper", command: "example login" }] }] }, { agent: "claude", name: "Claude Code", state: "not-installed", message: "Not installed in this fixture", capabilities: { login: false, logout: false, activate: false }, targets: [], methods: [], loginCommand: "claude auth login" }], attempts: [] };
+  const calls: Array<{ operation: string; intent: unknown }> = [];
+  const api: MobileAgentAccounts = {
+    read: async () => available(structuredClone(snapshot)),
+    connectKey: async intent => { calls.push({ operation: "key", intent }); return { status: "rejected", problem: { kind: "invalid-input", message: "Fixture refusal" } }; },
+    startLogin: async intent => { calls.push({ operation: "login", intent }); snapshot.attempts = [{ id: "attempt-one", agent: "opencode", target: "disposable", methodId: "browser", url: "https://example.invalid/login", instructions: "Paste the whole response", completion: "code", state: "pending", startedAt: Date.now(), expiresAt: Date.now() + 60_000 }]; return completed(structuredClone(snapshot)); },
+    submitCode: async intent => { calls.push({ operation: "code", intent }); snapshot.attempts[0]!.state = "complete"; return completed(structuredClone(snapshot)); },
+    submitRedirect: async intent => { calls.push({ operation: "redirect", intent }); return { status: "rejected", problem: { kind: "invalid-input", message: "Unsafe redirect refused" } }; },
+    cancel: async id => { calls.push({ operation: "cancel", intent: id }); snapshot.attempts[0]!.state = "cancelled"; return completed(structuredClone(snapshot)); },
+    activate: async intent => { calls.push({ operation: "activate", intent }); return completed(structuredClone(snapshot)); },
+    logout: async intent => { calls.push({ operation: "logout", intent }); return completed(structuredClone(snapshot)); },
+  };
+  return { snapshot, api, calls };
+}
+test("agent accounts are separate capability pages with search, conditional fields and secret clearing on refusal", async () => {
+  const f = accountFixture(), h = harness({ agentAccounts: f.api }); await h.ui.ready;
+  h.ui.showDetail({ kind: "agent", id: "opencode" }); await settle();
+  expect(h.region().textContent).toContain("machine-wide"); expect(h.region().textContent).toContain("all Hub users");
+  h.set("provider-search", "absent"); expect(h.region().textContent).toContain("No matching providers");
+  h.set("provider-search", "Disposable"); h.click("provider-0");
+  expect(h.region().textContent).toContain("DISPOSABLE_KEY"); expect(h.region().textContent).toContain("example login");
+  h.click("method-0"); expect(h.input("account-key").type).toBe("password"); expect(h.input("answer-1").type).toBe("password");
+  h.set("answer-0", "private"); expect(h.input("answer-1").disabled).toBe(false);
+  h.set("answer-1", "disposable-password"); h.set("account-key", "disposable-key");
+  h.click("commit-sheet"); await settle();
+  expect(f.calls).toEqual([{ operation: "key", intent: { agent: "opencode", target: "disposable", method: "key", key: "disposable-key", answers: { deployment: "private", password: "disposable-password" } } }]);
+  expect(h.input("account-key").value).toBe(""); expect(h.input("answer-1").value).toBe("");
+  expect(h.region().textContent).toContain("Fixture refusal");
+  expect(h.calls.some(call => call.operation === "createToken")).toBe(false);
+});
+test("account attempt code and redirect responses stay masked and page-local; cancel/retry do not start a login", async () => {
+  const f = accountFixture(), h = harness({ agentAccounts: f.api }); await h.ui.ready;
+  h.ui.showDetail({ kind: "agent", id: "opencode" }); await settle(); h.click("provider-0"); h.click("method-1"); h.click("commit-sheet"); await settle();
+  expect(h.input("account-response").type).toBe("password");
+  expect(h.region().querySelector("a")?.getAttribute("target")).toBe("_blank");
+  h.set("account-response", "whole disposable code"); h.click("submit"); await settle();
+  expect(f.calls.at(-1)).toEqual({ operation: "code", intent: { attemptId: "attempt-one", code: "whole disposable code" } });
+  expect(h.region().textContent).toContain("complete"); expect(h.region().querySelector("input")).toBeNull();
+  f.snapshot.attempts[0]!.state = "pending"; f.snapshot.attempts[0]!.completion = "redirect";
+  h.click("refresh"); await settle(); h.set("account-response", "https://elsewhere.invalid/?secret=disposable"); h.click("submit"); await settle();
+  expect(h.input("account-response").value).toBe(""); expect(h.region().textContent).toContain("Unsafe redirect refused");
+  h.click("cancel"); await settle(); expect(h.region().textContent).toContain("cancelled");
+  h.click("retry"); expect(f.calls.filter(call => call.operation === "login")).toHaveLength(1);
+});
+test("unavailable agents and absent backend capability never invent login controls", async () => {
+  const f = accountFixture(), h = harness({ agentAccounts: f.api }); await h.ui.ready;
+  h.ui.showDetail({ kind: "agent", id: "claude" }); await settle();
+  expect(h.region().textContent).toContain("Not installed in this fixture"); expect(h.region().textContent).toContain("claude auth login");
+  expect(h.region().querySelector('[data-flow^="method-"]')).toBeNull(); expect(f.calls).toEqual([]);
+});
+
+test("account actions respect removable capabilities and confirmations", async () => {
+  const f = accountFixture();
+  f.snapshot.agents[0]!.targets[0]!.credentials = [
+    { id: "environment", label: "Environment key", kind: "env", active: false, removable: false },
+    { id: "saved", label: "Saved key", kind: "saved", active: false, removable: true },
+  ];
+  const h = harness({ agentAccounts: f.api }); await h.ui.ready;
+  h.ui.showDetail({ kind: "agent", id: "opencode" }); await settle(); h.click("provider-0");
+  expect(h.region().querySelector('[data-flow="activate-0"]')).toBeNull();
+  expect(h.region().querySelector('[data-flow="logout-0"]')).toBeNull();
+  h.click("activate-1"); expect(f.calls).toEqual([]);
+  h.click("cancel-sheet"); expect(f.calls).toEqual([]);
+  h.click("activate-1"); h.click("commit-sheet"); await settle();
+  expect(f.calls).toEqual([{ operation: "activate", intent: { agent: "opencode", credential: "saved" } }]);
+  h.click("logout-1"); h.click("commit-sheet"); await settle();
+  expect(f.calls.at(-1)).toEqual({ operation: "logout", intent: { agent: "opencode", target: "disposable", credential: "saved" } });
+});
+
+test("late account read and submit cannot restore a departed page or clear another flow's secret", async () => {
+  const f = accountFixture(), h = harness({ agentAccounts: f.api }); await h.ui.ready;
+  h.ui.showDetail({ kind: "agent", id: "opencode" }); await settle(); h.click("provider-0"); h.click("method-1"); h.click("commit-sheet"); await settle();
+  let resolve!: (result: OperationResult<AgentAccountsSnapshot>) => void;
+  f.api.submitCode = () => new Promise(done => { resolve = done; });
+  const original = h.input("account-response"); h.set("account-response", "disposable code"); h.click("submit");
+  h.ui.showDetail({ kind: "agent", id: "opencode" }); await settle(); h.click("provider-0"); h.click("method-0"); h.set("account-key", "new draft");
+  resolve(completed(f.snapshot)); await settle();
+  expect(original.value).toBe(""); expect(h.input("account-key").value).toBe("new draft");
+  let read!: (result: ReadResult<AgentAccountsSnapshot>) => void;
+  f.api.read = () => new Promise(done => { read = done; });
+  h.ui.showDetail({ kind: "agent-accounts" }); h.ui.showDetail({ kind: "security" }); await settle();
+  read(available(f.snapshot)); await settle();
+  expect(h.region().textContent).toContain("Session Security"); expect(h.region().textContent).not.toContain("Disposable provider");
+});
 
 test("canceling creation returns to Add Workspace without a redundant configure page", async () => {
   const h = harness(); await h.ui.ready;

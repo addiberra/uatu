@@ -9,7 +9,10 @@ export const reviewMethods = [
   "browseFolders", "configureExisting", "createWorkspace", "createFolder", "renameFolder", "removeEmptyFolder", "submitClone", "reconcileCloneAttempt", "sendCloneInput", "cancelClone",
 ] as const satisfies ReadonlyArray<keyof MobileHubBackend>;
 export type ReviewMethod = typeof reviewMethods[number];
-type MissingReviewMethod = Exclude<keyof MobileHubBackend, ReviewMethod | "subscribeInvalidation" | "subscribeClone">;
+// Agent accounts is a separate optional capability object, not an RPC method.
+// This reviewer deliberately leaves it unavailable; account integration tests
+// use the existing fake agent service through real Hub routes, never live login.
+type MissingReviewMethod = Exclude<keyof MobileHubBackend, ReviewMethod | "subscribeInvalidation" | "subscribeClone" | "agentAccounts">;
 const exhaustiveReviewMethods: MissingReviewMethod extends never ? true : never = true;
 void exhaustiveReviewMethods;
 type Wire = null | boolean | number | string | Wire[] | { [key: string]: Wire };

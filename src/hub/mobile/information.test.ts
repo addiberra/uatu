@@ -3,7 +3,28 @@ import { parseHTML } from "linkedom";
 import { infoRows } from "./information";
 import { advisory, check, createFlowEnvironment, sharedUidKey } from "./flow-ui";
 import { createTaskView } from "./task-view";
-import type { MobileHubBackend } from "./backend";
+import type { MobileHubBackend, OperationResult } from "./backend";
+
+test("a reused page root fences departed reads and mutation cleanup from newer operations", async () => {
+  const { document } = parseHTML("<html><body><main></main><aside></aside></body></html>");
+  const root = document.querySelector("main")! as unknown as HTMLElement;
+  const view = createTaskView(document.querySelector("aside")! as unknown as HTMLElement, () => true, () => {});
+  const { env } = createFlowEnvironment(root, {} as MobileHubBackend, { ...view, error() {}, open: (title, body, primary, _cancel, presentation) => view.open(title, body, primary, presentation) }, { user: () => "fixture", home() {}, navigate() {}, changed() {}, authLost() {}, openWorkspace() {} });
+  env.page("First", "");
+  let first!: (value: OperationResult<unknown>) => void, second!: (value: OperationResult<unknown>) => void;
+  let restored = false;
+  const old = env.mutate<unknown>(() => new Promise(resolve => { first = resolve; }), () => { restored = true; });
+  env.page("Second", "");
+  const next = env.mutate<unknown>(() => new Promise(resolve => { second = resolve; }), () => {});
+  first({ status: "completed", value: {} }); await old;
+  expect(restored).toBe(false);
+  expect(root.getAttribute("aria-busy")).toBe("true");
+  second({ status: "completed", value: {} }); await next;
+  expect(root.hasAttribute("aria-busy")).toBe(false);
+  const captured = env.current();
+  env.page("Third", "");
+  expect(captured()).toBe(false);
+});
 
 test("facts are semantic, escaped and never controls", () => {
   const { document } = parseHTML(infoRows([{ label: "<Current>", value: "<secret>", detail: "Foot & note", mono: true, tone: "warning" }]));
@@ -34,7 +55,9 @@ test("inline named security notice dismisses in editors and stays dismissed per 
   expect(task.querySelectorAll('[data-flow="dismiss-advisory"]').length).toBe(1);
   task.querySelector<HTMLButtonElement>('[data-flow="dismiss-advisory"]')!.click();
   expect(task.querySelector("[data-shared-uid]")).toBeNull();
-  expect(advisory(user)).toBe("");
+  expect(advisory(user)).not.toContain("data-shared-uid");
+  expect(advisory(user)).toContain("Credential safety details");
+  for (const fact of ["same-UID", "runtime files", "shared agents", "unset the configuration", "credentials assigned elsewhere"]) expect(advisory(user)).toContain(fact);
   expect(advisory("another-information-test-user")).not.toBe("");
   expect(sharedUidKey("user")).toBe("uatu.hub.notice.shared-uid-v1:dXNlcg");
 });

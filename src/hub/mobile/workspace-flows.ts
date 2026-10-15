@@ -46,7 +46,7 @@ export function createWorkspaceFlows(env: FlowEnvironment, start: (workspace: Wo
     void env.read(() => backend.readWorkspace(id), w => {
       const shellText = w.runtime.status === "running" ? group("Shells", w.runtime.shells.status === "ready" ? text(`${w.runtime.shells.value.length} shells`) + w.runtime.shells.value.map(s => text(`${s.label || "Shell"} · ${s.attached ? "Attached" : "Detached"}`)).join("") : text(w.runtime.shells.status === "loading" ? "Loading…" : w.runtime.shells.problem.message)) : "";
       const actions: Record<string, () => unknown> = {
-        open: () => start(w),
+        open: () => { if (!w.availability) start(w); },
         rename: () => env.task("Rename workspace", text("Changes the display name, not its folder or stable URL.") + field("name", "Display name", w.displayName), { label: "Save", run: root => {
           const name = displayName(value(root, "name"));
           if (name === w.displayName) { env.sheet.error("No changes to the display name."); return; }

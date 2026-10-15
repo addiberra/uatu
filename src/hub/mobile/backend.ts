@@ -232,6 +232,8 @@ export type Unsubscribe = () => void;
  * with the existing surface clients, not this Hub management interface.
  */
 export interface MobileHubBackend {
+  /** Absent on older/synthetic assemblies means unavailable, never fake login. */
+  agentAccounts?: import("./agent-accounts").MobileAgentAccounts;
   readAuthentication(): Promise<ReadResult<AuthenticationState>>;
   signIn(intent: { user: string; password: string; deviceLabel?: string }): Promise<OperationResult<HubIdentity>>;
   signOut(): Promise<OperationResult<{ status: "signed-out" }>>;

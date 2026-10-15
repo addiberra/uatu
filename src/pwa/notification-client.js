@@ -2,7 +2,8 @@
 // injected by each host's shared URL helper; this module owns no mount paths.
 export function mountNotifications(options) {
   if (document.getElementById("uatu-notifications")) return;
-  const dialog = document.createElement("dialog");
+  const inline = Boolean(options.root);
+  const dialog = document.createElement(inline ? "section" : "dialog");
   dialog.id = "uatu-notifications";
   dialog.setAttribute("aria-labelledby", "uatu-notifications-title");
   dialog.innerHTML = `<h2 id="uatu-notifications-title">Notifications</h2>
@@ -14,8 +15,25 @@ export function mountNotifications(options) {
     <div class="notification-actions"><button type="button" data-enable disabled>Enable notifications</button><button type="button" data-disable hidden>Disable on this device</button><button type="button" data-close>Close</button></div>`;
   const style = document.createElement("style");
   style.textContent = `#uatu-notifications{box-sizing:border-box;width:min(32rem,calc(100vw - 2rem));max-height:calc(100dvh - 2rem);overflow:auto;padding:1.25rem;border:1px solid var(--border-soft,#888);border-radius:12px;background:var(--surface,Canvas);color:var(--text-strong,CanvasText);font:inherit}#uatu-notifications::backdrop{background:#0006}#uatu-notifications label{display:flex;gap:.5rem;align-items:center;margin:.65rem 0}#uatu-notifications input{width:auto;min-height:0}#uatu-notifications .notification-actions{display:flex;flex-wrap:wrap;gap:.5rem}#uatu-notifications button{min-height:40px;padding:.4rem .65rem}#uatu-notifications .notification-help{font-size:.85em;opacity:.8}#uatu-notifications .notification-all{padding-bottom:.4rem;border-bottom:1px solid var(--border-soft,#888)}#uatu-notifications .notification-workspaces label:not(.notification-all):has(input:disabled){opacity:.5}.hub-nav .uatu-notifications-trigger{font:inherit;cursor:pointer}`;
-  document.head.append(style);
-  document.body.append(dialog);
+  if (!inline) document.head.append(style);
+  (options.root || document.body).append(dialog);
+  if (inline) {
+    dialog.className = "mh-notifications";
+    dialog.removeAttribute("aria-labelledby");
+    dialog.querySelector("h2").remove();
+    dialog.querySelector("[data-close]").remove();
+    const refresh = document.createElement("button");
+    refresh.type = "button"; refresh.dataset.refresh = ""; refresh.textContent = "Refresh notification settings";
+    dialog.querySelector(".notification-actions").append(refresh);
+    dialog.querySelectorAll("button").forEach(button => { button.className = "mh-text-action"; });
+    dialog.querySelector("[data-enable]").classList.add("mh-commit");
+    dialog.querySelector("[data-disable]").classList.add("mh-destructive");
+  }
+  let disposed = false;
+  const abort = new AbortController();
+  const current = () => {
+    if (disposed || options.current && !options.current()) throw new Error("Notification settings are no longer active.");
+  };
   const status = dialog.querySelector('[role="status"]');
   const enable = dialog.querySelector("[data-enable]");
   const disable = dialog.querySelector("[data-disable]");
@@ -32,9 +50,13 @@ export function mountNotifications(options) {
   try { deviceId = localStorage.getItem("uatu:push-device") || undefined; } catch {}
   const apiUrl = () => options.apiUrl + (deviceId ? `?device=${encodeURIComponent(deviceId)}` : "");
   const request = async (url, init) => {
-    const response = await fetch(url, { ...init, credentials: "same-origin" });
+    current();
+    const response = await fetch(url, { ...init, credentials: "same-origin", redirect: "error", cache: "no-store", signal: abort.signal });
+    current();
+    if (response.status === 401) options.onUnauthorized?.();
     const value = await response.json();
-    if (!response.ok) throw new Error(value.error || `Notification request failed (${response.status})`);
+    current();
+    if (!response.ok) throw new Error(inline ? `Notification request failed (${response.status}). Check current settings before retrying.` : value.error || `Notification request failed (${response.status})`);
     return value;
   };
   const unsupported = () => {
@@ -47,9 +69,11 @@ export function mountNotifications(options) {
   };
   const prepare = async () => {
     await options.beforeRegister?.();
+    current();
     const intended = new URL(options.workerUrl, location.href);
     const root = new URL(".", intended).href;
     const existing = (await navigator.serviceWorker.getRegistrations()).find(item => item.scope === root);
+    current();
     if (existing) {
       const scripts = [existing.active, existing.waiting, existing.installing].filter(Boolean).map(worker => worker.scriptURL);
       if (!scripts.includes(intended.href)) {
@@ -57,6 +81,7 @@ export function mountNotifications(options) {
         else throw new Error("Another application's service worker owns this scope. Notification enrollment cannot replace it.");
       }
     }
+    current();
     const result = await navigator.serviceWorker.register(intended.href, { scope: root, updateViaCache: "none" });
     if (!result.active) await new Promise((resolve, reject) => {
       const worker = result.installing || result.waiting;
@@ -69,11 +94,12 @@ export function mountNotifications(options) {
       };
       worker.addEventListener("statechange", changed); changed();
     });
+    current();
     return result;
   };
   const open = async () => {
     if (busy) return;
-    dialog.showModal();
+    if (!inline) dialog.showModal();
     status.textContent = "Loading notification settings...";
     enable.disabled = true;
     try {
@@ -103,12 +129,13 @@ export function mountNotifications(options) {
       }
       registration = await prepare();
       const subscribed = await registration.pushManager.getSubscription();
+      current();
       const publicKey = Uint8Array.from(atob(state.publicKey.replace(/-/g, "+").replace(/_/g, "/")), char => char.charCodeAt(0));
       enable._applicationServerKey = publicKey;
       enable.textContent = remote && subscribed && remote.active ? "Save preferences" : "Enable notifications";
       status.textContent = remote && subscribed && remote.active ? enabledText() : "Choose workspaces and enable notifications for this device.";
       enable.disabled = false;
-    } catch (error) { status.textContent = error.message; }
+    } catch (error) { if (!disposed) status.textContent = error.message; }
   };
   enable.addEventListener("click", () => {
     if (!registration || busy) return;
@@ -116,12 +143,15 @@ export function mountNotifications(options) {
     // Invoke permission synchronously from the click, after worker setup.
     const permission = Notification.permission === "default" ? Notification.requestPermission() : Promise.resolve(Notification.permission);
     void permission.then(async verdict => {
+      current();
       if (verdict !== "granted") throw new Error(verdict === "denied" ? "Notifications are blocked in browser settings." : "Notification permission was not granted.");
       let subscription = await registration.pushManager.getSubscription();
+      current();
       if (subscription && !remote && deviceId) {
         await subscription.unsubscribe(); subscription = null; deviceId = undefined;
       }
       subscription ||= await registration.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: enable._applicationServerKey });
+      current();
       const state = await request(options.apiUrl, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({
         ...(deviceId ? { id: deviceId } : {}), subscription: subscription.toJSON(),
         allWorkspaces: all.checked,
@@ -133,7 +163,7 @@ export function mountNotifications(options) {
       try { localStorage.setItem("uatu:push-device", deviceId); } catch {}
       status.textContent = all.checked ? "Notification preferences saved: all workspaces on this device." : "Notification preferences saved for this device.";
       disable.hidden = false; enable.textContent = "Save preferences";
-    }).catch(error => { status.textContent = error.message; }).finally(() => { busy = false; enable.disabled = Boolean(unsupported()); });
+    }).catch(error => { if (!disposed) status.textContent = error.message; }).finally(() => { busy = false; enable.disabled = Boolean(unsupported()); });
   });
   disable.addEventListener("click", async () => {
     if (busy || !deviceId) return;
@@ -141,16 +171,18 @@ export function mountNotifications(options) {
     try {
       await request(apiUrl(), { method: "DELETE" });
       const current = registration || ("serviceWorker" in navigator ? await navigator.serviceWorker.getRegistration(options.workerUrl) : null);
+      if (disposed) return;
       await (await current?.pushManager.getSubscription())?.unsubscribe();
       deviceId = undefined; remote = null;
       try { localStorage.removeItem("uatu:push-device"); } catch {}
       status.textContent = "Notifications are disabled on this device.";
       disable.hidden = true; enable.textContent = "Enable notifications";
-    } catch (error) { status.textContent = error.message; }
+    } catch (error) { if (!disposed) status.textContent = error.message; }
     finally { busy = false; disable.disabled = false; }
   });
-  dialog.querySelector("[data-close]").addEventListener("click", () => dialog.close());
-  for (const host of document.querySelectorAll(options.hosts)) {
+  dialog.querySelector("[data-close]")?.addEventListener("click", () => dialog.close());
+  dialog.querySelector("[data-refresh]")?.addEventListener("click", open);
+  for (const host of inline ? [] : document.querySelectorAll(options.hosts)) {
     const button = document.createElement("button");
     const rail = host.classList.contains("sidebar-rail");
     const sidebar = host.classList.contains("sidebar-notifications-row");
@@ -167,10 +199,12 @@ export function mountNotifications(options) {
   }
   // Reconcile an existing registration on return, without prompting or
   // silently authorizing a different login. Explicit re-enable binds a login.
-  if (deviceId && "serviceWorker" in navigator && "Notification" in window) {
+  if (!inline && deviceId && "serviceWorker" in navigator && "Notification" in window) {
     void request(apiUrl()).then(async state => {
       if (Notification.permission === "denied" && state.device) await request(apiUrl(), { method: "DELETE" });
       else if (Notification.permission === "granted" && state.device?.active) await prepare();
     }).catch(() => {});
   }
+  const ready = inline ? open() : Promise.resolve();
+  return { ready, destroy() { disposed = true; abort.abort(); dialog.remove(); style.remove(); } };
 }

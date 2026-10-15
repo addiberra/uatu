@@ -1,15 +1,18 @@
 import type { MobileHubBackend, WorkspaceView } from "./backend";
-import { createFlowEnvironment, type MobileHubDetail, type SheetPort } from "./flow-ui";
+import { createFlowEnvironment, text, type MobileHubDetail, type SheetPort } from "./flow-ui";
+import type { MobileNotificationSettings } from "./notifications";
 import { createCredentialFlows } from "./credential-flows";
 import { createWorkspaceFlows } from "./workspace-flows";
 import { createOnboardingFlows } from "./onboarding-flows";
 import { createCloneFlow } from "./clone-flow";
+import { createAgentAccountFlows } from "./agent-account-flows";
 export type { MobileHubDetail } from "./flow-ui";
 
 export function createMobileHubFlows(root: HTMLElement, backend: MobileHubBackend, sheet: SheetPort, hooks: {
   user(): string; home(): void; changed(): void; authLost(): void; openWorkspace(id: string): void; startWorkspace(w: WorkspaceView): void;
   authContext?(): { user: string; current(): boolean };
   detailChanged?(detail: MobileHubDetail | null): void;
+  notifications?: MobileNotificationSettings;
 }) {
   let detail: MobileHubDetail | null = null;
   const owner = createFlowEnvironment(root, backend, sheet, { ...hooks, home: () => { leave(); hooks.home(); hooks.detailChanged?.(null); }, navigate: next => show(next, true) });
@@ -17,10 +20,20 @@ export function createMobileHubFlows(root: HTMLElement, backend: MobileHubBacken
   const workspaces = createWorkspaceFlows(owner.env, hooks.startWorkspace);
   const onboarding = createOnboardingFlows(owner.env);
   const clone = createCloneFlow(owner.env, credentials.unlock, path => { show({ kind: "folders" }, true); onboarding.browse(path, undefined, () => show({ kind: "clone" }, true)); });
+  const accounts = createAgentAccountFlows(owner.env);
+  let disposeNotifications = () => {};
+  const stopNotifications = () => { disposeNotifications(); disposeNotifications = () => {}; };
   function show(next: MobileHubDetail, notify = false) {
-    clone.hide(); sheet.close(); owner.begin(); detail = next;
+    clone.hide(); accounts.stop(); stopNotifications(); sheet.close(); owner.begin(); detail = next;
     if (notify) hooks.detailChanged?.(next);
     switch (next.kind) {
+      case "notifications": {
+        const page = owner.env.page("Notifications", hooks.notifications ? '<div data-notification-settings></div>' : text("Notification enrollment is unavailable in this environment. No browser permission or subscription has been requested."));
+        if (hooks.notifications) disposeNotifications = hooks.notifications(page.querySelector<HTMLElement>("[data-notification-settings]")!, owner.env.current(), hooks.authLost);
+        break;
+      }
+      case "agent-accounts": accounts.show(); break;
+      case "agent": accounts.show(next.id); break;
       case "credential": credentials.detail(next.id); break;
       case "workspace": workspaces.workspace(next.id); break;
       case "add-credential": credentials.chooser(); break;
@@ -34,12 +47,12 @@ export function createMobileHubFlows(root: HTMLElement, backend: MobileHubBacken
       case "clone": clone.show(); break;
     }
   }
-  function leave() { detail = null; clone.hide(); owner.leave(); }
+  function leave() { detail = null; clone.hide(); accounts.stop(); stopNotifications(); owner.leave(); }
   return {
     show, leave,
     get detail() { return detail; },
     workspaceInvalidated(id: string) { if (detail && ((detail.kind === "workspace" && detail.id === id) || detail.kind === "assignments")) show(detail); },
-    invalidate() { detail = null; clone.reset(); owner.invalidate(); },
-    destroy() { clone.reset(); owner.invalidate(); },
+    invalidate() { detail = null; clone.reset(); accounts.stop(); stopNotifications(); owner.invalidate(); },
+    destroy() { clone.reset(); accounts.stop(); stopNotifications(); owner.invalidate(); },
   };
 }

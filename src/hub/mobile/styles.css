@@ -228,3 +228,19 @@
 @media (max-height: 450px) {
   .mh-root .mh-sheet-body { padding-top: var(--mh-space-3); }
 }
+.mh-root .mh-workspace-family { border-radius: var(--mh-radius-group); overflow: hidden; }
+.mh-root .mh-workspace-family > summary { display: flex; align-items: center; gap: 12px; min-height: 52px; padding: 12px 16px; cursor: pointer; list-style: none; }
+.mh-root .mh-workspace-family > summary::-webkit-details-marker { display: none; }
+.mh-root .mh-workspace-family > summary > span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.mh-root .mh-workspace-family > summary strong, .mh-root .mh-workspace-family > summary small { display: block; }
+.mh-root .mh-workspace-family > summary small { font-size: .82em; opacity: .7; margin-top: 4px; }
+.mh-root .mh-workspace-family[open] > summary > [data-icon="chevron"] { transform: rotate(90deg); }
+.mh-root .mh-workspace-family > summary:focus-visible { outline: 2px solid currentColor; outline-offset: -3px; }
+.mh-root .mh-safety-details { margin: 8px 0; padding: 8px 16px; }
+.mh-root .mh-device-code { display: block; font: 700 1.8rem var(--mh-font-mono); letter-spacing: .08em; overflow-wrap: anywhere; user-select: all; margin: 16px 0; }
+.mh-root .mh-account-login-link { display: inline-flex; align-items: center; min-height: var(--mh-target); color: var(--mh-action); overflow-wrap: anywhere; }
+.mh-root .mh-notifications { padding: 0 16px; overflow-wrap: anywhere; }
+.mh-root .mh-notifications fieldset { margin: 16px 0; border: 0; padding: 0; min-width: 0; }
+.mh-root .mh-notifications label { display: flex; gap: 12px; align-items: center; min-height: var(--mh-target); padding: 8px 0; }
+.mh-root .mh-notifications input { flex-shrink: 0; accent-color: var(--mh-action); width: 22px; height: 22px; }
+.mh-root .mh-notifications .notification-actions { display: grid; gap: 12px; margin: 20px 0; }

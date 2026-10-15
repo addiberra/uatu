@@ -9,7 +9,8 @@ import type { TaskPort, TaskPresentation } from "./task-view";
 export type MobileHubDetail =
   | { kind: "credential"; id: string }
   | { kind: "workspace"; id: string }
-  | { kind: "add-credential" | "tools" | "assignments" | "default-folder" | "devices" | "security" | "add-workspace" | "clone" | "folders" };
+  | { kind: "agent"; id: "opencode" | "claude" }
+  | { kind: "notifications" | "agent-accounts" | "add-credential" | "tools" | "assignments" | "default-folder" | "devices" | "security" | "add-workspace" | "clone" | "folders" };
 export type FlowActions = Record<string, () => unknown>;
 export type SheetPort = TaskPort;
 export type { TaskPort } from "./task-view";
@@ -56,10 +57,11 @@ export function sharedUidKey(user: string): string {
 }
 export const sharedUidWarning = "Local workspace credential assignments configure normal tools only. All workspaces run as the Hub OS user, so same-UID processes can inspect runtime files, reach shared agents, unset the configuration, and use credentials assigned elsewhere.";
 const dismissed = new Set<string>();
-export function advisory(user: string): string {
+export function advisory(user: string, dismissible = true): string {
   const key = sharedUidKey(user);
   try { if (window.localStorage.getItem(key) === "dismissed") dismissed.add(key); } catch { /* in-memory fallback */ }
-  return dismissed.has(key) ? "" : `<aside class="mh-advisory" data-shared-uid aria-label="Credential security"><h2>${mobileHubIcon("shield")}<span>Credentials are shared on this Hub</span></h2>${text("Assignments choose defaults for tools. They do not prevent another workspace on this Hub from accessing a credential.")}${action("dismiss-advisory", "Dismiss")}</aside>`;
+  const details = `<section class="mh-safety-details" aria-label="Credential safety details"><h2>Credential safety details</h2>${text(sharedUidWarning)}${text("Do not run untrusted projects under this shared OS user. Disabling or deleting a provider token may stop running workspaces that still use it; removing a running workspace's assignment requires stopping its shells first.")}</section>`;
+  return (dismissed.has(key) ? "" : `<aside class="mh-advisory" data-shared-uid aria-label="Credential security"><h2>${mobileHubIcon("shield")}<span>Credentials are shared on this Hub</span></h2>${text("Assignments choose defaults for tools. They do not prevent another workspace on this Hub from accessing a credential.")}${dismissible ? action("dismiss-advisory", "Dismiss") : ""}</aside>`) + details;
 }
 export function dismissAdvisory(user: string, root: HTMLElement) {
   const key = sharedUidKey(user); dismissed.add(key);
@@ -95,6 +97,7 @@ export function createFlowEnvironment(root: HTMLElement, backend: MobileHubBacke
   let taskGeneration = 0;
   let activeTask: HTMLElement | undefined;
   let authenticationGeneration = 0;
+  const mutations = new WeakMap<HTMLElement, object>();
   let pageBack: () => unknown = hooks.home;
   let pageBackLabel = "Back";
   const problem = (p: BackendProblem) => {
@@ -106,6 +109,9 @@ export function createFlowEnvironment(root: HTMLElement, backend: MobileHubBacke
     authContext() { if (hooks.authContext) return hooks.authContext(); const captured = authenticationGeneration, user = hooks.user(); return { user, current: () => captured === authenticationGeneration && user === hooks.user() }; },
     current() { const captured = generation, task = taskGeneration, node = activeTask?.isConnected ? activeTask : undefined; return () => captured === generation && task === taskGeneration && (!node || node.isConnected) && hubForeground(root); },
     page(title, body, actions = {}, presentation) {
+      generation++;
+      mutations.delete(root);
+      root.removeAttribute("aria-busy");
       pageBack = actions["flow-back"] ?? hooks.home;
       pageBackLabel = presentation?.backLabel ?? "Back";
       clearSecrets(root);
@@ -143,6 +149,8 @@ export function createFlowEnvironment(root: HTMLElement, backend: MobileHubBacke
       const alert = region.querySelector<HTMLElement>('.mh-sheet-error, .mh-flow-error');
       const ownsRegion = () => current() && region.isConnected && (!alert || region.contains(alert));
       if (region.getAttribute("aria-busy") === "true") return;
+      const mutation = {};
+      mutations.set(region, mutation);
       region.setAttribute("aria-busy", "true");
       const controls = [...region.querySelectorAll<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement | HTMLButtonElement>("input,select,textarea,button")].filter(control => !control.disabled);
       const focused = controls.find(control => control === region.ownerDocument.activeElement);
@@ -155,6 +163,10 @@ export function createFlowEnvironment(root: HTMLElement, backend: MobileHubBacke
         else { uncertain = result.status === "indeterminate"; const message = result.status === "rejected" ? problem(result.problem) : `${result.message} The outcome is not confirmed. Reconcile the current state before retrying; do not repeat this operation blindly.`; if (current()) showContextualError(region, message, { reveal: true }); }
       } catch { uncertain = true; if (ownsRegion()) showContextualError(region, "The operation's outcome could not be confirmed. Check the current state before retrying.", { reveal: true }); }
       finally {
+        // The page root is reused. A departed operation must not release a
+        // newer page's busy state or remove its pending indicator.
+        if (mutations.get(region) !== mutation) return;
+        mutations.delete(region);
         region.removeAttribute("aria-busy");
         region.querySelector("[data-task-pending]")?.remove();
         // An unknown mutation is not safe to repeat from the same submit button.

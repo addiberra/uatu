@@ -9,14 +9,16 @@ import { group as section, text as note, destinationRow as destination, choiceGr
 import { createMobileHubFlows, type MobileHubDetail } from "./flows";
 import { advisory, clearSecrets, dismissAdvisory, field as flowField, showContextualError } from "./flow-ui";
 import { branchLabel } from "./workspace-presentation";
+import { mobileWorkspaceGroups, type MobileWorkspaceGroup } from "./workspace-groups";
 export { branchLabel } from "./workspace-presentation";
 import { observeMobileHubLayout } from "./layout";
 import { createTaskView, type TaskPresentation } from "./task-view";
 export type { MobileHubDetail } from "./flows";
 
 export type MobileHubRoute = "hub" | "settings";
-export type MobileHubDestination = { kind: "credential"; id: string } | { kind: "add-credential" | "tools" | "assignments" | "default-folder" | "devices" | "security" | "add-workspace" | "folders" };
+export type MobileHubDestination = { kind: "credential"; id: string } | { kind: "notifications" | "agent-accounts" | "add-credential" | "tools" | "assignments" | "default-folder" | "devices" | "security" | "add-workspace" | "folders" };
 export interface MobileHubCallbacks {
+  notifications?: import("./notifications").MobileNotificationSettings;
   navigateWorkspace(workspaceId: string): void;
   returnToWorkspace(workspaceId: string): void;
   setRoute(route: MobileHubRoute): void;
@@ -72,6 +74,7 @@ export function mountMobileHub(root: HTMLElement, backend: MobileHubBackend, cal
   let requestedDetail: MobileHubDetail | undefined;
   let lastInvalidationGeneration = -1;
   const scroll = { hub: 0, settings: 0 };
+  const disclosures = new Map<string, boolean>();
   root.classList.add("mh-root");
   root.innerHTML = '<div class="mh-page"></div><div class="mh-flow-page" hidden></div><div class="mh-modal-host"></div>';
   const page = root.querySelector<HTMLElement>(".mh-page")!;
@@ -86,6 +89,7 @@ export function mountMobileHub(root: HTMLElement, backend: MobileHubBackend, cal
   } }, {
     open: (title, body, primary, cancel, presentation) => openSheet(title, body, primary, cancel, presentation), close: () => closeSheet(false), busy, error: sheetError,
   }, {
+    notifications: callbacks.notifications,
     user: () => identity?.user ?? "", home: () => { render(); }, changed: () => { void refresh(); },
     authContext: () => { const captured = generation, user = authenticatedUser ?? ""; return { user, current: () => !disposed && generation === captured && authenticatedUser === user }; },
     authLost: invalidateAuthentication, openWorkspace: id => { void openWorkspace(id); },
@@ -93,12 +97,12 @@ export function mountMobileHub(root: HTMLElement, backend: MobileHubBackend, cal
     detailChanged: detail => {
       if (callbacks.detailChanged) callbacks.detailChanged(detail);
       else if (detail?.kind === "credential") callbacks.openDestination?.(detail);
-      else if (detail && detail.kind !== "workspace" && detail.kind !== "clone") callbacks.openDestination?.({ kind: detail.kind });
+      else if (detail && detail.kind !== "workspace" && detail.kind !== "clone" && detail.kind !== "agent") callbacks.openDestination?.({ kind: detail.kind });
       render();
       if (!detail && overviewTriggerAction) [...page.querySelectorAll<HTMLElement>("[data-action]")].find(el => el.dataset.action === overviewTriggerAction)?.focus({ preventScroll: true });
     },
   });
-  const deferredDestinations = new Set(["add-credential", "tools", "assignments", "default-folder", "devices", "security", "add-workspace", "folders"]);
+  const deferredDestinations = new Set(["notifications", "agent-accounts", "add-credential", "tools", "assignments", "default-folder", "devices", "security", "add-workspace", "folders"]);
   // Local chrome composition seam: label is trusted product HTML and attrs are
   // developer-owned markup with escaped interpolations, never raw user input.
   const button = (action: string, label: string, cls = "", attrs = "") => {
@@ -139,14 +143,19 @@ export function mountMobileHub(root: HTMLElement, backend: MobileHubBackend, cal
   }
   function workspaceRow(w: WorkspaceView) {
     const running = w.runtime.status === "running";
-    return `<article class="mh-workspace" data-workspace="${esc(w.id)}"><span class="mh-folder">${icon("folder")}</span><div class="mh-workspace-copy"><h3>${esc(w.displayName)}</h3><p>${esc(w.path)}</p></div>${button(`info:${w.id}`, icon("more"), "mh-more", `aria-label="Information and actions for ${esc(w.displayName)}, ${esc(w.path)}"`)}<div class="mh-status ${running ? "mh-running" : ""}">${running ? '<span aria-hidden="true">●</span> Running' : `${icon("branch")}<span>${esc(branchLabel(w.branch))}</span>`}</div>${button(`${running ? "open" : "start"}:${w.id}`, running ? "Open" : "Start", "mh-primary")}</article>`;
+    return `<article class="mh-workspace" data-workspace="${esc(w.id)}"><span class="mh-folder">${icon("folder")}</span><div class="mh-workspace-copy"><h3>${esc(w.displayName)}</h3><p>${esc(w.path)}</p></div>${button(`info:${w.id}`, icon("more"), "mh-more", `aria-label="Information and actions for ${esc(w.displayName)}, ${esc(w.path)}"`)}<div class="mh-status ${running && !w.availability ? "mh-running" : ""}">${w.availability ? esc(`Checkout ${w.availability}`) : `${running ? '<span aria-hidden="true">●</span> Running · ' : ""}${icon("branch")}<span>${esc(branchLabel(w.branch))}</span>`}</div>${button(`${running ? "open" : "start"}:${w.id}`, running ? "Open" : "Start", "mh-primary", w.availability ? 'disabled aria-description="Checkout unavailable; inspect Information and actions"' : "")}</article>`;
+  }
+  function workspaceGroup(group: MobileWorkspaceGroup) {
+    if (group.checkouts.length === 1) return workspaceRow(group.checkouts[0]!);
+    return `<details class="mh-workspace-family" data-family="${esc(group.id)}"${(disclosures.get(group.id) ?? group.running) ? " open" : ""}><summary>${icon("folder")}<span><strong>${esc(group.main.displayName)}</strong><small>${group.checkouts.length} checkouts · ${group.checkouts.filter(w => w.runtime.status === "running").length} running</small></span>${icon("chevron")}</summary><div class="mh-checkouts">${group.checkouts.map(workspaceRow).join("")}</div></details>`;
   }
   function dashboard() {
     const rows = workspaces.status === "ready" ? workspaces.value : [];
     const running = rows.filter(w => w.runtime.status === "running");
-    const stopped = rows.filter(w => w.runtime.status === "stopped");
+    const groups = mobileWorkspaceGroups(rows);
+    const active = groups.filter(group => group.running), stopped = groups.filter(group => !group.running);
     const collection = !rows.length ? emptyState("folder", "No workspaces yet", "Add an existing folder, create a project, or clone a repository.") : note("Workspaces stay on your hub, even when a session stops.");
-    return `<h1>Workspaces</h1><p class="mh-subtitle">${identity ? esc(identity.host) : ""}${workspaces.status === "ready" ? ` · ${running.length} session${running.length === 1 ? "" : "s"} running` : ""}</p>${target && (targetUnavailable || target.runtime.status === "stopped") ? note(`${target.displayName} ${targetUnavailable ? "is unavailable. Refresh to check its status." : "has stopped. Use Start below to open it again."}`) : ""}${workspaces.status === "loading" ? note("Loading workspaces…") : workspaces.status === "unavailable" ? `<div role="alert">${note(workspaces.problem.message)}${button("refresh", "Retry", "mh-text-action")}</div>` : `${running.length ? section("Running", running.map(workspaceRow).join(""), running.length) : ""}${stopped.length ? section("Ready to start", stopped.map(workspaceRow).join(""), stopped.length) : ""}${collection}`}${button("add-workspace", `${icon("plus")}<span>Add Workspace<small>Existing folder, new project, or clone</small></span>`, "mh-add")}`;
+    return `<h1>Workspaces</h1><p class="mh-subtitle">${identity ? esc(identity.host) : ""}${workspaces.status === "ready" ? ` · ${running.length} session${running.length === 1 ? "" : "s"} running` : ""}</p>${target && (targetUnavailable || target.runtime.status === "stopped") ? note(`${target.displayName} ${targetUnavailable ? "is unavailable. Refresh to check its status." : "has stopped. Use Start below to open it again."}`) : ""}${workspaces.status === "loading" ? note("Loading workspaces…") : workspaces.status === "unavailable" ? `<div role="alert">${note(workspaces.problem.message)}${button("refresh", "Retry", "mh-text-action")}</div>` : `${active.length ? section("Running", active.map(workspaceGroup).join(""), running.length) : ""}${stopped.length ? section("Ready to start", stopped.map(workspaceGroup).join(""), stopped.reduce((count, group) => count + group.checkouts.length, 0)) : ""}${collection}`}${button("add-workspace", `${icon("plus")}<span>Add Workspace<small>Existing folder, new project, or clone</small></span>`, "mh-add")}`;
   }
   function credentialCatalog() {
     if (credentials.status === "ready" && !credentials.value.length) return emptyState("key", "No credentials", "Add a credential to set up Git authentication or commit signing on this Hub.");
@@ -174,8 +183,14 @@ export function mountMobileHub(root: HTMLElement, backend: MobileHubBackend, cal
     const prefs = getNavigationPreferences();
     const folderValue = defaultFolder.status === "ready" ? defaultFolder.value.effective.split("/").filter(Boolean).at(-1) || "/" : defaultFolder.status === "loading" ? "Loading…" : "Unavailable";
     const folderNotice = defaultFolder.status === "ready" && defaultFolder.value.configured && !defaultFolder.value.configuredAvailable ? "Saved folder unavailable; using fallback" : "";
-    const catalog = `<div data-credential-catalog>${credentialCatalog()}</div>`;
-    return `<h1>Settings</h1>${identity ? button("identity", `<img src="${esc(appUrl("/assets/uatu-logo.svg"))}" alt=""/><span><strong>${esc(identity.user)}</strong><small>${esc(identity.host)}</small><small class="mh-running">● Connected</small></span>`, "mh-identity") + advisory(identity.user) : ""}${section("Credentials", `${catalog}${button("add-credential", "Add Credential", "mh-text-action")}`)}${note("Secure access for your workspaces. Stored only on this hub.")}${section("Workspaces", destination("default-folder", "Default Folder", "folder", folderNotice, folderValue, "blue") + destination("preview-side", "Preview File Controls", "preview", "Placement on this device", prefs.previewSide === "left" ? "Left" : "Right") + destination("auto-hide", "Navigation Auto-hide", "hub", "", prefs.autoHide ? "After 7 seconds" : "Until I close it"))}${section("Account", destination("security", "Session Security", "shield", "", "", "purple"))}${section("More settings", destination("handle", "Navigation Handle", "hub", "Side and vertical placement") + destination("tools", "Credential Tools", "key") + destination("assignments", "Workspace Assignments", "folder"))}`;
+    const catalog = advisory(identity?.user ?? "") + `<div data-credential-catalog>${credentialCatalog()}</div>`;
+    const accounts = section("Agent accounts", destination("agent-accounts", "Agent accounts", "device", "OpenCode and Claude Code · Shared by all Hub users"));
+    return `<h1>Settings</h1>${identity ? button("identity", `<img src="${esc(appUrl("/assets/uatu-logo.svg"))}" alt=""/><span><strong>${esc(identity.user)}</strong><small>${esc(identity.host)}</small><small class="mh-running">● Connected</small></span>`, "mh-identity") : ""}`
+      + section("Credentials", `${catalog}${button("add-credential", "Add Credential", "mh-text-action")}`) + note("Secure access for your workspaces. Stored only on this hub.") + accounts
+      + section("Workspaces", destination("default-folder", "Default Folder", "folder", folderNotice, folderValue, "blue") + destination("preview-side", "Preview File Controls", "preview", "Placement on this device", prefs.previewSide === "left" ? "Left" : "Right") + destination("auto-hide", "Navigation Auto-hide", "hub", "", prefs.autoHide ? "After 7 seconds" : "Until I close it"))
+      + section("Notifications", destination("notifications", "Notifications", "device", "This device and Hub login"))
+      + section("Account", destination("security", "Session Security", "shield", "", "", "purple"))
+      + section("More settings", destination("handle", "Navigation Handle", "hub", "Side and vertical placement") + destination("tools", "Credential Tools", "key") + destination("assignments", "Workspace Assignments", "folder"));
   }
   function render() {
     if (disposed) return;
@@ -183,6 +198,7 @@ export function mountMobileHub(root: HTMLElement, backend: MobileHubBackend, cal
     renderDeferred = false;
     const activeAction = page.contains(root.ownerDocument.activeElement) ? (root.ownerDocument.activeElement as HTMLElement)?.dataset.action : undefined;
     const previousScroll = page.scrollTop;
+    page.querySelectorAll<HTMLDetailsElement>("details[data-family]").forEach(detail => disclosures.set(detail.dataset.family!, detail.open));
     clearSecrets(page);
     page.innerHTML = `<header class="mh-brand"><img src="${esc(appUrl("/assets/uatu-logo.svg"))}" alt=""/><span>UatuCode</span></header><main>${signedOut ? login() : !identity ? `<h1>UatuCode</h1>${workspaces.status === "unavailable" ? `<div role="alert">${note(workspaces.problem.message)}${button("refresh", "Retry", "mh-text-action")}</div>` : note("Connecting to hub…")}` : route === "hub" ? dashboard() : settings()}</main>${identity ? dock() : ""}`;
     page.querySelector<HTMLElement>("main")!.inert = !!flows.detail;

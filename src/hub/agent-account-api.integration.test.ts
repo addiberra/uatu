@@ -18,6 +18,9 @@ import { PersonalWorkspaceStateStore } from "./personal-state";
 import { WorkspaceRegistry } from "./registry";
 import { startHubServer } from "./server";
 import { SessionManager } from "./sessions";
+import { parseHTML } from "linkedom";
+import { createLiveTransport } from "./mobile/live-transport";
+import { createLiveAgentAccounts } from "./mobile/live-agent-accounts";
 
 const KEY = "gsk-integration-secret-key";
 const CODE = "pasted-authorization-code";
@@ -162,6 +165,25 @@ async function contract(method: string, template: string, response: Response): P
 }
 
 describe("agent accounts API", () => {
+  test("mobile adapters use actual account routes, preserve capabilities and do not echo keys or follow unsafe redirects", async () => {
+    const saved = Object.getOwnPropertyDescriptor(globalThis, "document");
+    Object.defineProperty(globalThis, "document", { configurable: true, value: parseHTML('<html><head><meta name="uatu-hub" content="true"></head></html>').document });
+    try {
+      const api = createLiveAgentAccounts(createLiveTransport({ fetch: (route, init) => fetch(`${origin}${route}`, { ...init, headers: { ...Object.fromEntries(new Headers(init?.headers)), cookie, origin } }) }));
+      expect(await api.read()).toMatchObject({ status: "available", value: { agents: [{ agent: "opencode", generation: 1 }, { agent: "claude", state: "not-installed" }] } });
+      const login = { agent: "opencode" as const, target: "groq", method: "key", answers: {} };
+      const key = await api.connectKey({ ...login, key: "disposable-mobile-key" });
+      expect(key.status).toBe("completed"); expect(JSON.stringify(key)).not.toContain("disposable-mobile-key");
+      expect(changed).toContain("opencode");
+      expect((await api.logout({ agent: "opencode", target: "groq", credential: "groq" })).status).toBe("completed");
+      const started = await api.startLogin({ ...login, method: "0" });
+      expect(started.status).toBe("completed"); if (started.status !== "completed") throw new Error("Fixture login did not start");
+      const attempt = started.value.attempts.find(item => item.state === "pending")!;
+      const refused = await api.submitRedirect({ attemptId: attempt.id, address: "https://elsewhere.invalid/?code=disposable" });
+      expect(refused.status).toBe("rejected"); expect(JSON.stringify(refused)).not.toContain("disposable"); expect(fetched).toEqual([]);
+      expect((await api.cancel(attempt.id)).status).toBe("completed");
+    } finally { if (saved) Object.defineProperty(globalThis, "document", saved); else Reflect.deleteProperty(globalThis, "document"); }
+  });
   test("reads require a Hub session", async () => {
     const response = await fetch(`${origin}/api/hub/agent-accounts`);
     expect(response.status).toBe(401);
