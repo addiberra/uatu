@@ -10,8 +10,11 @@ function fixture(options: { permission?: string; unsupported?: boolean; device?:
   const storage = new Map(options.device ? [["uatu:push-device", "fixture-device"]] : []);
   let prompts = 0, registrations = 0, subscriptions = 0, unsubscribes = 0, unauthorized = 0;
   let permission: () => Promise<string> = async () => "granted";
-  const subscription = { toJSON: () => ({ endpoint: "https://push.invalid/fixture", keys: { p256dh: "fixture", auth: "fixture" } }), unsubscribe: async () => { unsubscribes++; } };
-  const registration = { active: {}, pushManager: { getSubscription: async () => options.device ? subscription : null, subscribe: async () => { subscriptions++; return subscription; } } };
+  let active = true;
+  let unsubscribe: () => Promise<void> = async () => {};
+  const subscription = { toJSON: () => ({ endpoint: "https://push.invalid/fixture", keys: { p256dh: "fixture", auth: "fixture" } }), unsubscribe: async () => { unsubscribes++; await unsubscribe(); } };
+  let getSubscription = async (): Promise<typeof subscription | null> => options.device ? subscription : null;
+  const registration = { active: {}, pushManager: { getSubscription: () => getSubscription(), subscribe: async () => { subscriptions++; return subscription; } } };
   const remote = { id: "fixture-device", active: true, allWorkspaces: true, workspaceIds: [], needsAnswer: true, completed: false };
   const notification = { permission: options.permission ?? "default", requestPermission: () => { prompts++; return permission(); } };
   const context = { document, window: { isSecureContext: true, ...(!options.unsupported ? { PushManager: {}, Notification: notification } : {}) }, navigator: { serviceWorker: { getRegistrations: async () => [], register: async () => { registrations++; return registration; }, getRegistration: async () => registration } }, Notification: notification, location: { href: "https://hub.invalid/settings?detail=notifications" }, localStorage: { getItem: (key: string) => storage.get(key), setItem: (key: string, value: string) => storage.set(key, value), removeItem: (key: string) => storage.delete(key) }, URL, Uint8Array, atob, AbortController, setTimeout, clearTimeout,
@@ -26,8 +29,8 @@ function fixture(options: { permission?: string; unsupported?: boolean; device?:
   };
   const mount = runInNewContext(source + "; mountNotifications", context);
   const root = document.querySelector("main")!;
-  const controller = mount({ apiUrl: "/notifications", stateUrl: "/state", workerUrl: "/push-worker.js", hosts: ".hub-nav", root, onUnauthorized: () => { unauthorized++; } });
-  return { root, controller, requests, storage, setPermission: (fn: () => Promise<string>) => { permission = fn; }, counts: () => ({ prompts, registrations, subscriptions, unsubscribes, unauthorized }), click: (selector: string) => root.querySelector<HTMLButtonElement>(selector)!.click(), input: (name: string) => root.querySelector<HTMLInputElement>(`[name="${name}"]`)!, document };
+  const controller = mount({ apiUrl: "/notifications", stateUrl: "/state", workerUrl: "/push-worker.js", hosts: ".hub-nav", root, current: () => active, onUnauthorized: () => { unauthorized++; } });
+  return { root, controller, requests, storage, subscription, setActive: (value: boolean) => { active = value; }, setGetSubscription: (fn: typeof getSubscription) => { getSubscription = fn; }, setUnsubscribe: (fn: typeof unsubscribe) => { unsubscribe = fn; }, setPermission: (fn: () => Promise<string>) => { permission = fn; }, counts: () => ({ prompts, registrations, subscriptions, unsubscribes, unauthorized }), click: (selector: string) => root.querySelector<HTMLButtonElement>(selector)!.click(), input: (name: string) => root.querySelector<HTMLInputElement>(`[name="${name}"]`)!, document };
 }
 
 test("focused page uses existing enrollment and filters without a dialog, third tab or automatic prompt", async () => {
@@ -71,6 +74,43 @@ test("leaving during a permission prompt fences enrollment and late status", asy
   f.click("[data-enable]"); f.controller.destroy(); resolve("granted"); await settle();
   expect(f.requests.every(item => item.method === "GET")).toBe(true);
   expect(f.counts().subscriptions).toBe(0); expect(f.root.children.length).toBe(0);
+});
+
+test("disable cannot unsubscribe a replacement session after delayed subscription lookup", async () => {
+  for (const destroy of [true, false]) {
+    const f = fixture({ device: true, permission: "granted" }); await f.controller.ready;
+    let release!: (value: typeof f.subscription) => void;
+    f.setGetSubscription(() => new Promise(done => { release = done; }));
+    f.click("[data-disable]"); await settle();
+    expect(f.requests.filter(item => item.method === "DELETE")).toHaveLength(1);
+    if (destroy) f.controller.destroy(); else f.setActive(false);
+    f.storage.set("uatu:push-device", "replacement-device");
+    release(f.subscription); await settle();
+    expect(f.counts().unsubscribes).toBe(0);
+    expect(f.storage.get("uatu:push-device")).toBe("replacement-device");
+    f.controller.destroy();
+  }
+});
+
+test("disable cannot clear replacement storage after delayed unsubscribe", async () => {
+  const f = fixture({ device: true, permission: "granted" }); await f.controller.ready;
+  let release!: () => void;
+  f.setUnsubscribe(() => new Promise(done => { release = done; }));
+  f.click("[data-disable]"); await settle();
+  expect(f.counts().unsubscribes).toBe(1);
+  f.controller.destroy(); f.storage.set("uatu:push-device", "replacement-device");
+  release(); await settle();
+  expect(f.storage.get("uatu:push-device")).toBe("replacement-device");
+});
+
+test("disable removes only the captured device's storage", async () => {
+  const f = fixture({ device: true, permission: "granted" }); await f.controller.ready;
+  let release!: () => void;
+  f.setUnsubscribe(() => new Promise(done => { release = done; }));
+  f.click("[data-disable]"); await settle();
+  f.storage.set("uatu:push-device", "replacement-device"); release(); await settle();
+  expect(f.storage.get("uatu:push-device")).toBe("replacement-device");
+  f.controller.destroy();
 });
 
 test("unauthorized/error states never display server error bodies or success", async () => {

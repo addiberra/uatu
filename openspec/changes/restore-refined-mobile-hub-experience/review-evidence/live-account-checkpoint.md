@@ -36,3 +36,19 @@ lifecycle/onboarding/clone browser matrix, full API/build/isolation and desktop
 comparison, historical Chat touch failures/archive digest, and all human/native
 acceptance gates. No section-19 task is certified complete by this checkpoint.
 No running service update or push was performed.
+
+## Notification disable lifecycle correction
+
+Independent review identified a late-disable race: the controller checked disposal
+before, but not after, subscription lookup/unsubscribe. A previous login could
+unsubscribe after replacement and unconditionally clear the new device hint.
+The correction checks lifecycle/auth ownership after each asynchronous boundary
+before subsequent effects, and removes storage only if it still names the captured
+device. Related enrollment/worker continuations use the same existing owner check.
+
+`bun test src/pwa/notification-client.test.ts`: the three new delayed lookup,
+delayed unsubscribe and matching-device regression tests failed before the fix;
+all 7 tests passed after it (139 assertions). Both destroyed and superseded
+auth-owner paths are exercised with the real client. Product TypeScript and
+`git diff --check` passed. This is self-verification of the independent finding,
+not a new independent review or native-push delivery evidence.

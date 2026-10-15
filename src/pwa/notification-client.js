@@ -83,6 +83,7 @@ export function mountNotifications(options) {
     }
     current();
     const result = await navigator.serviceWorker.register(intended.href, { scope: root, updateViaCache: "none" });
+    current();
     if (!result.active) await new Promise((resolve, reject) => {
       const worker = result.installing || result.waiting;
       if (!worker) { reject(new Error("Push worker did not start")); return; }
@@ -104,6 +105,7 @@ export function mountNotifications(options) {
     enable.disabled = true;
     try {
       const [state, hub] = await Promise.all([request(apiUrl()), request(options.stateUrl)]);
+      current();
       remote = state.device;
       disable.hidden = !remote;
       workspaces.querySelectorAll("label:not(.notification-all)").forEach(label => label.remove());
@@ -128,6 +130,7 @@ export function mountNotifications(options) {
         return;
       }
       registration = await prepare();
+      current();
       const subscribed = await registration.pushManager.getSubscription();
       current();
       const publicKey = Uint8Array.from(atob(state.publicKey.replace(/-/g, "+").replace(/_/g, "/")), char => char.charCodeAt(0));
@@ -148,7 +151,9 @@ export function mountNotifications(options) {
       let subscription = await registration.pushManager.getSubscription();
       current();
       if (subscription && !remote && deviceId) {
-        await subscription.unsubscribe(); subscription = null; deviceId = undefined;
+        await subscription.unsubscribe();
+        current();
+        subscription = null; deviceId = undefined;
       }
       subscription ||= await registration.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: enable._applicationServerKey });
       current();
@@ -159,6 +164,7 @@ export function mountNotifications(options) {
         needsAnswer: dialog.querySelector('[name="needsAnswer"]').checked,
         completed: dialog.querySelector('[name="completed"]').checked,
       }) });
+      current();
       remote = state.device; deviceId = remote.id;
       try { localStorage.setItem("uatu:push-device", deviceId); } catch {}
       status.textContent = all.checked ? "Notification preferences saved: all workspaces on this device." : "Notification preferences saved for this device.";
@@ -167,14 +173,19 @@ export function mountNotifications(options) {
   });
   disable.addEventListener("click", async () => {
     if (busy || !deviceId) return;
+    const disablingDevice = deviceId;
     busy = true; disable.disabled = true;
     try {
       await request(apiUrl(), { method: "DELETE" });
-      const current = registration || ("serviceWorker" in navigator ? await navigator.serviceWorker.getRegistration(options.workerUrl) : null);
-      if (disposed) return;
-      await (await current?.pushManager.getSubscription())?.unsubscribe();
+      current();
+      const worker = registration || ("serviceWorker" in navigator ? await navigator.serviceWorker.getRegistration(options.workerUrl) : null);
+      current();
+      const subscription = await worker?.pushManager.getSubscription();
+      current();
+      await subscription?.unsubscribe();
+      current();
       deviceId = undefined; remote = null;
-      try { localStorage.removeItem("uatu:push-device"); } catch {}
+      try { if (localStorage.getItem("uatu:push-device") === disablingDevice) localStorage.removeItem("uatu:push-device"); } catch {}
       status.textContent = "Notifications are disabled on this device.";
       disable.hidden = true; enable.textContent = "Enable notifications";
     } catch (error) { if (!disposed) status.textContent = error.message; }
@@ -201,6 +212,7 @@ export function mountNotifications(options) {
   // silently authorizing a different login. Explicit re-enable binds a login.
   if (!inline && deviceId && "serviceWorker" in navigator && "Notification" in window) {
     void request(apiUrl()).then(async state => {
+      current();
       if (Notification.permission === "denied" && state.device) await request(apiUrl(), { method: "DELETE" });
       else if (Notification.permission === "granted" && state.device?.active) await prepare();
     }).catch(() => {});
