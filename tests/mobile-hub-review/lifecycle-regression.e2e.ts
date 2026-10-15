@@ -11,7 +11,6 @@ for (const submitted of [false, true]) test(`history foreground clears retained 
   await page.locator('[data-action="add-credential"]').click();
   await credentialCreation(page, 'ssh', true);
   await page.getByLabel("Name", { exact: true }).fill("Late import");
-  await page.getByText("Paste a private key instead", { exact: true }).click();
   await page.getByLabel("Private key, masked").fill("DISPOSABLE-SECRET");
   await page.evaluate(() => { (window as any).oldSecret = document.querySelector('[name="privateText"]') ?? document.querySelector('textarea[data-secret]'); (window as any).oldCommit = document.querySelector('[data-action="commit-sheet"]'); });
   if (submitted) {
@@ -76,11 +75,11 @@ test("successful stop and remove retains the active assignment result", async ({
   await page.locator('[data-action="settings"]').click();
   await page.locator('[data-action="assignments"]').click();
   await page.locator('[data-flow="workspace-atlas"]').click();
-  await page.locator('[data-flow="assignment-0"]').click();
   await page.locator('[data-flow="remove-atlas-0"]').click();
   await page.getByRole("button", { name: "Remove", exact: true }).click();
   await page.getByRole("button", { name: "Stop and continue", exact: true }).click();
   await expect(activeTask(page, 'confirmation')).toHaveCount(0);
+  await expect(page.locator('.mh-flow-page [data-flow^="remove-atlas-"]')).toHaveCount(0);
   await expect(page.locator(".mh-flow-page")).toContainText("No credentials assigned");
   await expect(page.locator(".mh-flow-page h1")).toHaveText("Atlas");
   await expect(page.locator("#mobile-workspace-root")).toHaveAttribute("inert", "");

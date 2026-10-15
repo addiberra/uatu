@@ -13,7 +13,6 @@ test("SSH import masks and clears secrets before held failure, then generates a 
   await page.goto("/settings?detail=add-credential");
   await credentialCreation(page, 'ssh', true);
   await page.getByLabel("Name", { exact: true }).fill("Disposable import");
-  await page.getByText("Paste a private key instead", { exact: true }).click();
   const paste = page.getByLabel("Private key, masked");
   await paste.fill("DISPOSABLE-SYNTHETIC-NOT-A-KEY");
   await expect(paste).toHaveCSS("-webkit-text-security", "disc");
@@ -48,7 +47,7 @@ test("tool override does not invent readiness and clear uses discovery", async (
   await button(page, "Save").click();
   await expect(page.locator('.mh-flow-page')).toContainText("/synthetic/bin/custom-git");
   await page.locator('[data-flow="test-git"]').click();
-  await expect(activeTask(page, 'editor', 'Check Results')).toContainText("Synthetic binary not found");
+  await expect(activeTask(page, 'editor', 'Check Results')).toContainText("Software not found; configure an executable override (simulated; no executable probed).");
   await activeTask(page).getByRole('button', { name: 'Back', exact: true }).click();
   expect((await state(request)).model.tools.find((t: { tool: string }) => t.tool === "git").path).toBe("/synthetic/bin/custom-git");
   await control(request, "setToolState", ["git", "ready"]);
@@ -108,7 +107,7 @@ for (const outcome of ["succeeded", "register-failed", "start-failed", "cleanup-
     await page.getByLabel("Remote URL").fill("https://github.com/review/example.git");
     await page.getByLabel("Checkout folder name").fill("terminal-review");
     await page.getByLabel("Workspace display name").fill("Terminal review");
-    if (outcome === "start-failed") { await page.locator('.mh-flow-page details > summary').click(); await page.getByLabel("Start after configuration").check(); }
+    if (outcome === "start-failed") await page.getByLabel("Start after configuration").check();
     await button(page, "Review clone").click(); await button(page, "Clone").click();
     await expect(page.getByRole("heading", { name: "Clone Progress" })).toBeVisible();
     const send = await button(page, 'Send response').elementHandle();
@@ -141,14 +140,13 @@ test("assignment review is inert until Apply and stop failure preserves removal 
   await page.locator('[data-flow="workspace-atlas"]').click();
   await page.locator('[data-flow="new-atlas"]').click();
   await page.getByRole("combobox", { name: "Git authentication credential", exact: true }).selectOption("token-github");
-  await page.getByLabel("Authentication host").fill("github.com");
+  await page.getByRole("textbox", { name: "Authentication host", exact: true }).fill("github.com");
   await button(page, "Review").click();
   expect((await state(request)).model.workspaces.find((w: { id: string }) => w.id === "atlas").assignments).toEqual([]);
   await button(page, "Back to edit").click();
   await expect(page.getByRole("combobox", { name: "Git authentication credential", exact: true })).toHaveValue("token-github");
   await button(page, "Review").click();
   await button(page, "Apply").click();
-  await page.locator('[data-flow="assignment-0"]').click();
   await expect(page.locator('[data-flow="remove-atlas-0"]')).toBeVisible();
   await page.locator('[data-flow="remove-atlas-0"]').click();
   await button(page, "Remove").click();
@@ -156,7 +154,6 @@ test("assignment review is inert until Apply and stop failure preserves removal 
   await button(page, "Cancel").click();
   expect((await state(request)).model.workspaces.find((w: { id: string }) => w.id === "atlas").runtime.status).toBe("running");
   await control(request, "setStopFailure", ["atlas", true]);
-  await page.locator('[data-flow="assignment-0"]').click();
   await page.locator('[data-flow="remove-atlas-0"]').click();
   await button(page, "Remove").click();
   await activeTask(page, 'confirmation').getByRole("button", { name: /Stop/ }).click();
@@ -166,7 +163,7 @@ test("assignment review is inert until Apply and stop failure preserves removal 
 
 test("create empty folder is not registration; explicit Git consent registers it stopped", async ({ page, request }) => {
   await page.goto("/?detail=add-workspace");
-  await button(page, "Existing folder").click();
+  await button(page, "Manage folders").click();
   await moreAction(page, 'Create empty folder');
   await page.getByLabel("Folder name", { exact: true }).fill("review-empty");
   await button(page, "Create folder").click();
@@ -193,7 +190,7 @@ test("onboarding registration failure reports retained checkout without fabricat
   await button(page, "Review").click();
   await button(page, "Add stopped").click();
   await expect(page.getByRole("heading", { name: "Configuration needs attention" })).toBeVisible();
-  await expect(page.locator(".mh-flow-page")).toContainText("Folder retained: /synthetic/retained-review");
+  await expect(page.locator(".mh-flow-page .mh-info-row").filter({ has: page.locator("dt", { hasText: /^Folder retained$/ }) }).locator(".mh-info-value")).toHaveText("/synthetic/retained-review");
   const model = (await state(request)).model;
   expect(model.workspaces).toHaveLength(2);
   expect(model.folders.find((f: { path: string }) => f.path === "/synthetic/retained-review")).toMatchObject({ git: true });

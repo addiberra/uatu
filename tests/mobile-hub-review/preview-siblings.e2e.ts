@@ -1,4 +1,5 @@
 import { expect, test, type Page, type TestInfo } from "@playwright/test";
+import { assertDisposableReview } from './navigation';
 
 const capture = (page: Page, info: TestInfo, name: string) => page.screenshot({ path: new URL(`./results/artifacts/navigation-recovery/${info.project.name}-${name}.png`, import.meta.url).pathname });
 
@@ -9,8 +10,7 @@ const previous = (page: Page) => pill(page).getByRole("button", { name: "Previou
 const names = ["brief.md", "config.ts", "map.svg", "notes.txt", "reference.adoc", "runbook.adoc", "sample.bin"];
 
 test.beforeEach(async ({ request, baseURL }) => {
-  // Never reset the published reviewer. This suite is for the disposable 4732.
-  expect(new URL(baseURL!).port).toBe("4732");
+  await assertDisposableReview(request, baseURL);
   expect((await request.post("/review/reset", { data: { scenario: "mixed" } })).ok()).toBe(true);
 });
 

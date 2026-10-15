@@ -1,4 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
+import { writeFile } from "node:fs/promises";
 import { activeTask } from './navigation';
 import { continuityCommit } from "./continuity-fixture";
 import { recordMotionEvidence } from "./motion-evidence";
@@ -42,6 +43,7 @@ test.afterEach(async ({ page }, info) => {
           playbackRate: animation.playbackRate, timing: animation.effect?.getComputedTiming() })) };
     }),
   })).catch(error => ({ diagnosticError: String(error) }));
+  await writeFile(info.outputPath("continuity-failure-geometry.json"), JSON.stringify(snapshot, null, 2));
   await info.attach("continuity-failure-geometry", { body: JSON.stringify(snapshot, null, 2), contentType: "application/json" });
 });
 

@@ -22,7 +22,7 @@ test("Settings catalog retry completes while typing without stealing native focu
   await page.goto("/settings");
   await page.locator('[data-action="retry-credentials"]').click();
   const initialReads = workspaces;
-  await page.locator('.mh-overview-toolbar [data-action="add-credential"]').click();
+  await page.locator('[data-action="add-credential"]').click();
   await page.locator('[data-flow="token"]').click();
   const name = page.getByRole("textbox", { name: "Name", exact: true });
   await name.fill("Live draft"); release();

@@ -11,7 +11,7 @@ test("credential actions stay direct; key editors are full pages and deletion is
   for (const action of ["public", "defaults", "test", "toggle", "delete", "unlock"]) await expect(settings.locator(`[data-flow="${action}"]`)).toBeVisible();
   await expect(settings.locator('[data-flow="lock"]')).toHaveCount(0);
   await settings.locator('[data-flow="unlock"]').click();
-  const unlock = page.getByRole("region", { name: "Unlock credential", exact: true });
+  const unlock = page.getByRole("region", { name: "Unlock Review SSH (locked)", exact: true });
   await expect(unlock).toHaveAttribute("data-task-kind", "editor");
   await expect(unlock.getByLabel("Passphrase", { exact: true })).toHaveAttribute("type", "password");
   await info.attach("unlock-full-page", { body: await page.screenshot(), contentType: "image/png" });

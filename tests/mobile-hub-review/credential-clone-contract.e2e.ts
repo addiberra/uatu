@@ -30,14 +30,15 @@ test("Settings overview uses concise explicit lock facts, independent Disabled, 
   await control(request, "fail", ["readCredentialFacts", { kind: "unavailable", message: "ignored" }]); await page.reload();
   await expect(row.locator(".mh-value")).toHaveText("Unknown"); await row.click();
   await expect(page.getByRole("heading", { name: "Review SSH (locked)", exact: true })).toBeVisible();
-  await expect(page.locator('[data-credential-fact="lock"] .mh-value')).toHaveText('Unknown');
+  await expect(page.locator('[data-credential-fact="lock"] .mh-info-value')).toHaveText('Unknown');
   await expect(page.locator('[data-readiness-layer]')).toHaveCount(0);
   await diagnosticReport(page);
   await expect(activeTask(page).locator('[data-readiness-layer]')).toHaveCount(17);
   await activeTask(page).getByRole('button', { name: 'Back', exact: true }).click();
+  await activeTask(page).getByRole('button', { name: 'Back', exact: true }).click();
   await control(request, "fail", ["readCredentialFacts", null]); await button(page, "Retry status check").click();
-  await expect(page.locator('[data-credential-fact="lock"] .mh-value')).toHaveText("locked");
-  await expect(page.locator('[data-credential-fact="protection"] .mh-value')).toHaveText("protected");
+  await expect(page.locator('[data-credential-fact="lock"] .mh-info-value')).toHaveText("Locked");
+  await expect(page.locator('[data-credential-fact="protection"] .mh-info-value')).toHaveText("Set");
   await expect(page.locator(".mh-flow-header")).toContainText("Disabled");
 });
 
@@ -65,13 +66,13 @@ test("late overview facts preserve focused row identity, Settings scroll, and an
 test("explicit lock/protection/user-ID facts and current tool override are never guessed", async ({ page, request }) => {
   await request.post("/review/backend/lockSsh", { data: [{ id: "ssh-open", type: "ssh" }] });
   await page.goto("/settings?detail=credential&id=ssh-open");
-  await expect(page.locator('[data-credential-fact="lock"] .mh-value')).toHaveText("locked");
-  await expect(page.locator('[data-credential-fact="protection"] .mh-value')).toHaveText("unprotected");
+  await expect(page.locator('[data-credential-fact="lock"] .mh-info-value')).toHaveText("Locked");
+  await expect(page.locator('[data-credential-fact="protection"] .mh-info-value')).toHaveText("Not set");
   await control(request, "setOpenPgpUserId", ["pgp-locked", "Explicit signer <facts@mock.invalid>"]);
   await page.goto("/settings?detail=credential&id=pgp-locked");
-  await expect(page.locator('[data-credential-fact="userId"] .mh-value')).toHaveText("Explicit signer <facts@mock.invalid>");
+  await expect(page.locator('[data-credential-fact="userId"] .mh-info-value')).toHaveText("Explicit signer <facts@mock.invalid>");
   await control(request, "setCredentialFactsUnknown", ["pgp-locked", true]); await page.reload();
-  for (const name of ["lock", "protection", "userId"]) await expect(page.locator(`[data-credential-fact="${name}"] .mh-value`)).toHaveText("Unknown");
+  for (const name of ["lock", "protection", "userId"]) await expect(page.locator(`[data-credential-fact="${name}"] .mh-info-value`)).toHaveText("Unknown");
   await request.post("/review/backend/setToolOverride", { data: [{ tool: "git", path: "/synthetic/saved/git" }] });
   await page.goto("/settings?detail=tools"); await toolDetail(page); await toolOverride(page);
   await expect(page.getByLabel("Absolute executable path")).toHaveValue("/synthetic/saved/git");
@@ -102,8 +103,12 @@ test("CLI-only provider token is selectable for retained authentication, never f
   expect(created.status).toBe("completed"); const id = created.value.id;
   await page.goto("/settings?detail=assignments"); await page.locator('[data-flow="workspace-notes"]').click(); await page.locator('[data-flow="new-notes"]').click();
   await page.getByRole("combobox", { name: "Git authentication credential", exact: true }).selectOption(id);
-  await page.getByLabel("Authentication host").fill("github.com"); await button(page, "Review").click(); await button(page, "Apply").click();
+  await page.getByRole("textbox", { name: "Authentication host", exact: true }).fill("github.com"); await button(page, "Review").click();
+  await page.evaluate(() => { (window as any).assignmentDismissed = false; window.addEventListener('popstate', () => { (window as any).assignmentDismissed = true; }, { once: true }); });
+  await button(page, "Apply").click();
   await expect.poll(async () => (await state(request)).model.workspaces.find((w: { id: string }) => w.id === "notes").assignments).toContainEqual({ workspaceId: "notes", credentialId: id, role: "authentication", host: "github.com" });
+  // The server effect is not completion of the editor's owned history Back.
+  await expect.poll(() => page.evaluate(() => (window as any).assignmentDismissed)).toBe(true);
   await page.goto("/clone");
   await expect(page.locator(`[name="authentication"] option[value="${id}"]`)).toHaveCount(1);
   await expect(page.locator(`[name="cloneCredential"] option[value="${id}"]`)).toHaveCount(0);

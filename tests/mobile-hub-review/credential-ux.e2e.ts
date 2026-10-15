@@ -20,8 +20,9 @@ test("17 retained credential diagnostics collapse without hiding the blocker or 
   expect(before.some(row => row.status === 'unavailable' && /locked/i.test(row.message ?? ''))).toBe(true);
   await activeTask(page).getByRole('button', { name: 'Back', exact: true }).click();
   await expect(page.locator('[data-readiness-layer]')).toHaveCount(0);
-  await diagnosticReport(page);
+  await activeTask(page).getByRole('button', { name: /^View diagnostic report/ }).click();
   expect(await rows.evaluateAll(els => els.map(el => ({ layer: el.getAttribute('data-readiness-layer'), status: el.getAttribute('data-readiness-status'), message: el.querySelector('small')?.textContent })))).toEqual(before);
+  await activeTask(page).getByRole('button', { name: 'Back', exact: true }).click();
   await activeTask(page).getByRole('button', { name: 'Back', exact: true }).click();
   await lowerPrimary(page, "unlock");
   await info.attach("readiness-metrics", { body: JSON.stringify({ rows: before }), contentType: "application/json" });

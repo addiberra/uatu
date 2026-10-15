@@ -53,7 +53,7 @@ test('AUDIT H01 login pending and rate-limit', async ({ page, request }, info) =
 
 test('AUDIT H02 H03 H04 dashboard and workspace actions', async ({ page, request }, info) => {
   await page.goto('/'); await expect(page.locator('[data-action="info:atlas"]')).toBeVisible(); await observe(page, info, 'H02-H03-mixed');
-  await page.locator('[data-action="info:atlas"]').click(); await expect(page.locator('.mh-flow-page')).toContainText('Stable ID: atlas'); await observe(page, info, 'H04-ellipsis-information');
+  await page.locator('[data-action="info:atlas"]').click(); await expect(page.locator('.mh-flow-page .mh-info-row').filter({ has: page.locator('dt', { hasText: /^Stable ID$/ }) }).locator('.mh-info-value')).toHaveText('atlas'); await observe(page, info, 'H04-ellipsis-information');
   await expect(exactButton(page, 'Rename display name')).toBeVisible(); await observe(page, info, 'H04-actions');
   await exactButton(page, 'Rename display name').click(); await observe(page, info, 'H04-rename'); await exactButton(page, 'Cancel').click(); await observe(page, info, 'H04-rename-cancel');
   for (const scenario of ['empty', 'all-running', 'all-stopped', 'branches']) {
@@ -93,15 +93,15 @@ for (const [id, route, ready] of [
   if (['S04','S05'].includes(id)) { await exactButton(page, 'Unlock').click(); await observe(page, info, `${id}-unlock`); await exactButton(page, 'Cancel').click(); await observe(page, info, `${id}-cancel`); }
   if (id === 'S06') { await moreAction(page, 'Delete credential'); await observe(page, info, 'S06-delete-confirm'); await exactButton(page, 'Cancel').click(); }
   if (id === 'S07') { await toolDetail(page); await observe(page, info, 'S07-selected-tool'); await toolOverride(page); await expect(page.getByLabel('Absolute executable path')).toBeVisible(); await observe(page, info, 'S07-override'); await exactButton(page, 'Cancel').click(); }
-  if (id === 'S08') { await page.locator('[data-flow="workspace-atlas"]').click(); await page.locator('[data-flow="new-atlas"]').click(); await observe(page, info, 'S08-assignment-form'); await page.getByRole('combobox', { name: 'Git authentication credential', exact: true }).selectOption('token-github'); await page.getByLabel('Authentication host').fill('github.com'); await exactButton(page,'Review').click(); await observe(page, info, 'S08-review'); await exactButton(page, 'Back to edit').click(); await observe(page, info, 'S08-back-to-edit'); }
+   if (id === 'S08') { await page.locator('[data-flow="workspace-atlas"]').click(); await page.locator('[data-flow="new-atlas"]').click(); await observe(page, info, 'S08-assignment-form'); await page.getByRole('combobox', { name: 'Git authentication credential', exact: true }).selectOption('token-github'); await page.getByRole('textbox', { name: 'Authentication host', exact: true }).fill('github.com'); await exactButton(page,'Review').click(); await observe(page, info, 'S08-review'); await exactButton(page, 'Back to edit').click(); await observe(page, info, 'S08-back-to-edit'); }
   if (id === 'S09') { await page.locator('[data-flow="edit"]').click(); await page.getByLabel('Folder path').fill('relative'); await exactButton(page, 'Save').click(); await observe(page, info, 'S09-invalid'); await exactButton(page, 'Cancel').click(); }
-  if (id === 'S11') { await page.locator('[data-flow="device-1"]').click(); await exactButton(page, ready).click(); await observe(page, info, 'S11-revoke-confirm'); await exactButton(page, 'Cancel').click(); }
+  if (id === 'S11') { await page.locator('[data-flow="device-1"]').click(); await expect(activeTask(page, 'confirmation')).toBeVisible(); await observe(page, info, 'S11-revoke-confirm'); await exactButton(page, 'Cancel').click(); }
 });
 
 test('AUDIT A01 A02 A03 folder browse and create states', async ({ page, request }, info) => {
   await page.goto('/?detail=add-workspace'); await expect(exactButton(page, 'Existing folder')).toBeVisible(); await observe(page, info, 'A01-entry');
-  await exactButton(page, 'Existing folder').click(); await expect(page.locator('[data-flow="folder-0"]')).toBeVisible(); await observe(page, info, 'A02-browse');
-  await moreAction(page, 'Current folder options'); await expect(activeTask(page)).toBeVisible(); await observe(page, info, 'A03-folder-actions'); await exactButton(page, 'Back').click();
+  await exactButton(page, 'Manage folders').click(); await expect(page.locator('[data-flow="folder-0"]')).toBeVisible(); await observe(page, info, 'A02-browse');
+  await expect(exactButton(page, 'Rename folder')).toBeVisible(); await expect(exactButton(page, 'Remove empty folder')).toBeVisible(); await observe(page, info, 'A03-folder-actions');
   await moreAction(page, 'Create empty folder'); await observe(page, info, 'A03-empty-create'); await exactButton(page, 'Create folder').click(); await observe(page, info, 'A03-empty-invalid'); await exactButton(page, 'Cancel').click();
   await page.locator('[data-flow="folder-1"]').click(); await expect(page.locator('.mh-flow-page')).toContainText('unavailable'); await observe(page, info, 'A02-denied');
   await page.goto('/?detail=add-workspace'); await exactButton(page, 'Create workspace').click(); await expect(activeTask(page)).toBeVisible(); await observe(page, info, 'A03-workspace-create'); await exactButton(page, 'Cancel').click(); await observe(page, info, 'A03-create-cancel');
@@ -141,7 +141,7 @@ test('AUDIT key pending error cancel and recovery states', async ({ page, reques
   await control('hold', ['unlockCredential']); await activeTask(page).getByRole('button', { name: 'Unlock', exact: true }).click();
   await expect(activeTask(page).getByRole('button', { name: 'Unlock', exact: true })).toBeDisabled(); await observe(page, info, 'S04-unlock-pending');
   await control('settle', ['unlockCredential', true]); await expect(activeTask(page).getByRole('alert')).not.toBeEmpty(); await observe(page, info, 'S04-unlock-error'); await exactButton(page, 'Cancel').click();
-  await control('setToolState', ['git', 'missing']); await page.goto('/settings?detail=tools'); await toolDetail(page); await page.locator('[data-flow="test-git"]').click(); await expect(activeTask(page, 'editor', 'Check Results')).toContainText('Synthetic binary not found'); await observe(page, info, 'S07-missing-git'); await activeTask(page).getByRole('button', { name: 'Back', exact: true }).click();
+  await control('setToolState', ['git', 'missing']); await page.goto('/settings?detail=tools'); await toolDetail(page); await page.locator('[data-flow="test-git"]').click(); await expect(activeTask(page, 'editor', 'Check Results')).toContainText('Software not found; configure an executable override (simulated; no executable probed).'); await observe(page, info, 'S07-missing-git'); await activeTask(page).getByRole('button', { name: 'Back', exact: true }).click();
   await control('hold', ['testTool']); await page.locator('[data-flow="test-git"]').click(); await expect(page.locator('[data-flow="test-git"]')).toBeDisabled(); await observe(page, info, 'S07-test-pending');
   await control('settle', ['testTool', true]); await expect(page.locator('.mh-flow-error')).not.toBeEmpty(); await observe(page, info, 'S07-test-error');
   await page.goto('/settings'); await page.locator('[data-action="security"]').click(); await control('hold', ['signOut']); await exactButton(page, 'Sign out').click(); await observe(page, info, 'S12-signout-confirm');
@@ -156,7 +156,7 @@ test('AUDIT key pending error cancel and recovery states', async ({ page, reques
 
 test("RED folder browsing offers compact primary disclosure, not per-folder action cards", async ({ page }, info) => {
   await page.goto("/?detail=add-workspace");
-  await exactButton(page, 'Existing folder').click();
+  await exactButton(page, 'Manage folders').click();
   await expect(page.locator('[data-flow="folder-0"]')).toBeVisible();
   const metrics = await evidence(page, info, "A02-folder-cards");
   // An audit acceptance budget, not an Apple-prescribed maximum: two lines plus
@@ -186,5 +186,6 @@ test("RED credential readiness provides tool context and progressive diagnostics
   await info.attach('all-17-diagnostics', { body: JSON.stringify(await rows.allTextContents()), contentType: 'application/json' });
   await activeTask(page).getByRole('button', { name: 'Back', exact: true }).click();
   await expect(page.locator('[data-readiness-layer]')).toHaveCount(0);
+  await activeTask(page).getByRole('button', { name: 'Back', exact: true }).click();
   await expect(page.getByRole('heading', { name: 'Review SSH (locked)', exact: true })).toBeVisible();
 });

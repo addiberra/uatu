@@ -69,8 +69,10 @@ const pickerEnvironment: FolderPickerEnvironment = {
   },
 };
 const openFolderPicker = createFolderPicker(pickerEnvironment);
-function open(kind: string) {
-  trigger = document.activeElement as HTMLElement;
+function open(kind: string, source: HTMLElement) {
+  // Touch WebKit clicks need not focus their button. The activated control,
+  // not the previous active element, owns focus recovery in this local demo.
+  trigger = source;
   catalog.inert = true; root.classList.add("mh-task-active");
   const confirmation = kind === "confirmation";
   const detail = kind === "local-destination" || kind === "local-list";
@@ -112,7 +114,7 @@ catalog.addEventListener("click", event => {
     const result = document.querySelector<HTMLElement>("#local-result")!;
     result.textContent = "Local action ran. No backend changes.";
     result.scrollIntoView({ block: "nearest" });
-  } else open(key!);
+  } else open(key!, button);
 });
 host.addEventListener("click", event => { if ((event.target as HTMLElement).closest('[data-action="cancel-sheet"]') || (event.target as HTMLElement).classList.contains("mh-confirmation-backdrop")) cancelTask(); });
 document.addEventListener("keydown", event => task.key(event), true);

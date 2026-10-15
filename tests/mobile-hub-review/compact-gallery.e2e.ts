@@ -1,9 +1,9 @@
 import { expect, test, type Page } from "@playwright/test";
 import { galleryScenes, galleryEngines } from "./compact-gallery";
-import { namedButton } from "./navigation";
+import { assertDisposableReview, namedButton } from "./navigation";
 
 test.beforeEach(async ({ request, baseURL }) => {
-  expect(new URL(baseURL!).port).toBe("4732");
+  await assertDisposableReview(request, baseURL);
   expect((await request.post("/review/reset", { data: { scenario: "mixed" } })).ok()).toBe(true);
 });
 
@@ -61,9 +61,10 @@ for (const [scene, label] of galleryScenes) test(`compact gallery: ${label}`, as
     case "preview-markdown": {
       await page.goto("/s/atlas/examples/START-HERE.md");
       await expect(page.locator("#preview h1")).toHaveText("Preview field guide");
-      const image = page.locator('#preview img[src$="coast.svg"]');
+      const image = page.locator('#preview').getByRole('img', { name: 'A synthetic coastal landscape', exact: true });
       await image.scrollIntoViewIfNeeded();
       await expect.poll(() => image.evaluate((el: HTMLImageElement) => el.complete && el.naturalWidth > 0)).toBe(true);
+      expect(new URL(await image.evaluate((el: HTMLImageElement) => el.currentSrc)).pathname).toBe('/s/atlas/examples/media/coast.svg');
       break;
     }
     case "preview-siblings":

@@ -195,9 +195,36 @@ remain doubles; no personal provider was tested. The focused ownership units
 passed **67/67** (597 assertions); both TypeScript projects pass. The subsequent
 last-test precondition tightening awaits its focused repeat.
 
-The current synthetic rerun, separate retained responsive captures,
-desktop/native comparison and final evidence reconciliation still require their
-named results. Tasks stay open until verified, not merely adapter-connected.
+### Reconciled synthetic matrix (2026-10-16)
+
+```sh
+UATU_MOBILE_REVIEW_PORT=4793 bun node_modules/@playwright/test/cli.js test -c playwright.mobile-hub-review.config.ts --output=tests/mobile-hub-review/results/reconciled-matrix
+```
+
+**342 passed / 0 failed**, Chromium and WebKit, no retries (6.6 minutes).
+This supersedes the partial 338/342 discovery, not its retained failure record.
+The synthetic backend remains explicitly simulated and fail-closed. Existing
+operation/fact/count/masking/partial-outcome assertions remain; changes reconcile
+current direct actions, semantic facts, focused folder maintenance, diagnostic
+report/results Back and the actual canonical image path. Assignment completion
+waits for the task owner's native history traversal before document navigation.
+The local-only design-system reference restores focus to the activated button,
+including WebKit touch clicks that do not focus it automatically.
+
+The prior one-off Chromium delayed-Hub-visibility failure did not recur in the
+focused repeats or this matrix. Its original cause is not established; future
+failures persist animation/root geometry in `continuity-failure-geometry.json`.
+This is not a timeout waiver or evidence that the original failure never occurred.
+
+All three TypeScript projects and a production build passed at `781902c` plus
+these test-only edits. The private-HOME compiled smoke passed guardian EOF
+refusal, auth, assets, document/live delivery, desktop worktree entry and phone
+Hub → workspace → Settings → Return with no page errors. Build warnings remain
+the existing unsupported CSS `highlight` selector warnings.
+
+Separate retained responsive captures, desktop comparison and final evidence
+reconciliation still require their named results. Tasks stay open until verified,
+not merely adapter-connected. None of this is independent or human acceptance.
 
 Current historical Chat reproduction:
 

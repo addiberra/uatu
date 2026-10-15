@@ -1,4 +1,15 @@
-import { expect, type Page } from '@playwright/test';
+import { expect, type APIRequestContext, type Page } from '@playwright/test';
+
+/** Refuse published listeners before reset, including when selecting a free
+ * test port instead of the historical dedicated capture port. */
+export async function assertDisposableReview(request: APIRequestContext, baseURL: string | undefined) {
+  const url = new URL(baseURL!);
+  expect(url.protocol).toBe('http:'); expect(url.hostname).toBe('127.0.0.1');
+  expect(['4717', '4718', '8445', '8446']).not.toContain(url.port);
+  expect([process.env.UATU_MOBILE_REVIEW_PORT ?? '4703', '4732']).toContain(url.port);
+  const response = await request.get('/review/health'); expect(response.ok()).toBe(true);
+  expect(await response.json()).toMatchObject({ status: 'ready', backend: 'synthetic', assembly: 'same-document-mobile' });
+}
 
 /** The active task has a semantic role, not the retired drawer's dialog role. */
 export function activeTask(page: Page, kind: 'editor' | 'confirmation' = 'editor', name?: string) {
@@ -40,12 +51,14 @@ export async function toolOverride(page: Page, tool = 'git') {
 
 /** Settings uses top navigation; frequent bottom commands must opt in. */
 export async function settingsCommand(page: Page, key: string) {
+  const command = page.locator(`.mh-flow-page [data-flow="${key}"]`);
+  // Wait for the final detail read before touching its navigation nodes.
+  await expect(command).toBeVisible();
   const header = page.locator('.mh-flow-page .mh-flow-header');
   const back = header.locator('[data-flow="flow-back"]');
   await back.scrollIntoViewIfNeeded();
   await expect(back).toBeVisible();
   expect((await back.boundingBox())!.y).toBeLessThan(page.viewportSize()!.height / 2);
-  const command = page.locator(`.mh-flow-page [data-flow="${key}"]`);
   await expect(command).toHaveCount(1);
   await command.scrollIntoViewIfNeeded();
   await expect(command).toBeVisible();

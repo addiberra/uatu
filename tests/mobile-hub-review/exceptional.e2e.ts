@@ -17,18 +17,18 @@ async function setup<K extends ReviewMethod>(request: APIRequestContext, method:
   const result = await response.json(); expect(["available", "completed"]).toContain(result.status); return result;
 }
 async function browse(page: Page, path: string) {
-  await page.goto("/?detail=add-workspace"); await button(page, "Existing folder").click(); await moreAction(page, 'Browse elsewhere');
+  await page.goto("/?detail=add-workspace"); await button(page, "Manage folders").click(); await moreAction(page, 'Browse elsewhere');
   await page.getByLabel("Absolute folder path").fill(path); await button(page, "Browse").click();
   await expect(page.locator(".mh-flow-page")).toContainText(path);
 }
 async function rename(page: Page, name: string) {
-  await moreAction(page, 'Current folder options'); await button(page, "Rename folder").click(); await page.getByLabel("New folder name").fill(name);
+  await button(page, "Rename folder").click(); await page.getByLabel("New folder name").fill(name);
   await button(page, "Review").click(); await button(page, "Rename folder").click();
 }
 async function clone(page: Page, folder: string, start = false) {
   await page.goto("/clone"); await page.getByLabel("Remote URL").fill("https://github.com/review/exceptional.git");
   await page.getByLabel("Checkout folder name").fill(folder); await page.getByLabel("Workspace display name").fill(`Exceptional ${folder}`);
-  if (start) { await page.locator('.mh-flow-page details > summary').click(); await page.getByLabel("Start after configuration").check(); }
+  if (start) await page.getByLabel("Start after configuration").check();
   await button(page, "Review clone").click(); await button(page, "Clone").click(); await expect(page.getByRole("heading", { name: "Clone Progress" })).toBeVisible();
 }
 test.beforeEach(async ({ request }) => { await reset(request); });
@@ -51,16 +51,16 @@ test("rate-limited login preserves public fields, clears password, and waits wit
 
 test("device revocation fails contextually, then removes only the other device before current-session logout", async ({ page, request }) => {
   await page.goto("/settings?detail=devices"); await expect(page.locator(".mh-flow-page")).toContainText("Issued "); await expect(page.locator(".mh-flow-page")).not.toContainText("Last active");
-  await page.locator('[data-flow="device-1"]').click(); await button(page, "Revoke session").click(); await button(page, "Cancel").click(); expect(count(await state(request), "revokeDevice")).toBe(0);
+  await page.locator('[data-flow="device-1"]').click(); await button(page, "Cancel").click(); expect(count(await state(request), "revokeDevice")).toBe(0);
   await control(request, "hold", ["revokeDevice"]);
   try {
-    await page.locator('[data-flow="device-1"]').click(); await button(page, "Revoke session").click(); await button(page, "Revoke").click(); await expect(button(page, "Revoke")).toBeDisabled();
+    await page.locator('[data-flow="device-1"]').click(); await button(page, "Revoke").click(); await expect(button(page, "Revoke")).toBeDisabled();
     await control(request, "settle", ["revokeDevice", true]); await expect(activeTask(page, 'confirmation').getByRole("alert")).toContainText("Synthetic operation failed");
     expect((await state(request)).model.devices).toHaveLength(2); await button(page, "Cancel").click();
-    await control(request, "fail", ["revokeDevice", null]); await page.locator('[data-flow="device-1"]').click(); await button(page, "Revoke session").click(); await button(page, "Revoke").click();
-    await expect(button(page, "Revoke session")).toHaveCount(0); await expect(page.locator(".mh-flow-page h1")).toBeFocused();
+    await control(request, "fail", ["revokeDevice", null]); await page.locator('[data-flow="device-1"]').click(); await button(page, "Revoke").click();
+    await expect(page.locator('[data-flow="device-1"]')).toHaveCount(0); await expect(page.locator(".mh-flow-page h1")).toBeFocused();
     expect((await state(request)).model.devices.map(d => d.handle)).toEqual(["review-device"]);
-    await page.locator('[data-flow="device-0"]').click(); await button(page, "Revoke this session").click(); await expect(activeTask(page, 'confirmation')).toContainText("signs you out"); await button(page, "Revoke").click();
+    await page.locator('[data-flow="device-0"]').click(); await expect(activeTask(page, 'confirmation')).toContainText("signs you out"); await button(page, "Revoke").click();
     await expect(page.getByRole("heading", { name: "Sign in required" })).toBeVisible(); await expect(page.locator("#mobile-hub-root")).not.toContainText("Synthetic tablet");
     expect((await state(request)).model.workspaces.find(w => w.id === "atlas")?.runtime.status).toBe("running"); expect(count(await state(request), "stopWorkspace")).toBe(0);
   } finally { await control(request, "settle", ["revokeDevice", false]); }
@@ -101,25 +101,32 @@ test("OpenPGP generation preserves draft and sheet context through local and mis
     await expect(page.getByLabel("Passphrase", { exact: true })).toHaveValue(""); await control(request, "settle", ["generateOpenPgp", false]);
     await expect(activeTask(page).getByRole("alert")).toContainText("Required synthetic key tooling unavailable");
     expect(await name!.evaluate(el => el.isConnected)).toBe(true); await expect(page.getByLabel("User ID (name and email)")).toHaveValue("Exceptional <signer@mock.invalid>");
-    expect(await body.evaluate(el => el.scrollTop)).toBe(before);
+    // The longer error needs a six-pixel reveal in this short viewport. The
+    // contextual-error owner must reveal only the clipped amount, not reset
+    // the editor or scroll the document/Settings behind it.
+    const reveal = await body.evaluate(el => { const error = el.querySelector('[role="alert"]')!.getBoundingClientRect(), pane = el.getBoundingClientRect(); return { top: el.scrollTop, bottom: error.bottom, paneBottom: pane.bottom, paneTop: pane.top, errorTop: error.top, documentTop: document.scrollingElement!.scrollTop, settingsTop: document.querySelector('.mh-page')!.scrollTop }; });
+    expect(reveal.top).toBe(before + 6);
+    expect(Math.round(reveal.bottom)).toBe(Math.round(reveal.paneBottom));
+    expect(reveal.errorTop).toBeGreaterThanOrEqual(reveal.paneTop);
+    expect(reveal.documentTop).toBe(0); expect(reveal.settingsTop).toBe(0);
     expect(await activeTask(page).evaluate(el => el.contains(document.activeElement))).toBe(true);
     await page.keyboard.press("Tab"); expect(await activeTask(page).evaluate(el => el.contains(document.activeElement))).toBe(true);
     await control(request, "setToolState", ["gpg", "ready"]); await page.getByLabel("Passphrase", { exact: true }).fill("DISPOSABLE-SIGNER"); await button(page, "Generate").click();
     await expect(page.getByRole("heading", { name: "Exceptional signer", exact: true })).toBeVisible();
-    await expect(page.locator('[data-credential-fact="userId"] .mh-value')).toHaveText("Exceptional <signer@mock.invalid>"); await expect(button(page, "Lock SSH key")).toHaveCount(0);
+    await expect(page.locator('[data-credential-fact="userId"] .mh-info-value')).toHaveText("Exceptional <signer@mock.invalid>"); await expect(button(page, "Lock SSH key")).toHaveCount(0);
     expect((await state(request)).model.credentials.filter(c => c.name === "Exceptional signer")).toHaveLength(1); expect(JSON.stringify(await state(request))).not.toContain("DISPOSABLE-SIGNER");
   } finally { await control(request, "settle", ["generateOpenPgp", false]); }
 });
 
 test("SSH lock and failed independent unlock preserve protection and never start work", async ({ page, request }) => {
   await page.goto("/settings?detail=credential&id=ssh-open"); await moreAction(page, 'Lock SSH key');
-  await expect(page.locator('[data-credential-fact="lock"] .mh-value')).toHaveText("locked"); await expect(page.locator('[data-credential-fact="protection"] .mh-value')).toHaveText("unprotected");
+  await expect(page.locator('[data-credential-fact="lock"] .mh-info-value')).toHaveText("Locked"); await expect(page.locator('[data-credential-fact="protection"] .mh-info-value')).toHaveText("Not set");
   await control(request, "setUnlockFailure", [true]); await button(page, "Unlock").click(); await page.getByLabel("Passphrase", { exact: true }).fill("DISPOSABLE-UNLOCK");
   const secret = await page.getByLabel("Passphrase", { exact: true }).elementHandle(); await activeTask(page).getByRole("button", { name: "Unlock", exact: true }).click();
   await expect(activeTask(page).getByRole("alert")).toContainText("Synthetic unlock rejected"); await expect(page.getByLabel("Passphrase", { exact: true })).toHaveValue("");
   expect(await secret!.evaluate(el => el.isConnected)).toBe(true); expect((await state(request)).model.credentialFacts.find(c => c.id === "ssh-open")?.lock).toEqual({ status: "known", value: "locked" });
   await control(request, "setUnlockFailure", [false]); await activeTask(page).getByRole("button", { name: "Unlock", exact: true }).click();
-  await expect(activeTask(page)).toHaveCount(0); await expect(page.locator('[data-credential-fact="lock"] .mh-value')).toHaveText("unlocked");
+  await expect(activeTask(page)).toHaveCount(0); await expect(page.locator('[data-credential-fact="lock"] .mh-info-value')).toHaveText("Unlocked");
   expect(count(await state(request), "startWorkspace")).toBe(0); expect(count(await state(request), "submitClone")).toBe(0); expect(JSON.stringify(await state(request))).not.toContain("DISPOSABLE-UNLOCK");
 });
 
@@ -139,7 +146,9 @@ test("projected provider dependencies survive assignment replacement and a first
   await expect(activeTask(page, 'confirmation').getByRole("alert")).toContainText("Some prior dependent sessions may have stopped");
   const snapshot = await state(request); expect(snapshot.model.workspaces.find(w => w.id === "atlas")?.runtime.status).toBe("stopped"); expect(snapshot.model.workspaces.find(w => w.id === "notes")?.runtime.status).toBe("running");
   expect(snapshot.model.credentials.find(c => c.id === "token-github")?.enabled).toBe(true); expect(snapshot.model.credentials.find(c => c.id === "token-github")?.assignments).toEqual([]);
-  await page.keyboard.press("Tab"); expect(await activeTask(page, 'confirmation').evaluate(el => el.contains(document.activeElement))).toBe(true);
+  for (const key of ["Tab", "Tab", "Tab", "Shift+Tab", "Shift+Tab", "Shift+Tab"]) {
+    await page.keyboard.press(key); expect(await activeTask(page, 'confirmation').evaluate(el => el.contains(document.activeElement))).toBe(true);
+  }
   await button(page, "Cancel").click(); await expect(page.locator(".mh-flow-page h1")).toBeFocused();
 });
 
@@ -180,14 +189,14 @@ test("nested rename preflights collision, reports after-stop failure, and retrie
 
 test("empty-folder removal rejects nested contents and retains a registered child on after-stop failure", async ({ page, request }) => {
   test.setTimeout(60_000); await reset(request, "nested"); await browse(page, "/synthetic/group");
-  await moreAction(page, 'Current folder options'); await button(page, "Remove empty folder").click(); await activeTask(page, 'confirmation').getByRole("button", { name: "Remove empty folder", exact: true }).click();
+  await button(page, "Remove empty folder").click(); await activeTask(page, 'confirmation').getByRole("button", { name: "Remove empty folder", exact: true }).click();
   await expect(page.locator(".mh-flow-error")).toContainText("not empty"); expect((await state(request)).model.workspaces.filter(w => w.id.startsWith("nested-")).every(w => w.runtime.status === "running")).toBe(true);
   await browse(page, "/synthetic/group/child"); await control(request, "setFolderFault", ["after-stop"]);
-  await moreAction(page, 'Current folder options'); await button(page, "Remove empty folder").click(); await activeTask(page, 'confirmation').getByRole("button", { name: "Remove empty folder", exact: true }).click();
+  await button(page, "Remove empty folder").click(); await activeTask(page, 'confirmation').getByRole("button", { name: "Remove empty folder", exact: true }).click();
   await button(page, "Stop and continue").click(); await expect(activeTask(page, 'confirmation').getByRole("alert")).toContainText("folder retained");
   let snapshot = await state(request); expect(snapshot.model.workspaces.find(w => w.id === "nested-child")?.runtime.status).toBe("stopped"); expect(snapshot.model.workspaces.find(w => w.id === "nested-parent")?.runtime.status).toBe("running"); expect(snapshot.model.folders.some(f => f.path === "/synthetic/group/child")).toBe(true);
   await button(page, "Cancel").click(); await control(request, "setFolderFault", [null]);
-  await moreAction(page, 'Current folder options'); await button(page, "Remove empty folder").click(); await activeTask(page, 'confirmation').getByRole("button", { name: "Remove empty folder", exact: true }).click();
+  await button(page, "Remove empty folder").click(); await activeTask(page, 'confirmation').getByRole("button", { name: "Remove empty folder", exact: true }).click();
   await expect(page.locator(".mh-flow-page")).toContainText("/synthetic/group");
   await expect.poll(async () => (await state(request)).model.workspaces.some(w => w.id === "nested-child")).toBe(false);
   snapshot = await state(request); expect(snapshot.model.folders.some(f => f.path === "/synthetic/group/child")).toBe(false); expect(snapshot.model.workspaces.some(w => w.id === "nested-parent")).toBe(true);

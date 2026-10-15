@@ -8,10 +8,10 @@ test.beforeEach(async ({ request }) => {
 test("direct credential purpose keeps all 14 named diagnostics behind Troubleshooting", async ({ page, request }, info) => {
   await page.goto("/settings?detail=credential&id=ssh-open");
   const flow = page.locator(".mh-flow-page");
-  const section = flow.locator(".mh-section").filter({ has: page.getByRole("heading", { name: "Purpose", exact: true }) });
-  await expect(section).toContainText("SSH connections");
+  const section = flow.locator(".mh-section").filter({ has: page.getByRole("heading", { name: "Used for", exact: true }) });
+  await expect(section.locator('.mh-info-row').filter({ has: page.locator('dt', { hasText: /^Git access$/ }) }).locator('.mh-info-value')).toHaveText("SSH");
   // ssh-open is authentication-only: do not invent a signing capability.
-  await expect(section).not.toContainText("Signing commits");
+  await expect(section).not.toContainText("Commit signing");
   await expect(flow.locator('[data-readiness-layer], details, .mh-readiness-summary')).toHaveCount(0);
   await expect(flow.locator(".mh-flow-toolbar")).toHaveCount(0);
   await expect(flow.locator('.mh-flow-header [data-flow="flow-back"]')).toBeVisible();
@@ -27,7 +27,7 @@ test("direct credential purpose keeps all 14 named diagnostics behind Troublesho
   }
   await page.screenshot({ path: info.outputPath("credential-current.png"), timeout: 5_000 });
   await activeTask(page).getByRole('button', { name: 'Back', exact: true }).click();
-  await diagnosticReport(page);
+  await activeTask(page).getByRole('button', { name: /^View diagnostic report/ }).click();
   for (const row of await rows.all()) await expect(row).toBeVisible();
   expect(await rows.evaluateAll(els => els.map(el => ({ layer: el.getAttribute("data-readiness-layer"), status: el.getAttribute("data-readiness-status"), message: el.querySelector("small")?.textContent })))).toEqual(raw);
   await info.attach("all-14-diagnostics", { body: JSON.stringify(raw), contentType: "application/json" });
