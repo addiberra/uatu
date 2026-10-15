@@ -4,11 +4,13 @@
 // the projection so the live surface and the unit tests read one rule.
 
 import { backgroundStatusLabel } from "./background-tasks";
+import { scheduledStatusLabel } from "./scheduled-wakeups";
 import { statusLabel } from "./timeline-renderer";
-import type { BackgroundTaskItem, ContextReportItem, ConversationItem, ConversationStatus, NoticeItem, PlanUtilization, PlanUtilizationWindow, SessionTotals } from "./types";
+import { clockTime, localDaysBetween, relativeReset, resetClock, resetMoment, weekdayClock } from "./dates";
+import { isRateLimitStanding, type BackgroundTaskItem, type ScheduledWakeupItem, type ContextReportItem, type ConversationItem, type ConversationStatus, type NoticeItem, type PlanUtilization, type PlanUtilizationWindow, type SessionTotals, type UsageReadFailure } from "./types";
 
 export type ComposerRoutineState = {
-  stateName: "cancelling" | "sending" | "working" | "retrying" | "compacting" | "background" | "failed" | "ready";
+  stateName: "cancelling" | "sending" | "working" | "retrying" | "compacting" | "background" | "scheduled" | "failed" | "ready";
   label: string;
   // The reason that came with the state (a retry's attempt and HTTP status).
 };
@@ -20,6 +22,10 @@ export function composerRoutineState(input: {
   submitting: boolean;
   backgroundDeclared: boolean;
   backgroundTasks: readonly BackgroundTaskItem[];
+  scheduledDeclared?: boolean;
+  // Pending, soonest first (pendingWakeups).
+  scheduledWakeups?: readonly ScheduledWakeupItem[];
+  now?: number;
 }): ComposerRoutineState {
   const { status } = input;
   if (input.cancelling) return { stateName: "cancelling", label: "Cancelling" };
@@ -31,33 +37,102 @@ export function composerRoutineState(input: {
   // stall; a compaction in progress shows as compacting).
   if (status === "retrying") return { stateName: "retrying", label: input.statusMessage ? `Retrying (${input.statusMessage})` : "Retrying" };
   if (status === "compacting") return { stateName: "compacting", label: statusLabel(status) };
-  if (status === "background" && input.backgroundDeclared) return { stateName: "background", label: backgroundStatusLabel(input.backgroundTasks) };
+  // The background state is the list's state: the status is raised because a
+  // task is running and is only lowered when the agent says the turn moved on,
+  // so between a task settling and that word the status would name background
+  // work with no task left to name. An empty list falls back to ready.
+  if (status === "background" && input.backgroundDeclared && input.backgroundTasks.length > 0) return { stateName: "background", label: backgroundStatusLabel(input.backgroundTasks) };
+  // Nothing runs, but the session is held for the agent's own future turns
+  // (spec: the composer names the state, the pending count, and the next fire).
+  if (status === "scheduled" && input.scheduledDeclared) return { stateName: "scheduled", label: scheduledStatusLabel(input.scheduledWakeups ?? [], input.now) };
   if (status === "failed") return { stateName: "failed", label: statusLabel(status) };
   if (status === undefined) return { stateName: "ready", label: "Select a conversation" };
-  return { stateName: "ready", label: status === "background" ? "Ready" : statusLabel(status) };
+  return { stateName: "ready", label: status === "background" || status === "scheduled" ? "Ready" : statusLabel(status) };
 }
 
 export type RateLimitStanding = { level: "warning" | "rejected"; message: string; resetsAt?: number };
 
 /**
- * The latest rate-limit notice still standing: a rejection or a warning
- * until a later clearing notice retires it. Notices are scanned from the
- * tail, so the newest wins.
+ * The rate-limit standing in force, or none.
+ *
+ * Found by its code, not by an id: the code is what the contract gives a
+ * client to recognize a standing by, and it is what the timeline filters
+ * on. Keying this on the id the Claude normalizer happens to use would
+ * make the two disagree — an agent that kept its standing under another
+ * stable id would have it filtered out of the timeline and not found here,
+ * so the standing would show nowhere at all.
+ *
+ * The newest wins. One producer keeping one item id is a property of that
+ * producer, not a guarantee of the wire, so this reads the last one in
+ * order rather than assuming there is only ever one to find. Its absence
+ * is the answer "not limited": the agent removes the item when requests
+ * are allowed again.
  */
 export function latestRateLimit(items: readonly ConversationItem[]): RateLimitStanding | undefined {
   for (let index = items.length - 1; index >= 0; index -= 1) {
     const item = items[index];
-    if (!item || item.type !== "notice" || !item.code?.startsWith("rate-limit")) continue;
+    if (!item || !isRateLimitStanding(item)) continue;
     const notice = item as NoticeItem;
-    if (notice.code === "rate-limit-cleared") return undefined;
-    return { level: notice.code === "rate-limit-rejected" ? "rejected" : "warning", message: notice.message, ...(notice.resetsAt === undefined ? {} : { resetsAt: notice.resetsAt }) };
+    return {
+      level: notice.code === "rate-limit-rejected" ? "rejected" : "warning",
+      message: notice.message,
+      ...(notice.resetsAt === undefined ? {} : { resetsAt: notice.resetsAt }),
+    };
   }
   return undefined;
 }
 
-export function rateLimitBadgeLabel(standing: RateLimitStanding): string {
-  const resets = standing.resetsAt === undefined ? "" : ` · resets ${new Date(standing.resetsAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
+/**
+ * The one chip beside the composer, resolved from the plan report and the
+ * rate-limit standing together.
+ *
+ * They were two controls saying one thing: a plan summary that could not
+ * see it was rate limited, and a badge that could not be opened. Folding
+ * them gives the standing somewhere to be read in full — the readout the
+ * chip opens already names every window and its reset.
+ *
+ * Order matters. A rejection displaces the percentages deliberately: once
+ * requests are blocked, how full the window is has stopped being the
+ * actionable fact, and the figures are one click away. A warning keeps
+ * them and only raises the level, because there the percentage IS the
+ * warning — and the level cannot be derived from the figures alone, since
+ * the login warns on windows the summary does not list.
+ */
+export type PlanChip = {
+  text: string;
+  level: "normal" | "warning" | "rejected";
+  // What the chip is saying, for the surface's styling and its title.
+  kind: "plan" | "cost" | "rate-limit";
+};
+
+export function planChip(report: Pick<ContextReportItem, "plan" | "session"> | undefined, standing: RateLimitStanding | undefined): PlanChip | undefined {
+  if (standing?.level === "rejected") return { text: rateLimitBadgeLabel(standing), level: "rejected", kind: "rate-limit" };
+  const plan = report?.plan;
+  const summary = report ? planSummaryLabel(report) : undefined;
+  if (plan && planHasRows(plan) && summary) {
+    const level = standing || planUtilizationLevel(plan) === "warning" ? "warning" : "normal";
+    return { text: summary, level, kind: "plan" };
+  }
+  // No windows to show. A standing still has to be sayable — a login with
+  // no plan can still be rate limited, and before this it had nowhere to go.
+  if (standing) return { text: rateLimitBadgeLabel(standing), level: "warning", kind: "rate-limit" };
+  return summary ? { text: summary, level: "normal", kind: "cost" } : undefined;
+}
+
+export function rateLimitBadgeLabel(standing: RateLimitStanding, now = Date.now()): string {
+  // The chip is tight for room: the clock, with its day when not today, is
+  // what removes the ambiguity; the readout carries the relative time.
+  const resets = standing.resetsAt === undefined ? "" : ` · resets ${resetClock(standing.resetsAt, now)}`;
   return standing.level === "rejected" ? `Rate limited${resets}` : `Near rate limit${resets}`;
+}
+
+/**
+ * The standing as one sentence — the readout's standing line and what is
+ * announced to assistive technology — with its reset phrased as the plan
+ * rows phrase theirs: "… Resets Thu 23:00 · in 3d 4h."
+ */
+export function standingSentence(standing: Pick<RateLimitStanding, "message" | "resetsAt">, now = Date.now()): string {
+  return standing.resetsAt === undefined ? standing.message : `${standing.message} Resets ${resetMoment(standing.resetsAt, now)}.`;
 }
 
 /**
@@ -91,14 +166,9 @@ export function planUtilizationLabel(plan: PlanUtilization): string | undefined 
   return parts.length ? parts.join(" · ") : undefined;
 }
 
-/**
- * Dollars as the readout shows them: cents for anything a reader would
- * budget, four places below ten cents so a cheap turn does not round to
- * nothing.
- */
-export function formatUsd(value: number): string {
-  return value.toLocaleString(undefined, { style: "currency", currency: "USD", minimumFractionDigits: 2, maximumFractionDigits: value > 0 && value < 0.1 ? 4 : 2 });
-}
+import { formatUsd } from "./usage";
+
+export { formatUsd };
 
 /** "$1.23 this conversation": the chip's words for a login that has no windows to report. */
 export function sessionCostLabel(session: SessionTotals): string {
@@ -110,8 +180,11 @@ export function sessionCostLabel(session: SessionTotals): string {
  * idle conversation resumes a fresh one, so the totals are summed by the
  * workspace process from `since`, when it first saw the conversation. A
  * conversation with a message older than that — one resumed after a restart
- * — is titled "since HH:MM" (with the weekday once a day has passed) rather
- * than claiming the whole conversation.
+ * — is titled "since HH:MM" rather than claiming the whole conversation.
+ * Like every other day decision in the chat, the reader's local calendar day
+ * decides the form: a start earlier today is the bare clock ("since 23:00"),
+ * one on any earlier local day gains its weekday ("since Fri 23:00") — even
+ * when less than 24 hours have passed.
  */
 export function sessionTotalsTitle(session: Pick<SessionTotals, "since">, items: readonly ConversationItem[], now = Date.now()): string {
   let firstMessageAt: number | undefined;
@@ -119,9 +192,7 @@ export function sessionTotalsTitle(session: Pick<SessionTotals, "since">, items:
     if (item.type === "user_message" && (firstMessageAt === undefined || item.createdAt < firstMessageAt)) firstMessageAt = item.createdAt;
   }
   if (session.since === undefined || firstMessageAt === undefined || session.since <= firstMessageAt) return "This conversation";
-  const date = new Date(session.since);
-  const time = date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-  return `This conversation · since ${now - session.since < 86_400_000 ? time : `${date.toLocaleDateString([], { weekday: "short" })} ${time}`}`;
+  return `This conversation · since ${localDaysBetween(session.since, now) <= 0 ? clockTime(session.since) : weekdayClock(session.since)}`;
 }
 
 /**
@@ -228,30 +299,40 @@ export function planReadoutRows(plan: PlanUtilization, now = Date.now()): PlanRe
 }
 
 /**
- * "in 4d 11h" / "in 2h 05m" / "in 35m"; "now" once the reset has passed
- * and the next report has not yet said so. Minutes are dropped past a day
- * because a weekly window is not waited on to the minute.
+ * A usage report older than this is stale: still shown, marked as such.
+ * The 5-hour window moves about 0.3 %/min at full burn, so ten minutes
+ * bounds the error at a few percent.
  */
-export function relativeReset(resetsAt: number, now = Date.now()): string {
-  const remaining = resetsAt - now;
-  if (remaining < 30_000) return "now";
-  const minutes = Math.round(remaining / 60_000);
-  if (minutes < 60) return `in ${minutes}m`;
-  const hours = Math.floor(minutes / 60);
-  if (hours < 24) return `in ${hours}h ${String(minutes % 60).padStart(2, "0")}m`;
-  const days = Math.floor(hours / 24);
-  return `in ${days}d ${hours % 24}h`;
+export const USAGE_STALE_MS = 10 * 60_000;
+
+export function usageStale(readAt: number, now = Date.now()): boolean {
+  return now - readAt >= USAGE_STALE_MS;
 }
 
-/**
- * The reset as a clock time — bare within the coming day ("14:00"), with
- * the weekday beyond it ("Sat 21:00"), since a bare time a week out would
- * read as today.
- */
-export function resetClock(resetsAt: number, now = Date.now()): string {
-  const date = new Date(resetsAt);
-  const time = date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-  return resetsAt - now < 86_400_000 ? time : `${date.toLocaleDateString([], { weekday: "short" })} ${time}`;
+/** "just now", "12 min ago", "3 h ago", "2 d ago": how long since the read. */
+export function usageAge(readAt: number, now = Date.now()): string {
+  const elapsed = Math.max(0, now - readAt);
+  if (elapsed < 60_000) return "just now";
+  const minutes = Math.round(elapsed / 60_000);
+  if (minutes < 60) return `${minutes} min ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours} h ago`;
+  return `${Math.floor(hours / 24)} d ago`;
+}
+
+/** "as of 21:33 · 12 min ago" — the read's clock time and its age together. */
+export function usageAsOf(readAt: number, now = Date.now()): string {
+  return `as of ${clockTime(readAt)} · ${usageAge(readAt, now)}`;
+}
+
+/** Why a read did not answer, as the readout says it. */
+export function usageReadFailureLabel(reason: UsageReadFailure | "network"): string {
+  switch (reason) {
+    case "timeout": return "timed out";
+    case "unavailable": return "Claude Code could not answer";
+    case "no-live-session": return "no session is running";
+    case "network": return "the workspace did not answer";
+  }
 }
 
 /** The plan name as a reader says it: "Max plan", "Pro plan"; "Team", "Enterprise" likewise. */

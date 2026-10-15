@@ -17,6 +17,24 @@ async function boot(page: Page, url = "/nav/.first.md") {
 
 test.beforeEach(async ({ request }) => { await request.post("/__e2e/reset", { data: { extras, follow: false } }); });
 
+test("a connected partial inventory never reports a sibling boundary", async ({ page, request }) => {
+  await request.post("/__e2e/reset", { data: { extras, follow: false, holdDiscovery: true, nativeWatch: true } });
+  try {
+    await page.goto("/nav/.first.md");
+    await expect(page.locator("#preview")).toContainText("First");
+    await expect(overlay(page)).toContainText("Loading file index");
+    await expect(next(page)).toBeDisabled();
+    await expect(overlay(page).getByRole("button", { name: /first file|last file/ })).toHaveCount(0);
+    await expect(back(page)).toBeEnabled();
+    await request.post("/__e2e/reset", { data: { releaseDiscovery: true } });
+    await expect(next(page)).toBeEnabled();
+    await expect(page.locator("#preview-path")).toHaveText("nav/.first.md");
+  } finally {
+    await page.close();
+    await request.post("/__e2e/reset");
+  }
+});
+
 test("explicit binary URLs and reload select indexed images or the binary fallback", async ({ page }) => {
   for (const path of ["nav/b #?.svg", "nav/d.bin"]) {
     await page.goto(`/${path.split("/").map(encodeURIComponent).join("/")}`);
@@ -102,13 +120,13 @@ test("index failure is not a boundary and explicit retry keeps the page", async 
   await boot(page);
   await page.evaluate(() => { (window as any).__previewSentinel = {}; });
   await page.route("**/api/state**", route => route.fulfill({ status: 503, body: "unavailable" }));
-  await page.route("**/api/events**", route => route.abort());
+  await page.route("**/api/hub/live**", route => route.abort());
   await page.evaluate(() => window.dispatchEvent(new Event("online")));
   await expect(overlay(page)).toContainText("File index unavailable");
   await expect(overlay(page).getByRole("button", { name: /first file|last file/ })).toHaveCount(0);
   await expect(back(page)).toBeEnabled();
   await page.unroute("**/api/state**");
-  await page.unroute("**/api/events**");
+  await page.unroute("**/api/hub/live**");
   await overlay(page).getByRole("button", { name: "Retry" }).click();
   await expect(next(page)).toBeEnabled();
   expect(await page.evaluate(() => Boolean((window as any).__previewSentinel))).toBe(true);

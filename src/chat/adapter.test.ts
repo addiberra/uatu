@@ -1,7 +1,8 @@
 import { describe, expect, test } from "bun:test";
 
-import { BackgroundTasksUnsupportedError, ChatQueueFullError, CommandAttachmentsError, ConversationRenameUnsupportedError, deriveConversationTitle, InteractionConflictError, InvalidConversationTitleError, InvalidModeSelectionError, InvalidModelSelectionError, InvalidVariantSelectionError, ChatAdapter, parseSlashCommand, QueuedMessageNotHeldError, ReversibleHistoryUnsupportedError, UnknownAttachmentError } from "./adapter";
-import { createProviderEventMemory, normalizeProviderEvent, normalizeProviderMessage, storedMessageUsage, type ProviderEvent, type ProviderMessage } from "./opencode/normalization";
+import { BackgroundTasksUnsupportedError, ChatQueueFullError, CommandAttachmentsError, ConversationRenameUnsupportedError, deriveConversationTitle, InteractionConflictError, InvalidConversationTitleError, InvalidModeSelectionError, InvalidModelSelectionError, InvalidVariantSelectionError, ChatAdapter, parseSlashCommand, QueuedMessageNotHeldError, ReversibleHistoryUnsupportedError, ScheduledWakeupsUnsupportedError, UnknownAttachmentError, UsageUnsupportedError } from "./adapter";
+import { createClaudeEventMemory, normalizeClaudeMessage } from "./claude/normalization";
+import { createProviderEventMemory, normalizeProviderEvent, normalizeProviderMessage, storedMessageUsage, storedPromptId, type ProviderEvent, type ProviderMessage } from "./opencode/v1/normalization";
 import type { ChatAgent } from "./types";
 import type {
   NormalizedProviderEvent,
@@ -12,10 +13,13 @@ import type {
   StoredMessageAccounting,
 } from "./provider";
 import { ReversibleHistoryTargetError, UnsupportedVariantSelectionError } from "./provider";
-import type { ChatEvent, ChatModel, ConversationItem, ModelSelection, ReversibleHistoryResult, ReversibleHistoryState } from "./types";
+import type { ChatCommand, ChatEvent, ChatModel, ConversationItem, ToolItem, ModelSelection, ReversibleHistoryResult, ReversibleHistoryState } from "./types";
 import { ConversationNotFoundError } from "./workspace";
 import { MetricsRegistry } from "../debug/metrics";
 import type { ConversationInventorySubscription } from "./inventory-broadcaster";
+import { OpenCodeNotificationLifecycle } from "./opencode/notification-lifecycle";
+import type { AgentNotificationEvent } from "./notifications";
+import { notificationPipeline } from "../../tests/notification-pipeline";
 
 class EventQueue implements AsyncIterable<ProviderEvent> {
   private values: ProviderEvent[] = [];
@@ -26,6 +30,13 @@ class EventQueue implements AsyncIterable<ProviderEvent> {
     const waiter = this.waiters.shift();
     if (waiter) waiter({ value: event, done: false });
     else this.values.push(event);
+  }
+
+  // True while a consumer is parked on the queue. The adapter's pump asks
+  // for the next event only after it has fully handled the previous one, so
+  // after a push this turning true again means that event was processed.
+  get waiting(): boolean {
+    return this.waiters.length > 0;
   }
 
   close(): void {
@@ -58,8 +69,10 @@ class FakeProvider implements ChatProvider {
   sessions: ProviderSession[] = [];
   pages = new Map<string, RawPage>();
   eventQueue = new EventQueue();
+  notificationLifecycle = new OpenCodeNotificationLifecycle();
   prompts: Array<{ sessionId: string; id: string; text: string; delivery: "queue"; mode?: string; variant?: string; attachments?: import("./provider").ProviderAttachment[] }> = [];
-  commandCalls: Array<{ sessionId: string; id: string; name: string; arguments: string; model?: ModelSelection }> = [];
+  commandOperation?: "reload";
+  commandCalls: Array<{ sessionId: string; id: string; name: string; arguments: string; listed?: ChatCommand; model?: ModelSelection }> = [];
   permissionReplies: Array<{ sessionId: string; requestId: string; reply: ProviderPermissionReply }> = [];
   questionReplies: Array<{ sessionId: string; requestId: string; answers?: string[][]; rejected?: true }> = [];
   interrupts: string[] = [];
@@ -103,8 +116,15 @@ class FakeProvider implements ChatProvider {
     signal.addEventListener("abort", () => this.eventQueue.close(), { once: true });
     const memory = createProviderEventMemory();
     for await (const event of this.eventQueue) {
+      // A pre-normalized event, for shapes only another generation's mapper
+      // produces (a sparse 2.x lifecycle update).
+      const passthrough = (event as { normalized?: NormalizedProviderEvent }).normalized;
+      if (passthrough) { yield passthrough; continue; }
       try {
-        yield normalizeProviderEvent(event, memory);
+        const normalized = normalizeProviderEvent(event, memory);
+        const turns = this.notificationLifecycle.observe(event, normalized);
+        if (turns.length) normalized.notificationTurns = turns;
+        yield normalized;
       } catch {
         yield { updates: [], outcome: "unparseable", eventType: "" };
       }
@@ -114,9 +134,11 @@ class FakeProvider implements ChatProvider {
     this.prompts.push({ sessionId, ...input });
     return { messageId: input.id };
   }
-  async command(sessionId: string, input: { id: string; name: string; arguments: string; model?: ModelSelection }) {
+  // What a command's row reads as when the provider sent something else.
+  commandText: string | undefined;
+  async command(sessionId: string, input: { id: string; name: string; arguments: string; listed?: ChatCommand; model?: ModelSelection }) {
     this.commandCalls.push({ sessionId, ...input });
-    return { messageId: input.id };
+    return { messageId: input.id, ...(this.commandText ? { text: this.commandText } : {}), ...(this.commandOperation ? { operation: this.commandOperation } : {}) };
   }
   async interrupt(sessionId: string) { this.interrupts.push(sessionId); }
   async replyPermission(sessionId: string, requestId: string, reply: ProviderPermissionReply) {
@@ -133,10 +155,14 @@ class FakeProvider implements ChatProvider {
 type RawPage = { items: ProviderMessage[]; nextCursor?: string; configurationItems?: ProviderMessage[] };
 
 function normalizeRawPage(page: RawPage): ProviderHistoryPage {
+  // As the real provider does: a reply that names no prompt answers the
+  // newest user message before it.
   const accounting: StoredMessageAccounting[] = [];
+  let newestPrompt: string | undefined;
   for (const message of page.items) {
+    newestPrompt = storedPromptId(message) ?? newestPrompt;
     const reported = storedMessageUsage(message);
-    if (reported) accounting.push(reported);
+    if (reported) accounting.push(reported.promptId === undefined && newestPrompt !== undefined ? { ...reported, promptId: newestPrompt } : reported);
   }
   return {
     items: page.items.flatMap(message => normalizeProviderMessage(message)),
@@ -163,6 +189,21 @@ async function waitUntil(predicate: () => boolean): Promise<void> {
   expect(predicate()).toBe(true);
 }
 
+// Every live event pushed so far has been handled and its updates applied:
+// the pump has parked on the queue again (it asks for the next event only
+// after the previous one is fully handled) and the coalescer holds nothing
+// buffered or mid-flush. What a fixed sleep only hoped for, which a loaded
+// machine running `bun test --parallel` did not grant.
+async function liveEventsApplied(adapter: ChatAdapter, provider: FakeProvider): Promise<void> {
+  await waitUntil(() => provider.eventQueue.waiting);
+  const coalescer = (adapter as unknown as {
+    eventCoalescer: { timer: unknown; buffers: Map<string, unknown>; settled(): Promise<void> } | null;
+  }).eventCoalescer;
+  if (!coalescer) return;
+  await waitUntil(() => coalescer.timer === null && coalescer.buffers.size === 0);
+  await coalescer.settled();
+}
+
 async function expectInventorySignal(subscription: ConversationInventorySubscription): Promise<void> {
   const result = await Promise.race([
     subscription.next(),
@@ -171,6 +212,70 @@ async function expectInventorySignal(subscription: ConversationInventorySubscrip
   expect(result).not.toBe("timeout");
   expect((result as IteratorResult<void>).done).toBe(false);
 }
+
+describe("live notification confinement", () => {
+  test("OpenCode events reach both enrolled devices without an open page", async () => {
+    const provider = new FakeProvider();
+    provider.agent = { ...provider.agent, id: "opencode" };
+    provider.sessions = [fixtureSession("one")];
+    const pipeline = await notificationPipeline(provider, process.cwd());
+    try {
+      const timestamp = Date.now();
+      provider.eventQueue.push({ type: "session.next.step.started", data: { sessionID: "one", assistantMessageID: "a", timestamp } });
+      provider.eventQueue.push({ type: "question.asked", data: { sessionID: "one", id: "q", timestamp, questions: [{ question: "Choose?", options: [{ label: "A" }] }] } });
+      await pipeline.waitForSends(2);
+      await pipeline.restartHub();
+      provider.eventQueue.push({ type: "session.next.step.ended", data: { sessionID: "one", assistantMessageID: "a", finish: "stop", timestamp: Date.now() } });
+      await pipeline.waitForSends(4);
+      expect(pipeline.opens()).toBe(2);
+      expect(pipeline.sent.map(send => send.payload.kind).sort()).toEqual(["question-pending", "question-pending", "turn-completed", "turn-completed"]);
+      expect(pipeline.sent.every(send => send.payload.url.includes("opencode%3Aone"))).toBe(true);
+    } finally { await pipeline.dispose(); }
+  });
+  test("a question held while the user looks survives a hub restart and is sent once when they leave", async () => {
+    const provider = new FakeProvider();
+    provider.agent = { ...provider.agent, id: "opencode" };
+    provider.sessions = [fixtureSession("one")];
+    const pipeline = await notificationPipeline(provider, process.cwd());
+    try {
+      pipeline.setPresence("present");
+      provider.eventQueue.push({ type: "question.asked", data: { sessionID: "one", id: "q", timestamp: Date.now(), questions: [{ question: "Choose?", options: [{ label: "A" }] }] } });
+      await pipeline.waitForDeliveries(2);
+      for (let i = 0; i < 500 && pipeline.heldCount() < 2; i++) await Bun.sleep(2);
+      expect(pipeline.heldCount()).toBe(2);
+      expect(pipeline.sent).toHaveLength(0);
+      await pipeline.restartHub();
+      expect(pipeline.heldCount()).toBe(2);
+      pipeline.setPresence("away");
+      await pipeline.waitForSends(2);
+      await pipeline.restartHub();
+      await Bun.sleep(20);
+      await pipeline.waitForSends(2);
+      expect(pipeline.sent.map(send => send.endpoint).sort()).toEqual(["https://web.push.apple.com/desktop", "https://web.push.apple.com/phone"]);
+    } finally { await pipeline.dispose(); }
+  });
+  test("unselected conversations notify, while child completions and outside workspaces do not", async () => {
+    const provider = new FakeProvider();
+    provider.sessions = [fixtureSession("one"), fixtureSession("two"), { ...fixtureSession("child"), parentId: "one" }, fixtureSession("outside", "/tmp/uatu-outside")];
+    const events: AgentNotificationEvent[] = [];
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), onNotification: event => events.push(event) });
+    const pump = adapter.startEventPump();
+    const now = Date.now();
+    for (const sessionID of ["one", "two", "child", "outside"]) {
+      provider.eventQueue.push({ type: "session.next.step.started", data: { sessionID, assistantMessageID: "a", timestamp: now } });
+    }
+    for (const sessionID of ["one", "child", "outside"]) {
+      provider.eventQueue.push({ type: "session.next.step.ended", data: { sessionID, assistantMessageID: "a", finish: "stop", timestamp: now + 1 } });
+    }
+    provider.eventQueue.push({ type: "question.asked", data: { sessionID: "child", id: "q", questions: [{ question: "Choose?", options: [{ label: "A" }] }] } });
+    provider.eventQueue.close();
+    await pump;
+    expect(events.filter(event => event.type === "notification").map(event => event.type === "notification" ? [event.notification.conversationId, event.notification.kind] : [])).toEqual([
+      ["one", "turn-completed"], ["one", "question-pending"],
+    ]);
+    await adapter.dispose();
+  });
+});
 
 describe("OpenCode conversation inventory and history", () => {
   test("repairs a persisted default title from its first user message", async () => {
@@ -192,6 +297,49 @@ describe("OpenCode conversation inventory and history", () => {
     expect((await adapter.listConversations())[0]?.title).toBe("Investigate authenticated model discovery");
     await expectInventorySignal(inventory);
     inventory.cancel();
+  });
+
+  test("every priced usage carrier rides the first page, so the cost fold sees the whole conversation", async () => {
+    const provider = new FakeProvider();
+    provider.sessions = [fixtureSession("session")];
+    const priced = (id: string, created: number, cost: number) => ({
+      id, type: "assistant", time: { created }, modelID: "gpt-5.6-sol", providerID: "openai",
+      tokens: { input: 100, output: 10 }, cost, content: [{ id: `prt_${id}`, type: "text", text: `Reply ${id}` }],
+    });
+    const older = priced("older", 1, 0.5);
+    const newer = priced("newer", 101, 0.25);
+    // A subagent launched from the older page: its spend lives on the row
+    // that launched it, so the row rides the first page and is attributed.
+    const launch = {
+      id: "launch", type: "assistant", time: { created: 2 }, modelID: "gpt-5.6-sol", providerID: "openai",
+      content: [{ id: "prt_task", type: "tool", tool: "task", callID: "c1", state: { status: "completed", input: { description: "Review renderer", subagent_type: "explore" }, metadata: { sessionId: "child" }, output: "done" } }],
+    };
+    // The provider pages locally over the complete transcript: the newest
+    // page holds one message, the transcript everything.
+    provider.pages.set("first", { items: [newer], nextCursor: "older-page", configurationItems: [older, launch, newer] });
+    provider.pages.set("older-page", { items: [older, launch], configurationItems: [older, launch, newer] });
+    const listMessages = provider.readMessages.bind(provider);
+    provider.readMessages = async (sessionId, options) => {
+      if (sessionId !== "child") return listMessages(sessionId, options);
+      return { items: [{ id: "child_a", type: "assistant", modelID: "gpt-5.6-sol", time: { created: 3 }, tokens: { input: 50, output: 5 }, cost: 0.125 }] as never[] };
+    };
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd() });
+
+    const first = await adapter.history("session");
+    const carriers = (items: readonly ConversationItem[]) => items.filter(item => item.type === "assistant_message" && item.markdown === "" && item.usage).map(item => item.id).sort();
+    // The older message's text is not on the page; its price is, and so is
+    // the subagent's row with its child's aggregate.
+    expect(first.items.some(item => item.id === "part:prt_older")).toBe(false);
+    expect(carriers(first.items)).toEqual(["usage:newer", "usage:older"]);
+    expect(first.items.find(item => item.id === "tool:prt_task")).toEqual(expect.objectContaining({ childConversationId: "child", model: "gpt-5.6-sol", usage: expect.objectContaining({ costUsd: 0.125 }) }));
+    expect(first.olderCursor).toBeDefined();
+
+    // Loading the older page restates the carrier under the same id: one
+    // item in the projection, not two.
+    const older_page = await adapter.history("session", { cursor: first.olderCursor });
+    expect(older_page.items.some(item => item.id === "part:prt_older")).toBe(true);
+    expect(carriers(adapter.projectionForTests("session").items())).toEqual(["usage:newer", "usage:older"]);
+    expect(adapter.projectionForTests("session").items().filter(item => item.id === "tool:prt_task")).toHaveLength(1);
   });
 
   test("repairs a persisted default title from before the newest message page", async () => {
@@ -499,6 +647,35 @@ describe("filtered provider event pump", () => {
     await pump;
   });
 
+  test("a sparse lifecycle update keeps a child's parent; a full record without one promotes it", async () => {
+    const provider = new FakeProvider();
+    const local = fixtureSession("local");
+    const child = { ...fixtureSession("child"), parentId: "local" };
+    provider.sessions = [local, child];
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g" });
+    expect((await adapter.listConversations()).map(conversation => conversation.id)).toEqual(["local"]);
+    const inventory = adapter.subscribeInventory();
+    await expectInventorySignal(inventory);
+    const pump = adapter.startEventPump();
+    await expectInventorySignal(inventory);
+
+    // 2.x's rename names the id and the title only. The child stays a child:
+    // nothing to list, so nothing to invalidate.
+    let settled = false;
+    const afterSparse = inventory.next().then(result => { settled = true; return result; });
+    provider.eventQueue.push({ normalized: { conversationId: "child", updates: [], outcome: "handled", eventType: "session.renamed", sessionLifecycle: { kind: "updated", id: "child", directory: process.cwd(), title: "Child renamed", sparse: true } } });
+    await Bun.sleep(20);
+    expect(settled).toBe(false);
+    expect((await adapter.listConversations()).map(conversation => conversation.id)).toEqual(["local"]);
+
+    // A full record with no parent is the promotion it says it is.
+    provider.eventQueue.push({ type: "session.updated", data: { info: { ...child, parentId: undefined, title: "Child promoted" } } });
+    expect((await afterSparse).done).toBe(false);
+
+    await adapter.dispose();
+    await pump;
+  });
+
   test("classifies deleted sessions from event metadata without looking them up", async () => {
     const provider = new FakeProvider();
     let lookups = 0;
@@ -511,6 +688,36 @@ describe("filtered provider event pump", () => {
 
     provider.eventQueue.push({ type: "session.deleted", data: { info: fixtureSession("deleted") } });
     await expectInventorySignal(inventory);
+    expect(lookups).toBe(0);
+
+    await adapter.dispose();
+    await pump;
+  });
+
+  test("a sparse deletion invalidates only for a session the adapter listed, and never looks it up", async () => {
+    const provider = new FakeProvider();
+    let lookups = 0;
+    provider.getSession = async () => { lookups += 1; return null; };
+    const listed = fixtureSession("listed");
+    provider.sessions = [listed];
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g" });
+    await adapter.listConversations();
+    const inventory = adapter.subscribeInventory();
+    await expectInventorySignal(inventory);
+    const pump = adapter.startEventPump();
+    await expectInventorySignal(inventory);
+
+    // 2.x's deletion names an id and nothing else. Unknown here, it may be
+    // another directory's on a shared server: nothing listed can have gone.
+    let settled = false;
+    const afterUnknown = inventory.next().then(result => { settled = true; return result; });
+    provider.eventQueue.push({ normalized: { conversationId: "elsewhere", updates: [], outcome: "handled", eventType: "session.deleted", sessionLifecycle: { kind: "deleted", id: "elsewhere", directory: process.cwd(), title: "", sparse: true } } });
+    await Bun.sleep(20);
+    expect(settled).toBe(false);
+
+    // A listed session's deletion is a change to the list.
+    provider.eventQueue.push({ normalized: { conversationId: "listed", updates: [], outcome: "handled", eventType: "session.deleted", sessionLifecycle: { kind: "deleted", id: "listed", directory: process.cwd(), title: "", sparse: true } } });
+    expect((await afterUnknown).done).toBe(false);
     expect(lookups).toBe(0);
 
     await adapter.dispose();
@@ -602,7 +809,10 @@ describe("filtered provider event pump", () => {
   test("coalesces streamed deltas into a single published event per window", async () => {
     const provider = new FakeProvider();
     provider.sessions = [fixtureSession("local")];
-    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g", coalesceWindowMs: 5 });
+    // The window is real time; it has to outlast the pump's handling of three queued deltas on a loaded machine, or
+    // they straddle two windows.
+    const windowMs = 100;
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g", coalesceWindowMs: windowMs });
     const pump = adapter.startEventPump();
     const { events } = await adapter.subscribe("local");
     const received: ChatEvent[] = [];
@@ -611,7 +821,9 @@ describe("filtered provider event pump", () => {
     for (const delta of ["He", "ll", "o"]) {
       provider.eventQueue.push({ id: `e-${delta}`, type: "session.next.text.delta", data: { sessionID: "local", partID: "p", delta } });
     }
-    await Bun.sleep(40);
+    for (let i = 0; i < 200 && received.length === 0; i++) await Bun.sleep(10);
+    // A second window passes, so a split publication would have arrived.
+    await Bun.sleep(windowMs * 2);
     await adapter.stopEventPump();
     await pump;
 
@@ -619,6 +831,35 @@ describe("filtered provider event pump", () => {
     // Three provider deltas within one window publish a single event.
     expect(received).toHaveLength(1);
     expect(received[0]).toEqual(expect.objectContaining({ type: "item.upsert", item: expect.objectContaining({ markdown: "Hello" }) }));
+    events.cancel();
+  });
+
+  // OpenCode 2.x announces a tool call's input on `session.tool.called` and
+  // follows it inside the same window with a `session.tool.progress` that
+  // carries none. Replacing the buffered frame with the sparse one left the
+  // row without its input for the rest of its life, and a wildcard
+  // permission pointing at that row had nothing to show (GitHub #476).
+  test("a sparse tool frame in the same window as the call keeps the call's input", async () => {
+    const provider = new FakeProvider();
+    provider.sessions = [fixtureSession("local")];
+    const windowMs = 100;
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g", coalesceWindowMs: windowMs });
+    const pump = adapter.startEventPump();
+    const { events } = await adapter.subscribe("local");
+    const received: ChatEvent[] = [];
+    void (async () => { for await (const event of events) received.push(event); })();
+
+    provider.eventQueue.push({ id: "e-called", type: "session.tool.called", data: { sessionID: "local", callID: "call_1", tool: "execute", input: { code: "await tools.tracker.create_issue({ title: \"Login fails\" })" }, timestamp: 1 } });
+    provider.eventQueue.push({ id: "e-progress", type: "session.tool.progress", data: { sessionID: "local", callID: "call_1", tool: "execute", timestamp: 2 } });
+    for (let i = 0; i < 200 && received.length === 0; i++) await Bun.sleep(10);
+    await Bun.sleep(windowMs * 2);
+    await adapter.stopEventPump();
+    await pump;
+
+    const row = adapter.projectionForTests("local").items().find(item => item.id === "tool:call_1");
+    expect(row).toEqual(expect.objectContaining({ type: "tool", name: "execute", status: "running", input: JSON.stringify({ code: "await tools.tracker.create_issue({ title: \"Login fails\" })" }) }));
+    expect(received).toHaveLength(1);
+    expect(received[0]).toEqual(expect.objectContaining({ type: "item.upsert", item: expect.objectContaining({ id: "tool:call_1", input: expect.stringContaining("create_issue") }) }));
     events.cancel();
   });
 
@@ -1183,6 +1424,33 @@ describe("reversible history coordination", () => {
 });
 
 describe("prompt, abort, permission, and question mutations", () => {
+  test("catalog changes advance the agent revision and invalidate inventory without a conversation", async () => {
+    const provider = new FakeProvider();
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g" });
+    const inventory = adapter.subscribeInventory();
+    await inventory.next();
+    const pump = adapter.startEventPump();
+    try {
+      expect(adapter.catalogRevision()).toBeUndefined();
+      provider.eventQueue.push({ type: "catalog.updated", normalized: { updates: [], outcome: "handled", eventType: "catalog.updated", catalogsChanged: true } });
+      await liveEventsApplied(adapter, provider);
+      await expectInventorySignal(inventory);
+      expect(adapter.catalogRevision()).toBe("g:1");
+      expect(provider.sessions).toEqual([]);
+    } finally { inventory.cancel(); await adapter.stopEventPump(); await pump; await adapter.dispose(); }
+  });
+  test("provider-held window metadata survives projection eviction", async () => {
+    const provider = new FakeProvider();
+    provider.sessions = [fixtureSession("a"), fixtureSession("b")];
+    const window: ConversationItem = { id: "window", type: "context_window", createdAt: 1, model: { providerId: "anthropic", modelId: "opus" }, limit: 1_000_000, window: { source: "session", freshness: "current" } };
+    provider.listMessages = async id => ({ items: id === "a" ? [window] : [], accounting: [] });
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), maxProjections: 1 });
+    try {
+      expect((await adapter.history("a")).items).toContainEqual(window);
+      await adapter.history("b");
+      expect((await adapter.history("a")).items).toContainEqual(window);
+    } finally { await adapter.dispose(); }
+  });
   test("snapshots recover provider-owned configuration and cache only while projected", async () => {
     const provider = new FakeProvider();
     provider.sessions = [fixtureSession("a"), fixtureSession("b")];
@@ -1511,10 +1779,19 @@ describe("prompt, abort, permission, and question mutations", () => {
 
   test("recognizes only well-formed listed slash commands and separates arguments", () => {
     const commands = new FakeProvider().commands;
-    expect(parseSlashCommand("/review   routing behavior ", commands)).toEqual({ name: "review", arguments: "routing behavior" });
+    expect(parseSlashCommand("/review   routing behavior ", commands)).toMatchObject({ name: "review", arguments: "routing behavior" });
     for (const text of ["/unknown args", "/ review", "//review", "prefix /review"]) {
       expect(parseSlashCommand(text, commands)).toBeUndefined();
     }
+  });
+
+  test("the acceptance carries the operation the provider says it ran", async () => {
+    const provider = new FakeProvider();
+    provider.sessions = [fixtureSession("session")];
+    provider.commandOperation = "reload";
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g", id: () => "message" });
+    const accepted = await adapter.prompt("session", "request", "/review");
+    expect(accepted).toMatchObject({ messageId: "message", held: false, operation: "reload" });
   });
 
   test("dispatches recognized slash commands without changing the prompt contract", async () => {
@@ -1525,7 +1802,8 @@ describe("prompt, abort, permission, and question mutations", () => {
 
     const accepted = await adapter.prompt("session", "request", "/review   API compatibility", model);
     expect(accepted).toEqual({ messageId: "message", held: false, configuration: { model } });
-    expect(provider.commandCalls).toEqual([{ sessionId: "session", id: "message", name: "review", arguments: "API compatibility", model }]);
+    // The listed entry the text matched rides along, so the provider dispatches what was classified.
+    expect(provider.commandCalls).toEqual([{ sessionId: "session", id: "message", name: "review", arguments: "API compatibility", listed: expect.objectContaining({ name: "review", kind: "command" }), model }]);
     expect(provider.prompts).toEqual([]);
 
     adapter.projectionForTests("session").statusUpdate("completed");
@@ -1533,10 +1811,56 @@ describe("prompt, abort, permission, and question mutations", () => {
     expect(provider.prompts[0]).toEqual(expect.objectContaining({ text: "/missing stays ordinary" }));
   });
 
+  test("a command's row reads as the text the provider says it sent, whichever row lands first", async () => {
+    const provider = new FakeProvider();
+    provider.sessions = [fixtureSession("session")];
+    provider.commandText = "@review focus";
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g", id: () => "message" });
+    // The provider's own row can land before the acceptance does.
+    adapter.projectionForTests("session").upsert({ id: "message:message", type: "user_message", createdAt: 1, text: "@review focus", requestId: "message" });
+    await adapter.prompt("session", "request", "/review focus");
+    const rows = adapter.projectionForTests("session").items().filter(item => item.type === "user_message");
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ id: "message:message", text: "@review focus" });
+  });
+
   test("derives concise titles without reducing numeric prompts to a generic label", () => {
     expect(deriveConversationTitle("123 investigate flaky model routing")).toBe("123 investigate flaky model routing");
     expect(deriveConversationTitle("# Implement a deliberately long model selection request that should be shortened at a word boundary for the chooser"))
       .toBe("Implement a deliberately long model selection request that...");
+  });
+
+  test("a command's placeholder is published at acceptance, so a retirement during the first-prompt rename still finds it", async () => {
+    const provider = new FakeProvider();
+    provider.sessions = [{ ...fixtureSession("session"), title: "New session - 2026-08-15T12:00:00Z" }];
+    provider.renameSession = async (id, title) => {
+      await Bun.sleep(40);
+      const session = provider.sessions.find(candidate => candidate.id === id)!;
+      const renamed = { ...session, title };
+      provider.sessions[0] = renamed;
+      return renamed;
+    };
+    // The provider reports the local id (window closed), and the server's
+    // row lands, with the placeholder's retirement, while the rename runs.
+    provider.command = async () => {
+      setTimeout(() => provider.eventQueue.push({ normalized: { conversationId: "session", outcome: "handled", eventType: "session.inbox.enqueued", updates: [
+        { kind: "upsert", item: { id: "message:msg_server", type: "user_message", createdAt: 2, text: "Review focus", requestId: "msg_server" } },
+        { kind: "remove", itemId: "message:msg_local" },
+      ] } }), 10);
+      return { messageId: "msg_local" };
+    };
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g" });
+    const pump = adapter.startEventPump();
+    await Bun.sleep(10);
+    await adapter.prompt("session", "request", "/review focus");
+    await Bun.sleep(60);
+    // The live projection, which is what a client renders between events.
+    const live = await adapter.subscribe("session");
+    const ids = live.snapshot.items.filter(item => item.type === "user_message").map(item => item.id);
+    expect(ids).toEqual(["message:msg_server"]);
+    live.events.cancel();
+    await adapter.dispose();
+    await pump;
   });
 
   test("strictly selects a model and gives the first prompt a provider-owned title", async () => {
@@ -1921,9 +2245,15 @@ describe("prompt, abort, permission, and question mutations", () => {
     const stops: Array<{ sessionId: string; taskId: string }> = [];
     (provider as unknown as { stopTask: (sessionId: string, taskId: string) => Promise<void> }).stopTask = async (sessionId, taskId) => { stops.push({ sessionId, taskId }); };
     (provider as unknown as { listBackgroundTasks: () => Promise<unknown[]> }).listBackgroundTasks = async () => [
-      { conversationId: "session", taskId: "b1", description: "Sleep then echo", taskType: "local_bash", toolUseId: "toolu_1", startedAt: 5 },
+      { conversationId: "session", taskId: "b1", description: "Sleep then echo", taskType: "local_bash", toolUseId: "toolu_1", startedAt: 5, outputFile: "/tmp/claude-501/-w/s/tasks/b1.output" },
+      { conversationId: "session", taskId: "ada2", description: "Explore", taskType: "local_agent", toolUseId: "toolu_2", startedAt: 6, subagentType: "Explore", prompt: "look around", usage: { totalTokens: 10, toolUses: 1, durationMs: 100 }, childConversationId: "sub:session:ada2" },
       { conversationId: "other", taskId: "b2", description: "Elsewhere", startedAt: 6 },
     ];
+    const outputReads: Array<{ sessionId: string; taskId: string; tailBytes: number }> = [];
+    (provider as unknown as { taskOutput: (sessionId: string, taskId: string, options: { tailBytes: number }) => Promise<unknown> }).taskOutput = async (sessionId, taskId, options) => {
+      outputReads.push({ sessionId, taskId, tailBytes: options.tailBytes });
+      return taskId === "b1" ? { text: "so far", truncated: false, settled: false } : null;
+    };
     const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g" });
     const projection = adapter.projectionForTests("session");
     projection.statusUpdate("running");
@@ -1941,7 +2271,17 @@ describe("prompt, abort, permission, and question mutations", () => {
     // this conversation's only.
     const snapshot = await adapter.history("session");
     const tasks = snapshot.items.filter(item => item.type === "background_task");
-    expect(tasks).toEqual([expect.objectContaining({ id: "task:b1", status: "running", description: "Sleep then echo", toolUseId: "toolu_1", createdAt: 5 })]);
+    // The seeded rows carry the facts the live ones would have.
+    expect(tasks).toEqual([
+      expect.objectContaining({ id: "task:b1", status: "running", description: "Sleep then echo", toolUseId: "toolu_1", createdAt: 5, outputFile: "/tmp/claude-501/-w/s/tasks/b1.output" }),
+      expect.objectContaining({ id: "task:ada2", status: "running", subagentType: "Explore", prompt: "look around", usage: { totalTokens: 10, toolUses: 1, durationMs: 100 }, childConversationId: "sub:session:ada2" }),
+    ]);
+    // The output read reaches the provider for the owning session; a task
+    // with no output yet is null, not an error.
+    expect(await adapter.taskOutput("session", "b1", { tailBytes: 512 })).toEqual({ text: "so far", truncated: false, settled: false });
+    expect(await adapter.taskOutput("session", "ada2", { tailBytes: 512 })).toBeNull();
+    expect(outputReads).toEqual([{ sessionId: "session", taskId: "b1", tailBytes: 512 }, { sessionId: "session", taskId: "ada2", tailBytes: 512 }]);
+    await expect(adapter.taskOutput("missing", "b1", { tailBytes: 512 })).rejects.toBeInstanceOf(ConversationNotFoundError);
     await adapter.dispose();
   });
 
@@ -1978,11 +2318,133 @@ describe("prompt, abort, permission, and question mutations", () => {
     await adapter.dispose();
   });
 
+  test("a scheduled conversation accepts prompts, reopens scheduled with its live wakeups, and releases once per request", async () => {
+    const provider = new FakeProvider();
+    provider.agent = { ...provider.agent, capabilities: [...provider.agent.capabilities, "scheduled-wakeups"] };
+    provider.sessions = [fixtureSession("session")];
+    const releases: string[] = [];
+    let listed = [
+      { conversationId: "session", wakeupId: "w1", prompt: "check the build", recurring: false, schedule: "3 20 * * *", nextFireAt: 9, createdAt: 5 },
+      { conversationId: "other", wakeupId: "w2", prompt: "elsewhere", recurring: true, schedule: "* * * * *", createdAt: 6 },
+    ];
+    Object.assign(provider, {
+      release: async (sessionId: string) => { releases.push(sessionId); },
+      listScheduledWakeups: async () => listed,
+    });
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g" });
+    const projection = adapter.projectionForTests("session");
+    projection.statusUpdate("running");
+    projection.statusUpdate("completed");
+    projection.statusUpdate("scheduled");
+    // Not live: a prompt is delivered into the held session, not held back.
+    expect((await adapter.prompt("session", "r1", "meanwhile")).held).toBe(false);
+    projection.statusUpdate("completed");
+    // Reopened while the provider still holds the wakeup: its row (this
+    // conversation's only) and the scheduled state.
+    const snapshot = await adapter.history("session");
+    expect(snapshot.items.filter(item => item.type === "scheduled_wakeup")).toEqual([
+      expect.objectContaining({ id: "wakeup:w1", wakeupId: "w1", status: "pending", recurring: false, nextFireAt: 9, createdAt: 5 }),
+    ]);
+    expect(snapshot.conversation.status).toBe("scheduled");
+    // Release is idempotent per request id and addressed to the owning session.
+    expect(await adapter.release("session", "req-1")).toEqual({ released: true });
+    expect(await adapter.release("session", "req-1")).toEqual({ released: true });
+    expect(releases).toEqual(["session"]);
+    listed = [];
+    projection.statusUpdate("idle");
+    const after = await adapter.history("session");
+    expect(after.items.some(item => item.type === "scheduled_wakeup")).toBe(false);
+    expect(after.conversation.status).not.toBe("scheduled");
+    await adapter.dispose();
+  });
+
+  test("a conversation opened without a live session lists its paused crons, stays idle, and cancels one", async () => {
+    const provider = new FakeProvider();
+    provider.agent = { ...provider.agent, capabilities: [...provider.agent.capabilities, "scheduled-wakeups"] };
+    provider.sessions = [fixtureSession("session")];
+    const cancels: Array<[string, string]> = [];
+    const paused = { id: "wakeup:c1", type: "scheduled_wakeup" as const, createdAt: 5, wakeupId: "c1", prompt: "poll the queue", recurring: true, schedule: "*/5 * * * *", status: "paused" as const, message: "Paused." };
+    Object.assign(provider, {
+      listScheduledWakeups: async () => [],
+      listPausedWakeups: async (id: string) => id === "session" ? [paused] : [],
+      cancelWakeup: async (id: string, wakeupId: string) => { cancels.push([id, wakeupId]); },
+    });
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g" });
+    const snapshot = await adapter.history("session");
+    expect(snapshot.items.filter(item => item.type === "scheduled_wakeup")).toEqual([paused]);
+    expect(snapshot.conversation.status).not.toBe("scheduled");
+    expect(await adapter.cancelWakeup("session", "c1", "req-1")).toEqual({ cancelled: true });
+    expect(await adapter.cancelWakeup("session", "c1", "req-1")).toEqual({ cancelled: true });
+    expect(cancels).toEqual([["session", "c1"]]);
+    // A row this page already saw cancelled is not reopened by a stale list.
+    adapter.projectionForTests("session").apply({ kind: "upsert", item: { ...paused, status: "cancelled" } });
+    expect((await adapter.history("session")).items.find(item => item.id === "wakeup:c1")).toEqual(expect.objectContaining({ status: "cancelled" }));
+    await adapter.dispose();
+  });
+
+  test("a wakeup that fires or is cancelled while the snapshot is read is not seeded back to pending", async () => {
+    const provider = new FakeProvider();
+    provider.agent = { ...provider.agent, capabilities: [...provider.agent.capabilities, "scheduled-wakeups"] };
+    provider.sessions = [fixtureSession("session")];
+    const pending = (wakeupId: string) => ({ conversationId: "session", wakeupId, prompt: `check ${wakeupId}`, recurring: false, schedule: "3 20 * * *", nextFireAt: 9, createdAt: 5 });
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g" });
+    const projection = adapter.projectionForTests("session");
+    const settled = (wakeupId: string, status: "fired" | "cancelled") => ({ id: `wakeup:${wakeupId}`, type: "scheduled_wakeup" as const, createdAt: 5, wakeupId, prompt: `check ${wakeupId}`, recurring: false, schedule: "3 20 * * *", status, ...(status === "fired" ? { firedTurnId: "message:wakeup:f1" } : {}) });
+    Object.assign(provider, {
+      listScheduledWakeups: async () => [pending("w1"), pending("w2"), pending("w3")],
+      // Read after the wakeup list: the provider's events land meanwhile.
+      listPermissions: async () => {
+        projection.apply({ kind: "upsert", item: settled("w1", "fired") });
+        projection.apply({ kind: "upsert", item: settled("w2", "cancelled") });
+        return [];
+      },
+    });
+    const snapshot = await adapter.history("session");
+    const rows = (items: ConversationItem[]) => items.filter(item => item.type === "scheduled_wakeup").map(item => [item.id, (item as { status: string }).status]);
+    expect(rows(snapshot.items)).toEqual([["wakeup:w1", "fired"], ["wakeup:w2", "cancelled"], ["wakeup:w3", "pending"]]);
+    expect(rows(projection.items())).toEqual([["wakeup:w1", "fired"], ["wakeup:w2", "cancelled"], ["wakeup:w3", "pending"]]);
+    await adapter.dispose();
+  });
+
+  test("an agent without the scheduled-wakeups capability cannot release", async () => {
+    const provider = new FakeProvider();
+    provider.sessions = [fixtureSession("session")];
+    Object.assign(provider, { release: async () => {} });
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g" });
+    await expect(adapter.release("session", "req-1")).rejects.toBeInstanceOf(ScheduledWakeupsUnsupportedError);
+    await adapter.dispose();
+  });
+
+  // Design D13: a typed command's run row is the turn's, not background work
+  // the provider lists — the snapshot must neither stop it mid-command nor
+  // lose it, nor read it as background work.
+  test("a foreground run row rides a mid-command snapshot, running, and closes once no turn runs", async () => {
+    const provider = new FakeProvider();
+    provider.agent = { ...provider.agent, capabilities: [...provider.agent.capabilities, "background-tasks"] };
+    provider.sessions = [fixtureSession("session")];
+    (provider as unknown as { listBackgroundTasks: () => Promise<unknown[]> }).listBackgroundTasks = async () => [];
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g" });
+    const projection = adapter.projectionForTests("session");
+    projection.statusUpdate("running");
+    projection.apply({ kind: "upsert", item: { id: "task:rv", type: "background_task", createdAt: 5, taskId: "rv", description: "/code-review", taskType: "local_agent", status: "running", childConversationId: "sub:session:rv", foreground: true } });
+    const during = await adapter.history("session");
+    expect(during.items.filter(item => item.type === "background_task")).toEqual([expect.objectContaining({ id: "task:rv", status: "running", foreground: true })]);
+    expect(during.conversation.status).toBe("running");
+    // The command ended without the run's notification: no turn is live, so
+    // the row is over, and it never made the conversation background work.
+    projection.statusUpdate("completed");
+    const after = await adapter.history("session");
+    expect(after.items.filter(item => item.type === "background_task")).toEqual([expect.objectContaining({ id: "task:rv", status: "stopped" })]);
+    expect(after.conversation.status).toBe("completed");
+    await adapter.dispose();
+  });
+
   test("an agent without the background-tasks capability cannot stop tasks", async () => {
     const provider = new FakeProvider();
     provider.sessions = [fixtureSession("session")];
     const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g" });
     await expect(adapter.stopTask("session", "b1", "req-1")).rejects.toBeInstanceOf(BackgroundTasksUnsupportedError);
+    await expect(adapter.taskOutput("session", "b1", { tailBytes: 512 })).rejects.toBeInstanceOf(BackgroundTasksUnsupportedError);
     await adapter.dispose();
   });
 
@@ -2385,6 +2847,40 @@ describe("discarded event accounting", () => {
     await pump;
   });
 
+  test("a skipped content block is counted by block type under the shared cap", async () => {
+    const provider = new FakeProvider();
+    provider.sessions = [fixtureSession("local")];
+    const metrics = counters();
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), metrics, coalesceWindowMs: 1 });
+    const pump = adapter.startEventPump();
+
+    provider.eventQueue.push({ id: "p1", type: "message.part.updated", data: { sessionID: "local", part: { id: "prt", messageID: "m", sessionID: "local", type: "patch" } } } as never);
+    provider.eventQueue.push({ id: "d1", type: "session.next.text.delta", data: { sessionID: "local", partID: "p", delta: "after" } });
+    while (adapter.projectionForTests("local").items().length === 0) await Bun.sleep(1);
+
+    expect(metrics.values["chat.block.unrecognized.patch"]).toBe(1);
+    expect(Object.keys(metrics.values).filter(key => key.startsWith("chat.event."))).toEqual([]);
+    await adapter.stopEventPump();
+    await pump;
+  });
+
+  test("a Claude system subtype nobody reads is counted under its subtype", async () => {
+    const provider = new FakeProvider();
+    provider.sessions = [fixtureSession("local")];
+    const metrics = counters();
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), metrics, coalesceWindowMs: 1 });
+    const pump = adapter.startEventPump();
+
+    const normalized = { ...normalizeClaudeMessage({ type: "system", subtype: "model_refusal_no_fallback", uuid: "s1" }, createClaudeEventMemory(), "live"), conversationId: "local" };
+    provider.eventQueue.push({ normalized } as never);
+    provider.eventQueue.push({ id: "d1", type: "session.next.text.delta", data: { sessionID: "local", partID: "p", delta: "after" } });
+    while (adapter.projectionForTests("local").items().length === 0) await Bun.sleep(1);
+
+    expect(metrics.values["chat.event.unrecognized.system.model_refusal_no_fallback"]).toBe(1);
+    await adapter.stopEventPump();
+    await pump;
+  });
+
   test("discards land in the registry snapshot the workspace writes without --debug", async () => {
     // cli.ts writes `snapshot-<pid>.json` from MetricsRegistry.snapshot() on an
     // unconditional 1Hz tick; --debug only adds the NDJSON history. Driving the
@@ -2433,7 +2929,13 @@ describe("pending permission recovery", () => {
     // The pump never saw this: OpenCode raised it while the stream was down.
     // The diff rides along — recovery exists for the reader who missed the
     // live announcement, who must not approve an edit without seeing it.
-    provider.listPermissions = async () => [{ requestId: "perm_1", conversationId: "local", action: "skill", resources: ["review-code"], diff: "@@ -1 +1 @@\n-a\n+b" }];
+    // So does the rule an "always" reply would install: the recovered card
+    // confirms with the same scope the live one would have shown.
+    // And the tool row the request belongs to: a wildcard request shows
+    // the call's arguments from that row, recovered or live.
+    // And the MCP server and tool the provider resolved, so the recovered
+    // card is titled as the live one would have been.
+    provider.listPermissions = async () => [{ requestId: "perm_1", conversationId: "local", action: "skill", resources: ["review-code"], alwaysPatterns: ["review-*"], diff: "@@ -1 +1 @@\n-a\n+b", sourceToolId: "tool:call_1", mcp: { server: "tracker", tool: "review" } }];
     const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g" });
 
     const snapshot = await adapter.history("local");
@@ -2442,8 +2944,11 @@ describe("pending permission recovery", () => {
       type: "permission",
       action: "skill",
       resources: ["review-code"],
+      alwaysPatterns: ["review-*"],
       status: "pending",
       diff: "@@ -1 +1 @@\n-a\n+b",
+      sourceToolId: "tool:call_1",
+      mcp: { server: "tracker", tool: "review" },
     })]);
 
     await adapter.respondPermission("local", "perm_1", "req-1", "approved-once");
@@ -2579,6 +3084,185 @@ describe("pending permission recovery", () => {
     await pump;
   });
 
+  // A subagent's request is announced under its own conversation. Its
+  // resolution can reach the adapter only through the parent — an answer given
+  // from the parent's transcript, or a parent reconciliation that no longer
+  // lists it — and must still resolve the identity that was announced, or the
+  // hub keeps a delivery alive for a request nobody is waiting on.
+  test("a parent reconciliation that retires a child's question resolves the child's identity", async () => {
+    const provider = new FakeProvider();
+    provider.sessions = [fixtureSession("parent"), { ...fixtureSession("child"), parentId: "parent" }];
+    let pending = [{
+      requestId: "que_gone",
+      conversationId: "child",
+      questions: [{ prompt: "Pick", header: "Choice", options: [{ label: "A", description: "" }], multiple: false, allowFreeForm: false }],
+    }];
+    provider.listQuestions = async () => pending;
+    const events: AgentNotificationEvent[] = [];
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g", coalesceWindowMs: 1, onNotification: event => events.push(event) });
+    const pump = adapter.startEventPump();
+    // Discovered by the parent's sweep: the only signal for a question asked
+    // while the pump was down, and it names the child.
+    provider.eventQueue.push({ id: "t0", type: "session.next.tool.success", data: { sessionID: "parent", callID: "c0", tool: "question" } } as never);
+    await waitUntil(() => events.some(event => event.type === "notification"));
+    const announced = events.find(event => event.type === "notification");
+    expect(announced).toEqual({ type: "notification", notification: expect.objectContaining({
+      conversationId: "parent", kind: "question-pending", sourceId: JSON.stringify(["child", "que_gone"]),
+    }) });
+    // Answered elsewhere with the reply event lost; the parent's next
+    // reconciliation carries only the removal.
+    pending = [];
+    provider.eventQueue.push({ id: "t1", type: "session.next.tool.success", data: { sessionID: "parent", callID: "c1", tool: "question" } } as never);
+    await waitUntil(() => events.some(event => event.type === "resolved"));
+    await adapter.stopEventPump();
+    await pump;
+    expect(events.filter(event => event.type === "resolved")).toEqual([
+      { type: "resolved", id: (announced as Extract<AgentNotificationEvent, { type: "notification" }>).notification.id, conversationId: "parent" },
+    ]);
+    await adapter.dispose();
+  });
+
+  test("a history read that retires a child's request resolves the child's identity", async () => {
+    const provider = new FakeProvider();
+    provider.sessions = [fixtureSession("parent"), { ...fixtureSession("child"), parentId: "parent" }];
+    let questions = [{
+      requestId: "que_child",
+      conversationId: "child",
+      questions: [{ prompt: "Pick", header: "Choice", options: [{ label: "A", description: "" }], multiple: false, allowFreeForm: false }],
+    }];
+    let permissions = [{ requestId: "perm_child", conversationId: "child", action: "shell", resources: ["ls"] }];
+    provider.listQuestions = async () => questions;
+    provider.listPermissions = async () => permissions;
+    const events: AgentNotificationEvent[] = [];
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g", coalesceWindowMs: 1, onNotification: event => events.push(event) });
+    const pump = adapter.startEventPump();
+    // Announced live: the question through the parent's sweep, the permission on the child's own stream.
+    provider.eventQueue.push({ id: "t0", type: "session.next.tool.success", data: { sessionID: "parent", callID: "c0", tool: "question" } } as never);
+    provider.eventQueue.push({ type: "permission.v2.asked", data: { id: "perm_child", sessionID: "child", action: "shell", resources: ["ls"], timestamp: Date.now() } } as never);
+    await waitUntil(() => events.filter(event => event.type === "notification").length === 2);
+    await adapter.stopEventPump();
+    await pump;
+    const announced = events.flatMap(event => event.type === "notification" ? [event.notification] : []);
+    expect(announced.map(notification => notification.sourceId).sort()).toEqual([JSON.stringify(["child", "perm_child"]), JSON.stringify(["child", "que_child"])]);
+    // Both answered elsewhere with the reply events lost; opening the
+    // transcripts is the next authoritative read.
+    questions = []; permissions = [];
+    await adapter.history("parent");
+    await adapter.history("child");
+    expect(events.flatMap(event => event.type === "resolved" ? [event.id] : []).sort()).toEqual(announced.map(notification => notification.id).sort());
+    await adapter.dispose();
+  });
+
+  test("a request announced while the authoritative read is in flight is neither retired nor resolved", async () => {
+    const provider = new FakeProvider();
+    provider.sessions = [fixtureSession("local")];
+    let releaseQuestions = () => {}; let releasePermissions = () => {};
+    let questionsRead = false; let permissionsRead = false;
+    // Each read takes its snapshot (empty) and then stalls; the request that
+    // arrives meanwhile is newer than what the read will report.
+    provider.listQuestions = async () => { questionsRead = true; await new Promise<void>(resolve => { releaseQuestions = resolve; }); return []; };
+    provider.listPermissions = async () => { permissionsRead = true; await new Promise<void>(resolve => { releasePermissions = resolve; }); return []; };
+    const events: AgentNotificationEvent[] = [];
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g", coalesceWindowMs: 1, onNotification: event => events.push(event) });
+    const pump = adapter.startEventPump();
+    const load = adapter.history("local");
+    await waitUntil(() => questionsRead);
+    provider.eventQueue.push({ type: "question.asked", data: { sessionID: "local", id: "que_live", timestamp: Date.now(), questions: [{ question: "Pick", options: [{ label: "A" }] }] } });
+    await waitUntil(() => events.filter(event => event.type === "notification").length === 1);
+    releaseQuestions();
+    await waitUntil(() => permissionsRead);
+    provider.eventQueue.push({ type: "permission.v2.asked", data: { id: "perm_live", sessionID: "local", action: "shell", resources: ["ls"], timestamp: Date.now() } } as never);
+    await waitUntil(() => events.filter(event => event.type === "notification").length === 2);
+    releasePermissions();
+    const snapshot = await load;
+    await adapter.stopEventPump();
+    await pump;
+    expect(events.filter(event => event.type === "resolved")).toEqual([]);
+    expect(snapshot.items.map(item => item.id).sort()).toEqual(["permission:perm_live", "question:que_live"]);
+    expect(adapter.projectionForTests("local").has("question:que_live")).toBe(true);
+    expect(adapter.projectionForTests("local").has("permission:perm_live")).toBe(true);
+    await adapter.dispose();
+  });
+
+  test("a rewrite of the child's timeline keeps the announcement, so a later answer from the parent still resolves it", async () => {
+    const provider = new FakeProvider();
+    provider.sessions = [fixtureSession("parent"), { ...fixtureSession("child"), parentId: "parent" }];
+    provider.listQuestions = async () => [{
+      requestId: "que_child",
+      conversationId: "child",
+      questions: [{ prompt: "Pick", header: "Choice", options: [{ label: "A", description: "" }], multiple: false, allowFreeForm: false }],
+    }];
+    const events: AgentNotificationEvent[] = [];
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g", coalesceWindowMs: 1, onNotification: event => events.push(event) });
+    const pump = adapter.startEventPump();
+    provider.eventQueue.push({ id: "t0", type: "session.next.tool.success", data: { sessionID: "parent", callID: "c0", tool: "question" } } as never);
+    await waitUntil(() => events.some(event => event.type === "notification"));
+    await adapter.stopEventPump();
+    await pump;
+    const announced = events.find(event => event.type === "notification");
+    // An undo/redo/revert/restore replaces the child's timeline wholesale.
+    adapter.projectionForTests("child").replace([]);
+    await adapter.respondQuestion("parent", "que_child", "c1", { kind: "answered", answers: [["A"]] });
+    expect(events.filter(event => event.type === "resolved")).toEqual([
+      { type: "resolved", id: (announced as Extract<AgentNotificationEvent, { type: "notification" }>).notification.id, conversationId: "parent" },
+    ]);
+    await adapter.dispose();
+  });
+
+  test("deleting the parent settles a child's request announced under it", async () => {
+    const provider = new FakeProvider();
+    provider.sessions = [fixtureSession("parent"), { ...fixtureSession("child"), parentId: "parent" }];
+    provider.listQuestions = async () => [{
+      requestId: "que_child",
+      conversationId: "child",
+      questions: [{ prompt: "Pick", header: "Choice", options: [{ label: "A", description: "" }], multiple: false, allowFreeForm: false }],
+    }];
+    const events: AgentNotificationEvent[] = [];
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g", coalesceWindowMs: 1, onNotification: event => events.push(event) });
+    const pump = adapter.startEventPump();
+    provider.eventQueue.push({ id: "t0", type: "session.next.tool.success", data: { sessionID: "parent", callID: "c0", tool: "question" } } as never);
+    await waitUntil(() => events.some(event => event.type === "notification"));
+    const announced = events.find(event => event.type === "notification") as Extract<AgentNotificationEvent, { type: "notification" }>;
+    expect(announced.notification).toEqual(expect.objectContaining({ conversationId: "parent", sourceId: JSON.stringify(["child", "que_child"]) }));
+    // The parent goes away; no event for the child is guaranteed to follow.
+    provider.eventQueue.push({ type: "session.deleted", data: { info: fixtureSession("parent") } });
+    await waitUntil(() => events.some(event => event.type === "resolved"));
+    await adapter.stopEventPump();
+    await pump;
+    expect(events.filter(event => event.type === "resolved")).toEqual([{ type: "resolved", id: announced.notification.id, conversationId: "parent" }]);
+    await adapter.dispose();
+  });
+
+  test("answering a child's question or permission from the parent resolves the child's identity", async () => {
+    const provider = new FakeProvider();
+    provider.sessions = [fixtureSession("parent"), { ...fixtureSession("child"), parentId: "parent" }];
+    // The parent's projection is seeded from these when the answer arrives;
+    // the child transcript is never opened.
+    provider.listQuestions = async () => [{
+      requestId: "que_child",
+      conversationId: "child",
+      questions: [{ prompt: "Pick", header: "Choice", options: [{ label: "A", description: "" }], multiple: false, allowFreeForm: false }],
+    }];
+    provider.listPermissions = async () => [{ requestId: "perm_child", conversationId: "child", action: "shell", resources: ["ls"] }];
+    const events: AgentNotificationEvent[] = [];
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g", coalesceWindowMs: 1, onNotification: event => events.push(event) });
+    const pump = adapter.startEventPump();
+    const timestamp = Date.now();
+    provider.eventQueue.push({ type: "question.asked", data: { sessionID: "child", id: "que_child", timestamp, questions: [{ question: "Pick", options: [{ label: "A" }] }] } });
+    provider.eventQueue.push({ type: "permission.v2.asked", data: { id: "perm_child", sessionID: "child", action: "shell", resources: ["ls"], timestamp } } as never);
+    await waitUntil(() => events.filter(event => event.type === "notification").length === 2);
+    const announced = events.flatMap(event => event.type === "notification" ? [event.notification] : []);
+    expect(announced.map(notification => [notification.conversationId, notification.sourceId]).sort()).toEqual([
+      ["parent", JSON.stringify(["child", "perm_child"])], ["parent", JSON.stringify(["child", "que_child"])],
+    ]);
+    await adapter.respondQuestion("parent", "que_child", "c1", { kind: "answered", answers: [["A"]] });
+    await adapter.respondPermission("parent", "perm_child", "c2", "approved-once");
+    await adapter.stopEventPump();
+    await pump;
+    expect(events.flatMap(event => event.type === "resolved" ? [event.id] : []).sort()).toEqual(announced.map(notification => notification.id).sort());
+    await adapter.dispose();
+  });
+
   // A subagent's model and cost live in its own session, which the parent's
   // client never sees. The adapter is the only place both are in scope, so it
   // sums the child's messages and materializes the total onto the row that
@@ -2605,22 +3289,24 @@ describe("pending permission recovery", () => {
       id: `e-part-${id}`, type: "message.part.updated",
       data: { part: { id: `prt_${id}`, messageID: id, sessionID: "child", type: "text", text: "findings" } },
     });
-    const message = (id: string, input: number, output: number) => ({
+    // The price restates with the tokens, and follows the same rule: the
+    // message's latest figure, counted once.
+    const message = (id: string, input: number, output: number, cost: number) => ({
       id: `e-${id}-${input}`, type: "message.updated",
-      data: { info: { id, sessionID: "child", role: "assistant", modelID: "claude-sonnet-4-5", time: { created: 2 }, tokens: { input, output, cache: { read: 100, write: 0 } } } },
+      data: { info: { id, sessionID: "child", role: "assistant", modelID: "claude-sonnet-4-5", time: { created: 2 }, tokens: { input, output, cache: { read: 100, write: 0 } }, cost } },
     });
     // Two messages, and one of them restated: `message.updated` reports a
     // message's growing tokens rather than a delta, so the restatement must
     // replace that message's figure and not add to it.
     provider.eventQueue.push(part("msg_a") as never);
-    provider.eventQueue.push(message("msg_a", 1_000, 10) as never);
-    provider.eventQueue.push(message("msg_a", 1_200, 20) as never);
+    provider.eventQueue.push(message("msg_a", 1_000, 10, 0.5) as never);
+    provider.eventQueue.push(message("msg_a", 1_200, 20, 0.75) as never);
     provider.eventQueue.push(part("msg_b") as never);
-    provider.eventQueue.push(message("msg_b", 800, 5) as never);
+    provider.eventQueue.push(message("msg_b", 800, 5, 0.25) as never);
     while (sumInput(row()) !== 2_000) await Bun.sleep(1);
     expect(row()).toEqual(expect.objectContaining({
       model: "claude-sonnet-4-5",
-      usage: { input: 2_000, output: 25, cacheRead: 200, cacheWrite: 0 },
+      usage: { input: 2_000, output: 25, cacheRead: 200, cacheWrite: 0, costUsd: 1 },
     }));
 
     // A message that emits a second text part reports the SAME cumulative
@@ -2630,7 +3316,7 @@ describe("pending permission recovery", () => {
       id: "e-part-msg_b-2", type: "message.part.updated",
       data: { part: { id: "prt_msg_b_2", messageID: "msg_b", sessionID: "child", type: "text", text: "and more" } },
     } as never);
-    provider.eventQueue.push(message("msg_b", 900, 7) as never);
+    provider.eventQueue.push(message("msg_b", 900, 7, 0.375) as never);
     while (sumInput(row()) === 2_000) await Bun.sleep(1);
     expect(sumInput(row())).toBe(2_100);
 
@@ -2640,7 +3326,7 @@ describe("pending permission recovery", () => {
     const reopened = await adapter.history("parent");
     expect(reopened.items.find(item => item.type === "tool")).toEqual(expect.objectContaining({
       model: "claude-sonnet-4-5",
-      usage: { input: 2_100, output: 27, cacheRead: 200, cacheWrite: 0 },
+      usage: { input: 2_100, output: 27, cacheRead: 200, cacheWrite: 0, costUsd: 1.125 },
     }));
 
     // The tool part's own later update knows nothing about attribution; it
@@ -2651,8 +3337,709 @@ describe("pending permission recovery", () => {
         status: "completed", input: { description: "Review renderer", subagent_type: "explore" }, metadata: { sessionId: "child" }, output: "done",
       } } },
     } as never);
-    expect(row()).toEqual(expect.objectContaining({ status: "completed", model: "claude-sonnet-4-5", usage: { input: 2_100, output: 27, cacheRead: 200, cacheWrite: 0 } }));
+    expect(row()).toEqual(expect.objectContaining({ status: "completed", model: "claude-sonnet-4-5", usage: { input: 2_100, output: 27, cacheRead: 200, cacheWrite: 0, costUsd: 1.125 } }));
 
+    await adapter.stopEventPump();
+    await pump;
+  });
+
+  test("a nested subagent is listed beneath the row that launched its branch, from the store and live", async () => {
+    const provider = new FakeProvider();
+    provider.sessions = [fixtureSession("parent"), { ...fixtureSession("child"), parentId: "parent" }, { ...fixtureSession("grandchild"), parentId: "child" }];
+    const launcher = (id: string, target: string) => ({
+      id, type: "assistant", time: { created: 1 },
+      content: [{ id: `prt_${id}`, type: "tool", tool: "task", callID: id, state: { status: "completed", input: { description: `Run ${target}`, subagent_type: "explore" }, metadata: { sessionId: target }, output: "done" } }],
+    });
+    const priced = (id: string, cost: number) => ({ id, type: "assistant", modelID: "gpt-5.6-sol", providerID: "openai", time: { created: 2 }, tokens: { input: 100, output: 10 }, cost });
+    provider.pages.set("first", { items: [launcher("launch_child", "child")] });
+    const listMessages = provider.readMessages.bind(provider);
+    provider.readMessages = async (sessionId, options) => {
+      if (sessionId === "child") return { items: [launcher("launch_grandchild", "grandchild"), priced("child_msg", 0.5)] as never[] };
+      if (sessionId === "grandchild") return { items: [priced("grandchild_msg", 0.25)] as never[] };
+      return listMessages(sessionId, options);
+    };
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g", coalesceWindowMs: 1 });
+
+    // From the store: the child's row states the child's OWN spend, and the
+    // subagent it launched is a line beneath it with its own — nothing is
+    // added into the row, so row and line sum to what the branch cost.
+    const snapshot = await adapter.history("parent");
+    const row = () => adapter.projectionForTests("parent").items().find(item => item.type === "tool") as ToolItem | undefined;
+    expect(snapshot.items.find(item => item.type === "tool")).toEqual(expect.objectContaining({
+      childConversationId: "child", model: "gpt-5.6-sol", usage: { input: 100, output: 10, costUsd: 0.5 },
+      descendants: [{ id: "tool:prt_launch_grandchild", parentId: "tool:prt_launch_child", description: "Run grandchild", subagent: "explore", conversationId: "grandchild", model: "gpt-5.6-sol", usage: { input: 100, output: 10, costUsd: 0.25 } }],
+    }));
+
+    // Live: a grandchild message restates its price; its line moves, and the
+    // row above it does not.
+    const pump = adapter.startEventPump();
+    provider.eventQueue.push({
+      id: "e-part", type: "message.part.updated",
+      data: { part: { id: "prt_g", messageID: "grandchild_msg", sessionID: "grandchild", type: "text", text: "more" } },
+    } as never);
+    provider.eventQueue.push({
+      id: "e-msg", type: "message.updated",
+      data: { info: { id: "grandchild_msg", sessionID: "grandchild", role: "assistant", modelID: "gpt-5.6-sol", time: { created: 2 }, tokens: { input: 300, output: 30 }, cost: 0.5 } },
+    } as never);
+    await waitUntil(() => row()?.descendants?.[0]?.usage?.costUsd === 0.5);
+    expect(row()).toEqual(expect.objectContaining({
+      usage: { input: 100, output: 10, costUsd: 0.5 },
+      descendants: [expect.objectContaining({ conversationId: "grandchild", usage: { input: 300, output: 30, costUsd: 0.5 } })],
+    }));
+    await adapter.stopEventPump();
+    await pump;
+  });
+
+  test("a grandchild whose store read failed is read again on the next open", async () => {
+    const provider = new FakeProvider();
+    provider.sessions = [fixtureSession("parent"), { ...fixtureSession("child"), parentId: "parent" }, { ...fixtureSession("grandchild"), parentId: "child" }];
+    const launcher = (id: string, target: string) => ({
+      id, type: "assistant", time: { created: 1 },
+      content: [{ id: `prt_${id}`, type: "tool", tool: "task", callID: id, state: { status: "completed", input: { description: `Run ${target}`, subagent_type: "explore" }, metadata: { sessionId: target }, output: "done" } }],
+    });
+    const priced = (id: string, cost: number) => ({ id, type: "assistant", modelID: "gpt-5.6-sol", providerID: "openai", time: { created: 2 }, tokens: { input: 100, output: 10 }, cost });
+    provider.pages.set("first", { items: [launcher("launch_child", "child")] });
+    let grandchildReads = 0;
+    const listMessages = provider.readMessages.bind(provider);
+    provider.readMessages = async (sessionId, options) => {
+      if (sessionId === "child") return { items: [launcher("launch_grandchild", "grandchild"), priced("child_msg", 0.5)] as never[] };
+      if (sessionId === "grandchild") {
+        grandchildReads += 1;
+        if (grandchildReads === 1) throw new Error("transient");
+        return { items: [priced("grandchild_msg", 0.25)] as never[] };
+      }
+      return listMessages(sessionId, options);
+    };
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g" });
+    const row = (snapshot: { items: ConversationItem[] }) => snapshot.items.find(item => item.type === "tool");
+    // First open: the child's own spend is banked; the grandchild is listed,
+    // since the child's transcript names it, but with no figure — its spend is
+    // not yet known — and the tally is not marked squared.
+    const first = row(await adapter.history("parent")) as ToolItem;
+    expect(first.usage).toEqual({ input: 100, output: 10, costUsd: 0.5 });
+    expect(first.descendants).toEqual([{ id: "tool:prt_launch_grandchild", parentId: "tool:prt_launch_child", description: "Run grandchild", subagent: "explore", conversationId: "grandchild" }]);
+    // Next open reads the grandchild again and the nest is whole.
+    expect(row(await adapter.history("parent"))).toEqual(expect.objectContaining({
+      usage: { input: 100, output: 10, costUsd: 0.5 },
+      descendants: [expect.objectContaining({ conversationId: "grandchild", usage: { input: 100, output: 10, costUsd: 0.25 } })],
+    }));
+    expect(grandchildReads).toBe(2);
+    // Squared now: a third open reads nothing more.
+    await adapter.history("parent");
+    expect(grandchildReads).toBe(2);
+  });
+
+  test("a grandchild already being read for its own transcript is awaited by the top-level open", async () => {
+    const provider = new FakeProvider();
+    provider.sessions = [fixtureSession("parent"), { ...fixtureSession("child"), parentId: "parent" }, { ...fixtureSession("grandchild"), parentId: "child" }];
+    const launcher = (id: string, target: string) => ({
+      id, type: "assistant", time: { created: 1 },
+      content: [{ id: `prt_${id}`, type: "tool", tool: "task", callID: id, state: { status: "completed", input: { description: `Run ${target}`, subagent_type: "explore" }, metadata: { sessionId: target }, output: "done" } }],
+    });
+    const priced = (id: string, cost: number) => ({ id, type: "assistant", modelID: "gpt-5.6-sol", providerID: "openai", time: { created: 2 }, tokens: { input: 100, output: 10 }, cost });
+    provider.pages.set("first", { items: [launcher("launch_child", "child")] });
+    let releaseGrandchild = () => {};
+    const gate = new Promise<void>(resolve => { releaseGrandchild = resolve; });
+    let grandchildReads = 0;
+    let childReads = 0;
+    const listMessages = provider.readMessages.bind(provider);
+    provider.readMessages = async (sessionId, options) => {
+      if (sessionId === "child") {
+        childReads += 1;
+        return { items: [launcher("launch_grandchild", "grandchild"), priced("child_msg", 0.5)] as never[] };
+      }
+      if (sessionId === "grandchild") {
+        grandchildReads += 1;
+        await gate;
+        return { items: [priced("grandchild_msg", 0.25)] as never[] };
+      }
+      return listMessages(sessionId, options);
+    };
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g" });
+    // The child's transcript is opened first and is mid-read of its
+    // grandchild when the top-level conversation opens.
+    const childOpen = adapter.history("child");
+    while (grandchildReads === 0) await Bun.sleep(1);
+    const parentOpen = adapter.history("parent");
+    // The top-level open has read its way down to the child's transcript (the
+    // second read of it) before the grandchild is released; waiting on that,
+    // rather than on a fixed delay, keeps a loaded machine from releasing first.
+    while (childReads < 2) await Bun.sleep(1);
+    await Bun.sleep(5);
+    releaseGrandchild();
+    await childOpen;
+    const snapshot = await parentOpen;
+    expect(snapshot.items.find(item => item.type === "tool")).toEqual(expect.objectContaining({
+      usage: { input: 100, output: 10, costUsd: 0.5 },
+      descendants: [expect.objectContaining({ conversationId: "grandchild", usage: { input: 100, output: 10, costUsd: 0.25 } })],
+    }));
+    // One read served both; the nest is squared, so a reopen reads nothing more.
+    expect(grandchildReads).toBe(1);
+    await adapter.history("parent");
+    expect(grandchildReads).toBe(1);
+  });
+
+  // A subagent handed a further task (OpenCode's `task_id`) is ONE session and
+  // TWO rows. These fixtures are that shape: a prompt per task, a row per task.
+  const taskRow = (part: string, created: number, description: string, target = "child", resumed = false, gave?: string) => ({
+    id: `launch_${part}`, type: "assistant", time: { created },
+    content: [{ id: part, type: "tool", tool: "task", callID: part, state: {
+      status: "completed", input: { description, subagent_type: "general", ...(gave === undefined ? {} : { prompt: gave }), ...(resumed ? { task_id: target } : {}) }, metadata: { sessionId: target }, output: "done",
+    } }],
+  });
+  // Classic-store records, the shape a compacting subagent's session has: a
+  // user message per task, plus the two OpenCode adds when the subagent
+  // summarises itself — a compaction request and a synthetic "continue".
+  const asked = (id: string, created: number, text: string) => ({ info: { id, role: "user", time: { created } }, parts: [{ type: "text", text }] });
+  const compactionRequest = (id: string, created: number) => ({ info: { id, role: "user", time: { created } }, parts: [{ type: "compaction" }] });
+  const continued = (id: string, created: number) => ({ info: { id, role: "user", time: { created } }, parts: [{ type: "text", text: "Continue if you have next steps, or stop and ask for clarification.", synthetic: true }] });
+  const answered = (id: string, created: number, promptId: string, input: number, cost: number) => ({ info: { id, role: "assistant", parentID: promptId, modelID: "gpt-5.6-sol", providerID: "openai", time: { created }, tokens: { input, output: 0 }, cost }, parts: [] });
+  const prompt = (id: string, created: number) => ({ id, type: "user", time: { created }, text: "do it" });
+  const reply = (id: string, created: number, input: number, cost: number) => ({ id, type: "assistant", modelID: "gpt-5.6-sol", providerID: "openai", time: { created }, tokens: { input, output: input / 100 }, cost });
+  const rowsOf = (items: ConversationItem[]) => items.filter((item): item is ToolItem => item.type === "tool").sort((left, right) => left.createdAt - right.createdAt);
+
+  test("a subagent given a second task is billed once: each row states its own task, live and from the store", async () => {
+    const provider = new FakeProvider();
+    provider.sessions = [fixtureSession("parent"), { ...fixtureSession("child"), parentId: "parent" }];
+    provider.pages.set("first", { items: [taskRow("prt_t1", 1, "First task")] });
+    let childStore: unknown[] = [];
+    const listMessages = provider.readMessages.bind(provider);
+    provider.readMessages = async (sessionId, options) => (sessionId === "child" ? { items: childStore as never[] } : listMessages(sessionId, options));
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g", coalesceWindowMs: 1 });
+    await adapter.history("parent");
+    const rows = () => rowsOf(adapter.projectionForTests("parent").items());
+    const live = (id: string, promptId: string, input: number, cost: number) => ({
+      id: `e-${id}-${input}`, type: "message.updated",
+      data: { info: { id, sessionID: "child", role: "assistant", parentID: promptId, modelID: "gpt-5.6-sol", time: { created: 3 }, tokens: { input, output: input / 100 }, cost } },
+    });
+    const pump = adapter.startEventPump();
+    provider.eventQueue.push(live("m1", "p1", 1_000, 0.5) as never);
+    await waitUntil(() => rows()[0]?.usage?.input === 1_000);
+
+    // The main agent hands the SAME subagent a further task: a second row for
+    // the same child session, then that task's reply.
+    provider.eventQueue.push({
+      id: "e-row-2", type: "message.part.updated",
+      data: { part: { id: "prt_t2", messageID: "launch_prt_t2", sessionID: "parent", type: "tool", tool: "task", callID: "prt_t2", state: {
+        status: "running", input: { description: "Second task", subagent_type: "general", task_id: "child" }, metadata: { sessionId: "child" },
+      } } },
+    } as never);
+    provider.eventQueue.push(live("m2", "p2", 400, 0.2) as never);
+    await waitUntil(() => rows()[1]?.usage?.input === 400);
+    // The second row states the second task alone, and the first is untouched:
+    // keyed by session, the second row opened at the first one's total.
+    expect(rows().map(row => row.usage)).toEqual([{ input: 1_000, output: 10, costUsd: 0.5 }, { input: 400, output: 4, costUsd: 0.2 }]);
+    // The second task's figure restates as it streams; only its row moves.
+    provider.eventQueue.push(live("m2", "p2", 600, 0.3) as never);
+    await waitUntil(() => rows()[1]?.usage?.input === 600);
+    expect(rows().map(row => row.usage?.costUsd)).toEqual([0.5, 0.3]);
+    await adapter.stopEventPump();
+    await pump;
+
+    // From the store, in a process that saw none of it live. The v2 records
+    // name no prompt: each reply answers the newest prompt before it.
+    provider.pages.set("first", { items: [taskRow("prt_t1", 1, "First task"), taskRow("prt_t2", 5, "Second task", "child", true)] });
+    childStore = [prompt("p1", 2), reply("m1", 3, 1_000, 0.5), prompt("p2", 6), reply("m2", 7, 600, 0.3)];
+    const reopened = rowsOf((await new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g2" }).history("parent")).items);
+    expect(reopened.map(row => row.usage)).toEqual([{ input: 1_000, output: 10, costUsd: 0.5 }, { input: 600, output: 6, costUsd: 0.3 }]);
+    // Together the rows are what the session spent — no more.
+    expect(reopened.reduce((sum, row) => sum + (row.usage?.costUsd ?? 0), 0)).toBeCloseTo(0.8);
+  });
+
+  test("a subagent that compacted during its first task bills the compaction to that task, not the next", async () => {
+    // A real session's shape and figures: one `general`, two tasks, one
+    // compaction partway through the first. Four user messages, two rows:
+    // paired by position, the compaction request and the "continue" — and the
+    // 258k tokens answering them — were handed to the SECOND task.
+    const provider = new FakeProvider();
+    provider.sessions = [fixtureSession("parent"), { ...fixtureSession("child"), parentId: "parent" }];
+    provider.pages.set("first", { items: [
+      taskRow("prt_t1", 1, "Audit", "child", false, "Read-only audit, do not edit."),
+      taskRow("prt_t2", 9, "Re-audit", "child", true, "Re-audit the current files after fixes."),
+    ] });
+    const listMessages = provider.readMessages.bind(provider);
+    provider.readMessages = async (sessionId, options) => (sessionId === "child" ? { items: [
+      asked("p1", 2, "Read-only audit, do not edit."), answered("m1", 3, "p1", 270_923, 0.27),
+      compactionRequest("pc", 4), answered("mc", 5, "pc", 38_970, 0.04),
+      continued("ps", 6), answered("ms", 7, "ps", 218_840, 0.22),
+      asked("p2", 10, "Re-audit the current files after fixes."), answered("m2", 11, "p2", 23_000, 0.02),
+    ] as never[] } : listMessages(sessionId, options));
+    const rows = rowsOf((await new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g" }).history("parent")).items);
+    expect(rows.map(row => row.usage?.input)).toEqual([528_733, 23_000]);
+    expect(rows.map(row => row.usage?.costUsd)).toEqual([expect.closeTo(0.53, 10), 0.02]);
+  });
+
+  // OpenCode 2.x names the launcher `subagent` and the agent `agent`, and
+  // delivers a new child's first prompt behind its own preamble — so that
+  // prompt never equals the row's. Pairing must still see it as the task's.
+  test("a 2.x subagent that compacted during its first task bills the compaction to that task, not the next", async () => {
+    const subagentRow = (part: string, created: number, description: string, gave: string, resumed: boolean) => ({
+      id: `launch_${part}`, type: "assistant", time: { created },
+      content: [{ id: part, type: "tool", tool: "subagent", callID: part, state: {
+        status: "completed", input: { agent: "general", description, prompt: gave, ...(resumed ? { sessionID: "child" } : {}) },
+        metadata: { sessionID: "child", status: "completed" }, output: '<subagent sessionID="child" state="completed">\ndone\n</subagent>',
+      } }],
+    });
+    const provider = new FakeProvider();
+    provider.sessions = [fixtureSession("parent"), { ...fixtureSession("child"), parentId: "parent" }];
+    provider.pages.set("first", { items: [
+      subagentRow("prt_t1", 1, "Audit", "Read-only audit, do not edit.", false),
+      subagentRow("prt_t2", 9, "Re-audit", "Re-audit the current files after fixes.", true),
+    ] });
+    const listMessages = provider.readMessages.bind(provider);
+    provider.readMessages = async (sessionId, options) => (sessionId === "child" ? { items: [
+      asked("p1", 2, "You are a subagent spawned by another session.\nRead-only audit, do not edit."), answered("m1", 3, "p1", 270_923, 0.27),
+      compactionRequest("pc", 4), answered("mc", 5, "pc", 38_970, 0.04),
+      continued("ps", 6), answered("ms", 7, "ps", 218_840, 0.22),
+      asked("p2", 10, "Re-audit the current files after fixes."), answered("m2", 11, "p2", 23_000, 0.02),
+    ] as never[] } : listMessages(sessionId, options));
+    const rows = rowsOf((await new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g" }).history("parent")).items);
+    expect(rows.map(row => row.childConversationId)).toEqual(["child", "child"]);
+    expect(rows.map(row => row.usage?.input)).toEqual([528_733, 23_000]);
+    expect(rows.map(row => row.usage?.costUsd)).toEqual([expect.closeTo(0.53, 10), 0.02]);
+  });
+
+  // Only the prompt that creates the child carries the preamble. A message
+  // typed into the child during the first task that happens to end with the
+  // next task's prompt is still the first task's.
+  test("a 2.x child message that ends with a later task's prompt does not open that task early", async () => {
+    const subagentRow = (part: string, created: number, gave: string, resumed: boolean) => ({
+      id: `launch_${part}`, type: "assistant", time: { created },
+      content: [{ id: part, type: "tool", tool: "subagent", callID: part, state: {
+        status: "completed", input: { agent: "general", description: part, prompt: gave, ...(resumed ? { sessionID: "child" } : {}) },
+        metadata: { sessionID: "child", status: "completed" }, output: "done",
+      } }],
+    });
+    const provider = new FakeProvider();
+    provider.sessions = [fixtureSession("parent"), { ...fixtureSession("child"), parentId: "parent" }];
+    provider.pages.set("first", { items: [subagentRow("prt_t1", 1, "Audit the renderer.", false), subagentRow("prt_t2", 9, "Run tests", true)] });
+    const listMessages = provider.readMessages.bind(provider);
+    provider.readMessages = async (sessionId, options) => (sessionId === "child" ? { items: [
+      asked("p1", 2, "You are a subagent spawned by another session.\nAudit the renderer."), answered("m1", 3, "p1", 1_000, 0.1),
+      asked("pu", 4, "Before you finish:\nRun tests"), answered("mu", 5, "pu", 2_000, 0.2),
+      asked("p2", 10, "Run tests"), answered("m2", 11, "p2", 300, 0.03),
+    ] as never[] } : listMessages(sessionId, options));
+    const rows = rowsOf((await new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g" }).history("parent")).items);
+    expect(rows.map(row => row.usage?.input)).toEqual([3_000, 300]);
+  });
+
+  test("live, a compaction between two tasks stays with the first as the second task's row and prompt arrive", async () => {
+    const provider = new FakeProvider();
+    provider.sessions = [fixtureSession("parent"), { ...fixtureSession("child"), parentId: "parent" }];
+    provider.pages.set("first", { items: [taskRow("prt_t1", 1, "Audit", "child", false, "Read-only audit, do not edit.")] });
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g", coalesceWindowMs: 1 });
+    await adapter.history("parent");
+    const rows = () => rowsOf(adapter.projectionForTests("parent").items());
+    const user = (id: string) => ({ id: `e-u-${id}`, type: "message.updated", data: { info: { id, sessionID: "child", role: "user", time: { created: 2 } } } });
+    const typed = (id: string, text: string, synthetic = false) => ({ id: `e-t-${id}`, type: "message.part.updated", data: { part: { id: `prt_${id}`, messageID: id, sessionID: "child", type: "text", text, ...(synthetic ? { synthetic: true } : {}) } } });
+    const spent = (id: string, promptId: string, input: number) => ({ id: `e-a-${id}`, type: "message.updated", data: { info: { id, sessionID: "child", role: "assistant", parentID: promptId, modelID: "gpt-5.6-sol", time: { created: 3 }, tokens: { input, output: 0 }, cost: input / 1_000_000 } } });
+    const pump = adapter.startEventPump();
+    for (const event of [
+      user("p1"), typed("p1", "Read-only audit, do not edit."), spent("m1", "p1", 270_923),
+      // The subagent summarises itself: a request with no text, then OpenCode's own "continue".
+      user("pc"), spent("mc", "pc", 38_970),
+      user("ps"), typed("ps", "Continue if you have next steps, or stop and ask for clarification.", true), spent("ms", "ps", 218_840),
+    ]) provider.eventQueue.push(event as never);
+    await waitUntil(() => rows()[0]?.usage?.input === 528_733);
+
+    // The second task: its row in the parent, then its prompt and reply in the child.
+    provider.eventQueue.push({
+      id: "e-row-2", type: "message.part.updated",
+      data: { part: { id: "prt_t2", messageID: "launch_prt_t2", sessionID: "parent", type: "tool", tool: "task", callID: "prt_t2", state: {
+        status: "running", input: { description: "Re-audit", subagent_type: "general", prompt: "Re-audit the current files after fixes.", task_id: "child" }, metadata: { sessionId: "child" },
+      } } },
+    } as never);
+    for (const event of [user("p2"), typed("p2", "Re-audit the current files after fixes."), spent("m2", "p2", 23_000)]) provider.eventQueue.push(event as never);
+    await waitUntil(() => rows()[1]?.usage?.input === 23_000);
+    expect(rows().map(row => row.usage?.input)).toEqual([528_733, 23_000]);
+    await adapter.stopEventPump();
+    await pump;
+  });
+
+  test("a nested subagent launched after a compaction still hangs off the task it was launched during", async () => {
+    const provider = new FakeProvider();
+    provider.sessions = [fixtureSession("parent"), { ...fixtureSession("child"), parentId: "parent" }, { ...fixtureSession("grandchild"), parentId: "child" }];
+    provider.pages.set("first", { items: [taskRow("prt_t1", 1, "Audit", "child", false, "Audit."), taskRow("prt_t2", 9, "Re-audit", "child", true, "Re-audit.")] });
+    const listMessages = provider.readMessages.bind(provider);
+    provider.readMessages = async (sessionId, options) => {
+      // Still the FIRST task when the helper is launched: two of the child's
+      // user messages so far are OpenCode's own, not tasks.
+      if (sessionId === "child") return { items: [asked("p1", 2, "Audit."), compactionRequest("pc", 3), continued("ps", 4), taskRow("prt_g", 5, "Help", "grandchild"), answered("m1", 6, "ps", 1_000, 0.5), asked("p2", 10, "Re-audit."), answered("m2", 11, "p2", 400, 0.2)] as never[] };
+      if (sessionId === "grandchild") return { items: [prompt("pg", 5), reply("mg", 6, 100, 0.1)] as never[] };
+      return listMessages(sessionId, options);
+    };
+    const rows = rowsOf((await new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g" }).history("parent")).items);
+    expect(rows[0]?.descendants).toEqual([expect.objectContaining({ id: "tool:prt_g", parentId: "tool:prt_t1", usage: { input: 100, output: 1, costUsd: 0.1 } })]);
+    expect(rows[1]).not.toHaveProperty("descendants");
+    expect(rows.map(row => row.usage?.costUsd)).toEqual([0.5, 0.2]);
+  });
+
+  test("when no prompt matches any task's, pairing falls back to position rather than piling everything on one row", async () => {
+    // Texts that cannot be compared usefully (a provider that rewrites the
+    // prompt it stores) must not make the second task vanish into the first.
+    const provider = new FakeProvider();
+    provider.sessions = [fixtureSession("parent"), { ...fixtureSession("child"), parentId: "parent" }];
+    provider.pages.set("first", { items: [taskRow("prt_t1", 1, "First", "child", false, "Do the first thing."), taskRow("prt_t2", 5, "Second", "child", true, "Do the second thing.")] });
+    const listMessages = provider.readMessages.bind(provider);
+    provider.readMessages = async (sessionId, options) => (sessionId === "child"
+      ? { items: [asked("p1", 2, "[rewritten] first"), answered("m1", 3, "p1", 1_000, 0.5), asked("p2", 6, "[rewritten] second"), answered("m2", 7, "p2", 400, 0.2)] as never[] }
+      : listMessages(sessionId, options));
+    const rows = rowsOf((await new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g" }).history("parent")).items);
+    expect(rows.map(row => row.usage?.costUsd)).toEqual([0.5, 0.2]);
+  });
+
+  test("after a restart mid-task, a reply that names no prompt answers the newest prompt the store knows", async () => {
+    // The workspace comes up while a reused subagent is on its SECOND task:
+    // the store already holds that task's prompt, the event stream's own
+    // memory of prompts starts empty, and the live record names no `parentID`.
+    // Unpaired, the second task's spend would fall to the first task's row.
+    const provider = new FakeProvider();
+    provider.sessions = [fixtureSession("parent"), { ...fixtureSession("child"), parentId: "parent" }];
+    provider.pages.set("first", { items: [taskRow("prt_t1", 1, "First task"), taskRow("prt_t2", 5, "Second task", "child", true)] });
+    const listMessages = provider.readMessages.bind(provider);
+    provider.readMessages = async (sessionId, options) => (sessionId === "child"
+      ? { items: [prompt("p1", 2), reply("m1", 3, 1_000, 0.5), prompt("p2", 6)] as never[] }
+      : listMessages(sessionId, options));
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g", coalesceWindowMs: 1 });
+    const rows = () => rowsOf(adapter.projectionForTests("parent").items());
+    await adapter.history("parent");
+    expect(rows().map(row => row.usage?.costUsd)).toEqual([0.5, undefined]);
+
+    const unnamed = (id: string, input: number, cost: number) => ({
+      id: `e-${id}-${input}`, type: "message.updated",
+      data: { info: { id, sessionID: "child", role: "assistant", modelID: "gpt-5.6-sol", time: { created: 7 }, tokens: { input, output: input / 100 }, cost } },
+    });
+    const pump = adapter.startEventPump();
+    provider.eventQueue.push(unnamed("m2", 400, 0.2) as never);
+    await waitUntil(() => rows()[1]?.usage?.input === 400);
+    expect(rows().map(row => row.usage)).toEqual([{ input: 1_000, output: 10, costUsd: 0.5 }, { input: 400, output: 4, costUsd: 0.2 }]);
+    // A restatement of the FIRST task's message, equally unnamed, stays where
+    // the store paired it rather than moving to the task running now.
+    provider.eventQueue.push(unnamed("m1", 1_200, 0.6) as never);
+    await waitUntil(() => rows()[0]?.usage?.input === 1_200);
+    expect(rows().map(row => row.usage?.costUsd)).toEqual([0.6, 0.2]);
+    await adapter.stopEventPump();
+    await pump;
+  });
+
+  test("an older page's row keeps its place among all the rows that launched the child", async () => {
+    // Paged history returns some of a child's rows at a time. Placed among
+    // only the rows on its page, the first task's row would be the only row
+    // and claim the whole session.
+    const provider = new FakeProvider();
+    provider.sessions = [fixtureSession("parent"), { ...fixtureSession("child"), parentId: "parent" }];
+    const all = [taskRow("prt_t1", 1, "First task"), taskRow("prt_t2", 5, "Second task", "child", true)];
+    provider.pages.set("first", { items: [all[1]!], configurationItems: all, nextCursor: "older" });
+    provider.pages.set("older", { items: [all[0]!], configurationItems: all });
+    const listMessages = provider.readMessages.bind(provider);
+    provider.readMessages = async (sessionId, options) => (sessionId === "child"
+      ? { items: [prompt("p1", 2), reply("m1", 3, 1_000, 0.5), prompt("p2", 6), reply("m2", 7, 400, 0.2)] as never[] }
+      : listMessages(sessionId, options));
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g" });
+    const first = await adapter.history("parent");
+    expect(rowsOf(first.items).map(row => row.usage?.costUsd)).toEqual([0.5, 0.2]);
+    expect(first.olderCursor).toBeDefined();
+    const older = await adapter.history("parent", { cursor: first.olderCursor });
+    expect(rowsOf(older.items).map(row => [row.id, row.usage?.costUsd])).toEqual([["tool:prt_t1", 0.5]]);
+  });
+
+  test("subagents nest to any depth as lines, each under what launched it, and a change at the bottom reaches the top", async () => {
+    const provider = new FakeProvider();
+    provider.sessions = [fixtureSession("parent"), { ...fixtureSession("child"), parentId: "parent" },
+      { ...fixtureSession("grandchild"), parentId: "child" }, { ...fixtureSession("great"), parentId: "grandchild" }];
+    provider.pages.set("first", { items: [taskRow("prt_c", 1, "Audit docs")] });
+    const listMessages = provider.readMessages.bind(provider);
+    provider.readMessages = async (sessionId, options) => {
+      if (sessionId === "child") return { items: [prompt("pc", 2), taskRow("prt_g", 3, "Find files", "grandchild"), reply("mc", 4, 100, 0.0116)] as never[] };
+      if (sessionId === "grandchild") return { items: [prompt("pg", 4), taskRow("prt_gg", 5, "Count lines", "great"), reply("mg", 6, 200, 0.0119)] as never[] };
+      if (sessionId === "great") return { items: [prompt("pgg", 6), reply("mgg", 7, 300, 0.0136)] as never[] };
+      return listMessages(sessionId, options);
+    };
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g", coalesceWindowMs: 1 });
+    const row = () => rowsOf(adapter.projectionForTests("parent").items())[0];
+    await adapter.history("parent");
+    // Three layers below the conversation: the row is the child's own spend,
+    // and the two below are lines — the second hanging off the first.
+    expect(row()?.usage?.costUsd).toBe(0.0116);
+    expect(row()?.descendants).toEqual([
+      { id: "tool:prt_g", parentId: "tool:prt_c", description: "Find files", subagent: "general", conversationId: "grandchild", model: "gpt-5.6-sol", usage: { input: 200, output: 2, costUsd: 0.0119 } },
+      { id: "tool:prt_gg", parentId: "tool:prt_g", description: "Count lines", subagent: "general", conversationId: "great", model: "gpt-5.6-sol", usage: { input: 300, output: 3, costUsd: 0.0136 } },
+    ]);
+    // Row and lines are what the whole branch cost, each message once.
+    const branch = (row()?.usage?.costUsd ?? 0) + (row()?.descendants ?? []).reduce((sum, line) => sum + (line.usage?.costUsd ?? 0), 0);
+    expect(branch).toBeCloseTo(0.0371);
+
+    const pump = adapter.startEventPump();
+    provider.eventQueue.push({
+      id: "e-deep", type: "message.updated",
+      data: { info: { id: "mgg", sessionID: "great", role: "assistant", parentID: "pgg", modelID: "gpt-5.6-sol", time: { created: 7 }, tokens: { input: 900, output: 9 }, cost: 0.04 } },
+    } as never);
+    await waitUntil(() => row()?.descendants?.[1]?.usage?.costUsd === 0.04);
+    expect(row()?.usage?.costUsd).toBe(0.0116);
+    expect(row()?.descendants?.[0]?.usage?.costUsd).toBe(0.0119);
+    await adapter.stopEventPump();
+    await pump;
+  });
+
+  test("a nested subagent is listed under the task during which it was launched", async () => {
+    const provider = new FakeProvider();
+    provider.sessions = [fixtureSession("parent"), { ...fixtureSession("child"), parentId: "parent" }, { ...fixtureSession("grandchild"), parentId: "child" }];
+    provider.pages.set("first", { items: [taskRow("prt_t1", 1, "First task"), taskRow("prt_t2", 5, "Second task", "child", true)] });
+    const listMessages = provider.readMessages.bind(provider);
+    provider.readMessages = async (sessionId, options) => {
+      // The child launched its helper while answering its SECOND task.
+      if (sessionId === "child") return { items: [prompt("p1", 2), reply("m1", 3, 1_000, 0.5), prompt("p2", 6), taskRow("prt_g", 7, "Help", "grandchild"), reply("m2", 8, 400, 0.2)] as never[] };
+      if (sessionId === "grandchild") return { items: [prompt("pg", 7), reply("mg", 8, 100, 0.1)] as never[] };
+      return listMessages(sessionId, options);
+    };
+    const rows = rowsOf((await new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g" }).history("parent")).items);
+    expect(rows[0]).not.toHaveProperty("descendants");
+    expect(rows[1]?.descendants).toEqual([expect.objectContaining({ id: "tool:prt_g", parentId: "tool:prt_t2", usage: { input: 100, output: 1, costUsd: 0.1 } })]);
+  });
+
+  test("a subagent that launches its own subagent live is listed once its row appears", async () => {
+    const provider = new FakeProvider();
+    provider.sessions = [fixtureSession("parent"), { ...fixtureSession("child"), parentId: "parent" }, { ...fixtureSession("grandchild"), parentId: "child" }];
+    provider.pages.set("first", { items: [taskRow("prt_c", 1, "Audit docs")] });
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g", coalesceWindowMs: 1 });
+    await adapter.history("parent");
+    const row = () => rowsOf(adapter.projectionForTests("parent").items())[0];
+    const pump = adapter.startEventPump();
+    const spend = (id: string, sessionID: string, promptId: string, cost: number) => ({
+      id: `e-${id}`, type: "message.updated",
+      data: { info: { id, sessionID, role: "assistant", parentID: promptId, modelID: "gpt-5.6-sol", time: { created: 3 }, tokens: { input: 100, output: 1 }, cost } },
+    });
+    provider.eventQueue.push(spend("mc", "child", "pc", 0.5) as never);
+    // The child's own timeline gains a launcher row; the conversation above
+    // it has no such row, only the line.
+    provider.eventQueue.push({
+      id: "e-launch", type: "message.part.updated",
+      data: { part: { id: "prt_g", messageID: "mc", sessionID: "child", type: "tool", tool: "task", callID: "prt_g", state: {
+        status: "running", input: { description: "Find files", subagent_type: "explore" }, metadata: { sessionId: "grandchild" },
+      } } },
+    } as never);
+    provider.eventQueue.push(spend("mg", "grandchild", "pg", 0.25) as never);
+    await waitUntil(() => row()?.descendants?.[0]?.usage?.costUsd === 0.25);
+    expect(row()?.usage?.costUsd).toBe(0.5);
+    expect(row()?.descendants).toEqual([{ id: "tool:prt_g", parentId: "tool:prt_c", description: "Find files", subagent: "explore", conversationId: "grandchild", model: "gpt-5.6-sol", usage: { input: 100, output: 1, costUsd: 0.25 } }]);
+
+    // The nested task's tool part is removed (outside any revert): its line
+    // and its cost leave the row above, and — the tally being squared — a
+    // reopen must not bring them back from the launcher record.
+    provider.eventQueue.push({ id: "e-unlaunch", type: "message.part.removed", properties: { sessionID: "child", messageID: "mc", partID: "prt_g" } } as never);
+    await waitUntil(() => row()?.descendants === undefined);
+    expect(row()).not.toHaveProperty("descendants");
+    expect(row()?.usage?.costUsd).toBe(0.5);
+    expect(rowsOf((await adapter.history("parent")).items)[0]).not.toHaveProperty("descendants");
+    await adapter.stopEventPump();
+    await pump;
+  });
+
+  test("a nested launcher removed while its ancestor's stored read is in flight is not banked from that read", async () => {
+    const provider = new FakeProvider();
+    provider.sessions = [fixtureSession("parent"), { ...fixtureSession("child"), parentId: "parent" }, { ...fixtureSession("grandchild"), parentId: "child" }];
+    provider.pages.set("first", { items: [taskRow("prt_c", 1, "Audit docs")] });
+    let releaseChild = () => {};
+    const gate = new Promise<void>(resolve => { releaseChild = resolve; });
+    let childReads = 0;
+    const listMessages = provider.readMessages.bind(provider);
+    provider.readMessages = async (sessionId, options) => {
+      if (sessionId === "child") {
+        childReads += 1;
+        // The store as it was when the read began: the nested launcher is still in it.
+        const stale = { items: [prompt("pc", 2), taskRow("prt_g", 3, "Find files", "grandchild"), reply("mc", 4, 100, 0.5)] as never[] };
+        await gate;
+        return stale;
+      }
+      if (sessionId === "grandchild") return { items: [prompt("pg", 4), reply("mg", 5, 100, 0.25)] as never[] };
+      return listMessages(sessionId, options);
+    };
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g", coalesceWindowMs: 1 });
+    const pump = adapter.startEventPump();
+    const opening = adapter.history("parent");
+    await waitUntil(() => childReads === 1);
+    // The removal lands mid-read, when no launcher record exists to edit yet.
+    provider.eventQueue.push({ id: "e-unlaunch", type: "message.part.removed", properties: { sessionID: "child", messageID: "mc", partID: "prt_g" } } as never);
+    // Release the read only once the pump has handled the removal; a fixed
+    // 20 ms sleep lost that race under `bun test --parallel`.
+    await liveEventsApplied(adapter, provider);
+    releaseChild();
+    const opened = rowsOf((await opening).items)[0];
+    expect(opened?.usage?.costUsd).toBe(0.5);
+    expect(opened).not.toHaveProperty("descendants");
+    // Squared without it: a reopen reads nothing more and lists nothing more.
+    expect(rowsOf((await adapter.history("parent")).items)[0]).not.toHaveProperty("descendants");
+    expect(childReads).toBe(1);
+    await adapter.stopEventPump();
+    await pump;
+  });
+
+  test("a figure seen live before a read does not overwrite what the store says now", async () => {
+    const provider = new FakeProvider();
+    provider.sessions = [fixtureSession("parent"), { ...fixtureSession("child"), parentId: "parent" }];
+    provider.pages.set("first", { items: [{
+      id: "launch", type: "assistant", time: { created: 1 },
+      content: [{ id: "prt_task", type: "tool", tool: "task", callID: "c1", state: { status: "completed", input: { description: "Review", subagent_type: "explore" }, metadata: { sessionId: "child" }, output: "done" } }],
+    }] });
+    // The store already holds the child's final figure.
+    const listMessages = provider.readMessages.bind(provider);
+    provider.readMessages = async (sessionId, options) => {
+      if (sessionId === "child") return { items: [{ id: "child_msg", type: "assistant", modelID: "gpt-5.6-sol", providerID: "openai", time: { created: 2 }, tokens: { input: 300, output: 30 }, cost: 0.75 }] as never[] };
+      return listMessages(sessionId, options);
+    };
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g", coalesceWindowMs: 1 });
+    const pump = adapter.startEventPump();
+    // A partial figure for that message was seen live earlier — before the
+    // stream dropped and the child finished — and banked with no parent open.
+    provider.eventQueue.push({
+      id: "e-part", type: "message.part.updated",
+      data: { part: { id: "prt_c", messageID: "child_msg", sessionID: "child", type: "text", text: "partial" } },
+    } as never);
+    provider.eventQueue.push({
+      id: "e-msg", type: "message.updated",
+      data: { info: { id: "child_msg", sessionID: "child", role: "assistant", modelID: "gpt-5.6-sol", time: { created: 2 }, tokens: { input: 100, output: 10 }, cost: 0.25 } },
+    } as never);
+    await liveEventsApplied(adapter, provider);
+    // Opening the parent reads the store: its final figure stands, the
+    // older live one does not overwrite it — and the tally is squared.
+    const snapshot = await adapter.history("parent");
+    expect(snapshot.items.find(item => item.type === "tool")).toEqual(expect.objectContaining({ usage: { input: 300, output: 30, costUsd: 0.75 } }));
+    await adapter.stopEventPump();
+    await pump;
+  });
+
+  test("removing a grandchild's message takes its spend off its line", async () => {
+    const provider = new FakeProvider();
+    provider.sessions = [fixtureSession("parent"), { ...fixtureSession("child"), parentId: "parent" }, { ...fixtureSession("grandchild"), parentId: "child" }];
+    const launcher = (id: string, target: string) => ({
+      id, type: "assistant", time: { created: 1 },
+      content: [{ id: `prt_${id}`, type: "tool", tool: "task", callID: id, state: { status: "completed", input: { description: `Run ${target}`, subagent_type: "explore" }, metadata: { sessionId: target }, output: "done" } }],
+    });
+    provider.pages.set("first", { items: [launcher("launch_child", "child")] });
+    const listMessages = provider.readMessages.bind(provider);
+    provider.readMessages = async (sessionId, options) => {
+      if (sessionId === "child") return { items: [launcher("launch_grandchild", "grandchild")] as never[] };
+      if (sessionId === "grandchild") return { items: [{ id: "grandchild_msg", type: "assistant", modelID: "gpt-5.6-sol", providerID: "openai", time: { created: 2 }, tokens: { input: 100, output: 10 }, cost: 0.25 }] as never[] };
+      return listMessages(sessionId, options);
+    };
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g", coalesceWindowMs: 1 });
+    const row = () => adapter.projectionForTests("parent").items().find(item => item.type === "tool") as ToolItem | undefined;
+    await adapter.history("parent");
+    // The child spent nothing itself: the row asserts no figure, the line does.
+    expect(row()).not.toHaveProperty("usage");
+    expect(row()?.descendants?.[0]?.usage).toEqual({ input: 100, output: 10, costUsd: 0.25 });
+    // The grandchild's only priced message is removed (a revert below): its
+    // line stays — the subagent did run — but states no spend any more.
+    const pump = adapter.startEventPump();
+    provider.eventQueue.push({ id: "remove", type: "message.removed", properties: { sessionID: "grandchild", messageID: "grandchild_msg" } } as never);
+    await waitUntil(() => row()?.descendants?.[0]?.usage === undefined);
+    // Its model went with it: the message that named it is gone.
+    expect(row()?.descendants).toEqual([{ id: "tool:prt_launch_grandchild", parentId: "tool:prt_launch_child", description: "Run grandchild", subagent: "explore", conversationId: "grandchild" }]);
+    await adapter.stopEventPump();
+    await pump;
+  });
+
+  test("a revert inside a subagent takes the reverted spend off the parent's row", async () => {
+    const provider = new FakeProvider();
+    provider.agent.capabilities.push("reversible-history");
+    provider.sessions = [fixtureSession("parent"), { ...fixtureSession("child"), parentId: "parent" }];
+    const historyState = { staged: true, canUndo: false, canRedo: true, revertedMessages: [] };
+    provider.getReversibleHistoryState = async () => historyState;
+    provider.undo = async () => ({ outcome: "changed", state: historyState });
+    provider.redo = async () => ({ outcome: "changed", state: historyState });
+    provider.revert = async () => ({ outcome: "changed", state: historyState });
+    provider.restore = async () => ({ outcome: "changed", state: historyState });
+    const priced = (id: string, cost: number) => ({ id, type: "assistant", modelID: "gpt-5.6-sol", providerID: "openai", time: { created: 2 }, tokens: { input: 100, output: 10 }, cost, content: [{ id: `prt_${id}`, type: "text", text: id }] });
+    let childVisible = [priced("child_a", 0.5), priced("child_b", 0.25)];
+    provider.pages.set("first", { items: [{
+      id: "launch", type: "assistant", time: { created: 1 },
+      content: [{ id: "prt_task", type: "tool", tool: "task", callID: "c1", state: { status: "completed", input: { description: "Review", subagent_type: "explore" }, metadata: { sessionId: "child" }, output: "done" } }],
+    }] });
+    const listMessages = provider.readMessages.bind(provider);
+    provider.readMessages = async (sessionId, options) => (sessionId === "child" ? { items: childVisible as never[] } : listMessages(sessionId, options));
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g", coalesceWindowMs: 1 });
+    const row = () => adapter.projectionForTests("parent").items().find(item => item.type === "tool") as { usage?: { input?: number; output?: number; costUsd?: number } } | undefined;
+    await adapter.history("parent");
+    expect(row()?.usage?.costUsd).toBe(0.75);
+
+    // The child's second message is reverted: its store now holds one
+    // message, and the lifecycle event is all the parent hears about it.
+    const pump = adapter.startEventPump();
+    childVisible = [priced("child_a", 0.5)];
+    provider.eventQueue.push({ type: "session.next.revert.staged", data: { sessionID: "child" } } as never);
+    while (row()?.usage?.costUsd !== 0.5) await Bun.sleep(1);
+    expect(row()?.usage).toEqual({ input: 100, output: 10, costUsd: 0.5 });
+    // Squared against the rewritten store: a reopen reads the same figure.
+    expect((await adapter.history("parent")).items.find(item => item.type === "tool")).toEqual(expect.objectContaining({ usage: { input: 100, output: 10, costUsd: 0.5 } }));
+    await adapter.stopEventPump();
+    await pump;
+  });
+
+  test("a revert inside a subagent given two tasks withdraws only the reverted task's spend", async () => {
+    const provider = new FakeProvider();
+    provider.agent.capabilities.push("reversible-history");
+    provider.sessions = [fixtureSession("parent"), { ...fixtureSession("child"), parentId: "parent" }];
+    const historyState = { staged: true, canUndo: false, canRedo: true, revertedMessages: [] };
+    provider.getReversibleHistoryState = async () => historyState;
+    provider.undo = async () => ({ outcome: "changed", state: historyState });
+    provider.redo = async () => ({ outcome: "changed", state: historyState });
+    provider.revert = async () => ({ outcome: "changed", state: historyState });
+    provider.restore = async () => ({ outcome: "changed", state: historyState });
+    provider.pages.set("first", { items: [taskRow("prt_t1", 1, "First task"), taskRow("prt_t2", 5, "Second task", "child", true)] });
+    let childVisible: unknown[] = [prompt("p1", 2), reply("m1", 3, 1_000, 0.5), prompt("p2", 6), reply("m2", 7, 400, 0.2)];
+    const listMessages = provider.readMessages.bind(provider);
+    provider.readMessages = async (sessionId, options) => (sessionId === "child" ? { items: childVisible as never[] } : listMessages(sessionId, options));
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g", coalesceWindowMs: 1 });
+    const rows = () => rowsOf(adapter.projectionForTests("parent").items());
+    await adapter.history("parent");
+    expect(rows().map(row => row.usage?.costUsd)).toEqual([0.5, 0.2]);
+
+    // The second task is reverted out of the child's store. Its row stays —
+    // the parent still launched it — but states no spend; the first is whole.
+    const pump = adapter.startEventPump();
+    childVisible = [prompt("p1", 2), reply("m1", 3, 1_000, 0.5)];
+    provider.eventQueue.push({ type: "session.next.revert.staged", data: { sessionID: "child" } } as never);
+    await waitUntil(() => rows()[1]?.usage === undefined);
+    expect(rows()[0]?.usage).toEqual({ input: 1_000, output: 10, costUsd: 0.5 });
+    expect(rows()[1]).not.toHaveProperty("usage");
+    expect(rowsOf((await adapter.history("parent")).items).map(row => row.usage?.costUsd)).toEqual([0.5, undefined]);
+    await adapter.stopEventPump();
+    await pump;
+  });
+
+  test("a reversible-history replacement of the parent keeps its subagents' spend on their rows", async () => {
+    const provider = new FakeProvider();
+    provider.agent.capabilities.push("reversible-history");
+    provider.sessions = [fixtureSession("parent"), { ...fixtureSession("child"), parentId: "parent" }];
+    const historyState = { staged: true, canUndo: false, canRedo: true, revertedMessages: [] };
+    provider.getReversibleHistoryState = async () => historyState;
+    provider.undo = async () => ({ outcome: "changed", state: historyState });
+    provider.redo = async () => ({ outcome: "changed", state: historyState });
+    provider.revert = async () => ({ outcome: "changed", state: historyState });
+    provider.restore = async () => ({ outcome: "changed", state: historyState });
+    const launcher = {
+      id: "launch", type: "assistant", time: { created: 1 },
+      content: [{ id: "prt_task", type: "tool", tool: "task", callID: "c1", state: { status: "completed", input: { description: "Review", subagent_type: "explore" }, metadata: { sessionId: "child" }, output: "done" } }],
+    };
+    let parentVisible = [launcher, { id: "later", type: "user", time: { created: 5 }, text: "discard me" }];
+    const listMessages = provider.readMessages.bind(provider);
+    provider.readMessages = async (sessionId, options) => {
+      if (sessionId === "child") return { items: [{ id: "child_msg", type: "assistant", modelID: "gpt-5.6-sol", providerID: "openai", time: { created: 2 }, tokens: { input: 100, output: 10 }, cost: 0.5 }] as never[] };
+      if (sessionId === "parent") return { items: parentVisible as never[] };
+      return listMessages(sessionId, options);
+    };
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g", coalesceWindowMs: 1 });
+    const row = () => adapter.projectionForTests("parent").items().find(item => item.type === "tool") as { usage?: { costUsd?: number } } | undefined;
+    await adapter.history("parent");
+    expect(row()?.usage?.costUsd).toBe(0.5);
+
+    // The parent's own later prompt is reverted: its history is replaced
+    // with the provider's raw rows, and the launcher keeps its child's spend.
+    const pump = adapter.startEventPump();
+    parentVisible = [launcher];
+    provider.eventQueue.push({ type: "session.next.revert.staged", data: { sessionID: "parent" } } as never);
+    while (adapter.projectionForTests("parent").items().some(item => item.id === "message:later")) await Bun.sleep(1);
+    expect(row()?.usage?.costUsd).toBe(0.5);
     await adapter.stopEventPump();
     await pump;
   });
@@ -2742,7 +4129,7 @@ describe("pending permission recovery", () => {
       id: "e2", type: "message.part.updated",
       data: { part: { id: "prt_c", messageID: "msg", sessionID: "child", type: "text", text: "working" } },
     } as never);
-    await Bun.sleep(20);
+    await liveEventsApplied(adapter, provider);
     const row = adapter.projectionForTests("parent").items().find(item => item.type === "tool");
     // Still named, still carrying a status; simply nothing claimed about cost.
     expect(row).toEqual(expect.objectContaining({ id: "tool:prt_task", name: "task", input: JSON.stringify({ description: "Audit styles" }) }));
@@ -2831,9 +4218,11 @@ describe("pending permission recovery", () => {
     // snapshot it eventually returns is older than what the child reports
     // live while it is pending.
     let release: () => void = () => {};
+    let reconstructionReads = 0;
     const listMessages = provider.readMessages.bind(provider);
     provider.readMessages = async (sessionId, options) => {
       if (sessionId !== "child") return listMessages(sessionId, options);
+      reconstructionReads += 1;
       await new Promise<void>(resolve => { release = resolve; });
       return { items: [
         { id: "msg_a", type: "assistant", modelID: "claude-haiku", time: { created: 2 }, tokens: { input: 500, output: 5, cache: { read: 0, write: 0 } } },
@@ -2843,12 +4232,12 @@ describe("pending permission recovery", () => {
     const pump = adapter.startEventPump();
 
     const opening = adapter.history("parent");
-    await Bun.sleep(5); // the reconstruction is now blocked inside the read
+    await waitUntil(() => reconstructionReads === 1); // the reconstruction is now blocked inside the read
     provider.eventQueue.push({
       id: "e-live", type: "message.updated",
       data: { info: { id: "msg_a", sessionID: "child", role: "assistant", modelID: "gpt-5", time: { created: 3 }, tokens: { input: 900, output: 20, cache: { read: 0, write: 0 } } } },
     } as never);
-    await Bun.sleep(20); // let the live attribution land before the read returns
+    await liveEventsApplied(adapter, provider); // the live attribution lands before the read returns
     release();
 
     // Both the returned snapshot and later opens carry the live figure — the
@@ -2894,7 +4283,7 @@ describe("pending permission recovery", () => {
     const second = adapter.history("parent");
     while (childReads === 0) await Bun.sleep(1);
     provider.eventQueue.push({ id: "remove", type: "message.removed", properties: { sessionID: "child", messageID: "msg_removed" } } as never);
-    await Bun.sleep(20);
+    await liveEventsApplied(adapter, provider);
     release();
 
     for (const snapshot of await Promise.all([first, second])) {
@@ -2936,7 +4325,7 @@ describe("pending permission recovery", () => {
       id: "live", type: "message.updated",
       properties: { info: { id: "msg_live", sessionID: "child", role: "assistant", time: { created: 3 }, tokens: { input: 900 } } },
     } as never);
-    await Bun.sleep(20);
+    await liveEventsApplied(adapter, provider);
     adapter.projectionForTests("other-1");
     adapter.projectionForTests("other-2");
     childStore = [...childStore, { id: "msg_live", type: "assistant", time: { created: 3 }, tokens: { input: 900 } }];
@@ -3117,7 +4506,7 @@ describe("pending permission recovery", () => {
     adapter.projectionForTests("other-2");
 
     report("b", 700);
-    await Bun.sleep(20);
+    await liveEventsApplied(adapter, provider);
 
     // Reopened, the partial rebuild must not pass for the whole answer: the
     // pre-eviction 500 is recovered from the child's store and merged with
@@ -3153,6 +4542,32 @@ describe("pending permission recovery", () => {
     provider.sessions = [fixtureSession("local")];
     const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g" });
     expect((await adapter.history("local")).items).toEqual([]);
+  });
+
+  test("a reply keeps the tool row the ask named", async () => {
+    const provider = new FakeProvider();
+    provider.sessions = [fixtureSession("local")];
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g" });
+    // The ask names the call (2.x `source`); the reply names nothing but
+    // the request. The resolved card must still know which row it was about.
+    applyEvent(adapter, "local", {
+      id: "ask",
+      type: "permission.asked",
+      data: { id: "perm_mcp", sessionID: "local", action: "tracker_create_issue", resources: ["*"], save: ["*"], metadata: {}, source: { type: "tool", messageID: "msg_1", id: "call_1" }, timestamp: 10 },
+    } as never);
+    applyEvent(adapter, "local", {
+      id: "reply",
+      type: "permission.replied",
+      data: { sessionID: "local", requestID: "perm_mcp", reply: "once", timestamp: 11 },
+    } as never);
+    expect(adapter.projectionForTests("local").items()).toEqual([expect.objectContaining({
+      id: "permission:perm_mcp",
+      status: "resolved",
+      outcome: "approved-once",
+      action: "tracker_create_issue",
+      resources: ["*"],
+      sourceToolId: "tool:call_1",
+    })]);
   });
 
   test("a resolution whose ask was never projected is suppressed, not published invalid", async () => {
@@ -3600,5 +5015,282 @@ describe("image-only prompts reach the provider", () => {
     expect(accepted.held).toBe(false);
     expect(provider.prompts[0]).toEqual(expect.objectContaining({ text: "", attachments: [expect.objectContaining({ id: "11111111-2222-4333-8444-555555555555" })] }));
     await expect(adapter.prompt("session2", "r2", "")).rejects.toThrow("prompt must not be empty");
+  });
+});
+
+describe("workspace activity summary", () => {
+  function activityAdapter(options: { maxProjections?: number } = {}) {
+    let changes = 0;
+    const provider = new FakeProvider();
+    const adapter = new ChatAdapter({
+      provider,
+      workspacePath: process.cwd(),
+      generation: "activity",
+      onActivityChange: () => { changes += 1; },
+      ...options,
+    });
+    return { adapter, provider, changes: () => changes };
+  }
+
+  function permission(requestId: string, status: "pending" | "resolved" = "pending"): ConversationItem {
+    return {
+      id: `permission:${requestId}`,
+      type: "permission",
+      createdAt: 1,
+      requestId,
+      action: "edit",
+      resources: ["README.md"],
+      status,
+      ...(status === "resolved" ? { outcome: "approved-once" as const } : {}),
+    };
+  }
+
+  function question(requestId: string): ConversationItem {
+    return {
+      id: `question:${requestId}`,
+      type: "question",
+      createdAt: 1,
+      requestId,
+      questions: [{ prompt: "Proceed?", header: "Proceed", options: [], multiple: false, allowFreeForm: true }],
+      status: "pending",
+    };
+  }
+
+  test("a turn in flight in any conversation is working, and only a change of the summary is reported", () => {
+    const { adapter, changes } = activityAdapter();
+    expect(adapter.activity()).toEqual({ working: false, awaiting: false });
+    adapter.projectionForTests("a").apply({ kind: "status", status: "running" });
+    expect(adapter.activity()).toEqual({ working: true, awaiting: false });
+    expect(changes()).toBe(1);
+    // A second live turn, and the first ending while the second runs, leave
+    // the summary where it was.
+    adapter.projectionForTests("b").apply({ kind: "status", status: "compacting" });
+    adapter.projectionForTests("a").apply({ kind: "status", status: "completed" });
+    expect(adapter.activity()).toEqual({ working: true, awaiting: false });
+    expect(changes()).toBe(1);
+    adapter.projectionForTests("b").apply({ kind: "status", status: "idle" });
+    expect(adapter.activity()).toEqual({ working: false, awaiting: false });
+    expect(changes()).toBe(2);
+  });
+
+  test("a turn that ends into live background work keeps the workspace working without a change", () => {
+    const { adapter, changes } = activityAdapter();
+    adapter.projectionForTests("a").apply({ kind: "status", status: "running" });
+    expect(adapter.activity()).toEqual({ working: true, awaiting: false });
+    expect(changes()).toBe(1);
+    // The turn ended but the agent still holds a backgrounded task: the
+    // summary reads the same, so nothing is reported.
+    adapter.projectionForTests("a").apply({ kind: "status", status: "background" });
+    expect(adapter.activity()).toEqual({ working: true, awaiting: false });
+    expect(changes()).toBe(1);
+  });
+
+  test("background work going quiet stops working with exactly one change", () => {
+    const { adapter, changes } = activityAdapter();
+    adapter.projectionForTests("a").apply({ kind: "status", status: "running" });
+    adapter.projectionForTests("a").apply({ kind: "status", status: "background" });
+    expect(changes()).toBe(1);
+    adapter.projectionForTests("a").apply({ kind: "status", status: "idle" });
+    expect(adapter.activity()).toEqual({ working: false, awaiting: false });
+    expect(changes()).toBe(2);
+  });
+
+  test("a conversation deleted while in background stops counting as working", async () => {
+    const { adapter, provider, changes } = activityAdapter();
+    const local = fixtureSession("a");
+    provider.sessions = [local];
+    const pump = adapter.startEventPump();
+    adapter.projectionForTests("a").apply({ kind: "status", status: "running" });
+    adapter.projectionForTests("a").apply({ kind: "status", status: "background" });
+    expect(adapter.activity()).toEqual({ working: true, awaiting: false });
+    const before = changes();
+    provider.sessions = [];
+    provider.eventQueue.push({ type: "session.deleted", data: { info: local } });
+    await waitUntil(() => changes() > before);
+    await Bun.sleep(20);
+    expect(adapter.activity()).toEqual({ working: false, awaiting: false });
+    expect(changes() - before).toBe(1);
+    await adapter.dispose();
+    await pump;
+  });
+
+  test("a pending permission or question awaits the user until it settles or is withdrawn", () => {
+    const { adapter, changes } = activityAdapter();
+    adapter.projectionForTests("a").apply({ kind: "upsert", item: permission("p1") });
+    expect(adapter.activity()).toEqual({ working: false, awaiting: true });
+    expect(changes()).toBe(1);
+    adapter.projectionForTests("b").apply({ kind: "upsert", item: question("q1") });
+    adapter.projectionForTests("a").apply({ kind: "upsert", item: permission("p1", "resolved") });
+    expect(adapter.activity().awaiting).toBe(true);
+    expect(changes()).toBe(1);
+    adapter.projectionForTests("b").apply({ kind: "remove", itemId: "question:q1" });
+    expect(adapter.activity()).toEqual({ working: false, awaiting: false });
+    expect(changes()).toBe(2);
+    // A resync rewrite rebuilds the timeline from history, which carries no
+    // requests: what it drops no longer counts.
+    adapter.projectionForTests("a").apply({ kind: "upsert", item: permission("p2") });
+    expect(adapter.activity().awaiting).toBe(true);
+    adapter.projectionForTests("a").replace([]);
+    expect(adapter.activity().awaiting).toBe(false);
+  });
+
+  test("a waiting request outlives its conversation's eviction and clears on a content-less resolution", () => {
+    const { adapter } = activityAdapter({ maxProjections: 1 });
+    adapter.projectionForTests("a").apply({ kind: "upsert", item: permission("p1") });
+    // Opening another conversation evicts the quiet one — and a conversation
+    // blocked on the user is exactly the quiet one.
+    adapter.projectionForTests("b");
+    const recreated = adapter.projectionForTests("a");
+    expect(recreated.has("permission:p1")).toBe(false);
+    expect(adapter.activity().awaiting).toBe(true);
+    // The classic reply event carries no action or resources, so the fresh
+    // projection drops it for lack of content — but it still settles the
+    // request.
+    recreated.apply({ kind: "upsert", item: { ...permission("p1", "resolved"), resources: [] } as ConversationItem });
+    expect(recreated.has("permission:p1")).toBe(false);
+    expect(adapter.activity().awaiting).toBe(false);
+  });
+
+  // Once a conversation leaves the workspace, requireSession rejects its later
+  // events, so nothing else would ever settle its turn or its request.
+  for (const leave of ["moved out of the workspace", "deleted"] as const) {
+    for (const [kind, request] of [["permission", permission("p1")], ["question", question("q1")]] as const) {
+      test(`a running conversation with a pending ${kind} stops counting once ${leave}`, async () => {
+        const { adapter, provider, changes } = activityAdapter();
+        const local = fixtureSession("a");
+        provider.sessions = [local];
+        const pump = adapter.startEventPump();
+        adapter.projectionForTests("a").apply({ kind: "status", status: "running" });
+        adapter.projectionForTests("a").apply({ kind: "upsert", item: request });
+        expect(adapter.activity()).toEqual({ working: true, awaiting: true });
+        const before = changes();
+
+        if (leave === "deleted") {
+          provider.sessions = [];
+          provider.eventQueue.push({ type: "session.deleted", data: { info: local } });
+        } else {
+          const moved = fixtureSession("a", `${process.cwd()}-moved`);
+          provider.sessions = [moved];
+          provider.eventQueue.push({ type: "session.updated", data: { info: moved } });
+        }
+        await waitUntil(() => changes() > before);
+        await Bun.sleep(20);
+        expect(adapter.activity()).toEqual({ working: false, awaiting: false });
+        expect(changes() - before).toBe(1);
+
+        if (leave === "moved out of the workspace") {
+          // Moving back re-derives activity from new events; the request the
+          // move-out forgot is not resurrected from the retained timeline.
+          provider.sessions = [local];
+          provider.eventQueue.push({ type: "session.updated", data: { info: local } });
+          provider.eventQueue.push({ type: "session.status", data: { sessionID: "a", status: { type: "busy" } } });
+          await waitUntil(() => adapter.activity().working);
+          expect(adapter.activity()).toEqual({ working: true, awaiting: false });
+          expect(changes() - before).toBe(2);
+        }
+
+        await adapter.dispose();
+        await pump;
+      });
+    }
+  }
+
+  test("any lookup that finds a conversation outside the workspace forgets its activity", async () => {
+    for (const lookup of [
+      (adapter: ChatAdapter) => adapter.listConversations(),
+      (adapter: ChatAdapter) => adapter.getConversation("a").catch(() => undefined),
+    ]) {
+      const { adapter, provider, changes } = activityAdapter();
+      adapter.projectionForTests("a").apply({ kind: "status", status: "running" });
+      adapter.projectionForTests("a").apply({ kind: "upsert", item: permission("p1") });
+      const before = changes();
+      provider.sessions = [fixtureSession("a", `${process.cwd()}-moved`)];
+      await lookup(adapter);
+      expect(adapter.activity()).toEqual({ working: false, awaiting: false });
+      expect(changes() - before).toBe(1);
+    }
+  });
+
+  test("a conversation that stays in the workspace keeps its activity through lifecycle updates", async () => {
+    const { adapter, provider, changes } = activityAdapter();
+    const local = fixtureSession("a");
+    provider.sessions = [local];
+    const pump = adapter.startEventPump();
+    adapter.projectionForTests("a").apply({ kind: "status", status: "running" });
+    adapter.projectionForTests("a").apply({ kind: "upsert", item: permission("p1") });
+    const before = changes();
+    const inventory = adapter.subscribeInventory();
+    await expectInventorySignal(inventory);
+    provider.eventQueue.push({ type: "session.updated", data: { info: { ...local, title: "Renamed" } } });
+    await expectInventorySignal(inventory);
+    await adapter.listConversations();
+    await adapter.getConversation("a");
+    expect(adapter.activity()).toEqual({ working: true, awaiting: true });
+    expect(changes()).toBe(before);
+    inventory.cancel();
+    await adapter.dispose();
+    await pump;
+  });
+});
+
+describe("plan usage on demand", () => {
+  test("a read is gated on the capability, idempotent per request, and joined across concurrent requests", async () => {
+    const provider = new FakeProvider();
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd() });
+    await expect(adapter.usage()).rejects.toThrow(UsageUnsupportedError);
+    await expect(adapter.readUsage("req-1", "start")).rejects.toThrow(UsageUnsupportedError);
+    provider.agent = { ...provider.agent, capabilities: [...provider.agent.capabilities, "usage"] };
+    let reads = 0;
+    let release!: () => void;
+    const report = { plan: { fiveHour: { utilization: 9 } }, readAt: 5 };
+    (provider as unknown as { usageReport: () => Promise<unknown> }).usageReport = async () => undefined;
+    (provider as unknown as { readUsage: (mode: string) => Promise<unknown> }).readUsage = mode => {
+      reads += 1;
+      expect(mode).toBe("start");
+      return new Promise(resolve => { release = () => resolve({ report }); });
+    };
+    expect(await adapter.usage()).toBeNull();
+    const first = adapter.readUsage("req-1", "start");
+    const second = adapter.readUsage("req-2", "start");
+    await Bun.sleep(1);
+    release();
+    expect(await first).toEqual({ report });
+    expect(await second).toEqual({ report });
+    expect(reads).toBe(1);
+    // The same request id replays its receipt without a new read.
+    expect(await adapter.readUsage("req-1", "start")).toEqual({ report });
+    expect(reads).toBe(1);
+    // A later request reads again.
+    const third = adapter.readUsage("req-3", "start");
+    await Bun.sleep(1);
+    release();
+    await third;
+    expect(reads).toBe(2);
+  });
+
+  test("a start asked during a live-only read runs after it instead of inheriting no-live-session", async () => {
+    const provider = new FakeProvider();
+    provider.agent = { ...provider.agent, capabilities: [...provider.agent.capabilities, "usage"] };
+    const modes: string[] = [];
+    const settle: Array<(value: unknown) => void> = [];
+    (provider as unknown as { readUsage: (mode: string) => Promise<unknown> }).readUsage = mode => {
+      modes.push(mode);
+      return new Promise(resolve => { settle.push(resolve); });
+    };
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd() });
+    const quiet = adapter.readUsage("req-1", "live-only");
+    const click = adapter.readUsage("req-2", "start");
+    // A live-only asked while the start is queued joins the start: it answers at least as much.
+    const another = adapter.readUsage("req-3", "live-only");
+    await Bun.sleep(1);
+    expect(modes).toEqual(["live-only"]);
+    settle[0]!({ report: null, reason: "no-live-session" });
+    expect(await quiet).toEqual({ report: null, reason: "no-live-session" });
+    await Bun.sleep(1);
+    expect(modes).toEqual(["live-only", "start"]);
+    const report = { plan: {}, readAt: 9 };
+    settle[1]!({ report });
+    expect(await click).toEqual({ report });
+    expect(await another).toEqual({ report });
   });
 });

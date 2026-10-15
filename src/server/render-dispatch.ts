@@ -38,6 +38,34 @@ export type RenderDocumentOptions = {
   view?: ViewMode;
 };
 
+// The HTTP status `/api/document` answers a `renderDocument` failure with.
+// A failure that will not clear on its own is a final 4xx, so the client
+// shows one notice instead of retrying:
+// - 404: the index does not hold the id, or the indexed path no longer
+//   resolves to a readable file (ENOENT, ENOTDIR, EISDIR, ELOOP,
+//   ENAMETOOLONG). The watcher reports the change that caused it.
+// - 403: the process is not allowed to read the file (EACCES, EPERM; macOS
+//   privacy protection surfaces as EPERM). Stable until someone changes the
+//   permissions.
+// - 415: a binary document.
+// Anything else (a renderer that throws, EMFILE, ENFILE, EAGAIN, EBUSY, EIO,
+// an unrecognized error) is the server failing or a condition that may
+// clear: a 500, which the client retries on its bounded schedule.
+const NOT_FOUND_CODES = new Set(["ENOENT", "ENOTDIR", "EISDIR", "ELOOP", "ENAMETOOLONG"]);
+const NOT_READABLE_CODES = new Set(["EACCES", "EPERM"]);
+
+export function documentErrorStatus(error: unknown): 403 | 404 | 415 | 500 {
+  const message = error instanceof Error ? error.message : "";
+  if (message === "document not found") return 404;
+  if (message === "document is binary") return 415;
+  const code = (error as { code?: unknown } | null)?.code;
+  if (typeof code === "string") {
+    if (NOT_FOUND_CODES.has(code)) return 404;
+    if (NOT_READABLE_CODES.has(code)) return 403;
+  }
+  return 500;
+}
+
 export async function renderDocument(
   roots: RootGroup[],
   documentId: string,
@@ -53,8 +81,8 @@ export async function renderDocument(
   }
 
   const source = await fs.readFile(document.id, "utf8");
-  // Facts collection (stat + two git subprocesses) overlaps the render work
-  // below; awaited just before assembling the payload.
+  // Filesystem facts overlap rendering. Git provenance is requested by the
+  // browser independently and cannot delay this content response.
   // The root group always exists for a found document; the dirname fallback
   // is a type-level guard only.
   const rootPath = roots.find(root => root.id === document.rootId)?.path ?? path.dirname(document.id);
@@ -62,6 +90,7 @@ export async function renderDocument(
     absolutePath: document.id,
     rootPath,
     source,
+    includeGit: false,
   });
   const requestedView: ViewMode = options.view ?? "rendered";
   // Text / source files have no separate rendered representation, so a

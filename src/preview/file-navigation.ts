@@ -145,6 +145,9 @@ export function initPreviewFileNavigation(): void {
     try {
       await refreshServerStateForContext();
       if (!current()) return;
+      // A current snapshot can still be indexing. Do not turn a partial
+      // inventory into a missing-target verdict or an apparent boundary.
+      if (corpusStatus() !== "ready") return;
       if (!target || fileSiblings(appState.roots, appState.scope, target).kind !== "ready") {
         recoveryGeneration = generation;
         recoveryError = "Selected file is unavailable in the current scope.";

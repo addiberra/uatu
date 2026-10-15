@@ -22,10 +22,17 @@ const ALLOWED_FILES = new Set([
   // Hub-level URLs are origin-rooted on purpose: the hub's API lives
   // OUTSIDE the session's base path, so appUrl() must not touch them.
   "src/shell/hub-nav.ts",
+  // The brokered live stream is a hub route too (design D2): the protocol
+  // module names it and the child routes the hub subscribes to.
+  "src/shared/live-protocol.ts",
   // The legacy-worker cleanup MATCHES a historical script path rather than
   // building a URL to request, and it has to match it at the origin root as
   // well as under the base path — appUrl() can only produce the latter.
   "src/shell/pwa.ts",
+  // OpenCode's own loopback server: the readiness probe names OpenCode's
+  // routes (`/api/info` on 2.x), which live on the spawned agent process,
+  // never in the workspace's URL space that appUrl() relocates.
+  "src/chat/opencode/opencode-service.ts",
   // Server-side route matching / response construction:
   "src/terminal/sessions-route.ts",
   "src/terminal/auth.ts",
@@ -36,7 +43,7 @@ const ALLOWED_DIRS = ["src/server/", "src/cli/", "src/watchdog/", "src/debug/", 
 
 // A root-relative URL literal is only an offense when it is not the direct
 // argument of the appUrl() chokepoint.
-const URL_LITERAL = /(?<!appUrl\()["'`]\/(api\/|api["'`]|assets\/|sw\.js|manifest\.webmanifest)/;
+const URL_LITERAL = /(?<!appUrl\()(?<!hubUrl\()["'`]\/(api\/|api["'`]|assets\/|sw\.js|push-worker\.js|manifest\.webmanifest)/;
 
 function* walkTsFiles(dir: string): Generator<string> {
   for (const entry of readdirSync(dir, { withFileTypes: true })) {

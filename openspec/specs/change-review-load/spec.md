@@ -6,12 +6,12 @@ Define git-backed repository context for watched workspaces: repository metadata
 The system SHALL determine whether each watched root belongs to a git repository and SHALL expose repository context separately from the build identifier of the running `uatu` process. Repository context MUST include the repository root path, current branch name or detached commit, current commit short SHA, dirty worktree status, and whether the repository metadata is available. If a watched root is not inside a git repository or git metadata cannot be read, the system MUST keep the watch session usable and report an explicit non-git or unavailable state.
 
 #### Scenario: Watched root is inside a git repository
-- **WHEN** a user starts `uatu watch .` inside a git repository
+- **WHEN** a session child is started with `.` inside a git repository
 - **THEN** the system exposes repository metadata for that watched root
 - **AND** the metadata includes the current branch or detached commit and current short SHA
 
 #### Scenario: Watched root is not inside a git repository
-- **WHEN** a user starts `uatu watch` for a directory that is not inside a git repository
+- **WHEN** a session child is started with `--force` for a directory that is not inside a git repository
 - **THEN** the watch session still starts normally
 - **AND** the repository metadata reports that no git repository is available
 
@@ -26,12 +26,17 @@ The system SHALL determine whether each watched root belongs to a git repository
 - **AND** the browser UI can render the updated branch, commit, and dirty status
 
 ### Requirement: Provide bounded git commit log context
-The system SHALL provide a bounded recent commit log for each detected git repository. Each commit entry MUST include at minimum the short SHA, subject, full commit message, and author or relative time when available. The log MUST be contextual information only and MUST NOT alter the changed-files context.
+The system SHALL provide a bounded recent commit log for each detected git repository. Each commit entry MUST include at minimum the short SHA, subject, full commit message and commit time, plus the author when available. The commit time SHALL be an absolute timestamp so that clients can show a commit's age that stays current. Entries SHALL keep carrying the relative-time text for compatibility with older clients; current clients SHALL derive displayed ages from the commit time. The log MUST be contextual information only and MUST NOT alter the changed-files context.
 
 #### Scenario: Repository has recent commits
 - **WHEN** a watched repository has git commits
 - **THEN** the system exposes a bounded list of recent commits
-- **AND** each commit entry includes a short SHA, subject, and full commit message
+- **AND** each commit entry includes a short SHA, subject, full commit message and absolute commit time
+
+#### Scenario: Elapsed time alone does not change the commit log
+- **WHEN** the same commits are collected again later and only wall-clock time has passed
+- **THEN** each entry's commit time is unchanged
+- **AND** the commit log is not treated as changed repository data
 
 #### Scenario: Commit log cannot be read
 - **WHEN** git log data is unavailable or a repository has no commits

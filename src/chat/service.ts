@@ -1,11 +1,15 @@
 import { ChatAdapter, type ChatAdapterOptions, type ChatEventMetrics } from "./adapter";
+import { NotificationFeed } from "./notification-feed";
 import { createAttachmentStore, type AttachmentStore, type StoredAttachment } from "./attachment-store";
-import { OpenCodeService, type OpenCodeServiceOptions } from "./opencode/opencode-service";
-import type { ConversationInventorySubscription } from "./inventory-broadcaster";
-import { createSdkV2Provider } from "./opencode/sdk-v2-provider";
+import { OpenCodeService, type OpenCodeGeneration, type OpenCodeServiceOptions } from "./opencode/opencode-service";
+import { ConversationInventoryBroadcaster, type ConversationInventorySubscription } from "./inventory-broadcaster";
+import { createOpenCodeV1Provider } from "./opencode/v1/provider";
+import { createOpenCodeV2Provider } from "./opencode/v2/provider";
 import type { ChatProvider } from "./provider";
 import type { ReplaySubscription } from "./replay";
 import type {
+  BackgroundTaskOutput,
+  ChatActivity,
   ChatMode,
   ChatAvailability,
   ChatCommand,
@@ -17,17 +21,37 @@ import type {
   PermissionOutcome,
   ModelSelection,
   QuestionOutcome,
-  ReversibleHistoryResult,
-} from "./types";
+  ReversibleHistoryResult, AgentUsageReport, UsageReadMode, UsageReadResult, ChatAccountChange } from "./types";
 
 export interface WorkspaceChatService {
+  readonly notificationFeed?: NotificationFeed;
   status(): Promise<ChatAvailability>;
   retry(): Promise<ChatAvailability>;
+  /**
+   * The machine's logins changed through the Hub's Agent accounts. Bumps
+   * the agent's `accountsRevision` and lets its provider re-read and replay
+   * the change. Starts nothing: an agent not yet running reads fresh when
+   * it starts.
+   */
+  accountsChanged?(change: ChatAccountChange): Promise<void>;
   models(): Promise<ChatModel[]>;
   modes(): Promise<ChatMode[]>;
   commands(): Promise<ChatCommand[]>;
   listConversations(): Promise<ConversationSummary[]>;
   subscribeInventory(options?: { signal?: AbortSignal }): Promise<ConversationInventorySubscription>;
+  /**
+   * This agent's slice of the workspace activity summary: any turn in flight,
+   * any interaction awaiting the user. MUST NOT start the runtime — the hub
+   * watches it for every running workspace, and watching must not spawn an
+   * agent. An agent that has not started is idle.
+   */
+  activity(): Promise<ChatActivity>;
+  /**
+   * One-bit change ticks for activity(): an initial tick, then one per
+   * change, coalesced while unread. Consumers re-read activity() on each.
+   * Like activity(), subscribing starts nothing.
+   */
+  subscribeActivity(options?: { signal?: AbortSignal }): Promise<ConversationInventorySubscription>;
   createConversation(): Promise<ConversationSnapshot>;
   history(id: string, options?: { cursor?: string; limit?: number }): Promise<ConversationSnapshot>;
   subscribe(id: string, options?: { cursor?: string; signal?: AbortSignal }): Promise<{
@@ -54,6 +78,16 @@ export interface WorkspaceChatService {
   respondPermission(id: string, interactionId: string, requestId: string, outcome: PermissionOutcome, choiceId?: string): Promise<{ outcome: PermissionOutcome }>;
   respondQuestion(id: string, interactionId: string, requestId: string, outcome: QuestionOutcome): Promise<{ outcome: QuestionOutcome }>;
   stopTask(id: string, taskId: string, requestId: string): Promise<{ stopped: true }>;
+  /** End a session held for its scheduled wakeups (design D5 of claude-scheduled-wakeups). */
+  release(id: string, requestId: string): Promise<{ released: true }>;
+  /** Cancel one scheduled wakeup, live or paused; it never fires again. */
+  cancelWakeup(id: string, wakeupId: string, requestId: string): Promise<{ cancelled: true }>;
+  /** A bounded tail of a running (or just-settled) task's output; null until the agent has named where it goes. */
+  taskOutput(id: string, taskId: string, options: { tailBytes: number }): Promise<BackgroundTaskOutput | null>;
+  /** The agent's last-known plan usage; null when nothing has been read. */
+  usage(): Promise<AgentUsageReport | null>;
+  /** Read plan usage now; the agent picks the session (design D3). */
+  readUsage(requestId: string, mode: UsageReadMode): Promise<UsageReadResult>;
   dispose(): Promise<void>;
 }
 
@@ -88,12 +122,27 @@ export interface AgentRuntime {
   createProvider(): ChatProvider | null;
 }
 
+/**
+ * Builds the provider for a ready OpenCode server. Which factory runs is the
+ * server's generation, decided by its readiness answer: the 1.x stack over
+ * `@opencode-ai/sdk`, the 2.x stack over `@opencode/client`.
+ */
+export type OpenCodeProviderFactory = (options: { endpoint: string; password: string; directory: string; generation: OpenCodeGeneration }) => ChatProvider;
+export type OpenCodeProviderFactories = Partial<Record<OpenCodeGeneration, OpenCodeProviderFactory>>;
+
+const DEFAULT_PROVIDER_FACTORIES: Record<OpenCodeGeneration, OpenCodeProviderFactory> = {
+  1: createOpenCodeV1Provider,
+  2: createOpenCodeV2Provider,
+};
+
 export type LazyChatServiceOptions = OpenCodeServiceOptions & {
   // A complete agent stack. When present it owns lifecycle and provider
   // construction, and the OpenCode-specific options below are unused.
   agentRuntime?: AgentRuntime;
   runtime?: OpenCodeService;
-  createProvider?: (options: { endpoint: string; password: string; directory: string }) => ChatProvider;
+  // One factory for every generation (a test double), or a factory per
+  // generation, each defaulting to the real stack for that generation.
+  createProvider?: OpenCodeProviderFactory | OpenCodeProviderFactories;
   createAdapter?: (options: ChatAdapterOptions) => ChatAdapter;
   // Overrides the XDG-resolved store; the e2e harness points this at a
   // temporary directory.
@@ -104,6 +153,7 @@ export type LazyChatServiceOptions = OpenCodeServiceOptions & {
 };
 
 export class LazyChatService implements WorkspaceChatService {
+  readonly notificationFeed = new NotificationFeed();
   private readonly runtime: AgentRuntime;
   private readonly workspacePath: string;
   private readonly createAdapter: NonNullable<LazyChatServiceOptions["createAdapter"]>;
@@ -113,6 +163,12 @@ export class LazyChatService implements WorkspaceChatService {
   private adapter: ChatAdapter | null = null;
   private retryPromise: Promise<ChatAvailability> | null = null;
   private disposed = false;
+  // Bumped on every login change reported by the Hub, so clients know to
+  // re-read this agent's catalogs.
+  private accountsRevision = 0;
+  // Outlives any one adapter: a watcher stays attached while the adapter is
+  // built, retried, or replaced — and each of those is itself a change.
+  private readonly activityChanges = new ConversationInventoryBroadcaster();
 
   constructor(options: LazyChatServiceOptions) {
     this.workspacePath = options.workspacePath;
@@ -145,7 +201,16 @@ export class LazyChatService implements WorkspaceChatService {
       // knows a process is up, and only the adapter's provider knows who it
       // is and what it offers.
       const adapter = await this.ensureAdapter();
-      return { ...availability, agent: adapter.agent() };
+      const login = adapter.loginState();
+      // The revision is omitted while no login has changed: a client reads
+      // absent as 0, and a workspace that never saw a change answers as before.
+      return {
+        ...availability,
+        agent: adapter.agent(),
+        ...(login ? { login } : {}),
+        ...(this.accountsRevision > 0 ? { accountsRevision: this.accountsRevision } : {}),
+        ...(adapter.catalogRevision() ? { catalogRevision: adapter.catalogRevision() } : {}),
+      };
     } catch (error) {
       // Deliberately not cached: ensureAdapter forgets a rejected attempt, so
       // the next status() call rebuilds and re-probes. A transient failure — a
@@ -161,6 +226,11 @@ export class LazyChatService implements WorkspaceChatService {
         message: "The installed OpenCode version is not compatible with chat.",
       };
     }
+  }
+
+  async accountsChanged(change: ChatAccountChange): Promise<void> {
+    this.accountsRevision += 1;
+    await this.adapter?.accountsChanged(change).catch(() => undefined);
   }
 
   // User-initiated recovery from a cached startup failure. Drops the adapter
@@ -186,6 +256,7 @@ export class LazyChatService implements WorkspaceChatService {
     const pendingBuild = this.adapterPromise;
     this.adapterPromise = null;
     this.adapter = null;
+    this.activityChanges.invalidate();
     await previous?.dispose().catch(() => undefined);
     if (pendingBuild) await pendingBuild.then(adapter => adapter.dispose()).catch(() => undefined);
     // A full restart, not a bare runtime retry: an adapter-level failure
@@ -201,6 +272,7 @@ export class LazyChatService implements WorkspaceChatService {
     const stray = this.adapter as ChatAdapter | null;
     this.adapterPromise = null;
     this.adapter = null;
+    if (stray) this.activityChanges.invalidate();
     await stray?.dispose().catch(() => undefined);
     return this.ensureReady();
   }
@@ -210,6 +282,10 @@ export class LazyChatService implements WorkspaceChatService {
   async modes() { return (await this.requireAdapter()).modes(); }
   async commands() { return (await this.requireAdapter()).commands(); }
   async subscribeInventory(options: { signal?: AbortSignal } = {}) { return (await this.requireAdapter()).subscribeInventory(options.signal); }
+  // The current adapter only, never requireAdapter(): reading activity must
+  // not start the runtime. No adapter means nothing can be working or waiting.
+  async activity(): Promise<ChatActivity> { return this.adapter?.activity() ?? { working: false, awaiting: false }; }
+  async subscribeActivity(options: { signal?: AbortSignal } = {}) { return this.activityChanges.subscribe(options.signal); }
   async createConversation() { return (await this.requireAdapter()).createConversation(); }
   async history(id: string, options?: { cursor?: string; limit?: number }) { return (await this.requireAdapter()).history(id, options); }
   async subscribe(id: string, options?: { cursor?: string; signal?: AbortSignal }) { return (await this.requireAdapter()).subscribe(id, options); }
@@ -235,9 +311,22 @@ export class LazyChatService implements WorkspaceChatService {
   async stopTask(id: string, taskId: string, requestId: string) {
     return (await this.requireAdapter()).stopTask(id, taskId, requestId);
   }
+  async release(id: string, requestId: string) {
+    return (await this.requireAdapter()).release(id, requestId);
+  }
+  async cancelWakeup(id: string, wakeupId: string, requestId: string) {
+    return (await this.requireAdapter()).cancelWakeup(id, wakeupId, requestId);
+  }
+  async taskOutput(id: string, taskId: string, options: { tailBytes: number }) {
+    return (await this.requireAdapter()).taskOutput(id, taskId, options);
+  }
+  async usage() { return (await this.requireAdapter()).usage(); }
+  async readUsage(requestId: string, mode: UsageReadMode) { return (await this.requireAdapter()).readUsage(requestId, mode); }
 
   async dispose(): Promise<void> {
     this.disposed = true;
+    this.notificationFeed.dispose();
+    this.activityChanges.dispose();
     const runtimeDisposal = this.runtime.dispose();
     // Shutdown can race the first ensureAdapter: the promise may own a
     // provider mid-probe while this.adapter is still null. Join it and
@@ -276,6 +365,10 @@ export class LazyChatService implements WorkspaceChatService {
         workspacePath: this.workspacePath,
         resolveAttachment: id => this.attachmentStore.resolve(id),
         metrics: this.metrics,
+        // A retired adapter's late tick is harmless: it only prompts a re-read
+        // of the current adapter.
+        onActivityChange: () => this.activityChanges.invalidate(),
+        onNotification: event => { if (this.adapter === adapter) this.notificationFeed.publish(event); },
       });
       // Shutdown or a retry may have superseded this build while the probe
       // ran; a stale build retires itself instead of publishing.
@@ -284,6 +377,7 @@ export class LazyChatService implements WorkspaceChatService {
         throw new ChatUnavailableError();
       }
       this.adapter = adapter;
+      this.activityChanges.invalidate();
       this.superviseEventPump(adapter);
       return adapter;
     })();
@@ -328,20 +422,28 @@ export class LazyChatService implements WorkspaceChatService {
  */
 export function openCodeAgentRuntime(options: LazyChatServiceOptions): AgentRuntime {
   const runtime = options.runtime ?? new OpenCodeService(options);
-  const createProvider = options.createProvider ?? createSdkV2Provider;
+  const factories = resolveProviderFactories(options.createProvider);
   return {
     status: () => Promise.resolve(runtime.peekStatus()),
     ensure: () => runtime.status(),
     restart: () => runtime.restart(),
     dispose: () => runtime.dispose(),
     createProvider: () => {
+      // The connection carries the generation its server answered with, so a
+      // restart that finds a replaced binary builds the other stack.
       const connection = runtime.currentConnection();
       if (!connection) return null;
-      return createProvider({
+      return factories[connection.generation]({
         endpoint: connection.endpoint,
         password: connection.password,
         directory: options.workspacePath,
+        generation: connection.generation,
       });
     },
   };
+}
+
+export function resolveProviderFactories(override: LazyChatServiceOptions["createProvider"]): Record<OpenCodeGeneration, OpenCodeProviderFactory> {
+  if (typeof override === "function") return { 1: override, 2: override };
+  return { ...DEFAULT_PROVIDER_FACTORIES, ...(override ?? {}) };
 }

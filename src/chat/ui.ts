@@ -1,3 +1,4 @@
+import { boundedSet } from "../shared/bounded-map";
 import { escapeHtml } from "../shared/html";
 import { workspaceForeground } from "../hub/mobile/coordinator-context";
 import { createLoadingSignal } from "../preview/loading-signal";
@@ -5,21 +6,32 @@ import { measureChatWork } from "./performance";
 import { appState } from "../shell/state";
 import { presentationLocalStorage } from "../shell/presentation-storage";
 import { registerBackInterceptor } from "../shell/history";
-import { createLifecycleRecovery, type LifecycleRecovery } from "../shell/recovery";
+import { onManualRecovery, registerRecoveryWork, requestManualRecovery } from "../shell/live";
 import { onWorkspaceCredentialRefresh } from "../terminal/client";
 import { ChatApiClient, ChatConnectionInterruptedError, ChatTransportError, type ChatEventStream } from "./client";
 import { TimelineAnchorController, type AnchorGeometry, type TimelineAnchor } from "./anchor";
+import { CoordinatedScrollOwner, type RevealOptions } from "./coordinated-scroll";
 import { ChatViewportController } from "./viewport";
+import { notificationAwaiting, notificationConversation } from "./notification-navigation";
+import { setActiveTab } from "../shell/tab-bar";
+import { expandChatPanel, isChatPanelOpen } from "./surface";
+import { CHAT_SURFACE_ACTIVE_EVENT, chatSurfaceInView } from "./surface-visibility";
 import { newRequestId } from "./ids";
-import { insertCommand, localHistoryOperation, matchingCommands, type LocalHistoryOperation } from "./slash-commands";
+import { insertCommand, localHistoryOperation, matchingCommands, slashCommandQuery, type LocalHistoryOperation } from "./slash-commands";
+import { LatestRefresh } from "./latest-refresh";
 import { navigateWorkspaceFileReference, resolveWorkspaceFileReference } from "./file-references";
 import { READER_CLOSED, QueueDockRenderer, RevertedMessagesDockRenderer, TimelineRenderer, decorateAttachmentImages, decorateFileLinks, formatElapsed, latestTodoEntries, statusLabel, subagentEntries, subagentLabel, workingLabel } from "./timeline-renderer";
 import { backgroundStatusLabel, runningBackgroundTasks } from "./background-tasks";
-import { composerRoutineState, formatUsd, latestPlanReport, latestRateLimit, planHasRows, planName, planReadoutRows, planSummaryLabel, planUtilizationLevel, rateLimitBadgeLabel, sessionTotalsTitle } from "./composer-status";
-import { buildPlanRowNodes, noteUsageReport, revealUsagePane } from "./usage-pane";
+import { pausedStatusLabel, pausedWakeups, pendingWakeups, scheduledStatusLabel, wakeupFireTime } from "./scheduled-wakeups";
+import { RunningWorkDisclosure } from "./running-work-disclosure";
+import { SilentRunFollower, TaskInspectionPanel, formatTaskElapsed, runningTaskForChild, taskById, taskInspection, type OpenTaskInspection } from "./task-inspection";
+import { composerRoutineState, formatUsd, latestPlanReport, latestRateLimit, planChip, planHasRows, planName, planReadoutRows, sessionTotalsTitle, standingSentence, usageAsOf, usageStale, type RateLimitStanding } from "./composer-status";
+import { buildPlanRowNodes, currentUsageReport, initUsagePaneControls, noteUsageReport, onUsageChange, onUsageRead, readStatusText, readUsageNow, refreshUsageIfStale, revealUsagePane, usageReadState, usageReadable } from "./usage-pane";
 import { isLiveConversationStatus } from "./types";
 import { contextReadout } from "./context-readout";
-import { totalTokens } from "./usage";
+import { buildReceiptRows, buildReceiptTotal, parseReceiptView, receiptHeading, subagentTrackSummary, subagentTranscriptTitle, type ReceiptView } from "./receipt-view";
+import { formatTokens, totalTokens } from "./usage";
+import { resolveSessionTotals, type ConversationTotals } from "./conversation-totals";
 import {
   addAcceptedDraft,
   applyChatEvent,
@@ -28,16 +40,20 @@ import {
   noteQueuedMessage,
   prependSnapshot,
   projectionFromSnapshot,
+  refreshFromSnapshot,
   removeAcceptedDraft,
   type ChatProjection,
 } from "./projection";
-import { CHAT_ATTACHMENT_MAX_BYTES, CHAT_ATTACHMENT_MIME_TYPES, CHAT_ATTACHMENTS_PER_MESSAGE, type AgentChatStatus, type ChatAgent, type ChatCapability, type ChatMode, type ChatAvailability, type ChatCommand, type ChatModel, type ConversationConfiguration, type ConversationItem, type ConversationSnapshot, type ConversationSummary, type ContextReportItem, type MessageAttachment, type ModelSelection, type PermissionOutcome, type QuestionOutcome, type RestoredDraft, type ReversibleHistoryResult, type SessionTotals } from "./types";
+import { CHAT_ATTACHMENT_MAX_BYTES, CHAT_ATTACHMENT_MIME_TYPES, CHAT_ATTACHMENTS_PER_MESSAGE, type AgentChatStatus, type ChatAgent, type ChatCapability, type ChatMode, type ChatAvailability, type ChatCommand, type ChatLoginState, type ChatModel, type ConversationConfiguration, type ConversationItem, type ConversationSnapshot, type ConversationSummary, type ContextReportItem, type MessageAttachment, type ModelSelection, type PermissionOutcome, type QuestionOutcome, type RestoredDraft, type ReversibleHistoryResult, type SessionTotals } from "./types";
 import { formatDiagnostics } from "./diagnostics";
 import { collectQuestionAnswers, showQuestionPanel, syncQuestionControl, syncQuestionForm } from "./question-form";
 import { configurationOptionLabel, createChatConfigurationPicker, type ChatConfigurationPickerController } from "./configuration-picker";
+import { loginActionElement, loginActionFor, type LoginAction } from "./login-action";
 import { copyChatText } from "./copy-actions";
 import { announceConversationInventory, renderConversationInventoryAwareness, renderSelectedConversationDeleted } from "./inventory-presentation";
-import { ConversationInventoryTracker, SerializedInventoryReconciler, dedupeConversationInventory, isConversationChooserActivationKey, patchConversationOptions, retainedPresentationConversationIds } from "./inventory-reconciler";
+import { ConversationInventoryTracker, SerializedInventoryReconciler, conversationActivitySuffix, conversationDayGroup, dedupeConversationInventory, isConversationChooserActivationKey, patchConversationOptions, retainedPresentationConversationIds } from "./inventory-reconciler";
+import { dateTime, nextLocalMidnight } from "./dates";
+import { watchPinnedDayLabels } from "./pinned-day";
 
 const PRESENTATION_KEY = "uatu:chat-presentation";
 const SAVE_DEBOUNCE_MS = 400;
@@ -56,15 +72,50 @@ type Presentation = {
   // The agent the user last conversed with; the default for the next
   // creation (spec: last used, then the server default).
   lastAgentId?: string;
+  // How the cost receipt is itemized. A reading preference, not a fact about
+  // any one conversation, so it holds across conversations and reloads.
+  receiptView?: ReceiptView;
 };
 
 // A status line that also reports what it is currently saying, so an owner of
 // a specific message can check it is still the one on screen before removing it.
-type Announcer = ((message: string, error?: boolean) => void) & { current: () => string };
+type Announcer = ((message: string, error?: boolean) => void) & {
+  current: () => string;
+  // The line itself, for an owner that keeps an element child on it.
+  target: HTMLElement | null;
+  // Told after every announcement, before the line's visibility is settled,
+  // so an owner can attach or remove its child in the same pass.
+  spoken: Set<() => void>;
+};
 
 const EMPTY_PRESENTATION: Presentation = { drafts: {}, expanded: [], anchors: {}, workingSince: {}, dismissedSubagents: {} };
 
 export function initChat(api = new ChatApiClient()): void {
+  let notificationTarget = notificationConversation(window.location?.search ?? "");
+  // Opened from another workspace's "needs your answer" notice (?awaiting=1):
+  // this workspace names the conversation that waits, asked at once so the
+  // answer is usually in before the inventory. `undefined` is a failed read —
+  // startup then proceeds as if no destination was named, since saying the
+  // request was answered would be a guess.
+  let awaitingLookup: Promise<string | null | undefined> | null = !notificationTarget && notificationAwaiting(window.location?.search ?? "")
+    ? api.awaiting().catch(() => undefined) : null;
+  let awaitingAnswered = false;
+  const resolveAwaiting = async () => {
+    if (!awaitingLookup) return;
+    const found = await awaitingLookup;
+    awaitingLookup = null;
+    const id = typeof found === "string" ? notificationConversation(`conversation=${encodeURIComponent(found)}`) : null;
+    if (id) notificationTarget = id;
+    else awaitingAnswered = found === null;
+    // The destination is settled: the URL now names what was chosen, as a
+    // push notification's would, and a reload does not ask again.
+    if (window.location) {
+      const url = new URL(window.location.href);
+      url.searchParams.delete("awaiting");
+      if (id) url.searchParams.set("conversation", id);
+      window.history.replaceState(window.history.state, "", url);
+    }
+  };
   const surface = document.querySelector<HTMLElement>("#chat-surface");
   const timeline = document.querySelector<HTMLElement>("#chat-timeline");
   const items = document.querySelector<HTMLElement>("#chat-items");
@@ -104,23 +155,51 @@ export function initChat(api = new ChatApiClient()): void {
   const configurationVariantSection = document.querySelector<HTMLElement>("#chat-configuration-variant-section");
   const configurationVariant = document.querySelector<HTMLSelectElement>("#chat-configuration-variant");
   const composerStatus = document.querySelector<HTMLElement>("#chat-composer-status");
-  const rateLimitBadge = document.querySelector<HTMLElement>("#chat-rate-limit");
+  const loginNotice = document.querySelector<HTMLElement>("#chat-login-notice");
+  const rateLimitLive = document.querySelector<HTMLElement>("#chat-rate-limit-live");
   const planUsage = document.querySelector<HTMLDetailsElement>("#chat-plan-usage");
   const planUsageSummary = document.querySelector<HTMLElement>("#chat-plan-usage-summary");
   const planReadout = document.querySelector<HTMLElement>("#chat-plan-readout");
   const planReadoutHead = document.querySelector<HTMLElement>("#chat-plan-readout-head");
   const planReadoutName = document.querySelector<HTMLElement>("#chat-plan-readout-name");
+  const planReadoutAge = document.querySelector<HTMLElement>("#chat-plan-readout-age");
+  const planRead = document.querySelector<HTMLButtonElement>("#chat-plan-read");
+  const planReadoutStatus = document.querySelector<HTMLElement>("#chat-plan-readout-status");
   const planReadoutRowsElement = document.querySelector<HTMLElement>("#chat-plan-readout-rows");
+  const planReadoutStanding = document.querySelector<HTMLElement>("#chat-plan-readout-standing");
   const planPin = document.querySelector<HTMLButtonElement>("#chat-plan-pin");
   const planSession = document.querySelector<HTMLElement>("#chat-plan-readout-session");
   const planSessionTitle = document.querySelector<HTMLElement>("#chat-plan-session-title");
   const planSessionCost = document.querySelector<HTMLElement>("#chat-plan-session-cost");
   const planSessionModels = document.querySelector<HTMLElement>("#chat-plan-session-models");
+  const planSessionViews = document.querySelector<HTMLElement>("#chat-plan-session-views");
+  const planSessionHeading = document.querySelector<HTMLElement>("#chat-plan-session-heading");
+  const planSessionTotal = document.querySelector<HTMLElement>("#chat-plan-session-total");
   const composerChips = document.querySelector<HTMLElement>("#chat-composer-chips");
   // The reason the latest status event carried (a retry's attempt and HTTP
   // status), shown with the named state — per conversation, so a switch
   // to another retrying conversation never borrows this one's reason.
   const statusMessages = new Map<string, string | undefined>();
+  // Whether the caret sits in a slash query, matches or not: starting one
+  // re-reads the catalogs, so a command added elsewhere — which the banked
+  // list cannot match yet — appears while the user is still typing it. Any
+  // programmatic write to the composer ends the query it was tracking, so
+  // the next `/` typed counts as a new one.
+  let slashQueryActive = false;
+  // Rows the stream removed, per conversation, carried across snapshot
+  // rebuilds (a resync, a switch away and back) so a late acceptance never
+  // recreates a row the stream already retired.
+  const removedRows = new Map<string, string[]>();
+  // A `/reload` this client sent, by conversation, with the agent whose
+  // catalogs it changes and — once accepted — its message id: when its turn
+  // completes, the palette and pickers re-read them. A reload held behind a
+  // running turn is still in the conversation's queue when THAT turn
+  // completes, so a completion arriving while it is queued is not its own.
+  // One arriving before the acceptance names the message cannot be told
+  // apart: it re-reads (harmlessly) and keeps the mark for the real one.
+  // A failed or interrupted reload changed nothing to re-read.
+  // Several can wait in one conversation's queue, oldest first.
+  const pendingReloads = new Map<string, Array<{ agentId: string; messageId?: string }>>();
   const composerStatusLive = document.querySelector<HTMLElement>("#chat-composer-status-live");
   const composerError = document.querySelector<HTMLElement>("#chat-composer-error");
   // Attachment surfaces. Guarded at use rather than joining the required
@@ -150,10 +229,19 @@ export function initChat(api = new ChatApiClient()): void {
   const drilldownState = document.querySelector<HTMLElement>("#chat-drilldown-state");
   const drilldownBack = document.querySelector<HTMLButtonElement>("#chat-drilldown-back");
   const drilldownOlder = document.querySelector<HTMLButtonElement>("#chat-drilldown-older");
+  // The running-task panel inside the drill-down: the header strip over a
+  // subagent's transcript, and the output pane a shell task opens instead of
+  // a transcript (design D7).
+  const drilldownTask = document.querySelector<HTMLElement>("#chat-drilldown-task");
+  const drilldownOutput = document.querySelector<HTMLElement>("#chat-drilldown-output");
+  const drilldownOutputText = document.querySelector<HTMLElement>("#chat-drilldown-output-text");
+  const drilldownOutputNote = document.querySelector<HTMLElement>("#chat-drilldown-output-note");
   if (!surface || !timeline || !items || !state || !select || !newButton || !olderButton || !latestButton || !queueDockElement || !form || !input || !commandMenu || !send || !sendLabel || !configurationTrigger || !configurationSummary || !configurationDetails || !configurationModeSummary || !configurationVariantSummary || !configurationVariantValue || !configurationDialog || !configurationSearch || !configurationModelsSection || !configurationModels || !configurationResultStatus || !configurationEmpty || !configurationDone || !composerStatus || !composerStatusLive || !composerError || !copyStatus) return;
 
   const anchor = new TimelineAnchorController();
-  const viewport = new ChatViewportController(surface, form, timeline, anchor);
+  // Initial renders can run before focus wiring is installed. Later paints
+  // reconcile removals too: WebKit does not send focusout for a removed input.
+  let reconcileAnswerAfterPaint = () => {};
   const renderer = new TimelineRenderer();
   renderer.deferClosedActivity = true;
   const readSignal = createLoadingSignal({ segment: null, barHost: timeline, busyHost: timeline, visibleLabel: true });
@@ -204,9 +292,12 @@ export function initChat(api = new ChatApiClient()): void {
   let agentStatuses: AgentChatStatus[] = [];
   // Catalogs are per agent; the bare lists below are the selected-agent view,
   // swapped whenever the conversation's owning agent changes.
-  type AgentCatalogs = { models: ChatModel[]; modes: ChatMode[]; commands: ChatCommand[]; commandInventoryAvailable: boolean };
+  type AgentCatalogs = { models: ChatModel[]; modes: ChatMode[]; commands: ChatCommand[]; commandInventoryAvailable: boolean; catalogRevision?: string };
   const agentCatalogs = new Map<string, AgentCatalogs>();
   const agentCatalogLoads = new Map<string, Promise<AgentCatalogs>>();
+  // Latest requested revision, including invalidations received before the
+  // initial catalog is banked. Each bank acknowledges only successful reads.
+  const catalogRevisions = new Map<string, string>();
   let catalogLoading = false;
   let contextAgentId: string | undefined;
   let models: ChatModel[] = [];
@@ -216,11 +307,23 @@ export function initChat(api = new ChatApiClient()): void {
   const stagedConfigurations = new Map<string, ConversationConfiguration>();
   let configurationPicker: ChatConfigurationPickerController | null = null;
   let stream: ChatEventStream | null = null;
-  let chatLifecycle: LifecycleRecovery | null = null;
   let inventoryStream: ChatEventStream | null = null;
   let selectionGeneration = 0;
+  // A stored reference is not an opened selection. Keep it inert across
+  // missing inventories, even if creation cancels startup before it finishes.
+  let hasSelectedConversation = false;
+  // A consumed startup restore is not deletion-recovery eligible until its
+  // opening read succeeds. Keep this scoped to its current selection epoch.
+  let unestablishedStartup: { conversationId: string; generation: number } | null = null;
+  const isUnestablishedStartup = (id: string | null | undefined) =>
+    unestablishedStartup?.generation === selectionGeneration && unestablishedStartup.conversationId === id;
+  let startupOwnsSelection = true;
+  let pendingStartupId: string | null = null;
+  const supersedeStartupSelection = () => {
+    startupOwnsSelection = false;
+    pendingStartupId = null;
+  };
   let selectedConversationDeleted = false;
-  let disposed = false;
   type ConversationRefreshRecovery = {
     conversationId: string;
     token: number;
@@ -245,9 +348,65 @@ export function initChat(api = new ChatApiClient()): void {
     projection: ChatProjection | null;
     stream: ChatEventStream | null;
     read?: { controller: AbortController; token: number; label: string };
+    // The background task this layer inspects, when it was opened for one:
+    // the parent's item, found by id on every repaint so the strip follows
+    // it in place. A transcript view is a live child over it; an output view
+    // has no child at all and reads the task's output file instead.
+    task?: OpenTaskInspection;
   };
   let child: Drilldown | null = null;
+  // The error line the output view last put up. When a later read answers,
+  // the panel says so and the line comes down — but only if it still says
+  // what the panel put there, so a message something else has since spoken
+  // is left standing.
+  let taskOutputError = "";
+  const taskPanel = drilldownTask && drilldownOutput && drilldownOutputText && drilldownOutputNote
+    ? new TaskInspectionPanel({
+      hosts: { strip: drilldownTask, output: drilldownOutput, outputText: drilldownOutputText, outputNote: drilldownOutputNote },
+      fetchOutput: (conversationId, taskId, signal) => api.taskOutput(conversationId, taskId, undefined, signal),
+      active: () => chatSurfaceActive(),
+      onError: error => {
+        taskOutputError = messageOf(error);
+        announceChild(taskOutputError, true);
+      },
+      onRecovered: () => {
+        if (taskOutputError && announceChild.current() === taskOutputError) announceChild("");
+        taskOutputError = "";
+      },
+    })
+    : null;
+  // The drill-down's task, as the parent's projection now has it — the strip
+  // and the output view are re-synced from here by the background-task
+  // repaint, and by the stop control's own in-flight guard.
+  const syncTaskInspection = () => {
+    if (!taskPanel || !child?.task) return;
+    const owner = projection?.conversationId === child.task.conversationId ? projection : null;
+    taskPanel.sync(owner ? taskById(owner.items, child.task.taskId) : undefined, stoppingTasks.has(child.task.taskId));
+  };
   let childGeneration = 0;
+  // A run that streams nothing — the review a typed command launches — or
+  // whose stream has stalled is followed from its transcript on disk while
+  // its drill-down is open (design D14). The re-read folds into the open
+  // projection the way live events do, and repaints as new content does:
+  // it never goes through the open path, so the reader's place, the follow
+  // state, the stream, and the task strip are all left as they are.
+  const silentRun = new SilentRunFollower({
+    refresh: async signal => {
+      const open = child;
+      const generation = childGeneration;
+      if (!open?.projection) return undefined;
+      const page = await api.snapshot(open.conversationId, undefined, signal);
+      if (signal.aborted || generation !== childGeneration || child !== open || !open.projection) return undefined;
+      const refreshed = refreshFromSnapshot(open.projection, page);
+      if (!refreshed) return undefined;
+      open.projection = refreshed.projection;
+      if (refreshed.changed) { announceChild(""); renderChild(true); }
+      // The follower applies the status the read found itself: a read that
+      // finds the run settled is already a read made after the settle.
+      return isLiveConversationStatus(open.projection.status);
+    },
+    active: () => chatSurfaceActive(),
+  });
   const childRenderer = new TimelineRenderer();
   childRenderer.deferClosedActivity = true;
   const childAnchor = new TimelineAnchorController();
@@ -387,6 +546,98 @@ export function initChat(api = new ChatApiClient()): void {
   const declares = (capability: ChatCapability) => agent?.capabilities.includes(capability) ?? true;
   const agentStatusFor = (agentId: string | undefined): AgentChatStatus | undefined =>
     agentStatuses.find(status => status.agent.id === agentId);
+  // How the selected agent gets a login: the Hub's Settings, or its command.
+  const contextLoginAction = (): LoginAction | undefined => {
+    const status = agentStatusFor(contextAgentId);
+    return status ? loginActionFor(status.agent.id, status.agent.name) : undefined;
+  };
+  const contextLoginState = (): ChatLoginState | undefined => {
+    const availability = agentStatusFor(contextAgentId)?.availability;
+    return availability?.state === "ready" ? availability.login : undefined;
+  };
+  // Each agent's `accountsRevision` as last seen. It moves when a login
+  // changes through the Hub's Agent accounts: the agent's catalogs are then
+  // re-read, and an empty model list is believed (the last provider logged
+  // out) rather than skipped as a list that has not loaded yet.
+  const accountsRevisions = new Map<string, number>();
+  const setAgentStatuses = (next: AgentChatStatus[]) => {
+    agentStatuses = next;
+    for (const status of next) {
+      if (status.availability.state !== "ready") continue;
+      const revision = status.availability.accountsRevision ?? 0;
+      const known = accountsRevisions.get(status.agent.id);
+      accountsRevisions.set(status.agent.id, revision);
+      if (known === undefined || known === revision) continue;
+      if (contextAgentId === status.agent.id && agentCatalogs.has(status.agent.id)) void refreshBankedCommands(status.agent.id, { acceptEmpty: true });
+      else agentCatalogs.delete(status.agent.id);
+    }
+    renderLoginNotice();
+  };
+  // Status re-reads that land together collapse into one, plus one more if
+  // another was asked for while it ran.
+  let statusReread: Promise<void> | null = null;
+  let statusRereadQueued = false;
+  const rereadStatuses = () => {
+    if (statusReread) {
+      statusRereadQueued = true;
+      return;
+    }
+    statusReread = (async () => {
+      try {
+        setAgentStatuses(await api.status());
+      } catch {
+        // The next tick asks again. A login poll whose read failed has nothing
+        // else to wake it, so it is scheduled again from the last known state.
+        scheduleLoginPoll(contextLoginState());
+      }
+    })().finally(() => {
+      statusReread = null;
+      if (statusRereadQueued) {
+        statusRereadQueued = false;
+        rereadStatuses();
+      }
+    });
+  };
+  // While the selected agent has no usable login, or has not said yet,
+  // status is re-read now and then: a login made outside UatuCode (a
+  // terminal) sends no tick, and a first login read lands after the agent
+  // is ready. Nothing is polled once the login is known to work.
+  const LOGIN_POLL_MS = 5_000;
+  let loginPoll: ReturnType<typeof setTimeout> | null = null;
+  const scheduleLoginPoll = (state: ChatLoginState | undefined) => {
+    if (state !== "missing" && state !== "unknown") {
+      if (loginPoll !== null) { clearTimeout(loginPoll); loginPoll = null; }
+      return;
+    }
+    if (loginPoll !== null) return;
+    loginPoll = setTimeout(() => {
+      loginPoll = null;
+      if (document.visibilityState === "hidden") {
+        scheduleLoginPoll(contextLoginState());
+        return;
+      }
+      rereadStatuses();
+    }, LOGIN_POLL_MS);
+  };
+  // The selected agent cannot run a turn: said where a message is typed,
+  // with the way to log in. Present for a new conversation and an existing
+  // one alike, since both are typed into here.
+  const renderLoginNotice = () => {
+    const state = contextLoginState();
+    scheduleLoginPoll(state);
+    if (!loginNotice) return;
+    const status = agentStatusFor(contextAgentId);
+    const missing = state === "missing" && status !== undefined;
+    loginNotice.hidden = !missing;
+    if (!missing) {
+      loginNotice.replaceChildren();
+      return;
+    }
+    const text = document.createElement("span");
+    text.className = "chat-login-notice-text";
+    text.textContent = `${status.agent.name} is not logged in.`;
+    loginNotice.replaceChildren(text, " ", loginActionElement(document, loginActionFor(status.agent.id, status.agent.name)));
+  };
   // A conversation names its agent on its summary; a child conversation the
   // inventory never lists still carries the owner as its id prefix.
   const conversationAgentId = (conversationId: string | null | undefined): string | undefined => {
@@ -462,6 +713,7 @@ export function initChat(api = new ChatApiClient()): void {
     // as the textContent variant did — but element children survive; they
     // are removed explicitly where that is meant.
     let node: Text | null = null;
+    const spoken = new Set<() => void>();
     const speak = (message: string, error = false) => {
       if (!target) return;
       if (!node || node.parentNode !== target) {
@@ -473,12 +725,13 @@ export function initChat(api = new ChatApiClient()): void {
       }
       node.textContent = message;
       target.classList.toggle("is-error", error);
+      for (const listener of [...spoken]) listener();
       target.hidden = !message && target.childElementCount === 0;
     };
     // What the line is saying right now. A caller that owns a specific
     // message needs this to check it is still the one being shown before
     // taking it down.
-    return Object.assign(speak, { current: () => node?.textContent ?? "" });
+    return Object.assign(speak, { current: () => node?.textContent ?? "", target, spoken });
   };
   const announce = announcerFor(state);
   const announceChild = announcerFor(drilldownState);
@@ -491,6 +744,36 @@ export function initChat(api = new ChatApiClient()): void {
   // the other's warning while it is still down.
   const interruptionsFor = (speak: Announcer) => {
     const owned = new Map<string, string>();
+    // The way back while an interruption is what the line reports. The
+    // channel keeps retrying on its own, but a stall can outlive that cycle
+    // (a wake-up signal lost, a page whose recovery machinery is gone), and
+    // on a home-screen page there is no browser reload to fall back on. The
+    // shell's manual recovery reconnects in place and reloads only if that
+    // does not confirm; either way this surface's draft and position stand.
+    const reconnect = document.createElement("button");
+    reconnect.type = "button";
+    reconnect.className = "chat-secondary-button chat-reconnect-button";
+    reconnect.textContent = "Reconnect";
+    reconnect.addEventListener("click", () => { void requestManualRecovery(); });
+    onManualRecovery(inFlight => {
+      reconnect.disabled = inFlight;
+      reconnect.textContent = inFlight ? "Reconnecting…" : "Reconnect";
+      if (inFlight) reconnect.setAttribute("aria-busy", "true");
+      else reconnect.removeAttribute("aria-busy");
+    });
+    // Present exactly while the line is showing one of this owner's
+    // interruption messages — not while another message (a provider
+    // refusal, a failed turn) has displaced it, even if a stream is still
+    // down underneath.
+    const sync = () => {
+      const showing = speak.target !== null && [...owned.values()].includes(speak.current());
+      if (showing) {
+        if (reconnect.parentNode !== speak.target) speak.target!.append(reconnect);
+      } else if (reconnect.parentNode) {
+        reconnect.remove();
+      }
+    };
+    speak.spoken.add(sync);
     return {
       report(stream: string, error: unknown) {
         const message = messageOf(error);
@@ -546,8 +829,105 @@ export function initChat(api = new ChatApiClient()): void {
   // reader experiences as dead.
   const extentsOf = (scroller: HTMLElement): AnchorGeometry =>
     ({ scrollTop: scroller.scrollTop, clientHeight: scroller.clientHeight, scrollHeight: scroller.scrollHeight, items: [] });
-  const anchorGeometry = (): AnchorGeometry => anchor.isPinned() ? extentsOf(timeline) : geometry();
-  const childAnchorGeometry = (): AnchorGeometry => childAnchor.isPinned() ? extentsOf(drilldownTimeline!) : childGeometry();
+  const parentScroll = new CoordinatedScrollOwner(timeline, {
+    anchor, measure: includeItems => includeItems ? geometry() : extentsOf(timeline), active: chatSurfaceActive,
+    onChange: () => {
+      if (projection) {
+        const current = anchor.currentAnchor();
+        if (current) presentation.anchors[projection.conversationId] = current;
+        else delete presentation.anchors[projection.conversationId];
+        save();
+      }
+      latestButton.hidden = !anchor.hasUnseen();
+      syncPromptRailActive();
+    },
+  });
+  const childLatest = drilldownTimeline ? document.createElement("button") : null;
+  if (childLatest && drilldownTimeline) {
+    childLatest.id = "chat-drilldown-latest";
+    childLatest.type = "button";
+    childLatest.className = latestButton.className;
+    childLatest.textContent = "Latest in subagent";
+    childLatest.hidden = true;
+    drilldownTimeline.after(childLatest);
+  }
+  const childScroll = drilldownTimeline ? new CoordinatedScrollOwner(drilldownTimeline, {
+    anchor: childAnchor, measure: includeItems => includeItems ? childGeometry() : extentsOf(drilldownTimeline),
+    active: () => chatSurfaceActive() && !!child,
+    onChange: () => { if (childLatest) childLatest.hidden = !childAnchor.hasUnseen(); },
+  }) : null;
+  childLatest?.addEventListener("click", () => childScroll?.latest());
+  /**
+   * Where an answering reveal has to leave the field. The extent is the row
+   * carrying Answer and Reject, so the two are placed as one block: the field
+   * alone could be brought into the band with its own buttons still under the
+   * keyboard. `end` because the band's bottom is the only position that is
+   * stable whether or not the platform's focus scroll already moved the card —
+   * a minimal move leaves whatever height WebKit happened to give it as a
+   * strip of empty conversation between the buttons and the keyboard's edge.
+   * Touch only: nothing covers the chrome on desktop, so there is no band to
+   * be pressed against and the minimal move is the one that disturbs the
+   * reader least. The extent travels either way — which row has to land with
+   * the field is not a property of the device.
+   * Only question forms currently pair a text field with an action row. A
+   * future permission text editor must supply its own extent here; do not
+   * accidentally borrow an action row from another request or enclosing UI.
+   */
+  const answerPlacement = (element: HTMLElement): RevealOptions => ({
+    extent: element.closest("form[data-question-form]")?.querySelector<HTMLElement>(".chat-request-actions") ?? undefined,
+    align: document.documentElement.getAttribute("data-ui-mode") === "touch" ? "end" : "nearest",
+  });
+  /**
+   * A control is revealed by the owner of the timeline it sits in — the same
+   * card can be shown in the parent transcript or in a subagent drill-down,
+   * and each timeline scrolls itself.
+   */
+  const revealInOwningTimeline = (element: HTMLElement): void => {
+    const placement = answerPlacement(element);
+    if (drilldownTimeline?.contains(element)) childScroll?.reveal(element, placement);
+    else if (timeline.contains(element)) parentScroll.reveal(element, placement);
+  };
+  /**
+   * The same choice of owner, for the standing version: while the field is
+   * focused its timeline is held at the revealed position, so the platform's
+   * own autoscroll as the caret is dragged cannot run the conversation away.
+   */
+  const holdInOwningTimeline = (element: HTMLElement): void => {
+    const placement = answerPlacement(element);
+    if (drilldownTimeline?.contains(element)) childScroll?.hold(element, placement);
+    else if (timeline.contains(element)) parentScroll.hold(element, placement);
+  };
+  /** Both owners on release: by the time focus has left, the field that was
+   *  held may no longer be in the timeline that held it. Releasing an owner
+   *  that holds nothing does nothing; the holder resumes its prior follow
+   *  intent through the next coordinated frame. */
+  const releaseHeldTimelines = (): void => { parentScroll.release(); childScroll?.release(); };
+  /** The focused control, while it is a text control this surface owns. */
+  const focusedChatTextControl = (): HTMLElement | null => {
+    const active = document.activeElement;
+    return active instanceof HTMLElement && surface.contains(active) && isTextEditingControl(active) ? active : null;
+  };
+  renderer.shellMutationHooks = {
+    beforeMutation: () => parentScroll.beforeMutation(),
+    afterMutation: () => parentScroll.request(),
+    inspected: () => save(),
+  };
+  childRenderer.shellMutationHooks = {
+    beforeMutation: () => childScroll?.beforeMutation(),
+    afterMutation: () => childScroll?.request(),
+    inspected: () => save(),
+  };
+  const viewport = new ChatViewportController(surface, form, () => {
+    parentScroll.request();
+    childScroll?.request();
+    // While a request is being answered, the geometry that changed is the
+    // keyboard's: the correction that matters is keeping the field the user
+    // is typing into inside what is left of the viewport. It rides the frame
+    // the corrections above already asked for, and has the last word in it.
+    if (!document.documentElement.hasAttribute("data-chat-answering")) return;
+    const focused = focusedChatTextControl();
+    if (focused) revealInOwningTimeline(focused);
+  });
 
   const flushSave = () => {
     if (saveTimer !== null) {
@@ -562,6 +942,9 @@ export function initChat(api = new ChatApiClient()): void {
       projection?.conversationId ?? null,
       selectedConversationDeleted ? presentation.selectedId ?? null : null,
     );
+    if ((!hasSelectedConversation || isUnestablishedStartup(presentation.selectedId)) && presentation.selectedId) {
+      known.add(presentation.selectedId);
+    }
     // Prune only once the inventory has actually loaded — an empty list at
     // boot must not wipe every stored draft.
     if (conversations.length > 0) {
@@ -630,6 +1013,24 @@ export function initChat(api = new ChatApiClient()): void {
   const backgroundTasksItems = document.querySelector<HTMLElement>("#chat-background-tasks-items");
 
   /**
+   * Both pinned lists of running work open when running work first appears
+   * in them, so a task's inspect and Stop controls are a tap away rather
+   * than behind a disclosure; a user's collapse of running work is held
+   * until that work is over (see running-work-disclosure.ts). Opening sets
+   * `open` and nothing else — no focus moves and the timeline is not
+   * scrolled; the list's rows are height-bounded, so the composer's
+   * displacement stays capped.
+   */
+  const trackRunningWork = (list: HTMLDetailsElement | null) => {
+    const disclosure = new RunningWorkDisclosure(list?.open ?? false);
+    list?.addEventListener("toggle", () => disclosure.toggled(list.open));
+    return (runningCount: number) => {
+      if (list && disclosure.paint(projection?.conversationId ?? null, runningCount) && !list.open) list.open = true;
+    };
+  };
+  const discloseBackgroundTasks = trackRunningWork(backgroundTasks);
+
+  /**
    * Work the agent left running in the background, pinned above the
    * composer with a stop control per task (spec: each task is listed with a
    * stop action). Settled tasks leave the list and take a timeline row.
@@ -643,12 +1044,23 @@ export function initChat(api = new ChatApiClient()): void {
   const stoppingTasks = new Set<string>();
   const syncBackgroundTasks = () => {
     if (!backgroundTasks || !backgroundTasksLabel || !backgroundTasksItems) return;
+    // The open drill-down's strip reads the same items; it keeps its own
+    // change check, so it is asked before this list's early return.
+    syncTaskInspection();
     const entries = projection && declares("background-tasks") ? runningBackgroundTasks(projection.items) : [];
-    const signature = entries.map(entry => [entry.taskId, entry.description, entry.progress ?? "", stoppingTasks.has(entry.taskId) ? "stopping" : ""].join("\u0001")).join("\u0002");
+    // Ahead of the unchanged-signature return: the rule reads every paint,
+    // since the conversation it is keyed on can change under one signature.
+    discloseBackgroundTasks(entries.length);
+    const signature = entries.map(entry => [entry.taskId, entry.description, entry.progress ?? "", entry.childConversationId ?? "", stoppingTasks.has(entry.taskId) ? "stopping" : ""].join("\u0001")).join("\u0002");
     if (signature === paintedBackgroundTasks) return;
     paintedBackgroundTasks = signature;
     if (entries.length === 0) {
       backgroundTasks.hidden = true;
+      // Emptied as well as hidden: a summary kept from the last task is read
+      // out by anything that reaches the label without seeing the `hidden`
+      // attribute, and it comes back on the next open still naming work that
+      // has long finished.
+      backgroundTasksLabel.textContent = "";
       backgroundTasksItems.replaceChildren();
       return;
     }
@@ -657,16 +1069,40 @@ export function initChat(api = new ChatApiClient()): void {
       const row = document.createElement("li");
       row.className = "is-running";
       row.dataset.backgroundTask = entry.taskId;
-      const text = document.createElement("span");
+      // A running task's description is the way in: an agent task opens its
+      // transcript, a shell task its output (spec: a running task is
+      // inspected). Settled tasks never reach this list.
+      const target = taskInspection(entry);
+      const text = document.createElement(target ? "button" : "span");
       text.className = "chat-background-task-text";
       text.textContent = entry.description;
       text.title = entry.description;
+      if (target && text instanceof HTMLButtonElement) {
+        text.type = "button";
+        text.classList.add("chat-background-task-inspect");
+        text.dataset.inspectTask = entry.taskId;
+        text.dataset.inspectView = target.view;
+        text.setAttribute("aria-label", `${target.view === "transcript" ? "Open the transcript of" : "Show the output of"} ${entry.description}`);
+      }
       row.append(text);
       if (entry.progress) {
         const progress = document.createElement("span");
         progress.className = "chat-background-task-progress";
         progress.textContent = entry.progress;
         row.append(progress);
+      } else {
+        // With no progress note the elapsed time IS the progress line (D6). A
+        // shell task never reports progress at all — the CLI emits no
+        // `task_progress` for `local_bash` — so without this the row has no
+        // live signal whatsoever, and a reader cannot tell a task that is
+        // working from one that is wedged. The readout is stamped with the
+        // launch time and ticked by the shared second clock, never a timer
+        // of its own: one row or ten, it is the same tick.
+        const elapsed = document.createElement("span");
+        elapsed.className = "chat-background-task-progress chat-background-task-elapsed";
+        elapsed.dataset.elapsedSince = String(entry.createdAt);
+        elapsed.textContent = formatTaskElapsed(Date.now() - entry.createdAt);
+        row.append(elapsed);
       }
       const stop = document.createElement("button");
       stop.type = "button";
@@ -680,12 +1116,12 @@ export function initChat(api = new ChatApiClient()): void {
     }));
     backgroundTasks.hidden = false;
   };
-  backgroundTasksItems?.addEventListener("click", event => {
-    const button = (event.target as Element | null)?.closest<HTMLButtonElement>("[data-stop-task]");
-    if (!button || !projection) return;
+  // One stop path for every control that offers it: the composer row and the
+  // drill-down's strip both name the task, and the in-flight guard is shared
+  // so neither can send the stop twice.
+  const requestStopTask = (taskId: string) => {
+    if (!projection || stoppingTasks.has(taskId)) return;
     const source = projection;
-    const taskId = button.dataset.stopTask ?? "";
-    if (stoppingTasks.has(taskId)) return;
     // The agent reports the stop as the task settling, which is what moves
     // the row out of this list; until then the control stays inert.
     stoppingTasks.add(taskId);
@@ -698,12 +1134,169 @@ export function initChat(api = new ChatApiClient()): void {
       paintedBackgroundTasks = null;
       syncBackgroundTasks();
     });
+  };
+  /**
+   * Opens a running task from its composer row: the child transcript for an
+   * agent task, titled as its subagents-track row is, and the task view for
+   * a shell task, titled by the command.
+   */
+  const inspectTask = (taskId: string) => {
+    if (!projection) return;
+    const source = projection;
+    const task = taskById(source.items, taskId);
+    const target = task ? taskInspection(task) : undefined;
+    if (!task || !target) return;
+    if (target.view === "transcript") {
+      const known = subagentEntries(source.items).some(entry => entry.conversationId === target.conversationId);
+      openChildConversation(target.conversationId, known ? subagentLabelFor(target.conversationId, source) : task.description, false, { conversationId: source.conversationId, taskId, view: "transcript" });
+      return;
+    }
+    openChildConversation(`task-output:${taskId}`, task.description, false, { conversationId: source.conversationId, taskId, view: "output" });
+  };
+  backgroundTasksItems?.addEventListener("click", event => {
+    const target = (event.target as Element | null)?.closest<HTMLButtonElement>("[data-stop-task], [data-inspect-task]");
+    if (!target) return;
+    if (target.dataset.stopTask !== undefined) requestStopTask(target.dataset.stopTask);
+    else if (target.dataset.inspectTask !== undefined) inspectTask(target.dataset.inspectTask);
+  });
+  drilldownTask?.addEventListener("click", event => {
+    const button = (event.target as Element | null)?.closest<HTMLButtonElement>("[data-stop-task]");
+    if (button?.dataset.stopTask !== undefined) requestStopTask(button.dataset.stopTask);
+  });
+
+  const scheduledWakeups = document.querySelector<HTMLDetailsElement>("#chat-scheduled-wakeups");
+  const scheduledWakeupsLabel = document.querySelector<HTMLElement>("#chat-scheduled-wakeups-label");
+  const scheduledWakeupsItems = document.querySelector<HTMLElement>("#chat-scheduled-wakeups-items");
+  const releaseButton = document.querySelector<HTMLButtonElement>("#chat-wakeups-release");
+  const releaseNote = document.querySelector<HTMLElement>("#chat-wakeups-release-note");
+
+  /**
+   * The wakeups the agent scheduled for itself, pinned above the composer
+   * while its session is held for them: each with its prompt, whether it
+   * recurs, and when it next fires, and one release that ends the session
+   * and every wakeup in it (spec). There is no per-wakeup cancel — the agent
+   * holds that control, not the user. Rebuilt only on change.
+   */
+  let paintedScheduledWakeups: string | null = null;
+  // A release in flight, by conversation: the control stays inert until the
+  // agent reports the wakeups ended, so it cannot be sent twice.
+  const releasing = new Set<string>();
+  // Cancels in flight, by wakeup id: a rebuild mid-request must not hand
+  // back an enabled button that would send the cancel twice.
+  const cancellingWakeups = new Set<string>();
+  const syncScheduledWakeups = () => {
+    if (!scheduledWakeups || !scheduledWakeupsLabel || !scheduledWakeupsItems || !releaseButton || !releaseNote) return;
+    const declared = Boolean(projection && declares("scheduled-wakeups"));
+    const pending = declared ? pendingWakeups(projection!.items) : [];
+    // Paused crons (D11): the session is gone, the agent rebuilds them when
+    // the conversation runs again. Listed so a prompt never revives one by
+    // surprise, each with its own Cancel.
+    const paused = declared ? pausedWakeups(projection!.items) : [];
+    const entries = [...pending, ...paused];
+    const status = projection?.status;
+    const inFlight = projection ? releasing.has(projection.conversationId) : false;
+    const signature = [status ?? "", inFlight ? "releasing" : "", ...entries.map(entry => [entry.wakeupId, entry.status, entry.prompt, entry.recurring, entry.nextFireAt ?? "", entry.schedule, cancellingWakeups.has(entry.wakeupId) ? "cancelling" : ""].join("\u0001"))].join("\u0002");
+    if (signature === paintedScheduledWakeups) return;
+    paintedScheduledWakeups = signature;
+    if (entries.length === 0) {
+      scheduledWakeups.hidden = true;
+      scheduledWakeupsItems.replaceChildren();
+      return;
+    }
+    scheduledWakeupsLabel.textContent = pending.length > 0 ? scheduledStatusLabel(pending) : pausedStatusLabel(paused);
+    scheduledWakeupsItems.replaceChildren(...entries.map(entry => {
+      const row = document.createElement("li");
+      row.dataset.scheduledWakeup = entry.wakeupId;
+      row.className = `is-${entry.status}`;
+      const text = document.createElement("span");
+      text.className = "chat-wakeup-prompt";
+      text.textContent = entry.prompt || "(no prompt)";
+      text.title = entry.prompt;
+      row.append(text);
+      if (entry.recurring) {
+        const recurs = document.createElement("span");
+        recurs.className = "chat-wakeup-recurring";
+        recurs.textContent = "Repeats";
+        recurs.title = `Recurring: ${entry.schedule}`;
+        row.append(recurs);
+      }
+      const when = document.createElement("span");
+      when.className = "chat-wakeup-when";
+      if (entry.status === "paused") {
+        when.textContent = "Paused";
+        when.title = entry.message ?? "Fires again when this conversation runs.";
+      } else {
+        // An expression the workspace cannot read is still stated, as written.
+        when.textContent = wakeupFireTime(entry.nextFireAt) ?? entry.schedule;
+        if (entry.nextFireAt !== undefined) when.title = dateTime(entry.nextFireAt);
+      }
+      row.append(when);
+      const cancel = document.createElement("button");
+      cancel.type = "button";
+      cancel.className = "chat-task-stop";
+      cancel.dataset.cancelWakeup = entry.wakeupId;
+      cancel.textContent = cancellingWakeups.has(entry.wakeupId) ? "Cancelling…" : "Cancel";
+      cancel.disabled = cancellingWakeups.has(entry.wakeupId) || inFlight;
+      cancel.setAttribute("aria-label", `Cancel wakeup: ${entry.prompt}`);
+      row.append(cancel);
+      return row;
+    }));
+    // Release ends the session, so it is offered only where nothing else
+    // would end with it: a running turn, or background work, says so and
+    // waits (the agent would refuse the release anyway). With only paused
+    // crons there is no session to release; each has its own Cancel.
+    const release = releaseButton.parentElement as HTMLElement | null;
+    if (release) release.hidden = pending.length === 0;
+    const releasable = status === "scheduled" && !inFlight;
+    releaseButton.disabled = !releasable;
+    releaseButton.textContent = inFlight ? "Releasing…" : "Release session";
+    releaseNote.textContent = status === "background"
+      ? "Release is possible once the background work ends."
+      : status !== "scheduled" && !inFlight
+        ? "Release is possible once this turn ends."
+        : "Releasing cancels every wakeup and ends the agent's session.";
+    scheduledWakeups.hidden = false;
+  };
+  scheduledWakeupsItems?.addEventListener("click", event => {
+    const button = (event.target as Element | null)?.closest<HTMLButtonElement>("[data-cancel-wakeup]");
+    if (!button || button.disabled || !projection) return;
+    const source = projection;
+    const wakeupId = button.dataset.cancelWakeup ?? "";
+    if (cancellingWakeups.has(wakeupId)) return;
+    // The agent reports the cancel as the row settling, which is what moves
+    // it out of this list; until then the control stays inert.
+    cancellingWakeups.add(wakeupId);
+    paintedScheduledWakeups = null;
+    syncScheduledWakeups();
+    void api.cancelWakeup(source.conversationId, wakeupId, newRequestId()).catch(error => {
+      announceFailureFor(source)(messageOf(error), true);
+    }).finally(() => {
+      cancellingWakeups.delete(wakeupId);
+      paintedScheduledWakeups = null;
+      syncScheduledWakeups();
+    });
+  });
+  releaseButton?.addEventListener("click", () => {
+    if (!projection || releaseButton.disabled) return;
+    const source = projection;
+    if (releasing.has(source.conversationId)) return;
+    releasing.add(source.conversationId);
+    paintedScheduledWakeups = null;
+    syncScheduledWakeups();
+    void api.release(source.conversationId, newRequestId()).catch(error => {
+      announceFailureFor(source)(messageOf(error), true);
+    }).finally(() => {
+      releasing.delete(source.conversationId);
+      paintedScheduledWakeups = null;
+      syncScheduledWakeups();
+    });
   });
 
   const subagents = document.querySelector<HTMLDetailsElement>("#chat-subagents");
   const subagentsLabel = document.querySelector<HTMLElement>("#chat-subagents-label");
   const subagentsItems = document.querySelector<HTMLElement>("#chat-subagents-items");
   const dismissButton = document.querySelector<HTMLButtonElement>("#chat-subagents-dismiss");
+  const discloseSubagents = trackRunningWork(subagents);
   const requestsJump = document.querySelector<HTMLButtonElement>("#chat-requests-jump");
   // Finished subagents stay until explicitly dismissed — nothing retires
   // them on a timer. Dismissals persist with the rest of the per-conversation
@@ -714,8 +1307,10 @@ export function initChat(api = new ChatApiClient()): void {
   // entries rather than scraped from whichever markup happens to carry the
   // text — the track row and the timeline row must produce the same title.
   const subagentLabelFor = (conversationId: string, source: ChatProjection | null): string => {
-    const entry = source ? subagentEntries(source.items).find(candidate => candidate.conversationId === conversationId) : undefined;
-    return entry ? subagentLabel(entry) : "Subagent";
+    // What the subagent itself spent, beside its name, once it has reported a
+    // price: every task it was given, and nothing it launched. A row states
+    // one task; the transcript is the whole agent.
+    return source ? subagentTranscriptTitle(subagentEntries(source.items), source.items, conversationId) : "Subagent";
   };
   subagentsItems?.addEventListener("click", event => {
     const open = (event.target as Element).closest<HTMLElement>("[data-open-conversation]");
@@ -746,6 +1341,59 @@ export function initChat(api = new ChatApiClient()): void {
    * have to scroll and count. This says how many and takes you to one.
    */
   let paintedRequests = "";
+  let outstandingCount = 0;
+  // The pill leads to a request; while that request is already on screen it
+  // has nothing to offer, and it is floating over the very card the user is
+  // answering. Intersection is the right question to ask, and an observer
+  // answers it off the scroll path — reading geometry per frame here would
+  // both force a layout and flicker as the card crosses the edge.
+  let requestObserver: IntersectionObserver | null = null;
+  let observedRequestCard: Element | null = null;
+  let requestTargetVisible = false;
+  const syncRequestsJumpVisibility = () => {
+    if (!requestsJump) return;
+    // A parent card keeps intersecting the parent timeline while the
+    // drill-down is pushed over it, but the reader cannot reach it there —
+    // and the pill is layered above the pushed screen precisely so a request
+    // the parent is waiting on stays visible from inside a subagent. So the
+    // target does not count as on screen while the layer is up. A card
+    // observed in the drill-down's own timeline is the layer's own business
+    // and is unaffected.
+    const buried = Boolean(drilldown && !drilldown.hidden) && Boolean(observedRequestCard && items.contains(observedRequestCard));
+    requestsJump.hidden = outstandingCount === 0 || (requestTargetVisible && !buried);
+  };
+  /**
+   * One observer, on the card the pill currently points at. It is torn down
+   * and rebuilt whenever that element changes — a new target, a re-rendered
+   * card, another conversation, or no outstanding request at all — so nothing
+   * is left observing a node the timeline has dropped.
+   * The current observer shares the document lifetime of initChat. Do not
+   * disconnect it on pagehide: iOS can retain the page (see the save handler).
+   * If this surface gains a dispose path, release this observer there too.
+   */
+  const observeRequestTarget = (id: string | undefined) => {
+    const card = id ? items.querySelector(`[data-chat-item-id="${CSS.escape(id)}"]`) : null;
+    if (card === observedRequestCard) return;
+    observedRequestCard = card;
+    requestObserver?.disconnect();
+    requestObserver = null;
+    requestTargetVisible = false;
+    if (!card || typeof IntersectionObserver !== "function") return;
+    requestObserver = new IntersectionObserver(entries => {
+      const entry = entries.at(-1);
+      if (!entry) return;
+      // Half the card, or half of what the timeline can show — a sliver of a
+      // card crossing the edge leaves its answer field and its Answer/Reject
+      // controls off screen, and the pill is the only way back to them. The
+      // dense threshold list is what has the rule re-evaluated as the card
+      // scrolls rather than only as it enters and leaves.
+      requestTargetVisible = entry.isIntersecting
+        && (entry.intersectionRatio >= 0.5
+          || (entry.rootBounds ? entry.intersectionRect.height >= entry.rootBounds.height / 2 : false));
+      syncRequestsJumpVisibility();
+    }, { root: timeline, threshold: Array.from({ length: 21 }, (_, index) => index / 20) });
+    requestObserver.observe(card);
+  };
   const syncOutstandingRequests = () => {
     if (!requestsJump) return;
     const outstanding = projection
@@ -756,20 +1404,24 @@ export function initChat(api = new ChatApiClient()): void {
     // Skipped when nothing changed: rewriting the pill's text every frame
     // replaces the text node a finger may be resting on.
     const signature = `${outstanding.length}\u0001${target?.id ?? ""}`;
-    if (signature === paintedRequests) return;
-    paintedRequests = signature;
-    if (outstanding.length === 0) {
-      requestsJump.hidden = true;
-      requestsJump.textContent = "";
-      delete requestsJump.dataset.requestTarget;
-      return;
+    if (signature !== paintedRequests) {
+      paintedRequests = signature;
+      if (outstanding.length === 0) {
+        requestsJump.textContent = "";
+        delete requestsJump.dataset.requestTarget;
+      } else {
+        const noun = outstanding.length === 1 ? "request needs" : "requests need";
+        requestsJump.textContent = `${outstanding.length} ${noun} your answer`;
+        // The answerable one is the newest; that is where the jump lands,
+        // because it is the only one a user can act on right now.
+        requestsJump.dataset.requestTarget = target!.id;
+      }
     }
-    const noun = outstanding.length === 1 ? "request needs" : "requests need";
-    requestsJump.hidden = false;
-    requestsJump.textContent = `${outstanding.length} ${noun} your answer`;
-    // The answerable one is the newest; that is where the jump lands, because
-    // it is the only one a user can act on right now.
-    requestsJump.dataset.requestTarget = target!.id;
+    // The count is the text's business; whether the pill shows is the
+    // observer's, so these run on every sync even when the text did not move.
+    outstandingCount = outstanding.length;
+    observeRequestTarget(target?.id);
+    syncRequestsJumpVisibility();
   };
 
   // A jump parked while the drill-down closes. Closing can be asynchronous —
@@ -805,6 +1457,7 @@ export function initChat(api = new ChatApiClient()): void {
   const syncSubagents = () => {
     if (!subagents || !subagentsLabel || !subagentsItems) return;
     if (!declares("subagents")) {
+      discloseSubagents(0);
       paintedSubagents = "";
       subagents.hidden = true;
       subagentsItems.replaceChildren();
@@ -813,11 +1466,25 @@ export function initChat(api = new ChatApiClient()): void {
     const all = projection ? subagentEntries(projection.items) : [];
     const dismissed = projection ? dismissedSubagents(projection.conversationId) : new Set<string>();
     const entries = all.filter(entry => !dismissed.has(entry.id));
+    // Finished entries stay listed until dismissed, but they are not running
+    // work: only a run that has not settled opens the track.
+    discloseSubagents(entries.filter(entry => entry.status === "running" || entry.status === "pending").length);
     const signature = entries
-      .map(entry => [entry.id, entry.status, entry.subagent ?? "", entry.description, entry.conversationId ?? "", entry.model ?? "", entry.usage ? String(totalTokens(entry.usage)) : ""].join("\u0001"))
+      .map(entry => [entry.id, entry.status, entry.subagent ?? "", entry.description, entry.conversationId ?? "", entry.model ?? "", entry.usage ? String(totalTokens(entry.usage)) : "", entry.usage?.costUsd ?? "", entry.progress ?? ""].join("\u0001"))
       .join("\u0002");
     if (signature === paintedSubagents) return;
     paintedSubagents = signature;
+    // The open transcript's title states the same cost as the row: a running
+    // subagent's price moves while its transcript is open, and a title
+    // computed once at the click would keep the earlier figure. A task's
+    // output view is titled by its command and is no subagent's transcript.
+    if (child && drilldownTitle && child.task?.view !== "output") {
+      const label = subagentLabelFor(child.conversationId, projection);
+      if (label !== child.label) {
+        child.label = label;
+        drilldownTitle.textContent = label;
+      }
+    }
     if (dismissButton) {
       dismissButton.hidden = !entries.some(entry => entry.status !== "running" && entry.status !== "pending");
     }
@@ -826,11 +1493,7 @@ export function initChat(api = new ChatApiClient()): void {
       subagentsItems.replaceChildren();
       return;
     }
-    const running = entries.filter(entry => entry.status === "running" || entry.status === "pending");
-    const noun = entries.length === 1 ? "subagent" : "subagents";
-    subagentsLabel.textContent = running.length > 0
-      ? `${running.length} of ${entries.length} ${noun} working · ${running[0]!.description}`
-      : `${entries.length} ${noun} finished`;
+    subagentsLabel.textContent = subagentTrackSummary(entries);
     subagentsItems.replaceChildren(...entries.map(entry => {
       const row = document.createElement("li");
       row.className = `is-${entry.status}`;
@@ -848,6 +1511,15 @@ export function initChat(api = new ChatApiClient()): void {
         label.textContent = text;
         row.append(label);
       }
+      // What the subagent is doing right now, where the agent reports it —
+      // the model-written summary, or the tool it is using.
+      if (entry.progress) {
+        const progress = document.createElement("span");
+        progress.className = "chat-subagent-progress";
+        progress.textContent = entry.progress;
+        progress.title = entry.progress;
+        row.append(progress);
+      }
       // What it ran and what it cost, after the description so the row still
       // leads with what the subagent is doing. The model shows whenever the
       // agent named it; the token figure only where the agent declares it
@@ -856,6 +1528,9 @@ export function initChat(api = new ChatApiClient()): void {
       const attribution = [
         entry.model,
         declares("context") && entry.usage ? `${formatTokens(totalTokens(entry.usage))} tokens` : undefined,
+        // The child's own price, where its session reported one. Zero is
+        // an unpriced model, not a free one, and is not asserted.
+        declares("context") && entry.usage?.costUsd ? formatUsd(entry.usage.costUsd) : undefined,
       ].filter(Boolean).join(" · ");
       if (attribution) {
         const note = document.createElement("span");
@@ -884,15 +1559,18 @@ export function initChat(api = new ChatApiClient()): void {
   // breakdown rebuilds that would come out identical.
   let paintedSource: ConversationItem | undefined;
   let paintedUsageModel: string | undefined;
+  let paintedWindowKey: string | undefined;
   const syncContextIndicator = () => {
     if (!contextUsage?.isConnected || !contextUsageFill || !contextUsageLabel || !contextUsageBreakdown) return;
     // The newest report or carrier, scanned from the tail — it is almost
     // always right at the end of a long timeline (see context-readout.ts).
     const readout = contextReadout(projection?.items ?? [], models, displayedConfiguration().model);
     const reportingModel = readout?.model ? modelValue(readout.model) : "";
-    if (readout?.source === paintedSource && reportingModel === paintedUsageModel) return;
+    const windowKey = JSON.stringify([readout?.limit, readout?.window]);
+    if (readout?.source === paintedSource && reportingModel === paintedUsageModel && windowKey === paintedWindowKey) return;
     paintedSource = readout?.source;
     paintedUsageModel = reportingModel;
+    paintedWindowKey = windowKey;
     if (!readout || !declares("context")) {
       contextUsage.hidden = true;
       contextUsage.open = false;
@@ -908,12 +1586,15 @@ export function initChat(api = new ChatApiClient()): void {
     // The figure states the fill in words as well as in width, so the tier
     // colouring below is emphasis on something already legible rather than
     // the only signal.
-    contextUsageLabel.textContent = fraction === undefined ? "?" : `${Math.round(fraction * 100)}%`;
+    const estimated = readout.window?.source === "estimate";
+    contextUsageLabel.textContent = fraction === undefined ? formatTokens(used) : `${estimated ? "~" : ""}${Math.round(fraction * 100)}%`;
     contextUsage.dataset.fill = fraction === undefined ? "unknown" : fraction >= 0.9 ? "full" : fraction >= 0.75 ? "high" : "normal";
     contextUsage.dataset.source = readout.source.type === "context_report" ? "report" : "usage";
+    contextUsage.dataset.windowSource = readout.window?.source ?? (limit === undefined ? "unknown" : "legacy");
+    contextUsage.dataset.windowFreshness = readout.window?.freshness ?? "current";
     contextUsage.title = fraction === undefined
-      ? `${used.toLocaleString()} tokens in the context window`
-      : `${used.toLocaleString()} of ${limit!.toLocaleString()} tokens in the context window`;
+      ? `${used.toLocaleString()} tokens used · Limit unavailable`
+      : `${used.toLocaleString()} of ${limit!.toLocaleString()} tokens in the context window${estimated ? " · Estimated limit" : readout.window?.freshness === "cached" ? " · Cached limit" : ""}`;
     contextUsageBreakdown.replaceChildren(...readout.rows.flatMap(([label, value]) => {
       const term = document.createElement("dt");
       term.textContent = label;
@@ -921,6 +1602,13 @@ export function initChat(api = new ChatApiClient()): void {
       detail.textContent = value.toLocaleString();
       return [term, detail];
     }));
+    if (limit === undefined) {
+      const term = document.createElement("dt");
+      term.textContent = "Limit";
+      const detail = document.createElement("dd");
+      detail.textContent = "Limit unavailable";
+      contextUsageBreakdown.append(term, detail);
+    }
     contextUsage.hidden = false;
   };
 
@@ -1015,9 +1703,13 @@ export function initChat(api = new ChatApiClient()): void {
   const jumpToPrompt = (id: string, smooth: boolean): HTMLElement | null => {
     const node = items.querySelector<HTMLElement>(`[data-chat-item-id="${CSS.escape(id)}"]`);
     if (!node) return null;
+    parentScroll.pause();
     const bounds = timeline.getBoundingClientRect();
+    // Land below the scroller's reserved top band — the pinned day separator
+    // when there is one — rather than under it.
+    const reserved = items.querySelector(".chat-day-separator") ? Number.parseFloat(getComputedStyle(timeline).scrollPaddingTop) || 8 : 8;
     timeline.scrollTo({
-      top: timeline.scrollTop + node.getBoundingClientRect().top - bounds.top - 8,
+      top: timeline.scrollTop + node.getBoundingClientRect().top - bounds.top - reserved,
       behavior: smooth && !reducedMotion() ? "smooth" : "auto",
     });
     return node;
@@ -1101,6 +1793,15 @@ export function initChat(api = new ChatApiClient()): void {
     for (const button of revertedItems?.querySelectorAll<HTMLButtonElement>("[data-history-restore]") ?? []) button.disabled = historyBusy;
   };
 
+  // Focus a renderer asked for, once its timeline has painted (see
+  // TimelineRenderer.focusAfterPaint).
+  const applyFocusAfterPaint = (owner: TimelineRenderer, container: HTMLElement) => {
+    const selector = owner.focusAfterPaint;
+    if (!selector) return;
+    owner.focusAfterPaint = undefined;
+    container.querySelector<HTMLElement>(selector)?.focus();
+  };
+
   const renderNow = (newContent: boolean) => {
     if (!chatSurfaceActive()) { renderDirty = true; pendingNewContent ||= newContent; return; }
     renderDirty = false;
@@ -1108,7 +1809,12 @@ export function initChat(api = new ChatApiClient()): void {
     rendering = true;
     // The card states the owning agent's own persistent-approval reach.
     renderer.permissionScopeNote = agent?.permissionScopeNote;
+    renderer.loginAction = contextLoginAction();
+    const conversation = conversations.find(value => value.id === projection?.conversationId);
+    renderer.conversationTitle = conversation ? displayConversationTitle(conversation) : chatHeading();
     const dirty = renderer.render(items, projection, expanded, declares("subagents"), declares("reversible-history"), turnStartedAt(projection));
+    // Reconcile the current snapshot before revealing a retained output window.
+    renderer.setShellOutputsHidden(false);
     revertedDock?.render(projection?.reversibleHistory?.revertedMessages ?? []);
     queueDock.render(queueDockElement, projection?.queued ?? []);
     syncHistoryControls();
@@ -1116,10 +1822,11 @@ export function initChat(api = new ChatApiClient()): void {
     syncTaskList();
     syncSubagents();
     syncBackgroundTasks();
+    syncScheduledWakeups();
     syncOutstandingRequests();
     syncContextIndicator();
     syncPromptRail();
-    timeline.scrollTop = anchor.afterMutation(anchorGeometry(), newContent);
+    parentScroll.request(newContent);
     latestButton.hidden = !anchor.hasUnseen();
     syncControls();
     for (const node of dirty) {
@@ -1129,6 +1836,8 @@ export function initChat(api = new ChatApiClient()): void {
       // this settles the tab strip and button state for its first step.
       node.querySelectorAll<HTMLFormElement>("form[data-question-form]").forEach(syncQuestionForm);
     }
+    applyFocusAfterPaint(renderer, items);
+    reconcileAnswerAfterPaint();
   };
 
   const scheduleRender = (newContent = false, captureCurrent = true, incremental = false) => {
@@ -1147,12 +1856,13 @@ export function initChat(api = new ChatApiClient()): void {
     if (renderFrame !== null) return;
     // beforeMutation is a no-op while pinned — skipping the call skips the
     // full-geometry pass it would otherwise be handed for nothing.
-    if (captureCurrent && !anchor.isPinned()) anchor.beforeMutation(geometry());
-    renderFrame = requestAnimationFrame(() => {
+    if (captureCurrent) parentScroll.beforeMutation();
+    renderFrame = requestAnimationFrame(timestamp => {
       renderFrame = null;
       const content = pendingNewContent;
       pendingNewContent = false;
       renderNow(content);
+      parentScroll.flush(timestamp);
     });
   };
 
@@ -1189,14 +1899,29 @@ export function initChat(api = new ChatApiClient()): void {
     }
   };
 
-  // The tick runs while anything on screen is working: the parent's turn, or
-  // the subagent in the drill-down. A child keeps running after its parent
-  // has gone background or idle, and its working line is stamped from the
-  // child's own status — so the parent's status alone cannot decide whether
-  // the clock is needed. Re-evaluated wherever either status can change.
+  // The composer task rows that carry an elapsed readout instead of a
+  // progress note, ticked by the same clock as the working lines: the rows
+  // are rebuilt only when what they SAY changes, and the elapsed time is not
+  // part of that, so the second hand writes into the row in place.
+  const tickBackgroundTaskElapsed = () => {
+    if (!chatSurfaceActive()) return;
+    for (const readout of backgroundTasksItems?.querySelectorAll<HTMLElement>("[data-elapsed-since]") ?? []) {
+      readout.textContent = formatTaskElapsed(Date.now() - Number(readout.dataset.elapsedSince));
+    }
+  };
+
+  // The tick runs while anything on screen is working: the parent's turn, the
+  // subagent in the drill-down, or a background task the turn left running. A
+  // child keeps running after its parent has gone background or idle, and its
+  // working line is stamped from the child's own status — so the parent's
+  // status alone cannot decide whether the clock is needed. Background work
+  // is its own case because the background state is not a live status: the
+  // turn has ended, and only the tasks are still going. Re-evaluated wherever
+  // any of those can change, so the last task settling stops the clock.
   const syncWorkingTimer = () => {
-    const working = chatSurfaceActive() && (isLiveConversationStatus(projection?.status) || isLiveConversationStatus(child?.projection?.status));
-    if (working && workingTimer === null) workingTimer = setInterval(() => { syncRoutineStatus(); tickWorkingLines(); }, 1_000);
+    const tasksRunning = declares("background-tasks") && runningBackgroundTasks(projection?.items ?? []).length > 0;
+    const working = chatSurfaceActive() && (isLiveConversationStatus(projection?.status) || isLiveConversationStatus(child?.projection?.status) || tasksRunning);
+    if (working && workingTimer === null) workingTimer = setInterval(() => { syncRoutineStatus(); tickWorkingLines(); tickBackgroundTaskElapsed(); }, 1_000);
     if (!working && workingTimer !== null) {
       clearInterval(workingTimer);
       workingTimer = null;
@@ -1614,9 +2339,34 @@ export function initChat(api = new ChatApiClient()): void {
    * resets keep pace with the clock.
    */
   let paintedPlanReport: ContextReportItem | undefined;
+  let paintedTotalsKey: string | undefined;
+  // The standing the chip and readout were last painted for, so a rate
+  // limit that begins or ends without a new plan report still repaints.
+  let paintedStanding: RateLimitStanding | undefined;
+  // The standing last spoken, per conversation. Per conversation because a
+  // selection change blanks the projection before the incoming snapshot
+  // lands: read as one conversation's history, that blank says "the standing
+  // ended" and the reader is told a limit cleared that is still in force.
+  // A conversation's own entry only moves when its own standing does.
+  //
+  // The level, not the words. The login restates a warning on every request
+  // with its utilization ticking up, and the message carries that figure —
+  // keyed on the spoken text, the warning would be read aloud again on each
+  // one, moving the noise this change takes out of the timeline into the
+  // reader's ear instead. The transitions worth speaking are the ones the
+  // spec names: beginning, changing level, and retirement.
+  const announcedStandings = new Map<string, RateLimitStanding["level"] | undefined>();
+  // Which conversation the live region is currently describing, so a change
+  // of selection can stop it describing the one the reader has left.
+  let liveStandingConversation: string | undefined;
+  const ANNOUNCED_STANDING_LIMIT = 256;
   let planTick: ReturnType<typeof setInterval> | undefined;
   const paintPlanRows = () => {
     if (planReadoutRowsElement && paintedPlanReport?.plan) planReadoutRowsElement.replaceChildren(...buildPlanRowNodes(document, planReadoutRows(paintedPlanReport.plan)));
+    // The standing's reset reads relative to now, like the rows: ticked with them.
+    if (planReadoutStanding && paintedStanding) planReadoutStanding.textContent = standingSentence(paintedStanding);
+    paintPlanAge();
+    paintPlanReadControls();
   };
   // The pin makes sense only where the sidebar sits beside the chat: on the
   // desktop layout with the sidebar expanded, and while the pane is not
@@ -1643,8 +2393,15 @@ export function initChat(api = new ChatApiClient()): void {
     const family = exact ?? models.find(model => !model.default && ids(model).some(candidate => bare.includes(strip(candidate))));
     return family?.name ?? id;
   };
-  const paintPlanSession = (session: SessionTotals | undefined, items: readonly ConversationItem[]) => {
+  // The conversation block is a receipt: lines that sum to a total, itemized
+  // by agent, by kind of agent, or by model — one at a time, the reader's
+  // choice, remembered. Totals the agent tallies itself (Claude Code) come per
+  // model only: no control, no total line, the block as it has always read.
+  let paintedSession: { session: ConversationTotals; items: readonly ConversationItem[] } | undefined;
+  const receiptView = (session: ConversationTotals): ReceiptView => session.receipt ? presentation.receiptView ?? "agents" : "models";
+  const paintPlanSession = (session: ConversationTotals | undefined, items: readonly ConversationItem[]) => {
     if (!planSession || !planSessionCost || !planSessionModels) return;
+    paintedSession = session ? { session, items } : undefined;
     planSession.hidden = !session;
     if (!session) return;
     // "This conversation", or "since HH:MM" when the tally began after the
@@ -1656,23 +2413,41 @@ export function initChat(api = new ChatApiClient()): void {
     if (session.apiDurationMs > 0) parts.push(`${formatApiTime(session.apiDurationMs)} of API time`);
     if (session.linesAdded > 0 || session.linesRemoved > 0) parts.push(`+${session.linesAdded} −${session.linesRemoved} lines`);
     planSessionCost.textContent = parts.join(" · ");
-    planSessionModels.replaceChildren(...session.models.map(model => {
-      const row = document.createElement("tr");
-      const cells = [
-        [sessionModelName(model.id), model.id],
-        [formatTokens(model.input + model.cacheRead + model.cacheWrite), `${model.input.toLocaleString()} input · ${model.cacheRead.toLocaleString()} cache read · ${model.cacheWrite.toLocaleString()} cache write`],
-        [formatTokens(model.output), `${model.output.toLocaleString()} output`],
-        [formatUsd(model.costUsd), ""],
-      ];
-      for (const [text, title] of cells) {
-        const cell = document.createElement("td");
-        cell.textContent = text!;
-        if (title) cell.title = title;
-        row.append(cell);
+    const view = receiptView(session);
+    if (planSessionViews) {
+      planSessionViews.hidden = !session.receipt;
+      for (const button of planSessionViews.querySelectorAll<HTMLElement>("[data-receipt-view]")) {
+        const active = button.dataset.receiptView === view;
+        button.classList.toggle("is-active", active);
+        button.setAttribute("aria-checked", String(active));
+        button.tabIndex = active ? 0 : -1;
       }
-      return row;
-    }));
+    }
+    if (planSessionHeading) planSessionHeading.textContent = receiptHeading(view);
+    planSessionModels.replaceChildren(...buildReceiptRows(document, session, view, sessionModelName));
+    if (planSessionTotal) {
+      planSessionTotal.hidden = !session.receipt;
+      planSessionTotal.replaceChildren(...(session.receipt ? [buildReceiptTotal(document, session.receipt.total)] : []));
+    }
   };
+  const chooseReceiptView = (view: ReceiptView, focus: boolean) => {
+    presentation.receiptView = view;
+    save();
+    if (paintedSession) paintPlanSession(paintedSession.session, paintedSession.items);
+    if (focus) planSessionViews?.querySelector<HTMLElement>(`[data-receipt-view="${view}"]`)?.focus();
+  };
+  planSessionViews?.addEventListener("click", event => {
+    const view = parseReceiptView((event.target as Element).closest<HTMLElement>("[data-receipt-view]")?.dataset.receiptView);
+    if (view) chooseReceiptView(view, false);
+  });
+  // A radiogroup moves its selection with the arrow keys, not Tab.
+  planSessionViews?.addEventListener("keydown", event => {
+    const step = event.key === "ArrowRight" || event.key === "ArrowDown" ? 1 : event.key === "ArrowLeft" || event.key === "ArrowUp" ? -1 : 0;
+    if (step === 0 || !paintedSession) return;
+    event.preventDefault();
+    const views: readonly ReceiptView[] = ["agents", "types", "models"];
+    chooseReceiptView(views[(views.indexOf(receiptView(paintedSession.session)) + step + views.length) % views.length]!, true);
+  });
   // A login without plan limits (API key, Bedrock, Vertex) reports an empty
   // plan beside real session totals. The chip then carries the conversation's
   // cost — the figure that login budgets by — and the readout is only the
@@ -1681,41 +2456,128 @@ export function initChat(api = new ChatApiClient()): void {
   // empty plan and says the login reports none. "Empty" is the readout's
   // own test — no row to draw — not the chip's base summary: a plan of only
   // a model-scoped bucket, or of reset-only base windows, has rows to show.
-  const syncPlanUsage = () => {
+  // The workspace's last-known report, shaped as the report a conversation
+  // would carry, so a conversation without one of its own reads the same
+  // path. Cached per held report: the repaint check keys on identity.
+  let knownAsReport: { source: ReturnType<typeof currentUsageReport>; item: ContextReportItem } | undefined;
+  const lastKnownPlanReport = (): ContextReportItem | undefined => {
+    const known = currentUsageReport();
+    if (!known) return undefined;
+    if (knownAsReport?.source !== known) knownAsReport = { source: known, item: { id: "context:last-known", type: "context_report", createdAt: known.reportedAt, total: 0, plan: known.plan } };
+    return knownAsReport.item;
+  };
+  const syncPlanUsage = (standing: RateLimitStanding | undefined) => {
     if (!planUsage || !planUsageSummary) return;
-    const report = projection && declares("context") ? latestPlanReport(projection.items) : undefined;
+    const own = projection && declares("context") ? latestPlanReport(projection.items) : undefined;
+    // The newer of the conversation's own report and the workspace's
+    // last-known one: a reopened conversation, or one with only a standing,
+    // still shows the windows (spec), and a read that went through another
+    // session still answers the conversation that asked. The totals stay
+    // the conversation's own.
+    const known = declares("usage") ? lastKnownPlanReport() : undefined;
+    const report = own && (!known || own.createdAt >= known.createdAt) ? own : known ?? own;
     const plan = report?.plan;
-    const text = report ? planSummaryLabel(report) : undefined;
-    planUsage.hidden = !text;
-    if (!text || !report || !plan) {
+    // The conversation's totals: the report's own where the agent tallies
+    // them (Claude Code), else folded from the priced usage carriers
+    // (OpenCode). Either way the chip and the block below read one figure.
+    const totals = projection && declares("context") ? resolveSessionTotals(projection.items) : undefined;
+    // One chip for the plan and the standing together. It can be shown for
+    // a standing alone, so a login with no plan is not left with nowhere to
+    // say it is rate limited.
+    const chip = planChip(report || totals ? { ...(plan ? { plan } : {}), ...(totals ? { session: totals } : {}) } : undefined, standing);
+    planUsage.hidden = !chip;
+    if (!chip) {
       planUsage.open = false;
       paintedPlanReport = undefined;
+      paintedTotalsKey = undefined;
+      paintedStanding = undefined;
       // An empty plan still tells the pane something: this login has none.
       if (report?.plan) noteUsageReport({ plan: report.plan, reportedAt: report.createdAt });
       return;
     }
-    const hasWindows = planHasRows(plan);
-    planUsageSummary.textContent = text;
-    planUsage.dataset.level = hasWindows ? planUtilizationLevel(plan) : "normal";
-    planUsage.dataset.summary = hasWindows ? "plan" : "cost";
-    if (report === paintedPlanReport) return;
+    const hasWindows = Boolean(plan && planHasRows(plan));
+    planUsageSummary.textContent = chip.text;
+    planUsage.dataset.level = chip.level;
+    planUsage.dataset.summary = chip.kind;
+    // The standing is repainted on its own, not only when the report moves:
+    // a rate limit can begin and end without the login reporting a window.
+    // The reset is part of the key, not just the message and level: a
+    // rolling window restates one standing with a later reset, and the chip
+    // above already shows it — an early return here would leave the opened
+    // readout contradicting the chip that opened it.
+    const sameStanding = standing?.message === paintedStanding?.message
+      && standing?.level === paintedStanding?.level
+      && standing?.resetsAt === paintedStanding?.resetsAt;
+    // Folded totals are a fresh object per fold, so they are keyed by what
+    // they say: a restated carrier that moved the cost repaints, one that
+    // did not is a no-op.
+    const totalsKey = totals ? JSON.stringify([totals.costUsd, totals.models, totals.receipt?.lines]) : undefined;
+    if (report === paintedPlanReport && totalsKey === paintedTotalsKey && sameStanding) return;
     paintedPlanReport = report;
-    const name = planName(plan);
+    paintedTotalsKey = totalsKey;
+    paintedStanding = standing;
+    if (planReadoutStanding) {
+      planReadoutStanding.hidden = !standing;
+      planReadoutStanding.textContent = standing ? standingSentence(standing) : "";
+    }
+    const name = plan ? planName(plan) : undefined;
     if (planReadoutHead) planReadoutHead.hidden = !hasWindows;
     if (planReadoutRowsElement) planReadoutRowsElement.hidden = !hasWindows;
-    planReadout?.setAttribute("aria-label", hasWindows ? "Plan usage" : "This conversation's usage");
+    planReadout?.setAttribute("aria-label", hasWindows ? "Plan usage" : standing ? "Rate limit" : "This conversation's usage");
     if (planReadoutName) planReadoutName.textContent = name ?? "Plan usage";
-    planUsageSummary.title = hasWindows
+    planSummaryBaseTitle = hasWindows
       ? `${name ?? "Plan usage"} · open for every window and its reset`
-      : "This login reports no plan limits · open for this conversation's cost and per-model usage";
+      : standing
+        ? "Open for what the login reported and when it resets"
+        : "This login reports no plan limits · open for this conversation's cost and per-model usage";
+    planUsageSummary.title = planSummaryBaseTitle;
     paintPlanRows();
-    paintPlanSession(report.session, projection?.items ?? []);
-    noteUsageReport({ plan, reportedAt: report.createdAt });
+    paintPlanSession(totals, projection?.items ?? []);
+    if (own?.plan) noteUsageReport({ plan: own.plan, reportedAt: own.createdAt });
   };
+  // The read time and its age beside the plan name, and the stale mark on
+  // the readout and the chip; repainted with the rows so the age moves.
+  const paintPlanAge = () => {
+    const readAt = paintedPlanReport?.createdAt;
+    const hasPlan = Boolean(paintedPlanReport?.plan && planHasRows(paintedPlanReport.plan));
+    if (planReadoutAge) planReadoutAge.textContent = hasPlan && readAt !== undefined ? usageAsOf(readAt) : "";
+    const stale = hasPlan && readAt !== undefined && usageStale(readAt);
+    if (planUsage) {
+      if (stale) planUsage.dataset.stale = "true"; else delete planUsage.dataset.stale;
+      if (planUsageSummary) planUsageSummary.title = stale && readAt !== undefined ? `${planSummaryBaseTitle} · read ${usageAsOf(readAt).replace(/^as of /, "")}` : planSummaryBaseTitle;
+    }
+  };
+  let planSummaryBaseTitle = "";
+  // "Read now" and the read's state line: shown only for an agent that
+  // reports plan usage, disabled and relabelled while a read is out.
+  const paintPlanReadControls = () => {
+    const state = usageReadState();
+    if (planRead) {
+      planRead.hidden = !declares("usage") || !usageReadable();
+      planRead.disabled = state.reading;
+      planRead.textContent = state.reading ? "Reading…" : "Read now";
+    }
+    if (planReadoutStatus) {
+      const text = declares("usage") ? readStatusText(state) : undefined;
+      planReadoutStatus.hidden = !text;
+      planReadoutStatus.textContent = text ?? "";
+    }
+  };
+  onUsageChange(() => {
+    paintPlanReadControls();
+    // A fresh report from the read (or from any conversation) is a new
+    // last-known plan: a conversation reading through it repaints.
+    syncPlanUsage(paintedStanding);
+  });
+  planRead?.addEventListener("click", () => { void readUsageNow("start"); });
+  initUsagePaneControls();
   planUsage?.addEventListener("toggle", () => {
     if (planUsage.open) {
       syncPlanPin();
       paintPlanRows();
+      // A stale report refreshes through a session that is already up;
+      // nothing is started for an unasked read (spec).
+      if (declares("usage")) refreshUsageIfStale();
       if (planTick === undefined) planTick = setInterval(paintPlanRows, 60_000);
     } else if (planTick !== undefined) {
       clearInterval(planTick);
@@ -1748,20 +2610,43 @@ export function initChat(api = new ChatApiClient()): void {
       submitting,
       backgroundDeclared: declares("background-tasks"),
       backgroundTasks: runningBackgroundTasks(projection?.items ?? []),
+      scheduledDeclared: declares("scheduled-wakeups"),
+      scheduledWakeups: pendingWakeups(projection?.items ?? []),
     });
-    // The rate-limit badge and plan utilization ride beside the status, from
-    // the latest notice / report the timeline holds (D11, spec).
+    // The rate-limit standing and plan utilization ride beside the status as
+    // one chip, from the standing / report the timeline holds (D11, spec).
     const limit = projection ? latestRateLimit(projection.items) : undefined;
-    if (rateLimitBadge) {
-      const badge = limit ? rateLimitBadgeLabel(limit) : undefined;
-      rateLimitBadge.hidden = !badge;
-      rateLimitBadge.textContent = badge ?? "";
-      rateLimitBadge.dataset.level = limit?.level ?? "";
-      if (limit?.resetsAt) rateLimitBadge.title = `Resets ${new Date(limit.resetsAt).toLocaleString()}`;
-      else rateLimitBadge.removeAttribute("title");
+    syncPlanUsage(limit);
+    // Spoken only on a transition of THIS conversation's standing:
+    // beginning, hardening, or being retired. With no conversation in hand
+    // there is no standing to have changed, so nothing is said.
+    if (rateLimitLive) {
+      // The region describes one conversation. When the selection moves it
+      // is emptied, so it cannot go on stating the standing of the
+      // conversation the reader has left — an unlimited conversation would
+      // otherwise carry the previous one's warning in the accessibility
+      // tree. Emptying is not the same as clearing: it announces nothing
+      // and claims nothing about the incoming conversation, which is why it
+      // is not routed through the transition below.
+      if (liveStandingConversation !== projection?.conversationId) {
+        liveStandingConversation = projection?.conversationId;
+        rateLimitLive.textContent = "";
+      }
     }
-    syncPlanUsage();
-    if (composerChips) composerChips.hidden = (rateLimitBadge?.hidden ?? true) && (planUsage?.hidden ?? true);
+    if (rateLimitLive && projection) {
+      const previous = announcedStandings.get(projection.conversationId);
+      if (limit?.level !== previous) {
+        // What is spoken is still the full standing with its reset — the
+        // figure is worth hearing when the level moves, just not on every
+        // request. A standing that ended is worth saying too: the reader
+        // was told it began, and the chip is about to go quiet.
+        rateLimitLive.textContent = limit
+          ? standingSentence(limit)
+          : previous ? "Rate limit cleared; requests are allowed again." : "";
+        boundedSet(announcedStandings, projection.conversationId, limit?.level, ANNOUNCED_STANDING_LIMIT);
+      }
+    }
+    if (composerChips) composerChips.hidden = planUsage?.hidden ?? true;
     composerStatus.dataset.state = stateName;
     composerStatus.setAttribute("aria-label", label);
     composerStatus.title = stateName === "working" ? workingText() : label;
@@ -1830,11 +2715,12 @@ export function initChat(api = new ChatApiClient()): void {
   };
 
   // A default entry is named by what it runs: "Default · Opus (1M context)"
-  // rather than an opaque "Default (recommended)".
+  // rather than an opaque "Default (recommended)" — by its id when it runs a
+  // model no entry offers (a settings-selected id the catalog omits).
   const modelChipName = (model: ChatModel): string => {
     if (model.default && model.resolvesTo) {
       const resolved = models.find(candidate => sameModel(candidate.selection, model.resolvesTo!));
-      if (resolved) return `Default · ${resolved.name}`;
+      return `Default · ${resolved ? resolved.name : model.resolvesTo.modelId}`;
     }
     return model.name;
   };
@@ -1872,7 +2758,14 @@ export function initChat(api = new ChatApiClient()): void {
       offersReasoning ? `Reasoning: ${configuration.variant ? configurationOptionLabel(configuration.variant) : `chosen by ${agent?.name ?? "the agent"}`}` : "",
     ].filter(Boolean);
     configurationTrigger.setAttribute("aria-label", accessibleValues.length > 0 ? `Chat configuration. ${accessibleValues.join(". ")}` : "Chat settings");
-    configurationPicker?.update({ agent, models, modes, configuration });
+    configurationPicker?.update({
+      agent,
+      models,
+      modes,
+      configuration,
+      // An empty list with no usable login says why, and how to fix it.
+      ...(models.length === 0 && contextLoginState() === "missing" ? { emptyNotice: { message: "No provider is logged in.", action: contextLoginAction() } } : {}),
+    });
     syncAttachControl();
     syncControls();
   };
@@ -1906,7 +2799,7 @@ export function initChat(api = new ChatApiClient()): void {
 
   const recoverSelectedConversation = (id: string) => {
     const token = selectionGeneration;
-    if (disposed || activeConversationId() !== id) return;
+    if (activeConversationId() !== id) return;
     if (conversationRefreshRecovery?.conversationId === id && conversationRefreshRecovery.token === token) return;
     stopConversationRefreshRecovery();
     const recovery: ConversationRefreshRecovery = {
@@ -1918,9 +2811,9 @@ export function initChat(api = new ChatApiClient()): void {
     };
     conversationRefreshRecovery = recovery;
     void (async () => {
-      while (!disposed && conversationRefreshRecovery === recovery && selectionGeneration === token && activeConversationId() === id) {
+      while (conversationRefreshRecovery === recovery && selectionGeneration === token && activeConversationId() === id) {
         if (await refreshSelectedConversation(id)) return;
-        if (disposed || conversationRefreshRecovery !== recovery || selectionGeneration !== token || activeConversationId() !== id) return;
+        if (conversationRefreshRecovery !== recovery || selectionGeneration !== token || activeConversationId() !== id) return;
         await new Promise<void>(resolve => {
           recovery.wake = () => {
             recovery.wake = null;
@@ -1940,27 +2833,29 @@ export function initChat(api = new ChatApiClient()): void {
 
   const installConversationSnapshot = (snapshot: ConversationSnapshot, acceptedDrafts: ChatProjection["acceptedDrafts"], token: number) => {
     projection = projectionFromSnapshot(snapshot, acceptedDrafts);
+    const carried = removedRows.get(snapshot.conversation.id);
+    if (carried) projection = { ...projection, removedIds: carried };
     historyRefreshRequired.delete(snapshot.conversation.id);
     projectionEpoch += 1;
     conversations = conversations.map(item => item.id === snapshot.conversation.id ? snapshot.conversation : item);
     renderConfiguration();
     renderAttachments();
     announce(snapshot.items.length ? "" : "Start this conversation by sending a message.");
+    cancelForSnapshot(parentScroll);
     anchor.restore(presentation.anchors[snapshot.conversation.id] ?? null);
     scheduleRender(false, false);
     stream = openConversationStream(snapshot.conversation.id, snapshot.cursor, token);
   };
 
-  // Opens the selected conversation's event stream at a cursor. Split out of
-  // snapshot installation so a lifecycle resume can replace a stale stream
-  // without reprojecting: replaying from the cursor the projection already
-  // holds keeps the timeline, its scroll anchor, and the composer draft
-  // exactly as the user left them.
+  // Subscribes to the selected conversation's events from a cursor — a topic
+  // on the page's one live stream, never a connection of its own. A
+  // lifecycle wake-up does not come back here: the channel reconnects and
+  // resumes this topic from the cursor it holds, so the timeline, its scroll
+  // anchor, and the composer draft stay exactly as the user left them.
   const openConversationStream = (
     conversationId: string,
     cursor: string,
     token: number,
-    options: { resumed?: boolean } = {},
   ): ChatEventStream =>
     api.stream(conversationId, cursor, {
       event: (event, cursor) => {
@@ -1971,16 +2866,30 @@ export function initChat(api = new ChatApiClient()): void {
           return;
         }
         projection = result.projection;
+        if (projection.removedIds) removedRows.set(conversationId, projection.removedIds);
         if (event.type === "conversation.configuration") renderConfiguration();
         if (event.type === "conversation.status") {
+          const reloads = pendingReloads.get(conversationId);
+          if (reloads && (event.status === "completed" || event.status === "failed" || event.status === "interrupted")) {
+            // The turn that ended is the oldest tracked reload no longer
+            // waiting in the queue; one not yet named by its acceptance
+            // cannot be told apart, so it re-reads and stays tracked.
+            const queued = new Set((projection?.queued ?? []).map(entry => entry.id));
+            const index = reloads.findIndex(entry => entry.messageId === undefined || !queued.has(entry.messageId));
+            const reload = index < 0 ? undefined : reloads[index];
+            if (reload) {
+              if (reload.messageId !== undefined) reloads.splice(index, 1);
+              if (reloads.length === 0) pendingReloads.delete(conversationId);
+              if (event.status === "completed") void refreshBankedCommands(reload.agentId);
+            }
+          }
           if (event.status === "failed") setComposerError(event.message || "The active turn failed.");
           else if (isLiveConversationStatus(event.status)) setComposerError(null);
           statusMessages.set(conversationId, event.message);
         }
         if (event.type === "conversation.updated") {
           conversations = conversations.map(conversation => conversation.id === event.conversation.id ? event.conversation : conversation);
-          const option = Array.from(select.options).find(candidate => candidate.value === event.conversation.id);
-          if (option) option.text = displayConversationTitle(event.conversation);
+          relabelConversationOption(event.conversation);
           if (chatTitle) chatTitle.textContent = displayConversationTitle(event.conversation);
           if (renameInput && renameForm && !renameForm.hidden && document.activeElement !== renameInput) renameInput.value = event.conversation.title;
         }
@@ -1999,16 +2908,16 @@ export function initChat(api = new ChatApiClient()): void {
       // whether the projection is correct, so this clears the reconnect
       // message and nothing else — no refetch, no reprojection.
       recovered: () => { if (token === selectionGeneration) interruptions.clear("conversation"); },
-    }, options);
+    });
 
   async function refreshSelectedConversation(id: string): Promise<boolean> {
     const token = selectionGeneration;
     const current = projection;
-    if (disposed || !current || current.conversationId !== id || activeConversationId() !== id) return false;
+    if (!current || current.conversationId !== id || activeConversationId() !== id) return false;
     try {
       return await runConversationRead("Updating conversation...", () => { void refreshSelectedConversation(id); }, async signal => {
         const snapshot = await api.snapshot(id, undefined, signal);
-        if (signal.aborted || disposed || token !== selectionGeneration || projection?.conversationId !== id || activeConversationId() !== id) return false;
+        if (signal.aborted || token !== selectionGeneration || projection?.conversationId !== id || activeConversationId() !== id) return false;
         const previousStream = stream;
         installConversationSnapshot(snapshot, projection.acceptedDrafts, token);
         if (conversationRefreshRecovery?.conversationId === id && conversationRefreshRecovery.token === token) {
@@ -2022,8 +2931,17 @@ export function initChat(api = new ChatApiClient()): void {
     }
   }
 
-  const selectConversation = async (id: string): Promise<boolean> => {
+  const selectConversation = async (id: string, deferredStartup = false): Promise<boolean> => {
+    const openingStartup = deferredStartup || isUnestablishedStartup(id);
+    supersedeStartupSelection();
+    hasSelectedConversation = true;
     if (projection?.conversationId === id && stream && !historyRefreshRequired.has(id) && !selectedConversationDeleted) return true;
+    // Navigation ends the outgoing hold before a fast snapshot can arrive
+    // ahead of its clearing paint. Only an in-place refresh may renew it;
+    // otherwise removing A's field could resume A's follow intent over B.
+    parentScroll.cancel();
+    renderer.closeShellOutputWindow();
+    childRenderer.closeShellOutputWindow();
     readLane?.controller.abort();
     stopConversationRefreshRecovery();
     selectedConversationDeleted = false;
@@ -2033,6 +2951,7 @@ export function initChat(api = new ChatApiClient()): void {
     closeChildConversation();
     if (renameForm) renameForm.hidden = true;
     const token = ++selectionGeneration;
+    unestablishedStartup = openingStartup ? { conversationId: id, generation: token } : null;
     stream?.close();
     stream = null;
     const acceptedDrafts = projection?.conversationId === id ? projection.acceptedDrafts : [];
@@ -2042,6 +2961,11 @@ export function initChat(api = new ChatApiClient()): void {
       if (currentAnchor) presentation.anchors[projection.conversationId] = currentAnchor;
     }
     presentation.selectedId = id;
+    if (window.location && new URLSearchParams(window.location.search).has("conversation")) {
+      const url = new URL(window.location.href);
+      url.searchParams.set("conversation", id);
+      window.history.replaceState(window.history.state, "", url);
+    }
     const conversation = conversations.find(item => item.id === id);
     if (chatTitle) chatTitle.textContent = conversation ? displayConversationTitle(conversation) : chatHeading();
     form.hidden = false;
@@ -2066,6 +2990,7 @@ export function initChat(api = new ChatApiClient()): void {
     renderConfiguration();
     syncContextIndicator();
     input.value = presentation.drafts[id] ?? "";
+    slashQueryActive = false;
     autosize(input);
     renderAttachments();
     announce("");
@@ -2075,6 +3000,7 @@ export function initChat(api = new ChatApiClient()): void {
         const snapshot = await api.snapshot(id, undefined, signal);
         if (token !== selectionGeneration) return false;
         installConversationSnapshot(snapshot, acceptedDrafts, token);
+        unestablishedStartup = null;
         // The selection is settled; a ready agent stops polling, so this is
         // the moment mid-session command discoveries reach the completion
         // menu (background, after the chooser is done).
@@ -2086,12 +3012,43 @@ export function initChat(api = new ChatApiClient()): void {
     }
   };
 
+  // One chooser label for every path that writes it: the title, the owning
+  // agent when there is a choice of agents, and the last activity's clock
+  // time (its day is the option's heading).
+  const conversationOptionLabel = (conversation: ConversationSummary) => {
+    const title = agentStatuses.length > 1 && conversation.agent
+      ? `${displayConversationTitle(conversation)} · ${conversation.agent.name}`
+      : displayConversationTitle(conversation);
+    return `${title}${conversationActivitySuffix(conversation)}`;
+  };
+  const relabelConversationOption = (conversation: ConversationSummary) => {
+    const option = Array.from(select.options).find(candidate => candidate.value === conversation.id);
+    if (option) option.text = conversationOptionLabel(conversation);
+  };
+  // "Today" becomes "Yesterday" at the reader's midnight without any
+  // inventory change, so the headings are refiled then.
+  let chooserDayTimer: ReturnType<typeof setTimeout> | undefined;
+  const scheduleChooserDayRollover = () => {
+    if (chooserDayTimer !== undefined) clearTimeout(chooserDayTimer);
+    const now = Date.now();
+    chooserDayTimer = setTimeout(() => {
+      chooserDayTimer = undefined;
+      patchConversationOptions(select, conversations, conversationOptionLabel, conversationDayGroup);
+      scheduleChooserDayRollover();
+    }, nextLocalMidnight(now) - now + 1_000);
+  };
+
   const patchChooser = (selectedId: string | null, deleted = false) => {
     renderSelectedConversationDeleted(document, deleted);
-    patchConversationOptions(select, conversations, conversation =>
-      agentStatuses.length > 1 && conversation.agent
-        ? `${displayConversationTitle(conversation)} · ${conversation.agent.name}`
-        : displayConversationTitle(conversation));
+    // Keep only the unresolved startup selection across a transient omission;
+    // all other options must continue to reflect the latest inventory.
+    const retainedStartupOption = isUnestablishedStartup(selectedId)
+      && selectedId && !conversations.some(conversation => conversation.id === selectedId)
+      ? Array.from(select.options).find(option => option.value === selectedId)
+      : undefined;
+    patchConversationOptions(select, conversations, conversationOptionLabel, conversationDayGroup);
+    scheduleChooserDayRollover();
+    if (retainedStartupOption) select.append(retainedStartupOption);
     const genericPlaceholder = select.querySelector<HTMLOptionElement>("option[data-chat-inventory-placeholder]");
     if (deleted || selectedId) {
       genericPlaceholder?.remove();
@@ -2108,16 +3065,34 @@ export function initChat(api = new ChatApiClient()): void {
       select.disabled = false;
     } else {
       select.value = selectedId ?? "";
-      select.disabled = conversations.length === 0;
+      select.disabled = conversations.length === 0 && !retainedStartupOption;
     }
   };
 
   const installInitialChooser = () => {
+    if (awaitingAnswered) {
+      // Nothing waits any more: show the list, not some other conversation
+      // dressed up as the one the notice pointed at.
+      awaitingAnswered = false;
+      patchChooser(null);
+      form.hidden = true;
+      if (chatTitle) chatTitle.textContent = chatHeading();
+      announce("That request was already answered.");
+      return;
+    }
+    if (notificationTarget) {
+      const target = notificationTarget;
+      notificationTarget = null;
+      patchChooser(target);
+      void selectConversation(target);
+      return;
+    }
     const selected = conversations.some(item => item.id === presentation.selectedId)
       ? presentation.selectedId!
       : conversations[0]?.id ?? null;
     patchChooser(selected);
     if (!selected) {
+      if (startupOwnsSelection) pendingStartupId = presentation.selectedId ?? null;
       form.hidden = true;
       if (chatTitle) chatTitle.textContent = chatHeading();
       return;
@@ -2166,9 +3141,25 @@ export function initChat(api = new ChatApiClient()): void {
 
   const applyConversationInventory = (next: ConversationSummary[]) => {
     const tracked = inventoryTracker.reconcile(next);
-    const selectedId = presentation.selectedId ?? null;
+    // Consume before starting any asynchronous read. Inventory is discovery,
+    // not a retry mechanism for a failed opening read.
+    if (pendingStartupId && startupOwnsSelection && next.some(item => item.id === pendingStartupId)) {
+      const id = pendingStartupId;
+      pendingStartupId = null;
+      conversations = next;
+      patchChooser(id);
+      void selectConversation(id, true);
+      syncInventoryAwareness(tracked.increased);
+      syncControls();
+      save();
+      return;
+    }
+    const selectedId = hasSelectedConversation ? presentation.selectedId ?? null : null;
     const selectedMissing = selectedId !== null && !next.some(conversation => conversation.id === selectedId);
-    if (selectedMissing) enterSelectedConversationDeleted();
+    // A transient omission cannot invalidate this one-shot read or turn its
+    // failure into an automatic retry. Preserve its chooser and draft too.
+    const startupOpeningMissing = selectedMissing && isUnestablishedStartup(selectedId);
+    if (selectedMissing && !startupOpeningMissing) enterSelectedConversationDeleted();
 
     // The successful response replaces inventory truth. It does not install a
     // snapshot or touch the selected projection unless an unavailable
@@ -2260,7 +3251,10 @@ export function initChat(api = new ChatApiClient()): void {
     onMode: stageMode,
     onVariant: stageVariant,
   });
-  configurationTrigger.addEventListener("click", () => configurationPicker?.open());
+  configurationTrigger.addEventListener("click", () => {
+    refreshCatalogsOnUse();
+    configurationPicker?.open();
+  });
   renderConfiguration();
   // With one agent there is no choice to offer; with more, creation asks.
   // The menu shows every offered agent with its availability, so an
@@ -2339,6 +3333,7 @@ export function initChat(api = new ChatApiClient()): void {
   newButton.addEventListener("click", async () => {
     const chosenAgent = await chooseAgentForCreation();
     if (chosenAgent === null) return;
+    supersedeStartupSelection();
     newButton.disabled = true;
     announce("Creating conversation...");
     try {
@@ -2393,8 +3388,7 @@ export function initChat(api = new ChatApiClient()): void {
       const { conversation } = await api.renameConversation(conversationId, newRequestId(), title);
       void inventoryReconciler.supersede();
       conversations = conversations.map(item => item.id === conversation.id ? conversation : item);
-      const option = Array.from(select.options).find(candidate => candidate.value === conversation.id);
-      if (option) option.text = displayConversationTitle(conversation);
+      relabelConversationOption(conversation);
       if (projection?.conversationId === conversation.id) {
         projection = { ...projection, conversation };
         if (chatTitle) chatTitle.textContent = displayConversationTitle(conversation);
@@ -2451,7 +3445,7 @@ export function initChat(api = new ChatApiClient()): void {
     const current = projection;
     let changedHistory = false;
     olderButton.disabled = true;
-    if (chatSurfaceActive()) anchor.beforeMutation(anchorGeometry());
+    parentScroll.beforeMutation();
     try {
       await runConversationRead("Loading older messages...", () => {
         if (changedHistory) void refreshSelectedConversation(current.conversationId);
@@ -2463,43 +3457,15 @@ export function initChat(api = new ChatApiClient()): void {
         });
         if (signal.aborted || projection?.conversationId !== current.conversationId) return;
         projection = prependSnapshot(projection, page);
-        if (!chatSurfaceActive()) { scheduleRender(false, false); return; }
-        const dirty = renderer.render(items, projection, expanded, declares("subagents"), declares("reversible-history"), turnStartedAt(projection));
-        timeline.scrollTop = anchor.afterMutation(geometry());
-        for (const node of dirty) { decorateFileLinks(node); decorateAttachmentImages(node); }
+        // Publish the prepended DOM and its anchor correction in one frame.
+        scheduleRender(false, false);
       });
     } catch { /* The read lane owns its error and retry. */ }
     finally { olderButton.disabled = false; syncControls(); }
   });
 
-  let lastParentScrollTop = 0;
-  let lastChildScrollTop = 0;
-  timeline.addEventListener("scroll", () => {
-    if (rendering || !chatSurfaceActive()) return;
-    // Revealing an intrinsic-size placeholder can grow the scroll extent
-    // before ResizeObserver runs (notably in WebKit). That is not a reader
-    // scrolling upward; preserve pinning until an actual upward movement.
-    if (anchor.isPinned() && timeline.scrollTop >= lastParentScrollTop - 1) {
-      timeline.scrollTop = Math.max(0, timeline.scrollHeight - timeline.clientHeight);
-    }
-    // Cheap while pinned; the full pass runs only once actually unpinned.
-    // The first tick that crosses the threshold captures no anchor (items
-    // were not collected), which self-heals on the next tick — a transient
-    // preferable to a forced layout on every scroll event of a long chat.
-    anchor.observe(anchorGeometry());
-    lastParentScrollTop = timeline.scrollTop;
-    if (projection) {
-      const current = anchor.currentAnchor();
-      if (current) presentation.anchors[projection.conversationId] = current;
-      else delete presentation.anchors[projection.conversationId];
-      save();
-    }
-    latestButton.hidden = !anchor.hasUnseen();
-    syncPromptRailActive();
-  }, { passive: true });
   latestButton.addEventListener("click", () => {
-    timeline.scrollTo({ top: anchor.jumpToLatest(geometry()), behavior: reducedMotion() ? "auto" : "smooth" });
-    latestButton.hidden = true;
+    parentScroll.latest();
   });
 
   /**
@@ -2509,9 +3475,7 @@ export function initChat(api = new ChatApiClient()): void {
    */
   const wireExpansionToggle = (
     container: HTMLElement,
-    scroller: HTMLElement,
-    controller: TimelineAnchorController,
-    measure: () => AnchorGeometry,
+    scroll: CoordinatedScrollOwner,
   ) => {
     container.addEventListener("toggle", event => {
       const details = event.target as HTMLDetailsElement;
@@ -2525,7 +3489,7 @@ export function initChat(api = new ChatApiClient()): void {
       // The reader can only ever close an already-open row (open=false, which
       // passes) or open an unmarked one, so no real interaction is lost.
       if (details.open && details.hasAttribute("data-auto-open")) return;
-      controller.beforeMutation(measure(), details.dataset.chatItemId);
+      scroll.beforeMutation(details.dataset.chatItemId);
       // The reader has spoken, so the row is theirs from here. Clearing the
       // stream's auto-open marker stops the next render from undoing an
       // expansion they made on a row that had opened itself; recording a close
@@ -2536,7 +3500,7 @@ export function initChat(api = new ChatApiClient()): void {
       details.toggleAttribute(READER_CLOSED, !details.open);
       if (details.open) expanded.add(details.dataset.chatItemId!); else expanded.delete(details.dataset.chatItemId!);
       save();
-      requestAnimationFrame(() => { scroller.scrollTop = controller.afterMutation(measure()); });
+      scroll.request();
     }, true);
   };
 
@@ -2575,9 +3539,35 @@ export function initChat(api = new ChatApiClient()): void {
    * the parent's against the parent — which is what keeps the parent
    * answerable while a child is open.
    */
-  const wireItemInteractions = (container: HTMLElement, sourceProjection: () => ChatProjection | null) => {
+  const wireItemInteractions = (container: HTMLElement, sourceProjection: () => ChatProjection | null, stage: { renderer: TimelineRenderer; rerender: () => void }, scroll: CoordinatedScrollOwner) => {
+    // "Allow always" is confirmed one step deeper, on the same card, where
+    // it shows the rule the agent will actually install. The stage is this
+    // timeline's own (the drill-down keeps its own renderer), and nothing
+    // reaches the server until Confirm.
+    const enterConfirmation = (itemId: string) => {
+      stage.renderer.confirming.add(itemId);
+      // Cancel is the safe landing for a step that exists to catch a slip;
+      // Confirm is one Tab away.
+      stage.renderer.focusAfterPaint = `[data-chat-item-id="${CSS.escape(itemId)}"] [data-permission-cancel]`;
+      stage.rerender();
+    };
+    const leaveConfirmation = (itemId: string) => {
+      if (!stage.renderer.confirming.delete(itemId)) return;
+      stage.renderer.focusAfterPaint = `[data-chat-item-id="${CSS.escape(itemId)}"] [data-permission-outcome="approved-session"]`;
+      stage.rerender();
+    };
+    // Prevent only the focus default of the native/compatibility mousedown:
+    // blurring an answer restores the chrome and moves the action row before
+    // the click lands. Cancelling touch pointerdown instead suppresses the
+    // compatibility click altogether in WebKit. Mouse, pen and touch still
+    // activate normally; radios, links and summaries keep ordinary focus.
+    container.addEventListener("mousedown", event => {
+      if (!document.documentElement.hasAttribute("data-chat-answering")) return;
+      if (!(event.target as Element).closest?.(REQUEST_ANSWER_CONTROLS)) return;
+      event.preventDefault();
+    });
     container.addEventListener("click", event => {
-      const target = (event.target as Element).closest<HTMLElement>("[data-file-ref], [data-permission-outcome], [data-permission-choice], [data-question-reject], [data-open-conversation], [data-chat-copy], [data-history-revert]");
+      const target = (event.target as Element).closest<HTMLElement>("[data-file-ref], [data-permission-outcome], [data-permission-choice], [data-permission-confirm], [data-permission-cancel], [data-question-reject], [data-open-conversation], [data-chat-copy], [data-history-revert]");
       if (!target) return;
       if (target instanceof HTMLButtonElement && target.dataset.chatCopy) {
         const text = target.closest("pre")?.querySelector(":scope > code")?.textContent;
@@ -2610,6 +3600,12 @@ export function initChat(api = new ChatApiClient()): void {
       if (item.type === "permission" && target.dataset.permissionChoice) {
         // A chosen intent is an approval; the id tells the agent which one.
         void resolvePermission(source, item.id, "approved-once", target.dataset.permissionChoice);
+      } else if (item.type === "permission" && target.dataset.permissionOutcome === "approved-session") {
+        enterConfirmation(item.id);
+      } else if (item.type === "permission" && target.dataset.permissionConfirm !== undefined) {
+        void resolvePermission(source, item.id, "approved-session");
+      } else if (item.type === "permission" && target.dataset.permissionCancel !== undefined) {
+        leaveConfirmation(item.id);
       } else if (item.type === "permission" && target.dataset.permissionOutcome) {
         void resolvePermission(source, item.id, target.dataset.permissionOutcome as PermissionOutcome);
       } else if (item.type === "question" && target.dataset.questionReject !== undefined) {
@@ -2617,6 +3613,17 @@ export function initChat(api = new ChatApiClient()): void {
       }
     });
     container.addEventListener("keydown", event => {
+      if (event.key === "Escape") {
+        // Escape inside the confirmation is Cancel, through the same button
+        // so one path resolves the card. It stops here, so the surface's own
+        // Escape handling does not also close the drill-down.
+        const cancel = (event.target as Element).closest("[data-permission-confirming]")?.querySelector<HTMLButtonElement>("[data-permission-cancel]");
+        if (!cancel) return;
+        event.preventDefault();
+        event.stopPropagation();
+        cancel.click();
+        return;
+      }
       const target = (event.target as Element).closest<HTMLElement>("[role=button][data-file-ref]");
       if (target && (event.key === "Enter" || event.key === " ")) {
         event.preventDefault();
@@ -2627,6 +3634,14 @@ export function initChat(api = new ChatApiClient()): void {
       const input = event.target as HTMLInputElement;
       const form = input.form;
       if (!form?.matches("form[data-question-form]")) return;
+      // Choosing "Type your own answer" reveals and focuses the editor, which
+      // resizes the card and pans the visible viewport under the keyboard. The
+      // correction that follows must hold the request being answered rather
+      // than whatever is topmost, or the question scrolls away as the user
+      // starts to answer it. This timeline's own owner: the same card can be
+      // shown in the parent transcript or in a subagent drill-down.
+      const itemId = input.closest<HTMLElement>("[data-chat-item-id]")?.dataset.chatItemId;
+      if (itemId !== undefined) scroll.beforeMutation(itemId);
       syncQuestionControl(input, true);
     });
     container.addEventListener("input", event => {
@@ -2634,6 +3649,17 @@ export function initChat(api = new ChatApiClient()): void {
       const form = input.form;
       if (!form?.matches("form[data-question-form]")) return;
       syncQuestionControl(input);
+    });
+    // A wakeup row and the turn it started point at each other: the link
+    // brings the other one into view in this same timeline and focuses it.
+    container.addEventListener("click", event => {
+      const link = (event.target as Element).closest<HTMLButtonElement>("[data-chat-jump]");
+      if (!link) return;
+      const destination = container.querySelector(`[data-chat-item-id="${CSS.escape(link.dataset.chatJump ?? "")}"]`);
+      if (!(destination instanceof HTMLElement)) return;
+      destination.scrollIntoView({ block: "center" });
+      if (!destination.hasAttribute("tabindex")) destination.tabIndex = -1;
+      destination.focus?.({ preventScroll: true });
     });
     container.addEventListener("click", event => {
       const tab = (event.target as Element).closest<HTMLButtonElement>("[data-question-tab]");
@@ -2683,34 +3709,40 @@ export function initChat(api = new ChatApiClient()): void {
     }
     if (childIncrementalTimer !== null) { clearTimeout(childIncrementalTimer); childIncrementalTimer = null; }
     if (childRenderFrame !== null) return;
-    childRenderFrame = requestAnimationFrame(() => {
+    childRenderFrame = requestAnimationFrame(timestamp => {
       childRenderFrame = null;
       if (!chatSurfaceActive()) return;
       const content = childNewContent;
       childNewContent = false;
       childRenderDirty = false;
       renderChildNow(content);
+      childScroll?.flush(timestamp);
     });
   };
 
   const renderChildNow = (newContent: boolean) => {
     lastChildPaint = performance.now();
     if (!drilldownItems || !drilldownTimeline) return;
-    if (!childAnchor.isPinned()) childAnchor.beforeMutation(childGeometry());
+    childScroll?.beforeMutation();
     childRenderer.permissionScopeNote = agent?.permissionScopeNote;
+    childRenderer.loginAction = contextLoginAction();
+    childRenderer.conversationTitle = child?.label;
     const dirty = childRenderer.render(drilldownItems, child?.projection ?? null, expanded, declares("subagents"), false, turnStartedAt(child?.projection));
+    childRenderer.setShellOutputsHidden(false);
     syncWorkingTimer();
     if (drilldownOlder) drilldownOlder.hidden = !child?.projection?.olderCursor;
     // A subagent's report is the same login's plan: the Usage pane follows
     // it like the parent's (newest wins, by the report's own time).
     const childReport = child?.projection && declares("context") ? latestPlanReport(child.projection.items) : undefined;
     if (childReport?.plan) noteUsageReport({ plan: childReport.plan, reportedAt: childReport.createdAt });
-    drilldownTimeline.scrollTop = childAnchor.afterMutation(childAnchorGeometry(), newContent);
+    childScroll?.request(newContent);
     for (const node of dirty) {
       decorateFileLinks(node);
       decorateAttachmentImages(node);
       node.querySelectorAll<HTMLFormElement>("form[data-question-form]").forEach(syncQuestionForm);
     }
+    applyFocusAfterPaint(childRenderer, drilldownItems);
+    reconcileAnswerAfterPaint();
   };
 
   /**
@@ -2725,6 +3757,9 @@ export function initChat(api = new ChatApiClient()): void {
    * no-op.
    */
   const closeChildConversation = (popped = false) => {
+    childRenderer.closeShellOutputWindow();
+    childScroll?.cancel();
+    if (childLatest) childLatest.hidden = true;
     const open = child;
     if (!open) return;
     if (!popped && drilldownClosePending) return;
@@ -2750,14 +3785,18 @@ export function initChat(api = new ChatApiClient()): void {
     child = null;
     drilldownHistoryToken = null;
     childGeneration += 1;
+    silentRun.stop();
     open.stream?.close();
     open.read?.controller.abort();
     childReadSignal?.cancel();
     childReadError.hidden = true;
     releaseChildBack?.();
     releaseChildBack = null;
+    taskPanel?.close();
+    if (drilldownTimeline) drilldownTimeline.hidden = false;
     if (drilldownItems && chatSurfaceActive()) childRenderer.render(drilldownItems, null, expanded, declares("subagents"));
     else childRenderDirty = true;
+    reconcileAnswerAfterPaint();
     syncWorkingTimer();
     if (drilldownOlder) {
       drilldownOlder.hidden = true;
@@ -2765,11 +3804,14 @@ export function initChat(api = new ChatApiClient()): void {
     }
     if (drilldown) drilldown.hidden = true;
     if (drilldownTitle) drilldownTitle.textContent = "";
+    // The parent's cards are reachable again, so the pill returns to
+    // deferring to the one it leads to.
+    syncRequestsJumpVisibility();
     announceChild("");
     surface.removeAttribute("data-chat-drilldown");
     // Back to the parent at its live position: it never unmounted, so this is
     // only re-asserting the anchor the timeline was already holding.
-    timeline.scrollTop = anchor.afterMutation(geometry());
+    parentScroll.request();
     timeline.focus({ preventScroll: true });
     // A jump that was waiting on this close lands after the anchor restore,
     // never before it — see the requests-jump handler.
@@ -2790,18 +3832,16 @@ export function initChat(api = new ChatApiClient()): void {
    * one on screen: the drill-down is one level deep by design, and back
    * returns to the conversation the picker still shows.
    */
-  // The drill-down's own event stream. Split out of the open path so a
-  // lifecycle resume can replace a stalled one from the cursor the child
-  // projection already holds — the transcript on screen is as live a surface
-  // as the parent conversation, and a half-dead socket under it silently
-  // stops reporting subagent output.
+  // The drill-down's own event topic — one more subscription on the same
+  // stream, alongside the parent's. The transcript on screen is as live a
+  // surface as the parent conversation; the channel resumes it from its own
+  // cursor after a wake-up, the same as the parent.
   const openChildStream = (
     entry: Drilldown,
     id: string,
     label: string,
     cursor: string,
     generation: number,
-    options: { resumed?: boolean } = {},
   ): ChatEventStream =>
     api.stream(id, cursor, {
       event: (event, cursor) => {
@@ -2810,29 +3850,57 @@ export function initChat(api = new ChatApiClient()): void {
         // A gap in a drill-down is refetched in place; it is a view over a
         // turn, so there is no selection to re-run.
         if (result.outcome === "gap" || result.outcome === "resync") {
-          openChildConversation(id, label);
+          openChildConversation(id, label, true, entry.task);
           return;
         }
         entry.projection = result.projection;
-        if (result.outcome === "applied") { announceChild(""); renderChild(true); }
+        if (result.outcome === "applied") {
+          announceChild("");
+          renderChild(true);
+          // A record or its text arriving is the run speaking, so it is not
+          // silent. A status change is not: a run that never streams must
+          // still read as silent when it settles, so that it gets the reads
+          // that bring in its last records.
+          if (event.type === "item.upsert" || event.type === "item.text_delta" || event.type === "item.remove") silentRun.heard();
+          silentRun.follow(isLiveConversationStatus(entry.projection.status));
+        }
       },
-      resync: () => { if (generation === childGeneration) openChildConversation(id, label); },
+      resync: () => { if (generation === childGeneration) openChildConversation(id, label, true, entry.task); },
       error: error => { if (generation === childGeneration) childInterruptions.report("child", error); },
       recovered: () => { if (generation === childGeneration) childInterruptions.clear("child"); },
-    }, options);
+    });
 
-  const openChildConversation = (id: string, label: string) => {
+  const openChildConversation = (id: string, label: string, automaticRefresh = false, task?: OpenTaskInspection) => {
     if (!drilldown || !drilldownItems || !drilldownTimeline) return;
     const generation = ++childGeneration;
     drilldownClosePending = false;
+    silentRun.stop();
     const previous = child;
     previous?.stream?.close();
     previous?.read?.controller.abort();
     const retainedProjection = previous?.conversationId === id ? previous.projection : null;
     const retainedAnchor = retainedProjection ? childAnchor.currentAnchor() : null;
-    const next: Drilldown = { conversationId: id, label, projection: retainedProjection, stream: null };
+    // The task behind this layer: named by the caller (a composer row), kept
+    // from the layer being refreshed, or — for a transcript opened from the
+    // subagents track or the launching row — found by the child id on a
+    // running task, so a running subagent gets the strip whichever way in.
+    const owningTask = projection ? runningTaskForChild(projection.items, id) : undefined;
+    const link = task
+      ?? (previous?.conversationId === id ? previous.task : undefined)
+      ?? (projection && owningTask ? { conversationId: projection.conversationId, taskId: owningTask.taskId, view: "transcript" as const } : undefined);
+    const next: Drilldown = { conversationId: id, label, projection: retainedProjection, stream: null, ...(link ? { task: link } : {}) };
     const nested = previous !== null;
     child = next;
+    const outputView = link?.view === "output";
+    if (taskPanel) {
+      if (link) {
+        const owner = projection?.conversationId === link.conversationId ? projection : null;
+        taskPanel.show(link, owner ? taskById(owner.items, link.taskId) : undefined, stoppingTasks.has(link.taskId));
+      } else taskPanel.close();
+    }
+    // A task's output view has no transcript: the timeline stays out of the
+    // way and the pane takes its place.
+    drilldownTimeline.hidden = outputView;
     // One entry per layer, in both chromes. Conditioning this on the ui mode
     // meant storing "was this touch when it opened" under a name that claimed
     // to answer "does an entry exist" — two facts that drift the moment the
@@ -2873,8 +3941,12 @@ export function initChat(api = new ChatApiClient()): void {
     if (drilldownTitle) drilldownTitle.textContent = label;
     drilldown.hidden = false;
     surface.setAttribute("data-chat-drilldown", "open");
+    // A request the parent is waiting on is no longer reachable behind the
+    // pushed screen, so the pill stops deferring to it.
+    syncRequestsJumpVisibility();
     if (!retainedProjection && chatSurfaceActive()) childRenderer.render(drilldownItems, null, expanded, declares("subagents"));
     else childRenderDirty = true;
+    reconcileAnswerAfterPaint();
     // Hidden until this child's own first page says whether more exists —
     // otherwise a previous subagent's cursor would offer paging for a
     // transcript that has none.
@@ -2882,16 +3954,20 @@ export function initChat(api = new ChatApiClient()): void {
       drilldownOlder.hidden = true;
       drilldownOlder.disabled = false;
     }
+    if (automaticRefresh && retainedProjection && childScroll) cancelForSnapshot(childScroll);
+    else childScroll?.cancel();
     childAnchor.restore(retainedAnchor);
     announceChild("");
-    drilldownBack?.focus();
-    void runChildRead(next, "Loading conversation...", () => openChildConversation(id, label), async signal => {
+    if (!automaticRefresh) drilldownBack?.focus();
+    if (outputView) return;
+    void runChildRead(next, "Loading conversation...", () => openChildConversation(id, label, automaticRefresh, next.task), async signal => {
       const snapshot = await api.snapshot(id, undefined, signal);
       if (signal.aborted || generation !== childGeneration || child !== next) return;
       next.projection = projectionFromSnapshot(snapshot, []);
       announceChild(snapshot.items.length ? "" : "This subagent has not reported anything yet.");
       renderChild(false);
       next.stream = openChildStream(next, id, label, snapshot.cursor, generation);
+      silentRun.follow(isLiveConversationStatus(next.projection.status));
     });
   };
 
@@ -2903,11 +3979,11 @@ export function initChat(api = new ChatApiClient()): void {
     if (!open?.projection?.olderCursor) return;
     const generation = childGeneration;
     drilldownOlder.disabled = true;
-    childAnchor.beforeMutation(childGeometry());
+    childScroll?.beforeMutation();
     try {
       let changedHistory = false;
       await runChildRead(open, "Loading older messages...", () => {
-        if (changedHistory) openChildConversation(open.conversationId, open.label);
+        if (changedHistory) openChildConversation(open.conversationId, open.label, false, open.task);
         else drilldownOlder.click();
       }, async signal => {
         const page = await api.snapshot(open.conversationId, open.projection!.olderCursor, signal).catch(error => {
@@ -2932,19 +4008,11 @@ export function initChat(api = new ChatApiClient()): void {
     closeChildConversation();
   });
 
-  wireExpansionToggle(items, timeline, anchor, geometry);
-  wireItemInteractions(items, () => projection);
+  wireExpansionToggle(items, parentScroll);
+  wireItemInteractions(items, () => projection, { renderer, rerender: () => scheduleRender(false) }, parentScroll);
   if (drilldownItems && drilldownTimeline) {
-    wireExpansionToggle(drilldownItems, drilldownTimeline, childAnchor, childGeometry);
-    wireItemInteractions(drilldownItems, () => child?.projection ?? null);
-    drilldownTimeline.addEventListener("scroll", () => {
-      if (!chatSurfaceActive()) return;
-      if (childAnchor.isPinned() && drilldownTimeline.scrollTop >= lastChildScrollTop - 1) {
-        drilldownTimeline.scrollTop = Math.max(0, drilldownTimeline.scrollHeight - drilldownTimeline.clientHeight);
-      }
-      childAnchor.observe(childAnchorGeometry());
-      lastChildScrollTop = drilldownTimeline.scrollTop;
-    }, { passive: true });
+    wireExpansionToggle(drilldownItems, childScroll!);
+    wireItemInteractions(drilldownItems, () => child?.projection ?? null, { renderer: childRenderer, rerender: () => renderChild(false) }, childScroll!);
   }
 
   const closeCommandMenu = () => {
@@ -2967,8 +4035,18 @@ export function initChat(api = new ChatApiClient()): void {
     input.focus();
   };
 
+  // Each space-separated token of an argument hint is one unit, so the hint
+  // wraps only between tokens: "[--comment]" never splits after "--", and a
+  // lone "]" never lands on a line of its own (styles.css).
+  const hintTokens = (hint: string) => hint.split(/\s+/).filter(Boolean)
+    .map(token => `<span class="chat-command-hint-token">${escapeHtml(token)}</span>`).join(" ");
+
   const renderCommandMenu = () => {
-    const next = matchingCommands(input.value, input.selectionStart ?? input.value.length, commands);
+    const caret = input.selectionStart ?? input.value.length;
+    const querying = slashCommandQuery(input.value, caret) !== null;
+    if (querying && !slashQueryActive) refreshCatalogsOnUse();
+    slashQueryActive = querying;
+    const next = matchingCommands(input.value, caret, commands);
     if (!next) { closeCommandMenu(); return; }
     commandMatch = next;
     commandIndex = Math.min(commandIndex, next.commands.length - 1);
@@ -2979,7 +4057,7 @@ export function initChat(api = new ChatApiClient()): void {
       option.className = `chat-command-option${index === commandIndex ? " is-active" : ""}`;
       option.setAttribute("role", "option");
       option.setAttribute("aria-selected", String(index === commandIndex));
-      option.innerHTML = `<span class="chat-command-name">/${escapeHtml(command.name)}</span><span class="chat-command-hint">${escapeHtml(command.argumentHint)}</span><span class="chat-command-description">${escapeHtml(command.description)}</span>`;
+      option.innerHTML = `<span class="chat-command-name">/${escapeHtml(command.name)}</span>${command.kind === "skill" ? `<span class="chat-command-kind">skill</span>` : ""}<span class="chat-command-hint">${hintTokens(command.argumentHint)}</span><span class="chat-command-description">${escapeHtml(command.description)}</span>`;
       option.addEventListener("pointerdown", event => event.preventDefault());
       option.addEventListener("click", () => chooseCommand(index));
       return option;
@@ -3017,11 +4095,44 @@ export function initChat(api = new ChatApiClient()): void {
       form.requestSubmit();
     }
   });
+  // Answering is editing inside a request card. It is derived here rather
+  // than in CSS because only the focus path knows which control took focus,
+  // and it is the one state that hands the transcript the whole visible band.
+  let heldAnswerField: HTMLElement | null = null;
+  // A snapshot replaces automatic work, not the reader's focus intent. By
+  // contrast pause/latest/navigation intentionally release that intent and
+  // must keep the focus identity latched until focus actually changes.
+  const cancelForSnapshot = (owner: CoordinatedScrollOwner) => {
+    const field = heldAnswerField;
+    const restore = field && owner.isHolding(field);
+    // cancel restores the hold's original follow intent without scheduling;
+    // the replacement hold must inherit that rather than a reveal's pause.
+    owner.cancel();
+    if (restore && field.isConnected && document.activeElement === field && chatSurfaceActive()) {
+      holdInOwningTimeline(field);
+    }
+  };
   const syncEditingFocus = () => {
-    const editing = surface.contains(document.activeElement) && isTextEditingControl(document.activeElement);
+    const active = document.activeElement;
+    const editing = surface.contains(active) && isTextEditingControl(active);
     document.documentElement.toggleAttribute("data-chat-editing", editing);
-    document.documentElement.toggleAttribute("data-chat-input-focused", document.activeElement === input);
+    document.documentElement.toggleAttribute("data-chat-input-focused", active === input);
+    const answering = editing && Boolean((active as Element).closest?.(".chat-request, [data-question-form]"));
+    document.documentElement.toggleAttribute("data-chat-answering", answering);
+    // Focus identity, not the answering boolean, owns the hold: two request
+    // fields can hand focus directly to one another, including across owners.
+    // Ordinary viewport corrections only reveal; they must not renew a hold
+    // that an explicit gesture released.
+    const next = answering && chatSurfaceActive() && active instanceof HTMLElement ? active : null;
+    if (next !== heldAnswerField) {
+      if (heldAnswerField) releaseHeldTimelines();
+      heldAnswerField = next;
+      if (next) holdInOwningTimeline(next);
+    }
     viewport.apply();
+  };
+  reconcileAnswerAfterPaint = () => {
+    if (heldAnswerField && !surface.contains(heldAnswerField)) syncEditingFocus();
   };
   surface.addEventListener("focusin", syncEditingFocus);
   surface.addEventListener("focusout", () => queueMicrotask(syncEditingFocus));
@@ -3064,6 +4175,7 @@ export function initChat(api = new ChatApiClient()): void {
     save();
     if (!updateVisible) return unavailable.length;
     input.value = restored.text;
+    slashQueryActive = false;
     autosize(input);
     renderAttachments();
     syncControls();
@@ -3244,6 +4356,7 @@ export function initChat(api = new ChatApiClient()): void {
     const restoreDraftText = () => {
       if (!text.trim()) return;
       input.value = input.value.trim() ? `${text}\n${input.value}` : text;
+      slashQueryActive = false;
       autosize(input);
     };
     // The same rule for a submission that ends while another conversation is
@@ -3263,6 +4376,8 @@ export function initChat(api = new ChatApiClient()): void {
     // while the drain below waits, and anything typed then belongs to the
     // next message — an after-the-wait clear would erase it.
     input.value = "";
+    slashQueryActive = false;
+    closeCommandMenu();
     presentation.drafts[conversationId] = "";
     save();
     autosize(input);
@@ -3312,7 +4427,7 @@ export function initChat(api = new ChatApiClient()): void {
     // explained why on the composer error line.
     if (!text.trim() && (pendingAttachments.get(conversationId) ?? []).length === 0) {
       // Restore the (empty) capture only if the user typed nothing meanwhile.
-      if (!input.value.trim() && text) { input.value = text; autosize(input); }
+      if (!input.value.trim() && text) { input.value = text; slashQueryActive = false; autosize(input); }
       submitting = false;
       syncControls();
       return;
@@ -3373,15 +4488,46 @@ export function initChat(api = new ChatApiClient()): void {
     renderAttachments();
     noteComposer("Sending...");
     syncControls();
+    // Sending says where the reader wants to be: at the exchange they just
+    // started. Pin to the end so the echo, and the reply that follows it,
+    // land in view — a reader who scrolled up to reread an earlier turn
+    // before pressing Enter is not asking to stay there while the answer
+    // arrives out of sight below the latest-content affordance.
+    parentScroll.latest();
+    latestButton.hidden = true;
     scheduleRender(true);
     try {
-      const accepted = await api.prompt(conversationId, requestId, text, selectedModel, selectedMode, selectedVariant, attachmentRefs.length ? attachmentRefs : undefined);
+      // Marked before the send: the reload's outcome can reach the stream
+      // before the acceptance does. Only a guess from the text — the server
+      // decides whether `/reload` is the built-in or a shadowing config
+      // command or skill — so the acceptance's `operation` settles it; an
+      // extra catalog read from a wrong guess is harmless.
+      const reloading = Boolean(contextAgentId) && /^\/reload(?:\s|$)/.test(text.trim());
+      const reloadEntry = reloading ? { agentId: contextAgentId! } as { agentId: string; messageId?: string } : undefined;
+      if (reloadEntry) pendingReloads.set(conversationId, [...(pendingReloads.get(conversationId) ?? []), reloadEntry]);
+      const accepted = await api.prompt(conversationId, requestId, text, selectedModel, selectedMode, selectedVariant, attachmentRefs.length ? attachmentRefs : undefined).catch((error: unknown) => {
+        if (reloadEntry) {
+          const rest = (pendingReloads.get(conversationId) ?? []).filter(entry => entry !== reloadEntry);
+          if (rest.length) pendingReloads.set(conversationId, rest);
+          else pendingReloads.delete(conversationId);
+        }
+        throw error;
+      });
+      if (reloadEntry) {
+        reloadEntry.messageId = accepted.messageId;
+        // Dispatched and not the built-in: nothing to track. A held one is
+        // classified only at delivery, so it stays tracked.
+        if (!accepted.held && accepted.operation !== "reload") {
+          const rest = (pendingReloads.get(conversationId) ?? []).filter(entry => entry !== reloadEntry);
+          if (rest.length) pendingReloads.set(conversationId, rest);
+          else pendingReloads.delete(conversationId);
+        }
+      }
       retryRequests.delete(conversationId);
       stagedConfigurations.delete(conversationId);
       if (accepted.conversation) {
         conversations = conversations.map(conversation => conversation.id === accepted.conversation!.id ? accepted.conversation! : conversation);
-        const option = Array.from(select.options).find(candidate => candidate.value === accepted.conversation!.id);
-        if (option) option.text = displayConversationTitle(accepted.conversation);
+        relabelConversationOption(accepted.conversation);
         if (chatTitle) chatTitle.textContent = displayConversationTitle(accepted.conversation);
       }
       if (projection?.conversationId === conversationId) {
@@ -3410,7 +4556,11 @@ export function initChat(api = new ChatApiClient()): void {
           ? !retriedRequest && projectionEpoch === projectionEpochAtSubmit
             ? noteQueuedMessage(projection, { id: accepted.messageId, text, queuedAt: Date.now(), requestId, ...(attachmentRefs.length ? { attachments: attachmentRefs } : {}) }, queueRevisionAtSubmit)
             : removeAcceptedDraft(projection, requestId)
-          : confirmAcceptedDraft(projection, { requestId, messageId: accepted.messageId, text, ...(attachmentRefs.length ? { attachments: attachmentRefs } : {}) });
+          // A reload's row is published before its acceptance and retired
+          // with its outcome, which can precede the acceptance — even
+          // unobserved by this client, if it was away. It is the stream's
+          // to show, never recreated here.
+          : confirmAcceptedDraft(projection, { requestId, messageId: accepted.messageId, text, ...(attachmentRefs.length ? { attachments: attachmentRefs } : {}) }, { insert: accepted.operation !== "reload" });
         renderConfiguration();
         scheduleRender(true);
       }
@@ -3458,54 +4608,29 @@ export function initChat(api = new ChatApiClient()): void {
     submitting = false;
     syncControls();
   });
-  let resizeFrame: number | null = null;
   const observer = typeof ResizeObserver === "function" ? new ResizeObserver(() => {
     if (!chatSurfaceActive()) return;
-    if (resizeFrame !== null) return;
-    resizeFrame = requestAnimationFrame(() => {
-      resizeFrame = null;
-      if (!chatSurfaceActive()) return;
-      const parentTop = anchor.afterMutation(anchorGeometry());
-      const childTop = child && drilldownTimeline ? childAnchor.afterMutation(childAnchorGeometry()) : undefined;
-      timeline.scrollTop = parentTop;
-      if (childTop !== undefined && drilldownTimeline) drilldownTimeline.scrollTop = childTop;
-    });
+    parentScroll.request();
+    childScroll?.request();
   }) : null;
   observer?.observe(items);
+  observer?.observe(timeline);
   if (drilldownItems) observer?.observe(drilldownItems);
+  if (drilldownTimeline) observer?.observe(drilldownTimeline);
+  // Only the day being read keeps its pinned label; see pinned-day.ts.
+  watchPinnedDayLabels(timeline, items);
+  if (drilldownItems && drilldownTimeline) watchPinnedDayLabels(drilldownTimeline, drilldownItems);
   viewport.start();
-  window.addEventListener("pagehide", event => {
-    // Drafts are saved either way — a frozen page can be discarded later
-    // without ever running code again.
+  // The draft is saved on every hide, persisted or not: a frozen page can be
+  // discarded later without ever running code again. Nothing else happens
+  // here. This surface is never torn down on a lifecycle event — iOS fires an
+  // unpersisted `pagehide` for a home-screen page it then keeps alive, and a
+  // torn-down Chat would stay closed for the life of that document. The
+  // hidden-page path (`handleChatSurfaceState`) already cancels the timers
+  // and frames; the page's one channel releases the socket and keeps every
+  // subscription, so a return resumes the streams from where they stopped.
+  window.addEventListener("pagehide", () => {
     flushSave();
-    // `persisted` means the page went into the back/forward cache: it is
-    // frozen, not finished, and a later `pageshow` restores this very surface.
-    // Tearing it down here would leave the restored page holding a disposed
-    // Chat that never resubscribes — the suspended-page case this recovery
-    // work exists to fix.
-    if ((event as PageTransitionEvent).persisted) return;
-    disposed = true;
-    stopConversationRefreshRecovery();
-    stream?.close();
-    inventoryStream?.close();
-    chatLifecycle?.dispose();
-    child?.stream?.close();
-    child?.read?.controller.abort();
-    childReadSignal?.cancel();
-    observer?.disconnect();
-    surfaceObserver.disconnect();
-    document.removeEventListener("visibilitychange", handleChatSurfaceState);
-    document.removeEventListener("uatu:before-surface-change", captureSurfaceAnchors);
-    if (renderFrame !== null) cancelAnimationFrame(renderFrame);
-    if (childRenderFrame !== null) cancelAnimationFrame(childRenderFrame);
-    if (resizeFrame !== null) cancelAnimationFrame(resizeFrame);
-    if (incrementalTimer !== null) clearTimeout(incrementalTimer);
-    if (childIncrementalTimer !== null) clearTimeout(childIncrementalTimer);
-    readLane?.controller.abort();
-    readSignal.cancel();
-    viewport.stop();
-    configurationPicker?.destroy();
-    if (workingTimer !== null) clearInterval(workingTimer);
   });
 
   // Bootstrap is deferred until Chat is actually the active surface: status()
@@ -3526,6 +4651,7 @@ export function initChat(api = new ChatApiClient()): void {
   const applyAgentContext = async (agentId: string | undefined): Promise<void> => {
     const status = agentStatusFor(agentId) ?? agentStatuses[0];
     contextAgentId = status?.agent.id;
+    renderLoginNotice();
     models = [];
     modes = [];
     commands = [];
@@ -3533,6 +4659,7 @@ export function initChat(api = new ChatApiClient()): void {
     catalogLoading = Boolean(status && status.availability.state !== "unavailable");
     configurationTrigger.disabled = catalogLoading || !projection;
     agent = status?.availability.state === "ready" ? status.availability.agent : undefined;
+    if (status && agent?.capabilities.includes("usage")) seedUsage(status.agent.id);
     nameAgent();
     applyCapabilities();
     document.querySelectorAll(".chat-unavailable").forEach(panel => panel.remove());
@@ -3575,7 +4702,54 @@ export function initChat(api = new ChatApiClient()): void {
     catalogLoading = false;
     form.hidden = false;
     renderConfiguration();
+    syncContextIndicator();
     syncControls();
+    refreshCatalogRevision(status.agent.id);
+  };
+
+  // Plan usage is per login: the workspace's last-known report is fetched
+  // once per agent that reports it, and that agent answers the reads. One
+  // agent reports it today; the last one to answer would take the reads.
+  // "Seeded" means answered: a read that failed in transit is asked again
+  // on the next status or context refresh, and an agent that answered 409
+  // does not report usage and is not asked again.
+  const seededUsage = new Set<string>();
+  const usageUnsupported = new Set<string>();
+  const usageSeeds = new Map<string, Promise<void>>();
+  const seedUsage = (agentId: string): Promise<void> => {
+    if (seededUsage.has(agentId) || usageUnsupported.has(agentId)) return Promise.resolve();
+    const pending = usageSeeds.get(agentId);
+    if (pending) return pending;
+    // Inside the chain: a client without the read (an older fake) rejects
+    // like a failed read instead of throwing through the caller's bootstrap.
+    const seed = Promise.resolve().then(() => api.usage(agentId)).then(report => {
+      seededUsage.add(agentId);
+      // The agent that holds a report answers the reads; an agent that
+      // answered with nothing only takes them while no one else has. Which
+      // response lands last must not decide who is asked.
+      if (report || !usageReadable()) onUsageRead(mode => api.readUsage(agentId, newRequestId(), mode));
+      if (report) noteUsageReport({ plan: report.plan, reportedAt: report.readAt, ...(report.conversationId ? { conversationId: report.conversationId } : {}) });
+    }, error => {
+      if (error instanceof ChatTransportError && error.status === 409) usageUnsupported.add(agentId);
+    }).finally(() => { usageSeeds.delete(agentId); });
+    usageSeeds.set(agentId, seed);
+    return seed;
+  };
+  // An agent already up when the page loads seeds the pane before any
+  // conversation is opened; one that reports ready later seeds then.
+  const seedUsageFromStatuses = () => {
+    for (const status of agentStatuses) {
+      if (status.availability.state === "ready" && status.availability.agent?.capabilities.includes("usage")) seedUsage(status.agent.id);
+    }
+  };
+  // An agent idle at page load has not declared anything yet, and a
+  // workspace with no conversations never selects one to make it. The
+  // inventory read has started every agent by the time it answers, so each
+  // usable one is asked then; one that does not report usage says so once.
+  const seedUsageFromInventory = () => {
+    for (const status of agentStatuses) {
+      if (status.availability.state !== "unavailable") void seedUsage(status.agent.id);
+    }
   };
 
   /**
@@ -3591,30 +4765,98 @@ export function initChat(api = new ChatApiClient()): void {
   // Refreshed in the background from the idle poll and after a conversation
   // selection settles — never inside the selection or creation path itself,
   // where an in-flight read has raced the chooser before.
-  const refreshBankedCommands = (agentId: string | undefined) => {
-    if (!agentId) return;
+  // The catalogs are re-read where they are used: a ready agent has no idle
+  // poll, so a page left open would otherwise keep the commands, models, and
+  // modes it banked while another client's `/reload` changed them. Opening
+  // a slash query or the configuration picker refreshes them in the
+  // background; the open surface re-renders when the lists land. Every
+  // open reads — they are user actions — and overlapping reads are safe:
+  // only the latest one's answers are installed (LatestRefresh below), so
+  // a read begun before another client's reload cannot outlast the one this
+  // open started after it.
+  const refreshCatalogsOnUse = () => {
+    const agentId = contextAgentId;
+    if (agentId) void refreshBankedCommands(agentId);
+  };
+
+  // Refreshes can overlap (a slash query's, then a reload's): only the
+  // latest one's answers are installed, or a pre-reload list landing late
+  // would overwrite the reloaded one.
+  const catalogRefreshes = new LatestRefresh();
+  const catalogRevisionReads = new Map<string, { bank: AgentCatalogs; revision: string; retryRequested: boolean }>();
+  // Settles once every read has landed or failed. Track revision demand on
+  // every refresh, including one started by a reconnect or picker action.
+  const refreshBankedCommands = (agentId: string | undefined, options: { acceptEmpty?: boolean } = {}): Promise<void> => {
+    if (!agentId) return Promise.resolve();
     const banked = agentCatalogs.get(agentId);
-    if (!banked) return;
-    if (agent?.capabilities.includes("commands") || agent?.capabilities.includes("reversible-history")) {
-      void api.commands(agentId).then(list => {
-        if (agentCatalogs.get(agentId) !== banked) return;
+    if (!banked) return Promise.resolve();
+    const revision = catalogRevisions.get(agentId);
+    const revisionRead = revision === undefined ? undefined : { bank: banked, revision, retryRequested: false };
+    if (revisionRead) catalogRevisionReads.set(agentId, revisionRead);
+    const availability = agentStatusFor(agentId)?.availability;
+    const capabilities = availability?.state === "ready" ? availability.agent?.capabilities : undefined;
+    const has = (capability: ChatCapability) => capabilities?.includes(capability) ?? true;
+    const latest = catalogRefreshes.begin(agentId);
+    const current = () => agentCatalogs.get(agentId) === banked && latest();
+    let complete = true;
+    const reads: Promise<unknown>[] = [];
+    if (has("commands") || has("reversible-history")) {
+      reads.push(api.commands(agentId).then(list => {
+        if (!current()) { complete = false; return; }
         banked.commands = list;
         banked.commandInventoryAvailable = true;
-        if (contextAgentId === agentId) commands = list;
-      }).catch(() => undefined);
+        if (contextAgentId === agentId) {
+          commands = list;
+          if (slashQueryActive) renderCommandMenu();
+        }
+      }).catch(() => { complete = false; }));
     }
     // Models change under a running page too — a Claude Code update ships
     // new entries — so the banked model list refreshes on the same cadence.
-    if (agent?.capabilities.includes("models")) {
-      void api.models(agentId).then(list => {
-        if (agentCatalogs.get(agentId) !== banked || list.length === 0) return;
+    if (has("models")) {
+      reads.push(api.models(agentId).then(list => {
+        if (!current() || (list.length === 0 && !options.acceptEmpty)) { complete = false; return; }
         banked.models = list;
         if (contextAgentId === agentId) {
           models = list;
           renderConfiguration();
+          syncContextIndicator();
         }
-      }).catch(() => undefined);
+      }).catch(() => { complete = false; }));
     }
+    // Modes too: OpenCode's agents are its configuration, which a reload
+    // (or an edit picked up on restart) changes under a running page.
+    if (has("modes")) {
+      reads.push(api.modes(agentId).then(list => {
+        if (!current() || list.length === 0) { complete = false; return; }
+        banked.modes = list;
+        if (contextAgentId === agentId) {
+          modes = list;
+          renderConfiguration();
+        }
+      }).catch(() => { complete = false; }));
+    }
+    return Promise.all(reads).then(() => {
+      const stillCurrent = current();
+      if (stillCurrent && complete && reads.length > 0 && revision !== undefined) banked.catalogRevision = revision;
+      if (!revisionRead || catalogRevisionReads.get(agentId) !== revisionRead) return;
+      catalogRevisionReads.delete(agentId);
+      // One retry consumes all matching invalidations received during this
+      // attempt. Failure alone never creates more work or an automatic loop.
+      if (stillCurrent && !complete && revisionRead.retryRequested && catalogRevisions.get(agentId) === revision) refreshCatalogRevision(agentId);
+    });
+  };
+
+  const refreshCatalogRevision = (agentId: string): void => {
+    const bank = agentCatalogs.get(agentId);
+    const revision = catalogRevisions.get(agentId);
+    if (!bank || revision === undefined || bank.catalogRevision === revision) return;
+    const inflight = catalogRevisionReads.get(agentId);
+    if (inflight?.bank === bank && inflight.revision === revision) {
+      inflight.retryRequested = true;
+      return;
+    }
+    void refreshBankedCommands(agentId);
   };
 
   const refreshIdleAgentContext = () => {
@@ -3624,7 +4866,7 @@ export function initChat(api = new ChatApiClient()): void {
       const watching = contextAgentId;
       if (!watching || conversationAgentId(presentation.selectedId) !== watching) return;
       try {
-        agentStatuses = await api.status();
+        setAgentStatuses(await api.status());
       } catch {
         return;
       }
@@ -3636,16 +4878,22 @@ export function initChat(api = new ChatApiClient()): void {
     }, 1_500);
   };
 
-  // `resumed` distinguishes replacing a stream this client lost from opening
-  // the first one — only the former is transport recovery.
-  const startInventoryStream = (resumed = false) => {
+  const startInventoryStream = () => {
     if (inventoryStream) return;
     try {
       inventoryStream = api.inventoryStream({
-        invalidation: () => { void inventoryReconciler.request(); },
+        // A tick may also mean a login changed (Agent accounts): status is
+        // in-memory on the server, so it is re-read alongside the inventory.
+        invalidation: event => {
+          void inventoryReconciler.request(); rereadStatuses();
+          for (const [agentId, revision] of Object.entries(event.catalogs ?? {})) {
+            catalogRevisions.set(agentId, revision);
+            refreshCatalogRevision(agentId);
+          }
+        },
         error: error => interruptions.report("inventory", error),
-        recovered: () => interruptions.clear("inventory"),
-      }, { resumed });
+        recovered: () => { interruptions.clear("inventory"); refreshCatalogsOnUse(); },
+      });
     } catch (error) {
       announce(messageOf(error), true);
     }
@@ -3714,7 +4962,7 @@ export function initChat(api = new ChatApiClient()): void {
       announce(`Starting ${agentName}…`);
       try {
         const next = await api.retry(agentId);
-        agentStatuses = agentStatuses.map(status => status.agent.id === agentId ? next : status);
+        setAgentStatuses(agentStatuses.map(status => status.agent.id === agentId ? next : status));
         if (next.availability.state === "unavailable") {
           showUnavailable(agentId, next.availability, options);
           return;
@@ -3748,7 +4996,8 @@ export function initChat(api = new ChatApiClient()): void {
     bootstrapRead = initialRead;
     readError.hidden = true;
     try {
-      agentStatuses = await api.status();
+      setAgentStatuses(await api.status());
+      seedUsageFromStatuses();
       // Every offered agent down at once is the only full takeover: with no
       // agent to converse with, the surface's job is the diagnosis + retry.
       const anyUsable = agentStatuses.some(status => status.availability.state !== "unavailable");
@@ -3775,6 +5024,7 @@ export function initChat(api = new ChatApiClient()): void {
       // as soon as the inventory answers.
       const contextReady = applyAgentContext(preferred.agent.id);
       const nextConversations = await api.conversations();
+      seedUsageFromInventory();
       conversations = dedupeConversationInventory([...conversations, ...nextConversations]);
       // Bootstrap is the silent page-local baseline. The stream starts only
       // after this point, so its mandatory initial frame reconciles rather
@@ -3785,10 +5035,11 @@ export function initChat(api = new ChatApiClient()): void {
       select.disabled = false;
       newButton.disabled = false;
       announce(conversations.length ? "" : "No conversations yet. Create one to start.");
+      await resolveAwaiting();
       // A selection made mid-bootstrap is the user's; the initial chooser
       // pass must not replace it with this snapshot's newest entry.
-      if (selectionGeneration === selectionAtStart) installInitialChooser();
-      else patchChooser(presentation.selectedId ?? null);
+      if (startupOwnsSelection && selectionGeneration === selectionAtStart) installInitialChooser();
+      else patchChooser(hasSelectedConversation ? presentation.selectedId ?? null : null);
       void contextReady;
       bootstrapped = true;
       // The enumeration above probed every agent; the pre-probe snapshot
@@ -3799,7 +5050,7 @@ export function initChat(api = new ChatApiClient()): void {
       // that every agent is down after all, the takeover renders now
       // rather than after a reload.
       void api.status().then(next => {
-        agentStatuses = next;
+        setAgentStatuses(next);
         if (next.length > 0 && next.every(status => status.availability.state === "unavailable")) {
           for (const status of next) {
             if (status.availability.state === "unavailable") showUnavailable(status.agent.id, status.availability, { takeover: true });
@@ -3824,12 +5075,7 @@ export function initChat(api = new ChatApiClient()): void {
     finally { bootstrapping = false; readSignal.settle(bootstrapRead ?? initialRead); bootstrapRead = null; }
   };
   function chatSurfaceActive() {
-    if (!workspaceForeground()) return false;
-    if (document.visibilityState === "hidden") return false;
-    const root = document.documentElement;
-    return root.getAttribute("data-ui-mode") === "touch"
-      ? root.getAttribute("data-active-tab") === "chat"
-      : root.getAttribute("data-chat-panel") === "open";
+    return chatSurfaceInView();
   }
   function syncChatAttention() {
     const pending = [projection, child?.projection].some(source => source?.items.some(item =>
@@ -3843,17 +5089,25 @@ export function initChat(api = new ChatApiClient()): void {
   let chatWasActive = false;
   const captureSurfaceAnchors = () => {
     if (!chatSurfaceActive()) return;
-    if (!anchor.isPinned()) anchor.beforeMutation(geometry());
-    if (child && !childAnchor.isPinned() && drilldownTimeline) childAnchor.beforeMutation(childGeometry());
+    parentScroll.beforeMutation();
+    childScroll?.beforeMutation();
   };
   document.addEventListener("uatu:before-surface-change", captureSurfaceAnchors);
   const handleChatSurfaceState = () => {
+    if (document.documentElement.hasAttribute("data-notification-chat") && (document.documentElement.getAttribute("data-ui-mode") === "touch" || isChatPanelOpen())) {
+      document.documentElement.removeAttribute("data-notification-chat");
+    }
     const active = chatSurfaceActive();
     const becameActive = active && !chatWasActive;
     chatWasActive = active;
     syncWorkingTimer();
     syncChatAttention();
     if (!active) {
+      renderer.setShellOutputsHidden(true);
+      childRenderer.setShellOutputsHidden(true);
+      parentScroll.cancel();
+      childScroll?.cancel();
+      heldAnswerField = null;
       readSignal.cancel();
       childReadSignal?.cancel();
       if (incrementalTimer !== null) { clearTimeout(incrementalTimer); incrementalTimer = null; }
@@ -3863,11 +5117,21 @@ export function initChat(api = new ChatApiClient()): void {
       return;
     }
     if (becameActive) {
+      // The surface just came into view — the render below clears the
+      // pending-content badge, and the hub switcher clears the workspace's
+      // finished mark on the same cue. Fires at bootstrap too when the
+      // surface is already in view (chatWasActive starts false).
+      document.dispatchEvent(new CustomEvent(CHAT_SURFACE_ACTIVE_EVENT));
+      // Backgrounding cancels owners but may retain DOM focus without another
+      // focusin. Restore only the currently valid request field on return.
+      syncEditingFocus();
       if (readLane) readLane.token = readSignal.start(readLane.label);
       else if (bootstrapping) bootstrapRead = readSignal.start("Loading conversations...");
       if (child?.read) child.read.token = childReadSignal?.start(child.read.label) ?? 0;
-      if (renderDirty) scheduleRender(false, false);
-      if (childRenderDirty) renderChild(false);
+      // Even an unchanged projection may own a hidden floating viewport.
+      // Its latest state is painted before its retained window becomes visible.
+      scheduleRender(false, false);
+      renderChild(false);
     }
     if (!bootstrapped) void bootstrap();
     else if (becameActive) {
@@ -3876,7 +5140,7 @@ export function initChat(api = new ChatApiClient()): void {
     }
   };
   const surfaceObserver = new MutationObserver(handleChatSurfaceState);
-  surfaceObserver.observe(document.documentElement, { attributes: true, attributeFilter: ["data-chat-panel", "data-active-tab", "data-ui-mode", "data-workspace-foreground"] });
+  surfaceObserver.observe(document.documentElement, { attributes: true, attributeFilter: ["data-chat-panel", "data-active-tab", "data-ui-mode", "data-notification-chat", "data-workspace-foreground"] });
   document.addEventListener("visibilitychange", handleChatSurfaceState);
   onWorkspaceCredentialRefresh(() => {
     if (bootstrapped) {
@@ -3887,46 +5151,54 @@ export function initChat(api = new ChatApiClient()): void {
     }
   });
   // A page that was frozen, backgrounded, or off the network missed whatever
-  // the streams would have delivered, and may be holding sockets that will
-  // never speak again. Recovery is: reconcile the authoritative inventory and
-  // replace both streams. Nothing here touches presentation — the selected
-  // conversation resumes from the cursor its projection already holds, so
-  // drafts, timeline content, and scroll position survive intact.
-  chatLifecycle = createLifecycleRecovery({
-    win: window,
-    doc: document,
-    discard: () => {},
-    recover: async () => {
-      if (disposed || !bootstrapped) return;
-      const inventory = inventoryReconciler.request();
-      inventoryStream?.close();
-      inventoryStream = null;
-      startInventoryStream(true);
-      const current = projection;
-      if (current && activeConversationId() === current.conversationId) {
-        stream?.close();
-        stream = openConversationStream(current.conversationId, current.cursor, selectionGeneration, { resumed: true });
-      }
-      // An open subagent transcript owns its own stream, which the parent's
-      // replacement does not touch. Left alone it stays half-dead and silently
-      // stops reporting, while the surface looks recovered.
-      const openChild = child;
-      if (openChild?.projection) {
-        openChild.stream?.close();
-        openChild.stream = openChildStream(
-          openChild,
-          openChild.conversationId,
-          openChild.label,
-          openChild.projection.cursor,
-          childGeneration,
-          { resumed: true },
-        );
-      }
-      await inventory;
-    },
+  // the stream would have delivered. The shell's one lifecycle recovery
+  // (shell/live.ts) reconnects the page's live channel, which resumes the
+  // inventory, the selected conversation, and any open subagent transcript
+  // from the cursors it holds — a cursor the hub can no longer replay comes
+  // back as a resync on that topic alone. Chat's own part is the state the
+  // stream cannot replay: the authoritative inventory. Nothing here touches
+  // presentation — drafts, timeline content, and scroll position survive
+  // intact.
+  registerRecoveryWork(async () => {
+    if (!bootstrapped) return;
+    await inventoryReconciler.request();
   });
+  const revealNotificationChat = () => {
+    if (document.documentElement.getAttribute("data-ui-mode") === "touch") setActiveTab("chat");
+    else {
+      expandChatPanel();
+      // A notification still needs to be answerable in a desktop window too
+      // narrow for the split. This temporary view does not change UI mode.
+      if (!isChatPanelOpen()) document.documentElement.setAttribute("data-notification-chat", "");
+    }
+  };
+  document.getElementById("chat-collapse")?.addEventListener("click", () => document.documentElement.removeAttribute("data-notification-chat"));
+  navigator.serviceWorker?.addEventListener("message", event => {
+    if (event.data?.type !== "uatu:open-conversation" || typeof event.data.conversationId !== "string") return;
+    const id = notificationConversation(`conversation=${encodeURIComponent(event.data.conversationId)}`);
+    if (!id) return;
+    revealNotificationChat();
+    closeChildConversation();
+    if (bootstrapped) void selectConversation(id);
+    else notificationTarget = id;
+  });
+  if (notificationTarget || awaitingLookup) revealNotificationChat();
   handleChatSurfaceState();
 }
+
+/**
+ * The controls that resolve a request: a question's submit and reject, and a
+ * permission's choices, outcomes and confirmation pair. All of them can be
+ * tapped while a free-form answer field holds focus.
+ */
+const REQUEST_ANSWER_CONTROLS = [
+  "[data-question-primary]",
+  "[data-question-reject]",
+  ".chat-request-actions [data-permission-choice]",
+  ".chat-request-actions [data-permission-outcome]",
+  ".chat-request-actions [data-permission-confirm]",
+  ".chat-request-actions [data-permission-cancel]",
+].join(", ");
 
 function isTextEditingControl(value: Element | null): boolean {
   if (value instanceof HTMLTextAreaElement) return true;
@@ -3951,6 +5223,7 @@ function readPresentation(): Presentation {
     return {
       selectedId: typeof value.selectedId === "string" ? value.selectedId : undefined,
       lastAgentId: typeof value.lastAgentId === "string" ? value.lastAgentId : undefined,
+      receiptView: parseReceiptView(value.receiptView),
       drafts: value.drafts && typeof value.drafts === "object" ? value.drafts : {},
       expanded: Array.isArray(value.expanded) ? value.expanded.filter(item => typeof item === "string") : [],
       anchors: value.anchors && typeof value.anchors === "object" ? value.anchors : {},
@@ -3971,17 +5244,6 @@ function parseStoredTimestamps(value: unknown): Record<string, number> {
   if (!value || typeof value !== "object" || Array.isArray(value)) return {};
   return Object.fromEntries(Object.entries(value).filter((entry): entry is [string, number] =>
     typeof entry[1] === "number" && Number.isFinite(entry[1]) && entry[1] >= 0));
-}
-
-/**
- * Token counts at a glance: `840`, `12.4k`, `1.2M`. The exact figure is always
- * one hover or one expansion away (the title attribute and the breakdown), so
- * the compact form never has to be the only statement.
- */
-function formatTokens(value: number): string {
-  if (value < 1_000) return String(value);
-  if (value < 1_000_000) return `${(value / 1_000).toFixed(value < 10_000 ? 1 : 0)}k`;
-  return `${(value / 1_000_000).toFixed(1)}M`;
 }
 
 function modelValue(model: ModelSelection): string {

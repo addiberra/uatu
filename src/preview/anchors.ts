@@ -188,7 +188,7 @@ export function initCrossDocAnchorHandler() {
         return;
       }
       setFollowEnabled(false);
-      setSelectedId(null);
+      setSelectedId(null, "navigation");
       setPreviewMode({ kind: "empty" });
       window.history.pushState(null, "", resolved.pathname);
       syncFollowToggle();
@@ -199,7 +199,7 @@ export function initCrossDocAnchorHandler() {
 
     event.preventDefault();
     setFollowEnabled(false);
-    setSelectedId(doc.id);
+    setSelectedId(doc.id, "navigation");
     setPreviewMode({ kind: "document" });
     pushSelection(doc.id, doc.relativePath);
     syncFollowToggle();

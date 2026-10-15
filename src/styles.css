@@ -73,6 +73,12 @@
   --border-soft: light-dark(#e6eaef, #21262d);
   --border-medium: light-dark(#d0d7de, #30363d);
   --text-subtle: light-dark(#57606a, #8b949e);
+  /* The chat's activity chrome — working line, group summaries, member rows.
+     Between subtle and strong: strong enough to tell steps apart from each
+     other and from the prose (8.7:1 light and 9.6:1 dark on --surface,
+     8.8:1 on the dark --surface-raised; `chat/activity-contrast.test.ts`
+     holds it at 7:1 or better), still well short of prose weight. */
+  --chat-activity-fg: light-dark(#454c54, #b1bac4);
   --text-strong: light-dark(#1f2328, #e6edf3);
   --accent: light-dark(#0969da, #4493f8);
   --accent-soft: light-dark(#ddf4ff, #121d2f);
@@ -103,9 +109,19 @@
   --surface-track: light-dark(#eef1f4, #1c222b);
   /* Semantic state colors (GitHub light/dark pairs). */
   --success: light-dark(#2da44e, #3fb950);
+  /* The tinted background a success notice sits on (the worktree
+     confirmation). A token rather than a color-mix() of --success: a
+     light-dark() token nested inside color-mix() does not follow the used
+     color scheme in every engine, which left the notice light in dark mode. */
+  --success-soft: light-dark(#dafbe1, #12261e);
   --success-strong: light-dark(#1a7f37, #3fb950);
   --danger: light-dark(#cf222e, #f85149);
   --attention: light-dark(#bf8700, #d29922);
+  /* A workspace whose work finished and has not been viewed (the switcher's
+     finished entry and pill). Its own hue, GitHub's pink pair, so it reads
+     apart from blue working and amber awaiting at a glance; both values
+     clear 4.5:1 on the page and raised surfaces they sit on. */
+  --finished: light-dark(#bf3989, #db61a2);
   /* Warning-toned notice surfaces (config-warning, stale-client notice). */
   --notice-warn-border: light-dark(#f0cf7a, #9e6a03);
   --notice-warn-bg: light-dark(#fff8dc, #271d05);
@@ -203,6 +219,60 @@ body {
   height: 100vh;
   grid-template-columns: var(--sidebar-width) 6px minmax(0, 1fr);
   grid-template-areas: "sidebar resize preview";
+}
+
+/* Physical safe areas apply in desktop mode too, even with a trackpad.
+   The probe resolves env() to pixels for visual-viewport overlap accounting. */
+:root {
+  --device-safe-top: env(safe-area-inset-top, 0px);
+  --device-safe-right: env(safe-area-inset-right, 0px);
+  --device-safe-bottom: env(safe-area-inset-bottom, 0px);
+  --device-safe-left: env(safe-area-inset-left, 0px);
+}
+
+.desktop-safe-area-probe {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 0;
+  height: 0;
+  padding: var(--device-safe-top) var(--device-safe-right) var(--device-safe-bottom) var(--device-safe-left);
+  visibility: hidden;
+  pointer-events: none;
+}
+
+html[data-ui-mode="desktop"]:not(.uatu-desktop-host) .app-shell {
+  padding: var(--device-safe-top) var(--device-safe-right) var(--device-safe-bottom) var(--device-safe-left);
+  background: var(--surface);
+}
+
+@media (min-width: 901px) {
+  html[data-ui-mode="desktop"]:not(.uatu-desktop-host) {
+    overflow: hidden;
+  }
+
+  /* One visible rectangle for every desktop pane. Fixed positioning prevents
+     focus-induced document scrolling from carrying the headers out of view.
+     The native macOS wrapper keeps its existing titlebar stacking contract. */
+  html[data-ui-mode="desktop"]:not(.uatu-desktop-host) .app-shell {
+    position: fixed;
+    top: var(--desktop-visual-top, 0px);
+    left: var(--desktop-visual-left, 0px);
+    width: var(--desktop-visual-width, 100%);
+    height: var(--desktop-visual-height, 100dvh);
+    padding: var(--desktop-visual-safe-top, var(--device-safe-top))
+      var(--desktop-visual-safe-right, var(--device-safe-right))
+      var(--desktop-visual-safe-bottom, var(--device-safe-bottom))
+      var(--desktop-visual-safe-left, var(--device-safe-left));
+  }
+
+  /* Retain the stored dock height, but temporarily leave room for the work
+     row when a keyboard reduces the visible height. Xterm's ResizeObserver
+     refits its host; no second keyboard offset belongs on the terminal. */
+  html[data-ui-mode="desktop"][data-desktop-occluded]:not(.uatu-desktop-host) .terminal-panel[data-dock="bottom"][data-display="normal"] {
+    max-height: 40%;
+    min-height: min(120px, 40%);
+  }
 }
 
 .app-shell.is-sidebar-collapsed {
@@ -522,6 +592,7 @@ html.uatu-desktop-host
 .brand-wordmark {
   margin: 0;
   min-width: 0;
+  max-width: 100%;
   font-size: 1.5rem;
   font-weight: 700;
   letter-spacing: -0.01em;
@@ -586,6 +657,66 @@ html.uatu-desktop-host
   flex-shrink: 0;
 }
 
+/* The current checkout's branch, beside a main checkout's name on the chip. */
+.hub-toggle-branch {
+  margin-inline-start: 0.35rem;
+  color: var(--text-subtle);
+  font-weight: 400;
+}
+
+/* A repository's non-interactive header inside the menu: it names the
+   repository and owns its one fork control; the checkout rows below it are
+   the things you can switch to. A band, like the Hub dashboard's own group
+   heading, so the eye lands on the repository boundary before the rows.
+   --surface-track rather than --surface-muted: the muted/subtle/raised tiers
+   all collapse onto #161b22 in dark, where a band painted with any of them
+   would be invisible against the menu it sits in. */
+.hub-menu-group {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  padding: 0.15rem 0.4rem;
+  border-radius: 0.3rem;
+  background: var(--surface-track);
+  color: var(--text-strong);
+  font-size: 0.74rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+/* The repository's name takes the row and gives way to the fork control,
+   which the flex rule below pins to the trailing edge. */
+.hub-menu-group .hub-menu-label {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* At the header's trailing edge — the same edge a row's status text ends on
+   — while keeping a 44px tap target. */
+.hub-menu-fork {
+  flex: 0 0 auto;
+  margin-inline-start: auto;
+  min-width: 44px;
+  min-height: 44px;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  padding: 0;
+  background: transparent;
+  border: 0;
+  border-radius: 0.3rem;
+  color: inherit;
+  cursor: pointer;
+}
+
+.hub-menu-fork:hover {
+  background: var(--surface-subtle);
+  color: var(--text-strong);
+}
+
 .hub-toggle-label {
   flex: 1 1 auto;
   min-width: 0;
@@ -594,10 +725,24 @@ html.uatu-desktop-host
   white-space: nowrap;
 }
 
+/* A repository or two is enough to make this menu taller than the phone it
+   is open on, and in touch mode it sits inside a fullscreen `overflow:
+   hidden` Files pane pinned above the tab bar — so its last rows, Sign out
+   among them, were simply cut off and unreachable. It scrolls instead,
+   bounded by what is visible below its own top edge. The pixel bound is
+   measured at open time (shell/hub-nav.ts sets --hub-menu-max-height,
+   because the top depends on the header above it); the fallback keeps a
+   sane bound before that runs and if it never does. */
 .hub-menu {
   left: 0.75rem;
   right: 0.75rem;
   min-width: 0;
+  max-height: var(--hub-menu-max-height, calc(100dvh - 12rem));
+  overflow-y: auto;
+  /* A flick that reaches the end of the menu must not start scrolling the
+     page (or the fullscreen Files pane) behind it. */
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
 }
 
 /* The connection chip's live-dot treatment, available to the hub switcher's
@@ -644,16 +789,109 @@ html.uatu-desktop-host
   white-space: nowrap;
 }
 
+.hub-menu-provenance, .hub-menu-branch {
+  display: block;
+  color: var(--text-subtle);
+  font-size: 0.7rem;
+  font-weight: 400;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .hub-menu-item .hub-menu-state {
   color: var(--text-subtle);
   font-size: 0.7rem;
   flex-shrink: 0;
 }
 
+/* Other workspaces' live activity (hub-nav's activity consumer). In the
+   menu, the state column names it; on the collapsed chip, a badge summarizes
+   it — a warm count pill when an interaction awaits the user, a pink
+   count pill when work finished unviewed, a quiet accent dot while agents
+   merely work — so the three read as three levels. The chip button's
+   aria-label carries the same words. */
+.hub-menu-item .hub-menu-state.is-awaiting {
+  color: var(--attention);
+  font-weight: 600;
+}
+
+.hub-menu-item .hub-menu-state.is-working {
+  color: var(--accent);
+}
+
+.hub-menu-item .hub-menu-state.is-finished {
+  color: var(--finished);
+  font-weight: 400;
+}
+
+.hub-activity-badge {
+  display: inline-grid;
+  place-items: center;
+  flex-shrink: 0;
+  line-height: 1;
+}
+
+.hub-activity-badge[hidden] {
+  display: none;
+}
+
+.hub-activity-badge.is-awaiting {
+  min-width: 1.15rem;
+  height: 1.15rem;
+  /* Taller than the label's line box: without pulling it back into the
+     flex line, the chip grows by ~2 px when the pill appears and every row
+     below jumps each time a question arrives or is answered. */
+  margin-block: -0.25rem;
+  padding: 0 0.35rem;
+  border: 1px solid var(--notice-warn-border);
+  border-radius: 999px;
+  background: var(--notice-warn-bg);
+  color: var(--attention);
+  font-size: 0.68rem;
+  font-weight: 700;
+}
+
+/* The finished pill shares the awaiting pill's box, so the chip does not
+   change height as one badge gives way to the other; only the tone differs,
+   and it never pulses — nothing is waiting on the user. */
+.hub-activity-badge.is-finished {
+  min-width: 1.15rem;
+  height: 1.15rem;
+  margin-block: -0.25rem;
+  padding: 0 0.35rem;
+  border: 1px solid var(--finished);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--finished);
+  font-size: 0.68rem;
+  font-weight: 700;
+}
+
+.hub-activity-badge.is-working {
+  width: 0.45rem;
+  height: 0.45rem;
+  border-radius: 999px;
+  background: var(--accent);
+  animation: uatu-pulse 1.8s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .hub-activity-badge.is-working {
+    animation: none;
+  }
+}
+
 .hub-menu-divider {
   margin: 0.3rem 0.15rem;
   border: 0;
   border-top: 1px solid var(--border-soft);
+}
+
+/* The divide between two repositories: the same rule as the menu's other
+   dividers, with more air around it, so consecutive groups never run
+   together. */
+.hub-menu-divider.is-group {
+  margin-block: 0.65rem 0.45rem;
 }
 
 /* Terminal touch keybar — hidden everywhere except coarse-pointer devices
@@ -759,6 +997,10 @@ html.uatu-desktop-host
   background: var(--surface-subtle);
 }
 
+/* A button that has to read as the label it used to be: the reset keeps the
+   chip visually identical to the old <span> so the wordmark block below the
+   logo is unchanged, while the element itself is focusable and activatable.
+   `position: relative` is here for the coarse-pointer hit area below. */
 .connection-state {
   display: inline-flex;
   align-items: center;
@@ -767,6 +1009,28 @@ html.uatu-desktop-host
   font-weight: 500;
   color: var(--text-subtle);
   letter-spacing: 0.01em;
+  position: relative;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+/* Inert while live: the click handler ignores activation, so the cursor has
+   to stop advertising one. `aria-disabled` rather than `disabled` — a
+   disabled button drops out of the tab order and loses its hover tooltip,
+   and the state title is the thing a mouse user comes here for. */
+.connection-state[aria-disabled="true"] {
+  cursor: default;
+}
+
+.connection-state:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 0.25rem;
 }
 
 .connection-state[hidden] {
@@ -795,6 +1059,67 @@ html.uatu-desktop-host
   background: light-dark(#d4a72c, #d29922);
 }
 
+/* The hub says the session is stopped: a still dot in the danger tone, no
+   pulse — nothing is being tried until the user asks for the start. The
+   label reads a little stronger than the subtle default so the word is not
+   missed under the wordmark. */
+.connection-state.is-stopped {
+  color: var(--text-strong);
+}
+
+.connection-state.is-stopped .indicator-dot {
+  background: var(--danger);
+}
+
+/* Why a start was refused, under the indicator. Same idiom as the hub
+   pages' local errors; wraps within the header rather than widening it. */
+.connection-error {
+  margin: 0;
+  max-width: 100%;
+  font-size: 0.7rem;
+  line-height: 1.3;
+  color: var(--danger);
+  overflow-wrap: anywhere;
+}
+
+.connection-error[hidden] {
+  display: none;
+}
+
+/* A requested attempt is under way. The label still follows the channel, so
+   what is left to say is that the page is acting on the tap: the chip lifts
+   into a pill (negative margins keep the header's box where it was) and the
+   dot beats faster than the live pulse, in the reconnecting colour. */
+.connection-state.is-attempting {
+  margin: -0.15rem -0.5rem;
+  padding: 0.15rem 0.5rem;
+  border-radius: 999px;
+  background: var(--surface-subtle);
+  color: var(--text-strong);
+}
+
+.connection-state.is-attempting .indicator-dot {
+  background: light-dark(#d4a72c, #d29922);
+  animation: uatu-pulse 0.9s ease-in-out infinite;
+}
+
+/* Touch target, matching the 44px the rest of touch mode guarantees. Drawn
+   as an overlay rather than as padding or a min-height: the chip sits under
+   the wordmark in a fixed-height header, and growing the box would push the
+   header open. Keyed on the pointer, not the ui-mode attribute — an iPad in
+   desktop mode still taps with a finger. */
+@media (pointer: coarse) {
+  .connection-state::after {
+    content: "";
+    position: absolute;
+    left: -10px;
+    right: -10px;
+    top: 50%;
+    height: 44px;
+    transform: translateY(-50%);
+  }
+}
+
 @keyframes uatu-pulse {
   0%,
   100% {
@@ -808,7 +1133,8 @@ html.uatu-desktop-host
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .connection-state.is-live .indicator-dot {
+  .connection-state.is-live .indicator-dot,
+  .connection-state.is-attempting .indicator-dot {
     animation: none;
   }
 }
@@ -1713,7 +2039,17 @@ html:not([data-ui-mode="touch"]) .app-shell:has(.terminal-panel[data-dock="right
   display: none;
 }
 
-.terminal-toggle-button {
+.sidebar-notifications-row {
+  padding: 0.85rem 0.75rem 0;
+  flex-shrink: 0;
+}
+
+.sidebar-notifications-row[hidden] {
+  display: none;
+}
+
+.terminal-toggle-button,
+.sidebar-notifications-button {
   appearance: none;
   width: 100%;
   display: flex;
@@ -1730,7 +2066,8 @@ html:not([data-ui-mode="touch"]) .app-shell:has(.terminal-panel[data-dock="right
   text-align: left;
 }
 
-.terminal-toggle-button:hover {
+.terminal-toggle-button:hover,
+.sidebar-notifications-button:hover {
   background: var(--surface-muted);
   border-color: var(--border-medium);
 }
@@ -1925,6 +2262,93 @@ html:not([data-ui-mode="touch"]) .app-shell:has(.terminal-panel[data-dock="right
   border: 0;
   border-radius: 4px;
   color: #ffffff;
+  font: inherit;
+  font-size: 0.85rem;
+  padding: 0.45rem 0.9rem;
+  cursor: pointer;
+}
+
+/* Reconnecting: the pane keeps its last screen while attachment is
+   reconciled, and says so in a corner. Never a form and never a focus
+   target — restoration must not take the keyboard from the document. */
+.terminal-pane-status {
+  position: absolute;
+  top: 0.4rem;
+  /* Clear of the pane's corner close button. */
+  right: 1.8rem;
+  z-index: 2;
+  padding: 0.2rem 0.55rem;
+  border-radius: 999px;
+  background: rgba(230, 237, 243, 0.12);
+  color: var(--terminal-fg, #e6edf3);
+  font-size: 0.75rem;
+  letter-spacing: 0.02em;
+  pointer-events: none;
+}
+
+/* The pane's parked cards after a recovery settled: the PTY is held by
+   another client (occupied), the shell is gone (ended), or the terminal could
+   not be reached within the recovery window (unreachable). Same visual family
+   as the taken-over notice; each names its one or two explicit actions. */
+.terminal-occupied,
+.terminal-ended,
+.terminal-unreachable {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: flex-start;
+  gap: 0.6rem;
+  max-width: 28rem;
+  margin: 0 auto;
+  padding: 1.5rem;
+  color: var(--terminal-fg, #e6edf3);
+}
+
+.terminal-occupied-heading,
+.terminal-ended-heading,
+.terminal-unreachable-heading {
+  margin: 0;
+  font-size: 0.95rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.terminal-occupied-help,
+.terminal-ended-help,
+.terminal-unreachable-help {
+  margin: 0;
+  font-size: 0.82rem;
+  line-height: 1.45;
+  color: rgba(230, 237, 243, 0.65);
+}
+
+.terminal-card-actions {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.terminal-occupied-takeover,
+.terminal-ended-new,
+.terminal-unreachable-retry {
+  appearance: none;
+  background: var(--accent, #0969da);
+  border: 0;
+  border-radius: 4px;
+  color: #ffffff;
+  font: inherit;
+  font-size: 0.85rem;
+  padding: 0.45rem 0.9rem;
+  cursor: pointer;
+}
+
+.terminal-occupied-new {
+  appearance: none;
+  background: transparent;
+  border: 1px solid rgba(230, 237, 243, 0.35);
+  border-radius: 4px;
+  color: var(--terminal-fg, #e6edf3);
   font: inherit;
   font-size: 0.85rem;
   padding: 0.45rem 0.9rem;
@@ -3743,6 +4167,17 @@ html:not([data-ui-mode="touch"]) .app-shell:has(.terminal-panel[data-dock="right
     margin: 0 -1rem;
   }
 
+  /* The stacked desktop still scrolls the document, rather than fixing a
+     tall stack into the keyboard-sized rectangle. Its sticky header must
+     clear the device status area while scrolling. */
+  html[data-ui-mode="desktop"]:not(.uatu-desktop-host) {
+    scroll-padding-top: calc(var(--preview-scroll-inset) + var(--device-safe-top));
+  }
+
+  html[data-ui-mode="desktop"]:not(.uatu-desktop-host) .preview-header {
+    top: var(--device-safe-top);
+  }
+
   .preview {
     padding: 15px;
   }
@@ -4685,7 +5120,7 @@ html[data-ui-mode="desktop"][data-chat-panel="collapsed"] .chat-surface {
   max-width: none;
 }
 
-html[data-ui-mode="desktop"][data-chat-panel="collapsed"] .chat-surface > :not(.chat-expand-strip),
+html[data-ui-mode="desktop"][data-chat-panel="collapsed"]:not([data-notification-chat]) .chat-surface > :not(.chat-expand-strip),
 html[data-ui-mode="desktop"][data-chat-panel="collapsed"] .chat-resizer,
 html[data-ui-mode="touch"] .chat-resizer {
   display: none;
@@ -4766,7 +5201,7 @@ body.is-resizing-chat .chat-resizer {
     max-width: none;
   }
 
-  html[data-ui-mode="desktop"] .chat-surface > :not(.chat-expand-strip) {
+  html[data-ui-mode="desktop"]:not([data-notification-chat]) .chat-surface > :not(.chat-expand-strip) {
     display: none;
   }
 
@@ -4836,6 +5271,28 @@ body.is-resizing-chat .chat-resizer {
 .chat-surface:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: -2px;
+}
+
+html[data-ui-mode="desktop"][data-notification-chat] .chat-surface {
+  position: fixed;
+  inset: 0;
+  top: var(--desktop-visual-top, 0px);
+  left: var(--desktop-visual-left, 0px);
+  width: var(--desktop-visual-width, 100%);
+  height: var(--desktop-visual-height, 100dvh);
+  z-index: 100;
+  padding: var(--desktop-visual-safe-top, var(--device-safe-top))
+    var(--desktop-visual-safe-right, var(--device-safe-right))
+    var(--desktop-visual-safe-bottom, var(--device-safe-bottom))
+    var(--desktop-visual-safe-left, var(--device-safe-left));
+}
+
+html.uatu-desktop-host[data-notification-chat] .chat-surface {
+  padding-top: var(--titlebar-inset, 0px);
+}
+
+html[data-ui-mode="desktop"][data-notification-chat] .chat-expand-strip {
+  display: none;
 }
 
 .chat-header {
@@ -5183,6 +5640,41 @@ body.is-resizing-chat .chat-resizer {
   color: var(--text-subtle);
 }
 
+/* The "Allow always" confirmation stage: the same card, one step deeper.
+   Its pattern list is the rule the agent will install, set apart from the
+   resources above it by its own box, so the two are never read as one. */
+.chat-request-confirm {
+  margin: 0.55rem 0 0;
+  padding: 0.6rem 0.75rem;
+  border: 1px solid var(--border-soft);
+  border-radius: 0.5rem;
+  background: var(--surface-muted, transparent);
+}
+
+.chat-request-confirm-title {
+  margin: 0;
+  font-weight: 600;
+}
+
+.chat-request-confirm-action {
+  font-weight: 500;
+  color: var(--text-subtle);
+}
+
+.chat-request-confirm-lead {
+  margin: 0.3rem 0 0;
+  line-height: 1.4;
+}
+
+.chat-request-confirm .chat-request-always {
+  margin: 0.35rem 0 0;
+  padding-left: 1.25rem;
+}
+
+.chat-request-confirm .chat-request-actions {
+  margin-top: 0.55rem;
+}
+
 .chat-conversation-controls select,
 .chat-composer textarea,
 .chat-configuration-dialog input,
@@ -5208,6 +5700,29 @@ body.is-resizing-chat .chat-resizer {
 
 .chat-state[hidden] {
   display: none;
+}
+
+/* The way back on an interruption report: inline with the message, not a
+   second row, so the line reads as one sentence with its action. */
+.chat-reconnect-button {
+  margin-inline-start: 0.6rem;
+  min-height: 1.6rem;
+  padding: 0.15rem 0.6rem;
+  font: inherit;
+  font-size: 0.85em;
+  vertical-align: baseline;
+}
+
+.chat-reconnect-button[aria-busy="true"] {
+  opacity: 0.6;
+  cursor: progress;
+}
+
+@media (pointer: coarse) {
+  .chat-reconnect-button {
+    min-height: 44px;
+    padding-inline: 0.9rem;
+  }
 }
 
 .chat-conversation-unavailable {
@@ -5340,6 +5855,9 @@ body.is-resizing-chat .chat-resizer {
   overflow-x: hidden;
   overscroll-behavior: contain;
   padding: 1rem max(1rem, calc((100% - 52rem) / 2));
+  /* The top padding, named for the pinned day separator (which reaches up
+     over it); kept equal to padding-top wherever that is overridden. */
+  --chat-timeline-inset-top: 1rem;
   scroll-padding-block: 1rem;
 }
 
@@ -5450,6 +5968,122 @@ body.is-resizing-chat .chat-resizer {
 
 .chat-drilldown-timeline {
   border-radius: 0;
+}
+
+/* The running-task strip under the drill-down header: what the task is and
+   the Stop control on the first line, its live facts on the second. It reads
+   as part of the header — same raised surface — because it describes the
+   layer, not an entry in it. */
+.chat-drilldown-task {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  padding: 0.4rem 0.75rem;
+  border-bottom: 1px solid var(--border-soft);
+  background: var(--surface-raised);
+  font-size: 0.8125em;
+}
+
+.chat-drilldown-task[hidden] {
+  display: none;
+}
+
+.chat-drilldown-task-line {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  min-width: 0;
+}
+
+.chat-drilldown-task-description {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-strong);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-drilldown-task-type {
+  flex: 0 0 auto;
+  color: var(--text-subtle);
+  font-family: var(--mono-font-family);
+  font-size: 0.9em;
+}
+
+/* Elapsed leads because it is the one fact every task has; the progress note
+   takes the slack and truncates, the spend keeps its figures whole. */
+.chat-drilldown-task-facts {
+  display: flex;
+  align-items: baseline;
+  gap: 0.6rem;
+  min-width: 0;
+  color: var(--text-subtle);
+}
+
+.chat-drilldown-task-elapsed,
+.chat-drilldown-task-usage {
+  flex: 0 0 auto;
+  font-variant-numeric: tabular-nums;
+}
+
+.chat-drilldown-task-progress,
+.chat-drilldown-task-settled {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-drilldown-task.is-settled .chat-drilldown-task-settled {
+  color: var(--text-muted, inherit);
+}
+
+/* A shell task's output pane, in the timeline's place: the tail of the file
+   as a scrolling block in the terminal's face, with the trimmed note above
+   it so the reader knows the top is not the start. */
+.chat-drilldown-output {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.chat-drilldown-output[hidden] {
+  display: none;
+}
+
+.chat-drilldown-output-note {
+  flex: 0 0 auto;
+  margin: 0;
+  padding: 0.35rem 0.75rem;
+  color: var(--text-subtle);
+  font-size: 0.8125em;
+}
+
+.chat-drilldown-output-note[hidden] {
+  display: none;
+}
+
+.chat-drilldown-output-text {
+  flex: 1 1 auto;
+  min-height: 0;
+  margin: 0;
+  padding: 0.6rem 0.75rem;
+  overflow: auto;
+  overscroll-behavior: contain;
+  font-family: var(--mono-font-family);
+  font-size: 0.8125em;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.chat-drilldown-output-text:focus-visible {
+  outline: none;
+  box-shadow: inset 0 0 0 2px var(--accent);
 }
 
 /* The rail and the Latest button read the parent's timeline, which the child
@@ -5696,6 +6330,167 @@ body.is-resizing-chat .chat-resizer {
   text-overflow: ellipsis;
 }
 
+/* A scheduled wakeup's row: a quiet card like a notice, keyed by a clock.
+   Pending is accented (something will happen), fired and cancelled recede,
+   lost carries the reason in the warning colour — the schedule is gone and
+   the reader should know it will not fire. */
+.chat-wakeup {
+  border: 1px solid var(--border-soft);
+  border-radius: 0.55rem;
+  padding: 0.55rem 0.75rem;
+  background: var(--surface-raised);
+  color: var(--chat-activity-fg);
+  font-size: 0.9em;
+}
+
+.chat-wakeup.is-pending {
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border-soft));
+}
+
+.chat-wakeup.is-fired,
+.chat-wakeup.is-cancelled {
+  color: var(--text-subtle);
+}
+
+.chat-wakeup.is-paused {
+  border-style: dashed;
+}
+
+.chat-wakeup.is-paused .chat-wakeup-icon {
+  color: var(--text-subtle);
+}
+
+.chat-wakeup.is-lost {
+  border-color: color-mix(in srgb, var(--warning, #c9a227) 55%, var(--border-soft));
+}
+
+.chat-wakeup-head,
+.chat-wakeup-turn-head {
+  display: flex;
+  align-items: baseline;
+  gap: 0.45rem;
+  min-width: 0;
+}
+
+.chat-wakeup-icon {
+  flex: 0 0 auto;
+  align-self: center;
+  color: var(--accent);
+}
+
+/* One clock for every wakeup surface that draws it in CSS (the composer's
+   status and list rows); the timeline inlines the same shape as SVG. */
+:root {
+  --chat-clock-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='6.25' fill='none' stroke='black' stroke-width='1.5'/%3E%3Cpath d='M8 4.75V8l2.25 1.5' fill='none' stroke='black' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+}
+
+.chat-wakeup-label,
+.chat-wakeup-turn-label {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-weight: 600;
+}
+
+.chat-wakeup-subject,
+.chat-wakeup-turn-prompt {
+  margin-top: 0.25rem;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.chat-wakeup-subject {
+  color: var(--text-subtle);
+}
+
+.chat-wakeup-message {
+  margin: 0.35rem 0 0;
+}
+
+.chat-wakeup-link {
+  flex: 0 0 auto;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--accent);
+  font: inherit;
+  font-size: 0.9em;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 0.15em;
+}
+
+/* The turn a wakeup started opens with a header, not a bubble: the agent
+   asked for this turn, the user did not type it. Full width and left-set,
+   where the agent's own content runs, with the prompt it carried beneath. */
+.chat-wakeup-turn {
+  margin: 0.75rem 0 0.25rem;
+  padding: 0.5rem 0.75rem;
+  border-left: 3px solid var(--accent);
+  border-radius: 0 0.45rem 0.45rem 0;
+  background: color-mix(in srgb, var(--accent-soft) 55%, transparent);
+  font-size: 0.9em;
+}
+
+/* A day separator: where a local day's run of the conversation begins.
+   Sticky in the timeline scroller, so the day being read stays named while
+   scrolling back through it. Only the pill covers the transcript: the row
+   is transparent and lets taps and selection through, so the text beside
+   the pinned label stays readable and usable. Every separator shares one
+   containing block, so the ones already passed stay pinned too, stacked at
+   the top; the watcher in chat/pinned-day.ts marks a label superseded once
+   the next day's label reaches it, and a superseded label is hidden, so a
+   wider older label never shows around a narrower newer one. A sticky box
+   pins at the scroller's padding edge; the row instead pins that far higher
+   (negative top) and carries the same padding itself, so the pill sits where
+   it sits in flow, and scroll-padding-top below stays one fixed band. The
+   row paints only its own box — no shadow or negative margin reaching
+   outside it — so an unstuck separator never covers the end of the previous
+   day's last row. Not an item: it carries no data-chat-item-id, so
+   anchoring and item actions pass over it. */
+.chat-timeline {
+  --chat-day-separator-block: 1.75rem;
+}
+
+.chat-day-separator {
+  position: sticky;
+  top: calc(-1 * var(--chat-timeline-inset-top, 0px));
+  z-index: 2;
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: calc(var(--chat-timeline-inset-top, 0px) + var(--chat-day-separator-block));
+  margin: 0 0 0.75rem;
+  padding-top: var(--chat-timeline-inset-top, 0px);
+  pointer-events: none;
+}
+
+/* The pinned label covers the top of the scroller, so anything scrolled to —
+   a prompt jump, a revealed request, a ⌘F match — must land below it. All of
+   those honour the scroller's scroll-padding-top, which is measured from
+   the scroller's top edge, where the stuck row begins. */
+.chat-timeline:has(.chat-day-separator) {
+  scroll-padding-top: calc(var(--chat-timeline-inset-top, 0px) + var(--chat-day-separator-block) + 0.5rem);
+}
+
+.chat-day-separator time {
+  padding: 0.12rem 0.65rem;
+  border: 1px solid var(--border-soft);
+  border-radius: 999px;
+  background: var(--surface-raised);
+  box-shadow: 0 1px 4px rgb(0 0 0 / 10%);
+  color: var(--text-subtle);
+  font-size: 0.78em;
+  font-weight: 600;
+  line-height: 1.3;
+  white-space: nowrap;
+  pointer-events: auto;
+}
+
+.chat-day-separator[data-superseded] time {
+  visibility: hidden;
+}
+
 .chat-request,
 .chat-file-change,
 .chat-notice,
@@ -5704,7 +6499,7 @@ body.is-resizing-chat .chat-resizer {
   border-radius: 0.55rem;
   padding: 0.65rem 0.75rem;
   background: var(--surface-raised);
-  color: var(--text-subtle);
+  color: var(--chat-activity-fg);
 }
 
 /* Tool, command and reasoning rows are chrome, not content: one quiet line
@@ -5715,7 +6510,7 @@ body.is-resizing-chat .chat-resizer {
   padding: 0;
   border: 0;
   background: none;
-  color: var(--text-subtle);
+  color: var(--chat-activity-fg);
   margin-bottom: 0.1rem;
 }
 
@@ -5734,7 +6529,7 @@ body.is-resizing-chat .chat-resizer {
   gap: 0.55rem;
   padding: 0.2rem 0;
   cursor: pointer;
-  color: var(--text-subtle);
+  color: var(--chat-activity-fg);
   font-size: 0.875em;
   list-style: none;
 }
@@ -5787,6 +6582,157 @@ body.is-resizing-chat .chat-resizer {
   border-left: 2px solid var(--accent, #3b7dd8);
 }
 
+/* A shell command's output, and its stderr: the embedded terminal's own
+   surface — its background, foreground, palette and font, read off the same
+   variables xterm builds its theme from — so the bytes a command wrote read
+   the same in Chat as in the terminal pane. Dark in both themes, as the pane
+   is. Lines are not wrapped: a table stays a table and a long line scrolls,
+   the way the terminal treats it. */
+.chat-activity pre.chat-tool-terminal,
+.chat-shell-output pre.chat-tool-terminal {
+  background: var(--terminal-bg);
+  color: var(--terminal-fg);
+  font-family: var(--terminal-font-family);
+  white-space: pre;
+  overflow-wrap: normal;
+  overflow-x: auto;
+}
+
+.chat-activity pre.chat-tool-error.chat-tool-terminal,
+.chat-shell-output pre.chat-tool-error.chat-tool-terminal {
+  color: var(--terminal-ansi-red);
+}
+
+.chat-shell-slot, .chat-shell-output { min-width: 0; }
+.chat-shell-output { position: relative; }
+.chat-shell-output .chat-tool-command { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0 0 6px; }
+.chat-shell-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 6px; }
+.chat-shell-output .chat-shell-viewport {
+  box-sizing: border-box;
+  height: var(--shell-inline-height, 240px);
+  max-height: none;
+  margin: 0;
+  padding: 10px;
+  overflow: auto;
+  overscroll-behavior: contain;
+  overflow-anchor: none;
+  scroll-behavior: auto;
+  font-size: 12px;
+  line-height: 20px;
+  tab-size: 8;
+}
+.chat-shell-lines { display: block; width: max-content; min-width: 100%; font: inherit; color: inherit; }
+.chat-shell-line { display: block; height: 20px; white-space: pre; }
+.chat-shell-output .chat-tool-error { white-space: pre; overflow: auto; max-height: 160px; padding: 10px; }
+.chat-shell-inline-resize { height: 16px; cursor: ns-resize; touch-action: none; display: grid; place-items: center; }
+.chat-shell-inline-resize::after { content: ""; width: 44px; height: 3px; border-radius: 2px; background: currentColor; opacity: .45; }
+.chat-shell-slot.is-popped-out { border: 1px dashed var(--border-color, #666); display: grid; place-items: center; }
+.chat-shell-output button, .chat-shell-window button { font: inherit; cursor: pointer; }
+.chat-shell-output :focus-visible, .chat-shell-window :focus-visible, .chat-shell-slot > button:focus-visible { outline: 2px solid var(--accent, #3b7dd8); outline-offset: 2px; }
+.chat-shell-window {
+  position: fixed;
+  /* Above desktop-host frost/headers (90/91), below modal overlays (100). */
+  z-index: 95;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  padding: 8px;
+  border: 1px solid var(--border-color, #666);
+  border-radius: 8px;
+  background: var(--terminal-bg);
+  color: var(--terminal-fg);
+  box-shadow: 0 8px 36px #0006;
+  overflow: hidden;
+  font-size: 12px;
+}
+.chat-shell-window[hidden] { display: none; }
+.chat-shell-window-header { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; flex-shrink: 0; padding: 2px 2px 8px; }
+.chat-shell-window-move { flex: 1 1 120px; min-width: 0; cursor: move; touch-action: none; }
+.chat-shell-window-title { font-family: var(--terminal-font-family); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chat-shell-window-metadata { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chat-shell-window-content { flex: 1; min-height: 0; min-width: 0; display: flex; }
+.chat-shell-window-content > .chat-shell-output { flex: 1; display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
+.chat-shell-window .chat-shell-viewport { flex: 1; height: 0; min-height: 0; }
+.chat-shell-output [hidden] { display: none; }
+.chat-shell-window .chat-shell-actions { flex-shrink: 0; margin: 0; }
+.chat-shell-window .chat-shell-actions:has(button:not([hidden]):not(.chat-shell-popout)) { margin-bottom: 6px; }
+.chat-shell-window-resize { align-self: flex-end; cursor: nwse-resize; touch-action: none; padding: 4px 8px 0; }
+.chat-shell-window.is-full-area { border-radius: 0; padding: max(8px, env(safe-area-inset-top)) max(8px, env(safe-area-inset-right)) max(8px, env(safe-area-inset-bottom)) max(8px, env(safe-area-inset-left)); }
+.chat-shell-window.is-full-area .chat-shell-window-move { cursor: default; }
+
+/* SGR styling as the converter (`chat/ansi.ts`) emits it. Bold draws in the
+   bright half of the palette, matching xterm's drawBoldTextInBrightColors
+   default, so the two surfaces agree on what bold green looks like. */
+.ansi-fg-0 { color: var(--terminal-ansi-black); }
+.ansi-fg-1 { color: var(--terminal-ansi-red); }
+.ansi-fg-2 { color: var(--terminal-ansi-green); }
+.ansi-fg-3 { color: var(--terminal-ansi-yellow); }
+.ansi-fg-4 { color: var(--terminal-ansi-blue); }
+.ansi-fg-5 { color: var(--terminal-ansi-magenta); }
+.ansi-fg-6 { color: var(--terminal-ansi-cyan); }
+.ansi-fg-7 { color: var(--terminal-ansi-white); }
+.ansi-fg-8, .ansi-bold.ansi-fg-0 { color: var(--terminal-ansi-bright-black); }
+.ansi-fg-9, .ansi-bold.ansi-fg-1 { color: var(--terminal-ansi-bright-red); }
+.ansi-fg-10, .ansi-bold.ansi-fg-2 { color: var(--terminal-ansi-bright-green); }
+.ansi-fg-11, .ansi-bold.ansi-fg-3 { color: var(--terminal-ansi-bright-yellow); }
+.ansi-fg-12, .ansi-bold.ansi-fg-4 { color: var(--terminal-ansi-bright-blue); }
+.ansi-fg-13, .ansi-bold.ansi-fg-5 { color: var(--terminal-ansi-bright-magenta); }
+.ansi-fg-14, .ansi-bold.ansi-fg-6 { color: var(--terminal-ansi-bright-cyan); }
+.ansi-fg-15, .ansi-bold.ansi-fg-7 { color: var(--terminal-ansi-bright-white); }
+/* Inverse video swaps a block's own defaults: the terminal's in a shell
+   block, the plain block's text and surface colours elsewhere. */
+.ansi-fg-default { color: var(--surface); }
+.chat-tool-terminal .ansi-fg-default { color: var(--terminal-bg); }
+.ansi-bg-0 { background-color: var(--terminal-ansi-black); }
+.ansi-bg-1 { background-color: var(--terminal-ansi-red); }
+.ansi-bg-2 { background-color: var(--terminal-ansi-green); }
+.ansi-bg-3 { background-color: var(--terminal-ansi-yellow); }
+.ansi-bg-4 { background-color: var(--terminal-ansi-blue); }
+.ansi-bg-5 { background-color: var(--terminal-ansi-magenta); }
+.ansi-bg-6 { background-color: var(--terminal-ansi-cyan); }
+.ansi-bg-7 { background-color: var(--terminal-ansi-white); }
+.ansi-bg-8 { background-color: var(--terminal-ansi-bright-black); }
+.ansi-bg-9 { background-color: var(--terminal-ansi-bright-red); }
+.ansi-bg-10 { background-color: var(--terminal-ansi-bright-green); }
+.ansi-bg-11 { background-color: var(--terminal-ansi-bright-yellow); }
+.ansi-bg-12 { background-color: var(--terminal-ansi-bright-blue); }
+.ansi-bg-13 { background-color: var(--terminal-ansi-bright-magenta); }
+.ansi-bg-14 { background-color: var(--terminal-ansi-bright-cyan); }
+.ansi-bg-15 { background-color: var(--terminal-ansi-bright-white); }
+.ansi-bg-default { background-color: var(--text-strong); }
+.chat-tool-terminal .ansi-bg-default { background-color: var(--terminal-fg); }
+.ansi-bold { font-weight: 700; }
+/* Dim lowers the foreground's intensity and leaves a background alone, as
+   SGR 2 does in a terminal; opacity on the span would fade both. */
+.ansi-dim { color: color-mix(in srgb, currentColor 60%, transparent); }
+.ansi-dim.ansi-fg-0 { color: color-mix(in srgb, var(--terminal-ansi-black) 60%, transparent); }
+.ansi-dim.ansi-fg-1 { color: color-mix(in srgb, var(--terminal-ansi-red) 60%, transparent); }
+.ansi-dim.ansi-fg-2 { color: color-mix(in srgb, var(--terminal-ansi-green) 60%, transparent); }
+.ansi-dim.ansi-fg-3 { color: color-mix(in srgb, var(--terminal-ansi-yellow) 60%, transparent); }
+.ansi-dim.ansi-fg-4 { color: color-mix(in srgb, var(--terminal-ansi-blue) 60%, transparent); }
+.ansi-dim.ansi-fg-5 { color: color-mix(in srgb, var(--terminal-ansi-magenta) 60%, transparent); }
+.ansi-dim.ansi-fg-6 { color: color-mix(in srgb, var(--terminal-ansi-cyan) 60%, transparent); }
+.ansi-dim.ansi-fg-7 { color: color-mix(in srgb, var(--terminal-ansi-white) 60%, transparent); }
+.ansi-dim.ansi-fg-8 { color: color-mix(in srgb, var(--terminal-ansi-bright-black) 60%, transparent); }
+.ansi-dim.ansi-fg-9 { color: color-mix(in srgb, var(--terminal-ansi-bright-red) 60%, transparent); }
+.ansi-dim.ansi-fg-10 { color: color-mix(in srgb, var(--terminal-ansi-bright-green) 60%, transparent); }
+.ansi-dim.ansi-fg-11 { color: color-mix(in srgb, var(--terminal-ansi-bright-yellow) 60%, transparent); }
+.ansi-dim.ansi-fg-12 { color: color-mix(in srgb, var(--terminal-ansi-bright-blue) 60%, transparent); }
+.ansi-dim.ansi-fg-13 { color: color-mix(in srgb, var(--terminal-ansi-bright-magenta) 60%, transparent); }
+.ansi-dim.ansi-fg-14 { color: color-mix(in srgb, var(--terminal-ansi-bright-cyan) 60%, transparent); }
+.ansi-dim.ansi-fg-15 { color: color-mix(in srgb, var(--terminal-ansi-bright-white) 60%, transparent); }
+.ansi-fg-inline { color: var(--ansi-fg); }
+.ansi-bg-inline { background-color: var(--ansi-bg); }
+.ansi-dim.ansi-fg-inline { color: color-mix(in srgb, var(--ansi-fg) 60%, transparent); }
+.ansi-dim.ansi-fg-default { color: color-mix(in srgb, var(--surface) 60%, transparent); }
+.chat-tool-terminal .ansi-dim.ansi-fg-default { color: color-mix(in srgb, var(--terminal-bg) 60%, transparent); }
+.ansi-italic { font-style: italic; }
+.ansi-underline { text-decoration: underline; }
+.ansi-strike { text-decoration: line-through; }
+.ansi-underline.ansi-strike { text-decoration: underline line-through; }
+
 /* What the tail dropped off the top while running, and the show-more that
    reveals a finished tool's remaining output — both quiet, both secondary to
    the output they bound. */
@@ -5824,7 +6770,7 @@ body.is-resizing-chat .chat-resizer {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  color: var(--text-subtle);
+  color: var(--chat-activity-fg);
   font-family: var(--mono-font-family);
   font-size: 0.94em;
 }
@@ -6043,12 +6989,29 @@ body.is-resizing-chat .chat-resizer {
   bottom: 3.5rem;
 }
 
+/* The pill floats over the transcript's lower right, so a request sitting at
+   the end of the conversation had its answer field and its Answer/Cancel
+   controls underneath it. The timeline reserves the strip instead of the pill
+   moving into the flow — in the touch layout there is no room to push the
+   composer down. The scroll padding matters as much as the padding: scrolling
+   a request into view must not park it under the pill either. */
+.chat-transcript-area:has(> :where(#chat-requests-jump):not([hidden])) .chat-timeline {
+  padding-bottom: 3.5rem;
+  scroll-padding-bottom: 3.5rem;
+}
+
 .chat-composer {
   position: relative;
   flex: 0 0 auto;
   padding: 0.75rem max(1rem, calc((100% - 52rem) / 2)) calc(0.75rem + env(safe-area-inset-bottom));
   border-top: 1px solid var(--border-soft);
   background: var(--surface-raised);
+}
+
+/* The desktop shell (or notification overlay) reserves the bottom safe area.
+   Keeping the touch composer's inset here would reserve it a second time. */
+html[data-ui-mode="desktop"]:not(.uatu-desktop-host) .chat-composer {
+  padding-bottom: 0.75rem;
 }
 
 /* Context usage. The collapsed form has to answer "how full is this" on its
@@ -6212,6 +7175,21 @@ body.is-resizing-chat .chat-resizer {
   font-weight: 600;
 }
 
+/* The arguments of the call a wildcard permission (an MCP tool's) would
+   allow, read from its tool row: the same pre treatment as a tool row's
+   input, bounded like the diff so a long code-mode call scrolls. */
+.chat-request-arguments-lead {
+  margin: 0.45rem 0 0.25rem;
+}
+
+.chat-request-arguments {
+  margin: 0;
+  max-height: 20rem;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 /* The plan a Claude Code approval would put into effect. */
 .chat-request-plan {
   border: 1px solid var(--border-medium);
@@ -6293,9 +7271,14 @@ body.is-resizing-chat .chat-resizer {
   display: none;
 }
 
+/* Flex rather than a two-column grid: a long name shrinks and wraps, and
+   the hint drops to its own line once it no longer fits whole beside the
+   name, instead of being squeezed into a sliver that wraps one character
+   per line on a narrow touch panel. */
 .chat-command-option {
-  display: grid;
-  grid-template-columns: minmax(max-content, auto) 1fr;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
   gap: 0.15rem 0.65rem;
   width: 100%;
   border: 0;
@@ -6316,19 +7299,56 @@ body.is-resizing-chat .chat-resizer {
 }
 
 .chat-command-name {
+  flex: 0 1 auto;
+  min-width: 0;
   font-weight: 600;
+  overflow-wrap: anywhere;
 }
 
+/* Tells a skill from a command of a similar name at a glance. */
+.chat-command-kind {
+  flex: 0 0 auto;
+  padding: 0 0.4em;
+  border: 1px solid var(--border-medium);
+  border-radius: 0.35rem;
+  color: var(--text-subtle);
+  font-size: 0.72em;
+  font-weight: 500;
+  line-height: 1.5;
+}
+
+/* The hint's basis is its whole width, so it stays beside the name only when
+   it fits there entire and otherwise drops to its own line; there it wraps
+   only between tokens. A token is an atomic inline box, broken inside only
+   when it is wider than the whole line. */
+.chat-command-hint {
+  flex: 1 1 auto;
+  max-width: 100%;
+}
+
+.chat-command-hint-token {
+  display: inline-block;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+
+.chat-command-hint:empty {
+  display: none;
+}
+
+/* Shown in full, wrapped: a command is chosen by what it does, and a
+   one-line ellipsis hid exactly that for anything past a few words. The
+   menu is height-capped and scrolls; the highlight is scrolled into view. */
 .chat-command-hint,
 .chat-command-description {
-  overflow: hidden;
   color: var(--text-subtle);
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  white-space: normal;
 }
 
 .chat-command-description {
-  grid-column: 1 / -1;
+  flex: 1 0 100%;
+  min-width: 0;
+  overflow-wrap: anywhere;
   font-size: 0.78em;
 }
 
@@ -6492,7 +7512,6 @@ body.is-resizing-chat .chat-resizer {
   display: none;
 }
 
-.chat-rate-limit,
 .chat-plan-usage-summary {
   flex: 0 0 auto;
   max-width: 14rem;
@@ -6529,27 +7548,43 @@ body.is-resizing-chat .chat-resizer {
   border-color: var(--border-medium);
 }
 
-/* Warning is the rate-limit badge's colour: the same signal, one step
-   earlier — the reading says a window is nearly spent before the server
-   says so. */
+/* Warning: a window is nearly spent, or the login says it is near its
+   limit. One colour for one meaning, whether the reading or the server
+   said so first. */
 .chat-plan-usage[data-level="warning"] > .chat-plan-usage-summary {
   color: var(--warning, #b7791f);
   border-color: var(--warning, #b7791f);
   font-weight: 600;
 }
 
-.chat-rate-limit {
-  border: 1px solid var(--warning, #b7791f);
-  color: var(--warning, #b7791f);
-}
-
-.chat-rate-limit[data-level="rejected"] {
-  border-color: var(--danger, #cf4f57);
+/* Rejected: requests are blocked, not merely close to it. */
+.chat-plan-usage[data-level="rejected"] > .chat-plan-usage-summary {
   color: var(--danger, #cf4f57);
+  border-color: var(--danger, #cf4f57);
+  font-weight: 600;
 }
 
-.chat-rate-limit[hidden],
 .chat-plan-usage[hidden] {
+  display: none;
+}
+
+/* The standing, above the window rows it explains. */
+.chat-plan-standing {
+  margin: 0 0 0.6rem;
+  padding: 0.4rem 0.55rem;
+  border-radius: 0.4rem;
+  border-left: 3px solid var(--warning, #b7791f);
+  background: var(--surface-sunken, rgba(127, 127, 127, 0.08));
+  color: var(--text-strong);
+  font-size: 0.82em;
+  line-height: 1.35;
+}
+
+.chat-plan-usage[data-level="rejected"] .chat-plan-standing {
+  border-left-color: var(--danger, #cf4f57);
+}
+
+.chat-plan-standing[hidden] {
   display: none;
 }
 
@@ -6575,9 +7610,10 @@ body.is-resizing-chat .chat-resizer {
 
 .chat-plan-readout-head {
   display: flex;
+  flex-wrap: wrap;
   align-items: baseline;
   justify-content: space-between;
-  gap: 0.75rem;
+  gap: 0.35rem 0.75rem;
   margin-bottom: 0.5rem;
 }
 
@@ -6591,6 +7627,87 @@ body.is-resizing-chat .chat-resizer {
 .chat-plan-readout-name {
   color: var(--text-strong);
   font-weight: 600;
+  white-space: nowrap;
+}
+
+.chat-plan-readout-title,
+.chat-plan-readout-actions {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  min-width: 0;
+}
+
+.chat-plan-readout-actions {
+  margin-left: auto;
+}
+
+.chat-plan-readout-age {
+  color: var(--text-subtle);
+  font-size: 0.92em;
+  white-space: nowrap;
+}
+
+.chat-plan-readout-age:empty {
+  display: none;
+}
+
+/* The read's state line, in the readout and in the pane. */
+.chat-plan-status,
+.usage-pane-status {
+  margin: 0 0 0.5rem;
+  color: var(--text-subtle);
+  font-size: 0.92em;
+}
+
+.chat-plan-status[hidden] {
+  display: none;
+}
+
+/* "Read now": the same pill as the pin, but its own class — the pin is
+   hidden by layout rules (touch, collapsed sidebar) that do not apply here. */
+.usage-read-button {
+  flex: 0 0 auto;
+  padding: 0.1rem 0.5rem;
+  border: 1px solid var(--border-medium);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--text-subtle);
+  font: inherit;
+  font-size: 0.92em;
+  cursor: pointer;
+}
+
+.usage-read-button:hover:not(:disabled) {
+  color: var(--text-strong);
+  border-color: var(--accent);
+}
+
+.usage-read-button:disabled {
+  cursor: default;
+  opacity: 0.7;
+}
+
+.usage-read-button[hidden] {
+  display: none;
+}
+
+.usage-read-inline {
+  margin: 0 0 0.6rem;
+}
+
+/* A stale report stays readable but steps back: the figures and the chip
+   are muted, and the head says how old it is. */
+.usage-pane[data-stale="true"] .plan-row-figure,
+.usage-pane[data-stale="true"] .plan-meter-fill,
+.chat-plan-usage[data-stale="true"] .plan-row-figure,
+.chat-plan-usage[data-stale="true"] .plan-meter-fill {
+  opacity: 0.55;
+}
+
+.chat-plan-usage[data-stale="true"] .chat-plan-usage-summary {
+  opacity: 0.7;
+  border-style: dashed;
 }
 
 .chat-plan-pin {
@@ -6749,6 +7866,76 @@ html[data-ui-mode="touch"] .chat-plan-pin,
   display: none;
 }
 
+/* The title and the itemization control share a line: the control is a view
+   of the block, not a row in it. */
+.chat-plan-session-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin-bottom: 0.2rem;
+}
+
+.chat-plan-session-head .chat-plan-session-title {
+  margin: 0;
+}
+
+.chat-plan-session-views[hidden] {
+  display: none;
+}
+
+/* What ran, and what the line is, under its label — so a row says it without
+   a fifth column the readout has no room for. It wraps: "same agent as …"
+   names another task, and clipping it would clip the one thing it says. */
+.chat-plan-session-models .chat-plan-session-agent-model {
+  display: block;
+  color: var(--text-subtle);
+  font-size: 0.85em;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.chat-receipt-count {
+  color: var(--text-subtle);
+}
+
+/* A subagent launched by a subagent sits under its launcher, a step in per
+   level, with a guide so the step reads as "launched by" and not as a gap. */
+.chat-receipt-row[data-depth] td:first-child {
+  position: relative;
+}
+
+.chat-receipt-row[data-depth="1"] td:first-child { padding-left: 1rem; }
+.chat-receipt-row[data-depth="2"] td:first-child { padding-left: 2rem; }
+.chat-receipt-row[data-depth="3"] td:first-child { padding-left: 3rem; }
+.chat-receipt-row[data-depth="4"] td:first-child { padding-left: 4rem; }
+
+.chat-receipt-row[data-depth] td:first-child::before {
+  content: "└";
+  position: absolute;
+  margin-left: -0.95rem;
+  color: var(--text-subtle);
+  opacity: 0.7;
+}
+
+/* The total closes the list the way a receipt's does: ruled off, and heavier
+   than the lines it sums. */
+.chat-plan-session-models tfoot[hidden] {
+  display: none;
+}
+
+.chat-plan-session-models .chat-receipt-total th,
+.chat-plan-session-models .chat-receipt-total td {
+  padding-top: 0.35rem;
+  border-top: 1px solid var(--border-medium);
+  color: var(--text-strong);
+  font-weight: 600;
+}
+
+.chat-plan-session-models tbody tr:last-child td {
+  padding-bottom: 0.3rem;
+}
+
 /* The Usage pane: the same rows, in the sidebar's type size, with the
    report's time above them so a stale login is visibly stale. */
 .usage-pane {
@@ -6788,6 +7975,17 @@ html[data-ui-mode="touch"] .plan-meter {
   font-size: 0.85rem;
   line-height: 1;
   animation: chat-live-pulse 2.4s ease-in-out infinite;
+}
+
+/* Scheduled: nothing runs, the session waits for the agent's own next turn.
+   A still clock rather than a pulse — nothing is happening until it fires. */
+.chat-composer-status[data-state="scheduled"]::before {
+  content: "";
+  width: 0.95rem;
+  height: 0.95rem;
+  background: var(--accent);
+  -webkit-mask: var(--chat-clock-icon) center / contain no-repeat;
+  mask: var(--chat-clock-icon) center / contain no-repeat;
 }
 
 .chat-composer-status[data-state="cancelling"]::before {
@@ -7446,6 +8644,15 @@ html[data-ui-mode="touch"][data-active-tab="chat"] .chat-surface {
   padding-right: env(safe-area-inset-right);
 }
 
+/* Answering while the keyboard is already open: the surface grows to the
+   layout height, and that growth is what slides the composer and the pinned
+   tracks down under the keyboard. Animated so they are seen to move there
+   rather than to vanish. Only in this state — keyboard open and close geometry
+   must stay immediate, or the surface would lag the band it is tracking. */
+html[data-ui-mode="touch"][data-active-tab="chat"][data-chat-answering] .chat-surface {
+  transition: height 250ms ease-out;
+}
+
 /* Touch navigates as a stack, so the same drill-down state renders as a
    pushed screen rather than an inline layer: it takes the chat surface's own
    fixed box (one z-index above it, so the tab bar below is untouched and Chat
@@ -7565,6 +8772,7 @@ html[data-ui-mode="touch"] .chat-rename-form label {
 
 html[data-ui-mode="touch"] .chat-timeline {
   padding: 0.75rem 0.85rem;
+  --chat-timeline-inset-top: 0.75rem;
   font-size: 0.9375rem;
 }
 
@@ -7603,6 +8811,13 @@ html[data-ui-mode="touch"] .chat-composer textarea {
 
 html[data-ui-mode="touch"] .chat-configuration-dialog input,
 html[data-ui-mode="touch"] .chat-configuration-dialog select {
+  font-size: 16px;
+}
+
+/* Same reason as the composer and the dialog above: iOS zooms the page on
+   focus for any text control under 16px, and the free-form answer field is
+   the one that takes focus mid-conversation. */
+html[data-ui-mode="touch"] .chat-question-custom-editor input {
   font-size: 16px;
 }
 
@@ -7654,6 +8869,9 @@ html[data-ui-mode="touch"] .chat-configuration-model {
     animation: none;
   }
 
+  /* The surface itself, not only its descendants: the answering state gives
+     it a height transition, and that is motion like any other. */
+  .chat-surface,
   .chat-surface *,
   .touch-tab { scroll-behavior: auto !important; transition: none !important; animation: none !important; }
 
@@ -8022,6 +9240,69 @@ body.terminal-transcript-open .navigation-handle {
   display: none;
 }
 
+/* The selected agent has no usable login. Docked to the composer like the
+   queue, at the same gutter, so it reads as part of where a message is
+   typed rather than as a transcript row. */
+.chat-login-notice {
+  flex: 0 0 auto;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.35rem 0.6rem;
+  margin: 0.5rem max(1rem, calc((100% - 52rem) / 2)) 0;
+  padding: 0.55rem 0.75rem;
+  border: 1px solid color-mix(in srgb, var(--danger) 45%, var(--border-soft));
+  border-radius: 0.55rem;
+  background: color-mix(in srgb, var(--danger) 7%, var(--surface-raised));
+}
+
+.chat-login-notice[hidden] {
+  display: none;
+}
+
+.chat-login-notice-text {
+  color: var(--danger);
+}
+
+/* A turn that failed on the login: the agent's own words under a plain
+   heading, and the way to log in. */
+.chat-notice.chat-login-failed {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  border-color: color-mix(in srgb, var(--danger) 45%, var(--border-soft));
+}
+
+.chat-login-failed p {
+  margin: 0;
+}
+
+.chat-login-failed-title {
+  font-weight: 600;
+}
+
+.chat-login-failed-detail {
+  color: var(--chat-activity-fg);
+  overflow-wrap: anywhere;
+}
+
+.chat-login-link {
+  color: var(--accent);
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.chat-login-link:hover,
+.chat-login-link:focus-visible {
+  text-decoration: underline;
+}
+
+.chat-login-command code {
+  font-family: var(--mono-font-family);
+  font-size: 0.92em;
+  overflow-wrap: anywhere;
+}
+
 /* Docked next to the composer, the queue owns the seam: the composer's own
    border-top would double up. */
 .chat-queue:not([hidden]) + .chat-composer {
@@ -8347,6 +9628,19 @@ html[data-ui-mode="touch"] .chat-task-list {
   white-space: nowrap;
 }
 
+/* What a running subagent is doing now, between the description and the
+   attribution: it yields first, since the row still leads with the task. */
+.chat-subagent-progress {
+  flex: 0 1 auto;
+  overflow: hidden;
+  min-width: 0;
+  max-width: 45%;
+  color: var(--text-subtle);
+  font-size: 0.85em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .chat-subagent-attribution {
   flex: 0 0 auto;
   overflow: hidden;
@@ -8378,7 +9672,9 @@ html[data-ui-mode="touch"] .chat-task-list {
 }
 
 #chat-task-list-items,
-#chat-subagents-items {
+#chat-subagents-items,
+#chat-background-tasks-items,
+#chat-scheduled-wakeups-items {
   max-height: 8.5rem;
   overflow-y: auto;
   overscroll-behavior: contain;
@@ -8386,9 +9682,43 @@ html[data-ui-mode="touch"] .chat-task-list {
 
 html[data-chat-keyboard] #chat-task-list-items,
 html[data-chat-keyboard] #chat-subagents-items,
+html[data-chat-keyboard] #chat-background-tasks-items,
+html[data-chat-keyboard] #chat-scheduled-wakeups-items,
+html[data-chat-keyboard] .chat-wakeups-release,
 html[data-chat-keyboard] .chat-reverted-items,
 html[data-chat-keyboard] .chat-queue {
   display: none;
+}
+
+/* Answering a request is the one state where the chrome cannot be acted on
+   until the answer is sent. It is not removed for that: while the surface
+   keeps its layout height (viewport.ts) the keyboard simply covers it, so the
+   composer and the pinned tracks are under the keyboard rather than gone, and
+   dismissing it brings them straight back — no reflow of the conversation on
+   the way in or out. Two float over the band that stays visible and do step
+   aside: the prompt rail claims the touches beside the answer field outright,
+   and the outstanding-request pill sits on the Answer/Reject controls while
+   yielding to the card being answered anyway. */
+html[data-ui-mode="touch"][data-chat-answering] #chat-prompt-rail,
+html[data-ui-mode="touch"][data-chat-answering] #chat-requests-jump {
+  display: none;
+}
+
+/* The timeline runs on under the keyboard too, and a card can be scrolled no
+   further than the timeline's own bottom edge — which is beneath it. So the
+   covered strip is reserved as scroll room while answering: without it a
+   request at the end of the conversation can never be lifted into the band
+   above the keyboard. `--chat-keyboard-inset` is the covered height, written
+   by the viewport controller and 0 whenever no keyboard is up. The reveal's
+   own clearance is `scroll-padding-bottom`, which stays the ordinary touch
+   inset — it is measured against the visible band, not against this strip.
+   The pill reservation uses :where() to keep its id out of specificity:
+   this keyboard inset must win even when the pill lacks [hidden] (for
+   example over a pushed drill-down) but is hidden by the answering rule. */
+html[data-ui-mode="touch"][data-chat-answering] #chat-timeline,
+html[data-ui-mode="touch"][data-chat-answering] #chat-drilldown-timeline {
+  padding-bottom: calc(0.6rem + var(--chat-keyboard-inset, 0px));
+  scroll-padding-bottom: 0.6rem;
 }
 
 /* Rows of the background-task list: the task's description leads, its
@@ -8419,6 +9749,33 @@ html[data-chat-keyboard] .chat-queue {
   font-size: 0.9em;
 }
 
+/* The elapsed readout stands in for the progress note a shell task never
+   reports: fixed width so the second hand does not shuffle the row. */
+.chat-background-task-elapsed {
+  flex: 0 0 auto;
+  font-variant-numeric: tabular-nums;
+}
+
+/* A running task's description is the way into its transcript or output:
+   a button in the row's own words, underlined like the subagent rows. */
+.chat-background-task-inspect {
+  border: 0;
+  padding: 0;
+  min-height: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  text-decoration: underline;
+  text-decoration-color: var(--border-medium);
+}
+
+.chat-background-task-inspect:hover,
+.chat-background-task-inspect:focus-visible {
+  text-decoration-color: var(--accent);
+}
+
 .chat-task-stop {
   flex: 0 0 auto;
   padding: 0.15rem 0.5rem;
@@ -8434,6 +9791,84 @@ html[data-chat-keyboard] .chat-queue {
 .chat-task-stop:disabled {
   opacity: 0.6;
   cursor: default;
+}
+
+/* Rows of the scheduled-wakeup list: the prompt the wakeup will submit
+   leads, a recurring one says so, and the fire time closes the row. The
+   release sits under the list, beside the sentence saying what it ends. */
+#chat-scheduled-wakeups-items {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  margin: 0;
+  padding: 0 0.7rem 0.45rem 1.75rem;
+  list-style: none;
+}
+
+#chat-scheduled-wakeups-items li::before {
+  content: "";
+  flex: 0 0 auto;
+  align-self: center;
+  width: 0.85rem;
+  height: 0.85rem;
+  background: var(--accent);
+  -webkit-mask: var(--chat-clock-icon) center / contain no-repeat;
+  mask: var(--chat-clock-icon) center / contain no-repeat;
+}
+
+.chat-scheduled-wakeups li {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  min-width: 0;
+}
+
+.chat-wakeup-prompt {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-wakeup-recurring {
+  flex: 0 0 auto;
+  padding: 0 0.35rem;
+  border: 1px solid var(--border-medium);
+  border-radius: 0.3rem;
+  color: var(--text-subtle);
+  font-size: 0.8em;
+}
+
+.chat-wakeup-when {
+  flex: 0 0 auto;
+  color: var(--text-subtle);
+  font-size: 0.9em;
+  font-variant-numeric: tabular-nums;
+}
+
+.chat-wakeups-release {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.15rem 0.7rem 0.6rem 1.75rem;
+}
+
+.chat-wakeups-release[hidden] {
+  display: none;
+}
+
+/* A paused cron waits for the conversation, not for a clock: its clock is
+   greyed and its "Paused" reads where a fire time would. */
+#chat-scheduled-wakeups-items li.is-paused::before {
+  background: var(--text-subtle);
+}
+
+.chat-wakeups-release-note {
+  min-width: 0;
+  color: var(--text-subtle);
+  font-size: 0.85em;
 }
 
 .chat-task-summary {
@@ -8467,6 +9902,7 @@ html[data-chat-keyboard] .chat-queue {
    which on a phone spends most of the screen on whitespace. */
 html[data-ui-mode="touch"] .chat-timeline {
   padding: 0.6rem 0.75rem;
+  --chat-timeline-inset-top: 0.6rem;
   font-size: 0.875rem;
 }
 
@@ -8562,7 +9998,7 @@ html[data-ui-mode="touch"] .chat-header {
    first step arrives moves nothing). */
 .chat-activity-group {
   margin: 0.65rem 0 1rem;
-  color: var(--text-subtle);
+  color: var(--chat-activity-fg);
 }
 
 .chat-activity-group > summary,
@@ -8610,7 +10046,7 @@ html[data-ui-mode="touch"] .chat-header {
   width: 0.5rem;
   height: 0.5rem;
   border-radius: 50%;
-  background: var(--border-soft);
+  background: var(--border-medium);
 }
 
 .chat-activity-group[data-outcome="live"] .chat-group-dot {
@@ -8651,7 +10087,53 @@ html[data-ui-mode="touch"] .chat-header {
 .chat-group-items {
   margin: 0.2rem 0 0.4rem 0.2rem;
   padding-left: 0.9rem;
-  border-left: 2px solid var(--border-soft);
+  border-left: 2px solid var(--border-medium);
+}
+
+/* A file-change row among a group's members is one of its steps and reads
+   like its neighbours: the operation where a tool row has its label, the
+   path where it has its subject, in the same mono and at the same size —
+   not the boxed card it is as a flat row, which among quiet one-liners
+   reads as the one thing on the list that matters. The path stays a button
+   (it opens the file); the underline arrives on hover, as it does nowhere
+   else on a step row. */
+.chat-group-items .chat-file-change {
+  display: flex;
+  align-items: baseline;
+  gap: 0.55rem;
+  margin-bottom: 0.1rem;
+  padding: 0.2rem 0;
+  border: 0;
+  border-radius: 0;
+  background: none;
+  font-size: 0.875em;
+}
+
+.chat-group-items .chat-file-change > span {
+  flex: 0 0 auto;
+}
+
+.chat-group-items .chat-file-change button {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  overflow-wrap: normal;
+  color: var(--chat-activity-fg);
+  font-family: var(--mono-font-family);
+  font-size: 0.94em;
+  text-decoration: none;
+}
+
+.chat-group-items .chat-file-change button:hover,
+.chat-group-items .chat-file-change button:focus-visible {
+  text-decoration: underline;
+}
+
+html[data-ui-mode="touch"] .chat-group-items .chat-file-change {
+  padding: 0.12rem 0;
+  font-size: 0.8125rem;
 }
 
 html[data-ui-mode="touch"] .chat-activity-group > summary,
@@ -8882,4 +10364,128 @@ html[data-ui-mode="touch"] .chat-surface[data-chat-rail] .chat-timeline {
   color: #fff;
   font-size: 1.4rem;
   cursor: pointer;
+}
+
+/* In-app "an agent needs your answer" notices for other workspaces
+   (shell/attention-notice.ts). While the user is looking at Uatu the hub
+   holds their push notifications; a question elsewhere is announced here
+   instead, in the switcher's awaiting tone. A small stack, newest first,
+   clear of the chat composer, the hub navigation, and the touch tab bar. */
+.attention-notices {
+  position: fixed;
+  z-index: 95;
+  left: calc(1rem + env(safe-area-inset-left));
+  bottom: calc(1rem + env(safe-area-inset-bottom));
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  width: min(20rem, calc(100vw - 2rem - env(safe-area-inset-left) - env(safe-area-inset-right)));
+  pointer-events: none;
+}
+
+.attention-notices[hidden] {
+  display: none;
+}
+
+.attention-notice {
+  pointer-events: auto;
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.55rem 0.5rem 0.55rem 0.8rem;
+  border: 1px solid var(--notice-warn-border);
+  border-left: 3px solid var(--attention);
+  border-radius: 0.5rem;
+  background: var(--surface-raised);
+  box-shadow: 0 6px 20px rgba(15, 23, 42, 0.16);
+  font-size: 0.82rem;
+}
+
+.attention-notice-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  flex: 1;
+}
+
+.attention-notice-workspace {
+  overflow: hidden;
+  color: var(--text-strong);
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.attention-notice-detail {
+  color: var(--attention);
+  font-weight: 500;
+}
+
+.attention-notice-open {
+  flex-shrink: 0;
+  padding: 0.3rem 0.8rem;
+  border: 1px solid var(--notice-warn-border);
+  border-radius: 999px;
+  background: var(--notice-warn-bg);
+  color: var(--attention);
+  font-weight: 700;
+  text-decoration: none;
+}
+
+.attention-notice-open:hover {
+  border-color: var(--attention);
+}
+
+.attention-notice-dismiss {
+  flex-shrink: 0;
+  display: inline-grid;
+  place-items: center;
+  width: 1.75rem;
+  height: 1.75rem;
+  padding: 0;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-subtle);
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+
+.attention-notice-dismiss:hover {
+  background: light-dark(rgba(36, 41, 47, 0.06), rgba(230, 237, 243, 0.08));
+  color: var(--text-strong);
+}
+
+.attention-notice-open:focus-visible,
+.attention-notice-dismiss:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Touch mode: full width above the tab bar, 44px targets. */
+html[data-ui-mode="touch"] .attention-notices {
+  left: calc(0.75rem + env(safe-area-inset-left));
+  right: calc(0.75rem + env(safe-area-inset-right));
+  bottom: calc(var(--tab-bar-total) + 0.75rem);
+  width: auto;
+}
+
+html[data-ui-mode="touch"] .attention-notice-open {
+  min-height: 44px;
+  display: inline-flex;
+  align-items: center;
+}
+
+html[data-ui-mode="touch"] .attention-notice-dismiss {
+  width: 44px;
+  height: 44px;
+}
+
+/* On the Chat and Terminal tabs the bottom belongs to the composer and the
+   prompt line; the notice moves to the top there. Files keeps it at the
+   bottom: its top is the hub switcher. */
+html[data-ui-mode="touch"][data-active-tab="chat"] .attention-notices,
+html[data-ui-mode="touch"][data-active-tab="terminal"] .attention-notices {
+  top: calc(env(safe-area-inset-top) + 0.5rem);
+  bottom: auto;
 }

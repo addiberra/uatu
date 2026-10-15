@@ -159,28 +159,59 @@ The authenticated `/clone` page SHALL show live terminal output and current phas
 - **THEN** the clone page reports completion and navigates to the workspace's stable session URL
 
 ### Requirement: Hub-served sessions expose hub navigation
-When the SPA is served through a Hub, identified by both a Hub-session-shaped base path and a Hub API answering at the origin root, the sidebar header SHALL retain its workspace switcher naming the current workspace by display name. Its menu SHALL link the dashboard and every registered workspace by display name with running or stopped state and retain sign out. Duplicate display names SHALL be disambiguated with path or stable-id detail. Touch workspace navigation SHALL additionally provide the separate Hub action specified by touch-navigation without replacing the sidebar's existing controls or content. Outside a Hub, including plain serve and an arbitrary base-path invocation without a Hub, both Hub affordances MUST stay hidden. The Hub's desktop brand header SHALL retain its centered logo, wordmark beneath, and absence of a tagline; touch Hub pages SHALL use the compact brand treatment defined for mobile presentation.
+When the SPA is served through a hub (a hub-session-shaped base path AND the hub API answering at the origin root), the sidebar header SHALL show a workspace switcher naming the current workspace by its display name, whose menu links to the hub dashboard and to every registered workspace by display name with running or stopped state and offers a sign-out entry. Duplicate display names SHALL be disambiguated with path or stable-id detail. Ordinary same-tab activation of the current running workspace SHALL dismiss the menu without navigating, changing the current document URL, or interrupting terminal connections. Explicit browser gestures to open that link in another tab or window SHALL retain normal link behavior. The current stopped workspace SHALL retain its Start action and in-place recovery. Outside a hub, including a source-run session child at the default base path or under a bare `--base-path`, the affordance MUST stay hidden. The hub's brand header SHALL show the logo centered with the wordmark beneath it and no tagline.
+
+Touch workspace navigation SHALL additionally provide the separate Hub action specified by touch-navigation without replacing the sidebar's existing controls or content. Both Hub affordances MUST stay hidden outside a confirmed Hub. Touch Hub pages SHALL use the compact brand treatment defined for mobile presentation; the centered brand treatment remains on desktop.
 
 #### Scenario: Switching workspaces from inside a session
-- **WHEN** a user in a Hub session opens the workspace switcher
-- **THEN** they see the dashboard and sibling workspaces by display name and real running/stopped state
-- **AND** a running workspace navigates to its stable session URL while a stopped workspace offers the existing Start flow
+- **WHEN** a user inside a hub-served session opens the workspace switcher
+- **THEN** they see the dashboard and sibling workspaces by display name with running or stopped state
+- **AND** activating another running workspace navigates to its stable session URL while a stopped workspace offers Start
+
+#### Scenario: Selecting the current running workspace
+- **WHEN** the user clicks or keyboard-activates the current running workspace's entry for same-tab navigation
+- **THEN** the menu closes and the current page and document URL remain unchanged
+- **AND** open terminals retain their panes, connections, and shell processes without showing a takeover action
+
+#### Scenario: Opening the current workspace in another tab
+- **WHEN** the user explicitly opens the current running workspace's link in a new tab or window using browser link gestures
+- **THEN** the browser opens the workspace there normally
+- **AND** the original page and its terminal connections remain intact
+
+#### Scenario: Starting the current stopped workspace
+- **WHEN** the current workspace is stopped and the user activates its Start action
+- **THEN** the Hub starts that workspace and the current page recovers in place
+- **AND** the current-workspace no-navigation behavior does not suppress the Start request
 
 #### Scenario: Duplicate names are distinguishable
 - **WHEN** two registered workspaces share a display name
 - **THEN** path or stable-id detail distinguishes them without requiring unique names
 
 #### Scenario: No hub affordance outside a hub
-- **WHEN** the SPA runs under plain serve or a base path without an answering Hub
+- **WHEN** the SPA runs under a source-run session child or under a base path with no hub answering at the origin root
 - **THEN** neither the workspace switcher nor a Hub selector action is shown
 
 ### Requirement: The workspace switcher chip reflects real session state
-The in-session workspace switcher's collapsed chip SHALL show the current workspace's live indicator from hub-reported state, never from an assumption that the viewed session is running: a session page can outlive its server (a stop from the dashboard, a back/forward-cache restore). The chip SHALL update from fresh hub state on page-cache restores and whenever the menu's state refresh completes, so chip and menu can never disagree.
+The in-session workspace switcher's collapsed chip SHALL show the current workspace's live indicator from hub-reported state, never from an assumption that the viewed session is running: a session page can outlive its server (a stop from the dashboard, a back/forward-cache restore). The chip and the open menu SHALL update from the brokered live stream's activity topic as workspace state changes, and additionally from fresh hub state on page-cache restores and whenever the menu's state refresh completes, so chip and menu can never disagree. When the current workspace's session is stopped, its entry in the open menu SHALL offer to start it, as entries for other stopped workspaces do, and a successful start SHALL leave the page in place to recover from the stream rather than navigating. The switcher and the shell's connection indicator SHALL agree on whether the current session is stopped: both derive it from the same hub-reported state.
 
 #### Scenario: A cached page of a stopped session shows a truthful chip
 - **WHEN** the user stops a session from the dashboard and returns to its page via browser history
 - **THEN** the switcher chip's indicator shows not-running
 - **AND** opening the menu shows the same state
+
+#### Scenario: A stop elsewhere updates the chip without a refresh
+- **WHEN** the viewed workspace's session is stopped from another device while its page is open
+- **THEN** the chip's indicator turns not-running from the stream update, without the menu being opened or the page reloaded
+
+#### Scenario: The current workspace's row starts its stopped session
+- **WHEN** the user opens the switcher menu on a page whose session is stopped and activates the current workspace's entry
+- **THEN** the hub is asked to start that session and the entry shows it starting
+- **AND** the page is not navigated away; the chip's indicator and the connection indicator turn live once the started session's state arrives
+
+#### Scenario: Chip and indicator agree
+- **WHEN** the hub reports the current workspace's session not running
+- **THEN** the switcher chip shows not-running and the connection indicator reads `Stopped`
+- **AND** neither claims the session is running while the other says it is stopped
 
 ### Requirement: Dashboard and login follow uatu's visual language
 Hub login, dashboard, onboarding, Settings, and session-unavailable pages SHALL use Uatu branding, the existing assets, system-responsive light/dark colors, sans-serif body typography, and monospace for paths and code. Touch presentation SHALL use the approved iOS-inspired grouped surfaces, compact header, legible status, and restrained translucent controls without importing a fixed-scheme mock palette. Fine-pointer desktop and native Desktop presentation SHALL retain their existing layout, header treatment, and titlebar-inset behavior. Appearance changes MUST NOT disclose authenticated version or workspace information on unauthenticated pages.
@@ -366,7 +397,7 @@ Hub Settings SHALL let an authenticated user configure or clear one absolute def
 - **THEN** Settings rejects it and preserves the previous value
 
 ### Requirement: Workspace and filesystem actions use distinct language
-Workspace rows and directory rows SHALL distinguish Rename workspace, Rename folder, Remove from Hub, and Remove folder. Rename workspace SHALL be available while stopped or running and SHALL change only the workspace display name. Rename folder SHALL retain the existing coordinated filesystem behavior and stable URL id. Remove from Hub SHALL preserve the folder, while Remove folder SHALL retain its empty-directory restriction. A stopped registered directory SHALL offer Start rather than Open; a running workspace SHALL offer Open.
+Workspace rows and directory rows SHALL distinguish Rename workspace, Rename folder, Remove from Hub, Remove folder, and Delete worktree. Rename workspace SHALL remain available for ordinary/main workspaces while stopped or running and SHALL change only the display name. Linked child workspace names SHALL reflect their exact local branch; independent child renaming and branch rename are out of scope. Rename folder SHALL retain existing coordinated filesystem behavior and stable URL id only when Git dependency safety checks permit the move; it SHALL be refused for linked checkout, main/common-directory or ancestor dependencies that would break worktree links, including dependencies outside the Hub registry. The refusal SHALL explain that stopping does not make this safe and offer display-name editing only where applicable; this refusal is the disclosure, and no separate worktree folder-policy dialog SHALL be presented. Remove from Hub SHALL preserve the folder, while Remove folder SHALL retain its empty-directory restriction. Delete worktree SHALL be a separate guarded operation for verified Uatu-created linked checkouts. A stopped registered directory SHALL offer Start rather than Open; a running workspace SHALL offer Open.
 
 #### Scenario: Running workspace display name is changed
 - **WHEN** a user renames a running workspace from `API` to `Payments API`
@@ -377,6 +408,10 @@ Workspace rows and directory rows SHALL distinguish Rename workspace, Rename fol
 - **WHEN** the directory browser lists a registered workspace with no running session
 - **THEN** its primary action is Start
 - **AND** activating it uses the normal credential-aware start flow rather than navigating to an unavailable session
+
+#### Scenario: Unsafe folder move is explained
+- **WHEN** a proposed folder rename would invalidate worktree links
+- **THEN** the browser reports the refusal without stop as a bypass; ordinary/main display-name editing remains available, while a child's name continues to follow its branch
 
 ### Requirement: Mobile Hub navigation is compact without removing operations
 Coarse-pointer Hub pages SHALL provide the mobile presentation, with layouts adapting to narrow screens, landscape, and text enlargement. Hub and Settings SHALL be the persistent navigation destinations. Add Workspace SHALL be a Hub action leading to the existing browse/create/clone workflows, not a permanent third tab. Workspace rows SHALL keep identity and truthful shell/credential state readable, expose Open or Start as the primary action, and place secondary actions in an accessible menu or scoped sheet. Native titlebar and safe-area clearance SHALL remain honored.
@@ -474,3 +509,223 @@ If mobile presentation combines existing operations, it SHALL retain each operat
 #### Scenario: Clone start fails after registration
 - **WHEN** a requested clone start fails after its configuration committed
 - **THEN** the UI identifies the preserved stopped workspace and offers correction/retry rather than claiming it was removed
+### Requirement: The switcher surfaces other workspaces' activity
+The in-session workspace switcher SHALL show, for each other workspace the user may access, whether its session is running, whether an agent is working in it, whether an interaction awaits the user, and whether work there has finished since the user last viewed its chat — sourced from the brokered stream's activity topic. A menu entry SHALL name the four running states distinctly: awaiting the user, working, finished, and (by the absence of a word) idle. The collapsed chip SHALL carry a badge while any other workspace has an interaction awaiting the user, a distinct badge while any other workspace has finished unviewed work, and SHALL distinguish both from mere agent activity; when several apply the chip shows the most urgent, in the order awaiting, finished, working. When the user opens a finished workspace's chat, its entry and badge SHALL clear on every device without a reload. Activity presentation MUST NOT reveal conversation content or titles, and MUST NOT vary by mode beyond the switcher's existing placement rules.
+
+#### Scenario: An agent finishes in another workspace
+- **WHEN** an agent in a workspace the user is not viewing transitions from working to idle
+- **THEN** that workspace's entry in the switcher menu changes from working to finished without the menu being reopened
+- **AND** the collapsed chip shows a finished badge
+
+#### Scenario: Background work reads as working
+- **WHEN** an agent in another workspace has ended its turn but still holds a backgrounded task
+- **THEN** that workspace's entry still reads as working
+
+#### Scenario: Opening the finished workspace clears the state
+- **WHEN** the user opens a finished workspace and its chat surface is in view
+- **THEN** the workspace's entry no longer reads finished and the badge clears on the user's other open pages
+
+#### Scenario: A question elsewhere badges the chip
+- **WHEN** an agent in another running workspace asks the user a question
+- **THEN** the collapsed switcher chip shows an awaiting-interaction badge
+- **AND** the menu entry for that workspace names it as awaiting the user
+- **AND** the badge clears once the interaction is answered from any device
+
+#### Scenario: Awaiting outranks finished on the chip
+- **WHEN** one other workspace awaits the user and another has finished unviewed work
+- **THEN** the collapsed chip shows the awaiting badge
+- **AND** each menu entry still names its own state
+
+### Requirement: Worktree-capable dashboard uses selected Active groups layout
+Active groups SHALL be the sole worktree-capable dashboard layout, using reusable actual dashboard presentation. The discarded alternative and layout toggle SHALL be absent. Default load, reload and create/delete/start/stop operations SHALL preserve the selected presentation. Original row styling/actions, exact branches, provenance and safety SHALL remain; no-capability product behavior SHALL remain unchanged. The repository heading SHALL own parent Rename and fork, with those actions grouped at the row's trailing edge — the same edge the rows beneath end their own Open/Stop actions on, wrapping under the repository name on a narrow viewport without horizontal overflow — and the fork control last among them. Every fork control, on the dashboard heading and in the picker's group header alike, SHALL draw one shared glyph defined in a single place. A separate main checkout row SHALL expose its actual branch and independent lifecycle.
+
+#### Scenario: Main stops while a child runs
+- **WHEN** main Stop is activated
+- **THEN** only main stops and child runtime remains unchanged; children can also start while main is stopped
+- **AND** the repository stays under Active with a clearly stopped main row until the last running checkout stops
+
+#### Scenario: Active and inactive group treatment
+- **WHEN** the worktree-capable dashboard loads
+- **THEN** groups with any running checkout appear first under Active, stopped children are under expandable `N stopped worktrees`, and entirely stopped repositories are under collapsed Inactive groups with clear expand-to-Start/fork affordance
+- **AND** desktop/touch keyboard disclosures and mixed/all-stopped evidence are required
+
+### Requirement: Hub offers explicit worktree lifecycle navigation
+The existing workspace picker SHALL focus on switching and parent-only creation forks, with no Details menu or global worktree action. The workspace selector itself SHALL name the current checkout as its repository — a child's parent, a main checkout's own name — followed by its branch, in that one reading for every checkout in a repository family, so a child and its main checkout are labelled alike; it SHALL be the only place the picker names the repository of the current checkout, with no separate title line above it. A workspace with no repository family SHALL keep its display name alone, with no branch. It SHALL group its rows by repository: a non-interactive group header carrying the repository name with its fork control at the header's trailing edge, then that repository's main checkout row, then its children — all sharing one left edge, with no indentation, and consecutive repository groups visually separated from one another. A workspace with no repository family SHALL remain an ungrouped row. The dashboard SHALL preserve its original rows/actions and explicit parent/repository hierarchy, exact branch child names and parent forks, and SHALL place every row of a repository group on one left edge — its repository heading and main checkout row carry the hierarchy, so no child row is indented or given tree-line styling. Grouping MUST NOT be inferred from names. Generic Details navigation SHALL be absent. Parent credentials and shared policy, which children inherit live, SHALL be managed on the Hub's Settings page reached from its own navigation; neither a repository heading nor a child row SHALL carry a Configure control of its own. Open/Start/Stop and Remove from Uatu (unregister) remain distinct from guarded owned-only Delete worktree, using an existing secondary affordance when available. Errors SHALL provide relevant inline retry/actions rather than generic navigation. Inventory, discovery, recovery and missing-path states SHALL be reviewable on the real surfaces. Compact creation omits policy/path/base readouts and defaults to stopped without switching. Explicit Open SHALL use the separate stable `/s/<workspace-id>/` context and restore its own files/preview/terminal/chat without conversation migration. External registration preserves path/ownership; missing/uncertain trees remain unavailable, never silently recreated. Keyboard, touch, themes and titlebar inset SHALL be supported. No-capability dashboard behavior SHALL remain unchanged.
+
+#### Scenario: Fork targets the selected main workspace
+- **WHEN** the reviewer activates the fork on either of two main workspace rows in the picker or real dashboard
+- **THEN** a small dropdown offers New branch / worktree, Existing branch and Register worktree…, and creation targets that parent only without a source/path readout in the popup
+- **AND** Register worktree… opens a compact list of only the checkouts Git lists for that repository that Uatu has not registered — each with its branch, ownership label and path, offering Register workspace for an external tree and Retry registration for a retained Uatu-created checkout — with `Every worktree Git lists is registered.` and Cancel when there are none
+- **AND** neither child has a fork action or independent credential/settings form
+
+#### Scenario: Compact creation has an explicit starting branch
+- **WHEN** New branch / worktree is selected
+- **THEN** the popup contains target title, Name, Create from and Create/Cancel; Create from uses the shared local/remote editable fuzzy combobox plus adjacent Fetch
+- **AND** initial choice prefers local main then sole remote main, otherwise stays empty; current checkout does not control defaults and refetch never reapplies them
+- **WHEN** Existing branch is selected
+- **THEN** an editable fuzzy combobox covers all local/remote branches with badges and qualified names; picking fills the input exactly, edits clear selection and disable Create, reopening permits reviewing all refs, and arrows/Enter/Escape, focus, touch and empty results are supported
+- **AND** the adjacent Fetch remote branches icon explicitly refreshes cached refs, preserving query and a valid choice or invalidating a disappeared choice, with loading and inline errors; opening does not fetch
+- **AND** neither popup contains extra metadata/destination/configuration/ownership readouts; cancellation and no submission do not mutate
+- **AND** clicking an initial local or remote row without typing commits the exact input value and enables successful Create
+
+#### Scenario: Preserve dashboard and existing lifecycle access
+- **WHEN** worktree capability data is present
+- **THEN** the original dashboard row renderer, paths, status dots, shell/credential summaries, style and applicable Rename/Stop/Start/Remove actions remain, augmented by nesting, branch labels and parent forks
+- **AND** children follow their parent while retaining truthful individual status/actions, and child rename remains excluded
+- **AND** there is no generic Details navigation, global switcher worktree button or per-repository Configure control; parent policy on the Hub's Settings page, relevant recovery actions and guarded owned-only Delete remain available outside the focused switcher
+
+#### Scenario: Nested rows show unobtrusive truthful provenance
+- **WHEN** child workspaces appear in the actual workspace selector or original-style dashboard
+- **THEN** their exact branch remains primary and a small muted label states ownership first: `External worktree` for a registered external tree, `Ownership uncertain` for an unverifiable one, and otherwise `from <recorded-source-ref>` or, for a Uatu-owned branch with no recorded history, `origin unknown`
+- **AND** new branch sources reflect the exact selected starting ref, remote-created tracking branches show their selected remote ref, and existing-local/external branches without recorded history remain unknown
+- **AND** labels do not change with parent checkout/configuration or upstream updates
+
+#### Scenario: Current main checkout is not creation provenance
+- **WHEN** the main workspace is checked out on feature/foo
+- **THEN** dashboard and selector display feature/foo compactly, distinct from repository identity and child origin labels
+- **WHEN** the checkout changes, is detached, or its branch is unknown
+- **THEN** refresh reflects the current ref or explicit Detached HEAD / Branch unknown state without guessing main or modifying child sourceRef
+
+#### Scenario: Picker labels every checkout the same way and groups without indentation
+- **WHEN** a user opens the workspace picker from a child worktree of a repository
+- **THEN** the selector reads that checkout's repository followed by its branch, in the same weight and size as a main checkout's own repository-then-branch reading, keeping its running/stopped indicator and its activity badge
+- **WHEN** the picker's menu lists two repositories
+- **THEN** each repository's group header carries its name with its single fork control at the header's trailing edge, the header is visually distinct from the rows beneath it, and consecutive groups are separated from one another while the first group needs no separator of its own
+- **AND** the main checkout row leads its group with its branch beneath, children follow with their ownership labels beneath, and every row — main checkout and child alike — shares one left edge with no indentation or tree lines
+- **AND** the menu fits a 390 px viewport without horizontal overflow in both colour schemes
+
+#### Scenario: Worktree actions are available without leaving the workspace
+- **WHEN** a user opens the existing workspace picker while viewing a document or conversation
+- **THEN** worktree registration, create and explicit switch actions are available there without first visiting the Hub dashboard
+- **AND** opening or refreshing that list does not change the active document, terminal or conversation context
+
+#### Scenario: Created workspace is opened deliberately
+- **WHEN** creation succeeds without a start request
+- **THEN** the popup closes, the source list/picker/dashboard refreshes, the source remains selected and a small `Created <branch>` confirmation, rendered at the top of the viewport below the titlebar inset and in the app's success colour, offers Open while leaving the child stopped
+- **AND** no Worktree ready, Details or registration popup opens automatically on any SPA, dashboard or review creation path
+- **AND** only explicit Open starts then navigates to its separate stable session URL displaying its own files, preview, terminal and chat
+
+#### Scenario: Partial creation is not described as total failure
+- **WHEN** checkout creation succeeds but registration fails
+- **THEN** a compact actionable error in the originating flow explains that the checkout and branch remain and offers same-checkout Retry registration rather than duplicate Create or a metadata dump
+
+#### Scenario: Small screen deletion remains intelligible
+- **WHEN** a touch user reviews deletion
+- **THEN** the compact `Delete worktree?` dialog identifies `<parent display name> / <branch>` with no full path, internal IDs, ownership, status card, duplicate fields or configuration inside
+- **AND** stopped copy is “The worktree’s files will be removed. The Git branch will be kept.” with Cancel and destructive Delete
+- **AND** running copy is “Its Uatu terminal and agent sessions will stop, then the worktree’s files will be removed. The Git branch will be kept.” with Cancel and destructive Stop and delete, with no extra checkbox
+- **AND** normal cases fit the phone viewport without dialog overflow or scrolling
+
+#### Scenario: Safety blocker stays compact and cannot be bypassed
+- **WHEN** preflight or recheck identifies dirty/untracked/ignored data, a lock, external ownership/activity, nested dependency or stop failure
+- **THEN** a short actionable reason replaces normal deletion consequences and prevents proceeding, with Cancel/Close and retry only where meaningful
+- **AND** files and registration remain; no force action or promise to stop unknown external applications is shown
+- **WHEN** explicitly authorized known Uatu activity stops successfully and all checks pass
+- **THEN** deletion closes the dialog and removes the row, preserves the branch, and uses existing safe navigation if the removed workspace was active
+
+#### Scenario: Back restores usable navigation
+- **WHEN** the user opens a worktree and returns via the existing workspace picker or browser history
+- **THEN** the opening indicator clears, authoritative or explicitly stale checkout state is shown, and the returning workspace restores its own document/preview, terminal context and selected conversation
+- **AND** neither workspace's conversations are migrated or replaced by those from the other checkout
+
+### Requirement: Worktree dialogs are client-rendered from the published JSON
+One client dialog module SHALL render every worktree view — the register list of unregistered checkouts, create (new branch and existing branch), delete, register, forget and retry-open — from the Hub's published worktree JSON, and SHALL be embedded unchanged in both the in-workspace workspace picker and the Hub dashboard, so both entry points offer the same roles, labels, copy and keyboard behavior. The Hub SHALL NOT serve worktree presentation as server-rendered HTML fragments or answer worktree actions with redirects, and no worktree path SHALL be excluded from the published API contract. Surfaces SHALL discover the capability from published Hub state: a worktree API field present only when the Hub serves worktrees, a boolean marker on each main checkout that can fork, and the existing parent configuration navigation. Successful creation SHALL close its dialog on every entry path, refresh source lists, show a small `Created <branch>` confirmation with explicit Open at the top of the viewport in the app's success colour, and never switch automatically. A refusal SHALL be rendered in the originating flow as a short actionable reason replacing normal consequences, with retry only where meaningful; retained-checkout registration failure SHALL offer retry on that same checkout. Missing or replaced paths SHALL offer inline Retry refresh on the picker and dashboard rows that show them and MUST NOT recreate a checkout. Live `worktrees` invalidation SHALL refresh an open register list without changing the active document, terminal context or conversation. Every branch list SHALL open expanded with its full local and remote listing, and choosing an option SHALL commit it and enable Create by pointer, touch and keyboard alike. Client requests SHALL use the application's URL helper so a session relocated under a base path keeps working.
+
+#### Scenario: Both entry points render the same dialog
+- **WHEN** a user opens worktree creation, deletion, registration or forget from the in-workspace picker and from the Hub dashboard
+- **THEN** each renders from the published worktree JSON with the same dialog roles, labels and copy, and no navigation to a server-rendered worktree page or redirect occurs
+
+#### Scenario: Refusal is shown where the user is working
+- **WHEN** an operation is refused, whether by validation, a safety blocker or a failed stop
+- **THEN** the originating dialog shows its short actionable reason in place of the normal consequences, keeps the user's valid draft where one exists, and nothing is mutated
+
+#### Scenario: Unavailable checkout offers refresh, not recreation
+- **WHEN** a registered checkout's path is missing or now holds a different checkout
+- **THEN** the row stays visible and disabled with an inline Retry that re-reads authoritative inventory, and no create or recreate action is offered
+
+### Requirement: Session pages announce questions waiting in other workspaces
+A hub-served session page SHALL show an in-app notice when the activity topic reports that another workspace the user may access has changed from not awaiting the user to awaiting the user, compared with the last state the page knew. The page's first activity report after it loads SHALL be its baseline; a page returning from the background or reconnecting SHALL compare against the state it last knew, so a question raised while it was hidden produces a notice on return. The notice SHALL name that workspace, say that an agent needs an answer, and offer Open and Dismiss. It SHALL NOT reveal conversation content, titles, questions, or tool details. A page SHALL NOT show a notice for the workspace it is serving, for a workspace already awaiting when the page loaded, or for an agent that finished without asking. At most one notice per workspace SHALL be shown at a time; notices for several workspaces SHALL stack with the newest first and SHALL NOT cover the chat composer, the touch-mode tab bar, or the hub navigation. A notice SHALL clear when dismissed, when opened, or when that workspace stops awaiting the user for any reason, including an answer from another device or the workspace stopping. The notice SHALL be independent of notification enrollment and SHALL NOT request an OS notification.
+
+Open SHALL navigate to the named workspace with Chat as the active surface in the current UI mode and SHALL select the conversation whose interaction is awaiting the user, choosing the most recently raised one when several are waiting. If nothing is awaiting by the time the workspace opens, Chat SHALL open on its conversation list with a short note that the request was already answered, and SHALL NOT select an unrelated conversation as though it were the target. The destination link SHALL survive a login redirect.
+
+#### Scenario: A question in another workspace raises a notice
+- **WHEN** a user is working in workspace alpha and an agent in workspace beta asks a question
+- **THEN** alpha's page shows a notice naming beta with Open and Dismiss
+- **AND** the switcher chip still carries its awaiting badge
+
+#### Scenario: Open lands on the waiting conversation
+- **WHEN** the user presses Open on a notice for beta
+- **THEN** beta opens with Chat in front and the conversation holding the question selected
+- **AND** the pending question is available through the normal chat interaction
+
+#### Scenario: The question is answered elsewhere first
+- **WHEN** a notice for beta is showing and the question is answered from the user's phone
+- **THEN** the notice clears without user action
+
+#### Scenario: Open after the answer
+- **WHEN** the user opens beta from a link whose request was answered before the page loaded
+- **THEN** Chat shows its conversation list and a note that the request was already answered
+- **AND** no conversation is selected as though it were the target
+
+#### Scenario: The current workspace does not notify itself
+- **WHEN** an agent in the workspace the page is serving asks a question
+- **THEN** that page shows no notice for it
+
+#### Scenario: Already-waiting workspaces stay quiet on load
+- **WHEN** a user opens a session page while workspace beta is already awaiting an answer
+- **THEN** the page shows no notice for beta
+- **AND** the switcher badge reports beta as awaiting
+
+#### Scenario: A question raised during a brief tab switch
+- **WHEN** a user hides their session page for alpha for 10 seconds, an agent in beta asks a question meanwhile, and the user returns
+- **THEN** alpha's page shows a notice for beta once it has reconnected
+- **AND** no push was sent for that question
+
+#### Scenario: Completions do not raise a notice
+- **WHEN** an agent in another workspace finishes a turn without asking anything
+- **THEN** no notice appears
+- **AND** the switcher reports that workspace as finished
+
+#### Scenario: Touch mode keeps the tab bar usable
+- **WHEN** a notice appears on a page in touch mode
+- **THEN** it is shown above the bottom tab bar and every tab remains reachable
+
+### Requirement: Settings manages agent accounts
+The authenticated `/settings` page SHALL provide an Agent accounts area,
+separate from Credentials, that presents the behavior defined by the
+`agent-accounts` capability. One card per agent SHALL be collapsed by default
+and summarize the agent's name, installation state, and login state in plain
+words: "Logged in as <account> · <plan>", "Not logged in", or the number of
+logged-in OpenCode providers. Expanded cards SHALL keep their state across
+refreshes. Each login form, login attempt, and card action SHALL report its
+own failures next to its controls, and the page-level alert SHALL remain
+reserved for load failures. Actions that wait on an agent SHALL disable their
+control and show an in-progress label until they settle. The area SHALL work
+at phone width: a login started on a phone SHALL show its URL as a link that
+opens in a new tab, any code as large selectable text with a copy control,
+and paste fields that accept the whole pasted value.
+
+#### Scenario: Collapsed summary states the login
+- **WHEN** Claude Code is logged in with a subscription and OpenCode has three providers logged in
+- **THEN** the collapsed Claude Code card reads "Logged in as <email> · <plan>"
+- **AND** the collapsed OpenCode card reads "3 providers logged in"
+
+#### Scenario: Login attempt errors stay local
+- **WHEN** a pasted code is rejected
+- **THEN** the error appears next to that login attempt's code field
+- **AND** the page-level alert is not used
+
+#### Scenario: Device code on a phone
+- **WHEN** a user starts a device-code login on a phone-width screen
+- **THEN** the code is shown large enough to read and has a copy control, and the verification URL opens in a new tab
+
+### Requirement: Chat links a missing login to Agent accounts
+When a session is served by the Hub and the chat reports that an agent has
+no usable login, the chat SHALL offer a link that opens the Hub's Settings at
+the Agent accounts area with that agent's card expanded. Outside a Hub there
+is no Settings page, so the chat SHALL name the agent's own login command
+instead.
+
+#### Scenario: Link from a failed Claude turn
+- **WHEN** a Claude turn in a Hub-served workspace fails because there is no usable login
+- **THEN** the failure offers "Log in to Claude Code", which opens Settings with the Claude Code card expanded

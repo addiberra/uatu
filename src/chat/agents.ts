@@ -1,9 +1,13 @@
 import { createAttachmentStore, type AttachmentStore, type StoredAttachment } from "./attachment-store";
 import { ConversationInventoryBroadcaster, type ConversationInventorySubscription } from "./inventory-broadcaster";
+import { NotificationFeed } from "./notification-feed";
+import { qualifyNotificationEvent } from "./notifications";
 import type { WorkspaceChatService } from "./service";
 import { ConversationNotFoundError } from "./workspace";
 import type {
   AgentChatStatus,
+  BackgroundTaskOutput,
+  ChatActivity,
   ChatAgentDescriptor,
   ChatAvailability,
   ChatEvent,
@@ -18,8 +22,7 @@ import type {
   ModelSelection,
   PermissionOutcome,
   QuestionOutcome,
-  ReversibleHistoryResult,
-} from "./types";
+  ReversibleHistoryResult, AgentUsageReport, UsageReadMode, UsageReadResult, ChatAccountChange } from "./types";
 
 export type { AgentChatStatus, ChatAgentDescriptor } from "./types";
 
@@ -77,6 +80,9 @@ export type MultiAgentChatServiceOptions = {
  * status is per-agent. Implemented by the router below and by test fakes.
  */
 export interface MultiAgentWorkspaceChatService {
+  /** A login change made through the Hub's Agent accounts (internal route). */
+  accountsChanged(agentId: string, change: ChatAccountChange): Promise<void>;
+  readonly notificationFeed?: NotificationFeed;
   agents(): ChatAgentDescriptor[];
   defaultAgentId(): string;
   status(): Promise<AgentChatStatus[]>;
@@ -86,6 +92,10 @@ export interface MultiAgentWorkspaceChatService {
   commands(agentId: string): Promise<ChatCommand[]>;
   listConversations(): Promise<AgentConversationSummary[]>;
   subscribeInventory(options?: { signal?: AbortSignal }): Promise<ConversationInventorySubscription>;
+  // The workspace activity summary over every agent, and its change ticks.
+  // Neither starts an agent runtime.
+  activity(): Promise<ChatActivity>;
+  subscribeActivity(options?: { signal?: AbortSignal }): Promise<ConversationInventorySubscription>;
   createConversation(agentId?: string): Promise<AgentConversationSnapshot>;
   history(id: string, options?: { cursor?: string; limit?: number }): Promise<AgentConversationSnapshot>;
   subscribe(id: string, options?: { cursor?: string; signal?: AbortSignal }): Promise<{
@@ -110,6 +120,11 @@ export interface MultiAgentWorkspaceChatService {
   respondPermission(id: string, interactionId: string, requestId: string, outcome: PermissionOutcome, choiceId?: string): Promise<{ outcome: PermissionOutcome }>;
   respondQuestion(id: string, interactionId: string, requestId: string, outcome: QuestionOutcome): Promise<{ outcome: QuestionOutcome }>;
   stopTask(id: string, taskId: string, requestId: string): Promise<{ stopped: true }>;
+  release(id: string, requestId: string): Promise<{ released: true }>;
+  cancelWakeup(id: string, wakeupId: string, requestId: string): Promise<{ cancelled: true }>;
+  taskOutput(id: string, taskId: string, options: { tailBytes: number }): Promise<BackgroundTaskOutput | null>;
+  usage(agentId: string): Promise<AgentUsageReport | null>;
+  readUsage(agentId: string, requestId: string, mode: UsageReadMode): Promise<UsageReadResult>;
   dispose(): Promise<void>;
 }
 
@@ -121,6 +136,8 @@ export interface MultiAgentWorkspaceChatService {
  * affects only its own entries.
  */
 export class MultiAgentChatService implements MultiAgentWorkspaceChatService {
+  readonly notificationFeed = new NotificationFeed();
+  private readonly notificationUnsubscribes: Array<() => void> = [];
   private readonly agentsById = new Map<string, RegisteredChatAgent>();
   private readonly order: RegisteredChatAgent[];
   private readonly attachmentStore: AttachmentStore;
@@ -159,6 +176,13 @@ export class MultiAgentChatService implements MultiAgentWorkspaceChatService {
       this.agentsById.set(agent.descriptor.id, agent);
     }
     this.order = [...options.agents];
+    for (const agent of this.order) {
+      const feed = agent.service.notificationFeed;
+      if (!feed) continue;
+      const publish = (event: import("./notifications").AgentNotificationEvent) => this.notificationFeed.publish(qualifyNotificationEvent(agent.descriptor.id, event));
+      for (const notification of feed.snapshot()) publish({ type: "notification", notification });
+      this.notificationUnsubscribes.push(feed.listen(publish));
+    }
     // The store is workspace state shared across agents — same backing
     // directory the per-agent stacks resolve, one authority for routes.
     this.attachmentStore = options.attachmentStore ?? createAttachmentStore({ workspacePath: options.workspacePath });
@@ -166,6 +190,7 @@ export class MultiAgentChatService implements MultiAgentWorkspaceChatService {
   }
 
   private readonly inventoryContributionTimeoutMs: number;
+  private readonly activitySubscriptions = new Set<MergedActivitySubscription>();
 
   agents(): ChatAgentDescriptor[] {
     return this.order.map(agent => agent.descriptor);
@@ -193,6 +218,18 @@ export class MultiAgentChatService implements MultiAgentWorkspaceChatService {
     // a repaired agent's conversations must re-enter the chooser.
     if (availability.state === "ready") this.inventoryHub.refresh();
     return { agent: agent.descriptor, availability };
+  }
+
+  /**
+   * A login change made through the Hub's Agent accounts. The agent re-reads
+   * and replays it, then every client is ticked: a client re-reads status on
+   * an inventory tick, sees the agent's `accountsRevision` move, and re-reads
+   * that agent's catalogs.
+   */
+  async accountsChanged(agentId: string, change: ChatAccountChange): Promise<void> {
+    const agent = this.requireAgent(agentId);
+    await agent.service.accountsChanged?.(change);
+    this.inventoryHub.tick();
   }
 
   async models(agentId: string): Promise<ChatModel[]> { return this.requireAgent(agentId).service.models(); }
@@ -238,6 +275,40 @@ export class MultiAgentChatService implements MultiAgentWorkspaceChatService {
    */
   async subscribeInventory(options: { signal?: AbortSignal } = {}): Promise<ConversationInventorySubscription> {
     return this.inventoryHub.subscribe(options.signal);
+  }
+
+  /**
+   * Working or awaiting in any agent. An agent that cannot answer counts as
+   * idle rather than failing the summary: one agent's outage must not blank
+   * another's working or awaiting state.
+   */
+  async activity(): Promise<ChatActivity> {
+    const summaries = await Promise.all(this.order.map(agent =>
+      Promise.resolve()
+        .then(() => agent.service.activity())
+        .catch((): ChatActivity => ({ working: false, awaiting: false }))));
+    return {
+      working: summaries.some(summary => summary.working === true),
+      awaiting: summaries.some(summary => summary.awaiting === true),
+    };
+  }
+
+  /**
+   * One change bit over every agent's activity. The merged subscription opens
+   * with its own tick, so the first read reports the current summary; each
+   * agent's ticks attach as that agent's subscription arrives, so a slow or
+   * failing agent neither delays nor breaks the others.
+   */
+  async subscribeActivity(options: { signal?: AbortSignal } = {}): Promise<ConversationInventorySubscription> {
+    const merged = new MergedActivitySubscription(options.signal, () => this.activitySubscriptions.delete(merged));
+    if (merged.closed) return merged;
+    this.activitySubscriptions.add(merged);
+    for (const agent of this.order) {
+      void Promise.resolve()
+        .then(() => agent.service.subscribeActivity({ signal: merged.signal }))
+        .then(source => merged.attach(source), () => undefined);
+    }
+    return merged;
   }
 
   async createConversation(agentId?: string): Promise<AgentConversationSnapshot> {
@@ -331,8 +402,29 @@ export class MultiAgentChatService implements MultiAgentWorkspaceChatService {
     return agent.service.stopTask(conversationId, taskId, requestId);
   }
 
+  async release(id: string, requestId: string) {
+    const { agent, conversationId } = this.resolve(id);
+    return agent.service.release(conversationId, requestId);
+  }
+
+  async cancelWakeup(id: string, wakeupId: string, requestId: string) {
+    const { agent, conversationId } = this.resolve(id);
+    return agent.service.cancelWakeup(conversationId, wakeupId, requestId);
+  }
+
+  async taskOutput(id: string, taskId: string, options: { tailBytes: number }) {
+    const { agent, conversationId } = this.resolve(id);
+    return agent.service.taskOutput(conversationId, taskId, options);
+  }
+
+  async usage(agentId: string): Promise<AgentUsageReport | null> { return this.requireAgent(agentId).service.usage(); }
+  async readUsage(agentId: string, requestId: string, mode: UsageReadMode): Promise<UsageReadResult> { return this.requireAgent(agentId).service.readUsage(requestId, mode); }
+
   async dispose(): Promise<void> {
+    for (const unsubscribe of this.notificationUnsubscribes) unsubscribe();
+    this.notificationFeed.dispose();
     this.inventoryHub.dispose();
+    for (const subscription of [...this.activitySubscriptions]) subscription.cancel();
     await Promise.all(this.order.map(agent => agent.service.dispose().catch(() => undefined)));
   }
 
@@ -365,9 +457,12 @@ export class MultiAgentChatService implements MultiAgentWorkspaceChatService {
     if ((next.type === "permission" || next.type === "question") && next.conversationId) {
       next = { ...next, conversationId: qualifyConversationId(descriptor.id, next.conversationId) };
     }
-    if (next.type === "tool" && next.childConversationId) {
+    if ((next.type === "tool" || next.type === "background_task") && next.childConversationId) {
       // A subagent child belongs to the same agent as its parent; the
-      // drill-down opens it through the same qualified addressing.
+      // drill-down opens it through the same qualified addressing. A
+      // background task names the same child as its launching tool row —
+      // and names it first, from the start edge, which is what makes a
+      // still-running run openable — so it must be qualified alike.
       next = { ...next, childConversationId: qualifyConversationId(descriptor.id, next.childConversationId) };
     }
     return next;
@@ -408,6 +503,70 @@ class QualifyingEventSubscription implements AsyncIterable<ChatEvent> {
     // returns the source iterator — cancellation propagates without a
     // separate teardown path.
     for await (const event of this.source) yield this.map(event);
+  }
+}
+
+/**
+ * Every agent's activity ticks poured into one one-bit broadcaster, whose
+ * coalescing collapses a burst across agents into one re-read. Cancelling it
+ * — directly, through return(), or through the caller's signal — cancels
+ * every agent subscription it holds.
+ */
+class MergedActivitySubscription implements ConversationInventorySubscription {
+  private readonly broadcaster = new ConversationInventoryBroadcaster();
+  private readonly merged: ConversationInventorySubscription;
+  private readonly stop = new AbortController();
+  private readonly sources = new Set<ConversationInventorySubscription>();
+  private readonly onAbort = () => this.cancel();
+
+  constructor(private readonly signal_: AbortSignal | undefined, private readonly onClose: () => void) {
+    this.merged = this.broadcaster.subscribe(signal_);
+    if (signal_?.aborted) this.cancel();
+    else signal_?.addEventListener("abort", this.onAbort, { once: true });
+  }
+
+  /** Aborts when this subscription ends; agent subscriptions ride it. */
+  get signal(): AbortSignal { return this.stop.signal; }
+  get closed(): boolean { return this.stop.signal.aborted; }
+
+  attach(source: ConversationInventorySubscription): void {
+    if (this.closed) {
+      source.cancel();
+      return;
+    }
+    this.sources.add(source);
+    void (async () => {
+      try {
+        while (!(await source.next()).done) this.broadcaster.invalidate();
+      } catch {
+        // A dead source stops ticking; the other agents carry on.
+      } finally {
+        this.sources.delete(source);
+      }
+    })();
+  }
+
+  next(): Promise<IteratorResult<void>> {
+    return this.merged.next();
+  }
+
+  async return(): Promise<IteratorResult<void>> {
+    this.cancel();
+    return { value: undefined, done: true };
+  }
+
+  cancel(): void {
+    if (this.closed) return;
+    this.stop.abort();
+    this.signal_?.removeEventListener("abort", this.onAbort);
+    for (const source of this.sources) source.cancel();
+    this.sources.clear();
+    this.broadcaster.dispose();
+    this.onClose();
+  }
+
+  [Symbol.asyncIterator](): AsyncIterableIterator<void> {
+    return this;
   }
 }
 

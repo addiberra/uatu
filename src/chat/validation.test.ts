@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test";
 
 import {
+  parseAgentUsageReport,
+  parseBackgroundTaskOutput,
   parseChatAvailability,
   parseChatCommand,
   parseChatEvent,
@@ -10,12 +12,28 @@ import {
   parseConversationItem,
   parseConversationConfiguration,
   parseConversationSnapshot,
+  parseUsageReadResult,
+  parseUsageReportResponse,
   parseConversationSummary,
   parseInteractionRequest,
   parseReversibleHistoryResult,
   parseReversibleHistoryState,
 } from "./validation";
 import type { ConversationItem } from "./types";
+
+test("tool and command completion timestamps are optional finite non-negative numbers", () => {
+  for (const shape of [{ type: "tool", name: "Bash" }, { type: "command", command: "pwd" }] as const) {
+    const item = { id: "t", createdAt: 1, status: "completed" as const, ...shape };
+    expect(parseConversationItem(item)).toEqual(item);
+    for (const completedAt of [0, 2, 1_789_466_400_000]) {
+      expect(parseConversationItem({ ...item, completedAt })).toEqual({ ...item, completedAt });
+    }
+    for (const completedAt of [null, -1, NaN, Infinity, "2026-09-15T10:00:00Z", true]) {
+      expect(() => parseConversationItem({ ...item, completedAt })).toThrow("completedAt must be a timestamp");
+    }
+    expect(() => parseConversationItem({ ...item, inventedAt: 2 })).toThrow();
+  }
+});
 
 const summary = {
   id: "opencode:session-1",
@@ -62,6 +80,35 @@ const items = [
 ] as const;
 
 describe("chat domain validation", () => {
+  test("a permission's future-approval patterns are optional strings", () => {
+    const permission = items[6];
+    // Present: the agent's own pattern beside the request's resource.
+    expect(parseConversationItem({ ...permission, alwaysPatterns: ["bun test *"] })).toBeDefined();
+    // Empty: the agent supplied nothing reusable. Absent: it did not say.
+    expect(parseConversationItem({ ...permission, alwaysPatterns: [] })).toBeDefined();
+    expect(parseConversationItem(permission)).toBeDefined();
+    expect(() => parseConversationItem({ ...permission, alwaysPatterns: [42] })).toThrow(/always patterns/);
+    expect(() => parseConversationItem({ ...permission, alwaysPatterns: "bun test *" })).toThrow(/always patterns/);
+  });
+
+  test("a permission's source tool row is an optional identity", () => {
+    const permission = items[6];
+    // Present: the agent named the call the request belongs to.
+    expect(parseConversationItem({ ...permission, sourceToolId: "tool:call_ae43195d825941c99fb33dac" })).toBeDefined();
+    // Absent: the agent did not say; the client falls back on the action name.
+    expect(parseConversationItem(permission)).toBeDefined();
+    expect(() => parseConversationItem({ ...permission, sourceToolId: "" })).toThrow(/source tool id/);
+    expect(() => parseConversationItem({ ...permission, sourceToolId: 7 })).toThrow(/source tool id/);
+  });
+
+  test("a permission's MCP server and tool are an optional pair of names", () => {
+    const permission = items[6];
+    expect(parseConversationItem({ ...permission, action: "github_create_issue", mcp: { server: "github", tool: "create_issue" } })).toBeDefined();
+    expect(() => parseConversationItem({ ...permission, mcp: { server: "", tool: "create_issue" } })).toThrow(/mcp server/);
+    expect(() => parseConversationItem({ ...permission, mcp: { server: "github" } })).toThrow(/mcp tool/);
+    expect(() => parseConversationItem({ ...permission, mcp: "github" })).toThrow(/mcp tool/);
+  });
+
   test("accepts strict command metadata", () => {
     expect(parseChatCommand({ name: "review", description: "Review changes", argumentHint: "[focus]", kind: "skill" }))
       .toEqual(expect.objectContaining({ name: "review", kind: "skill" }));
@@ -108,6 +155,11 @@ describe("chat domain validation", () => {
     });
     expect(parseConversationSummary(summary)).toBeDefined();
     for (const item of items) expect(parseConversationItem(item)).toBeDefined();
+    // A ready agent says whether a login is usable and how often logins changed.
+    expect(parseChatAvailability({ state: "ready", version: "2.1.281", login: "missing", accountsRevision: 3 })).toEqual({ state: "ready", version: "2.1.281", login: "missing", accountsRevision: 3 });
+    expect(() => parseChatAvailability({ state: "ready", version: "1", login: "maybe" })).toThrow();
+    expect(() => parseChatAvailability({ state: "ready", version: "1", accountsRevision: -1 })).toThrow();
+    expect(() => parseChatAvailability({ state: "ready", version: "1", accountsRevision: 1.5 })).toThrow();
 
     const snapshot = {
       conversation: summary,
@@ -207,6 +259,30 @@ describe("chat domain validation", () => {
     })).toThrow(/unknown/);
   });
 
+  test("a subagent row's nested lines parse as a closed tree hanging off the row", () => {
+    const row = { ...items[3], childConversationId: "child" };
+    const line = { id: "tool:g", parentId: row.id, description: "Find files", subagent: "explore", conversationId: "grandchild", model: "gpt-5", usage: { input: 5, costUsd: 0.01 } };
+    const deeper = { id: "tool:gg", parentId: "tool:g", description: "Count lines", conversationId: "great" };
+    expect(parseConversationItem({ ...row, descendants: [line, deeper] })).toBeDefined();
+    // A subagent that launched nothing sends an empty list or none at all,
+    // and a list that shrank simply replaces the longer one.
+    expect(parseConversationItem({ ...row, descendants: [] })).toBeDefined();
+    expect(parseConversationItem({ ...row, descendants: [line] })).toBeDefined();
+    // Closed like the row: no stray keys, and the figures obey the usage rules.
+    expect(() => parseConversationItem({ ...row, descendants: [{ ...line, status: "running" }] })).toThrow(/unknown/);
+    expect(() => parseConversationItem({ ...row, descendants: [{ ...line, usage: { input: -1 } }] })).toThrow(/non-negative/);
+    expect(() => parseConversationItem({ ...row, descendants: [{ ...line, description: "" }] })).toThrow(/description/);
+    expect(() => parseConversationItem({ ...row, descendants: "none" })).toThrow(/array/);
+    // The receipt draws a tree from the links: an orphan, a line ahead of its
+    // parent, a repeated id, or a line naming itself is refused, not drawn.
+    expect(() => parseConversationItem({ ...row, descendants: [{ ...line, parentId: "tool:elsewhere" }] })).toThrow(/parentId/);
+    expect(() => parseConversationItem({ ...row, descendants: [deeper, line] })).toThrow(/parentId/);
+    expect(() => parseConversationItem({ ...row, descendants: [line, { ...deeper, id: "tool:g" }] })).toThrow(/unique/);
+    expect(() => parseConversationItem({ ...row, descendants: [{ ...line, id: row.id }] })).toThrow(/unique/);
+    // Lines belong to tool rows only.
+    expect(() => parseConversationItem({ ...items[1], descendants: [] })).toThrow(/unknown/);
+  });
+
   test("token usage parses on assistant and tool items and stays a closed shape", () => {
     const usage = { input: 12_000, output: 400, reasoning: 90, cacheRead: 8_000, cacheWrite: 512 };
     expect(parseConversationItem({ ...items[1], usage, model: { providerId: "anthropic", modelId: "claude" } })).toBeDefined();
@@ -216,8 +292,20 @@ describe("chat domain validation", () => {
     // be a count and no other key may ride along.
     expect(parseConversationItem({ ...items[1], usage: {} })).toBeDefined();
     expect(() => parseConversationItem({ ...items[1], usage: { input: -1 } })).toThrow(/non-negative/);
+    // Cost is money beside the counts: fractional, never negative, and
+    // present on the subagent mirror as well as the message's own record.
+    expect(parseConversationItem({ ...items[1], usage: { ...usage, costUsd: 0.0123 } })).toBeDefined();
+    expect(parseConversationItem({ ...items[3], model: "anthropic/claude-sonnet", usage: { input: 5, costUsd: 0 } })).toBeDefined();
+    expect(() => parseConversationItem({ ...items[1], usage: { costUsd: -0.01 } })).toThrow(/non-negative/);
+    expect(() => parseConversationItem({ ...items[1], usage: { costUsd: "0.01" } })).toThrow(/non-negative/);
     expect(() => parseConversationItem({ ...items[1], usage: { input: "12000" } })).toThrow(/non-negative/);
     expect(() => parseConversationItem({ ...items[1], usage: { total: 12_400 } })).toThrow(/unknown/);
+    // The carrier may name the agent that produced the message; a name that
+    // is present must be one, and the tool mirror takes no such field.
+    expect(parseConversationItem({ ...items[1], usage, agent: "build" })).toBeDefined();
+    expect(() => parseConversationItem({ ...items[1], usage, agent: "" })).toThrow(/assistant agent/);
+    expect(() => parseConversationItem({ ...items[1], usage, agent: 7 })).toThrow(/assistant agent/);
+    expect(() => parseConversationItem({ ...items[3], agent: "build" })).toThrow(/unknown/);
     expect(() => parseConversationItem({ ...items[1], usage: 12_400 })).toThrow();
     expect(() => parseConversationItem({ ...items[1], model: { providerId: "anthropic" } })).toThrow();
     expect(() => parseConversationItem({ ...items[3], model: 5 })).toThrow();
@@ -281,10 +369,94 @@ describe("chat domain validation", () => {
     expect(() => parseConversationItem({ id: "task:1", type: "background_task", createdAt: 1, taskId: "1", description: "d", status: "paused" })).toThrow(/background task status/);
   });
 
+  test("the scheduled status, wakeup rows, and a wakeup turn's origin parse; malformed ones fail", () => {
+    expect(parseConversationItem({ id: "s", type: "turn_status", createdAt: 1, status: "scheduled" })).toBeTruthy();
+    const row = { id: "wakeup:a1", type: "scheduled_wakeup", createdAt: 1, wakeupId: "a1", prompt: "check the build", recurring: false, schedule: "3 20 * * *", nextFireAt: 5, status: "pending" };
+    expect(parseConversationItem(row)).toBeTruthy();
+    expect(parseConversationItem({ ...row, status: "fired", firedTurnId: "message:wakeup:p1" })).toBeTruthy();
+    expect(parseConversationItem({ ...row, status: "lost", message: "The schedule did not survive the session." })).toBeTruthy();
+    expect(parseConversationItem({ ...row, status: "paused", message: "Fires again once this conversation runs." })).toBeTruthy();
+    expect(() => parseConversationItem({ ...row, status: "snoozed" })).toThrow(/scheduled wakeup status/);
+    expect(() => parseConversationItem({ ...row, recurring: "no" })).toThrow(/recurring/);
+    expect(() => parseConversationItem({ ...row, schedule: "" })).toThrow(/schedule/);
+    expect(() => parseConversationItem({ ...row, nextFireAt: -1 })).toThrow(/nextFireAt/);
+    expect(() => parseConversationItem({ ...row, jitter: 3 })).toThrow(/unknown scheduled_wakeup field/);
+    const turn = { id: "message:wakeup:p1", type: "user_message", createdAt: 1, text: "check the build", origin: "wakeup", wakeupId: "a1" };
+    expect(parseConversationItem(turn)).toBeTruthy();
+    expect(() => parseConversationItem({ ...turn, origin: "cron" })).toThrow(/user message origin/);
+  });
+
+  test("a foreground run row is accepted; any foreground value but true is dropped, not refused", () => {
+    const row: ConversationItem = { id: "task:rv", type: "background_task", createdAt: 1, taskId: "ad53ca64bd188affb", description: "/code-review", taskType: "local_agent", status: "running", childConversationId: "sub:s1:ad53ca64bd188affb", foreground: true };
+    expect(parseConversationItem(row)).toEqual(row);
+    const { foreground: _foreground, ...background } = row;
+    expect(parseConversationItem({ ...row, foreground: false })).toEqual(background);
+    expect(parseConversationItem({ ...row, foreground: "yes" })).toEqual(background);
+  });
+
+  test("a running task's facts are accepted when well-formed and stripped, not refused, when malformed", () => {
+    const row: ConversationItem = { id: "task:a", type: "background_task", createdAt: 1, taskId: "ada2b9582caa230c5", description: "List files and count them", taskType: "local_agent", toolUseId: "toolu_013s2jZs", status: "running" };
+    const facts = {
+      subagentType: "general-purpose",
+      prompt: "List the files in the current directory ...",
+      usage: { totalTokens: 13122, toolUses: 1, durationMs: 4751 },
+      outputFile: "/private/tmp/claude-501/-private-tmp-uatu-spike-work/s1/tasks/ada2b9582caa230c5.output",
+      childConversationId: "sub:s1:ada2b9582caa230c5",
+    };
+    expect(parseConversationItem({ ...row, ...facts })).toEqual({ ...row, ...facts });
+    // Each fact is decoration on a row that stands without it: the bad value
+    // goes, the row and its other facts stay.
+    const malformed = {
+      subagentType: 7,
+      prompt: "",
+      usage: { totalTokens: -1, toolUses: 1, durationMs: 4751 },
+      outputFile: ["/tmp/x"],
+      childConversationId: "bad\u0000id",
+    };
+    expect(parseConversationItem({ ...row, ...malformed, progress: "Using Bash" })).toEqual({ ...row, progress: "Using Bash" });
+    expect(parseConversationItem({ ...row, usage: { totalTokens: 1, toolUses: 1 } })).toEqual(row);
+    expect(parseConversationItem({ ...row, usage: { totalTokens: 1, toolUses: 1, durationMs: 2, extra: 3 } })).toEqual(row);
+    expect(parseConversationItem({ ...row, usage: { totalTokens: 1, toolUses: 1, durationMs: 2 } })).toEqual({ ...row, usage: { totalTokens: 1, toolUses: 1, durationMs: 2 } });
+    // A field the row does not know is still a refusal.
+    expect(() => parseConversationItem({ ...row, spawnDepth: 1 })).toThrow(/unknown/);
+  });
+
+  test("a task output tail parses with its two flags and nothing else", () => {
+    expect(parseBackgroundTaskOutput({ text: "spike-done\n[exited with code 0]", truncated: false, settled: true })).toEqual({ text: "spike-done\n[exited with code 0]", truncated: false, settled: true });
+    expect(() => parseBackgroundTaskOutput({ text: "x", truncated: "no", settled: true })).toThrow(/booleans/);
+    expect(() => parseBackgroundTaskOutput({ text: 1, truncated: false, settled: false })).toThrow(/text/);
+    expect(() => parseBackgroundTaskOutput({ text: "x", truncated: false, settled: false, path: "/tmp/x" })).toThrow(/unknown/);
+  });
+
+  test("a usage report parses with the plan's own rules; a read result is a report or a named failure", () => {
+    const report = { plan: { subscription: "pro", fiveHour: { utilization: 9, resetsAt: 5 }, sevenDay: { utilization: 25 } }, readAt: 1_700_000_000_000, conversationId: "c1" };
+    expect(parseAgentUsageReport(report)).toEqual(report);
+    // An empty plan is an answer: the login reports no limits.
+    expect(parseAgentUsageReport({ plan: {}, readAt: 1 })).toEqual({ plan: {}, readAt: 1 });
+    expect(parseAgentUsageReport(null)).toBeNull();
+    expect(() => parseAgentUsageReport({ plan: {} })).toThrow(/readAt/);
+    expect(() => parseAgentUsageReport({ plan: {}, readAt: Number.NaN })).toThrow(/readAt/);
+    expect(() => parseAgentUsageReport({ plan: { fiveHour: { utilization: -1 } }, readAt: 1 })).toThrow(/utilization/);
+    expect(() => parseAgentUsageReport({ plan: {}, readAt: 1, extra: true })).toThrow(/usage report/);
+    expect(parseUsageReportResponse({ report })).toEqual({ report });
+    expect(parseUsageReportResponse({ report: null })).toEqual({ report: null });
+    expect(() => parseUsageReportResponse({})).toThrow(/report or null/);
+    expect(parseUsageReadResult({ report })).toEqual({ report });
+    expect(parseUsageReadResult({ report: null, reason: "timeout" })).toEqual({ report: null, reason: "timeout" });
+    expect(() => parseUsageReadResult({ report: null, reason: "bored" })).toThrow(/reason/);
+    expect(() => parseUsageReadResult({ report, reason: "timeout" })).toThrow(/no reason/);
+  });
+
   test("context reports and compaction markers parse as closed shapes", () => {
     const report = { id: "context:1", type: "context_report", createdAt: 5, total: 9697, max: 1_000_000, model: { providerId: "anthropic", modelId: "opus[1m]" }, categories: [{ name: "Messages", tokens: 10, kind: "used" }, { name: "Free space", tokens: 990_303, kind: "free" }] } as ConversationItem;
     expect(parseConversationItem(report)).toEqual(report);
     expect(parseConversationItem({ id: "context:2", type: "context_report", createdAt: 5, total: 0 })).toBeTruthy();
+    const window = { id: "w", type: "context_window", createdAt: 5, model: { providerId: "anthropic", modelId: "opus" }, contextKey: "query:1", limit: 1_000_000, window: { source: "session", freshness: "current", observedAt: 5 } } as const;
+    expect(parseConversationItem(window)).toEqual(window);
+    for (const limit of [0, -1, Infinity, NaN, 1.5]) expect(() => parseConversationItem({ ...window, limit })).toThrow(/positive integer/);
+    expect(() => parseConversationItem({ ...window, total: 0 })).toThrow(/unknown/);
+    expect(() => parseConversationItem({ ...window, window: { source: "guessed", freshness: "current" } })).toThrow(/source/);
+    expect(() => parseConversationItem({ ...window, window: { source: "session", freshness: "stale" } })).toThrow(/freshness/);
     expect(() => parseConversationItem({ id: "context:3", type: "context_report", createdAt: 5 })).toThrow(/total/);
     expect(() => parseConversationItem({ ...report, max: 0 })).toThrow(/max/);
     expect(() => parseConversationItem({ ...report, categories: [{ name: "Messages", tokens: 10, kind: "spent" }] })).toThrow(/category kind/);

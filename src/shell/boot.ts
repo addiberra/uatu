@@ -1,6 +1,6 @@
 // Initial boot — fetches the first /api/state payload, resolves the URL
 // against the available documents, configures the shell chrome, and hands
-// off to `connectEvents` for the SSE stream. The follow-mode capability owns
+// off to `connectEvents` for the live document topic. The follow-mode capability owns
 // the Follow toggle's behavior; this file's only job is the initial state
 // resolution.
 
@@ -15,11 +15,12 @@ import { setFilesPaneFilter, syncFilesPaneFilterControl } from "../sidebar/files
 import { adoptCompareTarget } from "../sidebar/change-overview";
 import { setPaneState } from "../sidebar/panes";
 import { setFollowEnabled, syncFollowToggle } from "./follow";
-import type { StatePayload } from "../shared/types";
+import { isFollowableFile, type StatePayload } from "../shared/types";
 import { applyViewMode } from "../preview/view-mode";
 import { renderBuildBadge } from "./connection";
-import { applyServerSnapshot, connectEvents, watchPageLifecycle } from "./events";
-import { replaceSelection, scrollToFragment } from "./history";
+import { adoptBootSnapshot, connectEvents } from "./events";
+import { watchPageLifecycle } from "./live";
+import { recordEmptySelection, replaceSelection, scrollToFragment } from "./history";
 import {
   appState,
   readPaneState,
@@ -29,8 +30,9 @@ import {
   loadPersonalWorkspaceState,
   persistPersonalWorkspaceState,
 } from "./personal-state";
-import { contextualAppUrl } from "./watch-context";
-import { setPreviewMode, setSelectedId } from "./selection";
+import { applyWatchContext } from "../shared/watch-context";
+import { clearDocumentSelection, resumeDocumentSelection, setPreviewMode, setSelectedId, setPendingDocumentPath } from "./selection";
+import { readSelectionCleared } from "./selection-storage";
 import {
   commitPreviewParamsFromUrl,
   renderCommitPreview,
@@ -62,14 +64,25 @@ export async function loadInitialState(onWorkspaceReady?: () => void) {
   ]);
   let payload = (await response.json()) as StatePayload;
 
+  const requestedPath = urlRelativePath || personalState.documentPath;
+  if (requestedPath) {
+    const url = applyWatchContext(new URL(appUrl(`/api/state?documentPath=${encodeURIComponent(requestedPath)}`), window.location.href), {
+      scope: payload.scope, compareTarget: payload.compareTarget,
+    });
+    const resolved = await fetch(url, { cache: "no-store" });
+    if (resolved.ok) payload = await resolved.json() as StatePayload;
+  }
+
   adoptCompareTarget(personalState.compareTarget ?? "base");
   if (personalState.previewMode) applyViewMode(personalState.previewMode);
   if (payload.compareTarget !== appState.compareTarget) {
-    const contextualResponse = await fetch(contextualAppUrl(appUrl("/api/state")));
+    const contextualResponse = await fetch(applyWatchContext(new URL(appUrl("/api/state"), window.location.href), {
+      scope: payload.scope, compareTarget: appState.compareTarget,
+    }));
     if (contextualResponse.ok) payload = (await contextualResponse.json()) as StatePayload;
   }
 
-  applyServerSnapshot(payload);
+  adoptBootSnapshot(payload);
   syncStateGeneration(payload.generatedAt);
   renderBuildBadge(payload.build);
   setupTerminalPanel(payload.terminal === "enabled", personalState.lastPtyId);
@@ -80,16 +93,27 @@ export async function loadInitialState(onWorkspaceReady?: () => void) {
 
   let directLinkMessage: { title: string; body: string } | null = null;
   let explicitDocumentPath: string | null = null;
+  // A commit surface is not document resumption. Preserve browser-local
+  // close intent so a later root arrival remains empty.
+  if (hasExplicitRoute && !initialCommitPreview) resumeDocumentSelection();
+
   if (initialCommitPreview) {
     setFollowEnabled(false);
     setSelectedId(null);
     setPreviewMode({ kind: "commit", ...initialCommitPreview });
+  } else if (!hasExplicitRoute && readSelectionCleared()) {
+    clearDocumentSelection();
+    setFollowEnabled(false);
+    setPreviewMode({ kind: "empty" });
+    recordEmptySelection(true);
   } else if (!hasExplicitRoute) {
-    setFollowEnabled(personalState.follow ?? payload.initialFollow);
+    setFollowEnabled(personalState.follow ?? payload.initialFollow, true);
     const savedDocument = personalState.documentPath
       ? findDocumentByRelativePath(personalState.documentPath)
       : null;
-    setSelectedId(savedDocument?.kind !== "binary" ? savedDocument?.id ?? payload.defaultDocumentId : payload.defaultDocumentId);
+    // A saved image is restored like a document: Follow may have left the
+    // user on it (Rule C), and a reload must not drop it.
+    setSelectedId(savedDocument && isFollowableFile(savedDocument) ? savedDocument.id : payload.defaultDocumentId);
     setPreviewMode({ kind: "document" });
   } else if (!urlRelativePath) {
     // A fragment-bearing root URL is explicit navigation. Render the session
@@ -108,6 +132,12 @@ export async function loadInitialState(onWorkspaceReady?: () => void) {
       setSelectedId(requestedDoc.id);
       explicitDocumentPath = requestedDoc.relativePath;
       setPreviewMode({ kind: "document" });
+    } else if (!requestedDoc && appState.discovery.status !== "ready" && (payload.scope.kind === "folder"
+      || payload.scope.documentId.replaceAll("\\", "/").endsWith(`/${urlRelativePath}`))) {
+      setSelectedId(null);
+      setPendingDocumentPath(urlRelativePath);
+      setPreviewMode({ kind: "empty" });
+      directLinkMessage = { title: "Document indexing", body: `Waiting for indexing to resolve ${urlRelativePath}.` };
     } else if (payload.scope.kind === "file") {
       // Direct link to a doc outside the CLI single-file watch scope. Keep
       // the scoped doc as the selection but render a "session scoped to a
@@ -126,6 +156,7 @@ export async function loadInitialState(onWorkspaceReady?: () => void) {
     } else {
       // Direct link that doesn't resolve to any known doc in the index.
       setSelectedId(null);
+      if (!requestedDoc) setPendingDocumentPath(urlRelativePath);
       setPreviewMode({ kind: "empty" });
       directLinkMessage = {
         title: "Document not found",
@@ -136,6 +167,16 @@ export async function loadInitialState(onWorkspaceReady?: () => void) {
 
   syncFollowToggle();
   renderSidebar();
+  // Restoration above is read-only. From here the UI is interactive, even
+  // while the initial preview request is pending: never drop those writes or
+  // overwrite them later with the initial route's intent.
+  enablePersonalStatePersistence();
+  if (initialCommitPreview || hasExplicitRoute) {
+    persistPersonalWorkspaceState({
+      follow: false,
+      ...(explicitDocumentPath ? { documentPath: explicitDocumentPath } : {}),
+    });
+  }
   onWorkspaceReady?.();
   connectEvents();
   // Resume from the cursor even if the initial preview is still loading.
@@ -168,17 +209,7 @@ export async function loadInitialState(onWorkspaceReady?: () => void) {
         requestAnimationFrame(() => scrollToFragment(initialHash.slice(1)));
       }
     });
-  }
-
-  enablePersonalStatePersistence();
-  // Restored/default values are read-only at boot: writing a full snapshot
-  // here could overwrite newer field-level writes from another open client.
-  // An explicit route is current user intent, so only its affected fields are
-  // persisted for future root arrivals.
-  if (initialCommitPreview || hasExplicitRoute) {
-    persistPersonalWorkspaceState({
-      follow: false,
-      ...(explicitDocumentPath ? { documentPath: explicitDocumentPath } : {}),
-    });
+  } else {
+    renderEmptyPreview("No document selected", "Waiting for viewable files");
   }
 }

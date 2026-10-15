@@ -39,8 +39,22 @@ const HOP_BY_HOP = new Set([
   "host",
 ]);
 
-function childOrigin(session: RunningSession): string {
+export function childOrigin(session: RunningSession): string {
   return `http://${session.endpoint.hostname}:${session.endpoint.port}`;
+}
+
+// Headers for a request the HUB ITSELF originates against a child (the live
+// broker's upstream subscriptions): the same loopback shaping a proxied
+// browser request gets, without a browser request to copy from. The child's
+// localhost origin gate sees its own origin; identity encoding keeps the
+// child's SSE bytes as-is.
+export function childRequestHeaders(session: RunningSession): Headers {
+  const headers = new Headers();
+  headers.set("host", `${session.endpoint.hostname}:${session.endpoint.port}`);
+  headers.set("accept", "text/event-stream");
+  headers.set("accept-encoding", "identity");
+  headers.set("origin", childOrigin(session));
+  return headers;
 }
 
 // Builds the child-side URL for a proxied request: same (prefixed) path and
@@ -135,6 +149,13 @@ export async function proxyHttp(request: Request, session: RunningSession): Prom
   }
 
   statusCategory = statusCategoryOf(upstream.status);
+  if (upstream.status === 200 && upstream.headers.get("content-type")?.includes("text/html")) {
+    upstream = new HTMLRewriter().on("head", { element(head) {
+      head.prepend('<meta name="uatu-hub" content="true">', { html: true });
+    } }).transform(upstream);
+    upstream.headers.delete("content-length");
+    upstream.headers.delete("etag");
+  }
 
   // Stream the body through untouched — SSE depends on this staying
   // unbuffered. Strip hop-by-hop response headers; everything else
@@ -205,9 +226,12 @@ export async function proxyHttp(request: Request, session: RunningSession): Prom
 export type StreamOutcome = "completed" | "cancelled" | "failed";
 
 // The transport classes the hub can name. Derived from the route shape alone,
-// never from the workspace id, the conversation id, the query string, or any
-// header — so the set is closed and a diagnostic cannot leak an identifier.
-export const PROXY_TRANSPORT_CLASSES = ["document", "chat-conversation", "chat-inventory", "search", "other"] as const;
+// never from the workspace id, the query string, or any header — so the set
+// is closed and a diagnostic cannot leak an identifier. Live streams are no
+// longer proxied (the hub refuses the per-stream SSE routes and brokers
+// `/api/hub/live` instead — see live-broker.ts), so the only proxied stream
+// left to diagnose is the NDJSON search feed.
+export const PROXY_TRANSPORT_CLASSES = ["search", "other"] as const;
 export type ProxyTransportClass = (typeof PROXY_TRANSPORT_CLASSES)[number];
 
 // Status is recorded as a category, not a code, and `unreachable` covers a
@@ -222,9 +246,6 @@ export type ProxyStreamDiagnostic = {
 };
 
 export function classifyProxyTransport(pathname: string): ProxyTransportClass {
-  if (pathname.endsWith("/api/events")) return "document";
-  if (pathname.endsWith("/api/chat/conversations/events")) return "chat-inventory";
-  if (/\/api\/chat\/conversations\/[^/]+\/events$/.test(pathname)) return "chat-conversation";
   if (pathname.endsWith("/api/search")) return "search";
   return "other";
 }
@@ -280,9 +301,17 @@ function cancellableBody(
           return;
         }
         controller.enqueue(result.value);
-      } catch (error) {
+      } catch {
+        // The upstream failure is recorded through the diagnostic sink, which
+        // names only the transport class and status category. The browser
+        // gets a clean end-of-stream, never the error: EventSource treats an
+        // ended stream exactly like a dropped one (onerror, then reconnect),
+        // and the search client reads a stream that ends without `done` as
+        // cut off. Erroring the stream instead would make Bun print the raw
+        // fetch error to stderr — a source excerpt plus the child URL,
+        // brokered token included — which no sink can suppress.
         finish("failed");
-        controller.error(error);
+        controller.close();
       }
     },
     cancel(reason) {
@@ -317,12 +346,26 @@ export type BridgeData = {
 // the child side is a standard WebSocket client aimed at the loopback
 // endpoint. Messages and close events pass through in both directions with
 // app close codes (4001 kill, 4409 collision, 4410 takeover) preserved.
+//
+// The two handshakes are independent: the hub accepts the browser before
+// it knows whether the child will, so a bridge can end from either side at
+// any point — before the child opened, before the browser attached, or
+// after both. Ending is one idempotent step (`closed` is set once, by
+// whichever side went first), after which every later event is a no-op:
+// a late child `open` is closed again rather than becoming a holder for a
+// browser that has left, queued browser input is dropped rather than
+// flushed into it, and a browser that attaches after the child already
+// failed is closed with the child's verdict instead of waiting on nothing.
 export class WebSocketBridge {
   private browser: ServerWebSocket<BridgeData> | null = null;
   private child: WebSocket;
   // Browser messages that arrive before the child socket opens.
   private pending: (string | Uint8Array<ArrayBuffer>)[] = [];
   private childOpen = false;
+  // The close this bridge ended with, once it has. The code is what the
+  // side still open is closed with, so an application code (4001 from the
+  // browser, 4410 from the child) keeps its meaning across the bridge.
+  private closed: { code: number; reason: string } | null = null;
 
   constructor(session: RunningSession, requestUrl: URL) {
     const target = childUrlFor(session, requestUrl);
@@ -336,28 +379,45 @@ export class WebSocketBridge {
     this.child.binaryType = "arraybuffer";
 
     this.child.addEventListener("open", () => {
+      if (this.closed) {
+        // The browser departed (or its upgrade failed) while the child was
+        // still opening. Nothing queued reaches the child, and the child
+        // sees a close rather than an attach-ready that would make it the
+        // PTY's holder on behalf of nobody.
+        this.closeChild(this.closed.code, this.closed.reason);
+        return;
+      }
       this.childOpen = true;
       for (const message of this.pending.splice(0)) {
         this.child.send(message);
       }
     });
     this.child.addEventListener("message", event => {
+      if (this.closed) return;
       const data = event.data as string | ArrayBuffer;
       this.browser?.send(typeof data === "string" ? data : new Uint8Array(data));
     });
     this.child.addEventListener("close", event => {
-      this.closeBrowser(event.code, event.reason);
+      this.endFromChild(event.code, event.reason);
     });
     this.child.addEventListener("error", () => {
-      this.closeBrowser(1011, "upstream error");
+      this.endFromChild(1011, "upstream error");
     });
   }
 
   attachBrowser(socket: ServerWebSocket<BridgeData>): void {
+    if (this.closed) {
+      // The child already ended (a refused upgrade answers faster than the
+      // browser handshake completes): the browser must not be left open on
+      // a bridge with nothing behind it.
+      closeSocket(socket, this.closed.code, this.closed.reason);
+      return;
+    }
     this.browser = socket;
   }
 
   browserMessage(data: string | Buffer): void {
+    if (this.closed) return;
     const message: string | Uint8Array<ArrayBuffer> =
       typeof data === "string" ? data : new Uint8Array(data);
     if (!this.childOpen) {
@@ -368,30 +428,57 @@ export class WebSocketBridge {
   }
 
   browserClosed(code: number, reason: string): void {
-    this.closeChild(code, reason);
+    this.endFromBrowser(code, reason);
   }
 
-  private closeBrowser(code: number, reason: string): void {
-    try {
-      this.browser?.close(sendableCloseCode(code), reason);
-    } catch {
-      try {
-        this.browser?.close();
-      } catch {
-        // Already closed.
-      }
-    }
+  // The browser-side upgrade did not complete after the child connection
+  // was already started: release the child. 1001 (going away) is an
+  // ordinary departure to the child — a detach, never a kill.
+  dispose(): void {
+    this.endFromBrowser(1001, "browser upgrade failed");
+  }
+
+  get isClosed(): boolean {
+    return this.closed !== null;
+  }
+
+  private endFromChild(code: number, reason: string): void {
+    if (this.closed) return;
+    this.closed = { code: sendableCloseCode(code), reason };
+    this.pending = [];
+    if (this.browser) closeSocket(this.browser, this.closed.code, reason);
+  }
+
+  private endFromBrowser(code: number, reason: string): void {
+    if (this.closed) return;
+    this.closed = { code: sendableCloseCode(code), reason };
+    this.pending = [];
+    // A child still connecting is closed too: Bun fails the connection, and
+    // should `open` fire regardless, the handler above closes it again.
+    this.closeChild(this.closed.code, reason);
   }
 
   private closeChild(code: number, reason: string): void {
     try {
-      this.child.close(sendableCloseCode(code), reason);
+      this.child.close(code, reason);
     } catch {
       try {
         this.child.close();
       } catch {
         // Already closed.
       }
+    }
+  }
+}
+
+function closeSocket(socket: ServerWebSocket<BridgeData>, code: number, reason: string): void {
+  try {
+    socket.close(code, reason);
+  } catch {
+    try {
+      socket.close();
+    } catch {
+      // Already closed.
     }
   }
 }
@@ -415,6 +502,9 @@ export function upgradeToBridge(
   const bridge = new WebSocketBridge(session, requestUrl);
   const upgraded = server.upgrade(request, { data: { bridge } satisfies BridgeData });
   if (!upgraded) {
+    // The child connection was already started; without a browser to
+    // bridge it must not linger (or, worse, be attached by a late message).
+    bridge.dispose();
     return new Response("upgrade failed", { status: 500 });
   }
   return undefined;

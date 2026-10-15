@@ -4,11 +4,12 @@ The implemented touch Hub does not reproduce the approved refined reference: des
 
 ## What Changes
 
-- Deliver the **actual reusable frontend first**, against a test-only mocked backend, for hands-on visual and interaction approval before any real backend integration. This change's implementation tasks stop at that review gate.
+- Preserve the **frontend-first history** and amend this existing change to integrate its reusable refined mobile frontend into the **live phone Hub**. On 2026-10-15 the user agreed this design direction and explicitly authorized live integration, superseding the integration stop formerly bundled into task 8.3. This is not final visual acceptance, physical-device certification, or permission to sync/archive.
 - Treat `design/hub-mobile/refined.html` and its retained screenshots as a screen/state-level visual contract, not loose inspiration. Retain the current UatuCode name/logo as an explicit exception; keep system accessibility adaptations. Desktop Hub presentation and workspace interiors are not redesigned.
-- Implement reference-faithful touch dashboard composition, grouped Settings and detail views, task sheets, icon-and-label navigation, Return hierarchy, and coordinated overlay materials. Extend that language to unpictured production states and present those extensions for review.
+- Implement reference-faithful touch dashboard composition, grouped Settings and focused full-page editors (the later approved refinement), icon-and-label navigation, Return hierarchy, and coordinated overlay materials. Use compact cards for one checkout; disclose branch/checkout rows only for multiple checkouts. Keep Rename and branch/worktree creation secondary in More actions. Preserve all upstream operations and present unpictured states for review.
+- Keep exactly two persistent dock destinations, Hub and Settings, plus contextual Return after a workspace visit. Put Notifications in Settings and Agent accounts in a separate Settings group from repository Credentials, with focused agent/provider pages. Place the credential-sharing notice contextually in Credentials and retain full safety details in relevant credential, assignment, clone and account flows; do not weaken safeguards or redesign desktop.
 - Preserve one active workspace's browser-side state and ongoing client work across ordinary Hub/Settings/Return navigation through a **same-document integration with no iframes**. This supersedes the archived change's restoration-only constraint, not authentication or server-session lifetime rules.
-- Model truthful branch/detached/unborn/non-Git/unavailable metadata in the frontend interface and synthetic review fixtures. Real Git probing and any public API additions are deferred until frontend approval.
+- Connect real authenticated Hub reads, mutations and streams to the existing mobile interface, extending it for upstream worktrees, Agent accounts and Notifications. Reuse authoritative services and publish only required additive contracts, including truthful branch facts and clone-attempt reconciliation; never infer live facts from fixtures or readiness prose.
 - Add a deterministic review harness, visual comparisons, continuity tests, and an explicit human acceptance record. Keep mocks, fictional identities, scenario controls, and simulated operations in `tests/`, never in product code.
 
 ## Capabilities
@@ -16,7 +17,7 @@ The implemented touch Hub does not reproduce the approved refined reference: des
 ### New Capabilities
 
 - `mobile-hub-continuity`: Same-document, frame-free workspace retention across touch Hub and Settings visits, including route ownership, focus isolation, async work, and invalidation.
-- `mobile-hub-review`: Isolated mocked-backend review of the shipping frontend, deterministic scenarios, evidence, and a mandatory approval gate before live integration.
+- `mobile-hub-review`: Isolated mocked-backend review of the shipping frontend, deterministic scenarios, provenance, and distinct records for design/integration authorization and final acceptance.
 
 ### Modified Capabilities
 
@@ -25,8 +26,8 @@ The implemented touch Hub does not reproduce the approved refined reference: des
 
 ## Impact
 
-- Frontend work is expected under `src/hub/` with bounded integration through existing `src/shell/` and workspace entry owners. The existing workspace surfaces, `appState`, document identity, credential operations, and terminal/chat behavior remain owned by their current modules.
+- Work is expected under `src/hub/mobile/`, Hub server/asset assembly and existing `src/shell/` and workspace entry owners. The existing workspace surfaces, `appState`, document identity, credential/worktree/agent-account services, notification enrollment, and terminal/chat behavior remain owned by their current modules. API additions require aligned OpenAPI, operation/stream inventories, revision compatibility checks and documentation.
 - Test-only launchers, backend doubles, and fixtures live under `tests/`; colocated unit tests and feature E2E tests remain at the existing seams. Review serves a distinct loopback port and Tailscale endpoint without replacing the existing Hub or the archived reference endpoint.
-- No new runtime dependencies, live credential provisioning, real clone/start/stop operations, production Git probes, published API changes, or native Desktop changes are authorized in the frontend-first stage. Any required dependency or material architectural expansion must be raised before proceeding.
-- The later integration stage must connect the same frontend to real operations, publish the branch metadata contract, verify security/lifecycle behavior, and preserve the visually approved result. A mock pass is not evidence of live operation correctness.
+- The original frontend-first stage prohibited live effects. The authorized integration stage now covers their implementation and isolated acceptance tests, not unrestricted use of personal credentials, host configuration, paid providers or existing live services. No new dependencies or native Desktop redesign are assumed. Ask before any material expansion or deployment/resource change beyond assigned scope.
+- Live acceptance must cover routing/authentication/CSRF, provider and repository credentials, clone/start/stop/worktrees, retention and desktop nonregression. A mock pass is not live correctness. Existing broader Chat touch failures and archive-digest mismatch remain unwaived; outstanding visual, full-matrix and physical-device checks remain open.
 - Supporting artifacts: `diagnosis.md`, `reference-contract.md`, and `screen-map.md`. The archived change and original reference remain historical evidence and are not rewritten.

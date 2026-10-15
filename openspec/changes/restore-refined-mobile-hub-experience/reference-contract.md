@@ -2,16 +2,45 @@
 
 ## Target and exceptions
 
-The visual target is **the exact refined reference**, not “iOS-inspired” generic
-cards. Source: `design/hub-mobile/refined.html` and its 49 images in
+The visual foundation is **the refined reference with the explicit approved
+amendments below**, not “iOS-inspired” generic cards. Source:
+`design/hub-mobile/refined.html` and its 49 images in
 `design/hub-mobile/screenshots-refined/`. Filenames below are relative to that
 directory. The contract applies to touch/mobile Hub and its workspace navigation
 overlays; desktop and the current workspace interiors are not redesigned.
 
-The frontend reviewed in this change is the shipping implementation driven by
-test-owned synthetic services. It must remain suitable for subsequent live
-adapter integration, not be replaced after review. No backend implementation or
-live privileged operation is part of this phase.
+The frontend reviewed here is the reusable shipping implementation, currently
+driven by test-owned synthetic services. The user explicitly authorized live
+integration on 2026-10-15; the lead starts apply after this planning-only phase.
+The synthetic reviewer remains isolated and must not be repurposed as live.
+
+## Agreed amendments and acceptance status — 2026-10-15
+
+These amendments take precedence over the historical screenshot compositions
+below without altering the original images or implying approved new goldens:
+
+- Refined synthetic UI is the **live phone Hub target**, preserving upstream
+  capabilities; desktop and workspace interiors remain unchanged.
+- One checkout: one compact card, no repeated repository heading/main branch row.
+  Multiple checkouts: disclose independent branch/checkout rows. Rename and
+  create branch/worktree stay secondary in accessible More actions. This does
+  not reintroduce generic More menus into Settings editors.
+- The persistent icon dock has Hub and Settings only; contextual Return is not
+  a third equal destination. Notifications belongs in Settings, with all existing
+  device/enrollment/event choices and truthful permission/support states.
+- Agent accounts is a separate Settings group from repository Credentials,
+  leading to focused agent/provider/attempt pages and retaining machine-wide
+  scope, methods, progress and errors.
+- The sharing advisory is contextual within Credentials. Full same-UID safety
+  details remain there and in relevant credential/assignment/clone flows; keep
+  per-user advisory dismissal without suppressing details or operation warnings.
+- The previously agreed full-page editor/result model supersedes photographed
+  bottom sheets for management/preferences. Keep direct contextual actions,
+  header Back/Cancel/Save and small consequential confirmation dialogs.
+
+Design direction and integration are approved, not final rendered-state visual
+acceptance or physical-device certification. Tasks 7.1/7.4/8.3 and other open
+evidence remain pending. See `review-evidence/acceptance.md` for the dated record.
 
 Explicit exceptions and adaptations:
 
@@ -55,7 +84,7 @@ is removed; reconstruction requires image comparison and user review.
 | Docks | Inset floating full-radius material, softly translucent white, subtle luminous rim/shadow. Icon above label, pale blue selected capsule, muted inactive icon/text. No text-only navigation strip and no permanent content gutter in workspace surfaces. |
 | Sheets | Dim the actual underlying view; bottom-attached sheet with large top corners, centered small grabber, centered bold heading, fine header separator, grouped white inputs on the cool sheet field. Scroll body independently; reachable bottom action row separated by a hairline with Cancel/primary capsules. No centered desktop dialog masquerading as the phone sheet. |
 
-## Per-state contracts and anchors
+## Original per-state anchors (apply the amendments above)
 
 | State | Exact composition and behavior to preserve | Reference |
 | --- | --- | --- |
@@ -91,6 +120,7 @@ or security details, most credential types, or full onboarding/error workflows.
 Design these as coherent extensions of the above grammar and present them for
 review; do not claim they were already approved. Keep screenshot/interaction
 evidence, named deviations and unresolved decisions in the review handoff.
-Automatic checks are supporting evidence only. The phase ends at **explicit user
-visual and interaction approval**, not at a green test suite, and live integration
-requires the subsequent authorized work.
+Automatic checks are supporting evidence only. Live integration is now explicitly
+authorized; final visual/interaction acceptance still requires a named version
+and user decision, not a green test suite. No physical-device validation, release
+approval, spec sync or archive is inferred.

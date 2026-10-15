@@ -1,14 +1,20 @@
 import { appUrl } from "../shared/app-url";
 import { escapeHtml, escapeHtmlAttribute } from "../shared/html";
+import { loginActionMarkup, type LoginAction } from "./login-action";
+import { renderTerminalText, tailStart, terminalLinesToHtml, terminalTextToHtml } from "./ansi";
 import { appState } from "../shell/state";
 import { renderChatMarkdown } from "./markdown";
+import { retainShellSelection, ShellOutputController, type ShellMutationHooks, type ShellOutputMetadata, type ShellPresentation } from "./shell-output";
 import { measureChatWork } from "./performance";
 import { resolveWorkspaceFileReference } from "./file-references";
 import { commandSubject, describeToolDetail, deriveTodoActivities, patchDiffLines, todoActivitySummary, toolSubject, type DiffLine, type TodoEntry, type TodoSummary, type ToolDetail } from "./tool-detail";
 import type { AcceptedDraft, ChatProjection } from "./projection";
-import { isLiveConversationStatus, type ActivityStatus, type ConversationItem, type ConversationStatus, type MessageAttachment, type PermissionOutcome, type QueuedMessage, type QuestionRequest, type RevertedUserMessage, type TokenUsage, type ToolItem } from "./types";
+import { formatUsd } from "./usage";
+import { wakeupRowLabel } from "./scheduled-wakeups";
+import { dateTime, dayLabel, fullDate, knownTime, localDayKey, localDaysBetween, nextLocalMidnight, weekdayClock } from "./dates";
+import { LOGIN_FAILED_NOTICE_CODE, isLiveConversationStatus, isRateLimitStanding, type ActivityStatus, type ConversationItem, type ConversationStatus, type MessageAttachment, type PermissionOutcome, type QueuedMessage, type QuestionRequest, type RevertedUserMessage, type TokenUsage, type ToolItem } from "./types";
 
-type RenderedEntry = { node: HTMLElement; item: ConversationItem; active: boolean; variant: string };
+type RenderedEntry = { node: HTMLElement; item: ConversationItem; active: boolean; variant: string; shellVariant?: string };
 const deferredBodies = new WeakMap<HTMLElement, () => void>();
 
 export function materializeChatActivity(root: HTMLElement): void {
@@ -33,12 +39,53 @@ export class TimelineRenderer {
   private readonly entries = new Map<string, RenderedEntry>();
   private readonly draftEntries = new Map<string, { node: HTMLElement; draft: AcceptedDraft }>();
   private readonly groupEntries = new Map<string, HTMLElement>();
+  // One separator per local day shown, keyed by `YYYY-MM-DD` and reconciled
+  // like the group lines: presentation of the items' own times, never an item.
+  private readonly dayEntries = new Map<string, { node: HTMLElement; at: number }>();
+  private dayRollover: ReturnType<typeof setTimeout> | undefined;
+  // The midnight the rollover timer is aimed at, and the reader's day the
+  // separators' labels were last written against.
+  private dayRolloverAt: number | undefined;
+  private labelledDay: string | undefined;
   private conversationId: string | null = null;
+  // The reader's clock: "Today" is decided against it. Injectable for tests.
+  now: () => number = () => Date.now();
+  private readonly shells = new Map<string, ShellOutputController>();
+  private readonly shellPresentations = new Map<string, Map<string, { state: ShellPresentation; open: boolean; closed: boolean }>>();
+  private shellsHidden = false;
+  conversationTitle: string | undefined;
+  shellMutationHooks: ShellMutationHooks = {};
+
+  /** Call for both retained renderers when Chat/page visibility changes. */
+  setShellOutputsHidden(hidden: boolean): void {
+    if (hidden === this.shellsHidden) return;
+    this.shellsHidden = hidden;
+    for (const shell of this.shells.values()) shell.setHidden(hidden);
+  }
+
+  /** Explicit conversation/owning-child navigation closes, but retains inline state. */
+  closeShellOutputWindow(): void { for (const shell of this.shells.values()) shell.returnInline(); }
+  getShellOutput(itemId: string): ShellOutputController | undefined { return this.shells.get(itemId); }
 
   /** Reconciles the DOM under `target` and returns the created or changed nodes. */
   // The owning agent's persistent-approval sentence, set by the surface from
   // the agent's declaration; a card renders whatever its agent declared.
   permissionScopeNote: string | undefined;
+  // How this conversation's agent gets a login, set by the surface: a
+  // login-failure notice offers it.
+  loginAction: LoginAction | undefined;
+  // Permission cards the reader has moved into the "Allow always"
+  // confirmation stage. Owned by the surface, read here: the stage is a
+  // reader's choice the renderer is told about, not something to recover
+  // from the DOM it is about to replace. Ids leave the set on Confirm,
+  // Cancel, and Escape (the surface) and when the card stops being the
+  // answerable one (below). A request resolved elsewhere recedes as usual.
+  readonly confirming = new Set<string>();
+  // A selector to focus inside the next painted timeline. The confirmation
+  // stage is built by a render, so the button it should land on does not
+  // exist yet when the click that opens it is handled; the surface sets
+  // this and consumes it after the paint.
+  focusAfterPaint: string | undefined;
   deferClosedActivity = false;
 
   // `turnStartedAt` is when the running turn began (the surface's per-
@@ -47,18 +94,19 @@ export class TimelineRenderer {
   // renders. Absent for a settled conversation — nothing is working.
   render(target: HTMLElement, projection: ChatProjection | null, expanded: Set<string>, allowSubagents = true, allowRevert = false, turnStartedAt?: number): HTMLElement[] {
     const finish = measureChatWork("transcript-render");
+    const selection = retainShellSelection(target);
     try { return this.renderTimeline(target, projection, expanded, allowSubagents, allowRevert, turnStartedAt); }
-    finally { finish(); }
+    finally { selection(); finish(); }
   }
 
   private renderTimeline(target: HTMLElement, projection: ChatProjection | null, expanded: Set<string>, allowSubagents: boolean, allowRevert: boolean, turnStartedAt?: number): HTMLElement[] {
     if (!projection) {
-      this.reset();
+      this.reset(true);
       clearChildren(target);
       return [];
     }
     if (this.conversationId !== projection.conversationId) {
-      this.reset();
+      this.reset(true);
       clearChildren(target);
       this.conversationId = projection.conversationId;
     }
@@ -84,6 +132,7 @@ export class TimelineRenderer {
       }
     }
     const activeRequests = new Set<string>([...activeByOwner.values()].map(entry => entry.id));
+    const toolRows = toolRowIndex(projection.items);
 
     const todoLabels = todoActivityLabels(projection.items);
     const durations = turnDurations(projection.items);
@@ -102,10 +151,18 @@ export class TimelineRenderer {
     // finished run's group.
     // A context report is data of the same kind: the readout consumes it,
     // the timeline never shows it.
+    // A rate-limit standing is data of that same kind, and the reason it is
+    // filtered here rather than never minted: the composer's plan chip reads
+    // it out of the projection. The login restates it on every request, so
+    // drawn as rows it would bury the work the reader came for — the one
+    // place it belongs is the chip, which says it once and opens.
     // A running background task is presented in the composer's live list;
-    // only a settled one takes a place in the timeline (D8).
-    const visible = projection.items.filter(item => !(item.type === "assistant_message" && item.markdown === "") && item.type !== "context_report"
-      && !(item.type === "background_task" && item.status === "running"));
+    // only a settled one takes a place in the timeline (D8). A foreground
+    // run's row never does: it is listed with the subagents, and the command
+    // that ran it prints its own output into the timeline (D13).
+    const visible = projection.items.filter(item => !(item.type === "assistant_message" && item.markdown === "") && item.type !== "context_report" && item.type !== "context_window"
+      && !isRateLimitStanding(item)
+      && !(item.type === "background_task" && (item.status === "running" || item.foreground === true)));
 
     const nodes = new Map<string, HTMLElement>();
     for (const [visibleIndex, item] of visible.entries()) {
@@ -126,7 +183,29 @@ export class TimelineRenderer {
       // when a later user message is visible remains incomplete.
       const completedAssistant = item.type === "assistant_message"
         && (entry?.node.dataset.complete === "true" || assistantMessageComplete(visible, visibleIndex, projection.status));
-      const variant = [todo?.label ?? "", todo?.task ?? "", duration === undefined ? "" : String(duration), origin?.conversationId ?? "", origin?.label ?? "", String(allowSubagents), String(allowRevert), String(completedAssistant), this.permissionScopeNote ?? ""].join("\u0001");
+      // Only an answerable pending permission can be confirming; anything
+      // else drops out so the set cannot hold a stale id.
+      const confirming = this.confirming.has(item.id) && item.type === "permission" && item.status === "pending" && active;
+      if (!confirming) this.confirming.delete(item.id);
+      // The tool row a pending permission belongs to, when the card would
+      // show its arguments. Part of the key: the row's input can land after
+      // the card first rendered (a recovered request, a 1.x part under
+      // load), and the card must fill in when it does.
+      const linkedTool = item.type === "permission" ? linkedToolRow(item, toolRows) : undefined;
+      const variant = [todo?.label ?? "", todo?.task ?? "", duration === undefined ? "" : String(duration), origin?.conversationId ?? "", origin?.label ?? "", String(allowSubagents), String(allowRevert), String(completedAssistant), this.permissionScopeNote ?? "", String(confirming), linkedTool?.id ?? "", linkedTool?.input ?? "", this.loginAction ? `${this.loginAction.agentName}\u0002${this.loginAction.href ?? ""}` : ""].join("\u0001");
+      if (entry?.shellVariant !== undefined && entry.item === item && entry.active === active && entry.variant === variant
+        && entry.shellVariant === this.shellVariant(entry.node, item.id)) {
+        nodes.set(item.id, entry.node);
+        continue;
+      }
+      if (shellMetadata(item, this.conversationTitle ?? projection.conversationId)) {
+        const node = this.reconcileShell(item, entry, expanded, active, variant);
+        this.entries.get(item.id)!.shellVariant = this.shellVariant(node, item.id);
+        nodes.set(item.id, node);
+        dirty.push(node);
+        continue;
+      }
+      if (this.shells.has(item.id)) { this.shells.get(item.id)!.dispose(); this.shells.delete(item.id); }
       if (entry && entry.item === item && entry.active === active && entry.variant === variant) {
         nodes.set(item.id, entry.node);
         continue;
@@ -165,7 +244,7 @@ export class TimelineRenderer {
       // auto-open rule for the rest of the run, so a tool that keeps talking
       // cannot reopen a row the reader shut.
       const readerClosed = entry?.node.hasAttribute(READER_CLOSED) ?? false;
-      const markup = (defer: boolean) => renderItem(item, open, active, todo, duration, origin, readerClosed, allowSubagents, completedAssistant, allowRevert, this.permissionScopeNote, defer);
+      const markup = (defer: boolean) => renderItem(item, open, active, todo, duration, origin, readerClosed, allowSubagents, completedAssistant, allowRevert, this.permissionScopeNote, defer, confirming, linkedTool, this.loginAction);
       const node = buildNode(markup(this.deferClosedActivity));
       if (this.deferClosedActivity && node.matches("details.chat-activity:not([open])")) {
         node.setAttribute("data-chat-lazy", "");
@@ -197,11 +276,43 @@ export class TimelineRenderer {
     // is placed after the accepted drafts, not before them: the draft is the
     // prompt the agent is working on, and the line answers it.
     let awaitingNode: HTMLElement | null = null;
+    // Day separators: each top-level unit (a flat item, a group by its first
+    // member, a draft by now) that starts a new local day is preceded by that
+    // day's separator — the first day included, so a reopened conversation
+    // still says when it happened. An unknown time stays in the day before
+    // it; a day that recurs (clock skew) is not labelled twice. A time later
+    // than the reader's clock is an agent clock running ahead — nothing has
+    // happened in the future — so it is read as now: a message stamped
+    // 00:01 at the reader's 23:59 belongs under "Today", not under a
+    // separator dated tomorrow. Existing labels are only rewritten when the
+    // reader's day has changed since they were written (below), not on every
+    // streaming render.
+    const renderNow = this.now();
+    const liveDays = new Set<string>();
+    let currentDay: string | undefined;
+    const place = (node: HTMLElement, reported: number | undefined) => {
+      if (reported !== undefined && knownTime(reported)) {
+        const at = Math.min(reported, renderNow);
+        const key = localDayKey(at);
+        if (key !== currentDay && !liveDays.has(key)) {
+          liveDays.add(key);
+          let day = this.dayEntries.get(key);
+          if (!day) {
+            day = { node: buildNode(renderDaySeparator(key, at, renderNow)), at };
+            this.dayEntries.set(key, day);
+            dirty.push(day.node);
+          }
+          ordered.push(day.node);
+        }
+        if (key !== currentDay) currentDay = key;
+      }
+      ordered.push(node);
+    };
     for (const segment of activitySegments(visible, projection.status, projection.acceptedDrafts.length > 0)) {
       if (!segment.group) {
         for (const item of segment.items) {
           const node = nodes.get(item.id);
-          if (node) ordered.push(node);
+          if (node) place(node, item.createdAt);
         }
         continue;
       }
@@ -231,6 +342,12 @@ export class TimelineRenderer {
         for (const item of segment.items) {
           const node = nodes.get(item.id);
           if (!node) continue;
+          if (this.shells.get(item.id)?.readerOpened && !groupNode.hasAttribute(READER_CLOSED)) {
+            groupNode.setAttribute("open", "");
+            groupNode.removeAttribute("data-auto-open");
+            groupNode.removeAttribute(READER_CLOSED);
+            expanded.add(segment.group.id);
+          }
           if (node === memberCursor) {
             memberCursor = memberCursor.nextElementSibling;
             continue;
@@ -238,19 +355,19 @@ export class TimelineRenderer {
           body.insertBefore(node, memberCursor);
         }
       }
-      ordered.push(groupNode);
+      place(groupNode, segment.items.find(item => knownTime(item.createdAt))?.createdAt);
     }
 
     for (const draft of projection.acceptedDrafts) {
       const entry = this.draftEntries.get(draft.requestId);
       if (entry && entry.draft.messageId === draft.messageId && entry.draft.text === draft.text) {
-        ordered.push(entry.node);
+        place(entry.node, renderNow);
         continue;
       }
       const node = buildNode(renderDraft(draft));
       entry?.node.remove();
       this.draftEntries.set(draft.requestId, { node, draft });
-      ordered.push(node);
+      place(node, renderNow);
       dirty.push(node);
     }
     if (awaitingNode) ordered.push(awaitingNode);
@@ -258,6 +375,10 @@ export class TimelineRenderer {
     const liveIds = new Set(projection.items.map(item => item.id));
     for (const [id, entry] of this.entries) {
       if (!liveIds.has(id)) {
+        this.shellPresentations.get(this.conversationId!)?.delete(id);
+        this.shells.get(id)?.dispose();
+        this.shells.delete(id);
+        deferredBodies.delete(entry.node);
         entry.node.remove();
         this.entries.delete(id);
       }
@@ -287,15 +408,170 @@ export class TimelineRenderer {
         this.groupEntries.delete(id);
       }
     }
+    for (const [key, day] of this.dayEntries) {
+      if (!liveDays.has(key)) {
+        day.node.remove();
+        this.dayEntries.delete(key);
+      }
+    }
+    // Labels are relative to the reader's day: rewrite them only when that
+    // day has changed since they were written (a tab that slept past
+    // midnight, before its timer ran), then keep one timer to the next
+    // midnight.
+    const today = localDayKey(renderNow);
+    if (today !== this.labelledDay) this.relabelDays(renderNow);
+    this.armDayRollover(renderNow);
+    for (const node of dirty) {
+      const shell = this.shells.get(node.dataset.chatItemId ?? "");
+      if (shell) shell.attach(node);
+    }
     return dirty;
   }
 
-  reset(): void {
+  /**
+   * "Today" becomes "Yesterday" at the reader's midnight whether or not
+   * anything arrives: one timer to the next local midnight relabels the
+   * separators in place (text only), and re-arms itself. A render leaves a
+   * timer already aimed at the coming midnight alone, so streaming does not
+   * churn it; a render on a new day relabels (above) and re-aims it.
+   */
+  private armDayRollover(now: number): void {
+    if (!this.dayEntries.size) {
+      this.clearDayRollover();
+      return;
+    }
+    const midnight = nextLocalMidnight(now);
+    if (this.dayRollover !== undefined && this.dayRolloverAt === midnight) return;
+    this.clearDayRollover();
+    this.dayRolloverAt = midnight;
+    this.dayRollover = setTimeout(() => {
+      this.dayRollover = undefined;
+      this.dayRolloverAt = undefined;
+      const at = this.now();
+      this.relabelDays(at);
+      this.armDayRollover(at);
+    }, Math.max(1_000, midnight - now + 1_000));
+  }
+
+  private clearDayRollover(): void {
+    if (this.dayRollover !== undefined) clearTimeout(this.dayRollover);
+    this.dayRollover = undefined;
+    this.dayRolloverAt = undefined;
+  }
+
+  private relabelDays(now: number): void {
+    for (const day of this.dayEntries.values()) labelDaySeparator(day.node, day.at, now);
+    this.labelledDay = localDayKey(now);
+  }
+
+  private shellVariant(node: HTMLElement, itemId: string): string {
+    return JSON.stringify([this.conversationTitle ?? this.conversationId, node.hasAttribute("open"), node.hasAttribute("data-auto-open"),
+      node.hasAttribute(READER_CLOSED), node.hasAttribute("data-chat-lazy"), this.shells.get(itemId)?.readerOpened ?? false]);
+  }
+
+  private reconcileShell(item: ConversationItem, previous: RenderedEntry | undefined, expanded: Set<string>, active: boolean, variant: string): HTMLElement {
+    const metadata = shellMetadata(item, this.conversationTitle ?? this.conversationId!)!;
+    const output = item.type === "command" || item.type === "tool" ? item.output : undefined;
+    const old = previous?.node;
+    const retained = this.shellPresentations.get(this.conversationId!)?.get(item.id);
+    const closed = old?.hasAttribute(READER_CLOSED) ?? retained?.closed ?? false;
+    const inspected = this.shells.get(item.id)?.readerOpened ?? retained?.state.readerOpened ?? false;
+    const open = (inspected && !closed) || (old ? old.hasAttribute("open") && !old.hasAttribute("data-auto-open") : retained?.open ?? expanded.has(item.id));
+    const auto = autoOpen(metadata.status, output) && !closed;
+    const label = item.type === "tool" ? describeToolDetail(item).label : "Shell";
+    const status = item.type === "tool" ? activityStatusText(item.status, item.elapsedMs) : metadata.status;
+    const template = buildNode(activityShell(escapeHtmlAttribute(item.id), metadata.status, label, metadata.command, "", open, auto, closed, timestampAttribute(item.createdAt), status));
+    const node = old ?? template;
+    if (old) {
+      if (previous && !shellMetadata(previous.item, metadata.conversation)) {
+        for (const child of Array.from(node.childNodes).slice(1)) child.remove();
+        deferredBodies.delete(node); node.removeAttribute("data-chat-lazy");
+      }
+      node.className = template.className;
+      for (const attr of ["open", "data-auto-open", READER_CLOSED]) {
+        if (template.hasAttribute(attr)) node.setAttribute(attr, ""); else node.removeAttribute(attr);
+      }
+      const summary = node.querySelector("summary")!;
+      if (summary.innerHTML !== template.querySelector("summary")!.innerHTML) summary.innerHTML = template.querySelector("summary")!.innerHTML;
+    }
+    this.entries.set(item.id, { node, item, active, variant });
+    const materialize = () => {
+      const current = this.entries.get(item.id);
+      if (!current || current.node !== node) return;
+      let shell = this.shells.get(item.id);
+      if (!shell) {
+        shell = new ShellOutputController(this.conversationId!, item.id, shellMetadata(current.item, this.conversationTitle ?? this.conversationId!)!, {
+          beforeMutation: () => this.shellMutationHooks.beforeMutation?.(),
+          afterMutation: () => this.shellMutationHooks.afterMutation?.(),
+          inspected: preserveClosed => {
+            let ancestor: HTMLElement | null = node;
+            while (ancestor) {
+              if (ancestor.matches("details.chat-activity, details.chat-activity-group") && !(preserveClosed && ancestor.hasAttribute(READER_CLOSED))) {
+                ancestor.setAttribute("open", ""); ancestor.removeAttribute("data-auto-open"); ancestor.removeAttribute(READER_CLOSED);
+                const id = ancestor.dataset.chatItemId; if (id) expanded.add(id);
+              }
+              ancestor = ancestor.parentElement;
+            }
+            this.shellMutationHooks.inspected?.();
+          },
+        });
+        this.shells.set(item.id, shell);
+        if (this.shellsHidden) shell.setHidden(true);
+        if (retained) shell.restorePresentation(retained.state);
+        shell.attach(node);
+      }
+      node.removeAttribute("data-chat-lazy"); deferredBodies.delete(node);
+      const value = current.item;
+      shell.update(value.type === "command" || value.type === "tool" ? value.output : undefined, shellMetadata(value, this.conversationTitle ?? this.conversationId!)!, value.type === "tool" ? value.error : undefined);
+    };
+    if (this.shells.has(item.id) || !this.deferClosedActivity || open || auto) materialize();
+    else {
+      node.setAttribute("data-chat-lazy", ""); deferredBodies.set(node, materialize);
+      if (!old) node.addEventListener("toggle", () => { if (node.hasAttribute("open")) deferredBodies.get(node)?.(); });
+    }
+    return node;
+  }
+
+  /** true detaches for navigation/loading; the default explicitly evicts state. */
+  reset(retainShellPresentation = false): void {
+    if (retainShellPresentation && this.conversationId) {
+      let retained = this.shellPresentations.get(this.conversationId);
+      if (!retained) this.shellPresentations.set(this.conversationId, retained = new Map());
+      for (const [id, shell] of this.shells) {
+        const node = this.entries.get(id)?.node;
+        retained.set(id, { state: shell.presentation(), open: !!node?.hasAttribute("open") && !node.hasAttribute("data-auto-open"), closed: !!node?.hasAttribute(READER_CLOSED) });
+      }
+    } else if (!retainShellPresentation) this.shellPresentations.clear();
+    for (const shell of this.shells.values()) shell.dispose();
+    this.shells.clear();
+    for (const entry of this.entries.values()) deferredBodies.delete(entry.node);
     this.entries.clear();
     this.draftEntries.clear();
     this.groupEntries.clear();
+    this.dayEntries.clear();
+    this.clearDayRollover();
+    this.labelledDay = undefined;
+    // A confirmation left open belongs to the conversation that was showing;
+    // the next one starts every card at its pending choices, and a request
+    // id reused elsewhere must not inherit the stage.
+    this.confirming.clear();
+    this.focusAfterPaint = undefined;
     this.conversationId = null;
   }
+}
+
+function shellMetadata(item: ConversationItem, conversation: string): ShellOutputMetadata | null {
+  const detail = item.type === "tool" ? describeToolDetail(item) : undefined;
+  if (item.type !== "command" && detail?.kind !== "bash") return null;
+  if (item.type !== "command" && item.type !== "tool") return null;
+  const completedAt = item.completedAt;
+  return {
+    command: item.type === "command" ? item.command : detail!.kind === "bash" ? detail.command : "",
+    conversation, status: item.status,
+    ...(detail?.kind === "bash" ? { description: [detail.description, detail.background ? "started in the background" : ""].filter(Boolean).join(" · ") } : {}),
+    ...(item.type === "command" && item.exitCode !== undefined ? { exitCode: item.exitCode } : {}),
+    ...(completedAt === undefined ? {} : { completedAt }),
+  };
 }
 
 /**
@@ -342,31 +618,129 @@ export type SubagentEntry = {
   conversationId?: string;
   model?: string;
   usage?: TokenUsage;
+  // The agent's latest progress note for a still-running subagent, from the
+  // background task that runs it. Absent once settled, or where the agent
+  // reports none.
+  progress?: string;
+  // A skill Claude Code ran as a fork of itself rather than a subagent
+  // launch (design D10). It belongs in the same track — it is a run of its
+  // own with a transcript of its own — but it is named by the skill it runs,
+  // not by a subagent type and a task description, so the label says so.
+  kind?: "fork";
 };
 
 export function subagentLabel(entry: SubagentEntry): string {
+  if (entry.kind === "fork") return `Skill · ${entry.description}`;
   return entry.subagent ? `${entry.subagent} · ${entry.description}` : entry.description;
+}
+
+/**
+ * What a fork is doing right now, read off one of its tool rows in the
+ * parent timeline: the tool and what it is working on ("Bash · git diff
+ * HEAD"). The same two facts the row itself leads with.
+ */
+function toolActivityNote(detail: ToolDetail): string {
+  const subject = toolSubject(detail);
+  return subject ? `${detail.label} · ${subject}` : detail.label;
 }
 
 /**
  * Subagents launched in this conversation, in the order they started. Unlike
  * todos, each `task` call is its own agent rather than a snapshot of one list,
  * so every item counts — a fan-out of three is three entries.
+ *
+ * A skill Claude Code ran as a fork of itself counts too, from the moment it
+ * starts. A current CLI names the fork at its start edge, so its Skill row is
+ * openable from then on (design D13); an older one names it only when it
+ * ends (design D10), and without an entry here the track — and the reader —
+ * would have nothing at all to say about a run that may go on for minutes. A
+ * skill that settles without ever naming a child was no fork but an ordinary
+ * skill load, a moment's work, and leaves no entry behind.
+ *
+ * The run a typed command launches has no launching row at all; its own
+ * foreground task row is its entry.
  */
 export function subagentEntries(items: readonly ConversationItem[]): SubagentEntry[] {
-  const entries: SubagentEntry[] = [];
+  // The running task behind each launching row, by the tool use that launched
+  // it. The task item knows the child from its start edge — the launching row
+  // only learns it from the tool result, at the end — so while the run is
+  // going, the task is what makes the row openable and names its progress.
+  const runningTasks = new Map<string, Extract<ConversationItem, { type: "background_task" }>>();
   for (const item of items) {
+    if (item.type === "background_task" && item.status === "running" && item.toolUseId) runningTasks.set(`tool:${item.toolUseId}`, item);
+  }
+  const entries: SubagentEntry[] = [];
+  // The fork currently running, if any, and when its launching row was
+  // created. Nothing in a tool item says which run produced it, so the
+  // attribution is positional: while a Skill row is running the turn is
+  // blocked on that tool call, and the only frames that can arrive are the
+  // fork's own (a tool the parent started alongside the skill shares the
+  // launching frame's timestamp, which is why the note takes rows created
+  // strictly later). Two forks running at once are indistinguishable this
+  // way — the later one takes the note — which is the price of a signal
+  // that is otherwise not reported at all. A fork named at its start routes
+  // its rows into its own transcript instead (design D13), so it leaves the
+  // parent nothing to take a note from: its activity is in the transcript.
+  let fork: { entry: SubagentEntry; createdAt: number } | undefined;
+  for (const item of items) {
+    // A run with no launching row of its own — the review a typed command
+    // launches (design D13) — is listed from its own row, named by the
+    // command, and openable from the moment Claude Code names it. There is
+    // no tool row to merge it with, and it is no subagent type's launch.
+    if (item.type === "background_task" && item.foreground === true) {
+      entries.push({
+        id: item.id,
+        description: item.description,
+        status: item.status,
+        ...(item.childConversationId === undefined ? {} : { conversationId: item.childConversationId }),
+        ...(item.status === "running" && item.progress !== undefined ? { progress: item.progress } : {}),
+      });
+      continue;
+    }
     if (item.type !== "tool") continue;
     const detail = describeToolDetail(item);
-    if (detail.kind !== "agent") continue;
+    if (detail.kind === "skill") {
+      const running = item.status === "running" || item.status === "pending";
+      fork = undefined;
+      // Running, or ended having named its child: either is a fork the
+      // reader may want to follow. A settled skill with no child named
+      // nothing and ran nothing — it stays out rather than lingering as a
+      // finished run that never was.
+      if (!running && detail.conversationId === undefined) continue;
+      const entry: SubagentEntry = {
+        id: item.id,
+        description: detail.name,
+        status: item.status,
+        kind: "fork",
+        ...(detail.conversationId === undefined ? {} : { conversationId: detail.conversationId }),
+      };
+      entries.push(entry);
+      if (running) fork = { entry, createdAt: item.createdAt };
+      continue;
+    }
+    if (detail.kind !== "agent") {
+      if (fork && item.createdAt > fork.createdAt) fork.entry.progress = toolActivityNote(detail);
+      continue;
+    }
+    const task = runningTasks.get(item.id);
+    const conversationId = detail.conversationId ?? task?.childConversationId;
+    // A live task outranks the launching row's own status. A backgrounded
+    // Agent's tool result arrives at LAUNCH (`status: "async_launched"`), so
+    // the row completes while the agent is still working — read literally it
+    // would announce a running subagent as finished. The task row is the one
+    // that knows the run is still going, so while it runs the entry reads as
+    // running and carries the agent's latest progress note. A settled task,
+    // or none at all, leaves the row to speak for itself.
+    const progress = task?.progress;
     entries.push({
       id: item.id,
       description: detail.description,
       ...(detail.subagent === undefined ? {} : { subagent: detail.subagent }),
-      status: item.status,
-      ...(detail.conversationId === undefined ? {} : { conversationId: detail.conversationId }),
+      status: task ? "running" : item.status,
+      ...(conversationId === undefined ? {} : { conversationId }),
       ...(item.model === undefined ? {} : { model: item.model }),
       ...(item.usage === undefined ? {} : { usage: item.usage }),
+      ...(progress === undefined ? {} : { progress }),
     });
   }
   return entries;
@@ -390,10 +764,21 @@ type TimelineSegment = {
 
 const GROUP_MIN = 3;
 
-type ActivityItem = Extract<ConversationItem, { type: "tool" | "command" | "reasoning" | "background_task" }>;
+type ActivityItem = Extract<ConversationItem, { type: "tool" | "command" | "reasoning" | "background_task" | "file_change" }>;
 
 function isActivity(item: ConversationItem): item is ActivityItem {
-  return item.type === "tool" || item.type === "command" || item.type === "reasoning" || item.type === "background_task";
+  return item.type === "tool" || item.type === "command" || item.type === "reasoning" || item.type === "background_task" || item.type === "file_change";
+}
+
+/**
+ * A member's lifecycle state, where it has one. A file-change row reports
+ * what a step did to a file; it is not a step, so it has no state — it never
+ * runs, never fails, and never holds a run back from folding. OpenCode
+ * reports one per touched path on nearly every message, so a run split by
+ * them would never reach GROUP_MIN.
+ */
+function stepStatus(item: ActivityItem): Exclude<ActivityItem, { type: "file_change" }>["status"] | undefined {
+  return item.type === "file_change" ? undefined : item.status;
 }
 
 /**
@@ -414,7 +799,7 @@ export function awaitingFirstResponse(items: readonly ConversationItem[], status
     // A previous turn's footer, a hidden usage carrier, a context report,
     // and a compaction marker say nothing about THIS turn's response; keep
     // looking past them.
-    if (item.type === "turn_status" || item.type === "context_report" || item.type === "compaction") continue;
+    if (item.type === "turn_status" || item.type === "context_report" || item.type === "context_window" || item.type === "compaction") continue;
     if (item.type === "assistant_message" && item.markdown === "") continue;
     return false;
   }
@@ -423,9 +808,9 @@ export function awaitingFirstResponse(items: readonly ConversationItem[], status
 
 /**
  * Splits the timeline into flat items and groupable runs. A run of
- * consecutive activity rows (tool, command, reasoning, background task)
- * collapses behind one group line when it is long enough and every member
- * has finished. The trailing run of a still-running turn collapses from its
+ * consecutive activity rows (tool, command, reasoning, background task,
+ * file change) collapses behind one group line when it is long enough and
+ * every member has finished. The trailing run of a still-running turn collapses from its
  * very first member instead: that is the work happening now, and one line
  * saying so — opened on demand — keeps the timeline calm while it does.
  * Letting the first steps render flat and then fold at three would be the
@@ -444,7 +829,7 @@ function activitySegments(items: readonly ConversationItem[], status: Conversati
   let run: ActivityItem[] = [];
   const flushRun = (isTail: boolean) => {
     if (run.length === 0) return;
-    const finished = run.every(item => item.status !== "running" && item.status !== "pending");
+    const finished = run.every(item => stepStatus(item) !== "running" && stepStatus(item) !== "pending");
     const live = isTail && !acceptedDrafts && isLiveConversationStatus(status);
     segments.push(live || (run.length >= GROUP_MIN && finished)
       ? { group: describeGroup(run, live), items: run }
@@ -471,7 +856,7 @@ function activitySegments(items: readonly ConversationItem[], status: Conversati
 }
 
 function describeGroup(run: readonly ActivityItem[], live: boolean): TimelineGroup {
-  const failed = run.filter(item => item.status === "failed").length;
+  const failed = run.filter(item => stepStatus(item) === "failed").length;
   return {
     id: `group:${run[0]!.id}`,
     live,
@@ -493,12 +878,17 @@ function failedLabel(failed: number): string {
 
 /**
  * The step in flight, for the working line: the last member still running or
- * pending, else the last member (between steps, the line names what just
- * happened rather than going blank). Not the rolling summary — "Fetch … ·
- * WebSearch ×3" reads as a ledger, and a status line should read as a status.
+ * pending, else the last step (between steps, the line names what just
+ * happened rather than going blank). A file-change row is passed over for
+ * that: "Updated foo.ts" on a live line reads as a step in flight, and it is
+ * the result of the Edit before it. Only a tail of nothing but file rows
+ * names one. Not the rolling summary — "Fetch … · WebSearch ×3" reads as a
+ * ledger, and a status line should read as a status.
  */
 function currentStep(run: readonly ActivityItem[]): string {
-  const step = run.findLast(item => item.status === "running" || item.status === "pending") ?? run[run.length - 1]!;
+  const step = run.findLast(item => stepStatus(item) === "running" || stepStatus(item) === "pending")
+    ?? run.findLast(item => item.type !== "file_change")
+    ?? run[run.length - 1]!;
   const { label, subject } = stepName(step);
   return subject ? `${label} ${workspaceRelative(subject)}` : label;
 }
@@ -534,14 +924,18 @@ function renderGroup(id: string, awaiting: boolean, open: boolean): string {
  * How a step is named on a group line: its kind, and what it acted on where
  * the agent said. Grouped reasoning stays "Thought" without a duration — the
  * line counts kinds of steps, and per-entry timings belong on the entries.
+ * A file change is named by what happened to the file: "Updated foo.ts".
  */
 function stepName(item: ActivityItem): { label: string; subject: string | undefined } {
+  if (item.type === "file_change") return { label: FILE_CHANGE_LABELS[item.operation], subject: item.path };
   if (item.type === "command") return { label: "Shell", subject: commandSubject(item.command) };
   if (item.type === "reasoning") return { label: item.label ?? (item.status === "completed" ? "Thought" : "Thinking"), subject: undefined };
   if (item.type === "background_task") return { label: backgroundTaskLabel(item), subject: item.description };
   const detail = describeToolDetail(item);
   return { label: detail.label, subject: toolSubject(detail) };
 }
+
+const FILE_CHANGE_LABELS: Record<Extract<ConversationItem, { type: "file_change" }>["operation"], string> = { create: "Created", update: "Updated", delete: "Deleted" };
 
 // How many steps a collapsed group names before it counts the rest.
 const GROUP_NAMED = 3;
@@ -553,13 +947,16 @@ const GROUP_NAMED = 3;
  * is what makes the line legible without opening it (spec: a group still
  * names the commands it contains); counting keeps a long run to one line,
  * and reasoning steps — which act on nothing — never take a named slot.
+ * Neither does a file change: its path is the one the Edit before it already
+ * named, so a slot spent on it says the same file twice and pushes the next
+ * tool into the counted tail. File rows are counted ("Updated ×2").
  */
 function groupSummary(run: readonly ActivityItem[]): string {
   const named: string[] = [];
   const counts = new Map<string, number>();
   for (const item of run) {
     const { label, subject } = stepName(item);
-    if (subject && named.length < GROUP_NAMED) {
+    if (subject && item.type !== "file_change" && named.length < GROUP_NAMED) {
       named.push(`${label} ${workspaceRelative(subject)}`);
       continue;
     }
@@ -810,9 +1207,17 @@ export class RevertedMessagesDockRenderer {
 
 type RequestOrigin = { conversationId: string; label: string };
 
-export function renderItem(item: ConversationItem, open: boolean, activeRequest: boolean, todo?: TodoSummary, durationMs?: number, origin?: RequestOrigin, readerClosed = false, allowSubagents = true, completedAssistant = false, allowRevert = false, permissionScopeNote?: string, deferClosed = false): string {
+export function renderItem(item: ConversationItem, open: boolean, activeRequest: boolean, todo?: TodoSummary, durationMs?: number, origin?: RequestOrigin, readerClosed = false, allowSubagents = true, completedAssistant = false, allowRevert = false, permissionScopeNote?: string, deferClosed = false, confirming = false, linkedTool?: ToolItem, loginAction?: LoginAction): string {
   const id = escapeHtmlAttribute(item.id);
   const stamp = timestampAttribute(item.createdAt);
+  // A prompt a scheduled wakeup submitted opens that wakeup's turn. It is
+  // not the user's message, so it is never drawn as their bubble: a header
+  // names the wakeup and the prompt it carried, and points back at the
+  // wakeup's row when the turn is attributed to one (spec).
+  if (item.type === "user_message" && item.origin === "wakeup") {
+    const back = item.wakeupId ? ` <button type="button" class="chat-wakeup-link" data-chat-jump="${escapeHtmlAttribute(`wakeup:${item.wakeupId}`)}">Show schedule</button>` : "";
+    return `<div class="chat-item chat-wakeup-turn" data-chat-item-id="${id}"${stamp} role="note" aria-label="Wakeup turn"><div class="chat-wakeup-turn-head">${WAKEUP_ICON}<span class="chat-wakeup-turn-label">Wakeup</span>${back}</div>${item.text ? `<div class="chat-wakeup-turn-prompt">${escapeHtml(item.text)}</div>` : ""}</div>`;
+  }
   if (item.type === "user_message") {
     const action = allowRevert
       ? `<footer class="chat-message-actions"><button type="button" class="chat-message-revert" data-history-revert="${id}" aria-label="Revert message" title="Revert message"><svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><path d="M6 4 2.5 7.5 6 11M3 7.5h6a4 4 0 0 1 4 4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></button></footer>`
@@ -824,9 +1229,20 @@ export function renderItem(item: ConversationItem, open: boolean, activeRequest:
     const worked = durationMs === undefined ? "" : formatWorked(durationMs);
     return `<footer class="chat-item chat-turn-status is-${item.status}" data-chat-item-id="${id}"${stamp} role="status">${escapeHtml(statusLabel(item.status))}${item.message ? `: ${escapeHtml(item.message)}` : ""}${worked ? ` <span class="chat-turn-worked">· worked ${worked}</span>` : ""}</footer>`;
   }
+  // A turn that failed on the login: named as a login failure, the agent's
+  // own words as the detail, and the way to log in.
+  if (item.type === "notice" && item.code === LOGIN_FAILED_NOTICE_CODE) {
+    const title = loginAction ? `${loginAction.agentName} login failed` : "Login failed";
+    const action = loginAction ? `<p class="chat-login-failed-action">${loginActionMarkup(loginAction)}</p>` : "";
+    return `<aside class="chat-item chat-notice is-error chat-login-failed" data-chat-item-id="${id}"${stamp} data-notice-code="${escapeHtmlAttribute(item.code)}" role="alert"><p class="chat-login-failed-title">${escapeHtml(title)}</p><p class="chat-login-failed-detail">${escapeHtml(item.message)}</p>${action}</aside>`;
+  }
   if (item.type === "notice") {
     // A reset time is formatted here, in the reader's zone, never on the server.
-    const resets = item.resetsAt === undefined ? "" : ` Resets ${new Date(item.resetsAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}.`;
+    // Weekday and clock, never relative: the notice stays in the transcript
+    // and is not re-rendered as time passes, so "in 2h" or a bare "14:00"
+    // would be wrong the moment it is read later or replayed. The day marker
+    // above it gives the date.
+    const resets = item.resetsAt === undefined ? "" : ` Resets ${weekdayClock(item.resetsAt)}.`;
     return `<aside class="chat-item chat-notice is-${item.level}" data-chat-item-id="${id}"${stamp}${item.code ? ` data-notice-code="${escapeHtmlAttribute(item.code)}"` : ""} role="${item.level === "error" ? "alert" : "status"}">${escapeHtml(item.message + resets)}</aside>`;
   }
   // Compaction is a boundary, not a step: a quiet rule across the timeline
@@ -835,7 +1251,7 @@ export function renderItem(item: ConversationItem, open: boolean, activeRequest:
   if (item.type === "compaction") return `<div class="chat-item chat-compaction" data-chat-item-id="${id}"${stamp} role="status"><span class="chat-compaction-label">${escapeHtml(compactionLabel(item))}</span></div>`;
   // Never reached: reports are filtered before rendering. Kept exhaustive so
   // a new kind fails loudly here rather than falling into the activity shell.
-  if (item.type === "context_report") return "";
+  if (item.type === "context_report" || item.type === "context_window") return "";
   // A settled background task: its outcome and the agent's summary, in
   // place. (Running ones are filtered out above and listed by the composer.)
   if (item.type === "background_task") {
@@ -843,8 +1259,19 @@ export function renderItem(item: ConversationItem, open: boolean, activeRequest:
     const body = deferClosed && !open ? "" : `${item.summary ? `<pre class="chat-task-summary">${escapeHtml(item.summary)}</pre>` : ""}${item.toolUseId ? `<p class="chat-tool-meta">Started by the ${escapeHtml(item.taskType === "local_agent" ? "Agent" : "Bash")} step above.</p>` : ""}`;
     return activityShell(id, outcome, backgroundTaskLabel(item), item.description, body, open, false, readerClosed, stamp, item.status === "stopped" ? "stopped" : undefined);
   }
+  // A wakeup the agent scheduled for itself, drawn at every point of its
+  // life: pending with its fire time, fired with a link to the turn it
+  // started, cancelled, or lost with the reason. Pending rows show here as
+  // well as in the composer's list — the timeline is where it was set.
+  if (item.type === "scheduled_wakeup") {
+    const turn = item.status === "fired" && item.firedTurnId ? ` <button type="button" class="chat-wakeup-link" data-chat-jump="${escapeHtmlAttribute(item.firedTurnId)}">Go to its turn</button>` : "";
+    const why = item.message ? `<p class="chat-wakeup-message">${escapeHtml(item.message)}</p>` : "";
+    return `<aside class="chat-item chat-wakeup is-${item.status}" data-chat-item-id="${id}"${stamp} role="status"><div class="chat-wakeup-head">${WAKEUP_ICON}<span class="chat-wakeup-label">${escapeHtml(wakeupRowLabel(item))}</span>${turn}</div>${item.prompt ? `<div class="chat-wakeup-subject">${escapeHtml(item.prompt)}</div>` : ""}${why}</aside>`;
+  }
+  // The row says the word its group summary counts it under ("Updated"),
+  // from the same table, so the two cannot drift.
   if (item.type === "file_change") {
-    return `<article class="chat-item chat-file-change" data-chat-item-id="${id}"${stamp}><span>${escapeHtml(item.operation)}</span> <button type="button" data-file-ref="${escapeHtmlAttribute(item.path)}">${escapeHtml(item.path)}</button>${counts(item.additions, item.deletions)}</article>`;
+    return `<article class="chat-item chat-file-change" data-chat-item-id="${id}"${stamp}><span>${escapeHtml(FILE_CHANGE_LABELS[item.operation])}</span> <button type="button" data-file-ref="${escapeHtmlAttribute(item.path)}">${escapeHtml(item.path)}</button>${counts(item.additions, item.deletions)}</article>`;
   }
   if (item.type === "task_progress") {
     // One presentation, updated in place: the same item id re-renders this
@@ -856,7 +1283,7 @@ export function renderItem(item: ConversationItem, open: boolean, activeRequest:
     }).join("");
     return `<section class="chat-item chat-task-progress" data-chat-item-id="${id}"${stamp} aria-label="Task progress"><header class="chat-task-progress-header">Tasks <span class="chat-task-progress-count">${done}/${item.entries.length}</span></header><ol class="chat-task-list">${rows}</ol></section>`;
   }
-  if (item.type === "permission") return renderPermission(item, open, activeRequest, origin, allowSubagents, permissionScopeNote);
+  if (item.type === "permission") return renderPermission(item, open, activeRequest, origin, allowSubagents, permissionScopeNote, confirming, linkedTool);
   if (item.type === "question") return renderQuestion(item, open, activeRequest, origin, allowSubagents);
   if (item.type === "tool") return renderTool(item, open, readerClosed, todo, allowSubagents, deferClosed);
   // A command's text is the subject, not the label. As a label it lands in the
@@ -864,7 +1291,7 @@ export function renderItem(item: ConversationItem, open: boolean, activeRequest:
   // of truncating; "Shell" names the step and the command ellipsizes beside it.
   if (item.type === "command") {
     const auto = autoOpen(item.status, item.output) && !readerClosed;
-    return activityShell(id, item.status, "Shell", item.command, deferClosed && !open && !auto ? "" : renderActivityOutput(item.output, item.status), open, auto, readerClosed, stamp);
+    return activityShell(id, item.status, "Shell", item.command, deferClosed && !open && !auto ? "" : renderActivityOutput(item.output, item.status, true), open, auto, readerClosed, stamp);
   }
   // Reasoning has no streamed output to auto-open for; it opens only when the
   // reader says so.
@@ -930,25 +1357,38 @@ export const READER_CLOSED = "data-reader-closed";
 // carrying the whole log; once finished, a long output is bounded to a preview
 // with a native show-more that reveals the rest — from then on the full text
 // is present in the DOM.
-function renderActivityOutput(output: string | undefined, status: ActivityStatus): string {
+//
+// The text is terminal text: escape sequences are interpreted (colour, weight,
+// a progress line redrawn in place) rather than shown, for every tool —
+// anything that relays a process's output carries them. `terminal` adds the
+// terminal pane's own look, which the shell command row asks for.
+function renderActivityOutput(output: string | undefined, status: ActivityStatus, terminal = false): string {
   if (!output) return "";
+  if (terminal) return `<pre class="chat-tool-output chat-tool-terminal chat-shell-viewport">${terminalTextToHtml(output)}</pre>`;
+  const look = terminal ? " chat-tool-terminal" : "";
   if (status === "running") {
     // Search backward only as far as the visible tail. This runs for every
     // cumulative chunk, so counting every newline would make a long stream
-    // quadratic even though only twelve lines are rendered.
+    // quadratic even though only twelve lines are rendered. The cut is on
+    // the raw text, the tail is then interpreted: a redrawn progress line
+    // counts once, and a colour opened before the cut is lost to the tail —
+    // accepted while the command runs; the finished render sees it whole.
+    // A control string the cut landed inside is not: its remainder would
+    // read as text, so the tail starts after it (`tailStart`).
     let cut = output.length;
     for (let index = 0; index < OUTPUT_LINE_LIMIT; index += 1) {
       cut = output.lastIndexOf("\n", cut - 1);
-      if (cut === -1) return `<pre class="chat-tool-stream">${escapeHtml(output)}</pre>`;
+      if (cut === -1) return `<pre class="chat-tool-stream${look}">${terminalTextToHtml(output)}</pre>`;
     }
-    return `<p class="chat-output-elided">Earlier output omitted</p><pre class="chat-tool-stream">${escapeHtml(output.slice(cut + 1))}</pre>`;
+    return `<p class="chat-output-elided">Earlier output omitted</p><pre class="chat-tool-stream${look}">${terminalTextToHtml(output.slice(tailStart(output, cut + 1)))}</pre>`;
   }
-  const lines = output.split("\n");
-  if (lines.length <= OUTPUT_LINE_LIMIT) return `<pre>${escapeHtml(output)}</pre>`;
-  const preview = lines.slice(0, OUTPUT_LINE_LIMIT).join("\n");
-  const rest = lines.slice(OUTPUT_LINE_LIMIT).join("\n");
+  const block = terminal ? ' class="chat-tool-terminal"' : "";
+  const lines = renderTerminalText(output);
+  if (lines.length <= OUTPUT_LINE_LIMIT) return `<pre${block}>${terminalLinesToHtml(lines)}</pre>`;
+  const preview = terminalLinesToHtml(lines.slice(0, OUTPUT_LINE_LIMIT));
+  const rest = terminalLinesToHtml(lines.slice(OUTPUT_LINE_LIMIT));
   const more = lines.length - OUTPUT_LINE_LIMIT;
-  return `<pre>${escapeHtml(preview)}</pre><details class="chat-output-more"><summary>Show ${more} more ${more === 1 ? "line" : "lines"}</summary><pre>${escapeHtml(rest)}</pre></details>`;
+  return `<pre${block}>${preview}</pre><details class="chat-output-more"><summary>Show ${more} more ${more === 1 ? "line" : "lines"}</summary><pre${block}>${rest}</pre></details>`;
 }
 
 function renderTool(item: ToolItem, open: boolean, readerClosed: boolean, todo: TodoSummary | undefined, allowSubagents: boolean, deferClosed = false): string {
@@ -958,7 +1398,10 @@ function renderTool(item: ToolItem, open: boolean, readerClosed: boolean, todo: 
   // which task — every todowrite call carries the whole list, so showing the
   // list each time reprints it verbatim on every tool call.
   const label = detail.kind === "todo" && todo ? todo.label : detail.label;
-  const subject = detail.kind === "todo" ? todo?.task : toolSubject(detail);
+  // A subagent's row states what its child session cost, in context, once
+  // the child has reported a price; zero is an unpriced model, not free.
+  const subagentCost = detail.kind === "agent" && item.usage?.costUsd ? ` · ${formatUsd(item.usage.costUsd)}` : "";
+  const subject = detail.kind === "todo" ? todo?.task : `${toolSubject(detail) ?? ""}${subagentCost}` || undefined;
   return activityShell(escapeHtmlAttribute(item.id), item.status, label, subject, body, open, autoOpen(item.status, item.output) && !readerClosed, readerClosed, timestampAttribute(item.createdAt), activityStatusText(item.status, item.elapsedMs));
 }
 
@@ -969,7 +1412,9 @@ function chatDiffMarkup(diff: DiffLine[]): string {
 }
 
 function toolBody(detail: ToolDetail, item: ToolItem, allowSubagents: boolean): string {
-  const error = item.error ? `<pre class="chat-tool-error">${escapeHtml(item.error)}</pre>` : "";
+  // An error is a process's stderr as often as not, escapes included.
+  const errorBlock = (terminal: boolean) => (item.error ? `<pre class="chat-tool-error${terminal ? " chat-tool-terminal" : ""}">${terminalTextToHtml(item.error)}</pre>` : "");
+  const error = errorBlock(false);
   // Every branch has to surface `item.output` somehow, because the auto-open
   // rule keys on output alone: a row that opens itself to show its live tail
   // and then renders a body without it is a row that opened for nothing. The
@@ -998,19 +1443,33 @@ function toolBody(detail: ToolDetail, item: ToolItem, allowSubagents: boolean): 
       // markdown rather than dumped as the raw task envelope.
       return `<p class="chat-tool-meta">${detail.subagent ? `<code>${escapeHtml(detail.subagent)}</code> ` : ""}${escapeHtml(detail.description)}${allowSubagents && detail.conversationId ? ` <button type="button" data-open-conversation="${escapeHtmlAttribute(detail.conversationId)}">Open transcript</button>` : ""}</p><pre>${escapeHtml(detail.prompt)}</pre>${detail.result ? renderSubagentResult(detail.result) : ""}${error}`;
     case "skill":
-      return `${outputBlock(item)}${error}`;
+      // A skill Claude Code ran as a fork is a conversation of its own. The
+      // subagents track lists the fork too (as a fork entry, beside the agent
+      // launches), so this row is one of two ways into its transcript — the
+      // one that sits where the skill ran.
+      return `${allowSubagents && detail.conversationId ? `<p class="chat-tool-meta"><button type="button" data-open-conversation="${escapeHtmlAttribute(detail.conversationId)}">Open transcript</button></p>` : ""}${outputBlock(item)}${error}`;
     case "bash":
       // The command in full (the summary showed its first line), what the
       // agent said it was for, then the bounded output.
-      return `<pre class="chat-tool-command">${escapeHtml(detail.command)}</pre>${detail.description || detail.background ? `<p class="chat-tool-meta">${detail.description ? escapeHtml(detail.description) : ""}${detail.background ? `${detail.description ? " · " : ""}<span class="chat-tool-background">started in the background</span>` : ""}</p>` : ""}${outputBlock(item)}${error}`;
+      return `<pre class="chat-tool-command">${escapeHtml(detail.command)}</pre>${detail.description || detail.background ? `<p class="chat-tool-meta">${detail.description ? escapeHtml(detail.description) : ""}${detail.background ? `${detail.description ? " · " : ""}<span class="chat-tool-background">started in the background</span>` : ""}</p>` : ""}${outputBlock(item, true)}${errorBlock(true)}`;
+    case "schedule": {
+      // The prompt the agent will be woken with, then what kind of schedule
+      // it is, in words; the CLI's own confirmation follows as output.
+      const kind = detail.action === "create"
+        ? `${detail.recurring ? "Repeats" : "Runs once"}${detail.cron ? ` on <code>${escapeHtml(detail.cron)}</code>` : ""}`
+        : detail.action === "wakeup" && detail.reason ? escapeHtml(detail.reason)
+          : detail.action === "end-loop" ? "Ends the self-paced loop: no further wakeups."
+            : "";
+      return `${detail.prompt ? `<pre class="chat-tool-command">${escapeHtml(detail.prompt)}</pre>` : ""}${kind ? `<p class="chat-tool-meta">${kind}</p>` : ""}${outputBlock(item)}${error}`;
+    }
     default:
       // An unknown tool: show its input, then bound its output like any other.
       return `${item.input ? `<pre>${escapeHtml(item.input)}</pre>` : ""}${outputBlock(item)}${error}`;
   }
 }
 
-function outputBlock(item: ToolItem): string {
-  return renderActivityOutput(item.output, item.status);
+function outputBlock(item: ToolItem, terminal = false): string {
+  return renderActivityOutput(item.output, item.status, terminal);
 }
 
 // Task output is prose rather than a raw log, but it obeys the same finished
@@ -1101,7 +1560,7 @@ function requestOrigin(origin: RequestOrigin | undefined, allowSubagents: boolea
   return `<p class="chat-request-origin">Requested by ${escapeHtml(origin.label)}. <button type="button" data-open-conversation="${escapeHtmlAttribute(origin.conversationId)}">Open transcript</button></p>`;
 }
 
-function renderPermission(item: Extract<ConversationItem, { type: "permission" }>, open: boolean, active: boolean, origin?: RequestOrigin, allowSubagents = true, permissionScopeNote?: string): string {
+function renderPermission(item: Extract<ConversationItem, { type: "permission" }>, open: boolean, active: boolean, origin?: RequestOrigin, allowSubagents = true, permissionScopeNote?: string, confirming = false, linkedTool?: ToolItem): string {
   const pending = item.status === "pending";
   // `approved-session` is the transported value and stays; "Allow always" is
   // the human-facing text, because under every agent that offers it the
@@ -1118,12 +1577,13 @@ function renderPermission(item: Extract<ConversationItem, { type: "permission" }
   // Agent-provided approval intents replace the generic pair: each choice is
   // one approve button carrying its id, and Reject stays universal. The
   // always/session scope note applies only to the generic pair.
-  const scope = permissionScopeNote ? `<p class="chat-request-scope">${escapeHtml(permissionScopeNote)}</p>` : "";
-  const actions = item.choices?.length
-    ? `<div class="chat-request-actions">${item.choices.map(choice => `<button type="button" data-permission-choice="${escapeHtmlAttribute(choice.id)}"${choice.description ? ` title="${escapeHtmlAttribute(choice.description)}"` : ""}>${escapeHtml(choice.label)}</button>`).join("")}<button type="button" data-permission-outcome="rejected">Reject</button></div>`
-    : `<div class="chat-request-actions"><button type="button" data-permission-outcome="approved-once">Allow once</button><button type="button" data-permission-outcome="approved-session">Allow always</button><button type="button" data-permission-outcome="rejected">Reject</button></div>${scope}`;
+  // "Allow always" does not reply: it opens the confirmation stage, which
+  // shows the rule the agent will actually install, its own patterns
+  // apart from the resources above, and the lifetime sentence, then asks
+  // again. Only Confirm sends the persistent reply. A card with agent
+  // intents has no generic pair and so no stage.
   const body = pending && active
-    ? actions
+    ? renderPermissionActions(item, permissionScopeNote, confirming)
     : pending ? `<p class="chat-request-outcome">Waiting its turn — answer the newest request first.</p>` : "";
   const state = requestState(item.status, active);
   const summaryTrace = state === "resolved" ? ` <span class="chat-request-trace">${escapeHtml(permissionOutcomeLabel(item.outcome, item))}</span>` : requestBadge(state);
@@ -1133,7 +1593,141 @@ function renderPermission(item: Extract<ConversationItem, { type: "permission" }
   // The plan the approval would put into effect, rendered while the request
   // is open — the user approves what they can read, not a summary line.
   const planPreview = pending && item.plan ? `<div class="chat-request-plan">${renderChatMarkdown(item.plan)}</div>` : "";
-  return `<details class="chat-item chat-request" data-chat-item-id="${escapeHtmlAttribute(item.id)}"${requestAttributes(state)}${timestampAttribute(item.createdAt)}${open || pending ? " open" : ""}><summary>Permission: ${escapeHtml(item.action)}${summaryTrace}</summary>${requestOrigin(origin, allowSubagents)}<ul>${item.resources.map(resource => `<li><code>${escapeHtml(resource)}</code></li>`).join("")}</ul>${planPreview}${changePreview}${body}</details>`;
+  // A request that names no resource of its own (OpenCode's ask for an MCP
+  // tool carries the tool's name and a `*`) shows the arguments of the call
+  // it would allow instead, read from the tool row it belongs to. Only while
+  // open, like the diff: once answered the call is on its own row. Without a
+  // row to read, the card is exactly what OpenCode sent.
+  const callArguments = pending && linkedTool ? permissionCallArguments(linkedTool.input) : undefined;
+  const argumentsPreview = callArguments
+    ? `<p class="chat-tool-meta chat-request-arguments-lead">Would run with these arguments</p><pre class="chat-request-arguments">${escapeHtml(callArguments)}</pre>`
+    : "";
+  const resources = callArguments ? [] : item.resources;
+  return `<details class="chat-item chat-request" data-chat-item-id="${escapeHtmlAttribute(item.id)}"${requestAttributes(state)}${timestampAttribute(item.createdAt)}${open || pending ? " open" : ""}><summary>Permission: ${escapeHtml(permissionTitle(item))}${summaryTrace}</summary>${requestOrigin(origin, allowSubagents)}<ul>${resources.map(resource => `<li><code>${escapeHtml(resource)}</code></li>`).join("")}</ul>${argumentsPreview}${planPreview}${changePreview}${body}</details>`;
+}
+
+/**
+ * What the summary calls the request: an MCP tool by its server and tool,
+ * as the owning agent resolved them (`MCP github › create_issue`), else the
+ * action as sent. The Allow-always confirmation keeps the raw action in
+ * both cases, since that string is the rule the agent installs.
+ */
+export function permissionTitle(item: Pick<Extract<ConversationItem, { type: "permission" }>, "action" | "mcp">): string {
+  return item.mcp ? `MCP ${item.mcp.server} › ${item.mcp.tool}` : item.action;
+}
+
+/**
+ * Whether a permission says nothing specific about what it would allow: no
+ * resource, or only wildcards, and neither a diff nor a plan to show. Such
+ * a request is what OpenCode raises for an MCP tool call, and its card has
+ * nothing to show unless it reads the call itself.
+ */
+export function isWildcardPermission(item: Pick<Extract<ConversationItem, { type: "permission" }>, "resources" | "diff" | "plan">): boolean {
+  return item.diff === undefined && item.plan === undefined && item.resources.every(resource => resource.trim() === "*");
+}
+
+type ToolRowIndex = { byId: Map<string, ToolItem>; openByName: Map<string, ToolItem> };
+
+/**
+ * The conversation's tool rows, by id, and the newest row per tool name
+ * that has not yet finished, for the fallback when a request does not name
+ * its call. OpenCode asks at execution, so the row asking is the one still
+ * running under the request's action name.
+ */
+export function toolRowIndex(items: readonly ConversationItem[]): ToolRowIndex {
+  const byId = new Map<string, ToolItem>();
+  const openByName = new Map<string, ToolItem>();
+  for (const item of items) {
+    if (item.type !== "tool") continue;
+    byId.set(item.id, item);
+    if (item.status === "pending" || item.status === "running") openByName.set(item.name, item);
+  }
+  return { byId, openByName };
+}
+
+/**
+ * The tool row a wildcard permission would read its arguments from: the row
+ * the agent named (2.x `source`, the 1.x classic `tool.callID`), else the
+ * open row under the request's action name. A request that names specific
+ * resources, a diff, or a plan reads nothing; it already shows what it
+ * would allow. A named row that is not in the conversation yet yields
+ * nothing rather than a guess by name.
+ */
+export function linkedToolRow(item: Extract<ConversationItem, { type: "permission" }>, index: ToolRowIndex): ToolItem | undefined {
+  if (item.status !== "pending" || !isWildcardPermission(item)) return undefined;
+  if (item.sourceToolId !== undefined) return index.byId.get(item.sourceToolId);
+  return index.openByName.get(item.action);
+}
+
+/**
+ * A tool row's input as the lines a permission card shows: one `key: value`
+ * per argument, a multi-line string value (code-mode's `code`) on lines of
+ * its own so the call reads as it was written. Input that is not a JSON
+ * object is shown as it is. Nothing is summarized or reordered.
+ */
+export function permissionCallArguments(input: string | undefined): string | undefined {
+  if (input === undefined || input.trim() === "") return undefined;
+  let parsed: unknown;
+  try { parsed = JSON.parse(input); } catch { return input; }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return input;
+  const entries = Object.entries(parsed as Record<string, unknown>);
+  if (entries.length === 0) return "(no arguments)";
+  return entries.map(([key, value]) => {
+    if (typeof value === "string" && value.includes("\n")) return `${key}:\n${value}`;
+    return `${key}: ${typeof value === "string" ? value : JSON.stringify(value)}`;
+  }).join("\n");
+}
+
+// The three shapes a pending card's choices take. Agent intents replace the
+// generic pair and carry no scope sentence (each intent says what it does);
+// the confirmation stage carries the sentence beside the pattern list; the
+// generic pair carries it underneath.
+function renderPermissionActions(item: Extract<ConversationItem, { type: "permission" }>, permissionScopeNote: string | undefined, confirming: boolean): string {
+  const scope = permissionScopeNote ? `<p class="chat-request-scope">${escapeHtml(permissionScopeNote)}</p>` : "";
+  if (item.choices?.length) {
+    return `<div class="chat-request-actions">${item.choices.map(choice => `<button type="button" data-permission-choice="${escapeHtmlAttribute(choice.id)}"${choice.description ? ` title="${escapeHtmlAttribute(choice.description)}"` : ""}>${escapeHtml(choice.label)}</button>`).join("")}<button type="button" data-permission-outcome="rejected">Reject</button></div>`;
+  }
+  if (confirming) return renderAlwaysConfirmation(item, scope);
+  return `<div class="chat-request-actions"><button type="button" data-permission-outcome="approved-once">Allow once</button><button type="button" data-permission-outcome="approved-session">Allow always</button><button type="button" data-permission-outcome="rejected">Reject</button></div>${scope}`;
+}
+
+// The confirmation stage. What it lists is the agent's own future-approval
+// scope, verbatim: a `git status --short` request whose agent installs
+// `git status *` shows `git status *`, and nothing here shortens the command
+// to guess at it. The lead line calls the entries standing permissions, not
+// match patterns, because under Claude Code an entry can be a mode switch
+// or a withdrawn directory as well as a rule. A sole wildcard is the whole
+// permission, said so; no pattern at all is said plainly rather than
+// implied to be the command.
+// The action is named on the title line, not woven into the sentence: under
+// OpenCode it is a category noun ("bash") but under Claude Code it is a
+// whole title ("Claude wants to edit hello.sh"), and only a label slot reads
+// well for both.
+// With nothing reusable to install, the reply is worth exactly one request,
+// so the lifetime sentence (which describes a standing rule) is left out
+// rather than contradicting the line above it. Under Claude Code this is the
+// common case: most "don't ask again" suggestions are bound for a settings
+// file and are never forwarded.
+function renderAlwaysConfirmation(item: Extract<ConversationItem, { type: "permission" }>, scope: string): string {
+  const patterns = item.alwaysPatterns;
+  // Absent is not empty: the agent did not say what a standing approval
+  // covers (an item from before this field, a provider that does not speak
+  // to it), so the reply may well install something. Say that, and keep the
+  // lifetime sentence, rather than promise "only this request".
+  if (patterns === undefined) {
+    return confirmationShell(item, `<p class="chat-request-confirm-lead">The agent did not report which patterns this would allow.</p>${scope}`);
+  }
+  if (patterns.length === 0) {
+    return confirmationShell(item, `<p class="chat-request-confirm-lead">The agent reported no reusable pattern. Confirming allows only this request.</p>`);
+  }
+  const body = patterns.length === 1 && patterns[0] === "*"
+    ? `<p class="chat-request-confirm-lead">Confirming allows <em>every</em> request under this permission, not only this one.</p>`
+    : `<p class="chat-request-confirm-lead">Confirming allows this request and installs these standing permissions:</p><ul class="chat-request-always">${patterns.map(pattern => `<li><code>${escapeHtml(pattern)}</code></li>`).join("")}</ul>`;
+  return confirmationShell(item, `${body}${scope}`);
+}
+
+function confirmationShell(item: Extract<ConversationItem, { type: "permission" }>, body: string): string {
+  return `<div class="chat-request-confirm" data-permission-confirming><p class="chat-request-confirm-title">Allow always? <strong class="chat-request-confirm-action">${escapeHtml(item.action)}</strong></p>${body}<div class="chat-request-actions"><button type="button" data-permission-confirm>Confirm</button><button type="button" data-permission-cancel>Cancel</button></div></div>`;
 }
 
 // The receded form's label — what was decided, in words, since the summary no
@@ -1246,15 +1840,44 @@ export function compactionLabel(item: Extract<ConversationItem, { type: "compact
   return figures ? `${trigger} · ${figures}` : trigger;
 }
 
+// A clock, drawn rather than a glyph: the text clock renders a few pixels
+// tall in most UI fonts. Decoration — the label beside it says the words.
+const WAKEUP_ICON = `<svg class="chat-wakeup-icon" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><circle cx="8" cy="8" r="6.25" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M8 4.75V8l2.25 1.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+
 export function statusLabel(status: ConversationStatus): string {
-  return ({ idle: "Ready", sending: "Sending", running: "Working", completed: "Completed", interrupted: "Cancelled", failed: "Failed", background: "Background work running", retrying: "Retrying", compacting: "Compacting context" })[status];
+  return ({ idle: "Ready", sending: "Sending", running: "Working", completed: "Completed", interrupted: "Cancelled", failed: "Failed", background: "Background work running", retrying: "Retrying", compacting: "Compacting context", scheduled: "Wakeup scheduled" })[status];
 }
 
 function counts(additions?: number, deletions?: number): string {
   return additions === undefined && deletions === undefined ? "" : ` <span class="chat-change-counts">+${additions ?? 0} -${deletions ?? 0}</span>`;
 }
 
+// The locale's long date, which reads better aloud than the ISO label;
+// "Today, Friday 25 September" keeps the relative word as well.
+function daySeparatorAriaLabel(at: number, now: number): string {
+  const days = localDaysBetween(at, now);
+  const full = fullDate(at, now);
+  return days === 0 || days === 1 ? `${dayLabel(at, now)}, ${full}` : full;
+}
+
+// Not an item: no data-chat-item-id, so anchoring, item actions, copy, and
+// find-reveal pass over it. Not searchable either (data-find-skip): ⌘F finds
+// what was said, and "Today" relabelling to "Yesterday" at midnight must not
+// shift the match count under an open find bar. Sticky in the scroller (styles), so the day being
+// read stays named while scrolling back through it.
+function renderDaySeparator(key: string, at: number, now: number): string {
+  return `<div class="chat-day-separator" data-find-skip data-chat-day="${escapeHtmlAttribute(key)}" role="separator" aria-label="${escapeHtmlAttribute(daySeparatorAriaLabel(at, now))}"><time datetime="${escapeHtmlAttribute(key)}">${escapeHtml(dayLabel(at, now))}</time></div>`;
+}
+
+function labelDaySeparator(node: HTMLElement, at: number, now: number): void {
+  const label = dayLabel(at, now);
+  const time = node.querySelector("time");
+  if (time && time.textContent !== label) time.textContent = label;
+  const aria = daySeparatorAriaLabel(at, now);
+  if (node.getAttribute("aria-label") !== aria) node.setAttribute("aria-label", aria);
+}
+
 function timestampAttribute(createdAt: number): string {
   if (!createdAt) return "";
-  return ` title="${escapeHtmlAttribute(new Date(createdAt).toLocaleString())}"`;
+  return ` title="${escapeHtmlAttribute(dateTime(createdAt))}"`;
 }

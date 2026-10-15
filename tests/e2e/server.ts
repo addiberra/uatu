@@ -6,7 +6,7 @@ import path from "node:path";
 
 import { MultiAgentChatService } from "../../src/chat/agents";
 import { CLAUDE_PERMISSION_SCOPE_NOTE } from "../../src/chat/claude/provider";
-import { OPENCODE_PERMISSION_SCOPE_NOTE } from "../../src/chat/opencode/sdk-v2-provider";
+import { OPENCODE_PERMISSION_SCOPE_NOTE } from "../../src/chat/opencode/v1/provider";
 import mermaidAsset from "mermaid/dist/mermaid.min.js" with { type: "file" };
 import logoAsset from "../../src/assets/uatu-logo.svg" with { type: "file" };
 import icon192Asset from "../../src/assets/icon-192.png" with { type: "file" };
@@ -18,7 +18,7 @@ import nerdFontsLicenseAsset from "../../src/assets/fonts/LICENSE-nerdfonts.txt"
 import fontNoticesAsset from "../../src/assets/fonts/NOTICES.md" with { type: "file" };
 
 import index from "../../src/index.html";
-import { e2ePort, resetE2EWorkspace, workspaceRoot } from "./config";
+import { e2ePort, promoteRootReadme, resetE2EWorkspace, workspaceRoot } from "./config";
 
 // Per-process workspace root. Captured once at startup from the lazy
 // workspaceRoot() helper (which reads process.env.UATU_E2E_WORKSPACE if
@@ -26,10 +26,21 @@ import { e2ePort, resetE2EWorkspace, workspaceRoot } from "./config";
 // distinct value via env so each worker's server lives in its own dir.
 const E2E_WORKSPACE_ROOT = workspaceRoot();
 const E2E_PORT = e2ePort();
+// The harness serves at "/" for the worker fixture (tests/e2e/fixtures.ts).
+// As a hub child (tests/e2e/hub-server.ts) it serves under the hub-shaped
+// prefix the hub assigned — `/s/<id>/` — relocating its routes and the SPA
+// shell exactly as `uatu serve --base-path` does, and it does NOT mount the
+// brokered live stream: that is the hub's, and the hub subscribes to this
+// process's child routes through it. Unset, nothing below changes.
+const E2E_BASE_PATH = normalizeBasePath(process.env.UATU_E2E_BASE_PATH ?? "/");
+const E2E_HUB_CHILD = E2E_BASE_PATH !== "/";
 import { safeGit } from "../../src/document/git-base-ref";
+import { normalizeBasePath, stripBasePath } from "../../src/shared/base-path";
 import { createNavigationFetchHandler, INTERNAL_SHELL_PATH, spaShellResponse } from "../../src/server/navigation";
 import { resolveWatchRoots, type WatchEntry } from "../../src/server/roots";
 import { createWatchSession } from "../../src/server/watch-session";
+import { classifyFile } from "../../src/document/classify";
+import { collectRepositorySnapshots } from "../../src/document/git-data";
 import {
   buildFetchFallback,
   buildRoutes,
@@ -37,23 +48,47 @@ import {
 } from "../../src/server/routes";
 import { terminalBackendAvailable } from "../../src/terminal/backend";
 import { createTerminalServer } from "../../src/terminal/server";
-import { FakeE2EChatService, type ReversibleFileFixture } from "./chat-service";
-import type { ChatCapability, ChatModel, ConversationConfiguration, ConversationItem, ConversationStatus } from "../../src/chat/types";
+import { LiveBroker, type LiveSessionChange, type LiveUpstreamSource } from "../../src/hub/live-broker";
+import { LiveEndpoint } from "../../src/hub/live-endpoint";
+import { LIVE_STREAM_PATH } from "../../src/shared/live-protocol";
+import { FakeE2EChatService, type ReversibleFileFixture, type UsageReadOutcome } from "./chat-service";
+import { e2eTerminalShell } from "./terminal-shell";
+import type { ChatCapability, ChatCommand, ChatModel, ConversationConfiguration, ConversationItem, ConversationStatus, AgentUsageReport } from "../../src/chat/types";
 
-// One-shot artificial latency for GET /api/terminal/sessions, armed by tests
-// that need two inventory reads to complete out of order (the switcher's
-// stale-render guard). It has to live server-side: uatu registers a
-// pass-through service worker, and Playwright's page.route never sees fetches
-// a service worker mediates. The handler computes its response BEFORE the
-// delay so the held response reflects the state at request time — that
-// staleness is the point. `pending` stays true until the held response is
-// delivered, so a test can poll for delivery instead of sleeping.
-let terminalSessionsDelay: { ms: number; armed: boolean; pending: boolean } | null = null;
+// One-shot hold on GET /api/terminal/sessions, armed by tests that need an
+// inventory read to complete at a moment they choose (after a pagehide, or
+// out of order with a later read: the switcher's stale-render guard). It has
+// to live server-side: uatu registers a pass-through service worker, and
+// Playwright's page.route never sees fetches a service worker mediates. The
+// handler computes its response BEFORE the hold so the held response
+// reflects the state at request time — that staleness is the point. The test
+// releases it (`{ release: true }`); `pending` stays true until the held
+// response is delivered, so a test can poll for delivery instead of sleeping.
+let terminalSessionsDelay: { armed: boolean; pending: boolean; released: Promise<void>; release: () => void } | null = null;
+
+// Standing artificial latency for processing a terminal socket's CLOSE, armed
+// by tests that need a departing holder to release its PTY late — the
+// window a page navigating away leaves behind while its replacement is
+// already attaching. Every close is held by `ms` while armed; a reset
+// disarms it. Server-side for the same reason as the read delay above, and
+// because the departing socket belongs to a page that no longer runs. A GET
+// reports how many held closes the server has yet to process, so a test can
+// wait for the departing holder's release instead of sleeping past it.
+// `{ hold: true }` instead holds every close until the test posts
+// `{ release: true }`, for a test that must observe the window while it is
+// open rather than race a timer to it.
+let terminalCloseDelayMs = 0;
+let terminalCloseHold: { released: Promise<void>; release: () => void } | null = null;
+let terminalClosesHeld = 0;
 
 let activeFilePath: string | null = null;
 let activeRootPaths: string[] | null = null;
 let activeRespectGitignore = true;
 let activeFollow = true;
+let discoveryGate: ReturnType<typeof Promise.withResolvers<void>> | null = null;
+let repositoryGate: ReturnType<typeof Promise.withResolvers<void>> | null = null;
+let nativeWatch = false;
+let failDiscovery = false;
 let activeWorkspaceRoot = E2E_WORKSPACE_ROOT;
 let activeEntries: WatchEntry[] = [];
 let personalState: Record<string, unknown> = { version: 1 };
@@ -113,7 +148,7 @@ const fakeSecondAgent = new FakeE2EChatService({
   // Claude Code's own persistent-approval sentence and its typed-id
   // capability, as the real descriptor declares them (chat/claude/provider).
   permissionScopeNote: CLAUDE_PERMISSION_SCOPE_NOTE,
-  extraCapabilities: ["custom-model-id", "background-tasks"],
+  extraCapabilities: ["custom-model-id", "background-tasks", "scheduled-wakeups", "usage"],
 });
 // The fake owns attachment persistence (its prompt path validates ids
 // against its own store), so the routers delegate rather than keeping a
@@ -150,9 +185,70 @@ const chatService = new Proxy({} as MultiAgentChatService, {
   },
 });
 const terminalEnabled = await terminalBackendAvailable();
-let watchSession = await createSession({ resetWorkspace: true });
+let watchSession = await createSession({ resetWorkspace: process.env.UATU_E2E_PRESERVE_WORKSPACE !== "1" });
+
+// The brokered live stream, exactly as a hub would mount it, over this one
+// workspace: the SPA opens only /api/hub/live, so the harness brokers its
+// own child routes back to itself (a loopback fetch carrying the workspace
+// credential the chat routes check). No hub auth here — one fixed identity;
+// `ws` may be absent or anything, and names this workspace.
+const E2E_WORKSPACE_ID = "e2e";
+const E2E_LIVE_PRINCIPAL = { user: "e2e", sessionId: "e2e-session" };
+// A reset stops the watch session before the next one exists. Stopping ends
+// the broker's upstreams, and the broker retries within ~100 ms, which,
+// unguarded, lands on the STOPPED session: it still answers with a snapshot
+// of the old tree and never broadcasts again, so the next test's page sees
+// the previous test's files. (A real child that stops is gone; only this
+// in-process swap can answer from a dead session.) Upstream opens therefore
+// wait for the swap to finish.
+let liveUpstreamsReady: Promise<void> = Promise.resolve();
+let liveSessionRunning = true;
+const liveSessionListeners = new Set<(change: LiveSessionChange) => void>();
+function setLiveSessionRunning(running: boolean): void {
+  liveSessionRunning = running;
+  for (const listener of liveSessionListeners) listener({ workspaceId: E2E_WORKSPACE_ID, running });
+}
+function holdLiveUpstreams(): () => void {
+  let release!: () => void;
+  liveUpstreamsReady = new Promise<void>(resolve => {
+    release = resolve;
+  });
+  // A reset that throws midway must not wedge every later stream.
+  const safety = setTimeout(release, 30_000);
+  return () => {
+    clearTimeout(safety);
+    release();
+  };
+}
+const liveUpstreamSource: LiveUpstreamSource = {
+  isRunning: () => liveSessionRunning,
+  workspaceIds: () => [E2E_WORKSPACE_ID],
+  onSessionChange(listener) {
+    liveSessionListeners.add(listener);
+    return () => { liveSessionListeners.delete(listener); };
+  },
+  async open({ path: childPath, signal }) {
+    await liveUpstreamsReady;
+    const target = new URL(childPath, `http://127.0.0.1:${server.port}`);
+    target.searchParams.set("t", watchSession.getTerminalToken());
+    return fetch(target, {
+      headers: { accept: "text/event-stream", origin: `http://127.0.0.1:${server.port}` },
+      signal,
+    });
+  },
+};
+const liveBroker = new LiveBroker(liveUpstreamSource, {
+  // A reset replaces the watch session under the broker's upstreams; the
+  // in-process child answers instantly, so recovery can be quick.
+  retryMinMs: 100,
+});
+const liveEndpoint = new LiveEndpoint({
+  broker: liveBroker,
+  resolveWorkspace: requested => requested ?? E2E_WORKSPACE_ID,
+});
+// A deterministic shell, never the developer's own (see terminal-shell.ts).
 const terminalServer = terminalEnabled
-  ? createTerminalServer({ cwd: activeWorkspaceRoot })
+  ? createTerminalServer({ cwd: activeWorkspaceRoot, ...e2eTerminalShell() })
   : null;
 
 async function handleE2EReset(request: Request): Promise<Response> {
@@ -166,6 +262,12 @@ async function handleE2EReset(request: Request): Promise<Response> {
     uatuConfig?: unknown;
     respectGitignore?: boolean;
     follow?: boolean;
+    holdDiscovery?: boolean;
+    holdRepositories?: boolean;
+    releaseDiscovery?: boolean;
+    releaseRepositories?: boolean;
+    nativeWatch?: boolean;
+    failDiscovery?: boolean;
   } = {};
   try {
     const text = await request.text();
@@ -176,7 +278,27 @@ async function handleE2EReset(request: Request): Promise<Response> {
     body = {};
   }
 
+  if (body.releaseDiscovery || body.releaseRepositories) {
+    if (body.releaseDiscovery) { discoveryGate?.resolve(); discoveryGate = null; failDiscovery = false; }
+    if (body.releaseRepositories) { repositoryGate?.resolve(); repositoryGate = null; }
+    return Response.json({ ok: true });
+  }
+  discoveryGate?.resolve(); repositoryGate?.resolve();
+  discoveryGate = body.holdDiscovery ? Promise.withResolvers<void>() : null;
+  repositoryGate = body.holdRepositories ? Promise.withResolvers<void>() : null;
+  nativeWatch = body.nativeWatch ?? false;
+  failDiscovery = body.failDiscovery ?? false;
+
+  // A reset replaces the child in place. Tell the broker just as a real
+  // session restart would, so no lingering upstream serves the previous tree
+  // or keeps listening to the previous agent router.
+  const releaseLiveUpstreams = holdLiveUpstreams();
+  setLiveSessionRunning(false);
+  terminalSessionsDelay?.release();
   terminalSessionsDelay = null;
+  terminalCloseDelayMs = 0;
+  terminalCloseHold?.release();
+  terminalCloseHold = null;
   fakeChatAgent.reset();
   fakeSecondAgent.reset();
   activeChatRouter = singleAgentRouter;
@@ -206,6 +328,8 @@ async function handleE2EReset(request: Request): Promise<Response> {
   if (body.nonGit) {
     activeWorkspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "uatu-e2e-non-git-"));
     await fs.cp(E2E_WORKSPACE_ROOT, activeWorkspaceRoot, { recursive: true });
+    // The copy stamps every file "now", losing the README's lead.
+    await promoteRootReadme(activeWorkspaceRoot);
   }
   if (previousWorkspaceRoot !== E2E_WORKSPACE_ROOT) {
     await fs.rm(previousWorkspaceRoot, { recursive: true, force: true });
@@ -216,6 +340,9 @@ async function handleE2EReset(request: Request): Promise<Response> {
       await fs.mkdir(path.dirname(target), { recursive: true });
       await fs.writeFile(target, contents, "utf8");
     }
+    // A seeded root README must stay the default selection; the write above
+    // just reset the mtime the workspace reset gave it.
+    if (Object.hasOwn(body.extras, "README.md")) await promoteRootReadme(activeWorkspaceRoot);
   }
   if (body.uatuConfig) {
     await fs.writeFile(
@@ -224,6 +351,7 @@ async function handleE2EReset(request: Request): Promise<Response> {
       "utf8",
     );
   }
+  if (discoveryGate || failDiscovery) await fs.writeFile(path.join(activeWorkspaceRoot, "indexing-gate.unknown"), "Waiting for discovery\n");
   if (body.git) {
     await initE2EGitRepository();
   }
@@ -236,6 +364,8 @@ async function handleE2EReset(request: Request): Promise<Response> {
   }
 
   watchSession = await createSession({ resetWorkspace: false });
+  releaseLiveUpstreams();
+  setLiveSessionRunning(true);
   return Response.json(watchSession.getStatePayload());
 }
 
@@ -263,12 +393,25 @@ async function handleE2EChat(request: Request): Promise<Response> {
     message?: string;
     capabilities?: ChatCapability[];
     models?: ChatModel[];
+    login?: string;
+    silent?: boolean;
+    commands?: ChatCommand[];
     child?: boolean;
     invalidate?: boolean;
     configuration?: ConversationConfiguration;
+    // A seeded conversation's last activity (epoch ms).
+    updatedAt?: number;
     reversibleFiles?: ReversibleFileFixture[];
     agent?: "opencode" | "claude";
     count?: number;
+    // A shell task's fake output: what the task view's pane reads, set or
+    // appended to while the task runs (design D7).
+    taskId?: string;
+    text?: string;
+    append?: boolean;
+    // Plan usage (design D9): the last-known report and how the next read answers.
+    report?: AgentUsageReport | null;
+    outcome?: UsageReadOutcome;
   };
   // The chat wire is agent-qualified ("opencode:<id>") while the fake works
   // in bare provider ids. The control boundary translates both directions so
@@ -299,11 +442,19 @@ async function handleE2EChat(request: Request): Promise<Response> {
   if (body.item) body.item = stripQualifier(body.item) as typeof body.item;
   const targetFake = body.agent === "claude" ? fakeSecondAgent : fakeChatAgent;
   switch (body.action) {
-    case "agents":
-      activeChatRouter = body.count === 2 ? dualAgentRouter : singleAgentRouter;
+    case "agents": {
+      const next = body.count === 2 ? dualAgentRouter : singleAgentRouter;
+      if (next !== activeChatRouter) {
+        // Existing SSE subscriptions are bound to their original router;
+        // changing the delegating proxy only affects new requests.
+        setLiveSessionRunning(false);
+        activeChatRouter = next;
+        setLiveSessionRunning(true);
+      }
       return Response.json({ agents: body.count === 2 ? 2 : 1 });
+    }
     case "seed":
-      return controlJson(targetFake.seed(body.title ?? "Fixture conversation", body.items ?? [], body.older ?? [], body.child ?? false, body.configuration), body.agent ?? "opencode");
+      return controlJson(targetFake.seed(body.title ?? "Fixture conversation", body.items ?? [], body.older ?? [], body.child ?? false, body.configuration, body.updatedAt), body.agent ?? "opencode");
     case "externalCreate":
       return controlJson(targetFake.externalCreate(body.title ?? "External conversation", { child: body.child, invalidate: body.invalidate }), body.agent ?? "opencode");
     case "externalRename":
@@ -319,6 +470,9 @@ async function handleE2EChat(request: Request): Promise<Response> {
       break;
     case "item":
       if (body.conversationId && body.item) return controlJson(targetFake.publishItem(body.conversationId, body.item));
+      break;
+    case "removeItem":
+      if (body.conversationId && body.itemId) return controlJson(targetFake.removeItem(body.conversationId, body.itemId));
       break;
     case "delta":
       if (body.conversationId && body.itemId && typeof body.delta === "string") {
@@ -347,7 +501,7 @@ async function handleE2EChat(request: Request): Promise<Response> {
       fakeChatAgent.disconnect();
       return Response.json({ ok: true });
     case "stats":
-      return Response.json({ statusCalls: fakeChatAgent.statusCalls, promptAttempts: fakeChatAgent.promptAttempts, promptModes: fakeChatAgent.promptModes, promptVariants: fakeChatAgent.promptVariants, promptConfigurations: fakeChatAgent.promptConfigurations, reversibleAttempts: fakeChatAgent.reversibleAttempts, ...fakeChatAgent.inventoryStats() });
+      return Response.json({ statusCalls: fakeChatAgent.statusCalls, promptAttempts: fakeChatAgent.promptAttempts, promptModes: fakeChatAgent.promptModes, promptVariants: fakeChatAgent.promptVariants, promptConfigurations: fakeChatAgent.promptConfigurations, reversibleAttempts: fakeChatAgent.reversibleAttempts, permissionChoices: fakeChatAgent.permissionChoices, usageReads: [...fakeChatAgent.usageReads, ...fakeSecondAgent.usageReads].map(read => read.mode), ...targetFake.inventoryStats() });
     case "inventoryInvalidate":
       fakeChatAgent.invalidateInventory();
       return Response.json({ ok: true });
@@ -387,8 +541,34 @@ async function handleE2EChat(request: Request): Promise<Response> {
     case "declareOnly":
       targetFake.declareOnly(body.capabilities ?? []);
       return Response.json({ ok: true });
+    case "usageReport":
+      targetFake.setUsageReport(body.report ?? null);
+      return Response.json({ ok: true });
+    case "usageRead":
+      targetFake.setUsageReadOutcome({ ...(body.outcome ?? { outcome: "no-live-session" }), ...(body.outcome?.conversationId ? { conversationId: body.outcome.conversationId.replace(/^(?:opencode|claude):/, "") } : {}) });
+      return Response.json({ ok: true });
+    case "taskOutput":
+      if (body.taskId) {
+        targetFake.setTaskOutput(body.taskId, body.text ?? "", body.append === true);
+        return Response.json({ ok: true });
+      }
+      break;
     case "models":
       targetFake.setModels(body.models ?? []);
+      return Response.json({ ok: true });
+    // The agent's login, as it reports it on status (agent-accounts). The
+    // inventory is ticked so an open page re-reads status at once, unless
+    // `silent`: a login made in a terminal, which no tick announces.
+    case "login":
+      targetFake.setLogin(body.login === "ok" || body.login === "missing" || body.login === "unknown" ? body.login : undefined, { silent: body.silent === true });
+      return Response.json({ ok: true });
+    case "accountChanges":
+      return Response.json({ changes: targetFake.accountChanges });
+    case "commands":
+      targetFake.setExtraCommands(body.commands ?? []);
+      return Response.json({ ok: true });
+    case "modes":
+      targetFake.setModes(body.modes ?? []);
       return Response.json({ ok: true });
     case "resync":
       fakeChatAgent.rotateGeneration();
@@ -405,6 +585,13 @@ server = Bun.serve({
   hostname: "127.0.0.1",
   port: E2E_PORT,
   idleTimeout: SERVE_IDLE_TIMEOUT_SECONDS,
+  // Serve the HTMLBundle as a production bundle, as the compiled binary
+  // does. Bun's default (`NODE_ENV !== "production"`) is its dev server: an
+  // HMR websocket that reloads every open test page when src/ changes
+  // mid-run, and a <bun-hmr> error overlay that can cover the page (and
+  // swallow clicks) when the process behind it stops. The bundle stays
+  // unminified through tests/e2e/bunfig.toml, which the spawners pass.
+  development: false,
   routes: {
     // The HTMLBundle MUST be a literal at this call site (see the matching
     // comment in src/cli.ts) so Bun's bundler can wire up the chunk URLs.
@@ -412,7 +599,22 @@ server = Bun.serve({
     // through spaShellResponse like production so the e2e suite exercises
     // the same no-cache HTML + prefixed bundle-asset flow browsers get.
     [INTERNAL_SHELL_PATH]: index,
-    "/": { GET: () => spaShellResponse(server) },
+    // Under a hub prefix the root and the live stream belong to the hub;
+    // the prefix root resolves through the navigation fallback instead (as
+    // in cli.ts). Cast: TS types the conditional spread's keys as
+    // optional-undefined, which Bun's Routes type rejects.
+    ...((E2E_HUB_CHILD
+      ? {}
+      : {
+          "/": { GET: () => spaShellResponse(server) },
+          [LIVE_STREAM_PATH]: {
+            GET: (request: Request) => liveEndpoint.openStream(request, E2E_LIVE_PRINCIPAL),
+          },
+          [`${LIVE_STREAM_PATH}/:streamId/subscriptions`]: {
+            POST: (request: Request & { params: { streamId: string } }) =>
+              liveEndpoint.changeSubscriptions(request, request.params.streamId, E2E_LIVE_PRINCIPAL),
+          },
+        }) as Record<string, never>),
     ...buildRoutes({
       mode: "e2e",
       assets: {
@@ -431,6 +633,9 @@ server = Bun.serve({
       getSession: () => watchSession,
       chatService,
       getWorkspaceCredential: () => watchSession.getTerminalToken(),
+      basePath: E2E_BASE_PATH,
+      // A hub owns its origin root, as production's child invocation declares.
+      ...(E2E_HUB_CHILD ? { manifestScope: "origin" as const } : {}),
       handleE2EReset,
       handleE2EPersonalState,
       handleE2EChat,
@@ -438,22 +643,46 @@ server = Bun.serve({
   },
   fetch: async (request, srv) => {
     const url = new URL(request.url);
-    if (url.pathname === "/__e2e/terminal-sessions-delay") {
+    // Root-relative for the comparisons below; outside the prefix the
+    // fallback answers 404 itself.
+    const pathname = stripBasePath(url.pathname, E2E_BASE_PATH);
+    if (pathname === "/__e2e/terminal-sessions-delay") {
       if (request.method === "POST") {
-        const body = (await request.json()) as { ms?: number };
-        terminalSessionsDelay = {
-          ms: typeof body.ms === "number" ? body.ms : 0,
-          armed: true,
-          pending: false,
-        };
+        const body = (await request.json()) as { release?: boolean };
+        if (body.release === true) {
+          terminalSessionsDelay?.release();
+          return Response.json({ ok: true });
+        }
+        let release!: () => void;
+        const released = new Promise<void>(resolve => { release = resolve; });
+        terminalSessionsDelay = { armed: true, pending: false, released, release };
         return Response.json({ ok: true });
       }
       return Response.json({ pending: terminalSessionsDelay?.pending ?? false });
     }
+    if (pathname === "/__e2e/terminal-close-delay" && request.method === "GET") {
+      return Response.json({ pending: terminalClosesHeld });
+    }
+    if (pathname === "/__e2e/terminal-close-delay" && request.method === "POST") {
+      const body = (await request.json()) as { ms?: number; hold?: boolean; release?: boolean };
+      if (body.release === true) {
+        terminalCloseHold?.release();
+        terminalCloseHold = null;
+        return Response.json({ ok: true });
+      }
+      if (body.hold === true) {
+        let release!: () => void;
+        const released = new Promise<void>(resolve => { release = resolve; });
+        terminalCloseHold ??= { released, release };
+        return Response.json({ ok: true });
+      }
+      terminalCloseDelayMs = typeof body.ms === "number" && body.ms > 0 ? body.ms : 0;
+      return Response.json({ ok: true });
+    }
     if (
       terminalSessionsDelay?.armed
       && request.method === "GET"
-      && url.pathname === "/api/terminal/sessions"
+      && pathname === "/api/terminal/sessions"
     ) {
       // Consume the arming immediately so only THIS read is held — a second
       // read arriving during the delay must pass through at full speed, or
@@ -462,7 +691,7 @@ server = Bun.serve({
       delay.armed = false;
       delay.pending = true;
       const response = await fetchFallback(request, srv);
-      await new Promise(resolve => setTimeout(resolve, delay.ms));
+      await delay.released;
       delay.pending = false;
       return response;
     }
@@ -477,6 +706,25 @@ server = Bun.serve({
           terminalServer.message(socket as never, msg as never);
         },
         close: (socket, code) => {
+          // A held close keeps the departing socket as the PTY's holder for
+          // the armed window; an attach arriving meanwhile is refused as a
+          // collision exactly as a late browser teardown would produce.
+          if (terminalCloseHold) {
+            terminalClosesHeld += 1;
+            void terminalCloseHold.released.then(() => {
+              terminalClosesHeld -= 1;
+              terminalServer.close(socket as never, code);
+            });
+            return;
+          }
+          if (terminalCloseDelayMs > 0) {
+            terminalClosesHeld += 1;
+            setTimeout(() => {
+              terminalClosesHeld -= 1;
+              terminalServer.close(socket as never, code);
+            }, terminalCloseDelayMs);
+            return;
+          }
           terminalServer.close(socket as never, code);
         },
       }
@@ -485,20 +733,31 @@ server = Bun.serve({
 
 const navigationFetch = createNavigationFetchHandler({
   getUnscopedRoots: () => watchSession.getUnscopedRoots(),
+  ensureDocument: id => watchSession.ensureDocument(id),
+  isIndexComplete: () => watchSession.getDiscoveryState().status === "ready",
   getEntries: () => activeEntries,
   getRespectGitignore: () => activeRespectGitignore,
   getServer: () => server,
+  basePath: E2E_BASE_PATH,
 });
 
 const fetchFallback = buildFetchFallback({
   getTerminalServer: () => terminalServer,
   getTerminalToken: () => watchSession.getTerminalToken(),
   navigationFetch,
+  basePath: E2E_BASE_PATH,
 });
 
-console.log(`http://127.0.0.1:${server.port}`);
+// The readiness line the spawning fixture waits for. A hub child announces
+// its prefixed session URL, the shape the hub's backend contract expects.
+console.log(E2E_HUB_CHILD ? `http://127.0.0.1:${server.port}${E2E_BASE_PATH}` : `http://127.0.0.1:${server.port}`);
 
+let shuttingDown = false;
 const shutdown = async () => {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  liveEndpoint.endAll();
+  liveBroker.dispose();
   await singleAgentRouter.dispose();
   await dualAgentRouter.dispose().catch(() => undefined);
   await watchSession.stop();
@@ -512,6 +771,14 @@ process.on("SIGINT", () => {
 process.on("SIGTERM", () => {
   void shutdown();
 });
+// Set by the spawning fixture or hub (which hold our stdin pipe): EOF means
+// the parent is gone, so exit rather than hold the port its replacement is
+// given. Bun reports one EOF as both `end` and `close`.
+if (process.env.UATU_E2E_EXIT_ON_STDIN_CLOSE === "1") {
+  process.stdin.resume();
+  process.stdin.on("end", () => void shutdown());
+  process.stdin.on("close", () => void shutdown());
+}
 
 async function createSession(options: { resetWorkspace: boolean }) {
   if (options.resetWorkspace) {
@@ -523,12 +790,27 @@ async function createSession(options: { resetWorkspace: boolean }) {
     : activeRootPaths?.map(root => path.join(activeWorkspaceRoot, root)) ?? [activeWorkspaceRoot];
   const entries = await resolveWatchRoots(entryPaths, process.cwd());
   activeEntries = entries;
+  const heldDiscovery = discoveryGate;
+  const heldRepository = repositoryGate;
   const session = createWatchSession(entries, activeFollow, {
-    usePolling: true,
+    usePolling: !nativeWatch,
     respectGitignore: activeRespectGitignore,
     terminalEnabled,
+    ...(heldDiscovery || failDiscovery ? { classify: async (file: string, name?: string) => {
+      if (file.endsWith("/indexing-gate.unknown")) {
+        if (heldDiscovery) await heldDiscovery.promise;
+        if (failDiscovery) throw new Error("Controlled indexing failure");
+      }
+      return classifyFile(file, name);
+    } } : {}),
+    ...(heldRepository ? { collectRepositories: async (...args: Parameters<typeof collectRepositorySnapshots>) => {
+      await heldRepository.promise;
+      return collectRepositorySnapshots(...args);
+    } } : {}),
   });
-  await session.start();
+  const started = session.start();
+  if (heldDiscovery) void started.catch(error => console.error(error));
+  else await started;
   return session;
 }
 

@@ -23,7 +23,7 @@ import { mountLayoutToolbar, syncLayoutChooser } from "./layout";
 import { documentDiffCache, type RenderedDocument } from "./mount";
 import { refreshOutline } from "./outline";
 import { extensionToLanguage, syncViewToggle } from "./view-mode";
-import { setPreviewMode } from "../shell/selection";
+import { getSelectionGeneration, setPreviewMode } from "../shell/selection";
 
 const previewElementMaybe = document.querySelector<HTMLElement>("#preview");
 
@@ -53,11 +53,62 @@ function loadingSignal(): LoadingSignal {
 // newest invocation may settle the signal, so a superseded fetch finishing
 // first (rapid file switching while Diff is active) cannot clear the busy
 // state out from under the request the user is actually waiting on.
+import { documentRevisionKey } from "../shell/document-state";
+import { diffInputKey } from "./diff-input-key";
 let diffLoadGeneration = 0;
 
+function currentDiffInputKey(documentId: string): string {
+  return diffInputKey(documentId, appState.repositories, appState.compareTarget);
+}
+
+function diffRevisionKey(documentId: string): string {
+  return `${documentRevisionKey(documentId)}:${currentDiffInputKey(documentId)}`;
+}
+
+// The diff-input key each cached diff was fetched under, and the key each
+// document's latest diff request was made under (cached or still in
+// flight). A repository update drops only the cache entries whose key moved,
+// and re-requests the active diff only when its own key moved.
+const cachedDiffKeys = new Map<string, string>();
+const requestedDiffKeys = new Map<string, string>();
+
+export function dropStaleDiffs(): void {
+  for (const [documentId, key] of cachedDiffKeys) {
+    if (documentDiffCache.has(documentId) && key === currentDiffInputKey(documentId)) continue;
+    cachedDiffKeys.delete(documentId);
+    documentDiffCache.delete(documentId);
+  }
+}
+
+// .gitattributes decides how Git diffs a file (binary, diff drivers, eol)
+// without changing the file or its change entry, so an edit to one makes
+// every cached diff suspect.
+export function forgetAllDiffs(): void {
+  documentDiffCache.clear();
+  cachedDiffKeys.clear();
+}
+
+// Whether the repository data the document's diff was requested under has
+// moved on in a way that can change that diff.
+export function diffInputsMoved(documentId: string): boolean {
+  const requested = requestedDiffKeys.get(documentId);
+  return requested !== undefined && requested !== currentDiffInputKey(documentId);
+}
+
+export function cancelDiffPresentation(): void {
+  ++diffLoadGeneration;
+  ++diffRenderGeneration;
+  diffLoadingSignal?.settle();
+}
+
 export async function applyDiffForActiveDocument(documentId: string, ownsLoad?: () => boolean): Promise<void> {
+  requestedDiffKeys.set(documentId, currentDiffInputKey(documentId));
+  const selectionGeneration = getSelectionGeneration();
   const generation = ++diffLoadGeneration;
+  const revision = diffRevisionKey(documentId);
   const isCurrent = () => (ownsLoad?.() ?? true) && generation === diffLoadGeneration
+    && selectionGeneration === getSelectionGeneration()
+    && revision === diffRevisionKey(documentId)
     && appState.previewMode.kind === "document"
     && appState.selectedId === documentId
     && appState.viewMode === "diff"
@@ -81,6 +132,7 @@ export async function applyDiffForActiveDocument(documentId: string, ownsLoad?: 
         return;
       }
       documentDiffCache.set(documentId, fetched);
+      cachedDiffKeys.set(documentId, currentDiffInputKey(documentId));
       // The user may have switched away while the fetch was in flight; only
       // apply if the active selection AND view mode are still consistent.
       if (
@@ -106,7 +158,7 @@ export async function applyDiffForActiveDocument(documentId: string, ownsLoad?: 
 
 export async function fetchDocumentDiff(documentId: string): Promise<DocumentDiffPayload | null> {
   try {
-    const response = await fetch(contextualAppUrl(appUrl(`/api/document/diff?id=${encodeURIComponent(documentId)}`)));
+    const response = await fetch(contextualAppUrl(appUrl(`/api/document/diff?id=${encodeURIComponent(documentId)}`)), { cache: "no-store" });
     if (!response.ok) {
       return null;
     }
@@ -123,8 +175,12 @@ export async function renderDiffIntoPreview(
   payload: DocumentDiffPayload,
   ownsLoad: () => boolean = () => true,
 ): Promise<void> {
+  const selectionGeneration = getSelectionGeneration();
   const generation = ++diffRenderGeneration;
+  const revision = diffRevisionKey(documentId);
   const isCurrent = () => generation === diffRenderGeneration && ownsLoad()
+    && revision === diffRevisionKey(documentId)
+    && selectionGeneration === getSelectionGeneration()
     && appState.previewMode.kind === "document"
     && appState.selectedId === documentId && appState.viewMode === "diff"
     && Boolean(findDocumentById(documentId));

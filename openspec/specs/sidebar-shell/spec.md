@@ -7,6 +7,7 @@ Throughout this spec, "phone-class viewport" means a viewport that is BOTH
 coarse-pointer (`pointer: coarse`) AND narrower than the 900-pixel stacked-layout
 breakpoint. iPads in landscape and narrow desktop windows are not phone-class.
 ## Requirements
+
 ### Requirement: Organize sidebar content into resizable panes
 The browser UI SHALL organize the expanded sidebar as a stack of panes. The pane catalog SHALL include `Change Overview`, `Files`, and `Git Log`, all available regardless of session state — the user MAY toggle any pane's visibility via the per-pane visibility menu. The document tree SHALL render inside the `Files` pane and MUST preserve existing document selection and follow-mode interaction (see the `follow-mode` capability). Tree-internal behaviors that are owned by the `@pierre/trees` library — directory expansion handling, binary-entry presentation, and any future row-annotation behavior such as relative-time labels — are governed by the `document-tree` capability rather than this requirement, and this requirement no longer asserts that they survive the library swap. Pane visibility, collapsed state, and vertical sizing SHALL persist across reloads in the same browser for that origin under a single set of storage keys (no per-Mode partitioning). The pane stack SHALL fill the available expanded-sidebar height and MUST NOT force the whole sidebar body to scroll. Scrollbars used inside panes and preview overflow regions SHOULD be thin and visually light while remaining discoverable. The existing whole-sidebar collapse and expand controls MUST remain separate from per-pane visibility and collapse controls.
 
@@ -64,13 +65,18 @@ The browser UI SHALL allow users to resize the expanded sidebar horizontally. Th
 - **THEN** the expanded sidebar returns to the resized width
 
 ### Requirement: Render bounded commit history in the Git Log pane
-The browser UI SHALL render the bounded commit log for the selected or only detected repository in the `Git Log` pane. Each visible commit row MUST show at minimum the short SHA and subject. Each visible commit row MUST be a same-origin link to that commit's preview URL so standard browser link affordances are available. If multiple repositories are detected, the pane SHALL make clear which repository each log belongs to or provide a repository grouping/selection. The pane SHALL provide a history-length control for selecting how many commit rows are visible from the bounded data supplied by the server. The `Git Log` pane body SHALL scroll internally when the visible commit rows exceed its allocated height. If no commit log is available, the pane SHALL show an empty or unavailable state instead of failing to render. The Git Log pane is available at all times — it is not gated by Mode.
+The browser UI SHALL render the bounded commit log for the selected or only detected repository in the `Git Log` pane. Each visible commit row MUST show at minimum the short SHA and subject. Each visible commit row SHALL show the commit's age, derived from its commit time. Displayed ages SHALL stay current while the page is open, without new repository data and without refetching repository data. Each visible commit row MUST be a same-origin link to that commit's preview URL so standard browser link affordances are available. If multiple repositories are detected, the pane SHALL make clear which repository each log belongs to or provide a repository grouping/selection. The pane SHALL provide a history-length control for selecting how many commit rows are visible from the bounded data supplied by the server. The `Git Log` pane body SHALL scroll internally when the visible commit rows exceed its allocated height. If no commit log is available, the pane SHALL show an empty or unavailable state instead of failing to render. The Git Log pane is available at all times — it is not gated by Mode.
 
 #### Scenario: Single repository has commits
 - **WHEN** the browser receives a commit log for one detected repository
 - **THEN** the `Git Log` pane lists recent commits for that repository
 - **AND** each row includes the commit short SHA and subject
 - **AND** each row links to a commit preview URL containing that repository id and commit sha
+
+#### Scenario: Commit ages stay current
+- **WHEN** the `Git Log` pane is visible and no repository change occurs for several minutes
+- **THEN** each row's age advances to reflect the elapsed time
+- **AND** keeping the ages current does not request repository data from the server
 
 #### Scenario: Commit history length can be changed
 - **WHEN** a user selects a different history length in the `Git Log` pane
@@ -85,6 +91,7 @@ The browser UI SHALL render the bounded commit log for the selected or only dete
 #### Scenario: Commit click renders full message in preview
 - **WHEN** a user clicks a commit row in the `Git Log` pane without a modifier key and without requesting a new browsing context
 - **THEN** the main preview renders that commit's full commit message
+- **AND** the preview shows the commit's age, derived from its commit time in the same way
 - **AND** Follow mode is disabled
 - **AND** the browser URL updates to the commit preview URL
 - **AND** a new entry is added to the browser history stack
@@ -147,10 +154,10 @@ The browser UI SHALL provide a control that collapses the sidebar into a narrow 
 - **THEN** the document list returns to its previous width
 
 ### Requirement: Animate the live connection indicator
-While the browser UI is connected to the live update channel, the connection indicator SHALL animate with a subtle pulse so the live state is visually distinguishable from a static label. When the channel enters a reconnecting state, the pulse MUST stop and the indicator MUST communicate the reconnecting state without animation. The pulse MUST be disabled when the user's operating system requests reduced motion. The indicator's label MUST read `Connected` while the channel is open, `Reconnecting` while it is recovering, and `Connecting` before the first successful connect. The indicator MUST expose a hover tooltip whose text describes the current connection state to the uatu backend (for example, `Connected to the uatu backend`). The connection indicator SHALL be rendered inside the sidebar header, stacked beneath the `UatuCode` wordmark, so the indicator visually belongs to the application chrome rather than the per-document preview controls. As a tradeoff of this placement, collapsing the sidebar MAY hide the indicator along with the rest of the sidebar chrome. The indicator's label and animation MUST NOT vary by any Mode-equivalent state — the SPA is a single mode.
+While the browser UI has received and applied authoritative state from its current live update channel, the connection indicator SHALL animate with a subtle pulse so the live state is visually distinguishable from a static label. When the channel enters a reconnecting state, the pulse MUST stop and the indicator MUST communicate the reconnecting state without animation. The indicator MUST remain reconnecting until a current replacement channel has supplied authoritative state, and MUST return to connected immediately after that recovery succeeds rather than waiting for a later file change. The pulse MUST be disabled when the user's operating system requests reduced motion. The indicator's label MUST read `Connected` while the channel is confirmed live, `Reconnecting` while it is recovering, `Connecting` before the first successful connect, and — on a hub-served page — `Stopped` while the hub reports the current workspace's session not running and the channel is not confirmed live. A stopped session MUST NOT be presented as `Reconnecting`: the word is reserved for a transport gap or an unreachable child of a running session. The `Stopped` state SHALL be sourced from the hub's own report of the session (the activity topic prompting a read of the hub's workspace state), so a running session whose child is momentarily unreachable stays `Reconnecting`, and it SHALL clear from the stream when the session is started from anywhere, without a reload. The indicator MUST expose a hover tooltip whose text describes the current connection state to the uatu backend (for example, `Connected to the uatu backend`, or for a stopped session, `The workspace session is stopped`). The connection indicator SHALL be rendered inside the sidebar header, stacked beneath the `UatuCode` wordmark, so the indicator visually belongs to the application chrome rather than the per-document preview controls. As a tradeoff of this placement, collapsing the sidebar MAY hide the indicator along with the rest of the sidebar chrome. The indicator's label and animation MUST NOT vary by any Mode-equivalent state - the SPA is a single mode. On a hub-served page the live update channel is the hub's brokered stream, and the indicator SHALL reflect that stream's transport state together with the current workspace's applied `document` state; a topic-scoped resync or unavailability for a chat topic MUST NOT change the shell indicator, and Chat transport status SHALL remain scoped to the Chat surface. A page served directly, without a hub, never shows `Stopped`.
 
 #### Scenario: The indicator pulses while connected to the server
-- **WHEN** the browser UI's event channel is open
+- **WHEN** the browser UI's current event channel supplies authoritative state that the client applies
 - **THEN** the connection indicator displays a pulsing animation labeled `Connected`
 - **AND** the indicator's hover tooltip reads `Connected to the uatu backend`
 
@@ -159,6 +166,31 @@ While the browser UI is connected to the live update channel, the connection ind
 - **THEN** the indicator stops pulsing
 - **AND** the label reads `Reconnecting`
 - **AND** the hover tooltip describes the reconnecting state
+
+#### Scenario: Successful recovery clears reconnecting immediately
+- **WHEN** a replacement event channel supplies and applies its authoritative state
+- **THEN** the indicator returns to `Connected` without waiting for a watched file to change
+- **AND** an older recovery attempt cannot return the indicator to a stale state
+
+#### Scenario: A stopped session reads Stopped, not Reconnecting
+- **WHEN** the viewed workspace's session is stopped from the dashboard or another device while its page is open
+- **THEN** the indicator's label changes to `Stopped` without the page reloading
+- **AND** the indicator does not pulse
+- **AND** the hover tooltip says the workspace session is stopped
+
+#### Scenario: An unreachable child of a running session stays Reconnecting
+- **WHEN** the stream reports the current workspace not running but the hub's workspace state still lists its session as running
+- **THEN** the indicator reads `Reconnecting`
+- **AND** no start is offered
+
+#### Scenario: A start from elsewhere clears Stopped
+- **WHEN** a stopped session whose page reads `Stopped` is started from the dashboard or another device
+- **THEN** the page's indicator leaves `Stopped` from the stream update and returns to `Connected` once the replacement state is applied, without a reload
+
+#### Scenario: Chat status does not misrepresent document connectivity
+- **WHEN** a chat topic on the brokered stream requires a resync while the stream and its `document` topic remain confirmed live
+- **THEN** the shell connection indicator remains `Connected`
+- **AND** Chat reports its own status within the Chat surface
 
 #### Scenario: Reduced-motion users see no animation
 - **WHEN** the operating system reports a reduced-motion preference
@@ -290,7 +322,7 @@ on demand by its shortcut.
 - **THEN** the pane becomes visible and expanded without disturbing the other panes' persisted state
 
 ### Requirement: The sidebar hosts a Usage pane in the pane stack
-The sidebar SHALL include a Usage pane participating in the existing pane-stack behavior: it can be collapsed, hidden, resized, and restored from the panels menu, and its visibility and height SHALL persist across reloads like the other panes. The pane SHALL show the plan-usage windows most recently reported to this client by a Claude Code conversation — each window's name, percentage used, and reset time — and SHALL show an explanatory empty state when no conversation has reported plan usage. The pane SHALL default to hidden. When the chat's plan readout is open and the sidebar is displayed beside the chat, the readout SHALL offer a control that reveals the Usage pane.
+The sidebar SHALL include a Usage pane participating in the existing pane-stack behavior: it can be collapsed, hidden, resized, and restored from the panels menu, and its visibility and height SHALL persist across reloads like the other panes. The pane SHALL show the workspace's last-known plan-usage windows — each window's name, percentage used, and reset time — with the time they were read and how long ago; a report older than ten minutes SHALL be marked stale while remaining readable. The pane SHALL show the last-known report as soon as the client loads, without waiting for a conversation to be opened or a turn to end, and SHALL follow every newer report from any Claude Code conversation. The pane SHALL offer a control that reads plan usage now, subject to the same rules as the chat readout's control: a live Claude Code session answers without interruption, an idle conversation is started and retired for the read, the control shows a read in flight, and a failed read keeps the figures and states why. Opening the pane while its report is stale and a Claude Code session is live SHALL refresh through that session unasked. When no report has ever been read, the pane SHALL show an empty state that offers the read control. The pane SHALL default to hidden. When the chat's plan readout is open and the sidebar is displayed beside the chat, the readout SHALL offer a control that reveals the Usage pane.
 
 #### Scenario: Usage pane behaves like its siblings
 - **WHEN** the user collapses, hides, and then restores the Usage pane from the panels menu
@@ -301,12 +333,30 @@ The sidebar SHALL include a Usage pane participating in the existing pane-stack 
 - **THEN** the Usage pane becomes visible and expanded without disturbing the other panes' persisted state
 
 #### Scenario: The pane follows the newest report
-- **WHEN** a Claude Code conversation reports fresh plan usage after a turn
+- **WHEN** a Claude Code conversation reports fresh plan usage after a turn or a read
 - **THEN** the Usage pane shows those figures without the user reselecting anything
 
+#### Scenario: The pane survives a reload
+- **WHEN** the client reloads or returns to the workspace and no turn has ended since the last report
+- **THEN** the Usage pane shows the last-known windows with the time they were read and how long ago
+
+#### Scenario: A stale report says so
+- **WHEN** the pane's report was read more than ten minutes ago
+- **THEN** its figures remain shown and are marked stale
+
+#### Scenario: The pane reads on demand
+- **WHEN** the user activates the pane's read control
+- **THEN** the control shows the read in flight
+- **AND** the pane shows the refreshed windows with a new read time when it completes
+
+#### Scenario: A failed read keeps the pane's figures
+- **WHEN** the pane's read fails
+- **THEN** the last-known windows remain shown
+- **AND** the pane states that the read failed and why
+
 #### Scenario: No report yet
-- **WHEN** no conversation on this client has reported plan usage
-- **THEN** the Usage pane states that plan usage appears after a Claude Code turn
+- **WHEN** no plan usage has ever been read in this workspace
+- **THEN** the Usage pane states that nothing has been read yet and offers the read control
 
 ### Requirement: File tree keeps a usable height in the stacked layout
 In desktop mode's stacked (≤900px) layout the `Files` pane body SHALL receive an explicit height so the virtualized tree renders a usable number of rows and scrolls internally, instead of collapsing to its (nonexistent) intrinsic content height. Wide-viewport desktop flex allocation of pane heights SHALL be unchanged. (In touch mode the tree renders inside the full-screen Files tab and needs no stacked-layout special case.)
@@ -361,3 +411,48 @@ The browser UI SHALL render repository and change-context data in the `Change Ov
 - **WHEN** the changed-files list received by the browser contains no entries with the untracked status
 - **THEN** the `Change Overview` pane does NOT render the untracked categorical indicator
 - **AND** the pane shows no placeholder, empty row, or "0 untracked" affordance for that category
+
+### Requirement: The connection indicator offers a manual reconnect
+The connection indicator SHALL be an actionable control whenever the connection is not confirmed live, so a user can ask for recovery without depending on browser chrome. It MUST be operable by pointer, touch, and keyboard, MUST carry an accessible name describing the action rather than only the current state, and MUST present a touch target no smaller than the application's other touch-mode controls. While the connection is confirmed live the indicator MAY be inert.
+
+Activating the control SHALL first attempt recovery in place: reconcile authoritative state and re-establish the live channel, preserving the previewed document, scroll position, sidebar selection, and any Chat draft or timeline position. If the connection is not confirmed live within a bounded period after that attempt, the control SHALL reload the page, because an in-place recovery cannot rescue a page whose own recovery machinery is no longer running. The control MUST communicate that an attempt is under way and MUST NOT start a second concurrent attempt while one is in flight.
+
+While the indicator reads `Stopped`, its action SHALL be to start the workspace's session through the hub instead of reconnecting, and its accessible name SHALL say so. A successful start SHALL return the page to `Connected` in place, preserving the previewed document, scroll position, sidebar selection, and any Chat draft or timeline position; the page MUST NOT reload as part of the start. The control MUST NOT fall back to reloading the page while the session is stopped — a reload cannot offer more than the control already does — and a recovery attempt already in flight when the session stopped MUST settle without reloading. A start the hub refuses because the workspace's credentials are locked SHALL hand off to the hub dashboard's unlock flow; any other refusal SHALL be shown at the indicator and the control SHALL remain available. If the hub accepts the start but the channel is not confirmed live within the bounded period, the indicator SHALL return to `Reconnecting` with its ordinary reconnect action.
+
+#### Scenario: Activating the indicator recovers in place
+- **WHEN** a user activates the connection indicator while it reads `Reconnecting` and an in-place recovery succeeds
+- **THEN** the indicator returns to `Connected` without reloading the page
+- **AND** the previewed document, scroll position, and any Chat draft are unchanged
+
+#### Scenario: A dead page falls back to reloading
+- **WHEN** a user activates the connection indicator and the connection is still not confirmed live after the bounded attempt window
+- **THEN** the page reloads
+
+#### Scenario: Activating a stopped indicator starts the session
+- **WHEN** a user activates the connection indicator while it reads `Stopped`
+- **THEN** the hub is asked to start the workspace's session and the control shows an attempt under way
+- **AND** once the started session's state is applied the indicator reads `Connected`
+- **AND** the page did not reload, and the previewed document, scroll position, and any Chat draft are unchanged
+
+#### Scenario: A stopped session never reloads on its own
+- **WHEN** a recovery attempt was in flight and the session is stopped before the attempt's window elapses
+- **THEN** the page does not reload
+- **AND** the indicator reads `Stopped` and offers the start
+
+#### Scenario: A locked start hands off to the dashboard
+- **WHEN** a user activates a `Stopped` indicator and the hub refuses because the workspace's credentials are locked
+- **THEN** the page navigates to the hub dashboard, where the credential-aware start flow collects the passphrase
+
+#### Scenario: A failed start stays actionable
+- **WHEN** a user activates a `Stopped` indicator and the hub refuses for another reason
+- **THEN** the refusal's message is shown at the indicator
+- **AND** the indicator still reads `Stopped` and can be activated again
+
+#### Scenario: The control is reachable without a browser
+- **WHEN** the application runs in standalone display mode with no browser reload or pull-to-refresh available
+- **THEN** the connection indicator is operable by touch and exposes an accessible name describing the reconnect action
+
+#### Scenario: Repeated activation does not pile up attempts
+- **WHEN** a user activates the reconnect control repeatedly while an attempt is in flight
+- **THEN** the attempt already running continues and no second concurrent attempt is started
+- **AND** the control shows that an attempt is under way

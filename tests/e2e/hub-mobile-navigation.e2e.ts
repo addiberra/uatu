@@ -13,14 +13,22 @@ test("real visits, copied context, management identity, stopped Return and sign-
   }
   const [a, b] = ids as [string, string];
   await page.reload();
-  const row = page.locator("#workspaces .row").filter({ hasText: hub.workspaces.a });
+  await page.locator(`[data-disclosure="${a}-inactive"] > summary`).click();
+  const row = page.locator(`#workspaces .row[data-workspace="${a}"]`);
   page.once("dialog", dialog => dialog.dismiss());
   await row.getByRole("button", { name: "Start Shared", exact: true }).click();
   expect((await (await page.request.get(`${hub.origin}/api/hub/state`)).json()).workspaces.every((w: { running: boolean }) => !w.running)).toBe(true);
+  const opening = page.waitForRequest(request => request.isNavigationRequest()
+    && request.url() === `${hub.origin}/s/${a}/`);
   page.once("dialog", dialog => dialog.accept());
   await row.getByRole("button", { name: "Start Shared", exact: true }).click();
-  await expect(page).toHaveURL(`${hub.origin}/s/${a}/`);
+  await opening;
   await expect(page.locator("#hub-control")).not.toHaveAttribute("hidden");
+  // Root startup may select the newest document asynchronously. Establish an
+  // exact reading destination before recording the visit and leaving it.
+  const destination = `${hub.origin}/s/${a}/docs/guide.md`;
+  await page.goto(destination);
+  await expect(page.locator("#preview")).toContainText("Guide A");
   await expect.poll(() => page.evaluate(() => JSON.parse(sessionStorage.getItem("uatu.hub.return.v1") || "null")?.workspaceId)).toBe(a);
   await page.goto(hub.origin);
   await expect(page.locator("#hub-return")).toContainText(hub.workspaces.a);
@@ -34,8 +42,8 @@ test("real visits, copied context, management identity, stopped Return and sign-
   const inherited = await popupPromise;
   await expect(inherited.locator("#hub-return")).toContainText(hub.workspaces.a);
   await inherited.close();
-  const managed = page.locator("#workspaces .row").filter({ hasText: hub.workspaces.b });
-  await managed.getByText("More actions", { exact: true }).click();
+  await page.locator(`[data-disclosure="${b}-inactive"] > summary`).click();
+  const managed = page.locator(`[data-repository="${b}"]`);
   page.once("dialog", dialog => dialog.accept("Managed B"));
   await managed.getByRole("button", { name: "Rename workspace Shared" }).click();
   await expect(managed).toContainText("Managed B");
@@ -50,7 +58,8 @@ test("real visits, copied context, management identity, stopped Return and sign-
   await expect(page).toHaveURL(`${hub.origin}/settings`);
   page.once("dialog", dialog => dialog.accept());
   await page.locator("#hub-return").click();
-  await expect(page).toHaveURL(`${hub.origin}/s/${a}/`);
+  await expect(page).toHaveURL(destination);
+  await expect(page.locator("#preview")).toContainText("Guide A");
   await page.goBack();
   await expect(page).toHaveURL(`${hub.origin}/settings`);
   await expect(page.locator(".nav-overlay")).toHaveCount(0);
@@ -224,11 +233,11 @@ test("Return uses masked credential recovery and reports real startup rejection 
 test("real long-path rows retain loading, failure and slow-opening feedback", async ({ page, hub }) => {
   test.setTimeout(90_000);
   await loginHub(page, hub);
-  await expect(page.locator("#sessions")).toContainText("No sessions running");
-  await expect(page.locator("#workspaces")).toContainText("No stopped workspaces");
+  await expect(page.locator("#sessions")).toContainText("No checkouts running");
+  await expect(page.locator("#workspaces")).toContainText("No inactive repositories");
   const folderName = "long-workspace-path-".repeat(10);
   await hubPost(page.request, hub, "/api/hub/folders/create", { parent: hub.root, name: folderName });
-  await hubPost(page.request, hub, "/api/hub/workspaces/configure", { path: `${hub.root}/${folderName}`, displayName: "Long path", init: true });
+  const longPath = (await hubPost<{ workspace: { id: string } }>(page.request, hub, "/api/hub/workspaces/configure", { path: `${hub.root}/${folderName}`, displayName: "Long path", init: true })).workspace;
   const workspace = (await hubPost<{ workspace: { id: string } }>(page.request, hub, "/api/hub/workspaces/configure", { path: hub.workspaces.a, displayName: "Opening target" })).workspace;
   let releaseState!: () => void;
   const stateGate = new Promise<void>(resolve => { releaseState = resolve; });
@@ -243,6 +252,7 @@ test("real long-path rows retain loading, failure and slow-opening feedback", as
   await expect(page.locator("#workspaces")).toContainText("Loading");
   releaseState();
   await expect(page.locator("#workspaces")).toContainText(folderName);
+  await page.locator(`[data-disclosure="${longPath.id}-inactive"] > summary`).click();
   expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
   const secondary = page.locator("#workspaces .row").filter({ hasText: folderName }).locator("summary");
   await secondary.click();
@@ -277,6 +287,7 @@ test("real long-path rows retain loading, failure and slow-opening feedback", as
     }).observe(document.body, { childList: true });
   });
   page.once("dialog", dialog => dialog.accept());
+  await page.locator(`[data-disclosure="${workspace.id}-inactive"] > summary`).click();
   await page.getByRole("button", { name: "Start Opening target" }).click();
   await expect(page.getByRole("button", { name: "Start Opening target" })).toHaveText("Starting…");
   await expect(page.getByRole("button", { name: "Start Opening target" })).toBeDisabled();

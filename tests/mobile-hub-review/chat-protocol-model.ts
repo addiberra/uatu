@@ -1,4 +1,5 @@
 import type { ChatEvent, ChatModel, ChatCommand, ConversationSnapshot, ConversationStatus } from "../../src/chat/types";
+import { CHILD_CONVERSATION_OPEN_EVENT } from "../../src/shared/live-protocol";
 
 const models: ChatModel[] = [{ selection: { providerId: "synthetic", modelId: "review-small" }, provider: "Synthetic (no provider)", name: "Synthetic review small", default: true, imageInput: true }];
 const commands: ChatCommand[] = [{ name: "status", description: "Synthetic status; no tools or provider", argumentHint: "", kind: "command" }];
@@ -43,7 +44,7 @@ export function createChatProtocolModel(initial: ConversationSnapshot) {
     subscribe(listener: (id: string, frame: string) => void) { listeners.add(listener); return () => { listeners.delete(listener); }; },
     replay(id: string, cursor: string | null) {
       const record = records.get(id)!;
-      if (!cursor || cursor === record.snapshot.cursor) return ": synthetic chat stream\n\n";
+      if (!cursor || cursor === record.snapshot.cursor) return `event: ${CHILD_CONVERSATION_OPEN_EVENT}\ndata: ${JSON.stringify({ cursor: record.snapshot.cursor })}\n\n`;
       const prefix = `${record.snapshot.generation}:`, n = Number(cursor.slice(prefix.length));
       if (!cursor.startsWith(prefix) || !Number.isSafeInteger(n) || n < 0 || n > record.sequence || n < (record.events[0]?.sequence ?? 1) - 1) return frame({ type: "resync", reason: "retention-gap", generation: record.snapshot.generation, sequence: record.sequence, conversationId: id });
       return record.events.filter(event => event.sequence > n).map(frame).join("");

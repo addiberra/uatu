@@ -2,6 +2,7 @@ import { expect, test } from "./fixtures";
 
 import { treeRow } from "./tree-helpers";
 import { showGitLogPane, standardBeforeEach } from "./fixtures";
+import { captureScreenshot } from "./evidence";
 
 test.beforeEach(async ({ page, request }) => {
   await standardBeforeEach(page, request);
@@ -64,4 +65,71 @@ test("commit preview URLs show an unavailable state when data is missing", async
   await expect(page.locator("#preview")).toHaveClass(/empty/);
   await showGitLogPane(page);
   await expect(page.locator("#git-log")).toContainText("add feature doc");
+});
+
+test("Git Log rows and the commit preview show the commit's age from its commit time", async ({ page, request }, testInfo) => {
+  await request.post("/__e2e/reset", { data: { git: true } });
+  await page.goto("/");
+  await showGitLogPane(page);
+  const gitLog = page.locator("#git-log");
+  const row = gitLog.locator(".commit-log a", { hasText: "add feature doc" });
+  const age = row.locator("time.commit-age");
+  await expect(age).toHaveAttribute("data-committed-at", /^\d+$/);
+  await expect(age).toHaveText(/^\d+ (second|minute)s? ago$/);
+  const committedAt = Number(await age.getAttribute("data-committed-at"));
+  expect(new Date(await age.getAttribute("datetime") ?? "").getTime()).toBe(committedAt);
+  await captureScreenshot(page, testInfo, "git-log-commit-age");
+
+  await row.click();
+  const previewAge = page.locator(".commit-preview header time.commit-age");
+  await expect(previewAge).toHaveAttribute("data-committed-at", String(committedAt));
+  await expect(previewAge).toHaveText(/^\d+ (second|minute)s? ago$/);
+  await captureScreenshot(page, testInfo, "commit-preview-age");
+});
+
+test("commit ages advance in place without asking the server", async ({ page, request }, testInfo) => {
+  await request.post("/__e2e/reset", { data: { git: true } });
+  await page.clock.install();
+  await page.goto("/");
+  await showGitLogPane(page);
+  const row = page.locator("#git-log .commit-log a", { hasText: "add feature doc" });
+  const age = row.locator("time.commit-age");
+  await expect(age).toHaveText(/^\d+ (second|minute)s? ago$/);
+  await row.focus();
+  await row.evaluate(element => { (window as unknown as { __ageRow?: Element }).__ageRow = element; });
+
+  const repositoryReads: string[] = [];
+  page.on("request", request => {
+    const url = new URL(request.url());
+    if (url.pathname.endsWith("/api/state") || url.pathname.includes("/api/repositories")) repositoryReads.push(url.pathname);
+  });
+  await page.clock.runFor("20:00");
+
+  await expect(age).toHaveText(/^(19|20) minutes ago$/);
+  await captureScreenshot(page, testInfo, "git-log-age-after-20-minutes");
+  // Same element, still focused: the row was not rebuilt.
+  expect(await row.evaluate(element => element === (window as unknown as { __ageRow?: Element }).__ageRow && document.activeElement === element)).toBe(true);
+  expect(repositoryReads).toEqual([]);
+});
+
+test("commit ages pause while the page is hidden and catch up when it returns", async ({ page, request }) => {
+  await request.post("/__e2e/reset", { data: { git: true } });
+  await page.clock.install();
+  await page.goto("/");
+  await showGitLogPane(page);
+  const age = page.locator("#git-log .commit-log a", { hasText: "add feature doc" }).locator("time.commit-age");
+  await expect(age).toHaveText(/^\d+ (second|minute)s? ago$/);
+  const setHidden = (hidden: boolean) => page.evaluate(value => {
+    Object.defineProperty(document, "hidden", { configurable: true, get: () => value });
+    Object.defineProperty(document, "visibilityState", { configurable: true, get: () => (value ? "hidden" : "visible") });
+    document.dispatchEvent(new Event("visibilitychange"));
+  }, hidden);
+
+  await setHidden(true);
+  const before = await age.textContent();
+  await page.clock.runFor("20:00");
+  expect(await age.textContent()).toBe(before);
+
+  await setHidden(false);
+  await expect(age).toHaveText(/^(19|20) minutes ago$/);
 });

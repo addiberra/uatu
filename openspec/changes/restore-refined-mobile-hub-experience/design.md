@@ -1,27 +1,27 @@
 ## Context
 
-See `proposal.md` for motivation and `diagnosis.md` for evidence. The previous change produced working surface navigation but did not implement the refined Hub composition. Its real-Hub screenshots were documentary captures, not visual assertions. The user now requires reference fidelity, frame-free workspace continuity, and frontend approval against a mocked backend before live integration.
+See `proposal.md` for motivation and `diagnosis.md` for evidence. The previous change produced working surface navigation but did not implement the refined Hub composition. Its real-Hub screenshots were documentary captures, not visual assertions. The original frontend-first scope required mocked-backend review before live integration; the 2026-10-15 decision below explicitly authorizes integration without claiming completed visual/device certification.
 
 The repository has two document-global frontend implementations. `src/hub/pages.ts` emits Hub documents with a large inline controller. `src/app.ts` queries workspace elements at module initialization and wires singleton owners; `src/shell/state.ts` owns workspace state. Hub links currently perform document navigation. Chat retains pending File objects and asynchronous uploads that cannot be recreated from persisted text; non-BFCache pagehide disposes its work. These facts make a same-document module extraction necessary, rather than another stylesheet override or saved-state approximation.
 
-This design is required because the change crosses presentation, navigation, interaction ownership, and client lifetime seams. It describes the frontend-first stage, not a completed live integration.
+This design crosses presentation, navigation, interaction ownership, and client lifetime seams. D1–D7 describe the established frontend architecture; dated refinements preserve its history. D8–D10 and the amended migration plan govern the newly authorized live stage. No live implementation is completed by this planning amendment.
 
 ## Goals / Non-Goals
 
 **Goals**
 
-- Give the approved UI one reusable implementation and a backend interface that can be driven synthetically now and connected to real operations later.
+- Give the agreed UI one reusable implementation, with separate synthetic and live adapters and complete upstream capability parity.
 - Reproduce whole-screen composition and complete interaction flows, with named review states and explicit exceptions rather than loosely inspired styling.
 - Preserve exactly one workspace instance on ordinary Hub/Settings detours without embedding frames or duplicating state owners.
 - Keep server effects outside the frontend review environment and make unexpected mock gaps fail visibly.
 
 **Non-Goals**
 
-- No real branch probes, credential tools, clone jobs, filesystem onboarding mutations, live authentication/session mutations, or provider/PTY processes in this stage.
+- No live effects in the synthetic reviewer or this planning-only invocation. Subsequent apply work may implement and test real operations in isolated, explicitly assigned resources; personal provider login, secrets or existing service changes are not implied.
 - No replacement of current production desktop pages, standalone behavior, or workspace interiors. No native Desktop implementation changes.
 - No multiple resident workspaces, new workspace singleton, iframe, restore-from-screenshot UI, or alternate mock-only frontend.
 - No promise that pending browser work survives an OS process eviction or explicit reload. Ordinary view navigation must not cause those losses itself.
-- No automatic promotion of frontend approval into backend or release approval. Do not archive/sync these production-facing deltas merely because the mock review is ready.
+- No automatic promotion of design/integration authorization into backend correctness, visual/device acceptance or release approval. No spec sync/archive in this phase.
 
 ## Decisions
 
@@ -29,7 +29,7 @@ This design is required because the change crosses presentation, navigation, int
 
 Place reusable Hub frontend modules under the existing `src/hub/` feature, preferably a cohesive `mobile/` area rather than further growing the inline `pages.ts` controller. Provide a scoped root and an explicit backend interface. Its responsibilities are authenticated view data, typed operation intents/results, progress streams, and invalidation—not arbitrary HTML or a generic untyped action dispatcher.
 
-Reuse existing domain types where they express the real contract. Readiness, assignment, clone result, registration, and running state must not collapse into a single Boolean to simplify the mock. Branch metadata is an explicit discriminated frontend value (named, detached, unborn, non-Git, loading, unavailable), not a guessed `main`. Its eventual wire format is deferred rather than silently added to the published API in this stage.
+Reuse existing domain types where they express the real contract. Readiness, assignment, clone result, registration, and running state must not collapse into a single Boolean to simplify the mock. Branch metadata is an explicit discriminated frontend value (named, detached, unborn, non-Git, loading, unavailable), not a guessed `main`. Its wire format was deferred in the frontend-first stage; D10 now requires explicit reconciliation/publication before live use.
 
 Frontend behavior owns form drafts, validation, focus, sheet transitions, pending state, contextual errors, and intent sequencing. The backend adapter owns effects and transport. Backend failures cannot tell the UI to replace itself with unrelated markup. Do not copy fake prototype services or credentials into `src/`.
 
@@ -39,7 +39,7 @@ facts, and saved tool override separately from detected/effective path. Reuse
 existing public/domain DTOs, but do not infer these additional facts from
 readiness prose, names or key text. Unknown/not-applicable states remain explicit.
 Populate and test the facts synthetically; live acquisition and public API
-changes remain deferred.
+changes were deferred at that checkpoint and now belong to D10's authorized stage.
 
 Clone submission also receives an explicit non-secret attempt identity and an
 authoritative reconciliation operation. A lost response must not force a choice
@@ -100,11 +100,11 @@ The retained target is A during A -> Hub -> Settings -> A, even when a managemen
 
 ### D5. Reference-fidelity presentation, including complete workflows
 
-`reference-contract.md` is the visual authority and `screen-map.md` is the coverage inventory. Reconstruct the photographed composition, not the CSS of the gallery itself. Keep current UatuCode branding but use the reference's hierarchy, path treatment, folder/branch/ellipsis/navigation silhouettes, grouped Settings, and task-sheet grammar. Existing fonts remain available for current code/terminal surfaces; no proprietary icon/font package or new dependency is assumed.
+`reference-contract.md` is the visual authority and `screen-map.md` is the coverage inventory. Reconstruct the photographed composition with its explicit later amendments, not the CSS of the gallery itself. Keep current UatuCode branding and reference hierarchy, path treatment, folder/branch/ellipsis/navigation silhouettes and grouped Settings; later full-page editor and phone hierarchy decisions supersede the original task-sheet compositions. Existing fonts remain available for current code/terminal surfaces; no proprietary icon/font package or new dependency is assumed.
 
 The mobile dashboard is a dedicated overview composition, not a desktop pane with mobile padding. Settings is an identity and destination overview with focused details/tasks. Existing shell/credential/readiness information remains available through the reviewed subordinate information hierarchy; complete capability parity must not be traded for a photographed happy path. If satisfying an existing information-placement requirement would crowd the reference card, explicitly propose the overview/detail placement and reconcile that requirement instead of hiding the capability.
 
-Bottom-sheet forms need draft/commit/cancel semantics, not only a bottom border radius. Preview-side and other preference edits use current values, an owned draft, Cancel without committing, and an explicit commit action; a backdrop/Escape dismissal follows the same cancellation policy. Existing mutation confirmations, secret clearing, clone authorized-continuation rules, and partial-operation outcomes remain semantically authoritative. Unpictured compositions are review candidates, not pre-approved interaction-policy changes.
+Forms retain draft/commit/cancel semantics through the later full-page editor model. Preview-side and other preference edits use current values, an owned draft, Cancel without committing and an explicit commit action; Back/Escape obey the current task owner's cancellation policy. Existing mutation confirmations, secret clearing, clone authorized-continuation rules and partial-operation outcomes remain semantically authoritative. Unpictured compositions remain review candidates, not pre-approved changes to safety policy.
 
 The workspace selector retains its existing seven-second interaction-aware policy and local fade; the Hub return transition can slide the workspace aside in the same document. Keep motion brief and interruptible; detailed Hub-transition timing is tuned during visual review rather than claimed as recovered from still images. Reduced Motion removes travel. Hidden views do not reserve a workspace navigation gutter or become competing focus/scroll targets.
 
@@ -130,11 +130,35 @@ Visual tests must detect missing icons, wrong overview hierarchy, sheet anchorin
 
 Run relevant existing tests for modified frontend owners plus focused Chromium/WebKit mobile coverage where already installed. Exercise light/dark, 320/390 portrait, short landscape, tablet touch, text enlargement, safe areas, keyboard, reduced preferences and desktop non-regression. Full real-backend verification remains a later gate; report what was actually run rather than inheriting historical passes.
 
-### D8. Human approval is a stop, not an implementation checkbox to self-certify
+### D8. Separate integration authorization from final acceptance
 
-The frontend stage ends with the served URL, named scenarios, reference/actual comparisons, unpictured-state designs, known gaps, and an acceptance record explicitly awaiting the user. The user may request further frontend corrections before integration. Tests cannot mark the user approval complete.
+Historically the frontend stage ended with the served URL, named scenarios, comparisons, known gaps and a human review stop. On 2026-10-15 the user agreed the refined synthetic UI as the live phone Hub target and explicitly authorized integration in this existing change. This satisfies the authorization decision, not task 8.3's remaining version-specific visual/interaction acceptance or any physical-device check. Tests cannot mark those complete. Record the distinction in `review-evidence/acceptance.md`.
 
-After explicit visual/interaction approval, seek authorization for a separately scoped integration task set covering real Hub HTTP/data adapters, branch probing/public API documentation, deployment/entry routing, credential and clone correctness, authentication/transport invalidation, and full verification. Do not advance into these tasks simply because the user previously said to implement the frontend. Do not sync/archive the production-facing requirements or present them as shipped while the mock-backed frontend is the only active implementation.
+The existing proposal already anticipated real adapters and routing; this is an authorized scope amendment, not a different product intent requiring a separate change. Append dependency-ordered tasks without rewriting completed frontend history. The lead initiates apply after this planning phase. Do not sync/archive or call the target shipped while only the mock-backed frontend exists, and do not waive pending evidence to start implementation.
+
+### D9. Agreed phone hierarchy (2026-10-15)
+
+- A repository with one checkout uses one compact card with identity/path, truthful status and primary Open/Start. No duplicated repository header plus solitary branch row. Only multi-checkout repositories expose expanded branch/checkout rows; preserve stable repository/checkout identities and availability, inherited credentials, restart-required and activity facts. Never group by display-name coincidence.
+- Rename and create branch/worktree are secondary More actions, available only when supported. This changes dashboard action placement, not the earlier decision for direct actions and full-page editors inside Settings. Retain worktree inventory, fetch/base selection, create/open/start/register/forget/delete and their refusals; no direct Git mutation from the view.
+- Hub and Settings remain the two persistent icon/label dock destinations. Contextual Return remains distinct after a genuine visit. Notifications moves to a focused Settings page, not a third dock button; preserve enrollment, permission, unsupported/denied states and existing presence/attention behavior.
+- Agent accounts is its own Settings group with focused agent/provider/attempt pages, separate from SSH/OpenPGP/HTTPS and Git-provider CLI repository Credentials. Preserve machine-wide scope information, capability-based methods and all upstream login/logout/activation/recovery behavior. A provider unavailable in the isolated runtime is not a successful login test.
+- Place the concise credential-sharing notice within Credentials, not a general Settings banner. Keep the full explanation reachable there and present in relevant credential/assignment/clone flows: same OS UID, inspectable runtime files/shared agents, bypassable tool configuration and access to credentials assigned elsewhere. Retain per-user dismissal semantics for the advisory, but dismissal must not erase full details or consequential stop/delete warnings. Agent accounts keeps its separate machine-wide/all-users warning. Desktop placement and behavior stay unchanged.
+
+### D10. Grounded live integration boundary and contract gaps
+
+See the updated `review-evidence/integration-map.md` for source seams and checks. The production Hub currently serves `pages.ts` and proxies `/s/<id>/`; only the test-owned `browser-entry.ts` mounts the mobile coordinator. Do not copy that entry's review transport, xterm instrumentation or globals into shipping code.
+
+**Entry decision:** mount the mobile overview at authenticated Hub routes only on eligible touch devices, keeping the existing desktop renderer/controller active otherwise. With no resident workspace, Open may follow the canonical `/s/<id>/` document boundary. On an eligible Hub-served workspace entry, assemble one scoped Hub root alongside the existing workspace root and boot its coordinator once with the injected fixed base path, before workspace imports. Subsequent A → Hub → Settings → A uses that realm; opening B replaces it. Reloaded `/`, `/settings?detail=…`, `/clone` and `/s/<id>/file?…#…` must work without remembered synthetic state. No fixture workspace or retained draft is manufactured on direct Hub load.
+
+**Transport and auth:** introduce a browser-only live implementation of `MobileHubBackend`; validate wire payloads and map errors without treating network loss as rejection. Use `hubUrl()` for Hub APIs and `appUrl()` for the retained workspace's fixed `/s/A/` scope. The current state payload lacks the mobile authenticated user/host identity: add sanitized authenticated identity to the gated state response (or reuse an equivalent established bootstrap), never a session secret or anonymous workspace/version data. Keep the server's auth gate and cookie same-origin/CSRF checks, safe login return paths, rate limits, no-store and cookie attributes; native bearer behavior stays unchanged. Do not store the JSON login's bearer/session id in browser storage/history/logs. Unauthorized reads/mutations and authoritative revocation invalidate protected roots; transport failure alone is not proof of sign-out or Stop. Preserve proxy Origin/page-origin checks before rewriting and the existing brokered `/api/hub/live` ownership; never revive retired child SSE routes or create duplicate workspace streams.
+
+**Authoritative facts:** `/api/hub/state` already reports runtime/shell summaries, API revisions, worktree capability and sparse repository/branch facts. Those facts do not encode all `BranchState` variants: `readCheckoutHead()` returns branch/detached/unknown without detached commit or unborn/non-Git discrimination, and a linked fallback label is not an authoritative branch. Extend the bounded server fact seam additively as needed, without starting stopped workspaces or running Git per card on every poll. Missing/unsupported facts remain unknown/unavailable. Credential DTOs omit explicit protection/lock, OpenPGP user-ID and saved override facts required by the mobile seam; add safe optional DTO facts from existing owners, with explicit unknown/not-applicable states, not parsing readiness prose or secret material in the browser.
+
+**Mutation reuse:** use existing credential/onboarding/session/worktree/agent-account services and their lifecycle fences. Resolve inherited parent credential policy before child Start/assignment presentation. Preserve `ok:false` worktree outcomes even on HTTP 200, partial stop results, retained checkout/registration facts and credential-restart-required state. Notification enrollment reuses the existing PWA client/service, adapting only mounting and scoped presentation. Agent-account forms reuse published capabilities/field conditions and redirect validation; do not duplicate authentication runtimes.
+
+**Clone dependency:** the mobile seam has `attemptId` and authoritative reconciliation, while production currently offers job creation plus owner-scoped events/input/cancel, not an attempt lookup. Implement additive owner-bound attempt admission/reconciliation before enabling mobile clone submission. Serialize duplicates; bind accepted attempts to their original job and reject conflicting reuse; fenced `not-accepted` cannot later execute. Preserve pending/expired/unavailable across response loss and restart without authorizing blind retry. Publish request/result/retention semantics with compatibility tests; do not pretend a missing registration/job proves nonacceptance. Existing clients without an attempt id must retain their documented behavior.
+
+All wire additions ship with `api/openapi.yaml`, `api/operations.yaml`, relevant streaming inventory, contract/route/revision tests and documentation. Prefer additive optional fields/endpoints over changing existing clients. No new backend authorization model is intended; if needed, return to planning rather than quietly expanding scope.
 
 ## Risks / Trade-offs
 
@@ -317,6 +341,7 @@ embedded bytes, reject query/encoded variants, and remain explicitly allowlisted
 
 1. Record current reference and production/frontend baselines without overwriting archived evidence or existing dirty work.
 2. Add the reusable frontend and test-only entry/adapter, with existing production entry behavior unchanged by default.
-3. Serve the isolated review build and iterate against the reference until the user explicitly approves its visual and interaction design.
-4. Stop. Prepare live integration work only after that approval and authorization; publish any added wire contracts there.
-5. During review, rollback means stopping only the test launcher/Serve endpoint or removing the new scoped modules. No existing Hub state, credentials, registries, workspace files, or production deployment must be reset.
+3. Serve the isolated review build and iterate against the reference (historical frontend-first phase). Final version-specific visual/interaction acceptance remains open and carries forward separately from the newly granted integration authorization.
+4. The historical integration stop is superseded by the explicit 2026-10-15 authorization. Execute tasks 17–23 only when the lead starts apply: first read-only live adapter/contract tests, then routing/auth, credentials/accounts/notifications, lifecycle/onboarding/clone/worktrees and live retention. Do not expose an incomplete replacement that drops upstream operations; use test-owned assembly until parity and release checks pass.
+5. Preserve both current parallel services throughout this plan: live HTTPS 8445 → loopback 4717 and synthetic HTTPS 8446 → loopback 4718, with lifecycle details only in the existing private runtime handoff. Do not restart/reset them or change Serve/launchd/auth configuration as a side effect of planning or tests.
+6. Verify isolated live fixtures separately from synthetic scenarios; retain pending visual/device/native evidence and the unwaived broader Chat touch 11 failures and archive-digest mismatch. Rollout needs a verified candidate and explicitly scoped service action by the lead, not an automatic reviewer restart. Rollback selects the preceding production build/entry without deleting state, credentials, registries or workspace files; synthetic review remains independent. No commit/push, main-spec sync or archive is part of this planning phase.

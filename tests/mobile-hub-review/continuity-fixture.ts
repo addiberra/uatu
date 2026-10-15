@@ -11,7 +11,7 @@ export function continuityCorpus(base: StatePayload): StatePayload {
     ...identity, metadata: { ...identity, status: "git", branch: "synthetic", detached: false, commitShort: continuityCommit.slice(0, 7), dirty: false, message: null },
     status: "available", base: { mode: "fallback", ref: "HEAD", mergeBase: continuityCommit, compareTarget: "base", comparedAgainstRef: "HEAD", targetsCollapsed: true },
     changedFiles: [], gitIgnoredFiles: [], configWarnings: [], message: null,
-    commitLog: [{ sha: continuityCommit, subject: "Synthetic populated commit", message: "Synthetic populated commit\n\nRetain the canonical commit destination through Hub navigation.", author: "Synthetic reviewer", relativeTime: "fixture time" }],
+    commitLog: [{ sha: continuityCommit, subject: "Synthetic populated commit", message: "Synthetic populated commit\n\nRetain the canonical commit destination through Hub navigation.", author: "Synthetic reviewer", relativeTime: "fixture time", committedAtMs: root.docs[0]!.mtimeMs }],
   };
   state.repositories = [repository];
   return state;

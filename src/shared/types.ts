@@ -1,3 +1,5 @@
+import { isViewableImageName } from "./viewable-image";
+
 export type DocumentKind = "markdown" | "asciidoc" | "text" | "binary";
 
 export type DocumentMeta = {
@@ -7,6 +9,8 @@ export type DocumentMeta = {
   mtimeMs: number;
   rootId: string;
   kind: DocumentKind;
+  // Present on event-fed inventories; changes even for equal-mtime saves.
+  revision?: number;
 };
 
 export type RootGroup = {
@@ -21,10 +25,8 @@ export type RootGroup = {
   hiddenCount: number;
 };
 
-// Repo-derived facts about the on-disk file behind a rendered document,
-// computed fresh on every /api/document render (live reload keeps them
-// current). `git` is absent for non-git roots and whenever the git lookup
-// fails — the render itself must never fail because facts collection did.
+// Facts about the rendered file. Filesystem facts accompany fresh content;
+// Git provenance is separate and generation-bound. Diff can collect both.
 // String fields are HTML-escaped server-side before serialization, matching
 // the sanitizeMetadata posture.
 export type FileFactsGit = {
@@ -45,6 +47,7 @@ export type FileFacts = {
   bytes: number;
   mtime: string; // ISO 8601
   git?: FileFactsGit;
+  gitState?: "pending" | "stale" | "ready" | "unavailable" | "non-git";
 };
 
 export type BuildSummary = {
@@ -132,7 +135,11 @@ export type CommitLogEntry = {
   subject: string;
   message: string;
   author: string | null;
+  // Git's wall-clock text ("3 hours ago") as of collection. Kept for older
+  // clients; it goes stale between collections.
   relativeTime: string | null;
+  // Commit time in epoch milliseconds. Clients render the age from this.
+  committedAtMs: number | null;
 };
 
 export type RepositorySnapshot = {
@@ -174,7 +181,7 @@ export type StatePayload = WorkspaceApiCompatibility & {
   generatedAt: number;
   build: BuildSummary;
   scope: Scope;
-  // Opaque hash of the *unscoped* corpus (ids, paths, mtimes). In a scoped
+  // Opaque revision of the *unscoped* corpus. In a scoped
   // session the client never sees the unscoped roots, yet a widened search's
   // results live there — comparing this across snapshots is the only way it
   // can notice those documents changing.
@@ -426,6 +433,15 @@ export function findDocument(
   return flattenDocuments(roots).find(doc => doc.id === documentId);
 }
 
+// Follow mode (Rule C) follows what the preview can show: every non-binary
+// document, and binary files the preview renders inline as an image. Other
+// binaries (archives, PDFs, fonts, …) have only a "not viewable" notice and
+// never take the preview over. The default document and Rule B's catch-up
+// stay documents-only (see `defaultDocumentId`).
+export function isFollowableFile(doc: DocumentMeta): boolean {
+  return doc.kind !== "binary" || isViewableImageName(doc.name);
+}
+
 export function defaultDocumentId(roots: RootGroup[]): string | null {
   const docs = flattenDocuments(roots).filter(doc => doc.kind !== "binary");
   if (docs.length === 0) {
@@ -458,6 +474,7 @@ export function shouldRefreshPreview(
   return Boolean(previous && next && (
     previous.mtimeMs !== next.mtimeMs
     || previous.kind !== next.kind
+    || previous.revision !== next.revision
   ));
 }
 
@@ -466,7 +483,9 @@ export function nextSelectedDocumentId(
   currentId: string | null,
   changedId: string | null,
   followEnabled: boolean,
+  selectionCleared = false,
 ): string | null {
+  if (!followEnabled && selectionCleared) return null;
   // Navigation intent survives index gaps and binary classification.
   if (!followEnabled && currentId) return currentId;
 
@@ -476,14 +495,14 @@ export function nextSelectedDocumentId(
 
   if (followEnabled && changedId) {
     const changed = findDocument(roots, changedId);
-    if (changed && changed.kind !== "binary") {
+    if (changed && isFollowableFile(changed)) {
       return changedId;
     }
   }
 
   if (currentId) {
     const current = findDocument(roots, currentId);
-    if (current && current.kind !== "binary") {
+    if (current && isFollowableFile(current)) {
       return currentId;
     }
   }

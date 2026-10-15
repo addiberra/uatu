@@ -8,6 +8,7 @@ import path from "node:path";
 import {
   credentialGnuPgPath,
   credentialRuntimePath,
+  agentAccountsPath,
   credentialSecretsPath,
   credentialsPath,
   credentialTokenStorePath,
@@ -117,6 +118,7 @@ describe("resolveHubStateRoot", () => {
     expect(credentialTokenStorePath("/s")).toBe("/s/credential-secrets/tokens.json");
     expect(credentialGnuPgPath("/s")).toBe("/s/credential-gnupg");
     expect(credentialRuntimePath("/s")).toBe("/s/credential-runtime");
+    expect(agentAccountsPath("/s")).toBe("/s/agent-accounts");
   });
 });
 
@@ -164,6 +166,55 @@ describe("Hub state-root lease", () => {
     expect(losers.every(outcome => outcome.stderr.includes("Hub state root is already in use"))).toBe(true);
 
     await releaseLeaseProcess(contenders[outcomes.findIndex(outcome => outcome.status === "locked")]!);
+  });
+
+  test("a lock held only during another contender's setup is waited out, not taken for an owner", async () => {
+    const stateRoot = await tempStateRoot();
+    await ensureStateDir(stateRoot);
+    const leasePath = path.join(stateRoot, ".hub-lease");
+    await writeFile(leasePath, "", { mode: 0o600 });
+    // Stands in for a first-time contender caught mid-setup: it holds a write
+    // lock on the still-empty lease file, before any schema exists, and lets
+    // go on command instead of keeping it for life.
+    const blocker = spawn(process.execPath, ["-e", `
+      const { Database } = require("bun:sqlite");
+      const db = new Database(process.env.LEASE_PATH);
+      db.exec("BEGIN EXCLUSIVE");
+      process.stdout.write("held\\n");
+      process.stdin.once("data", () => { db.exec("ROLLBACK"); db.close(); process.exit(0); });
+    `], { stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, LEASE_PATH: leasePath } });
+    leaseProcesses.add(blocker);
+    blocker.once("exit", () => leaseProcesses.delete(blocker));
+    await new Promise<void>((resolve, reject) => {
+      let stdout = "";
+      blocker.stdout.on("data", chunk => {
+        stdout += chunk.toString();
+        if (stdout.includes("held\n")) resolve();
+      });
+      blocker.once("exit", code => reject(new Error(`blocker exited early (${code})`)));
+    });
+
+    const acquisition = acquireHubStateLease(stateRoot, { contentionWindowMs: 10_000 });
+    let settled = false;
+    void acquisition.then(() => { settled = true; }, () => { settled = true; });
+    await Bun.sleep(150);
+    expect(settled).toBe(false);
+    blocker.stdin.end("release\n");
+    expect(await waitForExit(blocker)).toBe(0);
+
+    const lease = await acquisition;
+    await expect(acquireHubStateLease(stateRoot, { contentionWindowMs: 0 })).rejects.toThrow(/already in use/);
+    await lease.release();
+  });
+
+  test("a live owner is reported within the bounded contention window", async () => {
+    const stateRoot = await tempStateRoot();
+    await ensureStateDir(stateRoot);
+    const owner = await acquireHubStateLease(stateRoot);
+    const started = performance.now();
+    await expect(acquireHubStateLease(stateRoot)).rejects.toThrow(/already in use/);
+    expect(performance.now() - started).toBeLessThan(3_000);
+    await owner.release();
   });
 
   test("graceful release permits reacquisition without changing the inode", async () => {
@@ -375,7 +426,7 @@ describe("Hub state-root lease", () => {
     expect((await firstLeaseProcessOutcome(compiled)).status).toBe("locked");
     await expect(acquireHubStateLease(stateRoot)).rejects.toThrow(/already in use/);
     await releaseLeaseProcess(compiled);
-  });
+  }, 30_000); // compiling the helper takes seconds on its own
 });
 
 describe("ensureCredentialStateDirs", () => {
@@ -383,7 +434,7 @@ describe("ensureCredentialStateDirs", () => {
     const stateRoot = await tempStateRoot();
     await ensureStateDir(stateRoot);
     await ensureCredentialStateDirs(stateRoot);
-    for (const directory of [credentialSecretsPath(stateRoot), credentialGnuPgPath(stateRoot), credentialRuntimePath(stateRoot)]) {
+    for (const directory of [credentialSecretsPath(stateRoot), credentialGnuPgPath(stateRoot), credentialRuntimePath(stateRoot), agentAccountsPath(stateRoot)]) {
       expect((await stat(directory)).mode & 0o777).toBe(0o700);
     }
 

@@ -159,7 +159,9 @@ export class LocalProcessBackend implements SessionBackend {
       },
     };
     void session.exited
-      .then(() => fs.rm(projected.runtimeDirectory, { recursive: true, force: true }))
+      .then(async () => {
+        await fs.rm(projected.runtimeDirectory, { recursive: true, force: true });
+      })
       .catch(() => undefined);
     return session;
   }

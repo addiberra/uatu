@@ -3,14 +3,19 @@ import os from "node:os";
 import path from "node:path";
 
 import { ConversationReplay } from "../../src/chat/replay";
-import { deriveConversationTitle, QueuedMessageNotHeldError, ReversibleHistoryUnsupportedError, UnknownAttachmentError } from "../../src/chat/adapter";
+import { NotificationFeed } from "../../src/chat/notification-feed";
+import { deriveConversationTitle, QueuedMessageNotHeldError, ReversibleHistoryUnsupportedError, UnknownAttachmentError, UsageUnsupportedError } from "../../src/chat/adapter";
 import { createAttachmentStore } from "../../src/chat/attachment-store";
 import { ConversationInventoryBroadcaster, type ConversationInventorySubscription } from "../../src/chat/inventory-broadcaster";
 import { ReversibleHistoryTargetError } from "../../src/chat/provider";
 import type { WorkspaceChatService } from "../../src/chat/service";
 import { ConversationNotFoundError } from "../../src/chat/workspace";
+import { isLiveConversationStatus, type AgentUsageReport, type ChatAccountChange, type ChatLoginState, type BackgroundTaskOutput, type UsageReadMode, type UsageReadResult } from "../../src/chat/types";
 import type {
+  ChatActivity,
   ChatCapability,
+  ChatCommand,
+  ChatMode,
   ChatModel,
   ChatEvent,
   ChatAvailability,
@@ -24,8 +29,7 @@ import type {
   QueuedMessage,
   QuestionOutcome,
   ReversibleHistoryResult,
-  ReversibleHistoryState,
-} from "../../src/chat/types";
+  ReversibleHistoryState, PlanUtilization } from "../../src/chat/types";
 
 export type ReversibleFileFixture = {
   relativePath: string;
@@ -45,6 +49,15 @@ type FakeE2EChatServiceOptions = {
   // Capabilities this fake declares beyond the shared default set (a
   // Claude-shaped fixture declares typed model ids; the OpenCode one does not).
   extraCapabilities?: ChatCapability[];
+};
+
+export type UsageReadOutcome = {
+  outcome: "ok" | "fail" | "no-live-session";
+  delayMs?: number;
+  plan?: PlanUtilization;
+  // The conversation a successful read lands its context report in.
+  conversationId?: string;
+  contextTotal?: number;
 };
 
 export class FakeE2EChatService implements WorkspaceChatService {
@@ -73,6 +86,11 @@ export class FakeE2EChatService implements WorkspaceChatService {
   private readonly children = new Set<string>();
   private readonly subscriptions = new Set<{ cancel(): void }>();
   private inventory = new ConversationInventoryBroadcaster();
+  private activityChanges = new ConversationInventoryBroadcaster();
+  // The workspace's unanswered requests, as the real adapter reports them:
+  // a pending permission or question announces, anything else resolves. The
+  // router qualifies and merges it; `/api/chat/awaiting` reads it.
+  readonly notificationFeed = new NotificationFeed();
   private readonly inventorySubscriptions = new Set<ConversationInventorySubscription>();
   private readonly pendingInventorySubscriptions = new Set<() => void>();
   private inventoryTransportInterrupted = false;
@@ -109,6 +127,18 @@ export class FakeE2EChatService implements WorkspaceChatService {
   private static readonly DEFAULT_CAPABILITIES: ChatCapability[] = ["modes", "models", "commands", "questions", "permissions", "subagents", "variants", "context", "conversation-rename", "attachments"];
   private capabilities: ChatCapability[];
   private modelInventory: ChatModel[] = FakeE2EChatService.defaultModels();
+  private modeInventory: ChatMode[] = FakeE2EChatService.defaultModes();
+
+  private static defaultModes(): ChatMode[] {
+    return [
+      { name: "build", description: "Full read-write mode" },
+      { name: "plan", description: "Read-only planning mode" },
+    ];
+  }
+
+  setModes(modes: ChatMode[]): void {
+    this.modeInventory = structuredClone(modes);
+  }
   // The real store against a throwaway root: e2e uploads exercise the real
   // sniffing, caps, and id policy rather than a parallel fake.
   private readonly attachmentStore = createAttachmentStore({
@@ -133,11 +163,41 @@ export class FakeE2EChatService implements WorkspaceChatService {
     ];
   }
 
+  // The machine's login as this fake agent reports it (agent-accounts). Absent
+  // until a test sets it, like an agent that has not said. An accounts change
+  // from the Hub bumps the revision and moves the login the way a real agent's
+  // re-read would: a login makes it usable and brings the models back, a
+  // logout of the last provider leaves it with none.
+  private login: ChatLoginState | undefined;
+  private accountsRevision = 0;
+  private catalogRevision = 0;
+  readonly accountChanges: ChatAccountChange[] = [];
+
+  setLogin(login: ChatLoginState | undefined, options: { silent?: boolean } = {}): void {
+    this.login = login;
+    if (!options.silent) this.invalidateInventory();
+  }
+
+  async accountsChanged(change: ChatAccountChange): Promise<void> {
+    this.accountChanges.push(change);
+    this.accountsRevision += 1;
+    if (change.kind === "added") {
+      this.login = "ok";
+      if (this.modelInventory.length === 0) this.modelInventory = FakeE2EChatService.defaultModels();
+    } else if (change.kind === "removed") {
+      this.login = "missing";
+      this.modelInventory = [];
+    }
+  }
+
   async status(): Promise<ChatAvailability> {
     this.statusCalls += 1;
     return this.unavailable ?? {
       state: "ready",
       version: "e2e",
+      ...(this.login ? { login: this.login } : {}),
+      ...(this.accountsRevision ? { accountsRevision: this.accountsRevision } : {}),
+      ...(this.catalogRevision ? { catalogRevision: `e2e:${this.catalogRevision}` } : {}),
       agent: {
         id: this.agentId,
         name: this.agentName,
@@ -153,6 +213,16 @@ export class FakeE2EChatService implements WorkspaceChatService {
 
   setModels(models: ChatModel[]): void {
     this.modelInventory = structuredClone(models);
+    this.catalogRevision += 1;
+    this.inventory.invalidate();
+  }
+
+  // Commands a test adds on top of the fixture's own (long descriptions for
+  // the wrapping check); cleared by reset.
+  private extraCommands: ChatCommand[] = [];
+
+  setExtraCommands(commands: ChatCommand[]): void {
+    this.extraCommands = structuredClone(commands);
   }
 
   configureNextConversation(configuration: ConversationConfiguration): void {
@@ -206,10 +276,7 @@ export class FakeE2EChatService implements WorkspaceChatService {
   }
 
   async modes() {
-    return [
-      { name: "build", description: "Full read-write mode" },
-      { name: "plan", description: "Read-only planning mode" },
-    ];
+    return structuredClone(this.modeInventory);
   }
 
   async commands() {
@@ -218,6 +285,7 @@ export class FakeE2EChatService implements WorkspaceChatService {
       { name: "openspec-archive-change", description: "Archive a completed OpenSpec change", argumentHint: "[change]", kind: "skill" as const },
       { name: "compact", description: "Compact the conversation context", argumentHint: "", kind: "command" as const },
       { name: "summarize", description: "Summarize and compact the conversation context", argumentHint: "", kind: "command" as const },
+      ...this.extraCommands,
     ];
     return this.capabilities.includes("reversible-history")
       ? [
@@ -257,6 +325,24 @@ export class FakeE2EChatService implements WorkspaceChatService {
       this.pendingInventorySubscriptions.add(resume);
       options.signal?.addEventListener("abort", resume, { once: true });
     });
+  }
+
+  // Workspace activity (hub-brokered-live-stream D5), read from the same
+  // state the fixture's conversations publish — a live status or live
+  // background work is working, a pending permission or question awaits the
+  // user — so a spec that drives a conversation drives the summary with it.
+  // Every mutation below ticks; the route drops ticks that leave the summary
+  // unchanged.
+  async activity(): Promise<ChatActivity> {
+    const working = [...this.conversations.values()].some(conversation =>
+      isLiveConversationStatus(conversation.status) || conversation.status === "background");
+    const awaiting = [...this.items.values()].some(items => [...items.values()].some(item =>
+      (item.type === "permission" || item.type === "question") && item.status === "pending"));
+    return { working, awaiting };
+  }
+
+  async subscribeActivity(options: { signal?: AbortSignal } = {}) {
+    return this.activityChanges.subscribe(options.signal);
   }
 
   async createConversation(): Promise<ConversationSnapshot> {
@@ -488,15 +574,17 @@ export class FakeE2EChatService implements WorkspaceChatService {
     const existing = this.receipts.get(key) as { outcome: PermissionOutcome } | undefined;
     if (existing) return existing;
     const result = { outcome };
-    this.permissionChoices.push({ interactionId, ...(choiceId ? { choiceId } : {}) });
+    this.permissionChoices.push({ interactionId, outcome, ...(choiceId ? { choiceId } : {}) });
     const item = this.items.get(id)!.get(`permission:${interactionId}`);
     if (item?.type === "permission") this.publishItem(id, { ...item, status: "resolved", outcome, ...(choiceId ? { choiceId } : {}) });
     this.receipts.set(key, result);
     return result;
   }
 
-  // What each permission reply carried, for spec assertions.
-  readonly permissionChoices: Array<{ interactionId: string; choiceId?: string }> = [];
+  // What each permission reply carried, for spec assertions, including the
+  // outcome, so a test can prove the persistent reply was sent exactly once
+  // and only after the confirmation step.
+  readonly permissionChoices: Array<{ interactionId: string; outcome: PermissionOutcome; choiceId?: string }> = [];
 
   async respondQuestion(id: string, interactionId: string, requestId: string, outcome: QuestionOutcome) {
     this.require(id);
@@ -512,6 +600,77 @@ export class FakeE2EChatService implements WorkspaceChatService {
 
   // What each stop request carried, for spec assertions.
   readonly stoppedTasks: string[] = [];
+  readonly releasedConversations: string[] = [];
+
+  // A fake output per task id, set by a control action: what the shell task
+  // view's output pane reads. Absent means the agent has not named the
+  // output yet, which the route answers as 404.
+  readonly taskOutputs = new Map<string, string>();
+  async taskOutput(id: string, taskId: string, options: { tailBytes: number }): Promise<BackgroundTaskOutput | null> {
+    this.require(id);
+    const text = this.taskOutputs.get(taskId);
+    if (text === undefined) return null;
+    const item = this.items.get(id)?.get(`task:${taskId}`);
+    const settled = item?.type === "background_task" ? item.status !== "running" : true;
+    const truncated = text.length > options.tailBytes;
+    return { text: truncated ? text.slice(text.length - options.tailBytes) : text, truncated, settled };
+  }
+
+  /**
+   * What a shell task has written so far, as the `taskOutput` control action
+   * sets it. Appending is the interesting shape: a spec proves the open
+   * output pane picks the new bytes up on its own poll, the way the real
+   * file grows under the running command. Absent (never set) leaves the read
+   * answering 404, which is the "output not yet available" state.
+   */
+  setTaskOutput(taskId: string, text: string, append = false): void {
+    this.taskOutputs.set(taskId, append ? (this.taskOutputs.get(taskId) ?? "") + text : text);
+  }
+
+  // The workspace's last-known plan usage and how the next read answers,
+  // both set by control actions (design D9).
+  usageReport: AgentUsageReport | null = null;
+  // No session is live in a fixture workspace unless a spec says so: an
+  // unasked (live-only) refresh answers nothing, an explicit read answers.
+  usageReadOutcome: UsageReadOutcome = { outcome: "no-live-session" };
+  readonly usageReads: Array<{ requestId: string; mode: UsageReadMode }> = [];
+
+  setUsageReport(report: AgentUsageReport | null): void {
+    this.usageReport = report;
+  }
+
+  setUsageReadOutcome(outcome: UsageReadOutcome): void {
+    this.usageReadOutcome = outcome;
+  }
+
+  async usage(): Promise<AgentUsageReport | null> {
+    // Gated like the real adapter: an agent that does not declare usage
+    // answers 409, so the client never routes reads to it.
+    if (!this.capabilities.includes("usage")) throw new UsageUnsupportedError();
+    return this.usageReport;
+  }
+
+  /**
+   * A read answers as the control action said it would. A report that
+   * answers also lands a context report in the named conversation, as the
+   * real provider's read does through the session it went through.
+   */
+  async readUsage(requestId: string, mode: UsageReadMode): Promise<UsageReadResult> {
+    if (!this.capabilities.includes("usage")) throw new UsageUnsupportedError();
+    this.usageReads.push({ requestId, mode });
+    const outcome = this.usageReadOutcome;
+    if (outcome.delayMs) await new Promise(resolve => setTimeout(resolve, outcome.delayMs));
+    if (outcome.outcome === "fail") return { report: null, reason: "timeout" };
+    if (outcome.outcome === "no-live-session" && mode === "live-only") return { report: null, reason: "no-live-session" };
+    const plan = outcome.plan ?? this.usageReport?.plan ?? { fiveHour: { utilization: 11 }, sevenDay: { utilization: 27 } };
+    const readAt = Date.now();
+    const report: AgentUsageReport = { plan, readAt, ...(outcome.conversationId ? { conversationId: outcome.conversationId } : {}) };
+    this.usageReport = report;
+    if (outcome.conversationId && this.items.has(outcome.conversationId)) {
+      this.publishItem(outcome.conversationId, { id: `context:report:${readAt}`, type: "context_report", createdAt: readAt, total: outcome.contextTotal ?? 30_000, max: 200_000, plan });
+    }
+    return { report };
+  }
 
   async stopTask(id: string, taskId: string, requestId: string): Promise<{ stopped: true }> {
     this.require(id);
@@ -527,14 +686,62 @@ export class FakeE2EChatService implements WorkspaceChatService {
     return result;
   }
 
+  // Cancel one wakeup, as the Claude provider does: the row reads cancelled.
+  async cancelWakeup(id: string, wakeupId: string, requestId: string): Promise<{ cancelled: true }> {
+    this.require(id);
+    const key = `cancel-wakeup:${id}:${wakeupId}:${requestId}`;
+    const existing = this.receipts.get(key) as { cancelled: true } | undefined;
+    if (existing) return existing;
+    const item = this.items.get(id)!.get(`wakeup:${wakeupId}`);
+    if (item?.type === "scheduled_wakeup" && (item.status === "pending" || item.status === "paused")) {
+      const { nextFireAt: _next, message: _message, ...rest } = item;
+      this.publishItem(id, { ...rest, status: "cancelled" });
+      const stillPending = [...this.items.get(id)!.values()].some(other => other.type === "scheduled_wakeup" && other.status === "pending");
+      if (item.status === "pending" && !stillPending) this.setStatus(id, "idle");
+    }
+    const result = { cancelled: true } as const;
+    this.receipts.set(key, result);
+    return result;
+  }
+
+  // Release the agent's session: as the Claude provider does, every pending
+  // wakeup reads as cancelled and the conversation is idle (D5).
+  async release(id: string, requestId: string): Promise<{ released: true }> {
+    this.require(id);
+    const key = `release:${id}:${requestId}`;
+    const existing = this.receipts.get(key) as { released: true } | undefined;
+    if (existing) return existing;
+    this.releasedConversations.push(id);
+    for (const item of [...this.items.get(id)!.values()]) {
+      if (item.type !== "scheduled_wakeup" || item.status !== "pending") continue;
+      const { nextFireAt: _next, ...rest } = item;
+      this.publishItem(id, { ...rest, status: "cancelled" });
+    }
+    this.setStatus(id, "idle");
+    const result = { released: true } as const;
+    this.receipts.set(key, result);
+    return result;
+  }
+
   async dispose(): Promise<void> {
     for (const subscription of [...this.inventorySubscriptions]) subscription.cancel();
     this.inventory.dispose();
+    // Ends every activity watcher, but stays usable: the harness keeps
+    // serving from this instance after a reset.
+    this.activityChanges.dispose();
+    this.activityChanges = new ConversationInventoryBroadcaster();
     this.inventoryTransportInterrupted = false;
     for (const resume of [...this.pendingInventorySubscriptions]) resume();
   }
 
   reset(): void {
+    this.login = undefined;
+    this.accountsRevision = 0;
+    this.catalogRevision = 0;
+    this.accountChanges.length = 0;
+    this.usageReport = null;
+    this.usageReadOutcome = { outcome: "no-live-session" };
+    this.usageReads.length = 0;
     this.disconnect();
     for (const subscription of [...this.inventorySubscriptions]) subscription.cancel();
     this.inventory.dispose();
@@ -552,6 +759,11 @@ export class FakeE2EChatService implements WorkspaceChatService {
     this.promptVariants = [];
     this.promptConfigurations = [];
     this.reversibleAttempts = [];
+    this.permissionChoices.length = 0;
+    // A fake task output and the stops one spec staged are that spec's setup:
+    // left behind they reach whichever test boots against this worker next.
+    this.taskOutputs.clear();
+    this.stoppedTasks.length = 0;
     this.failNextPrompt = false;
     this.failNextReversible = null;
     this.failNextHistory = false;
@@ -560,6 +772,9 @@ export class FakeE2EChatService implements WorkspaceChatService {
     // makes the next test on this worker boot against an unavailable agent.
     this.unavailable = null;
     this.generation = `e2e-chat-${this.nextId++}`;
+    for (const notification of this.notificationFeed.snapshot()) {
+      this.notificationFeed.publish({ type: "resolved", id: notification.id, conversationId: notification.conversationId });
+    }
     this.conversations.clear();
     this.items.clear();
     this.authoritativeItems.clear();
@@ -574,24 +789,31 @@ export class FakeE2EChatService implements WorkspaceChatService {
     this.dormant.clear();
     this.nextCreatedConfiguration = {};
     this.children.clear();
+    this.activityChanges.invalidate();
     // A narrowed agent is one test's setup, not the fixture's resting state:
     // left in place it reaches whichever test boots against this worker next.
     this.capabilities = this.defaultCapabilities();
     this.modelInventory = FakeE2EChatService.defaultModels();
+    this.extraCommands = [];
+    this.modeInventory = FakeE2EChatService.defaultModes();
   }
 
-  seed(title: string, items: ConversationItem[], older: ConversationItem[] = [], child = false, configuration: ConversationConfiguration = {}): ConversationSnapshot {
+  // `updatedAt` stamps a real last-activity time (epoch ms); without it the
+  // fixture's counter stands in, which the chooser treats as undated.
+  seed(title: string, items: ConversationItem[], older: ConversationItem[] = [], child = false, configuration: ConversationConfiguration = {}, updatedAt?: number): ConversationSnapshot {
     const id = `conversation-${this.nextId++}`;
     const conversation: ConversationSummary = {
       id,
       title,
-      createdAt: this.nextId,
-      updatedAt: this.nextId,
+      createdAt: updatedAt ?? this.nextId,
+      updatedAt: updatedAt ?? this.nextId,
       status: "idle",
     };
     this.conversations.set(id, conversation);
     if (child) this.children.add(id);
     this.items.set(id, new Map(items.map(item => [item.id, item])));
+    this.activityChanges.invalidate();
+    for (const item of items) this.announceInteraction(id, item);
     this.authoritativeItems.set(id, structuredClone(items));
     this.configurations.set(id, configuration);
     this.replay.set(id, new ConversationReplay(this.generation, id, 64 * 1024));
@@ -632,6 +854,7 @@ export class FakeE2EChatService implements WorkspaceChatService {
     this.conversations.delete(id);
     this.items.delete(id);
     this.authoritativeItems.delete(id);
+    this.activityChanges.invalidate();
     this.revertBoundaries.delete(id);
     this.reversibleFiles.delete(id);
     this.configurations.delete(id);
@@ -694,6 +917,19 @@ export class FakeE2EChatService implements WorkspaceChatService {
     };
   }
 
+  /** Retire an item, as an agent does when a standing it reported ends. */
+  removeItem(id: string, itemId: string): ChatEvent {
+    this.require(id);
+    const authoritative = this.authoritativeItems.get(id)!;
+    const existing = authoritative.findIndex(candidate => candidate.id === itemId);
+    if (existing >= 0) authoritative.splice(existing, 1);
+    const removed = this.items.get(id)!.get(itemId);
+    this.items.get(id)!.delete(itemId);
+    this.activityChanges.invalidate();
+    if (removed) this.announceInteraction(id, { ...removed, status: "resolved" } as ConversationItem);
+    return this.replay.get(id)!.publish({ type: "item.remove", itemId });
+  }
+
   publishItem(id: string, item: ConversationItem): ChatEvent {
     this.require(id);
     const authoritative = this.authoritativeItems.get(id)!;
@@ -706,7 +942,22 @@ export class FakeE2EChatService implements WorkspaceChatService {
       return this.replay.get(id)!.publish({ type: "resync", reason: "conversation-rewritten" });
     }
     this.items.get(id)!.set(item.id, item);
+    this.activityChanges.invalidate();
+    this.announceInteraction(id, item);
     return this.replay.get(id)!.publish({ type: "item.upsert", item });
+  }
+
+  private announceInteraction(conversationId: string, item: ConversationItem): void {
+    if (item.type !== "permission" && item.type !== "question") return;
+    const id = JSON.stringify([conversationId, item.id]);
+    const pending = this.notificationFeed.snapshot().some(notification => notification.id === id);
+    if (item.status === "pending" && !pending) {
+      this.notificationFeed.publish({ type: "notification", notification: {
+        id, conversationId, sourceId: item.id, kind: item.type === "question" ? "question-pending" : "permission-pending", createdAt: Date.now(),
+      } });
+    } else if (item.status !== "pending" && pending) {
+      this.notificationFeed.publish({ type: "resolved", id, conversationId });
+    }
   }
 
   publishDelta(id: string, itemId: string, delta: string): ChatEvent {
@@ -900,6 +1151,7 @@ export class FakeE2EChatService implements WorkspaceChatService {
     const authoritative = this.authoritativeItems.get(id)!;
     const end = this.boundaryIndex(id) ?? authoritative.length;
     this.items.set(id, new Map(authoritative.slice(0, end).map(item => [item.id, structuredClone(item)])));
+    this.activityChanges.invalidate();
   }
 
   private commitRevertedBranch(id: string): void {
@@ -940,8 +1192,17 @@ export class FakeE2EChatService implements WorkspaceChatService {
 
   private setStatus(id: string, status: ConversationSummary["status"], message?: string): void {
     const conversation = this.require(id);
+    // A top-level turn that goes from live to completed is what the real
+    // tracker announces as a finished turn.
+    if (status === "completed" && isLiveConversationStatus(conversation.status) && !this.children.has(id)) {
+      const sourceId = `turn-${this.nextId}`;
+      this.notificationFeed.publish({ type: "notification", notification: {
+        id: JSON.stringify([id, "turn-completed", sourceId]), conversationId: id, sourceId, kind: "turn-completed", createdAt: Date.now(),
+      } });
+    }
     this.conversations.set(id, { ...conversation, status, updatedAt: this.nextId });
     this.replay.get(id)!.publish({ type: "conversation.status", status, ...(message ? { message } : {}) });
+    this.activityChanges.invalidate();
     // A turn that ended on its own releases the next held message.
     if (status === "completed" || status === "idle") this.deliverNext(id);
   }

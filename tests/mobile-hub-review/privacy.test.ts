@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { buildEvidenceAssets, evidenceSelection } from "./hosting-evidence";
 
-const evidence = new URL("../../openspec/changes/restore-refined-mobile-hub-experience/review-evidence/", import.meta.url);
+import { reviewEvidenceRoot as evidence } from "./artifact-locations";
 test("compact public package contains no raw browser reports or personal path metadata", async () => {
   const assets = await buildEvidenceAssets();
   expect(evidenceSelection.filter(path => path.endsWith(".png"))).toHaveLength(20);

@@ -13,9 +13,12 @@ against Claude Code's native session storage.
 ### Requirement: Chat uses the workspace's Claude Code installation and identity
 When a Claude Code conversation is first needed, UatuCode SHALL discover
 the `claude` executable available to the workspace process and use the
-user's existing Claude Code configuration and authentication. UatuCode
-MUST NOT request, copy, persist, or transmit Anthropic or provider API
-keys. Claude Code availability SHALL be determined without keeping a
+user's existing Claude Code configuration and authentication. A
+workspace's chat MUST NOT request Anthropic or provider API keys or other
+credentials. Claude Code logins SHALL be started only from the Hub's Agent
+accounts area, through Claude Code's own login interface, and UatuCode MUST
+NOT copy, persist, log, or return the resulting credentials or the
+authorization codes that produce them. Claude Code availability SHALL be determined without keeping a
 long-lived idle service, and a failed or missing installation SHALL be
 reported as an actionable unavailable state attributed to Claude Code
 while the workspace, non-chat capabilities, and other agents remain
@@ -25,22 +28,26 @@ usable.
 - **WHEN** the workspace user has already authenticated Claude Code and starts a Claude Code conversation
 - **THEN** the conversation runs under that existing identity without asking for an API key
 
+#### Scenario: A login made in Agent accounts is used
+- **WHEN** a user logs in to Claude Code from Agent accounts and then prompts a Claude Code conversation in a running workspace
+- **THEN** the conversation runs under the new login without restarting the workspace
+
 #### Scenario: Claude Code is not installed
 - **WHEN** the workspace cannot resolve a `claude` executable
 - **THEN** the Claude Code agent reports that Claude Code must be installed and authenticated
 - **AND** OpenCode conversations, preview, search, and terminal continue working
 
 ### Requirement: A Claude Code conversation runs as its own agent session
-Each Claude Code conversation with an active turn or live background work
-SHALL be served by its own agent session scoped to the workspace directory;
-a conversation that has neither SHALL NOT hold a running session. Prompting
-an idle conversation SHALL start or resume its session transparently. The
-turn SHALL be considered over when the session reports itself idle, not
-when the first turn result arrives, so work the agent left running is not
-cut off. The user SHALL be able to interrupt the active turn, and workspace
-shutdown SHALL terminate every live Claude Code session it owns before
-shutdown completes, leaving completed history in Claude Code's native
-session storage.
+Each Claude Code conversation with an active turn, live background work, or
+a pending scheduled wakeup the user has not cancelled SHALL be served by its
+own agent session scoped to the workspace directory; a conversation that has
+none of these SHALL NOT hold a running session. Prompting an idle conversation SHALL start or
+resume its session transparently. The turn SHALL be considered over when
+the session reports itself idle, not when the first turn result arrives, so
+work the agent left running is not cut off. The user SHALL be able to
+interrupt the active turn, and workspace shutdown SHALL terminate every
+live Claude Code session it owns before shutdown completes, leaving
+completed history in Claude Code's native session storage.
 
 #### Scenario: Prompting an idle conversation resumes it
 - **WHEN** a user prompts a Claude Code conversation that has no running session
@@ -57,6 +64,15 @@ session storage.
 - **THEN** the session is not retired
 - **AND** it is retired once the session reports no live background tasks and no pending turn
 
+#### Scenario: A pending wakeup keeps the session alive
+- **WHEN** a turn's result arrives while the session reports one or more scheduled wakeups
+- **THEN** the session is not retired
+- **AND** it is retired once the session reports no wakeups, no live background tasks, and no pending turn
+
+#### Scenario: A cancelled wakeup holds nothing
+- **WHEN** a turn's result arrives while the only wakeups the session reports are ones the user cancelled
+- **THEN** the session is retired as if it reported none
+
 #### Scenario: Workspace shutdown owns the sessions
 - **WHEN** the workspace server shuts down while Claude Code sessions are live
 - **THEN** those sessions and their active turns are terminated before shutdown completes
@@ -68,7 +84,13 @@ canonical workspace directory from Claude Code's own session storage, and
 SHALL present a conversation's history without starting a turn or
 requiring a live session. Conversations belonging to another directory
 MUST NOT be listed or accepted. A stored session the workspace cannot
-parse SHALL be skipped without failing enumeration.
+parse SHALL be skipped without failing enumeration. A stored user record
+Claude Code authored on the person's behalf — a skill's preamble, a
+local-command caveat, an image caption, a background task's notification —
+MUST NOT be presented as the user's message, and MUST NOT serve as a
+session's first prompt or title. Where the store states who authored a
+record, that statement SHALL decide; a record the store attributes to the
+person SHALL be presented as their message whatever its text looks like.
 
 #### Scenario: Prior sessions appear after a workspace restart
 - **WHEN** a workspace starts and the user opens Chat
@@ -78,6 +100,21 @@ parse SHALL be skipped without failing enumeration.
 #### Scenario: A foreign directory's session is not offered
 - **WHEN** Claude Code's storage holds sessions for a different directory
 - **THEN** those sessions do not appear in the workspace's conversation inventory
+
+#### Scenario: Harness-authored records are not the user's bubbles
+- **WHEN** a reopened conversation's transcript holds a user record Claude Code injected (a skill preamble, a task notification)
+- **THEN** no user message is shown for it
+- **AND** a prompt in which the person merely quotes such markup is still shown as their message
+
+#### Scenario: A record older than the store's authorship field reads the same everywhere
+- **WHEN** a transcript written before authorship was recorded opens with a task-notification envelope
+- **THEN** it is not offered as the session's first prompt or title
+- **AND** the replayed timeline and the session's title agree on what that record is
+
+#### Scenario: A person's own words are never reissued as agent activity
+- **WHEN** the store attributes a record to the person and its text is nothing but a task-notification envelope
+- **THEN** it is shown as their message
+- **AND** no background task row is produced for it
 
 ### Requirement: Claude Code activity is normalized into the shared timeline
 The server SHALL normalize Claude Code session activity into the shared
@@ -89,7 +126,11 @@ completion, warnings, errors, and per-message token usage attributed to
 the reporting model. Assistant text SHALL be delivered as it streams, not
 only per completed block. An event the server does not recognize, or whose
 payload it cannot parse, SHALL be skipped without ending the stream and
-SHALL be counted by type without recording payloads.
+SHALL be counted by type without recording payloads. A content block of a
+type the server does not recognize inside a recognized message SHALL
+likewise be skipped and counted by block type without recording its
+payload, so an unknown block is measured the same way an unknown message
+is.
 
 #### Scenario: A streamed turn renders as shared timeline items
 - **WHEN** a Claude Code turn streams assistant text, reasoning, and tool activity
@@ -111,6 +152,21 @@ SHALL be counted by type without recording payloads.
 - **THEN** the event is skipped and counted by type
 - **AND** the conversation stream continues
 
+#### Scenario: An unrecognized content block is counted
+- **WHEN** an assistant or user message carries a content block of a type the workspace does not recognize
+- **THEN** the recognized blocks of that message are rendered as usual
+- **AND** the unknown block is skipped and counted by its block type without recording its payload
+
+#### Scenario: An unrecognized system subtype is counted by subtype
+- **WHEN** a Claude Code session emits a `system` message whose subtype the workspace neither handles nor deliberately ignores
+- **THEN** the message is skipped and counted as unrecognized under its subtype, not as a deliberately ignored message
+- **AND** the conversation stream continues
+
+#### Scenario: A recognized event with an unusable payload does not end the stream
+- **WHEN** a Claude Code session emits a recognized event type whose payload lacks what its handling requires
+- **THEN** the event is skipped and counted as unparseable
+- **AND** the conversation stream continues
+
 ### Requirement: Tool permissions are brokered interactively
 When a Claude Code session asks for permission to use a tool, the request
 SHALL surface as a pending permission in the owning conversation,
@@ -122,6 +178,18 @@ reach in Claude Code's own terms — never another agent's. A permission
 left pending when its session ends SHALL be resolved to a visible failed
 or interrupted outcome rather than remaining pending forever.
 
+The session-scoped approval SHALL NOT be sent on the first click: its
+confirmation step SHALL list, in Claude Code's own permission-rule syntax,
+exactly the session-scoped permission updates the reply will forward,
+listed separately from the request's own resources. Every update the
+reply forwards SHALL be listed, and nothing that is not forwarded SHALL be
+listed. Updates that would persist beyond the live session MUST NOT be
+forwarded and MUST NOT be listed. When Claude Code supplied no
+session-scoped update for the request, the confirmation SHALL state that
+confirming covers only this request. A request recovered after its live
+announcement was missed SHALL confirm with the same listed updates the
+live announcement would have shown.
+
 #### Scenario: A tool request waits for the user
 - **WHEN** a Claude Code turn requests permission for a file edit
 - **THEN** the conversation shows a pending permission naming the action and file
@@ -132,6 +200,21 @@ or interrupted outcome rather than remaining pending forever.
 - **WHEN** a Claude Code permission card offers a persistent approval
 - **THEN** its scope line describes what that approval covers under Claude Code
 - **AND** it does not name another agent
+
+#### Scenario: The confirmation lists the rules the reply will forward
+- **WHEN** a Claude Code permission request carries session-scoped rule suggestions and the user chooses the persistent approval
+- **THEN** the confirmation lists each suggested rule as a Claude Code permission rule, apart from the request's resources
+- **AND** confirming forwards exactly those rules with the approval
+
+#### Scenario: A persisting suggestion is neither forwarded nor listed
+- **WHEN** a Claude Code permission request suggests a rule destined for a settings file
+- **THEN** the confirmation does not list it
+- **AND** confirming does not forward it
+
+#### Scenario: No session-scoped suggestion means only this request
+- **WHEN** a Claude Code permission request carries no session-scoped suggestion and the user chooses the persistent approval
+- **THEN** the confirmation states that confirming covers only this request
+- **AND** confirming approves the request without forwarding any rule
 
 #### Scenario: A dead session's permission does not hang
 - **WHEN** a Claude Code session ends while a permission is pending
@@ -180,23 +263,72 @@ The Claude Code agent SHALL list the models Claude Code offers and SHALL
 offer each model's supported effort levels as that model's reasoning
 variants. Claude Code's own recommended default SHALL be offered as a
 first-class entry presented as the active choice while no model has been
-chosen — in place of a generic delegation row — and choosing it SHALL
+chosen, in place of a generic delegation row, and choosing it SHALL
 leave the model resolution to Claude Code. Every surface that names a
-model SHALL name it with its version (for example "Opus 5 (1M context)",
-"Fable 5.1"), derived from the catalog when the catalog's display name
-lacks one. In addition to the catalog, the agent SHALL offer the models
-the Claude apps offer under "More models" that the catalog omits, and
-SHALL accept a user-typed model id, each presented as distinct from the
-catalog's own entries; a rejected id SHALL fail the turn with the CLI's
-error, not silently fall back. A model or variant selection SHALL apply to
-the conversation's subsequent prompts, an effort level not supported by
-the selected model MUST NOT be selectable with it, and the model's
-context-window size SHALL be reported when known so context usage can be
-presented. The catalog SHALL be read from Claude Code itself before the
-first conversation runs when the install permits it, with a static
-fallback only for an install that cannot answer, and model ids reported by
-a running session SHALL be attributed to catalog entries so context usage
-joins the window actually in effect.
+model SHALL name it with its version, for example "Opus 5 (1M context)"
+or "Fable 5.1", derived from the catalog when its display name lacks one.
+In addition to the catalog, the agent SHALL offer the models the Claude
+apps offer under "More models" that the catalog omits, and SHALL accept
+a user-typed model id, each presented as distinct from the catalog's own
+entries. A rejected id SHALL fail the turn with the CLI's error, not
+silently fall back. A model or variant selection SHALL apply to the
+conversation's subsequent prompts. An effort level not supported by the
+selected model MUST NOT be selectable with it. The model's context-window
+size SHALL be reported when known so context usage can be presented.
+The catalog SHALL be read from Claude Code itself before the first
+conversation runs when the install permits it, with a static fallback
+only for an install that cannot answer. Model ids reported by a running
+session SHALL be attributed to catalog entries so context usage joins
+the window actually in effect.
+
+Each offered model's context window, including the catalog's rows, the
+"More models" rows, and the recommended default, SHALL use the window
+Claude Code itself states for that model on this install and login.
+Windows SHALL be requested when the catalog is first read. Reading the
+windows MUST NOT delay the catalog. Each accepted discovery SHALL become
+available to subsequent catalog reads and SHALL cause connected clients
+to refresh the affected catalog and context readout without a user action
+or waiting for a turn to finish. Reading these windows SHALL NOT spend
+tokens or make a model call, and MUST NOT change the model of any
+conversation.
+
+A window derived from a known model id or a static list SHALL be labelled
+as an estimate and SHALL be used only when no applicable Claude-reported
+window is available. An unrecognized model with no defensible estimate
+SHALL have an unknown window, not an assumed 200k window. A previously
+reported value reused while its execution context is being revalidated
+SHALL be identified as cached. An estimate or catalog refresh MUST NOT
+replace an applicable confirmed window. A fresh session report SHALL be
+allowed to replace an older window with either a larger or smaller one.
+
+The conversation SHALL request its effective window from its own Claude
+session after applying its selected configuration and before delivering
+the first prompt on that session. This SHALL include typed model ids and
+resumed conversations. Waiting for this answer SHALL be bounded: a failed
+or slow read MUST NOT prevent prompt delivery, cancellation, or normal
+stream processing. A valid late answer SHALL update the running
+conversation. A response from a superseded session, selection, or login
+context MUST NOT override a newer context. Different window variants
+SHALL remain distinguishable even when Claude reports the same bare model
+id for both.
+
+A transient read failure SHALL remain eligible for a bounded retry with
+backoff while the value is needed. An attempted read MUST NOT count as a
+success. Concurrent requests SHALL share discovery work; unsupported
+controls SHALL NOT cause an endless retry loop. Discovery SHALL stop
+when its owning provider is disposed.
+
+The recommended default SHALL be presented as the model it actually runs
+in the workspace after user, project, environment, and managed settings
+are applied, rather than the catalog's account-level resolution when the
+two differ. The model it runs SHALL determine the default entry's stated
+resolution, its name on every surface, its description, its effort
+levels, and its context window. A model the default runs that no offered
+entry represents SHALL be named by its id. The default's resolution
+SHALL be learned before any turn when Claude can answer and SHALL remain
+in force across an ordinary catalog refresh. An applicable newer
+observation SHALL update it; the catalog's own resolution is the fallback
+only when Claude Code cannot report what the default runs.
 
 #### Scenario: The recommended default is the active choice and names its resolution
 - **WHEN** a Claude Code conversation has not chosen a model
@@ -210,7 +342,8 @@ joins the window actually in effect.
 #### Scenario: An app-only model is offered and runs
 - **WHEN** a user selects a "More models" entry such as Opus 4.6
 - **THEN** subsequent prompts run under that model id
-- **AND** the context window presented is the one that model actually has
+- **AND** the context window presented is the one that model actually has when Claude has stated it
+- **AND** any fallback figure is explicitly identified as an estimate
 
 #### Scenario: A typed model id runs or fails visibly
 - **WHEN** a user enters a model id the picker does not list
@@ -230,7 +363,91 @@ joins the window actually in effect.
 #### Scenario: Effort qualifies the selected model
 - **WHEN** a user selects a model and one of its effort levels
 - **THEN** subsequent prompts run with that model and effort
+- **AND** the presented effort is the effort actually sent
 - **AND** an effort level the model does not support is not offered alongside it
+
+#### Scenario: A model's window is the one Claude Code states, before any turn
+- **WHEN** the model picker is read on a healthy install whose catalog offers Sonnet 5.5 under an id with no window marker, after Claude Code has stated a 1M window for it
+- **THEN** Sonnet 5.5 is offered with a 1M context window, though no conversation has run
+- **AND** no tokens are spent and no model call is made to learn it
+
+#### Scenario: Reading windows does not delay the catalog
+- **WHEN** the model picker is first read and Claude Code takes seconds to state every model's window
+- **THEN** the catalog is presented without waiting for all windows
+- **AND** a model whose window has not been stated yet is presented with a labelled estimate or an unknown window
+- **AND** a discovered window reaches the open picker and applicable readout without reopening the picker
+
+#### Scenario: Settings that override the account default are what the default names
+- **WHEN** the catalog's default row resolves to Sonnet 5.5 and the workspace's Claude Code settings set the model to `fable[1m]`
+- **THEN** before any turn on a healthy install the default is presented as "Default · Fable 5.1", resolving to the Fable 5.1 entry
+- **AND** its description and effort levels are Fable 5.1's
+- **AND** a first prompt under the default runs on Fable 5.1, matching what was presented
+
+#### Scenario: The default's window is the window of what it runs
+- **WHEN** the recommended default runs a model whose stated window differs from the window of the model the catalog names for it
+- **THEN** the default entry's context window is the stated window of the model the default actually runs
+
+#### Scenario: A default running an unlisted model is named by its id
+- **WHEN** the workspace's settings make the default run a model id that no offered entry represents
+- **THEN** the default is presented naming that id
+- **AND** not as the catalog's account-level resolution, nor as an unnamed "Default (recommended)"
+
+#### Scenario: The default's resolution outlives a catalog refresh
+- **WHEN** the default's actual model has been learned and a conversation then starts and refreshes the catalog without reporting a different resolution
+- **THEN** the default is still presented as the model it actually runs
+
+#### Scenario: Without a report the catalog's resolution stands
+- **WHEN** Claude Code cannot report what the default runs
+- **THEN** the default is presented by the catalog's own resolution, as before
+
+#### Scenario: Reading windows leaves running conversations alone
+- **WHEN** the catalog and its windows are read while a Claude Code conversation is running under a chosen model
+- **THEN** that conversation's model is unchanged and its next prompt runs under the model it had
+
+#### Scenario: A stated window outlives a catalog refresh
+- **WHEN** a model's window has been stated and a conversation then starts and refreshes the catalog
+- **THEN** the model is still offered with its applicable stated window, not an id-derived figure
+
+#### Scenario: A model with no stated window falls back to the derived figure
+- **WHEN** Claude Code cannot state a window for a model with a known static or id-derived figure
+- **THEN** the model is offered with that figure explicitly labelled as estimated
+- **AND** the catalog itself is still offered
+
+#### Scenario: An unrecognized model has no invented window
+- **WHEN** a typed or newly listed model has no known estimate and Claude cannot state its window
+- **THEN** the window is unavailable rather than assigned 200k
+- **AND** the user can still send a prompt under that model id
+
+#### Scenario: The conversation states its window before its first prompt
+- **WHEN** the user selects Opus 5.5 and its own Claude session reports 1M within the bounded startup read
+- **THEN** 1M is available to the conversation before its first prompt is delivered
+- **AND** a smaller catalog estimate does not replace that answer
+
+#### Scenario: A stalled startup read does not hold the prompt
+- **WHEN** the conversation's initial window read exceeds its startup wait budget
+- **THEN** prompt delivery proceeds with a labelled fallback or unknown limit
+- **AND** cancellation and stream processing remain available
+- **AND** a valid late answer updates the conversation while it is running
+
+#### Scenario: A failed discovery can recover
+- **WHEN** a window read fails transiently and a bounded retry succeeds
+- **THEN** connected clients receive the recovered value without another model selection or a completed turn
+- **AND** concurrent requests do not multiply the retry work
+
+#### Scenario: Unsupported discovery does not loop
+- **WHEN** the CLI does not support window reads
+- **THEN** the catalog and prompting remain available with labelled estimates or unknown windows
+- **AND** discovery does not continuously restart a process or issue reads
+
+#### Scenario: A superseded answer cannot change the current window
+- **WHEN** a read started under one session, model selection, or login finishes after that context has been superseded
+- **THEN** it does not replace the current context's window
+- **AND** a newer answer can increase or decrease the current window
+
+#### Scenario: Window variants remain distinct
+- **WHEN** two selections resolve to the same bare model id but Claude reports different windows for them
+- **THEN** each conversation uses the window of the variant it actually runs
+- **AND** the first catalog alias does not determine both conversations' limits
 
 ### Requirement: Attached images reach Claude Code with their prompt
 Images staged on a prompt to a Claude Code conversation SHALL be
@@ -255,16 +472,55 @@ labeled placeholder rather than failing the history.
 Each subagent run in a Claude Code conversation SHALL be represented by
 its launching row in the parent timeline and SHALL be openable as a
 child transcript through the shared drill-down behavior, rendered from
-the run's own activity. Subagent runs MUST NOT appear in the
+the run's own activity — while the run is still in progress as well as
+after it ends. An open transcript of a running subagent SHALL update as
+the subagent works, including its text and tool activity, and the
+subagents track SHALL name a running subagent's latest progress where
+Claude Code reports it. Subagent runs MUST NOT appear in the
 conversation inventory. The launching row SHALL be attributable with the
 subagent's model and consumed tokens as Claude Code reports them, and a
 run without reported usage SHALL stay readable without asserting
-figures.
+figures. The same SHALL hold for every other agent run Claude Code
+forks from the conversation, however it was started: a skill the agent
+runs as a fork of itself, and the run a typed command launches — such
+as a review command — which has no launching step in the timeline at
+all. Each such run SHALL be named as work in progress alongside the
+conversation's subagent runs from the moment Claude Code names it,
+carrying what it is running and, where reported, its latest activity,
+and SHALL be openable as a child transcript from then on. Where Claude
+Code streams the run's activity the open transcript SHALL update as it
+arrives; where it does not, the open transcript SHALL still follow the
+run from Claude Code's own record of it, refreshed while the run lasts,
+so no run is opaque while it works. A fork Claude Code names only when
+it ends SHALL still open with its complete transcript then, including
+the work it streamed before it was named. The output a typed command
+returns SHALL be shown in the timeline, live and when the conversation
+is reopened alike.
 
 #### Scenario: A subagent transcript is reachable from its row
 - **WHEN** a Claude Code turn runs a subagent and the user opens its row
 - **THEN** the subagent's own transcript is presented as a child of the parent conversation
 - **AND** the conversation picker still lists only the parent
+
+#### Scenario: A running subagent is opened and followed
+- **WHEN** the user opens a subagent that is still running, from its row or the subagents track
+- **THEN** its transcript shows the activity so far and continues to update until the run ends
+- **AND** the run's completion is reflected in the open transcript and on the launching row
+
+#### Scenario: A forked skill is followed while it runs
+- **WHEN** the agent runs a skill as a fork of itself and Claude Code names the run as it starts
+- **THEN** the run is listed as work in progress, named by the skill it runs, and opens as a child transcript that updates as it works
+- **AND** the conversation picker still lists only the parent
+
+#### Scenario: A run started by a typed command is followed while it runs
+- **WHEN** the user types a command that launches a forked run, such as a review command
+- **THEN** the run is listed as work in progress while it lasts, named by the command
+- **AND** opening it shows the run's transcript, which keeps filling in while the run works even though Claude Code streams none of it
+- **AND** the command's output appears in the timeline when it ends, and is still there when the conversation is reopened
+
+#### Scenario: A fork named only at its end is complete when it opens
+- **WHEN** Claude Code names a forked run only when it ends
+- **THEN** the run's whole transcript is presented when it is opened, including the work it streamed before it was named
 
 #### Scenario: A replayed conversation retains its subagent transcripts
 - **WHEN** a conversation with completed subagent runs is opened from native session storage
@@ -332,10 +588,10 @@ have no task-progress surface.
 ### Requirement: Claude Code capabilities are declared truthfully
 The Claude Code agent SHALL declare exactly the capabilities this
 capability specifies — including models, modes, variants, commands,
-permissions, questions, context usage, attachments, subagents, and
-reversible history — and MUST NOT declare a capability it does not
-support. Slash commands available to the session SHALL be discoverable
-under the declared commands capability.
+permissions, questions, context usage, attachments, subagents, reversible
+history, background tasks, and scheduled wakeups — and MUST NOT declare a
+capability it does not support. Slash commands available to the session
+SHALL be discoverable under the declared commands capability.
 
 #### Scenario: Undeclared abilities are absent, not broken
 - **WHEN** a client reads the Claude Code agent's declaration
@@ -344,14 +600,41 @@ under the declared commands capability.
 
 ### Requirement: Context usage measures the window, not the turn's spend
 Context usage for a Claude Code conversation SHALL be the occupancy of the
-context window after the most recent model call — the tokens that call
-sent as input, read from cache, and wrote to cache — and MUST NOT be a
-figure summed across the calls of a turn. When Claude Code compacts the
-conversation, the reported occupancy SHALL drop to the post-compaction
-figure and the timeline SHALL mark where compaction happened. Where the
-session can report its own context breakdown, that breakdown SHALL be
-offered as the expanded view and its total SHALL agree with the presented
-fill.
+context window after the most recent model call: the tokens that call
+sent as input, read from cache, and wrote to cache. It MUST NOT be summed
+across the calls of a turn. When Claude Code compacts the conversation,
+the reported occupancy SHALL drop to the post-compaction figure and the
+timeline SHALL mark where compaction happened. Where the session reports
+its own context breakdown, that breakdown SHALL be offered as the
+expanded view and its total SHALL agree with the presented fill.
+
+Window knowledge and occupancy SHALL update independently. A window-only
+discovery MUST NOT replace the most recent occupancy with a promptless
+estimate, zero, or another session's count. Within the applicable execution
+context, the session's reported window SHALL take precedence over a
+catalog-reported window, which SHALL take precedence over a known static
+estimate. Retained observations SHALL be labelled cached when awaiting
+revalidation. Estimates MUST NOT overwrite applicable reported windows.
+The newest valid session observation SHALL replace an older session
+window, including when the newer value is smaller. A model or window
+variant change SHALL NOT cause the preceding model's occupancy to be
+measured against the newly selected model's window.
+
+The displayed percentage, fill, warning state, tooltip, and expanded
+breakdown SHALL update when the applicable limit or its provenance
+changes, even when no new usage message arrives. Connected clients SHALL
+receive these updates while a turn is running. Reconnecting clients
+SHALL recover the latest window knowledge together with conversation
+state, without requiring another completed turn.
+
+A readout based on an estimate SHALL visibly identify the percentage and
+limit as estimated. If no limit is known, or occupancy disproves an
+estimate, the readout SHALL state tokens used and explain that the limit
+is unavailable, without a percentage, a bare question mark, or a full-window
+alert. An explicitly reported compaction-policy boundary SHALL NOT be
+discarded merely because occupancy exceeds it. Where Claude distinguishes
+model capacity from a compaction boundary, the readout SHALL distinguish
+those values and SHALL NOT label the latter as the model's hard capacity.
 
 #### Scenario: A long turn does not exceed its window
 - **WHEN** a turn makes many model calls, each against a window that is 30% full
@@ -364,32 +647,143 @@ fill.
 
 #### Scenario: The expanded breakdown is the session's own
 - **WHEN** the user opens the context readout on a session that reports a breakdown
-- **THEN** it shows the session's categories (system prompt, tools, messages, memory, and so on)
+- **THEN** it shows the session's categories, such as system prompt, tools, messages, and memory
 - **AND** their total matches the presented fill
+
+#### Scenario: The session's window beats the catalog's figure
+- **WHEN** the catalog lists a model with a 200k estimate and the session reports a 1M window for it
+- **THEN** a later call that occupies 212k tokens presents a fill of about 21%
+- **AND** the readout is not in its alert state
+
+#### Scenario: A first turn is measured against the stated window
+- **WHEN** Claude Code stated a 1M window for Sonnet 5.5 when the catalog was read, and a new conversation's first turn on Sonnet 5.5 occupies 50k tokens before any session report
+- **THEN** the presented fill is about 5% of 1M, not 25% of 200k
+
+#### Scenario: A reopened conversation is measured against the stated window
+- **WHEN** a Claude Code conversation on Sonnet 5.5 is reopened, its last call occupied 250k tokens, and Claude Code stated a 1M window for Sonnet 5.5 when the catalog was read
+- **THEN** the readout presents a fill of about 25% against 1M
+- **AND** it does not drop the fill for exceeding a 200k guess
+
+#### Scenario: An occupancy beyond the catalog's figure is not a full window
+- **WHEN** no applicable window has been reported and a call occupies more tokens than a static estimate
+- **THEN** the readout states the occupancy and explains that the limit is unavailable
+- **AND** it shows neither a percentage nor a full-window alert
+- **AND** a later confirmed limit restores the percentage without waiting for the turn to finish
+
+#### Scenario: A corrected limit repaints an unchanged usage message
+- **WHEN** the latest usage message remains at 150k tokens and the applicable limit changes from an estimated 200k to a reported 1M
+- **THEN** the percentage changes from an estimated 75% to 15%
+- **AND** the fill, warning state, tooltip, breakdown, and source label agree with 1M
+- **AND** no new message, model selection, or picker interaction is required
+
+#### Scenario: A source-only change is visible
+- **WHEN** a 1M estimate is confirmed as 1M with no new usage message
+- **THEN** the percentage stays the same and its estimated label is removed
+
+#### Scenario: Window discovery preserves occupancy
+- **WHEN** an early window query reports a local occupancy estimate and a 1M window while the conversation already has a newer usage count
+- **THEN** the readout keeps that usage count and uses the discovered window
+- **AND** discovery creates no synthetic conversation message or reset to zero
+
+#### Scenario: A fresh session answer can reduce the window
+- **WHEN** the session reports a current 200k window after an earlier 1M observation and the applicable usage is 50k
+- **THEN** the readout shows 25% against the newer 200k window
+- **AND** an older delayed 1M answer does not reverse it
+
+#### Scenario: A staged model change does not relabel old occupancy
+- **WHEN** the last usage belongs to one model and the user selects a different model or window variant for the next prompt
+- **THEN** the last usage remains measured against its own applicable window
+- **AND** new usage uses the window of the execution that produced it
+
+#### Scenario: Reconnect recovers window knowledge
+- **WHEN** the browser disconnects before a corrected window arrives and reconnects while the turn is still running
+- **THEN** its recovered conversation state includes the latest applicable window and source
+- **AND** its readout agrees with a browser that remained connected
+
+#### Scenario: A reported compaction boundary is not an invalid estimate
+- **WHEN** Claude explicitly distinguishes a 200k compaction boundary from a 1M model capacity and reports usage above the compaction boundary
+- **THEN** the readout labels the compaction boundary separately from model capacity
+- **AND** it does not discard that reported boundary using the rule for disproven estimates
 
 ### Requirement: Background tasks are surfaced, stoppable, and wake the model
 When a Claude Code session starts a task in the background — a backgrounded
 shell command, a backgrounded subagent, or a monitor — the conversation
 SHALL show that background work exists while it runs, naming each task
-and its progress where reported, and SHALL let the user stop a task. A
-task's completion, failure, or stop SHALL appear in the timeline with its
-summary. While the session holds live background work the composer SHALL
-present a background-work state distinct from both working and idle, and
-prompting SHALL remain possible. When a background task settles and the
+and its progress where reported, and SHALL let the user stop a task.
+Each running task SHALL carry what it is doing (the agent's latest
+progress note, for an agent task the model-written progress summary
+Claude Code produces when asked), how long it has run, and the tokens
+and tool uses it has consumed as Claude Code reports them. A running task
+SHALL be selectable and open an inspection view: an agent task opens the
+subagent's own transcript (see "Subagent runs open as child transcripts"),
+a shell task opens a task view with its command, elapsed time, latest
+progress, and — from the moment Claude Code makes the task's output
+location known — the output produced so far, refreshed while the task
+runs. Stop SHALL remain available from the inspection view. Tasks that
+start while a turn is still running SHALL be listed at once, not only
+after the turn ends. The lists of running background tasks and running
+subagents SHALL be shown expanded when running work first appears in
+them, so a task can be inspected or stopped without first disclosing the
+list; a list the user collapses SHALL stay collapsed until the work it
+holds is over, so the surface never reopens against the user's choice. A task's completion, failure, or stop SHALL appear
+in the timeline with its summary, live and when the conversation is
+reopened from storage alike: the notification Claude Code stored for the
+model SHALL replay as the settled task row, linked to the step that
+launched it, never as its markup. While the session holds live
+background work the composer SHALL present a background-work state
+distinct from both working and idle, and prompting SHALL remain possible;
+to the hub's workspace activity summary, however, live background work
+SHALL count as the workspace working, so the switcher does not show the
+workspace idle while a task runs. When a background task settles and the
 model is not mid-turn, the workspace SHALL wake the session so the agent
 can act on the notification, as Claude Code's own terminal client does.
 Housekeeping tasks the CLI marks as ambient MUST NOT count as background
-work.
+work. An agent run the CLI marks ambient — a forked skill, or the run a
+typed command such as a review command launches — is not housekeeping:
+it SHALL be treated as a run (listed and openable, see "Subagent runs
+open as child transcripts"), and the ambient mark SHALL only keep it out
+of the background-work state.
 
 #### Scenario: Backgrounded work is visible after the turn ends
 - **WHEN** a turn ends while a backgrounded command is still running
 - **THEN** the composer shows a background-work state naming one running task
 - **AND** the conversation still accepts a new prompt
+- **AND** the workspace's activity summary reports it working
+
+#### Scenario: Work that starts mid-turn is listed while the turn runs
+- **WHEN** a running turn launches a backgrounded task and a subagent
+- **THEN** the task is listed as running background work and the subagent appears in the subagents track before the turn ends
+
+#### Scenario: Running work is reachable without disclosing the list
+- **WHEN** a backgrounded task or a subagent starts in a conversation whose lists held no running work
+- **THEN** its list is shown expanded, with the entry's inspect and Stop controls reachable directly
+
+#### Scenario: A list the user collapsed stays collapsed
+- **WHEN** the user collapses a list while it holds running work, and further work starts in it
+- **THEN** the list stays collapsed
+- **AND** it expands again for work that starts after everything it held is over
+
+#### Scenario: A running agent task is inspected
+- **WHEN** the user selects a running background agent task
+- **THEN** the subagent's transcript opens as a child of the conversation, updating as the agent works
+- **AND** the view names the task, its latest progress note, elapsed time, and consumed tokens and tool uses
+- **AND** the user can stop the task from the view
+
+#### Scenario: A running shell task is inspected
+- **WHEN** the user selects a running backgrounded shell command whose output location Claude Code has made known
+- **THEN** a task view shows the command, elapsed time, latest progress, and the output produced so far
+- **AND** the output refreshes while the task runs
+- **AND** the user can stop the task from the view
 
 #### Scenario: A finished background task reaches the reader and the model
 - **WHEN** a backgrounded command completes
 - **THEN** the timeline gains a row with the task's summary
 - **AND** the agent produces a follow-up turn acting on it without a user prompt
+
+#### Scenario: A reopened conversation replays the settled task
+- **WHEN** a stored conversation whose transcript holds a background task's notification is reopened
+- **THEN** the timeline shows the task's settled row with its status and summary, named by the step that launched it
+- **AND** the notification's markup is not shown as a user message
 
 #### Scenario: The user stops a background task
 - **WHEN** the user stops a listed background task
@@ -399,6 +793,92 @@ work.
 #### Scenario: Ambient tasks stay out of the indicator
 - **WHEN** the session runs a housekeeping task marked ambient
 - **THEN** no background-work state is shown for it
+- **AND** the workspace's activity summary does not report it working on their account
+
+### Requirement: Scheduled wakeups are held, shown, fired, and releasable
+When a Claude Code session schedules a future turn for itself — a
+self-paced wakeup, a cron, or a loop — the conversation SHALL enter a
+scheduled state distinct from working, background, and idle for as long as
+at least one wakeup the user has not cancelled is pending and nothing else
+is running. The composer SHALL name the state and list each pending wakeup
+with its prompt, whether it recurs, and when it next fires. Each wakeup
+SHALL appear in the timeline as a row that follows its life: pending, then
+fired, cancelled, paused, or lost. When a wakeup fires, the turn it starts
+SHALL be presented as a wakeup turn, attributed to the wakeup that started
+it, and MUST NOT be presented as a message the user typed.
+
+The user SHALL be able to cancel any single wakeup and to release a
+scheduled session. A cancelled wakeup MUST NOT start a turn again, even
+when the agent's session is later resumed and the agent's tooling rebuilds
+it; enforcing this MUST NOT spend a model turn. Releasing cancels every
+wakeup of the session and ends the session.
+
+When the session ends for any other reason while wakeups are pending, a
+wakeup the agent's tooling cannot rebuild SHALL be marked lost with a
+notice saying the agent's schedule did not survive its session. A wakeup
+the agent's tooling rebuilds when the conversation runs again SHALL be
+marked paused with a notice saying it fires again once the conversation
+runs. A conversation opened without a live session SHALL list its paused
+wakeups, each with a cancel action. The workspace MUST NOT start a session
+on its own to keep a paused wakeup running. Prompting SHALL remain possible
+in the scheduled state. Agents that do not declare the capability SHALL
+show none of this.
+
+#### Scenario: A scheduled wakeup fires
+- **WHEN** a turn ends after the agent scheduled a wakeup in one minute
+- **THEN** the composer shows the scheduled state naming one pending wakeup and its fire time
+- **AND** about a minute later a wakeup turn begins without a user prompt, attributed to that wakeup
+- **AND** the wakeup's row reads as fired and links to that turn
+
+#### Scenario: The agent cancels its own wakeup
+- **WHEN** the agent ends its loop so that the session reports no pending wakeups
+- **THEN** the pending row reads as cancelled
+- **AND** the conversation returns to idle and its session is retired
+
+#### Scenario: The user cancels one wakeup
+- **WHEN** the user cancels one of two pending wakeups in a scheduled conversation
+- **THEN** that wakeup's row reads as cancelled and it is no longer listed
+- **AND** the session stays in the scheduled state for the other wakeup
+
+#### Scenario: The user releases a scheduled session
+- **WHEN** the user releases a conversation in the scheduled state
+- **THEN** the session ends, each pending wakeup's row reads as cancelled
+- **AND** the conversation is idle and accepts a new prompt
+
+#### Scenario: A cancelled cron stays cancelled when the conversation runs again
+- **WHEN** the user prompts a conversation whose recurring cron they released, and the agent's tooling rebuilds that cron in the resumed session
+- **THEN** each time the cron would fire, no turn starts, no model call is made, and no notification is sent
+- **AND** the conversation's state is not affected by the blocked fire
+
+#### Scenario: A recurring cron is visible and releasable
+- **WHEN** the agent creates a recurring cron
+- **THEN** the wakeup list marks it as recurring with its next fire time
+- **AND** the state persists across fired turns until the agent removes the cron or the user cancels it or releases the session
+
+#### Scenario: The session dies with a self-paced wakeup pending
+- **WHEN** the workspace stops, or the session process exits, while a self-paced wakeup is pending
+- **THEN** its row reads as lost with a notice that the schedule did not survive the session
+- **AND** the conversation is idle afterward
+
+#### Scenario: The session dies with a cron pending
+- **WHEN** the workspace stops, or the session process exits, while a cron the agent created is pending
+- **THEN** its row reads as paused with a notice that it fires again once the conversation runs
+- **AND** the conversation is idle afterward
+
+#### Scenario: A reopened conversation lists its paused crons
+- **WHEN** a conversation with no live session is opened whose agent created a cron that was not removed, not cancelled, and not expired
+- **THEN** the cron is listed as paused with its prompt and a cancel action
+- **AND** the conversation is idle, and no session is started for the cron
+
+#### Scenario: A prompt during the scheduled state
+- **WHEN** the user prompts a conversation in the scheduled state
+- **THEN** the prompt runs in the same session
+- **AND** the pending wakeups remain listed after that turn ends
+
+#### Scenario: A reopened conversation replays fired wakeups truthfully
+- **WHEN** a stored conversation whose transcript holds fired wakeup turns is reopened
+- **THEN** those turns are presented as wakeup turns where the transcript records their origin
+- **AND** no wakeup is shown as pending, because an idle conversation holds no session
 
 ### Requirement: Tool-driven dialogs and elicitations are brokered
 When a Claude Code session asks the host to render a tool-driven dialog or
@@ -422,29 +902,72 @@ outcome rather than remaining pending.
 The conversation SHALL surface Claude Code's routine session signals where
 they affect what the user is waiting on: an API retry SHALL show as a
 retrying state with the reason where reported; a claude.ai plan
-rate-limit warning or rejection SHALL be shown with its reset time; a
-compaction in progress SHALL show as compacting; a refusal that moved the
-turn to a fallback model SHALL be attributed to the fallback model in the
+rate-limit warning or rejection SHALL be shown as the current standing in
+the composer's plan summary and the readout it opens, with its reset
+time, and MUST NOT be presented as timeline content; a compaction in
+progress SHALL show as compacting; a refusal that moved the turn to a
+fallback model SHALL be attributed to the fallback model in the
 timeline; and memories the session recalled SHALL be shown inline as
 recalled context.
+
+A rate-limit standing is a standing, not an event log: however many times
+the login reports the same standing, the conversation SHALL present it
+once and update it in place, and SHALL retire it when the login reports
+that requests are allowed again. A change of standing SHALL be announced
+to assistive technology.
 
 Where the login reports plan utilization, the conversation SHALL present
 it beside context usage as a compact summary naming each window in plain
 words — the 5-hour window as the session and the 7-day window as the
 week — with its percentage used, and SHALL mark the summary as a warning
-when any window is at or past 80%. Activating the summary SHALL open a
+when any window is at or past 80% or when a rate-limit warning stands.
+While a rejection stands the summary SHALL instead state that requests
+are rate limited, name when the limit resets, and be marked as a
+rejection. Activating the summary SHALL open a
 readout that states, for every window the login reports: its name, its
 percentage used, and when it resets, both as a clock time and relative to
 now. The readout SHALL name the plan, SHALL list per-model weekly windows
 and model-scoped buckets under the label the login reports for them, SHALL
-show extra-usage credits where the login has them enabled, and SHALL show
+show extra-usage credits where the login has them enabled — as amounts in
+the login's currency, whatever unit the wire counts them in, with the
+percentage used derived from the amounts where the login states none — and SHALL show
 this conversation's accumulated cost and per-model token totals where the
 agent reports them. A login that reports only the two base windows SHALL
 render the summary and readout with just those. For a login without plan
-limits no plan summary SHALL be shown; where the agent still reports this
-conversation's accumulated cost, the summary SHALL state that cost instead,
+limits no plan summary SHALL be shown unless a rate-limit standing exists,
+in which case the summary SHALL appear carrying that standing; where the
+agent still reports this conversation's accumulated cost, the summary SHALL
+state that cost instead,
 and activating it SHALL show only this conversation's cost and per-model
 totals, with no plan name, windows, or sidebar control.
+
+Plan utilization belongs to the login, not to a conversation, and it
+SHALL be remembered and readable on demand rather than only after a
+turn. The workspace SHALL keep the newest plan report read through any
+of its Claude Code conversations — the windows and the time they were
+read — across conversation reopening, client reloads, and workspace
+restarts. A conversation that has no plan report of its own SHALL present
+the workspace's last-known report in its summary and readout, stating
+when it was read and how long ago; a report older than ten minutes SHALL
+be marked stale while remaining readable. A rate-limit standing MUST NOT
+displace the last-known windows: the readout SHALL show the standing
+beside them.
+
+The readout SHALL offer a control that reads plan usage now. A read
+SHALL go through a Claude Code session that is already live where one
+exists — a turn in flight or background tasks running — without
+interrupting it; otherwise it SHALL start a session for the conversation
+and let it retire after the read, adding no message to the conversation;
+and a workspace with no Claude Code conversation SHALL still answer,
+without a conversation appearing in the inventory. Every read SHALL
+refresh the conversation it went through with a fresh context report and
+this conversation's totals, exactly as a turn-end read does. While a read
+is in flight the control SHALL say so and further requests SHALL join it
+rather than start another; a read that fails SHALL keep the last-known
+figures and state why it failed. Opening the readout when the last-known
+report is stale and a Claude Code session is already live SHALL refresh
+through that session unasked; a session MUST NOT be started for a read
+the user did not ask for.
 
 #### Scenario: A retry is not a silent stall
 - **WHEN** Claude Code retries a failed API request
@@ -453,7 +976,31 @@ totals, with no plan name, windows, or sidebar control.
 
 #### Scenario: A rate limit names its reset
 - **WHEN** Claude Code reports a plan rate limit warning or rejection
-- **THEN** the conversation shows the limit's kind and when it resets
+- **THEN** the composer's plan summary is marked at that level
+- **AND** the readout it opens names the limit's window and when it resets
+
+#### Scenario: A rate limit is not timeline content
+- **WHEN** Claude Code reports a plan rate limit warning or rejection
+- **THEN** the timeline gains no row for it
+- **AND** the conversation's messages, tool activity, and task rows are unchanged
+
+#### Scenario: A standing is stated once, not once per report
+- **WHEN** the login reports the same rate-limit standing across many turns
+- **THEN** the conversation presents one standing, updated in place
+- **AND** it is retired once the login reports that requests are allowed again
+
+#### Scenario: A rejection says requests are blocked
+- **WHEN** the login rejects a request for having reached a window's limit, resetting at 06:00
+- **THEN** the composer summary states that requests are rate limited and that the limit resets at 06:00
+- **AND** the summary is marked as a rejection
+
+#### Scenario: A rate limit without a plan still has somewhere to go
+- **WHEN** the login reports no plan utilization but a rate-limit standing exists
+- **THEN** the composer summary is shown carrying that standing
+
+#### Scenario: A changed standing is announced
+- **WHEN** a rate-limit standing begins, changes level, or is retired
+- **THEN** the change is announced to assistive technology
 
 #### Scenario: A refusal fallback is attributed truthfully
 - **WHEN** a turn is retried on a fallback model after a refusal
@@ -468,10 +1015,20 @@ totals, with no plan name, windows, or sidebar control.
 - **WHEN** any reported window is at or past 80%
 - **THEN** the composer summary is marked as a warning
 
+#### Scenario: A warned window keeps its figures
+- **WHEN** a rate-limit warning stands for a window the base summary does not name
+- **THEN** the composer summary still reads its windows' percentages
+- **AND** it is marked as a warning
+
 #### Scenario: The readout names every window and its reset
 - **WHEN** the reader activates the plan summary
 - **THEN** each reported window shows its name, percentage, and reset as a clock time and a relative time
 - **AND** the plan name is shown
+
+#### Scenario: Extra-usage credits read as money
+- **WHEN** a Pro login has 85 € of extra usage enabled, none of it spent, and states no percentage
+- **THEN** the readout's extra-usage row reads 0,00 € of 85,00 € (in the reader's locale)
+- **AND** its percentage reads 0%
 
 #### Scenario: Per-model windows appear under their own labels
 - **WHEN** the login reports a weekly Opus window and a model-scoped bucket labelled "Fable"
@@ -496,13 +1053,61 @@ totals, with no plan name, windows, or sidebar control.
 - **AND** activating it shows those windows as rows, and is not the cost-only readout
 
 #### Scenario: No plan, no summary
-- **WHEN** the login has no plan limits (an API-key session) and the agent reports no conversation cost
+- **WHEN** the login has no plan limits (an API-key session), the agent reports no conversation cost, and no rate-limit standing exists
 - **THEN** no summary is shown beside the composer
 
 #### Scenario: No plan, the cost is still reachable
 - **WHEN** the login has no plan limits and the agent reports this conversation's accumulated cost
 - **THEN** the composer summary states the cost, as "$1.23 this conversation"
 - **AND** activating it shows only this conversation's cost and per-model usage, with no plan name or windows
+
+#### Scenario: A reopened conversation shows the last-known plan
+- **WHEN** a Claude Code conversation is opened after a reload, a workspace switch, or a workspace restart, and no turn has ended since
+- **THEN** the composer summary reads the workspace's last-known windows
+- **AND** the readout states when they were read and how long ago
+
+#### Scenario: A stale report says so
+- **WHEN** the last-known report was read more than ten minutes ago
+- **THEN** the summary and readout still show its figures
+- **AND** they are marked stale
+
+#### Scenario: A standing does not empty the readout
+- **WHEN** a rate-limit warning stands for a conversation that has no plan report of its own and the workspace holds a last-known report
+- **THEN** the readout shows the standing and the last-known windows together
+
+#### Scenario: A busy session answers without interruption
+- **WHEN** the reader asks for a read while the conversation runs a long background task
+- **THEN** the windows are refreshed from that session
+- **AND** the task continues, with no message or turn added to the conversation
+
+#### Scenario: An idle conversation is started for the read
+- **WHEN** the reader asks for a read and the conversation's session is retired
+- **THEN** a session is started, the windows are read, and the session retires again
+- **AND** the conversation gains a fresh context report and no message
+
+#### Scenario: A workspace without a conversation still answers
+- **WHEN** the reader asks for a read and the workspace has no Claude Code conversation
+- **THEN** the windows are read
+- **AND** the conversation inventory is unchanged
+
+#### Scenario: One read at a time
+- **WHEN** the reader activates the read control while a read is in flight
+- **THEN** the control shows the read in progress
+- **AND** no second read is started
+
+#### Scenario: A failed read keeps the figures
+- **WHEN** a read times out or the login refuses it
+- **THEN** the last-known windows remain shown
+- **AND** the readout states that the read failed and why
+
+#### Scenario: A live session refreshes a stale report unasked
+- **WHEN** the reader opens the readout while the last-known report is stale and a Claude Code session in this workspace is live
+- **THEN** the windows are refreshed through that session without a click
+
+#### Scenario: No session is started unasked
+- **WHEN** the reader opens the readout while the last-known report is stale and no Claude Code session is live
+- **THEN** the stale figures are shown with their age
+- **AND** no session is started until the reader activates the read control
 
 ### Requirement: Conversation titles follow Claude Code's own
 A Claude Code conversation's title SHALL follow the title Claude Code
@@ -518,3 +1123,77 @@ take precedence over both.
 #### Scenario: A user rename wins
 - **WHEN** the user has renamed the conversation in UatuCode
 - **THEN** a later Claude Code title does not replace the user's name
+
+### Requirement: Claude transcript paging reuses unchanged native history
+
+Repeated paging or reopening of a verified unchanged native Claude Code transcript within the documented reuse limits SHALL avoid rereading, reparsing, and renormalizing the entire transcript for every request. Reusable history SHALL be bounded in memory and isolated by workspace and native transcript identity, including child transcripts and forked histories. Eviction or a transcript larger than those limits SHALL fall back to authoritative reads without losing content. A transcript append, rewrite, replacement, truncation, deletion, or history mutation SHALL invalidate or reconcile affected state before it is returned as current. Uncertain freshness SHALL cause an authoritative read.
+
+The optimization MUST preserve transcript order, parent/child separation, token accounting, model attribution, reversible-history boundaries, and cursor correctness. Reading history SHALL NOT start a turn. Optional catalog readiness MUST NOT prevent displaying available transcript content; catalog-dependent readouts SHALL remain explicitly unknown until reliable metadata arrives.
+
+#### Scenario: Adjacent pages share unchanged transcript work
+- **WHEN** a user requests several pages from a retained transcript within the reuse limits verified unchanged since the first read
+- **THEN** later pages reuse the verified result without repeating full transcript processing
+- **AND** messages and usage remain correctly ordered and attributed
+
+#### Scenario: Transcript changes outside the current browser
+- **WHEN** a transcript is appended, rewritten, replaced, truncated, or deleted by the provider or another client
+- **THEN** subsequent history reads reconcile the changed source
+- **AND** no stale completed history is returned as authoritative
+
+#### Scenario: Native history is available before the model catalog
+- **WHEN** a stored conversation can be read but its optional model catalog is still loading
+- **THEN** its transcript becomes readable without starting a turn or waiting for that catalog
+- **AND** unresolved model-dependent values are presented as unknown until resolved
+
+### Requirement: A rate-limit reset names its day when it is not today
+Wherever the conversation states when a rate-limit standing resets — the
+composer's plan summary, the standing line in the readout it opens, and the
+announcement made to assistive technology — the reset SHALL be stated as a
+24-hour clock time (`HH:MM`, zero-padded, never AM/PM, whatever the
+reader's locale) in the reader's time zone, and SHALL name its weekday
+whenever the reset does not fall on the reader's current local calendar
+day, however far out it is. A reset on the reader's current local day
+SHALL be stated as the clock time alone. The readout's standing line and
+the announcement SHALL also state the time remaining until the reset,
+phrased as the readout's plan windows phrase it. The plan windows' own
+reset times SHALL follow the same day rule, so that no reset on a later
+day is ever shown as a bare clock time that reads as today. A reset stated
+in a notice kept in the conversation timeline SHALL be stated by its
+weekday and 24-hour clock time, whatever day it is read, and SHALL NOT
+state a time remaining, so that it stays true when read or replayed later.
+
+#### Scenario: A reset later today is a bare time
+- **WHEN** a rate-limit warning stands whose reset falls later on the reader's current local day at 23:00
+- **THEN** the readout's standing line states that it resets at 23:00 without naming a day, such as "Resets 23:00 · in 3h 00m"
+- **AND** it states the time remaining until the reset
+
+#### Scenario: A reset on another day names the weekday
+- **WHEN** it is Monday and a 7-day rate-limit warning stands whose reset falls on Thursday at 23:00
+- **THEN** the readout's standing line states that it resets on Thursday at 23:00, such as "Resets Thu 23:00 · in 3d 4h"
+- **AND** it states the time remaining until the reset in days and hours
+- **AND** the composer's plan summary names Thursday with the reset time, such as "resets Thu 23:00"
+
+#### Scenario: A reset early tomorrow is not read as today
+- **WHEN** it is 23:30 and a rate-limit warning stands whose reset falls at 06:00 the next local day
+- **THEN** every statement of that reset names the next day's weekday rather than stating 06:00 alone
+
+#### Scenario: A reset a week or more out names only its weekday
+- **WHEN** a rate-limit standing's reset falls seven or more local days after the reader's current day
+- **THEN** the reset is stated with its weekday and 24-hour time and no date, such as "Resets Mon 23:00 · in 10d 4h"
+
+#### Scenario: Reset times are 24-hour in every locale
+- **WHEN** the reader's browser locale uses a 12-hour clock and a reset falls at 7:43 in the evening
+- **THEN** every statement of that reset states 19:43, never "7:43 PM"
+
+#### Scenario: Plan windows follow the same day rule
+- **WHEN** the readout lists a plan window whose reset falls on the next local day, less than 24 hours away
+- **THEN** that window's reset names the day rather than stating the clock time alone
+
+#### Scenario: The announcement carries the day
+- **WHEN** a rate-limit standing whose reset falls on a later local day begins or changes level
+- **THEN** the announcement made to assistive technology names the reset's day, clock time, and the time remaining
+
+#### Scenario: A timeline notice's reset stays true later
+- **WHEN** the timeline shows a notice whose reset was stated earlier, and the reader reads or replays it after that reset has passed
+- **THEN** the notice states the reset's weekday and clock time, such as "Resets Mon 23:00"
+- **AND** it does not state a time remaining, such as "now" or "in 2h 05m"

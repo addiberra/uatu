@@ -8,14 +8,15 @@
 // must not, by itself, install a global event listener.
 
 import { appDocumentRelativePath, appUrl } from "../shared/app-url";
+import { carryNotificationTarget } from "../chat/notification-navigation";
 import { findDocumentById, findDocumentByRelativePath } from "./storage";
 import { loadDocument } from "../preview/mount";
 import { renderEmptyPreview } from "../preview/empty";
 import { renderSidebar } from "../sidebar/shell";
 import { setFollowEnabled, syncFollowToggle } from "./follow";
-import { defaultDocumentId } from "../shared/types";
+import { defaultDocumentId, isFollowableFile } from "../shared/types";
 import { appState } from "./state";
-import { setPreviewMode, setSelectedId } from "./selection";
+import { clearDocumentSelection, resumeDocumentSelection, setPreviewMode, setSelectedId } from "./selection";
 import {
   activateCommitPreview,
   commitPreviewParamsFromUrl,
@@ -47,14 +48,21 @@ export function pushSelection(documentId: string, relativePath: string) {
   if (window.location.pathname === url && window.history.state?.documentId === documentId) {
     return;
   }
-  if (!writeMobileHistory({ documentId }, url, false)) window.history.pushState({ documentId }, "", url);
+  const target = carryNotificationTarget(url, window.location.search);
+  if (!writeMobileHistory({ documentId }, target, false)) window.history.pushState({ documentId }, "", target);
+}
+
+export function recordEmptySelection(replace = false): void {
+  const method = replace ? "replaceState" : "pushState";
+  const target = carryNotificationTarget(appUrl("/"), window.location.search);
+  if (!writeMobileHistory({ selectionCleared: true }, target, replace)) window.history[method]({ selectionCleared: true }, "", target);
 }
 
 export function buildCommitPreviewPath(repositoryId: string, sha: string): string {
   const url = new URL(appUrl("/"), window.location.origin);
   url.searchParams.set("repository", repositoryId);
   url.searchParams.set("commit", sha);
-  return `${url.pathname}${url.search}`;
+  return carryNotificationTarget(`${url.pathname}${url.search}`, window.location.search);
 }
 
 export function pushCommitPreview(repositoryId: string, sha: string) {
@@ -73,7 +81,7 @@ export function pushCommitPreview(repositoryId: string, sha: string) {
 // until we set it). The hash is preserved on the boot path so a deep link
 // like `/guides/setup.md#installation` still scrolls to the named heading.
 export function replaceSelection(documentId: string, relativePath: string, hash = window.location.hash) {
-  const url = buildDocumentPath(relativePath) + hash;
+  const url = carryNotificationTarget(buildDocumentPath(relativePath) + hash, window.location.search);
   if (!writeMobileHistory({ documentId }, url, true)) window.history.replaceState({ documentId }, "", url);
 }
 
@@ -180,6 +188,15 @@ export function attachPopstateHandler() {
     }
 
     const urlRelativePath = appDocumentRelativePath(window.location.pathname);
+
+    if (!urlRelativePath && event.state?.selectionCleared === true) {
+      clearDocumentSelection();
+      setPreviewMode({ kind: "empty" });
+      renderSidebar();
+      renderEmptyPreview("No document selected", "Waiting for viewable files");
+      return;
+    }
+    resumeDocumentSelection();
 
     if (!urlRelativePath) {
       const fallbackId = defaultDocumentId(appState.roots);

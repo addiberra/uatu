@@ -79,6 +79,16 @@ function processExists(pid: number): boolean {
   try { process.kill(pid, 0); return true; } catch { return false; }
 }
 
+async function waitForProcessesToExit(pids: number[], timeoutMs: number): Promise<number[]> {
+  const deadline = Date.now() + timeoutMs;
+  let remaining = pids.filter(processExists);
+  while (remaining.length > 0 && Date.now() < deadline) {
+    await Bun.sleep(20);
+    remaining = remaining.filter(processExists);
+  }
+  return remaining;
+}
+
 async function killManaged(record: SshAgentOwnership): Promise<void> {
   for (const pid of [record.supervisorPid, record.agentPid]) {
     try { process.kill(pid, "SIGKILL"); } catch { /* Already gone. */ }
@@ -201,7 +211,16 @@ describe("ManagedSshAgent", () => {
     expect((await lstat(first.socketPath)).isSocket()).toBe(true);
     expect((await lstat(first.controlSocketPath)).isSocket()).toBe(true);
 
+    // The failed recovery must not have told the guardian to stop: with the
+    // true record restored, the owner's authenticated status round trip still
+    // succeeds and its shutdown retires everything.
     await writeFile(ownershipPath, `${JSON.stringify(original)}\n`, { mode: 0o600 });
+    expect(await first.start()).toBe(first.socketPath);
+    expect(await ownership(runtime)).toEqual(original);
+    await first.shutdown();
+    guardianPids.delete(original.supervisorPid);
+    expect(await pathExists(first.socketPath)).toBe(false);
+    expect(await pathExists(first.controlSocketPath)).toBe(false);
   });
 
   test("a replaced control socket fails closed without touching the agent socket", async () => {
@@ -525,9 +544,12 @@ describe("ManagedSshAgent", () => {
     await replacement.recover();
     expect(kill).not.toHaveBeenCalled();
     kill.mockRestore();
+    // recover() resolves once the guardian has retired its artifacts. Removing
+    // the ownership record is the guardian's last act before it exits, and
+    // the orphan is then reaped by init, so the PID may briefly outlive the
+    // record; wait for both processes to be gone rather than probing once.
+    expect(await waitForProcessesToExit([previous.agentPid, previous.supervisorPid], 5_000)).toEqual([]);
     guardianPids.delete(previous.supervisorPid);
-    expect(processExists(previous.agentPid)).toBe(false);
-    expect(processExists(previous.supervisorPid)).toBe(false);
     expect(await pathExists(path.join(runtime, "ssh-agent.json"))).toBe(false);
     const sshAddPath = (await discoverExecutable("ssh-add")).path;
     if (!sshAddPath) throw new Error("OpenSSH ssh-add is required for this test");

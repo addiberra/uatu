@@ -1,8 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import type { ChatEvent, ConversationSnapshot } from "./types";
 import { ConversationProjection } from "./adapter";
-import { addAcceptedDraft, applyChatEvent, dropQueuedMessage, noteQueuedMessage, prependSnapshot, projectionFromSnapshot } from "./projection";
+import { addAcceptedDraft, applyChatEvent, confirmAcceptedDraft, dropQueuedMessage, noteQueuedMessage, prependSnapshot, projectionFromSnapshot, refreshFromSnapshot } from "./projection";
 import { ConversationReplay } from "./replay";
+import { contextReadout } from "./context-readout";
 
 const snapshot = (items: ConversationSnapshot["items"] = []): ConversationSnapshot => ({
   conversation: { id: "c1", title: "Chat", createdAt: 1, updatedAt: 1, status: "running" },
@@ -14,6 +15,17 @@ const snapshot = (items: ConversationSnapshot["items"] = []): ConversationSnapsh
 });
 
 describe("chat projection", () => {
+  test("a window correction survives replay duplicates and snapshot recovery without replacing usage", () => {
+    const usage = { id: "usage", type: "assistant_message" as const, markdown: "", createdAt: 2, usage: { input: 250_000 }, model: { providerId: "anthropic", modelId: "opus" }, contextKey: "q1" };
+    const initial = projectionFromSnapshot(snapshot([usage]));
+    const event: ChatEvent = { generation: "g1", sequence: 5, conversationId: "c1", type: "item.upsert", item: { id: "window", type: "context_window", createdAt: 1, model: usage.model, contextKey: "q1", limit: 1_000_000, window: { source: "session", freshness: "current", observedAt: 3 } } };
+    const applied = applyChatEvent(initial, event).projection;
+    const duplicate = applyChatEvent(applied, event);
+    expect(duplicate.outcome).toBe("duplicate");
+    const recovered = projectionFromSnapshot(snapshot(applied.items));
+    expect(contextReadout(recovered.items, [], undefined)).toMatchObject({ used: 250_000, limit: 1_000_000, fraction: 0.25 });
+    expect(recovered.items.filter(item => item.type === "context_window")).toHaveLength(1);
+  });
   test("upserts by identity, ignores duplicates, and rejects sequence gaps", () => {
     const initial = projectionFromSnapshot(snapshot());
     const event: ChatEvent & { type: "item.upsert" } = { generation: "g1", sequence: 5, conversationId: "c1", type: "item.upsert", item: { id: "a1", type: "assistant_message", createdAt: 2, markdown: "one" } };
@@ -31,6 +43,43 @@ describe("chat projection", () => {
     expect(state.acceptedDrafts).toHaveLength(1);
     const result = applyChatEvent(state, { generation: "g1", sequence: 5, conversationId: "c1", type: "item.upsert", item: { id: "message", type: "user_message", createdAt: 2, text: "hello", requestId: "request" } });
     expect(result.projection.acceptedDrafts).toEqual([]);
+  });
+
+  test("confirming a draft keeps the text of a row the stream already delivered", () => {
+    // A 2.x skill: typed `/skill args`, sent and streamed as `@skill args`.
+    const streamed = projectionFromSnapshot(snapshot([
+      { id: "message:msg_skill", type: "user_message", createdAt: 2, text: "@openspec-apply-change my-change", requestId: "request" },
+    ]));
+    const confirmed = confirmAcceptedDraft(streamed, { requestId: "request", messageId: "msg_skill", text: "/openspec-apply-change my-change" });
+    expect(confirmed.items).toHaveLength(1);
+    expect(confirmed.items[0]).toMatchObject({ id: "message:msg_skill", text: "@openspec-apply-change my-change", requestId: "request" });
+    // A sparse streamed row (no text yet) takes the draft's.
+    const sparse = projectionFromSnapshot(snapshot([{ id: "message:msg_s", type: "user_message", createdAt: 2, text: "" }]));
+    expect(confirmAcceptedDraft(sparse, { requestId: "r", messageId: "msg_s", text: "hello" }).items[0]).toMatchObject({ text: "hello", requestId: "r" });
+  });
+
+  test("an acceptance answering after the stream retired its row does not recreate it", () => {
+    // `/reload`: its row is removed with the outcome, which can beat the POST response.
+    let state = addAcceptedDraft(projectionFromSnapshot(snapshot()), { requestId: "request", messageId: "pending:request", text: "/reload" });
+    state = applyChatEvent(state, { generation: "g1", sequence: 5, conversationId: "c1", type: "item.upsert", item: { id: "message:msg_reload", type: "user_message", createdAt: 2, text: "/reload", requestId: "request" }, conversation: { ...snapshot().conversation, status: "running" } } as ChatEvent).projection;
+    state = applyChatEvent(state, { generation: "g1", sequence: 6, conversationId: "c1", type: "item.remove", itemId: "message:msg_reload" } as ChatEvent).projection;
+    const confirmed = confirmAcceptedDraft(state, { requestId: "request", messageId: "msg_reload", text: "/reload" });
+    expect(confirmed.items.filter(item => item.type === "user_message")).toEqual([]);
+    expect(confirmed.acceptedDrafts).toEqual([]);
+    // A row the stream restores later is no longer treated as retired.
+    const restored = applyChatEvent(state, { generation: "g1", sequence: 7, conversationId: "c1", type: "item.upsert", item: { id: "message:msg_reload", type: "user_message", createdAt: 2, text: "/reload" }, conversation: { ...snapshot().conversation, status: "idle" } } as ChatEvent).projection;
+    expect(restored.removedIds ?? []).not.toContain("message:msg_reload");
+  });
+
+  test("a reload's acceptance never creates its row, even if the removal was never observed", () => {
+    // Switched back after the outcome: the snapshot omits the row and no removal was seen.
+    const state = addAcceptedDraft(projectionFromSnapshot(snapshot()), { requestId: "request", messageId: "pending:request", text: "/reload" });
+    const confirmed = confirmAcceptedDraft(state, { requestId: "request", messageId: "msg_reload", text: "/reload" }, { insert: false });
+    expect(confirmed.items).toEqual([]);
+    expect(confirmed.acceptedDrafts).toEqual([]);
+    // A row the stream already shows is still confirmed in place.
+    const shown = projectionFromSnapshot(snapshot([{ id: "message:msg_reload", type: "user_message", createdAt: 2, text: "/reload" }]));
+    expect(confirmAcceptedDraft(shown, { requestId: "request", messageId: "msg_reload", text: "/reload" }, { insert: false }).items[0]).toMatchObject({ id: "message:msg_reload", requestId: "request" });
   });
 
   test("does not add an accepted marker after the matching message arrived first", () => {
@@ -138,6 +187,23 @@ describe("chat projection", () => {
     expect(prependSnapshot(current, page).items.map(item => item.id)).toEqual(["old", "new"]);
   });
 
+  test("an older page merges around rows the first page carried from before its span", () => {
+    // The first page backfills a subagent launcher from older history (for
+    // the cost fold); the older page's rows must land around it by time,
+    // not wholesale ahead of it.
+    const item = (id: string, createdAt: number) => ({ id, type: "user_message" as const, createdAt, text: id });
+    const current = projectionFromSnapshot(snapshot([item("launcher", 2), item("new", 101)]));
+    const page = snapshot([item("first", 1), item("mid", 50), item("launcher", 2)]);
+    expect(prependSnapshot(current, page).items.map(entry => entry.id)).toEqual(["first", "launcher", "mid", "new"]);
+    // Parts of one message share its timestamp; the older page holds the
+    // whole message, so its order wins over the backfilled copy's position.
+    const part = (id: string, createdAt: number) => ({ id, type: "assistant_message" as const, createdAt, markdown: id });
+    const tool = (id: string, createdAt: number) => ({ id, type: "tool" as const, createdAt, name: "task", status: "completed" as const, childConversationId: "child" });
+    const held = projectionFromSnapshot(snapshot([tool("tool:launch", 5), item("new", 9)]));
+    const older = snapshot([part("part:a1", 5), tool("tool:launch", 5), part("part:a2", 5)]);
+    expect(prependSnapshot(held, older).items.map(entry => entry.id)).toEqual(["part:a1", "tool:launch", "part:a2", "new"]);
+  });
+
   test("authoritative replacement removes a suffix and resets text reconciliation", () => {
     const server = new ConversationProjection(new ConversationReplay("g1", "c1", 10_000));
     server.seed([
@@ -208,5 +274,74 @@ describe("sparse user-message updates preserve attachments", () => {
       item: { id: "message:m1", type: "user_message", createdAt: 2, text: "look", attachments: replaced },
     });
     expect(authoritative.projection.items[0]).toMatchObject({ attachments: replaced });
+  });
+});
+
+describe("a subagent row's nested lines", () => {
+  const row = { id: "tool:c", type: "tool" as const, createdAt: 1, name: "task", status: "completed" as const, childConversationId: "child", usage: { input: 10, costUsd: 0.5 } };
+  const line = (id: string, parentId: string, costUsd?: number) => ({ id, parentId, description: id, conversationId: `ses_${id}`, ...(costUsd === undefined ? {} : { usage: { costUsd } }) });
+
+  test("the workspace keeps them through the tool's own updates and replaces them when they change", () => {
+    const projection = new ConversationProjection(new ConversationReplay("g", "c1", 10_000));
+    projection.apply({ kind: "upsert", item: { ...row, descendants: [line("g", "tool:c", 0.25), line("gg", "g", 0.1)] } });
+    // The tool part's own later update knows nothing about attribution.
+    projection.apply({ kind: "upsert", item: { id: "tool:c", type: "tool", createdAt: 1, name: "task", status: "completed", output: "done" } });
+    const kept = projection.items()[0];
+    expect(kept).toEqual(expect.objectContaining({ output: "done", usage: { input: 10, costUsd: 0.5 }, descendants: [line("g", "tool:c", 0.25), line("gg", "g", 0.1)] }));
+    // A list that shrank is the new list, not merged into the old one.
+    projection.apply({ kind: "upsert", item: { ...row, descendants: [line("g", "tool:c", 0.3)] } });
+    expect(projection.items()[0]).toEqual(expect.objectContaining({ descendants: [line("g", "tool:c", 0.3)] }));
+  });
+
+  test("the client takes the published row as it is", () => {
+    const initial = projectionFromSnapshot(snapshot([{ ...row, descendants: [line("g", "tool:c", 0.25), line("gg", "g", 0.1)] }]));
+    const shrunk = applyChatEvent(initial, { generation: "g1", sequence: 5, conversationId: "c1", type: "item.upsert", item: { ...row, descendants: [line("g", "tool:c", 0.25)] } });
+    expect(shrunk.outcome).toBe("applied");
+    expect(shrunk.projection.items[0]).toEqual(expect.objectContaining({ descendants: [line("g", "tool:c", 0.25)] }));
+    // Withdrawn outright: the workspace publishes the row without them.
+    const bare = applyChatEvent(shrunk.projection, { generation: "g1", sequence: 6, conversationId: "c1", type: "item.upsert", item: row });
+    expect(bare.projection.items[0]).not.toHaveProperty("descendants");
+  });
+});
+
+// Design D14: a silent run's drill-down re-reads its snapshot and folds it in
+// the way live events land — never a reload of the view.
+describe("refreshing a held conversation from a fresh first page", () => {
+  const at = (sequence: number) => Buffer.from(JSON.stringify({ v: 1, g: "g1", s: sequence })).toString("base64url");
+  const page = (items: ConversationSnapshot["items"], sequence = 4, status: "running" | "completed" = "running"): ConversationSnapshot => ({
+    ...snapshot(items), cursor: at(sequence), conversation: { ...snapshot().conversation, status },
+  });
+  const message = (id: string, createdAt: number, markdown = id) => ({ id, type: "assistant_message" as const, createdAt, markdown });
+
+  test("new records arrive in order, and an identical read changes nothing", () => {
+    const held = projectionFromSnapshot(page([message("a", 1)]));
+    const refreshed = refreshFromSnapshot(held, page([message("a", 1), message("b", 2)]))!;
+    expect(refreshed.changed).toBe(true);
+    expect(refreshed.projection.items.map(item => item.id)).toEqual(["a", "b"]);
+    expect(refreshFromSnapshot(refreshed.projection, page([message("a", 1), message("b", 2)]))!.changed).toBe(false);
+  });
+
+  test("a settled status is adopted, and the stream resumes from the page's cursor", () => {
+    const held = projectionFromSnapshot(page([message("a", 1)]));
+    const refreshed = refreshFromSnapshot(held, page([message("a", 1)], 6, "completed"))!;
+    expect(refreshed.changed).toBe(true);
+    expect(refreshed.projection.status).toBe("completed");
+    expect(refreshed.projection.sequence).toBe(6);
+    const next = applyChatEvent(refreshed.projection, { generation: "g1", sequence: 7, conversationId: "c1", type: "item.upsert", item: message("c", 3) });
+    expect(next.outcome).toBe("applied");
+  });
+
+  test("an older page the reader paged in is kept, with its paging cursor", () => {
+    const held = { ...projectionFromSnapshot(page([message("old", 0), message("a", 1)])), olderCursor: "further" };
+    const refreshed = refreshFromSnapshot(held, page([message("a", 1), message("b", 2)]))!;
+    expect(refreshed.projection.items.map(item => item.id)).toEqual(["old", "a", "b"]);
+    expect(refreshed.projection.olderCursor).toBe("further");
+  });
+
+  test("a page behind the live stream, or from another conversation or generation, is not folded", () => {
+    const held = projectionFromSnapshot(page([message("a", 1)], 8));
+    expect(refreshFromSnapshot(held, page([message("a", 1)], 7))).toBeNull();
+    expect(refreshFromSnapshot(held, { ...page([], 9), conversation: { ...snapshot().conversation, id: "c2" } })).toBeNull();
+    expect(refreshFromSnapshot(held, { ...page([], 9), generation: "g2" })).toBeNull();
   });
 });

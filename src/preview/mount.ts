@@ -3,14 +3,14 @@
 // the preview DOM. Extracted from `app.ts` so the preview/ feature folder
 // owns the entire render-on-load flow.
 
-import { appUrl } from "../shared/app-url";
+import { appBasePath, appUrl } from "../shared/app-url";
 import { deferHiddenPreview } from "./deferred";
 import { contextualAppUrl } from "../shell/watch-context";
 import type { DocumentDiffPayload } from "./diff-view";
 import { findDocumentById } from "../shell/storage";
 import { closeMermaidViewer } from "./mermaid-viewer";
 import { renderMermaidDiagrams, replaceMermaidCodeBlocks } from "../render/preview";
-import type { FileFacts, ViewMode } from "../shared/types";
+import type { FileFacts, RootGroup, ViewMode } from "../shared/types";
 import { appState } from "../shell/state";
 import { previewObserverRoot, previewScrollRoot } from "../shell/preview-scroll-root";
 import { renderBinaryUnavailable } from "./binary";
@@ -19,6 +19,7 @@ import { renderEmptyPreview } from "./empty";
 import {
   clearPreviewType,
   previewPathElement,
+  previewBaseUrl,
   previewTitleElement,
   setPreviewBase,
   setPreviewType,
@@ -31,15 +32,30 @@ import {
   mountLayoutToolbar,
   syncLayoutChooser,
 } from "./layout";
-import { isViewableImageName, renderImagePreview } from "./image";
+import { renderImagePreview } from "./image";
+import { imageSources, refreshImageRevisions } from "./image-revision";
+import { canEmbedImages, createEmbeddedImagesLearner, recordEmbeddedImages, type EmbeddedImagesLookup } from "./embedded-images";
+import { fetchWithinBudget } from "../shell/bounded-fetch";
+import { isViewableImageName } from "../shared/viewable-image";
 import { currentMermaidThemeInputs } from "./mermaid";
 import { refreshOutline } from "./outline";
 import { clearUpdateSignal, syncFileFactsStrip } from "./file-facts-strip";
 import { attachMetadataCardToggleListener, renderMetadataCard } from "./metadata-card";
 import { syncViewToggle } from "./view-mode";
-import { getSelectedDestination, setPreviewMode } from "../shell/selection";
 import { createDocumentLoadGuard, type DocumentLoadToken } from "./load-generation";
 import { currentWatchContext } from "../shell/watch-context";
+import { getSelectedDestination, getSelectionActivation, getSelectionGeneration, setPreviewMode } from "../shell/selection";
+import { documentRevisionKey } from "../shell/document-state";
+import { enrichDocumentFacts, forgetDocumentFacts } from "./facts-enrichment";
+import {
+  classifyDocumentResponse,
+  createDocumentLoadRetry,
+  documentFailureMessage,
+  documentLoadRetryKey,
+  isTransientDocumentFailure,
+  type DocumentLoadFailure,
+  type DocumentLoadTrigger,
+} from "./load-retry";
 
 export type RenderedDocumentAuthor = { name: string; email?: string };
 
@@ -82,9 +98,10 @@ const previewShellElement: HTMLElement = previewShellElementMaybe;
 // (preserve scroll — the user is mid-read and a file-watcher reload must not
 // yank them back to the top).
 let lastLoadedDocumentId: string | null = null;
-const documentLoadGuard = createDocumentLoadGuard();
+const documentLoadGuard = createDocumentLoadGuard(getSelectionGeneration, documentRevisionKey);
 export const documentLoadState = documentLoadGuard.state;
 export const onDocumentLoadChange = documentLoadGuard.subscribe;
+const documentLoadRetry = createDocumentLoadRetry();
 const alwaysCurrent = () => true;
 
 // `DocumentDiffPayload` is imported from `./document-diff-view` (above) so
@@ -103,10 +120,61 @@ export function rememberDocumentPayload(payload: RenderedDocument): void {
   const entry = documentViewCache.get(payload.id) ?? {};
   entry[payload.view] = payload;
   documentViewCache.set(payload.id, entry);
+  // Only the shown document's images are remembered; every caller has
+  // already checked that this payload is current for the selection.
+  if (payload.view === "rendered" && documentSupportsSplit(payload) && appState.selectedId === payload.id) {
+    recordEmbeddedImages(payload.id, documentRevisionKey(payload.id), previewBaseUrl(payload.path), renderedImageSources(payload));
+  }
+}
+
+// The authored `src` of each image a rendered payload embeds. Parsed in an
+// inert <template>, so nothing is fetched or run.
+function renderedImageSources(payload: RenderedDocument): string[] {
+  const template = document.createElement("template");
+  template.innerHTML = payload.html;
+  return imageSources(template.content);
+}
+
+// A Markdown or AsciiDoc document shown as Source or Diff has no rendered
+// payload on the page, so the images it embeds are unknown. Look that payload
+// up once per revision, in the background, so Follow can still tell an
+// embedded image's change from any other image's (Rule C); until it answers,
+// Follow holds an image decision rather than guessing (shell/image-follow.ts).
+// The learner drops an answer that arrives after the selection or the
+// document's revision moved on. The request is bounded so a held decision
+// always settles: no answer within the budget counts as a failed lookup.
+export const EMBEDDED_IMAGES_LOOKUP_TIMEOUT_MS = 10_000;
+const learnEmbeddedImagesOf = createEmbeddedImagesLearner({
+  revisionOf: documentRevisionKey,
+  isSelected: documentId => appState.selectedId === documentId,
+  fetchSources: async documentId => {
+    const payload = await fetchWithinBudget(
+      (input, init) => fetch(input, { ...init, cache: "no-store" }),
+      contextualAppUrl(appUrl(`/api/document?id=${encodeURIComponent(documentId)}&view=rendered`)),
+      EMBEDDED_IMAGES_LOOKUP_TIMEOUT_MS,
+      async response => response.ok ? await response.json() as RenderedDocument : null,
+    );
+    return payload ? { baseUrl: previewBaseUrl(payload.path), sources: renderedImageSources(payload) } : null;
+  },
+});
+export function learnEmbeddedImages(documentId: string): Promise<EmbeddedImagesLookup> {
+  const doc = findDocumentById(documentId);
+  if (!doc || !canEmbedImages(doc)) return Promise.resolve("known");
+  return learnEmbeddedImagesOf(documentId);
 }
 
 export function forgetDocumentCache(documentId: string): void {
+  forgetDocumentFacts(documentId);
   documentViewCache.delete(documentId);
+  documentDiffCache.delete(documentId);
+}
+
+// Called on every state update: points each image in the preview at the
+// current revision of its file (see image-revision.ts). Only a document
+// preview is live; a commit preview stays historical.
+export function refreshPreviewImages(roots: RootGroup[]): void {
+  if (appState.previewMode.kind !== "document") return;
+  refreshImageRevisions(previewElement, appBasePath(), roots, documentRevisionKey);
 }
 
 // Mount a fetched document payload into the preview body. Centralizes the
@@ -148,6 +216,7 @@ export async function applyDocumentPayload(
   // Diff wires its comparison-specific variant in diff.ts. In split layouts
   // this shared chrome slot still renders exactly once above both panes.
   syncFileFactsStrip({ kind: "document", facts: payload.fileFacts });
+  void enrichDocumentFacts(payload, isCurrent);
 
   if (appState.viewLayout === "single" || !documentSupportsSplit(payload)) {
     await renderSinglePayload(payload, isCurrent);
@@ -209,6 +278,7 @@ export async function renderSinglePayload(
   previewElement.removeAttribute("data-auto-stack");
   const cardHtml = renderMetadataCard(payload.metadata);
   previewElement.innerHTML = cardHtml + replaceMermaidCodeBlocks(payload.html);
+  refreshImageRevisions(previewElement, appBasePath(), appState.roots, documentRevisionKey);
   // For markdown / asciidoc, mount the inline layout chooser above the
   // preview body so users can switch between Single / Side by side /
   // Stacked from beside the content — same pattern as the diff view's
@@ -244,6 +314,9 @@ export async function renderSplitForDocument(
   payload: RenderedDocument,
   isCurrent: () => boolean = alwaysCurrent,
 ): Promise<void> {
+  const ownsLoad = isCurrent;
+  const revision = documentRevisionKey(payload.id);
+  isCurrent = () => ownsLoad() && documentRevisionKey(payload.id) === revision && appState.selectedId === payload.id;
   if (!isCurrent()) return;
   const cache = documentViewCache.get(payload.id) ?? {};
   let sourcePayload = cache.source;
@@ -282,12 +355,15 @@ export async function fetchDocumentView(
   documentId: string,
   view: ViewMode,
 ): Promise<RenderedDocument | null> {
+  const revision = documentRevisionKey(documentId);
   try {
     const response = await fetch(
       contextualAppUrl(appUrl(`/api/document?id=${encodeURIComponent(documentId)}&view=${encodeURIComponent(view)}`)),
+      { cache: "no-store" },
     );
     if (!response.ok) return null;
-    return (await response.json()) as RenderedDocument;
+    const payload = (await response.json()) as RenderedDocument;
+    return documentRevisionKey(documentId) === revision ? payload : null;
   } catch {
     return null;
   }
@@ -302,6 +378,9 @@ export async function renderSplitPayloads(
   renderedPayload: RenderedDocument,
   isCurrent: () => boolean = alwaysCurrent,
 ): Promise<void> {
+  const ownsLoad = isCurrent;
+  const revision = documentRevisionKey(sourcePayload.id);
+  isCurrent = () => ownsLoad() && documentRevisionKey(sourcePayload.id) === revision && appState.selectedId === sourcePayload.id;
   if (!isCurrent()) return;
   const orientation: "split-h" | "split-v" =
     appState.viewLayout === "split-v" ? "split-v" : "split-h";
@@ -332,6 +411,7 @@ export async function renderSplitPayloads(
 
   mountLayoutToolbar(true);
   previewElement.replaceChildren(sourcePane, resizer, renderedPane);
+  refreshImageRevisions(renderedPane, appBasePath(), appState.roots, documentRevisionKey);
 
   attachMetadataCardToggleListener(renderedPane);
   // Lazy install (resolves on setup, diagrams stream in) — see the
@@ -358,19 +438,30 @@ export async function renderSplitPayloads(
   });
 }
 
-export async function loadDocument(documentId: string, onPresented?: () => void) {
+// `trigger` is "retry" only from the retry schedule's own timer. Every other
+// caller (navigation, a view change, a live frame reloading the selection) is
+// a "request", and a request that fails transiently starts the schedule over.
+export async function loadDocument(
+  documentId: string,
+  onPresented?: () => void,
+  trigger: DocumentLoadTrigger = "request",
+) {
+  const selectionGeneration = getSelectionGeneration();
   if (deferHiddenPreview(() => {
     const current = appState.selectedId;
-    if (current && appState.previewMode.kind === "document") void loadDocument(current, current === documentId ? onPresented : undefined);
+    const same = current === documentId && selectionGeneration === getSelectionGeneration();
+    if (current && appState.previewMode.kind === "document") void loadDocument(current,
+      same ? onPresented : undefined, same ? trigger : "request");
   })) return;
-  await executeLoadDocument(documentId);
-  if (appState.selectedId === documentId && documentLoadState().status === "ready") onPresented?.();
+  await executeLoadDocument(documentId, trigger);
+  if (selectionGeneration === getSelectionGeneration() && appState.selectedId === documentId && documentLoadState().status === "ready") onPresented?.();
 }
 
-async function executeLoadDocument(documentId: string) {
+async function executeLoadDocument(documentId: string, trigger: DocumentLoadTrigger) {
   const requestedView = appState.viewMode;
   const requestedLayout = appState.viewLayout;
   const loadToken = documentLoadGuard.begin(documentId, requestedView, requestedLayout);
+  const activation = getSelectionActivation();
   const context = JSON.stringify(currentWatchContext());
   let expired = false;
   const isCurrent = () => !expired && appState.previewMode.kind !== "commit"
@@ -389,6 +480,7 @@ async function executeLoadDocument(documentId: string) {
   // `#section`, cross-doc link with hash) run their own `scrollToFragment`
   // afterwards — the reset happens first, then the fragment scroll wins.
   const isDocumentSwitch = lastLoadedDocumentId !== documentId;
+  if (isDocumentSwitch && lastLoadedDocumentId) forgetDocumentFacts(lastLoadedDocumentId);
   lastLoadedDocumentId = documentId;
   if (isDocumentSwitch) {
     // The update signal marks "the doc you are viewing changed on disk" —
@@ -420,12 +512,15 @@ async function executeLoadDocument(documentId: string) {
   // path that used to surface as "The selected file no longer exists."
   const doc = findDocumentById(documentId);
   if (!doc) {
+    documentLoadRetry.settle();
     renderUnavailableDocument(documentId);
     documentLoadGuard.settle(loadToken, "missing-target");
     return;
   }
   setPreviewMode({ kind: "document" });
   if (doc.kind === "binary") {
+    documentLoadRetry.settle();
+    syncFileFactsStrip({ kind: "hidden" });
     if (isViewableImageName(doc.name)) {
       await renderImagePreview(doc, isCurrent);
     } else {
@@ -438,6 +533,8 @@ async function executeLoadDocument(documentId: string) {
   // own endpoint and renderer. The /api/document fetch is skipped for now;
   // toggling out of Diff will lazy-load the rendered/source view on demand.
   if (appState.viewMode === "diff") {
+    documentLoadRetry.settle();
+    void learnEmbeddedImages(documentId);
     await applyDiffForActiveDocument(documentId, isCurrent);
     return;
   }
@@ -446,20 +543,39 @@ async function executeLoadDocument(documentId: string) {
   // the viewMode is somehow "diff" we already short-circuited above; this
   // assertion narrows the param so the response stays well-typed.
   const apiView: "rendered" | "source" = appState.viewMode === "source" ? "source" : "rendered";
-  const response = await fetch(
-    contextualAppUrl(appUrl(`/api/document?id=${encodeURIComponent(documentId)}&view=${encodeURIComponent(apiView)}`)),
-  );
+  const result = await fetchDocumentPayload(documentId, apiView);
 
   if (!isCurrent()) return;
-  if (!response.ok) {
-    renderUnavailableDocument(documentId);
-    documentLoadGuard.settle(loadToken, response.status === 404 ? "missing-target" : "load-error");
+  if (!result.ok) {
+    const { failure } = result;
+    documentLoadGuard.settle(loadToken, failure.kind === "status" && failure.status === 404 ? "missing-target" : "load-error");
+    if (!isTransientDocumentFailure(failure)) {
+      // The server stated something about the document (gone, not readable,
+      // not viewable), or answered OK with something that is not a document.
+      // Retrying would get the same answer; the live document topic
+      // re-fetches if the file changes (see shouldRefreshPreview), and
+      // selecting it again makes one new request.
+      documentLoadRetry.settle();
+      renderUnavailableDocument(documentId, documentFailureMessage(failure, false));
+      return;
+    }
+    // The server failed, or no complete answer arrived. Nothing else will
+    // ask again, so retry while this is still the load the user is waiting on.
+    const retrying = documentLoadRetry.failed(documentLoadRetryKey({
+      selectionGeneration: loadToken.selectionGeneration,
+      activation,
+      documentId,
+    }), () => {
+      if (isCurrent()) void loadDocument(documentId, undefined, "retry");
+    }, trigger);
+    renderUnavailableDocument(documentId, documentFailureMessage(failure, retrying));
     return;
   }
 
-  const payload = (await response.json()) as RenderedDocument;
-  if (!isCurrent()) return;
+  const payload = result.payload;
+  documentLoadRetry.settle();
   rememberDocumentPayload(payload);
+  if (payload.view !== "rendered") void learnEmbeddedImages(documentId);
   await applyDocumentPayload(payload, isCurrent);
   };
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -478,10 +594,43 @@ async function executeLoadDocument(documentId: string) {
   }
 }
 
-function renderUnavailableDocument(documentId: string): void {
+// One `/api/document` request, classified (see classifyDocumentResponse).
+// `fetch()` throwing is no answer at all. Once the status line is in, the body
+// is read in its own `try` and parsed separately: a body that breaks mid-read
+// leaves a non-OK answer classified by its status (a 404 stays final) and an
+// OK answer as no complete answer (transient), and an OK answer that does not
+// parse is told apart from both (final); `response.json()` would merge them
+// into one rejection.
+async function fetchDocumentPayload(
+  documentId: string,
+  view: "rendered" | "source",
+): Promise<{ ok: true; payload: RenderedDocument } | { ok: false; failure: DocumentLoadFailure }> {
+  let response: Response;
+  try {
+    response = await fetch(
+      contextualAppUrl(appUrl(`/api/document?id=${encodeURIComponent(documentId)}&view=${encodeURIComponent(view)}`)),
+      { cache: "no-store" },
+    );
+  } catch {
+    return { ok: false, failure: { kind: "no-answer" } };
+  }
+  let text: string | null;
+  try {
+    text = await response.text();
+  } catch {
+    text = null;
+  }
+  const result = classifyDocumentResponse(response, text);
+  return result.ok ? { ok: true, payload: result.payload as RenderedDocument } : result;
+}
+
+function renderUnavailableDocument(
+  documentId: string,
+  message = "File unavailable. It may have been removed or excluded from this workspace.",
+): void {
   const destination = getSelectedDestination();
   setPreviewMode({ kind: "empty" });
-  renderEmptyPreview(destination?.name ?? "File unavailable", "File unavailable. It may have been removed or excluded from this workspace.");
+  renderEmptyPreview(destination?.name ?? "File unavailable", message);
   previewPathElement.textContent = destination?.relativePath ?? documentId;
   refreshOutline(null);
   syncFileFactsStrip({ kind: "hidden" });

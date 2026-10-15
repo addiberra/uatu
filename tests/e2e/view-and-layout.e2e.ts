@@ -136,6 +136,12 @@ test("Switching to single layout preserves the Source / Rendered preference", as
   // Enter side-by-side; the chooser stays visible (so Diff stays
   // reachable) and the persisted Source preference is preserved.
   await page.locator(".uatu-layout-toolbar [data-layout-value='split-h']").click();
+  // Wait for the split to actually mount. Entering split fetches the missing
+  // Rendered view and then rebuilds the layout toolbar; a click on Single
+  // that is still in progress when that rebuild lands is dropped (mousedown
+  // and mouseup hit different buttons), leaving the preview in split.
+  await expect(page.locator(".uatu-layout-toolbar [data-layout-value='split-h']")).toHaveAttribute("aria-checked", "true");
+  await expect(page.locator("#preview.is-split-h")).toBeVisible();
   await expect(page.locator("#view-control")).toBeVisible();
   await expect(page.locator("#view-source")).toHaveAttribute("aria-checked", "true");
 
@@ -145,6 +151,131 @@ test("Switching to single layout preserves the Source / Rendered preference", as
   await expect(page.locator("#view-source")).toHaveAttribute("aria-checked", "true");
   // And the body is in source view, not rendered.
   await expect(page.locator("#preview > pre.uatu-source-pre")).toBeVisible();
+});
+
+test("A document load the server fails transiently recovers without another click", async ({ page }) => {
+  // The first read of diagram.md fails the way an overloaded server does; the
+  // file itself is fine. A 5xx is not "file removed", so the preview must
+  // retry on its own instead of staying on the unavailable notice.
+  let reads = 0;
+  let releaseRetry: () => void = () => {};
+  const retryGate = new Promise<void>(resolve => { releaseRetry = resolve; });
+  await page.route("**/api/document?*", async route => {
+    const id = new URL(route.request().url()).searchParams.get("id") ?? "";
+    if (!id.endsWith("/diagram.md")) return route.continue();
+    reads += 1;
+    if (reads === 1) return route.fulfill({ status: 500, json: { error: "document render failed" } });
+    // Hold the retry until the interim notice has been observed.
+    await retryGate;
+    return route.continue();
+  });
+
+  await treeRow(page, "diagram.md").click();
+  await expect(page.locator("#preview")).toContainText("This file couldn't be loaded. Retrying");
+  await expect(page.locator("#preview-path")).toHaveText("diagram.md");
+  await expect.poll(() => reads).toBeGreaterThanOrEqual(2);
+  releaseRetry();
+
+  await expect(page.locator("#preview-title")).toHaveText("Diagram Fixture");
+  await expect(page.locator("#preview")).not.toContainText("couldn't be loaded");
+});
+
+test("A document the server cannot read shows the permission notice once and loads on the next selection", async ({ page }) => {
+  test.skip(process.getuid?.() === 0, "chmod cannot deny root a read");
+  // Permission denied will not clear on its own, so the server answers a final
+  // 403 and the preview must neither retry nor say "Retrying". The denying
+  // chmod runs before the first selection, so a watcher event it may cause
+  // has nothing selected to reload. The restoring chmod runs while the file
+  // is selected, and a watcher that reports a pure mode change (chokidar in
+  // fs.watch mode can) may reload it on its own, so the recovery check below
+  // does not count reads exactly.
+  const filePath = workspacePath("diagram.md");
+  let reads = 0;
+  await page.route("**/api/document?*", route => {
+    const id = new URL(route.request().url()).searchParams.get("id") ?? "";
+    if (id.endsWith("/diagram.md")) reads += 1;
+    return route.continue();
+  });
+
+  await fs.chmod(filePath, 0o000);
+  try {
+    await treeRow(page, "diagram.md").click();
+    await expect(page.locator("#preview")).toContainText(
+      "Uatu doesn't have permission to read this file. Change its permissions, then select it again.",
+    );
+    await expect(page.locator("#preview")).not.toContainText("Retrying");
+    // Settled: one read, still one past the first two retry delays (250 ms,
+    // 1 s). Any further read keeps the poll from passing.
+    const settledFrom = Date.now();
+    await expect.poll(() => {
+      if (reads !== 1) throw new Error(`expected one read, saw ${reads}`);
+      return Date.now() - settledFrom;
+    }, { timeout: 5_000, intervals: [100] }).toBeGreaterThanOrEqual(1_500);
+    expect(reads).toBe(1);
+    await expect(page.locator("#preview")).not.toContainText("Retrying");
+  } finally {
+    await fs.chmod(filePath, 0o644);
+  }
+
+  const readsBeforeReselect = reads;
+  await treeRow(page, "diagram.md").click();
+  await expect(page.locator("#preview-title")).toHaveText("Diagram Fixture");
+  await expect(page.locator("#preview")).not.toContainText("permission");
+  expect(reads).toBeGreaterThan(readsBeforeReselect);
+});
+
+test("An OK document answer that does not parse is final, not retried", async ({ page }) => {
+  let reads = 0;
+  await page.route("**/api/document?*", route => {
+    const id = new URL(route.request().url()).searchParams.get("id") ?? "";
+    if (!id.endsWith("/diagram.md")) return route.continue();
+    reads += 1;
+    return route.fulfill({ status: 200, contentType: "application/json", body: "not json" });
+  });
+
+  await treeRow(page, "diagram.md").click();
+  await expect(page.locator("#preview")).toContainText("This file couldn't be loaded. Select it again to retry.");
+  await expect(page.locator("#preview")).not.toContainText("Retrying");
+  const settledFrom = Date.now();
+  await expect.poll(() => {
+    if (reads !== 1) throw new Error(`expected one read, saw ${reads}`);
+    return Date.now() - settledFrom;
+  }, { timeout: 5_000, intervals: [100] }).toBeGreaterThanOrEqual(1_500);
+  expect(reads).toBe(1);
+});
+
+test("A layout click survives a render that lands between mousedown and mouseup", async ({ page }) => {
+  await expect(page.locator("#view-rendered")).toHaveAttribute("aria-checked", "true");
+  // Hold the Source fetch that entering side-by-side needs, so the render it
+  // triggers can be released at a chosen moment inside the next click.
+  let releaseSource: () => void = () => {};
+  const sourceHeld = new Promise<void>(resolve => {
+    void page.route("**/api/document?*", async route => {
+      if (new URL(route.request().url()).searchParams.get("view") !== "source") return route.continue();
+      releaseSource = () => void route.continue();
+      resolve();
+    });
+  });
+
+  await page.locator(".uatu-layout-toolbar [data-layout-value='split-h']").click();
+  await sourceHeld;
+
+  // Press on Single, let the split render land, then release. The render
+  // must not replace the button under the pointer, or the browser fires no
+  // click and the switch back to single is lost.
+  const single = page.locator(".uatu-layout-toolbar [data-layout-value='single']");
+  const box = await single.boundingBox();
+  expect(box).not.toBeNull();
+  if (!box) return;
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  await page.mouse.down();
+  releaseSource();
+  await expect(page.locator("#preview.is-split-h")).toBeVisible();
+  await expect(page.locator(".uatu-layout-toolbar [data-layout-value='split-h']")).toHaveAttribute("aria-checked", "true");
+  await page.mouse.up();
+
+  await expect(single).toHaveAttribute("aria-checked", "true");
+  await expect(page.locator("#preview")).not.toHaveClass(/is-split/);
 });
 
 test("Dragging the split resizer reallocates space between panes", async ({ page }) => {

@@ -15,7 +15,9 @@ bunx playwright install chromium
 bun run dev
 ```
 
-The development server watches `testdata/watch-docs` by default.
+`bun run dev` starts a dev hub at `http://127.0.0.1:4702/` with
+`testdata/watch-docs` registered and opens it. Sign in as `dev` with password
+`dev`; [dev/README.md](./dev/README.md) has the details.
 [ARCHITECTURE.md](./ARCHITECTURE.md) describes the runtime, state, request,
 terminal, and extension points.
 
@@ -107,14 +109,44 @@ same core checks as CI should pass:
 
 ```bash
 bun run typecheck
-bun audit --audit-level=moderate
-bun test
+bun run audit
+bun run test:ci
 bun run check:licenses
 bun run build
 bun run smoke
 bun run test:e2e
 bunx @fission-ai/openspec validate --all --strict
 ```
+
+### Agent SDK coverage
+
+The [Agent SDK coverage dashboard](https://github.com/tjakobsson/uatu/issues/480)
+records, for every message type, content-block or part type, and tool the
+installed agent SDKs declare, what uatu does with it: dedicated, generic,
+ignored, unhandled, or behavior-missing. It is not committed. The `Agent SDK
+coverage` workflow (`.github/workflows/agent-coverage.yml`) regenerates it after
+every push to `main`, and when a merge adds or removes SDK vocabulary it posts a
+comment on the issue naming what changed. An agent SDK bump
+(`@anthropic-ai/claude-agent-sdk`, `@anthropic-ai/sdk`, `@opencode-ai/sdk`,
+`@opencode/client`) has nothing to regenerate.
+
+To preview what your branch would publish:
+
+```bash
+bun run coverage:agents                       # the dashboard body, on stdout
+gh issue view 480 --json body --jq .body > /tmp/published.md
+bun run coverage:agents --previous /tmp/published.md > /dev/null
+                                              # the comment it would post, on stderr
+```
+
+`bun test` fails a bump only when uatu itself has to change, never because a
+version moved or coverage is incomplete. Only two things are written by hand,
+in `src/chat/claude/sdk-coverage.ts` and `src/chat/opencode/sdk-coverage.ts`:
+why an ignored type is dropped (every one needs a reason; a key ending in `*`
+covers a family), and which entries render without working (and what fixes
+them, by name). The generator, and with it `bun test`, rejects an annotation
+naming anything the installed SDK does not declare, and an ignored type nobody
+has explained — state why, or stop ignoring it so it reports as unhandled.
 
 The full Playwright suite takes longer than unit tests. Focused Playwright
 files are appropriate while iterating, but CI remains the final full-suite

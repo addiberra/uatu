@@ -7,6 +7,8 @@ import { buildDesignSystemAssets, designSystemPrefix } from "./design-system-ass
 import { createSyntheticBackend, type Scenario } from "./backend";
 import { createWorkspaceProtocols, terminalId } from "./protocols";
 import { previewResources } from "./preview-corpus";
+import { LiveBroker } from "../../src/hub/live-broker";
+import { LiveEndpoint } from "../../src/hub/live-endpoint";
 import { prefersHtmlNavigation } from "../../src/server/navigation";
 import { controller, controllerScript, scenarios, controls, dispatchControl } from "./controller";
 import { reviewMethods, deserializeReviewValue, createReviewPersonalState, type ReviewMethod } from "./transport";
@@ -71,7 +73,7 @@ async function boundedBody(request: Request, limit: number): Promise<string | nu
 
 /** Test-only loopback listener. Requests carry no live session meaning; cookies
  * and Authorization are neither read, forwarded, set nor written into logs. */
-export async function startReviewServer(options: { port?: number; assets?: ReviewAssets; publicOrigin?: string; evidenceAssets?: ReviewAssets; designSystemAssets?: ReviewAssets; instanceId?: string } = {}) {
+export async function startReviewServer(options: { port?: number; assets?: ReviewAssets; publicOrigin?: string; evidenceAssets?: ReviewAssets; designSystemAssets?: ReviewAssets; instanceId?: string; standalone?: boolean } = {}) {
   const port = options.port ?? 4703;
   const publicOrigin = validatePublicOrigin(options.publicOrigin);
   if ([4700, 4701, 4702].includes(port)) throw new Error("Reserved review backend port");
@@ -97,17 +99,43 @@ export async function startReviewServer(options: { port?: number; assets?: Revie
     return realm;
   };
   const missing: Array<{ method: string; contract: string }> = [];
+  // Exercise the real multiplexing contract with memory-only child sources.
+  // No Hub runtime, session process, provider, network upstream or PTY is started.
+  let liveSession = crypto.randomUUID();
+  const liveBroker = new LiveBroker({
+    workspaceIds: () => synthetic.inspect().workspaces.map(w => w.id),
+    isRunning: id => synthetic.snapshot().authenticated && synthetic.inspect().workspaces.some(w => w.id === id && w.runtime.status === "running"),
+    async open({ workspaceId, path, signal }) {
+      if (!synthetic.snapshot().authenticated) return new Response(null, { status: 401 });
+      if (!synthetic.inspect().workspaces.some(w => w.id === workspaceId && w.runtime.status === "running")) return new Response(null, { status: 409 });
+      const url = new URL(path, "http://synthetic.invalid");
+      return await realmFor(workspaceId).protocols.handle(new Request(url, { signal }), url)
+        ?? new Response(null, { status: 501 });
+    },
+  }, { lingerMs: 0, retryMinMs: 100 });
+  const liveEndpoint = new LiveEndpoint({
+    broker: liveBroker,
+    resolveWorkspace: id => synthetic.inspect().workspaces.some(w => w.id === (id ?? "atlas")) ? id ?? "atlas" : null,
+    principalStillValid: principal => synthetic.snapshot().authenticated && principal.sessionId === liveSession,
+  });
   let stopped = false;
   const sockets = new Set<import("bun").ServerWebSocket<{ ready: boolean; sessionId: string; workspaceId: string }>>();
   const invalidationStreams = new Set<ReadableStreamDefaultController<Uint8Array>>();
   const encoder = new TextEncoder();
   synthetic.backend.subscribeInvalidation(event => {
+    if (event.scope === "authentication") {
+      liveEndpoint.endAll();
+      liveSession = crypto.randomUUID();
+    }
     for (const controller of invalidationStreams) { try { controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`)); } catch { invalidationStreams.delete(controller); } }
     for (const [id, realm] of realms) if (event.scope === "authentication" || (event.scope === "workspace" && event.workspaceId === id)) {
       realm.protocols.reset(); for (const socket of sockets) if (socket.data.workspaceId === id) socket.close(1000, "Synthetic session invalidated");
     }
   });
   const server = Bun.serve<{ ready: boolean; sessionId: string; workspaceId: string }>({
+    // LiveEndpoint owns heartbeat/lifetime. Bun's shorter idle timeout would
+    // otherwise truncate quiet SSE streams before their next heartbeat.
+    idleTimeout: 0,
     hostname: "127.0.0.1", port,
     websocket: {
       open(ws) { sockets.add(ws); realmFor(ws.data.workspaceId).protocols.terminal.attached(ws.data.sessionId, true); },
@@ -139,7 +167,20 @@ export async function startReviewServer(options: { port?: number; assets?: Revie
       // Exact allowlist is authoritative even after WHATWG URL normalization.
       // Encodings/backslashes are never meaningful review asset names.
       if (/%|\\|\0/.test(url.pathname.replace(/\/api\/chat\/conversations\/review%3Aconversation-[0-9]+/, "/api/chat/conversations/synthetic"))) return reply("Invalid review path", 400);
-      if (url.search && ((url.pathname.startsWith("/review/") && url.pathname !== "/review/clone-events") || url.pathname.startsWith("/api/hub/"))) return reply("Unexpected review query", 400);
+      if (url.search && ((url.pathname.startsWith("/review/") && url.pathname !== "/review/clone-events") || (url.pathname.startsWith("/api/hub/") && url.pathname !== "/api/hub/live"))) return reply("Unexpected review query", 400);
+      if (url.pathname === "/api/hub/live" || /^\/api\/hub\/live\/[^/]+\/subscriptions$/.test(url.pathname)) {
+        if (canonical) return reply("Live stream belongs to the Hub origin", 404);
+        if (!synthetic.snapshot().authenticated) return reply("Synthetic session signed out", 401);
+        const principal = { user: "reviewer", sessionId: liveSession };
+        if (request.method === "GET" && url.pathname === "/api/hub/live") return liveEndpoint.openStream(request, principal);
+        if (request.method === "POST" && url.pathname.endsWith("/subscriptions")) {
+          if (request.headers.get("content-type") !== "application/json") return reply("JSON required", 415);
+          const text = await boundedBody(request, 65_536);
+          if (text === null) return reply("Too large", 413);
+          return liveEndpoint.changeSubscriptions(new Request(request.url, { method: "POST", headers: request.headers, body: text }), url.pathname.split("/")[4]!, principal);
+        }
+        return reply("Unsupported synthetic live operation", 405);
+      }
       if (url.pathname === "/review/design-system" || url.pathname.startsWith(designSystemPrefix)) {
         if (canonical || request.method !== "GET") return reply("Unknown reference route", 404);
         if (url.pathname === designSystemPrefix) return new Response(null, { status: 308, headers: { ...headers, Location: "/review/design-system" } });
@@ -217,7 +258,9 @@ export async function startReviewServer(options: { port?: number; assets?: Revie
         }
         const response = await protocols.handle(request, url);
         if (response) { for (const socket of sockets) if (socket.data.workspaceId === workspaceId && !protocols.terminal.has(socket.data.sessionId)) socket.close(1000, "Synthetic terminal deleted"); for (const [key, value] of Object.entries(headers)) response.headers.set(key, value); return response; }
-      } else if (url.search && (previewResources.has(url.pathname.slice(1)) || (!["/", "/settings", "/clone"].includes(url.pathname) && !protocols.documentPathAllowed(url.pathname)))) return reply("Unexpected review query", 400);
+      } else if (url.search && (previewResources.has(url.pathname.slice(1))
+        ? [...url.searchParams.keys()].some(key => key !== "revision") || url.searchParams.getAll("revision").length !== 1
+        : !["/", "/settings", "/clone"].includes(url.pathname) && !protocols.documentPathAllowed(url.pathname))) return reply("Unexpected review query", 400);
       if (request.method === "GET") {
         const resource = previewResources.get(url.pathname.slice(1));
         if (resource) {
@@ -243,7 +286,7 @@ export async function startReviewServer(options: { port?: number; assets?: Revie
         if (asset) {
           if (asset === assets.get("/index.html")) {
             const html = typeof asset.body === "string" ? asset.body : await asset.body.text();
-            const response = reply(html.replace('<meta charset="utf-8"', `<meta name="uatu-review-workspace" content="${workspaceId}"><meta name="uatu-base-path" content="/s/${workspaceId}/"><meta charset="utf-8"`), 200, asset.type);
+            const response = reply(options.standalone ? html : html.replace('<meta charset="utf-8"', `<meta name="uatu-review-workspace" content="${workspaceId}"><meta name="uatu-base-path" content="/s/${workspaceId}/"><meta charset="utf-8"`), 200, asset.type);
             if (resource) response.headers.set("Vary", "Accept");
             return response;
           }
@@ -284,6 +327,7 @@ export async function startReviewServer(options: { port?: number; assets?: Revie
         let body: { scenario?: unknown };
         try { body = JSON.parse(text); } catch { return reply("Invalid JSON", 400); }
         if (!body || !(scenarios as readonly string[]).includes(String(body.scenario))) return reply("Unknown scenario", 400);
+        liveEndpoint.endAll();
         synthetic.reset(body.scenario as Scenario); for (const realm of realms.values()) { realm.protocols.reset(); realm.personal.reset(); } for (const socket of sockets) socket.close(1000, "Synthetic reset"); missing.length = 0;
         return json({ reset: true });
       }
@@ -293,7 +337,7 @@ export async function startReviewServer(options: { port?: number; assets?: Revie
       return json({ error: "Missing synthetic route contract; request blocked" }, 501);
     },
   });
-  return { url: `http://127.0.0.1:${server.port}`, synthetic, protocols, stop() { if (!stopped) { stopped = true; synthetic.reset(); for (const realm of realms.values()) realm.protocols.reset(); for (const stream of invalidationStreams) { try { stream.close(); } catch {} } invalidationStreams.clear(); server.stop(true); } } };
+  return { url: `http://127.0.0.1:${server.port}`, synthetic, protocols, stop() { if (!stopped) { stopped = true; liveEndpoint.endAll(); liveBroker.dispose(); synthetic.reset(); for (const realm of realms.values()) realm.protocols.reset(); for (const stream of invalidationStreams) { try { stream.close(); } catch {} } invalidationStreams.clear(); server.stop(true); } } };
 }
 
 if (import.meta.main) {

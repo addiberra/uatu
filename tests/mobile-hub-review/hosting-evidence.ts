@@ -2,6 +2,7 @@ import { lstat, realpath } from "node:fs/promises";
 import { escapeHtml } from "../../src/shared/html";
 import type { ReviewAssets, ApprovedAsset } from "./server";
 import { galleryImages, galleryViewport } from "./compact-gallery";
+import { reviewEvidenceRoot } from "./artifact-locations";
 
 /** Fixed publication set. Raw outputs and historical directories are never served. */
 export const evidenceSelection: readonly string[] = Object.freeze([
@@ -9,7 +10,7 @@ export const evidenceSelection: readonly string[] = Object.freeze([
 ]);
 
 export async function buildEvidenceAssets(): Promise<ReviewAssets> {
-  const root = await realpath(new URL("../../openspec/changes/restore-refined-mobile-hub-experience/review-evidence/", import.meta.url));
+  const root = await realpath(reviewEvidenceRoot);
   const assets = new Map<string, ApprovedAsset>();
   const files = [];
   for (const name of evidenceSelection) {

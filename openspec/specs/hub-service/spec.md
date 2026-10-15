@@ -2,16 +2,16 @@
 
 ## Purpose
 
-Define the uatu hub daemon: a long-running service that keeps a persistent workspace registry (absolute paths, stable session ids), starts and stops `uatu serve` sessions through a pluggable session backend, and reverse-proxies all session traffic (HTTP, SSE, WebSocket) under `/s/<id>/` prefixes behind hub-terminated TLS — so one authenticated origin fronts many loopback-bound sessions — plus a self-hosting runbook covering real certificate and startup paths.
+Define the uatu hub daemon: a long-running service that keeps a persistent workspace registry (absolute paths, stable session ids), starts and stops `uatu serve` sessions through a pluggable session backend, reverse-proxies session traffic (HTTP and WebSocket) under `/s/<id>/` prefixes behind hub-terminated TLS, and delivers live updates to each page over one brokered stream it fans out from the sessions' internal event routes — so one authenticated origin fronts many loopback-bound sessions — plus a self-hosting runbook covering real certificate and startup paths.
 
 ## Requirements
 
 ### Requirement: Hub reports its public API compatibility identity
-The Hub SHALL expose an authenticated machine-readable compatibility identity containing its public Hub API revision and the public workspace API revision expected behind its proxied workspace routes. These revisions SHALL identify wire-contract compatibility independently from the product version and source-build identity, and SHALL correspond to published contract metadata. Clients MUST NOT need to infer API compatibility from a display-formatted version string.
+The Hub SHALL expose an authenticated machine-readable compatibility identity containing its public Hub API revision and the workspace revision, which versions the workspace-owned payload schemas the Hub forwards on its live stream (the workspace routes behind the Hub are internal and carry no public revision). These revisions SHALL identify wire-contract compatibility independently from the product version and source-build identity, and SHALL correspond to published contract metadata. Clients MUST NOT need to infer API compatibility from a display-formatted version string.
 
 #### Scenario: Native client probes Hub compatibility
 - **WHEN** an authenticated native client requests Hub state
-- **THEN** the response identifies the Hub API revision and proxied workspace API revision as machine-readable values
+- **THEN** the response identifies the Hub API revision and the workspace payload revision as machine-readable values
 - **AND** the values can be matched to published contract revisions
 
 #### Scenario: Product release does not imply a contract break
@@ -105,8 +105,9 @@ The Hub SHALL handle the personal-state API under `/s/<workspace-id>/` before ge
 - **AND** the child receives no request
 
 #### Scenario: Session traffic still proxies normally
-- **WHEN** the same client requests document state, SSE, or terminal transport
+- **WHEN** the same client requests document state or terminal transport
 - **THEN** the Hub forwards that traffic according to the existing proxy contract
+- **AND** the client's live updates arrive over the Hub's brokered live stream, not through a proxied workspace SSE route
 
 ### Requirement: The binary provides a hub daemon subcommand
 The `uatu` binary SHALL provide a `hub` subcommand that starts a long-running daemon from a configuration file (listen port, TLS certificate and key paths, users, state directory override), suitable for supervision by systemd or launchd. The hub SHALL persist its workspace registry and secrets under an XDG-resolved state directory, creating secret-bearing files with owner-only permissions. On SIGTERM or SIGINT the hub SHALL stop every running session and exit cleanly. The configuration SHALL NOT define a workspaces root: workspaces are registered by absolute path and the hub SHALL reject a configuration containing the removed `workspacesDir` key with an error naming it.
@@ -170,11 +171,21 @@ The hub SHALL manage session processes exclusively through a backend interface w
 - **THEN** each child server exits on its own because its standard input reached EOF
 
 ### Requirement: All session traffic is reverse-proxied under the workspace prefix
-The hub SHALL proxy every request under `/s/<id>/` to that workspace's loopback endpoint, covering plain HTTP, Server-Sent Events, and WebSocket upgrades. SSE responses SHALL be streamed without buffering. WebSocket proxying SHALL forward messages and close events in both directions, preserving application close codes (including the terminal's 4001, 4409, and 4410). Requests for an unknown or stopped workspace SHALL receive a non-cached error response that links back to the dashboard. Children SHALL bind loopback only and MUST NOT be directly reachable from the network.
+The hub SHALL proxy every request under `/s/<id>/` to that workspace's loopback endpoint, covering plain HTTP and WebSocket upgrades. Live updates for hub-served pages SHALL NOT be proxied one browser stream to one child stream: the hub SHALL deliver them over its brokered live stream, subscribing to each child's topics once and fanning out, so the hub's outbound connections for live delivery are bounded by watched topics rather than by connected clients. The per-stream workspace SSE routes (`/s/<id>/api/events`, `/s/<id>/api/chat/conversations/events`, `/s/<id>/api/chat/conversations/<conversation>/events`) SHALL NOT be proxied: a request for one SHALL receive a non-cached error naming the brokered stream as its replacement, and the child's routes remain the internal source the hub subscribes to. WebSocket proxying SHALL forward messages and close events in both directions, preserving application close codes (including the terminal's 4001, 4409, and 4410). Requests for an unknown or stopped workspace SHALL receive a non-cached error response that links back to the dashboard. Children SHALL bind loopback only and MUST NOT be directly reachable from the network.
 
 #### Scenario: A session round-trips through the hub
 - **WHEN** an authenticated browser requests `/s/uatu/api/state`
 - **THEN** the hub forwards the request to that session's loopback endpoint and streams the response back
+
+#### Scenario: Live updates are brokered, not proxied per client
+- **WHEN** three authenticated tabs view the same running workspace's page
+- **THEN** the hub holds one upstream subscription per watched topic of that workspace
+- **AND** each tab receives updates over its own single brokered stream
+
+#### Scenario: A per-stream route is refused through the hub
+- **WHEN** a client requests `/s/uatu/api/events` through the hub
+- **THEN** the hub answers with a non-cached error that names the brokered live stream as the replacement
+- **AND** no request reaches the child
 
 #### Scenario: Terminal WebSocket transits the hub
 - **WHEN** an authenticated browser upgrades `/s/uatu/api/terminal?sessionId=<uuid>` and later the PTY is killed via the session inventory
@@ -189,7 +200,7 @@ The hub SHALL proxy every request under `/s/<id>/` to that workspace's loopback 
 - **WHEN** a browser that accepts gzip loads a session's bundled script chunk through the hub
 - **THEN** the response is gzip-compressed and marked immutable with long-lived caching
 - **AND** a revalidation request with the asset's entity tag answers 304 without a body
-- **AND** incremental feeds (the SSE event stream, the NDJSON search feed) are never buffered for compression
+- **AND** incremental feeds (the NDJSON search feed) are never buffered for compression
 
 ### Requirement: The hub forwards loopback-shaped requests so children keep their localhost model
 When proxying to a child, the hub SHALL rewrite the forwarded `Host` header (and `Origin` header, when present) to the child's loopback endpoint, after the hub has itself validated the browser's origin against the hub's host. Children's existing loopback origin gates and token checks SHALL hold without modification.
@@ -230,7 +241,9 @@ The Hub SHALL start managed credential processes only in dedicated owner-only ru
 - **AND** unrelated system agents remain running
 
 ### Requirement: Hub exposes authenticated folder mutation operations
-The Hub SHALL expose public authenticated POST operations to create a folder from an absolute parent path and child name, rename a folder from an absolute source path and new sibling name, and remove an absolute folder path. Cookie-authenticated requests MUST pass the Hub's same-origin check. The Hub MUST reject relative paths, invalid names, non-directory or symbolic-link sources, rename destinations that already exist, and removal of any non-empty folder. A mutation MUST NOT recursively delete content or overwrite an existing filesystem entry.
+The Hub SHALL expose public authenticated POST operations to create a folder from an absolute parent path and child name, rename a folder from an absolute source path and new sibling name, and remove an absolute folder path. Cookie-authenticated requests MUST pass the Hub's same-origin check. The Hub MUST reject relative paths, invalid names, non-directory or symbolic-link sources, rename destinations that already exist, and removal of any non-empty folder. A mutation MUST NOT recursively delete content or overwrite an existing filesystem entry. Before generic rename, the Hub SHALL reject moves that would invalidate Git worktree dependencies involving linked checkouts, main checkouts, common Git directories or their ancestors, including unregistered linked trees. This safety restriction SHALL apply to all otherwise supported folder-rename flows, even with stop authorization; uncertainty about affected Git dependency safety SHALL fail closed with an actionable explanation. Display-name changes SHALL remain unaffected.
+
+The display-name allowance applies to ordinary/main workspaces. Linked child workspace names SHALL reflect their exact local branch; independent child display-name editing and branch rename are outside this change. This does not relax any folder dependency guard.
 
 #### Scenario: Cross-origin folder mutation is rejected
 - **WHEN** a cookie-authenticated cross-origin request attempts to create, rename, or remove a folder
@@ -243,6 +256,18 @@ The Hub SHALL expose public authenticated POST operations to create a folder fro
 #### Scenario: Remove delegates emptiness enforcement to the filesystem
 - **WHEN** a remove request names a directory containing a file, hidden entry, or child directory
 - **THEN** the operation fails without recursively removing any entry
+
+#### Scenario: Main checkout has an unregistered dependency
+- **WHEN** a generic rename would move a main checkout or its ancestor and break links to a worktree not registered in Hub
+- **THEN** the Hub refuses before filesystem mutation regardless of stop authorization and preserves registration paths
+
+#### Scenario: Linked checkout or common directory would move
+- **WHEN** a generic rename targets a linked checkout, shared Git directory, or containing ancestor whose move would invalidate a worktree dependency
+- **THEN** the Hub refuses without attempting automatic Git repair or filesystem rename
+
+#### Scenario: Dependency inspection is inconclusive
+- **WHEN** Git dependency inspection cannot establish rename safety
+- **THEN** the Hub leaves the filesystem unchanged and explains how to resolve or investigate the blocker
 
 ### Requirement: Folder mutations preserve registered workspace identity and consistency
 Before renaming a folder, the Hub SHALL identify every registered workspace whose path is the source or a descendant of it. A successful rename MUST update all affected registered paths by replacing the source prefix, MUST preserve every workspace id, backend, personal state, credential assignment, and session URL, and MUST persist the path updates as one registry mutation. Removing an empty folder that is itself a registered workspace MUST remove that registration and its associated personal state and credential assignments. A folder mutation and its registry or metadata changes MUST either complete coherently or be recovered or rolled back so a process interruption does not silently leave a registered path at the pre-mutation location after the folder moved.
@@ -339,3 +364,31 @@ The Hub SHALL persist an optional absolute default workspace parent directory in
 #### Scenario: Saved preference is unavailable
 - **WHEN** the configured directory disappears after it was saved
 - **THEN** Hub state identifies it as unavailable and provides the daemon user's home as the effective default
+
+### Requirement: Terminal bridges release abandoned connections and preserve recovery
+For proxied terminal WebSockets, the Hub SHALL propagate browser departure to the corresponding child connection and release both sides when bridge establishment fails or is cancelled. A late upstream connection completion MUST NOT retain an abandoned terminal holder or deliver queued input after the browser has departed. A child attachment refusal SHALL leave the browser able to reconcile the terminal through authenticated inventory without treating transport establishment as successful terminal attachment. Bridge failure SHALL NOT create or terminate a PTY or transfer ownership. Established terminal connections SHALL retain existing bidirectional message forwarding and application close-code semantics.
+
+#### Scenario: Navigation releases the old holder
+- **WHEN** a browser leaves a workspace and closes its terminal connection
+- **THEN** the Hub closes the corresponding child connection and the PTY becomes detached once that close is processed
+- **AND** the running shell remains available for ordinary reattachment
+
+#### Scenario: Browser departs while the upstream connection is opening
+- **WHEN** the browser disconnects before the child WebSocket finishes opening
+- **THEN** the Hub cancels or closes the upstream connection
+- **AND** any late completion cannot attach an abandoned holder or forward queued input
+
+#### Scenario: Browser upgrade fails after upstream creation
+- **WHEN** the Hub has begun opening a child connection but cannot complete the browser upgrade
+- **THEN** the Hub releases the child connection and pending bridge data
+- **AND** no terminal holder remains for the failed browser connection
+
+#### Scenario: Child rejects a terminal already held elsewhere
+- **WHEN** the child refuses an ordinary attach because the requested PTY already has a holder
+- **THEN** the rejected bridge releases its resources without affecting the holder
+- **AND** the browser can determine the occupied state through authenticated inventory and offer explicit takeover
+
+#### Scenario: Application close semantics survive bridge cleanup
+- **WHEN** an established terminal connection sends explicit termination or receives a takeover notification
+- **THEN** the Hub preserves the terminal's application close code and direction
+- **AND** ordinary navigation cleanup does not emit the explicit-termination code

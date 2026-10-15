@@ -8,7 +8,7 @@ const built = await Bun.build({ entrypoints: [new URL("../../src/index.html", im
 if (!built.success) throw new AggregateError(built.logs, "Standalone product build failed");
 const assets = new Map<string, ApprovedAsset>(await buildWorkspaceAssets());
 for (const output of built.outputs) assets.set(`/${output.path.replace(/^.*\//, "")}`, { body: output, type: output.type });
-const server = await startReviewServer({ port: 0, assets });
+const server = await startReviewServer({ port: 0, assets, standalone: true });
 try {
   for (const engine of [chromium, webkit]) {
     const browser = await engine.launch();
@@ -22,12 +22,14 @@ try {
           page.on("pageerror", e => errors.push(e.message));
           await page.goto(`${server.url}/README.md`);
           await page.locator("#preview").getByText("Synthetic review document").waitFor();
+          await page.locator("#connection-state.is-live").waitFor({ state: "attached" });
           assert.equal(await page.locator("#mobile-hub-root, .mh-coordinator-frame, iframe").count(), 0);
           assert.equal(await page.locator("html").getAttribute("data-workspace-foreground"), null);
           assert.equal(await page.locator("html").getAttribute("data-ui-mode"), touch ? "touch" : "desktop");
           assert.equal(await page.locator("#navigation-hub").isVisible(), false);
           assert(requests.includes("/api/state"));
-          assert(!requests.some(path => path.startsWith("/review/") || path.startsWith("/s/") || path.startsWith("/api/hub/")));
+          assert(requests.includes("/api/hub/live"));
+          assert(!requests.some(path => path.startsWith("/review/") || path.startsWith("/s/") || (path.startsWith("/api/hub/") && !path.startsWith("/api/hub/live"))));
           if (touch) {
             await page.evaluate(() => window.__uatuFind?.search());
             assert.equal(await page.locator("html").getAttribute("data-active-tab"), "files");

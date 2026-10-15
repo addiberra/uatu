@@ -1,7 +1,13 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
+import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 
 import { buildFetchFallback, buildRoutes } from "./routes";
+import { DOCUMENT_NOT_READABLE_ERROR } from "../shared/document-errors";
+import { scanRoots } from "./roots";
+import * as markdownRenderer from "../render/markdown";
+import { NotificationFeed, CHILD_NOTIFICATIONS_PATH } from "../chat/notification-feed";
 
 // Minimal stub: the asset routes never touch the session, so a thrown
 // getter is fine — it makes accidental coupling fail loudly.
@@ -13,6 +19,7 @@ function buildFontTestRoutes(
   basePath?: string,
   getSession: () => never = stubSession,
   manifestScope?: "base-path" | "origin",
+  notificationFeed?: NotificationFeed,
 ) {
   const repoRoot = path.resolve(import.meta.dir, "..", "..");
   return buildRoutes({
@@ -33,7 +40,7 @@ function buildFontTestRoutes(
       },
     },
     getSession,
-    chatService: {} as never,
+    chatService: { notificationFeed } as never,
     getWorkspaceCredential: () => "test-credential",
     debug: false,
     getMetricsSnapshot: () => ({}),
@@ -41,6 +48,39 @@ function buildFontTestRoutes(
 }
 
 describe("buildRoutes — bundled font asset routes", () => {
+  test("the internal notification stream authenticates, prefixes, and opens before an event", async () => {
+    const feed = new NotificationFeed();
+    const routes = buildFontTestRoutes("/s/test/", stubSession, "origin", feed);
+    const handler = (routes[`/s/test${CHILD_NOTIFICATIONS_PATH}`] as { GET: (request: Request) => Response }).GET;
+    expect(handler(new Request(`http://localhost/s/test${CHILD_NOTIFICATIONS_PATH}`)).status).toBe(401);
+    const response = handler(new Request(`http://localhost/s/test${CHILD_NOTIFICATIONS_PATH}?t=test-credential`));
+    expect(response.status).toBe(200);
+    const reader = response.body!.getReader();
+    expect(new TextDecoder().decode((await reader.read()).value)).toContain(": open");
+    expect(new TextDecoder().decode((await reader.read()).value)).toContain('"reason":"initial"');
+    feed.publish({ type: "notification", notification: { id: "q", sourceId: "q", conversationId: "opencode:one", kind: "question-pending", createdAt: Date.now() } });
+    expect(new TextDecoder().decode((await reader.read()).value)).toContain('"id":"q"');
+    await reader.cancel();
+    feed.dispose();
+  });
+  test("the awaiting lookup names the newest unanswered request's conversation, or none", async () => {
+    const feed = new NotificationFeed();
+    const routes = buildFontTestRoutes("/s/test/", stubSession, "origin", feed);
+    const handler = (routes["/s/test/api/chat/awaiting"] as { GET: (request: Request) => Response | Promise<Response> }).GET;
+    const read = async () => (await handler(new Request("http://localhost/s/test/api/chat/awaiting?t=test-credential"))).json();
+    expect((await handler(new Request("http://localhost/s/test/api/chat/awaiting"))).status).toBe(401);
+    expect(await read()).toEqual({ conversationId: null });
+    const ask = (id: string, conversationId: string, createdAt: number) =>
+      feed.publish({ type: "notification", notification: { id, sourceId: id, conversationId, kind: "question-pending", createdAt } });
+    ask("a", "opencode:one", Date.now() - 2_000);
+    expect(await read()).toEqual({ conversationId: "opencode:one" });
+    ask("b", "claude:two", Date.now() - 1_000);
+    ask("c", "opencode:three", Date.now() - 3_000);
+    expect(await read()).toEqual({ conversationId: "claude:two" });
+    feed.publish({ type: "resolved", id: "b", conversationId: "claude:two" });
+    expect(await read()).toEqual({ conversationId: "opencode:one" });
+    feed.dispose();
+  });
   test("serves the Hack WOFF2 with the right content-type and an immutable cache", async () => {
     const routes = buildFontTestRoutes();
     const response = routes["/assets/fonts/HackNerdFontMono-Regular.woff2"] as Response;
@@ -148,6 +188,17 @@ describe("buildRoutes — base-path prefixing", () => {
 });
 
 describe("buildRoutes — watch context", () => {
+  test("index recovery and repository refresh retain credential and origin gates", async () => {
+    let calls = 0;
+    const routes = buildFontTestRoutes(undefined, (() => ({ recover: async () => { calls++; }, requestRepositoryRefresh: () => { calls++; } })) as never);
+    for (const endpoint of ["/api/index/recover", "/api/repositories/refresh"]) {
+      const handler = routes[endpoint] as { POST: (request: Request) => Response | Promise<Response> };
+      expect((await handler.POST(new Request(`http://127.0.0.1${endpoint}`, { method: "POST" }))).status).toBe(401);
+      expect((await handler.POST(new Request(`http://127.0.0.1${endpoint}?t=test-credential`, { method: "POST", headers: { origin: "http://127.0.0.1:9999" } }))).status).toBe(403);
+      expect((await handler.POST(new Request(`http://127.0.0.1${endpoint}?t=test-credential`, { method: "POST", headers: { origin: "http://127.0.0.1" } }))).ok).toBe(true);
+    }
+    expect(calls).toBe(2);
+  });
   test("lets the session normalize a stale file scope", async () => {
     let receivedScope: unknown;
     const getSession = (() => ({
@@ -157,14 +208,87 @@ describe("buildRoutes — watch context", () => {
       },
     })) as never;
     const routes = buildFontTestRoutes(undefined, getSession);
-    const handler = routes["/api/state"] as { GET: (request: Request) => Response };
-    const response = handler.GET(new Request(
+    const handler = routes["/api/state"] as { GET: (request: Request) => Promise<Response> };
+    const response = await handler.GET(new Request(
       "http://127.0.0.1/api/state?scope=file&documentId=%2Fremoved%2FREADME.md",
     ));
 
     expect(response.status).toBe(200);
     expect(receivedScope).toEqual({ kind: "file", documentId: "/removed/README.md" });
     expect(await response.json()).toEqual({ scope: { kind: "folder" } });
+  });
+});
+
+describe("buildRoutes — /api/document failures", () => {
+  async function documentStatus(
+    prepare: (filePath: string) => Promise<void>,
+  ): Promise<{ status: number; body: unknown; logged: unknown[][]; filePath: string }> {
+    const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+    const directory = await mkdtemp(path.join(os.tmpdir(), "uatu-routes-document-"));
+    const filePath = path.join(directory, "notes.md");
+    try {
+      await writeFile(filePath, "# Notes\n");
+      const roots = await scanRoots([{ kind: "dir", absolutePath: directory }]);
+      await prepare(filePath);
+      const getSession = (() => ({ getDocumentRoots: () => roots, ensureDocument: async () => roots[0]?.docs[0] })) as never;
+      const handler = buildFontTestRoutes(undefined, getSession)["/api/document"] as {
+        GET: (request: Request) => Promise<Response>;
+      };
+      const response = await handler.GET(new Request(`http://127.0.0.1/api/document?id=${encodeURIComponent(filePath)}`));
+      return { status: response.status, body: await response.json(), logged: [...errorSpy.mock.calls], filePath };
+    } finally {
+      errorSpy.mockRestore();
+      await chmod(filePath, 0o644).catch(() => undefined);
+      await rm(directory, { recursive: true, force: true });
+    }
+  }
+
+  test("a file removed after indexing answers 404 and logs nothing", async () => {
+    const result = await documentStatus(filePath => rm(filePath));
+    expect({ status: result.status, body: result.body }).toEqual({ status: 404, body: { error: "document not found" } });
+    expect(result.logged).toEqual([]);
+  });
+
+  test("an indexed file that became a directory answers 404 and logs nothing", async () => {
+    const result = await documentStatus(async filePath => {
+      await rm(filePath);
+      await mkdir(filePath);
+    });
+    expect({ status: result.status, body: result.body }).toEqual({ status: 404, body: { error: "document not found" } });
+    expect(result.logged).toEqual([]);
+  });
+
+  // chmod 0o000 cannot deny root a read, so as root this case would render
+  // the file and prove nothing.
+  test.skipIf(process.getuid?.() === 0)(
+    "a file that exists but cannot be read answers 403 and logs nothing (skipped as root: chmod cannot deny root a read)",
+    async () => {
+      const result = await documentStatus(filePath => chmod(filePath, 0o000));
+      expect({ status: result.status, body: result.body }).toEqual({
+        status: 403,
+        body: { error: DOCUMENT_NOT_READABLE_ERROR },
+      });
+      expect(result.logged).toEqual([]);
+    },
+  );
+
+  test("a readable file whose renderer throws answers 500 and logs the document and cause", async () => {
+    const renderSpy = spyOn(markdownRenderer, "renderMarkdownToHtml").mockImplementation(() => {
+      throw new Error("renderer exploded");
+    });
+    try {
+      const result = await documentStatus(async () => {});
+      expect({ status: result.status, body: result.body }).toEqual({
+        status: 500,
+        body: { error: "document render failed" },
+      });
+      expect(result.logged).toHaveLength(1);
+      const [message, cause] = result.logged[0]!;
+      expect(String(message)).toContain(result.filePath);
+      expect((cause as Error).message).toBe("renderer exploded");
+    } finally {
+      renderSpy.mockRestore();
+    }
   });
 });
 

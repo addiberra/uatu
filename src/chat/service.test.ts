@@ -8,7 +8,9 @@ import type { ChatAgent, ReversibleHistoryResult } from "./types";
 const FAKE_AGENT: ChatAgent = { id: "opencode", name: "OpenCode", capabilities: ["models", "commands", "permissions"] };
 import { ChatAdapter, ReversibleHistoryUnsupportedError } from "./adapter";
 import { OpenCodeService, type SpawnedOpenCode } from "./opencode/opencode-service";
-import { LazyChatService } from "./service";
+import { LazyChatService, resolveProviderFactories } from "./service";
+import { createOpenCodeV1Provider } from "./opencode/v1/provider";
+import { createOpenCodeV2Provider } from "./opencode/v2/provider";
 
 function provider(): ChatProvider {
   return {
@@ -52,12 +54,39 @@ function fixtureRuntime(): OpenCodeService {
         kill() { resolveExit(143); },
       };
     },
-    fetch: async () => Response.json({ healthy: true, version: "test" }),
+    fetch: async url => String(url).endsWith("/global/health") ? Response.json({ healthy: true, version: "test" }) : new Response("Not Found", { status: 404 }),
     killGroup: () => { for (const resolve of exits) resolve(143); },
   });
 }
 
 describe("LazyChatService", () => {
+  test("a ready agent reports its login state, and every accounts change bumps the revision and reaches the provider", async () => {
+    const changes: unknown[] = [];
+    let login: "ok" | "missing" = "missing";
+    const service = new LazyChatService({
+      workspacePath: "/workspace",
+      runtime: fixtureRuntime(),
+      createProvider: () => ({
+        ...provider(),
+        loginState: () => login,
+        accountsChanged: async (change: unknown) => {
+          changes.push(change);
+          login = "ok";
+        },
+      }),
+    });
+    // Before anything runs, an accounts change starts nothing and still counts.
+    await service.accountsChanged({ kind: "added" });
+    expect(changes).toEqual([]);
+    await service.listConversations();
+    expect(await service.status()).toEqual({ state: "ready", version: "test", agent: FAKE_AGENT, login: "missing", accountsRevision: 1 });
+    await service.accountsChanged({ kind: "removed", target: "groq", credential: "groq" });
+    expect(changes).toEqual([{ kind: "removed", target: "groq", credential: "groq" }]);
+    expect(await service.status()).toEqual({ state: "ready", version: "test", agent: FAKE_AGENT, login: "ok", accountsRevision: 2 });
+    await service.dispose();
+  });
+
+
   test("status never spawns OpenCode; listing a conversation does", async () => {
     let spawns = 0;
     const exits: Array<(code: number) => void> = [];
@@ -77,7 +106,7 @@ describe("LazyChatService", () => {
           kill() { resolveExit(143); },
         };
       },
-      fetch: async () => Response.json({ healthy: true, version: "test" }),
+      fetch: async url => String(url).endsWith("/global/health") ? Response.json({ healthy: true, version: "test" }) : new Response("Not Found", { status: 404 }),
       killGroup: () => { for (const resolve of exits) resolve(143); },
     });
     const service = new LazyChatService({
@@ -91,9 +120,16 @@ describe("LazyChatService", () => {
     expect(await service.status()).toEqual({ state: "idle" });
     expect(spawns).toBe(0);
 
+    const notifications = service.notificationFeed.subscribe();
+    expect((await notifications.next()).value).toMatchObject({ type: "snapshot", pending: [] });
+    expect(spawns).toBe(0);
+
     // Conversation-scoped need is what starts it.
     await service.listConversations();
     expect(spawns).toBe(1);
+    service.notificationFeed.publish({ type: "notification", notification: { id: "q", sourceId: "q", conversationId: "one", kind: "question-pending", createdAt: Date.now() } });
+    expect((await notifications.next()).value).toMatchObject({ type: "event", event: { notification: { id: "q" } } });
+    notifications.cancel();
     expect(await service.status()).toEqual(expect.objectContaining({ state: "ready" }));
 
     await service.dispose();
@@ -108,7 +144,7 @@ describe("LazyChatService", () => {
       runtime,
       createProvider(options) {
         providerCalls += 1;
-        expect(runtime.currentConnection()).toEqual({ endpoint: options.endpoint, password: options.password });
+        expect(runtime.currentConnection()).toEqual({ endpoint: options.endpoint, password: options.password, generation: 1 });
         return provider();
       },
       createAdapter(options) {
@@ -303,7 +339,7 @@ describe("LazyChatService", () => {
           kill() { resolveExit(143); },
         };
       },
-      fetch: async () => Response.json({ healthy: true, version: "test" }),
+      fetch: async url => String(url).endsWith("/global/health") ? Response.json({ healthy: true, version: "test" }) : new Response("Not Found", { status: 404 }),
       killGroup: () => { for (const resolve of exits) resolve(143); },
     });
     let probes = 0;
@@ -350,7 +386,7 @@ describe("LazyChatService", () => {
           kill() { resolveExit(143); },
         };
       },
-      fetch: async () => Response.json({ healthy: true, version: "test" }),
+      fetch: async url => String(url).endsWith("/global/health") ? Response.json({ healthy: true, version: "test" }) : new Response("Not Found", { status: 404 }),
       killGroup: () => { for (const resolve of exits) resolve(143); },
     });
     const service = new LazyChatService({
@@ -391,7 +427,7 @@ describe("LazyChatService", () => {
           kill() { resolveExit(143); },
         };
       },
-      fetch: async () => Response.json({ healthy: true, version: "test" }),
+      fetch: async url => String(url).endsWith("/global/health") ? Response.json({ healthy: true, version: "test" }) : new Response("Not Found", { status: 404 }),
       killGroup: () => { for (const resolve of exits) resolve(143); },
     });
     const endpoints: string[] = [];
@@ -491,5 +527,116 @@ describe("LazyChatService", () => {
     expect((await adapters[0]!.subscribeInventory().next()).done).toBe(true);
     expect(adapters).toHaveLength(2);
     await service.dispose();
+  });
+});
+
+describe("workspace activity", () => {
+  test("reads the current adapter without starting the runtime, and ticks as the adapter comes and goes", async () => {
+    let providerCalls = 0;
+    const built: ChatAdapter[] = [];
+    const service = new LazyChatService({
+      workspacePath: "/workspace",
+      runtime: fixtureRuntime(),
+      createProvider: () => { providerCalls += 1; return provider(); },
+      createAdapter: options => {
+        const adapter = new ChatAdapter({ ...options, generation: "test" });
+        built.push(adapter);
+        return adapter;
+      },
+    });
+    const changes = await service.subscribeActivity();
+    expect((await changes.next()).done).toBe(false);
+    expect(await service.activity()).toEqual({ working: false, awaiting: false });
+    // Watching the summary starts nothing: the hub watches every running
+    // workspace, and watching must not spawn an agent.
+    expect(providerCalls).toBe(0);
+    expect(await service.status()).toEqual({ state: "idle" });
+
+    await service.listConversations();
+    expect((await changes.next()).done).toBe(false);
+    built.at(-1)!.projectionForTests("conversation").apply({ kind: "status", status: "running" });
+    expect((await changes.next()).done).toBe(false);
+    expect(await service.activity()).toEqual({ working: true, awaiting: false });
+
+    // A retry retires the adapter, and its turn with it.
+    await service.retry();
+    expect((await changes.next()).done).toBe(false);
+    expect(await service.activity()).toEqual({ working: false, awaiting: false });
+
+    await service.dispose();
+    expect((await changes.next()).done).toBe(true);
+  });
+});
+
+describe("OpenCode generation selects the provider stack", () => {
+  // A runtime whose spawned server answers as whichever generation is
+  // "installed" at the time: 1.x on `/global/health`, 2.x on `/api/info`
+  // with its web page on every other path.
+  function switchableRuntime(installed: () => 1 | 2): OpenCodeService {
+    const exits: Array<(code: number) => void> = [];
+    return new OpenCodeService({
+      workspacePath: "/workspace",
+      discoverCandidates: async () => ["/bin/opencode"],
+      allocatePort: async () => 43210,
+      spawn: (): SpawnedOpenCode => {
+        let resolveExit!: (code: number) => void;
+        const exited = new Promise<number>(resolve => { resolveExit = resolve; });
+        exits.push(resolveExit);
+        return { pid: 42, exited, stderr: new ReadableStream({ start(controller) { controller.close(); } }), kill() { resolveExit(143); } };
+      },
+      fetch: async url => {
+        const pathname = new URL(String(url)).pathname;
+        if (installed() === 2) {
+          return pathname === "/api/info"
+            ? Response.json({ version: "2.0.13", pid: 7, urls: ["http://127.0.0.1:43210"] })
+            : new Response("<!doctype html>", { status: 200, headers: { "content-type": "text/html" } });
+        }
+        return pathname === "/global/health" ? Response.json({ healthy: true, version: "1.18.31" }) : new Response("Not Found", { status: 404 });
+      },
+      killGroup: () => { for (const resolve of exits) resolve(143); },
+    });
+  }
+
+  test("the factory for the decided generation builds the provider, and a restart that decides differently swaps it", async () => {
+    let installed: 1 | 2 = 1;
+    const built: Array<{ generation: number; endpoint: string; directory: string }> = [];
+    const factory = (options: { generation: number; endpoint: string; directory: string }) => { built.push({ generation: options.generation, endpoint: options.endpoint, directory: options.directory }); return provider(); };
+    const service = new LazyChatService({
+      workspacePath: "/workspace",
+      runtime: switchableRuntime(() => installed),
+      createProvider: { 1: factory, 2: factory },
+      createAdapter: options => new ChatAdapter({ ...options, generation: "test" }),
+    });
+
+    await service.commands();
+    expect(await service.status()).toEqual({ state: "ready", version: "1.18.31", agent: FAKE_AGENT });
+    expect(built).toEqual([{ generation: 1, endpoint: "http://127.0.0.1:43210", directory: "/workspace" }]);
+
+    // The binary on disk is replaced; the retry respawns and re-decides.
+    installed = 2;
+    expect(await service.retry()).toEqual({ state: "ready", version: "2.0.13", agent: FAKE_AGENT });
+    await service.commands();
+    expect(built.map(entry => entry.generation)).toEqual([1, 2]);
+    await service.dispose();
+  });
+
+  test("one factory stands in for both generations, and a partial map keeps the other default", async () => {
+    const generations: number[] = [];
+    const single = new LazyChatService({
+      workspacePath: "/workspace",
+      runtime: switchableRuntime(() => 2),
+      createProvider: options => { generations.push(options.generation); return provider(); },
+      createAdapter: options => new ChatAdapter({ ...options, generation: "test" }),
+    });
+    await single.commands();
+    expect(generations).toEqual([2]);
+    await single.dispose();
+
+    // A partial map overrides one generation and keeps the real stack for
+    // the other; no override at all is the two real stacks.
+    const only1 = () => provider();
+    expect(resolveProviderFactories({ 1: only1 })).toEqual({ 1: only1, 2: createOpenCodeV2Provider });
+    expect(resolveProviderFactories(undefined)).toEqual({ 1: createOpenCodeV1Provider, 2: createOpenCodeV2Provider });
+    expect(resolveProviderFactories(only1)).toEqual({ 1: only1, 2: only1 });
   });
 });

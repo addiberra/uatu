@@ -1,15 +1,19 @@
 import { describe, expect, test } from "bun:test";
+import { notificationPipeline } from "../../../tests/notification-pipeline";
 import { appendFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
 import spike from "../../../tests/fixtures/claude-sdk/spike-messages.json";
+import spikeRevival from "../../../tests/fixtures/claude-sdk/spike-cron-revival.json";
+import forkedRuns from "../../../tests/fixtures/claude-sdk/forked-runs-2.1.280.json";
 import type { NormalizedProviderEvent } from "../provider";
 import { createClaudeEventMemory, markTasksBackgrounded, normalizeClaudeMessage, normalizeContextUsage, normalizeTranscriptEntries } from "./normalization";
-import { ClaudeProvider, normalizePlanUtilization, normalizeSessionTotals, type ClaudeQueryHandle, type ClaudeQueryInput, type ClaudeUserEnvelope } from "./provider";
+import { ClaudeProvider, normalizePlanUtilization, normalizeSessionTotals, taskOutputKey, wakeupPromptMatches, WAKEUP_PAUSED_MESSAGE, WAKEUP_PAUSED_ONCE_MESSAGE, type ClaudeProviderOptions, type ClaudeQueryHandle, type ClaudeQueryInput, type ClaudeUserEnvelope } from "./provider";
 import type { QuestionRequest } from "../types";
-import { BackgroundTaskUnavailableError } from "../provider";
+import { BackgroundTaskUnavailableError, ReleaseUnavailableError, ScheduledWakeupUnavailableError } from "../provider";
 import { claudeProjectDir } from "./transcript";
+import { contextReadout } from "../context-readout";
 
 class FakeQuery implements ClaudeQueryHandle {
   readonly emitted: unknown[] = [];
@@ -23,7 +27,8 @@ class FakeQuery implements ClaudeQueryHandle {
   supportedModels?: () => Promise<unknown>;
   supportedCommands?: () => Promise<unknown>;
   applyFlagSettings?: (settings: Record<string, unknown>) => Promise<void>;
-  getContextUsage?: () => Promise<unknown>;
+  getContextUsage?: (options?: { detail?: "summary" | "full" }) => Promise<unknown>;
+  setModel?: (model?: string) => Promise<void>;
   stopTask?: (taskId: string) => Promise<void>;
   usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET?: () => Promise<unknown>;
 
@@ -65,7 +70,7 @@ class FakeQuery implements ClaudeQueryHandle {
   }
 }
 
-function fixture(): { provider: ClaudeProvider; queries: FakeQuery[]; configDir: string; workspace: string } {
+function fixture(prepare?: (query: FakeQuery) => void, options: Partial<ClaudeProviderOptions> = {}): { provider: ClaudeProvider; queries: FakeQuery[]; configDir: string; workspace: string } {
   const root = realpathSync.native(mkdtempSync(path.join(tmpdir(), "uatu-claude-provider-")));
   const workspace = path.join(root, "workspace");
   mkdirSync(workspace, { recursive: true });
@@ -78,8 +83,10 @@ function fixture(): { provider: ClaudeProvider; queries: FakeQuery[]; configDir:
     executable: "/usr/local/bin/claude",
     configDir,
     catalogProbe: false,
+    ...options,
     queryFactory: input => {
       const query = new FakeQuery(input);
+      prepare?.(query);
       queries.push(query);
       return query;
     },
@@ -201,6 +208,60 @@ describe("context usage measures the window, not the turn (D1)", () => {
     expect(items[2]).toEqual(expect.objectContaining({ type: "context_report", total: 40_000 }));
   });
 
+  test("a reopened conversation replays a background task's notification as its settled row, not a bubble", () => {
+    // The store keeps no task edges — only the notification the model was
+    // sent, as a user record. It settles the same `task:<id>` row the live
+    // stream would, named by the Bash step that launched it.
+    const notification = "<task-notification>\n<task-id>bp1gl2rjw</task-id>\n<tool-use-id>toolu_bg</tool-use-id>\n<output-file>/tmp/bp1gl2rjw.output</output-file>\n<status>completed</status>\n<summary>Background command \"Wait for CI to finish on 6fc0e5e\" completed (exit code 0)</summary>\n</task-notification>";
+    const { items } = normalizeTranscriptEntries([
+      { kind: "user", uuid: "u1", parentUuid: null, timestamp: 1, isSidechain: false, parentToolUseId: null, origin: "human", message: { role: "user", content: "merge it when green" } },
+      { kind: "assistant", uuid: "a1", parentUuid: "u1", timestamp: 2, isSidechain: false, parentToolUseId: null, message: { role: "assistant", model: "claude-opus-5", content: [{ type: "tool_use", id: "toolu_bg", name: "Bash", input: { command: "gh run watch", description: "Wait for CI to finish on 6fc0e5e", run_in_background: true } }] } },
+      { kind: "user", uuid: "u2", parentUuid: "a1", timestamp: 3, isSidechain: false, parentToolUseId: null, message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_bg", content: "Command running in background with ID: bp1gl2rjw" }] } },
+      { kind: "user", uuid: "u3", parentUuid: "u2", timestamp: 4, isSidechain: false, parentToolUseId: null, origin: "task-notification", message: { role: "user", content: notification } },
+      { kind: "assistant", uuid: "a2", parentUuid: "u3", timestamp: 5, isSidechain: false, parentToolUseId: null, message: { role: "assistant", model: "claude-opus-5", content: [{ type: "text", text: "CI is green; merging." }] } },
+    ]);
+    expect(items.map(item => item.id)).toEqual(["message:u1", "tool:toolu_bg", "task:bp1gl2rjw", "message:a2"]);
+    expect(items[2]).toEqual({
+      id: "task:bp1gl2rjw", type: "background_task", createdAt: 4, taskId: "bp1gl2rjw", toolUseId: "toolu_bg",
+      description: "Wait for CI to finish on 6fc0e5e", status: "completed",
+      summary: "Background command \"Wait for CI to finish on 6fc0e5e\" completed (exit code 0)",
+    });
+    expect(items.some(item => item.type === "user_message" && item.text.includes("<task-notification>"))).toBe(false);
+  });
+
+  test("replayed notifications settle by status and fall back to a generic name; harness records never bubble", () => {
+    const entry = (uuid: string, timestamp: number, content: string, extra: Partial<Parameters<typeof normalizeTranscriptEntries>[0][number]> = {}) =>
+      ({ kind: "user" as const, uuid, parentUuid: null, timestamp, isSidechain: false, parentToolUseId: null, message: { role: "user", content }, ...extra });
+    const { items } = normalizeTranscriptEntries([
+      // An unknown launcher: the live fallback name, the reported outcome.
+      entry("n1", 1, "<task-notification>\n<task-id>f1</task-id>\n<status>failed</status>\n<summary>exit 1</summary>\n</task-notification>", { origin: "task-notification" }),
+      entry("n2", 2, "<task-notification>\n<task-id>k1</task-id>\n<status>killed</status>\n<summary></summary>\n</task-notification>", { origin: "task-notification" }),
+      // A monitor event names no status: settled as completed, as live does.
+      entry("n3", 3, "<task-notification>\n<task-id>m1</task-id>\n<summary>Monitor event: \"review activity\"</summary>\n<event>x</event>\nIf this matters, notify.\n</task-notification>", { origin: "task-notification" }),
+      // An older record with no author but the generated envelope is one too.
+      entry("n4", 4, "<task-notification>\n<task-id>o1</task-id>\n<status>completed</status>\n<summary>ok</summary>\n</task-notification>"),
+      // The store says notification but the text is not one: nothing, never markup.
+      entry("n5", 5, "garbled", { origin: "task-notification" }),
+      // A skill's preamble is the harness's, not the person's.
+      entry("n6", 6, "Base directory for this skill: /x/skills/simplify", { isMeta: true }),
+      // The person quoting the tag keeps their bubble.
+      entry("n7", 7, "why did <task-notification> show up in my chat?", { origin: "human" }),
+      // And so does the person who pastes nothing BUT an envelope — asking
+      // what it is, say. The store says who wrote it; the shape only stands
+      // in where it does not (records older than `origin`).
+      entry("n8", 8, "<task-notification>\n<task-id>h1</task-id>\n<status>completed</status>\n<summary>is this mine?</summary>\n</task-notification>", { origin: "human" }),
+    ]);
+    expect(items.map(item => item.id)).toEqual(["task:f1", "task:k1", "task:m1", "task:o1", "message:n7", "message:n8"]);
+    expect(items.some(item => item.id === "task:h1")).toBe(false);
+    expect(items[5]).toEqual(expect.objectContaining({ type: "user_message", text: expect.stringContaining("<task-id>h1</task-id>") }));
+    expect(items[0]).toEqual(expect.objectContaining({ type: "background_task", description: "Background task", status: "failed", summary: "exit 1" }));
+    expect(items[1]).toEqual(expect.objectContaining({ type: "background_task", status: "stopped" }));
+    expect(items[1]).not.toHaveProperty("summary");
+    expect(items[2]).toEqual(expect.objectContaining({ type: "background_task", status: "completed", summary: "Monitor event: \"review activity\"" }));
+    expect(items[3]).toEqual(expect.objectContaining({ type: "background_task", status: "completed", summary: "ok" }));
+    expect(items[4]).toEqual(expect.objectContaining({ type: "user_message", text: "why did <task-notification> show up in my chat?" }));
+  });
+
   test("a subagent's frames carry no window carrier and never move the conversation's model", () => {
     const memory = createClaudeEventMemory();
     normalizeClaudeMessage({ type: "system", subtype: "init", uuid: "i1", model: "claude-opus-5[1m]" }, memory, "live");
@@ -262,10 +323,123 @@ describe("background tasks and tool progress normalize into in-place rows (D8)",
     const started = normalizeClaudeMessage({ type: "system", subtype: "task_started", uuid: "ts1", timestamp: at(0), task_id: "b2f6", tool_use_id: "toolu_1", description: "Sleep for 8 seconds then echo done", task_type: "local_bash", is_backgrounded: true }, memory, "live");
     expect(started.outcome).toBe("handled");
     expect(started.updates).toEqual([{ kind: "upsert", item: { id: "task:b2f6", type: "background_task", createdAt: Date.parse(at(0)), taskId: "b2f6", description: "Sleep for 8 seconds then echo done", taskType: "local_bash", toolUseId: "toolu_1", status: "running" } }]);
+    // A shell task reports no progress in practice (spike); should an edge
+    // arrive anyway, its usage is kept but the last tool is never the
+    // progress line — the reader sees elapsed time instead.
     const progress = normalizeClaudeMessage({ type: "system", subtype: "task_progress", uuid: "tp1", timestamp: at(3), task_id: "b2f6", description: "Sleep for 8 seconds then echo done", usage: { total_tokens: 0, tool_uses: 1, duration_ms: 3000 }, last_tool_name: "Bash" }, memory, "live");
-    expect(progress.updates[0]).toEqual({ kind: "upsert", item: expect.objectContaining({ id: "task:b2f6", createdAt: Date.parse(at(0)), status: "running", progress: "Using Bash" }) });
+    expect(progress.updates[0]).toEqual({ kind: "upsert", item: expect.objectContaining({ id: "task:b2f6", createdAt: Date.parse(at(0)), status: "running", usage: { totalTokens: 0, toolUses: 1, durationMs: 3000 } }) });
+    expect((progress.updates[0] as { item: object }).item).not.toHaveProperty("progress");
     const notified = normalizeClaudeMessage({ type: "system", subtype: "task_notification", uuid: "tn1", timestamp: at(8), task_id: "b2f6", tool_use_id: "toolu_1", status: "completed", output_file: "/tmp/out", summary: "done" }, memory, "live");
-    expect(notified.updates[0]).toEqual({ kind: "upsert", item: { id: "task:b2f6", type: "background_task", createdAt: Date.parse(at(0)), taskId: "b2f6", description: "Sleep for 8 seconds then echo done", taskType: "local_bash", toolUseId: "toolu_1", status: "completed", summary: "done" } });
+    expect(notified.updates[0]).toEqual({ kind: "upsert", item: { id: "task:b2f6", type: "background_task", createdAt: Date.parse(at(0)), taskId: "b2f6", description: "Sleep for 8 seconds then echo done", taskType: "local_bash", toolUseId: "toolu_1", status: "completed", summary: "done", usage: { totalTokens: 0, toolUses: 1, durationMs: 3000 }, outputFile: "/tmp/out" } });
+  });
+
+  // The frames below are the spike's (spike-background-tasks.md, probes a2
+  // and b), shapes verbatim.
+  const spikeOutputFile = "/private/tmp/claude-501/-private-tmp-uatu-spike-work/57489e13/tasks/ada2b9582caa230c5.output";
+  const spikePrompt = "List the files in the current directory and count them.";
+
+  test("a backgrounded agent task carries its type, prompt, child id, usage, and progress summary from the edges", () => {
+    const memory = createClaudeEventMemory();
+    normalizeClaudeMessage({ type: "assistant", uuid: "a1", timestamp: at(0), message: { role: "assistant", model: "claude-haiku-4-5-20251001", content: [{ type: "tool_use", id: "toolu_013s2jZsDCiw3cAHYTqFeSpc", name: "Agent", input: { description: "List files and count them", prompt: spikePrompt, run_in_background: true } }] } }, memory, "live", "57489e13");
+    const started = normalizeClaudeMessage({ type: "system", subtype: "task_started", uuid: "ts1", timestamp: at(0), task_id: "ada2b9582caa230c5", tool_use_id: "toolu_013s2jZsDCiw3cAHYTqFeSpc", description: "List files and count them", subagent_type: "general-purpose", is_backgrounded: true, spawn_depth: 1, task_type: "local_agent", prompt: spikePrompt }, memory, "live", "57489e13");
+    // The task id is the agent id (D8): the child is addressable at start —
+    // by the task row and, from the same edge, by the row that launched it.
+    expect(started.updates).toEqual([
+      { kind: "upsert", item: expect.objectContaining({ id: "tool:toolu_013s2jZsDCiw3cAHYTqFeSpc", name: "Agent", status: "running", childConversationId: "sub:57489e13:ada2b9582caa230c5" }) },
+      { kind: "upsert", item: { id: "task:ada2b9582caa230c5", type: "background_task", createdAt: Date.parse(at(0)), taskId: "ada2b9582caa230c5", description: "List files and count them", taskType: "local_agent", toolUseId: "toolu_013s2jZsDCiw3cAHYTqFeSpc", status: "running", subagentType: "general-purpose", prompt: spikePrompt, childConversationId: "sub:57489e13:ada2b9582caa230c5" } },
+    ]);
+    // The async AgentOutput is complete at launch: the launching row is
+    // openable now, and the task learns where its output goes.
+    const launched = normalizeClaudeMessage({ type: "user", uuid: "u1", timestamp: at(0), message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_013s2jZsDCiw3cAHYTqFeSpc", content: "Async agent launched successfully." }] },
+      tool_use_result: { isAsync: true, status: "async_launched", agentId: "ada2b9582caa230c5", description: "List files and count them", resolvedModel: "claude-haiku-4-5-20251001", prompt: spikePrompt, outputFile: spikeOutputFile, canReadOutputFile: true } }, memory, "live", "57489e13");
+    expect(launched.updates).toEqual([
+      { kind: "upsert", item: expect.objectContaining({ id: "tool:toolu_013s2jZsDCiw3cAHYTqFeSpc", name: "Agent", status: "completed", childConversationId: "sub:57489e13:ada2b9582caa230c5", model: "claude-haiku-4-5-20251001" }) },
+      { kind: "upsert", item: expect.objectContaining({ id: "task:ada2b9582caa230c5", status: "running", outputFile: spikeOutputFile, prompt: spikePrompt, subagentType: "general-purpose", childConversationId: "sub:57489e13:ada2b9582caa230c5" }) },
+    ]);
+    // Progress: the last tool until the model writes a summary, which then
+    // replaces it; usage is cumulative and rides every edge from here.
+    const progress = normalizeClaudeMessage({ type: "system", subtype: "task_progress", uuid: "tp1", timestamp: at(4), task_id: "ada2b9582caa230c5", tool_use_id: "toolu_013s2jZsDCiw3cAHYTqFeSpc", description: "List files and count them", usage: { total_tokens: 13122, tool_uses: 1, duration_ms: 4751 }, last_tool_name: "Bash" }, memory, "live", "57489e13");
+    expect(progress.updates[0]).toEqual({ kind: "upsert", item: expect.objectContaining({ id: "task:ada2b9582caa230c5", status: "running", progress: "Using Bash", usage: { totalTokens: 13122, toolUses: 1, durationMs: 4751 }, outputFile: spikeOutputFile, subagentType: "general-purpose" }) });
+    const summarized = normalizeClaudeMessage({ type: "system", subtype: "task_progress", uuid: "tp2", timestamp: at(30), task_id: "ada2b9582caa230c5", tool_use_id: "toolu_013s2jZsDCiw3cAHYTqFeSpc", description: "List files and count them", usage: { total_tokens: 20000, tool_uses: 2, duration_ms: 30000 }, last_tool_name: "Read", summary: "Counting files in the working tree" }, memory, "live", "57489e13");
+    expect(summarized.updates[0]).toEqual({ kind: "upsert", item: expect.objectContaining({ progress: "Counting files in the working tree", usage: { totalTokens: 20000, toolUses: 2, durationMs: 30000 } }) });
+    const notified = normalizeClaudeMessage({ type: "system", subtype: "task_notification", uuid: "tn1", timestamp: at(35), task_id: "ada2b9582caa230c5", tool_use_id: "toolu_013s2jZsDCiw3cAHYTqFeSpc", status: "completed", output_file: spikeOutputFile, summary: "There is **1 file** in the directory.", usage: { total_tokens: 21000, tool_uses: 2, duration_ms: 34000 } }, memory, "live", "57489e13");
+    expect(notified.updates[0]).toEqual({ kind: "upsert", item: { id: "task:ada2b9582caa230c5", type: "background_task", createdAt: Date.parse(at(0)), taskId: "ada2b9582caa230c5", description: "List files and count them", taskType: "local_agent", toolUseId: "toolu_013s2jZsDCiw3cAHYTqFeSpc", status: "completed", summary: "There is **1 file** in the directory.", subagentType: "general-purpose", prompt: spikePrompt, usage: { totalTokens: 21000, toolUses: 2, durationMs: 34000 }, outputFile: spikeOutputFile, childConversationId: "sub:57489e13:ada2b9582caa230c5" } });
+    // Without a session id there is no child id to derive; nothing else changes.
+    const anonymous = createClaudeEventMemory();
+    const unscoped = normalizeClaudeMessage({ type: "system", subtype: "task_started", uuid: "ts2", timestamp: at(0), task_id: "b0b0", description: "Explore", subagent_type: "Explore", is_backgrounded: true, task_type: "local_agent" }, anonymous, "live");
+    expect((unscoped.updates[0] as { item: object }).item).not.toHaveProperty("childConversationId");
+  });
+
+  test("a backgrounded shell command's output file is learned from its launch text, whichever wording the CLI used", () => {
+    const outputFile = "/private/tmp/claude-501/-private-tmp-uatu-spike-work/57489e13/tasks/bgjpa5uwy.output";
+    const launchText = `Command running in background with ID: bgjpa5uwy. Output is being written to: ${outputFile}. You will be notified when it completes.\nTo check interim output, use Read on that file path.`;
+    const bashOutput = { stdout: "", stderr: "", interrupted: false, isImage: false, noOutputExpected: false, backgroundTaskId: "bgjpa5uwy" };
+    const memory = createClaudeEventMemory();
+    normalizeClaudeMessage({ type: "assistant", uuid: "a1", timestamp: at(0), message: { role: "assistant", content: [{ type: "tool_use", id: "toolu_01E1fJ", name: "Bash", input: { command: "sleep 25; echo spike-done", run_in_background: true } }] } }, memory, "live", "57489e13");
+    normalizeClaudeMessage({ type: "system", subtype: "task_started", uuid: "ts1", timestamp: at(0), task_id: "bgjpa5uwy", tool_use_id: "toolu_01E1fJ", description: "sleep 25; echo spike-done", is_backgrounded: true, task_type: "local_bash" }, memory, "live", "57489e13");
+    const launched = normalizeClaudeMessage({ type: "user", uuid: "u1", timestamp: at(0), message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_01E1fJ", content: launchText }] }, tool_use_result: bashOutput }, memory, "live", "57489e13");
+    expect(launched.updates).toEqual([
+      { kind: "upsert", item: expect.objectContaining({ id: "tool:toolu_01E1fJ", name: "Bash", status: "completed" }) },
+      { kind: "upsert", item: { id: "task:bgjpa5uwy", type: "background_task", createdAt: Date.parse(at(0)), taskId: "bgjpa5uwy", description: "sleep 25; echo spike-done", taskType: "local_bash", toolUseId: "toolu_01E1fJ", status: "running", outputFile } },
+    ]);
+    expect((launched.updates[0] as { item: object }).item).not.toHaveProperty("childConversationId");
+    // The notification only confirms the path; the row keeps it.
+    const notified = normalizeClaudeMessage({ type: "system", subtype: "task_notification", uuid: "tn1", timestamp: at(25), task_id: "bgjpa5uwy", tool_use_id: "toolu_01E1fJ", status: "completed", output_file: outputFile, summary: "Background command \"sleep 25; echo spike-done\" completed (exit code 0)" }, memory, "live", "57489e13");
+    expect(notified.updates[0]).toEqual({ kind: "upsert", item: expect.objectContaining({ id: "task:bgjpa5uwy", status: "completed", outputFile }) });
+    // A command moved to the background on timeout says it differently but
+    // names the file the same way; content as text blocks reads the same.
+    const moved = createClaudeEventMemory();
+    normalizeClaudeMessage({ type: "system", subtype: "task_started", uuid: "ts2", timestamp: at(0), task_id: "bgq1w2e3r", tool_use_id: "toolu_02", description: "make test", is_backgrounded: true, task_type: "local_bash" }, moved, "live");
+    const timedOut = normalizeClaudeMessage({ type: "user", uuid: "u2", timestamp: at(120), message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_02", content: [{ type: "text", text: "Command did not complete within its 120s timeout and was moved to the background (ID: bgq1w2e3r). Output is being written to: /tmp/claude-501/-work/s/tasks/bgq1w2e3r.output. You will be notified when it completes." }] }] }, tool_use_result: { ...bashOutput, backgroundTaskId: "bgq1w2e3r" } }, moved, "live");
+    expect(timedOut.updates.at(-1)).toEqual({ kind: "upsert", item: expect.objectContaining({ id: "task:bgq1w2e3r", status: "running", outputFile: "/tmp/claude-501/-work/s/tasks/bgq1w2e3r.output" }) });
+    // A launch result that beats its start edge says nothing yet; the edge
+    // then names the task and carries the file.
+    const early = createClaudeEventMemory();
+    const silent = normalizeClaudeMessage({ type: "user", uuid: "u3", timestamp: at(0), message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_03", content: launchText.replaceAll("bgjpa5uwy", "bgearly01") }] }, tool_use_result: { ...bashOutput, backgroundTaskId: "bgearly01" } }, early, "live");
+    expect(silent.updates.map(update => update.kind === "upsert" ? update.item.type : update.kind)).toEqual(["tool"]);
+    const late = normalizeClaudeMessage({ type: "system", subtype: "task_started", uuid: "ts3", timestamp: at(0), task_id: "bgearly01", tool_use_id: "toolu_03", description: "late job", is_backgrounded: true, task_type: "local_bash" }, early, "live");
+    expect(late.updates[0]).toEqual({ kind: "upsert", item: expect.objectContaining({ id: "task:bgearly01", description: "late job", outputFile: outputFile.replace("bgjpa5uwy", "bgearly01") }) });
+    // A result without the sentence changes nothing.
+    const plain = normalizeClaudeMessage({ type: "user", uuid: "u4", timestamp: at(1), message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_03", content: "done" }] }, tool_use_result: { ...bashOutput, backgroundTaskId: "bgearly01" } }, early, "live");
+    expect(plain.updates).toHaveLength(1);
+  });
+
+  test("a launch result's output file is the one the CLI's own last sentence names for that task", () => {
+    const real = "/private/tmp/claude-501/-work/57489e13/tasks/bgq1w2e3r.output";
+    const bashOutput = { stdout: "", stderr: "", interrupted: false, isImage: false, noOutputExpected: false, backgroundTaskId: "bgq1w2e3r" };
+    const launch = (memory: ReturnType<typeof createClaudeEventMemory>, text: string) => {
+      normalizeClaudeMessage({ type: "system", subtype: "task_started", uuid: "ts", timestamp: at(0), task_id: "bgq1w2e3r", tool_use_id: "toolu_02", description: "make test", is_backgrounded: true, task_type: "local_bash" }, memory, "live");
+      return normalizeClaudeMessage({ type: "user", uuid: "u", timestamp: at(120), message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_02", content: text }] }, tool_use_result: bashOutput }, memory, "live");
+    };
+    // The command's own stdout comes first and imitates the sentence; the
+    // CLI appends its real one after it, and that is the one that counts.
+    const decoyed = launch(createClaudeEventMemory(), `building…\nOutput is being written to: /tmp/evil/tasks/bgq1w2e3r.output. ok\nCommand did not complete within its 120s timeout and was moved to the background (ID: bgq1w2e3r). Output is being written to: ${real}. You will be notified when it completes.`);
+    expect(decoyed.updates.at(-1)).toEqual({ kind: "upsert", item: expect.objectContaining({ id: "task:bgq1w2e3r", outputFile: real }) });
+    // A sentence naming another task's file is not this task's.
+    const foreign = launch(createClaudeEventMemory(), "Command running in background with ID: bgq1w2e3r. Output is being written to: /private/tmp/claude-501/-work/57489e13/tasks/bgzzzzzzz.output. You will be notified when it completes.");
+    expect(foreign.updates.every(update => update.kind !== "upsert" || update.item.type !== "background_task" || update.item.outputFile === undefined)).toBe(true);
+    // The CLI's other wordings still parse: manually backgrounded, and moved
+    // so a message can reach the agent.
+    for (const text of [
+      `Command was manually backgrounded by user with ID: bgq1w2e3r. Output is being written to: ${real}.`,
+      `Command was moved to the background so that a message from the user can reach you (ID: bgq1w2e3r). Output is being written to: ${real}. You will be notified when it completes.`,
+    ]) {
+      expect(launch(createClaudeEventMemory(), text).updates.at(-1)).toEqual({ kind: "upsert", item: expect.objectContaining({ id: "task:bgq1w2e3r", outputFile: real }) });
+    }
+  });
+
+  test("a subagent's forwarded text and thinking stay out of the parent's timeline; its tool blocks land as before", () => {
+    const memory = createClaudeEventMemory();
+    const frame = (uuid: string, content: unknown[]) => ({ type: "assistant", uuid, timestamp: at(1), parent_tool_use_id: "toolu_013s2jZsDCiw3cAHYTqFeSpc", message: { role: "assistant", model: "claude-haiku-4-5-20251001", content } });
+    const mixed = normalizeClaudeMessage(frame("sub1", [{ type: "thinking", thinking: "Let me list the files." }, { type: "text", text: "Listing now." }, { type: "tool_use", id: "toolu_inner", name: "Bash", input: { command: "ls" } }]), memory, "live", "57489e13");
+    expect(mixed.outcome).toBe("handled");
+    expect(mixed.updates).toEqual([{ kind: "upsert", item: expect.objectContaining({ id: "tool:toolu_inner", type: "tool", name: "Bash", status: "running" }) }]);
+    const textOnly = normalizeClaudeMessage(frame("sub2", [{ type: "text", text: "There is 1 file." }]), memory, "live", "57489e13");
+    expect(textOnly.outcome).toBe("ignored");
+    expect(textOnly.updates).toEqual([]);
+    // The subagent's own tool result still completes the row it opened.
+    const result = normalizeClaudeMessage({ type: "user", uuid: "sub3", timestamp: at(2), parent_tool_use_id: "toolu_013s2jZsDCiw3cAHYTqFeSpc", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_inner", content: "README.md" }] }, tool_use_result: null }, memory, "live", "57489e13");
+    expect(result.updates).toEqual([{ kind: "upsert", item: expect.objectContaining({ id: "tool:toolu_inner", status: "completed", output: "README.md" }) }]);
   });
 
   test("failure, stop, and a killed patch settle the row with their outcome", () => {
@@ -303,6 +477,35 @@ describe("background tasks and tool progress normalize into in-place rows (D8)",
     // A foreground task that completes in the foreground never shows.
     normalizeClaudeMessage({ type: "system", subtype: "task_started", uuid: "ts2", timestamp: at(6), task_id: "fg2", description: "Quick check", is_backgrounded: false }, memory, "live");
     expect(normalizeClaudeMessage({ type: "system", subtype: "task_notification", uuid: "tn2", timestamp: at(7), task_id: "fg2", status: "completed", output_file: "/tmp/o", summary: "ok" }, memory, "live").outcome).toBe("ignored");
+  });
+
+  // Spike probe c, shapes verbatim: a foreground agent gets the same
+  // task_started as a backgrounded one, with `is_backgrounded: false`.
+  test("a foreground agent run opens its launching row at task_started, not only when the run ends", () => {
+    const memory = createClaudeEventMemory();
+    const agentId = "adcea0e635b291813";
+    normalizeClaudeMessage({ type: "assistant", uuid: "a1", timestamp: at(0), message: { role: "assistant", model: "claude-haiku-4-5-20251001", content: [{ type: "tool_use", id: "toolu_fg", name: "Agent", input: { description: "List files and count them", prompt: spikePrompt } }] } }, memory, "live", "57489e13");
+    const started = normalizeClaudeMessage({ type: "system", subtype: "task_started", uuid: "ts1", timestamp: at(0), task_id: agentId, tool_use_id: "toolu_fg", description: "List files and count them", subagent_type: "general-purpose", is_backgrounded: false, spawn_depth: 1, task_type: "local_agent", prompt: spikePrompt }, memory, "live", "57489e13");
+    // No background row — the run is in the foreground, and its tool row
+    // already shows the work — but that row is now openable, which is what
+    // makes a running subagent reachable from the track before it finishes.
+    expect(started.outcome).toBe("handled");
+    expect(started.updates).toEqual([{ kind: "upsert", item: {
+      id: "tool:toolu_fg", type: "tool", createdAt: Date.parse(at(0)), name: "Agent", status: "running",
+      input: JSON.stringify({ description: "List files and count them", prompt: spikePrompt }, null, 1),
+      childConversationId: `sub:57489e13:${agentId}`,
+    } }]);
+    // The result at the end of the run still carries the row's attribution,
+    // and the child id survives the re-upsert.
+    const result = normalizeClaudeMessage({ type: "user", uuid: "u1", timestamp: at(9), message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_fg", content: "There is 1 file." }] },
+      tool_use_result: { agentId, agentType: "general-purpose", content: "There is 1 file.", resolvedModel: "claude-haiku-4-5-20251001" } }, memory, "live", "57489e13");
+    expect(result.updates[0]).toEqual({ kind: "upsert", item: expect.objectContaining({ id: "tool:toolu_fg", name: "Agent", status: "completed", childConversationId: `sub:57489e13:${agentId}`, model: "claude-haiku-4-5-20251001" }) });
+    // A tool use this normalizer never saw gets no invented row: an upsert
+    // replaces the item, and a bare row would be a tool call with no name.
+    const blind = createClaudeEventMemory();
+    const orphan = normalizeClaudeMessage({ type: "system", subtype: "task_started", uuid: "ts2", timestamp: at(0), task_id: agentId, tool_use_id: "toolu_unseen", description: "List files and count them", subagent_type: "general-purpose", is_backgrounded: false, task_type: "local_agent" }, blind, "live", "57489e13");
+    expect(orphan.updates).toEqual([]);
+    expect(orphan.outcome).toBe("ignored");
   });
 
   test("ambient housekeeping tasks never become rows, start to finish", () => {
@@ -411,21 +614,29 @@ describe("streaming and session signals (D10, D11)", () => {
     expect(removed.length).toBe(3);
   });
 
-  test("rate limits surface as coded notices with their reset, and clear once allowed again", () => {
+  test("a rate limit is one standing with its onset, updated in place and retired when allowed", () => {
     const memory = createClaudeEventMemory();
     const warning = normalizeClaudeMessage({ type: "rate_limit_event", uuid: "rl1", timestamp: at(0), rate_limit_info: { status: "allowed_warning", rateLimitType: "five_hour", utilization: 0.87, resetsAt: 1_788_400_000 } }, memory, "live");
-    expect(warning.updates[0]).toEqual({ kind: "upsert", item: expect.objectContaining({ id: "notice:rate-limit:rl1", type: "notice", level: "warning", code: "rate-limit-warning", resetsAt: 1_788_400_000_000 }) });
+    expect(warning.updates[0]).toEqual({ kind: "upsert", item: expect.objectContaining({ id: "notice:rate-limit", type: "notice", createdAt: Date.parse(at(0)), level: "warning", code: "rate-limit-warning", resetsAt: 1_788_400_000_000 }) });
     expect((warning.updates[0] as { item: { message: string } }).item.message).toBe("Approaching your 5-hour rate limit (87% used).");
+    // Restating one standing is not news: the same item, at the same onset.
+    const restated = normalizeClaudeMessage({ type: "rate_limit_event", uuid: "rl1b", timestamp: at(9), rate_limit_info: { status: "allowed_warning", rateLimitType: "five_hour", utilization: 0.88 } }, memory, "live");
+    expect(restated.updates).toEqual([{ kind: "upsert", item: expect.objectContaining({ id: "notice:rate-limit", createdAt: Date.parse(at(0)), code: "rate-limit-warning" }) }]);
+    // Hardening to a rejection updates that same item, still at its onset.
     const rejected = normalizeClaudeMessage({ type: "rate_limit_event", uuid: "rl2", timestamp: at(1), rate_limit_info: { status: "rejected", rateLimitType: "seven_day", resetsAt: 1_788_400_000_000 } }, memory, "live");
-    expect(rejected.updates[0]).toEqual({ kind: "upsert", item: expect.objectContaining({ level: "error", code: "rate-limit-rejected", resetsAt: 1_788_400_000_000 }) });
+    expect(rejected.updates[0]).toEqual({ kind: "upsert", item: expect.objectContaining({ id: "notice:rate-limit", createdAt: Date.parse(at(0)), level: "error", code: "rate-limit-rejected", resetsAt: 1_788_400_000_000 }) });
     expect((rejected.updates[0] as { item: { message: string } }).item.message).toBe("Rate limit reached for your 7-day window.");
+    // Allowed again retires the standing rather than appending a third row.
     const allowed = normalizeClaudeMessage({ type: "rate_limit_event", uuid: "rl3", timestamp: at(2), rate_limit_info: { status: "allowed" } }, memory, "live");
-    expect(allowed.updates[0]).toEqual({ kind: "upsert", item: expect.objectContaining({ code: "rate-limit-cleared", level: "info" }) });
+    expect(allowed.updates).toEqual([{ kind: "remove", itemId: "notice:rate-limit" }]);
     // Routine allowed events with nothing to clear are silent.
     expect(normalizeClaudeMessage({ type: "rate_limit_event", uuid: "rl4", timestamp: at(3), rate_limit_info: { status: "allowed" } }, memory, "live").outcome).toBe("ignored");
     // A warning alone is a standing too: the next plain "allowed" retires it.
     normalizeClaudeMessage({ type: "rate_limit_event", uuid: "rl5", timestamp: at(4), rate_limit_info: { status: "allowed_warning", rateLimitType: "five_hour", utilization: 0.9 } }, memory, "live");
-    expect(normalizeClaudeMessage({ type: "rate_limit_event", uuid: "rl6", timestamp: at(5), rate_limit_info: { status: "allowed" } }, memory, "live").updates[0]).toEqual({ kind: "upsert", item: expect.objectContaining({ code: "rate-limit-cleared" }) });
+    expect(normalizeClaudeMessage({ type: "rate_limit_event", uuid: "rl6", timestamp: at(5), rate_limit_info: { status: "allowed" } }, memory, "live").updates).toEqual([{ kind: "remove", itemId: "notice:rate-limit" }]);
+    // A fresh standing after a clear is a fresh onset.
+    const reentered = normalizeClaudeMessage({ type: "rate_limit_event", uuid: "rl7", timestamp: at(6), rate_limit_info: { status: "allowed_warning", rateLimitType: "five_hour", utilization: 0.91 } }, memory, "live");
+    expect(reentered.updates[0]).toEqual({ kind: "upsert", item: expect.objectContaining({ id: "notice:rate-limit", createdAt: Date.parse(at(6)) }) });
   });
 
   test("a refusal fallback re-attributes later usage to the fallback model and says so", () => {
@@ -540,7 +751,8 @@ describe("catalog hydration probe", () => {
     expect(models.find(model => model.selection.modelId === "fable[1m]")?.contextLimit).toBe(1_000_000);
     expect(models.find(model => model.selection.modelId === "claude-opus-4-8")?.contextLimit).toBe(1_000_000);
     expect(models.find(model => model.selection.modelId === "claude-opus-4-6")?.contextLimit).toBe(200_000);
-    expect(models.find(model => model.selection.modelId === "sonnet")?.contextLimit).toBe(200_000);
+    expect(models.find(model => model.selection.modelId === "sonnet")?.contextLimit).toBe(1_000_000);
+    expect(models.find(model => model.selection.modelId === "haiku")?.contextLimit).toBe(200_000);
     // The control channel's command list rode the same probe, with
     // descriptions init's bare names cannot carry.
     expect(await provider.listCommands()).toEqual([
@@ -982,6 +1194,25 @@ describe("ClaudeProvider sessions", () => {
     await provider.dispose();
   });
 
+  test("Claude SDK permissions and successful results reach two devices with no page", async () => {
+    const { provider, queries, workspace } = fixture();
+    const session = await provider.createSession("notification-pipeline");
+    const pipeline = await notificationPipeline(provider, workspace);
+    try {
+      await provider.prompt(session.id, { id: "turn", text: "work", delivery: "queue" });
+      const decision = queries[0]!.input.options.canUseTool!("Write", { file_path: path.join(workspace, "a.txt"), content: "x" }, { signal: new AbortController().signal, toolUseID: "permission" });
+      await pipeline.waitForSends(2);
+      await pipeline.restartHub();
+      await provider.replyPermission(session.id, "permission", "once");
+      await decision;
+      queries[0]!.push({ type: "result", subtype: "success", uuid: "result", session_id: session.id, is_error: false });
+      await pipeline.waitForSends(4);
+      expect(pipeline.opens()).toBe(2);
+      expect(pipeline.sent.map(send => send.payload.kind).sort()).toEqual(["permission-pending", "permission-pending", "turn-completed", "turn-completed"]);
+      expect(pipeline.sent.every(send => send.payload.url.includes(encodeURIComponent(`claude:${session.id}`)))).toBe(true);
+    } finally { await pipeline.dispose(); }
+  });
+
   test("background work keeps the session alive past its result and reports the background state", async () => {
     const { provider, queries } = fixture();
     const { events, stop } = collect(provider);
@@ -998,6 +1229,7 @@ describe("ClaudeProvider sessions", () => {
     expect(query.returned).toBe(false);
     const statuses = events.flatMap(event => event.updates).filter(update => update.kind === "status").map(update => (update as { status: string }).status);
     expect(statuses).toEqual(["running", "completed", "background"]);
+    expect(events.flatMap(event => event.notificationTurns ?? []).map(turn => [turn.sourceId, turn.phase])).toEqual([["r1", "started"], ["r1", "background"]]);
     // Ambient ids stay out of the live list; the real task is listed.
     expect(await provider.listBackgroundTasks()).toEqual([expect.objectContaining({ conversationId: session.id, taskId: "b1", description: "Sleep then echo", taskType: "local_bash", toolUseId: "toolu_1" })]);
     // Prompting is still possible on the live session.
@@ -1006,6 +1238,117 @@ describe("ClaudeProvider sessions", () => {
     query.push({ type: "result", subtype: "success", uuid: "res2", timestamp: "2026-09-02T10:00:07.000Z", session_id: session.id, is_error: false });
     await waitFor(() => events.filter(event => event.eventType === "turn.background").length === 2);
     expect(provider.liveSessionCount()).toBe(1);
+    stop();
+    await provider.dispose();
+  });
+
+  test("the query asks for progress summaries and subagent text, and a task's facts reach the live list and the output read", async () => {
+    const { provider, queries, workspace } = fixture();
+    const { events, stop } = collect(provider);
+    const session = await provider.createSession("x");
+    await provider.prompt(session.id, { id: "r1", text: "run it in the background", delivery: "queue" });
+    const query = queries[0]!;
+    expect(query.input.options.agentProgressSummaries).toBe(true);
+    expect(query.input.options.forwardSubagentText).toBe(true);
+    // The CLI's own layout: <root>/tasks/<taskId>.output, with interim output.
+    const tasksDir = path.join(workspace, "tasks");
+    mkdirSync(tasksDir, { recursive: true });
+    const outputFile = path.join(tasksDir, "bgjpa5uwy.output");
+    writeFileSync(outputFile, "line one\nline two\n");
+    query.push({ type: "system", subtype: "init", uuid: "i1", session_id: session.id, model: "claude-haiku-4-5-20251001" });
+    query.push({ type: "assistant", uuid: "a1", session_id: session.id, timestamp: "2026-09-02T10:00:02.000Z", message: { role: "assistant", content: [{ type: "tool_use", id: "toolu_01E1fJ", name: "Bash", input: { command: "sleep 25; echo spike-done", run_in_background: true } }] } });
+    query.push({ type: "system", subtype: "background_tasks_changed", uuid: "bg1", session_id: session.id, tasks: [{ task_id: "bgjpa5uwy", task_type: "local_bash", description: "sleep 25; echo spike-done" }] });
+    query.push({ type: "system", subtype: "task_started", uuid: "ts1", session_id: session.id, timestamp: "2026-09-02T10:00:03.000Z", task_id: "bgjpa5uwy", tool_use_id: "toolu_01E1fJ", description: "sleep 25; echo spike-done", task_type: "local_bash", is_backgrounded: true });
+    query.push({ type: "user", uuid: "u1", session_id: session.id, timestamp: "2026-09-02T10:00:03.000Z", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_01E1fJ", content: `Command running in background with ID: bgjpa5uwy. Output is being written to: ${outputFile}. You will be notified when it completes.` }] }, tool_use_result: { stdout: "", stderr: "", interrupted: false, isImage: false, noOutputExpected: false, backgroundTaskId: "bgjpa5uwy" } });
+    await waitFor(() => events.some(event => event.updates.some(update => update.kind === "upsert" && update.item.type === "background_task" && update.item.outputFile === outputFile)));
+    expect(await provider.listBackgroundTasks()).toEqual([expect.objectContaining({ conversationId: session.id, taskId: "bgjpa5uwy", taskType: "local_bash", toolUseId: "toolu_01E1fJ", outputFile })]);
+    // The tail is read from the end, bounded, and says the task still runs.
+    expect(await provider.taskOutput(session.id, "bgjpa5uwy", { tailBytes: 9 })).toEqual({ text: "line two\n", truncated: true, settled: false });
+    expect(await provider.taskOutput(session.id, "bgjpa5uwy", { tailBytes: 1024 })).toEqual({ text: "line one\nline two\n", truncated: false, settled: false });
+    // More output while running is what the next refresh sees.
+    appendFileSync(outputFile, "spike-done\n[exited with code 0]");
+    expect((await provider.taskOutput(session.id, "bgjpa5uwy", { tailBytes: 1024 }))?.text).toBe("line one\nline two\nspike-done\n[exited with code 0]");
+    // Unknown task, or a task whose file is not yet named: nothing to read.
+    expect(await provider.taskOutput(session.id, "nope", { tailBytes: 1024 })).toBeNull();
+    expect(await provider.taskOutput("other-session", "bgjpa5uwy", { tailBytes: 1024 })).toBeNull();
+    // A named path that does not resolve to tasks/<taskId>.output is refused:
+    // an agent task's "output" is a symlink to its subagent transcript.
+    const subagentsDir = path.join(workspace, "subagents");
+    mkdirSync(subagentsDir, { recursive: true });
+    writeFileSync(path.join(subagentsDir, "agent-ada2b9582caa230c5.jsonl"), "{}\n");
+    symlinkSync(path.join(subagentsDir, "agent-ada2b9582caa230c5.jsonl"), path.join(tasksDir, "ada2b9582caa230c5.output"));
+    query.push({ type: "system", subtype: "background_tasks_changed", uuid: "bg2", session_id: session.id, tasks: [{ task_id: "bgjpa5uwy", task_type: "local_bash", description: "sleep 25; echo spike-done" }, { task_id: "ada2b9582caa230c5", task_type: "local_agent", description: "List files" }] });
+    query.push({ type: "system", subtype: "task_started", uuid: "ts2", session_id: session.id, timestamp: "2026-09-02T10:00:04.000Z", task_id: "ada2b9582caa230c5", tool_use_id: "toolu_agent", description: "List files", subagent_type: "general-purpose", is_backgrounded: true, task_type: "local_agent", prompt: "List the files" });
+    query.push({ type: "system", subtype: "task_notification", uuid: "tn0", session_id: session.id, timestamp: "2026-09-02T10:00:05.000Z", task_id: "ada2b9582caa230c5", tool_use_id: "toolu_agent", status: "completed", output_file: path.join(tasksDir, "ada2b9582caa230c5.output"), summary: "1 file" });
+    await waitFor(() => events.some(event => event.updates.some(update => update.kind === "upsert" && update.item.type === "background_task" && update.item.taskId === "ada2b9582caa230c5" && update.item.status === "completed")));
+    expect(await provider.taskOutput(session.id, "ada2b9582caa230c5", { tailBytes: 1024 })).toBeNull();
+    // A path the CLI named elsewhere (not the tasks layout) is refused too.
+    mkdirSync(path.join(workspace, "elsewhere"), { recursive: true });
+    writeFileSync(path.join(workspace, "elsewhere", "bgother.output"), "x");
+    query.push({ type: "system", subtype: "task_started", uuid: "ts3", session_id: session.id, timestamp: "2026-09-02T10:00:06.000Z", task_id: "bgother", tool_use_id: "toolu_other", description: "other", task_type: "local_bash", is_backgrounded: true });
+    query.push({ type: "user", uuid: "u2", session_id: session.id, timestamp: "2026-09-02T10:00:06.000Z", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_other", content: `Command running in background with ID: bgother. Output is being written to: ${path.join(workspace, "elsewhere", "bgother.output")}. You will be notified when it completes.` }] }, tool_use_result: { stdout: "", stderr: "", interrupted: false, isImage: false, noOutputExpected: false, backgroundTaskId: "bgother" } });
+    await waitFor(() => events.some(event => event.updates.some(update => update.kind === "upsert" && update.item.type === "background_task" && update.item.taskId === "bgother" && update.item.outputFile !== undefined)));
+    expect(await provider.taskOutput(session.id, "bgother", { tailBytes: 1024 })).toBeNull();
+    // The shell task settles: the read still answers, and says so.
+    query.push({ type: "system", subtype: "task_notification", uuid: "tn1", session_id: session.id, timestamp: "2026-09-02T10:00:30.000Z", task_id: "bgjpa5uwy", tool_use_id: "toolu_01E1fJ", status: "completed", output_file: outputFile, summary: "Background command completed (exit code 0)" });
+    query.push({ type: "system", subtype: "background_tasks_changed", uuid: "bg3", session_id: session.id, tasks: [] });
+    await waitFor(() => events.some(event => event.updates.some(update => update.kind === "upsert" && update.item.type === "background_task" && update.item.taskId === "bgjpa5uwy" && update.item.status === "completed")));
+    expect(await provider.taskOutput(session.id, "bgjpa5uwy", { tailBytes: 12 })).toEqual({ text: "with code 0]", truncated: true, settled: true });
+    stop();
+    await provider.dispose();
+  });
+
+  // Hardening, not a reachable bug: the CLI's ids (a UUID, an alphanumeric
+  // task id) hold no colon today, but the index must not depend on that.
+  test("the output index keys a task by its session and id as a pair, whatever characters they hold", () => {
+    expect(taskOutputKey("a:b", "c")).not.toBe(taskOutputKey("a", "b:c"));
+    expect(taskOutputKey("8d4c5f1e-0b1a-4c2e-9f7a-1d2e3f4a5b6c", "bgjpa5uwy")).toBe(taskOutputKey("8d4c5f1e-0b1a-4c2e-9f7a-1d2e3f4a5b6c", "bgjpa5uwy"));
+    expect(taskOutputKey("s", "t")).not.toBe(taskOutputKey("t", "s"));
+  });
+
+  test("a truncated output tail opens on a whole character", async () => {
+    const { provider, queries, workspace } = fixture();
+    const { events, stop } = collect(provider);
+    const session = await provider.createSession("x");
+    await provider.prompt(session.id, { id: "r1", text: "run it in the background", delivery: "queue" });
+    const query = queries[0]!;
+    const tasksDir = path.join(workspace, "tasks");
+    mkdirSync(tasksDir, { recursive: true });
+    const outputFile = path.join(tasksDir, "bgutf8abc.output");
+    query.push({ type: "system", subtype: "init", uuid: "i1", session_id: session.id, model: "claude-haiku-4-5-20251001" });
+    query.push({ type: "system", subtype: "background_tasks_changed", uuid: "bg1", session_id: session.id, tasks: [{ task_id: "bgutf8abc", task_type: "local_bash", description: "echo" }] });
+    query.push({ type: "system", subtype: "task_started", uuid: "ts1", session_id: session.id, timestamp: "2026-09-02T10:00:03.000Z", task_id: "bgutf8abc", tool_use_id: "toolu_utf8", description: "echo", task_type: "local_bash", is_backgrounded: true });
+    query.push({ type: "user", uuid: "u1", session_id: session.id, timestamp: "2026-09-02T10:00:03.000Z", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_utf8", content: `Command running in background with ID: bgutf8abc. Output is being written to: ${outputFile}. You will be notified when it completes.` }] }, tool_use_result: { stdout: "", stderr: "", interrupted: false, isImage: false, noOutputExpected: false, backgroundTaskId: "bgutf8abc" } });
+    await waitFor(() => events.some(event => event.updates.some(update => update.kind === "upsert" && update.item.type === "background_task" && update.item.outputFile === outputFile)));
+    // Two-byte characters, cut after the first byte of one: the split
+    // character is dropped, the tail still says it is partial.
+    writeFileSync(outputFile, "é".repeat(10));
+    expect(await provider.taskOutput(session.id, "bgutf8abc", { tailBytes: 5 })).toEqual({ text: "éé", truncated: true, settled: false });
+    // A four-byte emoji straddling the cut is dropped whole.
+    writeFileSync(outputFile, "ab\u{1F600}cd");
+    expect(await provider.taskOutput(session.id, "bgutf8abc", { tailBytes: 4 })).toEqual({ text: "cd", truncated: true, settled: false });
+    // An ASCII tail is unchanged.
+    writeFileSync(outputFile, "line one\nline two\n");
+    expect(await provider.taskOutput(session.id, "bgutf8abc", { tailBytes: 9 })).toEqual({ text: "line two\n", truncated: true, settled: false });
+    stop();
+    await provider.dispose();
+  });
+
+  test("duplicate result frames leave the next accepted notification turn running", async () => {
+    const { provider, queries } = fixture();
+    const { events, stop } = collect(provider);
+    const session = await provider.createSession("notification-queue");
+    await provider.prompt(session.id, { id: "a", text: "one", delivery: "queue" });
+    await provider.prompt(session.id, { id: "b", text: "two", delivery: "queue" });
+    const result = { type: "result", subtype: "success", uuid: "result-a", session_id: session.id, is_error: false };
+    queries[0]!.push(result);
+    await waitFor(() => events.some(event => event.notificationTurns?.some(turn => turn.sourceId === "a" && turn.phase === "completed")));
+    queries[0]!.push(result);
+    queries[0]!.push({ ...result, uuid: "result-b" });
+    await waitFor(() => events.some(event => event.notificationTurns?.some(turn => turn.sourceId === "b" && turn.phase === "completed")));
+    expect(events.flatMap(event => event.notificationTurns ?? []).map(turn => [turn.sourceId, turn.phase])).toEqual([
+      ["a", "started"], ["a", "completed"], ["b", "started"], ["b", "completed"],
+    ]);
     stop();
     await provider.dispose();
   });
@@ -1028,6 +1371,449 @@ describe("ClaudeProvider sessions", () => {
     query.push({ type: "system", subtype: "task_notification", uuid: "tn1", session_id: session.id, timestamp: "2026-09-02T10:00:08.000Z", task_id: "agent1", status: "completed", output_file: "/tmp/o", summary: "done" });
     stop();
     await provider.dispose();
+  });
+
+  // Design D8: a run known from its start edge streams into its own child
+  // conversation; the parent's timeline keeps only the row that launched it.
+  describe("subagent frames route to the child conversation", () => {
+    const stamp = (seconds: number) => new Date(Date.UTC(2026, 8, 22, 12, 0, seconds)).toISOString();
+    const AGENT_ID = "ada2b9582caa230c5";
+    const LAUNCHER = "toolu_013s2jZsDCiw3cAHYTqFeSpc";
+    const upsertIds = (events: NormalizedProviderEvent[], conversationId: string) =>
+      events.filter(event => event.conversationId === conversationId).flatMap(event => event.updates).flatMap(update => update.kind === "upsert" ? [update.item.id] : []);
+    // The run's own frames, tagged with the launching tool use as the CLI
+    // forwards them (spike probe b): thinking + a tool call, a heartbeat,
+    // the tool's result, then text.
+    const runFrames = (sessionId: string, launcher: string) => {
+      const tagged = { session_id: sessionId, parent_tool_use_id: launcher };
+      return [
+        { type: "assistant", uuid: "a202b083", timestamp: stamp(2), ...tagged, message: { role: "assistant", model: "claude-haiku-4-5-20251001", content: [{ type: "thinking", thinking: "Let me list the files." }, { type: "tool_use", id: "toolu_inner", name: "Bash", input: { command: "ls" } }], usage: { input_tokens: 10, output_tokens: 5 } } },
+        { type: "tool_progress", uuid: "hb1", timestamp: stamp(3), ...tagged, tool_use_id: "toolu_inner", tool_name: "Bash", elapsed_time_seconds: 1.5 },
+        { type: "user", uuid: "eb64650b", timestamp: stamp(3), ...tagged, message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_inner", content: "README.md" }] }, tool_use_result: null },
+        { type: "assistant", uuid: "f28f8ec7", timestamp: stamp(4), ...tagged, message: { role: "assistant", model: "claude-haiku-4-5-20251001", content: [{ type: "text", text: "There is 1 file." }], usage: { input_tokens: 20, output_tokens: 8 } } },
+      ];
+    };
+
+    test("a backgrounded agent's text, thinking, and tool frames reach its child; the parent keeps only its launching row", async () => {
+      const { provider, queries } = fixture();
+      const { events, stop } = collect(provider);
+      const session = await provider.createSession("x");
+      const childId = `sub:${session.id}:${AGENT_ID}`;
+      await provider.prompt(session.id, { id: "r1", text: "spawn", delivery: "queue" });
+      const query = queries[0]!;
+      query.push({ type: "assistant", uuid: "launch", timestamp: stamp(1), session_id: session.id, parent_tool_use_id: null, message: { role: "assistant", model: "claude-haiku-4-5-20251001", content: [{ type: "tool_use", id: LAUNCHER, name: "Agent", input: { description: "List files", prompt: "List the files", run_in_background: true } }] } });
+      query.push({ type: "system", subtype: "background_tasks_changed", uuid: "bg1", session_id: session.id, tasks: [{ task_id: AGENT_ID, task_type: "local_agent", description: "List files" }] });
+      query.push({ type: "system", subtype: "task_started", uuid: "ts1", timestamp: stamp(1), session_id: session.id, task_id: AGENT_ID, tool_use_id: LAUNCHER, description: "List files", subagent_type: "general-purpose", is_backgrounded: true, task_type: "local_agent", prompt: "List the files" });
+      query.push({ type: "user", uuid: "launched", timestamp: stamp(1), session_id: session.id, parent_tool_use_id: null, message: { role: "user", content: [{ type: "tool_result", tool_use_id: LAUNCHER, content: "Async agent launched" }] }, tool_use_result: { isAsync: true, status: "async_launched", agentId: AGENT_ID, description: "List files", prompt: "List the files", outputFile: `/tmp/t/${AGENT_ID}.output` } });
+      // The turn ends with the agent still running: the D9 situation, where
+      // the run's frames must not read as a turn the CLI started by itself.
+      query.push({ type: "result", subtype: "success", uuid: "res1", timestamp: stamp(1), session_id: session.id, is_error: false });
+      await waitFor(() => events.some(event => event.eventType === "turn.background"));
+      for (const frame of runFrames(session.id, LAUNCHER)) query.push(frame);
+      query.push({ type: "system", subtype: "task_progress", uuid: "tp1", timestamp: stamp(4), session_id: session.id, task_id: AGENT_ID, tool_use_id: LAUNCHER, usage: { total_tokens: 13122, tool_uses: 1, duration_ms: 4751 }, last_tool_name: "Bash" });
+      query.push({ type: "system", subtype: "task_notification", uuid: "tn1", timestamp: stamp(5), session_id: session.id, task_id: AGENT_ID, tool_use_id: LAUNCHER, status: "completed", output_file: `/tmp/t/${AGENT_ID}.output`, summary: "There is 1 file." });
+      await waitFor(() => events.some(event => event.conversationId === childId && event.updates.some(update => update.kind === "status" && update.status === "completed")));
+
+      const childEvents = events.filter(event => event.conversationId === childId);
+      const childUpdates = childEvents.flatMap(event => event.updates);
+      // Running from the start edge, settled by the notification.
+      expect(childUpdates[0]).toEqual({ kind: "status", status: "running" });
+      expect(childUpdates.at(-1)).toEqual({ kind: "status", status: "completed" });
+      const childItems = childUpdates.flatMap(update => update.kind === "upsert" ? [update.item] : []);
+      expect(childItems.map(item => item.id)).toEqual(["reasoning:a202b083:0", "tool:toolu_inner", "usage:a202b083", "tool:toolu_inner", "tool:toolu_inner", "message:f28f8ec7", "usage:f28f8ec7"]);
+      // The heartbeat found the tool in the child's own memory; the result
+      // completed the row it opened.
+      expect(childItems[3]).toEqual(expect.objectContaining({ type: "tool", status: "running", elapsedMs: 1500 }));
+      expect(childItems[4]).toEqual(expect.objectContaining({ type: "tool", status: "completed", output: "README.md" }));
+      expect(childItems[5]).toEqual(expect.objectContaining({ type: "assistant_message", markdown: "There is 1 file." }));
+      // The routed events carry no attribution: the launching row's figure
+      // comes from the tool result and the child transcript read, as before.
+      expect(childEvents.every(event => event.assistantUsage === undefined && event.assistantModel === undefined)).toBe(true);
+      // The parent: its launching row and the task row, nothing of the run.
+      const parentIds = upsertIds(events, session.id);
+      expect(parentIds).toContain(`tool:${LAUNCHER}`);
+      expect(parentIds).toContain(`task:${AGENT_ID}`);
+      expect(parentIds.filter(id => id.startsWith("reasoning:") || id === "tool:toolu_inner" || id === "message:f28f8ec7" || id === "usage:a202b083" || id === "usage:f28f8ec7")).toEqual([]);
+      const launcher = events.filter(event => event.conversationId === session.id).flatMap(event => event.updates).flatMap(update => update.kind === "upsert" && update.item.id === `tool:${LAUNCHER}` ? [update.item] : []).at(-1);
+      expect(launcher).toEqual(expect.objectContaining({ type: "tool", status: "completed", childConversationId: childId }));
+      expect(events.some(event => event.eventType === "turn.unprompted")).toBe(false);
+      // Live, the child is a session of its parent before the CLI has
+      // written its transcript, and reads as empty rather than unknown.
+      expect(await provider.getSession(childId)).toEqual(expect.objectContaining({ id: childId, parentId: session.id, title: "Subagent" }));
+      expect((await provider.listMessages(childId, { limit: 50 })).items).toEqual([]);
+      stop();
+      await provider.dispose();
+    });
+
+    test("a live run is resolved from its own parent session, not by searching every live session's runs", async () => {
+      const { provider, queries } = fixture();
+      const { events, stop } = collect(provider);
+      const first = await provider.createSession("x");
+      const second = await provider.createSession("y");
+      await provider.prompt(first.id, { id: "r1", text: "spawn", delivery: "queue" });
+      await provider.prompt(second.id, { id: "r2", text: "spawn", delivery: "queue" });
+      const runs = [[first.id, queries[0]!, "a1111111111111111"], [second.id, queries[1]!, "a2222222222222222"]] as const;
+      for (const [sessionId, query, agentId] of runs) {
+        query.push({ type: "system", subtype: "task_started", uuid: `ts-${agentId}`, timestamp: stamp(1), session_id: sessionId, task_id: agentId, description: "List files", subagent_type: "general-purpose", task_type: "local_agent", prompt: "List the files" });
+      }
+      const childOf = (sessionId: string, agentId: string) => `sub:${sessionId}:${agentId}`;
+      for (const [sessionId, , agentId] of runs) {
+        await waitFor(() => events.some(event => event.conversationId === childOf(sessionId, agentId) && event.eventType === "subagent.started"));
+      }
+      const internals = provider as unknown as {
+        live: Map<string, { children: Map<string, unknown> }>;
+        liveChild(id: string): { parentSessionId: string; child: { id: string } } | undefined;
+      };
+      // The first session's runs must not be consulted to find the second's.
+      const firstRuns = internals.live.get(first.id)!.children;
+      let consulted = 0;
+      const values = firstRuns.values.bind(firstRuns);
+      firstRuns.values = () => { consulted += 1; return values(); };
+      const secondChild = childOf(second.id, runs[1][2]);
+      expect(internals.liveChild(secondChild)).toEqual({ parentSessionId: second.id, child: expect.objectContaining({ id: secondChild }) });
+      expect(consulted).toBe(0);
+      expect(await provider.getSession(secondChild)).toEqual(expect.objectContaining({ id: secondChild, parentId: second.id }));
+      firstRuns.values = values;
+      expect(internals.liveChild(childOf(first.id, runs[0][2]))?.parentSessionId).toBe(first.id);
+      // Malformed, of an unknown session, or of a run the session never
+      // started: none of them names a live run.
+      expect(internals.liveChild(`sub:${first.id}`)).toBeUndefined();
+      expect(internals.liveChild(`${first.id}:${runs[0][2]}`)).toBeUndefined();
+      expect(internals.liveChild(`sub:${first.id}:${runs[0][2]}:extra`)).toBeUndefined();
+      expect(internals.liveChild(childOf("00000000-0000-0000-0000-000000000000", runs[0][2]))).toBeUndefined();
+      expect(internals.liveChild(childOf(first.id, runs[1][2]))).toBeUndefined();
+      stop();
+      await provider.dispose();
+    });
+
+    test("a foreground agent routes the same way and settles on its sync result; the launching row keeps the result's attribution", async () => {
+      const { provider, queries } = fixture();
+      const { events, stop } = collect(provider);
+      const session = await provider.createSession("x");
+      const agentId = "adcea0e635b291813";
+      const childId = `sub:${session.id}:${agentId}`;
+      await provider.prompt(session.id, { id: "r1", text: "spawn", delivery: "queue" });
+      const query = queries[0]!;
+      query.push({ type: "assistant", uuid: "launch", timestamp: stamp(1), session_id: session.id, parent_tool_use_id: null, message: { role: "assistant", model: "claude-haiku-4-5-20251001", content: [{ type: "tool_use", id: "toolu_fg", name: "Agent", input: { description: "List files", prompt: "List the files" } }] } });
+      query.push({ type: "system", subtype: "task_started", uuid: "ts1", timestamp: stamp(1), session_id: session.id, task_id: agentId, tool_use_id: "toolu_fg", description: "List files", subagent_type: "general-purpose", is_backgrounded: false, task_type: "local_agent", prompt: "List the files" });
+      for (const frame of runFrames(session.id, "toolu_fg")) query.push(frame);
+      await waitFor(() => upsertIds(events, childId).includes("message:f28f8ec7"));
+      expect(events.filter(event => event.conversationId === childId).flatMap(event => event.updates)[0]).toEqual({ kind: "status", status: "running" });
+      // No task frames this time (an older CLI): the sync result ends the run.
+      query.push({ type: "user", uuid: "done", timestamp: stamp(6), session_id: session.id, parent_tool_use_id: null, message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_fg", content: [{ type: "text", text: "There is 1 file." }] }] }, tool_use_result: { agentId, agentType: "general-purpose", content: [{ type: "text", text: "There is 1 file." }], resolvedModel: "claude-haiku-4-5-20251001", usage: { input_tokens: 100, output_tokens: 20 }, totalDurationMs: 4000, totalTokens: 120, totalToolUseCount: 1 } });
+      await waitFor(() => events.some(event => event.conversationId === childId && event.updates.some(update => update.kind === "status" && update.status === "completed")));
+      const parentIds = upsertIds(events, session.id);
+      // A foreground run has no task row; its launching row carries the
+      // result's model and usage, and nothing of the run itself.
+      expect(parentIds.filter(id => id.startsWith("task:") || id === "tool:toolu_inner" || id === "message:f28f8ec7" || id.startsWith("reasoning:"))).toEqual([]);
+      const launcher = events.filter(event => event.conversationId === session.id).flatMap(event => event.updates).flatMap(update => update.kind === "upsert" && update.item.id === "tool:toolu_fg" ? [update.item] : []).at(-1);
+      expect(launcher).toEqual(expect.objectContaining({ status: "completed", childConversationId: childId, model: "claude-haiku-4-5-20251001", usage: expect.objectContaining({ input: 100, output: 20 }) }));
+      stop();
+      await provider.dispose();
+    });
+
+    // A Skill fork (spike Q3, Surprise 5): frames under the Skill tool use
+    // from the first moment, no task edge, and the fork's agent id only in
+    // the tool result that ends it.
+    const FORK_AGENT = "aaeeab292f002e3d7";
+    const forkFrames = (sessionId: string) => [
+      { type: "assistant", uuid: "fork1", timestamp: stamp(2), session_id: sessionId, parent_tool_use_id: "toolu_skill", message: { role: "assistant", model: "claude-haiku-4-5-20251001", content: [{ type: "thinking", thinking: "Reading the diff." }, { type: "text", text: "Reviewing." }, { type: "tool_use", id: "toolu_diff", name: "Bash", input: { command: "git diff HEAD" } }] } },
+      { type: "user", uuid: "fork2", timestamp: stamp(3), session_id: sessionId, parent_tool_use_id: "toolu_skill", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_diff", content: "+1 -1" }] }, tool_use_result: null },
+    ];
+    const skillCall = (sessionId: string) => ({ type: "assistant", uuid: "skill", timestamp: stamp(1), session_id: sessionId, parent_tool_use_id: null, message: { role: "assistant", model: "claude-haiku-4-5-20251001", content: [{ type: "tool_use", id: "toolu_skill", name: "Skill", input: { skill: "code-review" } }] } });
+
+    test("a skill fork's frames are held until its result names it, then fill the child in arrival order", async () => {
+      const { provider, queries } = fixture();
+      const { events, stop } = collect(provider);
+      const session = await provider.createSession("x");
+      await provider.prompt(session.id, { id: "r1", text: "review", delivery: "queue" });
+      const query = queries[0]!;
+      const forkChildId = `sub:${session.id}:${FORK_AGENT}`;
+      query.push(skillCall(session.id));
+      for (const frame of forkFrames(session.id)) query.push(frame);
+      await waitFor(() => upsertIds(events, session.id).filter(id => id === "tool:toolu_diff").length === 2);
+      // While the fork has no name the parent's rows are exactly what they
+      // were before D10 — its tool row, opened and completed, its text and
+      // thinking dropped — and no child has been heard of.
+      expect(upsertIds(events, session.id).filter(id => id === "message:fork1" || id.startsWith("reasoning:"))).toEqual([]);
+      expect(events.some(event => event.conversationId?.startsWith("sub:"))).toBe(false);
+      expect(await provider.getSession(forkChildId)).toBeNull();
+      const parentBefore = upsertIds(events, session.id);
+
+      query.push({ type: "user", uuid: "forked", timestamp: stamp(4), session_id: session.id, parent_tool_use_id: null, message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_skill", content: "Based on my analysis..." }] }, tool_use_result: { success: true, commandName: "code-review", status: "forked", agentId: FORK_AGENT, result: "Based on my analysis..." } });
+      await waitFor(() => events.some(event => event.conversationId === forkChildId && event.updates.some(update => update.kind === "status" && update.status === "completed")));
+
+      const childUpdates = events.filter(event => event.conversationId === forkChildId).flatMap(event => event.updates);
+      // Running, then everything the fork streamed while nameless, then the
+      // settle: the transcript is complete before the status closes it.
+      expect(childUpdates[0]).toEqual({ kind: "status", status: "running" });
+      expect(childUpdates.at(-1)).toEqual({ kind: "status", status: "completed" });
+      expect(childUpdates.flatMap(update => update.kind === "upsert" ? [update.item.id] : []))
+        .toEqual(["reasoning:fork1:0", "tool:toolu_diff", "message:fork1", "tool:toolu_diff"]);
+      expect(childUpdates.flatMap(update => update.kind === "upsert" && update.item.id === "tool:toolu_diff" ? [update.item] : []).at(-1))
+        .toEqual(expect.objectContaining({ type: "tool", name: "Bash", status: "completed", output: "+1 -1" }));
+      // Replayed into the child only: the parent gained nothing but the
+      // launching row this result completes.
+      expect(upsertIds(events, session.id)).toEqual([...parentBefore, "tool:toolu_skill"]);
+      const launcher = events.filter(event => event.conversationId === session.id).flatMap(event => event.updates).flatMap(update => update.kind === "upsert" && update.item.id === "tool:toolu_skill" ? [update.item] : []).at(-1);
+      expect(launcher).toEqual(expect.objectContaining({ type: "tool", name: "Skill", status: "completed", childConversationId: forkChildId }));
+      expect(await provider.getSession(forkChildId)).toEqual(expect.objectContaining({ id: forkChildId, parentId: session.id }));
+      stop();
+      await provider.dispose();
+    });
+
+    test("frames held for a tool use that never forks are dropped unsent", async () => {
+      const { provider, queries } = fixture();
+      const { events, stop } = collect(provider);
+      const session = await provider.createSession("x");
+      await provider.prompt(session.id, { id: "r1", text: "review", delivery: "queue" });
+      const query = queries[0]!;
+      query.push(skillCall(session.id));
+      for (const frame of forkFrames(session.id)) query.push(frame);
+      await waitFor(() => upsertIds(events, session.id).filter(id => id === "tool:toolu_diff").length === 2);
+      // An ordinary skill load: the result names no agent, so there is no
+      // child the held frames could belong to.
+      query.push({ type: "user", uuid: "loaded", timestamp: stamp(4), session_id: session.id, parent_tool_use_id: null, message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_skill", content: "Skill loaded." }] }, tool_use_result: { success: true, commandName: "code-review" } });
+      await waitFor(() => upsertIds(events, session.id).filter(id => id === "tool:toolu_skill").length === 2);
+      await query.return();
+      await Bun.sleep(10);
+      expect(events.some(event => event.conversationId?.startsWith("sub:"))).toBe(false);
+      // The parent kept the fork's tool row, as it does today.
+      expect(upsertIds(events, session.id).filter(id => id === "tool:toolu_diff").length).toBe(2);
+      stop();
+      await provider.dispose();
+    });
+
+    // Claude Code answers each tool use in a frame of its own, parallel calls
+    // included (a `/simplify` run's four parallel Agent launches settled in
+    // four frames); the frame's one structured result names no tool use, so
+    // a frame that answered several could not say whose run it names.
+    test("a frame answering several tool uses names no run from its one structured result", async () => {
+      const { provider, queries } = fixture();
+      const { events, stop } = collect(provider);
+      const session = await provider.createSession("x");
+      await provider.prompt(session.id, { id: "r1", text: "review", delivery: "queue" });
+      const query = queries[0]!;
+      const forkChildId = `sub:${session.id}:${FORK_AGENT}`;
+      query.push(skillCall(session.id));
+      query.push({ type: "assistant", uuid: "other", timestamp: stamp(1), session_id: session.id, parent_tool_use_id: null, message: { role: "assistant", model: "claude-haiku-4-5-20251001", content: [{ type: "tool_use", id: "toolu_other", name: "Bash", input: { command: "ls" } }] } });
+      for (const frame of forkFrames(session.id)) query.push(frame);
+      await waitFor(() => upsertIds(events, session.id).filter(id => id === "tool:toolu_diff").length === 2);
+      query.push({ type: "user", uuid: "both", timestamp: stamp(4), session_id: session.id, parent_tool_use_id: null, message: { role: "user", content: [
+        { type: "tool_result", tool_use_id: "toolu_other", content: "README.md" },
+        { type: "tool_result", tool_use_id: "toolu_skill", content: "Based on my analysis..." },
+      ] }, tool_use_result: { success: true, commandName: "code-review", status: "forked", agentId: FORK_AGENT, result: "Based on my analysis..." } });
+      const completed = (id: string) => events.filter(event => event.conversationId === session.id).flatMap(event => event.updates)
+        .flatMap(update => update.kind === "upsert" && update.item.id === id && update.item.type === "tool" && update.item.status === "completed" ? [update.item] : []).at(-1);
+      await waitFor(() => completed("tool:toolu_other") !== undefined && completed("tool:toolu_skill") !== undefined);
+      // Neither row is given the run, and no run is registered under either
+      // tool use while the session is live: the Bash call is not the fork,
+      // and nothing says the Skill is.
+      expect(completed("tool:toolu_other")).not.toHaveProperty("childConversationId");
+      expect(completed("tool:toolu_skill")).not.toHaveProperty("childConversationId");
+      expect(await provider.getSession(forkChildId)).toBeNull();
+      await query.return();
+      await Bun.sleep(10);
+      expect(events.some(event => event.conversationId?.startsWith("sub:"))).toBe(false);
+      stop();
+      await provider.dispose();
+    });
+
+    test("a child filled from its transcript and then fed live upserts the same item ids", async () => {
+      const { provider, queries, configDir, workspace } = fixture();
+      const { events, stop } = collect(provider);
+      const session = await provider.createSession("x");
+      const childId = `sub:${session.id}:${AGENT_ID}`;
+      // The transcript as the CLI writes it, record for record the frames
+      // it forwards (same uuids and tool-use ids; spike probe b), plus the
+      // run's prompt, which is never forwarded.
+      const subagentDir = path.join(claudeProjectDir(workspace, configDir), session.id, "subagents");
+      mkdirSync(subagentDir, { recursive: true });
+      const stored = (frame: Record<string, unknown>) => {
+        const { session_id: _session, parent_tool_use_id: _parent, tool_use_result, ...rest } = frame as Record<string, unknown> & { tool_use_result?: unknown };
+        return JSON.stringify({ ...rest, parentUuid: null, isSidechain: true, agentId: AGENT_ID, ...(tool_use_result ? { toolUseResult: tool_use_result } : {}) });
+      };
+      writeFileSync(path.join(subagentDir, `agent-${AGENT_ID}.jsonl`), [
+        JSON.stringify({ type: "user", uuid: "cc451df4", parentUuid: null, isSidechain: true, agentId: AGENT_ID, timestamp: stamp(1), message: { role: "user", content: "List the files" } }),
+        ...runFrames(session.id, LAUNCHER).filter(frame => frame.type !== "tool_progress").map(stored),
+      ].join("\n") + "\n");
+      const snapshot = new Set((await provider.listMessages(childId, { limit: 50 })).items.map(item => item.id));
+      expect(snapshot).toEqual(new Set(["message:cc451df4", "reasoning:a202b083:0", "tool:toolu_inner", "usage:a202b083", "message:f28f8ec7", "usage:f28f8ec7"]));
+
+      await provider.prompt(session.id, { id: "r1", text: "spawn", delivery: "queue" });
+      const query = queries[0]!;
+      query.push({ type: "system", subtype: "task_started", uuid: "ts1", timestamp: stamp(1), session_id: session.id, task_id: AGENT_ID, tool_use_id: LAUNCHER, description: "List files", subagent_type: "general-purpose", is_backgrounded: true, task_type: "local_agent" });
+      for (const frame of runFrames(session.id, LAUNCHER)) query.push(frame);
+      await waitFor(() => upsertIds(events, childId).includes("usage:f28f8ec7"));
+      // Every live item is one the snapshot already holds: no second row
+      // for a tool call, a thought, or a message the file replayed.
+      for (const id of upsertIds(events, childId)) expect(snapshot.has(id)).toBe(true);
+      stop();
+      await provider.dispose();
+    });
+  });
+
+  // Design D13, against the CLI Uatu actually runs (spike Q4/Q5, frames
+  // verbatim): Claude Code marks two kinds of agent run ambient — a skill the
+  // model forks and the run a typed command launches — and both are runs.
+  describe("ambient agent runs are runs, never background work (D13)", () => {
+    type Frame = Record<string, unknown>;
+    const fork = forkedRuns.skillFork.live as Frame[];
+    const typed = forkedRuns.typedCodeReview.live as Frame[];
+    const FORK_AGENT = "afd1c64a374700d34";
+    const SKILL_USE = "toolu_01CS76rQV6QvfD4HfdsJmk1r";
+    const REVIEW_AGENT = "ad53ca64bd188affb";
+    const upserts = (events: NormalizedProviderEvent[], conversationId: string) =>
+      events.filter(event => event.conversationId === conversationId).flatMap(event => event.updates).flatMap(update => update.kind === "upsert" ? [update.item] : []);
+    const statuses = (events: NormalizedProviderEvent[], conversationId: string) =>
+      events.filter(event => event.conversationId === conversationId).flatMap(event => event.updates).flatMap(update => update.kind === "status" ? [update.status] : []);
+    const neverBackground = async (provider: ClaudeProvider, events: NormalizedProviderEvent[], sessionId: string) => {
+      expect(statuses(events, sessionId)).not.toContain("background");
+      expect(events.some(event => event.eventType === "turn.background" || event.eventType === "background.reconciled")).toBe(false);
+      expect(await provider.listBackgroundTasks()).toEqual([]);
+    };
+
+    test("a model-invoked code-review fork opens its child at task_started, and its tagged frames reach it live", async () => {
+      const { provider, queries } = fixture();
+      const { events, stop } = collect(provider);
+      const session = await provider.createSession("x");
+      const childId = `sub:${session.id}:${FORK_AGENT}`;
+      await provider.prompt(session.id, { id: "r1", text: "review my change", delivery: "queue" });
+      const query = queries[0]!;
+      const [skillCall, started, ...rest] = fork;
+      const notificationAt = rest.findIndex(frame => frame.subtype === "task_notification");
+      const run = rest.slice(0, notificationAt);
+      const [notification, forked] = rest.slice(notificationAt);
+      query.push(skillCall);
+      query.push(started);
+      // Named at its start edge, running, before a single frame of it arrives.
+      await waitFor(() => statuses(events, childId).includes("running"));
+      expect(await provider.getSession(childId)).toEqual(expect.objectContaining({ id: childId, parentId: session.id }));
+      expect(upserts(events, session.id).filter(item => item.id === `tool:${SKILL_USE}`).at(-1))
+        .toEqual(expect.objectContaining({ type: "tool", name: "Skill", status: "running", childConversationId: childId }));
+      for (const frame of run) query.push(frame);
+      const lastText = run.filter(frame => frame.type === "assistant").at(-1)!.uuid as string;
+      await waitFor(() => upserts(events, childId).some(item => item.id === `message:${lastText}`));
+      // Live in the child: its text and its own tool call, completed by its
+      // result. The parent holds nothing of the run but the Skill row.
+      const childItems = upserts(events, childId);
+      expect(childItems.filter(item => item.id === "tool:toolu_01UkPeqpEx1YUWZD1uAqPm6s").at(-1)).toEqual(expect.objectContaining({ type: "tool", name: "Bash", status: "completed" }));
+      expect(childItems.some(item => item.type === "assistant_message" && item.markdown.startsWith("I'll run a high-effort review."))).toBe(true);
+      const parentIds = new Set(upserts(events, session.id).map(item => item.id));
+      expect(childItems.filter(item => parentIds.has(item.id))).toEqual([]);
+      expect([...parentIds].filter(id => id.startsWith("tool:") || id.startsWith("reasoning:"))).toEqual([`tool:${SKILL_USE}`]);
+      query.push(notification);
+      query.push(forked);
+      await waitFor(() => statuses(events, childId).includes("completed"));
+      expect(upserts(events, session.id).filter(item => item.id === `tool:${SKILL_USE}`).at(-1))
+        .toEqual(expect.objectContaining({ status: "completed", childConversationId: childId }));
+      await neverBackground(provider, events, session.id);
+      expect(upserts(events, session.id).some(item => item.type === "background_task")).toBe(false);
+      stop();
+      await provider.dispose();
+    });
+
+    test("a fork frame that beats its start edge still opens the child's transcript", async () => {
+      const { provider, queries } = fixture();
+      const { events, stop } = collect(provider);
+      const session = await provider.createSession("x");
+      const childId = `sub:${session.id}:${FORK_AGENT}`;
+      await provider.prompt(session.id, { id: "r1", text: "review my change", delivery: "queue" });
+      const query = queries[0]!;
+      const [skillCall, started, ...rest] = fork;
+      const early = rest.find(frame => frame.type === "assistant" && JSON.stringify(frame).includes("toolu_01UkPeqpEx1YUWZD1uAqPm6s"))!;
+      query.push(skillCall);
+      query.push(early);
+      query.push(started);
+      await waitFor(() => statuses(events, childId).includes("running"));
+      await waitFor(() => upserts(events, childId).some(item => item.id === "tool:toolu_01UkPeqpEx1YUWZD1uAqPm6s"));
+      stop();
+      await provider.dispose();
+    });
+
+    test("a typed /code-review emits a foreground run row openable as its child, settled by the notification", async () => {
+      const { provider, queries, configDir, workspace } = fixture();
+      const { events, stop } = collect(provider);
+      const session = await provider.createSession("x");
+      const childId = `sub:${session.id}:${REVIEW_AGENT}`;
+      await provider.prompt(session.id, { id: "r1", text: "/code-review low", delivery: "queue" });
+      const query = queries[0]!;
+      const [started, rateLimit, notification, synthetic, result] = typed;
+      query.push(started);
+      await waitFor(() => upserts(events, session.id).some(item => item.id === `task:${REVIEW_AGENT}`));
+      expect(upserts(events, session.id).find(item => item.id === `task:${REVIEW_AGENT}`)).toEqual({
+        id: `task:${REVIEW_AGENT}`, type: "background_task", createdAt: expect.any(Number), taskId: REVIEW_AGENT,
+        description: "/code-review", taskType: "local_agent", status: "running", subagentType: "general-purpose",
+        childConversationId: childId, foreground: true,
+      });
+      expect(statuses(events, childId)).toEqual(["running"]);
+      // Openable at once, before the CLI has written a line of its transcript,
+      // and readable while the CLI is still writing it (spike Q4e: live).
+      expect(await provider.getSession(childId)).toEqual(expect.objectContaining({ id: childId, parentId: session.id }));
+      expect((await provider.listMessages(childId, { limit: 50 })).items).toEqual([]);
+      const subagents = path.join(claudeProjectDir(workspace, configDir), session.id, "subagents");
+      mkdirSync(subagents, { recursive: true });
+      const file = path.join(subagents, `agent-${REVIEW_AGENT}.jsonl`);
+      const record = (uuid: string, second: number, message: Record<string, unknown>, type = "assistant") =>
+        JSON.stringify({ type, uuid, parentUuid: null, isSidechain: true, agentId: REVIEW_AGENT, timestamp: `2026-09-24T17:08:1${second}.000Z`, message }) + "\n";
+      writeFileSync(file, record("rv-1", 1, { role: "user", content: "Review the diff." }, "user"));
+      expect((await provider.listMessages(childId, { limit: 50 })).items.map(item => item.id)).toEqual(["message:rv-1"]);
+      appendFileSync(file, record("rv-2", 2, { role: "assistant", model: "claude-haiku-4-5-20251001", content: [{ type: "text", text: "Reading the diff." }] }));
+      expect((await provider.listMessages(childId, { limit: 50 })).items.map(item => item.id)).toEqual(["message:rv-1", "message:rv-2"]);
+
+      query.push(rateLimit);
+      query.push(notification);
+      await waitFor(() => statuses(events, childId).includes("completed"));
+      expect(upserts(events, session.id).filter(item => item.id === `task:${REVIEW_AGENT}`).at(-1))
+        .toEqual(expect.objectContaining({ status: "completed", foreground: true, childConversationId: childId }));
+      query.push(synthetic);
+      query.push(result);
+      await waitFor(() => statuses(events, session.id).includes("completed"));
+      // The command's output is the timeline's record of the run (D15): its
+      // text as it arrived, naming no model and spending nothing.
+      const output = upserts(events, session.id).find(item => item.id === `message:${synthetic.uuid as string}`);
+      expect(output).toEqual(expect.objectContaining({ type: "assistant_message", markdown: expect.stringContaining("math.ts:2") }));
+      expect(upserts(events, session.id).some(item => item.id === `usage:${synthetic.uuid as string}`)).toBe(false);
+      expect(events.some(event => event.assistantModel !== undefined || event.assistantUsage !== undefined)).toBe(false);
+      await neverBackground(provider, events, session.id);
+      stop();
+      await provider.dispose();
+    });
+
+    test("a foreground run that never reports its end is settled by the turn's result", async () => {
+      const { provider, queries } = fixture();
+      const { events, stop } = collect(provider);
+      const session = await provider.createSession("x");
+      await provider.prompt(session.id, { id: "r1", text: "/code-review low", delivery: "queue" });
+      const query = queries[0]!;
+      const [started, , , synthetic, result] = typed;
+      query.push(started);
+      query.push(synthetic);
+      query.push(result);
+      await waitFor(() => statuses(events, session.id).includes("completed"));
+      expect(upserts(events, session.id).filter(item => item.id === `task:${REVIEW_AGENT}`).at(-1))
+        .toEqual(expect.objectContaining({ status: "stopped", foreground: true }));
+      stop();
+      await provider.dispose();
+    });
+
+    test("an ambient task that is not an agent run stays ignored: no row, no child", async () => {
+      const { provider, queries } = fixture();
+      const { events, stop } = collect(provider);
+      const session = await provider.createSession("x");
+      await provider.prompt(session.id, { id: "r1", text: "go", delivery: "queue" });
+      const query = queries[0]!;
+      query.push({ type: "system", subtype: "task_started", uuid: "w1", session_id: session.id, task_id: "watch1", description: "Live update watcher", task_type: "local_monitor", subagent_type: "general-purpose", ambient: true, skip_transcript: true });
+      query.push({ type: "system", subtype: "task_notification", uuid: "w2", session_id: session.id, task_id: "watch1", status: "completed", summary: "x", ambient: true });
+      query.push({ type: "result", subtype: "success", uuid: "res1", timestamp: "2026-09-24T17:08:20.000Z", session_id: session.id, is_error: false });
+      await waitFor(() => statuses(events, session.id).includes("completed"));
+      expect(events.filter(event => event.eventType === "system").every(event => event.outcome === "ignored" && event.updates.length === 0)).toBe(true);
+      expect(events.some(event => event.conversationId?.startsWith("sub:"))).toBe(false);
+      expect(await provider.getSession(`sub:${session.id}:watch1`)).toBeNull();
+      await neverBackground(provider, events, session.id);
+      stop();
+      await provider.dispose();
+    });
   });
 
   test("a prompt the CLI reports queued behind its follow-up keeps the session until it runs", async () => {
@@ -1484,7 +2270,7 @@ describe("ClaudeProvider sessions", () => {
         session: {}, subscription_type: "max", rate_limits_available: true,
         rate_limits: {
           ...(reads > 1 ? { five_hour: { utilization: 37, resets_at: "2026-09-02T14:00:00.000Z" } } : {}),
-          extra_usage: { is_enabled: true, monthly_limit: 100, used_credits: 12.5, utilization: 12.5, currency: "USD" },
+          extra_usage: { is_enabled: true, monthly_limit: 10_000, used_credits: 1_250, utilization: 12.5, currency: "USD" },
         },
       };
     };
@@ -1609,11 +2395,21 @@ describe("ClaudeProvider sessions", () => {
     first.push({ type: "rate_limit_event", uuid: "rl1", session_id: session.id, rate_limit_info: { status: "rejected", rateLimitType: "five_hour" } });
     first.push({ type: "result", subtype: "error_during_execution", uuid: "res1", timestamp: "2026-09-02T10:00:05.000Z", session_id: session.id, is_error: true, errors: ["rate limited"] });
     await waitFor(() => first.returned);
-    // The window reset; the next process's first "allowed" clears the badge.
     await provider.prompt(session.id, { id: "r2", text: "again", delivery: "queue" });
     const second = queries[1]!;
+    // The onset survived the query boundary: the second process's standing
+    // is the first's, not a fresh one dated to the resume.
+    const onset = events.flatMap(event => event.updates)
+      .find(update => update.kind === "upsert" && update.item.id === "notice:rate-limit") as { item: { createdAt: number } };
+    second.push({ type: "rate_limit_event", uuid: "rl1b", session_id: session.id, rate_limit_info: { status: "rejected", rateLimitType: "five_hour" } });
+    await waitFor(() => events.filter(event => event.updates.some(update => update.kind === "upsert" && update.item.id === "notice:rate-limit")).length > 1);
+    const resumed = events.flatMap(event => event.updates)
+      .filter(update => update.kind === "upsert" && update.item.id === "notice:rate-limit")
+      .at(-1) as { item: { createdAt: number } };
+    expect(resumed.item.createdAt).toBe(onset.item.createdAt);
+    // The window reset; the next "allowed" retires the standing.
     second.push({ type: "rate_limit_event", uuid: "rl2", session_id: session.id, rate_limit_info: { status: "allowed" } });
-    await waitFor(() => events.some(event => event.updates.some(update => update.kind === "upsert" && (update.item as { code?: string }).code === "rate-limit-cleared")));
+    await waitFor(() => events.some(event => event.updates.some(update => update.kind === "remove" && update.itemId === "notice:rate-limit")));
     stop();
     await provider.dispose();
   });
@@ -1713,6 +2509,7 @@ describe("ClaudeProvider sessions", () => {
   test("the agent declares background tasks and asks the CLI for a per-task stop affordance", async () => {
     const { provider, queries } = fixture();
     expect(provider.describe().capabilities).toContain("background-tasks");
+    expect(provider.describe().capabilities).toContain("scheduled-wakeups");
     const session = await provider.createSession("x");
     await provider.prompt(session.id, { id: "r1", text: "go", delivery: "queue" });
     expect(queries[0]!.input.options.perTaskStopAffordance).toBe(true);
@@ -1774,8 +2571,9 @@ describe("ClaudeProvider sessions", () => {
     const query = queries[0]!;
 
     const suggestions = [
-      { type: "addRules", behavior: "allow", destination: "session", rules: [{ toolName: "Write" }] },
+      { type: "addRules", behavior: "allow", destination: "session", rules: [{ toolName: "Write", ruleContent: "/workspace/*" }] },
       { type: "addRules", behavior: "allow", destination: "userSettings", rules: [{ toolName: "Write" }] },
+      { type: "addRules", behavior: "deny", destination: "session", rules: [{ toolName: "Bash" }] },
     ];
     let result: unknown = null;
     const decision = query.input.options.canUseTool!("Write", { file_path: "/workspace/a.txt", content: "x" }, {
@@ -1792,18 +2590,25 @@ describe("ClaudeProvider sessions", () => {
       type: "permission",
       action: "Claude wants to write a.txt",
       resources: ["/workspace/a.txt"],
+      // The card lists what "always" will install, in Claude Code's rule
+      // syntax: every session-scoped update, the deny included, apart from
+      // the resource; the settings-bound one is neither listed nor sent.
+      alwaysPatterns: ["Allow: Write(/workspace/*)", "Deny: Bash"],
       status: "pending",
     }) });
-    expect(await provider.listPermissions!()).toEqual([expect.objectContaining({ requestId: "toolu_1", conversationId: session.id })]);
+    expect(await provider.listPermissions!()).toEqual([expect.objectContaining({ requestId: "toolu_1", conversationId: session.id, alwaysPatterns: ["Allow: Write(/workspace/*)", "Deny: Bash"] })]);
 
     await provider.replyPermission(session.id, "toolu_1", "always");
     await decision;
-    // Always maps to allow + the session-scoped suggestions only (D5).
+    // Always maps to allow + the session-scoped suggestions as a set (D5):
+    // the settings-bound rule is neither listed nor forwarded, and the
+    // forwarded set is exactly as long as the list the card showed.
     expect(result).toEqual({
       behavior: "allow",
       updatedInput: { file_path: "/workspace/a.txt", content: "x" },
-      updatedPermissions: [suggestions[0]],
+      updatedPermissions: [suggestions[0], suggestions[2]],
     });
+    expect((result as { updatedPermissions: unknown[] }).updatedPermissions).toHaveLength(2);
     expect(await provider.listPermissions!()).toEqual([]);
     stop();
     await provider.dispose();
@@ -1819,6 +2624,9 @@ describe("ClaudeProvider sessions", () => {
     const first = query.input.options.canUseTool!("Bash", { command: "ls" }, { signal, toolUseID: "t1", suggestions: [{ destination: "session" }] });
     await waitFor(() => provider.liveSessionCount() === 1 && true);
     await Bun.sleep(5);
+    // Nothing session-scoped worth forwarding: the card says so with an
+    // empty list rather than leaving the question open.
+    expect(await provider.listPermissions!()).toEqual([expect.objectContaining({ requestId: "t1", alwaysPatterns: [] })]);
     await provider.replyPermission(session.id, "t1", "once");
     expect(await first).toEqual({ behavior: "allow", updatedInput: { command: "ls" } });
 
@@ -1909,8 +2717,10 @@ describe("ClaudeProvider sessions", () => {
 
   test("the live catalog replaces the manifest with real windows and effort levels", async () => {
     const { provider, queries } = fixture();
-    // Cold: the static fallback answers.
-    expect((await provider.listModels()).find(model => model.selection.modelId === "claude-opus-5")?.contextLimit).toBe(200_000);
+    // Cold: the static fallback answers (Opus 5 and Sonnet 5 run the enlarged window on their plain ids).
+    expect((await provider.listModels()).find(model => model.selection.modelId === "claude-opus-5")?.contextLimit).toBe(1_000_000);
+    expect((await provider.listModels()).find(model => model.selection.modelId === "claude-sonnet-5")?.contextLimit).toBe(1_000_000);
+    expect((await provider.listModels()).find(model => model.selection.modelId === "claude-haiku-4-5-20251001")?.contextLimit).toBe(200_000);
 
     const session = await provider.createSession("x");
     const catalog = [
@@ -3238,7 +4048,7 @@ describe("/usage normalization", () => {
         { display_name: "", utilization: 1, resets_at: null },
         { utilization: 2 },
       ],
-      extra_usage: { is_enabled: true, monthly_limit: 100, used_credits: 12.5, utilization: 12.5, currency: "USD" },
+      extra_usage: { is_enabled: true, monthly_limit: 10_000, used_credits: 1_250, utilization: 12.5, currency: "USD" },
     },
     behaviors: { day: { request_count: 1 }, week: { request_count: 2 } },
   };
@@ -3278,10 +4088,32 @@ describe("/usage normalization", () => {
     expect(normalizePlanUtilization("usage")).toBeUndefined();
   });
 
+  test("extra-usage credits arrive in minor units and read in major ones; a null utilization is derived from the amounts", () => {
+    // A Pro login with 85 € of credit and nothing spent: the wire says 8500
+    // and 0, and no utilization (issue #347's companion report).
+    const plan = normalizePlanUtilization({
+      session: {}, subscription_type: "pro", rate_limits_available: true,
+      rate_limits: { five_hour: { utilization: 30, resets_at: null }, extra_usage: { is_enabled: true, monthly_limit: 8_500, used_credits: 0, utilization: null, currency: "EUR" } },
+    });
+    expect(plan!.extraUsage).toEqual({ enabled: true, usedCredits: 0, monthlyLimit: 85, utilization: 0, currency: "EUR" });
+    // Partly spent, no utilization on the wire: derived from the amounts.
+    expect(normalizePlanUtilization({
+      rate_limits_available: true, rate_limits: { extra_usage: { is_enabled: true, monthly_limit: 8_500, used_credits: 2_125, utilization: null } },
+    })!.extraUsage).toEqual({ enabled: true, usedCredits: 21.25, monthlyLimit: 85, utilization: 25 });
+    // The wire's own utilization stands when it states one; a zero limit
+    // (unlimited or unknown) derives nothing.
+    expect(normalizePlanUtilization({
+      rate_limits_available: true, rate_limits: { extra_usage: { is_enabled: true, monthly_limit: 8_500, used_credits: 2_125, utilization: 26 } },
+    })!.extraUsage!.utilization).toBe(26);
+    expect(normalizePlanUtilization({
+      rate_limits_available: true, rate_limits: { extra_usage: { is_enabled: true, monthly_limit: 0, used_credits: 500, utilization: null } },
+    })!.extraUsage).toEqual({ enabled: true, usedCredits: 5, monthlyLimit: 0 });
+  });
+
   test("extra usage alone is a plan: the credit row survives without any time window", () => {
     const plan = normalizePlanUtilization({
       session: {}, subscription_type: "max", rate_limits_available: true,
-      rate_limits: { extra_usage: { is_enabled: true, monthly_limit: 100, used_credits: 12.5, utilization: 12.5, currency: "USD" } },
+      rate_limits: { extra_usage: { is_enabled: true, monthly_limit: 10_000, used_credits: 1_250, utilization: 12.5, currency: "USD" } },
     });
     expect(plan).toEqual({ subscription: "max", extraUsage: { enabled: true, usedCredits: 12.5, monthlyLimit: 100, utilization: 12.5, currency: "USD" } });
   });
@@ -3294,11 +4126,2383 @@ describe("/usage normalization", () => {
         seven_day: { utilization: "half", resets_at: 1_788_400_000 },
         seven_day_opus: "lots",
         model_scoped: "Fable",
-        extra_usage: { is_enabled: "yes", monthly_limit: 100 },
+        extra_usage: { is_enabled: "yes", monthly_limit: 10_000 },
       },
     });
     expect(plan).toEqual({ sevenDay: { resetsAt: 1_788_400_000_000 } });
     expect(normalizeSessionTotals({ session: { total_cost_usd: "free" } })).toBeUndefined();
     expect(normalizeSessionTotals({ session: { total_cost_usd: 0.5, total_duration_ms: "long", model_usage: null } })).toEqual({ costUsd: 0.5, apiDurationMs: 0, durationMs: 0, linesAdded: 0, linesRemoved: 0, models: [] });
+  });
+});
+
+test("the Claude agent declares plan usage as askable", async () => {
+  const { provider } = fixture();
+  try {
+    expect(provider.describe().capabilities).toContain("usage");
+  } finally { await provider.dispose(); }
+});
+
+describe("plan usage on demand", () => {
+  const plan = { subscription_type: "pro", rate_limits_available: true, rate_limits: { five_hour: { utilization: 9, resets_at: 1_800_000_000 }, seven_day: { utilization: 25, resets_at: 1_800_400_000 } } };
+  const context = { categories: [{ name: "Messages", tokens: 3_000, color: "x" }], totalTokens: 3_000, maxTokens: 200_000 };
+  const userRow = (id: string, text: string, cwd: string) => JSON.stringify({ type: "user", uuid: id, parentUuid: null, isSidechain: false, cwd, timestamp: "2026-09-01T12:00:00Z", message: { role: "user", content: text } }) + "\n";
+  const usageOptions: unknown[] = [];
+  const answer = (query: FakeQuery) => {
+    query.getContextUsage = async () => context;
+    query.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET = async (options?: unknown) => { usageOptions.push(options); return plan; };
+  };
+
+  test("a turn-end read becomes the workspace's last-known report and survives a restart", async () => {
+    const { provider, queries, configDir, workspace } = fixture(answer);
+    const { events, stop } = collect(provider);
+    expect(await provider.usageReport()).toBeUndefined();
+    const session = await provider.createSession("x");
+    await provider.prompt(session.id, { id: "r1", text: "first", delivery: "queue" });
+    queries[0]!.push({ type: "result", subtype: "success", uuid: "r-1", timestamp: "2026-08-30T10:00:02.000Z", session_id: session.id, is_error: false });
+    await waitFor(() => events.some(event => event.eventType === "context.reported"));
+    const report = await provider.usageReport();
+    expect(report).toEqual(expect.objectContaining({ plan: expect.objectContaining({ subscription: "pro", fiveHour: expect.objectContaining({ utilization: 9 }) }), conversationId: session.id }));
+    // The behaviors scan is never asked for: the block is not carried.
+    expect(usageOptions).toEqual([{ skipBehaviors: true }]);
+    stop();
+    await provider.dispose();
+    // A restarted workspace answers from the durable file before any session starts.
+    const restarted = new ClaudeProvider({ workspacePath: workspace, stateFile: path.join(workspace, ".uatu-test-state.json"), executable: "/usr/local/bin/claude", configDir, catalogProbe: false, queryFactory: input => new FakeQuery(input) });
+    expect(await restarted.usageReport()).toEqual(report);
+    await restarted.dispose();
+    // A durable file from before the field loads as it did.
+    writeFileSync(path.join(workspace, ".uatu-test-state.json"), JSON.stringify({ configurations: {} }));
+    const older = new ClaudeProvider({ workspacePath: workspace, stateFile: path.join(workspace, ".uatu-test-state.json"), executable: "/usr/local/bin/claude", configDir, catalogProbe: false, queryFactory: input => new FakeQuery(input) });
+    expect(await older.usageReport()).toBeUndefined();
+    await older.dispose();
+  });
+
+  test("a live-only read answers from a running turn without touching it", async () => {
+    const { provider, queries } = fixture(answer);
+    const { events, stop } = collect(provider);
+    expect(await provider.readUsage("live-only")).toEqual({ report: null, reason: "no-live-session" });
+    const session = await provider.createSession("x");
+    await provider.prompt(session.id, { id: "r1", text: "first", delivery: "queue" });
+    const query = queries[0]!;
+    const result = await provider.readUsage("live-only");
+    expect(result.report).toEqual(expect.objectContaining({ plan: expect.objectContaining({ subscription: "pro" }), conversationId: session.id }));
+    const reported = events.filter(event => event.eventType === "context.reported");
+    expect(reported).toHaveLength(1);
+    expect((reported[0]!.updates[0] as { item: { type: string; plan?: unknown; total: number } }).item).toEqual(expect.objectContaining({ type: "context_report", total: 3_000, plan: expect.objectContaining({ subscription: "pro" }) }));
+    // The turn is still running: not retired, and its own probe still follows its result.
+    expect(query.returned).toBe(false);
+    query.push({ type: "result", subtype: "success", uuid: "r-1", timestamp: "2026-08-30T10:00:02.000Z", session_id: session.id, is_error: false });
+    await waitFor(() => events.filter(event => event.eventType === "context.reported").length === 2);
+    await waitFor(() => query.returned);
+    stop();
+    await provider.dispose();
+  });
+
+  test("a start read resumes the idle conversation, reads, and retires it; a racing prompt keeps it", async () => {
+    let release: ((value: unknown) => void) | undefined;
+    const { provider, queries, configDir, workspace } = fixture(query => {
+      query.getContextUsage = async () => context;
+      query.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET = () => new Promise(resolve => { release = () => resolve(plan); });
+    });
+    const { events, stop } = collect(provider);
+    writeFileSync(path.join(claudeProjectDir(workspace, configDir), "idle-session.jsonl"), userRow("u1", "earlier", workspace));
+    const pending = provider.readUsage("start");
+    await waitFor(() => queries.length === 1 && release !== undefined);
+    expect(queries[0]!.input.options.resume).toBe("idle-session");
+    release!(plan);
+    const result = await pending;
+    expect(result.report).toEqual(expect.objectContaining({ conversationId: "idle-session" }));
+    expect(events.filter(event => event.conversationId === "idle-session" && event.eventType === "context.reported")).toHaveLength(1);
+    expect(events.some(event => event.updates.some(update => update.kind === "upsert" && update.item.type === "user_message"))).toBe(false);
+    await waitFor(() => queries[0]!.returned);
+    // A prompt that lands while the read is out joins the live session and keeps it.
+    release = undefined;
+    const second = provider.readUsage("start");
+    await waitFor(() => queries.length === 2 && release !== undefined);
+    await provider.prompt("idle-session", { id: "r2", text: "now", delivery: "queue" });
+    expect(queries).toHaveLength(2);
+    release!(plan);
+    await second;
+    expect(queries[1]!.returned).toBe(false);
+    stop();
+    await provider.dispose();
+  });
+
+  test("a turn that ends under an explicit read defers retirement until the read answers", async () => {
+    let release: ((value: unknown) => void) | undefined;
+    const { provider, queries } = fixture(query => {
+      query.getContextUsage = async () => context;
+      query.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET = () => new Promise(resolve => { release = () => resolve(plan); });
+    });
+    const { events, stop } = collect(provider);
+    const session = await provider.createSession("x");
+    await provider.prompt(session.id, { id: "r1", text: "first", delivery: "queue" });
+    const query = queries[0]!;
+    const pending = provider.readUsage("live-only");
+    await waitFor(() => release !== undefined);
+    // The turn ends while the read is out: its own probe runs (and hangs on
+    // the same fake read), the status completes, and the session stays.
+    const releaseRead = release!;
+    release = undefined;
+    query.push({ type: "result", subtype: "success", uuid: "r-1", timestamp: "2026-08-30T10:00:02.000Z", session_id: session.id, is_error: false });
+    await waitFor(() => events.some(event => event.updates.some(update => update.kind === "status" && update.status === "completed")));
+    await waitFor(() => release !== undefined);
+    await Bun.sleep(10);
+    expect(query.returned).toBe(false);
+    releaseRead(plan);
+    const result = await pending;
+    expect(result.report).toEqual(expect.objectContaining({ conversationId: session.id }));
+    release!(plan);
+    await waitFor(() => query.returned);
+    stop();
+    await provider.dispose();
+  });
+
+  test("a read on a session another operation started leaves that session to the operation", async () => {
+    const { provider, queries, configDir, workspace } = fixture(answer);
+    writeFileSync(path.join(claudeProjectDir(workspace, configDir), "idle-session.jsonl"), userRow("u1", "earlier", workspace));
+    // Another control operation has the session up (a rewind, say) with no turn on it.
+    await (provider as unknown as { ensureLive(id: string): Promise<unknown> }).ensureLive("idle-session");
+    expect(queries).toHaveLength(1);
+    const result = await provider.readUsage("live-only");
+    expect(result.report).toEqual(expect.objectContaining({ conversationId: "idle-session" }));
+    await Bun.sleep(10);
+    expect(queries[0]!.returned).toBe(false);
+    await provider.dispose();
+    expect(queries[0]!.returned).toBe(true);
+  });
+
+  test("a usage answer a newer one has overtaken is dropped rather than folded as a reset", async () => {
+    const resolvers: Array<(value: unknown) => void> = [];
+    const { provider, queries } = fixture(query => {
+      query.getContextUsage = async () => context;
+      query.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET = () => new Promise(resolve => { resolvers.push(resolve); });
+    });
+    const { events, stop } = collect(provider);
+    const costed = (cost: number) => ({ ...plan, session: { total_cost_usd: cost, model_usage: {} } });
+    const session = await provider.createSession("x");
+    await provider.prompt(session.id, { id: "r1", text: "first", delivery: "queue" });
+    const explicit = provider.readUsage("live-only");
+    await waitFor(() => resolvers.length === 1);
+    // The turn ends under the explicit read: its probe asks the same query.
+    queries[0]!.push({ type: "result", subtype: "success", uuid: "r-1", timestamp: "2026-08-30T10:00:02.000Z", session_id: session.id, is_error: false });
+    await waitFor(() => resolvers.length === 2);
+    // The newer answer lands first, the older (lower) one after.
+    resolvers[1]!(costed(2));
+    await waitFor(() => events.some(event => event.eventType === "context.reported"));
+    resolvers[0]!(costed(1));
+    const result = await explicit;
+    expect(result.report).not.toBeNull();
+    expect(events.filter(event => event.eventType === "context.reported")).toHaveLength(1);
+    await waitFor(() => queries[0]!.returned);
+    // The next query's tally adds to what was truly spent: 2, not 2 folded twice.
+    const next = provider.readUsage("start");
+    await waitFor(() => resolvers.length === 3);
+    resolvers[2]!(costed(0.5));
+    await next;
+    const reports = events.filter(event => event.eventType === "context.reported");
+    expect(reports).toHaveLength(2);
+    expect((reports[1]!.updates[0] as { item: { session?: { costUsd: number } } }).item.session?.costUsd).toBe(2.5);
+    stop();
+    await provider.dispose();
+  });
+
+  test("a workspace without a conversation reads through a hidden probe that never lists", async () => {
+    const { provider, queries, configDir, workspace } = fixture(answer);
+    expect(await provider.listSessions()).toEqual([]);
+    const result = await provider.readUsage("start");
+    expect(result.report).toEqual(expect.objectContaining({ plan: expect.objectContaining({ subscription: "pro" }) }));
+    expect(result.report?.conversationId).toBeUndefined();
+    expect(queries).toHaveLength(1);
+    const probeId = queries[0]!.input.options.sessionId!;
+    expect(probeId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(queries[0]!.input.options.resume).toBeUndefined();
+    expect(queries[0]!.returned).toBe(true);
+    // Even a transcript the CLI writes for the probe stays out of the inventory, across a restart.
+    writeFileSync(path.join(claudeProjectDir(workspace, configDir), `${probeId}.jsonl`), userRow("p1", "probe", workspace));
+    expect(await provider.listSessions()).toEqual([]);
+    await provider.dispose();
+    const stored = JSON.parse(readFileSync(path.join(workspace, ".uatu-test-state.json"), "utf8")) as { hiddenNative: string[] };
+    expect(stored.hiddenNative).toContain(probeId);
+    const restarted = new ClaudeProvider({ workspacePath: workspace, stateFile: path.join(workspace, ".uatu-test-state.json"), executable: "/usr/local/bin/claude", configDir, catalogProbe: false, queryFactory: input => new FakeQuery(input) });
+    expect(await restarted.listSessions()).toEqual([]);
+    await restarted.dispose();
+  });
+
+  test("a read that hangs times out and one the query cannot make is unavailable; the last-known report stands", async () => {
+    const { provider, queries } = fixture(query => {
+      query.getContextUsage = async () => context;
+      query.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET = () => new Promise(() => undefined);
+    }, { usageReadTimeoutMs: 20 });
+    const session = await provider.createSession("x");
+    await provider.prompt(session.id, { id: "r1", text: "first", delivery: "queue" });
+    expect(await provider.readUsage("live-only")).toEqual({ report: null, reason: "timeout" });
+    expect(await provider.usageReport()).toBeUndefined();
+    queries[0]!.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET = undefined;
+    expect(await provider.readUsage("live-only")).toEqual({ report: null, reason: "unavailable" });
+    // Concurrent asks join one read.
+    queries[0]!.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET = async () => plan;
+    const [a, b] = await Promise.all([provider.readUsage("live-only"), provider.readUsage("live-only")]);
+    expect(a).toBe(b);
+    expect(a.report?.plan).toEqual(expect.objectContaining({ subscription: "pro" }));
+    await provider.dispose();
+  });
+});
+
+test("disposing the provider mid-probe ends the probe query instead of leaving it to its timeout", async () => {
+  const { provider, queries } = fixture(query => {
+    query.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET = () => new Promise(() => undefined);
+  }, { usageReadTimeoutMs: 200 });
+  const pending = provider.readUsage("start");
+  await waitFor(() => queries.length === 1);
+  expect(queries[0]!.returned).toBe(false);
+  await provider.dispose();
+  expect(queries[0]!.returned).toBe(true);
+  expect(await pending).toEqual({ report: null, reason: expect.stringMatching(/timeout|unavailable/) });
+});
+
+describe("scheduled wakeups hold, fire, release, and lose (claude-scheduled-wakeups)", () => {
+  const signal = new AbortController().signal;
+  const stopHook = (query: FakeQuery, input: Record<string, unknown>) =>
+    query.input.options.hooks!.Stop![0]!.hooks[0]!({ hook_event_name: "Stop", stop_hook_active: false, background_tasks: [], ...input }, undefined, { signal });
+  const promptHook = (query: FakeQuery, input: Record<string, unknown>) =>
+    query.input.options.hooks!.UserPromptSubmit![0]!.hooks[0]!({ hook_event_name: "UserPromptSubmit", ...input }, undefined, { signal });
+  const oneShot = { id: "w1", schedule: "3 20 * * *", recurring: false, prompt: "WAKEUP check the build" };
+  const recurring = { id: "c1", schedule: "*/5 * * * *", recurring: true, prompt: "CRON poll the queue" };
+  const result = (sessionId: string, uuid: string) => ({ type: "result", subtype: "success", uuid, timestamp: "2026-09-24T18:01:10.000Z", session_id: sessionId, is_error: false });
+  const statuses = (events: NormalizedProviderEvent[]) => events.flatMap(event => event.updates).filter(update => update.kind === "status").map(update => (update as { status: string }).status);
+  const rows = (events: NormalizedProviderEvent[]) => events.flatMap(event => event.updates)
+    .filter(update => update.kind === "upsert" && update.item.type === "scheduled_wakeup")
+    .map(update => (update as { item: Record<string, unknown> }).item);
+
+  // The spike's sequence for the turn that schedules: tool call, Stop (with
+  // the crons), then the result.
+  async function scheduled(crons: unknown[], options: { background?: boolean } = {}) {
+    const context = fixture();
+    const { events, stop } = collect(context.provider);
+    const session = await context.provider.createSession("x");
+    await context.provider.prompt(session.id, { id: "r1", text: "wake me in a minute", delivery: "queue" });
+    const query = context.queries[0]!;
+    query.push({ type: "system", subtype: "init", uuid: "i1", session_id: session.id, model: "claude-haiku-4-5-20251001" });
+    if (options.background) {
+      query.push({ type: "system", subtype: "background_tasks_changed", uuid: "bg1", session_id: session.id, tasks: [{ task_id: "b1", task_type: "local_bash", description: "Long job" }] });
+    }
+    await waitFor(() => events.some(event => event.eventType !== "prompt.accepted"));
+    await promptHook(query, { prompt: "wake me in a minute", prompt_id: "typed-1" });
+    // The calls that made them, as the stream carries them: a ScheduleWakeup
+    // (no id comes back) and a CronCreate (its result names the cron) — D10.
+    query.push({ type: "assistant", uuid: "sw", session_id: session.id, message: { role: "assistant", content: [
+      { type: "tool_use", id: "toolu_sw", name: "ScheduleWakeup", input: { delaySeconds: 60, prompt: oneShot.prompt } },
+      { type: "tool_use", id: "toolu_cc", name: "CronCreate", input: { cron: recurring.schedule, prompt: recurring.prompt, recurring: true } },
+    ] } });
+    query.push({ type: "user", uuid: "cc-result", session_id: session.id, message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_cc", content: "Scheduled recurring job c1." }] }, tool_use_result: { id: "c1", recurring: true, durable: false } });
+    await waitFor(() => events.some(event => event.updates.some(update => update.kind === "upsert" && update.item.id === "tool:toolu_cc" && update.item.type === "tool" && update.item.status === "completed")));
+    await stopHook(query, { session_crons: crons });
+    query.push(result(session.id, "res1"));
+    await waitFor(() => events.some(event => event.eventType === "turn.scheduled" || event.eventType === "turn.background"));
+    return { ...context, events, stop, session, query };
+  }
+
+  test("a Stop payload's crons become the session's wakeups, each a pending row", async () => {
+    const { provider, events, stop, session } = await scheduled([oneShot, recurring]);
+    expect(await provider.listScheduledWakeups()).toEqual([
+      expect.objectContaining({ conversationId: session.id, wakeupId: "w1", prompt: oneShot.prompt, recurring: false, schedule: "3 20 * * *", nextFireAt: expect.any(Number) }),
+      expect.objectContaining({ conversationId: session.id, wakeupId: "c1", recurring: true, schedule: "*/5 * * * *" }),
+    ]);
+    expect(rows(events)).toEqual([
+      expect.objectContaining({ id: "wakeup:w1", wakeupId: "w1", status: "pending", recurring: false, nextFireAt: expect.any(Number) }),
+      expect.objectContaining({ id: "wakeup:c1", wakeupId: "c1", status: "pending", recurring: true }),
+    ]);
+    // The typed prompt's own hook is not a wakeup turn.
+    expect(events.flatMap(event => event.updates).some(update => update.kind === "upsert" && update.item.type === "user_message" && "origin" in update.item)).toBe(false);
+    stop();
+    await provider.dispose();
+  });
+
+  test("a result under a pending wakeup keeps the session and reports the scheduled state", async () => {
+    const { provider, events, stop, query } = await scheduled([oneShot]);
+    await Bun.sleep(20);
+    expect(provider.liveSessionCount()).toBe(1);
+    expect(query.returned).toBe(false);
+    expect(statuses(events)).toEqual(["running", "completed", "scheduled"]);
+    stop();
+    await provider.dispose();
+  });
+
+  test("live background work outranks pending wakeups; once it clears the session stays scheduled", async () => {
+    const root = realpathSync.native(mkdtempSync(path.join(tmpdir(), "uatu-claude-wakeup-grace-")));
+    const workspace = path.join(root, "workspace");
+    mkdirSync(workspace, { recursive: true });
+    const configDir = path.join(root, "config");
+    mkdirSync(claudeProjectDir(workspace, configDir), { recursive: true });
+    const queries: FakeQuery[] = [];
+    const provider = new ClaudeProvider({
+      workspacePath: workspace, stateFile: path.join(workspace, ".uatu-test-state.json"), executable: "/usr/local/bin/claude", configDir, catalogProbe: false,
+      backgroundGraceMs: 20,
+      queryFactory: input => { const query = new FakeQuery(input); queries.push(query); return query; },
+    });
+    const { events, stop } = collect(provider);
+    const session = await provider.createSession("x");
+    await provider.prompt(session.id, { id: "r1", text: "go", delivery: "queue" });
+    const query = queries[0]!;
+    query.push({ type: "system", subtype: "background_tasks_changed", uuid: "bg1", session_id: session.id, tasks: [{ task_id: "b1", task_type: "local_bash", description: "Job" }] });
+    await waitFor(() => events.some(event => event.eventType === "background.reconciled"));
+    await stopHook(query, { session_crons: [oneShot] });
+    query.push(result(session.id, "res1"));
+    await waitFor(() => events.some(event => event.eventType === "turn.background"));
+    expect(events.some(event => event.eventType === "turn.scheduled")).toBe(false);
+    // The task settles with no follow-up: the grace window ends in the
+    // scheduled state, not idle, and the process stays up for the wakeup.
+    query.push({ type: "system", subtype: "background_tasks_changed", uuid: "bg2", session_id: session.id, tasks: [] });
+    await waitFor(() => events.some(event => event.eventType === "turn.scheduled"));
+    await Bun.sleep(20);
+    expect(statuses(events).at(-1)).toBe("scheduled");
+    expect(provider.liveSessionCount()).toBe(1);
+    expect(query.returned).toBe(false);
+    stop();
+    await provider.dispose();
+  });
+
+  test("an emptied cron set cancels the pending rows, and the session retires at the turn's end", async () => {
+    const { provider, events, stop, session, query } = await scheduled([oneShot, recurring]);
+    // The agent ends its loop in a turn the user prompted (CronDelete).
+    await provider.prompt(session.id, { id: "r2", text: "stop polling", delivery: "queue" });
+    await promptHook(query, { prompt: "stop polling", prompt_id: "typed-2" });
+    await stopHook(query, { session_crons: [] });
+    query.push(result(session.id, "res2"));
+    await waitFor(() => query.returned);
+    expect(provider.liveSessionCount()).toBe(0);
+    expect(rows(events).slice(-2)).toEqual([
+      expect.objectContaining({ id: "wakeup:w1", status: "cancelled" }),
+      expect.objectContaining({ id: "wakeup:c1", status: "cancelled" }),
+    ]);
+    expect(rows(events).slice(-2).every(row => row.nextFireAt === undefined)).toBe(true);
+    // At rest, not scheduled: the second turn ends as completed and nothing holds the process.
+    expect(statuses(events).slice(-2)).toEqual(["running", "completed"]);
+    stop();
+    await provider.dispose();
+  });
+
+  test("a fired wakeup opens its own turn, attributed to the wakeup, and a fired one-shot's row links it", async () => {
+    const { provider, events, stop, session, query } = await scheduled([oneShot]);
+    // The spike's fired sequence: lifecycle, UserPromptSubmit (no source on
+    // this CLI), init, assistant, Stop (the one-shot gone), result.
+    query.push({ type: "command_lifecycle", command_uuid: "cmd-1", state: "started", uuid: "cl1", session_id: session.id });
+    await promptHook(query, { prompt: oneShot.prompt, prompt_id: "fired-1" });
+    query.push({ type: "system", subtype: "init", uuid: "i2", session_id: session.id, model: "claude-haiku-4-5-20251001" });
+    await waitFor(() => events.some(event => event.eventType === "turn.unprompted"));
+    const opening = events.find(event => event.eventType === "wakeup.fired")!;
+    expect(opening.updates).toEqual([{ kind: "upsert", item: expect.objectContaining({ id: "message:wakeup:fired-1", type: "user_message", text: oneShot.prompt, origin: "wakeup", wakeupId: "w1" }) }]);
+    query.push({ type: "assistant", uuid: "a2", timestamp: "2026-09-24T18:03:02.000Z", session_id: session.id, message: { role: "assistant", model: "claude-haiku-4-5-20251001", content: [{ type: "text", text: "pong" }], usage: { input_tokens: 5, output_tokens: 1 } } });
+    await stopHook(query, { session_crons: [] });
+    query.push(result(session.id, "res2"));
+    await waitFor(() => query.returned);
+    expect(rows(events).at(-1)).toEqual(expect.objectContaining({ id: "wakeup:w1", status: "fired", firedTurnId: "message:wakeup:fired-1" }));
+    expect(statuses(events).slice(-3)).toEqual(["scheduled", "running", "completed"]);
+    stop();
+    await provider.dispose();
+  });
+
+  test("a recurring cron fires and stays pending; a typed prompt during the scheduled state is the user's", async () => {
+    const { provider, events, stop, session, query } = await scheduled([recurring]);
+    await promptHook(query, { prompt: recurring.prompt, prompt_id: "fired-1" });
+    query.push({ type: "system", subtype: "init", uuid: "i2", session_id: session.id, model: "claude-haiku-4-5-20251001" });
+    await stopHook(query, { session_crons: [recurring] });
+    query.push(result(session.id, "res2"));
+    await waitFor(() => events.filter(event => event.eventType === "turn.scheduled").length === 2);
+    expect(rows(events).every(row => row.status === "pending")).toBe(true);
+    // The user types the cron's very text while it is pending: an accepted
+    // prompt is outstanding, so its hook is theirs, not a wakeup.
+    await provider.prompt(session.id, { id: "r3", text: recurring.prompt, delivery: "queue" });
+    await promptHook(query, { prompt: recurring.prompt, prompt_id: "typed-3" });
+    await stopHook(query, { session_crons: [recurring] });
+    query.push(result(session.id, "res3"));
+    await waitFor(() => events.filter(event => event.eventType === "turn.scheduled").length === 3);
+    const wakeupTurns = events.flatMap(event => event.updates).filter(update => update.kind === "upsert" && update.item.type === "user_message" && (update.item as { origin?: string }).origin === "wakeup");
+    expect(wakeupTurns.map(update => (update as { item: { id: string } }).item.id)).toEqual(["message:wakeup:fired-1"]);
+    // The pending wakeup is still listed after the typed turn (spec).
+    expect(await provider.listScheduledWakeups()).toHaveLength(1);
+    stop();
+    await provider.dispose();
+  });
+
+  test("a hook source is honored when the CLI sends one", async () => {
+    const { provider, events, stop, query } = await scheduled([oneShot]);
+    await promptHook(query, { prompt: "a peer message", prompt_id: "sys-1", source: "system" });
+    await promptHook(query, { prompt: "continue the loop", prompt_id: "loop-1", source: "loop_wakeup" });
+    await waitFor(() => events.some(event => event.eventType === "wakeup.fired"));
+    const opened = events.filter(event => event.eventType === "wakeup.fired").flatMap(event => event.updates);
+    // Only the wakeup source opens a wakeup turn; a prompt matching no cron has no wakeup id.
+    expect(opened).toEqual([{ kind: "upsert", item: expect.objectContaining({ id: "message:wakeup:loop-1", origin: "wakeup" }) }]);
+    expect((opened[0] as { item: Record<string, unknown> }).item.wakeupId).toBeUndefined();
+    stop();
+    await provider.dispose();
+  });
+
+  test("release ends a scheduled session: rows cancelled, idle, and the next prompt resumes fresh", async () => {
+    const { provider, queries, events, stop, session, query } = await scheduled([oneShot, recurring]);
+    await provider.release(session.id);
+    expect(query.returned).toBe(true);
+    expect(provider.liveSessionCount()).toBe(0);
+    const released = events.find(event => event.eventType === "session.released")!;
+    expect(released.updates).toEqual([
+      { kind: "upsert", item: expect.objectContaining({ id: "wakeup:w1", status: "cancelled" }) },
+      { kind: "upsert", item: expect.objectContaining({ id: "wakeup:c1", status: "cancelled" }) },
+      { kind: "status", status: "idle" },
+    ]);
+    // The process is gone on purpose: nothing reads as lost afterwards.
+    await Bun.sleep(10);
+    expect(rows(events).some(row => row.status === "lost")).toBe(false);
+    expect(await provider.listScheduledWakeups()).toEqual([]);
+    // Releasing again is a no-op; the next prompt starts a fresh query.
+    await provider.release(session.id);
+    await provider.prompt(session.id, { id: "r2", text: "again", delivery: "queue" });
+    expect(queries).toHaveLength(2);
+    queries[1]!.push(result(session.id, "res2"));
+    await waitFor(() => queries[1]!.returned);
+    stop();
+    await provider.dispose();
+  });
+
+  test("releasing more than 256 wakeups keeps every cancellation: the oldest still blocks its rebuilt fire", async () => {
+    const many = Array.from({ length: 300 }, (_, index) => ({ id: `m${index}`, schedule: "*/5 * * * *", recurring: true, prompt: `CRON job ${index}` }));
+    const { provider, queries, events, stop, session } = await scheduled(many);
+    await provider.release(session.id);
+    // Resumed with every cron rebuilt and one more holding the session.
+    const other = { id: "o1", schedule: "*/10 * * * *", recurring: true, prompt: "OTHER check" };
+    await provider.prompt(session.id, { id: "r2", text: "again", delivery: "queue" });
+    const next = queries[1]!;
+    await promptHook(next, { prompt: "again", prompt_id: "typed-2" });
+    await stopHook(next, { session_crons: [...many, other] });
+    next.push(result(session.id, "res2"));
+    await waitFor(() => events.filter(event => event.eventType === "turn.scheduled").length === 2);
+    expect((await provider.listScheduledWakeups()).map(wakeup => wakeup.wakeupId)).toEqual(["o1"]);
+    expect(await promptHook(next, { prompt: many[0]!.prompt, prompt_id: "fired-0" })).toEqual({ decision: "block", reason: expect.any(String) });
+    stop();
+    await provider.dispose();
+  });
+
+  test("a cancel or release whose write fails leaves nothing cancelled: the wakeup stays listed and unblocked", async () => {
+    const { provider, events, stop, session, query, workspace } = await scheduled([oneShot, recurring]);
+    // The state file's temporary path is a directory: every write fails.
+    mkdirSync(path.join(workspace, ".uatu-test-state.json.tmp"));
+    await expect(provider.cancelWakeup(session.id, "c1")).rejects.toThrow();
+    await expect(provider.release(session.id)).rejects.toThrow();
+    expect(events.some(event => event.eventType === "wakeup.cancelled" || event.eventType === "session.released")).toBe(false);
+    expect((await provider.listScheduledWakeups()).map(wakeup => wakeup.wakeupId)).toEqual(["w1", "c1"]);
+    expect(query.returned).toBe(false);
+    expect(await promptHook(query, { prompt: recurring.prompt, prompt_id: "fired-1" })).toEqual({ continue: true });
+    stop();
+    await provider.dispose();
+  });
+
+  test("release is refused, and records nothing, when a turn starts while its cancellations are written", async () => {
+    const { provider, events, stop, session, query } = await scheduled([oneShot]);
+    const releasing = provider.release(session.id);
+    // The CLI starts a turn of its own (its init) while the write is in flight.
+    query.push({ type: "system", subtype: "init", uuid: "i2", session_id: session.id, model: "claude-haiku-4-5-20251001" });
+    await expect(releasing).rejects.toBeInstanceOf(ReleaseUnavailableError);
+    expect(query.returned).toBe(false);
+    expect(events.some(event => event.eventType === "session.released")).toBe(false);
+    // Nothing stays cancelled: the wakeup is still held, and its fire is not blocked.
+    expect((await provider.listScheduledWakeups()).map(wakeup => wakeup.wakeupId)).toEqual(["w1"]);
+    await stopHook(query, { session_crons: [oneShot] });
+    query.push(result(session.id, "res2"));
+    await waitFor(() => events.filter(event => event.eventType === "turn.scheduled").length === 2);
+    expect(await promptHook(query, { prompt: oneShot.prompt, prompt_id: "fired-1" })).toEqual({ continue: true });
+    stop();
+    await provider.dispose();
+  });
+
+  test("release is refused while a wakeup that passed its hook has not yet started its turn", async () => {
+    const { provider, events, stop, session, query } = await scheduled([oneShot]);
+    await promptHook(query, { prompt: oneShot.prompt, prompt_id: "fired-1" });
+    await expect(provider.release(session.id)).rejects.toBeInstanceOf(ReleaseUnavailableError);
+    // The turn runs to its Stop and the one-shot reads fired, not cancelled.
+    query.push({ type: "system", subtype: "init", uuid: "i2", session_id: session.id, model: "claude-haiku-4-5-20251001" });
+    await stopHook(query, { session_crons: [] });
+    query.push(result(session.id, "res2"));
+    await waitFor(() => query.returned);
+    expect(rows(events).at(-1)).toEqual(expect.objectContaining({ id: "wakeup:w1", status: "fired", firedTurnId: "message:wakeup:fired-1" }));
+    stop();
+    await provider.dispose();
+  });
+
+  test("of two pending one-shots sharing a prompt, the fire goes to the one due first", async () => {
+    // Created first but due later (a fixed time half a day away, so it can never
+    // share the coming minute with the every-minute one) vs. due within the minute.
+    const laterHour = (new Date().getHours() + 12) % 24;
+    const later = { id: "wa", schedule: `3 ${laterHour} * * *`, recurring: false, prompt: "WAKEUP same words" };
+    const sooner = { id: "wb", schedule: "* * * * *", recurring: false, prompt: "WAKEUP same words" };
+    const { provider, events, stop, query } = await scheduled([later, sooner]);
+    await promptHook(query, { prompt: later.prompt, prompt_id: "fired-1" });
+    await waitFor(() => events.some(event => event.eventType === "wakeup.fired"));
+    expect(events.find(event => event.eventType === "wakeup.fired")!.updates).toEqual([{ kind: "upsert", item: expect.objectContaining({ id: "message:wakeup:fired-1", wakeupId: "wb" }) }]);
+    await stopHook(query, { session_crons: [later] });
+    await waitFor(() => rows(events).some(row => row.id === "wakeup:wb" && row.status !== "pending"));
+    const reconciled = events.filter(event => event.eventType === "wakeups.reconciled").at(-1)!;
+    expect(reconciled.updates).toEqual([{ kind: "upsert", item: expect.objectContaining({ id: "wakeup:wb", status: "fired", firedTurnId: "message:wakeup:fired-1" }) }]);
+    expect((await provider.listScheduledWakeups()).map(wakeup => wakeup.wakeupId)).toEqual(["wa"]);
+    stop();
+    await provider.dispose();
+  });
+
+  test("a same-prompt fire the Stop proves went to the other one-shot moves there, header and all", async () => {
+    // Identical schedules: nothing tells them apart at fire time.
+    const first = { id: "wa", schedule: "3 20 * * *", recurring: false, prompt: "WAKEUP same words" };
+    const second = { id: "wb", schedule: "3 20 * * *", recurring: false, prompt: "WAKEUP same words" };
+    const { provider, events, stop, query } = await scheduled([first, second]);
+    await promptHook(query, { prompt: first.prompt, prompt_id: "fired-1" });
+    await waitFor(() => events.some(event => event.eventType === "wakeup.fired"));
+    expect(events.find(event => event.eventType === "wakeup.fired")!.updates).toEqual([{ kind: "upsert", item: expect.objectContaining({ wakeupId: "wa" }) }]);
+    // The CLI still lists wa: wb is the one that fired, and it was not cancelled.
+    await stopHook(query, { session_crons: [first] });
+    await waitFor(() => rows(events).some(row => row.id === "wakeup:wb" && row.status !== "pending"));
+    const reconciled = events.filter(event => event.eventType === "wakeups.reconciled").at(-1)!;
+    expect(reconciled.updates).toEqual([
+      { kind: "upsert", item: expect.objectContaining({ id: "message:wakeup:fired-1", type: "user_message", origin: "wakeup", wakeupId: "wb", text: first.prompt }) },
+      { kind: "upsert", item: expect.objectContaining({ id: "wakeup:wb", status: "fired", firedTurnId: "message:wakeup:fired-1" }) },
+    ]);
+    expect((await provider.listScheduledWakeups()).map(wakeup => wakeup.wakeupId)).toEqual(["wa"]);
+    stop();
+    await provider.dispose();
+  });
+
+  test("release is refused while a turn runs or background work would die with it", async () => {
+    const { provider, stop, session, query } = await scheduled([oneShot]);
+    await provider.prompt(session.id, { id: "r2", text: "meanwhile", delivery: "queue" });
+    await expect(provider.release(session.id)).rejects.toBeInstanceOf(ReleaseUnavailableError);
+    query.push(result(session.id, "res2"));
+    await waitFor(() => provider.liveSessionCount() === 1 && !query.returned);
+    stop();
+    await provider.dispose();
+    const busy = await scheduled([oneShot], { background: true });
+    await expect(busy.provider.release(busy.session.id)).rejects.toThrow(/background work/);
+    expect(busy.provider.liveSessionCount()).toBe(1);
+    busy.stop();
+    await busy.provider.dispose();
+  });
+
+  test("a process that exits with wakeups pending marks them lost with the notice and returns to idle", async () => {
+    const { provider, events, stop, query } = await scheduled([oneShot]);
+    await query.return();
+    await waitFor(() => events.some(event => event.eventType === "turn.background-cleared"));
+    const cleared = events.find(event => event.eventType === "turn.background-cleared")!;
+    expect(cleared.updates).toEqual([
+      { kind: "upsert", item: expect.objectContaining({ id: "wakeup:w1", status: "lost", message: expect.stringContaining("did not survive its session") }) },
+      { kind: "status", status: "idle" },
+    ]);
+    expect(await provider.listScheduledWakeups()).toEqual([]);
+    stop();
+    await provider.dispose();
+  });
+
+  test("a process that exits with a cron pending marks it paused, not lost, and a self-paced wakeup lost", async () => {
+    const { provider, events, stop, query } = await scheduled([oneShot, recurring]);
+    await query.return();
+    await waitFor(() => events.some(event => event.eventType === "turn.background-cleared"));
+    expect(events.find(event => event.eventType === "turn.background-cleared")!.updates).toEqual([
+      { kind: "upsert", item: expect.objectContaining({ id: "wakeup:w1", status: "lost", message: expect.stringContaining("did not survive its session") }) },
+      { kind: "upsert", item: expect.objectContaining({ id: "wakeup:c1", status: "paused", message: WAKEUP_PAUSED_MESSAGE }) },
+      { kind: "status", status: "idle" },
+    ]);
+    // A paused row carries no fire time: nothing fires until a session runs.
+    expect(rows(events).find(row => row.id === "wakeup:c1" && row.status === "paused")!.nextFireAt).toBeUndefined();
+    stop();
+    await provider.dispose();
+  });
+
+  test("a cron the resumed session rebuilt, with no call seen in this process, is a cron; a one-shot cron's pause says when it lapses", async () => {
+    const rebuilt = { id: "r9", schedule: "34 21 24 9 *", recurring: false, prompt: "ONCE remind me" };
+    const context = fixture();
+    const { events, stop } = collect(context.provider);
+    const session = await context.provider.createSession("x");
+    await context.provider.prompt(session.id, { id: "r1", text: "hi", delivery: "queue" });
+    const query = context.queries[0]!;
+    await promptHook(query, { prompt: "hi", prompt_id: "typed-1" });
+    await stopHook(query, { session_crons: [rebuilt] });
+    query.push(result(session.id, "res1"));
+    await waitFor(() => events.some(event => event.eventType === "turn.scheduled"));
+    await query.return();
+    await waitFor(() => events.some(event => event.eventType === "turn.background-cleared"));
+    expect(rows(events).at(-1)).toEqual(expect.objectContaining({ id: "wakeup:r9", status: "paused", message: WAKEUP_PAUSED_ONCE_MESSAGE }));
+    stop();
+    await context.provider.dispose();
+  });
+
+  test("a failed process and a workspace shutdown each mark pending wakeups lost", async () => {
+    const failed = await scheduled([oneShot, recurring]);
+    failed.query.fail(new Error("child process died"));
+    await waitFor(() => failed.events.some(event => event.eventType === "session.failed"));
+    expect(failed.events.find(event => event.eventType === "session.failed")!.updates.slice(0, 2)).toEqual([
+      { kind: "upsert", item: expect.objectContaining({ id: "wakeup:w1", status: "lost" }) },
+      { kind: "upsert", item: expect.objectContaining({ id: "wakeup:c1", status: "paused" }) },
+    ]);
+    failed.stop();
+    await failed.provider.dispose();
+
+    const shutdown = await scheduled([oneShot, recurring]);
+    await shutdown.provider.dispose();
+    await waitFor(() => shutdown.events.some(event => event.eventType === "wakeups.lost"));
+    expect(shutdown.events.find(event => event.eventType === "wakeups.lost")!.updates).toEqual([
+      { kind: "upsert", item: expect.objectContaining({ id: "wakeup:w1", status: "lost", message: expect.stringContaining("did not survive") }) },
+      { kind: "upsert", item: expect.objectContaining({ id: "wakeup:c1", status: "paused", message: WAKEUP_PAUSED_MESSAGE }) },
+      { kind: "status", status: "idle" },
+    ]);
+    expect(shutdown.query.returned).toBe(true);
+    shutdown.stop();
+  });
+
+  test("a released cron the resumed session rebuilds is blocked: no model turn, no status, no notification", async () => {
+    const { provider, queries, events, stop, session } = await scheduled([recurring]);
+    await provider.release(session.id);
+    // The next prompt resumes the session; the CLI rebuilds the cron.
+    await provider.prompt(session.id, { id: "r2", text: "something else", delivery: "queue" });
+    const resumed = queries[1]!;
+    await promptHook(resumed, { prompt: "something else", prompt_id: "typed-2" });
+    await stopHook(resumed, { session_crons: [recurring] });
+    resumed.push(result(session.id, "res2"));
+    await waitFor(() => events.filter(event => event.eventType === "result").length >= 2);
+    // A cancelled cron holds nothing: the turn ends and the session retires.
+    await waitFor(() => resumed.returned);
+    expect(events.some(event => event.eventType === "turn.scheduled" && events.indexOf(event) > events.findIndex(candidate => candidate.eventType === "session.released"))).toBe(false);
+    // The row is not reopened by the rebuilt cron.
+    expect(rows(events).at(-1)).toEqual(expect.objectContaining({ id: "wakeup:c1", status: "cancelled" }));
+    stop();
+    await provider.dispose();
+  });
+
+  test("a cancelled cron's fire is blocked at the hook and its frames are swallowed", async () => {
+    const { provider, queries, events, stop, session } = await scheduled([recurring]);
+    await provider.release(session.id);
+    await provider.prompt(session.id, { id: "r2", text: "keep going", delivery: "queue" });
+    const resumed = queries[1]!;
+    await promptHook(resumed, { prompt: "keep going", prompt_id: "typed-2" });
+    // Another wakeup keeps this session up, so the cancelled cron can fire in it.
+    const other = { id: "o1", schedule: "*/10 * * * *", recurring: true, prompt: "OTHER check" };
+    await stopHook(resumed, { session_crons: [recurring, other] });
+    resumed.push(result(session.id, "res2"));
+    await waitFor(() => events.filter(event => event.eventType === "turn.scheduled").length === 2);
+    const before = events.length;
+    // The spike's blocked fire: the hook answers block, then the CLI sends
+    // init, an informational notice, and a result — no assistant frame.
+    const answer = await promptHook(resumed, { prompt: recurring.prompt, prompt_id: "fired-9" });
+    expect(answer).toEqual({ decision: "block", reason: expect.stringContaining("no longer fires") });
+    resumed.push({ type: "system", subtype: "init", uuid: "i9", session_id: session.id, model: "claude-haiku-4-5-20251001" });
+    resumed.push({ type: "system", subtype: "informational", uuid: "n9", session_id: session.id, content: "UserPromptSubmit operation blocked by hook" });
+    resumed.push(result(session.id, "res9"));
+    // The next real turn still reads normally: the other wakeup fires.
+    await promptHook(resumed, { prompt: other.prompt, prompt_id: "fired-10" });
+    resumed.push({ type: "system", subtype: "init", uuid: "i10", session_id: session.id, model: "claude-haiku-4-5-20251001" });
+    await waitFor(() => events.some(event => event.eventType === "turn.unprompted"));
+    const after = events.slice(before);
+    // Nothing from the blocked fire: the first events are the next real
+    // turn's (its opening header, its start, its own init).
+    expect(after.map(event => event.eventType)).toEqual(["wakeup.fired", "turn.unprompted", "system"]);
+    expect(after.flatMap(event => event.updates).filter(update => update.kind === "status").map(update => (update as { status: string }).status)).toEqual(["running"]);
+    expect(after.flatMap(event => event.notificationTurns ?? []).map(turn => turn.phase)).toEqual(["started"]);
+    expect(provider.liveSessionCount()).toBe(1);
+    stop();
+    await provider.dispose();
+  });
+
+  test("the cancel survives a restart: a new provider blocks the rebuilt cron", async () => {
+    const context = fixture();
+    const { events, stop } = collect(context.provider);
+    const session = await context.provider.createSession("x");
+    await context.provider.prompt(session.id, { id: "r1", text: "poll", delivery: "queue" });
+    const query = context.queries[0]!;
+    await promptHook(query, { prompt: "poll", prompt_id: "typed-1" });
+    await stopHook(query, { session_crons: [recurring] });
+    query.push(result(session.id, "res1"));
+    await waitFor(() => events.some(event => event.eventType === "turn.scheduled"));
+    await context.provider.release(session.id);
+    stop();
+    await context.provider.dispose();
+    // Same workspace, same state file, a fresh process.
+    const queries: FakeQuery[] = [];
+    const restarted = new ClaudeProvider({
+      workspacePath: context.workspace, stateFile: path.join(context.workspace, ".uatu-test-state.json"), executable: "/usr/local/bin/claude", configDir: context.configDir, catalogProbe: false,
+      queryFactory: input => { const next = new FakeQuery(input); queries.push(next); return next; },
+    });
+    await restarted.prompt(session.id, { id: "r2", text: "hello again", delivery: "queue" });
+    await promptHook(queries[0]!, { prompt: "hello again", prompt_id: "typed-2" });
+    queries[0]!.push(result(session.id, "res2"));
+    await waitFor(() => queries[0]!.returned);
+    // Resumed again with the cancelled cron rebuilt and another one holding
+    // the session: the cancelled one is not listed, and its fire is refused.
+    const other = { id: "o1", schedule: "*/10 * * * *", recurring: true, prompt: "OTHER check" };
+    const after = collect(restarted);
+    await restarted.prompt(session.id, { id: "r3", text: "and again", delivery: "queue" });
+    await promptHook(queries[1]!, { prompt: "and again", prompt_id: "typed-3" });
+    await stopHook(queries[1]!, { session_crons: [recurring, other] });
+    queries[1]!.push(result(session.id, "res3"));
+    await waitFor(() => after.events.some(event => event.eventType === "turn.scheduled"));
+    expect((await restarted.listScheduledWakeups()).map(wakeup => wakeup.wakeupId)).toEqual(["o1"]);
+    expect(await promptHook(queries[1]!, { prompt: recurring.prompt, prompt_id: "fired-1" })).toEqual({ decision: "block", reason: expect.any(String) });
+    expect(await promptHook(queries[1]!, { prompt: other.prompt, prompt_id: "fired-2" })).toEqual({ continue: true });
+    after.stop();
+    await restarted.dispose();
+  });
+
+  test("cancelling one of two live wakeups keeps the session scheduled for the other; the last one retires it", async () => {
+    const { provider, events, stop, session, query } = await scheduled([oneShot, recurring]);
+    await provider.cancelWakeup(session.id, "c1");
+    await waitFor(() => events.some(event => event.eventType === "wakeup.cancelled"));
+    expect(rows(events).at(-1)).toEqual(expect.objectContaining({ id: "wakeup:c1", status: "cancelled" }));
+    expect((await provider.listScheduledWakeups()).map(wakeup => wakeup.wakeupId)).toEqual(["w1"]);
+    expect(query.returned).toBe(false);
+    expect(statuses(events).at(-1)).toBe("scheduled");
+    // The CLI still lists c1 at the next Stop; it holds nothing.
+    await provider.prompt(session.id, { id: "r2", text: "anything", delivery: "queue" });
+    await promptHook(query, { prompt: "anything", prompt_id: "typed-2" });
+    await stopHook(query, { session_crons: [oneShot, recurring] });
+    query.push(result(session.id, "res2"));
+    await waitFor(() => events.filter(event => event.eventType === "turn.scheduled").length === 2);
+    expect((await provider.listScheduledWakeups()).map(wakeup => wakeup.wakeupId)).toEqual(["w1"]);
+    await provider.cancelWakeup(session.id, "w1");
+    await waitFor(() => query.returned);
+    expect(statuses(events).at(-1)).toBe("idle");
+    await expect(provider.cancelWakeup(session.id, "nope")).rejects.toBeInstanceOf(ScheduledWakeupUnavailableError);
+    stop();
+    await provider.dispose();
+  });
+
+  describe("paused crons of a conversation with no live session (D11)", () => {
+    function transcriptProvider(name: keyof typeof spikeRevival.sessions, at: (records: Array<Record<string, unknown>>) => number) {
+      const root = realpathSync.native(mkdtempSync(path.join(tmpdir(), "uatu-claude-paused-")));
+      const workspace = path.join(root, "workspace");
+      mkdirSync(workspace, { recursive: true });
+      const configDir = path.join(root, "config");
+      mkdirSync(claudeProjectDir(workspace, configDir), { recursive: true });
+      const records = spikeRevival.sessions[name].map(record => ({ ...record, cwd: workspace })) as Array<Record<string, unknown>>;
+      writeFileSync(path.join(claudeProjectDir(workspace, configDir), "resumable.jsonl"), records.map(record => JSON.stringify(record)).join("\n") + "\n");
+      const created = Date.parse(String(records.find(record => (record.toolUseResult as { id?: unknown } | undefined)?.id)!.timestamp));
+      const queries: FakeQuery[] = [];
+      const provider = new ClaudeProvider({
+        workspacePath: workspace, stateFile: path.join(workspace, ".uatu-test-state.json"), executable: "/usr/local/bin/claude", configDir, catalogProbe: false,
+        now: () => at(records) || created + 60_000,
+        queryFactory: input => { const next = new FakeQuery(input); queries.push(next); return next; },
+      });
+      return { provider, queries, workspace, configDir };
+    }
+
+    test("a reopened conversation lists its surviving cron as paused; cancelling it needs no session and sticks", async () => {
+      const { provider, queries } = transcriptProvider("delete", () => 0);
+      const { events, stop } = collect(provider);
+      const paused = await provider.listPausedWakeups("resumable");
+      expect(paused).toEqual([expect.objectContaining({ type: "scheduled_wakeup", status: "paused", prompt: "KEEP reply with exactly the word keep", recurring: true, message: WAKEUP_PAUSED_MESSAGE })]);
+      expect(paused[0]!.nextFireAt).toBeUndefined();
+      await provider.cancelWakeup("resumable", paused[0]!.wakeupId);
+      expect(queries).toHaveLength(0);
+      await waitFor(() => events.some(event => event.eventType === "wakeup.cancelled"));
+      expect(events.find(event => event.eventType === "wakeup.cancelled")!.updates).toEqual([{ kind: "upsert", item: expect.objectContaining({ id: paused[0]!.id, status: "cancelled" }) }]);
+      expect(await provider.listPausedWakeups("resumable")).toEqual([]);
+      await expect(provider.cancelWakeup("resumable", paused[0]!.wakeupId)).rejects.toBeInstanceOf(ScheduledWakeupUnavailableError);
+      stop();
+      await provider.dispose();
+    });
+
+    test("a resumed session attributes a rebuilt cron's fire before any Stop, and the first Stop settles the rest", async () => {
+      const { provider, queries } = transcriptProvider("block", () => 0);
+      const { events, stop } = collect(provider);
+      const [paused] = await provider.listPausedWakeups("resumable");
+      await provider.prompt("resumable", { id: "r1", text: "back again", delivery: "queue" });
+      const query = queries[0]!;
+      expect(query.input.options.resume).toBe("resumable");
+      await promptHook(query, { prompt: "back again", prompt_id: "typed-1" });
+      query.push(result("resumable", "res1"));
+      // The rebuilt cron fires within the minute, before any Stop listed it.
+      await waitFor(() => query.returned || events.some(event => event.eventType === "result"));
+      await Bun.sleep(5);
+      // The session retired (no Stop reported crons); resume and let it fire.
+      await provider.prompt("resumable", { id: "r2", text: "once more", delivery: "queue" });
+      const next = queries.at(-1)!;
+      await Bun.sleep(5);
+      await promptHook(next, { prompt: "once more", prompt_id: "typed-2" });
+      await stopHook(next, { session_crons: [{ id: paused!.wakeupId, schedule: "* * * * *", recurring: true, prompt: paused!.prompt }] });
+      next.push(result("resumable", "res2"));
+      await waitFor(() => events.some(event => event.eventType === "turn.scheduled"));
+      await promptHook(next, { prompt: paused!.prompt, prompt_id: "fired-1" });
+      await waitFor(() => events.some(event => event.eventType === "wakeup.fired"));
+      expect(events.find(event => event.eventType === "wakeup.fired")!.updates).toEqual([{ kind: "upsert", item: expect.objectContaining({ origin: "wakeup", wakeupId: paused!.wakeupId }) }]);
+      stop();
+      await provider.dispose();
+    });
+
+    test("a rebuilt one-shot the CLI did not restore reads as lost at the first Stop", async () => {
+      const { provider, queries } = transcriptProvider("missed", () => 0);
+      const { events, stop } = collect(provider);
+      // Read before the fire time: the transcript says it would come back.
+      const [paused] = await provider.listPausedWakeups("resumable");
+      expect(paused).toEqual(expect.objectContaining({ status: "paused", recurring: false, message: WAKEUP_PAUSED_ONCE_MESSAGE }));
+      await provider.prompt("resumable", { id: "r1", text: "hello", delivery: "queue" });
+      const query = queries[0]!;
+      await waitFor(() => query.input.options.resume === "resumable");
+      await Bun.sleep(20);
+      await promptHook(query, { prompt: "hello", prompt_id: "typed-1" });
+      await stopHook(query, { session_crons: [] });
+      query.push(result("resumable", "res1"));
+      await waitFor(() => events.some(event => event.eventType === "wakeups.reconciled"));
+      expect(rows(events).at(-1)).toEqual(expect.objectContaining({ id: paused!.id, status: "lost", message: expect.stringContaining("did not restore") }));
+      stop();
+      await provider.dispose();
+    });
+  });
+
+  test("the hooks wait for the resumed session's transcript read: a first Stop before it still settles an unrestored cron", async () => {
+    const root = realpathSync.native(mkdtempSync(path.join(tmpdir(), "uatu-claude-prime-race-")));
+    const workspace = path.join(root, "workspace");
+    mkdirSync(workspace, { recursive: true });
+    const configDir = path.join(root, "config");
+    mkdirSync(claudeProjectDir(workspace, configDir), { recursive: true });
+    const records = spikeRevival.sessions.missed.map(record => ({ ...record, cwd: workspace })) as Array<Record<string, unknown>>;
+    writeFileSync(path.join(claudeProjectDir(workspace, configDir), "resumable.jsonl"), records.map(record => JSON.stringify(record)).join("\n") + "\n");
+    const created = Date.parse(String(records.find(record => (record.toolUseResult as { id?: unknown } | undefined)?.id)!.timestamp));
+    const queries: FakeQuery[] = [];
+    const provider = new ClaudeProvider({
+      workspacePath: workspace, stateFile: path.join(workspace, ".uatu-test-state.json"), executable: "/usr/local/bin/claude", configDir, catalogProbe: false,
+      now: () => created + 60_000,
+      queryFactory: input => { const next = new FakeQuery(input); queries.push(next); return next; },
+    });
+    const { events, stop } = collect(provider);
+    const [paused] = await provider.listPausedWakeups("resumable");
+    expect(paused).toBeDefined();
+    await provider.prompt("resumable", { id: "r1", text: "hello", delivery: "queue" });
+    const query = queries[0]!;
+    // No pause for the read: the CLI's hooks arrive at once.
+    await Promise.all([
+      promptHook(query, { prompt: "hello", prompt_id: "typed-1" }),
+      stopHook(query, { session_crons: [] }),
+    ]);
+    query.push(result("resumable", "res1"));
+    await waitFor(() => events.some(event => event.eventType === "wakeups.reconciled"));
+    expect(rows(events).at(-1)).toEqual(expect.objectContaining({ id: paused!.id, status: "lost" }));
+    stop();
+    await provider.dispose();
+  });
+
+  test("a clipped cron prompt still matches the whole prompt it fires", () => {
+    expect(wakeupPromptMatches("same", "same")).toBe(true);
+    expect(wakeupPromptMatches("check the build and… [+120 chars]", "check the build and then the deploy")).toBe(true);
+    expect(wakeupPromptMatches("check the build", "check the build twice")).toBe(false);
+    expect(wakeupPromptMatches("… [+5 chars]", "anything")).toBe(false);
+  });
+});
+
+describe("conversation window discovery", () => {
+  const model = { providerId: "anthropic", modelId: "claude-opus-5-5" };
+  const answer = { model: model.modelId, maxTokens: 1_000_000, rawMaxTokens: 1_000_000, totalTokens: 999 };
+
+  for (const previous of [undefined, "default", model.modelId]) {
+    for (const failure of ["model-rejected", "attachment-missing"] as const) {
+      test(`model staging rollback restores the ${previous ?? "unpinned"} window (${failure})`, async () => {
+        const stagedModel = "claude-haiku-4-5-20251001";
+        const stagedRead = Promise.withResolvers<unknown>();
+        let actualModel: string | undefined;
+        let originalSummaries = 0;
+        const switches: Array<string | undefined> = [];
+        const { provider, queries, workspace } = fixture(query => {
+          actualModel = query.input.options.model;
+          query.setModel = async selected => {
+            switches.push(selected);
+            if (selected === stagedModel && failure === "model-rejected") throw new Error("model unavailable");
+            actualModel = selected;
+          };
+          query.getContextUsage = options => {
+            if (actualModel === stagedModel) return stagedRead.promise;
+            if (options?.detail === "summary") originalSummaries += 1;
+            return Promise.resolve(answer);
+          };
+        }, { defaultReadWaitMs: 1, windowReadTimeoutMs: 60_000, windowRetryDelaysMs: [] });
+        const { events, stop } = collect(provider);
+        try {
+          const session = await provider.createSession("x", previous ? { model: { providerId: "anthropic", modelId: previous } } : {});
+          await provider.prompt(session.id, { id: "r1", text: "start background work", delivery: "queue" });
+          const query = queries[0]!;
+          query.push({ type: "system", subtype: "background_tasks_changed", uuid: "bg", session_id: session.id, tasks: [{ task_id: "b1", task_type: "local_bash", description: "Long job" }] });
+          query.push({ type: "result", subtype: "success", uuid: "done", session_id: session.id, is_error: false });
+          await waitFor(() => events.some(event => event.eventType === "context.reported"));
+          const before = await provider.getConversationConfiguration(session.id);
+          await expect(provider.prompt(session.id, {
+            id: "refused", text: "stage another model", delivery: "queue", model: { providerId: "anthropic", modelId: stagedModel },
+            ...(failure === "attachment-missing" ? { attachments: [{ id: "gone", name: "gone.png", mimeType: "image/png", absolutePath: path.join(workspace, "gone.png") }] } : {}),
+          })).rejects.toThrow(failure === "model-rejected" ? "model unavailable" : "ENOENT");
+          expect(await provider.getConversationConfiguration(session.id)).toEqual(before);
+          expect(switches).toEqual([stagedModel, previous === "default" ? undefined : previous]);
+          await provider.prompt(session.id, { id: "r2", text: "continue without choosing a model", delivery: "queue" });
+          query.push({ type: "assistant", uuid: "after-rollback", session_id: session.id, message: { role: "assistant", model: model.modelId, content: [], usage: { input_tokens: 250_000 } } });
+          await waitFor(() => events.some(event => event.updates.some(update => update.kind === "upsert" && update.item.id === "usage:after-rollback")));
+          // A late answer from the abandoned selection cannot overwrite the
+          // restored model's denominator, even though the query survived.
+          stagedRead.resolve({ ...answer, model: stagedModel, maxTokens: 200_000 });
+          expect(contextReadout((await provider.listMessages(session.id, { limit: 1 })).items, [], undefined)).toMatchObject({ used: 250_000, limit: 1_000_000, window: { freshness: "current" } });
+          expect(originalSummaries).toBe(2);
+          expect(events.some(event => event.updates.some(update => update.kind === "upsert" && update.item.type === "context_window" && update.item.limit === 200_000))).toBe(false);
+          expect(events.some(event => event.updates.some(update => update.kind === "upsert" && update.item.id === "message:refused"))).toBe(false);
+          expect(queries).toHaveLength(1);
+        } finally { stop(); await provider.dispose(); }
+      });
+    }
+  }
+
+  test("the session states its window before prompt delivery and snapshot recovery keeps live occupancy", async () => {
+    const held = Promise.withResolvers<unknown>();
+    const { provider, queries } = fixture(query => { query.getContextUsage = () => held.promise; });
+    const { events, stop } = collect(provider);
+    try {
+      const session = await provider.createSession("x", { model });
+      const prompt = provider.prompt(session.id, { id: "r", text: "hello", delivery: "queue" });
+      await waitFor(() => queries.length === 1);
+      const query = queries[0]!;
+      let delivered = false;
+      const sent = query.input.prompt[Symbol.asyncIterator]().next().then(() => { delivered = true; });
+      expect(delivered).toBe(false);
+      held.resolve(answer);
+      await prompt;
+      await sent;
+      await waitFor(() => events.some(event => event.eventType === "context.window"));
+      expect(events.flatMap(event => event.updates).some(update => update.kind === "upsert" && update.item.type === "context_report")).toBe(false);
+      query.push({ type: "assistant", uuid: "live-usage", session_id: session.id, message: { role: "assistant", model: model.modelId, content: [{ type: "text", text: "working" }], usage: { input_tokens: 10, cache_read_input_tokens: 249_990 } } });
+      await waitFor(() => events.some(event => event.updates.some(update => update.kind === "upsert" && update.item.id === "usage:live-usage")));
+      const page = await provider.listMessages(session.id, { limit: 1 });
+      const readout = contextReadout(page.items, [], undefined);
+      expect(readout).toMatchObject({ used: 250_000, limit: 1_000_000, fraction: 0.25 });
+      expect(page.items.filter(item => item.type === "context_window")).toHaveLength(1);
+      expect(page.nextCursor).toBeUndefined();
+      expect(provider.windowDiagnostics()).toContainEqual(expect.objectContaining({ selected: model.modelId, resolved: model.modelId, outcome: "confirmed" }));
+    } finally { stop(); await provider.dispose(); }
+  });
+
+  test("a slow answer does not hold delivery or cancellation and corrects the running turn", async () => {
+    const held = Promise.withResolvers<unknown>();
+    const { provider, queries } = fixture(query => { query.getContextUsage = () => held.promise; }, { defaultReadWaitMs: 1, windowReadTimeoutMs: 500 });
+    const { events, stop } = collect(provider);
+    try {
+      const session = await provider.createSession("x", { model });
+      await provider.prompt(session.id, { id: "r", text: "hello", delivery: "queue" });
+      expect((await queries[0]!.input.prompt[Symbol.asyncIterator]().next()).done).toBe(false);
+      held.resolve(answer);
+      await waitFor(() => events.some(event => event.eventType === "context.window"));
+      expect(events.some(event => event.eventType === "result")).toBe(false);
+      await provider.interrupt(session.id);
+      expect(queries[0]!.interrupts).toBe(1);
+    } finally { stop(); await provider.dispose(); }
+  });
+
+  test("cancellation during startup prevents a delayed prompt from being delivered", async () => {
+    const held = Promise.withResolvers<unknown>();
+    const { provider, queries } = fixture(query => { query.getContextUsage = () => held.promise; });
+    const { events, stop } = collect(provider);
+    try {
+      const session = await provider.createSession("x", { model });
+      const prompt = provider.prompt(session.id, { id: "r", text: "hello", delivery: "queue" });
+      await waitFor(() => events.some(event => event.eventType === "prompt.accepted"));
+      await provider.interrupt(session.id);
+      held.resolve(answer);
+      await prompt;
+      expect((await queries[0]!.input.prompt[Symbol.asyncIterator]().next()).done).toBe(true);
+    } finally { stop(); await provider.dispose(); }
+  });
+
+  test("a cancellation does not swallow a subsequent accepted prompt", async () => {
+    const { provider, queries } = fixture();
+    try {
+      const session = await provider.createSession("x", { model });
+      await provider.prompt(session.id, { id: "r1", text: "first", delivery: "queue" });
+      await provider.interrupt(session.id);
+      await provider.prompt(session.id, { id: "r2", text: "second", delivery: "queue" });
+      const reader = queries[0]!.input.prompt[Symbol.asyncIterator]();
+      expect((await reader.next()).value.message.content).toEqual([{ type: "text", text: "first" }]);
+      let second: unknown;
+      void reader.next().then(result => { second = result.value; });
+      await waitFor(() => second !== undefined);
+      expect(second).toMatchObject({ message: { content: [{ type: "text", text: "second" }] } });
+    } finally { await provider.dispose(); }
+  });
+
+  test("a late old-model answer cannot override the new smaller window", async () => {
+    const held = Promise.withResolvers<unknown>();
+    let calls = 0;
+    const nextModel = { providerId: "anthropic", modelId: "claude-haiku-4-5-20251001" };
+    const { provider } = fixture(query => {
+      query.setModel = async () => undefined;
+      query.getContextUsage = () => ++calls === 1 ? held.promise : Promise.resolve({ ...answer, model: nextModel.modelId, maxTokens: 200_000 });
+    }, { defaultReadWaitMs: 1 });
+    const { events, stop } = collect(provider);
+    try {
+      const session = await provider.createSession("x", { model });
+      await provider.prompt(session.id, { id: "r", text: "hello", delivery: "queue" });
+      await provider.switchModel(session.id, nextModel);
+      held.resolve(answer);
+      await waitFor(() => events.some(event => event.eventType === "context.window"));
+      const windows = events.flatMap(event => event.updates).filter(update => update.kind === "upsert" && update.item.type === "context_window");
+      expect(windows).toHaveLength(1);
+      expect(windows[0]).toMatchObject({ item: { limit: 200_000, model: nextModel } });
+      expect(provider.windowDiagnostics()).toContainEqual(expect.objectContaining({ outcome: "stale" }));
+    } finally { stop(); await provider.dispose(); }
+  });
+
+  test("transient session failure retries once without losing the accepted turn", async () => {
+    let calls = 0;
+    const { provider } = fixture(query => { query.getContextUsage = async () => { if (++calls === 1) throw new Error("closed"); return answer; }; }, { windowRetryDelaysMs: [1] });
+    const { events, stop } = collect(provider);
+    try {
+      const session = await provider.createSession("x", { model });
+      await provider.prompt(session.id, { id: "r", text: "hello", delivery: "queue" });
+      await waitFor(() => events.some(event => event.eventType === "context.window"));
+      expect(calls).toBe(2);
+      const diagnostics = provider.windowDiagnostics();
+      expect(diagnostics).toContainEqual(expect.objectContaining({ outcome: "failed", phase: "session", selected: model.modelId }));
+      expect(JSON.stringify(diagnostics)).not.toContain("hello");
+    } finally { stop(); await provider.dispose(); }
+  });
+
+  for (const lateReply of [false, true]) {
+    test(`a timed-out window read releases its slot and retries (${lateReply ? "late reply" : "never settles"})`, async () => {
+      const first = Promise.withResolvers<unknown>();
+      let summaryReads = 0;
+      let fullReads = 0;
+      const { provider, queries } = fixture(query => {
+        query.getContextUsage = async options => {
+          if (options?.detail === "summary") return ++summaryReads === 1 ? first.promise : answer;
+          fullReads += 1;
+          return { ...answer, totalTokens: 250_000 };
+        };
+      }, { defaultReadWaitMs: 1, windowReadTimeoutMs: 10, windowRetryDelaysMs: [1] });
+      const { events, stop } = collect(provider);
+      try {
+        const session = await provider.createSession("x", { model });
+        await provider.prompt(session.id, { id: "r", text: "hello", delivery: "queue" });
+        await waitFor(() => events.some(event => event.eventType === "context.window"));
+        expect(summaryReads).toBe(2);
+        expect(provider.windowDiagnostics()).toContainEqual(expect.objectContaining({ outcome: "timeout", phase: "session" }));
+        if (lateReply) first.resolve({ ...answer, maxTokens: 200_000 });
+        queries[0]!.push({ type: "result", subtype: "success", uuid: "done", session_id: session.id, is_error: false });
+        await waitFor(() => events.some(event => event.eventType === "context.reported"));
+        expect(fullReads).toBe(1);
+        const windows = events.flatMap(event => event.updates).flatMap(update => update.kind === "upsert" && update.item.type === "context_window" ? [update.item.limit] : []);
+        expect(windows).toEqual([1_000_000, 1_000_000]);
+        expect(contextReadout((await provider.listMessages(session.id, { limit: 1 })).items, [], undefined)).toMatchObject({ used: 250_000, limit: 1_000_000 });
+      } finally { stop(); await provider.dispose(); }
+    });
+  }
+
+  test.each([false, true])("an account change during startup revalidates before prompt delivery (old read settles: %s)", async settleOldRead => {
+    const first = Promise.withResolvers<unknown>();
+    const order: string[] = [];
+    let reads = 0;
+    const { provider, queries } = fixture(query => {
+      query.getContextUsage = () => {
+        order.push(`read:${++reads}`);
+        return reads === 1 ? first.promise : Promise.resolve({ ...answer, maxTokens: 200_000 });
+      };
+    }, { onWindowDiagnostic: diagnostic => { if (diagnostic.outcome === "confirmed") order.push(`confirmed:${diagnostic.epoch}`); } });
+    try {
+      const session = await provider.createSession("x", { model });
+      const prompt = provider.prompt(session.id, { id: "r", text: "hello", delivery: "queue" });
+      await waitFor(() => reads === 1);
+      const sent = queries[0]!.input.prompt[Symbol.asyncIterator]().next().then(() => { order.push("delivered"); });
+      await provider.accountsChanged();
+      if (settleOldRead) first.resolve(answer);
+      await prompt;
+      await sent;
+      expect(order).toEqual(["read:1", "read:2", "confirmed:1", "delivered"]);
+      const windows = (await provider.listMessages(session.id, { limit: 1 })).items.filter(item => item.type === "context_window");
+      expect(windows).toHaveLength(1);
+      expect(windows[0]).toMatchObject({ limit: 200_000 });
+    } finally { await provider.dispose(); }
+  });
+
+  test("post-turn context reports recover after all summary attempts time out", async () => {
+    let summaries = 0;
+    let reports = 0;
+    const { provider, queries } = fixture(query => {
+      query.getContextUsage = options => {
+        if (options?.detail === "summary") { summaries += 1; return new Promise(() => undefined); }
+        reports += 1;
+        return Promise.resolve({ ...answer, totalTokens: 250_000 });
+      };
+    }, { defaultReadWaitMs: 1, windowReadTimeoutMs: 10, windowRetryDelaysMs: [1] });
+    const { events, stop } = collect(provider);
+    try {
+      const session = await provider.createSession("x", { model });
+      await provider.prompt(session.id, { id: "r", text: "hello", delivery: "queue" });
+      await waitFor(() => provider.windowDiagnostics().filter(record => record.outcome === "timeout").length === 2);
+      queries[0]!.push({ type: "result", subtype: "success", uuid: "done", session_id: session.id, is_error: false });
+      await waitFor(() => events.some(event => event.eventType === "context.reported"));
+      expect(summaries).toBe(2);
+      expect(reports).toBe(1);
+      expect(contextReadout((await provider.listMessages(session.id, { limit: 1 })).items, [], undefined)).toMatchObject({ used: 250_000, limit: 1_000_000 });
+    } finally { stop(); await provider.dispose(); }
+  });
+
+  test("a turn-end report supersedes a still-hanging startup read", async () => {
+    let reports = 0;
+    const { provider, queries } = fixture(query => {
+      query.getContextUsage = options => {
+        if (options?.detail === "summary") return new Promise(() => undefined);
+        reports += 1;
+        return Promise.resolve({ ...answer, totalTokens: 250_000 });
+      };
+    }, { defaultReadWaitMs: 1, windowReadTimeoutMs: 60_000 });
+    const { events, stop } = collect(provider);
+    try {
+      const session = await provider.createSession("x", { model });
+      await provider.prompt(session.id, { id: "r", text: "hello", delivery: "queue" });
+      queries[0]!.push({ type: "result", subtype: "success", uuid: "done", session_id: session.id, is_error: false });
+      await waitFor(() => events.some(event => event.eventType === "context.reported"));
+      expect(reports).toBe(1);
+      await waitFor(() => queries[0]!.returned);
+    } finally { stop(); await provider.dispose(); }
+  });
+
+  for (const lifetime of ["background", "scheduled"] as const) {
+    for (const failure of ["reject", "invalid", "no-limit", "timeout"] as const) {
+      test(`a failed turn-end report restores discovery for ${lifetime} work (${failure})`, async () => {
+        let summaries = 0;
+        let reports = 0;
+        const { provider, queries } = fixture(query => {
+          query.getContextUsage = options => {
+            if (options?.detail === "summary") return ++summaries === 1 ? new Promise(() => undefined) : Promise.resolve(answer);
+            reports += 1;
+            if (failure === "reject") return Promise.reject(new Error("unavailable"));
+            if (failure === "timeout") return new Promise(() => undefined);
+            return Promise.resolve(failure === "invalid" ? {} : { model: model.modelId, totalTokens: 250_000 });
+          };
+        }, { defaultReadWaitMs: 1, windowReadTimeoutMs: 60_000, contextReportTimeoutMs: 10, windowRetryDelaysMs: [1] });
+        const { events, stop } = collect(provider);
+        try {
+          const session = await provider.createSession("x", { model });
+          await provider.prompt(session.id, { id: "r1", text: "first", delivery: "queue" });
+          const query = queries[0]!;
+          query.push({ type: "assistant", uuid: "usage", session_id: session.id, message: { role: "assistant", model: model.modelId, content: [{ type: "text", text: "working" }], usage: { input_tokens: 250_000 } } });
+          if (lifetime === "background") {
+            query.push({ type: "system", subtype: "background_tasks_changed", uuid: "bg", session_id: session.id, tasks: [{ task_id: "b1", task_type: "local_bash", description: "Long job" }] });
+          } else {
+            await query.input.options.hooks!.Stop![0]!.hooks[0]!({ hook_event_name: "Stop", stop_hook_active: false, background_tasks: [], session_crons: [{ id: "w1", schedule: "*/5 * * * *", recurring: true, prompt: "Check progress" }] }, undefined, { signal: new AbortController().signal });
+          }
+          query.push({ type: "result", subtype: "success", uuid: "done", session_id: session.id, is_error: false });
+          await waitFor(() => events.some(event => event.eventType === "context.window"));
+          expect(summaries).toBe(2);
+          expect(reports).toBe(1);
+          expect(provider.liveSessionCount()).toBe(1);
+          expect(query.returned).toBe(false);
+          expect(contextReadout((await provider.listMessages(session.id, { limit: 1 })).items, [], undefined)).toMatchObject({ used: 250_000, limit: 1_000_000 });
+          await provider.prompt(session.id, { id: "r2", text: "second", delivery: "queue" });
+          expect(queries).toHaveLength(1);
+          expect(summaries).toBe(2);
+        } finally { stop(); await provider.dispose(); }
+      });
+    }
+  }
+
+  test("a failed full report restores a summary retry that was already queued", async () => {
+    let summaries = 0;
+    const { provider, queries } = fixture(query => {
+      query.getContextUsage = options => {
+        if (options?.detail === "summary" && ++summaries > 1) return Promise.resolve(answer);
+        return Promise.reject(new Error("unavailable"));
+      };
+    }, { defaultReadWaitMs: 1, windowRetryDelaysMs: [20] });
+    const { events, stop } = collect(provider);
+    try {
+      const session = await provider.createSession("x", { model });
+      await provider.prompt(session.id, { id: "r", text: "hello", delivery: "queue" });
+      const query = queries[0]!;
+      query.push({ type: "system", subtype: "background_tasks_changed", uuid: "bg", session_id: session.id, tasks: [{ task_id: "b1", task_type: "local_bash", description: "Long job" }] });
+      query.push({ type: "result", subtype: "success", uuid: "done", session_id: session.id, is_error: false });
+      await waitFor(() => events.some(event => event.eventType === "context.window"));
+      expect(summaries).toBe(2);
+      expect(query.returned).toBe(false);
+    } finally { stop(); await provider.dispose(); }
+  });
+
+  test("a failed on-demand report returns discovery to the summary retry path", async () => {
+    let summaries = 0;
+    const { provider, queries } = fixture(query => {
+      query.getContextUsage = options => {
+        if (options?.detail === "summary") return ++summaries === 1 ? new Promise(() => undefined) : Promise.resolve(answer);
+        return Promise.reject(new Error("unavailable"));
+      };
+      query.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET = async () => ({});
+    }, { defaultReadWaitMs: 1, windowReadTimeoutMs: 60_000, windowRetryDelaysMs: [1] });
+    const { events, stop } = collect(provider);
+    try {
+      const session = await provider.createSession("x", { model });
+      await provider.prompt(session.id, { id: "r", text: "hello", delivery: "queue" });
+      await provider.readUsage("live-only");
+      await waitFor(() => events.some(event => event.eventType === "context.window"));
+      expect(summaries).toBe(2);
+      expect(queries[0]!.returned).toBe(false);
+    } finally { stop(); await provider.dispose(); }
+  });
+
+  test("failed full reports do not replenish an exhausted summary retry budget", async () => {
+    let summaries = 0;
+    const { provider, queries } = fixture(query => {
+      query.getContextUsage = options => {
+        if (options?.detail === "summary" && ++summaries === 1) return new Promise(() => undefined);
+        return Promise.reject(new Error("unavailable"));
+      };
+      query.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET = async () => ({});
+    }, { defaultReadWaitMs: 1, windowReadTimeoutMs: 60_000, windowRetryDelaysMs: [0] });
+    try {
+      const session = await provider.createSession("x", { model });
+      await provider.prompt(session.id, { id: "r", text: "hello", delivery: "queue" });
+      await provider.readUsage("live-only");
+      await waitFor(() => provider.windowDiagnostics().some(record => record.outcome === "failed"));
+      expect(summaries).toBe(2);
+      await provider.readUsage("live-only");
+      // Any wrongly replenished zero-delay retry precedes this timer turn.
+      await Bun.sleep(0);
+      expect(summaries).toBe(2);
+      expect(queries[0]!.returned).toBe(false);
+    } finally { await provider.dispose(); }
+  });
+
+  test("a reply from before an account change is discarded", async () => {
+    const held = Promise.withResolvers<unknown>();
+    let reads = 0;
+    const { provider } = fixture(query => { query.getContextUsage = () => ++reads === 1 ? held.promise : Promise.resolve({ ...answer, maxTokens: 200_000 }); }, { defaultReadWaitMs: 1 });
+    const { events, stop } = collect(provider);
+    try {
+      const session = await provider.createSession("x", { model });
+      await provider.prompt(session.id, { id: "r", text: "hello", delivery: "queue" });
+      await provider.accountsChanged();
+      held.resolve(answer);
+      await waitFor(() => provider.windowDiagnostics().some(record => record.outcome === "stale"));
+      await waitFor(() => events.some(event => event.eventType === "context.window"));
+      const limits = events.flatMap(event => event.updates).flatMap(update => update.kind === "upsert" && update.item.type === "context_window" ? [update.item.limit] : []);
+      expect(limits).toEqual([200_000]);
+    } finally { stop(); await provider.dispose(); }
+  });
+
+  test("an account change after prompt delivery restarts discovery without another prompt", async () => {
+    let summaries = 0;
+    const { provider, queries } = fixture(query => {
+      query.getContextUsage = async () => ({ ...answer, maxTokens: ++summaries === 1 ? 1_000_000 : 200_000 });
+    });
+    const { events, stop } = collect(provider);
+    try {
+      const session = await provider.createSession("x", { model });
+      await provider.prompt(session.id, { id: "r", text: "hello", delivery: "queue" });
+      expect((await queries[0]!.input.prompt[Symbol.asyncIterator]().next()).done).toBe(false);
+      await provider.accountsChanged();
+      await waitFor(() => provider.windowDiagnostics().some(record => record.epoch === 1 && record.outcome === "confirmed"));
+      expect(summaries).toBe(2);
+      queries[0]!.push({ type: "assistant", uuid: "new-account", session_id: session.id, message: { role: "assistant", model: model.modelId, content: [], usage: { input_tokens: 50_000 } } });
+      await waitFor(() => events.some(event => event.updates.some(update => update.kind === "upsert" && update.item.id === "usage:new-account")));
+      expect(contextReadout((await provider.listMessages(session.id, { limit: 1 })).items, [], undefined)).toMatchObject({ used: 50_000, limit: 200_000, fraction: 0.25 });
+      expect(queries).toHaveLength(1);
+    } finally { stop(); await provider.dispose(); }
+  });
+
+  for (const selection of [undefined, "default"]) {
+    for (const revalidation of ["pending", "failed"] as const) {
+      test(`a resumed ${selection ?? "unpinned"} session reuses its window while revalidation is ${revalidation}`, async () => {
+        let starts = 0;
+        const catalog = [
+          { value: "default", resolvedModel: model.modelId, displayName: "Default" },
+          { value: "opus", resolvedModel: model.modelId, displayName: "Opus" },
+        ];
+        const { provider, queries, workspace, configDir } = fixture(query => {
+          const first = ++starts === 1;
+          query.supportedModels = async () => catalog;
+          query.getContextUsage = () => first ? Promise.resolve(answer) : revalidation === "pending" ? new Promise(() => undefined) : Promise.reject(new Error("unavailable"));
+        }, { defaultReadWaitMs: 1, windowReadTimeoutMs: 60_000, windowRetryDelaysMs: [] });
+        const { events, stop } = collect(provider);
+        try {
+          const session = await provider.createSession("x", selection ? { model: { providerId: "anthropic", modelId: selection } } : {});
+          await provider.prompt(session.id, { id: "r1", text: "first", delivery: "queue" });
+          queries[0]!.push({ type: "result", subtype: "success", uuid: "done", session_id: session.id, is_error: false });
+          await waitFor(() => queries[0]!.returned);
+          writeFileSync(path.join(claudeProjectDir(workspace, configDir), `${session.id}.jsonl`), JSON.stringify({ type: "user", uuid: "u1", parentUuid: null, isSidechain: false, cwd: workspace, timestamp: "2026-09-01T12:00:00Z", message: { role: "user", content: "first" } }) + "\n");
+          await provider.prompt(session.id, { id: "r2", text: "second", delivery: "queue" });
+          expect(queries[1]!.input.options.resume).toBe(session.id);
+          queries[1]!.push({ type: "assistant", uuid: "resumed-usage", session_id: session.id, message: { role: "assistant", model: model.modelId, content: [], usage: { input_tokens: 250_000 } } });
+          await waitFor(() => events.some(event => event.updates.some(update => update.kind === "upsert" && update.item.id === "usage:resumed-usage")));
+          expect(contextReadout((await provider.listMessages(session.id, { limit: 1 })).items, [], undefined)).toMatchObject({ used: 250_000, limit: 1_000_000, window: { source: "session", freshness: "cached" } });
+        } finally { stop(); await provider.dispose(); }
+      });
+    }
+  }
+
+  test("a cached default cannot supply another model's usage, and the new default is cached on the next resume", async () => {
+    const changed = { ...answer, model: "claude-haiku-4-5-20251001", maxTokens: 200_000, totalTokens: 50_000 };
+    const fresh = Promise.withResolvers<unknown>();
+    let starts = 0;
+    const { provider, queries } = fixture(query => {
+      const index = ++starts;
+      query.supportedModels = async () => [{ value: "default", resolvedModel: model.modelId, displayName: "Default" }, { value: "opus", resolvedModel: model.modelId, displayName: "Opus" }];
+      query.getContextUsage = () => index === 1 ? Promise.resolve(answer) : index === 2 ? fresh.promise : new Promise(() => undefined);
+    }, { defaultReadWaitMs: 1, windowReadTimeoutMs: 60_000, windowRetryDelaysMs: [] });
+    const { events, stop } = collect(provider);
+    try {
+      const session = await provider.createSession("x", { model: { providerId: "anthropic", modelId: "default" } });
+      await provider.prompt(session.id, { id: "r1", text: "first", delivery: "queue" });
+      queries[0]!.push({ type: "result", subtype: "success", uuid: "done1", session_id: session.id, is_error: false });
+      await waitFor(() => queries[0]!.returned);
+      await provider.prompt(session.id, { id: "r2", text: "second", delivery: "queue" });
+      expect((await provider.listMessages(session.id, { limit: 1 })).items).toContainEqual(expect.objectContaining({ type: "context_window", window: expect.objectContaining({ freshness: "cached" }) }));
+      const frame = (uuid: string) => ({ type: "assistant", uuid, session_id: session.id, message: { role: "assistant", model: changed.model, content: [], usage: { input_tokens: 50_000 } } });
+      queries[1]!.push(frame("changed-model"));
+      await waitFor(() => events.some(event => event.updates.some(update => update.kind === "upsert" && update.item.id === "usage:changed-model")));
+      expect(contextReadout((await provider.listMessages(session.id, { limit: 1 })).items, [], undefined)?.limit).toBeUndefined();
+      fresh.resolve(changed);
+      await waitFor(() => provider.windowDiagnostics().some(record => record.outcome === "confirmed" && record.resolved === changed.model));
+      expect(contextReadout((await provider.listMessages(session.id, { limit: 1 })).items, [], undefined)).toMatchObject({ used: 50_000, limit: 200_000 });
+      queries[1]!.push({ type: "result", subtype: "success", uuid: "done2", session_id: session.id, is_error: false });
+      await waitFor(() => queries[1]!.returned);
+      await provider.prompt(session.id, { id: "r3", text: "third", delivery: "queue" });
+      queries[2]!.push(frame("new-default"));
+      await waitFor(() => events.some(event => event.updates.some(update => update.kind === "upsert" && update.item.id === "usage:new-default")));
+      expect(contextReadout((await provider.listMessages(session.id, { limit: 1 })).items, [], undefined)).toMatchObject({ used: 50_000, limit: 200_000, window: { freshness: "cached" } });
+    } finally { stop(); await provider.dispose(); }
+  });
+
+  test("a fresh default-model answer can replace a cached resolution before usage arrives", async () => {
+    let starts = 0;
+    const changed = { ...answer, model: "claude-haiku-4-5-20251001", maxTokens: 200_000 };
+    const { provider, queries } = fixture(query => {
+      const first = ++starts === 1;
+      query.supportedModels = async () => [{ value: "default", resolvedModel: model.modelId, displayName: "Default" }, { value: "opus", resolvedModel: model.modelId, displayName: "Opus" }];
+      query.getContextUsage = async () => first ? answer : changed;
+    });
+    try {
+      const session = await provider.createSession("x", { model: { providerId: "anthropic", modelId: "default" } });
+      await provider.prompt(session.id, { id: "r1", text: "first", delivery: "queue" });
+      queries[0]!.push({ type: "result", subtype: "success", uuid: "done", session_id: session.id, is_error: false });
+      await waitFor(() => queries[0]!.returned);
+      await provider.prompt(session.id, { id: "r2", text: "second", delivery: "queue" });
+      expect(provider.windowDiagnostics()).toContainEqual(expect.objectContaining({ selected: "default", resolved: changed.model, outcome: "confirmed", limit: 200_000 }));
+    } finally { await provider.dispose(); }
+  });
+
+  test("a cached enlarged window is not reused for a newly selected plain variant", async () => {
+    let starts = 0;
+    const { provider, queries } = fixture(query => {
+      const first = ++starts === 1;
+      query.supportedModels = async () => [{ value: "opus[1m]", resolvedModel: model.modelId, displayName: "Opus 1M" }, { value: "opus", resolvedModel: model.modelId, displayName: "Opus" }];
+      query.getContextUsage = () => first ? Promise.resolve(answer) : new Promise(() => undefined);
+    }, { defaultReadWaitMs: 1, windowReadTimeoutMs: 60_000, windowRetryDelaysMs: [] });
+    const { events, stop } = collect(provider);
+    try {
+      const session = await provider.createSession("x", { model: { providerId: "anthropic", modelId: "opus[1m]" } });
+      await provider.prompt(session.id, { id: "r1", text: "first", delivery: "queue" });
+      queries[0]!.push({ type: "result", subtype: "success", uuid: "done", session_id: session.id, is_error: false });
+      await waitFor(() => queries[0]!.returned);
+      await provider.switchModel(session.id, { providerId: "anthropic", modelId: "opus" });
+      await provider.prompt(session.id, { id: "r2", text: "second", delivery: "queue" });
+      queries[1]!.push({ type: "assistant", uuid: "plain-usage", session_id: session.id, message: { role: "assistant", model: model.modelId, content: [], usage: { input_tokens: 50_000 } } });
+      await waitFor(() => events.some(event => event.updates.some(update => update.kind === "upsert" && update.item.id === "usage:plain-usage")));
+      expect(contextReadout((await provider.listMessages(session.id, { limit: 1 })).items, [], undefined)?.limit).toBeUndefined();
+      expect(events.some(event => event.eventType === "context.window.cached")).toBe(false);
+    } finally { stop(); await provider.dispose(); }
+  });
+
+  test("a known alias retargeting invalidates its old cached window", async () => {
+    let starts = 0;
+    let resolvedModel = model.modelId;
+    const { provider, queries } = fixture(query => {
+      const first = ++starts === 1;
+      query.supportedModels = async () => [{ value: "opus", resolvedModel, displayName: "Opus" }];
+      query.getContextUsage = () => first ? Promise.resolve(answer) : new Promise(() => undefined);
+    }, { defaultReadWaitMs: 1, windowReadTimeoutMs: 60_000, windowRetryDelaysMs: [] });
+    const { events, stop } = collect(provider);
+    try {
+      const session = await provider.createSession("x", { model: { providerId: "anthropic", modelId: "opus" } });
+      await provider.prompt(session.id, { id: "r1", text: "first", delivery: "queue" });
+      queries[0]!.push({ type: "result", subtype: "success", uuid: "done", session_id: session.id, is_error: false });
+      await waitFor(() => queries[0]!.returned);
+      resolvedModel = "claude-opus-6";
+      const other = await provider.createSession("other", { model: { providerId: "anthropic", modelId: "claude-haiku-4-5-20251001" } });
+      await provider.prompt(other.id, { id: "other-r", text: "refresh catalog", delivery: "queue" });
+      expect((await provider.listModels()).find(candidate => candidate.selection.modelId === "opus")?.resolvesTo?.modelId).toBe(resolvedModel);
+      await provider.prompt(session.id, { id: "r2", text: "second", delivery: "queue" });
+      expect(events.some(event => event.eventType === "context.window.cached")).toBe(false);
+    } finally { stop(); await provider.dispose(); }
+  });
+
+  for (const lifetime of ["background", "scheduled"] as const) {
+    test(`post-delivery account changes preserve retry recovery for ${lifetime} work`, async () => {
+      let summaries = 0;
+      const { provider, queries } = fixture(query => {
+        query.getContextUsage = options => {
+          if (options?.detail !== "summary") return Promise.reject(new Error("full report failed"));
+          summaries += 1;
+          return summaries === 2 ? new Promise(() => undefined) : Promise.resolve({ ...answer, maxTokens: summaries === 1 ? 1_000_000 : 200_000 });
+        };
+      }, { defaultReadWaitMs: 1, windowReadTimeoutMs: 60_000, windowRetryDelaysMs: [1] });
+      const { events, stop } = collect(provider);
+      try {
+        const session = await provider.createSession("x", { model });
+        await provider.prompt(session.id, { id: "r", text: "hello", delivery: "queue" });
+        const query = queries[0]!;
+        if (lifetime === "background") {
+          query.push({ type: "system", subtype: "background_tasks_changed", uuid: "bg", session_id: session.id, tasks: [{ task_id: "b1", task_type: "local_bash", description: "Long job" }] });
+        } else {
+          await query.input.options.hooks!.Stop![0]!.hooks[0]!({ hook_event_name: "Stop", stop_hook_active: false, background_tasks: [], session_crons: [{ id: "w1", schedule: "*/5 * * * *", recurring: true, prompt: "Check progress" }] }, undefined, { signal: new AbortController().signal });
+        }
+        await provider.accountsChanged();
+        query.push({ type: "result", subtype: "success", uuid: "done", session_id: session.id, is_error: false });
+        await waitFor(() => provider.windowDiagnostics().some(record => record.epoch === 1 && record.outcome === "confirmed"));
+        expect(summaries).toBe(3);
+        expect(query.returned).toBe(false);
+        expect(queries).toHaveLength(1);
+      } finally { stop(); await provider.dispose(); }
+    });
+  }
+
+  test("a dead query's late answer cannot overwrite its replacement", async () => {
+    const held = Promise.withResolvers<unknown>();
+    let starts = 0;
+    const { provider, queries } = fixture(query => {
+      query.getContextUsage = ++starts === 1 ? () => held.promise : async () => ({ ...answer, maxTokens: 200_000 });
+    }, { defaultReadWaitMs: 1 });
+    const { events, stop } = collect(provider);
+    try {
+      const session = await provider.createSession("x", { model });
+      await provider.prompt(session.id, { id: "r1", text: "first", delivery: "queue" });
+      queries[0]!.fail(new Error("process exited"));
+      await waitFor(() => provider.liveSessionCount() === 0);
+      await provider.prompt(session.id, { id: "r2", text: "second", delivery: "queue" });
+      held.resolve(answer);
+      await waitFor(() => provider.windowDiagnostics().some(record => record.outcome === "stale"));
+      const windows = events.flatMap(event => event.updates).filter(update => update.kind === "upsert" && update.item.type === "context_window");
+      expect(windows).toHaveLength(1);
+      expect(windows[0]).toMatchObject({ item: { limit: 200_000 } });
+    } finally { stop(); await provider.dispose(); }
+  });
+
+  test("automatic retries have a finite budget and diagnostics omit error payloads", async () => {
+    let calls = 0;
+    const { provider } = fixture(query => { query.getContextUsage = async () => { calls += 1; throw new Error("private-token"); }; }, { windowRetryDelaysMs: [0, 0] });
+    try {
+      const session = await provider.createSession("x", { model });
+      await provider.prompt(session.id, { id: "r1", text: "first", delivery: "queue" });
+      await waitFor(() => provider.windowDiagnostics().filter(record => record.outcome === "failed").length === 3);
+      await provider.prompt(session.id, { id: "r2", text: "second", delivery: "queue" });
+      expect(calls).toBe(3);
+      expect(JSON.stringify(provider.windowDiagnostics())).not.toContain("private-token");
+    } finally { await provider.dispose(); }
+  });
+
+  test("a reported compaction window and model capacity remain separate", async () => {
+    const { provider, queries } = fixture(query => {
+      query.getContextUsage = async () => ({ ...answer, maxTokens: 200_000, totalTokens: 210_000, over_limit: { kind: "compaction_window" } });
+      query.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET = async () => ({ session: { model_usage: { [model.modelId]: { contextWindow: 1_000_000 } } } });
+    });
+    const { events, stop } = collect(provider);
+    try {
+      const session = await provider.createSession("x", { model });
+      await provider.prompt(session.id, { id: "r", text: "hello", delivery: "queue" });
+      queries[0]!.push({ type: "result", subtype: "success", uuid: "done", session_id: session.id, is_error: false });
+      await waitFor(() => events.some(event => event.eventType === "context.reported"));
+      const page = await provider.listMessages(session.id, { limit: 1 });
+      const readout = contextReadout(page.items, [], undefined)!;
+      expect(readout.rows).toContainEqual(["Compaction window", 200_000]);
+      expect(readout.rows).toContainEqual(["Model capacity", 1_000_000]);
+      expect(readout.fraction).toBe(1);
+    } finally { stop(); await provider.dispose(); }
+  });
+});
+
+describe("windows and the default as Claude Code states them (claude-context-windows-from-cli)", () => {
+  for (const change of ["removed", "retargeted", "more-model-aliased"] as const) {
+    test(`obsolete window failures stop reopening catalog probes (${change})`, async () => {
+      let now = 0;
+      let changed = false;
+      let probes = 0;
+      const oldSelection = change === "more-model-aliased" ? "claude-opus-4-6" : "retired";
+      const rows = () => [
+        { value: "keep", resolvedModel: "claude-keep-1", displayName: "Keep" },
+        ...(!changed && change !== "more-model-aliased" ? [{ value: "retired", resolvedModel: "claude-retired-1", displayName: "Retired" }] : []),
+        ...(changed && change === "retargeted" ? [{ value: "retired", resolvedModel: "claude-replacement-2", displayName: "Replacement" }] : []),
+        ...(changed && change === "more-model-aliased" ? [{ value: "legacy", resolvedModel: oldSelection, displayName: "Legacy" }] : []),
+      ];
+      const { provider } = fixture(query => {
+        let selected: string | undefined;
+        query.supportedModels = async () => { probes += 1; return rows(); };
+        query.setModel = async model => { selected = model; };
+        query.getContextUsage = async () => {
+          if (!changed && selected === oldSelection) throw new Error("not available");
+          return { model: rows().find(row => row.value === selected)?.resolvedModel ?? selected ?? "claude-keep-1", maxTokens: 1_000_000 };
+        };
+      }, { catalogProbe: true, now: () => now, windowRetryDelaysMs: [60_000] });
+      try {
+        await provider.listModels();
+        await provider.windowsSettled();
+        expect(probes).toBe(1);
+        changed = true;
+        now = 60_000;
+        await provider.listModels();
+        await provider.windowsSettled();
+        expect(probes).toBe(2);
+        // Ordinary reads must not keep reopening probes for a retry key
+        // that the refreshed catalog can no longer visit.
+        for (let read = 0; read < 3; read += 1) {
+          await provider.listModels();
+          await provider.windowsSettled();
+        }
+        expect(probes).toBe(2);
+      } finally { await provider.dispose(); }
+    });
+  }
+
+  test("a late failure from a removed row cannot recreate an obsolete retry", async () => {
+    const late = Promise.withResolvers<unknown>();
+    let now = 0;
+    let changed = false;
+    let probes = 0;
+    let readingOld = false;
+    const rows = () => [{ value: "keep", resolvedModel: "claude-keep-1", displayName: "Keep" }, ...(!changed ? [{ value: "retired", resolvedModel: "claude-retired-1", displayName: "Retired" }] : [])];
+    const { provider } = fixture(query => {
+      let selected: string | undefined;
+      query.supportedModels = async () => { if (!query.input.options.sessionId && !query.input.options.resume) probes += 1; return rows(); };
+      query.setModel = async model => { selected = model; };
+      query.getContextUsage = () => {
+        if (selected === "retired") { readingOld = true; return late.promise; }
+        return Promise.resolve({ model: rows().find(row => row.value === selected)?.resolvedModel ?? selected ?? "claude-keep-1", maxTokens: 1_000_000 });
+      };
+    }, { catalogProbe: true, now: () => now, windowReadTimeoutMs: 60_000, windowRetryDelaysMs: [60_000] });
+    try {
+      await provider.listModels();
+      await waitFor(() => readingOld);
+      changed = true;
+      const session = await provider.createSession("x");
+      await provider.prompt(session.id, { id: "r", text: "refresh the catalog", delivery: "queue" });
+      expect((await provider.listModels()).some(model => model.selection.modelId === "retired")).toBe(false);
+      late.reject(new Error("old row failed after refresh"));
+      await provider.windowsSettled();
+      now = 60_000;
+      await provider.listModels();
+      await provider.windowsSettled();
+      expect(probes).toBe(1);
+    } finally { late.resolve({}); await provider.dispose(); }
+  });
+
+  test("catalog pruning preserves a More-model retry's remaining budget", async () => {
+    let now = 0;
+    let probes = 0;
+    let attempts = 0;
+    const { provider } = fixture(query => {
+      let selected: string | undefined;
+      query.supportedModels = async () => { probes += 1; return [{ value: "keep", resolvedModel: "claude-keep-1", displayName: "Keep" }]; };
+      query.setModel = async model => { selected = model; };
+      query.getContextUsage = async () => {
+        if (selected === "claude-opus-4-6") { attempts += 1; throw new Error("still unavailable"); }
+        return { model: selected === "keep" || !selected ? "claude-keep-1" : selected, maxTokens: 1_000_000 };
+      };
+    }, { catalogProbe: true, now: () => now, windowRetryDelaysMs: [60_000, 60_000] });
+    try {
+      for (const time of [0, 60_000, 120_000, 180_000, 240_000]) {
+        now = time;
+        await provider.listModels();
+        await provider.windowsSettled();
+      }
+      expect(probes).toBe(3);
+      expect(attempts).toBe(3);
+    } finally { await provider.dispose(); }
+  });
+
+  test("catalog pruning retains the unpinned retry when no default row is listed", async () => {
+    let now = 0;
+    let probes = 0;
+    let defaults = 0;
+    const { provider } = fixture(query => {
+      let selected: string | undefined;
+      query.supportedModels = async () => { probes += 1; return [{ value: "keep", resolvedModel: "claude-keep-1", displayName: "Keep" }]; };
+      query.setModel = async model => { selected = model; };
+      query.getContextUsage = async () => {
+        if (selected === undefined && ++defaults === 1) throw new Error("default read failed");
+        return { model: selected === "keep" || !selected ? "claude-keep-1" : selected, maxTokens: 1_000_000 };
+      };
+    }, { catalogProbe: true, now: () => now, windowRetryDelaysMs: [60_000] });
+    try {
+      await provider.listModels();
+      await provider.windowsSettled();
+      now = 60_000;
+      await provider.listModels();
+      await provider.windowsSettled();
+      expect(probes).toBe(2);
+      expect(defaults).toBe(2);
+      now = 120_000;
+      await provider.listModels();
+      await provider.windowsSettled();
+      expect(probes).toBe(2);
+    } finally { await provider.dispose(); }
+  });
+
+  for (const waitingBeforeReplacement of [false, true]) {
+    test(`an obsolete catalog walk cannot release its replacement (already waiting: ${waitingBeforeReplacement})`, async () => {
+      const oldRead = Promise.withResolvers<unknown>();
+      const newRead = Promise.withResolvers<unknown>();
+      const probes: FakeQuery[] = [];
+      const reading = new Set<number>();
+      const { provider } = fixture(query => {
+        let selected: string | undefined;
+        let index = 0;
+        query.supportedModels = async () => {
+          probes.push(query);
+          index = probes.length;
+          return [{ value: "opus", resolvedModel: "claude-opus-5-5", displayName: "Opus" }];
+        };
+        query.setModel = async model => { selected = model; };
+        query.getContextUsage = () => {
+          if (selected === "opus" && index <= 2) {
+            reading.add(index);
+            return index === 1 ? oldRead.promise : newRead.promise;
+          }
+          return Promise.resolve({ model: selected ?? "claude-opus-5-5", maxTokens: 1_000_000 });
+        };
+      }, { catalogProbe: true, windowReadTimeoutMs: 60_000, windowReprobeCooldownMs: 0 });
+      let settled = false;
+      let waiting: Promise<void> | undefined;
+      const wait = () => provider.windowsSettled().then(() => { settled = true; });
+      try {
+        await provider.listModels();
+        await waitFor(() => reading.has(1));
+        if (waitingBeforeReplacement) { waiting = wait(); await Bun.sleep(0); }
+        await provider.accountsChanged();
+        await provider.listModels();
+        await waitFor(() => reading.has(2));
+        oldRead.resolve({ model: "claude-opus-5-5", maxTokens: 111_000 });
+        await waitFor(() => probes[0]!.returned);
+        waiting ??= wait();
+        await Bun.sleep(0);
+        expect(settled).toBe(false);
+        await Promise.all(Array.from({ length: 4 }, () => provider.listModels()));
+        expect(probes).toHaveLength(2);
+        newRead.resolve({ model: "claude-opus-5-5", maxTokens: 500_000 });
+        await waiting;
+        expect(settled).toBe(true);
+        expect(probes[1]!.returned).toBe(true);
+        expect((await provider.listModels()).find(model => model.selection.modelId === "opus")?.contextLimit).toBe(500_000);
+      } finally {
+        oldRead.resolve({});
+        newRead.resolve({});
+        await provider.dispose();
+        await waiting;
+      }
+    });
+  }
+
+  test("a catalog walk remains owned until its query cleanup completes", async () => {
+    const close = Promise.withResolvers<void>();
+    let closing = false;
+    const { provider, queries } = fixture(query => {
+      let selected: string | undefined;
+      query.supportedModels = async () => [{ value: "opus", resolvedModel: "claude-opus-5-5", displayName: "Opus" }];
+      query.setModel = async model => { selected = model; };
+      query.getContextUsage = async () => ({ model: selected === "opus" || !selected ? "claude-opus-5-5" : selected, maxTokens: 1_000_000 });
+      const finish = query.return.bind(query);
+      query.return = async () => { closing = true; await close.promise; return finish(); };
+    }, { catalogProbe: true });
+    try {
+      await provider.listModels();
+      await waitFor(() => closing);
+      let settled = false;
+      const waiting = provider.windowsSettled().then(() => { settled = true; });
+      await Bun.sleep(0);
+      expect(settled).toBe(false);
+      close.resolve();
+      await waiting;
+      expect(queries[0]!.returned).toBe(true);
+    } finally { close.resolve(); await provider.dispose(); }
+  });
+
+  // The catalog as CLI 2.1.281 served it on 2026-10-01: no window field, the
+  // default resolving to the account default (Sonnet 5.5).
+  const currentCatalog = [
+    { value: "default", resolvedModel: "claude-sonnet-5-5", displayName: "Default (recommended)", description: "Sonnet 5.5 · Efficient for routine tasks", supportedEffortLevels: ["low", "medium", "high", "xhigh", "max"] },
+    { value: "opus", resolvedModel: "claude-opus-5-5", displayName: "Opus 5.5", description: "For complex work and everyday tasks", supportedEffortLevels: ["low", "medium", "high", "xhigh", "max"] },
+    { value: "fable[1m]", resolvedModel: "claude-fable-5-1", displayName: "Fable 5.1", description: "For your toughest challenges", supportedEffortLevels: ["low", "medium", "high", "xhigh"] },
+    { value: "sonnet", resolvedModel: "claude-sonnet-5-5", displayName: "Sonnet 5.5", description: "Most efficient for simpler tasks", supportedEffortLevels: ["low", "medium", "high", "xhigh", "max"] },
+    { value: "haiku", resolvedModel: "claude-haiku-4-5-20251001", displayName: "Haiku 4.5", description: "Fastest for quick answers" },
+  ];
+  // What the CLI states per model: the resolved id and its window.
+  const stated: Record<string, { model: string; maxTokens: number }> = {
+    opus: { model: "claude-opus-5-5", maxTokens: 1_000_000 },
+    "fable[1m]": { model: "claude-fable-5-1", maxTokens: 1_000_000 },
+    sonnet: { model: "claude-sonnet-5-5", maxTokens: 1_000_000 },
+    haiku: { model: "claude-haiku-4-5-20251001", maxTokens: 200_000 },
+    "claude-fable-5": { model: "claude-fable-5", maxTokens: 1_000_000 },
+    "claude-opus-4-8": { model: "claude-opus-4-8", maxTokens: 1_000_000 },
+    "claude-opus-4-7": { model: "claude-opus-4-7", maxTokens: 1_000_000 },
+    "claude-opus-4-6": { model: "claude-opus-4-6", maxTokens: 200_000 },
+    "claude-sonnet-4-6": { model: "claude-sonnet-4-6", maxTokens: 200_000 },
+  };
+
+  type Cli = {
+    // What an unpinned session runs in the workspace (settings applied).
+    unpinned?: { model: string; maxTokens: number };
+    // Per-model overrides: a hang, a throw, or an answer naming another model.
+    behave?: (model: string) => "hang" | "throw" | { model: string; maxTokens: number } | undefined;
+    controls?: boolean;
+    contextFails?: boolean;
+  };
+
+  function windowFixture(cli: Cli = {}, options: { windowReadTimeoutMs?: number; windowWalkBudgetMs?: number; windowReprobeCooldownMs?: number; defaultReadWaitMs?: number } = {}) {
+    const root = realpathSync.native(mkdtempSync(path.join(tmpdir(), "uatu-claude-windows-")));
+    const workspace = path.join(root, "workspace");
+    mkdirSync(workspace, { recursive: true });
+    const configDir = path.join(root, "config");
+    mkdirSync(claudeProjectDir(workspace, configDir), { recursive: true });
+    const queries: Array<FakeQuery & { modelCalls: Array<string | undefined>; contextReads: Array<string | undefined> }> = [];
+    const provider = new ClaudeProvider({
+      workspacePath: workspace,
+      stateFile: path.join(workspace, ".uatu-test-state.json"),
+      executable: "/usr/local/bin/claude",
+      configDir,
+      ...options,
+      queryFactory: input => {
+        const query = Object.assign(new FakeQuery(input), { modelCalls: [] as Array<string | undefined>, contextReads: [] as Array<string | undefined> });
+        query.supportedModels = async () => currentCatalog;
+        if (cli.controls !== false) {
+          let current: string | undefined;
+          query.setModel = async model => {
+            query.modelCalls.push(model);
+            current = model;
+          };
+          query.getContextUsage = async opts => {
+            query.contextReads.push(opts?.detail);
+            if (cli.contextFails) throw new Error("control channel closed");
+            const unpinned = cli.unpinned ?? { model: "claude-sonnet-5-5", maxTokens: 1_000_000 };
+            if (current === undefined) return { totalTokens: 14_000, ...unpinned };
+            const behaviour = cli.behave?.(current);
+            if (behaviour === "hang") return new Promise(() => undefined);
+            if (behaviour === "throw") throw new Error("unavailable");
+            const answer = behaviour ?? stated[current];
+            return answer ? { totalTokens: 14_000, ...answer, rawMaxTokens: answer.maxTokens } : { totalTokens: 14_000 };
+          };
+        }
+        queries.push(query);
+        return query;
+      },
+    });
+    return { provider, queries, workspace, configDir };
+  }
+
+  const find = (models: Awaited<ReturnType<ClaudeProvider["listModels"]>>, id: string) => models.find(model => model.selection.modelId === id)!;
+  type Served = Awaited<ReturnType<ClaudeProvider["listModels"]>>;
+  // The walk runs behind the catalog: read again until it has landed.
+  async function settled(provider: ClaudeProvider, landed: (models: Served) => boolean): Promise<Served> {
+    for (let attempt = 0; attempt < 400; attempt += 1) {
+      const models = await provider.listModels();
+      if (landed(models)) return models;
+      await Bun.sleep(5);
+    }
+    throw new Error("the window walk never landed");
+  }
+
+  test("every offered model carries the window Claude Code states, read before any turn without spending a call", async () => {
+    // This login runs Opus 4.6 at the enlarged window, which the fallback
+    // figure does not know: only a read can say so.
+    const { provider, queries } = windowFixture({ behave: model => (model === "claude-opus-4-6" ? { model: "claude-opus-4-6", maxTokens: 1_000_000 } : undefined) });
+    const models = await settled(provider, served => find(served, "claude-opus-4-6").contextLimit === 1_000_000);
+    expect(queries).toHaveLength(1);
+    const probe = queries[0]!;
+    // The probe closes once its walk is done.
+    await waitFor(() => probe.returned);
+    // The probe never prompted: no turn ran, and every read was a summary.
+    expect(probe.contextReads.every(detail => detail === "summary")).toBe(true);
+    expect(probe.contextReads.length).toBeGreaterThan(1);
+    // Sonnet 5.5 and Opus 5.5 under alias ids with no window marker: 1M,
+    // as stated — not the 200k an id heuristic would guess.
+    expect(find(models, "sonnet").contextLimit).toBe(1_000_000);
+    expect(find(models, "opus").contextLimit).toBe(1_000_000);
+    expect(find(models, "haiku").contextLimit).toBe(200_000);
+    // The app-only set is read too, and its detail states the read window.
+    expect(find(models, "claude-opus-4-7").contextLimit).toBe(1_000_000);
+    expect(find(models, "claude-opus-4-7").detail).toBe("claude-opus-4-7 · 1M context · offered by the Claude apps");
+    expect(find(models, "claude-opus-4-6").contextLimit).toBe(1_000_000);
+    expect(find(models, "claude-opus-4-6").detail).toBe("claude-opus-4-6 · 1M context · offered by the Claude apps");
+    expect(find(models, "claude-sonnet-4-6").detail).toBe("claude-sonnet-4-6 · 200k context · offered by the Claude apps");
+    // The first read named the default before any setModel.
+    expect(probe.modelCalls[0]).toBe("opus");
+    await provider.dispose();
+  });
+
+  test("a failed window read remains retryable", async () => {
+    let attempts = 0;
+    const { provider } = windowFixture({ behave: model => {
+      if (model !== "claude-opus-4-6") return undefined;
+      return ++attempts === 1 ? "throw" : { model, maxTokens: 1_000_000 };
+    } }, { windowReprobeCooldownMs: 0 });
+    try {
+      await settled(provider, models => find(models, "claude-opus-4-6").contextLimit === 1_000_000);
+      expect(attempts).toBeGreaterThan(1);
+    } finally {
+      await provider.dispose();
+    }
+  });
+
+  test("reading windows never touches a live conversation's model, and a refresh keeps what was stated", async () => {
+    const { provider, queries } = windowFixture({ unpinned: { model: "claude-fable-5-1", maxTokens: 1_000_000 } });
+    await provider.listModels();
+    const session = await provider.createSession("x");
+    await provider.prompt(session.id, { id: "r1", text: "hello", delivery: "queue" });
+    const live = queries[1]!;
+    // The live session's own catalog refresh lands (captureModels).
+    await waitFor(() => live.contextReads.length === 1 && queries.length === 2);
+    await Bun.sleep(10);
+    const models = await provider.listModels();
+    expect(live.modelCalls).toEqual([]);
+    expect(find(models, "sonnet").contextLimit).toBe(1_000_000);
+    expect(find(models, "default").resolvesTo).toEqual({ providerId: "anthropic", modelId: "fable[1m]" });
+    // Still one probe: windows were read, nothing re-probes.
+    expect(queries).toHaveLength(2);
+    await provider.dispose();
+  });
+
+  test("a live session that filled the catalog first still gets one probe for windows and the default", async () => {
+    const { provider, queries } = windowFixture();
+    const session = await provider.createSession("x");
+    await provider.prompt(session.id, { id: "r1", text: "hello", delivery: "queue" });
+    // Let the live session's catalog capture land before the first picker read.
+    await Bun.sleep(10);
+    const first = await provider.listModels();
+    expect(queries).toHaveLength(2);
+    expect(find(first, "default").resolvesTo).toEqual({ providerId: "anthropic", modelId: "sonnet" });
+    await settled(provider, served => find(served, "claude-opus-4-7").detail?.includes("1M") === true);
+    await waitFor(() => queries[1]!.returned);
+    expect(queries[0]!.modelCalls).toEqual([]);
+    await provider.listModels();
+    expect(queries).toHaveLength(2);
+    await provider.dispose();
+  });
+
+  test("settings that override the account default are what the default presents", async () => {
+    const { provider } = windowFixture({ unpinned: { model: "claude-fable-5-1", maxTokens: 1_000_000 } });
+    const entry = find(await provider.listModels(), "default");
+    expect(entry.name).toBe("Default (recommended)");
+    expect(entry.default).toBe(true);
+    expect(entry.resolvesTo).toEqual({ providerId: "anthropic", modelId: "fable[1m]" });
+    // Named as Claude Code names its default: the model first.
+    expect(entry.detail).toBe("Fable 5.1 · For your toughest challenges");
+    expect(entry.variants).toEqual(["low", "medium", "high", "xhigh"]);
+    expect(entry.contextLimit).toBe(1_000_000);
+    // Effort validation follows what the default runs: max is not Fable's here.
+    const session = await provider.createSession("x");
+    await expect(provider.switchModel(session.id, { providerId: "anthropic", modelId: "default" }, "max")).rejects.toThrow();
+    await provider.switchModel(session.id, { providerId: "anthropic", modelId: "default" }, "xhigh");
+    await provider.dispose();
+  });
+
+  test("a default the catalog already names keeps its own description, measured by its stated window", async () => {
+    const { provider } = windowFixture({ unpinned: { model: "claude-sonnet-5-5", maxTokens: 1_000_000 } });
+    const entry = find(await provider.listModels(), "default");
+    expect(entry.resolvesTo).toEqual({ providerId: "anthropic", modelId: "sonnet" });
+    expect(entry.detail).toBe("Sonnet 5.5 · Efficient for routine tasks");
+    expect(entry.contextLimit).toBe(1_000_000);
+    await provider.dispose();
+  });
+
+  test("among window variants the default resolves to the one whose window it runs", async () => {
+    const catalogWithVariants = [...currentCatalog, { value: "fable", resolvedModel: "claude-fable-5-1", displayName: "Fable 5.1", description: "Fable at the standard window" }];
+    const { provider, queries } = windowFixture({
+      unpinned: { model: "claude-fable-5-1", maxTokens: 1_000_000 },
+      behave: model => (model === "fable" ? { model: "claude-fable-5-1", maxTokens: 200_000 } : undefined),
+    });
+    void queries;
+    // Swap in the catalog with both spellings for this provider's probe.
+    const original = currentCatalog.slice();
+    currentCatalog.splice(0, currentCatalog.length, ...catalogWithVariants);
+    try {
+      const entry = find(await provider.listModels(), "default");
+      expect(entry.resolvesTo).toEqual({ providerId: "anthropic", modelId: "fable[1m]" });
+    } finally {
+      currentCatalog.splice(0, currentCatalog.length, ...original);
+      await provider.dispose();
+    }
+  });
+
+  test("a default running the standard window resolves to the standard variant even when the 1M one is listed first", async () => {
+    const original = currentCatalog.slice();
+    // fable[1m] sits before fable in the catalog; both resolve to claude-fable-5-1.
+    currentCatalog.push({ value: "fable", resolvedModel: "claude-fable-5-1", displayName: "Fable 5.1", description: "Fable at the standard window", supportedEffortLevels: ["low", "medium", "high"] } as typeof currentCatalog[number]);
+    const { provider } = windowFixture({
+      unpinned: { model: "claude-fable-5-1", maxTokens: 200_000 },
+      behave: model => (model === "fable" ? { model: "claude-fable-5-1", maxTokens: 200_000 } : undefined),
+    });
+    try {
+      const served = await settled(provider, models => find(models, "fable").contextLimit === 200_000);
+      const entry = find(served, "default");
+      expect(entry.resolvesTo).toEqual({ providerId: "anthropic", modelId: "fable" });
+      expect(entry.detail).toBe("Fable 5.1 · Fable at the standard window");
+      expect(entry.variants).toEqual(["low", "medium", "high"]);
+    } finally {
+      currentCatalog.splice(0, currentCatalog.length, ...original);
+      await provider.dispose();
+    }
+  });
+
+  test("before the walk lands the default already picks its variant by window marker", async () => {
+    for (const [runsWindow, listedFirst, expected] of [[200_000, "fable[1m]", "fable"], [1_000_000, "fable", "fable[1m]"]] as const) {
+      const original = currentCatalog.slice();
+      const plain = { value: "fable", resolvedModel: "claude-fable-5-1", displayName: "Fable 5.1", description: "Fable at the standard window", supportedEffortLevels: ["low", "medium", "high"] } as typeof currentCatalog[number];
+      if (listedFirst === "fable") currentCatalog.splice(currentCatalog.findIndex(row => row.value === "fable[1m]"), 0, plain);
+      else currentCatalog.push(plain);
+      const { provider, queries } = windowFixture({ unpinned: { model: "claude-fable-5-1", maxTokens: runsWindow } });
+      try {
+        // Hold every model switch: the first answer is served before any window is stated.
+        let release!: () => void;
+        const gate = new Promise<void>(resolve => (release = resolve));
+        const pending = provider.listModels();
+        await waitFor(() => queries.length === 1);
+        const original = queries[0]!.setModel!;
+        queries[0]!.setModel = async model => { await gate; return original(model); };
+        const first = await pending;
+        expect(find(first, "fable").contextLimit).toBe(find(first, "fable[1m]").contextLimit);
+        expect(find(first, "default").resolvesTo).toEqual({ providerId: "anthropic", modelId: expected });
+        release();
+      } finally {
+        currentCatalog.splice(0, currentCatalog.length, ...original);
+        await provider.dispose();
+      }
+    }
+  });
+
+  test("an unpinned conversation's usage is measured against the variant the default runs, live and reopened", async () => {
+    const original = currentCatalog.slice();
+    // fable[1m] first, fable second: the alias join would pick fable[1m].
+    currentCatalog.push({ value: "fable", resolvedModel: "claude-fable-5-1", displayName: "Fable 5.1", description: "Fable at the standard window" } as typeof currentCatalog[number]);
+    const { provider, queries, workspace, configDir } = windowFixture({
+      unpinned: { model: "claude-fable-5-1", maxTokens: 200_000 },
+      behave: model => (model === "fable" ? { model: "claude-fable-5-1", maxTokens: 200_000 } : undefined),
+    });
+    const { events, stop } = collect(provider);
+    try {
+      const served = await settled(provider, models => find(models, "fable").contextLimit === 200_000);
+      expect(find(served, "default").resolvesTo).toEqual({ providerId: "anthropic", modelId: "fable" });
+      const carriers = () => events.flatMap(event => event.updates)
+        .filter(update => update.kind === "upsert")
+        .map(update => (update as { item: { type: string; usage?: unknown; model?: { modelId: string } } }).item)
+        .filter(item => item.type === "assistant_message" && item.usage !== undefined);
+      // Unpinned: the default's variant.
+      const unpinned = await provider.createSession("x");
+      await provider.prompt(unpinned.id, { id: "r1", text: "hello", delivery: "queue" });
+      const live = queries.at(-1)!;
+      live.push({ type: "assistant", uuid: "a1", timestamp: "2026-10-01T10:00:00.000Z",
+        message: { role: "assistant", model: "claude-fable-5-1", content: [{ type: "text", text: "hi" }], usage: { input_tokens: 3, output_tokens: 1 } } });
+      await waitFor(() => carriers().length > 0);
+      expect(carriers().at(-1)!.model?.modelId).toBe("fable");
+      const readout = contextReadout(carriers() as never, await provider.listModels(), undefined);
+      expect(readout?.limit).toBe(200_000);
+      // Pinned to fable[1m]: the alias join, untouched.
+      const pinned = await provider.createSession("y", { model: { providerId: "anthropic", modelId: "fable[1m]" } });
+      await provider.prompt(pinned.id, { id: "r2", text: "hello", delivery: "queue" });
+      const pinnedLive = queries.at(-1)!;
+      pinnedLive.push({ type: "assistant", uuid: "a2", timestamp: "2026-10-01T10:01:00.000Z",
+        message: { role: "assistant", model: "claude-fable-5-1", content: [{ type: "text", text: "hi" }], usage: { input_tokens: 3, output_tokens: 1 } } });
+      await waitFor(() => carriers().length > 1);
+      expect(carriers().at(-1)!.model?.modelId).toBe("fable[1m]");
+      // Reopened from native storage, unpinned: the default's variant too.
+      writeFileSync(path.join(claudeProjectDir(workspace, configDir), "reopened-default.jsonl"), [
+        { type: "user", uuid: "u1", parentUuid: null, isSidechain: false, timestamp: "2026-10-01T09:00:00Z", message: { role: "user", content: "hello" } },
+        { type: "assistant", uuid: "a9", parentUuid: "u1", isSidechain: false, timestamp: "2026-10-01T09:00:01Z", message: { role: "assistant", model: "claude-fable-5-1", content: [{ type: "text", text: "hi" }], usage: { input_tokens: 5, cache_read_input_tokens: 150_000, output_tokens: 1 } } },
+      ].map(entry => JSON.stringify(entry)).join("\n") + "\n");
+      const page = await provider.listMessages("reopened-default", { limit: 10 });
+      const reopened = page.items.find(item => item.type === "assistant_message" && (item as { usage?: unknown }).usage) as { model?: { modelId: string } };
+      expect(reopened.model?.modelId).toBe("fable");
+      expect(contextReadout(page.items, await provider.listModels(), undefined)?.limit).toBe(200_000);
+    } finally {
+      stop();
+      currentCatalog.splice(0, currentCatalog.length, ...original);
+      await provider.dispose();
+    }
+  });
+
+  test("an unpinned conversation on a default no entry lists is measured against the default's stated window", async () => {
+    const { provider, queries, workspace, configDir } = windowFixture({ unpinned: { model: "claude-experimental-9", maxTokens: 400_000 } });
+    const { events, stop } = collect(provider);
+    try {
+      const models = await provider.listModels();
+      expect(find(models, "default").contextLimit).toBe(400_000);
+      const session = await provider.createSession("x");
+      await provider.prompt(session.id, { id: "r1", text: "hello", delivery: "queue" });
+      queries.at(-1)!.push({ type: "assistant", uuid: "a1", timestamp: "2026-10-01T10:00:00.000Z",
+        message: { role: "assistant", model: "claude-experimental-9", content: [{ type: "text", text: "hi" }], usage: { input_tokens: 3, cache_read_input_tokens: 100_000, output_tokens: 1 } } });
+      const carriers = () => events.flatMap(event => event.updates)
+        .filter(update => update.kind === "upsert")
+        .map(update => (update as { item: { type: string; usage?: unknown; model?: { modelId: string } } }).item)
+        .filter(item => item.type === "assistant_message" && item.usage !== undefined);
+      await waitFor(() => carriers().length > 0);
+      expect(carriers().at(-1)!.model?.modelId).toBe("default");
+      expect(contextReadout(carriers() as never, await provider.listModels(), undefined)?.limit).toBe(400_000);
+      // Reopened: the same attribution from native storage.
+      writeFileSync(path.join(claudeProjectDir(workspace, configDir), "reopened-unlisted.jsonl"), [
+        { type: "user", uuid: "u1", parentUuid: null, isSidechain: false, timestamp: "2026-10-01T09:00:00Z", message: { role: "user", content: "hello" } },
+        { type: "assistant", uuid: "a9", parentUuid: "u1", isSidechain: false, timestamp: "2026-10-01T09:00:01Z", message: { role: "assistant", model: "claude-experimental-9", content: [{ type: "text", text: "hi" }], usage: { input_tokens: 5, cache_read_input_tokens: 200_000, output_tokens: 1 } } },
+      ].map(entry => JSON.stringify(entry)).join("\n") + "\n");
+      const page = await provider.listMessages("reopened-unlisted", { limit: 10 });
+      const readout = contextReadout(page.items, await provider.listModels(), undefined);
+      expect(readout?.limit).toBe(400_000);
+      expect(readout?.fraction).toBeCloseTo(0.5, 2);
+    } finally {
+      stop();
+      await provider.dispose();
+    }
+  });
+
+  test("a reopened conversation read before the default is known is re-attributed once it is", async () => {
+    const { provider, workspace, configDir } = windowFixture({ unpinned: { model: "claude-experimental-9", maxTokens: 400_000 } });
+    try {
+      writeFileSync(path.join(claudeProjectDir(workspace, configDir), "early-reopen.jsonl"), [
+        { type: "user", uuid: "u1", parentUuid: null, isSidechain: false, timestamp: "2026-10-01T09:00:00Z", message: { role: "user", content: "hello" } },
+        { type: "assistant", uuid: "a9", parentUuid: "u1", isSidechain: false, timestamp: "2026-10-01T09:00:01Z", message: { role: "assistant", model: "claude-experimental-9", content: [{ type: "text", text: "hi" }], usage: { input_tokens: 5, output_tokens: 1 } } },
+      ].map(entry => JSON.stringify(entry)).join("\n") + "\n");
+      const carrierModel = (items: Array<{ type: string; usage?: unknown; model?: { modelId: string } }>) =>
+        items.find(item => item.type === "assistant_message" && item.usage)?.model?.modelId;
+      // A conversation started first fills the catalog (and its aliases)
+      // from its own session; the default is not known until the probe.
+      const session = await provider.createSession("x");
+      await provider.prompt(session.id, { id: "r1", text: "hello", delivery: "queue" });
+      await Bun.sleep(10);
+      expect(carrierModel((await provider.listMessages("early-reopen", { limit: 10 })).items as never)).toBe("claude-experimental-9");
+      await provider.listModels();
+      // The cached normalization is not reused across the default becoming known.
+      expect(carrierModel((await provider.listMessages("early-reopen", { limit: 10 })).items as never)).toBe("default");
+    } finally {
+      await provider.dispose();
+    }
+  });
+
+  test("a model a later refresh introduces is probed for its window, in the background and only once", async () => {
+    const original = currentCatalog.slice();
+    const { provider, queries } = windowFixture({
+      behave: model => (model === "claude-newer-7" ? { model: "claude-newer-7", maxTokens: 2_000_000 } : undefined),
+    }, { windowReprobeCooldownMs: 0 });
+    try {
+      await settled(provider, served => find(served, "claude-opus-4-7").detail?.includes("1M") === true);
+      await waitFor(() => queries[0]!.returned);
+      // Nothing new: no further probe.
+      await provider.listModels();
+      expect(queries).toHaveLength(1);
+      // A CLI update ships a model; a live session's refresh lists it.
+      currentCatalog.push({ value: "claude-newer-7", resolvedModel: "claude-newer-7", displayName: "Newer 7", description: "Newer 7 · Fresh" } as typeof currentCatalog[number]);
+      const session = await provider.createSession("x");
+      await provider.prompt(session.id, { id: "r1", text: "hello", delivery: "queue" });
+      await settled(provider, served => served.some(model => model.selection.modelId === "claude-newer-7"));
+      // The read that sees it answers at once, then a probe asks only about it.
+      const stated = await settled(provider, served => find(served, "claude-newer-7").contextLimit === 2_000_000);
+      expect(find(stated, "sonnet").contextLimit).toBe(1_000_000);
+      const reprobe = queries[2]!;
+      expect(reprobe.modelCalls).toEqual(["claude-newer-7"]);
+      expect(queries[1]!.modelCalls).toEqual([]);
+      await waitFor(() => reprobe.returned);
+      // Asked once: no probe after that.
+      await provider.listModels();
+      await Bun.sleep(10);
+      expect(queries).toHaveLength(3);
+    } finally {
+      currentCatalog.splice(0, currentCatalog.length, ...original);
+      await provider.dispose();
+    }
+  });
+
+  test("a model switch that outlasts its bound ends the walk; a later probe asks the rows it did not reach", async () => {
+    let slow = true;
+    const { provider, queries } = windowFixture({}, { windowReadTimeoutMs: 30, windowReprobeCooldownMs: 0 });
+    try {
+      const first = provider.listModels();
+      await waitFor(() => queries.length === 1);
+      const probe = queries[0]!;
+      const original = probe.setModel!;
+      // "sonnet" never finishes switching on the first probe.
+      probe.setModel = async model => { if (slow && model === "sonnet") return new Promise<void>(() => undefined); return original(model); };
+      await first;
+      await waitFor(() => probe.returned);
+      // Rows before it were read; the walk stopped at it, so a row after it was not asked.
+      expect(probe.modelCalls).not.toContain("haiku");
+      // The stalled switch never reached the recorder: the last recorded is the row before it.
+      expect(probe.modelCalls.at(-1)).toBe("fable[1m]");
+      slow = false;
+      // The next read sees unasked rows and probes again, asking only those.
+      const settledModels = await settled(provider, served => queries.length === 2 && queries[1]!.returned && find(served, "claude-opus-4-7").detail?.includes("1M") === true);
+      expect(queries[1]!.modelCalls).toContain("haiku");
+      expect(queries[1]!.modelCalls).not.toContain("opus");
+      // A timed-out switch was not a successful read: retry it as well.
+      expect(queries[1]!.modelCalls).toContain("sonnet");
+      expect(find(settledModels, "haiku").contextLimit).toBe(200_000);
+    } finally {
+      await provider.dispose();
+    }
+  });
+
+  test("a stalled default read does not hold the first catalog answer; it lands from a later read", async () => {
+    let answer!: () => void;
+    const late = new Promise<void>(resolve => (answer = resolve));
+    const { provider, queries } = windowFixture({ unpinned: { model: "claude-fable-5-1", maxTokens: 1_000_000 } }, { defaultReadWaitMs: 30 });
+    try {
+      const pending = provider.listModels();
+      await waitFor(() => queries.length === 1);
+      const probe = queries[0]!;
+      const original = probe.getContextUsage!;
+      // The unpinned read stalls until released; per-model reads are unaffected.
+      let first = true;
+      probe.getContextUsage = async opts => { if (first) { first = false; await late; } return original(opts); };
+      const started = performance.now();
+      const answered = await pending;
+      expect(performance.now() - started).toBeLessThan(1_000);
+      // The catalog's own resolution until Claude Code says otherwise.
+      expect(find(answered, "default").resolvesTo).toEqual({ providerId: "anthropic", modelId: "sonnet" });
+      // No model switch ran under the stalled unpinned read.
+      expect(probe.modelCalls).toEqual([]);
+      answer();
+      const later = await settled(provider, served => find(served, "default").resolvesTo?.modelId === "fable[1m]");
+      expect(find(later, "sonnet").contextLimit).toBe(1_000_000);
+      await waitFor(() => probe.returned);
+    } finally {
+      await provider.dispose();
+    }
+  });
+
+  test("a CLI without the window controls is not re-probed on later reads", async () => {
+    const { provider, queries } = windowFixture({ controls: false }, { windowReprobeCooldownMs: 0 });
+    try {
+      await provider.listModels();
+      await waitFor(() => queries[0]!.returned);
+      for (let read = 0; read < 3; read += 1) {
+        await provider.listModels();
+        await Bun.sleep(5);
+      }
+      expect(queries).toHaveLength(1);
+    } finally {
+      await provider.dispose();
+    }
+  });
+
+  test("probes for new models are throttled", async () => {
+    const original = currentCatalog.slice();
+    const { provider, queries } = windowFixture({}, { windowReprobeCooldownMs: 60_000 });
+    try {
+      await settled(provider, served => find(served, "claude-opus-4-7").detail?.includes("1M") === true);
+      currentCatalog.push({ value: "claude-newer-7", resolvedModel: "claude-newer-7", displayName: "Newer 7" } as typeof currentCatalog[number]);
+      const session = await provider.createSession("x");
+      await provider.prompt(session.id, { id: "r1", text: "hello", delivery: "queue" });
+      await settled(provider, served => served.some(model => model.selection.modelId === "claude-newer-7"));
+      await provider.listModels();
+      await Bun.sleep(10);
+      // Within the cooldown of the first probe: the derived figure, no probe.
+      expect(queries).toHaveLength(2);
+    } finally {
+      currentCatalog.splice(0, currentCatalog.length, ...original);
+      await provider.dispose();
+    }
+  });
+
+  test("an alias that moves to another model does not keep the old model's window", async () => {
+    const original = currentCatalog.slice();
+    const { provider } = windowFixture({ behave: model => (model === "haiku" ? { model: "claude-haiku-4-5-20251001", maxTokens: 640_000 } : undefined) });
+    try {
+      await settled(provider, served => find(served, "haiku").contextLimit === 640_000);
+      // A CLI update: "haiku" now resolves to a new generation nobody measured.
+      const index = currentCatalog.findIndex(row => row.value === "haiku");
+      currentCatalog[index] = { ...currentCatalog[index]!, resolvedModel: "claude-haiku-6", description: "Haiku 6 · Fastest" };
+      const session = await provider.createSession("x");
+      await provider.prompt(session.id, { id: "r1", text: "hello", delivery: "queue" });
+      const refreshed = await settled(provider, served => find(served, "haiku").resolvesTo?.modelId === "claude-haiku-6");
+      // The derived figure for the new model, not the 640k stated for the old one.
+      expect(find(refreshed, "haiku").contextLimit).toBeUndefined();
+    } finally {
+      currentCatalog.splice(0, currentCatalog.length, ...original);
+      await provider.dispose();
+    }
+  });
+
+  test("a default running a model no entry offers is named by its id", async () => {
+    const { provider } = windowFixture({ unpinned: { model: "claude-experimental-9", maxTokens: 400_000 } });
+    const entry = find(await provider.listModels(), "default");
+    expect(entry.resolvesTo).toEqual({ providerId: "anthropic", modelId: "claude-experimental-9" });
+    expect(entry.detail).toContain("claude-experimental-9");
+    expect(entry.contextLimit).toBe(400_000);
+    // No effort levels are known for it: none is offered, and none is accepted.
+    expect(entry.variants).toBeUndefined();
+    const session = await provider.createSession("x");
+    await expect(provider.switchModel(session.id, { providerId: "anthropic", modelId: "default" }, "high")).rejects.toThrow();
+    await provider.dispose();
+  });
+
+  test("without the controls the derived figures and the catalog's default stand", async () => {
+    const { provider, queries } = windowFixture({ controls: false });
+    const models = await provider.listModels();
+    expect(find(models, "default").resolvesTo).toEqual({ providerId: "anthropic", modelId: "sonnet" });
+    // Fallback figures (claudeContextWindow) for the current generation.
+    expect(find(models, "sonnet").contextLimit).toBe(1_000_000);
+    expect(find(models, "claude-opus-4-6").contextLimit).toBe(200_000);
+    await provider.listModels();
+    expect(queries).toHaveLength(1);
+    await provider.dispose();
+  });
+
+  test("a failed walk keeps the catalog with derived figures and is not re-probed", async () => {
+    const { provider, queries } = windowFixture({ contextFails: true });
+    const models = await provider.listModels();
+    expect(models.length).toBeGreaterThan(5);
+    expect(find(models, "default").resolvesTo).toEqual({ providerId: "anthropic", modelId: "sonnet" });
+    await provider.listModels();
+    expect(queries).toHaveLength(1);
+    await provider.dispose();
+  });
+
+  test("an answer naming another model lends no window; a stalled row does not stop the rows after it", async () => {
+    const { provider } = windowFixture({
+      behave: model => {
+        // The login cannot use Opus 4.8: setModel is ignored, the answer
+        // still names the model before it.
+        if (model === "claude-opus-4-8") return { model: "claude-fable-5", maxTokens: 777_000 };
+        if (model === "claude-fable-5") return "hang";
+        if (model === "haiku") return "throw";
+        if (model === "claude-opus-4-7") return { model: "claude-opus-4-7", maxTokens: 555_000 };
+        return undefined;
+      },
+    }, { windowReadTimeoutMs: 30, windowWalkBudgetMs: 2_000 });
+    const models = await settled(provider, served => find(served, "claude-opus-4-7").contextLimit === 555_000);
+    // Derived figures where nothing true was stated.
+    expect(find(models, "claude-opus-4-8").contextLimit).toBe(1_000_000);
+    expect(find(models, "claude-fable-5").contextLimit).toBe(1_000_000);
+    expect(find(models, "haiku").contextLimit).toBe(200_000);
+    // Rows after the stalled one were still read.
+    expect(find(models, "claude-opus-4-7").contextLimit).toBe(555_000);
+    expect(find(models, "claude-opus-4-7").detail).toContain("555k context");
+    await provider.dispose();
+  });
+
+  test("the first read answers before the walk; windows land on a later read; disposal stops the walk", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => (release = resolve));
+    const { provider, queries } = windowFixture({
+      unpinned: { model: "claude-fable-5-1", maxTokens: 1_000_000 },
+      behave: model => (model === "claude-opus-4-6" ? { model: "claude-opus-4-6", maxTokens: 333_000 } : undefined),
+    });
+    const probeSetModel = () => queries[0]!.setModel!;
+    // Hold every model switch until released, as a slow full-id switch would.
+    const first = await (async () => {
+      const pending = provider.listModels();
+      await waitFor(() => queries.length === 1);
+      const original = probeSetModel();
+      queries[0]!.setModel = async model => { await gate; return original(model); };
+      return pending;
+    })();
+    // The catalog and the default's real model answer at once; windows are
+    // still the fallback figures.
+    expect(find(first, "default").resolvesTo).toEqual({ providerId: "anthropic", modelId: "fable[1m]" });
+    expect(find(first, "claude-opus-4-6").contextLimit).toBe(200_000);
+    expect(queries[0]!.returned).toBe(false);
+    release();
+    const later = await settled(provider, served => find(served, "claude-opus-4-6").contextLimit === 333_000);
+    expect(find(later, "claude-opus-4-6").detail).toContain("333k context");
+    await waitFor(() => queries[0]!.returned);
+    await provider.dispose();
+  });
+
+  test("a stated window follows its model when a refresh offers it under another id", async () => {
+    const original = currentCatalog.slice();
+    const { provider, queries } = windowFixture({
+      behave: model => (model === "claude-opus-4-6" ? { model: "claude-opus-4-6", maxTokens: 1_000_000 } : undefined),
+    });
+    try {
+      await settled(provider, served => find(served, "claude-opus-4-6").contextLimit === 1_000_000);
+      // A CLI update: the catalog now lists Opus 4.6 under an alias, so the
+      // app-only full-id row drops out (never shadowing a catalog id).
+      currentCatalog.push({ value: "opus-legacy", resolvedModel: "claude-opus-4-6", displayName: "Opus 4.6", description: "Opus 4.6 · Previous generation" } as typeof currentCatalog[number]);
+      const session = await provider.createSession("x");
+      await provider.prompt(session.id, { id: "r1", text: "hello", delivery: "queue" });
+      const refreshed = await settled(provider, served => served.some(model => model.selection.modelId === "opus-legacy"));
+      expect(refreshed.some(model => model.selection.modelId === "claude-opus-4-6")).toBe(false);
+      // The window Claude Code stated for the model, not the 200k fallback.
+      expect(find(refreshed, "opus-legacy").contextLimit).toBe(1_000_000);
+      expect(queries[1]!.modelCalls).toEqual([]);
+    } finally {
+      currentCatalog.splice(0, currentCatalog.length, ...original);
+      await provider.dispose();
+    }
+  });
+
+  test("an id two rows resolve to at different windows lends neither", async () => {
+    const original = currentCatalog.slice();
+    currentCatalog.push({ value: "fable", resolvedModel: "claude-fable-5-1", displayName: "Fable 5.1", description: "Fable at the standard window" } as typeof currentCatalog[number]);
+    // Two rows, one resolved id, two stated windows (900k is distinct from
+    // the 1M fallback so a guess between them would show).
+    const { provider } = windowFixture({ behave: model => (model === "fable" ? { model: "claude-fable-5-1", maxTokens: 200_000 } : model === "fable[1m]" ? { model: "claude-fable-5-1", maxTokens: 900_000 } : undefined) });
+    try {
+      await settled(provider, served => find(served, "fable").contextLimit === 200_000);
+      // A refreshed row resolving to claude-fable-5-1 under a new id has two
+      // candidate windows: it keeps the derived figure rather than guess.
+      currentCatalog.push({ value: "fable-next", resolvedModel: "claude-fable-5-1", displayName: "Fable 5.1", description: "x" } as typeof currentCatalog[number]);
+      const session = await provider.createSession("x");
+      await provider.prompt(session.id, { id: "r1", text: "hello", delivery: "queue" });
+      const refreshed = await settled(provider, served => served.some(model => model.selection.modelId === "fable-next"));
+      expect(find(refreshed, "fable-next").contextLimit).toBe(1_000_000);
+      expect(find(refreshed, "fable").contextLimit).toBe(200_000);
+    } finally {
+      currentCatalog.splice(0, currentCatalog.length, ...original);
+      await provider.dispose();
+    }
+  });
+
+  test("disposal while the walk runs stops it and closes the probe", async () => {
+    const { provider, queries } = windowFixture({ behave: model => (model === "sonnet" ? "hang" : undefined) }, { windowReadTimeoutMs: 60_000 });
+    await provider.listModels();
+    await waitFor(() => queries[0]!.modelCalls.includes("sonnet"));
+    const disposing = provider.dispose();
+    // The stalled read is bounded by the probe's teardown, not by its 60 s.
+    await Promise.race([disposing, Bun.sleep(70_000).then(() => { throw new Error("disposal waited on the stalled walk"); })]);
+    expect(queries[0]!.returned).toBe(true);
+    const calls = queries[0]!.modelCalls.length;
+    await Bun.sleep(20);
+    expect(queries[0]!.modelCalls.length).toBe(calls);
+  });
+});
+
+describe("ClaudeProvider login state", () => {
+  test("reads the login on its own short-lived session, re-reads on an accounts change, and never asks a live session", async () => {
+    const root = realpathSync.native(mkdtempSync(path.join(tmpdir(), "uatu-claude-login-")));
+    const workspace = path.join(root, "workspace");
+    mkdirSync(workspace, { recursive: true });
+    const configDir = path.join(root, "config");
+    mkdirSync(claudeProjectDir(workspace, configDir), { recursive: true });
+    let info: Record<string, unknown> = { tokenSource: "none", apiProvider: "firstParty" };
+    const accountReads: FakeQuery[] = [];
+    const queries: FakeQuery[] = [];
+    const provider = new ClaudeProvider({
+      workspacePath: workspace,
+      stateFile: path.join(workspace, ".uatu-test-state.json"),
+      executable: "/usr/local/bin/claude",
+      configDir,
+      queryFactory: input => {
+        const query = new FakeQuery(input) as FakeQuery & { accountInfo?: () => Promise<unknown> };
+        query.accountInfo = async () => {
+          accountReads.push(query);
+          return info;
+        };
+        queries.push(query);
+        return query;
+      },
+    });
+    expect(provider.loginState()).toBe("unknown");
+    await waitFor(() => provider.loginState() === "missing");
+    const live = await provider.createSession("x");
+    await provider.prompt(live.id, { id: "r1", text: "go", delivery: "queue" });
+    // The live session is the one query that is neither a login read nor closed.
+    const liveQuery = queries.find(query => !accountReads.includes(query) && !query.returned);
+    expect(liveQuery).toBeDefined();
+    info = { subscriptionType: "Claude Max", apiProvider: "firstParty" };
+    await provider.accountsChanged();
+    expect(provider.loginState()).toBe("ok");
+    expect(accountReads).not.toContain(liveQuery);
+    // Every login read closed its session.
+    expect(accountReads.every(query => query.returned)).toBe(true);
+    await provider.dispose();
+  });
+
+  test("an environment key or a third-party provider counts as a usable login", async () => {
+    const { claudeLoginState, claudeAccountState } = await import("./account");
+    expect(claudeLoginState(claudeAccountState({ apiKeySource: "ANTHROPIC_API_KEY", apiProvider: "firstParty" }))).toBe("ok");
+    expect(claudeLoginState(claudeAccountState({ apiProvider: "bedrock" }))).toBe("ok");
+    expect(claudeLoginState(claudeAccountState({ tokenSource: "none", apiProvider: "firstParty" }))).toBe("missing");
+    expect(claudeLoginState(claudeAccountState({ tokenSource: "something-new", apiProvider: "firstParty" }))).toBe("unknown");
   });
 });

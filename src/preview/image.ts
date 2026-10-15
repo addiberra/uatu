@@ -13,6 +13,8 @@ import {
 import { hideViewToggle } from "./view-mode";
 import { appUrl } from "../shared/app-url";
 import { contextualAppUrl } from "../shell/watch-context";
+import { documentRevisionKey } from "../shell/document-state";
+import { withImageRevision } from "./image-revision";
 
 const previewElementMaybe = document.querySelector<HTMLElement>("#preview");
 
@@ -54,7 +56,8 @@ export async function renderImagePreview(doc: DocumentMeta, isCurrent: () => boo
     image.onload = () => resolve();
     image.onerror = () => reject(new Error("image unavailable"));
   });
-  image.src = contextualAppUrl(appUrl(`/api/document/resource?id=${encodeURIComponent(doc.id)}&rootId=${encodeURIComponent(doc.rootId)}`));
+  const src = withImageRevision(contextualAppUrl(appUrl(`/api/document/resource?id=${encodeURIComponent(doc.id)}&rootId=${encodeURIComponent(doc.rootId)}`)), documentRevisionKey(doc.id));
+  image.src = src;
   try {
     await loaded;
   } catch (error) {
@@ -75,6 +78,14 @@ export async function renderImagePreview(doc: DocumentMeta, isCurrent: () => boo
   clearPreviewType();
   hideViewToggle();
   previewElement.classList.remove("empty");
+  // Keep the mounted element and scroll during a same-file refresh. Decode
+  // off-document first, but never let a superseded response replace the bitmap.
+  const mounted = previewElement.querySelector<HTMLImageElement>(":scope > .image-preview > img");
+  if (mounted?.dataset.documentId === doc.id) {
+    mounted.src = src;
+    return;
+  }
+  image.dataset.documentId = doc.id;
   const container = document.createElement("div");
   container.className = "image-preview";
   container.append(image);

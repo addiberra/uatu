@@ -4,6 +4,102 @@ Notable user-facing changes to uatu are documented here. Versions follow
 [Semantic Versioning](https://semver.org/) and are generated from Conventional
 Commits by [Release Please](https://github.com/googleapis/release-please).
 
+## [0.8.0](https://github.com/tjakobsson/uatu/compare/v0.7.0...v0.8.0) (2026-10-12)
+
+
+### ⚠ BREAKING CHANGES
+
+* **chat:** workspace API revision 21. ConversationStatus gains `scheduled`, a `scheduled_wakeup` item joins the ConversationItem union, and `user_message` gains optional `origin` and `wakeupId`.
+* **chat:** itemize an OpenCode conversation's cost as a receipt by agent, type, or model
+* **chat:** workspace API revision 20. A task `tool` item's `usage` is now that task's own spend rather than the child session's aggregate with its descendants; `tool` items gain `descendants` and `assistant_message` usage carriers gain `agent`. Both objects are closed; see `api/CHANGELOG.md` for migration.
+* **chat:** Workspace API revision 19 adds optional provider-reported completedAt fields to closed tool and command item schemas. Strict workspace consumers must regenerate; Hub API revision remains 5.
+* **chat:** TokenUsage is a closed wire object; the optional costUsd bumps the workspace API revision 17 -> 18 (contract, OpenAPI, runtime constant, changelog with migration).
+
+### Features
+
+* **chat:** add shell scrollback and a floating output window ([#372](https://github.com/tjakobsson/uatu/issues/372)) ([b206104](https://github.com/tjakobsson/uatu/commit/b20610428552de3a0b848908e3dd5e391b8b5e25))
+* **chat:** itemize an OpenCode conversation's cost as a receipt by agent, type, or model ([29e347f](https://github.com/tjakobsson/uatu/commit/29e347fd85a185c612d1ad1b81fd2131cabfc02c))
+* **chat:** keep Claude Code scheduled wakeups alive, shown, and cancellable ([#449](https://github.com/tjakobsson/uatu/issues/449)) ([cb56708](https://github.com/tjakobsson/uatu/commit/cb56708590fb48bb913204700bd0080de3252e01))
+* **chat:** name the MCP server and tool on a permission and show the call it would run ([#479](https://github.com/tjakobsson/uatu/issues/479)) ([902f801](https://github.com/tjakobsson/uatu/commit/902f801a16824f1ea956907b41313f398e4e0ce6)), closes [#476](https://github.com/tjakobsson/uatu/issues/476)
+* **chat:** report OpenCode conversation cost per agent; render shell output as terminal text ([#368](https://github.com/tjakobsson/uatu/issues/368)) ([aba2428](https://github.com/tjakobsson/uatu/commit/aba24282879d1771101575a5a8df70be1c3ce235))
+* **chat:** run OpenCode 2.x skills from the slash palette and add /reload ([#475](https://github.com/tjakobsson/uatu/issues/475)) ([9502e71](https://github.com/tjakobsson/uatu/commit/9502e7142c87f2ecb4ccd91e4fc5819def0a5000))
+* **chat:** serve OpenCode 1.x and 2.x servers ([#430](https://github.com/tjakobsson/uatu/issues/430)) ([156ccb2](https://github.com/tjakobsson/uatu/commit/156ccb224b0bad6441fbc1cd85bbe44fb6806fdd))
+* **chat:** surface working, finished, and inspectable background work across workspaces ([#425](https://github.com/tjakobsson/uatu/issues/425)) ([dec65af](https://github.com/tjakobsson/uatu/commit/dec65afa014ee55f8c555029cae14fa9c30f68b8))
+* **desktop:** present web dialogs and the file chooser natively in both web hosts ([#477](https://github.com/tjakobsson/uatu/issues/477)) ([f364e94](https://github.com/tjakobsson/uatu/commit/f364e94c9a9357ff1fc50e99db31e3b98b3ef141))
+* **hub:** log in to agent providers from Settings ([#487](https://github.com/tjakobsson/uatu/issues/487)) ([efcb5ac](https://github.com/tjakobsson/uatu/commit/efcb5ac57046fa520cc9e0f052f0135eb9b841d3))
+* **hub:** name the session cookie for the request's port ([#375](https://github.com/tjakobsson/uatu/issues/375)) ([56e05cf](https://github.com/tjakobsson/uatu/commit/56e05cf598c255bd63652a40e449c02f06cf6591))
+* **notifications:** cover all workspaces as a standing per-device rule ([bdf9f97](https://github.com/tjakobsson/uatu/commit/bdf9f9734841d1698872b8fdc8a0e7adad3c38a1)), closes [#407](https://github.com/tjakobsson/uatu/issues/407)
+* **notifications:** hold pushes while you're looking at Uatu ([#455](https://github.com/tjakobsson/uatu/issues/455)) ([b087f07](https://github.com/tjakobsson/uatu/commit/b087f073efc46cfd7684a36f784e09ac94707cf2))
+* **pwa:** add Web Push notifications for agent questions and turn completion ([#400](https://github.com/tjakobsson/uatu/issues/400)) ([bd40e43](https://github.com/tjakobsson/uatu/commit/bd40e43c059a44bfe4d5559c73a23e19ec7f25ff))
+* **watch:** observe Git through events instead of 5 s polling ([#502](https://github.com/tjakobsson/uatu/issues/502)) ([5f78771](https://github.com/tjakobsson/uatu/commit/5f787711d5e10868c6f2f53465e2a14464e3cc64))
+* **watch:** stream incremental file updates during workspace discovery ([#497](https://github.com/tjakobsson/uatu/issues/497)) ([e555b54](https://github.com/tjakobsson/uatu/commit/e555b54188be4a327398b1cdf309e5fe6ed1c90d))
+* **worktrees:** provider-neutral Git worktree workspaces ([#395](https://github.com/tjakobsson/uatu/issues/395)) ([89ddbec](https://github.com/tjakobsson/uatu/commit/89ddbecca61c8a86e1585aacbfdac6bfb9883966))
+
+
+### Bug Fixes
+
+* **chat:** date the timeline, picker, and reset warnings; wrap slash descriptions ([#454](https://github.com/tjakobsson/uatu/issues/454)) ([53faffb](https://github.com/tjakobsson/uatu/commit/53faffbe4a7b6e27159073e3a5b54f9c5d9e13fb)), closes [#429](https://github.com/tjakobsson/uatu/issues/429) [#427](https://github.com/tjakobsson/uatu/issues/427) [#424](https://github.com/tjakobsson/uatu/issues/424)
+* **chat:** keep Claude context windows accurate during turns ([#492](https://github.com/tjakobsson/uatu/issues/492)) ([27d4e89](https://github.com/tjakobsson/uatu/commit/27d4e89a5ddf7a9cc1963736a1b4ef00147432f4))
+* **chat:** keep mobile answers visible across keyboard and lifecycle changes ([#415](https://github.com/tjakobsson/uatu/issues/415)) ([7287ac0](https://github.com/tjakobsson/uatu/commit/7287ac0443429eb8977c97ea4debd03e2826edb4))
+* **chat:** read Claude Code plan usage on demand and keep the last-known report ([#397](https://github.com/tjakobsson/uatu/issues/397)) ([8606b45](https://github.com/tjakobsson/uatu/commit/8606b4506bd9165e570ad4a727d4679c677715de)), closes [#387](https://github.com/tjakobsson/uatu/issues/387) [#389](https://github.com/tjakobsson/uatu/issues/389)
+* **chat:** read Claude Code's context windows and default model from the CLI ([#483](https://github.com/tjakobsson/uatu/issues/483)) ([04d49c2](https://github.com/tjakobsson/uatu/commit/04d49c25bce0c85d04e544bd83b778b046369962))
+* **chat:** restore saved chats correctly after workspace startup ([#378](https://github.com/tjakobsson/uatu/issues/378)) ([1501888](https://github.com/tjakobsson/uatu/commit/15018888a6dad4fa7de50af45941b96e8b6129e1))
+* **chat:** show conversations created just before a page subscribes to the chat list ([c96a0b8](https://github.com/tjakobsson/uatu/commit/c96a0b8f302fb91afcd86ce956146d4bc8e19d60))
+* **chat:** state each task's own tokens on a subagent's rows when the subagent is given several tasks ([29e347f](https://github.com/tjakobsson/uatu/commit/29e347fd85a185c612d1ad1b81fd2131cabfc02c))
+* **cli:** handle a stop signal that arrives as soon as a session reports ready ([c96a0b8](https://github.com/tjakobsson/uatu/commit/c96a0b8f302fb91afcd86ce956146d4bc8e19d60))
+* **deps:** patch http-cache-semantics for GHSA-ch52-4w7c-c8xp ([#490](https://github.com/tjakobsson/uatu/issues/490)) ([70df847](https://github.com/tjakobsson/uatu/commit/70df847c44d30611bfd0cb0545ed6fa82c3fcab2))
+* **hub:** fold repeated live-upstream failure lines in the hub log into one summary ([c96a0b8](https://github.com/tjakobsson/uatu/commit/c96a0b8f302fb91afcd86ce956146d4bc8e19d60))
+* **hub:** keep the state lease held after a failed shutdown until the next signal ([c96a0b8](https://github.com/tjakobsson/uatu/commit/c96a0b8f302fb91afcd86ce956146d4bc8e19d60))
+* **hub:** read Stopped and start in place when the viewed workspace is stopped ([#412](https://github.com/tjakobsson/uatu/issues/412)) ([8e046f6](https://github.com/tjakobsson/uatu/commit/8e046f6424e575abd9f0066290e188a4975fff7a))
+* **hub:** start one hub, not none, when several start at once on a fresh state directory ([c96a0b8](https://github.com/tjakobsson/uatu/commit/c96a0b8f302fb91afcd86ce956146d4bc8e19d60))
+* **hub:** stop a wrong-nonce SSH-agent recovery from shutting down the real guardian ([c96a0b8](https://github.com/tjakobsson/uatu/commit/c96a0b8f302fb91afcd86ce956146d4bc8e19d60))
+* **preview:** keep a clicked outline entry highlighted after its heading scrolls into place ([c96a0b8](https://github.com/tjakobsson/uatu/commit/c96a0b8f302fb91afcd86ce956146d4bc8e19d60))
+* **preview:** refresh changed images and follow them ([#496](https://github.com/tjakobsson/uatu/issues/496)) ([0076efc](https://github.com/tjakobsson/uatu/commit/0076efcb7eaabb0986a793907f20b1205b4f3271))
+* **preview:** retry documents that failed to load instead of showing them as unavailable ([c96a0b8](https://github.com/tjakobsson/uatu/commit/c96a0b8f302fb91afcd86ce956146d4bc8e19d60))
+* **preview:** stop layout clicks from being lost when the preview re-renders ([c96a0b8](https://github.com/tjakobsson/uatu/commit/c96a0b8f302fb91afcd86ce956146d4bc8e19d60))
+* **pwa:** give Home Screen icons opaque backgrounds and maskable-safe padding ([#400](https://github.com/tjakobsson/uatu/issues/400)) ([bd40e43](https://github.com/tjakobsson/uatu/commit/bd40e43c059a44bfe4d5559c73a23e19ec7f25ff))
+* **pwa:** keep iPad desktop mode inside the safe area and visible viewport ([#400](https://github.com/tjakobsson/uatu/issues/400)) ([bd40e43](https://github.com/tjakobsson/uatu/commit/bd40e43c059a44bfe4d5559c73a23e19ec7f25ff))
+* **shell:** keep keyboard focus on the tab when arrow keys move to the Terminal tab ([c96a0b8](https://github.com/tjakobsson/uatu/commit/c96a0b8f302fb91afcd86ce956146d4bc8e19d60))
+* **shell:** keep workspace switcher entries and focus in place while the open menu refreshes ([c96a0b8](https://github.com/tjakobsson/uatu/commit/c96a0b8f302fb91afcd86ce956146d4bc8e19d60))
+* **shell:** refuse live updates older than the state the page loaded at boot ([c96a0b8](https://github.com/tjakobsson/uatu/commit/c96a0b8f302fb91afcd86ce956146d4bc8e19d60))
+* **shell:** stop an idle browser from overwriting the document another browser picked last ([c96a0b8](https://github.com/tjakobsson/uatu/commit/c96a0b8f302fb91afcd86ce956146d4bc8e19d60))
+* **sidebar:** keep keyboard focus on a project search result while results update ([c96a0b8](https://github.com/tjakobsson/uatu/commit/c96a0b8f302fb91afcd86ce956146d4bc8e19d60))
+* **sidebar:** preserve folder state across refreshes and close the document on ancestor collapse ([04b69d1](https://github.com/tjakobsson/uatu/commit/04b69d1c891b6353552b1e79a40f00594fff74e0))
+* **terminal:** keep terminals through workspace navigation via the hub ([#420](https://github.com/tjakobsson/uatu/issues/420)) ([94a7d0e](https://github.com/tjakobsson/uatu/commit/94a7d0ed465eef5ed0c18c2b1690ddd84390f517))
+
+## [0.7.0](https://github.com/tjakobsson/uatu/compare/v0.6.2...v0.7.0) (2026-09-13)
+
+
+### ⚠ BREAKING CHANGES
+
+* **hub:** `uatu serve` and `uatu watch` are no longer user commands; a user-shaped invocation prints the Hub bootstrap steps and exits non-zero (run `uatu hub` and add folders from its dashboard). The Hub answers `/s/{id}/api/events`, `/s/{id}/api/chat/conversations/events`, and `/s/{id}/api/chat/conversations/{id}/events` with 410, naming `/api/hub/live` as the replacement, and the proxied workspace API left the public contract.
+
+### Features
+
+* **chat:** add Claude Code as a first-class chat agent ([#317](https://github.com/tjakobsson/uatu/issues/317)) ([30fd9c9](https://github.com/tjakobsson/uatu/commit/30fd9c9bbfdce9ba8f32c8a3f219fd84e7e7cdd6))
+* **chat:** collapse the live activity tail behind a working line ([778dd69](https://github.com/tjakobsson/uatu/commit/778dd690145e92e847e0490a1db5974ddcbb6099))
+* **chat:** confirm "Allow always" and show the agent's approval scope ([#352](https://github.com/tjakobsson/uatu/issues/352)) ([4fff180](https://github.com/tjakobsson/uatu/commit/4fff18054307d1031845003ea5e92595fb09743b))
+* **chat:** improve OpenCode interactions ([#312](https://github.com/tjakobsson/uatu/issues/312)) ([3270288](https://github.com/tjakobsson/uatu/commit/3270288db19babeff40cba5138c56c777ba0bc96))
+* **chat:** plain-words plan usage with a detail readout and a Usage pane ([65adf58](https://github.com/tjakobsson/uatu/commit/65adf58670d701641b988a5ef81a8ab9f6ece83f))
+* **chat:** polish Claude Code chat, phase 1 ([#325](https://github.com/tjakobsson/uatu/issues/325)) ([e7a02e8](https://github.com/tjakobsson/uatu/commit/e7a02e8dc3de37ad7a86c4e87c40769ae8ca408e))
+* **chat:** polish Claude Code chat, phase 2 ([#326](https://github.com/tjakobsson/uatu/issues/326)) ([d53fd76](https://github.com/tjakobsson/uatu/commit/d53fd769c15fa1d64ba802ad9444e7e38a9a6745))
+* **chat:** polish Claude Code chat, phase 3 ([#328](https://github.com/tjakobsson/uatu/issues/328)) ([17263f7](https://github.com/tjakobsson/uatu/commit/17263f75b1223026f13db1824916fc7292fe1a40))
+* **hub:** one brokered live stream per page; remove public uatu serve ([#357](https://github.com/tjakobsson/uatu/issues/357)) ([91b204d](https://github.com/tjakobsson/uatu/commit/91b204d0f242ae34c367d6e0b37d5ce727998642))
+* **shell:** recover the live connection after a backgrounded page ([#365](https://github.com/tjakobsson/uatu/issues/365)) ([e5701a0](https://github.com/tjakobsson/uatu/commit/e5701a0219bd4fb3606761e82850bd015266a5be))
+
+
+### Bug Fixes
+
+* **chat:** keep small upward scrolls and land sends at the end of the timeline ([#345](https://github.com/tjakobsson/uatu/issues/345)) ([59fd26d](https://github.com/tjakobsson/uatu/commit/59fd26d3ad626da4206b9e43ce2758123d6faa05))
+* **chat:** open a conversation's event stream at once instead of after the first keepalive ([#350](https://github.com/tjakobsson/uatu/issues/350)) ([4141501](https://github.com/tjakobsson/uatu/commit/414150184933f07c06af0e78ded7e252f7260099))
+* **live:** keep document and Chat streams alive across mobile interruptions ([#334](https://github.com/tjakobsson/uatu/issues/334)) ([711faad](https://github.com/tjakobsson/uatu/commit/711faad09283a183a598398b0bed862a3c909f00))
+* preserve manual file selection during background updates ([#341](https://github.com/tjakobsson/uatu/issues/341)) ([b3bfef3](https://github.com/tjakobsson/uatu/commit/b3bfef34053660eb2367bfda13e4132d40508711))
+
+
+### Performance
+
+* **chat:** reduce retained transcript reveal and history read work ([#342](https://github.com/tjakobsson/uatu/issues/342)) ([c11823b](https://github.com/tjakobsson/uatu/commit/c11823bbe4e38b2afddb8080b37afdf65e942774))
+
 ## [0.6.2](https://github.com/tjakobsson/uatu/compare/v0.6.1...v0.6.2) (2026-08-28)
 
 

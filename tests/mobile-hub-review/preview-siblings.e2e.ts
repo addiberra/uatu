@@ -71,7 +71,7 @@ test("index failure disables both arrows truthfully; Retry restores the same doc
   page.on("request", request => { if (request.resourceType() === "document") reloads++; });
   // Test-owned transport fault only; never replace UI, skip index or inject state.
   await page.route("**/s/atlas/api/state?**", route => route.fulfill({ status: 503, body: "Synthetic index failure" }));
-  await page.route("**/s/atlas/api/events?**", route => route.abort());
+  await page.route("**/api/hub/live?**", route => route.abort());
   await page.evaluate(() => window.dispatchEvent(new Event("online")));
   await expect(pill(page)).toContainText("File index unavailable. Retry to refresh.");
   await expect(previous(page)).toBeDisabled();
@@ -79,7 +79,7 @@ test("index failure disables both arrows truthfully; Retry restores the same doc
   await expect(pill(page).getByRole("button", { name: "Back to Files" })).toBeEnabled();
   await capture(page, info, "preview-index-error");
   await page.unroute("**/s/atlas/api/state?**");
-  await page.unroute("**/s/atlas/api/events?**");
+  await page.unroute("**/api/hub/live?**");
   await pill(page).getByRole("button", { name: "Retry", exact: true }).click();
   await selected(page, "reference.adoc");
   await expect(previous(page)).toBeEnabled();
@@ -114,7 +114,7 @@ test(`coast remains indexed; canonical binary direct navigation and reload: ${re
     if (attempt === 0) await page.reload();
   }
   await page.goto("/s/atlas/examples/START-HERE.md");
-  const embedded = page.locator('#preview img[src$="coast.svg"]');
+   const embedded = page.locator('#preview img[src*="coast.svg"]');
   await embedded.scrollIntoViewIfNeeded();
   await expect(embedded).toBeVisible();
   await expect.poll(() => embedded.evaluate((element: HTMLImageElement) => element.naturalWidth)).toBeGreaterThan(0);

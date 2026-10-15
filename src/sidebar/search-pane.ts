@@ -8,6 +8,7 @@
 import { appUrl } from "../shared/app-url";
 import { contextualAppUrl } from "../shell/watch-context";
 import { appState } from "../shell/state";
+import { documentIndex } from "../shell/document-state";
 import { escapeHtml, escapeHtmlAttribute } from "../shared/html";
 import type { SearchEvent, SearchFileResult } from "../server/search";
 import {
@@ -15,6 +16,7 @@ import {
   describeSearchSummary,
   displayLine,
   mergeResult,
+  replaceResultsMarkup,
   shouldDispatch,
 } from "./search-model";
 import { renderSidebar, setSidebarCollapsed } from "./shell";
@@ -319,7 +321,7 @@ function render(): void {
 
 function renderResults(): void {
   if (results.length === 0) {
-    resultsElement.replaceChildren();
+    replaceResultsMarkup(resultsElement, "", document.activeElement);
     return;
   }
   // Result paths are root-relative, so with several watched roots two
@@ -369,7 +371,8 @@ function renderResults(): void {
       );
     })
     .join("");
-  resultsElement.innerHTML = html;
+  // Keeps the keyboard-focused hit across re-renders (see replaceResultsMarkup).
+  replaceResultsMarkup(resultsElement, html, document.activeElement)?.focus({ preventScroll: true });
 }
 
 // Widened results can reference roots outside the scoped `appState.roots`,
@@ -496,6 +499,10 @@ export function noteSearchCorpusChange(): void {
     return;
   }
   if (results.length === 0) {
+    return;
+  }
+  if (documentIndex.epoch) {
+    if (results.some(result => !documentIndex.find(result.documentId))) { stale = true; renderNotice(); }
     return;
   }
   const present = new Set<string>();

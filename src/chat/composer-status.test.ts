@@ -1,14 +1,14 @@
 import { describe, expect, test } from "bun:test";
 
-import { composerRoutineState, latestPlanUtilization, latestRateLimit, planHasRows, planName, planReadoutRows, planSummaryLabel, planUtilizationLabel, planUtilizationLevel, rateLimitBadgeLabel, relativeReset, sessionCostLabel, sessionTotalsTitle } from "./composer-status";
-import type { ConversationItem } from "./types";
+import { composerRoutineState, latestPlanUtilization, latestRateLimit, planChip, planHasRows, planName, planReadoutRows, planSummaryLabel, planUtilizationLabel, planUtilizationLevel, rateLimitBadgeLabel, sessionCostLabel, sessionTotalsTitle, standingSentence } from "./composer-status";
+import { relativeReset } from "./dates";
+import { isRateLimitStanding, RATE_LIMIT_ITEM_ID, type ConversationItem, type ScheduledWakeupItem } from "./types";
+import type { RateLimitStanding } from "./composer-status";
 
 const base = { cancelling: false, submitting: false, backgroundDeclared: true, backgroundTasks: [] as [] };
 
 describe("session totals title", () => {
   const user = (createdAt: number): ConversationItem => ({ id: `m${createdAt}`, type: "user_message", createdAt, text: "hi" });
-  const clock = (at: number) => new Date(at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-
   test("a tally that began at or before the first message is the whole conversation", () => {
     expect(sessionTotalsTitle({}, [user(10)])).toBe("This conversation");
     expect(sessionTotalsTitle({ since: 5 }, [user(10)])).toBe("This conversation");
@@ -18,12 +18,24 @@ describe("session totals title", () => {
     expect(sessionTotalsTitle({ since: 10 }, [user(20), user(30)])).toBe("This conversation");
   });
 
-  test("a tally that began after the first message is stated since when, with the weekday once a day has passed", () => {
+  test("a tally that began after the first message is stated since when, with the weekday once the local day has changed", () => {
     const since = Date.parse("2026-09-02T21:33:00");
     const items = [user(since - 3_600_000), user(since + 60_000)];
-    expect(sessionTotalsTitle({ since }, items, since + 5_000)).toBe(`This conversation · since ${clock(since)}`);
+    expect(sessionTotalsTitle({ since }, items, since + 5_000)).toBe("This conversation · since 21:33");
     const weekday = new Date(since).toLocaleDateString([], { weekday: "short" });
-    expect(sessionTotalsTitle({ since }, items, since + 2 * 86_400_000)).toBe(`This conversation · since ${weekday} ${clock(since)}`);
+    expect(sessionTotalsTitle({ since }, items, since + 2 * 86_400_000)).toBe(`This conversation · since ${weekday} 21:33`);
+  });
+
+  test("the local calendar day, not 24 hours elapsed, decides whether the weekday is shown", () => {
+    // Started 23:00, read 00:30 the next local day: 1.5 h later, but yesterday.
+    const lateStart = Date.parse("2026-09-25T23:00:00");
+    const lateWeekday = new Date(lateStart).toLocaleDateString([], { weekday: "short" });
+    const lateItems = [user(lateStart - 3_600_000), user(lateStart + 60_000)];
+    expect(sessionTotalsTitle({ since: lateStart }, lateItems, Date.parse("2026-09-26T00:30:00"))).toBe(`This conversation · since ${lateWeekday} 23:00`);
+    // Started 01:00, read 23:00 the same local day: 22 h later, but still today.
+    const earlyStart = Date.parse("2026-09-26T01:00:00");
+    const earlyItems = [user(earlyStart - 3_600_000), user(earlyStart + 60_000)];
+    expect(sessionTotalsTitle({ since: earlyStart }, earlyItems, Date.parse("2026-09-26T23:00:00"))).toBe("This conversation · since 01:00");
   });
 });
 
@@ -50,21 +62,80 @@ describe("composer routine state", () => {
     const task: ConversationItem = { id: "task:1", type: "background_task", createdAt: 1, taskId: "1", description: "Sleep then report", status: "running" };
     expect(composerRoutineState({ ...base, status: "background", backgroundTasks: [task] as never })).toEqual({ stateName: "background", label: "1 background task running · Sleep then report" });
     expect(composerRoutineState({ ...base, status: "background", backgroundDeclared: false })).toEqual({ stateName: "ready", label: "Ready" });
+    // The status outlives the last task by the moment it takes the agent to
+    // say the turn moved on; with nothing left to name, the composer reads
+    // ready rather than announcing background work that has none.
+    expect(composerRoutineState({ ...base, status: "background" })).toEqual({ stateName: "ready", label: "Ready" });
+  });
+
+  test("the scheduled state names the pending count and the next fire time, only where the agent declares it", () => {
+    const now = new Date(2026, 8, 24, 20, 1).getTime();
+    const wakeup = (id: string, nextFireAt?: number): ScheduledWakeupItem => ({ id: `wakeup:${id}`, type: "scheduled_wakeup", createdAt: 1, wakeupId: id, prompt: "check", recurring: false, schedule: "3 20 * * *", ...(nextFireAt === undefined ? {} : { nextFireAt }), status: "pending" });
+    const soon = new Date(2026, 8, 24, 20, 3).getTime();
+    const time = "20:03";
+    expect(composerRoutineState({ ...base, status: "scheduled", scheduledDeclared: true, scheduledWakeups: [wakeup("a", soon)], now })).toEqual({ stateName: "scheduled", label: `1 wakeup scheduled · next about ${time}` });
+    expect(composerRoutineState({ ...base, status: "scheduled", scheduledDeclared: true, scheduledWakeups: [wakeup("a", soon), wakeup("b")], now }).label).toBe(`2 wakeups scheduled · next about ${time}`);
+    // A schedule the workspace could not read still names the state.
+    expect(composerRoutineState({ ...base, status: "scheduled", scheduledDeclared: true, scheduledWakeups: [wakeup("a")], now }).label).toBe("1 wakeup scheduled");
+    expect(composerRoutineState({ ...base, status: "scheduled", scheduledDeclared: false })).toEqual({ stateName: "ready", label: "Ready" });
+    // Sending outranks it: a prompt typed in the scheduled state is on its way.
+    expect(composerRoutineState({ ...base, status: "scheduled", scheduledDeclared: true, submitting: true }).stateName).toBe("sending");
   });
 });
 
 describe("rate-limit badge and plan utilization", () => {
   const notice = (id: string, code: string, level: "warning" | "error" | "info", resetsAt?: number): ConversationItem => ({ id, type: "notice", createdAt: 1, level, message: `${code} message`, code, ...(resetsAt === undefined ? {} : { resetsAt }) });
 
-  test("the newest rate-limit notice stands until a clearing one retires it", () => {
-    const warning = notice("n1", "rate-limit-warning", "warning", 1_788_400_000_000);
-    const rejected = notice("n2", "rate-limit-rejected", "error", 1_788_400_000_000);
+  test("the standing is the one item the agent keeps, and its absence means not limited", () => {
+    const warning = notice(RATE_LIMIT_ITEM_ID, "rate-limit-warning", "warning", 1_788_400_000_000);
+    const rejected = notice(RATE_LIMIT_ITEM_ID, "rate-limit-rejected", "error", 1_788_400_000_000);
     expect(latestRateLimit([warning])).toEqual({ level: "warning", message: "rate-limit-warning message", resetsAt: 1_788_400_000_000 });
-    expect(latestRateLimit([warning, rejected])?.level).toBe("rejected");
-    expect(latestRateLimit([warning, rejected, notice("n3", "rate-limit-cleared", "info")])).toBeUndefined();
+    // The agent upserts that one id, so the projection holds the current
+    // standing rather than a history to scan.
+    expect(latestRateLimit([rejected])?.level).toBe("rejected");
+    // Retired: the agent removed the item, so there is nothing to find.
+    expect(latestRateLimit([])).toBeUndefined();
+    // Found by its code, not by the id one producer happens to use — the
+    // contract gives clients the code, and the timeline filters on it, so a
+    // standing under another stable id must not vanish from both surfaces.
+    const elsewhere = notice("agent:standing:7", "rate-limit-warning", "warning", 1_788_400_000_000);
+    expect(latestRateLimit([elsewhere])?.level).toBe("warning");
+    expect(isRateLimitStanding(elsewhere)).toBe(true);
+    // Newest wins: one item id is a producer's property, not the wire's.
+    expect(latestRateLimit([warning, { ...rejected, id: "agent:standing:8" }])?.level).toBe("rejected");
+    // Exactly the two coded standings. A later rate-limit-adjacent notice
+    // is someone else's message, not a standing to report as a warning.
+    const adjacent = notice("notice:policy", "rate-limit-policy-changed", "info");
+    expect(latestRateLimit([adjacent])).toBeUndefined();
+    expect(isRateLimitStanding(adjacent)).toBe(false);
     expect(latestRateLimit([notice("n4", "refusal-fallback", "warning")])).toBeUndefined();
     expect(rateLimitBadgeLabel({ level: "rejected", message: "" })).toBe("Rate limited");
     expect(rateLimitBadgeLabel({ level: "warning", message: "", resetsAt: 1_788_400_000_000 })).toMatch(/^Near rate limit · resets /);
+  });
+
+  test("the chip folds the standing and the plan into one control", () => {
+    const withWindows = { plan: { fiveHour: { utilization: 9 }, sevenDay: { utilization: 25 } } };
+    const spentWindow = { plan: { fiveHour: { utilization: 9 }, sevenDay: { utilization: 83 } } };
+    const noPlan = { plan: {}, session: { costUsd: 1.23, apiDurationMs: 42_000, durationMs: 90_000, linesAdded: 0, linesRemoved: 0, models: [] } };
+    const warning: RateLimitStanding = { level: "warning", message: "Approaching your 7-day rate limit (77% used).", resetsAt: 1_788_400_000_000 };
+    const rejected: RateLimitStanding = { level: "rejected", message: "Rate limit reached for your 7-day window.", resetsAt: 1_788_400_000_000 };
+
+    // A rejection displaces the figures: blocked is the fact that matters.
+    expect(planChip(withWindows, rejected)).toEqual({ text: expect.stringMatching(/^Rate limited · resets /), level: "rejected", kind: "rate-limit" });
+    // A warning keeps them and raises the level — including for a window
+    // the summary does not name, which is the whole reason the level is not
+    // derived from the percentages.
+    expect(planChip(withWindows, warning)).toEqual({ text: "Session 9% · Week 25%", level: "warning", kind: "plan" });
+    expect(planChip(withWindows, undefined)).toEqual({ text: "Session 9% · Week 25%", level: "normal", kind: "plan" });
+    expect(planChip(spentWindow, undefined)?.level).toBe("warning");
+    // A login with no plan can still be rate limited; before this the fact
+    // had nowhere to go.
+    expect(planChip(noPlan, warning)).toEqual({ text: expect.stringMatching(/^Near rate limit · resets /), level: "warning", kind: "rate-limit" });
+    expect(planChip(undefined, rejected)?.kind).toBe("rate-limit");
+    // Unchanged without a standing: the cost chip, and nothing at all.
+    expect(planChip(noPlan, undefined)).toEqual({ text: "$1.23 this conversation", level: "normal", kind: "cost" });
+    expect(planChip(undefined, undefined)).toBeUndefined();
+    expect(planChip({ plan: {} }, undefined)).toBeUndefined();
   });
 
   test("plan utilization reads the newest report and is absent without one", () => {
@@ -154,6 +225,10 @@ describe("rate-limit badge and plan utilization", () => {
     expect(rows[6]).toMatchObject({ key: "extra-usage", utilization: 12.5, note: "$12.50 of $100.00" });
     expect(planName({ subscription: "max" })).toBe("Max plan");
     expect(planName({})).toBeUndefined();
+    // Credits read as money in the login's currency; a derived 0% is a
+    // figure, not a "?" (a Pro login with 85 € enabled and nothing spent).
+    const euro = planReadoutRows({ fiveHour: { utilization: 30 }, extraUsage: { enabled: true, usedCredits: 0, monthlyLimit: 85, utilization: 0, currency: "EUR" } }, now);
+    expect(euro[1]).toMatchObject({ key: "extra-usage", utilization: 0, note: "€0.00 of €85.00" });
     // A minimal report degrades to its two rows; disabled extra usage is not a row.
     expect(planReadoutRows({ fiveHour: { utilization: 1 }, sevenDay: { utilization: 2 }, extraUsage: { enabled: false } }, now).map(row => row.key)).toEqual(["session", "week"]);
     expect(planReadoutRows({}, now)).toEqual([]);
@@ -166,5 +241,65 @@ describe("rate-limit badge and plan utilization", () => {
     expect(relativeReset(now + 4 * 86_400_000 + 11 * 3_600_000 + 40 * 60_000, now)).toBe("in 4d 11h");
     expect(relativeReset(now + 10_000, now)).toBe("now");
     expect(relativeReset(now - 60_000, now)).toBe("now");
+  });
+});
+
+describe("rate-limit reset wording", () => {
+  const local = (day: number, hour: number, minute = 0) => new Date(2026, 8, day, hour, minute).getTime();
+  const weekday = (at: number) => new Date(at).toLocaleDateString([], { weekday: "short" });
+  const message = "Approaching your 7-day (overage included) rate limit (81% used).";
+
+  test("a reset later today reads as a bare time with the time remaining", () => {
+    const now = local(21, 20);
+    const reset = local(21, 23);
+    expect(standingSentence({ message, resetsAt: reset }, now)).toBe(`${message} Resets 23:00 · in 3h 00m.`);
+    expect(rateLimitBadgeLabel({ level: "warning", message, resetsAt: reset }, now)).toBe(`Near rate limit · resets 23:00`);
+  });
+
+  test("a reset on another day names the weekday wherever the standing is stated", () => {
+    const now = local(21, 19);
+    const reset = local(24, 23);
+    expect(standingSentence({ message, resetsAt: reset }, now)).toBe(`${message} Resets ${weekday(reset)} 23:00 · in 3d 4h.`);
+    expect(rateLimitBadgeLabel({ level: "warning", message, resetsAt: reset }, now)).toBe(`Near rate limit · resets ${weekday(reset)} 23:00`);
+    expect(rateLimitBadgeLabel({ level: "rejected", message, resetsAt: reset }, now)).toBe(`Rate limited · resets ${weekday(reset)} 23:00`);
+  });
+
+  test("a reset early tomorrow is not read as today", () => {
+    const now = local(25, 23, 30);
+    const reset = local(26, 6);
+    expect(standingSentence({ message, resetsAt: reset }, now)).toContain(`Resets ${weekday(reset)} 06:00 · in 6h 30m.`);
+  });
+
+  test("a reset a week or more out names only its weekday", () => {
+    const now = local(21, 19);
+    const reset = local(30, 23);
+    expect(standingSentence({ message, resetsAt: reset }, now)).toBe(`${message} Resets ${weekday(reset)} 23:00 · in 9d 4h.`);
+    expect(rateLimitBadgeLabel({ level: "warning", message, resetsAt: reset }, now)).toBe(`Near rate limit · resets ${weekday(reset)} 23:00`);
+  });
+
+  test("a standing without a reset is just its message", () => {
+    expect(standingSentence({ message }, local(21, 9))).toBe(message);
+  });
+
+  test("plan rows follow the same day rule", () => {
+    const now = local(25, 23, 30);
+    const reset = local(26, 6);
+    const [row] = planReadoutRows({ fiveHour: { utilization: 40, resetsAt: reset } }, now);
+    expect(row!.resetLabel).toBe(`resets ${weekday(reset)} 06:00 · in 6h 30m`);
+  });
+});
+
+describe("usage age", () => {
+  test("the age reads in the reader's units and staleness begins at ten minutes", async () => {
+    const { usageAge, usageAsOf, usageStale, USAGE_STALE_MS } = await import("./composer-status");
+    const readAt = Date.parse("2026-09-02T10:00:00.000Z");
+    expect(usageAge(readAt, readAt + 20_000)).toBe("just now");
+    expect(usageAge(readAt, readAt + 3 * 60_000)).toBe("3 min ago");
+    expect(usageAge(readAt, readAt + 5 * 3_600_000)).toBe("5 h ago");
+    expect(usageAge(readAt, readAt + 3 * 86_400_000)).toBe("3 d ago");
+    expect(usageAge(readAt, readAt - 5_000)).toBe("just now");
+    expect(usageStale(readAt, readAt + USAGE_STALE_MS - 1)).toBe(false);
+    expect(usageStale(readAt, readAt + USAGE_STALE_MS)).toBe(true);
+    expect(usageAsOf(readAt, readAt + 12 * 60_000)).toMatch(/^as of \d{1,2}:\d{2}(?: [AP]M)? · 12 min ago$/);
   });
 });

@@ -229,7 +229,7 @@ export async function captureVisualDiscovery() {
         const failState = (route: import("@playwright/test").Route) => route.fulfill({ status: 503, body: "Synthetic visual index failure" });
         const failEvents = (route: import("@playwright/test").Route) => route.abort();
         injectingIndexFailure = true;
-        await page.route("**/s/atlas/api/state**", failState); await page.route("**/s/atlas/api/events**", failEvents);
+        await page.route("**/s/atlas/api/state**", failState); await page.route("**/api/hub/live**", failEvents);
         await page.evaluate(() => window.dispatchEvent(new Event("online")));
         await expect(page.locator(".preview-nav-alert")).toContainText("File index unavailable");
         await capture("preview-index-error", "26-preview-index-error");
@@ -237,7 +237,7 @@ export async function captureVisualDiscovery() {
         expect(await page.locator(".preview-nav-arrow[data-boundary='true']").count()).toBe(0);
         const alert = (await page.locator(".preview-nav-alert").boundingBox())!, pill = (await page.locator(".preview-nav-pill").boundingBox())!;
         expect(alert.y + alert.height).toBeLessThan(pill.y);
-        await page.unroute("**/s/atlas/api/state**", failState); await page.unroute("**/s/atlas/api/events**", failEvents);
+        await page.unroute("**/s/atlas/api/state**", failState); await page.unroute("**/api/hub/live**", failEvents);
         injectingIndexFailure = false;
         corpus.generatedAt++; await page.locator(".preview-nav-retry").click(); await expect(page.locator(".preview-nav-alert")).toBeHidden();
         const indexRecovery = await page.locator(".preview-nav-alert").isVisible() ? await page.locator(".preview-nav-alert").innerText() : "recovered";

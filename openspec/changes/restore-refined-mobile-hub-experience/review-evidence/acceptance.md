@@ -1,4 +1,45 @@
-# Frontend acceptance record
+# Design authorization and frontend acceptance record
+
+## Current decision — 2026-10-15
+
+The user agreed the refined synthetic mobile UI as the **live phone Hub target**
+and explicitly authorized live integration in this existing change, formerly
+gated by task 8.3. Planning revisions are preapproved; the lead initiates apply
+after this planning-only phase. This amends the already contemplated integration
+stage rather than creating an unrelated implementation change.
+
+Agreed direction:
+
+- Compact single-checkout cards; expanded branch/checkout rows only for multiple
+  checkouts. Rename and branch/worktree creation are secondary More actions.
+- Two persistent Hub/Settings icon destinations, with contextual Return retained.
+  Notifications belongs in Settings, not a third dock item.
+- Agent accounts is a separate Settings group from repository Credentials, with
+  focused pages and all upstream provider methods, errors and scope information.
+- Contextual sharing notice in Credentials, full safety details in relevant
+  credential/assignment/clone flows; no removal of safety information or warnings.
+- Preserve upstream capabilities, desktop behavior and workspace interiors.
+
+| Decision | Current status |
+|---|---|
+| Design direction above | Agreed by user |
+| Live backend/API/routing integration | Explicitly authorized; tasks 17–23 define the stages |
+| Planning edits | Preapproved; no code/effects in this invocation |
+| Final visual/interaction acceptance of a named live candidate | Still open; task 8.3 unchecked |
+| Approved pixel-golden set / physical-device / native certification | Not established by this decision |
+| Existing full-matrix and visual gaps | Still open; do not inherit historical passes |
+| Broader Chat touch 11 failures / historical archive-digest mismatch | Open and unwaived; preserve evidence/assertions |
+| Running live/synthetic services | Preserve unchanged; updates require explicitly scoped lead action |
+| Commit/push, main-spec sync, archive | Not authorized in this planning phase |
+
+The current integration plan and this decision supersede older statements that
+live integration is unauthorized; they do **not** supersede their evidence or
+turn simulated results into live correctness. `verification.md` is deliberately
+preserved byte-for-byte with the five existing unstaged follow-up files and
+remains the factual compatibility/known-issues record. No new browser/device
+verification or served fingerprint is asserted by this update.
+
+## Historical frontend review record (unchanged decisions at their recorded dates)
 
 > Start with the [current evidence index](README.md) and [current verification](verification.md). Status and generated-artifact paths below are historical at pre-cleanup commit `373ef6350032f6a0f2a91c2037ebafb553bc002f`; they do not assert fresh passes or close pending gates.
 
@@ -7,7 +48,7 @@ Passing tests, reference normalization approval and approved additive frontend
 contracts do not approve the served visual/interaction design. No exceptions or
 omissions listed here have been accepted by the user.
 
-## Current candidate — creation exit, Session Security and preview recovery
+## Historical candidate — creation exit, Session Security and preview recovery
 
 **Latest correction:** [navigation-recovery/verification.md](navigation-recovery/verification.md).
 The user requested the previous candidate be committed/pushed first (`b5d5f30`),
@@ -96,6 +137,8 @@ that version and names each accepted exception. Record their words and date;
 do not infer approval from silence, test results or merely opening the URL.
 Changed served bytes require a new fingerprint and clear review-version scope.
 
-Until then leave **8.3 unchecked**. Tasks 7.1, 7.4, 9.6, 10.4 and 11.4 retain their
-separate pending criteria. Even frontend approval is a stop: seek separate live
-integration authorization, with production-facing delta specs still unmerged.
+Task **8.3 remains unchecked** for final version-specific acceptance. Tasks 7.1,
+7.4, 9.6, 10.4 and 11.4 retain their separate pending criteria. The historical
+requirement to seek separate integration authorization is now satisfied by the
+2026-10-15 decision above; it does not complete those evidence obligations or
+authorize spec sync/archive.

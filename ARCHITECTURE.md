@@ -6,37 +6,165 @@ For the user-facing pitch (features, install, usage), see [README.md](./README.m
 
 ## What uatu is
 
-`uatu` is a local Bun-served Progressive Web App that watches a directory of docs and source, previews Markdown and AsciiDoc with Mermaid diagrams, surfaces the repository's change context (changed files, diffs, git log), and (where supported) hosts an embedded terminal in the same browser tab. It runs entirely on `localhost` — there is no cloud component — and ships as a single Bun-compiled binary or runs from source.
+`uatu` is a Bun-served Progressive Web App that watches a directory of docs and source, previews Markdown and AsciiDoc with Mermaid diagrams, surfaces the repository's change context (changed files, diffs, git log), and (where supported) hosts an embedded terminal in the same browser tab. It runs as a hub (`uatu hub`) on a machine you own: a login-gated daemon that runs one loopback-only session child per workspace and is the only server a browser talks to. There is no cloud component. It ships as a single Bun-compiled binary or runs from source.
 
 ## The 30-second map
 
 ```mermaid
 flowchart LR
-  CLI["src/cli.ts<br/>(uatu serve ...)"]
-  WS["chokidar<br/>file watcher"]
-  Server["Bun.serve<br/>(src/cli.ts + src/server/routes.ts)"]
-  Session["WatchSession<br/>(src/server/watch-session.ts)"]
   SPA["browser SPA<br/>(src/app.ts → shell/preview/sidebar)"]
-  Term["terminal<br/>(xterm.js ↔ WebSocket ↔ PTY)"]
+  Hub["uatu hub<br/>(src/hub/: auth, proxy, live broker)"]
+  Child["session child<br/>(src/cli.ts serve, one per workspace)"]
+  Session["WatchSession<br/>(src/server/watch-session.ts)"]
+  WS["recursive file observer<br/>Chokidar fallback"]
+  Term["terminal<br/>(WebSocket ↔ PTY)"]
   FS[("docs tree<br/>on disk")]
   Term_PTY[("user's shell<br/>(real PTY)")]
 
-  CLI -- spawns + configures --> Server
-  WS -- file events --> Session
+  Hub -- spawns + supervises --> Child
+  SPA <-- "HTTP + WebSocket under /s/id/" --> Hub
+  SPA <-- "one live SSE stream: /api/hub/live" --> Hub
+  Hub <-- "HTTP, WebSocket, internal SSE (loopback)" --> Child
+  Child --- Session
+  Child --- Term
   FS -- mtime, contents --> WS
-  Server <-- HTTP + SSE --> SPA
-  Server <-- WebSocket --> Term
+  WS -- file events --> Session
   Term <-- spawn/io --> Term_PTY
-  Session -- /api/state, /api/events --> Server
 ```
 
-Four boundaries to keep in mind:
+The boundaries to keep in mind:
 
-- **HTTP/SSE between server and SPA.** `/api/state` supplies the initial snapshot, `/api/document` and `/api/document/diff` render one path, `/api/search` sweeps content, and `/api/events` streams updates. Scope and compare target travel as validated request context on all related requests; there are no process-global mutation endpoints.
-- **Per-client watch context.** The Change Overview measures against `base` (merge-base reviewer view) or `last-commit` (`HEAD` working view). `src/shared/watch-context.ts` serializes the client's scope and compare target, and `server/watch-session.ts` selects the corresponding roots and cached repository snapshot independently for each request and SSE subscriber. Two clients can therefore browse different scopes and comparison lenses through the same child process.
-- **Chokidar between server and the filesystem.** The `WatchSession` debounces, applies the ignore policy, rebuilds the document index, and emits SSE events.
+- **The hub between browser and session child.** Browsers only talk to the hub. It authenticates them, then reverse-proxies HTTP and WebSockets under `/s/<id>/` to that workspace's loopback child and brokers the child's token (see [Base paths and the hub](#base-paths-and-the-hub)).
+- **HTTP between the SPA and its session child.** Under the session's base path, `/api/state` supplies the initial snapshot, `/api/document` and `/api/document/diff` render one path, and `/api/search` sweeps content. `/api/document/facts` supplies Git provenance independently of document rendering. Scope and compare target travel as validated request context and never change another client's preferences.
+- **One live stream per page.** Pushed updates (document state, chat inventory, conversation events, other workspaces' activity) reach a page over a single `GET /api/hub/live` SSE connection to the hub. The child's own SSE routes are the internal hub↔child protocol (see [Live delivery](#live-delivery)).
+- **Per-client watch context.** The Change Overview measures against `base` (merge-base reviewer view) or `last-commit` (`HEAD` working view). `src/shared/watch-context.ts` serializes the client's scope and compare target, and `server/watch-session.ts` selects the corresponding roots and cached repository snapshot independently for each request and each document subscription. Two clients can therefore browse different scopes and comparison lenses through the same child process.
+- **Event-fed file indexing.** `server/file-observer.ts` uses native recursive directory subscriptions and a bounded discovery walk, with Chokidar for polling or unsupported platforms. `server/file-index.ts` applies path-specific changes and publishes bounded batches through `WatchSession`; normal edits never trigger a full document scan.
 - **WebSocket between SPA and terminal subsystem.** Authenticated by a cookie set on `POST /api/auth`; multiplexed across multiple PTY panes by `terminal/server.ts`.
-- **A single Bun binary.** No node, no separate frontend bundler — `Bun.serve` serves both the SPA and the API.
+- **A single Bun binary.** No node, no separate frontend bundler. The same binary runs the hub and every session child, and each child's `Bun.serve` serves the SPA and its API.
+
+## Web Push delivery
+
+The notification path runs independently of the page's brokered live stream:
+
+```text
+agent lifecycle --> ChatAdapter --> NotificationFeed
+                                         |
+                      /api/chat/notifications/events
+                                         |
+                         HubNotifications coordinator
+                                         |
+                        encrypted Web Push --> push worker
+```
+
+`chat/notifications.ts` tracks identified live occurrences and resolutions.
+OpenCode's `notification-lifecycle.ts` correlates native step and compatibility
+message records by assistant-message identity; unqualified idle/status frames
+do not create completion alerts. Claude's provider attaches execution identity
+and resolves cancellation/background state before emitting its notification
+outcome. The adapter checks workspace membership, excludes child completion,
+and routes child questions to their launching conversation.
+
+`chat/notification-feed.ts` provides bounded replay and an atomic pending-request
+snapshot/live handoff. Each lazy agent service owns a feed without starting its
+runtime. `MultiAgentChatService` qualifies and merges occurrences. The internal
+child route is declared by `server/routes.ts` and is refused through the browser
+proxy.
+
+`hub/notifications.ts` holds one notification upstream per interested running
+workspace, independent of visible pages. `notification-store.ts` atomically
+persists the VAPID keys, device enrollments, cursors, and event/device delivery
+journal. Authorization is checked against the enrollment's current hub session
+and workspace access before sending. Expiry, bounded retry, known interaction
+resolution, and subscription removal are delivery concerns. `push-sender.ts`
+uses the MIT-licensed Web Crypto implementation for encryption and VAPID signing.
+
+Pushes wait while the user is looking at Uatu. `hub/presence.ts` defines the
+signal and `LiveBroker` owns it: a hub user is *present* while at least one of
+their `activity` feed sinks exists. Only a visible session page holds a live
+stream subscribed to `activity`; hidden pages release theirs, and the dashboard
+never asks for the topic. When the last sink goes, the user is *recent* for 30 s
+(`PRESENCE_GRACE_MS`), then *away*. A new broker treats every user as recent for
+its first 30 s, so pages reconnecting after a restart are counted first.
+Presence is per user across devices. `startHubServer` hands the broker to
+`HubNotifications.usePresence`, and a presence change runs a delivery pass.
+
+`attempt()` decides once, before the first send:
+
+| Category | present | recent | away |
+|---|---|---|---|
+| turn completed | discarded | waits | sent |
+| needs answer | held (`heldAt`) | held | sent; a held one is released (`releasedAt`) first |
+
+A held question can be released up to `NOTIFICATION_HOLD_LIMIT_MS` (60 min)
+after the event, and its five-minute lifetime counts from the release. A held
+delivery stays `pending`, so resolution, gap reconciliation, access loss, and
+device or workspace removal discard it as they discard any unsent one. The
+child keeps unanswered requests for that hour plus one delivery lifetime (a
+question released at the limit still retries for five minutes), in both
+`AgentNotificationTracker` and `NotificationFeed`'s pending snapshot, so a late
+answer still announces its resolution and a gap snapshot still lists a held
+question. The replay ring keeps its five-minute window.
+
+While a page is open, `shell/attention-notice.ts` stands in for pushes about
+other workspaces. It reads hub-nav's `activity` reports and raises a notice when
+another workspace goes from not awaiting (held for at least 1.5 s, which rules
+out the broker's placeholder for a workspace it has not read yet) to awaiting.
+The page's first report per workspace is its baseline, and reconnects keep what
+the page knew. Open goes to `/s/<ws>/?awaiting=1`. Chat asks its own workspace
+through the internal `GET /api/chat/awaiting`, which returns the newest
+unanswered request's conversation id or null, then continues as for
+`?conversation=`, with the URL rewritten to that id. On null it shows the list
+with an "already answered" note. The `activity` summary itself stays four
+booleans.
+
+The hub serves `pwa/push-worker.js` at origin scope. It handles push and clicks,
+with no fetch handler or offline content cache. `notification-client.js` is a
+shared browser module, bundled into the SPA and served directly to hub pages;
+its declaration file supplies the TypeScript interface. Hosts inject URLs, and
+workspace boot requires the proxy's explicit `uatu-hub` marker before using
+`hubUrl()`. Legacy cleanup preserves active, waiting, and installing push workers.
+
+The 192px and 512px Home Screen icons have opaque white backgrounds and keep
+the complete mark inside the maskable safe circle. Regenerate them from the
+canonical SVG with `bun run generate:pwa-icons`; use `--check` to validate the
+checked-in pixels. `pwa/icons.ts` versions manifest and Apple touch-icon URLs,
+and the static session manifest carries the same revision.
+
+Notification URLs carry an agent-qualified `conversation` parameter (or the
+notice's `awaiting=1`) through login and document history changes
+(`carryNotificationTarget`). Chat opens that exact target or shows its
+read error. A matching window is focused without navigating another workspace's
+draft. A desktop window too narrow for the split uses a temporary Chat view
+that the existing collapse control dismisses; it does not change the stored UI
+mode.
+
+## Desktop viewport on tablets
+
+`shell/desktop-viewport.ts` owns the desktop work area's visible rectangle and
+safe-area overlap. It measures at boot and on mode changes, then coalesces
+visual-viewport resize/scroll and window resize events into animation frames.
+The scalar viewport observer is shared with the touch terminal through
+`shared/visual-viewport.ts`.
+
+Wide desktop browser layouts fit one fixed shell to that rectangle. Sidebar,
+preview, chat, and docked/fullscreen terminal therefore share the available
+height, including small hardware-keyboard accessory bars. Safe-area padding
+lives on that outer shell, so the desktop composer does not reserve the bottom
+inset again. A bottom-docked terminal is temporarily capped while the viewport
+is occluded, without changing its persisted size. Xterm refits through its
+existing host ResizeObserver.
+
+The narrow desktop layout remains a scrolling stack with a safe-area-aware
+sticky preview header. Native macOS hosting retains its existing titlebar and
+frost stacking contract. During pinch zoom, the desktop controller retains the
+last normal-scale layout and lets the browser pan it. Switching to touch clears
+the desktop measurements and hands sizing back to the touch chat/terminal
+controllers; Chat clears its own obsolete overrides immediately on mode change.
+
+Browser regressions inject safe areas and visual-viewport changes and assert
+header/composer bounds in Chromium and WebKit. They do not reproduce iPadOS's
+native glass or Magic Keyboard accessory UI. Those platform behaviors require
+physical-device acceptance in addition to the browser checks.
 
 ## Folder tour
 
@@ -45,8 +173,10 @@ Four boundaries to keep in mind:
 ```
 src/
 ├── app.ts                SPA entry — DOM queries, init calls, top-level boot
-├── cli.ts                CLI entry — process wiring: port probing, Bun.serve
-│                         assembly, watchdog spawn, signal handling
+├── cli.ts                CLI entry — dispatches `uatu hub`, and hosts the
+│                         session child the hub spawns (internal `serve`):
+│                         port probing, Bun.serve assembly, watchdog spawn,
+│                         signal handling
 ├── styles.d.ts           CSS module type declarations
 ├── index.html, styles.css, assets/   HTML shell + CSS + bundled assets
 │                         (logo, PWA icons + manifest,
@@ -55,8 +185,9 @@ src/
 │                         in the app, surfaced via the shared
 │                         `--mono-font-family` CSS variable on `:root`)
 │
-├── cli/                  CLI domain — argument parsing + usage text
-│                         (parse.ts) and TTY startup output (output.ts);
+├── cli/                  CLI domain — argument parsing, usage text, and the
+│                         refusal a user-shaped `serve` gets (parse.ts) and
+│                         TTY startup output (output.ts);
 │                         side-effect-free so the unit suite can import them
 ├── chat/                 The agent chat surface, shared across agents:
 │                         seam types (provider.ts, types.ts), the adapter
@@ -66,13 +197,18 @@ src/
 │                         inventory), client transport + validation, the
 │                         timeline renderer, and the whole browser UI.
 │                         Agent-specific code lives below the seam:
-│                         chat/opencode/ (loopback server runtime, SDK v2
-│                         provider, wire normalization) and chat/claude/
+│                         chat/opencode/ (loopback server runtime that
+│                         decides the spawned server's generation; v1/ and
+│                         v2/ hold one provider + normalization mapper per
+│                         OpenCode generation over a shared normalization
+│                         core — see "OpenCode generations") and chat/claude/
 │                         (probe-only runtime, per-conversation Claude
 │                         Agent SDK sessions, native-transcript reader,
 │                         model catalog (control-channel probe, manifest fallback), its own normalization)
 ├── shell/                App-wide chrome and the appState singleton: boot,
-│                         SSE event handling, URL/history, follow-mode
+│                         the page's one live stream (live-channel.ts) and
+│                         its lifecycle recovery (live.ts), document-state
+│                         handling (events.ts), URL/history, follow-mode
 │                         capability, connection chip, PWA registration
 ├── preview/              The right pane — every renderer that mounts HTML
 │                         into #preview: rendered / source / diff views,
@@ -103,14 +239,17 @@ src/
 ├── hub/                  The self-hostable session hub (`uatu hub`): config,
 │                         XDG state dir, workspace registry, the
 │                         SessionBackend seam + local-process backend,
-│                         HTTP/SSE/WS reverse proxy, hub auth (users, signed
+│                         HTTP/WS reverse proxy, the live broker
+│                         (live-broker.ts, live-sse.ts), hub auth (users, signed
 │                         cookie, rate limit, CSRF), dashboard pages, server
-│                         assembly, process wiring
+│                         assembly, process wiring, Agent accounts
+│                         (agent-account-*.ts: the machine's agent logins)
 ├── watchdog/             Heartbeat-driven hang recovery — spawned sibling
 │                         subprocess + forensic dump bundle
 ├── debug/                Observability — XDG-cache path resolution +
 │                         event-counter metrics
-├── pwa/                  PWA install affordance (manifest + SW asset refs)
+├── pwa/                  PWA assets, shared notification enrollment UI,
+│                         and the hub's push-only service worker
 └── shared/               Cross-cutting helpers: html escape, types,
                           license check, build version
 ```
@@ -126,7 +265,7 @@ supervises nothing. Each configured hub (`HubRoster.swift` — which may be
 authenticated natively (`HubAPI.swift`): a JSON login yields a session id
 held only in the Keychain, native API calls present it as `Authorization:
 Bearer`, and the id is written into the WebView's cookie store as the
-`uatu_hub` cookie before navigation so web and native surfaces share one
+hub session cookie before navigation so web and native surfaces share one
 server-side session. A 401 means the session is dead at the hub (expired or
 revoked — revocation is server-side); the app silently re-logs-in once with
 the Keychain password, then prompts. A sign-out observed in a web view
@@ -157,8 +296,8 @@ and the desktop app rides the same release train (see
 
 ## Base paths and the hub
 
-A serve session is relocatable under a path prefix: `uatu serve --base-path
-/s/uatu/` moves the entire HTTP surface — routes, assets, PWA scope, pushState
+A session child is relocatable under a path prefix: `--base-path /s/uatu/`,
+which the hub passes when it spawns a child, moves the entire HTTP surface — routes, assets, PWA scope, pushState
 document URLs, the terminal cookie's `Path` — under the prefix, with `/` as
 the byte-for-byte-unchanged default. Server-side, `buildRoutes` prefixes its
 static keys and the fetch fallback 404s anything outside the prefix;
@@ -175,29 +314,145 @@ a self-hostable daemon that keeps a workspace registry of absolute folder
 paths (stable collision-suffixed slugs; folders are added through a
 server-side directory browser or the API — there is no workspaces root;
 `backend` field reserved for a future container/VM backend), starts one
-loopback-bound `uatu serve` child per workspace through
-the `SessionBackend` interface (`hub/backend.ts` — the desktop wrapper's
-spawn contract: URL on stdout, held stdin as orphan backstop, SIGTERM), and
-reverse-proxies HTTP, SSE, and WebSockets under `/s/<id>/` from a single
+loopback-bound session child per workspace through
+the `SessionBackend` interface (`hub/backend.ts`: URL on stdout, held stdin
+as orphan backstop, SIGTERM), and
+reverse-proxies HTTP and WebSockets under `/s/<id>/` from a single
 TLS-terminating, login-gated port (`hub/proxy.ts`, `hub/auth.ts`,
 `hub/server.ts`). Authentication is a server-side session store in the hub's
 state dir: login mints an opaque session id (recorded with user, issue time,
-and a device label), browsers carry it in the `uatu_hub` cookie, native
+and a device label), browsers carry it in the session cookie, native
 clients carry the same id as `Authorization: Bearer`, and both transports
 resolve through one store lookup — so sign-out and the dashboard's
-per-device revocation kill a session everywhere, immediately. Login is
+per-device revocation kill a session everywhere, immediately. The cookie
+is `uatu_hub` at the scheme's default port and `uatu_hub_<port>` on any
+other port (`hub/auth.ts`). Browsers scope cookies by host, so without the
+suffix port-forwarded hubs on one host would share a jar. Login is
 required on every interface, loopback included; there is no trusted local
 mode. The hub is a trusted intermediary: it authenticates the client and
 validates its Origin (bearer requests are exempt — they carry no ambient
 credential), then forwards loopback-shaped `Host`/`Origin` headers and
 brokers the child's session token server-side — children keep their
-localhost security model unchanged and are never network-reachable. `uatu
-serve` remains the internal session child the hub spawns (its supervisor
-contract: URL on stdout, held stdin as orphan backstop, SIGTERM), but is
-deprecated as a public command. Operator documentation lives in
+localhost security model unchanged and are never network-reachable. A few
+session-path routes never reach the child at all: `/api/personal-state` and
+`/api/activity-viewed` carry facts about the hub's authenticated user rather
+than about the workspace, so the hub answers them itself, behind the same
+Origin check as any other session-path write. Live
+updates do not go through the proxy; [Live delivery](#live-delivery) covers
+them.
+
+The hub also owns Git worktrees: a linked checkout is a child workspace of
+the main one it forks from, sharing its Git objects and repository
+configuration. `src/hub/worktree-service.ts` composes the service — Git
+probes and the coordinator (`worktree-git.ts`), non-force creation
+(`worktree-create.ts`), credential-aware fetch (`worktree-fetch.ts`),
+deletion preflight and the confirm-stop-fence-recheck-remove sequence
+(`worktree-delete.ts`), the rename guard (`worktree-rename-guard.ts`), the
+durable intent/provenance journal with restart recovery
+(`worktree-journal.ts`), Git-backed reconciliation on open/activity/manual/
+periodic cadence (`worktree-reconciler.ts`), and onboarding
+(`worktree-registrar.ts`) — and answers every operation through one
+session-authenticated JSON family, `worktree-api.ts` at
+`/api/hub/worktrees` (`GET ?source=` inventory, `POST
+/{fetch,create,open,preflight-delete,delete,register,forget}`), published
+like any other hub route with no separate progress poll: each call answers
+its own bounded outcome, and a safety refusal is an ordinary `{ok: false,
+error}` response rather than a transport failure. `src/shell/worktree-dialog.ts`
+is the one client for that family — a shadow-DOM dialog embedded both in
+the in-workspace picker (`shell/hub-nav.ts`) and the hub dashboard
+(`hub/pages.ts`) — and `shell/worktree-live.ts` refreshes an open
+register list (the fork menu's `Register worktree…`, the checkouts Git lists
+that Uatu has not registered) from the live stream's cursor-free `worktrees`
+topic without touching the page's own document or conversation selection. Design rationale (safety
+model, provenance, parent credential inheritance) is in
+`openspec/changes/archive/2026-09-20-add-git-worktree-workspaces/design.md`.
+
+Deletion's safety inspection (`inspectRemovalSafety` in `worktree-delete.ts`)
+returns the first blocker in a fixed order — identity, Git lock, nested linked
+worktree, Git operation markers, then submodules and nested repositories: the
+checkout's own `<gitdir>/worktrees/<id>/modules` store, a `.git` at the root of
+any untracked or ignored directory entry, and, from `git ls-files --stage` on
+every inspection, populated gitlinks and any ancestor directory of a tracked
+path or status entry — Git removes a repository nested in tracked content even
+without force. A candidate holds a repository if it has a `.git` entry, or, as
+a bare repository or administrative directory, a non-directory `HEAD` with
+`objects/` and `refs/` directories or with a `commondir`/`gitdir` file; Git
+lists an untracked bare repository's files one by one, so this is what keeps
+its history from passing as ordinary untracked data. Those candidates are
+de-duplicated in linear time, sorted (so the path a refusal names is
+deterministic) and checked with at most 32 candidates in flight. The status and index listings run
+with a 60-second timeout and the index with a 64 MiB output bound (the
+runner's defaults are 10 seconds and 4 MiB). An unreadable status, index or
+folder, an exceeded bound, or a path that did not decode as UTF-8 fails closed
+as "could not be inspected". Tracked changes, untracked files and ignored files
+are not blockers: they come back as a local-data description — per-category
+counts and up to `WORKTREE_LOCAL_DATA_SAMPLE_LIMIT` (shared with the contract
+parser) sorted checkout-relative samples — plus a SHA-256 fingerprint over a
+domain tag, the checkout id and every `XY` status/path entry sorted by path.
+Preflight publishes it as `localData`; a delete must echo the fingerprint as
+`localDataFingerprint`, and one helper, `localDataRefusal`, re-verifies it at
+all three checks under the fence (the fenced re-preflight, the post-stop
+recheck, and the final probe immediately before Git), refusing a missing or
+stale acknowledgement as `local-data` (a stale one with `retry: refresh`). Nothing is stored between preflight and
+delete, and the journal is unchanged. Removal is `git worktree remove` without
+force by default; `removalRequiresForce` adds a single `--force` only when the
+final, fingerprint-matched data has tracked or untracked entries (Git deletes
+ignored files without force), and `buildWorktreeRemoveArguments` refuses any
+argument list with more than that one force (`-ff` counts as two), so a lock
+is never overridden. The removal runs with its own ten-minute timeout, since
+deleting a large ignored `node_modules/` can take far longer than a probe.
+
+The session child is `uatu serve`, and it is no longer a user command. A
+user-shaped invocation (`uatu serve`, the removed `watch` alias, a bare
+`uatu <path>`) prints the hub bootstrap steps and exits non-zero
+(`serveRemovedText` in `cli/parse.ts`). `serve` runs only for the hub's
+spawn, whose `--exit-on-stdin-close` marks the supervisor contract, and for
+source runs (`bun run src/cli.ts serve …`, detected from the script path in
+`Bun.argv[1]`), which the repository's own tests use. `bun run dev` starts a
+dev hub (`scripts/dev-hub.ts` with `dev/hub.json`). Operator documentation lives in
 `docs/SELF-HOSTING.md`;
 the design rationale (single-origin proxy over port-per-session, restart
 semantics, trust model) in `openspec/changes/add-uatu-hub/design.md`.
+
+## Live delivery
+
+A page gets pushed updates over exactly one long-lived connection: `GET /api/hub/live`, a server-sent-events stream at the hub origin, authenticated by the hub session like any other hub request. Document state, the chat inventory, conversation events (a subagent transcript is a conversation too), and the activity of the user's other workspaces all ride it as typed envelopes. The wire contract, including frame order and bounds, is `src/shared/live-protocol.ts`. The reasoning is in `openspec/changes/hub-brokered-live-stream/design.md`.
+
+The count is the point. Browsers allow six HTTP/1.1 connections per host, shared by every tab, and `Bun.serve` speaks only HTTP/1.1. When each pane held its own stream, two session tabs with chat open used up the budget and every later request stalled. On the hub side, Bun caps outbound `fetch` at 256 concurrent requests per process, and every proxied stream used to take one. Now a tab costs one connection whatever is open in it, and the hub's connections to a child follow what is watched, not how many tabs watch it.
+
+```mermaid
+sequenceDiagram
+  participant Tab as Browser tab (shell/live-channel.ts)
+  participant Hub as Hub (hub/server.ts, hub/live-broker.ts)
+  participant Child as Session child (server/routes.ts)
+  Tab->>Hub: GET /api/hub/live (ws, subs: document + inventory)
+  Hub-->>Tab: ": open", then event: hello with the stream id
+  Hub->>Child: GET base/api/events (first subscriber only)
+  Child-->>Hub: event: state (snapshot or patch)
+  Hub-->>Tab: event: live, topic document, cursor, data
+  Note over Child: a watched file changes
+  Child-->>Hub: event: state
+  Hub-->>Tab: event: live (to every tab subscribed to the topic)
+  Tab->>Hub: POST /api/hub/live/streamId/subscriptions (add conversation)
+  Hub->>Child: GET base/api/chat/conversations/id/events
+```
+
+- **The stream.** The response writes `: open` at once, then a `hello` event carrying an unguessable stream id, then `live` envelopes `{ ws, topic, key?, cursor, event }`. While idle it sends a `: keepalive` comment every 15 s. The query names the workspace (`ws`), opts into activity (`activity=1`), and lists the initial subscriptions with the cursor each one resumes from (`subs`).
+- **Subscription changes.** Selecting a conversation or opening a subagent never opens a connection. The page posts `add` and `remove` operations to `POST /api/hub/live/<streamId>/subscriptions`, which the hub accepts only from the hub session that owns the stream, so one tab can't steer another's. An `add` for a key that is already subscribed replaces it; that is how a topic re-attaches after a resync.
+- **Topics.** `document` is keyed by the watch context and carries a baseline snapshot followed by file patches and independent repository updates. The Hub applies patches to a keyed accumulator and materializes a current snapshot for joining or behind clients. The child epoch and predecessor revision protect application ordering independently of Hub transport cursors. Only full snapshots can replace queued document frames; patches retain their order. `inventory` invalidates the chat conversation list, `conversation` carries one conversation's events, and `activity` carries the validated workspace summary.
+- **Cursors and signals.** Each topic has its own opaque cursor, and only `data` events advance it. A reconnect presents every retained cursor, so each topic resumes independently and a stale conversation cursor never forces a document resync. Besides `data`, a topic can receive `ready` (attached, any owed replay written), `resync` (the cursor can't be replayed: take a fresh snapshot, then add the subscription again), or `unavailable` (the upstream failed or the child exited, and the hub is retrying). All three are scoped to their topic and never end the stream.
+
+**Fan-out at the hub.** `hub/live-broker.ts` holds one upstream subscription per (workspace, topic, key). The first interested client stream opens it and every later one shares it. The upstreams are the child's own SSE routes: `/api/events` for document state, `/api/chat/conversations/events` for the inventory, `/api/chat/conversations/<id>/events` for one conversation, and `/api/activity` for the workspace's working/awaiting summary (`hub/live-sse.ts` parses them). When the last subscriber leaves, the upstream lingers for 3 s (`LIVE_LINGER_MS`), so a reload or a quick A→B→A switch doesn't churn the child. After that the broker aborts it explicitly, which cancels the request at the child. Each upstream keeps a 256 KB replay buffer (`LIVE_REPLAY_BUFFER_BYTES`). A client cursor inside the buffer replays from the hub; one behind it falls back to the child's own replay, or its resync. An upstream failure sends `unavailable` to each subscriber, leaves every client stream open, and retries with capped backoff while anyone is still subscribed. The `activity` topic is computed per user: the hub merges its own session state (`running`) with each running child's `/api/activity` summary, which the broker subscribes to on its own account rather than on a client's (below). That summary stays two booleans, and `working` is the broader of them — a conversation counts while a turn is in flight *or* while the agent still holds live background work, so a workspace whose agent has backgrounded a command does not read as idle in someone else's switcher.
+
+**`finished` is the hub's own fact.** The child cannot supply it: it is per user, and it is about not having looked. Beside the feeds the broker keeps three marks — the last value each workspace's shared activity upstream delivered, a stamp for the moment that value went from working to quiet, and a per-user stamp for the last acknowledged view of the workspace. A user's `finished` is the composition of those: running, not working, nothing awaiting, and the finish outranking that user's last view. The marks sit at the broker rather than in a feed because a feed is discarded when the user's last page closes, and "switched away, came back later" is exactly the case the fact exists for. The *observation* is the broker's for the same reason: it holds one `activity` attachment per running workspace (`activityWatches`), opened when the session starts and released when it stops, and a feed only reads what that has recorded. An upstream attached per feed, as one was, sees nothing while every page is closed — which is precisely the work the fact is about. The production hub arms watching when it constructs the broker (`watchActivityFromStart`, set by `hub/main.ts`), so every running workspace is watched from the moment the hub starts and every session started later from its start, whether or not any page ever connects: a client that starts a session and drives its chat through the proxy without opening a page still has its finishes recorded. The marks are restored first, so no watch can compose a value before them. Brokers built for tests keep a lazy default, armed by the first activity subscription of their lifetime and never disarmed, so the e2e harness and unit fixtures for other topics open no child stream nobody asked for. A transition is read only between two values the watch delivered, so a page opening onto an already-quiet workspace invents nothing, and `working → awaiting` is not a finish. A stop the hub observes, a return to working, or a workspace leaving the registry forgets the marks. A child that goes unreachable does not: its upstream reports `unavailable` on the first failure of any episode, including a single dropped stream the retry recovers from, so it is recorded as not running instead — nothing resurrects it as live, the marks survive, and the recovered stream's first value has no working predecessor to misread as a finish.
+
+The marks outlive the hub process. `hub/activity-marks.ts` keeps `finishedAt` and `viewedAt` in `activity-marks.json` in the state dir, read once at startup and written back debounced and atomically (temp file, mode, rename) — `hub/personal-state.ts`'s shape and its failure behaviour with it: a missing, truncated or otherwise unreadable file starts the marks empty rather than refusing to serve, and a write that fails degrades them to memory-only instead of taking a live stream down. The last observed value is deliberately not among what is written: after a restart the hub has heard nothing, so the first frame it receives must have no predecessor and cannot be read as a finish. The stamp counter resumes above the highest stamp read back, which is what keeps "the finish outranks that user's last view" meaningful across the restart. A restart stops every session, and that is not the workspace being stopped — so a registered workspace that is merely not running keeps its marks, only a stop the hub actually watched clears them, and marks for a workspace the registry no longer names are dropped when the watches next reconcile. A hub upgrade during a long agent run is exactly when forgetting would be felt.
+
+The clearing signal comes from the page that is looking: `POST /s/<id>/api/activity-viewed`, which the hub answers itself. `shell/hub-nav.ts` posts it when its own workspace reads finished and `chatSurfaceInView()` (`chat/surface-visibility.ts` — a side-effect-free module apart from the chat panel so the switcher does not load the panel's state and storage; read from the attributes on `<html>` so chat and the switcher agree by construction) says the chat is the surface in front — on the activity update that says so, or on the `uatu:chat-surface-active` event chat dispatches when the surface comes forward. An acknowledgement re-derives that one user's feed, on every device they have open; another user watching the same workspace still sees it finished.
+
+**Child routes are internal.** The child's SSE routes are the hub↔child protocol, and the hub does not proxy them. A browser request for `/s/<id>/api/events` or either chat events route gets a non-cached error naming `/api/hub/live`. The child never learns the hub's address and holds no credential for it; the hub reaches the child through the endpoint and token it already brokers.
+
+**One channel in the page.** `shell/live-channel.ts` owns the stream: capped-exponential reconnect, a generation per attempt so events from a superseded stream are dropped, per-topic cursors, and subscription changes. `shell/live.ts` holds that one channel for the page and runs the one lifecycle recovery. A `pageshow`, `visibilitychange`, or `online` wake-up reconnects the stream and runs the reconciliation each consumer registered, in one coalesced pass. A hide (`visibilitychange` to hidden, or `pagehide` whatever `persisted` says) only *suspends* the channel — socket closed, subscriptions and cursors kept, listeners still armed — because iOS fires an unpersisted `pagehide` for a home-screen page it then keeps alive; nothing disposes the channel from a lifecycle event. Each recovery task is bounded (the state fetch has a timeout, and the coalescer releases its in-flight slot after a ceiling) so one hung request cannot swallow every later wake-up. `requestManualRecovery()` is the user's escape hatch behind Chat's interruption-line Reconnect and the shell's connection indicator: the same recovery in place, then a reload if the channel does not confirm live within a bounded window. The consumers keep their own callbacks. `shell/events.ts` handles `document` and confirms the shell's connection indicator once the current generation has applied state. The chat client handles `inventory` and `conversation` and reports topic-scoped trouble as chat-surface status, never as shell status. `shell/hub-nav.ts` shows `activity` in the workspace switcher.
 
 ## Request lifecycle
 
@@ -221,37 +476,114 @@ sequenceDiagram
 
 Failure paths:
 
-- File no longer exists → Session throws → Routes returns 404 → `preview/mount.ts` shows the "no longer exists" empty state.
+- File no longer resolves to a readable file (the id is not indexed, or the read fails with `ENOENT`, `ENOTDIR`, `EISDIR`, `ELOOP` or `ENAMETOOLONG`) → Routes returns 404 `{ error: "document not found" }`, unlogged → `preview/mount.ts` shows the "may have been removed or excluded" notice without retrying. The `document` topic re-fetches when the file comes back.
+- File cannot be read (`EACCES`, `EPERM`) → Routes returns 403 `{ error: "document not readable" }`, unlogged → `preview/mount.ts` shows the permission notice without retrying. A `chmod` is not reliably reported by the watcher, so the notice asks the user to select the file again, which makes one request.
 - File is binary → Session throws `"document is binary"` → Routes returns 415 → `preview/binary.ts` or `preview/image.ts` renders the appropriate fallback (image for `.png` / `.jpg` / etc., a "not viewable" notice otherwise).
+- Anything else (a renderer that throws, `EMFILE`, `ENFILE`, `EAGAIN`, `EBUSY`, `EIO`, an unrecognized error) → Routes returns 500 `{ error: "document render failed" }` and logs the document and cause (`documentErrorStatus` in `server/render-dispatch.ts`) → `preview/mount.ts` says the file couldn't be loaded and retries on its bounded schedule (`preview/load-retry.ts`).
 
-The companion SSE stream:
+On the client, `preview/load-retry.ts` classifies each failed load as a `DocumentLoadFailure`: no complete answer (`fetch()` threw, or an OK answer's body stream broke), any 5xx, and a 408 or 429 (a proxy's timeout or rate limit; `Retry-After` is not read) are transient and retried; every other 4xx, and an OK answer whose body does not parse as a document payload, is final. `classifyDocumentResponse` turns a status and body text (or `null` when the body read threw) into a failure; a non-JSON error body (a proxy's HTML page) or a non-OK body that broke mid-read yields no tag, so it is classified by status alone (`mount.ts` reads the body in its own `try` after `fetch()` resolves, so a 404 whose body breaks stays final). `documentFailureMessage` picks the notice; the permission text requires both the 403 and the `document not readable` tag (`DOCUMENT_NOT_READABLE_ERROR` in `shared/document-errors.ts`, imported by both `server/routes.ts` and `load-retry.ts` so the two sides cannot drift), so another 403 gets the generic "select it again" notice.
 
-```mermaid
-sequenceDiagram
-  participant Browser
-  participant Routes as server/routes.ts
-  participant Session as server/watch-session.ts
-  participant Watcher as chokidar
-  Browser->>Routes: GET /api/events (EventSource)
-  Routes->>Session: eventsResponse()
-  Session-->>Browser: SSE connection open
-  Watcher->>Session: file changed (debounced)
-  Session-->>Browser: event: state, data: <StatePayload>
-  Note over Browser: shell/events.ts<br/>updates appState + re-renders
-```
+Pushed updates take a different path. The child emits state events on its internal `/api/events` route, and the hub fans them out to every subscribed page over `/api/hub/live` (see [Live delivery](#live-delivery)).
+
+### Discovery, updates, and recovery
+
+The CLI starts HTTP and prints its existing readiness URL while discovery runs.
+State distinguishes `indexing`, `ready`, `recovering`, and `error`; an incomplete
+inventory does not prove that a requested document is absent. Direct navigation
+can resolve one allowed path without waiting for the rest of the tree.
+An unresolved direct link retains its relative destination while indexing is
+incomplete or failed; successful recovery opens that destination rather than
+an unrelated default. Explicit navigation or enabling Follow cancels the wait.
+
+`server/file-observer.ts` starts observation before its discovery walk. Native
+subscriptions cover directory roots and can be shared with nested roots.
+Recovery opens fresh coverage before releasing the old observer. A single-file root observes its parent but accepts only
+that file. The observer bounds metadata work to 16 concurrent paths, excludes
+denied directories before descent, and does not follow symlink entries.
+Unsupported recursive watching and explicit polling use Chokidar's normalized
+initial events instead. Both backends supply stats to the index and normalize
+atomic replacement with a short removal delay.
+
+A native rename notification may name only the temporary source. The observer
+coalesces those notifications into a shallow metadata check of the containing
+directory, including existing entries that may have been replaced. A single-file
+root rechecks only its allowed target. Unchanged subdirectories are not crawled;
+ordinary content-change notifications still inspect only the reported path.
+
+`server/file-index.ts` owns each root's path map, directory membership, and
+classification queue. Known extensions need no content read; unknown types
+use the existing 8 KB sniff with at most eight concurrent classifications.
+`newest-document.ts` maintains Follow's catch-up candidate without sorting the
+whole corpus per edit. File batches use a 150 ms trailing debounce with a
+two-second maximum wait, preserve every affected path, and yield between
+256-entry publication chunks. Initial discovery never acts as a Follow edit.
+
+`server/repository-refresh.ts` owns Git refreshes separately. It shares common
+work across comparison targets and marks results pending, stale, ready, or
+failed. Collection is triggered by file batches and, while document
+subscribers exist, by `server/git-observer.ts`. That observer works like VS
+Code's Git extension: non-recursive watches on the Git directory, the shared
+Git directory of a linked worktree, and the directories holding the current
+branch and compare-base refs. It ignores lock and temp files, `objects`,
+`FETCH_HEAD` and fsmonitor cookies, and re-resolves its paths when a `HEAD`
+moves. A watch root narrower than its repository also gets one recursive
+working-tree watch on the repository top level, because edits outside the root
+never reach the content watcher. Inside a root, the content watcher forwards
+every path it sees (its `raw` event), including the ones its policy excludes,
+such as `dist/`, `node_modules`, `.uatu.json` excludes and gitignored paths.
+The observer drops `.git` paths and untracked paths the top-level `.gitignore`
+matches, and keeps tracked files it matches (`git ls-files --cached --ignored`,
+refreshed on index and any `.gitignore` change). The browser never polls for
+repository data. In polling mode, or after a watch fails, a collection runs
+every 5 s instead, as v0.7.0 always did. Collections start at most
+once per 2 s after the first prompt one; Git reads run with
+`GIT_OPTIONAL_LOCKS=0`, so collection never rewrites the index it observes. A
+result identical to the published one (ignoring Git's wall-clock
+`relativeTime`) publishes nothing and keeps its generation, and "stale" is
+announced only when a collection is still pending after one second. Those
+operations never initiate a document scan. Source and Rendered responses read
+fresh bytes and filesystem facts without waiting for Git. The browser enriches
+the facts strip through `/api/document/facts`, with one current in-flight
+request and revision/generation checks on completion. Commit ages in the Git
+Log and the commit preview are rendered in the browser from `committedAtMs`
+(`shell/commit-ages.ts`, one ticker, paused while the page is hidden). Diff
+mode re-fetches the active diff after a repository update only when that
+file's diff inputs moved (`preview/diff-input-key.ts`: `HEAD`, compare base and
+target, and the file's change entry). Session shutdown cancels repository Git
+subprocesses and prevents subsequent collection steps from starting under the
+cancelled operation.
+
+Ignore-policy changes, observation failures, and authenticated explicit
+`POST /api/index/recover` requests rebuild affected roots. Replacements collect
+a coherent inventory before taking ownership, and current exposure rules apply
+to reads while recovery is pending. Automatic observation recovery has bounded
+retries; the UI offers Retry indexing after failure. Browser transport recovery
+alone consumes current server state rather than starting another filesystem
+walk. There is no periodic document-tree rescan.
+
+`shared/document-updates.ts` supplies the Hub/browser reducer. Per-file revisions
+invalidate Source, Rendered, split, Diff, and image representations even when
+mtime is unchanged. Snapshots retain the latest eligible edit so a returning
+Follow client can catch up once; repository updates cannot replay that edit.
+Content-only patches avoid tree path reconciliation. Membership changes use
+the tree library's incremental methods, whose internal visible-row projection
+may still be rebuilt. Full snapshots and explicit filter changes can reset the
+tree. Index watch/stat/directory counters and the Git observer's
+`git_observer.events_total` and `git_observer.fallback_total` remain available
+to the existing watchdog diagnostics.
 
 The route table that wires both of these requests is declared exactly once, in `src/server/routes.ts` via `buildRoutes({ mode: "prod" | "e2e", ... })`. Both `src/cli.ts` (production) and `tests/e2e/server.ts` (the Playwright harness) call it.
 
 ## State lifecycle
 
-The SPA's source of truth is `appState`, a module-level mutable singleton in `src/shell/state.ts`. The SSE handler in `src/shell/events.ts` is the only path that mutates `appState` from external events.
+The SPA's source of truth is `appState`, a module-level mutable singleton in `src/shell/state.ts`. The `document` topic consumer in `src/shell/events.ts` is the only path that mutates `appState` from pushed events.
 
 State is deliberately split into four lifetimes:
 
 | Lifetime | Examples | Owner / storage |
 |---|---|---|
 | Child session | watched roots, file index, repository snapshots, live PTYs | `server/watch-session.ts` and `terminal/server.ts`; ends when the child stops |
-| Client watch context | scope and compare target used by state, SSE, search, navigation, and diff requests | explicit URL/query context from `shell/watch-context.ts`; never mutates another client |
+| Client watch context | scope and compare target used by state, search, navigation, and diff requests and by the `document` topic's key | explicit URL/query context from `shell/watch-context.ts`; never mutates another client |
 | Personal workspace state | selected document, Follow, preview mode, compare target, Files filter, last-active PTY id | Hub store keyed by authenticated user + stable workspace id in `hub/personal-state.ts`; local Hub uses identity `local` |
 | Client presentation | sidebar and preview geometry, terminal dock/splits/pane attachments, transient visibility | base-path-namespaced browser local/session storage in `shell/presentation-storage.ts`; native macOS window/split geometry remains in `UserDefaults` |
 
@@ -263,7 +595,8 @@ Every `appState` field has exactly one owning module: direct assignment (`appSta
 |---|---|
 | `selectedId`, `previewMode` | `shell/selection.ts` |
 | `followEnabled` | `shell/follow.ts` (the four follow-mode rules) |
-| `roots`, `repositories`, `scope`, `unscopedFingerprint` | `shell/events.ts` (`applyServerSnapshot`) |
+| `roots`, `repositories`, `discovery`, `repositoryFreshness`, `unscopedFingerprint` | `shell/events.ts`; boot adopts a snapshot, live delivery applies ordered patches |
+| `scope` | `shell/watch-context.ts` |
 | `viewMode`, `wrap` | `preview/view-mode.ts` |
 | `viewLayout`, `splitRatio` | `preview/layout.ts` |
 | `diffStyle` | `preview/diff.ts` |
@@ -274,15 +607,15 @@ Every `appState` field has exactly one owning module: direct assignment (`appSta
 
 ```mermaid
 sequenceDiagram
-  participant Watcher as chokidar (server)
+  participant Watcher as file observer and index (server)
   participant SSE as src/shell/events.ts
   participant State as src/shell/state.ts (appState)
   participant Sidebar as src/sidebar/shell.ts (renderSidebar)
   participant Preview as src/preview/mount.ts (loadDocument)
 
-  Watcher->>SSE: state event (new roots, repositories, scope, changedId)
-  SSE->>State: appState.roots / repositories / scope = ...
-  SSE->>Sidebar: renderSidebar()
+  Watcher->>SSE: document patch (upserts, removals, revisions, changedId)
+  SSE->>State: apply affected index entries
+  SSE->>Sidebar: apply membership and selection changes
   Note over SSE: chooseSelectionForFileEvent (follow-mode)
   alt Follow on
     SSE->>State: appState.selectedId = changed file (Rule C)
@@ -290,16 +623,18 @@ sequenceDiagram
   else Follow off, selection is the changed file
     SSE->>Preview: loadDocument(selectedId) — Rule D, reload in place
   else Follow off, selection unrelated to change
-    Note over SSE: tree re-renders, selection unchanged
+    Note over SSE: update affected entries, preserve selection
   end
 ```
 
 The four authoritative rules of the `follow-mode` capability — defined in `openspec/specs/follow-mode/spec.md` — are the only paths that change `appState.followEnabled` or `appState.selectedId`:
 
 - **Rule A** (user clicks a tree row): selection moves to that file; follow turns off. Guarded by `TreeView.duringProgrammaticUpdate` so library-fired callbacks during mount or `resetPaths` are not mistaken for user input.
-- **Rule B** (user clicks the Follow toggle): `followEnabled` flips. Turning on jumps to the newest-mtime file in the current session.
-- **Rule C** (file event + follow on): selection moves to the changed file.
+- **Rule B** (user clicks the Follow toggle): `followEnabled` flips. Turning on jumps to the newest-mtime document in the current session (images are not candidates).
+- **Rule C** (file event + follow on): selection moves to the changed file when the preview can show it — a document, or an image it renders inline (`isFollowableFile` in `src/shared/types.ts`, used by the server's `changedId` nomination in `src/server/file-index.ts` and by the client). Other binaries are ignored. The exception is an image embedded in the document on screen: its change keeps the selection and the embedded image refreshes in place. The embedded images come from the document's rendered payload (`src/preview/embedded-images.ts`), never from the live preview DOM, so the exception holds in Rendered, Source, Diff, and split views; a document shown only as Source or Diff has its rendered payload looked up once per revision for this. What a document embeds is known only for its current revision; until then an image change is held, not guessed (`imageChangeOutcome` in `src/shell/follow-rules.ts` answers select, stay, or defer). `src/shell/image-follow.ts` holds that one decision and settles it when the lookup answers — embedded stays, otherwise, or if the lookup fails or goes unanswered for 10 s, the image is followed — but only while Follow is on and the selection, user activation, Follow switches, and the document's revision are unchanged; any newer file change cancels it. All three selection paths in `events.ts` (incremental patch, full frame, reconcile) apply it through one helper, `followableChange`.
 - **Rule D** (file event + follow off): selection unchanged; if the changed file equals the current selection, the preview reloads in place; otherwise just the tree refreshes.
+
+Images in the preview — an opened image or one embedded in a rendered document — that resolve to a watched file carry that file's change revision as a `?revision=` query (`documentRevisionKey`, applied by `src/preview/image-revision.ts`), updated in place on mount and on every applied state update. A browser reuses an already-decoded image for an unchanged URL whatever the cache headers say, so this is what makes a changed image show its new content without re-rendering the document around it; the static-file fallback matches on the path and ignores the query. An image Follow switched to is an ordinary destination afterwards: reload, workspace-root resume, and Back restore it (`boot.ts`, `history.ts` accept any `isFollowableFile`).
 
 ## Chat surface
 
@@ -312,14 +647,133 @@ The chat surface speaks one timeline model for every agent (`src/chat/types.ts`)
 | `tool`, `command`, `file_change` | What the agent did. A running tool carries `elapsedMs` from the agent's progress heartbeat; a shell tool's command is its subject. | Activity rows, groups |
 | `permission`, `question` | Interactions the user must answer. A `question` with `source` is a tool-driven dialog or an MCP elicitation, answered through the same operations. The persistent-approval sentence on a permission card is the owning agent's own (`ChatAgent.permissionScopeNote`). | Cards |
 | `task_progress` | The agent's todo list, one presentation updated in place | Pinned track |
-| `background_task` | A task the agent runs in the background, updated in place from start to settling. Running ones are listed above the composer with a stop control; settled ones are rows. | Composer list, timeline |
+| `background_task` | A task the agent runs in the background, updated in place from start to settling. Running ones are listed above the composer with a stop control and open for inspection; settled ones are rows. A `foreground` one is the run a typed command launched, listed with the subagents only. | Composer list, drill-down, timeline |
 | `context_report` | The agent's own statement of window occupancy (total, max, categories, plan utilization). Data for the readout, never a row; the readout uses whichever of a report or a usage carrier is newest. | Context meter |
+| `context_window` | A limit-only observation, scoped by model and execution `contextKey`, with source and freshness. Replayed and recovered as data, never a row or an occupancy sample. | Context meter |
 | `compaction` | Where the agent compacted its context, with before/after figures | Timeline marker |
-| `turn_status`, `notice` | A turn's outcome; warnings and errors. A `notice.code` (`rate-limit-*`, `refusal-fallback`) drives the composer's badge. | Timeline, composer |
+| `turn_status`, `notice` | A turn's outcome; warnings and errors. A `notice.code` (`rate-limit-*`, `refusal-fallback`) drives the composer's badge. `login-failed` marks a turn that failed on the agent's login and renders with the way to log in; `reauthenticating` is the one item an agent occupies while it signs in again. | Timeline, composer |
 
-Conversation status is `idle`, `sending`, `running`, `completed`, `interrupted`, `failed`, plus three named states: `retrying` and `compacting` are live-turn states (the composer offers Cancel, a new prompt is held), `background` means no turn is running but the agent still holds live background work (prompting is possible). `isLiveConversationStatus()` in `types.ts` is the one rule for which statuses are live.
+Claude context-window discovery is independent of occupancy. A query asks for
+`getContextUsage({ detail: "summary" })` before its first prompt. Prompt delivery
+waits at most two seconds; an eligible late answer can correct the window while
+the turn runs. The provider rejects replies from superseded query, selection,
+or account contexts. It retains bounded `context_window` records for snapshot
+recovery, and attaches the same `contextKey` to the usage they describe. A newer
+session observation can increase or decrease a limit. Known fallback values are
+estimates; unknown model ids have no invented 200k limit. Cached observations
+retain their requested selection, resolved model, and known catalog resolution.
+Unset and explicit default selections share a cache identity; known alias or
+variant changes prevent reuse. A fresh answer or usage naming another model
+supersedes the cached default. Transient discovery
+failures get bounded retries. Each logical read races its SDK request against
+a deadline and invalidation signal, releasing the in-flight slot even if the
+SDK never answers. Abandoned replies cannot publish or clear a newer read.
+If prompt admission rolls back a staged model, it also restores the previous
+window binding and restarts discovery after restoring the live controls.
+Turn-end and on-demand reports take over pending discovery. If a current
+report cannot confirm a window and work keeps the query alive, discovery
+resumes with its remaining summary retry budget, rather than starting over.
+Account changes during startup trigger revalidation before delivery within
+the same total startup wait budget. Changes after delivery also reset and
+restart discovery for queries held by a turn, background work, or wakeups.
+`UATU_DEBUG=1` logs the model ids, phase,
+source, epoch, and outcome of discovery without prompt or credential payloads.
+Catalog walks retain their ownership handle through query cleanup. An obsolete
+walk closes its own query but cannot release a replacement's handle or alter
+its retry schedule; callers waiting for settled windows follow replacements.
+Retry records are pruned against the currently offered selection/resolution
+keys before deciding or scheduling a probe. This includes "More models" and
+preserves the separate unpinned-default retry. Removed rows and late failures
+from an obsolete catalog cannot leave an expired retry reopening probes.
 
-A Claude Code conversation's session lifetime (`src/chat/claude/provider.ts`) follows the work, not the first result: the SDK session is retired on a turn's result only when no accepted prompt is pending, no unprompted follow-up is in flight, and the background set (`background_tasks_changed`, ambient tasks excluded) is empty. While the set is non-empty the conversation reports `background`. When a backgrounded task settles the CLI starts a follow-up turn by itself (see the D9 spike in the change's design notes); the provider reports that turn as running and completed like any other. A set that empties with no follow-up returns the conversation to idle after a short grace window. Conversation titles follow the transcript's own entries: a user rename (`custom-title`) outranks Claude Code's generated title (`ai-title`), which outranks the first prompt.
+Catalog discoveries advance an agent-scoped revision carried by the existing
+inventory stream's optional `catalogs` map. Browsers refresh the changed agent's
+banked models and repaint the meter without opening the picker. The Hub retains
+the latest inventory payload for joining and reconnecting pages, including
+those reusing a lingering upstream. A reopened child upstream starts with no
+retained payload, so old catalog revisions cannot cross into its new epoch.
+The browser keeps revisions received before initial catalog loading as pending.
+Once the catalog is banked, it catches up automatically and acknowledges the
+revision only after a successful current refresh. Duplicate in-flight revisions
+are coalesced; newer revisions can supersede older reads through `LatestRefresh`.
+Matching ticks received during a refresh retain one queued retry if that
+attempt fails. Every refresh owns this demand, including reconnect and picker
+reads. Success consumes it, and a failed retry needs a new invalidation to run
+again; an obsolete read cannot restart work over its replacement.
+The paint key
+includes limit and provenance, so an unchanged usage item does not hide a
+correction. The readout labels estimated and cached limits; with no usable limit
+it shows tokens used and explains that the limit is unavailable. Explicit
+compaction boundaries and separately reported model capacity keep their own
+labels. Neither a summary discovery nor a catalog refresh replaces occupancy.
+
+Conversation status is `idle`, `sending`, `running`, `completed`, `interrupted`, `failed`, plus four named states: `retrying` and `compacting` are live-turn states (the composer offers Cancel, a new prompt is held), `background` means no turn is running but the agent still holds live background work (prompting is possible), and `scheduled` means nothing runs but the agent's session holds future turns it scheduled for itself (prompting is possible; the composer lists the wakeups with a release). `isLiveConversationStatus()` in `types.ts` is the one rule for which statuses are live.
+
+A Claude Code conversation's session lifetime (`src/chat/claude/provider.ts`) follows the work, not the first result: the SDK session is retired on a turn's result only when no accepted prompt is pending, no unprompted follow-up is in flight, and the background set (`background_tasks_changed`, ambient tasks excluded) is empty. While the set is non-empty the conversation reports `background`. When a backgrounded task settles the CLI starts a follow-up turn by itself (see the D9 spike in the change's design notes); the provider reports that turn as running and completed like any other. A set that empties with no follow-up returns the conversation to idle after a short grace window. Scheduled wakeups from `ScheduleWakeup`, `CronCreate`, and `/loop` hold the session the same way. The SDK sends no stream message for them, so the provider registers a `Stop` hook and level-sets the session's wakeups from its `session_crons`. The hook fires before the turn's `result`, so the set is current when retirement is decided. A result with wakeups pending and no background work reports `scheduled`. With both, `background` wins. A fired wakeup's turn reaches the host only as a `UserPromptSubmit` hook, with no `user` message on the stream, so the provider mints that turn's opening `user_message` itself, with `origin: "wakeup"`. It attributes the turn by the hook's `source`, or by the prompt matching a pending wakeup while no accepted prompt is outstanding. A cron missing from the next `Stop` fired if a turn was attributed to it. Otherwise the agent cancelled it. Resuming a session makes the CLI rebuild its `CronCreate` crons from the transcript, while a `ScheduleWakeup` never outlives its process. So when the stream ends or the workspace shuts down, a pending `ScheduleWakeup` is marked lost and a `CronCreate` cron paused. The provider tells them apart by the `CronCreate` result's `id` and the `ScheduleWakeup` call's prompt. The provider enforces a cancel itself, because the SDK has no call that deletes a cron. Cancelled ids live per conversation in its durable state, never hold a session, and have their fires answered with `decision: "block"` at the `UserPromptSubmit` hook. The `init`, `informational`, and `result` frames a blocked fire produces are swallowed. The per-wakeup cancel is `POST /api/chat/conversations/:id/wakeups/:wakeupId/cancel`. Release, `POST /api/chat/conversations/:id/release`, cancels every wakeup and retires the session. A conversation opened without a live session lists its paused crons, derived from the transcript by `transcriptCrons()` in `src/chat/claude/transcript.ts`: `CronCreate` results minus `CronDelete`d ids, fired or lapsed one-shots, and crons past the 7-day expiry. Nothing starts a session to keep a schedule running. Conversation titles follow the transcript's own entries: a user rename (`custom-title`) outranks Claude Code's generated title (`ai-title`), which outranks the first prompt.
+
+A subagent run is a conversation in its own right (`sub:<parentSessionId>:<agentId>`), reached as a child of its launcher through the shared drill-down, and it is live while it runs. The query asks Claude Code to forward subagent text and thinking (`forwardSubagentText`), and the provider routes every frame tagged `parent_tool_use_id` to that run's child rather than to the parent: normalized untagged, with the child's *own* event memory, which is what keeps the item ids (`message:<uuid>`, `tool:<toolUseId>`) identical to the ones the stored `agent-<id>.jsonl` replays — so a projection filled from the file and then fed live frames upserts the same rows instead of doubling them. The run is known from its start edge, before the CLI has written a line of its transcript, because an agent task's `task_id` *is* its agent id. The parent keeps only the launching row and its attribution.
+
+Claude Code also forks agent runs that no Agent call launched: a skill the model runs as a fork of itself (`/code-review` is the one seen doing so), and the run a typed command such as `/code-review` starts. Which CLI is speaking decides what Uatu sees of them. Uatu drives the `claude` its runtime discovers on `PATH` (`chat/claude/runtime.ts`; the provider hands it to the SDK as `pathToClaudeCodeExecutable`), not the CLI bundled in the SDK package, and the two differ in exactly this area: the bundled one (2.1.261 when the change's spike ran) named a skill fork only in its ending tool result and did not expand a typed command at all, while the one on `PATH` (2.1.280 when probed) announces both with a `task_started` at their start — so a probe run with the SDK's defaults observes a different CLI from the one users have. That CLI marks both runs `ambient: true`, the flag it also puts on housekeeping, and `startsAgentRun` treats an ambient `local_agent` task as a run all the same: a census of 141 recorded runs found every run without a launching Agent call to be a fork or a typed command, and no housekeeping run under `subagents/` at all, so hiding ambient agent runs hid only work the user had started. Other ambient tasks (a monitor, a watcher) are still housekeeping. The flag keeps its one real meaning, that the run is not background work: an ambient run is remembered apart from the background set (`memory.ambientRuns`), so it never reaches the `background` status or the composer's list. A forked skill's start edge carries its Skill tool use as `tool_use_id` and its agent id as `task_id`, so the child opens then, the Skill row gains its `childConversationId` at that moment, and the fork's tagged frames route live exactly as a subagent's do; the subagents track names it from its launching row (`Skill · <name>`) and opens it from the start.
+
+The provider still buffers, for a CLI that names a fork only when it ends, as the bundled one did. There a fork's frames stream under the Skill tool use from the first moment with no id to open, and minting a provisional one would mean renaming the conversation a drill-down had subscribed to. A tagged frame whose run is not yet known is therefore held against its tool use (`forkBuffers`, bounded both in waiting tool uses and in frames per tool use, with stream deltas never held — the complete frame that follows says the same thing) and still falls through to the parent's normalizer, which is what keeps the fork's tool activity visible in the timeline while it runs. When a start edge or a result carrying `status: "forked"` with an `agentId` finally names the run, the child opens running, the buffer replays into it in arrival order through the same normalizer and the same child memory as a live frame would use, and anything later routes straight through — so the transcript is *complete* the first moment it can be read, rather than starting at the end. Until then the subagents track names the fork from its launching row, carrying the latest tool activity in the parent timeline as its progress note (attributed positionally, because nothing in a tool row says which run produced it), and offers it as an open button only once the run is named. A fork named at its start leaves the parent no such activity to borrow: its rows are in its own transcript.
+
+The run a typed command starts has no launching step at all: its `task_started` names no tool use, and none of its work streams — the review reaches the stream only as the command's output, when it ends. Its child is still opened at the start edge, keyed in the provider's run map by `task:<taskId>` (`runKey`) instead of a tool use id, a shape no tool use id takes, so no tagged frame can be routed to it by accident. With no Skill row to speak for the run, the normalizer gives it a row of its own: a `background_task` item with `foreground: true` and the child id, running from the start edge to the notification. The subagents track lists that row, named by the command, and opens it; the composer's background list and the timeline's settled-task rows skip it, because the run belongs to the turn that ran it rather than to background work, and the command's output is the timeline's record of it. A run that has not reported its end by the command's result never will, so the result (or the session ending) settles it as stopped; and since the store keeps no record of the row, the adapter carries its live copy into a snapshot, so a page opening mid-command still lists the run. The output itself arrives as an `assistant` frame whose model is `<synthetic>` and which carries a top-level `local_command_source`. It renders as the message it is, but it is no model turn: it sets no conversation model and no usage figure, since its zeroed usage, as a carrier, would read as an empty context window. On reopen the store's only record of that output is a `system` record with `subtype: "local_command"`, which the transcript reader admits beside the compaction boundary; its `<local-command-stdout>` content renders under the same `message:<uuid>` id the live frame used, so the live row and the reopened one are the same row.
+
+Running background work is inspectable, not merely stoppable. The query asks for model-written progress summaries (`agentProgressSummaries`, ~30 s per running agent task — a small fork whose cost buys a line that says what the agent is doing), and the task's row carries what the CLI's edges and the launching tool result report about it: subagent type, prompt, cumulative tokens and tool uses, output file, child id. Selecting a running row opens `chat/task-inspection.ts` in the drill-down chrome. An agent task shows a header strip — progress note, elapsed clock, usage, Stop — over its live child transcript. A shell task, which reports no progress at all, shows the same strip over an output pane fed by `GET /api/chat/conversations/:id/tasks/:taskId/output`: a bounded tail re-read every couple of seconds while the task runs, following the end only while the reader is at it. The client names only the task id — the child reads solely the path the agent itself reported for that task, and refuses anything that does not resolve to `…/tasks/<taskId>.output`.
+
+A run that streams nothing is followed from its transcript on disk. Claude Code writes every forked run's `agent-<id>.jsonl` as the run works (it appears within about a second and a half and grows with each record), and a `sub:` child's snapshot is already read from that file, so following it needs no new server path. While a drill-down is open on a run that is still running and whose stream has carried no record or text for about two seconds, `SilentRunFollower` (`chat/task-inspection.ts`) re-reads the child's snapshot every couple of seconds, and `refreshFromSnapshot` (`chat/projection.ts`) folds each page into the open projection in place: the page's items win where both hold one, older items the reader paged in stay, a page older than what the live stream has already applied is refused, and an identical read repaints nothing. A live record puts the clock back to a full quiet period — a status change does not, since it is not the run speaking — so a run that streams never trips it; one rule covers the typed command, which never streams, and is a harmless fallback for any run whose stream stalls. The settle needs care, because a silent run's last records (its closing thought, then the review itself) reach an open view only through a read made after it. A run that settles after speaking on its stream ends the follow, since its last word came that way; one that settles silent gets a read at once and one more a refresh period later, a bounded guard against a transcript flushed just behind the announcement. After that a settled run is never polled, and a hidden page defers a read rather than spending it. Tailing the file in the provider and emitting its records as events would be more machinery for a view only an open drill-down needs, with no gain over a snapshot that already dedupes by item id.
+
+What each agent's SDK declares that the timeline does not handle is recorded, not guessed: `bun run coverage:agents` (`scripts/agent-coverage.ts`) reads the installed SDKs' declaration files and runs every message type, block or part type, and tool name through the normalizers above and `describeToolDetail` (`src/chat/tool-detail.ts`), rendering the body of the [Agent SDK coverage dashboard](https://github.com/tjakobsson/uatu/issues/480), which `.github/workflows/agent-coverage.yml` publishes after every push to `main`. A hidden marker in that body records the published vocabulary, so the next run can comment on what a bump added or removed; nothing is committed. The normalizers report what they skip so the probe can observe it: an unrecognized event (`chat.event.unrecognized.<type>`, a Claude system subtype as `system.<subtype>`) and an unread content block or part inside a recognized event (`skippedBlocks`, counted as `chat.block.unrecognized.<type>`). The hand-kept inputs are the annotations modules `src/chat/claude/sdk-coverage.ts` and `src/chat/opencode/sdk-coverage.ts` (ignore reasons, behavior-missing flags, Claude tool wire names). `scripts/agent-coverage.test.ts` builds both reports from the installed SDKs, so a dependency bump fails CI only when an axis can no longer be read or an annotation goes stale, never because a version moved.
+
+### OpenCode generations
+
+OpenCode 1.x and 2.x have different server APIs, and a workspace has whichever one its `opencode` on `PATH` is. `src/chat/opencode/opencode-service.ts` spawns `opencode serve` the same way for both (loopback, random port, one password under both `OPENCODE_PASSWORD` and `OPENCODE_SERVER_PASSWORD`) and decides the generation from the readiness answer, never from `--version` text or the binary's path: each probe cycle asks `GET /api/info` (2.x: `{ version, pid, urls }`) and then `GET /global/health` (1.x: `{ healthy, version }`), and the first well-formed body decides. A 2.x server answers every path it does not know — including the 1.x health path — with its web UI's HTML page and a 200, which is why a successful status alone is never readiness. The decision is fixed for that server's lifetime and carried on `OpenCodeConnection.generation`; `openCodeAgentRuntime` in `src/chat/service.ts` picks the provider from it, and a restart decides again, so a replaced binary is served by its own generation without a workspace restart. The reported version is bare semver for both (`1.18.31`, `2.0.13`), so the generation is legible from the status object without a new field.
+
+The two stacks live under `src/chat/opencode/v1/` (`@opencode-ai/sdk`'s `/v2` client — the 1.x SDK's second client, nothing to do with OpenCode 2) and `src/chat/opencode/v2/` (`@opencode/client`, all routes under `/api/…`, events on `/api/event`). They share a normalization core at `src/chat/opencode/normalization.ts`: 2.x's session event vocabulary is 1.18's `session.next.*` generation with the `next.` segment dropped, so the text/reasoning/tool/step/shell/revert/compaction state machines are one implementation keyed by the 2.x names, and each generation contributes a mapper for what it alone has — 1.x its cumulative `message.*` records and `question.*` family, 2.x its `session.execution.*` turn lifecycle, `session.usage.updated`, `form.*` (presented as structured questions, one per field), and `session.message.content.updated` restatements. Every 2.x call is scoped with `location: { directory }`, and events carrying another directory's `location` are dropped before mapping.
+
+**Commands, skills, and reload differ by generation.** 1.x's `command.list` folds skills in (`source: "skill"`) and `session.command` runs either. 2.x's `command.list` holds only config commands; skills are their own catalog (`skill.list`) and run as prompt attachments, the way OpenCode's own 2.x clients send an `@skill` mention. So the v2 provider lists the union (config command, then skill under its id, then built-ins, first name wins) and dispatches each slash name as the entry the adapter matched it to: `parseSlashCommand` returns the entry of the provider's own `listCommands()` answer, and the adapter hands it to `command()` as `listed` (built-ins are recognised by identity). An entry removed or shadowed after classification is still sent as chosen (and refused by OpenCode if gone) rather than falling to a same-named built-in; a caller that passes no entry gets a fresh catalog read. A skill goes out as `session.prompt` with `text: "@<id> <args>"` and `skills: [{ id, mention }]`, everything else as `session.command`. `/reload` is a v2-only provider built-in over `location.reload()`, reported through injected notices. Its success is not the `204`: OpenCode shuts the location down, answers, and rebuilds it after, so the provider waits (bounded, reloads one at a time) for the workspace's `command.updated`, `skill.updated`, `model.updated`, and `agent.updated` following its `location.shutdown`, and reports a reload OpenCode never confirms as unconfirmed rather than successful. A catalog read on the `204` would find even the built-in skills missing. The invoking client re-reads commands, models, and modes when that turn completes; any other open client re-reads them when it next starts a slash query or opens the configuration picker (the idle poll stops once an agent is ready, so it cannot carry this).
+
+**Developing against both generations on one machine.** Homebrew cannot hold both (`anomalyco/tap/opencode-v2` conflicts with `opencode`: both install a binary named `opencode`), but the formula only unpacks a zip, and 2.x honours `XDG_*` for every path it writes. Keep 2.x off `PATH` and give it a private home:
+
+```sh
+mkdir -p ~/.local/opt/opencode-v2/bin
+curl -fsSL https://opencode.ai/files/bin/2.0.13/opencode-darwin-arm64.zip -o /tmp/oc2.zip   # the URL the tap's opencode-v2.rb points at
+unzip -o /tmp/oc2.zip -d ~/.local/opt/opencode-v2/bin/real
+cat > ~/.local/opt/opencode-v2/bin/opencode <<'WRAPPER'
+#!/bin/sh
+V2=$HOME/.local/opt/opencode-v2
+export XDG_DATA_HOME=$V2/xdg/data XDG_STATE_HOME=$V2/xdg/state XDG_CACHE_HOME=$V2/xdg/cache
+exec "$V2/bin/real/opencode" "$@"
+WRAPPER
+chmod +x ~/.local/opt/opencode-v2/bin/opencode
+```
+
+The isolation is not optional: with default paths 2.x opens `~/.local/share/opencode/opencode.db` — the 1.x database — and applies migrations 1.x does not have. Config (`~/.config/opencode/opencode.json`) is shared by design. Credentials are not: run `opencode auth login` inside the wrapper (2.x keeps them in its own database and imports a `<data>/auth.json` only on its first run); do not copy an OAuth entry that both generations would then refresh. 2.x also ships free public models (`opencode/*-free`) that need no login, which is what the integration test runs on.
+
+Then `PATH=~/.local/opt/opencode-v2/bin:$PATH bun run dev` serves the dev hub with 2.x, and the real-OpenCode integration test takes both binaries at once, each in its own temporary home:
+
+```sh
+UATU_REAL_OPENCODE=1 \
+UATU_REAL_OPENCODE_V1=$(which opencode) \
+UATU_REAL_OPENCODE_V2=~/.local/opt/opencode-v2/bin/real/opencode \
+bun test src/chat/opencode/real-opencode.integration.test.ts
+```
+
+### Agent accounts
+
+The Hub's Settings page manages the machine's agent logins: OpenCode's providers and Claude Code's account. Logins are written where each agent keeps them (OpenCode's store, Claude Code's login), so they apply to every workspace, every Hub user, and the agents' own tools on the machine; the Hub keeps no secret of its own, and no response carries one. The capability is `openspec/specs/agent-accounts/`.
+
+Agent runtimes otherwise exist only inside running workspaces, and a login has to work with none running, so the Hub starts its own (`src/hub/agent-account-runtime.ts`): an `opencode serve` through the same `OpenCodeService` a workspace uses, in a Hub-owned working directory with the workspaces' environment, and Claude Code's executable for short-lived SDK sessions. They start on the first request and stop after five idle minutes, never while a login is pending. One adapter per agent and generation (`agent-account-opencode-v1.ts`, `agent-account-opencode-v2.ts`, `agent-account-claude.ts`, behind `agent-account-adapter.ts`) turns each agent's interface into one model (`agent-account-types.ts`): providers with their login methods and form fields (`agent-account-fields.ts` normalizes 1.x prompts and 2.x forms), saved credentials, and Claude's account.
+
+- **OpenCode 1.x** uses `@opencode-ai/sdk/v2`'s `provider.auth`, `provider.oauth.authorize/callback`, `auth.set` and `auth.remove`. After each change the Hub resets its own server (`instance.dispose`): a 1.x instance that has listed its providers reports a key saved afterwards as `custom`, without a key, until it reloads.
+- **OpenCode 2.x** uses `integration.*` and, where the server answers them, `credential.*` (2.0.13 does not: logout and switching are then not offered).
+- **Claude Code** reads `accountInfo()` and logs in through the SDK's `claudeAuthenticate`, `claudeOAuthCallback` and `claudeOAuthWaitForCompletion`, which the CLI answers but `sdk.d.ts` does not declare; they are feature-detected, and without them the page names `claude auth login`. Only the `manualUrl` is used, which ends on a page showing a code to paste. Logout runs `claude auth logout`.
+
+`agent-account-service.ts` owns attempts. A started login is finished one of three ways (`agent-account-redirect.ts` classifies it): a device code approved on the provider's site, a code pasted back, or, for a browser login that redirects to a loopback listener on the Hub machine, the address the browser landed on. That address is requested by the Hub only when it is `http:` on a loopback host with the attempt's own callback port and path, once, following no redirect. A secret submitted (key, code, address) is scrubbed from any agent message that echoes it.
+
+A change reaches running workspaces through the internal child route `POST /api/chat/accounts-changed` (`agent-account-propagation.ts`), sent to every running session; the Hub runs one agent's changes one at a time and finishes notifying before the next. The workspace replays a removal or switch on its own agent server (1.x `auth.remove`, 2.x `credential.remove`/`activate`), which changes nothing on disk and updates that server's memory without a restart, re-reads Claude's login, bumps the agent's `accountsRevision`, and ticks the inventory. A page re-reads `/api/chat/status` on every inventory tick and re-reads an agent's catalogs when its revision moved. Ready availability also carries `login` (`ok`, `missing`, `unknown`); a missing one shows a notice above the composer and in the model picker, linked to `/settings#agent-accounts/<agent>` in a Hub-served session (`src/chat/login-action.ts`) and naming the agent's login command elsewhere.
+
+The Settings pane is `src/hub/agent-accounts-pane.ts`, inlined into the page the way `dashboard-groups.ts` is. The e2e Hub runs the real service over fake runtimes (`tests/e2e/agent-accounts-fake.ts`, `UATU_E2E_HUB_AGENT_ACCOUNTS`); `src/hub/agent-account-real-opencode.integration.test.ts` (`UATU_REAL_OPENCODE`) and the Agent accounts case in `src/chat/claude/real-claude.integration.test.ts` (`UATU_REAL_CLAUDE`) run against the installed agents in throwaway homes.
 
 ## Terminal subsystem
 
@@ -344,7 +798,7 @@ flowchart LR
   PTY <-- spawn + stdio --> Shell
 ```
 
-The panel UI (~700 lines in `src/terminal/panel.ts`) handles dock position, split, fullscreen, focus, and message routing across multiple PTY panes. On Windows, `terminal/backend.ts` reports unavailable and the panel button is hidden — uatu doesn't degrade other features.
+The panel UI (`src/terminal/panel.ts`) handles dock position, split, fullscreen, focus, page-lifecycle release/resume, and message routing across multiple PTY panes. On Windows, `terminal/backend.ts` reports unavailable and the panel button is hidden — uatu doesn't degrade other features.
 
 Auth is deliberately Host-relative: the origin gate compares the `Origin` header against the request's `Host` (hostname pinned to loopback names), and the auth cookie is named `uatu_term_<host-port>`, so port-mapped access (container publishes, SSH forwards) and multi-instance fleets work with zero configuration. The rationale — including which parts of this design would survive a hosted multi-tenant deployment and which are deliberate localhost scaffolding — is recorded in the `fix-terminal-auth-port-mapping` change's `design.md` (decision D4).
 
@@ -355,6 +809,10 @@ After upgrade, the client opens xterm, fits it, and sends `attach-ready` with ac
 Sessions are managed tmux-style: `GET /api/terminal/sessions` lists every live PTY (attached/detached, age, dimensions, best-effort foreground-process label via a POSIX `ps` adapter), and `DELETE /api/terminal/sessions/<id>` kills one. The picker lists resources not already shown in the window and requires explicit attach, takeover, kill, or new-shell actions. Local pane ids/layout are separate from server PTY ids. The personal last-active id is highlighted but never auto-attached on a new client; actual pane attachments remain base-path-namespaced per-window presentation state.
 
 App-defined WebSocket close codes: `4001` user-terminate (client→server: kill the PTY), `4409` sessionId in use (server→client: upgrade race lost), `4410` session taken (server→client: another window took this session over).
+
+**Pane lifecycle on the client** (`terminal/client.ts`, `terminal/recovery.ts`, `terminal/lifecycle.ts`). A pane's presentation — visibility, pane records, layout, all workspace-scoped in browser storage — is separate from its transport, and the mount tells five things apart that a bare socket close conflates: page departure, a failed attach, the loss of an established connection, a confirmed shell exit, and an explicit user close. On `pagehide` (either `persisted` value) the panel *releases* every pane: a plain `1000` close the child processes at once, so the PTY is free for whichever document comes next — this one restored from the history cache, or a fresh one reading the same records — while nothing is persisted, because leaving a page is not hiding the terminal. The return (`pageshow`, or a foreground return on platforms that resume without one) *resumes* each released pane once; an ordinary background tab releases nothing. Attachment is decided by terminal reconstruction readiness, never by the browser socket's `open`: through the hub the browser side opens before the child has been asked, so a socket that opens and then closes is an attach failure, not an exit. Failures run one bounded recovery per restore, resume, connection loss, or user Retry — a five-second budget, delays from 100 ms doubling to a one-second cap, every inventory read and readiness wait bounded by what is left — reconciling against `GET /api/terminal/sessions`, which also answers the upgrade gate's origin question (the read asserts the page's address in `X-Uatu-Page-Origin`, since a same-origin GET carries no `Origin`): detached → ordinary attach again; occupied → keep waiting for the departing holder, then park on an explicit *Take over*; absent from a successful read, or an explicit exit frame → *Shell ended* with *New shell*; inventory unreadable or the socket silent → *Retry*; 401/403 → the paste-token form or the origin notice. Nothing automatic ever sends `takeover=1`: the mount's takeover flag is consumed by the attempt that uses it, and only the parked cards' actions re-arm it. Every socket callback, timer, inventory read and reconstruction callback carries the attach cycle's generation and is ignored once a teardown, hide, close, suspend, or takeover has advanced it. The pane keeps its last screen under a *Reconnecting…* note while it recovers; a retry's reconstruction resets the terminal before it paints. Restoration never takes keyboard focus.
+
+**Hub bridge teardown** (`hub/proxy.ts`). The browser and child handshakes of a proxied terminal socket are independent, so the bridge can end from either side at any point. Ending is one idempotent step: whichever side closes first records the close, the other side is closed with the same (sendable) code so `4001` and `4410` keep their meaning across the hub, queued browser input is dropped, a child `open` arriving after the browser has left is closed again rather than becoming a holder, a failed browser upgrade releases the child connection it had started, and a browser that attaches after the child already refused is closed with the refusal instead of waiting on nothing. The bridge never creates, kills, or transfers a PTY; the child's own ownership rules do that, and the client's readiness-aware recovery above is what turns a refusal into an occupied/ended/retry verdict.
 
 Clipboard crosses the client/server boundary in two directions, both ending at `navigator.clipboard` — which is the **host** clipboard even when the uatu server runs in a container, because the browser is on the host. Paste reads it and forwards down the PTY (`clipboard.ts` shortcut handlers). Copy has two paths: xterm-owned selections go through the Windows-Terminal-parity shortcuts, while mouse-mode TUIs (Claude Code, opencode) emit OSC 52 up the PTY, which `client.ts` bridges via `term.parser.registerOscHandler(52, …)` → `createOsc52Handler` in `clipboard.ts`. The bridge is write-only by construction (read queries get no response — no exfiltration path), caps decoded payloads at 100 KB, and reports every accepted write through a pane-scoped toast in `panel.ts` so clipboard poisoning is always visible — the notify behavior is fixed, not configurable. A gestureless `writeText` rejection (Firefox/Safari) promotes the toast to its Copy-button form, which performs the write inside the click.
 
@@ -370,12 +828,12 @@ uatu is a single-mode app. There is no Author vs. Review distinction; the only b
 | Aspect | Behavior |
 |---|---|
 | Default `Follow` at boot | on at `/`; forced off when arriving via a direct document URL (e.g. `/guides/setup.md`) |
-| `--no-follow` CLI flag | flips the default at `/` to off |
+| `--no-follow` child flag | flips the default at `/` to off (source runs only; the hub never passes it) |
 | User clicks a tree row | selection moves; follow turns off (Rule A) |
-| User clicks the Follow switch | flips state; turning on jumps to the newest-mtime file (Rule B) |
+| User clicks the Follow switch | flips state; turning on jumps to the newest-mtime document; images are not candidates (Rule B) |
 | File changes on disk + follow on | selection moves to the changed file (Rule C) |
 | File changes on disk + follow off | current file reloads in place if it's what changed; otherwise tree refreshes silently (Rule D) |
-| Single-file CLI invocation (`uatu serve some-file.md`) | Follow switch disabled — nothing else to follow |
+| Single-file root (a source run such as `bun run src/cli.ts serve some-file.md`; hub workspaces are folders) | Follow switch disabled — nothing else to follow |
 | Sidebar panes available | Change Overview, Search, Files, Git Log, Usage — all always available; toggle via the per-pane visibility menu. Fresh clients start with Change Overview and Files visible (Git Log, Search, and Usage hidden); stored arrangements always win. Usage is chat-fed (`src/chat/usage-pane.ts` paints it; the sidebar owns the chrome) |
 
 The `withProgrammaticUpdate(fn)` helper in `src/sidebar/tree-view.ts` is what makes Rule A reliable: it suppresses the `@pierre/trees` library's `onSelectionChange` callback during initial mount and `resetPaths`-driven refreshes so library-fired selections aren't mistaken for user clicks. That single helper is the root fix for the historical flake on `tests/e2e/preview-renderers.e2e.ts` (issue #45) and the `follow-mode auto-switch` test.
@@ -543,10 +1001,11 @@ one that matches what actually broke.
    clients (anything documented in `api/openapi.yaml` / `api/streaming.yaml`),
    bump `HUB_API_REVISION` and/or `WORKSPACE_API_REVISION` for the affected
    domain instead, mirror the pair in `api/contract.json` and the OpenAPI
-   `x-uatu-revisions` block, and add a changelog entry with migration
-   guidance to `api/CHANGELOG.md` — CI's compatibility gate
-   (`scripts/api-contract/compatibility.ts`) rejects breaking contract
-   diffs that arrive without the bump and the guidance.
+   `x-uatu-revisions` block, and add a changelog entry to `api/CHANGELOG.md`
+   with migration guidance, headed `Unreleased` until the release that ships
+   it — CI's compatibility gate (`scripts/api-contract/compatibility.ts`)
+   rejects breaking contract diffs that arrive without the bump and the
+   guidance.
    A product or bundled-web change alone is NOT a public API break; the
    families move independently.
 
@@ -559,7 +1018,7 @@ one that matches what actually broke.
 ## Run and test
 
 ```bash
-bun run dev               # local watch on testdata/watch-docs
+bun run dev               # dev hub on :4702 with testdata/watch-docs (user dev / dev)
 bun test                  # unit + integration suite (~18s)
 bun run test:e2e          # Playwright (~5min, workers: 1, serial)
 bun run build             # compile single-file dist/uatu binary
@@ -571,5 +1030,4 @@ For tighter loops:
 
 - `bun test src/sidebar/git-log.test.ts` — single file
 - `bun x playwright test tests/e2e/mermaid.e2e.ts:127` — single e2e test
-- `bun run dev --no-gitignore` — exposes gitignored files in the tree
-- `bun run dev --no-follow` — boots with Follow disabled
+- `bun run dev --no-open` — start the dev hub without opening a browser

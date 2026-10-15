@@ -1,7 +1,7 @@
 // Tree-view mounting. Holds the lazily-constructed TreeView singleton; the
 // selection handler delegates to the `follow-mode` capability (Rule A).
 
-import { applyUserRowClick } from "../shell/follow";
+import { applyUserAncestorCollapse, applyUserRowClick } from "../shell/follow";
 import { TreeView } from "./tree-view";
 
 const treeElementMaybe = document.querySelector<HTMLDivElement>("#tree");
@@ -26,6 +26,7 @@ export function ensureTreeView(): TreeView {
       // driven and file-event tree updates can never steal the active tab.
       // Directory taps don't reach this handler at all.
       onSelectDocument: documentId => applyUserRowClick(documentId),
+      onDeselectDocument: applyUserAncestorCollapse,
     });
   }
   return treeView;

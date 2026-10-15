@@ -11,12 +11,16 @@ import type { ServerWebSocket } from "bun";
 import hubMonoFontAsset from "../assets/fonts/HackNerdFontMono-Regular.woff2" with { type: "file" };
 import hubIcon192Asset from "../assets/icon-192.png" with { type: "file" };
 import hubIcon512Asset from "../assets/icon-512.png" with { type: "file" };
+import pushWorkerAsset from "../pwa/push-worker.js" with { type: "file" };
+import notificationClientAsset from "../pwa/notification-client.js" with { type: "file" };
+import { PWA_ICON_VERSION } from "../pwa/icons";
 
 import {
   clientKeyForRateLimit,
   formatHubCookie,
   formatHubCookieClear,
   isSameOriginRequest,
+  isSameOriginValue,
   LoginRateLimiter,
   readPresentedSession,
   safeReturnPath,
@@ -49,12 +53,27 @@ import {
   type BridgeData,
   type UpgradableServer,
 } from "./proxy";
+import { LiveBroker } from "./live-broker";
+import { NotificationRequestError, type HubNotifications } from "./notifications";
+import { AGENT_ACCOUNTS_PATH, handleAgentAccountRequest } from "./agent-account-api";
+import type { AgentAccountsApi } from "./agent-account-service";
+import { createWorktreeApi, isWorktreeApiPath, WORKTREE_API_PATH, type WorktreeStartOutcome } from "./worktree-api";
+import { assertNoRegisteredWorktreeDependents, type WorktreeService } from "./worktree-service";
+import { WorktreeReconciler } from "./worktree-reconciler";
+import { checkoutGitLink, readCheckoutHead } from "./worktree-git";
+import { WorktreeOperationError } from "../shared/worktree-contract";
+import { LiveEndpoint } from "./live-endpoint";
+import { createHubUpstreamSource } from "./live-source";
 import { defaultWorkspaceDisplayName, validateWorkspaceDisplayName, type WorkspaceRegistry } from "./registry";
 import { OnboardingError, resolveOnboardingAssignments, type WorkspaceOnboardingCoordinator } from "./onboarding";
 import { HubPreferencesError, type HubPreferencesStore } from "./preferences";
 import type { PersonalWorkspaceStateStore } from "./personal-state";
+import type { ActivityMarkSink } from "./activity-marks";
 import type { SessionManager } from "./sessions";
+import { PAGE_ORIGIN_HEADER } from "../terminal/auth";
 import type { TerminalSessionInfo } from "../terminal/server";
+import { MetricsRegistry } from "../debug/metrics";
+import { LIVE_STREAM_PATH } from "../shared/live-protocol";
 import type { HubApiCompatibility } from "../shared/types";
 import {
   BUILD,
@@ -69,21 +88,86 @@ export type HubDeps = {
   sessions: SessionManager;
   sessionStore: HubSessionStore;
   personalState: PersonalWorkspaceStateStore;
+  // Where the live broker's finished/viewed marks survive a restart. Absent
+  // (tests, the e2e harness) they live for the broker's lifetime only.
+  activityMarks?: ActivityMarkSink;
+  // Whether the assembled live broker watches every running workspace's
+  // activity from the start, so a finish is recorded even for a session no
+  // page ever opened (D11). The production hub sets it; tests and the e2e
+  // harness leave the broker lazy, watching from its first activity feed.
+  watchActivityFromStart?: boolean;
   preferences?: HubPreferencesStore;
   onboarding?: WorkspaceOnboardingCoordinator;
   folderManager?: Pick<FolderManager, "create" | "rename" | "remove" | "assertNoPendingMutation">;
   reservations?: PathReservationCoordinator;
   cloneJobs?: CloneJobManager;
+  // The worktree operation service. Absent (tests, the e2e harness) leaves
+  // the worktree routes unmounted rather than half-answering.
+  worktrees?: WorktreeService;
   cloneCredentials?: CloneCredentialResolver;
   credentialApi?: CredentialApiServices;
+  // The machine's agent logins (Settings → Agent accounts). Absent (tests,
+  // the e2e harness) answers its routes with 503.
+  agentAccounts?: AgentAccountsApi;
   gitCommand?: () => string;
+  // The brokered live stream. startHubServer assembles them when absent;
+  // a handler built directly gets its own pair.
+  live?: LiveEndpoint;
+  liveBroker?: LiveBroker;
+  // Git reconciliation for the worktree inventory. startHubServer assembles
+  // one when `worktrees` is present.
+  worktreeReconciler?: WorktreeReconciler;
+  // Test seam for the reconciler's cadence.
+  worktreeReconcilerOptions?: Pick<ConstructorParameters<typeof WorktreeReconciler>[0], "minIntervalMs" | "periodMs" | "now" | "timers">;
+  metrics?: MetricsRegistry;
+  notifications?: HubNotifications;
+  // Test seam: how long a user stays `recent` after their last visible
+  // session page goes (src/hub/presence.ts). Production uses the default.
+  presenceGraceMs?: number;
 };
+
+// The Hub-side worktree invalidation loop (tasks 5.1–5.2): the reconciler
+// reads Git when a page opens the topic, when observed activity or a
+// session start/stop suggests something changed, and on a bounded cadence
+// while any page holds the topic; a changed inventory — or a committed Uatu
+// operation — invalidates every page showing that repository over the
+// existing live stream.
+function assembleWorktreeReconciler(deps: HubDeps, liveBroker: LiveBroker): WorktreeReconciler | undefined {
+  const service = deps.worktrees;
+  if (!service) return undefined;
+  if (deps.worktreeReconciler) return deps.worktreeReconciler;
+  const reconciler = new WorktreeReconciler({
+    inventory: source => service.inventory(source),
+    sourceFor: workspaceId => service.sourceFor(workspaceId),
+    onChange: source => liveBroker.publishWorktrees(service.familyOf(source)),
+    onError: error => console.error(`uatu hub: worktree reconciliation failed: ${error instanceof Error ? error.message : String(error)}`),
+    ...deps.worktreeReconcilerOptions,
+  });
+  const retained = new Map<string, () => void>();
+  liveBroker.observeWorktrees({
+    attached: workspaceId => { void reconciler.request(workspaceId, "subscribe").catch(() => undefined); },
+    interest: (workspaceId, interested) => {
+      retained.get(workspaceId)?.();
+      retained.delete(workspaceId);
+      if (interested) retained.set(workspaceId, reconciler.retain(workspaceId));
+    },
+    // An agent that started or finished working may have run `git worktree`.
+    activity: workspaceId => { void reconciler.request(workspaceId, "activity").catch(() => undefined); },
+  });
+  deps.sessions.onChange(change => { void reconciler.request(change.workspaceId, "activity").catch(() => undefined); });
+  return reconciler;
+}
 
 type HubServer = UpgradableServer & {
   requestIP?(request: Request): { address: string } | null;
 };
 
 const SESSION_PATH = /^\/s\/([^/]+)(\/|$)/;
+const LIVE_SUBSCRIPTIONS_PATH = /^\/api\/hub\/live\/([^/]+)\/subscriptions$/;
+// The child's per-stream SSE routes are the internal hub↔child protocol the
+// broker subscribes to; through the hub they are refused, never proxied.
+// `/api/activity` is internal too (the activity summary the broker reads).
+const REFUSED_CHILD_STREAM_SUFFIXES = /^\/api\/(events|activity|chat\/notifications\/events|chat\/conversations\/(events|[^/]+\/events))$/;
 const CREDENTIAL_PATH = "/api/hub/credentials";
 const CREDENTIAL_TOOL_PATH = "/api/hub/credential-tools";
 
@@ -173,6 +257,8 @@ export function createHubFetchHandler(deps: HubDeps) {
     credentials: deps.cloneCredentials,
     reservations: deps.reservations,
   });
+  const { live, liveBroker } = assembleLive(deps);
+  const worktreeReconciler = assembleWorktreeReconciler(deps, liveBroker);
   const limiter = new LoginRateLimiter();
   const credentialLimiter = new CredentialOperationRateLimiter();
   const credentialApi = deps.credentialApi ? new CredentialApi(deps.credentialApi) : null;
@@ -391,7 +477,7 @@ export function createHubFetchHandler(deps: HubDeps) {
       user.name,
       sanitizeDeviceLabel(requestedLabel, request.headers.get("user-agent")),
     );
-    const setCookie = formatHubCookie(record.id, { secure: secureCookies(request) });
+    const setCookie = formatHubCookie(record.id, new URL(request.url), { secure: secureCookies(request) });
     if (isJson) {
       // The session id doubles as the bearer credential for native
       // clients; the cookie is set too so a web view sharing the client's
@@ -413,7 +499,50 @@ export function createHubFetchHandler(deps: HubDeps) {
     });
   };
 
+  // The worktree presentation facts for the state list, read WITHOUT running
+  // Git: this endpoint is polled. `repositoryId` comes from the registry's
+  // worktree links (a main workspace takes its children's shared identity),
+  // the branch from the checkout's HEAD file, and `sourceRef` only from
+  // recorded creation history. `createWorktree` marks a main checkout that
+  // can host worktrees (a `.git` directory) — it is the fork entry point.
+  const worktreeStateFacts = async (): Promise<Map<string, Record<string, unknown>>> => {
+    const facts = new Map<string, Record<string, unknown>>();
+    const service = deps.worktrees;
+    if (!service) return facts;
+    const entries = registry.list();
+    const familyRepository = new Map<string, string>();
+    for (const entry of entries) {
+      if (entry.worktree) familyRepository.set(entry.worktree.parentWorkspaceId, entry.worktree.repositoryId);
+    }
+    await Promise.all(entries.map(async entry => {
+      const head = await readCheckoutHead(entry.path);
+      const link = entry.worktree;
+      const repositoryId = link?.repositoryId ?? familyRepository.get(entry.id);
+      const fact: Record<string, unknown> = {
+        ...(repositoryId === undefined ? {} : { repositoryId }),
+        ...(head.kind === "branch" ? { branch: head.branch } : {}),
+        ...(head.kind === "detached" ? { detached: true } : {}),
+      };
+      if (link) {
+        fact.parentId = link.parentWorkspaceId;
+        fact.ownership = await service.registeredOwnership(entry.id);
+        // A child is named by the branch it was registered on; its current
+        // HEAD, when readable, is the truthful label.
+        fact.branch = head.kind === "branch" ? head.branch : entry.displayName;
+        const origin = await service.branchOrigin(link.repositoryId, String(fact.branch));
+        if (origin !== undefined) fact.sourceRef = origin;
+        const availability = await service.registeredAvailability(entry.id);
+        if (availability !== "present") fact.availability = availability;
+      } else if (await checkoutGitLink(entry.path) === "directory") {
+        fact.createWorktree = true;
+      }
+      facts.set(entry.id, fact);
+    }));
+    return facts;
+  };
+
   const hubState = async (): Promise<Response> => {
+    const worktreeFacts = await worktreeStateFacts();
     const credentialState = deps.credentialApi?.metadata.snapshot();
     const credentialNames = new Map(credentialState?.credentials.map(credential => [credential.id, credential.name]));
     const workspaces = await Promise.all(
@@ -449,10 +578,17 @@ export function createHubFetchHandler(deps: HubDeps) {
           backend: entry.backend,
           running: running !== undefined,
           credentialRestartRequired: sessions.credentialRestartRequired(entry.id),
+          // A linked worktree's OWN assignment rows — normally none. Its
+          // effective credentials are its parent's, inherited live through
+          // `parentId` (credential-context's policyWorkspaceId); they are
+          // deliberately NOT substituted here, so this field never claims
+          // the child holds assignments it does not, and clients show the
+          // inherited policy by reading the parent named in `parentId`.
           credentialAssignments: {
             authentication: [...authentication],
             signing: [...signing],
           },
+          ...(worktreeFacts.get(entry.id) ?? {}),
           // The local-process backend always spawns this build's binary, so
           // every child speaks this constant. A backend that runs children
           // of other builds (the deferred container backend) must report
@@ -472,6 +608,11 @@ export function createHubFetchHandler(deps: HubDeps) {
       ...compatibility,
       workspaces,
       ...(workspaceDefaults === undefined ? {} : { workspaceDefaults }),
+      // Present only when this Hub serves worktree operations: the picker
+      // and dashboard read `worktreeApi`'s presence to mount their worktree
+      // affordances. Its value is the published JSON family, not a page —
+      // no server-rendered worktree URL is published here.
+      ...(deps.worktrees === undefined ? {} : { worktreeApi: WORKTREE_API_PATH }),
     });
   };
 
@@ -1181,6 +1322,73 @@ export function createHubFetchHandler(deps: HubDeps) {
     });
   };
 
+  // One workspace start, with the recovery fences that must run before a
+  // child can spawn. Shared by POST /api/hub/sessions/<id>/start and the
+  // worktree flow's Open action, so neither of them can drift from the
+  // other's safety checks.
+  const startWorkspaceSession = async (workspaceId: string): Promise<{ ok: true } | { ok: false; response: Response }> => {
+    // A pending onboarding journal can cover a partially configured
+    // registration (an assignment commit whose rollback also failed);
+    // starting it would project the previous or empty assignment set.
+    // Frozen until recovery, like assignment mutations and folder changes.
+    if (deps.onboarding && await deps.onboarding.hasPendingRecovery()) {
+      return { ok: false, response: json(409, { error: "a pending onboarding requires Hub recovery before session starts" }, NO_STORE_HEADERS) };
+    }
+    // A pending folder mutation freezes starts for the mirror-image reason:
+    // a registered rename or removal whose filesystem and registry halves
+    // diverged leaves the registry pointing at the journaled source path.
+    // Starting now either fails against a directory that is gone or — if
+    // something recreated that path — serves the workspace from unrelated
+    // content. Failing closed on an uninspectable journal, as the mutation
+    // routes do.
+    try {
+      await deps.folderManager?.assertNoPendingMutation();
+    } catch (error) {
+      return { ok: false, response: folderError(error) };
+    }
+    try {
+      // Starting is fenced by the folder-mutation journal from inside the
+      // workspace's lifecycle operation (see SessionManager.start): a
+      // journal that outlived its mutation means the registry may still
+      // point at a path recovery has to move or restore, and a child
+      // spawned there would carry this workspace's credentials and personal
+      // identity into unrelated content. The refusal arrives as a
+      // FolderManagerError and answers 409.
+      await sessions.start(workspaceId);
+      return { ok: true };
+    } catch (error) {
+      if (error instanceof FolderManagerError) return { ok: false, response: folderError(error) };
+      // A worktree whose checkout is missing or replaced is refused before
+      // any spawn; the sanitized reason is the answer.
+      if (error instanceof WorktreeOperationError) return { ok: false, response: json(409, { error: error.detail.message }) };
+      return { ok: false, response: json(500, { error: error instanceof Error ? error.message : String(error) }) };
+    }
+  };
+
+  const worktreeService = deps.worktrees;
+
+  // The Hub's whole worktree surface: one published JSON family, rendered by
+  // src/shell/worktree-dialog.ts in both the in-workspace picker and the
+  // dashboard. The retired server-rendered `/worktrees` flow had a second
+  // dependency object here; there is only this one now.
+  const worktreeApi = worktreeService === undefined ? undefined : createWorktreeApi({
+    service: worktreeService,
+    registry,
+    async inventory(sourceWorkspaceId, reason) {
+      return (await worktreeReconciler?.request(sourceWorkspaceId, reason)) ?? worktreeService.inventory(sourceWorkspaceId);
+    },
+    changed(sourceWorkspaceId, also = []) {
+      liveBroker.publishWorktrees([...worktreeService.familyOf(sourceWorkspaceId), ...also]);
+      void worktreeReconciler?.rebaseline(sourceWorkspaceId).catch(() => undefined);
+    },
+    async startWorkspace(workspaceId): Promise<WorktreeStartOutcome> {
+      const outcome = await startWorkspaceSession(workspaceId);
+      if (outcome.ok) return { ok: true };
+      const body = await outcome.response.clone().json().catch(() => ({})) as { error?: string };
+      return { ok: false, message: body.error ?? "The workspace could not be started." };
+    },
+  });
+
   const mutateFolder = async (
     request: Request,
     operation: "create" | "rename" | "remove",
@@ -1216,6 +1424,11 @@ export function createHubFetchHandler(deps: HubDeps) {
     const pathname = url.pathname;
 
     // Un-gated: the login flow and the dashboard's static assets.
+    if (pathname === "/push-worker.js" || pathname === "/hub-assets/notifications.js") {
+      return new Response(Bun.file(pathname === "/push-worker.js" ? pushWorkerAsset : notificationClientAsset), {
+        headers: { "content-type": "application/javascript; charset=utf-8", "cache-control": "no-cache", "service-worker-allowed": "/" },
+      });
+    }
     if (pathname === "/login") {
       return handleLogin(request, server);
     }
@@ -1232,6 +1445,7 @@ export function createHubFetchHandler(deps: HubDeps) {
       // the cookie — logout is idempotent.
       if (presented) {
         await sessionStore.revoke(presented.id);
+        live.endStreamsForSession(presented.id);
       }
       if (presented?.transport === "bearer") {
         return json(200, { revoked: true });
@@ -1240,7 +1454,7 @@ export function createHubFetchHandler(deps: HubDeps) {
         status: 303,
         headers: {
           location: "/login",
-          "set-cookie": formatHubCookieClear({ secure: secureCookies(request) }),
+          "set-cookie": formatHubCookieClear(new URL(request.url), { secure: secureCookies(request) }),
         },
       });
     }
@@ -1267,8 +1481,8 @@ export function createHubFetchHandler(deps: HubDeps) {
           background_color: "#ffffff",
           theme_color: "#0a1c38",
           icons: [
-            { src: "/hub-assets/icon-192.png", sizes: "192x192", type: "image/png", purpose: "any maskable" },
-            { src: "/hub-assets/icon-512.png", sizes: "512x512", type: "image/png", purpose: "any maskable" },
+            { src: `/hub-assets/icon-192.png?v=${PWA_ICON_VERSION}`, sizes: "192x192", type: "image/png", purpose: "any maskable" },
+            { src: `/hub-assets/icon-512.png?v=${PWA_ICON_VERSION}`, sizes: "512x512", type: "image/png", purpose: "any maskable" },
           ],
         },
         {
@@ -1304,6 +1518,77 @@ export function createHubFetchHandler(deps: HubDeps) {
       return json(401, { error: "authentication required" }, NO_STORE_HEADERS);
     }
 
+    if (pathname === "/api/hub/notifications") {
+      const notifications = deps.notifications;
+      if (!notifications) return json(503, { error: "notifications are unavailable" }, NO_STORE_HEADERS);
+      if (!csrfOk(request, session.transport)) return json(403, { error: "cross-origin request rejected" }, NO_STORE_HEADERS);
+      try {
+        const id = url.searchParams.get("device") ?? undefined;
+        if (id && id.length > 128) return json(400, { error: "invalid device id" }, NO_STORE_HEADERS);
+        if (request.method === "GET") return json(200, notifications.state(session, id), NO_STORE_HEADERS);
+        if (request.method === "PUT") {
+          const text = await request.text();
+          if (Buffer.byteLength(text) > 16 * 1024) return json(413, { error: "notification enrollment is too large" }, NO_STORE_HEADERS);
+          let body: unknown;
+          try { body = JSON.parse(text); } catch { return json(400, { error: "invalid JSON body" }, NO_STORE_HEADERS); }
+          return json(200, await notifications.enroll(session, body), NO_STORE_HEADERS);
+        }
+        if (request.method === "DELETE") {
+          if (!id) return json(400, { error: "device id required" }, NO_STORE_HEADERS);
+          await notifications.remove(session, id);
+          return json(200, { removed: true }, NO_STORE_HEADERS);
+        }
+        return new Response(null, { status: 405, headers: { allow: "GET, PUT, DELETE" } });
+      } catch (error) {
+        return error instanceof NotificationRequestError
+          ? json(error.status, { error: error.message }, NO_STORE_HEADERS)
+          : json(500, { error: "failed to persist notification state" }, NO_STORE_HEADERS);
+      }
+    }
+
+    // The brokered live stream (design D2/D3): one SSE connection per page,
+    // authenticated exactly as everything below the gate is; subscription
+    // changes are cookie-CSRF-checked state changes bound to the stream and
+    // to this session. The GET is origin-checked like the proxied /s/
+    // routes it replaced: SameSite=Lax attaches the cookie to a same-site
+    // cross-origin GET (another port on this host), and an open stream
+    // makes the hub open upstreams, which can spawn agent runtimes. A
+    // same-origin EventSource sends no Origin and passes. Neither does a
+    // followed link (a top-level navigation also sends no Origin), so a
+    // cookie request is refused, too, when Fetch Metadata reports anything
+    // but `same-origin` or `none` (a typed URL). `same-site` is refused as
+    // well: another port or a sibling subdomain is a different origin. An
+    // absent header (a non-browser client, an older browser) passes, as it
+    // does for the Origin check.
+    if (pathname === LIVE_STREAM_PATH && request.method === "GET") {
+      const fetchSite = request.headers.get("sec-fetch-site");
+      const crossSiteFetch = fetchSite !== null && fetchSite !== "same-origin" && fetchSite !== "none";
+      if (!csrfOk(request, session.transport) || (session.transport === "cookie" && crossSiteFetch)) {
+        return json(403, { error: "cross-origin request rejected" }, NO_STORE_HEADERS);
+      }
+      // `ws` is required (api/openapi.yaml): absent is a malformed request,
+      // not an unknown workspace. The generic endpoint leaves the absent
+      // case to its resolver because the e2e harness serves one fixed
+      // workspace without it.
+      if (!url.searchParams.has("ws")) {
+        return json(400, { error: "workspace id required" }, NO_STORE_HEADERS);
+      }
+      return live.openStream(request, { user: session.user, sessionId: session.sessionId });
+    }
+    const liveSubscriptions = LIVE_SUBSCRIPTIONS_PATH.exec(pathname);
+    if (liveSubscriptions && request.method === "POST") {
+      if (!csrfOk(request, session.transport)) {
+        return json(403, { error: "cross-origin request rejected" }, NO_STORE_HEADERS);
+      }
+      let streamId: string;
+      try {
+        streamId = decodeURIComponent(liveSubscriptions[1]!);
+      } catch {
+        return json(400, { error: "malformed stream id" }, NO_STORE_HEADERS);
+      }
+      return live.changeSubscriptions(request, streamId, { user: session.user, sessionId: session.sessionId });
+    }
+
     // Proxied session traffic. Validate the browser's origin BEFORE any
     // rewriting: SameSite=Lax still attaches the cookie on same-site
     // cross-origin requests (another port, a sibling subdomain), and the
@@ -1315,6 +1600,16 @@ export function createHubFetchHandler(deps: HubDeps) {
     const sessionMatch = SESSION_PATH.exec(pathname);
     if (sessionMatch) {
       if (!csrfOk(request, session.transport)) {
+        return json(403, { error: "cross-origin request rejected" }, NO_STORE_HEADERS);
+      }
+      // The origin a page asserts for a request that carries no Origin (the
+      // terminal inventory read) is judged here, by the same rule as a
+      // browser-set Origin: the proxy replaces Origin with the child's
+      // loopback one, so only the hub can tell a page whose real address
+      // fails the gate — the address the WebSocket upgrade is refused for —
+      // and answer the 403 the pane's recovery turns into the origin notice.
+      const pageOrigin = request.headers.get(PAGE_ORIGIN_HEADER);
+      if (pageOrigin !== null && session.transport !== "bearer" && !isSameOriginValue(pageOrigin, request)) {
         return json(403, { error: "cross-origin request rejected" }, NO_STORE_HEADERS);
       }
       let workspaceId: string;
@@ -1358,6 +1653,32 @@ export function createHubFetchHandler(deps: HubDeps) {
           return json(500, { error: "failed to persist personal state" });
         }
       }
+      // The viewing page says the user has this workspace's chat in view:
+      // whatever finished there is seen for this user, on every device.
+      // Hub-served like personal state — the fact is composed at the hub's
+      // live broker, and the child knows nothing of it.
+      if (suffix === "/api/activity-viewed") {
+        if (!registry.byId(workspaceId)) {
+          return json(404, { error: `unknown workspace: ${workspaceId}` });
+        }
+        if (request.method !== "POST") {
+          return new Response(JSON.stringify({ error: "method not allowed" }), {
+            status: 405,
+            headers: { "content-type": "application/json", allow: "POST" },
+          });
+        }
+        liveBroker.acknowledgeViewed(session.user, workspaceId);
+        return new Response(null, { status: 204, headers: NO_STORE_HEADERS });
+      }
+      if (REFUSED_CHILD_STREAM_SUFFIXES.test(suffix)) {
+        // Gone, not proxied: no request reaches the child for these. The
+        // body names the replacement so an old client or integration knows
+        // where to go.
+        return json(410, {
+          error: `${suffix} is not served through the hub; live updates are delivered by the brokered stream at ${LIVE_STREAM_PATH}`,
+          replacement: LIVE_STREAM_PATH,
+        }, NO_STORE_HEADERS);
+      }
       const running = sessions.get(workspaceId);
       if (!running) {
         return htmlResponse(stoppedSessionPage(workspaceId, registry.byId(workspaceId) !== undefined, registry.byId(workspaceId)?.displayName), 503);
@@ -1377,6 +1698,15 @@ export function createHubFetchHandler(deps: HubDeps) {
     }
     if (pathname === "/settings" && request.method === "GET") {
       return htmlResponse(settingsPage(session.user));
+    }
+    // The published JSON worktree family, behind the same gate as the
+    // dashboard. A cookie transport keeps the same-origin rule on every
+    // mutation; refusals are ordinary 200 answers the dialog renders.
+    if (worktreeApi && isWorktreeApiPath(pathname)) {
+      if (request.method !== "GET" && !csrfOk(request, session.transport)) {
+        return json(403, { error: "cross-origin request rejected" }, NO_STORE_HEADERS);
+      }
+      return worktreeApi.handle(request, url, { user: session.user });
     }
     if (pathname === "/api/hub/state" && request.method === "GET") {
       return hubState();
@@ -1425,6 +1755,14 @@ export function createHubFetchHandler(deps: HubDeps) {
           current: record.id === session.sessionId,
         })),
       });
+    }
+
+    if (pathname === AGENT_ACCOUNTS_PATH || pathname.startsWith(`${AGENT_ACCOUNTS_PATH}/`)) {
+      if (!deps.agentAccounts) return json(503, { error: "agent accounts are unavailable" }, NO_STORE_HEADERS);
+      if (request.method !== "GET" && !csrfOk(request, session.transport)) {
+        return json(403, { error: "cross-origin request rejected" }, NO_STORE_HEADERS);
+      }
+      return (await handleAgentAccountRequest(request, pathname, deps.agentAccounts))!;
     }
 
     // State-changing endpoints: POST-only + same-origin (CSRF) for
@@ -1524,27 +1862,25 @@ export function createHubFetchHandler(deps: HubDeps) {
               // stop: true makes stop-and-remove one lifecycle operation: the
               // unassignment runs inside the stop, so a concurrent start
               // cannot slip between them and keep the removed credential
-              // projected into a live session.
-              if (body.stop === true) {
-                // The same single lifecycle operation sessions.stop() would
-                // have taken, opened directly so the onboarding fence is
-                // rechecked BEFORE the stop: a refused unassignment must not
-                // leave the workspace stopped for a change it never made.
-                const removed = await sessions.runExclusive(workspaceId, async () => {
-                  await assertAssignmentsUnfenced();
-                  await sessions.stopWhileLifecycleQueueHeld(workspaceId);
-                  return credentialApi.unassign(credentialId, body);
-                });
-                return json(200, { removed }, headers);
-              }
+              // projected into a live session. Either way this is the single
+              // lifecycle operation sessions.stop() would have taken, opened
+              // directly so the onboarding fence is rechecked BEFORE the stop:
+              // a refused unassignment must not leave the workspace stopped
+              // for a change it never made.
               const removed = await sessions.runExclusive(workspaceId, async () => {
                 await assertAssignmentsUnfenced();
-                // A running child keeps its projected credential
+                // The target check `unassign` performs would run only after
+                // the stop (or after the running-session refusal) below; a
+                // refused id must not cost the workspace its session, nor be
+                // reported as a lifecycle conflict it could act on.
+                credentialApi.assertAssignmentTarget(workspaceId);
+                if (body.stop === true) await sessions.stopWhileLifecycleQueueHeld(workspaceId);
+                // A running workspace keeps its projected credential
                 // configuration, and the Hub-side helper serves tokens by
                 // id — removing only the catalog assignment would report a
                 // revocation that is not in effect. The page sends
                 // stop: true for running workspaces; other clients must too.
-                if (sessions.isRunning(workspaceId)) {
+                else if (sessions.isRunning(workspaceId)) {
                   throw new Error("credential assignment removal conflicts with the running workspace session; stop it first or pass stop: true");
                 }
                 return credentialApi.unassign(credentialId, body);
@@ -1581,10 +1917,11 @@ export function createHubFetchHandler(deps: HubDeps) {
           return json(404, { error: "unknown session" });
         }
         await sessionStore.revoke(record.id);
+        live.endStreamsForSession(record.id);
         const current = record.id === session.sessionId;
         if (current && session.transport === "cookie") {
           return json(200, { revoked: true, current }, {
-            "set-cookie": formatHubCookieClear({ secure: secureCookies(request) }),
+            "set-cookie": formatHubCookieClear(new URL(request.url), { secure: secureCookies(request) }),
           });
         }
         return json(200, { revoked: true, current });
@@ -1642,40 +1979,9 @@ export function createHubFetchHandler(deps: HubDeps) {
           return json(404, { error: `unknown workspace: ${workspaceId}` });
         }
         if (action[2] === "start") {
-          // A pending onboarding journal can cover a partially configured
-          // registration (an assignment commit whose rollback also
-          // failed); starting it would project the previous or empty
-          // assignment set. Frozen until recovery, like assignment
-          // mutations and folder changes.
-          if (deps.onboarding && await deps.onboarding.hasPendingRecovery()) {
-            return json(409, { error: "a pending onboarding requires Hub recovery before session starts" }, NO_STORE_HEADERS);
-          }
-          // A pending folder mutation freezes starts for the mirror-image
-          // reason: a registered rename or removal whose filesystem and
-          // registry halves diverged leaves the registry pointing at the
-          // journaled source path. Starting now either fails against a
-          // directory that is gone or — if something recreated that path —
-          // serves the workspace from unrelated content. Failing closed on
-          // an uninspectable journal, as the mutation routes do.
-          try {
-            await deps.folderManager?.assertNoPendingMutation();
-          } catch (error) {
-            return folderError(error);
-          }
-          try {
-            // Starting is fenced by the folder-mutation journal from inside
-            // the workspace's lifecycle operation (see SessionManager.start):
-            // a journal that outlived its mutation means the registry may
-            // still point at a path recovery has to move or restore, and a
-            // child spawned there would carry this workspace's credentials
-            // and personal identity into unrelated content. The refusal
-            // arrives as a FolderManagerError and answers 409.
-            await sessions.start(workspaceId);
-            return json(200, { id: workspaceId, running: true });
-          } catch (error) {
-            if (error instanceof FolderManagerError) return folderError(error);
-            return json(500, { error: error instanceof Error ? error.message : String(error) });
-          }
+          const outcome = await startWorkspaceSession(workspaceId);
+          if (!outcome.ok) return outcome.response;
+          return json(200, { id: workspaceId, running: true });
         }
         const stopped = await sessions.stop(workspaceId);
         return json(200, { id: workspaceId, running: false, wasRunning: stopped });
@@ -1753,6 +2059,10 @@ export function createHubFetchHandler(deps: HubDeps) {
               // is gone either way.
               return "reused";
             }
+            // Child onboarding holds this same parent lifecycle queue through
+            // its commit. Keep the dependent check AND all cleanup under it:
+            // no child may appear while personal-state persistence yields.
+            assertNoRegisteredWorktreeDependents(registry, workspaceId);
             await personalState.forgetWorkspace(
               workspaceId,
               () => registry.remove(workspaceId),
@@ -1767,6 +2077,7 @@ export function createHubFetchHandler(deps: HubDeps) {
           return json(200, { id: workspaceId, forgotten: true });
         } catch (error) {
           if (error instanceof FolderManagerError) return folderError(error);
+          if (error instanceof WorktreeOperationError) return json(409, { error: error.detail.message });
           const message = error instanceof Error ? error.message : String(error);
           if (message.includes("before forgetting")) return json(409, { error: message });
           return json(500, { error: "failed to forget workspace" });
@@ -1779,6 +2090,28 @@ export function createHubFetchHandler(deps: HubDeps) {
   };
 }
 
+// The live broker and its endpoint over the hub's own session table and
+// registry. Every configured user may access every registered workspace, so
+// the workspace resolver is registry membership alone.
+function assembleLive(deps: HubDeps): { live: LiveEndpoint; liveBroker: LiveBroker } {
+  const metrics = deps.metrics ?? new MetricsRegistry();
+  const liveBroker = deps.liveBroker ?? new LiveBroker(
+    createHubUpstreamSource({ sessions: deps.sessions, registry: deps.registry }),
+    { metrics, marks: deps.activityMarks, watchActivityFromStart: deps.watchActivityFromStart ?? false,
+      ...(deps.presenceGraceMs !== undefined ? { presenceGraceMs: deps.presenceGraceMs } : {}) },
+  );
+  const live = deps.live ?? new LiveEndpoint({
+    broker: liveBroker,
+    resolveWorkspace: requested => requested !== null && deps.registry.byId(requested) ? requested : null,
+    principalStillValid: principal => {
+      const record = deps.sessionStore.resolve(principal.sessionId);
+      return record !== null && deps.config.users.some(user => user.name === record.user);
+    },
+    metrics,
+  });
+  return { live, liveBroker };
+}
+
 // Starts the hub's Bun.serve with TLS when configured and the WebSocket
 // bridge handlers wired.
 export function startHubServer(deps: HubDeps) {
@@ -1789,7 +2122,11 @@ export function startHubServer(deps: HubDeps) {
     credentials: deps.cloneCredentials,
     reservations: deps.reservations,
   });
-  const handler = createHubFetchHandler({ ...deps, cloneJobs });
+  const { live, liveBroker } = assembleLive(deps);
+  // Pushes wait while the user has a visible session page (src/hub/presence.ts).
+  deps.notifications?.usePresence(liveBroker);
+  const worktreeReconciler = assembleWorktreeReconciler(deps, liveBroker);
+  const handler = createHubFetchHandler({ ...deps, cloneJobs, live, liveBroker, ...(worktreeReconciler ? { worktreeReconciler } : {}) });
   const server = Bun.serve<BridgeData>({
     hostname: deps.config.host,
     port: deps.config.port,
@@ -1811,5 +2148,5 @@ export function startHubServer(deps: HubDeps) {
       },
     },
   });
-  return Object.assign(server, { cloneJobs });
+  return Object.assign(server, { cloneJobs, live, liveBroker, worktreeReconciler });
 }

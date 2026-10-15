@@ -11,7 +11,10 @@ test("all authenticated Hub documents deliver mobile navigation and parseable cl
     expect(nav.querySelector("#hub-return")!.hasAttribute("hidden")).toBe(true);
     expect(document.querySelector('.hub-nav a[href="/clone"]')).not.toBeNull();
     expect(document.querySelector('form[action="/logout"][method="post"]')).not.toBeNull();
-    for (const script of document.querySelectorAll("script")) expect(() => new Function(script.textContent!)).not.toThrow();
+    for (const script of document.querySelectorAll("script")) {
+      if (script.getAttribute("type") === "module") expect(() => new Bun.Transpiler({ loader: "js" }).transformSync(script.textContent!)).not.toThrow();
+      else expect(() => new Function(script.textContent!)).not.toThrow();
+    }
   }
   expect(loginPage()).not.toContain('id="hub-return"');
 });

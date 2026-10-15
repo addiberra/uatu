@@ -1,6 +1,6 @@
 ## Purpose
 
-Provide an isolated, interactive review of the intended shipping mobile frontend against synthetic backend behavior, with reference-fidelity evidence and an explicit user gate before live integration.
+Provide isolated synthetic review of the shipping mobile frontend, with reference-fidelity evidence and separate records for integration authorization, live correctness and final visual/device acceptance.
 
 ## ADDED Requirements
 
@@ -35,7 +35,7 @@ The review SHALL provide the screen/state inventory in the change's `screen-map.
 
 #### Scenario: Reviewer inspects an unpictured flow
 - **WHEN** the reviewer chooses a credential type or onboarding outcome not pictured in the reference
-- **THEN** the actual frontend presents a coherent extension of the reference's grouped detail and task-sheet patterns
+- **THEN** the actual frontend presents a coherent extension of the reference's grouped detail and subsequently agreed full-page task patterns
 - **AND** the handoff identifies it as requiring review rather than previously approved design
 
 #### Scenario: Review a delayed failure
@@ -54,15 +54,27 @@ The review SHALL compare named frontend states with the corresponding refined re
 - **WHEN** a deterministic review workspace has a different name or path from the archived screenshot
 - **THEN** the comparison records the text substitution without treating it as permission to change row composition or hide layout differences
 
-### Requirement: Explicit review approval gates live integration
-The frontend-first stage SHALL end with a reachable review URL, scenario instructions, evidence, known gaps, and a request for explicit user visual and interaction approval. Passing automated tests or completing the implementation task list MUST NOT constitute that approval. Live backend integration, real branch acquisition, public API publication, and rollout into the live Hub SHALL remain deferred until separately authorized after review. The approval record SHALL distinguish the frontend version and accepted exceptions from later backend verification.
+### Requirement: Explicit authorization and final acceptance remain distinct
+The frontend-first review SHALL provide a reachable review URL, scenario instructions, evidence and known gaps. Live implementation SHALL require explicit user authorization, not inference from tests or task completion. The record SHALL distinguish agreed design direction and integration authorization from final version-specific visual/interaction acceptance, live correctness, physical-device checks and deployment scope. The 2026-10-15 agreement authorizes integration of the refined phone target and its named hierarchy amendments; it MUST NOT be reported as completed visual/physical-device certification or acceptance of unresolved failures. Spec sync and archive SHALL remain outside this planning amendment.
 
-#### Scenario: Tests pass but user has not approved
-- **WHEN** frontend checks pass and the review URL is available
-- **THEN** work stops at the review gate
-- **AND** no real backend implementation begins automatically
+#### Scenario: Tests pass without integration authorization
+- **WHEN** frontend checks pass but the user has not authorized live integration
+- **THEN** backend implementation does not begin automatically and the record still requests the missing authorization
+
+#### Scenario: Integration explicitly authorized with acceptance still open
+- **WHEN** the user agrees the refined UI as the live phone target and explicitly authorizes its integration
+- **THEN** the authorized task set can proceed without falsely completing final visual/interaction or physical-device acceptance
+- **AND** known failures, missing goldens and other evidence limits remain named and unwaived
 
 #### Scenario: Reviewer requests changes
 - **WHEN** the user rejects a visual state or interaction
 - **THEN** the frontend is corrected and re-presented against the same reference contract
 - **AND** the rejected result is not accepted as a new baseline merely because it was implemented
+
+### Requirement: Live and synthetic evidence keep distinct provenance
+The synthetic reviewer SHALL remain fail-closed and isolated after live integration is authorized. Reports SHALL identify frontend version, backend mode, fixture/real operation scope, browser versus physical device, and actual results. Live capability parity SHALL include upstream worktrees, repository credentials, Agent accounts and Notifications without pretending synthetic provider results are personal account tests. Neither service SHALL be restarted, reset or repurposed by planning edits.
+
+#### Scenario: Parallel reviewers remain distinguishable
+- **WHEN** the same refined UI is reviewed against synthetic services and an isolated real Hub
+- **THEN** their separate endpoints and evidence identify which operations are simulated versus backed by the live server
+- **AND** synthetic reset never changes live sessions, files or credentials

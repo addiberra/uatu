@@ -10,16 +10,18 @@
 // Both server entry points obtain both pieces here with mode-specific deps.
 
 import type { Serve } from "bun";
+import path from "node:path";
 
-import { ChatQueueFullError, CommandAttachmentsError, ConversationRenameUnsupportedError, InteractionConflictError, InvalidConversationTitleError, InvalidModeSelectionError, InvalidModelSelectionError, InvalidPermissionChoiceError, InvalidVariantSelectionError, QueuedMessageNotHeldError, ReversibleHistoryUnsupportedError, UnknownAttachmentError } from "../chat/adapter";
+import { ChatQueueFullError, CommandAttachmentsError, ConversationRenameUnsupportedError, InteractionConflictError, InvalidConversationTitleError, InvalidModeSelectionError, InvalidModelSelectionError, InvalidPermissionChoiceError, InvalidVariantSelectionError, QueuedMessageNotHeldError, ReversibleHistoryUnsupportedError, ScheduledWakeupsUnsupportedError, UnknownAttachmentError, UsageUnsupportedError } from "../chat/adapter";
 import { AttachmentStoreError } from "../chat/attachment-store";
-import { BackgroundTaskUnavailableError, InvalidQuestionAnswerError, ReversibleHistoryTargetError } from "../chat/provider";
+import { BackgroundTaskUnavailableError, InvalidQuestionAnswerError, ReleaseUnavailableError, ReversibleHistoryTargetError, ScheduledWakeupUnavailableError } from "../chat/provider";
 import { encodeReplayCursor } from "../chat/replay";
+import { CHILD_NOTIFICATIONS_PATH, type NotificationFrame } from "../chat/notification-feed";
 import { HistoryChangedError } from "../chat/history-reuse";
 import { resolveStartupTimeoutMs } from "../chat/opencode/opencode-service";
 import { ChatUnavailableError } from "../chat/service";
 import { UnknownAgentError, type MultiAgentWorkspaceChatService } from "../chat/agents";
-import { CHAT_ATTACHMENT_MAX_BYTES, CHAT_ATTACHMENT_MIME_TYPES, CHAT_ATTACHMENTS_PER_MESSAGE, type MessageAttachment, type ModelSelection, type PermissionOutcome, type QuestionOutcome } from "../chat/types";
+import { CHAT_ATTACHMENT_MAX_BYTES, CHAT_ATTACHMENT_MIME_TYPES, CHAT_ATTACHMENTS_PER_MESSAGE, TASK_OUTPUT_TAIL_DEFAULT_BYTES, TASK_OUTPUT_TAIL_MAX_BYTES, type MessageAttachment, type ModelSelection, type PermissionOutcome, type QuestionOutcome, type UsageReadMode, type ChatAccountChange } from "../chat/types";
 import { ConversationNotFoundError } from "../chat/workspace";
 import { StreamLifecycleMetrics, type StreamOutcome } from "../debug/stream-metrics";
 import { getDocumentDiff } from "../document/diff";
@@ -35,9 +37,11 @@ import {
 import type { createTerminalServer } from "../terminal/server";
 import { handleTerminalSessionsRoute } from "../terminal/sessions-route";
 import { joinBasePath, stripBasePath } from "../shared/base-path";
+import { DOCUMENT_NOT_READABLE_ERROR } from "../shared/document-errors";
+import { CHILD_CONVERSATION_OPEN_EVENT, CHILD_ACTIVITY_EVENT, CHILD_ACTIVITY_PATH } from "../shared/live-protocol";
 import { findDocument, isViewMode } from "../shared/types";
 import { parseWatchContext, type WatchContext } from "../shared/watch-context";
-import { renderDocument } from "./render-dispatch";
+import { documentErrorStatus, renderDocument } from "./render-dispatch";
 import { buildSearchPattern, searchDocuments } from "./search";
 import type { WatchSession } from "./watch-session";
 
@@ -145,6 +149,7 @@ export function buildRoutes(deps: BuildRoutesDeps): Serve.Routes<unknown, string
   };
 
   const chat = buildChatRoutes(deps, p);
+  const provenance = new Map<string, Promise<unknown>>();
 
   const modeRoutes =
     deps.mode === "prod"
@@ -241,8 +246,14 @@ export function buildRoutes(deps: BuildRoutesDeps): Serve.Routes<unknown, string
       },
     }),
     [p("/api/state")]: {
-      GET: (request: Request) => {
+      GET: async (request: Request) => {
         const context = requestContext(request);
+        const requested = new URL(request.url).searchParams.get("documentPath");
+        if (requested && !requested.includes("\0") && !requested.split(/[\\/]/).includes("..")) {
+          for (const root of getSession().getUnscopedRoots()) {
+            if (await getSession().ensureDocument(path.resolve(root.path, requested))) break;
+          }
+        }
         return context instanceof Response
           ? context
           : Response.json(getSession().getStatePayload(null, context));
@@ -262,14 +273,27 @@ export function buildRoutes(deps: BuildRoutesDeps): Serve.Routes<unknown, string
         const view = rawView && isViewMode(rawView) ? rawView : undefined;
 
         try {
-          const document = await renderDocument(getSession().getRoots(context), documentId, { view });
-          return Response.json(document);
+          if (!await getSession().ensureDocument(documentId)) throw new Error("document not found");
+          const document = await renderDocument(getSession().getDocumentRoots(documentId, context), documentId, { view });
+          return Response.json(document, { headers: { "cache-control": "no-store" } });
         } catch (error) {
-          const message = error instanceof Error ? error.message : "";
-          if (message === "document is binary") {
-            return Response.json({ error: "document is not viewable" }, { status: 415 });
+          const status = documentErrorStatus(error);
+          if (status === 415) {
+            return Response.json({ error: "document is not viewable" }, { status });
           }
-          return Response.json({ error: "document not found" }, { status: 404 });
+          if (status === 404) {
+            return Response.json({ error: "document not found" }, { status });
+          }
+          if (status === 403) {
+            // Permission denied: about the document, not the server, and the
+            // client explains it, so it is not logged (like 404 and 415).
+            return Response.json({ error: DOCUMENT_NOT_READABLE_ERROR }, { status });
+          }
+          // The server failing (a renderer throw, EMFILE, EIO, an unknown
+          // error): the client retries, so the session log is the only place
+          // the cause shows up. The response body stays generic.
+          console.error(`uatu: /api/document render failed for ${documentId}:`, error);
+          return Response.json({ error: "document render failed" }, { status });
         }
       },
     },
@@ -282,6 +306,53 @@ export function buildRoutes(deps: BuildRoutesDeps): Serve.Routes<unknown, string
         const rootId = params.get("rootId");
         if (!id || !rootId) return Response.json({ error: "missing document or root id" }, { status: 400 });
         return getSession().getDocumentResource(rootId, id, context);
+      },
+    },
+    [p("/api/document/facts")]: {
+      GET: async (request: Request) => {
+        const context = requestContext(request);
+        if (context instanceof Response) return context;
+        const url = new URL(request.url);
+        const id = url.searchParams.get("id");
+        if (!id) return Response.json({ error: "missing document id" }, { status: 400 });
+        const session = getSession();
+        const roots = session.getDocumentRoots(id, context);
+        const doc = findDocument(roots, id);
+        if (!doc) return Response.json({ error: "document not found" }, { status: 404 });
+        const revision = session.documentRevision(id);
+        const generation = session.repositoryGeneration();
+        const key = `${revision}:${generation}:${id}`;
+        let pending = provenance.get(key);
+        if (!pending) {
+          pending = collectFileFacts({ absolutePath: id, rootPath: roots[0]!.path }).then(facts => ({
+            revision, generation, git: facts?.git,
+            gitState: facts?.git ? "ready" : session.getRepositories(context).some(repo => repo.status === "non-git" && repo.watchedRootIds.includes(doc.rootId)) ? "non-git" : "unavailable",
+          }));
+          provenance.set(key, pending);
+          while (provenance.size > 128) provenance.delete(provenance.keys().next().value!);
+        }
+        const facts = await pending;
+        if (revision !== session.documentRevision(id) || generation !== session.repositoryGeneration()) {
+          provenance.delete(key);
+          return Response.json({ error: "file facts changed" }, { status: 409 });
+        }
+        return Response.json(facts, { headers: { "cache-control": "no-store" } });
+      },
+    },
+    [p("/api/index/recover")]: {
+      POST: async (request: Request) => {
+        if (!hasValidWorkspaceCredentials(request, new URL(request.url), deps.getWorkspaceCredential())) return new Response("Unauthorized", { status: 401 });
+        if (!isAllowedOrigin(request.headers.get("origin"), new URL(request.url))) return new Response("Forbidden", { status: 403 });
+        await getSession().recover();
+        return Response.json({ ok: true });
+      },
+    },
+    [p("/api/repositories/refresh")]: {
+      POST: (request: Request) => {
+        if (!hasValidWorkspaceCredentials(request, new URL(request.url), deps.getWorkspaceCredential())) return new Response("Unauthorized", { status: 401 });
+        if (!isAllowedOrigin(request.headers.get("origin"), new URL(request.url))) return new Response("Forbidden", { status: 403 });
+        getSession().requestRepositoryRefresh();
+        return Response.json({ ok: true }, { status: 202 });
       },
     },
     [p("/api/document/diff")]: {
@@ -467,6 +538,125 @@ function buildChatRoutes(deps: BuildRoutesDeps, p: (path: string) => string) {
   };
 
   return {
+    // Internal hub-to-child protocol (hub-brokered-live-stream D5): the
+    // workspace's activity summary for the hub's cross-workspace badge —
+    // whether any conversation is working and whether any interaction awaits
+    // the user, across every agent. Two booleans and nothing else: no id,
+    // title, or count crosses here. The current summary is sent at once, then
+    // again only when it changes. No stream metrics: the hub's broker holds
+    // one of these per workspace and owns that picture.
+    [p(CHILD_ACTIVITY_PATH)]: {
+      GET: async (request: Request) => {
+        const rejected = authenticated(request);
+        if (rejected) return rejected;
+        const abort = new AbortController();
+        const onAbort = () => abort.abort();
+        if (request.signal.aborted) abort.abort();
+        else request.signal.addEventListener("abort", onAbort, { once: true });
+        try {
+          const changes = await deps.chatService.subscribeActivity({ signal: abort.signal });
+          const encoder = new TextEncoder();
+          let pending: Promise<IteratorResult<void>> | null = null;
+          let sent: string | null = null;
+          let finished = false;
+          const finish = () => {
+            if (finished) return;
+            finished = true;
+            changes.cancel();
+            request.signal.removeEventListener("abort", onAbort);
+          };
+          const stream = new ReadableStream<Uint8Array>({
+            start(controller) {
+              // Headers leave with the first chunk (#350), so open at once
+              // rather than when the first summary is computed.
+              controller.enqueue(encoder.encode(": open\n\n"));
+            },
+            async pull(controller) {
+              try {
+                // The subscription opens with a tick, so the first pull sends
+                // the current summary; a later tick that leaves it unchanged
+                // sends nothing and waits again.
+                while (!abort.signal.aborted) {
+                  pending ??= changes.next();
+                  const result = await nextChatEvent(pending, keepaliveMs);
+                  if (result === "keepalive") {
+                    controller.enqueue(encoder.encode(": keepalive\n\n"));
+                    return;
+                  }
+                  pending = null;
+                  if (result.done) break;
+                  const summary = await deps.chatService.activity();
+                  // Rebuilt field by field, never spread: the wire shape is
+                  // exactly these two booleans whatever a service returns.
+                  const data = JSON.stringify({ working: summary.working === true, awaiting: summary.awaiting === true });
+                  if (data === sent) continue;
+                  sent = data;
+                  controller.enqueue(encoder.encode(`event: ${CHILD_ACTIVITY_EVENT}\ndata: ${data}\n\n`));
+                  return;
+                }
+              } catch {
+                // Cancellation closes the transport without an in-band error.
+              }
+              finish();
+              try { controller.close(); } catch { /* consumer cancelled */ }
+            },
+            cancel() {
+              abort.abort();
+              finish();
+            },
+          }, { highWaterMark: 0 });
+          return new Response(stream, {
+            headers: {
+              "cache-control": "no-store, no-transform",
+              "content-type": "text/event-stream; charset=utf-8",
+              "x-accel-buffering": "no",
+            },
+          });
+        } catch (error) {
+          request.signal.removeEventListener("abort", onAbort);
+          return normalizedChatError(error);
+        }
+      },
+    },
+    [p(CHILD_NOTIFICATIONS_PATH)]: {
+      GET: (request: Request) => {
+        const rejected = authenticated(request);
+        if (rejected) return rejected;
+        const feed = deps.chatService.notificationFeed;
+        if (!feed) return chatError(503, "notification feed unavailable");
+        const cursor = optionalBounded(new URL(request.url).searchParams.get("cursor"), "cursor", CHAT_CURSOR_LIMIT);
+        if (cursor instanceof Response) return cursor;
+        const subscription = feed.subscribe(cursor, request.signal);
+        const encoder = new TextEncoder();
+        let pending: Promise<IteratorResult<NotificationFrame>> | null = null;
+        return new Response(new ReadableStream<Uint8Array>({
+          start(controller) { controller.enqueue(encoder.encode(": open\n\n")); },
+          async pull(controller) {
+            try {
+              pending ??= subscription.next();
+              const result = await nextChatEvent(pending, keepaliveMs);
+              if (result === "keepalive") { controller.enqueue(encoder.encode(": keepalive\n\n")); return; }
+              pending = null;
+              if (result.done) { controller.close(); return; }
+              controller.enqueue(encoder.encode(`event: notification\nid: ${result.value.cursor}\ndata: ${JSON.stringify(result.value)}\n\n`));
+            } catch { subscription.cancel(); try { controller.close(); } catch {} }
+          },
+          cancel() { subscription.cancel(); },
+        }, { highWaterMark: 0 }), { headers: { "content-type": "text/event-stream", "cache-control": "no-store, no-transform", "x-accel-buffering": "no" } });
+      },
+    },
+    // The conversation whose question or permission request has waited the
+    // shortest time: what a page opened from an in-app "needs your answer"
+    // notice selects (`?awaiting=1`). Workspace-local on purpose — the hub's
+    // activity summary says only that something awaits, never which
+    // conversation — and bounded to the id: no question, title, or count.
+    [p("/api/chat/awaiting")]: {
+      GET: (request: Request) => authenticated(request) ?? run(async () => {
+        const pending = deps.chatService.notificationFeed?.snapshot() ?? [];
+        const newest = pending.reduce<(typeof pending)[number] | null>((best, item) => !best || item.createdAt >= best.createdAt ? item : best, null);
+        return { conversationId: newest?.conversationId ?? null };
+      }),
+    },
     [p("/api/chat/status")]: {
       GET: async (request: Request) => authenticated(request) ?? run(async () => ({
         agents: await deps.chatService.status(),
@@ -486,10 +676,48 @@ function buildChatRoutes(deps: BuildRoutesDeps, p: (path: string) => string) {
         return run(() => deps.chatService.retry(body.agentId as string));
       },
     },
+    // Hub → child only: a login change made through the Hub's Agent accounts.
+    // Behind the mutation gate like retry, since it replays a removal on the
+    // workspace's own agent server.
+    [p("/api/chat/accounts-changed")]: {
+      POST: async (request: Request) => {
+        const rejected = mutationGate(request);
+        if (rejected) return rejected;
+        const body = await parseJsonObject(request, ["agentId", "change"]);
+        if (body instanceof Response) return body;
+        if (typeof body.agentId !== "string" || !body.agentId) return chatError(400, "agentId must be a non-empty string");
+        const change = parseAccountChange(body.change);
+        if (!change) return chatError(400, "change must be an accounts change");
+        return run(async () => {
+          await deps.chatService.accountsChanged(body.agentId as string, change);
+          return { ok: true };
+        });
+      },
+    },
     [p("/api/chat/models")]: {
       GET: async (request: Request) => authenticated(request) ?? withAgentScope(request, agentId => run(async () => ({
         models: await deps.chatService.models(agentId),
       }))),
+    },
+    // Plan usage is per login, not per conversation: keyed by agent, like
+    // the catalogs. Internal like every child route (contract: workspace-api).
+    [p("/api/chat/usage")]: {
+      GET: async (request: Request) => authenticated(request) ?? withAgentScope(request, agentId => run(async () => ({
+        report: await deps.chatService.usage(agentId),
+      }))),
+    },
+    [p("/api/chat/usage/read")]: {
+      POST: async (request: Request) => {
+        const rejected = mutationGate(request);
+        if (rejected) return rejected;
+        const body = await parseJsonObject(request, ["agentId", "requestId", "mode"]);
+        if (body instanceof Response) return body;
+        if (typeof body.agentId !== "string" || !body.agentId) return chatError(400, "agentId must be a non-empty string");
+        const requestId = bodyIdentity(body, "requestId");
+        if (requestId instanceof Response) return requestId;
+        if (body.mode !== "live-only" && body.mode !== "start") return chatError(400, "mode must be live-only or start");
+        return run(() => deps.chatService.readUsage(body.agentId as string, requestId, body.mode as UsageReadMode));
+      },
     },
     [p("/api/chat/modes")]: {
       GET: async (request: Request) => authenticated(request) ?? withAgentScope(request, agentId => run(async () => ({
@@ -549,6 +777,14 @@ function buildChatRoutes(deps: BuildRoutesDeps, p: (path: string) => string) {
             request.signal.removeEventListener("abort", onAbort);
           };
           const stream = new ReadableStream<Uint8Array>({
+            start(controller) {
+              // Headers leave with the first chunk, not before. With no change to
+              // report, an idle workspace would hold this stream in CONNECTING for
+              // a whole keepalive interval, and the hub broker subscribing to it
+              // could not tell a live upstream from a stalled one. Same fix as the
+              // conversation route below: open with a comment.
+              controller.enqueue(encoder.encode(": open\n\n"));
+            },
             async pull(controller) {
               try {
                 pending ??= iterator.next();
@@ -559,7 +795,11 @@ function buildChatRoutes(deps: BuildRoutesDeps, p: (path: string) => string) {
                 }
                 pending = null;
                 if (!result.done) {
-                  controller.enqueue(encoder.encode('event: inventory\ndata: {"type":"conversation.inventory"}\n\n'));
+                  const catalogs: Record<string, string> = {};
+                  for (const entry of await deps.chatService!.status()) {
+                    if (entry.availability.state === "ready" && entry.availability.catalogRevision) catalogs[entry.agent.id] = entry.availability.catalogRevision;
+                  }
+                  controller.enqueue(encoder.encode(`event: inventory\ndata: ${JSON.stringify({ type: "conversation.inventory", ...(Object.keys(catalogs).length ? { catalogs } : {}) })}\n\n`));
                   return;
                 }
                 await finish(endedBy("completed"));
@@ -630,7 +870,7 @@ function buildChatRoutes(deps: BuildRoutesDeps, p: (path: string) => string) {
         const onAbort = () => abort.abort();
         request.signal.addEventListener("abort", onAbort, { once: true });
         try {
-          const { events } = await deps.chatService.subscribe(id, { cursor, signal: abort.signal });
+          const { snapshot, events } = await deps.chatService.subscribe(id, { cursor, signal: abort.signal });
           const encoder = new TextEncoder();
           const iterator = events[Symbol.asyncIterator]();
           let pending = iterator.next();
@@ -655,6 +895,16 @@ function buildChatRoutes(deps: BuildRoutesDeps, p: (path: string) => string) {
           // an unbounded queue inside the ReadableStream for as long as an
           // active agent kept publishing.
           const stream = new ReadableStream<Uint8Array>({
+            start(controller) {
+              // The response headers leave with the first chunk, not before, so the
+              // stream opens at once with an `open` event rather than waiting for a
+              // conversation event or the first keepalive. Its data names the cursor
+              // live events follow from: a subscriber that asked for no cursor — the
+              // hub's broker opening a shared stream — learns where the stream begins,
+              // so it can catch up a later subscriber whose cursor is older instead of
+              // skipping it past the gap.
+              controller.enqueue(encoder.encode(`event: ${CHILD_CONVERSATION_OPEN_EVENT}\ndata: ${JSON.stringify({ cursor: snapshot.cursor })}\n\n`));
+            },
             async pull(controller) {
               try {
                 while (!abort.signal.aborted) {
@@ -869,6 +1119,46 @@ function buildChatRoutes(deps: BuildRoutesDeps, p: (path: string) => string) {
         return run(() => deps.chatService.stopTask(id, taskId, requestId));
       }),
     },
+    [p("/api/chat/conversations/:conversationId/wakeups/:wakeupId/cancel")]: {
+      POST: async (request: RouteRequest) => chatMutation(request, ["requestId"], async (id, body) => {
+        const wakeupId = routeIdentity(request, "wakeupId");
+        const requestId = bodyIdentity(body, "requestId");
+        if (wakeupId instanceof Response) return wakeupId;
+        if (requestId instanceof Response) return requestId;
+        return run(() => deps.chatService.cancelWakeup(id, wakeupId, requestId));
+      }),
+    },
+    [p("/api/chat/conversations/:conversationId/release")]: {
+      POST: async (request: RouteRequest) => chatMutation(request, ["requestId"], async (id, body) => {
+        const requestId = bodyIdentity(body, "requestId");
+        if (requestId instanceof Response) return requestId;
+        return run(() => deps.chatService.release(id, requestId));
+      }),
+    },
+    // The output a shell task has written so far, as a bounded tail. A read
+    // (no CSRF gate) that names only the task: the child reads the path the
+    // agent reported for it, never one the client supplies. 404 until the
+    // agent has named where the output goes.
+    [p("/api/chat/conversations/:conversationId/tasks/:taskId/output")]: {
+      GET: async (request: RouteRequest) => {
+        const rejected = authenticated(request);
+        if (rejected) return rejected;
+        const id = routeIdentity(request, "conversationId");
+        if (id instanceof Response) return id;
+        const taskId = routeIdentity(request, "taskId");
+        if (taskId instanceof Response) return taskId;
+        const rawTail = new URL(request.url).searchParams.get("tail");
+        const tail = rawTail === null ? TASK_OUTPUT_TAIL_DEFAULT_BYTES : Number(rawTail);
+        if (!Number.isInteger(tail) || tail < 1) return chatError(400, "invalid tail");
+        const tailBytes = Math.min(tail, TASK_OUTPUT_TAIL_MAX_BYTES);
+        try {
+          const output = await deps.chatService.taskOutput(id, taskId, { tailBytes });
+          return output ? Response.json(output, { headers: { "cache-control": "no-store" } }) : chatError(404, "task output is not available");
+        } catch (error) {
+          return normalizedChatError(error);
+        }
+      },
+    },
     [p("/api/chat/conversations/:conversationId/questions/:interactionId")]: {
       POST: async (request: RouteRequest) => chatMutation(request, ["requestId", "outcome"], async (id, body) => {
         const interactionId = routeIdentity(request, "interactionId");
@@ -916,6 +1206,24 @@ function routeIdentity(request: RouteRequest, name: string): string | Response {
   let value = request.params?.[name] ?? "";
   try { value = decodeURIComponent(value); } catch { return chatError(400, `invalid ${name}`); }
   return validIdentity(value) ? value : chatError(400, `invalid ${name}`);
+}
+
+/** The accounts change the Hub sends; null when it is not one. */
+export function parseAccountChange(value: unknown): ChatAccountChange | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  const text = (key: string) => typeof record[key] === "string" && (record[key] as string).length > 0 && (record[key] as string).length <= 256 ? record[key] as string : null;
+  if (record.kind === "added" && Object.keys(record).length === 1) return { kind: "added" };
+  if (record.kind === "removed") {
+    const target = text("target");
+    const credential = text("credential");
+    return target && credential ? { kind: "removed", target, credential } : null;
+  }
+  if (record.kind === "activated") {
+    const credential = text("credential");
+    return credential ? { kind: "activated", credential } : null;
+  }
+  return null;
 }
 
 function bodyIdentity(body: Record<string, unknown>, name: string): string | Response {
@@ -1019,9 +1327,13 @@ function normalizedChatError(error: unknown): Response {
   if (error instanceof InteractionConflictError) return chatError(409, error.message);
   if (error instanceof ConversationRenameUnsupportedError) return chatError(409, error.message);
   if (error instanceof ReversibleHistoryUnsupportedError) return chatError(409, error.message);
+  if (error instanceof UsageUnsupportedError) return chatError(409, error.message);
   if (error instanceof ReversibleHistoryTargetError) return chatError(409, error.message);
   if (error instanceof InvalidQuestionAnswerError) return chatError(400, error.message);
   if (error instanceof BackgroundTaskUnavailableError) return chatError(409, error.message);
+  if (error instanceof ReleaseUnavailableError) return chatError(409, error.message);
+  if (error instanceof ScheduledWakeupUnavailableError) return chatError(409, error.message);
+  if (error instanceof ScheduledWakeupsUnsupportedError) return chatError(409, error.message);
   if (error instanceof InvalidConversationTitleError) return chatError(400, error.message);
   if (error instanceof InvalidModelSelectionError) return chatError(400, error.message);
   if (error instanceof InvalidModeSelectionError) return chatError(400, error.message);

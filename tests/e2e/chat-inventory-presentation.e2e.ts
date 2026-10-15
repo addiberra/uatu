@@ -109,7 +109,12 @@ test.describe("desktop conversation inventory presentation", () => {
       resources: ["bun test"],
     } });
     await expect(page.locator("#chat-send")).toHaveAttribute("aria-label", "Cancel response");
-    await expect(page.locator("#chat-requests-jump")).toBeVisible();
+    // What this state needs settled before it is captured is that the request
+    // is admitted and counted. Its card is the only entry in the transcript,
+    // so the pill yields to it and the count is what remains to assert.
+    await expect(page.locator('[data-chat-item-id="permission:inventory-review"]')).toBeVisible();
+    await expect(page.locator("#chat-requests-jump")).toHaveText("1 request needs your answer");
+    await expect(page.locator("#chat-requests-jump")).toBeHidden();
     await applyChatInventoryFixture(page, { unseenCount: 3, announce: true });
     await page.locator("#chat-conversation-select").focus();
     await captureSchemes(page, testInfo, "desktop-open-several-running-request");
@@ -140,7 +145,13 @@ test.describe("touch conversation inventory presentation", () => {
     await expect(page.locator("#touch-tab-chat .chat-inventory-attention")).toBeHidden();
     await expect(page.locator("#chat-conversation-unseen-count")).toHaveAttribute("aria-label", "Acknowledge 1 new conversation");
 
-    await applyChatInventoryFixture(page, { unseenCount: 3, announce: true, selectedConversationDeleted: true });
+    // This case already uses live inventory. Keep driving server state:
+    // painting a fictional deletion can be overwritten by the pending read
+    // triggered when Chat becomes visible again.
+    const conversationId = await page.locator("#chat-conversation-select").inputValue();
+    await control(request, { action: "externalCreate", title: "Another unseen conversation" });
+    await control(request, { action: "externalCreate", title: "Third unseen conversation" });
+    await control(request, { action: "externalDelete", conversationId });
     await expect(page.locator("#chat-conversation-unseen-count")).toHaveAttribute("aria-label", "Acknowledge 3 new conversations");
     await expect(page.locator("#chat-conversation-unavailable")).toBeVisible();
     await expect(page.locator("#chat-new-conversation")).toBeEnabled();

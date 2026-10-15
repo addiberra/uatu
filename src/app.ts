@@ -1,6 +1,8 @@
 import { captureTerminalToken, waitForWorkspaceCredential } from "./terminal/client";
 import { initHubNav } from "./shell/hub-nav";
 import { injectPwaLinks, unregisterLegacyServiceWorkers } from "./shell/pwa";
+import { mountNotifications } from "./pwa/notification-client.js";
+import { hubUrl, isHubPage, workspaceIdFromBasePath, appBasePath } from "./shared/app-url";
 import { attachPopstateHandler } from "./shell/history";
 import { loadInitialState } from "./shell/boot";
 import { installAnchorHandlers } from "./preview/anchors";
@@ -12,6 +14,7 @@ import { initSidebarCollapse, initSidebarWidth } from "./sidebar/shell";
 import { initSidebarPanes } from "./sidebar/panes";
 import { initPreviewTextSize } from "./preview/text-size";
 import { initGitLogClickHandler, initGitLogControls } from "./sidebar/git-log";
+import { startCommitAgeTicker } from "./shell/commit-ages";
 import { initChangeOverviewClickHandler } from "./sidebar/change-overview";
 import { initFilesPaneFilterControls } from "./sidebar/files-filter";
 import { initFollowToggle } from "./shell/follow";
@@ -21,6 +24,7 @@ import { initFindShortcuts, registerProjectSearch } from "./find/shortcut";
 import { initSearchPane, openSearchPane } from "./sidebar/search-pane";
 import { initUiMode } from "./shell/ui-mode";
 import { initTabBar, navigationWorkspaceReady } from "./shell/tab-bar";
+import { initDesktopViewport } from "./shell/desktop-viewport";
 import { initChatPanel } from "./chat/surface";
 import { initChat } from "./chat/ui";
 import { initPreviewFileNavigation } from "./preview/file-navigation";
@@ -92,6 +96,7 @@ if (
 // Mode + tab chrome first: everything layout-related keys on the
 // data-ui-mode / data-active-tab attributes these two stamp on <html>.
 initUiMode();
+initDesktopViewport();
 initTabBar();
 initChatPanel();
 initPreviewFileNavigation();
@@ -108,6 +113,7 @@ initHubNav();
 initSidebarWidth();
 initGitLogControls();
 initGitLogClickHandler();
+startCommitAgeTicker();
 initChangeOverviewClickHandler();
 initFilesPaneFilterControls();
 initFollowToggle();
@@ -122,9 +128,13 @@ attachAutoStackObserver();
 captureTerminalToken();
 
 injectPwaLinks();
-// Nothing waits on this: it is housekeeping for profiles that predate 0.5.0,
-// and it is removed once 0.7.0 ships.
+// Boot does not wait for cleanup. Notification enrollment awaits cleanup
+// before registering the current push worker.
 unregisterLegacyServiceWorkers();
+if (isHubPage()) mountNotifications({
+  apiUrl: hubUrl("/api/hub/notifications"), stateUrl: hubUrl("/api/hub/state"), workerUrl: hubUrl("/push-worker.js"),
+  workspaceId: workspaceIdFromBasePath(appBasePath()), hosts: ".sidebar-notifications-row, .sidebar-rail", beforeRegister: unregisterLegacyServiceWorkers,
+});
 attachPopstateHandler();
 
 export const workspaceReady = loadInitialState(() => {

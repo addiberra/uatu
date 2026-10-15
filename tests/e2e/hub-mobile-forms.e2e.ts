@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process";
 import { stat } from "node:fs/promises";
 import type { PublicCredentialDto } from "../../src/hub/credential-types";
 import { test, expect, loginHub, hubPost } from "./hub-mobile-fixtures";
+import { DEFAULT_NAVIGATION_PLACEMENT } from "../../src/shell/navigation-preferences";
 
 test.use({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
 
@@ -53,7 +54,7 @@ test("current defaults, explicit replacement review, draft refresh and shared de
   await expect(other.locator("#navigation-auto-hide")).toHaveValue("false");
   await expect(other.locator("#navigation-preview-side")).toHaveValue("right");
   const stored = await page.evaluate(() => JSON.parse(localStorage.getItem("uatu:navigation:v1:hub")!));
-  expect(stored).toEqual({ side: "right", position: 0.72, autoHide: false, previewSide: "right" });
+  expect(stored).toEqual({ side: "right", position: DEFAULT_NAVIGATION_PLACEMENT.position, autoHide: false, previewSide: "right" });
   await other.close();
 });
 
@@ -146,6 +147,10 @@ test("all credential types keep capability actions, contextual secret errors, to
       await expect(card).toContainText("Unlocked");
     }
     await card.getByRole("button", { name: "Test", exact: true }).click();
+    // "ready" already describes the installed binary before this action.
+    // Wait for Testing… and its catalog replacement to finish before typing
+    // into the next card, whose password field that replacement recreates.
+    await expect(card.getByRole("button", { name: "Test", exact: true })).toBeEnabled();
     await expect(card).toContainText("ready");
     await card.locator("summary").click();
   }
@@ -206,10 +211,15 @@ test("folder creation, dirty-sheet cancellation, Git consent, rename and forget 
   // Successful mutations do not leave a dirty-navigation warning.
   page.on("dialog", dialog => dialog.accept());
   await page.goto(hub.origin);
-  const workspace = page.locator("#workspaces .row").filter({ hasText: "Display only" });
+  await page.locator('#workspaces > details > summary').filter({ hasText: "Display only" }).click();
+  const workspace = page.locator("#workspaces .row[data-workspace]").filter({ hasText: "renamed-folder" });
   await expect(workspace).toContainText("renamed-folder");
   await workspace.getByText("More actions", { exact: true }).click();
-  await workspace.getByRole("button", { name: "Remove Display only from Hub", exact: true }).click();
+  await workspace.getByRole("button", { name: "Remove Display only from Uatu", exact: true }).click();
+  const removal = page.getByRole("dialog");
+  await removal.getByRole("checkbox").check();
+  await removal.getByRole("button", { name: "Remove from Uatu", exact: true }).click();
+  await expect(removal).toHaveCount(0);
   await expect(workspace).toHaveCount(0);
   expect((await stat(`${hub.root}/renamed-folder/.git`)).isDirectory()).toBe(true);
 });
@@ -233,16 +243,21 @@ test("stop failure preserves registration; failed forget truthfully leaves a sto
   await page.unroute(stopUrl);
   page.once("dialog", dialog => dialog.accept());
   await running.getByRole("button", { name: "Stop", exact: true }).click();
-  const stopped = page.locator("#workspaces .row");
+  const stopped = page.locator("#workspaces .row[data-workspace]");
+  await page.locator('#workspaces > details > summary').click();
   await expect(stopped).toContainText(hub.workspaces.a);
-  const forgetUrl = `**/api/hub/workspaces/${a}/forget`;
+  const forgetUrl = "**/api/hub/worktrees/forget";
   await page.route(forgetUrl, route => route.fulfill({ status: 500, json: { error: "Controlled forget failure" } }));
   await stopped.locator("summary").click();
-  await stopped.getByRole("button", { name: "Remove A from Hub" }).click();
-  await expect(stopped.locator("[role=alert]")).toHaveText("Controlled forget failure");
+  await stopped.getByRole("button", { name: "Remove A from Uatu" }).click();
+  const removal = page.getByRole("dialog");
+  await removal.getByRole("checkbox").check();
+  await removal.getByRole("button", { name: "Remove from Uatu", exact: true }).click();
+  await expect(removal).toContainText("Request failed. Nothing was retried automatically.");
   expect((await (await page.request.get(`${hub.origin}/api/hub/state`)).json()).workspaces[0].running).toBe(false);
   await page.unroute(forgetUrl);
-  await stopped.getByRole("button", { name: "Remove A from Hub" }).click();
+  await removal.getByRole("button", { name: "Remove from Uatu", exact: true }).click();
+  await expect(removal).toHaveCount(0);
   await expect(stopped).toHaveCount(0);
   expect(order).toEqual(["stop", "stop", "forget", "forget"]);
   expect((await stat(hub.workspaces.a)).isDirectory()).toBe(true);

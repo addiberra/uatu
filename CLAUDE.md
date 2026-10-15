@@ -15,7 +15,8 @@ after the running app's region or a coherent domain.
 ```
 src/
 ├── app.ts          SPA entry — DOM queries, init calls, event wiring
-├── cli.ts          CLI entry — `uatu serve ...` + Bun.serve assembly
+├── cli.ts          CLI entry — `uatu hub` dispatch + the session child the
+│                   hub spawns (internal `serve`) + its Bun.serve assembly
 ├── styles.d.ts     CSS module type declarations
 ├── index.html, styles.css, assets/, assets/fonts/
 │                   (the bundled Hack Nerd Font Mono lives here — it's
@@ -25,26 +26,57 @@ src/
 │
 ├── chat/           the agent chat surface — shared seam + machinery at
 │                   the root (provider/types/adapter/agents/replay/
-│                   receipts/client/validation/timeline-renderer/ui);
+│                   receipts/client/validation/timeline-renderer/ui;
+│                   ansi renders tool output as terminal text against the
+│                   terminal's palette; conversation-totals folds priced
+│                   usage carriers and task rows into the cost receipt, which
+│                   receipt-view itemizes by agent, type, or model;
+│                   task-inspection drives the running-task drill-down —
+│                   an agent task's live child transcript, a shell task's
+│                   output tail, and the re-read from disk that follows a
+│                   run which streams nothing; surface says whether the
+│                   chat is the surface in front, which the hub switcher's
+│                   viewed acknowledgement also reads; login-action says
+│                   where a missing login is fixed: the Hub's Settings, or
+│                   the agent's own command outside a Hub);
 │                   agent-specific stacks below the seam in
-│                   chat/opencode/ (server runtime + SDK v2 provider +
-│                   normalization) and chat/claude/ (probe runtime,
+│                   chat/opencode/ (the loopback server runtime, which
+│                   decides the spawned server's generation from its
+│                   readiness answer, + one stack per OpenCode generation:
+│                   v1/ is the 1.x provider on `@opencode-ai/sdk` and its
+│                   normalization, v2/ the 2.x provider on
+│                   `@opencode/client`; the shared normalization core sits
+│                   at the root) and chat/claude/ (probe runtime,
 │                   per-conversation SDK sessions, transcript reader,
-│                   model catalog, normalization). One conversation is
+│                   model catalog, normalization, account: what
+│                   `accountInfo()` says about the login). One conversation is
 │                   owned by one agent for life; ids are agent-qualified
-│                   on the wire (`<agentId>:<providerId>`)
+│                   on the wire (`<agentId>:<providerId>`). Each agent's
+│                   `sdk-coverage.ts` holds the hand-kept annotations for
+│                   the SDK coverage report (`bun run coverage:agents`,
+│                   scripts/agent-coverage.ts → the dashboard issue
+│                   #480, published by the agent-coverage workflow)
 ├── find/           ⌘F — active-surface tracking (which surface the user is
 │                   working in, tracked from interaction, NOT from DOM focus),
 │                   the shared find bar and its pluggable engines (preview and
 │                   terminal), text indexing, matching, and highlight painting
-├── shell/          boot, events, history, url, connection, pwa, follow,
+├── shell/          boot, events, live-channel + live (the page's one
+│                   brokered live stream and its lifecycle recovery),
+│                   history, url, connection, pwa, follow,
 │                   follow-rules, state, storage, freshness (client/server
 │                   build-identity handshake), ui-mode (per-device
-│                   touch/desktop mode on <html>), tab-bar (touch mode's
+│                   touch/desktop mode on <html>), desktop-viewport (desktop
+│                   visible rectangle and device safe areas), tab-bar (touch mode's
 │                   floating Files/Preview/Chat/Terminal navigation, its
 │                   edge handle and idle policy), navigation-preferences
 │                   (per-device placement/auto-hide, hub- or base-path
-│                   scoped) — the app-wide chrome and the appState singleton
+│                   scoped), worktree-dialog
+│                   (the one client worktree dialog, embedded in both
+│                   hub-nav's picker and the Hub dashboard) + worktree-live
+│                   (its `worktrees` live-invalidation subscription),
+│                   attention-notice (the in-page "needs your answer"
+│                   notice for other workspaces) — the app-wide chrome and
+│                   the appState singleton
 ├── preview/        the right pane — mounting rendered HTML, view-mode
 │                   chooser, layout (split/stacked), diff view,
 │                   mermaid trigger, anchors, image/binary fallbacks,
@@ -57,11 +89,23 @@ src/
 │                   renders fullscreen as the Files tab
 ├── terminal/       the embedded xterm panel — client + server +
 │                   auth + pty + pane-state + panel UI
-├── cli/            CLI domain — parse (flags + usage text) and output
-│                   (TTY banner + indexing status); cli.ts imports these
+├── cli/            CLI domain — parse (flags, usage text, and the refusal
+│                   a user-shaped `serve` gets) and output (TTY banner +
+│                   indexing status); cli.ts imports these
 ├── server/         routes (single source of truth for the HTTP route
 │                   table + the shared fetch fallback), watch-session
-│                   (live-reload engine), roots (resolution + scanning),
+│                   (coordinates incremental document updates and recovery),
+│                   file-observer (native recursive directory observation,
+│                   shared subscriptions and bounded discovery; Chokidar is
+│                   the polling/unsupported-platform fallback), file-index
+│                   (path map, bounded classification and event batches),
+│                   repository-refresh (independent, paced Git
+│                   collection) + git-observer (event-driven Git metadata
+│                   watch, plus the working tree for narrow roots and the
+│                   content watcher's excluded paths; collection every 5 s
+│                   only as the polling fallback),
+│                   newest-document (incremental Follow catch-up),
+│                   roots (resolution + one-shot scanning),
 │                   search (content sweep over the watched roots),
 │                   render-dispatch, static-files, navigation, port-probe
 ├── document/       document + repository git concerns — metadata, diff,
@@ -74,13 +118,33 @@ src/
 ├── hub/            `uatu hub` — self-hostable session server: config,
 │                   state-dir, registry (stable workspace slugs), backend
 │                   (SessionBackend seam + local-process impl), proxy
-│                   (HTTP/SSE/WS + token brokering), auth (users + the
-│                   server-side session store, one id over cookie/bearer
-│                   transports + rate limit + CSRF), pages, server, main
+│                   (HTTP/WS + token brokering), live-broker (refcounted
+│                   child-topic subscriptions fanned out to every page's
+│                   one `/api/hub/live` stream, plus one hub-lifetime
+│                   activity watch per running workspace; it also owns
+│                   per-user presence, see presence.ts, which holds pushes
+│                   while a session page is visible) + activity-marks
+│                   (its finished/viewed marks, persisted in the state dir),
+│                   auth (users + the server-side session store, one id over
+│                   cookie/bearer transports + rate limit + CSRF),
+│                   worktree-* (the linked Git worktree service — git
+│                   probes, journal, reconciler, rename/delete guards — and
+│                   its published JSON family at `worktree-api.ts`,
+│                   `/api/hub/worktrees`), agent-account-* (Settings →
+│                   Agent accounts: the machine's OpenCode and Claude Code
+│                   logins through the Hub's own short-lived agent runtimes,
+│                   login attempts, loopback-redirect delivery, and the
+│                   notice that tells running workspaces; the pane is
+│                   `agent-accounts-pane.ts`), pages, server, main
 ├── watchdog/       main + capture — heartbeat-driven hang recovery
 ├── debug/          cache + metrics + the heartbeat integration test
-├── pwa/            PWA install affordance (asset references only)
-└── shared/         html, types, license-check, version
+├── pwa/            PWA assets, shared browser notification enrollment UI,
+│                   and the hub's push-only service worker
+└── shared/         html, types, license-check, version, worktree-contract
+                    + worktree-branches (the worktree wire DTOs/errors and
+                    branch/destination rules shared by client and Hub),
+                    document-updates (versioned snapshots/patches and the
+                    keyed reducer used by Hub and browser)
 ```
 
 Outside `src/`: `desktop/macos/` is **UatuCode Desktop**, the SwiftUI macOS
@@ -105,10 +169,21 @@ is path-filtered (`.github/workflows/desktop-ci.yml`); it builds with plain
 - **Cross-cutting helpers** like `escapeHtml` live in `src/shared/`.
   Don't reach into `app.ts` for them — that path has caused
   circular-import TDZ bugs.
+- **`serve` is internal.** Users run `uatu hub`; a user-shaped `uatu serve`
+  prints the hub bootstrap steps and exits non-zero. `serve` is reached only
+  by the hub's spawn (`--exit-on-stdin-close`) and by source runs
+  (`bun run src/cli.ts serve …`, e.g. `tests/e2e/base-path.e2e.ts`).
 - **Client URLs go through `appUrl()`** (`src/shared/app-url.ts`) — never a
   root-relative `/api`/`/assets` literal; `shared/app-url-discipline.test.ts`
   enforces it. This is what makes a session relocatable under
   `--base-path` (which the hub relies on).
+- **Tests never write into `openspec/`.** E2E screenshots and evidence
+  reports go to Playwright's `test-results/` and the HTML report through
+  `tests/e2e/evidence.ts`. A change's `screenshots/` folder is PR evidence,
+  assembled at PR time by running the relevant suite with
+  `UATU_E2E_SCREENSHOTS_DIR=openspec/changes/<change>/screenshots`; it
+  travels with the change to the archive. `tests/evidence-discipline.test.ts`
+  fails any test that names a change folder.
 - E2E tests live in `tests/e2e/` under feature-named files
   (`mermaid.e2e.ts`, `sidebar.e2e.ts`, `document-tree.e2e.ts`, etc.) —
   there is no monolithic `uatu.e2e.ts`.
@@ -117,6 +192,13 @@ is path-filtered (`.github/workflows/desktop-ci.yml`); it builds with plain
   `TreeView.withProgrammaticUpdate(fn)` guard that distinguishes real
   user clicks from library-fired callbacks. Spec at
   `openspec/specs/follow-mode/spec.md`.
+- **Document updates are incremental.** Serve the shell while discovery runs.
+  Use the observer's events and supplied stats to update the index; ordinary
+  edits and idle timers must never initiate a whole-tree scan. File delivery
+  and Source/Rendered content must not wait for Git. Only full snapshots may
+  be coalesced in the Hub queue; dropping a document patch loses its predecessor.
+  Browser preview and provenance work must check file revision and selection
+  ownership before updating content or caches.
 
 ## Release-note discipline
 
@@ -144,11 +226,34 @@ is path-filtered (`.github/workflows/desktop-ci.yml`); it builds with plain
 
 ## Commands
 
-- `bun run dev` — local watch on `testdata/watch-docs`
-- `bun test` — unit suite (~18s)
+- `bun run dev` — dev hub at `http://127.0.0.1:4702/` (`dev/hub.json`, user
+  `dev` / password `dev`) with `testdata/watch-docs` registered and opened
+- `bun test` — unit suite, one file at a time (about 3 min on a CI runner)
+- `bun run test:ci` — the same suite in parallel, and what CI's required
+  `unit` job runs: `bun test --parallel=4` (four worker processes, each file
+  isolated) with `tests/unit-timings.json` starting the slowest files first;
+  the longest file, `src/hub/worktree-lifecycle.integration.test.ts`, sets
+  the floor (on a 6-core laptop about 70 s, against about 280 s one file at
+  a time). Under that contention a test must wait for the event it asserts
+  on (a process exit, a pump that has handled an event), never for a fixed
+  delay, and a test driving real processes or real Git may need a budget
+  above the 5 s default.
+  Refresh the timings with `bun run test:ci --update-timings` when files
+  move a lot
 - When developing Uatu inside a Hub-managed workspace, credential tests may
   discover Uatu's projected Git/SSH wrappers. Use a clean tool environment for
   those tests; do not change product behavior to accommodate nested projection.
-- `bun test:e2e` — Playwright suite (~5min, `workers: 1` serial)
+- `bun run test:e2e` — the whole Playwright suite, both projects (about 870
+  tests, 4 workers, `fullyParallel`, retries only on CI). CI splits the `e2e`
+  project into two legs by file list (`UATU_E2E_LEG=1`/`2`, see
+  `playwright.config.ts`; each leg takes about 15–17 min on a 4-core runner)
+  and runs `perf` in its own job, then merges their blob reports into one
+  HTML report. Unset, `UATU_E2E_LEG` runs the whole project.
+- `bun run test:e2e:perf` — only the `perf` project: tests tagged `@perf`
+  that hold a frame, interaction, or load budget (chat-follow-stability,
+  the long-output shell test, hub-live-stream), at most 2 workers.
+  `bun run test:e2e:no-perf` (the `e2e` project) skips them. Tag a new
+  budget test `@perf`; make deterministic work counters its pass criterion
+  and keep wall-clock time as evidence or a loose guard.
 - `bun run build` — compile the single-file `dist/uatu` binary
 - `bun run check:licenses` — license audit

@@ -34,6 +34,32 @@ describe("createDocumentLoadGuard", () => {
     guard.begin("ignored", "source", "single");
     expect(statuses).toEqual(["pending-selection", "timeout", "pending-selection", "missing-target", "pending-selection", "ready"]);
   });
+  test("a save invalidates a same-file response before its replacement load starts", () => {
+    let revision = "epoch:1";
+    const guard = createDocumentLoadGuard(() => 0, () => revision);
+    const first = guard.begin("README.md", "rendered", "split-h");
+    revision = "epoch:2";
+    expect(guard.isCurrent(first, "README.md", "rendered", "split-h")).toBe(false);
+    const second = guard.begin("README.md", "rendered", "split-h");
+    revision = "new-epoch:2";
+    expect(guard.isCurrent(second, "README.md", "rendered", "split-h")).toBe(false);
+  });
+  test.each(["rendered", "source", "diff"] as const)("close invalidates delayed %s even before a same-file reselect starts loading", async view => {
+    let selectionGeneration = 1;
+    const guard = createDocumentLoadGuard(() => selectionGeneration);
+    const token = guard.begin("README.md", view, "single");
+    const response = deferred();
+    const mounted: string[] = [];
+    const finished = response.promise.then(value => {
+      if (guard.isCurrent(token, "README.md", view, "single")) mounted.push(value);
+    });
+    ++selectionGeneration; // close, then reselect while touch preview is hidden
+    response.resolve("stale");
+    await finished;
+    expect(mounted).toEqual([]);
+    const next = guard.begin("README.md", view, "single");
+    expect(guard.isCurrent(next, "README.md", view, "single")).toBe(true);
+  });
   test("rejects an older selection response that finishes last", async () => {
     const guard = createDocumentLoadGuard();
     let selectedId = "README.md";

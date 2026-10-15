@@ -5,8 +5,14 @@
 
 import type { BackgroundTaskItem, ConversationItem } from "./types";
 
+/**
+ * The background work running now. A foreground run's row (the review a
+ * typed command launches, design D13) is not background work: the turn that
+ * ran it is still the conversation's turn, and the run is listed with the
+ * subagents instead.
+ */
 export function runningBackgroundTasks(items: readonly ConversationItem[]): BackgroundTaskItem[] {
-  return items.filter((item): item is BackgroundTaskItem => item.type === "background_task" && item.status === "running");
+  return items.filter((item): item is BackgroundTaskItem => item.type === "background_task" && item.status === "running" && item.foreground !== true);
 }
 
 /** "1 background task running · Sleep for 20 seconds" / "3 background tasks running". */

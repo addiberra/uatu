@@ -1,15 +1,52 @@
 import { describe, expect, test } from "bun:test";
+import { readdir } from "node:fs/promises";
 
 import { createAjv, openApiOperations, readJson, readYaml, schemaForAjv, validateApi } from "../scripts/validate-api";
+import { HUB_COOKIE_NAME, hubCookieName } from "../src/hub/auth";
 import { isVisibleFolderName } from "../src/hub/folder-manager";
+import type { DocumentPatch, DocumentSnapshot } from "../src/shared/document-updates";
+import {
+  formatLiveEnvelope,
+  formatLiveHello,
+  LIVE_ENVELOPE_EVENT,
+  LIVE_HELLO_EVENT,
+  LIVE_KEEPALIVE_FRAME,
+  LIVE_KEEPALIVE_MS,
+  LIVE_MAX_CURSOR_BYTES,
+  LIVE_MAX_KEY_BYTES,
+  LIVE_MAX_SUBSCRIPTIONS,
+  LIVE_MAX_WORKSPACE_ID_BYTES,
+  LIVE_OPEN_FRAME,
+  LIVE_STREAM_PATH,
+  LIVE_TOPICS,
+  type LiveEnvelope,
+  parseLiveEnvelope,
+  parseLiveHello,
+  parseLiveSubscriptionChange,
+  sanitizeWorkspaceActivity,
+  WORKTREE_INVALIDATION,
+} from "../src/shared/live-protocol";
+import {
+  WORKTREE_AVAILABILITIES,
+  WORKTREE_CREATE_MODES,
+  WORKTREE_CREATE_PHASES,
+  WORKTREE_DELETE_PHASES,
+  WORKTREE_ERROR_CODES,
+  WORKTREE_INVENTORY_STATUSES,
+  WORKTREE_OPERATION_KINDS,
+  WORKTREE_OWNERSHIPS,
+  WORKTREE_RETRY_ACTIONS,
+} from "../src/shared/worktree-contract";
 
-type Inventory = { operations: Array<{ operationId: string; method: string; path: string; childPath?: string; transport?: string; runtime: string }> };
+type Inventory = { operations: Array<{ operationId: string; domain: string; method: string; path: string; childPath?: string; transport?: string; runtime: string }> };
 type Streaming = { channels: Record<string, unknown>; schemas: Record<string, object> };
 
 describe("API contract structure", () => {
   test("metadata, schemas, and all source examples validate", async () => {
     await validateApi();
-  });
+    // CPU-bound: about a second alone, several when other test files share the
+    // cores (`bun test --parallel`), so the default five seconds is no bound.
+  }, 30_000);
 
   test("OpenAPI operations exactly match the public inventory", async () => {
     const [openapi, inventory] = await Promise.all([
@@ -23,8 +60,14 @@ describe("API contract structure", () => {
   });
 
   test("Hub cookie authentication matches the runtime cookie name", async () => {
-    const openapi = await readYaml<{ components: { securitySchemes: { hubCookie: { name: string } } } }>("api/openapi.yaml");
-    expect(openapi.components.securitySchemes.hubCookie.name).toBe("uatu_hub");
+    const openapi = await readYaml<{ components: { securitySchemes: { hubCookie: { name: string; description: string } } } }>("api/openapi.yaml");
+    // The literal is the default-port name. The port-suffixed form the
+    // runtime derives elsewhere cannot be an apiKey `name`, so the scheme's
+    // description carries the rule.
+    expect(openapi.components.securitySchemes.hubCookie.name).toBe(HUB_COOKIE_NAME);
+    expect(openapi.components.securitySchemes.hubCookie.name).toBe(hubCookieName(new URL("https://hub.example/")));
+    expect(openapi.components.securitySchemes.hubCookie.description).toContain("uatu_hub_<port>");
+    expect(hubCookieName(new URL("http://127.0.0.1:4701/"))).toBe("uatu_hub_4701");
   });
 
   test("public logout uses the bearer JSON transport", async () => {
@@ -32,26 +75,57 @@ describe("API contract structure", () => {
     expect(openapi.paths["/logout"].post.security).toEqual([{ hubBearer: [] }]);
   });
 
-  test("every proxied HTTP operation documents an unreachable child", async () => {
-    const [openapi, inventory] = await Promise.all([
-      readYaml<{ paths: Record<string, Record<string, { responses?: Record<string, unknown> }>> }>("api/openapi.yaml"),
+  test("the public contract is the Hub API and the workspace API is an explicit internal exclusion", async () => {
+    const [openapi, inventory, streaming, excluded] = await Promise.all([
+      readYaml<{ paths: Record<string, unknown> }>("api/openapi.yaml"),
       readYaml<Inventory>("api/operations.yaml"),
+      readYaml<{ channels: Record<string, { path?: string }> }>("api/streaming.yaml"),
+      readYaml<{ exclusions: Array<{ id: string; pathPattern?: string; reason?: string }> }>("api/exclusions.yaml"),
     ]);
-    for (const operation of inventory.operations.filter(item => item.childPath && item.transport !== "websocket")) {
-      expect(openapi.paths[operation.path]?.[operation.method.toLowerCase()]?.responses?.["502"]).toBeDefined();
+    // The Hub serves personal state and the activity acknowledgement itself
+    // under the workspace prefix, so they are Hub operations. Nothing the
+    // Hub proxies to the child is public.
+    const personalStatePath = "/s/{workspaceId}/api/personal-state";
+    const activityViewedPath = "/s/{workspaceId}/api/activity-viewed";
+    expect(Object.keys(openapi.paths).filter(path => path.startsWith("/s/")).sort()).toEqual([activityViewedPath, personalStatePath]);
+    const hubServed = inventory.operations.filter(operation => operation.path.startsWith("/s/"));
+    expect(hubServed.map(operation => operation.operationId).sort()).toEqual(["hubAcknowledgeWorkspaceActivity", "workspaceGetPersonalState", "workspacePatchPersonalState"]);
+    for (const operation of hubServed) {
+      expect(operation).toMatchObject({ domain: "hub", runtime: "src/hub/server.ts" });
+      expect(operation.childPath).toBeUndefined();
+    }
+    // The Hub tag is what makes the compatibility check charge a break here
+    // to the Hub revision rather than the workspace revision.
+    const personalState = openapi.paths[personalStatePath] as Record<"get" | "patch", { tags?: string[] }>;
+    const activityViewed = openapi.paths[activityViewedPath] as Record<"post", { tags?: string[] }>;
+    expect([personalState.get.tags, personalState.patch.tags, activityViewed.post.tags]).toEqual([["Hub"], ["Hub"], ["Hub"]]);
+    // New operation IDs begin with `hub`. The personal-state IDs predate the
+    // move to the Hub domain and are kept, since a rename breaks generated clients.
+    const retainedIds = new Set(hubServed.map(operation => operation.operationId));
+    expect(inventory.operations.filter(operation => operation.domain !== "hub" || !(operation.operationId.startsWith("hub") || retainedIds.has(operation.operationId))).map(operation => operation.operationId)).toEqual([]);
+    expect(Object.entries(streaming.channels).filter(([, channel]) => channel.path?.startsWith("/s/")).map(([name]) => name)).toEqual([]);
+    expect(excluded.exclusions.find(item => item.id === "workspace-api")?.pathPattern).toBe("/s/{workspaceId}/api/*");
+    // The streams the Hub refuses say where their events went.
+    for (const id of ["workspace-state-stream-refused", "workspace-inventory-stream-refused", "workspace-conversation-stream-refused", "workspace-activity-stream-refused"]) {
+      expect(excluded.exclusions.find(item => item.id === id)?.reason).toContain("/api/hub/live");
     }
   });
 
   test("metadata revisions agree with OpenAPI and changelog", async () => {
     const [metadata, openapi, changelog] = await Promise.all([
-      readJson<{ hubApiRevision: number; workspaceApiRevision: number }>("api/contract.json"),
-      readYaml<{ info: { "x-uatu-revisions": { hubApiRevision: number; workspaceApiRevision: number } } }>("api/openapi.yaml"),
+      readJson<{ stability: "experimental" | "stable"; hubApiRevision: number; workspaceApiRevision: number }>("api/contract.json"),
+      readYaml<{ info: { version: string; "x-uatu-revisions": { hubApiRevision: number; workspaceApiRevision: number } } }>("api/openapi.yaml"),
       Bun.file(new URL("CHANGELOG.md", new URL("./", import.meta.url))).text(),
     ]);
     expect(openapi.info["x-uatu-revisions"]).toEqual({
       hubApiRevision: metadata.hubApiRevision,
       workspaceApiRevision: metadata.workspaceApiRevision,
     });
+    // `info.version` restates the pair as `<hub>.<workspace>.0`, tagged
+    // `-experimental` while the contract is, so a revision bump that misses it
+    // publishes a document whose version names the previous generation.
+    const tag = metadata.stability === "experimental" ? "-experimental" : "";
+    expect(openapi.info.version).toBe(`${metadata.hubApiRevision}.${metadata.workspaceApiRevision}.0${tag}`);
     expect(changelog).toContain(`## Hub ${metadata.hubApiRevision} / Workspace ${metadata.workspaceApiRevision}`);
     expect(changelog).toMatch(/Compatibility: (initial|additive|breaking)/);
     expect(changelog).toMatch(/### Migration\n\n\S/);
@@ -70,24 +144,89 @@ describe("API contract structure", () => {
   });
 });
 
-describe("streaming protocol is closed", () => {
-  test("rejects unknown events, controls, and close codes but accepts binary PTY data", async () => {
-    const contract = await readYaml<Streaming & { channels: { terminal: { closeCodes: Array<{ code: number }> } } }>("api/streaming.yaml");
-    const ajv = createAjv();
-    const compile = (name: string) => ajv.compile(schemaForAjv(contract.schemas[name], contract.schemas));
-    expect(compile("ClonePhase")({ phase: "unknown" })).toBe(false);
-    expect(compile("SearchStreamItem")({ kind: "error", error: "boom" })).toBe(false);
-    expect(compile("TerminalAttachReady")({ type: "ping", cols: 80, rows: 24 })).toBe(false);
-    expect(compile("TerminalResize")({ type: "resize", cols: 0, rows: 24 })).toBe(false);
-    const cloneEvents = (contract.channels as unknown as { cloneJobEvents: { events: Array<{ name: string }> } }).cloneJobEvents.events;
-    expect(cloneEvents.map(event => event.name)).not.toContain("error");
-    expect(contract.channels.terminal.closeCodes.map(item => item.code)).not.toContain(4444);
-    expect(contract.channels.terminal.closeCodes.map(item => item.code)).toEqual([1000, 1011, 4001, 4404, 4409, 4410]);
-    expect(new Uint8Array([0, 255, 10])).toBeInstanceOf(Uint8Array);
+describe("worktree contract agrees with the shared wire protocol", () => {
+  test("published enum families exactly match the runtime vocabulary", async () => {
+    type Schema = { enum?: string[]; properties?: Record<string, Schema> };
+    const openapi = await readYaml<{ components: { schemas: Record<string, Schema> } }>("api/openapi.yaml");
+    const schemas = openapi.components.schemas;
+    const families: Array<[Schema, readonly string[]]> = [
+      [schemas.WorktreeOwnership!, WORKTREE_OWNERSHIPS],
+      [schemas.WorktreeAvailability!, WORKTREE_AVAILABILITIES],
+      [schemas.WorktreeErrorCode!, WORKTREE_ERROR_CODES],
+      [schemas.WorktreeRetryAction!, WORKTREE_RETRY_ACTIONS],
+      // Create and delete share `complete`; the wire schema is their union,
+      // not an ordering of either operation's phase transitions.
+      [schemas.WorktreePhase!, [...new Set([...WORKTREE_CREATE_PHASES, ...WORKTREE_DELETE_PHASES])]],
+      [schemas.WorktreeInventoryResponse!.properties!.inventory!.properties!.status!, WORKTREE_INVENTORY_STATUSES],
+      [schemas.WorktreeOperationResult!.properties!.kind!, WORKTREE_OPERATION_KINDS],
+      [schemas.CreateWorktreeRequest!.properties!.mode!, WORKTREE_CREATE_MODES],
+    ];
+    for (const [schema, values] of families) {
+      expect(schema.enum).toBeDefined();
+      expect([...schema.enum!].sort()).toEqual([...values].sort());
+    }
   });
 });
 
-describe("conversation configuration and rename", () => {
+describe("streaming protocol is closed", () => {
+  test("rejects unknown events, topics, signal kinds, and activity fields", async () => {
+    const contract = await readYaml<Streaming & { channels: { cloneJobEvents: { events: Array<{ name: string }> }; live: { events: Array<{ name: string }> } } }>("api/streaming.yaml");
+    const ajv = createAjv();
+    const compile = (name: string) => ajv.compile(schemaForAjv(contract.schemas[name], contract.schemas));
+    expect(compile("ClonePhase")({ phase: "unknown" })).toBe(false);
+    expect(contract.channels.cloneJobEvents.events.map(event => event.name)).not.toContain("error");
+    expect(contract.channels.live.events.map(event => event.name)).toEqual(["hello", "live"]);
+
+    const envelope = compile("LiveEnvelope");
+    const ready = { ws: "uatu", topic: "conversation", key: "opencode:conversation-1", cursor: "", event: { kind: "ready" } };
+    expect(envelope(ready)).toBe(true);
+    expect(envelope({ ...ready, topic: "terminal" })).toBe(false);
+    expect(envelope({ ...ready, event: { kind: "error" } })).toBe(false);
+    expect(envelope({ ...ready, event: { kind: "data" } })).toBe(false);
+    expect(envelope({ ...ready, event: { kind: "ready", data: {} } })).toBe(false);
+    expect(envelope({ ...ready, id: "7" })).toBe(false);
+
+    const activity = compile("WorkspaceActivity");
+    expect(activity({ running: true, working: false, awaiting: true, finished: false })).toBe(true);
+    expect(activity({ running: true, working: false, awaiting: true })).toBe(false);
+    expect(activity({ running: true, working: false })).toBe(false);
+    expect(activity({ running: true, working: false, awaiting: true, finished: false, title: "Fix the build" })).toBe(false);
+    expect(compile("LiveHello")({ streamId: "" })).toBe(false);
+  });
+});
+
+describe("conversation configuration", () => {
+  test("window-only observations and execution keys agree with runtime validation", async () => {
+    const { parseConversationItem } = await import("../src/chat/validation");
+    const openapi = await readYaml<{ components: { schemas: Record<string, object> } }>("api/openapi.yaml");
+    const validate = createAjv().compile(schemaForAjv(openapi.components.schemas.ConversationItem, openapi.components.schemas));
+    const window = { id: "w", type: "context_window", createdAt: 1, model: { providerId: "anthropic", modelId: "opus" }, contextKey: "q1", limit: 1_000_000, window: { source: "session", freshness: "current", observedAt: 1 } } as const;
+    expect(validate(window)).toBe(true);
+    expect(parseConversationItem(window)).toEqual(window);
+    expect(validate({ ...window, limit: 0 })).toBe(false);
+    expect(validate({ ...window, total: 1 })).toBe(false);
+    expect(validate({ id: "u", type: "assistant_message", createdAt: 1, markdown: "", contextKey: "q1" })).toBe(true);
+    expect(validate({ id: "r", type: "context_report", createdAt: 1, total: 250_000, contextKey: "q1", window: window.window })).toBe(true);
+  });
+  test("tool and command optional completion timestamps agree with runtime validation", async () => {
+    const { parseConversationItem } = await import("../src/chat/validation");
+    const openapi = await readYaml<{ components: { schemas: Record<string, object> } }>("api/openapi.yaml");
+    const validate = createAjv().compile(schemaForAjv(openapi.components.schemas.ConversationItem, openapi.components.schemas));
+    for (const shape of [{ type: "tool", name: "Bash" }, { type: "command", command: "pwd" }]) {
+      const item = { id: "t", createdAt: 1, status: "completed", ...shape };
+      for (const fields of [{}, { completedAt: 0 }, { completedAt: 1_789_466_400_000 }]) {
+        const wire = { ...item, ...fields };
+        expect(validate(wire)).toBe(true);
+        expect(parseConversationItem(wire)).toEqual(wire);
+      }
+      // JSON has no NaN/Infinity; runtime validation tests cover those values.
+      for (const completedAt of [null, -1, "2026-09-15T10:00:00Z", true]) {
+        expect(validate({ ...item, completedAt })).toBe(false);
+        expect(() => parseConversationItem({ ...item, completedAt })).toThrow();
+      }
+    }
+  });
+
   test("configuration requires a model when a variant is present", async () => {
     const openapi = await readYaml<{ components: { schemas: Record<string, object> } }>("api/openapi.yaml");
     const validate = createAjv().compile(schemaForAjv(openapi.components.schemas.ConversationConfiguration, openapi.components.schemas));
@@ -96,34 +235,193 @@ describe("conversation configuration and rename", () => {
     expect(validate({ variant: "high" })).toBe(false);
   });
 
-  test("rename request is closed and documents the UTF-8 byte limit", async () => {
-    const openapi = await readYaml<{ components: { schemas: Record<string, object> } }>("api/openapi.yaml");
-    const schema = openapi.components.schemas.ConversationRenameRequest as { properties: { title: Record<string, unknown> } };
-    const validate = createAjv().compile(schemaForAjv(openapi.components.schemas.ConversationRenameRequest, openapi.components.schemas));
-    expect(validate({ requestId: "rename-1", title: "New title" })).toBe(true);
-    expect(validate({ requestId: "rename-1", title: "   " })).toBe(false);
-    expect(validate({ requestId: "rename-1", title: "New title", extra: true })).toBe(false);
-    expect(schema.properties.title["x-uatu-maxUtf8Bytes"]).toBe(200);
+});
+
+describe("live stream topics", () => {
+  test("snapshot documents and patch upserts require valid file revisions", async () => {
+    const [openapi, snapshotFixture, patchFixture] = await Promise.all([
+      readYaml<{ components: { schemas: Record<string, object> } }>("api/openapi.yaml"),
+      readJson<{ data: { event: { data: DocumentSnapshot } } }>("api/examples/sse/live-document.json"),
+      readJson<{ data: { event: { data: DocumentPatch } } }>("api/examples/sse/live-document-patch.json"),
+    ]);
+    const snapshot = snapshotFixture.data.event.data;
+    const patch = patchFixture.data.event.data;
+    const { revision, ...document } = patch.upserts[0]!;
+    const snapshotWith = (doc: object) => ({ ...snapshot, roots: [{ ...patch.roots![0], docs: [doc] }] });
+    const patchWith = (doc: object) => ({ ...patch, upserts: [doc] });
+    for (const [schema, withEntry, fileRevision] of [
+      ["WorkspaceState", snapshotWith, snapshot.revision],
+      ["DocumentPatch", patchWith, revision],
+    ] as const) {
+      for (const schemaName of [schema, "DocumentUpdate"]) {
+        const validate = createAjv().compile(schemaForAjv(openapi.components.schemas[schemaName], openapi.components.schemas));
+        expect(validate(withEntry({ ...document, revision: fileRevision }))).toBe(true);
+        expect(validate(withEntry(document)), `${schemaName}: ${schema} entry without revision`).toBe(false);
+        for (const revision of [null, -1, 1.5, "1"]) {
+          expect(validate(withEntry({ ...document, revision }))).toBe(false);
+        }
+      }
+    }
+  });
+
+  test("document snapshots require their protocol and freshness fields", async () => {
+    const [openapi, fixture] = await Promise.all([
+      readYaml<{ components: { schemas: Record<string, object> } }>("api/openapi.yaml"),
+      readJson<{ data: { event: { data: Record<string, unknown> } } }>("api/examples/sse/live-document.json"),
+    ]);
+    for (const schema of ["WorkspaceState", "DocumentUpdate"]) {
+      const validate = createAjv().compile(schemaForAjv(openapi.components.schemas[schema], openapi.components.schemas));
+      const snapshot = fixture.data.event.data;
+      expect(validate(snapshot)).toBe(true);
+      for (const field of ["kind", "epoch", "revision", "discovery", "repositoryState"]) {
+        const incomplete = { ...snapshot };
+        delete incomplete[field];
+        expect(validate(incomplete), `${schema} without ${field}`).toBe(false);
+      }
+    }
+  });
+
+  test("each topic names its payload schema and the domain that owns it", async () => {
+    const streaming = await readYaml<{ channels: { live: { topics: Record<string, unknown> } } }>("api/streaming.yaml");
+    expect(streaming.channels.live.topics).toMatchObject({
+      document: { domain: "workspace", dataSchema: "DocumentUpdate" },
+      inventory: { domain: "workspace", dataSchema: "ConversationInventoryEvent" },
+      conversation: { domain: "workspace", dataSchema: "ChatEvent", resyncDataSchema: "ChatResyncEvent" },
+      activity: { domain: "hub", dataSchema: "WorkspaceActivity" },
+    });
+    expect(Object.keys(streaming.channels.live.topics).sort()).toEqual([...LIVE_TOPICS].sort());
+  });
+
+  test("the inventory payload is exact, closed, and carries no conversation identity", async () => {
+    const [openapi, fixture] = await Promise.all([
+      readYaml<{ components: { schemas: Record<string, object> } }>("api/openapi.yaml"),
+      readJson<{ event: string; data: { topic: string; event: { kind: string; data?: unknown } } }>("api/examples/sse/live-inventory.json"),
+    ]);
+    const validate = createAjv().compile(schemaForAjv(openapi.components.schemas.ConversationInventoryEvent, openapi.components.schemas));
+    expect(fixture.event).toBe("live");
+    expect(fixture.data.topic).toBe("inventory");
+    expect(fixture.data.event).toEqual({ kind: "data", data: { type: "conversation.inventory" } });
+    expect(validate(fixture.data.event.data)).toBe(true);
+    expect(validate({ type: "conversation.inventory", catalogs: { claude: "g:2" } })).toBe(true);
+    expect(validate({ type: "conversation.inventory", catalogs: { claude: 2 } })).toBe(false);
+    expect(validate({ type: "conversation.inventory", conversationId: "conversation-1" })).toBe(false);
+    expect(validate({ type: "conversation.updated" })).toBe(false);
   });
 });
 
-describe("conversation inventory events", () => {
-  test("the inventory SSE payload is exact, closed, and not replay identified", async () => {
-    const [openapi, streaming, fixture] = await Promise.all([
-      readYaml<{ components: { schemas: Record<string, object> } }>("api/openapi.yaml"),
-      readYaml<{ channels: { workspaceChatConversationInventory: { events: unknown[]; lifecycle: { initialEvent: string } } } }>("api/streaming.yaml"),
-      readJson<{ event: string; data: unknown; id?: unknown }>("api/examples/sse/chat-conversation-inventory.json"),
+describe("live stream contract agrees with the shared wire protocol", () => {
+  test("paths, frames, topics, and bounds", async () => {
+    const [openapi, streaming] = await Promise.all([
+      readYaml<{ paths: Record<string, unknown>; components: { schemas: Record<string, Record<string, unknown>> } }>("api/openapi.yaml"),
+      readYaml<{
+        channels: { live: { path: string; bounds: Record<string, number>; lifecycle: Record<string, string> } };
+        schemas: Record<string, { properties: { topic: { enum: string[] } } }>;
+      }>("api/streaming.yaml"),
     ]);
-    const validate = createAjv().compile(schemaForAjv(openapi.components.schemas.ConversationInventoryEvent, openapi.components.schemas));
+    expect(streaming.channels.live.path).toBe(LIVE_STREAM_PATH);
+    expect(openapi.paths[LIVE_STREAM_PATH]).toBeDefined();
+    expect(openapi.paths[`${LIVE_STREAM_PATH}/{streamId}/subscriptions`]).toBeDefined();
+    expect(streaming.channels.live.lifecycle.open).toContain(`\`${LIVE_OPEN_FRAME.trim()}\``);
+    expect(streaming.channels.live.lifecycle.keepalive).toContain(`\`${LIVE_KEEPALIVE_FRAME.trim()}\``);
+    expect(streaming.schemas.LiveEnvelope!.properties.topic.enum).toEqual([...LIVE_TOPICS]);
+    expect(streaming.channels.live.bounds).toEqual({
+      maxSubscriptions: LIVE_MAX_SUBSCRIPTIONS,
+      maxKeyUtf8Bytes: LIVE_MAX_KEY_BYTES,
+      maxCursorUtf8Bytes: LIVE_MAX_CURSOR_BYTES,
+      maxWorkspaceIdUtf8Bytes: LIVE_MAX_WORKSPACE_ID_BYTES,
+      keepaliveSeconds: LIVE_KEEPALIVE_MS / 1000,
+    });
+    const schemas = openapi.components.schemas;
+    expect(schemas.LiveSubscriptionList!.maxItems).toBe(LIVE_MAX_SUBSCRIPTIONS);
+    expect(schemas.LiveSubscriptionKeyList!.maxItems).toBe(LIVE_MAX_SUBSCRIPTIONS);
+    expect(schemas.LiveCursor!["x-uatu-maxUtf8Bytes"]).toBe(LIVE_MAX_CURSOR_BYTES);
+    expect(schemas.LiveDocumentKey!["x-uatu-maxUtf8Bytes"]).toBe(LIVE_MAX_KEY_BYTES);
+    expect(schemas.LiveConversationKey!["x-uatu-maxUtf8Bytes"]).toBe(LIVE_MAX_KEY_BYTES);
+    // The descriptions state the bounds in prose too; keep them in step.
+    expect(String(schemas.LiveDocumentKey!.description)).toContain(`${LIVE_MAX_KEY_BYTES} UTF-8 bytes`);
+    expect(String(schemas.LiveConversationKey!.description)).toContain(`${LIVE_MAX_KEY_BYTES} UTF-8 bytes`);
+    expect(String(schemas.LiveCursor!.description)).toContain(`${LIVE_MAX_CURSOR_BYTES} UTF-8 bytes`);
+  });
 
-    expect(fixture).toEqual({ event: "inventory", data: { type: "conversation.inventory" } });
-    expect(validate(fixture.data)).toBe(true);
-    expect(validate({ type: "conversation.inventory", conversationId: "conversation-1" })).toBe(false);
-    expect(validate({ type: "conversation.updated" })).toBe(false);
-    expect(streaming.channels.workspaceChatConversationInventory.events).toEqual([
-      { name: "inventory", dataSchema: "ConversationInventoryEvent", replayId: "none" },
-    ]);
-    expect(streaming.channels.workspaceChatConversationInventory.lifecycle.initialEvent).toBe("inventory");
+  test("the Hub accepts every contract-valid subscription change and the contract states what it refuses", async () => {
+    const openapi = await readYaml<{ components: { schemas: Record<string, object> } }>("api/openapi.yaml");
+    const validate = createAjv().compile(schemaForAjv(openapi.components.schemas.LiveSubscriptionChange, openapi.components.schemas));
+    const accepts = (body: unknown) => !("error" in parseLiveSubscriptionChange(body));
+    const valid = [
+      {},
+      { add: [{ topic: "document" }] },
+      { add: [{ topic: "document", key: "compareTarget=last-commit&scope=file&documentId=README.md", cursor: "4" }] },
+      { add: [{ topic: "inventory", cursor: "7" }] },
+      { add: [{ topic: "conversation", key: "opencode:conversation-1", cursor: "eyJ2IjoxfQ" }], remove: [{ topic: "conversation", key: "opencode:conversation-0" }] },
+      { remove: [{ topic: "document", key: "" }, { topic: "inventory" }] },
+      { add: [{ topic: "worktrees" }] },
+      { add: [{ topic: "worktrees", cursor: "ignored" }], remove: [{ topic: "worktrees" }] },
+    ];
+    for (const body of valid) {
+      expect(validate(body)).toBe(true);
+      expect(accepts(body)).toBe(true);
+    }
+    const refused = [
+      { add: [{ topic: "activity" }] },
+      { add: [{ topic: "conversation" }] },
+      { add: [{ topic: "conversation", key: "" }] },
+      { add: [{ topic: "inventory", key: "x" }] },
+      { add: [{ topic: "worktrees", key: "x" }] },
+      { add: Array.from({ length: LIVE_MAX_SUBSCRIPTIONS + 1 }, (_, index) => ({ topic: "conversation", key: `opencode:${index}` })) },
+      { replace: [] },
+      [],
+    ];
+    for (const body of refused) {
+      expect(validate(body)).toBe(false);
+      expect(accepts(body)).toBe(false);
+    }
+    // Byte bounds are x-uatu-maxUtf8Bytes annotations, which Ajv does not
+    // enforce. The bounds test above pins them to the Hub's constants.
+    expect(accepts({ add: [{ topic: "conversation", key: "k".repeat(LIVE_MAX_KEY_BYTES + 1) }] })).toBe(false);
+    expect(accepts({ add: [{ topic: "inventory", cursor: "c".repeat(LIVE_MAX_CURSOR_BYTES + 1) }] })).toBe(false);
+  });
+
+  test("formatted frames and sanitized activity match the published schemas", async () => {
+    const streaming = await readYaml<{ schemas: Record<string, object> }>("api/streaming.yaml");
+    const compile = (name: string) => createAjv().compile(schemaForAjv(streaming.schemas[name], streaming.schemas));
+    const activity = compile("WorkspaceActivity");
+    for (const input of [undefined, null, {}, { running: true, working: true, awaiting: true, title: "secret" }, { running: false, working: true }, { running: "yes" }]) {
+      expect(activity(sanitizeWorkspaceActivity(input))).toBe(true);
+    }
+    const frameData = (frame: string) => JSON.parse(frame.split("\n").find(line => line.startsWith("data: "))!.slice("data: ".length));
+    expect(formatLiveHello({ streamId: "b7e2" }).startsWith(`event: ${LIVE_HELLO_EVENT}\n`)).toBe(true);
+    expect(compile("LiveHello")(frameData(formatLiveHello({ streamId: "b7e2" })))).toBe(true);
+    const envelope = compile("LiveEnvelope");
+    const envelopes: LiveEnvelope[] = [
+      { ws: "uatu", topic: "document", key: "scope=folder", cursor: "1", event: { kind: "data", data: { any: "payload" } } },
+      { ws: "uatu", topic: "inventory", cursor: "2", event: { kind: "ready" } },
+      { ws: "uatu", topic: "conversation", key: "opencode:c", cursor: "", event: { kind: "resync" } },
+      { ws: "uatu", topic: "conversation", key: "opencode:c", cursor: "x", event: { kind: "unavailable" } },
+      { ws: "payments-api", topic: "activity", cursor: "3", event: { kind: "data", data: { running: false, working: false, awaiting: false, finished: false } } },
+      { ws: "uatu", topic: "worktrees", cursor: "", event: { kind: "data", data: WORKTREE_INVALIDATION } },
+      { ws: "uatu", topic: "worktrees", cursor: "", event: { kind: "ready" } },
+    ];
+    expect(compile("WorktreeInventoryEvent")(WORKTREE_INVALIDATION)).toBe(true);
+    expect(compile("WorktreeInventoryEvent")({ type: "worktree.inventory", path: "/secret" })).toBe(false);
+    for (const value of envelopes) {
+      const frame = formatLiveEnvelope(value);
+      expect(frame.startsWith(`event: ${LIVE_ENVELOPE_EVENT}\n`)).toBe(true);
+      expect(envelope(frameData(frame))).toBe(true);
+    }
+  });
+
+  test("the client parser accepts every published live example unchanged", async () => {
+    const directory = new URL("examples/sse/", new URL("./", import.meta.url));
+    const names = (await readdir(directory)).filter(name => name.startsWith("live-") && name !== "live-hello.json");
+    expect(names.length).toBeGreaterThan(0);
+    for (const name of names) {
+      const fixture = await Bun.file(new URL(name, directory)).json() as { event: string; data: unknown };
+      expect(fixture.event).toBe(LIVE_ENVELOPE_EVENT);
+      expect(parseLiveEnvelope(JSON.stringify(fixture.data))).toEqual(fixture.data as LiveEnvelope);
+    }
+    const hello = await readJson<{ event: string; data: unknown }>("api/examples/sse/live-hello.json");
+    expect(hello.event).toBe(LIVE_HELLO_EVENT);
+    expect(parseLiveHello(JSON.stringify(hello.data))).toEqual(hello.data as { streamId: string });
   });
 });
 

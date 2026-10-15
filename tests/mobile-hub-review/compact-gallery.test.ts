@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import { galleryImages, galleryScenes, galleryViewport } from "./compact-gallery";
 import { buildEvidenceAssets, evidenceSelection } from "./hosting-evidence";
+import { reviewEvidenceRoot } from "./artifact-locations";
 
 test("compact gallery is exactly ten named scenes in two engines at the documented size", async () => {
   expect(galleryScenes).toHaveLength(10);
@@ -8,7 +9,7 @@ test("compact gallery is exactly ten named scenes in two engines at the document
   expect(new Set(galleryImages.map(image => image.path)).size).toBe(20);
   for (const image of galleryImages) {
     expect(image.path).toMatch(/^gallery\/(chromium|webkit)-[a-z-]+\.png$/);
-    const bytes = Buffer.from(await Bun.file(new URL(`../../openspec/changes/restore-refined-mobile-hub-experience/review-evidence/${image.path}`, import.meta.url)).arrayBuffer());
+    const bytes = Buffer.from(await Bun.file(new URL(image.path, reviewEvidenceRoot)).arrayBuffer());
     expect([...bytes.subarray(0, 8)]).toEqual([137, 80, 78, 71, 13, 10, 26, 10]);
     expect(bytes.readUInt32BE(16)).toBe(galleryViewport.width * galleryViewport.deviceScaleFactor);
     expect(bytes.readUInt32BE(20)).toBe(galleryViewport.height * galleryViewport.deviceScaleFactor);

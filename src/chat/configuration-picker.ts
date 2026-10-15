@@ -1,4 +1,5 @@
 import { onUiModeChange, uiMode, type UiMode } from "../shell/ui-mode";
+import { loginActionElement, type LoginAction } from "./login-action";
 import type {
   ChatAgent,
   ChatCapability,
@@ -41,7 +42,12 @@ export function groupChatModels(models: ChatModel[]): ModelGroup[] {
 }
 
 export function modelIdentityLabel(model: ChatModel): string {
-  return model.detail ?? `${model.provider} · ${model.selection.providerId}/${model.selection.modelId}`;
+  const detail = model.detail ?? `${model.provider} · ${model.selection.providerId}/${model.selection.modelId}`;
+  if (!model.contextWindow) return detail;
+  if (model.contextLimit === undefined) return `${detail} · Limit unavailable`;
+  if (detail.includes("estimated context")) return detail;
+  const label = model.contextWindow.source === "estimate" ? "Estimated limit" : model.contextWindow.freshness === "cached" ? "Cached limit" : "Context window";
+  return `${detail} · ${label}: ${model.contextLimit.toLocaleString()} tokens`;
 }
 
 export function agentControlledModelLabel(agentName?: string): string {
@@ -120,6 +126,9 @@ export type ChatConfigurationPickerState = {
   models: ChatModel[];
   modes: ChatMode[];
   configuration: ConversationConfiguration;
+  // What an empty model list says instead of "No models are available":
+  // why it is empty, and how to fix it.
+  emptyNotice?: { message: string; action?: LoginAction };
 };
 
 export type ChatConfigurationPickerElements = {
@@ -463,9 +472,16 @@ export function createChatConfigurationPicker(
     elements.resultStatus.textContent = modelResultCountLabel(filtered.length);
     elements.empty.hidden = filtered.length !== 0;
     if (filtered.length === 0) {
-      elements.empty.textContent = state.models.length === 0
-        ? "No models are available."
-        : "No models match your search.";
+      if (state.models.length === 0 && state.emptyNotice) {
+        const text = elements.empty.ownerDocument.createElement("span");
+        text.textContent = state.emptyNotice.message;
+        elements.empty.replaceChildren(text);
+        if (state.emptyNotice.action) elements.empty.append(" ", loginActionElement(elements.empty.ownerDocument, state.emptyNotice.action));
+      } else {
+        elements.empty.textContent = state.models.length === 0
+          ? "No models are available."
+          : "No models match your search.";
+      }
     }
 
     const rows = selectableRows();
@@ -503,7 +519,15 @@ export function createChatConfigurationPicker(
     activeModelValue = "";
     elements.trigger.setAttribute("aria-expanded", "false");
     renderModels();
-    if (elements.trigger.ownerDocument.body.contains(elements.trigger)) elements.trigger.focus();
+    // Focus goes back to the trigger only if it has nowhere else to be. The
+    // native `close()` already restores it there synchronously and this
+    // `close` event lands a task later — by which time a user who tapped
+    // Done and then the composer has moved on, and refocusing the trigger
+    // would take that tap away from them.
+    const doc = elements.trigger.ownerDocument;
+    const active = doc.activeElement;
+    const stranded = !active || active === doc.body || elements.dialog.contains(active);
+    if (stranded && doc.body.contains(elements.trigger)) elements.trigger.focus();
   };
 
   const close = (): void => {

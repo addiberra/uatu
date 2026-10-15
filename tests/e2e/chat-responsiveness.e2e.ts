@@ -20,6 +20,10 @@ for (const agent of ["claude", "opencode"]) test.describe(`${agent} presentation
     await page.locator("#chat-timeline").evaluate(el => { el.scrollTop = 300; });
     await page.waitForTimeout(100);
     const beforeTop = await page.locator("#chat-timeline").evaluate(el => el.scrollTop);
+    // Revealing earlier intrinsic-size rows can change the extent on the same
+    // scroll event. The reader must actually be paused here, not snapped back
+    // to a moving bottom before the hide/return assertion starts.
+    expect(beforeTop).toBeCloseTo(300, 0);
     await showSurface(page, "files");
     await page.waitForTimeout(100);
     const before = await page.evaluate(() => structuredClone(globalThis.__uatuChatPerformance));
@@ -142,6 +146,9 @@ for (const agent of ["claude", "opencode"]) test.describe(`${agent} presentation
   });
 
   test("long loaded history preserves find, copy, links, prompt jumps and active selections", async ({ page, request }) => {
+    // Long flow: passes at a 23 s median on CI against the 30 s default
+    // budget, and timed out under four-worker contention while progressing.
+    test.slow();
     await request.post("/__e2e/reset");
     await request.post("/__e2e/chat", { data: { action: "agents", count: 2 } });
     const items = chatWorkload(500);

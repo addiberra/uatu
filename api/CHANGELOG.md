@@ -1,20 +1,242 @@
 # API changelog
 
-Entries are ordered newest first. Every entry has Hub and workspace revisions, a compatibility classification, and migration guidance. Use `None` when no migration is required.
+Entries are ordered newest first. Every entry has Hub and workspace revisions, a compatibility classification, and migration guidance. Use `None` when no migration is required. An entry is headed `Unreleased` until the release that ships it; the release-prep step replaces that with the version tag (`v0.7.0`), so a consumer can tell which revision pair a given uatu version speaks. An additive change that lands after a pair has shipped gets its own entry under the same pair, stamped with its own release, rather than being appended to the shipped entry.
 
-## Hub 5 / Workspace 14 - Additive Image Resources (Unreleased)
+## Hub 11 / Workspace 24 - Unreleased
 
-Compatibility: additive (workspace)
+Compatibility: breaking (hub, workspace)
 
 ### Changes
 
-- Added `workspaceGetDocumentResource`: `GET /s/{workspaceId}/api/document/resource?id=...&rootId=...` reads an indexed image by exact identity within the current scope, with containment and ignore checks. It does not widen stale pins or change ordinary static links.
+- Internal workspace image resources retain exact root identity and scope checks (including stale pins), alongside revision-qualified image refresh. Like other child APIs since workspace revision 16, `/api/document/resource` is not part of the public Hub OpenAPI contract.
+
+- The document topic now carries `DocumentUpdate`: a snapshot with discovery state, epoch, and revision, followed by path-specific patches and independent repository freshness updates.
+- File revisions identify saves independently of modification time. The Hub supplies coherent snapshots to joining or behind subscribers.
+- Snapshots retain the latest eligible edit revision for Follow catch-up without replaying it after unrelated repository refreshes.
+- Workspace startup can report indexing before its inventory is complete. Same-build document rendering and Git provenance requests are independent; the internal recovery and provenance routes remain excluded from the public workspace API.
+- Commit-log entries are documented as `CommitLogEntry` and gain `committedAtMs`, the commit time in epoch milliseconds. `relativeTime` remains, but it no longer advances between repository changes, because an identical repository result is not republished.
 
 ### Migration
 
-None. Existing routes and payloads are unchanged. Clients needing unambiguous multi-root images can use the new operation; older servers return 404.
+Hub live-stream consumers must accept the document topic's snapshot-or-patch protocol under Hub revision 11. Workspace payload consumers must update to workspace revision 24 and apply a patch only when its epoch and predecessor match their current state. Resubscribe for a snapshot on a gap. Use file revisions to invalidate preview caches, and treat indexing as an incomplete inventory. Render commit ages from `committedAtMs` rather than `relativeTime`. The Hub envelope shape and other topics are unchanged.
 
-## Hub 5 / Workspace 14 - Unreleased
+## Hub 10 / Workspace 23 - Unreleased
+
+Compatibility: breaking (workspace)
+
+### Changes
+
+- `ConversationItem` gains `context_window`, a data-only window observation with source and freshness. It changes the context meter's denominator without replacing its token count. `assistant_message` and `context_report` can carry a matching `contextKey`; reports can carry window metadata too.
+- `ConversationInventoryEvent.catalogs` carries agent-scoped catalog revisions. A changed revision asks a connected client to re-read that agent's catalog, including newly discovered context limits.
+
+### Migration
+
+Regenerate strict workspace live-payload clients for revision 23. Do not render `context_window` as a message. Join it to usage by execution identity when present, preserve model/window variants, and repaint when the limit or its source changes. Label estimates and cached observations; an unavailable limit is not a full window. The Hub revision remains 10. Model-list provenance and availability catalog revisions are internal same-build workspace fields.
+
+## Hub 10 / Workspace 22 - Unreleased (agent accounts)
+
+Compatibility: additive
+
+### Changes
+
+- New `Hub agent accounts` operations manage the Hub machine's chat-agent logins: OpenCode providers and the Claude Code account. `GET /api/hub/agent-accounts` (`hubGetAgentAccounts`) reports each agent's login state, the login methods it offers with their extra fields, and the logins in progress. The POST operations log in with a key (`hubConnectAgentAccountKey`), start a browser or device-code login (`hubStartAgentAccountLogin`), finish it with a pasted code (`hubSubmitAgentAccountCode`) or with the address a loopback redirect landed on (`hubSubmitAgentAccountRedirect`), cancel it (`hubCancelAgentAccountLogin`), log out (`hubLogoutAgentAccount`), and switch the active credential (`hubActivateAgentAccountCredential`).
+- Logins are written to each agent's own store on the Hub machine, so they apply to every workspace, every Hub user, and the agents' own tools there. The Hub keeps no agent secret, and no response carries a key, token, code, or pasted address. Errors from these operations use `AgentAccountError`, whose optional `field` names the input concerned.
+- A pasted redirect address is requested only when it is `http:` on a loopback host with the port and path of the attempt's own callback, and the Hub follows no redirect from it.
+- Conversation `notice` items may carry two new `code` values. `login-failed` marks a turn that failed because the agent's login is missing, expired, or refused, with the agent's own words as `message`. `reauthenticating` is the one item an agent occupies while it signs in again mid-session. `code` was already an open string, so the schema is unchanged.
+
+### Migration
+
+None. The operations are new and existing operations are unchanged. A client that presents notices by `code` can offer a way to log in on `login-failed`; one that does not keeps showing it as an error notice.
+
+## Hub 10 / Workspace 22 - Unreleased
+
+Compatibility: breaking (workspace)
+
+### Changes
+
+- `PermissionItem` gains an optional `sourceToolId`: the `tool` item the permission belongs to (`tool:<call id>`), set when the agent names the call it is asking about. OpenCode 2.x names it on every tool permission through the request's `source`. An MCP tool's permission names no resource of its own; a `*` resource and a `*` save pattern are all the wire carries for such a call. With the reference, a client can show the arguments of the call the permission would allow, read from that tool row, which the conversation already holds before the request arrives.
+- `PermissionItem` gains an optional `mcp` (`PermissionMcpTool`: `server`, `tool`): the MCP server and tool an action names, resolved by the agent against the servers it reports. A client can then say `MCP github › create_issue` where the wire says `github_create_issue`; the `action` stays what a persistent approval installs.
+
+### Migration
+
+Strict workspace clients must regenerate against workspace revision 22: `PermissionItem` is closed, so a revision 21 validator rejects the new fields on every permission that carries them. A client that renders permission cards should, for a pending permission whose `resources` are empty or only `*`, look up the `tool` item named by `sourceToolId` in the same conversation and show its `input` where the choices are; when the field is absent, the newest not-yet-completed `tool` item whose `name` equals the permission's `action` is the call being asked about. The Hub revision remains 10.
+
+## Hub 10 / Workspace 21 - Unreleased
+
+Compatibility: breaking (Hub)
+
+### Changes
+
+- `POST /api/hub/worktrees/preflight-delete` no longer refuses a checkout just because it has tracked changes, untracked files or ignored files. When nothing else blocks, its `ok: true` answer carries `localData`: for each category present (`tracked`, `untracked`, `ignored`), the entry count and up to five sorted checkout-relative sample paths, plus one `fingerprint` of the complete set of entries. A path with a trailing `/` is a whole folder and stands for everything inside it.
+- `POST /api/hub/worktrees/delete` accepts an optional `localDataFingerprint`, the preflight's fingerprint echoed back as the acknowledgement of exactly the disclosed data. The Hub re-verifies it at every recheck, up to the moment before Git runs. A missing acknowledgement while local data exists is refused as `local-data`; a set that changed since preflight is refused as `local-data` with `retry: refresh`, since only a new preflight can succeed; a malformed value is refused as `invalid-input`. Nothing is removed in any of these cases.
+- The acknowledgement never overrides a Git lock, a nested worktree, an initialized submodule or nested repository, a Git operation in progress, external activity, uncertain identity or ownership. There is no client-facing force: the Hub may pass Git at most a single force, only for acknowledged tracked or untracked data, never the double force that overrides a lock. The branch is always kept.
+
+### Migration
+
+Strict Hub clients must regenerate against Hub revision 10: `WorktreeDeletionPreflight` is closed, so a revision 9 validator rejects the new `localData` field. A client that does not send `localDataFingerprint` keeps today's behavior: a checkout with local data is refused as `local-data`, now at `delete` rather than at `preflight-delete`, so a preflight `ok: true` is not by itself a promise that deletion will proceed. To delete such a checkout, show the disclosed data, get the user's explicit acknowledgement and send the fingerprint; on a `local-data` refusal with `retry: refresh`, run the preflight again and review. The workspace payload revision remains 21.
+
+## Hub 9 / Workspace 21 - Unreleased
+
+Compatibility: breaking (Hub)
+
+### Changes
+
+- The live stream's `WorkspaceActivity` gains a required `finished` boolean, held per caller: the Hub observed the workspace working, it has since gone quiet, and the caller has not viewed its chat since. The Hub watches every running workspace from the moment it starts, whether or not any page is open, and keeps the fact across a restart.
+- `WorkspaceActivity.working` now also covers an agent's live background work after its turn ended, not only a turn in flight.
+- A new Hub operation, `POST /s/{workspaceId}/api/activity-viewed` (`hubAcknowledgeWorkspaceActivity`, 204), reports that the caller has the workspace's chat in view and clears `finished` for that caller on every device.
+
+### Migration
+
+Strict Hub clients must regenerate against Hub revision 9: the `WorkspaceActivity` object is closed, so a revision 8 validator rejects the new `finished` field on every activity event. A client that shows the activity summary should send `hubAcknowledgeWorkspaceActivity` while it has a workspace's chat in view, or `finished` stays set for that user until the session stops or work starts there again. A client that read `working` as "a turn is in flight" should now read it as "the agent is doing something", since a workspace holding only background work also reports it. The workspace payload revision remains 21.
+
+## Hub 8 / Workspace 21 - Unreleased
+
+Compatibility: breaking (workspace)
+
+### Changes
+
+- `ConversationStatus` gains `scheduled`. No turn runs and nothing executes, but the agent's session holds one or more future turns it scheduled for itself. Prompting stays possible. Only agents declaring the new `scheduled-wakeups` capability report it, which today means Claude Code. When the session also holds live background work, the status is `background`.
+- A new `scheduled_wakeup` conversation item follows one scheduled wakeup through its life. A `pending` row carries the cron `schedule`, whether it is `recurring`, and the workspace's `nextFireAt` reading. It then becomes `fired` (a one-shot, with `firedTurnId`), `cancelled` because the agent removed it or the user cancelled it or released the session, `paused` because the session ended but the agent will rebuild it (a cron) when the conversation runs again, or `lost` because the session ended and the schedule with it. A paused or lost row carries a `message` that says so. A recurring wakeup stays `pending` across its fires. A conversation opened without a live session lists its paused wakeups.
+- A cancelled wakeup stays cancelled. Claude Code rebuilds a session's crons when the session resumes; the workspace blocks the fires of the ones the user cancelled, without a model call, and no turn, status change, or notification follows a blocked fire.
+- `user_message` items gain optional `origin` (`wakeup`) and `wakeupId`. Such an item is the prompt a fired wakeup submitted, and it opens that wakeup's turn. The user did not type it, and clients must not present it as theirs.
+
+### Migration
+
+Strict workspace Chat consumers must regenerate against workspace revision 21. `ConversationStatus` is a closed enum, the `ConversationItem` union is closed, and `user_message` is a closed object, so a revision 20 validator rejects the `scheduled` status, the `scheduled_wakeup` item, and `origin`/`wakeupId` on the conversation topic. A consumer that cannot present the scheduled state should treat `scheduled` like an idle conversation, where prompting works, and should skip unknown item types instead of failing the event. The Hub revision stays 8.
+
+## Hub 8 / Workspace 20 - Unreleased
+
+Compatibility: breaking (Hub)
+
+### Changes
+
+- A published worktree operation family serves the complete Git worktree lifecycle as JSON: `GET /api/hub/worktrees` (inventory) and `POST /api/hub/worktrees/{fetch,create,open,preflight-delete,delete,register,forget}`. It is the Hub's only worktree transport — the in-workspace picker and the Hub dashboard both drive it through one client dialog — so every caller, browser or not, runs over the same service and the same safety rules and no client can reach a weaker check. A refusal is a completed request and answers 200 with `ok: false` and a sanitized error; HTTP statuses report transport problems only. Creation never takes a destination — the Hub computes `<main-folder>.worktrees/<safe-branch-folder>` — deletion requires `confirm: true`, forgetting a workspace is itself the authorization to stop its own Uatu sessions first (there is no `stop: false` variant), the branch is always kept, there is no force anywhere in the family, and there is no operation-progress poll in this contract. `fetch` is one explicit, credential-aware remote fetch that reports refs whether or not it succeeded, carrying no server-side draft. `preflight-delete` is a read-only check of the one blocker that would refuse a deletion, or whether proceeding needs the caller's explicit stop authorization. `register` covers both retrying a Uatu-created checkout that outlived a failed registration and registering an external tree for the first time, told apart by the service's own pending state rather than anything the caller says.
+- Hub state adds optional repository, parent, branch, provenance and availability fields, plus `worktreeApi` — the origin-rooted path of the published JSON family, present only when the Hub serves worktree operations — and a boolean `createWorktree` on a main checkout that can host linked worktrees. Neither publishes a server-rendered worktree URL; the picker and dashboard derive their behavior from the field's presence and the JSON family alone. The live stream adds the cursor-free `worktrees` topic, with an inventory invalidation on subscription, reconnect and committed changes.
+
+### Migration
+
+Strict Hub clients must regenerate against Hub revision 8. The state objects are closed, so revision 7 validators reject the new optional fields. Accept the new `worktrees` envelope topic and subscription variant. On invalidation, fetch authoritative inventory without changing the selected workspace or conversation. The workspace payload revision remains 20.
+
+## Hub 7 / Workspace 20 - Unreleased
+
+Compatibility: breaking (Hub)
+
+### Changes
+
+- `PUT /api/hub/notifications` accepts an optional `allWorkspaces` boolean (default `false`). When true, the device receives its selected event categories from every workspace the login can reach, including workspaces registered after the enrollment was saved; the Hub evaluates the rule at event time rather than expanding it into a list. `workspaceIds` remains required and is stored as the explicit selection the rule overrides, so turning the rule off restores it.
+- The `device` object in `NotificationState` gains a required `allWorkspaces` boolean reporting the stored mode.
+
+### Migration
+
+Strict Hub clients must regenerate against Hub revision 7: the `device` object is closed, so a revision 6 validator rejects the new field on every `GET` and `PUT /api/hub/notifications` response. Clients that never send `allWorkspaces` keep their current behaviour. A Hub downgraded below this revision ignores the stored flag and sends from each device's explicit `workspaceIds` only, until the device is saved again on an upgraded Hub.
+
+## Hub 6 / Workspace 20 - Unreleased
+
+Compatibility: breaking (workspace); additive (Hub)
+
+### Changes
+
+- Added `GET`, `PUT`, and `DELETE /api/hub/notifications` for device push enrollment, preferences, and removal. Device enrollments follow their authenticated login session and selected workspaces. The API never returns push endpoints or private keys.
+- A task `tool` item's `usage` changes meaning. It was the subagent's whole child session, with every subagent beneath it added in; it is now what the subagent spent on the task that row represents — the messages it produced answering that task's prompt — and nothing else. A subagent handed a further task (OpenCode's `task_id` continuation) is one `childConversationId` on several rows: those rows used to restate the session's total, so a sum over rows counted the subagent once per task, and they now state one task each and sum to the session.
+- Task `tool` items gain optional `descendants`: the subagents launched beneath the row, at any depth, as a flat ordered list of `SubagentLine` objects (`id`, `parentId`, `description`, optional `subagent`, `conversationId`, optional `model` and `usage`). Each line's `usage` is that task's own spend, and `parentId` names the row or an earlier line.
+- `assistant_message` usage carriers gain optional `agent`: the agent that produced the message, as the provider names it (OpenCode: `build`, `plan`, `compaction`, or a subagent's kind).
+
+### Migration
+
+Strict workspace Chat consumers must regenerate against workspace revision 20: `tool` and `assistant_message` items are closed objects, so a revision 19 validator rejects `descendants` and `agent` when present. A consumer that totals a conversation's cost must now add each task row's `descendants[].usage` to the row's own `usage` — subagents launched by subagents are no longer folded into their launcher's figure — and must stop treating rows that share a `childConversationId` as separate subagents: they are one subagent's tasks. With both changes, carriers plus rows plus lines count every priced message exactly once. Group carriers by `agent` to itemize the main agent's spend; treat an absent `agent` as unnamed rather than as a distinct agent.
+
+The notification operations require no client migration. Operators enabling Web Push configure `notifications.contact` with a valid `mailto:` address or HTTPS contact URL. Existing devices opt in through notification settings.
+
+## Hub 6 / Workspace 19 - Unreleased
+
+Compatibility: breaking (Hub)
+
+### Changes
+
+- The `hubCookie` session cookie is named for the port of the request's `Host`. It is `uatu_hub` at the scheme's default port and `uatu_hub_<port>` otherwise, so `uatu_hub_4701` for a Hub reached at `127.0.0.1:4701`. Login sets, every request reads, and sign-out clears the cookie under that name. Hubs reached on different ports of one host, as through local port forwards, no longer overwrite each other's session. Bearer authentication and Hubs at a default port are unchanged.
+
+### Migration
+
+Cookie clients of a Hub at a non-default port must present and clear the port-named cookie. A bare `uatu_hub` is ignored there. A client that writes the cookie by name from a natively held session id (UatuCode Desktop before this revision) gets 401 from web views on such a Hub until it derives the name the same way. Browsers sign in once more. Clients of a Hub at a default port, and every bearer client, need no change.
+
+## Hub 5 / Workspace 19 - Unreleased
+
+Compatibility: breaking (workspace)
+
+### Changes
+
+- `tool` and `command` conversation items gain optional `completedAt`, the provider-reported terminal timestamp in Unix epoch milliseconds. Live updates and history carry it when available. Unknown times remain absent.
+
+### Migration
+
+Strict workspace Chat consumers must regenerate against workspace revision 19. These item objects are closed, so revision 18 validators reject the optional field when present. Display the time only for a terminal status; pending or running items must not receive a completed label from a stale timestamp. Do not substitute creation time, duration, receive time, or silence for an absent completion time.
+
+## Hub 5 / Workspace 18 - Unreleased
+
+Compatibility: breaking (workspace)
+
+### Changes
+
+- `TokenUsage` gains an optional `costUsd`: what the message cost in USD, where the agent prices its messages. OpenCode reports one per assistant message; it rides the message's usage record on the live stream, on snapshots, and on the subagent attribution mirrored onto the launching `tool` item. It is not a token component — token sums leave it out — and absent means unpriced, which is not zero.
+
+### Migration
+
+Strict workspace Chat consumers must regenerate against workspace revision 18: `TokenUsage` is a closed object, so a validator built from revision 17 rejects a usage record carrying `costUsd`. A consumer that sums the conversation's cost should count each `assistant_message` usage record once, by item id, since a message restates its cumulative figure while it streams; treat an all-zero sum as "no price known" rather than free.
+
+## Hub 5 / Workspace 17 - v0.7.0
+
+Compatibility: breaking (workspace)
+
+### Changes
+
+- The `notice` item's rate-limit codes are data for the composer, not timeline content. `rate-limit-warning` and `rate-limit-rejected` carry the conversation's current rate-limit standing and are never rendered as a row, the same contract `context_report` has with the context readout.
+- The standing occupies one item id for the conversation's life. It is upserted as the standing begins and changes, keeping the `createdAt` of the moment the conversation entered it, rather than a new item per reported event.
+- `rate-limit-cleared` is removed. A standing that ends is retired with `item.remove` for that id — a state that ended, not a further event to record.
+
+### Migration
+
+Strict workspace Chat consumers must regenerate against workspace revision 17. Treat a notice coded `rate-limit-warning` or `rate-limit-rejected` as data, never as a timeline row: read the newest one as the conversation's standing and present it wherever the client shows plan or quota state, with its `resetsAt`. Expect one such item per conversation rather than one per event, and expect `item.remove` for its id when the standing ends; a client that waited for a `rate-limit-cleared` notice must treat the removal as the clear. Clients that ignore the codes and keep drawing the notices keep working, but will show the standing restated where this revision shows it once.
+
+## Hub 5 / Workspace 16 - v0.7.0
+
+Compatibility: breaking (workspace); additive (Hub)
+
+### Changes
+
+- The Hub API is now the whole public contract. The workspace API under `/s/{workspaceId}/` left it: every `workspace*` operation except the two personal-state operations, the `workspaceState`, `workspaceChat`, `workspaceChatConversationInventory`, and `workspaceSearch` streaming channels, and the terminal WebSocket. Those routes are the internal protocol between the Hub, the workspace child, and the web client shipped in the same build. `exclusions.yaml` lists them as `workspace-api` and `direct-child-api`.
+- `workspaceGetPersonalState` and `workspacePatchPersonalState` (`GET` and `PATCH /s/{workspaceId}/api/personal-state`) stay public, as Hub operations. The Hub stores personal state and answers these requests itself, without proxying them to the child, so `hubApiRevision` now versions them. Their operation IDs, path, authentication, and schemas are unchanged.
+- Added `hubStreamLive` (`GET /api/hub/live`), one Server-Sent Events connection per client. Each `live` event is an envelope `{ ws, topic, key?, cursor, event }` for one of four topics. `document` carries `WorkspaceState` snapshots, `inventory` carries `ConversationInventoryEvent`, `conversation` carries one conversation's `ChatEvent`s, and `activity` carries a `WorkspaceActivity` summary (`running`, `working`, `awaiting`) for every workspace the caller may access. Each subscription has its own cursor, and the `ready`, `resync`, and `unavailable` signals affect one subscription only. The `live` channel in `streaming.yaml` defines the protocol.
+- Added `hubUpdateLiveSubscriptions` (`POST /api/hub/live/{streamId}/subscriptions`), which adds and removes subscriptions on an open stream without reconnecting.
+- The Hub no longer proxies `/s/{workspaceId}/api/events`, `/s/{workspaceId}/api/chat/conversations/events`, or `/s/{workspaceId}/api/chat/conversations/{conversationId}/events`. It answers them, and the new internal `/s/{workspaceId}/api/activity`, with `410 Gone`, `Cache-Control: no-store`, and a JSON body whose `replacement` is `/api/hub/live`.
+- The workspace revision now versions the workspace payloads the live stream forwards: `WorkspaceState`, `ConversationInventoryEvent`, `ChatEvent`, and `ChatResyncEvent`. Their schemas did not change in this revision. `HubWorkspace.workspaceApiRevision` still reports the revision each workspace's child speaks.
+- `uatu serve` and `uatu watch` are no longer user commands. `uatu hub` runs UatuCode, and the workspace child the Hub starts is internal.
+
+### Migration
+
+Workspace clients have no public contract at workspace revision 16. A client that followed workspace streams through the Hub moves to the live stream:
+
+- Replace `/s/{workspaceId}/api/events` with `GET /api/hub/live?ws={workspaceId}` and a `document` subscription. Each `data` event carries the same `WorkspaceState` the old `state` event did.
+- Replace `/s/{workspaceId}/api/chat/conversations/events` with an `inventory` subscription on the same stream.
+- Replace `/s/{workspaceId}/api/chat/conversations/{conversationId}/events` with a `conversation` subscription keyed by the conversation id. The old `cursor` query parameter or `Last-Event-ID` becomes the subscription's `cursor`. The old `resync` event arrives as a `resync` signal whose `data` is the same `ChatResyncEvent`.
+- Open one stream per client and change its subscriptions with `hubUpdateLiveSubscriptions` rather than opening a connection per topic. After a transport error, open a new stream and present every retained cursor in `subs`.
+- Replace `uatu serve` and `uatu watch` with `uatu hub`, and reach workspaces through the Hub. `docs/SELF-HOSTING.md` has the bootstrap steps.
+
+The other workspace routes, meaning documents, search, chat mutations, and terminals, have no public replacement in this revision. They keep working for the web client the Hub serves, which ships with the child in the same build. Validators of the forwarded payloads can keep their workspace revision 15 schemas, since only the transport changed. Clients of the personal-state operations need no change.
+
+## Hub 5 / Workspace 15 - v0.7.0
+
+Compatibility: breaking (workspace)
+
+### Changes
+
+- `permission` items gained optional `alwaysPatterns`: what the persistent approval (`approved-session`) will authorize, in the owning agent's own syntax (OpenCode `git status *`, Claude Code `Bash(git status:*)`), kept apart from `resources`. Empty means the agent supplied nothing reusable; absent means it did not say. A client that shows the persistent choice should show these before sending it.
+- The `workspaceChat` streaming channel's event union reflects the same shape.
+
+### Migration
+
+Strict workspace Chat consumers must regenerate against workspace revision 15 and admit `alwaysPatterns` on permission items (the item schema is closed, so a revision-14 validator rejects it). Clients that ignore the field keep working once their validators admit it.
+
+## Hub 5 / Workspace 14 - v0.7.0
 
 Compatibility: breaking (workspace)
 
@@ -30,7 +252,7 @@ Compatibility: breaking (workspace)
 
 Strict workspace Chat consumers must regenerate against workspace revision 14. Treat `retrying` and `compacting` as live statuses (offer Cancel, hold a new prompt), admit `code` and `resetsAt` on notices, `label` on reasoning items, and `plan` on context reports (an empty plan means the login reports no windows; an absent one means the report does not speak to the plan, so the previous plan stands). Clients that ignore the new fields keep working once their validators admit them; a client that maps unknown statuses to "working" needs no change.
 
-## Hub 5 / Workspace 13 - Unreleased
+## Hub 5 / Workspace 13 - v0.7.0
 
 Compatibility: breaking (workspace)
 
@@ -46,7 +268,7 @@ Compatibility: breaking (workspace)
 
 Strict workspace Chat consumers must regenerate against workspace revision 13. Treat `background` as a non-live status that still accepts a prompt, render `background_task` items (running ones as a live list with a stop control where the agent declares `background-tasks`, settled ones in place), and admit `elapsedMs` on tool items. Clients that ignore the new status, item, and field keep working once their validators admit them.
 
-## Hub 5 / Workspace 12 - Unreleased
+## Hub 5 / Workspace 12 - v0.7.0
 
 Compatibility: breaking (workspace)
 
@@ -61,7 +283,7 @@ Compatibility: breaking (workspace)
 
 Strict workspace Chat consumers must regenerate against workspace revision 12. Accept the new optional `permissionScopeNote` on the agent object and render it as the card's scope line when present; treat `context_report` and `compaction` items as data (one feeds the context readout, the other renders as a marker), never as message bubbles; and render a question carrying `source` with its `intro` and `link`. Clients that ignore the new fields and item kinds keep working once their validators admit them.
 
-## Hub 5 / Workspace 11 - Unreleased
+## Hub 5 / Workspace 11 - v0.7.0
 
 Compatibility: breaking (workspace)
 
@@ -77,7 +299,7 @@ Compatibility: breaking (workspace)
 
 Strict workspace Chat consumers must regenerate against workspace revision 11. Read availability from the `agents` array (a single-agent deployment still answers one entry), send the owning agent on retry and on catalog reads, treat conversation ids as opaque qualified strings, and accept the new closed-object fields on models, modes, permissions, and summaries. Clients that ignore declared defaults keep working; the delegation presentation simply remains.
 
-## Hub 5 / Workspace 10 - Unreleased
+## Hub 5 / Workspace 10 - v0.7.0
 
 Compatibility: breaking (workspace)
 
@@ -90,7 +312,7 @@ Compatibility: breaking (workspace)
 
 Strict workspace Chat consumers must regenerate against workspace revision 10 and accept required `revertedMessages` on every reversible-history state. Clients that expose selected revert or restore send a `messageId` from the visible timeline or current `revertedMessages` list respectively; a stale or inapplicable target answers `409`.
 
-## Hub 5 / Workspace 9 - Unreleased
+## Hub 5 / Workspace 9 - v0.7.0
 
 Compatibility: breaking (workspace)
 
@@ -104,7 +326,19 @@ Compatibility: breaking (workspace)
 
 Strict workspace Chat consumers must regenerate against workspace revision 9 or accept the new closed-object fields and enum variants. Clients may ignore reversible history unless the agent declares the capability. Clients that implement it must preserve local composer drafts when another client triggers a `conversation-rewritten` resync.
 
-## Hub 5 / Workspace 8 - Unreleased
+## Hub 5 / Workspace 8 - v0.6.1
+
+Compatibility: additive (workspace)
+
+### Changes
+
+- Added `workspaceStreamChatConversationInventory` (`GET .../chat/conversations/events`): an authenticated SSE stream whose `inventory` event carries only `{type: "conversation.inventory"}`. The initial event and every later invalidation tell clients to refetch the authoritative conversation list; the stream has no replay cursor or mutation-specific payload. Additive, so the revision pair did not move; v0.6.0 does not serve this route.
+
+### Migration
+
+None.
+
+## Hub 5 / Workspace 8 - v0.6.0
 
 Compatibility: breaking (Hub and workspace)
 
@@ -131,7 +365,6 @@ Compatibility: breaking (Hub and workspace)
 - `ChatPromptRequest` gained optional `attachments`: up to 8 `{id, name, mimeType}` references to previously uploaded images, submitted with the text as one message. `text` may now be empty when `attachments` is non-empty — an image-only prompt is valid (and `QueuedMessage.text` may be empty for such a message). Bytes never ride the prompt request. A reference the workspace has not stored, attachments on a slash command, or an empty text with no attachments answer `400`.
 - `UserMessageItem` and `QueuedMessage` gained optional `attachments` (`MessageAttachment` references): held messages keep their attachments and deliver them under the configuration frozen at submission, and replayed user messages restate theirs. A replayed attachment whose reference could not be recovered carries no `id`; clients render it as a labeled placeholder.
 - `ChatModel` gained optional `imageInput`, reporting whether the model can see image attachments; absent means not reported, which clients treat as no.
-- Added `workspaceStreamChatConversationInventory` (`GET .../chat/conversations/events`): an authenticated SSE stream whose `inventory` event carries only `{type: "conversation.inventory"}`. The initial event and every later invalidation tell clients to refetch the authoritative conversation list; the stream has no replay cursor or mutation-specific payload. This operation is additive.
 
 ### Migration
 
@@ -139,7 +372,7 @@ Strict Hub consumers must regenerate against Hub revision 5: accept required `di
 
 Strict workspace chat consumers must regenerate against workspace revision 8: the closed response objects for user message items, queued messages, and models gained optional properties (`attachments`, `imageInput`), so validators built from revision 7 reject conversation snapshots, chat events, and model listings produced by revision 8. Request producers need no changes — every new request field is optional, and existing prompts remain valid.
 
-## Hub 4 / Workspace 7 - Unreleased
+## Hub 4 / Workspace 7 - v0.6.0
 
 Compatibility: breaking (workspace)
 
@@ -157,7 +390,7 @@ Compatibility: breaking (workspace)
 
 Strict workspace chat consumers must regenerate against workspace revision 7: read `held` instead of `delivery` on prompt acceptance, accept the `conversation.queue` event variant, and accept optional `queued` on conversation snapshots. Clients that steered a running turn must queue instead; there is no steer delivery in revision 7.
 
-## Hub 4 / Workspace 6 - Unreleased
+## Hub 4 / Workspace 6 - v0.6.0
 
 Compatibility: breaking (Hub)
 
@@ -175,7 +408,7 @@ Compatibility: breaking (Hub)
 
 Strict credential-tool consumers must regenerate against Hub revision 4 or accept the new `ssh` enum value. The optional `stop` unassignment field and paired assignment operation are additive and require no migration. Clients may send an empty unlock passphrase only when unlocking an SSH credential.
 
-## Hub 3 / Workspace 6 - Unreleased
+## Hub 3 / Workspace 6 - v0.6.0
 
 Compatibility: breaking (Hub)
 
@@ -187,7 +420,7 @@ Compatibility: breaking (Hub)
 
 Strict Hub state consumers must regenerate against Hub revision 3 or add the required closed `credentialAssignments` object and its two required string arrays. Consumers deciding whether to warn about missing assignments must test both arrays for emptiness and must not treat a non-empty array as proof that startup will succeed.
 
-## Hub 2 / Workspace 6 - Unreleased
+## Hub 2 / Workspace 6 - v0.6.0
 
 Compatibility: breaking (Hub and workspace)
 
@@ -205,7 +438,7 @@ Compatibility: breaking (Hub and workspace)
 
 Strict workspace consumers must regenerate against Workspace revision 6 or widen their closed schemas before connecting. Snapshot decoders must accept and require `configuration`; prompt-acceptance decoders must accept and require `configuration`; stream decoders must accept `conversation.configuration` and `conversation.updated`. Configuration fields are optional, and absence means unknown or agent-controlled: clients must not substitute the first offered model, mode, or variant. A `variant` is only valid together with `model`. Capability-aware clients should expose rename only when `conversation-rename` is declared, send a unique `requestId`, and enforce the 200 UTF-8-byte trimmed-title limit rather than a 200-character limit. Clients that reject unknown event variants or newly required response fields are incompatible with revision 6. Strict Hub state consumers must regenerate against Hub revision 2 or add the required `credentialRestartRequired` boolean to their closed `HubWorkspace` schema. The credential operations and optional clone request fields otherwise remain additive.
 
-## Hub 1 / Workspace 5 - Unreleased
+## Hub 1 / Workspace 5 - v0.6.0
 
 Compatibility: breaking (workspace)
 
@@ -219,7 +452,7 @@ Compatibility: breaking (workspace)
 
 A workspace client that validates conversation items against a closed schema must accept the new optional `diff` on permission items, the new optional `usage` and `model` on assistant-message items, and the new optional `usage` and `model` on tool items, or it will reject an otherwise valid timeline. A client presenting assistant messages must suppress the empty-markdown `usage:<provider-message-id>` carrier as a bubble while still consuming its usage data. Clients that ignore unknown properties need no change. No existing field changed meaning, type, or nullability. Window occupancy is `input + cacheRead + cacheWrite`; `output` is what came back rather than what occupies the window, so a client that adds it to the fill will overstate it. When a usage carrier has `model`, its context percentage uses that model's `contextLimit`, not a different model selected for a future prompt.
 
-## Hub 1 / Workspace 4 - Unreleased
+## Hub 1 / Workspace 4 - v0.6.0
 
 Compatibility: breaking (workspace)
 
@@ -233,7 +466,7 @@ Compatibility: breaking (workspace)
 
 A workspace client that lists ways of working must call `/api/chat/modes` and read the `modes` key; the `agents` route and key are gone, not deprecated. A client that sends a mode with a prompt must rename the request property from `agent` to `mode`; the accepted values are unchanged. A client that validates `ChatAvailability` against a closed schema must accept the new optional `agent` on the `ready` variant, or it will reject an otherwise valid status. Clients that ignore unknown properties need no change for that last item. A client SHOULD present a control only when the agent declares the matching capability, and MUST treat an absent capability as unsupported rather than as an error or an empty result.
 
-## Hub 1 / Workspace 3 - Unreleased
+## Hub 1 / Workspace 3 - v0.6.0
 
 Compatibility: breaking (workspace)
 
@@ -245,7 +478,7 @@ Compatibility: breaking (workspace)
 
 Workspace clients that validate conversation items against a closed schema must accept the new optional `conversationId` on permission and question items, or they will reject an otherwise valid timeline. Clients that ignore unknown properties need no change. A client that answers a request MUST address the owning `conversationId` when present, rather than the conversation it is displaying; answering the displayed conversation for a surfaced subagent request will be refused as a stale request. No existing field changed meaning, type, or nullability.
 
-## Hub 1 / Workspace 2 - Unreleased
+## Hub 1 / Workspace 2 - v0.6.0
 
 Compatibility: breaking (workspace)
 
@@ -258,7 +491,7 @@ Compatibility: breaking (workspace)
 
 Workspace clients that validate `ChatAvailability` against a closed schema must accept the new optional `diagnostics` property on the `unavailable` variant, or they will reject an otherwise valid response. Clients that ignore unknown properties need no change, and the property is absent whenever there is nothing to report. No existing field changed meaning, type, or nullability.
 
-## Hub 1 / Workspace 1 - Unreleased
+## Hub 1 / Workspace 1 - v0.6.0
 
 Compatibility: initial
 

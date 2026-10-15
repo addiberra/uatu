@@ -14,6 +14,21 @@ import { isPathAtOrBelow, normalizeAbsolutePath } from "./path-reservations";
 
 export type WorkspaceBackend = "local";
 
+// A registered linked worktree's relationship to the main workspace that
+// owns its repository. It is a RELATIONSHIP, not copied configuration:
+// credentials and shared workspace configuration stay on the parent and are
+// read through this link live, so a parent change applies to every child
+// with no per-child record to update (design §3).
+//
+// `repositoryId`/`checkoutId` are the canonical Git identities from
+// worktree-git; they are what keeps the link honest when a path is reused
+// by some other tree.
+export type WorkspaceWorktreeLink = {
+  parentWorkspaceId: string;
+  repositoryId: string;
+  checkoutId: string;
+};
+
 export type WorkspaceEntry = {
   id: string;
   // Absolute path of the workspace folder on the hub host.
@@ -22,7 +37,25 @@ export type WorkspaceEntry = {
   // Mutable human-facing label. Unlike `id` it may change at any time, may
   // duplicate another workspace's name, and never participates in routing.
   displayName: string;
+  // Present only for a registered linked worktree.
+  worktree?: WorkspaceWorktreeLink;
 };
+
+// Parses a persisted link, dropping one that is not complete rather than
+// rejecting the whole registration: a workspace with an unreadable link is
+// an ordinary workspace, never a child with a guessed parent.
+export function parseWorktreeLink(value: unknown): WorkspaceWorktreeLink | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  const fields = ["parentWorkspaceId", "repositoryId", "checkoutId"] as const;
+  if (Object.keys(record).some(key => !(fields as readonly string[]).includes(key))) return undefined;
+  if (fields.some(field => typeof record[field] !== "string" || record[field] === "")) return undefined;
+  return {
+    parentWorkspaceId: record.parentWorkspaceId as string,
+    repositoryId: record.repositoryId as string,
+    checkoutId: record.checkoutId as string,
+  };
+}
 
 export const WORKSPACE_DISPLAY_NAME_MAX_LENGTH = 64;
 
@@ -81,8 +114,21 @@ export class WorkspaceRegistry {
   // (temp file + rename) so a crash mid-write cannot corrupt the registry.
   private mutationChain: Promise<unknown> = Promise.resolve();
   private saveCounter = 0;
+  // Told after a removal has committed. A freed id can be minted again for
+  // a different folder, so whatever the hub keeps keyed by workspace id
+  // outside this file — the live broker's finished/viewed marks — must hear
+  // of every removal, whichever flow performed it (forget, a rolled-back
+  // registration, a folder removal, a worktree unregister).
+  private readonly removedListeners = new Set<(id: string) => void>();
 
   constructor(private readonly filePath: string) {}
+
+  onRemoved(listener: (id: string) => void): () => void {
+    this.removedListeners.add(listener);
+    return () => {
+      this.removedListeners.delete(listener);
+    };
+  }
 
   // Enqueues one mutation behind every earlier one; a failed predecessor
   // does not block successors.
@@ -109,7 +155,7 @@ export class WorkspaceRegistry {
     let migrated = false;
     this.workspaces = workspaces
       .filter(
-        (entry): entry is { id: string; path: string; backend: "local"; displayName?: unknown } =>
+        (entry): entry is { id: string; path: string; backend: "local"; displayName?: unknown; worktree?: unknown } =>
           typeof entry === "object" &&
           entry !== null &&
           typeof (entry as WorkspaceEntry).id === "string" &&
@@ -126,7 +172,8 @@ export class WorkspaceRegistry {
           displayName = defaultWorkspaceDisplayName(entry.path);
           migrated = true;
         }
-        return { id: entry.id, path: entry.path, backend: "local" as const, displayName };
+        const worktree = parseWorktreeLink(entry.worktree);
+        return { id: entry.id, path: entry.path, backend: "local" as const, displayName, ...(worktree ? { worktree } : {}) };
       });
     if (migrated) {
       // Persist the derived names through the serialized writer so the file
@@ -151,6 +198,12 @@ export class WorkspaceRegistry {
 
   byId(id: string): WorkspaceEntry | undefined {
     return this.workspaces.find(entry => entry.id === id);
+  }
+
+  // The workspace whose policy governs this one: a linked worktree's parent,
+  // else the workspace itself.
+  policyWorkspaceId(workspaceId: string): string {
+    return this.byId(workspaceId)?.worktree?.parentWorkspaceId ?? workspaceId;
   }
 
   byPath(folderPath: string): WorkspaceEntry | undefined {
@@ -218,7 +271,10 @@ export class WorkspaceRegistry {
         ...entry,
         path: normalizeAbsolutePath(entry.path),
         displayName: validateWorkspaceDisplayName(entry.displayName),
-      }));
+        // A recovery record carries the relationship verbatim; an
+        // incomplete one is dropped rather than half-restored.
+        ...(entry.worktree === undefined ? {} : { worktree: parseWorktreeLink(entry.worktree) }),
+      })).map(entry => (entry.worktree === undefined ? (({ worktree, ...rest }) => rest)(entry) : entry));
       if (restored.some(entry => entry.backend !== "local")) {
         throw new Error("invalid workspace recovery entry");
       }
@@ -266,6 +322,10 @@ export class WorkspaceRegistry {
     folderPath: string,
     backend: WorkspaceBackend = "local",
     displayName?: string,
+    // The parent/repository relationship, committed with the registration
+    // itself so a child is never registered without the policy owner it
+    // inherits from.
+    worktree?: WorkspaceWorktreeLink,
   ): Promise<{ entry: WorkspaceEntry; created: boolean }> {
     return this.enqueueMutation(async () => {
       if (!path.isAbsolute(folderPath)) {
@@ -287,7 +347,7 @@ export class WorkspaceRegistry {
         suffix += 1;
       }
 
-      const entry: WorkspaceEntry = { id, path: folderPath, backend, displayName: validatedName };
+      const entry: WorkspaceEntry = { id, path: folderPath, backend, displayName: validatedName, ...(worktree ? { worktree } : {}) };
       this.workspaces.push(entry);
       try {
         await this.save();
@@ -336,6 +396,13 @@ export class WorkspaceRegistry {
       } catch (error) {
         this.workspaces = previous;
         throw error;
+      }
+      for (const listener of [...this.removedListeners]) {
+        try {
+          listener(id);
+        } catch {
+          // A listener never undoes or fails a committed removal.
+        }
       }
       return true;
     });

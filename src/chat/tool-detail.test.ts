@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
-import { deriveTodoActivities, describeToolDetail, humanizeToolName, naiveLineDiff, patchDiffLines, patchFiles, taskResultText, todoActivitySummary, toolSubject } from "./tool-detail";
+import { deriveTodoActivities, describeToolDetail, formatDelay, humanizeToolName, naiveLineDiff, patchDiffLines, patchFiles, taskResultText, todoActivitySummary, toolSubject } from "./tool-detail";
+import { createClaudeEventMemory, normalizeClaudeMessage } from "./claude/normalization";
+import type { ToolItem } from "./types";
 
 describe("describeToolDetail", () => {
   test("classifies edit calls and diffs only the changed region", () => {
@@ -226,11 +228,76 @@ describe("OpenCode-native tool payloads", () => {
     expect(detail).toMatchObject({ kind: "agent", result: "**Paper Moon**\n\nNight folds its map." });
   });
 
+  // OpenCode 2.x renamed the tool `subagent` and the agent field `agent`, and
+  // wraps the report in its own envelope. Payloads as a 2.0.18 server
+  // recorded them; before this case the row fell to the generic tool view,
+  // with no Agent card and no way into the child's transcript.
+  test("an OpenCode 2.x subagent call reads as the same agent row as a 1.x task", () => {
+    const detail = describeToolDetail({
+      name: "subagent",
+      input: JSON.stringify({ agent: "general", description: "List files in current directory", prompt: "List the files in the current directory." }),
+      output: '<subagent sessionID="ses_child" state="completed">\nThe current directory contains the following files:\n\n1. **README.md**\n2. **notes.txt**\n</subagent>',
+      childConversationId: "ses_child",
+    });
+    expect(detail).toEqual({
+      kind: "agent",
+      label: "Agent",
+      description: "List files in current directory",
+      subagent: "general",
+      prompt: "List the files in the current directory.",
+      conversationId: "ses_child",
+      result: "The current directory contains the following files:\n\n1. **README.md**\n2. **notes.txt**",
+    });
+    expect(toolSubject(detail)).toBe("general · List files in current directory");
+  });
+
+  test("a 2.x report that quotes the envelope keeps everything inside the outer one", () => {
+    expect(taskResultText('<subagent sessionID="ses_a" state="completed">\nIt printed <subagent>x</subagent> verbatim.\n</subagent>'))
+      .toBe("It printed <subagent>x</subagent> verbatim.");
+    expect(taskResultText('<subagent sessionID="ses_a" state="completed">\n\n</subagent>')).toBeUndefined();
+    // Quoting 1.x's envelope must not cut the report down to the quoted part.
+    expect(taskResultText('<subagent sessionID="ses_a" state="completed">\n1.x wrapped it as <task_result>x</task_result>, 2.x does not.\n</subagent>'))
+      .toBe("1.x wrapped it as <task_result>x</task_result>, 2.x does not.");
+  });
+
   test("an unwrapped task output passes through and empty output stays absent", () => {
     expect(taskResultText("plain report")).toBe("plain report");
     expect(taskResultText("")).toBeUndefined();
     expect(taskResultText(undefined)).toBeUndefined();
     expect(taskResultText("<task id='x'><task_result>  </task_result></task>")).toBeUndefined();
+  });
+
+  // A settled Agent row read as `[ { "type": "text", "text": "…" } ]`: the
+  // Claude tool result carries its content as the API's content-block array,
+  // and the normalizer stringified it instead of taking the text out. The row
+  // shows the subagent's report, so the chain from frame to detail is pinned
+  // here rather than the detail alone.
+  test("a settled Agent row shows the subagent's prose, not the result envelope", () => {
+    const memory = createClaudeEventMemory();
+    normalizeClaudeMessage({ type: "assistant", uuid: "a1", timestamp: "2026-09-22T12:00:00.000Z", message: { role: "assistant", model: "claude-opus-5", content: [
+      { type: "tool_use", id: "toolu_agent", name: "Agent", input: { description: "Summarize the files", subagent_type: "Explore", prompt: "Summarize each file." } },
+    ] } }, memory, "live");
+    const report = "Here are summaries of four files…";
+    const settled = normalizeClaudeMessage({ type: "user", uuid: "u1", timestamp: "2026-09-22T12:04:00.000Z", message: { role: "user", content: [
+      { type: "tool_result", tool_use_id: "toolu_agent", content: [{ type: "text", text: report }] },
+    ] } }, memory, "live", "57489e13");
+    const item = settled.updates.flatMap(update => update.kind === "upsert" && update.item.type === "tool" ? [update.item as ToolItem] : [])[0]!;
+    expect(item.output).toBe(report);
+    expect(describeToolDetail(item)).toMatchObject({ kind: "agent", description: "Summarize the files", result: report });
+  });
+
+  // Anything that is not an all-text array keeps its JSON view: a tool whose
+  // result is a shape rather than prose must not lose it to an unwrap.
+  test("a result that is not plain text blocks still reads as JSON", () => {
+    const memory = createClaudeEventMemory();
+    normalizeClaudeMessage({ type: "assistant", uuid: "a1", timestamp: "2026-09-22T12:00:00.000Z", message: { role: "assistant", content: [
+      { type: "tool_use", id: "toolu_shot", name: "Screenshot", input: {} },
+    ] } }, memory, "live");
+    const settled = normalizeClaudeMessage({ type: "user", uuid: "u1", timestamp: "2026-09-22T12:00:01.000Z", message: { role: "user", content: [
+      { type: "tool_result", tool_use_id: "toolu_shot", content: [{ type: "image", source: { type: "base64", media_type: "image/png", data: "iVBOR" } }] },
+    ] } }, memory, "live");
+    const item = settled.updates.flatMap(update => update.kind === "upsert" && update.item.type === "tool" ? [update.item as ToolItem] : [])[0]!;
+    expect(item.output).toContain("\"type\": \"image\"");
   });
 
   test("a skill load is one fact: which skill", () => {
@@ -264,5 +331,33 @@ describe("todo activity", () => {
     expect(todoActivitySummary(activities, current)).toEqual({ label: "Completed +1", task: "one" });
     expect(todoActivitySummary([], current)).toEqual({ label: "Todos 1/3" });
     expect(todoActivitySummary([{ type: "created", count: 3 }], current)).toEqual({ label: "Added 3 todos" });
+  });
+});
+
+describe("Claude Code scheduling calls (claude-scheduled-wakeups)", () => {
+  const detail = (name: string, input: Record<string, unknown>) => describeToolDetail({ name, input: JSON.stringify(input) });
+
+  test("a wakeup names its delay and carries its prompt and reason; a stop ends the loop", () => {
+    const wakeup = detail("ScheduleWakeup", { delaySeconds: 1200, reason: "waiting on CI", prompt: "check the build", noop: false });
+    expect(wakeup).toEqual({ kind: "schedule", label: "Schedule wakeup", action: "wakeup", prompt: "check the build", delaySeconds: 1200, reason: "waiting on CI" });
+    expect(toolSubject(wakeup)).toBe("in 20 min");
+    expect(detail("ScheduleWakeup", { stop: true, prompt: "ignored" })).toEqual({ kind: "schedule", label: "End loop", action: "end-loop" });
+  });
+
+  test("cron calls say what repeats, what runs once, and what is cancelled", () => {
+    const every = detail("CronCreate", { cron: "*/5 * * * *", prompt: "poll the queue" });
+    expect(every).toEqual({ kind: "schedule", label: "Schedule task", action: "create", prompt: "poll the queue", cron: "*/5 * * * *", recurring: true });
+    expect(toolSubject(every)).toBe("every */5 * * * *");
+    const once = detail("CronCreate", { cron: "30 14 28 2 *", prompt: "remind me", recurring: false, durable: true });
+    expect(once).toEqual(expect.objectContaining({ recurring: false, durable: true }));
+    expect(toolSubject(once)).toBe("once at 30 14 28 2 *");
+    const cancel = detail("CronDelete", { id: "0898e09c" });
+    expect(cancel).toEqual({ kind: "schedule", label: "Cancel scheduled task", action: "delete", cronId: "0898e09c" });
+    expect(toolSubject(cancel)).toBe("0898e09c");
+    expect(detail("CronList", {})).toEqual({ kind: "schedule", label: "List scheduled tasks", action: "list" });
+  });
+
+  test("a delay reads the way a person says it", () => {
+    expect([45, 60, 90, 1200, 3600, 5400].map(formatDelay)).toEqual(["45s", "1 min", "2 min", "20 min", "1 h", "1 h 30 min"]);
   });
 });

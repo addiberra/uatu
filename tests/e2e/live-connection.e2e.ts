@@ -3,6 +3,11 @@
 // come back on its own. Both cases are deterministic — the interruption is a
 // refused request, and the resume is the lifecycle event the browser fires,
 // not a wall-clock wait.
+//
+// The page holds ONE live stream (the hub-brokered `/api/hub/live`) carrying
+// the document and chat topics alike, so refusing it interrupts everything
+// at once; each consumer still owns its own status — the shell indicator for
+// the document topic, the chat surface for its topics.
 
 import type { APIRequestContext, Page } from "@playwright/test";
 import { promises as fs } from "node:fs";
@@ -21,6 +26,25 @@ async function resumePage(page: Page): Promise<void> {
   });
 }
 
+// The hide iOS gives a home-screen page it then keeps alive: `persisted`
+// false, as if the document were being discarded.
+async function hidePage(page: Page): Promise<void> {
+  await page.evaluate(() => {
+    const event = new Event("pagehide");
+    Object.defineProperty(event, "persisted", { value: false });
+    window.dispatchEvent(event);
+  });
+}
+
+// A mark that only survives if the document does: gone after a reload.
+async function markPage(page: Page): Promise<void> {
+  await page.evaluate(() => { (window as unknown as { __uatuMark?: string }).__uatuMark = "kept"; });
+}
+
+async function pageMark(page: Page): Promise<string | null> {
+  return page.evaluate(() => (window as unknown as { __uatuMark?: string }).__uatuMark ?? null);
+}
+
 test.afterEach(async ({ request }) => {
   await request.post("/__e2e/reset");
 });
@@ -33,10 +57,10 @@ test.describe("document channel recovery", () => {
   test("an interrupted stream reads Reconnecting, then recovers current state on resume without a reload", async ({ page, request }) => {
     await expect(page.locator("#connection-state .connection-label")).toHaveText("Connected");
 
-    // Every attempt to (re)open the event stream is refused from here on. The
+    // Every attempt to (re)open the live stream is refused from here on. The
     // network-restored signal makes the client install a fresh stream, which
     // is what walks it into the refusal — the shape of a vanished path.
-    await page.route("**/api/events*", route => route.abort());
+    await page.route("**/api/hub/live*", route => route.abort());
     await page.evaluate(() => window.dispatchEvent(new Event("online")));
 
     await expect(page.locator("#connection-state .connection-label")).toHaveText("Reconnecting", { timeout: 15_000 });
@@ -71,7 +95,7 @@ test.describe("document channel recovery", () => {
     await expect(page.locator("#connection-state .connection-label")).toHaveText("Reconnecting");
 
     // The path comes back and the page resumes from the back/forward cache.
-    await page.unroute("**/api/events*");
+    await page.unroute("**/api/hub/live*");
     await resumePage(page);
 
     // Connected means authoritative state was applied, not merely that a
@@ -82,6 +106,84 @@ test.describe("document channel recovery", () => {
     await expect(treeRow(page, "recovered.md")).toBeVisible();
     await expect(page.locator("#document-count")).toHaveText("19 files");
     await expect(page.locator("#preview")).toContainText("Edited while the page was suspended");
+  });
+
+  test("a page hidden without a promised restore reconnects on its own when shown again", async ({ page, request }) => {
+    const label = page.locator("#connection-state .connection-label");
+    await expect(label).toHaveText("Connected");
+    await markPage(page);
+
+    // iOS backgrounding a home-screen page: `pagehide` with `persisted:
+    // false` — the shape of a discard — for a document it then keeps alive.
+    await hidePage(page);
+
+    // The stream is released: the workspace changes, and nothing reaches
+    // the page. A second, connected page is the proof that the change was
+    // delivered to live subscribers — only once it has the new file does the
+    // hidden page's lack of it mean anything.
+    const observer = await page.context().newPage();
+    await observer.goto("/");
+    await expect(observer.locator("#connection-state .connection-label")).toHaveText("Connected");
+    await fs.writeFile(workspacePath("pocketed.md"), "# Pocketed\n\nWritten while backgrounded.\n", "utf8");
+    await expect.poll(
+      async () => {
+        const state = await request.get("/api/state?compareTarget=base&scope=folder").then(r => r.json());
+        return (state.roots as { docs: unknown[] }[]).flatMap(group => group.docs).length;
+      },
+      { timeout: 15_000 },
+    ).toBe(19);
+    await expect(observer.locator("#document-count")).toHaveText("19 files");
+    await expect(treeRow(page, "pocketed.md")).toHaveCount(0);
+    await observer.close();
+
+    // Reopened. iOS does not reliably fire `pageshow` here; the visibility
+    // change is the only signal, and it has to be enough.
+    await page.evaluate(() => document.dispatchEvent(new Event("visibilitychange")));
+    await expect(treeRow(page, "pocketed.md")).toBeVisible({ timeout: 15_000 });
+    await expect(label).toHaveText("Connected");
+    await expect(page.locator("#connection-state")).toHaveClass(/is-live/);
+    expect(await pageMark(page)).toBe("kept");
+  });
+
+  test("the connection indicator is a reconnect control that recovers a stalled page in place", async ({ page }) => {
+    const indicator = page.locator("#connection-state");
+    const label = indicator.locator(".connection-label");
+    await expect(label).toHaveText("Connected");
+    // Inert while live: a click starts nothing and the page stays put.
+    await expect(indicator).toHaveAttribute("aria-disabled", "true");
+    await markPage(page);
+
+    await page.route("**/api/hub/live*", route => route.abort());
+    await page.evaluate(() => window.dispatchEvent(new Event("online")));
+    await expect(label).toHaveText("Reconnecting", { timeout: 15_000 });
+    await expect(indicator).toHaveAccessibleName(/reconnect/i);
+    await expect(indicator).not.toHaveAttribute("aria-disabled", "true");
+
+    // The path is back, but the page has not noticed. The user asks.
+    await page.unroute("**/api/hub/live*");
+    await indicator.click();
+    await expect(label).toHaveText("Connected", { timeout: 15_000 });
+    await expect(indicator).not.toHaveAttribute("aria-busy", "true");
+    expect(await pageMark(page)).toBe("kept");
+  });
+
+  test("a dead page falls back to reloading when the reconnect control cannot confirm live", async ({ page }) => {
+    const indicator = page.locator("#connection-state");
+    const label = indicator.locator(".connection-label");
+    await expect(label).toHaveText("Connected");
+    await markPage(page);
+
+    await page.route("**/api/hub/live*", route => route.abort());
+    await page.evaluate(() => window.dispatchEvent(new Event("online")));
+    await expect(label).toHaveText("Reconnecting", { timeout: 15_000 });
+
+    // Still refused: the in-place attempt cannot succeed, and once its
+    // window passes the page reloads itself.
+    const reloaded = page.waitForEvent("load", { timeout: 25_000 });
+    await indicator.click();
+    await expect(indicator).toHaveAttribute("aria-busy", "true");
+    await reloaded;
+    expect(await pageMark(page)).toBeNull();
   });
 });
 
@@ -104,22 +206,48 @@ test.describe("Chat channel recovery", () => {
     const status = page.locator("#chat-state");
     await expect(status).not.toContainText("interrupted");
 
-    // Refuse the selected conversation's stream only; the inventory stream is
-    // a different route and stays healthy, so one stream fails alone.
-    await page.route("**/api/chat/conversations/*/events*", route => route.abort());
+    // Refuse the one live stream. Chat's topics ride it, so Chat is
+    // interrupted too — and reports that within its own surface.
+    await page.route("**/api/hub/live*", route => route.abort());
     await page.evaluate(() => window.dispatchEvent(new Event("online")));
 
     // The first drop retries silently; the message appears only once the
     // outage outlives one reconnect attempt.
     await expect(status).toContainText("Chat connection interrupted; reconnecting", { timeout: 40_000 });
-    // The document channel is unaffected — Chat's trouble is Chat's to report.
-    await expect(page.locator("#connection-state .connection-label")).toHaveText("Connected");
+    // The shell indicator reports the same stream from the document topic's
+    // point of view; neither surface speaks for the other.
+    await expect(page.locator("#connection-state .connection-label")).toHaveText("Reconnecting");
 
-    await page.unroute("**/api/chat/conversations/*/events*");
+    await page.unroute("**/api/hub/live*");
     await page.evaluate(() => window.dispatchEvent(new Event("online")));
 
-    // Nothing is sent and no assistant output arrives. The successful open is
-    // the only evidence of recovery there is, and it has to be enough.
+    // Nothing is sent and no assistant output arrives. The conversation
+    // topic's `ready` on the replacement stream is the only evidence of
+    // recovery there is, and it has to be enough.
     await expect(status).not.toContainText("Chat connection interrupted; reconnecting", { timeout: 40_000 });
+    await expect(page.locator("#connection-state .connection-label")).toHaveText("Connected", { timeout: 15_000 });
+  });
+
+  test("Reconnect on the interruption line recovers the stalled page in place, keeping the draft", async ({ page }) => {
+    const status = page.locator("#chat-state");
+    const reconnect = status.getByRole("button", { name: "Reconnect" });
+    await page.locator("#chat-input").fill("a draft written before the stall");
+    await markPage(page);
+    await expect(reconnect).toHaveCount(0);
+
+    await page.route("**/api/hub/live*", route => route.abort());
+    await page.evaluate(() => window.dispatchEvent(new Event("online")));
+    await expect(status).toContainText("Chat connection interrupted; reconnecting", { timeout: 40_000 });
+    // The report carries its own way back — the surface a phone user is
+    // looking at, with no browser reload to fall back on.
+    await expect(reconnect).toBeVisible();
+
+    await page.unroute("**/api/hub/live*");
+    await reconnect.click();
+    await expect(status).not.toContainText("interrupted", { timeout: 15_000 });
+    await expect(reconnect).toHaveCount(0);
+    await expect(page.locator("#connection-state .connection-label")).toHaveText("Connected", { timeout: 15_000 });
+    await expect(page.locator("#chat-input")).toHaveValue("a draft written before the stall");
+    expect(await pageMark(page)).toBe("kept");
   });
 });

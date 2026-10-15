@@ -1,15 +1,12 @@
-import path from "node:path";
-import { fileURLToPath } from "node:url";
-
 import type { APIRequestContext, Page } from "@playwright/test";
 
 import type { ConversationConfiguration, ConversationItem } from "../../src/chat/types";
-import { captureScreenshot, chooseChatModel, openChatConfiguration, openChatPanel } from "./chat-helpers";
+import { chooseChatModel, openChatConfiguration, openChatPanel } from "./chat-helpers";
+import { captureScreenshot } from "./evidence";
 import { expect, test } from "./fixtures";
 
 // Where the zen-chat-activity change keeps its evidence: the working line's
 // closed and open forms, a failed dot, and the phone width.
-const ZEN_SCREENSHOTS = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../openspec/changes/zen-chat-activity/screenshots");
 
 async function bootChat(page: Page, request: APIRequestContext): Promise<void> {
   await request.post("/__e2e/reset");
@@ -120,15 +117,15 @@ test.describe("chat panels and navigation", () => {
     await expect(line).toHaveCount(1);
     await expect(line.locator("> summary .chat-activity-subject")).toHaveText("Bash sleep 20 && echo done");
     await expect(page.locator('[data-chat-item-id="tool:1"]')).toBeHidden();
-    await captureScreenshot(page, testInfo, ZEN_SCREENSHOTS, "after-working-line-closed-desktop");
+    await captureScreenshot(page, testInfo, "after-working-line-closed-desktop");
 
     // Opened: the member rows with their state, and the running member with
     // output already open so its tail shows.
     await line.locator("> summary").click();
     await expect(page.locator('[data-chat-item-id="tool:1"]')).toBeVisible();
     await expect(page.locator('[data-chat-item-id="tool:4"]')).toHaveAttribute("open", "");
-    await expect(page.locator('[data-chat-item-id="tool:4"] .chat-tool-stream')).toContainText("still going");
-    await captureScreenshot(page, testInfo, ZEN_SCREENSHOTS, "after-working-line-open-desktop");
+    await expect(page.locator('[data-chat-item-id="tool:4"] .chat-shell-viewport')).toContainText("still going");
+    await captureScreenshot(page, testInfo, "after-working-line-open-desktop");
 
     // Finishing settles the same line into the group summary, still open.
     await control(request, { action: "item", conversationId: id, item: bash("tool:4", at(7), "sleep 20 && echo done", "completed", "done") });
@@ -176,7 +173,7 @@ test.describe("chat panels and navigation", () => {
     await expect(worded).toHaveText("1 failed");
     await expect(line).not.toHaveAttribute("open", "");
     expect(await dot.evaluate(node => getComputedStyle(node).backgroundColor)).toBe(danger);
-    await captureScreenshot(page, testInfo, ZEN_SCREENSHOTS, "after-finished-group-failed-dot-desktop");
+    await captureScreenshot(page, testInfo, "after-finished-group-failed-dot-desktop");
   });
 
   test("reduced motion stills the working line's pulse", async ({ page, request }) => {
@@ -280,13 +277,19 @@ test.describe("chat panels and navigation", () => {
     await expect(page.locator("#chat-drilldown-title")).toHaveText("explore · Open A");
 
     await control(request, { action: "failOlderHistory" });
+    const staleOlder = page.waitForRequest(candidate => new URL(candidate.url()).searchParams.get("cursor") === "older");
     await page.locator("#chat-drilldown-older").click();
+    const staleOlderRequest = await staleOlder;
     const nested = page.locator('[data-chat-item-id="tool:nested"]');
     await nested.locator(":scope > summary").click();
     await nested.getByRole("button", { name: "Open transcript" }).click();
     await expect(page.locator("#chat-drilldown-title")).toHaveText("explore · Open B");
     await expect(page.locator("#chat-drilldown-items")).toContainText("child B findings");
-    await page.waitForTimeout(350);
+    // The stale page read has settled — refused, or aborted by the switch —
+    // and the page has had a frame to handle it, before its error's absence
+    // means anything.
+    await (await staleOlderRequest.response())?.finished();
+    await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => resolve(null))));
     await expect(page.locator("#chat-drilldown-state")).not.toContainText("older transcript unavailable");
     await expect(page.locator("#chat-drilldown-older")).toBeEnabled();
     await page.locator("#chat-drilldown-older").click();
@@ -308,7 +311,8 @@ test.describe("chat panels and navigation", () => {
     await expect(track.locator("summary")).toContainText("1 of 2 subagents working · Audit styles");
     await expect(page.locator('[data-chat-item-id="part:parent"] [data-chat-copy="answer"]')).toHaveCount(0);
 
-    await track.locator("summary").click();
+    // Open already: it holds a running subagent.
+    await expect(track).toHaveAttribute("open", "");
     await expect(track.locator("li")).toHaveCount(2);
     await track.getByRole("button", { name: "explore · Review renderer" }).click();
 
@@ -364,6 +368,47 @@ test.describe("chat panels and navigation", () => {
     await expect.poll(() => page.evaluate(() => (history.state as { laterDocument?: boolean } | null)?.laterDocument)).toBe(true);
   });
 
+  // OpenCode 2.x launches subagents with a `subagent` tool naming the agent
+  // `agent`, and wraps the report in `<subagent …>`. The row as a 2.0.18
+  // server delivers it read as a generic tool: no track entry, no Agent card,
+  // no way into the child's transcript (issue #453).
+  test("an OpenCode 2.x subagent is tracked, carded, and opens its transcript", async ({ page, request }, testInfo) => {
+    const child = await control(request, { action: "seed", title: "List files in current directory", child: true, items: [
+      { id: "message:child-prompt", type: "user_message", createdAt: 1, text: "You are a subagent spawned by another session.\nList the files in the current directory." },
+      { id: "part:child", type: "assistant_message", createdAt: 2, markdown: "The directory holds **README.md** and **notes.txt**." },
+    ] }) as { conversation: { id: string } };
+    await seedAndOpen(page, request, "Fan-out 2.x", [
+      { id: "message:ask", type: "user_message", createdAt: 1, text: "Have a subagent list the files." },
+      {
+        id: "tool:sub1", type: "tool", createdAt: 2, name: "subagent", status: "completed", completedAt: 3,
+        input: JSON.stringify({ agent: "general", description: "List files in current directory", prompt: "List the files in the current directory." }),
+        output: `<subagent sessionID="${child.conversation.id}" state="completed">\nThe directory holds **README.md** and **notes.txt**.\n</subagent>`,
+        childConversationId: child.conversation.id,
+      },
+      { id: "part:parent", type: "assistant_message", createdAt: 4, markdown: "The subagent found README.md and notes.txt." },
+    ]);
+
+    const track = page.locator("#chat-subagents");
+    await expect(track).toBeVisible();
+    await track.locator("summary").click();
+    await expect(track.getByRole("button", { name: "general · List files in current directory" })).toBeVisible();
+
+    // The row itself is an Agent card: the agent, its assignment, and the
+    // report without the machine envelope.
+    const row = page.locator('[data-chat-item-id="tool:sub1"]');
+    await expect(row).toContainText("List files in current directory");
+    await row.locator("summary").first().click();
+    await expect(row.locator(".chat-subagent-result")).toContainText("The directory holds README.md and notes.txt.");
+    await expect(row).not.toContainText("<subagent");
+    await captureScreenshot(page, testInfo, "opencode-2x-subagent-card");
+
+    await row.getByRole("button", { name: "Open transcript" }).click();
+    await expect(page.locator("#chat-drilldown")).toBeVisible();
+    await expect(page.locator("#chat-drilldown-title")).toHaveText("general · List files in current directory");
+    await expect(page.locator("#chat-drilldown-items")).toContainText("The directory holds README.md and notes.txt.");
+    await captureScreenshot(page, testInfo, "opencode-2x-subagent-transcript");
+  });
+
   test("an incomplete question in a drill-down announces inside that layer", async ({ page, request }) => {
     const child = await control(request, { action: "seed", title: "Question child", child: true, items: [{
       id: "question:q1", type: "question", createdAt: 1, requestId: "q1", status: "pending",
@@ -376,7 +421,8 @@ test.describe("chat panels and navigation", () => {
       id: "tool:agent-question", type: "tool", createdAt: 2, name: "task", status: "running", childConversationId: child.conversation.id,
       input: JSON.stringify({ description: "Ask reader", subagent_type: "explore", prompt: "go" }),
     }]);
-    await page.locator("#chat-subagents summary").click();
+    // Open already: it holds a running subagent.
+    await expect(page.locator("#chat-subagents")).toHaveAttribute("open", "");
     await page.getByRole("button", { name: "explore · Ask reader" }).click();
     const drilldown = page.locator("#chat-drilldown");
     await expect(drilldown).toBeVisible();
@@ -696,6 +742,6 @@ test.describe("the working line at phone width", () => {
     await expect(line).toHaveAttribute("data-outcome", "live");
     await expect(line.locator("> summary .chat-activity-subject")).toHaveText("Bash sleep 20 && echo done");
     await expect(page.locator('[data-chat-item-id="tool:1"]')).toBeHidden();
-    await captureScreenshot(page, testInfo, ZEN_SCREENSHOTS, "after-working-line-phone");
+    await captureScreenshot(page, testInfo, "after-working-line-phone");
   });
 });

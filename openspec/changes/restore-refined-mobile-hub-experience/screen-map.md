@@ -1,4 +1,4 @@
-# Touch Hub screen/state map and frontend-review scenarios
+# Touch Hub screen/state map and staged live acceptance
 
 ## Reading this map
 
@@ -16,16 +16,27 @@ fall through to real Hub operations, Git, filesystem mutation, credential tools,
 providers or PTYs. Mocked operation outcomes demonstrate presentation and intent,
 not backend correctness or authorization enforcement.
 
+**2026-10-15 amendment:** the refined UI is now the agreed live phone target and
+integration is explicitly authorized. This planning phase performs no live
+effects. The inventory below retains original reference/provenance notes; its
+synthetic-only labels describe review evidence, not a ban on the new live task
+set. The current full-page editor/result model supersedes historical sheet
+references; small dialogs are reserved for consequential confirmations. Desktop
+and workspace interiors stay unchanged. No final visual/device acceptance is
+recorded by this direction decision.
+
 ## Navigation skeleton
 
 ```text
 Login (no authenticated dock)
-  +-- simulated successful sign-in --> Hub
-Hub -- Settings -- identity / credentials / defaults / devices / security / navigation
- |       +-- details -- task sheet -- review / cancel / outcome
+  +-- authenticated sign-in (synthetic in reviewer) --> Hub
+Hub -- Settings -- identity / Credentials / Agent accounts / Notifications
+ |       |          / defaults / security -> devices / navigation
+ |       +-- focused details -- full-page task -- review / cancel / outcome
  +-- Add Workspace -- browse / create / clone -- task / progress / recovery
- +-- workspace menu -- information / rename / assignments / stop / forget
- +-- Open or explicit simulated Start --> current workspace root
+ +-- compact card or multi-checkout disclosure -- Open/Start
+ +-- More -- information / rename / branch-worktree / assignments / stop / forget
+ +-- Open or explicit Start --> current workspace root
          Files <--> Preview <--> Chat <--> Terminal
          +-- Hub --> Settings/details --> Return to same mounted workspace
 ```
@@ -42,10 +53,10 @@ the existing workspace interiors, not a freshly designed facsimile.
 | --- | --- | --- |
 | H01 Login | Empty, submitting, invalid credentials, rate-limited, unavailable/retry; safe return-target context, keyboard/autofill, password masking. Signed-out page never exposes workspace/version metadata. | **E**; compact current branding and grouped form derived from Hub/sheet grammar. Simulated authentication only. |
 | H02 Dashboard | Initial loading; empty registration list with Add Workspace; mixed running/stopped; all running; all stopped; refresh failure with truthful stale/unknown status. Host and count agree with supplied state. | **P/D/E**, `01-hub.png`, `30-history-stopped.png`; empty/loading/error are extensions. |
-| H03 Workspace row | Name/path, running state or branch metadata, assigned-auth/signing summary and shell information reachable without losing row clarity; Open/Start and ellipsis. Long/duplicate names disambiguated by path/id. Branch named, detached, non-Git, loading and unavailable states; no invented `main`. | **P/D/E**, `01-hub.png`; branch values simulated and labeled during this phase. Branch acquisition deferred. |
+| H03 Workspace card/checkout rows | One compact card for a single checkout; expand branch/checkout rows only for multiple checkouts. Name/path, runtime, branch facts and reachable assignment/shell details; one Open/Start and secondary More. Long/duplicate names use stable identity, not grouping by name. Named/detached/unborn/non-Git/loading/unavailable, missing/replaced and restart-required states. | **P/D/E**, `01-hub.png` plus agreed amendment; synthetic branch values remain labeled, live authoritative facts need separate checks. |
 | H04 Workspace actions | View information; rename display name; edit assignments; explicit Start including unassigned confirmation or masked unlock; starting/opening/failure; Stop confirmation and pending/result; forget registration distinct from deleting files; composite partial success if supported. Cancel creates no operation. | **D/E**, row ellipsis in `01-hub.png`, recovery in `30-history-stopped.png`; sheets follow `31-defaults-draft.png`. Preserve existing operation semantics, do not invent a new destructive policy. |
 | H05 Hub dock/history | Fresh: Hub, Settings. After genuine open: Return to workspace, Hub, Settings. Return survives Settings and detail browsing; managing B does not replace opened A. Renamed, stopped, missing, auth-expired and refresh-unavailable targets get truthful recovery. Back/Forward never starts or substitutes a workspace. | **P/D/E**, `08-return-hub.png`, `15-return-in-settings.png`, `30-history-stopped.png`; exceptions are review states. |
-| S01 Settings overview | Identity card; credential summary group + Add Credential; Workspace settings; Account group; sign out. Loading/empty/error for independently loaded sections. Refresh preserves current detail/form/focus, not wholesale DOM replacement. | **P/D**, `15-return-in-settings.png`, `22-preview-side-setting.png`. |
+| S01 Settings overview | Identity; repository Credentials + Add; separate Agent accounts group; Notifications destination; Workspace settings; Account/Security; sign out. Independent loading/empty/error and refresh preserving detail/form/focus. No global sharing banner or third dock destination. | **P/D/E**, original Settings anchors with agreed hierarchy amendments. |
 | S02 Hub identity | Current Hub identity/host and authenticated user as available; connected/reconnecting/unavailable; version only where authorized. Do not manufacture editable identity fields or diagnostic facts absent from the interface. | **D/E**, identity card in `15-return-in-settings.png`; full detail needs review. |
 | S03 Credentials list | Empty/mixed SSH, OpenPGP and HTTPS/provider token catalog; name/type/capability/public identifier summary, locked/unlocked/unprotected/disabled/missing-tool/unavailable where applicable; assignment/readiness distinction. Add Credential chooser. Shared-UID advisory and existing dismissal semantics. | **P/D/E**, SSH summary in `15-return-in-settings.png`; complete catalog extends it. |
 | S04 SSH detail/tasks | Readiness groups, fingerprint/public key and applicable public-copy/download; auth/signing capabilities and assignments; generate with purposes/passphrase; import file or secondary paste, mutually exclusive and existing size limit; unlock/lock, enable/disable, test, delete, pending/error/cancel/result. | **D/E**, visible SSH detail in `31-defaults-draft.png`; full actions unpictured. Mask and clear submitted secrets/import sources according to existing rules; never redisplay private material. |
@@ -57,6 +68,9 @@ the existing workspace interiors, not a freshly designed facsimile.
 | S10 Navigation preferences | Preview-side Cancel/Done; handle side/vertical placement/reset; automatic seven-second versus Keep Open; shared Hub/device scope explanation. Storage denial fallback; other-tab update; large text and keyboard. No prototype-display controls in product. | **P/D/E**, `22-preview-side-setting.png`, `33-keep-navigation-open.png`; full preference bodies extend pictured sheet. |
 | S11 Devices | Device label, issued time, current-session marker; empty/loading/error; revoke another/current session with pending/error and sign-out consequence. Never label issued time “last active” without that fact. | **D/E**, Devices row in `15-return-in-settings.png`; simulated outcomes only. |
 | S12 Session Security/sign out | Explain existing session/security behavior and shared-UID limitation; reachable sign out; expired/revoked session and failed sign-out presentation. Do not invent password rotation, biometric locking, credential isolation or new security controls. | **D/E**, partially visible Session Security row in `15-return-in-settings.png`; full page/confirmation requires review. |
+| S13 Agent accounts | Focused agent/provider/attempt pages, separate from repository credentials; summary/version/unavailable, provider search, key/device/code/redirect and conditional fields, env/command-only explanation, cancel/expired/failed/retry, activate/logout, Chat deep link and machine-wide/all-users warning. | **E**, upstream capability preserved in refined grammar; fake-service results never certify personal provider login. |
+| S14 Notifications | Focused Settings page; enable/disable this device, selected/all workspaces, questions/permission/completion choices, explicit permission intent, unsupported/Home Screen/denied/error, login lifetime and presence behavior. | **E**, preserve existing PWA service; no third Hub dock item, desktop unchanged. |
+| H06 Worktree tasks | Secondary branch/worktree creation; inventory/refs/fetch/base choice, create/open/start/register/forget/preflight-delete/delete, inherited credentials and restart-required, independent main/child lifecycle, dirty/untracked/ignored/local data confirmations, missing/replaced/external/owned refusal and partial recovery. | **E**, reuse upstream published API and safeguards; retain operation ids and HTTP-200 refusal distinction. |
 | A01 Add Workspace entry | Reachable plus-led card, not third permanent tab. Choose existing folder, create workspace or clone; return/cancel keeps Hub context. | **P/D/E**, card in `01-hub.png`; chooser extends sheet grammar. |
 | A02 Folder browse | Default parent/loading, breadcrumbs/up/browse elsewhere, folders/empty/permission-unavailable/retry, selected path, registered/nested registrations, folder secondary actions. Existing folder registration has distinct display name, auth/host/signing, Add stopped or explicit Add and start. | **E**, `src/hub/pages.ts:471–576` is capability evidence; reference Hub rows/sheets provide presentation grammar. |
 | A03 Create/folder management | Create empty folder distinct from create workspace with explicit Git-init description/consent; folder/display names, assignments; path/name errors/collision; rename folder/empty-folder removal and affected nested-registration warnings; cancellation, pending and partial failure. | **E**, same source capability range. No real filesystem or Git operations in review. |
@@ -83,6 +97,11 @@ the existing workspace interiors, not a freshly designed facsimile.
 | R09 Responsive/accessibility extensions | Portrait 320/390, short landscape 844×390, tablet touch, 200% text, virtual keyboard, light/dark, reduced motion/transparency and forced colors. Inspect wrapping Return, scrollable sheet actions, visible focus, safe areas and 44px targets. Browser emulation is not physical-device or VoiceOver validation. |
 | R10 Non-redesign and isolation | Compare desktop Hub/workspace/native-inset behavior and current workspace interiors with pre-change evidence, not old prototype data. While Hub is active, hidden workspace shortcuts cannot consume Hub input; while workspace is active, Hub CSS/selectors/listeners cannot alter it. Workspace requests retain their explicit base path across Hub URL changes. |
 | R11 Review-environment separation | Review chrome clearly says simulated backend/no real operations and identifies the selected fixture scenario. Switch pending/error cases there, not in product Settings. Audit request/transport logs for blocked unmocked requests; fixture modules must not enter shipping bundles. Capture product viewport without review controls while preserving simulation provenance in adjacent review metadata. |
+| L01 Live auth/API/routes | Real isolated Hub: anonymous 401/HTML login, same-origin cookie vs cross-origin CSRF rejection, bearer compatibility, device revoke/sign-out and stale-response fencing. Direct/reload Hub/detail/clone/workspace URLs; fixed `/s/A/` requests behind Settings, no duplicate broker/WS boot. No operator auth changes. |
+| L02 Live operation parity | Real Hub with disposable repositories/credentials and deterministic provider fixtures: S03–S08/S13/S14 and H04/H06/A01–A07. Verify actual mutation/refusal/state outcomes, partial stop/recovery and full safety copy, not only control visibility. Report external-provider and push-delivery limits separately. |
+| L03 Clone uncertainty | Accepted duplicate attempt, conflicting reuse, response loss, owner isolation, fenced nonacceptance, pending/expired/restart; no blind retry. Replay/input/cancel races, masked prompts, retained files/registration/start failures and legacy API callers. |
+| L04 Live retention and desktop | Repeat R02–R05/R10 via real Hub routing with test provider/PTY where needed; exact File/client/scroll, background work, hidden input, invalidation and canonical URLs. Compare fine-pointer desktop/native inset/standalone unchanged; no physical-device claim from emulation. |
+| L05 Release evidence | Reconcile target screenshots and open visual/device/full-matrix tasks. Broader Chat touch 11 failures and archive-digest mismatch remain unwaived; integration authorization is not release certification. |
 
 ## Review chrome and handoff boundary
 
@@ -99,6 +118,7 @@ High-risk destructive/credential confirmations, auth-loss handling, multi-worksp
 residency, stopped-history behavior and unpictured workflow compositions require
 explicit review rather than invented policy. Missing scenarios remain named gaps.
 
-**Stop for the user's visual and interaction approval.** Automated tests,
-screenshot comparisons and historical 82-checkpoint reports do not sign off this
-frontend and do not authorize live backend, Git or credential integration.
+**Current boundary:** planning ends here; the lead starts the explicitly authorized
+integration task set. Automated tests and historical reports do not sign off
+final visual/device acceptance. Keep the synthetic reviewer separate, preserve
+both running services and report actual live evidence before any scoped rollout.

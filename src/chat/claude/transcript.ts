@@ -3,6 +3,7 @@ import { promises as fs, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { measureChatWork } from "../performance";
+import { nextCronFire } from "./cron";
 
 /**
  * Read-only access to Claude Code's native session storage:
@@ -52,9 +53,11 @@ function hashSuffix(input: string): string {
 }
 
 export type TranscriptEntry = {
-  // `system` is admitted for one subtype only: the compaction boundary,
+  // `system` is admitted for two subtypes only: the compaction boundary,
   // which the timeline marks (spec: the timeline marks where compaction
-  // happened) and the readout resets on, live and on reload alike.
+  // happened) and the readout resets on, live and on reload alike; and a
+  // local command's output (`local_command`), which is the store's only
+  // record of what a typed command such as a review printed (design D15).
   kind: "user" | "assistant" | "system";
   uuid: string;
   parentUuid: string | null;
@@ -71,10 +74,30 @@ export type TranscriptEntry = {
   // own figures (camelCase on disk, unlike the live message's snake_case).
   subtype?: string;
   compactMetadata?: { trigger?: string; preTokens?: number; postTokens?: number };
+  // A local command record's own text, as stored: the command's output in
+  // `<local-command-stdout>` markup. The normalizer reads the output out of
+  // it; nothing else of the record is kept.
+  content?: string;
   // The store's own record of a tool's outcome, when present. A Task
   // completion carries the subagent linkage here: agentId, resolvedModel,
   // usage.
   toolUseResult?: Record<string, unknown>;
+  // Who authored a user record, as the store names it (`origin.kind`):
+  // "human" for typed prompts, "task-notification" for the message the
+  // CLI sends the model when background work settles. Absent from older
+  // records and from every non-user record.
+  origin?: string;
+  // The store's flag for a user record the CLI injected on the person's
+  // behalf — a skill's preamble, a local-command caveat, an image caption.
+  // Not the person's words, so never a prompt or a bubble.
+  isMeta?: boolean;
+  // What started the turn this record opens, as newer CLIs store it:
+  // "sdk" for a prompt an SDK host sent, "scheduled" for a fired wakeup
+  // (spike, claude-scheduled-wakeups D8). Absent from older records.
+  turnOrigin?: string;
+  // An assistant record the CLI wrote for a failed API call names the
+  // failure here (`authentication_failed`, `rate_limit`, …).
+  error?: string;
 };
 
 export type TranscriptReadResult = {
@@ -112,12 +135,14 @@ function validateEntry(value: unknown): TranscriptEntry | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const record = value as Record<string, unknown>;
   const compaction = record.type === "system" && record.subtype === "compact_boundary";
-  if (record.type !== "user" && record.type !== "assistant" && !compaction) return null;
+  const localCommand = record.type === "system" && record.subtype === "local_command" && typeof record.content === "string";
+  if (record.type !== "user" && record.type !== "assistant" && !compaction && !localCommand) return null;
   if (typeof record.uuid !== "string" || !record.uuid) return null;
-  const message = compaction ? (record.message ?? {}) : record.message;
+  const message = compaction || localCommand ? (record.message ?? {}) : record.message;
   if (!message || typeof message !== "object" || Array.isArray(message)) return null;
   const timestamp = typeof record.timestamp === "string" ? Date.parse(record.timestamp) : NaN;
   if (Number.isNaN(timestamp)) return null;
+  const origin = originKind(record.origin);
   const metadata = compaction && record.compactMetadata && typeof record.compactMetadata === "object" && !Array.isArray(record.compactMetadata)
     ? record.compactMetadata as Record<string, unknown> : undefined;
   return {
@@ -130,6 +155,7 @@ function validateEntry(value: unknown): TranscriptEntry | null {
         ...(typeof metadata?.postTokens === "number" ? { postTokens: metadata.postTokens } : {}),
       },
     } : {}),
+    ...(localCommand ? { subtype: "local_command", content: record.content as string } : {}),
     uuid: record.uuid,
     parentUuid: typeof record.parentUuid === "string" ? record.parentUuid : null,
     timestamp,
@@ -141,7 +167,141 @@ function validateEntry(value: unknown): TranscriptEntry | null {
     ...(record.toolUseResult && typeof record.toolUseResult === "object" && !Array.isArray(record.toolUseResult)
       ? { toolUseResult: record.toolUseResult as Record<string, unknown> }
       : {}),
+    ...(origin ? { origin } : {}),
+    ...(record.isMeta === true ? { isMeta: true } : {}),
+    ...(typeof record.turnOrigin === "string" && record.turnOrigin ? { turnOrigin: record.turnOrigin } : {}),
+    ...(typeof record.error === "string" && record.error ? { error: record.error } : {}),
   };
+}
+
+function originKind(value: unknown): string | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const kind = (value as { kind?: unknown }).kind;
+  return typeof kind === "string" && kind ? kind : undefined;
+}
+
+/**
+ * Whether a stored user record is the settled-task notification the CLI
+ * sent the model, rather than something the person typed.
+ *
+ * The one rule, so the replayed timeline and the session's title cannot
+ * disagree about the same record. Authorship decides where the store
+ * states it; the envelope's shape stands in only where it does not, for
+ * records written before `origin` existed. A record the store attributes
+ * to the person stays the person's, whatever its text looks like.
+ */
+export function readsAsTaskNotification(origin: string | undefined, text: string): boolean {
+  if (origin === TASK_NOTIFICATION_ORIGIN) return true;
+  return origin === undefined && parseTaskNotification(text) !== null;
+}
+
+export const TASK_NOTIFICATION_ORIGIN = "task-notification";
+
+/** The `turnOrigin` newer CLIs store on a fired wakeup's prompt. */
+export const WAKEUP_TURN_ORIGIN = "scheduled";
+
+/**
+ * The prompt a scheduling tool call asked to be woken with — `ScheduleWakeup`
+ * and `CronCreate` both carry it as `prompt` — or undefined for any other
+ * call. What an older transcript's fired prompts are recognized by.
+ */
+export function scheduledWakeupPrompt(toolName: string, input: unknown): string | undefined {
+  if (toolName !== "ScheduleWakeup" && toolName !== "CronCreate") return undefined;
+  if (!input || typeof input !== "object" || Array.isArray(input)) return undefined;
+  const prompt = (input as Record<string, unknown>).prompt;
+  return typeof prompt === "string" && prompt ? prompt : undefined;
+}
+
+/**
+ * Whether a stored user record is the prompt a fired wakeup submitted,
+ * rather than something the person typed or another injected record.
+ *
+ * The store says so where it can: `turnOrigin: "scheduled"` (2.1.281 on).
+ * A record that names another turn origin is not one. Where the store
+ * names none (older CLIs), the fired prompt is an `isMeta` record whose
+ * text is exactly the prompt of a scheduling call made earlier in the same
+ * transcript — the only trace of its origin the record's file keeps.
+ */
+export function readsAsWakeupPrompt(entry: { turnOrigin?: string; isMeta?: boolean }, text: string, scheduledPrompts: ReadonlySet<string>): boolean {
+  if (entry.turnOrigin === WAKEUP_TURN_ORIGIN) return true;
+  if (entry.turnOrigin !== undefined) return false;
+  return entry.isMeta === true && text !== "" && scheduledPrompts.has(text);
+}
+
+/** A cron the transcript says the CLI will rebuild when the session resumes. */
+export type TranscriptCron = { id: string; prompt: string; cron: string; recurring: boolean; createdAt: number };
+
+/** The CLI auto-expires a cron this long after it was created. */
+export const CRON_EXPIRY_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * The `CronCreate` crons a session's transcript still holds (D11): every
+ * `CronCreate` result, minus crons a `CronDelete` removed, one-shots that
+ * already fired, one-shots whose time passed without a process (the CLI
+ * drops those, spike D9), and crons past the CLI's 7-day expiry. `created`
+ * is every `CronCreate` id, alive or not, which is what classifies a
+ * wakeup as a cron. `ScheduleWakeup` never appears: it does not survive
+ * its process.
+ */
+export function transcriptCrons(entries: readonly TranscriptEntry[], now: number): { alive: TranscriptCron[]; created: Set<string> } {
+  const calls = new Map<string, { name: string; input: Record<string, unknown> }>();
+  const crons = new Map<string, TranscriptCron>();
+  const deleted = new Set<string>();
+  const firedPrompts: Array<{ text: string; at: number }> = [];
+  for (const entry of entries) {
+    if (entry.isSidechain) continue;
+    const content = entry.message.content;
+    if (entry.kind === "user" && !Array.isArray(content) && typeof content === "string") {
+      if (readsAsWakeupPrompt(entry, content, new Set(crons.size ? [...crons.values()].map(cron => cron.prompt) : []))) firedPrompts.push({ text: content, at: entry.timestamp });
+      continue;
+    }
+    if (!Array.isArray(content)) continue;
+    for (const value of content) {
+      if (!value || typeof value !== "object") continue;
+      const block = value as Record<string, unknown>;
+      if (entry.kind === "assistant" && block.type === "tool_use" && typeof block.id === "string" && typeof block.name === "string") {
+        const input = block.input && typeof block.input === "object" && !Array.isArray(block.input) ? block.input as Record<string, unknown> : {};
+        calls.set(block.id, { name: block.name, input });
+        continue;
+      }
+      if (entry.kind !== "user" || block.type !== "tool_result" || typeof block.tool_use_id !== "string" || block.is_error === true) continue;
+      const call = calls.get(block.tool_use_id);
+      if (call?.name === "CronCreate") {
+        const id = entry.toolUseResult?.id;
+        const prompt = call.input.prompt;
+        const cron = call.input.cron;
+        if (typeof id !== "string" || !id || typeof prompt !== "string" || typeof cron !== "string") continue;
+        crons.set(id, { id, prompt, cron, recurring: call.input.recurring !== false, createdAt: entry.timestamp });
+      } else if (call?.name === "CronDelete" && typeof call.input.id === "string") {
+        deleted.add(call.input.id);
+      }
+    }
+  }
+  // Each recorded fire used up one one-shot, not every one-shot sharing its
+  // prompt: the one it was, among those created before it and not yet
+  // spent, is the one whose time had come — the earliest due by then, or,
+  // if none was due yet (a fire a little early), the earliest due at all.
+  const fired = new Set<string>();
+  const oneShots = [...crons.values()]
+    .filter(cron => !cron.recurring && !deleted.has(cron.id))
+    .map(cron => ({ cron, fireAt: nextCronFire(cron.cron, cron.createdAt) ?? Infinity }));
+  for (const record of firedPrompts) {
+    const candidates = oneShots
+      .filter(({ cron }) => !fired.has(cron.id) && cron.prompt === record.text && cron.createdAt <= record.at)
+      .sort((left, right) => left.fireAt - right.fireAt || left.cron.createdAt - right.cron.createdAt);
+    const spent = candidates.find(({ fireAt }) => fireAt <= record.at) ?? candidates[0];
+    if (spent) fired.add(spent.cron.id);
+  }
+  const alive = [...crons.values()].filter(cron => {
+    if (deleted.has(cron.id)) return false;
+    if (now - cron.createdAt >= CRON_EXPIRY_MS) return false;
+    if (cron.recurring) return true;
+    if (fired.has(cron.id)) return false;
+    // Still ahead, or unreadable (kept: the next session's Stop is the truth).
+    const fireAt = nextCronFire(cron.cron, cron.createdAt);
+    return fireAt === undefined || fireAt > now;
+  });
+  return { alive, created: new Set(crons.keys()) };
 }
 
 /**
@@ -390,10 +550,18 @@ export async function listTranscriptSessions(workspacePath: string, configDir: s
   return { sessions, skippedFiles };
 }
 
-/** The user-typed text of an entry, or null for tool results and non-text. */
+/**
+ * The user-typed text of an entry, or null for tool results, non-text, and
+ * records the CLI authored on the person's behalf (a skill preamble, a
+ * background task's notification): those are neither a session's first
+ * prompt nor its title.
+ */
 export function promptText(entry: TranscriptEntry): string | null {
+  if (entry.isMeta === true) return null;
   const content = entry.message.content;
-  if (typeof content === "string") return foldCommandMarkup(content);
+  if (typeof content === "string") {
+    return readsAsTaskNotification(entry.origin, content) ? null : foldCommandMarkup(content);
+  }
   if (!Array.isArray(content)) return null;
   const blocks = content.filter((block): block is { type: string; text?: unknown } =>
     Boolean(block) && typeof block === "object");
@@ -402,7 +570,8 @@ export function promptText(entry: TranscriptEntry): string | null {
     .filter(block => block.type === "text" && typeof block.text === "string")
     .map(block => block.text as string)
     .join("\n");
-  return text.length > 0 ? foldCommandMarkup(text) : null;
+  if (text.length === 0) return null;
+  return readsAsTaskNotification(entry.origin, text) ? null : foldCommandMarkup(text);
 }
 
 /**
@@ -438,6 +607,47 @@ export function foldCommandMarkup(text: string): string {
   if (outside.trim()) return text;
   const argText = args?.value.trim() ?? "";
   return argText ? `${command} ${argText}` : command;
+}
+
+/**
+ * What Claude Code tells the model when a background task settles. The
+ * SDK stream carries this as a `task_notification` system message, but the
+ * transcript stores only the prompt it became: a user record whose text is
+ * a `<task-notification>` envelope of `<task-id>`, `<tool-use-id>`,
+ * `<status>`, `<summary>` (and, for a monitor, an `<event>` body plus free
+ * text). Nothing else about the task survives in the store, so a reopened
+ * conversation reads the task's outcome from here.
+ */
+export type StoredTaskNotification = {
+  taskId: string;
+  toolUseId?: string;
+  status?: string;
+  summary?: string;
+};
+
+/**
+ * The notification's fields, or null when the text is not one. Only the
+ * generated envelope parses: the text, ignoring surrounding whitespace, is
+ * exactly one `<task-notification>…</task-notification>` naming a task id.
+ * A prompt that merely quotes the tag inline is the person's own words and
+ * comes back null.
+ */
+export function parseTaskNotification(text: string): StoredTaskNotification | null {
+  const body = text.trim();
+  const envelope = outerSpan(body, "task-notification");
+  if (!envelope || envelope.start !== 0 || envelope.end !== body.length) return null;
+  const inner = envelope.value;
+  const taskId = innerSpan(inner, "task-id")?.value.trim();
+  if (!taskId) return null;
+  const toolUseId = innerSpan(inner, "tool-use-id")?.value.trim();
+  const status = innerSpan(inner, "status")?.value.trim();
+  const summary = innerSpan(inner, "summary")?.value.trim();
+  return {
+    taskId,
+    ...(toolUseId ? { toolUseId } : {}),
+    ...(status ? { status } : {}),
+    ...(summary ? { summary } : {}),
+  };
 }
 
 type TagSpan = { start: number; end: number; value: string };

@@ -23,3 +23,8 @@ Opening a different workspace, a genuine document reload, and existing desktop o
 - **WHEN** the retained workspace is stopped or removed, or its authentication session becomes invalid
 - **THEN** the frontend invalidates its retained access and presents the appropriate recovery state
 - **AND** history or stale responses cannot silently start a session or restore unauthorized content
+
+#### Scenario: Agent login and Notifications stay within Settings
+- **WHEN** a phone user opens a focused Agent accounts or Notifications page from a retained workspace
+- **THEN** it uses the same Hub/Settings navigation context without adding a permanent dock destination or replacing that workspace
+- **AND** returning preserves its client state, while actual sign-out or revocation still overrides retention

@@ -15,7 +15,7 @@ import hackLicenseAsset from "./assets/fonts/LICENSE-hack.md" with { type: "file
 import nerdFontsLicenseAsset from "./assets/fonts/LICENSE-nerdfonts.txt" with { type: "file" };
 import fontNoticesAsset from "./assets/fonts/NOTICES.md" with { type: "file" };
 import index from "./index.html";
-import { parseCommand, usageText, versionText, type WatchOptions } from "./cli/parse";
+import { parseCommand, serveRemovedText, usageText, versionText, type WatchOptions } from "./cli/parse";
 import { LazyChatService } from "./chat/service";
 import { MultiAgentChatService } from "./chat/agents";
 import { ClaudeProvider } from "./chat/claude/provider";
@@ -28,8 +28,6 @@ import {
   formatSessionUrl,
   printIndexingStatus,
   printStartupBanner,
-  SERVE_DEPRECATION_WARNING,
-  shouldWarnServeDeprecation,
   startSupervisedStartupHeartbeat,
 } from "./cli/output";
 import { createNavigationFetchHandler, INTERNAL_SHELL_PATH, openBrowser, spaShellResponse } from "./server/navigation";
@@ -103,6 +101,11 @@ async function main() {
     process.exit(1);
   }
 
+  if (parsed.kind === "serve-removed") {
+    process.stderr.write(serveRemovedText());
+    process.exit(1);
+  }
+
   if (parsed.kind === "help") {
     console.log(usageText());
     return;
@@ -129,13 +132,9 @@ async function main() {
   }
 }
 
+// The session child. parseCommand only routes here for the hub's spawn
+// (--exit-on-stdin-close) or a source run; users get serveRemovedText().
 async function runWatch(options: WatchOptions) {
-  // stderr only, so piped-stdout consumers capturing the URL line are
-  // unaffected; behavior is otherwise identical to before.
-  if (shouldWarnServeDeprecation(options)) {
-    console.error(`uatu: ${SERVE_DEPRECATION_WARNING}`);
-  }
-
   // Diagnostic plumbing comes before any heavy startup work — the cache dir
   // and the metrics registry are needed by createWatchSession and by the
   // watchdog spawn. Failures in this layer must never fail the watch session.
@@ -229,7 +228,8 @@ async function runWatch(options: WatchOptions) {
       terminalEnabled,
       metrics,
     });
-    await watchSession.start();
+    // HTTP readiness is independent of the file inventory and Git work.
+    void watchSession.start().catch(error => console.error("uatu: indexing failed:", error));
 
     if (terminalEnabled) {
       terminalServer = createTerminalServer({
@@ -240,6 +240,8 @@ async function runWatch(options: WatchOptions) {
 
     const navigationFetch = createNavigationFetchHandler({
       getUnscopedRoots: () => watchSession!.getUnscopedRoots(),
+      ensureDocument: id => watchSession!.ensureDocument(id),
+      isIndexComplete: () => watchSession!.getDiscoveryState().status === "ready",
       getEntries: () => rootEntries,
       getRespectGitignore: () => options.respectGitignore,
       getServer: () => server!,
@@ -351,6 +353,92 @@ async function runWatch(options: WatchOptions) {
   // TypeScript narrowing: both are set if the try block above completed.
   if (!server || !watchSession) {
     throw new Error("failed to start watch session");
+  }
+
+  // The shutdown handlers are installed BEFORE the URL is printed. The URL
+  // line is the supervisor's ready signal (the hub's backend reads it), and a
+  // SIGTERM that follows it must take the clean path — dispose the detached
+  // OpenCode child and exit 0 — not Bun's default action, which kills the
+  // process (exit 143) and orphans that child. Everything shutdown touches
+  // exists by now.
+  let shuttingDown = false;
+  const hardExit = (code: number) => {
+    try {
+      process.exit(code);
+    } catch {
+      // process.exit throwing should be impossible, but if it does, fall through to SIGKILL.
+    }
+    // Belt-and-braces: if process.exit hasn't taken hold within 50ms
+    // (has happened with Bun + macOS fsevents holding native handles), self-SIGKILL.
+    setTimeout(() => {
+      try {
+        process.kill(process.pid, "SIGKILL");
+      } catch {
+        // If even that fails, there's nothing more we can do.
+      }
+    }, 50);
+  };
+
+  const shutdown = async () => {
+    if (shuttingDown) {
+      console.error("uatu: received second interrupt — force exiting");
+      hardExit(1);
+      return;
+    }
+    shuttingDown = true;
+    console.error("uatu: shutting down");
+
+    // The OpenCode child is detached as its own process group, so dispose it
+    // before the hard exit rather than relying on OS cleanup of this process.
+    await chatService!.dispose().catch(() => undefined);
+
+    // Best-effort cleanup. We do NOT await these — if either hangs
+    // (chokidar/fsevents sometimes never resolves close()), waiting would
+    // block the shutdown indefinitely. The OS reclaims everything once we exit.
+    void Promise.resolve()
+      .then(() => watchSession!.stop())
+      .catch(() => undefined);
+    void Promise.resolve()
+      .then(() => server!.stop(true))
+      .catch(() => undefined);
+    if (terminalServer) {
+      try {
+        terminalServer.disposeAll();
+      } catch {
+        // Ignore — we are already exiting.
+      }
+    }
+
+    hardExit(0);
+  };
+
+  // These handlers cover the *healthy* shutdown path. When the JS event
+  // loop is wedged none of them can run — recovery from a wedge is the
+  // watchdog subprocess's job (see watchdog.ts).
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
+  process.on("SIGHUP", shutdown);
+
+  // --exit-on-stdin-close: a supervising wrapper (e.g. the desktop app) holds
+  // our stdin pipe for its whole lifetime. EOF means the supervisor is gone —
+  // including by crash, where no signal is ever sent — so shut down instead of
+  // running orphaned. Without the flag stdin's lifetime is deliberately
+  // ignored (a source run piped through `tee` must not couple).
+  if (options.exitOnStdinClose && !process.stdin.isTTY) {
+    process.stdin.resume();
+    // Bun emits BOTH `end` and `close` for a single EOF. Wired directly to
+    // shutdown, the second event hit the second-interrupt guard and force-
+    // exited while the first call was still disposing the detached OpenCode
+    // child — orphaning it on every supervisor shutdown. One EOF is one
+    // shutdown request, however many events report it.
+    let stdinGone = false;
+    const onStdinGone = () => {
+      if (stdinGone) return;
+      stdinGone = true;
+      void shutdown();
+    };
+    process.stdin.on("end", onStdinGone);
+    process.stdin.on("close", onStdinGone);
   }
 
   // The child credential gates terminal and chat controls. The browser strips
@@ -471,86 +559,6 @@ async function runWatch(options: WatchOptions) {
     } catch (error) {
       console.error(`uatu: failed to spawn watchdog (continuing without): ${error instanceof Error ? error.message : String(error)}`);
     }
-  }
-
-  let shuttingDown = false;
-  const hardExit = (code: number) => {
-    try {
-      process.exit(code);
-    } catch {
-      // process.exit throwing should be impossible, but if it does, fall through to SIGKILL.
-    }
-    // Belt-and-braces: if process.exit hasn't taken hold within 50ms
-    // (has happened with Bun + macOS fsevents holding native handles), self-SIGKILL.
-    setTimeout(() => {
-      try {
-        process.kill(process.pid, "SIGKILL");
-      } catch {
-        // If even that fails, there's nothing more we can do.
-      }
-    }, 50);
-  };
-
-  const shutdown = async () => {
-    if (shuttingDown) {
-      console.error("uatu: received second interrupt — force exiting");
-      hardExit(1);
-      return;
-    }
-    shuttingDown = true;
-    console.error("uatu: shutting down");
-
-    // The OpenCode child is detached as its own process group, so dispose it
-    // before the hard exit rather than relying on OS cleanup of this process.
-    await chatService!.dispose().catch(() => undefined);
-
-    // Best-effort cleanup. We do NOT await these — if either hangs
-    // (chokidar/fsevents sometimes never resolves close()), waiting would
-    // block the shutdown indefinitely. The OS reclaims everything once we exit.
-    void Promise.resolve()
-      .then(() => watchSession!.stop())
-      .catch(() => undefined);
-    void Promise.resolve()
-      .then(() => server!.stop(true))
-      .catch(() => undefined);
-    if (terminalServer) {
-      try {
-        terminalServer.disposeAll();
-      } catch {
-        // Ignore — we are already exiting.
-      }
-    }
-
-    hardExit(0);
-  };
-
-  // These handlers cover the *healthy* shutdown path. When the JS event
-  // loop is wedged none of them can run — recovery from a wedge is the
-  // watchdog subprocess's job (see watchdog.ts).
-  process.on("SIGINT", shutdown);
-  process.on("SIGTERM", shutdown);
-  process.on("SIGHUP", shutdown);
-
-  // --exit-on-stdin-close: a supervising wrapper (e.g. the desktop app) holds
-  // our stdin pipe for its whole lifetime. EOF means the supervisor is gone —
-  // including by crash, where no signal is ever sent — so shut down instead of
-  // running orphaned. Without the flag stdin's lifetime is deliberately
-  // ignored (piped invocations like `uatu serve | tee` must not couple).
-  if (options.exitOnStdinClose && !process.stdin.isTTY) {
-    process.stdin.resume();
-    // Bun emits BOTH `end` and `close` for a single EOF. Wired directly to
-    // shutdown, the second event hit the second-interrupt guard and force-
-    // exited while the first call was still disposing the detached OpenCode
-    // child — orphaning it on every supervisor shutdown. One EOF is one
-    // shutdown request, however many events report it.
-    let stdinGone = false;
-    const onStdinGone = () => {
-      if (stdinGone) return;
-      stdinGone = true;
-      void shutdown();
-    };
-    process.stdin.on("end", onStdinGone);
-    process.stdin.on("close", onStdinGone);
   }
 
   // Some terminals don't reliably deliver SIGINT to Bun-compiled binaries when

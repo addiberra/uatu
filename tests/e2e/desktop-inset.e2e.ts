@@ -3,13 +3,13 @@
 // clears the covered strip while scrolled content flows beneath it; without
 // the marker, layout is byte-identical to the plain browser. The Swift side
 // (script injection, contentLayoutRect tracking) is verified manually in
-// the app. Spec: openspec/changes/add-desktop-glass-titlebar/specs/.
+// the app. Spec: openspec/specs/desktop-titlebar-inset/spec.md.
 
 import { expect, test } from "./fixtures";
 import type { Page } from "@playwright/test";
 
 import { openChatPanel } from "./chat-helpers";
-import { treeRow } from "./tree-helpers";
+import { openTreeFile, treeRow } from "./tree-helpers";
 import { standardBeforeEach } from "./fixtures";
 
 const INSET = 52;
@@ -52,7 +52,7 @@ test("with the marker, chrome clears the covered strip and content scrolls benea
     data: { dirty: { "long-doc.md": `# Long Doc\n\n${filler}\n` } },
   });
   await page.reload();
-  await treeRow(page, "long-doc.md").click();
+  await openTreeFile(page, "long-doc.md");
   await expect(page.locator("#preview-title")).toHaveText("Long Doc");
 
   const baseline = await chromeTops(page);

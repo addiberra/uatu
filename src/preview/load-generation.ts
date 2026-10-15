@@ -2,12 +2,14 @@ import type { ViewLayout, ViewMode } from "../shared/types";
 
 export type DocumentLoadToken = {
   generation: number;
+  selectionGeneration: number;
   documentId: string;
   view: ViewMode;
   layout: ViewLayout;
+  revision: string;
 };
 
-export function createDocumentLoadGuard() {
+export function createDocumentLoadGuard(selectionGeneration: () => number = () => 0, revisionOf: (id: string) => string = () => "") {
   let latestGeneration = 0;
   let state: { documentId: string | null; status: "idle" | "pending-selection" | "ready" | "load-error" | "timeout" | "missing-target" } = { documentId: null, status: "idle" };
   const listeners = new Set<() => void>();
@@ -25,7 +27,7 @@ export function createDocumentLoadGuard() {
       notify();
     },
     begin(documentId: string, view: ViewMode, layout: ViewLayout): DocumentLoadToken {
-      const token = { generation: ++latestGeneration, documentId, view, layout };
+      const token = { generation: ++latestGeneration, selectionGeneration: selectionGeneration(), documentId, view, layout, revision: revisionOf(documentId) };
       state = { documentId, status: "pending-selection" };
       notify();
       return token;
@@ -37,7 +39,9 @@ export function createDocumentLoadGuard() {
       layout: ViewLayout,
     ): boolean {
       return token.generation === latestGeneration
+        && token.selectionGeneration === selectionGeneration()
         && token.documentId === selectedId
+        && token.revision === revisionOf(token.documentId)
         && token.view === view
         && token.layout === layout;
     },

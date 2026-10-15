@@ -1,51 +1,87 @@
-// Live event stream — opens the /api/events EventSource and dispatches each
-// `state` payload back into the app. The reducer logic for build-freshness
-// checking, follow-mode auto-switching, and on-disk-change reloads lives in
-// here, intentionally close to its trigger (the SSE message).
+// Live document state — the `document` topic consumer on the page's one
+// brokered live channel (see `shell/live.ts`). Each `state` payload is
+// dispatched back into the app from here. The reducer logic for
+// build-freshness checking, follow-mode auto-switching, and on-disk-change
+// reloads lives in here, intentionally close to its trigger (the envelope).
 
-import { chooseSelectionForFileEvent } from "./follow";
+import { chooseSelectionForFileEvent, finishFollowDiscovery, getFollowSwitches } from "./follow";
+import { imageChangeOutcome } from "./follow-rules";
+import { createDeferredImageFollow } from "./image-follow";
 import { checkBuildFreshness } from "./freshness";
 import { applyProjectIdentity } from "./identity";
-import { findDocumentById, syncStateGeneration } from "./storage";
+import { findDocumentById, findDocumentByRelativePath, syncStateGeneration } from "./storage";
 import { signalActiveDocumentUpdated } from "../preview/file-facts-strip";
-import { documentDiffCache, forgetDocumentCache, loadDocument } from "../preview/mount";
+import { documentDiffCache, forgetDocumentCache, learnEmbeddedImages, loadDocument, refreshPreviewImages } from "../preview/mount";
+import { embeddedImageMembership, type EmbeddedImageMembership } from "../preview/embedded-images";
+import { applyDiffForActiveDocument, diffInputsMoved, dropStaleDiffs, forgetAllDiffs } from "../preview/diff";
 import { renderEmptyPreview } from "../preview/empty";
-import { renderSidebar } from "../sidebar/shell";
+import { renderSidebar, renderSidebarPatch } from "../sidebar/shell";
+import { documentIndex, resetDocumentIndex, documentRevisionKey } from "./document-state";
+import { enrichDocumentFacts, forgetDocumentFacts } from "../preview/facts-enrichment";
+import { syncFileFactsStrip } from "../preview/file-facts-strip";
+import { documentViewCache } from "../preview/mount";
+import { sameDocumentContext, unseenSnapshotChange, type DocumentPatch, type DocumentSnapshot, type DocumentUpdate } from "../shared/document-updates";
 import { markSearchResultsStale, noteSearchCorpusChange, syncSearchScope } from "../sidebar/search-pane";
 import {
   hasDocument,
+  isFollowableFile,
   shouldRefreshPreview,
   type StatePayload,
+  type RootGroup,
 } from "../shared/types";
 import { applyChannelStatus } from "./connection";
-import { createLiveChannel, type LiveChannel } from "./live-channel";
-import { createLifecycleRecovery, createStateReconciler, type LifecycleRecovery } from "./recovery";
+import type { LiveSubscriptionHandle, LiveTopicConsumer } from "./live-channel";
+import { fetchWithinBudget } from "./bounded-fetch";
+import { liveChannel, registerLiveTeardown, registerRecoveryWork } from "./live";
+import { createStateReconciler } from "./recovery";
 import { renderBuildBadge } from "./connection";
-import { appUrl } from "../shared/app-url";
+import { appBasePath, appUrl } from "../shared/app-url";
+import { documentContextKey } from "../shared/live-protocol";
+import { applyWatchContext } from "../shared/watch-context";
 import { replaceSelection } from "./history";
-import { setSelectedId } from "./selection";
+import { setSelectedId, getPendingDocumentPath, getSelectionActivation, getSelectionGeneration } from "./selection";
 import { appState } from "./state";
 import { renderCommitPreview } from "./url";
-import { contextualAppUrl, setClientScope } from "./watch-context";
+import { contextualAppUrl, currentWatchContext, setClientScope } from "./watch-context";
 import { setCorpusStatus } from "./corpus-status";
 
-// Recovery for this stream is owned by `createLiveChannel`, not by the
-// browser. Native `EventSource` retry is unbounded in the one case that
-// matters — a mobile device whose network path vanished leaves the source in
-// `CONNECTING` with no error and no timeout, so the app sits on
-// "Reconnecting" forever and never observes the server again (the
-// client-freshness handshake rides the reconnect's first state payload). The
-// channel closes each failed source and reopens on a capped-backoff schedule
-// of its own, and it treats a generation as connected only once that
-// generation's authoritative state has been applied below.
-let channel: LiveChannel | null = null;
+function syncCorpusStatus(): void {
+  setCorpusStatus(appState.discovery.status === "ready" ? "ready"
+    : appState.discovery.status === "error" ? "index-error" : "loading");
+}
 
-function documentChannel(): LiveChannel {
-  channel ??= createLiveChannel({ open: openDocumentStream, onStatus: status => {
-    applyChannelStatus(status);
-    if (status === "reconnecting") setCorpusStatus("index-error");
-  } });
-  return channel;
+// The page's document subscription. Transport recovery belongs to the
+// channel (`shell/live-channel.ts`): it closes each failed stream and reopens
+// on a capped-backoff schedule of its own, presenting this topic's retained
+// cursor so a reconnect resumes rather than restarts. What this module owns
+// is the indicator's truth: a generation counts as connected only once it
+// has proven the page's state current — the first applied `state` payload,
+// or the topic's `ready` when the page already holds state at the presented
+// cursor and nothing newer exists to deliver.
+let documentSubscription: LiveSubscriptionHandle | null = null;
+let subscriptionKey: string | null = null;
+// Whether the current subscription has delivered state (or found the page's
+// state current). Reset on every new subscription: a fresh one, with no
+// cursor, owes a snapshot before `ready` can mean anything.
+let documentStateHeld = false;
+let installed = false;
+
+// The document topic's key: the current watch context (compare target and
+// scope) as the canonical query the hub appends to the child's route.
+function documentKey(): string {
+  const url = applyWatchContext(new URL("http://uatu.invalid/"), currentWatchContext());
+  return documentContextKey(url.searchParams);
+}
+
+// Replaces the document subscription with one for the current context. No
+// cursor is presented, so the hub delivers a fresh snapshot. Not a recovery:
+// the transport is untouched — a scope widening, a compare-target change, or
+// the server normalizing an invalid pin all land here.
+function subscribeDocument(): void {
+  documentSubscription?.close();
+  documentStateHeld = false;
+  subscriptionKey = documentKey();
+  documentSubscription = liveChannel().subscribe({ topic: "document", key: subscriptionKey }, documentConsumer);
 }
 
 function scopesEqual(left: StatePayload["scope"], right: StatePayload["scope"]): boolean {
@@ -53,15 +89,114 @@ function scopesEqual(left: StatePayload["scope"], right: StatePayload["scope"]):
     && (left.kind === "folder" || (right.kind === "file" && left.documentId === right.documentId));
 }
 
+function renderPendingDocument(): boolean {
+  const path = getPendingDocumentPath();
+  if (!path) return false;
+  const complete = appState.discovery.status === "ready";
+  renderEmptyPreview(complete ? "Document not found" : "Document indexing",
+    complete ? `Document not found at ${path}.` : `Waiting for indexing to resolve ${path}.`);
+  return true;
+}
+
+// What the shown document embeds, read from its rendered payload for the
+// current revision (see preview/embedded-images.ts), so the answer is the
+// same in Rendered, Source, Diff, and split views.
+function shownDocumentImages(documentId: string | null): EmbeddedImageMembership {
+  const document = documentId ? documentIndex.find(documentId) : undefined;
+  return embeddedImageMembership(document, documentId ? documentRevisionKey(documentId) : "", appState.roots, appBasePath());
+}
+
+// Rule C's image decision held while the shown document's images are unknown
+// (see shell/image-follow.ts). Settling it to "follow" switches the selection
+// like any Follow switch: replace the URL, reveal in the tree, load.
+const deferredImageFollow = createDeferredImageFollow({
+  guard: documentId => [
+    getSelectionGeneration(), getSelectionActivation(), getFollowSwitches(),
+    appState.selectedId === documentId, documentRevisionKey(documentId),
+  ].join("\n"),
+  canFollow: () => appState.followEnabled && appState.previewMode.kind !== "commit",
+  lookup: learnEmbeddedImages,
+  membership: shownDocumentImages,
+  follow: imageId => {
+    const image = documentIndex.find(imageId);
+    if (!image || !isFollowableFile(image)) return;
+    setSelectedId(imageId);
+    replaceSelection(imageId, image.relativePath);
+    renderSidebar();
+    void loadDocument(imageId);
+  },
+});
+
+// Rule C's image exception, applied identically on the incremental patch,
+// full frame, and reconcile paths: the change the selection decision may
+// follow. An image the shown document embeds is kept off the selection (it
+// refreshes in place); an image whose membership is unknown is held until the
+// document's rendered payload answers, and the selection stays put meanwhile.
+// Any other change — a document, a non-embedded image — supersedes a held
+// image decision.
+function followableChange(selectedId: string | null, changedId: string | null): string | null {
+  if (!appState.followEnabled || !changedId) return changedId;
+  const outcome = imageChangeOutcome(appState.roots, selectedId, changedId, shownDocumentImages(selectedId));
+  if (outcome === "defer" && selectedId) {
+    deferredImageFollow.defer(selectedId, changedId);
+    return null;
+  }
+  deferredImageFollow.cancel();
+  return outcome === "stay" ? null : changedId;
+}
+
+function hasNewRepositoryState(update: DocumentUpdate): boolean {
+  const previous = documentIndex.view();
+  return update.epoch !== previous?.epoch || update.compareTarget !== previous?.compareTarget
+    || update.repositoryState !== undefined && update.repositoryState.generation !== previous?.repositoryState.generation;
+}
+
 // Owner mutator for the server-snapshot triple (`roots`, `repositories`,
 // `scope`). The SSE reducer below is the ongoing writer; the boot path
-// (`shell/boot.ts`) applies its initial /api/state payload through this too.
-export function applyServerSnapshot(payload: StatePayload): void {
+// (`shell/boot.ts`) applies its initial /api/state payload through
+// `adoptBootSnapshot`, which also records its freshness.
+// .gitattributes documents and their revisions: a change decides how Git
+// diffs files without touching them, so cached diffs are dropped.
+function attributesSignature(roots: readonly RootGroup[] | undefined): string {
+  return (roots ?? []).flatMap(root => root.docs)
+    .filter(doc => /(^|\/)\.gitattributes$/.test(doc.id))
+    .map(doc => `${doc.id}:${doc.revision}`).sort().join("\n");
+}
+// Set when a snapshot changed attributes, so the frame or reconciler path
+// that applied it re-fetches an open diff.
+let attributesRefetch = false;
+function takeAttributesRefetch(): boolean {
+  const value = attributesRefetch;
+  attributesRefetch = false;
+  return value;
+}
+
+function applyServerSnapshot(payload: StatePayload): boolean {
+  let repositoryUpdated = false;
+  if ((payload as DocumentSnapshot).kind === "snapshot") {
+    const snapshot = payload as DocumentSnapshot;
+    repositoryUpdated = hasNewRepositoryState(snapshot);
+    const previous = documentIndex.view();
+    // A snapshot replaces patches missed while disconnected, including a
+    // .gitattributes edit.
+    if (previous && attributesSignature(previous.roots) !== attributesSignature(snapshot.roots)) {
+      forgetAllDiffs();
+      attributesRefetch = true;
+    }
+    if (previous && !sameDocumentContext(previous, snapshot)) resetDocumentIndex();
+    if (documentIndex.apply(snapshot) !== "applied") return false;
+    // A new epoch or compare target invalidates every diff; a repository
+    // update only those whose inputs moved (after repositories are applied).
+    if (snapshot.epoch !== previous?.epoch || snapshot.compareTarget !== previous?.compareTarget) documentDiffCache.clear();
+    appState.discovery = snapshot.discovery;
+    appState.repositoryFreshness = snapshot.repositoryState;
+  }
   // Every payload carries the server's build identity — boot and SSE
   // reconnect both land here, so this is the one freshness chokepoint.
   checkBuildFreshness(payload.build);
   appState.roots = payload.roots;
   appState.repositories = payload.repositories ?? [];
+  if ((payload as DocumentSnapshot).kind === "snapshot" && repositoryUpdated) dropStaleDiffs();
   setClientScope(payload.scope);
   appState.unscopedFingerprint = payload.unscopedFingerprint ?? null;
   // The Search pane names the scope in effect; it has to hear about changes.
@@ -73,146 +208,270 @@ export function applyServerSnapshot(payload: StatePayload): void {
   // Title, favicon tint, and sidebar marker all derive from roots;
   // re-applying on every payload keeps them honest if roots change.
   applyProjectIdentity(payload.roots);
-  setCorpusStatus("ready");
+  syncCorpusStatus();
+  // An image changed on disk gets a new URL wherever the preview shows it —
+  // embedded in the open document or opened as an image itself — even when
+  // the document around it did not change and is not reloaded.
+  refreshPreviewImages(payload.roots);
+  return true;
 }
 
-// `resumed` says this replaces a stream the client believes it lost, which is
-// what makes it a recovery. A scope widening, a compare-target change, or the
-// server normalizing an invalid pin all replace the stream too, and counting
-// those as recoveries would make the diagnostic meaningless.
-export function connectEvents(options: { resumed?: boolean } = {}) {
-  documentChannel().connect(options);
+// Boot's initial /api/state payload. Applied like any snapshot, and recorded
+// with the reconciler as the state every later payload must be newer than.
+// Otherwise the first live frame is accepted whatever its age — and through
+// the hub it can be older: a page joining a document upstream that is
+// already open (another tab, or the one a reload leaves lingering) is handed
+// that upstream's latest snapshot, produced before this fetch was answered,
+// which would put the page back on the older roots.
+export function adoptBootSnapshot(payload: StatePayload): void {
+  stateReconciler.recordApplied(payload.generatedAt);
+  applyServerSnapshot(payload);
 }
 
-// Tears down the live channel for good. Called when the page is being
-// discarded: a retry cycle outliving the page would keep firing timers
-// against a document that is on its way out.
-export function disconnectEvents() {
-  channel?.dispose();
-  channel = null;
-  lifecycle?.dispose();
-  lifecycle = null;
+// Boot's entry point: subscribes the document topic for the current context
+// and opens the page's one live stream. Wake-up recovery is the channel's
+// (`shell/live.ts`); this module registers the state fetch it needs.
+export function connectEvents() {
+  if (!installed) {
+    installed = true;
+    const unsubscribeStatus = liveChannel().onStatus(status => {
+      applyChannelStatus(status);
+      if (status === "reconnecting") setCorpusStatus("index-error");
+      else if (status === "live") syncCorpusStatus();
+    });
+    const unregisterRecovery = registerRecoveryWork(reconcileCorpus);
+    // Repository data arrives on the document topic. The server observes Git
+    // metadata, and for a narrow root its repository's working tree, so the
+    // page never polls for it.
+    registerLiveTeardown(() => {
+      unsubscribeStatus();
+      unregisterRecovery();
+      documentSubscription?.close();
+      documentSubscription = null;
+      subscriptionKey = null;
+      documentStateHeld = false;
+      installed = false;
+    });
+  }
+  subscribeDocument();
+  liveChannel().connect();
 }
 
-function openDocumentStream(generation: number, context: { reconnect: boolean }): EventSource {
-  // A bare marker so the workspace can count recoveries apart from first
-  // connects. Nothing about the connection that was lost travels with it.
-  const url = new URL(contextualAppUrl(appUrl("/api/events")), window.location.href);
-  if (context.reconnect) url.searchParams.set("reconnect", "1");
-  const events = new EventSource(`${url.pathname}${url.search}`);
+const documentConsumer: LiveTopicConsumer = {
+  data: (data, _cursor, generation) => {
+    const update = data as DocumentUpdate;
+    if (update.kind === "patch") void applyDocumentPatch(update, generation);
+    else void applyDocumentFrame(data as StatePayload, generation);
+  },
+  // Nothing newer than the presented cursor exists: the state this page
+  // holds IS current, and the indicator can say so without a payload.
+  ready: generation => {
+    if (documentStateHeld) liveChannel().confirm(generation);
+  },
+  // The cursor is not replayable. A fresh subscription delivers a snapshot,
+  // which confirms the generation on arrival.
+  resync: () => subscribeDocument(),
+  // The workspace child is gone or unreachable; the hub retries and sends
+  // `ready` (and fresh state) on recovery. Until then the page's state is
+  // not proven current.
+  unavailable: generation => liveChannel().invalidate(generation),
+};
 
-  events.addEventListener("state", async event => {
-    // A payload from a superseded attempt describes a connection this client
-    // has already replaced; applying it could overwrite newer state.
-    if (!documentChannel().isCurrent(generation)) return;
-    const payload = JSON.parse((event as MessageEvent<string>).data) as StatePayload;
-    // A frame the server produced before state this client has already applied
-    // — the initial frame of a stream opened just before a reconciliation
-    // fetch answered, typically. Applying it would put back the older roots,
-    // repositories, and scope. The transport is still proven live, so the
-    // channel is confirmed either way.
-    if (!stateReconciler.acceptFrame(payload.generatedAt)) {
-      documentChannel().confirm(generation);
-      return;
+async function applyDocumentPatch(patch: DocumentPatch, generation: number): Promise<void> {
+  if (!liveChannel().isCurrent(generation)) return;
+  const mode = appState.previewMode;
+  const repositoryChanged = hasNewRepositoryState(patch);
+  const selected = appState.selectedId;
+  const previousDocument = selected ? documentIndex.find(selected) : undefined;
+  const result = documentIndex.apply(patch);
+  if (result === "resync") { subscribeDocument(); return; }
+  if (result === "ignored") { liveChannel().confirm(generation); return; }
+  const payload = documentIndex.view()!;
+  appState.roots = payload.roots;
+  appState.repositories = payload.repositories;
+  if (repositoryChanged) dropStaleDiffs();
+  const attributesChanged = [...patch.upserts, ...patch.removals].some(doc => /(^|\/)\.gitattributes$/.test(doc.id));
+  if (attributesChanged) forgetAllDiffs();
+  appState.discovery = payload.discovery;
+  syncCorpusStatus();
+  appState.repositoryFreshness = payload.repositoryState;
+  appState.unscopedFingerprint = payload.unscopedFingerprint ?? null;
+  refreshPreviewImages(payload.roots);
+  documentStateHeld = true;
+  stateReconciler.recordApplied(payload.generatedAt);
+  liveChannel().confirm(generation);
+  syncStateGeneration(payload.generatedAt);
+  for (const doc of patch.upserts) { forgetDocumentCache(doc.id); markSearchResultsStale(doc.id); }
+  for (const doc of patch.removals) { forgetDocumentCache(doc.id); markSearchResultsStale(doc.id); }
+  noteSearchCorpusChange();
+  if (mode.kind === "commit") {
+    renderSidebarPatch(patch);
+    if (patch.repositories) renderCommitPreview(mode);
+    return;
+  }
+
+  const pendingPath = getPendingDocumentPath();
+  let next = (pendingPath ? patch.upserts.find(doc => doc.relativePath === pendingPath)?.id : null) ?? selected;
+  const catchUp = finishFollowDiscovery(payload.defaultDocumentId, patch.changedId);
+  const followed = followableChange(selected, patch.changedId);
+  if (appState.followEnabled && followed) next = followed;
+  else if (catchUp) next = catchUp;
+  else if (payload.discovery.status === "ready" && !appState.selectionCleared && appState.previewMode.kind === "document"
+    && (!selected || appState.followEnabled && !documentIndex.find(selected))) next = payload.defaultDocumentId;
+  setSelectedId(next);
+  if (next && next !== selected) {
+    const doc = documentIndex.find(next);
+    if (doc) replaceSelection(next, doc.relativePath);
+  }
+  renderSidebarPatch(patch);
+  if (patch.repositoryState && appState.selectedId && appState.viewMode !== "diff") {
+    const id = appState.selectedId;
+    const cached = documentViewCache.get(id);
+    const payload = cached?.[appState.viewMode] ?? cached?.source ?? cached?.rendered;
+    const key = documentRevisionKey(id);
+    if (payload && patch.repositoryState.status === "ready") {
+      void enrichDocumentFacts(payload, () => appState.selectedId === id && appState.viewMode !== "diff" && documentRevisionKey(id) === key);
+    } else if (payload?.fileFacts && payload.fileFacts.gitState !== "non-git") {
+      forgetDocumentFacts(id);
+      payload.fileFacts = { ...payload.fileFacts, gitState: patch.repositoryState.status === "error" ? "unavailable" : payload.fileFacts.git ? "stale" : "pending" };
+      syncFileFactsStrip({ kind: "document", facts: payload.fileFacts });
     }
-    const previousSelectedId = appState.selectedId;
-    const previousScope = appState.scope;
-    const shouldReload = shouldRefreshPreview(
-      previousSelectedId,
-      payload.changedId,
-      appState.roots,
-      payload.roots,
-    );
+  }
+  const current = next ? documentIndex.find(next) : undefined;
+  const reload = next !== selected || previousDocument?.revision !== current?.revision
+    || Boolean(previousDocument) !== Boolean(current);
+  if (next && reload) {
+    await loadDocument(next);
+    if (next === selected && appState.selectedId === next && current) signalActiveDocumentUpdated();
+  } else if (next && appState.viewMode === "diff" && (attributesChanged || repositoryChanged && diffInputsMoved(next))) {
+    await applyDiffForActiveDocument(next);
+  } else if (!next && !renderPendingDocument() && reload) renderEmptyPreview("No document selected", "Waiting for viewable files");
+}
 
-    applyServerSnapshot(payload);
-    // Transport is only proven once this generation's authoritative state has
-    // been applied — an open socket that never delivers state is exactly the
-    // half-dead connection the indicator must not call `Connected`.
-    documentChannel().confirm(generation);
-    if (!scopesEqual(previousScope, payload.scope)) {
-      // EventSource automatically reconnects its original URL. Replace it
-      // after server-side normalization so a later reconnect cannot revive a
-      // deleted file pin that this client has already widened away from. Not a
-      // recovery: the transport never failed, the server changed the context.
-      connectEvents();
-    }
-    syncStateGeneration(payload.generatedAt);
+async function applyDocumentFrame(payload: StatePayload, generation: number): Promise<void> {
+  // A payload from a superseded attempt describes a connection this client
+  // has already replaced; applying it could overwrite newer state.
+  if (!liveChannel().isCurrent(generation)) return;
+  documentStateHeld = true;
+  // A frame the server produced before state this client has already applied
+  // — the initial frame of a stream opened just before a reconciliation
+  // fetch answered, typically. Applying it would put back the older roots,
+  // repositories, and scope. The transport is still proven live, so the
+  // channel is confirmed either way.
+  if ((payload as DocumentSnapshot).kind !== "snapshot" && !stateReconciler.acceptFrame(payload.generatedAt)) {
+    liveChannel().confirm(generation);
+    return;
+  }
+  const previousSelectedId = appState.selectedId;
+  const repositoryChanged = (payload as DocumentSnapshot).kind === "snapshot" && hasNewRepositoryState(payload as DocumentSnapshot);
+  const changedId = payload.changedId ?? ((payload as DocumentSnapshot).kind === "snapshot" ? unseenSnapshotChange(documentIndex, payload as DocumentSnapshot) : null);
+  const previousScope = appState.scope;
+  const shouldReload = Boolean(documentIndex.epoch && (payload as DocumentSnapshot).epoch
+    && documentIndex.epoch !== (payload as DocumentSnapshot).epoch) || shouldRefreshPreview(
+    previousSelectedId,
+    payload.changedId,
+    appState.roots,
+    payload.roots,
+  );
 
-    // A watched file changed, so displayed search results captured line
-    // numbers that may no longer hold. Mark them rather than re-running: in a
-    // watched repository that would be a query storm, and rows would jump
-    // under the reader's cursor while they are reading them. The pane checks
-    // the id against its rows — a change to an unlisted file proves nothing
-    // about the results. This must precede the preview-mode returns below:
-    // the Search pane is visible in those modes too, and its results go stale
-    // the same way there.
-    if (payload.changedId) {
-      markSearchResultsStale(payload.changedId);
-    }
+  if (!applyServerSnapshot(payload)) { liveChannel().confirm(generation); return; }
+  stateReconciler.recordApplied(payload.generatedAt);
+  // Transport is only proven once this generation's authoritative state has
+  // been applied — an open socket that never delivers state is exactly the
+  // half-dead connection the indicator must not call `Connected`.
+  liveChannel().confirm(generation);
+  if (!scopesEqual(previousScope, payload.scope) || subscriptionKey !== documentKey()) {
+    // The subscription is keyed by context. Replace it after server-side
+    // normalization so a later reconnect cannot revive a deleted file pin
+    // that this client has already widened away from. Not a recovery: the
+    // transport never failed, the server changed the context.
+    subscribeDocument();
+  }
+  syncStateGeneration(payload.generatedAt);
 
-    // Local snapshot so the discriminant narrowing survives into the closure.
-    const previewMode = appState.previewMode;
-    if (previewMode.kind === "commit") {
-      renderSidebar();
-      renderCommitPreview(previewMode);
-      return;
-    }
-    if (previewMode.kind === "empty" && !previousSelectedId && !appState.followEnabled) {
-      renderSidebar();
-      return;
-    }
+  // A watched file changed, so displayed search results captured line
+  // numbers that may no longer hold. Mark them rather than re-running: in a
+  // watched repository that would be a query storm, and rows would jump
+  // under the reader's cursor while they are reading them. The pane checks
+  // the id against its rows — a change to an unlisted file proves nothing
+  // about the results. This must precede the preview-mode returns below:
+  // the Search pane is visible in those modes too, and its results go stale
+  // the same way there.
+  if (payload.changedId) {
+    markSearchResultsStale(payload.changedId);
+  }
 
-    // Rule C/D selection decision (see follow-mode capability).
-    setSelectedId(chooseSelectionForFileEvent(
-      payload.roots,
-      previousSelectedId,
-      payload.changedId,
-      appState.followEnabled,
-    ));
-
-    // Reveal the newly-selected file only when selection actually changed —
-    // so a user-closed ancestor isn't re-opened by unrelated state updates.
-    if (appState.selectedId && appState.selectedId !== previousSelectedId) {
-      // Server-driven selection change (follow auto-switch, or current doc
-      // was deleted and we fell back to the default). The URL must follow
-      // what's on screen, but we use replaceState — pushing here would
-      // pollute the back stack with file-change-driven entries the user
-      // never asked for.
-      const switched = findDocumentById(appState.selectedId);
-      if (switched) {
-        replaceSelection(appState.selectedId, switched.relativePath);
-      }
-    }
-
+  // Local snapshot so the discriminant narrowing survives into the closure.
+  const previewMode = appState.previewMode;
+  if (previewMode.kind === "commit") {
     renderSidebar();
+    renderCommitPreview(previewMode);
+    return;
+  }
 
-    if (
-      appState.selectedId &&
-      (shouldReload || appState.selectedId !== previousSelectedId)
-    ) {
-      if (shouldReload) {
-        // The file changed on disk — any cached payload is now stale.
-        forgetDocumentCache(appState.selectedId);
-      }
-      await loadDocument(appState.selectedId);
-      if (shouldReload && appState.selectedId === previousSelectedId && hasDocument(appState.roots, previousSelectedId)) {
-        // In-place reload of the document being viewed (Rule D): surface the
-        // otherwise-silent swap. A selection switch is a new document, not an
-        // update of what the user was reading — no signal there.
-        signalActiveDocumentUpdated();
-      }
-      return;
+  // Rule C/D selection decision (see follow-mode capability).
+  const catchUp = finishFollowDiscovery(payload.defaultDocumentId, changedId);
+  const pendingPath = getPendingDocumentPath();
+  const pendingDocument = pendingPath ? findDocumentByRelativePath(pendingPath) : null;
+  const preserveEmpty = !appState.followEnabled && appState.previewMode.kind === "empty" && previousSelectedId === null;
+  const discovering = (payload as DocumentSnapshot).discovery?.status !== undefined && (payload as DocumentSnapshot).discovery.status !== "ready";
+  setSelectedId(pendingDocument?.id ?? catchUp ?? (preserveEmpty || discovering && !changedId ? previousSelectedId : chooseSelectionForFileEvent(
+    payload.roots,
+    previousSelectedId,
+    followableChange(previousSelectedId, changedId),
+    appState.followEnabled,
+    appState.selectionCleared,
+  )));
+
+  // Reveal the newly-selected file only when selection actually changed —
+  // so a user-closed ancestor isn't re-opened by unrelated state updates.
+  if (appState.selectedId && appState.selectedId !== previousSelectedId) {
+    // Server-driven selection change (follow auto-switch, or current doc
+    // was deleted and we fell back to the default). The URL must follow
+    // what's on screen, but we use replaceState — pushing here would
+    // pollute the back stack with file-change-driven entries the user
+    // never asked for.
+    const switched = findDocumentById(appState.selectedId);
+    if (switched) {
+      replaceSelection(appState.selectedId, switched.relativePath);
     }
+  }
 
-    if (appState.selectedId && !hasDocument(payload.roots, appState.selectedId)) {
-      await loadDocument(appState.selectedId);
-    } else if (!appState.selectedId) {
-      renderEmptyPreview("No document selected", "Waiting for viewable files");
+  renderSidebar();
+
+  if (
+    appState.selectedId &&
+    (shouldReload || appState.selectedId !== previousSelectedId)
+  ) {
+    if (shouldReload) {
+      // The file changed on disk — any cached payload is now stale.
+      forgetDocumentCache(appState.selectedId);
     }
-  });
+    await loadDocument(appState.selectedId);
+    if (shouldReload && appState.selectedId === previousSelectedId && hasDocument(appState.roots, previousSelectedId)) {
+      // In-place reload of the document being viewed (Rule D): surface the
+      // otherwise-silent swap. A selection switch is a new document, not an
+      // update of what the user was reading — no signal there.
+      signalActiveDocumentUpdated();
+    }
+    return;
+  }
 
-  return events;
+  if (appState.selectedId && !hasDocument(payload.roots, appState.selectedId)) {
+    await loadDocument(appState.selectedId);
+  } else if (appState.selectedId && appState.viewMode === "diff" && (takeAttributesRefetch() || repositoryChanged && diffInputsMoved(appState.selectedId))) {
+    await applyDiffForActiveDocument(appState.selectedId);
+  } else if (!appState.selectedId) {
+    if (!renderPendingDocument()) renderEmptyPreview("No document selected", "Waiting for viewable files");
+  }
 }
+
+// How long the state fetch may go unanswered. A phone that changed networks
+// mid-request gets no error, only silence; unbounded, that silence would hold
+// the lifecycle recovery's coalescer (see `shell/recovery.ts`) and every
+// later wake-up would be dropped. Under the recovery ceiling, so the fetch
+// is the one that fails, and the reconciler's ordering sees a real rejection.
+export const STATE_FETCH_TIMEOUT_MS = 15_000;
 
 // The one path that converges this client on authoritative state and a fresh
 // stream. Both the explicit callers (scope widening, compare-target change)
@@ -221,11 +480,30 @@ function openDocumentStream(generation: number, context: { reconnect: boolean })
 // whichever route delivered that state.
 const stateReconciler = createStateReconciler<StatePayload>({
   fetchState: async () => {
-    const response = await fetch(contextualAppUrl(appUrl("/api/state")), { signal: AbortSignal.timeout(10_000) });
-    if (!response.ok) throw new Error(`state refresh failed: ${response.status}`);
-    return (await response.json()) as StatePayload;
+    const epoch = documentIndex.epoch;
+    const context = currentWatchContext();
+    const payload = await fetchWithinBudget(
+      (input, init) => fetch(input, init), contextualAppUrl(appUrl("/api/state")), STATE_FETCH_TIMEOUT_MS,
+      async response => {
+        if (!response.ok) throw new Error(`state refresh failed: ${response.status}`);
+        return await response.json() as StatePayload;
+      },
+    );
+    // A stream can replace the child epoch or normalize/change context while
+    // this HTTP read is pending. Its obsolete answer cannot put that back.
+    if (!sameDocumentContext(context, currentWatchContext())
+      || epoch !== documentIndex.epoch && (payload as DocumentSnapshot).epoch !== documentIndex.epoch) {
+      return documentIndex.view() ?? payload;
+    }
+    return payload;
   },
   freshnessOf: payload => payload.generatedAt,
+  acceptState: payload => {
+    const snapshot = payload as DocumentSnapshot;
+    if (snapshot.kind !== "snapshot") return undefined;
+    const current = documentIndex.view();
+    return !current || snapshot.epoch !== current.epoch || !sameDocumentContext(current, snapshot) || snapshot.revision >= current.revision;
+  },
   applyState: payload => {
     // Decided against the roots this client still holds, BEFORE the snapshot
     // overwrites them. A document edited while the page was suspended arrives
@@ -233,76 +511,78 @@ const stateReconciler = createStateReconciler<StatePayload>({
     // stream's first frame sees no mtime difference either — so this is the
     // only place the staleness is still visible.
     const selectedId = appState.selectedId;
-    const staleSelection = shouldRefreshPreview(
+    const repositoryChanged = (payload as DocumentSnapshot).kind === "snapshot" && hasNewRepositoryState(payload as DocumentSnapshot);
+    const changedId = (payload as DocumentSnapshot).kind === "snapshot" ? unseenSnapshotChange(documentIndex, payload as DocumentSnapshot) : payload.changedId;
+    const staleSelection = Boolean(documentIndex.epoch && (payload as DocumentSnapshot).epoch
+      && documentIndex.epoch !== (payload as DocumentSnapshot).epoch) || shouldRefreshPreview(
       selectedId,
       payload.changedId,
       appState.roots,
       payload.roots,
     );
 
-    applyServerSnapshot(payload);
+    if (!applyServerSnapshot(payload)) return;
+    if (installed && subscriptionKey !== documentKey()) subscribeDocument();
+    const catchUp = finishFollowDiscovery(payload.defaultDocumentId, changedId);
+    const pendingPath = getPendingDocumentPath();
+    const pendingDocument = pendingPath ? findDocumentByRelativePath(pendingPath) : null;
+    const reconcileFollow = appState.followEnabled && appState.discovery.status === "ready" && appState.previewMode.kind !== "commit";
+    const followTarget = pendingDocument?.id ?? catchUp ?? (reconcileFollow ? chooseSelectionForFileEvent(payload.roots, selectedId, followableChange(selectedId, changedId), true) : null);
+    if (reconcileFollow || followTarget) {
+      setSelectedId(followTarget);
+      const document = followTarget ? findDocumentById(followTarget) : null;
+      if (document) replaceSelection(document.id, document.relativePath);
+    }
     syncStateGeneration(payload.generatedAt);
     renderBuildBadge(payload.build);
     renderSidebar();
-    if (selectedId && staleSelection) {
-      forgetDocumentCache(selectedId);
-      void loadDocument(selectedId).then(() => {
+    if (appState.previewMode.kind === "commit") {
+      renderCommitPreview(appState.previewMode);
+      return;
+    }
+    const activeId = appState.selectedId;
+    if (activeId && (staleSelection || activeId !== selectedId)) {
+      forgetDocumentCache(activeId);
+      void loadDocument(activeId).then(() => {
         // Same signal the in-place reload gives on Rule D: the document the
         // user was reading changed under them, and the swap is otherwise
         // silent.
         if (appState.selectedId === selectedId && hasDocument(appState.roots, selectedId)) signalActiveDocumentUpdated();
       });
-    }
+    } else if (activeId && appState.viewMode === "diff" && (takeAttributesRefetch() || repositoryChanged && diffInputsMoved(activeId))) {
+      void applyDiffForActiveDocument(activeId);
+    } else if (!activeId && !renderPendingDocument() && reconcileFollow) renderEmptyPreview("No document selected", "Waiting for viewable files");
   },
 });
 
-// Reconcile authoritative state AND ensure a current channel.
+// A context change, not a recovery — the caller moved the scope or the
+// compare target and the transport was never in doubt. Reconciles
+// authoritative state AND replaces the document subscription.
 //
-// The channel is superseded FIRST, and there is no `await` between the
-// caller's context change and this call, so the stream being replaced cannot
-// deliver anything more. That ordering matters twice over:
-//
-//   - The old stream carries the context the client has just moved away from
-//     (a file pin the caller is widening, an old compare target). A frame from
-//     it would reinstate that context — and, being newer by the server's own
-//     clock, would also discard the payload this fetch is about to bring back,
-//     leaving the session on the context the user asked to leave.
-//   - The stream this page holds may be the half-dead one that prompted a
-//     wake-up. Replacing it must not depend on the fetch succeeding: only a
-//     fresh attempt can error and hand recovery to the channel's retry cycle.
+// The subscription is replaced FIRST, and there is no `await` between the
+// caller's context change and this call, so the topic being replaced cannot
+// deliver anything more: it carries the context the client has just moved
+// away from (a file pin the caller is widening, an old compare target), and
+// a frame from it would reinstate that context — and, being newer by the
+// server's own clock, would also discard the payload this fetch is about to
+// bring back, leaving the session on the context the user asked to leave.
 //
 // The fetch is then a fallback rather than the primary path — when the fresh
-// stream connects, its own first frame is the newer state and this payload is
-// correctly discarded.
-async function reconcileDocumentState(options: { resumed?: boolean } = {}): Promise<void> {
+// subscription's snapshot arrives, it is the newer state and this payload is
+// correctly discarded. (A wake-up goes through `shell/live.ts` instead: it
+// reconnects the one channel, then runs the reconcile registered above.)
+export async function refreshServerStateForContext(): Promise<void> {
+  subscribeDocument();
+  await reconcileCorpus();
+}
+
+async function reconcileCorpus(): Promise<void> {
   setCorpusStatus("loading");
-  connectEvents(options);
   try {
     await stateReconciler.reconcile();
+    syncCorpusStatus();
   } catch (error) {
     setCorpusStatus("index-error");
     throw error;
   }
-}
-
-export async function refreshServerStateForContext(): Promise<void> {
-  // A context change, not a recovery — the caller moved the scope or the
-  // compare target and the transport was never in doubt.
-  await reconcileDocumentState();
-}
-
-// Installed once, by boot. `pageshow` from the back/forward cache, a return
-// to the foreground, and a regained network connection all mean the same
-// thing — this page has been out of touch and cannot trust what it holds.
-let lifecycle: LifecycleRecovery | null = null;
-
-export function watchPageLifecycle(): void {
-  lifecycle ??= createLifecycleRecovery({
-    win: window,
-    doc: document,
-    // A wake-up IS a recovery: the stream this page holds may have died
-    // silently while it was suspended or off the network.
-    recover: () => reconcileDocumentState({ resumed: true }),
-    discard: disconnectEvents,
-  });
 }

@@ -7,10 +7,11 @@
 import type { AssistantMessageItem, TokenUsage } from "./types";
 
 /**
- * Every component a `TokenUsage` can carry, as one list. Summing, comparing,
- * and validating all enumerate the components; a new one the agent starts
- * reporting is added here and every consumer follows, instead of each copy of
- * the list silently missing it.
+ * Every token component a `TokenUsage` can carry, as one list. Summing,
+ * comparing, and validating all enumerate the components; a new one the agent
+ * starts reporting is added here and every consumer follows, instead of each
+ * copy of the list silently missing it. `costUsd` is deliberately not a
+ * component: it is money, not tokens, so a token sum must not add it.
  */
 export const TOKEN_USAGE_COMPONENTS = ["input", "output", "reasoning", "cacheRead", "cacheWrite"] as const;
 
@@ -23,15 +24,39 @@ export function totalTokens(usage: TokenUsage): number {
   return TOKEN_USAGE_COMPONENTS.reduce((sum, key) => sum + (usage[key] ?? 0), 0);
 }
 
+/**
+ * Dollars as the readouts show them: cents for anything a reader would
+ * budget, four places below ten cents so a cheap turn does not round to
+ * nothing.
+ */
+export function formatUsd(value: number): string {
+  return value.toLocaleString(undefined, { style: "currency", currency: "USD", minimumFractionDigits: 2, maximumFractionDigits: value > 0 && value < 0.1 ? 4 : 2 });
+}
+
+/**
+ * Token counts at a glance: `840`, `12.4k`, `1.2M`. The exact figure is always
+ * one hover or one expansion away (the title attribute and the breakdown), so
+ * the compact form never has to be the only statement.
+ */
+export function formatTokens(value: number): string {
+  if (value < 1_000) return String(value);
+  if (value < 1_000_000) return `${(value / 1_000).toFixed(value < 10_000 ? 1 : 0)}k`;
+  return `${(value / 1_000_000).toFixed(1)}M`;
+}
+
 /** Tokens occupying the model's context window right now. */
 export function contextTokens(usage: TokenUsage): number {
   return (usage.input ?? 0) + (usage.cacheRead ?? 0) + (usage.cacheWrite ?? 0);
 }
 
-/** Component-by-component equality; absent components must match too. */
+/**
+ * Component-by-component equality; absent components must match too. Cost
+ * is compared as well — it rides the same record, and a restatement that
+ * only moved the price is still a change.
+ */
 export function sameUsage(left: TokenUsage | undefined, right: TokenUsage | undefined): boolean {
   if (left === undefined || right === undefined) return left === right;
-  return TOKEN_USAGE_COMPONENTS.every(key => left[key] === right[key]);
+  return TOKEN_USAGE_COMPONENTS.every(key => left[key] === right[key]) && left.costUsd === right.costUsd;
 }
 
 /**

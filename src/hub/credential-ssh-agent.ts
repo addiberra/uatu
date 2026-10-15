@@ -286,8 +286,18 @@ export class ManagedSshAgent {
       return;
     }
     await this.assertNoGuardianQuarantines();
+    // A pre-flight, not the identity proof: a socket removed or replaced
+    // since the record was written fails here at once with a precise
+    // mismatch, instead of timing out the `status` probe below. The signed
+    // `status` reply is what proves the nonce's owner is at that socket.
     await assertSocket(this.socketPath, record.agentSocket);
     await assertSocket(this.controlSocketPath, record.controlSocket);
+    // The guardian answers any well-formed request from its private socket,
+    // and a `stop` takes effect before we can check its reply. A record read
+    // from disk is not yet proven to belong to this guardian, so prove it
+    // with a harmless `status` round trip (whose reply is keyed by the
+    // nonce) before sending the irreversible `stop`.
+    await this.request(record, "status");
     await this.request(record, "stop");
     await this.waitForAllArtifactsToDisappear(record);
     await this.assertNoGuardianQuarantines();

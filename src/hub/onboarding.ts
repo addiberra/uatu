@@ -23,6 +23,7 @@ import {
   workspaceSlug,
   type WorkspaceEntry,
   type WorkspaceRegistry,
+  type WorkspaceWorktreeLink,
 } from "./registry";
 import type { SessionManager } from "./sessions";
 
@@ -596,6 +597,105 @@ export class WorkspaceOnboardingCoordinator {
     });
   }
 
+  // Worktree completion path (task 4.3): the checkout already exists and has
+  // been VERIFIED by identity, so this skips folder creation and the git
+  // probe and commits the registration together with its parent/repository
+  // relationship. The child gets NO assignments of its own — credentials and
+  // shared configuration are read live from the parent through the link —
+  // and it is registered stopped unless an explicit start is requested.
+  configureWorktree(options: {
+    path: string;
+    displayName: string;
+    link: WorkspaceWorktreeLink;
+    start?: boolean;
+    expectedParentPath?: string;
+    verifyParentIdentity?: () => Promise<void>;
+    // Set only by the worktree registrar (src/hub/worktree-registrar.ts),
+    // which registerCreatedWorktree() (src/hub/worktree-journal.ts) calls
+    // exclusively from inside WorktreeService's create()/retryRegistration()
+    // — both of which already hold a WorktreeOperationCoordinator path
+    // reservation covering this exact `path` on the SAME PathReservationCoordinator
+    // main.ts hands `onboarding` (see worktree-coordinator.ts's own header
+    // comment on the two fences). Reserving it a SECOND time here would
+    // conflict with the caller's own reservation — not with anything else —
+    // and always refuse with "folder path is reserved by another operation"
+    // (Bug 3: first-attempt worktree registration always failing in
+    // production). A direct, unfenced caller (registerExisting's own
+    // external-discovery path, which holds no outer path reservation) must
+    // still self-reserve, so this defaults to false.
+    fenced?: boolean;
+  }): Promise<OnboardingResult> {
+    return this.enqueue(async () => {
+      await this.assertNoPendingOnboarding();
+      const canonical = await this.canonicalDirectory(options.path);
+      await this.reconcileRegisteredAliases();
+      const parent = this.options.registry.byId(options.link.parentWorkspaceId);
+      if (!parent) throw new OnboardingError("not-found", `unknown parent workspace: ${options.link.parentWorkspaceId}`);
+      // Policy ownership is one level deep by construction: a child never
+      // becomes another child's policy owner, so inheritance cannot chain.
+      if (parent.worktree) throw new OnboardingError("conflict", "a linked worktree cannot own another worktree's configuration");
+      // The parent's lifecycle queue is the family fence shared with BOTH
+      // forget APIs. Hold both parent and child through commit/rollback, in
+      // the SAME sorted order as batch lifecycle operations (revocation and
+      // folder mutations), never nesting parent -> child unconditionally.
+      // Revalidate after waiting, before writing any onboarding state.
+      const planned = this.planWorkspaceId(canonical);
+      const ids = [...new Set([parent.id, planned])].sort();
+      const withQueues = <T>(index: number, operation: () => Promise<T>): Promise<T> => index === ids.length
+        ? operation()
+        : this.options.sessions.runExclusive(ids[index]!, () => withQueues(index + 1, operation));
+      return withQueues(0, async () => {
+        const currentParent = this.options.registry.byId(parent.id);
+        if (!currentParent) throw new OnboardingError("not-found", `unknown parent workspace: ${parent.id}`);
+        if (currentParent.path !== parent.path || currentParent.backend !== parent.backend || currentParent.worktree) {
+          throw new OnboardingError("conflict", "parent workspace changed during worktree registration; refresh and try again");
+        }
+        // A retry's slug may now name an unrelated registration. Compare to
+        // the pre-failure source, not merely the parent observed on entry.
+        if (options.expectedParentPath !== undefined && currentParent.path !== options.expectedParentPath) {
+          throw new OnboardingError("conflict", "the original parent workspace changed; register the retained checkout from its original repository");
+        }
+        await options.verifyParentIdentity?.();
+        const existing = this.options.registry.byPath(canonical);
+        if (existing) {
+          // An idempotent retry of the SAME verified checkout returns the
+          // registration that is already there rather than minting a second
+          // one; anything else at that path is a conflict.
+          if (existing.worktree?.checkoutId === options.link.checkoutId
+            && existing.worktree.parentWorkspaceId === options.link.parentWorkspaceId) {
+            return {
+              entry: { ...existing },
+              created: false,
+              alreadyRegistered: true,
+              createdFolder: false,
+              started: false,
+              startError: null,
+            };
+          }
+          throw new OnboardingError("conflict", `folder is already registered: ${canonical}`);
+        }
+        // A fenced caller already owns this path reservation; direct external
+        // discovery must still reserve it against folder/clone mutations.
+        const reservation = options.fenced === true ? undefined : this.reserve([canonical]);
+        try {
+          return await this.commitPlanned({
+            operation: "configure-existing",
+            canonical,
+            displayName: displayName(options.displayName),
+            planned,
+            desired: [],
+            createdFolder: false,
+            start: options.start === true,
+            link: options.link,
+            lifecycleQueueHeld: true,
+          });
+        } finally {
+          reservation?.release();
+        }
+      });
+    });
+  }
+
   // Startup recovery: a pending journal means the process died between the
   // registry and assignment commits (or before rollback finished). Compare
   // the journaled desired entry with the registry: when the registration
@@ -852,12 +952,15 @@ export class WorkspaceOnboardingCoordinator {
     desired: CredentialAssignment[];
     createdFolder: boolean;
     start: boolean;
+    link?: WorkspaceWorktreeLink;
+    lifecycleQueueHeld?: boolean;
   }): Promise<OnboardingResult> {
     const entry: WorkspaceEntry = {
       id: options.planned,
       path: options.canonical,
       backend: "local",
       displayName: options.displayName,
+      ...(options.link ? { worktree: { ...options.link } } : {}),
     };
     const previousAssignments = this.options.credentials.snapshot().assignments
       .filter(assignment => assignment.workspaceId === options.planned);
@@ -885,7 +988,7 @@ export class WorkspaceOnboardingCoordinator {
     // execute only after this whole section.
     let started = false;
     let startError: string | null = null;
-    await this.options.sessions.runExclusive(options.planned, async () => {
+    const commit = async () => {
       try {
         await this.journal.write(pending);
       } catch (error) {
@@ -912,7 +1015,7 @@ export class WorkspaceOnboardingCoordinator {
 
       let registered: WorkspaceEntry;
       try {
-        const result = await this.options.registry.registerWithStatus(options.canonical, "local", options.displayName);
+        const result = await this.options.registry.registerWithStatus(options.canonical, "local", options.displayName, options.link);
         registered = result.entry;
         if (!result.created || registered.id !== options.planned) {
           // The planned id was taken between planning and commit — impossible
@@ -982,7 +1085,10 @@ export class WorkspaceOnboardingCoordinator {
           startError = error instanceof Error ? error.message : String(error);
         }
       }
-    });
+    };
+    // Worktree onboarding already owns the sorted parent + child queues.
+    if (options.lifecycleQueueHeld) await commit();
+    else await this.options.sessions.runExclusive(options.planned, commit);
 
     return {
       entry: { ...entry },

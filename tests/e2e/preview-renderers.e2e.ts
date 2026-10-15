@@ -2,8 +2,9 @@ import { expect, test } from "./fixtures";
 import { promises as fs } from "node:fs";
 
 import { workspacePath } from "./config";
-import { treeRow } from "./tree-helpers";
+import { openTreeFile, treeRow } from "./tree-helpers";
 import { standardBeforeEach } from "./fixtures";
+import { afterAnimationFrames, naturalWidth } from "./sync-helpers";
 
 test.beforeEach(async ({ page, request }) => {
   await standardBeforeEach(page, request);
@@ -44,13 +45,17 @@ test("relative image references in a README are served natively from the watched
   const img = page.locator('#preview img[alt="hero"]');
   await expect(img).toBeVisible();
 
-  // Rendered HTML preserves the original relative URL verbatim.
-  expect(await img.getAttribute("src")).toBe("./hero.svg");
+  // The authored relative URL resolves against the document's directory and
+  // carries the file's change revision, the same parameter an opened image
+  // carries, so a later change to the image is refetched.
+  await expect.poll(async () => new URL((await img.getAttribute("src"))!, page.url()).searchParams.get("revision"))
+    .toMatch(/:\d+$/);
+  expect(new URL((await img.getAttribute("src"))!, page.url()).pathname).toBe("/hero.svg");
 
   // The browser actually loaded the image through the static file fallback.
-  await img.evaluate((el: HTMLImageElement) => el.complete && el.naturalWidth > 0);
+  await expect.poll(() => naturalWidth(page, '#preview img[alt="hero"]')).toBe(16);
   const resolved = await img.evaluate((el: HTMLImageElement) => el.currentSrc);
-  expect(resolved).toMatch(/\/hero\.svg$/);
+  expect(resolved).toMatch(/\/hero\.svg\?revision=/);
 
   const response = await request.get("/hero.svg");
   expect(response.ok()).toBe(true);
@@ -61,53 +66,103 @@ test("a multi-file burst refreshes the active document when another path is nomi
   const marker = `Burst refresh ${Date.now()}`;
   await expect(page.locator("#preview-path")).toHaveText("README.md");
 
+  type Batch = { changedId: string | null; upserts: string[] };
   await page.evaluate(async () => {
     const state = window as unknown as {
-      __uatuWatchEvents?: Array<string | null>;
+      __uatuWatchEvents?: Array<{ changedId: string | null; upserts: string[] }>;
       __uatuWatchSource?: EventSource;
     };
     state.__uatuWatchEvents = [];
-    const source = new EventSource("/api/events");
+    // An observer on the brokered live stream, subscribed to the same
+    // document topic the page holds; it records each batch's nominated path
+    // and the documents it carries.
+    const subs = JSON.stringify([{ topic: "document", key: "compareTarget=base&scope=folder" }]);
+    const source = new EventSource(`/api/hub/live?subs=${encodeURIComponent(subs)}`);
     state.__uatuWatchSource = source;
-    source.addEventListener("state", event => {
-      const payload = JSON.parse((event as MessageEvent<string>).data) as { changedId: string | null };
-      state.__uatuWatchEvents!.push(payload.changedId);
+    source.addEventListener("live", event => {
+      const envelope = JSON.parse((event as MessageEvent<string>).data) as {
+        topic: string;
+        event: { kind: string; data?: { changedId: string | null; upserts?: Array<{ id: string }> } };
+      };
+      if (envelope.topic !== "document" || envelope.event.kind !== "data" || !envelope.event.data) return;
+      const { changedId, upserts = [] } = envelope.event.data;
+      state.__uatuWatchEvents!.push({ changedId, upserts: upserts.map(doc => doc.id) });
     });
     await new Promise<void>((resolve, reject) => {
       source.addEventListener("open", () => resolve(), { once: true });
       source.addEventListener("error", () => reject(new Error("watch observer failed to connect")), { once: true });
     });
   });
-  await expect.poll(() => page.evaluate(() => (
-    window as unknown as { __uatuWatchEvents?: Array<string | null> }
-  ).__uatuWatchEvents?.length ?? 0)).toBeGreaterThan(0);
-  // Both writes pass through awaitWriteFinish with the same spacing, so the
-  // later binary event lands in the same debounce batch and the batch's
-  // representative path is null. Event-loop jitter under a loaded suite can
-  // split the pair into two batches, which nominates README instead — that
-  // is a scheduling artifact, not the behavior under test, so the burst is
-  // retried until it lands as one batch.
+  const events = () => page.evaluate(() => (window as unknown as { __uatuWatchEvents: Batch[] }).__uatuWatchEvents);
+  await expect.poll(async () => (await events()).length).toBeGreaterThan(0);
+  const readme = workspacePath("README.md");
+  // README and a second document are written 50 ms apart, so they normally
+  // land in one batch, which nominates the later document. Event-loop jitter
+  // under a loaded suite can split the pair, and README's own batch then
+  // nominates README. That is a scheduling artifact, not the behavior under
+  // test, so the burst is retried until README's update arrives in a batch
+  // that nominates another path.
+  let round = 0;
   await expect.poll(async () => {
-    const before = await page.evaluate(() => (
-      window as unknown as { __uatuWatchEvents: Array<string | null> }
-    ).__uatuWatchEvents.length);
-    await fs.writeFile(workspacePath("README.md"), `# Uatu\n\n${marker}\n`, "utf8");
+    const before = (await events()).length;
+    round++;
+    await fs.writeFile(readme, `# Uatu\n\n${marker} ${round}\n`, "utf8");
     await page.waitForTimeout(50);
-    await fs.writeFile(
-      workspacePath("hero.svg"),
-      `<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"></svg>`,
-      "utf8",
-    );
-    await expect.poll(() => page.evaluate(() => (
-      window as unknown as { __uatuWatchEvents: Array<string | null> }
-    ).__uatuWatchEvents.length)).toBeGreaterThan(before);
-    return page.evaluate(() => (
-      window as unknown as { __uatuWatchEvents: Array<string | null> }
-    ).__uatuWatchEvents.at(-1));
-  }, { timeout: 20_000 }).toBeNull();
+    await fs.writeFile(workspacePath("burst-companion.md"), `# Companion ${round}\n`, "utf8");
+    await expect.poll(async () => (await events()).slice(before)
+      .some(batch => batch.upserts.includes(workspacePath("burst-companion.md")))).toBe(true);
+    return (await events()).slice(before)
+      .some(batch => batch.upserts.includes(readme) && batch.changedId !== null && batch.changedId !== readme);
+  }, { timeout: 20_000 }).toBe(true);
 
-  await expect(page.locator("#preview")).toContainText(marker);
+  await expect(page.locator("#preview")).toContainText(`${marker} ${round}`);
   await expect(page.locator("#preview-path")).toHaveText("README.md");
+});
+
+// An SVG whose intrinsic width is `width` — the decoded image's
+// naturalWidth tells which version of the file the browser is showing.
+function sizedSvg(width: number): string {
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${width}"><rect width="${width}" height="${width}" fill="#1ca8a7"/></svg>`;
+}
+
+test("an open image refreshes in place when the file changes on disk", async ({ page, request }) => {
+  await request.post("/__e2e/reset", { data: { extras: { "hero.svg": sizedSvg(16) } } });
+  await page.goto("/");
+  await openTreeFile(page, "hero.svg");
+  await expect(page.locator("#preview-path")).toHaveText("hero.svg");
+  const selector = "#preview .image-preview img";
+  await expect.poll(() => naturalWidth(page, selector)).toBe(16);
+  // Marks the element on screen: an in-place refresh keeps it.
+  await page.locator(selector).evaluate(el => { el.dataset.e2eMounted = "1"; });
+
+  await fs.writeFile(workspacePath("hero.svg"), sizedSvg(48), "utf8");
+
+  await expect.poll(() => naturalWidth(page, selector)).toBe(48);
+  await expect(page.locator(selector)).toHaveAttribute("data-e2e-mounted", "1");
+  await expect(page.locator("#preview-path")).toHaveText("hero.svg");
+});
+
+test("an image embedded in the open document refreshes when only the image changes", async ({ page, request }) => {
+  await request.post("/__e2e/reset", {
+    data: { extras: { "hero.svg": sizedSvg(16), "embed.md": `# Embed\n\n<img src="./hero.svg" alt="hero" />\n` } },
+  });
+  await page.goto("/");
+  // Opened by a click, so Rule A turns Follow off: this is the Follow-off
+  // variant (follow-mode.e2e.ts covers the same refresh with Follow on).
+  await openTreeFile(page, "embed.md");
+  await expect(page.locator("#preview-path")).toHaveText("embed.md");
+  await expect(page.locator("#follow-toggle")).toHaveAttribute("aria-pressed", "false");
+  const selector = '#preview img[alt="hero"]';
+  await expect.poll(() => naturalWidth(page, selector)).toBe(16);
+  // The document itself did not change, so it must not be re-rendered: the
+  // marked heading survives and only the image's source moves.
+  await page.locator("#preview h1").evaluate(el => { el.dataset.e2eMounted = "1"; });
+
+  await fs.writeFile(workspacePath("hero.svg"), sizedSvg(48), "utf8");
+
+  await expect.poll(() => naturalWidth(page, selector)).toBe(48);
+  await expect(page.locator("#preview h1")).toHaveAttribute("data-e2e-mounted", "1");
+  await expect(page.locator("#preview-path")).toHaveText("embed.md");
 });
 
 test("server falls back with 404 for paths outside every watched root", async ({ request }) => {
@@ -183,10 +238,10 @@ test("preview header shows a file-type chip for the selected document", async ({
     data: { extras: { "config.yaml": "key: value\n" } },
   });
   await page.goto("/");
-  await treeRow(page, "README.md").click();
+  await openTreeFile(page, "README.md");
   await expect(page.locator("#preview-type")).toHaveText("markdown");
 
-  await treeRow(page, "config.yaml").click();
+  await openTreeFile(page, "config.yaml");
   await expect(page.locator("#preview-type")).toHaveText("yaml");
 });
 
@@ -195,7 +250,7 @@ test("Markdown cross-document links render with the original .md extension", asy
   // preserves the author's URL verbatim — this test locks that behavior in
   // so a future renderer swap can't silently regress it. Drives the
   // permanent `testdata/watch-docs/links-demo.md` fixture.
-  await treeRow(page, "links-demo.md").click();
+  await openTreeFile(page, "links-demo.md");
   await expect(page.locator("#preview-title")).toHaveText("Markdown Cross-Document Links");
 
   await expect(page.locator('#preview a[href="README.md"]')).toBeVisible();
@@ -204,7 +259,7 @@ test("Markdown cross-document links render with the original .md extension", asy
 });
 
 test("clicking a Markdown cross-document link switches the preview in-app", async ({ page }) => {
-  await treeRow(page, "links-demo.md").click();
+  await openTreeFile(page, "links-demo.md");
   await expect(page.locator("#preview-title")).toHaveText("Markdown Cross-Document Links");
 
   await page.locator('#preview a[href="guides/setup.md"]').click();
@@ -239,7 +294,7 @@ test("switching to a different document resets the preview scroll to the top", a
   await page.goto("/");
 
   // Open doc A and scroll it well past the top.
-  await treeRow(page, "long-doc.md").click();
+  await openTreeFile(page, "long-doc.md");
   await expect(page.locator("#preview-title")).toHaveText("Long Doc");
   await expect(page.locator("#preview")).toContainText("Paragraph 80.");
   await page.locator(".preview-shell").evaluate(element => {
@@ -248,7 +303,7 @@ test("switching to a different document resets the preview scroll to the top", a
   await expect.poll(() => page.locator(".preview-shell").evaluate(el => el.scrollTop)).toBeGreaterThan(500);
 
   // Switch to doc B — preview scroll must reset to the top.
-  await treeRow(page, "short-doc.md").click();
+  await openTreeFile(page, "short-doc.md");
   await expect(page.locator("#preview-title")).toHaveText("Short Doc");
 
   const scrollTop = await page.locator(".preview-shell").evaluate(el => el.scrollTop);
@@ -259,14 +314,15 @@ test("preview header stays visible while scrolling and the sidebar scroll is ind
   const padding = Array.from({ length: 80 }, (_, index) => `Paragraph ${index + 1}.`).join("\n\n");
   await fs.writeFile(workspacePath("README.md"), `# Uatu\n\n${padding}\n`, "utf8");
 
-  await treeRow(page, "README.md").click();
+  await openTreeFile(page, "README.md");
   await expect(page.locator("#preview")).toContainText("Paragraph 80.");
 
   const headerBefore = await page.locator(".preview-header").boundingBox();
   await page.locator(".preview-shell").evaluate(element => {
     element.scrollTop = 600;
   });
-  await page.waitForTimeout(100);
+  await expect.poll(() => page.locator(".preview-shell").evaluate(el => el.scrollTop)).toBeGreaterThan(500);
+  await afterAnimationFrames(page);
   const headerAfter = await page.locator(".preview-header").boundingBox();
 
   expect(headerBefore?.y ?? 0).toBeCloseTo(headerAfter?.y ?? 0, 0);

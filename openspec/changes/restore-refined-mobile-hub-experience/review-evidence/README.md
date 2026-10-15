@@ -1,7 +1,13 @@
 # Current UI development and review package
 
 Use this package to continue the unfinished UI update, not as an archive of every
-capture run. **Simulation only; no real credentials. Visual approval is pending.**
+capture run. **The reviewer remains simulation only; no real credentials.**
+The user agreed the refined UI as the live phone target and explicitly authorized
+integration on 2026-10-15; final version-specific visual/device acceptance is
+still pending. See [the current decision](acceptance.md) and the
+[live integration map](integration-map.md). Older no-authorization statements in
+historical evidence do not override this decision; their results and limitations
+remain unchanged. Planning does not change or restart either running service.
 
 ## What to use
 
@@ -15,7 +21,8 @@ capture run. **Simulation only; no real credentials. Visual approval is pending.
   reduced motion. These illustrate the current UI, **not approved pixel goldens**.
 - [Canonical reference index](index.md) and
   [the original design references](../../../../design/hub-mobile/README.md): all
-  49 original images remain unchanged. They remain the visual target.
+  49 original images remain unchanged. They are the visual foundation, subject to
+  the explicit agreed amendments in the reference contract.
 - `baseline.json`, `baseline.ts` and `baseline.test.ts`: the immutable historical
   preservation/reference fixture and its tests, not a current run report.
 - The change's [proposal](../proposal.md), [design](../design.md),

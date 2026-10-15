@@ -52,16 +52,17 @@
 - [x] 7.3 Run focused unit/E2E regressions for changed workspace, navigation, form and preference owners plus type checking and production-bundle separation checks; verify no fixture/server/scenario-control imports enter shipping code and record exact commands/results.
 - [ ] 7.4 Compare fine-pointer desktop/native-inset presentation and unchanged workspace interiors against pre-change evidence; verify no global CSS/event/route leakage and account explicitly for intentional overlay changes rather than deleting assertions.
 
-## 8. Serve for user review and stop
+## 8. Serve for user review and record acceptance
 
 - [x] 8.1 Launch the isolated mock review on unused loopback/Tailscale HTTPS ports and leave existing Hub/test/reference services intact; verify local readiness and remote phone access, then provide exact scoped start/stop/restart/reset commands and simulation credentials/instructions without personal secrets.
 - [x] 8.2 Deliver the frontend review URL, reference/actual evidence, complete scenario guide, unpictured-state designs, known gaps, and an acceptance record marked awaiting user review; verify the handoff explicitly distinguishes mocked behavior from live backend correctness.
-- [ ] 8.3 Obtain and record the user's explicit visual and interaction approval of the served frontend version and accepted exceptions. **Human gate: leave unchecked until the user approves; stop here and request review.** Passing tests cannot complete this task or authorize real backend integration, production rollout, spec sync, or archive.
+- [ ] 8.3 Obtain and record the user's explicit final visual and interaction acceptance of a named served version and enumerated exceptions; verify the acceptance record identifies the actual version and reviewer decision. **Leave unchecked:** the 2026-10-15 design-direction agreement and explicit live integration authorization supersede this task's former integration stop, but do not certify rendered states, approved goldens or physical devices. Passing tests cannot complete this acceptance task, authorize rollout, spec sync or archive.
 
-Live integration tasks are deliberately not included. After frontend approval,
-obtain authorization and prepare the real backend/API/routing/security task set
-before continuing. Keep production-facing delta specs unmerged until their live
-requirements are implemented and verified.
+Originally live integration tasks were deliberately excluded. The user has now
+authorized the scope amendment below; the lead starts apply after planning.
+Sections 1–16 preserve historical completed work and pending evidence; their
+past review-only publication boundaries are not new integration prohibitions.
+Keep production-facing delta specs unsynced until implemented and verified.
 
 ## 9. User-requested iOS UX and one-handed correction
 
@@ -124,6 +125,62 @@ requirements are implemented and verified.
 - [x] 16.2 Remove the canceled-creation landing page and make Add Workspace the safe exit; move the sole Devices entry into Session Security while preserving counts, direct routes, nested drafts, history and authorization semantics.
 - [x] 16.3 Reproduce the screenshot's stale file-index failure and repair the synthetic freshness contract; verify same-directory arrows across all represented file kinds, boundaries, retries, reset/resume and canonical workspace request scope without redesigning the workspace.
 - [x] 16.4 Run current focused cross-engine and retention regressions, retain new evidence and publish only the isolated reviewer for renewed user review; preserve older full-app/approval gates.
+
+## 17. Authorized integration foundation — bounded first slice
+
+- [x] 17.1 Record the 2026-10-15 agreed live phone design and integration authorization separately from final visual/device acceptance; verify proposal/design/specs/tasks and existing reference/screen/integration/acceptance plans agree, without marking 8.3 or prior verification gaps complete.
+- [x] 17.2 Recheck the working-tree/index baseline and actual API/interface matrix in `review-evidence/integration-map.md` at apply entry; verify all upstream operations, fact gaps, auth/CSRF boundaries and dependency owners are named, with staged merge and five existing follow-up files preserved and no runtime changes.
+- [x] 17.3 Implement only browser-safe live read transport/decoders for authenticated Hub state, repository credential catalog and default-folder data, using existing routes and injected test fetch; verify typed available/unavailable/401/malformed/timeout outcomes, unknown facts rather than guesses, `hubUrl()` scope during `/s/A/` navigation, no mutations/automatic retries and no test/runtime imports in the shipping graph. Do not mount the production replacement or expose incomplete mutation stubs in this slice.
+
+## 18. Live contracts, authentication and entry routing
+
+- [ ] 18.1 Add bounded authoritative branch/checkout facts and safe explicit credential/tool facts where existing DTOs cannot represent the mobile contract; verify named/detached/unborn/non-Git/unavailable, stopped/no-start, absent tools, protected/unprotected/unknown and saved-vs-effective override cases through server/adapter tests without secret disclosure or Git-per-poll fanout.
+- [ ] 18.2 Implement live authentication/device adapters through existing login/logout/session routes and safe gated user/host identity facts; verify valid/invalid/rate-limited login, safe next targets, no anonymous identity/version disclosure, cookie-only browser session handling, revoke current/other device, no-store, sanitized errors and generation fencing. Test cookie CSRF refusal, native bearer compatibility and no session id in storage/history/logs; do not change operator auth configuration.
+- [ ] 18.3 Assemble eligible touch Hub routes and the one-workspace production coordinator entry, retaining desktop/standalone defaults; verify direct/reloaded `/`, `/settings?detail=…`, `/clone`, `/s/<id>/file?…#…`, cold loading/Back, canonical Open, mode escape and fallback routes using isolated test assembly. Do not ship the replacement before all parity dependencies pass.
+- [ ] 18.4 Bind workspace HTTP/WS/brokered live transport to its fixed base path and map auth/workspace invalidation to the coordinator; verify one stream/boot, current-session revoke/401 and delayed response fencing, stop/removal and reconnect while Hub is foreground, including proxy Origin/page-origin and cross-site stream checks. Do not treat network failure as an authoritative Stop or revive retired child SSE endpoints.
+- [ ] 18.5 Publish every new wire field/operation from this section in OpenAPI, operation/stream inventories and relevant docs, with revision compatibility decisions; verify `bun run api:validate`, `bun run test:api`, route coverage and old-payload/client compatibility. Repeat this check for later clone additions, not only this initial batch.
+
+## 19. Phone composition and upstream Settings parity
+
+- [ ] 19.1 Implement compact single-checkout cards and multi-checkout disclosure using authoritative family/checkout identities; verify mixed running/stopped, missing/replaced, duplicate/long names, branch unknown/detached and refresh-stable disclosure with one Open/Start per eligible checkout. Rename and create branch/worktree belong to accessible More actions, not permanent primary card buttons; desktop grouping stays unchanged.
+- [ ] 19.2 Add focused Notifications Settings using existing enrollment/PWA owners; verify enable/disable, granted/denied/default/unsupported/install-needed/error states, device/session scope, no permission prompt until explicit intent, unchanged presence/attention behavior and exactly Hub/Settings persistent dock destinations plus contextual Return.
+- [ ] 19.3 Add separate Agent accounts Settings group and focused agent/provider/attempt pages against published capabilities/field definitions; verify OpenCode generations and Claude status, search/selection, key/login/device/code/redirect flows, conditional/secret fields, cancel/expired/failed/retry, activate/logout and unavailable agent states using existing fake-service fixtures plus real Hub routes. Verify machine-wide/all-users warning, safe redirect refusal, no echoed secrets and propagation to running workspaces. No personal or paid provider login is implied; report real-provider testing separately.
+- [ ] 19.4 Relocate the phone sharing advisory to Credentials with accessible full safety details in credential/assignment/clone flows and retain the separate Agent accounts scope warning; verify all same-UID/runtime-file/shared-agent/configuration-bypass facts, per-user advisory dismissal, persistent access to full details and consequential confirmations. Preserve desktop advisory placement and direct full-page Settings actions rather than introducing generic Settings More menus.
+
+## 20. Repository credentials and tools live adapters
+
+- [ ] 20.1 Connect SSH/OpenPGP/HTTPS and GitHub/GitLab CLI token catalog, generate/import/public-key/test/enable/disable/delete and applicable lock/unlock to existing credential APIs; verify supported-operation matrix, file/paste exclusivity and pre-read size limit, secret masking/clearing, local-vs-remote readiness and sanitized contextual errors with disposable credentials only.
+- [ ] 20.2 Connect tool saved overrides/readiness and workspace authentication/signing assignments; verify accurate current values, host normalization, no-op/omitted-role preservation, inherited child policy, unavailable credentials and credential-restart-required states. Test coordinated stop success/partial failure/cancel before catalog mutation; never infer projected provider-token users from current assignment rows.
+- [ ] 20.3 Verify credential/agent-account presentation together through focused Chromium/WebKit live-route tests and contract tests: repository credentials cannot silently become agent logins, unknown facts remain unknown, full diagnostics remain reachable, redirects/secrets cannot enter history and rejected/indeterminate writes cannot display success or auto-retry.
+
+## 21. Workspace lifecycle, onboarding, worktrees and clone
+
+- [ ] 21.1 Connect Start/Stop/Rename/Forget with existing session/registry services; verify no-assignment confirmation, inherited assignments, all-required-unlocks then one authorized Start, disabled/unavailable refusal, restart-required, Stop shell termination warning, partial results and Forget preserving files. Back/Return never starts a stopped checkout.
+- [ ] 21.2 Connect remote browsing/default folder/existing registration/create and folder maintenance; verify explicit Git-init consent, separate folder/display names, collisions/path validation, nested registrations, coordinated-stop failure, cancellation/drafts and retained-path/registration/start-failure recovery in isolated temporary repositories.
+- [ ] 21.3 Reuse upstream worktree API and operation ownership for inventory/refs/fetch/create/open/register/forget/preflight-delete/delete; adapt presentation only through the mobile task owner. Verify HTTP-200 refusals, stable checkout identity, inherited credentials, external/owned/missing/replaced paths, active sessions, dirty/untracked/ignored/local data, exact confirmations, no force bypass, branch/path collisions, operation ids and live inventory refresh. Keep single-checkout card compact and desktop dialog behavior intact.
+- [ ] 21.4 Implement owner-bound clone attempt admission/reconciliation before wiring submit; verify duplicate same-attempt returns original job, conflicting reuse is refused, concurrent requests and lost responses cannot create two jobs, fenced not-accepted cannot later execute, and pending/expired/unavailable/restart recovery never permits blind resubmission. Publish additive API/retention semantics and test legacy callers without attempt ids, auth/CSRF and cross-owner rejection through API contracts.
+- [ ] 21.5 Connect clone submit/events/replay/input/cancel to real job owners after 21.4; verify separate clone identity vs retained assignments, unlock without unauthorized submission, all prompts masked, one accepted job through detours/reload hints, lost acceptance reconciliation, disconnect/replay and cancel/finish race. Exercise success, retained checkout, failed registration/start/cleanup and expired job in isolated fixtures, preserving all authoritative partial facts.
+
+## 22. Live continuity and nonregression acceptance
+
+- [ ] 22.1 Verify live Hub A → Settings/details → A on Files/Preview/Chat/Terminal with exact DOM/client/boot identity, selected document/query/hash/surface, scroll, draft and File objects, pending upload/stream progression and terminal geometry; test hidden input isolation, late focus, Back/Forward, manage B without retargeting A, and explicit B/reload/invalidation boundaries. Use real Hub routing with deterministic test provider/PTY where needed; label doubles rather than claiming external-provider evidence.
+- [ ] 22.2 Run focused real-Hub API/auth/credential/agent-account/worktree/lifecycle tests and Chromium/WebKit browser suites plus both TypeScript projects and production build; verify frontend bundles contain no fixture/scenario/controller or privileged server modules and synthetic requests still fail closed. Keep browser suites separate from fixed-port unit runs and do not claim a blocked/partial matrix is green.
+- [ ] 22.3 Compare phone composition in light/dark, 320/390 portrait, short landscape, touch tablet, enlarged text, keyboard/safe areas and reduced preferences with agreed references; retain named before/after evidence. Recheck fine-pointer desktop/native inset, desktop Hub actions and workspace interiors/standalone against pre-integration baselines; preserve tests and record intentional phone-only differences. Actual native/physical-device checks remain explicitly untested until performed.
+- [ ] 22.4 Reconcile all task evidence, including still-open 7.1/7.4/8.3/9.6/10.4/11.4 and the broader Chat touch 11 failures and historical archive-digest mismatch; verify no golden/baseline/assertion was weakened or unrelated failure waived. Report unresolved release blockers to the lead instead of broadening fixes silently.
+
+## 23. Controlled live candidate handoff
+
+- [ ] 23.1 After sections 18–22 establish capability parity and gates, deliver the live candidate identity, endpoint/action matrix, checks/limits, rollback and separately labeled synthetic review instructions; verify every upstream capability remains reachable and no mock success can be mistaken for a live operation. Obtain version-specific acceptance under 8.3 rather than treating integration authorization as certification.
+- [ ] 23.2 Before any running-service update, have the lead confirm the exact resource scope and preserve the existing live 8445/4717 and synthetic 8446/4718 services until then; verify isolated smoke, auth gating, route/assets and rollback against the approved candidate without resetting state or credentials. No commit/push, spec sync or archive is authorized by these planning revisions.
+
+Dependency order: 17.2–17.3 is the bounded first implementation slice (read-only,
+no production mount). Section 18 supplies contracts/auth/routing; 19–20 can then
+proceed independently where their DTOs are ready. 21.1–21.3 depend on credential
+policy in 20; 21.5 depends on 21.4 and credential/onboarding adapters. Section 22
+requires all parity paths; 23 follows evidence review and explicitly scoped
+deployment. Pending historical visual tasks do not bar authorized implementation,
+but remain acceptance obligations. These are implementation stages, not a request
+to stage any Git files.
 
 ### Historical reconciliation checkpoint — 2026-09-10
 

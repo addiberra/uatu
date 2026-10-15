@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { assertOpenApiResponse, loadContract } from "../../tests/contracts/contract-harness";
-import { hashPassword, HubSessionStore, HUB_COOKIE_NAME } from "./auth";
+import { hashPassword, HubSessionStore, hubCookieName } from "./auth";
 import type { HubConfig } from "./config";
 import {
   EMPTY_RESOLVED_CREDENTIAL_CONTEXT,
@@ -178,10 +178,11 @@ async function fixture(root: string) {
       openpgp,
       tokens,
       workspaceExists: id => registry.byId(id) !== undefined,
+      policyWorkspaceId: id => registry.policyWorkspaceId(id),
     },
   });
   servers.push(server);
-  return { server, metadata, tokenStore, tokens, workspace, state, openpgp, registry, personalState, sessions, backendEvents, onboardingJournal, folderJournal };
+  return { server, metadata, tokenStore, tokens, workspace, state, openpgp, registry, personalState, sessions, backendEvents, onboarding, onboardingJournal, folderJournal };
 }
 
 async function login(origin: string, name: string, password: string): Promise<string> {
@@ -192,7 +193,7 @@ async function login(origin: string, name: string, password: string): Promise<st
   });
   expect(response.status).toBe(200);
   const sessionId = ((await response.json()) as { sessionId: string }).sessionId;
-  return `${HUB_COOKIE_NAME}=${sessionId}`;
+  return `${hubCookieName(new URL(origin))}=${sessionId}`;
 }
 
 function post(origin: string, cookie: string, endpoint: string, body: unknown, requestOrigin = origin) {
@@ -208,6 +209,13 @@ describe("credential API integration", () => {
     expect(credentialApiError(new Error("SSH credential could not be unlocked"))).toEqual({
       status: 400,
       message: "SSH credential could not be unlocked",
+    });
+  });
+
+  test("maps an unknown id to 404 even when its text overlaps a conflict shape", () => {
+    expect(credentialApiError(new Error("unknown workspace: locked-repo"))).toEqual({
+      status: 404,
+      message: "unknown workspace: locked-repo",
     });
   });
 
@@ -234,6 +242,7 @@ describe("credential API integration", () => {
       openpgp: {} as OpenPgpCredentialManager,
       tokens: {} as TokenCredentialManager,
       workspaceExists: () => false,
+      policyWorkspaceId: id => id,
       async toolsChanged() {
         const pathAtStart = activePath;
         if (pathAtStart === "/first") {
@@ -276,12 +285,19 @@ describe("credential API integration", () => {
     const response = await fetch(`${origin}/api/hub/state`, { headers: { cookie } });
     expect(response.status).toBe(200);
     await assertContract("GET", "/api/hub/state", response);
-    expect(await response.json()).toMatchObject({
+    const state = await response.json() as Record<string, unknown> & { workspaces: Record<string, unknown>[] };
+    expect(state).toMatchObject({
       workspaces: [{
         id: f.workspace.id,
         credentialAssignments: { authentication: ["Shared SSH"], signing: ["Shared SSH"] },
       }],
     });
+    // This Hub was started with no worktree service: no worktreeApi
+    // capability, no worktreeConfigureNavigation, and no per-row
+    // createWorktree fork affordance are published.
+    expect(state.worktreeApi).toBeUndefined();
+    expect(state.worktreeConfigureNavigation).toBeUndefined();
+    expect(state.workspaces[0]!.createWorktree).toBeUndefined();
   });
 
   test("reports missing tools and permits an authenticated readiness test", async () => {
@@ -695,6 +711,226 @@ describe("credential API integration", () => {
     const response = await post(origin, cookie, `/api/hub/workspaces/${f.workspace.id}/forget`, {});
     expect(response.status).toBe(200);
     expect(f.metadata.snapshot().assignments).toEqual([]);
+  });
+
+  test("legacy forget preserves a registered worktree's parent and inherited credentials", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "uatu-credential-api-"));
+    roots.push(root);
+    const f = await fixture(root);
+    const credential = await f.metadata.create({
+      name: "Parent token", type: "token", enabled: true,
+      capabilities: ["https-git"], metadata: { host: "github.com" },
+    });
+    await f.metadata.assign({ workspaceId: f.workspace.id, credentialId: credential.id, role: "authentication", host: "github.com" });
+    const child = (await f.registry.registerWithStatus(path.join(root, "linked"), "local", "feature", {
+      parentWorkspaceId: f.workspace.id, repositoryId: "repository", checkoutId: "checkout",
+    })).entry;
+    const before = f.registry.list();
+    const credentialsBefore = f.metadata.snapshot();
+    const origin = `http://127.0.0.1:${f.server.port}`;
+    const cookie = await login(origin, "alice", "alice password");
+    const stateUrl = `/s/${f.workspace.id}/api/personal-state`;
+    expect((await fetch(`${origin}${stateUrl}`, {
+      method: "PATCH", headers: { cookie, origin, "content-type": "application/json" },
+      body: JSON.stringify({ follow: false, documentPath: "README.md" }),
+    })).status).toBe(200);
+
+    const response = await post(origin, cookie, `/api/hub/workspaces/${f.workspace.id}/forget`, {});
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({ error: expect.stringContaining("worktrees") });
+    expect(f.registry.list()).toEqual(before);
+    expect(f.metadata.snapshot()).toEqual(credentialsBefore);
+    expect(await (await fetch(`${origin}${stateUrl}`, { headers: { cookie } })).json()).toMatchObject({ follow: false, documentPath: "README.md" });
+    const owner = f.registry.byId(child.id)!.worktree!.parentWorkspaceId;
+    expect(f.registry.byId(owner)).toEqual(f.workspace);
+    expect(f.metadata.snapshot().assignments).toContainEqual({ workspaceId: owner, credentialId: credential.id, role: "authentication", host: "github.com" });
+    // Refusal must not free the policy owner's slug for an unrelated folder.
+    const unrelated = await f.registry.register(path.join(root, "unrelated", path.basename(f.workspace.path)));
+    expect(unrelated.id).not.toBe(owner);
+  });
+
+  test("refuses credential assignments to a linked worktree and names its parent", async () => {
+    // Policy is resolved on the parent (main.ts: policyWorkspaceId), so a
+    // row recorded against a child id would never take effect. Both
+    // assignment routes refuse the child; the parent remains assignable.
+    const root = await mkdtemp(path.join(os.tmpdir(), "uatu-credential-api-"));
+    roots.push(root);
+    const f = await fixture(root);
+    const child = (await f.registry.registerWithStatus(path.join(root, "linked"), "local", "feature", {
+      parentWorkspaceId: f.workspace.id, repositoryId: "repository", checkoutId: "checkout",
+    })).entry;
+    const origin = `http://127.0.0.1:${f.server.port}`;
+    const cookie = await login(origin, "alice", "alice password");
+    const create = await post(origin, cookie, "/api/hub/credentials/token", {
+      name: "Parent token",
+      host: "github.com",
+      token: "parent-secret",
+      capabilities: ["https-git"],
+    });
+    const credentialId = ((await create.json()) as { credential: { id: string } }).credential.id;
+    const refusal = { error: `credentials are managed on the parent workspace ${f.workspace.id}; linked worktrees inherit them` };
+
+    const assigned = await post(origin, cookie, `/api/hub/credentials/${credentialId}/assign`, {
+      workspaceId: child.id,
+      role: "authentication",
+      host: "github.com",
+    });
+    expect(assigned.status).toBe(409);
+    await assertContract("POST", "/api/hub/credentials/{credentialId}/assign", assigned);
+    expect(await assigned.json()).toEqual(refusal);
+    const replaced = await post(origin, cookie, `/api/hub/workspaces/${child.id}/credential-assignments`, {
+      authentication: { credentialId, host: "github.com" },
+    });
+    expect(replaced.status).toBe(409);
+    await assertContract("POST", "/api/hub/workspaces/{workspaceId}/credential-assignments", replaced);
+    expect(await replaced.json()).toEqual(refusal);
+    expect(f.metadata.snapshot().assignments).toEqual([]);
+
+    const parentAssigned = await post(origin, cookie, `/api/hub/credentials/${credentialId}/assign`, {
+      workspaceId: f.workspace.id,
+      role: "authentication",
+      host: "github.com",
+    });
+    expect(parentAssigned.status).toBe(200);
+    const parentReplaced = await post(origin, cookie, `/api/hub/workspaces/${f.workspace.id}/credential-assignments`, {
+      authentication: { credentialId, host: "github.com" },
+    });
+    expect(parentReplaced.status).toBe(200);
+    expect(f.metadata.snapshot().assignments).toEqual([{ workspaceId: f.workspace.id, credentialId, role: "authentication", host: "github.com" }]);
+
+    // Removal is refused on the same terms, and refused BEFORE the stop the
+    // stop: true route would otherwise take: a child that never held the
+    // assignment must not lose its session to the attempt.
+    await f.sessions.start(child.id);
+    const unassignedChild = await post(origin, cookie, `/api/hub/credentials/${credentialId}/unassign`, {
+      workspaceId: child.id,
+      role: "authentication",
+      host: "github.com",
+      stop: true,
+    });
+    expect(unassignedChild.status).toBe(409);
+    await assertContract("POST", "/api/hub/credentials/{credentialId}/unassign", unassignedChild);
+    expect(await unassignedChild.json()).toEqual(refusal);
+    expect(f.sessions.isRunning(child.id)).toBe(true);
+    expect(f.backendEvents.stops).toEqual([]);
+    expect(f.metadata.snapshot().assignments).toHaveLength(1);
+
+    // Without stop the running-session conflict would answer first and tell
+    // the caller to stop a workspace that could never hold the assignment;
+    // the target refusal names the parent instead.
+    const unassignedRunningChild = await post(origin, cookie, `/api/hub/credentials/${credentialId}/unassign`, {
+      workspaceId: child.id,
+      role: "authentication",
+      host: "github.com",
+    });
+    expect(unassignedRunningChild.status).toBe(409);
+    await assertContract("POST", "/api/hub/credentials/{credentialId}/unassign", unassignedRunningChild);
+    expect(await unassignedRunningChild.json()).toEqual(refusal);
+    expect(f.sessions.isRunning(child.id)).toBe(true);
+    expect(f.metadata.snapshot().assignments).toHaveLength(1);
+
+    const unassignedParent = await post(origin, cookie, `/api/hub/credentials/${credentialId}/unassign`, {
+      workspaceId: f.workspace.id,
+      role: "authentication",
+      host: "github.com",
+    });
+    expect(unassignedParent.status).toBe(200);
+    expect(await unassignedParent.json()).toEqual({ removed: true });
+    expect(f.metadata.snapshot().assignments).toEqual([]);
+  });
+
+  test.each([false, true])("parent forget fences child onboarding across personal-state cleanup (reuse slug: %s)", async reuseSlug => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "uatu-credential-api-"));
+    roots.push(root);
+    const f = await fixture(root);
+    const childPath = path.join(root, "linked");
+    await mkdir(childPath);
+    const origin = `http://127.0.0.1:${f.server.port}`;
+    const cookie = await login(origin, "alice", "alice password");
+    const enteredForget = Promise.withResolvers<void>();
+    const releaseForget = Promise.withResolvers<void>();
+    const enteringCommit = Promise.withResolvers<void>();
+    const originalForget = f.personalState.forgetWorkspace.bind(f.personalState);
+    f.personalState.forgetWorkspace = async (...args) => {
+      enteredForget.resolve();
+      await releaseForget.promise;
+      const result = await originalForget(...args);
+      if (reuseSlug) await f.registry.register(path.join(root, "unrelated", "workspace"));
+      return result;
+    };
+    const originalExclusive = f.sessions.runExclusive.bind(f.sessions);
+    f.sessions.runExclusive = (id, operation) => {
+      enteringCommit.resolve();
+      return originalExclusive(id, operation);
+    };
+    const forgetting = post(origin, cookie, `/api/hub/workspaces/${f.workspace.id}/forget`, {});
+    await enteredForget.promise;
+    const registering = f.onboarding.configureWorktree({ path: childPath, displayName: "feature", link: {
+      parentWorkspaceId: f.workspace.id, repositoryId: "repository", checkoutId: "checkout",
+    } }).then(value => ({ value, error: null }), error => ({ value: null, error }));
+    try {
+      await enteringCommit.promise;
+    } finally {
+      releaseForget.resolve();
+    }
+    expect((await forgetting).status).toBe(200);
+    const registration = await registering;
+    expect(registration.error).toMatchObject({ code: reuseSlug ? "conflict" : "not-found" });
+    expect(f.registry.list().filter(entry => entry.worktree)).toEqual([]);
+    if (reuseSlug) {
+      expect(f.registry.byId(f.workspace.id)?.path).toBe(path.join(root, "unrelated", "workspace"));
+    } else {
+      expect(f.registry.list()).toEqual([]);
+    }
+  });
+
+  test("child onboarding fences parent forget before the child registration is visible", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "uatu-credential-api-"));
+    roots.push(root);
+    const f = await fixture(root);
+    const childPath = path.join(root, "z-linked");
+    await mkdir(childPath);
+    const credential = await f.metadata.create({ name: "Parent token", type: "token", enabled: true,
+      capabilities: ["https-git"], metadata: { host: "github.com" } });
+    await f.metadata.assign({ workspaceId: f.workspace.id, credentialId: credential.id, role: "authentication", host: "github.com" });
+    await f.personalState.patch("alice", f.workspace.id, { follow: false });
+    const credentialsBefore = f.metadata.snapshot();
+    const enteredChild = Promise.withResolvers<void>();
+    const releaseChild = Promise.withResolvers<void>();
+    const enteredForget = Promise.withResolvers<void>();
+    const originalExclusive = f.sessions.runExclusive.bind(f.sessions);
+    f.sessions.runExclusive = (id, operation) => originalExclusive(id, async () => {
+      if (id !== f.workspace.id) {
+        enteredChild.resolve();
+        await releaseChild.promise;
+      }
+      return operation();
+    });
+    const originalStopped = f.sessions.runWhileStopped.bind(f.sessions);
+    f.sessions.runWhileStopped = (id, operation) => {
+      const result = originalStopped(id, operation);
+      enteredForget.resolve();
+      return result;
+    };
+    const origin = `http://127.0.0.1:${f.server.port}`;
+    const cookie = await login(origin, "alice", "alice password");
+    const registering = f.onboarding.configureWorktree({ path: childPath, displayName: "feature", link: {
+      parentWorkspaceId: f.workspace.id, repositoryId: "repository", checkoutId: "checkout",
+    } });
+    await enteredChild.promise;
+    const parentBefore = f.registry.byId(f.workspace.id);
+    const forgetting = post(origin, cookie, `/api/hub/workspaces/${f.workspace.id}/forget`, {});
+    try {
+      await enteredForget.promise;
+    } finally {
+      releaseChild.resolve();
+    }
+    const child = await registering;
+    expect((await forgetting).status).toBe(409);
+    expect(f.registry.byId(f.workspace.id)).toEqual(parentBefore);
+    expect(f.registry.byId(child.entry.id)?.worktree?.parentWorkspaceId).toBe(f.workspace.id);
+    expect(f.metadata.snapshot()).toEqual(credentialsBefore);
+    expect(f.personalState.get("alice", f.workspace.id)).toMatchObject({ follow: false });
   });
 
   test("keeps credential assignments when registry removal fails", async () => {

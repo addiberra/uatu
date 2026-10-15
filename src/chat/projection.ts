@@ -14,6 +14,11 @@ export type ChatProjection = {
   status: ConversationStatus;
   olderCursor?: string;
   acceptedDrafts: AcceptedDraft[];
+  // Items the stream removed, most recent last and bounded: an acceptance
+  // answering after the stream already retired its row (a `/reload`, a 2.x
+  // placeholder the server's own row replaced) must not bring it back.
+  // A later upsert of the same id takes it off the list.
+  removedIds?: string[];
   // Server-held messages awaiting delivery, in submission order. Sourced from
   // the snapshot and restated whole by every queue event, so this is state,
   // not an accumulation.
@@ -54,8 +59,58 @@ export function projectionFromSnapshot(snapshot: ConversationSnapshot, acceptedD
 }
 
 export function prependSnapshot(current: ChatProjection, page: ConversationSnapshot): ChatProjection {
-  const existing = new Set(current.items.map(item => item.id));
-  return { ...current, items: [...page.items.filter(item => !existing.has(item.id)), ...current.items], olderCursor: page.olderCursor };
+  // Merged by time, not merely prepended: the first page can carry rows
+  // from before its own span (a subagent launcher backfilled for the cost
+  // fold), and an older page's rows must land around such a row, not
+  // wholesale ahead of it. Where both hold a row, the page's copy is kept
+  // in the page's order: parts of one message share its timestamp, and only
+  // the page that holds the whole message knows their order. The sort is
+  // stable, so ties keep that order and the older page still precedes what
+  // was already held.
+  const fromPage = new Set(page.items.map(item => item.id));
+  const items = [...page.items, ...current.items.filter(item => !fromPage.has(item.id))].sort((left, right) => left.createdAt - right.createdAt);
+  return { ...current, items, olderCursor: page.olderCursor };
+}
+
+/**
+ * A fresh first page of a conversation the reader already holds, folded in
+ * place — the silent-run re-read (design D14): the drill-down of a run that
+ * streams nothing re-reads its snapshot while it works, and the reader must
+ * see new records arrive the way live ones would, not a reload.
+ *
+ * Null when the page cannot be folded — another conversation or generation,
+ * or a page older than what the live stream already applied (the stream is
+ * ahead, and owns the view until the next read). Otherwise the page's items
+ * win where both hold one, items only the reader holds (an older page it
+ * paged in) stay, and the page's cursor, status, and summary are adopted, so
+ * the stream resumes from the page. `changed` says whether any of that
+ * differs from what the reader holds, so an identical read repaints nothing.
+ */
+export function refreshFromSnapshot(current: ChatProjection, page: ConversationSnapshot): { projection: ChatProjection; changed: boolean } | null {
+  if (page.conversation.id !== current.conversationId || page.generation !== current.generation) return null;
+  const sequence = decodeCursorSequence(page.cursor) ?? 0;
+  if (sequence < current.sequence) return null;
+  const fresh = deduplicate(page.items);
+  const fromPage = new Set(fresh.map(item => item.id));
+  const kept = current.items.filter(item => !fromPage.has(item.id));
+  const items = [...kept, ...fresh].sort((left, right) => left.createdAt - right.createdAt);
+  const held = new Map(current.items.map(item => [item.id, item]));
+  const changed = page.conversation.status !== current.status
+    || fresh.some(item => { const before = held.get(item.id); return !before || JSON.stringify(before) !== JSON.stringify(item); });
+  return {
+    projection: {
+      ...current,
+      sequence,
+      cursor: page.cursor,
+      conversation: page.conversation,
+      status: page.conversation.status,
+      items,
+      // Paging continues from what the reader already reached when it has
+      // gone past the page's own start.
+      olderCursor: kept.length > 0 ? current.olderCursor : page.olderCursor,
+    },
+    changed,
+  };
 }
 
 export function addAcceptedDraft(current: ChatProjection, draft: AcceptedDraft): ChatProjection {
@@ -114,10 +169,27 @@ export function dropQueuedMessage(current: ChatProjection, messageId: string): C
   return { ...current, queued: current.queued.filter(entry => entry.id !== messageId) };
 }
 
-export function confirmAcceptedDraft(current: ChatProjection, draft: AcceptedDraft): ChatProjection {
+const REMOVED_ID_LIMIT = 64;
+
+export function confirmAcceptedDraft(current: ChatProjection, draft: AcceptedDraft, options: { insert?: boolean } = {}): ChatProjection {
   const id = `message:${draft.messageId}`;
-  const item: ConversationItem = { id, type: "user_message", createdAt: Date.now(), text: draft.text, requestId: draft.requestId, ...(draft.attachments?.length ? { attachments: draft.attachments } : {}) };
+  // The stream retired this row before the acceptance answered, or the
+  // caller knows the row is the stream's alone to show (`insert: false`, a
+  // `/reload`, which the stream shows and retires): the draft is settled,
+  // and nothing is created.
+  const absent = current.items.findIndex(candidate => candidate.id === id) < 0;
+  if (current.removedIds?.includes(id) || (options.insert === false && absent)) {
+    return { ...current, acceptedDrafts: current.acceptedDrafts.filter(candidate => candidate.requestId !== draft.requestId) };
+  }
   const existing = current.items.findIndex(candidate => candidate.id === id);
+  // A row the stream already delivered is the server's statement of the
+  // turn, and it can differ from what was typed (a 2.x skill runs as
+  // `@<skill> <args>`): it keeps its text, gaining only what the local draft
+  // knows and it lacks. A sparse streamed row (no text yet) takes the draft.
+  const streamed = existing < 0 ? undefined : current.items[existing];
+  const item: ConversationItem = streamed?.type === "user_message" && streamed.text
+    ? { ...streamed, requestId: streamed.requestId ?? draft.requestId, ...(!streamed.attachments?.length && draft.attachments?.length ? { attachments: draft.attachments } : {}) }
+    : { id, type: "user_message", createdAt: Date.now(), text: draft.text, requestId: draft.requestId, ...(draft.attachments?.length ? { attachments: draft.attachments } : {}) };
   return {
     ...current,
     items: existing < 0 ? [...current.items, item] : current.items.map((candidate, index) => index === existing ? item : candidate),
@@ -139,13 +211,16 @@ export function applyChatEvent(current: ChatProjection, event: ChatEvent, cursor
   let queued = current.queued;
   let queueRevision = current.queueRevision;
   let configurationRevision = current.configurationRevision;
+  let removedIds = current.removedIds;
   if (event.type === "item.upsert") {
+    if (removedIds?.includes(event.item.id)) removedIds = removedIds.filter(id => id !== event.item.id);
     const index = items.findIndex(item => item.id === event.item.id);
     const existing = index < 0 ? undefined : items[index];
     const incoming = mergeUpsert(existing, event.item);
     items = index < 0 ? insertInConversationOrder(items, incoming) : items.map((item, at) => at === index ? incoming : item);
   } else if (event.type === "item.remove") {
     items = items.filter(item => item.id !== event.itemId);
+    removedIds = [...(removedIds ?? []).filter(id => id !== event.itemId), event.itemId].slice(-REMOVED_ID_LIMIT);
   } else if (event.type === "item.text_delta") {
     items = items.map(item => item.id === event.itemId ? appendDelta(item, event.delta) : item);
   } else if (event.type === "conversation.status") {
@@ -173,6 +248,7 @@ export function applyChatEvent(current: ChatProjection, event: ChatEvent, cursor
       queued,
       queueRevision,
       configurationRevision,
+      ...(removedIds ? { removedIds } : {}),
       acceptedDrafts: reconcileDrafts(current.acceptedDrafts, items, queued),
     },
     outcome: "applied",

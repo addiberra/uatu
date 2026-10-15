@@ -28,6 +28,13 @@ export type SessionsStoppedResult<T> =
   | { status: "completed"; value: T }
   | { status: "needs-stop"; workspaceIds: string[] };
 
+// A workspace's child came up or went away. Fired after the running map
+// changed, so a listener that reads `get()`/`isRunning()` sees the new
+// state. Consumers: the live broker (reopen upstreams on a restart rather
+// than at the next backoff tick; report a stopped workspace at once).
+export type SessionChange = { workspaceId: string; running: boolean };
+export type SessionChangeListener = (change: SessionChange) => void;
+
 export class SessionManager {
   private readonly running = new Map<string, RunningSession>();
   // Published at CALL time — before the operation even reaches the front of
@@ -52,6 +59,7 @@ export class SessionManager {
   private readonly lifecycle = new Map<string, Promise<unknown>>();
   private readonly runningCredentialRevisions = new Map<string, string>();
   private readonly runningCredentialIds = new Map<string, Set<string>>();
+  private readonly changeListeners = new Set<SessionChangeListener>();
 
   constructor(
     private readonly registry: WorkspaceRegistry,
@@ -61,7 +69,10 @@ export class SessionManager {
     // operation (see start()). Injected rather than imported because the
     // folder manager that owns the recovery journal takes this manager as a
     // dependency and is therefore assembled after it.
-    private readonly assertStartAllowed?: () => Promise<void>,
+    // Receives the workspace being started, so a per-workspace precondition
+    // (a worktree whose checkout went missing or was replaced) is checked
+    // under the same queue.
+    private readonly assertStartAllowed?: (workspaceId: string) => Promise<void>,
   ) {}
 
   get(workspaceId: string): RunningSession | undefined {
@@ -81,6 +92,25 @@ export class SessionManager {
 
   runningIds(): string[] {
     return [...this.running.keys()];
+  }
+
+  // Subscribes to start/stop transitions; returns the unsubscribe. A
+  // listener that throws cannot break a lifecycle operation.
+  onChange(listener: SessionChangeListener): () => void {
+    this.changeListeners.add(listener);
+    return () => {
+      this.changeListeners.delete(listener);
+    };
+  }
+
+  private notifyChange(workspaceId: string, running: boolean): void {
+    for (const listener of [...this.changeListeners]) {
+      try {
+        listener({ workspaceId, running });
+      } catch {
+        // Observers never fail the operation they observe.
+      }
+    }
   }
 
   runningWorkspaceIdsUsingCredential(credentialId: string): string[] {
@@ -249,7 +279,7 @@ export class SessionManager {
       // cleanup unregisters, which is itself fenced while recovery is
       // pending). Skipped for a caller that already owns this queue from an
       // earlier fence of its own — see startWhileLifecycleQueueHeld.
-      if (fencePendingMutation) await this.assertStartAllowed?.();
+      if (fencePendingMutation) await this.assertStartAllowed?.(workspaceId);
 
       let workspace: WorkspaceEntry;
       let session: RunningSession;
@@ -295,8 +325,10 @@ export class SessionManager {
           this.running.delete(workspace.id);
           this.runningCredentialRevisions.delete(workspace.id);
           this.runningCredentialIds.delete(workspace.id);
+          this.notifyChange(workspace.id, false);
         }
       });
+      this.notifyChange(workspace.id, true);
       return session;
     } finally {
       const remaining = (this.lifecycleHeldStarts.get(workspaceId) ?? 1) - 1;
@@ -328,6 +360,7 @@ export class SessionManager {
     this.running.delete(workspaceId);
     this.runningCredentialRevisions.delete(workspaceId);
     this.runningCredentialIds.delete(workspaceId);
+    this.notifyChange(workspaceId, false);
     return true;
   }
 

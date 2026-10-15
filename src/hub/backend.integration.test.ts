@@ -61,10 +61,31 @@ describe("LocalProcessBackend", () => {
       await session.stop();
       const exitCode = await session.exited;
       // SIGTERM produces a clean shutdown (exit 0) via the CLI's handler.
-      expect(exitCode === 0 || exitCode === null).toBe(true);
+      // (A signal death would report 128 + the signal, e.g. 143 or 137.)
+      expect([0, null]).toContain(exitCode);
 
       // The endpoint is really gone.
       await expect(fetch(`${base}/s/backend-test/api/state`)).rejects.toThrow();
+    },
+    60_000,
+  );
+
+  test(
+    "a SIGTERM straight after the ready URL takes the clean shutdown path",
+    async () => {
+      // The URL line is the ready signal; the hub may stop the session the
+      // moment it has read it. The child must already have its SIGTERM
+      // handler installed then — otherwise Bun's default action kills it
+      // (exit 143) and the detached OpenCode child is orphaned.
+      const workspace = await makeWorkspace();
+      const backend = new LocalProcessBackend({ uatuArgv: ["bun", "run", CLI_PATH] });
+      const session = await backend.start(
+        { id: "backend-early-stop", path: workspace, backend: "local", displayName: "backend-early-stop" },
+        "/s/backend-early-stop/",
+        EMPTY_RESOLVED_CREDENTIAL_CONTEXT,
+      );
+      await session.stop();
+      expect([0, null]).toContain(await session.exited);
     },
     60_000,
   );

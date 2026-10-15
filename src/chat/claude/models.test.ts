@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { CLAUDE_MODELS, CLAUDE_MORE_MODELS, MORE_MODELS_GROUP, versionedModelName, withMoreModels } from "./models";
+import { CLAUDE_MODELS, CLAUDE_MORE_MODELS, MORE_MODELS_GROUP, claudeContextWindow, moreModelDetail, versionedModelName, windowLabel, withMoreModels } from "./models";
 import type { ChatModel } from "../types";
 
 describe("More models (D3)", () => {
@@ -53,5 +53,46 @@ describe("versioned model names (D2)", () => {
     expect(versionedModelName("Sonnet 4.6", "Sonnet 4.6 · older", "claude-sonnet-4-6")).toBe("Sonnet 4.6");
     // Nothing states a version: the display name stands rather than a guess.
     expect(versionedModelName("Mystery", "Mystery · no version anywhere", "mystery-model")).toBe("Mystery");
+  });
+});
+
+describe("window labels", () => {
+  test("a window above 1M is stated in millions, not collapsed to 1M", () => {
+    expect(windowLabel(200_000)).toBe("200k");
+    expect(windowLabel(1_000_000)).toBe("1M");
+    expect(windowLabel(2_000_000)).toBe("2M");
+    expect(windowLabel(2_500_000)).toBe("2.5M");
+    expect(moreModelDetail("claude-x", 2_000_000)).toBe("claude-x · 2M context · offered by the Claude apps");
+  });
+});
+
+describe("catalog windows (#347)", () => {
+  test("an unknown model has no invented context limit", () => {
+    expect(claudeContextWindow("claude-unknown-99")).toBeUndefined();
+  });
+  test("a window marker means 1M; a known plain id takes an estimate; the rest is unknown", () => {
+    expect(claudeContextWindow("opus[1m]", "claude-opus-5[1m]")).toBe(1_000_000);
+    expect(claudeContextWindow("claude-fable-5-1[1m]")).toBe(1_000_000);
+    // Opus 5 runs the enlarged window on its plain id: the alias row the
+    // CLI offers as "opus" must not be pinned to 200k.
+    expect(claudeContextWindow("opus", "claude-opus-5")).toBe(1_000_000);
+    expect(claudeContextWindow("claude-opus-4-8")).toBe(1_000_000);
+    expect(claudeContextWindow("sonnet", "claude-sonnet-5")).toBe(1_000_000);
+    expect(claudeContextWindow("claude-sonnet-5", "claude-sonnet-5")).toBe(1_000_000);
+    expect(claudeContextWindow("sonnet", "claude-sonnet-5-5")).toBe(1_000_000);
+    expect(claudeContextWindow("opus", "claude-opus-5-5")).toBe(1_000_000);
+    expect(claudeContextWindow("claude-opus-4-7")).toBe(1_000_000);
+    expect(claudeContextWindow("claude-sonnet-4-6")).toBe(200_000);
+    expect(claudeContextWindow("haiku", "claude-haiku-4-5-20251001")).toBe(200_000);
+    expect(claudeContextWindow("claude-opus-4-6")).toBe(200_000);
+    expect(claudeContextWindow("claude-mystery-9")).toBeUndefined();
+  });
+
+  test("the default sentinel speaks only through what it resolves to", () => {
+    expect(claudeContextWindow("default", "claude-opus-5[1m]")).toBe(1_000_000);
+    expect(claudeContextWindow("default", "claude-opus-5")).toBe(1_000_000);
+    expect(claudeContextWindow("default", "claude-sonnet-5-5")).toBe(1_000_000);
+    expect(claudeContextWindow("default", "claude-haiku-4-5-20251001")).toBe(200_000);
+    expect(claudeContextWindow("default", undefined)).toBeUndefined();
   });
 });

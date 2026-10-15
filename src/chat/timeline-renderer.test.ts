@@ -1,14 +1,21 @@
 import { beforeAll, describe, expect, test } from "bun:test";
 import { parseHTML } from "linkedom";
 import type { ChatProjection } from "./projection";
-import type { ConversationItem } from "./types";
+import { RATE_LIMIT_ITEM_ID, type ConversationItem, type TokenUsage, type ToolItem } from "./types";
 
 const dom = parseHTML("<!doctype html><html><body><div id=\"items\"></div></body></html>");
 beforeAll(() => {
   (globalThis as Record<string, unknown>).document = dom.document;
 });
 
-const { QueueDockRenderer, RevertedMessagesDockRenderer, TimelineRenderer, materializeChatActivity, awaitingFirstResponse, formatElapsed, subagentEntries, workingLabel } = await import("./timeline-renderer");
+// An accepted draft is being sent now, so it opens today's separator; the
+// ordering tests around drafts look past it.
+const withoutDays = (host: Element) => Array.from(host.children).filter(child => !child.classList.contains("chat-day-separator"));
+
+const { QueueDockRenderer, RevertedMessagesDockRenderer, TimelineRenderer, materializeChatActivity, awaitingFirstResponse, formatElapsed, permissionCallArguments, subagentEntries, subagentLabel, workingLabel } = await import("./timeline-renderer");
+// The track's one-line summary reads the same entries, so what the entries
+// say about a running run is checked where the entries are built.
+const { subagentTrackSummary } = await import("./receipt-view");
 
 test("closed activity defers its body and find materializes current sanitized content", () => {
   const previousFilter = Reflect.get(globalThis, "NodeFilter");
@@ -47,6 +54,217 @@ function projectionWith(items: ConversationItem[], overrides: Partial<ChatProjec
     ...overrides,
   };
 }
+
+describe("persistent shell rendering", () => {
+  for (const input of ["wheel", "touch", "keyboard", "scrollbar", "untouched", "closed"]) test(`${input} inspection controls row and group completion`, () => {
+    const oldRequest = globalThis.requestAnimationFrame, oldCancel = globalThis.cancelAnimationFrame;
+    const frames = new Map<number, FrameRequestCallback>(); let sequence = 0, time = 0;
+    globalThis.requestAnimationFrame = callback => { frames.set(++sequence, callback); return sequence; };
+    globalThis.cancelAnimationFrame = id => { frames.delete(id); };
+    const flush = () => { const callbacks = [...frames.values()]; frames.clear(); time += 16; callbacks.forEach(callback => callback(time)); };
+    const renderer = new TimelineRenderer();
+    try {
+      const target = dom.document.createElement("div") as unknown as HTMLElement, expanded = new Set<string>();
+      const item: ConversationItem = { id: "shell", type: "command", command: "test", createdAt: 1, status: "running", output: "output" };
+      const siblings: ConversationItem[] = [1, 2].map(n => ({ id: `reason-${n}`, type: "reasoning", text: "thought", createdAt: 1, status: "completed" }));
+      renderer.render(target, projectionWith([item, ...siblings]), expanded);
+      const shell = renderer.getShellOutput(item.id)!, row = target.querySelector('[data-chat-item-id="shell"]')!;
+      const group = row.closest(".chat-activity-group")!;
+      Object.assign(shell.viewport, { scrollTop: 0, scrollLeft: 0, scrollHeight: 2000, clientHeight: 240 }); flush();
+      const fire = (type: string, props: Record<string, unknown>) => {
+        const event = new dom.window.Event(type, { bubbles: true }); Object.assign(event, props); shell.viewport.dispatchEvent(event);
+      };
+      if (input === "closed") for (const node of [row, group]) { node.removeAttribute("open"); node.removeAttribute("data-auto-open"); node.setAttribute("data-reader-closed", ""); }
+      if (input === "wheel" || input === "closed") fire("wheel", { deltaY: -4 });
+      else if (input === "keyboard") fire("keydown", { key: "ArrowUp" });
+      else if (input === "touch") { fire("touchstart", { touches: [{ clientY: 100 }] }); fire("touchmove", { touches: [{ clientY: 104 }] }); }
+      if (input !== "untouched") { shell.viewport.scrollTop -= 4; shell.scroll.observe(); }
+      expect(shell.readerOpened).toBe(input !== "untouched");
+      renderer.render(target, projectionWith([{ ...item, status: "completed" }, ...siblings], { status: "idle" }), expanded); flush();
+      const staysOpen = input !== "untouched" && input !== "closed";
+      expect(row.hasAttribute("open")).toBe(staysOpen);
+      expect(row.closest(".chat-activity-group")!.hasAttribute("open")).toBe(staysOpen);
+    } finally { renderer.reset(); globalThis.requestAnimationFrame = oldRequest; globalThis.cancelAnimationFrame = oldCancel; }
+  });
+  test("renderer hide/restore after Home leaves the first downward arrival free to resume shell following", () => {
+    const oldRequest = globalThis.requestAnimationFrame, oldCancel = globalThis.cancelAnimationFrame;
+    const frames = new Map<number, FrameRequestCallback>(); let sequence = 0, time = 0;
+    globalThis.requestAnimationFrame = callback => { frames.set(++sequence, callback); return sequence; };
+    globalThis.cancelAnimationFrame = id => { frames.delete(id); };
+    const flush = () => { const callbacks = [...frames.values()]; frames.clear(); time += 16; callbacks.forEach(callback => callback(time)); };
+    const renderer = new TimelineRenderer();
+    try {
+      const target = dom.document.createElement("div") as unknown as HTMLElement;
+      const item: ConversationItem = { id: "shell", type: "command", command: "test", createdAt: 1, status: "running", output: "output" };
+      renderer.render(target, projectionWith([item]), new Set());
+      const controller = renderer.getShellOutput(item.id)!;
+      Object.assign(controller.viewport, { scrollTop: 0, scrollLeft: 0, scrollHeight: 2000, clientHeight: 240, scrollWidth: 500, clientWidth: 500 }); flush();
+      const home = new dom.window.Event("keydown", { cancelable: true }); Object.assign(home, { key: "Home" }); controller.viewport.dispatchEvent(home); flush();
+      renderer.setShellOutputsHidden(true);
+      renderer.render(target, projectionWith([item]), new Set());
+      renderer.setShellOutputsHidden(false); flush(); controller.scroll.observe();
+      expect(controller.scroll.following).toBe(false);
+      const wheel = new dom.window.Event("wheel"); Object.assign(wheel, { deltaY: 2000 }); controller.viewport.dispatchEvent(wheel);
+      controller.viewport.scrollTop = 1760; controller.scroll.observe();
+      expect(controller.scroll.following).toBe(true);
+    } finally { renderer.reset(); globalThis.requestAnimationFrame = oldRequest; globalThis.cancelAnimationFrame = oldCancel; }
+  });
+  test("unrelated assistant updates do not paint or mutate retained shell bodies; renames still propagate", async () => {
+    const renderer = new TimelineRenderer(); renderer.conversationTitle = "Original title";
+    const target = dom.document.createElement("div") as unknown as HTMLElement;
+    const items: ConversationItem[] = Array.from({ length: 60 }, (_, index) => ({
+      id: `completed:${index}`, type: "tool", name: "Bash", status: "completed", createdAt: index + 1,
+      input: JSON.stringify({ command: `command ${index}`, description: `description ${index}` }), output: `output ${index}`,
+    }));
+    const assistant: ConversationItem = { id: "answer", type: "assistant_message", markdown: "Initial", createdAt: 100 };
+    renderer.render(target, projectionWith([...items, assistant]), new Set());
+    let paints = 0;
+    const commands = items.map(item => {
+      const controller = renderer.getShellOutput(item.id)!;
+      const update = controller.buffer.update.bind(controller.buffer);
+      controller.buffer.update = snapshot => { paints++; return update(snapshot); };
+      return controller.command.firstChild;
+    });
+    const mutations: MutationRecord[] = [];
+    const observer = new dom.window.MutationObserver(records => mutations.push(...records as unknown as MutationRecord[]));
+    for (const item of items) observer.observe(renderer.getShellOutput(item.id)!.element, { subtree: true, attributes: true, childList: true, characterData: true });
+    for (let index = 0; index < 10; index++) {
+      renderer.setShellOutputsHidden(false);
+      renderer.render(target, projectionWith([...items, { ...assistant, markdown: `Append ${index}` }]), new Set());
+    }
+    await Promise.resolve();
+    expect(paints).toBe(0); expect(mutations).toHaveLength(0);
+    for (const [index, item] of items.entries()) expect(renderer.getShellOutput(item.id)!.command.firstChild).toBe(commands[index]!);
+    renderer.conversationTitle = "Renamed conversation";
+    renderer.render(target, projectionWith([...items, assistant]), new Set());
+    expect(paints).toBe(items.length);
+    for (const item of items) expect(renderer.getShellOutput(item.id)!.metadata.conversation).toBe("Renamed conversation");
+    await Promise.resolve(); expect(mutations).toHaveLength(0);
+    observer.disconnect(); renderer.reset();
+  });
+
+  test("same-identity shell fast path respects reader close and inspection before regrouping", () => {
+    const renderer = new TimelineRenderer(); const expanded = new Set<string>();
+    const target = dom.document.createElement("div") as unknown as HTMLElement;
+    const item: ConversationItem = { id: "command", type: "command", command: "test", status: "running", output: "output", createdAt: 1 };
+    renderer.render(target, projectionWith([item]), expanded);
+    const row = target.querySelector('[data-chat-item-id="command"]')!;
+    row.removeAttribute("open"); row.removeAttribute("data-auto-open"); row.setAttribute("data-reader-closed", "");
+    renderer.render(target, projectionWith([item]), expanded);
+    expect(row.hasAttribute("open")).toBe(false);
+    renderer.getShellOutput(item.id)!.inspect();
+    renderer.render(target, projectionWith([item]), expanded);
+    expect(row.hasAttribute("open")).toBe(true);
+    expect(row.closest(".chat-activity-group")!.hasAttribute("open")).toBe(true);
+    renderer.reset();
+  });
+  test("navigation through a null projection retains per-conversation item presentation; explicit reset evicts", () => {
+    const renderer = new TimelineRenderer();
+    const target = dom.document.createElement("div") as unknown as HTMLElement;
+    const item: ConversationItem = { id: "shared-id", type: "command", command: "test", createdAt: 1, status: "completed", output: "line" };
+    renderer.render(target, projectionWith([item]), new Set());
+    const a = renderer.getShellOutput(item.id)!;
+    a.setInlineHeight(360); a.floatingGeometry = { x: 70, y: 40, width: 800, height: 400 }; a.scroll.following = false;
+    renderer.render(target, null, new Set());
+    expect(a.element.parentElement).toBeNull();
+    renderer.render(target, projectionWith([item], { conversationId: "c2" }), new Set());
+    const b = renderer.getShellOutput(item.id)!;
+    expect(b.inlineHeight).toBe(240); expect(b.floatingGeometry).toBeUndefined();
+    b.setInlineHeight(300); b.floatingGeometry = { x: 20, y: 30, width: 400, height: 200 };
+    renderer.reset(true);
+    renderer.render(target, projectionWith([item]), new Set());
+    const restored = renderer.getShellOutput(item.id)!;
+    expect(restored).not.toBe(a); expect(restored.inlineHeight).toBe(360);
+    expect(restored.floatingGeometry).toEqual(a.floatingGeometry); expect(restored.scroll.following).toBe(false);
+    expect(restored.scroll.unseen).toBe(false);
+    expect(target.querySelector('[data-chat-item-id="shared-id"]')!.hasAttribute("open")).toBe(true);
+    renderer.render(target, projectionWith([item], { conversationId: "c2" }), new Set());
+    expect(renderer.getShellOutput(item.id)!.floatingGeometry).toEqual(b.floatingGeometry);
+    renderer.reset(); renderer.render(target, projectionWith([item]), new Set());
+    expect(renderer.getShellOutput(item.id)!.inlineHeight).toBe(240); expect(renderer.getShellOutput(item.id)!.floatingGeometry).toBeUndefined();
+    renderer.reset();
+  });
+  for (const shape of ["command", "bash"] as const) {
+    const shellItem = (status: "pending" | "running" | "completed" | "failed", output = "first\nlast"): ConversationItem => shape === "command"
+      ? { id: "shell", type: "command", command: "bun test", createdAt: 1, status, output }
+      : { id: "shell", type: "tool", name: "bash", input: JSON.stringify({ command: "bun test", description: "Run tests" }), createdAt: 1, status, output, ...(status === "failed" ? { error: "\x1b[31mseparate error\x1b[0m" } : {}) };
+
+    test(`${shape}: lazy materialization uses the latest snapshot and remains persistent through regrouping`, () => {
+      const renderer = new TimelineRenderer(); renderer.deferClosedActivity = true; renderer.conversationTitle = "Review";
+      const target = dom.document.createElement("div") as unknown as HTMLElement;
+      const expanded = new Set<string>();
+      renderer.render(target, projectionWith([shellItem("completed", "stale")], { status: "idle" }), expanded);
+      const row = target.querySelector('[data-chat-item-id="shell"]')!;
+      expect(row.hasAttribute("data-chat-lazy")).toBe(true); expect(renderer.getShellOutput("shell")).toBeUndefined();
+      renderer.render(target, projectionWith([shellItem("failed", "current")], { status: "idle" }), expanded);
+      expect(target.querySelector('[data-chat-item-id="shell"]')).toBe(row);
+      materializeChatActivity(target);
+      const controller = renderer.getShellOutput("shell")!;
+      expect(controller.viewport.textContent).toContain("current"); expect(controller.viewport.textContent).not.toContain("stale");
+      expect(controller.metadata.conversation).toBe("Review"); expect(controller.metadata.completedAt).toBeUndefined();
+      if (shape === "bash") { expect(controller.error.textContent).toBe("separate error"); expect(controller.description.textContent).toBe("Run tests"); }
+      controller.setInlineHeight(320);
+      const viewport = controller.viewport;
+      const siblings: ConversationItem[] = [1, 2].map(n => ({ id: `reason-${n}`, type: "reasoning", text: "thought", createdAt: 1, status: "completed" }));
+      renderer.render(target, projectionWith([shellItem("failed", "current\nmore"), ...siblings], { status: "idle" }), expanded);
+      expect(renderer.getShellOutput("shell")!.viewport).toBe(viewport);
+      expect(row.closest(".chat-activity-group")!.hasAttribute("open")).toBe(true);
+      expect(row.hasAttribute("open")).toBe(true); expect(row.hasAttribute("data-auto-open")).toBe(false);
+      expect(expanded.has("group:shell")).toBe(true);
+      row.removeAttribute("open"); row.setAttribute("data-reader-closed", "");
+      renderer.render(target, projectionWith([shellItem("failed", "current\nmore\nend"), ...siblings], { status: "idle" }), expanded);
+      expect(row.hasAttribute("open")).toBe(false);
+      renderer.reset(); expect(renderer.getShellOutput("shell")).toBeUndefined();
+    });
+
+    test(`${shape}: auto-open closes on completion but explicit reader-close survives streaming`, () => {
+      const renderer = new TimelineRenderer();
+      const target = dom.document.createElement("div") as unknown as HTMLElement;
+      renderer.render(target, projectionWith([shellItem("running")]), new Set());
+      const row = target.querySelector('[data-chat-item-id="shell"]')!;
+      expect(row.hasAttribute("data-auto-open")).toBe(true);
+      const viewport = renderer.getShellOutput("shell")!.viewport;
+      renderer.render(target, projectionWith([shellItem("completed")], { status: "idle" }), new Set());
+      expect(row.hasAttribute("open")).toBe(false); expect(renderer.getShellOutput("shell")!.viewport).toBe(viewport);
+      row.setAttribute("data-reader-closed", "");
+      renderer.render(target, projectionWith([shellItem("running", "new output")]), new Set());
+      expect(row.hasAttribute("open")).toBe(false);
+      renderer.reset();
+    });
+  }
+
+  test("hidden renderer shells reconcile current output on return and dispose on removal or conversation reset", () => {
+    const renderer = new TimelineRenderer();
+    const target = dom.document.createElement("div") as unknown as HTMLElement;
+    const item: ConversationItem = { id: "shell", type: "command", command: "x", createdAt: 1, status: "pending", output: "before" };
+    renderer.render(target, projectionWith([item]), new Set());
+    const controller = renderer.getShellOutput("shell")!;
+    expect(controller.metadata.status).toBe("pending");
+    renderer.setShellOutputsHidden(true);
+    renderer.render(target, projectionWith([{ ...item, status: "completed", output: "after" }]), new Set());
+    expect(controller.viewport.textContent).toContain("before");
+    renderer.setShellOutputsHidden(false); expect(controller.viewport.textContent).toContain("after");
+    renderer.render(target, projectionWith([]), new Set());
+    expect(renderer.getShellOutput("shell")).toBeUndefined(); expect(controller.element.parentElement).toBeNull();
+    renderer.render(target, projectionWith([item]), new Set());
+    renderer.render(target, projectionWith([item], { conversationId: "other" }), new Set());
+    expect(renderer.getShellOutput("shell")!.conversationId).toBe("other");
+    expect(renderer.getShellOutput("shell")!.inlineHeight).toBe(240);
+    renderer.reset();
+  });
+
+  test("a pending tool gaining shell input replaces its former generic body once", () => {
+    const renderer = new TimelineRenderer();
+    const target = dom.document.createElement("div") as unknown as HTMLElement;
+    const item: ConversationItem = { id: "shell", type: "tool", name: "bash", createdAt: 1, status: "pending", input: "{}", output: "before" };
+    renderer.render(target, projectionWith([item]), new Set());
+    renderer.render(target, projectionWith([{ ...item, input: '{"command":"bun test"}', status: "running", output: "current" }]), new Set());
+    expect(target.querySelectorAll(".chat-shell-viewport")).toHaveLength(1);
+    expect(target.textContent).not.toContain("before");
+    expect(target.textContent).toContain("current");
+    renderer.reset();
+  });
+});
 
 function target(): HTMLElement {
   const node = dom.document.createElement("div");
@@ -388,7 +606,7 @@ describe("activity grouping", () => {
     const renderer = new TimelineRenderer();
     const host = target();
     renderer.render(host, projectionWith([], { status: "sending", acceptedDrafts: [{ requestId: "r1", messageId: "pending:r1", text: "go" }] }), new Set());
-    expect(Array.from(host.children).map(child => child.getAttribute("data-chat-item-id") ?? child.className)).toEqual(["draft-r1", "chat-item chat-activity-group is-awaiting"]);
+    expect(withoutDays(host).map(child => child.getAttribute("data-chat-item-id") ?? child.className)).toEqual(["draft-r1", "chat-item chat-activity-group is-awaiting"]);
   });
 
   test("a previous turn's trailing run is not the live tail while the new prompt is only a draft", () => {
@@ -400,7 +618,7 @@ describe("activity grouping", () => {
     // gets the one working line, in its awaiting form.
     const draft = { requestId: "r2", messageId: "pending:r2", text: "again" };
     renderer.render(host, projectionWith([user, tool("a"), tool("b"), tool("c")], { status: "sending", acceptedDrafts: [draft] }), new Set(), true, false, Date.now() - 1_000);
-    expect(Array.from(host.children).map(child => child.getAttribute("data-chat-item-id") ?? child.className))
+    expect(withoutDays(host).map(child => child.getAttribute("data-chat-item-id") ?? child.className))
       .toEqual(["message:u1", "group:tool:a", "draft-r2", "chat-item chat-activity-group is-awaiting"]);
     const working = host.querySelectorAll("[data-working-since]");
     expect(working).toHaveLength(1);
@@ -416,7 +634,7 @@ describe("activity grouping", () => {
     const host = target();
     const draft = { requestId: "r2", messageId: "pending:r2", text: "again" };
     renderer.render(host, projectionWith([user, tool("a"), tool("b")], { status: "sending", acceptedDrafts: [draft] }), new Set());
-    expect(Array.from(host.children).map(child => child.getAttribute("data-chat-item-id") ?? child.className))
+    expect(withoutDays(host).map(child => child.getAttribute("data-chat-item-id") ?? child.className))
       .toEqual(["message:u1", "tool:a", "tool:b", "draft-r2", "chat-item chat-activity-group is-awaiting"]);
   });
 
@@ -508,6 +726,97 @@ describe("activity grouping", () => {
     const host = target();
     renderer.render(host, projectionWith([user, tool("a"), tool("b"), tool("c"), answer], { status: "idle" }), new Set(["group:tool:a"]));
     expect(host.querySelector('[data-chat-item-id="group:tool:a"]')!.hasAttribute("open")).toBe(true);
+  });
+
+  // OpenCode reports every touched path as a file-change row — one per file
+  // on each message's snapshot, one per output path of an edit — so an edit
+  // turn arrives as read · edit · update · read · edit · update. The rows
+  // are activity: they join the run around them instead of ending it.
+  describe("file-change rows", () => {
+    const changed = (path: string, operation: "create" | "update" | "delete" = "update"): ConversationItem => ({ id: `file:${path}`, type: "file_change", createdAt: 1, path, operation });
+    const edit = (path: string, status: "running" | "completed" = "completed"): ConversationItem => ({ id: `tool:edit:${path}`, type: "tool", createdAt: 1, name: "edit", status, input: JSON.stringify({ filePath: path, oldString: "a", newString: "b" }) });
+    const ids = (host: HTMLElement) => Array.from(host.children).map(child => child.getAttribute("data-chat-item-id"));
+
+    test("a file-change row joins the finished run around it", () => {
+      const renderer = new TimelineRenderer();
+      const host = target();
+      renderer.render(host, projectionWith([user, tool("a"), changed("a.ts"), tool("b"), tool("c"), answer], { status: "idle" }), new Set());
+      expect(ids(host)).toEqual(["message:u1", "group:tool:a", "part:a1"]);
+      const group = host.querySelector('[data-chat-item-id="group:tool:a"]')!;
+      expect(group.querySelector(".chat-group-count")!.textContent).toBe("4 steps");
+      expect(group.getAttribute("data-outcome")).toBe("clean");
+      expect(group.querySelector(".chat-group-outcome")!.textContent).toBe("");
+      expect(Array.from(group.querySelectorAll(".chat-group-items > [data-chat-item-id]")).map(node => node.getAttribute("data-chat-item-id")))
+        .toEqual(["tool:a", "file:a.ts", "tool:b", "tool:c"]);
+      expect(group.querySelector('.chat-group-items .chat-file-change[data-chat-item-id="file:a.ts"]')).not.toBeNull();
+    });
+
+    test("a file-change row stays inside the working line", () => {
+      const renderer = new TimelineRenderer();
+      const host = target();
+      renderer.render(host, projectionWith([user, edit("a.ts"), changed("a.ts"), tool("b", "running")], { status: "running" }), new Set(), true, false, Date.now() - 5_000);
+      expect(ids(host)).toEqual(["message:u1", "group:tool:edit:a.ts"]);
+      const line = host.querySelector(".chat-activity-group")!;
+      expect(line.getAttribute("data-outcome")).toBe("live");
+      // The step in flight, not the file the last Edit wrote.
+      expect(line.querySelector(".chat-activity-subject")!.textContent).toBe("Read b.ts");
+      expect(line.querySelectorAll(".chat-group-items > [data-chat-item-id]")).toHaveLength(3);
+    });
+
+    test("a lone file-change row renders flat", () => {
+      const renderer = new TimelineRenderer();
+      const host = target();
+      const first: ConversationItem = { id: "part:a0", type: "assistant_message", createdAt: 2, markdown: "Saved." };
+      renderer.render(host, projectionWith([user, first, changed("a.ts"), answer], { status: "idle" }), new Set());
+      expect(host.querySelector(".chat-activity-group")).toBeNull();
+      expect(ids(host)).toEqual(["message:u1", "part:a0", "file:a.ts", "part:a1"]);
+      expect(host.querySelector(':scope > .chat-file-change[data-chat-item-id="file:a.ts"]')).not.toBeNull();
+    });
+
+    test("the row says the word its summary counts it under", () => {
+      const renderer = new TimelineRenderer();
+      const host = target();
+      // Flat and as a member, the row reads "Updated a.ts" — the summary's
+      // word, never the raw operation name.
+      renderer.render(host, projectionWith([user, changed("a.ts"), answer, changed("b.ts", "create"), changed("c.ts"), changed("d.ts", "delete")], { status: "idle" }), new Set());
+      const flat = host.querySelector(':scope > .chat-file-change[data-chat-item-id="file:a.ts"]')!;
+      expect(flat.textContent!.replace(/\s+/g, " ").trim()).toBe("Updated a.ts");
+      const members = Array.from(host.querySelectorAll(".chat-group-items .chat-file-change")).map(node => node.textContent!.replace(/\s+/g, " ").trim());
+      expect(members).toEqual(["Created b.ts", "Updated c.ts", "Deleted d.ts"]);
+      expect(host.querySelector(".chat-activity-subject")!.textContent).toBe("Created · Updated · Deleted");
+    });
+
+    test("the summary counts file changes after the steps it names", () => {
+      const renderer = new TimelineRenderer();
+      const host = target();
+      renderer.render(host, projectionWith([user, edit("foo.ts"), changed("foo.ts"), edit("bar.ts"), changed("bar.ts"), tool("baz"), answer], { status: "idle" }), new Set());
+      const group = host.querySelector(".chat-activity-group")!;
+      // The named slots go to the tools; "Updated foo.ts" would name the file
+      // the Edit before it already named.
+      expect(group.querySelector(".chat-activity-subject")!.textContent).toBe("Edit foo.ts · Edit bar.ts · Read baz.ts · Updated ×2");
+      expect(group.querySelector(".chat-group-count")!.textContent).toBe("5 steps");
+    });
+
+    test("the summary names each operation", () => {
+      const renderer = new TimelineRenderer();
+      const host = target();
+      renderer.render(host, projectionWith([user, changed("a.ts", "create"), changed("b.ts"), changed("c.ts", "delete"), answer], { status: "idle" }), new Set());
+      const group = host.querySelector(".chat-activity-group")!;
+      expect(ids(host)).toEqual(["message:u1", "group:file:a.ts", "part:a1"]);
+      expect(group.querySelector(".chat-activity-subject")!.textContent).toBe("Created · Updated · Deleted");
+      renderer.render(host, projectionWith([user, changed("a.ts"), changed("b.ts"), changed("c.ts"), answer], { status: "idle" }), new Set());
+      expect(host.querySelector(".chat-activity-subject")!.textContent).toBe("Updated ×3");
+    });
+
+    test("the working line names the last step, not the file row after it", () => {
+      const renderer = new TimelineRenderer();
+      const host = target();
+      renderer.render(host, projectionWith([user, edit("a.ts"), changed("a.ts")], { status: "running" }), new Set(), true, false, Date.now() - 5_000);
+      expect(host.querySelector(".chat-activity-subject")!.textContent).toBe("Edit a.ts");
+      // A tail of nothing but file rows has only a file row to name.
+      renderer.render(host, projectionWith([user, changed("a.ts"), changed("b.ts")], { status: "running" }), new Set(), true, false, Date.now() - 5_000);
+      expect(host.querySelector(".chat-activity-subject")!.textContent).toBe("Updated b.ts");
+    });
   });
 });
 
@@ -841,6 +1150,46 @@ describe("subagent entries", () => {
     expect(entry).not.toHaveProperty("usage");
   });
 
+  test("a running subagent takes its child id and progress note from the task that runs it", () => {
+    // The launching row learns its child only from the tool result, at the
+    // end; the background task names it from the start edge, keyed by the
+    // tool use that launched it.
+    const running: ConversationItem = {
+      id: "task:ada2b", type: "background_task", createdAt: 2, taskId: "ada2b", description: "Review renderer", taskType: "local_agent",
+      toolUseId: "d", status: "running", childConversationId: "sub:parent:ada2b", progress: "Reading the renderer tests", subagentType: "explore",
+    };
+    const [entry] = subagentEntries([task("d", { status: "running" }), running]);
+    expect(entry).toEqual({ id: "tool:d", description: "Review renderer", subagent: "explore", status: "running", conversationId: "sub:parent:ada2b", progress: "Reading the renderer tests" });
+    // Once the row has its own child id it is the one that counts; a settled
+    // task no longer supplies a progress note.
+    const [settled] = subagentEntries([task("d", { childConversationId: "sub:parent:ada2b" }), { ...running, status: "completed", summary: "done" }]);
+    expect(settled).toEqual({ id: "tool:d", description: "Review renderer", subagent: "explore", status: "completed", conversationId: "sub:parent:ada2b" });
+    expect(settled).not.toHaveProperty("progress");
+    // A task launched by some other tool use says nothing about this row.
+    const [unrelated] = subagentEntries([task("d", { status: "running" }), { ...running, toolUseId: "other" }]);
+    expect(unrelated).not.toHaveProperty("conversationId");
+    expect(unrelated).not.toHaveProperty("progress");
+  });
+
+  test("a backgrounded subagent reads as running while its task runs, though its launching row completed at launch", () => {
+    // The async AgentOutput arrives with `status: "async_launched"`, so the
+    // launching row is `completed` seconds into a run that may last minutes.
+    // Read from the row alone the track would announce the live run finished.
+    const running: ConversationItem = {
+      id: "task:ada2b9582caa230c5", type: "background_task", createdAt: 2, taskId: "ada2b9582caa230c5", description: "Review renderer",
+      taskType: "local_agent", toolUseId: "e", status: "running", childConversationId: "sub:parent:ada2b9582caa230c5",
+      progress: "Counting files in the working tree", subagentType: "general-purpose",
+    };
+    const launched = task("e", { status: "completed", childConversationId: "sub:parent:ada2b9582caa230c5", output: "Async agent launched successfully." });
+    const [entry] = subagentEntries([launched, running]);
+    expect(entry).toEqual(expect.objectContaining({ id: "tool:e", status: "running", conversationId: "sub:parent:ada2b9582caa230c5", progress: "Counting files in the working tree" }));
+    expect(subagentTrackSummary(subagentEntries([launched, running]))).toBe("1 of 1 subagent working · Review renderer");
+    // Once the task settles the row speaks for itself again.
+    const [settled] = subagentEntries([launched, { ...running, status: "completed", summary: "done" }]);
+    expect(settled.status).toBe("completed");
+    expect(settled).not.toHaveProperty("progress");
+  });
+
   test("a long completed report renders spanning Markdown once behind a visual bound", () => {
     const renderer = new TimelineRenderer();
     const host = target();
@@ -854,6 +1203,89 @@ describe("subagent entries", () => {
     const more = host.querySelector(".chat-subagent-result .chat-output-more") as HTMLDetailsElement;
     expect(more.querySelector(".chat-report-expand")?.textContent).toBe("Show full report");
     expect(more.hasAttribute("open")).toBe(false);
+  });
+
+  // A skill Claude Code ran as a fork is a conversation of its own, offered
+  // from its launching row as well as from the track (design D10).
+  test("a forked skill's row offers its transcript", () => {
+    const childId = "sub:parent:aaeeab292f002e3d7";
+    const skill: ConversationItem = {
+      id: "tool:toolu_skill", type: "tool", createdAt: 1, name: "Skill", status: "completed",
+      input: JSON.stringify({ skill: "code-review" }), output: "Based on my analysis...", childConversationId: childId,
+    };
+    const host = target();
+    new TimelineRenderer().render(host, projectionWith([skill]), new Set(["tool:toolu_skill"]));
+    expect(host.querySelector<HTMLButtonElement>("[data-open-conversation]")?.dataset.openConversation).toBe(childId);
+    expect(host.textContent).toContain("Based on my analysis...");
+    // A fork still running has no id yet: the row reads as it always has.
+    const running = target();
+    new TimelineRenderer().render(running, projectionWith([{ ...skill, status: "running", output: undefined, childConversationId: undefined }]), new Set(["tool:toolu_skill"]));
+    expect(running.querySelector("[data-open-conversation]")).toBeNull();
+    // And where subagents are unsupported, no navigation is offered at all.
+    const unsupported = target();
+    new TimelineRenderer().render(unsupported, projectionWith([skill]), new Set(["tool:toolu_skill"]), false);
+    expect(unsupported.querySelector("[data-open-conversation]")).toBeNull();
+  });
+
+  // A fork emits no task edge and names itself only when it ends, so while it
+  // runs these entries are the only thing that says the conversation is
+  // working at all (GitHub #385: "/code-review appears as if very little or
+  // nothing is happening").
+  describe("a forked skill", () => {
+    const skill = (extra: Partial<ToolItem> = {}): ConversationItem => ({
+      id: "tool:toolu_skill", type: "tool", createdAt: 1, name: "Skill", status: "running",
+      input: JSON.stringify({ skill: "code-review" }), ...extra,
+    });
+    const forkTool = (id: string, createdAt: number, input: Record<string, unknown>, name = "Bash"): ConversationItem =>
+      ({ id: `tool:${id}`, type: "tool", createdAt, name, status: "completed", input: JSON.stringify(input) });
+
+    test("is listed as work in progress while it runs, named by its skill and with nothing to open", () => {
+      const [entry, ...rest] = subagentEntries([skill(), forkTool("diff", 2, { command: "git diff HEAD" })]);
+      expect(rest).toEqual([]);
+      expect(entry).toEqual({ id: "tool:toolu_skill", description: "code-review", status: "running", kind: "fork", progress: "Bash · git diff HEAD" });
+      expect(entry).not.toHaveProperty("conversationId");
+      expect(subagentLabel(entry!)).toBe("Skill · code-review");
+      // The latest row wins: the note is what the fork is doing now.
+      const [later] = subagentEntries([skill(), forkTool("diff", 2, { command: "git diff HEAD" }), forkTool("read", 3, { path: "src/chat/ui.ts" }, "Read")]);
+      expect(later?.progress).toBe("Read · src/chat/ui.ts");
+    });
+
+    test("takes no note from a tool the parent started in the same frame as the skill", () => {
+      // Tool uses that share an assistant frame run alongside each other, and
+      // share its timestamp; only what arrives strictly later can be the
+      // fork's own work.
+      const [entry] = subagentEntries([skill(), forkTool("sibling", 1, { command: "git status" })]);
+      expect(entry).not.toHaveProperty("progress");
+    });
+
+    test("becomes openable, keeping its place in the track, once the result names the run", () => {
+      const childId = "sub:parent:aaeeab292f002e3d7";
+      const items = [skill({ status: "completed", output: "Based on my analysis...", childConversationId: childId }), forkTool("diff", 2, { command: "git diff HEAD" })];
+      const [entry] = subagentEntries(items);
+      expect(entry).toEqual({ id: "tool:toolu_skill", description: "code-review", status: "completed", kind: "fork", conversationId: childId });
+      // A settled run no longer says what it is doing, as a settled agent
+      // task does not either.
+      expect(entry).not.toHaveProperty("progress");
+      expect(subagentTrackSummary(subagentEntries(items))).toBe("1 subagent finished");
+    });
+
+    test("leaves no entry when the skill was only loaded and never forked", () => {
+      // An ordinary skill load settles naming no child: nothing ran, so
+      // nothing is listed as having run.
+      expect(subagentEntries([skill({ status: "completed", output: "Skill loaded." })])).toEqual([]);
+      // And a fork's tool rows that follow it belong to no run of its own.
+      expect(subagentEntries([skill({ status: "completed" }), forkTool("diff", 2, { command: "git diff HEAD" })])).toEqual([]);
+    });
+
+    test("reads alongside a running agent in the track's summary", () => {
+      const agent: ConversationItem = {
+        id: "tool:toolu_task", type: "tool", createdAt: 3, name: "task", status: "running",
+        input: JSON.stringify({ description: "Review renderer", subagent_type: "explore", prompt: "go" }),
+      };
+      const entries = subagentEntries([skill(), forkTool("diff", 2, { command: "git diff HEAD" }), agent]);
+      expect(entries.map(entry => subagentLabel(entry))).toEqual(["Skill · code-review", "explore · Review renderer"]);
+      expect(subagentTrackSummary(entries)).toBe("2 of 2 subagents working · code-review");
+    });
   });
 
   test("a task keeps its report but hides transcript navigation when subagents are unsupported", () => {
@@ -1030,12 +1462,103 @@ describe("recalled memory rows and coded notices", () => {
   test("a coded notice carries its code for the surface to react to", () => {
     const renderer = new TimelineRenderer();
     const host = target();
-    renderer.render(host, projectionWith([{ id: "notice:rl", type: "notice", createdAt: 1, level: "error", message: "Rate limit reached for your 5-hour window.", code: "rate-limit-rejected", resetsAt: 1_788_400_000_000 }]), new Set());
-    const notice = host.querySelector('[data-chat-item-id="notice:rl"]')!;
-    expect(notice.getAttribute("data-notice-code")).toBe("rate-limit-rejected");
-    // The reset time is the reader's clock, appended where the notice shows.
-    expect(notice.textContent).toMatch(/^Rate limit reached for your 5-hour window\. Resets \d.*\.$/);
+    renderer.render(host, projectionWith([{ id: "notice:fb", type: "notice", createdAt: 1, level: "warning", message: "claude-opus-5 declined this request; the turn continues on claude-sonnet-4-5.", code: "refusal-fallback" }]), new Set());
+    const notice = host.querySelector('[data-chat-item-id="notice:fb"]')!;
+    expect(notice.getAttribute("data-notice-code")).toBe("refusal-fallback");
+    expect(notice.getAttribute("role")).toBe("status");
+  });
+
+  test("a login failure names the agent, keeps its words, and offers the way to log in", () => {
+    const renderer = new TimelineRenderer();
+    const host = target();
+    const failure: ConversationItem = { id: "notice:login:1", type: "notice", createdAt: 1, level: "error", code: "login-failed", message: "Not logged in · Please run /login" };
+    renderer.loginAction = { agentName: "Claude Code", href: "/settings#agent-accounts/claude", command: "claude auth login" };
+    renderer.render(host, projectionWith([failure]), new Set());
+    const notice = host.querySelector('[data-chat-item-id="notice:login:1"]')!;
     expect(notice.getAttribute("role")).toBe("alert");
+    expect(notice.querySelector(".chat-login-failed-title")?.textContent).toBe("Claude Code login failed");
+    expect(notice.querySelector(".chat-login-failed-detail")?.textContent).toBe("Not logged in · Please run /login");
+    expect(notice.querySelector("a.chat-login-link")?.getAttribute("href")).toBe("/settings#agent-accounts/claude");
+    expect(notice.querySelector("a.chat-login-link")?.textContent).toBe("Log in to Claude Code");
+    // Outside a Hub there is no Settings page: the agent's own command.
+    renderer.loginAction = { agentName: "Claude Code", href: null, command: "claude auth login" };
+    renderer.render(host, projectionWith([failure]), new Set());
+    expect(host.querySelector(".chat-login-failed a")).toBeNull();
+    expect(host.querySelector(".chat-login-command code")?.textContent).toBe("claude auth login");
+  });
+
+  test("a rate-limit standing is data for the composer, never a row", () => {
+    const renderer = new TimelineRenderer();
+    const host = target();
+    const standing = (code: string, level: "warning" | "error"): ConversationItem =>
+      ({ id: RATE_LIMIT_ITEM_ID, type: "notice", createdAt: 1, level, message: "Approaching your 7-day rate limit (77% used).", code, resetsAt: 1_788_400_000_000 });
+    for (const item of [standing("rate-limit-warning", "warning"), standing("rate-limit-rejected", "error")]) {
+      renderer.render(host, projectionWith([item]), new Set());
+      expect(host.querySelector(`[data-chat-item-id="${RATE_LIMIT_ITEM_ID}"]`)).toBeNull();
+      expect(host.querySelectorAll(".chat-item")).toHaveLength(0);
+    }
+  });
+
+  test("a rate-limit-adjacent notice is still a row", () => {
+    const renderer = new TimelineRenderer();
+    const host = target();
+    // Only the two coded standings are data. Anything else keeps its row,
+    // whatever its code begins with.
+    renderer.render(host, projectionWith([{ id: "notice:policy", type: "notice", createdAt: 1, level: "info", message: "Your plan's rate limits changed.", code: "rate-limit-policy-changed" }]), new Set());
+    expect(host.querySelector('[data-chat-item-id="notice:policy"]')).not.toBeNull();
+  });
+
+  test("a filtered standing between two tool calls does not split their group", () => {
+    const renderer = new TimelineRenderer();
+    const host = target();
+    const tool = (n: number): ConversationItem => ({ id: `tool:${n}`, type: "tool", createdAt: n, name: "Read", status: "completed", input: JSON.stringify({ file_path: `${n}.ts` }), output: "x" });
+    renderer.render(host, projectionWith([
+      tool(1),
+      tool(2),
+      { id: RATE_LIMIT_ITEM_ID, type: "notice", createdAt: 3, level: "warning", message: "Approaching your 7-day rate limit (77% used).", code: "rate-limit-warning" },
+      tool(4),
+    ], { status: "completed" }), new Set());
+    // One group holding all three calls: the standing is filtered before
+    // grouping, so it cannot break a finished run apart.
+    const groups = host.querySelectorAll(".chat-activity-group");
+    expect(groups).toHaveLength(1);
+    expect([...groups[0]!.querySelectorAll(".chat-group-items [data-chat-item-id]")].map(node => node.getAttribute("data-chat-item-id")))
+      .toEqual(["tool:1", "tool:2", "tool:4"]);
+  });
+});
+
+// Design D13: the run a typed command launches has no launching row; its
+// own foreground row is what lists it with the subagents.
+describe("a foreground run row", () => {
+  const review = (status: "running" | "completed" | "stopped"): ConversationItem => ({
+    id: "task:ad53ca64bd188affb", type: "background_task", createdAt: 5, taskId: "ad53ca64bd188affb", description: "/code-review",
+    taskType: "local_agent", status, subagentType: "general-purpose", childConversationId: "sub:parent:ad53ca64bd188affb", foreground: true,
+    ...(status === "running" ? {} : { summary: "/code-review" }),
+  });
+  const typed: ConversationItem = { id: "message:u1", type: "user_message", createdAt: 1, text: "/code-review low" };
+
+  test("is listed as its own entry, named by the command and openable, running while its row runs", () => {
+    const entries = subagentEntries([typed, review("running")]);
+    expect(entries).toEqual([{ id: "task:ad53ca64bd188affb", description: "/code-review", status: "running", conversationId: "sub:parent:ad53ca64bd188affb" }]);
+    expect(subagentLabel(entries[0]!)).toBe("/code-review");
+    expect(subagentTrackSummary(entries)).toBe("1 of 1 subagent working · /code-review");
+    // Settled, it stays listed and openable, as a finished subagent does.
+    expect(subagentEntries([typed, review("completed")])).toEqual([expect.objectContaining({ status: "completed", conversationId: "sub:parent:ad53ca64bd188affb" })]);
+  });
+
+  test("keeps its place among the conversation's other runs", () => {
+    const agent: ConversationItem = { id: "tool:a", type: "tool", createdAt: 9, name: "task", status: "running", input: JSON.stringify({ description: "Explore", prompt: "p", subagent_type: "explore" }) };
+    expect(subagentEntries([typed, review("running"), agent]).map(entry => entry.id)).toEqual(["task:ad53ca64bd188affb", "tool:a"]);
+  });
+
+  test("adds no timeline row, running or settled: the command's output is the record", () => {
+    const renderer = new TimelineRenderer();
+    for (const status of ["running", "completed", "stopped"] as const) {
+      const host = target();
+      renderer.render(host, projectionWith([typed, review(status)], { status: "completed" }), new Set());
+      expect(host.querySelector('[data-chat-item-id="task:ad53ca64bd188affb"]')).toBeNull();
+      expect(host.querySelector('[data-chat-item-id="message:u1"]')).not.toBeNull();
+    }
   });
 });
 
@@ -1084,6 +1607,97 @@ describe("background task rows and tool elapsed time", () => {
   });
 });
 
+describe("scheduled wakeup rows and wakeup turns", () => {
+  const fireAt = new Date(2026, 8, 24, 20, 3).getTime();
+  const row = (status: "pending" | "fired" | "cancelled" | "paused" | "lost", extra: Partial<ConversationItem> = {}): ConversationItem => ({
+    id: "wakeup:w1", type: "scheduled_wakeup", createdAt: 1, wakeupId: "w1", prompt: "check the build", recurring: false, schedule: "3 20 * * *",
+    ...(status === "pending" ? { nextFireAt: fireAt } : {}), status, ...extra,
+  } as ConversationItem);
+  const render = (items: ConversationItem[], status: "scheduled" | "completed" | "running" = "completed") => {
+    const renderer = new TimelineRenderer();
+    const host = target();
+    renderer.render(host, projectionWith(items, { status }), new Set());
+    return host;
+  };
+
+  test("a pending wakeup is a timeline row with its prompt and fire time", () => {
+    const host = render([row("pending")], "scheduled");
+    const node = host.querySelector('[data-chat-item-id="wakeup:w1"]')!;
+    const time = "20:03";
+    expect(node.className).toContain("chat-wakeup is-pending");
+    expect(node.querySelector(".chat-wakeup-label")?.textContent).toContain(`Wakeup scheduled · about ${time}`);
+    expect(node.querySelector(".chat-wakeup-subject")?.textContent).toBe("check the build");
+    expect(node.querySelector("[data-chat-jump]")).toBeNull();
+  });
+
+  test("a recurring wakeup says so and names its next fire", () => {
+    const host = render([row("pending", { id: "wakeup:c1", wakeupId: "c1", recurring: true, schedule: "*/5 * * * *" } as never)], "scheduled");
+    expect(host.querySelector('[data-chat-item-id="wakeup:c1"] .chat-wakeup-label')?.textContent).toMatch(/^Recurring wakeup scheduled · next about /);
+  });
+
+  test("a fired wakeup links the turn it started", () => {
+    const host = render([row("fired", { firedTurnId: "message:wakeup:p1" } as never)]);
+    const node = host.querySelector('[data-chat-item-id="wakeup:w1"]')!;
+    expect(node.className).toContain("is-fired");
+    expect(node.querySelector(".chat-wakeup-label")?.textContent).toBe("Wakeup fired");
+    expect(node.querySelector("[data-chat-jump]")?.getAttribute("data-chat-jump")).toBe("message:wakeup:p1");
+  });
+
+  test("cancelled and lost wakeups read as such; a lost one carries its reason", () => {
+    const cancelled = render([row("cancelled")]).querySelector('[data-chat-item-id="wakeup:w1"]')!;
+    expect(cancelled.querySelector(".chat-wakeup-label")?.textContent).toBe("Wakeup cancelled");
+    expect(cancelled.querySelector(".chat-wakeup-message")).toBeNull();
+    const lost = render([row("lost", { message: "The agent's schedule did not survive its session." } as never)]).querySelector('[data-chat-item-id="wakeup:w1"]')!;
+    expect(lost.className).toContain("is-lost");
+    expect(lost.querySelector(".chat-wakeup-label")?.textContent).toBe("Wakeup lost");
+    expect(lost.querySelector(".chat-wakeup-message")?.textContent).toBe("The agent's schedule did not survive its session.");
+  });
+
+  test("the scheduling call is its own row: what was scheduled, when, with which prompt", () => {
+    const host = render([
+      { id: "tool:w", type: "tool", createdAt: 1, name: "ScheduleWakeup", status: "completed", input: JSON.stringify({ delaySeconds: 60, reason: "waiting on CI", prompt: "check the build" }), output: "Next wakeup scheduled for 20:03:00." },
+      { id: "tool:c", type: "tool", createdAt: 2, name: "CronCreate", status: "completed", input: JSON.stringify({ cron: "*/5 * * * *", prompt: "poll the queue", recurring: true }), output: "Scheduled recurring job c1." },
+    ].map(item => item as ConversationItem));
+    const wakeup = host.querySelector('[data-chat-item-id="tool:w"]')!;
+    expect(wakeup.querySelector("summary > span")?.textContent).toBe("Schedule wakeup");
+    expect(wakeup.querySelector(".chat-activity-subject")?.textContent).toBe("in 1 min");
+    const cron = host.querySelector('[data-chat-item-id="tool:c"]')!;
+    expect(cron.querySelector("summary > span")?.textContent).toBe("Schedule task");
+    expect(cron.querySelector(".chat-activity-subject")?.textContent).toBe("every */5 * * * *");
+    const opened = render([{ id: "tool:c", type: "tool", createdAt: 2, name: "CronCreate", status: "running", input: JSON.stringify({ cron: "*/5 * * * *", prompt: "poll the queue" }) } as ConversationItem]);
+    expect(opened.querySelector('[data-chat-item-id="tool:c"] .chat-tool-command')?.textContent).toBe("poll the queue");
+    expect(opened.querySelector('[data-chat-item-id="tool:c"] .chat-tool-meta')?.textContent).toBe("Repeats on */5 * * * *");
+  });
+
+  test("a paused cron reads as paused with its notice, and a durable call is not promised to survive", () => {
+    const paused = render([row("paused", { recurring: true, message: "Paused: the agent's session ended. Claude Code restores this schedule when the conversation runs again." } as never)]).querySelector('[data-chat-item-id="wakeup:w1"]')!;
+    expect(paused.className).toContain("is-paused");
+    expect(paused.querySelector(".chat-wakeup-label")?.textContent).toBe("Recurring wakeup paused");
+    expect(paused.querySelector(".chat-wakeup-message")?.textContent).toContain("restores this schedule");
+    const durable = render([{ id: "tool:d", type: "tool", createdAt: 1, name: "CronCreate", status: "running", input: JSON.stringify({ cron: "0 9 * * *", prompt: "standup", durable: true }) } as ConversationItem]);
+    expect(durable.textContent).not.toContain("restarts");
+  });
+
+  test("a wakeup turn opens with a wakeup header, never a user bubble, and points back at its wakeup", () => {
+    const host = render([
+      row("fired", { firedTurnId: "message:wakeup:p1" } as never),
+      { id: "message:wakeup:p1", type: "user_message", createdAt: 2, text: "check the build", origin: "wakeup", wakeupId: "w1" },
+      { id: "a1", type: "assistant_message", createdAt: 3, markdown: "Build is green.", completedAt: 4 },
+    ]);
+    const header = host.querySelector('[data-chat-item-id="message:wakeup:p1"]')!;
+    expect(header.className).toContain("chat-wakeup-turn");
+    expect(header.className).not.toContain("chat-user-message");
+    expect(header.querySelector(".chat-wakeup-turn-label")?.textContent).toBe("Wakeup");
+    expect(header.querySelector(".chat-wakeup-turn-prompt")?.textContent).toBe("check the build");
+    expect(header.querySelector("[data-chat-jump]")?.getAttribute("data-chat-jump")).toBe("wakeup:w1");
+    expect(host.querySelectorAll(".chat-user-message")).toHaveLength(0);
+    // Without a known wakeup the header still names the origin, with no link.
+    const unattributed = render([{ id: "message:wakeup:p2", type: "user_message", createdAt: 2, text: "continue", origin: "wakeup" }]);
+    expect(unattributed.querySelector(".chat-wakeup-turn [data-chat-jump]")).toBeNull();
+    expect(unattributed.querySelector(".chat-wakeup-turn-label")?.textContent).toBe("Wakeup");
+  });
+});
+
 describe("compaction markers and context reports", () => {
   const tool = (id: string, createdAt: number): ConversationItem => ({ id, type: "tool", createdAt, name: "Bash", status: "completed", input: JSON.stringify({ command: `echo ${id}` }), output: id });
 
@@ -1116,10 +1730,12 @@ describe("compaction markers and context reports", () => {
     renderer.render(host, projectionWith([
       tool("tool:a", 1),
       { id: "context:report:1", type: "context_report", createdAt: 2, total: 9_697, max: 1_000_000 },
+      { id: "window:1", type: "context_window", createdAt: 2, model: { providerId: "anthropic", modelId: "opus" }, limit: 1_000_000, window: { source: "session", freshness: "current" } },
       tool("tool:b", 3),
       tool("tool:c", 4),
     ], { status: "completed" }), new Set());
     expect(host.querySelector('[data-chat-item-id="context:report:1"]')).toBeNull();
+    expect(host.querySelector('[data-chat-item-id="window:1"]')).toBeNull();
     expect(host.querySelectorAll(".chat-activity-group")).toHaveLength(1);
   });
 });
@@ -1217,6 +1833,117 @@ describe("permission choices state the authority they grant", () => {
     renderer.permissionScopeNote = "Something else entirely.";
     renderer.render(host, projectionWith([permission]), new Set());
     expect(host.querySelector(".chat-request-scope")!.textContent).toBe("Something else entirely.");
+  });
+
+  test("the confirmation stage shows the agent's pattern apart from the resource, then Confirm and Cancel", () => {
+    const renderer = new TimelineRenderer();
+    renderer.permissionScopeNote = "“Allow always” also covers later conversations, and similar requests — until OpenCode restarts.";
+    const host = target();
+    const shell: ConversationItem = { ...permission, action: "bash", resources: ["git status --short"], alwaysPatterns: ["git status *"] };
+    renderer.render(host, projectionWith([shell]), new Set());
+    // Not confirming: the generic pair, no stage.
+    expect(host.querySelector("[data-permission-confirming]")).toBeNull();
+    expect(host.querySelector('[data-permission-outcome="approved-session"]')).not.toBeNull();
+
+    renderer.confirming.add(shell.id);
+    renderer.render(host, projectionWith([shell]), new Set());
+    const stage = host.querySelector("[data-permission-confirming]")!;
+    expect(stage).not.toBeNull();
+    // The agent's pattern, not the command, is what will be allowed, and
+    // the command stays listed above it, apart from the pattern list.
+    expect([...stage.querySelectorAll(".chat-request-always code")].map(code => code.textContent)).toEqual(["git status *"]);
+    expect([...host.querySelectorAll("[data-chat-item-id] > ul > li code")].map(code => code.textContent)).toEqual(["git status --short"]);
+    expect(stage.querySelector(".chat-request-confirm-action")!.textContent).toBe("bash");
+    // Entries are called standing permissions, not match patterns: under
+    // Claude Code one can be a mode switch or a withdrawn directory.
+    expect(stage.querySelector(".chat-request-confirm-lead")!.textContent).toContain("standing permissions");
+    expect(stage.querySelector(".chat-request-confirm-lead")!.textContent).not.toContain("matching");
+    expect(stage.querySelector(".chat-request-scope")!.textContent).toContain("until OpenCode restarts");
+    expect(stage.querySelector("[data-permission-confirm]")!.textContent).toBe("Confirm");
+    expect(stage.querySelector("[data-permission-cancel]")!.textContent).toBe("Cancel");
+    // The generic pair is gone while confirming: nothing here replies.
+    expect(host.querySelector("[data-permission-outcome]")).toBeNull();
+
+    // Leaving the stage brings the pair back.
+    renderer.confirming.delete(shell.id);
+    renderer.render(host, projectionWith([shell]), new Set());
+    expect(host.querySelector("[data-permission-confirming]")).toBeNull();
+    expect(host.querySelector('[data-permission-outcome="approved-session"]')).not.toBeNull();
+  });
+
+  test("a sole wildcard names the whole permission; no pattern is said plainly", () => {
+    const renderer = new TimelineRenderer();
+    const host = target();
+    const wildcard: ConversationItem = { ...permission, action: "webfetch", alwaysPatterns: ["*"] };
+    // A card enters the stage after it has painted, never before.
+    renderer.render(host, projectionWith([wildcard]), new Set());
+    renderer.confirming.add(wildcard.id);
+    renderer.render(host, projectionWith([wildcard]), new Set());
+    const lead = host.querySelector(".chat-request-confirm-lead")!.textContent!;
+    expect(lead).toContain("every");
+    expect(lead).toContain("not only this one");
+    expect(host.querySelector(".chat-request-confirm-action")!.textContent).toBe("webfetch");
+    expect(host.querySelector(".chat-request-always")).toBeNull();
+
+    const stageFor = (item: ConversationItem) => {
+      const bare = new TimelineRenderer();
+      bare.permissionScopeNote = "“Allow always” also covers similar requests for the rest of this turn.";
+      const bareHost = target();
+      bare.render(bareHost, projectionWith([item]), new Set());
+      bare.confirming.add(item.id);
+      bare.render(bareHost, projectionWith([item]), new Set());
+      return bareHost.querySelector<HTMLElement>("[data-permission-confirming]")!;
+    };
+    // Explicitly empty: nothing reusable is installed, so no lifetime
+    // sentence, which would contradict the line above it.
+    const empty = stageFor({ ...permission, alwaysPatterns: [] });
+    expect(empty.querySelector(".chat-request-confirm-lead")!.textContent).toContain("only this request");
+    expect(empty.querySelector(".chat-request-always")).toBeNull();
+    expect(empty.querySelector(".chat-request-scope")).toBeNull();
+    // Absent: the agent did not say, which is not the same as nothing. The
+    // stage says so and keeps the lifetime sentence, and never claims
+    // "only this request".
+    const unknown = stageFor(permission);
+    expect(unknown.querySelector(".chat-request-confirm-lead")!.textContent).toContain("did not report");
+    expect(unknown.textContent).not.toContain("only this request");
+    expect(unknown.querySelector(".chat-request-always")).toBeNull();
+    expect(unknown.querySelector(".chat-request-scope")).not.toBeNull();
+  });
+
+  test("a card with agent intents never enters the stage, and a resolved or queued card leaves it", () => {
+    const renderer = new TimelineRenderer();
+    const host = target();
+    const choices: ConversationItem = { ...permission, choices: [{ id: "implement", label: "Approve" }] };
+    renderer.render(host, projectionWith([choices]), new Set());
+    renderer.confirming.add(choices.id);
+    renderer.render(host, projectionWith([choices]), new Set());
+    expect(host.querySelector("[data-permission-confirming]")).toBeNull();
+    expect(host.querySelector("[data-permission-choice]")).not.toBeNull();
+
+    renderer.confirming.add(permission.id);
+    renderer.render(host, projectionWith([{ ...permission, status: "resolved", outcome: "approved-session" }]), new Set());
+    expect(renderer.confirming.has(permission.id)).toBe(false);
+    expect(host.querySelector("[data-permission-confirming]")).toBeNull();
+    expect(host.querySelector(".chat-request-trace")!.textContent).toBe("Allowed always");
+
+    // Queued behind a newer request: not answerable, so not confirming.
+    renderer.confirming.add(permission.id);
+    renderer.render(host, projectionWith([permission, { ...permission, id: "permission:p2", requestId: "p2", createdAt: 4 }]), new Set());
+    expect(renderer.confirming.has(permission.id)).toBe(false);
+  });
+
+  test("switching conversations drops an open confirmation, so a reused id cannot inherit it", () => {
+    const renderer = new TimelineRenderer();
+    const host = target();
+    renderer.render(host, projectionWith([permission]), new Set());
+    renderer.confirming.add(permission.id);
+    renderer.render(host, projectionWith([permission]), new Set());
+    expect(host.querySelector("[data-permission-confirming]")).not.toBeNull();
+    // Another conversation with the same request id starts at its choices.
+    renderer.render(host, { ...projectionWith([permission]), conversationId: "elsewhere" }, new Set());
+    expect(renderer.confirming.size).toBe(0);
+    expect(host.querySelector("[data-permission-confirming]")).toBeNull();
+    expect(host.querySelector('[data-permission-outcome="approved-session"]')).not.toBeNull();
   });
 
   test("an agent that declares no scope sentence gets no scope line, not another agent's", () => {
@@ -1538,6 +2265,91 @@ describe("tool output is streamed live and bounded when finished", () => {
     expect(more.textContent).toContain("line 30");
   });
 
+  test("a shell command's output is terminal text: escapes render, a redrawn line counts once", () => {
+    const renderer = new TimelineRenderer();
+    const host = target();
+    // Thirteen lines once the progress line has been redrawn in place; as raw
+    // bytes it is many more, and shown raw the colours are bracket codes.
+    const output = `\x1b[32mpass\x1b[0m one\n${Array.from({ length: 11 }, (_, i) => `line ${i + 2}`).join("\n")}\n` + "Downloading  10%\rDownloading  55%\rDownloading 100%";
+    const bash = (status: "running" | "completed"): ConversationItem => ({ id: "tool:sh", type: "tool", createdAt: 1, name: "bash", status, input: JSON.stringify({ command: "bun test" }), output });
+    renderer.render(host, projectionWith([bash("running")]), new Set());
+    const stream = host.querySelector(".chat-shell-viewport")!;
+    expect(stream.classList.contains("chat-tool-terminal")).toBe(true);
+    expect(stream.querySelectorAll(".chat-shell-line")).toHaveLength(13);
+    expect(host.querySelector(".chat-output-elided")).toBeNull();
+    expect(stream.textContent).toContain("pass one");
+    expect(stream.textContent).toContain("line 2");
+    expect(stream.textContent).toContain("Downloading 100%");
+    expect(stream.textContent).not.toContain("55%");
+
+    renderer.render(host, projectionWith([bash("completed")]), new Set());
+    expect(host.querySelector(".chat-tool-stream")).toBeNull();
+    expect(host.querySelector(".chat-output-more")).toBeNull();
+    expect(host.querySelector(".chat-shell-viewport")).toBe(stream);
+    expect(stream.textContent).toContain("Downloading 100%");
+    expect(host.querySelector("pre.chat-tool-terminal .ansi-fg-2")!.textContent).toBe("pass");
+  });
+
+  test("a subagent's row states its cost once the child reported a price", () => {
+    const renderer = new TimelineRenderer();
+    const host = target();
+    const agent = (usage?: TokenUsage): ConversationItem => ({ id: "tool:ag", type: "tool", createdAt: 1, name: "task", status: "completed", input: JSON.stringify({ description: "Review renderer", subagent_type: "explore" }), childConversationId: "child", ...(usage ? { usage } : {}) });
+    renderer.render(host, projectionWith([agent({ input: 10, costUsd: 0 })]), new Set());
+    expect(host.querySelector('[data-chat-item-id="tool:ag"] .chat-activity-subject')!.textContent).toBe("explore · Review renderer");
+    renderer.render(host, projectionWith([agent({ input: 10, costUsd: 0.13 })]), new Set());
+    expect(host.querySelector('[data-chat-item-id="tool:ag"] .chat-activity-subject')!.textContent).toBe("explore · Review renderer · $0.13");
+  });
+
+  test("each task's row states that task's own cost: a reused subagent's rows differ, and a launcher's row leaves out what it launched", () => {
+    const renderer = new TimelineRenderer();
+    const host = target();
+    const task = (id: string, description: string, costUsd: number, extra: Partial<ToolItem> = {}): ConversationItem => ({
+      id, type: "tool", createdAt: 1, name: "task", status: "completed", input: JSON.stringify({ description, subagent_type: "general" }), childConversationId: "child", usage: { input: 10, costUsd }, ...extra,
+    });
+    const subject = (id: string) => host.querySelector(`[data-chat-item-id="${id}"] .chat-activity-subject`)!.textContent;
+    renderer.render(host, projectionWith([
+      // One subagent, two tasks: two rows, two figures — neither the agent's total.
+      task("tool:t1", "Summarise README", 0.0113),
+      task("tool:t2", "Shorten README summary", 0.0057),
+      // A subagent that launched its own: the row is its own spend, and the
+      // $0.0255 beneath it is the receipt's to list, not this row's to add.
+      task("tool:t3", "Audit mermaid docs", 0.0116, { childConversationId: "other", descendants: [
+        { id: "tool:g", parentId: "tool:t3", description: "Find mermaid files", subagent: "explore", conversationId: "grandchild", usage: { costUsd: 0.0255 } },
+      ] }),
+    ]), new Set());
+    expect(subject("tool:t1")).toBe("general · Summarise README · $0.0113");
+    expect(subject("tool:t2")).toBe("general · Shorten README summary · $0.0057");
+    expect(subject("tool:t3")).toBe("general · Audit mermaid docs · $0.0116");
+  });
+
+  test("a control string spanning the running tail's cut does not leak its payload", () => {
+    const renderer = new TimelineRenderer();
+    const host = target();
+    // An OSC payload with newlines, then eleven ordinary lines: the raw
+    // twelve-line cut lands inside the payload.
+    const output = `start\n\x1b]0;secret title\nwith newline\x07${Array.from({ length: 11 }, (_, i) => `line ${i + 1}`).join("\n")}`;
+    const item: ConversationItem = { id: "tool:osc", type: "tool", createdAt: 1, name: "bash", status: "running", input: JSON.stringify({ command: "x" }), output };
+    renderer.render(host, projectionWith([item]), new Set());
+    const text = host.querySelector(".chat-shell-viewport")!.textContent!;
+    expect(text).not.toContain("with newline");
+    expect(text).not.toContain("secret");
+    expect(text).toContain("line 1");
+    expect(text).toContain("line 11");
+  });
+
+  test("other tools interpret escapes but keep the plain block", () => {
+    const renderer = new TimelineRenderer();
+    const host = target();
+    const item: ConversationItem = { id: "tool:rd", type: "tool", createdAt: 1, name: "read", status: "completed", input: JSON.stringify({ filePath: "/tmp/a.log" }), output: "\x1b[31merr\x1b[0m fine", error: "\x1b[1mboom\x1b[0m" };
+    renderer.render(host, projectionWith([item]), new Set());
+    const block = host.querySelector('[data-chat-item-id="tool:rd"] pre:not(.chat-tool-error)')!;
+    expect(block.classList.contains("chat-tool-terminal")).toBe(false);
+    expect(block.querySelector(".ansi-fg-1")!.textContent).toBe("err");
+    const error = host.querySelector(".chat-tool-error")!;
+    expect(error.classList.contains("chat-tool-terminal")).toBe(false);
+    expect(error.querySelector(".ansi-bold")!.textContent).toBe("boom");
+  });
+
   test("a finished tool with short output shows it whole", () => {
     const renderer = new TimelineRenderer();
     const host = target();
@@ -1547,7 +2359,7 @@ describe("tool output is streamed live and bounded when finished", () => {
     expect(host.querySelector('[data-chat-item-id="tool:t3"] pre')!.textContent).toContain("line 4");
   });
 
-  test("a running shell update keeps one keyed row and only its bounded tail", () => {
+  test("a running shell update keeps one viewport and every supplied line", () => {
     const renderer = new TimelineRenderer();
     const host = target();
     const command = (output: string): ConversationItem => ({
@@ -1555,16 +2367,23 @@ describe("tool output is streamed live and bounded when finished", () => {
     });
 
     renderer.render(host, projectionWith([command(lines(20))]), new Set());
+    const viewport = host.querySelector(".chat-shell-viewport");
+    const first = viewport!.querySelector(".chat-shell-line");
     renderer.render(host, projectionWith([command(lines(30))]), new Set());
 
     expect(host.querySelectorAll('[data-chat-item-id="tool:shell"]')).toHaveLength(1);
-    const stream = host.querySelector(".chat-tool-stream")!;
-    expect(stream.textContent!.split("\n")).toHaveLength(12);
+    const stream = host.querySelector(".chat-shell-viewport")!;
+    expect(stream).toBe(viewport!);
+    expect(stream.querySelector(".chat-shell-line")).toBe(first);
+    expect(stream.querySelectorAll(".chat-shell-line")).toHaveLength(30);
     expect(stream.textContent).toContain("line 30");
-    expect(stream.textContent).not.toContain("line 18\n");
+    expect(stream.textContent).toContain("line 1\n");
+    // OpenCode's own shell step is a `command` item, not a bash tool: it
+    // gets the terminal look the same way.
+    expect(stream.classList.contains("chat-tool-terminal")).toBe(true);
   });
 
-  test("a fast-completed shell retains inspectable output behind the existing bound", () => {
+  test("a fast-completed shell retains all output in one bounded viewport", () => {
     const renderer = new TimelineRenderer();
     const host = target();
     const item: ConversationItem = {
@@ -1574,9 +2393,295 @@ describe("tool output is streamed live and bounded when finished", () => {
 
     expect(host.querySelectorAll('[data-chat-item-id="tool:fast-shell"]')).toHaveLength(1);
     expect(host.querySelector('[data-chat-item-id="tool:fast-shell"] .chat-activity-status')!.textContent).toBe("completed");
-    const more = host.querySelector(".chat-output-more") as HTMLDetailsElement;
-    expect(more.querySelector("summary")!.textContent).toContain("Show 18 more lines");
-    expect(more.hasAttribute("open")).toBe(false);
-    expect(more.textContent).toContain("line 30");
+    expect(host.querySelector(".chat-output-more")).toBeNull();
+    expect(host.querySelectorAll(".chat-shell-viewport")).toHaveLength(1);
+    expect(host.querySelector(".chat-shell-viewport")!.textContent).toContain("line 30");
+  });
+});
+
+describe("day separators", () => {
+  // Local wall-clock instants, so every case holds in whatever zone runs it.
+  const local = (day: number, hour = 12, minute = 0) => new Date(2026, 8, day, hour, minute).getTime();
+  const now = local(25, 10);
+  const user = (id: string, createdAt: number): ConversationItem => ({ id: `message:${id}`, type: "user_message", createdAt, text: id });
+  const answer = (id: string, createdAt: number): ConversationItem => ({ id: `part:${id}`, type: "assistant_message", createdAt, markdown: id });
+  const read = (id: string, createdAt: number): ConversationItem => ({ id: `tool:${id}`, type: "tool", createdAt, name: "read", status: "completed", input: JSON.stringify({ filePath: `${id}.ts` }) });
+  const host = () => dom.document.createElement("div") as unknown as HTMLElement;
+  const renderer = () => { const value = new TimelineRenderer(); value.now = () => now; return value; };
+  const outline = (element: HTMLElement) => Array.from(element.children).map(child => child.classList.contains("chat-day-separator") ? `day:${child.textContent}` : child.getAttribute("data-chat-item-id"));
+  const longDate = (at: number) => new Date(at).toLocaleDateString([], { weekday: "long", day: "numeric", month: "long" });
+  // The visible label beyond yesterday: short weekday and ISO date.
+  const isoLabel = (at: number) => `${new Date(at).toLocaleDateString([], { weekday: "short" })} 2026-09-${String(new Date(at).getDate()).padStart(2, "0")}`;
+
+  test("each local day's run starts with its separator, the first day included", () => {
+    const element = host();
+    const older = local(23, 9);
+    renderer().render(element, projectionWith([user("a", older), answer("a", older + 60_000), user("b", local(24, 18)), user("c", local(25, 8)), answer("c", local(25, 8, 1))], { status: "idle" }), new Set());
+    expect(outline(element)).toEqual([`day:${isoLabel(older)}`, "message:a", "part:a", "day:Yesterday", "message:b", "day:Today", "message:c", "part:c"]);
+    const separator = element.querySelector<HTMLElement>(".chat-day-separator")!;
+    expect(separator.getAttribute("role")).toBe("separator");
+    expect(separator.hasAttribute("data-chat-item-id")).toBe(false);
+    expect(separator.getAttribute("data-chat-day")).toBe("2026-09-23");
+    expect(separator.querySelector("time")!.getAttribute("datetime")).toBe("2026-09-23");
+    expect(element.querySelectorAll(".chat-day-separator")[2]!.getAttribute("aria-label")).toBe(`Today, ${longDate(local(25))}`);
+    // An older day is read aloud in the locale's long form rather than as ISO.
+    expect(separator.getAttribute("aria-label")).toBe(longDate(older));
+    expect(separator.textContent).toBe(`${new Date(older).toLocaleDateString([], { weekday: "short" })} 2026-09-23`);
+  });
+
+  test("an item's hover time is weekday, ISO date, and 24-hour clock", () => {
+    const element = host();
+    renderer().render(element, projectionWith([user("a", local(20, 19, 43))], { status: "idle" }), new Set());
+    expect(element.querySelector('[data-chat-item-id="message:a"]')!.getAttribute("title")).toBe(`${new Date(local(20)).toLocaleDateString([], { weekday: "short" })} 2026-09-20 19:43`);
+  });
+
+  test("a single past day is still dated", () => {
+    const element = host();
+    renderer().render(element, projectionWith([user("a", local(18)), answer("a", local(18, 13))], { status: "idle" }), new Set());
+    expect(outline(element)).toEqual([`day:${isoLabel(local(18))}`, "message:a", "part:a"]);
+  });
+
+  test("23:50 and 00:10 are separated", () => {
+    const element = host();
+    renderer().render(element, projectionWith([user("a", local(24, 23, 50)), answer("a", local(25, 0, 10))], { status: "idle" }), new Set());
+    expect(outline(element)).toEqual(["day:Yesterday", "message:a", "day:Today", "part:a"]);
+  });
+
+  test("a group takes the day of its first member", () => {
+    const element = host();
+    renderer().render(element, projectionWith([user("a", local(24, 23)), read("x", local(24, 23, 59)), read("y", local(25, 0, 1)), read("z", local(25, 0, 2)), answer("a", local(25, 0, 3))], { status: "idle" }), new Set());
+    expect(outline(element)).toEqual(["day:Yesterday", "message:a", "group:tool:x", "day:Today", "part:a"]);
+  });
+
+  test("unknown times stay in the day before them and a recurring day is not labelled twice", () => {
+    const element = host();
+    renderer().render(element, projectionWith([user("a", local(24)), answer("a", 0), answer("placeholder", 7), user("b", local(25)), answer("skewed", local(24, 13)), user("c", local(25, 11))], { status: "idle" }), new Set());
+    expect(outline(element)).toEqual(["day:Yesterday", "message:a", "part:a", "part:placeholder", "day:Today", "message:b", "part:skewed", "message:c"]);
+  });
+
+  test("an accepted draft belongs to today", () => {
+    const element = host();
+    renderer().render(element, projectionWith([user("a", local(24))], { status: "idle", acceptedDrafts: [{ requestId: "r1", messageId: "m1", text: "now" }] as ChatProjection["acceptedDrafts"] }), new Set());
+    expect(outline(element)[2]).toBe("day:Today");
+  });
+
+  test("separators are reused across renders and removed with their days", () => {
+    const element = host();
+    const view = renderer();
+    const first = [user("a", local(24)), user("b", local(25))];
+    view.render(element, projectionWith(first, { status: "idle" }), new Set());
+    const today = element.querySelector('[data-chat-day="2026-09-25"]');
+    view.render(element, projectionWith([...first, answer("b", local(25, 11))], { status: "idle" }), new Set());
+    expect(element.querySelector('[data-chat-day="2026-09-25"]')).toBe(today);
+    view.render(element, projectionWith([user("b", local(25))], { status: "idle" }), new Set());
+    expect(outline(element)).toEqual(["day:Today", "message:b"]);
+  });
+
+  test("labels roll over at local midnight without a render", () => {
+    const timers: Array<{ callback: () => void; delay: number }> = [];
+    const realSetTimeout = globalThis.setTimeout;
+    const realClearTimeout = globalThis.clearTimeout;
+    Reflect.set(globalThis, "setTimeout", (callback: () => void, delay: number) => { timers.push({ callback, delay }); return timers.length as unknown as ReturnType<typeof setTimeout>; });
+    Reflect.set(globalThis, "clearTimeout", () => {});
+    try {
+      const element = host();
+      const view = renderer();
+      let clock = local(25, 23, 30);
+      view.now = () => clock;
+      view.render(element, projectionWith([user("a", local(24)), user("b", local(25))], { status: "idle" }), new Set());
+      expect(outline(element)).toEqual(["day:Yesterday", "message:a", "day:Today", "message:b"]);
+      const armed = timers.at(-1)!;
+      expect(armed.delay).toBe(30 * 60_000 + 1_000);
+      clock = local(26, 0, 0) + 1_000;
+      armed.callback();
+      expect(outline(element)).toEqual([`day:${isoLabel(local(24))}`, "message:a", "day:Yesterday", "message:b"]);
+      expect(element.querySelectorAll(".chat-day-separator")[1]!.getAttribute("aria-label")).toBe(`Yesterday, ${longDate(local(25))}`);
+    } finally {
+      Reflect.set(globalThis, "setTimeout", realSetTimeout);
+      Reflect.set(globalThis, "clearTimeout", realClearTimeout);
+    }
+  });
+
+  test("a notice's reset is stated by weekday and clock, so it is still true when replayed later", () => {
+    const element = host();
+    // Rendered long after the reset: nothing relative ("now", "in 2h", a bare
+    // "today" clock) may be baked into the durable notice.
+    const reset = local(21, 14);
+    renderer().render(element, projectionWith([{ id: "notice:x", type: "notice", createdAt: local(21, 9), level: "warning", message: "Heads up.", resetsAt: reset }], { status: "idle" }), new Set());
+    const weekday = new Date(reset).toLocaleDateString([], { weekday: "short" });
+    expect(element.querySelector(".chat-notice")!.textContent).toBe(`Heads up. Resets ${weekday} 14:00.`);
+  });
+
+  test("separators are skipped by find", () => {
+    const element = host();
+    renderer().render(element, projectionWith([user("a", local(25, 9))], { status: "idle" }), new Set());
+    expect(element.querySelector(".chat-day-separator")!.hasAttribute("data-find-skip")).toBe(true);
+  });
+
+  test("a time ahead of the reader's clock is read as now, never as a later day", () => {
+    const element = host();
+    const view = renderer();
+    const late = local(25, 23, 59);
+    view.now = () => late;
+    // The agent's clock runs a few minutes ahead, past the reader's midnight.
+    view.render(element, projectionWith([user("a", local(25, 20)), answer("a", local(26, 0, 3)), user("b", local(26, 0, 4))], { status: "idle" }), new Set());
+    expect(outline(element)).toEqual(["day:Today", "message:a", "part:a", "message:b"]);
+  });
+
+  test("streaming renders neither rewrite labels nor re-aim the midnight timer; a new day does", () => {
+    const timers: Array<{ callback: () => void; delay: number }> = [];
+    let cleared = 0;
+    const realSetTimeout = globalThis.setTimeout;
+    const realClearTimeout = globalThis.clearTimeout;
+    Reflect.set(globalThis, "setTimeout", (callback: () => void, delay: number) => { timers.push({ callback, delay }); return timers.length as unknown as ReturnType<typeof setTimeout>; });
+    Reflect.set(globalThis, "clearTimeout", () => { cleared += 1; });
+    try {
+      const element = host();
+      const view = renderer();
+      let clock = local(25, 10);
+      view.now = () => clock;
+      const items = [user("a", local(24)), user("b", local(25))];
+      view.render(element, projectionWith(items, { status: "idle" }), new Set());
+      expect(timers).toHaveLength(1);
+      const today = element.querySelector<HTMLElement>('[data-chat-day="2026-09-25"] time')!;
+      // A marker text: any relabel on the next renders would overwrite it.
+      today.textContent = "untouched";
+      for (let tick = 1; tick <= 5; tick++) {
+        clock = local(25, 10) + tick * 50;
+        view.render(element, projectionWith([...items, answer("b", local(25, 10))], { status: "running" }), new Set());
+      }
+      expect(timers).toHaveLength(1);
+      expect(cleared).toBe(0);
+      expect(today.textContent).toBe("untouched");
+      // The tab slept past midnight and its timer has not run yet: the next
+      // render relabels and aims at the following midnight.
+      clock = local(26, 8);
+      view.render(element, projectionWith([...items, answer("b", local(25, 10))], { status: "idle" }), new Set());
+      expect(outline(element)).toEqual([`day:${isoLabel(local(24))}`, "message:a", "day:Yesterday", "message:b", "part:b"]);
+      expect(timers).toHaveLength(2);
+      expect(timers.at(-1)!.delay).toBe(16 * 3_600_000 + 1_000);
+    } finally {
+      Reflect.set(globalThis, "setTimeout", realSetTimeout);
+      Reflect.set(globalThis, "clearTimeout", realClearTimeout);
+    }
+  });
+});
+
+// GitHub #476: OpenCode's ask for an MCP tool carries the tool's name and a
+// `*`, nothing about the call. The arguments live on the tool row the
+// request belongs to (2.x names it in `source`; 1.x's classic event in
+// `tool.callID`), and the card reads them from there while it is open.
+describe("a wildcard permission shows the call it would allow", () => {
+  const codeRow: ConversationItem = {
+    id: "tool:call_function_dh8j80sy7yde_1",
+    type: "tool",
+    createdAt: 2,
+    name: "execute",
+    status: "running",
+    input: JSON.stringify({ code: 'const res = await tools.tracker.create_issue({\n  title: "Login fails on Safari",\n  labels: ["bug", "safari"],\n});\nreturn res;' }),
+  };
+  const directRow: ConversationItem = {
+    id: "tool:call_direct",
+    type: "tool",
+    createdAt: 2,
+    name: "tracker_create_issue",
+    status: "running",
+    input: JSON.stringify({ title: "Login fails on Safari", body: "Steps: open /login.", labels: ["bug", "safari"] }),
+  };
+  const asked = (overrides: Partial<Extract<ConversationItem, { type: "permission" }>> = {}): ConversationItem => ({
+    id: "permission:per_mcp",
+    type: "permission",
+    createdAt: 3,
+    requestId: "per_mcp",
+    action: "tracker_create_issue",
+    resources: ["*"],
+    alwaysPatterns: ["*"],
+    status: "pending",
+    ...overrides,
+  });
+  function render(items: ConversationItem[]): HTMLElement {
+    const host = target();
+    new TimelineRenderer().render(host, projectionWith(items), new Set());
+    return host;
+  }
+  const card = (host: HTMLElement) => host.querySelector('[data-chat-item-id="permission:per_mcp"]') as HTMLElement;
+
+  test("the row the request names supplies the arguments, and the bare wildcard is not drawn", () => {
+    const host = render([codeRow, asked({ sourceToolId: codeRow.id })]);
+    const pre = card(host).querySelector(".chat-request-arguments") as HTMLElement;
+    expect(pre.textContent).toContain('title: "Login fails on Safari"');
+    expect(pre.textContent).toContain("tools.tracker.create_issue");
+    expect(card(host).querySelectorAll("li")).toHaveLength(0);
+    // The action stays the tool's name as OpenCode sent it.
+    expect(card(host).querySelector("summary")!.textContent).toContain("Permission: tracker_create_issue");
+    // The choices are still where they were.
+    expect([...card(host).querySelectorAll("[data-permission-outcome]")]).toHaveLength(3);
+  });
+
+  test("the summary names the MCP server and tool, and the confirmation keeps the raw action", () => {
+    const host = render([codeRow, asked({ sourceToolId: codeRow.id, mcp: { server: "github", tool: "create_issue" }, action: "github_create_issue" })]);
+    expect(card(host).querySelector("summary")!.textContent).toContain("Permission: MCP github › create_issue");
+    expect(card(host).querySelector("summary")!.textContent).not.toContain("github_create_issue");
+    // The stage names what OpenCode installs: the action as sent.
+    const confirming = new TimelineRenderer();
+    const staged = target();
+    const items = [codeRow, asked({ sourceToolId: codeRow.id, mcp: { server: "github", tool: "create_issue" }, action: "github_create_issue" })];
+    confirming.render(staged, projectionWith(items), new Set());
+    confirming.confirming.add("permission:per_mcp");
+    confirming.render(staged, projectionWith(items), new Set());
+    expect(staged.querySelector(".chat-request-confirm-action")!.textContent).toBe("github_create_issue");
+    // Unresolved: the action as sent.
+    const bare = render([asked()]);
+    expect(bare.querySelector("summary")!.textContent).toContain("Permission: tracker_create_issue");
+  });
+
+  test("a request that names no row falls back to the open row under its action name", () => {
+    const host = render([directRow, asked()]);
+    const pre = card(host).querySelector(".chat-request-arguments") as HTMLElement;
+    expect(pre.textContent).toBe('title: Login fails on Safari\nbody: Steps: open /login.\nlabels: ["bug","safari"]');
+  });
+
+  test("a named row that is not in the conversation yields today's card, not a guess by name", () => {
+    const host = render([directRow, asked({ sourceToolId: "tool:call_elsewhere" })]);
+    expect(card(host).querySelector(".chat-request-arguments")).toBeNull();
+    expect([...card(host).querySelectorAll("li code")].map(node => node.textContent)).toEqual(["*"]);
+  });
+
+  test("a finished row under the action name is not the call being asked about", () => {
+    const host = render([{ ...directRow, status: "completed" } as ConversationItem, asked()]);
+    expect(card(host).querySelector(".chat-request-arguments")).toBeNull();
+    expect([...card(host).querySelectorAll("li code")].map(node => node.textContent)).toEqual(["*"]);
+  });
+
+  test("a request naming a specific resource adds no arguments even with a row of the same name open", () => {
+    const bashRow: ConversationItem = { id: "tool:call_bash", type: "tool", createdAt: 2, name: "bash", status: "running", input: JSON.stringify({ command: "git status --short" }) };
+    const host = render([bashRow, asked({ action: "bash", resources: ["git status --short"], alwaysPatterns: ["git status *"], sourceToolId: bashRow.id })]);
+    expect(card(host).querySelector(".chat-request-arguments")).toBeNull();
+    expect([...card(host).querySelectorAll("li code")].map(node => node.textContent)).toEqual(["git status --short"]);
+  });
+
+  test("a resolved card recedes without the block", () => {
+    const host = render([codeRow, asked({ sourceToolId: codeRow.id, status: "resolved", outcome: "approved-once" })]);
+    expect(card(host).querySelector(".chat-request-arguments")).toBeNull();
+    expect([...card(host).querySelectorAll("li code")].map(node => node.textContent)).toEqual(["*"]);
+    expect(card(host).querySelector(".chat-request-trace")!.textContent).toContain("Allowed once");
+  });
+
+  test("the card fills in when the row's input lands after it", () => {
+    const host = target();
+    const renderer = new TimelineRenderer();
+    renderer.render(host, projectionWith([{ ...directRow, input: undefined } as ConversationItem, asked()]), new Set());
+    expect(card(host).querySelector(".chat-request-arguments")).toBeNull();
+    renderer.render(host, projectionWith([directRow, asked()]), new Set());
+    expect(card(host).querySelector(".chat-request-arguments")!.textContent).toContain("Login fails on Safari");
+  });
+
+  test("arguments read one per line, a multi-line value on its own lines, and non-JSON input as it is", () => {
+    expect(permissionCallArguments(JSON.stringify({ title: "A", count: 2, labels: ["x"] }))).toBe('title: A\ncount: 2\nlabels: ["x"]');
+    expect(permissionCallArguments(JSON.stringify({ code: "line 1\nline 2" }))).toBe("code:\nline 1\nline 2");
+    expect(permissionCallArguments("{}")).toBe("(no arguments)");
+    expect(permissionCallArguments("not json")).toBe("not json");
+    expect(permissionCallArguments(undefined)).toBeUndefined();
+    expect(permissionCallArguments("   ")).toBeUndefined();
   });
 });

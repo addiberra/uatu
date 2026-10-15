@@ -1,6 +1,7 @@
 import { TOKEN_USAGE_COMPONENTS } from "./usage";
 import type {
   AgentChatStatus,
+  BackgroundTaskOutput,
   ChatAgentDescriptor,
   ActivityStatus,
   ChatAgent,
@@ -24,6 +25,8 @@ import type {
   ReversibleHistoryResult,
   ReversibleHistoryState,
   StructuredQuestion,
+  AgentUsageReport,
+  UsageReadResult,
 } from "./types";
 
 const CONVERSATION_STATUSES = new Set<ConversationStatus>([
@@ -36,6 +39,7 @@ const CONVERSATION_STATUSES = new Set<ConversationStatus>([
   "background",
   "retrying",
   "compacting",
+  "scheduled",
 ]);
 const ACTIVITY_STATUSES = new Set<ActivityStatus>(["pending", "running", "completed", "failed", "cancelled"]);
 
@@ -48,11 +52,17 @@ export function parseChatAvailability(value: unknown): ChatAvailability {
       expectKeys(record, ["state"], "chat availability");
       break;
     case "ready":
-      expectKeys(record, ["state", "version", "agent"], "chat availability");
+      expectKeys(record, ["state", "version", "agent", "login", "accountsRevision", "catalogRevision"], "chat availability");
+      expectOptionalIdentity(record.catalogRevision, "catalog revision");
       expectNonEmptyString(record.version, "version");
       // Optional: absent for the moment between the runtime reporting ready
       // and the adapter existing to describe the agent.
       if (record.agent !== undefined) parseChatAgent(record.agent);
+      // Optional: absent until the agent has said whether a login is usable.
+      if (record.login !== undefined) expectOneOf(record.login, ["ok", "missing", "unknown"], "login state");
+      if (record.accountsRevision !== undefined && (!Number.isInteger(record.accountsRevision) || (record.accountsRevision as number) < 0)) {
+        throw new Error("invalid accounts revision");
+      }
       break;
     case "unavailable":
       expectKeys(record, ["state", "reason", "message", "diagnostics"], "chat availability");
@@ -110,12 +120,13 @@ function parseChatStartupDiagnostics(value: unknown): ChatStartupDiagnostics {
 
 export function parseChatModel(value: unknown): ChatModel {
   const record = expectRecord(value, "chat model");
-  expectKeys(record, ["selection", "provider", "name", "variants", "contextLimit", "imageInput", "detail", "default", "resolvesTo"], "chat model");
+  expectKeys(record, ["selection", "provider", "name", "variants", "contextLimit", "contextWindow", "imageInput", "detail", "default", "resolvesTo"], "chat model");
   expectModelSelection(record.selection);
   expectNonEmptyString(record.provider, "model provider");
   expectNonEmptyString(record.name, "model name");
   if (record.variants !== undefined) expectStringArray(record.variants, "model variants", true);
-  if (record.contextLimit !== undefined && (typeof record.contextLimit !== "number" || record.contextLimit < 1)) throw new Error("model contextLimit must be a positive number");
+  if (record.contextLimit !== undefined) expectPositiveLimit(record.contextLimit, "model contextLimit");
+  if (record.contextWindow !== undefined) expectContextWindow(record.contextWindow);
   if (record.imageInput !== undefined && typeof record.imageInput !== "boolean") throw new Error("model imageInput must be a boolean");
   if (record.detail !== undefined) expectNonEmptyString(record.detail, "model detail");
   if (record.default !== undefined && typeof record.default !== "boolean") throw new Error("model default must be a boolean");
@@ -250,7 +261,7 @@ export function parsePermissionRequest(value: unknown): PermissionRequest {
   const record = expectRecord(value, "permission request");
   expectKeys(
     record,
-    ["id", "type", "createdAt", "requestId", "conversationId", "action", "resources", "status", "outcome", "diff", "plan", "choices", "choiceId"],
+    ["id", "type", "createdAt", "requestId", "conversationId", "action", "resources", "alwaysPatterns", "status", "outcome", "diff", "plan", "choices", "choiceId", "sourceToolId", "mcp"],
     "permission request",
   );
   expectOptionalIdentity(record.conversationId, "permission owning conversation");
@@ -259,6 +270,9 @@ export function parsePermissionRequest(value: unknown): PermissionRequest {
   expectNonEmptyString(record.action, "permission action");
   // Empty is legitimate: a plan approval affects no named resource.
   expectStringArray(record.resources, "permission resources", record.plan === undefined);
+  // Empty is the agent saying it has nothing reusable to install; absent is
+  // an agent that did not say. Both are honest, so both are admitted.
+  if (record.alwaysPatterns !== undefined) expectStringArray(record.alwaysPatterns, "permission always patterns", false);
   expectOneOf(record.status, ["pending", "resolved"], "permission status");
   if (record.status === "pending" && record.outcome !== undefined) {
     throw new Error("pending permission must not have an outcome");
@@ -279,6 +293,14 @@ export function parsePermissionRequest(value: unknown): PermissionRequest {
     }
   }
   if (record.choiceId !== undefined) expectIdentity(record.choiceId, "permission choice id");
+  // The tool row the request belongs to, when the agent named the call.
+  expectOptionalIdentity(record.sourceToolId, "permission source tool id");
+  if (record.mcp !== undefined) {
+    const mcp = expectRecord(record.mcp, "permission mcp tool");
+    expectKeys(mcp, ["server", "tool"], "permission mcp tool");
+    expectNonEmptyString(mcp.server, "permission mcp server");
+    expectNonEmptyString(mcp.tool, "permission mcp tool name");
+  }
   return value as PermissionRequest;
 }
 
@@ -308,6 +330,32 @@ export function parseQuestionRequest(value: unknown): QuestionRequest {
 }
 
 /**
+ * The subagents launched beneath a row, closed like the row itself. Each line
+ * hangs off the row or off an earlier line — the receipt draws a tree from
+ * these links, so a line pointing nowhere, at itself, or at a later line is
+ * refused rather than drawn as an orphan or a loop.
+ */
+function expectSubagentLines(value: unknown, rowId: unknown): void {
+  if (value === undefined) return;
+  if (!Array.isArray(value)) throw new Error("tool descendants must be an array");
+  const known = new Set<unknown>([rowId]);
+  for (const entry of value) {
+    const line = expectRecord(entry, "subagent line");
+    expectKeys(line, ["id", "parentId", "description", "subagent", "conversationId", "model", "usage"], "subagent line");
+    expectNonEmptyString(line.id, "subagent line id");
+    expectNonEmptyString(line.parentId, "subagent line parentId");
+    expectNonEmptyString(line.description, "subagent line description");
+    expectOptionalString(line.subagent, "subagent line subagent");
+    expectNonEmptyString(line.conversationId, "subagent line conversationId");
+    expectOptionalString(line.model, "subagent line model");
+    expectTokenUsage(line.usage, "subagent line usage");
+    if (known.has(line.id)) throw new Error("subagent line id must be unique");
+    if (!known.has(line.parentId)) throw new Error("subagent line parentId must name the row or an earlier line");
+    known.add(line.id);
+  }
+}
+
+/**
  * Token usage, closed like every other item field. Each component is optional
  * because an agent reports what it measures — but an absent component must
  * stay absent, not arrive as some other type, since the readouts do
@@ -316,9 +364,27 @@ export function parseQuestionRequest(value: unknown): QuestionRequest {
 function expectTokenUsage(value: unknown, label: string): void {
   if (value === undefined) return;
   const usage = expectRecord(value, label);
-  expectKeys(usage, [...TOKEN_USAGE_COMPONENTS], label);
+  expectKeys(usage, [...TOKEN_USAGE_COMPONENTS, "costUsd"], label);
   for (const key of TOKEN_USAGE_COMPONENTS) {
     expectOptionalCount(usage[key], `${label} ${key}`);
+  }
+  // Money, not a count: fractional cents are the normal case.
+  expectOptionalNonNegative(usage.costUsd, `${label} costUsd`);
+}
+
+function expectPositiveLimit(value: unknown, label: string): void {
+  if (!Number.isSafeInteger(value) || (value as number) < 1) throw new Error(`${label} must be a positive integer`);
+}
+
+function expectContextWindow(value: unknown): void {
+  const window = expectRecord(value, "context window");
+  expectKeys(window, ["source", "freshness", "observedAt", "kind", "capacity", "compactionThreshold"], "context window");
+  expectOneOf(window.source, ["session", "catalog", "estimate"], "window source");
+  expectOneOf(window.freshness, ["current", "cached"], "window freshness");
+  expectOptionalTimestamp(window.observedAt, "window observedAt");
+  if (window.kind !== undefined) expectOneOf(window.kind, ["effective", "compaction"], "window kind");
+  for (const key of ["capacity", "compactionThreshold"]) {
+    if (window[key] !== undefined) expectPositiveLimit(window[key], `window ${key}`);
   }
 }
 
@@ -330,17 +396,21 @@ export function parseConversationItem(value: unknown): ConversationItem {
 
   switch (type) {
     case "user_message":
-      expectKeys(record, ["id", "type", "createdAt", "text", "requestId", "attachments"], type);
+      expectKeys(record, ["id", "type", "createdAt", "text", "requestId", "attachments", "origin", "wakeupId"], type);
       expectString(record.text, "user message text");
       expectOptionalIdentity(record.requestId, "user message request id");
+      if (record.origin !== undefined) expectOneOf(record.origin, ["wakeup"], "user message origin");
+      expectOptionalIdentity(record.wakeupId, "user message wakeup id");
       if (record.attachments !== undefined) parseMessageAttachments(record.attachments, "user message attachment");
       break;
     case "assistant_message":
-      expectKeys(record, ["id", "type", "createdAt", "markdown", "completedAt", "usage", "model"], type);
+      expectKeys(record, ["id", "type", "createdAt", "markdown", "completedAt", "usage", "model", "agent", "contextKey"], type);
+      expectOptionalIdentity(record.contextKey, "assistant contextKey");
       expectString(record.markdown, "assistant markdown");
       expectOptionalTimestamp(record.completedAt, "completedAt");
       expectTokenUsage(record.usage, "assistant usage");
       if (record.model !== undefined) expectModelSelection(record.model);
+      if (record.agent !== undefined) expectNonEmptyString(record.agent, "assistant agent");
       break;
     case "reasoning":
       expectKeys(record, ["id", "type", "createdAt", "text", "status", "durationMs", "label"], type);
@@ -351,7 +421,8 @@ export function parseConversationItem(value: unknown): ConversationItem {
       if (record.label !== undefined) expectNonEmptyString(record.label, "reasoning label");
       break;
     case "tool":
-      expectKeys(record, ["id", "type", "createdAt", "name", "status", "input", "output", "error", "childConversationId", "model", "usage", "elapsedMs"], type);
+      expectKeys(record, ["id", "type", "createdAt", "name", "status", "completedAt", "input", "output", "error", "childConversationId", "model", "usage", "descendants", "elapsedMs"], type);
+      expectOptionalTimestamp(record.completedAt, "completedAt");
       expectNonEmptyString(record.name, "tool name");
       parseActivityStatus(record.status);
       expectOptionalString(record.input, "tool input");
@@ -360,10 +431,12 @@ export function parseConversationItem(value: unknown): ConversationItem {
       expectOptionalString(record.childConversationId, "tool child conversation id");
       expectOptionalString(record.model, "tool model");
       expectTokenUsage(record.usage, "tool usage");
+      expectSubagentLines(record.descendants, record.id);
       expectOptionalTimestamp(record.elapsedMs, "tool elapsedMs");
       break;
     case "command":
-      expectKeys(record, ["id", "type", "createdAt", "command", "status", "output", "exitCode"], type);
+      expectKeys(record, ["id", "type", "createdAt", "command", "status", "completedAt", "output", "exitCode"], type);
+      expectOptionalTimestamp(record.completedAt, "completedAt");
       expectNonEmptyString(record.command, "command");
       parseActivityStatus(record.status);
       expectOptionalString(record.output, "command output");
@@ -401,32 +474,10 @@ export function parseConversationItem(value: unknown): ConversationItem {
       expectOptionalTimestamp(record.resetsAt, "notice resetsAt");
       break;
     case "context_report": {
-      expectKeys(record, ["id", "type", "createdAt", "total", "max", "model", "categories", "plan", "session"], type);
-      if (record.plan !== undefined) {
-        // The plan is the one place unknown keys pass: the SDK adds windows
-        // over time and a new one must not make an older client reject the
-        // whole report. Known fields are still held to their types.
-        const plan = expectRecord(record.plan, "context report plan");
-        if (plan.subscription !== undefined) expectNonEmptyString(plan.subscription, "context report plan subscription");
-        for (const key of ["fiveHour", "sevenDay", "sevenDayOpus", "sevenDaySonnet", "sevenDayOauthApps"] as const) {
-          if (plan[key] === undefined) continue;
-          expectPlanWindow(plan[key], `context report plan ${key}`, []);
-        }
-        if (plan.modelScoped !== undefined) {
-          if (!Array.isArray(plan.modelScoped)) throw new Error("context report plan modelScoped must be an array");
-          for (const entry of plan.modelScoped) {
-            const window = expectPlanWindow(entry, "context report plan modelScoped", ["label"]);
-            expectNonEmptyString(window.label, "context report plan modelScoped label");
-          }
-        }
-        if (plan.extraUsage !== undefined) {
-          const extra = expectRecord(plan.extraUsage, "context report plan extraUsage");
-          expectKeys(extra, ["enabled", "usedCredits", "monthlyLimit", "utilization", "currency"], "context report plan extraUsage");
-          if (typeof extra.enabled !== "boolean") throw new Error("context report plan extraUsage enabled must be a boolean");
-          for (const key of ["usedCredits", "monthlyLimit", "utilization"] as const) expectOptionalNonNegative(extra[key], `context report plan extraUsage ${key}`);
-          expectOptionalString(extra.currency, "context report plan extraUsage currency");
-        }
-      }
+      expectKeys(record, ["id", "type", "createdAt", "total", "max", "model", "categories", "plan", "session", "contextKey", "window"], type);
+      expectOptionalIdentity(record.contextKey, "report contextKey");
+      if (record.window !== undefined) expectContextWindow(record.window);
+      if (record.plan !== undefined) expectPlanUtilization(record.plan, "context report plan");
       if (record.session !== undefined) {
         const session = expectRecord(record.session, "context report session");
         expectKeys(session, ["costUsd", "apiDurationMs", "durationMs", "linesAdded", "linesRemoved", "models", "since"], "context report session");
@@ -463,8 +514,15 @@ export function parseConversationItem(value: unknown): ConversationItem {
       }
       break;
     }
+    case "context_window":
+      expectKeys(record, ["id", "type", "createdAt", "model", "contextKey", "limit", "window"], type);
+      expectModelSelection(record.model);
+      expectOptionalIdentity(record.contextKey, "window contextKey");
+      expectPositiveLimit(record.limit, "window limit");
+      expectContextWindow(record.window);
+      break;
     case "background_task":
-      expectKeys(record, ["id", "type", "createdAt", "taskId", "description", "taskType", "toolUseId", "status", "progress", "summary"], type);
+      expectKeys(record, ["id", "type", "createdAt", "taskId", "description", "taskType", "toolUseId", "status", "progress", "summary", "subagentType", "prompt", "usage", "outputFile", "childConversationId", "foreground"], type);
       expectIdentity(record.taskId, "background task id");
       expectNonEmptyString(record.description, "background task description");
       expectOptionalString(record.taskType, "background task type");
@@ -472,6 +530,27 @@ export function parseConversationItem(value: unknown): ConversationItem {
       expectOneOf(record.status, ["running", "completed", "failed", "stopped"], "background task status");
       expectOptionalString(record.progress, "background task progress");
       expectOptionalString(record.summary, "background task summary");
+      // The facts a running task carries are decoration on a row that stands
+      // without them: a malformed one is dropped, and the row — its identity,
+      // status, and summary — is kept rather than refused whole.
+      stripUnless(record, "subagentType", value => typeof value === "string" && value.length > 0);
+      stripUnless(record, "prompt", value => typeof value === "string" && value.length > 0);
+      stripUnless(record, "outputFile", value => typeof value === "string" && value.length > 0);
+      stripUnless(record, "childConversationId", value => typeof value === "string" && value.length > 0 && value.length <= 512 && !/[\u0000-\u001f\u007f]/.test(value));
+      stripUnless(record, "usage", isBackgroundTaskUsage);
+      // Only `true` means anything; anything else is a background row as before.
+      stripUnless(record, "foreground", value => value === true);
+      break;
+    case "scheduled_wakeup":
+      expectKeys(record, ["id", "type", "createdAt", "wakeupId", "prompt", "recurring", "schedule", "nextFireAt", "status", "firedTurnId", "message"], type);
+      expectIdentity(record.wakeupId, "scheduled wakeup id");
+      expectString(record.prompt, "scheduled wakeup prompt");
+      if (typeof record.recurring !== "boolean") throw new Error("scheduled wakeup recurring must be a boolean");
+      expectNonEmptyString(record.schedule, "scheduled wakeup schedule");
+      expectOptionalTimestamp(record.nextFireAt, "scheduled wakeup nextFireAt");
+      expectOneOf(record.status, ["pending", "fired", "cancelled", "paused", "lost"], "scheduled wakeup status");
+      expectOptionalIdentity(record.firedTurnId, "scheduled wakeup fired turn id");
+      expectOptionalString(record.message, "scheduled wakeup message");
       break;
     case "compaction":
       expectKeys(record, ["id", "type", "createdAt", "trigger", "preTokens", "postTokens"], type);
@@ -548,8 +627,15 @@ export function parseQueuedMessages(value: unknown): QueuedMessage[] {
 
 export function parseConversationInventoryEvent(value: unknown): ConversationInventoryEvent {
   const record = expectRecord(value, "conversation inventory event");
-  expectKeys(record, ["type"], "conversation inventory event");
+  expectKeys(record, ["type", "catalogs"], "conversation inventory event");
   if (record.type !== "conversation.inventory") throw new Error("invalid conversation inventory event type");
+  if (record.catalogs !== undefined) {
+    const catalogs = expectRecord(record.catalogs, "catalog revisions");
+    for (const [agent, revision] of Object.entries(catalogs)) {
+      expectIdentity(agent, "catalog agent");
+      expectIdentity(revision, "catalog revision");
+    }
+  }
   return value as ConversationInventoryEvent;
 }
 
@@ -650,6 +736,85 @@ function expectTimelineBase(record: Record<string, unknown>, type: string): void
   expectIdentity(record.id, `${type} item id`);
   if (record.type !== type) throw new Error(`expected ${type} item`);
   expectTimestamp(record.createdAt, `${type} createdAt`);
+}
+
+/**
+ * The plan is the one place unknown keys pass: the SDK adds windows over
+ * time and a new one must not make an older client reject the whole report.
+ * Known fields are still held to their types.
+ */
+function expectPlanUtilization(value: unknown, field: string): void {
+  const plan = expectRecord(value, field);
+  if (plan.subscription !== undefined) expectNonEmptyString(plan.subscription, `${field} subscription`);
+  for (const key of ["fiveHour", "sevenDay", "sevenDayOpus", "sevenDaySonnet", "sevenDayOauthApps"] as const) {
+    if (plan[key] === undefined) continue;
+    expectPlanWindow(plan[key], `${field} ${key}`, []);
+  }
+  if (plan.modelScoped !== undefined) {
+    if (!Array.isArray(plan.modelScoped)) throw new Error(`${field} modelScoped must be an array`);
+    for (const entry of plan.modelScoped) {
+      const window = expectPlanWindow(entry, `${field} modelScoped`, ["label"]);
+      expectNonEmptyString(window.label, `${field} modelScoped label`);
+    }
+  }
+  if (plan.extraUsage !== undefined) {
+    const extra = expectRecord(plan.extraUsage, `${field} extraUsage`);
+    expectKeys(extra, ["enabled", "usedCredits", "monthlyLimit", "utilization", "currency"], `${field} extraUsage`);
+    if (typeof extra.enabled !== "boolean") throw new Error(`${field} extraUsage enabled must be a boolean`);
+    for (const key of ["usedCredits", "monthlyLimit", "utilization"] as const) expectOptionalNonNegative(extra[key], `${field} extraUsage ${key}`);
+    expectOptionalString(extra.currency, `${field} extraUsage currency`);
+  }
+}
+
+/** The workspace's last-known plan usage for one agent, or null when none has been read. */
+export function parseAgentUsageReport(value: unknown): AgentUsageReport | null {
+  if (value === null) return null;
+  const record = expectRecord(value, "usage report");
+  expectKeys(record, ["plan", "readAt", "conversationId"], "usage report");
+  expectPlanUtilization(record.plan, "usage report plan");
+  if (typeof record.readAt !== "number" || !Number.isFinite(record.readAt) || record.readAt < 0) throw new Error("usage report readAt must be a timestamp");
+  if (record.conversationId !== undefined) expectIdentity(record.conversationId, "usage report conversationId");
+  return value as AgentUsageReport;
+}
+
+export function parseUsageReportResponse(value: unknown): { report: AgentUsageReport | null } {
+  const record = expectRecord(value, "usage report response");
+  expectKeys(record, ["report"], "usage report response");
+  if (record.report === undefined) throw new Error("usage report response must carry a report or null");
+  return { report: parseAgentUsageReport(record.report) };
+}
+
+/** The bounded tail of a task's output as the child answers it. */
+export function parseBackgroundTaskOutput(value: unknown): BackgroundTaskOutput {
+  const record = expectRecord(value, "task output");
+  expectKeys(record, ["text", "truncated", "settled"], "task output");
+  expectString(record.text, "task output text");
+  if (typeof record.truncated !== "boolean" || typeof record.settled !== "boolean") throw new Error("task output flags must be booleans");
+  return value as BackgroundTaskOutput;
+}
+
+export function parseUsageReadResult(value: unknown): UsageReadResult {
+  const record = expectRecord(value, "usage read");
+  expectKeys(record, ["report", "reason"], "usage read");
+  if (record.report === null) {
+    if (record.reason !== "no-live-session" && record.reason !== "timeout" && record.reason !== "unavailable") throw new Error("usage read reason must name a failure");
+    return { report: null, reason: record.reason };
+  }
+  if (record.reason !== undefined) throw new Error("usage read with a report carries no reason");
+  return { report: parseAgentUsageReport(record.report)! };
+}
+
+/** Drops an optional field whose value is not what it should be, leaving the record otherwise intact. */
+function stripUnless(record: Record<string, unknown>, key: string, accept: (value: unknown) => boolean): void {
+  if (record[key] !== undefined && !accept(record[key])) delete record[key];
+}
+
+function isBackgroundTaskUsage(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const usage = value as Record<string, unknown>;
+  const keys = Object.keys(usage);
+  if (keys.length !== 3 || !["totalTokens", "toolUses", "durationMs"].every(key => keys.includes(key))) return false;
+  return keys.every(key => typeof usage[key] === "number" && Number.isFinite(usage[key]) && (usage[key] as number) >= 0);
 }
 
 function expectRecord(value: unknown, field: string): Record<string, unknown> {

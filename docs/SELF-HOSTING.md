@@ -2,7 +2,7 @@
 
 `uatu hub` turns a machine you own — a homelab box, a spare Mac mini, a VPS —
 into a session server: it serves a dashboard over one HTTPS port, supervises
-one `uatu serve` child per workspace, and reverse-proxies every session under
+one session child per workspace, and reverse-proxies every session under
 `https://<your-host>/s/<workspace-id>/`. Any browser is a client; an iPad can
 install the hub as a PWA and every session lives inside it, and UatuCode
 Desktop is a native hub client — Add Hub… on its splash screen signs in and
@@ -12,6 +12,42 @@ way to run uatu, and every client authenticates the same way.
 This document is the operator runbook: the trust model, the config
 reference, certificate walkthroughs (mkcert and both tailscale shapes), and
 service definitions for systemd and launchd.
+
+## Quick start
+
+A hub on your own machine takes four steps.
+
+1. Hash a password. The command reads it from stdin, never from its
+   arguments, and prompts for it when run bare in a terminal:
+
+   ```sh
+   printf '%s' 'your-password-here' | uatu hub hash-password
+   ```
+
+2. Save the printed `$argon2id$…` string as a user in
+   `~/.config/uatu/hub.json` (or `$XDG_CONFIG_HOME/uatu/hub.json`):
+
+   ```json
+   { "users": [{ "name": "you", "passwordHash": "$argon2id$…" }] }
+   ```
+
+3. Start the hub. It listens on `http://127.0.0.1:4700/` and prints that URL:
+
+   ```sh
+   uatu hub
+   ```
+
+4. Open the URL, sign in, and choose **Add Folder**. The folder becomes a
+   workspace, and its session opens at `/s/<workspace-id>/`.
+
+To reach the hub from other devices, give it a certificate
+([Certificates](#certificates--three-worked-paths)) and run it as a
+service ([Running as a service](#running-as-a-service)). Read the trust
+model below before you add anyone else as a user.
+
+`uatu serve`, deprecated since v0.5.0, has been removed. Running it (or the
+old `watch` alias, or a bare `uatu <path>`) prints these steps and exits
+with an error.
 
 ## The trust model — read this first
 
@@ -80,8 +116,9 @@ to `$XDG_CONFIG_HOME/uatu/hub.json` (usually `~/.config/uatu/hub.json`):
 | `users` | — | Required, non-empty. Password hashes only — generate with `uatu hub hash-password`. |
 | `stateDir` | `~/.local/state/uatu-hub` | Workspace registry, personal workspace state, and the session store (secret-bearing files are created owner-only) |
 
-Generate a password hash (read from stdin so it never lands in shell
-history):
+Generate a password hash. The command reads the password from stdin, never
+from its arguments; run `uatu hub hash-password` bare to type it at a prompt
+instead of leaving it in shell history:
 
 ```sh
 printf '%s' 'your-password-here' | uatu hub hash-password
@@ -113,6 +150,65 @@ Follow, preview/filter/compare modes, and the last-active PTY reference.
 Browser layout, dock, split, and dimensions remain client-local. Forgetting a
 stopped workspace removes every user's personal record and its credential
 assignments as part of the same coordinated operation.
+
+## Web Push notifications
+
+Add `"notifications": { "contact": "mailto:operator@example.com" }` to the hub
+configuration. An HTTPS contact URL is also accepted. Restart the hub after a
+configuration change. Without this setting, normal use continues and the
+Notifications form explains that sender configuration is required.
+
+Each browser profile or Home Screen installation enrolls independently through
+**Notifications**. Users choose needs-answer and successful turn-completion
+alerts, and either **All workspaces** or a list of workspaces. All workspaces is
+a standing rule: a workspace registered later is covered from the moment the
+hub sees it, with no further configuration. A device with a workspace list does
+not gain newly registered workspaces until they are ticked. On iOS/iPadOS 16.4
+and later, enrollment requires opening the Home
+Screen installation and responding to the permission prompt from the Enable
+notifications action. Use a trusted HTTPS URL on remote devices.
+
+The hub sends encrypted Web Push requests to browser-issued Apple, Google,
+Mozilla, or Windows push endpoints over HTTPS. Allow outbound access to these
+services when using an egress firewall. The phone does not need an open Uatu
+connection to receive a push; it does need access to the hub when opening the
+conversation. Keep the hub and relevant agent running.
+
+`notifications.json` in the private hub state directory contains the persistent
+VAPID identity, enrollment endpoints/keys, login ownership, preferences, delivery
+journal, and source cursors. Back it up with the rest of that state directory and
+preserve its owner-only permissions. Do not publish it. Restart reuses the keys;
+deleting the file loses the sender identity and requires device re-enrollment.
+Unsent events expire after five minutes. Pushes wait while the user has a
+visible Uatu workspace page on any device. A question held that way can still
+be sent up to an hour after it was asked, once the user has been away for
+30 seconds, and it then gets its own five minutes. Deduplication records have a bounded
+24-hour retention window. Browser acceptance is not proof that the OS displayed
+an alert immediately, and delivery is not exactly once.
+
+If alerts seem missing while you work, that is expected: a visible Uatu page on
+any of your devices, including a window left open on another screen, holds them.
+If alerts stop, check the browser/OS permission and Focus settings, hub sender
+configuration, the enrolled workspaces/categories, and whether the enrollment's
+login expired or was revoked. The form reports a missing subscription when the
+device returns. Sign in and explicitly enable again to renew its authorization.
+Another application's root service worker is an enrollment conflict; Uatu does
+not replace it. Close older Uatu pages during an upgrade if they still run legacy
+worker cleanup, then reopen the current version to reconcile registration.
+
+To stop sending during rollback, remove the notification contact configuration
+and restart the hub, or disable enrollment on each device. Retain
+`notifications.json` if returning to this version later. Older binaries can
+remove the root registration through their legacy cleanup, so verify device
+enrollment when upgrading again. A binary from before the All workspaces option
+ignores that rule and sends from each device's stored workspace list only, until
+the device is saved again on a current build. The push worker does not intercept requests or
+cache application content offline.
+
+Home Screen icons use opaque, padded artwork and versioned image URLs. iOS can
+retain an installed app's old icon after a hub update. If reopening the app
+does not refresh it, re-add it to the Home Screen, then check its login and
+notification enrollment again.
 
 ## Credential setup and migration
 
@@ -409,11 +505,13 @@ server {
     location / {
         proxy_pass http://127.0.0.1:4700;
         proxy_http_version 1.1;
-        # REQUIRED: the hub's origin gate compares Origin against this.
-        proxy_set_header Host $host;
+        # REQUIRED: the hub's origin gate compares Origin against this, and
+        # the session cookie is named for its port. $http_host is the
+        # browser's header verbatim; $host would drop a non-default port.
+        proxy_set_header Host $http_host;
         proxy_set_header X-Forwarded-Proto $scheme;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        # WebSockets (the terminal) and SSE (live reload).
+        # WebSockets (the terminal) and SSE (the live stream).
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection $connection_upgrade;
         proxy_buffering off;
@@ -516,5 +614,13 @@ tail -f /tmp/uatu-hub.log
 - **Login lockout**: five failed attempts per minute per address; wait a
   minute. Revoke a single device from the dashboard's Devices pane; rotate
   everyone's sessions by deleting `sessions.json` in the state dir.
+- **Several hubs through port forwards** (`ssh -L`, AWS SSM, WSL2) reached
+  as `127.0.0.1:4700`, `:4701`, and so on keep separate logins. Browsers
+  scope cookies by host, not port, so the hub names its session cookie for
+  the port the browser used (`uatu_hub_4701`). At a default port the name
+  stays `uatu_hub`. Nothing to configure. Browsers still send every hub's
+  cookie to every port on that host (cookies never isolate by port), so
+  forward only hubs you would hand your password to. A fronting proxy must
+  still pass `Host` through unchanged (see Path C).
 - **Sizing**: each running session is one Bun process (plus a watchdog and
   your shells). A handful of sessions is well within a small homelab box.

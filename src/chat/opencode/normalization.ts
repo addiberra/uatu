@@ -1,27 +1,49 @@
 import { boundedSet } from "../../shared/bounded-map";
 import { attachmentIdFromFileUri, attachmentIdFromText } from "../attachment-store";
-import { CHAT_ATTACHMENT_MIME_TYPES, CHAT_ATTACHMENTS_PER_MESSAGE, type ConversationConfiguration, type ConversationItem, type ConversationStatus, type MessageAttachment, type StructuredQuestion, type TokenUsage } from "../types";
+import { CHAT_ATTACHMENT_MIME_TYPES, CHAT_ATTACHMENTS_PER_MESSAGE, LOGIN_FAILED_NOTICE_CODE, type ConversationConfiguration, type ConversationItem, type MessageAttachment, type StructuredQuestion, type TokenUsage } from "../types";
 import type { NormalizedEventOutcome, NormalizedProviderEvent, NormalizedProviderUpdate, NormalizedSessionLifecycle } from "../provider";
 
-// Raw OpenCode payload shapes, private to this normalizer.
+/**
+ * The normalization core both OpenCode generations share.
+ *
+ * OpenCode 2.x's session event vocabulary is 1.18's `session.next.*`
+ * generation with the `next.` segment dropped, so the text, reasoning, tool,
+ * step, shell, revert, and compaction state machines are one implementation
+ * here, keyed by the 2.x (canonical) names and reading the canonical payload
+ * shape — which is 1.18's, because that is what the fixtures that define this
+ * behavior were captured from. Each generation contributes a
+ * `GenerationMapper`: `toCanonical` renames (and, for 2.x, reshapes) a wire
+ * event into the canonical form, and `own` handles what that generation alone
+ * announces (1.x: cumulative `message.*` records and the `question.*` family;
+ * 2.x: the `session.execution.*` turn lifecycle, `form.*`, usage updates).
+ *
+ * The stored-record readers (`normalizeProviderMessage`, `storedMessageUsage`,
+ * `storedPromptId`) read 1.x's two store shapes; 2.x's provider maps its own
+ * message records onto `normalizePart` and friends.
+ */
+
+// Raw OpenCode payload shapes, private to the normalizers.
 export type ProviderMessage = Record<string, unknown>;
 export type ProviderEvent = Record<string, unknown>;
 
 export type { NormalizedEventOutcome, NormalizedProviderEvent, NormalizedProviderUpdate, NormalizedSessionLifecycle };
 
-type RecordValue = Record<string, unknown>;
+export type RecordValue = Record<string, unknown>;
 
 export type ProviderEventMemory = {
   roles: Map<string, string>;
+  // The newest user message seen per session: the prompt an assistant message
+  // answers when the event does not name it (the v2 record has no `parentID`).
+  prompts: Map<string, string>;
 };
 
 export function createProviderEventMemory(): ProviderEventMemory {
-  return { roles: new Map() };
+  return { roles: new Map(), prompts: new Map() };
 }
 
 const MEMORY_LIMIT = 2_048;
 
-function remember<T>(map: Map<string, T>, key: string, value: T): void {
+export function remember<T>(map: Map<string, T>, key: string, value: T): void {
   boundedSet(map, key, value, MEMORY_LIMIT);
 }
 
@@ -33,20 +55,28 @@ function remember<T>(map: Map<string, T>, key: string, value: T): void {
  *
  * `tokens.total` is deliberately not read — it counts output, so it is not
  * what occupies the context window.
+ *
+ * `cost` is the message's price in USD, a sibling of `tokens` on the
+ * message rather than a member of it, so it arrives separately. OpenCode
+ * reports `0` for a model it has no price for; that is kept as zero (the
+ * readout decides that an all-zero conversation shows no cost) and only a
+ * missing or malformed figure stays absent.
  */
-export function tokensToUsage(value: unknown): TokenUsage | undefined {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
-  const tokens = value as RecordValue;
-  const cache = record(tokens.cache);
+export function tokensToUsage(value: unknown, cost?: unknown): TokenUsage | undefined {
   const usage: TokenUsage = {};
   const put = (key: keyof TokenUsage, raw: unknown) => {
     if (typeof raw === "number" && Number.isFinite(raw) && raw >= 0) usage[key] = raw;
   };
-  put("input", tokens.input);
-  put("output", tokens.output);
-  put("reasoning", tokens.reasoning);
-  put("cacheRead", cache.read);
-  put("cacheWrite", cache.write);
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    const tokens = value as RecordValue;
+    const cache = record(tokens.cache);
+    put("input", tokens.input);
+    put("output", tokens.output);
+    put("reasoning", tokens.reasoning);
+    put("cacheRead", cache.read);
+    put("cacheWrite", cache.write);
+  }
+  put("costUsd", cost);
   return Object.keys(usage).length > 0 ? usage : undefined;
 }
 
@@ -58,14 +88,36 @@ export function tokensToUsage(value: unknown): TokenUsage | undefined {
  * for it is gone. Returns nothing for a user message, or for one that reported
  * neither.
  */
-export function storedMessageUsage(value: unknown): { messageId: string; createdAt: number; usage?: TokenUsage; model?: string } | undefined {
+export function storedMessageUsage(value: unknown): { messageId: string; createdAt: number; usage?: TokenUsage; model?: string; promptId?: string } | undefined {
   const { info } = unwrapStoredMessage(value);
   const messageId = optionalString(info.id);
   if (!messageId || (info.role !== "assistant" && info.type !== "assistant")) return undefined;
-  const usage = tokensToUsage(info.tokens);
+  const usage = tokensToUsage(info.tokens, info.cost);
   const model = messageModel(info);
   if (usage === undefined && model === undefined) return undefined;
-  return { messageId, createdAt: timestamp(record(info.time).created, 0), ...(usage === undefined ? {} : { usage }), ...(model === undefined ? {} : { model }) };
+  const promptId = answeredPrompt(info);
+  return { messageId, createdAt: timestamp(record(info.time).created, 0), ...(usage === undefined ? {} : { usage }), ...(model === undefined ? {} : { model }), ...(promptId === undefined ? {} : { promptId }) };
+}
+
+/**
+ * The id of a stored USER message, or nothing for any other kind. The v2
+ * record names no prompt on an assistant message, so a reader walking the
+ * transcript in order pairs each assistant message with the newest user
+ * message before it; this is how it recognises one.
+ */
+export function storedPromptId(value: unknown): string | undefined {
+  const { info } = unwrapStoredMessage(value);
+  return info.role === "user" || info.type === "user" ? optionalString(info.id) : undefined;
+}
+
+/** The user message an assistant message answers, where the record names it (classic: `parentID`). */
+export function answeredPrompt(info: RecordValue): string | undefined {
+  return optionalString(info.parentID ?? info.parentId);
+}
+
+/** The agent that produced a message: `agent` in both stores, `mode` in older classic records. */
+export function messageAgent(info: RecordValue): string | undefined {
+  return optionalString(info.agent ?? info.mode);
 }
 
 /**
@@ -76,50 +128,34 @@ export function storedMessageUsage(value: unknown): { messageId: string; created
  * persisted v2 child restores its cost with no model label and the completed
  * attribution is then banked without one for good.
  */
-function messageModel(info: RecordValue): string | undefined {
+export function messageModel(info: RecordValue): string | undefined {
   return optionalString(info.modelID ?? info.modelId) ?? optionalString(record(info.model).id);
 }
 
-function messageModelSelection(info: RecordValue): { providerId: string; modelId: string } | undefined {
+export function messageModelSelection(info: RecordValue): { providerId: string; modelId: string } | undefined {
   const model = record(info.model);
   const providerId = optionalString(info.providerID ?? info.providerId) ?? optionalString(model.providerID ?? model.providerId);
   const modelId = messageModel(info);
   return providerId && modelId ? { providerId, modelId } : undefined;
 }
 
-// Event types recognized as deliberately carrying nothing for the timeline.
-// Listed rather than lumped with `unrecognized` so the drop counter stays
-// honest about what the workspace genuinely does not understand.
-const INTENTIONALLY_IGNORED = new Set([
+// Canonical event types recognized as deliberately carrying nothing for the
+// timeline. Listed rather than lumped with `unrecognized` so the drop counter
+// stays honest about what the workspace genuinely does not understand. Each
+// generation adds its own wire-level list on top.
+export const CORE_IGNORED: ReadonlySet<string> = new Set([
   // Streaming progress for an operation whose started/ended pair is enough.
-  "session.next.compaction.delta",
-  "session.next.tool.input.started",
-  "session.next.tool.input.delta",
-  "session.next.tool.input.ended",
+  "session.compaction.delta",
+  "session.tool.input.started",
+  "session.tool.input.delta",
+  "session.tool.input.ended",
   // Server and workspace lifecycle with no conversation meaning.
   "server.connected",
-  "server.heartbeat",
-  "server.instance.disposed",
-  "global.disposed",
   "installation.updated",
-  "installation.update.available",
-  "catalog.updated",
-  "plugin.added",
   "integration.updated",
-  "integration.connection.updated",
   "project.updated",
-  "project.directories.updated",
-  "file.watcher.updated",
   "reference.updated",
-  "lsp.updated",
-  "mcp.tools.changed",
-  "mcp.browser.open.failed",
   "vcs.branch.updated",
-  "workspace.ready",
-  "workspace.failed",
-  "workspace.status",
-  "worktree.ready",
-  "worktree.failed",
   "pty.created",
   "pty.updated",
   "pty.exited",
@@ -173,6 +209,7 @@ export function normalizeProviderMessage(value: unknown, mintUsageCarrier = true
         command: text(message.command),
         output: text(message.output),
         status: isFinishedTime(message.time) ? "completed" : "running",
+        ...completionTime(finishedTime(message.time)),
       }];
     case "synthetic":
     case "system":
@@ -184,17 +221,79 @@ export function normalizeProviderMessage(value: unknown, mintUsageCarrier = true
   }
 }
 
+// What one event contributes beyond its timeline updates. Assembled by the
+// core's canonical cases and by each generation's own handlers alike.
+export type KnownEvent = {
+  conversationId?: string;
+  updates: NormalizedProviderUpdate[];
+  assistantModel?: { messageId: string; model: string; createdAt: number; promptId?: string };
+  assistantUsage?: { messageId: string; usage: TokenUsage; promptId?: string };
+  removedMessageId?: string;
+  configuration?: ConversationConfiguration;
+  replaceModel?: boolean;
+  sessionLifecycle?: NormalizedSessionLifecycle;
+  revertLifecycle?: "staged" | "committed" | "cleared";
+  // Part types the event carried that no part reader handles, by type only.
+  skippedBlocks?: string[];
+};
+
+// The identity every handler needs, computed once per event from its payload:
+// the owning session, an id for items minted from the event itself, and when
+// it happened.
+export type EventContext = {
+  conversationId: string | undefined;
+  eventId: string;
+  createdAt: number;
+};
+
+export function eventContext(event: RecordValue, data: RecordValue): EventContext {
+  return {
+    conversationId: optionalString(data.sessionID) ?? optionalString(data.sessionId),
+    eventId: optionalString(event.id) ?? `${String(event.type)}:${timestamp(data.timestamp, Date.now())}`,
+    createdAt: timestamp(data.timestamp ?? data.timeCreated, Date.now()),
+  };
+}
+
+// A canonical event: a 2.x type name over the canonical payload shape.
+export type CanonicalEvent = { type: string; data: RecordValue };
+
+/**
+ * What one OpenCode generation contributes to normalization. `own` runs first
+ * and handles what only that generation announces; otherwise `toCanonical`
+ * maps the wire event onto a canonical one for the shared cases. Returning
+ * `undefined` from both leaves the event to the ignore list, or to the
+ * `unrecognized` counter.
+ */
+export type GenerationMapper<Memory extends ProviderEventMemory = ProviderEventMemory> = {
+  own(event: RecordValue, data: RecordValue, context: EventContext, memory?: Memory): KnownEvent | undefined;
+  toCanonical(type: string, data: RecordValue, event: RecordValue): CanonicalEvent | undefined;
+  // Wire-level types this generation deliberately carries nothing for, on
+  // top of `CORE_IGNORED` (which is matched against the canonical name).
+  ignored: ReadonlySet<string>;
+};
+
 // Public boundary. Every failure mode resolves to an outcome rather than an
 // exception, so one malformed payload costs one event instead of the pump.
-export function normalizeProviderEvent(value: unknown, memory?: ProviderEventMemory): NormalizedProviderEvent {
-  const eventType = optionalString(record(value).type) ?? "";
+export function normalizeEventWith<Memory extends ProviderEventMemory>(value: unknown, mapper: GenerationMapper<Memory>, memory?: Memory): NormalizedProviderEvent {
+  const event = record(value);
+  const eventType = optionalString(event.type) ?? "";
   try {
-    const matched = normalizeKnownEvent(value, memory);
+    const data = record(event.data ?? event.properties);
+    const context = eventContext(event, data);
+    let matched = mapper.own(event, data, context, memory);
+    let canonicalType: string | undefined;
+    if (!matched) {
+      const canonical = mapper.toCanonical(eventType, data, event);
+      if (canonical) {
+        canonicalType = canonical.type;
+        matched = normalizeCanonicalEvent(canonical.type, canonical.data, eventContext(event, canonical.data));
+      }
+    }
     if (matched) return { ...matched, outcome: matched.updates.length > 0 || matched.sessionLifecycle || matched.revertLifecycle ? "handled" : "ignored", eventType };
     return {
       conversationId: conversationIdOf(value),
       updates: [],
-      outcome: INTENTIONALLY_IGNORED.has(eventType) ? "ignored" : "unrecognized",
+      outcome: mapper.ignored.has(eventType) || CORE_IGNORED.has(canonicalType ?? eventType) ? "ignored" : "unrecognized",
       eventType,
     };
   } catch {
@@ -214,33 +313,19 @@ function conversationIdOf(value: unknown): string | undefined {
   }
 }
 
-type KnownEvent = {
-  conversationId?: string;
-  updates: NormalizedProviderUpdate[];
-  assistantModel?: { messageId: string; model: string; createdAt: number };
-  assistantUsage?: { messageId: string; usage: TokenUsage };
-  removedMessageId?: string;
-  configuration?: ConversationConfiguration;
-  replaceModel?: boolean;
-  sessionLifecycle?: NormalizedSessionLifecycle;
-  revertLifecycle?: "staged" | "committed" | "cleared";
-};
-
-function normalizeKnownEvent(value: unknown, memory?: ProviderEventMemory): KnownEvent | undefined {
-  const event = record(value);
-  const data = record(event.data ?? event.properties);
-  const conversationId = optionalString(data.sessionID) ?? optionalString(data.sessionId);
-  const eventId = optionalString(event.id) ?? `${String(event.type)}:${timestamp(data.timestamp, Date.now())}`;
-  const createdAt = timestamp(data.timestamp ?? data.timeCreated, Date.now());
-
-  switch (event.type) {
+// The shared cases, by canonical (2.x) name over the canonical payload shape.
+// 1.x reaches them by renaming `session.next.X`; 2.x by reshaping its typed
+// payloads onto the same fields.
+export function normalizeCanonicalEvent(type: string, data: RecordValue, context: EventContext): KnownEvent | undefined {
+  const { conversationId, eventId, createdAt } = context;
+  switch (type) {
     case "session.created": {
       const sessionLifecycle = normalizeSessionLifecycle("created", data);
       return { conversationId: conversationId ?? sessionLifecycle.id, updates: [], sessionLifecycle };
     }
-    case "session.next.agent.switched":
+    case "session.agent.selected":
       return { conversationId, updates: [], configuration: { mode: string(data.agent, "session agent") } };
-    case "session.next.model.switched": {
+    case "session.model.selected": {
       const model = record(data.model);
       const providerId = string(model.providerID ?? model.providerId, "model provider id");
       const modelId = string(model.id ?? model.modelID ?? model.modelId, "model id");
@@ -269,23 +354,7 @@ function normalizeKnownEvent(value: unknown, memory?: ProviderEventMemory): Know
       const sessionLifecycle = normalizeSessionLifecycle("deleted", data);
       return { conversationId: conversationId ?? sessionLifecycle.id, updates: [], sessionLifecycle };
     }
-    case "session.next.prompted":
-    case "session.next.prompt.admitted": {
-      const prompt = record(data.prompt);
-      const messageId = optionalString(data.messageID) ?? optionalString(data.id) ?? eventId;
-      return {
-        conversationId,
-        updates: [{ kind: "upsert", item: {
-          id: `message:${messageId}`,
-          type: "user_message",
-          createdAt,
-          text: text(prompt.text),
-          requestId: optionalString(data.id),
-        } }],
-      };
-    }
-    case "session.next.context.updated":
-    case "session.next.synthetic":
+    case "session.synthetic":
       return { conversationId, updates: [{ kind: "upsert", item: {
         id: `notice:${eventId}`,
         type: "notice",
@@ -293,35 +362,34 @@ function normalizeKnownEvent(value: unknown, memory?: ProviderEventMemory): Know
         level: "info",
         message: text(data.text) || "Context updated",
       } }] };
-    case "session.next.text.started":
+    case "session.text.started":
       return textUpdate(data, eventId, createdAt, "cumulative", "");
-    case "session.next.text.delta":
-    case "message.part.delta":
+    case "session.text.delta":
       return textUpdate(data, eventId, createdAt, "incremental", text(data.delta ?? data.text));
-    case "session.next.text.ended":
+    case "session.text.ended":
       return textUpdate(data, eventId, createdAt, "cumulative", text(data.text));
-    case "session.next.reasoning.started":
-    case "session.next.reasoning.delta":
-    case "session.next.reasoning.ended": {
+    case "session.reasoning.started":
+    case "session.reasoning.delta":
+    case "session.reasoning.ended": {
       const partId = optionalString(data.reasoningID) ?? optionalString(data.partID) ?? optionalString(data.id) ?? eventId;
       const item = {
         id: `reasoning:${partId}`,
         type: "reasoning" as const,
         createdAt,
         text: "",
-        status: String(event.type).endsWith("ended") ? "completed" as const : "running" as const,
+        status: type.endsWith("ended") ? "completed" as const : "running" as const,
       };
       return { conversationId, updates: [{
         kind: "text",
         itemId: item.id,
         identity: partId,
-        mode: String(event.type).endsWith("delta") ? "incremental" : "cumulative",
+        mode: type.endsWith("delta") ? "incremental" : "cumulative",
         text: text(data.text ?? data.delta),
         item,
       }] };
     }
-    case "session.next.shell.started":
-    case "session.next.shell.ended": {
+    case "session.shell.started":
+    case "session.shell.ended": {
       const callId = optionalString(data.callID) ?? eventId;
       const exitCode = number(data.exitCode);
       return { conversationId, updates: [{ kind: "upsert", item: {
@@ -331,53 +399,63 @@ function normalizeKnownEvent(value: unknown, memory?: ProviderEventMemory): Know
         command: text(data.command) || "command",
         output: optionalString(data.output),
         exitCode,
-        status: String(event.type).endsWith("ended") ? (exitCode === undefined || exitCode === 0 ? "completed" : "failed") : "running",
+        status: type.endsWith("ended") ? (exitCode === undefined || exitCode === 0 ? "completed" : "failed") : "running",
+        ...(type === "session.shell.ended" ? completionTime(data.timestamp) : {}),
       } }] };
     }
-    case "session.next.tool.called":
-    case "session.next.tool.progress":
-    case "session.next.tool.success":
-    case "session.next.tool.failed":
-      return normalizeToolEvent(event, data, conversationId, eventId, createdAt);
+    case "session.tool.called":
+    case "session.tool.progress":
+    case "session.tool.success":
+    case "session.tool.failed":
+      return normalizeToolEvent(type, data, conversationId, eventId, createdAt);
     // Compaction and revert both change what the transcript means. Unmapped,
     // a compacted conversation looks like it silently lost content and
     // reverted work keeps rendering as though it still applies. Notices rather
     // than a new item type: the requirement is that the transcript stop lying,
     // and a new type would drag the published ConversationItem schema — and an
     // API revision — into a change that otherwise needs none.
-    case "session.next.compaction.started":
+    // One row per compaction, not per phase: the outcome replaces the
+    // "Compacting…" marker instead of leaving it beside itself. 2.x names
+    // the compaction (`inputID`) on every phase; 1.x does not, and there
+    // each phase keeps its own row as before.
+    case "session.compaction.started":
       return { conversationId, updates: [{ kind: "upsert", item: {
-        id: `notice:${eventId}`,
+        id: compactionNoticeId(data, eventId),
         type: "notice",
         createdAt,
         level: "info",
         message: "Compacting conversation context…",
       } }] };
-    case "session.next.compaction.ended":
+    case "session.compaction.ended":
       return { conversationId, updates: [{ kind: "upsert", item: {
-        id: `notice:${eventId}`,
+        id: compactionNoticeId(data, eventId),
         type: "notice",
         createdAt,
         level: "info",
         message: text(data.summary) || "Conversation context compacted. Earlier turns are summarized.",
       } }] };
-    case "session.next.revert.staged":
-    case "session.next.revert.committed":
-    case "session.next.revert.cleared":
+    case "session.revert.staged":
+    case "session.revert.committed":
+    case "session.revert.cleared":
       return {
         conversationId,
         updates: [],
-        revertLifecycle: event.type === "session.next.revert.staged"
+        revertLifecycle: type === "session.revert.staged"
           ? "staged"
-          : event.type === "session.next.revert.committed" ? "committed" : "cleared",
+          : type === "session.revert.committed" ? "committed" : "cleared",
       };
-    case "session.next.step.ended":
+    case "session.step.ended":
       return { conversationId, updates: normalizeDiffs(data, createdAt) };
-    // OpenCode 1.18 announces one request under two naming generations: v2 is
-    // native and the classic name is bridged from it (`action`→`permission`,
-    // `resources`→`patterns`, `save`→`always`). Both carry the same request id,
-    // so mapping both onto `permission:<id>` makes the projection upsert the
-    // dedupe — whichever arrives second merges into the same entry.
+    // 1.18 announces one request under two naming generations: v2 is native
+    // and the classic name is bridged from it (`action`→`permission`,
+    // `resources`→`patterns`, `save`→`always`); 2.x announces only the native
+    // one. Both carry the same request id, so mapping both onto
+    // `permission:<id>` makes the projection upsert the dedupe — whichever
+    // arrives second merges into the same entry. `always`/`save` is what an
+    // "always" reply installs: `git status *` for a `git status --short`
+    // request (captured live from 1.18.29). It is carried apart from the
+    // request's own patterns so the card can show the user the rule they are
+    // about to grant rather than the command.
     case "permission.asked":
       return { conversationId, updates: [{ kind: "upsert", item: {
         id: `permission:${string(data.id, "permission id")}`,
@@ -385,36 +463,10 @@ function normalizeKnownEvent(value: unknown, memory?: ProviderEventMemory): Know
         createdAt,
         conversationId,
         requestId: string(data.id, "permission id"),
-        action: text(data.permission),
-        resources: stringArray(data.patterns),
+        ...pendingPermissionFields(data),
         status: "pending",
-        ...permissionDiff(data),
       } }] };
-    case "permission.replied":
-      return { conversationId, updates: [{ kind: "upsert", item: {
-        id: `permission:${string(data.requestID, "permission id")}`,
-        type: "permission",
-        createdAt,
-        conversationId,
-        requestId: string(data.requestID, "permission id"),
-        action: "permission",
-        resources: [],
-        status: "resolved",
-        outcome: permissionOutcome(data.reply),
-      } }] };
-    case "permission.v2.asked":
-      return { conversationId, updates: [{ kind: "upsert", item: {
-        id: `permission:${string(data.id, "permission id")}`,
-        type: "permission",
-        createdAt,
-        conversationId,
-        requestId: string(data.id, "permission id"),
-        action: text(data.action),
-        resources: stringArray(data.resources),
-        status: "pending",
-        ...permissionDiff(data),
-      } }] };
-    case "permission.v2.replied": {
+    case "permission.replied": {
       const requestId = string(data.requestID, "permission id");
       return { conversationId, updates: [{ kind: "upsert", item: {
         id: `permission:${requestId}`,
@@ -428,166 +480,45 @@ function normalizeKnownEvent(value: unknown, memory?: ProviderEventMemory): Know
         outcome: permissionOutcome(data.reply),
       } }] };
     }
-    // Same two-generation story as permissions. This one matters more: the
-    // workspace previously saw no live question signal at all and fell back to
-    // polling, because it was listening only for the v2 name.
-    case "question.asked": {
-      const requestId = string(data.id, "question id");
-      return { conversationId, updates: [{ kind: "upsert", item: {
-        id: `question:${requestId}`,
-        type: "question",
-        createdAt,
-        conversationId,
-        requestId,
-        questions: array(data.questions).map(normalizeQuestion),
-        status: "pending",
-      } }] };
-    }
-    case "question.replied":
-    case "question.rejected": {
-      const requestId = string(data.requestID, "question id");
-      return { conversationId, updates: [{ kind: "upsert", item: {
-        id: `question:${requestId}`,
-        type: "question",
-        createdAt,
-        conversationId,
-        requestId,
-        questions: [],
-        status: "resolved",
-        outcome: event.type === "question.rejected"
-          ? { kind: "rejected" }
-          : { kind: "answered", answers: array(data.answers).map(stringArray) },
-      } }] };
-    }
-    case "question.v2.asked": {
-      const requestId = string(data.id, "question id");
-      return { conversationId, updates: [{ kind: "upsert", item: {
-        id: `question:${requestId}`,
-        type: "question",
-        createdAt,
-        conversationId,
-        requestId,
-        questions: array(data.questions).map(normalizeQuestion),
-        status: "pending",
-      } }] };
-    }
-    case "question.v2.replied":
-    case "question.v2.rejected": {
-      const requestId = string(data.requestID, "question id");
-      return { conversationId, updates: [{ kind: "upsert", item: {
-        id: `question:${requestId}`,
-        type: "question",
-        createdAt,
-        conversationId,
-        requestId,
-        questions: [],
-        status: "resolved",
-        outcome: event.type === "question.v2.rejected"
-          ? { kind: "rejected" }
-          : { kind: "answered", answers: array(data.answers).map(stringArray) },
-      } }] };
-    }
     case "session.status": {
       const providerStatus = record(data.status);
-      const type = optionalString(providerStatus.type) ?? optionalString(data.status);
-      return { conversationId, updates: [{ kind: "status", status: type === "idle" ? "completed" : "running" }] };
+      const statusType = optionalString(providerStatus.type) ?? optionalString(data.status);
+      return { conversationId, updates: [{ kind: "status", status: statusType === "idle" ? "completed" : "running" }] };
     }
     case "session.idle":
       return { conversationId, updates: [{ kind: "status", status: "completed" }] };
-    case "session.error":
-    case "session.next.step.failed": {
+    case "session.step.failed": {
       const message = errorMessage(data.error) || text(data.message) || "The turn failed";
       return { conversationId, updates: [
-        { kind: "upsert", item: { id: `notice:${eventId}`, type: "notice", createdAt, level: "error", message } },
+        { kind: "upsert", item: { id: `notice:${eventId}`, type: "notice", createdAt, level: "error", message, ...(isLoginError(data.error) ? { code: LOGIN_FAILED_NOTICE_CODE } : {}) } },
         { kind: "status", status: "failed", message },
       ] };
     }
-    case "session.next.retried":
-      return { conversationId, updates: [{ kind: "upsert", item: {
-        id: `notice:${eventId}`,
-        type: "notice",
-        createdAt,
-        level: "warning",
-        message: text(data.message) || errorMessage(data.error) || "Retrying the turn",
-      } }] };
-    case "message.updated": {
-      const info = record(data.info ?? data.message);
-      const messageId = optionalString(info.id);
-      const role = optionalString(info.role) ?? optionalString(info.type);
-      if (messageId && role && memory) remember(memory.roles, messageId, role);
-      const updates: NormalizedProviderUpdate[] = normalizeProviderMessage({ info, parts: [] }, false)
-        .map(item => ({ kind: "upsert" as const, item }));
-      // A message's tokens are the message's, so they ride one item keyed by
-      // the message — never a text part it produced. `message.updated`
-      // restates a growing cumulative figure, and a message can emit several
-      // text parts: decorating "the newest part" left the earlier part still
-      // claiming the same total, so one message's spend appeared on two items
-      // and anything aggregating them counted it twice. One carrier per
-      // message cannot double-count, needs no memory of which part came last,
-      // and covers the message that produces no text part at all (a purely
-      // agentic turn still fills the context window). Empty markdown is what
-      // keeps it off the screen — the renderer draws no bubble for it.
-      const usage = role === "assistant" ? tokensToUsage(info.tokens) : undefined;
-      let reported: { messageId: string; usage: TokenUsage } | undefined;
-      if (usage && messageId) {
-        reported = { messageId, usage };
-        updates.push(usageUpsert(`usage:${messageId}`, timestamp(record(info.time).created, createdAt), usage, messageModelSelection(info)));
-      }
-      const model = role === "assistant" ? messageModel(info) : undefined;
-      const assistantModel = model && messageId
-        ? { messageId, model, createdAt: timestamp(record(info.time).created, createdAt) }
-        : undefined;
-      return {
-        conversationId: conversationId ?? optionalString(info.sessionID),
-        updates,
-        ...(assistantModel === undefined ? {} : { assistantModel }),
-        ...(reported === undefined ? {} : { assistantUsage: reported }),
-      };
-    }
-    case "message.removed": {
-      const messageId = optionalString(data.messageID) ?? optionalString(data.messageId);
-      if (!messageId) return { conversationId, updates: [] };
-      memory?.roles.delete(messageId);
-      return {
-        conversationId,
-        updates: [
-          { kind: "remove", itemId: `message:${messageId}` },
-          { kind: "remove", itemId: `usage:${messageId}` },
-        ],
-        removedMessageId: messageId,
-      };
-    }
-    case "message.part.updated": {
-      const part = record(data.part);
-      const messageId = optionalString(part.messageID);
-      if (part.type === "text" && messageId && memory?.roles.get(messageId) === "user") {
-        return { conversationId: conversationId ?? optionalString(part.sessionID), updates: [{ kind: "upsert", item: {
-          id: `message:${messageId}`,
-          type: "user_message",
-          createdAt: timestamp(record(part.time).created ?? data.time, createdAt),
-          text: text(part.text),
-        } }] };
-      }
-      // A part carries no token report of its own: usage arrives on
-      // `message.updated` and lands on the message's own carrier, so a part
-      // needs no bookkeeping about where a figure should go.
-      const partCreatedAt = timestamp(record(data.message).time, createdAt);
-      return {
-        conversationId: conversationId ?? optionalString(part.sessionID),
-        updates: normalizePart(part, partCreatedAt),
-      };
-    }
-    case "message.part.removed": {
-      const partId = optionalString(data.partID);
-      return { conversationId, updates: partId ? [{ kind: "remove", itemId: `part:${partId}` }] : [] };
-    }
+    case "session.retry.scheduled":
+      // The failed step that precedes this ended the turn as failed; the
+      // retry means it is still live, and a live turn holds prompts and
+      // stays in the workspace's activity.
+      return { conversationId, updates: [
+        { kind: "upsert", item: {
+          id: `notice:${eventId}`,
+          type: "notice",
+          createdAt,
+          level: "warning",
+          message: text(data.message) || errorMessage(data.error) || "Retrying the turn",
+        } },
+        { kind: "status", status: "retrying" },
+      ] };
     default:
       // No case matched. The wrapper decides whether that is expected.
       return undefined;
   }
 }
 
-function normalizeSessionLifecycle(kind: NormalizedSessionLifecycle["kind"], data: RecordValue): NormalizedSessionLifecycle {
+export function compactionNoticeId(data: RecordValue, eventId: string): string {
+  return `notice:compaction:${optionalString(data.inputID) ?? eventId}`;
+}
+
+export function normalizeSessionLifecycle(kind: NormalizedSessionLifecycle["kind"], data: RecordValue): NormalizedSessionLifecycle {
   const info = record(data.info ?? data.session);
   const id = string(info.id ?? data.sessionID ?? data.sessionId, "session id");
   const directory = string(info.directory ?? record(info.location).directory, "session directory");
@@ -600,7 +531,7 @@ function normalizeSessionLifecycle(kind: NormalizedSessionLifecycle["kind"], dat
   return { kind, id, directory, title: info.title, ...(parentId ? { parentId } : {}) };
 }
 
-function configurationFromRecord(value: RecordValue): ConversationConfiguration | undefined {
+export function configurationFromRecord(value: RecordValue): ConversationConfiguration | undefined {
   const modelRecord = record(value.model);
   const providerId = optionalString(value.providerID ?? value.providerId) ?? optionalString(modelRecord.providerID ?? modelRecord.providerId);
   const modelId = optionalString(value.modelID ?? value.modelId) ?? optionalString(modelRecord.id ?? modelRecord.modelID ?? modelRecord.modelId);
@@ -619,8 +550,8 @@ function configurationFromRecord(value: RecordValue): ConversationConfiguration 
  * merge both the server and client projections apply, keeps the earlier
  * timestamp rather than resorting the timeline as the figure is restated.
  */
-function usageUpsert(itemId: string, createdAt: number, usage: TokenUsage, model?: { providerId: string; modelId: string }): NormalizedProviderUpdate {
-  return { kind: "upsert", item: { id: itemId, type: "assistant_message", createdAt, markdown: "", usage, ...(model ? { model } : {}) } };
+export function usageUpsert(itemId: string, createdAt: number, usage: TokenUsage, model?: { providerId: string; modelId: string }, agent?: string): NormalizedProviderUpdate {
+  return { kind: "upsert", item: { id: itemId, type: "assistant_message", createdAt, markdown: "", usage, ...(model ? { model } : {}), ...(agent ? { agent } : {}) } };
 }
 
 // V2 user messages echo `files: [{uri, mime, name}]` with the `file:` uri we
@@ -629,7 +560,7 @@ function usageUpsert(itemId: string, createdAt: number, usage: TokenUsage, model
 // basename is the issued attachment id (design D5), which the client turns
 // into the workspace's serve-route URL. An entry whose uri does not parse to
 // an issued-id shape becomes an id-less placeholder reference.
-function normalizeUserAttachments(value: unknown): MessageAttachment[] {
+export function normalizeUserAttachments(value: unknown): MessageAttachment[] {
   if (!Array.isArray(value)) return [];
   return value.flatMap(entry => {
     const file = record(entry);
@@ -650,12 +581,12 @@ function normalizeUserAttachments(value: unknown): MessageAttachment[] {
 // history is under no such obligation, so replayed names are truncated (by
 // code point, matching JSON Schema maxLength) rather than emitted verbatim
 // for strict consumers to reject.
-function boundReplayedName(name: string): string {
+export function boundReplayedName(name: string): string {
   const points = [...name];
   return points.length <= 200 ? name : points.slice(0, 200).join("");
 }
 
-function contractImageMime(mime: string | undefined): string | null {
+export function contractImageMime(mime: string | undefined): string | null {
   const normalized = mime?.toLowerCase();
   return normalized !== undefined && (CHAT_ATTACHMENT_MIME_TYPES as readonly string[]).includes(normalized) ? normalized : null;
 }
@@ -709,12 +640,12 @@ function normalizeStoredMessage(info: RecordValue, parts: unknown[], mintUsageCa
     return [{ id: `message:${id}`, type: "user_message", createdAt, text: body, ...(attachments.length ? { attachments } : {}) }];
   }
   if (info.role === "assistant") {
-    return normalizeAssistant({ content: parts, error: info.error, snapshot: info.snapshot, tokens: info.tokens, modelID: info.modelID ?? info.modelId, providerID: info.providerID ?? info.providerId, model: info.model }, id, createdAt, mintUsageCarrier);
+    return normalizeAssistant({ content: parts, error: info.error, snapshot: info.snapshot, tokens: info.tokens, cost: info.cost, modelID: info.modelID ?? info.modelId, providerID: info.providerID ?? info.providerId, model: info.model, agent: info.agent ?? info.mode }, id, createdAt, mintUsageCarrier);
   }
   return [];
 }
 
-function normalizeAssistant(message: RecordValue, messageId: string, createdAt: number, mintUsageCarrier: boolean): ConversationItem[] {
+export function normalizeAssistant(message: RecordValue, messageId: string, createdAt: number, mintUsageCarrier: boolean): ConversationItem[] {
   const items = array(message.content).flatMap(value => normalizePart(record(value), createdAt)).flatMap(update => {
     if (update.kind === "upsert") return [update.item];
     if (update.kind === "text" && update.item) return [update.item];
@@ -726,10 +657,11 @@ function normalizeAssistant(message: RecordValue, messageId: string, createdAt: 
   // conversation, before any new turn is taken. Never attached to a text
   // part: a message can emit several, and a per-part figure is one message's
   // spend claimed by two items.
-  const usage = tokensToUsage(message.tokens);
+  const usage = tokensToUsage(message.tokens, message.cost);
   if (usage && mintUsageCarrier) {
     const model = messageModelSelection(message);
-    items.push({ id: `usage:${messageId}`, type: "assistant_message", createdAt, markdown: "", usage, ...(model ? { model } : {}) });
+    const agent = messageAgent(message);
+    items.push({ id: `usage:${messageId}`, type: "assistant_message", createdAt, markdown: "", usage, ...(model ? { model } : {}), ...(agent ? { agent } : {}) });
   }
   const error = errorMessage(message.error);
   if (error) items.push({ id: `notice:${messageId}:error`, type: "notice", createdAt, level: "error", message: error });
@@ -739,7 +671,16 @@ function normalizeAssistant(message: RecordValue, messageId: string, createdAt: 
   return items;
 }
 
-function normalizePart(part: RecordValue, createdAt: number): NormalizedProviderUpdate[] {
+// Part types that deliberately carry nothing for the timeline, so they are
+// neither rendered nor reported as skipped: step boundaries and snapshots
+// arrive on nearly every step, and the one figure a step's end carries (its
+// cost and tokens) is restated on the message's `message.updated`, which is
+// what the usage carrier reads.
+export const IGNORED_PARTS: ReadonlySet<string> = new Set(["step-start", "step-finish", "snapshot"]);
+
+// `skipped` collects the type of a part no case reads, so a caller on the
+// live path can report it the way an unrecognized event is reported.
+export function normalizePart(part: RecordValue, createdAt: number, skipped?: string[]): NormalizedProviderUpdate[] {
   const id = string(part.id, "part id");
   if (part.type === "text") {
     const item: ConversationItem = { id: `part:${id}`, type: "assistant_message", createdAt, markdown: text(part.text) };
@@ -765,11 +706,17 @@ function normalizePart(part: RecordValue, createdAt: number): NormalizedProvider
     } }];
   }
   if (part.type === "tool") return [normalizeToolPart(part, createdAt)];
+  const type = optionalString(part.type) ?? "unknown";
+  if (!IGNORED_PARTS.has(type)) skipped?.push(type);
   return [];
 }
 
-function normalizeToolPart(part: RecordValue, createdAt: number): NormalizedProviderUpdate {
+export function normalizeToolPart(part: RecordValue, createdAt: number): NormalizedProviderUpdate {
   const state = record(part.state);
+  // Classic parts keep the terminal time on state; v2 keeps it on the part.
+  // A stray end time on pending/running state is not a completion signal.
+  const completed = state.status === "completed" || state.status === "error"
+    ? completionTime(finishedTime(state.time) ?? finishedTime(part.time)) : {};
   const metadata = record(state.metadata);
   const name = text(part.name ?? part.tool) || "tool";
   const id = optionalString(part.id) ?? optionalString(part.callID) ?? name;
@@ -787,6 +734,7 @@ function normalizeToolPart(part: RecordValue, createdAt: number): NormalizedProv
       type: "command",
       createdAt,
       command: commandText(state),
+      ...completed,
       status: exitCode !== undefined && exitCode !== 0 ? "failed" : status,
       output,
       exitCode,
@@ -801,6 +749,7 @@ function normalizeToolPart(part: RecordValue, createdAt: number): NormalizedProv
     createdAt,
     name,
     status: activityStatus(state.status),
+    ...completed,
     input,
     output,
     error,
@@ -808,16 +757,17 @@ function normalizeToolPart(part: RecordValue, createdAt: number): NormalizedProv
   } };
 }
 
-function normalizeToolEvent(event: RecordValue, data: RecordValue, conversationId: string | undefined, eventId: string, createdAt: number) {
+function normalizeToolEvent(type: string, data: RecordValue, conversationId: string | undefined, eventId: string, createdAt: number): KnownEvent {
   const callId = optionalString(data.callID) ?? eventId;
   const state = {
-    status: String(event.type).endsWith("success") ? "completed" : String(event.type).endsWith("failed") ? "error" : "running",
+    status: type.endsWith("success") ? "completed" : type.endsWith("failed") ? "error" : "running",
     input: data.input,
     content: data.content,
     output: data.output,
     result: data.result,
     error: data.error,
     metadata: data.metadata,
+    time: { end: data.timestamp },
   };
   return {
     conversationId,
@@ -852,7 +802,7 @@ function normalizeDiffs(data: RecordValue, createdAt: number): NormalizedProvide
   });
 }
 
-function textUpdate(data: RecordValue, fallbackId: string, createdAt: number, mode: "cumulative" | "incremental", value: string) {
+export function textUpdate(data: RecordValue, fallbackId: string, createdAt: number, mode: "cumulative" | "incremental", value: string): KnownEvent {
   const partId = optionalString(data.textID) ?? optionalString(data.partID) ?? optionalString(data.id) ?? fallbackId;
   const itemId = `part:${partId}`;
   return {
@@ -882,8 +832,39 @@ export function normalizeQuestion(value: unknown): StructuredQuestion {
   };
 }
 
-function permissionOutcome(value: unknown): "approved-once" | "approved-session" | "rejected" {
+export function permissionOutcome(value: unknown): "approved-once" | "approved-session" | "rejected" {
   return value === "once" ? "approved-once" : value === "always" ? "approved-session" : "rejected";
+}
+
+// What a pending permission carries, read from either generation's field
+// names (v2: action/resources/save; the classic bridge: permission/patterns/
+// always). One reader for the live events and the pending list, so a field
+// cannot land on one path and not the other. `alwaysPatterns` is what an
+// "always" reply installs; missing on both spellings is an empty list, since
+// OpenCode installs nothing then and the card should say so rather than guess.
+// Empty strings are dropped: the client validator refuses them, and a
+// server item the client cannot parse would loop the stream through resync.
+export function pendingPermissionFields(data: RecordValue): { action: string; resources: string[]; alwaysPatterns: string[]; diff?: string; sourceToolId?: string } {
+  return {
+    action: text(data.action ?? data.permission),
+    resources: stringArray(data.resources ?? data.patterns).filter(Boolean),
+    alwaysPatterns: stringArray(data.always ?? data.save).filter(Boolean),
+    ...permissionDiff(data),
+    ...permissionSourceTool(data),
+  };
+}
+
+// The tool call a permission belongs to, as the timeline id of its row.
+// 2.x names it on every tool-raised request (`source: { type: "tool",
+// messageID, id }`, captured live from 2.0.18 for an MCP tool: the `id` is
+// the call id the tool row was minted from, `tool:<id>`). The classic 1.x
+// request records `tool: { messageID, callID }` server-side; read here too
+// in case the bridged event carries it. Nothing on either spelling yields
+// nothing to spread, and the client falls back on the action name.
+export function permissionSourceTool(data: RecordValue): { sourceToolId?: string } {
+  const source = record(data.source);
+  const id = source.type === "tool" ? optionalString(source.id) : optionalString(record(data.tool).callID);
+  return id ? { sourceToolId: `tool:${id}` } : {};
 }
 
 // The change a file-edit permission would apply, when the agent attaches one.
@@ -901,8 +882,11 @@ function activityStatus(value: unknown): "pending" | "running" | "completed" | "
   return value === "pending" ? "pending" : value === "completed" ? "completed" : value === "error" ? "failed" : "running";
 }
 
+// Tool names whose part renders as a command row rather than a tool row.
+export const COMMAND_TOOL_NAMES: readonly string[] = ["bash", "shell", "command", "terminal"];
+
 function isCommand(name: string, state: RecordValue): boolean {
-  return /^(bash|shell|command|terminal)$/i.test(name) || optionalString(record(state.structured).command) !== undefined;
+  return COMMAND_TOOL_NAMES.includes(name.toLowerCase()) || optionalString(record(state.structured).command) !== undefined;
 }
 
 function commandText(state: RecordValue): string {
@@ -916,7 +900,21 @@ function toolContent(value: unknown): string | undefined {
   return content || undefined;
 }
 
-function errorMessage(value: unknown): string | undefined {
+/**
+ * Whether a turn failed on the provider's login rather than on the request.
+ * 1.x: `ProviderAuthError` (no usable credential), or an `APIError` the
+ * provider answered 401 (a rejected key). 2.x: `provider.auth`, or status
+ * 401. Shapes as both generations reported a rejected Groq key on
+ * 2026-10-03 (1.18.34, 2.0.13).
+ */
+export function isLoginError(value: unknown): boolean {
+  const error = record(value);
+  const data = record(error.data);
+  if (error.name === "ProviderAuthError" || error.type === "provider.auth") return true;
+  return data.statusCode === 401 || error.status === 401 || error.statusCode === 401;
+}
+
+export function errorMessage(value: unknown): string | undefined {
   const error = record(value);
   return optionalString(error.message) ?? optionalString(record(error.data).message);
 }
@@ -926,45 +924,53 @@ function errorMessage(value: unknown): string | undefined {
  * `time.completed`, the classic store sets `time.end`. Reading only one leaves
  * replayed history claiming it is still running.
  */
-function isFinishedTime(value: unknown): boolean {
-  const time = record(value);
-  return time.completed !== undefined || time.end !== undefined;
+export function isFinishedTime(value: unknown): boolean {
+  return finishedTime(value) !== undefined;
 }
 
-function record(value: unknown): RecordValue {
+export function finishedTime(value: unknown): number | undefined {
+  const time = record(value);
+  return completionTime(time.completed).completedAt ?? completionTime(time.end).completedAt;
+}
+
+export function completionTime(value: unknown): { completedAt?: number } {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? { completedAt: value } : {};
+}
+
+export function record(value: unknown): RecordValue {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? value as RecordValue : {};
 }
 
-function array(value: unknown): unknown[] {
+export function array(value: unknown): unknown[] {
   return Array.isArray(value) ? value : [];
 }
 
-function string(value: unknown, field: string): string {
+export function string(value: unknown, field: string): string {
   if (typeof value !== "string" || !value) throw new Error(`invalid OpenCode ${field}`);
   return value;
 }
 
-function optionalString(value: unknown): string | undefined {
+export function optionalString(value: unknown): string | undefined {
   return typeof value === "string" && value ? value : undefined;
 }
 
-function text(value: unknown): string {
+export function text(value: unknown): string {
   return typeof value === "string" ? value : "";
 }
 
-function timestamp(value: unknown, fallback: number): number {
+export function timestamp(value: unknown, fallback: number): number {
   return typeof value === "number" && Number.isFinite(value) ? value : fallback;
 }
 
-function number(value: unknown): number | undefined {
+export function number(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
-function stringArray(value: unknown): string[] {
+export function stringArray(value: unknown): string[] {
   return array(value).filter((item): item is string => typeof item === "string");
 }
 
-function json(value: unknown): string | undefined {
+export function json(value: unknown): string | undefined {
   if (value === undefined) return undefined;
   if (typeof value === "string") return value;
   try {

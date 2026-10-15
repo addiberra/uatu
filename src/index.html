@@ -73,10 +73,19 @@
             </svg>
             <div class="brand-text">
               <h1 class="brand-wordmark">UatuCode</h1>
-              <span id="connection-state" class="connection-state" title="Connecting to the uatu backend">
+              <button
+                id="connection-state"
+                class="connection-state"
+                type="button"
+                title="Connecting to the uatu backend"
+                aria-label="Reconnect to the uatu backend"
+              >
                 <span class="indicator-dot" aria-hidden="true"></span>
                 <span class="connection-label">Connecting</span>
-              </span>
+              </button>
+              <!-- Why a start of a stopped session was refused (shell/connection.ts);
+                   hidden unless there is something to say. -->
+              <p id="connection-error" class="connection-error" role="alert" hidden></p>
             </div>
           </div>
           <div class="sidebar-header-actions">
@@ -186,12 +195,17 @@
                  page can belong to a stopped session, so no default. -->
             <span class="indicator-dot" aria-hidden="true"></span>
             <span id="hub-current" class="hub-toggle-label"></span>
+            <!-- Other workspaces' activity, from the live stream: a count
+                 pill while one awaits the user, a quiet dot while agents
+                 merely work. The button's aria-label carries the words. -->
+            <span id="hub-activity-badge" class="hub-activity-badge" aria-hidden="true" hidden></span>
             <svg viewBox="0 0 16 16" width="10" height="10" aria-hidden="true">
               <path d="M4 6l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />
             </svg>
           </button>
           <div id="hub-menu" class="panels-menu hub-menu" hidden></div>
         </div>
+        <div class="sidebar-notifications-row" hidden></div>
         <div class="sidebar-mode-row">
           <button
             id="follow-toggle"
@@ -343,12 +357,13 @@
             <header class="pane-header">
               <h2>Usage</h2>
               <div class="pane-actions">
+                <button class="pane-action" type="button" data-usage-read="start" aria-label="Read usage now" title="Read usage now" hidden>↻</button>
                 <button class="pane-action" type="button" data-pane-collapse="usage" aria-label="Collapse Usage" title="Collapse pane">−</button>
                 <button class="pane-action" type="button" data-pane-hide="usage" aria-label="Hide Usage" title="Hide pane">×</button>
               </div>
             </header>
             <div id="usage-pane" class="pane-body usage-pane">
-              <p class="pane-empty">Plan usage appears here after a Claude Code turn.</p>
+              <p class="pane-empty">No usage read yet.</p>
             </div>
             <div class="pane-resizer" data-pane-resizer="usage" role="separator" aria-orientation="horizontal" aria-label="Resize Usage"></div>
           </section>
@@ -774,12 +789,25 @@
                 <p id="chat-drilldown-title" class="chat-drilldown-title"></p>
               </header>
               <div id="chat-drilldown-state" class="chat-state chat-drilldown-state" role="status" aria-live="polite" hidden></div>
+              <!-- A running background task's facts, over the transcript it
+                   runs as (an agent task) or over its output (a shell task):
+                   description, progress, elapsed, spend, and Stop. Filled and
+                   kept current by the same repaint as the composer's task
+                   list; it settles into one line when the task does. -->
+              <div id="chat-drilldown-task" class="chat-drilldown-task" hidden></div>
               <div id="chat-drilldown-timeline" class="chat-timeline chat-drilldown-timeline" role="log" aria-live="polite" aria-relevant="additions text" tabindex="0">
                 <!-- A subagent can outrun one page like any conversation; without
                      this its earlier messages are simply absent, with nothing
                      saying so. -->
                 <button id="chat-drilldown-older" class="chat-secondary-button chat-load-older" type="button" hidden>Load older messages</button>
                 <div id="chat-drilldown-items"></div>
+              </div>
+              <!-- A shell task's view: the tail of its output file, re-read
+                   while it runs. Takes the timeline's place; there is no
+                   transcript to show for a command. -->
+              <div id="chat-drilldown-output" class="chat-drilldown-output" hidden>
+                <p id="chat-drilldown-output-note" class="chat-drilldown-output-note" role="status" hidden></p>
+                <pre id="chat-drilldown-output-text" class="chat-drilldown-output-text" aria-label="Task output" tabindex="0"></pre>
               </div>
             </section>
             <!-- Both pin to the transcript's lower edge rather than to a
@@ -805,6 +833,17 @@
             <summary><span id="chat-background-tasks-label"></span></summary>
             <ul id="chat-background-tasks-items" aria-label="Background tasks"></ul>
           </details>
+          <!-- The agent's own future turns, while its session is held for
+               them: one row per pending wakeup (prompt, whether it recurs,
+               when it next fires) and the release that ends them all. -->
+          <details id="chat-scheduled-wakeups" class="chat-task-list chat-scheduled-wakeups" hidden>
+            <summary><span id="chat-scheduled-wakeups-label"></span></summary>
+            <ul id="chat-scheduled-wakeups-items" aria-label="Scheduled wakeups"></ul>
+            <div class="chat-wakeups-release">
+              <span id="chat-wakeups-release-note" class="chat-wakeups-release-note"></span>
+              <button id="chat-wakeups-release" class="chat-task-stop" type="button">Release session</button>
+            </div>
+          </details>
           <details id="chat-reverted" class="chat-reverted" hidden open>
             <summary><span id="chat-reverted-label">Reverted messages</span></summary>
             <div id="chat-reverted-items" class="chat-reverted-items" role="list" aria-label="Reverted messages"></div>
@@ -814,6 +853,10 @@
                message is not part of the transcript yet, so it must not sit
                wherever the transcript happens to end. -->
           <div id="chat-queue" class="chat-queue" role="list" aria-label="Queued messages" hidden></div>
+          <!-- The selected agent has no usable login: said where a message
+               is typed, with the way to log in (the Hub's Settings, or the
+               agent's own command outside a Hub). -->
+          <div id="chat-login-notice" class="chat-login-notice" role="status" hidden></div>
           <form id="chat-composer" class="chat-composer" hidden>
             <label class="sr-only" id="chat-input-label" for="chat-input">Send a message</label>
             <div id="chat-command-menu" class="chat-command-menu" role="listbox" aria-label="Slash commands" hidden></div>
@@ -875,24 +918,60 @@
                   <summary id="chat-plan-usage-summary" class="chat-plan-usage-summary" title="Plan usage"></summary>
                   <div id="chat-plan-readout" class="chat-plan-readout" role="group" aria-label="Plan usage">
                     <div id="chat-plan-readout-head" class="chat-plan-readout-head">
-                      <span id="chat-plan-readout-name" class="chat-plan-readout-name">Plan usage</span>
-                      <button id="chat-plan-pin" class="chat-plan-pin" type="button" hidden>Keep in sidebar</button>
+                      <span class="chat-plan-readout-title">
+                        <span id="chat-plan-readout-name" class="chat-plan-readout-name">Plan usage</span>
+                        <span id="chat-plan-readout-age" class="chat-plan-readout-age"></span>
+                      </span>
+                      <span class="chat-plan-readout-actions">
+                        <button id="chat-plan-read" class="usage-read-button" type="button" data-usage-read="start" hidden>Read now</button>
+                        <button id="chat-plan-pin" class="chat-plan-pin" type="button" hidden>Keep in sidebar</button>
+                      </span>
                     </div>
+                    <!-- The read's own state: in flight, or why the last
+                         one did not answer. The figures above stand either
+                         way — a failed read never empties the readout. -->
+                    <p id="chat-plan-readout-status" class="chat-plan-status" hidden></p>
+                    <!-- The standing, stated in full where it can be read:
+                         the chip has room for a level and a reset, this has
+                         room for which limit is biting and why. Present
+                         whenever one stands, plan or no plan. -->
+                    <p id="chat-plan-readout-standing" class="chat-plan-standing" hidden></p>
                     <div id="chat-plan-readout-rows" class="plan-rows"></div>
                     <section id="chat-plan-readout-session" class="chat-plan-session" aria-label="This conversation" hidden>
-                      <h3 id="chat-plan-session-title" class="chat-plan-session-title">This conversation</h3>
+                      <div class="chat-plan-session-head">
+                        <h3 id="chat-plan-session-title" class="chat-plan-session-title">This conversation</h3>
+                        <!-- One receipt, itemized three ways: the same total
+                             by agent, by kind of agent, or by model. Only
+                             where the cost is itemizable per agent — an agent
+                             that tallies the session itself reports per model
+                             alone, and has nothing to switch between. -->
+                        <div id="chat-plan-session-views" class="files-pane-filter chat-plan-session-views" role="radiogroup" aria-label="Itemize by" hidden>
+                          <button class="files-pane-filter-segment is-active" type="button" role="radio" aria-checked="true" data-receipt-view="agents" title="One line per agent and task">Agents</button>
+                          <button class="files-pane-filter-segment" type="button" role="radio" aria-checked="false" tabindex="-1" data-receipt-view="types" title="One line per kind of agent">Types</button>
+                          <button class="files-pane-filter-segment" type="button" role="radio" aria-checked="false" tabindex="-1" data-receipt-view="models" title="One line per model">Models</button>
+                        </div>
+                      </div>
                       <p id="chat-plan-session-cost" class="chat-plan-session-cost"></p>
                       <table class="chat-plan-session-models">
                         <thead>
-                          <tr><th scope="col">Model</th><th scope="col">In</th><th scope="col">Out</th><th scope="col">Cost</th></tr>
+                          <tr><th id="chat-plan-session-heading" scope="col">Model</th><th scope="col">In</th><th scope="col">Out</th><th scope="col">Cost</th></tr>
                         </thead>
                         <tbody id="chat-plan-session-models"></tbody>
+                        <!-- What the lines above sum to. -->
+                        <tfoot id="chat-plan-session-total" hidden></tfoot>
                       </table>
                     </section>
                   </div>
                 </details>
-                <span id="chat-rate-limit" class="chat-rate-limit" role="status" hidden></span>
               </span>
+              <!-- The standing used to announce itself because the badge was
+                   a live region. The chip that replaced it is a <summary>
+                   and cannot be one, so the announcement lives here rather
+                   than being lost to a visual simplification. Its own region,
+                   not the composer's: re-announcing the routine state on
+                   every rate-limit change would talk over the state the
+                   reader is actually waiting on. -->
+              <span id="chat-rate-limit-live" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></span>
             </div>
           </form>
           <span id="chat-conversation-inventory-live" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></span>

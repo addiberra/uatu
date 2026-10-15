@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
+import { reviewEvidenceRoot } from "./artifact-locations";
 
 export const evidence = new URL("./results/artifacts/isolation/", import.meta.url);
 export const sha = (value: string | Uint8Array) => createHash("sha256").update(value).digest("hex");
@@ -35,10 +36,10 @@ export async function auditBundle(entry: string) {
 }
 
 if (import.meta.main) {
-  const inventory = Bun.spawnSync(["bun", "openspec/changes/restore-refined-mobile-hub-experience/review-evidence/baseline.ts", "capture"], { stdout: "pipe", stderr: "pipe" });
+  const inventory = Bun.spawnSync(["bun", new URL("baseline.ts", reviewEvidenceRoot).pathname, "capture"], { stdout: "pipe", stderr: "pipe" });
   assert.equal(inventory.exitCode, 0, inventory.stderr.toString());
   const current = JSON.parse(inventory.stdout.toString());
-  const baseline = JSON.parse(await readFile(new URL("../../openspec/changes/restore-refined-mobile-hub-experience/review-evidence/baseline.json", import.meta.url), "utf8"));
+  const baseline = JSON.parse(await readFile(new URL("baseline.json", reviewEvidenceRoot), "utf8"));
   assert.deepEqual(current.groups.references, baseline.groups.references, "Retained reference signatures changed");
   assert.deepEqual(current.groups.retainedArchive, baseline.groups.retainedArchive, "Retained archive signatures changed");
   await mkdir(evidence, { recursive: true });

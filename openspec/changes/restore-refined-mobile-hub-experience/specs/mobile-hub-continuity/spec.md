@@ -15,7 +15,7 @@ This guarantee applies to ordinary navigation within the live document and one r
 - **AND** restoring only a filename or saved text does not satisfy the requirement
 
 #### Scenario: Terminal client continues during Hub visit
-- **WHEN** synthetic terminal output arrives while the user is browsing Hub details
+- **WHEN** terminal output arrives while the user is browsing Hub details in either the labeled synthetic review or live integration
 - **THEN** the retained terminal client accumulates that output without a new terminal instance or duplicate stream
 - **AND** Return restores its selected surface and scroll behavior
 
@@ -53,17 +53,30 @@ The mobile frontend SHALL represent Hub, Settings, task/detail location, and the
 - **AND** the frontend does not claim an old in-memory draft or upload survived the reload
 
 ### Requirement: Authentication and explicit lifecycle outcomes override retention
-Sign-out, current-session revocation, authoritative unauthorized state, workspace Stop, and workspace removal SHALL invalidate the corresponding retained access and present an appropriate recovery state. Pending responses from an older authentication or workspace generation MUST NOT restore invalid content, Return intent, or actionability. Client retention SHALL never be treated as authorization or evidence of a running server. The frontend-first review SHALL exercise these states synthetically; live enforcement remains an integration-stage acceptance requirement.
+Sign-out, current-session revocation, authoritative unauthorized state, workspace Stop, and workspace removal SHALL invalidate the corresponding retained access and present an appropriate recovery state. Pending responses from an older authentication or workspace generation MUST NOT restore invalid content, Return intent, or actionability. Client retention SHALL never be treated as authorization or evidence of a running server. Synthetic scenarios and live Hub enforcement SHALL be verified separately; a mock pass MUST NOT certify the live boundary. Temporary connection loss SHALL remain distinct from authoritative invalidation.
 
 #### Scenario: Authentication expires while Settings is open
-- **WHEN** the simulated current session is invalidated and a stale successful workspace response arrives later
+- **WHEN** the current session is invalidated and a stale successful workspace response arrives later
 - **THEN** the frontend shows signed-out recovery and keeps retained protected content inaccessible
 - **AND** the stale response cannot restore it
 
 #### Scenario: Retained workspace is stopped
-- **WHEN** an explicit simulated Stop completes for the retained workspace
+- **WHEN** an explicit Stop completes for the retained workspace
 - **THEN** its live presentation becomes unavailable and Return offers the truthful stopped recovery path
 - **AND** Back or Return does not start it without explicit activation through the normal start flow
+
+### Requirement: Live request scope survives phone route changes
+While Hub or Settings is foreground, the retained workspace's requests and live transports SHALL remain scoped to its authenticated workspace identity, independently of the displayed URL. Hub operations SHALL remain on the authenticated Hub origin. Direct load/reload SHALL use canonical server routes without synthetic fixtures; cookie CSRF and proxy-origin checks SHALL continue to apply. Ordinary detours MUST NOT create duplicate workspace boots, live subscriptions or terminal attachments.
+
+#### Scenario: Settings does not retarget workspace requests
+- **WHEN** A is retained behind `/settings` and its upload, document request or live update continues
+- **THEN** it uses A's service context and updates only A's owner without changing foreground focus
+- **AND** a Hub mutation remains Hub-scoped and subject to the existing server authorization checks
+
+#### Scenario: Direct Hub load has no fabricated workspace
+- **WHEN** the live phone Hub is loaded directly with no resident workspace
+- **THEN** authenticated Hub data renders without booting a fixture or stopped workspace
+- **AND** an explicit Open uses the canonical workspace entry, after which ordinary same-workspace detours retain it
 
 ### Requirement: Desktop and standalone presentation remain compatible
 The continuity frontend SHALL be confined to its touch/mobile Hub integration. Existing desktop Hub routes, layout, native titlebar handling, and standalone workspace behavior SHALL not be replaced by the mobile shell. Workspace-local UI mode and preference ownership SHALL remain intact; Hub-wide presentation preferences MUST NOT overwrite workspace mode or semantic state.

@@ -4,6 +4,23 @@
 workspace clients run against test-owned protocols. This is not live-backend
 correctness, visual approval or authorization to expose a remote endpoint.
 
+## Pinned-upstream compatibility
+
+The uncommitted merge integrates upstream `c3a8306` while keeping live mobile
+management integration deferred. Workspace clients now use `/api/hub/live`
+and its subscription-control route. The real broker/endpoint frame the reviewer's
+memory-only document, conversation and activity sources; they do not launch a
+Hub, workspace child, provider or PTY. Document snapshots carry discovery,
+repository freshness, epoch and revision metadata. Image requests retain exact
+root identity and accept the production revision parameter. Child resource APIs
+remain internal, not additions to the public Hub OpenAPI.
+
+Upstream Agent accounts, worktrees and notifications remain in production pages;
+this compatibility pass does not add their management UI to the synthetic mobile
+frontend. `review-artifacts.json` owns the curated evidence location so test
+sources do not hard-code a movable change folder. Existing images are historical,
+not fresh compatibility captures or approved goldens.
+
 ## Start and inspect
 
 ```sh

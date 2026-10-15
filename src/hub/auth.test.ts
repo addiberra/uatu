@@ -7,11 +7,14 @@ import {
   clientKeyForRateLimit,
   deriveDeviceLabel,
   formatHubCookie,
+  formatHubCookieClear,
+  hubCookieName,
   hashPassword,
   HUB_COOKIE_NAME,
   HUB_SESSION_MAX_AGE,
   HubSessionStore,
   isSameOriginRequest,
+  isSameOriginValue,
   LoginRateLimiter,
   readPresentedSession,
   safeReturnPath,
@@ -177,6 +180,35 @@ describe("readPresentedSession", () => {
     });
     expect(readPresentedSession(basic)).toEqual({ id: "tok-2", transport: "cookie" });
   });
+
+  test("reads only the cookie named for the request's port", () => {
+    // Several port-forwarded hubs on 127.0.0.1 share one jar. Each reads
+    // its own suffixed cookie and ignores the rest, including a bare
+    // `uatu_hub` left by an older hub.
+    const forwarded = new Request("http://127.0.0.1:4701/api/hub/state", {
+      headers: { cookie: "uatu_hub=other-hub; uatu_hub_4701=mine; uatu_hub_4702=third" },
+    });
+    expect(readPresentedSession(forwarded)).toEqual({ id: "mine", transport: "cookie" });
+    const legacyOnly = new Request("http://127.0.0.1:4701/api/hub/state", {
+      headers: { cookie: "uatu_hub=other-hub" },
+    });
+    expect(readPresentedSession(legacyOnly)).toBeNull();
+    const defaultPort = new Request("https://hub.lan/api/hub/state", {
+      headers: { cookie: "uatu_hub_4701=forwarded; uatu_hub=direct" },
+    });
+    expect(readPresentedSession(defaultPort)).toEqual({ id: "direct", transport: "cookie" });
+  });
+});
+
+describe("hubCookieName", () => {
+  test("keeps the bare name at the scheme's default port and suffixes any other", () => {
+    expect(hubCookieName(new URL("https://hub.lan/"))).toBe("uatu_hub");
+    expect(hubCookieName(new URL("https://hub.lan:443/login"))).toBe("uatu_hub");
+    expect(hubCookieName(new URL("http://127.0.0.1/"))).toBe("uatu_hub");
+    expect(hubCookieName(new URL("http://127.0.0.1:4701/"))).toBe("uatu_hub_4701");
+    expect(hubCookieName(new URL("http://[::1]:4702/"))).toBe("uatu_hub_4702");
+    expect(hubCookieName(new URL("https://hub.lan:8443/"))).toBe("uatu_hub_8443");
+  });
 });
 
 describe("device labels", () => {
@@ -209,13 +241,20 @@ describe("device labels", () => {
 
 describe("cookie formatting", () => {
   test("formatHubCookie sets the hardening attributes", () => {
-    const secure = formatHubCookie("v", { secure: true });
+    const secure = formatHubCookie("v", new URL("https://hub.lan/login"), { secure: true });
     expect(secure).toContain("HttpOnly");
     expect(secure).toContain("SameSite=Lax");
     expect(secure).toContain("Secure");
     expect(secure).toContain("Path=/");
-    const plain = formatHubCookie("v", { secure: false });
+    const plain = formatHubCookie("v", new URL("http://hub/login"), { secure: false });
     expect(plain).not.toContain("Secure");
+  });
+
+  test("set and clear name the cookie for the request's port", () => {
+    const forwarded = new URL("http://127.0.0.1:4701/login");
+    expect(formatHubCookie("v", forwarded, { secure: false })).toMatch(/^uatu_hub_4701=v;/);
+    expect(formatHubCookieClear(forwarded, { secure: false })).toMatch(/^uatu_hub_4701=;/);
+    expect(formatHubCookieClear(new URL("https://hub.lan/logout"), { secure: true })).toMatch(/^uatu_hub=;/);
   });
 });
 
@@ -230,6 +269,14 @@ describe("isSameOriginRequest", () => {
     expect(isSameOriginRequest(make())).toBe(true);
     expect(isSameOriginRequest(make("https://attacker.example"))).toBe(false);
     expect(isSameOriginRequest(make("null"))).toBe(false);
+  });
+
+  test("an asserted origin is judged by the same rule as a browser-set one", () => {
+    const request = new Request("https://hub.lan/s/project/api/terminal/sessions", { headers: { host: "hub.lan" } });
+    expect(isSameOriginValue("https://hub.lan", request)).toBe(true);
+    expect(isSameOriginValue("https://hub.lan:443", request)).toBe(true);
+    expect(isSameOriginValue("https://public.example", request)).toBe(false);
+    expect(isSameOriginValue("not a url", request)).toBe(false);
   });
 });
 
@@ -283,6 +330,9 @@ describe("safeReturnPath", () => {
       "/s/uatu/?scope=file&documentId=%2FREADME.md",
     );
     expect(safeReturnPath("/")).toBe("/");
+    // A notification's chat destination survives the login bounce.
+    expect(safeReturnPath("/s/uatu/?conversation=claude%3Aone")).toBe("/s/uatu/?conversation=claude%3Aone");
+    expect(safeReturnPath("/s/uatu/?awaiting=1")).toBe("/s/uatu/?awaiting=1");
   });
 
   test("rejects everything that could leave the origin", () => {

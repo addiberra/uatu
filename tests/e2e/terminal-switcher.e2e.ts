@@ -326,20 +326,18 @@ test.describe("touch terminal switcher", () => {
     await expect(page.locator(".terminal-pane")).toHaveCount(1, { timeout: 10000 });
 
     // Hold the NEXT inventory read server-side (the pass-through service
-    // worker hides fetches from page.route, so the latency hook lives in the
-    // e2e server). The held response is computed at request time — it will
-    // never know about the session staged below.
-    await request.post("/__e2e/terminal-sessions-delay", { data: { ms: 1500 } });
+    // worker hides fetches from page.route, so the hold lives in the e2e
+    // server) until the test releases it. The held response is computed at
+    // request time — it will never know about the session staged below.
+    const heldRead = async () => (await (await request.get("/__e2e/terminal-sessions-delay")).json()).pending as boolean;
+    await request.post("/__e2e/terminal-sessions-delay", { data: {} });
 
     // First opening: its read is now in flight, held. Close it again before
     // anything renders, stage a new session, and reopen: the second opening's
     // read is fast and paints both rows.
     await page.locator(switchKey).click();
     await expect
-      .poll(async () => (await (await request.get("/__e2e/terminal-sessions-delay")).json()).pending, {
-        timeout: 5000,
-        message: "the first opening's inventory read must be the held one",
-      })
+      .poll(heldRead, { message: "the first opening's inventory read must be the held one" })
       .toBe(true);
     await page.locator(switchKey).click();
     const [fresh] = await stageSessions(page, 1);
@@ -347,18 +345,20 @@ test.describe("touch terminal switcher", () => {
     await expect(page.locator("#terminal-switcher")).toBeVisible();
     await expect(page.locator(".terminal-switcher-row")).toHaveCount(2);
 
-    // Wait until the held response has actually been delivered — the moment
-    // the un-guarded code repaints the reopened sheet with the older
-    // inventory, dropping the freshly staged session's row.
+    // Release the held response and wait until the page has received it —
+    // the moment the un-guarded code repaints the reopened sheet with the
+    // older inventory, dropping the freshly staged session's row. Every
+    // other read has finished by now (the sheet shows both rows), so the
+    // next finished inventory read is the held one; the stale repaint, if
+    // any, runs as its body is parsed, before the next rendered frame.
+    const delivered = page.context().waitForEvent("requestfinished", finished =>
+      finished.method() === "GET" && new URL(finished.url()).pathname === "/api/terminal/sessions");
+    await request.post("/__e2e/terminal-sessions-delay", { data: { release: true } });
     await expect
-      .poll(async () => (await (await request.get("/__e2e/terminal-sessions-delay")).json()).pending, {
-        timeout: 10000,
-        message: "the delayed inventory response must be delivered",
-      })
+      .poll(heldRead, { message: "the held inventory response must be delivered" })
       .toBe(false);
-    // The stale repaint, if it happens, lands one client hop after delivery;
-    // a short settle bounds that window before asserting nothing changed.
-    await page.waitForTimeout(300);
+    await delivered;
+    await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
     await expect(page.locator(".terminal-switcher-row")).toHaveCount(2);
     await expect(
       page.locator(`.terminal-switcher-row[data-session-id="${fresh!}"]`),
@@ -529,20 +529,27 @@ test.describe("touch terminal switcher", () => {
     });
 
     // Reload window 1. Restore replays both persisted records; the one window
-    // 2 now holds is refused, which is the collision path — distinct from
-    // being taken over, which parks the pane in place. The refused record is
-    // the one that held the active slot.
+    // 2 now holds is refused, and recovery finds it occupied for the whole
+    // window, so that pane parks on the explicit takeover choice in place —
+    // it keeps its saved reference and the active slot it held.
     await page.reload();
     await expect(page.locator("#connection-state .connection-label")).toHaveText("Connected");
 
     // Touch mode shows only the pane carrying data-active, so leaving none
-    // active blanks the tab while a live terminal sits hidden behind it.
+    // active would blank the tab while a live terminal sits hidden behind
+    // it. What the active pane shows here is the occupied card with its
+    // Take over action — a surface, not a blank.
     await expect(page.locator(".terminal-pane[data-active]")).toHaveCount(1, { timeout: 10000 });
     await expect(page.locator(".terminal-pane[data-active]")).toHaveAttribute(
       "data-session-id",
-      staged[0]!,
+      staged[1]!,
     );
+    await expect(page.locator(".terminal-pane[data-active]")).toHaveAttribute("data-state", "occupied", { timeout: 15000 });
+    await expect(page.locator(".terminal-pane[data-active] .terminal-occupied")).toBeVisible();
+    await expect(page.locator(".terminal-pane[data-active] .terminal-occupied-takeover")).toBeVisible();
     await expect(page.locator(".terminal-pane:visible")).toHaveCount(1);
+    // The other pane is attached behind it, untouched by the collision.
+    await expect(page.locator(`.terminal-pane[data-session-id="${staged[0]!}"] .xterm`)).toHaveCount(1);
 
     await page2.close();
   });

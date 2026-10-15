@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { boundedSet } from "../../shared/bounded-map";
 import { HistoryReuse, historyPageCursor, historyPageEnd, historyVersion } from "../history-reuse";
 
 import type {
@@ -11,16 +12,23 @@ import type {
   PendingBackgroundTask,
   PendingPermission,
   PendingQuestion,
+  PendingScheduledWakeup,
   ProviderAttachment,
   ProviderHistoryPage,
   ProviderPermissionReply,
   ProviderSession,
 } from "../provider";
-import type { ChatAgent, ChatCommand, ChatMode, ChatModel, ConversationConfiguration, ModelSelection, PermissionRequest, PlanExtraUsage, PlanModelWindow, PlanUtilization, PlanUtilizationWindow, QuestionRequest, ReversibleHistoryResult, ReversibleHistoryState, SessionModelTotals, SessionTotals, StructuredQuestion } from "../types";
-import { BackgroundTaskUnavailableError, InvalidQuestionAnswerError, ReversibleHistoryTargetError, UnsupportedVariantSelectionError } from "../provider";
-import { CLAUDE_MODELS, claudeContextWindow, findClaudeModel, stripWindowMarker, versionedModelName, withMoreModels } from "./models";
-import { createClaudeEventMemory, markTasksBackgrounded, normalizeClaudeMessage, normalizeContextUsage, normalizeTranscriptEntries, claudeModelSelection } from "./normalization";
-import { listTranscriptSessions, readSessionTranscript, readTranscriptTitles, sessionTranscriptPath, subagentTranscriptPath, claudeConfigDir } from "./transcript";
+import type { ContextWindowItem, ContextWindowMetadata, ConversationItem, ScheduledWakeupItem } from "../types";
+import { claudeWindowAnswer, type ClaudeWindowAnswer, type WindowDiagnostic } from "./context-window";
+import { ScheduledWakeupUnavailableError } from "../provider";
+import { LOGIN_FAILED_NOTICE_CODE, TASK_OUTPUT_TAIL_MAX_BYTES, type AgentUsageReport, type BackgroundTaskOutput, type ChatAgent, type ChatLoginState, type ChatCommand, type ChatMode, type ChatModel, type ConversationConfiguration, type ModelSelection, type PermissionRequest, type PlanExtraUsage, type PlanModelWindow, type PlanUtilization, type PlanUtilizationWindow, type QuestionRequest, type ReversibleHistoryResult, type ReversibleHistoryState, type SessionModelTotals, type SessionTotals, type StructuredQuestion, type UsageReadMode, type UsageReadResult } from "../types";
+import { BackgroundTaskUnavailableError, InvalidQuestionAnswerError, ReleaseUnavailableError, ReversibleHistoryTargetError, UnsupportedVariantSelectionError } from "../provider";
+import { nextCronFire } from "./cron";
+import { CLAUDE_MODELS, MORE_MODELS_GROUP, claudeContextWindow, findClaudeModel, moreModelDetail, stripWindowMarker, versionedModelName, withMoreModels } from "./models";
+import { claudeToolInteraction, createClaudeEventMemory, describeSessionScopedUpdates, markTasksBackgrounded, normalizeClaudeMessage, normalizeContextUsage, normalizeTranscriptEntries, claudeModelSelection, sessionScopedSuggestions, settleForegroundRuns, startsAgentRun, taskFacts, type BackgroundTaskFacts, type ClaudeEventMemory } from "./normalization";
+import { ClaudeNotificationLifecycle } from "./notification-lifecycle";
+import { claudeAccountState, claudeLoginState, parseClaudeAccountInfo } from "./account";
+import { listTranscriptSessions, readSessionTranscript, readTranscriptTitles, sessionTranscriptPath, subagentTranscriptPath, claudeConfigDir, transcriptCrons, type TranscriptCron } from "./transcript";
 
 /**
  * The slice of an SDK `Query` this provider drives. Narrow on purpose: tests
@@ -40,13 +48,22 @@ export type ClaudeQueryHandle = AsyncIterable<unknown> & {
   applyFlagSettings?(settings: Record<string, unknown>): Promise<void>;
   supportedModels?(): Promise<unknown>;
   supportedCommands?(): Promise<unknown>;
-  /** The CLI's own context breakdown (the `/context` data), structurally. */
-  getContextUsage?(): Promise<unknown>;
+  /**
+   * The CLI's own context breakdown (the `/context` data), structurally.
+   * `summary` answers from local estimates without token-count calls.
+   */
+  getContextUsage?(options?: { detail?: "summary" | "full" }): Promise<unknown>;
   /** Stop one background task; the CLI reports a stopped task_notification. */
   stopTask?(taskId: string): Promise<void>;
-  /** The `/usage` data: session cost and claude.ai plan rate-limit windows. The SDK's own (experimental) name. */
-  usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET?(): Promise<unknown>;
+  /**
+   * The `/usage` data: session cost and claude.ai plan rate-limit windows.
+   * The SDK's own (experimental) name. `skipBehaviors` spares the scan of
+   * every local transcript that fills the answer's `behaviors` block.
+   */
+  usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET?(options?: { skipBehaviors?: boolean }): Promise<unknown>;
   rewindFiles?(userMessageId: string, options?: { dryRun?: boolean }): Promise<ClaudeRewindFilesResult>;
+  /** The login in effect: account, plan, and where the credential comes from. */
+  accountInfo?(): Promise<unknown>;
   return?(value?: unknown): Promise<IteratorResult<unknown, void>>;
 };
 
@@ -90,6 +107,23 @@ export type ClaudeQueryInput = {
      * behaviour when declared).
      */
     perTaskStopAffordance?: boolean;
+    /**
+     * In-process hook callbacks (structurally the SDK's `hooks` option):
+     * `Stop` carries the session's crons, `UserPromptSubmit` names a prompt
+     * the CLI submits by itself (scheduled wakeups, D1/D4).
+     */
+    hooks?: Partial<Record<"Stop" | "UserPromptSubmit", Array<{ hooks: Array<(input: Record<string, unknown>, toolUseID: string | undefined, options: { signal: AbortSignal }) => Promise<{ continue: true } | { decision: "block"; reason: string }>> }>>>;
+    /**
+     * A model-written one-line progress summary on an agent task's
+     * `task_progress` (~30 s cadence), so a running subagent's row can say
+     * what it is doing rather than only which tool it last used.
+     */
+    agentProgressSummaries?: boolean;
+    /**
+     * Subagent text and thinking frames, not only tool blocks, tagged with
+     * `parent_tool_use_id` — what a live child transcript is rendered from.
+     */
+    forwardSubagentText?: boolean;
   };
 };
 
@@ -161,6 +195,22 @@ export type ClaudeProviderOptions = {
    * Tests shorten it.
    */
   backgroundGraceMs?: number;
+  /** Bound on an on-demand usage read, cold start included. Tests shorten it. */
+  usageReadTimeoutMs?: number;
+  /**
+   * Bounds on the catalog probe's window walk: one model's read, and the
+   * whole walk. Tests shorten them.
+   */
+  windowReadTimeoutMs?: number;
+  windowWalkBudgetMs?: number;
+  /** Least time between probes for rows a catalog refresh introduced. Tests shorten it. */
+  windowReprobeCooldownMs?: number;
+  /** How long the first catalog answer waits for what the default runs. Tests shorten it. */
+  defaultReadWaitMs?: number;
+  windowRetryDelaysMs?: number[];
+  /** Turn-end context/plan read budget. Tests shorten it. */
+  contextReportTimeoutMs?: number;
+  onWindowDiagnostic?: (diagnostic: WindowDiagnostic) => void;
   // Re-read delays for a generated title that lands after the result.
   titleRefreshDelaysMs?: number[];
 };
@@ -177,10 +227,27 @@ const DEFAULT_TITLE = "New conversation";
  */
 export const CLAUDE_PERMISSION_SCOPE_NOTE = "“Allow always” also covers similar requests for the rest of this turn. Nothing is saved to your settings.";
 const CATALOG_PROBE_TIMEOUT_MS = 20_000;
+// The login read is one control request on a fresh session: generous for a
+// cold CLI start, short enough that a wedged CLI cannot hold the read.
+const LOGIN_READ_TIMEOUT_MS = 20_000;
 const CATALOG_PROBE_COOLDOWN_MS = 60_000;
+// The window walk on the probe, run behind the catalog: a summary read
+// answers in milliseconds, but each model switch costs ~0.2 s for an alias
+// and up to ~2 s for a full id (CLI 2.1.281, 2026-10-01), so a full catalog
+// takes ~11 s. The per-step bound leaves room for a slow switch; the walk's
+// bound only stops a CLI that stalls on every row.
+const WINDOW_READ_TIMEOUT_MS = 8_000;
+// The first catalog answer waits this long for what the default runs: a
+// healthy CLI answers in milliseconds (its first control read, ~0.5 s cold);
+// past this, the catalog answers without it and the default lands later.
+const DEFAULT_READ_WAIT_MS = 2_000;
+const WINDOW_WALK_BUDGET_MS = 90_000;
 // One control round-trip after each turn; a CLI that never answers must not
 // hold the session open past this.
 const CONTEXT_REPORT_TIMEOUT_MS = 3_000;
+// An on-demand usage read may have to start the CLI first; the probe's
+// bound is sized for a query that is already up.
+const USAGE_READ_TIMEOUT_MS = 15_000;
 // The CLI generates its title from an un-awaited side call that can land
 // after the first result; a short turn is re-read a few times for it.
 const TITLE_REFRESH_DELAYS_MS = [1_000, 3_000, 8_000];
@@ -192,9 +259,23 @@ const TITLE_LIMIT = 80;
 
 type LiveSession = {
   id: string;
+  notificationLifecycle: ClaudeNotificationLifecycle;
   queue: PushQueue<ClaudeUserEnvelope>;
   query: ClaudeQueryHandle;
   reader: Promise<void>;
+  contextKey: string;
+  windowSelection?: string;
+  windowResolved?: string;
+  windowSequence: number;
+  windowRead?: Promise<void>;
+  windowReadAbort?: AbortController;
+  windowReady?: Promise<void>;
+  windowRetry?: ReturnType<typeof setTimeout>;
+  cancelSequence: number;
+  windowAttempts: number;
+  windowAccountEpoch: number;
+  windowConfirmed?: boolean;
+  modelCapacities?: Map<string, number>;
   // Turns accepted but not yet terminally reported. The queue cannot be
   // peeked for this — the SDK consumes envelopes eagerly — so the provider
   // counts what it accepted and what results retired.
@@ -211,10 +292,22 @@ type LiveSession = {
   resultsSeen: number;
   // User sends the CLI reported still queued on its last result.
   queuedTurns: number;
+  // Explicit usage reads out on this query: activity, so a turn that ends
+  // under one does not retire the session the reader asked through.
+  usageReads: number;
+  // A retirement a read held back: the read retires the session when it
+  // settles. Without it a read never retires a session it did not start —
+  // another control operation may be using it.
+  retireAfterRead?: boolean;
+  // `/usage` answers are adopted in the order they were asked: an answer
+  // a later one has overtaken is dropped, or its lower counters would read
+  // as the CLI's own reset and be folded into the ledger twice.
+  usageSeq: number;
+  usageAdopted: number;
   // Live background work, replaced on every background_tasks_changed level
   // signal (ambient ids excluded) and reset when the process starts (D7).
   // A non-empty set keeps the session alive past its turn's result.
-  backgroundTasks: Map<string, { description: string; taskType?: string; toolUseId?: string; startedAt: number }>;
+  backgroundTasks: Map<string, LiveBackgroundTask>;
   // A turn the CLI started by itself — the follow-up after a settled
   // background task (D9) — so its messages report running/completed like an
   // accepted prompt's, and retirement waits for its result.
@@ -222,17 +315,186 @@ type LiveSession = {
   // Armed when the set empties with nothing pending: retires the session if
   // no follow-up turn starts within the grace window.
   idleTimer?: ReturnType<typeof setTimeout>;
+  // Future turns the session scheduled for itself (ScheduleWakeup, CronCreate,
+  // /loop), replaced on every Stop hook's `session_crons` (D1). A non-empty
+  // set holds the session past its turn's result, like background work (D2).
+  wakeups: Map<string, SessionWakeup>;
+  // Wakeups that started a turn since the last Stop, by id → that turn's
+  // opening user_message: a one-shot gone from the next Stop fired rather
+  // than being cancelled (spike, D2). The whole message is kept so a fire
+  // the Stop shows went to a same-prompt sibling can be re-attributed.
+  firedSinceStop: Map<string, WakeupFire>;
+  // What each wakeup is, from the calls this process saw (D10): ids a
+  // CronCreate result returned, and prompts a ScheduleWakeup call asked for.
+  // A cron the CLI rebuilt on resume matches neither and is a cron: a
+  // ScheduleWakeup never survives its process (spike, D9).
+  cronIds: Set<string>;
+  selfPacedPrompts: Set<string>;
+  // Fires the hook blocked whose frames (init, informational, result) have
+  // not all been read yet: they are no turn and are swallowed (D12).
+  blockedFires: number;
+  // Crons the transcript says the CLI rebuilt when this session resumed
+  // (D11), read once in the background: their fires are attributed before
+  // the first Stop lists them, and the first Stop settles the ones the CLI
+  // did not in fact restore.
+  revived: Map<string, TranscriptCron>;
+  revivedSettled: boolean;
+  // Settles once that read is done (or was never needed). The Stop and
+  // UserPromptSubmit hooks wait on it: a restored cron can fire, or the
+  // first Stop arrive, before a large transcript is read, and either would
+  // otherwise act on an empty `revived`.
+  revivedReady: Promise<void>;
   // This query's own running totals as last read: folded into the
   // conversation's ledger when the query retires, since a resumed query
   // starts its counters fresh (SDK: "resumed sessions start fresh").
   lastTotals?: SessionTotals;
+  // The subagent runs this query launched, by `runKey`: the tool use that
+  // launched each, which is where a frame tagged `parent_tool_use_id` is
+  // routed (design D8), or — for a run no tool use launched, the review a
+  // typed command starts (design D13) — `task:<taskId>`, which no frame is
+  // ever tagged with. Kept for the query's life — a settled run's transcript
+  // is on disk, but a late frame still has a home, and the drill-down keeps
+  // resolving it.
+  children: Map<string, LiveChild>;
+  // Frames tagged with a tool use no run is known for, held in arrival
+  // order against that tool use (design D10). A skill fork streams from its
+  // first moment but names its agent id only in the result that ends it, so
+  // this is what the child is filled from when the id lands. Bounded in
+  // entries and in frames per entry; dropped when the tool use settles or
+  // the query ends.
+  forkBuffers: Map<string, Record<string, unknown>[]>;
 };
+
+type SessionWakeup = { prompt: string; recurring: boolean; schedule: string; createdAt: number; nextFireAt?: number };
+
+/** The turn a wakeup's fire opened: its user_message id, text, and time. */
+type WakeupFire = { turnId: string; text: string; createdAt: number };
+
+function wakeupTurnItem(fire: WakeupFire, wakeupId: string | undefined): ConversationItem {
+  return { id: fire.turnId, type: "user_message", createdAt: fire.createdAt, text: fire.text, origin: "wakeup", ...(wakeupId !== undefined ? { wakeupId } : {}) };
+}
+
+/**
+ * Whether the CLI rebuilds this wakeup when the conversation's session is
+ * resumed (D9, D10): a CronCreate cron does, a ScheduleWakeup does not.
+ */
+function wakeupRevives(session: Pick<LiveSession, "cronIds" | "selfPacedPrompts">, wakeupId: string, wakeup: SessionWakeup): boolean {
+  if (session.cronIds.has(wakeupId)) return true;
+  return !(session.selfPacedPrompts.has(wakeup.prompt) && !wakeup.recurring);
+}
+
+// The notice a pending wakeup carries when its session ends any way but a
+// release: the CLI owns the schedule, and it lives only as long as the process.
+const WAKEUP_LOST_MESSAGE = "The agent's schedule did not survive its session: Claude Code keeps scheduled wakeups only while its process runs.";
+// A cron outlives its process: Claude Code rebuilds it when the session
+// resumes. A one-shot whose time passes meanwhile is dropped (spike, D9).
+// What the CLI records in the transcript when the hook blocks a cancelled
+// wakeup's fire.
+const CANCELLED_FIRE_REASON = "Cancelled in uatu: this scheduled wakeup no longer fires.";
+export const WAKEUP_PAUSED_MESSAGE = "Paused: the agent's session ended. Claude Code restores this schedule when the conversation runs again.";
+const WAKEUP_NOT_RESTORED_MESSAGE = "Claude Code did not restore this schedule when the conversation ran again.";
+export const WAKEUP_PAUSED_ONCE_MESSAGE = "Paused: the agent's session ended. It fires only if the conversation is running again by its time.";
+
+/**
+ * One subagent run of a live session: its child conversation id
+ * (`sub:<parentSessionId>:<agentId>`) and the normalizer memory its frames
+ * are folded with. The memory is the child's own, not the parent's: a
+ * subagent's tool results, streams, and model are its transcript's, and
+ * within it a frame is untagged — the same shape the stored transcript
+ * replays, so the ids agree (`message:<uuid>`, `tool:<toolUseId>`).
+ */
+type LiveChild = {
+  id: string;
+  agentId: string;
+  memory: ClaudeEventMemory;
+  startedAt: number;
+  // The run reported its end (task frame, sync tool result, or the
+  // session's own end): the child read as running until then.
+  settled: boolean;
+};
+
+// Frames the CLI forwards from inside a subagent run carry the launching
+// tool use as `parent_tool_use_id`. Only these kinds are the run's own;
+// session-level frames (`system` task edges, `result`, rate limits) stay
+// the parent's whatever tag they carry (task 5.1, requirement f).
+const SUBAGENT_FRAME_TYPES = new Set(["assistant", "user", "stream_event", "tool_progress"]);
+
+/**
+ * A run's key in `LiveSession.children`. A run launched by a tool use is
+ * keyed by that tool use's id as is, since that is what its forwarded frames
+ * name. A run with no launching tool use is keyed by its task id under a
+ * prefix of its own: a tool use id never takes that shape, so the two can
+ * never collide, and no tagged frame can be routed to such a run by accident.
+ */
+function runKey(launch: { toolUseId: string } | { taskId: string }): string {
+  return "toolUseId" in launch ? launch.toolUseId : `task:${launch.taskId}`;
+}
+const CHILDREN_LIMIT = 512;
+// A fork's held frames: how many tool uses may be waiting for an id at once,
+// and how many frames each may hold. Both bounds exist so a chatty fork — or
+// a run whose result never arrives — cannot grow the session without limit.
+const FORK_BUFFERS_LIMIT = 32;
+const FORK_BUFFER_FRAMES = 256;
+
+// One live background task as the session holds it: the level signal's
+// identity plus the facts the edges and the launching tool result added
+// (mirrored from the normalizer's rows, see readSession), so a reopened
+// conversation's seeded row says what the live one said.
+type LiveBackgroundTask = BackgroundTaskFacts & { description: string; taskType?: string; toolUseId?: string; startedAt: number };
+
+const TASK_OUTPUTS_LIMIT = 512;
+
+/**
+ * The output index's key for one task of one session. Both ids are the CLI's
+ * (a UUID, an alphanumeric task id) and hold no separator today, but a key
+ * joined on one would let two different pairs meet if either ever did; the
+ * encoded pair cannot.
+ */
+export function taskOutputKey(sessionId: string, taskId: string): string {
+  return JSON.stringify([sessionId, taskId]);
+}
 
 // What retired queries of one conversation spent, and when this process began
 // observing it. The SDK's `/usage` session counters cover the current query
 // only, and an idle conversation's next turn resumes a fresh one, so "this
 // conversation" is the sum over the generations this process saw.
 type SessionTotalsLedger = { settled?: SessionTotals; since: number };
+
+function pausedRow(cron: TranscriptCron): ScheduledWakeupItem {
+  return wakeupRow(cron.id, { prompt: cron.prompt, recurring: cron.recurring, schedule: cron.cron, createdAt: cron.createdAt }, "paused", { message: cron.recurring ? WAKEUP_PAUSED_MESSAGE : WAKEUP_PAUSED_ONCE_MESSAGE });
+}
+
+function boundedAdd(set: Set<string>, value: string): void {
+  if (set.size >= 256) set.delete(set.values().next().value!);
+  set.add(value);
+}
+
+function wakeupRow(wakeupId: string, wakeup: SessionWakeup, status: ScheduledWakeupItem["status"], extra: { firedTurnId?: string; message?: string } = {}): ScheduledWakeupItem {
+  return {
+    id: `wakeup:${wakeupId}`,
+    type: "scheduled_wakeup",
+    createdAt: wakeup.createdAt,
+    wakeupId,
+    prompt: wakeup.prompt,
+    recurring: wakeup.recurring,
+    schedule: wakeup.schedule,
+    // A fire time is a pending wakeup's fact; a settled row keeps none.
+    ...(status === "pending" && wakeup.nextFireAt !== undefined ? { nextFireAt: wakeup.nextFireAt } : {}),
+    status,
+    ...extra,
+  };
+}
+
+/**
+ * A fired prompt against a cron's prompt. The Stop payload clips a prompt
+ * past 1000 characters with an in-string "… [+N chars]" marker, while the
+ * submitted prompt is whole: a clipped cron matches by its kept prefix.
+ */
+export function wakeupPromptMatches(cronPrompt: string, submitted: string): boolean {
+  if (cronPrompt === submitted) return true;
+  const clipped = /… \[\+\d+ chars\]$/.exec(cronPrompt);
+  return clipped !== null && clipped.index > 0 && submitted.startsWith(cronPrompt.slice(0, clipped.index));
+}
 
 /** Sums two tallies: scalars added, per-model rows merged by model id. */
 export function mergeSessionTotals(base: SessionTotals | undefined, next: SessionTotals): SessionTotals {
@@ -280,6 +542,60 @@ export class ClaudeProvider implements ChatProvider {
   // before any session has run.
   private liveModels: ChatModel[] | null = null;
   private modelAliases = new Map<string, string>();
+  // Whether a turn can run under the machine's login, as `accountInfo()`
+  // last said; null until read. Read on a short-lived promptless session,
+  // never on a conversation's, and again whenever Agent accounts reports a
+  // change or a turn fails on its login.
+  private login: ChatLoginState | null = null;
+  private loginRead: Promise<void> | null = null;
+  private loginReadQueued = false;
+  // What Claude Code itself states before any turn, read on the catalog
+  // probe: each offered row's window, keyed by its selection id, and the
+  // model an unpinned session actually runs in this workspace (settings
+  // applied). Held apart from `liveModels` so a live session's catalog
+  // refresh cannot erase them; applied whenever the catalog is served.
+  // Keyed by selection id, with the id the row resolved to when measured: an
+  // alias can move to another model on a refresh ("sonnet" → a new
+  // generation), and a window is only reused while both still match.
+  private readonly statedWindows = new Map<string, { resolved: string; window: number }>();
+  private readonly windowMetadata = new Map<string, ContextWindowMetadata>();
+  private readonly windowFailures = new Map<string, { attempts: number; retryAt: number }>();
+  private windowRetryTimer?: ReturnType<typeof setTimeout>;
+  private readonly windowRetryDelaysMs: number[];
+  private readonly contextReportTimeoutMs: number;
+  private accountEpoch = 0;
+  private readonly contextWindows = new Map<string, Map<string, ContextWindowItem>>();
+  // Private cache identity, retained only as long as its observation. The
+  // attributed model on the wire may be an alias, not the requested default.
+  private readonly windowBindings = new WeakMap<ContextWindowItem, { selection: string; resolvedModel: string; resolutionKey: string }>();
+  private readonly usageContexts = new Map<string, { contextKey: string; model?: ModelSelection }>();
+  private readonly latestContextUsage = new Map<string, Extract<ConversationItem, { type: "assistant_message" | "context_report" }>>();
+  private readonly windowDiagnosticRecords: WindowDiagnostic[] = [];
+  private readonly onWindowDiagnostic?: (diagnostic: WindowDiagnostic) => void;
+  // The same windows by the exact id each row resolved to: a refresh can
+  // offer a stated model under another selection id (an app-only full id
+  // the catalog later lists under an alias), and the window follows the
+  // model. Only an unambiguous figure is lent — "fable" and "fable[1m]"
+  // resolve to one id at two windows.
+  private readonly statedByResolved = new Map<string, Set<number>>();
+  private defaultRuns: { model: string; window?: number } | null = null;
+  // Whether the probe's window walk has run (in full, in part, or not at
+  // all on a CLI without the controls). Only a failed catalog re-probes.
+  private windowsRead = false;
+  // The background walk, while it runs; disposal waits for it to stop, and
+  // `disposal` ends any read it is waiting on rather than its bound.
+  private windowWalk: Promise<void> | null = null;
+  private readonly disposal = Promise.withResolvers<undefined>();
+  private readonly windowReadTimeoutMs: number;
+  // Rows (selection + resolved id) the walk has asked about, and when the
+  // last probe ran: a refresh's unseen rows are probed, throttled.
+  private readonly probedRows = new Set<string>();
+  private windowProbeAt: number | null = null;
+  // A CLI without the controls to state windows: nothing to re-probe for.
+  private windowControlsMissing = false;
+  private readonly windowReprobeCooldownMs: number;
+  private readonly defaultReadWaitMs: number;
+  private readonly windowWalkBudgetMs: number;
   private readonly historyReuse = new HistoryReuse<ReturnType<typeof normalizeTranscriptEntries>>();
   private readonly catalogProbe: boolean;
   private hydration: Promise<void> | null = null;
@@ -323,10 +639,13 @@ export class ClaudeProvider implements ChatProvider {
   private readonly renameGenerations = new Map<string, number>();
   private readonly events_ = new PushQueue<NormalizedProviderEvent>();
   private readonly backgroundGraceMs: number;
+  private readonly usageReadTimeoutMs: number;
   private readonly titleRefreshDelaysMs: number[];
   // Conversations whose last rate-limit signal was a standing (warning or
-  // rejection): carried across processes so the eventual "allowed" clears it.
-  private readonly rateLimitedSessions = new Set<string>();
+  // rejection), with the moment they entered it: carried across this
+  // process's queries so a resumed conversation keeps one standing, at its
+  // original onset, and the eventual "allowed" clears it.
+  private readonly rateLimitedSessions = new Map<string, NonNullable<ClaudeEventMemory["rateLimit"]>>();
   // Per conversation, the totals of the queries this process has retired and
   // when it began observing the conversation: process memory, like the
   // rate-limit standing, so a restart truthfully starts a new "since".
@@ -334,7 +653,29 @@ export class ClaudeProvider implements ChatProvider {
   // A rename asked for before the native transcript existed: written to it
   // once the first turn has created it.
   private readonly deferredRenames = new Map<string, string>();
+  // Wakeups the user cancelled, by conversation: id → the prompt it fires.
+  // The CLI rebuilds a cron when its session resumes, so a cancel is
+  // enforced here, durably: a cancelled wakeup never holds a session and
+  // its fires are blocked at the UserPromptSubmit hook (D12).
+  private readonly cancelledWakeups = new Map<string, Map<string, string>>();
+  // Where each task's output file is, by session and task (`taskOutputKey`),
+  // kept past the task's settling and the session's retirement (bounded):
+  // the reader's last refresh after a settle must still find it. Never a
+  // client's path: only what a CLI frame or the launching tool result named.
+  private readonly taskOutputs = new Map<string, { outputFile: string; settled: boolean }>();
   private readonly titleRefreshTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  // The login's plan usage as last read on this workspace — after a turn or
+  // on demand, through any conversation. Per login, not per conversation,
+  // and durable, so a restarted workspace answers before a session starts.
+  private lastUsage: AgentUsageReport | undefined;
+  // One on-demand read at a time. A second ask joins the first when the
+  // first answers at least as much (same mode, or the second is live-only);
+  // a "start" asked while a live-only read is out runs after it — joining
+  // would hand it "no-live-session" for a session it asked to start.
+  private usageRead: { mode: UsageReadMode; promise: Promise<UsageReadResult> } | null = null;
+  // The conversation-less probe query while its read is out, so disposal
+  // ends it rather than leaving a child to run out its own timeout.
+  private usageProbe: { query: ClaudeQueryHandle; queue: PushQueue<ClaudeUserEnvelope> } | null = null;
   private disposed = false;
 
   constructor(options: ClaudeProviderOptions) {
@@ -344,12 +685,112 @@ export class ClaudeProvider implements ChatProvider {
     this.queryFactory = options.queryFactory ?? defaultQueryFactory;
     this.offerBypassPermissions = options.offerBypassPermissions === true;
     this.catalogProbe = options.catalogProbe !== false;
+    this.windowReadTimeoutMs = options.windowReadTimeoutMs ?? WINDOW_READ_TIMEOUT_MS;
+    this.windowWalkBudgetMs = options.windowWalkBudgetMs ?? WINDOW_WALK_BUDGET_MS;
+    this.windowReprobeCooldownMs = options.windowReprobeCooldownMs ?? CATALOG_PROBE_COOLDOWN_MS;
+    this.defaultReadWaitMs = options.defaultReadWaitMs ?? DEFAULT_READ_WAIT_MS;
+    this.windowRetryDelaysMs = options.windowRetryDelaysMs ?? [1_000, 5_000, 30_000];
+    this.contextReportTimeoutMs = options.contextReportTimeoutMs ?? CONTEXT_REPORT_TIMEOUT_MS;
+    this.onWindowDiagnostic = options.onWindowDiagnostic;
     this.forkSession = options.forkSession ?? defaultForkSession;
     this.renameNativeSession = options.renameNativeSession ?? defaultRenameSession;
     this.stateFile = options.stateFile ?? defaultStateFile(options.workspacePath);
     this.now = options.now ?? (() => Date.now());
     this.backgroundGraceMs = options.backgroundGraceMs ?? BACKGROUND_FOLLOW_UP_GRACE_MS;
+    this.usageReadTimeoutMs = options.usageReadTimeoutMs ?? USAGE_READ_TIMEOUT_MS;
     this.titleRefreshDelaysMs = options.titleRefreshDelaysMs ?? TITLE_REFRESH_DELAYS_MS;
+  }
+
+  loginState(): ChatLoginState {
+    if (this.login === null && this.catalogProbe) void this.readLogin();
+    return this.login ?? "unknown";
+  }
+
+  async accountsChanged(): Promise<void> {
+    this.accountEpoch += 1;
+    this.statedWindows.clear();
+    this.statedByResolved.clear();
+    this.windowMetadata.clear();
+    this.probedRows.clear();
+    this.windowFailures.clear();
+    for (const [id, records] of this.contextWindows) {
+      this.emit(id, { updates: [...records.values()].map(item => ({ kind: "remove", itemId: item.id })), outcome: "handled", eventType: "context.window.invalidated" });
+    }
+    this.contextWindows.clear();
+    this.defaultRuns = null;
+    this.windowsRead = false;
+    if (this.windowRetryTimer) clearTimeout(this.windowRetryTimer);
+    for (const session of this.live.values()) {
+      if (!this.sessionIsIdle(session)) {
+        this.resetSessionWindow(session);
+        session.windowReady = this.prepareSessionWindow(session);
+      } else {
+        // An idle query will be revalidated if another prompt claims it.
+        session.windowSequence += 1;
+        session.windowConfirmed = false;
+        this.cancelSessionWindowRead(session);
+      }
+    }
+    this.catalogChanged();
+    await this.readLogin();
+  }
+
+  /**
+   * Reads the login on its own promptless session (no transcript, no model
+   * call), then closes it. A read requested while one runs is queued once
+   * behind it, so a change that lands mid-read is never answered by the
+   * stale read.
+   */
+  private readLogin(): Promise<void> {
+    if (this.disposed || !this.catalogProbe) return Promise.resolve();
+    if (this.loginRead) {
+      if (!this.loginReadQueued) {
+        this.loginReadQueued = true;
+        this.loginRead = this.loginRead.then(() => {
+          this.loginReadQueued = false;
+          return this.performLoginRead();
+        });
+      }
+      return this.loginRead;
+    }
+    const read = this.performLoginRead().finally(() => {
+      if (this.loginRead === read) this.loginRead = null;
+    });
+    this.loginRead = read;
+    return read;
+  }
+
+  private async performLoginRead(): Promise<void> {
+    if (this.disposed) return;
+    const queue = new PushQueue<ClaudeUserEnvelope>();
+    let query: ClaudeQueryHandle;
+    try {
+      query = this.queryFactory({
+        prompt: queue,
+        options: { cwd: this.workspacePath, pathToClaudeCodeExecutable: this.executable, enableFileCheckpointing: false },
+      });
+    } catch {
+      return;
+    }
+    void (async () => { for await (const _ of query) { /* nothing to read */ } })().catch(() => undefined);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      if (!query.accountInfo) return;
+      const answer = await Promise.race([
+        query.accountInfo(),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error("account read timed out")), LOGIN_READ_TIMEOUT_MS);
+        }),
+      ]);
+      const info = parseClaudeAccountInfo(answer);
+      if (info && !this.disposed) this.login = claudeLoginState(claudeAccountState(info));
+    } catch {
+      // Unknown stays unknown; a known state is kept rather than guessed over.
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+      queue.close();
+      await query.return?.().catch(() => undefined);
+    }
   }
 
   describe(): ChatAgent {
@@ -357,7 +798,7 @@ export class ClaudeProvider implements ChatProvider {
     return {
       id: "claude",
       name: "Claude Code",
-      capabilities: ["context", "permissions", "questions", "models", "modes", "variants", "commands", "attachments", "reversible-history", "subagents", "custom-model-id", "background-tasks", "conversation-rename"],
+      capabilities: ["context", "permissions", "questions", "models", "modes", "variants", "commands", "attachments", "reversible-history", "subagents", "custom-model-id", "background-tasks", "scheduled-wakeups", "conversation-rename", "usage"],
       permissionScopeNote: CLAUDE_PERMISSION_SCOPE_NOTE,
     };
   }
@@ -370,9 +811,130 @@ export class ClaudeProvider implements ChatProvider {
   }
   async listModels(): Promise<ChatModel[]> {
     await this.hydrateCatalog();
-    // The catalog's own rows first, then UatuCode's app-only set under its
-    // own group (D3) — never shadowing an id the catalog already offers.
-    return withMoreModels(this.liveModels ?? CLAUDE_MODELS);
+    return this.servedModels();
+  }
+
+  /**
+   * The catalog as every surface sees it: the catalog's own rows first, then
+   * UatuCode's app-only set under its own group (D3) — never shadowing an id
+   * the catalog already offers — with what Claude Code stated applied over
+   * both: each row's window, and the default presented as what it runs.
+   */
+  private servedModels(): ChatModel[] {
+    const rows = withMoreModels(this.liveModels ?? CLAUDE_MODELS).map(model => {
+      const stated = model.default ? undefined : this.statedWindowFor(model);
+      if (stated === undefined) return model;
+      return {
+        ...model,
+        contextLimit: stated,
+        contextWindow: this.windowMetadata.get(model.selection.modelId) ?? { source: "catalog", freshness: "current" },
+        ...(model.provider === MORE_MODELS_GROUP ? { detail: moreModelDetail(model.selection.modelId, stated) } : {}),
+      };
+    });
+    return this.presentDefault(rows);
+  }
+
+  private hasUnprobedRows(): boolean {
+    if (this.windowControlsMissing) return false;
+    return withMoreModels(this.liveModels ?? []).some(row => !row.default && this.windowEligible(probeKey(row)));
+  }
+
+  private statedWindowFor(model: ChatModel): number | undefined {
+    const resolved = model.resolvesTo?.modelId ?? model.selection.modelId;
+    const bySelection = this.statedWindows.get(model.selection.modelId);
+    if (bySelection !== undefined && bySelection.resolved === resolved) return bySelection.window;
+    const byResolved = this.statedByResolved.get(resolved);
+    return byResolved?.size === 1 ? [...byResolved][0] : undefined;
+  }
+
+  /**
+   * The entry a model id reported by a conversation's own session is
+   * attributed to — what the context readout finds its window by. A
+   * conversation that chose no model runs the default, so the id the
+   * default runs is the default's: its resolved entry, which may be one of
+   * several sharing that id ("fable" / "fable[1m]") where the first-wins
+   * alias join would pick another window, or the default entry itself when
+   * no entry lists the model. Any other id joins through the catalog's aliases.
+   */
+  private attributeModel(id: string, conversationId: string): string {
+    const chosen = this.live.get(conversationId)?.windowSelection ?? this.configurations.get(conversationId)?.model?.modelId;
+    if (chosen && chosen !== "default") {
+      const row = this.liveModels?.find(model => model.selection.modelId === chosen);
+      const resolved = row?.resolvesTo?.modelId ?? chosen;
+      if (stripWindowMarker(resolved) === stripWindowMarker(id)) return chosen;
+    }
+    const target = this.defaultAttribution(conversationId);
+    if (target && this.defaultRuns && stripWindowMarker(id) === stripWindowMarker(this.defaultRuns.model)) return target;
+    const matches = this.liveModels?.filter(model => !model.default && stripWindowMarker(model.resolvesTo?.modelId ?? model.selection.modelId) === stripWindowMarker(id)) ?? [];
+    const exact = matches.filter(model => (model.resolvesTo?.modelId ?? model.selection.modelId) === id);
+    if (exact.length === 1) return exact[0]!.selection.modelId;
+    if (matches.length > 1 && !matches.some(model => model.selection.modelId === id)) return id;
+    return this.modelAliases.get(id) ?? id;
+  }
+
+  /** The entry an unpinned conversation's default model is attributed to, or null when it chose a model. */
+  private defaultAttribution(conversationId: string): string | null {
+    const chosen = this.configurations.get(conversationId)?.model?.modelId;
+    if ((chosen && chosen !== "default") || !this.defaultRuns) return null;
+    const served = this.servedModels();
+    const target = served.find(model => model.default)?.resolvesTo?.modelId;
+    return target && served.some(model => !model.default && model.selection.modelId === target) ? target : "default";
+  }
+
+  /**
+   * The recommended default as what it actually runs here: an unpinned
+   * session runs what Claude Code's settings select (user, project,
+   * environment, managed), which can differ from the catalog's account-level
+   * resolution. The row keeps its own name and selection — choosing it still
+   * leaves the resolution to Claude Code — but resolves to, describes,
+   * offers effort for, and measures against the model it runs. Unreported,
+   * the catalog's resolution stands.
+   */
+  private presentDefault(rows: ChatModel[]): ChatModel[] {
+    const runs = this.defaultRuns;
+    const index = rows.findIndex(model => model.default);
+    if (!runs || index < 0) return rows;
+    const entry = rows[index]!;
+    const resolvedId = (model: ChatModel) => model.resolvesTo?.modelId ?? model.selection.modelId;
+    const bare = stripWindowMarker(runs.model);
+    const candidates = rows.filter(model => !model.default && stripWindowMarker(resolvedId(model)) === bare);
+    // Window variants ("fable" / "fable[1m]") can share one resolved id, so
+    // the window the default runs decides first: by a row's served window
+    // once stated, and by its window marker before the walk has landed (both
+    // variants then derive the same figure); the exact id breaks what's left.
+    const windowMatches = (model: ChatModel) => runs.window !== undefined && model.contextLimit === runs.window;
+    const markerMatches = (model: ChatModel) => runs.window !== undefined
+      && [model.selection.modelId, model.resolvesTo?.modelId].some(id => id?.includes("[1m]")) === runs.window >= 1_000_000;
+    const exact = (model: ChatModel) => resolvedId(model) === runs.model;
+    const score = (model: ChatModel) => (windowMatches(model) ? 4 : 0) + (markerMatches(model) ? 2 : 0) + (exact(model) ? 1 : 0);
+    const match = candidates.reduce<ChatModel | undefined>((best, model) => (!best || score(model) > score(best) ? model : best), undefined);
+    const contextLimit = runs.window ?? match?.contextLimit ?? claudeContextWindow(runs.model);
+    const contextWindow: ContextWindowMetadata | undefined = runs.window ? { source: "catalog", freshness: "current" } : match?.contextWindow ?? (contextLimit ? { source: "estimate", freshness: "current" } : undefined);
+    let presented: ChatModel;
+    if (!match) {
+      presented = { ...entry, resolvesTo: { providerId: "anthropic", modelId: runs.model }, detail: `Runs ${runs.model} · Claude Code's own model choice`, contextLimit };
+      // Nothing states which effort levels that model takes; the catalog
+      // default's belong to another model, and an unsupported level must
+      // not be selectable — so none is offered.
+      delete presented.variants;
+    } else if (entry.resolvesTo && sameSelection(entry.resolvesTo, match.selection)) {
+      // The catalog already names what runs: Claude Code's own presentation
+      // of its default stands — a description that names the model ("Sonnet
+      // 5.5 · Efficient for routine tasks") and the effort it offers there.
+      presented = { ...entry, contextLimit };
+    } else {
+      presented = { ...entry, resolvesTo: match.selection, contextLimit };
+      // In Claude Code's own shape for its default: the model's name first,
+      // since a concrete row's description often omits it ("For your
+      // toughest challenges") and the default row's name does not carry it.
+      if (match.detail) presented.detail = match.detail.startsWith(match.name) ? match.detail : `${match.name} · ${match.detail}`;
+      else presented.detail = match.name;
+      if (match.variants) presented.variants = [...match.variants];
+      else delete presented.variants;
+    }
+    const served = [...rows];
+    served[index] = { ...presented, contextWindow };
+    return served;
   }
 
   /**
@@ -383,22 +945,46 @@ export class ClaudeProvider implements ChatProvider {
    * so a broken install cannot be re-probed on every read.
    */
   private async hydrateCatalog(): Promise<void> {
-    if (this.liveModels !== null || !this.catalogProbe || this.disposed) return;
+    if (!this.catalogProbe || this.disposed) return;
+    this.pruneWindowFailures();
+    if (this.liveModels !== null && this.windowsRead) {
+      // Claude Code updates itself under a running workspace and ships new
+      // models that way; a refreshed catalog with rows no probe has asked
+      // about gets one more probe — in the background, at most once per
+      // cooldown, and only for those rows.
+      const retryDue = [...this.windowFailures.values()].some(failure => failure.retryAt <= this.now());
+      if (this.windowWalk || this.hydration || (!this.hasUnprobedRows() && !retryDue)) return;
+      if (!retryDue && this.windowProbeAt !== null && this.now() - this.windowProbeAt < this.windowReprobeCooldownMs) return;
+      // Throttled from its start, so a probe that fails is not retried on
+      // every read; not awaited, so no read waits on it.
+      this.windowProbeAt = this.now();
+      this.hydration = this.runCatalogProbe()
+        .catch(() => undefined)
+        .finally(() => { this.hydration = null; this.scheduleWindowRetries(); });
+      return;
+    }
+    // A live session can fill the catalog first; the windows and the
+    // default's resolution only come from the probe, so it still runs once.
     if (this.probeFailedAt !== null && this.now() - this.probeFailedAt < CATALOG_PROBE_COOLDOWN_MS) return;
     this.hydration ??= this.runCatalogProbe()
       .then(() => { this.probeFailedAt = null; })
       .catch(() => { this.probeFailedAt = this.now(); })
-      .finally(() => { this.hydration = null; });
+      .finally(() => { this.hydration = null; this.scheduleWindowRetries(); });
     await this.hydration;
   }
 
   private async runCatalogProbe(): Promise<void> {
+    const epoch = this.accountEpoch;
     const queue = new PushQueue<ClaudeUserEnvelope>();
+    // The query and the stream that keeps it open, handed to the background
+    // window walk once the catalog stands; whoever holds them last closes them.
+    let handedOff = false;
+    let query: ClaudeQueryHandle | undefined;
     try {
       // The workspace cwd on purpose: a promptless probe writes no
       // transcript (nothing to enumerate), and the command inventory must
       // include the workspace's own project commands.
-      const query = this.queryFactory({
+      query = this.queryFactory({
         prompt: queue,
         options: {
           cwd: this.workspacePath,
@@ -412,7 +998,8 @@ export class ClaudeProvider implements ChatProvider {
         // The control channel answers before any turn starts; a promptless
         // stream never emits init, so the catalog is requested immediately
         // while the message stream is merely drained to keep the pump alive.
-        const drain = (async () => { for await (const message of query) this.captureCommands(message); })();
+        const probe = query;
+        const drain = (async () => { for await (const message of probe) this.captureCommands(message); })();
         drain.catch(() => undefined);
         await Promise.race([
           new Promise<never>((_, reject) => {
@@ -425,12 +1012,89 @@ export class ClaudeProvider implements ChatProvider {
         if (this.liveModels === null) throw new Error("catalog probe answered nothing");
       } finally {
         if (timer !== undefined) clearTimeout(timer);
-        await query.return?.().catch(() => undefined);
       }
+      // The catalog stands from here; what follows only refines it, and a
+      // failure keeps the derived figures. What the default runs is one
+      // read of a few milliseconds on a healthy CLI, so the first picker
+      // read waits briefly for it — but no longer than a short bound: the
+      // chat's availability waits on this answer, and a CLI that stalls on
+      // the read must not hold it. A late answer is served from a later
+      // read. The per-model windows (a model switch each, up to ~2 s for a
+      // full id) follow it on the same query, never alongside it: a switch
+      // under the unpinned read would change what it reports.
+      if (epoch !== this.accountEpoch || this.disposed) return;
+      this.windowsRead = true;
+      this.windowProbeAt = this.now();
+      if (!query.setModel || !query.getContextUsage) this.windowControlsMissing = true;
+      const defaultRead = this.readDefaultRuns(query, epoch).catch(() => { if (epoch === this.accountEpoch) this.windowFailed("default"); });
+      if (!this.disposed) {
+        const walked = query;
+        handedOff = true;
+        const walk = defaultRead
+          .then(() => (walked.setModel && walked.getContextUsage && !this.disposed && epoch === this.accountEpoch ? this.readStatedWindows(walked, epoch) : undefined))
+          .catch(() => undefined)
+          .finally(async () => {
+            try {
+              await this.closeProbe(walked, queue);
+            } finally {
+              // An account change may have installed a replacement walk.
+              // Only the owner can release the slot or schedule its retries.
+              if (this.windowWalk === walk) {
+                this.windowWalk = null;
+                this.scheduleWindowRetries();
+              }
+            }
+          });
+        this.windowWalk = walk;
+      }
+      let waited: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([defaultRead, new Promise<void>(resolve => { waited = setTimeout(resolve, this.defaultReadWaitMs); })]);
+      if (waited !== undefined) clearTimeout(waited);
     } finally {
-      this.probeQuery = null;
-      queue.close();
+      if (!handedOff) await this.closeProbe(query, queue);
     }
+  }
+
+  /**
+   * Settles once the background window walk has finished (or was never
+   * started): what Claude Code stated for every model is served from then.
+   * For callers that need the complete figures, such as the real-CLI test.
+   */
+  async windowsSettled(): Promise<void> {
+    // A replacement can be installed while the walk we awaited is closing.
+    while (this.hydration || this.windowWalk) {
+      await this.hydration?.catch(() => undefined);
+      await this.windowWalk?.catch(() => undefined);
+    }
+  }
+
+  private async closeProbe(query: ClaudeQueryHandle | undefined, queue: PushQueue<ClaudeUserEnvelope>): Promise<void> {
+    await query?.return?.().catch(() => undefined);
+    if (this.probeQuery === query) this.probeQuery = null;
+    queue.close();
+  }
+
+  /** One summary context read on the probe: the model in effect and its window. */
+  private async readProbeContext(query: ClaudeQueryHandle): Promise<{ model?: string; window?: number } | undefined> {
+    const raw = await bounded(query.getContextUsage!({ detail: "summary" }), this.windowReadTimeoutMs, this.disposal.promise);
+    const answer = claudeWindowAnswer(raw);
+    return answer ? { model: answer.model, window: answer.limit } : undefined;
+  }
+
+  /**
+   * What an unpinned session runs in this workspace — the default as Claude
+   * Code's settings resolve it (user, project, environment, managed): the
+   * probe's first read, before any `setModel`, names it and its window.
+   */
+  private async readDefaultRuns(query: ClaudeQueryHandle, epoch = this.accountEpoch): Promise<void> {
+    if (!query.getContextUsage) return;
+    const unpinned = await this.readProbeContext(query);
+    if (epoch !== this.accountEpoch || this.disposed) return;
+    if (unpinned?.model) {
+      this.defaultRuns = { model: unpinned.model, ...(unpinned.window ? { window: unpinned.window } : {}) };
+      if (unpinned.window) this.windowFailures.delete("default");
+      this.catalogChanged();
+    } else this.windowFailed("default");
   }
 
   /**
@@ -453,7 +1117,7 @@ export class ClaudeProvider implements ChatProvider {
   async switchModel(sessionId: string, selection: ModelSelection, variant?: string): Promise<void> {
     await this.restoreDurableState();
     if (variant !== undefined) {
-      const model = withMoreModels(this.liveModels ?? CLAUDE_MODELS).find(candidate => candidate.selection.modelId === selection.modelId)
+      const model = this.servedModels().find(candidate => candidate.selection.modelId === selection.modelId)
         ?? findClaudeModel(selection.modelId);
       if (!model?.variants?.includes(variant)) {
         throw new UnsupportedVariantSelectionError(`model ${selection.modelId} does not offer effort level ${variant}`);
@@ -466,9 +1130,11 @@ export class ClaudeProvider implements ChatProvider {
     this.persistDurableState();
     const live = this.live.get(sessionId);
     if (!live) return;
+    this.resetSessionWindow(live, selection.modelId);
     // The "default" sentinel is the CLI's own pick on the live path too:
     // reset instead of sending an id session start deliberately omits.
     await live.query.setModel?.(selection.modelId === "default" ? undefined : selection.modelId);
+    live.windowReady = this.prepareSessionWindow(live);
     // Effort applies to the live session as well — `effort` at spawn only
     // covers a fresh one. Clearing the variant clears the flag layer so
     // lower-precedence settings resume. Best-effort: a CLI without the
@@ -536,6 +1202,14 @@ export class ClaudeProvider implements ChatProvider {
     // from where Claude actually stored them.
     const child = parseSubagentId(id);
     if (child) {
+      // A run this process launched is known from its start edge, before
+      // the CLI has written a line of its transcript: the drill-down opens
+      // it live, and its routed frames pass the adapter's confinement check
+      // (design D8). The parent is a live session, so it is accepted.
+      const live = this.liveChild(id);
+      if (live) {
+        return { id, title: "Subagent", directory: this.workspacePath, createdAt: live.child.startedAt, updatedAt: this.now(), parentId: live.parentSessionId };
+      }
       // Synthetic and read-only: a subagent run is reached from its parent's
       // row, never started or listed on its own. `parentId` is what keeps it
       // out of the picker and routes its interactions to the parent. The
@@ -585,7 +1259,7 @@ export class ClaudeProvider implements ChatProvider {
       const file = await fs.realpath(sourcePath());
       const stat = await fs.stat(file, { bigint: true });
       return historyVersion([file, stat.dev.toString(), stat.ino.toString(), stat.size.toString(), stat.mtimeNs.toString(), stat.ctimeNs.toString(),
-        sessionId, this.staged.get(sessionId)?.boundaryIndex, [...this.modelAliases]]);
+        sessionId, this.staged.get(sessionId)?.boundaryIndex, [...this.modelAliases], child ? null : this.defaultAttribution(sessionId)]);
     };
     let normalized: ReturnType<typeof normalizeTranscriptEntries> = { items: [], accounting: [] };
     let version = "empty";
@@ -601,7 +1275,7 @@ export class ClaudeProvider implements ChatProvider {
             const boundary = reversibleTurns(mainline)[staged.boundaryIndex];
             if (boundary) mainline = mainline.slice(0, boundary.entryIndex);
           }
-          return normalizeTranscriptEntries(mainline, child ? undefined : sessionId, id => this.modelAliases.get(id) ?? id);
+          return normalizeTranscriptEntries(mainline, child ? undefined : sessionId, id => (child ? this.modelAliases.get(id) ?? id : this.attributeModel(id, sessionId)));
         });
         if (await signature() === version) break;
         this.historyReuse.invalidate(sessionId);
@@ -609,19 +1283,27 @@ export class ClaudeProvider implements ChatProvider {
       } catch (error) {
         this.historyReuse.invalidate(sessionId);
         if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-        if (child) throw new Error(`unknown Claude subagent transcript: ${sessionId}`);
-        if (!this.pending.has(sessionId) && !this.live.has(sessionId)) throw new Error(`unknown Claude conversation: ${sessionId}`);
+        // A live run whose transcript is not on disk yet is empty, not
+        // unknown: the drill-down's snapshot is empty and the routed frames
+        // fill it (design D8).
+        if (child && !this.liveChild(sessionId)) throw new Error(`unknown Claude subagent transcript: ${sessionId}`);
+        if (!child && !this.pending.has(sessionId) && !this.live.has(sessionId)) throw new Error(`unknown Claude conversation: ${sessionId}`);
         normalized = { items: [], accounting: [] };
         version = "empty";
         break;
       }
     }
-    const { items, accounting } = normalized;
+    const accounting = normalized.accounting;
+    const items = normalized.items.map(item => {
+      if (item.type !== "assistant_message" && item.type !== "context_report") return item;
+      const context = this.usageContexts.get(`${sessionId}:${item.id}`);
+      return context ? { ...item, ...context } : item;
+    });
     const end = historyPageEnd(options.cursor, version, items.length);
     const start = Math.max(0, end - Math.max(1, options.limit));
     const ids = new Set(items.slice(start, end).map(item => item.id));
     return {
-      items: items.slice(start, end),
+      items: [...items.slice(start, end), ...(!options.cursor ? this.recoveredWindows(sessionId, items.slice(start, end)) : [])],
       accounting: accounting.filter(entry => ids.has(`usage:${entry.messageId}`) || ids.has(`message:${entry.messageId}`)),
       completeItems: items,
       nextCursor: historyPageCursor(start, version),
@@ -732,7 +1414,13 @@ export class ClaudeProvider implements ChatProvider {
         const survivor = this.live.get(sessionId);
         if (survivor) {
           const priorModel = configurationBefore?.model?.modelId;
-          if (input.model) await survivor.query.setModel?.(priorModel === undefined || priorModel === "default" ? undefined : priorModel).catch(() => undefined);
+          if (input.model) {
+            // Discard the abandoned selection's reads before restoring the
+            // controls. The explicit sentinel also restores an unpinned
+            // binding: undefined would keep resetSessionWindow's selection.
+            this.resetSessionWindow(survivor, priorModel ?? "default");
+            await survivor.query.setModel?.(priorModel === undefined || priorModel === "default" ? undefined : priorModel).catch(() => undefined);
+          }
           // Unset resolves to the declared default (auto) — the mode the
           // session actually runs — not "leave whatever the failed request
           // applied".
@@ -740,6 +1428,7 @@ export class ClaudeProvider implements ChatProvider {
           if (input.variant !== undefined || input.model) {
             await survivor.query.applyFlagSettings?.({ effortLevel: configurationBefore?.variant ?? null }).catch(() => undefined);
           }
+          if (input.model && this.live.get(sessionId) === survivor) survivor.windowReady = this.prepareSessionWindow(survivor);
         }
       }
       if (stagedBefore) {
@@ -766,6 +1455,7 @@ export class ClaudeProvider implements ChatProvider {
     // The provider mints the user's timeline item at accept time; the SDK's
     // own echo is skipped by the live normalizer.
     this.emit(sessionId, {
+      notificationTurns: session.notificationLifecycle.accept(input.id, acceptedAt),
       updates: [
         { kind: "upsert", item: {
           id: `message:${input.id}`,
@@ -791,6 +1481,26 @@ export class ClaudeProvider implements ChatProvider {
       await this.queuePersist(this.durableSnapshot()).catch(() => undefined);
     }
     session.pendingTurns += 1;
+    const cancelSequence = session.cancelSequence;
+    // An account change can land inside the startup wait. Revalidate before
+    // delivery, sharing one total grace budget even if accounts change again.
+    const windowWaitUntil = performance.now() + this.defaultReadWaitMs;
+    let waitedFor: Promise<void> | undefined;
+    do {
+      if (session.windowAccountEpoch !== this.accountEpoch) {
+        this.resetSessionWindow(session);
+        session.windowReady = this.prepareSessionWindow(session);
+      }
+      const remaining = windowWaitUntil - performance.now();
+      if (remaining <= 0 || session.cancelSequence !== cancelSequence || this.live.get(sessionId) !== session || this.disposed) break;
+      waitedFor = session.windowReady;
+      await bounded(waitedFor ?? Promise.resolve(), remaining, this.disposal.promise);
+    } while (session.windowAccountEpoch !== this.accountEpoch || waitedFor !== session.windowReady);
+    if (session.cancelSequence !== cancelSequence || this.live.get(sessionId) !== session || this.disposed) {
+      session.pendingTurns = Math.max(0, session.pendingTurns - 1);
+      if (this.live.get(sessionId) === session && session.pendingTurns === 0) await this.retireIfIdle(session);
+      return { messageId: input.id };
+    }
     session.queue.push({
       type: "user",
       message: { role: "user", content },
@@ -824,6 +1534,7 @@ export class ClaudeProvider implements ChatProvider {
     // would mark the NEXT turn's result as interrupted. Background tasks
     // have their own stop control; an interrupt does not touch them.
     if (session.pendingTurns === 0 && !session.unpromptedTurn) return;
+    const cancelSequence = ++session.cancelSequence;
     session.interrupted = true;
     try {
       await session.query.interrupt();
@@ -831,6 +1542,7 @@ export class ClaudeProvider implements ChatProvider {
       // The turn continues; its eventual result must report its real
       // outcome, not a cancellation that never took.
       session.interrupted = false;
+      if (session.cancelSequence === cancelSequence) session.cancelSequence -= 1;
       throw error;
     }
     this.emit(sessionId, {
@@ -857,11 +1569,11 @@ export class ClaudeProvider implements ChatProvider {
     // "Always" returns the SDK's own suggestions, but only those scoped to
     // the session: an approval uatu brokered must never outlive the session
     // it was given in (D5: map conservatively).
-    const updatedPermissions = reply === "always" ? sessionScopedSuggestions(pending.suggestions) : undefined;
+    const updatedPermissions = reply === "always" ? sessionScopedSuggestions(pending.suggestions) : [];
     pending.settle({
       behavior: "allow",
       updatedInput: pending.input,
-      ...(updatedPermissions && updatedPermissions.length > 0 ? { updatedPermissions } : {}),
+      ...(updatedPermissions.length > 0 ? { updatedPermissions } : {}),
     });
   }
 
@@ -894,6 +1606,8 @@ export class ClaudeProvider implements ChatProvider {
           resources: item.resources,
           // A recovered plan card must still show the plan and its intent
           // choices — the reader this path exists for missed the live one.
+          // Likewise the rules an always reply would install.
+          ...(item.alwaysPatterns === undefined ? {} : { alwaysPatterns: item.alwaysPatterns }),
           ...(item.plan === undefined ? {} : { plan: item.plan }),
           ...(item.choices === undefined ? {} : { choices: item.choices }),
         };
@@ -926,17 +1640,31 @@ export class ClaudeProvider implements ChatProvider {
   async dispose(): Promise<void> {
     this.historyReuse.dispose();
     this.disposed = true;
+    this.disposal.resolve(undefined);
+    if (this.windowRetryTimer) clearTimeout(this.windowRetryTimer);
     for (const timer of this.titleRefreshTimers.values()) clearTimeout(timer);
     this.titleRefreshTimers.clear();
     // Nothing durable may still be in flight when the workspace stops.
     await this.persistChain.catch(() => undefined);
     await this.probeQuery?.return?.().catch(() => undefined);
+    await this.windowWalk?.catch(() => undefined);
+    const usageProbe = this.usageProbe;
+    if (usageProbe) {
+      this.usageProbe = null;
+      usageProbe.queue.close();
+      await usageProbe.query.return?.().catch(() => undefined);
+    }
     await this.hydration?.catch(() => undefined);
     const sessions = [...this.live.values()];
     this.live.clear();
     for (const session of sessions) {
+      this.cancelSessionWindowRead(session);
       this.clearIdleTimer(session);
       this.abandonInteractions(session.id, "The workspace shut down before the user answered.");
+      // Shutdown is the process exit a schedule cannot survive (D6): a
+      // reader still attached sees the rows lost and the state cleared.
+      const lost = this.settleWakeups(session, "ended");
+      if (lost.length > 0) this.emit(session.id, { updates: [...lost, { kind: "status", status: "idle" }], outcome: "handled", eventType: "wakeups.lost" });
     }
     await Promise.all(sessions.map(async session => {
       await session.query.interrupt().catch(() => undefined);
@@ -955,12 +1683,26 @@ export class ClaudeProvider implements ChatProvider {
   private async ensureLive(sessionId: string, model?: ModelSelection, mode?: string, variant?: string): Promise<LiveSession> {
     const existing = this.live.get(sessionId);
     if (existing) return existing;
+    // The cancelled wakeups must be known before a resumed session can
+    // rebuild and fire one of them.
+    await this.restoreDurableState();
+    const raced = this.live.get(sessionId);
+    if (raced) return raced;
     const known = this.pending.has(sessionId) || await this.getSession(sessionId);
     if (!known) throw new Error(`unknown Claude conversation: ${sessionId}`);
     const nativeId = this.nativeId(sessionId);
     const hasTranscript = await fs.access(sessionTranscriptPath(this.workspacePath, nativeId, this.configDir)).then(() => true, () => false);
     const queue = new PushQueue<ClaudeUserEnvelope>();
     const configuration = this.configurations.get(sessionId) ?? {};
+    // The hooks close over the session they belong to, which exists only
+    // once the query does; a hook that fires first (it cannot: hooks follow
+    // a prompt) or for a retired session finds no owner and does nothing.
+    let owner: LiveSession | undefined;
+    const observe = (handler: (session: LiveSession, input: Record<string, unknown>) => void) => async (input: Record<string, unknown>) => {
+      // Observers only: a hook that throws or blocks would change the turn.
+      try { if (owner) { await owner.revivedReady; handler(owner, input); } } catch { /* observation is best-effort */ }
+      return { continue: true as const };
+    };
     const query = this.queryFactory({
       prompt: queue,
       options: {
@@ -991,11 +1733,33 @@ export class ClaudeProvider implements ChatProvider {
         onUserDialog: (request, options) => this.brokerDialog(sessionId, request, options),
         supportedDialogKinds: [...CLAUDE_SUPPORTED_DIALOG_KINDS],
         perTaskStopAffordance: true,
+        hooks: {
+          Stop: [{ hooks: [observe((session, input) => this.trackWakeups(session, input))] }],
+          UserPromptSubmit: [{ hooks: [async (input: Record<string, unknown>) => {
+            try {
+              if (owner) await owner.revivedReady;
+              if (owner && this.blocksCancelledFire(owner, input)) return { decision: "block" as const, reason: CANCELLED_FIRE_REASON };
+              if (owner) this.attributeWakeupTurn(owner, input);
+            } catch { /* observation is best-effort */ }
+            return { continue: true as const };
+          }] }],
+        },
+        // A running agent task's row shows the model's own progress line
+        // (spec: the model-written progress summary Claude Code produces
+        // when asked); the cost is a short fork per running agent task.
+        agentProgressSummaries: true,
+        // A running subagent's text and thinking arrive under its parent
+        // tool use, so an open child transcript can be live (design D8):
+        // readSession routes every frame so tagged to the run's child
+        // conversation once the run is known (routeSubagentFrame).
+        forwardSubagentText: true,
       },
     });
-    const session: LiveSession = { id: sessionId, queue, query, reader: Promise.resolve(), pendingTurns: 0, backgroundTasks: new Map(), unpromptedTurn: false, resultsSeen: 0, queuedTurns: 0 };
+    const session: LiveSession = { id: sessionId, contextKey: randomUUID(), windowSelection: (model ?? configuration.model)?.modelId, windowSequence: 0, windowAttempts: 0, windowAccountEpoch: this.accountEpoch, cancelSequence: 0, notificationLifecycle: new ClaudeNotificationLifecycle(), queue, query, reader: Promise.resolve(), pendingTurns: 0, backgroundTasks: new Map(), wakeups: new Map(), firedSinceStop: new Map(), cronIds: new Set(), selfPacedPrompts: new Set(), blockedFires: 0, revived: new Map(), revivedSettled: false, revivedReady: Promise.resolve(), unpromptedTurn: false, resultsSeen: 0, queuedTurns: 0, usageReads: 0, usageSeq: 0, usageAdopted: 0, children: new Map(), forkBuffers: new Map() };
+    owner = session;
     session.reader = this.readSession(session);
     this.live.set(sessionId, session);
+    session.windowReady = this.prepareSessionWindow(session);
     // Observation begins with the conversation's first query in this
     // process: everything that query and its successors spend is counted.
     // The adapter stamps the prompt's user message after this call, so a
@@ -1010,19 +1774,63 @@ export class ClaudeProvider implements ChatProvider {
     // models, skills appear mid-session — so every session start re-reads
     // both (captureModels also refreshes the command inventory).
     void this.captureModels(query);
+    if (hasTranscript) session.revivedReady = this.primeRevivedCrons(session, nativeId);
     return session;
   }
 
   private async readSession(session: LiveSession): Promise<void> {
     const memory = createClaudeEventMemory();
-    memory.resolveModel = id => this.modelAliases.get(id) ?? id;
-    memory.rateLimited = this.rateLimitedSessions.has(session.id);
+    memory.resolveModel = id => this.attributeModel(id, session.id);
+    memory.rateLimit = this.rateLimitedSessions.get(session.id);
     try {
       for await (const message of session.query) {
+        // A blocked fire is no turn: its init, informational notice, and
+        // result are swallowed whole — no running status, no completed
+        // status, no notification, no retirement decision (D12).
+        if (session.blockedFires > 0) {
+          const frame = message as { type?: unknown; subtype?: unknown; parent_tool_use_id?: unknown };
+          if (!frame.parent_tool_use_id && frame.type === "system" && (frame.subtype === "init" || frame.subtype === "informational")) continue;
+          if (!frame.parent_tool_use_id && frame.type === "result") { session.blockedFires -= 1; continue; }
+        }
+        const resultId = !(message as { parent_tool_use_id?: unknown }).parent_tool_use_id && (message as { type?: unknown; uuid?: unknown }).type === "result" && typeof (message as { uuid?: unknown }).uuid === "string"
+          ? (message as { uuid: string }).uuid : undefined;
+        if (resultId && session.notificationLifecycle.hasResult(resultId)) continue;
         this.captureCommands(message);
+        // A frame from inside a known subagent run is the child's, whole:
+        // it never reaches the parent's normalizer, turn accounting, or the
+        // unprompted-turn guard below (design D8).
+        if (this.routeSubagentFrame(session, message)) continue;
         this.trackSessionLevel(session, message, memory);
+        this.trackSchedulingCalls(session, message, memory);
         const normalized = normalizeClaudeMessage(message, memory, "live", session.id);
-        if (memory.rateLimited) this.rateLimitedSessions.add(session.id); else this.rateLimitedSessions.delete(session.id);
+        for (const update of normalized.updates) {
+          if (update.kind !== "upsert" || (update.item.type !== "assistant_message" && update.item.type !== "context_report")) continue;
+          if (update.item.type === "assistant_message" && !update.item.usage) continue;
+          const rawModel = update.item.type === "assistant_message" ? (message as { message?: { model?: string } }).message?.model : undefined;
+          if (rawModel && session.windowResolved && stripWindowMarker(rawModel) !== stripWindowMarker(session.windowResolved)) {
+            const cached = this.contextWindows.get(session.id)?.get(session.contextKey)?.window.freshness === "cached";
+            this.resetSessionWindow(session, cached ? session.windowSelection : rawModel);
+            session.windowResolved = rawModel;
+            session.windowReady = this.prepareSessionWindow(session);
+          }
+          update.item = { ...update.item, contextKey: session.contextKey };
+          if (!update.item.model && session.windowResolved) update.item = { ...update.item, model: claudeModelSelection(this.attributeModel(session.windowResolved, session.id)) };
+          if (update.item.type === "context_report" && update.item.max !== undefined) {
+            session.windowSequence += 1;
+            const context = claudeWindowAnswer((message as { context_usage?: unknown }).context_usage);
+            if (context) {
+              const observation = this.retainWindow(session, context);
+              if (observation) update.item = { ...update.item, window: observation.window, model: observation.model };
+            }
+          }
+          if (update.item.model) boundedSet(this.usageContexts, `${session.id}:${update.item.id}`, { contextKey: session.contextKey, model: update.item.model }, 8_192);
+          if (update.item.type === "context_report" || update.item.usage) boundedSet(this.latestContextUsage, session.id, update.item, 256);
+        }
+        // A turn that failed on the login: what the composer says about the
+        // login must not wait for the next accounts change to catch up.
+        if (normalized.updates.some(update => update.kind === "upsert" && update.item.type === "notice" && update.item.code === LOGIN_FAILED_NOTICE_CODE)) void this.readLogin();
+        this.learnSubagentRuns(session, message);
+        if (memory.rateLimit) this.rateLimitedSessions.set(session.id, memory.rateLimit); else this.rateLimitedSessions.delete(session.id);
         this.adoptRefusalFallback(session.id, message);
         // A retry or a compaction names a state of the conversation's own
         // turn. Outside one (a background subagent's retry, the CLI's side
@@ -1039,6 +1847,12 @@ export class ClaudeProvider implements ChatProvider {
           const entry = typeof started.task_id === "string" ? session.backgroundTasks.get(started.task_id) : undefined;
           if (entry && typeof started.tool_use_id === "string" && started.tool_use_id) entry.toolUseId = started.tool_use_id;
         }
+        // Whatever a task's row learned (its type, prompt, usage, output
+        // file, child id) is mirrored onto the live entry, so the list a
+        // reopened conversation is seeded from carries it too; the output
+        // file is kept past the row's settling for the one read that
+        // follows it (taskOutput).
+        this.mirrorTaskRows(session, normalized.updates);
         // A turn the CLI started by itself (the follow-up after a settled
         // background task, D9): report it running so the composer and the
         // held-message queue treat it like any turn.
@@ -1051,14 +1865,27 @@ export class ClaudeProvider implements ChatProvider {
           && (normalized.eventType === "assistant" || normalized.eventType === "stream_event" || (normalized.eventType === "system" && (message as { subtype?: unknown }).subtype === "init"))) {
           session.unpromptedTurn = true;
           this.clearIdleTimer(session);
-          this.emit(session.id, { updates: [{ kind: "status", status: "running" }], outcome: "handled", eventType: "turn.unprompted" });
+          this.emit(session.id, { updates: [{ kind: "status", status: "running" }], outcome: "handled", eventType: "turn.unprompted",
+            notificationTurns: session.notificationLifecycle.beginFollowup(`followup:${randomUUID()}`, this.now()),
+          });
         }
         // A result that lands after the user cancelled is the cancellation's
         // own echo: report interrupted, not a turn failure.
+        const wasInterrupted = session.interrupted;
         if (session.interrupted && normalized.eventType === "result") {
           session.interrupted = false;
           normalized.updates = normalized.updates.map(update =>
             update.kind === "status" ? { kind: "status", status: "interrupted" } : update);
+        }
+        // A foreground run (design D13) belongs to the turn that ran it: one
+        // that has not reported its end by the turn's result never will.
+        if (resultId && normalized.outcome === "handled") {
+          normalized.updates = [...settleForegroundRuns(memory, "The command ended without this run reporting its outcome."), ...normalized.updates];
+        }
+        if (resultId && normalized.outcome === "handled") {
+          const failed = normalized.updates.some(update => update.kind === "status" && update.status === "failed");
+          normalized.notificationTurns = session.notificationLifecycle.finish(resultId,
+            wasInterrupted ? "interrupted" : failed ? "failed" : session.backgroundTasks.size > 0 ? "background" : "completed", this.now());
         }
         this.emit(session.id, normalized);
         // A terminal result ends the turn; an idle conversation holds no
@@ -1095,7 +1922,14 @@ export class ClaudeProvider implements ChatProvider {
           if (session.backgroundTasks.size > 0 && session.pendingTurns === 0) {
             // Not idle: the composer shows background work, prompting stays
             // possible, and the process stays up for the tasks (spec).
+            // Running work outranks pending wakeups: both hold the session,
+            // background is the more urgent fact (D2).
             this.emit(session.id, { updates: [{ kind: "status", status: "background" }], outcome: "handled", eventType: "turn.background" });
+          } else if (session.wakeups.size > 0 && session.pendingTurns === 0 && session.queuedTurns === 0) {
+            // Nothing runs, but the session holds the agent's future turns:
+            // the scheduled state, kept up until they fire or end (D2). The
+            // Stop hook precedes this result (spike), so the set is current.
+            this.emit(session.id, { updates: [{ kind: "status", status: "scheduled" }], outcome: "handled", eventType: "turn.scheduled" });
           }
           void report.then(async generation => {
             // A set that emptied while the report was out has armed the
@@ -1103,7 +1937,7 @@ export class ClaudeProvider implements ChatProvider {
             // A probe a later turn overtook is not the one to retire on:
             // that turn's own continuation decides, once its read is in.
             if (session.idleTimer !== undefined || session.reportGeneration !== generation) return;
-            if (this.sessionIsIdle(session) && this.live.get(session.id) === session) await this.retireSession(session);
+            await this.retireIfIdle(session);
           });
         }
       }
@@ -1120,7 +1954,15 @@ export class ClaudeProvider implements ChatProvider {
         // status the adapter keeps the conversation running, prompts stay
         // held, and cancellation finds nothing to interrupt. Background
         // work died with the process: its rows settle and the state clears.
-        const settled = this.settleBackgroundTasks(session, "The Claude Code session ended before this task finished.", memory);
+        const settled = [
+          ...this.settleBackgroundTasks(session, "The Claude Code session ended before this task finished.", memory),
+          ...settleForegroundRuns(memory, "The Claude Code session ended before this run finished."),
+          // The crons were inside the process; they end with it (D6).
+          ...this.settleWakeups(session, "ended"),
+        ];
+        // Subagent runs died with it too: their child transcripts stop
+        // reading as running.
+        this.settleChildren(session, "interrupted");
         // A turn the CLI reported queued behind its follow-up is lost with
         // the process too: it was accepted, so it fails rather than vanishes.
         if (session.pendingTurns > 0 || session.unpromptedTurn || session.queuedTurns > 0) {
@@ -1139,15 +1981,20 @@ export class ClaudeProvider implements ChatProvider {
       this.foldSessionTotals(session);
       this.clearIdleTimer(session);
       this.abandonInteractions(session.id, "The session failed before the user answered.");
+      this.settleChildren(session, "failed");
       this.emit(session.id, {
         updates: [
           ...this.settleBackgroundTasks(session, "The Claude Code session failed before this task finished.", memory),
+          ...settleForegroundRuns(memory, "The Claude Code session failed before this run finished."),
+          ...this.settleWakeups(session, "ended"),
           { kind: "upsert", item: { id: `notice:session-error:${this.now()}`, type: "notice", createdAt: this.now(), level: "error", message: error instanceof Error ? error.message : "Claude Code session failed" } },
           { kind: "status", status: "failed", message: "Claude Code session ended unexpectedly" },
         ],
         outcome: "handled",
         eventType: "session.failed",
       });
+    } finally {
+      this.cancelSessionWindowRead(session);
     }
   }
 
@@ -1224,7 +2071,7 @@ export class ClaudeProvider implements ChatProvider {
     } finally {
       // A session started only for this control call holds no turn; an idle
       // conversation keeps no process behind after a rewind, refused or not.
-      if (this.sessionIsIdle(session)) await this.retireSession(session);
+      await this.retireIfIdle(session);
     }
   }
 
@@ -1407,7 +2254,18 @@ export class ClaudeProvider implements ChatProvider {
           modeBeforePlan?: Record<string, string>;
           deferredRenames?: Record<string, string>;
           pending?: Record<string, { title: string; createdAt: number; updatedAt: number }>;
+          usage?: AgentUsageReport;
+          cancelledWakeups?: Record<string, Record<string, string>>;
         };
+        for (const [id, wakeups] of Object.entries(stored.cancelledWakeups ?? {})) {
+          if (!wakeups || typeof wakeups !== "object") continue;
+          const cancelled = this.cancelledWakeups.get(id) ?? new Map<string, string>();
+          for (const [wakeupId, prompt] of Object.entries(wakeups)) {
+            if (typeof prompt === "string" && !cancelled.has(wakeupId)) cancelled.set(wakeupId, prompt);
+          }
+          this.cancelledWakeups.set(id, cancelled);
+        }
+        if (stored.usage && typeof stored.usage.readAt === "number" && (!this.lastUsage || stored.usage.readAt > this.lastUsage.readAt)) this.lastUsage = stored.usage;
         for (const [id, configuration] of Object.entries(stored.configurations ?? {})) {
           if (!this.configurations.has(id)) this.configurations.set(id, configuration);
         }
@@ -1497,6 +2355,8 @@ export class ClaudeProvider implements ChatProvider {
       deferredRenames: Object.fromEntries(this.deferredRenames),
       pending: Object.fromEntries([...this.pending.values()].map(session =>
         [session.id, { title: session.title, createdAt: session.createdAt, updatedAt: session.updatedAt }])),
+      usage: this.lastUsage,
+      cancelledWakeups: Object.fromEntries([...this.cancelledWakeups].map(([id, wakeups]) => [id, Object.fromEntries(wakeups)])),
     });
   }
 
@@ -1514,10 +2374,11 @@ export class ClaudeProvider implements ChatProvider {
   private brokerToolUse(sessionId: string, toolName: string, input: Record<string, unknown>, options: ClaudeCanUseToolOptions): Promise<ClaudePermissionResult> {
     const requestId = options.toolUseID ?? randomUUID();
     const createdAt = this.now();
-    const questions = toolName === "AskUserQuestion" ? normalizeAskUserQuestions(input) : null;
     // A completed plan asks for its own kind of approval: the card carries
     // the plan and intents rather than the generic allow pair (D5).
-    const plan = toolName === "ExitPlanMode" && typeof input.plan === "string" ? input.plan : null;
+    const interaction = claudeToolInteraction(toolName, input);
+    const questions = interaction.kind === "question" ? interaction.questions : null;
+    const plan = interaction.kind === "plan" ? interaction.plan : null;
     const returnMode = this.modeBeforePlan.get(sessionId);
     const item: PermissionRequest | QuestionRequest = questions
       ? { id: `question:${requestId}`, type: "question", createdAt, requestId, questions, status: "pending" }
@@ -1545,6 +2406,10 @@ export class ClaudeProvider implements ChatProvider {
           requestId,
           action: options.title ?? options.displayName ?? toolName,
           resources: permissionResources(input, options),
+          // What "Allow always" will forward, spelled as Claude Code rules,
+          // derived from the same filter the reply uses, so the card can
+          // never promise a rule the reply does not install.
+          alwaysPatterns: describeSessionScopedUpdates(options.suggestions),
           status: "pending",
         };
     return this.awaitInteraction<ClaudePermissionResult>(sessionId, {
@@ -1776,7 +2641,7 @@ export class ClaudeProvider implements ChatProvider {
     // add a second, unobserved path to retirement. Results and the
     // background set decide.
     if (record.subtype !== "background_tasks_changed" || !Array.isArray(record.tasks)) return;
-    const next = new Map<string, { description: string; taskType?: string; toolUseId?: string; startedAt: number }>();
+    const next = new Map<string, LiveBackgroundTask>();
     // Every id the payload names, ambient ones included: a task that turned
     // ambient is still running and must not read as dropped.
     const named = new Set<string>();
@@ -1793,6 +2658,7 @@ export class ClaudeProvider implements ChatProvider {
         ...(typeof task.task_type === "string" && task.task_type ? { taskType: task.task_type } : known?.taskType ? { taskType: known.taskType } : {}),
         ...(known?.toolUseId ? { toolUseId: known.toolUseId } : {}),
         startedAt: known && "startedAt" in known ? (known as { startedAt: number }).startedAt : (known as { createdAt?: number } | undefined)?.createdAt ?? this.now(),
+        ...taskFacts(known),
       });
     }
     const previous = session.backgroundTasks;
@@ -1808,7 +2674,7 @@ export class ClaudeProvider implements ChatProvider {
     const reconciled: NormalizedProviderUpdate[] = [];
     for (const [taskId, task] of next) {
       if (previous.has(taskId) || memory.tasks.get(taskId)?.announced) continue;
-      reconciled.push({ kind: "upsert", item: { id: `task:${taskId}`, type: "background_task", createdAt: task.startedAt, taskId, description: task.description, ...(task.taskType ? { taskType: task.taskType } : {}), ...(task.toolUseId ? { toolUseId: task.toolUseId } : {}), status: "running" } });
+      reconciled.push({ kind: "upsert", item: { id: `task:${taskId}`, type: "background_task", createdAt: task.startedAt, taskId, description: task.description, ...(task.taskType ? { taskType: task.taskType } : {}), ...(task.toolUseId ? { toolUseId: task.toolUseId } : {}), status: "running", ...taskFacts(task) } });
     }
     for (const taskId of ambient) {
       // Ambient is not user work, whether the task turned so or its start
@@ -1828,7 +2694,8 @@ export class ClaudeProvider implements ChatProvider {
       // The level says only that the task ended, not how: the row closes as
       // stopped and says so, and the notification (when it comes) supplies
       // the real outcome and summary — a terminal row takes any but running.
-      reconciled.push({ kind: "upsert", item: { id: `task:${taskId}`, type: "background_task", createdAt: task.startedAt, taskId, description: task.description, ...(task.taskType ? { taskType: task.taskType } : {}), ...(task.toolUseId ? { toolUseId: task.toolUseId } : {}), status: "stopped", summary: "The task left Claude Code's task list without reporting an outcome." } });
+      reconciled.push({ kind: "upsert", item: { id: `task:${taskId}`, type: "background_task", createdAt: task.startedAt, taskId, description: task.description, ...(task.taskType ? { taskType: task.taskType } : {}), ...(task.toolUseId ? { toolUseId: task.toolUseId } : {}), status: "stopped", summary: "The task left Claude Code's task list without reporting an outcome.", ...taskFacts(task) } });
+      this.settleTaskOutput(session.id, taskId);
     }
     if (reconciled.length > 0) this.emit(session.id, { updates: reconciled, outcome: "handled", eventType: "background.reconciled" });
     if (next.size === 0 && session.pendingTurns === 0 && !session.unpromptedTurn) {
@@ -1838,9 +2705,16 @@ export class ClaudeProvider implements ChatProvider {
       this.clearIdleTimer(session);
       session.idleTimer = setTimeout(() => {
         session.idleTimer = undefined;
-        if (this.live.get(session.id) !== session || !this.sessionIsIdle(session)) return;
+        if (this.live.get(session.id) !== session) return;
+        // Background work is gone and no follow-up came, but the session
+        // still holds wakeups: it stays up, in the scheduled state (D2).
+        if (session.wakeups.size > 0 && session.backgroundTasks.size === 0 && session.pendingTurns === 0 && session.queuedTurns === 0 && !session.unpromptedTurn) {
+          this.emit(session.id, { updates: [{ kind: "status", status: "scheduled" }], outcome: "handled", eventType: "turn.scheduled" });
+          return;
+        }
+        if (!this.idleExceptReads(session)) return;
         this.emit(session.id, { updates: [{ kind: "status", status: "idle" }], outcome: "handled", eventType: "turn.background-cleared" });
-        void this.retireSession(session);
+        void this.retireIfIdle(session);
       }, this.backgroundGraceMs);
       (session.idleTimer as unknown as { unref?: () => void }).unref?.();
     } else if (next.size > 0) {
@@ -1856,11 +2730,12 @@ export class ClaudeProvider implements ChatProvider {
     // row the level set never held: it died with the process all the same.
     for (const [taskId, task] of memory.tasks) {
       if (live.has(taskId) || !task.announced || task.settled || memory.ambientTasks.has(taskId)) continue;
-      live.set(taskId, { description: task.description, ...(task.taskType ? { taskType: task.taskType } : {}), ...(task.toolUseId ? { toolUseId: task.toolUseId } : {}), startedAt: task.createdAt });
+      live.set(taskId, { description: task.description, ...(task.taskType ? { taskType: task.taskType } : {}), ...(task.toolUseId ? { toolUseId: task.toolUseId } : {}), startedAt: task.createdAt, ...taskFacts(task) });
     }
     for (const [taskId, task] of live) {
       const known = memory.tasks.get(taskId);
       if (known) known.settled = true;
+      this.settleTaskOutput(session.id, taskId);
       updates.push({ kind: "upsert", item: {
         id: `task:${taskId}`,
         type: "background_task",
@@ -1871,10 +2746,339 @@ export class ClaudeProvider implements ChatProvider {
         ...(task.toolUseId ? { toolUseId: task.toolUseId } : {}),
         status: "stopped",
         summary,
+        ...taskFacts(task),
       } });
     }
     session.backgroundTasks = new Map();
     return updates;
+  }
+
+  /**
+   * The Stop hook's `session_crons`, level-set like the background set
+   * (D1): each cron is a pending row; one the set dropped fired (a one-shot
+   * that started a wakeup turn since the last Stop) or was cancelled (the
+   * agent removed it, or a loop ended). A recurring cron stays pending and
+   * its next fire time moves on. A payload without the field (a CLI that
+   * does not report crons) changes nothing.
+   */
+  private trackWakeups(session: LiveSession, input: Record<string, unknown>): void {
+    if (this.live.get(session.id) !== session) return;
+    // A subagent's stop is not the conversation's.
+    if (typeof input.agent_id === "string" && input.agent_id) return;
+    if (!Array.isArray(input.session_crons)) return;
+    const now = this.now();
+    const next = new Map<string, SessionWakeup>();
+    const updates: NormalizedProviderUpdate[] = [];
+    for (const value of input.session_crons) {
+      if (!value || typeof value !== "object") continue;
+      const cron = value as Record<string, unknown>;
+      if (typeof cron.id !== "string" || !cron.id || typeof cron.schedule !== "string" || !cron.schedule) continue;
+      // Cancelled by the user: the CLI still holds it, uatu does not (D12).
+      if (this.cancelledWakeups.get(session.id)?.has(cron.id)) continue;
+      const known = session.wakeups.get(cron.id);
+      const wakeup: SessionWakeup = {
+        prompt: typeof cron.prompt === "string" ? cron.prompt : "",
+        recurring: cron.recurring === true,
+        schedule: cron.schedule,
+        createdAt: known?.createdAt ?? now,
+      };
+      const nextFireAt = nextCronFire(wakeup.schedule, now);
+      if (nextFireAt !== undefined) wakeup.nextFireAt = nextFireAt;
+      next.set(cron.id, wakeup);
+      if (known && known.prompt === wakeup.prompt && known.recurring === wakeup.recurring && known.schedule === wakeup.schedule && known.nextFireAt === wakeup.nextFireAt) continue;
+      updates.push({ kind: "upsert", item: wakeupRow(cron.id, wakeup, "pending") });
+    }
+    // A fire attributed to a one-shot this Stop still lists went to a
+    // same-prompt sibling that is gone: the disappearance is the CLI's word
+    // on which one fired, so the fire moves there and its header follows.
+    const misattributed = [...session.firedSinceStop].filter(([wakeupId]) => {
+      const kept = next.get(wakeupId);
+      return kept !== undefined && !kept.recurring;
+    });
+    const firedTurn = (wakeupId: string, prompt: string): string | undefined => {
+      const own = session.firedSinceStop.get(wakeupId);
+      if (own && !misattributed.some(([id]) => id === wakeupId)) return own.turnId;
+      const index = misattributed.findIndex(([, fire]) => wakeupPromptMatches(prompt, fire.text));
+      if (index < 0) return undefined;
+      const [[, fire]] = misattributed.splice(index, 1) as [[string, WakeupFire]];
+      updates.push({ kind: "upsert", item: wakeupTurnItem(fire, wakeupId) });
+      return fire.turnId;
+    };
+    for (const [wakeupId, wakeup] of session.wakeups) {
+      if (next.has(wakeupId)) continue;
+      const firedTurnId = wakeup.recurring ? undefined : firedTurn(wakeupId, wakeup.prompt);
+      updates.push({ kind: "upsert", item: firedTurnId !== undefined
+        ? wakeupRow(wakeupId, wakeup, "fired", { firedTurnId })
+        : wakeupRow(wakeupId, wakeup, "cancelled") });
+    }
+    // The first Stop of a resumed session is the CLI's own word on what it
+    // rebuilt: a paused cron it lists is pending again (above); one that
+    // fired meanwhile is fired; one it does not list was not restored.
+    if (!session.revivedSettled) {
+      session.revivedSettled = true;
+      for (const [wakeupId, cron] of session.revived) {
+        if (next.has(wakeupId) || session.wakeups.has(wakeupId) || this.cancelledWakeups.get(session.id)?.has(wakeupId)) continue;
+        const wakeup: SessionWakeup = { prompt: cron.prompt, recurring: cron.recurring, schedule: cron.cron, createdAt: cron.createdAt };
+        const firedTurnId = cron.recurring ? undefined : firedTurn(wakeupId, cron.prompt);
+        updates.push({ kind: "upsert", item: firedTurnId !== undefined
+          ? wakeupRow(wakeupId, wakeup, "fired", { firedTurnId })
+          : wakeupRow(wakeupId, wakeup, "lost", { message: WAKEUP_NOT_RESTORED_MESSAGE }) });
+      }
+    }
+    session.wakeups = next;
+    session.firedSinceStop.clear();
+    if (updates.length > 0) this.emit(session.id, { updates, outcome: "handled", eventType: "wakeups.reconciled" });
+  }
+
+  /** Reads which crons the CLI rebuilt for a resumed session (D11). */
+  private async primeRevivedCrons(session: LiveSession, nativeId: string): Promise<void> {
+    try {
+      const { entries } = await readSessionTranscript(sessionTranscriptPath(this.workspacePath, nativeId, this.configDir));
+      const { alive, created } = transcriptCrons(entries, this.now());
+      for (const id of created) boundedAdd(session.cronIds, id);
+      // A Stop that already ran settled nothing it did not know about.
+      if (session.revivedSettled) return;
+      for (const cron of alive) session.revived.set(cron.id, cron);
+    } catch {
+      // No transcript to read: nothing was rebuilt.
+    }
+  }
+
+  /**
+   * A conversation's paused crons (D11), for opening it without a live
+   * session: what its transcript says the CLI rebuilds on resume, minus
+   * what the user cancelled. A live session answers with nothing — its own
+   * Stop is the truth then. Cancelled ids the transcript no longer yields
+   * are dropped from the durable set.
+   */
+  async listPausedWakeups(sessionId: string): Promise<ScheduledWakeupItem[]> {
+    await this.restoreDurableState();
+    if (this.live.has(sessionId)) return [];
+    let alive: TranscriptCron[];
+    try {
+      const { entries } = await readSessionTranscript(sessionTranscriptPath(this.workspacePath, this.nativeId(sessionId), this.configDir));
+      alive = transcriptCrons(entries, this.now()).alive;
+    } catch {
+      return [];
+    }
+    const cancelled = this.cancelledWakeups.get(sessionId);
+    if (cancelled) {
+      const aliveIds = new Set(alive.map(cron => cron.id));
+      let pruned = false;
+      for (const wakeupId of cancelled.keys()) if (!aliveIds.has(wakeupId)) { cancelled.delete(wakeupId); pruned = true; }
+      if (cancelled.size === 0) this.cancelledWakeups.delete(sessionId);
+      if (pruned) this.persistDurableState();
+    }
+    return alive.filter(cron => !cancelled?.has(cron.id)).map(cron => pausedRow(cron));
+  }
+
+  /**
+   * Cancel one wakeup (D12). A live one leaves the session's schedule — the
+   * rest stay, and a session held by nothing else retires; a paused one
+   * needs no session. Either way the cancel is recorded durably and the
+   * wakeup's fires are blocked from then on.
+   */
+  async cancelWakeup(sessionId: string, wakeupId: string): Promise<void> {
+    await this.restoreDurableState();
+    const session = this.live.get(sessionId);
+    const live = session?.wakeups.get(wakeupId);
+    if (session && live) {
+      await this.recordCancelled(sessionId, [[wakeupId, live.prompt]]);
+      if (this.live.get(sessionId) !== session || !session.wakeups.has(wakeupId)) return;
+      session.wakeups.delete(wakeupId);
+      const updates: NormalizedProviderUpdate[] = [{ kind: "upsert", item: wakeupRow(wakeupId, live, "cancelled") }];
+      const idle = this.idleExceptReads(session) && session.idleTimer === undefined;
+      if (idle) updates.push({ kind: "status", status: "idle" });
+      this.emit(sessionId, { updates, outcome: "handled", eventType: "wakeup.cancelled" });
+      if (idle) await this.retireIfIdle(session);
+      return;
+    }
+    const revived = session?.revived.get(wakeupId);
+    const paused = revived ? pausedRow(revived) : (await this.listPausedWakeups(sessionId)).find(item => item.wakeupId === wakeupId);
+    if (!paused) throw new ScheduledWakeupUnavailableError("that wakeup is no longer scheduled");
+    await this.recordCancelled(sessionId, [[wakeupId, paused.prompt]]);
+    const { message: _message, ...row } = paused;
+    this.emit(sessionId, { updates: [{ kind: "upsert", item: { ...row, status: "cancelled" } }], outcome: "handled", eventType: "wakeup.cancelled" });
+  }
+
+  /**
+   * A prompt the CLI submits by itself because a wakeup fired (D4). No `user`
+   * message reaches the stream for it (spike), so the provider mints the
+   * turn's opening item here, as it does for a typed prompt at accept time —
+   * a wakeup header, never a bubble the user did not type. Attributed by the
+   * hook's `source` when the CLI sends one; otherwise (every CLI the spike
+   * saw) by the prompt matching a pending wakeup while no accepted prompt is
+   * outstanding. The `init` that follows starts the unprompted turn (D9).
+   */
+  private attributeWakeupTurn(session: LiveSession, input: Record<string, unknown>): void {
+    if (this.live.get(session.id) !== session) return;
+    if (typeof input.agent_id === "string" && input.agent_id) return;
+    const prompt = typeof input.prompt === "string" ? input.prompt : "";
+    const source = typeof input.source === "string" ? input.source : undefined;
+    const cancelled = this.cancelledWakeups.get(session.id);
+    // Wakeups can share a prompt: the one firing is the one due soonest,
+    // and a one-shot that already fired this round cannot fire again. The
+    // next Stop corrects a guess it proves wrong (trackWakeups).
+    const firable = (id: string, recurring: boolean) => recurring || !session.firedSinceStop.has(id);
+    const matched = [...session.wakeups]
+      .filter(([id, wakeup]) => firable(id, wakeup.recurring) && wakeupPromptMatches(wakeup.prompt, prompt))
+      .sort(([, left], [, right]) => (left.nextFireAt ?? Infinity) - (right.nextFireAt ?? Infinity))[0]
+      ?? [...session.revived].find(([id, cron]) => !cancelled?.has(id) && firable(id, cron.recurring) && wakeupPromptMatches(cron.prompt, prompt));
+    if (source !== undefined) {
+      if (source !== "loop_wakeup" && source !== "schedule_wakeup") return;
+    } else if (!matched || session.pendingTurns > 0 || session.queuedTurns > 0) {
+      return;
+    }
+    const promptId = typeof input.prompt_id === "string" && input.prompt_id ? input.prompt_id : randomUUID();
+    const fire: WakeupFire = { turnId: `message:wakeup:${promptId}`, text: prompt, createdAt: this.now() };
+    if (matched) session.firedSinceStop.set(matched[0], fire);
+    this.emit(session.id, {
+      updates: [{ kind: "upsert", item: wakeupTurnItem(fire, matched?.[0]) }],
+      outcome: "handled",
+      eventType: "wakeup.fired",
+    });
+  }
+
+  /**
+   * Which scheduling call made which wakeup (D10), from the conversation's
+   * own frames: a ScheduleWakeup call's prompt, a CronCreate result's id.
+   * Read before the frame is normalized, while the tool memory still holds
+   * the call a result answers.
+   */
+  private trackSchedulingCalls(session: LiveSession, message: unknown, memory: ReturnType<typeof createClaudeEventMemory>): void {
+    if (!message || typeof message !== "object") return;
+    const record = message as Record<string, unknown>;
+    if (record.parent_tool_use_id) return;
+    const content = (record.message as { content?: unknown } | undefined)?.content;
+    if (!Array.isArray(content)) return;
+    for (const value of content) {
+      if (!value || typeof value !== "object") continue;
+      const block = value as Record<string, unknown>;
+      if (record.type === "assistant" && block.type === "tool_use" && block.name === "ScheduleWakeup") {
+        const prompt = (block.input as { prompt?: unknown } | undefined)?.prompt;
+        if (typeof prompt === "string" && prompt) boundedAdd(session.selfPacedPrompts, prompt);
+      }
+      if (record.type === "user" && block.type === "tool_result" && typeof block.tool_use_id === "string" && memory.tools.get(block.tool_use_id)?.name === "CronCreate") {
+        const id = (record.tool_use_result as { id?: unknown } | undefined)?.id;
+        if (typeof id === "string" && id) boundedAdd(session.cronIds, id);
+      }
+    }
+  }
+
+  /**
+   * The pending wakeup rows of a session whose schedule ends, settled and
+   * cleared. `ended` is the process going away (D6, D10): a cron is paused,
+   * a self-paced wakeup lost. `cancelled` is the user's call.
+   */
+  private settleWakeups(session: LiveSession, outcome: "cancelled" | "ended"): NormalizedProviderUpdate[] {
+    const updates: NormalizedProviderUpdate[] = [...session.wakeups].map(([wakeupId, wakeup]) => {
+      if (outcome === "cancelled") return { kind: "upsert" as const, item: wakeupRow(wakeupId, wakeup, "cancelled") };
+      const revives = wakeupRevives(session, wakeupId, wakeup);
+      return { kind: "upsert" as const, item: revives
+        ? wakeupRow(wakeupId, wakeup, "paused", { message: wakeup.recurring ? WAKEUP_PAUSED_MESSAGE : WAKEUP_PAUSED_ONCE_MESSAGE })
+        : wakeupRow(wakeupId, wakeup, "lost", { message: WAKEUP_LOST_MESSAGE }) };
+    });
+    session.wakeups = new Map();
+    session.firedSinceStop.clear();
+    return updates;
+  }
+
+  /** Every pending wakeup, for a reopened conversation's rows and list. */
+  async listScheduledWakeups(): Promise<PendingScheduledWakeup[]> {
+    const wakeups: PendingScheduledWakeup[] = [];
+    for (const session of this.live.values()) {
+      for (const [wakeupId, wakeup] of session.wakeups) {
+        wakeups.push({ conversationId: session.id, wakeupId, prompt: wakeup.prompt, recurring: wakeup.recurring, schedule: wakeup.schedule, ...(wakeup.nextFireAt !== undefined ? { nextFireAt: wakeup.nextFireAt } : {}), createdAt: wakeup.createdAt });
+      }
+    }
+    return wakeups;
+  }
+
+  /**
+   * A fire of a wakeup the user cancelled (D12): the prompt of a cancelled
+   * wakeup, submitted while no accepted prompt is outstanding (a person who
+   * types the same words is still a person). The hook blocks it — no model
+   * call — and the frames it produces are swallowed.
+   */
+  private blocksCancelledFire(session: LiveSession, input: Record<string, unknown>): boolean {
+    if (this.live.get(session.id) !== session) return false;
+    if (typeof input.agent_id === "string" && input.agent_id) return false;
+    const cancelled = this.cancelledWakeups.get(session.id);
+    if (!cancelled || cancelled.size === 0 || session.pendingTurns > 0 || session.queuedTurns > 0) return false;
+    const prompt = typeof input.prompt === "string" ? input.prompt : "";
+    if (![...cancelled.values()].some(cancelledPrompt => wakeupPromptMatches(cancelledPrompt, prompt))) return false;
+    session.blockedFires += 1;
+    return true;
+  }
+
+  /**
+   * Records cancelled wakeups durably; the block must survive a restart.
+   * No count cap: a record dropped while its cron can still be rebuilt
+   * would let a resume run a wakeup the user cancelled. The set shrinks
+   * only when the transcript stops yielding the cron (listPausedWakeups).
+   * A failed write takes the records back out: a cancel reported as failed
+   * must not go on blocking and hiding the wakeup in this process while a
+   * restart would bring it back. Resolves to the same undo, for a caller
+   * that finds after the write that it cannot go through with the cancel.
+   */
+  private async recordCancelled(sessionId: string, wakeups: Array<[string, string]>): Promise<() => void> {
+    if (wakeups.length === 0) return () => {};
+    const cancelled = this.cancelledWakeups.get(sessionId) ?? new Map<string, string>();
+    const prior = new Map(wakeups.map(([wakeupId]) => [wakeupId, cancelled.get(wakeupId)]));
+    for (const [wakeupId, prompt] of wakeups) cancelled.set(wakeupId, prompt);
+    this.cancelledWakeups.set(sessionId, cancelled);
+    const undo = () => {
+      const current = this.cancelledWakeups.get(sessionId);
+      if (!current) return;
+      for (const [wakeupId, previous] of prior) {
+        if (previous === undefined) current.delete(wakeupId); else current.set(wakeupId, previous);
+      }
+      if (current.size === 0) this.cancelledWakeups.delete(sessionId);
+    };
+    try {
+      await this.queuePersist(this.durableSnapshot());
+    } catch (error) {
+      undo();
+      throw error;
+    }
+    return undo;
+  }
+
+  /**
+   * Release (D5): retire a session held only for its wakeups. The process
+   * ends and its crons with it, so the rows read as cancelled — the user's
+   * call, not a loss — and the conversation is idle; the next prompt resumes
+   * fresh. Refused while a turn runs or background work would die with it.
+   */
+  async release(sessionId: string): Promise<void> {
+    const session = this.live.get(sessionId);
+    if (!session) return;
+    // A wakeup attributed at its hook is a turn already, before its init.
+    const turning = () => session.pendingTurns > 0 || session.queuedTurns > 0 || session.unpromptedTurn || session.firedSinceStop.size > 0;
+    if (turning()) {
+      throw new ReleaseUnavailableError("a turn is running; release is possible once it ends");
+    }
+    if (session.backgroundTasks.size > 0) {
+      throw new ReleaseUnavailableError("background work is running; stop it before releasing the session");
+    }
+    // Recorded before the process goes: the next resume rebuilds every
+    // cron, and each must already be blocked when it does (D12).
+    const undo = await this.recordCancelled(sessionId, [...session.wakeups].map(([wakeupId, wakeup]) => [wakeupId, wakeup.prompt] as [string, string]));
+    if (this.live.get(sessionId) !== session) return;
+    // A wakeup that passed its hook while the write ran has started a turn:
+    // retiring now would kill it under its own header. The release is
+    // refused as it would have been a moment later, and nothing it recorded
+    // stays cancelled.
+    if (turning() || session.backgroundTasks.size > 0) {
+      undo();
+      await this.queuePersist(this.durableSnapshot()).catch(() => undefined);
+      throw new ReleaseUnavailableError(session.backgroundTasks.size > 0
+        ? "background work is running; stop it before releasing the session"
+        : "a turn is running; release is possible once it ends");
+    }
+    const cancelled = this.settleWakeups(session, "cancelled");
+    this.emit(sessionId, { updates: [...cancelled, { kind: "status", status: "idle" }], outcome: "handled", eventType: "session.released" });
+    await this.retireSession(session);
   }
 
   private clearIdleTimer(session: LiveSession): void {
@@ -1883,9 +3087,27 @@ export class ClaudeProvider implements ChatProvider {
     session.idleTimer = undefined;
   }
 
-  /** No accepted turn pending, no follow-up in flight, no live background work. */
+  /** No accepted turn pending, no follow-up in flight, no live background work, no read out. */
   private sessionIsIdle(session: LiveSession): boolean {
-    return session.pendingTurns === 0 && session.queuedTurns === 0 && !session.unpromptedTurn && session.backgroundTasks.size === 0;
+    return this.idleExceptReads(session) && session.usageReads === 0;
+  }
+
+  private idleExceptReads(session: LiveSession): boolean {
+    return session.pendingTurns === 0 && session.queuedTurns === 0 && !session.unpromptedTurn && session.backgroundTasks.size === 0 && session.wakeups.size === 0;
+  }
+
+  /**
+   * Retires an idle session, or — with a usage read out on it — leaves
+   * the retirement to that read's completion. Every retirement decision
+   * after a turn or a control operation comes through here.
+   */
+  private async retireIfIdle(session: LiveSession): Promise<void> {
+    if (this.live.get(session.id) !== session || !this.idleExceptReads(session)) return;
+    if (session.usageReads > 0) {
+      session.retireAfterRead = true;
+      return;
+    }
+    await this.retireSession(session);
   }
 
   /** Every live background task, for a reopened conversation's live list. */
@@ -1893,7 +3115,7 @@ export class ClaudeProvider implements ChatProvider {
     const tasks: PendingBackgroundTask[] = [];
     for (const session of this.live.values()) {
       for (const [taskId, task] of session.backgroundTasks) {
-        tasks.push({ conversationId: session.id, taskId, description: task.description, ...(task.taskType ? { taskType: task.taskType } : {}), ...(task.toolUseId ? { toolUseId: task.toolUseId } : {}), startedAt: task.startedAt });
+        tasks.push({ conversationId: session.id, taskId, description: task.description, ...(task.taskType ? { taskType: task.taskType } : {}), ...(task.toolUseId ? { toolUseId: task.toolUseId } : {}), startedAt: task.startedAt, ...taskFacts(task) });
       }
     }
     return tasks;
@@ -1910,33 +3132,540 @@ export class ClaudeProvider implements ChatProvider {
   }
 
   /**
+   * A bounded tail of a shell task's output file (design D7). Null when the
+   * task is unknown, when nothing has named its output yet, or when the
+   * named file does not resolve to `…/tasks/<taskId>.output` — the CLI's own
+   * layout for a task's output; an agent task's "output" is a symlink to its
+   * subagent transcript and is refused here, its drill-down reads that. Only
+   * the tail is read (no whole-file reads), from the end of the file, and it
+   * opens on a whole UTF-8 character.
+   */
+  async taskOutput(sessionId: string, taskId: string, options: { tailBytes: number }): Promise<BackgroundTaskOutput | null> {
+    const entry = this.taskOutputs.get(taskOutputKey(sessionId, taskId));
+    if (!entry) return null;
+    const tailBytes = Math.max(1, Math.min(Math.floor(options.tailBytes), TASK_OUTPUT_TAIL_MAX_BYTES));
+    let real: string;
+    try {
+      real = await fs.realpath(entry.outputFile);
+    } catch {
+      return null;
+    }
+    if (path.basename(real) !== `${taskId}.output` || path.basename(path.dirname(real)) !== "tasks") return null;
+    const running = this.live.get(sessionId)?.backgroundTasks.has(taskId) === true && !entry.settled;
+    let handle: fs.FileHandle;
+    try {
+      handle = await fs.open(real, "r");
+    } catch {
+      return null;
+    }
+    try {
+      const { size } = await handle.stat();
+      const start = Math.max(0, size - tailBytes);
+      const length = size - start;
+      const buffer = Buffer.alloc(length);
+      let read = 0;
+      while (read < length) {
+        const chunk = await handle.read(buffer, read, length - read, start + read);
+        if (chunk.bytesRead === 0) break;
+        read += chunk.bytesRead;
+      }
+      // A tail cut mid-character would open on a replacement character, so
+      // one that starts past the beginning skips the continuation bytes of
+      // the character the cut split and opens on the next whole one.
+      let first = 0;
+      if (start > 0) while (first < read && (buffer[first]! & 0xC0) === 0x80) first += 1;
+      return { text: buffer.subarray(first, read).toString("utf8"), truncated: start > 0, settled: !running };
+    } finally {
+      await handle.close();
+    }
+  }
+
+  /**
+   * What the normalizer's task rows say, mirrored onto the session's live
+   * entry and the output-file index: the rows are the one place every
+   * source of a task's facts (edges, launching tool result, stored
+   * notification) converges.
+   */
+  private mirrorTaskRows(session: LiveSession, updates: NormalizedProviderUpdate[]): void {
+    for (const update of updates) {
+      if (update.kind !== "upsert" || update.item.type !== "background_task") continue;
+      const row = update.item;
+      const live = session.backgroundTasks.get(row.taskId);
+      if (live) Object.assign(live, taskFacts(row));
+      if (row.outputFile) {
+        const key = taskOutputKey(session.id, row.taskId);
+        const known = this.taskOutputs.get(key);
+        boundedSet(this.taskOutputs, key, { outputFile: row.outputFile, settled: known?.settled === true || row.status !== "running" }, TASK_OUTPUTS_LIMIT);
+      } else if (row.status !== "running") {
+        this.settleTaskOutput(session.id, row.taskId);
+      }
+    }
+  }
+
+  /**
+   * A frame tagged with the tool use of a known subagent run is the child
+   * conversation's (design D8): it is normalized with the child's own memory
+   * and emitted under `sub:<parentSessionId>:<agentId>`, where the adapter's
+   * `parentId` routing publishes it on the child's topic — text, thinking,
+   * tool calls, tool results, streams, and tool heartbeats alike. Nothing of
+   * it lands in the parent: its tool rows too are the run's own, and the
+   * parent's picture of the run is its launching row (the renderer's
+   * subagent entries derive from that row, not from the run's tool rows;
+   * the adapter's launcher tracking reads rows with a child id, which the
+   * run's own rows never carry). A tagged frame whose run is unknown — a
+   * Skill fork on a CLI that names it only in the ending tool result (a
+   * current one names it at its start edge, design D13), or a CLI that emits
+   * no task edges — falls through to the parent's normalizer, which keeps
+   * its tool blocks and drops its text as before.
+   *
+   * The launching row's attribution stays the tool result's and the child
+   * transcript read's (`reconstructAttributionRead`): the routed events
+   * carry no `assistantUsage`/`assistantModel`, so the adapter does not
+   * grow the row's figure live from a third source. The child's own usage
+   * carriers still ride its timeline, as the stored replay's do.
+   *
+   * @returns whether the frame was the child's and has been emitted.
+   */
+  private routeSubagentFrame(session: LiveSession, message: unknown): boolean {
+    if (!message || typeof message !== "object") return false;
+    const record = message as Record<string, unknown>;
+    const parentToolUseId = typeof record.parent_tool_use_id === "string" && record.parent_tool_use_id ? record.parent_tool_use_id : undefined;
+    if (!parentToolUseId || typeof record.type !== "string" || !SUBAGENT_FRAME_TYPES.has(record.type)) return false;
+    const child = session.children.get(parentToolUseId);
+    // No run for this tool use yet: held for the id the ending result will
+    // name (design D10), and still the parent's frame until then, so its
+    // rows read exactly as they do today.
+    if (!child) {
+      this.bufferForkFrame(session, parentToolUseId, record);
+      return false;
+    }
+    this.emitChildFrame(child, record);
+    return true;
+  }
+
+  /**
+   * One forwarded frame as the child's own. Untagged for the child's
+   * normalizer: within its own conversation the frame is the conversation's,
+   * which is also how the stored transcript replays it — the same uuids and
+   * tool-use ids, so a projection filled from the file and then fed live
+   * upserts the same items (task 5.1 c). "live", as for the parent: the CLI
+   * does not forward the run's prompt, and the stored replay supplies that
+   * bubble.
+   *
+   * Shared with the replay a fork's buffer gets (D10), so a frame held and
+   * a frame routed straight through fold into the same child memory and
+   * produce the same item ids.
+   */
+  private emitChildFrame(child: LiveChild, record: Record<string, unknown>): void {
+    const { assistantUsage: _usage, assistantModel: _model, ...normalized } = normalizeClaudeMessage({ ...record, parent_tool_use_id: null }, child.memory, "live");
+    if (normalized.updates.length === 0 && !normalized.configuration) return;
+    this.emit(child.id, normalized);
+  }
+
+  /**
+   * A frame whose run the session cannot name yet, held against its tool use
+   * (design D10). A skill fork's frames stream under the Skill tool use from
+   * the first moment, but the fork's `agentId` appears only in the tool
+   * result, when the run ends — the opposite of an agent task, whose id its
+   * start edge already carries.
+   *
+   * Bounded twice: FORK_BUFFERS_LIMIT tool uses may be waiting at once, and
+   * each holds at most FORK_BUFFER_FRAMES frames. The overflow is dropped
+   * rather than shifted out of the front, so a `tool_use` never loses the
+   * frame that named it and a replayed transcript stays readable from its
+   * start; the fork's own `.jsonl` is the complete record the drill-down
+   * reads once the child is openable. Stream deltas are not held at all:
+   * the complete `assistant` frame that follows says the same thing, and
+   * holding partials would spend the whole bound on text that arrives again.
+   */
+  private bufferForkFrame(session: LiveSession, parentToolUseId: string, record: Record<string, unknown>): void {
+    if (record.type === "stream_event") return;
+    const held = session.forkBuffers.get(parentToolUseId) ?? [];
+    if (held.length < FORK_BUFFER_FRAMES) held.push(record);
+    // Re-inserted on every frame, so the entry the ceiling evicts is the
+    // tool use nothing has streamed under for longest — never the fork
+    // still running.
+    boundedSet(session.forkBuffers, parentToolUseId, held, FORK_BUFFERS_LIMIT);
+  }
+
+  /**
+   * Where the runs are learned (design D8, spike Q1): a `local_agent` task's
+   * `task_id` IS the subagent's agent id, so the start edge names the child
+   * before the first forwarded frame; a launching tool result's `agentId`
+   * (the async launch, or the sync result that ends a foreground run) is
+   * the fallback. The run's end — task frames, the sync result — settles
+   * the child's status. All from the parent's own frames.
+   */
+  private learnSubagentRuns(session: LiveSession, message: unknown): void {
+    if (!message || typeof message !== "object") return;
+    const record = message as Record<string, unknown>;
+    if (record.type === "system") {
+      const taskId = typeof record.task_id === "string" && record.task_id ? record.task_id : undefined;
+      if (!taskId) return;
+      if (record.subtype === "task_started") {
+        const toolUseId = typeof record.tool_use_id === "string" && record.tool_use_id ? record.tool_use_id : undefined;
+        // An agent run is a run whatever the ambient flag says (design D13):
+        // a skill the model forks is marked ambient and streams under its
+        // Skill tool use from its first moment, so opening it here is what
+        // routes those frames live rather than holding them for the result
+        // (D10). The run a typed command launches is ambient too and has no
+        // tool use at all; it is keyed by its task id, and followed from its
+        // transcript on disk, since none of it streams (D14). Ambient work
+        // that is not an agent run — a monitor, a watcher — is still no one's
+        // run and gets no child that would read as running.
+        if (!startsAgentRun(record)) return;
+        // Anything the run streamed before its start edge was held against
+        // its tool use (D10); it opens the child's transcript, in order.
+        const held = toolUseId ? session.forkBuffers.get(toolUseId) : undefined;
+        if (toolUseId) session.forkBuffers.delete(toolUseId);
+        const child = this.openChild(session, runKey(toolUseId ? { toolUseId } : { taskId }), taskId, true);
+        for (const frame of held ?? []) this.emitChildFrame(child, frame);
+        return;
+      }
+      const child = [...session.children.values()].find(candidate => candidate.agentId === taskId);
+      if (!child) return;
+      if (record.subtype === "task_notification") {
+        this.settleChild(child, record.status === "failed" ? "failed" : record.status === "stopped" || record.status === "killed" ? "interrupted" : "completed");
+      } else if (record.subtype === "task_updated") {
+        const status = (record.patch as Record<string, unknown> | undefined)?.status;
+        if (status === "completed") this.settleChild(child, "completed");
+        else if (status === "failed") this.settleChild(child, "failed");
+        else if (status === "killed") this.settleChild(child, "interrupted");
+      }
+      return;
+    }
+    if (record.type !== "user") return;
+    // The tool uses this frame answers, read from its own result blocks.
+    const content = (record.message as { content?: unknown } | undefined)?.content;
+    const results = Array.isArray(content)
+      ? content.flatMap(block => {
+        const result = block as { type?: unknown; tool_use_id?: unknown; is_error?: unknown } | null;
+        return result?.type === "tool_result" && typeof result.tool_use_id === "string" && result.tool_use_id ? [{ toolUseId: result.tool_use_id, failed: result.is_error === true }] : [];
+      })
+      : [];
+    // Whatever these tool uses were, they are over: frames held for one
+    // either become the fork's transcript just below, or are dropped unsent —
+    // a tool use that never forked has no child to replay them into (D10).
+    const held = results.map(result => {
+      const frames = session.forkBuffers.get(result.toolUseId);
+      session.forkBuffers.delete(result.toolUseId);
+      return frames;
+    });
+    // The frame's structured result is one object and names no tool use, so
+    // it can only be read as the result of a frame that answers exactly one.
+    // Claude Code writes each result in a frame of its own, parallel calls
+    // included; a frame that answered several could not say whose `agentId`
+    // this is, and a run named on the wrong tool use would be worse than one
+    // not named here (a current CLI names it at its start edge anyway, D13).
+    if (results.length !== 1) return;
+    const [{ toolUseId, failed }] = results as [{ toolUseId: string; failed: boolean }];
+    const raw = record.toolUseResult ?? record.tool_use_result;
+    const outcome = raw && typeof raw === "object" ? raw as Record<string, unknown> : undefined;
+    const agentId = outcome && typeof outcome.agentId === "string" && outcome.agentId ? outcome.agentId : undefined;
+    if (!agentId || !outcome) return;
+    const launched = outcome.isAsync === true || outcome.status === "async_launched";
+    const buffered = held[0] && held[0].length > 0 ? held[0] : undefined;
+    // A fork (`status: "forked"`) is named only here. Held frames are the
+    // sign that this result names a run that was already streaming, so its
+    // child opens running rather than silently settled: running first, then
+    // the frames it streamed while nameless, in arrival order and once each.
+    // They land BEFORE the settle below, so the status is the last thing the
+    // child hears and the transcript is complete when it is read. A result
+    // that names a run nothing streamed under keeps today's behaviour — the
+    // child is registered so the drill-down resolves it, and says nothing.
+    const child = this.openChild(session, runKey({ toolUseId }), agentId, launched || buffered !== undefined);
+    if (buffered) for (const frame of buffered) this.emitChildFrame(child, frame);
+    // A sync result means the run is over; the task notification usually
+    // said so already, and a fork only ends here — unlike an async agent
+    // launch, whose result is the run's START, a fork's result IS its end
+    // (spec: a fork's identity "is only confirmed when it ends").
+    if (!launched) this.settleChild(child, failed ? "failed" : "completed");
+  }
+
+  /** The child for a run (by `runKey`), opened on first sight; a live run reads as running from here. */
+  private openChild(session: LiveSession, key: string, agentId: string, running: boolean): LiveChild {
+    const known = session.children.get(key);
+    if (known) return known;
+    // A run that becomes known routes its frames from here on: nothing held
+    // against this tool use outlives the moment (the caller that wanted the
+    // buffer took it first). A task-keyed run has no buffer to drop.
+    session.forkBuffers.delete(key);
+    const child: LiveChild = { id: `sub:${session.id}:${agentId}`, agentId, memory: createClaudeEventMemory(), startedAt: this.now(), settled: !running };
+    child.memory.resolveModel = id => this.modelAliases.get(id) ?? id;
+    boundedSet(session.children, key, child, CHILDREN_LIMIT);
+    if (running) this.emit(child.id, { updates: [{ kind: "status", status: "running" }], outcome: "handled", eventType: "subagent.started" });
+    return child;
+  }
+
+  private settleChild(child: LiveChild, status: "completed" | "failed" | "interrupted"): void {
+    if (child.settled) return;
+    child.settled = true;
+    this.emit(child.id, { updates: [{ kind: "status", status }], outcome: "handled", eventType: "subagent.settled" });
+  }
+
+  /** Every run still reading as running when the query ends: settled with the query's own outcome. */
+  private settleChildren(session: LiveSession, status: "failed" | "interrupted"): void {
+    for (const child of session.children.values()) this.settleChild(child, status);
+    // The query that would have named the held frames' run is gone; nothing
+    // can replay them, so they go with it (design D10).
+    session.forkBuffers.clear();
+  }
+
+  /**
+   * A run of a live session, by its child conversation id. The id names its
+   * parent (`sub:<sessionId>:<agentId>`, as `openChild` builds it), so only
+   * that session's runs are searched: the silent-run follower resolves an
+   * open drill-down every couple of seconds, and a scan of every run of
+   * every live session would grow with work that has nothing to do with it.
+   * An id that does not parse names no run.
+   */
+  private liveChild(childId: string): { parentSessionId: string; child: LiveChild } | undefined {
+    const parsed = parseSubagentId(childId);
+    const session = parsed ? this.live.get(parsed.parentSessionId) : undefined;
+    if (!session) return undefined;
+    for (const child of session.children.values()) {
+      if (child.id === childId) return { parentSessionId: session.id, child };
+    }
+    return undefined;
+  }
+
+  /** The task is over, however it ended: its next output read says so. */
+  private settleTaskOutput(sessionId: string, taskId: string): void {
+    const entry = this.taskOutputs.get(taskOutputKey(sessionId, taskId));
+    if (entry) entry.settled = true;
+  }
+
+  /**
    * The `/usage` read: the plan windows when the login has plan limits, and
    * the session's own running totals; bounded like the context read.
    */
-  private async readPlanUtilization(session: LiveSession): Promise<{ plan: PlanUtilization; session?: SessionTotals } | undefined> {
-    const read = session.query.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET;
-    if (!read || this.live.get(session.id) !== session) return undefined;
+  private async readPlanUtilization(session: LiveSession, timeoutMs = this.contextReportTimeoutMs): Promise<{ plan: PlanUtilization; session?: SessionTotals } | undefined> {
+    if (this.live.get(session.id) !== session) return undefined;
+    const seq = ++session.usageSeq;
+    const answer = await this.readUsageAnswer(session.query, timeoutMs);
+    if ("failure" in answer || seq <= session.usageAdopted) return undefined;
+    session.usageAdopted = seq;
+    return this.adoptUsageAnswer(session, answer.raw);
+  }
+
+  /**
+   * The raw `/usage` answer, or why there is none: the query cannot answer
+   * (no such method, a rejected call) or did not in time.
+   */
+  private async readUsageAnswer(query: ClaudeQueryHandle, timeoutMs: number): Promise<{ raw: unknown } | { raw?: undefined; failure: "timeout" | "unavailable" }> {
+    const read = query.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET;
+    if (!read) return { failure: "unavailable" };
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      // The behaviors block (a scan of every transcript touched in a week)
+      // is not carried (readout design D6): asking for it would only cost
+      // the disk work and, on a long history, the probe's whole budget.
+      const raw = await Promise.race([
+        read.call(query, { skipBehaviors: true }),
+        new Promise<null>(resolve => { timer = setTimeout(() => resolve(null), timeoutMs); }),
+      ]);
+      return raw === null ? { failure: "timeout" } : { raw };
+    } catch {
+      return { failure: "unavailable" };
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  }
+
+  /**
+   * What one answer says for the session: the plan and the conversation's
+   * running totals. Answered with no windows (an API-key login): an
+   * explicit empty plan, so the report states it rather than staying silent
+   * like a timeout. That answer holds for the life of the process, so the
+   * plan is not re-read; the call still goes out, because the same answer
+   * carries the conversation's running totals, which change with every turn
+   * and are the figure such a login budgets by. Every answer is also the
+   * workspace's newest usage report.
+   */
+  private adoptUsageAnswer(session: LiveSession, raw: unknown): { plan: PlanUtilization; session?: SessionTotals } {
+    const byModel = (raw as { session?: { model_usage?: Record<string, { contextWindow?: unknown }> } } | null)?.session?.model_usage;
+    if (byModel && typeof byModel === "object") {
+      session.modelCapacities = new Map(Object.entries(byModel).flatMap(([model, value]) => typeof value?.contextWindow === "number" && Number.isSafeInteger(value.contextWindow) && value.contextWindow > 0 ? [[model, value.contextWindow] as const] : []));
+    }
+    const plan = session.planUnavailable ? undefined : normalizePlanUtilization(raw);
+    if (!plan) session.planUnavailable = true;
+    const totals = this.accumulateSessionTotals(session, normalizeSessionTotals(raw));
+    this.noteUsage({ plan: plan ?? {}, readAt: this.now(), conversationId: session.id });
+    return { plan: plan ?? {}, ...(totals ? { session: totals } : {}) };
+  }
+
+  /** Newest read wins; the report is durable so a restart answers from it. */
+  private noteUsage(report: AgentUsageReport): void {
+    if (this.lastUsage && this.lastUsage.readAt > report.readAt) return;
+    this.lastUsage = report;
+    this.persistDurableState();
+  }
+
+  /** The login's plan usage as last read, from memory. */
+  async usageReport(): Promise<AgentUsageReport | undefined> {
+    await this.restoreDurableState();
+    return this.lastUsage;
+  }
+
+  /**
+   * Read plan usage now. The provider picks the session (design D3): a live
+   * one answers without interruption; otherwise, with "start", the most
+   * recently updated conversation is resumed for the read and retired
+   * again; a workspace without one reads through an unlisted probe query.
+   * One read at a time — a second ask joins the first.
+   */
+  async readUsage(mode: UsageReadMode): Promise<UsageReadResult> {
+    await this.restoreDurableState();
+    const inFlight = this.usageRead;
+    if (inFlight && (inFlight.mode === mode || mode === "live-only")) return inFlight.promise;
+    const run = inFlight ? inFlight.promise.catch(() => undefined).then(() => this.performUsageRead(mode)) : this.performUsageRead(mode);
+    const entry = { mode, promise: run };
+    entry.promise = run.finally(() => { if (this.usageRead === entry) this.usageRead = null; });
+    this.usageRead = entry;
+    return entry.promise;
+  }
+
+  private async performUsageRead(mode: UsageReadMode): Promise<UsageReadResult> {
+    const live = this.mostActiveLiveSession();
+    if (live) return this.readUsageThrough(live);
+    if (mode === "live-only") return { report: null, reason: "no-live-session" };
+    const sessions = await this.listSessions();
+    // A conversation with a transcript resumes; a never-prompted one would
+    // start as fresh as the probe does, so it is the last resort before it.
+    const target = [...sessions].sort((a, b) => b.updatedAt - a.updatedAt).find(session => !this.pending.has(session.id)) ?? sessions[0];
+    if (!target) return this.readUsageThroughProbe();
+    let session: LiveSession;
+    let startedForRead = false;
+    try {
+      startedForRead = !this.live.has(target.id);
+      session = await this.ensureLive(target.id);
+    } catch {
+      return { report: null, reason: "unavailable" };
+    }
+    return this.readUsageThrough(session, startedForRead);
+  }
+
+  /** A session with work in flight first, else the most recently started. */
+  private mostActiveLiveSession(): LiveSession | undefined {
+    const sessions = [...this.live.values()];
+    return sessions.findLast(session => !this.sessionIsIdle(session)) ?? sessions.at(-1);
+  }
+
+  /**
+   * The read through a conversation's query: the plan and the context
+   * breakdown together, as after a turn, upserted as one context report so
+   * the conversation's own readout refreshes with it. Deliberately outside
+   * the turn's bookkeeping: no probe generation, no turn count, no idle
+   * timer — a running turn is not interrupted and retires as it would.
+   */
+  private async readUsageThrough(session: LiveSession, startedForRead = false): Promise<UsageReadResult> {
+    // The read counts as activity: a turn that ends meanwhile defers its
+    // retirement to here rather than closing the query under the read.
+    session.usageReads += 1;
+    const contextKey = session.contextKey;
+    const epoch = this.accountEpoch;
+    const windowSequence = ++session.windowSequence;
+    this.cancelSessionWindowRead(session);
+    try {
+      const seq = ++session.usageSeq;
+      const [answer, contextRaw] = await Promise.all([
+        this.readUsageAnswer(session.query, this.usageReadTimeoutMs),
+        this.readContextAnswer(session.query, this.usageReadTimeoutMs),
+      ]);
+      if ("failure" in answer) return { report: null, reason: answer.failure };
+      if (this.live.get(session.id) !== session) return { report: null, reason: "unavailable" };
+      // Overtaken by a newer answer (a turn-end probe on the same query):
+      // that one is the report; this one would only inflate the ledger.
+      if (seq <= session.usageAdopted) return this.lastUsage ? { report: this.lastUsage } : { report: null, reason: "unavailable" };
+      session.usageAdopted = seq;
+      const usage = this.adoptUsageAnswer(session, answer.raw);
+      const configured = this.configurations.get(session.id)?.model;
+      const model = configured && configured.modelId !== "default" ? configured.modelId : undefined;
+      const window = claudeWindowAnswer(contextRaw);
+      const reportingModel = window?.model ? this.attributeModel(window.model, session.id) : model;
+      const item = contextRaw === undefined ? undefined : normalizeContextUsage(contextRaw, this.now(), reportingModel);
+      if (item && contextKey === session.contextKey && epoch === this.accountEpoch && windowSequence === session.windowSequence) {
+        item.contextKey = contextKey;
+        if (window) {
+          const observation = this.retainWindow(session, { ...window, model: window.model ?? model });
+          if (observation) item.window = observation.window;
+        }
+        boundedSet(this.latestContextUsage, session.id, item, 256);
+        this.emit(session.id, { updates: [{ kind: "upsert", item: { ...item, ...usage } }], outcome: "handled", eventType: "context.reported" });
+      }
+      return { report: { plan: usage.plan, readAt: this.lastUsage?.readAt ?? this.now(), conversationId: session.id } };
+    } finally {
+      session.usageReads -= 1;
+      if (contextKey === session.contextKey && epoch === this.accountEpoch && windowSequence === session.windowSequence && !this.sessionIsIdle(session)) this.scheduleSessionWindowRetry(session);
+      // Only what this read is answerable for retires here: a session it
+      // started, or a retirement it held back. A session some other
+      // control operation is using is that operation's to retire. A
+      // follow-up grace window (idle timer) keeps its own say.
+      const owed = startedForRead || session.retireAfterRead === true;
+      if (owed && session.usageReads === 0) session.retireAfterRead = false;
+      if (owed && session.idleTimer === undefined && this.sessionIsIdle(session) && this.live.get(session.id) === session) await this.retireSession(session);
+    }
+  }
+
+  private async readContextAnswer(query: ClaudeQueryHandle, timeoutMs: number): Promise<unknown | undefined> {
+    if (!query.getContextUsage) return undefined;
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       const raw = await Promise.race([
-        read.call(session.query),
-        new Promise<null>(resolve => { timer = setTimeout(() => resolve(null), CONTEXT_REPORT_TIMEOUT_MS); }),
+        query.getContextUsage(),
+        new Promise<null>(resolve => { timer = setTimeout(() => resolve(null), timeoutMs); }),
       ]);
-      // Answered with no windows (an API-key login): an explicit empty plan,
-      // so the report states it rather than staying silent like a timeout.
-      // That answer holds for the life of the process, so the plan is not
-      // re-read; the call still goes out, because the same answer carries
-      // the conversation's running totals, which change with every turn and
-      // are the figure such a login budgets by.
-      if (raw === null) return undefined;
-      const plan = session.planUnavailable ? undefined : normalizePlanUtilization(raw);
-      if (!plan) session.planUnavailable = true;
-      const totals = this.accumulateSessionTotals(session, normalizeSessionTotals(raw));
-      return { plan: plan ?? {}, ...(totals ? { session: totals } : {}) };
+      return raw === null ? undefined : raw;
     } catch {
       return undefined;
     } finally {
       if (timer !== undefined) clearTimeout(timer);
+    }
+  }
+
+  /**
+   * A workspace with no Claude conversation still answers: a query under a
+   * fresh id that is hidden before it starts, so a transcript the CLI may
+   * write for the unprompted session never lists, and that is never
+   * registered as a conversation. Nothing is emitted: there is no
+   * conversation to report into.
+   */
+  private async readUsageThroughProbe(): Promise<UsageReadResult> {
+    const nativeId = randomUUID();
+    this.hiddenNative.add(nativeId);
+    this.persistDurableState();
+    const queue = new PushQueue<ClaudeUserEnvelope>();
+    let query: ClaudeQueryHandle;
+    try {
+      query = this.queryFactory({
+        prompt: queue,
+        options: {
+          cwd: this.workspacePath,
+          sessionId: nativeId,
+          pathToClaudeCodeExecutable: this.executable,
+          enableFileCheckpointing: false,
+          permissionMode: "plan",
+          canUseTool: async () => ({ behavior: "deny", message: "This session only reads usage." }),
+        },
+      });
+    } catch {
+      return { report: null, reason: "unavailable" };
+    }
+    // Drained so the SDK's reader never blocks on an unread message.
+    void (async () => { for await (const _ of query) { /* nothing to read */ } })().catch(() => undefined);
+    this.usageProbe = { query, queue };
+    try {
+      const answer = await this.readUsageAnswer(query, this.usageReadTimeoutMs);
+      if (this.disposed) return { report: null, reason: "unavailable" };
+      if ("failure" in answer) return { report: null, reason: answer.failure };
+      const plan = normalizePlanUtilization(answer.raw) ?? {};
+      const report: AgentUsageReport = { plan, readAt: this.now() };
+      this.noteUsage(report);
+      return { report };
+    } finally {
+      if (this.usageProbe?.query === query) this.usageProbe = null;
+      queue.close();
+      await query.return?.().catch(() => undefined);
     }
   }
 
@@ -2050,6 +3779,154 @@ export class ClaudeProvider implements ChatProvider {
     return renamed;
   }
 
+  private cancelSessionWindowRead(session: LiveSession): void {
+    if (session.windowRetry !== undefined) clearTimeout(session.windowRetry);
+    session.windowRetry = undefined;
+    const abort = session.windowReadAbort;
+    session.windowReadAbort = undefined;
+    session.windowRead = undefined;
+    abort?.abort();
+  }
+
+  private resetSessionWindow(session: LiveSession, selection = session.windowSelection): void {
+    this.cancelSessionWindowRead(session);
+    session.contextKey = randomUUID();
+    session.windowSelection = selection;
+    session.windowResolved = undefined;
+    session.windowSequence += 1;
+    session.windowAttempts = 0;
+    session.windowConfirmed = false;
+    session.modelCapacities = undefined;
+    session.windowAccountEpoch = this.accountEpoch;
+  }
+
+  private recoveredWindows(id: string, page: readonly ConversationItem[]): ConversationItem[] {
+    const held = new Set(page.map(item => item.id));
+    const records: ConversationItem[] = [...(this.contextWindows.get(id)?.values() ?? [])].filter(item => !held.has(item.id));
+    const usage = this.latestContextUsage.get(id);
+    if (usage && !held.has(usage.id) && !page.some(item => (item.type === "assistant_message" && item.usage || item.type === "context_report") && item.createdAt > usage.createdAt)) records.push(usage);
+    return records;
+  }
+
+  private retainWindow(session: LiveSession, answer: ClaudeWindowAnswer): ContextWindowItem | undefined {
+    if (!answer.model) return undefined;
+    const model = claudeModelSelection(this.attributeModel(answer.model, session.id));
+    const records = this.contextWindows.get(session.id) ?? new Map<string, ContextWindowItem>();
+    const old = records.get(session.contextKey);
+    const observedAt = Math.max(this.now(), (old?.window.observedAt ?? 0) + 1);
+    const capacity = session.modelCapacities?.get(answer.model);
+    const item: ContextWindowItem = {
+      id: `context:window:${session.contextKey}`, type: "context_window", createdAt: old?.createdAt ?? observedAt,
+      model, contextKey: session.contextKey, limit: answer.limit,
+      window: { source: "session", freshness: "current", observedAt, ...answer.details, ...(capacity && capacity !== answer.limit ? { capacity } : {}) },
+    };
+    this.windowBindings.set(item, { selection: session.windowSelection ?? "default", resolvedModel: answer.model, resolutionKey: this.windowResolutionKey(session) });
+    boundedSet(records, session.contextKey, item, 32);
+    boundedSet(this.contextWindows, session.id, records, 256);
+    session.windowResolved = answer.model;
+    session.windowConfirmed = true;
+    this.emit(session.id, { updates: [{ kind: "upsert", item }], outcome: "handled", eventType: "context.window" });
+    return item;
+  }
+
+  /** Detect a changed known alias/default without preferring an older catalog
+   * resolution to what this conversation's own query actually reported. */
+  private windowResolutionKey(session: LiveSession): string {
+    const selection = session.windowSelection ?? "default";
+    if (selection === "default" && this.defaultRuns) return JSON.stringify([this.defaultAttribution(session.id), this.defaultRuns.model, this.defaultRuns.window]);
+    const row = this.liveModels?.find(candidate => candidate.selection.modelId === selection);
+    const target = selection === "default" ? this.liveModels?.find(candidate => candidate.selection.modelId === row?.resolvesTo?.modelId) : undefined;
+    return JSON.stringify([row?.resolvesTo?.modelId, target?.resolvesTo?.modelId]);
+  }
+
+  private prepareSessionWindow(session: LiveSession): Promise<void> {
+    // A previous query's answer is useful while revalidating, but never
+    // copied across a model/window variant or account change.
+    const selection = session.windowSelection ?? "default";
+    const resolutionKey = this.windowResolutionKey(session);
+    const previous = [...(this.contextWindows.get(session.id)?.values() ?? [])].reverse().find(item => {
+      const binding = this.windowBindings.get(item);
+      return binding?.selection === selection && binding.resolutionKey === resolutionKey
+        && (!session.windowResolved || stripWindowMarker(binding.resolvedModel) === stripWindowMarker(session.windowResolved));
+    });
+    if (previous && !session.windowConfirmed) {
+      const cached: ContextWindowItem = { ...previous, id: `context:window:${session.contextKey}`, contextKey: session.contextKey, window: { ...previous.window, freshness: "cached" } };
+      const binding = this.windowBindings.get(previous)!;
+      this.windowBindings.set(cached, binding);
+      // A later assistant frame can disprove the cached model even when the
+      // fresh window read fails. Its usage must not inherit the old limit.
+      session.windowResolved = binding.resolvedModel;
+      const records = this.contextWindows.get(session.id)!;
+      boundedSet(records, session.contextKey, cached, 32);
+      this.emit(session.id, { updates: [{ kind: "upsert", item: cached }], outcome: "handled", eventType: "context.window.cached" });
+    }
+    this.startSessionWindowRead(session);
+    return bounded(session.windowRead ?? Promise.resolve(), this.defaultReadWaitMs, this.disposal.promise).then(() => undefined);
+  }
+
+  private startSessionWindowRead(session: LiveSession): void {
+    if (this.disposed || this.live.get(session.id) !== session || session.windowRead || session.windowConfirmed || session.windowAccountEpoch !== this.accountEpoch) return;
+    const epoch = this.accountEpoch;
+    const key = session.contextKey;
+    const sequence = ++session.windowSequence;
+    const selected = session.windowSelection;
+    const diagnostic = (outcome: WindowDiagnostic["outcome"], answer?: ClaudeWindowAnswer) => this.windowDiagnostic({ phase: "session", source: "session", selected, resolved: answer?.model, epoch, outcome, ...(answer ? { limit: answer.limit } : {}) });
+    if (!session.query.getContextUsage) { diagnostic("unsupported"); return; }
+    session.windowAttempts += 1;
+    const timedOut = Symbol("window read timed out");
+    const cancelled = Symbol("window read cancelled");
+    const deadline = Promise.withResolvers<symbol>();
+    const abort = new AbortController();
+    const onAbort = () => deadline.resolve(cancelled);
+    abort.signal.addEventListener("abort", onAbort, { once: true });
+    session.windowReadAbort = abort;
+    const timer = setTimeout(() => deadline.resolve(timedOut), this.windowReadTimeoutMs);
+    timer.unref?.();
+    const current = () => !this.disposed && this.live.get(session.id) === session && key === session.contextKey && epoch === this.accountEpoch && sequence === session.windowSequence;
+    // The SDK does not expose cancellation for this control request. Bound
+    // our waiter instead: an abandoned SDK reply can settle later, but loses
+    // this race and cannot publish or occupy the next attempt's slot.
+    const request = (async () => session.query.getContextUsage!({ detail: "summary" }))();
+    const read = Promise.race([request, deadline.promise]).then(raw => {
+      if (!current() || abort.signal.aborted) { diagnostic("stale"); return; }
+      if (raw === timedOut) { diagnostic("timeout"); return; }
+      const answer = claudeWindowAnswer(raw);
+      const cached = this.contextWindows.get(session.id)?.get(key)?.window.freshness === "cached";
+      const row = selected !== "default" ? this.liveModels?.find(model => model.selection.modelId === selected) : undefined;
+      // The default delegates to this query's settings. A cached resolution
+      // cannot veto a fresh answer naming a newly selected default model.
+      const expected = (cached ? undefined : session.windowResolved) ?? row?.resolvesTo?.modelId ?? (selected?.startsWith("claude-") ? selected : undefined);
+      if (!answer?.model) { diagnostic("failed"); return; }
+      if (expected && stripWindowMarker(expected) !== stripWindowMarker(answer.model)) { diagnostic("mismatch", answer); return; }
+      this.retainWindow(session, answer);
+      diagnostic("confirmed", answer);
+    }).catch(() => diagnostic("failed")).finally(() => {
+      clearTimeout(timer);
+      abort.signal.removeEventListener("abort", onAbort);
+      if (session.windowReadAbort === abort) session.windowReadAbort = undefined;
+      if (session.windowRead === read) session.windowRead = undefined;
+      if (!current() || abort.signal.aborted || session.windowConfirmed) return;
+      this.scheduleSessionWindowRetry(session);
+    });
+    session.windowRead = read;
+  }
+
+  /** Resume discovery without replenishing the current binding's retry budget. */
+  private scheduleSessionWindowRetry(session: LiveSession): void {
+    if (this.disposed || this.live.get(session.id) !== session || session.windowConfirmed || session.windowRead || session.windowRetry !== undefined || session.windowAccountEpoch !== this.accountEpoch || !session.query.getContextUsage) return;
+    const delay = session.windowAttempts === 0 ? 0 : this.windowRetryDelaysMs[session.windowAttempts - 1];
+    if (delay === undefined) return;
+    const key = session.contextKey;
+    const sequence = session.windowSequence;
+    const epoch = this.accountEpoch;
+    session.windowRetry = setTimeout(() => {
+      session.windowRetry = undefined;
+      if (key !== session.contextKey || sequence !== session.windowSequence || epoch !== this.accountEpoch) return;
+      this.startSessionWindowRead(session);
+    }, delay);
+    session.windowRetry.unref?.();
+  }
+
   /** The CLI's own context breakdown, emitted as a report item after a turn. */
   private async reportContextUsage(session: LiveSession, model: string | undefined): Promise<number> {
     // One probe per turn; a probe a later turn's probe has overtaken says
@@ -2064,6 +3941,12 @@ export class ClaudeProvider implements ChatProvider {
 
   private async probeContextUsage(session: LiveSession, model: string | undefined, generation: number): Promise<void> {
     if (!session.query.getContextUsage || this.live.get(session.id) !== session) return;
+    const key = session.contextKey;
+    const epoch = this.accountEpoch;
+    const sequence = ++session.windowSequence;
+    // This newer full report supersedes discovery. Waiting for the old
+    // summary could spend the report's entire budget on an abandoned read.
+    this.cancelSessionWindowRead(session);
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       // Plan utilization rides the same report when the login reports it
@@ -2073,18 +3956,30 @@ export class ClaudeProvider implements ChatProvider {
       const planRead = this.readPlanUtilization(session);
       const raw = await Promise.race([
         session.query.getContextUsage(),
-        new Promise<null>(resolve => { timer = setTimeout(() => resolve(null), CONTEXT_REPORT_TIMEOUT_MS); }),
+        new Promise<null>(resolve => { timer = setTimeout(() => resolve(null), this.contextReportTimeoutMs); }),
       ]);
-      if (raw === null || session.reportGeneration !== generation) return;
-      const item = normalizeContextUsage(raw, this.now(), model);
+      if (raw === null || session.reportGeneration !== generation || key !== session.contextKey || epoch !== this.accountEpoch || sequence !== session.windowSequence || this.live.get(session.id) !== session) return;
+      const answer = claudeWindowAnswer(raw);
+      const reportingModel = answer?.model ? this.attributeModel(answer.model, session.id) : model;
+      const item = normalizeContextUsage(raw, this.now(), reportingModel);
       if (!item) return;
+      item.contextKey = key;
       const usage = await planRead;
-      if (session.reportGeneration !== generation) return;
+      if (session.reportGeneration !== generation || key !== session.contextKey || epoch !== this.accountEpoch || sequence !== session.windowSequence || this.live.get(session.id) !== session) return;
+      if (answer) {
+        const observed = this.retainWindow(session, { ...answer, model: answer.model ?? model });
+        if (observed) item.window = observed.window;
+      }
+      boundedSet(this.latestContextUsage, session.id, item, 256);
       this.emit(session.id, { updates: [{ kind: "upsert", item: usage !== undefined ? { ...item, ...usage } : item }], outcome: "handled", eventType: "context.reported" });
     } catch {
       // The per-message carrier stands.
     } finally {
       if (timer !== undefined) clearTimeout(timer);
+      // A full report borrowed discovery's slot. If it could not confirm a
+      // window, hand the remaining retry budget back while work keeps this
+      // query alive. An obsolete report must not disturb a newer attempt.
+      if (session.reportGeneration === generation && key === session.contextKey && epoch === this.accountEpoch && sequence === session.windowSequence && !this.sessionIsIdle(session)) this.scheduleSessionWindowRetry(session);
     }
   }
 
@@ -2092,6 +3987,11 @@ export class ClaudeProvider implements ChatProvider {
   private async retireSession(session: LiveSession): Promise<void> {
     if (this.live.get(session.id) !== session) return;
     this.clearIdleTimer(session);
+    this.cancelSessionWindowRead(session);
+    // A run that never reported its end does not outlive the query that
+    // ran it; settled before the session leaves the live map, so the
+    // child's status is the last thing this query says about it.
+    this.settleChildren(session, "interrupted");
     this.live.delete(session.id);
     this.foldSessionTotals(session);
     this.abandonInteractions(session.id, "The turn ended before the user answered.");
@@ -2107,18 +4007,124 @@ export class ClaudeProvider implements ChatProvider {
   }
 
   private emit(conversationId: string, normalized: Omit<NormalizedProviderEvent, "conversationId">): void {
+    if (normalized.revertLifecycle) {
+      this.contextWindows.delete(conversationId);
+      this.latestContextUsage.delete(conversationId);
+    }
     this.historyReuse.invalidate(conversationId);
     this.events_.push({ ...normalized, conversationId });
   }
 
+  /**
+   * Claude Code states each model's window before any turn: on the probe's
+   * promptless session, `setModel` and a summary context read answer it
+   * with no model call and no tokens. Runs behind the catalog — a model
+   * switch costs up to ~2 s for a full id — and each window is served from
+   * the first catalog read after it lands. A row's answer counts only when
+   * it names the row's own model: a `setModel` the CLI ignored (a model the
+   * login cannot use) must not lend the row another model's window. Only
+   * ever on the probe's own query — a live conversation's model is never
+   * touched.
+   */
+  private async readStatedWindows(query: ClaudeQueryHandle, epoch = this.accountEpoch): Promise<void> {
+    if (!query.getContextUsage || !query.setModel || !this.liveModels) return;
+    const started = performance.now();
+    for (const row of withMoreModels(this.liveModels)) {
+      const key = probeKey(row);
+      if (row.default || !this.windowEligible(key)) continue;
+      if (this.disposed || epoch !== this.accountEpoch || performance.now() - started > this.windowWalkBudgetMs) return;
+      const set = await bounded(query.setModel(row.selection.modelId).then(() => true).catch(() => false), this.windowReadTimeoutMs, this.disposal.promise);
+      // A switch that outlasted its bound may still land and change the
+      // session's model under the next row's read: this query is no longer
+      // trustworthy, so the walk ends here and the rows it did not reach are
+      // asked by the next probe, on a fresh query.
+      if (!set) {
+        if (epoch === this.accountEpoch) this.windowFailed(key);
+        this.windowDiagnostic({ phase: "catalog", source: "catalog", selected: row.selection.modelId, epoch, outcome: set === undefined ? "timeout" : "failed" });
+        return;
+      }
+      const answer = await this.readProbeContext(query).catch(() => undefined);
+      if (this.disposed || epoch !== this.accountEpoch) return;
+      const expected = stripWindowMarker(row.resolvesTo?.modelId ?? row.selection.modelId);
+      if (answer?.window && answer.model && stripWindowMarker(answer.model) === expected) {
+        this.probedRows.add(key);
+        this.windowFailures.delete(key);
+        const resolved = row.resolvesTo?.modelId ?? row.selection.modelId;
+        this.statedWindows.set(row.selection.modelId, { resolved, window: answer.window });
+        this.windowMetadata.set(row.selection.modelId, { source: "catalog", freshness: "current", observedAt: this.now() });
+        const windows = this.statedByResolved.get(resolved) ?? new Set<number>();
+        windows.add(answer.window);
+        this.statedByResolved.set(resolved, windows);
+        this.catalogChanged();
+        this.windowDiagnostic({ phase: "catalog", source: "catalog", selected: row.selection.modelId, resolved: answer.model, epoch, outcome: "confirmed", limit: answer.window });
+      } else {
+        this.windowFailed(key);
+        this.windowDiagnostic({ phase: "catalog", source: "catalog", selected: row.selection.modelId, resolved: answer?.model, epoch, outcome: answer?.model ? "mismatch" : "failed" });
+      }
+    }
+  }
+
+  private catalogChanged(): void {
+    if (!this.disposed) this.events_.push({ updates: [], outcome: "handled", eventType: "catalog.updated", catalogsChanged: true });
+  }
+
+  private windowEligible(key: string): boolean {
+    return !this.probedRows.has(key) && (this.windowFailures.get(key)?.retryAt ?? 0) <= this.now();
+  }
+
+  private windowFailed(key: string): void {
+    const attempts = (this.windowFailures.get(key)?.attempts ?? 0) + 1;
+    const delay = this.windowRetryDelaysMs[attempts - 1];
+    this.windowFailures.set(key, { attempts, retryAt: delay === undefined ? Infinity : this.now() + Math.min(delay, this.windowReprobeCooldownMs) });
+  }
+
+  private pruneWindowFailures(): void {
+    if (this.windowFailures.size === 0) return;
+    const offered = new Set(withMoreModels(this.liveModels ?? []).filter(row => !row.default).map(probeKey));
+    for (const key of this.windowFailures.keys()) {
+      // The unpinned read is independent of whether ModelInfo lists a
+      // default row. Other keys belong to an exact selection/resolution.
+      if (key !== "default" && !offered.has(key)) this.windowFailures.delete(key);
+    }
+  }
+
+  private scheduleWindowRetries(): void {
+    // A walk that began before a catalog refresh may fail after it, so
+    // pruning only when installing the catalog would miss those late keys.
+    this.pruneWindowFailures();
+    if (this.windowRetryTimer) clearTimeout(this.windowRetryTimer);
+    this.windowRetryTimer = undefined;
+    if (this.disposed || this.windowControlsMissing || this.windowWalk || this.hydration) return;
+    const next = Math.min(...[...this.windowFailures.values()].map(failure => failure.retryAt));
+    if (!Number.isFinite(next)) return;
+    this.windowRetryTimer = setTimeout(() => {
+      this.windowRetryTimer = undefined;
+      void this.hydrateCatalog();
+    }, Math.max(1, next - this.now()));
+    this.windowRetryTimer.unref?.();
+  }
+
+  windowDiagnostics(): readonly WindowDiagnostic[] { return this.windowDiagnosticRecords; }
+
+  private windowDiagnostic(diagnostic: WindowDiagnostic): void {
+    this.windowDiagnosticRecords.push(diagnostic);
+    if (this.windowDiagnosticRecords.length > 128) this.windowDiagnosticRecords.shift();
+    this.onWindowDiagnostic?.(diagnostic);
+    if (process.env.UATU_DEBUG) console.debug("[claude context window]", JSON.stringify(diagnostic));
+  }
+
   private async captureModels(query: ClaudeQueryHandle): Promise<void> {
     if (!query.supportedModels) return;
+    const epoch = this.accountEpoch;
     try {
       const raw = await query.supportedModels();
+      if (epoch !== this.accountEpoch || this.disposed) return;
       const { models, aliases } = modelsFromCatalog(raw);
       if (models.length > 0) {
         this.liveModels = models;
         this.modelAliases = aliases;
+        this.scheduleWindowRetries();
+        this.catalogChanged();
       }
     } catch {
       // The manifest fallback stands; the next session retries.
@@ -2250,6 +4256,7 @@ function modelsFromCatalog(raw: unknown): { models: ChatModel[]; aliases: Map<st
       contextLimit: typeof info.contextWindow === "number" && info.contextWindow > 0
         ? info.contextWindow
         : claudeContextWindow(info.value, resolvedModel),
+      contextWindow: { source: typeof info.contextWindow === "number" && info.contextWindow > 0 ? "catalog" : "estimate", freshness: "current" },
       imageInput: true,
     });
   }
@@ -2393,6 +4400,10 @@ function nonNegativeNumber(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
 }
 
+function minorToMajor(amount: number | undefined): number | undefined {
+  return amount === undefined ? undefined : amount / 100;
+}
+
 function planWindow(value: unknown): PlanUtilizationWindow | undefined {
   if (!value || typeof value !== "object") return undefined;
   const entry = value as Record<string, unknown>;
@@ -2402,13 +4413,21 @@ function planWindow(value: unknown): PlanUtilizationWindow | undefined {
   return { ...(utilization === undefined ? {} : { utilization }), ...(Number.isNaN(resetsAt) ? {} : { resetsAt: Math.round(resetsAt) }) };
 }
 
+/**
+ * Extra-usage credits arrive in the currency's minor unit — the CLI builds
+ * the same shape from its own `spendLimitCents`/`usedCents` — so a plan
+ * with 85 € of credit reads `monthly_limit: 8500`. The readout speaks in
+ * major units. A null utilization on the wire is derived from the two
+ * amounts where the limit allows it, the way the CLI's own dialog does.
+ */
 function planExtraUsage(value: unknown): PlanExtraUsage | undefined {
   if (!value || typeof value !== "object") return undefined;
   const entry = value as Record<string, unknown>;
   if (typeof entry.is_enabled !== "boolean") return undefined;
-  const usedCredits = nonNegativeNumber(entry.used_credits);
-  const monthlyLimit = nonNegativeNumber(entry.monthly_limit);
-  const utilization = nonNegativeNumber(entry.utilization);
+  const usedCredits = minorToMajor(nonNegativeNumber(entry.used_credits));
+  const monthlyLimit = minorToMajor(nonNegativeNumber(entry.monthly_limit));
+  const utilization = nonNegativeNumber(entry.utilization)
+    ?? (usedCredits !== undefined && monthlyLimit !== undefined && monthlyLimit > 0 ? usedCredits / monthlyLimit * 100 : undefined);
   return {
     enabled: entry.is_enabled,
     ...(usedCredits === undefined ? {} : { usedCredits }),
@@ -2726,43 +4745,6 @@ function dialogQuestions(request: ClaudeUserDialogRequest): { intro: string; que
   };
 }
 
-/** Only session-destination suggestions survive: never persist an allow. */
-function sessionScopedSuggestions(suggestions: unknown[] | undefined): unknown[] | undefined {
-  if (!suggestions) return undefined;
-  return suggestions.filter(suggestion =>
-    Boolean(suggestion) && typeof suggestion === "object"
-    && (suggestion as { destination?: unknown }).destination === "session");
-}
-
-/** AskUserQuestion input → the shared structured-question shape. */
-function normalizeAskUserQuestions(input: Record<string, unknown>): StructuredQuestion[] | null {
-  if (!Array.isArray(input.questions) || input.questions.length === 0) return null;
-  const questions: StructuredQuestion[] = [];
-  for (const value of input.questions) {
-    if (!value || typeof value !== "object") return null;
-    const record = value as Record<string, unknown>;
-    if (typeof record.question !== "string") return null;
-    const options = Array.isArray(record.options)
-      ? record.options.flatMap(option => {
-        if (!option || typeof option !== "object") return [];
-        const optionRecord = option as Record<string, unknown>;
-        if (typeof optionRecord.label !== "string") return [];
-        return [{ label: optionRecord.label, description: typeof optionRecord.description === "string" ? optionRecord.description : "" }];
-      })
-      : [];
-    questions.push({
-      prompt: record.question,
-      header: typeof record.header === "string" ? record.header : "",
-      options,
-      multiple: record.multiSelect === true,
-      // Claude Code's "Other" free-form entry is host-provided, not an
-      // option in the schema — the host always offers it.
-      allowFreeForm: true,
-    });
-  }
-  return questions;
-}
-
 function permissionResources(input: Record<string, unknown>, options: ClaudeCanUseToolOptions): string[] {
   const resources: string[] = [];
   if (typeof options.blockedPath === "string") resources.push(options.blockedPath);
@@ -2844,4 +4826,25 @@ function defaultQueryFactory(input: ClaudeQueryInput): ClaudeQueryHandle {
   // eslint-disable-next-line @typescript-eslint/no-require-imports
   const { query } = require("@anthropic-ai/claude-agent-sdk") as typeof import("@anthropic-ai/claude-agent-sdk");
   return query(input as never) as unknown as ClaudeQueryHandle;
+}
+
+function sameSelection(left: ModelSelection, right: ModelSelection): boolean {
+  return left.providerId === right.providerId && left.modelId === right.modelId;
+}
+
+/** A control answer, or undefined when it fails, outlasts its bound, or is cut short. */
+async function bounded<T>(work: Promise<T>, limitMs: number, cutShort?: Promise<undefined>): Promise<T | undefined> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([work, new Promise<undefined>(resolve => { timer = setTimeout(() => resolve(undefined), limitMs); }), ...(cutShort ? [cutShort] : [])]);
+  } catch {
+    return undefined;
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+/** A row as the window walk knows it: the id it is chosen by and the model it resolves to. */
+function probeKey(model: ChatModel): string {
+  return `${model.selection.modelId}\u0000${model.resolvesTo?.modelId ?? model.selection.modelId}`;
 }

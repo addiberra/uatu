@@ -83,7 +83,8 @@ for (const [scene, label] of galleryScenes) test(`compact gallery: ${label}`, as
   // Only an explicit promotion invocation writes the fixed 20 names to the
   // curated tree. Normal test/capture runs stay in ignored local output.
   const path = process.env.UATU_PROMOTE_COMPACT_GALLERY === "1"
-    ? new URL(`../../openspec/changes/restore-refined-mobile-hub-experience/review-evidence/gallery/${filename}`, import.meta.url).pathname
+    ? new URL(`gallery/${filename}`, reviewEvidenceRoot).pathname
     : info.outputPath(filename);
   await page.screenshot({ path });
 });
+import { reviewEvidenceRoot } from "./artifact-locations";

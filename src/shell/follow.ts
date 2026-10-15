@@ -11,14 +11,25 @@
 import { chooseSelectionForFileEvent, selectionForChipTurnOn } from "./follow-rules";
 import { findDocumentById } from "./storage";
 import { loadDocument } from "../preview/mount";
+import { renderEmptyPreview } from "../preview/empty";
 import { renderSidebar } from "../sidebar/shell";
-import { pushSelection } from "./history";
+import { pushSelection, recordEmptySelection } from "./history";
 import { appState } from "./state";
-import { setPreviewMode, setSelectedId } from "./selection";
+import { clearDocumentSelection, resumeDocumentSelection, setPreviewMode, setSelectedId, getSelectionGeneration, getSelectionActivation } from "./selection";
 import { persistPersonalWorkspaceState } from "./personal-state";
 import { revealPreviewSurface } from "./tab-bar";
 
 export { chooseSelectionForFileEvent };
+let pendingCatchUp: { generation: number; activation: number } | null = null;
+
+export function finishFollowDiscovery(defaultId: string | null, liveChange: string | null): string | null {
+  if (liveChange) { pendingCatchUp = null; return null; }
+  if (!pendingCatchUp || appState.discovery.status !== "ready") return null;
+  const intent = pendingCatchUp;
+  pendingCatchUp = null;
+  return appState.followEnabled && intent.generation === getSelectionGeneration() && intent.activation === getSelectionActivation()
+    ? defaultId : null;
+}
 
 const followToggleElementMaybe = document.querySelector<HTMLButtonElement>("#follow-toggle");
 
@@ -42,10 +53,22 @@ export function initFollowToggle(): void {
   });
 }
 
+// Counts Follow switches, so a decision Follow deferred while it was on
+// (shell/image-follow.ts) is not carried out after the user switched it off,
+// or off and on again.
+let followSwitches = 0;
+export function getFollowSwitches(): number {
+  return followSwitches;
+}
+
 // Owner mutator for `appState.followEnabled`. The four follow-mode rules in
 // this module flip it; boot / URL routing / navigation call sites use this
 // instead of assigning directly (module-structure appState field ownership).
-export function setFollowEnabled(next: boolean): void {
+export function setFollowEnabled(next: boolean, restore = false): void {
+  if (!next) pendingCatchUp = null;
+  if (next !== appState.followEnabled) followSwitches++;
+  // Reading a saved Follow preference during boot is not a user enabling it.
+  if (next && !restore) resumeDocumentSelection();
   appState.followEnabled = next;
   persistPersonalWorkspaceState({ follow: next });
 }
@@ -62,6 +85,11 @@ export function applyChipClick(): void {
   syncFollowToggle();
 
   if (!wasEnabled && appState.followEnabled) {
+    if (appState.discovery.status !== "ready") {
+      pendingCatchUp = { generation: getSelectionGeneration(), activation: getSelectionActivation() };
+      setPreviewMode({ kind: "document" });
+      return;
+    }
     const jumpTo = selectionForChipTurnOn(appState.roots, appState.selectedId);
     if (jumpTo) {
       setSelectedId(jumpTo);
@@ -89,7 +117,7 @@ export function applyChipClick(): void {
 export function applyUserRowClick(documentId: string): Promise<void> {
   revealPreviewSurface();
   setFollowEnabled(false);
-  setSelectedId(documentId);
+  setSelectedId(documentId, "navigation");
   setPreviewMode({ kind: "document" });
   const doc = findDocumentById(documentId);
   if (doc) {
@@ -101,6 +129,18 @@ export function applyUserRowClick(documentId: string): Promise<void> {
   // project search jumping to a match — can await it. Callers that don't
   // simply ignore it, as the tree's selection handler does.
   return loadDocument(documentId);
+}
+
+// Rule A's close variant deliberately does not reveal the touch Preview tab.
+export function applyUserAncestorCollapse(): void {
+  if (!appState.selectedId) return;
+  clearDocumentSelection();
+  setFollowEnabled(false);
+  setPreviewMode({ kind: "empty" });
+  recordEmptySelection();
+  syncFollowToggle();
+  renderSidebar();
+  renderEmptyPreview("No document selected", "Waiting for viewable files");
 }
 
 

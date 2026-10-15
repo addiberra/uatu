@@ -241,7 +241,12 @@ async function readPublicKey(executable: string, args: string[], env: Record<str
     } catch (error) {
       if (!timedOut) throw error;
     }
-    const exitCode = (await child.exited) ?? 1;
+    // A timed-out run is a failure whatever its exit status reads, as in the
+    // other two helpers: under load the killed child's status has come back
+    // as a clean exit with no output, which then failed as "did not yield a
+    // public key" instead of the timeout's "could not be unlocked".
+    const exited = (await child.exited) ?? 1;
+    const exitCode = timedOut ? 124 : exited;
     const bytes = new Uint8Array(size);
     let offset = 0;
     for (const chunk of chunks) {

@@ -57,7 +57,15 @@ export type ChatCapability =
   // The agent can run work in the background and reports it: live tasks
   // are listed with a stop action, settled tasks land in the timeline, and
   // the conversation presents a background-work state.
-  | "background-tasks";
+  | "background-tasks"
+  // The agent can schedule future turns for itself (a wakeup, a cron, a
+  // loop) and reports them: the session is held while they are pending,
+  // each is a timeline row that follows its life, a fired one starts a
+  // wakeup turn, and the user can release the session to end them all.
+  | "scheduled-wakeups"
+  // The agent's login has plan usage that can be asked for: the workspace
+  // keeps the newest report and a read can be requested on demand.
+  | "usage";
 
 // Image attachment bounds, shared by the composer (intake refusal), the
 // upload route (authoritative enforcement), and the store. 10 MiB sits
@@ -110,7 +118,11 @@ export type ChatAvailability =
   // `agent` is absent for the moment between the runtime reporting ready and
   // the adapter existing to describe it. A surface that has no agent yet says
   // nothing about one rather than guessing a name.
-  | { state: "ready"; version: string; agent?: ChatAgent }
+  // `login`: whether the machine's logins let the agent run a turn, as the
+  // agent last said (absent until it has). `accountsRevision`: bumped on every
+  // login change made through the Hub's Agent accounts, so a client knows to
+  // re-read this agent's catalogs.
+  | { state: "ready"; version: string; agent?: ChatAgent; login?: ChatLoginState; accountsRevision?: number; catalogRevision?: string }
   | {
     state: "unavailable";
     reason: "not-installed" | "startup-failed" | "unsupported";
@@ -118,18 +130,49 @@ export type ChatAvailability =
     diagnostics?: ChatStartupDiagnostics;
   };
 
+/**
+ * Whether the machine's logins let an agent run a turn. `missing`: nothing
+ * usable (Claude Code: no login or key; OpenCode: no model offered at all,
+ * since its free models need none). `unknown`: the agent has not said.
+ */
+export type ChatLoginState = "ok" | "missing" | "unknown";
+
+/**
+ * A login change made through the Hub's Agent accounts, as a running
+ * workspace hears about it. `removed` and `activated` name what changed so
+ * the workspace can replay it on its own agent server.
+ */
+export type ChatAccountChange =
+  | { kind: "added" }
+  | { kind: "removed"; target: string; credential: string }
+  | { kind: "activated"; credential: string };
+
 // `background`: no turn is running, but the agent still holds live background
 // work (a backgrounded command, a subagent, a monitor). Distinct from both
 // working and idle: prompting is possible, and the composer names what runs.
 // `retrying`: the turn is live but the agent is waiting to retry a failed API
 // request; `compacting`: the turn is live and the agent is compacting its
 // context. Both are working states with a name, never idle ones.
-export type ConversationStatus = "idle" | "sending" | "running" | "completed" | "interrupted" | "failed" | "background" | "retrying" | "compacting";
+// `scheduled`: nothing runs and nothing executes, but the agent's session
+// holds one or more future wakeups it scheduled for itself. Distinct from
+// `background` (live work, stoppable) and from idle (no session held):
+// prompting is possible, and the composer lists the wakeups with a release.
+export type ConversationStatus = "idle" | "sending" | "running" | "completed" | "interrupted" | "failed" | "background" | "retrying" | "compacting" | "scheduled";
 
 /** A turn is in flight: the composer offers Cancel, a new prompt is held. */
 export function isLiveConversationStatus(status: ConversationStatus | undefined): boolean {
   return status === "running" || status === "sending" || status === "retrying" || status === "compacting";
 }
+
+/**
+ * A workspace's chat activity at a glance, for surfaces that describe the
+ * workspace rather than a conversation (the hub's cross-workspace badge).
+ * Exactly two facts and never an id, a title, or a count: `working` — some
+ * conversation has a turn in flight (isLiveConversationStatus) or live
+ * background work (`background`); `awaiting` — some permission request or
+ * question waits on the user.
+ */
+export type ChatActivity = { working: boolean; awaiting: boolean };
 export type ActivityStatus = "pending" | "running" | "completed" | "failed" | "cancelled";
 
 export type ModelSelection = {
@@ -153,6 +196,7 @@ export type ChatModel = {
   variants?: string[];
   // The model's context-window size in tokens, when the agent reports it.
   contextLimit?: number;
+  contextWindow?: ContextWindowMetadata;
   // Whether this model can see image attachments, as the agent reports it.
   // Drives the attach control's inactive state; absent means not reported,
   // which the surface treats as no.
@@ -235,6 +279,11 @@ export type UserMessageItem = TimelineItemBase & {
   requestId?: string;
   // Images sent with this message, as references (see MessageAttachment).
   attachments?: MessageAttachment[];
+  // Who put this prompt in the conversation when it was not the user:
+  // `wakeup` is a scheduled wakeup firing. Absent means the user typed it.
+  // `wakeupId` names the `scheduled_wakeup` that fired, when known.
+  origin?: "wakeup";
+  wakeupId?: string;
 };
 
 /**
@@ -254,6 +303,10 @@ export type TokenUsage = {
   reasoning?: number;
   cacheRead?: number;
   cacheWrite?: number;
+  // What the message cost in USD, where the agent prices its messages
+  // (OpenCode does, per message). Not a token component: token sums leave
+  // it out, and absent means unpriced, which is not the same as free.
+  costUsd?: number;
 };
 
 export type AssistantMessageItem = TimelineItemBase & {
@@ -265,6 +318,12 @@ export type AssistantMessageItem = TimelineItemBase & {
   // The model that reported this carrier's usage, so a context percentage is
   // measured against that model's window even after another model is selected.
   model?: ModelSelection;
+  contextKey?: string;
+  // The agent that produced the message, as the provider names it (OpenCode:
+  // `build`, `plan`, `compaction`, a subagent's kind). Rides the usage carrier
+  // so the cost receipt can name the main agent's lines instead of lumping
+  // them as "This agent". Absent where the provider names none.
+  agent?: string;
 };
 
 export type ReasoningItem = TimelineItemBase & {
@@ -280,10 +339,28 @@ export type ReasoningItem = TimelineItemBase & {
   label?: string;
 };
 
+/**
+ * A subagent launched by a subagent, as a line beneath the row that launched
+ * its branch. `id` is the launching row's id in its own conversation and
+ * `parentId` the row or line above it; `usage` is that task's own spend.
+ * Lines sharing a `conversationId` are one subagent given several tasks.
+ */
+export type SubagentLine = {
+  id: string;
+  parentId: string;
+  description: string;
+  subagent?: string;
+  conversationId: string;
+  model?: string;
+  usage?: TokenUsage;
+};
+
 export type ToolItem = TimelineItemBase & {
   type: "tool";
   name: string;
   status: ActivityStatus;
+  // Provider-reported terminal time in epoch milliseconds; absent when unknown.
+  completedAt?: number;
   input?: string;
   output?: string;
   error?: string;
@@ -296,6 +373,11 @@ export type ToolItem = TimelineItemBase & {
   // row that launched it. Absent until the child has reported something.
   model?: string;
   usage?: TokenUsage;
+  // The subagents launched beneath this row, at any depth, flat with a link to
+  // the row or line that launched each. `usage` above is this task's OWN
+  // spend — nothing below is added into it — so these lines are what makes
+  // the conversation's receipt whole. Absent when the subagent launched none.
+  descendants?: SubagentLine[];
   // How long the tool has been running, from the agent's own progress
   // heartbeat, when it reports one for a tool still producing no output.
   elapsedMs?: number;
@@ -305,6 +387,8 @@ export type CommandItem = TimelineItemBase & {
   type: "command";
   command: string;
   status: ActivityStatus;
+  // Provider-reported terminal time in epoch milliseconds; absent when unknown.
+  completedAt?: number;
   output?: string;
   exitCode?: number;
 };
@@ -341,6 +425,13 @@ export type PermissionRequest = TimelineItemBase & {
   resources: string[];
   status: "pending" | "resolved";
   outcome?: PermissionOutcome;
+  // What the persistent approval will authorize, in the owning agent's own
+  // syntax (OpenCode's `git status *`, Claude Code's `Bash(git status:*)`),
+  // kept apart from `resources` because the two differ: the agent derives a
+  // reusable pattern from the request, and that pattern is what it installs.
+  // Empty means the agent supplied nothing reusable; absent means it did not
+  // say. Rendered verbatim. The client never derives scope from a resource.
+  alwaysPatterns?: string[];
   // A unified diff of the change a file-edit permission would apply, when the
   // agent attaches one (OpenCode puts it on the permission's `metadata.diff`).
   // Absent for a permission with nothing to show — a command, a fetch.
@@ -352,6 +443,19 @@ export type PermissionRequest = TimelineItemBase & {
   choices?: PermissionChoice[];
   // On resolution: which choice approved it, when choices were offered.
   choiceId?: string;
+  // The timeline id of the tool row this permission belongs to (`tool:<call
+  // id>`), when the agent names the call it is asking about (OpenCode 2.x's
+  // `source`). What lets a request that names no resource of its own (an
+  // MCP tool's `*`) show the arguments of the call it would allow. Absent
+  // when the agent did not say; the client then falls back to the running
+  // tool row bearing the request's action name.
+  sourceToolId?: string;
+  // The MCP server and tool the action names, when it is an MCP tool's
+  // registry name (`<server>_<tool>`) and the owning agent resolved it
+  // against the servers it reports. The card names them; the action stays
+  // what the persistent-approval confirmation shows, being the rule the
+  // agent installs. Absent for a built-in tool or an unresolved action.
+  mcp?: { server: string; tool: string };
 };
 
 export type QuestionOption = {
@@ -427,13 +531,48 @@ export type NoticeItem = TimelineItemBase & {
   level: "info" | "warning" | "error";
   message: string;
   // A machine-readable kind for notices the surface reacts to beyond
-  // showing them: `rate-limit-warning` and `rate-limit-rejected` drive the
-  // composer's rate-limit badge (the latest one wins), `rate-limit-cleared`
-  // retires it, `refusal-fallback` names a model swap. Absent otherwise.
+  // showing them: `rate-limit-warning` and `rate-limit-rejected` carry the
+  // plan chip's standing and are never drawn as rows; `refusal-fallback`
+  // names a model swap. Absent otherwise.
   code?: string;
   // When a rate-limit notice's window resets, as a timestamp.
   resetsAt?: number;
 };
+
+/**
+ * The one item id a rate-limit standing occupies. A standing is a state,
+ * not an event log: however many times the login restates it, it is this
+ * one item, upserted in place and removed when requests are allowed again.
+ * `createdAt` marks when the conversation entered the standing.
+ *
+ * Data for the composer's plan chip and its readout, never a timeline row —
+ * the same contract `context_report` has with the context readout.
+ */
+export const RATE_LIMIT_ITEM_ID = "notice:rate-limit";
+
+/**
+ * Notice codes for the agent's login. `login-failed`: a turn failed because
+ * the agent's login is missing, expired, or refused; the message is the
+ * agent's own words, and the surface offers a way to log in. A timeline row.
+ * `reauthenticating`: the agent is signing in again mid-session; one item,
+ * retired when it finishes.
+ */
+export const LOGIN_FAILED_NOTICE_CODE = "login-failed";
+export const REAUTHENTICATING_NOTICE_CODE = "reauthenticating";
+
+/**
+ * The notice codes that carry a standing. Exactly these two: the contract
+ * names them and nothing else, so the test is membership rather than a
+ * `rate-limit` prefix. A prefix would silently swallow any later
+ * rate-limit-adjacent notice — hiding it from the timeline and reporting
+ * it to the composer as a warning it never was.
+ */
+const RATE_LIMIT_STANDING_CODES: ReadonlySet<string> = new Set(["rate-limit-warning", "rate-limit-rejected"]);
+
+/** Whether an item is the rate-limit standing (data, not a row). */
+export function isRateLimitStanding(item: ConversationItem): boolean {
+  return item.type === "notice" && item.code !== undefined && RATE_LIMIT_STANDING_CODES.has(item.code);
+}
 
 // One row of an agent-reported context breakdown. `kind` says what the row
 // is: `used` content occupies the window and sums to the report's total;
@@ -445,19 +584,38 @@ export type ContextReportCategory = {
   kind: "used" | "free" | "buffer" | "deferred";
 };
 
+/** Where a context limit came from, independently of occupancy. */
+export type ContextWindowMetadata = {
+  source: "session" | "catalog" | "estimate";
+  freshness: "current" | "cached";
+  observedAt?: number;
+  // Only populated when the agent explicitly distinguishes these values.
+  kind?: "effective" | "compaction";
+  capacity?: number;
+  compactionThreshold?: number;
+};
+
+/** Limit-only data. Never an occupancy sample or a rendered timeline row. */
+export type ContextWindowItem = TimelineItemBase & {
+  type: "context_window";
+  model: ModelSelection;
+  contextKey?: string;
+  limit: number;
+  window: ContextWindowMetadata;
+};
+
 /**
- * The agent's own statement of how full the context window is, at the point
- * in the timeline where it was reported (after a turn, after a compaction).
- * Never rendered as a row: the context readout reads it, the way it reads
- * the empty-markdown usage carriers, and prefers whichever is newest.
- * `max` is the window the total was measured against; absent when the
- * report did not state one, in which case the model's known limit stands.
+ * The agent's own occupancy report, after a turn or compaction. Never a row.
+ * The newest report or usage carrier supplies occupancy; window-only updates
+ * may correct its denominator without replacing that occupancy.
  */
 export type ContextReportItem = TimelineItemBase & {
   type: "context_report";
   total: number;
   max?: number;
   model?: ModelSelection;
+  contextKey?: string;
+  window?: ContextWindowMetadata;
   categories?: ContextReportCategory[];
   // Plan utilization the login reports (claude.ai plans only): percent of
   // each rate-limit window used and when it resets. Empty when the login
@@ -502,6 +660,27 @@ export type PlanUtilization = {
   extraUsage?: PlanExtraUsage;
 };
 
+/**
+ * The login's plan usage as the workspace last read it. Per login, not per
+ * conversation: one report serves every conversation of the agent. An empty
+ * plan is an answer ("this login reports no limits"), not an absence.
+ * `conversationId` names the conversation the read went through, when one
+ * did — a read through a probe query has none.
+ */
+export type AgentUsageReport = {
+  plan: PlanUtilization;
+  readAt: number;
+  conversationId?: string;
+};
+
+// "live-only" reads through a session that is already up and answers
+// nothing otherwise; "start" may start one for the read.
+export type UsageReadMode = "live-only" | "start";
+export type UsageReadFailure = "no-live-session" | "timeout" | "unavailable";
+export type UsageReadResult =
+  | { report: AgentUsageReport; reason?: undefined }
+  | { report: null; reason: UsageReadFailure };
+
 export type SessionModelTotals = {
   // The raw model id the agent keyed its tally by; the readout resolves it
   // through the catalog where it can and shows it verbatim otherwise.
@@ -545,7 +724,8 @@ export type CompactionItem = TimelineItemBase & {
  * settles (D8). Running tasks are presented in the composer's live list;
  * settled ones as timeline rows with their outcome and summary. `toolUseId`
  * links the task to the tool row that launched it. Ambient housekeeping
- * tasks never become items.
+ * tasks never become items; an ambient agent run with no launching tool use
+ * becomes a `foreground` item (see the field).
  */
 export type BackgroundTaskItem = TimelineItemBase & {
   type: "background_task";
@@ -558,7 +738,75 @@ export type BackgroundTaskItem = TimelineItemBase & {
   progress?: string;
   // The agent's summary, once settled.
   summary?: string;
+  // What the task is, as the agent said at start: an agent task's subagent
+  // type and the prompt it was given. Absent for a shell task.
+  subagentType?: string;
+  prompt?: string;
+  // What the task has consumed, as the agent reports it on progress and on
+  // settling. A shell task reports no progress, so it carries none while
+  // running; elapsed time is derived from `createdAt` instead.
+  usage?: BackgroundTaskUsage;
+  // Where the agent writes the task's output, from the moment it names it —
+  // a shell task's output file at launch, an agent task's transcript on
+  // settling. Presence is what tells a reader an output view can be asked
+  // for; the read itself names the task, never this path.
+  outputFile?: string;
+  // The child conversation an agent task runs as (`sub:<parent>:<agentId>`),
+  // known from the start edge — what makes a running subagent openable.
+  childConversationId?: string;
+  // A run Claude Code forked in the foreground with no launching tool use of
+  // its own — the review a typed command starts (design D13). It is a run,
+  // not background work: the subagents track lists it and opens it, while the
+  // composer's background list and the timeline's settled rows skip it (the
+  // command's own output is the timeline's record of it).
+  foreground?: boolean;
 };
+
+/**
+ * One future turn the agent scheduled for itself — a self-paced wakeup, a
+ * cron, a loop — as its session reports it, updated in place through its
+ * life. `pending` rows are listed by the composer (with the release that
+ * ends them) and shown in the timeline; a one-shot that fired reads
+ * `fired` and links the wakeup turn it started (`firedTurnId`, the id of
+ * that turn's `user_message`); a recurring one stays `pending` across its
+ * fires. `cancelled`: the agent removed it, or the user cancelled it or
+ * released the session; the workspace blocks it from firing again.
+ * `paused`: the session ended, but the agent's tooling rebuilds this wakeup
+ * (a cron) when the conversation runs again; `message` says so.
+ * `lost`: the session ended some other way, taking the schedule with it.
+ * `nextFireAt` is the workspace's reading of `schedule` (a five-field cron
+ * expression in the workspace host's local time, which is what the agent
+ * fires on), for display only: the agent keeps its own clock.
+ */
+export type ScheduledWakeupItem = TimelineItemBase & {
+  type: "scheduled_wakeup";
+  wakeupId: string;
+  prompt: string;
+  recurring: boolean;
+  schedule: string;
+  nextFireAt?: number;
+  status: "pending" | "fired" | "cancelled" | "paused" | "lost";
+  firedTurnId?: string;
+  // Why it ended, when it did not fire: the notice a lost schedule carries.
+  message?: string;
+};
+
+export type BackgroundTaskUsage = { totalTokens: number; toolUses: number; durationMs: number };
+
+/**
+ * A bounded tail of a background task's output file: what a shell task has
+ * written so far. `truncated` says the file holds more than the tail;
+ * `settled` says the task is no longer running, so the reader can stop
+ * refreshing.
+ */
+export type BackgroundTaskOutput = { text: string; truncated: boolean; settled: boolean };
+
+// How much of a task's output one read returns: by default enough for a
+// scrolled pane, and never more than the maximum, whatever a reader asks —
+// the file is a shell command's live output and can be arbitrarily large.
+// The route applies the default and the provider enforces the maximum.
+export const TASK_OUTPUT_TAIL_DEFAULT_BYTES = 16 * 1024;
+export const TASK_OUTPUT_TAIL_MAX_BYTES = 64 * 1024;
 
 export type ConversationItem =
   | UserMessageItem
@@ -573,8 +821,10 @@ export type ConversationItem =
   | TurnStatusItem
   | NoticeItem
   | ContextReportItem
+  | ContextWindowItem
   | CompactionItem
-  | BackgroundTaskItem;
+  | BackgroundTaskItem
+  | ScheduledWakeupItem;
 
 export type InteractionRequest = PermissionRequest | QuestionRequest;
 
@@ -609,6 +859,9 @@ export type ConversationSnapshot = {
 
 export type ConversationInventoryEvent = {
   type: "conversation.inventory";
+  // Agent-qualified catalog versions. A changed version invalidates only
+  // that agent's banked catalog; this also repairs missed pushes on reconnect.
+  catalogs?: Record<string, string>;
 };
 
 type ChatEventBase = {

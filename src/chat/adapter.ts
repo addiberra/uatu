@@ -1,9 +1,11 @@
 import { randomBytes, randomUUID } from "node:crypto";
+import { AgentNotificationTracker, type AgentNotificationEvent } from "./notifications";
 
 import { boundedSet } from "../shared/bounded-map";
 import { ProviderUpdateCoalescer } from "./coalescer";
 import { ConversationInventoryBroadcaster, type ConversationInventorySubscription } from "./inventory-broadcaster";
-import type { NormalizedProviderUpdate, NormalizedSessionLifecycle } from "./provider";
+import type { NormalizedProviderEvent, NormalizedProviderUpdate, NormalizedSessionLifecycle } from "./provider";
+import { describeToolDetail } from "./tool-detail";
 import { mergeAssistantMessage, sameUsage, TOKEN_USAGE_COMPONENTS } from "./usage";
 import { ReversibleHistoryTargetError, UnsupportedVariantSelectionError, type ChatProvider, type ProviderAttachment, type ProviderPermissionReply, type ProviderSession } from "./provider";
 import { IdempotencyReceipts } from "./receipts";
@@ -11,6 +13,8 @@ import { ConversationReplay, type ReplaySubscription } from "./replay";
 import { ProviderTextReconciler } from "./text-reconciler";
 import { isLiveConversationStatus } from "./types";
 import type {
+  BackgroundTaskOutput,
+  ChatActivity,
   ChatAgent,
   ChatMode,
   ChatEvent,
@@ -31,8 +35,9 @@ import type {
   RestoredDraft,
   ReversibleHistoryResult,
   ReversibleHistoryState,
+  SubagentLine,
   TokenUsage,
-} from "./types";
+  ToolItem, AgentUsageReport, UsageReadMode, UsageReadResult, ChatAccountChange, ChatLoginState } from "./types";
 import { ConversationNotFoundError, isSessionInWorkspace } from "./workspace";
 
 const DEFAULT_PAGE_SIZE = 50;
@@ -62,10 +67,24 @@ export class InvalidPermissionChoiceError extends Error {
   }
 }
 
+export class UsageUnsupportedError extends Error {
+  constructor() {
+    super("this agent does not report plan usage");
+    this.name = "UsageUnsupportedError";
+  }
+}
+
 export class BackgroundTasksUnsupportedError extends Error {
   constructor() {
     super("this agent does not run background tasks");
     this.name = "BackgroundTasksUnsupportedError";
+  }
+}
+
+export class ScheduledWakeupsUnsupportedError extends Error {
+  constructor() {
+    super("this agent does not schedule wakeups");
+    this.name = "ScheduledWakeupsUnsupportedError";
   }
 }
 
@@ -203,9 +222,15 @@ export type ChatAdapterOptions = {
   metrics?: ChatEventMetrics;
   now?: () => number;
   id?: () => string;
+  // Called when activity() may read differently than it last did (already
+  // deduplicated here). The service forwards it to whoever watches the
+  // workspace's activity summary.
+  onActivityChange?: () => void;
+  onNotification?: (event: AgentNotificationEvent) => void;
 };
 
 export class ChatAdapter {
+  private readonly notifications: AgentNotificationTracker;
   readonly generation: string;
   private readonly provider: ChatProvider;
   private readonly workspacePath: string;
@@ -220,13 +245,45 @@ export class ChatAdapter {
   private readonly questionRefreshes = new Set<string>();
   private readonly questionCreatedAt = new Map<string, number>();
   private readonly permissionCreatedAt = new Map<string, number>();
+  // What each pending question/permission was announced as, by item id: the
+  // owning conversation and the launching conversation it appeared under. A
+  // removal has no item to read these from, and the conversation reporting it
+  // may be the parent — a subagent's request is answered from the parent's
+  // transcript, or retired by a reconciliation — so the resolution is built
+  // from this record, with no provider lookup that could fail and drop it.
+  // The tick orders an announcement against an authoritative pending read: a
+  // request announced after the read began is pending now whatever the older
+  // snapshot lists.
+  private interactionClock = 0;
+  private readonly announced = new Map<string, { owner: string; destination: string; tick: number }>();
   private readonly sessionParents = new Map<string, string | null>();
   private readonly inventorySessions = new Map<string, InventorySessionMetadata>();
+  // Ids this adapter has listed as visible conversations. A list fetch does
+  // not acknowledge lifecycle metadata (see inventorySessions), but it does
+  // establish what a later sparse deletion can have removed.
+  private readonly listedSessions = new Map<string, true>();
   private readonly inventory = new ConversationInventoryBroadcaster();
+  private catalogSequence = 0;
+
+  catalogRevision(): string | undefined {
+    return this.catalogSequence ? `${this.generation}:${this.catalogSequence}` : undefined;
+  }
   // Conversations with a turn in flight, tracked at the adapter so the fact
   // survives projection eviction. This is what distinguishes "the store says
   // running because OpenCode died mid-turn" from "running right now".
   private readonly liveTurns = new Set<string>();
+  // Conversations holding live background work (`background` status) with no
+  // turn in flight. Kept apart from liveTurns on purpose: liveTurns gates the
+  // composer's Cancel and held prompts, and a background conversation must
+  // still accept a prompt — while the hub's activity summary, by spec, counts
+  // live background work as working.
+  private readonly backgroundWork = new Set<string>();
+  // Pending permission and question item ids per conversation, adapter-level
+  // like liveTurns: a conversation blocked on the user goes quiet and is
+  // exactly the one an LRU pass evicts, and its request must still count.
+  private readonly pendingInteractions = new Map<string, Set<string>>();
+  private readonly onActivityChange: (() => void) | undefined;
+  private lastActivity: ChatActivity = { working: false, awaiting: false };
   private readonly maxProjections: number;
   private readonly coalesceWindowMs: number | undefined;
   private readonly metrics: ChatEventMetrics | undefined;
@@ -267,11 +324,32 @@ export class ChatAdapter {
   // no projection of its own. A ceiling backstops both maps besides.
   private readonly childUsage = new Map<string, Map<string, TokenUsage>>();
   private readonly childModels = new Map<string, Map<string, MessageModel>>();
+  // Which prompt each of the child's messages answers. A subagent handed a
+  // further task (OpenCode's `task_id`) is one session with a prompt per task,
+  // and two rows in the parent; the prompt is what says which row a message's
+  // spend belongs on. Without it every row would restate the whole session.
+  private readonly childPrompts = new Map<string, Map<string, string>>();
+  // The child's prompts in order, and the subagents the child itself launched.
+  // The k-th prompt pairs with the k-th row that launched the child; a nested
+  // launcher belongs to the prompt it follows. Same key and lifetime as the
+  // tallies, so an eviction re-arms the stored read for all of them together.
+  private readonly childTranscripts = new Map<string, ChildTranscript>();
+  // Launchers removed before the tally was squared against the store. A
+  // stored read in flight would otherwise hand the removed launcher back and
+  // bank it — the same race `removedChildAttribution` closes for messages.
+  private readonly removedLaunchers = new Map<string, Set<string>>();
   // Deletions that race a stored-history reconstruction must win over that
   // stale read just as newer live usage does.
   private readonly removedChildAttribution = new Map<string, Set<string>>();
   private readonly attributionReconstructions = new Map<string, Promise<void>>();
   private readonly attributionEpochs = new Map<string, number>();
+  // When each live-banked figure arrived, as a running sequence, so a
+  // reconstruction can tell an update that landed during its read (newer
+  // than the store) from one banked before it began (which the store may
+  // have overtaken — a partial figure seen before a disconnect, the child
+  // finishing while the stream was down).
+  private attributionSequence = 0;
+  private readonly attributionArrivals = new Map<string, Map<string, number>>();
   // Attribution keys whose tally has been squared against the child's stored
   // history. A live tally alone is not proof of completeness: a parent evicted
   // mid-run loses its maps, and the child's next event recreates one holding
@@ -286,6 +364,7 @@ export class ChatAdapter {
   private disposed = false;
 
   constructor(options: ChatAdapterOptions) {
+    this.notifications = new AgentNotificationTracker({ emit: options.onNotification ?? (() => {}), now: options.now });
     this.provider = options.provider;
     this.workspacePath = options.workspacePath;
     this.resolveAttachment = options.resolveAttachment;
@@ -295,6 +374,7 @@ export class ChatAdapter {
     this.coalesceWindowMs = options.coalesceWindowMs;
     this.metrics = options.metrics;
     this.id = options.id ?? randomUUID;
+    this.onActivityChange = options.onActivityChange;
     this.receipts = new IdempotencyReceipts({
       maxEntries: options.receiptEntries ?? 1_000,
       maxBytes: options.receiptBytes ?? 512 * 1024,
@@ -323,7 +403,8 @@ export class ChatAdapter {
             else items.push(...page.items);
           }
           const firstUserMessage = items
-            .filter(item => item.type === "user_message" && item.text.trim())
+            // A wakeup's prompt was the agent's, not a title the user gave.
+            .filter(item => item.type === "user_message" && item.origin === undefined && item.text.trim())
             .sort((left, right) => left.createdAt - right.createdAt)[0];
           if (firstUserMessage?.type === "user_message") {
             const renamed = await this.provider.renameSession(session.id, deriveConversationTitle(firstUserMessage.text));
@@ -336,6 +417,7 @@ export class ChatAdapter {
           // A title repair must not make an otherwise usable conversation disappear.
         }
       }
+      boundedSet(this.listedSessions, session.id, true, INVENTORY_SESSION_LIMIT);
       accepted.push(this.summary(session));
     }
     return accepted.sort((left, right) => right.updatedAt - left.updatedAt || left.id.localeCompare(right.id));
@@ -343,6 +425,16 @@ export class ChatAdapter {
 
   models(): Promise<ChatModel[]> {
     return this.provider.listModels();
+  }
+
+  /** Whether the machine's logins let the agent run a turn, as last read; undefined when the provider cannot say. */
+  loginState(): ChatLoginState | undefined {
+    return this.provider.loginState?.();
+  }
+
+  /** The machine's logins changed (Agent accounts): the provider re-reads and replays. */
+  async accountsChanged(change: ChatAccountChange): Promise<void> {
+    await this.provider.accountsChanged?.(change);
   }
 
   agent(): ChatAgent {
@@ -401,6 +493,39 @@ export class ChatAdapter {
     // that complete source for recovery, never the bounded visible page.
     const configuration = await this.configuration(id);
     const items = [...page.items];
+    // A conversation's price is the sum of every message's, and the client
+    // folds it from the usage carriers it holds — so the newest page alone
+    // would present a partial figure that grows as older pages load. Where
+    // the provider exposes the complete transcript, every priced carrier
+    // rides the first page: hidden, small, keyed by message id, and
+    // idempotent when an older page later restates it. Priced only — an
+    // agent that prices nothing (Claude Code) has a carrier per assistant
+    // frame, and shipping those would grow the first page with the whole
+    // conversation for a fold that has nothing to sum. A subagent's spend
+    // lives on the row that launched it, so those rows ride too — the
+    // attribution pass below gives them their child's aggregate like any
+    // row on the page. They render, as an out-of-page background task
+    // already does, and merge in place when their page loads.
+    if (page.completeItems && !cursor) {
+      const held = new Set(items.map(item => item.id));
+      for (const item of page.completeItems) {
+        if (held.has(item.id)) continue;
+        const pricedCarrier = item.type === "assistant_message" && item.markdown === "" && item.usage?.costUsd !== undefined;
+        const launcher = item.type === "tool" && item.childConversationId !== undefined;
+        if (pricedCarrier || launcher) items.push(item);
+      }
+    }
+    // A foreground run's row (a typed command's review, design D13) exists
+    // only as a live row: the store keeps no record of it, and it is not
+    // background work the provider lists. A page opening mid-command must
+    // still see the run listed, so the row this process holds rides along;
+    // the liveness rule below closes one no turn is running any more.
+    if (!cursor) {
+      const held = new Set(items.map(item => item.id));
+      for (const existing of this.projection(id).filter(item => item.type === "background_task" && item.foreground === true)) {
+        if (!held.has(existing.id)) items.push(existing);
+      }
+    }
     // Stable sort with no id tiebreaker: parts of one message share the
     // message's timestamp, so ties must fall back to the provider's own part
     // order (the order `flatMap` already produced). Comparing ids instead
@@ -419,6 +544,12 @@ export class ChatAdapter {
         if ((item.type === "tool" || item.type === "command" || item.type === "reasoning") && (item.status === "running" || item.status === "pending")) {
           items[index] = { ...item, status: "cancelled" };
         }
+        // A foreground run (a typed command's) is part of the turn that ran
+        // it, not background work the provider lists: with no turn live, it
+        // is over whatever its row last said.
+        if (item.type === "background_task" && item.foreground && item.status === "running") {
+          items[index] = { ...item, status: "stopped" };
+        }
       }
     }
     // Live background work is held by the provider, not the transcript: a
@@ -435,12 +566,40 @@ export class ChatAdapter {
       // projection — would offer a Stop that errors.
       for (let index = 0; index < items.length; index += 1) {
         const item = items[index]!;
-        if (item.type === "background_task" && item.status === "running" && !live.has(item.id)) items[index] = { ...item, status: "stopped" };
+        if (item.type === "background_task" && !item.foreground && item.status === "running" && !live.has(item.id)) items[index] = { ...item, status: "stopped" };
       }
       for (const existing of this.projection(id).items()) {
-        if (existing.type === "background_task" && existing.status === "running" && !live.has(existing.id) && !items.some(item => item.id === existing.id)) {
+        if (existing.type === "background_task" && !existing.foreground && existing.status === "running" && !live.has(existing.id) && !items.some(item => item.id === existing.id)) {
           items.push({ ...existing, status: "stopped" });
         }
+      }
+    }
+    // Pending wakeups live in the provider's session, never in the
+    // transcript (spec: a reopened conversation replays no pending row): a
+    // reader opening a conversation that is scheduled right now gets its
+    // rows from the provider's list, so the composer shows the held state.
+    const liveWakeups = await this.liveScheduledWakeups(id);
+    for (const wakeup of liveWakeups) {
+      const index = items.findIndex(item => item.id === wakeup.id);
+      if (index < 0) items.push(wakeup); else items[index] = wakeup;
+    }
+    // With no session holding them, the crons the agent rebuilds when the
+    // conversation runs again are listed as paused (D11). The conversation
+    // stays idle: nothing is held. A row this page already settled keeps
+    // its settled state.
+    if (liveWakeups.length === 0 && this.provider.listPausedWakeups) {
+      try {
+        for (const paused of await this.provider.listPausedWakeups(id)) {
+          const index = items.findIndex(item => item.id === paused.id);
+          const current = index >= 0 ? items[index] : this.projection(id).find(item => item.id === paused.id);
+          if (current?.type === "scheduled_wakeup" && (current.status === "cancelled" || current.status === "fired")) {
+            if (index < 0) items.push(current);
+            continue;
+          }
+          if (index < 0) items.push(paused); else items[index] = paused;
+        }
+      } catch {
+        // No paused list: the conversation reads as it would without one.
       }
     }
     // A subagent's attribution reached the parent as a live upsert, and the
@@ -454,24 +613,7 @@ export class ChatAdapter {
     // child rather than per open (the aggregate is still computed here, not
     // fetched per render) — and in parallel, so a fan-out costs one round trip
     // rather than one each.
-    const unattributed = [...new Set(items.flatMap(item =>
-      item.type === "tool" && item.childConversationId && !this.completeAttributions.has(attributionKey(id, item.childConversationId))
-        ? [item.childConversationId]
-        : []))];
-    await Promise.all(unattributed.map(childId => this.reconstructAttribution(id, childId)));
-    for (let index = 0; index < items.length; index += 1) {
-      const item = items[index]!;
-      if (item.type !== "tool" || !item.childConversationId) continue;
-      const key = attributionKey(id, item.childConversationId);
-      const model = latestModel(this.childModels.get(key));
-      const usage = sumUsage(this.childUsage.get(key));
-      if (model === undefined && usage === undefined) continue;
-      items[index] = {
-        ...item,
-        ...(model === undefined ? {} : { model }),
-        ...(usage === undefined ? {} : { usage }),
-      };
-    }
+    await this.attributeLaunchers(id, items, page.completeItems);
     // OpenCode 1.18 never emits `question.v2.asked`, so a pending question is
     // invisible to the event stream and only the provider knows about it.
     // Asking here is what makes an open question answerable at all. A failed
@@ -479,6 +621,7 @@ export class ChatAdapter {
     // rewrite the published set — that would erase live questions.
     let questionsReconciled = false;
     try {
+      const questionTick = this.interactionClock;
       const pendingNow = await this.pendingQuestions(id);
       for (const pending of pendingNow) {
         if (items.some(item => item.id === pending.id)) continue;
@@ -493,8 +636,12 @@ export class ChatAdapter {
         const projection = this.projection(id);
         for (const existing of projection.items()) {
           if (existing.type !== "question" || existing.status !== "pending" || live.has(existing.id)) continue;
+          // Announced after the read began: the snapshot predates it, so it
+          // stays on the timeline and its notification stays pending.
+          if ((this.announced.get(existing.id)?.tick ?? 0) > questionTick) { if (!items.some(item => item.id === existing.id)) items.push(existing); continue; }
           projection.apply({ kind: "remove", itemId: existing.id });
           this.questionCreatedAt.delete(existing.id);
+          this.resolveAnnounced(existing.id);
         }
       }
       if (pendingNow.length > 0) {
@@ -525,6 +672,7 @@ export class ChatAdapter {
     // answerable. Ids match the event path's, so a request that also arrives
     // live converges on one entry instead of rendering twice.
     try {
+      const permissionTick = this.interactionClock;
       const pendingNow = await this.pendingPermissions(id);
       for (const pending of pendingNow) {
         if (items.some(item => item.id === pending.id)) continue;
@@ -542,8 +690,10 @@ export class ChatAdapter {
         const projection = this.projection(id);
         for (const existing of projection.items()) {
           if (existing.type !== "permission" || existing.status !== "pending" || live.has(existing.id)) continue;
+          if ((this.announced.get(existing.id)?.tick ?? 0) > permissionTick) { if (!items.some(item => item.id === existing.id)) items.push(existing); continue; }
           projection.apply({ kind: "remove", itemId: existing.id });
           this.permissionCreatedAt.delete(existing.id);
+          this.resolveAnnounced(existing.id);
         }
       }
     } catch {
@@ -569,11 +719,26 @@ export class ChatAdapter {
       const current = projection.find(candidate => candidate.id === item.id);
       if (current?.type === "background_task" && current.status !== "running") items[index] = current;
     }
+    // Likewise the wakeup snapshot: a wakeup that fired or was cancelled
+    // during those awaits keeps that row, not the pending or paused copy read
+    // before — the copy would offer a Cancel for a wakeup that is gone. Only
+    // those two are final for an id; paused and lost are not (a resume turns
+    // a paused cron pending again), so a projection row in either state may
+    // be the older one and the snapshot's read stands.
+    for (let index = 0; index < items.length; index += 1) {
+      const item = items[index]!;
+      if (item.type !== "scheduled_wakeup" || (item.status !== "pending" && item.status !== "paused")) continue;
+      const current = projection.find(candidate => candidate.id === item.id);
+      if (current?.type === "scheduled_wakeup" && (current.status === "fired" || current.status === "cancelled")) items[index] = current;
+    }
     projection.seed(items);
     // A reopened conversation whose agent still holds live work is in the
     // background state, not idle: the list and the status must agree.
-    if (items.some(item => item.type === "background_task" && item.status === "running") && !isLiveConversationStatus(projection.status) && projection.status !== "background") {
+    if (items.some(item => item.type === "background_task" && !item.foreground && item.status === "running") && !isLiveConversationStatus(projection.status) && projection.status !== "background") {
       projection.statusUpdate("background");
+    } else if (items.some(item => item.type === "scheduled_wakeup" && item.status === "pending") && !isLiveConversationStatus(projection.status) && projection.status !== "background" && projection.status !== "scheduled") {
+      // Likewise a session held for its wakeups is scheduled, not idle.
+      projection.statusUpdate("scheduled");
     }
     const reversibleHistory = await this.readReversibleHistoryState(id);
     return {
@@ -615,6 +780,79 @@ export class ChatAdapter {
 
   subscribeInventory(signal?: AbortSignal): ConversationInventorySubscription {
     return this.inventory.subscribe(signal);
+  }
+
+  /**
+   * This agent's slice of the workspace activity summary: whether any
+   * conversation has a turn in flight or live background work, and whether
+   * any permission request or question awaits the user. Read from the
+   * adapter-level records, never from the provider, so it is cheap enough to
+   * answer on every change.
+   */
+  activity(): ChatActivity {
+    return { working: this.liveTurns.size > 0 || this.backgroundWork.size > 0, awaiting: this.pendingInteractions.size > 0 };
+  }
+
+  pendingNotifications() { return this.notifications.pendingSnapshot(); }
+
+  // Deduplicated at the source: a second conversation starting while one
+  // already runs does not change the summary.
+  private activityMayHaveChanged(): void {
+    const next = this.activity();
+    if (next.working === this.lastActivity.working && next.awaiting === this.lastActivity.awaiting) return;
+    this.lastActivity = next;
+    this.onActivityChange?.();
+  }
+
+  private trackInteraction(conversationId: string, itemId: string, pending: boolean): void {
+    const ids = this.pendingInteractions.get(conversationId);
+    if (pending) {
+      if (ids) ids.add(itemId);
+      else this.pendingInteractions.set(conversationId, new Set([itemId]));
+    } else if (ids) {
+      ids.delete(itemId);
+      if (ids.size === 0) this.pendingInteractions.delete(conversationId);
+    }
+    this.activityMayHaveChanged();
+  }
+
+  // Also reached when a timeline is rewritten (undo, redo, revert, restore).
+  // Announcement records outlive that: the request is still pending for the
+  // agent and the hub, and only an explicit resolution — or the
+  // conversation's loss below — settles what was announced.
+  private forgetInteractions(conversationId: string): void {
+    this.pendingInteractions.delete(conversationId);
+    this.activityMayHaveChanged();
+  }
+
+  // A conversation that is deleted or has left the workspace can neither work
+  // nor wait on the user here: requireSession rejects its later events, so
+  // nothing else would ever settle its adapter-level records. If it returns,
+  // its activity is re-derived from new events.
+  private forgetActivity(conversationId: string): void {
+    // Owned by it, or announced under it: a child's request appears in its
+    // launching conversation, and that conversation's loss settles it too —
+    // no child event is guaranteed to follow.
+    for (const [itemId, record] of this.announced) if (record.owner === conversationId || record.destination === conversationId) this.resolveAnnounced(itemId);
+    for (const notification of this.notifications.pendingSnapshot()) {
+      try {
+        if (JSON.parse(notification.sourceId)[0] !== conversationId || notification.kind === "turn-completed") continue;
+        this.notifications.observe({ type: "interaction", origin: "live", conversationId: notification.conversationId, sourceId: notification.sourceId,
+          kind: notification.kind, pending: false, createdAt: Date.now() });
+      } catch { /* only interaction source ids are owner/request tuples */ }
+    }
+    this.notifications.forgetConversation(conversationId);
+    this.liveTurns.delete(conversationId);
+    this.backgroundWork.delete(conversationId);
+    this.forgetInteractions(conversationId);
+  }
+
+  // The adapter's only workspace classification. Every path that learns a
+  // conversation lies outside the workspace forgets its activity here.
+  private async isInWorkspace(session: Pick<ProviderSession, "id" | "directory">): Promise<boolean> {
+    const inWorkspace = await isSessionInWorkspace(session.directory, this.workspacePath);
+    if (!inWorkspace) this.forgetActivity(session.id);
+    return inWorkspace;
   }
 
   startEventPump(): Promise<void> {
@@ -661,6 +899,8 @@ export class ChatAdapter {
     held: boolean;
     configuration: ConversationConfiguration;
     conversation?: ConversationSummary;
+    // What the provider actually ran, when it was not an ordinary turn.
+    operation?: "reload";
   }> {
     if (!text.trim() && !attachments?.length) throw new Error("prompt must not be empty");
     return this.receipts.run(`prompt:${conversationId}:${requestId}`, () =>
@@ -864,7 +1104,7 @@ export class ChatAdapter {
     model?: ModelSelection;
     mode?: string;
     variant?: string;
-  }): Promise<{ messageId: string; configuration: ConversationConfiguration; conversation?: ConversationSummary }> {
+  }): Promise<{ messageId: string; configuration: ConversationConfiguration; conversation?: ConversationSummary; operation?: "reload" }> {
     let session = initialSession;
     const { text, mode, variant } = input;
     // Emptiness is checked before dispatch (afterwards the store already
@@ -893,8 +1133,8 @@ export class ChatAdapter {
       // the queue holds references, and a reference that stopped resolving
       // while held fails the delivery like any provider refusal.
       const providerAttachments = await this.locateAttachments(input.attachments);
-      const accepted = slash
-        ? await this.provider.command(conversationId, { id: input.messageId, name: slash.name, arguments: slash.arguments, model: input.model, mode, variant })
+      const accepted: { messageId: string; text?: string; operation?: "reload" } = slash
+        ? await this.provider.command(conversationId, { id: input.messageId, name: slash.name, arguments: slash.arguments, listed: slash.command, model: input.model, mode, variant })
         : await this.provider.prompt(conversationId, { id: input.messageId, text, delivery: "queue", ...(providerAttachments.length ? { attachments: providerAttachments } : {}), model: input.model, mode, variant });
       // "sending" ends at acceptance, BEFORE the rename side-work below —
       // the dispatch is no longer in flight once the provider has accepted
@@ -903,6 +1143,12 @@ export class ChatAdapter {
       // acceptance response, and a terminal status that already landed must
       // not be overwritten back to "running".
       if (projection.status === "sending") projection.statusUpdate("running");
+      // The row goes in at acceptance too, before the rename's round trips:
+      // a provider that later retires this placeholder (a 2.x command whose
+      // server-minted row arrived after its admission window) removes it by
+      // id, and a removal that lands before the row exists is a no-op that
+      // leaves the row beside the server's for good.
+      projection.upsert({ id: `message:${accepted.messageId}`, type: "user_message", createdAt: Date.now(), text: accepted.text ?? text, requestId: input.requestId, ...(input.attachments?.length ? { attachments: input.attachments } : {}) });
       if (renameToFirstPrompt) {
         try {
           // A manual rename can finish while prompt validation is still
@@ -919,9 +1165,8 @@ export class ChatAdapter {
           }
         } catch { /* cosmetic — listConversations repairs default titles later */ }
       }
-      projection.upsert({ id: `message:${accepted.messageId}`, type: "user_message", createdAt: Date.now(), text, requestId: input.requestId, ...(input.attachments?.length ? { attachments: input.attachments } : {}) });
       const configuration = this.commitConfiguration(conversationId, this.configurations.get(conversationId) ?? {}, input.model, mode, variant);
-      return { messageId: accepted.messageId, configuration, ...(conversation ? { conversation } : {}) };
+      return { messageId: accepted.messageId, configuration, ...(conversation ? { conversation } : {}), ...(accepted.operation ? { operation: accepted.operation } : {}) };
     } catch (error) {
       const mapped = error instanceof UnsupportedVariantSelectionError
         ? new InvalidVariantSelectionError(error.message)
@@ -1260,8 +1505,49 @@ export class ChatAdapter {
     // No buffered update from the discarded branch may apply after replace.
     this.eventCoalescer?.discard(conversationId);
     this.rememberReversibleHistory(conversationId, state);
-    if (changed) projection.replace(items);
+    if (changed) {
+      // The replacement is the provider's raw rows: a launcher among them
+      // carries no attribution, so the banked tallies go back on before
+      // they replace what the client shows.
+      await this.attributeLaunchers(conversationId, items, items);
+      projection.replace(items);
+      // A revert in a subagent rewrote what its store holds: the tally its
+      // parent banked for it — and the line every ancestor lists for it —
+      // counts spend that is gone, and no removal event says so.
+      // Forget it, square against the rewritten store, and put the fresh
+      // figure on the launching row.
+      await this.rebuildChildAttribution(conversationId);
+    }
     return state;
+  }
+
+  private async rebuildChildAttribution(childId: string): Promise<void> {
+    let parentId: string | null;
+    try {
+      parentId = await this.parentOf(childId);
+    } catch {
+      return;
+    }
+    if (!parentId) return;
+    const key = attributionKey(parentId, childId);
+    // A read in flight for the old store must not bank what it finds.
+    this.attributionEpochs.set(key, (this.attributionEpochs.get(key) ?? 0) + 1);
+    this.childUsage.delete(key);
+    this.childModels.delete(key);
+    this.childPrompts.delete(key);
+    this.childTranscripts.delete(key);
+    this.removedLaunchers.delete(key);
+    this.removedChildAttribution.delete(key);
+    this.attributionArrivals.delete(key);
+    this.completeAttributions.delete(key);
+    await this.reconstructAttribution(parentId, childId);
+    // The dedupe may have handed back that stale in-flight read; it banks
+    // nothing, so square once more from a clean start.
+    if (!this.completeAttributions.has(key)) await this.reconstructAttribution(parentId, childId);
+    const coalescer = this.eventCoalescer;
+    if (!coalescer) return;
+    this.decorateLauncherRows(parentId, childId, coalescer);
+    await this.refreshAncestors(parentId, coalescer);
   }
 
   private scheduleRevertReconciliation(conversationId: string, lifecycle: RevertLifecycle): void {
@@ -1351,6 +1637,12 @@ export class ChatAdapter {
         if ((item.type === "tool" || item.type === "command" || item.type === "reasoning") && (item.status === "running" || item.status === "pending")) {
           items[index] = { ...item, status: "cancelled" };
         }
+        // A foreground run (a typed command's) is part of the turn that ran
+        // it, not background work the provider lists: with no turn live, it
+        // is over whatever its row last said.
+        if (item.type === "background_task" && item.foreground && item.status === "running") {
+          items[index] = { ...item, status: "stopped" };
+        }
       }
     }
     items.sort((left, right) => left.createdAt - right.createdAt);
@@ -1386,6 +1678,7 @@ export class ChatAdapter {
       const reply: ProviderPermissionReply = outcome === "approved-once" ? "once" : outcome === "approved-session" ? "always" : "reject";
       await this.provider.replyPermission(conversationId, requestId, reply, choiceId);
       projection.resolvePermission(requestId, outcome, choiceId);
+      await this.observeNotifications({ conversationId, updates: [{ kind: "remove", itemId: `permission:${requestId}` }], outcome: "handled", eventType: "permission.answered" });
       this.resolveMirroredCopy(session.parentId, `permission:${requestId}`, parent => parent.resolvePermission(requestId, outcome, choiceId));
       return { outcome };
     });
@@ -1396,6 +1689,36 @@ export class ChatAdapter {
    * reports the stop as that task settling, which is what the timeline
    * records; this only carries the request.
    */
+  /** The login's plan usage as the provider last read it; null when nothing has been read. */
+  async usage(): Promise<AgentUsageReport | null> {
+    if (!this.provider.usageReport || !this.provider.describe().capabilities.includes("usage")) throw new UsageUnsupportedError();
+    return (await this.provider.usageReport()) ?? null;
+  }
+
+  /**
+   * Read plan usage now. Idempotent per client request id, and one read at
+   * a time across request ids: a second ask while one is out joins it
+   * rather than starting another (spec) — when the one out answers at
+   * least as much. A "start" asked while a live-only read is out runs
+   * after it: joined, it would be told "no-live-session" for the session
+   * it asked to start.
+   */
+  readUsage(clientRequestId: string, mode: UsageReadMode): Promise<UsageReadResult> {
+    return this.receipts.run(`usage-read:${clientRequestId}`, async () => {
+      const provider = this.provider;
+      if (!provider.readUsage || !provider.describe().capabilities.includes("usage")) throw new UsageUnsupportedError();
+      const inFlight = this.usageRead;
+      if (inFlight && (inFlight.mode === mode || mode === "live-only")) return inFlight.promise;
+      const run = inFlight ? inFlight.promise.catch(() => undefined).then(() => provider.readUsage!(mode)) : provider.readUsage(mode);
+      const entry = { mode, promise: run };
+      entry.promise = run.finally(() => { if (this.usageRead === entry) this.usageRead = null; });
+      this.usageRead = entry;
+      return entry.promise;
+    });
+  }
+
+  private usageRead: { mode: UsageReadMode; promise: Promise<UsageReadResult> } | null = null;
+
   stopTask(conversationId: string, taskId: string, clientRequestId: string): Promise<{ stopped: true }> {
     return this.receipts.run(`stop-task:${conversationId}:${taskId}:${clientRequestId}`, async () => {
       await this.requireSession(conversationId);
@@ -1403,6 +1726,42 @@ export class ChatAdapter {
       await this.provider.stopTask(conversationId, taskId);
       return { stopped: true as const };
     });
+  }
+
+  /**
+   * Release a conversation held for its scheduled wakeups (D5): the agent's
+   * session ends, its wakeups read as cancelled, and the conversation is
+   * idle. Serialized with deliveries so a held prompt the idle status
+   * releases lands in a fresh session, not the one being retired.
+   */
+  /** Cancel one wakeup, live or paused (D12): it never fires again. */
+  cancelWakeup(conversationId: string, wakeupId: string, clientRequestId: string): Promise<{ cancelled: true }> {
+    return this.receipts.run(`cancel-wakeup:${conversationId}:${wakeupId}:${clientRequestId}`, async () => {
+      await this.requireSession(conversationId);
+      if (!this.provider.cancelWakeup || !this.provider.describe().capabilities.includes("scheduled-wakeups")) throw new ScheduledWakeupsUnsupportedError();
+      await this.provider.cancelWakeup(conversationId, wakeupId);
+      return { cancelled: true as const };
+    });
+  }
+
+  release(conversationId: string, clientRequestId: string): Promise<{ released: true }> {
+    return this.receipts.run(`release:${conversationId}:${clientRequestId}`, () => this.enqueuePromptAdmission(conversationId, async () => {
+      await this.requireSession(conversationId);
+      if (!this.provider.release || !this.provider.describe().capabilities.includes("scheduled-wakeups")) throw new ScheduledWakeupsUnsupportedError();
+      await this.provider.release(conversationId);
+      return { released: true as const };
+    }));
+  }
+
+  /**
+   * The output a task has produced so far: a read, not a mutation, so no
+   * receipt. Gated like stop — only an agent with background work can be
+   * asked — and the provider decides whether this task has an output file.
+   */
+  async taskOutput(conversationId: string, taskId: string, options: { tailBytes: number }): Promise<BackgroundTaskOutput | null> {
+    await this.requireSession(conversationId);
+    if (!this.provider.taskOutput || !this.provider.describe().capabilities.includes("background-tasks")) throw new BackgroundTasksUnsupportedError();
+    return this.provider.taskOutput(conversationId, taskId, options);
   }
 
   respondQuestion(conversationId: string, requestId: string, clientRequestId: string, outcome: QuestionOutcome): Promise<{ outcome: QuestionOutcome }> {
@@ -1420,6 +1779,7 @@ export class ChatAdapter {
       if (outcome.kind === "rejected") await this.provider.rejectQuestion(conversationId, requestId);
       else await this.provider.replyQuestion(conversationId, requestId, outcome.answers);
       projection.resolveQuestion(requestId, outcome);
+      await this.observeNotifications({ conversationId, updates: [{ kind: "remove", itemId: `question:${requestId}` }], outcome: "handled", eventType: "question.answered" });
       this.resolveMirroredCopy(session.parentId, `question:${requestId}`, parent => parent.resolveQuestion(requestId, outcome));
       return { outcome };
     });
@@ -1437,19 +1797,34 @@ export class ChatAdapter {
     if (!parentId) return;
     const parent = this.projections.get(parentId);
     if (parent?.has(itemId)) resolve(parent);
+    // An evicted parent has no copy left to resolve, but its eviction-proof
+    // pending record must not outlive the answer.
+    else this.trackInteraction(parentId, itemId, false);
   }
 
   // Counts an event the pump could not use, by type. Never records a payload:
   // a payload can carry file contents, and the count is what is actionable.
   private countDiscard(outcome: "unrecognized" | "unparseable", eventType: string): void {
     if (!this.metrics) return;
-    const type = eventType || "unknown";
-    let key = type;
-    if (!this.countedEventTypes.has(type)) {
-      if (this.countedEventTypes.size >= MAX_COUNTED_EVENT_TYPES) key = "other";
-      else this.countedEventTypes.add(type);
-    }
-    this.metrics.inc(`chat.event.${outcome}.${key}`);
+    this.metrics.inc(`chat.event.${outcome}.${this.countedType("event", eventType)}`);
+  }
+
+  // Counts a content block (or part) skipped inside a recognized event, by
+  // block type, under the same distinct-type cap as events.
+  private countSkippedBlock(blockType: string): void {
+    if (!this.metrics) return;
+    this.metrics.inc(`chat.block.unrecognized.${this.countedType("block", blockType)}`);
+  }
+
+  // The counter key for a type: itself while the bounded key space has room,
+  // `other` once it is full. Events and blocks share the one budget.
+  private countedType(space: "event" | "block", name: string): string {
+    const type = name || "unknown";
+    const seen = `${space}:${type}`;
+    if (this.countedEventTypes.has(seen)) return type;
+    if (this.countedEventTypes.size >= MAX_COUNTED_EVENT_TYPES) return "other";
+    this.countedEventTypes.add(seen);
+    return type;
   }
 
   /**
@@ -1499,12 +1874,21 @@ export class ChatAdapter {
    * which is what stops a child that genuinely reported nothing from being
    * re-read on every open.
    */
-  private reconstructAttribution(parentId: string, childId: string): Promise<void> {
+  /**
+   * `ancestry` is the chain of sessions whose reads this one is nested in. A
+   * grandchild found in the read is reconstructed in turn; one that leads back
+   * into that chain (a loop in the data) is skipped rather than awaited, since
+   * the in-flight dedupe would hand back the very promise being waited on. An
+   * independent read of the same child already in flight — the child's own
+   * transcript opened at the same moment — is not on the chain, and is awaited
+   * like any other so its figure lands here too.
+   */
+  private reconstructAttribution(parentId: string, childId: string, ancestry: ReadonlySet<string> = new Set()): Promise<void> {
     const key = attributionKey(parentId, childId);
     const existing = this.attributionReconstructions.get(key);
     if (existing) return existing;
     const epoch = this.attributionEpochs.get(key) ?? 0;
-    const pending = this.reconstructAttributionOnce(key, childId, epoch).finally(() => {
+    const pending = this.reconstructAttributionRead(key, childId, epoch, new Set([...ancestry, childId])).finally(() => {
       if (this.attributionReconstructions.get(key) === pending) {
         this.attributionReconstructions.delete(key);
         this.attributionEpochs.delete(key);
@@ -1514,9 +1898,13 @@ export class ChatAdapter {
     return pending;
   }
 
-  private async reconstructAttributionOnce(key: string, childId: string, epoch: number): Promise<void> {
+  private async reconstructAttributionRead(key: string, childId: string, epoch: number, ancestry: ReadonlySet<string>): Promise<void> {
     const byMessage = new Map<string, TokenUsage>();
     const byModel = new Map<string, MessageModel>();
+    const byPrompt = new Map<string, string>();
+    let transcript: ChildTranscript;
+    let descendantsIncomplete = false;
+    const readStartedAt = this.attributionSequence;
     try {
       // Every message, in one read: banking a partial tally would permanently
       // underreport the child, because a banked key is never re-read. The
@@ -1527,14 +1915,34 @@ export class ChatAdapter {
       // read; pages walk newest to oldest, so the first page's last-reported
       // model is the child's newest and is kept.
       let cursor: string | undefined;
+      let complete: ConversationItem[] | undefined;
+      let paged: ConversationItem[] = [];
       do {
         const page = await this.provider.listMessages(childId, { cursor, limit: RECONSTRUCTION_READ_LIMIT });
         for (const reported of page.accounting) {
           if (reported.usage) byMessage.set(reported.messageId, reported.usage);
           if (reported.model) byModel.set(reported.messageId, { model: reported.model, createdAt: reported.createdAt });
+          if (reported.promptId) byPrompt.set(reported.messageId, reported.promptId);
         }
+        complete ??= page.completeItems;
+        if (!complete) paged = [...page.items, ...paged];
         cursor = page.nextCursor;
       } while (cursor !== undefined);
+      // The child's prompts in order, and the subagents it launched itself,
+      // each under the prompt it followed. A launcher that leads back into
+      // the chain being read (a loop in the data) is not listed.
+      transcript = readChildTranscript(complete ?? paged, ancestry);
+      for (const promptId of byPrompt.values()) if (!transcript.prompts.some(prompt => prompt.id === promptId)) transcript.prompts.push({ id: promptId });
+      // The child's own subagents are squared against their stores the same
+      // way (recursively), each under its own key: nothing is rolled up into
+      // this tally, and the lines beneath a row are assembled from those keys
+      // when the row is decorated. A grandchild whose read did not complete
+      // leaves this tally unmarked too — banked for what it holds, but read
+      // again on the next open rather than listing an incomplete nest for good.
+      for (const grandchildId of new Set(transcript.launchers.map(launcher => launcher.conversationId))) {
+        await this.reconstructAttribution(childId, grandchildId, ancestry);
+        if (!this.completeAttributions.has(attributionKey(childId, grandchildId))) descendantsIncomplete = true;
+      }
     } catch {
       return;
     }
@@ -1542,25 +1950,55 @@ export class ChatAdapter {
     // from before that boundary must not repopulate the cleared maps and mark
     // a potentially incomplete answer authoritative.
     if ((this.attributionEpochs.get(key) ?? 0) !== epoch) return;
-    // Live events may have landed while the read was in flight, and they are
-    // newer than the stored snapshot — per message the live figure wins, and
-    // a model attributed live outranks the stored one. Overwriting instead
-    // would bank the stale snapshot permanently once the events fall behind
-    // the replay cursor.
+    // Live events that landed while the read was in flight are newer than
+    // the stored snapshot — for those the live figure wins, or the stale
+    // snapshot would be banked permanently once the events fall behind the
+    // replay cursor. A figure banked before the read began is the older
+    // one: the store may have overtaken it (a partial figure seen before a
+    // disconnect, the child finishing while the stream was down), so it
+    // stands only where the store has nothing for that message — a tally
+    // rebuilt live after an eviction, which the store read is squaring, not
+    // replacing. A message the store dropped is handled where the drop is
+    // seen: a removal event withdraws it, and a revert invalidates the
+    // child's tally outright. A model attributed live outranks the stored
+    // one either way.
     const live = this.childUsage.get(key);
-    if (live) for (const [messageId, usage] of live) byMessage.set(messageId, usage);
+    const arrivals = this.attributionArrivals.get(key);
+    if (live) for (const [messageId, usage] of live) {
+      if (!byMessage.has(messageId) || (arrivals?.get(messageId) ?? 0) > readStartedAt) byMessage.set(messageId, usage);
+    }
     const liveModels = this.childModels.get(key);
     if (liveModels) for (const [messageId, model] of liveModels) byModel.set(messageId, model);
+    // Which prompt a message answers never changes, so the store's word
+    // stands and a live one only fills what the store did not say. Prompts
+    // and launchers seen live during the read are newer than the transcript
+    // it returned, and go after it.
+    const livePrompts = this.childPrompts.get(key);
+    if (livePrompts) for (const [messageId, promptId] of livePrompts) if (!byPrompt.has(messageId)) byPrompt.set(messageId, promptId);
+    const liveTranscript = this.childTranscripts.get(key);
+    if (liveTranscript) {
+      for (const prompt of liveTranscript.prompts) if (!transcript.prompts.some(known => known.id === prompt.id)) transcript.prompts.push(prompt);
+      for (const launcher of liveTranscript.launchers) if (!transcript.launchers.some(known => known.id === launcher.id)) transcript.launchers.push(launcher);
+    }
+    // A launcher removed while this read was in flight is newer than the
+    // transcript it returned, and must not come back with it.
+    const removedLaunchers = this.removedLaunchers.get(key);
+    if (removedLaunchers) transcript.launchers = transcript.launchers.filter(launcher => !removedLaunchers.has(launcher.id));
     const removed = this.removedChildAttribution.get(key);
     if (removed) for (const messageId of removed) {
       byMessage.delete(messageId);
       byModel.delete(messageId);
+      byPrompt.delete(messageId);
     }
     this.bankAttribution(this.childUsage, key, byMessage);
     this.bankAttribution(this.childModels, key, byModel);
+    this.bankAttribution(this.childPrompts, key, byPrompt);
+    this.bankAttribution(this.childTranscripts, key, transcript);
+    if (descendantsIncomplete) return;
     // Squared against the store from here on; only an eviction re-arms the read.
     this.completeAttributions.add(key);
     this.removedChildAttribution.delete(key);
+    this.removedLaunchers.delete(key);
     if (this.completeAttributions.size > MAX_CHILD_ATTRIBUTIONS) {
       this.completeAttributions.delete(this.completeAttributions.values().next().value!);
     }
@@ -1591,19 +2029,19 @@ export class ChatAdapter {
   }
 
   /**
-   * Attributes a subagent on the row that launched it: the model its own
-   * session ran and the tokens it consumed, summed across its messages and
-   * upserted onto the parent's `task` tool item.
+   * Attributes a subagent on the rows that launched it: the model its own
+   * session ran and the tokens it consumed, upserted onto the parent's `task`
+   * tool items — each row stating the task it represents, not the session.
    *
-   * Materialized onto the parent's item rather than read on demand because the
+   * Materialized onto the parent's items rather than read on demand because the
    * client holds one conversation's projection and can never see a child's —
    * and computed from the events already flowing through this pump rather than
    * fetched per child, which would be a provider call per subagent per render.
    */
   private async attributeSubagent(
     conversationId: string,
-    reported: { messageId: string; usage: TokenUsage } | undefined,
-    assistantModel: { messageId: string; model: string; createdAt: number } | undefined,
+    reported: { messageId: string; usage: TokenUsage; promptId?: string } | undefined,
+    assistantModel: { messageId: string; model: string; createdAt: number; promptId?: string } | undefined,
     removedMessageId: string | undefined,
     coalescer: ProviderUpdateCoalescer,
   ): Promise<void> {
@@ -1630,54 +2068,234 @@ export class ChatAdapter {
       const byMessage = this.childUsage.get(key) ?? new Map<string, TokenUsage>();
       byMessage.set(reported.messageId, reported.usage);
       this.bankAttribution(this.childUsage, key, byMessage);
+      this.stampArrival(key, reported.messageId);
       this.removedChildAttribution.get(key)?.delete(reported.messageId);
+    }
+    const answered = reported ?? assistantModel;
+    // Which prompt the message answers: named by the event where it can be.
+    // An event that names none (a record shape with no `parentID`, and a
+    // normalizer whose own memory of the session's prompts began empty — a
+    // restart or reconnect mid-task) answers the newest prompt the child is
+    // known to have received, from the store or live; without this a reused
+    // subagent's new spend would fall to its FIRST task's row. A message that
+    // is already paired keeps its pairing: a restatement of an earlier task's
+    // message must not move to the task running now.
+    const promptId = answered === undefined ? undefined
+      : answered.promptId ?? (this.childPrompts.get(key)?.has(answered.messageId) ? undefined : this.childTranscripts.get(key)?.prompts.at(-1)?.id);
+    if (answered !== undefined && promptId !== undefined) {
+      const byMessage = this.childPrompts.get(key) ?? new Map<string, string>();
+      byMessage.set(answered.messageId, promptId);
+      this.bankAttribution(this.childPrompts, key, byMessage);
+      // A prompt first heard of here is newer than every prompt already
+      // known: prompts reach a session one at a time, in order.
+      const transcript = this.childTranscripts.get(key) ?? { prompts: [], launchers: [] };
+      if (!transcript.prompts.some(prompt => prompt.id === promptId)) {
+        this.bankAttribution(this.childTranscripts, key, { ...transcript, prompts: [...transcript.prompts, { id: promptId }] });
+      }
     }
     if (removedMessageId !== undefined) {
       const byMessage = this.childUsage.get(key) ?? new Map<string, TokenUsage>();
       byMessage.delete(removedMessageId);
       this.bankAttribution(this.childUsage, key, byMessage);
-      const byModel = this.childModels.get(key);
-      byModel?.delete(removedMessageId);
+      this.childModels.get(key)?.delete(removedMessageId);
+      this.childPrompts.get(key)?.delete(removedMessageId);
       if (!this.completeAttributions.has(key)) {
         const removed = this.removedChildAttribution.get(key) ?? new Set<string>();
         removed.add(removedMessageId);
         this.bankAttribution(this.removedChildAttribution, key, removed);
       }
     }
-    // Nothing to decorate if the parent is not projected — the row lives in
-    // its timeline, and an unprojected parent has no row on screen to carry
-    // the figure. The lookup walks the projection unordered: this runs per
-    // child event, and OpenCode restates a message's tokens many times a
-    // turn, so sorting the whole parent timeline each time (what `items()`
-    // does) would make a chatty subagent cost the parent's length per chunk.
-    const parent = this.projections.get(parentId);
-    const row = parent?.find(item => item.type === "tool" && item.childConversationId === conversationId);
-    if (!row || row.type !== "tool") return;
-    const model = latestModel(this.childModels.get(key));
-    const usage = sumUsage(this.childUsage.get(key));
-    // Nothing new to say: most restatements change nothing until the turn's
-    // token counts actually move, and an upsert that restates the row
-    // verbatim still costs a replay frame for every subscriber.
-    if ((model === undefined ? row.model === undefined : row.model === model) && (usage === undefined ? row.usage === undefined : sameUsage(row.usage, usage))) return;
-    if (removedMessageId !== undefined) {
-      const { usage: _usage, model: _model, ...withoutAttribution } = row;
-      // Upserts deliberately preserve attribution omitted by ordinary tool
-      // updates. Remove first so an intentional clear is not merged away.
-      coalescer.push(parentId, [
-        { kind: "remove", itemId: row.id },
-        { kind: "upsert", item: {
-          ...withoutAttribution,
-          ...(model === undefined ? {} : { model }),
-          ...(usage === undefined ? {} : { usage }),
-        } },
-      ]);
+    this.decorateLauncherRows(parentId, conversationId, coalescer);
+    // A subagent's spend is listed beneath every conversation above it: its
+    // own rows carry it one level up, and each ancestor's row for the branch
+    // lists it as a line. Nothing is added into an ancestor's figure — the
+    // lines sum to the total on their own — so going up is only a refresh.
+    await this.refreshAncestors(parentId, coalescer);
+  }
+
+  /**
+   * Re-decorate the rows of every conversation above `sessionId`: the lines
+   * a row lists beneath it include everything its subagent's branch spent, so
+   * a change anywhere below has to reach each ancestor that is on screen.
+   */
+  private async refreshAncestors(sessionId: string, coalescer: ProviderUpdateCoalescer): Promise<void> {
+    const seen = new Set<string>([sessionId]);
+    let lower = sessionId;
+    for (;;) {
+      let upper: string | null;
+      try {
+        upper = await this.parentOf(lower);
+      } catch {
+        return;
+      }
+      if (!upper || seen.has(upper)) return;
+      seen.add(upper);
+      this.decorateLauncherRows(upper, lower, coalescer);
+      lower = upper;
+    }
+  }
+
+  /**
+   * A subagent's own launchers, seen live: what becomes the lines beneath the
+   * row that launched the subagent. Only a session that has a parent is
+   * tracked — a top-level conversation's launchers are its own rows.
+   */
+  private async trackLaunchers(conversationId: string, updates: readonly NormalizedProviderUpdate[], coalescer: ProviderUpdateCoalescer): Promise<void> {
+    const rows = updates.flatMap(update => update.kind === "upsert" && update.item.type === "tool" && update.item.childConversationId ? [update.item] : []);
+    // A launcher that is removed takes its line with it. OpenCode's part
+    // removal names the part, not the row made from it, so both spellings of
+    // the id are read as the row's. Without this the record never forgets: the
+    // line and its cost stay on every ancestor, and — the tally being marked
+    // squared — a reopen keeps them too.
+    const removed = new Set(updates.flatMap(update => update.kind === "remove" ? [update.itemId.replace(/^part:/, "tool:")] : []));
+    // The child's own prompts, with their text: what tells a task's prompt
+    // from a compaction request or a "continue" OpenCode put there itself.
+    const prompted = updates.flatMap(update => update.kind === "upsert" && update.item.type === "user_message" ? [{ id: update.item.id.replace(/^message:/, ""), text: update.item.text }] : []);
+    if (rows.length === 0 && removed.size === 0 && prompted.length === 0) return;
+    let parentId: string | null;
+    try {
+      parentId = await this.parentOf(conversationId);
+    } catch {
       return;
     }
-    coalescer.push(parentId, [{ kind: "upsert", item: {
-      ...row,
-      ...(model === undefined ? {} : { model }),
-      ...(usage === undefined ? {} : { usage }),
-    } }]);
+    if (!parentId) return;
+    const key = attributionKey(parentId, conversationId);
+    const transcript = this.childTranscripts.get(key) ?? { prompts: [], launchers: [] };
+    const launchers = transcript.launchers.filter(launcher => !removed.has(launcher.id));
+    let changed = launchers.length !== transcript.launchers.length;
+    const prompts = [...transcript.prompts];
+    for (const prompt of prompted) {
+      const known = prompts.findIndex(candidate => candidate.id === prompt.id);
+      if (known < 0) prompts.push(prompt);
+      // A restatement of the message arrives with no parts, and so no text:
+      // it must not blank a text already heard.
+      else if (prompts[known]!.text === prompt.text || (prompt.text === "" && prompts[known]!.text !== undefined)) continue;
+      else prompts[known] = prompt;
+      changed = true;
+    }
+    // Not yet squared against the store: a read may be in flight, or still to
+    // come, holding the launcher this removal names — even when no record of
+    // it exists here yet. Remember the removal so that read cannot bank it.
+    if (removed.size > 0 && !this.completeAttributions.has(key)) {
+      const tombstones = this.removedLaunchers.get(key) ?? new Set<string>();
+      for (const id of removed) tombstones.add(id);
+      this.bankAttribution(this.removedLaunchers, key, tombstones);
+    }
+    for (const row of rows) this.removedLaunchers.get(key)?.delete(row.id);
+    for (const row of rows) {
+      const known = launchers.findIndex(launcher => launcher.id === row.id);
+      // The prompt being answered when the launcher first appeared is the
+      // newest one known; later restatements of the row do not move it.
+      const next = launcherOf(row, known >= 0 ? launchers[known]!.promptIndex : Math.max(0, prompts.length - 1), known >= 0 ? launchers[known] : undefined);
+      if (known < 0) launchers.push(next);
+      else if (sameLauncher(launchers[known]!, next)) continue;
+      else launchers[known] = next;
+      changed = true;
+    }
+    if (!changed) return;
+    this.bankAttribution(this.childTranscripts, key, { prompts, launchers });
+    this.decorateLauncherRows(parentId, conversationId, coalescer);
+    await this.refreshAncestors(parentId, coalescer);
+  }
+
+  private stampArrival(key: string, id: string): void {
+    const arrivals = this.attributionArrivals.get(key) ?? new Map<string, number>();
+    arrivals.set(id, ++this.attributionSequence);
+    this.bankAttribution(this.attributionArrivals, key, arrivals);
+  }
+
+  /**
+   * What each of the rows that launched `childId` should state: the k-th row
+   * the spend of the k-th task the child was given, and beneath it the lines
+   * of every subagent launched while answering that task, at any depth.
+   */
+  private rowAttributions(parentId: string, childId: string, rows: readonly TaskRow[]): RowAttribution[] {
+    const key = attributionKey(parentId, childId);
+    const folds = foldByTask(rows, this.childTranscripts.get(key)?.prompts, this.childUsage.get(key), this.childModels.get(key), this.childPrompts.get(key));
+    const beneath = new Map<string, SubagentLine[]>();
+    for (const line of this.descendantLines(parentId, childId, rows, new Set([parentId, childId]))) {
+      beneath.set(line.parentId, [...(beneath.get(line.parentId) ?? []), line]);
+    }
+    const branch = (id: string): SubagentLine[] => (beneath.get(id) ?? []).flatMap(line => [line, ...branch(line.id)]);
+    return folds.map((fold, index) => {
+      const descendants = branch(rows[index]!.id);
+      return { ...fold, ...(descendants.length > 0 ? { descendants } : {}) };
+    });
+  }
+
+  /**
+   * The lines beneath the rows that launched `sessionId`: one per task the
+   * session gave a subagent of its own, stating that task's own spend, then
+   * the same one level further down. A nested launcher hangs off the row of
+   * the task during which it was launched — the prompt it follows, paired the
+   * way the spend is. `ancestry` stops a loop in the data.
+   */
+  private descendantLines(parentId: string, sessionId: string, rows: readonly TaskRow[], ancestry: ReadonlySet<string>): SubagentLine[] {
+    const transcript = this.childTranscripts.get(attributionKey(parentId, sessionId));
+    const launchers = transcript?.launchers ?? [];
+    if (launchers.length === 0 || rows.length === 0) return [];
+    const pairing = pairPrompts(rows, transcript?.prompts ?? []);
+    const byChild = new Map<string, Launcher[]>();
+    for (const launcher of launchers) {
+      if (ancestry.has(launcher.conversationId)) continue;
+      byChild.set(launcher.conversationId, [...(byChild.get(launcher.conversationId) ?? []), launcher]);
+    }
+    const lines: SubagentLine[] = [];
+    for (const [childId, own] of byChild) {
+      const key = attributionKey(sessionId, childId);
+      const tasks: TaskRow[] = own.map(launcher => ({ id: launcher.id, ...(launcher.prompt === undefined ? {} : { prompt: launcher.prompt }) }));
+      const folds = foldByTask(tasks, this.childTranscripts.get(key)?.prompts, this.childUsage.get(key), this.childModels.get(key), this.childPrompts.get(key));
+      own.forEach((launcher, index) => lines.push({
+        id: launcher.id,
+        parentId: rows[Math.min(pairing[launcher.promptIndex] ?? launcher.promptIndex, rows.length - 1)]!.id,
+        description: launcher.description,
+        ...(launcher.subagent === undefined ? {} : { subagent: launcher.subagent }),
+        conversationId: childId,
+        ...folds[index],
+      }));
+      lines.push(...this.descendantLines(sessionId, childId, tasks, new Set([...ancestry, childId])));
+    }
+    return lines;
+  }
+
+  /**
+   * Put the banked tally onto the rows that launched the child, if the parent
+   * is projected — the rows live in its timeline, and an unprojected parent
+   * has no row on screen to carry a figure. The scan walks the projection
+   * unordered and sorts only the child's own rows: this runs per child event,
+   * and OpenCode restates a message's tokens many times a turn, so sorting the
+   * whole parent timeline each time (what `items()` does) would make a chatty
+   * subagent cost the parent's length per chunk.
+   */
+  private decorateLauncherRows(parentId: string, conversationId: string, coalescer: ProviderUpdateCoalescer): void {
+    const parent = this.projections.get(parentId);
+    if (!parent) return;
+    for (const updates of this.launcherRowUpdates(parentId, conversationId, parent)) coalescer.push(parentId, updates);
+  }
+
+  /** The same, applied to a projection directly — for rows a flush has only just materialized. */
+  private settleLauncherRows(parentId: string, conversationId: string, parent: ConversationProjection): void {
+    for (const updates of this.launcherRowUpdates(parentId, conversationId, parent)) for (const update of updates) parent.apply(update);
+  }
+
+  private launcherRowUpdates(parentId: string, conversationId: string, parent: ConversationProjection): NormalizedProviderUpdate[][] {
+    const rows = launcherRows(parent.filter(item => item.type === "tool" && item.childConversationId === conversationId));
+    if (rows.length === 0) return [];
+    const attributions = this.rowAttributions(parentId, conversationId, rows.map(taskRow));
+    return rows.flatMap((row, index) => {
+      const attribution = attributions[index]!;
+      // Nothing new to say: most restatements change nothing until the turn's
+      // token counts actually move, and an upsert that restates the row
+      // verbatim still costs a replay frame for every subscriber.
+      if (sameAttribution(row, attribution)) return [];
+      const { usage: _usage, model: _model, descendants: _descendants, ...withoutAttribution } = row;
+      const item = { ...withoutAttribution, ...attribution };
+      // Upserts deliberately preserve attribution omitted by ordinary tool
+      // updates, so attribution that is no longer there — a removed or
+      // reverted message, a line that left — has to be put on as a
+      // replacement: remove first, or the intentional clear is merged away.
+      return [withdraws(row, attribution) ? [{ kind: "remove" as const, itemId: row.id }, { kind: "upsert" as const, item }] : [{ kind: "upsert" as const, item }]];
+    });
   }
 
   projectionForTests(id: string): ConversationProjection {
@@ -1687,6 +2305,10 @@ export class ChatAdapter {
   private async pump(signal: AbortSignal): Promise<void> {
     const coalescer = new ProviderUpdateCoalescer({
       windowMs: this.coalesceWindowMs,
+      // The window folds repeated upserts the way the projection applies
+      // them, so a sparse frame landing right behind a full one cannot
+      // strip what the full one carried (a 2.x tool call's input).
+      mergeUpsert: mergeInteraction,
       onFlush: (conversationId, updates) => {
         // Not gated on the abort signal: a graceful stop still applies
         // whatever the coalescer buffered in its final window.
@@ -1698,20 +2320,14 @@ export class ChatAdapter {
         // figures. The row exists now — settle any banked attribution onto
         // task rows this flush just materialized, or a child that never
         // speaks again leaves its row bare until the parent is reopened.
+        // Every row of that child is settled, not only the new one: a further
+        // task's row changes which messages the earlier rows answer for.
+        const settled = new Set<string>();
         for (const update of updates) {
           if (update.kind !== "upsert" || update.item.type !== "tool" || !update.item.childConversationId) continue;
-          const key = attributionKey(conversationId, update.item.childConversationId);
-          const model = latestModel(this.childModels.get(key));
-          const usage = sumUsage(this.childUsage.get(key));
-          if (model === undefined && usage === undefined) continue;
-          const row = projection.find(item => item.id === update.item.id);
-          if (!row || row.type !== "tool") continue;
-          if ((model === undefined || row.model === model) && (usage === undefined || sameUsage(row.usage, usage))) continue;
-          projection.apply({ kind: "upsert", item: {
-            ...row,
-            ...(model === undefined ? {} : { model }),
-            ...(usage === undefined ? {} : { usage }),
-          } });
+          if (settled.has(update.item.childConversationId)) continue;
+          settled.add(update.item.childConversationId);
+          this.settleLauncherRows(conversationId, update.item.childConversationId, projection);
         }
       },
     });
@@ -1719,9 +2335,14 @@ export class ChatAdapter {
     try {
       for await (const normalized of this.provider.events(signal)) {
         if (signal.aborted) break;
+        if (normalized.catalogsChanged) {
+          this.catalogSequence += 1;
+          this.inventory.invalidate();
+        }
         if (normalized.outcome === "unrecognized" || normalized.outcome === "unparseable") {
           this.countDiscard(normalized.outcome, normalized.eventType);
         }
+        for (const blockType of normalized.skippedBlocks ?? []) this.countSkippedBlock(blockType);
         if (normalized.sessionLifecycle) {
           await this.applySessionLifecycle(normalized.sessionLifecycle);
           if (signal.aborted) break;
@@ -1735,7 +2356,7 @@ export class ChatAdapter {
         // reasoning parts emits. Attribution must see those; only an event
         // carrying nothing at all is skipped.
         if (normalized.updates.length === 0 && normalized.assistantUsage === undefined && normalized.assistantModel === undefined
-          && normalized.removedMessageId === undefined && normalized.configuration === undefined && normalized.revertLifecycle === undefined) continue;
+          && normalized.removedMessageId === undefined && normalized.configuration === undefined && normalized.revertLifecycle === undefined && !normalized.notificationTurns?.length) continue;
         // Confinement is checked per event as it arrives, never at flush time:
         // a session that moves out of the workspace must stop publishing from
         // that moment, and events received while it was confined stay valid.
@@ -1751,6 +2372,7 @@ export class ChatAdapter {
           this.scheduleRevertReconciliation(normalized.conversationId, normalized.revertLifecycle);
           continue;
         }
+        await this.observeNotifications(normalized);
         if (normalized.configuration) {
           const current = await this.configuration(normalized.conversationId);
           const configuration = { ...current, ...normalized.configuration };
@@ -1784,6 +2406,9 @@ export class ChatAdapter {
         // subagent's model and token spend live in its own session, which the
         // parent's client never sees.
         await this.attributeSubagent(normalized.conversationId, normalized.assistantUsage, normalized.assistantModel, normalized.removedMessageId, coalescer);
+        // And for the subagents a subagent launches itself: they are rows in
+        // ITS timeline, so the conversation above it learns of them here.
+        await this.trackLaunchers(normalized.conversationId, normalized.updates, coalescer);
       }
     } finally {
       coalescer.dispose();
@@ -1826,9 +2451,12 @@ export class ChatAdapter {
         status: "pending" as const,
         // The recovered card must show what the live one would have —
         // this path exists for the reader who missed that event.
+        ...(request.alwaysPatterns === undefined ? {} : { alwaysPatterns: request.alwaysPatterns }),
         ...(request.diff === undefined ? {} : { diff: request.diff }),
         ...(request.plan === undefined ? {} : { plan: request.plan }),
         ...(request.choices === undefined ? {} : { choices: request.choices }),
+        ...(request.sourceToolId === undefined ? {} : { sourceToolId: request.sourceToolId }),
+        ...(request.mcp === undefined ? {} : { mcp: request.mcp }),
       });
     }
     return items;
@@ -1836,6 +2464,61 @@ export class ChatAdapter {
 
   /** The provider's live background tasks for this conversation, as running rows. */
   /** Null when the provider cannot list: unknown, not empty. */
+  /**
+   * Put each subagent's banked tally onto the row that launched it, reading
+   * a child's store first where the tally is not yet squared against it.
+   * Used for a history page and for the items a reversible-history
+   * replacement puts in a projection's place — raw rows from the provider,
+   * which carry no attribution of their own.
+   */
+  private async attributeLaunchers(id: string, items: ConversationItem[], complete?: readonly ConversationItem[]): Promise<void> {
+    const unattributed = [...new Set(items.flatMap(item =>
+      item.type === "tool" && item.childConversationId && !this.completeAttributions.has(attributionKey(id, item.childConversationId))
+        ? [item.childConversationId]
+        : []))];
+    await Promise.all(unattributed.map(childId => this.reconstructAttribution(id, childId)));
+    // A row's figure depends on its place among ALL the rows that launched
+    // the same child — the k-th row states the k-th task. A page holds only
+    // some of them, so the order is taken from the complete transcript where
+    // the provider exposes it, and from the page alone only where it does not.
+    const rowsByChild = new Map<string, TaskRow[]>();
+    for (const row of launcherRows([...(complete ?? items)])) {
+      rowsByChild.set(row.childConversationId, [...(rowsByChild.get(row.childConversationId) ?? []), taskRow(row)]);
+    }
+    const attributions = new Map<string, RowAttribution>();
+    for (const [childId, rows] of rowsByChild) {
+      this.rowAttributions(id, childId, rows).forEach((attribution, index) => attributions.set(rows[index]!.id, attribution));
+    }
+    for (let index = 0; index < items.length; index += 1) {
+      const item = items[index]!;
+      if (item.type !== "tool") continue;
+      const attribution = attributions.get(item.id);
+      if (!attribution || Object.keys(attribution).length === 0) continue;
+      items[index] = { ...item, ...attribution };
+    }
+  }
+
+  private async liveScheduledWakeups(id: string): Promise<ConversationItem[]> {
+    if (!this.provider.listScheduledWakeups) return [];
+    try {
+      return (await this.provider.listScheduledWakeups())
+        .filter(wakeup => wakeup.conversationId === id)
+        .map(wakeup => ({
+          id: `wakeup:${wakeup.wakeupId}`,
+          type: "scheduled_wakeup" as const,
+          createdAt: wakeup.createdAt,
+          wakeupId: wakeup.wakeupId,
+          prompt: wakeup.prompt,
+          recurring: wakeup.recurring,
+          schedule: wakeup.schedule,
+          ...(wakeup.nextFireAt === undefined ? {} : { nextFireAt: wakeup.nextFireAt }),
+          status: "pending" as const,
+        }));
+    } catch {
+      return [];
+    }
+  }
+
   private async liveBackgroundTasks(id: string): Promise<ConversationItem[] | null> {
     if (!this.provider.listBackgroundTasks) return null;
     try {
@@ -1850,6 +2533,11 @@ export class ChatAdapter {
           ...(task.taskType === undefined ? {} : { taskType: task.taskType }),
           ...(task.toolUseId === undefined ? {} : { toolUseId: task.toolUseId }),
           status: "running" as const,
+          ...(task.subagentType === undefined ? {} : { subagentType: task.subagentType }),
+          ...(task.prompt === undefined ? {} : { prompt: task.prompt }),
+          ...(task.usage === undefined ? {} : { usage: task.usage }),
+          ...(task.outputFile === undefined ? {} : { outputFile: task.outputFile }),
+          ...(task.childConversationId === undefined ? {} : { childConversationId: task.childConversationId }),
         }));
     } catch {
       return null;
@@ -1941,6 +2629,7 @@ export class ChatAdapter {
         if (live.size > 0) this.publishedQuestions.set(conversationId, live);
         else this.publishedQuestions.delete(conversationId);
         if (updates.length > 0) {
+          await this.observeNotifications({ conversationId, updates, outcome: "handled", eventType: "questions.refreshed" });
           coalescer.push(conversationId, updates);
           // This fallback is the only path that discovers a subagent's
           // question at all (no asked event exists), and the pump's mirror
@@ -1957,12 +2646,77 @@ export class ChatAdapter {
     })();
   }
 
+  /**
+   * Resolves a request exactly as it was announced — same owner, same
+   * launching conversation — from the record kept at announcement, so a
+   * removal reported by the parent, or by a reconciliation that retires the
+   * card, needs no provider lookup. False when nothing was announced under
+   * this id: there is then nothing pending to resolve.
+   */
+  private resolveAnnounced(itemId: string): boolean {
+    const match = /^(question|permission):(.+)$/.exec(itemId);
+    const known = match ? this.announced.get(itemId) : undefined;
+    if (!match || !known) return false;
+    this.announced.delete(itemId);
+    this.notifications.observe({
+      type: "interaction", origin: "live", conversationId: known.destination,
+      sourceId: JSON.stringify([known.owner, match[2]]),
+      kind: match[1] === "question" ? "question-pending" : "permission-pending",
+      pending: false, createdAt: Date.now(),
+    });
+    return true;
+  }
+
+  private async observeNotifications(event: NormalizedProviderEvent): Promise<void> {
+    if (!event.conversationId) return;
+    if (!event.notificationTurns?.length && !event.updates.some(update =>
+      update.kind === "upsert" && (update.item.type === "question" || update.item.type === "permission")
+      || update.kind === "remove" && /^(question|permission):/.test(update.itemId))) return;
+    const session = await this.requireSession(event.conversationId);
+    for (const turn of event.notificationTurns ?? []) {
+      this.notifications.observe({ ...turn, origin: "live", type: "turn", conversationId: session.id, child: Boolean(session.parentId) });
+    }
+    // Child requests appear in their launching conversation. Use the owning
+    // session in the source key so mirroring never creates a second alert.
+    let destination = session;
+    const visited = new Set([session.id]);
+    while (destination.parentId && !visited.has(destination.parentId)) {
+      visited.add(destination.parentId);
+      destination = await this.requireSession(destination.parentId);
+    }
+    for (const update of event.updates) {
+      if (update.kind === "upsert" && (update.item.type === "question" || update.item.type === "permission")) {
+        const item = update.item;
+        const owner = item.conversationId ?? session.id;
+        if (item.status !== "pending" && this.resolveAnnounced(item.id)) continue;
+        if (item.status === "pending") this.announced.set(item.id, { owner, destination: destination.id, tick: ++this.interactionClock });
+        this.notifications.observe({
+          type: "interaction", origin: "live", conversationId: destination.id,
+          sourceId: JSON.stringify([owner, item.requestId]),
+          kind: item.type === "question" ? "question-pending" : "permission-pending",
+          pending: item.status === "pending", createdAt: item.createdAt,
+        });
+      } else if (update.kind === "remove") {
+        const match = /^(question|permission):(.+)$/.exec(update.itemId);
+        if (!match || this.resolveAnnounced(update.itemId)) continue;
+        // Never announced here — nothing is pending under it, but a resolution
+        // after a lost pending frame must still reach the hub.
+        this.notifications.observe({
+          type: "interaction", origin: "live", conversationId: destination.id,
+          sourceId: JSON.stringify([session.id, match[2]]),
+          kind: match[1] === "question" ? "question-pending" : "permission-pending",
+          pending: false, createdAt: Date.now(),
+        });
+      }
+    }
+  }
+
   private async requireSession(id: string): Promise<ProviderSession> {
     // A provider failure propagates as itself: the pump treats not-found as
     // "skip this frame" but must restart on transport errors, and the API
     // routes should answer 500, not 404, when the provider is unreachable.
     const session = await this.provider.getSession(id);
-    if (!session || !await isSessionInWorkspace(session.directory, this.workspacePath)) throw new ConversationNotFoundError();
+    if (!session || !await this.isInWorkspace(session)) throw new ConversationNotFoundError();
     return session;
   }
 
@@ -1973,7 +2727,7 @@ export class ChatAdapter {
     const parentId = session.parentId ?? null;
     boundedSet(this.sessionParents, session.id, parentId, INVENTORY_SESSION_LIMIT);
     return {
-      inWorkspace: await isSessionInWorkspace(session.directory, this.workspacePath),
+      inWorkspace: await this.isInWorkspace(session),
       parentId,
       title: session.title,
       deleted,
@@ -1990,11 +2744,32 @@ export class ChatAdapter {
   }
 
   private async applySessionLifecycle(lifecycle: NormalizedSessionLifecycle): Promise<void> {
-    if (lifecycle.kind === "deleted") this.cancelRevertReconciliation(lifecycle.id);
-    const next = await this.classifyInventorySession(lifecycle, lifecycle.kind === "deleted");
+    if (lifecycle.kind === "deleted") {
+      this.cancelRevertReconciliation(lifecycle.id);
+      this.forgetActivity(lifecycle.id);
+    }
+    // A sparse update names only what changed (2.x's rename: id and title).
+    // Parentage it does not mention is unchanged, not cleared: a child
+    // renamed mid-turn must keep mirroring its requests to its parent. A
+    // read that fails leaves the cached answer, which is what it would have
+    // been cleared to.
+    // A deleted session cannot be read, so a sparse deletion takes the
+    // cached parent and nothing else.
+    const parentId = lifecycle.sparse
+      ? lifecycle.kind === "deleted"
+        ? this.sessionParents.get(lifecycle.id) ?? null
+        : await this.parentOf(lifecycle.id).catch(() => this.sessionParents.get(lifecycle.id) ?? null)
+      : lifecycle.parentId ?? null;
+    // Classification forgets the activity of a session outside the workspace.
+    const next = await this.classifyInventorySession({ ...lifecycle, parentId: parentId ?? undefined }, lifecycle.kind === "deleted");
     if (!next.inWorkspace) this.cancelRevertReconciliation(lifecycle.id);
     const previous = this.inventorySessions.get(lifecycle.id);
-    const eventDescribesVisibleSession = next.inWorkspace && next.parentId === null;
+    // A sparse event's directory is the workspace by assumption, not by the
+    // wire (2.x's deletion carries none), so it vouches for nothing unseen:
+    // only a session this adapter listed can have left the list.
+    const eventDescribesVisibleSession = lifecycle.sparse
+      ? this.listedSessions.has(lifecycle.id)
+      : next.inWorkspace && next.parentId === null;
     const relevantDeletion = lifecycle.kind === "deleted"
       && previous?.deleted !== true
       && (inventoryVisible(previous) || eventDescribesVisibleSession);
@@ -2034,10 +2809,19 @@ export class ChatAdapter {
       // but the conversation accepts a prompt. Retrying and compacting are.
       if (isLiveConversationStatus(status)) this.liveTurns.add(id);
       else this.liveTurns.delete(id);
+      // Background work still counts as working for the workspace summary,
+      // through its own set so the composer rules above stay untouched.
+      if (status === "background") this.backgroundWork.add(id);
+      else this.backgroundWork.delete(id);
       // A turn that ended on its own releases the next held message. Only
       // these two: an interruption leaves the queue dormant by decision, and
       // a failure must not restart a failing conversation by itself.
       if (status === "idle" || status === "completed") this.scheduleDelivery(id);
+      this.activityMayHaveChanged();
+    }, {
+      pending: itemId => this.trackInteraction(id, itemId, true),
+      settled: itemId => this.trackInteraction(id, itemId, false),
+      cleared: () => this.forgetInteractions(id),
     });
     this.projections.set(id, projection);
     for (const [candidateId, candidate] of this.projections) {
@@ -2053,6 +2837,9 @@ export class ChatAdapter {
       }
       forgetAttributions(this.childUsage, candidateId);
       forgetAttributions(this.childModels, candidateId);
+      forgetAttributions(this.childPrompts, candidateId);
+      forgetAttributions(this.childTranscripts, candidateId);
+      forgetAttributions(this.removedLaunchers, candidateId);
       forgetAttributions(this.removedChildAttribution, candidateId);
       forgetAttributions(this.completeAttributions, candidateId);
     }
@@ -2073,12 +2860,13 @@ function isQuestionToolUpdate(update: NormalizedProviderUpdate): boolean {
   return update.kind === "upsert" && update.item.type === "tool" && update.item.name.toLowerCase() === "question";
 }
 
-export function parseSlashCommand(text: string, commands: ChatCommand[]): { name: string; arguments: string } | undefined {
+export function parseSlashCommand(text: string, commands: ChatCommand[]): { name: string; arguments: string; command: ChatCommand } | undefined {
   if (!text.startsWith("/") || text.startsWith("//")) return undefined;
   const match = /^\/([^\s/]+)(?:\s+([\s\S]*))?$/.exec(text);
   if (!match || REVERSIBLE_HISTORY_COMMANDS.some(command => command.name === match[1])) return undefined;
-  if (!commands.some(command => command.name === match[1] && command.kind !== "local-operation")) return undefined;
-  return { name: match[1]!, arguments: match[2]?.trim() ?? "" };
+  const command = commands.find(candidate => candidate.name === match[1] && candidate.kind !== "local-operation");
+  if (!command) return undefined;
+  return { name: match[1]!, arguments: match[2]?.trim() ?? "", command };
 }
 
 const REVERSIBLE_HISTORY_COMMANDS: ChatCommand[] = [
@@ -2121,6 +2909,14 @@ function sameConversationItems(left: ConversationItem[], right: ConversationItem
   return JSON.stringify(left) === JSON.stringify(right);
 }
 
+// How a projection reports its interaction requests (permissions, questions)
+// becoming pending or settling, and its timeline being rebuilt wholesale.
+export type ProjectionInteractionHooks = {
+  pending(itemId: string): void;
+  settled(itemId: string): void;
+  cleared(): void;
+};
+
 export class ConversationProjection {
   status: ConversationStatus = "idle";
   private readonly timeline = new Map<string, ConversationItem>();
@@ -2131,6 +2927,9 @@ export class ConversationProjection {
     // Every status change flows through statusUpdate, so this single hook is
     // how the adapter keeps its eviction-proof live-turn set accurate.
     private readonly onStatus?: (status: ConversationStatus) => void,
+    // Every interaction request's lifecycle, so the adapter can keep an
+    // eviction-proof record of what awaits the user.
+    private readonly interactions?: ProjectionInteractionHooks,
   ) {}
 
   has(itemId: string): boolean {
@@ -2147,9 +2946,21 @@ export class ConversationProjection {
     return undefined;
   }
 
+  /** Every matching item, unordered — `items()` sorts the whole timeline, which a per-event caller cannot afford. */
+  filter(predicate: (item: ConversationItem) => boolean): ConversationItem[] {
+    const found: ConversationItem[] = [];
+    for (const item of this.timeline.values()) if (predicate(item)) found.push(item);
+    return found;
+  }
+
   seed(items: ConversationItem[]): void {
     for (const item of items) {
-      this.timeline.set(item.id, mergeInteraction(this.timeline.get(item.id), item));
+      const merged = mergeInteraction(this.timeline.get(item.id), item);
+      this.timeline.set(item.id, merged);
+      if (merged.type === "permission" || merged.type === "question") {
+        if (merged.status === "pending") this.interactions?.pending(merged.id);
+        else this.interactions?.settled(merged.id);
+      }
       if (item.type === "assistant_message") this.text.seed(item.id.replace(/^part:/, ""), item.markdown);
       else if (item.type === "reasoning") this.text.seed(item.id.replace(/^part:|^reasoning:/, ""), item.text);
     }
@@ -2158,6 +2969,7 @@ export class ConversationProjection {
   replace(items: ConversationItem[]): ChatEvent {
     this.timeline.clear();
     this.text.clear();
+    this.interactions?.cleared();
     this.seed(items);
     return this.replay.publish({ type: "resync", reason: "conversation-rewritten" });
   }
@@ -2166,6 +2978,7 @@ export class ConversationProjection {
     if (update.kind === "upsert") return this.upsert(update.item);
     if (update.kind === "remove") {
       this.timeline.delete(update.itemId);
+      this.interactions?.settled(update.itemId);
       // A removed item's stream is over: its reconciler text goes with it,
       // or a long conversation would keep every replaced streaming block.
       this.text.forget(update.itemId);
@@ -2216,6 +3029,10 @@ export class ConversationProjection {
   upsert(item: ConversationItem): ChatEvent | undefined {
     const current = this.timeline.get(item.id);
     const merged = mergeInteraction(current, item);
+    // A settled request clears the adapter's record even when the frame is
+    // dropped below for lack of content: that record outlives eviction, and a
+    // recreated projection may see nothing of the request but its resolution.
+    if ((merged.type === "permission" || merged.type === "question") && merged.status !== "pending") this.interactions?.settled(merged.id);
     // A resolution for a question this projection never saw (asked frame
     // missed, projection evicted) has no question content to render, and an
     // empty questions array fails client validation — publishing it would
@@ -2229,6 +3046,7 @@ export class ConversationProjection {
     // accepts empty resources exactly when a plan is present.
     if (merged.type === "permission" && merged.resources.length === 0 && merged.plan === undefined) return undefined;
     this.timeline.set(item.id, merged);
+    if ((merged.type === "permission" || merged.type === "question") && merged.status === "pending") this.interactions?.pending(merged.id);
     if (merged.type === "assistant_message") this.text.seed(merged.id.replace(/^part:/, ""), merged.markdown);
     if (merged.type === "reasoning") this.text.seed(merged.id.replace(/^part:|^reasoning:/, ""), merged.text);
     return this.replay.publish({ type: "item.upsert", item: merged });
@@ -2295,6 +3113,162 @@ const MAX_CHILD_ATTRIBUTIONS = 512;
 // NUL: a session id cannot contain one, so the two halves stay unambiguous.
 const ATTRIBUTION_SEPARATOR = "\u0000";
 
+/** Whether any figure in `next` is below the same figure in `previous`. */
+/** A subagent launched by a subagent: a row in the launching subagent's own timeline. */
+type Launcher = { id: string; description: string; subagent?: string; conversationId: string; promptIndex: number; prompt?: string };
+// A user message in a child session. `text` is what decides whether it is a
+// task's prompt: undefined when never seen, empty for a message that carries
+// none (OpenCode's compaction request, or its synthetic "continue").
+type Prompt = { id: string; text?: string };
+// A row (or nested launcher) that gave a subagent a task, with the prompt it gave.
+type TaskRow = { id: string; prompt?: string };
+type ChildTranscript = { prompts: Prompt[]; launchers: Launcher[] };
+type RowAttribution = { model?: string; usage?: TokenUsage; descendants?: SubagentLine[] };
+type LauncherRow = ToolItem & { childConversationId: string };
+
+/** The rows that launched subagents, oldest first — the order their tasks were given in. */
+function launcherRows(items: ConversationItem[]): LauncherRow[] {
+  return items
+    .filter((item): item is LauncherRow => item.type === "tool" && item.childConversationId !== undefined)
+    .sort((left, right) => left.createdAt - right.createdAt || (left.id < right.id ? -1 : left.id > right.id ? 1 : 0));
+}
+
+/** The prompt a task row gave its subagent, where the row still carries its input. */
+function taskPrompt(row: ToolItem): string | undefined {
+  const detail = describeToolDetail(row);
+  return detail.kind === "agent" && detail.prompt !== "" ? detail.prompt : undefined;
+}
+
+function taskRow(row: ToolItem): TaskRow {
+  const prompt = taskPrompt(row);
+  return { id: row.id, ...(prompt === undefined ? {} : { prompt }) };
+}
+
+function launcherOf(row: ToolItem & { childConversationId?: string }, promptIndex: number, known?: Launcher): Launcher {
+  const detail = describeToolDetail(row);
+  // A restatement that has lost its input says nothing new about the task.
+  const description = detail.kind === "agent" ? detail.description : known?.description ?? row.name;
+  const subagent = detail.kind === "agent" ? detail.subagent : known?.subagent;
+  const prompt = taskPrompt(row) ?? known?.prompt;
+  return { id: row.id, description, ...(subagent === undefined ? {} : { subagent }), conversationId: row.childConversationId!, promptIndex, ...(prompt === undefined ? {} : { prompt }) };
+}
+
+function sameLauncher(left: Launcher, right: Launcher): boolean {
+  return left.description === right.description && left.subagent === right.subagent && left.conversationId === right.conversationId && left.promptIndex === right.promptIndex && left.prompt === right.prompt;
+}
+
+/** A child's prompts in order and the subagents it launched, each under the prompt it followed. */
+function readChildTranscript(items: readonly ConversationItem[], ancestry: ReadonlySet<string>): ChildTranscript {
+  const prompts: Prompt[] = [];
+  const launchers: Launcher[] = [];
+  for (const item of items) {
+    if (item.type === "user_message") prompts.push({ id: item.id.replace(/^message:/, ""), text: item.text });
+    else if (item.type === "tool" && item.childConversationId && !ancestry.has(item.childConversationId)) {
+      launchers.push(launcherOf(item, Math.max(0, prompts.length - 1)));
+    }
+  }
+  return { prompts, launchers };
+}
+
+/**
+ * Which task row each of a child's prompts belongs to. A subagent's session
+ * holds more user messages than the tasks it was given: OpenCode adds a
+ * compaction request and a synthetic "continue" every time a long-running
+ * subagent summarises itself, and someone can type into it. Pairing by
+ * position alone would hand everything after the first such message to the
+ * NEXT task — a compaction during task one billed to task two.
+ *
+ * So a prompt opens the next task row only when it IS that task's prompt: its
+ * text is the prompt the row gave. The first task alone may also arrive
+ * behind a preamble — its prompt ending with the row's on lines of its own —
+ * because OpenCode 2.x opens the prompt that creates a child session with
+ * "You are a subagent spawned by another session."; a task given to an
+ * existing child arrives bare, so later rows match exactly and a message
+ * typed into the child cannot open one early. Any other prompt belongs to
+ * the task before it. A prompt whose text was never seen is taken to be a task's — the
+ * position it would have had. Where nothing can be compared (an agent that
+ * reports no texts, rows that have lost their input) or nothing matched at
+ * all, pairing falls back to position, which is right whenever the counts agree.
+ */
+function pairPrompts(rows: readonly TaskRow[], prompts: readonly Prompt[]): number[] {
+  const positional = prompts.map((_, index) => Math.min(index, rows.length - 1));
+  if (!rows.some(row => row.prompt !== undefined) || !prompts.some(prompt => prompt.text !== undefined)) return positional;
+  let row = -1;
+  const paired = prompts.map(prompt => {
+    const next = rows[row + 1];
+    const opens = next !== undefined && (prompt.text === undefined
+      || (next.prompt === undefined ? prompt.text !== "" : deliversPrompt(prompt.text, next.prompt, row < 0)));
+    if (opens) row += 1;
+    return Math.max(row, 0);
+  });
+  return row < 0 ? positional : paired;
+}
+
+/** Whether a child's prompt is the task prompt a row gave — after a preamble only where one may precede it. */
+function deliversPrompt(delivered: string, given: string, preambled: boolean): boolean {
+  const text = delivered.trim();
+  const prompt = given.trim();
+  return prompt !== "" && (text === prompt || (preambled && text.endsWith(`\n${prompt}`)));
+}
+
+/**
+ * A child's tally, split over the rows that launched it. A subagent handed a
+ * further task is one session and several rows: a message belongs to the row
+ * its prompt is paired with (`pairPrompts`). Messages that name no prompt
+ * belong to the first row (an agent that reports none has one row per child).
+ * Every message is counted on exactly one row, so the rows always sum to the
+ * session.
+ */
+function foldByTask(
+  rows: readonly TaskRow[],
+  prompts: readonly Prompt[] | undefined,
+  usage: Map<string, TokenUsage> | undefined,
+  models: Map<string, MessageModel> | undefined,
+  answered: Map<string, string> | undefined,
+): Array<{ model?: string; usage?: TokenUsage }> {
+  if (rows.length === 0) return [];
+  // Prompts only heard of through a reply are newer than every known one.
+  const order = [...(prompts ?? [])];
+  if (answered) for (const promptId of answered.values()) if (!order.some(prompt => prompt.id === promptId)) order.push({ id: promptId });
+  const pairing = pairPrompts(rows, order);
+  const rowOfPrompt = new Map(order.map((prompt, index) => [prompt.id, pairing[index]!]));
+  const rowOf = (messageId: string): number => {
+    const promptId = answered?.get(messageId);
+    return promptId === undefined ? 0 : rowOfPrompt.get(promptId) ?? 0;
+  };
+  const usageByRow = rows.map(() => new Map<string, TokenUsage>());
+  const modelsByRow = rows.map(() => new Map<string, MessageModel>());
+  if (usage) for (const [messageId, value] of usage) usageByRow[rowOf(messageId)]!.set(messageId, value);
+  if (models) for (const [messageId, value] of models) modelsByRow[rowOf(messageId)]!.set(messageId, value);
+  return usageByRow.map((byMessage, index) => {
+    const total = sumUsage(byMessage);
+    const model = latestModel(modelsByRow[index]);
+    return { ...(model === undefined ? {} : { model }), ...(total === undefined ? {} : { usage: total }) };
+  });
+}
+
+function sameLines(left: readonly SubagentLine[] | undefined, right: readonly SubagentLine[] | undefined): boolean {
+  if (left === undefined || right === undefined) return left === right;
+  return left.length === right.length && left.every((line, index) => {
+    const other = right[index]!;
+    return line.id === other.id && line.parentId === other.parentId && line.description === other.description && line.subagent === other.subagent
+      && line.conversationId === other.conversationId && line.model === other.model && sameUsage(line.usage, other.usage);
+  });
+}
+
+function sameAttribution(row: ToolItem, attribution: RowAttribution): boolean {
+  return row.model === attribution.model && sameUsage(row.usage, attribution.usage) && sameLines(row.descendants, attribution.descendants);
+}
+
+/** Whether the row states something the attribution no longer does — which an upsert's merge would keep. */
+function withdraws(row: ToolItem, attribution: RowAttribution): boolean {
+  if (row.model !== undefined && attribution.model === undefined) return true;
+  if (row.descendants !== undefined && attribution.descendants === undefined) return true;
+  if (row.usage === undefined) return false;
+  if (attribution.usage === undefined) return true;
+  return Object.keys(row.usage).some(component => attribution.usage![component as keyof TokenUsage] === undefined);
+}
+
 function attributionKey(parentId: string, childId: string): string {
   return `${parentId}${ATTRIBUTION_SEPARATOR}${childId}`;
 }
@@ -2317,6 +3291,7 @@ function sumUsage(byMessage: Map<string, TokenUsage> | undefined): TokenUsage | 
       const value = usage[key];
       if (value !== undefined) total[key] = (total[key] ?? 0) + value;
     }
+    if (usage.costUsd !== undefined) total.costUsd = (total.costUsd ?? 0) + usage.costUsd;
   }
   return Object.keys(total).length > 0 ? total : undefined;
 }
@@ -2362,6 +3337,10 @@ function mergeInteraction(current: ConversationItem | undefined, incoming: Conve
       ...incoming,
       action: incoming.action === "permission" ? current.action : incoming.action,
       resources: incoming.resources.length ? incoming.resources : current.resources,
+      // Same sparse rule: a second announcement without the agent's
+      // always-patterns (the v2 `save` is optional, a reply carries none)
+      // says nothing about them, and must not blank the ones already known.
+      ...(incoming.alwaysPatterns?.length ? {} : current.alwaysPatterns !== undefined ? { alwaysPatterns: current.alwaysPatterns } : {}),
       ...(reopened ? { status: "resolved" as const, outcome: current.outcome } : {}),
     };
   }
@@ -2404,6 +3383,7 @@ function mergeInteraction(current: ConversationItem | undefined, incoming: Conve
       childConversationId: incoming.childConversationId ?? current.childConversationId,
       model: incoming.model ?? current.model,
       ...(current.usage || incoming.usage ? { usage: { ...current.usage, ...incoming.usage } } : {}),
+      ...(incoming.descendants ?? current.descendants ? { descendants: incoming.descendants ?? current.descendants } : {}),
     };
   }
   if (current.type === "command" && incoming.type === "command") {

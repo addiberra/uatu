@@ -2,6 +2,7 @@ import type { APIRequestContext, Page } from "@playwright/test";
 
 import type { ConversationItem } from "../../src/chat/types";
 import { chooseChatModel, installClipboardMock, openChatConfiguration, openChatPanel, readClipboardMock } from "./chat-helpers";
+import { captureScreenshot } from "./evidence";
 import { expect, test } from "./fixtures";
 
 async function bootChat(page: Page, request: APIRequestContext): Promise<void> {
@@ -199,22 +200,356 @@ test.describe("desktop OpenCode chat", () => {
     await expect(page.locator("#chat-items")).toContainText("/review API routes");
   });
 
+  test("labels skills in the palette and follows /reload with fresh catalogs", async ({ page, request }, testInfo) => {
+    const reload = { name: "reload", description: "Reload OpenCode's configuration for this workspace", argumentHint: "", kind: "command" };
+    await control(request, { action: "commands", commands: [reload] });
+    const seeded = await control(request, { action: "seed", title: "Reload", items: [] }) as { conversation: { id: string } };
+    await page.reload();
+    await openChatPanel(page);
+    const input = page.locator("#chat-input");
+    const menu = page.locator("#chat-command-menu");
+    // A skill carries its label; a command does not.
+    await input.fill("/");
+    await expect(menu.getByRole("option", { name: /openspec-archive-change/ }).locator(".chat-command-kind")).toHaveText("skill");
+    await expect(menu.getByRole("option", { name: /\/review/ }).locator(".chat-command-kind")).toHaveCount(0);
+    await input.fill("/openspec");
+    await captureScreenshot(page, testInfo, "slash-command-skill-label");
+
+    // The configuration changes behind the page; /reload brings it in
+    // without a page reload.
+    await control(request, { action: "commands", commands: [reload, { name: "fresh-skill", description: "Added after the page loaded", argumentHint: "", kind: "skill" }] });
+    await control(request, { action: "modes", modes: [{ name: "build", description: "Full read-write mode" }, { name: "plan", description: "Read-only planning mode" }, { name: "audit", description: "Added by the reload" }] });
+    // Arguments do not stop it being a reload; the completed turn re-reads
+    // the catalogs before the palette is opened again.
+    await input.fill("/reload now");
+    await page.keyboard.press("Escape");
+    await page.locator("#chat-send").click();
+    await expect(page.locator("#chat-items")).toContainText("/reload now");
+    const reread = page.waitForResponse(response => response.url().includes("/chat/commands"));
+    await control(request, { action: "status", conversationId: seeded.conversation.id, status: "completed" });
+    await reread;
+    await input.fill("/fresh");
+    await expect(menu.getByRole("option", { name: /fresh-skill/ })).toBeVisible();
+    await expect(menu.getByRole("option", { name: /fresh-skill/ }).locator(".chat-command-kind")).toHaveText("skill");
+    await page.keyboard.press("Escape");
+    await input.fill("");
+    await openChatConfiguration(page);
+    await expect(page.locator("#chat-configuration-mode")).toContainText(/audit/i);
+  });
+
+  test("a /reload queued behind a running turn re-reads the catalogs when it completes, not when that turn does", async ({ page, request }) => {
+    const reload = { name: "reload", description: "Reload OpenCode's configuration for this workspace", argumentHint: "", kind: "command" };
+    await control(request, { action: "commands", commands: [reload] });
+    await page.reload();
+    await openChatPanel(page);
+    await page.getByRole("button", { name: "New conversation" }).click();
+    await expect(page.locator("#chat-conversation-select")).not.toHaveValue("");
+    const conversationId = await page.locator("#chat-conversation-select").inputValue();
+    const input = page.locator("#chat-input");
+    const send = async (text: string) => {
+      await input.fill(text);
+      // A slash text opens the palette, whose Enter would choose rather than send.
+      if (await page.locator("#chat-command-menu").isVisible()) await page.keyboard.press("Escape");
+      const accepted = page.waitForResponse(response => response.url().endsWith("/prompts"));
+      await input.press("Enter");
+      await accepted;
+    };
+    await send("Start the work");
+    await expect(page.locator("#chat-send")).toHaveAttribute("aria-label", "Cancel response");
+    await send("/reload");
+    await expect(page.locator("#chat-queue .is-held")).toHaveCount(1);
+    // The running turn ends; the held /reload is delivered and starts.
+    await control(request, { action: "status", conversationId, status: "completed" });
+    await expect(page.locator("#chat-queue .is-held")).toHaveCount(0);
+    // Only the reload's own completion re-reads the catalogs.
+    const reread = page.waitForResponse(response => response.url().includes("/chat/commands"), { timeout: 5_000 });
+    await control(request, { action: "status", conversationId, status: "completed" });
+    await reread;
+  });
+
+  test("two /reloads queued in one conversation each count their own completion", async ({ page, request }) => {
+    const reload = { name: "reload", description: "Reload OpenCode's configuration for this workspace", argumentHint: "", kind: "command" };
+    await control(request, { action: "commands", commands: [reload] });
+    await page.reload();
+    await openChatPanel(page);
+    await page.getByRole("button", { name: "New conversation" }).click();
+    await expect(page.locator("#chat-conversation-select")).not.toHaveValue("");
+    const conversationId = await page.locator("#chat-conversation-select").inputValue();
+    const input = page.locator("#chat-input");
+    const send = async (text: string) => {
+      await input.fill(text);
+      if (await page.locator("#chat-command-menu").isVisible()) await page.keyboard.press("Escape");
+      const accepted = page.waitForResponse(response => response.url().endsWith("/prompts"));
+      await input.press("Enter");
+      await accepted;
+    };
+    await send("Start the work");
+    await expect(page.locator("#chat-send")).toHaveAttribute("aria-label", "Cancel response");
+    await send("/reload");
+    await send("/reload");
+    await expect(page.locator("#chat-queue .is-held")).toHaveCount(2);
+    // The running turn ends; the first reload is delivered, the second waits.
+    await control(request, { action: "status", conversationId, status: "completed" });
+    await expect(page.locator("#chat-queue .is-held")).toHaveCount(1);
+    // The first reload's own completion re-reads, though the second is still queued.
+    const reread = page.waitForResponse(response => response.url().includes("/chat/commands"), { timeout: 5_000 });
+    await control(request, { action: "status", conversationId, status: "completed" });
+    await reread;
+  });
+
+  test("the first / after sending a slash command starts a fresh catalog read", async ({ page }) => {
+    await page.getByRole("button", { name: "New conversation" }).click();
+    await expect(page.locator("#chat-conversation-select")).not.toHaveValue("");
+    const input = page.locator("#chat-input");
+    await input.fill("/review");
+    await expect(page.locator("#chat-command-menu")).toBeVisible();
+    await page.keyboard.press("Escape");
+    const accepted = page.waitForResponse(response => response.url().endsWith("/prompts"));
+    await input.press("Enter");
+    await accepted;
+    await expect(input).toHaveValue("");
+    // Sending cleared the composer mid-query; the next / is a new query.
+    const read = page.waitForRequest(request => request.url().includes("/chat/commands"), { timeout: 5_000 });
+    await input.pressSequentially("/");
+    await read;
+  });
+
+  test("a page left open picks up catalogs changed elsewhere when the palette or picker opens", async ({ page, request }) => {
+    await page.getByRole("button", { name: "New conversation" }).click();
+    const input = page.locator("#chat-input");
+    const menu = page.locator("#chat-command-menu");
+    await input.fill("/");
+    await expect(menu.getByRole("option", { name: /openspec-archive-change/ })).toBeVisible();
+    await page.keyboard.press("Escape");
+    await input.fill("");
+    // Another client's /reload changed the configuration; this page has no
+    // idle poll once the agent is ready.
+    await control(request, { action: "commands", commands: [{ name: "late-skill", description: "Loaded after this page", argumentHint: "", kind: "skill" }] });
+    await control(request, { action: "modes", modes: [{ name: "build", description: "Full read-write mode" }, { name: "plan", description: "Read-only planning mode" }, { name: "audit", description: "Loaded after this page" }] });
+    await input.fill("/late");
+    await expect(menu.getByRole("option", { name: /late-skill/ })).toBeVisible();
+    await page.keyboard.press("Escape");
+    await input.fill("");
+    await openChatConfiguration(page);
+    await expect(page.locator("#chat-configuration-mode")).toContainText(/audit/i);
+  });
+
+  test("wraps long slash-command descriptions in full and keeps the highlight in view", async ({ page, request }, testInfo) => {
+    const long = (topic: string) => `${topic}: ${"Review the diff for correctness bugs, reuse, simplification, and efficiency cleanups at the chosen effort level, then report ranked findings. ".repeat(3)}End of ${topic}.`;
+    await control(request, { action: "commands", commands: Array.from({ length: 6 }, (_, index) => ({
+      name: `code-lint-${index}`, description: long(`lint ${index}`), argumentHint: "[path/to/a/rather/long/argument/hint/that/also/wraps]", kind: "skill",
+    })) });
+    await page.reload();
+    await openChatPanel(page);
+    await page.getByRole("button", { name: "New conversation" }).click();
+    const input = page.locator("#chat-input");
+    await input.fill("/code-lint");
+    const menu = page.locator("#chat-command-menu");
+    await expect(menu.getByRole("option")).toHaveCount(6);
+    const measured = await menu.evaluate(element => ({
+      horizontal: element.scrollWidth - element.clientWidth,
+      descriptions: [...element.querySelectorAll<HTMLElement>(".chat-command-description")].map(description => ({
+        text: description.textContent,
+        // Line height is "normal" here; two font sizes is well past one line.
+        multiline: description.getBoundingClientRect().height > 2 * parseFloat(getComputedStyle(description).fontSize),
+        clipped: description.scrollHeight > description.clientHeight + 1 || description.scrollWidth > description.clientWidth + 1,
+        ellipsis: getComputedStyle(description).textOverflow,
+        whiteSpace: getComputedStyle(description).whiteSpace,
+      })),
+    }));
+    expect(measured.horizontal).toBeLessThanOrEqual(1);
+    for (const [index, description] of measured.descriptions.entries()) {
+      // Every suggestion, highlighted or not, shows its whole description.
+      expect(description.text).toContain(`End of lint ${index}.`);
+      expect(description.multiline).toBe(true);
+      expect(description.clipped).toBe(false);
+      expect(description.ellipsis).not.toBe("ellipsis");
+      expect(description.whiteSpace).not.toBe("nowrap");
+    }
+    await captureScreenshot(page, testInfo, "slash-command-descriptions-wrap");
+
+    // The highlight walks down through tall options and stays inside the menu.
+    const inView = () => menu.evaluate(element => {
+      const active = element.querySelector<HTMLElement>(".chat-command-option.is-active")!;
+      const bounds = element.getBoundingClientRect();
+      const option = active.getBoundingClientRect();
+      return { name: active.querySelector(".chat-command-name")!.textContent, visible: option.top >= bounds.top - 1 && option.bottom <= bounds.bottom + 1 };
+    });
+    for (let step = 1; step < 6; step++) {
+      await page.keyboard.press("ArrowDown");
+      await expect.poll(inView).toEqual({ name: `/code-lint-${step}`, visible: true });
+    }
+    for (let step = 4; step >= 0; step--) {
+      await page.keyboard.press("ArrowUp");
+      await expect.poll(inView).toEqual({ name: `/code-lint-${step}`, visible: true });
+    }
+  });
+
+  test("dates the conversation with sticky day separators", async ({ page, request }, testInfo) => {
+    // Local instants in the page's zone: two days ago, yesterday, and today.
+    const days = await page.evaluate(() => {
+      const today = new Date();
+      const at = (offset: number, hour: number) => new Date(today.getFullYear(), today.getMonth(), today.getDate() - offset, hour, 0).getTime();
+      const older = new Date(at(2, 9));
+      const iso = `${older.getFullYear()}-${String(older.getMonth() + 1).padStart(2, "0")}-${String(older.getDate()).padStart(2, "0")}`;
+      return { older: at(2, 9), yesterday: at(1, 9), today: at(0, 0) + 60_000, olderLabel: `${older.toLocaleDateString([], { weekday: "short" })} ${iso}` };
+    });
+    // Prompts alternate with full-width replies, so there is transcript text
+    // beside a pinned label as well as under it.
+    const run = (prefix: string, start: number, count: number): ConversationItem[] => Array.from({ length: count }, (_, index) => {
+      const text = `${prefix} message ${index} ${"content ".repeat(14)}`;
+      return index % 2
+        ? { id: `message:${prefix}-${index}`, type: "assistant_message", createdAt: start + index * 60_000, markdown: text }
+        : { id: `message:${prefix}-${index}`, type: "user_message", createdAt: start + index * 60_000, text };
+    });
+    const seeded = await control(request, { action: "seed", title: "Dated", items: [...run("older", days.older, 3), ...run("yesterday", days.yesterday, 24), ...run("today", days.today, 3)] }) as { conversation: { id: string } };
+    await page.reload();
+    await openChatPanel(page);
+    await expect(page.locator("#chat-conversation-select")).toHaveValue(seeded.conversation.id);
+    const separators = page.locator("#chat-items > .chat-day-separator");
+    await expect(separators).toHaveText([days.olderLabel, "Yesterday", "Today"]);
+    const order = await page.locator("#chat-items > *").evaluateAll(nodes => nodes.map(node => node.classList.contains("chat-day-separator") ? `day:${node.textContent}` : node.getAttribute("data-chat-item-id")));
+    expect(order.indexOf("day:Yesterday")).toBe(order.indexOf("message:yesterday-0") - 1);
+    expect(order.indexOf("day:Today")).toBe(order.indexOf("message:today-0") - 1);
+    await expect(separators.nth(1)).toHaveAttribute("role", "separator");
+    await expect(separators.nth(1)).not.toHaveAttribute("data-chat-item-id", /.*/);
+
+    // Scroll back into the middle of yesterday: its separator stays pinned at the top.
+    const timeline = page.locator("#chat-timeline");
+    await page.locator('[data-chat-item-id="message:yesterday-14"]').evaluate(element => element.scrollIntoView({ block: "center" }));
+    // The labels a reader sees at the top of the transcript. Every day already
+    // passed is pinned there too, but only the latest one's label is shown.
+    const pinnedLabels = async () => timeline.evaluate(element => {
+      const top = element.getBoundingClientRect().top;
+      return [...element.querySelectorAll<HTMLElement>(".chat-day-separator time")].filter(label => {
+        const bounds = label.getBoundingClientRect();
+        return bounds.top >= top - 1 && bounds.top <= top + 60 && getComputedStyle(label).visibility === "visible";
+      }).map(label => label.textContent);
+    });
+    await expect.poll(pinnedLabels).toEqual(["Yesterday"]);
+    await expect(separators.first()).toHaveAttribute("data-superseded", "");
+
+    // Only the label covers the transcript: beside it, the text scrolled under
+    // the pinned row is what a tap or a selection reaches.
+    // Scrolled and measured in one task, and retried, so a settling scroll
+    // cannot move the reply between the two.
+    const beside = () => separators.nth(1).evaluate(separator => {
+      const timeline = separator.closest<HTMLElement>("#chat-timeline")!;
+      const replyNode = document.querySelector<HTMLElement>('[data-chat-item-id="message:yesterday-15"]')!;
+      timeline.scrollTop += replyNode.getBoundingClientRect().top - timeline.getBoundingClientRect().top - 4;
+      const label = separator.querySelector("time")!.getBoundingClientRect();
+      const row = separator.getBoundingClientRect();
+      const reply = replyNode.getBoundingClientRect();
+      const y = label.top + label.height / 2;
+      const hit = (x: number) => {
+        const element = document.elementFromPoint(x, y);
+        return { separator: !!element?.closest(".chat-day-separator"), item: element?.closest<HTMLElement>("[data-chat-item-id]")?.dataset.chatItemId ?? null };
+      };
+      return {
+        background: getComputedStyle(separator).backgroundColor,
+        pointerEvents: getComputedStyle(separator).pointerEvents,
+        underRow: reply.top < y && reply.bottom > y && row.top <= y && row.bottom >= y,
+        left: hit(Math.max(row.left, reply.left) + 12),
+        right: hit(Math.min(row.right, reply.right) - 12),
+        label: hit(label.left + label.width / 2).separator,
+      };
+    });
+    await expect.poll(beside).toEqual({
+      background: "rgba(0, 0, 0, 0)",
+      pointerEvents: "none",
+      underRow: true,
+      left: { separator: false, item: "message:yesterday-15" },
+      right: { separator: false, item: "message:yesterday-15" },
+      label: true,
+    });
+    await captureScreenshot(page, testInfo, "chat-day-separator-sticky");
+
+    // Two days' separators near the top at once: yesterday's arriving under the
+    // older day's pinned label. Only one label shows, never one behind another.
+    await timeline.evaluate(element => {
+      element.scrollTop = 0;
+      const arriving = element.querySelectorAll<HTMLElement>(".chat-day-separator")[1]!;
+      element.scrollTop += arriving.getBoundingClientRect().top - element.getBoundingClientRect().top - 8;
+    });
+    const nearTop = () => timeline.evaluate(element => {
+      const top = element.getBoundingClientRect().top;
+      const labels = [...element.querySelectorAll<HTMLElement>(".chat-day-separator time")].map(label => ({ label, bounds: label.getBoundingClientRect() }));
+      return {
+        near: labels.filter(({ bounds }) => bounds.top <= top + 60).length,
+        visible: labels.filter(({ label, bounds }) => bounds.top <= top + 60 && getComputedStyle(label).visibility === "visible").map(({ label }) => label.textContent),
+      };
+    });
+    await expect.poll(nearTop).toEqual({ near: 2, visible: ["Yesterday"] });
+    // Past yesterday's first message, the older day's separator takes over.
+    await timeline.evaluate(element => { element.scrollTop = 0; });
+    await expect.poll(pinnedLabels).toEqual([days.olderLabel]);
+    await expect(separators.first()).not.toHaveAttribute("data-superseded", /.*/);
+
+    // An unstuck separator paints only its own box: it never reaches over
+    // the end of the previous day's last row.
+    await timeline.evaluate(element => { element.scrollTop = element.scrollHeight; });
+    const unstuck = await page.locator('#chat-items > .chat-day-separator[data-chat-day]').evaluateAll(nodes => nodes.map(node => {
+      const previous = node.previousElementSibling?.getBoundingClientRect();
+      return { gap: previous ? node.getBoundingClientRect().top - previous.bottom : 0, shadow: getComputedStyle(node).boxShadow };
+    }));
+    for (const separator of unstuck) {
+      expect(separator.gap).toBeGreaterThanOrEqual(0);
+      expect(separator.shadow).toBe("none");
+    }
+
+    // Whatever is scrolled to lands below the pinned row, not under its label.
+    const clearOfBand = (id: string) => page.evaluate(target => {
+      const timeline = document.querySelector<HTMLElement>("#chat-timeline")!;
+      const top = timeline.getBoundingClientRect().top;
+      const bands = [...timeline.querySelectorAll<HTMLElement>(".chat-day-separator")].map(node => node.getBoundingClientRect()).filter(bounds => bounds.top <= top + 1 && bounds.bottom > top);
+      const bandBottom = Math.max(top, ...bands.map(bounds => bounds.bottom));
+      return document.querySelector(`[data-chat-item-id="${target}"]`)!.getBoundingClientRect().top - bandBottom;
+    }, id);
+    // A prompt jump from the rail.
+    await timeline.evaluate(element => { element.scrollTop = 0; });
+    await page.locator('#chat-prompt-rail [data-prompt-target="message:yesterday-16"]').click();
+    await expect.poll(() => clearOfBand("message:yesterday-16")).toBeGreaterThanOrEqual(0);
+    await expect.poll(() => clearOfBand("message:yesterday-16")).toBeLessThan(40);
+
+    // ⌘F: a match whose line sits under the pinned row is revealed below it,
+    // and the separators' own labels are not matches.
+    await page.locator('[data-chat-item-id="message:yesterday-20"]').evaluate(element => {
+      const timeline = element.closest<HTMLElement>("#chat-timeline")!;
+      timeline.scrollTop += element.getBoundingClientRect().top - timeline.getBoundingClientRect().top - 4;
+    });
+    expect(await clearOfBand("message:yesterday-20")).toBeLessThan(0);
+    await timeline.click({ position: { x: 5, y: 200 } });
+    await page.keyboard.press("ControlOrMeta+f");
+    await page.locator("#find-query").fill("yesterday message 20 ");
+    await expect(page.locator("#find-status")).toHaveText("1 of 1");
+    await expect.poll(() => clearOfBand("message:yesterday-20")).toBeGreaterThanOrEqual(-1);
+    await page.locator("#find-query").fill("Yesterday");
+    // 24 message texts say "yesterday"; the separator does not add a 25th.
+    await expect(page.locator("#find-status")).toHaveText(/ of 24$/);
+    await page.locator("#find-query").fill("Today");
+    await expect(page.locator("#find-status")).toHaveText(/ of 3$/);
+  });
+
   test("keeps an active turn timer across conversation navigation", async ({ page }) => {
     await page.getByRole("button", { name: "New conversation" }).click();
     await expect(page.locator("#chat-conversation-select")).not.toHaveValue("");
     const firstId = await page.locator("#chat-conversation-select").inputValue();
     await page.locator("#chat-input").fill("Keep timing this turn");
     await page.locator("#chat-input").press("Enter");
-    await expect(page.locator("#chat-composer-status")).toHaveAttribute("aria-label", "Working");
-    await page.waitForTimeout(1_100);
-    const before = elapsedSeconds(await page.locator("#chat-composer-status").getAttribute("title"));
-    expect(before).toBeGreaterThanOrEqual(1);
+    const status = page.locator("#chat-composer-status");
+    await expect(status).toHaveAttribute("aria-label", "Working");
+    const elapsed = async () => elapsedSeconds(await status.getAttribute("title"));
+    await expect.poll(elapsed).toBeGreaterThanOrEqual(1);
+    const before = await elapsed();
 
     await page.getByRole("button", { name: "New conversation" }).click();
     await expect(page.locator("#chat-conversation-select")).not.toHaveValue(firstId);
     await page.locator("#chat-conversation-select").selectOption(firstId);
-    await expect(page.locator("#chat-composer-status")).toHaveAttribute("aria-label", "Working");
-    expect(elapsedSeconds(await page.locator("#chat-composer-status").getAttribute("title"))).toBeGreaterThanOrEqual(before);
+    await expect(status).toHaveAttribute("aria-label", "Working");
+    // One read once the timer shows at all: polling would let a timer that
+    // restarted from zero count back up past `before` and pass.
+    await expect(status).toHaveAttribute("title", /\d+s/);
+    expect(await elapsed()).toBeGreaterThanOrEqual(before);
   });
 
   test("streams Markdown, exposes code copy on completion, and updates one tool entry in place", async ({ page, request }) => {
@@ -246,8 +581,10 @@ test.describe("desktop OpenCode chat", () => {
     await installClipboardMock(page);
     const beforeCopy = await assistantNode.boundingBox();
     await assistantNode.locator("[data-chat-copy='code']").click();
-    expect(await readClipboardMock(page)).toBe("const value = 1;\n");
+    // The copied state is set once the clipboard write has resolved, and it
+    // clears again after a moment: assert it first, then read the clipboard.
     await expect(assistantNode.locator("[data-chat-copy='code']")).toHaveAttribute("data-state", "copied");
+    expect(await readClipboardMock(page)).toBe("const value = 1;\n");
     const afterCopy = await assistantNode.boundingBox();
     expect(afterCopy?.width).toBeCloseTo(beforeCopy?.width ?? 0, 1);
     expect(afterCopy?.height).toBeCloseTo(beforeCopy?.height ?? 0, 1);
@@ -296,14 +633,16 @@ test.describe("desktop OpenCode chat", () => {
     page.on("request", request => {
       if (new URL(request.url()).pathname.endsWith(`/questions/${question.requestId}`)) replies += 1;
     });
+    // Choosing an option only arms Answer. Whether it also sent a reply is
+    // settled below: requests leave in order, so once Answer's own reply has
+    // answered, any reply the choice had sent was already counted.
     await questionCard.getByRole("radio", { name: "Minimal Small change" }).check();
     await expect(answer).toBeEnabled();
-    await page.waitForTimeout(100);
-    expect(replies).toBe(0);
 
     const response = page.waitForResponse(candidate => new URL(candidate.url()).pathname.endsWith(`/questions/${question.requestId}`));
     await answer.click();
     expect((await response).request().postDataJSON()).toMatchObject({ outcome: { kind: "answered", answers: [["Minimal"]] } });
+    expect(replies).toBe(1);
     await expect(questionCard).toContainText("Answered");
     await expect(answer).toHaveCount(0);
   });
@@ -503,11 +842,17 @@ test.describe("desktop OpenCode chat", () => {
 test("the chat backend starts only when the panel opens", async ({ page, request }) => {
   await request.post("/__e2e/reset");
   const token = await request.get("/__e2e/terminal-token").then(response => response.json()) as { token: string };
+  // Chat initializes once the workspace state has loaded and the URL
+  // credential has become the workspace cookie — the moment an eager
+  // bootstrap would call status.
+  const credentialPromoted = page.waitForResponse(response => new URL(response.url()).pathname.endsWith("/api/auth"));
   await page.goto(`/?t=${encodeURIComponent(token.token)}`);
   await expect(page.locator("#connection-state .connection-label")).toHaveText("Connected");
+  await (await credentialPromoted).finished();
+  // One rendered frame lets the page run what that promotion resolved.
+  await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => resolve(null))));
   // Booting with the panel collapsed must not touch chat status — in
   // production that call lazily launches the OpenCode server.
-  await page.waitForTimeout(250);
   expect(((await control(request, { action: "stats" })) as { statusCalls: number }).statusCalls).toBe(0);
   await openChatPanel(page);
   await expect(page.locator("#chat-state")).not.toContainText("Loading chat");
@@ -518,3 +863,86 @@ function elapsedSeconds(value: string | null): number {
   const match = /(?:·\s*)?(?:(\d+)m\s+)?(\d+)s/.exec(value ?? "");
   return match ? Number(match[1] ?? 0) * 60 + Number(match[2]) : -1;
 }
+
+test.describe("timeline reading position", () => {
+  test.beforeEach(async ({ page, request }) => bootChat(page, request));
+
+  const seedLong = async (page: Page, request: APIRequestContext): Promise<string> => {
+    const items: ConversationItem[] = Array.from({ length: 28 }, (_, index) => ({
+      id: `message:loaded-${index}`, type: "user_message", createdAt: index, text: `loaded message ${index} ${"content ".repeat(12)}`,
+    }));
+    const seeded = await control(request, { action: "seed", title: "Reading", items }) as { conversation: { id: string } };
+    await page.reload();
+    await openChatPanel(page);
+    await expect(page.locator("#chat-conversation-select")).toHaveValue(seeded.conversation.id);
+    await expect(page.locator("#chat-items")).toContainText("loaded message 27");
+    return seeded.conversation.id;
+  };
+
+  test("a small upward wheel scroll during streaming is not pulled back to the end", async ({ page, request }) => {
+    const id = await seedLong(page, request);
+    const timeline = page.locator("#chat-timeline");
+    await timeline.evaluate(el => { el.scrollTop = el.scrollHeight; });
+    await control(request, { action: "status", conversationId: id, status: "running" });
+    await control(request, { action: "item", conversationId: id, item: { id: "part:stream", type: "assistant_message", createdAt: 500, markdown: "Streaming" } });
+    await expect(page.locator("#chat-items")).toContainText("Streaming");
+    await timeline.evaluate(el => {
+      (window as any).__scrollTops = [] as number[];
+      el.addEventListener("scroll", () => (window as any).__scrollTops.push(el.scrollTop));
+    });
+    await timeline.hover();
+    // Trackpad-sized steps, each well inside the 48px near-end threshold,
+    // while the turn keeps rendering underneath them.
+    const streaming = (async () => {
+      for (let index = 0; index < 30; index++) {
+        await control(request, { action: "delta", conversationId: id, itemId: "part:stream", delta: ` word${index}` });
+        await page.waitForTimeout(40);
+      }
+    })();
+    for (let index = 0; index < 20; index++) {
+      await page.mouse.wheel(0, -12);
+      await page.waitForTimeout(30);
+    }
+    await streaming;
+    const tops = await page.evaluate(() => (window as any).__scrollTops as number[]);
+    const pulledBack = tops.filter((top, index) => index > 0 && top > tops[index - 1]! + 1);
+    expect(pulledBack).toEqual([]);
+    expect(await timeline.evaluate(el => el.scrollHeight - el.clientHeight - el.scrollTop)).toBeGreaterThan(150);
+    await expect(page.locator("#chat-latest")).toBeVisible();
+  });
+
+  test("sending a message returns the reader to the end", async ({ page, request }) => {
+    await seedLong(page, request);
+    const timeline = page.locator("#chat-timeline");
+    await timeline.evaluate(el => { el.scrollTop = el.scrollHeight - el.clientHeight - 150; el.dispatchEvent(new Event("scroll")); });
+    await page.locator("#chat-input").fill("hello there");
+    await page.locator("#chat-input").press("Enter");
+    await expect(page.locator("#chat-items")).toContainText("hello there");
+    await expect.poll(() => timeline.evaluate(el => el.scrollHeight - el.clientHeight - el.scrollTop)).toBeLessThan(2);
+    await expect(page.locator("#chat-latest")).toBeHidden();
+  });
+
+  test("a reading position saved just above the end survives a reload and the next update", async ({ page, request }) => {
+    const id = await seedLong(page, request);
+    const timeline = page.locator("#chat-timeline");
+    const distance = () => timeline.evaluate(el => el.scrollHeight - el.clientHeight - el.scrollTop);
+    // Leave by less than the near-end threshold, then let the position save.
+    await timeline.evaluate(el => { el.scrollTop = el.scrollHeight - el.clientHeight - 30; el.dispatchEvent(new Event("scroll")); });
+    await expect.poll(distance).toBeGreaterThan(20);
+    await expect.poll(() => page.evaluate(() =>
+      Object.entries(localStorage).some(([key, value]) => key.endsWith(":chat-presentation") && /"anchors":\{"[^"]+":\{/.test(String(value))),
+    )).toBe(true);
+    await page.reload();
+    await openChatPanel(page);
+    await expect(page.locator("#chat-items")).toContainText("loaded message 27");
+    // The restore lands where the reader left, and its own scroll echo must
+    // not read as the reader arriving near the end.
+    await expect.poll(distance).toBeGreaterThan(20);
+    const restored = await distance();
+    await control(request, { action: "status", conversationId: id, status: "running" });
+    await control(request, { action: "item", conversationId: id, item: { id: "part:after-reload", type: "assistant_message", createdAt: 500, markdown: "After reload " + "content ".repeat(40) } });
+    await expect(page.locator("#chat-latest")).toBeVisible();
+    // The update landed below the reader: the distance grew by its height.
+    await expect.poll(distance).toBeGreaterThan(restored + 20);
+  });
+});

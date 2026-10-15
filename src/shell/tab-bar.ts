@@ -13,7 +13,17 @@ import { isChatPanelOpen } from "../chat/surface";
 import { isHubAvailable, onHubAvailabilityChange } from "./hub-nav";
 import { DEFAULT_NAVIGATION_PLACEMENT, confirmNavigationHubScope, getNavigationPreferences, onNavigationPreferencesChange, setNavigationPreferences } from "./navigation-preferences";
 
-export type TabChangeListener = (tab: TouchTab, previous: TouchTab) => void;
+/** How a tab change wants keyboard focus treated. `holdFocus` marks the ARIA
+ *  tabs pattern's roving navigation — ArrowLeft/Right/Up/Down, Home and End
+ *  on a focused tab move focus to the target tab and select it as they go —
+ *  so keyboard focus belongs on the tab button, and a surface coming forward
+ *  MUST NOT pull it into itself (the terminal otherwise focuses its pane the
+ *  moment one attaches, and the next arrow key types into the shell). A tap,
+ *  a click, Enter/Space on a tab, and shortcuts are activations and leave it
+ *  unset: surfaces keep their usual focus behavior. */
+export type TabChangeOptions = { holdFocus?: boolean };
+
+export type TabChangeListener = (tab: TouchTab, previous: TouchTab, options: TabChangeOptions) => void;
 
 const listeners = new Set<TabChangeListener>();
 
@@ -73,14 +83,14 @@ function applyActiveTabToDom(): void {
   }
 }
 
-export function setActiveTab(tab: TouchTab): void {
+export function setActiveTab(tab: TouchTab, options: TabChangeOptions = {}): void {
   const previous = appState.activeTab;
   if (previous === tab) return;
   appState.activeTab = tab;
   writeActiveTabPreference(tab);
   applyActiveTabToDom();
   for (const listener of listeners) {
-    listener(tab, previous);
+    listener(tab, previous, options);
   }
 }
 
@@ -424,21 +434,26 @@ function initNavigationOverlay(bar: HTMLElement): void {
   place();
 }
 
-export function initTabBar(): void {
+/** Wires the touch tab bar. Returns a teardown that removes every listener
+ *  and forgets the bar, so a test that mounts one document does not leave
+ *  `tabBarBottomInset()` measuring a stale element for the rest of the
+ *  process. The app never calls it. */
+export function initTabBar(): () => void {
   barElement = document.getElementById("touch-tab-bar");
-  if (!barElement) return;
+  if (!barElement) return () => {};
   tabButtons = Array.from(barElement.querySelectorAll<HTMLButtonElement>("[data-tab]"));
   initNavigationOverlay(barElement);
+  const cleanups: (() => void)[] = [];
 
   for (const button of tabButtons) {
-    button.addEventListener("click", () => {
+    const onClick = () => {
       const tab = button.dataset.tab;
       if (tab === "files" || tab === "preview" || tab === "chat" || tab === "terminal") {
         setActiveTab(tab);
         resetIdle();
       }
-    });
-    button.addEventListener("keydown", event => {
+    };
+    const onKeydown = (event: KeyboardEvent) => {
       const enabled = tabButtons.filter(candidate => !candidate.disabled);
       const index = enabled.indexOf(button);
       let target: HTMLButtonElement | undefined;
@@ -448,8 +463,19 @@ export function initTabBar(): void {
       else if (event.key === "End") target = enabled.at(-1);
       if (!target) return;
       event.preventDefault();
+      // Roving navigation, not a click: focus moves to the target tab and
+      // stays there even when the surface it selects would focus itself.
       target.focus();
-      target.click();
+      const tab = target.dataset.tab;
+      if (tab === "files" || tab === "preview" || tab === "chat" || tab === "terminal") {
+        setActiveTab(tab, { holdFocus: true });
+      }
+    };
+    button.addEventListener("click", onClick);
+    button.addEventListener("keydown", onKeydown);
+    cleanups.push(() => {
+      button.removeEventListener("click", onClick);
+      button.removeEventListener("keydown", onKeydown);
     });
   }
 
@@ -462,10 +488,12 @@ export function initTabBar(): void {
     document.getElementById("ui-mode-toggle"),
     document.getElementById("rail-ui-mode-toggle"),
   ];
+  const onToggleClick = () => {
+    setUiMode(uiMode() === "touch" ? "desktop" : "touch");
+  };
   for (const toggle of modeToggles) {
-    toggle?.addEventListener("click", () => {
-      setUiMode(uiMode() === "touch" ? "desktop" : "touch");
-    });
+    toggle?.addEventListener("click", onToggleClick);
+    cleanups.push(() => toggle?.removeEventListener("click", onToggleClick));
   }
   const syncModeToggleLabels = () => {
     const label = uiMode() === "touch" ? "Switch to desktop layout" : "Switch to touch layout";
@@ -474,19 +502,25 @@ export function initTabBar(): void {
       toggle?.setAttribute("title", label);
     }
   };
-  onUiModeChange(syncModeToggleLabels);
+  cleanups.push(onUiModeChange(syncModeToggleLabels));
   // Mode-switch normalization, desktop→touch half: touch presents one
   // surface at a time, so entering it lands on Chat only when the user was
   // last working in an open Chat panel; otherwise Preview. The touch→desktop
   // half (Chat tab opens the panel) lives in chat/surface.ts.
-  onUiModeChange(mode => {
+  cleanups.push(onUiModeChange(mode => {
     if (mode === "touch") {
       setActiveTab(appState.activeSurface === "chat" && isChatPanelOpen() ? "chat" : "preview");
     }
-  });
+  }));
   syncModeToggleLabels();
 
   // appState.activeTab was restored from storage at state-module init;
   // stamp it so the first paint lands on the persisted surface.
   applyActiveTabToDom();
+
+  return () => {
+    for (const cleanup of cleanups.splice(0).reverse()) cleanup();
+    barElement = null;
+    tabButtons = [];
+  };
 }

@@ -1,10 +1,11 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
-import { renderDocument } from "./render-dispatch";
+import { documentErrorStatus, renderDocument } from "./render-dispatch";
 import { scanRoots } from "./roots";
+import { setGitMetricsSink } from "../document/git-data";
 
 const tempDirectories: string[] = [];
 
@@ -13,6 +14,23 @@ afterEach(async () => {
 });
 
 describe("renderDocument", () => {
+  test("source and rendered content do not start or await Git work", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "uatu-render-independent-"));
+    tempDirectories.push(directory);
+    const file = path.join(directory, "README.md");
+    await writeFile(file, "# Fresh bytes\n");
+    const roots = await scanRoots([{ kind: "dir", absolutePath: directory }]);
+    let commands = 0;
+    setGitMetricsSink({ inc: name => { if (name === "git.execs_total") commands++; } });
+    try {
+      for (const view of ["source", "rendered"] as const) {
+        const payload = await renderDocument(roots, file, { view });
+        expect(payload.html).toContain("Fresh bytes");
+        expect(payload.fileFacts).toMatchObject({ lines: 1, bytes: 14, gitState: "pending" });
+      }
+      expect(commands).toBe(0);
+    } finally { setGitMetricsSink(null); }
+  });
   test("renders a markdown document through the markdown pipeline", async () => {
     const tempDirectory = await mkdtemp(path.join(os.tmpdir(), "uatu-render-md-"));
     tempDirectories.push(tempDirectory);
@@ -205,5 +223,92 @@ describe("renderDocument", () => {
       expect(payload.fileFacts?.bytes).toBeGreaterThan(0);
       expect(Date.parse(payload.fileFacts?.mtime ?? "")).not.toBeNaN();
     }
+  });
+});
+
+describe("documentErrorStatus", () => {
+  async function scannedMarkdown(prefix: string) {
+    const tempDirectory = await mkdtemp(path.join(os.tmpdir(), prefix));
+    tempDirectories.push(tempDirectory);
+    const filePath = path.join(tempDirectory, "notes.md");
+    await writeFile(filePath, "# Notes\n");
+    const roots = await scanRoots([{ kind: "dir", absolutePath: tempDirectory }]);
+    return { filePath, roots };
+  }
+
+  async function statusOf(promise: Promise<unknown>): Promise<number> {
+    try {
+      await promise;
+    } catch (error) {
+      return documentErrorStatus(error);
+    }
+    throw new Error("expected renderDocument to reject");
+  }
+
+  test("an id the index does not hold is not found", async () => {
+    expect(await statusOf(renderDocument([], "/nope"))).toBe(404);
+  });
+
+  test("a file that vanished from disk after indexing is not found", async () => {
+    const { filePath, roots } = await scannedMarkdown("uatu-render-vanished-");
+    await rm(filePath);
+    expect(await statusOf(renderDocument(roots, filePath))).toBe(404);
+  });
+
+  test("a binary document is not viewable", async () => {
+    const tempDirectory = await mkdtemp(path.join(os.tmpdir(), "uatu-render-binary-status-"));
+    tempDirectories.push(tempDirectory);
+    const filePath = path.join(tempDirectory, "logo.png");
+    await writeFile(filePath, "not really png");
+    const roots = await scanRoots([{ kind: "dir", absolutePath: tempDirectory }]);
+    expect(await statusOf(renderDocument(roots, filePath))).toBe(415);
+  });
+
+  test("an indexed file replaced by a directory of the same name is not found", async () => {
+    const { filePath, roots } = await scannedMarkdown("uatu-render-eisdir-");
+    await rm(filePath);
+    await mkdir(filePath);
+    expect(await statusOf(renderDocument(roots, filePath))).toBe(404);
+  });
+
+  // chmod 0o000 cannot deny root a read, so as root this case would render
+  // the file and prove nothing.
+  test.skipIf(process.getuid?.() === 0)(
+    "a file that exists but cannot be read is forbidden, not missing and not a server failure (skipped as root: chmod cannot deny root a read)",
+    async () => {
+      const { filePath, roots } = await scannedMarkdown("uatu-render-unreadable-");
+      await chmod(filePath, 0o000);
+      try {
+        expect(await statusOf(renderDocument(roots, filePath))).toBe(403);
+      } finally {
+        await chmod(filePath, 0o644);
+      }
+    },
+  );
+
+  const errno = (code: string) => Object.assign(new Error(code), { code });
+
+  test.each([
+    ["ENOENT", 404],
+    ["ENOTDIR", 404],
+    ["EISDIR", 404],
+    ["ELOOP", 404],
+    ["ENAMETOOLONG", 404],
+    ["EACCES", 403],
+    ["EPERM", 403],
+    ["EMFILE", 500],
+    ["ENFILE", 500],
+    ["EAGAIN", 500],
+    ["EBUSY", 500],
+    ["EIO", 500],
+    ["EUNKNOWNCODE", 500],
+  ] as const)("a read failing with %s answers %d", (code, status) => {
+    expect(documentErrorStatus(errno(code))).toBe(status);
+  });
+
+  test("errors that say nothing about the document itself are server failures", () => {
+    expect(documentErrorStatus(new Error("asciidoctor exploded"))).toBe(500);
+    expect(documentErrorStatus("not an error")).toBe(500);
+    expect(documentErrorStatus(null)).toBe(500);
   });
 });

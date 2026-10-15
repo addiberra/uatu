@@ -6,15 +6,21 @@ Define workspace-scoped OpenCode conversations and the responsive web chat surfa
 ## Requirements
 
 ### Requirement: Chat uses the workspace's OpenCode installation and identity
-When an OpenCode conversation is first needed in a running workspace, UatuCode SHALL discover the `opencode` executable available to that workspace process and start a loopback-only OpenCode service whose lifetime is owned by the workspace server. Opening Chat, or conversing with another agent, MUST NOT by itself start the OpenCode service. The service SHALL use OpenCode's existing user configuration and authentication; UatuCode MUST NOT request, copy, persist, or transmit provider API keys. If OpenCode is unavailable, cannot start, or is not authenticated, the workspace, all non-chat capabilities, and conversations with other agents SHALL remain usable and the Chat surface SHALL report an actionable unavailable state attributed to OpenCode.
+When an OpenCode conversation is first needed in a running workspace, UatuCode SHALL discover the `opencode` executable available to that workspace process and start a loopback-only OpenCode service whose lifetime is owned by the workspace server. Opening Chat, or conversing with another agent, MUST NOT by itself start the OpenCode service. The service SHALL use OpenCode's existing user configuration and authentication. A workspace's chat MUST NOT request provider API keys or other provider credentials. UatuCode SHALL accept a provider credential only through the Hub's Agent accounts area, which hands it to OpenCode's own login interface; UatuCode MUST NOT copy, persist, log, or return it. If OpenCode is unavailable, cannot start, or is not authenticated, the workspace, all non-chat capabilities, and conversations with other agents SHALL remain usable and the Chat surface SHALL report an actionable unavailable state attributed to OpenCode.
 
 Startup SHALL be observed as two separately bounded phases, distinguished by whether OpenCode has answered at the protocol level rather than by any text it emits. Until a probe receives an HTTP response, the generous bind budget applies; from the first HTTP response onward, a shorter health budget applies. A startup that fails SHALL be attributed to the phase that failed: if no probe ever received an HTTP response, the failure SHALL report that OpenCode never accepted a health request at the probed endpoint; if any probe did, the failure SHALL report that OpenCode answered but never became healthy, naming the endpoint and the last status observed. A health probe SHALL be individually bounded so that a connection which is accepted but never answered does not consume the whole budget.
+
+Readiness SHALL be decided by either OpenCode generation's contract: a 1.x server is ready when its health resource answers with a well-formed health body that says it is healthy; a 2.x server is ready when its server-information resource answers with a well-formed body carrying its version. Each probe cycle SHALL ask both, and the first well-formed answer decides the generation for that server's lifetime. An answer that is not a well-formed body of either contract — in particular the page a 2.x server returns for any unknown path — MUST NOT be accepted as ready, whatever its status. The version reported for a ready server SHALL be the server's version alone, in the same form for both generations, so the generation is legible from it.
 
 UatuCode MUST NOT depend on the format of any text OpenCode writes to its standard output or standard error in order to determine readiness. Such output MAY be captured as diagnostic evidence, but a change to its format MUST NOT affect whether Chat becomes ready.
 
 #### Scenario: Existing OpenCode authentication is reused
 - **WHEN** the workspace user has already authenticated OpenCode and starts an OpenCode conversation
 - **THEN** UatuCode connects using that existing OpenCode identity without asking for a provider API key
+
+#### Scenario: Chat never asks for a key
+- **WHEN** an OpenCode conversation runs in a workspace with no provider logged in
+- **THEN** the chat directs the user to Agent accounts and offers no field for a provider key
 
 #### Scenario: OpenCode is not installed
 - **WHEN** the workspace cannot resolve an OpenCode executable
@@ -36,16 +42,29 @@ UatuCode MUST NOT depend on the format of any text OpenCode writes to its standa
 - **AND** the reported message distinguishes this from a health-check failure
 
 #### Scenario: OpenCode answers but never becomes healthy
-- **WHEN** a probe receives an HTTP response and no subsequent probe reports a healthy body before the health budget elapses
+- **WHEN** a probe receives an HTTP response and no subsequent probe reports a well-formed ready body of either generation before the health budget elapses
 - **THEN** Chat reports an unavailable state attributed to the health phase
 - **AND** the reported message identifies the probed endpoint and the last status observed
 
 #### Scenario: An answering-but-unhealthy server fails on the short budget
-- **WHEN** OpenCode answers the first probe immediately and then answers every probe with a non-healthy response
+- **WHEN** OpenCode answers the first probe immediately and then answers every probe with a non-ready response
 - **THEN** Chat reports unavailable after the health budget rather than after the full startup budget
 
+#### Scenario: A 1.x server is recognized
+- **WHEN** the spawned server answers the health resource with a healthy body carrying its version
+- **THEN** Chat becomes ready as a 1.x server and reports that version
+
+#### Scenario: A 2.x server is recognized
+- **WHEN** the spawned server answers the server-information resource with a body carrying its version
+- **THEN** Chat becomes ready as a 2.x server and reports that version in the same form a 1.x version takes
+
+#### Scenario: A 2.x server's page on the 1.x path is not health
+- **WHEN** the spawned server answers the 1.x health resource with a successful status and a body that is not a health body
+- **THEN** that answer counts as answering but not as ready
+- **AND** the same cycle's server-information probe can still make Chat ready
+
 #### Scenario: Readiness does not depend on emitted text
-- **WHEN** OpenCode becomes healthy at the probed endpoint but writes nothing recognizable to its standard output
+- **WHEN** OpenCode becomes ready at the probed endpoint but writes nothing recognizable to its standard output
 - **THEN** Chat becomes ready
 
 #### Scenario: A single unanswered probe does not exhaust the budget
@@ -54,7 +73,7 @@ UatuCode MUST NOT depend on the format of any text OpenCode writes to its standa
 - **AND** further probes are attempted while the budget remains
 
 ### Requirement: A failed Chat startup reports actionable diagnostics
-When Chat becomes unavailable because OpenCode could not be started or could not become healthy, the reported unavailable state SHALL carry the evidence needed to diagnose the failure from the report alone, without asking the user to reproduce it. That evidence SHALL include the resolved `opencode` executable path, any other executables of that name that were passed over on the search path, the OpenCode version when it could be determined, the endpoint that was probed, the elapsed time and number of probes attempted, the concrete outcome of the last probe, and bounded captures of OpenCode's standard output and standard error.
+When Chat becomes unavailable because OpenCode could not be started or could not become healthy, the reported unavailable state SHALL carry the evidence needed to diagnose the failure from the report alone, without asking the user to reproduce it. That evidence SHALL include the resolved `opencode` executable path, any other executables of that name that were passed over on the search path, the OpenCode version when it could be determined, the endpoint that was probed, the elapsed time and number of probes attempted, the concrete outcome of the last probe on each generation's readiness resource, and bounded captures of OpenCode's standard output and standard error. When the failure is that OpenCode answered but never became ready, the report SHALL name both readiness resources and what each last answered, so a server of one generation behind a probe that only understood the other is diagnosable from the report.
 
 The diagnostics MUST NOT contain the ephemeral OpenCode server password, in any field or capture, in any encoding. Captures SHALL be bounded so a verbose or looping OpenCode cannot grow the workspace process's memory without limit.
 
@@ -67,6 +86,10 @@ The diagnostics MUST NOT contain the ephemeral OpenCode server password, in any 
 - **WHEN** the last health probe failed
 - **THEN** the reported outcome distinguishes a refused connection from an abandoned unanswered connection from an HTTP status response from a malformed or unhealthy body
 - **AND** an HTTP status response reports the status code
+
+#### Scenario: Both readiness resources are accounted for
+- **WHEN** OpenCode answered but never became ready
+- **THEN** the report states the last outcome of the 1.x health probe and the last outcome of the 2.x server-information probe separately
 
 #### Scenario: An unrecognized probe failure is not misattributed
 - **WHEN** a probe fails in a way that matches none of the known outcome kinds
@@ -334,9 +357,9 @@ A history snapshot SHALL identify a stream cursor; reconnecting from a retained 
 - **THEN** the timeline reflects the revert rather than continuing to present the reverted work as though it still applies
 
 ### Requirement: Chat presents turns as readable conversation with inspectable activity
-The web Chat surface SHALL render user prompts and streamed assistant Markdown as the primary conversation, with safe code rendering consistent with UatuCode's existing rendering posture. Reasoning, tool calls, command execution, file changes, and tool results SHALL be represented as subordinate, inspectable activity with running, completed, failed, and cancelled states rather than flattened into assistant prose. Every activity row SHALL name what it acted on where the agent reported it — a shell command's command line, a file operation's path, a search's pattern — so a row and any group summary it joins are legible without being opened. While a tool or command runs, its output SHALL be shown as it streams rather than only on completion, and its elapsed time SHALL be shown where the agent reports progress without output, so long-running activity shows progress. A finished tool or command's output SHALL be bounded - presented as a summary and a bounded preview with a way to see the rest - rather than shown whole or hidden whole. A command that completes before the surface renders a running update MUST still retain inspectable output and its provider-reported completion or failure state. Untrusted Markdown, tool output, filenames, and errors MUST NOT create active markup or script execution.
+The web Chat surface SHALL render user prompts and streamed assistant Markdown as the primary conversation, with safe code rendering consistent with UatuCode's existing rendering posture. Reasoning, tool calls, command execution, file changes, and tool results SHALL be represented as subordinate, inspectable activity with running, completed, failed, and cancelled states rather than flattened into assistant prose. Every activity row SHALL name what it acted on where the agent reported it, including a shell command's command line, a file operation's path, and a search's pattern, so a row and any group summary it joins are legible without being opened. While a tool or command runs, its output SHALL be shown as it streams rather than only on completion, and its elapsed time SHALL be shown where the agent reports progress without output, so long-running activity shows progress. A finished non-shell tool's output SHALL retain its summary and bounded preview with a way to see the rest. Shell tools and normalized command items SHALL instead present a summary and one bounded-height scrollback viewport containing all available provider-supplied output, while running and after completion. Earlier shell output SHALL be reachable by scrolling rather than a separate preview or "Show more lines" disclosure. A command that completes before the surface renders a running update MUST still retain inspectable output and its provider-reported completion or failure state. Untrusted Markdown, tool output, filenames, and errors MUST NOT create active markup or script execution.
 
-While a turn is running, the trailing run of activity SHALL be collapsed behind a single working line rather than rendered as flat rows: the line SHALL carry a live indicator, the elapsed time of the turn, and the step currently in flight, and SHALL be present from the moment the prompt is accepted — before any step has arrived — so the same line carries the turn from waiting to done. Opening the working line SHALL reveal its member rows with their live state, and a running member with output SHALL still open itself so its streaming tail is visible. A working line the reader opened SHALL remain open when the turn finishes and the line settles into the finished group summary. A group line SHALL carry a status indicator: live while its turn runs, neutral when every member finished cleanly, and failed when any member failed. A failed outcome MUST NOT rely on colour alone: the line SHALL also state in words that a step failed, in text that is visible and part of the line's accessible name, without the group being opened. The live indicator's motion SHALL honour the reader's reduced-motion preference.
+While a turn is running, the trailing run of activity SHALL be collapsed behind a single working line rather than rendered as flat rows. Activity, for the working line and for finished groups, SHALL include file-change rows: a file change reported between two steps SHALL join the run around it rather than end it, and a file-change row SHALL count as a finished, clean member, never as the step in flight and never as a failed step. A group summary SHALL name a file-change row by its operation and path, after the steps the summary names, and the row itself SHALL state its operation in that same word — Created, Updated, Deleted — wherever it is shown. The line SHALL carry a live indicator, the elapsed time of the turn, and the step currently in flight, and SHALL be present from the moment the prompt is accepted, before any step has arrived, so the same line carries the turn from waiting to done. Opening the working line SHALL reveal its member rows with their live state, and a running member with output SHALL still open itself so its output viewport is visible. Shell output SHALL initially follow the bottom and respect subsequent reader scrolling. A working line the reader opened SHALL remain open when the turn finishes and the line settles into the finished group summary. Popping out or resizing shell output SHALL count as the reader opening both the output and its containing activity group. That output and group SHALL remain open on completion or failure. A group line SHALL carry a status indicator, live while its turn runs, neutral when every member finished cleanly, and failed when any member failed. A failed outcome MUST NOT rely on colour alone. The line SHALL also state in words that a step failed, in text that is visible and part of the line's accessible name, without the group being opened. The live indicator's motion SHALL honour the reader's reduced-motion preference.
 
 #### Scenario: Assistant answer remains visually primary
 - **WHEN** a turn contains assistant text interleaved with multiple tool calls
@@ -364,8 +387,8 @@ While a turn is running, the trailing run of activity SHALL be collapsed behind 
 
 #### Scenario: A running shell command shows its output as it streams
 - **WHEN** the agent reports rolling output for a running shell command
-- **THEN** the command entry shows the latest output without waiting for completion
-- **AND** later output updates the same command entry
+- **THEN** the command entry makes that output available without waiting for completion
+- **AND** later output updates the same scrollback viewport, following the latest output only while its independent follow state is active
 
 #### Scenario: A fast command retains its completed output
 - **WHEN** a shell command completes before the client observes a running update
@@ -373,15 +396,15 @@ While a turn is running, the trailing run of activity SHALL be collapsed behind 
 - **AND** the entry reports the provider's completed or failed outcome
 
 #### Scenario: A finished tool's output is bounded with a way to see the rest
-- **WHEN** a completed tool produced more output than the bounded preview shows
+- **WHEN** a completed non-shell tool produced more output than the bounded preview shows
 - **THEN** the entry shows a summary and a bounded preview
 - **AND** offers a way to see the full output
 - **AND** does not render the whole output by default
 
 #### Scenario: A finished command's output is bounded with a way to see the rest
-- **WHEN** a completed shell command produced more output than the bounded preview shows
-- **THEN** the command entry shows a bounded preview
-- **AND** offers a way to see the full output
+- **WHEN** a completed shell command produced more output than fits in its bounded-height viewport
+- **THEN** the command entry retains one scrollback viewport
+- **AND** all available provider-supplied output is reachable by scrolling without a separate preview or "Show more lines" disclosure
 
 #### Scenario: Hostile content remains inert
 - **WHEN** assistant Markdown or tool output contains script-capable markup or a JavaScript URL
@@ -416,8 +439,235 @@ While a turn is running, the trailing run of activity SHALL be collapsed behind 
 - **WHEN** the reader's system prefers reduced motion
 - **THEN** the working line's live indicator does not animate
 
+#### Scenario: Reader-sized output stays open when work finishes
+- **WHEN** the reader resizes or pops out shell output and the command or containing turn then completes or fails
+- **THEN** the output and its containing activity group remain reader-opened
+- **AND** popped-out output remains open on the same item until the reader returns it inline, opens another item, switches conversations, closes its owning child transcript, or the item is removed or its view is disposed
+- **AND** the provider-reported outcome remains visible without resetting the reading state
+
+
+#### Scenario: A file-change row joins the run around it
+- **WHEN** a finished turn reports a tool step, a file change for the path that step wrote, and two more tool steps, with no assistant text between them
+- **THEN** those rows collapse behind one group line
+- **AND** the line counts the file-change row among its steps
+
+#### Scenario: A file-change row stays inside the working line
+- **WHEN** a turn is running and the agent has reported a step, a file change, and a further running step
+- **THEN** none of the three renders as a flat row
+- **AND** the working line names the running step, not the file change
+
+#### Scenario: A group summary names a file change by operation and path
+- **WHEN** a finished group contains a file-change row for `src/foo.ts` reported as an update
+- **THEN** the group line's summary names it as an update of `src/foo.ts`
+- **AND** it does not take a place before the tool steps the summary names
+
+#### Scenario: A file-change row says the same word as its summary
+- **WHEN** a file-change row reported as an update is shown, inside a group or flat
+- **THEN** the row reads "Updated" followed by the path
+- **AND** the word is the one its group summary would count it under
+
+#### Scenario: A file-change row alone does not make a group
+- **WHEN** a finished turn reports a single file change between two assistant messages
+- **THEN** the file-change row renders flat, as it did before
+### Requirement: Shell output reads as the terminal would render it
+Where a tool's output carries terminal escape sequences, Chat SHALL interpret them rather than show them. Select-graphic-rendition styling, including the 16 standard colours, 256-colour and truecolour foreground and background, bold, dim, italic, underline, inverse, and strikethrough, SHALL be rendered as styling. Carriage-return overwrites and erase-line sequences SHALL be applied so a line that was rewritten in place shows only its final content, and any other control sequence SHALL be removed from the shown text. Interpreting escapes MUST NOT create active markup or script execution, whatever the sequences or the text around them contain.
+
+A shell command's output block SHALL be presented with the embedded terminal's background, foreground, 16-colour palette, and font, so the same bytes read the same in Chat and in the terminal pane. The palette SHALL be the one central set of terminal colour variables, not a second copy. Lines in a shell output block SHALL NOT be broken mid-token. A line longer than the block SHALL scroll horizontally, as it would in the terminal.
+
+Shell scrollback SHALL operate on the lines as rendered after overwrites are applied, so a progress bar that rewrote one line many times counts as one line, not as many. The viewport SHALL retain all available provider-supplied output for the item during its retained view lifetime, without a client-side preview or tail limit discarding earlier output. This contract SHALL apply to shell tools and normalized command items in both parent and subagent conversations, while running and after completion or failure. It SHALL NOT require recovery of output truncated upstream by the provider. Non-shell output SHALL retain its existing preview behavior.
+
+#### Scenario: Coloured test output renders in colour
+- **WHEN** a shell command's output contains `\x1b[32mpass\x1b[0m` and `\x1b[31mfail\x1b[0m`
+- **THEN** the block shows "pass" in the terminal's green and "fail" in the terminal's red
+- **AND** no bracket-code fragments appear in the text
+
+#### Scenario: A progress bar collapses to its final state
+- **WHEN** a running command rewrites one line repeatedly with carriage returns and erase-line sequences
+- **THEN** the block shows that line once, with its latest content
+- **AND** the scrollback's line count treats it as one line
+
+#### Scenario: Unknown control sequences are dropped
+- **WHEN** a command's output contains cursor-movement or operating-system-command sequences the renderer does not interpret
+- **THEN** those sequences do not appear in the shown text
+- **AND** the surrounding text is shown intact
+
+#### Scenario: Escapes cannot smuggle markup
+- **WHEN** a command's output interleaves escape sequences with `<script>` text or a JavaScript URL
+- **THEN** the rendered block contains no active markup and executes nothing
+
+#### Scenario: Shell output uses the terminal's palette and font
+- **WHEN** the same coloured output is shown in Chat and typed into the embedded terminal
+- **THEN** both use the same background, foreground, colour values and font family
+- **AND** changing a terminal colour variable changes both
+
+#### Scenario: Long lines scroll instead of wrapping
+- **WHEN** a command prints a table wider than the output block
+- **THEN** the columns stay aligned and the block scrolls horizontally
+- **AND** no line is broken mid-token
+
+#### Scenario: Earlier output remains available throughout the command lifecycle
+- **WHEN** a shell tool or normalized command item in a parent or subagent conversation emits more rendered lines than fit in the viewport
+- **THEN** the reader can scroll to the earliest available provider-supplied lines while it runs and after it completes or fails
+- **AND** later output does not discard earlier available lines to maintain a preview or tail limit
+
+#### Scenario: Provider truncation does not imply recoverable output
+- **WHEN** the provider supplies only a truncated portion of a command's output
+- **THEN** scrollback makes that available portion inspectable
+- **AND** Chat does not claim that omitted upstream output can be recovered by its scrollback controls
+
+### Requirement: Shell scrollback has accessible inline sizing and a floating output window
+Each shell tool and normalized command item's output in a parent or subagent conversation SHALL offer inline height adjustment through both pointer and keyboard controls. The resize control SHALL be focusable, have an accessible name, expose its current size and bounds, and show visible keyboard focus. Applied inline height SHALL be finite and clamped between a usable minimum and the available layout height. A layout smaller than the preferred minimum SHALL take precedence so output cannot force controls outside the available area. The reader's chosen inline height SHALL be retained while output is popped out and restored on return inline, subject to those bounds.
+
+On desktop, an accessible Pop out control SHALL move the same output into one nonmodal in-app floating window. The reader SHALL be able to drag the window and resize its width and height, with keyboard equivalents for movement and both resize dimensions. Its bounds SHALL be the UatuCode work area, not the Chat column, panel, or transcript area. The window SHALL be able to exceed the Chat width while keeping its controls reachable within the work area. Uncovered parts of the app SHALL remain usable without dismissing the window. Pop out MUST NOT open a separate browser window or use browser fullscreen.
+
+Maximize SHALL fill the UatuCode work area. Restore size SHALL return a maximized window to its previous floating position and dimensions, clamped only as needed to fit the current work area. In touch mode, Pop out SHALL present a full-area output view within the UatuCode work area instead of floating drag and resize interactions. Maximized and touch full-area output MAY cover Preview, the composer, and request controls, but controls to return to chat SHALL remain reachable. Covered app controls MUST NOT receive keyboard focus while covered.
+
+Each Chat surface SHALL have at most one popped-out shell output across its parent and child transcripts. Popping out another item SHALL return the previous item inline with its reading state retained before opening the selected item. Return to chat and Escape from the output SHALL return it directly inline, including from maximized or touch full-area presentation. They SHALL restore focus to the invoking control when available or a logical control for the same item without stealing the current outer reading anchor. Escape handled by output MUST NOT also close the subagent transcript. Pop out SHALL place keyboard focus within the output controls. All controls SHALL have accessible names and visible focus, and keyboard movement and resize controls SHALL expose their current values and bounds.
+
+#### Scenario: Inline output can be resized with a pointer or keyboard
+- **WHEN** the reader adjusts a shell viewport using its pointer resize control or focuses the resize control and uses the keyboard
+- **THEN** its inline height changes within the available bounds
+- **AND** the control exposes the resulting size and bounds accessibly
+- **AND** the reader retains the output's reading position and follow state
+
+#### Scenario: Output height remains bounded in a smaller layout
+- **WHEN** the reader requests an inline height beyond the available layout or the layout shrinks below the chosen inline height
+- **THEN** the applied height remains finite and clamped to the available layout
+- **AND** output controls, the composer, and request controls remain reachable
+- **AND** the chosen height remains available when space permits it again
+
+#### Scenario: Pop out opens beyond the chat column
+- **WHEN** the reader pops out shell output from a parent or subagent transcript on desktop
+- **THEN** the same output appears in a nonmodal in-app floating window whose width can exceed the Chat column or panel within the UatuCode work area
+- **AND** keyboard focus moves into the output controls and Return to chat is available
+- **AND** uncovered app content and controls remain usable
+- **AND** no separate browser window or browser fullscreen opens
+
+#### Scenario: Floating output can be moved and resized with a pointer or keyboard
+- **WHEN** the reader drags or uses keyboard movement controls, or resizes either dimension with pointer or keyboard controls
+- **THEN** the floating window changes position, width, or height within the UatuCode work area
+- **AND** its controls remain reachable and keyboard controls expose current values and bounds
+- **AND** the output retains its reading anchor, horizontal offset, and follow state within available bounds
+
+#### Scenario: Maximize and Restore size preserve floating bounds
+- **WHEN** the reader maximizes floating output and then activates Restore size
+- **THEN** Maximize fills the UatuCode work area and may cover Preview and the composer while keeping Return to chat reachable
+- **AND** Restore size returns to the previous floating position, width, and height, clamped only to fit the current work area
+- **AND** neither action overwrites the chosen inline height or follow state
+
+#### Scenario: Touch output uses a full-area view
+- **WHEN** the reader pops out shell output in touch mode
+- **THEN** the same output fills the UatuCode work area without floating drag or resize interactions
+- **AND** Return to chat remains reachable even when Preview, the composer, or request controls are covered
+- **AND** keyboard focus cannot move to covered app controls
+
+#### Scenario: Only one shell view is popped out per Chat surface
+- **WHEN** one shell view is popped out and the reader pops out a different item in the parent or a child transcript
+- **THEN** the previous item returns inline with its reading state retained
+- **AND** only the newly selected item owns the popped-out view
+
+#### Scenario: Return to chat returns to the inline reading context
+- **WHEN** the reader activates Return to chat or presses Escape from floating, maximized, or touch full-area shell output
+- **THEN** the output returns inline at its retained height subject to available bounds
+- **AND** focus returns to the invoking control or a logical control for that item if the invoking control is unavailable
+- **AND** the outer timeline anchor and shell reading state are restored
+- **AND** maximized output returns directly inline without an intermediate floating view
+
+#### Scenario: Escape returns child output without closing the child
+- **WHEN** shell output is popped out from a subagent transcript, including maximized or touch full-area output, and the reader presses Escape from that output
+- **THEN** the shell output returns inline within that transcript
+- **AND** the subagent transcript remains open
+
+#### Scenario: Return respects reading elsewhere in the transcript
+- **WHEN** the reader scrolls the uncovered outer transcript while a floating output window is open and then returns that output inline
+- **THEN** the current outer reading position remains anchored rather than reverting to the position saved at Pop out
+- **AND** focus restoration does not scroll the transcript back to an offscreen invoking control
+
+### Requirement: Popped-out output identifies and retains its owning command
+Popped-out output SHALL remain bound to the specific immutable conversation and item identity selected by the reader. It SHALL show the command, conversation label, and provider-reported running, completed, failed, or cancelled status. It SHALL show the provider's completion time when known and MUST NOT fabricate a completion time when unknown. Disconnection MUST NOT be presented as completion. Completion, failure, cancellation, activity regrouping, and later commands SHALL NOT dismiss the output or automatically switch it to another item. Output and status updates SHALL continue to apply only to its owning item.
+
+#### Scenario: The window identifies the selected command
+- **WHEN** the reader pops out a shell item from a parent or child conversation
+- **THEN** the output shows that item's command, conversation label, and provider-reported status
+- **AND** updates to other items do not change its conversation or item identity
+
+#### Scenario: Completed output stays open as later commands run
+- **WHEN** the selected command completes, fails, or is cancelled and later commands start or activity is regrouped
+- **THEN** its output remains open with its own provider-reported outcome
+- **AND** the window does not switch automatically to a later command
+- **AND** its reading state is retained
+
+#### Scenario: Completion metadata is not invented
+- **WHEN** a provider reports command completion with a known completion time
+- **THEN** the output shows that provider-reported time
+- **AND** when the provider supplies no completion time, the output does not invent one
+
+#### Scenario: Disconnection is not completion
+- **WHEN** the provider disconnects without reporting a terminal outcome for the selected running command
+- **THEN** the output does not label that command completed or fabricate a completion time
+
+### Requirement: Shell reading state is local to its conversation and item
+Shell reading state SHALL belong to the local client's immutable conversation and item identity during the retained view lifetime. It SHALL include the output's horizontal position, vertical reading anchor and offset, chosen inline height, follow state, reader-opened status, and floating position and dimensions. These values SHALL survive output updates, moves between inline and popped-out views, Maximize, Restore size, desktop/touch presentation changes, and command lifecycle changes, subject to available content and layout bounds. Temporary maximized or touch full-area geometry MUST NOT overwrite the retained floating bounds. Updates to other items or conversations MUST NOT overwrite this state. This contract SHALL NOT require persistence across reloads.
+
+Explicitly switching the selected conversation SHALL close any popped-out shell output and release its old focus, movement, resize, and keyboard ownership so it cannot act on the new conversation. Leaving or closing a child transcript SHALL likewise release output owned by that child. Removing the owning item or disposing its view SHALL close its output and release those interactions. Popped-out output SHALL NOT remain pinned across conversations. Retained per-item reading state SHALL remain scoped to its owning conversation if it survives navigation, and returning SHALL NOT automatically reopen the prior popped-out view. A newly created view without retained state SHALL start with the default bounded inline height and bottom following.
+
+Hiding Chat without changing the selected conversation SHALL hide its output window and defer output painting under the existing hidden-Chat behavior. Returning to the same retained Chat view SHALL restore the window's presentation and reconcile its owning item's latest output and status. It SHALL NOT display an independent output inspector over another active app tab.
+
+#### Scenario: Switching conversations releases popped-out ownership
+- **WHEN** the reader explicitly switches conversations while a parent or child shell output is popped out
+- **THEN** the popped-out view closes and its old focus, movement, resize, and keyboard ownership is released
+- **AND** subsequent input affects only the current conversation
+- **AND** no old shell reading state is applied to an item in the new conversation
+
+#### Scenario: Leaving a child transcript releases its popped-out view
+- **WHEN** the reader navigates out of or closes a child transcript that owns popped-out shell output
+- **THEN** that popped-out view closes and releases its interaction ownership
+- **AND** the parent transcript remains usable with its own reading state
+
+#### Scenario: Retained reading state survives a return without reopening output
+- **WHEN** the reader returns to a conversation whose shell item view state was retained
+- **THEN** the item uses its retained position, inline height, follow state, and reader-opened status within current bounds
+- **AND** its previous popped-out view does not reopen automatically
+- **AND** a later explicit Pop out uses its retained floating bounds within the current work area
+
+#### Scenario: Presentation changes preserve per-item geometry and reading state
+- **WHEN** the reader moves an item between inline, floating, maximized, and touch full-area output and then returns to floating or inline output
+- **THEN** floating output uses its retained floating position and dimensions and inline output uses its chosen inline height, subject to current layout bounds
+- **AND** the output retains its horizontal offset, vertical reading anchor, and follow state wherever the content and layout permit
+- **AND** maximized or touch full-area dimensions do not replace its retained floating geometry
+
+#### Scenario: Item removal or view disposal releases output interactions
+- **WHEN** the owning item is removed or its view is disposed while output is popped out
+- **THEN** the popped-out view closes and releases its focus, movement, resize, and keyboard ownership
+- **AND** subsequent pointer or keyboard input cannot manipulate the removed output or an unrelated item
+
+#### Scenario: A fresh view does not require persisted reading state
+- **WHEN** a shell item is opened after reload or after its retained view state has been released
+- **THEN** it can start at the default bounded inline height with bottom following
+- **AND** restoring prior local shell reading state from persistent storage is not required
+
+#### Scenario: Hiding Chat hides its output window
+- **WHEN** the reader hides Chat or selects another app tab without changing the selected conversation
+- **THEN** its output window is hidden and output painting is deferred
+- **AND** returning to the same retained Chat view restores the output window with its owning item's latest output and status
+
+### Requirement: Activity chrome is legible and distinct from prose
+The activity chrome — the working line while a turn runs, a finished group's summary line, each member row's label and subject, and the rule and neutral dot that tie a group's members together — SHALL use a colour that is visibly stronger than the surface's secondary-label colour and visibly quieter than assistant prose, in both the light and the dark theme, so steps are readable and told apart from each other and from the answer without being the answer's equal. Status words and outcome indicators (running, failed) keep their own colours.
+
+#### Scenario: Steps are readable in light and dark
+- **WHEN** a turn has produced a working line with several member rows, in either theme
+- **THEN** the line and its rows meet at least the contrast the surface's body text meets against the same background
+- **AND** they remain distinguishable from the assistant prose around them
+
+#### Scenario: Chrome stays quieter than the answer
+- **WHEN** a finished group sits between two assistant messages
+- **THEN** the group's summary and rows read as secondary to the messages
+- **AND** a failed step's status is still shown in the failure colour
+
 ### Requirement: Users can resolve agent interaction requests in context
 An unresolved OpenCode permission request SHALL appear in the conversation that raised it with the approval and rejection choices OpenCode supports for it: approving the single occurrence, approving persistently, and rejecting. Where a permission would change a file, the request SHALL show what it would change — the pending diff — where the choice is made, so the user sees the change before allowing it. A permission with nothing to show a diff for is unaffected. A structured OpenCode question SHALL render its prompt, options, multi-selection behavior, and free-form response when supported. A resolved request SHALL become non-interactive and record its outcome. A resolved request SHALL also recede: its outcome stays legible where the request was raised, but it MUST NOT keep the footprint it held while it needed an answer, and what it named SHALL stay reachable from the receded form. Submitting a response more than once MUST NOT produce multiple provider replies.
+
+A permission that names no specific resource, whose request carries only a wildcard as OpenCode's request to call an MCP tool does, SHALL show the arguments of the tool call it would allow, where the choice is made, so the user sees what the call does before allowing it. The arguments SHALL be those of the tool call the permission belongs to, as the conversation already shows them; the surface MUST NOT invent, summarize, or reorder them. When that call cannot be found in the conversation, the request SHALL show what OpenCode sent, unchanged. A permission for an MCP tool SHALL name the MCP server and the tool as the user registered them with OpenCode, distinguished from the built-in tools, so the user can tell which server is being granted what; the action name OpenCode sent SHALL remain what the persistent-approval confirmation names, since it is the rule OpenCode installs. When the server cannot be identified among the servers OpenCode reports, the request SHALL show the action as sent. A permission naming a specific resource, carrying a diff, or carrying a plan is unaffected. Like the diff, the arguments are shown while the request is open; the resolved request recedes to its outcome and the resources OpenCode named, as any other permission does. The arguments SHALL be shown for a request recovered from OpenCode's pending set as for one announced live.
 
 A request raised by a subagent SHALL additionally appear in the conversation that launched that subagent, and SHALL be answerable there. The subagent's own conversation remains the single owner of the request: an answer given from the launching conversation SHALL be directed to the owning conversation, so exactly one response reaches OpenCode however many places the request was shown. Resolving it SHALL resolve it everywhere it appears.
 
@@ -427,9 +677,13 @@ Only the active unresolved request of a given conversation MAY accept a response
 
 A request's state SHALL be distinguishable without reading its body — whether it awaits the user now, awaits its turn behind another request of the same conversation, or is resolved. That distinction MUST NOT rely on colour alone. A request awaiting its turn MUST NOT be presented as obsolete, superseded, or otherwise not needing an answer, because it will require one.
 
-The surface SHALL report how many requests are outstanding across everything it is showing, and SHALL offer a way to reach an outstanding request without hunting for it.
+The surface SHALL report how many requests are outstanding across everything it is showing, and SHALL offer a way to reach an outstanding request without hunting for it. That report, and any other control the surface floats over the conversation, MUST NOT cover a request's own answer field or its submit and cancel controls; the conversation SHALL reserve room for them so an outstanding request shown at the end of the transcript stays fully operable. The report SHALL NOT be shown while a request it would lead to is already on screen; when it is shown, its count remains that of every outstanding request.
 
-A choice that grants authority beyond the request being answered SHALL state the scope and lifetime of that authority where the choice is offered, so a user learns what they are granting before granting it rather than afterwards. In particular, OpenCode's persistent approval carries past the answered request into later conversations served by the same OpenCode instance and covers the request's saved pattern rather than only the resource displayed, and it is lost when that instance restarts. It MUST NOT be presented as limited to the current conversation, nor as outliving the OpenCode instance that granted it.
+Revealing a request's free-form answer field SHALL hold the conversation's position on the request being answered, so the request does not scroll out of view as the user starts to answer it.
+
+A choice that grants authority beyond the request being answered SHALL state the scope and lifetime of that authority where the choice is offered, so a user learns what they are granting before granting it rather than afterwards. In particular, OpenCode's persistent approval carries past the answered request into later conversations served by the same OpenCode instance and covers the request's saved pattern rather than only the resource displayed, and it is lost when that instance restarts. It MUST NOT be presented as limited to the current conversation, nor as permanent, nor as outliving the OpenCode instance that granted it.
+
+Choosing the persistent approval SHALL NOT send a reply. It SHALL open a confirmation step on the same request that lists the future-approval patterns OpenCode supplied for that request, the patterns its persistent reply installs, verbatim and apart from the request's own resources, so the user can see where the two differ. The surface MUST NOT derive or shorten a pattern from the displayed command; a request whose patterns are unknown SHALL say so rather than present the command as the scope. The patterns SHALL be carried on the request wherever it is shown, including a request recovered from OpenCode's pending set after its live announcement was missed.
 
 A pending request SHALL remain discoverable and answerable even when the server did not observe its live announcement — because the event stream was interrupted, restarted, or the conversation was not being tracked at the time. Loading a conversation SHALL reconcile its unresolved requests against OpenCode's own pending set, so a request that OpenCode is still waiting on is never permanently invisible.
 
@@ -446,6 +700,34 @@ A pending request SHALL remain discoverable and answerable even when the server 
 #### Scenario: A non-edit permission shows no diff
 - **WHEN** a pending permission has no file change to show
 - **THEN** the card presents its choices without a diff
+
+#### Scenario: An MCP tool permission shows the call's arguments
+- **WHEN** OpenCode asks permission to call an MCP tool, naming only a wildcard resource, and the conversation holds that call with its arguments
+- **THEN** the card shows those arguments where the approve and reject choices are
+- **AND** the card names the MCP server and the tool, apart from the built-in tools
+- **AND** no bare wildcard stands in for the arguments
+
+#### Scenario: The persistent-approval confirmation keeps OpenCode's own action name
+- **WHEN** the user chooses the persistent approval on an MCP tool permission
+- **THEN** the confirmation names the action as OpenCode sent it, the rule it will install
+
+#### Scenario: An MCP permission whose server cannot be identified keeps the action as sent
+- **WHEN** a pending permission's action matches none of the MCP servers OpenCode reports
+- **THEN** the card shows the action as OpenCode sent it
+
+#### Scenario: A wildcard permission whose call is not in the conversation
+- **WHEN** a pending permission names only a wildcard resource and the conversation holds no tool call it belongs to
+- **THEN** the card shows the request as OpenCode sent it, with its choices
+
+#### Scenario: A permission naming a specific resource adds no arguments
+- **WHEN** a pending permission names a command, a file, or another specific resource
+- **THEN** the card shows that resource as before
+- **AND** it does not add the tool call's arguments beside it
+
+#### Scenario: A resolved MCP permission recedes like any other
+- **WHEN** a permission that showed a call's arguments has been answered
+- **THEN** its receded form records the outcome and the resources OpenCode named, without the arguments block
+- **AND** the arguments remain readable on the tool row the call ran as
 
 #### Scenario: An answered request recedes
 - **WHEN** a permission or question has been answered
@@ -503,6 +785,21 @@ A pending request SHALL remain discoverable and answerable even when the server 
 - **AND** offers a way to reach an outstanding request directly
 - **AND** reports none once every request has been answered
 
+#### Scenario: The outstanding-request report does not cover an answer
+- **WHEN** a request at the end of the conversation shows its answer field and submit and cancel controls while the surface reports outstanding requests
+- **THEN** the report does not overlap that field or those controls
+- **AND** each of them can be activated directly where it appears
+
+#### Scenario: The outstanding-request report yields to a visible request
+- **WHEN** the only outstanding request's card is within the visible part of the conversation
+- **THEN** the report is not shown
+- **AND** it reappears once the card is scrolled out of view while the request is still outstanding
+
+#### Scenario: Revealing a free-form answer holds the request in view
+- **WHEN** the user chooses a request's free-form answer and its field is revealed and focused
+- **THEN** the request being answered stays in view
+- **AND** the conversation does not reposition onto a different entry
+
 #### Scenario: User rejects a structured question
 - **WHEN** OpenCode asks a structured question and the user rejects or dismisses it
 - **THEN** OpenCode receives one rejection response
@@ -517,15 +814,28 @@ A pending request SHALL remain discoverable and answerable even when the server 
 - **THEN** the surface states that choosing it reaches beyond this conversation and beyond this exact request, and that it lasts until OpenCode restarts
 - **AND** it is not described as applying only to this conversation, nor as permanent
 
+#### Scenario: The confirmation shows OpenCode's pattern, not the command
+- **WHEN** OpenCode requests permission for `git status --short` and supplies `git status *` as its future-approval pattern, and the user chooses the persistent approval
+- **THEN** no reply is sent
+- **AND** the confirmation lists `git status *` as what will be allowed
+- **AND** the request's own resource `git status --short` remains visible apart from that list
+
 #### Scenario: Persistent approval is still sent as OpenCode's persistent reply
-- **WHEN** the user chooses persistent approval
+- **WHEN** the user confirms the persistent approval
 - **THEN** OpenCode receives its persistent-approval reply once for that request
 - **AND** the recorded outcome is unchanged from before this correction
+
+#### Scenario: Patterns are announced under either naming generation
+- **WHEN** OpenCode announces a request's future-approval patterns under its current or its legacy event name
+- **THEN** the request carries those patterns
+- **AND** a request announced under both carries them once
 
 #### Scenario: A request missed by the event stream is recovered on load
 - **WHEN** OpenCode raised a permission request while the server's event stream was interrupted, and the user then opens that conversation
 - **THEN** the pending request appears and can be answered
 - **AND** answering it resolves the request OpenCode is waiting on
+- **AND** its persistent approval confirms with the future-approval patterns OpenCode reports for it
+- **AND** a wildcard-only request shows the arguments of the call it belongs to, as the live announcement would have
 
 #### Scenario: Recovered and live announcements do not double up
 - **WHEN** a pending request is recovered on load and OpenCode also announces it over the event stream
@@ -758,6 +1068,12 @@ Every answered question request SHALL contain exactly one answer array for each 
 ### Requirement: Timeline position remains stable under streaming and navigation
 The Chat timeline SHALL remain pinned to the latest content only while the user is at or near its end. Once the user scrolls away, streaming, tool updates, image or code layout, and activity expansion MUST NOT steal the reading position; an accessible latest-content affordance SHALL indicate unseen updates and return to the end. Prepending older history SHALL preserve the same visible content and offset. Opening a conversation SHALL restore that client's last reading position when possible, otherwise it SHALL open at the latest turn.
 
+Each shell viewport SHALL have a follow state independent of the outer timeline and other shell items. It SHALL initially follow the bottom. Any upward reader scroll SHALL stop following, including a movement smaller than a near-bottom threshold. Returning to the bottom or activating the viewport's accessible latest-output control SHALL resume following. Incoming output while following SHALL keep the bottom visible without resetting the horizontal offset. While following is paused, incoming output SHALL preserve the visible rendered content and its vertical offset, and the latest-output control SHALL indicate unseen output.
+
+Output updates, layout resize, inline height adjustment, Pop out, Maximize, Restore size, Return to chat, changes between desktop and touch presentation, and completion or failure SHALL preserve the shell item's horizontal position, vertical reading anchor, chosen inline height, and follow state. Position and applied size SHALL be clamped only where the available content or layout cannot accommodate them. A layout change that clamps position to the bottom MUST NOT itself resume paused following. Resizing or popping out shell output SHALL preserve the outer timeline's reading anchor, and returning inline SHALL preserve its current reading anchor, including any deliberate outer scrolling while the nonmodal window was open. Shell scrolling and its latest-output control MUST NOT independently move the outer timeline to its end. Long shell output SHALL preserve long-chat responsiveness, text selection, copying, and find over available rendered output.
+
+Following SHALL be stable in both parent and child outer timelines and in each shell output viewport, whether inline or popped out. While following during passive append-only updates, automatic movement MUST NOT alternate upward and downward when the scroll extent is not shrinking. Activating the relevant latest-content or latest-output control during streaming SHALL settle at the current bottom and continue following without oscillation between smooth movement and snapping. Any upward manual scroll SHALL interrupt automatic movement immediately and pause following, even during movement initiated by a latest control. Resize effects and programmatic scroll echoes MUST NOT change the reader's follow intent. A shrinking layout or content extent MAY cause a legitimate position clamp without being treated as follow jitter or resuming paused following.
+
 #### Scenario: Active reader follows streaming output
 - **WHEN** the user is at the end of the timeline as assistant content streams
 - **THEN** new content remains visible without repeated manual scrolling
@@ -767,6 +1083,14 @@ The Chat timeline SHALL remain pinned to the latest content only while the user 
 - **THEN** their visible content remains anchored
 - **AND** an affordance reports and navigates to unseen latest content
 
+#### Scenario: Any upward scroll leaves the end
+- **WHEN** the user scrolls upward by less than the near-end distance while content continues streaming
+- **THEN** the timeline is no longer pinned and the next update does not return it to the end
+
+#### Scenario: Sending returns the reader to the end
+- **WHEN** the user submits a message while scrolled above the end
+- **THEN** the timeline moves to the end so the sent message and the reply that follows are in view
+
 #### Scenario: Loading older history preserves the viewport
 - **WHEN** the user requests an older history page at the top of the loaded timeline
 - **THEN** the previously visible first item remains at the same visual offset after insertion
@@ -774,6 +1098,60 @@ The Chat timeline SHALL remain pinned to the latest content only while the user 
 #### Scenario: Expanding activity does not cause an unrelated jump
 - **WHEN** the user expands or collapses a tool entry away from the timeline end
 - **THEN** the chosen entry remains anchored in the viewport
+
+#### Scenario: Shell output initially follows independently
+- **WHEN** a shell viewport first shows output and further output arrives
+- **THEN** it shows the bottom of its scrollback
+- **AND** an outer timeline scrolled away from its end retains its reading anchor
+
+#### Scenario: Any upward shell scroll pauses following
+- **WHEN** the reader scrolls a shell viewport upward even by less than a near-bottom threshold and more output arrives
+- **THEN** the viewport preserves the reader's visible content and vertical offset instead of returning to the bottom
+- **AND** its latest-output control indicates unseen output
+- **AND** other shell viewports and the outer timeline retain their own follow state
+
+#### Scenario: Returning to latest output resumes following
+- **WHEN** the reader scrolls a paused shell viewport back to the bottom or activates its latest-output control
+- **THEN** that viewport resumes following incoming output
+- **AND** it preserves its horizontal offset and does not jump the outer timeline to its end
+
+#### Scenario: Reading position survives output and layout changes
+- **WHEN** the reader has paused shell following and scrolled horizontally, and the output updates, the layout resizes, the inline height changes, the viewport is popped out, maximized, restored to floating size, returned inline, changes between desktop and touch presentation, or the command completes or fails
+- **THEN** the same rendered content remains at the same vertical offset and the horizontal offset is preserved wherever the content and layout permit
+- **AND** the chosen inline height is retained with its applied size clamped to the available layout
+- **AND** following remains paused even if clamping places the viewport at the bottom
+
+#### Scenario: Following survives resize and completion
+- **WHEN** a shell viewport is following and is resized, popped out, maximized, restored to floating size, returned inline, changes between desktop and touch presentation, or receives completion or failure
+- **THEN** it remains at the bottom with following active
+- **AND** its horizontal offset and chosen inline height are retained within available bounds
+
+#### Scenario: Long scrollback remains usable
+- **WHEN** a long conversation contains shell output spanning many viewport heights and further output streams
+- **THEN** scrolling, resizing, and conversation controls remain responsive
+- **AND** available rendered output remains selectable, copyable, and reachable through find in inline, floating, maximized, and touch full-area views
+- **AND** streaming does not clear an existing selection in unchanged output or steal the outer reading anchor
+
+#### Scenario: Passive following does not jitter during append
+- **WHEN** a parent outer timeline, child outer timeline, or shell output viewport is following during passive append-only streaming and its scroll extent is not shrinking
+- **THEN** automatic scrolling keeps the latest content visible without alternating upward and downward movement
+- **AND** the same behavior applies to inline, floating, maximized, and touch full-area shell output
+
+#### Scenario: Latest settles at the bottom during streaming
+- **WHEN** the reader activates the latest control in a parent outer timeline, child outer timeline, or shell output viewport while content continues appending
+- **THEN** the view settles at the current bottom and follows subsequent appends
+- **AND** it does not oscillate between smooth movement and snapping
+
+#### Scenario: Manual upward scrolling interrupts automatic movement
+- **WHEN** the reader scrolls upward in a parent outer timeline, child outer timeline, or shell output viewport during automatic following or movement initiated by its latest control
+- **THEN** automatic movement stops immediately and following pauses, even for movement smaller than the near-bottom threshold
+- **AND** subsequent appends preserve the reader's position rather than completing the interrupted movement
+
+#### Scenario: Resize and programmatic echoes preserve follow intent
+- **WHEN** resize effects or scroll events caused by automatic movement occur in a parent outer timeline, child outer timeline, or shell output viewport
+- **THEN** they do not change whether the reader has chosen to follow
+- **AND** a legitimate position clamp after layout or content shrink is allowed
+- **AND** clamping a paused view to the bottom does not resume following
 
 ### Requirement: Desktop presents Preview and Chat as a persistent split
 In desktop mode the work area SHALL present Preview and Chat side by side with
@@ -830,6 +1208,32 @@ viewport and safe-area inset while the software keyboard is present, and
 keyboard opening, resizing, or dismissal MUST NOT hide the input or cause the
 current reading position to jump.
 
+The touch surface's geometry SHALL follow the viewport that is actually
+visible. It SHALL be re-derived whenever the page returns to the foreground
+and not only when the platform announces a viewport change, so a keyboard
+dismissed while the app was backgrounded leaves no keyboard-sized surface
+behind and the user does not have to open and dismiss the keyboard to recover
+the full height. Detection of the software keyboard SHALL hold on platforms
+that pan the page under the keyboard rather than only shrinking it.
+
+While the keyboard is present the pinned progress tracks SHALL yield so the
+composer stays inside the visible viewport, and every pinned track that can
+grow SHALL be bounded, so no combination of populated and expanded tracks can
+push the composer out of view. Moving the text caret inside a chat text
+control MUST NOT move the conversation's reading position, even when the
+platform pans the viewport to follow the caret. A reading-position correction
+withheld while the page is hidden SHALL be applied once the page is visible
+again rather than dropped.
+
+While a text control that belongs to a request has focus on a touch device,
+the surface SHALL give the transcript the visible band: chrome that cannot be
+used while the keyboard is open SHALL sit beneath the keyboard rather than
+above it, so the band above the keyboard belongs to the transcript and the
+request; it SHALL reappear as the keyboard dismisses; the transcript SHALL keep enough scroll room below its last entry that a request at the end of the conversation can still be lifted above the keyboard. The focused control
+SHALL be kept inside the visible viewport once the keyboard geometry has
+settled. Focusing that control MUST NOT change the page's scale. When focus
+leaves the request, the surface SHALL return to its normal arrangement.
+
 #### Scenario: Preview updates while the conversation stays visible
 - **WHEN** a desktop user prompts the agent and it modifies the currently
   previewed document
@@ -850,6 +1254,124 @@ current reading position to jump.
   safe area
 - **AND** the timeline resizes without placing the active content behind the
   composer
+
+#### Scenario: Returning from the background restores the surface
+- **WHEN** a touch user focuses the composer, backgrounds the app with the
+  keyboard open, and returns to it with the keyboard dismissed and no
+  viewport-change notification from the platform
+- **THEN** the Chat surface again fills the visible viewport with no
+  keyboard-sized strip below it
+- **AND** the composer is reachable without opening and dismissing the
+  keyboard again
+- **AND** the conversation shows the reading position it held
+
+#### Scenario: A panned keyboard is still a keyboard
+- **WHEN** the software keyboard opens on a device that pans the page upward,
+  so the strip occluded below the visible viewport is smaller than the
+  keyboard itself
+- **THEN** Chat treats the keyboard as present
+- **AND** the pinned progress tracks give up their rows as they do when the
+  keyboard shrinks the viewport without panning
+
+#### Scenario: Pinch zoom is not a software keyboard
+- **WHEN** the browser magnifies the page and reduces the visual viewport at a
+  non-default scale
+- **THEN** Chat retains its last normal-scale layout and keyboard state without
+  treating the zoom as a keyboard or correcting the browser's zoom pan
+- **AND** normal viewport measurement resumes when the scale returns to normal
+
+#### Scenario: Expanded progress tracks cannot displace the composer
+- **WHEN** the task list, the subagent list, and the background-task list are
+  all populated and expanded while the keyboard is open
+- **THEN** the composer and its send control remain inside the visible
+  viewport
+- **AND** the transcript absorbs the reduction instead of the composer
+
+#### Scenario: Moving the caret does not move the conversation
+- **WHEN** a touch user moves the text caret inside the composer or a
+  request's answer field and the platform pans the visible viewport to follow
+  it
+- **THEN** the conversation's reading position is unchanged
+- **AND** repeated pans during one caret movement do not each reposition the
+  transcript
+
+#### Scenario: The transcript holds still while an answer is typed
+- **WHEN** a touch user has a request's answer field focused and the platform
+  autoscrolls the transcript while the caret is dragged
+- **THEN** the transcript returns to the position that keeps the field in view
+- **AND** it scrolls freely again once the field loses focus
+
+#### Scenario: Resolving a focused answer removes the answering state
+- **WHEN** answering, rejecting, or a remote update removes a focused request
+  field, including on a browser that emits no focusout for a removed node
+- **THEN** the editing and answering state is cleared and the detached field no
+  longer holds the transcript
+- **AND** the normal tabs and chrome return and the transcript can scroll freely
+
+#### Scenario: Answering temporarily preserves the reader's follow choice
+- **WHEN** a reader following the newest content answers a request and its
+  temporary positioning hold ends
+- **THEN** following resumes for the agent's next message
+- **AND** a reader who was already reading older content is not forced to follow
+- **AND** an explicit transcript gesture or Latest action ends the answer hold
+
+#### Scenario: A live refresh preserves an actual answer hold
+- **WHEN** an authoritative snapshot refresh cancels pending scroll work while a
+  focused request field is held in its parent or drill-down timeline
+- **THEN** the retained field is held again after the refresh
+- **AND** a hold already ended by explicit reader action is not resurrected
+
+#### Scenario: Dragging a question choice scrolls the conversation
+- **WHEN** an upward transcript drag starts on a radio or checkbox choice
+- **THEN** following pauses as it does for the same drag starting on its label
+- **AND** caret gestures inside text-editing controls do not pause following
+
+#### Scenario: A keyboard resize and pan together keep the answer visible
+- **WHEN** a touch user is answering a request and the visual viewport's height
+  and offset change together while the chat surface retains its layout height
+- **THEN** the focused field and its submit and cancel controls are repositioned
+  inside the new visible band without waiting for another viewport notification
+- **AND** a subsequent pan with no height change does not reposition the transcript
+
+#### Scenario: A direct focus transfer holds the new answer field
+- **WHEN** focus moves directly between two independently answerable request
+  fields without leaving the answering state
+- **THEN** subsequent platform autoscroll is corrected for the newly focused
+  field rather than the previous field
+- **AND** the previous field's timeline hold is released
+
+#### Scenario: Returning with retained answer focus restores the hold
+- **WHEN** the app returns from the background with a request's answer field
+  still focused and without a new focus event
+- **THEN** the field's timeline hold is restored in its parent or drill-down
+  transcript
+- **AND** later caret autoscroll is corrected after foreground recovery settles
+
+#### Scenario: Answering a request on touch puts the chrome under the keyboard
+- **WHEN** a touch user focuses a request's free-form answer field and the
+  software keyboard opens while the task, subagent and background-task tracks
+  are populated and the conversation has a composer
+- **THEN** the composer and the pinned tracks lie beneath the keyboard's edge
+  rather than above it
+- **AND** the chat header remains visible
+- **AND** the answer field and the request's submit and cancel controls are
+  inside the visible viewport
+- **AND** the field and its submit and cancel controls sit directly above the
+  keyboard's edge, with the conversation filling the band above them
+- **AND** the composer and the pinned tracks are back above the keyboard's
+  former edge once it dismisses
+
+#### Scenario: A parent request pill cannot override child answer clearance
+- **WHEN** a parent request is outstanding while a child request is answered in
+  the pushed drill-down with the keyboard open
+- **THEN** the answering keyboard inset takes precedence over the pill's normal
+  reservation even if the pill's hidden attribute is unset
+- **AND** the child's field and action row remain above the keyboard
+
+#### Scenario: Focusing the answer field does not zoom the page
+- **WHEN** a touch user focuses a request's free-form answer field
+- **THEN** the page's scale is unchanged
+- **AND** the field's text renders at the same size as the composer's
 
 ### Requirement: Conversation file references navigate through UatuCode safely
 Workspace-relative file references in assistant content or normalized
@@ -954,7 +1476,7 @@ Where the agent declares the context capability, Chat SHALL report how full the 
 
 The context report SHALL be legible without the user opening anything, and MAY expand to the breakdown the agent reports — input, cache, and output, or the agent's own categories when it reports them. It reports the live window fill after the latest model call, not lifetime spend and not a sum over a turn, and SHALL be populated when an existing conversation is opened, not only after a new turn is taken. When the agent reports that it compacted the conversation, the fill SHALL follow the post-compaction figure. Where the agent reports plan utilization, the readout MAY present it alongside the fill, distinct from it.
 
-A subagent's attribution SHALL reflect the subagent's own session — a subagent may run a different model from its parent — and SHALL state the tokens that subagent consumed, aggregated from its child session onto the launching conversation. The model MAY be shown before any usage is known. When the agent has not reported usage for a subagent, the row SHALL stay readable and SHALL NOT assert a figure it does not have.
+A subagent's attribution SHALL reflect the subagent's own session — a subagent may run a different model from its parent — and SHALL state the tokens that subagent consumed for the task the row represents, taken from its child session onto the launching conversation. Where the agent gives one subagent several tasks, each task's row SHALL state that task's tokens alone, and tokens consumed by subagents the subagent launched SHALL NOT be added to its row. The model MAY be shown before any usage is known. When the agent has not reported usage for a subagent, the row SHALL stay readable and SHALL NOT assert a figure it does not have.
 
 #### Scenario: The context indicator reads without being opened
 - **WHEN** a conversation has exchanged turns and the agent declares context reporting
@@ -978,6 +1500,11 @@ A subagent's attribution SHALL reflect the subagent's own session — a subagent
 - **WHEN** a subagent has run and the agent reports its model and token counts
 - **THEN** its row states which model it ran and how many tokens it consumed
 
+#### Scenario: A subagent's second task states its own tokens
+- **WHEN** a subagent that finished one task is given a further task
+- **THEN** the second task's row states the tokens of the second task alone
+- **AND** the first task's row is unchanged by it
+
 #### Scenario: A subagent without reported usage stays readable
 - **WHEN** a subagent has not yet reported usage, or the agent does not report it
 - **THEN** the row still names the subagent and its status
@@ -987,6 +1514,113 @@ A subagent's attribution SHALL reflect the subagent's own session — a subagent
 - **WHEN** the agent does not declare the context capability
 - **THEN** the context indicator and the subagent token figure are absent
 - **AND** the capabilities the agent does declare are unaffected
+
+### Requirement: Chat reports what an OpenCode conversation has cost
+Where OpenCode reports a cost for an assistant message, Chat SHALL present the conversation's accumulated cost in the same place a Claude Code conversation's session totals appear: the composer's usage chip reads the conversation's cost when the agent reports no plan windows, and the usage readout's conversation block states the total. The figure SHALL be the sum of the cost OpenCode reported per assistant message, in the currency OpenCode reports it, across the conversation and every subagent session beneath it at any depth. Each message SHALL be counted once — however many times it was restated while it streamed, and however many tasks the subagent that produced it was given.
+
+The cost SHALL be populated when an existing conversation is opened, from its stored history, not only after a new turn is taken; it SHALL NOT be qualified as "since" a later time, because the stored history carries every message's cost. When every message in the conversation reports a cost of zero — a model OpenCode has no price for — Chat SHALL show no cost rather than a zero figure. A message for which OpenCode reports no cost contributes nothing and SHALL NOT be presented as zero.
+
+The conversation block SHALL read as a receipt: line items, each with its tokens and cost, closed by a total line, where the line items' costs sum to the stated total. It SHALL offer three itemizations of that same total — by agent, by agent type, and by model — through one control that shows one itemization at a time. Switching itemization SHALL NOT change the total, and the chosen itemization SHALL be remembered on the device across conversations and reloads.
+
+Itemized by agent, the block SHALL list:
+- the main agent under the name OpenCode gives it, identified as the main agent, with one line per name the conversation ran under; an agent OpenCode runs on the conversation's behalf to summarise it SHALL have its own line saying so; where OpenCode names no agent the line reads "This agent";
+- one line per task given to a subagent — labelled by the subagent's kind and the task's description, with the model it ran — stating the tokens and cost of that task alone: what the subagent spent answering that task, excluding any other task it was given and excluding any subagent it launched;
+- a task given to a subagent that already has a line as its own line, identifying the earlier line as the same agent;
+- a subagent launched by a subagent as its own line beneath its launcher's line, visibly subordinate to it, at every depth.
+
+Itemized by agent type, the block SHALL list the main agent lines as above and one line per kind of subagent, stating how many distinct subagents of that kind worked in the conversation at any depth, with their combined tokens and cost, and stating the number of tasks where it exceeds the number of subagents. Itemized by model, the block SHALL list one line per model with the tokens and cost of every agent that ran it, naming which agents those were.
+
+A subagent's timeline row and its row in the composer's subagent list SHALL state the same own-task cost as its receipt line, in the conversation that launched it and inside an opened subagent transcript alike. The header of an opened subagent transcript SHALL state what that subagent itself spent across every task it was given, excluding subagents it launched. A line whose session reported no cost SHALL be listed without a figure, not with zero.
+
+#### Scenario: The chip reads the conversation's cost
+- **WHEN** an OpenCode conversation has exchanged turns and OpenCode reported a cost for its assistant messages
+- **THEN** the composer's usage chip reads the accumulated cost as "this conversation"
+- **AND** opening the readout shows the total and the line items of the remembered itemization
+
+#### Scenario: A restated message is counted once
+- **WHEN** OpenCode restates one assistant message's cumulative cost several times while it streams
+- **THEN** the conversation total counts that message's latest figure once
+
+#### Scenario: Cost is restored from history
+- **WHEN** the user opens an OpenCode conversation whose assistant messages carry costs
+- **THEN** the chip and readout show the cost from that history before any new turn
+- **AND** the readout block is titled for the whole conversation, not "since" a time
+
+#### Scenario: A free model shows no cost
+- **WHEN** every assistant message in the conversation reports a cost of zero
+- **THEN** no cost figure is shown on the chip or in the readout
+
+#### Scenario: The readout attributes cost per agent
+- **WHEN** a conversation launched two subagents whose child sessions reported cost, on the same model as the main agent
+- **THEN** itemized by agent, the conversation block lists the main agent's own spend and one line per subagent task with its label, model, tokens, and cost
+- **AND** the chip's figure and the model line for that model include the subagents' spend
+
+#### Scenario: The receipt adds up
+- **WHEN** a priced conversation ran a main agent, several subagents, a subagent given two tasks, and a subagent that launched its own subagent
+- **THEN** in each of the three itemizations the line items' costs sum to the total line
+- **AND** the total line, the block's stated total, and the chip state the same figure
+- **AND** that figure equals the sum of the costs OpenCode reported for every assistant message in the conversation and the subagent sessions beneath it
+
+#### Scenario: A subagent given a second task is billed once
+- **WHEN** the main agent gives a subagent a task, and after it finishes gives the same subagent a further task
+- **THEN** the receipt lists two lines for that subagent, each stating only the spend of its own task
+- **AND** the second line identifies the first as the same agent
+- **AND** the two lines together equal what that subagent's session reported, and the total counts it once
+- **AND** this holds while the second task streams and after the conversation is reopened
+
+#### Scenario: Work between two tasks belongs to the task before it
+- **WHEN** a subagent given two tasks summarised its own conversation partway through the first, so that its session holds prompts that are not tasks
+- **THEN** the first task's line includes what the subagent spent summarising and continuing
+- **AND** the second task's line states only what the subagent spent answering the second task
+
+#### Scenario: Nested subagents are listed beneath their launcher
+- **WHEN** a subagent launched a subagent, which launched a further subagent
+- **THEN** each has its own line beneath its launcher's line, visibly subordinate to it
+- **AND** the launcher's line states only the launcher's own spend
+
+#### Scenario: Main agents are named
+- **WHEN** a conversation ran under one named main agent, was switched to another, and OpenCode summarised it along the way
+- **THEN** the receipt lists one line per main agent name, each identified as the main agent
+- **AND** the summarising agent has its own line saying what it did
+- **AND** no line reads "This agent"
+
+#### Scenario: Types count distinct subagents
+- **WHEN** a conversation ran three subagents of one kind, one of them given two tasks, and two nested subagents of another kind
+- **THEN** the itemization by type lists the first kind with a count of three and states four tasks
+- **AND** lists the second kind with a count of two and no task count
+
+#### Scenario: Models name who ran them
+- **WHEN** the user itemizes the receipt by model
+- **THEN** each model's line states the tokens and cost of every agent that ran it and names those agents
+
+#### Scenario: The itemization choice is remembered
+- **WHEN** the user chooses an itemization, opens another conversation, and reloads the page
+- **THEN** the readout opens on the chosen itemization
+
+#### Scenario: A subagent row states its cost in context
+- **WHEN** a subagent's child session reported cost with its tokens
+- **THEN** the subagent's timeline row and its row in the composer's subagent list state that task's own cost, equal to its receipt line
+- **AND** opening the subagent's transcript shows in its header what that subagent itself spent across its tasks
+
+#### Scenario: An unpriced subagent is listed without a figure
+- **WHEN** a subagent's child session reported tokens but no cost
+- **THEN** its line in the conversation block names it and its tokens and asserts no cost
+
+#### Scenario: Cost rides the usage wire
+- **WHEN** a client validates a conversation snapshot or update carrying a usage record with a cost, a subagent row carrying the lines beneath it, or a usage record naming the agent that produced it
+- **THEN** the record is accepted under the workspace API revision that introduced it
+
+### Requirement: The composer's subagent list counts subagents and tasks distinctly
+The composer's subagent list SHALL keep one row per task, and its summary line SHALL NOT count a subagent once per task it was given. Where every task went to its own subagent the summary SHALL count subagents as it does today. Where a subagent was given more than one task, the summary SHALL state the number of distinct subagents and the number of tasks.
+
+#### Scenario: One task per subagent reads as before
+- **WHEN** a conversation launched four subagents with one task each and all have finished
+- **THEN** the summary reads "4 subagents finished"
+
+#### Scenario: A subagent given two tasks is one subagent
+- **WHEN** a conversation launched three subagents, gave one of them a second task, and all have finished
+- **THEN** the list shows four rows
+- **AND** the summary reads "3 subagents · 4 tasks finished"
 
 ### Requirement: Chat composer actions keep a stable one-line layout
 The Chat composer SHALL place context usage, one configuration trigger, routine status, and the Send/Cancel action in a deliberate non-wrapping action rail. The configuration trigger SHALL take the flexible space and truncate its visible label when necessary. Routine status and the trailing action SHALL keep fixed footprints, and routine lifecycle changes MUST NOT move either control or reorder the rail. Deliberate panel resizing can change the flexible label width but MUST NOT make individual controls jump between rows.
@@ -1492,10 +2126,51 @@ Where an agent declares that it can run work in the background, Chat SHALL prese
 ### Requirement: Persistent-approval scope copy is the owning agent's
 When a permission card offers an approval that outlives the request, the sentence stating what that approval covers SHALL describe the owning agent's actual persistence semantics and SHALL name only that agent. Two agents with different semantics SHALL have different sentences.
 
+Choosing that approval SHALL open a confirmation step on the card rather than reply. The confirmation SHALL name the action being authorized, list each future-approval pattern the owning agent supplied, verbatim and in that agent's own syntax, visibly apart from the request's own resources, and state the approval's lifetime in the owning agent's terms. The list SHALL be what the agent supplied; the surface MUST NOT derive it from the displayed request. When the agent supplied a single wildcard covering the whole permission, the confirmation SHALL state that every request of that action will be allowed, naming the action. When the agent supplied no reusable pattern, the confirmation SHALL state that confirming covers only this request. The confirmation SHALL offer explicit Confirm and Cancel choices; only Confirm SHALL send the persistent reply, once. Cancel, and Escape while the confirmation has keyboard focus, SHALL return the card to its pending choices without sending any reply and without changing the request's state. When the confirmation opens, keyboard focus SHALL move into it. If the request resolves while the confirmation is open, the card SHALL recede as a resolved request does. The single-occurrence approval, rejection, and agent-provided approval intents SHALL be unaffected.
+
 #### Scenario: Each agent's card states its own reach
 - **WHEN** a permission card is shown for a conversation owned by a given agent
 - **THEN** its scope sentence describes that agent's persistent-approval lifetime
 - **AND** no other agent is named on the card
+
+#### Scenario: Choosing the persistent approval asks for confirmation
+- **WHEN** the user chooses the persistent approval on a pending request
+- **THEN** no reply is sent
+- **AND** the card shows the action, the agent-supplied patterns apart from the request's resources, the agent's lifetime sentence, and Confirm and Cancel
+
+#### Scenario: Confirm sends the persistent reply once
+- **WHEN** the user chooses Confirm on the confirmation
+- **THEN** the agent receives its persistent-approval reply exactly once
+- **AND** the card records the persistent approval as it did before this change
+
+#### Scenario: Cancel returns to the pending choices
+- **WHEN** the user chooses Cancel on the confirmation
+- **THEN** the card shows its pending choices again
+- **AND** no reply has been sent and the request is still pending
+
+#### Scenario: Escape cancels the confirmation
+- **WHEN** the confirmation has keyboard focus and the user presses Escape
+- **THEN** the card shows its pending choices again
+- **AND** no reply has been sent
+
+#### Scenario: A sole wildcard names the whole action
+- **WHEN** the agent's only future-approval pattern is a wildcard covering the whole permission
+- **THEN** the confirmation states that every request of that action will be allowed, naming the action
+- **AND** it does not present the wildcard as though it were one command
+
+#### Scenario: No reusable pattern is said plainly
+- **WHEN** the agent supplied no future-approval pattern for the request
+- **THEN** the confirmation states that confirming covers only this request
+- **AND** it does not present the displayed command as the pattern
+
+#### Scenario: A request resolved elsewhere closes its confirmation
+- **WHEN** the request resolves while its confirmation is open
+- **THEN** the card recedes as a resolved request
+- **AND** Confirm and Cancel are no longer offered
+
+#### Scenario: The other choices are unchanged
+- **WHEN** the user chooses the single-occurrence approval, rejection, or an agent-provided approval intent
+- **THEN** the reply is sent on that choice without a confirmation step
 
 ### Requirement: Timeline marks conversation compaction
 Where an agent reports that it compacted the conversation's context, Chat SHALL place a marker in the timeline at that point stating that compaction happened and, where reported, the before and after token figures. Content before the marker SHALL remain readable.
@@ -1504,3 +2179,391 @@ Where an agent reports that it compacted the conversation's context, Chat SHALL 
 - **WHEN** the agent reports a compaction between two turns of activity
 - **THEN** the timeline shows a compaction marker between them with the figures reported
 - **AND** the earlier content remains in the timeline
+
+### Requirement: Chat transport recovery is observable and self-correcting
+The conversation and inventory event streams SHALL maintain transport liveness during normal idle periods and SHALL reconnect with bounded backoff after interruption. Opening a replacement stream MUST count as successful transport recovery even when no application event is immediately available: it SHALL reset consecutive-failure accounting and clear only the connection-interruption status owned by that stream. Keepalives MUST NOT appear as conversation or inventory events and MUST NOT alter projections, unread state, or timeline content.
+
+The Chat surface MUST NOT continue to claim that it is reconnecting after its replacement stream has opened successfully. A later independent interruption MAY be reported normally. Resuming a suspended page or restoring network connectivity SHALL trigger authoritative inventory reconciliation and ensure the selected conversation's stream is current without discarding drafts, timeline position, or already received content.
+
+A hidden page SHALL NOT permanently close the Chat surface. Chat MAY release its streams whenever the page is hidden, however the browser announces it, and MUST continue to save drafts on that signal, but it MUST remain able to resubscribe so that returning to a still-running page restores conversation and inventory delivery. Chat MUST NOT stay closed for the life of a document that is still running.
+
+While Chat reports a connection interruption, it SHALL offer the user an action that attempts recovery, so a stalled surface is never a dead end on a device with no browser reload control. That action MUST NOT discard drafts, timeline position, or content already received when recovery succeeds in place.
+
+#### Scenario: Idle reconnect clears stale interruption status
+- **WHEN** a Chat stream is interrupted, reports a reconnecting status, and then opens successfully while no conversation event is emitted
+- **THEN** the reconnecting status is cleared promptly
+- **AND** the client does not wait for later assistant output to recognize recovery
+
+#### Scenario: Successful open resets failure accounting
+- **WHEN** a replacement Chat stream opens after one or more failed attempts
+- **THEN** consecutive-failure accounting resets for that stream
+- **AND** a later interruption begins a new recovery sequence rather than inheriting the old failure count
+
+#### Scenario: Keepalive has no presentation effect
+- **WHEN** an idle conversation or inventory stream emits a transport keepalive
+- **THEN** no timeline item, inventory change, unread marker, or user-facing activity is produced
+
+#### Scenario: Suspended Chat resumes from authoritative state
+- **WHEN** a suspended page resumes after missing inventory or conversation events
+- **THEN** Chat reconciles the authoritative inventory and ensures the selected conversation stream is current
+- **AND** preserves drafts, timeline position, and content already received
+
+#### Scenario: A backgrounded standalone Chat resubscribes when reopened
+- **WHEN** a page installed to the home screen is backgrounded, the browser announces the hide in a form that does not promise a later restore, and the user reopens the still-running page
+- **THEN** Chat resubscribes its inventory and selected conversation streams
+- **AND** the composer draft written before the page was backgrounded is still present
+
+#### Scenario: An interrupted Chat offers a way back
+- **WHEN** Chat reports a connection interruption to the user
+- **THEN** an action that attempts recovery is available from that report
+- **AND** recovering in place leaves the draft, timeline position, and received content intact
+
+#### Scenario: Client recoveries are independent
+- **WHEN** one of multiple clients viewing the same conversation loses and restores its transport
+- **THEN** that client resumes from its retained cursor or reconciles from a fresh snapshot as required
+- **AND** the other clients' streams continue without interruption
+
+### Requirement: Conversation subscriptions ride the brokered stream
+When a session is served through the hub, a selected conversation's ordered events — and an open subagent transcript's — SHALL be delivered as `conversation` topics of the hub's brokered live stream, subscribed and unsubscribed on the open connection as the selection changes. The cursor and resync semantics of conversation updates SHALL hold per topic: a retained cursor replays later events once in order, and a non-replayable cursor requires a fresh snapshot for that conversation only. Selecting a conversation MUST NOT open an additional HTTP connection, and the reconnect-status ownership rules for the chat surface SHALL apply to the brokered stream: a successful open clears only the chat surface's connection-interruption status.
+
+#### Scenario: Switching conversations reuses the connection
+- **WHEN** a user selects a different conversation on a hub-served page
+- **THEN** the previous conversation's topic is unsubscribed and the new one subscribed from its snapshot cursor
+- **AND** no HTTP connection is opened or closed
+
+#### Scenario: A subagent drill-down is one more topic
+- **WHEN** a user opens a subagent transcript from the parent conversation
+- **THEN** the transcript's events arrive as a second conversation topic on the same stream
+- **AND** closing it unsubscribes that topic and leaves the parent's subscription intact
+
+### Requirement: OpenCode history reuse preserves authoritative pagination
+
+Repeated paging through a verified unchanged OpenCode conversation within the documented reuse limits SHALL avoid a complete provider-history traversal for each page. Reusable history SHALL be bounded in memory and isolated by workspace and conversation. Eviction or a history larger than those limits SHALL fall back to authoritative reads without losing content. Native provider history remains authoritative: content edits, new messages, undo, redo, revert, restore, deletion, and replay gaps SHALL invalidate or reconcile affected reusable state before it is represented as current. When freshness cannot be established, the system SHALL perform authoritative reconciliation rather than return an unverified history snapshot as current.
+
+History optimization MUST preserve the existing merge of supported provider stores, normalized ordering, accounting, child attribution, and the snapshot-to-stream boundary. Older-page cursors SHALL either deliver correctly ordered, nonduplicated history or explicitly require a fresh snapshot when no longer applicable.
+
+#### Scenario: Repeated reads of unchanged history
+- **WHEN** a client requests adjacent pages of a retained conversation within the reuse limits whose source version is verified unchanged
+- **THEN** the server reuses the verified history without traversing all provider pages again for each request
+- **AND** page boundaries contain no duplicates or omissions
+
+#### Scenario: History changes after reuse was established
+- **WHEN** a history mutation, external edit, or replay gap invalidates previously read history
+- **THEN** the next authoritative snapshot reflects the changed history
+- **AND** incompatible older cursors do not silently skip or repeat messages
+
+#### Scenario: Compatibility history remains complete
+- **WHEN** supported provider stores contain different portions of a conversation
+- **THEN** optimized history includes the same merged content as authoritative reconciliation
+- **AND** an unavailable store is not silently treated as empty unless its response is an established missing-store condition
+
+### Requirement: Remembered conversation restoration survives an empty startup inventory
+
+When Chat bootstrap receives an empty conversation inventory and this client has a remembered conversation selection that has not been superseded by a user action, Chat SHALL retain the intent to restore that exact conversation. If a later successful inventory includes it, Chat SHALL open its history and resume its live updates without requiring a page reload, a manual conversation switch, or a new conversation. After the read succeeds, its saved draft SHALL be restored and its composer SHALL obey the normal conversation controls rather than remaining disabled because restoration was skipped.
+
+Deferred restoration SHALL be attempted only once per bootstrap intent. Repeated inventory updates before or after the attempt SHALL NOT duplicate the opening read or live subscription. A failed opening read SHALL expose the normal actionable read error and explicit retry; inventory updates alone SHALL NOT automatically retry that failed read.
+
+An explicit conversation selection or a user-confirmed new-conversation action SHALL supersede deferred restoration. This precedence SHALL apply while creation is in flight and SHALL remain in effect if creation fails. Dismissing the agent-choice menu without choosing an agent SHALL NOT count as a confirmed creation action. A delayed result from an obsolete opening read SHALL NOT replace a subsequently selected conversation.
+
+While restoration is pending, repeated inventories that omit the remembered conversation SHALL NOT turn that pending intent into a deletion-recovery attempt or select an unrelated conversation. Without a remembered selection, this rule SHALL NOT automatically open newly discovered conversations. This behavior SHALL NOT change existing bootstrap selection from a nonempty inventory, force Chat open, move keyboard focus, or alter inventory-awareness acknowledgement.
+
+#### Scenario: A saved OpenCode conversation arrives after cold startup
+- **GIVEN** this client remembers an OpenCode conversation with persisted history and a local draft
+- **AND** the initial workspace conversation inventory is empty while OpenCode starts
+- **WHEN** a later inventory includes the remembered conversation and no user action has superseded restoration
+- **THEN** Chat selects and loads that conversation's history and subscribes to its live updates
+- **AND** the saved draft is restored and normal composer actions become available after loading
+- **AND** the user does not need to switch conversations or reload the page
+
+#### Scenario: Repeated inventories do not duplicate restoration
+- **GIVEN** a remembered conversation's deferred opening read is pending or has succeeded
+- **WHEN** more inventory updates contain the same conversation
+- **THEN** those updates do not issue another opening read or add another live subscription
+
+#### Scenario: The remembered conversation remains absent for several reads
+- **GIVEN** deferred restoration is pending after an empty startup inventory
+- **WHEN** subsequent inventories are empty or contain only other conversations
+- **THEN** Chat keeps restoration pending without fetching the absent conversation or opening a different one
+- **AND** the user can explicitly select or create a conversation
+- **AND** a later inventory containing the remembered conversation can still complete restoration if no user action superseded it
+
+#### Scenario: Manual selection wins over late restoration
+- **GIVEN** deferred restoration of a remembered conversation is pending
+- **WHEN** the user explicitly selects another conversation before the remembered conversation arrives
+- **THEN** later inventory updates do not open the remembered conversation
+- **AND** the user's selected conversation and local draft remain in place
+
+#### Scenario: Creation wins before its response arrives
+- **GIVEN** deferred restoration is pending
+- **WHEN** the user confirms creation of a new conversation and the remembered conversation appears while that creation request is in flight
+- **THEN** Chat does not open the remembered conversation
+- **AND** successful creation selects the newly created conversation through the normal creation flow
+
+#### Scenario: Failed creation does not re-arm restoration
+- **GIVEN** a confirmed creation action has superseded deferred restoration
+- **WHEN** creation fails and a later inventory includes the remembered conversation
+- **THEN** Chat retains the creation error and does not automatically open the remembered conversation
+- **AND** the user can explicitly select a conversation or retry creation
+
+#### Scenario: Dismissing agent choice does not abandon restoration
+- **GIVEN** deferred restoration is pending and creation requires choosing an agent
+- **WHEN** the user dismisses the agent-choice menu without choosing one
+- **THEN** no creation request is made
+- **AND** the remembered conversation can still be restored when its inventory entry arrives
+
+#### Scenario: Failed restoration offers explicit read retry
+- **GIVEN** the remembered conversation has arrived and its deferred opening read fails
+- **WHEN** Chat reports that failure and another inventory update includes the conversation
+- **THEN** Chat keeps an actionable read error with explicit retry rather than appearing successfully loaded
+- **AND** that inventory update does not retry history automatically
+- **AND** explicit read retry loads the same conversation without creating a conversation or submitting a prompt
+
+#### Scenario: A late history response does not undo a newer selection
+- **GIVEN** deferred restoration has started loading the remembered conversation
+- **WHEN** the user selects another conversation before that history response arrives
+- **THEN** the obsolete response cannot replace the newer selection, timeline, draft, or subscription
+
+#### Scenario: No saved selection does not introduce auto-selection
+- **GIVEN** the initial inventory is empty and this client has no remembered conversation
+- **WHEN** conversations appear in later inventory updates
+- **THEN** Chat lists them without automatically opening one under deferred-restoration behavior
+
+#### Scenario: Existing startup selection and attention behavior remain unchanged
+- **WHEN** bootstrap receives a nonempty inventory
+- **THEN** Chat uses its existing saved-selection or initial fallback behavior without arming deferred restoration
+- **AND** subsequent inventory updates preserve that selection
+
+#### Scenario: Deferred restoration does not take over another surface
+- **GIVEN** restoration is pending and the user has hidden Chat or focused another control
+- **WHEN** the remembered conversation arrives and restoration completes
+- **THEN** Chat does not open itself or move keyboard focus
+- **AND** existing inventory-awareness acknowledgement rules remain unchanged
+
+### Requirement: Chat serves whichever OpenCode generation the workspace has installed
+UatuCode SHALL converse through an OpenCode 1.x server and through an OpenCode 2.x server with the same Chat surface, the same agent identity, and the same conversation operations. The generation is a property of the spawned server, decided by its readiness answer, and SHALL be fixed for that server's lifetime; a later start — a retry, a restart after an unexpected exit — SHALL decide again, so a binary replaced on disk is served by the matching generation without a workspace restart. Conversation identifiers, capability declarations, and the chat routes SHALL NOT change form between generations; a capability the running generation cannot back SHALL be left undeclared rather than declared and broken.
+
+Normalization SHALL recognize each generation's event vocabulary — 1.x's cumulative and incremental announcements and 2.x's typed session events — and produce the same ordered conversation events for the same activity: text and reasoning, tool lifecycle, shell commands, permission requests and replies, structured questions and their answers, compaction, staged and committed reverts, usage, turn status, cancellation, completion, and errors. A 2.x structured form SHALL be presented as a structured question: each field becomes one question, a field with options offers those options, a field allowing custom input offers a free-form answer, and answering or rejecting it sends exactly one reply to the form OpenCode is waiting on. Loading a conversation SHALL reconcile pending requests against the running generation's own pending sets — permission requests and forms on 2.x — so a request announced while the stream was interrupted is still answerable. A 2.x permission request names the tool call it belongs to; normalization SHALL carry that reference onto the request, from the live announcement and from the pending set alike, so the surface can show the call. A 1.x request that carries no such reference SHALL be unaffected by its absence. On either generation, a request whose action is an MCP tool's registered name SHALL carry the MCP server and tool it resolves to, resolved against the servers that generation reports, from the live announcement and from the pending set alike.
+
+Every call to a 2.x server SHALL be scoped to the workspace directory, and events for another directory served by the same server MUST NOT reach the workspace's conversations.
+
+#### Scenario: A 2.x workspace holds a conversation
+- **WHEN** the workspace's `opencode` is a 2.x binary and the user creates a conversation, sends a prompt, and the agent runs a tool and answers
+- **THEN** Chat becomes ready, the conversation streams the answer with its tool activity, and history reloads the same timeline
+
+#### Scenario: A 1.x workspace is unchanged
+- **WHEN** the workspace's `opencode` is a 1.x binary
+- **THEN** Chat behaves as before this change, with the same declared capabilities
+
+#### Scenario: A replaced binary is served by its own generation
+- **WHEN** a 1.x server was running, exits, and the next start finds a 2.x binary on the search path
+- **THEN** the restarted service is served as 2.x without restarting the workspace
+- **AND** the reported version is the 2.x version
+
+#### Scenario: A 2.x form is answered as a structured question
+- **WHEN** a 2.x agent raises a form with a single-choice field, a multiple-choice field, and a free-text field
+- **THEN** the conversation shows one structured question per field with the choices OpenCode supplied
+- **AND** submitting the answers replies to the form once, and the agent continues
+
+#### Scenario: A 2.x form is rejected
+- **WHEN** the user rejects a structured question raised as a 2.x form
+- **THEN** OpenCode's form is cancelled once and the request records its outcome
+
+#### Scenario: A 2.x permission is approved persistently
+- **WHEN** a 2.x agent asks permission with saved patterns and the user chooses persistent approval
+- **THEN** the confirmation lists the patterns OpenCode supplied for that request
+- **AND** confirming sends OpenCode's persistent reply once
+
+#### Scenario: A 2.x MCP permission is tied to its tool call
+- **WHEN** a 2.x agent asks permission to call an MCP tool and names the tool call the request belongs to
+- **THEN** the request carries that call's reference
+- **AND** the request carries the MCP server and tool the action resolves to
+- **AND** the card shows the call's arguments
+
+#### Scenario: A 2.x request missed by the stream is recovered on load
+- **WHEN** a 2.x server raised a permission request or a form while the event stream was interrupted, and the user then opens that conversation
+- **THEN** the pending request appears and can be answered
+- **AND** a recovered permission that names its tool call carries that reference
+
+#### Scenario: Another directory's activity on a 2.x server stays out
+- **WHEN** a 2.x server announces events for a session in a directory other than the workspace's
+- **THEN** no conversation in the workspace changes
+
+#### Scenario: A 2.x event the server does not handle is counted, not fatal
+- **WHEN** a 2.x server emits an event type normalization does not handle
+- **THEN** the event is skipped and counted by type, and later events are delivered
+
+### Requirement: Skills are offered as slash commands on every OpenCode generation
+The command inventory Chat reports for an OpenCode agent SHALL include the skills OpenCode has loaded for the workspace, each as a command of kind `skill`, on both the 1.x and the 2.x generation. On 2.x, where OpenCode keeps skills in a catalog apart from its config commands, Chat SHALL read both catalogs and present their union together with Chat's own built-in commands; a name present in more than one source SHALL appear once, with a config command taking precedence over a skill of the same name and a built-in yielding to either. The slash palette SHALL mark a skill entry with a visible "skill" label so a skill and a command with similar names are told apart.
+
+Submitting `/<skill> <arguments>` on 2.x SHALL invoke the skill the way OpenCode's own 2.x clients do: as a prompt that carries the skill as an attachment identified by the skill's id, whose text is the skill mention followed by the arguments (`@<skill-id> <arguments>`, or `@<skill-id>` alone when there are none). The resulting user turn SHALL read as that invocation in the live timeline and after the conversation's history is reloaded. Whether a `/<name>` is a command or a skill SHALL be decided when the message is sent, against the agent's current commands and skills: a name that is no longer either is sent as ordinary text, as any unknown `/<name>` is. A skill OpenCode drops after that decision but before it runs SHALL be refused in the conversation the way an invalid command is, and MUST NOT be sent as prose. Skill dispatch on 1.x is unchanged.
+
+#### Scenario: A 2.x skill appears in the palette
+- **WHEN** the workspace's OpenCode is 2.x and it has loaded a skill named `openspec-apply-change`
+- **THEN** typing `/openspec` lists `/openspec-apply-change` with the skill's description and a "skill" label
+- **AND** OpenCode's config commands and Chat's built-ins are listed alongside it
+
+#### Scenario: A 2.x skill is invoked with arguments
+- **WHEN** the user submits `/openspec-apply-change my-change` on a 2.x conversation
+- **THEN** OpenCode receives a prompt with the skill attached and the text `@openspec-apply-change my-change`
+- **AND** the conversation shows a user turn reading `@openspec-apply-change my-change`
+- **AND** reopening the conversation shows the same user turn
+
+#### Scenario: A skill removed before the message is sent goes out as text
+- **WHEN** the user submits `/<skill>` for a skill that was in the palette but is no longer one of the agent's commands or skills when the message is sent
+- **THEN** the text is sent as an ordinary prompt, as any unknown `/<name>` is
+
+#### Scenario: A skill OpenCode drops as it is dispatched is refused
+- **WHEN** a skill is still listed when the message is sent but OpenCode no longer has it when uatu dispatches it
+- **THEN** the conversation shows OpenCode's refusal and no prose is sent
+
+#### Scenario: A 1.x skill is unchanged
+- **WHEN** the workspace's OpenCode is 1.x
+- **THEN** skills are listed and dispatched as before this change, now with the "skill" label in the palette
+
+### Requirement: Users can reload OpenCode's configuration on 2.x
+When the running OpenCode generation offers configuration reload (2.x), Chat SHALL offer a built-in `/reload` command that asks OpenCode to reload its configuration for the workspace. It MUST NOT be offered on a generation without that operation (1.x). Reload applies to every conversation served by that OpenCode server; it requires no confirmation and SHALL NOT interrupt a running turn, which OpenCode continues under the reloaded configuration.
+
+The conversation in which `/reload` was submitted SHALL show that the reload is in progress, then its outcome: success, or failure with the message OpenCode reported. Success means OpenCode has confirmed its rebuilt commands, skills, models, and agents; a reload OpenCode does not confirm within a bounded time SHALL be reported as unconfirmed, not as success. The `/reload` turn SHALL NOT remain in the timeline as a user prompt and MUST NOT be sent to the model. Arguments after `/reload` are ignored: `/reload now` reloads the same way. After a successful reload, the client that invoked it SHALL re-read the agent's commands (including skills), models, and modes so the palette and pickers reflect the new configuration without a page reload. Any other open client SHALL show the reloaded catalogs no later than when it next starts a slash query, opens the configuration picker, or selects a conversation, without a page reload.
+
+#### Scenario: Reload succeeds
+- **WHEN** the user submits `/reload` on a 2.x conversation after adding a skill to the workspace's OpenCode configuration
+- **THEN** the conversation shows the reload in progress and then "Configuration reloaded"
+- **AND** the new skill appears in the palette without reloading the page
+
+#### Scenario: Reload fails
+- **WHEN** OpenCode refuses or fails the reload
+- **THEN** the conversation shows the failure with OpenCode's message
+- **AND** the catalogs shown are the ones from before the attempt
+
+#### Scenario: A reload queued behind a running turn refreshes when it completes
+- **WHEN** the user submits `/reload` while a turn in the same conversation is running, so the reload is queued
+- **THEN** the running turn's completion does not count as the reload's
+- **AND** the invoking client re-reads its catalogs when the reload itself completes
+
+#### Scenario: Reload while another conversation is running
+- **WHEN** a turn is running in another conversation of the same workspace and the user submits `/reload`
+- **THEN** the reload proceeds without a confirmation prompt
+- **AND** the running conversation is not interrupted
+
+#### Scenario: Another open client sees the reloaded catalogs
+- **WHEN** a second client has the same workspace's Chat open and another client's `/reload` added a skill
+- **THEN** typing that skill's name after `/` in the second client lists it, without reloading the page
+
+#### Scenario: Reload is not offered on 1.x
+- **WHEN** the workspace's OpenCode is 1.x
+- **THEN** `/reload` is not in the palette and submitting it is treated as ordinary prompt text
+
+### Requirement: The conversation timeline marks the day its content happened
+For every agent's conversations, the timeline — the main transcript and a
+subagent drill-down alike — SHALL place a day separator at the start of
+each run of content that happened on one local calendar day of the reader,
+including the first day shown. Content with no known time — none
+reported, or a placeholder time before the year 2001 — SHALL be treated as
+belonging to the day of the content before it and SHALL NOT start a
+separator. Content whose reported time is later than the reader's clock
+SHALL be treated as happening now, so that no separator names a day after
+the reader's current day. A separator SHALL read "Today" or "Yesterday" for those days,
+and otherwise the short weekday and the ISO date (`YYYY-MM-DD`), such as
+"Sun 2026-09-20"; days SHALL be those of the reader's time zone, and only
+the weekday name MAY follow the reader's locale. Replayed or paged-in history SHALL be separated by the same
+rule as live content, from the times each agent reports for it. While the
+reader scrolls through a day's content, that day's separator SHALL remain
+visible at the top of the transcript until the next day's separator
+replaces it. Only the pinned separator's label SHALL cover the
+transcript: content beside the label SHALL stay visible and reachable by
+taps and selection, and at most one day's label SHALL be visible at the top
+at a time. Content scrolled to — by prompt navigation, by revealing an
+item, or by find — SHALL come to rest below the pinned separator rather
+than under it, and a separator that is not pinned SHALL NOT cover any part
+of the content before it. Separators SHALL NOT be treated as timeline
+items: they SHALL NOT participate in scroll anchoring, activity grouping,
+item actions, or find matches.
+When the reader's local day changes while a conversation is shown, the
+existing separators SHALL be relabelled without waiting for new content.
+
+#### Scenario: Messages on different days are separated
+- **WHEN** a conversation has messages from two days ago, yesterday, and today
+- **THEN** the timeline shows a separator with the short weekday and ISO date, such as "Wed 2026-09-23", before the first of the oldest day's content
+- **AND** a "Yesterday" separator before yesterday's first content
+- **AND** a "Today" separator before today's first content
+
+#### Scenario: A single-day conversation from the past states its day
+- **WHEN** the reader reopens a conversation whose content all happened on one earlier day
+- **THEN** one separator naming that day appears above its first content
+
+#### Scenario: Replayed history is dated
+- **WHEN** the reader opens a Claude Code or OpenCode conversation whose history is read back from the agent's stored transcript
+- **THEN** its day separators reflect the times the agent recorded for that content, not the time it was read
+
+#### Scenario: The day stays visible while scrolling back
+- **WHEN** the reader scrolls up through a long day of content so that its separator has scrolled out of view
+- **THEN** that day's separator remains visible at the top of the transcript
+- **AND** it is replaced by the earlier day's separator once the reader scrolls past that day's boundary
+
+#### Scenario: Only the day label covers the transcript
+- **WHEN** a day's separator is pinned at the top of the transcript while the reader scrolls through that day
+- **THEN** the transcript text to the left and right of the label stays visible and can be tapped or selected
+- **AND** when the next day's separator reaches the top, only one day's label is visible, never one behind the other
+
+#### Scenario: Separators follow the reader's time zone
+- **WHEN** two messages were sent at 23:50 and 00:10 in the reader's time zone
+- **THEN** a day separator appears between them, regardless of the agent's or server's time zone
+
+#### Scenario: A time slightly ahead of the reader's clock is today
+- **WHEN** it is 23:59 for the reader and a message arrives stamped 00:01 of the next day by an agent whose clock runs ahead
+- **THEN** the message appears under the "Today" separator
+- **AND** no separator names the next day
+
+#### Scenario: Scrolled-to content is not hidden under the pinned day
+- **WHEN** the reader jumps to a prompt, or find reveals a match, inside a day whose separator is pinned at the top of the transcript
+- **THEN** the prompt or the match comes to rest below the pinned separator
+
+#### Scenario: Find does not match day separators
+- **WHEN** the reader searches the conversation for "Today" or "Yesterday"
+- **THEN** only occurrences in the conversation's content are counted, not the separators' labels
+- **AND** a separator relabelled at midnight does not change the count of an open search
+
+#### Scenario: Labels roll over at midnight
+- **WHEN** a conversation stays open across the reader's local midnight
+- **THEN** the separator that read "Today" reads "Yesterday" and the one that read "Yesterday" reads the short weekday and ISO date, without new content arriving
+
+#### Scenario: Separators do not disturb reading position
+- **WHEN** a new day's first content arrives while the reader is paused above the end of the timeline
+- **THEN** the reader's anchored position is preserved as for any other appended content
+
+### Requirement: Slash-command suggestions show their descriptions in full
+Slash-command suggestions, for every agent, SHALL wrap a command's name,
+description, and argument hint onto further lines rather than truncating
+them, and every suggestion SHALL show its complete description whether or
+not it is highlighted. The suggestion list SHALL remain scrollable, SHALL
+NOT scroll horizontally in desktop or touch layouts, and SHALL keep the
+highlighted suggestion in view as the highlight moves. When a long command
+name leaves too little room beside it, the argument hint SHALL move onto
+its own line rather than wrapping into a narrow column. An argument hint
+SHALL wrap only at its spaces, keeping each space-separated token whole,
+unless a single token is wider than the whole suggestion list.
+
+#### Scenario: A long description wraps
+- **WHEN** the user types `/code` and the agent offers `/code-review` with a description longer than one line of the suggestion list
+- **THEN** the description continues onto further lines instead of ending in an ellipsis on one line
+
+#### Scenario: Every suggestion shows its full description
+- **WHEN** the suggestion list shows several commands with multi-line descriptions
+- **THEN** each suggestion shows its complete description, highlighted or not
+
+#### Scenario: The highlight stays in view among tall suggestions
+- **WHEN** the user moves the highlight with the keyboard past suggestions whose descriptions span several lines
+- **THEN** the highlighted suggestion is scrolled into view within the list
+
+#### Scenario: Both agents wrap alike
+- **WHEN** a Claude Code conversation and an OpenCode conversation each offer a command with a long description
+- **THEN** both suggestion lists wrap that description the same way
+
+#### Scenario: A long name does not squeeze the argument hint
+- **WHEN** a narrow touch layout offers a command whose name is nearly as wide as the suggestion list, with an argument hint
+- **THEN** the argument hint is shown on its own line at a readable width rather than wrapping one character per line
+
+#### Scenario: An argument hint wraps only at its spaces
+- **WHEN** a narrow touch layout offers a command whose argument hint, such as `[path/to/a/long/argument] [--comment]`, does not fit on one line
+- **THEN** the hint wraps between its tokens, so `[--comment]` stays whole and no `]` is left on a line of its own
+- **AND** only a token wider than the whole suggestion list is broken inside

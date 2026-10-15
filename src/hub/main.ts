@@ -13,7 +13,10 @@ import { CredentialMetadataStore, CredentialTokenStore, CredentialToolOverrideSt
 import { CredentialToolManager, readyToolPath } from "./credential-tools";
 import { OpenPgpCredentialManager, type OpenPgpCredentialOperations } from "./openpgp-credentials";
 import { TokenCredentialManager } from "./token-credentials";
-import { createStoredCloneCredentialResolver, createStoredCredentialContextResolver } from "./credential-context";
+import { createStoredCloneCredentialResolver, createStoredCredentialContextResolver, stripAmbientCredentialEnvironment } from "./credential-context";
+import { createAccountRuntimeFactory } from "./agent-account-runtime";
+import { AgentAccountService } from "./agent-account-service";
+import { createAccountChangeNotifier } from "./agent-account-propagation";
 import { CloneJobManager } from "./clone-jobs";
 import { CloneProcessAdapter } from "./clone-process";
 import { FolderManager } from "./folder-manager";
@@ -21,11 +24,14 @@ import { hashPassword, HubSessionStore } from "./auth";
 import { loadHubConfig } from "./config";
 import { WorkspaceRegistry } from "./registry";
 import { PersonalWorkspaceStateStore } from "./personal-state";
+import { ActivityMarkStore } from "./activity-marks";
 import { PathReservationCoordinator } from "./path-reservations";
 import {
+  agentAccountsPath,
   ensureCredentialStateDirs,
   ensureCanonicalStateDir,
   acquireHubStateLease,
+  activityMarksPath,
   credentialGnuPgPath,
   credentialRuntimePath,
   credentialSecretsPath,
@@ -39,11 +45,22 @@ import {
   registryPath,
   resolveHubStateRoot,
   sessionsPath,
+  worktreeJournalPath,
+  worktreeProvenancePath,
 } from "./state-dir";
 import { HubPreferencesStore } from "./preferences";
+import { createWorktreeRenameGuard } from "./worktree-rename-guard";
+import { WorktreeJournal, WorktreeProvenanceStore } from "./worktree-journal";
+import { createOnboardingWorktreeRegistrar } from "./worktree-registrar";
+import { createParentFetchPolicy } from "./worktree-fetch";
+import { WorktreeService } from "./worktree-service";
+import { WorktreeOperationCoordinator } from "./worktree-coordinator";
 import { WorkspaceOnboardingCoordinator } from "./onboarding";
 import { startHubServer } from "./server";
 import { SessionManager } from "./sessions";
+import { NotificationStore } from "./notification-store";
+import { HubNotifications } from "./notifications";
+import { createHubUpstreamSource } from "./live-source";
 
 export type RunHubOptions = {
   configPath?: string;
@@ -104,7 +121,7 @@ export async function stopHubRuntime(parts: {
 }
 
 export async function shutdownHub(parts: {
-  stopServer(): void;
+  stopServer(): void | Promise<void>;
   stateLease: { release(): Promise<void> };
   cloneJobs: { close(): Promise<void> };
   credentialTools?: { shutdown(): Promise<void> } | null;
@@ -116,7 +133,9 @@ export async function shutdownHub(parts: {
   const report = parts.reportError ?? (message => console.error(message));
   let serverStopped = true;
   try {
-    parts.stopServer();
+    // Awaited: the lease must not be released while the server's own
+    // teardown (in-flight pushes, notification state writes) is still running.
+    await parts.stopServer();
   } catch {
     serverStopped = false;
     report("uatu hub: server shutdown failed");
@@ -143,9 +162,25 @@ export function createHubSignalShutdown(options: {
   shutdown(): Promise<HubShutdownResult>;
   forceExit?: (code: number) => void;
   reportRetained?: () => void;
+  // Keeps the process alive while it holds a retained lease. Shutdown has
+  // already stopped the server, so nothing else is guaranteed to hold the
+  // event loop open: without this the process would drain, exit 0, and let
+  // the OS drop the lease the contract says stays held until the next signal.
+  holdProcess?: () => void;
+  // Reports a shutdown that rejected instead of resolving.
+  reportFailure?: (error: unknown) => void;
 }): () => void {
   const forceExit = options.forceExit ?? (code => process.exit(code));
+  const reportFailure = options.reportFailure ?? (error => {
+    console.error(`uatu hub: shutdown failed: ${error instanceof Error ? error.message : String(error)}`);
+  });
+  const holdProcess = options.holdProcess ?? (() => { setInterval(() => {}, 2 ** 31 - 1); });
   let state: "running" | "shutting-down" | "lease-retained" = "running";
+  const retain = () => {
+    state = "lease-retained";
+    holdProcess();
+    options.reportRetained?.();
+  };
   return () => {
     if (state !== "running") {
       forceExit(1);
@@ -154,14 +189,17 @@ export function createHubSignalShutdown(options: {
     state = "shutting-down";
     void Promise.resolve().then(() => options.shutdown()).then(result => {
       if (result.stateLeaseHeld) {
-        state = "lease-retained";
-        options.reportRetained?.();
+        retain();
         return;
       }
       forceExit(result.exitCode);
-    }, () => {
-      state = "lease-retained";
-      options.reportRetained?.();
+    }, error => {
+      // shutdownHub() reports a retained lease by resolving, never by
+      // rejecting; a rejection means the wrapper around it threw, possibly
+      // after the lease was released. Holding the process would claim a
+      // lease nothing proves is held, so exit instead.
+      reportFailure(error);
+      forceExit(1);
     });
   };
 }
@@ -292,8 +330,13 @@ export async function runHub(options: RunHubOptions): Promise<void> {
   const preferences = new HubPreferencesStore(hubPreferencesPath(stateRoot));
   await preferences.load();
   const personalState = new PersonalWorkspaceStateStore(personalWorkspaceStatePath(stateRoot));
+  // What finished where, and who has seen it. Read before the live broker is
+  // assembled: the broker adopts the marks at construction and resumes its
+  // stamp counter above them, and this hub's broker starts watching there
+  // too, before any page connects.
+  const activityMarks = new ActivityMarkStore(activityMarksPath(stateRoot));
   const credentialMetadata = new CredentialMetadataStore(credentialsPath(stateRoot));
-  await Promise.all([personalState.load(), credentialMetadata.load()]);
+  await Promise.all([personalState.load(), credentialMetadata.load(), activityMarks.load()]);
   const credentialTokens = new CredentialTokenStore(credentialTokenStorePath(stateRoot));
   const credentialToolStore = new CredentialToolOverrideStore(credentialToolsPath(stateRoot));
   const credentialTools = new CredentialToolManager(
@@ -436,6 +479,10 @@ export async function runHub(options: RunHubOptions): Promise<void> {
     readiness: credentialId => openPgpRuntime.run(manager => manager.readiness(credentialId)),
   };
   const tokenCredentials = new TokenCredentialManager(credentialMetadata, credentialTokens);
+  // One seam for "whose policy governs this workspace?", shared by the
+  // resolver (which reads the parent's assignments) and the credential API
+  // (which refuses to record assignments on a child).
+  const policyWorkspaceId = (workspaceId: string) => registry.policyWorkspaceId(workspaceId);
   const credentialContexts = createStoredCredentialContextResolver({
     metadata: credentialMetadata,
     tokens: credentialTokens,
@@ -450,16 +497,28 @@ export async function runHub(options: RunHubOptions): Promise<void> {
     },
     tools: contextTools,
     runExclusive: operation => sshRuntime.run(() => operation()),
+    // A registered linked worktree is governed by its parent's policy,
+    // read live through the registry link: credentials and shared
+    // configuration are managed only on the parent, never copied to a child
+    // and never overridden per child.
+    policyWorkspaceId,
   });
   const sessions = new SessionManager(
     registry,
-    { local: new LocalProcessBackend() },
+    {
+      local: new LocalProcessBackend(),
+    },
     credentialContexts,
     // The pending-mutation fence every start is checked against, evaluated
     // inside the queued lifecycle operation. Reached through the closure
     // because the folder manager below takes `sessions` as a dependency; the
     // first start can only come from the server assembled after it.
-    () => folderManager.assertNoPendingMutation(),
+    async workspaceId => {
+      await folderManager.assertNoPendingMutation();
+      // A registered worktree starts only in the checkout it was registered
+      // with: never in a missing folder, never in a replacement.
+      await worktrees.assertStartable(workspaceId);
+    },
   );
   const cloneCredentials = createStoredCloneCredentialResolver({
     metadata: credentialMetadata,
@@ -483,6 +542,12 @@ export async function runHub(options: RunHubOptions): Promise<void> {
     personalState,
     credentials: credentialMetadata,
     reservations,
+    // Renames that would break Git worktree links are refused before any
+    // filesystem mutation, including links to checkouts Uatu never
+    // registered. An unestablished verdict fails closed.
+    worktreeDependencies: createWorktreeRenameGuard({
+      gitCommand: () => activePaths.get("git") ?? path.join(stateRoot, ".unavailable-git"),
+    }),
   });
   await folderManager.recover();
   const onboarding = new WorkspaceOnboardingCoordinator({
@@ -501,6 +566,45 @@ export async function runHub(options: RunHubOptions): Promise<void> {
     workspaceId => registry.byId(workspaceId) !== undefined,
     async workspaceId => { await credentialMetadata.removeWorkspaceAssignments(workspaceId); },
   );
+  const worktrees = new WorktreeService({
+    registry,
+    sessions,
+    journal: new WorktreeJournal(worktreeJournalPath(stateRoot)),
+    provenance: new WorktreeProvenanceStore(worktreeProvenancePath(stateRoot)),
+    registrar: createOnboardingWorktreeRegistrar({ onboarding, registry }),
+    // Removal and "Remove from Uatu" end in the same Hub cleanup the
+    // dashboard's forget performs: registration, personal state and
+    // credential assignments. Checkout, branch and files are never touched.
+    unregister: async workspaceId => {
+      await personalState.forgetWorkspace(
+        workspaceId,
+        () => registry.remove(workspaceId),
+        async () => { await credentialMetadata.removeWorkspaceAssignments(workspaceId); },
+      );
+    },
+    // The same Hub-wide path fence every other folder mutation takes, so a
+    // rename, a clone and a worktree creation cannot race for one hierarchy.
+    coordinator: new WorktreeOperationCoordinator(reservations),
+    assertOperationsAllowed: () => folderManager.assertNoPendingMutation(),
+    git: { gitCommand: () => activePaths.get("git") ?? path.join(stateRoot, ".unavailable-git") },
+    // Fetch uses the parent's selected credential and nothing else: no
+    // ambient agent, helper, netrc or unselected key can take part.
+    fetchPolicy: createParentFetchPolicy({
+      assignments: () => credentialMetadata.snapshot().assignments,
+      resolve: async (remote, credentialId) => cloneCredentials.resolve(remote, credentialId),
+    }),
+  });
+  // A worktree operation interrupted by a restart is reconciled against
+  // actual Git state before the Hub serves: it never deletes content and
+  // never claims a tree it cannot prove it created.
+  try {
+    const recovered = await worktrees.recover();
+    if (recovered) {
+      console.error(`uatu hub: reconciled an interrupted worktree operation (${recovered.kind})`);
+    }
+  } catch (error) {
+    console.error(`uatu hub: a pending worktree operation needs attention: ${error instanceof Error ? error.message : String(error)}`);
+  }
   const cloneJobs = new CloneJobManager({
     processFactory: new CloneProcessAdapter({ gitCommand: () => activePaths.get("git") ?? path.join(stateRoot, ".unavailable-git") }),
     registry,
@@ -513,17 +617,44 @@ export async function runHub(options: RunHubOptions): Promise<void> {
     },
     reservations,
   });
+  const notificationStore = new NotificationStore(path.join(stateRoot, "notifications.json"));
+  await notificationStore.load();
+  const notifications = new HubNotifications({
+    store: notificationStore,
+    contact: config.notifications?.contact,
+    source: createHubUpstreamSource({ sessions, registry }),
+    authorized: (principal, workspaceId) => {
+      const session = sessionStore.resolve(principal.sessionId);
+      return session?.user === principal.user && config.users.some(user => user.name === principal.user) && (workspaceId === undefined || Boolean(registry.byId(workspaceId)));
+    },
+    workspaceName: id => registry.byId(id)?.displayName ?? id,
+  });
+  // The machine's agent logins. Its runtimes see the environment workspaces
+  // see, so they read and write the same agent stores.
+  const agentAccounts = new AgentAccountService({
+    runtimes: createAccountRuntimeFactory({
+      cwd: agentAccountsPath(stateRoot),
+      env: stripAmbientCredentialEnvironment(process.env),
+    }),
+    // Running workspaces replay each change on their own agent servers.
+    onChanged: createAccountChangeNotifier({ sessions }),
+  });
   const server = startHubServer({
     config,
+    agentAccounts,
     registry,
     sessions,
     sessionStore,
     personalState,
+    activityMarks,
+    watchActivityFromStart: true,
+    notifications,
     preferences,
     onboarding,
     gitCommand: () => activePaths.get("git") ?? path.join(stateRoot, ".unavailable-git"),
     cloneCredentials,
     cloneJobs,
+    worktrees,
     folderManager,
     reservations,
     credentialApi: {
@@ -533,9 +664,11 @@ export async function runHub(options: RunHubOptions): Promise<void> {
       openpgp: openPgpOperations,
       tokens: tokenCredentials,
       workspaceExists: workspaceId => registry.byId(workspaceId) !== undefined,
+      policyWorkspaceId,
     },
   });
 
+  notifications.start();
   const scheme = config.tls ? "https" : "http";
   console.log(`${scheme}://${config.host}:${server.port}/`);
   console.error(
@@ -549,7 +682,20 @@ export async function runHub(options: RunHubOptions): Promise<void> {
       // credential operation could otherwise restart the SSH agent after
       // shutdown observed it stopped, orphaning its socket past exit.
       return await shutdownHub({
-        stopServer: () => server.stop(true),
+        stopServer: async () => {
+          // End brokered client streams and abort their child upstreams
+          // before the socket-level stop, so the cancellation reaches the
+          // children the runtime is about to stop.
+          server.live.endAll();
+          server.liveBroker.dispose();
+          server.stop(true);
+          // Anything still inside the marks' debounce is owed to the next
+          // hub: write it before the process goes.
+          await activityMarks.flush();
+          activityMarks.close();
+          await notifications.dispose();
+          await agentAccounts.dispose();
+        },
         stateLease,
         cloneJobs: server.cloneJobs,
         credentialTools,

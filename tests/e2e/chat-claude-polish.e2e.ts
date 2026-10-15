@@ -3,26 +3,17 @@
 // real model — the context readout's sources, compaction, versioned model
 // names and the app-only set, typed model ids, Bash rows naming their
 // commands, agent-specific permission copy, and dialog cards. Each test that
-// changes what the user sees ends by saving a screenshot into the change's
-// screenshots folder (see its README), so review reads the folder instead of
-// running a session.
+// changes what the user sees ends by capturing a screenshot as evidence
+// (see evidence.ts), so review reads the shots instead of running a session.
 
-import { existsSync } from "node:fs";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
-
-import type { APIRequestContext, Page, TestInfo } from "@playwright/test";
+import type { APIRequestContext, Page } from "@playwright/test";
 
 import { withMoreModels } from "../../src/chat/claude/models";
 import type { ChatModel, ConversationItem } from "../../src/chat/types";
 import { openChatConfiguration, openChatPanel } from "./chat-helpers";
+import { captureScreenshot as capture } from "./evidence";
 import { expect, test } from "./fixtures";
 import { showSurface } from "./navigation-helpers";
-
-const CHANGE_SCREENSHOTS = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../openspec/changes/polish-claude-code-chat/screenshots");
-// The plan-usage readout landed as its own change; its evidence goes to its
-// own folder while the change is open and to the test output once archived.
-const USAGE_SCREENSHOTS = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../openspec/changes/claude-usage-readout/screenshots");
 
 async function control(request: APIRequestContext, body: Record<string, unknown>): Promise<any> {
   const response = await request.post("/__e2e/chat", { data: body });
@@ -30,21 +21,15 @@ async function control(request: APIRequestContext, body: Record<string, unknown>
   return response.json();
 }
 
-async function capture(page: Page, testInfo: TestInfo, name: string, folder = CHANGE_SCREENSHOTS): Promise<void> {
-  await page.evaluate(() => document.fonts.ready);
-  await page.waitForTimeout(150);
-  const target = existsSync(folder) ? path.join(folder, `${name}.png`) : testInfo.outputPath(`${name}.png`);
-  await page.screenshot({ path: target, animations: "disabled", caret: "hide" });
-  await testInfo.attach(name, { path: target, contentType: "image/png" });
-}
-
 // The catalog as Claude Code 2.1.258 answered it on 2026-09-02, after the
-// provider's own naming and the app-only set (chat/claude/models).
+// provider's own naming and the app-only set (chat/claude/models) — with the
+// `sonnet` alias as it resolves since (Sonnet 5.5, 2026-10-01) and every
+// window as Claude Code states it on the probe.
 const claudeModels: ChatModel[] = withMoreModels([
   { selection: { providerId: "anthropic", modelId: "default" }, provider: "Anthropic", name: "Default (recommended)", default: true, detail: "Opus 5 with 1M context · Best for everyday, complex tasks", variants: ["low", "medium", "high", "xhigh", "max"], contextLimit: 1_000_000, imageInput: true, resolvesTo: { providerId: "anthropic", modelId: "opus[1m]" } },
   { selection: { providerId: "anthropic", modelId: "opus[1m]" }, provider: "Anthropic", name: "Opus 5 (1M context)", detail: "Opus 5 with 1M context · Best for everyday, complex tasks", variants: ["low", "medium", "high", "xhigh", "max"], contextLimit: 1_000_000, imageInput: true },
   { selection: { providerId: "anthropic", modelId: "fable[1m]" }, provider: "Anthropic", name: "Fable 5.1", detail: "Fable 5.1 · Most capable for your hardest and longest-running tasks", variants: ["low", "medium", "high", "xhigh", "max"], contextLimit: 1_000_000, imageInput: true },
-  { selection: { providerId: "anthropic", modelId: "sonnet" }, provider: "Anthropic", name: "Sonnet 5", detail: "Sonnet 5 · Efficient for routine tasks", variants: ["low", "medium", "high", "xhigh", "max"], contextLimit: 200_000, imageInput: true },
+  { selection: { providerId: "anthropic", modelId: "sonnet" }, provider: "Anthropic", name: "Sonnet 5.5", detail: "Most efficient for simpler tasks", variants: ["low", "medium", "high", "xhigh", "max"], contextLimit: 1_000_000, imageInput: true, resolvesTo: { providerId: "anthropic", modelId: "claude-sonnet-5-5" } },
   { selection: { providerId: "anthropic", modelId: "haiku" }, provider: "Anthropic", name: "Haiku 4.5", detail: "Haiku 4.5 · Fastest for quick answers", contextLimit: 200_000, imageInput: true },
 ]);
 
@@ -76,16 +61,63 @@ const sessionTotals = {
   ],
 };
 
+/**
+ * A running background task as Claude Code reports one mid-flight (design
+ * D6): `createdAt` is what the elapsed clock counts from, so it is stamped
+ * relative to now rather than to the fixture's ordinal timeline.
+ */
+type BackgroundTask = Extract<ConversationItem, { type: "background_task" }>;
+const runningTask = (taskId: string, description: string, rest: Partial<BackgroundTask> = {}): BackgroundTask => ({
+  id: `task:${taskId}`, type: "background_task", createdAt: Date.now() - 5_000, taskId, description, status: "running", ...rest,
+});
+/** The `task` tool call a subagent run is launched by, still running. */
+const agentTool = (id: string, description: string, subagent: string): ConversationItem => ({
+  id, type: "tool", createdAt: 2, name: "task", status: "running",
+  input: JSON.stringify({ description, subagent_type: subagent, prompt: "go" }),
+});
+/**
+ * The `Skill` tool call a forked skill runs under (design D10, spike Q3).
+ * A fork emits no task edge at all: its frames stream under this tool use
+ * and only its result names the run, so `childConversationId` arrives with
+ * the completed row and never before it.
+ */
+const skillTool = (id: string, createdAt: number, skill: string, status: "running" | "completed", childConversationId?: string, output?: string): ConversationItem => ({
+  id, type: "tool", createdAt, name: "Skill", status,
+  input: JSON.stringify({ skill }),
+  ...(childConversationId === undefined ? {} : { childConversationId }),
+  ...(output === undefined ? {} : { output }),
+});
+/**
+ * The composer's task list, open so its rows can be read and clicked. It
+ * opens itself when running work first appears in it — no disclosure click —
+ * so this asserts that rather than clicking: a click on an open list would
+ * collapse it.
+ */
+async function openTaskList(page: Page) {
+  const list = page.locator("#chat-background-tasks");
+  await expect(list).toBeVisible();
+  await expect(list).toHaveAttribute("open", "");
+  return list;
+}
+
 /** Boots the dual-agent workspace and opens a seeded Claude conversation. */
-async function bootClaude(page: Page, request: APIRequestContext, title: string, items: ConversationItem[] = [], configuration: Record<string, unknown> = {}): Promise<string> {
+async function bootClaude(page: Page, request: APIRequestContext, title: string, items: ConversationItem[] = [], configuration: Record<string, unknown> = {}, touch = false, models: ChatModel[] = claudeModels): Promise<string> {
   await request.post("/__e2e/reset");
   await control(request, { action: "agents", count: 2 });
-  await control(request, { action: "models", agent: "claude", models: claudeModels });
+  await control(request, { action: "models", agent: "claude", models });
   const seeded = await control(request, { action: "seed", agent: "claude", title, items, configuration }) as { conversation: { id: string } };
   const token = await request.get("/__e2e/terminal-token").then(response => response.json()) as { token: string };
   await page.goto(`/?t=${encodeURIComponent(token.token)}`);
-  await expect(page.locator("#connection-state .connection-label")).toHaveText("Connected");
-  await openChatPanel(page);
+  if (touch) {
+    // The same conversation on the phone chrome, where the chat is a tab and
+    // the drill-down takes the whole surface.
+    await expect(page.locator("html")).toHaveAttribute("data-ui-mode", "touch");
+    await page.locator("#touch-tab-chat").click();
+    await expect(page.locator("#chat-surface")).toBeVisible();
+  } else {
+    await expect(page.locator("#connection-state .connection-label")).toHaveText("Connected");
+    await openChatPanel(page);
+  }
   await expect(page.locator("#chat-state")).not.toContainText("Loading chat");
   await page.locator("#chat-conversation-select").selectOption(seeded.conversation.id);
   await expect(page.locator("#chat-context")).toContainText("Claude Code");
@@ -94,6 +126,62 @@ async function bootClaude(page: Page, request: APIRequestContext, title: string,
 
 test.describe("Claude Code chat polish (fixture-driven)", () => {
   test.use({ viewport: { width: 1400, height: 1000 } });
+
+  test("a corrected catalog limit repaints an unchanged usage message", async ({ page, request }) => {
+    const models = claudeModels.map(model => model.selection.modelId === "sonnet" ? { ...model, contextLimit: 200_000 } : model);
+    await bootClaude(page, request, "Late window discovery", [carrier("usage:unchanged", 2, "sonnet", 100, 149_900)], {}, false, models);
+    const label = page.locator("#chat-context-usage-label");
+    await expect(label).toHaveText("75%");
+    await control(request, { action: "models", agent: "claude", models: claudeModels });
+    await expect(label).toHaveText("15%");
+  });
+
+  test("catalog revisions received before the first model response are applied after bootstrap", async ({ page, request }) => {
+    await page.addInitScript(() => {
+      const NativeEventSource = window.EventSource;
+      window.EventSource = class extends NativeEventSource {
+        constructor(url: string | URL, options?: EventSourceInit) {
+          super(url, options);
+          this.addEventListener("live", event => {
+            const envelope = JSON.parse((event as MessageEvent<string>).data);
+            if (envelope.topic === "inventory" && envelope.event?.kind === "data") Reflect.set(window, "__e2eCatalogs", envelope.event.data.catalogs ?? {});
+          });
+        }
+      };
+    });
+    const captured = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    let reads = 0;
+    await page.route(/\/api\/chat\/models\?agent=claude$/, async route => {
+      if (++reads > 1) { await route.continue(); return; }
+      const response = await route.fetch();
+      captured.resolve();
+      await release.promise;
+      await route.fulfill({ response });
+    });
+    try {
+      const staleModels = claudeModels.map(model => model.selection.modelId === "sonnet" ? { ...model, contextLimit: 200_000 } : model);
+      await bootClaude(page, request, "Bootstrap window discovery", [carrier("usage:bootstrap", 2, "sonnet", 100, 149_900)], {}, false, staleModels);
+      await captured.promise;
+      const revision = () => page.evaluate(() => Reflect.get(window, "__e2eCatalogs")?.claude);
+      await expect.poll(revision).toBe("e2e:1");
+      await control(request, { action: "models", agent: "claude", models: claudeModels });
+      await expect.poll(revision).toBe("e2e:2");
+      expect(reads).toBe(1);
+      release.resolve();
+      await expect(page.locator("#chat-context-usage-label")).toHaveText("15%");
+      expect(reads).toBe(2);
+    } finally { release.resolve(); }
+  });
+
+  test("confirming an estimated window updates the source without another usage message", async ({ page, request }) => {
+    const models = claudeModels.map(model => ({ ...model, contextWindow: { source: "estimate" as const, freshness: "current" as const } }));
+    await bootClaude(page, request, "Confirm window", [carrier("usage:same", 2, "sonnet", 100, 149_900)], {}, false, models);
+    await expect(page.locator("#chat-context-usage-label")).toHaveText("~15%");
+    await control(request, { action: "models", agent: "claude", models: models.map(model => ({ ...model, contextWindow: { source: "catalog", freshness: "current" } })) });
+    await expect(page.locator("#chat-context-usage-label")).toHaveText("15%");
+    await expect(page.locator("#chat-context-usage")).toHaveAttribute("data-window-source", "catalog");
+  });
 
   test("the context readout prefers the session's own report and expands to its categories", async ({ page, request }, testInfo) => {
     const id = await bootClaude(page, request, "Context report", [
@@ -129,20 +217,46 @@ test.describe("Claude Code chat polish (fixture-driven)", () => {
     await capture(page, testInfo, "phase1-meter-and-breakdown");
   });
 
+  test("the session's reported window beats the catalog's figure, and an occupancy beyond that figure is not a full window (#347)", async ({ page, request }, testInfo) => {
+    // The catalog's figure for Opus 4.6 is the 200k fallback (no window was
+    // stated for it); the first call already occupies 212k, so the figure is
+    // wrong for this session and nothing is painted as full.
+    const id = await bootClaude(page, request, "Window from the session", [
+      { id: "message:u1", type: "user_message", createdAt: 1, text: "Read the whole tree" },
+      carrier("usage:a1", 2, "claude-opus-4-6", 2, 212_895),
+    ], { model: { providerId: "anthropic", modelId: "claude-opus-4-6" } });
+    const label = page.locator("#chat-context-usage-label");
+    const meter = page.locator("#chat-context-usage");
+    await expect(label).toHaveText("213k");
+    await expect(meter).toHaveAttribute("data-fill", "unknown");
+    await expect(meter).toHaveAttribute("title", "212,897 tokens used · Limit unavailable");
+    // The session states its window: 1M. The report and every later call
+    // measure against it, not the catalog.
+    await control(request, { action: "item", conversationId: id, item: { id: "context:report:1", type: "context_report", createdAt: 3, total: 213_000, max: 1_000_000, model: { providerId: "anthropic", modelId: "claude-opus-4-6" } } });
+    await expect(label).toHaveText("21%");
+    await control(request, { action: "item", conversationId: id, item: carrier("usage:a2", 4, "claude-opus-4-6", 2, 262_895) });
+    await expect(label).toHaveText("26%");
+    await expect(meter).toHaveAttribute("data-fill", "normal");
+    await expect(meter).toHaveAttribute("data-source", "usage");
+    await page.locator("#chat-context-usage > summary").click();
+    await expect(page.locator("#chat-context-usage-breakdown dd").nth(1)).toHaveText("1,000,000");
+    await capture(page, testInfo, "window-from-the-session");
+  });
+
   test("a compaction marker sits between two activity runs and the readout drops after it", async ({ page, request }, testInfo) => {
     const id = await bootClaude(page, request, "Compaction", [
       { id: "message:u1", type: "user_message", createdAt: 1, text: "Audit the scripts" },
-    ], { model: { providerId: "anthropic", modelId: "sonnet" } });
+    ], { model: { providerId: "anthropic", modelId: "haiku" } });
     await control(request, { action: "status", conversationId: id, status: "running" });
     for (const [index, command] of ["./hello.sh", "ls -la", "cat README.md"].entries()) {
       await control(request, { action: "item", conversationId: id, item: bash(`tool:a${index}`, 10 + index, command, "completed", "ok") });
     }
-    await control(request, { action: "item", conversationId: id, item: carrier("usage:a1", 20, "sonnet", 200, 179_800) });
+    await control(request, { action: "item", conversationId: id, item: carrier("usage:a1", 20, "haiku", 200, 179_800) });
     const label = page.locator("#chat-context-usage-label");
     await expect(label).toHaveText("90%");
 
     await control(request, { action: "item", conversationId: id, item: { id: "compaction:1", type: "compaction", createdAt: 21, trigger: "auto", preTokens: 180_000, postTokens: 40_000 } });
-    await control(request, { action: "item", conversationId: id, item: { id: "context:compaction:1", type: "context_report", createdAt: 22, total: 40_000, model: { providerId: "anthropic", modelId: "sonnet" } } });
+    await control(request, { action: "item", conversationId: id, item: { id: "context:compaction:1", type: "context_report", createdAt: 22, total: 40_000, model: { providerId: "anthropic", modelId: "haiku" } } });
     await expect(label).toHaveText("20%");
     for (const [index, command] of ["date", "whoami", "uname -a"].entries()) {
       await control(request, { action: "item", conversationId: id, item: bash(`tool:b${index}`, 30 + index, command, "completed", "ok") });
@@ -168,10 +282,56 @@ test.describe("Claude Code chat polish (fixture-driven)", () => {
     await capture(page, testInfo, "phase1-composer-model-button");
     await openChatConfiguration(page);
     const names = page.locator("#chat-configuration-models .chat-configuration-model-name");
-    await expect(names).toHaveText(["Default (recommended)", "Opus 5 (1M context)", "Fable 5.1", "Sonnet 5", "Haiku 4.5", "Fable 5", "Opus 4.8", "Opus 4.7", "Opus 4.6", "Sonnet 4.6"]);
+    await expect(names).toHaveText(["Default (recommended)", "Opus 5 (1M context)", "Fable 5.1", "Sonnet 5.5", "Haiku 4.5", "Fable 5", "Opus 4.8", "Opus 4.7", "Opus 4.6", "Sonnet 4.6"]);
     const groups = page.locator("#chat-configuration-models .chat-configuration-provider h3");
     await expect(groups).toHaveText(["Anthropic", "More models"]);
     await capture(page, testInfo, "phase1-picker-versioned-names");
+  });
+
+  test("a reopened conversation is measured against the window Claude Code stated for its model", async ({ page, request }, testInfo) => {
+    // Reopened from history: no session report, only the last call's usage.
+    // Sonnet 5.5 runs under an alias with no window marker; the window the
+    // catalog serves is the 1M Claude Code stated before any turn, so 250k
+    // reads as a quarter full, not as an over-full 200k guess.
+    await bootClaude(page, request, "Reopened on Sonnet 5.5", [
+      { id: "message:u1", type: "user_message", createdAt: 1, text: "Summarise the repository" },
+      carrier("usage:a1", 2, "sonnet", 2, 249_998),
+      { id: "message:a1", type: "assistant_message", createdAt: 3, markdown: "Here is the summary.", completedAt: 3 },
+    ], { model: { providerId: "anthropic", modelId: "sonnet" } });
+    const label = page.locator("#chat-context-usage-label");
+    const meter = page.locator("#chat-context-usage");
+    await expect(label).toHaveText("25%");
+    await expect(meter).toHaveAttribute("data-fill", "normal");
+    await page.locator("#chat-context-usage > summary").click();
+    await expect(page.locator("#chat-context-usage-breakdown dd").nth(1)).toHaveText("1,000,000");
+    await capture(page, testInfo, "reopened-sonnet-5-5-stated-window");
+  });
+
+  test("a default the workspace's settings resolve to Fable 5.1 is presented as Fable 5.1", async ({ page, request }, testInfo) => {
+    // The catalog's own default resolves to Sonnet 5.5 (the account
+    // default); `"model": "fable[1m]"` in the settings makes an unpinned
+    // session run Fable 5.1, and the provider presents the default as that.
+    const settingsResolved = claudeModels.map(model => model.default
+      ? { ...model, detail: "Fable 5.1 · Most capable for your hardest and longest-running tasks", resolvesTo: { providerId: "anthropic", modelId: "fable[1m]" } }
+      : model);
+    await bootClaude(page, request, "Default from settings", [], {}, false, settingsResolved);
+    await expect(page.locator("#chat-configuration-summary")).toHaveText("Default · Fable 5.1");
+    await openChatConfiguration(page);
+    const defaultRow = page.locator('#chat-configuration-models button[data-model-value="anthropic/default"]');
+    await expect(defaultRow.locator(".chat-configuration-model-name")).toHaveText("Default (recommended)");
+    await expect(defaultRow.locator(".chat-configuration-model-identity")).toHaveText("Fable 5.1 · Most capable for your hardest and longest-running tasks");
+    await expect(defaultRow).toHaveAttribute("aria-pressed", "true");
+    // The catalog's Sonnet 5.5 entry is still offered on its own.
+    await expect(page.locator('#chat-configuration-models button[data-model-value="anthropic/sonnet"] .chat-configuration-model-name')).toHaveText("Sonnet 5.5");
+    await capture(page, testInfo, "default-resolved-from-settings");
+  });
+
+  test("a default running a model no entry offers is named by its id", async ({ page, request }) => {
+    const unlisted = claudeModels.map(model => model.default
+      ? { ...model, detail: "Runs claude-experimental-9 · Claude Code's own model choice", resolvesTo: { providerId: "anthropic", modelId: "claude-experimental-9" } }
+      : model);
+    await bootClaude(page, request, "Default unlisted", [], {}, false, unlisted);
+    await expect(page.locator("#chat-configuration-summary")).toHaveText("Default · claude-experimental-9");
   });
 
   test("a typed model id reaches the prompt verbatim and the readout shows an unknown window", async ({ page, request }, testInfo) => {
@@ -195,7 +355,7 @@ test.describe("Claude Code chat polish (fixture-driven)", () => {
     // proves the typed id reached the conversation configuration.
     expect(stats).toBeTruthy();
     await control(request, { action: "item", conversationId: id, item: carrier("usage:t1", 50, "claude-opus-4-9", 100, 900) });
-    await expect(page.locator("#chat-context-usage-label")).toHaveText("?");
+    await expect(page.locator("#chat-context-usage-label")).toHaveText("1.0k");
     await expect(page.locator("#chat-context-usage")).toHaveAttribute("data-fill", "unknown");
   });
 
@@ -286,7 +446,8 @@ test.describe("Claude Code chat polish (fixture-driven)", () => {
     await expect(page.locator('[data-chat-item-id="task:b2f6"]')).toHaveCount(0);
     await capture(page, testInfo, "phase2-background-state-composer");
     await control(request, { action: "item", conversationId: id, item: { ...task, progress: "Using Bash" } });
-    await list.locator("summary").click();
+    // Open already: running work is reachable without disclosing the list.
+    await expect(list).toHaveAttribute("open", "");
     await expect(list.locator("li")).toHaveCount(1);
     await expect(list.locator("li .chat-background-task-progress")).toHaveText("Using Bash");
     await capture(page, testInfo, "phase2-task-list-stop");
@@ -334,6 +495,312 @@ test.describe("Claude Code chat polish (fixture-driven)", () => {
     await expect(page.locator("#chat-background-tasks-label")).toHaveText("1 background task running · Watch the build");
   });
 
+  test("running work is reachable without disclosing its list, and a list the user collapsed stays collapsed", async ({ page, request }) => {
+    // Spec: "Running work is reachable without disclosing the list" and "A
+    // list the user collapsed stays collapsed".
+    const id = await bootClaude(page, request, "Reachable running work", [
+      { id: "message:u1", type: "user_message", createdAt: 1, text: "Run the suite and have an explorer read the tree" },
+    ]);
+    await control(request, { action: "status", conversationId: id, status: "background" });
+    const focusedBefore = await page.evaluate(() => document.activeElement?.id ?? "");
+    await control(request, { action: "item", conversationId: id, item: runningTask("bgjpa", "bun test", { taskType: "local_bash", toolUseId: "toolu_2", outputFile: "/tmp/tasks/bgjpa.output" }) });
+    await control(request, { action: "item", conversationId: id, item: agentTool("tool:toolu_1", "Read the tree", "explore") });
+
+    // No disclosure click: the task's inspect and Stop controls are on screen.
+    const list = page.locator("#chat-background-tasks");
+    await expect(list.locator('[data-inspect-task="bgjpa"]')).toBeVisible();
+    await expect(list.getByRole("button", { name: "Stop bun test" })).toBeVisible();
+    const track = page.locator("#chat-subagents");
+    await expect(track.locator("li")).toContainText("explore · Read the tree");
+    await expect(track.locator("li")).toBeVisible();
+    // Opening moved no focus.
+    expect(await page.evaluate(() => document.activeElement?.id ?? "")).toBe(focusedBefore);
+
+    // The user collapses both; new running work does not reopen them.
+    await list.locator("summary").click();
+    await track.locator("summary").click();
+    await expect(list).not.toHaveAttribute("open", "");
+    await expect(track).not.toHaveAttribute("open", "");
+    await control(request, { action: "item", conversationId: id, item: runningTask("c1", "Build the docs", { taskType: "local_bash", toolUseId: "toolu_3" }) });
+    await control(request, { action: "item", conversationId: id, item: agentTool("tool:toolu_4", "Audit the links", "explore") });
+    await expect(list.locator("#chat-background-tasks-label")).toHaveText("2 background tasks running");
+    await expect(track.locator("summary")).toContainText("2 of 2 subagents working");
+    await expect(list).not.toHaveAttribute("open", "");
+    await expect(track).not.toHaveAttribute("open", "");
+    await expect(list.locator('[data-inspect-task="c1"]')).toBeHidden();
+  });
+
+  test("work that starts mid-turn is listed while the turn is still running", async ({ page, request }) => {
+    // Spec: a task and a subagent launched by a running turn are listed at
+    // once, not only once the turn ends. The composer is still `working`.
+    const id = await bootClaude(page, request, "Mid-turn work", [
+      { id: "message:u1", type: "user_message", createdAt: 1, text: "Build the docs in the background while an explorer reads the tree" },
+    ]);
+    await control(request, { action: "status", conversationId: id, status: "running" });
+    await expect(page.locator("#chat-composer-status")).toHaveAttribute("data-state", "working");
+    await control(request, { action: "item", conversationId: id, item: agentTool("tool:toolu_1", "Read the tree", "explore") });
+    await control(request, { action: "item", conversationId: id, item: runningTask("ada2b", "Read the tree", {
+      taskType: "local_agent", toolUseId: "toolu_1", subagentType: "explore", progress: "Listing src/",
+    }) });
+    await control(request, { action: "item", conversationId: id, item: runningTask("bgjpa", "Build the docs", {
+      taskType: "local_bash", toolUseId: "toolu_2", outputFile: "/tmp/tasks/bgjpa.output",
+    }) });
+
+    // The turn has not ended and both are already listed.
+    await expect(page.locator("#chat-composer-status")).toHaveAttribute("data-state", "working");
+    const list = await openTaskList(page);
+    await expect(list.locator("li")).toHaveCount(2);
+    await expect(list.locator('li[data-background-task="bgjpa"]')).toContainText("Build the docs");
+    const track = page.locator("#chat-subagents");
+    await expect(track).toBeVisible();
+    await expect(track).toHaveAttribute("open", "");
+    // No child id has been reported for this run yet, so the row names it
+    // without offering a transcript — it is still listed, with its progress.
+    await expect(track.locator("li")).toContainText("explore · Read the tree");
+    await expect(track.locator(".chat-subagent-progress")).toHaveText("Listing src/");
+  });
+
+  test("a running agent task opens its subagent's transcript, live, under a strip stating the task's facts", async ({ page, request }, testInfo) => {
+    const id = await bootClaude(page, request, "Inspect a running agent", [
+      { id: "message:u1", type: "user_message", createdAt: 1, text: "Have an explorer review the renderer" },
+    ]);
+    // Seeded after the boot: the boot resets the workspace.
+    const child = await control(request, {
+      action: "seed", agent: "claude", title: "Review renderer", child: true,
+      items: [{ id: "part:child-1", type: "assistant_message", createdAt: 3, markdown: "Reading timeline-renderer.ts" }],
+    }) as { conversation: { id: string } };
+    await control(request, { action: "status", conversationId: id, status: "running" });
+    await control(request, { action: "item", conversationId: id, item: agentTool("tool:toolu_1", "Review renderer", "explore") });
+    const task = runningTask("ada2b", "Review renderer", {
+      taskType: "local_agent", toolUseId: "toolu_1", childConversationId: child.conversation.id,
+      subagentType: "explore", progress: "Reading the tests", usage: { totalTokens: 13_122, toolUses: 1, durationMs: 4_000 },
+    });
+    await control(request, { action: "item", conversationId: id, item: task });
+
+    // Both ways in address the child by the id the drill-down opens it with:
+    // the agent-qualified one the rest of the wire uses.
+    await expect(page.locator("#chat-subagents [data-open-conversation]")).toHaveAttribute("data-open-conversation", child.conversation.id);
+    const list = await openTaskList(page);
+    const inspect = list.locator('[data-inspect-task="ada2b"]');
+    await expect(inspect).toHaveAttribute("data-inspect-view", "transcript");
+    await inspect.click();
+
+    // The child's transcript, with the strip naming the task, its type, the
+    // elapsed clock, the progress note and what it has consumed.
+    const drilldown = page.locator("#chat-drilldown");
+    await expect(drilldown).toBeVisible();
+    await expect(page.locator("#chat-drilldown-output")).toBeHidden();
+    const strip = page.locator("#chat-drilldown-task");
+    await expect(strip).toHaveAttribute("data-task-id", "ada2b");
+    await expect(strip).toHaveAttribute("data-task-state", "running");
+    await expect(strip.locator(".chat-drilldown-task-description")).toHaveText("Review renderer");
+    await expect(strip.locator(".chat-drilldown-task-type")).toHaveText("explore");
+    await expect(strip.locator(".chat-drilldown-task-progress")).toHaveText("Reading the tests");
+    await expect(strip.locator(".chat-drilldown-task-usage")).toHaveText("13k tokens · 1 tool use");
+    await expect(strip.locator("[data-task-elapsed]")).toHaveText(/^\d+:\d\d$/);
+    await expect(strip.locator("[data-stop-task]")).toBeVisible();
+    await expect(page.locator("#chat-drilldown-items")).toContainText("Reading timeline-renderer.ts");
+
+    // It keeps updating while it stays open: the run's own new activity, and
+    // the facts the strip states.
+    await control(request, { action: "item", conversationId: child.conversation.id, item: { id: "part:child-2", type: "assistant_message", createdAt: 4, markdown: "The renderer groups by turn." } });
+    await expect(page.locator("#chat-drilldown-items")).toContainText("The renderer groups by turn.");
+    await control(request, { action: "item", conversationId: id, item: { ...task, progress: "Writing the findings", usage: { totalTokens: 42_000, toolUses: 3, durationMs: 9_000 } } });
+    await expect(strip.locator(".chat-drilldown-task-progress")).toHaveText("Writing the findings");
+    await expect(strip.locator(".chat-drilldown-task-usage")).toHaveText("42k tokens · 3 tool uses");
+    await capture(page, testInfo, "phase5-running-agent-task-strip");
+
+    // The same run from the subagents track: one way in, one transcript.
+    await page.locator("#chat-drilldown-back").click();
+    await expect(drilldown).toBeHidden();
+    const track = page.locator("#chat-subagents");
+    await expect(track).toHaveAttribute("open", "");
+    await expect(track.locator(".chat-subagent-progress")).toHaveText("Writing the findings");
+    await track.getByRole("button", { name: "explore · Review renderer" }).click();
+    await expect(drilldown).toBeVisible();
+    await expect(strip).toHaveAttribute("data-task-id", "ada2b");
+    await expect(page.locator("#chat-drilldown-items")).toContainText("The renderer groups by turn.");
+
+    // The run ending is reflected in the open transcript and on the row.
+    await control(request, { action: "item", conversationId: child.conversation.id, item: { id: "part:child-3", type: "assistant_message", createdAt: 5, markdown: "Findings filed." } });
+    await control(request, { action: "item", conversationId: id, item: { ...task, status: "completed", summary: "Reviewed 4 files." } });
+    await expect(page.locator("#chat-drilldown-items")).toContainText("Findings filed.");
+    await expect(strip).toHaveAttribute("data-task-state", "settled");
+    await expect(strip.locator(".chat-drilldown-task-settled")).toHaveText("finished · Reviewed 4 files.");
+  });
+
+  test("a running shell task opens an output view whose pane follows the output as it is written", async ({ page, request }, testInfo) => {
+    const id = await bootClaude(page, request, "Inspect a running command", [
+      { id: "message:u1", type: "user_message", createdAt: 1, text: "Run the suite in the background" },
+    ]);
+    await control(request, { action: "status", conversationId: id, status: "background" });
+    const task = runningTask("bgjpa", "bun test", { taskType: "local_bash", toolUseId: "toolu_2", outputFile: "/tmp/tasks/bgjpa.output" });
+    await control(request, { action: "item", conversationId: id, item: task });
+
+    const list = await openTaskList(page);
+    const inspect = list.locator('[data-inspect-task="bgjpa"]');
+    await expect(inspect).toHaveAttribute("data-inspect-view", "output");
+    await inspect.click();
+
+    // The task's own view: no transcript, the command named, the clock
+    // running, and — until the agent has written anything — the honest note.
+    await expect(page.locator("#chat-drilldown")).toBeVisible();
+    await expect(page.locator("#chat-drilldown-timeline")).toBeHidden();
+    const output = page.locator("#chat-drilldown-output");
+    await expect(output).toBeVisible();
+    await expect(page.locator("#chat-drilldown-title")).toHaveText("bun test");
+    const strip = page.locator("#chat-drilldown-task");
+    await expect(strip.locator(".chat-drilldown-task-description")).toHaveText("bun test");
+    await expect(strip.locator("[data-task-elapsed]")).toHaveText(/^\d+:\d\d$/);
+    await expect(page.locator("#chat-drilldown-output-note")).toHaveText("Output not yet available");
+
+    // The output as it is written: the pane picks up what the file holds on
+    // its own poll (2 s), so the expectation is what waits, not a sleep.
+    const text = page.locator("#chat-drilldown-output-text");
+    await control(request, { action: "taskOutput", agent: "claude", taskId: "bgjpa", text: "bun test v1.3.0\n" });
+    await expect(text).toContainText("bun test v1.3.0", { timeout: 10_000 });
+    await expect(page.locator("#chat-drilldown-output-note")).toBeHidden();
+    await control(request, { action: "taskOutput", agent: "claude", taskId: "bgjpa", text: " 41 pass\n 0 fail\n", append: true });
+    await expect(text).toContainText("41 pass", { timeout: 10_000 });
+    await expect(text).toContainText("0 fail");
+    await capture(page, testInfo, "phase5-running-shell-task-output");
+
+    // The last write lands even when it arrives with the settle: the view
+    // reads once more when the task stops running.
+    await control(request, { action: "taskOutput", agent: "claude", taskId: "bgjpa", text: "[exited with code 0]\n", append: true });
+    await control(request, { action: "item", conversationId: id, item: { ...task, status: "completed", summary: "41 pass, 0 fail" } });
+    await expect(text).toContainText("[exited with code 0]", { timeout: 10_000 });
+    await expect(strip).toHaveAttribute("data-task-state", "settled");
+  });
+
+  test("stopping a running task from the inspection view settles the row in place", async ({ page, request }) => {
+    const id = await bootClaude(page, request, "Stop from the view", [
+      { id: "message:u1", type: "user_message", createdAt: 1, text: "Tail the log in the background" },
+    ]);
+    await control(request, { action: "status", conversationId: id, status: "background" });
+    await control(request, { action: "taskOutput", agent: "claude", taskId: "tailer", text: "waiting for the first line\n" });
+    const task = runningTask("tailer", "tail -f build.log", { taskType: "local_bash", toolUseId: "toolu_3", outputFile: "/tmp/tasks/tailer.output" });
+    await control(request, { action: "item", conversationId: id, item: task });
+    const list = await openTaskList(page);
+    await list.locator('[data-inspect-task="tailer"]').click();
+    const strip = page.locator("#chat-drilldown-task");
+    await expect(strip).toHaveAttribute("data-task-state", "running");
+    await expect(page.locator("#chat-drilldown-output-text")).toContainText("waiting for the first line", { timeout: 10_000 });
+
+    // Stop is offered by the view itself; the agent reports the stop as the
+    // task settling, and the strip states the outcome in place.
+    const stopped = page.waitForResponse(response => response.url().includes("/tasks/tailer/stop"));
+    await strip.getByRole("button", { name: "Stop tail -f build.log" }).click();
+    expect((await stopped).status()).toBe(200);
+    await expect(strip).toHaveAttribute("data-task-state", "settled");
+    await expect(strip).toHaveClass(/is-settled/);
+    await expect(strip.locator(".chat-drilldown-task-settled")).toHaveText("stopped · Stopped by the user.");
+    await expect(strip.locator("[data-stop-task]")).toHaveCount(0);
+
+    // Behind the view the row has left the list and taken its timeline place.
+    await page.locator("#chat-drilldown-back").click();
+    await expect(page.locator("#chat-background-tasks")).toBeHidden();
+    await expect(page.locator('[data-chat-item-id="task:tailer"]')).toContainText("Background task stopped");
+  });
+
+  test("a running fork is named in the track and opens a complete transcript once its result names it", async ({ page, request }, testInfo) => {
+    // Spec: "A running fork is not silent" and "A forked skill's transcript
+    // is complete when it opens". The surface is driven with the items the
+    // provider produces for a fork (design D10): a Skill row that runs while
+    // its work streams into the parent timeline, then completes carrying the
+    // child it forked into — which by then holds the whole run.
+    const id = await bootClaude(page, request, "Forked skill", [
+      { id: "message:u1", type: "user_message", createdAt: 1, text: "Review the diff" },
+    ]);
+    await control(request, { action: "status", conversationId: id, status: "running" });
+    await control(request, { action: "item", conversationId: id, item: skillTool("tool:toolu_skill", 10, "code-review", "running") });
+
+    // Listed as work in progress, named by the skill it runs. There is no id
+    // to click yet, so the entry is a label rather than a button.
+    const track = page.locator("#chat-subagents");
+    await expect(track).toBeVisible();
+    await expect(track.locator("summary")).toContainText("code-review");
+    await expect(track).toHaveAttribute("open", "");
+    await expect(track.locator("li")).toHaveCount(1);
+    await expect(track.locator(".chat-subagent-label")).toHaveText("Skill · code-review");
+    await expect(track.locator("[data-open-conversation]")).toHaveCount(0);
+
+    // The fork's tool activity streams into the parent timeline under the
+    // Skill row, and the track reads its latest step off exactly that.
+    await control(request, { action: "item", conversationId: id, item: bash("tool:fork-bash", 11, "git diff HEAD", "completed", "diff --git a/README.md b/README.md") });
+    await expect(track.locator(".chat-subagent-progress")).toHaveText("Bash · git diff HEAD");
+    await page.locator(".chat-activity-group > summary").first().click();
+    await expect(page.locator('[data-chat-item-id="tool:fork-bash"] .chat-activity-subject')).toHaveText("git diff HEAD");
+    await capture(page, testInfo, "phase5-running-fork-in-the-track");
+
+    // The result names the run. The child it names holds what the fork
+    // streamed while it was still nameless — the provider's buffer, replayed
+    // — as well as what it said at the end.
+    const child = await control(request, {
+      action: "seed", agent: "claude", title: "code-review", child: true,
+      items: [
+        { id: "part:fork-1", type: "assistant_message", createdAt: 3, markdown: "Reading the diff before it had a name." },
+        { id: "tool:fork-child-bash", type: "tool", createdAt: 4, name: "Bash", status: "completed", input: JSON.stringify({ command: "git diff HEAD" }), output: "diff --git a/README.md b/README.md" },
+        { id: "part:fork-2", type: "assistant_message", createdAt: 5, markdown: "One high finding in README.md." },
+      ],
+    }) as { conversation: { id: string } };
+    await control(request, { action: "item", conversationId: id, item: skillTool("tool:toolu_skill", 10, "code-review", "completed", child.conversation.id, "Based on my analysis …") });
+    await control(request, { action: "status", conversationId: id, status: "completed" });
+
+    // The same entry, in place, now openable.
+    await expect(track.locator("li")).toHaveCount(1);
+    const open = track.getByRole("button", { name: "Skill · code-review" });
+    await expect(open).toHaveAttribute("data-open-conversation", child.conversation.id);
+    await open.click();
+    const drilldown = page.locator("#chat-drilldown");
+    const items = page.locator("#chat-drilldown-items");
+    await expect(drilldown).toBeVisible();
+    await expect(page.locator("#chat-drilldown-title")).toHaveText("Skill · code-review");
+    await expect(items).toContainText("Reading the diff before it had a name.");
+    await expect(items).toContainText("git diff HEAD");
+    await expect(items).toContainText("One high finding in README.md.");
+    // A drill-down, not a conversation switch: the picker never moves and
+    // never lists the fork.
+    await expect(page.locator("#chat-conversation-select")).toHaveValue(id);
+    await expect(page.locator(`#chat-conversation-select option[value="${child.conversation.id}"]`)).toHaveCount(0);
+    await capture(page, testInfo, "phase5-forked-skill-transcript");
+
+    // And the same transcript from the row that launched it: one run, one
+    // child, two ways in.
+    await page.locator("#chat-drilldown-back").click();
+    await expect(drilldown).toBeHidden();
+    const row = page.locator('[data-chat-item-id="tool:toolu_skill"]');
+    await expect(row.locator(".chat-activity-subject")).toHaveText("code-review");
+    await row.locator(":scope > summary").click();
+    await row.getByRole("button", { name: "Open transcript" }).click();
+    await expect(drilldown).toBeVisible();
+    await expect(items).toContainText("Reading the diff before it had a name.");
+    await expect(items).toContainText("One high finding in README.md.");
+  });
+
+  test("a skill that names no child was no fork and leaves nothing in the track", async ({ page, request }) => {
+    const id = await bootClaude(page, request, "Plain skill", [
+      { id: "message:u1", type: "user_message", createdAt: 1, text: "Load the run skill" },
+    ]);
+    await control(request, { action: "status", conversationId: id, status: "running" });
+    await control(request, { action: "item", conversationId: id, item: skillTool("tool:toolu_skill", 10, "run", "running") });
+    const track = page.locator("#chat-subagents");
+    await expect(track).toBeVisible();
+    await expect(track).toHaveAttribute("open", "");
+    await expect(track.locator(".chat-subagent-label")).toHaveText("Skill · run");
+
+    // It settles without ever naming a child: an ordinary skill load, a
+    // moment's work, no run to follow. The track drops it rather than
+    // keeping a finished entry for a fork that never was, and the row itself
+    // offers no transcript.
+    await control(request, { action: "item", conversationId: id, item: skillTool("tool:toolu_skill", 10, "run", "completed", undefined, "Loaded.") });
+    await control(request, { action: "status", conversationId: id, status: "completed" });
+    await expect(track).toBeHidden();
+    const row = page.locator('[data-chat-item-id="tool:toolu_skill"]');
+    await row.locator(":scope > summary").click();
+    await expect(row.getByRole("button", { name: "Open transcript" })).toHaveCount(0);
+  });
+
   test("assistant text grows in place as it streams and the completed block matches it", async ({ page, request }, testInfo) => {
     const id = await bootClaude(page, request, "Streaming", [
       { id: "message:u1", type: "user_message", createdAt: 1, text: "Two sentences about autumn" },
@@ -370,20 +837,31 @@ test.describe("Claude Code chat polish (fixture-driven)", () => {
     await expect(status).toHaveAttribute("aria-label", "Retrying (attempt 2 of 10, HTTP 529)");
     // Still a live turn: the primary action is Cancel, not Send.
     await expect(page.locator("#chat-send")).toHaveAttribute("aria-label", /Cancel/);
-    await control(request, { action: "item", conversationId: id, item: { id: "notice:rl1", type: "notice", createdAt: 5, level: "error", message: "Rate limit reached for your 5-hour window.", code: "rate-limit-rejected", resetsAt: Date.now() + 3_600_000 } });
-    const badge = page.locator("#chat-rate-limit");
-    await expect(badge).toBeVisible();
-    await expect(badge).toHaveText(/^Rate limited · resets /);
-    await expect(badge).toHaveAttribute("data-level", "rejected");
-    await expect(page.locator('[data-chat-item-id="notice:rl1"]')).toHaveAttribute("data-notice-code", "rate-limit-rejected");
+    // The standing is the composer's, not the timeline's: one chip, opened
+    // for the detail, and no row anywhere.
+    await control(request, { action: "item", conversationId: id, item: { id: "notice:rate-limit", type: "notice", createdAt: 5, level: "error", message: "Rate limit reached for your 5-hour window.", code: "rate-limit-rejected", resetsAt: Date.now() + 3_600_000 } });
+    const chip = page.locator("#chat-plan-usage");
+    const chipSummary = page.locator("#chat-plan-usage-summary");
+    await expect(chipSummary).toBeVisible();
+    await expect(chipSummary).toHaveText(/^Rate limited · resets /);
+    await expect(chip).toHaveAttribute("data-level", "rejected");
+    await expect(page.locator('[data-chat-item-id="notice:rate-limit"]')).toHaveCount(0);
+    await expect(page.locator("#chat-rate-limit-live")).toHaveText(/^Rate limit reached for your 5-hour window\. Resets /);
+    // It opens — the thing the badge could never do.
+    await chipSummary.click();
+    await expect(page.locator("#chat-plan-readout-standing")).toBeVisible();
+    await expect(page.locator("#chat-plan-readout-standing")).toHaveText(/^Rate limit reached for your 5-hour window\. Resets /);
+    await chipSummary.click();
     await capture(page, testInfo, "phase3-status-retrying-compacting-ratelimit");
     await control(request, { action: "status", conversationId: id, status: "running" });
     await expect(status).toHaveAttribute("data-state", "working");
     await control(request, { action: "status", conversationId: id, status: "compacting" });
     await expect(status).toHaveAttribute("data-state", "compacting");
     await expect(status).toHaveAttribute("aria-label", "Compacting context");
-    await control(request, { action: "item", conversationId: id, item: { id: "notice:rl2", type: "notice", createdAt: 6, level: "info", message: "Rate limit cleared; requests are allowed again.", code: "rate-limit-cleared" } });
-    await expect(badge).toBeHidden();
+    // Retired, not restated: the agent removes the standing it reported.
+    await control(request, { action: "removeItem", conversationId: id, itemId: "notice:rate-limit" });
+    await expect(chipSummary).toBeHidden();
+    await expect(page.locator("#chat-rate-limit-live")).toHaveText("Rate limit cleared; requests are allowed again.");
     await control(request, { action: "status", conversationId: id, status: "running" });
     await control(request, { action: "status", conversationId: id, status: "completed" });
     await expect(status).toHaveAttribute("data-state", "ready");
@@ -423,6 +901,256 @@ test.describe("Claude Code chat polish (fixture-driven)", () => {
     await expect(plan).toBeHidden();
   });
 
+  test("a rate-limit standing folds into the plan chip, with and without a plan to fold into", async ({ page, request }, testInfo) => {
+    const resetsAt = Date.now() + 3_600_000;
+    const standing = (code: "rate-limit-warning" | "rate-limit-rejected", message: string) =>
+      ({ id: "notice:rate-limit", type: "notice" as const, createdAt: 5, level: code === "rate-limit-rejected" ? "error" as const : "warning" as const, message, code, resetsAt });
+    const id = await bootClaude(page, request, "Rate limit", [
+      { id: "message:u1", type: "user_message", createdAt: 1, text: "Keep going" },
+      { id: "context:report:1", type: "context_report", createdAt: 2, total: 24_000, max: 200_000, model: { providerId: "anthropic", modelId: "sonnet" }, plan: { fiveHour: { utilization: 9, resetsAt }, sevenDay: { utilization: 25, resetsAt } } },
+    ], { model: { providerId: "anthropic", modelId: "sonnet" } });
+    const chip = page.locator("#chat-plan-usage");
+    const summary = page.locator("#chat-plan-usage-summary");
+    await expect(summary).toHaveText("Session 9% · Week 25%");
+    await expect(chip).toHaveAttribute("data-level", "normal");
+
+    // A warning keeps the figures and raises the level — here for a window
+    // the summary does not even name.
+    await control(request, { action: "item", conversationId: id, item: standing("rate-limit-warning", "Approaching your 7-day (overage included) rate limit (77% used).") });
+    await expect(summary).toHaveText("Session 9% · Week 25%");
+    await expect(chip).toHaveAttribute("data-level", "warning");
+    await expect(page.locator('[data-chat-item-id="notice:rate-limit"]')).toHaveCount(0);
+    await expect(page.locator(".chat-notice")).toHaveCount(0);
+    await summary.click();
+    await expect(page.locator("#chat-plan-readout-standing")).toHaveText(/^Approaching your 7-day \(overage included\) rate limit \(77% used\)\. Resets /);
+    // The windows are still there to read beneath it.
+    await expect(page.locator("#chat-plan-readout-rows")).toBeVisible();
+    await capture(page, testInfo, "rate-limit-warning-folded-into-plan-chip");
+    await summary.click();
+
+    // A rejection displaces the figures: blocked is the fact that matters.
+    await control(request, { action: "item", conversationId: id, item: standing("rate-limit-rejected", "Rate limit reached for your 7-day window.") });
+    await expect(summary).toHaveText(/^Rate limited · resets /);
+    await expect(chip).toHaveAttribute("data-level", "rejected");
+    await capture(page, testInfo, "rate-limit-rejected-folded-into-plan-chip");
+
+    // Retired: the chip returns to the plan it was showing all along.
+    await control(request, { action: "removeItem", conversationId: id, itemId: "notice:rate-limit" });
+    await expect(summary).toHaveText("Session 9% · Week 25%");
+    await expect(chip).toHaveAttribute("data-level", "normal");
+  });
+
+  test("a standing without a report of its own shows beside the last-known plan; the readout refreshes when opened and reads on demand", async ({ page, request }, testInfo) => {
+    const resetsAt = Date.now() + 3_600_000;
+    // bootClaude's reset would wipe the seeded report, so the boot is inlined
+    // with the workspace's last-known report seeded after the reset.
+    await request.post("/__e2e/reset");
+    await control(request, { action: "agents", count: 2 });
+    await control(request, { action: "models", agent: "claude", models: claudeModels });
+    await control(request, { action: "usageReport", agent: "claude", report: { plan: { subscription: "pro", fiveHour: { utilization: 9, resetsAt }, sevenDay: { utilization: 25, resetsAt } }, readAt: Date.now() - 12 * 60_000 } });
+    // Opening the readout may only refresh through a live session: none is.
+    await control(request, { action: "usageRead", agent: "claude", outcome: { outcome: "no-live-session" } });
+    const seeded = await control(request, { action: "seed", agent: "claude", title: "Standing only", items: [
+      { id: "message:u1", type: "user_message", createdAt: 1, text: "Keep going" },
+      { id: "notice:rate-limit", type: "notice", createdAt: 2, level: "warning", message: "Approaching your 5-hour rate limit (91% used).", code: "rate-limit-warning", resetsAt },
+    ], configuration: { model: { providerId: "anthropic", modelId: "sonnet" } } }) as { conversation: { id: string } };
+    const id = seeded.conversation.id;
+    const token = await request.get("/__e2e/terminal-token").then(response => response.json()) as { token: string };
+    await page.goto(`/?t=${encodeURIComponent(token.token)}`);
+    await expect(page.locator("#connection-state .connection-label")).toHaveText("Connected");
+    await openChatPanel(page);
+    await expect(page.locator("#chat-state")).not.toContainText("Loading chat");
+    await page.locator("#chat-conversation-select").selectOption(id);
+    await expect(page.locator("#chat-context")).toContainText("Claude Code");
+    const chip = page.locator("#chat-plan-usage");
+    const summary = page.locator("#chat-plan-usage-summary");
+    // The standing and the last-known windows, together — not the standing alone (#389).
+    await expect(summary).toHaveText("Session 9% · Week 25%");
+    await expect(chip).toHaveAttribute("data-level", "warning");
+    await expect(chip).toHaveAttribute("data-stale", "true");
+    await summary.click();
+    await expect(page.locator("#chat-plan-readout-standing")).toHaveText(/^Approaching your 5-hour rate limit \(91% used\)\. Resets /);
+    await expect(page.locator("#chat-plan-readout-head")).toBeVisible();
+    await expect(page.locator("#chat-plan-readout-name")).toHaveText("Pro plan");
+    await expect(page.locator("#chat-plan-readout-age")).toHaveText(/^as of \d{2}:\d{2} · 12 min ago$/);
+    await expect(page.locator("#chat-plan-readout-rows .plan-row-label")).toHaveText(["Session", "Week"]);
+    await capture(page, testInfo, "standing-beside-last-known-plan");
+    // No session was live: the stale figures stand, nothing was started, nothing is called a failure.
+    await expect.poll(async () => ((await control(request, { action: "stats" })) as { usageReads: string[] }).usageReads).toEqual(["live-only"]);
+    await expect(page.locator("#chat-plan-readout-status")).toBeHidden();
+    await expect(chip).toHaveAttribute("data-stale", "true");
+
+    // "Read now" starts a session if it must; the read lands this
+    // conversation's own report, so the readout and the context meter follow it.
+    await control(request, { action: "usageRead", agent: "claude", outcome: { outcome: "ok", delayMs: 600, conversationId: id, contextTotal: 40_000, plan: { subscription: "pro", fiveHour: { utilization: 14, resetsAt }, sevenDay: { utilization: 25, resetsAt } } } });
+    const read = page.locator("#chat-plan-read");
+    await expect(read).toBeVisible();
+    await read.click();
+    await expect(read).toHaveText("Reading…");
+    await expect(page.locator("#chat-plan-readout-status")).toHaveText("Reading…");
+    await expect(summary).toHaveText("Session 14% · Week 25%");
+    await expect(page.locator("#chat-plan-readout-age")).toHaveText(/· just now$/);
+    await expect(chip).not.toHaveAttribute("data-stale", "true");
+    await expect(page.locator("#chat-plan-readout-status")).toBeHidden();
+    await expect(read).toHaveText("Read now");
+    await expect(page.locator("#chat-context-usage-label")).toHaveText("20%");
+    await capture(page, testInfo, "readout-after-read-now");
+    await expect.poll(async () => ((await control(request, { action: "stats" })) as { usageReads: string[] }).usageReads).toEqual(["live-only", "start"]);
+  });
+
+  test("a stale readout opened while a session is live refreshes without a click", async ({ page, request }) => {
+    const resetsAt = Date.now() + 3_600_000;
+    await request.post("/__e2e/reset");
+    await control(request, { action: "agents", count: 2 });
+    await control(request, { action: "models", agent: "claude", models: claudeModels });
+    await control(request, { action: "usageReport", agent: "claude", report: { plan: { subscription: "pro", fiveHour: { utilization: 14, resetsAt }, sevenDay: { utilization: 25, resetsAt } }, readAt: Date.now() - 20 * 60_000 } });
+    // A session is live: a live-only read answers.
+    await control(request, { action: "usageRead", agent: "claude", outcome: { outcome: "ok", plan: { subscription: "pro", fiveHour: { utilization: 16, resetsAt }, sevenDay: { utilization: 25, resetsAt } } } });
+    const seeded = await control(request, { action: "seed", agent: "claude", title: "Reportless", items: [{ id: "message:u1", type: "user_message", createdAt: 1, text: "hello" }] }) as { conversation: { id: string } };
+    const token = await request.get("/__e2e/terminal-token").then(response => response.json()) as { token: string };
+    await page.goto(`/?t=${encodeURIComponent(token.token)}`);
+    await expect(page.locator("#connection-state .connection-label")).toHaveText("Connected");
+    await openChatPanel(page);
+    await expect(page.locator("#chat-state")).not.toContainText("Loading chat");
+    await page.locator("#chat-conversation-select").selectOption(seeded.conversation.id);
+    const chip = page.locator("#chat-plan-usage");
+    const summary = page.locator("#chat-plan-usage-summary");
+    await expect(summary).toHaveText("Session 14% · Week 25%");
+    await expect(chip).toHaveAttribute("data-stale", "true");
+    await summary.click();
+    await expect(summary).toHaveText("Session 16% · Week 25%");
+    await expect(chip).not.toHaveAttribute("data-stale", "true");
+    await expect(page.locator("#chat-plan-readout-age")).toHaveText(/· just now$/);
+    await expect.poll(async () => ((await control(request, { action: "stats" })) as { usageReads: string[] }).usageReads).toEqual(["live-only"]);
+  });
+
+  test("switching conversations does not announce a clear the limited conversation never had", async ({ page, request }) => {
+    // The selection change blanks the projection before the incoming
+    // snapshot lands. Read as one conversation's history that blank looks
+    // like the standing ending, and the reader is told a limit cleared that
+    // is still in force.
+    const resetsAt = Date.now() + 3_600_000;
+    const limited = await bootClaude(page, request, "Limited", [
+      { id: "message:u1", type: "user_message", createdAt: 1, text: "Keep going" },
+    ], { model: { providerId: "anthropic", modelId: "sonnet" } });
+    const other = await control(request, { action: "seed", agent: "claude", title: "Unlimited", items: [{ id: "message:u2", type: "user_message", createdAt: 1, text: "Something else" }] }) as { conversation: { id: string } };
+    const live = page.locator("#chat-rate-limit-live");
+    const chooser = page.locator("#chat-conversation-select");
+
+    await control(request, { action: "item", conversationId: limited, item: { id: "notice:rate-limit", type: "notice", createdAt: 2, level: "error", message: "Rate limit reached for your 5-hour window.", code: "rate-limit-rejected", resetsAt } });
+    await expect(live).toHaveText(/^Rate limit reached /);
+
+    // Away: the other conversation has no standing, and none is claimed to
+    // have ended — the limited one's standing never moved. The region stops
+    // describing the conversation left behind rather than carrying its
+    // warning into an unlimited one.
+    await chooser.selectOption(other.conversation.id);
+    await expect(page.locator("#chat-plan-usage-summary")).toBeHidden();
+    await expect(live).toHaveText("");
+    await expect(live).not.toHaveText(/cleared/);
+
+    // Back: still limited, still the same standing, so nothing is re-said.
+    await chooser.selectOption(limited);
+    await expect(page.locator("#chat-plan-usage-summary")).toHaveText(/^Rate limited · resets /);
+    await expect(live).not.toHaveText(/cleared/);
+
+    // A real clear still speaks.
+    await control(request, { action: "removeItem", conversationId: limited, itemId: "notice:rate-limit" });
+    await expect(live).toHaveText("Rate limit cleared; requests are allowed again.");
+  });
+
+  test("a rising warning is not read aloud again on every request", async ({ page, request }) => {
+    // The login restates a warning per request with its utilization ticking
+    // up, and the message carries the figure. Keyed on the spoken words,
+    // the warning would be re-read on every one — the timeline's chattiness
+    // moved into the reader's ear.
+    const resetsAt = Date.now() + 3_600_000;
+    const id = await bootClaude(page, request, "Rising warning", [
+      { id: "message:u1", type: "user_message", createdAt: 1, text: "Keep going" },
+    ], { model: { providerId: "anthropic", modelId: "sonnet" } });
+    const warn = (used: number) => ({ action: "item", conversationId: id, item: { id: "notice:rate-limit", type: "notice", createdAt: 2, level: "warning" as const, message: `Approaching your 5-hour rate limit (${used}% used).`, code: "rate-limit-warning", resetsAt } });
+    const live = page.locator("#chat-rate-limit-live");
+    const summary = page.locator("#chat-plan-usage-summary");
+
+    await control(request, warn(87));
+    await expect(live).toHaveText(/87% used/);
+    await summary.click();
+
+    // Same level, higher figure: the readout follows, the live region holds.
+    for (const used of [88, 89, 90]) await control(request, warn(used));
+    await expect(page.locator("#chat-plan-readout-standing")).toContainText("(90% used)");
+    await expect(live).toHaveText(/87% used/);
+
+    // A level change is a transition, and is spoken — with the figure.
+    await control(request, { action: "item", conversationId: id, item: { id: "notice:rate-limit", type: "notice", createdAt: 2, level: "error", message: "Rate limit reached for your 5-hour window.", code: "rate-limit-rejected", resetsAt } });
+    await expect(live).toHaveText(/^Rate limit reached /);
+  });
+
+  test("a rolling reset repaints the opened readout, not only the chip", async ({ page, request }) => {
+    // One standing restated with a later reset: the chip is painted before
+    // the readout's repaint guard, so a guard blind to the reset would
+    // leave the open readout contradicting the chip that opened it.
+    const id = await bootClaude(page, request, "Rolling reset", [
+      { id: "message:u1", type: "user_message", createdAt: 1, text: "Keep going" },
+    ], { model: { providerId: "anthropic", modelId: "sonnet" } });
+    const rejection = (resetsAt: number) => ({ action: "item", conversationId: id, item: { id: "notice:rate-limit", type: "notice", createdAt: 2, level: "error" as const, message: "Rate limit reached for your 5-hour window.", code: "rate-limit-rejected", resetsAt } });
+    const at = (hour: number) => new Date(2026, 8, 12, hour, 0, 0).getTime();
+    await control(request, rejection(at(18)));
+    const summary = page.locator("#chat-plan-usage-summary");
+    await summary.click();
+    const standing = page.locator("#chat-plan-readout-standing");
+    // The day is named whenever the reset is not today, so the fixed date
+    // may carry one: only the clock is asserted here.
+    await expect(standing).toContainText(/Resets (?:[^·]+ )?18:00 · /);
+
+    // Same message, same level, later reset.
+    await control(request, rejection(at(19)));
+    await expect(summary).toHaveText(/resets (?:.+ )?19:00$/);
+    await expect(standing).toContainText(/Resets (?:[^·]+ )?19:00 · /);
+  });
+
+  test("a reset on a later day names its weekday and the time remaining", async ({ page, request }, testInfo) => {
+    const id = await bootClaude(page, request, "Weekly reset", [
+      { id: "message:u1", type: "user_message", createdAt: 1, text: "Keep going" },
+    ], { model: { providerId: "anthropic", modelId: "sonnet" } });
+    // Three local days out, at 23:00, computed in the page's own zone; the
+    // weekday name is the locale's, the clock always 24-hour.
+    const expected = await page.evaluate(() => {
+      const today = new Date();
+      const reset = new Date(today.getFullYear(), today.getMonth(), today.getDate() + 3, 23, 0);
+      return {
+        resetsAt: reset.getTime(),
+        clock: `${reset.toLocaleDateString([], { weekday: "short" })} 23:00`,
+      };
+    });
+    await control(request, { action: "item", conversationId: id, item: { id: "notice:rate-limit", type: "notice", createdAt: 2, level: "warning", message: "Approaching your 7-day (overage included) rate limit (81% used).", code: "rate-limit-warning", resetsAt: expected.resetsAt } });
+    const summary = page.locator("#chat-plan-usage-summary");
+    await expect(summary).toHaveText(`Near rate limit · resets ${expected.clock}`);
+    await expect(page.locator("#chat-rate-limit-live")).toHaveText(new RegExp(`Resets ${expected.clock} · in [23]d \\d+h\\.$`));
+    await summary.click();
+    await expect(page.locator("#chat-plan-readout-standing")).toHaveText(new RegExp(`^Approaching your 7-day \\(overage included\\) rate limit \\(81% used\\)\\. Resets ${expected.clock} · in [23]d \\d+h\\.$`));
+    await capture(page, testInfo, "rate-limit-reset-names-its-day");
+  });
+
+  test("a rate limit on a login with no plan still has a chip to live in", async ({ page, request }, testInfo) => {
+    // An API-key login reports an empty plan and no cost: before this the
+    // standing had nowhere to go, because there was no chip at all.
+    const id = await bootClaude(page, request, "Rate limit, no plan", [
+      { id: "message:u1", type: "user_message", createdAt: 1, text: "Keep going" },
+      { id: "context:report:1", type: "context_report", createdAt: 2, total: 24_000, max: 200_000, model: { providerId: "anthropic", modelId: "sonnet" }, plan: {} },
+    ], { model: { providerId: "anthropic", modelId: "sonnet" } });
+    const summary = page.locator("#chat-plan-usage-summary");
+    await expect(page.locator("#chat-plan-usage")).toBeHidden();
+    await control(request, { action: "item", conversationId: id, item: { id: "notice:rate-limit", type: "notice", createdAt: 3, level: "warning", message: "Approaching your 5-hour rate limit (91% used).", code: "rate-limit-warning", resetsAt: Date.now() + 1_800_000 } });
+    await expect(summary).toBeVisible();
+    await expect(summary).toHaveText(/^Near rate limit · resets /);
+    // It opens, and the standing is the whole readout: no windows to draw.
+    await summary.click();
+    await expect(page.locator("#chat-plan-readout-standing")).toHaveText(/^Approaching your 5-hour rate limit \(91% used\)\. Resets /);
+    await expect(page.locator("#chat-plan-readout-rows")).toBeHidden();
+    await capture(page, testInfo, "rate-limit-without-a-plan");
+  });
+
   test("a login without plan limits keeps the conversation's cost reachable: the chip states it and the readout is this conversation alone", async ({ page, request }, testInfo) => {
     // API-key, Bedrock, and Vertex logins: the provider reports an empty
     // plan beside real session totals.
@@ -450,7 +1178,7 @@ test.describe("Claude Code chat polish (fixture-driven)", () => {
     const modelRows = page.locator("#chat-plan-session-models tr");
     await expect(modelRows).toHaveCount(2);
     await expect(modelRows.nth(0).locator("td")).toHaveText(["Opus 5 (1M context)", "55k", "200", "$1.10"]);
-    await capture(page, testInfo, "after-cost-chip-readout-desktop", USAGE_SCREENSHOTS);
+    await capture(page, testInfo, "after-cost-chip-readout-desktop");
     // The pane hears the empty plan and says so, rather than waiting.
     await page.locator("#panels-toggle").click();
     await page.locator('#panels-menu label:has-text("Usage") input').check();
@@ -477,7 +1205,7 @@ test.describe("Claude Code chat polish (fixture-driven)", () => {
     const summary = page.locator("#chat-plan-usage-summary");
     await expect(summary).toHaveText("Session 9% · Week 25%");
     await expect(plan).toHaveAttribute("data-level", "normal");
-    await capture(page, testInfo, "after-plan-chip-desktop", USAGE_SCREENSHOTS);
+    await capture(page, testInfo, "after-plan-chip-desktop");
 
     await summary.click();
     const readout = page.locator("#chat-plan-readout");
@@ -486,8 +1214,8 @@ test.describe("Claude Code chat polish (fixture-driven)", () => {
     const rows = readout.locator(".plan-row");
     await expect(rows.locator(".plan-row-label")).toHaveText(["Session", "Week", "Week · Opus", "Week · Sonnet", "Week · Fable", "Extra usage"]);
     await expect(rows.locator(".plan-row-figure")).toHaveText(["9%", "25%", "61%", "4%", "47%", "13%"]);
-    await expect(rows.nth(0).locator(".plan-row-reset")).toHaveText(/^resets \d{1,2}:\d{2}( [AP]M)? · in 35m$/);
-    await expect(rows.nth(1).locator(".plan-row-reset")).toHaveText(/^resets \w{3} \d{1,2}:\d{2}( [AP]M)? · in 4d 11h$/);
+    await expect(rows.nth(0).locator(".plan-row-reset")).toHaveText(/^resets \d{2}:\d{2} · in 35m$/);
+    await expect(rows.nth(1).locator(".plan-row-reset")).toHaveText(/^resets \w{3} \d{2}:\d{2} · in 4d 11h$/);
     await expect(rows.nth(5).locator(".plan-row-reset")).toHaveText("$12.50 of $100.00");
     // This conversation: the total, then each model with its own cost, the
     // catalog's name where the wire id resolves to one.
@@ -498,7 +1226,7 @@ test.describe("Claude Code chat polish (fixture-driven)", () => {
     await expect(modelRows).toHaveCount(2);
     await expect(modelRows.nth(0).locator("td")).toHaveText(["Opus 5 (1M context)", "55k", "200", "$1.10"]);
     await expect(modelRows.nth(1).locator("td")).toHaveText(["Haiku 4.5", "300", "40", "$0.13"]);
-    await capture(page, testInfo, "after-plan-readout-desktop", USAGE_SCREENSHOTS);
+    await capture(page, testInfo, "after-plan-readout-desktop");
 
     // A later report with a bucket at 83% turns the summary to a warning
     // and repaints the open readout in place.
@@ -506,7 +1234,7 @@ test.describe("Claude Code chat polish (fixture-driven)", () => {
     await expect(plan).toHaveAttribute("data-level", "warning");
     await expect(rows.nth(4).locator(".plan-row-figure")).toHaveText("83%");
     await expect(rows.nth(4)).toHaveAttribute("data-level", "warning");
-    await capture(page, testInfo, "after-plan-readout-warning-desktop", USAGE_SCREENSHOTS);
+    await capture(page, testInfo, "after-plan-readout-warning-desktop");
 
     // The pin reveals the Usage pane beside the chat and then retires,
     // leaving the other panes' arrangement alone.
@@ -526,7 +1254,7 @@ test.describe("Claude Code chat polish (fixture-driven)", () => {
     await expect(usagePane.locator(".plan-row-label")).toHaveText(["Session", "Week", "Week · Opus", "Week · Sonnet", "Week · Fable", "Extra usage"]);
     await expect(pin).toBeHidden();
     await expect(page.locator('[data-pane-id="git-log"]')).toBeHidden();
-    await capture(page, testInfo, "after-usage-pane-desktop", USAGE_SCREENSHOTS);
+    await capture(page, testInfo, "after-usage-pane-desktop");
     // Hiding the pane from its own chrome brings the pin back; pinning
     // again reveals the pane once more.
     await usagePane.getByRole("button", { name: "Hide Usage" }).click();
@@ -599,6 +1327,36 @@ test.describe("Claude Code chat polish (fixture-driven)", () => {
   });
 });
 
+for (const touch of [false, true]) {
+  test.describe(`Claude live window discovery on ${touch ? "touch" : "desktop"}`, () => {
+    test.use(touch ? { viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true } : { viewport: { width: 1400, height: 1000 } });
+    test("a running turn recovers its window past an estimate and after reconnect", async ({ page, request }, testInfo) => {
+      const model = { providerId: "anthropic", modelId: "claude-opus-4-6" };
+      const id = await bootClaude(page, request, "Live window discovery", [carrier("usage:held", 2, model.modelId, 2, 212_895)], { model }, touch);
+      await control(request, { action: "status", conversationId: id, status: "running" });
+      const label = page.locator("#chat-context-usage-label");
+      await expect(label).toHaveText("213k");
+      await expect(page.locator("#chat-context-usage")).toHaveAttribute("data-fill", "unknown");
+      await page.locator("#chat-context-usage > summary").click();
+      await expect(page.locator("#chat-context-usage-breakdown")).toContainText("Limit unavailable");
+      await capture(page, testInfo, "context-limit-unavailable");
+      await control(request, { action: "item", conversationId: id, item: {
+        id: "window:live", type: "context_window", createdAt: 3, model, limit: 1_000_000,
+        window: { source: "session", freshness: "current", observedAt: 3 },
+      } });
+      await expect(label).toHaveText("21%");
+      await expect(page.locator("#chat-context-usage")).toHaveAttribute("title", "212,897 of 1,000,000 tokens in the context window");
+      await expect(page.locator('[data-chat-item-id="window:live"]')).toHaveCount(0);
+      await capture(page, testInfo, "context-limit-confirmed-during-turn");
+      await page.reload();
+      if (touch) await page.locator("#touch-tab-chat").click();
+      else await openChatPanel(page);
+      await expect(label).toHaveText("21%");
+      await expect(page.locator("#chat-context-usage")).toHaveAttribute("data-window-source", "session");
+    });
+  });
+}
+
 test.describe("Claude Code plan readout at phone width", () => {
   test.use({ viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true });
 
@@ -633,7 +1391,7 @@ test.describe("Claude Code plan readout at phone width", () => {
     const composerTop = await page.locator("#chat-composer").evaluate(element => element.getBoundingClientRect().top);
     const readoutBottom = await readout.evaluate(element => element.getBoundingClientRect().bottom);
     expect(readoutBottom).toBeLessThanOrEqual(composerTop + 8);
-    await capture(page, testInfo, "after-plan-readout-phone", USAGE_SCREENSHOTS);
+    await capture(page, testInfo, "after-plan-readout-phone");
 
     // A live switch to the desktop layout puts the sidebar beside the chat
     // and the still-open readout gains its pin; switching back retires it.
@@ -647,5 +1405,204 @@ test.describe("Claude Code plan readout at phone width", () => {
     await page.locator("#ui-mode-toggle").click();
     await expect(page.locator("html")).toHaveAttribute("data-ui-mode", "touch");
     await expect(page.locator("#chat-plan-pin")).toBeHidden();
+  });
+});
+
+// claude-scheduled-wakeups: a wakeup the agent scheduled holds the session in
+// a named state, fires as a wakeup turn (never a user bubble), and the user
+// can release the session to end every wakeup in it.
+test.describe("Claude Code scheduled wakeups (fixture-driven)", () => {
+  test.use({ viewport: { width: 1400, height: 1000 } });
+
+  // 24-hour and zero-padded in every locale.
+  const clock = (time: number) => `${String(new Date(time).getHours()).padStart(2, "0")}:${String(new Date(time).getMinutes()).padStart(2, "0")}`;
+
+  test("schedule → scheduled state → fire → wakeup turn → release", async ({ page, request }, testInfo) => {
+    const id = await bootClaude(page, request, "Scheduled wakeups", [
+      { id: "message:u1", type: "user_message", createdAt: 1, text: "Check the build in a minute and tell me whether it is green" },
+    ]);
+    // The turn that schedules: the tool call, the agent's reply, the pending
+    // wakeup the session reports, and the scheduled state after the result.
+    await control(request, { action: "status", conversationId: id, status: "running" });
+    await control(request, { action: "item", conversationId: id, item: { id: "tool:wake", type: "tool", createdAt: 10, name: "ScheduleWakeup", status: "completed", input: JSON.stringify({ delaySeconds: 60, reason: "check the build", prompt: "Check whether the build is green and report" }), output: "Next wakeup scheduled." } });
+    await control(request, { action: "item", conversationId: id, item: { id: "message:a1", type: "assistant_message", createdAt: 11, markdown: "I'll look again in a minute.", completedAt: 11 } });
+    const fireAt = Date.now() + 60_000;
+    const oneShot: ConversationItem = { id: "wakeup:w1", type: "scheduled_wakeup", createdAt: 12, wakeupId: "w1", prompt: "Check whether the build is green and report", recurring: false, schedule: "3 20 * * *", nextFireAt: fireAt, status: "pending" };
+    await control(request, { action: "item", conversationId: id, item: oneShot });
+    await control(request, { action: "status", conversationId: id, status: "completed" });
+    await control(request, { action: "status", conversationId: id, status: "scheduled" });
+
+    const status = page.locator("#chat-composer-status");
+    await expect(status).toHaveAttribute("data-state", "scheduled");
+    await expect(status).toHaveAttribute("aria-label", `1 wakeup scheduled · next about ${clock(fireAt)}`);
+    const panel = page.locator("#chat-scheduled-wakeups");
+    await expect(panel).toBeVisible();
+    await panel.locator("summary").click();
+    await expect(panel.locator("li .chat-wakeup-prompt")).toHaveText("Check whether the build is green and report");
+    await expect(panel.locator("li .chat-wakeup-when")).toHaveText(`about ${clock(fireAt)}`);
+    await expect(panel.locator("#chat-wakeups-release-note")).toHaveText("Releasing cancels every wakeup and ends the agent's session.");
+    await expect(page.locator('[data-chat-item-id="wakeup:w1"]')).toContainText(`Wakeup scheduled · about ${clock(fireAt)}`);
+    // Prompting stays possible: Send, not Cancel.
+    await page.locator("#chat-input").fill("anything new?");
+    await expect(page.locator("#chat-send")).toBeEnabled();
+    await expect(page.locator("#chat-send")).not.toHaveAttribute("aria-label", /Cancel/);
+    await page.locator("#chat-input").fill("");
+    await capture(page, testInfo, "scheduled-composer");
+
+    // The wakeup fires: the CLI starts a turn by itself. It opens with a
+    // wakeup header attributed to the wakeup, and the one-shot's row links it.
+    await control(request, { action: "status", conversationId: id, status: "running" });
+    await control(request, { action: "item", conversationId: id, item: { id: "message:wakeup:p1", type: "user_message", createdAt: 20, text: "Check whether the build is green and report", origin: "wakeup", wakeupId: "w1" } });
+    await control(request, { action: "item", conversationId: id, item: { id: "message:a2", type: "assistant_message", createdAt: 21, markdown: "The build is green.", completedAt: 21 } });
+    const { nextFireAt: _fire, ...firedRow } = oneShot as Extract<ConversationItem, { type: "scheduled_wakeup" }>;
+    await control(request, { action: "item", conversationId: id, item: { ...firedRow, status: "fired", firedTurnId: "message:wakeup:p1" } });
+    await control(request, { action: "status", conversationId: id, status: "completed" });
+    const header = page.locator('[data-chat-item-id="message:wakeup:p1"]');
+    await expect(header).toHaveClass(/chat-wakeup-turn/);
+    await expect(header.locator(".chat-wakeup-turn-label")).toHaveText("Wakeup");
+    await expect(page.locator(".chat-user-message")).toHaveCount(1);
+    const row = page.locator('[data-chat-item-id="wakeup:w1"]');
+    await expect(row.locator(".chat-wakeup-label")).toHaveText("Wakeup fired");
+    await expect(panel).toBeHidden();
+    await expect(status).toHaveAttribute("data-state", "ready");
+    await row.getByRole("button", { name: "Go to its turn" }).click();
+    await expect(header).toBeFocused();
+    await capture(page, testInfo, "wakeup-fired-turn");
+
+    // Two recurring crons the agent created: one cancelled on its own — the
+    // session stays scheduled for the other — then the rest released.
+    const recurring: ConversationItem = { id: "wakeup:c1", type: "scheduled_wakeup", createdAt: 30, wakeupId: "c1", prompt: "Poll the deploy queue", recurring: true, schedule: "*/5 * * * *", nextFireAt: Date.now() + 5 * 60_000, status: "pending" };
+    const digest: ConversationItem = { id: "wakeup:c2", type: "scheduled_wakeup", createdAt: 31, wakeupId: "c2", prompt: "Summarise new issues", recurring: true, schedule: "0 * * * *", nextFireAt: Date.now() + 30 * 60_000, status: "pending" };
+    await control(request, { action: "item", conversationId: id, item: recurring });
+    await control(request, { action: "item", conversationId: id, item: digest });
+    await control(request, { action: "status", conversationId: id, status: "scheduled" });
+    await expect(status).toHaveAttribute("data-state", "scheduled");
+    await expect(panel.locator("li")).toHaveCount(2);
+    const cancelRequest = page.waitForResponse(response => response.url().includes("/wakeups/c2/cancel"));
+    await panel.getByRole("button", { name: "Cancel wakeup: Summarise new issues" }).click();
+    expect((await cancelRequest).status()).toBe(200);
+    await expect(panel.locator("li")).toHaveCount(1);
+    await expect(page.locator('[data-chat-item-id="wakeup:c2"] .chat-wakeup-label')).toHaveText("Recurring wakeup cancelled");
+    await expect(status).toHaveAttribute("data-state", "scheduled");
+    await expect(panel.locator("li .chat-wakeup-recurring")).toHaveText("Repeats");
+    await capture(page, testInfo, "scheduled-recurring-before-release");
+    const releaseRequest = page.waitForResponse(response => response.url().includes(`/release`));
+    await panel.getByRole("button", { name: "Release session" }).click();
+    expect((await releaseRequest).status()).toBe(200);
+    await expect(panel).toBeHidden();
+    await expect(page.locator('[data-chat-item-id="wakeup:c1"] .chat-wakeup-label')).toHaveText("Recurring wakeup cancelled");
+    await expect(status).toHaveAttribute("data-state", "ready");
+    await capture(page, testInfo, "wakeup-released");
+  });
+
+  test("a reopened conversation lists its paused cron, idle, with a Cancel that ends it for good", async ({ page, request }, testInfo) => {
+    const id = await bootClaude(page, request, "Paused cron", [
+      { id: "message:u1", type: "user_message", createdAt: 1, text: "Check the deploy every five minutes" },
+      { id: "message:a1", type: "assistant_message", createdAt: 2, markdown: "Polling every five minutes.", completedAt: 2 },
+      { id: "wakeup:c1", type: "scheduled_wakeup", createdAt: 3, wakeupId: "c1", prompt: "Poll the deploy queue and report anything stuck", recurring: true, schedule: "*/5 * * * *", status: "paused", message: "Paused: the agent's session ended. Claude Code restores this schedule when the conversation runs again." },
+    ]);
+    const panel = page.locator("#chat-scheduled-wakeups");
+    await expect(panel).toBeVisible();
+    await expect(page.locator("#chat-composer-status")).toHaveAttribute("data-state", "ready");
+    await expect(panel.locator("#chat-scheduled-wakeups-label")).toHaveText("1 schedule paused · fires again when this conversation runs");
+    await panel.locator("summary").click();
+    await expect(panel.locator("li .chat-wakeup-when")).toHaveText("Paused");
+    await expect(panel.locator(".chat-wakeups-release")).toBeHidden();
+    const row = page.locator('[data-chat-item-id="wakeup:c1"]');
+    await expect(row.locator(".chat-wakeup-label")).toHaveText("Recurring wakeup paused");
+    await expect(row.locator(".chat-wakeup-message")).toContainText("restores this schedule");
+    await capture(page, testInfo, "paused-cron-reopened");
+    const cancelRequest = page.waitForResponse(response => response.url().includes("/wakeups/c1/cancel"));
+    await panel.getByRole("button", { name: /Cancel wakeup/ }).click();
+    expect((await cancelRequest).status()).toBe(200);
+    await expect(panel).toBeHidden();
+    await expect(row.locator(".chat-wakeup-label")).toHaveText("Recurring wakeup cancelled");
+    await capture(page, testInfo, "paused-cron-cancelled");
+  });
+
+  test("a schedule that did not survive its session reads as lost, with the reason", async ({ page, request }, testInfo) => {
+    const id = await bootClaude(page, request, "Lost wakeup", [
+      { id: "message:u1", type: "user_message", createdAt: 1, text: "Remind me in ten minutes" },
+      { id: "wakeup:w1", type: "scheduled_wakeup", createdAt: 2, wakeupId: "w1", prompt: "Remind the user", recurring: false, schedule: "10 20 * * *", nextFireAt: Date.now() + 600_000, status: "pending" },
+    ]);
+    await control(request, { action: "status", conversationId: id, status: "scheduled" });
+    await expect(page.locator("#chat-composer-status")).toHaveAttribute("data-state", "scheduled");
+    await control(request, { action: "item", conversationId: id, item: { id: "wakeup:w1", type: "scheduled_wakeup", createdAt: 2, wakeupId: "w1", prompt: "Remind the user", recurring: false, schedule: "10 20 * * *", status: "lost", message: "The agent's schedule did not survive its session: Claude Code keeps scheduled wakeups only while its process runs." } });
+    await control(request, { action: "status", conversationId: id, status: "idle" });
+    const row = page.locator('[data-chat-item-id="wakeup:w1"]');
+    await expect(row.locator(".chat-wakeup-label")).toHaveText("Wakeup lost");
+    await expect(row.locator(".chat-wakeup-message")).toContainText("did not survive its session");
+    await expect(page.locator("#chat-scheduled-wakeups")).toBeHidden();
+    await expect(page.locator("#chat-composer-status")).toHaveAttribute("data-state", "ready");
+    await capture(page, testInfo, "wakeup-lost");
+  });
+});
+
+test.describe("Claude Code scheduled wakeups at phone width", () => {
+  test.use({ viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true });
+
+  test("the scheduled state and its release fit the touch composer", async ({ page, request }, testInfo) => {
+    await request.post("/__e2e/reset");
+    await control(request, { action: "agents", count: 2 });
+    await control(request, { action: "models", agent: "claude", models: claudeModels });
+    const seeded = await control(request, {
+      action: "seed", agent: "claude", title: "Scheduled on a phone",
+      items: [
+        { id: "message:u1", type: "user_message", createdAt: 1, text: "Check the deploy every five minutes" },
+        { id: "message:a1", type: "assistant_message", createdAt: 2, markdown: "Polling every five minutes.", completedAt: 2 },
+        { id: "wakeup:c1", type: "scheduled_wakeup", createdAt: 3, wakeupId: "c1", prompt: "Poll the deploy queue and report anything stuck", recurring: true, schedule: "*/5 * * * *", nextFireAt: Date.now() + 5 * 60_000, status: "pending" },
+      ],
+    }) as { conversation: { id: string } };
+    const id = seeded.conversation.id;
+    const token = await request.get("/__e2e/terminal-token").then(response => response.json()) as { token: string };
+    await page.goto(`/?t=${encodeURIComponent(token.token)}`);
+    await expect(page.locator("html")).toHaveAttribute("data-ui-mode", "touch");
+    await page.locator("#touch-tab-chat").click();
+    await expect(page.locator("#chat-surface")).toBeVisible();
+    await page.locator("#chat-conversation-select").selectOption(id);
+    await control(request, { action: "status", conversationId: id, status: "scheduled" });
+    const panel = page.locator("#chat-scheduled-wakeups");
+    await expect(panel).toBeVisible();
+    await panel.locator("summary").click();
+    await expect(panel.getByRole("button", { name: "Release session" })).toBeVisible();
+    await capture(page, testInfo, "scheduled-composer-phone");
+  });
+});
+
+test.describe("Claude Code running-task inspection at phone width", () => {
+  test.use({ viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true });
+
+  test("both inspection views fill the phone surface", async ({ page, request }, testInfo) => {
+    const id = await bootClaude(page, request, "Inspect on the phone", [
+      { id: "message:u1", type: "user_message", createdAt: 1, text: "Explore the tree and run the suite in the background" },
+    ], {}, true);
+    const child = await control(request, {
+      action: "seed", agent: "claude", title: "Read the tree", child: true,
+      items: [{ id: "part:child-1", type: "assistant_message", createdAt: 3, markdown: "Reading src/chat/." }],
+    }) as { conversation: { id: string } };
+    await control(request, { action: "status", conversationId: id, status: "background" });
+    await control(request, { action: "item", conversationId: id, item: agentTool("tool:toolu_1", "Read the tree", "explore") });
+    await control(request, { action: "item", conversationId: id, item: runningTask("ada2b", "Read the tree", {
+      taskType: "local_agent", toolUseId: "toolu_1", childConversationId: child.conversation.id,
+      subagentType: "explore", progress: "Reading the tests", usage: { totalTokens: 13_122, toolUses: 1, durationMs: 4_000 },
+    }) });
+    await control(request, { action: "taskOutput", agent: "claude", taskId: "bgjpa", text: "bun test v1.3.0\n 41 pass\n" });
+    await control(request, { action: "item", conversationId: id, item: runningTask("bgjpa", "bun test", {
+      taskType: "local_bash", toolUseId: "toolu_2", outputFile: "/tmp/tasks/bgjpa.output",
+    }) });
+
+    const list = await openTaskList(page);
+    const strip = page.locator("#chat-drilldown-task");
+    await list.locator('[data-inspect-task="ada2b"]').click();
+    await expect(strip).toHaveAttribute("data-task-id", "ada2b");
+    await expect(strip.locator(".chat-drilldown-task-type")).toHaveText("explore");
+    await expect(page.locator("#chat-drilldown-items")).toContainText("Reading src/chat/.");
+    await capture(page, testInfo, "phase5-running-agent-task-strip-phone");
+
+    await page.locator("#chat-drilldown-back").click();
+    await (await openTaskList(page)).locator('[data-inspect-task="bgjpa"]').click();
+    await expect(page.locator("#chat-drilldown-timeline")).toBeHidden();
+    await expect(page.locator("#chat-drilldown-output-text")).toContainText("41 pass", { timeout: 10_000 });
+    await capture(page, testInfo, "phase5-running-shell-task-output-phone");
   });
 });

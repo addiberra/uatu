@@ -1,4 +1,6 @@
 import type { StatePayload } from "../../src/shared/types";
+import type { DocumentSnapshot } from "../../src/shared/document-updates";
+import { WORKSPACE_API_REVISION, BUNDLED_WEB_REVISION } from "../../src/shared/version";
 import type { ConversationSnapshot, AgentChatStatus } from "../../src/chat/types";
 import { FIXTURE_TIME } from "./backend";
 import { continuityCorpus, continuityDocument, continuityConversation } from "./continuity-fixture";
@@ -34,7 +36,16 @@ export function createWorkspaceProtocols() {
   // Keep fixture mtimes fixed, but emit fresh snapshots even within one ms or
   // after reset. Reset must not rewind the freshness watermark of an open page.
   let generatedAt = FIXTURE_TIME;
-  const stateSnapshot = () => ({ ...currentCorpus(), generatedAt: generatedAt = Math.max(Date.now(), generatedAt + 1) });
+  let revision = 0;
+  const stateSnapshot = (): DocumentSnapshot => ({
+    ...currentCorpus(), workspaceApiRevision: WORKSPACE_API_REVISION,
+    build: { ...currentCorpus().build, bundledWebRevision: BUNDLED_WEB_REVISION },
+    kind: "snapshot", epoch: `synthetic-${epoch}`, revision: ++revision,
+    roots: currentCorpus().roots.map(root => ({ ...root, docs: root.docs.map(doc => ({ ...doc, revision: 0 })) })),
+    discovery: { status: "ready", discovered: currentCorpus().roots.reduce((n, root) => n + root.docs.length, 0) },
+    repositoryState: { status: "ready", generation: 0 },
+    generatedAt: generatedAt = Math.max(Date.now(), generatedAt + 1),
+  });
   const streams = new Set<ReadableStreamDefaultController<Uint8Array>>();
   const chatStreams = new Set<ReadableStreamDefaultController<Uint8Array>>();
   const uploads = new Set<(response: Response) => void>();
@@ -69,8 +80,9 @@ export function createWorkspaceProtocols() {
     async handle(request: Request, url: URL): Promise<Response | null> {
       const path = url.pathname;
       const queries: Record<string, string[]> = {
-        "/api/state": ["compareTarget", "scope"], "/api/events": ["compareTarget", "scope", "reconnect"], "/api/document": ["compareTarget", "scope", "id", "view"],
-        "/api/document/resource": ["compareTarget", "scope", "id", "rootId"],
+        "/api/state": ["compareTarget", "scope", "documentPath"], "/api/events": ["compareTarget", "scope", "reconnect"], "/api/document": ["compareTarget", "scope", "id", "view"],
+        "/api/document/resource": ["compareTarget", "scope", "id", "rootId", "revision"],
+        "/api/document/facts": ["compareTarget", "scope", "id"],
         "/api/chat/models": ["agent"], "/api/chat/commands": ["agent"], "/api/chat/modes": ["agent"], "/api/chat/conversations/events": ["reconnect"],
         [`/api/chat/conversations/${encodeURIComponent(conversationId)}`]: ["limit"],
         [`/api/chat/conversations/${encodeURIComponent(conversationId)}/events`]: ["cursor", "reconnect"],
@@ -90,6 +102,11 @@ export function createWorkspaceProtocols() {
         return sse(request, chat.replay(id, url.searchParams.get("cursor")), false, id);
       }
       if (request.method === "GET") {
+        if (path === "/api/activity") return sse(request, 'event: activity\ndata: {"working":false,"awaiting":false}\n\n');
+        if (path === "/api/document/facts") {
+          const doc = currentCorpus().roots.flatMap(root => root.docs).find(doc => doc.id === url.searchParams.get("id"));
+          return doc ? json({ revision: `synthetic-${epoch}:0`, generation: 0, gitState: "non-git" }) : json({ error: "Unknown synthetic document" }, 404);
+        }
         if (path === "/api/state") return json(stateSnapshot());
         if (path === "/api/personal-state") return json({ version: 1 });
         if (path === "/api/events") return sse(request, `event: state\ndata: ${JSON.stringify(stateSnapshot())}\n\n`);

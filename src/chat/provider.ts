@@ -1,4 +1,4 @@
-import type { ChatAgent, ChatMode, ChatCommand, ChatModel, ConversationConfiguration, ConversationItem, ConversationStatus, ModelSelection, PermissionChoice, ReversibleHistoryResult, ReversibleHistoryState, StructuredQuestion, TokenUsage } from "./types";
+import type { AgentUsageReport, BackgroundTaskOutput, BackgroundTaskUsage, ChatAccountChange, ChatAgent, ChatLoginState, ChatMode, ChatCommand, ChatModel, ConversationConfiguration, ConversationItem, ConversationStatus, ModelSelection, PermissionChoice, ReversibleHistoryResult, ReversibleHistoryState, ScheduledWakeupItem, StructuredQuestion, TokenUsage, UsageReadMode, UsageReadResult } from "./types";
 
 // `conversationId` is the owning session, like PendingPermission's: the global
 // list is filtered by the adapter, which is what lets a parent discover its
@@ -17,7 +17,7 @@ export type PendingQuestion = {
 // `diff` is the change a file-edit permission would apply (OpenCode's
 // `metadata.diff`), carried through recovery so a card rebuilt after a missed
 // event shows the same change the live announcement would have.
-export type PendingPermission = { requestId: string; conversationId: string; action: string; resources: string[]; diff?: string; plan?: string; choices?: PermissionChoice[] };
+export type PendingPermission = { requestId: string; conversationId: string; action: string; resources: string[]; alwaysPatterns?: string[]; diff?: string; plan?: string; choices?: PermissionChoice[]; sourceToolId?: string; mcp?: { server: string; tool: string } };
 
 // One live background task the provider still holds, for a reader opening a
 // conversation whose live announcements they missed (spec: the state is
@@ -30,6 +30,26 @@ export type PendingBackgroundTask = {
   taskType?: string;
   toolUseId?: string;
   startedAt: number;
+  // The facts the live row carries (types.ts BackgroundTaskItem), so the
+  // seeded row is as complete as the one a reader who stayed would have.
+  subagentType?: string;
+  prompt?: string;
+  usage?: BackgroundTaskUsage;
+  outputFile?: string;
+  childConversationId?: string;
+};
+
+// One wakeup a live session holds, for a reader opening a conversation whose
+// wakeup announcements they missed — the scheduled state's equivalent of
+// PendingBackgroundTask.
+export type PendingScheduledWakeup = {
+  conversationId: string;
+  wakeupId: string;
+  prompt: string;
+  recurring: boolean;
+  schedule: string;
+  nextFireAt?: number;
+  createdAt: number;
 };
 
 export type ProviderSession = {
@@ -60,6 +80,12 @@ export type NormalizedSessionLifecycle = {
   directory: string;
   title: string;
   parentId?: string;
+  // The wire event named only the fields it carries (2.x `session.renamed`:
+  // id and title; 2.x `session.deleted`: id alone). Parentage it omits is
+  // unchanged, not cleared, and a directory it omits is the workspace by
+  // assumption, vouching for nothing the adapter has not seen. A full
+  // record (1.x `session.updated`) without a parent means top-level.
+  sparse?: true;
 };
 
 // Why an event produced no updates. Without this an unrecognized event and one
@@ -76,21 +102,34 @@ export type NormalizedEventOutcome =
   | "unparseable";
 
 export type NormalizedProviderEvent = {
+  catalogsChanged?: boolean;
   conversationId?: string;
   updates: NormalizedProviderUpdate[];
   outcome: NormalizedEventOutcome;
   // The event's own type, so a caller can count drops per type. Never a
   // payload — a payload can carry file contents.
   eventType: string;
+  // Content blocks (Claude) or parts (OpenCode) of a type the normalizer
+  // does not read, skipped inside an otherwise recognized event: by type
+  // only, never payload, so the caller can count them the way it counts
+  // dropped events.
+  skippedBlocks?: string[];
+  // Correlated live execution signals, separate from the UI's unqualified
+  // status transitions. History readers never populate these.
+  notificationTurns?: Array<{
+    sourceId: string;
+    phase: "started" | "completed" | "failed" | "interrupted" | "background";
+    createdAt: number;
+  }>;
   // The model the assistant message ran, when the event states it. Reported on
   // the envelope rather than on an item: it belongs to the message, and the
   // one thing that needs it — attributing a subagent on its parent's row —
   // reads it from the child's event stream, not from the child's timeline.
-  assistantModel?: { messageId: string; model: string; createdAt: number };
+  assistantModel?: { messageId: string; model: string; createdAt: number; promptId?: string };
   // The tokens a message reported, with the message's own id. A message can
   // produce several parts, so aggregation keys on this id rather than counting
   // the dedicated usage carrier as though it were another content part.
-  assistantUsage?: { messageId: string; usage: TokenUsage };
+  assistantUsage?: { messageId: string; usage: TokenUsage; promptId?: string };
   // A deleted assistant message must also leave any aggregate keyed by its
   // provider id; timeline removes alone cannot reach the adapter's tally.
   removedMessageId?: string;
@@ -109,7 +148,10 @@ export type NormalizedProviderEvent = {
 // message's own provider id — the aggregation input for subagent attribution,
 // which the timeline's usage carriers cannot serve (they are items, not
 // per-message records).
-export type StoredMessageAccounting = { messageId: string; createdAt: number; usage?: TokenUsage; model?: string };
+// `promptId` is the user message an assistant message answers: a subagent
+// given several tasks has one prompt per task, and it is what lets a task's
+// row state that task's spend rather than the whole session's.
+export type StoredMessageAccounting = { messageId: string; createdAt: number; usage?: TokenUsage; model?: string; promptId?: string };
 
 export type ProviderHistoryPage = {
   // Normalized timeline items for this page, in the provider's part order.
@@ -151,6 +193,31 @@ export class BackgroundTaskUnavailableError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "BackgroundTaskUnavailableError";
+  }
+}
+
+/**
+ * A release the session cannot take right now: a turn is running, or live
+ * background work would die with it. A conflict with the current state —
+ * the scheduled state is the only one Release ends.
+ */
+export class ReleaseUnavailableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ReleaseUnavailableError";
+  }
+}
+
+/**
+ * A cancel for a wakeup the agent no longer holds or the transcript no
+ * longer yields — it fired, expired, or was removed first. A conflict with
+ * the current state, not a failure: the row's own settling says what became
+ * of it.
+ */
+export class ScheduledWakeupUnavailableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ScheduledWakeupUnavailableError";
   }
 }
 
@@ -212,7 +279,24 @@ export interface ChatProvider {
    */
   dispose?(): Promise<void>;
   prompt(sessionId: string, input: { id: string; text: string; delivery: "queue"; attachments?: ProviderAttachment[]; model?: ModelSelection; mode?: string; variant?: string }): Promise<{ messageId: string }>;
-  command(sessionId: string, input: { id: string; name: string; arguments: string; model?: ModelSelection; mode?: string; variant?: string }): Promise<{ messageId: string }>;
+  /**
+   * `text`, when set, is what the user's row reads as because the provider
+   * sent something other than the typed command — a 2.x skill runs as a
+   * prompt reading `@<skill> <args>`. The adapter's acceptance row takes it,
+   * so the row agrees with the provider's own restatement whichever lands
+   * first.
+   */
+  //
+  // `listed`, when the caller classified the text, is the entry of this
+  // provider's own `listCommands()` answer it matched: the provider
+  // dispatches by it rather than re-reading its catalogs, so an entry that
+  // changed in between still runs as what the user chose.
+  //
+  // `operation` names what actually ran when it was not an ordinary command
+  // turn: "reload" when the provider reloaded its server's configuration.
+  // Only the provider knows — a config command or skill named `reload`
+  // shadows the built-in — so clients key reload behavior off this answer.
+  command(sessionId: string, input: { id: string; name: string; arguments: string; listed?: ChatCommand; model?: ModelSelection; mode?: string; variant?: string }): Promise<{ messageId: string; text?: string; operation?: "reload" }>;
   interrupt(sessionId: string): Promise<void>;
   replyPermission(sessionId: string, requestId: string, reply: ProviderPermissionReply, choiceId?: string): Promise<void>;
   /**
@@ -245,4 +329,57 @@ export interface ChatProvider {
    * task settling. Optional: only an agent declaring `background-tasks`.
    */
   stopTask?(sessionId: string, taskId: string): Promise<void>;
+  /**
+   * Every pending wakeup the provider's live sessions hold, each naming its
+   * owning session. Optional: only an agent declaring `scheduled-wakeups`.
+   */
+  listScheduledWakeups?(): Promise<PendingScheduledWakeup[]>;
+  /**
+   * End a session held only for its scheduled wakeups: the process retires,
+   * its wakeups end with it and read as cancelled, the conversation is idle.
+   * A no-op for a conversation with no live session. Optional: only an agent
+   * declaring `scheduled-wakeups`.
+   */
+  release?(sessionId: string): Promise<void>;
+  /**
+   * A conversation's paused wakeups: ones its session no longer holds but
+   * the agent rebuilds when the conversation runs again. Empty while a
+   * session is live. Optional: only an agent declaring `scheduled-wakeups`.
+   */
+  listPausedWakeups?(sessionId: string): Promise<ScheduledWakeupItem[]>;
+  /**
+   * Cancel one wakeup, live or paused; it never fires again. Optional: only
+   * an agent declaring `scheduled-wakeups`.
+   */
+  cancelWakeup?(sessionId: string, wakeupId: string): Promise<void>;
+  /**
+   * A bounded tail of a background task's output so far — a shell task's
+   * output file, read from its end. Null when the task is unknown to the
+   * session or nothing has named its output yet. Optional: only an agent
+   * declaring `background-tasks`, and only one whose tasks write files.
+   */
+  taskOutput?(sessionId: string, taskId: string, options: { tailBytes: number }): Promise<BackgroundTaskOutput | null>;
+  /**
+   * The login's plan usage as last read, from memory: no I/O. Optional:
+   * only an agent declaring `usage`.
+   */
+  usageReport?(): Promise<AgentUsageReport | undefined>;
+  /**
+   * Read plan usage now. The provider chooses the session: a live one
+   * answers without interruption; with "start" an idle conversation is
+   * started for the read and retired again. A failure says why.
+   */
+  readUsage?(mode: UsageReadMode): Promise<UsageReadResult>;
+  /**
+   * Whether the machine's logins let this agent run a turn, as last read:
+   * no I/O. Absent: the agent cannot say.
+   */
+  loginState?(): ChatLoginState;
+  /**
+   * The machine's logins changed through the Hub's Agent accounts. The
+   * provider re-reads what it caches about them and replays a removal or
+   * switch on its own agent server; it never restarts anything and never
+   * touches a running turn.
+   */
+  accountsChanged?(change: ChatAccountChange): Promise<void>;
 }

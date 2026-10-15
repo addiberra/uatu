@@ -86,7 +86,7 @@ async function expectDocument(page: Page, workspace: string, path: string, headi
 }
 
 async function expectCoast(page: Page, workspace: string) {
-  const image = page.locator('#preview img[src$="coast.svg"]');
+  const image = page.locator('#preview img[src*="coast.svg"]');
   await image.scrollIntoViewIfNeeded();
   await expect(image).toBeVisible();
   await expect.poll(() => image.evaluate((element: HTMLImageElement) => element.complete && element.naturalWidth > 0 && element.naturalHeight > 0)).toBe(true);
