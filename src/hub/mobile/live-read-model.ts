@@ -10,7 +10,7 @@ import type { PublicToolReadinessDto } from "../credential-types";
 /** Decoded current wire facts, NOT WorkspaceView or AuthenticationState.
  * Missing optional facts remain absent (unknown), not false/empty/non-Git.
  * Optional checkout/credential facts are authoritative; legacy labels are not.
- * Authentication identity is a separate, still-unimplemented contract. */
+ * Old servers may omit authenticated identity; clients must not invent it. */
 export type HubWorkspaceSnapshot = Pick<WorkspaceEntry, "id" | "displayName" | "path" | "backend"> & {
   running: boolean;
   credentialRestartRequired: boolean;
@@ -33,6 +33,7 @@ export type HubWorkspaceSnapshot = Pick<WorkspaceEntry, "id" | "displayName" | "
 
 export type HubStateSnapshot = HubApiCompatibility & {
   version: string;
+  identity?: { user: string; host: string };
   workspaces: HubWorkspaceSnapshot[];
   workspaceDefaults?: DefaultWorkspaceParentState;
   worktreeApi?: string;
@@ -124,6 +125,10 @@ export function decodeHubState(value: unknown): HubStateSnapshot {
     workspaces: unique(array(row.workspaces, decodeWorkspace), workspace => workspace.id),
   };
   if (row.workspaceDefaults !== undefined) result.workspaceDefaults = decodeDefaultFolder(row.workspaceDefaults);
+  if (row.identity !== undefined) {
+    const identity = object(row.identity);
+    result.identity = { user: nonempty(identity.user), host: nonempty(identity.host) };
+  }
   // Retained as capability data, not used as a fetch destination by this reader.
   if (row.worktreeApi !== undefined) result.worktreeApi = nonempty(row.worktreeApi);
   return result;

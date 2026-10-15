@@ -2,6 +2,31 @@
 
 Entries are ordered newest first. Every entry has Hub and workspace revisions, a compatibility classification, and migration guidance. Use `None` when no migration is required. An entry is headed `Unreleased` until the release that ships it; the release-prep step replaces that with the version tag (`v0.7.0`), so a consumer can tell which revision pair a given uatu version speaks. An additive change that lands after a pair has shipped gets its own entry under the same pair, stamped with its own release, rather than being appended to the shipped entry.
 
+## Hub 13 / Workspace 24 - Unreleased (browser authentication)
+
+Compatibility: breaking (hub; optional identity added to a closed response)
+
+### Changes
+
+- Authenticated Hub state includes `identity.user` (configured user) and
+  `identity.host` (Hub OS hostname). Anonymous responses contain neither identity
+  nor version/workspace data. Old payloads without identity remain valid but
+  cannot supply the mobile identity overview.
+- JSON login accepts optional `sessionTransport: cookie`, returning only `user`
+  and the existing HttpOnly session cookie. Omission preserves the native
+  `sessionId` response and bearer compatibility. Browser clients must not persist
+  bearer credentials; JSON login does not accept a navigation target.
+- Cookie logout with `Accept: application/json` returns `{revoked: true}` and
+  clears the cookie without redirecting. Existing form redirects and bearer JSON
+  remain supported. Cookie CSRF checks, rate limits and safe form return paths
+  are unchanged. Hub JSON responses are no-store, including device/revoke reads.
+
+### Migration
+
+Closed Hub revision-12 validators must allow the new optional state identity and
+cookie-login response variant before accepting revision 13. Native callers need
+no request change. No workspace or streaming protocol changes.
+
 ## Hub 12 / Workspace 24 - Unreleased (checkout and credential facts)
 
 Compatibility: breaking (hub; optional additions to closed response objects)

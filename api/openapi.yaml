@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: UatuCode public API
-  version: 12.24.0-experimental
+  version: 13.24.0-experimental
   license: { name: MIT, identifier: MIT }
   summary: Hub revision 12 and workspace revision 24
   description: |
@@ -20,7 +20,7 @@ info:
     is the authoritative machine-readable pair, and the product version of a
     published snapshot is recorded in that snapshot's `contract.json`.
   x-uatu-revisions:
-    hubApiRevision: 12
+    hubApiRevision: 13
     workspaceApiRevision: 24
 servers:
   - url: https://{hubHost}
@@ -101,7 +101,7 @@ paths:
     post:
       operationId: hubLogin
       tags: [Hub authentication]
-      summary: Create a native Hub session
+      summary: Create a native or cookie-only browser Hub session
       security: []
       requestBody:
         required: true
@@ -111,13 +111,16 @@ paths:
             example: { name: alice, password: secret, deviceLabel: Alice's Mac }
       responses:
         '200':
-          description: Session issued. The session ID is also set as a cookie.
+          description: Session issued as an HttpOnly cookie. Native callers also receive the bearer sessionId; sessionTransport cookie omits it entirely. No redirect target is accepted by this JSON flow.
           headers:
             Set-Cookie: { schema: { type: string } }
             Cache-Control: { schema: { type: string, const: no-store } }
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/NativeLoginResponse' }
+              schema:
+                oneOf:
+                  - { $ref: '#/components/schemas/NativeLoginResponse' }
+                  - { $ref: '#/components/schemas/CookieLoginResponse' }
               example: { sessionId: token-value, user: alice }
         '400': { $ref: '#/components/responses/NoStoreError' }
         '401': { $ref: '#/components/responses/NoStoreError' }
@@ -127,8 +130,9 @@ paths:
     post:
       operationId: hubLogout
       tags: [Hub authentication]
-      summary: Revoke the bearer session
-      security: [{ hubBearer: [] }]
+      summary: Revoke the current session
+      security: [{ hubBearer: [] }, { hubCookie: [] }]
+      description: Bearer callers receive JSON. Cookie callers requesting Accept application/json receive JSON and a cleared cookie; other browser callers redirect to /login. Cookie requests require same-origin CSRF validation.
       responses:
         '200': { $ref: '#/components/responses/Revoked' }
         '403': { $ref: '#/components/responses/Error' }
@@ -148,7 +152,7 @@ paths:
                   summary: An ordinary workspace
                   value:
                     version: 0.5.1 (abcdef0)
-                    hubApiRevision: 12
+                    hubApiRevision: 13
                     workspaceApiRevision: 20
                     workspaces: [{ id: uatu, displayName: Uatu Docs, path: /src/uatu, backend: local, running: true, credentialRestartRequired: false, credentialAssignments: { authentication: [Work GitHub], signing: [Work signing] }, workspaceApiRevision: 20, shells: [{ attached: false, label: zsh }] }]
                     workspaceDefaults: { configured: /srv/workspaces, configuredAvailable: true, effective: /srv/workspaces }
@@ -156,7 +160,7 @@ paths:
                   summary: A main workspace and one linked worktree
                   value:
                     version: 0.5.1 (abcdef0)
-                    hubApiRevision: 12
+                    hubApiRevision: 13
                     workspaceApiRevision: 20
                     worktreeApi: /api/hub/worktrees
                     workspaces:
@@ -1593,13 +1597,24 @@ components:
     NativeLoginRequest:
       type: object
       required: [name, password]
-      properties: { name: { type: string }, password: { type: string }, deviceLabel: { type: string } }
+      properties: { name: { type: string }, password: { type: string }, deviceLabel: { type: string }, sessionTransport: { type: string, const: cookie, description: Omit the bearer credential from the response; authentication uses only the HttpOnly cookie. } }
       additionalProperties: false
     NativeLoginResponse:
       type: object
       required: [sessionId, user]
       properties: { sessionId: { type: string }, user: { type: string } }
       additionalProperties: false
+    CookieLoginResponse:
+      type: object
+      required: [user]
+      properties: { user: { type: string } }
+      additionalProperties: false
+    HubIdentity:
+      type: object
+      required: [user, host]
+      properties: { user: { type: string, minLength: 1 }, host: { type: string, minLength: 1 } }
+      additionalProperties: false
+      description: Authenticated configured user and Hub operating-system hostname. Never present on anonymous pages or responses.
     CompatibilityMetadata:
       type: object
       required: [hubApiRevision, workspaceApiRevision]
@@ -1611,6 +1626,7 @@ components:
       required: [version, hubApiRevision, workspaceApiRevision, workspaces]
       properties:
         version: { type: string }
+        identity: { $ref: '#/components/schemas/HubIdentity' }
         hubApiRevision: { type: integer, minimum: 1 }
         workspaceApiRevision: { type: integer, minimum: 1 }
         workspaces:

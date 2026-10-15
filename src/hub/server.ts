@@ -172,7 +172,7 @@ const CREDENTIAL_PATH = "/api/hub/credentials";
 const CREDENTIAL_TOOL_PATH = "/api/hub/credential-tools";
 
 function json(status: number, body: unknown, headers?: Record<string, string>): Response {
-  return Response.json(body, { status, headers });
+  return Response.json(body, { status, headers: { "cache-control": "no-store", ...headers } });
 }
 
 const NO_STORE_HEADERS = { "cache-control": "no-store" };
@@ -435,14 +435,16 @@ export function createHubFetchHandler(deps: HubDeps) {
     let name = "";
     let password = "";
     let requestedLabel: unknown;
+    let cookieOnly = false;
     // Browser form flow only — native JSON logins have no page to return to.
     let postedNext: string | null = null;
     try {
       if (isJson) {
-        const body = (await request.json()) as { name?: unknown; password?: unknown; deviceLabel?: unknown };
+        const body = (await request.json()) as { name?: unknown; password?: unknown; sessionTransport?: unknown; deviceLabel?: unknown };
         name = typeof body.name === "string" ? body.name : "";
         password = typeof body.password === "string" ? body.password : "";
         requestedLabel = body.deviceLabel;
+        cookieOnly = body.sessionTransport === "cookie";
       } else {
         const form = await request.formData();
         name = String(form.get("name") ?? "");
@@ -483,7 +485,7 @@ export function createHubFetchHandler(deps: HubDeps) {
       // clients; the cookie is set too so a web view sharing the client's
       // cookie jar is signed in at once.
       return Response.json(
-        { sessionId: record.id, user: user.name },
+        cookieOnly ? { user: user.name } : { sessionId: record.id, user: user.name },
         { status: 200, headers: { "set-cookie": setCookie, ...NO_STORE_HEADERS } },
       );
     }
@@ -544,7 +546,7 @@ export function createHubFetchHandler(deps: HubDeps) {
     return facts;
   };
 
-  const hubState = async (): Promise<Response> => {
+  const hubState = async (user: string): Promise<Response> => {
     const worktreeFacts = await worktreeStateFacts();
     const credentialState = deps.credentialApi?.metadata.snapshot();
     const credentialNames = new Map(credentialState?.credentials.map(credential => [credential.id, credential.name]));
@@ -608,6 +610,7 @@ export function createHubFetchHandler(deps: HubDeps) {
     const workspaceDefaults = await workspaceDefaultsState();
     return json(200, {
       version: formatBuildIdentifier(BUILD),
+      identity: { user, host: os.hostname() },
       ...compatibility,
       workspaces,
       ...(workspaceDefaults === undefined ? {} : { workspaceDefaults }),
@@ -1450,14 +1453,18 @@ export function createHubFetchHandler(deps: HubDeps) {
         await sessionStore.revoke(presented.id);
         live.endStreamsForSession(presented.id);
       }
-      if (presented?.transport === "bearer") {
-        return json(200, { revoked: true });
+      if (presented?.transport === "bearer" || request.headers.get("accept") === "application/json") {
+        return json(200, { revoked: true }, {
+          ...NO_STORE_HEADERS,
+          "set-cookie": formatHubCookieClear(new URL(request.url), { secure: secureCookies(request) }),
+        });
       }
       return new Response(null, {
         status: 303,
         headers: {
           location: "/login",
           "set-cookie": formatHubCookieClear(new URL(request.url), { secure: secureCookies(request) }),
+          ...NO_STORE_HEADERS,
         },
       });
     }
@@ -1712,7 +1719,7 @@ export function createHubFetchHandler(deps: HubDeps) {
       return worktreeApi.handle(request, url, { user: session.user });
     }
     if (pathname === "/api/hub/state" && request.method === "GET") {
-      return hubState();
+      return hubState(session.user);
     }
     if (pathname === "/api/hub/browse" && request.method === "GET") {
       return browse(url);

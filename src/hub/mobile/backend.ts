@@ -76,7 +76,8 @@ export type AuthenticationState =
   | { status: "authenticated"; identity: HubIdentity }
   | { status: "signed-out"; identity?: never };
 
-/** Public device handle, never the bearer/cookie session secret. Time is issued, not last-active. */
+/** Public device handle, never the bearer/cookie session secret. Time is issued,
+ * not last-active, in browser epoch milliseconds (wire seconds are converted). */
 export type DeviceView = Pick<HubSessionRecord, "deviceLabel" | "issuedAt"> & { handle: string; current: boolean };
 export type CredentialView<T extends CredentialRecord["type"]> = Extract<PublicCredentialDto, { type: T }>;
 export type CredentialTarget<T extends CredentialRecord["type"] = CredentialRecord["type"]> = {

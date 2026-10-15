@@ -71,9 +71,9 @@ describe("API contract structure", () => {
     expect(hubCookieName(new URL("http://127.0.0.1:4701/"))).toBe("uatu_hub_4701");
   });
 
-  test("public logout uses the bearer JSON transport", async () => {
+  test("public logout preserves bearer JSON and also supports same-origin cookie JSON", async () => {
     const openapi = await readYaml<{ paths: { "/logout": { post: { security: unknown } } } }>("api/openapi.yaml");
-    expect(openapi.paths["/logout"].post.security).toEqual([{ hubBearer: [] }]);
+    expect(openapi.paths["/logout"].post.security).toEqual([{ hubBearer: [] }, { hubCookie: [] }]);
   });
 
   test("the public contract is the Hub API and the workspace API is an explicit internal exclusion", async () => {

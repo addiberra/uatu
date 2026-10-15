@@ -281,6 +281,46 @@ afterAll(async () => {
 });
 
 describe("hub end to end", () => {
+  test("cookie-only browser login, identity and device revocation keep bearer secrets out of JSON", async () => {
+    const body = JSON.stringify({ name: "alice", password: "alice secret", sessionTransport: "cookie", deviceLabel: "Mobile adapter test" });
+    const denied = await fetch(`${origin}/login`, { method: "POST", headers: { "content-type": "application/json", origin: "https://elsewhere.invalid" }, body });
+    expect(denied.status).toBe(403);
+    const login = await fetch(`${origin}/login?next=https://elsewhere.invalid`, { method: "POST", headers: { "content-type": "application/json", origin }, body, redirect: "manual" });
+    await assertContract("POST", "/login", login.clone());
+    expect(await login.json()).toEqual({ user: "alice" });
+    expect(login.headers.get("location")).toBeNull();
+    expect(login.headers.get("cache-control")).toBe("no-store");
+    expect(login.headers.get("set-cookie")).toContain("HttpOnly");
+    const browserCookie = login.headers.get("set-cookie")!.split(";")[0]!;
+    const headers = { cookie: browserCookie, origin, accept: "application/json" };
+    const state = await fetch(`${origin}/api/hub/state`, { headers });
+    await assertContract("GET", "/api/hub/state", state.clone());
+    expect((await state.json() as { identity: unknown }).identity).toEqual({ user: "alice", host: os.hostname() });
+    expect(state.headers.get("cache-control")).toBe("no-store");
+    const anonymous = await fetch(`${origin}/api/hub/state`);
+    const anonymousBody = await anonymous.text();
+    expect(anonymous.status).toBe(401);
+    expect(anonymousBody).not.toContain(os.hostname());
+    expect(anonymousBody).not.toContain('"identity"');
+    expect(anonymousBody).not.toContain('"version"');
+    const devices = await fetch(`${origin}/api/hub/sessions`, { headers });
+    expect(devices.headers.get("cache-control")).toBe("no-store");
+    const records = (await devices.json() as { sessions: Array<{ handle: string; current: boolean }> }).sessions;
+    const current = records.find(record => record.current)!;
+    const target = `${origin}/api/hub/sessions/${current.handle}/revoke`;
+    expect((await fetch(target, { method: "POST", headers: { ...headers, origin: "https://elsewhere.invalid" } })).status).toBe(403);
+    expect((await fetch(`${origin}/api/hub/state`, { headers })).status).toBe(200);
+    const revoked = await fetch(target, { method: "POST", headers });
+    expect(await revoked.json()).toEqual({ revoked: true, current: true });
+    expect(revoked.headers.get("cache-control")).toBe("no-store");
+    expect(revoked.headers.get("set-cookie")).toContain("Max-Age=0");
+    expect((await fetch(`${origin}/api/hub/state`, { headers })).status).toBe(401);
+    const relogin = await fetch(`${origin}/login`, { method: "POST", headers: { "content-type": "application/json", origin }, body });
+    const logout = await fetch(`${origin}/logout`, { method: "POST", headers: { ...headers, cookie: relogin.headers.get("set-cookie")!.split(";")[0]! }, redirect: "manual" });
+    expect(await logout.json()).toEqual({ revoked: true });
+    expect(logout.headers.get("cache-control")).toBe("no-store");
+    expect(logout.headers.get("set-cookie")).toContain("Max-Age=0");
+  });
   test("push enrollment follows the authenticated user and rejects cookie CSRF", async () => {
     const login = await sessionStore.issue("tobias", "notification test");
     const other = await sessionStore.issue("alice", "other notification test");
