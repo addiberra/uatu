@@ -1,4 +1,6 @@
 import { appUrl } from "../shared/app-url";
+import { backgroundTasksByTool } from "./background-tasks";
+import type { BackgroundTaskItem } from "./types";
 import { escapeHtml, escapeHtmlAttribute } from "../shared/html";
 import { loginActionMarkup, type LoginAction } from "./login-action";
 import { renderTerminalText, tailStart, terminalLinesToHtml, terminalTextToHtml } from "./ansi";
@@ -133,6 +135,7 @@ export class TimelineRenderer {
     }
     const activeRequests = new Set<string>([...activeByOwner.values()].map(entry => entry.id));
     const toolRows = toolRowIndex(projection.items);
+    const workers = backgroundTasksByTool(projection.items);
 
     const todoLabels = todoActivityLabels(projection.items);
     const durations = turnDurations(projection.items);
@@ -192,7 +195,8 @@ export class TimelineRenderer {
       // the card first rendered (a recovered request, a 1.x part under
       // load), and the card must fill in when it does.
       const linkedTool = item.type === "permission" ? linkedToolRow(item, toolRows) : undefined;
-      const variant = [todo?.label ?? "", todo?.task ?? "", duration === undefined ? "" : String(duration), origin?.conversationId ?? "", origin?.label ?? "", String(allowSubagents), String(allowRevert), String(completedAssistant), this.permissionScopeNote ?? "", String(confirming), linkedTool?.id ?? "", linkedTool?.input ?? "", this.loginAction ? `${this.loginAction.agentName}\u0002${this.loginAction.href ?? ""}` : ""].join("\u0001");
+      const worker = workers.get(item.id);
+      const variant = [JSON.stringify(worker ?? null), todo?.label ?? "", todo?.task ?? "", duration === undefined ? "" : String(duration), origin?.conversationId ?? "", origin?.label ?? "", String(allowSubagents), String(allowRevert), String(completedAssistant), this.permissionScopeNote ?? "", String(confirming), linkedTool?.id ?? "", linkedTool?.input ?? "", this.loginAction ? `${this.loginAction.agentName}\u0002${this.loginAction.href ?? ""}` : ""].join("\u0001");
       if (entry?.shellVariant !== undefined && entry.item === item && entry.active === active && entry.variant === variant
         && entry.shellVariant === this.shellVariant(entry.node, item.id)) {
         nodes.set(item.id, entry.node);
@@ -244,7 +248,7 @@ export class TimelineRenderer {
       // auto-open rule for the rest of the run, so a tool that keeps talking
       // cannot reopen a row the reader shut.
       const readerClosed = entry?.node.hasAttribute(READER_CLOSED) ?? false;
-      const markup = (defer: boolean) => renderItem(item, open, active, todo, duration, origin, readerClosed, allowSubagents, completedAssistant, allowRevert, this.permissionScopeNote, defer, confirming, linkedTool, this.loginAction);
+      const markup = (defer: boolean) => renderItem(item, open, active, todo, duration, origin, readerClosed, allowSubagents, completedAssistant, allowRevert, this.permissionScopeNote, defer, confirming, linkedTool, this.loginAction, worker);
       const node = buildNode(markup(this.deferClosedActivity));
       if (this.deferClosedActivity && node.matches("details.chat-activity:not([open])")) {
         node.setAttribute("data-chat-lazy", "");
@@ -665,10 +669,7 @@ export function subagentEntries(items: readonly ConversationItem[]): SubagentEnt
   // it. The task item knows the child from its start edge — the launching row
   // only learns it from the tool result, at the end — so while the run is
   // going, the task is what makes the row openable and names its progress.
-  const runningTasks = new Map<string, Extract<ConversationItem, { type: "background_task" }>>();
-  for (const item of items) {
-    if (item.type === "background_task" && item.status === "running" && item.toolUseId) runningTasks.set(`tool:${item.toolUseId}`, item);
-  }
+  const runningTasks = backgroundTasksByTool(items);
   const entries: SubagentEntry[] = [];
   // The fork currently running, if any, and when its launching row was
   // created. Nothing in a tool item says which run produced it, so the
@@ -731,12 +732,12 @@ export function subagentEntries(items: readonly ConversationItem[]): SubagentEnt
     // that knows the run is still going, so while it runs the entry reads as
     // running and carries the agent's latest progress note. A settled task,
     // or none at all, leaves the row to speak for itself.
-    const progress = task?.progress;
+    const progress = task?.status === "running" ? task.progress : undefined;
     entries.push({
       id: item.id,
       description: detail.description,
       ...(detail.subagent === undefined ? {} : { subagent: detail.subagent }),
-      status: task ? "running" : item.status,
+      status: task?.stateUncertain ? "status unavailable" : task?.status ?? item.status,
       ...(conversationId === undefined ? {} : { conversationId }),
       ...(item.model === undefined ? {} : { model: item.model }),
       ...(item.usage === undefined ? {} : { usage: item.usage }),
@@ -1107,12 +1108,23 @@ export type QueueDockContext = {
   sendNow: boolean;
   running: boolean;
   isCommand: (text: string) => boolean;
-  // The one note under the dock while any steer is pending: steers run
-  // with the conversation's model and mode as they stand at delivery.
+  // The dock note while any steer is pending: delivery-time configuration,
+  // plus a visible warning above the entries when a replacement is staged.
   note?: HTMLElement;
+  replacement?: boolean;
 };
 
 export const STEER_MODEL_NOTE = "Steers run with the conversation's model and mode as they stand when delivered.";
+
+export function pendingSteerReplacementNote(queued: readonly QueuedMessage[]): string {
+  const steers = queued.filter(entry => entry.delivery === "steer");
+  if (!steers.length) return "";
+  const names = steers.map(entry => {
+    const text = entry.text || "Image attachment";
+    return `“${text.length > 40 ? `${text.slice(0, 39)}…` : text}”`;
+  });
+  return `${steers.length === 1 ? "Pending steer" : "Pending steers"} ${names.join(", ")} will be delivered together with your replacement.`;
+}
 
 function queuedTag(entry: QueuedMessage): string {
   if (entry.delivery === "steer") return entry.paused ? "Steer — paused until the agent is woken" : "Steer — joins the running turn at its next step";
@@ -1157,6 +1169,7 @@ function renderQueued(entry: QueuedMessage, context: QueueDockContext): string {
  */
 export class QueueDockRenderer {
   private readonly entries = new Map<string, { node: HTMLElement; html: string }>();
+  private replacementWarningShown = false;
 
   render(target: HTMLElement, queued: readonly QueuedMessage[], context: QueueDockContext = { steering: false, sendNow: false, running: true, isCommand: () => false }): void {
     // The entries live in the dock's own list; the note sits beside it, so
@@ -1203,12 +1216,25 @@ export class QueueDockRenderer {
     if (context.note) {
       const steering = queued.some(entry => entry.delivery === "steer");
       context.note.hidden = !steering;
-      if (steering && context.note.textContent !== STEER_MODEL_NOTE) context.note.textContent = STEER_MODEL_NOTE;
+      const replacementNote = context.replacement ? pendingSteerReplacementNote(queued) : "";
+      const note = replacementNote ? `${replacementNote} ${STEER_MODEL_NOTE}` : STEER_MODEL_NOTE;
+      if (steering && context.note.textContent !== note) context.note.textContent = note;
+      // The replacement warning must be visible before the user submits,
+      // not buried below the entries in the dock's scrollable list.
+      if (replacementNote) {
+        if (context.note.nextElementSibling !== list) list.before(context.note);
+        // Moving the note before the list alone leaves it clipped when the
+        // reader was at the bottom. Reveal once on entry into this state;
+        // subsequent queue updates must respect the reader's own scrolling.
+        if (!this.replacementWarningShown) target.scrollTop = 0;
+      } else if (list.nextElementSibling !== context.note) list.after(context.note);
+      this.replacementWarningShown = Boolean(replacementNote);
     }
   }
 
   reset(): void {
     this.entries.clear();
+    this.replacementWarningShown = false;
   }
 }
 
@@ -1266,7 +1292,7 @@ export class RevertedMessagesDockRenderer {
 
 type RequestOrigin = { conversationId: string; label: string };
 
-export function renderItem(item: ConversationItem, open: boolean, activeRequest: boolean, todo?: TodoSummary, durationMs?: number, origin?: RequestOrigin, readerClosed = false, allowSubagents = true, completedAssistant = false, allowRevert = false, permissionScopeNote?: string, deferClosed = false, confirming = false, linkedTool?: ToolItem, loginAction?: LoginAction): string {
+export function renderItem(item: ConversationItem, open: boolean, activeRequest: boolean, todo?: TodoSummary, durationMs?: number, origin?: RequestOrigin, readerClosed = false, allowSubagents = true, completedAssistant = false, allowRevert = false, permissionScopeNote?: string, deferClosed = false, confirming = false, linkedTool?: ToolItem, loginAction?: LoginAction, worker?: BackgroundTaskItem): string {
   const id = escapeHtmlAttribute(item.id);
   const stamp = timestampAttribute(item.createdAt);
   // A prompt a scheduled wakeup submitted opens that wakeup's turn. It is
@@ -1315,7 +1341,7 @@ export function renderItem(item: ConversationItem, open: boolean, activeRequest:
   // place. (Running ones are filtered out above and listed by the composer.)
   if (item.type === "background_task") {
     const outcome = item.status === "completed" ? "completed" : item.status === "failed" ? "failed" : item.status === "stopped" ? "cancelled" : "running";
-    const body = deferClosed && !open ? "" : `${item.summary ? `<pre class="chat-task-summary">${escapeHtml(item.summary)}</pre>` : ""}${item.toolUseId ? `<p class="chat-tool-meta">Started by the ${escapeHtml(item.taskType === "local_agent" ? "Agent" : "Bash")} step above.</p>` : ""}`;
+    const body = deferClosed && !open ? "" : `${item.summary ? `<pre class="chat-task-summary">${escapeHtml(item.summary)}</pre>` : ""}${item.toolUseId ? `<p class="chat-tool-meta"><button type="button" data-chat-jump="tool:${escapeHtmlAttribute(item.toolUseId)}">Go to launch</button></p>` : ""}${allowSubagents && item.childConversationId ? `<button type="button" data-open-conversation="${escapeHtmlAttribute(item.childConversationId)}">Open transcript</button>` : ""}`;
     return activityShell(id, outcome, backgroundTaskLabel(item), item.description, body, open, false, readerClosed, stamp, item.status === "stopped" ? "stopped" : undefined);
   }
   // A wakeup the agent scheduled for itself, drawn at every point of its
@@ -1344,7 +1370,7 @@ export function renderItem(item: ConversationItem, open: boolean, activeRequest:
   }
   if (item.type === "permission") return renderPermission(item, open, activeRequest, origin, allowSubagents, permissionScopeNote, confirming, linkedTool);
   if (item.type === "question") return renderQuestion(item, open, activeRequest, origin, allowSubagents);
-  if (item.type === "tool") return renderTool(item, open, readerClosed, todo, allowSubagents, deferClosed);
+  if (item.type === "tool") return renderTool(item, open, readerClosed, todo, allowSubagents, deferClosed, worker);
   // A command's text is the subject, not the label. As a label it lands in the
   // summary's non-shrinking slot, so a long pipeline overruns the row instead
   // of truncating; "Shell" names the step and the command ellipsizes beside it.
@@ -1450,9 +1476,9 @@ function renderActivityOutput(output: string | undefined, status: ActivityStatus
   return `<pre${block}>${preview}</pre><details class="chat-output-more"><summary>Show ${more} more ${more === 1 ? "line" : "lines"}</summary><pre${block}>${rest}</pre></details>`;
 }
 
-function renderTool(item: ToolItem, open: boolean, readerClosed: boolean, todo: TodoSummary | undefined, allowSubagents: boolean, deferClosed = false): string {
+function renderTool(item: ToolItem, open: boolean, readerClosed: boolean, todo: TodoSummary | undefined, allowSubagents: boolean, deferClosed = false, worker?: BackgroundTaskItem): string {
   const detail = describeToolDetail(item);
-  const body = deferClosed && !open && !(autoOpen(item.status, item.output) && !readerClosed) ? "" : toolBody(detail, item, allowSubagents);
+  const body = deferClosed && !open && !(autoOpen(item.status, item.output) && !readerClosed) ? "" : toolBody(detail, item, allowSubagents, worker);
   // A todo update stays collapsed, but its summary reports what moved and to
   // which task — every todowrite call carries the whole list, so showing the
   // list each time reprints it verbatim on every tool call.
@@ -1461,7 +1487,9 @@ function renderTool(item: ToolItem, open: boolean, readerClosed: boolean, todo: 
   // the child has reported a price; zero is an unpriced model, not free.
   const subagentCost = detail.kind === "agent" && item.usage?.costUsd ? ` · ${formatUsd(item.usage.costUsd)}` : "";
   const subject = detail.kind === "todo" ? todo?.task : `${toolSubject(detail) ?? ""}${subagentCost}` || undefined;
-  return activityShell(escapeHtmlAttribute(item.id), item.status, label, subject, body, open, autoOpen(item.status, item.output) && !readerClosed, readerClosed, timestampAttribute(item.createdAt), activityStatusText(item.status, item.elapsedMs));
+  const outcome = worker?.status === "stopped" ? "cancelled" : worker?.status ?? item.status;
+  const state = worker?.stateUncertain ? "Status unavailable — reconnecting" : worker?.status === "running" ? "Started in background" : worker?.status;
+  return activityShell(escapeHtmlAttribute(item.id), outcome, label, subject, body, open, autoOpen(item.status, item.output) && !readerClosed, readerClosed, timestampAttribute(item.createdAt), state ?? activityStatusText(item.status, item.elapsedMs));
 }
 
 // One rendering for every diff the chat shows — a tool's edit, a patch, and a
@@ -1470,7 +1498,7 @@ function chatDiffMarkup(diff: DiffLine[]): string {
   return `<pre class="chat-diff">${diff.map(line => `<span class="chat-diff-line is-${line.sign === "-" ? "del" : "add"}">${escapeHtml(`${line.sign} ${line.text}`)}</span>`).join("\n")}</pre>`;
 }
 
-function toolBody(detail: ToolDetail, item: ToolItem, allowSubagents: boolean): string {
+function toolBody(detail: ToolDetail, item: ToolItem, allowSubagents: boolean, worker?: BackgroundTaskItem): string {
   // An error is a process's stderr as often as not, escapes included.
   const errorBlock = (terminal: boolean) => (item.error ? `<pre class="chat-tool-error${terminal ? " chat-tool-terminal" : ""}">${terminalTextToHtml(item.error)}</pre>` : "");
   const error = errorBlock(false);
@@ -1500,7 +1528,7 @@ function toolBody(detail: ToolDetail, item: ToolItem, allowSubagents: boolean): 
     case "agent":
       // The result is the subagent's report — prose, rendered like assistant
       // markdown rather than dumped as the raw task envelope.
-      return `<p class="chat-tool-meta">${detail.subagent ? `<code>${escapeHtml(detail.subagent)}</code> ` : ""}${escapeHtml(detail.description)}${allowSubagents && detail.conversationId ? ` <button type="button" data-open-conversation="${escapeHtmlAttribute(detail.conversationId)}">Open transcript</button>` : ""}</p><pre>${escapeHtml(detail.prompt)}</pre>${detail.result ? renderSubagentResult(detail.result) : ""}${error}`;
+      return `<p class="chat-tool-meta">${detail.subagent ? `<code>${escapeHtml(detail.subagent)}</code> ` : ""}${escapeHtml(detail.description)}${allowSubagents && (worker?.childConversationId ?? detail.conversationId) ? ` <button type="button" data-open-conversation="${escapeHtmlAttribute((worker?.childConversationId ?? detail.conversationId)!)}">Open transcript</button>` : ""}</p><pre>${escapeHtml(detail.prompt)}</pre>${worker ? worker.status === "running" ? `<p>Started in background</p>` : `<button type="button" data-chat-jump="${escapeHtmlAttribute(worker.id)}">View ${escapeHtml(worker.status)} worker result</button>` : detail.result ? renderSubagentResult(detail.result) : ""}${error}`;
     case "skill":
       // A skill Claude Code ran as a fork is a conversation of its own. The
       // subagents track lists the fork too (as a fork entry, beside the agent

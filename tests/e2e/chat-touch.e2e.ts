@@ -23,7 +23,7 @@ async function boot(page: Page, request: APIRequestContext, seed?: { items: Conv
   await expect(page.locator("#chat-surface")).toBeVisible();
   await expect(page.locator("#chat-conversation-select")).toHaveValue(snapshot.conversation.id);
   await expect(page.locator("body")).toHaveCSS("overflow", "hidden");
-  await expect(page.locator("#chat-send .chat-send-icon")).toBeVisible();
+  await expect(page.locator("#chat-send")).toHaveText("Send");
   return snapshot.conversation.id as string;
 }
 
@@ -227,7 +227,7 @@ test("questions wait for Answer and send a custom choice as text", async ({ page
   await expect(card).toContainText("Answered");
 });
 
-test("composer stays flush and its trailing action becomes cancel without adding a row", async ({ page, request }) => {
+test("composer stays flush with separate Send and Stop on a stable narrow action row", async ({ page, request }) => {
   const id = await boot(page, request);
   await chooseChatModel(page, "Claude Sonnet");
   await page.locator("#chat-configuration-mode").selectOption("build");
@@ -237,9 +237,11 @@ test("composer stays flush and its trailing action becomes cancel without adding
   await page.locator("#chat-input").press("Enter");
   await expect(page.locator("#chat-input")).toHaveValue("Idle first line\n");
   await page.locator("#chat-input").fill("");
+  const idleActions = await page.locator("#chat-send-group").boundingBox();
   await control(request, { action: "status", conversationId: id, status: "running" });
-  await expect(page.locator("#chat-send")).toHaveAttribute("aria-label", "Cancel response");
-  await expect(page.locator("#chat-send .chat-send-cancel")).toBeVisible();
+  await expect(page.locator("#chat-stop")).toBeEnabled();
+  await expect(page.locator("#chat-send")).toHaveText("Send");
+  expect(await page.locator("#chat-send-group").boundingBox()).toEqual(idleActions);
   await page.locator("#chat-input").focus();
   await expect(page.locator("html")).toHaveAttribute("data-chat-editing", "");
 
@@ -260,7 +262,7 @@ test("composer stays flush and its trailing action becomes cancel without adding
       margin: style.margin,
     };
   });
-  expect(Math.abs(geometry.sendBottom - geometry.triggerBottom)).toBeLessThanOrEqual(3);
+  expect(geometry.sendTop - geometry.triggerBottom).toBeGreaterThanOrEqual(8);
   expect(Math.abs(geometry.statusBottom - geometry.triggerBottom)).toBeLessThanOrEqual(2);
   expect(geometry.sendRight).toBeLessThanOrEqual(geometry.boundsRight + 1);
   expect(geometry.margin).toBe("0px");
@@ -269,7 +271,7 @@ test("composer stays flush and its trailing action becomes cancel without adding
   await page.locator("#chat-input").press("Shift+Enter");
   await expect(page.locator("#chat-input")).toHaveValue("First line\n");
   await page.locator("#chat-input").fill("Queued from touch");
-  await expect(page.locator("#chat-send")).toHaveAttribute("aria-label", "Cancel response");
+  await expect(page.locator("#chat-stop")).toBeEnabled();
   const queuedResponse = page.waitForResponse(response => response.url().endsWith("/prompts"));
   await page.locator("#chat-input").press("Enter");
   expect((await queuedResponse).request().postDataJSON()).toMatchObject({ text: "Queued from touch" });

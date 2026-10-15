@@ -1284,6 +1284,33 @@ describe("subagent entries", () => {
     expect(more.hasAttribute("open")).toBe(false);
   });
 
+  test("joined V2 launchers keep their rows and costs but share the worker outcome and one report", () => {
+    const launched = task("v2-a", { name: "subagent", output: "Provider launch instructions, not a report", usage: { costUsd: 0.01 } });
+    const joined = task("v2-b", { name: "subagent", output: "Provider launch instructions, not a report", usage: { costUsd: 0.02 } });
+    const worker: ConversationItem = { id: "task:v2-worker", taskId: "v2-worker", type: "background_task", createdAt: 2, description: "Review renderer", taskType: "agent", toolUseId: "v2-a", toolUseIds: ["v2-a", "v2-b"], childConversationId: "child", status: "failed", summary: "One canonical worker report", resultId: "result-1" };
+    const entries = subagentEntries([launched, joined, worker]);
+    expect(entries.map(entry => entry.status)).toEqual(["failed", "failed"]);
+    expect(entries.map(entry => entry.usage?.costUsd)).toEqual([0.01, 0.02]);
+    const renderer = new TimelineRenderer();
+    const host = target();
+    renderer.render(host, projectionWith([launched, joined, worker]), new Set(["tool:v2-a", "tool:v2-b", worker.id]));
+    expect(host.textContent).not.toContain("Provider launch instructions");
+    expect(host.textContent!.match(/One canonical worker report/g)).toHaveLength(1);
+    expect(host.querySelectorAll('[data-chat-jump="task:v2-worker"]')).toHaveLength(2);
+    expect(host.querySelector('[data-chat-item-id="task:v2-worker"] [data-open-conversation="child"]')).not.toBeNull();
+    expect(launched).toHaveProperty("status", "completed");
+    renderer.reset();
+  });
+  test("worker reports render hostile markup and links as inert text", () => {
+    const renderer = new TimelineRenderer();
+    const host = target();
+    const summary = '<script>alert(1)</script><img src=x onerror=alert(1)>[unsafe](javascript:alert(1))';
+    renderer.render(host, projectionWith([{ id: "task:safe", taskId: "safe", type: "background_task", createdAt: 1, description: "Fixture", status: "failed", summary }]), new Set(["task:safe"]));
+    expect(host.querySelector(".chat-task-summary")?.textContent).toBe(summary);
+    expect(host.querySelector("script, img, a[href^='javascript:']")).toBeNull();
+    renderer.reset();
+  });
+
   // A skill Claude Code ran as a fork is a conversation of its own, offered
   // from its launching row as well as from the track (design D10).
   test("a forked skill's row offers its transcript", () => {

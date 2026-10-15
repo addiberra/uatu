@@ -222,6 +222,16 @@ export class BackgroundTaskUnavailableError extends Error {
   }
 }
 
+/** A dispatched mutation may have applied. Retain this outcome in receipts;
+ * rejecting it through the ordinary receipt helper would permit a replay.
+ */
+export class OperationOutcomeUnknownError extends Error {
+  constructor() {
+    super("Operation outcome unknown; refresh state before a new explicit action. Do not automatically retry.");
+    this.name = "OperationOutcomeUnknownError";
+  }
+}
+
 /**
  * A release the session cannot take right now: a turn is running, or live
  * background work would die with it. A conflict with the current state —
@@ -380,6 +390,11 @@ export interface ChatProvider {
    * Optional: a provider without background work never lists any.
    */
   listBackgroundTasks?(): Promise<PendingBackgroundTask[]>;
+  /** Scoped evidence, including terminal results and uncertain last-known rows.
+   * Unlike a live-only list, absence is never an instruction to cancel a task.
+   */
+  reconcileBackgroundTasks?(sessionId: string): Promise<import("./types").BackgroundTaskItem[]>;
+  backgroundBlockingWork?(sessionId: string): Promise<void>;
   /**
    * Stop one running background task; the agent reports the stop as that
    * task settling. Optional: only an agent declaring `background-tasks`.

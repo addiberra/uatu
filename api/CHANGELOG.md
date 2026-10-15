@@ -2,6 +2,21 @@
 
 Entries are ordered newest first. Every entry has Hub and workspace revisions, a compatibility classification, and migration guidance. Use `None` when no migration is required. An entry is headed `Unreleased` until the release that ships it; the release-prep step replaces that with the version tag (`v0.7.0`), so a consumer can tell which revision pair a given uatu version speaks. An additive change that lands after a pair has shipped gets its own entry under the same pair, stamped with its own release, rather than being appended to the shipped entry.
 
+## Hub 11 / Workspace 26 - Unreleased
+
+Compatibility: breaking (workspace)
+
+### Changes
+
+- Background task payloads can carry `stateUncertain`: retain known content but do not treat it as current execution evidence or authorize a worker stop. The schema also includes the existing child-inspection, usage, and foreground-task fields.
+- `resultId` identifies one provider notification across pending, delivered and recovered forms. `toolUseIds` links multiple launcher calls to one worker occurrence; keep their individual task/cost rows without counting each alias as another worker.
+- The internal session-child mutation `POST …/conversations/:id/background {requestId}` requests native parent-wide backgrounding of all eligible blockers, including shells; known acceptance is `{accepted:true}`, not a count. Capability `background-blocking-work` gates the operation.
+- Background and V2 worker-stop operations retain ambiguous dispatched outcomes as `operation_outcome_unknown`/409. Accepted and unknown receipts are in memory only, retained up to 15 minutes after settlement, subject to earlier count/byte eviction. Adapter recreation or process restart loses them. An old request ID beyond retention can dispatch anew; clients must not automatically replay unknown operations on reconnect or reload.
+
+### Migration
+
+Strict workspace consumers must regenerate against revision 26, preserve uncertainty explicitly, and recover state read-only after an unknown operation. Internal child routes remain excluded from the public Hub API. Hub revision stays 11.
+
 ## Hub 11 / Workspace 25 - Unreleased
 
 Compatibility: breaking (workspace)

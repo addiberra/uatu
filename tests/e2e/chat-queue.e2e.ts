@@ -30,13 +30,28 @@ async function send(page: Page, text: string): Promise<void> {
 test.describe("chat message queue", () => {
   test.beforeEach(async ({ page, request }) => bootChat(page, request));
 
+  test("non-steering busy conversations can enqueue with visible Send without stopping", async ({ page, request }, testInfo) => {
+    await page.getByRole("button", { name: "New conversation" }).click();
+    await expect(page.locator("#chat-conversation-select")).not.toHaveValue("");
+    await send(page, "Start the work");
+    await expect(page.locator("#chat-stop")).toBeEnabled();
+    await expect(page.locator("#chat-delivery-toggle")).toBeHidden();
+    await page.locator("#chat-input").fill("Queue by clicking Send");
+    const accepted = page.waitForResponse(response => response.url().endsWith("/prompts"));
+    await page.getByRole("button", { name: "Send message", exact: true }).click();
+    expect((await accepted).ok()).toBe(true);
+    await expect(page.locator("#chat-queue .is-held")).toContainText("Queue by clicking Send");
+    await expect(page.locator("#chat-stop")).toBeEnabled();
+    await captureScreenshot(page, testInfo, "non-steering-busy-send");
+  });
+
   test("busy submissions pin at the composer, survive reload, are removable, and deliver in order", async ({ page, request }) => {
     await page.getByRole("button", { name: "New conversation" }).click();
     await expect(page.locator("#chat-conversation-select")).not.toHaveValue("");
     const conversationId = await page.locator("#chat-conversation-select").inputValue();
 
     await send(page, "Start the work");
-    await expect(page.locator("#chat-send")).toHaveAttribute("aria-label", "Cancel response");
+    await expect(page.locator("#chat-stop")).toBeEnabled();
 
     await send(page, "Refine the plan");
     await send(page, "Then write tests");
@@ -78,7 +93,7 @@ test.describe("chat message queue", () => {
     await expect(page.locator("#chat-queue .is-held")).toHaveCount(1);
 
     // Cancel stops the agent; the held message stays, visibly queued.
-    await page.locator("#chat-send").click();
+    await page.locator("#chat-stop").click();
     await expect(page.locator("#chat-composer-status")).toHaveAttribute("aria-label", "Cancelled");
     await expect(page.locator("#chat-queue .is-held")).toHaveCount(1);
 
@@ -113,7 +128,7 @@ test.describe("chat message queue", () => {
     await expect(page.locator("#chat-delivery-toggle")).toBeHidden();
     await expect(held.locator("[data-queue-steer], [data-queue-send-now]")).toHaveCount(0);
 
-    await page.locator("#chat-send").click();
+    await page.locator("#chat-stop").click();
     await expect(page.locator("#chat-composer-status")).toHaveAttribute("aria-label", "Cancelled");
     await expect(held.locator("[data-queue-send-now]")).toHaveCount(3);
     await expect(page.locator("#chat-queue .is-held[data-paused]")).toHaveCount(3);
@@ -131,7 +146,7 @@ test.describe("chat message queue", () => {
 
     // Ending the selected message's turn must not drain the dormant backlog.
     await control(request, { action: "status", conversationId, status: "completed" });
-    await expect(page.locator("#chat-send")).toHaveAttribute("aria-label", "Send message");
+    await expect(page.locator("#chat-stop")).toBeDisabled();
     await expect(held).toHaveText([/Held first/, /Held last/]);
     await page.reload();
     await openChatPanel(page);

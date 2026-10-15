@@ -58,6 +58,8 @@ export type ChatCapability =
   // are listed with a stop action, settled tasks land in the timeline, and
   // the conversation presents a background-work state.
   | "background-tasks"
+  // Explicitly background every eligible blocker in the parent, including shells.
+  | "background-blocking-work"
   // The agent can schedule future turns for itself (a wakeup, a cron, a
   // loop) and reports them: the session is held while they are pending,
   // each is a timeline row that follows its life, a fired one starts a
@@ -740,6 +742,15 @@ export type CompactionItem = TimelineItemBase & {
  */
 export type BackgroundTaskItem = TimelineItemBase & {
   type: "background_task";
+  // Known history is retained, but current execution/occurrence is unverified.
+  // Never use an uncertain row as authority for a worker stop.
+  stateUncertain?: boolean;
+  // Structured provider notification identity; deduplicates provisional/live
+  // results against the same notification recovered with its launcher.
+  resultId?: string;
+  // Additional tool calls proven to share this worker occurrence. Each tool
+  // remains a separate task/cost row; this worker is counted only once.
+  toolUseIds?: string[];
   taskId: string;
   description: string;
   taskType?: string;

@@ -709,6 +709,29 @@ labels. Neither a summary discovery nor a catalog refresh replaces occupancy.
 
 Conversation status is `idle`, `sending`, `running`, `completed`, `interrupted`, `failed`, plus four named states: `retrying` and `compacting` are live-turn states (the composer offers Cancel, a new prompt is held), `background` means no turn is running but the agent still holds live background work (prompting is possible), and `scheduled` means nothing runs but the agent's session holds future turns it scheduled for itself (prompting is possible; the composer lists the wakeups with a release). `isLiveConversationStatus()` in `types.ts` is the one rule for which statuses are live.
 
+Send stays a labelled submit button while busy for every agent; only the
+separate Stop button cancels. The steering-capability-gated delivery selector
+shows Steer/Queue and only changes the device preference, never submits the
+draft. Send and Enter use that preference; Option/Alt+Enter uses the other one.
+Submission controls have at least 44px targets and 8px gaps. Narrow composer
+widths (up to 30rem content width) use a dedicated second action rail; wide
+ones share one rail. Turn status and menu opening never change that layout.
+Raw-touch hit checking suppresses gap taps that a mobile browser might snap
+onto a nearby action. Stop remains disabled in place while idle, and the
+delivery selector remains disabled in place when neither running nor pending.
+
+The delivery menu supports ArrowUp/ArrowDown, Home/End, Escape back to its
+disclosure, and Tab out into the surrounding controls. Touch composer and
+dock actions preserve focus through `mousedown`, not cancelled touch
+`pointerdown` (which suppresses activation in WebKit). While a revert is
+staged, the dock keeps the named-steer replacement warning visibly above
+its entries, rather than announcing it only to assistive technology. Entering
+that warning state reveals the dock's top once, including when it was already
+scrolled; subsequent updates preserve the reader's own scrolling.
+A steer that wakes an idle/interrupted conversation marks admission as
+sending/running before releasing the admission lane; clearing the revert
+must not drain the held queue before the provider's running event arrives.
+
 **Pending messages are one dock with two owners** (`opencode-v2-steering`). A prompt submitted while the conversation is busy is either *held* by the workspace — `heldQueues` in `src/chat/adapter.ts`, strict submission order, delivered one at a time when the turn ends under the model, mode, and variant frozen at submission; skills, slash commands, and `/reload` always take this path — or, on an agent declaring `steering` (OpenCode 2.x only), handed to the agent's own session inbox at once as a *steer* (`session.prompt` with `delivery: "steer", resume: true`), which OpenCode delivers into the running turn at its next step boundary. A steer carries no model or mode: a mid-turn switch would retarget the turn being steered. The adapter keeps a per-conversation map of pending steers from the 2.x normalizer's `inbox` provider updates (`enqueued` → pending, `delivered`/`cancelled` → settled, `delivery.changed`), replaced from `session.inbox.list` on attach and after every stream reconnect, and the steer's user message joins the timeline only when `session.inbox.delivered` names it — so a pending steer is in the dock and nowhere else. The dock (`QueuedMessage` with `delivery` and `paused`, `conversation.queue` events) lists steers first, then the held queue, under one bound of 20 messages and 256 KiB. *Paused* is derived, not reported: a held message while the queue is dormant (after Cancel) or a revert is staged; a steer enqueued before the conversation last became idle, interrupted, or completed with no wake since. Cancel interrupts without `resume`, so steers stay with OpenCode and read as paused; Send now on a paused steer is `interrupt({ resume: true })`, which wakes every paused steer together. Withdrawing a steer (remove, edit, switch to queue) asks `session.inbox.cancel` and then waits for that entry's settlement event, because OpenCode answers 204 for a delivered or missing entry too; a `delivered` settlement makes the withdrawal fail as "already delivered" (409 with code `steer-already-delivered`), and a silent agent is decided from its list and history after a bounded wait. Switching a held message to steer, which is also Send now on a steering agent, sends it as a steer with its attachments and leaves the rest of a dormant queue dormant; on an agent with `send-now` alone (Claude Code) Send now dispatches that held message under its frozen configuration while nothing runs. In the composer, Enter uses the per-device default delivery (`src/chat/delivery-preference.ts`, initially steer) and ⌥Enter the other, with a disclosure inside the Send/Cancel footprint offering both by name; an undo replacement on a steering agent goes out as a steer, and the confirmation names the steers that deliver with it.
 
 A Claude Code conversation's session lifetime (`src/chat/claude/provider.ts`) follows the work, not the first result: the SDK session is retired on a turn's result only when no accepted prompt is pending, no unprompted follow-up is in flight, and the background set (`background_tasks_changed`, ambient tasks excluded) is empty. While the set is non-empty the conversation reports `background`. When a backgrounded task settles the CLI starts a follow-up turn by itself (see the D9 spike in the change's design notes); the provider reports that turn as running and completed like any other. A set that empties with no follow-up returns the conversation to idle after a short grace window. Scheduled wakeups from `ScheduleWakeup`, `CronCreate`, and `/loop` hold the session the same way. The SDK sends no stream message for them, so the provider registers a `Stop` hook and level-sets the session's wakeups from its `session_crons`. The hook fires before the turn's `result`, so the set is current when retirement is decided. A result with wakeups pending and no background work reports `scheduled`. With both, `background` wins. A fired wakeup's turn reaches the host only as a `UserPromptSubmit` hook, with no `user` message on the stream, so the provider mints that turn's opening `user_message` itself, with `origin: "wakeup"`. It attributes the turn by the hook's `source`, or by the prompt matching a pending wakeup while no accepted prompt is outstanding. A cron missing from the next `Stop` fired if a turn was attributed to it. Otherwise the agent cancelled it. Resuming a session makes the CLI rebuild its `CronCreate` crons from the transcript, while a `ScheduleWakeup` never outlives its process. So when the stream ends or the workspace shuts down, a pending `ScheduleWakeup` is marked lost and a `CronCreate` cron paused. The provider tells them apart by the `CronCreate` result's `id` and the `ScheduleWakeup` call's prompt. The provider enforces a cancel itself, because the SDK has no call that deletes a cron. Cancelled ids live per conversation in its durable state, never hold a session, and have their fires answered with `decision: "block"` at the `UserPromptSubmit` hook. The `init`, `informational`, and `result` frames a blocked fire produces are swallowed. The per-wakeup cancel is `POST /api/chat/conversations/:id/wakeups/:wakeupId/cancel`. Release, `POST /api/chat/conversations/:id/release`, cancels every wakeup and retires the session. A conversation opened without a live session lists its paused crons, derived from the transcript by `transcriptCrons()` in `src/chat/claude/transcript.ts`: `CronCreate` results minus `CronDelete`d ids, fired or lapsed one-shots, and crons past the 7-day expiry. Nothing starts a session to keep a schedule running. Conversation titles follow the transcript's own entries: a user rename (`custom-title`) outranks Claude Code's generated title (`ai-title`), which outranks the first prompt.
@@ -728,6 +751,53 @@ A run that streams nothing is followed from its transcript on disk. Claude Code 
 What each agent's SDK declares that the timeline does not handle is recorded, not guessed: `bun run coverage:agents` (`scripts/agent-coverage.ts`) reads the installed SDKs' declaration files and runs every message type, block or part type, and tool name through the normalizers above and `describeToolDetail` (`src/chat/tool-detail.ts`), rendering the body of the [Agent SDK coverage dashboard](https://github.com/tjakobsson/uatu/issues/480), which `.github/workflows/agent-coverage.yml` publishes after every push to `main`. A hidden marker in that body records the published vocabulary, so the next run can comment on what a bump added or removed; nothing is committed. The normalizers report what they skip so the probe can observe it: an unrecognized event (`chat.event.unrecognized.<type>`, a Claude system subtype as `system.<subtype>`) and an unread content block or part inside a recognized event (`skippedBlocks`, counted as `chat.block.unrecognized.<type>`). The hand-kept inputs are the annotations modules `src/chat/claude/sdk-coverage.ts` and `src/chat/opencode/sdk-coverage.ts` (ignore reasons, behavior-missing flags, Claude tool wire names). `scripts/agent-coverage.test.ts` builds both reports from the installed SDKs, so a dependency bump fails CI only when an axis can no longer be read or an annotation goes stale, never because a version moved.
 
 ### OpenCode generations
+
+**V2 native background work.** The provider declares `background-tasks` and
+`background-blocking-work`; unsupported V1/Claude views do not gain Continue.
+`opencode/v2/background.ts` folds successful tool launches and authenticated
+synthetic results into independent worker occurrences. Launcher tool rows keep
+their costs and success; `toolUseIds` aliases join one worker, and `resultId`
+deduplicates pending/delivered/stored reports. Reused children are correlated
+only when execution boundaries disambiguate them. Otherwise the readable
+result stays separate and affected work is uncertain. Stream correlation is
+bounded to 8,192 entries / 4 MiB; saturation discards the entire correlation
+cache rather than unsafe partial tombstones and relies on scoped recovery
+until reconnect. Complete-history folds are transient and precede pagination.
+
+`reconcileBackgroundTasks(parent)` reads complete history, all pending inbox
+entries, verified child/active evidence and owned shell records. Unlike
+Claude's authoritative live list, absence never means cancellation. The adapter
+waits for the connected marker, fences recovery generations and live updates,
+coalesces reads per parent, limits concurrent parents to four, and backs off
+uncertain/failed reads. Recovery updates workspace activity even for unselected
+parents without making `ChatService.activity()` start a runtime. Recovery is
+read-only; child results/hydration do not emit top-level success notifications.
+Complete history uses the bounded provider cache only within a connected stream
+generation; session events invalidate it and disconnected reads remain fresh.
+Child execution boundaries also constrain unresolved worker occurrences: an
+active child may belong to a newer foreground run, so it does not reauthorize
+an old task. Stop revalidates fresh parent and child histories. Inventory
+recovery reconciles pending child permissions/questions through the same
+generation/dirty fences, preserving needs-answer without selecting the parent.
+
+The explicit receipt-keyed `background` route calls `session.background` for
+all eligible parent blockers, including shells, through the parent admission
+lane. Worker Stop resolves a verified occurrence to child `session.interrupt`
+with `resume:false`; shell Stop uses owned `shell.remove`. Shell exit/removal
+is not terminal capture evidence: missing capture can produce error, while
+confirmed completion and locally retained output are not rewritten as stopped.
+Unknown dispatched outcomes resolve inside the receipt store and become
+`operation_outcome_unknown`/409 outside it. Accepted/unknown deduplication ends
+at settled TTL (default 15 minutes), capacity eviction or adapter destruction;
+there is no persistent receipt or automatic replay. Native interrupt has no
+atomic generation precondition. Isolated real-provider acceptance passed on
+OpenCode 2.0.29/client 2.0.28, including mixed native worker/shell conversion,
+stop scopes, notification wakeup and disconnected-result recovery.
+Settled inspection strips show only the outcome and a link to the canonical
+parent result, not another copy of its report. Task-list repaint restores the
+focused surviving worker/action rather than leaving keyboard focus on the body.
+See [Chat's limitations](docs/CHAT.md#background-workers-opencode-v2)
+and the pinned source evidence in `opencode-v2-background-work/design.md`.
 
 OpenCode 1.x and 2.x have different server APIs, and a workspace has whichever one its `opencode` on `PATH` is. `src/chat/opencode/opencode-service.ts` spawns `opencode serve` the same way for both (loopback, random port, one password under both `OPENCODE_PASSWORD` and `OPENCODE_SERVER_PASSWORD`) and decides the generation from the readiness answer, never from `--version` text or the binary's path: each probe cycle asks `GET /api/info` (2.x: `{ version, pid, urls }`) and then `GET /global/health` (1.x: `{ healthy, version }`), and the first well-formed body decides. A 2.x server answers every path it does not know — including the 1.x health path — with its web UI's HTML page and a 200, which is why a successful status alone is never readiness. The decision is fixed for that server's lifetime and carried on `OpenCodeConnection.generation`; `openCodeAgentRuntime` in `src/chat/service.ts` picks the provider from it, and a restart decides again, so a replaced binary is served by its own generation without a workspace restart. The reported version is bare semver for both (`1.18.31`, `2.0.13`), so the generation is legible from the status object without a new field.
 

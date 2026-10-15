@@ -17,6 +17,16 @@ import type { CoverageAnnotations } from "../coverage-annotations";
  * `resume` are used; `session.inbox.update` is deliberately not — switching
  * delivery through it would leave the message in OpenCode's queue, where it
  * loses the configuration frozen at submission (D1).
+ *
+ * V2 native background work additionally uses `session.background` (all
+ * eligible parent blockers), `session.active`/`session.get`/`message.list`
+ * and all synthetic `session.inbox.list` entries for read-only recovery.
+ * `session.interrupt({resume:false})` targets a verified child occurrence;
+ * `shell.get`/`shell.output`/`shell.remove` inspect or remove owned shell work.
+ * Removal deletes output and may fail pending capture; neither shell exit nor
+ * deletion establishes a terminal worker result. Source-shaped synthetic
+ * metadata establishes that outcome. No generic jobs endpoint, synthetic
+ * injection, explicit parent resume or shell-list polling is used.
  */
 export const openCodeCoverageAnnotations: CoverageAnnotations = {
   reasons: {
@@ -43,7 +53,7 @@ export const openCodeCoverageAnnotations: CoverageAnnotations = {
     "1.x:pty.*": "Terminal sessions on the OpenCode server, not the conversation's; the agent's shell runs arrive as session.next.shell.* events.",
     "2.x:pty.*": "Terminal sessions on the OpenCode server, not the conversation's; the agent's shell runs arrive as session.shell.* events.",
     "2.x:persistent-pty.*": "Terminal sessions on the OpenCode server, not the conversation's; the agent's shell runs arrive as session.shell.* events.",
-    "2.x:shell.*": "Terminal sessions on the OpenCode server, not the conversation's; the agent's shell runs arrive as session.shell.* events.",
+    "2.x:shell.*": "Shell registry/process edges are not background job settlement: confirmed results arrive as correlated source:shell synthetic inbox/history metadata. Owned shell get/output/remove operations support inspection and Stop; deletion can remove final capture, not guarantee cancellation.",
     "1.x:mcp.*": "MCP server bookkeeping; MCP tool calls themselves arrive as tool events.",
     "2.x:mcp.*": "MCP server bookkeeping; MCP tool calls themselves arrive as tool events.",
     "1.x:server.*": "Server connection lifecycle; uatu tracks the server through its own connection.",

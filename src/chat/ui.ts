@@ -20,11 +20,11 @@ import { newRequestId } from "./ids";
 import { insertCommand, localHistoryOperation, matchingCommands, slashCommandQuery, type LocalHistoryOperation } from "./slash-commands";
 import { LatestRefresh } from "./latest-refresh";
 import { navigateWorkspaceFileReference, resolveWorkspaceFileReference } from "./file-references";
-import { READER_CLOSED, QueueDockRenderer, RevertedMessagesDockRenderer, TimelineRenderer, decorateAttachmentImages, decorateFileLinks, formatElapsed, latestTodoEntries, statusLabel, subagentEntries, subagentLabel, workingLabel } from "./timeline-renderer";
+import { READER_CLOSED, QueueDockRenderer, RevertedMessagesDockRenderer, TimelineRenderer, decorateAttachmentImages, decorateFileLinks, formatElapsed, latestTodoEntries, pendingSteerReplacementNote, statusLabel, subagentEntries, subagentLabel, workingLabel } from "./timeline-renderer";
 import { backgroundStatusLabel, runningBackgroundTasks } from "./background-tasks";
 import { pausedStatusLabel, pausedWakeups, pendingWakeups, scheduledStatusLabel, wakeupFireTime } from "./scheduled-wakeups";
 import { RunningWorkDisclosure } from "./running-work-disclosure";
-import { SilentRunFollower, TaskInspectionPanel, formatTaskElapsed, runningTaskForChild, taskById, taskInspection, type OpenTaskInspection } from "./task-inspection";
+import { SilentRunFollower, TaskInspectionPanel, formatTaskElapsed, taskForChild, taskById, taskInspection, type OpenTaskInspection } from "./task-inspection";
 import { composerRoutineState, formatUsd, latestPlanReport, latestRateLimit, planChip, planHasRows, planName, planReadoutRows, sessionTotalsTitle, standingSentence, usageAsOf, usageStale, type RateLimitStanding } from "./composer-status";
 import { buildPlanRowNodes, currentUsageReport, initUsagePaneControls, noteUsageReport, onUsageChange, onUsageRead, readStatusText, readUsageNow, refreshUsageIfStale, revealUsagePane, usageReadState, usageReadable } from "./usage-pane";
 import { isLiveConversationStatus } from "./types";
@@ -134,11 +134,14 @@ export function initChat(api = new ChatApiClient()): void {
   const queueDockElement = document.querySelector<HTMLElement>("#chat-queue");
   const queueNoteElement = document.querySelector<HTMLElement>("#chat-queue-note");
   const deliveryToggle = document.querySelector<HTMLButtonElement>("#chat-delivery-toggle");
+  const deliveryLabel = document.querySelector<HTMLElement>("#chat-delivery-label");
   const deliveryMenu = document.querySelector<HTMLElement>("#chat-delivery-menu");
   const form = document.querySelector<HTMLFormElement>("#chat-composer");
   const input = document.querySelector<HTMLTextAreaElement>("#chat-input");
   const commandMenu = document.querySelector<HTMLElement>("#chat-command-menu");
   const send = document.querySelector<HTMLButtonElement>("#chat-send");
+  const sendGroup = document.querySelector<HTMLElement>("#chat-send-group");
+  const stop = document.querySelector<HTMLButtonElement>("#chat-stop");
   const sendLabel = document.querySelector<HTMLElement>("#chat-send .chat-send-label");
   const configurationTrigger = document.querySelector<HTMLButtonElement>("#chat-configuration-trigger");
   const configurationSummary = document.querySelector<HTMLElement>("#chat-configuration-summary");
@@ -365,6 +368,8 @@ export function initChat(api = new ChatApiClient()): void {
     task?: OpenTaskInspection;
   };
   let child: Drilldown | null = null;
+  let childInvoker: HTMLElement | null = null;
+  let childInvokerSelector: string | null = null;
   // The error line the output view last put up. When a later read answers,
   // the panel says so and the line comes down — but only if it still says
   // what the panel put there, so a message something else has since spoken
@@ -1052,17 +1057,47 @@ export function initChat(api = new ChatApiClient()): void {
   // Stops in flight, by task id: a rebuild mid-request must not hand back
   // an enabled button that would send the stop twice.
   const stoppingTasks = new Set<string>();
+  const backgrounding = new Set<string>();
+  const backgroundAction = document.querySelector<HTMLElement>("#chat-background-action");
+  const continueWorkers = document.querySelector<HTMLButtonElement>("#chat-continue-workers");
+  const backgroundFeedback = document.querySelector<HTMLElement>("#chat-background-feedback");
+  const backgroundNotes = new Map<string, string>();
+  continueWorkers?.addEventListener("click", async () => {
+    if (!projection || !declares("background-blocking-work") || !isLiveConversationStatus(projection.status) || cancelling || backgrounding.has(projection.conversationId)) return;
+    const id = projection.conversationId;
+    backgrounding.add(id);
+    backgroundNotes.set(id, "Requesting background work…");
+    syncControls();
+    try {
+      await api.backgroundBlockingWork(id, newRequestId());
+      backgroundNotes.set(id, "Request accepted. If no eligible jobs remained, nothing changed.");
+    } catch (error) {
+      backgroundNotes.set(id, error instanceof ChatTransportError && error.status !== undefined && error.code !== "operation_outcome_unknown"
+        ? `Request failed: ${messageOf(error)}` : "Outcome unknown; refreshing. This action will not be replayed automatically.");
+    } finally {
+      await refreshSelectedConversation(id);
+      backgrounding.delete(id);
+      syncControls();
+    }
+  });
   const syncBackgroundTasks = () => {
     if (!backgroundTasks || !backgroundTasksLabel || !backgroundTasksItems) return;
     // The open drill-down's strip reads the same items; it keeps its own
     // change check, so it is asked before this list's early return.
     syncTaskInspection();
     const entries = projection && declares("background-tasks") ? runningBackgroundTasks(projection.items) : [];
+    for (const item of projection?.items ?? []) {
+      if (item.type === "background_task" && item.status !== "running") stoppingTasks.delete(item.taskId);
+    }
     // Ahead of the unchanged-signature return: the rule reads every paint,
     // since the conversation it is keyed on can change under one signature.
     discloseBackgroundTasks(entries.length);
-    const signature = entries.map(entry => [entry.taskId, entry.description, entry.progress ?? "", entry.childConversationId ?? "", stoppingTasks.has(entry.taskId) ? "stopping" : ""].join("\u0001")).join("\u0002");
+    const signature = entries.map(entry => [entry.taskId, entry.description, entry.progress ?? "", entry.childConversationId ?? "", entry.stateUncertain ? "uncertain" : "", stoppingTasks.has(entry.taskId) ? "stopping" : ""].join("\u0001")).join("\u0002");
     if (signature === paintedBackgroundTasks) return;
+    const focused = document.activeElement;
+    const focusedTask = focused instanceof HTMLElement && backgroundTasksItems.contains(focused)
+      ? focused.closest<HTMLElement>("[data-background-task]")?.dataset.backgroundTask : undefined;
+    const focusedAction = focused instanceof HTMLElement && focused.hasAttribute("data-stop-task") ? "data-stop-task" : "data-inspect-task";
     paintedBackgroundTasks = signature;
     if (entries.length === 0) {
       backgroundTasks.hidden = true;
@@ -1072,6 +1107,7 @@ export function initChat(api = new ChatApiClient()): void {
       // has long finished.
       backgroundTasksLabel.textContent = "";
       backgroundTasksItems.replaceChildren();
+      if (focusedTask) timeline.focus({ preventScroll: true });
       return;
     }
     backgroundTasksLabel.textContent = backgroundStatusLabel(entries);
@@ -1095,10 +1131,10 @@ export function initChat(api = new ChatApiClient()): void {
         text.setAttribute("aria-label", `${target.view === "transcript" ? "Open the transcript of" : "Show the output of"} ${entry.description}`);
       }
       row.append(text);
-      if (entry.progress) {
+      if (entry.stateUncertain || entry.progress) {
         const progress = document.createElement("span");
         progress.className = "chat-background-task-progress";
-        progress.textContent = entry.progress;
+        progress.textContent = entry.stateUncertain ? "Status unavailable — reconnecting" : entry.progress!;
         row.append(progress);
       } else {
         // With no progress note the elapsed time IS the progress line (D6). A
@@ -1119,12 +1155,19 @@ export function initChat(api = new ChatApiClient()): void {
       stop.className = "chat-task-stop";
       stop.dataset.stopTask = entry.taskId;
       stop.textContent = stoppingTasks.has(entry.taskId) ? "Stopping…" : "Stop";
-      stop.disabled = stoppingTasks.has(entry.taskId);
-      stop.setAttribute("aria-label", `Stop ${entry.description}`);
+      stop.disabled = stoppingTasks.has(entry.taskId) || entry.stateUncertain === true;
+      stop.setAttribute("aria-label", declares("background-blocking-work") ? `Stop worker: ${entry.description}` : `Stop ${entry.description}`);
       row.append(stop);
       return row;
     }));
     backgroundTasks.hidden = false;
+    if (focusedTask) {
+      const row = backgroundTasksItems.querySelector<HTMLElement>(`[data-background-task="${CSS.escape(focusedTask)}"]`);
+      const control = row?.querySelector<HTMLButtonElement>(`[${focusedAction}]:not(:disabled)`)
+        ?? row?.querySelector<HTMLButtonElement>("[data-inspect-task]")
+        ?? backgroundTasksItems.querySelector<HTMLButtonElement>("[data-inspect-task]");
+      (control ?? timeline).focus({ preventScroll: true });
+    }
   };
   // One stop path for every control that offers it: the composer row and the
   // drill-down's strip both name the task, and the in-flight guard is shared
@@ -1132,15 +1175,29 @@ export function initChat(api = new ChatApiClient()): void {
   const requestStopTask = (taskId: string) => {
     if (!projection || stoppingTasks.has(taskId)) return;
     const source = projection;
+    const task = taskById(source.items, taskId);
+    if (!task || task.status !== "running" || task.stateUncertain) return;
+    if (declares("background-blocking-work") && task.taskType === "shell" && !window.confirm("Stop this shell worker? This removes its provider record and output. OpenCode may report failed rather than cancelled; missing output cannot be recovered after reload.")) return;
+    const asynchronous = declares("background-blocking-work");
     // The agent reports the stop as the task settling, which is what moves
     // the row out of this list; until then the control stays inert.
     stoppingTasks.add(taskId);
     paintedBackgroundTasks = null;
     syncBackgroundTasks();
-    void api.stopTask(source.conversationId, taskId, newRequestId()).catch(error => {
-      announceFailureFor(source)(messageOf(error), true);
-    }).finally(() => {
+    void api.stopTask(source.conversationId, taskId, newRequestId()).catch(async error => {
       stoppingTasks.delete(taskId);
+      const message = error instanceof ChatTransportError && error.status !== undefined && error.code !== "operation_outcome_unknown"
+        ? messageOf(error) : "Outcome unknown; refreshing. Stop will not be replayed automatically.";
+      // Snapshot installation clears its transient loading announcement. Keep
+      // the mutation outcome independently, and announce it after that read;
+      // a successful read cannot turn an unknown receipt into acceptance.
+      await refreshSelectedConversation(source.conversationId);
+      setComposerError(message, source.conversationId);
+      if (projection?.conversationId === source.conversationId) {
+        (child?.task?.conversationId === source.conversationId ? announceChild : announce)(message, true);
+      }
+    }).finally(() => {
+      if (!asynchronous) stoppingTasks.delete(taskId);
       paintedBackgroundTasks = null;
       syncBackgroundTasks();
     });
@@ -1170,8 +1227,12 @@ export function initChat(api = new ChatApiClient()): void {
     else if (target.dataset.inspectTask !== undefined) inspectTask(target.dataset.inspectTask);
   });
   drilldownTask?.addEventListener("click", event => {
-    const button = (event.target as Element | null)?.closest<HTMLButtonElement>("[data-stop-task]");
+    const button = (event.target as Element | null)?.closest<HTMLButtonElement>("[data-stop-task], [data-task-result]");
     if (button?.dataset.stopTask !== undefined) requestStopTask(button.dataset.stopTask);
+    else if (button?.dataset.taskResult) {
+      pendingRequestJump = button.dataset.taskResult;
+      closeChildConversation();
+    }
   });
 
   const scheduledWakeups = document.querySelector<HTMLDetailsElement>("#chat-scheduled-wakeups");
@@ -1443,7 +1504,11 @@ export function initChat(api = new ChatApiClient()): void {
   const jumpToRequestCard = (id: string) => {
     const card = items.querySelector(`[data-chat-item-id="${CSS.escape(id)}"]`);
     if (!(card instanceof HTMLElement)) return;
+    for (let parent = card.parentElement; parent && parent !== items; parent = parent.parentElement) {
+      if (parent instanceof HTMLDetailsElement) parent.open = true;
+    }
     if (card instanceof HTMLDetailsElement) card.open = true;
+    if (!card.hasAttribute("tabindex")) card.tabIndex = -1;
     card.scrollIntoView({ block: "center" });
     card.focus?.();
   };
@@ -1830,6 +1895,7 @@ export function initChat(api = new ChatApiClient()): void {
       steering: declares("steering"),
       sendNow: declares("send-now"),
       running: isLiveConversationStatus(projection?.status),
+      replacement: projection?.reversibleHistory?.staged === true,
       isCommand: isListedCommand,
       ...(queueNoteElement ? { note: queueNoteElement } : {}),
     });
@@ -2690,24 +2756,32 @@ export function initChat(api = new ChatApiClient()): void {
       save();
     }
     syncWorkingTimer();
-    send.type = running ? "button" : "submit";
-    send.dataset.action = running ? "cancel" : "send";
     // A message needs content, not necessarily words: pending attachments make
     // an empty draft sendable (image-only prompts are accepted end to end),
     // and an upload still in flight counts — submission waits for it.
     const activeId = activeConversationId();
     const hasContent = Boolean(input.value.trim()) || currentPendingAttachments().length > 0
       || (activeId !== null && attachmentStaging.has(activeId));
-    send.disabled = running ? cancelling || !projection : submitting || !projection || !hasContent;
-    const action = running ? "Cancel" : "Send";
-    sendLabel.textContent = action;
-    send.setAttribute("aria-label", running ? "Cancel response" : "Send message");
-    send.title = running ? "Cancel response" : "Send message";
-    // The delivery choice exists only while a steering conversation is busy
-    // (opencode-v2-steering D10); idle submission is unchanged.
+    send.disabled = submitting || cancelling || !projection || !hasContent;
+    if (stop) {
+      stop.disabled = cancelling || !projection || !running;
+      const workers = declares("background-blocking-work") && projection?.items.some(item => item.type === "background_task");
+      stop.setAttribute("aria-label", workers ? "Stop parent" : "Stop response");
+      stop.title = workers ? "Stop the parent and still-blocking work. Detached workers continue; their later notifications can wake the parent again." : "Stop";
+    }
+    if (backgroundAction && continueWorkers) {
+      const note = activeId ? backgroundNotes.get(activeId) ?? "" : "";
+      backgroundAction.hidden = !declares("background-blocking-work") || !projection || !running && !note;
+      continueWorkers.disabled = !running || cancelling || !activeId || backgrounding.has(activeId);
+      if (backgroundFeedback && backgroundFeedback.textContent !== note) backgroundFeedback.textContent = note;
+    }
+    // Keep the selector's space across lifecycle changes. Idle delivery is
+    // unchanged; only a steering-capable conversation exposes the preference.
     if (deliveryToggle) {
-      deliveryToggle.hidden = !deliveryChoiceOffered();
-      if (deliveryToggle.hidden) closeDeliveryMenu();
+      deliveryToggle.hidden = !declares("steering");
+      deliveryToggle.disabled = !deliveryChoiceOffered();
+      if (deliveryToggle.hidden || deliveryToggle.disabled) closeDeliveryMenu();
+      syncDeliveryMenu();
     }
     configurationTrigger.disabled = submitting || !projection || catalogLoading;
     configurationTrigger.toggleAttribute("aria-busy", catalogLoading);
@@ -3479,6 +3553,15 @@ export function initChat(api = new ChatApiClient()): void {
       save();
     }
   };
+  // Keep the focused touch composer's chrome in place until activation.
+  // Cancel mousedown's focus default, not pointerdown: WebKit suppresses
+  // the compatibility click when a touch pointerdown is cancelled.
+  const keepTouchComposerFocus = (event: MouseEvent) => {
+    if (document.documentElement.dataset.uiMode === "touch" && document.activeElement === input) event.preventDefault();
+  };
+  queueDockElement.addEventListener("mousedown", event => {
+    if ((event.target as Element).closest(".chat-queued-action")) keepTouchComposerFocus(event);
+  });
   queueDockElement.addEventListener("click", event => {
     const target = (event.target as Element).closest<HTMLButtonElement>("[data-queue-remove], [data-queue-edit], [data-queue-steer], [data-queue-queue], [data-queue-send-now]");
     if (!target || !projection) return;
@@ -3502,24 +3585,54 @@ export function initChat(api = new ChatApiClient()): void {
   });
 
   // The delivery Enter uses while a steering conversation is busy, and its
-  // menu on the Send/Cancel control (D10). The preference is per device and
-  // read on every submission; ⌥Enter and a menu choice override it once.
+  // separate selection-only menu (D10). The preference is per device and
+  // read on every submission; ⌥Enter overrides it once.
   let requestedDelivery: MessageDelivery | undefined;
   // A declaration, not a const: syncControls reads it before this point runs.
   function deliveryChoiceOffered(): boolean {
     return Boolean(projection) && declares("steering") && (isLiveConversationStatus(projection?.status) || (projection?.queued.length ?? 0) > 0);
   }
-  const syncDeliveryMenu = () => {
+  function syncDeliveryMenu(): void {
     const preferred = readDeliveryPreference(presentationLocalStorage());
+    const label = preferred === "steer" ? "Steer" : "Queue";
+    if (deliveryLabel) deliveryLabel.textContent = label;
+    deliveryToggle?.setAttribute("aria-label", `Delivery: ${label}`);
+    if (deliveryToggle) deliveryToggle.title = `Delivery: ${label}`;
     for (const item of deliveryMenu?.querySelectorAll<HTMLButtonElement>("[data-delivery-choice]") ?? []) {
       item.setAttribute("aria-checked", String(item.dataset.deliveryChoice === preferred));
     }
-  };
+  }
   const onDeliveryMenuOutside = (event: Event) => {
     if (deliveryMenu && !deliveryMenu.contains(event.target as Node) && !deliveryToggle?.contains(event.target as Node)) closeDeliveryMenu();
   };
   const onDeliveryMenuKey = (event: KeyboardEvent) => {
-    if (event.key === "Escape") { event.preventDefault(); closeDeliveryMenu(); deliveryToggle?.focus(); }
+    if (event.key === "Escape") {
+      event.preventDefault();
+      closeDeliveryMenu();
+      deliveryToggle?.focus();
+      return;
+    }
+    // Touch can leave focus in the composer while the menu is open. Do not
+    // intercept its editing keys unless focus is actually in the menu.
+    if (!deliveryMenu?.contains(document.activeElement)) return;
+    if (event.key === "Tab") {
+      closeDeliveryMenu();
+      deliveryToggle?.focus();
+      // Let Tab move naturally from the disclosure into the surrounding UI.
+      return;
+    }
+    const choices = Array.from(deliveryMenu.querySelectorAll<HTMLButtonElement>("[data-delivery-choice]"));
+    const index = choices.indexOf(document.activeElement as HTMLButtonElement);
+    let next: number;
+    switch (event.key) {
+      case "ArrowDown": next = (index + 1) % choices.length; break;
+      case "ArrowUp": next = (index - 1 + choices.length) % choices.length; break;
+      case "Home": next = 0; break;
+      case "End": next = choices.length - 1; break;
+      default: return;
+    }
+    event.preventDefault();
+    choices[next]?.focus();
   };
   function closeDeliveryMenu(): void {
     if (!deliveryMenu || deliveryMenu.hidden) return;
@@ -3528,11 +3641,7 @@ export function initChat(api = new ChatApiClient()): void {
     document.removeEventListener("pointerdown", onDeliveryMenuOutside, true);
     document.removeEventListener("keydown", onDeliveryMenuKey, true);
   }
-  // Keep the touch rail in place until the click, as on Send: blurring the
-  // composer during pointerdown can otherwise move the disclosure away.
-  deliveryToggle?.addEventListener("pointerdown", event => {
-    if (event.pointerType === "touch") event.preventDefault();
-  });
+  deliveryToggle?.addEventListener("mousedown", keepTouchComposerFocus);
   deliveryToggle?.addEventListener("click", event => {
     if (!deliveryMenu) return;
     if (!deliveryMenu.hidden) { closeDeliveryMenu(); return; }
@@ -3548,26 +3657,18 @@ export function initChat(api = new ChatApiClient()): void {
     document.addEventListener("pointerdown", onDeliveryMenuOutside, true);
     document.addEventListener("keydown", onDeliveryMenuKey, true);
   });
-  deliveryMenu?.addEventListener("pointerdown", event => {
-    if (event.pointerType === "touch") event.preventDefault();
-  });
+  deliveryMenu?.addEventListener("mousedown", keepTouchComposerFocus);
   deliveryMenu?.addEventListener("click", event => {
     const choice = (event.target as Element).closest<HTMLButtonElement>("[data-delivery-choice]");
     if (!choice) return;
     const delivery: MessageDelivery = choice.dataset.deliveryChoice === "queue" ? "queue" : "steer";
-    // A choice is the device's new default, and sends the draft with it when
-    // there is one; with nothing to send it only sets the default.
+    // Selection never sends or stops work. Send (or Enter) is the explicit
+    // submission action, regardless of whether a draft is already present.
     writeDeliveryPreference(presentationLocalStorage(), delivery);
     syncDeliveryMenu();
     closeDeliveryMenu();
-    const hasContent = Boolean(input.value.trim()) || currentPendingAttachments().length > 0;
-    if (hasContent && projection && !submitting) {
-      requestedDelivery = delivery;
-      form.requestSubmit();
-    } else {
-      noteComposer(delivery === "steer" ? "Enter steers while the agent works" : "Enter queues while the agent works");
-      input.focus();
-    }
+    noteComposer(delivery === "steer" ? "Send or Enter steers while the agent works" : "Send or Enter queues while the agent works");
+    input.focus();
   });
 
   revertedItems?.addEventListener("pointerdown", event => {
@@ -3722,7 +3823,10 @@ export function initChat(api = new ChatApiClient()): void {
       const source = sourceProjection();
       if (!source) return;
       if (target.dataset.openConversation) {
-        openChildConversation(target.dataset.openConversation, subagentLabelFor(target.dataset.openConversation, source));
+        const row = target.closest<HTMLElement>("[data-chat-item-id]")?.dataset.chatItemId;
+        const task = source ? taskForChild(source.items, target.dataset.openConversation, row) : undefined;
+        openChildConversation(target.dataset.openConversation, subagentLabelFor(target.dataset.openConversation, source), false,
+          task && source ? { conversationId: source.conversationId, taskId: task.taskId, view: "transcript" } : undefined);
         return;
       }
       if (target.dataset.fileRef) {
@@ -3956,7 +4060,11 @@ export function initChat(api = new ChatApiClient()): void {
     // Back to the parent at its live position: it never unmounted, so this is
     // only re-asserting the anchor the timeline was already holding.
     parentScroll.request();
-    timeline.focus({ preventScroll: true });
+    const invoker = childInvoker?.isConnected ? childInvoker : childInvokerSelector ? surface.querySelector<HTMLElement>(childInvokerSelector) : null;
+    if (invoker && invoker.getClientRects().length > 0) invoker.focus({ preventScroll: true });
+    else timeline.focus({ preventScroll: true });
+    childInvoker = null;
+    childInvokerSelector = null;
     // A jump that was waiting on this close lands after the anchor restore,
     // never before it — see the requests-jump handler.
     if (pendingRequestJump !== null) {
@@ -4020,6 +4128,12 @@ export function initChat(api = new ChatApiClient()): void {
     drilldownClosePending = false;
     silentRun.stop();
     const previous = child;
+    if (!previous) {
+      childInvoker = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+      const attribute = ["data-inspect-task", "data-open-conversation"].find(name => childInvoker?.hasAttribute(name));
+      const row = childInvoker?.closest<HTMLElement>("[data-chat-item-id]")?.dataset.chatItemId;
+      childInvokerSelector = attribute ? `${row ? `[data-chat-item-id="${CSS.escape(row)}"] ` : ""}[${attribute}="${CSS.escape(childInvoker!.getAttribute(attribute)!)}"]` : null;
+    }
     previous?.stream?.close();
     previous?.read?.controller.abort();
     const retainedProjection = previous?.conversationId === id ? previous.projection : null;
@@ -4028,7 +4142,7 @@ export function initChat(api = new ChatApiClient()): void {
     // from the layer being refreshed, or — for a transcript opened from the
     // subagents track or the launching row — found by the child id on a
     // running task, so a running subagent gets the strip whichever way in.
-    const owningTask = projection ? runningTaskForChild(projection.items, id) : undefined;
+    const owningTask = projection ? taskForChild(projection.items, id) : undefined;
     const link = task
       ?? (previous?.conversationId === id ? previous.task : undefined)
       ?? (projection && owningTask ? { conversationId: projection.conversationId, taskId: owningTask.taskId, view: "transcript" as const } : undefined);
@@ -4288,10 +4402,22 @@ export function initChat(api = new ChatApiClient()): void {
   };
   surface.addEventListener("focusin", syncEditingFocus);
   surface.addEventListener("focusout", () => queueMicrotask(syncEditingFocus));
-  send.addEventListener("pointerdown", event => {
-    if (event.pointerType === "touch") event.preventDefault();
-  });
-  send.addEventListener("click", async () => {
+  send.addEventListener("mousedown", keepTouchComposerFocus);
+  // Mobile browsers can adjust a gap tap onto a nearby button. Use the raw
+  // touch coordinates (click/pointer coordinates may already be adjusted)
+  // to suppress only these misses; actual controls keep their native events.
+  sendGroup?.addEventListener("touchstart", event => {
+    if (event.touches.length !== 1) return;
+    const touch = event.touches[0]!;
+    const hit = [...sendGroup.querySelectorAll("button")].some(button => {
+      const box = button.getBoundingClientRect();
+      return touch.clientX >= box.left && touch.clientX < box.right
+        && touch.clientY >= box.top && touch.clientY < box.bottom;
+    });
+    if (!hit) event.preventDefault();
+  }, { passive: false });
+  stop?.addEventListener("mousedown", keepTouchComposerFocus);
+  stop?.addEventListener("click", async () => {
     if (!projection || !isLiveConversationStatus(projection.status) || cancelling) return;
     // Captured for the round trip: a failure landing after a switch belongs
     // to the conversation whose turn was being cancelled.
@@ -4387,10 +4513,8 @@ export function initChat(api = new ChatApiClient()): void {
     const pendingSteers = operation === "undo" && declares("steering") && projection?.conversationId === conversationId
       ? projection.queued.filter(entry => entry.delivery === "steer")
       : [];
-    const steerNote = pendingSteers.length
-      ? ` ${pendingSteers.length === 1 ? "Pending steer" : "Pending steers"} ${pendingSteers.map(entry => `“${entry.text.length > 40 ? `${entry.text.slice(0, 39)}…` : entry.text}”`).join(", ")} will be delivered together with your replacement.`
-      : "";
-    noteComposer(`${unavailableMessage ? `${label} complete. ${unavailableMessage}` : `${label} complete`}${steerNote}`);
+    const steerNote = pendingSteerReplacementNote(pendingSteers);
+    noteComposer(`${unavailableMessage ? `${label} complete. ${unavailableMessage}` : `${label} complete`}${steerNote ? ` ${steerNote}` : ""}`);
     return true;
   };
 
@@ -4469,7 +4593,13 @@ export function initChat(api = new ChatApiClient()): void {
 
   form.addEventListener("submit", async event => {
     event.preventDefault();
-    if (!projection || submitting) return;
+    // Every submission path, including requestSubmit from keyboard shortcuts,
+    // shares the cancellation lock. Consume the one-shot override even when
+    // refusing this attempt, and keep accepted submissions' delivery local
+    // across awaits (such as attachment staging).
+    const submissionDelivery = requestedDelivery;
+    requestedDelivery = undefined;
+    if (!projection || submitting || cancelling) return;
     const operation = localHistoryOperation(input.value, commands, declares("reversible-history"));
     if (operation) {
       const conversationId = projection.conversationId;
@@ -4643,8 +4773,7 @@ export function initChat(api = new ChatApiClient()): void {
     // Named only to a steering agent: the device default, or this
     // submission's one-off choice (⌥Enter, the menu). The workspace decides
     // whether it steers, holds, or dispatches, and reports which.
-    const delivery: MessageDelivery | undefined = declares("steering") ? requestedDelivery ?? readDeliveryPreference(presentationLocalStorage()) : undefined;
-    requestedDelivery = undefined;
+    const delivery: MessageDelivery | undefined = declares("steering") ? submissionDelivery ?? readDeliveryPreference(presentationLocalStorage()) : undefined;
     // Optimistic send: the message shows immediately and the input clears;
     // on failure the draft is removed and the text restored.
     projection = addAcceptedDraft(projection, { requestId, messageId: `pending:${requestId}`, text, ...(attachmentRefs.length ? { attachments: attachmentRefs } : {}) });

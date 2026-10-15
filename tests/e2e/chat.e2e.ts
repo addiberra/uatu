@@ -58,8 +58,8 @@ test.describe("desktop OpenCode chat", () => {
     await expect(page.locator("#chat-conversation-select option:checked")).toHaveText("Initial prompt");
     await expect(configurationTrigger).toBeEnabled();
     await expect(page.locator("#chat-items")).toContainText("Initial prompt");
-    // The fixed trailing action becomes cancel while the turn is live.
-    await expect(page.locator("#chat-send")).toHaveAttribute("aria-label", "Cancel response");
+    // Send stays available; the separate Stop action is enabled while live.
+    await expect(page.locator("#chat-stop")).toBeEnabled();
     // With a turn in flight and nothing back yet, the timeline's working
     // line says so — the same line the first step will join.
     await expect(page.locator(".chat-activity-group.is-awaiting")).toBeVisible();
@@ -83,7 +83,7 @@ test.describe("desktop OpenCode chat", () => {
     await expect(input).toHaveValue("draft retained across surfaces");
     await expect(configurationTrigger).toContainText("GPT-5");
 
-    await page.locator("#chat-send").click();
+    await page.locator("#chat-stop").click();
     await expect(page.locator("#chat-composer-status")).toHaveAttribute("aria-label", "Cancelled");
     await expect(page.locator("#chat-items")).toContainText("Initial prompt");
 
@@ -255,7 +255,7 @@ test.describe("desktop OpenCode chat", () => {
       await accepted;
     };
     await send("Start the work");
-    await expect(page.locator("#chat-send")).toHaveAttribute("aria-label", "Cancel response");
+    await expect(page.locator("#chat-stop")).toBeEnabled();
     await send("/reload");
     await expect(page.locator("#chat-queue .is-held")).toHaveCount(1);
     // The running turn ends; the held /reload is delivered and starts.
@@ -284,7 +284,7 @@ test.describe("desktop OpenCode chat", () => {
       await accepted;
     };
     await send("Start the work");
-    await expect(page.locator("#chat-send")).toHaveAttribute("aria-label", "Cancel response");
+    await expect(page.locator("#chat-stop")).toBeEnabled();
     await send("/reload");
     await send("/reload");
     await expect(page.locator("#chat-queue .is-held")).toHaveCount(2);

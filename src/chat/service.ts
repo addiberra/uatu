@@ -87,6 +87,7 @@ export interface WorkspaceChatService {
   respondPermission(id: string, interactionId: string, requestId: string, outcome: PermissionOutcome, choiceId?: string): Promise<{ outcome: PermissionOutcome }>;
   respondQuestion(id: string, interactionId: string, requestId: string, outcome: QuestionOutcome): Promise<{ outcome: QuestionOutcome }>;
   stopTask(id: string, taskId: string, requestId: string): Promise<{ stopped: true }>;
+  backgroundBlockingWork?(id: string, requestId: string): Promise<{ accepted: true }>;
   /** End a session held for its scheduled wakeups (design D5 of claude-scheduled-wakeups). */
   release(id: string, requestId: string): Promise<{ released: true }>;
   /** Cancel one scheduled wakeup, live or paused; it never fires again. */
@@ -321,6 +322,10 @@ export class LazyChatService implements WorkspaceChatService {
   }
   async stopTask(id: string, taskId: string, requestId: string) {
     return (await this.requireAdapter()).stopTask(id, taskId, requestId);
+  }
+
+  async backgroundBlockingWork(id: string, requestId: string) {
+    return (await this.requireAdapter()).backgroundBlockingWork(id, requestId);
   }
   async release(id: string, requestId: string) {
     return (await this.requireAdapter()).release(id, requestId);

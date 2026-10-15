@@ -14,7 +14,7 @@ import path from "node:path";
 
 import { ChatQueueFullError, CommandAttachmentsError, CommandSteeringError, ConversationRenameUnsupportedError, InteractionConflictError, InvalidConversationTitleError, InvalidModeSelectionError, InvalidModelSelectionError, InvalidPermissionChoiceError, InvalidVariantSelectionError, QueuedMessageNotHeldError, ReversibleHistoryUnsupportedError, ScheduledWakeupsUnsupportedError, SendNowUnavailableError, SendNowUnsupportedError, SteerAlreadyDeliveredError, SteeringUnsupportedError, SteerWithdrawalUnconfirmedError, UnknownAttachmentError, UsageUnsupportedError } from "../chat/adapter";
 import { AttachmentStoreError } from "../chat/attachment-store";
-import { BackgroundTaskUnavailableError, InvalidQuestionAnswerError, ReleaseUnavailableError, ReversibleHistoryTargetError, ScheduledWakeupUnavailableError } from "../chat/provider";
+import { OperationOutcomeUnknownError, BackgroundTaskUnavailableError, InvalidQuestionAnswerError, ReleaseUnavailableError, ReversibleHistoryTargetError, ScheduledWakeupUnavailableError } from "../chat/provider";
 import { encodeReplayCursor } from "../chat/replay";
 import { CHILD_NOTIFICATIONS_PATH, type NotificationFrame } from "../chat/notification-feed";
 import { HistoryChangedError } from "../chat/history-reuse";
@@ -1134,6 +1134,14 @@ function buildChatRoutes(deps: BuildRoutesDeps, p: (path: string) => string) {
         return run(() => deps.chatService.stopTask(id, taskId, requestId));
       }),
     },
+    [p("/api/chat/conversations/:conversationId/background")]: {
+      POST: async (request: RouteRequest) => chatMutation(request, ["requestId"], async (id, body) => {
+        const requestId = bodyIdentity(body, "requestId");
+        if (requestId instanceof Response) return requestId;
+        if (!deps.chatService.backgroundBlockingWork) return chatError(409, "Backgrounding is not supported");
+        return run(() => deps.chatService.backgroundBlockingWork!(id, requestId));
+      }),
+    },
     [p("/api/chat/conversations/:conversationId/wakeups/:wakeupId/cancel")]: {
       POST: async (request: RouteRequest) => chatMutation(request, ["requestId"], async (id, body) => {
         const wakeupId = routeIdentity(request, "wakeupId");
@@ -1353,6 +1361,7 @@ function normalizedChatError(error: unknown): Response {
   if (error instanceof ReversibleHistoryTargetError) return chatError(409, error.message);
   if (error instanceof InvalidQuestionAnswerError) return chatError(400, error.message);
   if (error instanceof BackgroundTaskUnavailableError) return chatError(409, error.message);
+  if (error instanceof OperationOutcomeUnknownError) return chatError(409, error.message, "operation_outcome_unknown");
   if (error instanceof ReleaseUnavailableError) return chatError(409, error.message);
   if (error instanceof ScheduledWakeupUnavailableError) return chatError(409, error.message);
   if (error instanceof ScheduledWakeupsUnsupportedError) return chatError(409, error.message);

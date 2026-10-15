@@ -1,4 +1,39 @@
+## RENAMED Requirements
+
+- FROM: `### Requirement: Chat composer actions keep a stable one-line layout`
+- TO: `### Requirement: Chat composer actions keep a stable responsive layout`
+
 ## MODIFIED Requirements
+
+### Requirement: Chat composer actions keep a stable responsive layout
+The Chat composer SHALL present context usage, one flexible configuration trigger, routine status, a persistent visible Send action, and a separate Stop action. A capability-gated delivery selector SHALL precede Send where supported. Send SHALL NOT become Stop while work runs. Each submission control SHALL have a target at least 44×44 CSS pixels with at least 8px separation from adjacent submission controls and a visible keyboard-focus indicator. Stop SHALL remain in place but disabled when no turn is live. Routine lifecycle changes and opening the delivery menu MUST NOT move or resize these controls at an unchanged panel width.
+
+Wide panels SHALL use one non-wrapping rail. At narrow widths the composer SHALL use two deliberate rails: context/configuration/status above delivery/Send/Stop. The configuration label SHALL truncate as needed, without shrinking submission targets or causing horizontal overflow. Resizing MAY switch the entire rail arrangement; individual controls MUST NOT wrap independently. Actionable failures SHALL remain explanatory text outside the routine status footprint, without horizontally reordering the controls. Textarea autosizing remains independent of rail stability.
+
+#### Scenario: Routine lifecycle keeps trailing controls stationary
+- **WHEN** a prompt moves through ready, sending, working, cancelling, and ready states at an unchanged Chat-panel width
+- **THEN** the status, Send, Stop, and supported delivery selector retain their dimensions and positions
+- **AND** Stop is enabled only during live work and unavailable during its cancellation request
+
+#### Scenario: Narrow desktop panel truncates configuration
+- **WHEN** a desktop or touch Chat panel is too narrow for one rail
+- **THEN** the submission controls occupy one separate non-wrapping row below settings/status
+- **AND** their minimum target sizes and separation are preserved without horizontal overflow
+- **AND** the configuration label truncates to its available width
+
+#### Scenario: Context usage does not displace the trailing action
+- **WHEN** context usage becomes available or its displayed value changes
+- **THEN** it does not move the routine status, Send, or Stop
+- **AND** it does not change the number of action rows
+
+#### Scenario: Failure remains explanatory
+- **WHEN** sending, cancellation, or the active turn fails
+- **THEN** Chat displays explanatory failure text
+- **AND** the action rails keep their horizontal ordering
+
+#### Scenario: Gap taps do not activate adjacent actions
+- **WHEN** a touch lands in the gap between submission controls
+- **THEN** no prompt or cancellation is sent, even if the browser attempts to retarget that tap
 
 ### Requirement: The workspace API exposes normalized chat operations
 The workspace API SHALL provide authenticated operations to list, create, and read conversations; start a prompt turn; remove a queued message; change a pending message's delivery; send a pending message now; cancel the active turn; answer a pending permission; and answer or reject a structured question. Mutation requests SHALL be origin-protected under cookie authentication, SHALL validate conversation ownership against the workspace directory, and SHALL use client-generated request identifiers to make network retries idempotent. Provider-specific payloads and credentials MUST NOT be exposed as the public contract when a normalized UatuCode representation exists.
@@ -121,6 +156,22 @@ The Chat composer SHALL submit a message with content — non-empty text, at lea
 Every message held in the workspace's queue SHALL stay held until delivery, whatever its kind: prompts, skills, slash commands, and `/reload`. When the running turn ends on its own, the workspace SHALL deliver held messages to the agent one at a time in submission order. Each held message SHALL be delivered under the model, mode, and reasoning variant fixed at its submission. A delivered message SHALL leave the dock and begin its own turn at the end of the timeline. The user SHALL be able to remove any message that is still pending; a removed message is never delivered. Removal of a message that has already been delivered SHALL be refused without altering the conversation. The user SHALL be able to edit a pending message: the message leaves the dock under the same rules as removal, and the invoking client's composer receives its text and attachments.
 
 The user SHALL be able to cancel an active turn without deleting its completed history. Cancellation SHALL NOT deliver pending messages. They remain pending, removable, and visible, and are presented as paused. The queue stays dormant until the user next submits a prompt, which joins the end of the queue and resumes delivery from its head. The other ways out of the dormant state are switching an entry to steer and Send now. Transport failure SHALL preserve the draft until acceptance is known.
+
+Send SHALL remain visible while work runs and SHALL submit the draft with the selected delivery, or queue it when steering is unsupported. A separate Stop button SHALL cancel active work without submitting or discarding an unsent draft. Changing delivery SHALL only change the per-device selection, never submit a message or cancel work. Send SHALL be unavailable for an empty draft, during submission, or while a cancellation request is pending. The shared submit path SHALL also refuse keyboard submission during cancellation, preserving the draft and discarding any one-shot delivery override from the refused attempt.
+
+#### Scenario: Visible Send works while busy for every agent
+- **WHEN** the user clicks or taps Send with a non-empty draft while work runs
+- **THEN** the draft is submitted with the selected delivery, or queued when the agent does not support steering
+- **AND** the running turn is not cancelled
+
+#### Scenario: Stop does not send the draft
+- **WHEN** the user activates Stop while work runs and an unsent draft exists
+- **THEN** only cancellation is requested and the draft remains intact
+
+#### Scenario: Keyboard submission cannot bypass pending cancellation
+- **WHEN** a cancellation request is pending and the user presses Enter or Option/Alt+Enter
+- **THEN** no prompt is sent and the draft remains intact
+- **AND** after cancellation settles, a normal submission uses the device preference rather than any override from the refused attempt
 
 The surface SHALL name the agent it is talking to, taking that name from what the agent reports rather than from fixed copy. Text presented to the user SHALL NOT assume a particular agent, so that installing a different agent changes the name shown and nothing else.
 
@@ -361,7 +412,7 @@ A message submitted with attachments while the conversation is running SHALL kee
 ### Requirement: OpenCode 2.x conversations can steer the running turn
 An agent that can deliver a message into its running turn at the next safe step boundary, and can withdraw or switch a message before then, SHALL declare the `steering` capability. The OpenCode 2.x agent SHALL declare it. The OpenCode 1.x agent and the Claude Code agent SHALL NOT declare it.
 
-While a conversation whose agent declares `steering` is running, the composer SHALL offer two deliveries. Enter submits with the default delivery. ⌥Enter (Option/Alt+Enter) submits with the other one. A menu on the Send/Cancel control SHALL offer both deliveries by name, so the choice is available without a keyboard. The default delivery SHALL be a per-device preference, initially steer. Opening the menu SHALL NOT change the Send/Cancel control's footprint or the action rail's order. The delivery choice SHALL apply only to prompts: skills, slash commands, and `/reload` are always held in the workspace's queue. While the conversation is idle, submission SHALL be unchanged.
+While a conversation whose agent declares `steering` is running or has pending messages, the composer SHALL offer two deliveries. Send and Enter submit with the default delivery. ⌥Enter (Option/Alt+Enter) submits with the other one. A separate labelled selector preceding Send SHALL offer Steer and Queue by name and display the current choice. Selecting a delivery SHALL preserve the draft without submitting it. The default delivery SHALL be a per-device preference, initially steer. Opening the menu SHALL NOT change control footprints or rail order. The selector SHALL support keyboard navigation, dismissal and visible focus, and menu choices SHALL be at least 44px high. On capable conversations it SHALL remain visible but disabled while idle with no pending messages; on other agents it SHALL be absent. The delivery choice SHALL apply only to prompts: skills, slash commands, and `/reload` are always held in the workspace's queue. While the conversation is idle, submission SHALL be unchanged.
 
 A steer SHALL be handed to the agent at once and kept pending by the agent until the agent delivers it. Steers SHALL be delivered before any held message. The dock SHALL list the user's pending steers, from any client of the conversation, labelled "Steer", and SHALL NOT list the agent's own internal inbox entries. A steer SHALL NOT appear in the timeline until the agent reports it delivered, at which point it SHALL appear as an ordinary user message. While steers are pending, the dock SHALL note that they run with the conversation's model and mode as they stand when they are delivered.
 
@@ -398,9 +449,14 @@ When the workspace attaches to a conversation, or reconnects to the agent, it SH
 - **AND** other devices keep their own default
 
 #### Scenario: The delivery menu is available on touch
-- **WHEN** the user opens the menu on the Send/Cancel control while the agent works
+- **WHEN** the user opens the separate delivery selector while the agent works
 - **THEN** both Steer and Queue are offered by name
 - **AND** the action rail keeps its layout
+
+#### Scenario: Selecting delivery is not submission
+- **WHEN** the user chooses Queue or Steer with an existing draft
+- **THEN** the selector shows the choice, the draft remains, and focus returns to the composer
+- **AND** no prompt or cancellation request is made until the corresponding explicit action is activated
 
 #### Scenario: A steer joins the turn at the next step
 - **WHEN** a steer is pending and the agent reaches its next step boundary

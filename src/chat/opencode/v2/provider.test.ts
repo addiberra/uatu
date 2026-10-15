@@ -14,7 +14,7 @@ const STORED = FIXTURES.storedMessages.data;
 const WORKSPACE = "/ws";
 const AUTH = `Basic ${Buffer.from("opencode:pw").toString("base64")}`;
 
-type Call = { method: string; path: string; query: URLSearchParams; body: unknown; headers: Headers };
+type Call = { method: string; path: string; query: URLSearchParams; body: unknown; headers: Headers; signal: AbortSignal };
 const ENVELOPED = [
   /^GET \/api\/session\/[^/]+$/,
   /^POST \/api\/session$/,
@@ -39,7 +39,7 @@ function fakeOpenCode(routes: Record<string, Handler>) {
     const request = input instanceof Request ? new Request(input, init) : new Request(input, init);
     const url = new URL(request.url);
     const text = await request.clone().text().catch(() => "");
-    const call: Call = { method: request.method, path: url.pathname, query: url.searchParams, body: text ? JSON.parse(text) : undefined, headers: request.headers };
+    const call: Call = { method: request.method, path: url.pathname, query: url.searchParams, body: text ? JSON.parse(text) : undefined, headers: request.headers, signal: request.signal };
     calls.push(call);
     const match = patterns.find(candidate => candidate.method === request.method && candidate.regex.test(url.pathname));
     if (!match) return Response.json({ _tag: "NotFoundError", message: `no route ${request.method} ${url.pathname}` }, { status: 404 });
@@ -76,7 +76,7 @@ describe("OpenCode 2.x provider: identity and catalogs", () => {
   test("declares the capabilities the 2.x stack backs", () => {
     const { provider } = fakeOpenCode({});
     expect(provider().describe()).toMatchObject({ id: "opencode", name: "OpenCode" });
-    expect(provider().describe().capabilities).toEqual(["modes", "models", "commands", "questions", "permissions", "subagents", "variants", "context", "conversation-rename", "attachments", "reversible-history", "steering", "send-now"]);
+    expect(provider().describe().capabilities).toEqual(["modes", "models", "commands", "questions", "permissions", "subagents", "variants", "context", "conversation-rename", "attachments", "reversible-history", "steering", "send-now", "background-tasks", "background-blocking-work"]);
     expect(provider().describe().permissionScopeNote).toContain("until OpenCode restarts");
   });
 
@@ -150,6 +150,310 @@ describe("OpenCode 2.x provider: identity and catalogs", () => {
 });
 
 describe("OpenCode 2.x provider: sessions", () => {
+  test("background-all is one parent-scoped native mutation, including an accepted empty no-op", async () => {
+    const server = fakeOpenCode({
+      "GET /api/session/ses_parent": () => session("ses_parent"),
+      "POST /api/session/ses_parent/background": () => undefined,
+    });
+    await server.provider().backgroundBlockingWork("ses_parent");
+    expect(server.calls.filter(call => call.method === "POST")).toEqual([expect.objectContaining({ path: "/api/session/ses_parent/background", body: undefined })]);
+    expect(server.calls.some(call => /prompt|interrupt|inbox/.test(call.path))).toBe(false);
+  });
+  test("background parent validation refuses foreign sessions before mutation; dispatched response loss is unknown", async () => {
+    const server = fakeOpenCode({
+      "GET /api/session/ses_parent": () => session("ses_parent", { location: { directory: "/other" } }),
+      "POST /api/session/ses_parent/background": () => undefined,
+    });
+    await expect(server.provider().backgroundBlockingWork("ses_parent")).rejects.toThrow(/unavailable/);
+    expect(server.calls.some(call => call.method === "POST")).toBe(false);
+    const lost = fakeOpenCode({
+      "GET /api/session/ses_parent": () => session("ses_parent"),
+      "POST /api/session/ses_parent/background": () => new Response("lost", { status: 502 }),
+    });
+    await expect(lost.provider().backgroundBlockingWork("ses_parent")).rejects.toMatchObject({ name: "OperationOutcomeUnknownError" });
+    expect(lost.requests("POST", "/api/session/ses_parent/background")).toHaveLength(1);
+  });
+  test("worker stop verifies its occurrence and interrupts only its child without resuming", async () => {
+    const fixture = JSON.parse(readFileSync(path.join(import.meta.dir, "../../../../tests/fixtures/opencode-v2/background-2.0.29.json"), "utf8"));
+    let completed = false;
+    const server = fakeOpenCode({
+      "GET /api/session/active": () => ({ ses_child: { status: "running" } }),
+      "GET /api/session/:id": ({ path }) => session(path.split("/").at(-1)!, path.endsWith("ses_child") ? { parentID: "ses_parent" } : {}),
+      "GET /api/session/ses_parent/message": () => ({ data: completed ? [fixture.launch, fixture.stored] : [fixture.launch], cursor: {} }),
+      "GET /api/session/ses_parent/inbox": () => ({ data: [] }),
+      "GET /api/session/ses_child/message": () => ({ data: [], cursor: {} }),
+      "POST /api/session/ses_child/interrupt": () => ({ interrupted: true }),
+    });
+    const provider = server.provider();
+    await provider.stopTask("ses_parent", "v2:ses_parent:call_worker");
+    expect(server.calls.filter(call => call.method === "POST")).toEqual([expect.objectContaining({ path: "/api/session/ses_child/interrupt", body: undefined })]);
+    expect(server.requests("POST", "/api/session/ses_child/interrupt")[0]!.query.get("resume")).toBe("false");
+    completed = true;
+    await expect(provider.stopTask("ses_parent", "v2:ses_parent:call_worker")).rejects.toThrow(/no longer/);
+    expect(server.calls.filter(call => call.method === "POST")).toHaveLength(1);
+  });
+  test("worker stop does not authorize from a recovery read that predates the stop request", async () => {
+    const fixture = JSON.parse(readFileSync(path.join(import.meta.dir, "../../../../tests/fixtures/opencode-v2/background-2.0.29.json"), "utf8"));
+    let release!: () => void;
+    let started!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const reading = new Promise<void>(resolve => { started = resolve; });
+    let reads = 0;
+    const server = fakeOpenCode({
+      "GET /api/session/active": () => ({ ses_child: { status: "running" } }),
+      "GET /api/session/:id": ({ path }) => session(path.split("/").at(-1)!, path.endsWith("ses_child") ? { parentID: "ses_parent" } : {}),
+      "GET /api/session/ses_parent/inbox": () => ({ data: [] }),
+      "GET /api/session/ses_child/message": () => ({ data: [{ id: "idle", type: "idle", time: { created: 40 } }], cursor: {} }),
+      "GET /api/session/ses_parent/message": async () => {
+        if (++reads === 1) { started(); await gate; return { data: [fixture.launch], cursor: {} }; }
+        return { data: [fixture.launch, fixture.stored, fixture.converted], cursor: {} };
+      },
+      "POST /api/session/ses_child/interrupt": () => ({ interrupted: true }),
+    });
+    const provider = server.provider();
+    const recovery = provider.reconcileBackgroundTasks("ses_parent");
+    await reading;
+    const stop = provider.stopTask("ses_parent", "v2:ses_parent:call_worker");
+    release();
+    // Even the older parent read cannot authorize a task past the child's
+    // independently observed execution boundary.
+    expect(await recovery).toContainEqual(expect.objectContaining({ toolUseId: "call_worker", stateUncertain: true }));
+    await expect(stop).rejects.toThrow(/no longer confirmed/);
+    expect(server.requests("POST", "/api/session/ses_child/interrupt")).toHaveLength(0);
+  });
+  for (const withForegroundLauncher of [false, true]) test(`an unresolved old background task cannot stop a newer child occurrence (${withForegroundLauncher ? "foreground launcher running" : "external child continuation"})`, async () => {
+    const fixture = JSON.parse(readFileSync(path.join(import.meta.dir, "../../../../tests/fixtures/opencode-v2/background-2.0.29.json"), "utf8"));
+    const foreground = structuredClone(fixture.converted);
+    foreground.content[0].state.status = "running";
+    foreground.content[0].time = { created: 50 };
+    foreground.time = { created: 50 };
+    const server = fakeOpenCode({
+      "GET /api/session/active": () => ({ ses_child: { status: "running" } }),
+      "GET /api/session/:id": ({ path }) => session(path.split("/").at(-1)!, path.endsWith("ses_child") ? { parentID: "ses_parent" } : {}),
+      "GET /api/session/ses_parent/message": () => ({ data: withForegroundLauncher ? [fixture.launch, foreground] : [fixture.launch], cursor: {} }),
+      "GET /api/session/ses_parent/inbox": () => ({ data: [] }),
+      "GET /api/session/ses_child/message": () => ({ data: [
+        { id: "idle-old", type: "idle", time: { created: 40 } },
+        { id: "prompt-new", type: "user", text: "New foreground occurrence", time: { created: 50 } },
+      ], cursor: {} }),
+      "POST /api/session/ses_child/interrupt": () => ({ interrupted: true }),
+    });
+    const provider = server.provider();
+    expect(await provider.reconcileBackgroundTasks("ses_parent")).toContainEqual(expect.objectContaining({ taskId: "v2:ses_parent:call_worker", status: "running", stateUncertain: true }));
+    await expect(provider.stopTask("ses_parent", "v2:ses_parent:call_worker")).rejects.toThrow(/no longer confirmed/);
+    expect(server.requests("POST", "/api/session/ses_child/interrupt")).toHaveLength(0);
+  });
+  test("shell output is an owned bounded tail; removal acknowledgement is not a terminal result", async () => {
+    const fixture = JSON.parse(readFileSync(path.join(import.meta.dir, "../../../../tests/fixtures/opencode-v2/background-2.0.29.json"), "utf8"));
+    let removed = false;
+    const server = fakeOpenCode({
+      "GET /api/session/active": () => ({}),
+      "GET /api/session/:id": () => session("ses_parent"),
+      "GET /api/session/ses_parent/message": () => ({ data: [fixture.shell], cursor: {} }),
+      "GET /api/session/ses_parent/inbox": () => ({ data: [] }),
+      "GET /api/shell/sh_fixture": () => removed ? Response.json({ _tag: "ShellNotFoundError" }, { status: 404 }) : scoped({ id: "sh_fixture", status: "exited", metadata: { sessionID: "ses_parent" } }),
+      "GET /api/shell/sh_fixture/output": ({ query }) => scoped({ output: query.get("cursor") === String(Number.MAX_SAFE_INTEGER) ? "" : "tail", size: 1000, cursor: 1000, truncated: false }),
+      "DELETE /api/shell/sh_fixture": () => { removed = true; return undefined; },
+    });
+    const provider = server.provider();
+    expect(await provider.taskOutput("ses_parent", "v2:ses_parent:call_shell", { tailBytes: 4 })).toEqual({ text: "tail", truncated: true, settled: false });
+    await expect(provider.taskOutput("ses_parent", "/private/secret", { tailBytes: 4 })).rejects.toThrow(/unavailable/);
+    await provider.stopTask("ses_parent", "v2:ses_parent:call_shell");
+    expect(await provider.reconcileBackgroundTasks("ses_parent")).toEqual([expect.objectContaining({ status: "running", stateUncertain: true })]);
+    expect(await provider.taskOutput("ses_parent", "v2:ses_parent:call_shell", { tailBytes: 4 })).toBeNull();
+    expect(server.requests("DELETE", "/api/shell/sh_fixture")).toHaveLength(1);
+    expect(server.calls.filter(call => call.path.startsWith("/api/shell/")).every(call => call.query.get("location[directory]") === WORKSPACE)).toBe(true);
+  });
+  test("foreign shell ownership refuses output and removal; already-missing removal 204 alone settles nothing", async () => {
+    const fixture = JSON.parse(readFileSync(path.join(import.meta.dir, "../../../../tests/fixtures/opencode-v2/background-2.0.29.json"), "utf8"));
+    let owner = "other-parent";
+    const server = fakeOpenCode({
+      "GET /api/session/active": () => ({}),
+      "GET /api/session/ses_parent": () => session("ses_parent"),
+      "GET /api/session/ses_parent/message": () => ({ data: [fixture.shell], cursor: {} }),
+      "GET /api/session/ses_parent/inbox": () => ({ data: [] }),
+      "GET /api/shell/sh_fixture": () => scoped({ id: "sh_fixture", metadata: { sessionID: owner } }),
+      // A removal can race another client's removal after our ownership read.
+      "DELETE /api/shell/sh_fixture": () => undefined,
+    });
+    const provider = server.provider();
+    await expect(provider.stopTask("ses_parent", "v2:ses_parent:call_shell")).rejects.toThrow(/no longer confirmed/);
+    await expect(provider.taskOutput("ses_parent", "v2:ses_parent:call_shell", { tailBytes: 10 })).rejects.toThrow(/unavailable/);
+    expect(server.calls.some(call => call.method === "DELETE" || call.path.endsWith("/output"))).toBe(false);
+    owner = "ses_parent";
+    await provider.stopTask("ses_parent", "v2:ses_parent:call_shell");
+    expect(server.requests("DELETE", "/api/shell/sh_fixture")).toHaveLength(1);
+    expect(await provider.reconcileBackgroundTasks("ses_parent")).toEqual([expect.objectContaining({ status: "running" })]);
+  });
+  test("background reconciliation reads pending results even when the parent is idle; active absence is uncertainty", async () => {
+    const fixture = JSON.parse(readFileSync(path.join(import.meta.dir, "../../../../tests/fixtures/opencode-v2/background-2.0.29.json"), "utf8"));
+    let pending = false;
+    let active = true;
+    const server = fakeOpenCode({
+      "GET /api/session/active": () => active ? { ses_child: { status: "running" } } : {},
+      "GET /api/session/:id": ({ path }) => session(path.split("/").at(-1)!, path.endsWith("ses_child") ? { parentID: "ses_parent" } : {}),
+      "GET /api/session/ses_parent/message": () => ({ data: [fixture.launch], cursor: {} }),
+      "GET /api/session/ses_parent/inbox": () => ({ data: pending ? [fixture.pending] : [] }),
+      "GET /api/session/ses_child/message": () => ({ data: [], cursor: {} }),
+    });
+    const provider = server.provider();
+    expect(await provider.reconcileBackgroundTasks("ses_parent")).toEqual([expect.objectContaining({ status: "running", stateUncertain: false })]);
+    active = false;
+    expect(await provider.reconcileBackgroundTasks("ses_parent")).toEqual([expect.objectContaining({ status: "running", stateUncertain: true })]);
+    pending = true;
+    expect(await provider.reconcileBackgroundTasks("ses_parent")).toEqual([expect.objectContaining({ status: "completed", summary: "Fixture checked.", stateUncertain: false })]);
+    expect(server.calls.every(call => call.method === "GET")).toBe(true);
+  });
+  test("concurrent recovery requests for one parent share every read", async () => {
+    let release!: () => void;
+    const wait = new Promise<void>(resolve => { release = resolve; });
+    const server = fakeOpenCode({
+      "GET /api/session/active": () => ({}),
+      "GET /api/session/ses_parent": () => session("ses_parent"),
+      "GET /api/session/ses_parent/message": async () => { await wait; return { data: [], cursor: {} }; },
+      "GET /api/session/ses_parent/inbox": () => ({ data: [] }),
+    });
+    const provider = server.provider();
+    const first = provider.reconcileBackgroundTasks("ses_parent");
+    const second = provider.reconcileBackgroundTasks("ses_parent");
+    release();
+    expect(await Promise.all([first, second])).toEqual([[], []]);
+    expect(server.requests("GET", "/api/session/ses_parent/inbox")).toHaveLength(1);
+    expect(server.requests("GET", "/api/session/active")).toHaveLength(1);
+    expect(server.requests("GET", "/api/session/ses_parent/message")).toHaveLength(1);
+  });
+  test("successive background reconciliations reuse complete history but refresh current execution and pending inbox", async () => {
+    const encoder = new TextEncoder();
+    let stream!: ReadableStreamDefaultController<Uint8Array>;
+    const server = fakeOpenCode({
+      "GET /api/event": () => new Response(new ReadableStream<Uint8Array>({ start(controller) {
+        stream = controller;
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: "server.connected", data: {} })}\n\n`));
+      } }), { headers: { "content-type": "text/event-stream" } }),
+      "GET /api/session/active": () => ({}),
+      "GET /api/session/ses_parent": () => session("ses_parent"),
+      "GET /api/session/ses_parent/message": () => ({ data: [], cursor: {} }),
+      "GET /api/session/ses_parent/inbox": () => ({ data: [] }),
+    });
+    const provider = server.provider();
+    const controller = new AbortController();
+    const events = provider.events(controller.signal)[Symbol.asyncIterator]();
+    await events.next();
+    await provider.reconcileBackgroundTasks("ses_parent");
+    await provider.reconcileBackgroundTasks("ses_parent");
+    expect(server.requests("GET", "/api/session/ses_parent/message")).toHaveLength(1);
+    expect(server.requests("GET", "/api/session/active")).toHaveLength(2);
+    expect(server.requests("GET", "/api/session/ses_parent/inbox")).toHaveLength(2);
+    expect(server.calls.some(call => call.method !== "GET")).toBe(false);
+    const updated = events.next();
+    stream.enqueue(encoder.encode(`data: ${JSON.stringify({ type: "session.message.content.updated", data: { sessionID: "ses_parent", messageID: "msg_new", content: [] } })}\n\n`));
+    await updated;
+    await provider.reconcileBackgroundTasks("ses_parent");
+    expect(server.requests("GET", "/api/session/ses_parent/message")).toHaveLength(2);
+    stream.close();
+    await events.next();
+    // With no stream/replay guarantee, even unchanged history must be read.
+    await provider.reconcileBackgroundTasks("ses_parent");
+    expect(server.requests("GET", "/api/session/ses_parent/message")).toHaveLength(3);
+    await provider.dispose();
+  });
+  test("disposing cancels and awaits owned background reads without touching provider execution", async () => {
+    let started!: () => void;
+    const reading = new Promise<void>(resolve => { started = resolve; });
+    let signal: AbortSignal | undefined;
+    let release!: () => void;
+    const server = fakeOpenCode({
+      "GET /api/session/active": () => ({}),
+      "GET /api/session/ses_parent": () => session("ses_parent"),
+      "GET /api/session/ses_parent/inbox": () => ({ data: [] }),
+      "GET /api/session/ses_parent/message": call => new Promise((_resolve, reject) => {
+        signal = call.signal;
+        release = () => reject(new DOMException("Stopped read", "AbortError"));
+        signal.addEventListener("abort", release, { once: true });
+        started();
+      }),
+    });
+    const provider = server.provider();
+    const pending = provider.reconcileBackgroundTasks("ses_parent").catch(() => undefined);
+    await reading;
+    try {
+      await provider.dispose();
+      expect(signal?.aborted).toBe(true);
+    } finally { release(); await pending; }
+    expect(server.calls.every(call => call.method === "GET")).toBe(true);
+  });
+  test("a notification for an existing verified child is readable without its creation event", async () => {
+    const fixture = JSON.parse(readFileSync(path.join(import.meta.dir, "../../../../tests/fixtures/opencode-v2/background-2.0.29.json"), "utf8"));
+    const event = { id: "evt_notice", type: "session.inbox.enqueued", created: 41, location: { directory: WORKSPACE }, data: { sessionID: "ses_parent", inboxID: "msg_result", item: fixture.pending } };
+    const server = fakeOpenCode({
+      "GET /api/session/ses_child": () => session("ses_child", { parentID: "ses_parent" }),
+      "GET /api/event": () => new Response(`data: ${JSON.stringify(event)}\n\n`, { headers: { "content-type": "text/event-stream" } }),
+    });
+    const updates = [];
+    for await (const event of server.provider().events(new AbortController().signal)) updates.push(...event.updates);
+    expect(updates).toContainEqual({ kind: "upsert", item: expect.objectContaining({ type: "background_task", resultId: "msg_result", status: "completed", summary: "Fixture checked." }) });
+    expect(updates.some(update => update.kind === "upsert" && update.item.type === "notice")).toBe(false);
+  });
+  test("complete history correlates a worker result before paging, without duplicating its envelope", async () => {
+    const fixture = JSON.parse(readFileSync(path.join(import.meta.dir, "../../../../tests/fixtures/opencode-v2/background-2.0.29.json"), "utf8"));
+    const server = fakeOpenCode({
+      "GET /api/session/:id": ({ path }) => session(path.split("/").at(-1)!, path.endsWith("ses_child") ? { parentID: "ses_parent" } : {}),
+      "GET /api/session/ses_parent/message": () => ({ data: [fixture.launch, fixture.stored], cursor: {} }),
+    });
+    const provider = server.provider();
+    const latest = await provider.listMessages("ses_parent", { limit: 1 });
+    expect(latest.items).toContainEqual(expect.objectContaining({ type: "background_task", status: "completed", summary: "Fixture checked.", childConversationId: "ses_child" }));
+    expect(latest.items.some(item => item.type === "notice")).toBe(false);
+    const older = await provider.listMessages("ses_parent", { limit: 1, cursor: latest.nextCursor });
+    expect(older.items.filter(item => item.type === "background_task")).toEqual([]);
+    expect(latest.completeItems?.filter(item => item.type === "background_task")).toHaveLength(1);
+    expect(latest.completeItems).toContainEqual(expect.objectContaining({ type: "tool", id: "tool:call_worker", status: "completed" }));
+  });
+
+  test("notification-first stored history retires its provisional result when the older launch is restated", async () => {
+    const fixture = JSON.parse(readFileSync(path.join(import.meta.dir, "../../../../tests/fixtures/opencode-v2/background-2.0.29.json"), "utf8"));
+    const server = fakeOpenCode({
+      "GET /api/session/:id": ({ path }) => session(path.split("/").at(-1)!, path.endsWith("ses_child") ? { parentID: "ses_parent" } : {}),
+      "GET /api/session/ses_parent/message": () => ({ data: [fixture.stored, { ...fixture.launch, time: { created: 50 } }], cursor: {} }),
+    });
+    const result = await server.provider().listMessages("ses_parent", { limit: 100 });
+    expect(result.items.filter(item => item.type === "background_task")).toEqual([expect.objectContaining({ toolUseId: "call_worker", resultId: "msg_result", status: "completed" })]);
+  });
+  test("the first history page carries every live worker and its out-of-page launcher aliases", async () => {
+    const fixture = JSON.parse(readFileSync(path.join(import.meta.dir, "../../../../tests/fixtures/opencode-v2/background-2.0.29.json"), "utf8"));
+    const server = fakeOpenCode({
+      "GET /api/session/:id": ({ path }) => session(path.split("/").at(-1)!, path.endsWith("ses_child") ? { parentID: "ses_parent" } : {}),
+      "GET /api/session/ses_parent/message": () => ({ data: [fixture.launch, { id: "latest", type: "user", time: { created: 100 }, text: "Later prompt" }], cursor: {} }),
+    });
+    const provider = server.provider();
+    const result = await provider.listMessages("ses_parent", { limit: 1 });
+    expect(result.items).toContainEqual(expect.objectContaining({ id: "tool:call_worker", status: "completed" }));
+    expect(result.items.filter(item => item.type === "background_task")).toHaveLength(1);
+    const older = await provider.listMessages("ses_parent", { cursor: result.nextCursor, limit: 1 });
+    expect(new Set([...result.items, ...older.items].filter(item => item.type === "background_task").map(item => item.id)).size).toBe(1);
+  });
+  test("child execution boundaries separate reused occurrences; an ambiguous delayed notice settles neither", async () => {
+    const fixture = JSON.parse(readFileSync(path.join(import.meta.dir, "../../../../tests/fixtures/opencode-v2/background-2.0.29.json"), "utf8"));
+    const notice = { ...fixture.stored, time: { created: 70 } };
+    const server = fakeOpenCode({
+      "GET /api/session/active": () => ({ ses_child: { status: "running" } }),
+      "GET /api/session/:id": ({ path }) => session(path.split("/").at(-1)!, path.endsWith("ses_child") ? { parentID: "ses_parent" } : {}),
+      "GET /api/session/ses_parent/inbox": () => ({ data: [] }),
+      "GET /api/session/ses_parent/message": () => ({ data: [fixture.launch, fixture.converted, notice], cursor: {} }),
+      "GET /api/session/ses_child/message": () => ({ data: [{ id: "msg_idle", type: "idle", outcome: "succeeded", time: { created: 40 } }, { id: "msg_continue", type: "user", text: "Check another fixture", time: { created: 50 } }], cursor: {} }),
+    });
+    const result = await server.provider().listMessages("ses_parent", { limit: 50 });
+    expect(result.items.filter(item => item.type === "background_task" && item.status === "running")).toEqual([
+      expect.objectContaining({ toolUseId: "call_worker", stateUncertain: true }),
+      expect.objectContaining({ toolUseId: "call_converted", stateUncertain: true }),
+    ]);
+    expect(result.items.filter(item => item.type === "background_task" && item.status === "completed")).toEqual([expect.objectContaining({ summary: "Fixture checked." })]);
+    const provider = server.provider();
+    expect((await provider.reconcileBackgroundTasks("ses_parent")).filter(item => item.status === "running").every(item => item.stateUncertain)).toBe(true);
+    await expect(provider.stopTask("ses_parent", "v2:ses_parent:call_converted")).rejects.toThrow(/no longer confirmed/);
+    expect(server.calls.every(call => call.method === "GET")).toBe(true);
+  });
+
   test("lists only the workspace's sessions, following the cursor", async () => {
     const server = fakeOpenCode({
       "GET /api/session": ({ query }) => query.get("cursor") === "page2"

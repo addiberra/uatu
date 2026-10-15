@@ -22,7 +22,7 @@ See proposal.md, "Why". The current state that shapes this design:
 **Goals:**
 - A steer on 2.x reaches the running turn at its next step boundary, and until OpenCode delivers it the user can still withdraw it, switch it to queue, or edit it.
 - One dock and one bound across both deliveries. Every client sees the same dock, and a message is never delivered twice.
-- No change in behavior for OpenCode 1.x. Claude Code keeps its current queue, plus Send now.
+- No change in delivery behavior for OpenCode 1.x. Claude Code keeps its current queue, plus Send now. Both receive the shared separate Send/Stop composer controls.
 
 **Non-Goals:**
 - Steering on Claude Code or OpenCode 1.x.
@@ -122,8 +122,11 @@ On a `send-now` agent without `steering` (Claude), Send now is accepted only whe
 ### D10. Composer and dock
 
 - **Keys.** Enter submits with the device default delivery, and ⌥Enter with the other one. This applies only while a `steering` conversation is busy. When idle, both behave as Enter does today.
-- **Menu.** A disclosure segment on the Send/Cancel control offers "Steer" and "Queue". It lives inside the control's fixed footprint, as required by "Chat composer actions keep a stable one-line layout".
+- **Send and Stop (approved UX revision, 2026-10-15).** Send remains a visible, labelled submit button while busy, including on non-steering agents where it queues. Stop is a separate labelled button that only cancels the turn; it remains in place but disabled when idle. Empty drafts disable Send, not Stop. Cancelling disables duplicate Stop and Send until the cancellation request settles.
+- **Menu.** A separate labelled Steer/Queue disclosure precedes Send, with Stop last. Selection only sets the default and preserves the draft; it never submits or cancels. This deliberately replaces both the original inside-footprint disclosure and its draft-submitting menu choices. Send or Enter explicitly submits. The selector is absent for agents without `steering`; on a capable agent it keeps its space when idle, disabled unless running or pending messages exist. Arrow keys and Home/End navigate, Escape returns to the disclosure, and Tab leaves normally; selection returns focus to the composer.
+- **Layout.** Send, Stop, the selector, and menu choices have at least 44px targets; submission controls have 8px non-overlapping gaps and visible focus rings. At composer content widths up to 30rem, settings/status occupy the first rail and delivery/Send/Stop the second. Above that width they share one rail. Only deliberate resizing changes this arrangement; lifecycle transitions and menu opening do not. This replaces the unconditional one-line requirement to retain usable settings and safe targets on narrow desktop and touch panels. Raw-touch hit checking ignores gap taps that mobile browsers would otherwise retarget onto a nearby button.
 - **Preference.** The default is stored in `presentationLocalStorage()` (per device, scoped by base path) and defaults to `steer`.
+- **Cancellation lock.** The shared form-submit handler refuses all submission paths while cancellation is pending, not just the disabled Send button. It captures and clears a one-shot delivery override before any early return; a blocked Alt+Enter cannot leak into the next message, and an accepted override remains local across asynchronous attachment staging.
 - **Dock.** `QueueDockRenderer` renders steers first and queued messages after. Each entry shows a Steer or Queue label and, when paused, a paused note.
 - **Entry actions.** Every entry offers Remove and Edit. Queued entries offer "Steer" or "Send now", depending on capability and state. Steers offer "Queue", and paused steers offer "Send now (all paused steers)". Commands get no Steer action.
 - **Note.** While any steer is pending, a single dock note says steers run with the conversation's model and mode at delivery.
@@ -141,6 +144,8 @@ The existing check counts pending steers plus held messages against 20 messages 
 
 The chat Playwright suites (`tests/e2e/chat-queue.e2e.ts` and the others) run against `FakeE2EChatService` (`tests/e2e/chat-service.ts`), which replaces the whole chat service. No fake OpenCode server exists in `tests/e2e/`; the only scripted 2.x server is the `fetch` stub in `src/chat/opencode/v2/provider.test.ts`. This change adds `tests/e2e/opencode-v2-fake.ts`. It is a small scripted HTTP plus SSE server that implements the 2.0.28 routes the provider calls (session, prompt with delivery and resume, inbox list/cancel, interrupt, switchModel/switchAgent, event stream), and it is driven through `/__e2e/chat` control calls. `tests/e2e/server.ts` registers it as an extra agent served by the real `ChatAdapter` and `OpenCodeV2Provider`. The Claude Send now flow uses the existing `FakeE2EChatService` (`claude` agent) extended with `send-now`. *Alternative rejected:* extending `FakeE2EChatService` with steering. It is cheaper, but it would not exercise the adapter or provider in e2e.
 
+The real manual pass targets installed OpenCode 2.0.29, as approved on 2026-10-15. This changes only the real verification target: the SDK and scripted fake remain pinned to 2.0.28, and fake-server checks do not count as the real manual pass.
+
 ## Risks / Trade-offs
 
 - [The wait for withdrawal confirmation could hang if the stream is down] → Bounded wait plus an `inbox.list` decision (D7). The mutation reports failure rather than guessing, and the steer stays in the dock.
@@ -150,7 +155,7 @@ The chat Playwright suites (`tests/e2e/chat-queue.e2e.ts` and the others) run ag
 - [`delivered` with no remembered payload, for example a workspace restart while a steer was pending] → The row comes from history on the next snapshot. Until then the dock entry clears and the row is absent, the same as today's restart behavior for in-flight work.
 - [The OpenCode TUI on the same session does not see Uatu-held messages] → Accepted limitation, as agreed.
 - [The Uatu queue is lost on workspace restart, while steers survive in OpenCode's SQLite] → Accepted for the queue. Steers re-appear through `inbox.list` on attach (D3).
-- [A Send now/steer menu could disturb the action rail] → It stays inside the fixed footprint. The existing rail-stability e2e test covers it.
+- [Separate actions need more space] → A width-based second rail on narrow panels trades composer height for large labelled targets and usable settings. Stop never replaces Send, and opening the selector never changes geometry. Desktop and Chromium/WebKit touch tests cover state stability, selection-only behavior, edge/gap taps, focus, and non-steering enqueue.
 
 ## Migration Plan
 

@@ -2,7 +2,10 @@ import type { APIRequestContext, Page } from "@playwright/test";
 
 import { openChatPanel } from "./chat-helpers";
 import { captureScreenshot } from "./evidence";
-import { expect, test } from "./fixtures";
+import { expect, test as base } from "./fixtures";
+import { withEngineBrowsers } from "./page-diagnostics";
+
+const test = withEngineBrowsers(base);
 
 // Steering on OpenCode 2.x (opencode-v2-steering), end to end over the real
 // ChatAdapter and OpenCodeV2Provider and the scripted fake OpenCode 2.0.28
@@ -23,7 +26,8 @@ async function bootChat(page: Page, request: APIRequestContext): Promise<void> {
   const token = await request.get("/__e2e/terminal-token").then(response => response.json()) as { token: string };
   await page.goto(`/?t=${encodeURIComponent(token.token)}`);
   await expect(page.locator("#connection-state .connection-label")).toHaveText("Connected");
-  await openChatPanel(page);
+  if (await page.locator("html").getAttribute("data-ui-mode") === "touch") await page.locator("#touch-tab-chat").tap();
+  else await openChatPanel(page);
   await expect(page.locator("#chat-state")).not.toContainText("Loading chat");
 }
 
@@ -62,7 +66,7 @@ async function startTurn(page: Page, request: APIRequestContext): Promise<string
   const conversationId = await newConversation(page);
   expect(await submit(page, "Start the work")).toMatchObject({ pending: false });
   await expect(page.locator("#chat-items")).toContainText("Start the work");
-  await expect(page.locator("#chat-send")).toHaveAttribute("aria-label", "Cancel response");
+  await expect(page.locator("#chat-stop")).toBeEnabled();
   await expect.poll(async () => (await fakeSession(request, conversationId))?.running).toBe(true);
   return conversationId;
 }
@@ -73,6 +77,124 @@ const held = (page: Page) => page.locator("#chat-queue .chat-queued-message[data
 
 test.describe("steering an OpenCode 2.x turn", () => {
   test.beforeEach(async ({ page, request }) => bootChat(page, request));
+
+  for (const key of ["Enter", "Alt+Enter"] as const) {
+    test(`cancellation blocks ${key} without losing the draft or leaking a delivery override`, async ({ page, request }) => {
+      await startTurn(page, request);
+      // Retain a paused steer after Stop so the next submission still has a
+      // delivery choice, making a leaked Alt override observable on the wire.
+      await submit(page, "Pending before cancellation");
+      let releaseCancel!: () => void;
+      let enteredCancel!: () => void;
+      const gate = new Promise<void>(resolve => { releaseCancel = resolve; });
+      const entered = new Promise<void>(resolve => { enteredCancel = resolve; });
+      await page.route("**/cancel", async route => {
+        enteredCancel();
+        await gate;
+        await route.continue();
+      });
+      const prompts: unknown[] = [];
+      page.on("request", request => {
+        if (request.url().endsWith("/prompts")) prompts.push(request.postDataJSON());
+      });
+      const input = page.locator("#chat-input");
+      await input.fill("Keep this draft until cancellation settles");
+      const cancelled = page.waitForResponse(response => response.url().endsWith("/cancel"));
+      try {
+        await page.locator("#chat-stop").click();
+        await entered;
+        await expect(page.locator("#chat-send")).toBeDisabled();
+        await input.press(key);
+        await expect(input).toHaveValue("Keep this draft until cancellation settles");
+        expect(prompts).toEqual([]);
+      } finally {
+        releaseCancel();
+      }
+      expect((await cancelled).ok()).toBe(true);
+      await expect(page.locator("#chat-send")).toBeEnabled();
+      await expect(page.locator("#chat-stop")).toBeDisabled();
+      const accepted = page.waitForResponse(response => response.url().endsWith("/prompts"));
+      await input.press("Enter");
+      expect(await (await accepted).json()).toMatchObject({ pending: true, delivery: "steer" });
+      expect(prompts).toEqual([expect.objectContaining({ text: "Keep this draft until cancellation settles", delivery: "steer" })]);
+      await expect(input).toHaveValue("");
+    });
+  }
+
+  test("visible Send uses the selected delivery while only Stop cancels", async ({ page, request }, testInfo) => {
+    const conversationId = await newConversation(page);
+    const send = page.getByRole("button", { name: "Send message", exact: true });
+    const stop = page.getByRole("button", { name: "Stop response", exact: true });
+    await expect(stop).toBeDisabled();
+    await submit(page, "Start the work");
+    await expect(stop).toBeEnabled();
+    await expect(send).toBeVisible();
+    await expect(send).toBeDisabled();
+    const input = page.locator("#chat-input");
+    const mutations: string[] = [];
+    page.on("request", request => {
+      if (/\/(prompts|cancel)$/.test(request.url())) mutations.push(request.url());
+    });
+    await input.fill("Later, please");
+    await page.locator("#chat-delivery-toggle").click();
+    await page.getByRole("menuitemradio", { name: /^Queue/ }).click();
+    await expect(input).toHaveValue("Later, please");
+    await expect(input).toBeFocused();
+    await expect(page.locator("#chat-delivery-toggle")).toContainText("Queue");
+    expect(mutations).toEqual([]);
+    await captureScreenshot(page, testInfo, "steering-separated-actions-desktop");
+    const queued = page.waitForResponse(response => response.url().endsWith("/prompts"));
+    await send.click();
+    expect(await (await queued).json()).toMatchObject({ pending: true, delivery: "queue" });
+    await expect(held(page)).toContainText("Later, please");
+    expect((await fakeSession(request, conversationId))?.running).toBe(true);
+    expect(mutations.filter(url => url.endsWith("/cancel"))).toEqual([]);
+    await input.fill("Keep my unsent draft");
+    const cancelled = page.waitForResponse(response => response.url().endsWith("/cancel"));
+    await stop.click();
+    expect((await cancelled).ok()).toBe(true);
+    await expect(stop).toBeDisabled();
+    await expect(input).toHaveValue("Keep my unsent draft");
+    await expect(send).toBeEnabled();
+    await expect(held(page)).toHaveAttribute("data-paused");
+  });
+
+  test("delivery choices support menu keys and dismiss when keyboard focus leaves", async ({ page, request }, testInfo) => {
+    await startTurn(page, request);
+    const toggle = page.locator("#chat-delivery-toggle");
+    const menu = page.locator("#chat-delivery-menu");
+    const steer = menu.locator("[data-delivery-choice='steer']");
+    const queue = menu.locator("[data-delivery-choice='queue']");
+    await toggle.focus();
+    await toggle.press("Enter");
+    await expect(steer).toBeFocused();
+    await captureScreenshot(page, testInfo, "steering-keyboard-menu");
+    await page.keyboard.press("ArrowDown");
+    await expect(queue).toBeFocused();
+    await page.keyboard.press("ArrowDown");
+    await expect(steer).toBeFocused();
+    await page.keyboard.press("End");
+    await expect(queue).toBeFocused();
+    await page.keyboard.press("Home");
+    await expect(steer).toBeFocused();
+    await page.keyboard.press("ArrowUp");
+    await expect(queue).toBeFocused();
+    await page.keyboard.press("Escape");
+    await expect(menu).toBeHidden();
+    await expect(toggle).toBeFocused();
+    await toggle.press("Enter");
+    await page.keyboard.press("Shift+Tab");
+    await expect(menu).toBeHidden();
+    await expect(page.locator("#chat-configuration-trigger")).toBeFocused();
+    // Choosing a default with no draft is not a submission.
+    await toggle.focus();
+    await toggle.press("Enter");
+    await page.keyboard.press("ArrowDown");
+    await page.keyboard.press("Enter");
+    await expect(menu).toBeHidden();
+    await expect(page.locator("#chat-input")).toBeFocused();
+    expect(await submit(page, "Keyboard queued")).toMatchObject({ delivery: "queue" });
+  });
 
   test("Enter steers by default: the steer waits in the dock and joins the timeline only at the step boundary", async ({ page, request }, testInfo) => {
     const conversationId = await startTurn(page, request);
@@ -194,7 +316,7 @@ test.describe("steering an OpenCode 2.x turn", () => {
     await expect(dock(page)).toHaveCount(3);
 
     const cancel = page.waitForResponse(response => response.url().endsWith("/cancel"));
-    await page.locator("#chat-send").click();
+    await page.locator("#chat-stop").click();
     expect((await cancel).status()).toBe(200);
     await expect(page.locator("#chat-composer-status")).toHaveAttribute("aria-label", "Cancelled");
     await expect.poll(async () => (await fakeSession(request, conversationId))?.running).toBe(false);
@@ -225,7 +347,7 @@ test.describe("steering an OpenCode 2.x turn", () => {
   test("a new steer resumes paused steers", async ({ page, request }) => {
     const conversationId = await startTurn(page, request);
     expect(await submit(page, "Stranded")).toMatchObject({ delivery: "steer" });
-    await page.locator("#chat-send").click();
+    await page.locator("#chat-stop").click();
     await expect(page.locator("#chat-composer-status")).toHaveAttribute("aria-label", "Cancelled");
     await expect(steers(page).filter({ hasText: "Stranded" })).toHaveAttribute("data-paused", "");
     expect(await submit(page, "And this")).toMatchObject({ delivery: "steer" });
@@ -235,7 +357,7 @@ test.describe("steering an OpenCode 2.x turn", () => {
     await expect.poll(async () => (await fakeSession(request, conversationId))?.running).toBe(true);
   });
 
-  test("Undo names pending steers and the replacement delivers them oldest first ahead of the held queue", async ({ page, request }) => {
+  test("Undo names pending steers and the replacement delivers them oldest first ahead of the held queue", async ({ page, request }, testInfo) => {
     const conversationId = await startTurn(page, request);
     await submit(page, "Keep this steer");
     await submit(page, "Keep this held", "Alt+Enter");
@@ -250,6 +372,9 @@ test.describe("steering an OpenCode 2.x turn", () => {
     await expect(page.locator("#chat-composer-status-live")).toContainText("delivered together with your replacement");
     await expect(page.locator("#chat-input")).toHaveValue("Start the work");
     await expect(page.locator("#chat-queue .chat-queued-message[data-paused]")).toHaveCount(2);
+    await captureScreenshot(page, testInfo, "steering-undo-confirmation");
+    await expect(page.locator("#chat-queue-note")).toContainText("Keep this steer");
+    await expect(page.locator("#chat-queue-note")).toContainText("delivered together with your replacement");
 
     expect(await submit(page, "Replacement work")).toMatchObject({ delivery: "steer" });
     await expect(steers(page)).toHaveCount(0);
@@ -262,6 +387,27 @@ test.describe("steering an OpenCode 2.x turn", () => {
     await expect(page.locator("#chat-items")).toContainText("Answer 1");
     await expect(page.locator("#chat-items")).toContainText("Keep this held");
     await expect(held(page)).toHaveCount(0);
+  });
+
+  test("Revert reveals its replacement warning in an already-scrolled dock without stealing subsequent scroll", async ({ page, request }, testInfo) => {
+    await startTurn(page, request);
+    for (let index = 1; index <= 6; index++) await submit(page, `Pending steer ${index}`);
+    const queue = page.locator("#chat-queue");
+    const note = page.locator("#chat-queue-note");
+    await queue.evaluate(element => { element.scrollTop = element.scrollHeight; });
+    expect(await queue.evaluate(element => element.scrollTop)).toBeGreaterThan(0);
+    await page.locator("#chat-items").getByRole("button", { name: "Revert message", exact: true }).click();
+    await expect(note).toContainText("delivered together with your replacement");
+    await captureScreenshot(page, testInfo, "steering-scrolled-revert-warning");
+    await expect(note).toBeInViewport({ ratio: 1 });
+    // Reading lower entries after the reveal is deliberate. A later queue
+    // update must not drag the reader back to the still-active warning.
+    await queue.evaluate(element => { element.scrollTop = element.scrollHeight; });
+    await steers(page).last().getByRole("button", { name: "Remove", exact: true }).click();
+    await expect(steers(page)).toHaveCount(5);
+    await expect(note).not.toContainText("Pending steer 6");
+    expect(await queue.evaluate(element => element.scrollTop)).toBeGreaterThan(0);
+    await expect(note).not.toBeInViewport();
   });
 
   test("a command always queues, whatever the delivery, and offers no steer", async ({ page, request }) => {
@@ -281,7 +427,7 @@ test.describe("steering an OpenCode 2.x turn", () => {
     await startTurn(page, request);
     expect(await submit(page, "Steer one")).toMatchObject({ delivery: "steer" });
     expect(await submit(page, "Held one", "Alt+Enter")).toMatchObject({ delivery: "queue" });
-    await page.locator("#chat-send").click();
+    await page.locator("#chat-stop").click();
     await expect(page.locator("#chat-composer-status")).toHaveAttribute("aria-label", "Cancelled");
     await expect(page.locator("#chat-queue .chat-queued-message[data-paused]")).toHaveCount(2);
 
@@ -295,10 +441,143 @@ test.describe("steering an OpenCode 2.x turn", () => {
   });
 });
 
-test.describe("the delivery menu on touch", () => {
-  test.use({ viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true });
+for (const browserName of ["chromium", "webkit"] as const) test.describe(`steering on touch (${browserName})`, () => {
+  test.use({ page: async ({ launchBrowser, baseURL }, use) => {
+    const browser = await launchBrowser(browserName);
+    const page = await browser.newPage({ baseURL, viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true });
+    await use(page);
+    await browser.close();
+  } });
 
-  test("offers Steer and Queue by name inside the Send control, sets the default, and keeps the rail's layout", async ({ page, request }, testInfo) => {
+  test("large separated targets keep narrow layouts stable and edge taps never stop work", async ({ page, request }, testInfo) => {
+    await page.setViewportSize({ width: 320, height: 740 });
+    await bootChat(page, request);
+    const conversationId = await newConversation(page);
+    const controls = ["#chat-delivery-toggle", "#chat-send", "#chat-stop"];
+    const boxes = async () => Promise.all(controls.map(async selector => {
+      const box = await page.locator(selector).boundingBox();
+      expect(box).not.toBeNull();
+      return box!;
+    }));
+    const idle = await boxes();
+    await page.locator("#chat-input").fill("Start narrow work");
+    await page.locator("#chat-send").tap();
+    await expect(page.locator("#chat-stop")).toBeEnabled();
+    expect(await boxes()).toEqual(idle);
+    const mutations: string[] = [];
+    page.on("request", request => {
+      if (/\/(prompts|cancel)$/.test(request.url())) mutations.push(request.url());
+    });
+    for (const width of [320, 390]) {
+      await page.setViewportSize({ width, height: 740 });
+      await page.locator("#chat-input").fill("Unsent draft");
+      const before = await boxes();
+      for (const [index, box] of before.entries()) {
+        expect(box.width).toBeGreaterThanOrEqual(44);
+        expect(box.height).toBeGreaterThanOrEqual(44);
+        expect(box.x).toBeGreaterThanOrEqual(0);
+        expect(box.x + box.width).toBeLessThanOrEqual(width);
+        if (index > 0) {
+          expect(box.x - (before[index - 1]!.x + before[index - 1]!.width)).toBeGreaterThanOrEqual(8);
+          expect(box.y).toEqual(before[0]!.y);
+        }
+      }
+      // Both ends of the edge nearest Send, inside the rounded corners,
+      // belong only to Delivery, not Stop.
+      for (const y of [10, before[0]!.height - 10]) {
+        await page.locator("#chat-delivery-toggle").tap({ position: { x: before[0]!.width - 2, y } });
+        await expect(page.locator("#chat-delivery-menu")).toBeVisible();
+        for (const choice of await page.locator("[data-delivery-choice]").all()) {
+          expect((await choice.boundingBox())!.height).toBeGreaterThanOrEqual(44);
+        }
+        await page.locator("[data-delivery-choice='queue']").tap();
+        await expect(page.locator("#chat-input")).toHaveValue("Unsent draft");
+        await expect(page.locator("#chat-input")).toBeFocused();
+      }
+      // The empty gap before Stop is not a hidden extension of its hit area.
+      await page.touchscreen.tap(before[2]!.x - 4, before[2]!.y + 22);
+      expect(await boxes()).toEqual(before);
+      expect(mutations).toEqual([]);
+      expect((await fakeSession(request, conversationId))?.running).toBe(true);
+      expect(await page.locator("#chat-surface").evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true);
+      await captureScreenshot(page, testInfo, `steering-separated-${width}-${browserName}`);
+    }
+    // Hardware-keyboard navigation on touch retains the same safe semantics.
+    await page.locator("#chat-delivery-toggle").focus();
+    await page.keyboard.press("Enter");
+    await expect(page.locator("[data-delivery-choice='queue']")).toBeFocused();
+    await page.keyboard.press("Home");
+    await page.keyboard.press("Enter");
+    await expect(page.locator("#chat-input")).toHaveValue("Unsent draft");
+    expect(mutations).toEqual([]);
+    const accepted = page.waitForResponse(response => response.url().endsWith("/prompts"));
+    await page.locator("#chat-send").tap();
+    expect(await (await accepted).json()).toMatchObject({ pending: true, delivery: "steer" });
+    await expect(page.locator("#chat-stop")).toBeEnabled();
+    const stopped = page.waitForResponse(response => response.url().endsWith("/cancel"));
+    await page.locator("#chat-stop").tap();
+    expect((await stopped).ok()).toBe(true);
+    await expect(page.locator("#chat-stop")).toBeDisabled();
+    expect(mutations.filter(url => url.endsWith("/cancel"))).toHaveLength(1);
+  });
+
+  test("touch dock supports switch, edit, cancel, resume, and a visible Undo warning", async ({ page, request }, testInfo) => {
+    await bootChat(page, request);
+    const conversationId = await newConversation(page);
+    const input = page.locator("#chat-input");
+    await input.fill("Start touch work");
+    await page.locator("#chat-send").tap();
+    await captureScreenshot(page, testInfo, `steering-touch-start-${browserName}`);
+    await expect(page.locator("#chat-stop")).toBeEnabled();
+    const sendChoice = async (text: string, delivery: "steer" | "queue") => {
+      await input.fill(text);
+      await page.locator("#chat-delivery-toggle").tap();
+      const accepted = page.waitForResponse(response => response.url().endsWith("/prompts"));
+      await page.locator(`#chat-delivery-menu [data-delivery-choice='${delivery}']`).tap();
+      await expect(input).toHaveValue(text);
+      await page.locator("#chat-send").tap();
+      expect(await (await accepted).json()).toMatchObject({ pending: true, delivery });
+      await expect(input).toHaveValue("");
+    };
+    await sendChoice("Touch steer", "steer");
+    await steers(page).locator("[data-queue-queue]").tap();
+    await captureScreenshot(page, testInfo, `steering-touch-switch-${browserName}`);
+    await expect(held(page)).toHaveText([/Touch steer/]);
+    await held(page).locator("[data-queue-steer]").tap();
+    await expect(steers(page)).toHaveText([/Touch steer/]);
+    await input.fill("Private draft");
+    await steers(page).locator("[data-queue-edit]").tap();
+    await expect(input).toHaveValue("Touch steer\nPrivate draft");
+    await expect(input).toBeFocused();
+    await expect(dock(page)).toHaveCount(0);
+    await sendChoice("First touch steer", "steer");
+    await sendChoice("Second touch steer", "steer");
+    await sendChoice("Held touch work", "queue");
+    await page.locator("#chat-stop").tap();
+    await expect(page.locator("#chat-queue [data-paused]")).toHaveCount(3);
+    await captureScreenshot(page, testInfo, `steering-touch-paused-${browserName}`);
+    await steers(page).first().getByRole("button", { name: "Send now (all paused steers)", exact: true }).tap();
+    await expect(steers(page)).toHaveCount(0);
+    await expect(held(page)).toHaveCount(1);
+    await expect(page.locator("#chat-items")).toContainText("Second touch steer");
+    await sendChoice("Keep this touch steer", "steer");
+    await page.locator("#chat-items").getByRole("button", { name: "Revert message", exact: true }).last().tap();
+    await expect(input).toHaveValue("Second touch steer");
+    await expect(page.locator("#chat-queue-note")).toContainText("Keep this touch steer");
+    await expect(page.locator("#chat-queue-note")).toContainText("delivered together with your replacement");
+    await expect(page.locator("#chat-queue-note")).toBeInViewport();
+    await captureScreenshot(page, testInfo, `steering-touch-undo-${browserName}`);
+    // No clipped horizontal controls; the dock itself scrolls vertically.
+    expect(await page.locator("#chat-surface").evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true);
+    await input.fill("Touch replacement");
+    await page.locator("#chat-send").tap();
+    await expect(page.locator("#chat-items")).toContainText("Touch replacement");
+    await expect(held(page)).toHaveText([/Held touch work/]);
+    await control(request, { action: "opencode", op: "finish", conversationId });
+    await expect(page.locator("#chat-items")).toContainText("Held touch work");
+  });
+
+  test("separate touch delivery selects without sending and keeps the rails stable", async ({ page, request }, testInfo) => {
     await request.post("/__e2e/reset");
     await control(request, { action: "agents", stack: "opencode-v2" });
     const token = await request.get("/__e2e/terminal-token").then(response => response.json()) as { token: string };
@@ -312,7 +591,7 @@ test.describe("the delivery menu on touch", () => {
     const started = page.waitForResponse(response => response.url().endsWith("/prompts"));
     await page.locator("#chat-send").tap();
     expect(await (await started).json()).toMatchObject({ pending: false });
-    await expect(page.locator("#chat-send")).toHaveAttribute("aria-label", "Cancel response");
+    await expect(page.locator("#chat-stop")).toBeEnabled();
     await expect.poll(async () => (await fakeSession(request, conversationId))?.running).toBe(true);
 
     const rail = page.locator(".chat-composer-actions");
@@ -325,7 +604,7 @@ test.describe("the delivery menu on touch", () => {
     await expect(menu).toBeVisible();
     await expect(menu.locator("[data-delivery-choice]")).toHaveText([/Steer/, /Queue/]);
     await expect(menu.locator("[data-delivery-choice='steer']")).toHaveAttribute("aria-checked", "true");
-    await captureScreenshot(page, testInfo, "steering-touch-menu");
+    await captureScreenshot(page, testInfo, `steering-touch-menu-${browserName}`);
     const after = await rail.boundingBox();
     const sendAfter = await page.locator("#chat-send").boundingBox();
     expect(after!.height).toBeCloseTo(before!.height, 0);
@@ -335,12 +614,14 @@ test.describe("the delivery menu on touch", () => {
     await toggle.tap();
     await expect(menu).toBeHidden();
 
-    // Choosing Queue with a draft sends it as a queue and makes queue the
-    // device default: the next Enter queues too.
+    // Choosing Queue only sets the default; Send and Enter use it.
     await input.fill("Later, please");
     await toggle.tap();
     const queued = page.waitForResponse(response => response.url().endsWith("/prompts"));
     await menu.locator("[data-delivery-choice='queue']").tap();
+    await expect(input).toHaveValue("Later, please");
+    await expect(input).toBeFocused();
+    await page.locator("#chat-send").tap();
     expect(await (await queued).json()).toMatchObject({ pending: true, delivery: "queue" });
     await expect(menu).toBeHidden();
     await expect(held(page).filter({ hasText: "Later, please" })).toHaveCount(1);

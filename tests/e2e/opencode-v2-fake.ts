@@ -28,8 +28,8 @@ type InboxEntry = {
   id: string;
   sessionID: string;
   time: { created: number };
-  type: "user";
-  payload: { text: string; files?: InboxFile[] };
+  type: "user" | "synthetic";
+  payload: { text: string; files?: InboxFile[]; description?: string; metadata?: Record<string, unknown> };
   delivery: InboxDelivery;
 };
 type StoredMessage = Record<string, unknown> & { id: string; time: { created: number; completed?: number } };
@@ -68,7 +68,17 @@ export type OpenCodeV2Fake = {
   finish(sessionId: string, text?: string): { assistantMessageId: string; delivered: string[] } | null;
   /** The next cancel of `inboxId` finds it already delivered (the too-late race). */
   raceDeliverOnCancel(inboxId: string): void;
-  state(): { sessions: Record<string, OpenCodeV2FakeSessionState>; unhandled: string[] };
+  launchWorker(sessionId: string, background: boolean, existingChildId?: string): { childId: string; taskId: string; callId: string };
+  launchShell(sessionId: string, background: boolean): { shellId: string; taskId: string };
+  shellPhase(shellId: string, phase: "exit" | "capture" | "captureBeforeRemove"): void;
+  settleWorker(childId: string, state: "completed" | "error" | "cancelled", text: string): void;
+  disconnect(): void;
+  pauseEvents(paused: boolean): void;
+  appendHistory(sessionId: string, count: number): void;
+  loseNextBackgroundResponse(): void;
+  loseNextWorkerResponse(): void;
+  wakeParent(sessionId: string): void;
+  state(): { eventSubscribers: number; sessions: Record<string, OpenCodeV2FakeSessionState>; shells: Record<string, { removed: boolean; waiter: string; captured: boolean; outputAvailable: boolean }>; unhandled: string[]; calls: string[] };
   stop(): Promise<void>;
 };
 
@@ -98,9 +108,15 @@ export function startOpenCodeV2Fake(options: { directory: string; password?: str
   const authorization = `Basic ${Buffer.from(`opencode:${password}`).toString("base64")}`;
   const encoder = new TextEncoder();
   const subscribers = new Set<ReadableStreamDefaultController<Uint8Array>>();
+  let eventsPaused = false;
   const sessions = new Map<string, SessionState>();
   const raceOnCancel = new Set<string>();
   const unhandled: string[] = [];
+  const calls: string[] = [];
+  const workers = new Map<string, { parent: SessionState; child: SessionState; message: StoredMessage; background: boolean; settled: boolean }>();
+  const shells = new Map<string, { parent: SessionState; message: StoredMessage; background: boolean; removed: boolean; exited: boolean; waiter: "pending" | "exited" | "failed"; captured: boolean; captureBeforeRemove: boolean; output: string | null }>();
+  let loseBackground = false;
+  let loseWorker = false;
   let counter = 0;
   let clock = 0;
   // Strictly increasing: stored records sort by creation time.
@@ -127,7 +143,7 @@ export function startOpenCodeV2Fake(options: { directory: string; password?: str
   function deliver(session: SessionState, entry: InboxEntry): void {
     session.inbox = session.inbox.filter(candidate => candidate.id !== entry.id);
     const created = emit("session.inbox.delivered", { sessionID: session.info.id, inboxID: entry.id });
-    session.messages.push({ id: entry.id, type: "user", time: { created }, text: entry.payload.text, ...(entry.payload.files ? { files: entry.payload.files } : {}) });
+    session.messages.push({ id: entry.id, type: entry.type, time: { created }, ...entry.payload });
     session.info.time.updated = created;
   }
   function deliverAll(session: SessionState, filter: (entry: InboxEntry) => boolean): string[] {
@@ -205,14 +221,79 @@ export function startOpenCodeV2Fake(options: { directory: string; password?: str
       location: { directory },
       time: { created, updated: created },
       agent: typeof body.agent === "string" ? body.agent : "build",
+      ...(typeof body.parentID === "string" ? { parentID: body.parentID } : {}),
       model: model?.id && model.providerID
         ? { id: model.id, providerID: model.providerID, ...(model.variant ? { variant: model.variant } : {}) }
         : { id: MODEL.modelID, providerID: MODEL.providerID },
     };
     const session: SessionState = { info, running: false, inbox: [], messages: [] };
     sessions.set(info.id, session);
-    emit("session.created", { sessionID: info.id, title: info.title, location: info.location, projectID: info.projectID, version: "2.0.28" });
+    emit("session.created", { sessionID: info.id, parentID: info.parentID, title: info.title, location: info.location, projectID: info.projectID, version: "2.0.28" });
     return session;
+  }
+
+  // Source-shaped 2.0.29 tool and notification records (see the pinned
+  // background-2.0.29 fixture). Interrupt acknowledgement does not settle a
+  // worker; the test advances its provider-owned notification separately.
+  function launchWorker(sessionId: string, background: boolean, existingChildId?: string) {
+    const parent = sessions.get(sessionId);
+    if (!parent) throw new Error("Unknown fixture parent");
+    const child = existingChildId ? sessions.get(existingChildId) : createSession({ parentID: sessionId, title: "Inspect safe fixture" });
+    if (!child || child.info.parentID !== sessionId || child.running) throw new Error("Unavailable fixture continuation");
+    const childId = child.info.id;
+    const callId = mint("call");
+    const created = now();
+    const message: StoredMessage = { id: mint("msg"), type: "assistant", time: { created }, content: [{ type: "tool", id: callId, name: "subagent", time: { created }, state: { status: background ? "completed" : "running", input: { agent: "explore", description: "Inspect safe fixture", prompt: "Check fixture", ...(background ? { background: true } : {}) }, metadata: { sessionID: childId, status: "running" }, content: background ? [{ type: "text", text: "The subagent is working in the background. You will be notified automatically." }] : [] } }] };
+    child.messages.push({ id: mint("msg"), type: "user", text: "Check fixture", time: { created } });
+    startTurn(child);
+    parent.messages.push(message);
+    workers.set(childId, { parent, child, message, background, settled: false });
+    emit("session.message.content.updated", { sessionID: sessionId, messageID: message.id, content: message.content });
+    return { childId, callId, taskId: `v2:${sessionId}:${callId}` };
+  }
+
+  function settleWorker(childId: string, state: "completed" | "error" | "cancelled", text: string) {
+    const worker = workers.get(childId);
+    if (!worker || worker.settled) return;
+    worker.settled = true;
+    finish(worker.child, text);
+    const created = now();
+    worker.child.messages.push({ id: mint("msg"), type: "idle", time: { created } });
+    const entry: InboxEntry = { id: mint("msg"), sessionID: worker.parent.info.id, type: "synthetic", delivery: "steer", time: { created }, payload: { description: "Inspect safe fixture", text: `<subagent sessionID="${childId}" state="${state}">\n${text}\n</subagent>`, metadata: { source: "subagent", childID: childId, state, agent: "explore" } } };
+    worker.parent.inbox.push(entry);
+    emit("session.inbox.enqueued", { sessionID: worker.parent.info.id, inboxID: entry.id, item: entry });
+  }
+
+  function launchShell(sessionId: string, background: boolean) {
+    const parent = sessions.get(sessionId);
+    if (!parent) throw new Error("Unknown fixture parent");
+    const shellId = mint("sh");
+    const callId = mint("call");
+    const created = now();
+    const message: StoredMessage = { id: mint("msg"), type: "assistant", time: { created }, content: [{ type: "tool", id: callId, name: "shell", time: { created }, state: { status: background ? "completed" : "running", input: { command: "printf 'safe shell output'" }, metadata: { shellID: shellId, status: "running" }, content: background ? [{ type: "text", text: "Command moved to the background." }] : [] } }] };
+    shells.set(shellId, { parent, message, background, removed: false, exited: false, waiter: "pending", captured: false, captureBeforeRemove: false, output: "safe shell output" });
+    parent.messages.push(message);
+    emit("session.message.content.updated", { sessionID: sessionId, messageID: message.id, content: message.content });
+    return { shellId, taskId: `v2:${sessionId}:${callId}` };
+  }
+
+  // Pinned 2.0.29 removal deletes registry/output and fails a pending waiter.
+  // The plugin's later capture (not DELETE or shell.deleted) produces the
+  // source-shaped error. Exit and capture are deliberately separate controls.
+  function shellPhase(shellId: string, phase: "exit" | "capture" | "captureBeforeRemove") {
+    const shell = shells.get(shellId);
+    if (!shell) throw new Error("Unknown fixture shell");
+    if (phase === "captureBeforeRemove") { shell.captureBeforeRemove = true; return; }
+    shell.exited = true;
+    if (shell.waiter === "pending") shell.waiter = "exited";
+    if (phase === "exit") { emit("shell.exited", { shellID: shellId }); return; }
+    if (shell.captured) return;
+    shell.captured = true;
+    const state = shell.output === null ? "error" : "completed";
+    const text = shell.output ?? "Shell not found: final output capture unavailable";
+    const entry: InboxEntry = { id: mint("msg"), sessionID: shell.parent.info.id, type: "synthetic", delivery: "steer", time: { created: now() }, payload: { text: `<shell id="${shellId}" state="${state}">\n${text}\n</shell>`, metadata: { source: "shell", shellID: shellId, jobID: shellId, state, ...(state === "completed" ? { exit: 0 } : {}) } } };
+    shell.parent.inbox.push(entry);
+    emit("session.inbox.enqueued", { sessionID: shell.parent.info.id, inboxID: entry.id, item: entry });
   }
 
   const scoped = (data: unknown) => Response.json({ location: { directory }, data });
@@ -242,8 +323,10 @@ export function startOpenCodeV2Fake(options: { directory: string; password?: str
     if (request.headers.get("authorization") !== authorization) return Response.json({ _tag: "UnauthorizedError", message: "unauthorized" }, { status: 401 });
     const url = new URL(request.url);
     const route = `${request.method} ${url.pathname}`;
+    calls.push(`${route}${url.search}`);
     const body = request.method === "GET" || request.method === "DELETE" ? {} : await request.json().catch(() => ({})) as Record<string, unknown>;
-    if (route === "GET /api/event") return eventStream(request.signal);
+    if (route === "GET /api/event") return eventsPaused ? new Response("Fixture event connection unavailable", { status: 503 }) : eventStream(request.signal);
+    if (route === "GET /api/session/active") return enveloped(Object.fromEntries([...sessions.values()].filter(session => session.running).map(session => [session.info.id, { status: "running" }])));
     if (route === "GET /api/agent") return scoped(AGENTS);
     if (route === "GET /api/command" || route === "GET /api/skill" || route === "GET /api/mcp" || route === "GET /api/form" || route === "GET /api/permission/request") return scoped([]);
     if (route === "GET /api/model") return scoped(MODELS);
@@ -263,6 +346,29 @@ export function startOpenCodeV2Fake(options: { directory: string; password?: str
       return Response.json({ data: listed, cursor: { next: null } });
     }
     if (route === "POST /api/session") return enveloped(createSession(body).info);
+    const shellMatch = /^\/api\/shell\/([^/]+)(\/output)?$/.exec(url.pathname);
+    if (shellMatch) {
+      const id = decodeURIComponent(shellMatch[1]!);
+      const shell = shells.get(id);
+      if (request.method === "DELETE") {
+        if (shell) {
+          if (shell.captureBeforeRemove) shellPhase(id, "capture");
+          shell.removed = true; shell.output = null;
+          if (shell.waiter === "pending") shell.waiter = "failed";
+          emit("shell.deleted", { shellID: id });
+        }
+        if (loseWorker) { loseWorker = false; return new Response("truncated response", { status: 502 }); }
+        return noContent();
+      }
+      if (!shell || shell.removed) return Response.json({ _tag: "ShellNotFoundError", id }, { status: 404 });
+      if (shellMatch[2]) {
+        const output = shell.output ?? "";
+        const cursor = Math.min(Number(url.searchParams.get("cursor") ?? 0), output.length);
+        const limit = Number(url.searchParams.get("limit") ?? output.length);
+        return scoped({ output: output.slice(cursor, cursor + limit), size: output.length, cursor: output.length, truncated: false });
+      }
+      return scoped({ id, status: shell.exited ? "exited" : "running", metadata: { sessionID: shell.parent.info.id } });
+    }
     if (url.pathname.startsWith("/api/permission/request/") && request.method === "POST") return noContent();
 
     const match = /^\/api\/session\/([^/]+)(?:\/(.*))?$/.exec(url.pathname);
@@ -318,7 +424,20 @@ export function startOpenCodeV2Fake(options: { directory: string; password?: str
     }
     if (sub === "POST interrupt") {
       const wasRunning = session.running;
-      if (wasRunning) {
+      if (wasRunning && !workers.has(sessionID)) {
+        // Native jobs.cancel(parent) cancels only jobs still blocking it.
+        // Detached jobs are no longer in that scope. Foreground cancellation
+        // settles its tool, not a background synthetic completion.
+        for (const worker of workers.values()) {
+          if (worker.parent !== session || worker.background || worker.settled) continue;
+          worker.settled = true;
+          worker.child.running = false;
+          emit("session.execution.interrupted", { sessionID: worker.child.info.id, reason: "user" }, false);
+          const part = (worker.message.content as Array<{ state: { status: string; error?: string } }>)[0]!;
+          part.state.status = "error";
+          part.state.error = "Interrupted with parent";
+          emit("session.message.content.updated", { sessionID, messageID: worker.message.id, content: worker.message.content });
+        }
         session.running = false;
         emit("session.execution.interrupted", { sessionID, reason: "user" }, false);
       }
@@ -326,7 +445,28 @@ export function startOpenCodeV2Fake(options: { directory: string; password?: str
       if (url.searchParams.get("resume") === "true" && session.inbox.some(entry => entry.delivery === "steer")) {
         startTurn(session, entry => entry.delivery === "steer");
       }
+      if (workers.has(sessionID) && loseWorker) { loseWorker = false; return new Response("truncated response", { status: 502 }); }
       return Response.json({ interrupted: wasRunning });
+    }
+    if (sub === "POST background") {
+      for (const shell of shells.values()) {
+        if (shell.parent !== session || shell.background || shell.captured) continue;
+        shell.background = true;
+        const part = (shell.message.content as Array<{ state: { status: string; content: unknown[] } }>)[0]!;
+        part.state.status = "completed";
+        part.state.content = [{ type: "text", text: "Command moved to the background." }];
+        emit("session.message.content.updated", { sessionID, messageID: shell.message.id, content: shell.message.content });
+      }
+      for (const worker of workers.values()) {
+        if (worker.parent !== session || worker.background || worker.settled) continue;
+        worker.background = true;
+        const part = (worker.message.content as Array<{ state: { status: string; content: unknown[] } }>)[0]!;
+        part.state.status = "completed";
+        part.state.content = [{ type: "text", text: "The subagent is working in the background. You will be notified automatically." }];
+        emit("session.message.content.updated", { sessionID, messageID: worker.message.id, content: worker.message.content });
+      }
+      if (loseBackground) { loseBackground = false; return new Response("truncated response", { status: 502 }); }
+      return noContent();
     }
     if (sub === "GET inbox") return Response.json({ data: session.inbox });
     const inboxMatch = /^(DELETE|PATCH) inbox\/(.+)$/.exec(sub);
@@ -397,6 +537,34 @@ export function startOpenCodeV2Fake(options: { directory: string; password?: str
       sessions.clear();
       raceOnCancel.clear();
       unhandled.length = 0;
+      calls.length = 0;
+      workers.clear();
+      shells.clear();
+      loseBackground = false;
+      loseWorker = false;
+      eventsPaused = false;
+    },
+    launchWorker,
+    launchShell,
+    shellPhase,
+    settleWorker,
+    disconnect: closeStreams,
+    pauseEvents(paused) { eventsPaused = paused; if (paused) closeStreams(); },
+    appendHistory(sessionId, count) {
+      const session = sessions.get(sessionId);
+      if (!session) throw new Error("Unknown fixture history owner");
+      for (let index = 0; index < Math.min(120, count); index++) {
+        session.messages.push({ id: mint("msg"), type: "user", text: `Historical fixture prompt ${index}`, time: { created: now() } });
+        session.messages.push({ id: mint("msg"), type: "assistant", time: { created: now() }, content: [{ id: mint("part"), type: "text", text: `Historical fixture answer ${index}` }] });
+      }
+      emit("session.message.content.updated", { sessionID: sessionId, messageID: session.messages.at(-1)!.id, content: session.messages.at(-1)!.content });
+    },
+    loseNextBackgroundResponse() { loseBackground = true; },
+    loseNextWorkerResponse() { loseWorker = true; },
+    wakeParent(sessionId) {
+      const session = sessions.get(sessionId);
+      if (!session || session.running || !session.inbox.some(entry => entry.type === "synthetic")) throw new Error("No pending native completion to wake parent");
+      startTurn(session);
     },
     step(sessionId) {
       const session = sessions.get(sessionId);
@@ -421,7 +589,7 @@ export function startOpenCodeV2Fake(options: { directory: string; password?: str
           messages: session.messages.map(message => ({ id: message.id, type: message.type, ...(message.type === "user" ? { text: message.text } : {}) })),
         };
       }
-      return { sessions: result, unhandled: [...unhandled] };
+      return { eventSubscribers: subscribers.size, sessions: result, shells: Object.fromEntries([...shells].map(([id, shell]) => [id, { removed: shell.removed, waiter: shell.waiter, captured: shell.captured, outputAvailable: shell.output !== null }])), unhandled: [...unhandled], calls: [...calls] };
     },
     async stop() {
       clearInterval(keepalive);

@@ -4,6 +4,7 @@ import { NotificationFeed } from "./notification-feed";
 import { qualifyNotificationEvent } from "./notifications";
 import type { WorkspaceChatService } from "./service";
 import { ConversationNotFoundError } from "./workspace";
+import { BackgroundTasksUnsupportedError } from "./adapter";
 import type {
   AgentChatStatus,
   BackgroundTaskOutput,
@@ -124,6 +125,7 @@ export interface MultiAgentWorkspaceChatService {
   respondPermission(id: string, interactionId: string, requestId: string, outcome: PermissionOutcome, choiceId?: string): Promise<{ outcome: PermissionOutcome }>;
   respondQuestion(id: string, interactionId: string, requestId: string, outcome: QuestionOutcome): Promise<{ outcome: QuestionOutcome }>;
   stopTask(id: string, taskId: string, requestId: string): Promise<{ stopped: true }>;
+  backgroundBlockingWork?(id: string, requestId: string): Promise<{ accepted: true }>;
   release(id: string, requestId: string): Promise<{ released: true }>;
   cancelWakeup(id: string, wakeupId: string, requestId: string): Promise<{ cancelled: true }>;
   taskOutput(id: string, taskId: string, options: { tailBytes: number }): Promise<BackgroundTaskOutput | null>;
@@ -414,6 +416,12 @@ export class MultiAgentChatService implements MultiAgentWorkspaceChatService {
   async stopTask(id: string, taskId: string, requestId: string) {
     const { agent, conversationId } = this.resolve(id);
     return agent.service.stopTask(conversationId, taskId, requestId);
+  }
+
+  async backgroundBlockingWork(id: string, requestId: string) {
+    const { agent, conversationId } = this.resolve(id);
+    if (!agent.service.backgroundBlockingWork) throw new BackgroundTasksUnsupportedError();
+    return agent.service.backgroundBlockingWork(conversationId, requestId);
   }
 
   async release(id: string, requestId: string) {

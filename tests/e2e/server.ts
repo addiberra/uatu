@@ -189,7 +189,7 @@ const dualAgentRouter = new MultiAgentChatService({
 // reset, so every test starts with a fresh adapter over an empty server.
 const openCodeV2Fake = startOpenCodeV2Fake({ directory: E2E_WORKSPACE_ROOT });
 let openCodeV2Router: MultiAgentChatService | null = null;
-function openCodeV2Stack(): MultiAgentChatService {
+function openCodeV2Stack(backgroundPreview = true): MultiAgentChatService {
   if (openCodeV2Router) return openCodeV2Router;
   const ready = { state: "ready" as const, version: "2.0.28" };
   const runtime: AgentRuntime = {
@@ -197,7 +197,15 @@ function openCodeV2Stack(): MultiAgentChatService {
     ensure: async () => ready,
     restart: async () => ready,
     dispose: async () => undefined,
-    createProvider: () => createOpenCodeV2Provider({ endpoint: openCodeV2Fake.url, password: openCodeV2Fake.password, directory: E2E_WORKSPACE_ROOT }),
+    createProvider: () => {
+      const provider = createOpenCodeV2Provider({ endpoint: openCodeV2Fake.url, password: openCodeV2Fake.password, directory: E2E_WORKSPACE_ROOT });
+      // Only the negative capability test hides the production declarations.
+      if (!backgroundPreview) {
+        const describe = provider.describe.bind(provider);
+        provider.describe = () => ({ ...describe(), capabilities: describe().capabilities.filter(capability => capability !== "background-tasks" && capability !== "background-blocking-work") });
+      }
+      return provider;
+    },
   };
   const service = new LazyChatService({
     workspacePath: E2E_WORKSPACE_ROOT,
@@ -454,7 +462,13 @@ async function handleE2EChat(request: Request): Promise<Response> {
     // The real 2.x stack: which router `agents` selects, and the scripted
     // fake OpenCode's controls (`opencode` action).
     stack?: "opencode-v2";
-    op?: "step" | "finish" | "raceDeliverOnCancel" | "state";
+    backgroundPreview?: boolean;
+    op?: "step" | "finish" | "raceDeliverOnCancel" | "state" | "launchWorker" | "settleWorker" | "disconnect" | "pauseEvents" | "reconnectEvents" | "appendHistory" | "loseBackgroundResponse" | "loseWorkerResponse" | "launchShell" | "shellPhase" | "wakeParent";
+    shellId?: string;
+    shellPhase?: "exit" | "capture" | "captureBeforeRemove";
+    background?: boolean;
+    workerState?: "completed" | "error" | "cancelled";
+    childId?: string;
     inboxId?: string;
   };
   // The chat wire is agent-qualified ("opencode:<id>") while the fake works
@@ -487,7 +501,7 @@ async function handleE2EChat(request: Request): Promise<Response> {
   const targetFake = body.agent === "claude" ? fakeSecondAgent : fakeChatAgent;
   switch (body.action) {
     case "agents": {
-      const next = body.stack === "opencode-v2" ? openCodeV2Stack() : body.count === 2 ? dualAgentRouter : singleAgentRouter;
+      const next = body.stack === "opencode-v2" ? openCodeV2Stack(body.backgroundPreview) : body.count === 2 ? dualAgentRouter : singleAgentRouter;
       if (next !== activeChatRouter) {
         // Existing SSE subscriptions are bound to their original router;
         // changing the delegating proxy only affects new requests.
@@ -501,6 +515,34 @@ async function handleE2EChat(request: Request): Promise<Response> {
     // ids arrive qualified or bare; the fake works in bare session ids.
     case "opencode":
       switch (body.op) {
+        case "wakeParent":
+          if (body.conversationId) { openCodeV2Fake.wakeParent(body.conversationId); return Response.json({ ok: true }); }
+          break;
+        case "launchShell":
+          if (body.conversationId) return Response.json(openCodeV2Fake.launchShell(body.conversationId, body.background !== false));
+          break;
+        case "shellPhase":
+          if (body.shellId && body.shellPhase) { openCodeV2Fake.shellPhase(body.shellId, body.shellPhase); return Response.json({ ok: true }); }
+          break;
+        case "launchWorker":
+          if (body.conversationId) return Response.json(openCodeV2Fake.launchWorker(body.conversationId, body.background !== false, body.childId));
+          break;
+        case "settleWorker":
+          if (body.childId) { openCodeV2Fake.settleWorker(body.childId, body.workerState ?? "completed", body.text ?? "Fixture checked."); return Response.json({ ok: true }); }
+          break;
+        case "disconnect":
+          openCodeV2Fake.disconnect(); return Response.json({ ok: true });
+        case "pauseEvents":
+          openCodeV2Fake.pauseEvents(true); return Response.json({ ok: true });
+        case "reconnectEvents":
+          openCodeV2Fake.pauseEvents(false); return Response.json({ ok: true });
+        case "appendHistory":
+          if (body.conversationId) { openCodeV2Fake.appendHistory(body.conversationId, body.count ?? 60); return Response.json({ ok: true }); }
+          break;
+        case "loseBackgroundResponse":
+          openCodeV2Fake.loseNextBackgroundResponse(); return Response.json({ ok: true });
+        case "loseWorkerResponse":
+          openCodeV2Fake.loseNextWorkerResponse(); return Response.json({ ok: true });
         case "step":
           if (body.conversationId) return Response.json(openCodeV2Fake.step(body.conversationId));
           break;

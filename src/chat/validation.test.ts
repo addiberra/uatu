@@ -379,6 +379,9 @@ describe("chat domain validation", () => {
     expect(() => parseConversationItem({ ...superset, session: { ...superset.session, behaviors: {} } })).toThrow(/unknown context report session field/);
     expect(parseConversationItem({ id: "t", type: "tool", createdAt: 1, name: "Bash", status: "running", elapsedMs: 1200 })).toBeTruthy();
     expect(parseConversationItem({ id: "task:1", type: "background_task", createdAt: 1, taskId: "1", description: "d", status: "running" })).toBeTruthy();
+    expect(parseConversationItem({ id: "task:1", type: "background_task", createdAt: 1, taskId: "1", description: "d", status: "running", stateUncertain: true })).toHaveProperty("stateUncertain", true);
+    expect(parseConversationItem({ id: "task:1", type: "background_task", createdAt: 1, taskId: "1", description: "d", status: "completed", resultId: "notification-1", toolUseIds: ["call-1", "call-2"] })).toHaveProperty("toolUseIds", ["call-1", "call-2"]);
+    expect(() => parseConversationItem({ id: "task:1", type: "background_task", createdAt: 1, taskId: "1", description: "d", status: "running", stateUncertain: "true" })).toThrow();
     expect(() => parseConversationItem({ id: "task:1", type: "background_task", createdAt: 1, taskId: "1", description: "d", status: "paused" })).toThrow(/background task status/);
   });
 

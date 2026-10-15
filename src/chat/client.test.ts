@@ -12,6 +12,17 @@ afterEach(() => {
 });
 
 describe("chat API client", () => {
+  test("explicit backgrounding uses the qualified base path and never replays an unknown response", async () => {
+    Reflect.set(globalThis, "document", { querySelector: () => ({ getAttribute: () => "/s/work/" }) });
+    resetAppBasePathForTests();
+    const calls: Array<{ url: string; body: unknown }> = [];
+    const client = new ChatApiClient((async (url, init) => {
+      calls.push({ url: String(url), body: JSON.parse(String(init?.body)) });
+      return Response.json({ error: "Outcome unknown", code: "operation_outcome_unknown" }, { status: 409 });
+    }) as typeof fetch);
+    await expect(client.backgroundBlockingWork("opencode:c/1", "r1")).rejects.toMatchObject({ status: 409, code: "operation_outcome_unknown" });
+    expect(calls).toEqual([{ url: "/s/work/api/chat/conversations/opencode%3Ac%2F1/background", body: { requestId: "r1" } }]);
+  });
   test("read deadlines release even fetchers and bodies that ignore cancellation", async () => {
     let signal: AbortSignal | null | undefined;
     const hanging = new ChatApiClient(async (_url, init) => {

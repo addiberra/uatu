@@ -89,7 +89,7 @@ Each slice is written test first: write the named test and watch it fail, implem
   Implement until the tests pass.
 - [x] 6.3 Wire the composer in `src/chat/ui.ts`:
   - Enter and ⌥Enter choose the delivery while a `steering` conversation is busy;
-  - the delivery menu sits inside the Send/Cancel footprint (`src/index.html`, `src/styles.css`);
+   - the original inside-footprint menu is superseded by the approved separate delivery/Send/Stop controls in section 9 (`src/index.html`, `src/styles.css`);
   - dock actions call the new client operations;
   - Edit loads the composer only after a successful withdrawal;
   - a 409 already-delivered answer shows "Too late — already delivered";
@@ -121,7 +121,28 @@ Each slice is written test first: write the named test and watch it fail, implem
 - [x] 8.2 Update `ARCHITECTURE.md` where it describes the chat queue (steer ownership, dock), and the `src/chat/` entry in `CLAUDE.md` if the module map changes. Verify by review.
 - [ ] 8.3 Run `bun run test:ci`, `bun run test:e2e`, and `bun run build`. All must pass.
 
-  Verification (2026-10-15): the final steering/queue/panel browser selection
+  Latest verification (2026-10-15 continuation): installed the project's
+  approved WebKit 26.6 (Playwright build 2359). Clean-tool-environment full
+  CI passed: 5088 passed, 16 skipped, 0 failed across 285 files. Build,
+  typecheck, and strict OpenSpec validation passed. Full E2E completed with
+  941 passed, 4 failed, and 6 not run (the serial inventory suite stopped
+  after its failure). All steering, OpenCode fake-stack, and queue scenarios
+  passed in that run, including WebKit performance scenarios elsewhere.
+  The four failures were remote conversation creation, variant-without-model
+  validation (401 instead of 400), lazy chat startup (one status call instead
+  of zero), and desktop worktree live-inventory message count. Repeating
+  those tests three times (including the worktree touch counterpart) passed
+  14/15; variant validation again received 401 once. Authentication behavior
+  and test assertions were not weakened or changed. A subsequent complete
+  inventory-file recheck passed 17/17, including the six previously not run.
+  This is not a passing
+  full E2E run, so the task remains open. Latest logs in the approved temporary
+  `opencode/` directory: `steering-continuation-ci.log`,
+  `steering-continuation-e2e.log`, `steering-continuation-rechecks.log`, and
+  `steering-continuation-build.log`; the inventory recheck is recorded in
+  `steering-continuation-inventory.log`.
+
+  Earlier verification (2026-10-15): the final steering/queue/panel browser selection
   passed 49/49, including Undo and rail stability; build and typecheck passed.
   The clean-tool-environment full CI run had 5087 passed, 16 skipped, and one
   native file-observer deletion timeout (its isolated file recheck passed
@@ -133,7 +154,7 @@ Each slice is written test first: write the named test and watch it fail, implem
   `steering-full-e2e.log`, `steering-file-observer-recheck.log`, and
   `steering-e2e-failure-recheck.log` in the session's approved temporary
   `opencode/` directory. No browser installation was attempted.
-- [ ] 8.4 Do one manual pass against a real OpenCode 2.0.28 binary (`bun run dev`):
+- [ ] 8.4 Do one manual pass against a real OpenCode 2.0.29 binary (`bun run dev`; target change approved 2026-10-15):
   - steer mid-turn;
   - steer → queue before the boundary;
   - the already-delivered race;
@@ -142,6 +163,89 @@ Each slice is written test first: write the named test and watch it fail, implem
 
   Record the results in the PR body.
 
-  Verification blocker (2026-10-15): the installed `opencode --version` reports
-  `opencode v2.0.29`, not the required 2.0.28. No alternative binary was
-  installed, and scripted fake-server checks do not satisfy this manual pass.
+  Target update (2026-10-15): the installed `opencode --version` reports
+  `opencode v2.0.29`, now the approved real manual target. The SDK and fake
+  server remain pinned to 2.0.28. No alternative binary was installed, and
+  scripted fake-server checks do not satisfy this manual pass.
+
+  Manual verification blocker (2026-10-15 continuation): `bun run dev
+  --no-open` started the real dev hub and registered `watch-docs`, but the
+  interactive browser tool could not navigate because its separate
+  `chrome-for-testing` executable (`chromium-1246`) is missing. Only the
+  project's WebKit installation was approved and installed; no additional
+  browser was installed. The dev hub was stopped. None of the five real
+  manual scenarios above was exercised, so this task remains open.
+  Startup evidence: `steering-continuation-dev.log` in the approved temporary
+  `opencode/` directory; browser navigation returned the missing-executable
+  error directly.
+
+## 9. Approved composer safety and discoverability revision (2026-10-15)
+
+- [x] 9.1 Test first and implement persistent visible Send, selection-only Steer/Queue, and separate Stop. Preserve idle submission, Enter/Option+Enter, attachments, draft recovery, prior dock fixes, and non-steering busy enqueue. Keep capability gating and device preference.
+- [x] 9.2 Verify desktop and installed Chromium/WebKit touch browsers: 44px targets, 8px gaps, no mutation from selection or gap taps, explicit Send/Stop actions, focus/keyboard behavior, and stable geometry at 320px/390px and desktop widths. Adapt existing cancellation and rail tests without dropping their behavioral coverage.
+- [x] 9.3 Update proposal/design/delta specs and architecture; run focused unit and browser regressions, typecheck, build, and strict OpenSpec validation. Record results without closing outstanding full-suite or real-agent verification tasks.
+- [x] 9.4 Refresh only the approved parallel hub on 4703 and its workspace child after ownership/configuration checks; preserve auth/state/Tailscale routes and verify the served bundle locally and through 8443. No paid prompts.
+
+  Verification: the first new behavior test failed on the missing Stop control
+  (`send-stop-red.log`) before implementation, then passed. Touch gap tests
+  exposed native tap retargeting onto Send; raw-touch bounds checking fixed
+  that behavior in both installed Chromium 1243 and WebKit 2359. The final
+  affected browser selection passed 196/197 tests. The sole failure was the
+  previously recorded lazy-chat-startup assertion (`statusCalls` 1 instead
+  of 0), also failing an isolated recheck; its assertion remains unchanged.
+  All steering, queue, touch, panel, history, attachment, inventory,
+  OpenCode-v2 and Claude-polish scenarios passed. Focused unit tests passed
+  505/505 across seven files. Typecheck, build, strict OpenSpec validation,
+  and `git diff --check` passed. Build emitted the existing unsupported
+  `highlight` selector warnings. This was not a full-suite or real-agent pass.
+  Evidence in the approved temporary `opencode/` directory:
+  `send-stop-e2e-final.log`, `send-stop-unit.log`, `send-stop-typecheck.log`,
+  `send-stop-build.log`, and `send-stop-screenshots/` (desktop plus 320px/390px
+  Chromium/WebKit captures).
+
+  Initial refresh blocker (resolved below): preflight verified the isolated hub, its sole registered
+  workspace, and a completed conversation with zero pending messages.
+  Graceful SIGTERM stopped the workspace child and listener, but the hub
+  reported failed workspace-session cleanup and retained its state-root
+  lease. The restart script stopped rather than sending a forced second
+  signal. The deployed binary remained unchanged, with a backup retained;
+  the new build remained in `dist/uatu`. The parallel service was unavailable
+  pending bounded recovery; production processes were not signalled.
+  See `send-stop-restart.log`.
+
+  Recovery completed after lead confirmation: revalidated the exact retained
+  hub PID, no remaining children or workspace process, and no listener before
+  sending its documented second SIGTERM. Preserved the original environment
+  only in memory and restarted the same config/state with the verified build.
+  New isolated hub PID 79094 and workspace child PID 80113 are running. The
+  authenticated workspace-start API returned 200. Authenticated hub state,
+  workspace shell, JavaScript, and CSS returned 200 both locally on 4703 and
+  through the existing tailnet 8443 route. Both endpoints serve identical
+  JS/CSS hashes with separate Send/Stop, the delivery selector, touch-gap
+  guard, responsive large targets, and the prior replacement-warning fix.
+  Config, auth-session and registry file hashes and all Tailscale routes
+  remained unchanged. Production hub PID 17245 was untouched. No prompts
+  were submitted. Logs: `send-stop-recovery.log` and
+  `send-stop-hub-verify.log` in the approved temporary `opencode/` directory.
+
+- [x] 9.5 Close the independently reviewed cancellation-lock bypass at the shared submit handler. First reproduce delayed-cancel Enter and Alt+Enter submissions; verify both preserve the draft, send no prompt, and cannot leak an Alt override into the next submission. Run focused regressions, typecheck/build, then safely refresh only the isolated hub/workspace and verify its new served assets.
+
+  Both new tests first failed with the draft cleared during a held cancellation
+  request, then passed with the shared cancellation guard and synchronous
+  one-shot override consumption. Focused steering/queue/attachment/history
+  browser suites passed 59/59, including Chromium/WebKit touch; unit checks
+  passed 505/505. Typecheck, build, strict spec validation and diff checks
+  passed. This does not replace the outstanding full-suite/real-agent checks.
+  After confirming no active or pending work, the supported workspace-stop
+  API returned 200 and the isolated hub restarted gracefully without a forced
+  signal. Current hub PID 98776 and workspace child PID 98876 serve identical
+  corrected JS hashes locally on 4703 and through tailnet 8443; authenticated
+  shell/assets/state checks returned 200. Served code includes the shared
+  cancellation guard and consumes the override before that guard. Config,
+  auth-session and registry hashes and Tailscale routes remained unchanged;
+  production PID 17245 was untouched and no real agent prompts were sent.
+  Logs in the approved temporary `opencode/` directory:
+  `cancel-lock-red.log`, `cancel-lock-green.log`, `cancel-lock-e2e.log`,
+  `cancel-lock-unit.log`, `cancel-lock-typecheck.log`, `cancel-lock-build.log`,
+  `cancel-lock-stop.log`, `cancel-lock-restart.log`, and
+  `cancel-lock-hub-verify.log`.

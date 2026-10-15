@@ -70,7 +70,7 @@ test.describe("chat over the OpenCode 2.x stack", () => {
     await send(page, "Start the work");
     const items = page.locator("#chat-items");
     await expect(items).toContainText("Start the work");
-    await expect(page.locator("#chat-send")).toHaveAttribute("aria-label", "Cancel response");
+    await expect(page.locator("#chat-stop")).toBeEnabled();
     await expect.poll(async () => (await fakeState(request, conversationId))?.running).toBe(true);
 
     // A busy submission asking to queue: the workspace holds it in the dock.
@@ -91,7 +91,7 @@ test.describe("chat over the OpenCode 2.x stack", () => {
 
     await control(request, { action: "opencode", op: "finish", conversationId, text: "Second answer" });
     await expect(items).toContainText("Second answer");
-    await expect(page.locator("#chat-send")).not.toHaveAttribute("aria-label", "Cancel response");
+    await expect(page.locator("#chat-stop")).toBeDisabled();
 
     // History is OpenCode's stored messages, in order.
     await page.reload();

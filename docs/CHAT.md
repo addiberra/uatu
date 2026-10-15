@@ -56,6 +56,60 @@ conversation holds no process. Conversations resume from Claude Code's
 own session storage (`~/.claude/projects/...`), which uatu reads but
 never writes.
 
+### Background workers (OpenCode V2)
+
+OpenCode V2 exposes native background-worker inspection and controls. Automated
+acceptance uses source-shaped OpenCode 2.0.29 records with client 2.0.28.
+Isolated real-provider acceptance also passed native launch/completion, mixed
+worker/shell conversion, stop scopes and disconnect recovery on those versions.
+
+A background subagent's successful launch is not its finished result. Chat
+tracks its running, completed, failed, or stopped outcome separately, links the
+launcher to one result, and keeps its child transcript inspectable after it
+settles. Children need not appear in the conversation picker. Worker results
+are not editable steers and do not produce a successful-parent-turn push alert.
+The settled inspection strip links back to that result instead of repeating
+the report. Pending worker permissions/questions remain visible in workspace
+attention even before you open their parent conversation.
+
+When supported, **Continue while workers run** explicitly moves **all eligible
+blocking jobs in the parent**, including shell commands, to the background.
+It does not stop them, submit or clear your draft, or change delivery/model
+selection. Acceptance is not a worker count; nothing eligible is a valid no-op.
+Ordinary Send never backgrounds work automatically.
+
+**Stop parent** affects the current parent execution and its still-blocking
+dependencies, not detached workers. **Stop worker** targets that verified
+worker only. An accepted request stays **Stopping…** until the provider reports
+its outcome. A later provider-owned completion notification can wake the
+parent again; Stop is not a permanent ban on future turns.
+
+Stopping a shell removes its provider record and output. If removal prevents
+final capture, OpenCode can report **failed**, even after the process exited.
+An already confirmed completed report stays completed. Output already received
+can remain in the open view, but missing provider output cannot be recovered
+after reload; there is no persistent output archive.
+
+Reconnect reads history, pending results and current execution evidence.
+Complete history is reused only within a connected event generation, invalidated
+by session events, and reread after disconnection; execution/inbox evidence stays fresh.
+Missing evidence means **Status unavailable**, not finished or cancelled; an
+unverified worker cannot be stopped. This is not a promise of execution survival
+across service restarts. Reused child sessions can have ambiguous results, and
+the native interruption API cannot atomically lock a particular execution
+generation against an external continuation.
+
+If a response is lost, Chat reports **Outcome unknown** and refreshes without
+replaying the mutation. Same-request retries are deduplicated only while the
+in-memory receipt exists: by default up to 15 minutes after settlement, possibly
+less under capacity pressure, and never across adapter/process restart.
+
+**Optional workflow tip:** Prefer background subagents for independent work
+when useful, non-overlapping work can continue. Keep dependent work foreground;
+avoid overlapping writes or use isolated worktrees. Rely on completion
+notifications rather than polling. This is advice, not an always-background
+policy: Chat does not install instructions or change agent/model defaults.
+
 ### Scheduled wakeups (Claude Code)
 
 Claude Code can schedule a future turn for itself with `ScheduleWakeup`,

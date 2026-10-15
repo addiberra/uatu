@@ -310,6 +310,13 @@ export class ChatApiClient {
     return this.mutate(appUrl(`/api/chat/conversations/${encodeURIComponent(conversationId)}/tasks/${encodeURIComponent(taskId)}/stop`), { requestId }, value => value);
   }
 
+  backgroundBlockingWork(conversationId: string, requestId: string): Promise<{ accepted: true }> {
+    return this.mutate(appUrl(`/api/chat/conversations/${encodeURIComponent(conversationId)}/background`), { requestId }, value => {
+      if (!value || typeof value !== "object" || (value as { accepted?: unknown }).accepted !== true || Object.keys(value).length !== 1) throw new Error("Invalid background acceptance");
+      return { accepted: true };
+    });
+  }
+
   cancelWakeup(conversationId: string, wakeupId: string, requestId: string): Promise<unknown> {
     return this.mutate(appUrl(`/api/chat/conversations/${encodeURIComponent(conversationId)}/wakeups/${encodeURIComponent(wakeupId)}/cancel`), { requestId }, value => value);
   }

@@ -42,6 +42,23 @@ type Inventory = { operations: Array<{ operationId: string; domain: string; meth
 type Streaming = { channels: Record<string, unknown>; schemas: Record<string, object> };
 
 describe("API contract structure", () => {
+  test("background task uncertainty and child inspection agree across strict wire validators", async () => {
+    const { parseConversationItem } = await import("../src/chat/validation");
+    const openapi = await readYaml<{ components: { schemas: Record<string, object> } }>("api/openapi.yaml");
+    const validate = createAjv().compile(schemaForAjv(openapi.components.schemas.ConversationItem, openapi.components.schemas));
+    const item = { id: "task:worker", type: "background_task", taskId: "worker", createdAt: 1, description: "Inspect fixture", status: "running", childConversationId: "opencode:child", subagentType: "Explore", prompt: "Inspect fixture", stateUncertain: true };
+    expect(parseConversationItem(item)).toEqual(item);
+    expect(validate(item), JSON.stringify(validate.errors)).toBe(true);
+    expect(validate({ ...item, stateUncertain: "true" })).toBe(false);
+    expect(() => parseConversationItem({ ...item, stateUncertain: "true" })).toThrow();
+    const result = { ...item, resultId: "result-1", toolUseIds: ["call-1", "call-2"] };
+    expect(parseConversationItem(result)).toEqual(result);
+    expect(validate(result), JSON.stringify(validate.errors)).toBe(true);
+    for (const invalid of [{ ...result, resultId: "" }, { ...result, toolUseIds: [] }, { ...result, toolUseIds: [12] }]) {
+      expect(validate(invalid)).toBe(false);
+      expect(() => parseConversationItem(invalid)).toThrow();
+    }
+  });
   test("metadata, schemas, and all source examples validate", async () => {
     await validateApi();
     // CPU-bound: about a second alone, several when other test files share the

@@ -5355,7 +5355,7 @@ html[data-ui-mode="desktop"][data-notification-chat] .chat-expand-strip {
 
 .chat-composer-actions {
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr) 2.25rem 2.55rem;
+  grid-template-columns: auto minmax(0, 1fr) 2.25rem auto;
   align-items: center;
   gap: 0.5rem;
 }
@@ -5369,7 +5369,7 @@ html[data-ui-mode="desktop"][data-notification-chat] .chat-expand-strip {
    a leading fixed column; without it the four-column layout above stands, so
    capability removal never leaves a hole in the grid. */
 .chat-composer-actions:has(> .chat-attach-button) {
-  grid-template-columns: 2.25rem auto minmax(0, 1fr) 2.25rem 2.55rem;
+  grid-template-columns: 2.25rem auto minmax(0, 1fr) 2.25rem auto;
 }
 .chat-composer-actions:has(> .chat-attach-button) > .chat-attach-button { grid-column: 1; }
 .chat-composer-actions:has(> .chat-attach-button) > .chat-context-usage { grid-column: 2; }
@@ -6870,42 +6870,43 @@ html[data-ui-mode="desktop"][data-notification-chat] .chat-expand-strip {
   background: var(--accent);
 }
 
-/* Icon-only in both chromes: the up arrow IS the action, in the accent blue
-   for send and queue alike — the aria-label and title state which one this
-   press is, and the label span stays in the DOM for assistive tech. */
+/* Send never becomes Stop. Each action has a labelled, separate touch target. */
 #chat-send {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 2.55rem;
-  height: 2.55rem;
-  min-height: 2.55rem;
-  border-radius: 999px;
+  width: 3.5rem;
+  height: 44px;
+  min-height: 44px;
+  min-width: 44px;
+  border-radius: 0.5rem;
   padding: 0;
 }
 
-/* The group is exactly the button's footprint; the delivery toggle and its
-   menu are positioned over and above it, so showing them moves nothing. */
+/* Fixed targets and real empty gaps: no overlapping cancellation hit area. */
 .chat-send-group {
   position: relative;
   display: inline-flex;
-  width: 2.55rem;
-  height: 2.55rem;
+  gap: 8px;
+  align-items: center;
+  height: 44px;
 }
 
 .chat-delivery-toggle {
-  position: absolute;
-  right: -0.15rem;
-  bottom: -0.15rem;
-  display: inline-grid;
-  place-items: center;
-  width: 1.1rem;
-  height: 1.1rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.3rem;
+  width: 5rem;
+  height: 44px;
+  min-width: 44px;
   padding: 0;
-  border: 1px solid var(--surface-raised);
-  border-radius: 999px;
-  background: var(--text-strong);
-  color: var(--surface-raised);
+  border: 1px solid var(--border-medium);
+  border-radius: 0.5rem;
+  background: var(--surface);
+  color: var(--text-strong);
+  font: inherit;
+  font-size: 0.8em;
   cursor: pointer;
 }
 
@@ -6916,8 +6917,28 @@ html[data-ui-mode="desktop"][data-notification-chat] .chat-expand-strip {
 .chat-delivery-toggle:hover,
 .chat-delivery-toggle:focus-visible,
 .chat-delivery-toggle[aria-expanded="true"] {
-  background: var(--accent);
+  background: var(--surface-muted);
 }
+
+.chat-stop-button {
+  width: 3.25rem;
+  min-width: 44px;
+  height: 44px;
+  padding: 0;
+  border: 1px solid var(--border-medium);
+  border-radius: 0.5rem;
+  background: var(--surface);
+  color: var(--text-strong);
+  font: inherit;
+  font-size: 0.8em;
+  cursor: pointer;
+}
+
+.chat-stop-button:disabled,
+.chat-delivery-toggle:disabled { opacity: 0.5; cursor: default; }
+.chat-stop-button:hover:not(:disabled) { background: var(--surface-muted); }
+.chat-send-group button { touch-action: manipulation; }
+.chat-send-group button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
 .chat-delivery-menu {
   position: absolute;
@@ -6939,6 +6960,7 @@ html[data-ui-mode="desktop"][data-notification-chat] .chat-expand-strip {
 }
 
 .chat-delivery-menu [role="menuitemradio"] {
+  min-height: 44px;
   display: flex;
   flex-direction: column;
   align-items: flex-start;
@@ -6967,32 +6989,6 @@ html[data-ui-mode="desktop"][data-notification-chat] .chat-expand-strip {
 .chat-delivery-hint {
   color: var(--text-subtle);
   font-size: 0.75em;
-}
-
-#chat-send .chat-send-label {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  overflow: hidden;
-  clip: rect(0 0 0 0);
-  clip-path: inset(50%);
-  white-space: nowrap;
-}
-
-.chat-send-icon {
-  display: block;
-}
-
-.chat-send-cancel {
-  display: none;
-}
-
-#chat-send[data-action="cancel"] .chat-send-arrow {
-  display: none;
-}
-
-#chat-send[data-action="cancel"] .chat-send-cancel {
-  display: block;
 }
 
 /* The liveness pulse shared by the timeline's working line and the composer's
@@ -7070,6 +7066,7 @@ html[data-ui-mode="desktop"][data-notification-chat] .chat-expand-strip {
 }
 
 .chat-composer {
+  container: chat-composer / inline-size;
   position: relative;
   flex: 0 0 auto;
   padding: 0.75rem max(1rem, calc((100% - 52rem) / 2)) calc(0.75rem + env(safe-area-inset-bottom));
@@ -7493,15 +7490,6 @@ html[data-ui-mode="desktop"]:not(.uatu-desktop-host) .chat-composer {
 
 @container (min-width: 14rem) {
   .chat-configuration-details:not([hidden]) {
-    display: flex;
-  }
-}
-
-/* The attach control costs the rail its own column (~2.75rem with the gap),
-   so with it present the details threshold moves by the same amount — the
-   same panel width keeps showing the same information. */
-@container (min-width: 11.25rem) {
-  .chat-composer-actions:has(> .chat-attach-button) .chat-configuration-details:not([hidden]) {
     display: flex;
   }
 }
@@ -8687,7 +8675,7 @@ html[data-ui-mode="touch"] .chat-question-custom-editor input {
 }
 
 html[data-ui-mode="touch"] .chat-composer-actions {
-  grid-template-columns: auto minmax(0, 1fr) 2.25rem 2.55rem;
+  grid-template-columns: auto minmax(0, 1fr) 2.25rem auto;
   align-items: center;
   min-height: 2rem;
 }
@@ -8698,18 +8686,26 @@ html[data-ui-mode="touch"] .chat-composer-actions {
    assignments land in touch's four-column grid and squeeze the model name
    into a 2.25rem track. */
 html[data-ui-mode="touch"] .chat-composer-actions:has(> .chat-attach-button) {
-  grid-template-columns: 2.25rem auto minmax(0, 1fr) 2.25rem 2.55rem;
+  grid-template-columns: 2.25rem auto minmax(0, 1fr) 2.25rem auto;
 }
 
-html[data-ui-mode="touch"] #chat-send {
-  display: inline-grid;
-  place-items: center;
-  width: 2.55rem;
-  height: 2.55rem;
-  min-height: 2.55rem;
-  border-radius: 999px;
-  padding: 0;
-  touch-action: manipulation;
+/* At narrow panel widths, two deliberate rails keep settings usable without
+   shrinking the submission targets. This depends on width, never turn state. */
+@container chat-composer (max-width: 30rem) {
+  .chat-composer-actions,
+  html[data-ui-mode="touch"] .chat-composer-actions {
+    grid-template-columns: auto minmax(0, 1fr) 2.25rem;
+  }
+  .chat-composer-actions:has(> .chat-attach-button),
+  html[data-ui-mode="touch"] .chat-composer-actions:has(> .chat-attach-button) {
+    grid-template-columns: 2.25rem auto minmax(0, 1fr) 2.25rem;
+  }
+  .chat-composer-actions > .chat-send-group,
+  .chat-composer-actions:has(> .chat-attach-button) > .chat-send-group {
+    grid-column: 1 / -1;
+    grid-row: 2;
+    justify-self: end;
+  }
 }
 
 html[data-ui-mode="touch"] .chat-configuration-dialog {
@@ -9644,8 +9640,8 @@ html[data-ui-mode="touch"][data-chat-answering] #chat-drilldown-timeline {
 
 .chat-background-tasks li {
   display: flex;
-  align-items: baseline;
-  gap: 0.5rem;
+  align-items: center;
+  gap: 8px;
   min-width: 0;
 }
 
@@ -9660,6 +9656,8 @@ html[data-ui-mode="touch"][data-chat-answering] #chat-drilldown-timeline {
 .chat-background-task-progress {
   color: var(--text-subtle);
   font-size: 0.9em;
+  max-width: 35%;
+  overflow-wrap: anywhere;
 }
 
 /* The elapsed readout stands in for the progress note a shell task never
@@ -9674,7 +9672,8 @@ html[data-ui-mode="touch"][data-chat-answering] #chat-drilldown-timeline {
 .chat-background-task-inspect {
   border: 0;
   padding: 0;
-  min-height: 0;
+  min-height: 44px;
+  min-width: 44px;
   background: transparent;
   color: inherit;
   font: inherit;
@@ -9689,6 +9688,25 @@ html[data-ui-mode="touch"][data-chat-answering] #chat-drilldown-timeline {
   text-decoration-color: var(--accent);
 }
 
+.chat-background-action {
+  padding: 8px 12px;
+}
+.chat-background-action p {
+  margin: 4px 0;
+  font-size: 12px;
+}
+.chat-background-action button,
+.chat-drilldown-task-facts [data-task-result],
+.chat-task-stop {
+  min-width: 44px;
+  min-height: 44px;
+}
+.chat-background-action button:focus-visible,
+.chat-drilldown-task-facts [data-task-result]:focus-visible,
+.chat-task-stop:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: 2px;
+}
 .chat-task-stop {
   flex: 0 0 auto;
   padding: 0.15rem 0.5rem;

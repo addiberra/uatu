@@ -7,13 +7,14 @@ import { ConversationInventoryBroadcaster, type ConversationInventorySubscriptio
 import type { InboxDelta, NormalizedProviderEvent, NormalizedProviderUpdate, NormalizedSessionLifecycle } from "./provider";
 import { describeToolDetail } from "./tool-detail";
 import { mergeAssistantMessage, sameUsage, TOKEN_USAGE_COMPONENTS } from "./usage";
-import { ReversibleHistoryTargetError, UnsupportedVariantSelectionError, type ChatProvider, type ProviderAttachment, type ProviderPermissionReply, type ProviderSession } from "./provider";
+import { OperationOutcomeUnknownError, ReversibleHistoryTargetError, UnsupportedVariantSelectionError, type ChatProvider, type ProviderAttachment, type ProviderPermissionReply, type ProviderSession } from "./provider";
 import { IdempotencyReceipts } from "./receipts";
 import { ConversationReplay, type ReplaySubscription } from "./replay";
 import { ProviderTextReconciler } from "./text-reconciler";
 import { isLiveConversationStatus } from "./types";
 import type {
   BackgroundTaskOutput,
+  BackgroundTaskItem,
   ChatActivity,
   ChatAgent,
   ChatMode,
@@ -358,6 +359,13 @@ export class ChatAdapter {
   // still accept a prompt — while the hub's activity summary, by spec, counts
   // live background work as working.
   private readonly backgroundWork = new Set<string>();
+  private readonly backgroundRecoveries = new Map<string, { dirty: boolean; running: boolean; failures: number; timer?: ReturnType<typeof setTimeout> }>();
+  private backgroundRecoveryCount = 0;
+  private readonly backgroundPending = new Set<Promise<void>>();
+  private backgroundStreamGeneration = 0;
+  private backgroundConnected = false;
+  private backgroundReady?: Promise<void>;
+  private backgroundReadyResolve?: () => void;
   // Pending permission and question item ids per conversation, adapter-level
   // like liveTurns: a conversation blocked on the user goes quiet and is
   // exactly the one an LRU pass evicts, and its request must still count.
@@ -658,7 +666,38 @@ export class ChatAdapter {
     // Live background work is held by the provider, not the transcript: a
     // reopened conversation gets its running tasks from the provider's own
     // list so the composer shows the state it is actually in (spec).
-    const liveTasks = await this.liveBackgroundTasks(id);
+    // V2 supplies positive evidence, not an authoritative live-only list.
+    // An omitted worker or failed read must never manufacture cancellation.
+    if (this.provider.reconcileBackgroundTasks) {
+      let recovered: BackgroundTaskItem[];
+      try {
+        if (this.pumpPromise && !this.backgroundConnected) {
+          await this.backgroundReady;
+          if (!this.backgroundConnected) throw new Error("Background stream is disconnected");
+        }
+        recovered = await this.provider.reconcileBackgroundTasks(id);
+      }
+      catch { recovered = []; }
+      const byId = new Map(recovered.map(item => [item.id, item]));
+      const results = new Map(recovered.flatMap(item => item.resultId ? [[item.resultId, item.id] as const] : []));
+      const launches = new Map(recovered.flatMap(item => [...(item.toolUseIds ?? []), ...(item.toolUseId ? [item.toolUseId] : [])].map(call => [call, item.id] as const)));
+      for (const known of [...this.projection(id).items(), ...items]) {
+        if (known.type !== "background_task" || byId.has(known.id)) continue;
+        if (known.resultId && results.has(known.resultId) && results.get(known.resultId) !== known.id
+          || known.toolUseId && launches.has(known.toolUseId) && launches.get(known.toolUseId) !== known.id) {
+          this.projection(id).apply({ kind: "remove", itemId: known.id });
+          const index = items.findIndex(item => item.id === known.id);
+          if (index >= 0) items.splice(index, 1);
+          continue;
+        }
+        byId.set(known.id, known.status === "running" ? { ...known, stateUncertain: true } : known);
+      }
+      for (const task of byId.values()) {
+        const index = items.findIndex(item => item.id === task.id);
+        if (index < 0) items.push(task); else items[index] = task;
+      }
+    }
+    const liveTasks = this.provider.reconcileBackgroundTasks ? null : await this.liveBackgroundTasks(id);
     if (liveTasks !== null) {
       const live = new Set(liveTasks.map(task => task.id));
       for (const task of liveTasks) {
@@ -835,6 +874,7 @@ export class ChatAdapter {
       if (current?.type === "scheduled_wakeup" && (current.status === "fired" || current.status === "cancelled")) items[index] = current;
     }
     projection.seed(items);
+    if (this.provider.reconcileBackgroundTasks) this.syncBackgroundState(id);
     // A reopened conversation whose agent still holds live work is in the
     // background state, not idle: the list and the status must agree.
     if (items.some(item => item.type === "background_task" && !item.foreground && item.status === "running") && !isLiveConversationStatus(projection.status) && projection.status !== "background") {
@@ -963,6 +1003,7 @@ export class ChatAdapter {
     if (this.pumpPromise) return this.pumpPromise;
     const controller = new AbortController();
     this.pumpController = controller;
+    if (this.provider.reconcileBackgroundTasks) this.backgroundReady = new Promise(resolve => { this.backgroundReadyResolve = resolve; });
     this.pumpPromise = this.pump(controller.signal).finally(() => {
       // Abort on every exit, not just stopEventPump: when one merged provider
       // stream dies the other survives on this signal, and the supervisor's
@@ -985,6 +1026,8 @@ export class ChatAdapter {
   dispose(): Promise<void> {
     if (this.disposalPromise) return this.disposalPromise;
     this.disposed = true;
+    for (const recovery of this.backgroundRecoveries.values()) clearTimeout(recovery.timer);
+    this.backgroundRecoveries.clear();
     for (const pending of this.revertReconciliations.values()) {
       if (pending.timer !== null) clearTimeout(pending.timer);
     }
@@ -992,6 +1035,10 @@ export class ChatAdapter {
     this.inventory.dispose();
     // The provider's own resources retire with the adapter: live agent
     // sessions must not keep working with no event consumer left.
+    if (this.provider.reconcileBackgroundTasks) {
+      return this.disposalPromise = Promise.allSettled([this.stopEventPump(), this.provider.dispose?.()])
+        .then(() => Promise.allSettled(this.backgroundPending)).then(() => undefined);
+    }
     return this.disposalPromise = this.stopEventPump()
       .then(() => this.provider.dispose?.())
       .then(() => undefined, () => undefined);
@@ -1145,7 +1192,22 @@ export class ChatAdapter {
    */
   private async admitSteer(conversationId: string, requestId: string, text: string, attachmentRefs: MessageAttachment[], queuedAt = Date.now()): Promise<PendingSteer> {
     const providerAttachments = await this.locateAttachments(attachmentRefs);
-    const accepted = await this.provider.prompt(conversationId, { id: this.id(), text, delivery: "steer", ...(providerAttachments.length ? { attachments: providerAttachments } : {}) });
+    const projection = this.projection(conversationId);
+    const previousStatus = projection.status;
+    const waking = !this.turnActive(conversationId, projection);
+    // A steer can wake an interrupted turn, including an Undo replacement.
+    // Mark that admission before awaiting the provider: committing the revert
+    // can release the held queue before the stream reports the resumed turn.
+    // As with dispatchPrompt, a faster terminal event must win over acceptance.
+    if (waking) projection.statusUpdate("sending");
+    let accepted: { messageId: string };
+    try {
+      accepted = await this.provider.prompt(conversationId, { id: this.id(), text, delivery: "steer", ...(providerAttachments.length ? { attachments: providerAttachments } : {}) });
+      if (waking && projection.status === "sending") projection.statusUpdate("running");
+    } catch (error) {
+      if (waking && projection.status === "sending") projection.statusUpdate(previousStatus);
+      throw error;
+    }
     // The agent wakes for a steer: whatever was stranded delivers with it.
     this.lastSettledAt.delete(conversationId);
     const steers = this.pendingSteers.get(conversationId) ?? [];
@@ -2228,13 +2290,28 @@ export class ChatAdapter {
 
   private usageRead: { mode: UsageReadMode; promise: Promise<UsageReadResult> } | null = null;
 
-  stopTask(conversationId: string, taskId: string, clientRequestId: string): Promise<{ stopped: true }> {
-    return this.receipts.run(`stop-task:${conversationId}:${taskId}:${clientRequestId}`, async () => {
+  async stopTask(conversationId: string, taskId: string, clientRequestId: string): Promise<{ stopped: true }> {
+    const result = await this.receipts.run(`stop-task:${conversationId}:${taskId}:${clientRequestId}`, async () => {
       await this.requireSession(conversationId);
       if (!this.provider.stopTask || !this.provider.describe().capabilities.includes("background-tasks")) throw new BackgroundTasksUnsupportedError();
-      await this.provider.stopTask(conversationId, taskId);
+      try { await this.provider.stopTask(conversationId, taskId); }
+      catch (error) { if (error instanceof OperationOutcomeUnknownError) return { unknown: true as const }; throw error; }
       return { stopped: true as const };
     });
+    if ("unknown" in result) throw new OperationOutcomeUnknownError();
+    return result;
+  }
+
+  async backgroundBlockingWork(conversationId: string, requestId: string): Promise<{ accepted: true }> {
+    const result = await this.receipts.run(`background:${conversationId}:${requestId}`, () => this.enqueuePromptAdmission(conversationId, async () => {
+      await this.requireSession(conversationId);
+      if (!this.provider.backgroundBlockingWork || !this.agent().capabilities.includes("background-blocking-work")) throw new BackgroundTasksUnsupportedError();
+      try { await this.provider.backgroundBlockingWork(conversationId); }
+      catch (error) { if (error instanceof OperationOutcomeUnknownError) return { unknown: true as const }; throw error; }
+      return { accepted: true as const };
+    }));
+    if ("unknown" in result) throw new OperationOutcomeUnknownError();
+    return result;
   }
 
   /**
@@ -2823,6 +2900,7 @@ export class ChatAdapter {
         // whatever the coalescer buffered in its final window.
         const projection = this.projection(conversationId);
         for (const update of updates) projection.apply(update);
+        if (this.provider.reconcileBackgroundTasks) this.syncBackgroundState(conversationId);
         // A fast subagent can start and report inside one coalescer window:
         // its usage arrives while the parent's task row is still buffered, so
         // attributeSubagent found no row to decorate and only banked the
@@ -2849,6 +2927,28 @@ export class ChatAdapter {
     try {
       for await (const normalized of this.provider.events(signal)) {
         if (signal.aborted) break;
+        if (this.provider.reconcileBackgroundTasks && normalized.eventType === "server.connected") {
+          this.backgroundConnected = true;
+          this.backgroundReadyResolve?.();
+          this.backgroundReadyResolve = undefined;
+          this.backgroundStreamGeneration++;
+          this.drainBackgroundRecoveries();
+          // Only an initialized, connected provider is read. Activity itself
+          // remains memory-only and cannot start a runtime.
+          void this.provider.listSessions().then(async sessions => {
+            for (const session of sessions) {
+              if (signal.aborted || this.disposed) break;
+              if (!session.parentId && await this.isInWorkspace(session)) this.scheduleBackgroundRecovery(session.id);
+            }
+          }).catch(() => undefined);
+        }
+        const interactionUpdate = normalized.updates.some(update => update.kind === "upsert" && (update.item.type === "permission" || update.item.type === "question")
+          || update.kind === "remove" && /^(permission|question):/.test(update.itemId));
+        if (this.provider.reconcileBackgroundTasks && normalized.conversationId && (interactionUpdate || /^(session\.(inbox\.(enqueued|delivered)|tool\.success|message\.content\.updated|execution\.(succeeded|failed|interrupted)))$/.test(normalized.eventType))) {
+          void this.requireSession(normalized.conversationId).then(session => {
+            this.scheduleBackgroundRecovery(session.parentId ?? session.id);
+          }).catch(() => undefined);
+        }
         if (normalized.catalogsChanged) {
           this.catalogSequence += 1;
           this.inventory.invalidate();
@@ -2935,7 +3035,109 @@ export class ChatAdapter {
     } finally {
       coalescer.dispose();
       await coalescer.settled();
+      this.backgroundConnected = false;
+      this.backgroundReadyResolve?.();
+      this.backgroundReadyResolve = undefined;
+      this.backgroundStreamGeneration++;
+      for (const recovery of this.backgroundRecoveries.values()) { clearTimeout(recovery.timer); recovery.timer = undefined; }
+      if (this.provider.reconcileBackgroundTasks && !this.disposed) {
+        for (const projection of this.projections.values()) {
+          for (const item of projection.items()) if (item.type === "background_task" && item.status === "running") projection.apply({ kind: "upsert", item: { ...item, stateUncertain: true } });
+        }
+      }
       if (this.eventCoalescer === coalescer) this.eventCoalescer = null;
+    }
+  }
+
+  private scheduleBackgroundRecovery(id: string): void {
+    if (this.disposed || !this.provider.reconcileBackgroundTasks) return;
+    const existing = this.backgroundRecoveries.get(id);
+    if (existing) { existing.dirty = true; return; }
+    this.backgroundRecoveries.set(id, { dirty: true, running: false, failures: 0 });
+    this.drainBackgroundRecoveries();
+  }
+
+  private syncBackgroundState(id: string): void {
+    const projection = this.projection(id);
+    const running = projection.find(item => item.type === "background_task" && !item.foreground && item.status === "running") !== undefined;
+    if (running) this.backgroundWork.add(id); else this.backgroundWork.delete(id);
+    if (running && !isLiveConversationStatus(projection.status) && projection.status !== "background") projection.statusUpdate("background");
+    else if (!running && projection.status === "background") projection.statusUpdate("completed");
+    this.activityMayHaveChanged();
+  }
+
+  private drainBackgroundRecoveries(): void {
+    if (this.disposed || !this.backgroundConnected) return;
+    for (const [id, recovery] of this.backgroundRecoveries) {
+      if (this.backgroundRecoveryCount >= 4) break;
+      if (recovery.running || recovery.timer) continue;
+      recovery.running = true;
+      recovery.dirty = false;
+      this.backgroundRecoveryCount++;
+      const generation = this.backgroundStreamGeneration;
+      const interactionTick = this.interactionClock;
+      const pending = this.requireSession(id).then(() => {
+        if (this.disposed) throw new Error("Background recovery disposed");
+        return Promise.all([
+          this.provider.reconcileBackgroundTasks!(id),
+          Promise.allSettled([this.pendingPermissions(id), this.pendingQuestions(id)]),
+        ]);
+      }).then(([tasks, interactions]) => {
+        if (this.disposed || recovery.dirty || generation !== this.backgroundStreamGeneration) return;
+        const projection = this.projection(id);
+        const ids = new Set(tasks.map(task => task.id));
+        const results = new Map(tasks.flatMap(item => item.resultId ? [[item.resultId, item.id] as const] : []));
+        const launches = new Map(tasks.flatMap(item => [...(item.toolUseIds ?? []), ...(item.toolUseId ? [item.toolUseId] : [])].map(call => [call, item.id] as const)));
+        for (const known of projection.items()) {
+          if (known.type === "background_task" && (known.resultId && results.has(known.resultId) && results.get(known.resultId) !== known.id
+            || known.toolUseId && launches.has(known.toolUseId) && launches.get(known.toolUseId) !== known.id)) {
+            projection.apply({ kind: "remove", itemId: known.id });
+            continue;
+          }
+          if (known.type === "background_task" && known.status === "running" && !ids.has(known.id)) projection.apply({ kind: "upsert", item: { ...known, stateUncertain: true } });
+        }
+        for (const item of tasks) projection.apply({ kind: "upsert", item });
+        // Inventory recovery must expose already-pending child requests even
+        // when no parent is selected. Failed reads are unknown, not empty;
+        // stream generation/dirty fences above also govern these snapshots.
+        for (const [index, type] of (["permission", "question"] as const).entries()) {
+          if (!(type === "permission" ? this.provider.listPermissions : this.provider.listQuestions)) continue;
+          const result = interactions[index]!;
+          if (result.status !== "fulfilled") continue;
+          const live = new Set(result.value.map(item => item.id));
+          for (const known of projection.items()) {
+            if (known.type !== type || known.status !== "pending" || live.has(known.id)
+              || (this.announced.get(known.id)?.tick ?? 0) > interactionTick) continue;
+            projection.apply({ kind: "remove", itemId: known.id });
+            this.resolveAnnounced(known.id);
+          }
+          for (const item of result.value) {
+            if ((item.type === "permission" || item.type === "question") && !this.announced.has(item.id)) {
+              this.announced.set(item.id, { owner: item.conversationId ?? id, destination: id, tick: ++this.interactionClock });
+            }
+            projection.apply({ kind: "upsert", item });
+          }
+        }
+        this.syncBackgroundState(id);
+        recovery.failures = interactions.some(result => result.status === "rejected") || projection.find(item => item.type === "background_task" && item.status === "running" && item.stateUncertain === true) ? recovery.failures + 1 : 0;
+      }, () => {
+        if (this.disposed) return;
+        for (const known of this.projection(id).items()) {
+          if (known.type === "background_task" && known.status === "running") this.projection(id).apply({ kind: "upsert", item: { ...known, stateUncertain: true } });
+        }
+        recovery.failures++;
+      }).finally(() => {
+        this.backgroundPending.delete(pending);
+        this.backgroundRecoveryCount--;
+        recovery.running = false;
+        if (this.disposed) return;
+        if (recovery.failures) {
+          recovery.timer = setTimeout(() => { recovery.timer = undefined; this.drainBackgroundRecoveries(); }, Math.min(30_000, 1_000 * 2 ** Math.min(5, recovery.failures - 1)));
+          recovery.timer.unref?.();
+        } else if (!recovery.dirty && generation === this.backgroundStreamGeneration) this.backgroundRecoveries.delete(id);
+        this.drainBackgroundRecoveries();
+      });
+      this.backgroundPending.add(pending);
     }
   }
 
@@ -3333,7 +3535,7 @@ export class ChatAdapter {
       else this.liveTurns.delete(id);
       // Background work still counts as working for the workspace summary,
       // through its own set so the composer rules above stay untouched.
-      if (status === "background") this.backgroundWork.add(id);
+      if (status === "background" || this.provider.reconcileBackgroundTasks && projection.find(item => item.type === "background_task" && !item.foreground && item.status === "running")) this.backgroundWork.add(id);
       else this.backgroundWork.delete(id);
       // The conversation settling strands the steers enqueued before it (D3);
       // a live turn takes its inbox at its boundaries, so nothing is stranded

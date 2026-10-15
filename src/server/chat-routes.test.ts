@@ -8,7 +8,7 @@ import type { WorkspaceChatService } from "../chat/service";
 import { isLiveConversationStatus, type ChatAccountChange, type AgentUsageReport, type BackgroundTaskOutput, type UsageReadMode, type UsageReadResult, type ChatActivity, type ChatAvailability, type ConversationSnapshot, type ConversationStatus, type ConversationSummary, type MessageAttachment, type MessageDelivery, type ModelSelection, type PermissionOutcome, type QuestionOutcome, type ReversibleHistoryResult } from "../chat/types";
 import { ConversationNotFoundError } from "../chat/workspace";
 import { CommandSteeringError, ConversationRenameUnsupportedError, QueuedMessageNotHeldError, ReversibleHistoryUnsupportedError, ScheduledWakeupsUnsupportedError, SendNowUnavailableError, SendNowUnsupportedError, SteerAlreadyDeliveredError, SteeringUnsupportedError } from "../chat/adapter";
-import { ReversibleHistoryTargetError, InvalidQuestionAnswerError, ReleaseUnavailableError, ScheduledWakeupUnavailableError } from "../chat/provider";
+import { OperationOutcomeUnknownError, ReversibleHistoryTargetError, InvalidQuestionAnswerError, ReleaseUnavailableError, ScheduledWakeupUnavailableError } from "../chat/provider";
 import { MetricsRegistry } from "../debug/metrics";
 import { activeGauge, closedCounter, openedCounter, reconnectedCounter } from "../debug/stream-metrics";
 import { buildRoutes } from "./routes";
@@ -32,6 +32,10 @@ class FakeChatService implements WorkspaceChatService {
   questionResponses: QuestionOutcome[] = [];
   rejectAnswers: Error | null = null;
   stoppedTasks: string[] = [];
+  backgrounded: string[] = [];
+  async backgroundBlockingWork(id: string, _requestId: string): Promise<{ accepted: true }> {
+    this.require(id); this.backgrounded.push(id); return { accepted: true };
+  }
   released: string[] = [];
   cancelledWakeups: string[] = [];
   removals: string[] = [];
@@ -897,6 +901,34 @@ describe("workspace chat routes", () => {
     expect((await send({})).status).toBe(400);
     expect((await send({ requestId: crypto.randomUUID(), extra: 1 })).status).toBe(400);
     expect(service.stoppedTasks).toEqual(["b2f6"]);
+  });
+  test("background-all is qualified, validated, and exposes unknown outcomes as 409, never acceptance", async () => {
+    const service = new FakeChatService();
+    const handler = routes(service)["/api/chat/conversations/:conversationId/background"] as { POST(request: Request): Promise<Response> };
+    const send = (body: Record<string, unknown>, id = "opencode:local") => handler.POST(request(`/api/chat/conversations/${id}/background`, { method: "POST", headers: { origin: "http://127.0.0.1:4711", "content-type": "application/json" }, body: JSON.stringify(body) }, { conversationId: id }));
+    expect(await (await send({ requestId: "bg-request" })).json()).toEqual({ accepted: true });
+    expect(service.backgrounded).toEqual(["local"]);
+    expect((await send({})).status).toBe(400);
+    expect((await send({ requestId: "bg-request", childId: "other" })).status).toBe(400);
+    expect((await send({ requestId: "bg-request" }, "opencode:foreign")).status).toBe(404);
+    service.backgroundBlockingWork = async () => { throw new OperationOutcomeUnknownError(); };
+    const unknown = await send({ requestId: "ambiguous" });
+    expect(unknown.status).toBe(409);
+    expect(await unknown.json()).toMatchObject({ code: "operation_outcome_unknown" });
+  });
+  test("relocated background mutation refuses missing credentials and foreign origins before dispatch", async () => {
+    const service = new FakeChatService();
+    const handler = routes(service, "/s/project/")["/s/project/api/chat/conversations/:conversationId/background"] as { POST(request: Request): Promise<Response> };
+    const pathname = "/s/project/api/chat/conversations/opencode:local/background";
+    const params = { conversationId: "opencode:local" };
+    const init = { method: "POST", headers: { origin: "http://127.0.0.1:4711", "content-type": "application/json" }, body: JSON.stringify({ requestId: "receipt" }) };
+    const unauthenticated = new Request(`http://127.0.0.1:4711${pathname}`, init) as Request & { params: typeof params };
+    unauthenticated.params = params;
+    expect((await handler.POST(unauthenticated)).status).toBe(401);
+    expect((await handler.POST(request(pathname, { ...init, headers: { ...init.headers, origin: "https://foreign.invalid" } }, params))).status).toBe(403);
+    expect(service.backgrounded).toEqual([]);
+    expect((await handler.POST(request(pathname, init, params))).status).toBe(200);
+    expect(service.backgrounded).toEqual(["local"]);
   });
 
   test("releases a scheduled conversation through the chat service; a refused release is a conflict", async () => {

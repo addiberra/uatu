@@ -90,6 +90,17 @@ class StubAgentService implements WorkspaceChatService {
 }
 
 describe("background task stops route to the owning agent", () => {
+  test("parent backgrounding dispatches the bare parent and receipt only to its owning agent", async () => {
+    const { service, a, b } = fixture();
+    const calls: unknown[] = [];
+    Object.assign(a, { backgroundBlockingWork: async (...args: unknown[]) => { calls.push(args); return { accepted: true as const }; } });
+    expect(await service.backgroundBlockingWork("opencode:parent", "receipt")).toEqual({ accepted: true });
+    expect(calls).toEqual([["parent", "receipt"]]);
+    expect(b.calls).toEqual([]);
+    await expect(service.backgroundBlockingWork("nope:parent", "receipt")).rejects.toThrow();
+    await expect(service.backgroundBlockingWork("claude:parent", "receipt")).rejects.toThrow();
+    expect(calls).toHaveLength(1);
+  });
   test("stopTask strips the qualifier and reaches the agent that owns the conversation", async () => {
     const { service, a, b } = fixture();
     expect(await service.stopTask("claude:conv-1", "task-9", "req-1")).toEqual({ stopped: true });
