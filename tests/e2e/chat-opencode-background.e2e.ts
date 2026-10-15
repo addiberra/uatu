@@ -134,13 +134,21 @@ test("completion wins a delayed worker Stop response; an idle parent can prompt 
   const sibling = await control(request, { op: "launchWorker", conversationId });
   await control(request, { op: "finish", conversationId });
   let release!: () => void;
+  let admitted!: () => void;
   const gate = new Promise<void>(resolve => { release = resolve; });
+  const stopAdmitted = new Promise<void>(resolve => { admitted = resolve; });
   await page.route("**/api/chat/conversations/*/tasks/*/stop", async route => {
-    const response = await route.fetch(); await gate; await route.fulfill({ response });
+    const response = await route.fetch();
+    // Delay only the browser acknowledgement, not server admission. The UI's
+    // optimistic Stopping label alone does not prove the interrupt dispatched.
+    admitted();
+    await gate; await route.fulfill({ response });
   });
   const row = page.locator(`[data-background-task="${worker.taskId}"]`);
   await row.locator("[data-stop-task]").click();
   await expect(row.locator("[data-stop-task]")).toHaveText("Stopping…");
+  await stopAdmitted;
+  expect((await control(request, { op: "state" })).calls.filter((call: string) => call.startsWith("POST ") && call.includes("/interrupt"))).toEqual([`POST /api/session/${worker.childId}/interrupt?resume=false`]);
   await control(request, { op: "settleWorker", childId: worker.childId, text: "Completion won the race" });
   await expect(page.locator(`[data-chat-item-id="task:${worker.taskId}"]`)).toContainText("finished");
   const stopped = page.waitForResponse(response => response.url().endsWith("/stop"));

@@ -8,7 +8,7 @@ Tests use existing UI/browser and normalization seams; test artifacts stay outsi
 - [x] Explain queued Send now waking paused steers; retain resume semantics (browser red: ambiguous Send now; green: confirmation cancel/accept and remaining queue; renderer 184/184).
 - [x] Order terminal results after launchers without duplicating reports (agent/shell renderer cases red; 186/186 green; typecheck passes).
 - [x] Separate vertically adjacent worker Stop targets by at least 0.5rem (Chromium/WebKit touch red: 0px; green: 2/2 including existing target/gap/navigation assertions).
-- [ ] Diagnose and fix delayed Stop completion race without weakening assertions.
+- [x] Diagnose and fix delayed Stop completion race without weakening assertions (red: 9/12 failures; probe: 409 before native dispatch; event-gated browser acknowledgement: 16/16 green). Harness settled before server admission; product correctly rejected an already-settled target. Existing success/result assertions retained and native-call assertion added.
 
 ## Phase 2 — pending dock
 - [ ] Accessible targets, sticky counts, bounded height/overflow fade, delivery/paused badges and plain timing labels.
