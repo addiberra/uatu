@@ -344,6 +344,34 @@ test.describe("steering an OpenCode 2.x turn", () => {
     await expect(held(page)).toHaveCount(1);
   });
 
+  test("queued Send now explains and confirms waking paused steers", async ({ page, request }) => {
+    const conversationId = await startTurn(page, request);
+    await submit(page, "Paused first");
+    await submit(page, "Send selected queue", "Alt+Enter");
+    await submit(page, "Leave held", "Alt+Enter");
+    const cancelled = page.waitForResponse(response => response.url().endsWith("/cancel"));
+    await page.locator("#chat-stop").click();
+    expect((await cancelled).ok()).toBe(true);
+    const action = held(page).filter({ hasText: "Send selected queue" }).locator("[data-queue-send-now]");
+    await expect(action).toHaveText("Send now + paused steers");
+    page.once("dialog", async dialog => {
+      expect(dialog.message()).toContain("also sends all 1 paused steer");
+      await dialog.dismiss();
+    });
+    await action.click();
+    await expect(dock(page)).toHaveCount(3);
+    page.once("dialog", dialog => dialog.accept());
+    const sent = page.waitForResponse(response => response.url().endsWith("/send-now"));
+    await action.click();
+    expect((await sent).ok()).toBe(true);
+    await expect(steers(page)).toHaveCount(0);
+    await expect(held(page)).toHaveCount(1);
+    await expect(held(page)).toContainText("Leave held");
+    await expect(page.locator("#chat-items")).toContainText("Paused first");
+    await expect(page.locator("#chat-items")).toContainText("Send selected queue");
+    expect((await fakeSession(request, conversationId))?.running).toBe(true);
+  });
+
   test("a new steer resumes paused steers", async ({ page, request }) => {
     const conversationId = await startTurn(page, request);
     expect(await submit(page, "Stranded")).toMatchObject({ delivery: "steer" });

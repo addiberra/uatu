@@ -528,6 +528,8 @@ An agent that can deliver a held message ahead of the rest of the queue SHALL de
 
 On an agent that declares `steering`, Send now SHALL hand the held message to the agent as a steer. This is the same operation as switching it to steer, and it is available while the turn runs, while the queue is dormant, and while the conversation is idle.
 
+When paused steers exist, the queued Send now control SHALL explicitly name that it also sends paused steers and SHALL confirm that batch effect before submission. Cancelling the confirmation SHALL leave all pending messages unchanged. The remaining held queue SHALL stay dormant.
+
 On an agent that declares `send-now` but not `steering`, Send now SHALL be offered only while the held queue is dormant or the conversation is idle, never while a turn runs. Send now SHALL deliver that message immediately, ahead of the other held messages, under the configuration fixed at its submission. The other held messages SHALL remain held in submission order.
 
 #### Scenario: Claude Code sends a dormant queued message now

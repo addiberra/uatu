@@ -1112,6 +1112,7 @@ export type QueueDockContext = {
   // plus a visible warning above the entries when a replacement is staged.
   note?: HTMLElement;
   replacement?: boolean;
+  pausedSteers?: number;
 };
 
 export const STEER_MODEL_NOTE = "Steers run with the conversation's model and mode as they stand when delivered.";
@@ -1142,7 +1143,7 @@ export function queuedActions(entry: QueuedMessage, context: QueueDockContext): 
   } else if (context.steering) {
     // On a steering agent, Send now IS the switch to steer (D8); a command
     // cannot go to the agent's inbox either way.
-    if (!context.isCommand(entry.text)) actions.push(context.running ? ["data-queue-steer", "Steer"] : ["data-queue-send-now", "Send now"]);
+    if (!context.isCommand(entry.text)) actions.push(context.running ? ["data-queue-steer", "Steer"] : ["data-queue-send-now", context.pausedSteers ? "Send now + paused steers" : "Send now"]);
   } else if (context.sendNow && !context.running) {
     actions.push(["data-queue-send-now", "Send now"]);
   }
@@ -1172,6 +1173,7 @@ export class QueueDockRenderer {
   private replacementWarningShown = false;
 
   render(target: HTMLElement, queued: readonly QueuedMessage[], context: QueueDockContext = { steering: false, sendNow: false, running: true, isCommand: () => false }): void {
+    context = { ...context, pausedSteers: queued.filter(entry => entry.delivery === "steer" && entry.paused).length };
     // The entries live in the dock's own list; the note sits beside it, so
     // the list holds list items only.
     let list = target.querySelector<HTMLElement>(":scope > .chat-queue-items");

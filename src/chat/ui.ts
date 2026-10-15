@@ -3573,6 +3573,9 @@ export function initChat(api = new ChatApiClient()): void {
     const { queueRemove, queueEdit, queueSteer, queueQueue, queueSendNow } = target.dataset;
     const messageId = queueRemove ?? queueEdit ?? queueSteer ?? queueQueue ?? queueSendNow!;
     const entry = projection.queued.find(candidate => candidate.id === messageId);
+    const pausedSteers = projection.queued.filter(candidate => candidate.delivery === "steer" && candidate.paused).length;
+    if ((queueSendNow !== undefined || queueSteer !== undefined) && entry?.delivery === "queue" && pausedSteers
+      && !window.confirm(`Send this queued message now? This also sends all ${pausedSteers} paused steer${pausedSteers === 1 ? "" : "s"}. Other queued messages stay held.`)) return;
     target.disabled = true;
     const operation: Promise<unknown> = queueRemove !== undefined
       ? api.removeQueued(conversationId, messageId, newRequestId())
