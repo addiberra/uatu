@@ -167,6 +167,18 @@ export class TimelineRenderer {
       && !isRateLimitStanding(item)
       && !(item.type === "background_task" && (item.status === "running" || item.foreground === true)));
 
+    // A worker retains its start timestamp for elapsed time/correlation. Its
+    // launcher can be reported later, but the settled report cannot precede
+    // that cause. Preserve all unrelated conversation order and report bodies.
+    for (const result of [...visible]) {
+      if (result.type !== "background_task") continue;
+      const resultIndex = visible.indexOf(result);
+      const launcherIndex = visible.findLastIndex(item => item.type === "tool" && workers.get(item.id) === result);
+      if (launcherIndex <= resultIndex) continue;
+      visible.splice(resultIndex, 1);
+      visible.splice(launcherIndex, 0, result);
+    }
+
     const nodes = new Map<string, HTMLElement>();
     for (const [visibleIndex, item] of visible.entries()) {
       const active = activeRequests.has(item.id);

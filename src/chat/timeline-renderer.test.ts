@@ -55,6 +55,16 @@ function projectionWith(items: ConversationItem[], overrides: Partial<ChatProjec
   };
 }
 
+for (const name of ["subagent", "shell"]) test(`${name} result follows its launcher even when the worker start timestamp predates the tool row`, () => {
+  const host = dom.document.createElement("div") as unknown as HTMLElement;
+  const worker: ConversationItem = { id: "task:worker", type: "background_task", taskId: "worker", createdAt: 1, description: "Fixture work", taskType: name === "shell" ? "shell" : "agent", toolUseId: "launch", status: "completed", summary: "Canonical report" };
+  const launcher: ConversationItem = { id: "tool:launch", type: "tool", createdAt: 2, name, status: "completed", input: "{}" };
+  new TimelineRenderer().render(host, projectionWith([worker, launcher]), new Set(["task:worker"]));
+  const ids = Array.from(host.querySelectorAll("[data-chat-item-id]")).map(node => node.getAttribute("data-chat-item-id"));
+  expect(ids.indexOf("tool:launch")).toBeLessThan(ids.indexOf("task:worker"));
+  expect(host.textContent!.match(/Canonical report/g)).toHaveLength(1);
+});
+
 describe("persistent shell rendering", () => {
   for (const input of ["wheel", "touch", "keyboard", "scrollbar", "untouched", "closed"]) test(`${input} inspection controls row and group completion`, () => {
     const oldRequest = globalThis.requestAnimationFrame, oldCancel = globalThis.cancelAnimationFrame;

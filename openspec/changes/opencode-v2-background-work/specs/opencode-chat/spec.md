@@ -66,6 +66,10 @@ Notification enqueue, delivery, history, and replay SHALL converge without dupli
 - **THEN** Uatu shows the worker's outcome and report without waiting for a user prompt
 - **AND** later delivery and history reads update the same logical result rather than add another
 
+#### Scenario: Worker start predates the launcher row
+- **WHEN** a settled worker retains a start timestamp earlier than its correlated launcher row
+- **THEN** the timeline presents its result after its launcher, without changing canonical report identity or duplicating its body
+
 #### Scenario: A synthetic result wakes the parent
 - **WHEN** OpenCode resumes an idle parent to consume a worker notification
 - **THEN** Uatu shows the correlated result and the actual resumed parent activity
