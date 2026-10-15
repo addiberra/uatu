@@ -71,7 +71,7 @@ Each slice is written test first: write the named test and watch it fail, implem
 
 ## 5. Service, routes, and client API
 
-- [ ] 5.1 Add tests in `src/server/chat-routes.test.ts`:
+- [x] 5.1 Add tests in `src/server/chat-routes.test.ts`:
   - the prompt route accepts and validates `delivery`;
   - `PATCH …/queue/:messageId {requestId, delivery}` and `POST …/queue/:messageId/send-now {requestId}` are origin-protected and idempotent, and map `SteerAlreadyDeliveredError` to 409 with a distinct code and unsupported operations to their refusal;
   - `DELETE` withdraws a steer.

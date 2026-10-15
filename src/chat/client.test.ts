@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { resetAppBasePathForTests } from "../shared/app-url";
 import type { LiveSubscription, LiveSubscriptionKey } from "../shared/live-protocol";
 import type { LiveChannel, LiveTopicConsumer } from "../shell/live-channel";
-import { ChatApiClient, ChatConnectionInterruptedError } from "./client";
+import { ChatApiClient, ChatConnectionInterruptedError, ChatTransportError } from "./client";
 
 const originalDocument = Reflect.get(globalThis, "document");
 
@@ -89,6 +89,30 @@ describe("chat API client", () => {
       model: { providerId: "anthropic", modelId: "claude" },
     });
     expect(requests[6]!.init?.method).toBe("PATCH");
+  });
+
+  test("sends a delivery with a prompt, switches and sends pending messages now, and carries the already-delivered code (opencode-v2-steering)", async () => {
+    Reflect.set(globalThis, "document", { querySelector: () => ({ getAttribute: () => "/s/work/" }) });
+    resetAppBasePathForTests();
+    const requests: Array<{ url: string; init?: RequestInit }> = [];
+    const client = new ChatApiClient((async (url: string | URL | Request, init?: RequestInit) => {
+      requests.push({ url: String(url), init });
+      if (String(url).endsWith("/prompts")) return Response.json({ messageId: "msg_1", pending: true, delivery: "steer", configuration: {} }, { status: 202 });
+      if (String(url).endsWith("/send-now")) return Response.json({ messageId: "msg_2", delivery: "steer" });
+      if (String(url).includes("/queue/late")) return Response.json({ error: "the message was already delivered", code: "steer-already-delivered" }, { status: 409 });
+      return Response.json({ messageId: "held-9", delivery: "queue" });
+    }) as typeof fetch);
+    expect(await client.prompt("c/1", "r1", "steer this", undefined, undefined, undefined, undefined, "steer")).toEqual({ messageId: "msg_1", pending: true, delivery: "steer", configuration: {} });
+    expect(JSON.parse(requests[0]!.init!.body as string)).toEqual({ requestId: "r1", text: "steer this", delivery: "steer" });
+    expect(await client.changeDelivery("c/1", "msg_1", "r2", "queue")).toEqual({ messageId: "held-9", delivery: "queue" });
+    expect(requests[1]).toMatchObject({ url: "/s/work/api/chat/conversations/c%2F1/queue/msg_1", init: { method: "PATCH" } });
+    expect(JSON.parse(requests[1]!.init!.body as string)).toEqual({ requestId: "r2", delivery: "queue" });
+    expect(await client.sendNow("c/1", "held-9", "r3")).toEqual({ messageId: "msg_2", delivery: "steer" });
+    expect(requests[2]).toMatchObject({ url: "/s/work/api/chat/conversations/c%2F1/queue/held-9/send-now", init: { method: "POST" } });
+    expect(JSON.parse(requests[2]!.init!.body as string)).toEqual({ requestId: "r3" });
+    const late = await client.removeQueued("c/1", "late", "r4").catch(error => error as ChatTransportError);
+    expect(late).toBeInstanceOf(ChatTransportError);
+    expect(late).toMatchObject({ status: 409, code: "steer-already-delivered" });
   });
 
   test("posts reversible-history receipts through the base path and validates their results", async () => {

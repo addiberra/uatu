@@ -12,7 +12,7 @@
 import type { Serve } from "bun";
 import path from "node:path";
 
-import { ChatQueueFullError, CommandAttachmentsError, ConversationRenameUnsupportedError, InteractionConflictError, InvalidConversationTitleError, InvalidModeSelectionError, InvalidModelSelectionError, InvalidPermissionChoiceError, InvalidVariantSelectionError, QueuedMessageNotHeldError, ReversibleHistoryUnsupportedError, ScheduledWakeupsUnsupportedError, UnknownAttachmentError, UsageUnsupportedError } from "../chat/adapter";
+import { ChatQueueFullError, CommandAttachmentsError, CommandSteeringError, ConversationRenameUnsupportedError, InteractionConflictError, InvalidConversationTitleError, InvalidModeSelectionError, InvalidModelSelectionError, InvalidPermissionChoiceError, InvalidVariantSelectionError, QueuedMessageNotHeldError, ReversibleHistoryUnsupportedError, ScheduledWakeupsUnsupportedError, SendNowUnavailableError, SendNowUnsupportedError, SteerAlreadyDeliveredError, SteeringUnsupportedError, SteerWithdrawalUnconfirmedError, UnknownAttachmentError, UsageUnsupportedError } from "../chat/adapter";
 import { AttachmentStoreError } from "../chat/attachment-store";
 import { BackgroundTaskUnavailableError, InvalidQuestionAnswerError, ReleaseUnavailableError, ReversibleHistoryTargetError, ScheduledWakeupUnavailableError } from "../chat/provider";
 import { encodeReplayCursor } from "../chat/replay";
@@ -21,7 +21,7 @@ import { HistoryChangedError } from "../chat/history-reuse";
 import { resolveStartupTimeoutMs } from "../chat/opencode/opencode-service";
 import { ChatUnavailableError } from "../chat/service";
 import { UnknownAgentError, type MultiAgentWorkspaceChatService } from "../chat/agents";
-import { CHAT_ATTACHMENT_MAX_BYTES, CHAT_ATTACHMENT_MIME_TYPES, CHAT_ATTACHMENTS_PER_MESSAGE, TASK_OUTPUT_TAIL_DEFAULT_BYTES, TASK_OUTPUT_TAIL_MAX_BYTES, type MessageAttachment, type ModelSelection, type PermissionOutcome, type QuestionOutcome, type UsageReadMode, type ChatAccountChange } from "../chat/types";
+import { CHAT_ATTACHMENT_MAX_BYTES, CHAT_ATTACHMENT_MIME_TYPES, CHAT_ATTACHMENTS_PER_MESSAGE, TASK_OUTPUT_TAIL_DEFAULT_BYTES, TASK_OUTPUT_TAIL_MAX_BYTES, type MessageAttachment, type MessageDelivery, type ModelSelection, type PermissionOutcome, type QuestionOutcome, type UsageReadMode, type ChatAccountChange } from "../chat/types";
 import { ConversationNotFoundError } from "../chat/workspace";
 import { StreamLifecycleMetrics, type StreamOutcome } from "../debug/stream-metrics";
 import { getDocumentDiff } from "../document/diff";
@@ -938,7 +938,7 @@ function buildChatRoutes(deps: BuildRoutesDeps, p: (path: string) => string) {
       },
     },
     [p("/api/chat/conversations/:conversationId/prompts")]: {
-      POST: async (request: RouteRequest) => chatMutation(request, ["requestId", "text", "model", "mode", "variant", "attachments"], async (id, body) => {
+      POST: async (request: RouteRequest) => chatMutation(request, ["requestId", "text", "model", "mode", "variant", "attachments", "delivery"], async (id, body) => {
         const requestId = bodyIdentity(body, "requestId");
         if (requestId instanceof Response) return requestId;
         if (typeof body.text !== "string") return chatError(400, "text must be a string");
@@ -961,7 +961,12 @@ function buildChatRoutes(deps: BuildRoutesDeps, p: (path: string) => string) {
         // Words or images: a message needs content, and an image-only prompt
         // is content (OpenCode admits empty text with files — verified live).
         if (!body.text.trim() && !attachments?.length) return chatError(400, "text must not be empty");
-        return run(() => deps.chatService.prompt(id, requestId, body.text as string, model, mode, variant, attachments), 202);
+        // How the message reaches a busy agent (opencode-v2-steering D5):
+        // `steer` is honored only where the agent declares steering; the
+        // workspace decides and reports what it did.
+        const delivery = parseDelivery(body.delivery);
+        if (delivery instanceof Response) return delivery;
+        return run(() => deps.chatService.prompt(id, requestId, body.text as string, model, mode, variant, attachments, delivery), 202);
       }),
     },
     // Multipart rather than JSON: image bytes ride the request as a file
@@ -1080,11 +1085,32 @@ function buildChatRoutes(deps: BuildRoutesDeps, p: (path: string) => string) {
       }),
     },
     [p("/api/chat/conversations/:conversationId/queue/:messageId")]: {
+      // Removes a held message, or withdraws a steer from the agent (D7).
       DELETE: async (request: RouteRequest) => chatMutation(request, ["requestId"], async (id, body) => {
         const messageId = routeIdentity(request, "messageId");
         if (messageId instanceof Response) return messageId;
         const requestId = bodyIdentity(body, "requestId");
         return requestId instanceof Response ? requestId : run(() => deps.chatService.removeQueued(id, messageId, requestId));
+      }),
+      // Switches a pending message between steer and queue (D7, D8).
+      PATCH: async (request: RouteRequest) => chatMutation(request, ["requestId", "delivery"], async (id, body) => {
+        const messageId = routeIdentity(request, "messageId");
+        if (messageId instanceof Response) return messageId;
+        const requestId = bodyIdentity(body, "requestId");
+        if (requestId instanceof Response) return requestId;
+        const delivery = parseDelivery(body.delivery);
+        if (delivery instanceof Response) return delivery;
+        if (delivery === undefined) return chatError(400, "delivery must be steer or queue");
+        return run(() => deps.chatService.changeDelivery(id, messageId, requestId, delivery));
+      }),
+    },
+    // Sends a pending message now (D8).
+    [p("/api/chat/conversations/:conversationId/queue/:messageId/send-now")]: {
+      POST: async (request: RouteRequest) => chatMutation(request, ["requestId"], async (id, body) => {
+        const messageId = routeIdentity(request, "messageId");
+        if (messageId instanceof Response) return messageId;
+        const requestId = bodyIdentity(body, "requestId");
+        return requestId instanceof Response ? requestId : run(() => deps.chatService.sendNow(id, messageId, requestId));
       }),
     },
     [p("/api/chat/conversations/:conversationId/permissions/:interactionId")]: {
@@ -1312,6 +1338,13 @@ function normalizedChatError(error: unknown): Response {
   if (error instanceof HistoryChangedError) return chatError(409, error.message);
   if (error instanceof UnknownAgentError) return chatError(404, error.message);
   if (error instanceof QueuedMessageNotHeldError) return chatError(409, error.message);
+  // Its own code: the client says "too late" rather than "not held" (D7).
+  if (error instanceof SteerAlreadyDeliveredError) return chatError(409, error.message, "steer-already-delivered");
+  if (error instanceof SteerWithdrawalUnconfirmedError) return chatError(409, error.message);
+  if (error instanceof SteeringUnsupportedError) return chatError(409, error.message);
+  if (error instanceof SendNowUnsupportedError) return chatError(409, error.message);
+  if (error instanceof SendNowUnavailableError) return chatError(409, error.message);
+  if (error instanceof CommandSteeringError) return chatError(409, error.message);
   if (error instanceof ChatQueueFullError) return chatError(429, error.message);
   if (error instanceof InteractionConflictError) return chatError(409, error.message);
   if (error instanceof ConversationRenameUnsupportedError) return chatError(409, error.message);
@@ -1354,8 +1387,13 @@ function nextChatEvent<T>(
   });
 }
 
-function chatError(status: number, error: string): Response {
-  return Response.json({ error }, { status, headers: { "cache-control": "no-store" } });
+function chatError(status: number, error: string, code?: string): Response {
+  return Response.json({ error, ...(code ? { code } : {}) }, { status, headers: { "cache-control": "no-store" } });
+}
+
+function parseDelivery(value: unknown): MessageDelivery | undefined | Response {
+  if (value === undefined) return undefined;
+  return value === "steer" || value === "queue" ? value : chatError(400, "delivery must be steer or queue");
 }
 
 function buildProdRoutes(deps: ProdRouteDeps, p: (path: string) => string) {

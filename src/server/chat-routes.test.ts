@@ -61,11 +61,13 @@ class FakeChatService implements WorkspaceChatService {
     const handoff = this.replay.handoff(() => this.snapshot(), options.cursor, options.signal);
     return { snapshot: handoff.snapshot, events: handoff.subscription };
   }
-  async prompt(id: string, requestId: string, _text: string, model?: ModelSelection, agent?: string, _variant?: string, attachments?: MessageAttachment[]) {
+  selectedDelivery: MessageDelivery | undefined;
+  async prompt(id: string, requestId: string, _text: string, model?: ModelSelection, agent?: string, _variant?: string, attachments?: MessageAttachment[], delivery?: MessageDelivery) {
     this.require(id);
     this.selectedModel = model;
     this.selectedAgent = agent;
     this.promptAttachments = attachments;
+    this.selectedDelivery = delivery;
     if (!this.promptResult) {
       this.prompts += 1;
       this.promptResult = { messageId: requestId, pending: false, delivery: "queue" };
@@ -709,9 +711,82 @@ describe("workspace chat routes", () => {
     const conflict = await send("delivered");
     expect(conflict.status).toBe(409);
     expect(await conflict.json()).toEqual({ error: "message is no longer held" });
+    // A steer the agent delivered before the withdrawal (opencode-v2-steering
+    // D7): the same status with its own code.
+    const late = await send("steered");
+    expect(late.status).toBe(409);
+    expect(await late.json()).toEqual({ error: "the message was already delivered", code: "steer-already-delivered" });
 
     const foreign = handler.DELETE(request("/api/chat/conversations/other/queue/held-1", {
       method: "DELETE", headers: { origin: "http://127.0.0.1:4711", "content-type": "application/json" }, body: JSON.stringify({ requestId: "remove-2" }),
+    }, { conversationId: "other", messageId: "held-1" }) as never);
+    expect((await foreign).status).toBe(404);
+  });
+
+  test("the prompt route accepts and validates a delivery (opencode-v2-steering)", async () => {
+    const service = new FakeChatService();
+    const handler = routes(service)["/api/chat/conversations/:conversationId/prompts"] as { POST(request: Request & { params: Record<string, string> }): Promise<Response> };
+    const send = (body: unknown) => handler.POST(request("/api/chat/conversations/opencode:local/prompts", {
+      method: "POST", headers: { origin: "http://127.0.0.1:4711", "content-type": "application/json" }, body: JSON.stringify(body),
+    }, { conversationId: "opencode:local" }) as never);
+    expect((await send({ requestId: crypto.randomUUID(), text: "hello", delivery: "later" })).status).toBe(400);
+    expect((await send({ requestId: crypto.randomUUID(), text: "hello", delivery: 1 })).status).toBe(400);
+    const steered = await send({ requestId: crypto.randomUUID(), text: "hello", delivery: "steer" });
+    expect(steered.status).toBe(202);
+    expect(service.selectedDelivery).toBe("steer");
+    expect(await steered.json()).toMatchObject({ pending: false, delivery: "queue" });
+    expect((await send({ requestId: crypto.randomUUID(), text: "hello" })).status).toBe(202);
+    expect(service.selectedDelivery).toBeUndefined();
+  });
+
+  test("switches a pending message's delivery: origin-guarded, validated, idempotent, with distinct refusals", async () => {
+    const service = new FakeChatService();
+    const handler = routes(service)["/api/chat/conversations/:conversationId/queue/:messageId"] as { PATCH(request: Request & { params: Record<string, string> }): Promise<Response> };
+    const send = (messageId: string, body: unknown = { requestId: "switch-1", delivery: "steer" }, origin = "http://127.0.0.1:4711") => handler.PATCH(request(`/api/chat/conversations/opencode:local/queue/${messageId}`, {
+      method: "PATCH", headers: { origin, "content-type": "application/json" }, body: JSON.stringify(body),
+    }, { conversationId: "opencode:local", messageId }) as never);
+    expect((await send("held-1", undefined, "https://attacker.example")).status).toBe(403);
+    expect((await send("held-1", { delivery: "steer" })).status).toBe(400);
+    expect((await send("held-1", { requestId: "switch-1" })).status).toBe(400);
+    expect((await send("held-1", { requestId: "switch-1", delivery: "later" })).status).toBe(400);
+    const switched = await send("held-1");
+    expect(switched.status).toBe(200);
+    expect(await switched.json()).toEqual({ messageId: "held-1", delivery: "steer" });
+    expect(await (await send("msg_1", { requestId: "switch-2", delivery: "queue" })).json()).toEqual({ messageId: "msg_1", delivery: "queue" });
+    expect(service.switches).toEqual([{ messageId: "held-1", delivery: "steer" }, { messageId: "msg_1", delivery: "queue" }]);
+    // Already delivered by the agent: a conflict with its own code, so the
+    // client can say "too late" rather than "not held".
+    const late = await send("steered", { requestId: "switch-3", delivery: "queue" });
+    expect(late.status).toBe(409);
+    expect(await late.json()).toEqual({ error: "the message was already delivered", code: "steer-already-delivered" });
+    const command = await send("command");
+    expect(command.status).toBe(409);
+    expect(await command.json()).toEqual({ error: "a command cannot be steered; it stays queued" });
+    expect((await send("unsupported")).status).toBe(409);
+    const foreign = handler.PATCH(request("/api/chat/conversations/other/queue/held-1", {
+      method: "PATCH", headers: { origin: "http://127.0.0.1:4711", "content-type": "application/json" }, body: JSON.stringify({ requestId: "switch-4", delivery: "steer" }),
+    }, { conversationId: "other", messageId: "held-1" }) as never);
+    expect((await foreign).status).toBe(404);
+  });
+
+  test("sends a pending message now: origin-guarded, idempotent, refused while a turn runs or without the capability", async () => {
+    const service = new FakeChatService();
+    const handler = routes(service)["/api/chat/conversations/:conversationId/queue/:messageId/send-now"] as { POST(request: Request & { params: Record<string, string> }): Promise<Response> };
+    const send = (messageId: string, body: unknown = { requestId: "send-1" }, origin = "http://127.0.0.1:4711") => handler.POST(request(`/api/chat/conversations/opencode:local/queue/${messageId}/send-now`, {
+      method: "POST", headers: { origin, "content-type": "application/json" }, body: JSON.stringify(body),
+    }, { conversationId: "opencode:local", messageId }) as never);
+    expect((await send("held-1", undefined, "https://attacker.example")).status).toBe(403);
+    expect((await send("held-1", { messageId: "held-1" })).status).toBe(400);
+    const sent = await send("held-1");
+    expect(sent.status).toBe(200);
+    expect(await sent.json()).toEqual({ messageId: "held-1", delivery: "queue" });
+    expect(service.sent).toEqual(["held-1"]);
+    const running = await send("running");
+    expect(running.status).toBe(409);
+    expect(await running.json()).toEqual({ error: "a turn is running; the message is delivered when it ends" });
+    expect((await send("unsupported")).status).toBe(409);
+    const foreign = handler.POST(request("/api/chat/conversations/other/queue/held-1/send-now", {
+      method: "POST", headers: { origin: "http://127.0.0.1:4711", "content-type": "application/json" }, body: JSON.stringify({ requestId: "send-2" }),
     }, { conversationId: "other", messageId: "held-1" }) as never);
     expect((await foreign).status).toBe(404);
   });

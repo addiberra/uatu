@@ -4514,7 +4514,7 @@ export function initChat(api = new ChatApiClient()): void {
         reloadEntry.messageId = accepted.messageId;
         // Dispatched and not the built-in: nothing to track. A held one is
         // classified only at delivery, so it stays tracked.
-        if (!accepted.held && accepted.operation !== "reload") {
+        if (!accepted.pending && accepted.operation !== "reload") {
           const rest = (pendingReloads.get(conversationId) ?? []).filter(entry => entry !== reloadEntry);
           if (rest.length) pendingReloads.set(conversationId, rest);
           else pendingReloads.delete(conversationId);
@@ -4549,7 +4549,7 @@ export function initChat(api = new ChatApiClient()): void {
         // since resolved (delivered, or removed by another client) with
         // nothing durable left to check it against, while anything the first
         // attempt really held has long been stated by the stream itself.
-        projection = accepted.held
+        projection = accepted.pending
           ? !retriedRequest && projectionEpoch === projectionEpochAtSubmit
             ? noteQueuedMessage(projection, { id: accepted.messageId, text, queuedAt: Date.now(), delivery: "queue", requestId, ...(attachmentRefs.length ? { attachments: attachmentRefs } : {}) }, queueRevisionAtSubmit)
             : removeAcceptedDraft(projection, requestId)
@@ -4561,7 +4561,7 @@ export function initChat(api = new ChatApiClient()): void {
         renderConfiguration();
         scheduleRender(true);
       }
-      noteComposer(accepted.held ? "Queued — sends when the agent is ready" : "Message accepted");
+      noteComposer(accepted.pending ? "Queued — sends when the agent is ready" : "Message accepted");
       // Addressed to the submitted conversation, not the selection: the
       // acceptance may land after a switch, and clearing the selected
       // conversation's own error would erase an unrelated reason.
