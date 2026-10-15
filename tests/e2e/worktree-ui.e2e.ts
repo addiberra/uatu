@@ -72,6 +72,11 @@ async function inventoryOf(page: Page, sourceWorkspaceId: string) {
 // `N stopped worktrees` disclosures; open every one so their rows are in the
 // accessibility tree.
 async function dashboard(page: Page): Promise<void> {
+  // Hub inventory is joined asynchronously. Wait for the real registered rows
+  // before expanding their stopped disclosures, not just the initial parents.
+  const response = await page.request.get("/api/hub/state"); expect(response.ok()).toBe(true);
+  const ids = ((await response.json()).workspaces as { id: string }[]).map(workspace => workspace.id);
+  await expect.poll(() => page.locator("[data-workspace]").evaluateAll(rows => [...new Set(rows.map(row => row.getAttribute("data-workspace")))])).toEqual(expect.arrayContaining(ids));
   await expect.poll(async () => page.locator("[data-disclosure]").count()).toBeGreaterThan(0);
   // The dashboard re-renders on its own poll, so a collapsed disclosure can
   // detach between the query and the click; each pass takes the first one
@@ -79,8 +84,11 @@ async function dashboard(page: Page): Promise<void> {
   for (let attempt = 0; attempt < 10; attempt += 1) {
     const collapsed = page.locator("[data-disclosure]:not([open])");
     if (await collapsed.count() === 0) return;
-    await collapsed.first().locator("summary").click({ timeout: 5_000 }).catch(() => undefined);
+    // Descendant summaries include each checkout's More actions. Select only
+    // this disclosure's own summary; never swallow a strict-locator failure.
+    await collapsed.first().locator(":scope > summary").click({ timeout: 5_000 });
   }
+  await expect(page.locator("[data-disclosure]:not([open])")).toHaveCount(0);
 }
 
 const rowFor = async (page: Page, source: string, branch: string) =>
@@ -621,7 +629,7 @@ for (const touch of [false, true]) test.describe(touch ? "worktree dialog on tou
     const standaloneRow = page.locator(`[data-workspace="${standaloneId}"]`);
     await expect(standaloneRow).toContainText("Linked checkout");
     await expect(standaloneRow.locator(".chip")).not.toContainText("Main checkout");
-    const standaloneSummary = page.locator(`[data-disclosure="${standaloneId}-inactive"] summary`);
+    const standaloneSummary = page.locator(`[data-disclosure="${standaloneId}-inactive"] > summary`);
     await expect(standaloneSummary).toContainText("expand to Start");
     await expect(standaloneSummary).not.toContainText("or fork");
     await captureScreenshot(page, info, `worktree-ui-${label}-standalone-linked`);
@@ -683,6 +691,14 @@ for (const touch of [false, true]) test.describe(touch ? "worktree dialog on tou
     await expect(dialog.getByRole("heading", { name: "Register worktree", exact: true })).toBeVisible();
     await expect.poll(async () => (await live()).states).toEqual([1]);
     await expect.poll(async () => (await live()).messages).toBeGreaterThan(0);
+    // Establish the settled pre-mutation list, not just its loading heading.
+    // Otherwise the initial inventory read can discover the later Git change
+    // before any subsequent live invalidation has been delivered.
+    await expect(dialog.locator("main")).not.toHaveAttribute("aria-busy", "true");
+    await expect(dialog.getByText("Loading worktree inventory…", { exact: true })).toHaveCount(0);
+    // Earlier tests may intentionally leave forgotten Git checkouts. Only this
+    // test's new branch must be absent from the authoritative initial list.
+    await expect(dialog.locator(".wt-card", { hasText: "live/dashboard-external" })).toHaveCount(0);
     const before = await live();
     const subscription = new URL(before.urls[0]!);
     expect(subscription.searchParams.get("ws")).toBe(parentId);

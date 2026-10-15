@@ -23,7 +23,7 @@
 import { AccountOperationError, type AccountAdapter, type AccountAdapterStatus, type StartedLogin } from "../../src/hub/agent-account-adapter";
 import { classifyCompletion } from "../../src/hub/agent-account-redirect";
 import type { AccountRuntime, AccountRuntimeFactory } from "../../src/hub/agent-account-runtime";
-import type { AccountCredential, AccountMethod, AccountTarget, ClaudeAccountState } from "../../src/hub/agent-account-types";
+import type { AccountCredential, AccountField, AccountMethod, AccountTarget, ClaudeAccountState } from "../../src/hub/agent-account-types";
 
 export const FAKE_DEVICE_CODE = "15EF-0DB6";
 export const FAKE_CLAUDE_CODE = "good-code";
@@ -38,13 +38,13 @@ function deferred(): Deferred {
   return { promise, resolve, reject };
 }
 
-const COPILOT_FIELDS = [
+const COPILOT_FIELDS: AccountField[] = [
   { key: "deploymentType", label: "Select GitHub deployment type", kind: "select" as const, valueType: "string", required: true, options: [{ value: "github.com", label: "GitHub.com", hint: "Public" }, { value: "enterprise", label: "GitHub Enterprise", hint: "Data residency or self-hosted" }] },
   { key: "enterpriseUrl", label: "Enter your GitHub Enterprise URL or domain", kind: "text" as const, valueType: "string", required: true, placeholder: "company.ghe.com", when: [{ key: "deploymentType", op: "eq" as const, value: "enterprise" }] },
 ];
 
 // A self-hosted OAuth app: the agent marks its client secret as sensitive.
-const GITLAB_FIELDS = [
+const GITLAB_FIELDS: AccountField[] = [
   { key: "instanceUrl", label: "GitLab instance URL", kind: "text" as const, valueType: "string", required: true, placeholder: "gitlab.example.com" },
   { key: "clientSecret", label: "OAuth client secret", kind: "text" as const, valueType: "string", required: true, secret: true },
 ];

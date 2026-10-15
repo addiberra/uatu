@@ -254,6 +254,76 @@ The current integration/cold-entry and editor/history/continuity gates 10.4/11.4
 now have current cross-engine results and captures. Broader reference comparisons,
 native/device checks, desktop reconciliation and human acceptance remain separate.
 
+### Candidate capability/action map
+
+This is the implemented product routing map, **not a deployed-candidate approval**.
+The full published operation inventory remains `api/operations.yaml` and
+`api/streaming.yaml`; public revisions are Hub/workspace **14/24**.
+
+| Phone destination | Authoritative operations | Evidence seam |
+| --- | --- | --- |
+| Hub, Settings, workspace | `/`, `/settings?detail=…`, `/clone`, `/s/<id>/…`; fixed workspace HTTP/WS and `/api/hub/live` broker | `mobile-live-continuity.e2e.ts`, compiled smoke |
+| Sign in, Session Security, Devices | `/login`, `/logout`, `/api/hub/state`, `/api/hub/sessions` and handle-scoped revoke | live auth units, Hub API contracts, account/continuity browser checks |
+| Credentials | `/api/hub/credentials`: SSH/OpenPGP generate/import, token create; applicable public-key/unlock/lock/test/enable/disable/delete | real disposable key/token browsers; credential API and adapter tests |
+| Credential Tools and Assignments | `/api/hub/credential-tools`, tool test/override; workspace credential-assignments and credential assign/unassign | real tool/host/no-op/multi-key Start browsers; coordinated-stop units/contracts |
+| Agent accounts (separate group) | `/api/hub/agent-accounts`, key/login/logout/activate and attempt code/redirect/cancel | real routes with explicitly fake account runtimes; no personal provider login |
+| Notifications | existing `/api/hub/notifications` GET/PUT/DELETE and enrollment owner | real enrollment routes, platform permission/PushManager doubles; no OS delivery claim |
+| Workspace actions | session start/stop, workspace display-name/forget | real Hub lifecycle/credential checks; Forget preserves files |
+| Add Workspace, Default Folder, Manage Folders | browse, workspace-defaults, configure/create; folders create/rename/remove | real temporary paths and Git; refusal/partial-result adapter and API tests |
+| Checkout More and multi-checkout disclosure | worktrees inventory/fetch/create/open/register/forget/preflight-delete/delete | real Git/Hub browser and API checks; HTTP-200 refusals and local-data confirmation retained |
+| Clone | clone-jobs, owner-bound clone-attempt reconcile, events/input/cancel | real job/API owners; deterministic browser process double, real local-Git integration tests separately |
+
+Rollback is entry/build selection, not deletion of runtime state: the lead must
+name the preceding approved production artifact and exact service scope before
+any update; retain credentials, registries, workspaces and existing configuration.
+No tested local binary has replaced the existing live service. The synthetic
+reviewer's reset/restart instructions in `handoff.md` remain separate and are not
+instructions to reset live state. Tasks 8.3/23.1/23.2 remain acceptance/handoff
+gates, not authority inferred from this map.
+
+### Desktop and standalone regression result (2026-10-16)
+
+```sh
+bun node_modules/@playwright/test/cli.js test --project=e2e tests/e2e/worktree-ui.e2e.ts --grep 'worktree dialog on desktop' --workers=1 --output=test-results/desktop-settled
+bun node_modules/typescript/bin/tsc --noEmit -p tests/tsconfig.worktree.json
+bun tests/mobile-hub-review/compatibility.ts
+```
+
+**6/6 desktop browser cases passed** (35.1s); worktree type checking passed;
+**4/4 standalone Chromium/WebKit × desktop/touch checks passed**. The earlier
+desktop lifecycle/credential baseline also passed. Current desktop-inset/iPad
+viewport browser evidence in `test-results/insets-current` is **15/15**, not native
+Desktop or physical iPad validation.
+
+Desktop iterations were not all green: 4/7 initial cases, then 2/6 after only the
+inventory-readiness correction. The retained `desktop-disclosure-probe` trace
+proves `locator("summary")` matched the group summary **and** nested More actions;
+the helper's catch swallowed the strict-mode failure without any click. Selecting
+the disclosure's direct child summary and removing the catch fixes the actual
+precondition. The helper still waits for authoritative registered rows and asserts
+that disclosures are open. A later 5/6 exposed the same descendant-selector issue
+in the standalone-heading assertion; it now selects the direct summary too.
+
+The live-event test also sampled its heading before the initial list settled, so
+Git changes could enter that first response without an additional live event.
+It now waits for loading/aria-busy to settle and asserts its new branch absent
+before changing Git. It does not assume the worker's shared repository has no
+other unregistered checkouts: an earlier test intentionally leaves a forgotten
+Git checkout. The intermediate all-registered assumption failed 5/6 and was
+corrected to that actual precondition. The final test still requires a new live
+event, the same dialog, one stream, no navigation and stream closure on Cancel.
+
+No desktop product renderer/style was changed in this reconciliation. Comparing
+the retained desktop grouping screenshot to the older archived worktree capture
+shows the same Active/repository/main/children/stopped-disclosure structure.
+Current branding, Notifications and inherited-policy text reflect intervening
+upstream work, not exceptions invented for this change; the desktop grouping
+module is byte-unchanged against pre-integration `20247bc`. This limited comparison
+does not reconstruct the missing exact historical four-interior/native baseline
+or complete 7.4/22.3. Type-only `AccountField[]` fixture annotations repair two
+literal-widening errors exposed by the worktree TypeScript project, with no value
+or product API change. Temporary disclosure instrumentation was removed.
+
 Current historical Chat reproduction:
 
 ```sh
