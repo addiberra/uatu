@@ -117,8 +117,8 @@ Each slice is written test first: write the named test and watch it fail, implem
 
 ## 8. Coverage, docs, and final verification
 
-- [ ] 8.1 Update `src/chat/opencode/sdk-coverage.ts` (D12) and run `bun run coverage:agents`. Verify that the report lists the inbox events and operations as mapped, with `session.inbox.update` as deliberately unused.
-- [ ] 8.2 Update `ARCHITECTURE.md` where it describes the chat queue (steer ownership, dock), and the `src/chat/` entry in `CLAUDE.md` if the module map changes. Verify by review.
+- [x] 8.1 Update `src/chat/opencode/sdk-coverage.ts` (D12) and run `bun run coverage:agents`. Verify that the report lists the inbox events and operations as mapped, with `session.inbox.update` as deliberately unused.
+- [x] 8.2 Update `ARCHITECTURE.md` where it describes the chat queue (steer ownership, dock), and the `src/chat/` entry in `CLAUDE.md` if the module map changes. Verify by review.
 - [ ] 8.3 Run `bun run test:ci`, `bun run test:e2e`, and `bun run build`. All must pass.
 - [ ] 8.4 Do one manual pass against a real OpenCode 2.0.28 binary (`bun run dev`):
   - steer mid-turn;

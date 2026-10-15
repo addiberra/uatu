@@ -7,6 +7,16 @@ import type { CoverageAnnotations } from "../coverage-annotations";
  * event names that the two mappers treat differently. A key ending in `*`
  * gives the reason for every ignored entry under that prefix; the most
  * specific key wins.
+ *
+ * The 2.x inbox needs no reason any more (opencode-v2-steering D3, D4): the
+ * user's entries are the dock's pending steers until `session.inbox.delivered`
+ * puts the message on the timeline, and `cancelled` and `delivery.changed`
+ * move the dock. The report has no operations axis, so the inbox operations
+ * are recorded here: `session.inbox.list` (reconcile on attach and reconnect),
+ * `session.inbox.cancel` (withdraw a steer), and `session.interrupt` with
+ * `resume` are used; `session.inbox.update` is deliberately not — switching
+ * delivery through it would leave the message in OpenCode's queue, where it
+ * loses the configuration frozen at submission (D1).
  */
 export const openCodeCoverageAnnotations: CoverageAnnotations = {
   reasons: {
@@ -23,7 +33,6 @@ export const openCodeCoverageAnnotations: CoverageAnnotations = {
 
     // Session bookkeeping with nothing new for the timeline.
     "2.x:session.usage.*": "The session's running total; per-message figures ride session.step.ended.",
-    "2.x:session.inbox.*": "Delivery bookkeeping for a prompt already shown when session.inbox.enqueued accepted it.",
     "2.x:session.instructions.updated": "Which instruction files the session loaded; uatu does not present the agent's system context.",
     "2.x:session.viewed": "A client marked the session read; nothing happened in the conversation.",
     "2.x:session.permissions": "The session's standing permission rules; each request arrives as permission.asked.",
