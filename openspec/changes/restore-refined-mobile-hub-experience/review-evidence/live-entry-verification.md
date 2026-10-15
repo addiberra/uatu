@@ -342,3 +342,48 @@ fails, and neither it nor any golden was changed. Historical Chat touch failures
 also remain unwaived pending their current reproduction and lead scope decision.
 Physical/native checks, version-specific human acceptance (8.3), and lead-reviewed
 service scope (23.2) remain separate. No push, deployment, spec sync or archive.
+
+### Broad-unit investigation and current API contracts (2026-10-16)
+
+The first expanded 97-file unit run was **1,370 pass / 1 skip / 11 fail**, 11,194
+assertions, not a green result. Four credential-projection failures reproduced in
+`bun test src/hub/credential-context.test.ts` (**24 pass / 4 fail**). The shell's
+inherited `GIT_CONFIG_*` overrides hid the fixture's own ambient Git configuration.
+Running that unchanged file with an empty environment, private HOME and explicit
+installed-tool PATH passed **28/28**, 180 assertions. No operator Git configuration,
+authentication setting or product credential safeguard was changed.
+
+Two minimized test-order commands reproduced the six DOM failures:
+
+```sh
+bun test src/hub/dashboard-groups.test.ts src/hub/mobile/frontend.test.ts src/hub/mobile/coordinator-context.test.ts
+bun test src/shell/hub-nav.test.ts src/hub/mobile/frontend.test.ts
+```
+
+The first was **54 pass / 1 fail**: the dashboard fixture leaked `window` and
+`document`, causing native Event dispatch into a Linkedom target. The second was
+**116 pass / 5 fail**: restoring an inherited focus function by assignment left
+new own properties on Linkedom anchor/button prototypes, shadowing later tests'
+focus model. Restoring exact descriptors (deleting previously absent properties)
+and restoring dashboard globals removes the contamination without changing any
+product focus code or focus assertions.
+
+The remaining old flow expectation treated a failed authentication connection as
+authoritative sign-out, contrary to the implemented transient-ownership policy.
+Cancel and authoritative unauthorized reads still assert clearing the original
+secret node and hiding protected detail. A separate transient-read regression now
+asserts the same masked native draft, no write, visible unconfirmed notice,
+successful revalidation without remount and secret clearing on subsequent
+authoritative invalidation. The pending-command real-route regression still
+requires submitted secrets to clear before the held result arrives.
+
+The combined five-file reproducer/regression run passed **216/216**, 1,446
+assertions; main type checking and whitespace checks passed. A full private-HOME
+repeat of all 97 files is tracked separately below; focused green results do not
+relabel the original 11 failures as passing.
+
+`bun run test:api` passed **212/212**, 1,851 assertions, across nine files (27.11s),
+separate from fixture-backed browser runs. Main/review/worktree TypeScript
+projects, strict OpenSpec validation and `bun run api:validate` pass; the unchanged
+single-schema `WorkspaceConflict.allOf` warning remains. Public revisions and
+published payloads are unchanged by these test/evidence corrections.

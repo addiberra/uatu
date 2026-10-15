@@ -5,10 +5,18 @@
 // shapes them (a .row-title it replaces, a .row-actions it reads buttons
 // out of) and assert on the resulting DOM and its own stylesheet text.
 
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import { parseHTML } from "linkedom";
 
 import { createDashboardGroups, dashboardGroupsStyle } from "./dashboard-groups";
+
+const globals = new Map(["document", "window"].map(key => [key, Object.getOwnPropertyDescriptor(globalThis, key)]));
+afterEach(() => {
+  for (const [key, descriptor] of globals) {
+    if (descriptor) Object.defineProperty(globalThis, key, descriptor);
+    else Reflect.deleteProperty(globalThis, key);
+  }
+});
 
 type Workspace = {
   id: string;

@@ -727,12 +727,24 @@ describe("authentication flow", () => {
     h.invalidate({ scope: "authentication", generation: 1, reason: "unauthorized" }); resolve(completed(ssh() as PublicCredentialDto & { type: "ssh" })); await settle();
     expect(h.root.querySelector(".mh-flow-page")?.hasAttribute("hidden")).toBe(true); expect(h.root.textContent).toContain("Sign in required"); expect(h.root.textContent).not.toContain("SSH identity");
   });
-  test("cancel and authentication-unavailable recovery clear secret nodes without exposing stale detail", async () => {
+  test("cancel and authoritative authentication loss clear secret nodes without exposing stale detail", async () => {
     let unavailable = false;
-    const h = harness({ readAuthentication: async () => unavailable ? { status: "unavailable", problem: { kind: "unavailable", message: "Authentication connection unavailable" } } : available({ status: "authenticated", identity: { user: "user", host: "hub.invalid", version: "test" } }) }); await h.ui.ready;
+    const h = harness({ readAuthentication: async () => unavailable ? { status: "unavailable", problem: { kind: "unauthorized", message: "Authentication expired" } } : available({ status: "authenticated", identity: { user: "user", host: "hub.invalid", version: "test" } }) }); await h.ui.ready;
     h.ui.showDetail({ kind: "add-credential" }); h.chooseKey("ssh", "generate"); h.set("passphrase", "secret-before-cancel"); const cancelled = h.input("passphrase"); h.click("cancel-sheet"); expect(cancelled.value).toBe("");
     h.click("ssh-generate"); h.set("passphrase", "secret-before-loss"); const oldInput = h.input("passphrase"); unavailable = true; await h.ui.refresh();
-    expect(oldInput.value).toBe(""); expect(h.root.querySelector(".mh-sheet")).toBeNull(); expect(h.root.querySelector(".mh-flow-page")?.hasAttribute("hidden")).toBe(true); expect(h.root.textContent).toContain("Authentication connection unavailable");
+    expect(oldInput.value).toBe(""); expect(h.root.querySelector(".mh-sheet")).toBeNull(); expect(h.root.querySelector(".mh-flow-page")?.hasAttribute("hidden")).toBe(true); expect(h.root.textContent).toContain("Sign in required");
+  });
+  test("transient authentication-read failure retains the masked draft until Cancel or authoritative loss", async () => {
+    let unavailable = false;
+    const h = harness({ readAuthentication: async () => unavailable ? { status: "unavailable", problem: { kind: "unavailable", message: "Authentication connection unavailable" } } : available({ status: "authenticated", identity: { user: "user", host: "hub.invalid", version: "test" } }) }); await h.ui.ready;
+    h.ui.showDetail({ kind: "add-credential" }); h.chooseKey("ssh", "generate"); h.set("name", "Unsubmitted draft"); h.set("passphrase", "disposable-draft");
+    const original = h.input("passphrase"), task = h.root.querySelector(".mh-sheet");
+    unavailable = true; await h.ui.refresh();
+    expect(h.root.querySelector(".mh-sheet")).toBe(task); expect(h.input("passphrase")).toBe(original); expect(original.type).toBe("password"); expect(original.value).toBe("disposable-draft"); expect(h.input("name").value).toBe("Unsubmitted draft");
+    expect(h.root.querySelector("[data-hub-revalidation]")?.textContent).toBe("Authentication connection unavailable"); expect(h.mutations("generateSsh")).toHaveLength(0);
+    unavailable = false; await h.ui.refresh(); expect(h.root.querySelector("[data-hub-revalidation]")).toBeNull(); expect(h.input("passphrase")).toBe(original);
+    h.invalidate({ scope: "authentication", generation: 1, reason: "unauthorized" });
+    expect(original.value).toBe(""); expect(h.root.querySelector(".mh-sheet")).toBeNull(); expect(h.root.textContent).toContain("Sign in required"); expect(h.mutations("generateSsh")).toHaveLength(0);
   });
   test("successful sign-in reads authenticated state without navigating a forged return URL", async () => {
     let authenticated = false;

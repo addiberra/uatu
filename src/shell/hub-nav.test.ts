@@ -1932,7 +1932,7 @@ describe("activating the current workspace in the switcher", () => {
       get: () => (focused !== null && page.document.contains(focused) ? focused : page.document.body),
     });
     const anchorPrototype = Object.getPrototypeOf(twin) as { focus: () => void };
-    const originalFocus = anchorPrototype.focus;
+    const originalFocus = Object.getOwnPropertyDescriptor(anchorPrototype, "focus");
     anchorPrototype.focus = function (this: Element) { focused = this; };
     try {
       twin.focus();
@@ -1941,7 +1941,8 @@ describe("activating the current workspace in the switcher", () => {
       expect(page.entry("twin") === twin).toBe(false);
       expect(page.document.activeElement === page.entry("twin")).toBe(true);
     } finally {
-      anchorPrototype.focus = originalFocus;
+      if (originalFocus) Object.defineProperty(anchorPrototype, "focus", originalFocus);
+      else Reflect.deleteProperty(anchorPrototype, "focus");
     }
   });
 
@@ -2093,7 +2094,7 @@ describe("fork controls of main checkouts that share a display name", () => {
       get: () => (focused !== null && page.document.contains(focused) ? focused : page.document.body),
     });
     const buttonPrototype = Object.getPrototypeOf(second) as { focus: () => void };
-    const originalFocus = buttonPrototype.focus;
+    const originalFocus = Object.getOwnPropertyDescriptor(buttonPrototype, "focus");
     buttonPrototype.focus = function (this: Element) { focused = this; };
     try {
       second.focus();
@@ -2104,7 +2105,8 @@ describe("fork controls of main checkouts that share a display name", () => {
       expect(page.document.activeElement === page.fork("docs-b")).toBe(true);
       expect(page.document.activeElement === page.fork("docs-a")).toBe(false);
     } finally {
-      buttonPrototype.focus = originalFocus;
+      if (originalFocus) Object.defineProperty(buttonPrototype, "focus", originalFocus);
+      else Reflect.deleteProperty(buttonPrototype, "focus");
     }
   });
 
