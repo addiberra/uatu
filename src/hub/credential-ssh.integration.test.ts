@@ -52,6 +52,83 @@ async function run(executable: string, args: string[], env: Record<string, strin
 }
 
 describe("managed SSH credential lifecycle", () => {
+  test("failed removal suppresses autoload without inventing locked facts, and unavailable probes remain unknown", async () => {
+    const found = await tools();
+    const root = await stateRoot("uatu-ssh-lock-facts-");
+    const metadata = new CredentialMetadataStore(credentialsPath(root));
+    await metadata.load();
+    const agent = new ManagedSshAgent({ runtimeDirectory: credentialRuntimePath(root), sshAgentPath: found.agent, uatuArgv: CLI_ARGV });
+    agents.push(agent);
+    const addPath = path.join(root, "controlled-ssh-add");
+    const normalAdd = `#!/bin/sh\nexec '${found.add}' "$@"\n`;
+    await writeFile(addPath, normalAdd, { mode: 0o700 });
+    const explicitLocks = new Set<string>();
+    const options = {
+      secretsDirectory: credentialSecretsPath(root), runtimeDirectory: credentialRuntimePath(root),
+      metadataStore: metadata, agent, sshKeygenPath: found.keygen, sshAddPath: addPath, explicitLocks,
+      createId: () => "lock-facts",
+    };
+    const service = new SshCredentialService(options);
+    const source = path.join(root, "source");
+    expect((await run(found.keygen, ["-q", "-t", "ed25519", "-N", "", "-f", source], cleanEnv())).code).toBe(0);
+    const key = await service.import("Disposable lock test", ["ssh-authentication"], await readFile(source, "utf8"), "");
+    await writeFile(addPath, `#!/bin/sh\nif [ "$1" = '-d' ]; then exit 1; fi\nexec '${found.add}' "$@"\n`, { mode: 0o700 });
+    const shutdown = agent.shutdown.bind(agent);
+    agent.shutdown = async () => { throw new Error("test-owned agent stop refusal"); };
+    try {
+      await expect(service.lock(key.id)).rejects.toThrow("test-owned agent stop refusal");
+      expect(explicitLocks.has(key.id)).toBe(true); // Suppression must survive failure.
+      expect(await service.testUsability(key.id)).toBe(true); // The real key is still usable.
+      expect((await service.facts(key.id)).lock).toBe("unlocked");
+    } finally { agent.shutdown = shutdown; }
+
+    await rm(addPath);
+    expect((await service.facts(key.id)).lock).toBe("unknown");
+    await writeFile(addPath, normalAdd, { mode: 0o700 });
+    await service.lock(key.id);
+    expect((await service.facts(key.id)).lock).toBe("locked");
+    expect(await service.testUsability(key.id)).toBe(false);
+    await writeFile(addPath, "#!/bin/sh\nexit 2\n", { mode: 0o700 });
+    expect((await service.facts(key.id)).lock).toBe("unknown"); // Agent/tool error, not confirmed absence.
+    await writeFile(addPath, normalAdd, { mode: 0o700 });
+    expect((await run(found.add, [source], { ...cleanEnv(), SSH_AUTH_SOCK: agent.currentSocket()! })).code).toBe(0);
+    const publicPath = path.join(credentialSecretsPath(root), `${key.id}.key.pub`);
+    const publicKey = await readFile(publicPath, "utf8");
+    await rm(publicPath);
+    // Independent usability uses the intact source public key, not the missing
+    // managed probe input. A successful earlier Lock cannot override this error.
+    expect((await run(found.add, ["-T", `${source}.pub`], { ...cleanEnv(), SSH_AUTH_SOCK: agent.currentSocket()! })).code).toBe(0);
+    const missingProbe = await run(found.add, ["-T", publicPath], { ...cleanEnv(), SSH_AUTH_SOCK: agent.currentSocket()! });
+    expect(missingProbe.code).toBe(1);
+    expect(missingProbe.output).toContain("Couldn't read public key");
+    expect(await service.facts(key.id)).toEqual({ protection: "unprotected", lock: "unknown", userId: null });
+    for (const invalid of ["not a public key\n", "ssh-ed25519 AAAA invalid\n", "", "x".repeat(32_769)]) {
+      await writeFile(publicPath, invalid, { mode: 0o600 });
+      expect((await service.facts(key.id)).lock).toBe("unknown");
+    }
+    await writeFile(publicPath, publicKey, { mode: 0o600 });
+    // The input can also disappear after the owner's bounded validation but
+    // before ssh-add opens it; the tool's exit-1 diagnostic must remain unknown.
+    await writeFile(addPath, `#!/bin/sh\nif [ "$1" = '-T' ]; then /bin/rm -f "$2"; fi\nexec '${found.add}' "$@"\n`, { mode: 0o700 });
+    expect((await service.facts(key.id)).lock).toBe("unknown");
+    await writeFile(publicPath, publicKey, { mode: 0o600 });
+    await writeFile(addPath, "#!/bin/sh\necho 'synthetic probe input failure' >&2\nexit 1\n", { mode: 0o700 });
+    expect((await service.facts(key.id)).lock).toBe("unknown");
+    await writeFile(addPath, normalAdd, { mode: 0o700 });
+    expect((await service.facts(key.id)).lock).toBe("unlocked"); // Current evidence overrides a prior Lock.
+    await service.lock(key.id);
+    await rm(addPath);
+    expect((await service.facts(key.id)).lock).toBe("unknown"); // Even after confirmed removal.
+    await shutdown();
+    expect((await service.facts(key.id)).lock).toBe("locked"); // Confirmed lock and no agent.
+    const rebuilt = new SshCredentialService(options);
+    expect((await rebuilt.facts(key.id)).lock).toBe("unknown"); // Intent alone is not evidence.
+    expect(await rebuilt.testUsability(key.id)).toBe(false);
+    expect(agent.currentSocket()).toBeUndefined(); // No suppressed autoload/agent start.
+    await rebuilt.lock(key.id); // With no managed agent, absence can be confirmed without a tool.
+    expect((await rebuilt.facts(key.id)).lock).toBe("locked");
+  }, 30_000);
+
   test("generates, imports, unlocks, locks, disables, enables, tests, and deletes without retaining its passphrase", async () => {
     const found = await tools();
     const root = await stateRoot("uatu-ssh-credential-");
@@ -84,8 +161,10 @@ describe("managed SSH credential lifecycle", () => {
 
     await service.unlock(generated.id, passphrase);
     expect(await service.testUsability(generated.id)).toBe(true);
+    expect(await service.facts(generated.id)).toEqual({ protection: "protected", lock: "unlocked", userId: null });
     await service.lock(generated.id);
     expect(await service.testUsability(generated.id)).toBe(false);
+    expect(await service.facts(generated.id)).toEqual({ protection: "protected", lock: "locked", userId: null });
     await service.unlock(generated.id, passphrase);
     await service.setEnabled(generated.id, false);
     expect(await service.testUsability(generated.id)).toBe(false);
@@ -164,6 +243,7 @@ describe("managed SSH credential lifecycle", () => {
 
     const imported = await service.import("Unencrypted", ["ssh-authentication"], await readFile(source, "utf8"), "");
     expect(await service.testUsability(imported.id)).toBe(true);
+    expect(await service.facts(imported.id)).toEqual({ protection: "unprotected", lock: "unlocked", userId: null });
     await agent.shutdown();
     expect(await service.testUsability(imported.id)).toBe(true);
 
@@ -194,6 +274,7 @@ describe("managed SSH credential lifecycle", () => {
     await agent.shutdown();
     await rm(path.join(credentialSecretsPath(root), `${imported.id}.key`));
     expect(await service.testUsability(imported.id)).toBe(false);
+    expect(await service.facts(imported.id)).toEqual({ protection: "unknown", lock: "unknown", userId: null });
   }, 30_000);
 
   test("a delete queued behind an in-flight unlock cannot leave the identity in the agent", async () => {

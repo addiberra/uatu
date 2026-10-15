@@ -1,12 +1,16 @@
-import { parsePublicCredentialDto } from "../credential-types";
+import { parsePublicCredentialDto, parsePublicToolReadinessDto } from "../credential-types";
 import type { PublicCredentialDto } from "../credential-types";
 import type { DefaultWorkspaceParentState } from "../preferences";
 import type { WorkspaceEntry } from "../registry";
 import type { HubApiCompatibility } from "../../shared/types";
+import { parseCheckoutState, type CheckoutState } from "../../shared/checkout-state";
+import type { CredentialFacts, ToolConfiguration } from "./backend";
+import type { PublicToolReadinessDto } from "../credential-types";
 
 /** Decoded current wire facts, NOT WorkspaceView or AuthenticationState.
  * Missing optional facts remain absent (unknown), not false/empty/non-Git.
- * The current API cannot supply the complete mobile branch/identity contract. */
+ * Optional checkout/credential facts are authoritative; legacy labels are not.
+ * Authentication identity is a separate, still-unimplemented contract. */
 export type HubWorkspaceSnapshot = Pick<WorkspaceEntry, "id" | "displayName" | "path" | "backend"> & {
   running: boolean;
   credentialRestartRequired: boolean;
@@ -19,6 +23,7 @@ export type HubWorkspaceSnapshot = Pick<WorkspaceEntry, "id" | "displayName" | "
   // A reported label: server.ts can fall back to a linked checkout's display
   // name. Do not promote this to BranchState.named or infer unborn/non-Git.
   branch?: string;
+  checkout?: CheckoutState;
   detached?: true;
   sourceRef?: string;
   ownership?: "uatu" | "external" | "uncertain";
@@ -104,6 +109,7 @@ function decodeWorkspace(value: unknown): HubWorkspaceSnapshot {
     }
   }
   if (row.ownership !== undefined) result.ownership = oneOf(row.ownership, ["uatu", "external", "uncertain"]);
+  if (row.checkout !== undefined) result.checkout = parseCheckoutState(row.checkout);
   if (row.availability !== undefined) result.availability = oneOf(row.availability, ["missing", "replaced"]);
   return result;
 }
@@ -130,6 +136,28 @@ export function decodeCredentialCatalog(value: unknown): PublicCredentialDto[] {
   }
   // The existing public parser validates type-specific capabilities, metadata,
   // assignments and readiness and rejects private/unknown credential fields.
-  // It does not infer protection, lock or OpenPGP user IDs from diagnostic text.
+  // Explicit optional facts never come from diagnostic text.
   return unique(credentials, credential => credential.id);
+}
+
+export function decodeCredentialTools(value: unknown) {
+  return unique(array(object(value).tools, parsePublicToolReadinessDto), tool => tool.tool);
+}
+
+export function credentialFactsFromSnapshot(credential: PublicCredentialDto): CredentialFacts {
+  const unknown = { status: "unknown" } as const;
+  const inapplicable = { status: "not-applicable" } as const;
+  const { id, type, facts } = credential;
+  if (type === "token") return { id, type, protection: inapplicable, lock: inapplicable, userId: inapplicable };
+  const protection = facts?.protection === "protected" || facts?.protection === "unprotected"
+    ? { status: "known" as const, value: facts.protection } : unknown;
+  const lock = facts?.lock === "locked" || facts?.lock === "unlocked"
+    ? { status: "known" as const, value: facts.lock } : unknown;
+  if (type === "ssh") return { id, type, protection, lock, userId: inapplicable };
+  return { id, type, protection, lock, userId: facts?.userId ? { status: "known", value: facts.userId } : unknown };
+}
+
+export function toolConfigurationFromSnapshot(tool: PublicToolReadinessDto): ToolConfiguration {
+  return { tool: tool.tool, savedOverride: tool.savedOverride === undefined
+    ? { status: "unknown" } : { status: "known", value: tool.savedOverride } };
 }

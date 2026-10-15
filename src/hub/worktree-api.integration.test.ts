@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, writeFile, readFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
@@ -28,6 +28,9 @@ import {
   parseWorktreeRefsResponse,
 } from "../shared/worktree-contract";
 import { parseLiveEnvelope, type LiveEnvelope } from "../shared/live-protocol";
+import { createGitRunner, repositoryContext } from "./worktree-git";
+import { decodeHubState } from "./mobile/live-read-model";
+import { assertOpenApiResponse, loadContract } from "../../tests/contracts/contract-harness";
 
 // Task 6.2 against the REAL Hub: Bun.serve, the registry, onboarding, the
 // worktree service and the published JSON family, over real temporary Git
@@ -43,6 +46,9 @@ let cookie = "";
 let server: ReturnType<typeof startHubServer>;
 let registry: WorkspaceRegistry;
 let atlasId = "";
+let gitCalls = 0;
+let startCalls = 0;
+let clockNow = Date.now();
 
 function cleanEnvironment(): Record<string, string> {
   return {
@@ -92,6 +98,7 @@ const onboardingGit: OnboardingGit = {
 
 const backend: SessionBackend = {
   async start(workspace, basePath): Promise<RunningSession> {
+    startCalls++;
     return {
       workspaceId: workspace.id,
       basePath,
@@ -153,7 +160,8 @@ beforeAll(async () => {
     provenance: new WorktreeProvenanceStore(path.join(state, "worktree-provenance.json")),
     registrar: createOnboardingWorktreeRegistrar({ onboarding, registry }),
     coordinator: new WorktreeOperationCoordinator(reservations),
-    git: { env: cleanEnvironment() },
+    git: { env: cleanEnvironment(), run: async (...args) => { gitCalls++; return createGitRunner({ env: cleanEnvironment() })(...args); } },
+    now: () => clockNow,
     unregister: async workspaceId => {
       await personalState.forgetWorkspace(workspaceId, () => registry.remove(workspaceId), async () => {
         await credentials.removeWorkspaceAssignments(workspaceId);
@@ -338,6 +346,48 @@ describe("worktree operations over JSON", () => {
     expect(created.started).toBe(false);
     expect(await git(path.join(root, "atlas.worktrees", "feature-login"), ["rev-parse", "--abbrev-ref", "HEAD"]))
       .toBe("feature/login\n");
+  });
+
+  test("linked state polls after classification expiry never fan out Git or disguise replaced identities", async () => {
+    const contract = await loadContract(path.resolve(import.meta.dir, "../../api/openapi.yaml"));
+    // Drain the existing operation-triggered reconciliation before measuring
+    // state GETs. It remains the authoritative inventory owner, not poll work.
+    await server.worktreeReconciler!.request(atlasId, "manual");
+    const linked = registry.list().find(row => row.worktree?.parentWorkspaceId === atlasId)!;
+    const context = await repositoryContext(linked.path, { env: cleanEnvironment() });
+    if (context.kind !== "checkout") throw new Error("expected checkout");
+    const before = gitCalls;
+    const startsBefore = startCalls;
+    const configFile = path.join(root, "atlas", ".git", "config");
+    const config = await readFile(configFile, "utf8");
+    try {
+      for (const setting of ["autocrlf = true", "abbrev = 7", "hooksPath = .githooks", "fsmonitor = true"]) {
+        await writeFile(configFile, `${config}\n[core]\n${setting}\n`);
+        clockNow += 3000;
+        const response = await fetch(`${origin}/api/hub/state`, withSession());
+        await assertOpenApiResponse(contract, { method: "GET", path: "/api/hub/state", response: response.clone() });
+        const state = decodeHubState(await response.json());
+        const child = state.workspaces.find(row => row.parentId === atlasId);
+        expect(child?.checkout).toEqual({ kind: "named", name: "feature/login" });
+        expect(child?.ownership).toBe("uatu");
+        expect(child?.availability).toBeUndefined(); // Existing desktop Delete eligibility.
+        expect(child?.running).toBe(false);
+      }
+    } finally { await writeFile(configFile, config); clockNow += 3000; }
+    const stampFile = path.join(context.gitDirectory, "uatu-checkout");
+    const stamp = await readFile(stampFile, "utf8");
+    try {
+      await writeFile(stampFile, `uatu-checkout-${crypto.randomUUID()}\n`);
+      clockNow += 3000;
+      const response = await fetch(`${origin}/api/hub/state`, withSession());
+      await assertOpenApiResponse(contract, { method: "GET", path: "/api/hub/state", response: response.clone() });
+      const child = decodeHubState(await response.json()).workspaces.find(row => row.id === linked.id)!;
+      expect(child.availability).toBe("replaced");
+      expect(child.ownership).toBe("uncertain");
+      expect(child.checkout?.kind).toBe("unavailable");
+    } finally { await writeFile(stampFile, stamp); clockNow += 3000; }
+    expect(gitCalls).toBe(before);
+    expect(startCalls).toBe(startsBefore);
   });
 
   test("a base that is not in the listing is refused without substituting one", async () => {

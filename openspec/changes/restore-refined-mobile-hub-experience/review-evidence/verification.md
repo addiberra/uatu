@@ -1,7 +1,34 @@
 # Current verification and known issues
 
-**Awaiting user review.** This is an unfinished frontend-first change; tests do
-not approve its visual design or authorize live integration, spec sync or archive.
+**Final acceptance remains open.** The 2026-10-15 user decision authorizes live
+integration, not visual/device certification, service rollout, spec sync or archive.
+
+## Current bounded live-facts slice — 2026-10-15
+
+**Approved metadata checkpoint:** the lead confirms renewed independent approval
+after the SSH lock/facts and checkout-file corrections, reporting **121 tests
+passed**, **208 API tests passed**, both typechecks, build and strict specification
+validation passed. These unchanged checks are reused, not rerun for this commit.
+See `live-facts-verification.md` for the approval provenance, historical red–green
+checks, contrary evidence and conservative supported-config limitations. No
+historical release/visual gate is closed by this work.
+
+Task 18.1 is complete; the corresponding initial 18.5 publication is verified,
+but 18.5 remains open for subsequent additions. Optional authoritative checkout,
+credential protection/lock/public-UID and saved-tool-override facts now flow
+through existing owners, authenticated routes and browser decoders. No UI mount,
+mutation adapter or service update is included. The user now authorizes this
+scoped commit; pushing is deferred until the final handoff. See
+[exact checks and limitations](live-facts-verification.md) and the
+[integration map](integration-map.md).
+
+Historical original results: focused/route rerun 490 passed; clean-environment credential/worktree
+regressions 193 passed; clean-environment `test:api` 208 passed; both TypeScript
+projects, API validation, isolated production compile and strict change validation
+passed. Earlier environment-sensitive failures and one temporary-runtime cleanup
+failure are retained in that evidence, not silently waived. These checks are
+self-verification, not independent review or browser/physical-device acceptance.
+The broader Chat touch 11 failures and historical archive mismatch remain open.
 
 ## Candidate scope
 
@@ -17,7 +44,7 @@ The new frontend is not yet wired to live Hub management operations. Workspace
 interior layouts and controls are not redesigned. Review hosting defaults to
 local-only; an optional public origin requires explicit local configuration.
 
-## Pinned-upstream compatibility verification (uncommitted merge)
+## Historical pinned-upstream compatibility verification (then-uncommitted merge)
 
 Baseline `37047e5` is retained as `recovery/hub-mobile-navigation-37047e5`.
 The merge target is `c3a8306`; no commit, push or PR update is authorized here.

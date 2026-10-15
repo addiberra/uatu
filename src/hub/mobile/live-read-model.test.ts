@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { decodeCredentialCatalog, decodeDefaultFolder, decodeHubState } from "./live-read-model";
+import { credentialFactsFromSnapshot, decodeCredentialCatalog, decodeCredentialTools, decodeDefaultFolder, decodeHubState, toolConfigurationFromSnapshot } from "./live-read-model";
 
 const workspace = (id = "a") => ({
   id, displayName: "Same name", path: `/projects/${id}`, backend: "local", running: false,
@@ -16,6 +16,43 @@ const credential = (type: "ssh" | "openpgp" | "token" = "ssh") => ({
 });
 
 describe("current Hub read decoders", () => {
+  test("authoritative checkout variants survive decoding independently of legacy fallback labels", () => {
+    for (const checkout of [{ kind: "named", name: "topic" }, { kind: "unborn", name: "new" }, { kind: "detached", commit: "a".repeat(40) }, { kind: "non-git" }, { kind: "unavailable", message: "Unavailable" }]) {
+      const decoded = decodeHubState({ ...state(), workspaces: [{ ...workspace(), branch: "fallback", checkout }] });
+      expect<unknown>(decoded.workspaces[0]!.checkout).toEqual(checkout);
+      expect(decoded.workspaces[0]!.running).toBe(false);
+    }
+    expect(decodeHubState(state()).workspaces[0]).not.toHaveProperty("checkout");
+    for (const checkout of [{ kind: "detached" }, { kind: "named", name: "" }, { kind: "non-git", name: "fake" }, { kind: "loading" }, { kind: "detached", commit: "abbrev" }]) {
+      expect(() => decodeHubState({ ...state(), workspaces: [{ ...workspace(), checkout }] })).toThrow();
+    }
+  });
+
+  test("credential facts preserve protection/lock/UID and remain unknown for old payloads regardless of readiness prose", () => {
+    for (const protection of ["protected", "unprotected", "unknown"]) {
+      const row = decodeCredentialCatalog({ credentials: [{ ...credential(), facts: { protection, lock: "unknown", userId: null } }] })[0]!;
+      expect<unknown>(row.facts?.protection).toBe(protection);
+      expect(credentialFactsFromSnapshot(row).lock).toEqual({ status: "unknown" });
+    }
+    const old = decodeCredentialCatalog({ credentials: [credential()] })[0]!;
+    expect(credentialFactsFromSnapshot(old).protection).toEqual({ status: "unknown" });
+    const pgp = decodeCredentialCatalog({ credentials: [{ ...credential("openpgp"), facts: { protection: "unknown", lock: "unlocked", userId: "Signer <signer@example.test>" } }] })[0]!;
+    expect(credentialFactsFromSnapshot(pgp).userId).toEqual({ status: "known", value: "Signer <signer@example.test>" });
+    for (const facts of [{ protection: "protected", lock: "ready", userId: null }, { protection: "unprotected", lock: "locked", userId: "not-applicable" }, { protection: "unknown", lock: "unknown", userId: null, privateKey: "reject" }]) {
+      expect(() => decodeCredentialCatalog({ credentials: [{ ...credential(), facts }] })).toThrow();
+    }
+  });
+
+  test("tool absence and saved overrides are independent of effective paths and legacy omission", () => {
+    const tool = { tool: "ssh", path: null, version: null, guidance: "Install", results: [] };
+    for (const savedOverride of [undefined, null, "/saved/missing/ssh"]) {
+      const [decoded] = decodeCredentialTools({ tools: [{ ...tool, ...(savedOverride === undefined ? {} : { savedOverride }) }] });
+      expect(decoded!.path).toBeNull();
+      expect(toolConfigurationFromSnapshot(decoded!).savedOverride).toEqual(savedOverride === undefined ? { status: "unknown" } : { status: "known", value: savedOverride });
+    }
+    expect(() => decodeCredentialTools({ tools: [{ ...tool, savedOverride: "relative" }] })).toThrow();
+    expect(() => decodeCredentialTools({ tools: [tool, tool] })).toThrow();
+  });
   test("keeps absent facts unknown and assignment names distinct from ids", () => {
     const result = decodeHubState(state());
     expect<unknown>(result.workspaces[0]).toEqual(workspace());

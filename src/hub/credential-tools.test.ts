@@ -29,6 +29,23 @@ async function executable(name: string): Promise<{ directory: string; filePath: 
 }
 
 describe("credential executable discovery", () => {
+  test("saved override differs from automatic/effective discovery, survives an absent binary and GET-like lists never reprobe", async () => {
+    const { directory, filePath } = await executable("git");
+    const store = new CredentialToolOverrideStore(path.join(directory, "tools.json"));
+    let probes = 0;
+    const manager = new CredentialToolManager(store, directory, async discovery => {
+      probes++;
+      return { tool: discovery.tool, path: discovery.path, version: null, guidance: null, results: [] };
+    });
+    await manager.load();
+    expect(manager.list().find(row => row.tool === "git")).toMatchObject({ path: filePath, savedOverride: null });
+    await store.set({ tool: "git", path: "/missing/saved/git" });
+    await manager.reprobeAll();
+    expect(manager.list().find(row => row.tool === "git")).toMatchObject({ path: "/missing/saved/git", savedOverride: "/missing/saved/git" });
+    const before = probes;
+    for (let i = 0; i < 10; i++) manager.list();
+    expect(probes).toBe(before);
+  });
   test("discovers fixed executable names from PATH without invoking them", async () => {
     const { directory, filePath } = await executable("git");
     expect(await discoverExecutable("git", { path: directory })).toEqual({

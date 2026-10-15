@@ -33,7 +33,8 @@
 
 import { createHash } from "node:crypto";
 import path from "node:path";
-import { promises as fs } from "node:fs";
+import { constants, promises as fs } from "node:fs";
+import type { CheckoutState } from "../shared/checkout-state";
 
 import { WorktreeOperationError, type WorktreeIdentity } from "../shared/worktree-contract";
 
@@ -251,7 +252,11 @@ const TOKEN_PATTERN = /^uatu-checkout-[0-9a-f-]{36}$/;
 
 async function readIdentityToken(gitDirectory: string): Promise<string | null | "unreadable"> {
   try {
-    const token = (await fs.readFile(path.join(gitDirectory, CHECKOUT_IDENTITY_FILE), "utf8")).trim();
+    const file = path.join(gitDirectory, CHECKOUT_IDENTITY_FILE);
+    await fs.lstat(file);
+    const contents = await readSmall(file);
+    if (contents === null) return "unreadable";
+    const token = contents.trim();
     return TOKEN_PATTERN.test(token) ? token : "unreadable";
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
@@ -511,23 +516,222 @@ export type CheckoutHead =
   | { readonly kind: "detached" }
   | { readonly kind: "unknown" };
 
+/** null proves absence; undefined is unsupported, unreadable or over budget. */
+async function readAdministrativeFile(file: string, limit = 4096): Promise<string | null | undefined> {
+  try {
+    const handle = await fs.open(file, constants.O_RDONLY | constants.O_NONBLOCK);
+    try {
+      const stats = await handle.stat();
+      if (!stats.isFile() || stats.size > limit) return undefined;
+      const buffer = Buffer.alloc(limit + 1);
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+      return bytesRead > limit ? undefined : buffer.subarray(0, bytesRead).toString("utf8");
+    } finally { await handle.close(); }
+  } catch (error) { return (error as NodeJS.ErrnoException).code === "ENOENT" ? null : undefined; }
+}
+
+// A recognizer for a deliberately small Git-config subset, NOT a Git parser.
+// Accept ordinary section/key lines and plain or wholly quoted values only.
+// Includes, escapes/continuations, worktree config, alternate worktree roots,
+// bare layouts and unknown repository extensions require Git's interpretation
+// and therefore stay unavailable on this subprocess-free list path.
+function supportedConfigObjectIdLength(config: string): 40 | 64 | undefined {
+  if (/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(config)) return undefined;
+  let section: string | undefined;
+  let format = "0";
+  let objectFormat: string | undefined;
+  for (const raw of config.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || /^[#;]/.test(line)) continue;
+    const header = /^\[([a-z][a-z0-9.-]*)(?:[ \t]+"([^"\\]*)")?\][ \t]*(?:[#;].*)?$/i.exec(line);
+    if (header) {
+      section = header[1]!.toLowerCase();
+      if (/^include(?:if)?(?:\.|$)/.test(section)) return undefined;
+      if ((section === "core" || section === "extensions") && header[2] !== undefined) return undefined;
+      continue;
+    }
+    if (!section) return undefined;
+    const assignment = /^([a-z][a-z0-9-]*)(?:[ \t]*=[ \t]*(.*))?$/i.exec(line);
+    if (!assignment) return undefined;
+    const key = assignment[1]!.toLowerCase();
+    const rawValue = assignment[2];
+    let value = "true"; // A bare key is Git's implicit boolean true.
+    if (rawValue !== undefined) {
+      if (rawValue.startsWith('"')) {
+        const quoted = /^"([^"\\]*)"[ \t]*(?:[#;].*)?$/.exec(rawValue);
+        if (!quoted) return undefined;
+        value = quoted[1]!;
+      } else {
+        value = rawValue.replace(/[#;].*$/, "").trim();
+        if (/["\\]/.test(value)) return undefined;
+      }
+    }
+    if (section === "core") {
+      if (key === "repositoryformatversion") {
+        if (value !== "0" && value !== "1") return undefined;
+        format = value;
+      } else if (key === "bare") {
+        if (!/^(false|no|off|0)$/i.test(value)) return undefined;
+      } else if (["filemode", "logallrefupdates", "ignorecase", "precomposeunicode", "symlinks"].includes(key)) {
+        if (!/^(true|yes|on|1|false|no|off|0)$/i.test(value)
+          && !(key === "logallrefupdates" && value === "always")) return undefined;
+      } else if (key === "autocrlf") {
+        if (!/^(true|yes|on|1|false|no|off|0|input)$/i.test(value)) return undefined;
+      } else if (key === "abbrev") {
+        if (!/^(auto|no|off|false)$/i.test(value)
+          && !(/^\d+$/.test(value) && Number(value) >= 4 && Number(value) <= 64)) return undefined;
+      } else if (key === "worktree") return undefined;
+      // Other core settings (autocrlf, abbrev, hooksPath, fsmonitor, etc.) do
+      // not relocate this checkout or select its object/ref format. Do not
+      // turn ordinary Git preferences or ignored unknown keys into lost identity.
+    } else if (section === "extensions") {
+      if (key === "objectformat" && (value === "sha1" || value === "sha256")) objectFormat = value;
+      else if (key !== "refstorage" || value !== "files") return undefined;
+    }
+  }
+  if (objectFormat !== undefined && format !== "1") return undefined;
+  return objectFormat === "sha256" ? 64 : 40;
+}
+
+// Read only bounded administrative files; never Git, object traversal, or a
+// workspace Start. Unsupported ref stores and incomplete reads stay unknown.
+async function readCheckoutMetadataState(checkoutPath: string, legacy: { head: CheckoutHead; identityReadable?: boolean }): Promise<CheckoutState> {
+  const unavailable: CheckoutState = { kind: "unavailable", message: "Checkout metadata is unavailable." };
+  const read = readAdministrativeFile;
+  try {
+    if (!(await fs.stat(checkoutPath)).isDirectory()) return unavailable;
+    const dotGit = path.join(checkoutPath, ".git");
+    let stats;
+    try { stats = await fs.lstat(dotGit); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") return unavailable;
+      // A bare repository has no checkout HEAD to present here, but is not
+      // a non-Git folder. Leave that unsupported layout explicit.
+      if (await read(path.join(checkoutPath, "HEAD")) !== null) return unavailable;
+      // A registered subdirectory may inherit Git from an ancestor. We don't
+      // model its HEAD as a checkout root, nor falsely call it non-Git.
+      let parent = path.dirname(path.resolve(checkoutPath));
+      for (let depth = 0; depth < 64; depth++) {
+        try { await fs.lstat(path.join(parent, ".git")); return unavailable; }
+        catch (ancestorError) { if ((ancestorError as NodeJS.ErrnoException).code !== "ENOENT") return unavailable; }
+        const next = path.dirname(parent);
+        if (next === parent) return { kind: "non-git" };
+        parent = next;
+      }
+      return unavailable;
+    }
+    let directory = dotGit;
+    if (stats.isFile()) {
+      const pointer = await read(dotGit);
+      const match = pointer?.match(/^gitdir: ([^\r\n]+)\r?\n?$/);
+      if (!match?.[1]) return unavailable;
+      directory = path.resolve(checkoutPath, match[1]);
+    } else if (!stats.isDirectory()) return unavailable;
+    const head = (await read(path.join(directory, "HEAD")))?.trim();
+    if (!head) return unavailable;
+    const oid = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/;
+    const symbolic = /^ref: refs\/heads\/(.+)$/.exec(head)?.[1];
+    // Preserve the sparse legacy label even when the richer fact cannot be
+    // established (for example an unsupported ref store). One HEAD read.
+    if (symbolic) legacy.head = { kind: "branch", branch: symbolic };
+    else if (oid.test(head)) legacy.head = { kind: "detached" };
+    const commonPointer = await read(path.join(directory, "commondir"));
+    if (commonPointer === undefined) return unavailable;
+    if (commonPointer !== null && !commonPointer.trim()) return unavailable;
+    const common = commonPointer === null ? directory : path.resolve(directory, commonPointer.trim());
+    const config = await read(path.join(common, "config"), 65536);
+    if (config === undefined || config === null) return unavailable;
+    const objectIdLength = supportedConfigObjectIdLength(config);
+    if (objectIdLength === undefined) return unavailable;
+    const configuredOid = new RegExp(`^[0-9a-f]{${objectIdLength}}$`);
+    if (!(await fs.stat(path.join(common, "objects"))).isDirectory()
+      || !(await fs.stat(path.join(common, "refs"))).isDirectory()) return unavailable;
+    if (configuredOid.test(head)) {
+      legacy.identityReadable = true;
+      return { kind: "detached", commit: head };
+    }
+    const name = /^ref: refs\/heads\/(.+)$/.exec(head)?.[1];
+    if (!name || name.split("/").some(segment => !segment || segment.startsWith(".") || segment.endsWith(".lock"))
+      || /[\x00-\x20\x7f~^:?*\[\\]/.test(name) || name.includes("..") || name.includes("@{") || name.endsWith(".")) return unavailable;
+    // Git's checkout identity depends on valid HEAD/setup, not on successfully
+    // reading the branch tip. Oversized/unsupported ref contents may withhold
+    // the richer branch fact without hiding existing desktop worktree actions.
+    legacy.identityReadable = true;
+    const loose = await read(path.join(common, "refs", "heads", name));
+    if (loose === undefined) return unavailable;
+    if (loose !== null) return configuredOid.test(loose.trim()) ? { kind: "named", name } : unavailable;
+    const packed = await read(path.join(common, "packed-refs"), 1024 * 1024);
+    if (packed === undefined) return unavailable;
+    for (const line of (packed ?? "").split(/\r?\n/)) {
+      if (!line || line.startsWith("#") || line.startsWith("^")) continue;
+      const [commit, ref] = line.split(" ");
+      if (!commit || !configuredOid.test(commit) || !ref) return unavailable;
+      if (ref === `refs/heads/${name}`) return { kind: "named", name };
+    }
+    return { kind: "unborn", name };
+  } catch { return unavailable; }
+}
+
+export async function readCheckoutFacts(checkoutPath: string): Promise<{ head: CheckoutHead; checkout: CheckoutState }> {
+  const legacy: { head: CheckoutHead } = { head: { kind: "unknown" } };
+  const checkout = await readCheckoutMetadataState(checkoutPath, legacy);
+  return { head: legacy.head, checkout };
+}
+
+export async function readCheckoutState(checkoutPath: string): Promise<CheckoutState> {
+  return (await readCheckoutFacts(checkoutPath)).checkout;
+}
+
 export type CheckoutGitLink = "directory" | "file" | "none";
 
-const HEAD_LIMIT = 4096;
+/** List-only identity inspection. Mutating operations still use inspectCheckout
+ * and Git. Linked gitdir/commondir/backlink/stamp must all agree; no fallback
+ * process is allowed on this polled path. */
+export async function inspectCheckoutFromFiles(checkoutPath: string): Promise<CheckoutInspection> {
+  const unknown: CheckoutInspection = { present: true, identityReadable: false };
+  try {
+    if (!(await fs.stat(checkoutPath)).isDirectory()) return unknown;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    return code === "ENOENT" || code === "ENOTDIR" ? { present: false, identityReadable: true } : unknown;
+  }
+  try {
+    const dotGit = path.join(checkoutPath, ".git");
+    const stats = await fs.lstat(dotGit);
+    let directory = dotGit;
+    if (stats.isFile()) {
+      const pointer = await readSmall(dotGit);
+      const match = pointer?.match(/^gitdir: ([^\r\n]+)\r?\n?$/);
+      if (!match?.[1]) return unknown;
+      directory = path.resolve(checkoutPath, match[1]);
+    } else if (!stats.isDirectory()) return unknown;
+    // A stamp/backlink identifies administrative paths, not a valid checkout.
+    // Validate HEAD/config/layout, independently of richer branch-ref facts.
+    const metadata: { head: CheckoutHead; identityReadable?: boolean } = { head: { kind: "unknown" } };
+    await readCheckoutMetadataState(checkoutPath, metadata);
+    if (!metadata.identityReadable) return unknown;
+    let common = directory;
+    try {
+      await fs.lstat(path.join(directory, "commondir"));
+      const pointer = await readSmall(path.join(directory, "commondir"));
+      if (!pointer?.trim()) return unknown;
+      common = path.resolve(directory, pointer.trim());
+    } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") return unknown; }
+    const [canonicalCommon, canonicalGit] = await Promise.all([fs.realpath(common), fs.realpath(directory)]);
+    const identity = worktreeIdentityFor(canonicalCommon, canonicalGit);
+    if (canonicalCommon !== canonicalGit) {
+      const backlink = await readSmall(path.join(directory, "gitdir"));
+      if (!backlink?.trim() || await fs.realpath(path.resolve(directory, backlink.trim())) !== await fs.realpath(dotGit)) return unknown;
+      const token = await readIdentityToken(canonicalGit);
+      if (token === "unreadable") return unknown;
+      if (token !== null) identity.checkoutId = digest(`${canonicalGit}\n${token}`);
+    }
+    return { present: true, identityReadable: true, identity };
+  } catch { return unknown; }
+}
 
 async function readSmall(file: string): Promise<string | null> {
-  try {
-    const handle = await fs.open(file, "r");
-    try {
-      const buffer = Buffer.alloc(HEAD_LIMIT);
-      const { bytesRead } = await handle.read(buffer, 0, HEAD_LIMIT, 0);
-      return buffer.subarray(0, bytesRead).toString("utf8");
-    } finally {
-      await handle.close();
-    }
-  } catch {
-    return null;
-  }
+  return await readAdministrativeFile(file) ?? null;
 }
 
 // What `<checkout>/.git` is: a directory for a main checkout, a `gitdir:`
@@ -549,19 +753,5 @@ export async function checkoutGitLink(checkoutPath: string): Promise<CheckoutGit
 // unexpected is "unknown", never a guessed `main`. A symbolic ref outside
 // refs/heads (rare, hand-edited) is also unknown.
 export async function readCheckoutHead(checkoutPath: string): Promise<CheckoutHead> {
-  const link = await checkoutGitLink(checkoutPath);
-  let gitDirectory: string;
-  if (link === "directory") gitDirectory = path.join(checkoutPath, ".git");
-  else if (link === "file") {
-    const pointer = await readSmall(path.join(checkoutPath, ".git"));
-    const match = pointer === null ? null : /^gitdir: (.+)$/m.exec(pointer);
-    if (!match?.[1]) return { kind: "unknown" };
-    gitDirectory = path.resolve(checkoutPath, match[1].trim());
-  } else return { kind: "unknown" };
-  const head = (await readSmall(path.join(gitDirectory, "HEAD")))?.trim();
-  if (!head) return { kind: "unknown" };
-  const symbolic = /^ref: refs\/heads\/(.+)$/.exec(head);
-  if (symbolic?.[1]) return { kind: "branch", branch: symbolic[1] };
-  if (/^[0-9a-f]{40}([0-9a-f]{24})?$/.test(head)) return { kind: "detached" };
-  return { kind: "unknown" };
+  return (await readCheckoutFacts(checkoutPath)).head;
 }

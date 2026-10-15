@@ -44,6 +44,7 @@ import {
 import {
   createGitRunner,
   inspectCheckout,
+  inspectCheckoutFromFiles,
   listRefs,
   listWorktrees,
   probeGitCapabilities,
@@ -972,7 +973,7 @@ export class WorktreeService {
 
   // Cheap facts for the Hub state list: provenance by the registration's
   // recorded identity plus a filesystem/identity probe of its path. The
-  // probe runs Git only for a present path, once per registered child.
+  // list-only probe reads bounded Git administrative files, never subprocesses.
   async registeredOwnership(workspaceId: string): Promise<"uatu" | "external" | "uncertain"> {
     return (await this.registeredClassification(workspaceId)).ownership;
   }
@@ -989,7 +990,7 @@ export class WorktreeService {
     const now = this.now();
     const matches = (item: typeof cached) => item?.path === entry.path && item.repositoryId === link.repositoryId && item.checkoutId === link.checkoutId;
     if (cached && now - cached.at < AVAILABILITY_CACHE_MS && matches(cached)) return cached;
-    const inspection = await inspectCheckout(entry.path, { ...this.options.git, run: this.run });
+    const inspection = await inspectCheckoutFromFiles(entry.path);
     const resolved = await ownershipForCheckout({ provenance: this.options.provenance, inspection, checkoutPath: entry.path, registeredIdentity: link });
     const refreshed = this.availabilityCache.get(workspaceId);
     if (refreshed && refreshed !== cached && matches(refreshed)) return refreshed;

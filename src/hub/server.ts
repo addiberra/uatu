@@ -60,7 +60,7 @@ import type { AgentAccountsApi } from "./agent-account-service";
 import { createWorktreeApi, isWorktreeApiPath, WORKTREE_API_PATH, type WorktreeStartOutcome } from "./worktree-api";
 import { assertNoRegisteredWorktreeDependents, type WorktreeService } from "./worktree-service";
 import { WorktreeReconciler } from "./worktree-reconciler";
-import { checkoutGitLink, readCheckoutHead } from "./worktree-git";
+import { checkoutGitLink, readCheckoutFacts } from "./worktree-git";
 import { WorktreeOperationError } from "../shared/worktree-contract";
 import { LiveEndpoint } from "./live-endpoint";
 import { createHubUpstreamSource } from "./live-source";
@@ -508,22 +508,22 @@ export function createHubFetchHandler(deps: HubDeps) {
   const worktreeStateFacts = async (): Promise<Map<string, Record<string, unknown>>> => {
     const facts = new Map<string, Record<string, unknown>>();
     const service = deps.worktrees;
-    if (!service) return facts;
     const entries = registry.list();
     const familyRepository = new Map<string, string>();
     for (const entry of entries) {
       if (entry.worktree) familyRepository.set(entry.worktree.parentWorkspaceId, entry.worktree.repositoryId);
     }
     await Promise.all(entries.map(async entry => {
-      const head = await readCheckoutHead(entry.path);
+      const { head, checkout } = await readCheckoutFacts(entry.path);
       const link = entry.worktree;
       const repositoryId = link?.repositoryId ?? familyRepository.get(entry.id);
       const fact: Record<string, unknown> = {
+        checkout,
         ...(repositoryId === undefined ? {} : { repositoryId }),
         ...(head.kind === "branch" ? { branch: head.branch } : {}),
         ...(head.kind === "detached" ? { detached: true } : {}),
       };
-      if (link) {
+      if (link && service) {
         fact.parentId = link.parentWorkspaceId;
         fact.ownership = await service.registeredOwnership(entry.id);
         // A child is named by the branch it was registered on; its current
@@ -532,8 +532,11 @@ export function createHubFetchHandler(deps: HubDeps) {
         const origin = await service.branchOrigin(link.repositoryId, String(fact.branch));
         if (origin !== undefined) fact.sourceRef = origin;
         const availability = await service.registeredAvailability(entry.id);
-        if (availability !== "present") fact.availability = availability;
-      } else if (await checkoutGitLink(entry.path) === "directory") {
+        if (availability !== "present") {
+          fact.availability = availability;
+          fact.checkout = { kind: "unavailable", message: "Registered checkout could not be verified." };
+        }
+      } else if (service && await checkoutGitLink(entry.path) === "directory") {
         fact.createWorktree = true;
       }
       facts.set(entry.id, fact);

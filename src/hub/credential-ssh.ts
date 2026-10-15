@@ -1,11 +1,11 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, createPrivateKey, randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { constants, promises as fs } from "node:fs";
 import path from "node:path";
 
 import { CredentialMetadataStore } from "./credential-store";
 import { ManagedSshAgent } from "./credential-ssh-agent";
-import type { CredentialCapability, SshCredentialRecord } from "./credential-types";
+import type { CredentialCapability, SshCredentialRecord, PublicCredentialFacts } from "./credential-types";
 
 const ECHO_FLAG = 0x00000008;
 const OPERATION_TIMEOUT_MS = 15_000;
@@ -65,7 +65,7 @@ function terminateDetachedProcess(child: SpawnedProcess): void {
 export type SshCredentialOperations = Pick<
   SshCredentialService,
   "generate" | "import" | "unlock" | "lock" | "setEnabled" | "delete" | "testUsability"
->;
+> & { facts?: (credentialId: string) => Promise<PublicCredentialFacts> };
 
 function credentialFile(directory: string, credentialId: string): string {
   if (!/^[A-Za-z0-9_-]{1,128}$/.test(credentialId)) throw new Error("invalid SSH credential id");
@@ -86,6 +86,23 @@ function encryptedPrivateKey(value: string): boolean {
   } catch {
     return false;
   }
+}
+
+function privateKeyProtection(value: string): PublicCredentialFacts["protection"] {
+  const match = value.match(/-----BEGIN OPENSSH PRIVATE KEY-----\s*([A-Za-z0-9+/=\s]+)-----END OPENSSH PRIVATE KEY-----/);
+  if (match) {
+    try {
+      const bytes = Buffer.from(match[1]!.replace(/\s/g, ""), "base64");
+      const magic = Buffer.from("openssh-key-v1\0");
+      if (!bytes.subarray(0, magic.length).equals(magic)) return "unknown";
+      const length = bytes.readUInt32BE(magic.length);
+      if (!length || length > 128 || magic.length + 4 + length >= bytes.length) return "unknown";
+      const cipher = bytes.subarray(magic.length + 4, magic.length + 4 + length).toString("ascii");
+      return cipher === "none" ? "unprotected" : /^[a-z0-9-]+$/.test(cipher) ? "protected" : "unknown";
+    } catch { return "unknown"; }
+  }
+  if (encryptedPrivateKey(value)) return "protected";
+  try { createPrivateKey(value); return "unprotected"; } catch { return "unknown"; }
 }
 
 function publicMetadata(publicKey: string): { publicKey: string; fingerprint: string } {
@@ -212,15 +229,15 @@ async function executableFromPath(name: string, environmentPath: string): Promis
   throw new Error(`${name} is unavailable`);
 }
 
-async function readPublicKey(executable: string, args: string[], env: Record<string, string>, timeoutMs: number): Promise<PtyResult> {
+async function readToolOutput(executable: string, args: string[], env: Record<string, string>, timeoutMs: number, stream: "stdout" | "stderr" = "stdout"): Promise<PtyResult & { outputExceeded: boolean }> {
   const child = Bun.spawn([executable, ...args], {
     stdin: "ignore",
-    stdout: "pipe",
-    stderr: "ignore",
+    stdout: stream === "stdout" ? "pipe" : "ignore",
+    stderr: stream === "stderr" ? "pipe" : "ignore",
     env,
     detached: process.platform !== "win32",
   });
-  const reader = child.stdout.getReader();
+  const reader = (child[stream] as ReadableStream<Uint8Array>).getReader();
   let timedOut = false;
   const timer = setTimeout(() => {
     timedOut = true;
@@ -230,11 +247,13 @@ async function readPublicKey(executable: string, args: string[], env: Record<str
   try {
     const chunks: Uint8Array[] = [];
     let size = 0;
+    let outputExceeded = false;
     try {
       for (;;) {
         const next = await reader.read();
         if (next.done) break;
         const remaining = MAX_PUBLIC_OUTPUT_BYTES - size;
+        if (next.value.length > remaining) outputExceeded = true;
         if (remaining > 0) chunks.push(next.value.slice(0, remaining));
         size += Math.min(next.value.length, Math.max(remaining, 0));
       }
@@ -253,7 +272,7 @@ async function readPublicKey(executable: string, args: string[], env: Record<str
       bytes.set(chunk, offset);
       offset += chunk.length;
     }
-    return { exitCode, publicOutput: new TextDecoder().decode(bytes) };
+    return { exitCode, publicOutput: new TextDecoder().decode(bytes), outputExceeded };
   } finally {
     clearTimeout(timer);
     await reader.cancel().catch(() => undefined);
@@ -325,6 +344,10 @@ export class SshCredentialService {
   // Runtime state by design: the agent's contents do not survive a Hub
   // restart either.
   private readonly explicitlyLocked: Set<string>;
+  // Autoload suppression is intent, not evidence: a failed removal can leave
+  // the key usable. Only a completed removal/no-agent observation confirms a
+  // lock, and current positive/failed agent probes take precedence in facts.
+  private readonly confirmedLocks = new Set<string>();
   // Agent-mutating operations serialize per credential: a pending ssh-add
   // must not land its identity after a concurrent disable/delete finished
   // revoking the credential, which would leave the deleted key usable
@@ -397,7 +420,7 @@ export class SshCredentialService {
             timeoutMs: this.timeoutMs,
             capturePublicKey: true,
           })
-        : await readPublicKey(this.options.sshKeygenPath, ["-y", "-f", privatePath], this.toolEnvironment(), this.timeoutMs);
+        : await readToolOutput(this.options.sshKeygenPath, ["-y", "-f", privatePath], this.toolEnvironment(), this.timeoutMs);
       if (result.exitCode !== 0) throw new Error("SSH private key could not be unlocked");
       const match = result.publicOutput.match(SSH_PUBLIC_KEY);
       if (!match?.[1]) throw new Error("SSH private key did not yield a public key");
@@ -465,6 +488,7 @@ export class SshCredentialService {
       throw new Error("SSH credential could not be unlocked");
     }
     this.explicitlyLocked.delete(credentialId);
+    this.confirmedLocks.delete(credentialId);
   }
 
   lock(credentialId: string): Promise<void> {
@@ -476,8 +500,12 @@ export class SshCredentialService {
     // Set before removal so a concurrent readiness check cannot auto-load
     // the key back between the agent removal and the lock response.
     this.explicitlyLocked.add(credentialId);
+    this.confirmedLocks.delete(credentialId);
     const socket = this.options.agent.currentSocket();
-    if (!socket) return;
+    if (!socket) {
+      this.confirmedLocks.add(credentialId);
+      return;
+    }
     const exitCode = await runQuiet(
       this.options.sshAddPath,
       ["-d", `${credentialFile(this.options.secretsDirectory, credentialId)}.pub`],
@@ -488,6 +516,7 @@ export class SshCredentialService {
       await this.options.agent.shutdown();
       throw new Error("SSH credential could not be removed; the managed agent was stopped");
     }
+    if (exitCode === 0) this.confirmedLocks.add(credentialId);
   }
 
   setEnabled(credentialId: string, enabled: boolean): Promise<void> {
@@ -501,7 +530,10 @@ export class SshCredentialService {
       if (!enabled) await this.lockNow(credentialId);
       // Re-enabling restores the credential's normal readiness behavior; an
       // unencrypted key becomes auto-loadable again, as after a Hub restart.
-      else this.explicitlyLocked.delete(credentialId);
+      else {
+        this.explicitlyLocked.delete(credentialId);
+        this.confirmedLocks.delete(credentialId);
+      }
     });
   }
 
@@ -514,7 +546,7 @@ export class SshCredentialService {
     const privatePath = credentialFile(this.options.secretsDirectory, credentialId);
     const publicPath = `${privatePath}.pub`;
     const deleted = await this.options.metadataStore.deleteCredentialWithCleanup(credentialId, unassign, async credential => {
-      await this.lockBacking(credentialId);
+      await this.lockBacking(credentialId, (credential as SshCredentialRecord).metadata.publicKey);
       await this.removeFile(publicPath);
       try {
         await this.removeFile(privatePath);
@@ -528,7 +560,10 @@ export class SshCredentialService {
         throw error;
       }
     });
-    if (deleted) this.explicitlyLocked.delete(credentialId);
+    if (deleted) {
+      this.explicitlyLocked.delete(credentialId);
+      this.confirmedLocks.delete(credentialId);
+    }
     return deleted;
   }
 
@@ -536,6 +571,33 @@ export class SshCredentialService {
   // a concurrent revocation, then rechecks the explicit lock in that chain.
   testUsability(credentialId: string): Promise<boolean> {
     return this.usable(credentialId, id => this.enqueueCredential(id, () => this.autoLoadNow(id)));
+  }
+
+  facts(credentialId: string): Promise<PublicCredentialFacts> {
+    return this.enqueueCredential(credentialId, async () => {
+      this.credential(credentialId);
+      let protection: PublicCredentialFacts["protection"] = "unknown";
+      try {
+        const file = credentialFile(this.options.secretsDirectory, credentialId);
+        await assertPrivateKeyFile(file);
+        const handle = await fs.open(file, constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW);
+        try {
+          const buffer = Buffer.alloc(MAX_PRIVATE_KEY_BYTES + 1);
+          const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+          const key = buffer.subarray(0, bytesRead).toString("utf8");
+          if (bytesRead <= MAX_PRIVATE_KEY_BYTES) protection = privateKeyProtection(key);
+        } finally { await handle.close(); }
+      } catch { /* Private material never leaves this owner; failure is unknown. */ }
+      let lock: PublicCredentialFacts["lock"] = "unknown";
+      try {
+        const state = await this.agentKeyState(credentialId);
+        if (state === "present") {
+          lock = "unlocked";
+          this.confirmedLocks.delete(credentialId);
+        } else if (state !== "unavailable" && this.confirmedLocks.has(credentialId)) lock = "locked";
+      } catch { /* Tool failure is not locked, including after a prior Lock. */ }
+      return { protection, lock, userId: null };
+    });
   }
 
   private async usable(credentialId: string, load: (credentialId: string) => Promise<boolean | void>): Promise<boolean> {
@@ -567,18 +629,42 @@ export class SshCredentialService {
     return next;
   }
 
-  private async agentHasKey(credentialId: string): Promise<boolean> {
-    const socket = this.options.agent.currentSocket();
-    if (!socket) return false;
-    return await runQuiet(
-      this.options.sshAddPath,
-      ["-T", `${credentialFile(this.options.secretsDirectory, credentialId)}.pub`],
-      this.agentEnvironment(socket),
-      this.timeoutMs,
-    ) === 0;
+  private async agentHasKey(credentialId: string, publicKey?: string): Promise<boolean> {
+    return await this.agentKeyState(credentialId, publicKey) === "present";
   }
 
-  private async lockBacking(credentialId: string): Promise<void> {
+  private async agentKeyState(credentialId: string, expectedPublicKey = this.credential(credentialId).metadata.publicKey): Promise<"present" | "absent" | "no-agent" | "unavailable"> {
+    const socket = this.options.agent.currentSocket();
+    if (!socket) return "no-agent";
+    const publicPath = `${credentialFile(this.options.secretsDirectory, credentialId)}.pub`;
+    // Only probe the catalog's key, never a replacement, directory, symlink or
+    // unbounded input. ssh-add validates the actual public-key encoding below.
+    const handle = await fs.open(publicPath, constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW);
+    try {
+      if (!(await handle.stat()).isFile()) return "unavailable";
+      const buffer = Buffer.alloc(MAX_PUBLIC_OUTPUT_BYTES + 1);
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+      if (bytesRead > MAX_PUBLIC_OUTPUT_BYTES) return "unavailable";
+      const publicKey = buffer.subarray(0, bytesRead).toString("utf8").trim();
+      if (/[\r\n]/.test(publicKey) || publicKey.split(/\s+/).slice(0, 2).join(" ") !== expectedPublicKey.split(/\s+/).slice(0, 2).join(" ")) return "unavailable";
+    } finally { await handle.close(); }
+    const probe = await readToolOutput(
+      this.options.sshAddPath,
+      ["-T", publicPath],
+      this.agentEnvironment(socket),
+      this.timeoutMs,
+      "stderr",
+    );
+    if (probe.outputExceeded) return "unavailable";
+    if (probe.exitCode === 0) return "present";
+    // Exit 1 also means an unreadable/invalid public file, even if it vanished
+    // after the bounded read above. Only OpenSSH's explicit agent refusal (C
+    // locale) supports a prior confirmed Lock; all other failures stay unknown.
+    return probe.exitCode === 1 && probe.publicOutput.trim() === `Agent signature failed for ${publicPath}: agent refused operation`
+      ? "absent" : "unavailable";
+  }
+
+  private async lockBacking(credentialId: string, publicKey: string): Promise<void> {
     const socket = this.options.agent.currentSocket();
     if (!socket) return;
     const publicPath = `${credentialFile(this.options.secretsDirectory, credentialId)}.pub`;
@@ -586,7 +672,9 @@ export class SshCredentialService {
     // ssh-add -d fails for an already-absent identity too; whole-agent
     // shutdown is the fallback only while this key is provably still loaded,
     // so deleting a locked key cannot lock every other credential.
-    if (exitCode !== 0 && await this.agentHasKey(credentialId)) await this.options.agent.shutdown();
+    // The metadata transaction has temporarily removed this record: use its
+    // cleanup callback's key, not a lookup in the intermediate catalog.
+    if (exitCode !== 0 && await this.agentHasKey(credentialId, publicKey)) await this.options.agent.shutdown();
   }
 
   private async removeIdentityNow(credentialId: string): Promise<void> {

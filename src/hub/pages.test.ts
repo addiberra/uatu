@@ -163,6 +163,22 @@ test("dashboard preserves ordinary-folder removal and routes repository removal 
   expect(calls).toEqual(["/api/hub/workspaces/docs/forget", "forget:main", "forget:child"]);
 });
 
+test("desktop retains Delete worktree for owned present checkouts even without richer branch facts", async () => {
+  const dialogs: unknown[] = [];
+  const { document, refresh } = dashboardRefreshHarness([
+    { id: "main", createWorktree: true },
+    { id: "child", parentId: "main", ownership: "uatu", checkout: { kind: "unavailable", message: "Checkout metadata is unavailable." } },
+    { id: "uncertain", parentId: "main", ownership: "uncertain" },
+    { id: "replaced", parentId: "main", ownership: "uatu", availability: "replaced" },
+  ], { matchMedia: () => ({ matches: false }), openWorktreeDialog: (options: unknown) => dialogs.push(options) });
+  await refresh();
+  const actions = [...document.querySelectorAll<HTMLButtonElement>("button")].filter(button => button.textContent === "Delete worktree");
+  expect(actions).toHaveLength(1);
+  expect(actions[0]!.closest("[data-workspace]")?.getAttribute("data-workspace")).toBe("child");
+  actions[0]!.click();
+  expect(dialogs).toMatchObject([{ view: "delete" }]);
+});
+
 test("dashboard rows disclose a linked worktree's inherited parent credentials", async () => {
   const none = { authentication: [], signing: [] };
   const { document, refresh } = dashboardRefreshHarness([

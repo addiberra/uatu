@@ -117,6 +117,8 @@ export type ReadinessResult = {
 };
 
 export type PublicToolReadinessDto = {
+  /** Omitted by older servers; null explicitly means automatic discovery. */
+  savedOverride?: string | null;
   tool: CredentialTool;
   path: string | null;
   version: string | null;
@@ -125,9 +127,27 @@ export type PublicToolReadinessDto = {
 };
 
 export type PublicCredentialDto = CredentialRecord & {
+  facts?: PublicCredentialFacts;
   assignments: CredentialAssignment[];
   readiness: ReadinessResult[];
 };
+
+export type PublicCredentialFacts = {
+  protection: "protected" | "unprotected" | "unknown" | "not-applicable";
+  lock: "locked" | "unlocked" | "unknown" | "not-applicable";
+  /** OpenPGP primary user ID; null means unknown (other types: inapplicable). */
+  userId: string | null;
+};
+
+export function parsePublicCredentialFacts(value: unknown, type: CredentialType): PublicCredentialFacts {
+  const row = record(value, "credential facts");
+  keys(row, ["protection", "lock", "userId"], "credential facts");
+  const protection = oneOf(row.protection, type === "token" ? ["not-applicable"] as const : ["protected", "unprotected", "unknown"] as const, "protection");
+  const lock = oneOf(row.lock, type === "token" ? ["not-applicable"] as const : ["locked", "unlocked", "unknown"] as const, "lock");
+  const userId = row.userId === null ? null : string(row.userId, "user ID");
+  if (type !== "openpgp" && userId !== null) throw new Error("user ID is not applicable");
+  return { protection, lock, userId };
+}
 
 type RecordValue = Record<string, unknown>;
 
@@ -355,7 +375,9 @@ export function parseReadinessResult(value: unknown): ReadinessResult {
 
 export function parsePublicToolReadinessDto(value: unknown): PublicToolReadinessDto {
   const parsed = record(value, "public tool readiness");
-  keys(parsed, ["tool", "path", "version", "results", "guidance"], "public tool readiness");
+  keys(parsed, ["tool", "path", "version", "results", "guidance", "savedOverride"], "public tool readiness");
+  const savedOverride = parsed.savedOverride === undefined ? undefined : parsed.savedOverride === null ? null : string(parsed.savedOverride, "saved override");
+  if (savedOverride && !savedOverride.startsWith("/")) throw new Error("saved override must be absolute");
   for (const field of ["path", "version", "guidance"] as const) {
     if (parsed[field] !== null && typeof parsed[field] !== "string") {
       throw new Error(`public tool readiness ${field} must be a string or null`);
@@ -363,6 +385,7 @@ export function parsePublicToolReadinessDto(value: unknown): PublicToolReadiness
   }
   return {
     tool: oneOf(parsed.tool, CREDENTIAL_TOOLS, "credential tool"),
+    ...(savedOverride === undefined ? {} : { savedOverride }),
     path: parsed.path as string | null,
     version: parsed.version as string | null,
     results: array(parsed.results, "readiness results").map(parseReadinessResult),
@@ -374,7 +397,7 @@ export function parsePublicCredentialDto(value: unknown): PublicCredentialDto {
   const parsed = record(value, "public credential");
   keys(
     parsed,
-    ["id", "name", "type", "capabilities", "enabled", "createdAt", "metadata", "assignments", "readiness"],
+    ["id", "name", "type", "capabilities", "enabled", "createdAt", "metadata", "assignments", "readiness", "facts"],
     "public credential",
   );
   const credential = parseCredentialRecord({
@@ -388,6 +411,7 @@ export function parsePublicCredentialDto(value: unknown): PublicCredentialDto {
   });
   return {
     ...credential,
+    ...(parsed.facts === undefined ? {} : { facts: parsePublicCredentialFacts(parsed.facts, credential.type) }),
     assignments: array(parsed.assignments, "public credential assignments").map(parseCredentialAssignment),
     readiness: array(parsed.readiness, "public credential readiness").map(parseReadinessResult),
   };
@@ -397,6 +421,7 @@ export function toPublicCredentialDto(
   credential: CredentialRecord,
   assignments: CredentialAssignment[],
   readiness: ReadinessResult[],
+  facts?: PublicCredentialFacts,
 ): PublicCredentialDto {
   return parsePublicCredentialDto({
     id: credential.id,
@@ -408,5 +433,6 @@ export function toPublicCredentialDto(
     metadata: { ...credential.metadata },
     assignments: assignments.map(assignment => ({ ...assignment })),
     readiness: readiness.map(result => ({ ...result })),
+    ...(facts === undefined ? {} : { facts }),
   });
 }

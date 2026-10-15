@@ -111,6 +111,7 @@ describe("OpenPgpCredentialManager generation and import", () => {
     expect(store.snapshot().credentials).toEqual([credential]);
     expect(JSON.stringify(credential)).not.toContain("sentinel-generation-passphrase");
     expect(JSON.stringify(store.snapshot())).not.toContain("sentinel-generation-passphrase");
+    expect((await manager.describe(credential.id)).facts).toEqual({ protection: "protected", lock: "unknown", userId: "Uatu Release <release@example.test>" });
     for (const command of fake.commands) {
       expect(command.args).toContain(gnupgHome);
       expect(command.env).toEqual({ GNUPGHOME: gnupgHome, PATH: "/managed/bin", LANG: "C", LC_ALL: "C" });
@@ -550,6 +551,25 @@ describe("OpenPgpCredentialManager generation and import", () => {
 });
 
 describe("OpenPgpCredentialManager lifecycle and capability", () => {
+  test("structured facts reuse one listing/sign check and preserve unknown protection/lock rather than parsing readiness prose", async () => {
+    const fake = fakeGpg();
+    let listings = 0;
+    const { manager, store } = await fixture(async command => {
+      const result = await fake.run(command);
+      if (command.args.includes("--list-secret-keys")) {
+        listings++;
+        result.stdout += "uid:-::::::::Signer\\x3a Example <signer@example.test>:\n";
+      }
+      return result;
+    });
+    await createCredential(store);
+    const description = await manager.describe("pgp-1");
+    expect(listings).toBe(1);
+    expect(description.facts).toEqual({ protection: "unknown", lock: "unknown", userId: "Signer: Example <signer@example.test>" });
+    expect(description.readiness.some(row => row.status === "unavailable")).toBe(true);
+    await manager.unlock("pgp-1", "disposable-test-passphrase");
+    expect((await manager.describe("pgp-1")).facts.lock).toBe("unlocked");
+  });
   test("unlocks with loopback input, detects cache, then signs and verifies the fixed challenge", async () => {
     const fake = fakeGpg();
     const { manager, store, gnupgHome } = await fixture(fake.run);

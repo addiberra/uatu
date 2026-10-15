@@ -11,6 +11,8 @@ import {
   type CredentialTool,
   type PublicCredentialDto,
   type ReadinessResult,
+  type PublicCredentialFacts,
+  type CredentialRecord,
 } from "./credential-types";
 
 const MAX_JSON_BYTES = 1_100_000;
@@ -153,19 +155,30 @@ export class CredentialApi {
 
   async listCredentials(): Promise<PublicCredentialDto[]> {
     const state = this.services.metadata.snapshot();
-    return Promise.all(state.credentials.map(async credential => {
-      let readiness: ReadinessResult[];
-      try {
+    return Promise.all(state.credentials.map(credential => this.describeCredential(credential,
+      state.assignments.filter(item => item.credentialId === credential.id))));
+  }
+
+  private async describeCredential(credential: CredentialRecord, assignments: CredentialAssignment[], tolerateReadinessFailure = true): Promise<PublicCredentialDto> {
+    let readiness: ReadinessResult[];
+    let facts: PublicCredentialFacts = this.unknownFacts(credential.type);
+    try {
+      if (credential.type === "openpgp" && this.services.openpgp.describe) {
+        ({ readiness, facts } = await this.services.openpgp.describe(credential.id));
+        if (!credential.enabled) readiness = [{ layer: "credential", status: "unavailable", message: "The credential is disabled." }];
+      } else {
         readiness = await this.readiness(credential.id);
-      } catch {
-        readiness = [{ layer: "runtime", status: "unavailable", message: "Credential readiness could not be determined." }];
       }
-      return toPublicCredentialDto(
-        credential,
-        state.assignments.filter(item => item.credentialId === credential.id),
-        readiness,
-      );
-    }));
+    } catch (error) {
+      if (!tolerateReadinessFailure) throw error;
+      readiness = [{ layer: "runtime", status: "unavailable", message: "Credential readiness could not be determined." }];
+    }
+    if (credential.type === "ssh" && this.services.ssh?.facts) {
+      try {
+        facts = await this.services.ssh.facts(credential.id);
+      } catch { /* Preserve readiness diagnostics; only facts are unknown. */ }
+    }
+    return toPublicCredentialDto(credential, assignments, readiness, facts);
   }
 
   listTools() {
@@ -435,11 +448,11 @@ export class CredentialApi {
     const state = this.services.metadata.snapshot();
     const credential = state.credentials.find(item => item.id === credentialId);
     if (!credential) throw new Error(`unknown credential: ${credentialId}`);
-    return toPublicCredentialDto(
-      credential,
-      state.assignments.filter(item => item.credentialId === credentialId),
-      await this.readiness(credentialId),
-    );
+    return this.describeCredential(credential, state.assignments.filter(item => item.credentialId === credentialId), false);
+  }
+
+  private unknownFacts(type: "ssh" | "openpgp" | "token"): PublicCredentialFacts {
+    return { protection: type === "token" ? "not-applicable" : "unknown", lock: type === "token" ? "not-applicable" : "unknown", userId: null };
   }
 
   private async readiness(credentialId: string): Promise<ReadinessResult[]> {

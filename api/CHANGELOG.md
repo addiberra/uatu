@@ -2,6 +2,39 @@
 
 Entries are ordered newest first. Every entry has Hub and workspace revisions, a compatibility classification, and migration guidance. Use `None` when no migration is required. An entry is headed `Unreleased` until the release that ships it; the release-prep step replaces that with the version tag (`v0.7.0`), so a consumer can tell which revision pair a given uatu version speaks. An additive change that lands after a pair has shipped gets its own entry under the same pair, stamped with its own release, rather than being appended to the shipped entry.
 
+## Hub 12 / Workspace 24 - Unreleased (checkout and credential facts)
+
+Compatibility: breaking (hub; optional additions to closed response objects)
+
+### Changes
+
+- `HubWorkspace.checkout` optionally distinguishes named, detached (full commit),
+  unborn, non-Git and unavailable metadata. Legacy branch/detached fields remain;
+  linked branch fallback labels are not authoritative checkout facts. Stopped
+  workspaces are inspected without Start or Git subprocess fanout per state poll.
+  Linked identity classification reuses the worktree owner and its identity stamp;
+  consequential Start/delete still perform full Git validation.
+- Public credential DTOs optionally carry `facts` (protection, lock, public OpenPGP
+  user ID). Unavailable tools, inconclusive checks and older keys remain unknown;
+  no fact is inferred from readiness text. OpenPGP protection is known only for
+  generation observed by the current owner; imports/runtime replacement may be
+  unknown. Token facts are not applicable. No secret or secret path is added.
+- Tool DTOs optionally carry `savedOverride`: null means automatic discovery,
+  omission means unknown, and a string is the saved override, not an inferred
+  value from the effective `path`. GETs reuse cached readiness, without probes.
+
+### Migration
+
+Hub clients pinned to revision 11 must regenerate or update closed response
+validators to allow the optional `checkout`, `facts` and `savedOverride` fields
+before accepting Hub revision 12. The repository compatibility policy treats
+new response properties as breaking when the old object disallows additional
+properties, even though tolerant clients can ignore them. New decoders retain
+old-payload support; omitted facts remain unknown. Existing fields, operation
+identities, requests and streams are unchanged. Workspace revision stays 24.
+No streaming inventory addition is needed: these are HTTP fields, not a new
+topic or event.
+
 ## Hub 11 / Workspace 24 - Unreleased
 
 Compatibility: breaking (hub, workspace)

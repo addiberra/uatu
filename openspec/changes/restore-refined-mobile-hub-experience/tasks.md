@@ -134,11 +134,19 @@ Keep production-facing delta specs unsynced until implemented and verified.
 
 ## 18. Live contracts, authentication and entry routing
 
-- [ ] 18.1 Add bounded authoritative branch/checkout facts and safe explicit credential/tool facts where existing DTOs cannot represent the mobile contract; verify named/detached/unborn/non-Git/unavailable, stopped/no-start, absent tools, protected/unprotected/unknown and saved-vs-effective override cases through server/adapter tests without secret disclosure or Git-per-poll fanout.
+- [x] 18.1 Add bounded authoritative branch/checkout facts and safe explicit credential/tool facts where existing DTOs cannot represent the mobile contract; verify named/detached/unborn/non-Git/unavailable, stopped/no-start, absent tools, protected/unprotected/unknown and saved-vs-effective override cases through server/adapter tests without secret disclosure or Git-per-poll fanout.
 - [ ] 18.2 Implement live authentication/device adapters through existing login/logout/session routes and safe gated user/host identity facts; verify valid/invalid/rate-limited login, safe next targets, no anonymous identity/version disclosure, cookie-only browser session handling, revoke current/other device, no-store, sanitized errors and generation fencing. Test cookie CSRF refusal, native bearer compatibility and no session id in storage/history/logs; do not change operator auth configuration.
 - [ ] 18.3 Assemble eligible touch Hub routes and the one-workspace production coordinator entry, retaining desktop/standalone defaults; verify direct/reloaded `/`, `/settings?detail=…`, `/clone`, `/s/<id>/file?…#…`, cold loading/Back, canonical Open, mode escape and fallback routes using isolated test assembly. Do not ship the replacement before all parity dependencies pass.
 - [ ] 18.4 Bind workspace HTTP/WS/brokered live transport to its fixed base path and map auth/workspace invalidation to the coordinator; verify one stream/boot, current-session revoke/401 and delayed response fencing, stop/removal and reconnect while Hub is foreground, including proxy Origin/page-origin and cross-site stream checks. Do not treat network failure as an authoritative Stop or revive retired child SSE endpoints.
 - [ ] 18.5 Publish every new wire field/operation from this section in OpenAPI, operation/stream inventories and relevant docs, with revision compatibility decisions; verify `bun run api:validate`, `bun run test:api`, route coverage and old-payload/client compatibility. Repeat this check for later clone additions, not only this initial batch.
+
+  Initial 18.1 batch published and verified; this task stays open for later
+  identity/auth/routing and clone additions. See
+  `review-evidence/live-facts-verification.md` for contract choices, commands,
+  results and limitations, including the lead-confirmed independent approval.
+  The user now authorizes a scoped 18.1/initial-18.5 checkpoint commit, not a
+  claim of completed integration. No production mount or service change in this
+  slice; push is deferred until the final handoff.
 
 ## 19. Phone composition and upstream Settings parity
 

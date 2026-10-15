@@ -26,6 +26,7 @@ const defaults = { configured: null, configuredAvailable: false, effective: "/te
 const cases = [
   { method: "readHubState", path: "/api/hub/state", body: state, value: state },
   { method: "readCredentials", path: "/api/hub/credentials", body: { credentials: [] }, value: [] },
+  { method: "readCredentialTools", path: "/api/hub/credential-tools", body: { tools: [] }, value: [] },
   { method: "readDefaultFolder", path: "/api/hub/settings/workspace-defaults", body: defaults, value: defaults },
 ] as const;
 
@@ -50,7 +51,7 @@ function typeContracts(reads: ReturnType<typeof createLiveHubReads>, result: Liv
 void typeContracts;
 
 describe("live Hub read transport", () => {
-  test("has only three reads, does nothing at construction and keeps Hub scope during a workspace detour", async () => {
+  test("has only four reads, does nothing at construction and keeps Hub scope during a workspace detour", async () => {
     const calls: Array<{ input: string; init: RequestInit }> = [];
     const reads = createLiveHubReads({ fetch: async (input, init) => {
       calls.push({ input, init: init! });
@@ -186,7 +187,7 @@ describe("live Hub read transport", () => {
       }
     }
     // appUrl's base-path code is tree-shaken: only hubUrl is used here.
-    const allowed = ["hub/mobile/live-reads.ts", "hub/mobile/live-read-model.ts", "hub/credential-types.ts", "shared/app-url.ts", "shell/bounded-fetch.ts"];
+    const allowed = ["hub/mobile/live-reads.ts", "hub/mobile/live-read-model.ts", "hub/credential-types.ts", "shared/checkout-state.ts", "shared/app-url.ts", "shell/bounded-fetch.ts"];
     expect(sources).toHaveLength(allowed.length);
     for (const source of sources) expect(allowed.some(path => source.endsWith(path))).toBe(true);
   });

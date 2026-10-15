@@ -1,9 +1,9 @@
 openapi: 3.1.0
 info:
   title: UatuCode public API
-  version: 11.24.0-experimental
+  version: 12.24.0-experimental
   license: { name: MIT, identifier: MIT }
-  summary: Hub revision 11 and workspace revision 24
+  summary: Hub revision 12 and workspace revision 24
   description: |
     Canonical HTTP contract for the UatuCode Hub API, the only public API.
     Under `/s/{workspaceId}/` the Hub serves one family itself, personal
@@ -20,7 +20,7 @@ info:
     is the authoritative machine-readable pair, and the product version of a
     published snapshot is recorded in that snapshot's `contract.json`.
   x-uatu-revisions:
-    hubApiRevision: 11
+    hubApiRevision: 12
     workspaceApiRevision: 24
 servers:
   - url: https://{hubHost}
@@ -148,7 +148,7 @@ paths:
                   summary: An ordinary workspace
                   value:
                     version: 0.5.1 (abcdef0)
-                    hubApiRevision: 10
+                    hubApiRevision: 12
                     workspaceApiRevision: 20
                     workspaces: [{ id: uatu, displayName: Uatu Docs, path: /src/uatu, backend: local, running: true, credentialRestartRequired: false, credentialAssignments: { authentication: [Work GitHub], signing: [Work signing] }, workspaceApiRevision: 20, shells: [{ attached: false, label: zsh }] }]
                     workspaceDefaults: { configured: /srv/workspaces, configuredAvailable: true, effective: /srv/workspaces }
@@ -156,7 +156,7 @@ paths:
                   summary: A main workspace and one linked worktree
                   value:
                     version: 0.5.1 (abcdef0)
-                    hubApiRevision: 10
+                    hubApiRevision: 12
                     workspaceApiRevision: 20
                     worktreeApi: /api/hub/worktrees
                     workspaces:
@@ -1634,13 +1634,33 @@ components:
         shells: { type: array, items: { type: object, required: [attached, label], properties: { attached: { type: boolean }, label: { type: string } }, additionalProperties: false } }
         parentId: { $ref: '#/components/schemas/WorkspaceId', description: "Present for a registered linked worktree. The main workspace it belongs to, whose credentials and shared configuration it inherits live. Its own `credentialAssignments` stay its own rows, normally none; read the parent's for the inherited policy." }
         repositoryId: { type: string, minLength: 1, description: "Opaque canonical repository identity shared by a main workspace and its linked worktrees. Group by this and `parentId`, never by names or paths. Absent when unknown." }
-        branch: { type: string, minLength: 1, description: "The checkout's current local branch, read from its HEAD. For a linked worktree it is also its name. Absent when detached or unknown." }
+        branch: { type: string, minLength: 1, description: "Legacy label from a readable symbolic HEAD. A linked worktree can instead carry its display-name fallback when detached or unavailable; it is not authoritative branch state. Prefer checkout when supplied. Retained for existing clients." }
+        checkout: { $ref: '#/components/schemas/CheckoutState' }
         detached: { type: boolean, const: true, description: "Present when the checkout's HEAD is detached." }
         sourceRef: { type: string, minLength: 1, description: "Linked worktrees only. The recorded ref the branch was created from, when Uatu created it. Never inferred from upstream or history; absent means origin unknown." }
         ownership: { type: string, enum: [uatu, external, uncertain], description: "Linked worktrees only. `uatu` for a checkout with verified Uatu creation provenance, which alone can be deleted through Uatu." }
         availability: { type: string, enum: [missing, replaced], description: "Linked worktrees only, present when the registered checkout is not at its path (`missing`) or the path holds a different checkout (`replaced`). Such a workspace cannot start until resolved outside Uatu." }
         createWorktree: { type: boolean, const: true, description: "Present and true for a main checkout that can host linked worktrees. Construct the fork's create request against worktreeApi (mode: new-branch or existing-local/remote-tracking) with sourceWorkspaceId set to this workspace's id; no URL is published here." }
       additionalProperties: false
+    CheckoutState:
+      description: "Optional authoritative checkout HEAD fact, independent of running state. Obtained without Start or Git subprocesses per poll. Legacy branch may contain a linked-workspace fallback label; prefer this field. Omission means unsupported/unknown, not non-Git. Unsupported ref stores, incomplete reads and missing/replaced registered checkouts are unavailable."
+      oneOf:
+        - type: object
+          required: [kind, name]
+          properties: { kind: { type: string, enum: [named, unborn] }, name: { type: string, minLength: 1 } }
+          additionalProperties: false
+        - type: object
+          required: [kind, commit]
+          properties: { kind: { const: detached }, commit: { type: string, pattern: '^[0-9a-f]{40}([0-9a-f]{24})?$' } }
+          additionalProperties: false
+        - type: object
+          required: [kind]
+          properties: { kind: { const: non-git } }
+          additionalProperties: false
+        - type: object
+          required: [kind, message]
+          properties: { kind: { const: unavailable }, message: { type: string, minLength: 1 } }
+          additionalProperties: false
     WorkspaceCredentialAssignmentSummary:
       type: object
       required: [authentication, signing]
@@ -1872,6 +1892,7 @@ components:
       type: object
       required: [id, name, type, capabilities, enabled, createdAt, metadata, assignments, readiness]
       properties:
+        facts: { $ref: '#/components/schemas/SshCredentialFacts' }
         id: { $ref: '#/components/schemas/CredentialId' }
         name: { type: string, minLength: 1 }
         type: { const: ssh }
@@ -1890,6 +1911,7 @@ components:
       type: object
       required: [id, name, type, capabilities, enabled, createdAt, metadata, assignments, readiness]
       properties:
+        facts: { $ref: '#/components/schemas/OpenPgpCredentialFacts' }
         id: { $ref: '#/components/schemas/CredentialId' }
         name: { type: string, minLength: 1 }
         type: { const: openpgp }
@@ -1908,6 +1930,7 @@ components:
       type: object
       required: [id, name, type, capabilities, enabled, createdAt, metadata, assignments, readiness]
       properties:
+        facts: { $ref: '#/components/schemas/TokenCredentialFacts' }
         id: { $ref: '#/components/schemas/CredentialId' }
         name: { type: string, minLength: 1 }
         type: { const: token }
@@ -1928,10 +1951,37 @@ components:
         - { $ref: '#/components/schemas/PublicOpenPgpCredential' }
         - { $ref: '#/components/schemas/PublicTokenCredential' }
       description: Explicit public DTO. It never contains a private key, passphrase, token value, secret path, or reusable agent credential.
+    SshCredentialFacts:
+      type: object
+      description: "Optional explicit facts; omission means unknown. Protection is determined within the credential owner, never from readiness prose. Autoload suppression records intent, not confirmed lock evidence. A failed tool/agent probe is unknown, not locked, even after an earlier successful Lock."
+      required: [protection, lock, userId]
+      properties:
+        protection: { type: string, enum: [protected, unprotected, unknown] }
+        lock: { type: string, enum: [locked, unlocked, unknown] }
+        userId: { type: 'null' }
+      additionalProperties: false
+    OpenPgpCredentialFacts:
+      type: object
+      description: "Protection is known for keys generated by the current owner; imported/older keys or runtime replacement can report unknown. Successful cached signing proves unlocked; failed signing does not prove locked. userId is the first available public UID, null if unknown. Disabled/missing-tool keys retain unknown runtime facts. No private material or passphrase is exposed."
+      required: [protection, lock, userId]
+      properties:
+        protection: { type: string, enum: [protected, unprotected, unknown] }
+        lock: { type: string, enum: [locked, unlocked, unknown] }
+        userId: { type: [string, 'null'], minLength: 1 }
+      additionalProperties: false
+    TokenCredentialFacts:
+      type: object
+      required: [protection, lock, userId]
+      properties:
+        protection: { const: not-applicable }
+        lock: { const: not-applicable }
+        userId: { type: 'null' }
+      additionalProperties: false
     PublicCredentialTool:
       type: object
       required: [tool, path, version, results, guidance]
       properties:
+        savedOverride: { type: [string, 'null'], pattern: '^/', description: "Saved absolute-path override, independently of the detected/effective path and readiness. null means automatic discovery; omission by older servers means unknown. Read from the existing override owner without probing tools on GET." }
         tool: { $ref: '#/components/schemas/CredentialToolName' }
         path: { type: [string, 'null'] }
         version: { type: [string, 'null'] }

@@ -2,6 +2,32 @@
 
 ## Current live integration plan — 2026-10-15
 
+### Task 18.1 implementation update
+
+The lead confirms renewed independent approval after both correction rounds.
+SSH suppression intent is separate from confirmed lock evidence, and invalid
+probe input remains unknown. File/stamp identity requires supported readable
+HEAD/admin metadata, independently of richer ref facts; ordinary non-layout core
+preferences retain identity. Malformed or unsupported config remains unavailable
+through a bounded conservative recognizer, never a Git-per-poll fallback. See
+`live-facts-verification.md` for red–green evidence and supported-layout limits.
+
+The clean pushed checkpoint `20247bc` is the apply-entry baseline for this slice.
+Bounded authoritative checkout facts, explicit safe credential facts and saved
+tool overrides are now implemented and initially published under 18.5; see
+[actual contracts, commands and contrary evidence](live-facts-verification.md).
+Task 18.1 is complete; 18.5 remains open for future fields. Revisions are 12/24:
+the compatibility checker requires a Hub bump for new fields in closed responses,
+despite old-payload support in the new decoders. State polling no longer runs Git for
+expired linked-checkout classification: it reuses the existing worktree owner's
+file/stamp identity seam, while full Start/delete/inventory guards stay intact.
+The browser reader now has a fourth explicit read for cached credential tools,
+with no UI mount, mutation stub, auto-retry or parallel polling/credential owner.
+No services, configuration or personal credentials changed. The user now
+authorizes a scoped metadata checkpoint commit; no intermediate push is included.
+Next is 18.2. The table and first-slice entries below retain their planning and
+17.2–17.3 provenance; their former gaps are not claims that this slice is absent.
+
 The user explicitly authorized integrating the refined mobile frontend into the
 live phone Hub. This updates the historical review-only boundary below, not its
 past results. Current-tree source inspection found the following seams; these

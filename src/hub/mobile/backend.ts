@@ -85,8 +85,8 @@ export type CredentialTarget<T extends CredentialRecord["type"] = CredentialReco
 export type KeyTarget = CredentialTarget<"ssh" | "openpgp">;
 export type PublicKeyView = { id: string; type: "ssh" | "openpgp"; publicKey: string; fingerprint: string };
 
-/** Frontend-only facts, not additions to the public credential/tool wire DTOs.
- * Unknown must never be inferred from diagnostic prose, a name or effective path. */
+/** Transport-independent facts. Live adapters map optional public DTO facts;
+ * unknown must never be inferred from diagnostic prose, a name or effective path. */
 export type KnownFact<T> = { status: "known"; value: T } | { status: "unknown"; value?: never };
 export type NotApplicableFact = { status: "not-applicable"; value?: never };
 export type CredentialFacts =

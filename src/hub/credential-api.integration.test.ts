@@ -1,5 +1,5 @@
-import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, mkdir, rm } from "node:fs/promises";
+import { afterEach, describe, expect, test, spyOn } from "bun:test";
+import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
@@ -24,6 +24,8 @@ import { WorkspaceRegistry } from "./registry";
 import { startHubServer } from "./server";
 import { SessionManager } from "./sessions";
 import { TokenCredentialManager } from "./token-credentials";
+import { decodeHubState, decodeCredentialCatalog, decodeCredentialTools } from "./mobile/live-read-model";
+import type { SshCredentialOperations } from "./credential-ssh";
 
 const roots: string[] = [];
 const servers: ReturnType<typeof startHubServer>[] = [];
@@ -46,7 +48,7 @@ afterEach(async () => {
   await Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true })));
 });
 
-async function fixture(root: string) {
+async function fixture(root: string, ssh: SshCredentialOperations | null = null) {
   const state = path.join(root, "state");
   await mkdir(state, { recursive: true });
   const registry = new WorkspaceRegistry(path.join(state, "registry.json"));
@@ -174,7 +176,7 @@ async function fixture(root: string) {
     credentialApi: {
       metadata,
       tools,
-      ssh: null,
+      ssh,
       openpgp,
       tokens,
       workspaceExists: id => registry.byId(id) !== undefined,
@@ -205,6 +207,101 @@ function post(origin: string, cookie: string, endpoint: string, body: unknown, r
 }
 
 describe("credential API integration", () => {
+  test("actual catalog serialization carries explicit protected/unprotected/unknown facts, independent of readiness wording", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "uatu-wire-facts-")); roots.push(root);
+    const f = await fixture(root, {
+      generate: async () => { throw new Error("unexpected mutation"); },
+      import: async () => { throw new Error("unexpected mutation"); },
+      unlock: async () => { throw new Error("unexpected mutation"); },
+      lock: async () => { throw new Error("unexpected mutation"); },
+      setEnabled: async () => { throw new Error("unexpected mutation"); },
+      delete: async () => { throw new Error("unexpected mutation"); },
+      testUsability: async () => true,
+      facts: async id => ({ protection: id === "protected" ? "protected" : id === "unprotected" ? "unprotected" : "unknown", lock: id === "protected" ? "locked" : "unknown", userId: null }),
+    });
+    for (const id of ["protected", "unprotected", "unknown"]) await f.metadata.create({ name: id, type: "ssh", enabled: true,
+      capabilities: ["ssh-authentication"], metadata: { publicKey: "public-only", fingerprint: `public-${id}` } }, () => id);
+    const origin = `http://127.0.0.1:${f.server.port}`;
+    const cookie = await login(origin, "alice", "alice password");
+    const response = await fetch(`${origin}/api/hub/credentials`, { headers: { cookie } });
+    await assertContract("GET", "/api/hub/credentials", response.clone());
+    const rows = decodeCredentialCatalog(await response.json());
+    for (const row of rows) expect(row.facts?.protection).toBe(row.id as "protected" | "unprotected" | "unknown");
+    expect(rows.find(row => row.id === "protected")!.facts?.lock).toBe("locked");
+    // Deliberately contradictory test double: never derive structured facts
+    // from the legacy readiness text, even when it reports usable.
+    expect(rows.find(row => row.id === "protected")!.readiness[0]?.status).toBe("ready");
+  });
+  test("actual stopped state serializes authoritative checkout variants without Start or Git, even without worktree capability", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "uatu-state-facts-")); roots.push(root);
+    const { server, workspace, backendEvents } = await fixture(root);
+    const origin = `http://127.0.0.1:${server.port}`;
+    const cookie = await login(origin, "alice", "alice password");
+    const folder = workspace.path;
+    const read = async () => {
+      const response = await fetch(`${origin}/api/hub/state`, { headers: { cookie } });
+      await assertContract("GET", "/api/hub/state", response.clone());
+      return decodeHubState(await response.json()).workspaces.find(row => row.id === workspace.id)!;
+    };
+    const spawn = spyOn(Bun, "spawn").mockImplementation(() => { throw new Error("state must not spawn Git or children"); });
+    try {
+      expect((await read()).checkout).toEqual({ kind: "non-git" });
+      await mkdir(path.join(folder, ".git", "refs", "heads"), { recursive: true });
+      await mkdir(path.join(folder, ".git", "objects"));
+      await writeFile(path.join(folder, ".git", "config"), "[core]\nrepositoryformatversion = 0\n");
+      await writeFile(path.join(folder, ".git", "HEAD"), "ref: refs/heads/new\n");
+      expect((await read()).checkout).toEqual({ kind: "unborn", name: "new" });
+      const commit = "a".repeat(40);
+      await writeFile(path.join(folder, ".git", "refs", "heads", "new"), commit);
+      expect((await read()).checkout).toEqual({ kind: "named", name: "new" });
+      await writeFile(path.join(folder, ".git", "config"), "[extensions]\nrefStorage = reftable\n");
+      const unsupported = await read();
+      expect(unsupported.checkout?.kind).toBe("unavailable");
+      expect(unsupported.branch).toBe("new");
+      await writeFile(path.join(folder, ".git", "config"), "[broken\n");
+      const malformed = await read();
+      expect(malformed.checkout?.kind).toBe("unavailable");
+      expect(malformed.branch).toBe("new"); // Preserve the legacy label, not fabricated new authority.
+      await writeFile(path.join(folder, ".git", "config"), "[core]\nrepositoryformatversion = 0\n");
+      await writeFile(path.join(folder, ".git", "HEAD"), commit);
+      expect((await read()).checkout).toEqual({ kind: "detached", commit });
+      await writeFile(path.join(folder, ".git", "HEAD"), "invalid");
+      expect((await read()).checkout?.kind).toBe("unavailable");
+      expect((await read()).running).toBe(false);
+      expect(backendEvents.starts).toEqual([]);
+      expect(spawn).not.toHaveBeenCalled();
+    } finally { spawn.mockRestore(); }
+  });
+
+  test("real credential/tool routes publish unknown/inapplicable facts and absent tools without secrets or GET reprobes", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "uatu-safe-facts-")); roots.push(root);
+    const { server, metadata } = await fixture(root);
+    const origin = `http://127.0.0.1:${server.port}`;
+    const cookie = await login(origin, "alice", "alice password");
+    for (const type of ["ssh", "openpgp"] as const) await metadata.create({ name: type, type, enabled: true,
+      capabilities: type === "ssh" ? ["ssh-authentication"] : ["openpgp-signing"],
+      metadata: { publicKey: "public-only", fingerprint: "public-fingerprint" } } as never);
+    await post(origin, cookie, "/api/hub/credentials/token", { name: "Token", host: "example.test", token: "never-echo-token-sentinel", capabilities: ["https-git"] });
+    const spawn = spyOn(Bun, "spawn").mockImplementation(() => { throw new Error("GET must not discover tools"); });
+    try {
+      for (let i = 0; i < 3; i++) {
+        const response = await fetch(`${origin}/api/hub/credentials`, { headers: { cookie } });
+        await assertContract("GET", "/api/hub/credentials", response.clone());
+        const text = await response.text();
+        expect(text).not.toContain("never-echo-token-sentinel");
+        const credentials = decodeCredentialCatalog(JSON.parse(text));
+        for (const credential of credentials) expect(credential.facts).toEqual(credential.type === "token"
+          ? { protection: "not-applicable", lock: "not-applicable", userId: null }
+          : { protection: "unknown", lock: "unknown", userId: null });
+        const tools = await fetch(`${origin}/api/hub/credential-tools`, { headers: { cookie } });
+        await assertContract("GET", "/api/hub/credential-tools", tools.clone());
+        const rows = decodeCredentialTools(await tools.json());
+        expect(rows).toHaveLength(9);
+        for (const row of rows) expect(row).toMatchObject({ path: null, savedOverride: null });
+      }
+      expect(spawn).not.toHaveBeenCalled();
+    } finally { spawn.mockRestore(); }
+  });
   test("maps an incorrect SSH passphrase to an actionable client error", () => {
     expect(credentialApiError(new Error("SSH credential could not be unlocked"))).toEqual({
       status: 400,
@@ -1589,6 +1686,7 @@ describe("credential API integration", () => {
       metadata: { host: "github.com" },
     }, () => "healthy-item");
     f.openpgp.readiness = async () => { throw new Error("gpg probe crashed"); };
+    f.openpgp.describe = async () => { throw new Error("gpg probe crashed"); };
     const origin = `http://127.0.0.1:${f.server.port}`;
     const cookie = await login(origin, "alice", "alice password");
 

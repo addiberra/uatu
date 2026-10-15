@@ -2,7 +2,7 @@ import { hubUrl } from "../../shared/app-url";
 import { fetchWithinBudget } from "../../shell/bounded-fetch";
 import type { BoundedFetchTimers, Fetcher } from "../../shell/bounded-fetch";
 import type { BackendProblem } from "./backend";
-import { decodeCredentialCatalog, decodeDefaultFolder, decodeHubState } from "./live-read-model";
+import { decodeCredentialCatalog, decodeCredentialTools, decodeDefaultFolder, decodeHubState } from "./live-read-model";
 
 /** ReadResult-compatible failures with local transport diagnostics, never raw
  * response bodies, bearer credentials, exception messages or guessed identity. */
@@ -15,7 +15,7 @@ function unavailable<T>(reason: Extract<LiveReadResult<T>, { status: "unavailabl
   return { status: "unavailable", reason, problem: { kind: "unavailable", message } };
 }
 
-/** Three explicit GETs only. No mount, polling, cache, auth mutation, retries or
+/** Explicit GETs only. No mount, polling, cache, auth mutation, retries or
  * incomplete MobileHubBackend stubs. Each call returns its own snapshot; the
  * eventual frontend owner must fence stale auth/workspace generations. */
 export function createLiveHubReads(options: {
@@ -80,6 +80,7 @@ export function createLiveHubReads(options: {
   return {
     readHubState: () => read("/api/hub/state", decodeHubState),
     readCredentials: () => read("/api/hub/credentials", decodeCredentialCatalog),
+    readCredentialTools: () => read("/api/hub/credential-tools", decodeCredentialTools),
     readDefaultFolder: () => read("/api/hub/settings/workspace-defaults", decodeDefaultFolder),
   };
 }

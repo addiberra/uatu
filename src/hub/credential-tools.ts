@@ -450,7 +450,9 @@ export class CredentialToolManager {
   private async probeAll(): Promise<void> {
     const overrides = Object.fromEntries(this.store.list().map(value => [value.tool, value.path]));
     const discoveries = await discoverCredentialTools(overrides, this.servicePath);
-    const results = await Promise.all(discoveries.map(discovery => this.probe(discovery)));
+    const results = await Promise.all(discoveries.map(async discovery => ({
+      ...await this.probe(discovery), savedOverride: overrides[discovery.tool] ?? null,
+    })));
     this.readiness = new Map(results.map(result => [result.tool, result]));
   }
 

@@ -4,6 +4,7 @@ import { readdir } from "node:fs/promises";
 import { createAjv, openApiOperations, readJson, readYaml, schemaForAjv, validateApi } from "../scripts/validate-api";
 import { HUB_COOKIE_NAME, hubCookieName } from "../src/hub/auth";
 import { isVisibleFolderName } from "../src/hub/folder-manager";
+import { parseCheckoutState } from "../src/shared/checkout-state";
 import type { DocumentPatch, DocumentSnapshot } from "../src/shared/document-updates";
 import {
   formatLiveEnvelope,
@@ -426,6 +427,18 @@ describe("live stream contract agrees with the shared wire protocol", () => {
 });
 
 describe("Hub credential contracts", () => {
+  test("checkout schema and browser decoder agree on additive authoritative variants and reject fabricated states", async () => {
+    const openapi = await readYaml<{ components: { schemas: Record<string, object> } }>("api/openapi.yaml");
+    const validate = createAjv().compile(schemaForAjv(openapi.components.schemas.CheckoutState, openapi.components.schemas));
+    for (const fact of [{ kind: "named", name: "topic" }, { kind: "unborn", name: "new" }, { kind: "detached", commit: "a".repeat(40) }, { kind: "detached", commit: "b".repeat(64) }, { kind: "non-git" }, { kind: "unavailable", message: "Metadata unavailable" }]) {
+      expect(validate(fact)).toBe(true);
+      expect<unknown>(parseCheckoutState(fact)).toEqual(fact);
+    }
+    for (const fact of [{ kind: "loading" }, { kind: "named" }, { kind: "detached", commit: "short" }, { kind: "non-git", name: "main" }, { kind: "unavailable" }]) {
+      expect(validate(fact)).toBe(false);
+      expect(() => parseCheckoutState(fact)).toThrow();
+    }
+  });
   test("a populated Hub state includes workspace credential status and assignment names", async () => {
     const openapi = await readYaml<{ components: { schemas: Record<string, object> } }>("api/openapi.yaml");
     const validate = createAjv().compile(schemaForAjv(openapi.components.schemas.HubState, openapi.components.schemas));
@@ -473,6 +486,14 @@ describe("Hub credential contracts", () => {
       { ...base, type: "token", capabilities: ["https-git"], metadata: { host: "github.com", username: "git" } },
     ];
     for (const fixture of fixtures) expect(validate(fixture)).toBe(true);
+    for (const fixture of fixtures) {
+      const facts = fixture.type === "token"
+        ? { protection: "not-applicable", lock: "not-applicable", userId: null }
+        : { protection: "unknown", lock: "unknown", userId: fixture.type === "openpgp" ? "Signer <signer@example.test>" : null };
+      expect(validate({ ...fixture, facts })).toBe(true);
+      expect(validate({ ...fixture, facts: { ...facts, secret: "must-not-ship" } })).toBe(false);
+      expect(validate({ ...fixture, facts: { ...facts, lock: "ready" } })).toBe(false);
+    }
     for (const field of ["privateKey", "passphrase", "token", "secret", "agentSocket"]) {
       expect(validate({ ...fixtures[0], [field]: "must-not-ship" })).toBe(false);
       expect(validate({ ...fixtures[0], metadata: { ...fixtures[0]!.metadata, [field]: "must-not-ship" } })).toBe(false);
@@ -484,6 +505,10 @@ describe("Hub credential contracts", () => {
     const compile = (name: string) => createAjv().compile(schemaForAjv(openapi.components.schemas[name], openapi.components.schemas));
     expect(compile("CredentialAssignment")({ workspaceId: "uatu", credentialId: "credential-1", role: "authentication", host: "github.com" })).toBe(true);
     expect(compile("PublicCredentialTool")({ tool: "git", path: "/usr/bin/git", version: "git version 2.50.0", results: [], guidance: null })).toBe(true);
+    const tool = compile("PublicCredentialTool");
+    const missing = { tool: "git", path: null, version: null, results: [], guidance: "Install Git" };
+    for (const savedOverride of [null, "/missing/git"]) expect(tool({ ...missing, savedOverride })).toBe(true);
+    expect(tool({ ...missing, savedOverride: "relative" })).toBe(false);
     const clone = compile("CreateCloneJobRequest");
     expect(clone({ url: "https://github.com/example/repo.git", dest: "/src" })).toBe(true);
     expect(clone({ url: "https://github.com/example/repo.git", dest: "/src", credentialId: "credential-1", retainAssignment: true })).toBe(true);

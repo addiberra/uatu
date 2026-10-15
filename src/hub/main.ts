@@ -465,6 +465,7 @@ export async function runHub(options: RunHubOptions): Promise<void> {
     setEnabled: (credentialId, enabled) => sshRuntime.run(service => requireSshService(service).setEnabled(credentialId, enabled)),
     delete: (credentialId, unassign) => sshRuntime.run(service => requireSshService(service).delete(credentialId, unassign)),
     testUsability: credentialId => sshRuntime.run(service => service?.testUsability(credentialId) ?? Promise.resolve(false)),
+    facts: credentialId => sshRuntime.run(service => service?.facts(credentialId) ?? Promise.resolve({ protection: "unknown", lock: "unknown", userId: null })),
   };
   const sshUsable = (credentialId: string) => sshOperations.testUsability(credentialId);
   // OpenPGP operations go through their gate for the same reason.
@@ -477,6 +478,7 @@ export async function runHub(options: RunHubOptions): Promise<void> {
     delete: (credentialId, unassign) => openPgpRuntime.run(manager => manager.delete(credentialId, unassign)),
     test: credentialId => openPgpRuntime.run(manager => manager.test(credentialId)),
     readiness: credentialId => openPgpRuntime.run(manager => manager.readiness(credentialId)),
+    describe: credentialId => openPgpRuntime.run(manager => manager.describe(credentialId)),
   };
   const tokenCredentials = new TokenCredentialManager(credentialMetadata, credentialTokens);
   // One seam for "whose policy governs this workspace?", shared by the

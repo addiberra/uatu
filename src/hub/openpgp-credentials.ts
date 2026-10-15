@@ -8,6 +8,7 @@ import type {
   OpenPgpCredentialMetadata,
   OpenPgpCredentialRecord,
   ReadinessResult,
+  PublicCredentialFacts,
 } from "./credential-types";
 
 const COMMAND_OUTPUT_LIMIT = 256 * 1024;
@@ -221,7 +222,7 @@ function ready(layer: ReadinessResult["layer"], message: string): ReadinessResul
 export type OpenPgpCredentialOperations = Pick<
   OpenPgpCredentialManager,
   "generate" | "import" | "unlock" | "enable" | "disable" | "delete" | "test" | "readiness"
->;
+> & { describe?: (credentialId: string) => Promise<{ readiness: ReadinessResult[]; facts: PublicCredentialFacts }> };
 
 export class OpenPgpCredentialManager {
   private readonly gnupgHome: string;
@@ -232,6 +233,8 @@ export class OpenPgpCredentialManager {
   private readonly timeoutMs: number;
   private readonly runCommand: OpenPgpCommandRunner;
   private operationChain: Promise<unknown> = Promise.resolve();
+  // Only generation proves protection. Imports/older/rebuilt owners stay unknown.
+  private readonly generatedUserIds = new Map<string, string>();
 
   constructor(options: OpenPgpCredentialManagerOptions) {
     this.gnupgHome = options.gnupgHome;
@@ -244,24 +247,41 @@ export class OpenPgpCredentialManager {
   }
 
   readiness(credentialId?: string): Promise<ReadinessResult[]> {
+    if (credentialId) return this.describe(credentialId).then(value => value.readiness);
+    return Promise.resolve(this.gpgPath ? [ready("binary", "GnuPG is available.")] : [unavailable("binary", "GnuPG is unavailable; install it or configure its absolute path.")]);
+  }
+
+  describe(credentialId: string): Promise<{ readiness: ReadinessResult[]; facts: PublicCredentialFacts }> {
     return this.enqueue(async () => {
-      if (!this.gpgPath) return [unavailable("binary", "GnuPG is unavailable; install it or configure its absolute path.")];
+      const generated = this.generatedUserIds.get(credentialId);
+      const facts: PublicCredentialFacts = { protection: generated === undefined ? "unknown" : "protected", lock: "unknown", userId: generated ?? null };
+      if (!this.gpgPath) return { facts, readiness: [unavailable("binary", "GnuPG is unavailable; install it or configure its absolute path.")] };
       const results = [ready("binary", "GnuPG is available.")];
-      if (!credentialId) return results;
       const credential = this.credential(credentialId);
       if (!credential.enabled) {
         results.push(unavailable("credential", "The OpenPGP credential is disabled."));
-        return results;
+        return { facts, readiness: results };
       }
       const listed = await this.gpg(["--with-colons", "--list-secret-keys", credential.metadata.fingerprint]);
       if (!this.succeeded(listed)) {
         results.push(unavailable("credential", "The OpenPGP secret key is unavailable."));
-        return results;
+        return { facts, readiness: results };
+      }
+      const uid = listed.stdout.split(/\r?\n/).map(line => line.split(":"))
+        .find(fields => fields[0] === "uid")?.[9];
+      if (uid) {
+        try {
+          const chunks = uid.split(/(\\x[0-9a-f]{2})/gi).map(part => /^\\x[0-9a-f]{2}$/i.test(part)
+            ? Buffer.from([parseInt(part.slice(2), 16)]) : Buffer.from(part));
+          const decoded = new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks));
+          if (decoded.trim() && !/[\x00-\x1f\x7f]/.test(decoded)) facts.userId = decoded;
+        } catch { /* Invalid public UID encoding remains unknown. */ }
       }
       results.push(ready("credential", "The OpenPGP secret key is available."));
       const cached = await this.sign(credential.metadata.fingerprint, "cached");
+      if (cached) facts.lock = "unlocked";
       results.push(cached ? ready("runtime", "The OpenPGP signing key is unlocked in the Hub agent.") : unavailable("runtime", "The OpenPGP signing key requires unlock."));
-      return results;
+      return { facts, readiness: results };
     });
   }
 
@@ -308,7 +328,9 @@ export class OpenPgpCredentialManager {
         return this.rollbackGeneratedKeys(added, operationError, cleanupUncertain);
       }
       try {
-        return await this.createCredential(name, fingerprint);
+        const credential = await this.createCredential(name, fingerprint);
+        this.generatedUserIds.set(credential.id, userId);
+        return credential;
       } catch (error) {
         return this.rollbackGeneratedKeys(added, error, cleanupUncertain);
       }
@@ -406,11 +428,13 @@ export class OpenPgpCredentialManager {
       const credential = snapshot.credentials.find(item => item.id === credentialId);
       if (!credential) return false;
       if (credential.type !== "openpgp") throw new Error(`credential is not OpenPGP: ${credentialId}`);
-      return this.metadataStore.deleteCredentialWithCleanup(credentialId, unassign, async () => {
+      const deleted = await this.metadataStore.deleteCredentialWithCleanup(credentialId, unassign, async () => {
         if (this.hasFingerprint(credential.metadata.fingerprint)) return;
         const deleted = await this.gpg(["--yes", "--delete-secret-and-public-key", credential.metadata.fingerprint]);
         if (!this.succeeded(deleted)) throw new Error("OpenPGP credential deletion failed.");
       });
+      if (deleted) this.generatedUserIds.delete(credentialId);
+      return deleted;
     });
   }
 
