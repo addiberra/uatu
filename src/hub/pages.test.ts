@@ -4,6 +4,7 @@ import { parseHTML } from "linkedom";
 import { LOCAL_CREDENTIAL_ASSIGNMENT_WARNING, parseCloneRemote } from "./credential-context";
 import { createDashboardGroups, dashboardGroupsStyle } from "./dashboard-groups";
 import { clonePage, dashboardPage, loginPage, settingsPage, stoppedSessionPage } from "./pages";
+import { workspaceIsCheckout } from "../shell/worktree-dialog";
 
 const htmlFor = {
   dashboard: () => dashboardPage("alice"),
@@ -78,7 +79,7 @@ function dashboardRefreshHarness(entries: unknown[], overrides: Record<string, u
     fetch: async () => ({ ok: true, json: async () => ({ worktreeApi: "/api/hub/worktrees", workspaces: entries }) }),
     row, renderInto: (container: Element, rows: Element[]) => container.replaceChildren(...rows),
     actionErrorFor: () => ({}), setLocalError: () => {}, api: async () => {}, el: (tag: string) => document.createElement(tag),
-    worktreeProvenanceLabel: () => "", worktreeForkIcon: "", renderDashboardGroups: () => {}, openWorktreeDialog: () => {},
+    worktreeProvenanceLabel: () => "", workspaceIsCheckout, worktreeForkIcon: "", renderDashboardGroups: () => {}, openWorktreeDialog: () => {},
     sessionUrl: (id: string) => "/s/" + id + "/",
     ...overrides,
   };

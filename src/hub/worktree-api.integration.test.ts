@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
@@ -43,6 +43,7 @@ let cookie = "";
 let server: ReturnType<typeof startHubServer>;
 let registry: WorkspaceRegistry;
 let onboarding: WorkspaceOnboardingCoordinator;
+let worktreeService: WorktreeService;
 let atlasId = "";
 
 function cleanEnvironment(): Record<string, string> {
@@ -161,6 +162,7 @@ beforeAll(async () => {
       });
     },
   });
+  worktreeService = service;
   server = startHubServer({
     config, registry, sessions, sessionStore, personalState, onboarding,
     worktrees: service,
@@ -685,6 +687,73 @@ describe("removing registrations whose files were deleted outside Uatu (#504)", 
     await rm(folder, { recursive: true, force: true });
     expect(await stateOf(entry.id)).toMatchObject({ availability: "missing" });
     await registry.remove(entry.id);
+  });
+
+  // Only ENOENT/ENOTDIR establish that a folder is gone. A folder the Hub
+  // cannot stat — here an ancestor that denies traversal, as EACCES from a
+  // permission change or a failing mount would — is unreadable, not missing,
+  // exactly as inspectCheckout already decides for a linked worktree.
+  // Root ignores directory permissions, so these cannot deny it anything.
+  const denying = process.getuid?.() === 0;
+  async function withDeniedAncestor(ancestor: string, run: () => Promise<void>): Promise<void> {
+    await chmod(ancestor, 0o000);
+    try {
+      await run();
+    } finally {
+      await chmod(ancestor, 0o755);
+    }
+  }
+
+  test.skipIf(denying)("a plain folder that cannot be read is not reported missing", async () => {
+    const ancestor = path.join(root, "veiled-docs");
+    const folder = path.join(ancestor, "docs");
+    await mkdir(folder, { recursive: true });
+    const entry = await registry.register(folder);
+    try {
+      await withDeniedAncestor(ancestor, async () => {
+        const fact = await stateOf(entry.id);
+        expect(fact.availability).toBeUndefined();
+      });
+    } finally {
+      await registry.remove(entry.id);
+    }
+  });
+
+  test.skipIf(denying)("a worktree that becomes unreadable is not served as missing from the cache", async () => {
+    const { children } = await onboardFamily("veiled");
+    const [childId] = children as [string, string];
+    const childPath = registry.byId(childId)!.path;
+    await rm(childPath, { recursive: true, force: true });
+    expect(await worktreeService.registeredAvailability(childId)).toBe("missing");
+    // Within the presentation cache's lifetime the folder is back but its
+    // parent denies the stat: absence is no longer established.
+    await mkdir(childPath);
+    await withDeniedAncestor(path.dirname(childPath), async () => {
+      expect(await worktreeService.registeredAvailability(childId)).toBe("present");
+      expect(await worktreeService.registeredOwnership(childId)).toBe("uncertain");
+    });
+  });
+
+  test.skipIf(denying)("an inventory of a repository that cannot be read does not say its folder no longer exists", async () => {
+    const ancestor = path.join(root, "veiled-repository");
+    const folder = path.join(ancestor, "repository");
+    await mkdir(folder, { recursive: true });
+    await git(folder, ["init", "--initial-branch=main"]);
+    await writeFile(path.join(folder, "README.md"), "# veiled\n");
+    await git(folder, ["add", "."]);
+    await git(folder, ["commit", "-m", "initial"]);
+    const sourceId = (await onboarding.configureExisting({ path: folder, displayName: "veiled-repository", authentication: [], signing: null, init: false, start: false })).entry.id;
+    try {
+      await withDeniedAncestor(ancestor, async () => {
+        const response = await fetch(`${origin}${WORKTREE_API_PATH}?source=${sourceId}`, withSession());
+        const listing = parseWorktreeInventory((await response.json() as { inventory: unknown }).inventory);
+        expect(listing.status).toBe("error");
+        expect(listing.error!.message).not.toContain("no longer exists");
+        expect(listing.error!.code).not.toBe("not-found");
+      });
+    } finally {
+      await registry.remove(sourceId);
+    }
   });
 
   test("the worktree API removes a deleted main workspace by id once no worktree depends on it", async () => {

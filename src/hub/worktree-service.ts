@@ -9,8 +9,6 @@
 // DTOs. Operations are scoped to the user who started them — the journal
 // records the initiator, and progress is only ever reported to them.
 
-import { lstat, stat } from "node:fs/promises";
-
 import {
   canDeleteWorktree,
   toWorktreeError,
@@ -45,6 +43,7 @@ import {
 } from "./worktree-fetch";
 import {
   createGitRunner,
+  folderPresence,
   inspectCheckout,
   listRefs,
   listWorktrees,
@@ -137,14 +136,6 @@ function notFound(message: string): WorktreeOperationError {
   return WorktreeOperationError.of("not-found", message);
 }
 
-async function isDirectory(folder: string): Promise<boolean> {
-  try {
-    return (await stat(folder)).isDirectory();
-  } catch {
-    return false;
-  }
-}
-
 export class WorktreeService {
   private readonly coordinator: WorktreeOperationCoordinator;
   private readonly run: GitRunner;
@@ -184,8 +175,9 @@ export class WorktreeService {
       // Git runs inside the repository, so a folder deleted outside Uatu
       // fails the probe too; say which of the two it is (#504). One plain
       // statement: the dialog that shows it says what removal does, and the
-      // dashboard rows say how to recover.
-      if (!capabilities.available && !(await isDirectory(source.path))) {
+      // dashboard rows say how to recover. Only a folder that is established
+      // to be gone says so; one the Hub cannot stat is not claimed gone.
+      if (!capabilities.available && await folderPresence(source.path, { follow: true }) === "missing") {
         throw notFound("This repository's folder no longer exists, so Uatu cannot read it.");
       }
       throw WorktreeOperationError.of("git-unsupported", capabilities.reason ?? "Worktree operations are unavailable on this Hub.");
@@ -1015,10 +1007,12 @@ export class WorktreeService {
     // outlives the folder it describes. One stat says whether the folder is
     // still there, so a checkout deleted outside Uatu reads as missing on
     // the very next state answer rather than when the cache expires (#504).
-    // lstat, like inspectCheckout's own presence test, so the two agree.
-    const present = await lstat(entry.path).then(stats => stats.isDirectory(), () => false);
+    // lstat, like inspectCheckout's own presence test, so the two agree:
+    // only ENOENT/ENOTDIR mean missing, and a folder that cannot be stated
+    // is not served a cached "missing" it no longer establishes.
+    const missing = await folderPresence(entry.path) === "missing";
     const matches = (item: typeof cached) => item?.path === entry.path && item.repositoryId === link.repositoryId && item.checkoutId === link.checkoutId
-      && (item.value === "missing") === !present;
+      && (item.value === "missing") === missing;
     if (cached && now - cached.at < AVAILABILITY_CACHE_MS && matches(cached)) return cached;
     const inspection = await inspectCheckout(entry.path, { ...this.options.git, run: this.run });
     const resolved = await ownershipForCheckout({ provenance: this.options.provenance, inspection, checkoutPath: entry.path, registeredIdentity: link });

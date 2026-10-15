@@ -364,7 +364,8 @@ Uatu is still removable:
 its worktrees first, then the main workspace. The dashboard learns which
 folders are gone from `/api/hub/state`'s `availability: "missing"`, which
 covers a top-level workspace as well as a linked worktree; it is read with a
-stat rather than Git, and the short cache of a worktree's Git probe never
+stat rather than Git (only `ENOENT`/`ENOTDIR` mean gone: a folder the Hub
+cannot stat is never reported missing), and the short cache of a worktree's Git probe never
 outlives its folder, so a deletion shows on the next state read. The forget
 dialog names that state instead of promising files "remain", and it explains
 a main workspace's registered worktrees up front rather than offering a

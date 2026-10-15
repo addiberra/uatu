@@ -1843,7 +1843,7 @@ async function refresh(force) {
         // Hub cannot tell a repository from a docs folder, and either way the
         // dialog's confirmation says that no files are changed.
         const dependents = w.parentId ? 0 : dashboardWorkspaces.filter(child => child.parentId === w.id).length;
-        const checkout = Boolean(w.parentId || w.createWorktree === true || dependents > 0);
+        const checkout = workspaceIsCheckout(w, dashboardWorkspaces);
         if (forget && (checkout || w.availability)) {
           forget.textContent = "Remove from Uatu";
           forget.setAttribute("aria-label", "Remove " + workspaceLabel(w) + " from Uatu");

@@ -207,6 +207,21 @@ export function installWorktreeDialog<T extends Record<string, unknown>>(
     return row.sourceRef ? `from ${row.sourceRef}` : "origin unknown";
   }
 
+  /** Whether a registration is a Git checkout, as far as Hub state says
+   *  without running Git: a linked worktree, a main checkout that can host
+   *  worktrees, or a main workspace with worktrees still registered under it.
+   *  Anything else — a folder deleted outside Uatu included, whose `.git` went
+   *  with it (#504) — is a folder, never claimed to be a checkout. The one
+   *  rule for that wording on the dashboard's rows (pages.ts) and in the
+   *  picker (hub-nav.ts). */
+  function workspaceIsCheckout(
+    workspace: { id: string; parentId?: string; createWorktree?: boolean },
+    workspaces: readonly { parentId?: string }[],
+  ): boolean {
+    return Boolean(workspace.parentId) || workspace.createWorktree === true
+      || workspaces.some(candidate => candidate.parentId === workspace.id);
+  }
+
   /** Maps one inventory checkout onto the dialog's row. `sourceName` titles
    *  the repository's own main checkout; a child IS its branch. */
   function worktreeRowFrom(checkout: Record<string, unknown>, sourceName: string): WorktreeDialogRow {
@@ -1257,6 +1272,7 @@ export function installWorktreeDialog<T extends Record<string, unknown>>(
     worktreeDialogStyle,
     worktreeRowState,
     worktreeProvenanceLabel,
+    workspaceIsCheckout,
     worktreeRowFrom,
     worktreeRowPrimary,
     renderWorktreeView,
@@ -1285,6 +1301,7 @@ export const worktreeEscape = runtime.worktreeEscape;
 export const worktreeDialogStyle = runtime.worktreeDialogStyle;
 export const worktreeRowState = runtime.worktreeRowState;
 export const worktreeProvenanceLabel = runtime.worktreeProvenanceLabel;
+export const workspaceIsCheckout = runtime.workspaceIsCheckout;
 export const worktreeRowFrom = runtime.worktreeRowFrom;
 export const worktreeRowPrimary = runtime.worktreeRowPrimary;
 export const renderWorktreeView = runtime.renderWorktreeView;
