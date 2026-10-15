@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: UatuCode public API
-  version: 11.24.0-experimental
+  version: 11.25.0-experimental
   license: { name: MIT, identifier: MIT }
   summary: Hub revision 11 and workspace revision 24
   description: |
@@ -21,7 +21,7 @@ info:
     published snapshot is recorded in that snapshot's `contract.json`.
   x-uatu-revisions:
     hubApiRevision: 11
-    workspaceApiRevision: 24
+    workspaceApiRevision: 25
 servers:
   - url: https://{hubHost}
     variables:
@@ -2304,7 +2304,7 @@ components:
       dependentRequired: { variant: [model] }
       additionalProperties: false
     MessageAttachment: { type: object, required: [name, mimeType], description: "An image riding a user message, referenced by workspace attachment id — never by bytes. `id` is absent on a replayed attachment whose reference could not be recovered; clients render those as labeled placeholders.", properties: { id: { type: string, minLength: 1, maxLength: 512 }, name: { type: string, minLength: 1, maxLength: 200 }, mimeType: { type: string, enum: [image/png, image/jpeg, image/gif, image/webp] } }, additionalProperties: false }
-    QueuedMessage: { type: object, required: [id, text, queuedAt], description: "A submission the workspace holds until the running turn ends. Not a timeline item; it becomes one when delivered. `requestId` echoes the accepting mutation's client request id so the submitting client can reconcile.", properties: { id: { type: string }, text: { type: string, description: "Empty for an image-only message." }, queuedAt: { type: number }, requestId: { type: string }, attachments: { type: array, maxItems: 8, items: { $ref: '#/components/schemas/MessageAttachment' } } }, additionalProperties: false }
+    QueuedMessage: { type: object, required: [id, text, queuedAt, delivery], description: "A submission accepted while the conversation was busy and not yet delivered to the agent. Not a timeline item; it becomes one when delivered. `delivery` says who holds it: `queue` is held by the workspace until the running turn ends, in submission order; `steer` is pending with the agent, which delivers it into its running turn at the next step boundary (only an agent declaring the `steering` capability accepts one). `paused`, present only when true, says nothing will deliver the entry on its own: a held message behind a cancellation or a staged revert, or a steer enqueued before the conversation last went idle. `requestId` echoes the accepting mutation's client request id so the submitting client can reconcile.", properties: { id: { type: string }, text: { type: string, description: "Empty for an image-only message." }, queuedAt: { type: number }, delivery: { enum: [steer, queue] }, paused: { const: true }, requestId: { type: string }, attachments: { type: array, maxItems: 8, items: { $ref: '#/components/schemas/MessageAttachment' } } }, additionalProperties: false }
     ChatEvent:
       oneOf:
         - { type: object, required: [generation, sequence, conversationId, type, item], properties: { generation: { type: string }, sequence: { type: integer, minimum: 0 }, conversationId: { type: string }, type: { const: item.upsert }, item: { $ref: '#/components/schemas/ConversationItem' } }, additionalProperties: false }
@@ -2313,7 +2313,7 @@ components:
         - { type: object, required: [generation, sequence, conversationId, type, status], properties: { generation: { type: string }, sequence: { type: integer, minimum: 0 }, conversationId: { type: string }, type: { const: conversation.status }, status: { $ref: '#/components/schemas/ConversationStatus' }, message: { type: string } }, additionalProperties: false }
         - { type: object, required: [generation, sequence, conversationId, type, configuration], properties: { generation: { type: string }, sequence: { type: integer, minimum: 0 }, conversationId: { type: string }, type: { const: conversation.configuration }, configuration: { $ref: '#/components/schemas/ConversationConfiguration' } }, additionalProperties: false }
         - { type: object, required: [generation, sequence, conversationId, type, conversation], properties: { generation: { type: string }, sequence: { type: integer, minimum: 0 }, conversationId: { type: string }, type: { const: conversation.updated }, conversation: { allOf: [{ $ref: '#/components/schemas/ConversationSummary' }], description: "Updated summary for this conversation. Its id is the event conversationId." } }, additionalProperties: false }
-        - { type: object, required: [generation, sequence, conversationId, type, queued, change], description: "Restates the whole held queue after a change, so replayed or duplicated frames converge on the same state.", properties: { generation: { type: string }, sequence: { type: integer, minimum: 0 }, conversationId: { type: string }, type: { const: conversation.queue }, queued: { type: array, items: { $ref: '#/components/schemas/QueuedMessage' } }, change: { type: object, required: [kind, messageId], properties: { kind: { enum: [held, removed, delivered] }, messageId: { type: string } }, additionalProperties: false } }, additionalProperties: false }
+        - { type: object, required: [generation, sequence, conversationId, type, queued, change], description: "Restates every pending message after a change — steers first in enqueue order, then held messages in submission order — so replayed or duplicated frames converge on the same state. `change.kind` names what happened to `change.messageId`: `held` or `steered` (accepted), `switched` (delivery changed), `paused` or `resumed` (paused state changed), `removed`, `delivered`.", properties: { generation: { type: string }, sequence: { type: integer, minimum: 0 }, conversationId: { type: string }, type: { const: conversation.queue }, queued: { type: array, items: { $ref: '#/components/schemas/QueuedMessage' } }, change: { type: object, required: [kind, messageId], properties: { kind: { enum: [held, steered, removed, switched, paused, resumed, delivered] }, messageId: { type: string } }, additionalProperties: false } }, additionalProperties: false }
         - { $ref: '#/components/schemas/ChatResyncEvent' }
     ChatResyncEvent: { type: object, required: [generation, sequence, conversationId, type, reason], properties: { generation: { type: string }, sequence: { type: integer, minimum: 0 }, conversationId: { type: string }, type: { const: resync }, reason: { enum: [generation-changed, retention-gap, invalid-cursor, conversation-rewritten] } }, additionalProperties: false }
     DocumentMeta:

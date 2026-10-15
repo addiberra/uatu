@@ -2,20 +2,20 @@ Each slice is written test first: write the named test and watch it fail, implem
 
 ## 1. Wire contract and capabilities
 
-- [ ] 1.1 Add tests in `src/chat/validation.test.ts`:
+- [x] 1.1 Add tests in `src/chat/validation.test.ts`:
   - `QueuedMessage` with `delivery` (`steer`/`queue`, required) and optional `paused: true` is accepted, and an unknown key is still rejected;
   - `conversation.queue` accepts the change kinds `steered`, `switched`, `paused`, and `resumed`, and still rejects an unknown kind.
 
   Then extend `src/chat/types.ts` (`QueuedMessage`, the `conversation.queue` change kinds) and `parseQueuedMessages` and the queue-event case in `src/chat/validation.ts` until the tests pass.
-- [ ] 1.2 Add `"steering"` and `"send-now"` to `ChatCapability` (`src/chat/types.ts`) with comments. Add tests asserting the provider descriptors:
+- [x] 1.2 Add `"steering"` and `"send-now"` to `ChatCapability` (`src/chat/types.ts`) with comments. Add tests asserting the provider descriptors:
   - 2.x declares both (`v2/provider.test.ts`);
   - Claude declares `send-now` only (`claude/provider.test.ts`);
   - 1.x declares neither (`v1/provider.test.ts`).
 
   Implement the descriptor changes until the tests pass.
-- [ ] 1.3 Bump `WORKSPACE_API_REVISION` from 24 to 25 in `src/shared/version.ts`. Verify that `bun test src/shared/api-revisions.test.ts` passes.
-- [ ] 1.4 In `api/openapi.yaml`, add `delivery` (required, `steer`/`queue`) and `paused` to the `QueuedMessage` schema, and add the change kinds `steered`, `switched`, `paused`, and `resumed` to the `conversation.queue` event schema. Verify that `bun test scripts/api-contract` passes.
-- [ ] 1.5 Add a "Hub 11 / Workspace 25 - Unreleased" entry to the top of `api/CHANGELOG.md`, marked breaking (workspace). List the `QueuedMessage` and queue-event changes, and add migration guidance for strict live-payload consumers. Verify that the compatibility check in `bun test scripts/api-contract` accepts the breaking diff with the revision bump and changelog entry.
+- [x] 1.3 Bump `WORKSPACE_API_REVISION` from 24 to 25 in `src/shared/version.ts`. Verify that `bun test src/shared/api-revisions.test.ts` passes.
+- [x] 1.4 In `api/openapi.yaml`, add `delivery` (required, `steer`/`queue`) and `paused` to the `QueuedMessage` schema, and add the change kinds `steered`, `switched`, `paused`, and `resumed` to the `conversation.queue` event schema. Verify that `bun test scripts/api-contract` passes.
+- [x] 1.5 Add a "Hub 11 / Workspace 25 - Unreleased" entry to the top of `api/CHANGELOG.md`, marked breaking (workspace). List the `QueuedMessage` and queue-event changes, and add migration guidance for strict live-payload consumers. Verify that the compatibility check in `bun test scripts/api-contract` accepts the breaking diff with the revision bump and changelog entry.
 
 ## 2. OpenCode 2.x inbox normalization
 

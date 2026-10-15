@@ -973,6 +973,7 @@ export class ChatAdapter {
             id: this.id(),
             text,
             queuedAt: Date.now(),
+            delivery: "queue",
             requestId,
             ...(attachmentRefs.length ? { attachments: attachmentRefs } : {}),
             ...(heldModel ? { model: heldModel } : {}),
@@ -1208,7 +1209,7 @@ export class ChatAdapter {
 
   /** The held queue as it goes on the wire — handles, not dispatch payloads. */
   private queuedMessages(conversationId: string): QueuedMessage[] {
-    return (this.heldQueues.get(conversationId) ?? []).map(({ id, text, queuedAt, requestId, attachments }) => ({ id, text, queuedAt, requestId, ...(attachments?.length ? { attachments } : {}) }));
+    return (this.heldQueues.get(conversationId) ?? []).map(({ id, text, queuedAt, requestId, attachments }) => ({ id, text, queuedAt, delivery: "queue" as const, requestId, ...(attachments?.length ? { attachments } : {}) }));
   }
 
   // Resolved at publish time for the same eviction reason as configuration

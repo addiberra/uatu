@@ -76,7 +76,7 @@ describe("OpenCode 2.x provider: identity and catalogs", () => {
   test("declares the capabilities the 2.x stack backs", () => {
     const { provider } = fakeOpenCode({});
     expect(provider().describe()).toMatchObject({ id: "opencode", name: "OpenCode" });
-    expect(provider().describe().capabilities).toEqual(["modes", "models", "commands", "questions", "permissions", "subagents", "variants", "context", "conversation-rename", "attachments", "reversible-history"]);
+    expect(provider().describe().capabilities).toEqual(["modes", "models", "commands", "questions", "permissions", "subagents", "variants", "context", "conversation-rename", "attachments", "reversible-history", "steering", "send-now"]);
     expect(provider().describe().permissionScopeNote).toContain("until OpenCode restarts");
   });
 

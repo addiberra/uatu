@@ -4551,7 +4551,7 @@ export function initChat(api = new ChatApiClient()): void {
         // attempt really held has long been stated by the stream itself.
         projection = accepted.held
           ? !retriedRequest && projectionEpoch === projectionEpochAtSubmit
-            ? noteQueuedMessage(projection, { id: accepted.messageId, text, queuedAt: Date.now(), requestId, ...(attachmentRefs.length ? { attachments: attachmentRefs } : {}) }, queueRevisionAtSubmit)
+            ? noteQueuedMessage(projection, { id: accepted.messageId, text, queuedAt: Date.now(), delivery: "queue", requestId, ...(attachmentRefs.length ? { attachments: attachmentRefs } : {}) }, queueRevisionAtSubmit)
             : removeAcceptedDraft(projection, requestId)
           // A reload's row is published before its acceptance and retired
           // with its outcome, which can precede the acceptance — even

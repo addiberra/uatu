@@ -2,6 +2,21 @@
 
 Entries are ordered newest first. Every entry has Hub and workspace revisions, a compatibility classification, and migration guidance. Use `None` when no migration is required. An entry is headed `Unreleased` until the release that ships it; the release-prep step replaces that with the version tag (`v0.7.0`), so a consumer can tell which revision pair a given uatu version speaks. An additive change that lands after a pair has shipped gets its own entry under the same pair, stamped with its own release, rather than being appended to the shipped entry.
 
+## Hub 11 / Workspace 25 - Unreleased
+
+Compatibility: breaking (workspace)
+
+### Changes
+
+- `QueuedMessage` gains a required `delivery` (`steer` or `queue`) and an optional `paused` (`true` when present). A `queue` message is held by the workspace until the running turn ends; a `steer` is pending with the agent, which delivers it into its running turn at the next step boundary. Only a conversation whose agent declares the new `steering` capability can carry a steer. A paused entry is pending but nothing delivers it on its own: a held message behind a cancellation or a staged revert, or a steer enqueued before the conversation last went idle.
+- The `conversation.queue` event's `change.kind` gains `steered`, `switched`, `paused`, and `resumed`. Its `queued` list, and a conversation snapshot's `queued`, are in delivery order: steers first in enqueue order, then held messages in submission order.
+- Two new agent capabilities can appear in a chat status: `steering` (OpenCode 2.x) and `send-now` (OpenCode 2.x and Claude Code). OpenCode 1.x declares neither.
+- Internal session-child routes under the excluded `/s/{workspaceId}/api/*` family change with this build: the prompt mutation accepts an optional `delivery` and reports `pending` plus `delivery` instead of `held`; `PATCH …/queue/{messageId}` switches a pending message's delivery; `POST …/queue/{messageId}/send-now` sends it now; the existing `DELETE` also withdraws a steer. They stay outside the public contract.
+
+### Migration
+
+Strict workspace live-payload consumers must regenerate against workspace revision 25: `QueuedMessage` is closed, so a revision 24 validator rejects every pending message for its `delivery`, and a closed `change.kind` enum rejects the four new kinds. Label pending messages by `delivery` and present `paused` ones as waiting; treat the list order as the delivery order. A consumer that offers queue actions should offer them only where the conversation's agent declares the capability behind them (`steering`, `send-now`). The Hub revision remains 11.
+
 ## Hub 11 / Workspace 24 - Unreleased
 
 Compatibility: breaking (hub, workspace)

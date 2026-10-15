@@ -615,10 +615,12 @@ export function parseQueuedMessages(value: unknown): QueuedMessage[] {
   if (!Array.isArray(value)) throw new Error("queued messages must be an array");
   for (const entry of value) {
     const record = expectRecord(entry, "queued message");
-    expectKeys(record, ["id", "text", "queuedAt", "requestId", "attachments"], "queued message");
+    expectKeys(record, ["id", "text", "queuedAt", "delivery", "paused", "requestId", "attachments"], "queued message");
     expectIdentity(record.id, "queued message id");
     expectString(record.text, "queued message text");
     expectTimestamp(record.queuedAt, "queued message queuedAt");
+    expectOneOf(record.delivery, ["steer", "queue"], "queued message delivery");
+    if (record.paused !== undefined && record.paused !== true) throw new Error("queued message paused must be true when present");
     if (record.requestId !== undefined) expectIdentity(record.requestId, "queued message requestId");
     if (record.attachments !== undefined) parseMessageAttachments(record.attachments, "queued message attachment");
   }
@@ -681,7 +683,7 @@ export function parseChatEvent(value: unknown): ChatEvent {
       parseQueuedMessages(record.queued);
       const change = expectRecord(record.change, "queue change");
       expectKeys(change, ["kind", "messageId"], "queue change");
-      expectOneOf(change.kind, ["held", "removed", "delivered"], "queue change kind");
+      expectOneOf(change.kind, ["held", "steered", "removed", "switched", "paused", "resumed", "delivered"], "queue change kind");
       expectIdentity(change.messageId, "queue change message id");
       break;
     }

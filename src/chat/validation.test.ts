@@ -16,6 +16,7 @@ import {
   parseUsageReportResponse,
   parseConversationSummary,
   parseInteractionRequest,
+  parseQueuedMessages,
   parseReversibleHistoryResult,
   parseReversibleHistoryState,
 } from "./validation";
@@ -167,7 +168,7 @@ describe("chat domain validation", () => {
       generation: "generation-1",
       cursor: "generation-1:10",
       items,
-      queued: [{ id: "held-1", text: "queued follow-up", queuedAt: 11, requestId: "request-9" }],
+      queued: [{ id: "held-1", text: "queued follow-up", queuedAt: 11, requestId: "request-9", delivery: "queue" }],
       reversibleHistory: { staged: true, canUndo: true, canRedo: true, revertedMessages: [{ id: "message:user-1", text: "hello" }] },
       olderCursor: "before:user-1",
     };
@@ -200,8 +201,14 @@ describe("chat domain validation", () => {
       { ...base, sequence: 4, type: "conversation.status", status: "completed" },
       { ...base, sequence: 5, type: "conversation.configuration", configuration: { model: { providerId: "anthropic", modelId: "claude" }, variant: "high" } },
       { ...base, sequence: 6, type: "conversation.updated", conversation: summary },
-      { ...base, sequence: 7, type: "conversation.queue", queued: [{ id: "held-1", text: "queued follow-up", queuedAt: 11 }], change: { kind: "held", messageId: "held-1" } },
+      { ...base, sequence: 7, type: "conversation.queue", queued: [{ id: "held-1", text: "queued follow-up", queuedAt: 11, delivery: "queue" }], change: { kind: "held", messageId: "held-1" } },
       { ...base, sequence: 8, type: "conversation.queue", queued: [], change: { kind: "delivered", messageId: "held-1" } },
+      // Steering (opencode-v2-steering): a steer first, then the kinds a
+      // switch, a pause, and a wake announce.
+      { ...base, sequence: 11, type: "conversation.queue", queued: [{ id: "msg_1", text: "steer this", queuedAt: 12, delivery: "steer" }, { id: "held-2", text: "then this", queuedAt: 13, delivery: "queue", paused: true }], change: { kind: "steered", messageId: "msg_1" } },
+      { ...base, sequence: 12, type: "conversation.queue", queued: [], change: { kind: "switched", messageId: "msg_1" } },
+      { ...base, sequence: 13, type: "conversation.queue", queued: [], change: { kind: "paused", messageId: "msg_1" } },
+      { ...base, sequence: 14, type: "conversation.queue", queued: [], change: { kind: "resumed", messageId: "msg_1" } },
       { ...base, sequence: 9, type: "resync", reason: "retention-gap" },
       { ...base, sequence: 10, type: "resync", reason: "conversation-rewritten" },
     ];
@@ -225,8 +232,14 @@ describe("chat domain validation", () => {
       () => parseConversationItem({ ...items[0], type: "provider_message" }),
       () => parseChatEvent({ generation: "g", sequence: -1, conversationId: "c", type: "item.remove", itemId: "i" }),
       () => parseChatEvent({ generation: "g", sequence: 1.5, conversationId: "c", type: "item.remove", itemId: "i" }),
-      () => parseChatEvent({ generation: "g", sequence: 1, conversationId: "c", type: "conversation.queue", queued: [{ id: "held-1", text: 5, queuedAt: 1 }], change: { kind: "held", messageId: "held-1" } }),
-      () => parseChatEvent({ generation: "g", sequence: 1, conversationId: "c", type: "conversation.queue", queued: [], change: { kind: "steered", messageId: "held-1" } }),
+      () => parseChatEvent({ generation: "g", sequence: 1, conversationId: "c", type: "conversation.queue", queued: [{ id: "held-1", text: 5, queuedAt: 1, delivery: "queue" }], change: { kind: "held", messageId: "held-1" } }),
+      () => parseChatEvent({ generation: "g", sequence: 1, conversationId: "c", type: "conversation.queue", queued: [], change: { kind: "enqueued", messageId: "held-1" } }),
+      // A queued message names its delivery, one of the two, and `paused` is
+      // either absent or true; unknown keys are still refused.
+      () => parseQueuedMessages([{ id: "held-1", text: "x", queuedAt: 1 }]),
+      () => parseQueuedMessages([{ id: "held-1", text: "x", queuedAt: 1, delivery: "later" }]),
+      () => parseQueuedMessages([{ id: "held-1", text: "x", queuedAt: 1, delivery: "queue", paused: false }]),
+      () => parseQueuedMessages([{ id: "held-1", text: "x", queuedAt: 1, delivery: "queue", model: "gpt" }]),
     ];
     for (const parse of invalid) expect(parse).toThrow();
   });

@@ -461,7 +461,7 @@ export class FakeE2EChatService implements WorkspaceChatService {
     // holds the message instead of delivering it, exactly like the adapter.
     const queue = this.queues.get(id) ?? [];
     if (conversation.status === "running" || conversation.status === "sending" || queue.length > 0) {
-      const held: QueuedMessage = { id: `held-${this.nextId++}`, text, queuedAt: Date.now(), requestId, ...(attachmentRefs.length ? { attachments: attachmentRefs } : {}) };
+      const held: QueuedMessage = { id: `held-${this.nextId++}`, text, queuedAt: Date.now(), delivery: "queue", requestId, ...(attachmentRefs.length ? { attachments: attachmentRefs } : {}) };
       queue.push(held);
       this.queues.set(id, queue);
       this.dormant.delete(id);

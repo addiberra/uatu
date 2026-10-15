@@ -124,7 +124,10 @@ export class OpenCodeV2Provider implements ChatProvider {
     return {
       id: "opencode",
       name: "OpenCode",
-      capabilities: ["modes", "models", "commands", "questions", "permissions", "subagents", "variants", "context", "conversation-rename", "attachments", "reversible-history"],
+      // `steering` and `send-now` ride the 2.x session inbox: a steer is an
+      // inbox entry OpenCode delivers at the next step boundary and can
+      // cancel before then (opencode-v2-steering D2).
+      capabilities: ["modes", "models", "commands", "questions", "permissions", "subagents", "variants", "context", "conversation-rename", "attachments", "reversible-history", "steering", "send-now"],
       permissionScopeNote: OPENCODE_PERMISSION_SCOPE_NOTE,
     };
   }

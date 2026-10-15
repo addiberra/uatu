@@ -798,7 +798,10 @@ export class ClaudeProvider implements ChatProvider {
     return {
       id: "claude",
       name: "Claude Code",
-      capabilities: ["context", "permissions", "questions", "models", "modes", "variants", "commands", "attachments", "reversible-history", "subagents", "custom-model-id", "background-tasks", "scheduled-wakeups", "conversation-rename", "usage"],
+      // `send-now` without `steering`: a dormant or idle queue's message can
+      // be dispatched ahead of the rest, but the SDK has no inbox to deliver
+      // into a running turn (opencode-v2-steering D2).
+      capabilities: ["context", "permissions", "questions", "models", "modes", "variants", "commands", "attachments", "reversible-history", "subagents", "custom-model-id", "background-tasks", "scheduled-wakeups", "conversation-rename", "usage", "send-now"],
       permissionScopeNote: CLAUDE_PERMISSION_SCOPE_NOTE,
     };
   }

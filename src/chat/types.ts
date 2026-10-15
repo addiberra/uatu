@@ -65,7 +65,18 @@ export type ChatCapability =
   | "scheduled-wakeups"
   // The agent's login has plan usage that can be asked for: the workspace
   // keeps the newest report and a read can be requested on demand.
-  | "usage";
+  | "usage"
+  // The agent can take a message into its running turn at the next safe
+  // step boundary, and can withdraw or switch it before then: the composer
+  // offers steer delivery while busy, the dock shows Steer entries with
+  // their switch actions, and an undo replacement goes out as a steer.
+  // Declared by OpenCode 2.x only (opencode-v2-steering, design D2).
+  | "steering"
+  // The agent can deliver a held message ahead of the rest of the queue:
+  // the dock offers Send now. On a `steering` agent that is the switch to
+  // steer; without it, only while the queue is dormant or the conversation
+  // is idle. Declared by OpenCode 2.x and Claude Code, not by 1.x.
+  | "send-now";
 
 // Image attachment bounds, shared by the composer (intake refusal), the
 // upload route (authoritative enforcement), and the store. 10 MiB sits
@@ -828,21 +839,40 @@ export type ConversationItem =
 
 export type InteractionRequest = PermissionRequest | QuestionRequest;
 
-// A prompt accepted while the conversation was busy, held by this workspace
-// and not yet delivered to the agent. Not a timeline item: it has no position
-// in the transcript until delivery, which is what lets it stay pinned at the
-// composer and removable. `id` is the handle removal addresses. `requestId`
-// echoes the accepting mutation's client request id so the submitting
-// client's optimistic draft retires the moment the held entry appears.
+// How a pending message reaches the agent. `queue`: held by this workspace
+// until the running turn ends, in submission order. `steer`: handed to the
+// agent at once, which keeps it until its running turn's next step boundary
+// (opencode-v2-steering, design D1). Only an agent declaring `steering`
+// accepts a steer.
+export type MessageDelivery = "steer" | "queue";
+
+// A prompt accepted while the conversation was busy and not yet delivered
+// to the agent: held by this workspace (`queue`) or pending with the agent
+// (`steer`). Not a timeline item: it has no position in the transcript until
+// delivery, which is what lets it stay pinned at the composer and removable.
+// `id` is the handle removal and switching address; for a steer it is the
+// agent's own inbox id. `requestId` echoes the accepting mutation's client
+// request id so the submitting client's optimistic draft retires the moment
+// the pending entry appears.
 export type QueuedMessage = {
   id: string;
   text: string;
   queuedAt: number;
+  delivery: MessageDelivery;
+  // Present only when true: the entry is pending but nothing will deliver it
+  // on its own — a held message behind a cancellation or a staged revert, or
+  // a steer enqueued before the conversation last went idle (design D3).
+  paused?: true;
   requestId?: string;
   // Attachment references held with the message; delivered exactly as
   // submitted, discarded with the message on removal.
   attachments?: MessageAttachment[];
 };
+
+// What a `conversation.queue` event announces about one entry. `held` and
+// `steered` are admissions; `switched` a delivery change; `paused` and
+// `resumed` the paused state changing; `removed` and `delivered` the ends.
+export type QueueChangeKind = "held" | "steered" | "removed" | "switched" | "paused" | "resumed" | "delivered";
 
 export type ConversationSnapshot = {
   conversation: ConversationSummary;
@@ -850,7 +880,8 @@ export type ConversationSnapshot = {
   generation: string;
   cursor: string;
   items: ConversationItem[];
-  // Held messages in submission order. Optional on the wire so a snapshot
+  // Pending messages in delivery order: steers first in enqueue order, then
+  // held messages in submission order. Optional on the wire so a snapshot
   // producer with no queue concept stays parseable; absent means empty.
   queued?: QueuedMessage[];
   reversibleHistory?: ReversibleHistoryState;
@@ -881,6 +912,6 @@ export type ChatEvent = ChatEventBase & (
   // duplicated frames converge on the same state, and a client that missed
   // nothing pays only the few queued entries a conversation can hold. `change`
   // names what happened for announcements.
-  | { type: "conversation.queue"; queued: QueuedMessage[]; change: { kind: "held" | "removed" | "delivered"; messageId: string } }
+  | { type: "conversation.queue"; queued: QueuedMessage[]; change: { kind: QueueChangeKind; messageId: string } }
   | { type: "resync"; reason: "generation-changed" | "retention-gap" | "invalid-cursor" | "conversation-rewritten" }
 );

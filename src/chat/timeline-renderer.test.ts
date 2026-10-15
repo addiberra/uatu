@@ -988,7 +988,7 @@ describe("presentation details", () => {
     const dockHost = target();
     const projection = projectionWith(
       [{ id: "message:u1", type: "user_message", createdAt: 1, text: "earlier" }],
-      { queued: [{ id: "held-1", text: "first held", queuedAt: 2 }, { id: "held-2", text: "second held", queuedAt: 3 }] },
+      { queued: [{ id: "held-1", text: "first held", queuedAt: 2, delivery: "queue" }, { id: "held-2", text: "second held", queuedAt: 3, delivery: "queue" }] },
     );
     renderer.render(host, projection, new Set());
     dock.render(dockHost, projection.queued);
