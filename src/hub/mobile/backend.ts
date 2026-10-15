@@ -63,6 +63,12 @@ export type WorkspaceRuntime =
   | { status: "stopped"; shells?: never };
 
 export type WorkspaceView = WorkspaceEntry & {
+  parentId?: string;
+  repositoryId?: string;
+  availability?: "missing" | "replaced";
+  ownership?: "uatu" | "external" | "uncertain";
+  sourceRef?: string;
+  createWorktree?: true;
   runtime: WorkspaceRuntime;
   branch: BranchState;
   credentialRestartRequired: boolean;
@@ -112,7 +118,8 @@ export type ImportOpenPgpIntent = { name: string; source: PrivateKeySource };
 
 /** Only explicit confirmation permits the adapter to stop dependent sessions first. */
 export type StopConsent = "ask" | "stop-dependent-workspaces";
-export type CoordinatedResult<T> = SessionsStoppedResult<T>;
+export type CoordinatedResult<T> = SessionsStoppedResult<T>
+  | { status: "needs-stop"; workspaceIds: []; scope: "projected-provider-users" };
 export type AssignmentSelection =
   | { authentication: AuthenticationSelection; signing?: { credentialId: string } }
   | { authentication?: AuthenticationSelection; signing: { credentialId: string } };

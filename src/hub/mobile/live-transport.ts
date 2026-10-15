@@ -11,12 +11,15 @@ export function createLiveTransport(options: { fetch?: Fetcher; timeoutMs?: numb
   let generation = 0;
   const listeners = new Set<(event: Invalidation) => void>();
   const fence = () => ++generation;
+  let eventGeneration = 0;
+  const emit = (event: Invalidation) => { for (const listener of listeners) listener(event); };
   function invalidate(reason: Extract<Invalidation, { scope: "authentication" }>["reason"]) {
-    const event: Invalidation = { scope: "authentication", generation: fence(), reason };
-    for (const listener of listeners) listener(event);
+    fence();
+    emit({ scope: "authentication", generation: ++eventGeneration, reason });
   }
   const unavailable = (): BackendProblem => ({ kind: "unavailable", message: "The Hub could not confirm this operation. Refresh its state before trying again." });
-  async function request<T>(path: string, decode: (value: unknown) => T, body?: unknown, authenticate = true): Promise<OperationResult<T>> {
+  async function request<T>(path: string, decode: (value: unknown) => T, body?: unknown, authenticate = true,
+    decodeFailure?: (value: unknown, status: number) => T | undefined): Promise<OperationResult<T>> {
     const started = generation;
     let url: string;
     try { url = hubUrl(path); }
@@ -34,8 +37,14 @@ export function createLiveTransport(options: { fetch?: Fetcher; timeoutMs?: numb
       }, url, timeout, async response => {
         if (signal?.aborted || started !== generation) { void response.body?.cancel().catch(() => {}); return uncertain(); }
         if (!response.ok) {
-          void response.body?.cancel().catch(() => {});
           if (response.status === 401 && authenticate) invalidate("unauthorized");
+          if (decodeFailure && response.status !== 401 && response.status !== 403
+            && response.headers.get("content-type")?.split(";", 1)[0]?.trim() === "application/json") {
+            const payload: unknown = await response.json();
+            if (signal?.aborted || started !== generation) return uncertain();
+            const value = decodeFailure(payload, response.status);
+            if (value !== undefined) return { status: "completed", value };
+          } else void response.body?.cancel().catch(() => {});
           // A server failure may follow an effect. It is not permission to retry.
           if (response.status >= 500) return uncertain();
           const retry = Number(response.headers.get("retry-after"));
@@ -56,6 +65,10 @@ export function createLiveTransport(options: { fetch?: Fetcher; timeoutMs?: numb
   }
   return {
     generation: () => generation, fence, invalidate,
+    workspaceChanged(workspaceId: string, reason: "stopped" | "removed") {
+      fence();
+      emit({ scope: "workspace", workspaceId, generation: ++eventGeneration, reason });
+    },
     subscribeInvalidation(listener: (event: Invalidation) => void) { listeners.add(listener); return () => { listeners.delete(listener); }; },
     request,
     async read<T>(path: string, decode: (value: unknown) => T): Promise<ReadResult<T>> {

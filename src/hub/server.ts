@@ -31,6 +31,7 @@ import {
 } from "./auth";
 import type { HubConfig } from "./config";
 import { CloneJobManager, type CloneJobEvent } from "./clone-jobs";
+import type { CloneAttemptStore } from "./clone-attempts";
 import { CloneProcessAdapter } from "./clone-process";
 import type { CloneCredentialResolver } from "./credential-context";
 import { normalizeProviderHost } from "./credential-types";
@@ -101,6 +102,9 @@ export type HubDeps = {
   folderManager?: Pick<FolderManager, "create" | "rename" | "remove" | "assertNoPendingMutation">;
   reservations?: PathReservationCoordinator;
   cloneJobs?: CloneJobManager;
+  // Assembled with the canonical, leased state root. Never resolve personal
+  // state implicitly in a handler/test assembly.
+  cloneAttempts?: CloneAttemptStore;
   // The worktree operation service. Absent (tests, the e2e harness) leaves
   // the worktree routes unmounted rather than half-answering.
   worktrees?: WorktreeService;
@@ -258,6 +262,7 @@ export function createHubFetchHandler(deps: HubDeps) {
     reservations: deps.reservations,
   });
   const { live, liveBroker } = assembleLive(deps);
+  const cloneAttempts = deps.cloneAttempts;
   const worktreeReconciler = assembleWorktreeReconciler(deps, liveBroker);
   const limiter = new LoginRateLimiter();
   const credentialLimiter = new CredentialOperationRateLimiter();
@@ -889,7 +894,7 @@ export function createHubFetchHandler(deps: HubDeps) {
           recoveryRequired: error.message,
         }, NO_STORE_HEADERS);
       }
-      const body: Record<string, unknown> = { error: error.message };
+      const body: Record<string, unknown> = { error: error.message, code: error.code };
       if (error.retainedPath !== undefined) body.retainedPath = error.retainedPath;
       if (error.code === "needs-init") return json(409, { needsInit: true, ...body }, NO_STORE_HEADERS);
       const status = error.code === "invalid-input" ? 400
@@ -1053,11 +1058,19 @@ export function createHubFetchHandler(deps: HubDeps) {
     try {
       body = closedJsonObject(await request.json(), [
         "url", "dest", "folderName", "credentialId", "retainAssignment",
-        "displayName", "retainedAuthentication", "signing", "start",
+        "displayName", "retainedAuthentication", "signing", "start", "attemptId",
       ]);
     } catch {
       return json(400, { error: "invalid JSON body or unknown field" });
     }
+    const { attemptId, ...intent } = body;
+    if (attemptId === undefined) return executeCloneJob(intent, owner);
+    if (typeof attemptId !== "string") return json(400, { error: "invalid clone attempt id" });
+    if (!cloneAttempts) return json(503, { error: "clone attempt admission is unavailable" });
+    return cloneAttempts.submit(owner, attemptId, intent, () => executeCloneJob(intent, owner));
+  };
+
+  const executeCloneJob = async (body: Record<string, unknown>, owner: string): Promise<Response> => {
     const url = typeof body.url === "string" ? body.url.trim() : "";
     if (url === "" || cloneTargetName(url) === null) {
       return json(400, { error: "a git clone URL is required" });
@@ -1784,6 +1797,13 @@ export function createHubFetchHandler(deps: HubDeps) {
       }
       if (!csrfOk(request, session.transport)) {
         return json(403, { error: "cross-origin request rejected" }, NO_STORE_HEADERS);
+      }
+      const cloneAttempt = /^\/api\/hub\/clone-attempts\/([^/]+)\/reconcile$/.exec(pathname);
+      if (cloneAttempt) {
+        if (!cloneAttempts) return json(503, { error: "clone attempt reconciliation is unavailable" });
+        let id: string;
+        try { id = decodeURIComponent(cloneAttempt[1]!); } catch { return json(400, { error: "invalid clone attempt id" }); }
+        return cloneAttempts.reconcile(session.user, id);
       }
       const workspaceCredentialAssignments = /^\/api\/hub\/workspaces\/([^/]+)\/credential-assignments$/.exec(pathname);
       if (workspaceCredentialAssignments && credentialApi) {

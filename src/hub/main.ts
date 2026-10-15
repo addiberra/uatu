@@ -57,6 +57,7 @@ import { WorktreeService } from "./worktree-service";
 import { WorktreeOperationCoordinator } from "./worktree-coordinator";
 import { WorkspaceOnboardingCoordinator } from "./onboarding";
 import { startHubServer } from "./server";
+import { CloneAttemptStore } from "./clone-attempts";
 import { SessionManager } from "./sessions";
 import { NotificationStore } from "./notification-store";
 import { HubNotifications } from "./notifications";
@@ -656,6 +657,7 @@ export async function runHub(options: RunHubOptions): Promise<void> {
     gitCommand: () => activePaths.get("git") ?? path.join(stateRoot, ".unavailable-git"),
     cloneCredentials,
     cloneJobs,
+    cloneAttempts: new CloneAttemptStore(path.join(stateRoot, "clone-attempts"), (owner, id) => cloneJobs.has(owner, id)),
     worktrees,
     folderManager,
     reservations,

@@ -2,6 +2,29 @@
 
 Entries are ordered newest first. Every entry has Hub and workspace revisions, a compatibility classification, and migration guidance. Use `None` when no migration is required. An entry is headed `Unreleased` until the release that ships it; the release-prep step replaces that with the version tag (`v0.7.0`), so a consumer can tell which revision pair a given uatu version speaks. An additive change that lands after a pair has shipped gets its own entry under the same pair, stamped with its own release, rather than being appended to the shipped entry.
 
+## Hub 14 / Workspace 24 - Unreleased (clone admission recovery)
+
+Compatibility: breaking (hub; optional onboarding code added to a closed response)
+
+### Changes
+
+- Clone requests may carry an owner-bound `attemptId`. Concurrent identical
+  submissions return the original job; conflicting reuse, cross-owner access and
+  expired jobs are refused. Legacy callers without an id remain supported.
+- Added CSRF-protected POST `/api/hub/clone-attempts/{attemptId}/reconcile`.
+  Nonacceptance is durably fenced; pending/expired/unavailable outcomes never
+  permit blind resubmission. Tombstones survive job expiry/restart and admission
+  fails closed at capacity. See [clone recovery](guides/clone-jobs.md).
+- Onboarding error responses optionally carry their structured `code`, preserving
+  retained-path and committed-recovery outcomes without parsing diagnostic prose.
+
+### Migration
+
+Closed revision-13 onboarding-error validators must allow `code`. Clients using
+attempt recovery must persist the non-secret id before dispatch and reconcile
+lost acceptance. Old request bodies and payloads without `code` remain supported.
+No workspace or clone-event schema change.
+
 ## Hub 13 / Workspace 24 - Unreleased (browser authentication)
 
 Compatibility: breaking (hub; optional identity added to a closed response)

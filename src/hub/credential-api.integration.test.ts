@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test, spyOn } from "bun:test";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
@@ -26,6 +26,13 @@ import { SessionManager } from "./sessions";
 import { TokenCredentialManager } from "./token-credentials";
 import { decodeHubState, decodeCredentialCatalog, decodeCredentialTools } from "./mobile/live-read-model";
 import type { SshCredentialOperations } from "./credential-ssh";
+import { parseHTML } from "linkedom";
+import { resetAppBasePathForTests } from "../shared/app-url";
+import { createLiveTransport } from "./mobile/live-transport";
+import { createLiveWorkspaceReads } from "./mobile/live-workspaces";
+import { createLiveCredentials } from "./mobile/live-credentials";
+import { createLiveLifecycle } from "./mobile/live-lifecycle";
+import { createLiveOnboarding } from "./mobile/live-onboarding";
 
 const roots: string[] = [];
 const servers: ReturnType<typeof startHubServer>[] = [];
@@ -207,6 +214,57 @@ function post(origin: string, cookie: string, endpoint: string, body: unknown, r
 }
 
 describe("credential API integration", () => {
+  test("mobile adapters execute real credential, lifecycle and folder routes with explicit stop consent", async () => {
+    const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "uatu-live-adapters-"))); roots.push(root);
+    const f = await fixture(root);
+    const origin = `http://127.0.0.1:${f.server.port}`, cookie = await login(origin, "alice", "alice password");
+    const savedDocument = Object.getOwnPropertyDescriptor(globalThis, "document");
+    const { document } = parseHTML('<html><head><meta name="uatu-hub" content="true"><meta name="uatu-base-path" content="/s/workspace/"></head></html>');
+    Object.defineProperty(globalThis, "document", { configurable: true, value: document }); resetAppBasePathForTests();
+    const calls: string[] = [];
+    try {
+      const transport = createLiveTransport({ fetch: (route, init) => {
+        calls.push(`${init?.method} ${route}`);
+        return fetch(`${origin}${route}`, { ...init, headers: { ...Object.fromEntries(new Headers(init?.headers)), cookie, origin } });
+      } });
+      const reads = createLiveWorkspaceReads(transport), credentials = createLiveCredentials(transport, reads);
+      const lifecycle = createLiveLifecycle(transport, { ...reads, ...credentials }), folders = createLiveOnboarding(transport);
+      const start = { workspaceId: f.workspace.id, unassigned: "not-confirmed" as const };
+      expect(await lifecycle.startWorkspace(start)).toMatchObject({ status: "completed", value: { status: "confirm-unassigned" } });
+      expect(f.backendEvents.starts).toEqual([]);
+      const token = await credentials.createToken({ name: "Disposable provider token", host: "github.com", token: "disposable-test-value", capabilities: ["https-git", "github-cli"] });
+      expect(token.status).toBe("completed"); if (token.status !== "completed") throw new Error("Token creation failed");
+      expect(JSON.stringify(token)).not.toContain("disposable-test-value");
+      expect(await credentials.assignWorkspace({ workspaceId: f.workspace.id, mode: "edit-current", selection: { authentication: { credentialId: token.value.id, host: "GitHub.COM" } } })).toMatchObject({ status: "completed", value: [{ role: "authentication", host: "github.com" }] });
+      expect(await lifecycle.startWorkspace(start)).toMatchObject({ status: "completed", value: { status: "running" } });
+      expect(f.backendEvents.starts).toEqual([f.workspace.id]);
+      const target = { id: token.value.id, type: "token" as const };
+      const before = calls.length;
+      expect(await credentials.disableCredential({ target, stop: "ask" })).toEqual({ status: "completed", value: { status: "needs-stop", workspaceIds: [], scope: "projected-provider-users" } });
+      expect(calls.slice(before).some(call => call.startsWith("POST"))).toBe(false);
+      expect(f.backendEvents.stops).toEqual([]);
+      f.backendEvents.stopFailures.add(f.workspace.id);
+      expect((await credentials.disableCredential({ target, stop: "stop-dependent-workspaces" })).status).not.toBe("completed");
+      expect(f.metadata.snapshot().credentials.find(row => row.id === target.id)!.enabled).toBe(true);
+      f.backendEvents.stopFailures.clear();
+      expect(await credentials.disableCredential({ target, stop: "stop-dependent-workspaces" })).toMatchObject({ status: "completed", value: { status: "completed", value: { enabled: false } } });
+      expect(await lifecycle.startWorkspace(start)).toMatchObject({ status: "rejected", problem: { kind: "conflict" } });
+      expect(await credentials.enableCredential(target)).toMatchObject({ status: "completed", value: { enabled: true } });
+      expect(await credentials.testCredential(target)).toMatchObject({ status: "completed", value: [{ status: "ready" }] });
+      expect(await lifecycle.renameWorkspace({ workspaceId: f.workspace.id, displayName: "Renamed fixture" })).toMatchObject({ status: "completed", value: { displayName: "Renamed fixture", path: f.workspace.path } });
+      expect(await folders.createFolder({ parent: root, name: "new-folder" })).toMatchObject({ status: "completed", value: { path: path.join(root, "new-folder") } });
+      expect(await folders.browseFolders(root)).toMatchObject({ status: "available", value: { path: root } });
+      expect(await folders.renameFolder({ path: path.join(root, "new-folder"), name: "renamed-folder", stop: "ask" })).toMatchObject({ status: "completed", value: { status: "completed", value: { path: path.join(root, "renamed-folder") } } });
+      expect(await folders.removeEmptyFolder({ path: path.join(root, "renamed-folder"), stop: "ask" })).toMatchObject({ status: "completed", value: { status: "completed" } });
+      expect(await credentials.removeAssignment({ assignment: { workspaceId: f.workspace.id, credentialId: target.id, role: "authentication", host: "github.com" }, stop: "ask" })).toMatchObject({ status: "completed", value: { status: "completed", value: { removed: true } } });
+      expect(await credentials.deleteCredential({ target, confirm: true, unassign: false, stop: "stop-dependent-workspaces" })).toMatchObject({ status: "completed", value: { status: "completed", value: { deleted: true } } });
+      expect(await lifecycle.forgetWorkspace(f.workspace.id)).toMatchObject({ status: "completed", value: { status: "forgotten" } });
+      expect((await folders.browseFolders(root)).status).toBe("available");
+    } finally {
+      if (savedDocument) Object.defineProperty(globalThis, "document", savedDocument); else Reflect.deleteProperty(globalThis, "document");
+      resetAppBasePathForTests();
+    }
+  });
   test("actual catalog serialization carries explicit protected/unprotected/unknown facts, independent of readiness wording", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "uatu-wire-facts-")); roots.push(root);
     const f = await fixture(root, {

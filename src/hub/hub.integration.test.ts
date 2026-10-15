@@ -22,6 +22,7 @@ import {
 } from "./credential-context";
 import { hashPassword, HubSessionStore, hubCookieName } from "./auth";
 import { CloneJobManager } from "./clone-jobs";
+import { CloneAttemptStore } from "./clone-attempts";
 import { CloneProcessAdapter, type CloneProcessFactory } from "./clone-process";
 import type { HubConfig } from "./config";
 import { CredentialMetadataStore } from "./credential-store";
@@ -263,6 +264,7 @@ beforeAll(async () => {
     preferences,
     onboarding,
     cloneJobs,
+    cloneAttempts: new CloneAttemptStore(path.join(tempRoot, "clone-attempts"), (owner, id) => cloneJobs.has(owner, id)),
     folderManager,
     reservations,
     worktrees,
@@ -281,6 +283,33 @@ afterAll(async () => {
 });
 
 describe("hub end to end", () => {
+  test("clone attempts deduplicate real route admission, fence absence, and enforce owner/auth/CSRF", async () => {
+    const principal = await sessionStore.issue("alice", "Attempt contract test");
+    const headers = { authorization: `Bearer ${principal.id}`, "content-type": "application/json" };
+    const attemptId = "integration-attempt-one";
+    const body = { url: "interactive:attempt-owned", dest: path.join(tempRoot, "attempt-clones"), attemptId };
+    const submit = () => fetch(`${origin}/api/hub/clone-jobs`, { method: "POST", headers, body: JSON.stringify(body) });
+    const [first, duplicate] = await Promise.all([submit(), submit()]);
+    await assertContract("POST", "/api/hub/clone-jobs", first.clone());
+    expect(first.status).toBe(202); expect(duplicate.status).toBe(202);
+    const accepted = await first.json() as { jobId: string };
+    expect(await duplicate.json()).toEqual(accepted);
+    const reconcile = (id: string, requestHeaders: HeadersInit = headers) => fetch(`${origin}/api/hub/clone-attempts/${id}/reconcile`, { method: "POST", headers: requestHeaders });
+    const recovered = await reconcile(attemptId);
+    await assertContract("POST", "/api/hub/clone-attempts/{attemptId}/reconcile", recovered.clone());
+    expect(recovered.headers.get("cache-control")).toBe("no-store");
+    expect(await recovered.json()).toEqual({ status: "accepted", ...accepted });
+    const conflict = await fetch(`${origin}/api/hub/clone-jobs`, { method: "POST", headers, body: JSON.stringify({ ...body, start: true }) });
+    expect(conflict.status).toBe(409);
+    const other = await sessionStore.issue("tobias", "Other attempt owner");
+    expect((await reconcile(attemptId, { authorization: `Bearer ${other.id}` })).status).toBe(404);
+    expect((await reconcile("anonymous-attempt", {})).status).toBe(401);
+    expect((await reconcile("cross-site-attempt", { cookie: `${hubCookieName(new URL(origin))}=${principal.id}`, origin: "https://elsewhere.invalid" })).status).toBe(403);
+    expect(await (await reconcile("fenced-before-submit")).json()).toEqual({ status: "not-accepted" });
+    const fenced = await fetch(`${origin}/api/hub/clone-jobs`, { method: "POST", headers, body: JSON.stringify({ ...body, attemptId: "fenced-before-submit" }) });
+    expect(fenced.status).toBe(409);
+    expect(await cloneJobs.cancel("alice", accepted.jobId)).toBe("cancelled");
+  });
   test("cookie-only browser login, identity and device revocation keep bearer secrets out of JSON", async () => {
     const body = JSON.stringify({ name: "alice", password: "alice secret", sessionTransport: "cookie", deviceLabel: "Mobile adapter test" });
     const denied = await fetch(`${origin}/login`, { method: "POST", headers: { "content-type": "application/json", origin: "https://elsewhere.invalid" }, body });

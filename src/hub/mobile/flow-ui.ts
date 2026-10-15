@@ -176,7 +176,7 @@ export function createFlowEnvironment(root: HTMLElement, backend: MobileHubBacke
     async coordinated(title, call, success) {
       const run = (stop: StopConsent, context?: HTMLElement) => env.mutate(() => call(stop), result => {
         if (result.status === "completed") { sheet.close(); hooks.changed(); success(result.value); }
-        else env.confirm(title, text(`Stopping these workspaces terminates their shells: ${result.workspaceIds.join(", ")}. The catalog changes only after all required stops succeed. Some sessions may already have stopped if stopping fails.`), { label: "Stop and continue", run: task => run("stop-dependent-workspaces", task) });
+        else env.confirm(title, text(`${"scope" in result ? "The Hub will stop any running workspaces still using this provider token, terminating their shells. Current assignment rows do not identify these sessions." : `Stopping these workspaces terminates their shells: ${result.workspaceIds.join(", ")}.`} The catalog changes only after all required stops succeed. Some sessions may already have stopped if stopping fails.`), { label: "Stop and continue", run: task => run("stop-dependent-workspaces", task) });
       }, context);
       await run("ask", root);
     },

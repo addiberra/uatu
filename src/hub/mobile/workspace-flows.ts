@@ -93,6 +93,10 @@ export function createWorkspaceFlows(env: FlowEnvironment, start: (workspace: Wo
             actions[`workspace-${w.id}`] = () => assignments(w.id);
             return listRow(`workspace-${w.id}`, w.displayName, `${w.runtime.status} · ${w.assignments.length} assignments · ${w.path}`);
           }
+          if (w.parentId) {
+            actions["parent-policy"] = () => assignments(w.parentId);
+            return group("Inherited credentials", text("This linked checkout uses its parent workspace's live credential policy. Editing the parent affects all its linked checkouts.") + listRow("parent-policy", "Manage parent workspace credentials", w.parentId));
+          }
           actions[`new-${w.id}`] = () => editAssignments(w, catalog, "assign-new");
           actions[`edit-${w.id}`] = () => editAssignments(w, catalog, "edit-current");
           const current = w.assignments.map((a, index) => {

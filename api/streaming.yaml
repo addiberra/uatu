@@ -145,6 +145,7 @@ channels:
       replay: Send Last-Event-ID; retained events whose integer id is greater are replayed in order.
       replayLimit: Output retention is byte-bounded; phase and result events remain replayable while the job is retained.
       reconnection: A result event closes the stream. Reconnecting within the job retention window replays retained events — including the terminal result — and then closes again.
+      admissionRecovery: Before connecting after lost submission acceptance, POST hubReconcileCloneAttempt with the original attempt id. Only accepted supplies a job id; pending, expired and unavailable never permit a replacement clone. Attempt tombstones outlive the in-memory job and are not event replay storage.
       errors: Unknown or non-owned jobs return HTTP 404 before stream start; no in-band error event exists.
 schemas:
   DocumentUpdate:

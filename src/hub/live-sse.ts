@@ -13,6 +13,7 @@ export type SseFrame = {
 export class SseFrameParser {
   private pending = "";
   private readonly decoder = new TextDecoder();
+  constructor(private readonly maxFrameCharacters = Infinity) {}
 
   // Feeds one chunk and returns every complete frame it closed. A frame
   // made only of comments yields `{ comment: true }` so a keepalive is still
@@ -24,10 +25,12 @@ export class SseFrameParser {
       const boundary = findFrameBoundary(this.pending);
       if (!boundary) break;
       const block = this.pending.slice(0, boundary.index);
+      if (block.length > this.maxFrameCharacters) throw new Error("SSE frame exceeds limit");
       this.pending = this.pending.slice(boundary.index + boundary.length);
       const parsed = parseBlock(block);
       if (parsed) frames.push(parsed);
     }
+    if (this.pending.length > this.maxFrameCharacters) throw new Error("SSE frame exceeds limit");
     return frames;
   }
 }

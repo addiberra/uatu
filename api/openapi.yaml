@@ -1,9 +1,9 @@
 openapi: 3.1.0
 info:
   title: UatuCode public API
-  version: 13.24.0-experimental
+  version: 14.24.0-experimental
   license: { name: MIT, identifier: MIT }
-  summary: Hub revision 12 and workspace revision 24
+  summary: Hub revision 14 and workspace revision 24
   description: |
     Canonical HTTP contract for the UatuCode Hub API, the only public API.
     Under `/s/{workspaceId}/` the Hub serves one family itself, personal
@@ -20,7 +20,7 @@ info:
     is the authoritative machine-readable pair, and the product version of a
     published snapshot is recorded in that snapshot's `contract.json`.
   x-uatu-revisions:
-    hubApiRevision: 13
+    hubApiRevision: 14
     workspaceApiRevision: 24
 servers:
   - url: https://{hubHost}
@@ -152,7 +152,7 @@ paths:
                   summary: An ordinary workspace
                   value:
                     version: 0.5.1 (abcdef0)
-                    hubApiRevision: 13
+                    hubApiRevision: 14
                     workspaceApiRevision: 20
                     workspaces: [{ id: uatu, displayName: Uatu Docs, path: /src/uatu, backend: local, running: true, credentialRestartRequired: false, credentialAssignments: { authentication: [Work GitHub], signing: [Work signing] }, workspaceApiRevision: 20, shells: [{ attached: false, label: zsh }] }]
                     workspaceDefaults: { configured: /srv/workspaces, configuredAvailable: true, effective: /srv/workspaces }
@@ -160,7 +160,7 @@ paths:
                   summary: A main workspace and one linked worktree
                   value:
                     version: 0.5.1 (abcdef0)
-                    hubApiRevision: 13
+                    hubApiRevision: 14
                     workspaceApiRevision: 20
                     worktreeApi: /api/hub/worktrees
                     workspaces:
@@ -859,6 +859,7 @@ paths:
       operationId: hubCreateCloneJob
       tags: [Clone jobs]
       summary: Start an asynchronous git clone
+      description: With attemptId, admission is durable and owner-bound. Identical retries return the original retained job; conflicting reuse is refused. After a lost response reconcile the attempt, never blindly submit a new id. Clients omitting attemptId retain legacy non-idempotent behavior.
       requestBody:
         required: true
         content:
@@ -875,8 +876,29 @@ paths:
         '400': { $ref: '#/components/responses/Error' }
         '401': { $ref: '#/components/responses/Error' }
         '403': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
         '409': { $ref: '#/components/responses/Error' }
+        '410': { $ref: '#/components/responses/Error' }
         '500': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
+  /api/hub/clone-attempts/{attemptId}/reconcile:
+    parameters:
+      - { name: attemptId, in: path, required: true, schema: { $ref: '#/components/schemas/CloneAttemptId' } }
+    post:
+      operationId: hubReconcileCloneAttempt
+      tags: [Clone jobs]
+      summary: Reconcile or fence an owned clone submission attempt
+      description: Absence is durably fenced before not-accepted is returned; this is a CSRF-protected mutation, not a GET. Accepted identifies the original retained job. Pending means admission is in flight; expired means execution cannot be reconstructed after job expiry or restart. Neither permits resubmission. Records are never silently evicted; at 10000 records new admission/fencing fails closed with 503. Only non-secret request/owner hashes and job identity persist. A different owner's attempt returns 404. Responses are no-store.
+      responses:
+        '200':
+          description: Authoritative attempt state
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/CloneAttemptState' } }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
   /api/hub/clone-jobs/{jobId}/events:
     parameters: [{ $ref: '#/components/parameters/JobId' }]
     head:
@@ -1838,6 +1860,7 @@ components:
         error: { type: string, minLength: 1 }
         needsInit: { type: boolean, const: true, description: The folder is not a Git repository; re-submit with init true after user confirmation. }
         retainedPath: { type: string, description: "A created repository was initialized before the failure and is retained at this path; retry through the Existing folder flow." }
+        code: { enum: [invalid-input, not-found, conflict, needs-init, credential, git-init, internal, recovery-pending, recovery-required], description: Optional authoritative onboarding error category; absence on older servers remains unknown. }
       additionalProperties: false
     UpdateWorkspaceDisplayNameRequest:
       type: object
@@ -2074,6 +2097,7 @@ components:
       type: object
       required: [url, dest]
       properties:
+        attemptId: { $ref: '#/components/schemas/CloneAttemptId' }
         url: { type: string }
         dest: { type: string }
         folderName: { type: string, description: "Checkout folder name, independent of the workspace display name, trimmed before use. Absent, blank, or whitespace-only derives it from the clone URL. Any other value must be one visible path segment — `.`, `..`, path separators, control characters, and Unicode format characters (Cf) answer 400 — but, unlike FolderName, a dot-prefixed checkout is accepted." }
@@ -2088,6 +2112,14 @@ components:
           if: { properties: { retainAssignment: { const: true } } }
           then: { properties: { credentialId: { $ref: '#/components/schemas/CredentialId' } }, required: [credentialId] }
       additionalProperties: false
+    CloneAttemptId:
+      type: string
+      pattern: '^[A-Za-z0-9][A-Za-z0-9_-]{7,127}$'
+      description: Fresh opaque random identity, persisted before dispatch; never derived from secrets or reused for another intent.
+    CloneAttemptState:
+      oneOf:
+        - { type: object, required: [status, jobId], properties: { status: { const: accepted }, jobId: { type: string, minLength: 1 } }, additionalProperties: false }
+        - { type: object, required: [status], properties: { status: { enum: [pending, not-accepted, expired] } }, additionalProperties: false }
     CloneJob:
       type: object
       required: [jobId]

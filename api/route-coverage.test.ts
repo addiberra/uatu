@@ -101,6 +101,7 @@ test("Hub dispatch families are public or explicitly excluded", async () => {
     ["hubUpdateWorkspaceDefaults", 'pathname === "/api/hub/settings/workspace-defaults"'],
     ["hubListDeviceSessions", 'pathname === "/api/hub/sessions"'],
     ["hubCreateCloneJob", 'pathname === "/api/hub/clone-jobs"'],
+    ["hubReconcileCloneAttempt", "const cloneAttempt ="],
     ["hubStreamCloneJobEvents", "cloneJobEvents"],
     ["hubProbeCloneJobEvents", "cloneJobEvents"],
     ["hubSendCloneJobInput", "cloneJobAction"],
