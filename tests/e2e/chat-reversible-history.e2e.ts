@@ -239,7 +239,7 @@ test.describe("reversible Chat history", () => {
 
     const replacement = await send(page, "replacement turn");
     expect(replacement.status()).toBe(202);
-    expect(await replacement.json()).toMatchObject({ held: false });
+    expect(await replacement.json()).toMatchObject({ pending: false });
     await expect(page.locator("#chat-items")).toContainText("replacement turn");
     await expect(page.locator("#chat-items")).not.toContainText("discarded active turn");
     await expect(page.locator("#chat-queue .is-held")).toContainText("older queued turn");

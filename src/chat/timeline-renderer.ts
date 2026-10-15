@@ -1099,53 +1099,112 @@ function renderDraft(draft: AcceptedDraft): string {
   return `<article class="chat-item chat-user-message is-pending" data-chat-item-id="draft-${escapeHtmlAttribute(draft.requestId)}">${renderMessageAttachments(draft.attachments)}${draft.text ? `<p>${escapeHtml(draft.text)}</p>` : ""}<small>${label}</small></article>`;
 }
 
-// A held message is not a timeline item: it renders in the dock above the
-// composer, keeps its removal control, and only becomes a transcript entry
-// when the workspace delivers it.
-function renderQueued(held: QueuedMessage): string {
-  const id = escapeHtmlAttribute(held.id);
-  return `<article class="chat-queued-message is-held" role="listitem" data-chat-queued-id="${id}">${renderMessageAttachments(held.attachments)}${held.text ? `<p>${escapeHtml(held.text)}</p>` : ""}<footer class="chat-queued-row"><small class="chat-queued-tag">Queued — sends when the agent is ready</small><button type="button" class="chat-queued-remove" data-queue-remove="${id}">Remove</button></footer></article>`;
+// What the dock needs beyond the entries to decide each one's actions
+// (opencode-v2-steering D10): the agent's capabilities, whether the turn
+// runs, and whether an entry's text is a command (commands are never steered).
+export type QueueDockContext = {
+  steering: boolean;
+  sendNow: boolean;
+  running: boolean;
+  isCommand: (text: string) => boolean;
+  // The one note under the dock while any steer is pending: steers run
+  // with the conversation's model and mode as they stand at delivery.
+  note?: HTMLElement;
+};
+
+export const STEER_MODEL_NOTE = "Steers run with the conversation's model and mode as they stand when delivered.";
+
+function queuedTag(entry: QueuedMessage): string {
+  if (entry.delivery === "steer") return entry.paused ? "Steer — paused until the agent is woken" : "Steer — joins the running turn at its next step";
+  return entry.paused ? "Queue — paused" : "Queued — sends when the agent is ready";
+}
+
+// The entry's own actions, in rail order (switch or send first, then edit,
+// then remove), as `[attribute, label]` pairs — a pure decision the renderer
+// and the tests share.
+export function queuedActions(entry: QueuedMessage, context: QueueDockContext): Array<[string, string]> {
+  const actions: Array<[string, string]> = [];
+  if (entry.delivery === "steer") {
+    if (entry.paused) actions.push(["data-queue-send-now", "Send now (all paused steers)"]);
+    actions.push(["data-queue-queue", "Queue"]);
+  } else if (context.steering) {
+    // On a steering agent, Send now IS the switch to steer (D8); a command
+    // cannot go to the agent's inbox either way.
+    if (!context.isCommand(entry.text)) actions.push(context.running ? ["data-queue-steer", "Steer"] : ["data-queue-send-now", "Send now"]);
+  } else if (context.sendNow && !context.running) {
+    actions.push(["data-queue-send-now", "Send now"]);
+  }
+  actions.push(["data-queue-edit", "Edit"], ["data-queue-remove", "Remove"]);
+  return actions;
+}
+
+// A pending message is not a timeline item: it renders in the dock above the
+// composer with its delivery label and its actions, and only becomes a
+// transcript entry when the agent delivers it.
+function renderQueued(entry: QueuedMessage, context: QueueDockContext): string {
+  const id = escapeHtmlAttribute(entry.id);
+  const classes = `chat-queued-message ${entry.delivery === "steer" ? "is-steer" : "is-held"}`;
+  const buttons = queuedActions(entry, context).map(([attribute, label]) => `<button type="button" class="chat-queued-action${attribute === "data-queue-remove" ? " chat-queued-remove" : ""}" ${attribute}="${id}">${escapeHtml(label)}</button>`).join("");
+  return `<article class="${classes}" role="listitem" data-chat-queued-id="${id}" data-delivery="${entry.delivery}"${entry.paused ? " data-paused" : ""}>${renderMessageAttachments(entry.attachments)}${entry.text ? `<p>${escapeHtml(entry.text)}</p>` : ""}<footer class="chat-queued-row"><small class="chat-queued-tag">${escapeHtml(queuedTag(entry))}</small><span class="chat-queued-actions">${buttons}</span></footer></article>`;
 }
 
 /**
  * Reconciles the queue dock — the strip docked to the composer that shows
- * what the workspace holds. Deliberately outside the timeline scroll: a held
- * message must sit against the composer whatever length the transcript is
- * and wherever the reader has scrolled it.
+ * what is pending: steers first, then the workspace's held queue (D5).
+ * Deliberately outside the timeline scroll: a pending message must sit
+ * against the composer whatever length the transcript is and wherever the
+ * reader has scrolled it.
  */
 export class QueueDockRenderer {
-  private readonly entries = new Map<string, { node: HTMLElement; held: QueuedMessage }>();
+  private readonly entries = new Map<string, { node: HTMLElement; html: string }>();
 
-  render(target: HTMLElement, queued: readonly QueuedMessage[]): void {
+  render(target: HTMLElement, queued: readonly QueuedMessage[], context: QueueDockContext = { steering: false, sendNow: false, running: true, isCommand: () => false }): void {
+    // The entries live in the dock's own list; the note sits beside it, so
+    // the list holds list items only.
+    let list = target.querySelector<HTMLElement>(":scope > .chat-queue-items");
+    if (!list) {
+      list = target.ownerDocument.createElement("div");
+      list.className = "chat-queue-items";
+      list.setAttribute("role", "list");
+      target.prepend(list);
+    }
     const ordered: HTMLElement[] = [];
-    for (const held of queued) {
-      const entry = this.entries.get(held.id);
-      if (entry && entry.held.text === held.text && JSON.stringify(entry.held.attachments ?? []) === JSON.stringify(held.attachments ?? [])) {
-        ordered.push(entry.node);
+    for (const entry of queued) {
+      // Rebuilt when anything shown changes — text, attachments, delivery,
+      // paused state, or the actions the context allows — and kept otherwise.
+      const html = renderQueued(entry, context);
+      const existing = this.entries.get(entry.id);
+      if (existing && existing.html === html) {
+        ordered.push(existing.node);
         continue;
       }
-      const node = buildNode(renderQueued(held));
+      const node = buildNode(html);
       decorateAttachmentImages(node);
-      entry?.node.remove();
-      this.entries.set(held.id, { node, held });
+      existing?.node.remove();
+      this.entries.set(entry.id, { node, html });
       ordered.push(node);
     }
-    const live = new Set(queued.map(held => held.id));
+    const live = new Set(queued.map(entry => entry.id));
     for (const [id, entry] of this.entries) {
       if (!live.has(id)) {
         entry.node.remove();
         this.entries.delete(id);
       }
     }
-    let cursor = target.firstElementChild;
+    let cursor = list.firstElementChild;
     for (const node of ordered) {
       if (node === cursor) {
         cursor = cursor.nextElementSibling;
         continue;
       }
-      target.insertBefore(node, cursor);
+      list.insertBefore(node, cursor);
     }
     target.hidden = queued.length === 0;
+    if (context.note) {
+      const steering = queued.some(entry => entry.delivery === "steer");
+      context.note.hidden = !steering;
+      if (steering && context.note.textContent !== STEER_MODEL_NOTE) context.note.textContent = STEER_MODEL_NOTE;
+    }
   }
 
   reset(): void {

@@ -981,6 +981,85 @@ describe("presentation details", () => {
     expect(host.textContent).toContain("worked 7s");
   });
 
+  describe("the queue dock under steering (opencode-v2-steering D10)", () => {
+    const queued = (overrides: Partial<import("./types").QueuedMessage> & { id: string }): import("./types").QueuedMessage => ({ text: overrides.id, queuedAt: 1, delivery: "queue", ...overrides });
+    const steering = { steering: true, sendNow: true, running: true, isCommand: (text: string) => text.startsWith("/") };
+    const actions = (node: Element) => [...node.querySelectorAll("button")].map(button => button.textContent?.trim());
+
+    test("steers render before queued entries, labelled, with a paused note, and the model note shows only while a steer is pending", () => {
+      const dock = new QueueDockRenderer();
+      const host = target();
+      const note = target();
+      dock.render(host, [queued({ id: "msg_1", text: "steer me", delivery: "steer" }), queued({ id: "held-1", text: "later", paused: true }), queued({ id: "msg_2", text: "stranded", delivery: "steer", paused: true })], { ...steering, note });
+      const entries = [...host.querySelectorAll(".chat-queued-message")];
+      expect(entries.map(entry => entry.getAttribute("data-delivery"))).toEqual(["steer", "queue", "steer"]);
+      expect(entries.map(entry => entry.classList.contains("is-held"))).toEqual([false, true, false]);
+      expect(entries.map(entry => entry.classList.contains("is-steer"))).toEqual([true, false, true]);
+      expect(entries.map(entry => entry.querySelector(".chat-queued-tag")?.textContent)).toEqual([
+        expect.stringMatching(/^Steer\b/),
+        expect.stringMatching(/^Queue\b.*paused/i),
+        expect.stringMatching(/^Steer\b.*paused/i),
+      ]);
+      expect(entries.map(entry => entry.hasAttribute("data-paused"))).toEqual([false, true, true]);
+      expect(note.hidden).toBe(false);
+      expect(note.textContent).toContain("model and mode");
+      // No steer pending: no note.
+      dock.render(host, [queued({ id: "held-1", text: "later" })], { ...steering, note });
+      expect(note.hidden).toBe(true);
+      dock.render(host, [], { ...steering, note });
+      expect(host.hidden).toBe(true);
+      expect(note.hidden).toBe(true);
+    });
+
+    test("actions follow capability and state: remove and edit always; steer or send now on queued entries; queue on steers; send now on paused steers; none to steer a command", () => {
+      const dock = new QueueDockRenderer();
+      const host = target();
+      const entry = (id: string) => host.querySelector(`[data-chat-queued-id="${id}"]`)!;
+      // A steering agent while the turn runs.
+      dock.render(host, [queued({ id: "held-1", text: "later" }), queued({ id: "held-2", text: "/review all" }), queued({ id: "msg_1", text: "steer", delivery: "steer" }), queued({ id: "msg_2", text: "stranded", delivery: "steer", paused: true })], steering);
+      expect(actions(entry("held-1"))).toEqual(["Steer", "Edit", "Remove"]);
+      expect(entry("held-1").querySelector("[data-queue-steer='held-1']")).not.toBeNull();
+      expect(actions(entry("held-2"))).toEqual(["Edit", "Remove"]);
+      expect(actions(entry("msg_1"))).toEqual(["Queue", "Edit", "Remove"]);
+      expect(entry("msg_1").querySelector("[data-queue-queue='msg_1']")).not.toBeNull();
+      expect(actions(entry("msg_2"))).toEqual(["Send now (all paused steers)", "Queue", "Edit", "Remove"]);
+      expect(entry("msg_2").querySelector("[data-queue-send-now='msg_2']")).not.toBeNull();
+      // The same agent at rest (dormant or idle): a queued message is sent
+      // now, which steers it; a command still cannot be steered.
+      dock.render(host, [queued({ id: "held-1", text: "later", paused: true }), queued({ id: "held-2", text: "/review all", paused: true })], { ...steering, running: false });
+      expect(actions(entry("held-1"))).toEqual(["Send now", "Edit", "Remove"]);
+      expect(entry("held-1").querySelector("[data-queue-send-now='held-1']")).not.toBeNull();
+      expect(actions(entry("held-2"))).toEqual(["Edit", "Remove"]);
+      // Send now without steering (Claude Code): only while nothing runs,
+      // and a command may be sent now there — it is a dispatch, not a steer.
+      const claude = { steering: false, sendNow: true, isCommand: steering.isCommand };
+      dock.render(host, [queued({ id: "held-1", text: "later" }), queued({ id: "held-2", text: "/review all" })], { ...claude, running: true });
+      expect(actions(entry("held-1"))).toEqual(["Edit", "Remove"]);
+      dock.render(host, [queued({ id: "held-1", text: "later", paused: true }), queued({ id: "held-2", text: "/review all", paused: true })], { ...claude, running: false });
+      expect(actions(entry("held-1"))).toEqual(["Send now", "Edit", "Remove"]);
+      expect(actions(entry("held-2"))).toEqual(["Send now", "Edit", "Remove"]);
+      // Neither capability (OpenCode 1.x): remove and edit only.
+      dock.render(host, [queued({ id: "held-1", text: "later", paused: true })], { steering: false, sendNow: false, running: false, isCommand: steering.isCommand });
+      expect(actions(entry("held-1"))).toEqual(["Edit", "Remove"]);
+      expect(entry("held-1").querySelector("[data-queue-edit='held-1']")).not.toBeNull();
+      expect(entry("held-1").querySelector("[data-queue-remove='held-1']")).not.toBeNull();
+    });
+
+    test("a change of delivery, paused state, or available actions re-renders the entry in place", () => {
+      const dock = new QueueDockRenderer();
+      const host = target();
+      dock.render(host, [queued({ id: "held-1", text: "later" })], steering);
+      const before = host.querySelector("[data-chat-queued-id='held-1']");
+      dock.render(host, [queued({ id: "held-1", text: "later" })], steering);
+      expect(host.querySelector("[data-chat-queued-id='held-1']")).toBe(before);
+      dock.render(host, [queued({ id: "held-1", text: "later", paused: true })], { ...steering, running: false });
+      const after = host.querySelector("[data-chat-queued-id='held-1']")!;
+      expect(after).not.toBe(before);
+      expect(after.hasAttribute("data-paused")).toBe(true);
+      expect(actions(after)).toEqual(["Send now", "Edit", "Remove"]);
+    });
+  });
+
   test("held messages render in the queue dock, ordered, removable, and never in the timeline", () => {
     const renderer = new TimelineRenderer();
     const dock = new QueueDockRenderer();

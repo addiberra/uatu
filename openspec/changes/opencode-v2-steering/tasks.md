@@ -80,8 +80,8 @@ Each slice is written test first: write the named test and watch it fail, implem
 
 ## 6. Composer and dock UI
 
-- [ ] 6.1 Add unit tests for a delivery-preference helper: it is stored per device in `presentationLocalStorage()`, defaults to `steer`, and unknown values fall back to `steer`. Implement until the tests pass.
-- [ ] 6.2 Add `QueueDockRenderer` tests in `src/chat/timeline-renderer.test.ts`:
+- [x] 6.1 Add unit tests for a delivery-preference helper: it is stored per device in `presentationLocalStorage()`, defaults to `steer`, and unknown values fall back to `steer`. Implement until the tests pass.
+- [x] 6.2 Add `QueueDockRenderer` tests in `src/chat/timeline-renderer.test.ts`:
   - steers render before queued entries with "Steer" and "Queue" labels and a paused note;
   - the model note shows only while a steer is pending;
   - actions depend on capability and state: Remove and Edit always; Steer or Send now on queued entries; Queue on steers; "Send now (all paused steers)" on paused steers; no Steer action on commands.

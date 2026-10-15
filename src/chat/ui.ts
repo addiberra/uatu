@@ -7,7 +7,8 @@ import { presentationLocalStorage } from "../shell/presentation-storage";
 import { registerBackInterceptor } from "../shell/history";
 import { onManualRecovery, registerRecoveryWork, requestManualRecovery } from "../shell/live";
 import { onWorkspaceCredentialRefresh } from "../terminal/client";
-import { ChatApiClient, ChatConnectionInterruptedError, ChatTransportError, type ChatEventStream } from "./client";
+import { ChatApiClient, ChatConnectionInterruptedError, ChatTransportError, STEER_ALREADY_DELIVERED_CODE, type ChatEventStream } from "./client";
+import { otherDelivery, readDeliveryPreference, writeDeliveryPreference } from "./delivery-preference";
 import { TimelineAnchorController, type AnchorGeometry, type TimelineAnchor } from "./anchor";
 import { CoordinatedScrollOwner, type RevealOptions } from "./coordinated-scroll";
 import { ChatViewportController } from "./viewport";
@@ -43,7 +44,7 @@ import {
   removeAcceptedDraft,
   type ChatProjection,
 } from "./projection";
-import { CHAT_ATTACHMENT_MAX_BYTES, CHAT_ATTACHMENT_MIME_TYPES, CHAT_ATTACHMENTS_PER_MESSAGE, type AgentChatStatus, type ChatAgent, type ChatCapability, type ChatMode, type ChatAvailability, type ChatCommand, type ChatLoginState, type ChatModel, type ConversationConfiguration, type ConversationItem, type ConversationSnapshot, type ConversationSummary, type ContextReportItem, type MessageAttachment, type ModelSelection, type PermissionOutcome, type QuestionOutcome, type RestoredDraft, type ReversibleHistoryResult, type SessionTotals } from "./types";
+import { CHAT_ATTACHMENT_MAX_BYTES, CHAT_ATTACHMENT_MIME_TYPES, CHAT_ATTACHMENTS_PER_MESSAGE, type AgentChatStatus, type ChatAgent, type ChatCapability, type ChatMode, type ChatAvailability, type ChatCommand, type ChatLoginState, type ChatModel, type ConversationConfiguration, type ConversationItem, type ConversationSnapshot, type ConversationSummary, type ContextReportItem, type MessageAttachment, type MessageDelivery, type ModelSelection, type PermissionOutcome, type QueuedMessage, type QuestionOutcome, type RestoredDraft, type ReversibleHistoryResult, type SessionTotals } from "./types";
 import { formatDiagnostics } from "./diagnostics";
 import { collectQuestionAnswers, showQuestionPanel, syncQuestionControl, syncQuestionForm } from "./question-form";
 import { configurationOptionLabel, createChatConfigurationPicker, type ChatConfigurationPickerController } from "./configuration-picker";
@@ -131,6 +132,9 @@ export function initChat(api = new ChatApiClient()): void {
   const revertedLabel = document.querySelector<HTMLElement>("#chat-reverted-label");
   const revertedItems = document.querySelector<HTMLElement>("#chat-reverted-items");
   const queueDockElement = document.querySelector<HTMLElement>("#chat-queue");
+  const queueNoteElement = document.querySelector<HTMLElement>("#chat-queue-note");
+  const deliveryToggle = document.querySelector<HTMLButtonElement>("#chat-delivery-toggle");
+  const deliveryMenu = document.querySelector<HTMLElement>("#chat-delivery-menu");
   const form = document.querySelector<HTMLFormElement>("#chat-composer");
   const input = document.querySelector<HTMLTextAreaElement>("#chat-input");
   const commandMenu = document.querySelector<HTMLElement>("#chat-command-menu");
@@ -302,6 +306,13 @@ export function initChat(api = new ChatApiClient()): void {
   let models: ChatModel[] = [];
   let modes: ChatMode[] = [];
   let commands: ChatCommand[] = [];
+  // Whether a dock entry's text runs as a listed command — what the adapter's
+  // parseSlashCommand decides — so the dock offers no steer for one.
+  const isListedCommand = (text: string): boolean => {
+    if (!text.startsWith("/") || text.startsWith("//")) return false;
+    const match = /^\/([^\s/]+)/.exec(text);
+    return Boolean(match) && commands.some(command => command.name === match![1] && command.kind !== "local-operation");
+  };
   let projection: ChatProjection | null = null;
   const stagedConfigurations = new Map<string, ConversationConfiguration>();
   let configurationPicker: ChatConfigurationPickerController | null = null;
@@ -1815,7 +1826,13 @@ export function initChat(api = new ChatApiClient()): void {
     // Reconcile the current snapshot before revealing a retained output window.
     renderer.setShellOutputsHidden(false);
     revertedDock?.render(projection?.reversibleHistory?.revertedMessages ?? []);
-    queueDock.render(queueDockElement, projection?.queued ?? []);
+    queueDock.render(queueDockElement, projection?.queued ?? [], {
+      steering: declares("steering"),
+      sendNow: declares("send-now"),
+      running: isLiveConversationStatus(projection?.status),
+      isCommand: isListedCommand,
+      ...(queueNoteElement ? { note: queueNoteElement } : {}),
+    });
     syncHistoryControls();
     rendering = false;
     syncTaskList();
@@ -2686,6 +2703,12 @@ export function initChat(api = new ChatApiClient()): void {
     sendLabel.textContent = action;
     send.setAttribute("aria-label", running ? "Cancel response" : "Send message");
     send.title = running ? "Cancel response" : "Send message";
+    // The delivery choice exists only while a steering conversation is busy
+    // (opencode-v2-steering D10); idle submission is unchanged.
+    if (deliveryToggle) {
+      deliveryToggle.hidden = !deliveryChoiceOffered();
+      if (deliveryToggle.hidden) closeDeliveryMenu();
+    }
     configurationTrigger.disabled = submitting || !projection || catalogLoading;
     configurationTrigger.toggleAttribute("aria-busy", catalogLoading);
     syncHistoryControls();
@@ -3401,26 +3424,130 @@ export function initChat(api = new ChatApiClient()): void {
     }
   });
 
+  // A pending entry's actions (opencode-v2-steering D10). The server answers
+  // every one with a queue event that converges every client; nothing is
+  // changed optimistically. A 409 is the server stating the entry is not as
+  // the dock shows it — delivered while the click was in flight, removed
+  // elsewhere, or a stale echo a reload left behind — so the local copy
+  // reconciles to that instead of stranding buttons that can only ever 409;
+  // and a 409 carrying the already-delivered code is said as such ("Too late").
+  const TOO_LATE = "Too late — already delivered";
+  const queueActionFailed = (error: unknown, conversationId: string, messageId: string) => {
+    if (error instanceof ChatTransportError && error.status === 409) {
+      if (projection?.conversationId === conversationId) {
+        projection = dropQueuedMessage(projection, messageId);
+        scheduleRender();
+      }
+      if (error.code === STEER_ALREADY_DELIVERED_CODE) { announce(TOO_LATE, true); noteComposer(TOO_LATE); return; }
+    }
+    announce(messageOf(error), true);
+  };
+  // Edit: the entry leaves the dock first — removal or withdrawal — and the
+  // composer takes its text and attachments only once that succeeded, so a
+  // failed withdrawal ("already delivered") leaves the draft untouched.
+  const loadIntoComposer = (conversationId: string, entry: QueuedMessage) => {
+    const available: PendingAttachment[] = [];
+    const unavailable: MessageAttachment[] = [];
+    for (const attachment of entry.attachments ?? []) {
+      if (attachment.id) available.push({ ...attachment, id: attachment.id, previewUrl: api.attachmentUrl(attachment.id) });
+      else unavailable.push(attachment);
+    }
+    if (activeConversationId() === conversationId) {
+      setPendingAttachments(conversationId, [...currentPendingAttachments(), ...available]);
+      setUnavailableAttachments(conversationId, [...(unavailableAttachments.get(conversationId) ?? []), ...unavailable]);
+      // The returned text leads; what was typed meanwhile follows as its own line.
+      if (entry.text) input.value = input.value.trim() ? `${entry.text}\n${input.value}` : entry.text;
+      slashQueryActive = false;
+      autosize(input);
+      presentation.drafts[conversationId] = input.value;
+      save();
+      renderAttachments();
+      syncControls();
+      input.focus();
+    } else {
+      setPendingAttachments(conversationId, [...(pendingAttachments.get(conversationId) ?? []), ...available]);
+      setUnavailableAttachments(conversationId, [...(unavailableAttachments.get(conversationId) ?? []), ...unavailable]);
+      const edits = presentation.drafts[conversationId];
+      presentation.drafts[conversationId] = edits?.trim() && entry.text ? `${entry.text}\n${edits}` : entry.text || edits || "";
+      save();
+    }
+  };
   queueDockElement.addEventListener("click", event => {
-    const target = (event.target as Element).closest<HTMLButtonElement>("[data-queue-remove]");
+    const target = (event.target as Element).closest<HTMLButtonElement>("[data-queue-remove], [data-queue-edit], [data-queue-steer], [data-queue-queue], [data-queue-send-now]");
     if (!target || !projection) return;
-    // The server answers with a queue event that drops the entry on every
-    // client; no optimistic removal. A refusal ("no longer held") is the
-    // server stating this entry does not exist for it — delivered while the
-    // click was in flight, removed elsewhere, or a stale echo a reload left
-    // behind — so the local copy reconciles to that instead of stranding a
-    // Remove button that can only ever 409.
-    const messageId = target.dataset.queueRemove!;
     const conversationId = projection.conversationId;
+    const { queueRemove, queueEdit, queueSteer, queueQueue, queueSendNow } = target.dataset;
+    const messageId = queueRemove ?? queueEdit ?? queueSteer ?? queueQueue ?? queueSendNow!;
+    const entry = projection.queued.find(candidate => candidate.id === messageId);
     target.disabled = true;
-    void api.removeQueued(conversationId, messageId, newRequestId())
-      .catch(error => {
-        if (error instanceof ChatTransportError && error.status === 409 && projection?.conversationId === conversationId) {
-          projection = dropQueuedMessage(projection, messageId);
-          scheduleRender();
-        } else announce(messageOf(error), true);
-      })
+    const operation: Promise<unknown> = queueRemove !== undefined
+      ? api.removeQueued(conversationId, messageId, newRequestId())
+      : queueEdit !== undefined
+        ? api.removeQueued(conversationId, messageId, newRequestId()).then(() => { if (entry) loadIntoComposer(conversationId, entry); })
+        : queueSteer !== undefined
+          ? api.changeDelivery(conversationId, messageId, newRequestId(), "steer")
+          : queueQueue !== undefined
+            ? api.changeDelivery(conversationId, messageId, newRequestId(), "queue")
+            : api.sendNow(conversationId, messageId, newRequestId());
+    void operation
+      .catch(error => queueActionFailed(error, conversationId, messageId))
       .finally(() => { target.disabled = false; });
+  });
+
+  // The delivery Enter uses while a steering conversation is busy, and its
+  // menu on the Send/Cancel control (D10). The preference is per device and
+  // read on every submission; ⌥Enter and a menu choice override it once.
+  let requestedDelivery: MessageDelivery | undefined;
+  // A declaration, not a const: syncControls reads it before this point runs.
+  function deliveryChoiceOffered(): boolean {
+    return Boolean(projection) && declares("steering") && (isLiveConversationStatus(projection?.status) || (projection?.queued.length ?? 0) > 0);
+  }
+  const syncDeliveryMenu = () => {
+    const preferred = readDeliveryPreference(presentationLocalStorage());
+    for (const item of deliveryMenu?.querySelectorAll<HTMLButtonElement>("[data-delivery-choice]") ?? []) {
+      item.setAttribute("aria-checked", String(item.dataset.deliveryChoice === preferred));
+    }
+  };
+  const onDeliveryMenuOutside = (event: Event) => {
+    if (deliveryMenu && !deliveryMenu.contains(event.target as Node) && event.target !== deliveryToggle) closeDeliveryMenu();
+  };
+  const onDeliveryMenuKey = (event: KeyboardEvent) => {
+    if (event.key === "Escape") { event.preventDefault(); closeDeliveryMenu(); deliveryToggle?.focus(); }
+  };
+  function closeDeliveryMenu(): void {
+    if (!deliveryMenu || deliveryMenu.hidden) return;
+    deliveryMenu.hidden = true;
+    deliveryToggle?.setAttribute("aria-expanded", "false");
+    document.removeEventListener("pointerdown", onDeliveryMenuOutside, true);
+    document.removeEventListener("keydown", onDeliveryMenuKey, true);
+  }
+  deliveryToggle?.addEventListener("click", () => {
+    if (!deliveryMenu) return;
+    if (!deliveryMenu.hidden) { closeDeliveryMenu(); return; }
+    syncDeliveryMenu();
+    deliveryMenu.hidden = false;
+    deliveryToggle.setAttribute("aria-expanded", "true");
+    deliveryMenu.querySelector<HTMLButtonElement>("[aria-checked='true']")?.focus();
+    document.addEventListener("pointerdown", onDeliveryMenuOutside, true);
+    document.addEventListener("keydown", onDeliveryMenuKey, true);
+  });
+  deliveryMenu?.addEventListener("click", event => {
+    const choice = (event.target as Element).closest<HTMLButtonElement>("[data-delivery-choice]");
+    if (!choice) return;
+    const delivery: MessageDelivery = choice.dataset.deliveryChoice === "queue" ? "queue" : "steer";
+    // A choice is the device's new default, and sends the draft with it when
+    // there is one; with nothing to send it only sets the default.
+    writeDeliveryPreference(presentationLocalStorage(), delivery);
+    syncDeliveryMenu();
+    closeDeliveryMenu();
+    const hasContent = Boolean(input.value.trim()) || currentPendingAttachments().length > 0;
+    if (hasContent && projection && !submitting) {
+      requestedDelivery = delivery;
+      form.requestSubmit();
+    } else {
+      noteComposer(delivery === "steer" ? "Enter steers while the agent works" : "Enter queues while the agent works");
+      input.focus();
+    }
   });
 
   revertedItems?.addEventListener("pointerdown", event => {
@@ -4086,6 +4213,14 @@ export function initChat(api = new ChatApiClient()): void {
     }
     if (commandMatch && event.key === "Escape") { event.preventDefault(); closeCommandMenu(); return; }
     const running = isLiveConversationStatus(projection?.status);
+    // ⌥Enter submits with the delivery Enter does not use (D10), only while
+    // the choice exists; otherwise it is an ordinary Enter.
+    if (event.key === "Enter" && event.altKey && !event.shiftKey && !event.isComposing && deliveryChoiceOffered()) {
+      event.preventDefault();
+      requestedDelivery = otherDelivery(readDeliveryPreference(presentationLocalStorage()));
+      form.requestSubmit();
+      return;
+    }
     if (event.key === "Enter" && !event.shiftKey && !event.isComposing
       && (event.metaKey || event.ctrlKey || document.documentElement.dataset.uiMode !== "touch" || running)) {
       event.preventDefault();
@@ -4227,7 +4362,15 @@ export function initChat(api = new ChatApiClient()): void {
       : null;
     historyRetries.delete(conversationId);
     setComposerError(unavailableMessage, conversationId);
-    noteComposer(unavailableMessage ? `${label} complete. ${unavailableMessage}` : `${label} complete`);
+    // Steers the agent still holds deliver together with the replacement,
+    // oldest first (opencode-v2-steering D6): the confirmation names them.
+    const pendingSteers = operation === "undo" && declares("steering") && projection?.conversationId === conversationId
+      ? projection.queued.filter(entry => entry.delivery === "steer")
+      : [];
+    const steerNote = pendingSteers.length
+      ? ` ${pendingSteers.length === 1 ? "Pending steer" : "Pending steers"} ${pendingSteers.map(entry => `“${entry.text.length > 40 ? `${entry.text.slice(0, 39)}…` : entry.text}”`).join(", ")} will be delivered together with your replacement.`
+      : "";
+    noteComposer(`${unavailableMessage ? `${label} complete. ${unavailableMessage}` : `${label} complete`}${steerNote}`);
     return true;
   };
 
@@ -4477,6 +4620,11 @@ export function initChat(api = new ChatApiClient()): void {
     const queueRevisionAtSubmit = projection.queueRevision;
     const configurationRevisionAtSubmit = projection.configurationRevision;
     const projectionEpochAtSubmit = projectionEpoch;
+    // Named only to a steering agent: the device default, or this
+    // submission's one-off choice (⌥Enter, the menu). The workspace decides
+    // whether it steers, holds, or dispatches, and reports which.
+    const delivery: MessageDelivery | undefined = declares("steering") ? requestedDelivery ?? readDeliveryPreference(presentationLocalStorage()) : undefined;
+    requestedDelivery = undefined;
     // Optimistic send: the message shows immediately and the input clears;
     // on failure the draft is removed and the text restored.
     projection = addAcceptedDraft(projection, { requestId, messageId: `pending:${requestId}`, text, ...(attachmentRefs.length ? { attachments: attachmentRefs } : {}) });
@@ -4502,7 +4650,7 @@ export function initChat(api = new ChatApiClient()): void {
       const reloading = Boolean(contextAgentId) && /^\/reload(?:\s|$)/.test(text.trim());
       const reloadEntry = reloading ? { agentId: contextAgentId! } as { agentId: string; messageId?: string } : undefined;
       if (reloadEntry) pendingReloads.set(conversationId, [...(pendingReloads.get(conversationId) ?? []), reloadEntry]);
-      const accepted = await api.prompt(conversationId, requestId, text, selectedModel, selectedMode, selectedVariant, attachmentRefs.length ? attachmentRefs : undefined).catch((error: unknown) => {
+      const accepted = await api.prompt(conversationId, requestId, text, selectedModel, selectedMode, selectedVariant, attachmentRefs.length ? attachmentRefs : undefined, delivery).catch((error: unknown) => {
         if (reloadEntry) {
           const rest = (pendingReloads.get(conversationId) ?? []).filter(entry => entry !== reloadEntry);
           if (rest.length) pendingReloads.set(conversationId, rest);
@@ -4551,7 +4699,7 @@ export function initChat(api = new ChatApiClient()): void {
         // attempt really held has long been stated by the stream itself.
         projection = accepted.pending
           ? !retriedRequest && projectionEpoch === projectionEpochAtSubmit
-            ? noteQueuedMessage(projection, { id: accepted.messageId, text, queuedAt: Date.now(), delivery: "queue", requestId, ...(attachmentRefs.length ? { attachments: attachmentRefs } : {}) }, queueRevisionAtSubmit)
+            ? noteQueuedMessage(projection, { id: accepted.messageId, text, queuedAt: Date.now(), delivery: accepted.delivery, requestId, ...(attachmentRefs.length ? { attachments: attachmentRefs } : {}) }, queueRevisionAtSubmit)
             : removeAcceptedDraft(projection, requestId)
           // A reload's row is published before its acceptance and retired
           // with its outcome, which can precede the acceptance — even
@@ -4561,7 +4709,7 @@ export function initChat(api = new ChatApiClient()): void {
         renderConfiguration();
         scheduleRender(true);
       }
-      noteComposer(accepted.pending ? "Queued — sends when the agent is ready" : "Message accepted");
+      noteComposer(accepted.pending ? accepted.delivery === "steer" ? "Steer sent — joins the turn at its next step" : "Queued — sends when the agent is ready" : "Message accepted");
       // Addressed to the submitted conversation, not the selection: the
       // acceptance may land after a switch, and clearing the selected
       // conversation's own error would erase an unrelated reason.

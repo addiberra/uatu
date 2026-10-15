@@ -5363,7 +5363,7 @@ html[data-ui-mode="desktop"][data-notification-chat] .chat-expand-strip {
 .chat-composer-actions > .chat-context-usage { grid-column: 1; }
 .chat-composer-actions > .chat-configuration-trigger { grid-column: 2; }
 .chat-composer-actions > .chat-composer-status { grid-column: 3; }
-.chat-composer-actions > #chat-send { grid-column: 4; }
+.chat-composer-actions > .chat-send-group { grid-column: 4; }
 
 /* With the attach control present (agent declares attachments) the rail gains
    a leading fixed column; without it the four-column layout above stands, so
@@ -5375,7 +5375,7 @@ html[data-ui-mode="desktop"][data-notification-chat] .chat-expand-strip {
 .chat-composer-actions:has(> .chat-attach-button) > .chat-context-usage { grid-column: 2; }
 .chat-composer-actions:has(> .chat-attach-button) > .chat-configuration-trigger { grid-column: 3; }
 .chat-composer-actions:has(> .chat-attach-button) > .chat-composer-status { grid-column: 4; }
-.chat-composer-actions:has(> .chat-attach-button) > #chat-send { grid-column: 5; }
+.chat-composer-actions:has(> .chat-attach-button) > .chat-send-group { grid-column: 5; }
 
 .chat-attach-button {
   display: grid;
@@ -6882,6 +6882,91 @@ html[data-ui-mode="desktop"][data-notification-chat] .chat-expand-strip {
   min-height: 2.55rem;
   border-radius: 999px;
   padding: 0;
+}
+
+/* The group is exactly the button's footprint; the delivery toggle and its
+   menu are positioned over and above it, so showing them moves nothing. */
+.chat-send-group {
+  position: relative;
+  display: inline-flex;
+  width: 2.55rem;
+  height: 2.55rem;
+}
+
+.chat-delivery-toggle {
+  position: absolute;
+  right: -0.15rem;
+  bottom: -0.15rem;
+  display: inline-grid;
+  place-items: center;
+  width: 1.1rem;
+  height: 1.1rem;
+  padding: 0;
+  border: 1px solid var(--surface-raised);
+  border-radius: 999px;
+  background: var(--text-strong);
+  color: var(--surface-raised);
+  cursor: pointer;
+}
+
+.chat-delivery-toggle[hidden] {
+  display: none;
+}
+
+.chat-delivery-toggle:hover,
+.chat-delivery-toggle:focus-visible,
+.chat-delivery-toggle[aria-expanded="true"] {
+  background: var(--accent);
+}
+
+.chat-delivery-menu {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 0.4rem);
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  min-width: 13rem;
+  padding: 0.3rem;
+  border: 1px solid var(--border-medium);
+  border-radius: 0.6rem;
+  background: var(--surface-raised);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
+}
+
+.chat-delivery-menu[hidden] {
+  display: none;
+}
+
+.chat-delivery-menu [role="menuitemradio"] {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.1rem;
+  padding: 0.4rem 0.6rem;
+  border: none;
+  border-radius: 0.4rem;
+  background: none;
+  color: var(--text-strong);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.chat-delivery-menu [role="menuitemradio"]:hover,
+.chat-delivery-menu [role="menuitemradio"]:focus-visible {
+  background: var(--surface-muted);
+}
+
+.chat-delivery-menu [role="menuitemradio"][aria-checked="true"] .chat-delivery-name::after {
+  content: " · default";
+  color: var(--text-subtle);
+  font-size: 0.8em;
+}
+
+.chat-delivery-hint {
+  color: var(--text-subtle);
+  font-size: 0.75em;
 }
 
 #chat-send .chat-send-label {
@@ -9030,6 +9115,26 @@ body.terminal-transcript-open .touch-tab-bar {
   display: none;
 }
 
+.chat-queue-items {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.chat-queue-items:empty {
+  display: none;
+}
+
+.chat-queue-note {
+  margin: 0;
+  color: var(--text-subtle);
+  font-size: 0.75em;
+}
+
+.chat-queue-note[hidden] {
+  display: none;
+}
+
 /* The selected agent has no usable login. Docked to the composer like the
    queue, at the same gutter, so it reads as part of where a message is
    typed rather than as a transcript row. */
@@ -9106,6 +9211,23 @@ body.terminal-transcript-open .touch-tab-bar {
   padding: 0.5rem 0.75rem;
 }
 
+/* A steer is already the agent's: a solid edge says it is on its way, where
+   a held message's dashed one says the workspace still has it. */
+.chat-queued-message.is-steer {
+  border-style: solid;
+}
+
+.chat-queued-message[data-paused] {
+  opacity: 0.85;
+}
+
+.chat-queued-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 0.6rem;
+}
+
 .chat-queued-message p {
   margin: 0;
   overflow-wrap: anywhere;
@@ -9126,7 +9248,7 @@ body.terminal-transcript-open .touch-tab-bar {
   font-size: 0.75em;
 }
 
-.chat-queued-remove {
+.chat-queued-action {
   border: none;
   background: none;
   padding: 0;
@@ -9135,14 +9257,15 @@ body.terminal-transcript-open .touch-tab-bar {
   font-size: 0.75em;
   text-decoration: underline;
   cursor: pointer;
+  white-space: nowrap;
 }
 
-.chat-queued-remove:hover,
-.chat-queued-remove:focus-visible {
+.chat-queued-action:hover,
+.chat-queued-action:focus-visible {
   color: var(--text-strong);
 }
 
-.chat-queued-remove:disabled {
+.chat-queued-action:disabled {
   opacity: 0.5;
   cursor: default;
 }

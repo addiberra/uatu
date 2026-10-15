@@ -852,7 +852,12 @@
                the composer rather than rendered into the timeline: a held
                message is not part of the transcript yet, so it must not sit
                wherever the transcript happens to end. -->
-          <div id="chat-queue" class="chat-queue" role="list" aria-label="Queued messages" hidden></div>
+          <div id="chat-queue" class="chat-queue" hidden>
+            <div id="chat-queue-items" class="chat-queue-items" role="list" aria-label="Pending messages"></div>
+            <!-- While a steer is pending: steers run under the conversation's
+                 configuration at delivery, not the composer's staged one. -->
+            <p id="chat-queue-note" class="chat-queue-note" role="note" hidden></p>
+          </div>
           <!-- The selected agent has no usable login: said where a message
                is typed, with the way to log in (the Hub's Settings, or the
                agent's own command outside a Hub). -->
@@ -899,13 +904,26 @@
               </button>
               <span id="chat-composer-status" class="chat-composer-status" data-state="ready" aria-label="Ready" title="Ready" role="img"></span>
               <span id="chat-composer-status-live" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></span>
-              <button id="chat-send" class="chat-primary-button" type="submit" aria-label="Send message" title="Send message" disabled>
-                <span class="chat-send-label">Send</span>
-                <svg class="chat-send-icon" viewBox="0 0 20 20" width="18" height="18" aria-hidden="true">
-                  <path class="chat-send-arrow" d="M10 16V4m0 0L5.5 8.5M10 4l4.5 4.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-                  <path class="chat-send-cancel" d="M5 5l10 10M15 5L5 15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-                </svg>
-              </button>
+              <!-- The Send/Cancel control and, while a steering conversation is
+                   busy, its delivery menu: a disclosure inside the same
+                   footprint offering Steer and Queue by name, so the choice is
+                   there without a keyboard and the rail keeps its layout. -->
+              <span id="chat-send-group" class="chat-send-group">
+                <button id="chat-send" class="chat-primary-button" type="submit" aria-label="Send message" title="Send message" disabled>
+                  <span class="chat-send-label">Send</span>
+                  <svg class="chat-send-icon" viewBox="0 0 20 20" width="18" height="18" aria-hidden="true">
+                    <path class="chat-send-arrow" d="M10 16V4m0 0L5.5 8.5M10 4l4.5 4.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                    <path class="chat-send-cancel" d="M5 5l10 10M15 5L5 15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                  </svg>
+                </button>
+                <button id="chat-delivery-toggle" class="chat-delivery-toggle" type="button" aria-haspopup="menu" aria-controls="chat-delivery-menu" aria-expanded="false" aria-label="Delivery" title="Delivery: steer or queue" hidden>
+                  <svg viewBox="0 0 12 12" width="10" height="10" aria-hidden="true"><path d="M3 4.5 6 7.5l3-3" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                </button>
+                <div id="chat-delivery-menu" class="chat-delivery-menu" role="menu" aria-label="Delivery" hidden>
+                  <button type="button" role="menuitemradio" aria-checked="true" data-delivery-choice="steer"><span class="chat-delivery-name">Steer</span><span class="chat-delivery-hint">Joins the running turn at its next step</span></button>
+                  <button type="button" role="menuitemradio" aria-checked="false" data-delivery-choice="queue"><span class="chat-delivery-name">Queue</span><span class="chat-delivery-hint">Sends when the agent is ready</span></button>
+                </div>
+              </span>
               <!-- Chips the login reports beside the status: plan utilization
                    and a standing rate limit. Their own row under the actions,
                    present only while one of them has something to say. -->

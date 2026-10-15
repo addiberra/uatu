@@ -53,7 +53,7 @@ test.describe("desktop OpenCode chat", () => {
     await expect(configurationTrigger).toBeDisabled();
     const response = await firstResponse;
     expect(response.request().postDataJSON()).toMatchObject({ model: { providerId: "openai", modelId: "gpt-5" } });
-    expect(await response.json()).toMatchObject({ held: false, conversation: { title: "Initial prompt" } });
+    expect(await response.json()).toMatchObject({ pending: false, conversation: { title: "Initial prompt" } });
     await expect(page.locator("#chat-title")).toHaveText("Initial prompt");
     await expect(page.locator("#chat-conversation-select option:checked")).toHaveText("Initial prompt");
     await expect(configurationTrigger).toBeEnabled();
@@ -68,7 +68,7 @@ test.describe("desktop OpenCode chat", () => {
     await input.fill("Use the smaller approach");
     const heldResponse = page.waitForResponse(response => response.url().endsWith("/prompts"));
     await input.press("Enter");
-    expect(await (await heldResponse).json()).toMatchObject({ held: true });
+    expect(await (await heldResponse).json()).toMatchObject({ pending: true, delivery: "queue" });
     // The busy submission pins at the composer as a held message.
     await expect(page.locator("#chat-queue .is-held")).toContainText("Use the smaller approach");
 
