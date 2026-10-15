@@ -382,8 +382,70 @@ assertions; main type checking and whitespace checks passed. A full private-HOME
 repeat of all 97 files is tracked separately below; focused green results do not
 relabel the original 11 failures as passing.
 
+The full repeat passed **1,382 tests / 1 opt-in skip / 0 failures**, **11,256
+assertions**, across **97 files** (128s). It used a newly created private HOME,
+approved temporary root and `env -i` with only HOME/TMPDIR/PATH. The sole skip is
+the existing `UATU_REAL_OPENCODE=1`-gated real-account store/propagation test, not
+a silently omitted required case or evidence of a personal-provider login.
+The gate was unset; no binary installation, model call or provider fallback was
+attempted. Account-runtime/browser doubles remain explicitly labeled above.
+
+Exact test selection (with the isolated environment prefix described above):
+
+```sh
+bun test src/hub/mobile tests/mobile-hub-review src/pwa \
+  src/hub/worktree*.test.ts src/hub/clone-attempts.test.ts \
+  src/hub/clone-jobs.test.ts src/hub/clone-process.test.ts \
+  src/hub/folder-manager.test.ts src/hub/credential*.test.ts \
+  src/hub/agent-account*.test.ts src/hub/sessions.test.ts \
+  src/hub/checkout-facts.test.ts src/hub/live-sse.test.ts \
+  src/hub/dashboard-groups.test.ts src/shared/browser-bundle-discipline.test.ts \
+  src/shared/app-url*.test.ts src/shell/navigation*.test.ts \
+  src/shell/hub-nav.test.ts src/shell/history.test.ts \
+  src/shell/bounded-fetch.test.ts src/shell/chat-login-link.test.ts
+```
+
+No product source or public contract changed after `781902c`; the final corrections
+are test isolation, current-flow assertions and evidence. Together with the real
+Hub 66-case result and tightened multi-key Start repeat (**2/2**), current API
+contracts, full synthetic matrix, all three TypeScript projects and build/smoke,
+this completes the scoped automated gate 22.2. It is not an all-repository,
+independent, native-device or approved visual-baseline pass.
+
 `bun run test:api` passed **212/212**, 1,851 assertions, across nine files (27.11s),
 separate from fixture-backed browser runs. Main/review/worktree TypeScript
 projects, strict OpenSpec validation and `bun run api:validate` pass; the unchanged
 single-schema `WorkspaceConflict.allOf` warning remains. Public revisions and
 published payloads are unchanged by these test/evidence corrections.
+
+### Remaining lead decisions and acceptance boundaries
+
+| Open task | Missing evidence or authority |
+| --- | --- |
+| 7.1 | Approved deterministic pixel goldens/reference comparisons; current captures and mutation/geometry guards are not golden approval. |
+| 7.4 | Exact historical dirty-tree four-interior/native comparison baseline cannot be reconstructed from the retained aggregate-only record. Current desktop/standalone checks do not replace it. |
+| 8.3 | A named served version and explicit reviewer visual/interaction decision, including enumerated exceptions. Design-direction/integration authorization is not that decision. |
+| 9.6 | The current behavioral/responsive matrices pass, but the complete before/after UX comparison package remains unreconciled. No historical mismatch is accepted as a new baseline. |
+| 22.3 | Complete agreed-reference phone comparisons and the missing historical/native evidence; physical/native checks remain unperformed, not emulated passes. |
+| 23.1 | Final parity/gate handoff and version-specific acceptance; the local action map and isolated smoke are preparation, not release approval. |
+| 23.2 | Lead confirmation of exact service/resource scope, approved artifact and rollback selection before any running-service change. |
+
+The lead must also decide the scope of any investigation/correction for the
+unmodified historical Chat-touch **11 failures** and the archive digest mismatch.
+Neither was waived or absorbed into a broader redesign. The 25-file archive and
+refined screenshots still match `c259efb` byte-for-byte; the read-only baseline
+verifier still reports the original retained-archive digest discrepancy. Normal
+evolution of HEAD/index/status is separate from that unexplained archive mismatch.
+
+No assertion, golden or archive was changed to waive an unrelated failure. The
+test-order fixes restore harness state; the auth tests explicitly separate
+transient transport loss from authoritative invalidation while retaining secret
+clearing. These changes add no dependencies or product auth/config writes. This
+review is self-review only, not independent validation. Existing listener PIDs on
+4717, 4718 and occupied 4703 were preserved; private runtime state was not reset.
+
+Task reconciliation is **93/100 complete**: 18.4, 20.1–20.3, 21.1–21.2, 21.5 and
+22.1 now have the real-route/adapter/contract evidence mapped above; 10.4/11.4
+have current cross-engine evidence; 22.2 has the current complete scoped checks;
+22.4 records the unwaived historical failures and the seven remaining gates in
+the table. This closes evidence reconciliation, not those release blockers.

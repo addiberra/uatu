@@ -1,5 +1,26 @@
 # Design authorization and frontend acceptance record
 
+## Implementation checkpoint — not a served-version acceptance
+
+The subsequent user assignment authorizes milestone commits of verified live
+implementation, but no push or existing-service update before lead review.
+Candidate source `a294065` adds the product Hub/workspace assembly after the
+notification correction `4c49add` and worktree checkpoint `6c33c24`; `29cfb4b`
+and `781902c` correct cold-route/history and pending-command/Start ownership.
+`live-entry-verification.md` records the 66-case real-Hub Chromium/WebKit pass,
+342-case synthetic pass, retained 1,102-pass responsive run, contract/type/build
+evidence and explicit doubles. Its dated results distinguish current reruns from
+historical passes, failures and incomplete comparisons.
+The final expanded isolated unit repeat is 1,382 passed / one opt-in skip / zero
+failed; API contracts are 212/212. Task reconciliation is 93/100, with all seven
+remaining gates and the unwaived Chat/archive blockers named in that evidence.
+These are self-verification, not a new independent review.
+
+The deployed live/synthetic versions have not changed. This source checkpoint is
+not a newly served candidate, final visual acceptance, a golden approval or a
+physical/native-device result. Tasks 8.3 and 23.2 stay open, along with the named
+remaining regression/evidence obligations; none is waived by these commits.
+
 ## Current decision — 2026-10-15
 
 The user agreed the refined synthetic mobile UI as the **live phone Hub target**
