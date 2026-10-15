@@ -29,6 +29,20 @@ async function boot(page: Page, request: APIRequestContext, preview = true) {
   return conversationId;
 }
 
+test("Continue feedback clears after parent and workers settle", async ({ page, request }) => {
+  const conversationId = await boot(page, request);
+  const worker = await control(request, { op: "launchWorker", conversationId, background: false });
+  await page.getByRole("button", { name: "Continue while workers run", exact: true }).click();
+  await expect(page.locator("#chat-background-feedback")).toContainText("Request accepted");
+  await control(request, { op: "finish", conversationId });
+  await control(request, { op: "settleWorker", childId: worker.childId });
+  await expect(page.locator("#chat-background-tasks-items [data-inspect-task]")).toHaveCount(0);
+  await expect(page.locator("#chat-background-action")).toBeHidden();
+  await expect(page.locator("#chat-background-feedback")).toBeEmpty();
+  await control(request, { op: "wakeParent", conversationId });
+  await expect(page.locator("#chat-background-feedback")).toBeEmpty();
+});
+
 test("Continue is parent-wide, keeps the draft, and inspection survives worker failure", async ({ page, request }) => {
   const conversationId = await boot(page, request);
   const worker = await control(request, { op: "launchWorker", conversationId, background: false });

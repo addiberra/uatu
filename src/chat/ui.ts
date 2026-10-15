@@ -2770,6 +2770,10 @@ export function initChat(api = new ChatApiClient()): void {
       stop.title = workers ? "Stop the parent and still-blocking work. Detached workers continue; their later notifications can wake the parent again." : "Stop";
     }
     if (backgroundAction && continueWorkers) {
+      if (activeId && !running && !backgrounding.has(activeId)
+        && !projection?.items.some(item => item.type === "background_task" && item.status === "running")) {
+        backgroundNotes.delete(activeId);
+      }
       const note = activeId ? backgroundNotes.get(activeId) ?? "" : "";
       backgroundAction.hidden = !declares("background-blocking-work") || !projection || !running && !note;
       continueWorkers.disabled = !running || cancelling || !activeId || backgrounding.has(activeId);

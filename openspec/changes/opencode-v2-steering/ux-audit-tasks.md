@@ -1,0 +1,26 @@
+# UX audit follow-up (baseline 32e6d73)
+
+Existing implementation tasks and their verification limitations remain unchanged.
+Tests use existing UI/browser and normalization seams; test artifacts stay outside OpenSpec.
+
+## Phase 1 — individual regression commits
+- [x] Clear Continue feedback after parent/workers settle (browser regression red: action visible after settlement; green: 1/1).
+- [ ] Explain queued Send now waking paused steers; retain resume semantics.
+- [ ] Order terminal results after launchers without duplicating reports.
+- [ ] Separate vertically adjacent worker Stop targets by at least 0.5rem.
+- [ ] Diagnose and fix delayed Stop completion race without weakening assertions.
+
+## Phase 2 — pending dock
+- [ ] Accessible targets, sticky counts, bounded height/overflow fade, delivery/paused badges and plain timing labels.
+- [ ] One paused-steer batch action, contextual accessible names, polite mutation feedback, visible focus, neutral delivery-race feedback and count-only Undo note.
+
+## Phase 3 — composer
+- [ ] Checked radio choices and current shortcut labels, accurate Send/selector names, contrast, compact non-steering rail and previous-focus Escape restoration.
+
+## Phase 4 — background surface
+- [ ] Consistent rem/token controls, actual-blocker-only Continue with concise explanation, less duplicate touch presentation and explicit stop scopes; use established in-app shell confirmation if appropriate.
+
+## Verification
+- [ ] `bun run test:ci` and all three requested browser suites pass.
+- [ ] Desktop/touch, light/dark screenshot comparisons reviewed.
+- [ ] Affected behavior documentation aligned; independent lead review remains separate.
