@@ -4,7 +4,7 @@ import { AgentNotificationTracker, type AgentNotificationEvent } from "./notific
 import { boundedSet } from "../shared/bounded-map";
 import { ProviderUpdateCoalescer } from "./coalescer";
 import { ConversationInventoryBroadcaster, type ConversationInventorySubscription } from "./inventory-broadcaster";
-import type { NormalizedProviderEvent, NormalizedProviderUpdate, NormalizedSessionLifecycle } from "./provider";
+import type { InboxDelta, NormalizedProviderEvent, NormalizedProviderUpdate, NormalizedSessionLifecycle } from "./provider";
 import { describeToolDetail } from "./tool-detail";
 import { mergeAssistantMessage, sameUsage, TOKEN_USAGE_COMPONENTS } from "./usage";
 import { ReversibleHistoryTargetError, UnsupportedVariantSelectionError, type ChatProvider, type ProviderAttachment, type ProviderPermissionReply, type ProviderSession } from "./provider";
@@ -26,9 +26,11 @@ import type {
   ConversationStatus,
   ConversationSummary,
   MessageAttachment,
+  MessageDelivery,
   PermissionOutcome,
   PermissionRequest,
   ModelSelection,
+  QueueChangeKind,
   QueuedMessage,
   QuestionOutcome,
   QuestionRequest,
@@ -144,6 +146,58 @@ export class ChatQueueFullError extends Error {
   }
 }
 
+// opencode-v2-steering D7: the agent delivered the steer into its turn
+// before the withdrawal reached it. The message stays delivered — never
+// held, returned, or sent again — and the user is told it was too late.
+export class SteerAlreadyDeliveredError extends Error {
+  constructor() {
+    super("the message was already delivered");
+    this.name = "SteerAlreadyDeliveredError";
+  }
+}
+
+// The agent neither confirmed nor denied a withdrawal within the bounded
+// wait and still lists the entry: the steer stays in the dock, and the
+// mutation reports that rather than guessing (D7).
+export class SteerWithdrawalUnconfirmedError extends Error {
+  constructor() {
+    super("the agent has not confirmed the withdrawal; the message is still pending");
+    this.name = "SteerWithdrawalUnconfirmedError";
+  }
+}
+
+export class SteeringUnsupportedError extends Error {
+  constructor() {
+    super("this agent does not support steering");
+    this.name = "SteeringUnsupportedError";
+  }
+}
+
+export class SendNowUnsupportedError extends Error {
+  constructor() {
+    super("this agent does not support sending a held message now");
+    this.name = "SendNowUnsupportedError";
+  }
+}
+
+// Send now is refused while a turn runs on an agent without steering, and a
+// steer cannot be woken while the turn it would join is still running.
+export class SendNowUnavailableError extends Error {
+  constructor() {
+    super("a turn is running; the message is delivered when it ends");
+    this.name = "SendNowUnavailableError";
+  }
+}
+
+// Skills, slash commands, and /reload are always the workspace queue's:
+// the agent's inbox cannot run them under Uatu's own built-ins.
+export class CommandSteeringError extends Error {
+  constructor() {
+    super("a command cannot be steered; it stays queued");
+    this.name = "CommandSteeringError";
+  }
+}
+
 export class UnknownAttachmentError extends Error {
   constructor() {
     super("prompt references an attachment the workspace has not stored");
@@ -174,11 +228,35 @@ const MAX_HELD_TEXT_BYTES = 256 * 1024;
 // at submission time: the configuration the user saw when they sent it, not
 // whatever the conversation drifts to while it waits.
 type HeldMessage = QueuedMessage & {
+  delivery: "queue";
   requestId: string;
   model?: ModelSelection;
   mode?: string;
   variant?: string;
 };
+
+// A steer the agent holds in its own inbox (opencode-v2-steering D1). The
+// workspace keeps only what the dock needs; the agent owns delivery.
+// `queuedAt` is the inbox enqueue time, which the paused rule compares with
+// the conversation's last settle (D3).
+type PendingSteer = {
+  id: string;
+  text: string;
+  queuedAt: number;
+  requestId?: string;
+  attachments?: MessageAttachment[];
+  // When this adapter learned of the entry, as a running count: a
+  // reconciliation keeps entries learned after its list read began, which a
+  // list that old cannot vouch for either way.
+  tick: number;
+};
+
+// How long a withdrawal waits for the agent's own settlement before deciding
+// from its list and history (D7).
+const DEFAULT_STEER_WITHDRAW_TIMEOUT_MS = 5_000;
+// Steers known to have been delivered, so a late withdrawal of one is told
+// "already delivered" rather than merely "not held".
+const DELIVERED_STEERS_LIMIT = 64;
 
 type RevertLifecycle = "staged" | "committed" | "cleared";
 type RevertReconciliation = {
@@ -222,6 +300,8 @@ export type ChatAdapterOptions = {
   metrics?: ChatEventMetrics;
   now?: () => number;
   id?: () => string;
+  // How long a steer withdrawal waits for the agent's settlement event.
+  steerWithdrawTimeoutMs?: number;
   // Called when activity() may read differently than it last did (already
   // deduplicated here). The service forwards it to whoever watches the
   // workspace's activity summary.
@@ -308,6 +388,23 @@ export class ChatAdapter {
   // and removable but delivers nothing until the user's next submission
   // reactivates it — cancel means stop, not "start the next thing".
   private readonly dormantQueues = new Set<string>();
+  // Steers pending in the agent's inbox, per conversation, in enqueue order
+  // (opencode-v2-steering D3). Built from inbox deltas and this adapter's own
+  // admissions; replaced from the agent's list on attach and reconnect.
+  // Adapter-level like heldQueues, for the same eviction reason.
+  private readonly pendingSteers = new Map<string, PendingSteer[]>();
+  // When each conversation last became idle, interrupted, or completed, and
+  // no wake has happened since: a steer enqueued before then is stranded
+  // (paused). Cleared when the turn goes live or something wakes the agent.
+  private readonly lastSettledAt = new Map<string, number>();
+  // Which entries were last published as paused, so a change publishes one
+  // `paused` or `resumed` event per affected entry and nothing otherwise.
+  private readonly publishedPaused = new Map<string, Set<string>>();
+  // Withdrawals waiting for the agent's settlement of an inbox entry (D7).
+  private readonly steerSettlements = new Map<string, Map<string, (outcome: "delivered" | "cancelled") => void>>();
+  private readonly deliveredSteers = new Map<string, true>();
+  private readonly steerWithdrawTimeoutMs: number;
+  private inboxClock = 0;
   // Mirrors a running OpenCode TUI: once this adapter accepts a prompt, the
   // next conversation starts from that process-local selection. A fresh
   // adapter falls back to OpenCode's durable config/recent-model policy.
@@ -374,6 +471,7 @@ export class ChatAdapter {
     this.coalesceWindowMs = options.coalesceWindowMs;
     this.metrics = options.metrics;
     this.id = options.id ?? randomUUID;
+    this.steerWithdrawTimeoutMs = options.steerWithdrawTimeoutMs ?? DEFAULT_STEER_WITHDRAW_TIMEOUT_MS;
     this.onActivityChange = options.onActivityChange;
     this.receipts = new IdempotencyReceipts({
       maxEntries: options.receiptEntries ?? 1_000,
@@ -489,6 +587,11 @@ export class ChatAdapter {
     const replayCursor = this.projection(id).replay.latestCursor();
     const cursor = options.cursor ? decodeHistoryCursor(options.cursor) : undefined;
     const page = await this.provider.listMessages(id, { cursor: cursor?.provider, limit: options.limit ?? DEFAULT_PAGE_SIZE });
+    // Attaching reconciles the pending steers with the agent's own list, so a
+    // steer raised by another client or while the stream was down is listed
+    // (opencode-v2-steering D3). Only the first page: an older page is not
+    // an attach.
+    if (!cursor) await this.reconcilePendingSteers(id, page.items);
     // Some providers page locally after loading the complete transcript. Reuse
     // that complete source for recovery, never the bounded visible page.
     const configuration = await this.configuration(id);
@@ -894,9 +997,12 @@ export class ChatAdapter {
       .then(() => undefined, () => undefined);
   }
 
-  async prompt(conversationId: string, requestId: string, text: string, model?: ModelSelection, mode?: string, variant?: string, attachments?: MessageAttachment[]): Promise<{
+  async prompt(conversationId: string, requestId: string, text: string, model?: ModelSelection, mode?: string, variant?: string, attachments?: MessageAttachment[], delivery?: MessageDelivery): Promise<{
     messageId: string;
-    held: boolean;
+    // Accepted but not yet delivered: held by the workspace (`queue`) or
+    // pending with the agent (`steer`). A dispatched prompt is not pending.
+    pending: boolean;
+    delivery: MessageDelivery;
     configuration: ConversationConfiguration;
     conversation?: ConversationSummary;
     // What the provider actually ran, when it was not an ordinary turn.
@@ -932,7 +1038,23 @@ export class ChatAdapter {
         // the draft to restore.
         const attachmentRefs = await this.validateAttachments(attachments);
         const reversible = await this.readReversibleHistoryState(conversationId);
+        // opencode-v2-steering D6: on a steering agent, a prompt that is not a
+        // command can go to the agent's inbox as a steer — the replacement
+        // under a staged revert always does, a busy submission when asked to.
+        const steerable = this.agent().capabilities.includes("steering")
+          && (reversible?.staged || delivery === "steer")
+          && !(text.startsWith("/") && parseSlashCommand(text, await this.provider.listCommands()) !== undefined);
         if (reversible?.staged) {
+          if (steerable) {
+            // The replacement goes out as a steer with resume: the agent
+            // commits the boundary, wakes, and delivers every pending steer
+            // with it, oldest first. The held queue stays pending behind it.
+            const steered = await this.admitSteer(conversationId, requestId, text, attachmentRefs);
+            this.dormantQueues.delete(conversationId);
+            await this.reconcileReversibleHistory(conversationId).catch(() => undefined);
+            this.publishPausedChanges(conversationId);
+            return { messageId: steered.id, pending: true, delivery: "steer", configuration: this.configurations.get(conversationId) ?? currentConfiguration };
+          }
           // OpenCode commits a staged boundary when it accepts a new prompt.
           // This submission is the replacement branch, not another held
           // message, so it goes ahead of the queue that Undo paused.
@@ -947,17 +1069,25 @@ export class ChatAdapter {
           });
           this.dormantQueues.delete(conversationId);
           await this.reconcileReversibleHistory(conversationId).catch(() => undefined);
-          return { ...dispatched, held: false };
+          this.publishPausedChanges(conversationId);
+          return { ...dispatched, pending: false, delivery: "queue" };
         }
         const busy = this.turnActive(conversationId, projection);
         const queue = this.heldQueues.get(conversationId) ?? [];
         // Order is absolute: while anything is held, a new submission joins the
         // back of the queue even when the conversation is momentarily idle —
         // dormant after a cancellation, or between deliveries.
-        if (busy || queue.length > 0) {
-          if (queue.length >= MAX_HELD_MESSAGES
-            || queue.reduce((total, entry) => total + Buffer.byteLength(entry.text), 0) + Buffer.byteLength(text) > MAX_HELD_TEXT_BYTES) {
-            throw new ChatQueueFullError();
+        if (busy || queue.length > 0 || (this.pendingSteers.get(conversationId)?.length ?? 0) > 0) {
+          // One bound over the whole dock: steers and held messages together,
+          // whoever raised them (D11).
+          this.assertDockCapacity(conversationId, text);
+          if (steerable) {
+            // The steer carries no model, mode, or variant: a mid-turn switch
+            // would retarget the turn being steered (D6). The composer's
+            // staged selection stays staged for the next queued or idle
+            // submission, so nothing is committed here.
+            const steered = await this.admitSteer(conversationId, requestId, text, attachmentRefs);
+            return { messageId: steered.id, pending: true, delivery: "steer", configuration: this.configurations.get(conversationId) ?? currentConfiguration };
           }
           // The EFFECTIVE selections are resolved and frozen at submission, not
           // just the explicitly supplied ones: a later submission may move the
@@ -989,8 +1119,9 @@ export class ChatAdapter {
           // same values on the wire.
           const configuration = this.commitConfiguration(conversationId, currentConfiguration, model, mode, variant);
           this.publishQueue(conversationId, { kind: "held", messageId: held.id });
+          this.publishPausedChanges(conversationId);
           if (!busy) this.scheduleDelivery(conversationId);
-          return { messageId: held.id, held: true, configuration };
+          return { messageId: held.id, pending: true, delivery: "queue", configuration };
         }
         const dispatched = await this.dispatchPrompt(conversationId, projection, session, {
           messageId: this.id(),
@@ -1001,8 +1132,327 @@ export class ChatAdapter {
           ...(mode ? { mode } : {}),
           ...(variant ? { variant } : {}),
         });
-        return { ...dispatched, held: false };
+        return { ...dispatched, pending: false, delivery: "queue" };
       }));
+  }
+
+  /**
+   * Hand a message to the agent's inbox as a steer (opencode-v2-steering D1):
+   * delivered into the running turn at its next step boundary, or waking a
+   * resting session (`resume`). The entry joins the pending-steer map at
+   * once under the agent's id — the same id its inbox events will name — so
+   * the dock, the bound, and the stream agree on one handle.
+   */
+  private async admitSteer(conversationId: string, requestId: string, text: string, attachmentRefs: MessageAttachment[], queuedAt = Date.now()): Promise<PendingSteer> {
+    const providerAttachments = await this.locateAttachments(attachmentRefs);
+    const accepted = await this.provider.prompt(conversationId, { id: this.id(), text, delivery: "steer", ...(providerAttachments.length ? { attachments: providerAttachments } : {}) });
+    // The agent wakes for a steer: whatever was stranded delivers with it.
+    this.lastSettledAt.delete(conversationId);
+    const steers = this.pendingSteers.get(conversationId) ?? [];
+    const existing = steers.find(entry => entry.id === accepted.messageId);
+    const steer: PendingSteer = { id: accepted.messageId, text, queuedAt: existing?.queuedAt ?? queuedAt, requestId, ...(attachmentRefs.length ? { attachments: attachmentRefs } : {}), tick: ++this.inboxClock };
+    if (existing) {
+      // The stream announced it before the acceptance answered: the entry is
+      // there already, restated now with the request id the client waits for.
+      Object.assign(existing, steer);
+    } else {
+      steers.push(steer);
+      this.pendingSteers.set(conversationId, steers);
+    }
+    this.publishQueue(conversationId, { kind: "steered", messageId: steer.id });
+    this.publishPausedChanges(conversationId);
+    return steer;
+  }
+
+  // The dock is one bound: pending steers and held messages together, by
+  // count and by text bytes (D11). Refused before anything changes.
+  private assertDockCapacity(conversationId: string, text: string): void {
+    const steers = this.pendingSteers.get(conversationId) ?? [];
+    const queue = this.heldQueues.get(conversationId) ?? [];
+    const count = steers.length + queue.length;
+    const bytes = steers.reduce((total, entry) => total + Buffer.byteLength(entry.text), 0)
+      + queue.reduce((total, entry) => total + Buffer.byteLength(entry.text), 0);
+    if (count >= MAX_HELD_MESSAGES || bytes + Buffer.byteLength(text) > MAX_HELD_TEXT_BYTES) throw new ChatQueueFullError();
+  }
+
+  /**
+   * Change a pending message's delivery (opencode-v2-steering D7, D8). Held
+   * to steer hands the message to the agent now, with its attachments and
+   * no frozen configuration; steer to held withdraws it from the agent and
+   * holds it at its submission-order position under the session's current
+   * configuration. Both run in the admission lane and are receipt-keyed.
+   */
+  changeDelivery(conversationId: string, messageId: string, requestId: string, delivery: MessageDelivery): Promise<{ messageId: string; delivery: MessageDelivery }> {
+    return this.receipts.run(`switch:${conversationId}:${requestId}`, () => this.enqueuePromptAdmission(conversationId, async () => {
+      await this.requireSession(conversationId);
+      this.requireSteering();
+      if (delivery === "steer") {
+        const held = this.heldQueues.get(conversationId)?.find(entry => entry.id === messageId);
+        if (!held) {
+          if (this.pendingSteers.get(conversationId)?.some(entry => entry.id === messageId)) return { messageId, delivery: "steer" as const };
+          throw this.notPendingError(messageId);
+        }
+        const steered = await this.steerHeld(conversationId, held);
+        return { messageId: steered.id, delivery: "steer" as const };
+      }
+      const steer = this.pendingSteers.get(conversationId)?.find(entry => entry.id === messageId);
+      if (!steer) {
+        if (this.heldQueues.get(conversationId)?.some(entry => entry.id === messageId)) return { messageId, delivery: "queue" as const };
+        throw this.notPendingError(messageId);
+      }
+      await this.withdrawSteer(conversationId, steer);
+      // Frozen now, as a submission would freeze it: the configuration the
+      // session has at the moment of withdrawal.
+      const configuration = await this.configuration(conversationId);
+      const held: HeldMessage = {
+        // A fresh id: the agent's inbox id named an entry it has now
+        // cancelled, and a later dispatch must not reuse it.
+        id: this.id(),
+        text: steer.text,
+        queuedAt: steer.queuedAt,
+        delivery: "queue",
+        requestId: steer.requestId ?? requestId,
+        ...(steer.attachments?.length ? { attachments: steer.attachments } : {}),
+        ...(configuration.model ? { model: configuration.model } : {}),
+        ...(configuration.mode ? { mode: configuration.mode } : {}),
+        ...(configuration.variant ? { variant: configuration.variant } : {}),
+      };
+      const queue = this.heldQueues.get(conversationId) ?? [];
+      const index = queue.findIndex(entry => entry.queuedAt > held.queuedAt);
+      queue.splice(index < 0 ? queue.length : index, 0, held);
+      this.heldQueues.set(conversationId, queue);
+      this.publishQueue(conversationId, { kind: "switched", messageId: held.id });
+      this.publishPausedChanges(conversationId);
+      this.scheduleDelivery(conversationId);
+      return { messageId: held.id, delivery: "queue" as const };
+    }));
+  }
+
+  /**
+   * Send a pending message now (opencode-v2-steering D8). On a steering
+   * agent a held message is steered, and a paused steer wakes the agent,
+   * which delivers every paused steer together. On an agent with `send-now`
+   * alone, a held message is dispatched under its frozen configuration while
+   * nothing runs; the rest stay held, and a dormant queue stays dormant.
+   */
+  sendNow(conversationId: string, messageId: string, requestId: string): Promise<{ messageId: string; delivery: MessageDelivery }> {
+    return this.receipts.run(`send-now:${conversationId}:${requestId}`, () => this.enqueuePromptAdmission(conversationId, async () => {
+      const session = await this.requireSession(conversationId);
+      const capabilities = this.agent().capabilities;
+      if (!capabilities.includes("send-now")) throw new SendNowUnsupportedError();
+      const projection = this.projection(conversationId);
+      if (capabilities.includes("steering")) {
+        const steer = this.pendingSteers.get(conversationId)?.find(entry => entry.id === messageId);
+        if (steer) {
+          // A running turn takes its steers at its next boundary on its own;
+          // interrupting it to wake them would stop the work being steered.
+          if (this.turnActive(conversationId, projection)) throw new SendNowUnavailableError();
+          await this.provider.interrupt(conversationId, { resume: true });
+          this.lastSettledAt.delete(conversationId);
+          this.publishPausedChanges(conversationId);
+          return { messageId, delivery: "steer" as const };
+        }
+        const held = this.heldQueues.get(conversationId)?.find(entry => entry.id === messageId);
+        if (!held) throw this.notPendingError(messageId);
+        const steered = await this.steerHeld(conversationId, held);
+        return { messageId: steered.id, delivery: "steer" as const };
+      }
+      if (this.turnActive(conversationId, projection)) throw new SendNowUnavailableError();
+      const queue = this.heldQueues.get(conversationId) ?? [];
+      const index = queue.findIndex(entry => entry.id === messageId);
+      if (index < 0) throw this.notPendingError(messageId);
+      const held = queue[index]!;
+      await this.dispatchPrompt(conversationId, projection, session, {
+        messageId: held.id,
+        text: held.text,
+        requestId: held.requestId,
+        ...(held.attachments?.length ? { attachments: held.attachments } : {}),
+        ...(held.model ? { model: held.model } : {}),
+        ...(held.mode ? { mode: held.mode } : {}),
+        ...(held.variant ? { variant: held.variant } : {}),
+      });
+      queue.splice(queue.indexOf(held), 1);
+      if (queue.length === 0) this.heldQueues.delete(conversationId);
+      this.publishQueue(conversationId, { kind: "delivered", messageId: held.id });
+      this.publishPausedChanges(conversationId);
+      return { messageId: held.id, delivery: "queue" as const };
+    }));
+  }
+
+  // A held message leaves the queue and goes to the agent as a steer with
+  // its attachments; its frozen configuration is not applied (D8). Refused
+  // for a command: the inbox cannot run Uatu's built-ins.
+  private async steerHeld(conversationId: string, held: HeldMessage): Promise<PendingSteer> {
+    if (held.text.startsWith("/") && !held.attachments?.length && parseSlashCommand(held.text, await this.provider.listCommands()) !== undefined) throw new CommandSteeringError();
+    const steer = await this.admitSteer(conversationId, held.requestId, held.text, held.attachments ?? []);
+    const queue = this.heldQueues.get(conversationId) ?? [];
+    const index = queue.indexOf(held);
+    if (index >= 0) queue.splice(index, 1);
+    if (queue.length === 0) this.heldQueues.delete(conversationId);
+    this.publishQueue(conversationId, { kind: "switched", messageId: steer.id });
+    this.publishPausedChanges(conversationId);
+    return steer;
+  }
+
+  private requireSteering(): void {
+    if (!this.agent().capabilities.includes("steering")) throw new SteeringUnsupportedError();
+  }
+
+  private notPendingError(messageId: string): Error {
+    return this.deliveredSteers.has(messageId) ? new SteerAlreadyDeliveredError() : new QueuedMessageNotHeldError();
+  }
+
+  /**
+   * Withdraw a steer from the agent (D7): ask for the cancellation, then wait
+   * for the agent's own settlement of that entry, because a cancel of an
+   * already-delivered or missing entry answers as if it worked. Returns once
+   * the entry is out of the pending map; throws SteerAlreadyDeliveredError
+   * when the agent delivered it first, so a message is never both delivered
+   * and returned or held.
+   */
+  private async withdrawSteer(conversationId: string, steer: PendingSteer): Promise<void> {
+    if (!this.provider.cancelInbox) throw new SteeringUnsupportedError();
+    const waiters = this.steerSettlements.get(conversationId) ?? new Map<string, (outcome: "delivered" | "cancelled") => void>();
+    this.steerSettlements.set(conversationId, waiters);
+    let settle!: (outcome: "delivered" | "cancelled" | "timeout") => void;
+    const settled = new Promise<"delivered" | "cancelled" | "timeout">(resolve => { settle = resolve; });
+    waiters.set(steer.id, settle);
+    const timer = setTimeout(() => settle("timeout"), this.steerWithdrawTimeoutMs);
+    let outcome: "delivered" | "cancelled" | "timeout";
+    try {
+      await this.provider.cancelInbox(conversationId, steer.id);
+      outcome = await settled;
+    } finally {
+      clearTimeout(timer);
+      if (waiters.get(steer.id) === settle) waiters.delete(steer.id);
+      if (waiters.size === 0) this.steerSettlements.delete(conversationId);
+    }
+    if (outcome === "timeout") {
+      // No event: decide from the agent's list, then from history.
+      const listed = await this.provider.listPendingInbox?.(conversationId) ?? [];
+      if (listed.some(entry => entry.id === steer.id)) throw new SteerWithdrawalUnconfirmedError();
+      const page = await this.provider.listMessages(conversationId, { limit: DEFAULT_PAGE_SIZE });
+      const rowId = `message:${steer.id}`;
+      outcome = page.items.some(item => item.id === rowId) || this.projection(conversationId).has(rowId) ? "delivered" : "cancelled";
+    }
+    this.forgetSteer(conversationId, steer.id);
+    if (outcome === "delivered") {
+      this.rememberDelivered(steer.id);
+      this.publishQueue(conversationId, { kind: "delivered", messageId: steer.id });
+      this.publishPausedChanges(conversationId);
+      throw new SteerAlreadyDeliveredError();
+    }
+  }
+
+  private forgetSteer(conversationId: string, steerId: string): boolean {
+    const steers = this.pendingSteers.get(conversationId);
+    if (!steers) return false;
+    const index = steers.findIndex(entry => entry.id === steerId);
+    if (index < 0) return false;
+    steers.splice(index, 1);
+    if (steers.length === 0) this.pendingSteers.delete(conversationId);
+    return true;
+  }
+
+  private rememberDelivered(steerId: string): void {
+    boundedSet(this.deliveredSteers, steerId, true, DELIVERED_STEERS_LIMIT);
+  }
+
+  /**
+   * One inbox change from the agent's stream (D3): a user steer pending, an
+   * entry settled, a delivery switched. Applied to the pending-steer map,
+   * never to a timeline; the delivered row arrives as its own upsert.
+   */
+  private applyInboxDelta(conversationId: string, delta: InboxDelta): void {
+    const steers = this.pendingSteers.get(conversationId) ?? [];
+    if (delta.kind === "pending") {
+      // The dock lists the user's steers; the agent's own entries and its
+      // natively queued input are not Uatu's queue.
+      if (delta.delivery !== "steer") return;
+      const existing = steers.find(entry => entry.id === delta.id);
+      if (existing) {
+        existing.text = delta.text;
+        existing.queuedAt = delta.at;
+        if (delta.attachments?.length) existing.attachments = delta.attachments; else delete existing.attachments;
+        return;
+      }
+      steers.push({ id: delta.id, text: delta.text, queuedAt: delta.at, ...(delta.attachments?.length ? { attachments: delta.attachments } : {}), tick: ++this.inboxClock });
+      this.pendingSteers.set(conversationId, steers);
+      this.publishQueue(conversationId, { kind: "steered", messageId: delta.id });
+      this.publishPausedChanges(conversationId);
+      return;
+    }
+    if (delta.kind === "delivery") {
+      // Switched to the agent's native queue elsewhere: no longer a steer the
+      // dock lists. A switch to steer of an entry never seen carries no text;
+      // the next reconciliation lists it.
+      if (delta.delivery === "queue" && this.forgetSteer(conversationId, delta.id)) {
+        this.publishQueue(conversationId, { kind: "removed", messageId: delta.id });
+        this.publishPausedChanges(conversationId);
+      }
+      return;
+    }
+    // Settled. A withdrawal waiting on this entry takes the outcome and
+    // publishes the end itself; otherwise the dock learns it here.
+    const waiter = this.steerSettlements.get(conversationId)?.get(delta.id);
+    if (delta.outcome === "delivered") this.rememberDelivered(delta.id);
+    if (waiter) {
+      this.forgetSteer(conversationId, delta.id);
+      waiter(delta.outcome);
+      return;
+    }
+    if (!this.forgetSteer(conversationId, delta.id)) return;
+    this.publishQueue(conversationId, { kind: delta.outcome === "delivered" ? "delivered" : "removed", messageId: delta.id });
+    this.publishPausedChanges(conversationId);
+  }
+
+  /**
+   * Replace the pending-steer map from the agent's own list (D3): on attach
+   * and after the stream reconnects, so steers raised while the stream was
+   * down or by another client are listed. A failed list is unknown, not
+   * empty, and leaves the map as it stands. With no turn live, listed steers
+   * are stranded until something wakes the agent.
+   */
+  private async reconcilePendingSteers(conversationId: string, history: readonly ConversationItem[] = []): Promise<void> {
+    if (!this.provider.listPendingInbox || !this.agent().capabilities.includes("steering")) return;
+    const readTick = this.inboxClock;
+    let listed: Awaited<ReturnType<NonNullable<ChatProvider["listPendingInbox"]>>>;
+    try {
+      listed = await this.provider.listPendingInbox(conversationId);
+    } catch {
+      return;
+    }
+    const projection = this.projection(conversationId);
+    const current = this.pendingSteers.get(conversationId) ?? [];
+    // Steers learned of only now, on a session with no turn live, have
+    // nothing coming to deliver them: stranded until something wakes the
+    // agent. Steers already tracked keep the wake and settle bookkeeping.
+    if (current.length === 0 && listed.length > 0 && !this.turnActive(conversationId, projection) && !this.lastSettledAt.has(conversationId)) this.lastSettledAt.set(conversationId, Date.now());
+    const next: PendingSteer[] = listed.filter(entry => entry.delivery === "steer").map(entry => {
+      const known = current.find(candidate => candidate.id === entry.id);
+      return { id: entry.id, text: entry.text, queuedAt: known?.queuedAt ?? entry.at, ...(known?.requestId ? { requestId: known.requestId } : {}), ...(entry.attachments?.length ? { attachments: entry.attachments } : {}), tick: known?.tick ?? ++this.inboxClock };
+    });
+    const nextIds = new Set(next.map(entry => entry.id));
+    // Kept without the list's say: entries a withdrawal is waiting on (their
+    // settlement decides) and entries learned after the read began.
+    const kept = current.filter(entry => !nextIds.has(entry.id) && (this.steerSettlements.get(conversationId)?.has(entry.id) || entry.tick > readTick));
+    const gone = current.filter(entry => !nextIds.has(entry.id) && !kept.includes(entry));
+    const added = next.filter(entry => !current.some(candidate => candidate.id === entry.id));
+    if (next.length + kept.length === 0) this.pendingSteers.delete(conversationId);
+    else this.pendingSteers.set(conversationId, [...next, ...kept].sort((left, right) => left.queuedAt - right.queuedAt));
+    for (const entry of gone) {
+      const rowId = `message:${entry.id}`;
+      const delivered = history.some(item => item.id === rowId) || projection.has(rowId);
+      if (delivered) this.rememberDelivered(entry.id);
+      this.publishQueue(conversationId, { kind: delivered ? "delivered" : "removed", messageId: entry.id });
+    }
+    for (const entry of added) this.publishQueue(conversationId, { kind: "steered", messageId: entry.id });
+    this.publishPausedChanges(conversationId);
+  }
+
+  /** The pending steers as the adapter holds them, for tests. */
+  pendingSteersForTests(conversationId: string): readonly PendingSteer[] {
+    return this.pendingSteers.get(conversationId) ?? [];
   }
 
   async removeQueued(conversationId: string, messageId: string, requestId: string): Promise<{ removed: true }> {
@@ -1014,10 +1464,19 @@ export class ChatAdapter {
       await this.requireSession(conversationId);
       const queue = this.heldQueues.get(conversationId) ?? [];
       const index = queue.findIndex(held => held.id === messageId);
-      if (index < 0) throw new QueuedMessageNotHeldError();
+      if (index < 0) {
+        // A steer is withdrawn from the agent, which must confirm it (D7).
+        const steer = this.pendingSteers.get(conversationId)?.find(entry => entry.id === messageId);
+        if (!steer) throw this.notPendingError(messageId);
+        await this.withdrawSteer(conversationId, steer);
+        this.publishQueue(conversationId, { kind: "removed", messageId });
+        this.publishPausedChanges(conversationId);
+        return { removed: true as const };
+      }
       queue.splice(index, 1);
       if (queue.length === 0) this.heldQueues.delete(conversationId);
       this.publishQueue(conversationId, { kind: "removed", messageId });
+      this.publishPausedChanges(conversationId);
       return { removed: true as const };
     }));
   }
@@ -1137,6 +1596,8 @@ export class ChatAdapter {
       const accepted: { messageId: string; text?: string; operation?: "reload" } = slash
         ? await this.provider.command(conversationId, { id: input.messageId, name: slash.name, arguments: slash.arguments, listed: slash.command, model: input.model, mode, variant })
         : await this.provider.prompt(conversationId, { id: input.messageId, text, delivery: "queue", ...(providerAttachments.length ? { attachments: providerAttachments } : {}), model: input.model, mode, variant });
+      // A dispatch wakes the agent, which takes its pending steers with it.
+      this.lastSettledAt.delete(conversationId);
       // "sending" ends at acceptance, BEFORE the rename side-work below —
       // the dispatch is no longer in flight once the provider has accepted
       // it, so the state must not span the rename's provider round trips.
@@ -1207,17 +1668,56 @@ export class ChatAdapter {
     return configuration;
   }
 
-  /** The held queue as it goes on the wire — handles, not dispatch payloads. */
+  /**
+   * The dock as it goes on the wire — handles, not dispatch payloads: steers
+   * first in enqueue order, then held messages in submission order, each with
+   * its delivery and, when nothing will deliver it on its own, `paused` (D3,
+   * D5). A steer is paused when it was enqueued before the conversation last
+   * settled and nothing has woken the agent since; a held message while
+   * delivery is paused (dormant, or a revert in progress or staged).
+   */
   private queuedMessages(conversationId: string): QueuedMessage[] {
-    return (this.heldQueues.get(conversationId) ?? []).map(({ id, text, queuedAt, requestId, attachments }) => ({ id, text, queuedAt, delivery: "queue" as const, requestId, ...(attachments?.length ? { attachments } : {}) }));
+    const settledAt = this.lastSettledAt.get(conversationId);
+    const heldPaused = this.deliveryPaused(conversationId);
+    const steers = (this.pendingSteers.get(conversationId) ?? []).map(({ id, text, queuedAt, requestId, attachments }): QueuedMessage => ({
+      id, text, queuedAt, delivery: "steer",
+      ...(settledAt !== undefined && queuedAt <= settledAt ? { paused: true as const } : {}),
+      ...(requestId ? { requestId } : {}),
+      ...(attachments?.length ? { attachments } : {}),
+    }));
+    const held = (this.heldQueues.get(conversationId) ?? []).map(({ id, text, queuedAt, requestId, attachments }): QueuedMessage => ({
+      id, text, queuedAt, delivery: "queue",
+      ...(heldPaused ? { paused: true as const } : {}),
+      requestId,
+      ...(attachments?.length ? { attachments } : {}),
+    }));
+    return [...steers, ...held];
   }
 
   // Resolved at publish time for the same eviction reason as configuration
   // commits: the delivered event especially has no provider-side echo, so a
   // subscriber who arrived on a replacement projection would otherwise show
   // the departed head as still held until the next queue change.
-  private publishQueue(conversationId: string, change: { kind: "held" | "removed" | "delivered"; messageId: string }): void {
+  private publishQueue(conversationId: string, change: { kind: QueueChangeKind; messageId: string }): void {
     this.projection(conversationId).replay.publish({ type: "conversation.queue", queued: this.queuedMessages(conversationId), change });
+  }
+
+  // The paused state is derived, so a change to what it derives from (a
+  // settle, a wake, dormancy, a revert) publishes one `paused` or `resumed`
+  // per entry whose state changed — and nothing when none did (D5).
+  private publishPausedChanges(conversationId: string): void {
+    if (!this.pendingSteers.has(conversationId) && !this.heldQueues.has(conversationId) && !this.publishedPaused.has(conversationId)) return;
+    const before = this.publishedPaused.get(conversationId) ?? new Set<string>();
+    const dock = this.queuedMessages(conversationId);
+    const present = new Set(dock.map(entry => entry.id));
+    for (const entry of dock) {
+      if (entry.paused && !before.has(entry.id)) this.publishQueue(conversationId, { kind: "paused", messageId: entry.id });
+      else if (!entry.paused && before.has(entry.id)) this.publishQueue(conversationId, { kind: "resumed", messageId: entry.id });
+    }
+    // An entry that left the dock was announced by its own event.
+    const paused = new Set(dock.filter(entry => entry.paused).map(entry => entry.id));
+    if (paused.size === 0) this.publishedPaused.delete(conversationId);
+    else this.publishedPaused.set(conversationId, paused);
   }
 
   // liveTurns as well as projection status: a projection evicted mid-turn
@@ -1291,6 +1791,7 @@ export class ChatAdapter {
       // status flap; the failed turn status is already published, and the
       // user's next submission or removal decides what happens.
       this.dormantQueues.add(conversationId);
+      this.publishPausedChanges(conversationId);
     }
   }
 
@@ -1350,8 +1851,11 @@ export class ChatAdapter {
       const paused = (this.heldQueues.get(conversationId)?.length ?? 0) > 0 && !this.dormantQueues.has(conversationId);
       if (paused) this.dormantQueues.add(conversationId);
       try {
-        await this.provider.interrupt(conversationId);
+        // Without resume: pending steers stay with the agent, unwoken, and
+        // read as paused once the interrupt settles the turn (D9).
+        await this.provider.interrupt(conversationId, { resume: false });
         projection.statusUpdate("interrupted");
+        this.publishPausedChanges(conversationId);
         return { cancelled: true };
       } catch (error) {
         // A failed interrupt leaves the turn running, so the pause must not
@@ -1363,6 +1867,7 @@ export class ChatAdapter {
         // the caller the cancellation failed, and the turn's own terminal
         // event still ends the status.
         if (paused) this.dormantQueues.delete(conversationId);
+        this.publishPausedChanges(conversationId);
         throw error;
       }
     }));
@@ -1408,10 +1913,12 @@ export class ChatAdapter {
         }
 
         this.reversibleMutations.add(conversationId);
+        this.publishPausedChanges(conversationId);
         try {
           if ((operation === "undo" || operation === "revert") && this.turnActive(conversationId, this.projection(conversationId))) {
             // Pause first. OpenCode can publish idle before interrupt() returns.
-            await this.provider.interrupt(conversationId);
+            // Without resume: the steers stay pending for the replacement.
+            await this.provider.interrupt(conversationId, { resume: false });
             this.projection(conversationId).statusUpdate("interrupted");
           }
           const result = operation === "undo"
@@ -1439,6 +1946,7 @@ export class ChatAdapter {
         } finally {
           this.reversibleMutations.delete(conversationId);
           this.scheduleDelivery(conversationId);
+          this.publishPausedChanges(conversationId);
         }
       }));
   }
@@ -2333,6 +2841,11 @@ export class ChatAdapter {
       },
     });
     this.eventCoalescer = coalescer;
+    // A (re)connect: the agent's inbox may have moved while no stream was
+    // listening, so every conversation this adapter knows is reconciled (D3).
+    for (const id of new Set([...this.projections.keys(), ...this.pendingSteers.keys()])) {
+      void this.reconcilePendingSteers(id).catch(() => undefined);
+    }
     try {
       for await (const normalized of this.provider.events(signal)) {
         if (signal.aborted) break;
@@ -2387,7 +2900,15 @@ export class ChatAdapter {
             this.projection(normalized.conversationId).replay.publish({ type: "conversation.configuration", configuration });
           }
         }
-        coalescer.push(normalized.conversationId, normalized.updates);
+        // Inbox deltas are the dock's, applied in order and at once; the
+        // timeline updates that may ride the same event go through the
+        // coalescer as before.
+        const timelineUpdates: NormalizedProviderUpdate[] = [];
+        for (const update of normalized.updates) {
+          if (update.kind === "inbox") this.applyInboxDelta(normalized.conversationId, update.delta);
+          else timelineUpdates.push(update);
+        }
+        coalescer.push(normalized.conversationId, timelineUpdates);
         // OpenCode never emits `question.v2.asked`, so the arrival of the
         // `question` tool part is the only live signal that a question was
         // asked or answered. Ask the provider for the real pending set and
@@ -2814,10 +3335,16 @@ export class ChatAdapter {
       // through its own set so the composer rules above stay untouched.
       if (status === "background") this.backgroundWork.add(id);
       else this.backgroundWork.delete(id);
+      // The conversation settling strands the steers enqueued before it (D3);
+      // a live turn takes its inbox at its boundaries, so nothing is stranded
+      // while one runs.
+      if (status === "idle" || status === "completed" || status === "interrupted") this.lastSettledAt.set(id, Date.now());
+      else if (isLiveConversationStatus(status)) this.lastSettledAt.delete(id);
       // A turn that ended on its own releases the next held message. Only
       // these two: an interruption leaves the queue dormant by decision, and
       // a failure must not restart a failing conversation by itself.
       if (status === "idle" || status === "completed") this.scheduleDelivery(id);
+      this.publishPausedChanges(id);
       this.activityMayHaveChanged();
     }, {
       pending: itemId => this.trackInteraction(id, itemId, true),

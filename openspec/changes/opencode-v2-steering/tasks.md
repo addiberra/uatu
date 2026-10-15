@@ -39,35 +39,35 @@ Each slice is written test first: write the named test and watch it fail, implem
 
 ## 3. Adapter: pending steers and admission
 
-- [ ] 3.1 Add tests in `src/chat/adapter.test.ts`, with a fake provider declaring `steering`:
+- [x] 3.1 Add tests in `src/chat/adapter.test.ts`, with a fake provider declaring `steering`:
   - a busy prompt with `delivery: "steer"` reaches `provider.prompt` as a steer and is published as `steered`, listed before held messages;
   - a busy steer-delivery command, skill, or `/reload` is held;
   - a busy steer to an agent without `steering` is held;
   - an omitted delivery is held.
 
   Implement the D6 decision table and the pending-steer map until the tests pass.
-- [ ] 3.2 Add tests: pending deltas from the provider update the map and publish queue events; a settled(delivered) steer leaves the dock with `delivered`. Snapshot `queued` lists steers first, then held messages, each with its `delivery`. Attach and reconnect replace the map from `listPendingInbox`. Implement until the tests pass.
-- [ ] 3.3 Add tests for the bound: steers and held messages count together against 20 messages and 256 KiB, a steer raised by another client counts, and an over-bound submission throws `ChatQueueFullError` with the dock unchanged. Implement until the tests pass.
-- [ ] 3.4 Add tests for the paused state:
+- [x] 3.2 Add tests: pending deltas from the provider update the map and publish queue events; a settled(delivered) steer leaves the dock with `delivered`. Snapshot `queued` lists steers first, then held messages, each with its `delivery`. Attach and reconnect replace the map from `listPendingInbox`. Implement until the tests pass.
+- [x] 3.3 Add tests for the bound: steers and held messages count together against 20 messages and 256 KiB, a steer raised by another client counts, and an over-bound submission throws `ChatQueueFullError` with the dock unchanged. Implement until the tests pass.
+- [x] 3.4 Add tests for the paused state:
   - a steer enqueued before the latest idle, interrupted, or completed transition reads `paused: true` in the snapshot and publishes `paused`;
   - a new steer, or a wake, publishes `resumed`;
   - held messages read `paused` while `deliveryPaused()` is true.
 
   Implement the derivation (D3) until the tests pass.
-- [ ] 3.5 Add tests for cancel: `abort` calls `interrupt(id, { resume: false })`, held messages go dormant as today, pending steers stay pending and paused, and nothing is delivered. Implement until the tests pass.
-- [ ] 3.6 Add tests for undo on a steering agent: the replacement under a staged revert goes out as a steer with `resume: true`, held messages stay held, paused steers are delivered with it oldest first, and on a non-steering agent the path is unchanged. Implement until the tests pass.
+- [x] 3.5 Add tests for cancel: `abort` calls `interrupt(id, { resume: false })`, held messages go dormant as today, pending steers stay pending and paused, and nothing is delivered. Implement until the tests pass.
+- [x] 3.6 Add tests for undo on a steering agent: the replacement under a staged revert goes out as a steer with `resume: true`, held messages stay held, paused steers are delivered with it oldest first, and on a non-steering agent the path is unchanged. Implement until the tests pass.
 
 ## 4. Adapter: per-entry operations
 
-- [ ] 4.1 Add tests for withdrawing a steer (remove, edit, or switch to queue):
+- [x] 4.1 Add tests for withdrawing a steer (remove, edit, or switch to queue):
   - `inbox.cancel` followed by a `cancelled` delta removes the steer, or holds it at its submission-order position with the session's current configuration frozen;
   - a `delivered` delta arriving first throws `SteerAlreadyDeliveredError` and leaves nothing held and no second delivery;
   - with no event before the bounded wait, the outcome is decided from `listPendingInbox` and history;
   - retries with the same request id apply once.
 
   Implement D7 in the admission lane until the tests pass.
-- [ ] 4.2 Add tests for switching a held message to steer, or Send now on a steering agent: the message leaves `heldQueues` (`switched`) and goes to `provider.prompt` as a steer with its attachments, and a dormant queue stays dormant for the other entries. Send now on a paused steer calls `interrupt(id, { resume: true })`. Commands are refused a switch to steer. Implement until the tests pass.
-- [ ] 4.3 Add tests for Send now on a `send-now` agent without `steering` (Claude-shaped fake): it is refused while a turn is active. When dormant or idle, it dispatches that message under its frozen configuration ahead of the others, publishes `delivered`, and leaves the rest held in order. An agent without `send-now` refuses it. Implement until the tests pass.
+- [x] 4.2 Add tests for switching a held message to steer, or Send now on a steering agent: the message leaves `heldQueues` (`switched`) and goes to `provider.prompt` as a steer with its attachments, and a dormant queue stays dormant for the other entries. Send now on a paused steer calls `interrupt(id, { resume: true })`. Commands are refused a switch to steer. Implement until the tests pass.
+- [x] 4.3 Add tests for Send now on a `send-now` agent without `steering` (Claude-shaped fake): it is refused while a turn is active. When dormant or idle, it dispatches that message under its frozen configuration ahead of the others, publishes `delivered`, and leaves the rest held in order. An agent without `send-now` refuses it. Implement until the tests pass.
 
 ## 5. Service, routes, and client API
 

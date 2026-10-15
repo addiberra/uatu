@@ -19,6 +19,7 @@ import type {
   ConversationSnapshot,
   ConversationSummary,
   MessageAttachment,
+  MessageDelivery,
   ModelSelection,
   PermissionOutcome,
   QuestionOutcome,
@@ -102,13 +103,16 @@ export interface MultiAgentWorkspaceChatService {
     snapshot: AgentConversationSnapshot;
     events: ChatEventSubscription;
   }>;
-  prompt(id: string, requestId: string, text: string, model?: ModelSelection, mode?: string, variant?: string, attachments?: MessageAttachment[]): Promise<{
+  prompt(id: string, requestId: string, text: string, model?: ModelSelection, mode?: string, variant?: string, attachments?: MessageAttachment[], delivery?: MessageDelivery): Promise<{
     messageId: string;
-    held: boolean;
+    pending: boolean;
+    delivery: MessageDelivery;
     configuration: ConversationConfiguration;
     conversation?: AgentConversationSummary;
   }>;
   removeQueued(id: string, messageId: string, requestId: string): Promise<{ removed: true }>;
+  changeDelivery(id: string, messageId: string, requestId: string, delivery: MessageDelivery): Promise<{ messageId: string; delivery: MessageDelivery }>;
+  sendNow(id: string, messageId: string, requestId: string): Promise<{ messageId: string; delivery: MessageDelivery }>;
   saveAttachment(bytes: Uint8Array): Promise<{ id: string; mimeType: string; sizeBytes: number }>;
   resolveAttachment(id: string): Promise<StoredAttachment | null>;
   renameConversation(id: string, requestId: string, title: string): Promise<{ conversation: AgentConversationSummary }>;
@@ -333,9 +337,9 @@ export class MultiAgentChatService implements MultiAgentWorkspaceChatService {
     };
   }
 
-  async prompt(id: string, requestId: string, text: string, model?: ModelSelection, mode?: string, variant?: string, attachments?: MessageAttachment[]) {
+  async prompt(id: string, requestId: string, text: string, model?: ModelSelection, mode?: string, variant?: string, attachments?: MessageAttachment[], delivery?: MessageDelivery) {
     const { agent, conversationId } = this.resolve(id);
-    const { conversation, ...accepted } = await agent.service.prompt(conversationId, requestId, text, model, mode, variant, attachments);
+    const { conversation, ...accepted } = await agent.service.prompt(conversationId, requestId, text, model, mode, variant, attachments, delivery);
     return {
       ...accepted,
       ...(conversation ? { conversation: this.qualifySummary(agent.descriptor, conversation) } : {}),
@@ -345,6 +349,16 @@ export class MultiAgentChatService implements MultiAgentWorkspaceChatService {
   async removeQueued(id: string, messageId: string, requestId: string) {
     const { agent, conversationId } = this.resolve(id);
     return agent.service.removeQueued(conversationId, messageId, requestId);
+  }
+
+  async changeDelivery(id: string, messageId: string, requestId: string, delivery: MessageDelivery) {
+    const { agent, conversationId } = this.resolve(id);
+    return agent.service.changeDelivery(conversationId, messageId, requestId, delivery);
+  }
+
+  async sendNow(id: string, messageId: string, requestId: string) {
+    const { agent, conversationId } = this.resolve(id);
+    return agent.service.sendNow(conversationId, messageId, requestId);
   }
 
   async saveAttachment(bytes: Uint8Array): Promise<{ id: string; mimeType: string; sizeBytes: number }> {

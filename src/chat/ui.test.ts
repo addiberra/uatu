@@ -114,7 +114,7 @@ describe("chat reversible-history composer", () => {
       },
       prompt: async (conversationId: string, _requestId: string, text: string, _model: unknown, _mode: unknown, _variant: unknown, attachments?: unknown[]) => {
         prompts.push({ conversationId, text, attachments });
-        return { messageId: `message-${prompts.length}`, held: false, configuration: {} };
+        return { messageId: `message-${prompts.length}`, pending: false, delivery: "queue", configuration: {} };
       },
     } as unknown as ChatApiClient;
 

@@ -5,9 +5,9 @@ import { ConversationReplay, encodeReplayCursor } from "../chat/replay";
 import { AttachmentStoreError, sniffImageMime, type StoredAttachment } from "../chat/attachment-store";
 import { ConversationInventoryBroadcaster } from "../chat/inventory-broadcaster";
 import type { WorkspaceChatService } from "../chat/service";
-import { isLiveConversationStatus, type ChatAccountChange, type AgentUsageReport, type BackgroundTaskOutput, type UsageReadMode, type UsageReadResult, type ChatActivity, type ChatAvailability, type ConversationSnapshot, type ConversationStatus, type ConversationSummary, type MessageAttachment, type ModelSelection, type PermissionOutcome, type QuestionOutcome, type ReversibleHistoryResult } from "../chat/types";
+import { isLiveConversationStatus, type ChatAccountChange, type AgentUsageReport, type BackgroundTaskOutput, type UsageReadMode, type UsageReadResult, type ChatActivity, type ChatAvailability, type ConversationSnapshot, type ConversationStatus, type ConversationSummary, type MessageAttachment, type MessageDelivery, type ModelSelection, type PermissionOutcome, type QuestionOutcome, type ReversibleHistoryResult } from "../chat/types";
 import { ConversationNotFoundError } from "../chat/workspace";
-import { ConversationRenameUnsupportedError, QueuedMessageNotHeldError, ReversibleHistoryUnsupportedError, ScheduledWakeupsUnsupportedError } from "../chat/adapter";
+import { CommandSteeringError, ConversationRenameUnsupportedError, QueuedMessageNotHeldError, ReversibleHistoryUnsupportedError, ScheduledWakeupsUnsupportedError, SendNowUnavailableError, SendNowUnsupportedError, SteerAlreadyDeliveredError, SteeringUnsupportedError } from "../chat/adapter";
 import { ReversibleHistoryTargetError, InvalidQuestionAnswerError, ReleaseUnavailableError, ScheduledWakeupUnavailableError } from "../chat/provider";
 import { MetricsRegistry } from "../debug/metrics";
 import { activeGauge, closedCounter, openedCounter, reconnectedCounter } from "../debug/stream-metrics";
@@ -26,7 +26,7 @@ class FakeChatService implements WorkspaceChatService {
   prompts = 0;
   retries = 0;
   renames = 0;
-  private promptResult: { messageId: string; held: boolean } | undefined;
+  private promptResult: { messageId: string; pending: boolean; delivery: MessageDelivery } | undefined;
   selectedModel: ModelSelection | undefined;
   selectedAgent: string | undefined;
   questionResponses: QuestionOutcome[] = [];
@@ -68,7 +68,7 @@ class FakeChatService implements WorkspaceChatService {
     this.promptAttachments = attachments;
     if (!this.promptResult) {
       this.prompts += 1;
-      this.promptResult = { messageId: requestId, held: false };
+      this.promptResult = { messageId: requestId, pending: false, delivery: "queue" };
     }
     return { ...this.promptResult, configuration: { ...(model ? { model } : {}), ...(agent ? { mode: agent } : {}) } };
   }
@@ -88,8 +88,26 @@ class FakeChatService implements WorkspaceChatService {
   async removeQueued(id: string, messageId: string, _requestId: string) {
     this.require(id);
     if (messageId === "delivered") throw new QueuedMessageNotHeldError();
+    if (messageId === "steered") throw new SteerAlreadyDeliveredError();
     this.removals.push(messageId);
     return { removed: true } as const;
+  }
+  switches: Array<{ messageId: string; delivery: MessageDelivery }> = [];
+  sent: string[] = [];
+  async changeDelivery(id: string, messageId: string, _requestId: string, delivery: MessageDelivery) {
+    this.require(id);
+    if (messageId === "steered") throw new SteerAlreadyDeliveredError();
+    if (messageId === "command") throw new CommandSteeringError();
+    if (messageId === "unsupported") throw new SteeringUnsupportedError();
+    this.switches.push({ messageId, delivery });
+    return { messageId, delivery };
+  }
+  async sendNow(id: string, messageId: string, _requestId: string) {
+    this.require(id);
+    if (messageId === "running") throw new SendNowUnavailableError();
+    if (messageId === "unsupported") throw new SendNowUnsupportedError();
+    this.sent.push(messageId);
+    return { messageId, delivery: "queue" as const };
   }
   async renameConversation(id: string, _requestId: string, title: string) {
     this.require(id);

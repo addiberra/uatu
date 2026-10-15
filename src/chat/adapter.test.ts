@@ -1,19 +1,21 @@
 import { describe, expect, test } from "bun:test";
 
-import { BackgroundTasksUnsupportedError, ChatQueueFullError, CommandAttachmentsError, ConversationRenameUnsupportedError, deriveConversationTitle, InteractionConflictError, InvalidConversationTitleError, InvalidModeSelectionError, InvalidModelSelectionError, InvalidVariantSelectionError, ChatAdapter, parseSlashCommand, QueuedMessageNotHeldError, ReversibleHistoryUnsupportedError, ScheduledWakeupsUnsupportedError, UnknownAttachmentError, UsageUnsupportedError } from "./adapter";
+import { BackgroundTasksUnsupportedError, ChatQueueFullError, CommandAttachmentsError, CommandSteeringError, ConversationRenameUnsupportedError, deriveConversationTitle, InteractionConflictError, InvalidConversationTitleError, InvalidModeSelectionError, InvalidModelSelectionError, InvalidVariantSelectionError, ChatAdapter, parseSlashCommand, QueuedMessageNotHeldError, ReversibleHistoryUnsupportedError, ScheduledWakeupsUnsupportedError, SendNowUnavailableError, SendNowUnsupportedError, SteerAlreadyDeliveredError, SteeringUnsupportedError, SteerWithdrawalUnconfirmedError, UnknownAttachmentError, UsageUnsupportedError } from "./adapter";
 import { createClaudeEventMemory, normalizeClaudeMessage } from "./claude/normalization";
 import { createProviderEventMemory, normalizeProviderEvent, normalizeProviderMessage, storedMessageUsage, storedPromptId, type ProviderEvent, type ProviderMessage } from "./opencode/v1/normalization";
 import type { ChatAgent } from "./types";
 import type {
+  InboxDelta,
   NormalizedProviderEvent,
   ChatProvider,
+  PendingInboxEntry,
   ProviderHistoryPage,
   ProviderPermissionReply,
   ProviderSession,
   StoredMessageAccounting,
 } from "./provider";
 import { ReversibleHistoryTargetError, UnsupportedVariantSelectionError } from "./provider";
-import type { ChatCommand, ChatEvent, ChatModel, ConversationItem, ToolItem, ModelSelection, ReversibleHistoryResult, ReversibleHistoryState } from "./types";
+import type { ChatCommand, ChatEvent, ChatModel, ConversationItem, MessageDelivery, ToolItem, ModelSelection, ReversibleHistoryResult, ReversibleHistoryState } from "./types";
 import { ConversationNotFoundError } from "./workspace";
 import { MetricsRegistry } from "../debug/metrics";
 import type { ConversationInventorySubscription } from "./inventory-broadcaster";
@@ -61,21 +63,29 @@ class FakeProvider implements ChatProvider {
   // the suite that can exercise a surface whose agent is missing a capability.
   agent: ChatAgent = { id: "fake", name: "Fake Agent", capabilities: ["models", "commands", "permissions"] };
   describe(): ChatAgent { return this.agent; }
-  commands = [
-    { name: "review", description: "Review", argumentHint: "[focus]", kind: "command" as const },
-    { name: "compact", description: "Compact", argumentHint: "", kind: "command" as const },
+  commands: ChatCommand[] = [
+    { name: "review", description: "Review", argumentHint: "[focus]", kind: "command" },
+    { name: "compact", description: "Compact", argumentHint: "", kind: "command" },
   ];
   models: ChatModel[] = [{ selection: { providerId: "anthropic", modelId: "claude" }, provider: "Anthropic", name: "Claude" }];
   sessions: ProviderSession[] = [];
   pages = new Map<string, RawPage>();
   eventQueue = new EventQueue();
   notificationLifecycle = new OpenCodeNotificationLifecycle();
-  prompts: Array<{ sessionId: string; id: string; text: string; delivery: "queue"; mode?: string; variant?: string; attachments?: import("./provider").ProviderAttachment[] }> = [];
+  prompts: Array<{ sessionId: string; id: string; text: string; delivery: MessageDelivery; model?: ModelSelection; mode?: string; variant?: string; attachments?: import("./provider").ProviderAttachment[] }> = [];
   commandOperation?: "reload";
   commandCalls: Array<{ sessionId: string; id: string; name: string; arguments: string; listed?: ChatCommand; model?: ModelSelection }> = [];
   permissionReplies: Array<{ sessionId: string; requestId: string; reply: ProviderPermissionReply }> = [];
   questionReplies: Array<{ sessionId: string; requestId: string; answers?: string[][]; rejected?: true }> = [];
   interrupts: string[] = [];
+  // What each interrupt asked for (opencode-v2-steering D9): Cancel passes
+  // `resume: false`, a Send now on a paused steer `resume: true`.
+  interruptOptions: Array<{ resume?: boolean } | undefined> = [];
+  // The agent's own inbox, for a fake declaring `steering`.
+  pendingInbox: PendingInboxEntry[] = [];
+  cancelledInbox: string[] = [];
+  listPendingInbox?: ChatProvider["listPendingInbox"];
+  cancelInbox?: ChatProvider["cancelInbox"];
   modelSwitches: Array<{ sessionId: string; selection: ModelSelection }> = [];
   renameSession?: ChatProvider["renameSession"];
   listPermissions?: ChatProvider["listPermissions"];
@@ -130,7 +140,7 @@ class FakeProvider implements ChatProvider {
       }
     }
   }
-  async prompt(sessionId: string, input: { id: string; text: string; delivery: "queue"; mode?: string; variant?: string; attachments?: import("./provider").ProviderAttachment[] }) {
+  async prompt(sessionId: string, input: { id: string; text: string; delivery: MessageDelivery; model?: ModelSelection; mode?: string; variant?: string; attachments?: import("./provider").ProviderAttachment[] }) {
     this.prompts.push({ sessionId, ...input });
     return { messageId: input.id };
   }
@@ -140,7 +150,7 @@ class FakeProvider implements ChatProvider {
     this.commandCalls.push({ sessionId, ...input });
     return { messageId: input.id, ...(this.commandText ? { text: this.commandText } : {}), ...(this.commandOperation ? { operation: this.commandOperation } : {}) };
   }
-  async interrupt(sessionId: string) { this.interrupts.push(sessionId); }
+  async interrupt(sessionId: string, options?: { resume?: boolean }) { this.interrupts.push(sessionId); this.interruptOptions.push(options); }
   async replyPermission(sessionId: string, requestId: string, reply: ProviderPermissionReply) {
     this.permissionReplies.push({ sessionId, requestId, reply });
   }
@@ -1046,7 +1056,7 @@ describe("reversible history coordination", () => {
     await adapter.history("session");
     adapter.projectionForTests("session").statusUpdate("running");
     const held = await adapter.prompt("session", "queued", "older queued message");
-    expect(held.held).toBe(true);
+    expect(held.pending).toBe(true);
     const firstClient = await adapter.subscribe("session");
     const secondClient = await adapter.subscribe("session");
 
@@ -1384,7 +1394,7 @@ describe("reversible history coordination", () => {
     adapter.projectionForTests("session").statusUpdate("interrupted");
 
     const replacement = await adapter.prompt("session", "replacement", "replacement");
-    expect(replacement.held).toBe(false);
+    expect(replacement.pending).toBe(false);
     expect(order).toEqual(["replacement"]);
     expect((await adapter.history("session")).queued).toEqual([expect.objectContaining({ id: older.messageId })]);
     adapter.projectionForTests("session").statusUpdate("completed");
@@ -1681,7 +1691,7 @@ describe("prompt, abort, permission, and question mutations", () => {
     // The second submission was accepted while the turn ran: held by the
     // workspace with its configuration committed in admission order, and
     // nothing dispatched to the provider yet.
-    expect((await second).held).toBe(true);
+    expect((await second).pending).toBe(true);
     expect((await second).configuration).toEqual({ model: anthropic });
     expect(calls).toBe(1);
 
@@ -1791,7 +1801,7 @@ describe("prompt, abort, permission, and question mutations", () => {
     provider.commandOperation = "reload";
     const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g", id: () => "message" });
     const accepted = await adapter.prompt("session", "request", "/review");
-    expect(accepted).toMatchObject({ messageId: "message", held: false, operation: "reload" });
+    expect(accepted).toMatchObject({ messageId: "message", pending: false, operation: "reload" });
   });
 
   test("dispatches recognized slash commands without changing the prompt contract", async () => {
@@ -1801,7 +1811,7 @@ describe("prompt, abort, permission, and question mutations", () => {
     const model = { providerId: "anthropic", modelId: "claude" };
 
     const accepted = await adapter.prompt("session", "request", "/review   API compatibility", model);
-    expect(accepted).toEqual({ messageId: "message", held: false, configuration: { model } });
+    expect(accepted).toEqual({ messageId: "message", pending: false, delivery: "queue", configuration: { model } });
     // The listed entry the text matched rides along, so the provider dispatches what was classified.
     expect(provider.commandCalls).toEqual([{ sessionId: "session", id: "message", name: "review", arguments: "API compatibility", listed: expect.objectContaining({ name: "review", kind: "command" }), model }]);
     expect(provider.prompts).toEqual([]);
@@ -1957,10 +1967,10 @@ describe("prompt, abort, permission, and question mutations", () => {
       expect(predicate()).toBe(true);
     };
 
-    expect((await adapter.prompt("session", "r1", "first")).held).toBe(false);
+    expect((await adapter.prompt("session", "r1", "first")).pending).toBe(false);
     const second = await adapter.prompt("session", "r2", "second");
     const third = await adapter.prompt("session", "r3", "third");
-    expect([second.held, third.held]).toEqual([true, true]);
+    expect([second.pending, third.pending]).toEqual([true, true]);
     expect(provider.prompts).toHaveLength(1);
     expect((await adapter.history("session")).queued).toEqual([
       expect.objectContaining({ id: second.messageId, text: "second", requestId: "r2" }),
@@ -1982,7 +1992,7 @@ describe("prompt, abort, permission, and question mutations", () => {
     // The next submission joins the back of the queue and resumes delivery
     // from its head, preserving submission order.
     const fourth = await adapter.prompt("session", "r4", "fourth");
-    expect(fourth.held).toBe(true);
+    expect(fourth.pending).toBe(true);
     await until(() => provider.prompts.length === 3);
     expect(provider.prompts[2]).toEqual(expect.objectContaining({ text: "third" }));
     adapter.projectionForTests("session").statusUpdate("completed");
@@ -1997,7 +2007,7 @@ describe("prompt, abort, permission, and question mutations", () => {
     let message = 0;
     const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g", id: () => `id-${++message}` });
 
-    expect((await adapter.prompt("session", "r1", "first")).held).toBe(false);
+    expect((await adapter.prompt("session", "r1", "first")).pending).toBe(false);
     await adapter.prompt("session", "r2", "second");
     const third = await adapter.prompt("session", "r3", "third");
 
@@ -2097,7 +2107,7 @@ describe("prompt, abort, permission, and question mutations", () => {
     let message = 0;
     const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g", id: () => `id-${++message}` });
 
-    expect((await adapter.prompt("session", "r1", "first")).held).toBe(false);
+    expect((await adapter.prompt("session", "r1", "first")).pending).toBe(false);
     await adapter.prompt("session", "r2", "second");
     await adapter.prompt("session", "r3", "third");
 
@@ -2133,9 +2143,9 @@ describe("prompt, abort, permission, and question mutations", () => {
     let message = 0;
     const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g", id: () => `id-${++message}` });
 
-    expect((await adapter.prompt("session", "r1", "first")).held).toBe(false);
+    expect((await adapter.prompt("session", "r1", "first")).pending).toBe(false);
     const held = await adapter.prompt("session", "r2", "second");
-    expect(held.held).toBe(true);
+    expect(held.pending).toBe(true);
 
     const lookup = provider.getSession.bind(provider);
     provider.getSession = async () => { throw new Error("transient lookup failure"); };
@@ -2161,9 +2171,9 @@ describe("prompt, abort, permission, and question mutations", () => {
     let message = 0;
     const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g", id: () => `id-${++message}` });
 
-    expect((await adapter.prompt("session", "r1", "first")).held).toBe(false);
+    expect((await adapter.prompt("session", "r1", "first")).pending).toBe(false);
     const held = await adapter.prompt("session", "r2", "second");
-    expect(held.held).toBe(true);
+    expect(held.pending).toBe(true);
 
     // The merged stream corrects a stale terminal report while the delivery's
     // session lookup is still awaiting. The busy guard already passed before
@@ -2192,9 +2202,9 @@ describe("prompt, abort, permission, and question mutations", () => {
     let message = 0;
     const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g", maxProjections: 2, id: () => `id-${++message}` });
 
-    expect((await adapter.prompt("a", "r1", "first")).held).toBe(false);
+    expect((await adapter.prompt("a", "r1", "first")).pending).toBe(false);
     const held = await adapter.prompt("a", "r2", "second");
-    expect(held.held).toBe(true);
+    expect(held.pending).toBe(true);
     const original = adapter.projectionForTests("a");
 
     // The delivery's session lookup stalls; meanwhile activity on other
@@ -2261,7 +2271,7 @@ describe("prompt, abort, permission, and question mutations", () => {
     projection.statusUpdate("background");
     // Not live: the next prompt is delivered, not held (spec: prompting
     // remains possible while background work runs).
-    expect((await adapter.prompt("session", "r1", "meanwhile")).held).toBe(false);
+    expect((await adapter.prompt("session", "r1", "meanwhile")).pending).toBe(false);
     expect(provider.prompts).toHaveLength(1);
     // Stop is idempotent per request id and addressed to the owning session.
     expect(await adapter.stopTask("session", "b1", "req-1")).toEqual({ stopped: true });
@@ -2337,7 +2347,7 @@ describe("prompt, abort, permission, and question mutations", () => {
     projection.statusUpdate("completed");
     projection.statusUpdate("scheduled");
     // Not live: a prompt is delivered into the held session, not held back.
-    expect((await adapter.prompt("session", "r1", "meanwhile")).held).toBe(false);
+    expect((await adapter.prompt("session", "r1", "meanwhile")).pending).toBe(false);
     projection.statusUpdate("completed");
     // Reopened while the provider still holds the wakeup: its row (this
     // conversation's only) and the scheduled state.
@@ -2462,7 +2472,7 @@ describe("prompt, abort, permission, and question mutations", () => {
       expect(predicate()).toBe(true);
     };
 
-    expect((await adapter.prompt("session", "r1", "first")).held).toBe(false);
+    expect((await adapter.prompt("session", "r1", "first")).pending).toBe(false);
     // Submitted with no explicit model — under the configuration the user
     // saw at the time (model A)...
     await adapter.prompt("session", "r2", "second");
@@ -2483,9 +2493,9 @@ describe("prompt, abort, permission, and question mutations", () => {
     let message = 0;
     const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g", id: () => `id-${++message}` });
 
-    expect((await adapter.prompt("session", "r0", "start")).held).toBe(false);
+    expect((await adapter.prompt("session", "r0", "start")).pending).toBe(false);
     for (let index = 1; index <= 20; index += 1) {
-      expect((await adapter.prompt("session", `count-${index}`, `held ${index}`)).held).toBe(true);
+      expect((await adapter.prompt("session", `count-${index}`, `held ${index}`)).pending).toBe(true);
     }
     await expect(adapter.prompt("session", "count-21", "one too many")).rejects.toBeInstanceOf(ChatQueueFullError);
     expect((await adapter.history("session")).queued).toHaveLength(20);
@@ -2496,10 +2506,10 @@ describe("prompt, abort, permission, and question mutations", () => {
       fresh.sessions = [fixtureSession("session")];
       return fresh;
     })(), workspacePath: process.cwd(), generation: "g2", id: () => `byte-${++message}` });
-    expect((await bytes.prompt("session", "b0", "start")).held).toBe(false);
+    expect((await bytes.prompt("session", "b0", "start")).pending).toBe(false);
     const large = "x".repeat(60 * 1024);
     for (let index = 1; index <= 4; index += 1) {
-      expect((await bytes.prompt("session", `bytes-${index}`, large)).held).toBe(true);
+      expect((await bytes.prompt("session", `bytes-${index}`, large)).pending).toBe(true);
     }
     await expect(bytes.prompt("session", "bytes-5", large)).rejects.toBeInstanceOf(ChatQueueFullError);
   });
@@ -2510,9 +2520,9 @@ describe("prompt, abort, permission, and question mutations", () => {
     let message = 0;
     const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g", id: () => `id-${++message}` });
 
-    expect((await adapter.prompt("session", "r1", "first")).held).toBe(false);
+    expect((await adapter.prompt("session", "r1", "first")).pending).toBe(false);
     const held = await adapter.prompt("session", "r2", "second");
-    expect(held.held).toBe(true);
+    expect(held.pending).toBe(true);
 
     // The provider publishes the interrupt's idle transition before the
     // interrupt request itself resolves — the pump is faster than the HTTP
@@ -2529,9 +2539,9 @@ describe("prompt, abort, permission, and question mutations", () => {
 
     // A failed interrupt leaves the turn running and must roll back only the
     // pause this cancellation added — the next natural end still delivers.
-    expect((await adapter.prompt("session", "r3", "third")).held).toBe(false);
+    expect((await adapter.prompt("session", "r3", "third")).pending).toBe(false);
     const fourth = await adapter.prompt("session", "r4", "fourth");
-    expect(fourth.held).toBe(true);
+    expect(fourth.pending).toBe(true);
     provider.interrupt = async () => { throw new Error("interrupt refused"); };
     await expect(adapter.abort("session", "cancel-2")).rejects.toThrow("interrupt refused");
     adapter.projectionForTests("session").statusUpdate("completed");
@@ -2545,9 +2555,9 @@ describe("prompt, abort, permission, and question mutations", () => {
     let message = 0;
     const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g", id: () => `id-${++message}` });
 
-    expect((await adapter.prompt("session", "r1", "first")).held).toBe(false);
+    expect((await adapter.prompt("session", "r1", "first")).pending).toBe(false);
     const held = await adapter.prompt("session", "r2", "second");
-    expect(held.held).toBe(true);
+    expect(held.pending).toBe(true);
 
     // The interrupt is refused while the provider turn keeps running. The
     // projection must keep reporting that turn live — a "failed" downgrade
@@ -2557,7 +2567,7 @@ describe("prompt, abort, permission, and question mutations", () => {
     await expect(adapter.abort("session", "cancel-1")).rejects.toThrow("interrupt refused");
     expect(adapter.projectionForTests("session").status).toBe("running");
 
-    expect((await adapter.prompt("session", "r3", "third")).held).toBe(true);
+    expect((await adapter.prompt("session", "r3", "third")).pending).toBe(true);
     await new Promise(resolve => setTimeout(resolve, 20));
     expect(provider.prompts).toHaveLength(1);
     expect((await adapter.history("session")).queued).toHaveLength(2);
@@ -2578,9 +2588,9 @@ describe("prompt, abort, permission, and question mutations", () => {
       expect(predicate()).toBe(true);
     };
 
-    expect((await adapter.prompt("session", "r1", "first")).held).toBe(false);
+    expect((await adapter.prompt("session", "r1", "first")).pending).toBe(false);
     const held = await adapter.prompt("session", "r2", "second");
-    expect(held.held).toBe(true);
+    expect(held.pending).toBe(true);
 
     let attempts = 0;
     const accept = provider.prompt.bind(provider);
@@ -2620,12 +2630,12 @@ describe("prompt, abort, permission, and question mutations", () => {
     ]);
     expect(first).toEqual(duplicate);
     expect(provider.prompts).toHaveLength(1);
-    expect(first.held).toBe(false);
+    expect(first.pending).toBe(false);
     expect(projection.status).toBe("running");
 
     // A busy submission is held by the workspace, not delivered mid-turn.
     const held = await adapter.prompt("session", "request-2", "follow-up");
-    expect(held.held).toBe(true);
+    expect(held.pending).toBe(true);
     expect(provider.prompts).toHaveLength(1);
 
     await Promise.all([adapter.abort("session", "cancel-1"), adapter.abort("session", "cancel-1")]);
@@ -4846,7 +4856,7 @@ describe("prompt attachments", () => {
     // The client claims image/png; the store sniffed webp. The store wins on
     // both the provider hand-off and the projected reference.
     const accepted = await adapter.prompt("session", "r1", "look at this", undefined, undefined, undefined, [ref("22222222-2222-4333-8444-555555555555", "actually.webp")]);
-    expect(accepted.held).toBe(false);
+    expect(accepted.pending).toBe(false);
     expect(provider.prompts[0]!.attachments).toEqual([{
       id: "22222222-2222-4333-8444-555555555555",
       name: "actually.webp",
@@ -4917,8 +4927,8 @@ describe("prompt attachments", () => {
     await Bun.sleep(5);
     expect(provider.prompts).toHaveLength(0);
     releaseListing();
-    expect((await first).held).toBe(false);
-    expect((await second).held).toBe(true);
+    expect((await first).pending).toBe(false);
+    expect((await second).pending).toBe(true);
     expect(provider.prompts).toHaveLength(1);
     expect(provider.prompts[0]!.text).toBe("/unknown focus");
   });
@@ -4947,7 +4957,7 @@ describe("prompt attachments", () => {
 
     await adapter.prompt("session", "r1", "first");
     const held = await adapter.prompt("session", "r2", "with image", undefined, undefined, undefined, [ref("11111111-2222-4333-8444-555555555555")]);
-    expect(held.held).toBe(true);
+    expect(held.pending).toBe(true);
     expect(provider.prompts).toHaveLength(1);
     expect((await adapter.history("session")).queued).toEqual([expect.objectContaining({
       id: held.messageId,
@@ -5012,7 +5022,7 @@ describe("image-only prompts reach the provider", () => {
       : null;
     const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g", resolveAttachment });
     const accepted = await adapter.prompt("session", "r1", "", undefined, undefined, undefined, [{ id: "11111111-2222-4333-8444-555555555555", name: "shot.png", mimeType: "image/png" }]);
-    expect(accepted.held).toBe(false);
+    expect(accepted.pending).toBe(false);
     expect(provider.prompts[0]).toEqual(expect.objectContaining({ text: "", attachments: [expect.objectContaining({ id: "11111111-2222-4333-8444-555555555555" })] }));
     await expect(adapter.prompt("session2", "r2", "")).rejects.toThrow("prompt must not be empty");
   });
@@ -5292,5 +5302,436 @@ describe("plan usage on demand", () => {
     settle[1]!({ report });
     expect(await click).toEqual({ report });
     expect(await another).toEqual({ report });
+  });
+});
+
+describe("steering (opencode-v2-steering)", () => {
+  // A fake shaped like the OpenCode 2.x agent: it declares steering and
+  // send-now, keeps an inbox the adapter can list and cancel, and announces
+  // inbox changes as the 2.x normalizer would — as `inbox` deltas.
+  function steering(options: { capabilities?: Array<"steering" | "send-now">; steerWithdrawTimeoutMs?: number } = {}) {
+    const provider = new FakeProvider();
+    provider.agent = { ...provider.agent, capabilities: [...provider.agent.capabilities, ...(options.capabilities ?? ["steering", "send-now"])] };
+    provider.sessions = [fixtureSession("session")];
+    // The agent's inbox lists what it was handed until it settles, as the
+    // real server does: a steer the adapter admits is listed at once.
+    provider.listPendingInbox = async () => provider.pendingInbox;
+    provider.cancelInbox = async (_sessionId, inboxId) => { provider.cancelledInbox.push(inboxId); };
+    const accept = provider.prompt.bind(provider);
+    provider.prompt = async (sessionId, input) => {
+      const accepted = await accept(sessionId, input);
+      if (input.delivery === "steer") provider.pendingInbox = [...provider.pendingInbox, { id: accepted.messageId, text: input.text, delivery: "steer", at: Date.now() }];
+      return accepted;
+    };
+    let n = 0;
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g", id: () => `id-${++n}`, coalesceWindowMs: 1, steerWithdrawTimeoutMs: options.steerWithdrawTimeoutMs ?? 60 });
+    const inbox = (delta: InboxDelta, eventType = `session.inbox.${delta.kind === "pending" ? "enqueued" : delta.kind === "delivery" ? "delivery.changed" : delta.outcome}`) => {
+      if (delta.kind === "settled") provider.pendingInbox = provider.pendingInbox.filter(entry => entry.id !== delta.id);
+      if (delta.kind === "pending" && delta.delivery === "steer" && !provider.pendingInbox.some(entry => entry.id === delta.id)) provider.pendingInbox = [...provider.pendingInbox, { id: delta.id, text: delta.text, delivery: "steer", at: delta.at }];
+      provider.eventQueue.push({ normalized: { conversationId: "session", updates: [{ kind: "inbox", delta }], outcome: "handled", eventType } });
+    };
+    const steer = (requestId: string, text: string) => adapter.prompt("session", requestId, text, undefined, undefined, undefined, undefined, "steer");
+    const queue = (requestId: string, text: string) => adapter.prompt("session", requestId, text, undefined, undefined, undefined, undefined, "queue");
+    const queued = async () => (await adapter.history("session")).queued ?? [];
+    return { provider, adapter, inbox, steer, queue, queued };
+  }
+  // The queue events a subscriber saw, as `kind:messageId`.
+  async function watchQueue(adapter: ChatAdapter): Promise<{ changes: string[]; stop: () => void }> {
+    const { events } = await adapter.subscribe("session");
+    const changes: string[] = [];
+    void (async () => { for await (const event of events) if (event.type === "conversation.queue") changes.push(`${event.change.kind}:${event.change.messageId}`); })();
+    return { changes, stop: () => events.cancel() };
+  }
+
+  test("a busy steer reaches the provider as a steer, counts as pending, and lists before held messages", async () => {
+    const { adapter, provider, steer, queue, queued } = steering();
+    const watch = await watchQueue(adapter);
+    adapter.projectionForTests("session").statusUpdate("running");
+    const held = await queue("r-q", "later");
+    const steered = await steer("r-s", "now");
+    expect(held).toEqual(expect.objectContaining({ pending: true, delivery: "queue" }));
+    expect(steered).toEqual(expect.objectContaining({ pending: true, delivery: "steer", messageId: "id-2" }));
+    expect(provider.prompts).toEqual([expect.objectContaining({ id: "id-2", text: "now", delivery: "steer" })]);
+    // No model or mode travels with a steer (D6): the session keeps its own.
+    expect(provider.prompts[0]!.model).toBeUndefined();
+    expect(provider.prompts[0]!.mode).toBeUndefined();
+    expect(await queued()).toEqual([
+      expect.objectContaining({ id: "id-2", text: "now", delivery: "steer", requestId: "r-s" }),
+      expect.objectContaining({ id: "id-1", text: "later", delivery: "queue", requestId: "r-q" }),
+    ]);
+    await waitUntil(() => watch.changes.length === 2);
+    expect(watch.changes).toEqual(["held:id-1", "steered:id-2"]);
+    watch.stop();
+    await adapter.dispose();
+  });
+
+  test("commands, skills, and reload are held whatever the delivery; so is a steer to an agent without steering, and an omitted delivery", async () => {
+    const { adapter, provider, steer } = steering();
+    provider.commands = [...provider.commands, { name: "reload", description: "Reload", argumentHint: "", kind: "command" as const }, { name: "pdf", description: "PDF", argumentHint: "", kind: "skill" as const }];
+    adapter.projectionForTests("session").statusUpdate("running");
+    for (const text of ["/review focus", "/pdf read it", "/reload"]) {
+      expect(await steer(`r-${text}`, text)).toEqual(expect.objectContaining({ pending: true, delivery: "queue" }));
+    }
+    expect(await adapter.prompt("session", "r-omitted", "no delivery named")).toEqual(expect.objectContaining({ pending: true, delivery: "queue" }));
+    expect(provider.prompts).toEqual([]);
+    expect(((await adapter.history("session")).queued ?? []).map(entry => entry.delivery)).toEqual(["queue", "queue", "queue", "queue"]);
+
+    const plain = steering({ capabilities: [] });
+    plain.adapter.projectionForTests("session").statusUpdate("running");
+    expect(await plain.steer("r-plain", "steer please")).toEqual(expect.objectContaining({ pending: true, delivery: "queue" }));
+    expect(plain.provider.prompts).toEqual([]);
+    await adapter.dispose();
+    await plain.adapter.dispose();
+  });
+
+  test("submitting while idle with nothing pending dispatches at once whatever the delivery", async () => {
+    const { adapter, provider, steer } = steering();
+    expect(await steer("r-idle", "go")).toEqual(expect.objectContaining({ pending: false, delivery: "queue" }));
+    expect(provider.prompts).toEqual([expect.objectContaining({ text: "go", delivery: "queue" })]);
+    await adapter.dispose();
+  });
+
+  test("inbox deltas keep the dock: another client's steer joins it, a delivery leaves it, and the snapshot lists steers first", async () => {
+    const { adapter, provider, inbox, queue, queued } = steering();
+    const pump = adapter.startEventPump();
+    const watch = await watchQueue(adapter);
+    adapter.projectionForTests("session").statusUpdate("running");
+    await queue("r-q", "held one");
+    inbox({ kind: "pending", id: "msg_other", text: "from the TUI", delivery: "steer", at: 5 });
+    await liveEventsApplied(adapter, provider);
+    expect(await queued()).toEqual([
+      expect.objectContaining({ id: "msg_other", text: "from the TUI", delivery: "steer" }),
+      expect.objectContaining({ id: "id-1", delivery: "queue" }),
+    ]);
+    // A natively queued entry or an internal one is not the dock's.
+    inbox({ kind: "pending", id: "msg_native", text: "native queue", delivery: "queue", at: 6 });
+    await liveEventsApplied(adapter, provider);
+    expect((await queued()).map(entry => entry.id)).toEqual(["msg_other", "id-1"]);
+    inbox({ kind: "settled", id: "msg_other", outcome: "delivered" });
+    await liveEventsApplied(adapter, provider);
+    expect((await queued()).map(entry => entry.id)).toEqual(["id-1"]);
+    await waitUntil(() => watch.changes.length === 3);
+    expect(watch.changes).toEqual(["held:id-1", "steered:msg_other", "delivered:msg_other"]);
+    watch.stop();
+    await adapter.stopEventPump();
+    await pump;
+    await adapter.dispose();
+  });
+
+  test("attach and reconnect replace the pending steers from the agent's own list", async () => {
+    const { adapter, provider, queued } = steering();
+    provider.pendingInbox = [{ id: "msg_listed", text: "raised while away", delivery: "steer", at: 7 }];
+    expect(await queued()).toEqual([expect.objectContaining({ id: "msg_listed", text: "raised while away", delivery: "steer" })]);
+    // The stream reconnecting re-reads the list: a steer delivered meanwhile
+    // leaves, one raised meanwhile joins.
+    provider.pendingInbox = [{ id: "msg_newer", text: "raised during the gap", delivery: "steer", at: 8 }];
+    const pump = adapter.startEventPump();
+    await waitUntil(() => provider.eventQueue.waiting);
+    await waitUntil(() => adapter.pendingSteersForTests("session").map(entry => entry.id).join() === "msg_newer");
+    // A failed list is unknown, not empty: the map stands.
+    provider.listPendingInbox = async () => { throw new Error("inbox unavailable"); };
+    expect((await queued()).map(entry => entry.id)).toEqual(["msg_newer"]);
+    await adapter.stopEventPump();
+    await pump;
+    await adapter.dispose();
+  });
+
+  test("the bound counts steers and held messages together, including steers raised elsewhere", async () => {
+    const { adapter, provider, inbox, steer, queue, queued } = steering();
+    const pump = adapter.startEventPump();
+    adapter.projectionForTests("session").statusUpdate("running");
+    for (let index = 1; index <= 9; index += 1) await steer(`s-${index}`, `steer ${index}`);
+    for (let index = 1; index <= 9; index += 1) await queue(`q-${index}`, `held ${index}`);
+    inbox({ kind: "pending", id: "msg_tui1", text: "tui 1", delivery: "steer", at: 1 });
+    inbox({ kind: "pending", id: "msg_tui2", text: "tui 2", delivery: "steer", at: 2 });
+    await liveEventsApplied(adapter, provider);
+    expect((await queued()).length).toBe(20);
+    await expect(steer("s-21", "one too many")).rejects.toBeInstanceOf(ChatQueueFullError);
+    await expect(queue("q-21", "one too many")).rejects.toBeInstanceOf(ChatQueueFullError);
+    expect((await queued()).length).toBe(20);
+    expect(provider.prompts).toHaveLength(9);
+    // Bytes count across both as well.
+    const bytes = steering();
+    bytes.adapter.projectionForTests("session").statusUpdate("running");
+    const large = "x".repeat(100 * 1024);
+    await bytes.steer("b-1", large);
+    await bytes.queue("b-2", large);
+    await expect(bytes.steer("b-3", large)).rejects.toBeInstanceOf(ChatQueueFullError);
+    await expect(bytes.queue("b-4", large)).rejects.toBeInstanceOf(ChatQueueFullError);
+    await adapter.stopEventPump();
+    await pump;
+    await adapter.dispose();
+    await bytes.adapter.dispose();
+  });
+
+  test("a steer enqueued before the conversation last went idle reads paused; a new steer or a wake resumes it", async () => {
+    const { adapter, provider, inbox, steer, queued } = steering();
+    const pump = adapter.startEventPump();
+    const watch = await watchQueue(adapter);
+    adapter.projectionForTests("session").statusUpdate("running");
+    const first = await steer("s-1", "steer one");
+    expect((await queued())[0]).not.toHaveProperty("paused");
+    // The turn ends without delivering it: stranded, and said so.
+    adapter.projectionForTests("session").statusUpdate("completed");
+    expect(await queued()).toEqual([expect.objectContaining({ id: first.messageId, paused: true })]);
+    await waitUntil(() => watch.changes.includes(`paused:${first.messageId}`));
+    // A new steer wakes the agent, which delivers every pending steer:
+    // nothing reads paused any more, and the wake is announced.
+    const second = await steer("s-2", "steer two");
+    expect(provider.prompts[1]).toEqual(expect.objectContaining({ id: second.messageId, delivery: "steer" }));
+    expect((await queued()).map(entry => entry.paused ?? false)).toEqual([false, false]);
+    await waitUntil(() => watch.changes.includes(`resumed:${first.messageId}`));
+    // Delivered together, oldest first.
+    inbox({ kind: "settled", id: first.messageId, outcome: "delivered" });
+    inbox({ kind: "settled", id: second.messageId, outcome: "delivered" });
+    await liveEventsApplied(adapter, provider);
+    expect(await queued()).toEqual([]);
+    watch.stop();
+    await adapter.stopEventPump();
+    await pump;
+    await adapter.dispose();
+  });
+
+  test("held messages read paused while delivery is paused: after a cancel, and behind a staged revert", async () => {
+    const fixture = steering();
+    const { adapter, queue, queued } = fixture;
+    const watch = await watchQueue(adapter);
+    expect((await adapter.prompt("session", "r-1", "start")).pending).toBe(false);
+    const held = await queue("r-2", "held");
+    expect((await queued())[0]).not.toHaveProperty("paused");
+    await adapter.abort("session", "cancel-1");
+    expect(await queued()).toEqual([expect.objectContaining({ id: held.messageId, paused: true })]);
+    await waitUntil(() => watch.changes.includes(`paused:${held.messageId}`));
+    // A new submission resumes the queue: the entry stops reading paused,
+    // and as the conversation is idle the head is delivered at once.
+    const { provider } = fixture;
+    await queue("r-3", "resume");
+    await waitUntil(() => watch.changes.includes(`resumed:${held.messageId}`));
+    await waitUntil(() => provider.prompts.length === 2);
+    expect(provider.prompts[1]).toEqual(expect.objectContaining({ id: held.messageId, delivery: "queue" }));
+    expect((await queued()).map(entry => entry.paused ?? false)).toEqual([false]);
+    watch.stop();
+    await adapter.dispose();
+  });
+
+  test("cancel interrupts without resuming: held messages go dormant, pending steers stay pending and paused, nothing delivers", async () => {
+    const { adapter, provider, steer, queue, queued } = steering();
+    expect((await adapter.prompt("session", "r-1", "start")).pending).toBe(false);
+    const held = await queue("r-2", "held");
+    const steered = await steer("r-3", "steered");
+    await adapter.abort("session", "cancel-1");
+    expect(provider.interruptOptions).toEqual([{ resume: false }]);
+    adapter.projectionForTests("session").statusUpdate("idle");
+    await Bun.sleep(20);
+    expect(provider.prompts).toHaveLength(2);
+    expect(await queued()).toEqual([
+      expect.objectContaining({ id: steered.messageId, delivery: "steer", paused: true }),
+      expect.objectContaining({ id: held.messageId, delivery: "queue", paused: true }),
+    ]);
+    await adapter.dispose();
+  });
+
+  test("a replacement under a staged revert goes out as a steer on a steering agent, and dispatches as before on one without", async () => {
+    for (const declares of [true, false]) {
+      const { adapter, provider, steer, queue, queued, inbox } = steering({ capabilities: declares ? ["steering", "send-now"] : [] });
+      const pump = adapter.startEventPump();
+      provider.agent = { ...provider.agent, capabilities: [...provider.agent.capabilities, "reversible-history"] };
+      let state: ReversibleHistoryState = { staged: false, canUndo: true, canRedo: false, revertedMessages: [] };
+      provider.getReversibleHistoryState = async () => state;
+      provider.undo = async () => { state = { staged: true, canUndo: false, canRedo: true, revertedMessages: [{ id: "message:old", text: "old" }] }; return { outcome: "changed", state }; };
+      provider.redo = async () => ({ outcome: "nothing-to-redo", state });
+      provider.revert = async () => ({ outcome: "changed", state });
+      provider.restore = async () => ({ outcome: "changed", state });
+      adapter.projectionForTests("session").statusUpdate("running");
+      const held = await queue("r-held", "held one");
+      const paused = declares ? await steer("r-steer", "steer one") : undefined;
+      await adapter.undo("session", "undo-1");
+      // Undo interrupted the turn: the held message waits, and so does the steer.
+      expect((await queued()).every(entry => entry.paused)).toBe(true);
+      const replacement = await adapter.prompt("session", "r-replace", "replacement");
+      if (declares) {
+        expect(replacement).toEqual(expect.objectContaining({ pending: true, delivery: "steer" }));
+        expect(provider.prompts.at(-1)).toEqual(expect.objectContaining({ text: "replacement", delivery: "steer" }));
+        // Held stays held; the paused steer stays, to be delivered with the
+        // replacement oldest first (the agent batches them on resume).
+        expect((await queued()).map(entry => entry.id)).toEqual([paused!.messageId, replacement.messageId, held.messageId]);
+        inbox({ kind: "settled", id: paused!.messageId, outcome: "delivered" });
+        inbox({ kind: "settled", id: replacement.messageId, outcome: "delivered" });
+        await liveEventsApplied(adapter, provider);
+        expect((await queued()).map(entry => entry.id)).toEqual([held.messageId]);
+      } else {
+        expect(replacement).toEqual(expect.objectContaining({ pending: false, delivery: "queue" }));
+        expect(provider.prompts.at(-1)).toEqual(expect.objectContaining({ text: "replacement", delivery: "queue" }));
+        expect((await queued()).map(entry => entry.id)).toEqual([held.messageId]);
+      }
+      await adapter.stopEventPump();
+      await pump;
+      await adapter.dispose();
+    }
+  });
+
+  test("withdrawing a steer waits for the agent's confirmation: cancelled removes it or holds it in submission order with the current configuration", async () => {
+    const { adapter, provider, inbox, steer, queue, queued } = steering();
+    const pump = adapter.startEventPump();
+    const watch = await watchQueue(adapter);
+    provider.configurations.set("session", { model: { providerId: "anthropic", modelId: "claude" }, mode: "build" });
+    adapter.projectionForTests("session").statusUpdate("running");
+    // Spaced by a clock tick each: submission order is by time, and three
+    // submissions in one millisecond would tie.
+    const older = await queue("q-1", "held first");
+    await Bun.sleep(2);
+    const steered = await steer("s-1", "steer me");
+    await Bun.sleep(2);
+    const newer = await queue("q-2", "held later");
+    // The agent confirms the withdrawal on its stream, not in the response.
+    const answerCancel = (id: string) => { provider.cancelInbox = async (_s, inboxId) => { provider.cancelledInbox.push(inboxId); setTimeout(() => inbox({ kind: "settled", id, outcome: "cancelled" }), 5); }; };
+    answerCancel(steered.messageId);
+    // Held again under a fresh id: the agent's inbox id named an entry it
+    // has now cancelled, and a later dispatch must not reuse it.
+    const switched = await adapter.changeDelivery("session", steered.messageId, "switch-1", "queue");
+    expect(switched).toEqual({ messageId: expect.not.stringMatching(steered.messageId), delivery: "queue" });
+    expect(provider.cancelledInbox).toEqual([steered.messageId]);
+    // Back in the held queue at its submission-order position, frozen to the
+    // session's configuration as it stands now.
+    expect((await queued()).map(entry => `${entry.id}:${entry.delivery}`)).toEqual([`${older.messageId}:queue`, `${switched.messageId}:queue`, `${newer.messageId}:queue`]);
+    adapter.projectionForTests("session").statusUpdate("completed");
+    await waitUntil(() => provider.prompts.length === 2);
+    expect(provider.prompts[1]).toEqual(expect.objectContaining({ id: older.messageId, delivery: "queue" }));
+    // Removing a steer goes the same way.
+    adapter.projectionForTests("session").statusUpdate("running");
+    const removable = await steer("s-2", "remove me");
+    answerCancel(removable.messageId);
+    await expect(adapter.removeQueued("session", removable.messageId, "remove-1")).resolves.toEqual({ removed: true });
+    expect((await queued()).map(entry => entry.id)).toEqual([switched.messageId, newer.messageId]);
+    await waitUntil(() => watch.changes.includes(`switched:${switched.messageId}`) && watch.changes.includes(`removed:${removable.messageId}`));
+    watch.stop();
+    await adapter.stopEventPump();
+    await pump;
+    await adapter.dispose();
+  });
+
+  test("a steer the agent delivers first cannot be withdrawn: already delivered, nothing held, nothing sent twice; retries apply once", async () => {
+    const { adapter, provider, inbox, steer, queued } = steering();
+    const pump = adapter.startEventPump();
+    adapter.projectionForTests("session").statusUpdate("running");
+    const steered = await steer("s-1", "too late");
+    provider.cancelInbox = async (_s, inboxId) => { provider.cancelledInbox.push(inboxId); setTimeout(() => inbox({ kind: "settled", id: steered.messageId, outcome: "delivered" }), 5); };
+    await expect(adapter.changeDelivery("session", steered.messageId, "switch-1", "queue")).rejects.toBeInstanceOf(SteerAlreadyDeliveredError);
+    expect(await queued()).toEqual([]);
+    expect(provider.prompts).toHaveLength(1);
+    // Delivered before the withdrawal was even asked for: still "already
+    // delivered", not merely "not held".
+    await expect(adapter.removeQueued("session", steered.messageId, "remove-1")).rejects.toBeInstanceOf(SteerAlreadyDeliveredError);
+    expect(provider.cancelledInbox).toEqual([steered.messageId]);
+    // A retry with the same request id replays, asking the agent nothing more.
+    const again = await steer("s-2", "again");
+    provider.cancelInbox = async (_s, inboxId) => { provider.cancelledInbox.push(inboxId); setTimeout(() => inbox({ kind: "settled", id: again.messageId, outcome: "cancelled" }), 5); };
+    await Promise.all([adapter.removeQueued("session", again.messageId, "remove-2"), adapter.removeQueued("session", again.messageId, "remove-2")]);
+    expect(provider.cancelledInbox).toEqual([steered.messageId, again.messageId]);
+    await adapter.stopEventPump();
+    await pump;
+    await adapter.dispose();
+  });
+
+  test("with no confirmation before the bounded wait, the outcome comes from the agent's list and history", async () => {
+    const { adapter, provider, steer, queued } = steering({ steerWithdrawTimeoutMs: 30 });
+    const pump = adapter.startEventPump();
+    adapter.projectionForTests("session").statusUpdate("running");
+    const silent = await steer("s-1", "no event");
+    // Absent from the list and present in history: delivered.
+    provider.pendingInbox = [];
+    provider.readMessages = async () => ({ items: [{ info: { id: silent.messageId, role: "user", sessionID: "session", time: { created: 1 } }, parts: [{ id: "p1", type: "text", text: "no event" }] }] });
+    await expect(adapter.removeQueued("session", silent.messageId, "remove-1")).rejects.toBeInstanceOf(SteerAlreadyDeliveredError);
+    expect(await queued()).toEqual([]);
+    // Absent from both: cancelled.
+    const gone = await steer("s-2", "vanished");
+    provider.pendingInbox = [];
+    provider.readMessages = async () => ({ items: [] });
+    await expect(adapter.removeQueued("session", gone.messageId, "remove-2")).resolves.toEqual({ removed: true });
+    // Still listed: the withdrawal did not take; the steer stays and the
+    // mutation says so rather than guessing.
+    const stuck = await steer("s-3", "stuck");
+    provider.pendingInbox = [{ id: stuck.messageId, text: "stuck", delivery: "steer", at: 1 }];
+    await expect(adapter.removeQueued("session", stuck.messageId, "remove-3")).rejects.toBeInstanceOf(SteerWithdrawalUnconfirmedError);
+    expect((await queued()).map(entry => entry.id)).toEqual([stuck.messageId]);
+    await adapter.stopEventPump();
+    await pump;
+    await adapter.dispose();
+  });
+
+  test("switching a held message to steer hands it to the agent with its attachments; a dormant queue stays dormant for the rest", async () => {
+    const { adapter, provider, queue, queued } = steering();
+    const watch = await watchQueue(adapter);
+    const stored = { id: "11111111-2222-4333-8444-555555555555", mimeType: "image/png", absolutePath: "/tmp/uatu/att.png" };
+    (adapter as unknown as { resolveAttachment: (id: string) => Promise<typeof stored | null> }).resolveAttachment = async id => id === stored.id ? stored : null;
+    expect((await adapter.prompt("session", "r-1", "start")).pending).toBe(false);
+    const first = await queue("q-1", "held first");
+    const second = await adapter.prompt("session", "q-2", "with image", undefined, undefined, undefined, [{ id: stored.id, name: "shot.png", mimeType: "image/png" }], "queue");
+    await adapter.abort("session", "cancel-1");
+    // Dormant. Switching the second to steer sends it now, with its image,
+    // under no frozen configuration; the first stays held and dormant.
+    const switched = await adapter.changeDelivery("session", second.messageId, "switch-1", "steer");
+    expect(switched).toEqual({ messageId: switched.messageId, delivery: "steer" });
+    expect(provider.prompts[1]).toEqual(expect.objectContaining({ text: "with image", delivery: "steer", attachments: [expect.objectContaining({ id: stored.id, absolutePath: "/tmp/uatu/att.png" })] }));
+    expect(provider.prompts[1]!.model).toBeUndefined();
+    expect((await queued()).map(entry => `${entry.id}:${entry.delivery}`)).toEqual([`${switched.messageId}:steer`, `${first.messageId}:queue`]);
+    expect((await queued())[1]).toEqual(expect.objectContaining({ paused: true }));
+    adapter.projectionForTests("session").statusUpdate("completed");
+    await Bun.sleep(20);
+    expect(provider.prompts).toHaveLength(2);
+    await waitUntil(() => watch.changes.includes(`switched:${switched.messageId}`));
+    // Send now on a steering agent is the same operation.
+    const third = await queue("q-3", "send me now");
+    const sent = await adapter.sendNow("session", third.messageId, "send-1");
+    expect(sent).toEqual({ messageId: sent.messageId, delivery: "steer" });
+    expect(provider.prompts.at(-1)).toEqual(expect.objectContaining({ text: "send me now", delivery: "steer" }));
+    // A command is refused a switch to steer.
+    adapter.projectionForTests("session").statusUpdate("running");
+    const command = await queue("q-4", "/review all");
+    await expect(adapter.changeDelivery("session", command.messageId, "switch-2", "steer")).rejects.toBeInstanceOf(CommandSteeringError);
+    await expect(adapter.sendNow("session", command.messageId, "send-2")).rejects.toBeInstanceOf(CommandSteeringError);
+    watch.stop();
+    await adapter.dispose();
+  });
+
+  test("send now on a paused steer wakes the agent with resume; on a running one it is refused", async () => {
+    const { adapter, provider, steer, queued } = steering();
+    expect((await adapter.prompt("session", "r-1", "start")).pending).toBe(false);
+    const steered = await steer("s-1", "steer me");
+    await expect(adapter.sendNow("session", steered.messageId, "send-0")).rejects.toBeInstanceOf(SendNowUnavailableError);
+    await adapter.abort("session", "cancel-1");
+    expect((await queued())[0]).toEqual(expect.objectContaining({ id: steered.messageId, paused: true }));
+    await expect(adapter.sendNow("session", steered.messageId, "send-1")).resolves.toEqual({ messageId: steered.messageId, delivery: "steer" });
+    expect(provider.interruptOptions).toEqual([{ resume: false }, { resume: true }]);
+    expect((await queued())[0]).not.toHaveProperty("paused");
+    await adapter.dispose();
+  });
+
+  test("send now without steering (Claude-shaped) is refused while a turn runs, and otherwise dispatches that message under its frozen configuration", async () => {
+    const { adapter, provider, queue, queued } = steering({ capabilities: ["send-now"] });
+    const watch = await watchQueue(adapter);
+    provider.models = [...provider.models, { selection: { providerId: "anthropic", modelId: "haiku" }, provider: "Anthropic", name: "Haiku" }];
+    expect((await adapter.prompt("session", "r-1", "start")).pending).toBe(false);
+    const first = await queue("q-1", "held first");
+    const second = await adapter.prompt("session", "q-2", "send me", { providerId: "anthropic", modelId: "haiku" }, undefined, undefined, undefined, "queue");
+    await expect(adapter.sendNow("session", second.messageId, "send-0")).rejects.toBeInstanceOf(SendNowUnavailableError);
+    await adapter.abort("session", "cancel-1");
+    await expect(adapter.sendNow("session", second.messageId, "send-1")).resolves.toEqual({ messageId: second.messageId, delivery: "queue" });
+    expect(provider.prompts[1]).toEqual(expect.objectContaining({ id: second.messageId, text: "send me", delivery: "queue", model: { providerId: "anthropic", modelId: "haiku" } }));
+    expect((await queued()).map(entry => entry.id)).toEqual([first.messageId]);
+    await waitUntil(() => watch.changes.includes(`delivered:${second.messageId}`));
+    // The rest stay dormant: the turn ending delivers nothing by itself.
+    adapter.projectionForTests("session").statusUpdate("completed");
+    await Bun.sleep(20);
+    expect(provider.prompts).toHaveLength(2);
+    // Without send-now, or steering, the operations are refused outright.
+    const plain = steering({ capabilities: [] });
+    plain.adapter.projectionForTests("session").statusUpdate("running");
+    const held = await plain.queue("q-1", "held");
+    await expect(plain.adapter.sendNow("session", held.messageId, "send-1")).rejects.toBeInstanceOf(SendNowUnsupportedError);
+    await expect(plain.adapter.changeDelivery("session", held.messageId, "switch-1", "steer")).rejects.toBeInstanceOf(SteeringUnsupportedError);
+    watch.stop();
+    await adapter.dispose();
+    await plain.adapter.dispose();
   });
 });

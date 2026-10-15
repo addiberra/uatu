@@ -5,7 +5,7 @@ import { ConversationInventoryBroadcaster } from "./inventory-broadcaster";
 import { ReplaySubscription } from "./replay";
 import type { WorkspaceChatService } from "./service";
 import { ConversationNotFoundError } from "./workspace";
-import type { ChatActivity, ChatAvailability, ChatEvent, ConversationSnapshot, ConversationSummary, UsageReadMode } from "./types";
+import type { ChatActivity, ChatAvailability, ChatEvent, ConversationSnapshot, ConversationSummary, MessageDelivery, UsageReadMode } from "./types";
 
 function summary(id: string, updatedAt = 1): ConversationSummary {
   return { id, title: `Conversation ${id}`, createdAt: updatedAt, updatedAt, status: "idle" };
@@ -51,12 +51,15 @@ class StubAgentService implements WorkspaceChatService {
   async prompt(id: string, requestId: string, text: string) {
     return this.record("prompt", [id, requestId, text], {
       messageId: "msg-1",
-      held: false,
+      pending: false,
+      delivery: "queue" as const,
       configuration: {},
       conversation: summary(id),
     });
   }
   async removeQueued(id: string, messageId: string) { return this.record("removeQueued", [id, messageId], { removed: true as const }); }
+  async changeDelivery(id: string, messageId: string, _requestId: string, delivery: MessageDelivery) { return this.record("changeDelivery", [id, messageId, delivery], { messageId, delivery }); }
+  async sendNow(id: string, messageId: string) { return this.record("sendNow", [id, messageId], { messageId, delivery: "queue" as const }); }
   async saveAttachment(): Promise<{ id: string; mimeType: string; sizeBytes: number }> { throw new Error("unused: the router owns the store"); }
   async resolveAttachment(): Promise<null> { throw new Error("unused: the router owns the store"); }
   async renameConversation(id: string, _requestId: string, title: string) {
