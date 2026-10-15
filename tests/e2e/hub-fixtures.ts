@@ -47,6 +47,7 @@ type TestFixtures = {
 // `test.use({ hubWorkspaces: ["alpha", "beta"] })`. Names must be
 // slug-shaped ([a-z0-9-]): they are the workspace ids.
 type WorkerOptions = {
+  hubMobileFlows: boolean;
   hubWorkspaces: string[];
   hubWorktrees: boolean;
   // Serve the credential API (token credentials) — see hub-server.ts.
@@ -58,6 +59,7 @@ type WorkerOptions = {
 };
 
 export const test = base.extend<TestFixtures, WorkerFixtures & WorkerOptions>({
+  hubMobileFlows: [false, { option: true, scope: "worker" }],
   hubWorkspaces: [["alpha"], { option: true, scope: "worker" }],
   hubWorktrees: [false, { option: true, scope: "worker" }],
   hubCredentials: [false, { option: true, scope: "worker" }],
@@ -65,7 +67,7 @@ export const test = base.extend<TestFixtures, WorkerFixtures & WorkerOptions>({
   hubAgentAccounts: [false, { option: true, scope: "worker" }],
 
   hubProcess: [
-    async ({ hubWorkspaces, hubWorktrees, hubCredentials, hubPush, hubAgentAccounts }, use, workerInfo) => {
+    async ({ hubWorkspaces, hubWorktrees, hubCredentials, hubPush, hubAgentAccounts, hubMobileFlows }, use, workerInfo) => {
       const { hubPort, end } = hubPortBlock(workerInfo.parallelIndex);
       if (hubWorkspaces.length >= HUB_PORTS_PER_WORKER) {
         throw new Error(`a hub worker serves at most ${HUB_PORTS_PER_WORKER - 1} workspaces`);
@@ -82,6 +84,7 @@ export const test = base.extend<TestFixtures, WorkerFixtures & WorkerOptions>({
           UATU_E2E_HUB_CREDENTIALS: hubCredentials ? "1" : "0",
           UATU_E2E_HUB_AGENT_ACCOUNTS: hubAgentAccounts ? "1" : "0",
           UATU_E2E_HUB_PUSH: hubPush ? "1" : "0",
+          UATU_E2E_HUB_MOBILE_FLOWS: hubMobileFlows ? "1" : "0",
           UATU_E2E_EXIT_ON_STDIN_CLOSE: "1",
         },
         // stdin carries the per-test reset command; its close (this worker

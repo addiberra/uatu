@@ -91,6 +91,12 @@ import { waitForPortsFree } from "./ports";
 import { createFakeAgentAccounts } from "./agent-accounts-fake";
 import { AgentAccountService, type AgentAccountsApi } from "../../src/hub/agent-account-service";
 import { createAccountChangeNotifier } from "../../src/hub/agent-account-propagation";
+import { HubPreferencesStore } from "../../src/hub/preferences";
+import { FolderManager } from "../../src/hub/folder-manager";
+import { createWorktreeRenameGuard } from "../../src/hub/worktree-rename-guard";
+import { CloneJobManager } from "../../src/hub/clone-jobs";
+import { CloneAttemptStore } from "../../src/hub/clone-attempts";
+import { mobileCloneProcess } from "./mobile-clone-fake";
 
 export const HUB_E2E_USER = { name: "e2e", password: "e2e-hub-password" };
 export const HUB_E2E_READY_PREFIX = "uatu-e2e-hub ";
@@ -138,6 +144,7 @@ const WORKTREES = process.env.UATU_E2E_HUB_WORKTREES === "1";
 const CREDENTIALS = process.env.UATU_E2E_HUB_CREDENTIALS === "1";
 const PUSH = process.env.UATU_E2E_HUB_PUSH === "1";
 const AGENT_ACCOUNTS = process.env.UATU_E2E_HUB_AGENT_ACCOUNTS === "1";
+const MOBILE_FLOWS = process.env.UATU_E2E_HUB_MOBILE_FLOWS === "1";
 const EXIT_ON_STDIN_CLOSE = process.env.UATU_E2E_EXIT_ON_STDIN_CLOSE === "1";
 const PRESENCE_GRACE_MS = Number.parseInt(process.env.UATU_E2E_HUB_PRESENCE_GRACE_MS ?? "1500", 10);
 
@@ -417,7 +424,12 @@ const accountsControl = fakeAccounts ? Bun.serve({
   },
 }) : null;
 
+const preferences = new HubPreferencesStore(path.join(tempRoot, "preferences.json"), () => path.join(tempRoot, "workspaces"));
+await preferences.load();
+const folders = new FolderManager({ journalPath: path.join(tempRoot, "folder-mutations.json"), registry, sessions, personalState, credentials, reservations, worktreeDependencies: createWorktreeRenameGuard({ env: { PATH: process.env.PATH, HOME: tempRoot, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" } }) });
+const cloneJobs = MOBILE_FLOWS ? new CloneJobManager({ processFactory: mobileCloneProcess, registry, sessions, reservations, onboarding: { configureCloned: options => onboarding.configureCloned(options), removeWorkspaceAssignments: id => credentials.removeWorkspaceAssignments(id) }, personalState }) : undefined;
 const server = startHubServer({ config, registry, sessions, sessionStore, personalState, notifications,
+  ...(MOBILE_FLOWS ? { preferences, folders, onboarding, cloneJobs, cloneAttempts: new CloneAttemptStore(path.join(tempRoot, "clone-attempts"), (owner, id) => cloneJobs!.has(owner, id)) } : {}),
   ...(agentAccounts ? { agentAccounts } : {}),
   ...(PUSH ? { presenceGraceMs: PRESENCE_GRACE_MS } : {}),
   ...(WORKTREES ? { onboarding, worktrees: worktreesService,
@@ -497,6 +509,7 @@ const shutdown = async () => {
   server.worktreeReconciler?.dispose();
   server.live.endAll();
   server.liveBroker.dispose();
+  await server.cloneJobs.close();
   await sessions.stopAll().catch(() => undefined);
   await credentialTools?.shutdown().catch(() => undefined);
   // Children stopped outside the manager (a test's /stop) are gone already;

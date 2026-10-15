@@ -6,13 +6,18 @@ export function createLiveLifecycle(transport: LiveTransport, reads: Pick<Mobile
   return {
     async startWorkspace(intent): Promise<OperationResult<StartWorkspaceResult>> {
       const generation = transport.generation();
+      const workspaceGeneration = transport.workspaceGeneration(intent.workspaceId);
+      const current = () => generation === transport.generation() && workspaceGeneration === transport.workspaceGeneration(intent.workspaceId);
+      const changed = (): OperationResult<StartWorkspaceResult> => ({ status: "rejected", problem: { kind: "conflict", message: "Hub state changed before Start. Review its current state." } });
       const workspace = await reads.readWorkspace(intent.workspaceId);
+      if (!current()) return changed();
       if (workspace.status === "unavailable") return { status: "rejected", problem: workspace.problem };
       if (workspace.value.availability) return { status: "rejected", problem: { kind: "conflict", message: "This checkout is missing or replaced. Inspect its worktree inventory before starting it." } };
       if (workspace.value.runtime.status === "running") return { status: "completed", value: { status: "running", workspaceId: intent.workspaceId } };
       if (!workspace.value.assignments.length && intent.unassigned !== "confirmed-without-credentials") return { status: "completed", value: { status: "confirm-unassigned", workspaceId: intent.workspaceId } };
       if (workspace.value.assignments.length) {
         const catalog = await reads.readCredentials();
+        if (!current()) return changed();
         if (catalog.status === "unavailable") return { status: "rejected", problem: catalog.problem };
         const locked: KeyTarget[] = [];
         for (const id of new Set(workspace.value.assignments.map(row => row.credentialId))) {
@@ -22,7 +27,7 @@ export function createLiveLifecycle(transport: LiveTransport, reads: Pick<Mobile
         }
         if (locked.length) return { status: "completed", value: { status: "requires-unlock", credentials: locked as [KeyTarget, ...KeyTarget[]] } };
       }
-      if (generation !== transport.generation()) return { status: "rejected", problem: { kind: "conflict", message: "Hub state changed before Start. Review its current state." } };
+      if (!current()) return changed();
       return transport.request(`/api/hub/sessions/${encodeURIComponent(intent.workspaceId)}/start`, value => {
         const row = object(value);
         if (row.id !== intent.workspaceId || row.running !== true) throw new Error("Invalid start result");

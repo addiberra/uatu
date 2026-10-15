@@ -2,6 +2,7 @@ import { captureTerminalToken, waitForWorkspaceCredential } from "./terminal/cli
 import { initHubNav } from "./shell/hub-nav";
 import { injectPwaLinks, unregisterLegacyServiceWorkers } from "./shell/pwa";
 import { mountNotifications } from "./pwa/notification-client.js";
+import { mobileCoordinatorInstalled } from "./hub/mobile/coordinator-context";
 import { hubUrl, isHubPage, workspaceIdFromBasePath, appBasePath } from "./shared/app-url";
 import { attachPopstateHandler } from "./shell/history";
 import { loadInitialState } from "./shell/boot";
@@ -131,7 +132,7 @@ injectPwaLinks();
 // Boot does not wait for cleanup. Notification enrollment awaits cleanup
 // before registering the current push worker.
 unregisterLegacyServiceWorkers();
-if (isHubPage()) mountNotifications({
+if (isHubPage() && !mobileCoordinatorInstalled()) mountNotifications({
   apiUrl: hubUrl("/api/hub/notifications"), stateUrl: hubUrl("/api/hub/state"), workerUrl: hubUrl("/push-worker.js"),
   workspaceId: workspaceIdFromBasePath(appBasePath()), hosts: ".sidebar-notifications-row, .sidebar-rail", beforeRegister: unregisterLegacyServiceWorkers,
 });

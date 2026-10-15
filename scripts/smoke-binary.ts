@@ -462,6 +462,32 @@ try {
     } else {
       pass("dashboard opens the Register worktree list with no page errors");
     }
+
+    // Exercise BOTH compiled HTML bundles. Dev HTMLRoute bundling alone cannot
+    // prove the Hub template's emitted chunk URLs survive single-file compile.
+    const phone = await browser.newContext({ hasTouch: true, isMobile: true, viewport: { width: 390, height: 844 } });
+    await phone.addCookies([{ name: cookieName, value: cookieValue, url: BASE }]);
+    const mobile = await phone.newPage(); const mobileErrors: string[] = [];
+    mobile.on("pageerror", error => mobileErrors.push(error.message));
+    await mobile.goto(`${BASE}/`, { waitUntil: "load", timeout: 10_000 });
+    await expect(mobile.locator("#mobile-hub-root h1")).toHaveText("Workspaces");
+    await expect(mobile.locator(".mh-dock .mh-tab")).toHaveCount(2);
+    await expect(mobile.locator("body > main, #mobile-workspace-root")).toHaveCount(0);
+    await expect.poll(() => mobile.locator(".mh-brand img").evaluate(image => (image as HTMLImageElement).naturalWidth)).toBeGreaterThan(0);
+    await mobile.goto(SESSION, { waitUntil: "load", timeout: 10_000 });
+    await expect(mobile.locator("#connection-state .connection-label")).toHaveText("Connected");
+    await mobile.evaluate(() => { (window as unknown as { retainedSmokeRoot: Element | null }).retainedSmokeRoot = document.querySelector(".app-shell"); });
+    if (await mobile.locator("#navigation-handle").isVisible()) await mobile.locator("#navigation-handle").click();
+    await mobile.locator("#navigation-hub").click();
+    await mobile.locator('[data-action="settings"]').click();
+    await mobile.locator('[data-action="preview-side"]').click();
+    await mobile.getByRole("button", { name: "Cancel", exact: true }).click();
+    await mobile.locator('[data-action="return"]').click();
+    await expect(mobile.locator("html")).toHaveAttribute("data-workspace-foreground", "true");
+    if (!await mobile.evaluate(() => (window as unknown as { retainedSmokeRoot: Element | null }).retainedSmokeRoot === document.querySelector(".app-shell"))) fail("compiled phone Return replaced the workspace root");
+    else if (mobileErrors.length) fail(`compiled phone pageerror(s): ${mobileErrors.join(" | ")}`);
+    else pass("compiled phone Hub/assets and same-document Settings/Return work without page errors");
+    await phone.close();
   } finally {
     await browser.close();
   }

@@ -2,6 +2,37 @@
 
 ## Current live integration plan — 2026-10-15
 
+### Production-entry implementation (candidate source, not deployed)
+
+The later implementation supersedes the planned gaps in the table below:
+`workspace-entry.ts` chooses the existing standalone/desktop app by default,
+and eligible Hub touch workspaces install `mobile/live-entry.ts` before the
+single app import. The authenticated Hub documents use a bundled product entry;
+their desktop controller is gated only for the selected phone presentation.
+Direct phone Hub entry has no resident workspace or broker stream. Canonical Open
+enters a workspace document; ordinary same-workspace detours then retain its root.
+The reviewer still replaces only the workspace entry with its fail-closed test
+transport; no review controller, globals or xterm instrumentation ships.
+
+`live-entry.ts` reuses `shell/live.ts` and its fixed workspace namespace, recovery,
+Hub-auth and session-running signals. A stream drop requests an authenticated
+read; only an authoritative Stop/removal/401 invalidates retained access. The
+transport now distinguishes authentication and per-workspace generations so a
+dependent Stop cannot discard the same command's eventual catalog result.
+Start preparation is independently fenced by its target's workspace generation.
+Phone Notifications has one inline enrollment owner; the desktop dialog is not
+also mounted inside a retained workspace. All named live adapters, including
+Agent accounts and worktrees, are connected rather than stubbed.
+
+No new wire fields were needed for this assembly: published Hub/workspace
+revisions remain **14/24**. The internal non-secret HTMLBundle template and logo
+are static assets, not authenticated data APIs. Template extraction self-fetches
+only the configured server listener with a bounded timeout and no credentials;
+its TLS exception is confined to that self-fetch, never browser/API traffic.
+Running live 4717/8445 and synthetic 4718/8446 services remain unchanged. Final
+cross-suite evidence, historical failures and release/acceptance obligations are
+tracked separately; source implementation is not task 23.2 deployment approval.
+
 ### Task 18.1 implementation update
 
 The lead confirms renewed independent approval after both correction rounds.

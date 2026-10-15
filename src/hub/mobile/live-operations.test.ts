@@ -95,6 +95,30 @@ test("delayed key file read cannot submit into a different authentication genera
   expect((await pending).status).toBe("rejected"); expect(calls).toBe(0);
 });
 
+test("workspace stop facts do not discard an owned coordinated catalog mutation result", async () => {
+  let release!: (response: Response) => void;
+  const transport = createLiveTransport({ fetch: () => new Promise(resolve => { release = resolve; }) });
+  const pending = transport.request("/api/hub/credentials/fixture/disable", input => input, {});
+  transport.workspaceChanged("dependent", "stopped");
+  release(Response.json({ enabled: false }));
+  expect(await pending).toEqual({ status: "completed", value: { enabled: false } });
+});
+
+test("workspace generation fences a Start still preparing its authoritative read", async () => {
+  let release!: (response: Response) => void, starts = 0;
+  const transport = createLiveTransport({ fetch: async route => {
+    if (route.endsWith("/start")) { starts++; return Response.json({ id: "child", running: true }); }
+    if (route.endsWith("/credentials")) return Response.json({ credentials: [] });
+    return new Promise(resolve => { release = resolve; });
+  } });
+  const reads = createLiveWorkspaceReads(transport), credentials = createLiveCredentials(transport, reads);
+  const lifecycle = createLiveLifecycle(transport, { ...reads, ...credentials });
+  const pending = lifecycle.startWorkspace({ workspaceId: "child", unassigned: "confirmed-without-credentials" });
+  transport.workspaceChanged("child", "stopped");
+  release(Response.json({ version: "test", hubApiRevision: 14, workspaceApiRevision: 24, workspaces: [workspace("child")] }));
+  expect((await pending).status).not.toBe("completed"); expect(starts).toBe(0);
+});
+
 test("malformed or wrong-identity mutation results are indeterminate, not success", async () => {
   const transport = createLiveTransport({ fetch: async () => Response.json({ credential: credential("other") }) });
   const credentials = createLiveCredentials(transport, createLiveWorkspaceReads(transport));

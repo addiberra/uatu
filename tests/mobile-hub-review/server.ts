@@ -20,7 +20,7 @@ export type ReviewAssets = ReadonlyMap<string, ApprovedAsset>;
  * copied workspace markup, repository static directory or request-derived reads. */
 export async function buildWorkspaceAssets(): Promise<ReviewAssets> {
   const result = await Bun.build({ entrypoints: [new URL("../../src/index.html", import.meta.url).pathname], target: "browser", minify: false, sourcemap: "none", plugins: [{ name: "mobile-review-entry", setup(build) {
-    build.onResolve({ filter: /app\.ts$/ }, args => args.importer.endsWith("index.html") ? { path: new URL("./browser-entry.ts", import.meta.url).pathname } : undefined);
+    build.onResolve({ filter: /workspace-entry\.ts$/ }, args => args.importer.endsWith("index.html") ? { path: new URL("./browser-entry.ts", import.meta.url).pathname } : undefined);
   } }], define: { __UATU_BUILD__: JSON.stringify({ version: "review", branch: "synthetic", commitSha: "0000000", commitShort: "0000000", buildTime: "2026-07-02T00:00:00Z", release: false }) } });
   if (!result.success) throw new AggregateError(result.logs, "Review frontend build failed");
   const assets = new Map<string, ApprovedAsset>();

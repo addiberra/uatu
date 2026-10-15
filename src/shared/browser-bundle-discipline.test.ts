@@ -4,7 +4,7 @@
 // script fails to load, and the page never leaves "Connecting". The e2e
 // server's bundler stubs such imports instead, so only the compiled-binary
 // smoke test would notice. This walks the page's static import graph from its
-// entry (src/index.html loads src/app.ts) and fails on any reachable module
+// entries (workspace and Hub) and fails on any reachable module
 // that imports a Node built-in. Type-only imports are erased and allowed; a
 // module that needs Node at run time looks it up where the runtime has it
 // (see shared/version.ts).
@@ -14,7 +14,7 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 
 const SRC_ROOT = path.resolve(import.meta.dir, "..");
-const ENTRY = path.join(SRC_ROOT, "app.ts");
+const ENTRIES = ["workspace-entry.ts", "hub/mobile/document-entry.ts"].map(entry => path.join(SRC_ROOT, entry));
 
 const IMPORT = /(?:^|\n)\s*(import|export)\s+(type\s+)?(?:[^'";]*?\sfrom\s+)?["']([^"']+)["']/g;
 // `typeof import("…")` is a type position and erased; only value imports count.
@@ -41,11 +41,13 @@ function resolveLocal(from: string, specifier: string): string | null {
 test("no module reachable from the page's entry imports a Node built-in", () => {
   const seen = new Set<string>();
   const offenders: string[] = [];
-  const queue = [ENTRY];
+  const queue = [...ENTRIES];
   while (queue.length > 0) {
     const file = queue.pop()!;
     if (seen.has(file)) continue;
     seen.add(file);
+    if (file !== path.resolve(SRC_ROOT, "../package.json")) expect(path.relative(SRC_ROOT, file)).not.toMatch(/^\.\./);
+    expect(file).not.toMatch(/(?:fixture|scenario|review\/backend|review\/transport)/);
     if (!/\.(ts|tsx|js|mjs)$/.test(file)) continue;
     const source = readFileSync(file, "utf8");
     const specifiers: { specifier: string; typeOnly: boolean }[] = [];

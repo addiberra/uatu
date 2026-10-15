@@ -168,6 +168,15 @@ uatu hub
 
 Sign in and choose **Add Folder** to pick any folder on the machine, or clone
 a repository into one. Each folder becomes a workspace with a stable URL.
+On phones, use **Add Workspace** on the Hub. **Settings** groups repository
+Credentials, separate machine-wide Agent accounts, Notifications and Session
+Security. Worktree actions are available through a workspace's information menu.
+
+In touch mode, ordinary trips from a workspace to Hub/Settings and **Return**
+keep that one workspace's live browser clients, surface and unfinished work in
+the same document. Opening another workspace, reloading, signing out, revocation
+or Stop are separate lifetime boundaries; browser termination cannot preserve
+memory-only drafts or uploads. Desktop and standalone navigation stay unchanged.
 
 ```text
 uatu hub [--config <PATH>] [--port <PORT>] [--exit-on-stdin-close]
@@ -194,8 +203,9 @@ instead.
 ## Web notifications
 
 The hub can send Web Push notifications when an agent asks a question, requests
-permission, or successfully finishes a turn. Open **Notifications** in the hub
-navigation or workspace sidebar to choose workspaces and event categories for
+permission, or successfully finishes a turn. Open **Settings → Notifications**
+on a phone, or **Notifications** in desktop Hub navigation/workspace sidebar,
+to choose workspaces and event categories for
 that browser or installed app. Tick **All workspaces** to cover every workspace
 on the hub, including ones registered later, or pick workspaces one by one;
 turning All workspaces off brings back the workspaces you had picked.

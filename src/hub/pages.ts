@@ -445,7 +445,7 @@ function authenticatedChrome(current: AuthenticatedPage): string {
   ${link("settings", "/settings", "Settings")}
 </nav><script type="module">
 import { mountNotifications } from "/hub-assets/notifications.js";
-mountNotifications({ apiUrl: "/api/hub/notifications", stateUrl: "/api/hub/state", workerUrl: "/push-worker.js", hosts: ".hub-nav, .hub-mobile-nav" });
+if (document.documentElement.dataset.mobileHub !== "true") mountNotifications({ apiUrl: "/api/hub/notifications", stateUrl: "/api/hub/state", workerUrl: "/push-worker.js", hosts: ".hub-nav, .hub-mobile-nav" });
 </script>`;
 }
 
@@ -740,6 +740,7 @@ function authenticatedPage(pageName: AuthenticatedPage, authenticatedUser: strin
 ${content}
 </div>
 <script>
+if (document.documentElement.dataset.mobileHub !== "true") {
 ${worktreeDialogScript}
 const renderDashboardGroups = (${createDashboardGroups.toString()})();
 const dashboardGroupsStyle = document.createElement("style");
@@ -3061,6 +3062,7 @@ if (pageMode === "dashboard") {
   initSettingsPage();
 } else if (pageMode === "clone") {
   initClonePage();
+}
 }
 </script>`,
   );

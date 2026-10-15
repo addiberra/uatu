@@ -12,10 +12,15 @@ import { createLiveWorktrees } from "./live-worktrees";
 /** Browser-only assembly. The caller owns mounting, stream invalidation and
  * eligibility; no fixtures, personal configuration or independent polling. */
 export function createLiveBackend(options: Parameters<typeof createLiveTransport>[0] = {}): MobileHubBackend {
+  return createLiveBackendRuntime(options).backend;
+}
+
+/** Assembly controls stay with the host, outside the view's operation port. */
+export function createLiveBackendRuntime(options: Parameters<typeof createLiveTransport>[0] = {}) {
   const transport = createLiveTransport(options);
   const workspaces = createLiveWorkspaceReads(transport);
   const credentials = createLiveCredentials(transport, workspaces);
-  return {
+  const backend: MobileHubBackend = {
     worktrees: createLiveWorktrees(transport),
     agentAccounts: createLiveAgentAccounts(transport),
     ...createLiveAuthentication(transport), ...workspaces, ...credentials,
@@ -23,4 +28,5 @@ export function createLiveBackend(options: Parameters<typeof createLiveTransport
     ...createLiveOnboarding(transport), ...createLiveClone(transport, credentials, options),
     subscribeInvalidation: transport.subscribeInvalidation,
   };
+  return { backend, transport };
 }

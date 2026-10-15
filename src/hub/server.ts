@@ -73,6 +73,9 @@ import type { ActivityMarkSink } from "./activity-marks";
 import type { SessionManager } from "./sessions";
 import { PAGE_ORIGIN_HEADER } from "../terminal/auth";
 import type { TerminalSessionInfo } from "../terminal/server";
+import mobileDocument from "./mobile/document.html";
+import hubLogoAsset from "../assets/uatu-logo.svg" with { type: "file" };
+import { mobileBundleUrl, mobileHubAssets, withMobileHubBootstrap } from "./mobile/document";
 import { MetricsRegistry } from "../debug/metrics";
 import { LIVE_STREAM_PATH } from "../shared/live-protocol";
 import type { HubApiCompatibility } from "../shared/types";
@@ -84,6 +87,8 @@ import {
 } from "../shared/version";
 
 export type HubDeps = {
+  /** Host-owned bundled asset provider; handler-only assemblies keep defaults. */
+  mobileAssets?: () => Promise<string>;
   config: HubConfig;
   registry: WorkspaceRegistry;
   sessions: SessionManager;
@@ -1448,6 +1453,7 @@ export function createHubFetchHandler(deps: HubDeps) {
         headers: { "content-type": "application/javascript; charset=utf-8", "cache-control": "no-cache", "service-worker-allowed": "/" },
       });
     }
+    if (pathname === "/hub-assets/logo.svg") return new Response(Bun.file(hubLogoAsset), { headers: { "content-type": "image/svg+xml", "cache-control": "no-cache" } });
     if (pathname === "/login") {
       return handleLogin(request, server);
     }
@@ -1714,13 +1720,16 @@ export function createHubFetchHandler(deps: HubDeps) {
 
     // Dashboard + its APIs.
     if (pathname === "/" && request.method === "GET") {
-      return htmlResponse(dashboardPage(session.user));
+      const page = dashboardPage(session.user);
+      return htmlResponse(deps.mobileAssets ? withMobileHubBootstrap(page, await deps.mobileAssets()) : page);
     }
     if (pathname === "/clone" && request.method === "GET") {
-      return htmlResponse(clonePage(session.user));
+      const page = clonePage(session.user);
+      return htmlResponse(deps.mobileAssets ? withMobileHubBootstrap(page, await deps.mobileAssets()) : page);
     }
     if (pathname === "/settings" && request.method === "GET") {
-      return htmlResponse(settingsPage(session.user));
+      const page = settingsPage(session.user);
+      return htmlResponse(deps.mobileAssets ? withMobileHubBootstrap(page, await deps.mobileAssets()) : page);
     }
     // The published JSON worktree family, behind the same gate as the
     // dashboard. A cookie transport keeps the same-origin rule on every
@@ -2156,12 +2165,21 @@ export function startHubServer(deps: HubDeps) {
   // Pushes wait while the user has a visible session page (src/hub/presence.ts).
   deps.notifications?.usePresence(liveBroker);
   const worktreeReconciler = assembleWorktreeReconciler(deps, liveBroker);
-  const handler = createHubFetchHandler({ ...deps, cloneJobs, live, liveBroker, ...(worktreeReconciler ? { worktreeReconciler } : {}) });
+  const handler = createHubFetchHandler({ ...deps, mobileAssets: async () => {
+    // Fetch only this server's static, non-secret HTMLBundle template. Never
+    // use a client Host/forwarded origin as an asset authority. TLS verification
+    // is inapplicable to this same-listener self-fetch (operators may use a
+    // public-name certificate); no cookie, bearer or user data is transmitted.
+    const response = await fetch(mobileBundleUrl(deps.config.host, server.port!, Boolean(deps.config.tls)), { redirect: "error", signal: AbortSignal.timeout(5000), ...(deps.config.tls ? { tls: { rejectUnauthorized: false } } : {}) });
+    if (!response.ok) throw new Error("Mobile Hub bundle unavailable");
+    return mobileHubAssets(await response.text());
+  }, cloneJobs, live, liveBroker, ...(worktreeReconciler ? { worktreeReconciler } : {}) });
   const server = Bun.serve<BridgeData>({
     hostname: deps.config.host,
     port: deps.config.port,
     // SSE and long-lived terminal sockets must never be idle-reaped.
     idleTimeout: 0,
+    routes: { "/__uatu/mobile-hub": mobileDocument },
     ...(deps.config.tls
       ? { tls: { cert: Bun.file(deps.config.tls.cert), key: Bun.file(deps.config.tls.key) } }
       : {}),

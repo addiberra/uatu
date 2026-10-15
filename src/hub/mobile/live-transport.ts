@@ -9,6 +9,7 @@ export function createLiveTransport(options: { fetch?: Fetcher; timeoutMs?: numb
   const timeout = options.timeoutMs ?? 15_000;
   if (!Number.isSafeInteger(timeout) || timeout <= 0 || timeout > 2_147_483_647) throw new RangeError("Invalid Hub timeout");
   let generation = 0;
+  const workspaceGenerations = new Map<string, number>();
   const listeners = new Set<(event: Invalidation) => void>();
   const fence = () => ++generation;
   let eventGeneration = 0;
@@ -65,8 +66,11 @@ export function createLiveTransport(options: { fetch?: Fetcher; timeoutMs?: numb
   }
   return {
     generation: () => generation, fence, invalidate,
+    workspaceGeneration: (id: string) => workspaceGenerations.get(id) ?? 0,
     workspaceChanged(workspaceId: string, reason: "stopped" | "removed") {
-      fence();
+      // A dependent Stop may precede an owned credential/worktree command's
+      // result. Fence workspace continuations, not that authenticated command.
+      workspaceGenerations.set(workspaceId, (workspaceGenerations.get(workspaceId) ?? 0) + 1);
       emit({ scope: "workspace", workspaceId, generation: ++eventGeneration, reason });
     },
     subscribeInvalidation(listener: (event: Invalidation) => void) { listeners.add(listener); return () => { listeners.delete(listener); }; },

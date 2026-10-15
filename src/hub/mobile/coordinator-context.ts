@@ -20,6 +20,7 @@ export function installWorkspacePresentationRoot(root: HTMLElement) {
 }
 let dispatch: ((event: PopStateEvent) => boolean) | undefined;
 let write: ((state: object, url: string, replace: boolean) => boolean) | undefined;
+export const mobileCoordinatorInstalled = () => dispatch !== undefined;
 const listeners = new Set<() => void>();
 export const workspaceForeground = () => foreground && !modal;
 export function onWorkspaceForegroundChange(listener: () => void) {

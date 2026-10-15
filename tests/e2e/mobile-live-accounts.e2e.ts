@@ -1,33 +1,10 @@
-import { execFileSync } from "node:child_process";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { writeFile } from "node:fs/promises";
 import path from "node:path";
 import { test, expect } from "./hub-fixtures";
 
 test.use({ hubAgentAccounts: true, hubCredentials: true, hubWorktrees: true, hubWorkspaces: ["mobile-accounts"] });
-let directory: string, js: string, css: string;
-test.beforeAll(async () => {
-  directory = await mkdtemp(path.join(process.env.UATU_TEST_TEMP_ROOT ?? tmpdir(), "mobile-live-browser-"));
-  execFileSync("bun", ["build", "tests/e2e/mobile-live-test-entry.ts", "--target=browser", `--outdir=${directory}`]);
-  js = await readFile(`${directory}/mobile-live-test-entry.js`, "utf8");
-  css = await readFile(`${directory}/mobile-live-test-entry.css`, "utf8");
-});
-test.afterAll(async () => { if (directory) await rm(directory, { recursive: true, force: true }); });
-
-// The real Hub still gates each document and every API. Only the authenticated
-// HTML assembly is substituted; no API is intercepted and no agent is personal.
-test.beforeEach(async ({ hubContext, hub }) => {
-  await hubContext.route("**/*", async route => {
-    const request = route.request(), url = new URL(request.url());
-    if (url.origin !== hub.origin) return route.continue();
-    if (url.pathname === "/__mobile-test-entry.js") return route.fulfill({ contentType: "text/javascript", body: js });
-    if (url.pathname === "/__mobile-test-entry.css") return route.fulfill({ contentType: "text/css", body: css });
-    if (!request.isNavigationRequest() || !["/", "/settings", "/clone"].includes(url.pathname)) return route.continue();
-    const response = await route.fetch({ maxRedirects: 0 });
-    if (response.status() !== 200) return route.fulfill({ response });
-    return route.fulfill({ response, body: '<!doctype html><html data-ui-mode="touch"><head><meta name="uatu-hub" content="true"><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="stylesheet" href="/__mobile-test-entry.css"></head><body><main id="live-mobile-test" style="position:fixed;inset:0"></main><script type="module" src="/__mobile-test-entry.js"></script></body></html>' });
-  });
-});
+// Real production HTML, assets, authentication and APIs. Agent runtimes remain
+// disposable fakes; no personal provider is contacted.
 
 test("phone accounts use real Hub routes, conditional key validation and masked cleared secrets", async ({ hubContext }) => {
   const page = await hubContext.newPage(); await page.setViewportSize({ width: 390, height: 844 });
@@ -50,6 +27,54 @@ test("phone accounts use real Hub routes, conditional key validation and masked 
   await expect(page.locator(".mh-flow-page")).toContainText("Logged in");
   expect(page.url()).not.toMatch(/bad-key|cf-good-key|abc123/);
   await expect(page.locator(".mh-dock .mh-tab")).toHaveCount(2);
+});
+
+test("phone device login honors conditional fields, displays selectable code and expires without retry", async ({ hubContext, hub }) => {
+  const page = await hubContext.newPage(); await page.goto("/settings?detail=agent&id=opencode");
+  await page.getByLabel("Search providers").fill("copilot"); await page.getByRole("button", { name: /GitHub Copilot/ }).click();
+  await page.locator('[data-flow="method-0"]').click();
+  await expect(page.locator('[name="answer-1"]')).toBeHidden();
+  await page.locator('[name="answer-0"]').selectOption("enterprise");
+  await expect(page.locator('[name="answer-1"]')).toBeVisible();
+  await page.getByRole("button", { name: "Start login", exact: true }).click();
+  await expect(page.locator(".mh-sheet-error")).toContainText("required");
+  await page.locator('[name="answer-0"]').selectOption("github.com");
+  await fetch(hub.agentAccountsControl!, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ action: "expireNextAfter", ms: 1500 }) });
+  await page.getByRole("button", { name: "Start login", exact: true }).click();
+  await expect(page.locator(".mh-device-code")).toHaveText("15EF-0DB6");
+  await expect(page.getByRole("button", { name: "Copy device code", exact: true })).toBeVisible();
+  await expect(page.locator(".mh-flow-page")).toContainText("expired");
+  await expect(page.getByRole("button", { name: "Review login methods to try again", exact: true })).toBeVisible();
+});
+
+test("phone redirect refuses a hostile address without leaking it, then completes only the bound loopback callback", async ({ hubContext }) => {
+  const page = await hubContext.newPage(); await page.goto("/settings?detail=agent&id=opencode");
+  await page.getByLabel("Search providers").fill("openai"); await page.getByRole("button", { name: /^OpenAI,/ }).click();
+  await page.locator('[data-flow="method-0"]').click(); await page.getByRole("button", { name: "Start login", exact: true }).click();
+  const auth = new URL((await page.getByRole("link", { name: "Open login page in a new tab" }).getAttribute("href"))!);
+  const input = page.getByLabel("Whole localhost redirect address"); await expect(input).toHaveAttribute("type", "password");
+  await input.fill("https://attacker.invalid/?code=do-not-leak"); await page.getByRole("button", { name: "Submit login response", exact: true }).click();
+  await expect(input).toHaveValue(""); await expect(page.locator(".mh-flow-error")).not.toBeEmpty();
+  expect(page.url()).not.toContain("do-not-leak");
+  const callback = new URL(auth.searchParams.get("redirect_uri")!); callback.searchParams.set("state", auth.searchParams.get("state")!); callback.searchParams.set("code", "fixture-code");
+  await input.fill(callback.href); await page.getByRole("button", { name: "Submit login response", exact: true }).click();
+  await expect(page.locator(".mh-flow-page")).toContainText("complete");
+  expect(page.url()).not.toContain("fixture-code");
+});
+
+test("phone OpenCode multiple-credential activation and logout keep machine-wide warning", async ({ hubContext, hub }) => {
+  await fetch(hub.agentAccountsControl!, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ action: "twoGroqKeys" }) });
+  const page = await hubContext.newPage(); await page.goto("/settings?detail=agent&id=opencode");
+  await page.getByLabel("Search providers").fill("groq"); await page.getByRole("button", { name: /^Groq,/ }).click();
+  const activate = page.getByRole("button", { name: /^Activate / });
+  await expect(activate).toHaveCount(1); await activate.click();
+  await expect(page.locator(".mh-sheet")).toContainText("machine-wide");
+  await page.getByRole("button", { name: "Activate agent credential", exact: true }).click();
+  await expect(page.locator(".mh-sheet")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Activate Groq work", exact: true })).toBeVisible();
+  await page.getByRole("button", { name: /^Log out / }).first().click();
+  await page.getByRole("button", { name: "Log out agent credential", exact: true }).click();
+  await expect(page.locator(".mh-flow-page")).toContainText("machine-wide");
 });
 
 test("phone login attempts expose code flow, clear a rejected code, cancel and retain truthful status", async ({ hubContext }) => {

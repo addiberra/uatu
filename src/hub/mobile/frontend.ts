@@ -18,6 +18,7 @@ export type { MobileHubDetail } from "./flows";
 export type MobileHubRoute = "hub" | "settings";
 export type MobileHubDestination = { kind: "credential"; id: string } | { kind: "notifications" | "agent-accounts" | "add-credential" | "tools" | "assignments" | "default-folder" | "devices" | "security" | "add-workspace" | "folders" };
 export interface MobileHubCallbacks {
+  brandLogoUrl?: string;
   notifications?: import("./notifications").MobileNotificationSettings;
   navigateWorkspace(workspaceId: string): void;
   returnToWorkspace(workspaceId: string): void;
@@ -200,7 +201,7 @@ export function mountMobileHub(root: HTMLElement, backend: MobileHubBackend, cal
     const previousScroll = page.scrollTop;
     page.querySelectorAll<HTMLDetailsElement>("details[data-family]").forEach(detail => disclosures.set(detail.dataset.family!, detail.open));
     clearSecrets(page);
-    page.innerHTML = `<header class="mh-brand"><img src="${esc(appUrl("/assets/uatu-logo.svg"))}" alt=""/><span>UatuCode</span></header><main>${signedOut ? login() : !identity ? `<h1>UatuCode</h1>${workspaces.status === "unavailable" ? `<div role="alert">${note(workspaces.problem.message)}${button("refresh", "Retry", "mh-text-action")}</div>` : note("Connecting to hub…")}` : route === "hub" ? dashboard() : settings()}</main>${identity ? dock() : ""}`;
+    page.innerHTML = `<header class="mh-brand"><img src="${esc(callbacks.brandLogoUrl ?? appUrl("/assets/uatu-logo.svg"))}" alt=""/><span>UatuCode</span></header><main>${signedOut ? login() : !identity ? `<h1>UatuCode</h1>${workspaces.status === "unavailable" ? `<div role="alert">${note(workspaces.problem.message)}${button("refresh", "Retry", "mh-text-action")}</div>` : note("Connecting to hub…")}` : route === "hub" ? dashboard() : settings()}</main>${identity ? dock() : ""}`;
     page.querySelector<HTMLElement>("main")!.inert = !!flows.detail;
     if (flows.detail) page.querySelector("main")!.setAttribute("aria-hidden", "true");
     else page.querySelector("main")!.removeAttribute("aria-hidden");
