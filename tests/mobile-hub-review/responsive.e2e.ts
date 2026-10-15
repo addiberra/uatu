@@ -9,7 +9,9 @@ export async function captureResponsiveEvidence() {
 const base = new URL("./results/artifacts/responsive", import.meta.url).pathname;
 // Discovery checks readiness, not response latency; retain failures separately.
 const expect = baseExpect.configure({ timeout: 30000 });
-const out = process.env.RESPONSIVE_PREFLIGHT ? `${base}/preflight` : base;
+// An explicit output keeps captures separate from Playwright's cleaned result
+// directory when another browser matrix runs in the same checkout.
+const out = process.env.RESPONSIVE_OUTPUT_DIR ?? (process.env.RESPONSIVE_PREFLIGHT ? `${base}/preflight` : base);
 // Preserve previous discovery, including failures, before any evidence overwrite.
 if (await Bun.file(`${out}/results.json`).exists()) {
   const prior = await Bun.file(`${out}/results.json`).json();
@@ -20,7 +22,8 @@ if (await Bun.file(`${out}/results.json`).exists()) {
 }
 const rows: { scenario: string; status: string; details?: unknown }[] = [];
 const closeConnections = process.env.RESPONSIVE_CLOSE_CONNECTIONS !== '0';
-const provenance = { browsers: {} as Record<string, string>, bun: Bun.version, closeConnections, sourceHashes: Object.fromEntries(await Promise.all(['src/hub/mobile/styles.css', 'tests/mobile-hub-review/responsive.e2e.ts', 'tests/mobile-hub-review/responsive-server.ts'].map(async path => [path, new Bun.CryptoHasher('sha256').update(await Bun.file(path).arrayBuffer()).digest('hex')])) ) };
+const selectedCases = process.env.RESPONSIVE_CASES?.split(',');
+const provenance = { browsers: {} as Record<string, string>, bun: Bun.version, closeConnections, selectedCases: selectedCases ?? null, sourceHashes: Object.fromEntries(await Promise.all(['src/hub/mobile/styles.css', 'tests/mobile-hub-review/responsive.e2e.ts', 'tests/mobile-hub-review/responsive-server.ts'].map(async path => [path, new Bun.CryptoHasher('sha256').update(await Bun.file(path).arrayBuffer()).digest('hex')])) ) };
 const sizes = [[320, 740], [390, 844], [844, 390], [820, 1180]] as const;
 async function scale(page: Page, factor: number) {
   // Explicit reference text stress policy, NOT native OS Dynamic Type or browser zoom.
@@ -33,6 +36,14 @@ async function scale(page: Page, factor: number) {
 }
 async function audit(page: Page, scenario: string, factor: number, screenshot = false) {
   await scale(page, factor); await page.waitForTimeout(350);
+  if (await page.locator('html').getAttribute('data-workspace-foreground') === 'true') {
+    // This is settled composition evidence, not a motion/latency test. Content
+    // can render before the existing coordinator's entry travel has completed.
+    await expect.poll(() => page.evaluate(() => {
+      const root = document.querySelector('#mobile-workspace-root')!, bar = document.querySelector('#touch-tab-bar')!;
+      return { x: root.getBoundingClientRect().x, translate: getComputedStyle(bar).translate };
+    })).toEqual({ x: 0, translate: 'none' });
+  }
   const details = await page.evaluate(() => {
     const root = document.querySelector('.mh-sheet') ?? (document.querySelector('.mh-root')?.closest('[inert]') ? document.querySelector('#touch-tab-bar') : document.querySelector('.mh-root:not([hidden])'));
     const issues: unknown[] = [];
@@ -56,9 +67,21 @@ async function audit(page: Page, scenario: string, factor: number, screenshot = 
       rows.push({ scenario: `${scenario}-footer`, status: r && r.y >= 0 && r.y + r.height <= page.viewportSize()!.height + 1 ? 'PASS' : 'FAIL', details: r });
     }
     await page.locator('.mh-sheet button,.mh-sheet input,.mh-sheet select').first().focus();
+    const confirmation = await page.locator('.mh-task').getAttribute('data-task-kind') === 'confirmation';
     const escaped: string[] = [];
-    for (let i = 0; i < 18; i++) { await page.keyboard.press('Tab'); const outside = await page.evaluate(() => document.activeElement?.closest('.mh-sheet') ? null : document.activeElement?.outerHTML.slice(0, 200)); if (outside) escaped.push(outside); }
-    rows.push({ scenario: `${scenario}-focus-trap`, status: escaped.length ? 'FAIL' : 'PASS', details: escaped });
+    for (let i = 0; i < 18; i++) {
+      await page.keyboard.press('Tab');
+      const outside = await page.evaluate(confirmation => {
+        const active = document.activeElement;
+        if (active?.closest('.mh-task')) return null;
+        // Editors are nonmodal full pages: native traversal to browser chrome
+        // is allowed, but inactive Hub/workspace controls must remain inert.
+        if (!confirmation && (active === document.body || active === document.documentElement)) return null;
+        return active?.outerHTML.slice(0, 200) ?? 'No active element';
+      }, confirmation);
+      if (outside) escaped.push(outside);
+    }
+    rows.push({ scenario: `${scenario}-${confirmation ? 'focus-trap' : 'focus-isolation'}`, status: escaped.length ? 'FAIL' : 'PASS', details: escaped });
   }
 }
 async function isolatedServer() {
@@ -81,6 +104,7 @@ try {
     try {
       for (const [width, height] of sizes) for (const theme of ['light', 'dark'] as const) for (const factor of [1, 2]) {
         const id = `${engineName}-${width}x${height}-${theme}-${factor * 100}`;
+        if (selectedCases && !selectedCases.includes(id)) continue;
         if (process.env.RESPONSIVE_PREFLIGHT && !['webkit-320x740-light-100', 'chromium-844x390-dark-200'].includes(id)) continue;
         // Keep real HTTP/SSE protocols while opting out of socket reuse. This
         // reduced transient stalls in A/B runs, but is NOT a proven root-cause fix.
@@ -125,7 +149,7 @@ try {
           rows.push({ scenario: `${id}-keyboard-input-reachable`, status: inputReachability.reachable ? 'PASS' : 'FAIL', details: inputReachability });
           await check('keyboard-viewport', width === 320 && factor === 2 && theme === 'light'); await page.setViewportSize({ width, height });
           await context.request.post('/review/control/hold', { data: ['createToken'] }); await button('Add').click(); await context.request.post('/review/control/settle', { data: ['createToken', true] }); await expect(activeTask(page)).toContainText('Synthetic operation failed'); await check('credential-error'); await button('Cancel').click();
-          await page.goto('/settings?detail=assignments'); await page.locator('[data-flow="workspace-atlas"]').click(); await page.locator('[data-flow="new-atlas"]').click(); await check('assignment', engineName === 'webkit' && width === 320 && factor === 1 && theme === 'light'); await page.getByRole('combobox', { name: 'Git authentication credential', exact: true }).selectOption('token-github'); await page.getByLabel('Authentication host').fill('github.com'); await button('Review').click(); await check('assignment-review'); await button('Back to edit').click();
+          await page.goto('/settings?detail=assignments'); await page.locator('[data-flow="workspace-atlas"]').click(); await page.locator('[data-flow="new-atlas"]').click(); await check('assignment', engineName === 'webkit' && width === 320 && factor === 1 && theme === 'light'); await page.getByRole('combobox', { name: 'Git authentication credential', exact: true }).selectOption('token-github'); await page.getByRole('textbox', { name: 'Authentication host', exact: true }).fill('github.com'); await button('Review').click(); await check('assignment-review'); await button('Back to edit').click();
           await page.goto('/?detail=add-workspace'); await button('Create workspace').click(); await check('onboard', width === 844 && factor === 2);
           await page.getByLabel('New folder name').fill('responsive-review'); await page.getByLabel('Workspace display name').fill('Responsive review'); await page.getByLabel('Create the folder and initialize Git').check();
           await context.request.post('/review/control/setOnboardingFault', { data: ['register-failed'] }); await button('Review').click(); await check('onboard-review'); await button('Add stopped').click(); await expect(page.getByRole('heading', { name: 'Configuration needs attention' })).toBeVisible(); await check('onboard-error'); await button('Inspect retained folder').click(); await check('onboard-recovery');

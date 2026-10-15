@@ -79,7 +79,7 @@ Keep production-facing delta specs unsynced until implemented and verified.
 - [x] 10.1 Restore conventional iOS Settings navigation/contextual editing, remove blanket bottom commands and single-option menus, clarify Hub-wide folder behavior, and preserve draft/Cancel/Save semantics without duplicated controls.
 - [x] 10.2 Present credential purpose and understandable local availability first, explain secondary troubleshooting and each tool's role, retain all diagnostics, and preserve capability/secret/operation semantics.
 - [x] 10.3 Reproduce and repair cold-entry handle/selector presentation, provide loading Back to Hub, fence inactive shortcuts and late boot completion, and preserve saved Files/placement/URL and first-frame Hub availability.
-- [ ] 10.4 Complete current Chromium/WebKit integration, responsive and cold-entry verification; retain exact test results and keep blocked checks open rather than inheriting an older green matrix.
+- [x] 10.4 Complete current Chromium/WebKit integration, responsive and cold-entry verification; retain exact test results and keep blocked checks open rather than inheriting an older green matrix.
 - [x] 10.5 Publish the versioned isolated review refinement with its evidence and outstanding verification clearly identified, then request renewed user review without live integration.
 
 ## 11. Direct Settings and full-page editors
@@ -87,7 +87,7 @@ Keep production-facing delta specs unsynced until implemented and verified.
 - [x] 11.1 Replace drawer task presentation with one shared full-page editor/result owner and explicit centered consequential confirmations; preserve focus, cancellation, secret clearing and safe history without duplicate controls.
 - [x] 11.2 Expose applicable Settings/management actions directly, remove generic More menus and option accordions, keep folder rows compact, and preserve every supported operation and confirmation order.
 - [x] 11.3 Remove diagnostic panels from normal Settings; provide concise explicitly requested check results and a complete named report view, with readable long metadata values and no repeated check on report Back.
-- [ ] 11.4 Complete current cross-engine editor/confirmation/history/operation/continuity verification and current visual evidence; keep failed or blocked checks explicit rather than inheriting older passes.
+- [x] 11.4 Complete current cross-engine editor/confirmation/history/operation/continuity verification and current visual evidence; keep failed or blocked checks explicit rather than inheriting older passes.
 - [x] 11.5 Publish the isolated page-based candidate and updated evidence/acceptance record, then stop for user review without live integration.
 
 ## 12. Readable information and explicit controls

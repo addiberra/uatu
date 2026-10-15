@@ -222,9 +222,37 @@ refusal, auth, assets, document/live delivery, desktop worktree entry and phone
 Hub → workspace → Settings → Return with no page errors. Build warnings remain
 the existing unsupported CSS `highlight` selector warnings.
 
-Separate retained responsive captures, desktop comparison and final evidence
-reconciliation still require their named results. Tasks stay open until verified,
-not merely adapter-connected. None of this is independent or human acceptance.
+### Retained responsive result (2026-10-16)
+
+```sh
+RESPONSIVE_OUTPUT_DIR=.local/mobile-responsive-reconciled bun tests/mobile-hub-review/responsive.e2e.ts
+```
+
+**1,102 PASS / 0 FAIL / 0 UNTESTED / 1 UNSUPPORTED**. Full selection
+(`selectedCases: null`), Chromium 153.0.8010.12 and WebKit 26.6, Bun 1.4.2.
+The local `results.json`, `scenarios.md` and 22 PNGs are retained separately from
+Playwright's cleaned directory. This exercises 320×740, 390×844, 844×390 and
+820×1180, light/dark, scoped 100/200% text, focused-input viewport reduction,
+contrast, forced colors and reduced preferences. WebKit reduced-transparency
+emulation is unsupported. Text stress is not native Dynamic Type; viewport
+reduction is not a physical keyboard or safe-area/device certification.
+
+The retained earlier run in `.local/mobile-responsive-20261016` was
+**1,101 PASS / 1 FAIL / 1 UNSUPPORTED**: WebKit 320×740 dark 200% sampled the
+workspace mid-entry translation. The current static-composition audit awaits
+exact x=0 and no tab-bar translation; it does not widen any bounds or replace the
+separate transition/input tests. The focused diagnostic had 82 passes, no failures
+and one unsupported check; only the full result above is called a full matrix.
+Editors now check nonmodal focus isolation (browser chrome traversal is allowed);
+consequential confirmations still require modal focus containment.
+
+Sampled the retained short-landscape editor, narrow assignment page and narrow
+200% dark credential page: the header commands remain visible and long content
+uses its scrolling body. These are self-inspection, not approved reference/pixel
+comparisons. No goldens, archived bytes or curated published gallery were changed.
+The current integration/cold-entry and editor/history/continuity gates 10.4/11.4
+now have current cross-engine results and captures. Broader reference comparisons,
+native/device checks, desktop reconciliation and human acceptance remain separate.
 
 Current historical Chat reproduction:
 
