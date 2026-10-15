@@ -44,7 +44,10 @@ let server: ReturnType<typeof startHubServer>;
 let registry: WorkspaceRegistry;
 let onboarding: WorkspaceOnboardingCoordinator;
 let worktreeService: WorktreeService;
+let sessionManager: SessionManager;
 let atlasId = "";
+// Every session the stub backend was asked to stop, by workspace id.
+const stoppedSessions: string[] = [];
 
 function cleanEnvironment(): Record<string, string> {
   return {
@@ -100,7 +103,7 @@ const backend: SessionBackend = {
       endpoint: { hostname: "127.0.0.1", port: 1 },
       token: null,
       exited: new Promise<number | null>(() => {}),
-      async stop() {},
+      async stop() { stoppedSessions.push(workspace.id); },
     };
   },
 };
@@ -163,6 +166,7 @@ beforeAll(async () => {
     },
   });
   worktreeService = service;
+  sessionManager = sessions;
   server = startHubServer({
     config, registry, sessions, sessionStore, personalState, onboarding,
     worktrees: service,
@@ -687,6 +691,34 @@ describe("removing registrations whose files were deleted outside Uatu (#504)", 
     await rm(folder, { recursive: true, force: true });
     expect(await stateOf(entry.id)).toMatchObject({ availability: "missing" });
     await registry.remove(entry.id);
+  });
+
+  // PR #515 review: a workspace still running when its folder is deleted
+  // keeps its child alive on an unlinked cwd, so its dashboard row is a
+  // running row. Remove from Uatu must stop it and then unregister it, with
+  // no Git and no prior Stop; the inventory names it neutrally, because
+  // the Hub cannot tell a deleted repository from a deleted docs folder.
+  test("a running workspace whose folder was deleted is stopped, then removed from Uatu", async () => {
+    const docs = path.join(root, "running-docs");
+    await mkdir(docs);
+    const plain = await registry.register(docs);
+    const repositoryFolder = await repository("running-repository");
+    const repositoryId = (await onboarding.configureExisting({ path: repositoryFolder, displayName: "running-repository", authentication: [], signing: null, init: false, start: false })).entry.id;
+    for (const [id, folder] of [[plain.id, docs], [repositoryId, repositoryFolder]] as const) {
+      await sessionManager.start(id);
+      await rm(folder, { recursive: true, force: true });
+      expect(await stateOf(id)).toMatchObject({ running: true, availability: "missing" });
+
+      const listing = parseWorktreeInventory((await (await fetch(`${origin}${WORKTREE_API_PATH}?source=${id}`, withSession())).json() as { inventory: unknown }).inventory);
+      expect(listing.error).toMatchObject({ code: "not-found", message: "This workspace's folder no longer exists, so Uatu cannot read it." });
+
+      const forgotten = await result(await post("forget", { sourceWorkspaceId: id, reference: id }));
+      expect(forgotten.ok).toBe(true);
+      expect(stoppedSessions).toContain(id);
+      expect(sessionManager.isRunning(id)).toBe(false);
+      expect(registry.byId(id)).toBeUndefined();
+      expect(existsSync(folder)).toBe(false);
+    }
   });
 
   // Only ENOENT/ENOTDIR establish that a folder is gone. A folder the Hub

@@ -1835,7 +1835,15 @@ async function refresh(force) {
         // the Hub's own Settings page, which the site navigation already
         // reaches; parent credentials and shared policy are managed there,
         // for every repository, as they always were.
-        const forget = actions.querySelector('[aria-label^="Remove "]');
+        let forget = actions.querySelector('[aria-label^="Remove "]');
+        // A workspace still running when its folder was deleted (its child
+        // can outlive an unlinked cwd) is a running row, which has no Remove
+        // button of its own. It is offered one: the forget route stops the
+        // workspace before unregistering it, as its dialog says.
+        if (!forget && w.availability) {
+          forget = el("button", "danger", "Remove from Uatu");
+          actions.append(forget);
+        }
         // Capability is Hub-wide, not proof that this row is a repository.
         // Docs folders must keep the ordinary unregister path, which needs
         // no Git inventory. Repository families retain the guarded dialog.
@@ -1854,6 +1862,7 @@ async function refresh(force) {
             ...target, view: "forget", id: w.id, label: workspaceLabel(w),
             ...(w.availability ? { availability: w.availability } : {}),
             ...(w.parentId ? {} : { dependents }),
+            checkout,
           }, forget);
         }
         if (w.availability) {

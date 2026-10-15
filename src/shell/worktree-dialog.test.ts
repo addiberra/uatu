@@ -1369,7 +1369,7 @@ describe("W5 a failed inventory read disables destructive compact views instead 
 // forget view must still let the user finish it, named by the row they
 // clicked, rather than dead-ending in "could not be found".
 describe("#504 Remove from Uatu when the repository can no longer be read", () => {
-  const reason = "This repository's folder no longer exists, so Uatu cannot read it.";
+  const reason = "This workspace's folder no longer exists, so Uatu cannot read it.";
   const unreadable = () => inventory([], { local: [], remote: [] }, {
     repositoryId: "unknown",
     status: "error",
@@ -1443,6 +1443,32 @@ describe("#504 Remove from Uatu when the repository can no longer be read", () =
     expect(h.document.querySelector("[data-worktree-confirmation]")!.textContent)
       .toContain("Removed from Uatu. Its folder was already gone; nothing on disk was changed.");
   });
+
+  // PR #515 review: the Hub cannot tell a deleted repository from a deleted
+  // docs folder, so the dialog names the stand-in by the opener's own
+  // classification — the dashboard row's "Missing folder" / "Missing
+  // checkout" — and never calls an ordinary workspace a repository.
+  test("a missing plain folder is named a folder, never a repository", async () => {
+    const h = harness({ "/": unreadable, "/forget": forgotten });
+    await open(h, { view: "forget", id: "atlas", label: "Atlas", availability: "missing", dependents: 0, checkout: false });
+    const body = h.main().querySelector("form p")!.textContent!;
+    expect(body).toBe("This workspace's folder is already gone. Stop this workspace and remove Hub registration, assignments and personal state. Uatu changes nothing on disk.");
+    expect(h.text()).not.toContain("repository");
+    expect(h.text()).not.toContain("checkout's");
+  });
+
+  test("a missing checkout is named a checkout, and its running workspace is stopped by the removal", async () => {
+    for (const [id, extra] of [["atlas", { dependents: 0 }], ["atlas-child", { label: "feature/a" }]] as const) {
+      const h = harness({ "/": unreadable, "/forget": forgotten });
+      await open(h, { view: "forget", id, availability: "missing", checkout: true, ...extra });
+      expect(h.main().querySelector("form p")!.textContent)
+        .toBe("This checkout's folder is already gone. Stop this workspace and remove Hub registration, assignments and personal state. Uatu changes nothing on disk.");
+      expect(h.main().querySelector("label.check")!.textContent).toBe("Stop Uatu activity and remove only the Hub registration.");
+      expect(h.text()).not.toContain("folder no longer exists");
+      for (const [key, value] of savedGlobals) Reflect.set(globalThis, key, value);
+      savedGlobals.clear();
+    }
+  });
 });
 
 // Demo 04c: removing a repository whose worktrees are still registered could
@@ -1453,7 +1479,7 @@ describe("#504 a repository with registered worktrees explains that they go firs
   const unreadable = () => inventory([], { local: [], remote: [] }, {
     repositoryId: "unknown",
     status: "error",
-    error: { code: "not-found", message: "This repository's folder no longer exists, so Uatu cannot read it.", retry: "none" },
+    error: { code: "not-found", message: "This workspace's folder no longer exists, so Uatu cannot read it.", retry: "none" },
   });
 
   test("an unreadable repository uses the worktrees its opener's rows showed", async () => {

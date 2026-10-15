@@ -166,7 +166,7 @@ describe("#504 a top-level row whose folder is missing", () => {
     expect(actionsOf(document, "atlas")).toEqual(["Rename workspace Atlas", "Remove Atlas from Uatu", "Retry refresh"]);
     await (main.querySelector('[aria-label="Remove Atlas from Uatu"]') as any).onclick();
     expect(calls).toEqual([]);
-    expect(opened).toEqual([expect.objectContaining({ view: "forget", id: "atlas", label: "Atlas", availability: "missing", dependents: 1 })]);
+    expect(opened).toEqual([expect.objectContaining({ view: "forget", id: "atlas", label: "Atlas", availability: "missing", dependents: 1, checkout: true })]);
   });
 
   test("with nothing under it, it is still removed from Uatu through the confirmation, never unregistered on one click", async () => {
@@ -178,7 +178,49 @@ describe("#504 a top-level row whose folder is missing", () => {
     expect(actionsOf(document, "docs")).toEqual(["Rename workspace Docs", "Remove Docs from Uatu", "Retry refresh"]);
     await (row.querySelector('[aria-label="Remove Docs from Uatu"]') as any).onclick();
     expect(calls).toEqual([]);
-    expect(opened).toEqual([expect.objectContaining({ view: "forget", id: "docs", label: "Docs", availability: "missing", dependents: 0 })]);
+    expect(opened).toEqual([expect.objectContaining({ view: "forget", id: "docs", label: "Docs", availability: "missing", dependents: 0, checkout: false })]);
+  });
+
+  // PR #515 review: a workspace still running when its folder was deleted
+  // (the child keeps an unlinked cwd) is a running row. Running rows had no
+  // Remove button to relabel, so the warning promised a removal the row did
+  // not offer. The forget route stops the workspace itself (stop: true).
+  test("still running, it offers Remove from Uatu beside Stop, through the same confirmation", async () => {
+    const { document, refresh, opened, calls } = harness([{ id: "docs", displayName: "Docs", running: true, availability: "missing" }]);
+    await refresh();
+    const row = document.querySelector('#sessions [data-workspace="docs"]')!;
+    expect(row.querySelector('[role="alert"]')!.textContent)
+      .toBe("Missing folder. Restore the original folder externally, then retry, or remove it from Uatu. Nothing will be recreated.");
+    expect(actionsOf(document, "docs")).toEqual(["Rename workspace Docs", "Stop", "Remove Docs from Uatu", "Retry refresh"]);
+    const remove = row.querySelector('[aria-label="Remove Docs from Uatu"]') as any;
+    expect(remove.textContent).toBe("Remove from Uatu");
+    expect(remove.className).toBe("danger");
+    await remove.onclick();
+    expect(calls).toEqual([]);
+    expect(opened).toEqual([expect.objectContaining({ view: "forget", id: "docs", label: "Docs", availability: "missing", dependents: 0, checkout: false })]);
+  });
+
+  test("a running repository family keeps its worktrees-first count and calls itself a checkout", async () => {
+    const { document, refresh, opened } = harness([
+      { id: "atlas", displayName: "Atlas", repositoryId: "r", running: true, availability: "missing" },
+      { id: "atlas-a", parentId: "atlas", repositoryId: "r", branch: "feature/a", running: true, availability: "missing" },
+    ]);
+    await refresh();
+    expect(actionsOf(document, "atlas")).toEqual(["Rename workspace Atlas", "Stop", "Remove Atlas from Uatu", "Retry refresh"]);
+    expect(actionsOf(document, "atlas-a")).toEqual(["Stop", "Remove feature/a from Uatu", "Retry refresh"]);
+    await (document.querySelector('[aria-label="Remove Atlas from Uatu"]') as any).onclick();
+    await (document.querySelector('[aria-label="Remove feature/a from Uatu"]') as any).onclick();
+    expect(opened).toEqual([
+      expect.objectContaining({ view: "forget", id: "atlas", availability: "missing", dependents: 1, checkout: true }),
+      expect.objectContaining({ view: "forget", id: "atlas-a", availability: "missing", checkout: true }),
+    ]);
+    expect(opened[1].dependents).toBeUndefined();
+  });
+
+  test("a running row whose folder is present offers no removal", async () => {
+    const { document, refresh } = harness([{ id: "docs", displayName: "Docs", running: true }]);
+    await refresh();
+    expect(actionsOf(document, "docs")).toEqual(["Open Docs", "Rename workspace Docs", "Stop"]);
   });
 
   test("a present ordinary folder keeps its one-step Remove from Hub", async () => {

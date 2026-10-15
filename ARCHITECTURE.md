@@ -366,8 +366,12 @@ folders are gone from `/api/hub/state`'s `availability: "missing"`, which
 covers a top-level workspace as well as a linked worktree; it is read with a
 stat rather than Git (only `ENOENT`/`ENOTDIR` mean gone: a folder the Hub
 cannot stat is never reported missing), and the short cache of a worktree's Git probe never
-outlives its folder, so a deletion shows on the next state read. The forget
-dialog names that state instead of promising files "remain", and it explains
+outlives its folder, so a deletion shows on the next state read. A workspace
+still running when its folder went is offered removal too; `forget` stops it
+first. The forget dialog names that state instead of promising files "remain"
+(a checkout or a workspace folder, by the dashboard row's own
+classification, since the Hub cannot tell a deleted repository from a deleted
+docs folder), and it explains
 a main workspace's registered worktrees up front rather than offering a
 confirmation the Hub would refuse. `src/shell/worktree-dialog.ts`
 is the one client for that family — a shadow-DOM dialog embedded both in

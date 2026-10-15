@@ -177,8 +177,10 @@ export class WorktreeService {
       // statement: the dialog that shows it says what removal does, and the
       // dashboard rows say how to recover. Only a folder that is established
       // to be gone says so; one the Hub cannot stat is not claimed gone.
+      // With the folder gone, so is any `.git`: the Hub cannot tell a
+      // repository from a plain docs folder, so it names neither.
       if (!capabilities.available && await folderPresence(source.path, { follow: true }) === "missing") {
-        throw notFound("This repository's folder no longer exists, so Uatu cannot read it.");
+        throw notFound("This workspace's folder no longer exists, so Uatu cannot read it.");
       }
       throw WorktreeOperationError.of("git-unsupported", capabilities.reason ?? "Worktree operations are unavailable on this Hub.");
     }

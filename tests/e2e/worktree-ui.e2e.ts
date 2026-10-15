@@ -738,8 +738,9 @@ for (const touch of [false, true]) test.describe(touch ? "worktree dialog on tou
     await expect(dialog).toContainText(`${parentId}-derelict / ${two.branch}`);
     // One message, in the body under the title: no error box repeating it.
     await expect(dialog.getByRole("heading", { name: "Remove from Uatu" })).toBeVisible();
-    await expect(dialog).toContainText("This repository's folder no longer exists, so Uatu cannot read it.");
-    await expect(dialog).toContainText("No files are changed.");
+    // Named as its row names it: a missing checkout, never "repository".
+    await expect(dialog).toContainText("This checkout's folder is already gone.");
+    await expect(dialog).toContainText("Uatu changes nothing on disk.");
     await expect(dialog.getByRole("alert")).toHaveCount(0);
     await dialog.getByRole("checkbox").check();
     await captureScreenshot(page, info, `worktree-ui-${label}-forget-deleted-repository`);
@@ -755,7 +756,8 @@ for (const touch of [false, true]) test.describe(touch ? "worktree dialog on tou
     await expect(row(repositoryId)).toContainText("Missing folder", { timeout: 2_000 });
     await expect(row(repositoryId).locator(".chip")).toHaveCount(0);
     await row(repositoryId).getByRole("button", { name: `Remove ${parentId}-derelict from Uatu`, exact: true }).click();
-    await expect(dialog).toContainText("folder no longer exists");
+    await expect(dialog).toContainText("This workspace's folder is already gone.");
+    await expect(dialog).not.toContainText("repository");
     await dialog.getByRole("checkbox").check();
     await dialog.getByRole("button", { name: "Remove from Uatu", exact: true }).click();
     await expect(page.getByRole("dialog")).toHaveCount(0);
@@ -763,6 +765,59 @@ for (const touch of [false, true]) test.describe(touch ? "worktree dialog on tou
     expect(await hubIds(page)).not.toContain(repositoryId);
     expect(existsSync(repository)).toBe(false);
     expect(existsSync(two.path)).toBe(false);
+
+    expect(errors).toEqual([]);
+    await page.close();
+  });
+
+  // PR #515 review: a workspace still running when its folder is deleted
+  // keeps its child alive on an unlinked cwd, so its row is a running row.
+  // It offers Remove from Uatu beside Stop, names a plain folder a folder,
+  // and the removal stops the workspace itself.
+  test("Remove from Uatu stops and clears a running workspace whose folder was deleted", async ({ hub, hubContext }, info) => {
+    test.setTimeout(90_000);
+    const parent = hub.workspaces.find(workspace => workspace.id === parentId)!;
+    const page = await hubContext.newPage();
+    const errors: string[] = [];
+    page.on("pageerror", error => errors.push(error.message));
+    await page.goto(`${hub.origin}/`);
+
+    const folder = path.join(path.dirname(parent.path), `${parentId}-running-docs`);
+    await rm(folder, { recursive: true, force: true });
+    await mkdir(folder);
+    await git(folder, ["init", "-q", "--initial-branch=main"]);
+    await writeFile(path.join(folder, "README.md"), "# running docs\n");
+    await git(folder, ["add", "."]);
+    await git(folder, ["commit", "-q", "-m", "initial"]);
+    const name = `${parentId}-running-docs`;
+    // Onboarding registers repositories only; once this one's folder (and
+    // its .git) is gone with no worktree under it, nothing says it was one,
+    // so it reads exactly as a deleted docs folder does.
+    const configured = await page.request.post("/api/hub/workspaces/configure", { data: { path: folder, displayName: name } });
+    expect(configured.ok(), await configured.text()).toBe(true);
+    const id = ((await configured.json()) as { workspace: { id: string } }).workspace.id;
+    const started = await page.request.post(`/api/hub/sessions/${encodeURIComponent(id)}/start`);
+    expect(started.ok(), await started.text()).toBe(true);
+
+    await rm(folder, { recursive: true, force: true });
+    await page.reload();
+    const row = page.locator(`#sessions [data-workspace="${id}"]`);
+    await expect(row).toContainText("Missing folder. Restore the original folder externally, then retry, or remove it from Uatu.", { timeout: 5_000 });
+    await expect(row.getByRole("button", { name: `Open ${name}`, exact: true })).toHaveCount(0);
+    await expect(row.getByRole("button", { name: "Stop", exact: true })).toBeVisible();
+    await row.getByRole("button", { name: `Remove ${name} from Uatu`, exact: true }).click();
+
+    const dialog = page.getByRole("dialog");
+    await expect(dialog).toContainText("This workspace's folder is already gone. Stop this workspace and remove Hub registration, assignments and personal state. Uatu changes nothing on disk.");
+    await expect(dialog).not.toContainText("repository");
+    await dialog.getByRole("checkbox").check();
+    await captureScreenshot(page, info, `worktree-ui-${label}-forget-running-missing-folder`);
+    await dialog.getByRole("button", { name: "Remove from Uatu", exact: true }).click();
+    await expect(page.getByRole("dialog")).toHaveCount(0);
+    await expect(page.locator("[data-worktree-confirmation]")).toContainText("Removed from Uatu. Its folder was already gone; nothing on disk was changed.");
+    await expect(page.locator(`[data-workspace="${id}"]`)).toHaveCount(0);
+    expect(await hubIds(page)).not.toContain(id);
+    expect(existsSync(folder)).toBe(false);
 
     expect(errors).toEqual([]);
     await page.close();

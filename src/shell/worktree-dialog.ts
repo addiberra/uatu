@@ -83,6 +83,11 @@ export type WorktreeDialogOptions = {
    *  under it. Used only when the repository can no longer be read; a
    *  readable inventory counts its own registered rows. */
   dependents?: number;
+  /** Whether the opener's row is a Git checkout, by workspaceIsCheckout.
+   *  Names a missing stand-in "checkout" or plain workspace folder, as the
+   *  row itself says "Missing checkout" or "Missing folder": with the
+   *  folder gone the Hub cannot tell which it was. */
+  checkout?: boolean;
   message?: string;
   error?: boolean;
 };
@@ -113,6 +118,9 @@ export type WorktreeDialogModel = {
   /** Forget of a main workspace: its linked worktrees still registered in
    *  Uatu, which must be removed first. The Hub refuses otherwise. */
   dependents?: number;
+  /** Forget of a stand-in whose folder is missing: whether the opener's row
+   *  is a checkout, so it is named the way the row names it. */
+  checkout?: boolean;
 };
 
 /** Defines every runtime helper the dialog needs, nested inside this one
@@ -394,11 +402,18 @@ export function installWorktreeDialog<T extends Record<string, unknown>>(
       // repository says why (the Hub's own reason, never repeated in a
       // notice above the title), and a checkout whose folder is already gone
       // is not promised that its files "remain".
+      // A stand-in its opener reports missing is named as its row names it
+      // ("Missing checkout" / "Missing folder"): the Hub's reason cannot say
+      // whether a folder that is gone held a repository. A listed row is a
+      // checkout by definition. Removal stops a running workspace first.
       const removal = "Stop this workspace and remove Hub registration, assignments and personal state.";
-      const consequence = m.unreadable !== undefined
-        ? `${h(m.unreadable)} ${removal} <strong>No files are changed.</strong>`
-        : m.selected?.availability === "missing"
-          ? `This checkout's folder is already gone. ${removal} <strong>Uatu changes nothing on disk.</strong>`
+      const gone = m.selected?.availability === "missing"
+        ? `This ${m.unreadable !== undefined && m.checkout !== true ? "workspace" : "checkout"}'s folder is already gone.`
+        : undefined;
+      const consequence = gone !== undefined
+        ? `${gone} ${removal} <strong>Uatu changes nothing on disk.</strong>`
+        : m.unreadable !== undefined
+          ? `${h(m.unreadable)} ${removal} <strong>No files are changed.</strong>`
           : `${removal} <strong>Checkout, branch, files and creation provenance remain.</strong>`;
       const dependents = m.dependents ?? 0;
       // The Hub refuses to remove a main workspace while worktrees inherit
@@ -763,6 +778,7 @@ export function installWorktreeDialog<T extends Record<string, unknown>>(
         ...(localData === undefined ? {} : { localData }),
         blocked,
         ...(standIn ? { unreadable } : {}),
+        ...(standIn && options.checkout !== undefined ? { checkout: options.checkout } : {}),
         ...(dependents > 0 ? { dependents } : {}),
       };
     }
