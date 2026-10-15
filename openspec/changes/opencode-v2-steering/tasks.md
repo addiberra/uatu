@@ -99,7 +99,7 @@ Each slice is written test first: write the named test and watch it fail, implem
 
 ## 7. End-to-end harness and scenarios
 
-- [ ] 7.1 Build `tests/e2e/opencode-v2-fake.ts`: a scripted fake OpenCode 2.0.28 HTTP and SSE server implementing the routes the 2.x provider calls, including the inbox list and cancel, prompt with delivery and resume, and interrupt with resume. It is controlled through `/__e2e/chat`. Register it in `tests/e2e/server.ts` as an agent served by the real `ChatAdapter` and `OpenCodeV2Provider` (D13). Verify with a smoke test: a conversation is created, a prompt answers, and history reloads.
+- [x] 7.1 Build `tests/e2e/opencode-v2-fake.ts`: a scripted fake OpenCode 2.0.28 HTTP and SSE server implementing the routes the 2.x provider calls, including the inbox list and cancel, prompt with delivery and resume, and interrupt with resume. It is controlled through `/__e2e/chat`. Register it in `tests/e2e/server.ts` as an agent served by the real `ChatAdapter` and `OpenCodeV2Provider` (D13). Verify with a smoke test: a conversation is created, a prompt answers, and history reloads.
 - [ ] 7.2 Add `tests/e2e/chat-steering.e2e.ts` against the fake with these scenarios:
   - Enter steers and the steer delivers at a scripted step boundary, entering the timeline only then;
   - ⌥Enter queues;
