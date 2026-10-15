@@ -19,7 +19,7 @@ Each slice is written test first: write the named test and watch it fail, implem
 
 ## 2. OpenCode 2.x inbox normalization
 
-- [ ] 2.1 Add tests in `src/chat/opencode/v2/normalization.test.ts`:
+- [x] 2.1 Add tests in `src/chat/opencode/v2/normalization.test.ts`:
   - `session.inbox.enqueued` (type `user`) yields a pending-inbox delta (id, text, attachments, delivery, time) and **no** `user_message` upsert;
   - `synthetic`, `compaction`, and `move` entries yield no pending delta, and synthetic keeps its current timeline behavior;
   - `delivered` yields a settled delta plus the remembered `user_message` upsert, with the same `message:<id>` id and `requestId` and the delivery time as `createdAt`;
@@ -27,8 +27,8 @@ Each slice is written test first: write the named test and watch it fail, implem
   - `delivery.changed` yields a delivery delta.
 
   Implement the new provider update kind and the memory keyed by inbox id. Remove the events from `IGNORED` until the tests pass.
-- [ ] 2.2 Add a test in `v2/provider.test.ts`: a `/command` still converges on the inbox id the server minted, both inside the admission window and as a late admission, now that `enqueued` carries no timeline row. Re-key `reportEnqueuedUser` to the pending delta (D4) until this test and the existing command tests pass.
-- [ ] 2.3 Add tests in `v2/provider.test.ts` against the scripted `fetch` stub:
+- [x] 2.2 Add a test in `v2/provider.test.ts`: a `/command` still converges on the inbox id the server minted, both inside the admission window and as a late admission, now that `enqueued` carries no timeline row. Re-key `reportEnqueuedUser` to the pending delta (D4) until this test and the existing command tests pass.
+- [x] 2.3 Add tests in `v2/provider.test.ts` against the scripted `fetch` stub:
   - `prompt(delivery: "steer")` sends `delivery: "steer", resume: true` and does **not** call `switchModel` or `switchAgent`;
   - a queue-delivered prompt still applies its model and mode first;
   - `interrupt(id, { resume: false | true })` passes `resume` through;

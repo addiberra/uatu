@@ -42,8 +42,8 @@ describe("OpenCode 2.x normalization: a real turn", () => {
     expect(normalized.filter(entry => entry.outcome === "unparseable").map(entry => entry.eventType)).toEqual([]);
   });
 
-  test("the running total and the inbox plumbing are ignored, not dropped", () => {
-    for (const type of ["session.usage.updated", "session.inbox.delivered", "session.instructions.updated", "session.step.streamed"]) {
+  test("the running total and the step stream are ignored, not dropped", () => {
+    for (const type of ["session.usage.updated", "session.instructions.updated", "session.step.streamed"]) {
       expect(byType(type).map(entry => entry.outcome)).toEqual(byType(type).map(() => "ignored"));
     }
   });
@@ -53,18 +53,26 @@ describe("OpenCode 2.x normalization: a real turn", () => {
     expect(created?.sessionLifecycle).toEqual({ kind: "created", id: created!.conversationId!, directory: WORKSPACE, title: "capture4" });
   });
 
-  test("an enqueued prompt is the user's message, keyed by its inbox id", () => {
+  test("an enqueued prompt is pending until delivered, when it is the user's message keyed by its inbox id", () => {
+    // Steering (opencode-v2-steering D4): the enqueue carries no timeline
+    // row, only the pending delta; the row lands with the delivery.
     const [first] = byType("session.inbox.enqueued");
-    const [item] = upserts(first!);
-    expect(item).toMatchObject({ type: "user_message", text: "Read the file /etc/hosts using the read tool and reply with its first line only." });
+    expect(upserts(first!)).toEqual([]);
+    expect(first?.updates).toEqual([{ kind: "inbox", delta: { kind: "pending", id: expect.stringMatching(/^msg_/), text: "Read the file /etc/hosts using the read tool and reply with its first line only.", delivery: "steer", at: 1790075148437 } }]);
+    const [delivered] = byType("session.inbox.delivered");
+    const [item] = upserts(delivered!);
+    expect(item).toMatchObject({ type: "user_message", text: "Read the file /etc/hosts using the read tool and reply with its first line only.", createdAt: 1790075148446 });
     expect(item?.id).toMatch(/^message:msg_/);
     expect((item as { requestId?: string }).requestId).toBe(item!.id.slice("message:".length));
+    expect(delivered?.updates[0]).toEqual({ kind: "inbox", delta: { kind: "settled", id: item!.id.slice("message:".length), outcome: "delivered" } });
   });
 
   test("a skill turn reads as its mention text, live and from history", () => {
     const skills = [{ id: "openspec-apply-change", name: "openspec-apply-change", text: "# Apply", mention: { start: 0, end: 22, text: "@openspec-apply-change" } }];
     const normalize = createOpenCodeV2Normalizer(WORKSPACE);
-    const live = normalize({ id: "evt_sk", created: 1_789_999_999_000, type: "session.inbox.enqueued", location: { directory: WORKSPACE }, data: { sessionID: "ses_sk", inboxID: "msg_sk", item: { type: "user", payload: { text: "@openspec-apply-change my-change", skills }, delivery: "queue" } } });
+    const memory = createOpenCodeV2Memory();
+    normalize({ id: "evt_sk", created: 1_789_999_999_000, type: "session.inbox.enqueued", location: { directory: WORKSPACE }, data: { sessionID: "ses_sk", inboxID: "msg_sk", item: { type: "user", payload: { text: "@openspec-apply-change my-change", skills }, delivery: "queue" } } }, memory);
+    const live = normalize({ id: "evt_skd", created: 1_789_999_999_001, type: "session.inbox.delivered", location: { directory: WORKSPACE }, data: { sessionID: "ses_sk", inboxID: "msg_sk" } }, memory);
     expect(upserts(live!)[0]).toMatchObject({ id: "message:msg_sk", type: "user_message", text: "@openspec-apply-change my-change" });
     const stored = normalizeStoredMessage({ id: "msg_sk", type: "user", time: { created: 1 }, text: "@openspec-apply-change my-change", skills });
     expect(stored).toEqual([{ id: "message:msg_sk", type: "user_message", createdAt: 1, text: "@openspec-apply-change my-change" }]);
@@ -157,6 +165,80 @@ describe("OpenCode 2.x normalization: a real turn", () => {
     // The step's start attributed the model to the message before any usage.
     const [stepStarted] = byType("session.step.started");
     expect(stepStarted?.assistantModel).toMatchObject({ messageId, model: "mimo-v2.6-flash-free", promptId: stepEnded?.assistantUsage?.promptId });
+  });
+});
+
+describe("OpenCode 2.x normalization: the session inbox (steering)", () => {
+  const normalize = createOpenCodeV2Normalizer(WORKSPACE);
+  const files = [{ mime: "image/png", name: "shot.png", source: { type: "uri", uri: "file:///tmp/uatu/11111111-2222-4333-8444-555555555555.png" } }];
+  const enqueued = (inboxID: string, item: Record<string, unknown>, created = 10) => ({ id: `evt_${inboxID}`, created, type: "session.inbox.enqueued", location: { directory: WORKSPACE }, data: { sessionID: "ses_i", inboxID, item } });
+  const delivered = (inboxID: string, created = 20) => ({ id: `evt_${inboxID}_d`, created, type: "session.inbox.delivered", location: { directory: WORKSPACE }, data: { sessionID: "ses_i", inboxID } });
+
+  test("an enqueued user entry is a pending delta with its text, attachments, delivery, and time — and no timeline row", () => {
+    const event = normalize(enqueued("msg_p", { type: "user", payload: { text: "steer me", files }, delivery: "steer" }, 10), createOpenCodeV2Memory());
+    expect(event.outcome).toBe("handled");
+    expect(event.conversationId).toBe("ses_i");
+    expect(event.updates).toEqual([{ kind: "inbox", delta: {
+      kind: "pending", id: "msg_p", text: "steer me", delivery: "steer", at: 10,
+      attachments: [{ id: "11111111-2222-4333-8444-555555555555", name: "shot.png", mimeType: "image/png" }],
+    } }]);
+  });
+
+  test("synthetic, compaction, and move entries yield no pending delta; synthetic keeps its notice", () => {
+    const memory = createOpenCodeV2Memory();
+    const synthetic = normalize(enqueued("msg_s", { type: "synthetic", payload: { text: "a note" }, delivery: "steer" }), memory);
+    expect(synthetic.updates).toEqual([{ kind: "upsert", item: expect.objectContaining({ id: "notice:msg_s", type: "notice", message: "a note" }) }]);
+    const compaction = normalize(enqueued("msg_c", { type: "compaction", payload: {}, delivery: "queue" }), memory);
+    expect(compaction.updates).toEqual([]);
+    const move = normalize(enqueued("msg_m", { type: "move", payload: { location: { directory: "/elsewhere" } }, delivery: "queue" }), memory);
+    expect(move.updates).toEqual([]);
+    // Their deliveries settle nothing the dock lists and add no row.
+    for (const id of ["msg_s", "msg_c", "msg_m"]) {
+      const settled = normalize(delivered(id), memory);
+      expect(settled.updates).toEqual([{ kind: "inbox", delta: { kind: "settled", id, outcome: "delivered" } }]);
+    }
+  });
+
+  test("delivery upserts the remembered message with the same id and requestId, timed at delivery", () => {
+    const memory = createOpenCodeV2Memory();
+    normalize(enqueued("msg_p", { type: "user", payload: { text: "steer me", files }, delivery: "steer" }, 10), memory);
+    const event = normalize(delivered("msg_p", 25), memory);
+    expect(event.outcome).toBe("handled");
+    expect(event.updates).toEqual([
+      { kind: "inbox", delta: { kind: "settled", id: "msg_p", outcome: "delivered" } },
+      { kind: "upsert", item: { id: "message:msg_p", type: "user_message", createdAt: 25, text: "steer me", requestId: "msg_p", attachments: [{ id: "11111111-2222-4333-8444-555555555555", name: "shot.png", mimeType: "image/png" }] } },
+    ]);
+    // The memory is consumed: a repeated delivery adds no second row, and
+    // the delivered prompt is now the one an assistant message answers.
+    expect(normalize(delivered("msg_p", 26), memory).updates).toEqual([{ kind: "inbox", delta: { kind: "settled", id: "msg_p", outcome: "delivered" } }]);
+    expect(memory.prompts.get("ses_i")).toBe("msg_p");
+  });
+
+  test("a delivery the memory never saw settles without a row; history supplies it", () => {
+    const event = normalize(delivered("msg_unknown"), createOpenCodeV2Memory());
+    expect(event.updates).toEqual([{ kind: "inbox", delta: { kind: "settled", id: "msg_unknown", outcome: "delivered" } }]);
+  });
+
+  test("a cancellation settles as cancelled with no timeline item", () => {
+    const memory = createOpenCodeV2Memory();
+    normalize(enqueued("msg_x", { type: "user", payload: { text: "never mind" }, delivery: "steer" }), memory);
+    const event = normalize({ id: "evt_x_c", created: 30, type: "session.inbox.cancelled", location: { directory: WORKSPACE }, data: { sessionID: "ses_i", inboxID: "msg_x" } }, memory);
+    expect(event.outcome).toBe("handled");
+    expect(event.updates).toEqual([{ kind: "inbox", delta: { kind: "settled", id: "msg_x", outcome: "cancelled" } }]);
+    // Forgotten: a later delivery of the same id has nothing to show.
+    expect(normalize(delivered("msg_x"), memory).updates).toEqual([{ kind: "inbox", delta: { kind: "settled", id: "msg_x", outcome: "delivered" } }]);
+  });
+
+  test("a delivery change is a delivery delta", () => {
+    const event = normalize({ id: "evt_dc", created: 30, type: "session.inbox.delivery.changed", location: { directory: WORKSPACE }, data: { sessionID: "ses_i", inboxID: "msg_x", delivery: "queue" } }, createOpenCodeV2Memory());
+    expect(event.outcome).toBe("handled");
+    expect(event.updates).toEqual([{ kind: "inbox", delta: { kind: "delivery", id: "msg_x", delivery: "queue" } }]);
+  });
+
+  test("another directory's inbox yields nothing", () => {
+    const foreign = normalize({ ...enqueued("msg_f", { type: "user", payload: { text: "x" }, delivery: "steer" }), location: { directory: "/elsewhere" } }, createOpenCodeV2Memory());
+    expect(foreign.updates).toEqual([]);
+    expect(foreign.outcome).toBe("ignored");
   });
 });
 

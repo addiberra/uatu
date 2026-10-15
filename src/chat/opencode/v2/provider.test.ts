@@ -317,6 +317,66 @@ describe("OpenCode 2.x provider: prompting and events", () => {
     });
   });
 
+  test("a steer is handed to the inbox with resume, and never retargets the session it steers", async () => {
+    // opencode-v2-steering D6: a mid-turn switchModel/switchAgent would
+    // retarget the turn being steered, so a steer carries no model or mode
+    // to the session and runs under whatever it has at delivery.
+    const server = fakeOpenCode({
+      "POST /api/session/:id/model": () => undefined,
+      "POST /api/session/:id/agent": () => undefined,
+      "POST /api/session/:id/prompt": ({ body }) => ({ id: (body as { id: string }).id, sessionID: "ses_1", time: { created: 1 }, type: "user", payload: { text: (body as { text: string }).text }, delivery: "steer" }),
+    });
+    const result = await server.provider().prompt("ses_1", {
+      id: "req-s",
+      text: "stop, do the other thing",
+      delivery: "steer",
+      attachments: [{ id: "att_1", name: "shot.png", mimeType: "image/png", absolutePath: "/tmp/uatu/att_1.png" }],
+      model: { providerId: "berget", modelId: "think" },
+      mode: "plan",
+      variant: "high",
+    });
+    expect(result.messageId).toMatch(/^msg_[0-9a-f]{26}$/);
+    expect(server.calls.map(call => `${call.method} ${call.path}`)).toEqual(["POST /api/session/ses_1/prompt"]);
+    expect(server.requests("POST", "/api/session/ses_1/prompt")[0]?.body).toEqual({
+      id: result.messageId,
+      text: "stop, do the other thing",
+      files: [{ uri: "file:///tmp/uatu/att_1.png", name: "shot.png" }],
+      delivery: "steer",
+      resume: true,
+    });
+  });
+
+  test("interrupt passes resume through, and sends none when the caller names none", async () => {
+    const server = fakeOpenCode({ "POST /api/session/:id/interrupt": () => ({ interrupted: true }) });
+    const provider = server.provider();
+    await provider.interrupt("ses_1");
+    await provider.interrupt("ses_1", { resume: false });
+    await provider.interrupt("ses_1", { resume: true });
+    // The pinned client carries `resume` as a query parameter.
+    expect(server.requests("POST", "/api/session/ses_1/interrupt").map(call => call.query.get("resume"))).toEqual([null, "false", "true"]);
+  });
+
+  test("the pending inbox lists the user's steers only, as pending entries", async () => {
+    const server = fakeOpenCode({
+      "GET /api/session/:id/inbox": () => ({ data: [
+        { id: "msg_steer", sessionID: "ses_1", time: { created: 5 }, type: "user", payload: { text: "steer me", files: [{ mime: "image/png", name: "shot.png", source: { type: "uri", uri: "file:///tmp/uatu/11111111-2222-4333-8444-555555555555.png" } }] }, delivery: "steer" },
+        { id: "msg_queued", sessionID: "ses_1", time: { created: 6 }, type: "user", payload: { text: "native queue" }, delivery: "queue" },
+        { id: "msg_syn", sessionID: "ses_1", time: { created: 7 }, type: "synthetic", payload: { text: "note" }, delivery: "steer" },
+        { id: "msg_cmp", sessionID: "ses_1", time: { created: 8 }, type: "compaction", payload: {}, delivery: "steer" },
+        { id: "msg_mv", sessionID: "ses_1", time: { created: 9 }, type: "move", payload: { location: { directory: "/x" } }, delivery: "steer" },
+      ] }),
+    });
+    expect(await server.provider().listPendingInbox("ses_1")).toEqual([
+      { id: "msg_steer", text: "steer me", delivery: "steer", at: 5, attachments: [{ id: "11111111-2222-4333-8444-555555555555", name: "shot.png", mimeType: "image/png" }] },
+    ]);
+  });
+
+  test("cancelling an inbox entry hits its route", async () => {
+    const server = fakeOpenCode({ "DELETE /api/session/:id/inbox/:inboxId": () => undefined });
+    await server.provider().cancelInbox("ses_1", "msg_steer");
+    expect(server.requests("DELETE", "/api/session/ses_1/inbox/msg_steer")).toHaveLength(1);
+  });
+
   test("a retried prompt is the same message to OpenCode", async () => {
     const server = fakeOpenCode({ "POST /api/session/:id/prompt": ({ body }) => ({ id: (body as { id: string }).id, sessionID: "ses_1", time: { created: 1 }, type: "user", payload: { text: "x" }, delivery: "queue" }) });
     const first = await server.provider().prompt("ses_1", { id: "req-9", text: "x", delivery: "queue" });
@@ -577,6 +637,9 @@ describe("OpenCode 2.x provider: prompting and events", () => {
     }), { status: 200, headers: { "content-type": "text/event-stream" } });
     return { route, frame };
   }
+  // The inbox delivering an entry: only then does its row join the timeline
+  // (opencode-v2-steering D4). `enqueued` helpers below push both frames.
+  const delivered = (inboxID: string, created = 10) => ({ id: `evt_${inboxID}_d`, created, type: "session.inbox.delivered", location: { directory: WORKSPACE }, data: { sessionID: "ses_1", inboxID } });
 
   test("a slash command's row takes the inbox id the stream names, ahead of the 204", async () => {
     const events = pushableEvents();
@@ -586,6 +649,7 @@ describe("OpenCode 2.x provider: prompting and events", () => {
         // The server enqueues the item and announces it before answering,
         // with its own id and the expanded template as the text.
         events.frame({ id: "evt_1", created: 5, type: "session.inbox.enqueued", location: { directory: WORKSPACE }, data: { sessionID: "ses_1", inboxID: "msg_srv1", item: { type: "user", payload: { text: "Create or update AGENTS.md" }, delivery: "queue" } } });
+        events.frame(delivered("msg_srv1", 6));
         return undefined;
       },
     });
@@ -597,7 +661,10 @@ describe("OpenCode 2.x provider: prompting and events", () => {
     })();
     await Bun.sleep(10); // the stream is live once its first frame has arrived
     expect(await provider.command("ses_1", { id: "req-5", name: "init", arguments: "" })).toEqual({ messageId: "msg_srv1" });
-    // The streamed row had already been consumed when the admission returned.
+    // The enqueue named the row's id before the admission returned; the row
+    // itself lands with the delivery that followed it.
+    const deadline = Date.now() + 2_000;
+    while (rows.length < 1 && Date.now() < deadline) await Bun.sleep(5);
     expect(rows).toEqual(["message:msg_srv1"]);
     controller.abort();
     await pump;
@@ -620,9 +687,10 @@ describe("OpenCode 2.x provider: prompting and events", () => {
     expect(accepted.messageId).toMatch(/^msg_[0-9a-f]{26}$/);
     // The stream names the row only now, after the caller's own upsert.
     events.frame({ id: "evt_9", created: 9, type: "session.inbox.enqueued", location: { directory: WORKSPACE }, data: { sessionID: "ses_1", inboxID: "msg_late", item: { type: "user", payload: { text: "Create or update AGENTS.md" }, delivery: "queue" } } });
+    events.frame(delivered("msg_late", 10));
     const deadline = Date.now() + 2_000;
     while (seen.length < 2 && Date.now() < deadline) await Bun.sleep(5);
-    expect(seen).toEqual(["upsert message:msg_late", `remove message:${accepted.messageId}`]);
+    expect(seen).toEqual([`remove message:${accepted.messageId}`, "upsert message:msg_late"]);
     controller.abort();
     await pump;
   });
@@ -642,7 +710,7 @@ describe("OpenCode 2.x provider: prompting and events", () => {
       }
     })();
     await Bun.sleep(10); // the stream is live once its first frame has arrived
-    const enqueued = (inboxID: string) => events.frame({ id: `evt_${inboxID}`, created: 9, type: "session.inbox.enqueued", location: { directory: WORKSPACE }, data: { sessionID: "ses_1", inboxID, item: { type: "user", payload: { text: "expanded" }, delivery: "queue" } } });
+    const enqueued = (inboxID: string) => { events.frame({ id: `evt_${inboxID}`, created: 9, type: "session.inbox.enqueued", location: { directory: WORKSPACE }, data: { sessionID: "ses_1", inboxID, item: { type: "user", payload: { text: "expanded" }, delivery: "queue" } } }); events.frame(delivered(inboxID)); };
     const a = await provider.command("ses_1", { id: "req-a", name: "init", arguments: "" });
     // B is admitted while A's row is still on its way.
     const b = provider.command("ses_1", { id: "req-b", name: "review", arguments: "" });
@@ -650,12 +718,12 @@ describe("OpenCode 2.x provider: prompting and events", () => {
     enqueued("msg_a");
     let deadline = Date.now() + 2_000;
     while (seen.length < 2 && Date.now() < deadline) await Bun.sleep(5);
-    expect(seen).toEqual(["upsert message:msg_a", `remove message:${a.messageId}`]);
+    expect(seen).toEqual([`remove message:${a.messageId}`, "upsert message:msg_a"]);
     enqueued("msg_b");
     expect(await b).toEqual({ messageId: "msg_b" });
     deadline = Date.now() + 2_000;
     while (seen.length < 3 && Date.now() < deadline) await Bun.sleep(5);
-    expect(seen).toEqual(["upsert message:msg_a", `remove message:${a.messageId}`, "upsert message:msg_b"]);
+    expect(seen).toEqual([`remove message:${a.messageId}`, "upsert message:msg_a", "upsert message:msg_b"]);
     controller.abort();
     await pump;
   });
@@ -673,14 +741,14 @@ describe("OpenCode 2.x provider: prompting and events", () => {
       }
     })();
     await Bun.sleep(10); // the stream is live once its first frame has arrived
-    const enqueued = (inboxID: string) => events.frame({ id: `evt_${inboxID}`, created: 9, type: "session.inbox.enqueued", location: { directory: WORKSPACE }, data: { sessionID: "ses_1", inboxID, item: { type: "user", payload: { text: "expanded" }, delivery: "queue" } } });
+    const enqueued = (inboxID: string) => { events.frame({ id: `evt_${inboxID}`, created: 9, type: "session.inbox.enqueued", location: { directory: WORKSPACE }, data: { sessionID: "ses_1", inboxID, item: { type: "user", payload: { text: "expanded" }, delivery: "queue" } } }); events.frame(delivered(inboxID)); };
     const a = await provider.command("ses_1", { id: "req-a2", name: "init", arguments: "" });
     const b = await provider.command("ses_1", { id: "req-b2", name: "review", arguments: "" });
     enqueued("msg_a");
     enqueued("msg_b");
     const deadline = Date.now() + 2_000;
     while (seen.length < 4 && Date.now() < deadline) await Bun.sleep(5);
-    expect(seen).toEqual(["upsert message:msg_a", `remove message:${a.messageId}`, "upsert message:msg_b", `remove message:${b.messageId}`]);
+    expect(seen).toEqual([`remove message:${a.messageId}`, "upsert message:msg_a", `remove message:${b.messageId}`, "upsert message:msg_b"]);
     controller.abort();
     await pump;
   });
@@ -708,6 +776,7 @@ describe("OpenCode 2.x provider: prompting and events", () => {
     while (seen.length < 3 && Date.now() < deadline) await Bun.sleep(5);
     expect(seen).toEqual([`remove message:${accepted.messageId}`, `upsert notice:${accepted.messageId}:refused error`, "status failed"]);
     events.frame({ id: "evt_x", created: 9, type: "session.inbox.enqueued", location: { directory: WORKSPACE }, data: { sessionID: "ses_1", inboxID: "msg_x", item: { type: "user", payload: { text: "someone else's prompt" }, delivery: "queue" } } });
+    events.frame(delivered("msg_x", 10));
     deadline = Date.now() + 2_000;
     while (seen.length < 4 && Date.now() < deadline) await Bun.sleep(5);
     await Bun.sleep(30);
@@ -737,9 +806,10 @@ describe("OpenCode 2.x provider: prompting and events", () => {
     await Bun.sleep(120);
     expect(seen).toEqual([]);
     events.frame({ id: "evt_t", created: 9, type: "session.inbox.enqueued", location: { directory: WORKSPACE }, data: { sessionID: "ses_1", inboxID: "msg_t", item: { type: "user", payload: { text: "expanded" }, delivery: "queue" } } });
+    events.frame(delivered("msg_t", 10));
     const deadline = Date.now() + 2_000;
     while (seen.length < 2 && Date.now() < deadline) await Bun.sleep(5);
-    expect(seen).toEqual(["upsert message:msg_t", `remove message:${accepted.messageId}`]);
+    expect(seen).toEqual([`remove message:${accepted.messageId}`, "upsert message:msg_t"]);
     controller.abort();
     await pump;
   });
@@ -761,21 +831,21 @@ describe("OpenCode 2.x provider: prompting and events", () => {
       }
     })();
     await Bun.sleep(10); // the stream is live once its first frame has arrived
-    const enqueued = (inboxID: string) => events.frame({ id: `evt_${inboxID}`, created: 9, type: "session.inbox.enqueued", location: { directory: WORKSPACE }, data: { sessionID: "ses_1", inboxID, item: { type: "user", payload: { text: "t" }, delivery: "queue" } } });
+    const enqueued = (inboxID: string) => { events.frame({ id: `evt_${inboxID}`, created: 9, type: "session.inbox.enqueued", location: { directory: WORKSPACE }, data: { sessionID: "ses_1", inboxID, item: { type: "user", payload: { text: "t" }, delivery: "queue" } } }); events.frame(delivered(inboxID)); };
     const command = await provider.command("ses_1", { id: "req-c", name: "init", arguments: "" });
     const prompt = await provider.prompt("ses_1", { id: "req-p", text: "x", delivery: "queue" });
     enqueued(prompt.messageId);
     enqueued("msg_cmd");
     const deadline = Date.now() + 2_000;
     while (seen.length < 3 && Date.now() < deadline) await Bun.sleep(5);
-    expect(seen).toEqual([`upsert message:${prompt.messageId}`, "upsert message:msg_cmd", `remove message:${command.messageId}`]);
+    expect(seen).toEqual([`upsert message:${prompt.messageId}`, `remove message:${command.messageId}`, "upsert message:msg_cmd"]);
     controller.abort();
     await pump;
   });
 
   test("a prompt's row announced before the prompt is answered is still a prompt's", async () => {
     const events = pushableEvents();
-    const enqueued = (inboxID: string) => events.frame({ id: `evt_${inboxID}`, created: 9, type: "session.inbox.enqueued", location: { directory: WORKSPACE }, data: { sessionID: "ses_1", inboxID, item: { type: "user", payload: { text: "t" }, delivery: "queue" } } });
+    const enqueued = (inboxID: string) => { events.frame({ id: `evt_${inboxID}`, created: 9, type: "session.inbox.enqueued", location: { directory: WORKSPACE }, data: { sessionID: "ses_1", inboxID, item: { type: "user", payload: { text: "t" }, delivery: "queue" } } }); events.frame(delivered(inboxID)); };
     const server = fakeOpenCode({
       "GET /api/event": events.route,
       "POST /api/session/:id/command": () => undefined,
@@ -797,7 +867,7 @@ describe("OpenCode 2.x provider: prompting and events", () => {
     enqueued("msg_cmd3");
     const deadline = Date.now() + 2_000;
     while (seen.length < 3 && Date.now() < deadline) await Bun.sleep(5);
-    expect(seen).toEqual([`upsert message:${prompt.messageId}`, "upsert message:msg_cmd3", `remove message:${command.messageId}`]);
+    expect(seen).toEqual([`upsert message:${prompt.messageId}`, `remove message:${command.messageId}`, "upsert message:msg_cmd3"]);
     controller.abort();
     await pump;
   });
@@ -855,6 +925,7 @@ describe("OpenCode 2.x provider: prompting and events", () => {
     })();
     await Bun.sleep(20);
     events.frame({ id: "evt_z", created: 9, type: "session.inbox.enqueued", location: { directory: WORKSPACE }, data: { sessionID: "ses_1", inboxID: "msg_z", item: { type: "user", payload: { text: "next command" }, delivery: "queue" } } });
+    events.frame(delivered("msg_z", 10));
     const deadline = Date.now() + 2_000;
     while (seen.length < 1 && Date.now() < deadline) await Bun.sleep(5);
     await Bun.sleep(30);
@@ -946,6 +1017,7 @@ describe("OpenCode 2.x provider: prompting and events", () => {
     expect(accepted.messageId).toMatch(/^msg_[0-9a-f]{26}$/);
     await Bun.sleep(100);
     frame({ id: "evt_q", created: 9, type: "session.inbox.enqueued", location: { directory: WORKSPACE }, data: { sessionID: "ses_1", inboxID: "msg_q", item: { type: "user", payload: { text: "next command" }, delivery: "queue" } } });
+    frame(delivered("msg_q", 10));
     const deadline = Date.now() + 2_000;
     while (seen.length < 1 && Date.now() < deadline) await Bun.sleep(5);
     await Bun.sleep(30);
@@ -969,6 +1041,7 @@ describe("OpenCode 2.x provider: prompting and events", () => {
     const admission = provider.command("ses_1", { id: "req-hs", name: "init", arguments: "" });
     await Bun.sleep(120);
     frame({ id: "evt_h", created: 9, type: "session.inbox.enqueued", location: { directory: WORKSPACE }, data: { sessionID: "ses_1", inboxID: "msg_h", item: { type: "user", payload: { text: "expanded" }, delivery: "queue" } } });
+    frame(delivered("msg_h", 10));
     expect(await admission).toEqual({ messageId: "msg_h" });
     controller.abort();
     await pump;
@@ -1021,10 +1094,12 @@ describe("OpenCode 2.x provider: prompting and events", () => {
     events.frame({ id: "evt_k1", created: 9, type: "session.inbox.enqueued", location: { directory: WORKSPACE }, data: { sessionID: "ses_1", inboxID: compaction.messageId, item: { type: "compaction", payload: {}, delivery: "queue" } } });
     // And the shape the finding supposed: a user row under the compaction's id.
     events.frame({ id: "evt_k2", created: 9, type: "session.inbox.enqueued", location: { directory: WORKSPACE }, data: { sessionID: "ses_1", inboxID: compaction.messageId, item: { type: "user", payload: { text: "compact" }, delivery: "queue" } } });
+    events.frame(delivered(compaction.messageId, 10));
     events.frame({ id: "evt_k3", created: 9, type: "session.inbox.enqueued", location: { directory: WORKSPACE }, data: { sessionID: "ses_1", inboxID: "msg_cmd9", item: { type: "user", payload: { text: "expanded" }, delivery: "queue" } } });
+    events.frame(delivered("msg_cmd9", 10));
     const deadline = Date.now() + 2_000;
     while (seen.length < 3 && Date.now() < deadline) await Bun.sleep(5);
-    expect(seen).toEqual([`upsert message:${compaction.messageId}`, "upsert message:msg_cmd9", `remove message:${command.messageId}`]);
+    expect(seen).toEqual([`upsert message:${compaction.messageId}`, `remove message:${command.messageId}`, "upsert message:msg_cmd9"]);
     controller.abort();
     await pump;
   });
@@ -1048,6 +1123,7 @@ describe("OpenCode 2.x provider: prompting and events", () => {
     })();
     await Bun.sleep(20);
     events.frame({ id: "evt_y", created: 9, type: "session.inbox.enqueued", location: { directory: WORKSPACE }, data: { sessionID: "ses_1", inboxID: "msg_y", item: { type: "user", payload: { text: "later" }, delivery: "queue" } } });
+    events.frame(delivered("msg_y", 10));
     const deadline = Date.now() + 2_000;
     while (seen.length < 1 && Date.now() < deadline) await Bun.sleep(5);
     await Bun.sleep(30);
@@ -1084,6 +1160,7 @@ describe("OpenCode 2.x provider: prompting and events", () => {
     const admission = provider.command("ses_1", { id: "req-l", name: "init", arguments: "" });
     await Bun.sleep(40);
     events.frame({ id: "evt_l", created: 9, type: "session.inbox.enqueued", location: { directory: WORKSPACE }, data: { sessionID: "ses_1", inboxID: "msg_l", item: { type: "user", payload: { text: "expanded" }, delivery: "queue" } } });
+    events.frame(delivered("msg_l", 10));
     expect(await admission).toEqual({ messageId: "msg_l" });
     controller.abort();
     await pump;

@@ -8,7 +8,7 @@ import { OPENCODE_PERMISSION_SCOPE_NOTE } from "../permission-scope";
 import { stableProviderId } from "../message-id";
 import { measureChatWork } from "../../performance";
 import { HistoryReuse, historyPageCursor, historyPageEnd, historyVersion } from "../../history-reuse";
-import { InvalidQuestionAnswerError, ReversibleHistoryTargetError } from "../../provider";
+import { InvalidQuestionAnswerError, ReversibleHistoryTargetError, type PendingInboxEntry } from "../../provider";
 import type {
   ChatProvider,
   NormalizedProviderEvent,
@@ -21,8 +21,8 @@ import type {
   StoredMessageAccounting,
 } from "../../provider";
 import { pendingPermissionFields } from "../normalization";
-import { createOpenCodeV2Memory, createOpenCodeV2Normalizer, formPresentation, modelSelection, normalizeStoredMessage, storedAccounting, storedPromptId, supportedFormFields } from "./normalization";
-import type { ChatAccountChange, ChatAgent, ChatCommand, ChatLoginState, ChatMode, ChatModel, ConversationConfiguration, ModelSelection, RestoredDraft, ReversibleHistoryResult, ReversibleHistoryState } from "../../types";
+import { createOpenCodeV2Memory, createOpenCodeV2Normalizer, formPresentation, modelSelection, normalizeStoredMessage, pendingInboxEntry, storedAccounting, storedPromptId, supportedFormFields } from "./normalization";
+import type { ChatAccountChange, ChatAgent, ChatCommand, ChatLoginState, ChatMode, ChatModel, ConversationConfiguration, MessageDelivery, ModelSelection, RestoredDraft, ReversibleHistoryResult, ReversibleHistoryState } from "../../types";
 
 /**
  * The OpenCode 2.x provider: the same `ChatProvider` seam as the 1.x stack,
@@ -569,9 +569,12 @@ export class OpenCodeV2Provider implements ChatProvider {
 
   private reportEnqueuedUser(event: NormalizedProviderEvent): NormalizedProviderEvent | undefined {
     if (event.eventType !== "session.inbox.enqueued" || !event.conversationId) return;
-    const row = event.updates.find(update => update.kind === "upsert" && update.item.type === "user_message");
-    if (!row || row.kind !== "upsert") return;
-    const serverId = row.item.id.slice("message:".length);
+    // The enqueue carries no timeline row any more (opencode-v2-steering
+    // D4): the server-minted id is read from the pending inbox delta, and
+    // the row itself lands when the inbox delivers the entry.
+    const pending = event.updates.find(update => update.kind === "inbox" && update.delta.kind === "pending");
+    if (!pending || pending.kind !== "inbox") return;
+    const serverId = pending.delta.id;
     // A prompt's row carries the id this process gave it; no command
     // admission, however old, is waiting for that one.
     if (this.promptIds.has(serverId)) return;
@@ -625,12 +628,16 @@ export class OpenCodeV2Provider implements ChatProvider {
     this.historyReuse.dispose();
   }
 
-  async prompt(sessionId: string, input: { id: string; text: string; delivery: "queue"; attachments?: ProviderAttachment[]; model?: ModelSelection; mode?: string; variant?: string }): Promise<{ messageId: string }> {
+  async prompt(sessionId: string, input: { id: string; text: string; delivery: MessageDelivery; attachments?: ProviderAttachment[]; model?: ModelSelection; mode?: string; variant?: string }): Promise<{ messageId: string }> {
     this.historyReuse.invalidate(sessionId);
     // Session-level, not prompt fields: the prompt input carries neither a
-    // model nor an agent.
-    if (input.model) await this.switchModel(sessionId, input.model, input.variant);
-    if (input.mode) await this.client.session.switchAgent({ sessionID: sessionId, agent: input.mode });
+    // model nor an agent. Applied only for a queue delivery — a steer runs
+    // under the session's configuration at delivery, because a mid-turn
+    // switch would retarget the very turn being steered (D6).
+    if (input.delivery === "queue") {
+      if (input.model) await this.switchModel(sessionId, input.model, input.variant);
+      if (input.mode) await this.client.session.switchAgent({ sessionID: sessionId, agent: input.mode });
+    }
     const files = (input.attachments ?? []).map(attachment => ({
       // `file:` over `data:` because the processes share a disk: no base64
       // inflation, and the stored record echoes the uri as the attachment's
@@ -766,8 +773,29 @@ export class OpenCodeV2Provider implements ChatProvider {
     }
   }
 
-  async interrupt(sessionId: string): Promise<void> {
-    await this.client.session.interrupt({ sessionID: sessionId });
+  async interrupt(sessionId: string, options?: { resume?: boolean }): Promise<void> {
+    // `resume: true` wakes steer-scope input only; omitted or false wakes
+    // nothing. Pending input is never deleted by an interrupt (2.0.28).
+    await this.client.session.interrupt({ sessionID: sessionId, ...(options?.resume === undefined ? {} : { resume: options.resume }) });
+  }
+
+  /**
+   * The session's pending user steers, in enqueue order. OpenCode's own
+   * entries (synthetic, compaction, move) and natively queued input are not
+   * the dock's: Uatu's queue is held in the workspace, never in this inbox.
+   */
+  async listPendingInbox(sessionId: string): Promise<PendingInboxEntry[]> {
+    const entries = await this.client.session.inbox.list({ sessionID: sessionId });
+    return (entries as Array<Record<string, unknown>>).flatMap(entry => {
+      if (entry.type !== "user" || entry.delivery !== "queue" && entry.delivery !== "steer") return [];
+      if (entry.delivery !== "steer") return [];
+      const pending = pendingInboxEntry(entry);
+      return pending ? [pending] : [];
+    });
+  }
+
+  async cancelInbox(sessionId: string, inboxId: string): Promise<void> {
+    await this.client.session.inbox.cancel({ sessionID: sessionId, inboxID: inboxId });
   }
 
   async replyPermission(sessionId: string, requestId: string, reply: ProviderPermissionReply): Promise<void> {

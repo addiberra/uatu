@@ -2998,6 +2998,9 @@ export class ConversationProjection {
     // turn actually ends; only removability is lost early. Without turn
     // identity on status events the two cases cannot be told apart here.
     if (update.kind === "status") return this.statusUpdate(update.status, update.message);
+    // An inbox delta is the adapter's, applied to its pending-steer map
+    // before updates reach a projection; one that arrives here is a no-op.
+    if (update.kind === "inbox") return undefined;
     const wasNew = update.item !== undefined && !this.timeline.has(update.itemId);
     if (wasNew && update.item) this.timeline.set(update.itemId, update.item);
     const before = this.text.value(update.identity);
