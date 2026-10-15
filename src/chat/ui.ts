@@ -1,6 +1,6 @@
 import { boundedSet } from "../shared/bounded-map";
 import { escapeHtml } from "../shared/html";
-import { workspaceForeground } from "../hub/mobile/coordinator-context";
+import { readWorkspaceHistory, workspaceForeground, workspaceInitialUrl, workspaceLocation, writeMobileHistory } from "../hub/mobile/coordinator-context";
 import { createLoadingSignal } from "../preview/loading-signal";
 import { measureChatWork } from "./performance";
 import { appState } from "../shell/state";
@@ -91,13 +91,14 @@ type Announcer = ((message: string, error?: boolean) => void) & {
 const EMPTY_PRESENTATION: Presentation = { drafts: {}, expanded: [], anchors: {}, workingSince: {}, dismissedSubagents: {} };
 
 export function initChat(api = new ChatApiClient()): void {
-  let notificationTarget = notificationConversation(window.location?.search ?? "");
+  const initialSearch = window.location?.href ? workspaceInitialUrl().search : window.location?.search ?? "";
+  let notificationTarget = notificationConversation(initialSearch);
   // Opened from another workspace's "needs your answer" notice (?awaiting=1):
   // this workspace names the conversation that waits, asked at once so the
   // answer is usually in before the inventory. `undefined` is a failed read —
   // startup then proceeds as if no destination was named, since saying the
   // request was answered would be a guess.
-  let awaitingLookup: Promise<string | null | undefined> | null = !notificationTarget && notificationAwaiting(window.location?.search ?? "")
+  let awaitingLookup: Promise<string | null | undefined> | null = !notificationTarget && notificationAwaiting(initialSearch)
     ? api.awaiting().catch(() => undefined) : null;
   let awaitingAnswered = false;
   const resolveAwaiting = async () => {
@@ -110,10 +111,11 @@ export function initChat(api = new ChatApiClient()): void {
     // The destination is settled: the URL now names what was chosen, as a
     // push notification's would, and a reload does not ask again.
     if (window.location) {
-      const url = new URL(window.location.href);
+      const context = readWorkspaceHistory();
+      const url = new URL(context.url, window.location.href);
       url.searchParams.delete("awaiting");
       if (id) url.searchParams.set("conversation", id);
-      window.history.replaceState(window.history.state, "", url);
+      if (!writeMobileHistory(context.state, url.pathname + url.search + url.hash, true)) window.history.replaceState(context.state, "", url);
     }
   };
   const surface = document.querySelector<HTMLElement>("#chat-surface");
@@ -2961,10 +2963,11 @@ export function initChat(api = new ChatApiClient()): void {
       if (currentAnchor) presentation.anchors[projection.conversationId] = currentAnchor;
     }
     presentation.selectedId = id;
-    if (window.location && new URLSearchParams(window.location.search).has("conversation")) {
-      const url = new URL(window.location.href);
+    if (window.location && new URLSearchParams(workspaceLocation().search).has("conversation")) {
+      const context = readWorkspaceHistory();
+      const url = new URL(context.url, window.location.href);
       url.searchParams.set("conversation", id);
-      window.history.replaceState(window.history.state, "", url);
+      if (!writeMobileHistory(context.state, url.pathname + url.search + url.hash, true)) window.history.replaceState(context.state, "", url);
     }
     const conversation = conversations.find(item => item.id === id);
     if (chatTitle) chatTitle.textContent = conversation ? displayConversationTitle(conversation) : chatHeading();

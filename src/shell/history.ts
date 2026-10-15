@@ -22,7 +22,7 @@ import {
   commitPreviewParamsFromUrl,
 } from "./url";
 import { previewScrollRoot } from "./preview-scroll-root";
-import { dispatchMobileHistory, writeMobileHistory } from "../hub/mobile/coordinator-context";
+import { dispatchMobileHistory, readWorkspaceHistory, workspaceLocation, writeMobileHistory } from "../hub/mobile/coordinator-context";
 
 // Local query for the preview body. We can't import this from `../app`
 // without widening the type to `HTMLElement | null` for consumers — the
@@ -45,16 +45,17 @@ export function buildDocumentPath(relativePath: string): string {
 // must not grow the back stack.
 export function pushSelection(documentId: string, relativePath: string) {
   const url = buildDocumentPath(relativePath);
-  if (window.location.pathname === url && window.history.state?.documentId === documentId) {
+  const location = workspaceLocation();
+  if (location.pathname === url && readWorkspaceHistory().state?.documentId === documentId) {
     return;
   }
-  const target = carryNotificationTarget(url, window.location.search);
+  const target = carryNotificationTarget(url, location.search);
   if (!writeMobileHistory({ documentId }, target, false)) window.history.pushState({ documentId }, "", target);
 }
 
 export function recordEmptySelection(replace = false): void {
   const method = replace ? "replaceState" : "pushState";
-  const target = carryNotificationTarget(appUrl("/"), window.location.search);
+  const target = carryNotificationTarget(appUrl("/"), workspaceLocation().search);
   if (!writeMobileHistory({ selectionCleared: true }, target, replace)) window.history[method]({ selectionCleared: true }, "", target);
 }
 
@@ -62,12 +63,13 @@ export function buildCommitPreviewPath(repositoryId: string, sha: string): strin
   const url = new URL(appUrl("/"), window.location.origin);
   url.searchParams.set("repository", repositoryId);
   url.searchParams.set("commit", sha);
-  return carryNotificationTarget(`${url.pathname}${url.search}`, window.location.search);
+  return carryNotificationTarget(`${url.pathname}${url.search}`, workspaceLocation().search);
 }
 
 export function pushCommitPreview(repositoryId: string, sha: string) {
   const nextPath = buildCommitPreviewPath(repositoryId, sha);
-  const currentPath = `${window.location.pathname}${window.location.search}`;
+  const current = workspaceLocation();
+  const currentPath = `${current.pathname}${current.search}`;
   if (currentPath === nextPath) {
     return;
   }
@@ -80,8 +82,8 @@ export function pushCommitPreview(repositoryId: string, sha: string) {
 // subsequent popstate resolution — the initial entry has `state === null`
 // until we set it). The hash is preserved on the boot path so a deep link
 // like `/guides/setup.md#installation` still scrolls to the named heading.
-export function replaceSelection(documentId: string, relativePath: string, hash = window.location.hash) {
-  const url = carryNotificationTarget(buildDocumentPath(relativePath) + hash, window.location.search);
+export function replaceSelection(documentId: string, relativePath: string, hash = workspaceLocation().hash) {
+  const url = carryNotificationTarget(buildDocumentPath(relativePath) + hash, workspaceLocation().search);
   if (!writeMobileHistory({ documentId }, url, true)) window.history.replaceState({ documentId }, "", url);
 }
 

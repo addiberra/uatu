@@ -115,6 +115,25 @@ Node-based `bunx playwright` launch fails before running those cases.
 
 ## Unwaived obligations
 
+### Cold notification/history follow-up (2026-10-16)
+
+A delayed cold workspace boot behind Settings exposed a real loss of the
+`conversation` query: Chat and selection history read the foreground Hub URL.
+The existing coordinator now supplies its workspace URL/state through the same
+context that owns writes, without another cache. Chat reads the original entry
+destination, and subsequent workspace history changes read that workspace owner.
+The regression failed in Chromium/WebKit before this correction and now passes.
+
+- `bun run typecheck` and `bunx tsc --noEmit -p tests/mobile-hub-review/tsconfig.json`: passed.
+- Focused coordinator/context/history/Chat/bundle unit command: **9 passed**, 487 assertions.
+- `bun node_modules/@playwright/test/cli.js test -c playwright.mobile-live.config.ts --grep 'cold notification|exact scroll roots|transport loss and reconnect'`: **6 passed**, both engines.
+- Exact Files/Preview/Chat scroll offsets, rendered terminal scrollback and exact
+  terminal dimensions survive detours. A preceding **5/6** run sampled WebKit's
+  translating rectangle at 390.0000305175781px instead of 390px. The check now waits
+  for exact original dimensions; no tolerance or geometry assertion was relaxed.
+- Reconnect behind Settings keeps the same workspace and one broker subscription;
+  the injected transport loss is not treated as an authoritative Stop.
+
 The broader credential/onboarding/clone exceptional browser matrices, exact live
 scroll/geometry/reconnect coverage, complete current synthetic/regression suites,
 desktop/native comparison and final evidence reconciliation require their named

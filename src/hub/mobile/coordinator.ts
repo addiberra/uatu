@@ -234,6 +234,7 @@ export function mountMobileCoordinator(options: {
     return true;
   };
   const unhistory = installMobileHistory({
+    read: () => ({ url: workspaceUrl, state: workspaceState }),
     dispatch(event) {
       if (resumingHistory) return false;
       if (earlyHistoryEvents.has(event)) return true;

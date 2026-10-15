@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { dispatchMobileHistory, installMobileHistory, onWorkspaceForegroundChange, setWorkspaceForeground, workspaceForeground, writeMobileHistory } from "./coordinator-context";
+import { dispatchMobileHistory, installMobileHistory, onWorkspaceForegroundChange, readWorkspaceHistory, setWorkspaceForeground, workspaceForeground, workspaceLocation, writeMobileHistory } from "./coordinator-context";
 
 afterEach(() => setWorkspaceForeground(true));
 test("standalone defaults stay active; modal and Hub presentation gate only interaction", () => {
@@ -27,4 +27,20 @@ test("one optional route owner partitions before workspace history; removing it 
   } finally { stop(); }
   expect(dispatchMobileHistory(event)).toBe(false);
   expect(writeMobileHistory({}, "/doc.md", false)).toBe(false);
+});
+
+test("workspace URL reads and writes share their existing owner while Settings is displayed", () => {
+  const saved = Object.getOwnPropertyDescriptor(globalThis, "window");
+  const location = new URL("https://hub.invalid/settings?detail=security");
+  Object.defineProperty(globalThis, "window", { configurable: true, value: { location, history: { state: { mobileHub: { route: "settings" } } } } });
+  let frame = { url: "/s/a/README.md?conversation=opencode%3Aoriginal#anchor", state: { documentId: "readme" } };
+  const stop = installMobileHistory({ dispatch: () => true, read: () => frame, write(state, url) { frame = { url, state: state as typeof frame.state }; return true; } });
+  try {
+    expect(workspaceLocation().pathname).toBe("/s/a/README.md");
+    expect(workspaceLocation().search).toBe("?conversation=opencode%3Aoriginal");
+    expect(readWorkspaceHistory().state).toEqual({ documentId: "readme" });
+    writeMobileHistory(readWorkspaceHistory().state, "/s/a/next.md?conversation=opencode%3Aoriginal#next", true);
+    expect(workspaceLocation().hash).toBe("#next");
+    expect(location.href).toBe("https://hub.invalid/settings?detail=security");
+  } finally { stop(); if (saved) Object.defineProperty(globalThis, "window", saved); else Reflect.deleteProperty(globalThis, "window"); }
 });

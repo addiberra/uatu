@@ -20,6 +20,11 @@ export function installWorkspacePresentationRoot(root: HTMLElement) {
 }
 let dispatch: ((event: PopStateEvent) => boolean) | undefined;
 let write: ((state: object, url: string, replace: boolean) => boolean) | undefined;
+let read: (() => { url: string; state: History["state"] }) | undefined;
+/** Read through the installed workspace history owner, never the foreground
+ * Hub URL. No second URL/state cache is maintained here. */
+export const readWorkspaceHistory = () => read?.() ?? { url: window.location.href, state: window.history?.state ?? {} };
+export const workspaceLocation = () => read ? new URL(read().url, window.location.href) : window.location;
 export const mobileCoordinatorInstalled = () => dispatch !== undefined;
 const listeners = new Set<() => void>();
 export const workspaceForeground = () => foreground && !modal;
@@ -34,10 +39,10 @@ export function setWorkspaceForeground(active: boolean, blockingModal = false) {
   if (typeof document !== "undefined") document.documentElement.dataset.workspaceForeground = String(workspaceForeground());
   for (const listener of listeners) listener();
 }
-export function installMobileHistory(handlers: { dispatch(event: PopStateEvent): boolean; write(state: object, url: string, replace: boolean): boolean }) {
+export function installMobileHistory(handlers: { dispatch(event: PopStateEvent): boolean; write(state: object, url: string, replace: boolean): boolean; read?(): { url: string; state: History["state"] } }) {
   if (dispatch) throw new Error("A mobile history owner is already installed");
-  dispatch = handlers.dispatch; write = handlers.write;
-  return () => { dispatch = undefined; write = undefined; };
+  dispatch = handlers.dispatch; write = handlers.write; read = handlers.read;
+  return () => { dispatch = undefined; write = undefined; read = undefined; };
 }
 export const dispatchMobileHistory = (event: PopStateEvent) => dispatch?.(event) ?? false;
 export const writeMobileHistory = (state: object, url: string, replace: boolean) => write?.(state, url, replace) ?? false;

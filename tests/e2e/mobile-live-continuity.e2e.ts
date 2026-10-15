@@ -117,6 +117,24 @@ test("cold production workspace loading Back keeps one boot and late completion 
   expect(boots).toBe(1);
 });
 
+test("cold notification conversation destination survives a Hub detour before Chat initializes", async ({ hubContext, hub: info }) => {
+  const workspace = info.workspaces[0]!;
+  const original = await childChatControl(workspace, { action: "seed", title: "Original explicit destination", items: [] }) as { conversation: { id: string } };
+  await childChatControl(workspace, { action: "seed", title: "Newer unrelated default", items: [] });
+  let release!: () => void, held!: () => void;
+  const barrier = new Promise<void>(resolve => { release = resolve; }), arrived = new Promise<void>(resolve => { held = resolve; });
+  await hubContext.route("**/s/mobile-a/api/state", async route => { const response = await route.fetch(); held(); await barrier; await route.fulfill({ response }); });
+  const page = await hubContext.newPage();
+  await page.goto(`/s/mobile-a/README.md?conversation=${encodeURIComponent(original.conversation.id)}#original-destination`); await arrived;
+  await page.getByRole("button", { name: "Back to Hub", exact: true }).click(); await page.locator('[data-action="settings"]').click();
+  release();
+  await expect(page.locator("#preview-path")).toHaveText("README.md");
+  await expect(page).toHaveURL(/\/settings$/); await expect(page.locator("html")).toHaveAttribute("data-workspace-foreground", "false");
+  await page.locator('[data-action="return"]').click();
+  await expect(page).toHaveURL(new RegExp(`conversation=${encodeURIComponent(original.conversation.id)}#original-destination$`));
+  await expect(page.locator("#chat-conversation-select")).toHaveValue(original.conversation.id);
+});
+
 test("live retained Chat owns the exact File/draft and one upload while broker updates and a fixture PTY progress behind Settings", async ({ hubContext, hub: info }) => {
   const workspace = info.workspaces[0]!;
   const seeded = await childChatControl(workspace, { action: "seed", title: "Retained live draft", items: [] }) as { conversation: { id: string } };
@@ -174,4 +192,72 @@ test("coordinated assignment removal keeps its command owner while authoritative
   await expect(page.locator(".mh-flow-page")).toContainText("No credentials assigned");
   await expect(page.locator("#mobile-workspace-root")).toHaveAttribute("data-access-invalidated", "");
   const state = await (await hubContext.request.get("/api/hub/state")).json(); expect(state.workspaces.find((row: any) => row.id === "mobile-a").running).toBe(false);
+});
+
+test("transport loss and reconnect behind Settings retain A without treating offline as Stop", async ({ hubContext }) => {
+  const page = await hubContext.newPage(); let streams = 0, failed = 0;
+  page.on("request", request => { if (new URL(request.url()).pathname === "/api/hub/live") streams++; });
+  page.on("requestfailed", request => { if (new URL(request.url()).pathname.startsWith("/api/hub/")) failed++; });
+  await page.goto("/s/mobile-a/README.md#offline-retained"); await expect(page.locator("#connection-state .connection-label")).toHaveText("Connected");
+  await page.evaluate(() => { (window as any).offlineRoot = document.querySelector(".app-shell"); });
+  await hub(page); await page.locator('[data-action="settings"]').click();
+  await hubContext.setOffline(true); await page.evaluate(() => window.dispatchEvent(new Event("online")));
+  await expect.poll(() => failed).toBeGreaterThan(0);
+  await expect(page.locator("#mobile-workspace-root")).not.toHaveAttribute("data-access-invalidated", "");
+  await hubContext.setOffline(false); await page.evaluate(() => window.dispatchEvent(new Event("online")));
+  await expect.poll(() => streams).toBeGreaterThan(1);
+  await expect(page.locator("#connection-state .connection-label")).toHaveText("Connected");
+  await expect.poll(async () => (await openEventSources(page)).filter(url => url.includes("/api/hub/live?")).length).toBe(1);
+  await page.locator('[data-action="return"]').click(); await expect(page).toHaveURL(/\/s\/mobile-a\/README.md#offline-retained$/);
+  expect(await page.evaluate(() => (window as any).offlineRoot === document.querySelector(".app-shell"))).toBe(true);
+});
+
+test("live Files, Preview and Chat exact scroll roots and terminal rendered viewport survive repeated detours", async ({ hubContext, hub: info }) => {
+  const workspace = info.workspaces[0]!;
+  await writeFile(path.join(workspace.path, "README.md"), "# Retention scroll fixture\n\n" + Array.from({ length: 90 }, (_, i) => `## Section ${i}\n\n${"Disposable document content. ".repeat(18)}\n\n`).join(""));
+  await Promise.all(Array.from({ length: 70 }, (_, i) => writeFile(path.join(workspace.path, `scroll-fixture-${String(i).padStart(3, "0")}.md`), `# Scroll fixture ${i}\n`)));
+  const seeded = await childChatControl(workspace, { action: "seed", title: "Live scroll retention", items: Array.from({ length: 60 }, (_, i) => ({ id: `live-scroll-${i}`, type: "assistant_message", createdAt: i + 1, markdown: `Message ${i}: ${"Disposable conversation content. ".repeat(12)}` })) }) as { conversation: { id: string } };
+  const page = await hubContext.newPage(); await page.goto(`/s/mobile-a/README.md?conversation=${encodeURIComponent(seeded.conversation.id)}#scroll-retained`);
+  await expect(page.locator("#chat-conversation-select")).toHaveValue(seeded.conversation.id);
+  for (const surface of ["files", "preview", "chat"] as const) {
+    await navigation(page); await page.locator(`[data-tab="${surface}"]`).click();
+    if (surface === "preview") await expect(page.locator("#preview")).toContainText("Section 89");
+    if (surface === "chat") await expect(page.locator("#chat-items")).toContainText("Message 59");
+    await expect.poll(() => page.evaluate(surface => {
+      const candidates: HTMLElement[] = [];
+      const visit = (node: Element) => { if (node instanceof HTMLElement && node.scrollHeight > node.clientHeight + 300 && /auto|scroll/.test(getComputedStyle(node).overflowY)) candidates.push(node); for (const child of node.children) visit(child); if (node.shadowRoot) for (const child of node.shadowRoot.children) visit(child); };
+      const host = document.querySelector(surface === "files" ? ".sidebar" : "#chat-timeline")!;
+      if (surface === "preview") (window as any).liveScrollRoot = document.scrollingElement; else { visit(host); (window as any).liveScrollRoot = candidates.sort((a, b) => b.scrollHeight - a.scrollHeight)[0]; }
+      return Boolean((window as any).liveScrollRoot && (window as any).liveScrollRoot.scrollHeight > (window as any).liveScrollRoot.clientHeight + 300);
+    }, surface)).toBe(true);
+    if (surface === "chat") {
+      // Match the established continuity precondition: first reveal skipped
+      // content-visibility rows, then let the existing anchor owner settle.
+      await page.evaluate(() => { (window as any).liveScrollRoot.scrollTop = 0; });
+      await expect.poll(() => page.locator("#chat-items > [data-chat-item-id]").evaluateAll(rows => rows.slice(0, 3).length === 3 && rows.slice(0, 3).every(row => row.checkVisibility({ contentVisibilityAuto: true })))).toBe(true);
+      await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+    }
+    await page.evaluate(() => { (window as any).liveScrollRoot.scrollTop = 210; });
+    await expect.poll(() => page.evaluate(() => (window as any).liveScrollRoot.scrollTop)).toBe(210);
+    await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+    for (let visit = 0; visit < 2; visit++) {
+      await hub(page); await page.locator('[data-action="settings"]').click(); await page.locator('[data-action="return"]').click();
+      await expect(page.locator("html")).toHaveAttribute("data-active-tab", surface);
+      await expect.poll(() => page.evaluate(() => (window as any).liveScrollRoot.scrollTop)).toBe(210);
+      expect(await page.evaluate(() => (window as any).liveScrollRoot.isConnected)).toBe(true);
+    }
+  }
+  await navigation(page); await page.locator('[data-tab="terminal"]').click(); await expect(page.locator('[data-terminal-ready="true"]')).toHaveCount(1);
+  await page.locator(".xterm-helper-textarea").focus(); await page.keyboard.type("for i in {000..099}; do printf 'retained-line-%s\\n' $i; done"); await page.keyboard.press("Enter");
+  await expect(page.locator(".xterm-rows")).toContainText("retained-line-099");
+  // Real xterm keyboard scroll works in both engines; mobile WebKit does not
+  // support Playwright's mouse.wheel operation.
+  await page.keyboard.press("Shift+PageUp");
+  await expect(page.locator(".xterm-rows")).not.toContainText("retained-line-099");
+  const rows = await page.locator(".xterm-rows").textContent(), size = await page.locator(".terminal-pane-host").boundingBox();
+  await hub(page); await page.locator('[data-action="settings"]').click(); await page.locator('[data-action="return"]').click();
+  await expect(page.locator(".xterm-rows")).toHaveText(rows!);
+  // WebKit's in-flight translate can introduce floating-point rect noise.
+  // Wait for the exact original geometry; do not widen its tolerance.
+  await expect.poll(async () => { const returned = await page.locator(".terminal-pane-host").boundingBox(); return { width: returned?.width, height: returned?.height }; }).toEqual({ width: size?.width, height: size?.height });
 });
