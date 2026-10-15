@@ -1,0 +1,493 @@
+## MODIFIED Requirements
+
+### Requirement: The workspace API exposes normalized chat operations
+The workspace API SHALL provide authenticated operations to list, create, and read conversations; start a prompt turn; remove a queued message; change a pending message's delivery; send a pending message now; cancel the active turn; answer a pending permission; and answer or reject a structured question. Mutation requests SHALL be origin-protected under cookie authentication, SHALL validate conversation ownership against the workspace directory, and SHALL use client-generated request identifiers to make network retries idempotent. Provider-specific payloads and credentials MUST NOT be exposed as the public contract when a normalized UatuCode representation exists.
+
+A prompt MAY name its delivery, steer or queue. A prompt that names steer SHALL be accepted as a steer only when the owning agent declares the `steering` capability, the conversation is running, and the text is not a command. Otherwise it SHALL be handled as a queued prompt. A prompt that names no delivery SHALL be handled as a queued prompt. A prompt accepted while the conversation is running SHALL be reported as pending, identifying the message and its delivery so that a client can later remove it or change its delivery. Conversation reads SHALL include the currently pending messages in delivery order, each with its delivery and whether it is paused. A client that joins or reloads mid-run therefore presents the same dock as a client that watched it build.
+
+The API SHALL report every agent a workspace's Chat offers, and which capabilities each agent declares. A capability is declared only when the agent actually supports it; the absence of a declaration SHALL be a normal, expected state rather than an error or an empty result. Consumers SHALL be able to decide what to present from an agent's declaration alone, without probing an operation to discover whether it works. Agent-scoped catalog reads — models, modes, commands — SHALL identify which agent they describe.
+
+The API SHALL name a way of working a **mode**, and SHALL name the program Chat talks to an **agent**. These two SHALL NOT share a name in the route table, because they are not the same thing and a reader cannot tell them apart from the route alone.
+
+#### Scenario: Retried prompt does not run twice
+- **WHEN** a client retries a prompt mutation with the same request identifier after losing the response
+- **THEN** the server returns the original accepted result or current outcome
+- **AND** the owning agent receives the prompt at most once
+
+#### Scenario: Retried removal is applied once
+- **WHEN** a client retries a queued-message removal with the same request identifier after losing the response
+- **THEN** the server reports the original outcome
+- **AND** at most one held message is removed
+
+#### Scenario: Retried delivery change is applied once
+- **WHEN** a client retries a change of a pending message's delivery, or a send-now, with the same request identifier after losing the response
+- **THEN** the server reports the original outcome
+- **AND** the message is delivered to the agent at most once
+
+#### Scenario: A reload shows the queue as it stands
+- **WHEN** a client loads a conversation snapshot while messages are pending
+- **THEN** the response identifies the pending messages in delivery order, each with its delivery and paused state
+- **AND** the client can present, remove, and switch them without having observed their submission
+
+#### Scenario: A steer request to an agent without steering is queued
+- **WHEN** a client submits a prompt naming steer delivery to a conversation whose agent does not declare `steering`
+- **THEN** the prompt is handled as a queued prompt
+- **AND** nothing is delivered to the agent mid-turn
+
+#### Scenario: Cross-origin mutation is rejected
+- **WHEN** a cookie-authenticated cross-origin request attempts to prompt, remove a queued message, change a pending message's delivery, send a pending message now, cancel, or answer an agent request
+- **THEN** the workspace rejects it without changing the conversation
+
+#### Scenario: Base-path deployment uses relocated chat routes
+- **WHEN** Chat is served under a workspace base path such as `/s/project-a/`
+- **THEN** every chat request and stream URL resolves through that base path
+- **AND** the hub proxies it without exposing any loopback agent service
+
+#### Scenario: The API reports its agent and that agent's capabilities
+- **WHEN** a client asks a workspace for its chat status
+- **THEN** the response identifies every agent Chat offers
+- **AND** states which capabilities each agent declares
+
+#### Scenario: An undeclared capability is not an error
+- **WHEN** an agent does not declare a capability
+- **THEN** the status response omits it rather than reporting a failure
+- **AND** the client can tell the difference between "not supported" and "supported but empty"
+
+#### Scenario: Modes are listed under a route named for modes
+- **WHEN** a client lists the ways of working a prompt can run under
+- **THEN** the route names them modes
+- **AND** no route names them agents
+
+### Requirement: Conversation updates are structured and reconnectable
+The server SHALL normalize OpenCode activity into ordered conversation events covering user and assistant content, reasoning, tool lifecycle, permission requests and resolutions, structured questions and resolutions, context compaction, reverted work, turn status, cancellation, completion, warnings, and errors. Normalization SHALL recognize each of these regardless of which of OpenCode's event-naming generations announced it, and when one logical occurrence is announced more than once the timeline SHALL contain a single entry for it.
+
+Changes to a conversation's pending messages SHALL be announced on the same ordered event stream, so every connected client presents the same dock at the same point in the conversation. Those changes are: a message held, a message accepted as a steer, a message removed, a message's delivery changed, a message paused or resumed, and a message delivered to the agent.
+
+An event the server does not recognize, or whose payload it cannot parse, SHALL be skipped without ending or restarting the event stream, and SHALL be counted by type so an operator can discover what a running workspace is discarding. Counting MUST NOT record event payloads.
+
+A history snapshot SHALL identify a stream cursor; reconnecting from a retained cursor SHALL replay every later event in order before delivering live events. If the cursor is no longer replayable or belongs to an earlier server generation, the server SHALL explicitly require a fresh snapshot. Applying a snapshot followed by its event stream MUST NOT duplicate message content or tool entries.
+
+#### Scenario: Stream reconnect replays missed output
+- **WHEN** the event connection drops during an assistant response and reconnects with a retained cursor
+- **THEN** every event after that cursor is replayed once in order before live output continues
+
+#### Scenario: Queue changes reach every connected client
+- **WHEN** a message is held, steered, removed, switched, paused, or delivered while more than one client watches the conversation
+- **THEN** each client receives the change on the ordered event stream
+- **AND** all clients present the same pending messages, deliveries, and paused states in the same order
+
+#### Scenario: Stale cursor requests resynchronization
+- **WHEN** a client reconnects with a cursor outside retained history or from an earlier workspace-server generation
+- **THEN** the stream reports that a new snapshot is required rather than silently omitting events
+
+#### Scenario: Cumulative and incremental provider updates do not duplicate text
+- **WHEN** OpenCode reports overlapping cumulative part state and text deltas for one assistant part
+- **THEN** the normalized timeline contains each text segment exactly once
+
+#### Scenario: An interaction announced under either naming generation is recognized
+- **WHEN** OpenCode announces a permission request or a structured question using either its current or its legacy event name
+- **THEN** the request appears in the conversation that raised it and can be answered
+
+#### Scenario: One occurrence announced twice yields one entry
+- **WHEN** a single permission request or question reaches the server under both naming generations
+- **THEN** the conversation shows one entry for it
+- **AND** answering it sends exactly one response to OpenCode
+
+#### Scenario: An unrecognized event does not end the stream
+- **WHEN** OpenCode emits an event type the server does not handle
+- **THEN** the event is skipped, the stream continues delivering later events, and the occurrence is counted by type
+
+#### Scenario: An unparseable event costs one event, not the stream
+- **WHEN** an event of a recognized type carries a payload the server cannot parse
+- **THEN** only that event is dropped and counted
+- **AND** subsequent events for that conversation are still delivered
+
+#### Scenario: Discarded-event counts are observable
+- **WHEN** an operator inspects the workspace's diagnostic counters after events were discarded
+- **THEN** the counts are reported per event type
+- **AND** no event payload is included
+
+#### Scenario: A compacted conversation says so
+- **WHEN** OpenCode compacts a conversation's context
+- **THEN** the timeline records that compaction occurred rather than appearing to lose content without explanation
+
+#### Scenario: Reverted work stops being presented as current
+- **WHEN** OpenCode reports that work in a conversation was reverted
+- **THEN** the timeline reflects the revert rather than continuing to present the reverted work as though it still applies
+
+### Requirement: Users can prompt, queue, and cancel the active conversation
+The Chat composer SHALL submit a message with content — non-empty text, at least one image attachment, or both — to the selected conversation and clearly distinguish ready, sending, running, interrupted, and failed states. A prompt submitted while the conversation is running SHALL be held in a workspace-owned queue rather than delivered to the agent mid-turn. The exception is a prompt the user explicitly submits as a steer to an agent that declares `steering`, which "OpenCode 2.x conversations can steer the running turn" governs. Pending messages, steers and queued messages alike, SHALL be presented adjacent to the composer as one list in delivery order, with steers listed before queued messages. Each SHALL be visibly labelled with its delivery and SHALL NOT appear as part of the running turn's timeline. While the agent continues to stream output, pending messages SHALL remain adjacent to the composer rather than drifting into the transcript. Pending messages SHALL be bounded per conversation, with steers and queued messages counted together. A submission that would exceed the bound SHALL be refused without altering the pending messages, with the draft preserved.
+
+Every message held in the workspace's queue SHALL stay held until delivery, whatever its kind: prompts, skills, slash commands, and `/reload`. When the running turn ends on its own, the workspace SHALL deliver held messages to the agent one at a time in submission order. Each held message SHALL be delivered under the model, mode, and reasoning variant fixed at its submission. A delivered message SHALL leave the dock and begin its own turn at the end of the timeline. The user SHALL be able to remove any message that is still pending; a removed message is never delivered. Removal of a message that has already been delivered SHALL be refused without altering the conversation. The user SHALL be able to edit a pending message: the message leaves the dock under the same rules as removal, and the invoking client's composer receives its text and attachments.
+
+The user SHALL be able to cancel an active turn without deleting its completed history. Cancellation SHALL NOT deliver pending messages. They remain pending, removable, and visible, and are presented as paused. The queue stays dormant until the user next submits a prompt, which joins the end of the queue and resumes delivery from its head. The other ways out of the dormant state are switching an entry to steer and Send now. Transport failure SHALL preserve the draft until acceptance is known.
+
+The surface SHALL name the agent it is talking to, taking that name from what the agent reports rather than from fixed copy. Text presented to the user SHALL NOT assume a particular agent, so that installing a different agent changes the name shown and nothing else.
+
+The way of working a prompt runs under SHALL be presented as a **mode** — the agent's own named ways of working, such as building or planning. It SHALL NOT be called an agent, because that word names the program Chat talks to.
+
+A control the surface offers the user to start an operation — a picker such as the mode or model chooser — SHALL be presented only when the agent declares the capability behind it. Where that capability is undeclared, the control SHALL be absent rather than shown inert, shown empty, or shown with an error. Reactive interaction controls — those that appear only in response to an agent-raised request, governed by "Users can resolve agent interaction requests in context" — are not covered here: an agent that lacks a capability raises no request of that kind, so the control has nothing to appear for. Absence of a capability SHALL NOT degrade any capability the agent does declare.
+
+#### Scenario: Empty prompt is not submitted
+- **WHEN** the composer contains only whitespace and no pending attachments
+- **THEN** the send action is unavailable and no mutation is sent
+
+#### Scenario: An image-only message is submittable
+- **WHEN** the composer contains only whitespace but at least one pending attachment
+- **THEN** the send action is available and the message submits with empty text
+
+#### Scenario: Follow-up queues while the agent works
+- **WHEN** the user submits a prompt with queue delivery while the selected conversation is running
+- **THEN** the message is held by the workspace rather than delivered to the agent
+- **AND** it is presented adjacent to the composer, labelled as queued
+
+#### Scenario: Follow-up on an agent without steering always queues
+- **WHEN** the conversation's agent does not declare `steering` and the user submits a prompt while it is running
+- **THEN** the message is held and labelled as queued
+- **AND** no steer choice is offered
+
+#### Scenario: Commands always queue
+- **WHEN** the user submits a skill, a slash command, or `/reload` while the conversation is running, whatever the selected delivery
+- **THEN** it is held in the workspace's queue in submission order
+- **AND** it is not delivered to the agent mid-turn
+
+#### Scenario: Queued messages stay with the composer while output streams
+- **WHEN** the agent continues streaming output after messages were queued
+- **THEN** the pending messages remain adjacent to the composer
+- **AND** no pending message appears between items of the running turn
+
+#### Scenario: A queued message is delivered when the turn ends
+- **WHEN** the running turn completes on its own while messages are held
+- **THEN** the workspace delivers the oldest held message to the agent under its submission-time model, mode, and variant
+- **AND** it leaves the dock and starts its own turn at the end of the timeline
+
+#### Scenario: A queued message can be removed
+- **WHEN** the user removes a message that is still held
+- **THEN** it disappears from the dock on every client
+- **AND** it is never delivered to the agent
+
+#### Scenario: A queued message can be edited
+- **WHEN** the user edits a message that is still held
+- **THEN** it disappears from the dock on every client and is never delivered
+- **AND** the invoking client's composer receives its text and attachments
+
+#### Scenario: A full queue refuses further submissions
+- **WHEN** a conversation's pending steers and queued messages together are at the bound and the user submits another prompt while the agent works
+- **THEN** the submission is refused and the draft is preserved
+- **AND** the pending messages are unaffected
+
+#### Scenario: Removing an already-delivered message is refused
+- **WHEN** a removal arrives for a message the workspace has already delivered to the agent
+- **THEN** the removal is refused without altering the conversation
+- **AND** the client learns the message is no longer held
+
+#### Scenario: Cancellation preserves completed content
+- **WHEN** the user cancels a running turn
+- **THEN** OpenCode is asked to abort that turn without resuming
+- **AND** content and tool activity already received remain in the timeline with an interrupted outcome
+
+#### Scenario: Cancellation leaves the queue dormant
+- **WHEN** the user cancels a running turn while messages are pending
+- **THEN** the pending messages remain visible and removable, presented as paused
+- **AND** none of them is delivered as a consequence of the cancellation
+
+#### Scenario: A new submission resumes a dormant queue
+- **WHEN** the user submits a prompt while the conversation is idle and messages are held from before a cancellation
+- **THEN** the new message joins the end of the queue
+- **AND** delivery resumes from the head of the queue in submission order
+
+#### Scenario: Submitting while idle sends at once
+- **WHEN** the conversation is idle and nothing is held
+- **THEN** a submitted prompt starts its turn immediately whatever the selected delivery
+
+#### Scenario: The surface names its agent
+- **WHEN** a conversation is open and the agent has reported its identity
+- **THEN** the surface names that agent
+- **AND** no user-visible text names a different agent
+
+#### Scenario: Ways of working are presented as modes
+- **WHEN** the agent offers more than one way of working, such as building and planning
+- **THEN** the user selects between them as modes
+- **AND** they are not labelled agents
+
+#### Scenario: An undeclared proactive control leaves nothing behind
+- **WHEN** the agent does not declare the capability behind a control the surface offers the user to start an operation, such as a mode or model picker
+- **THEN** that control is absent from the surface
+- **AND** the controls for declared capabilities are unaffected
+
+### Requirement: Chat supports reversible conversation undo and redo
+When the connected agent declares reversible-history support, Chat SHALL offer local `/undo` and `/redo` commands that operate on the selected conversation and MUST NOT send those command strings as ordinary prompts or provider-defined slash commands. Each visible user turn in the main transcript SHALL also offer a direct Revert message action. Undo SHALL stage the previous visible user turn as the conversation's revert boundary; direct Revert SHALL stage the selected visible user turn in one boundary mutation rather than repeated Undo mutations. Both SHALL hide the boundary turn and all later work from the current transcript and restore affected workspace files through the agent's revert operation. The invoking client SHALL receive the boundary turn's non-synthetic prompt text and any still-available attachments as an editable composer draft; other clients' private drafts MUST NOT be overwritten.
+
+If work is running, Undo SHALL interrupt it before changing the boundary. Messages queued behind that work MUST NOT be admitted between interruption and the completed revert. Existing pending messages SHALL remain visible and removable but paused while a revert is staged. They SHALL resume only after Redo clears the revert or after the user submits a replacement prompt, with that replacement admitted before the older held queue resumes. When the agent declares `steering`, the replacement SHALL be sent as a steer. Messages held in the workspace's queue SHALL stay pending rather than being discarded. Steers already pending with the agent SHALL be delivered together with the replacement, the oldest first. When Undo succeeds while steers are pending, Chat's undo confirmation SHALL name those steers and say that they will be delivered together with the replacement.
+
+Repeated Undo SHALL move the boundary backward one visible user turn at a time. While a boundary is staged, Chat SHALL list the hidden user turns from the boundary onward and offer a Restore message action for each. Redo SHALL move forward one hidden user turn at a time. Restoring a selected hidden turn SHALL make history current through that turn in one mutation by staging the following hidden user turn, or SHALL clear the boundary when the selected turn is newest. The invoking client's composer SHALL receive the next boundary turn when one remains and SHALL clear when the original transcript is fully restored. Submitting a replacement prompt while a revert is staged SHALL commit the reverted history before starting the replacement turn, after which the hidden turns can no longer be restored by Redo or Restore.
+
+Every successful boundary change SHALL reconcile the authoritative conversation so all connected clients agree on visible history and workspace state. Mutation retries MUST be idempotent. If interruption or the requested boundary change fails, Chat SHALL report the failure and MUST NOT claim that history or files changed.
+
+#### Scenario: Undo and redo are offered only when supported
+- **WHEN** the connected agent declares reversible-history support
+- **THEN** Chat offers `/undo` and `/redo` as local commands
+- **AND** invoking them does not send their text as an ordinary prompt or provider-defined command
+
+#### Scenario: Unsupported agents do not expose reversible history
+- **WHEN** the connected agent does not declare reversible-history support
+- **THEN** Chat does not offer Undo or Redo controls
+- **AND** a direct request to mutate the revert boundary is refused without changing the conversation
+
+#### Scenario: Undo restores the latest user turn for editing
+- **WHEN** the user invokes Undo with no revert currently staged
+- **THEN** the latest visible user turn and all later work disappear from the visible transcript
+- **AND** affected workspace files return to their state before that turn
+- **AND** the invoking client's composer receives the turn's non-synthetic text and available attachments
+
+#### Scenario: A selected visible message becomes the boundary directly
+- **WHEN** the user invokes Revert message on an earlier visible user turn
+- **THEN** that selected turn and every later turn disappear from the visible transcript
+- **AND** the agent receives one revert operation naming the selected turn
+- **AND** the invoking client's composer receives the selected turn for editing
+
+#### Scenario: Undo interrupts active work before reverting
+- **WHEN** the user invokes Undo while the selected conversation is running
+- **THEN** the active turn is interrupted before the revert boundary changes
+- **AND** no queued message is admitted during that transition
+
+#### Scenario: Queued messages pause behind a staged revert
+- **WHEN** Undo succeeds while messages are pending
+- **THEN** the pending messages remain visible and removable, presented as paused
+- **AND** none is delivered while the revert remains staged
+
+#### Scenario: Repeated Undo walks backward by user turn
+- **WHEN** a revert is staged and the user invokes Undo again
+- **THEN** the boundary moves to the preceding visible user turn
+- **AND** the invoking client's composer receives that earlier turn for editing
+
+#### Scenario: Redo walks forward through hidden turns
+- **WHEN** more than one user turn is hidden behind a staged revert and the user invokes Redo
+- **THEN** the boundary advances to the next hidden user turn
+- **AND** that turn becomes the invoking client's editable composer draft
+
+#### Scenario: Redo clears the newest boundary
+- **WHEN** the boundary is at the newest hidden user turn and the user invokes Redo
+- **THEN** the staged revert is cleared
+- **AND** the original transcript and workspace state become current again
+- **AND** paused queued messages may resume
+
+#### Scenario: Reverted messages remain visible in a restore dock
+- **WHEN** a revert boundary is staged
+- **THEN** Chat lists every hidden user turn from the boundary onward outside the active transcript
+- **AND** each listed turn offers a Restore message action
+- **AND** every connected client sees the same list without losing its private composer draft
+
+#### Scenario: Restore advances through the selected hidden message
+- **WHEN** the user restores a hidden user turn that has later hidden turns
+- **THEN** the boundary advances to the following hidden user turn in one mutation
+- **AND** the selected turn and its prior history return to the active transcript
+- **AND** the invoking client's composer receives the following boundary turn
+
+#### Scenario: Restoring the newest hidden message clears the boundary
+- **WHEN** the user restores the newest hidden user turn
+- **THEN** the staged revert is cleared
+- **AND** the original transcript and workspace state become current again
+- **AND** the invoking client's restored composer draft is cleared
+
+#### Scenario: A replacement prompt commits the reverted branch
+- **WHEN** the user edits the restored draft and submits it while a revert is staged
+- **THEN** the hidden history is committed as reverted before the replacement turn starts
+- **AND** the replacement is admitted before previously held messages resume
+- **AND** Redo no longer restores the discarded branch
+
+#### Scenario: A replacement on a steering agent is a steer
+- **WHEN** the agent declares `steering` and the user submits a replacement prompt while a revert is staged and messages are pending
+- **THEN** the replacement is sent to the agent as a steer
+- **AND** the messages held in the workspace's queue remain pending
+- **AND** steers already pending with the agent are delivered with the replacement, the oldest first
+
+#### Scenario: The undo confirmation names pending steers
+- **WHEN** the agent declares `steering` and Undo succeeds while steers are pending
+- **THEN** Chat's undo confirmation names each pending steer
+- **AND** says they will be delivered together with the replacement prompt
+
+#### Scenario: Other clients reconcile without losing private drafts
+- **WHEN** one client successfully changes the revert boundary
+- **THEN** every connected client reconciles to the same visible conversation and workspace state
+- **AND** only the invoking client's composer draft is replaced
+
+#### Scenario: Retried undo does not move twice
+- **WHEN** a client retries the same Undo mutation after losing its response
+- **THEN** the conversation boundary changes at most once for that request
+
+#### Scenario: Failed undo preserves current state
+- **WHEN** interruption or the agent's revert operation fails
+- **THEN** Chat reports the failure
+- **AND** does not claim that the transcript, composer, queue, or workspace files were reverted
+
+#### Scenario: Undo at the oldest boundary is harmless
+- **WHEN** no earlier visible user turn exists and the user invokes Undo
+- **THEN** Chat reports that there is nothing more to undo
+- **AND** the current revert boundary and workspace state do not change
+
+#### Scenario: Redo without a staged revert is harmless
+- **WHEN** no revert is staged and the user invokes Redo
+- **THEN** Chat reports that there is nothing to redo
+- **AND** the conversation and workspace state do not change
+
+### Requirement: Held messages keep their attachments
+A message submitted with attachments while the conversation is running SHALL keep its attachments while it is pending, whether it is held or steered. The dock SHALL show the message's thumbnails. Removal of a pending message SHALL discard the message together with its attachment references. Editing a pending message SHALL return its attachments to the composer with its text. Changing a pending message's delivery SHALL keep its attachments. Delivery SHALL carry the attachments exactly as submitted. Switching the composer's model after a message is held SHALL NOT alter the held message's attachments: held messages deliver under their frozen configuration.
+
+#### Scenario: A queued message shows its thumbnails
+- **WHEN** a message with attachments is held or steered while the agent works
+- **THEN** the dock shows the message with its image thumbnails
+
+#### Scenario: Removing a held message discards its attachments
+- **WHEN** the user removes a pending message that has attachments
+- **THEN** the message and its attachment references leave the dock on every client
+- **AND** the message is never delivered
+
+#### Scenario: Editing a pending message returns its attachments
+- **WHEN** the user edits a pending message that has attachments
+- **THEN** the invoking client's composer receives the message's text and its attachments
+
+#### Scenario: Switching delivery keeps attachments
+- **WHEN** the user switches a pending message with attachments between steer and queue
+- **THEN** the message keeps its attachments
+- **AND** delivers with them
+
+#### Scenario: A held message delivers with its attachments
+- **WHEN** the running turn ends and a held message with attachments is delivered
+- **THEN** the agent receives the message text and its attachments under the configuration frozen at submission
+
+## ADDED Requirements
+
+### Requirement: OpenCode 2.x conversations can steer the running turn
+An agent that can deliver a message into its running turn at the next safe step boundary, and can withdraw or switch a message before then, SHALL declare the `steering` capability. The OpenCode 2.x agent SHALL declare it. The OpenCode 1.x agent and the Claude Code agent SHALL NOT declare it.
+
+While a conversation whose agent declares `steering` is running, the composer SHALL offer two deliveries. Enter submits with the default delivery. ⌥Enter (Option/Alt+Enter) submits with the other one. A menu on the Send/Cancel control SHALL offer both deliveries by name, so the choice is available without a keyboard. The default delivery SHALL be a per-device preference, initially steer. Opening the menu SHALL NOT change the Send/Cancel control's footprint or the action rail's order. The delivery choice SHALL apply only to prompts: skills, slash commands, and `/reload` are always held in the workspace's queue. While the conversation is idle, submission SHALL be unchanged.
+
+A steer SHALL be handed to the agent at once and kept pending by the agent until the agent delivers it. Steers SHALL be delivered before any held message. The dock SHALL list the user's pending steers, from any client of the conversation, labelled "Steer", and SHALL NOT list the agent's own internal inbox entries. A steer SHALL NOT appear in the timeline until the agent reports it delivered, at which point it SHALL appear as an ordinary user message. While steers are pending, the dock SHALL note that they run with the conversation's model and mode as they stand when they are delivered.
+
+For each pending entry, the user SHALL be able to:
+- switch a queued message to steer, which hands it to the agent as a steer at once; on a dormant queue or an idle conversation this is how a held message is sent now;
+- switch a steer back to queue, which withdraws it from the agent and holds it in the workspace's queue in its submission order;
+- edit or remove a steer, which withdraws it from the agent.
+
+Withdrawing a steer SHALL complete only when the agent confirms the withdrawal. If the agent delivers the steer first, the withdrawal SHALL fail, the message SHALL stay delivered, and the user SHALL be told it was already delivered. A message SHALL never be delivered twice.
+
+Skills, slash commands, and `/reload` in the queue SHALL NOT offer the switch to steer.
+
+Cancelling the turn SHALL leave pending steers with the agent and SHALL present them as paused. A steer is paused when it was pending before the conversation last became idle. A paused steer SHALL offer Send now, which resumes the agent so that it delivers its pending steers. The control SHALL say that every paused steer is delivered together. Submitting a new steer SHALL also resume delivery of paused steers.
+
+When the workspace attaches to a conversation, or reconnects to the agent, it SHALL reconcile the pending steers with the agent's own list, so the dock shows steers raised while the stream was interrupted or by another client.
+
+#### Scenario: Steering is offered only where declared
+- **WHEN** a running conversation's agent declares `steering`
+- **THEN** the composer offers steer and queue delivery
+- **AND** on a conversation whose agent does not declare it, no steer choice appears and busy submissions queue
+
+#### Scenario: Enter steers by default
+- **WHEN** the default delivery preference has not been changed and the user presses Enter while the agent works
+- **THEN** the message is handed to the agent as a steer
+- **AND** the dock lists it labelled "Steer", ahead of any queued messages
+
+#### Scenario: Option+Enter uses the other delivery
+- **WHEN** the default delivery is steer and the user presses ⌥Enter while the agent works
+- **THEN** the message is held in the workspace's queue labelled "Queue"
+
+#### Scenario: The default delivery is a per-device choice
+- **WHEN** the user changes the default delivery to queue on one device
+- **THEN** Enter queues on that device
+- **AND** other devices keep their own default
+
+#### Scenario: The delivery menu is available on touch
+- **WHEN** the user opens the menu on the Send/Cancel control while the agent works
+- **THEN** both Steer and Queue are offered by name
+- **AND** the action rail keeps its layout
+
+#### Scenario: A steer joins the turn at the next step
+- **WHEN** a steer is pending and the agent reaches its next step boundary
+- **THEN** the agent delivers the steer into the running turn
+- **AND** it leaves the dock and appears in the timeline as a user message
+
+#### Scenario: A steer shown pending is not yet in the timeline
+- **WHEN** a steer has been handed to the agent but not delivered
+- **THEN** it appears only in the dock
+- **AND** the timeline contains no user message for it
+
+#### Scenario: Pending steers note the model they run with
+- **WHEN** at least one steer is pending
+- **THEN** the dock says that steers run with the conversation's model and mode at delivery
+
+#### Scenario: A queued message is switched to steer
+- **WHEN** the user switches a held message to steer while the agent works
+- **THEN** the message leaves the workspace's queue and is handed to the agent as a steer with its attachments
+- **AND** every client shows it labelled "Steer"
+
+#### Scenario: A steer is switched back to queue
+- **WHEN** the user switches a pending steer to queue and the agent confirms the withdrawal
+- **THEN** the message is held in the workspace's queue in its submission order, labelled "Queue"
+- **AND** the agent does not deliver it mid-turn
+
+#### Scenario: A steer delivered before it could be withdrawn
+- **WHEN** the user switches, edits, or removes a pending steer and the agent delivers it before confirming the withdrawal
+- **THEN** the user is told the message was already delivered
+- **AND** it appears once in the timeline and is not held, returned to the composer, or delivered again
+
+#### Scenario: A steer is edited
+- **WHEN** the user edits a pending steer and the agent confirms the withdrawal
+- **THEN** the steer leaves the dock on every client
+- **AND** the invoking client's composer receives its text and attachments
+
+#### Scenario: Commands cannot be steered
+- **WHEN** a skill, slash command, or `/reload` is held in the queue
+- **THEN** its entry offers no switch to steer
+- **AND** submitting one with the steer delivery holds it in the queue
+
+#### Scenario: Cancel pauses pending steers
+- **WHEN** the user cancels the running turn while steers are pending
+- **THEN** the agent is not resumed and no steer is delivered
+- **AND** the steers remain in the dock presented as paused
+
+#### Scenario: Send now wakes paused steers together
+- **WHEN** steers are paused and the user chooses Send now on one of them
+- **THEN** the agent resumes and delivers every paused steer
+- **AND** the control said beforehand that all paused steers go together
+
+#### Scenario: A new steer resumes paused steers
+- **WHEN** steers are paused and the user submits a new steer
+- **THEN** the paused steers and the new one are delivered
+
+#### Scenario: Pending steers survive a reload
+- **WHEN** a client reloads while steers are pending
+- **THEN** the dock lists the same pending steers, with the same paused states
+
+#### Scenario: Steers raised while disconnected are recovered
+- **WHEN** a steer was handed to the agent while the workspace's stream was interrupted
+- **THEN** after reconnecting, the dock lists it as pending
+
+#### Scenario: Internal inbox entries are not shown
+- **WHEN** the agent holds a pending entry that is not a user message, such as a synthetic note, a compaction, or a move
+- **THEN** the dock does not list it
+
+### Requirement: A paused or idle queued message can be sent now
+An agent that can deliver a held message ahead of the rest of the queue SHALL declare the `send-now` capability. The OpenCode 2.x and Claude Code agents SHALL declare it. The OpenCode 1.x agent SHALL NOT declare it. A held message SHALL offer Send now only when its agent declares `send-now`.
+
+On an agent that declares `steering`, Send now SHALL hand the held message to the agent as a steer. This is the same operation as switching it to steer, and it is available while the turn runs, while the queue is dormant, and while the conversation is idle.
+
+On an agent that declares `send-now` but not `steering`, Send now SHALL be offered only while the held queue is dormant or the conversation is idle, never while a turn runs. Send now SHALL deliver that message immediately, ahead of the other held messages, under the configuration fixed at its submission. The other held messages SHALL remain held in submission order.
+
+#### Scenario: Claude Code sends a dormant queued message now
+- **WHEN** a Claude Code conversation's queue is dormant after a cancellation and the user chooses Send now on a held message
+- **THEN** that message is delivered and starts its turn
+- **AND** the other held messages remain held in submission order
+
+#### Scenario: Send now is unavailable while a Claude Code turn runs
+- **WHEN** a Claude Code conversation is running
+- **THEN** held messages offer no Send now
+
+#### Scenario: OpenCode 2.x Send now steers
+- **WHEN** an OpenCode 2.x conversation has held messages and the user chooses Send now on one
+- **THEN** the message is handed to the agent as a steer
+
+#### Scenario: OpenCode 1.x offers no Send now
+- **WHEN** the conversation's agent is OpenCode 1.x, which does not declare `send-now`
+- **THEN** held messages offer no Send now
+- **AND** a direct send-now request is refused without changing the queue

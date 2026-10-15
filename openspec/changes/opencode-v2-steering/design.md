@@ -1,0 +1,161 @@
+## Context
+
+See proposal.md, "Why". The current state that shapes this design:
+
+- **The archived decision.** `own-chat-message-queue` (archive 2026-08-23, design D1–D3) made every busy submission Uatu-held. The reason was that the OpenCode server pinned then could not withdraw an admitted input, and that design's Non-Goals said steer "may return later as an explicit action". OpenCode 2.x's session inbox can now list, cancel, and re-deliver pending input, so that reason no longer applies to 2.x. This change reverses the "no steer" decision for 2.x only. Every other decision in that design still holds: the workspace owns the queue, admission is serialized, cancel leaves the queue dormant, queue state rides the snapshot and event stream, and the dock sits at the composer.
+- **The adapter's queue** (`src/chat/adapter.ts`). `prompt()` (≈:897) holds a busy or behind-queue submission in `heldQueues` (≈:306), with its model, mode, and variant fixed at submission (≈:963–981). The bound is `MAX_HELD_MESSAGES = 20` and `MAX_HELD_TEXT_BYTES = 256 KiB` (≈:170). `scheduleDelivery`/`deliverNextHeld` (≈:1232–1294) release the head on an idle or completed transition, and `dormantQueues` pauses delivery. `removeQueued` (≈:1007) and `abort` (≈:1335) run through the per-conversation admission lane `enqueuePromptAdmission`. A staged revert dispatches the replacement immediately, ahead of the paused queue (≈:933–950). Every dispatch goes through `dispatchPrompt` (≈:1099), which calls `provider.prompt(..., delivery: "queue")` or `provider.command(...)`.
+- **The provider seam** (`src/chat/provider.ts:281`). `prompt` is typed `delivery: "queue"`, and `interrupt(sessionId)` takes no options.
+- **OpenCode 2.x provider** (`src/chat/opencode/v2/provider.ts`). `prompt` (≈:625) applies the model and mode through `session.switchModel`/`switchAgent`, then calls `session.prompt({ delivery, resume: true })`. `interrupt` (≈:766) calls `session.interrupt` without `resume`. Slash commands learn the inbox id that the server minted from the normalized `session.inbox.enqueued` user row (`reportEnqueuedUser`, ≈:567).
+- **2.x normalization** (`v2/normalization.ts`). `session.inbox.enqueued` with `item.type === "user"` upserts a `user_message` timeline item at once (≈:188–204). `session.inbox.delivered` and `session.inbox.delivery.changed` are in `IGNORED` (≈:73–74). `session.inbox.cancelled` is not recognized.
+- **The wire.** `QueuedMessage` (`src/chat/types.ts:837`) is `{id, text, queuedAt, requestId?, attachments?}`. `conversation.queue` (≈:884) restates the whole queue with `change.kind ∈ {held, removed, delivered}`. `parseQueuedMessages` and the queue-event case in `src/chat/validation.ts` (≈:614, ≈:676) reject unknown keys. `api/openapi.yaml` (≈:2307, ≈:2316) publishes both shapes. `WORKSPACE_API_REVISION` is **24** (`src/shared/version.ts:44`), and v0.8.0 shipped it.
+- **Client.** `QueueDockRenderer` (`src/chat/timeline-renderer.ts:1116`) renders `#chat-queue` (`src/index.html:855`), and its only action is Remove (`ui.ts` ≈:3404). Enter submits at `ui.ts` ≈:4089, and no ⌥Enter binding exists. Per-device preferences use `presentationLocalStorage()` (`src/shell/presentation-storage.ts`).
+- **OpenCode 2.0.28 server semantics.** These were read from its source and must not be assumed beyond it:
+  - Default delivery is steer. Steers batch-promote at the next safe step boundary.
+  - `interrupt` never deletes pending input. `resume: true` wakes steer-scope input only, and omitting it or passing false wakes nothing.
+  - `inbox.update` from steer to steer answers 409. Updating to steer wakes execution.
+  - `inbox.cancel` on a delivered or missing entry is a 204 no-op.
+  - The inbox is persisted in SQLite.
+  - Model and agent are session-level and resolved at delivery. Entries carry no model of their own.
+
+## Goals / Non-Goals
+
+**Goals:**
+- A steer on 2.x reaches the running turn at its next step boundary, and until OpenCode delivers it the user can still withdraw it, switch it to queue, or edit it.
+- One dock and one bound across both deliveries. Every client sees the same dock, and a message is never delivered twice.
+- No change in behavior for OpenCode 1.x. Claude Code keeps its current queue, plus Send now.
+
+**Non-Goals:**
+- Steering on Claude Code or OpenCode 1.x.
+- Persisting the Uatu-held queue across a workspace restart. It stays in memory as today.
+- Showing Uatu-held messages to OpenCode's TUI attached to the same session.
+- Per-steer model, mode, or variant. OpenCode has no per-entry configuration.
+- Showing OpenCode's non-user inbox entries (synthetic, compaction, move).
+- Client 2.0.29 (#513) and #457.
+
+## Decisions
+
+### D1. Steers live in OpenCode's inbox; the queue stays Uatu-held
+
+A steer is handed to OpenCode at once with `session.prompt({ delivery: "steer", resume: true })`, and OpenCode owns it until delivery. A queued message stays in the adapter's `heldQueues` for every agent, in strict submit order, including skills, slash commands, and `/reload`. This keeps #475's ordering for a queued `/reload`. When a held message is released on 2.x, the provider's existing `switchModel`/`switchAgent` calls apply its fixed model, mode, and variant first. That code path is already in `OpenCodeV2Provider.prompt`/`command`. This decision keeps it and pins it with a test.
+
+*Alternatives rejected:*
+- **Uatu-held steers, released by interrupting and resending.** This loses the running step's work, which is the opposite of steering.
+- **OpenCode's native `delivery: "queue"` for queued messages.** OpenCode resolves model and agent at delivery and stores none per entry, so a queued message would lose the configuration it was submitted under. Commands and `/reload` cannot share OpenCode's inbox ordering with Uatu's own built-ins, and the 1.x and Claude paths would diverge from 2.x.
+- **`session.inbox.update` to switch delivery.** Steer to queue would leave the message in OpenCode's queue, where it would again lose its frozen configuration. Queue to steer would need the message to already be in OpenCode's inbox. `inbox.update` stays unused and is annotated as such (D12).
+
+### D2. Two positive capabilities: `steering` and `send-now`
+
+`steering` is declared by the 2.x provider only. It gates the delivery choice, the Steer entries, the switch actions, and the steer treatment of undo replacements. `send-now` is needed because the shared surface may show a control only behind a declared capability ("One chat surface serves every agent"), and the agreed scope gives Send now to 2.x and Claude but not to 1.x. Both provider descriptors gain it. 1.x is unchanged, because not declaring a capability is the only way to leave it unchanged.
+
+*Alternative rejected:* inferring Send now from `steering`. That would hide it on Claude, which #514 asks for.
+
+### D3. Pending steers are tracked from inbox events, reconciled by `inbox.list`
+
+2.x normalization turns inbox events into a new provider update kind, a pending-inbox delta, instead of timeline items:
+- `enqueued` with `type: "user"` becomes *pending(id, text, attachments, delivery, at)*.
+- `delivered` and `cancelled` become *settled(id, outcome)*.
+- `delivery.changed` becomes *delivery(id, delivery)*.
+- `synthetic`, `compaction`, and `move` entries yield nothing for the dock. Synthetic keeps its current timeline behavior.
+
+The adapter keeps a per-conversation pending-steer map built from these deltas. It replaces the map from `session.inbox.list` when it attaches to a conversation (snapshot read) and after the provider stream reconnects, keeping `type: "user"` and `delivery: "steer"` entries only.
+
+**Paused.** OpenCode does not report a paused state, so the workspace derives it. A steer is paused when it is pending and was enqueued before the session's most recent transition to idle, interrupted, or completed. That transition is already tracked by the projection's status. This is the "stranded" rule. A held message is paused when `deliveryPaused()` is true: dormant, a revert mutation in progress, or a revert staged.
+
+### D4. A steer enters the timeline when OpenCode delivers it
+
+`session.inbox.enqueued` no longer upserts a `user_message`. Normalization keeps the enqueued user payload in its memory, keyed by inbox id, and upserts the `user_message` (same `message:<id>` id, same `requestId`) when `session.inbox.delivered` arrives. The item's `createdAt` is the delivery event's time, so the row sorts after the output that preceded it (the order rule in "Timeline order follows the conversation's message order"). A delivered message that the memory never saw, for example after a restart, comes from history as today.
+
+**Knock-on effect (must be handled, not a contradiction):** `reportEnqueuedUser` (≈:567) finds a slash command's server-minted id from the enqueued **timeline row**. It must key off the new pending delta instead, so `/command` row convergence and late-admission retirement keep working. The command tests in `v2/provider.test.ts` cover it. Idle prompts also lose their enqueued-time row. The adapter's acceptance row (`dispatchPrompt`) still shows the message at once, and the delivered row converges on the same id.
+
+### D5. Wire shape
+
+- `QueuedMessage` gains `delivery: "steer" | "queue"` (required on the wire) and `paused?: true`.
+- `conversation.queue`'s `change.kind` gains `steered`, `switched`, `paused`, and `resumed`. `messageId` stays required, so a group pause or resume publishes one event per affected entry, which the bound limits to 20.
+- `queued` lists steers first, in enqueue order, then held messages in submission order. A steer's `id` is its inbox id, which equals the provider message id that Uatu mints (`stableProviderId("msg", …)`), so Remove and Switch address one handle across the event and the snapshot.
+- The prompt route body accepts an optional `delivery`. The prompt response's `held` becomes `pending` plus `delivery`.
+- New routes:
+  - `PATCH /api/chat/conversations/:id/queue/:messageId {requestId, delivery}` switches delivery.
+  - `POST …/queue/:messageId/send-now {requestId}` sends a message now.
+  - The existing `DELETE` removes a steer as well as a held message.
+
+  All three are origin-protected, receipt-keyed, run in the admission lane, and are registered once in `src/server/routes.ts`. They are classified as internal session-child routes in the contract coverage, like the existing queue `DELETE`.
+- `WORKSPACE_API_REVISION` goes from 24 to 25. The code is at 24 and v0.8.0 shipped 24, so this needs a new `api/CHANGELOG.md` entry. `api/openapi.yaml`'s `QueuedMessage` and queue-event schemas are updated, and `validation.ts` accepts exactly the new keys and kinds.
+
+### D6. Prompt admission decision table (adapter)
+
+| conversation | agent declares `steering` | text is a command | delivery | result |
+|---|---|---|---|---|
+| idle, nothing held, no revert | any | any | any | dispatch now (unchanged) |
+| revert staged | yes | no | any | replacement sent as a **steer** (`resume: true`); pending entries stay |
+| revert staged | no | any | any | dispatch now, ahead of the paused queue (unchanged) |
+| busy, or something held | yes | no | steer | **steer**: counted against the bound, `provider.prompt(delivery: "steer")` |
+| busy, or something held | otherwise | | | **hold** (unchanged) |
+
+A steer submission does not apply the composer's staged model, mode, or variant to the session, because a mid-turn `switchModel` would retarget the turn the user is steering. The steer runs with the session's configuration at delivery, which the dock note states. The composer's staged selection stays staged for the next queued or idle submission.
+
+Undo replacement on a steering agent: with `resume: true`, OpenCode promotes every pending steer at the next boundary. By decision, steers paused before the undo deliver in the same batch as the replacement, oldest first by inbox order, and only the Uatu-held queue stays pending. When Undo succeeds while steers are pending, Chat's undo confirmation names those steers and says they will be delivered together with the replacement.
+
+### D7. Withdrawing a steer (switch to queue, edit, remove)
+
+This runs in the admission lane:
+1. Call `inbox.cancel({inboxID})`.
+2. Wait for that id's settled delta. The wait is bounded, about 5 s. If it times out, the adapter decides from `inbox.list`: if the entry is absent, it treats it as delivered when history holds the message and as cancelled otherwise.
+3. If the outcome is `cancelled`, the steer leaves the map. For switch-to-queue, it is inserted into `heldQueues` at its submission-order position by `queuedAt`, with the session's configuration at that moment frozen onto it. Removal and edit publish `removed`.
+4. If the outcome is `delivered`, the adapter throws `SteerAlreadyDeliveredError`. The route answers 409 with a distinct code, the client shows "Too late — already delivered", and nothing is held or returned.
+
+The 204-on-missing behavior is why step 2 waits for the event instead of trusting the response. A message is never both delivered and returned or held.
+
+A switched-back message takes its submission-order position in the held queue, and the session's configuration at the moment of withdrawal is frozen onto it.
+
+### D8. Switching a held message to steer and Send now
+
+On a `steering` agent, Switch-to-steer and Send now are one operation. The message leaves `heldQueues` (`switched`) and goes through `provider.prompt(delivery: "steer", resume: true)` with its attachments. Its frozen configuration is not applied (D6): a steer runs with the session's configuration at delivery. This works mid-turn, when dormant, and when idle. A dormant queue stays dormant for the remaining held entries, because only a new submission resumes it.
+
+For a paused steer, Send now calls `provider.interrupt(sessionId, { resume: true })`, which wakes OpenCode, and OpenCode delivers every paused steer. The entry's label says so.
+
+On a `send-now` agent without `steering` (Claude), Send now is accepted only when `turnActive()` is false. It dispatches that held message through `dispatchPrompt` under its frozen configuration, removes it (`delivered`), and leaves the rest held. Dormancy is unchanged, so the remaining entries wait for the next submission.
+
+### D9. Cancel
+
+`abort` calls `provider.interrupt(id, { resume: false })`. The seam's `interrupt` gains an optional `{ resume?: boolean }`. 2.x passes it through, and the 1.x and Claude providers ignore it. The Uatu queue goes dormant as today. Pending steers stay with OpenCode and read as paused (D3). Delivery restarts on a new message, on switching an entry to steer, or on Send now.
+
+### D10. Composer and dock
+
+- **Keys.** Enter submits with the device default delivery, and ⌥Enter with the other one. This applies only while a `steering` conversation is busy. When idle, both behave as Enter does today.
+- **Menu.** A disclosure segment on the Send/Cancel control offers "Steer" and "Queue". It lives inside the control's fixed footprint, as required by "Chat composer actions keep a stable one-line layout".
+- **Preference.** The default is stored in `presentationLocalStorage()` (per device, scoped by base path) and defaults to `steer`.
+- **Dock.** `QueueDockRenderer` renders steers first and queued messages after. Each entry shows a Steer or Queue label and, when paused, a paused note.
+- **Entry actions.** Every entry offers Remove and Edit. Queued entries offer "Steer" or "Send now", depending on capability and state. Steers offer "Queue", and paused steers offer "Send now (all paused steers)". Commands get no Steer action.
+- **Note.** While any steer is pending, a single dock note says steers run with the conversation's model and mode at delivery.
+- **Edit.** Edit calls the remove or withdraw mutation first and loads the composer only on success, so a failed withdrawal ("already delivered") leaves the draft untouched.
+
+### D11. Bound
+
+The existing check counts pending steers plus held messages against 20 messages and 256 KiB of text. Steers raised by other clients (D3) count too. This makes the bound a property of the dock, not of who submitted.
+
+### D12. SDK coverage annotations
+
+`src/chat/opencode/sdk-coverage.ts` holds the annotations for both generations. The `2.x:session.inbox.*` "ignored" reason is replaced by mappings for `enqueued`, `delivered`, `cancelled`, and `delivery.changed`. The operations `session.inbox.list`, `session.inbox.cancel`, and `session.interrupt` (with `resume`) are annotated as used. `session.inbox.update` is annotated as deliberately unused, for the D1 reason. The dashboard (#480) is regenerated by `bun run coverage:agents`.
+
+### D13. Test harness
+
+The chat Playwright suites (`tests/e2e/chat-queue.e2e.ts` and the others) run against `FakeE2EChatService` (`tests/e2e/chat-service.ts`), which replaces the whole chat service. No fake OpenCode server exists in `tests/e2e/`; the only scripted 2.x server is the `fetch` stub in `src/chat/opencode/v2/provider.test.ts`. This change adds `tests/e2e/opencode-v2-fake.ts`. It is a small scripted HTTP plus SSE server that implements the 2.0.28 routes the provider calls (session, prompt with delivery and resume, inbox list/cancel, interrupt, switchModel/switchAgent, event stream), and it is driven through `/__e2e/chat` control calls. `tests/e2e/server.ts` registers it as an extra agent served by the real `ChatAdapter` and `OpenCodeV2Provider`. The Claude Send now flow uses the existing `FakeE2EChatService` (`claude` agent) extended with `send-now`. *Alternative rejected:* extending `FakeE2EChatService` with steering. It is cheaper, but it would not exercise the adapter or provider in e2e.
+
+## Risks / Trade-offs
+
+- [The wait for withdrawal confirmation could hang if the stream is down] → Bounded wait plus an `inbox.list` decision (D7). The mutation reports failure rather than guessing, and the steer stays in the dock.
+- [The derived paused state could disagree with OpenCode after a missed idle] → The paused state is recomputed from the projection status on every snapshot and reconnect, so at worst the label is stale and delivery is unaffected. Send now on a steer that is not actually stranded is a harmless wake.
+- [Undo replacement batches older paused steers with the replacement] → By decision (D6). The undo confirmation names those steers, so the user knows before submitting.
+- [The timeline row moving from enqueue to delivery changes 2.x command id convergence] → D4 re-keys `reportEnqueuedUser`, and the existing command tests guard it.
+- [`delivered` with no remembered payload, for example a workspace restart while a steer was pending] → The row comes from history on the next snapshot. Until then the dock entry clears and the row is absent, the same as today's restart behavior for in-flight work.
+- [The OpenCode TUI on the same session does not see Uatu-held messages] → Accepted limitation, as agreed.
+- [The Uatu queue is lost on workspace restart, while steers survive in OpenCode's SQLite] → Accepted for the queue. Steers re-appear through `inbox.list` on attach (D3).
+- [A Send now/steer menu could disturb the action rail] → It stays inside the fixed footprint. The existing rail-stability e2e test covers it.
+
+## Migration Plan
+
+This is one deployable change with no data migration. The workspace API revision goes from 24 to 25, with an `api/CHANGELOG.md` entry. Strict consumers (web, Desktop WebView) ship the same assets, and the freshness handshake makes a stale pairing diagnosable. Rollback is a revert. The release note is a visible `feat(chat)`, because steering is new user-facing behavior.
+
+## Open Questions
+
+None.
