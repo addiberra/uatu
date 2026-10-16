@@ -68,6 +68,13 @@ function changeSelect(root: HTMLElement, value: string) {
 
 const overviewKey = (id = "key", enabled = true): Extract<PublicCredentialDto, { type: "ssh" }> => ({ id, type: "ssh", name: `Identity ${id}`, enabled, createdAt: "2026-01-01", capabilities: ["ssh-authentication"], metadata: { fingerprint: "public-only", publicKey: "public-only" }, assignments: [], readiness: [{ layer: "credential", status: "ready", message: "Unlocked (prose is not a fact)" }] });
 const keyFacts = (id: string, lock: "locked" | "unlocked" | "unknown"): CredentialFacts => ({ id, type: "ssh", protection: { status: "known", value: "unprotected" }, lock: lock === "unknown" ? { status: "unknown" } : { status: "known", value: lock }, userId: { status: "not-applicable" } });
+test("runtime and branch remain separate whole labels with textual separation", async () => {
+  const h = harness(); await h.ui.ready;
+  const status = h.root.querySelector('.mh-workspace[data-workspace="a"] .mh-status')!;
+  expect(status.querySelector(".mh-runtime")?.textContent).toBe("● Running");
+  expect(status.querySelector(".mh-branch")?.textContent).toBe("feature/test");
+  expect(status.textContent).toBe("● Running feature/test");
+});
 test("Settings uses the supplied branding for every image, including identity", async () => {
   const h = harness({}, { brandLogoUrl: "/hub-assets/logo.svg" });
   await h.ui.ready; h.ui.show("settings");
@@ -399,6 +406,14 @@ describe("stable Return and explicit workspace intents", () => {
 });
 
 describe("Settings and browser-owned preference sheets", () => {
+  test("a safety disclosure stays open and focused through overview refresh", async () => {
+    const h = harness(); await h.ui.ready; h.ui.show("settings");
+    const disclosure = h.root.querySelector<HTMLDetailsElement>(".mh-safety-disclosure")!;
+    disclosure.open = true; disclosure.querySelector<HTMLElement>("summary")!.focus();
+    await h.ui.refresh();
+    expect(h.root.querySelector<HTMLDetailsElement>(".mh-safety-disclosure")!.open).toBe(true);
+    expect(document.activeElement).toBe(h.root.querySelector(".mh-safety-disclosure > summary"));
+  });
   test("overview is grouped destinations rather than inline forms", async () => {
     const h = harness(); await h.ui.ready; h.click("settings");
     expect(h.root.querySelector(".mh-identity strong")?.textContent).toBe("Reviewer");

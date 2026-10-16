@@ -57,16 +57,30 @@ export function sharedUidKey(user: string): string {
 }
 export const sharedUidWarning = "Local workspace credential assignments configure normal tools only. All workspaces run as the Hub OS user, so same-UID processes can inspect runtime files, reach shared agents, unset the configuration, and use credentials assigned elsewhere.";
 const dismissed = new Set<string>();
-export function advisory(user: string, dismissible = true): string {
+function advisoryDismissed(user: string): boolean {
   const key = sharedUidKey(user);
   try { if (window.localStorage.getItem(key) === "dismissed") dismissed.add(key); } catch { /* in-memory fallback */ }
-  const details = `<section class="mh-safety-details" aria-label="Credential safety details"><h2>Credential safety details</h2>${text(sharedUidWarning)}${text("Do not run untrusted projects under this shared OS user. Disabling or deleting a provider token may stop running workspaces that still use it; removing a running workspace's assignment requires stopping its shells first.")}</section>`;
-  return (dismissed.has(key) ? "" : `<aside class="mh-advisory" data-shared-uid aria-label="Credential security"><h2>${mobileHubIcon("shield")}<span>Credentials are shared on this Hub</span></h2>${text("Assignments choose defaults for tools. They do not prevent another workspace on this Hub from accessing a credential.")}${dismissible ? action("dismiss-advisory", "Dismiss") : ""}</aside>`) + details;
+  return dismissed.has(key);
+}
+const assignmentWarning = "Assignments choose defaults for tools. They do not prevent another workspace on this Hub from accessing a credential.";
+const safetyFacts = () => text(sharedUidWarning) + text("Do not run untrusted projects under this shared OS user. Disabling or deleting a provider token may stop running workspaces that still use it; removing a running workspace's assignment requires stopping its shells first.");
+/** Overview only: concise context, with the complete facts always reachable even
+ * after dismissal. Native disclosure supplies keyboard/screen-reader semantics. */
+export function credentialSafetyNotice(user: string): string {
+  return (advisoryDismissed(user) ? "" : `<aside class="mh-credential-notice" data-shared-uid aria-label="Credential security">${mobileHubIcon("shield")}<p>Credentials are shared across workspaces on this Hub.</p><button type="button" data-flow="dismiss-advisory" aria-label="Dismiss credential sharing notice">Dismiss</button></aside>`)
+    + `<details class="mh-safety-disclosure"><summary>Credential safety details</summary><div class="mh-safety-details">${text(assignmentWarning)}${safetyFacts()}</div></details>`;
+}
+export function advisory(user: string, dismissible = true): string {
+  const details = `<section class="mh-safety-details" aria-label="Credential safety details"><h2>Credential safety details</h2>${safetyFacts()}</section>`;
+  return (advisoryDismissed(user) ? "" : `<aside class="mh-advisory" data-shared-uid aria-label="Credential security"><h2>${mobileHubIcon("shield")}<span>Credentials are shared on this Hub</span></h2>${text(assignmentWarning)}${dismissible ? action("dismiss-advisory", "Dismiss") : ""}</aside>`) + details;
 }
 export function dismissAdvisory(user: string, root: HTMLElement) {
   const key = sharedUidKey(user); dismissed.add(key);
   try { window.localStorage.setItem(key, "dismissed"); } catch { /* in-memory fallback */ }
   root.querySelectorAll("[data-shared-uid]").forEach(el => el.remove());
+  // WebKit does not necessarily focus the clicked button. Explicitly orient
+  // dismissal to the persistent facts instead of depending on activeElement.
+  root.querySelector<HTMLElement>(".mh-safety-disclosure > summary")?.focus({ preventScroll: true });
 }
 
 export interface FlowEnvironment {

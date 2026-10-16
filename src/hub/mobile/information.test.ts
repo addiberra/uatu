@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { parseHTML } from "linkedom";
 import { infoRows } from "./information";
-import { advisory, check, createFlowEnvironment, sharedUidKey } from "./flow-ui";
+import { advisory, credentialSafetyNotice, dismissAdvisory, check, createFlowEnvironment, sharedUidKey, sharedUidWarning } from "./flow-ui";
 import { createTaskView } from "./task-view";
 import type { MobileHubBackend, OperationResult } from "./backend";
 
@@ -60,4 +60,24 @@ test("inline named security notice dismisses in editors and stays dismissed per 
   for (const fact of ["same-UID", "runtime files", "shared agents", "unset the configuration", "credentials assigned elsewhere"]) expect(advisory(user)).toContain(fact);
   expect(advisory("another-information-test-user")).not.toBe("");
   expect(sharedUidKey("user")).toBe("uatu.hub.notice.shared-uid-v1:dXNlcg");
+});
+
+test("overview safety is concise with all exact facts in an always-reachable native disclosure", () => {
+  const user = "overview-disclosure-test";
+  const { document } = parseHTML(`<main>${credentialSafetyNotice(user)}</main>`);
+  const root = document.querySelector("main")! as unknown as HTMLElement;
+  const detail = root.querySelector("details")!;
+  expect(detail.hasAttribute("open")).toBe(false);
+  expect(detail.querySelector("summary")?.textContent).toBe("Credential safety details");
+  expect(root.querySelector("h2, .mh-advisory")).toBeNull();
+  expect(root.querySelector("aside")?.textContent).toContain("Credentials are shared across workspaces on this Hub.");
+  expect(detail.textContent).toContain(sharedUidWarning);
+  for (const fact of ["Assignments choose defaults for tools.", "They do not prevent another workspace", "Do not run untrusted projects", "Disabling or deleting a provider token may stop running workspaces", "removing a running workspace's assignment requires stopping its shells first."]) expect(detail.textContent).toContain(fact);
+  dismissAdvisory(user, root);
+  expect(root.querySelector("aside")).toBeNull();
+  expect(root.querySelector("details")).toBe(detail);
+  expect(credentialSafetyNotice(user)).toContain("<summary>Credential safety details</summary>");
+  expect(credentialSafetyNotice(user)).not.toContain("data-shared-uid");
+  expect(advisory(user)).toContain(sharedUidWarning);
+  expect(advisory(user)).toContain("<h2>Credential safety details</h2>");
 });

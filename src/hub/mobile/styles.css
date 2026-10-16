@@ -18,6 +18,9 @@
 .mh-root :focus:not(:focus-visible) { outline: none; }
 .mh-root h1 { font-size: var(--mh-type-page); line-height: 1.15; letter-spacing: -.6px; margin: 0 0 var(--mh-space-2); font-weight: 700; overflow-wrap: anywhere; }
 .mh-root .mh-page { height: 100%; overflow: auto; overscroll-behavior: contain; padding: max(var(--mh-space-5), env(safe-area-inset-top)) max(var(--mh-space-5), env(safe-area-inset-right)) calc(var(--mh-keyboard-clearance) + var(--mh-dock-clearance) + var(--mh-overview-toolbar-height) + var(--mh-space-7)) max(var(--mh-space-5), env(safe-area-inset-left)); }
+/* Production Hub documents have legacy global main rules; workspace documents
+   do not. The page already owns spacing/scroll clearance in both contexts. */
+.mh-root .mh-page > main { position: static; max-width: none; margin: 0; padding: 0; }
 .mh-root .mh-brand { display: flex; align-items: center; gap: var(--mh-space-2); font-weight: 700; margin-bottom: var(--mh-space-5); min-height: 25px; }
 .mh-root .mh-brand img { width: 22px; height: 22px; object-fit: contain; }
 .mh-root .mh-subtitle { color: var(--mh-muted); margin: 0 0 var(--mh-space-6); font-size: var(--mh-type-control); }
@@ -34,9 +37,12 @@
 .mh-root .mh-workspace p { font-size: var(--mh-type-secondary); line-height: 1.4; margin: 0; color: var(--mh-muted); overflow-wrap: anywhere; }
 .mh-root .mh-more { position: absolute; right: 7px; top: 11px; width: var(--mh-target); display: grid; place-items: center; }
 .mh-root .mh-more .mh-icon, .mh-root .mh-tab .mh-icon { width: 22px; height: 24px; }
-.mh-root .mh-status { display: flex; align-items: center; gap: var(--mh-space-2); color: var(--mh-muted); font-size: var(--mh-type-secondary); min-width: 0; overflow-wrap: anywhere; }
+.mh-root .mh-status { display: flex; flex-wrap: wrap; align-content: center; align-items: center; gap: var(--mh-space-1) var(--mh-space-2); color: var(--mh-muted); font-size: var(--mh-type-secondary); min-width: 0; overflow-wrap: anywhere; }
 .mh-root .mh-status .mh-icon { width: 12px; height: 15px; }
-.mh-root .mh-status > span:first-child:not(:only-child) { font-size: .625rem; }
+.mh-root .mh-runtime, .mh-root .mh-branch { display: inline-flex; align-items: center; gap: var(--mh-space-1); max-width: 100%; }
+.mh-root .mh-runtime { flex: none; white-space: nowrap; }
+.mh-root .mh-runtime > span { font-size: .625rem; }
+.mh-root .mh-branch { min-width: 0; }
 .mh-root .mh-running, .mh-root .mh-identity .mh-running { color: var(--mh-positive); }
 /* Repeated workspace-row commands stay secondary to Add Workspace. */
 .mh-root .mh-primary { font-size: var(--mh-type-control); font-weight: 600; border-radius: var(--mh-radius-button); min-width: 66px; padding: var(--mh-space-1) var(--mh-space-4); text-align: center; align-self: center; background: var(--mh-action-subtle); }
@@ -138,7 +144,7 @@
 .mh-root .mh-switch:has(input:disabled) { opacity: .5; cursor: not-allowed; }
 .mh-root .mh-paste { margin: var(--mh-space-4) 0; }
 .mh-root .mh-paste summary, .mh-root .mh-technical-details > summary { color: var(--mh-action); }
-.mh-root summary { cursor: pointer; min-height: var(--mh-target); padding: var(--mh-space-3) var(--mh-space-4); overflow-wrap: anywhere; }
+.mh-root summary { font: inherit; cursor: pointer; min-height: var(--mh-target); padding: var(--mh-space-3) var(--mh-space-4); overflow-wrap: anywhere; }
 .mh-root textarea[data-secret] { -webkit-text-security: disc; }
 .mh-root .mh-public-key, .mh-root .mh-clone-output { white-space: pre-wrap; overflow-wrap: anywhere; font: var(--mh-type-secondary)/1.5 var(--mh-font-mono); max-height: 35vh; overflow: auto; padding: var(--mh-space-4); background: var(--mh-surface); border-radius: var(--mh-radius-group); }
 .mh-root .mh-login { margin-top: var(--mh-space-6); }
@@ -237,6 +243,15 @@
 .mh-root .mh-workspace-family[open] > summary > [data-icon="chevron"] { transform: rotate(90deg); }
 .mh-root .mh-workspace-family > summary:focus-visible { outline: 2px solid currentColor; outline-offset: -3px; }
 .mh-root .mh-safety-details { margin: 8px 0; padding: 8px 16px; }
+.mh-root .mh-safety-details h2 { font-size: var(--mh-type-body); line-height: 1.4; margin: 0 0 var(--mh-space-2); }
+.mh-root .mh-credential-notice { display: flex; align-items: center; gap: var(--mh-space-2); padding: var(--mh-space-2) var(--mh-space-4) 0; color: var(--mh-muted); font-size: var(--mh-type-secondary); }
+.mh-root .mh-credential-notice > .mh-icon { width: 18px; height: 20px; }
+.mh-root .mh-credential-notice p { margin: 0; flex: 1; }
+.mh-root .mh-credential-notice button { flex: none; padding-inline: var(--mh-space-1); }
+.mh-root .mh-safety-disclosure { font-size: var(--mh-type-secondary); }
+.mh-root .mh-safety-disclosure > summary { color: var(--mh-action); }
+.mh-root .mh-safety-disclosure .mh-safety-details { padding-top: 0; }
+.mh-root .mh-safety-disclosure .mh-note { margin-inline: 0; }
 .mh-root .mh-device-code { display: block; font: 700 1.8rem var(--mh-font-mono); letter-spacing: .08em; overflow-wrap: anywhere; user-select: all; margin: 16px 0; }
 .mh-root .mh-account-login-link { display: inline-flex; align-items: center; min-height: var(--mh-target); color: var(--mh-action); overflow-wrap: anywhere; }
 .mh-root .mh-notifications { padding: 0 16px; overflow-wrap: anywhere; }

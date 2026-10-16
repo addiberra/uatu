@@ -7,7 +7,7 @@ import { DEFAULT_NAVIGATION_PLACEMENT, getNavigationPreferences, setNavigationPr
 import { mobileHubIcon as icon } from "./icons";
 import { group as section, text as note, destinationRow as destination, choiceGroup as choices, emptyState } from "./design-system";
 import { createMobileHubFlows, type MobileHubDetail } from "./flows";
-import { advisory, clearSecrets, dismissAdvisory, field as flowField, showContextualError } from "./flow-ui";
+import { credentialSafetyNotice, clearSecrets, dismissAdvisory, field as flowField, showContextualError } from "./flow-ui";
 import { branchLabel } from "./workspace-presentation";
 import { mobileWorkspaceGroups, type MobileWorkspaceGroup } from "./workspace-groups";
 export { branchLabel } from "./workspace-presentation";
@@ -146,7 +146,7 @@ export function mountMobileHub(root: HTMLElement, backend: MobileHubBackend, cal
   }
   function workspaceRow(w: WorkspaceView) {
     const running = w.runtime.status === "running";
-    return `<article class="mh-workspace" data-workspace="${esc(w.id)}"><span class="mh-folder">${icon("folder")}</span><div class="mh-workspace-copy"><h3>${esc(w.displayName)}</h3><p>${esc(w.path)}</p></div>${button(`info:${w.id}`, icon("more"), "mh-more", `aria-label="Information and actions for ${esc(w.displayName)}, ${esc(w.path)}"`)}<div class="mh-status ${running && !w.availability ? "mh-running" : ""}">${w.availability ? esc(`Checkout ${w.availability}`) : `${running ? '<span aria-hidden="true">●</span> Running · ' : ""}${icon("branch")}<span>${esc(branchLabel(w.branch))}</span>`}</div>${button(`${running ? "open" : "start"}:${w.id}`, running ? "Open" : "Start", "mh-primary", w.availability ? 'disabled aria-description="Checkout unavailable; inspect Information and actions"' : "")}</article>`;
+    return `<article class="mh-workspace" data-workspace="${esc(w.id)}"><span class="mh-folder">${icon("folder")}</span><div class="mh-workspace-copy"><h3>${esc(w.displayName)}</h3><p>${esc(w.path)}</p></div>${button(`info:${w.id}`, icon("more"), "mh-more", `aria-label="Information and actions for ${esc(w.displayName)}, ${esc(w.path)}"`)}<div class="mh-status ${running && !w.availability ? "mh-running" : ""}">${w.availability ? esc(`Checkout ${w.availability}`) : `${running ? '<span class="mh-runtime"><span aria-hidden="true">●</span> Running</span> ' : ""}<span class="mh-branch">${icon("branch")}<span>${esc(branchLabel(w.branch))}</span></span>`}</div>${button(`${running ? "open" : "start"}:${w.id}`, running ? "Open" : "Start", "mh-primary", w.availability ? 'disabled aria-description="Checkout unavailable; inspect Information and actions"' : "")}</article>`;
   }
   function workspaceGroup(group: MobileWorkspaceGroup) {
     if (group.checkouts.length === 1) return workspaceRow(group.checkouts[0]!);
@@ -186,7 +186,7 @@ export function mountMobileHub(root: HTMLElement, backend: MobileHubBackend, cal
     const prefs = getNavigationPreferences();
     const folderValue = defaultFolder.status === "ready" ? defaultFolder.value.effective.split("/").filter(Boolean).at(-1) || "/" : defaultFolder.status === "loading" ? "Loading…" : "Unavailable";
     const folderNotice = defaultFolder.status === "ready" && defaultFolder.value.configured && !defaultFolder.value.configuredAvailable ? "Saved folder unavailable; using fallback" : "";
-    const catalog = advisory(identity?.user ?? "") + `<div data-credential-catalog>${credentialCatalog()}</div>`;
+    const catalog = credentialSafetyNotice(identity?.user ?? "") + `<div data-credential-catalog>${credentialCatalog()}</div>`;
     const accounts = section("Agent accounts", destination("agent-accounts", "Agent accounts", "device", "OpenCode and Claude Code · Shared by all Hub users"));
     return `<h1>Settings</h1>${identity ? button("identity", `<img src="${esc(brandLogoUrl)}" alt=""/><span><strong>${esc(identity.user)}</strong><small>${esc(identity.host)}</small><small class="mh-running">${authenticationProblem ? "Connection unconfirmed" : "● Connected"}</small></span>`, "mh-identity") : ""}`
       + section("Credentials", `${catalog}${button("add-credential", "Add Credential", "mh-text-action")}`) + note("Secure access for your workspaces. Stored only on this hub.") + accounts
@@ -200,18 +200,25 @@ export function mountMobileHub(root: HTMLElement, backend: MobileHubBackend, cal
     if (sheet) { renderDeferred = true; revalidationNotice(); return; }
     renderDeferred = false;
     const activeAction = page.contains(root.ownerDocument.activeElement) ? (root.ownerDocument.activeElement as HTMLElement)?.dataset.action : undefined;
+    const safetySummary = page.querySelector(".mh-safety-disclosure > summary");
+    const safetyFocused = !!safetySummary && root.ownerDocument.activeElement === safetySummary;
     const previousScroll = page.scrollTop;
     page.querySelectorAll<HTMLDetailsElement>("details[data-family]").forEach(detail => disclosures.set(detail.dataset.family!, detail.open));
+    const safety = page.querySelector<HTMLDetailsElement>(".mh-safety-disclosure");
+    if (safety) disclosures.set("credential-safety", safety.open);
     clearSecrets(page);
     page.innerHTML = `<header class="mh-brand"><img src="${esc(brandLogoUrl)}" alt=""/><span>UatuCode</span></header><main>${signedOut ? login() : !identity ? `<h1>UatuCode</h1>${workspaces.status === "unavailable" ? `<div role="alert">${note(workspaces.problem.message)}${button("refresh", "Retry", "mh-text-action")}</div>` : note("Connecting to hub…")}` : route === "hub" ? dashboard() : settings()}</main>${identity ? dock() : ""}`;
     page.querySelector<HTMLElement>("main")!.inert = !!flows.detail;
     if (flows.detail) page.querySelector("main")!.setAttribute("aria-hidden", "true");
     else page.querySelector("main")!.removeAttribute("aria-hidden");
     page.querySelector("[data-flow=\"dismiss-advisory\"]")?.addEventListener("click", () => { if (identity) dismissAdvisory(identity.user, page); });
+    const safetyDisclosure = page.querySelector<HTMLDetailsElement>(".mh-safety-disclosure");
+    if (safetyDisclosure) safetyDisclosure.open = disclosures.get("credential-safety") ?? false;
     page.querySelector<HTMLFormElement>(".mh-login")?.addEventListener("submit", event => { event.preventDefault(); void signIn(); });
     if (loginBusy) page.querySelectorAll<HTMLInputElement>(".mh-login input").forEach(input => { input.disabled = true; });
     page.scrollTop = previousScroll;
     if (activeAction) [...page.querySelectorAll<HTMLElement>("[data-action]")].find(el => el.dataset.action === activeAction)?.focus();
+    if (safetyFocused) safetyDisclosure?.querySelector<HTMLElement>("summary")?.focus({ preventScroll: true });
     revalidationNotice();
   }
   function revalidationNotice() {
