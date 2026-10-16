@@ -5041,7 +5041,7 @@ html[data-ui-mode="touch"]:not([data-active-tab="preview"]) .uatu-outline {
    only — desktop has browser zoom, and its chrome stays clean. Same
    CSS-owned visibility recipe as the terminal keybar. */
 .terminal-font-button,
-.text-size-action {
+.preview-text-size {
   display: none;
 }
 
@@ -5054,12 +5054,23 @@ html[data-ui-mode="touch"]:not([data-active-tab="preview"]) .uatu-outline {
     letter-spacing: 0.02em;
   }
 
-  .text-size-action {
+  .preview-text-size {
     display: inline-flex;
-    width: auto;
-    padding: 0 0.4rem;
-    font-size: 0.72rem;
+    align-items: center;
+    gap: 0.25rem;
   }
+}
+
+/* Touch presentation remains usable after a viewport/input-mode change. Keep
+   this labeled group intact and wrap the action bar, never drop controls. */
+html[data-ui-mode="touch"] .preview-text-size { display: inline-flex; align-items: center; gap: 0.25rem; }
+.preview-text-size > span { font-size: 0.75rem; white-space: nowrap; }
+.preview-text-size .text-size-action { width: 44px; height: 44px; flex: none; font-size: 0.8rem; }
+html[data-ui-mode="touch"] .preview-action-bar { flex-wrap: wrap; }
+html[data-ui-mode="touch"] .preview-action-bar > .action-icon { min-width: 44px; min-height: 44px; }
+@media (pointer: coarse) {
+  .preview-action-bar { flex-wrap: wrap; }
+  .preview-action-bar > .action-icon { min-width: 44px; min-height: 44px; }
 }
 
 /* Sticky Ctrl latch: armed state must be visible at a glance. */
@@ -5847,6 +5858,17 @@ html[data-ui-mode="desktop"][data-notification-chat] .chat-expand-strip {
   cursor: default;
   opacity: 0.6;
 }
+
+html[data-ui-mode="touch"] .chat-unavailable :is(button, summary, a) {
+  min-height: 44px;
+  box-sizing: border-box;
+}
+html[data-ui-mode="touch"] .chat-unavailable :is(summary, a) {
+  display: flex;
+  align-items: center;
+}
+html[data-ui-mode="touch"] .chat-unavailable summary::before { content: "▸"; margin-right: 0.4em; }
+html[data-ui-mode="touch"] .chat-unavailable details[open] summary::before { content: "▾"; }
 
 .chat-timeline {
   flex: 1 1 auto;

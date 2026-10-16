@@ -4917,22 +4917,40 @@ export function initChat(api = new ChatApiClient()): void {
       newButton.disabled = true;
     }
     const agentName = agentStatusFor(agentId)?.agent.name ?? agentId;
-    announce(`${agentName}: ${availability.message}`, true);
+    const touch = document.documentElement.dataset.uiMode === "touch";
+    announce(touch ? options.takeover ? "No chat agents are available. Repair an agent below, then retry it." : `${agentName} is unavailable.` : `${agentName}: ${availability.message}`, true);
+    for (const previous of state.querySelectorAll<HTMLElement>(".chat-unavailable")) {
+      if (previous.dataset.agentId === agentId) previous.remove();
+    }
 
     const panel = document.createElement("div");
     panel.className = "chat-unavailable";
+    panel.dataset.agentId = agentId;
     // The panel names its own agent: a takeover renders one panel per
     // failed agent, and two bare Retry buttons would be indistinguishable.
     const heading = document.createElement("p");
     heading.className = "chat-unavailable__heading";
-    heading.textContent = `${agentName}: ${availability.message}`;
+    heading.textContent = touch ? `${agentName} · ${availability.reason === "not-installed" ? "CLI not installed" : availability.reason === "unsupported" ? "Unsupported installation" : "Could not start"}` : `${agentName}: ${availability.message}`;
     panel.append(heading);
 
-    if (availability.diagnostics) {
+    if (touch) {
+      const guidance = document.createElement("p");
+      guidance.textContent = availability.reason === "not-installed"
+        ? `Ask the Hub operator to install ${agentName} on the machine running UatuCode and make its CLI available on PATH. Agent accounts manages logins; it cannot install a CLI.`
+        : `Check ${agentName}'s installation and the full error below on the machine running UatuCode. A startup failure is not evidence of a missing account login.`;
+      panel.append(guidance);
+      const setup = loginActionFor(agentId, agentName);
+      if (setup.href) {
+        const link = document.createElement("a"); link.className = "chat-login-link"; link.href = setup.href;
+        link.textContent = `Review ${agentName} account setup`; panel.append(link);
+      }
+    }
+
+    if (touch || availability.diagnostics) {
       const details = document.createElement("details");
       details.className = "chat-unavailable__details";
       const summary = document.createElement("summary");
-      summary.textContent = "Diagnostics";
+      summary.textContent = touch ? "Full error and diagnostics" : "Diagnostics";
       const report = document.createElement("pre");
       report.className = "chat-unavailable__report";
       report.textContent = formatDiagnostics(availability);
@@ -4956,7 +4974,7 @@ export function initChat(api = new ChatApiClient()): void {
     const retry = document.createElement("button");
     retry.type = "button";
     retry.className = "chat-unavailable__retry";
-    retry.textContent = "Retry";
+    retry.textContent = touch ? `Retry ${agentName}` : "Retry";
     if (availability.reason === "not-installed") retry.classList.add("is-secondary");
     retry.addEventListener("click", async () => {
       retry.disabled = true;
@@ -5012,6 +5030,7 @@ export function initChat(api = new ChatApiClient()): void {
         }
         return;
       }
+      if (document.documentElement.dataset.uiMode === "touch") state.querySelectorAll(".chat-unavailable").forEach(panel => panel.remove());
       // Named before anything is fetched: every later render reads the agent,
       // and a control that appeared unnamed and then renamed itself would be
       // the pop-in this seam exists to avoid. The starting context is the

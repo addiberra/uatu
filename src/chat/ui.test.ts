@@ -2281,6 +2281,30 @@ function taskApi(document: Document, options: {
   } as unknown as ChatApiClient;
 }
 
+test("unavailable agents have one summary, full errors, installation guidance and independently named retries", async () => {
+  const { document, window } = parseHTML(html); installDomGlobals(document, window); stubConversationSelect(document);
+  document.documentElement.setAttribute("data-ui-mode", "touch"); document.documentElement.setAttribute("data-active-tab", "chat");
+  const statuses = [
+    { agent: { id: "opencode", name: "OpenCode" }, availability: { state: "unavailable", reason: "not-installed", message: "OpenCode executable missing from fixture PATH" } },
+    { agent: { id: "claude", name: "Claude Code" }, availability: { state: "unavailable", reason: "startup-failed", message: "Claude fixture startup failed in probe" } },
+  ];
+  const retries: string[] = [];
+  const api = { ...taskApi(document, { items: () => [] }), status: async () => statuses, retry: async (id: string) => { retries.push(id); return statuses.find(s => s.agent.id === id)!; } } as unknown as ChatApiClient;
+  const { initChat } = await import(`./ui.ts?unavailable-review=${Date.now()}`); initChat(api);
+  await waitUntil(() => document.querySelectorAll(".chat-unavailable").length === 2, () => document.querySelector("#chat-state")?.textContent ?? "waiting");
+  const state = document.querySelector("#chat-state")!;
+  expect(state.textContent?.split("No chat agents are available.")).toHaveLength(2);
+  expect(state.textContent).toContain("Agent accounts manages logins; it cannot install a CLI.");
+  expect(state.textContent).toContain("A startup failure is not evidence of a missing account login.");
+  expect([...state.querySelectorAll(".chat-unavailable__report")].map(el => el.textContent)).toEqual(statuses.map(s => s.availability.message));
+  expect([...state.querySelectorAll(".chat-unavailable__retry")].map(el => el.textContent)).toEqual(["Retry OpenCode", "Retry Claude Code"]);
+  state.querySelector<HTMLButtonElement>('[data-agent-id="claude"] .chat-unavailable__retry')!.click();
+  await waitUntil(() => retries.length === 1 && state.querySelectorAll(".chat-unavailable").length === 2, () => state.textContent ?? "waiting");
+  expect(retries).toEqual(["claude"]);
+  expect(state.querySelectorAll('[data-agent-id="opencode"]')).toHaveLength(1);
+  expect(state.querySelectorAll('[data-agent-id="claude"]')).toHaveLength(1);
+});
+
 afterAll(() => {
   for (const [key, value] of savedGlobals) Reflect.set(globalThis, key, value);
 });

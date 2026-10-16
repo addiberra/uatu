@@ -417,7 +417,10 @@ describe("Settings and browser-owned preference sheets", () => {
   test("overview is grouped destinations rather than inline forms", async () => {
     const h = harness(); await h.ui.ready; h.click("settings");
     expect(h.root.querySelector(".mh-identity strong")?.textContent).toBe("Reviewer");
-    expect([...h.root.querySelectorAll(".mh-section > h2")].map(el => el.textContent)).toEqual(["Credentials", "Agent accounts", "Workspaces", "Notifications", "Account", "More settings"]);
+    expect([...h.root.querySelectorAll(".mh-section > h2")].map(el => el.textContent)).toEqual(["Credentials", "Agent accounts", "Workspaces", "Navigation", "Notifications", "Account"]);
+    const section = (name: string) => [...h.root.querySelectorAll(".mh-section")].find(el => el.querySelector("h2")?.textContent === name)!;
+    for (const key of ["auto-hide", "handle", "preview-side"]) expect(section("Navigation").querySelector(`[data-action="${key}"]`)).not.toBeNull();
+    for (const key of ["tools", "assignments"]) expect(section("Credentials").querySelector(`[data-action="${key}"]`)).not.toBeNull();
     expect(h.root.querySelector('[data-shared-uid]')?.closest(".mh-section")?.querySelector("h2")?.textContent).toBe("Credentials");
     expect(h.root.querySelector("input,select")).toBeNull();
     h.click("add-credential");

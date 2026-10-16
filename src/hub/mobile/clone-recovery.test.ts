@@ -41,7 +41,8 @@ function mount(backend: MobileHubBackend) {
     home: () => { clone.hide(); owner.leave(); }, navigate: () => {}, changed: () => {}, openWorkspace: () => {},
     authLost: () => { authGeneration++; clone.reset(); owner.invalidate(); },
   });
-  const clone = createCloneFlow(owner.env, createCredentialFlows(owner.env).unlock, () => {});
+  const credentials = createCredentialFlows(owner.env);
+  const clone = createCloneFlow(owner.env, credentials.unlock, () => {}, credentials.setup);
   const show = () => { owner.begin(); clone.show(); };
   const region = () => modal ?? root;
   const click = (key: string) => { const button = region().querySelector<HTMLButtonElement>(`[data-flow="${key}"], [data-action="${key}"]`); if (!button) throw new Error(`Missing action ${key}: ${region().textContent}`); button.click(); };

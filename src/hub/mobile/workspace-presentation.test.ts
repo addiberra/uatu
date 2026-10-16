@@ -68,7 +68,8 @@ test.each([true, false])("workspace detail preserves facts and a sole contextual
   expect(values(section("Git authentication"), "Credential")).toEqual(["Shared identity", "Shared identity"]);
   expect(values(section("Commit signing"), "Credential")).toEqual(["Shared identity"]);
   if (running) { expect(h.root.textContent).toContain("1 shells"); expect(h.root.textContent).toContain("Build shell · Attached"); }
-  expect(h.root.textContent).not.toContain("Workspace actions");
+  expect(h.root.querySelector("details [data-workspace-assignments]")).not.toBeNull();
+  expect(h.root.innerHTML.indexOf('data-flow="rename"')).toBeLessThan(h.root.innerHTML.indexOf("<details"));
   expect(h.root.querySelectorAll('[data-flow="open"]')).toHaveLength(1);
   const primary = h.root.querySelector<HTMLButtonElement>('.mh-flow-content [data-flow="open"]')!;
   expect(primary.classList.contains("mh-commit")).toBe(true);

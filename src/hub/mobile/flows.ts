@@ -18,8 +18,8 @@ export function createMobileHubFlows(root: HTMLElement, backend: MobileHubBacken
   const owner = createFlowEnvironment(root, backend, sheet, { ...hooks, home: () => { leave(); hooks.home(); hooks.detailChanged?.(null); }, navigate: next => show(next, true) });
   const credentials = createCredentialFlows(owner.env);
   const workspaces = createWorkspaceFlows(owner.env, hooks.startWorkspace);
-  const onboarding = createOnboardingFlows(owner.env);
-  const clone = createCloneFlow(owner.env, credentials.unlock, path => { show({ kind: "folders" }, true); onboarding.browse(path, undefined, () => show({ kind: "clone" }, true)); });
+  const onboarding = createOnboardingFlows(owner.env, credentials.setup);
+  const clone = createCloneFlow(owner.env, credentials.unlock, path => { show({ kind: "folders" }, true); onboarding.browse(path, undefined, () => show({ kind: "clone" }, true)); }, credentials.setup);
   const accounts = createAgentAccountFlows(owner.env);
   let disposeNotifications = () => {};
   const stopNotifications = () => { disposeNotifications(); disposeNotifications = () => {}; };

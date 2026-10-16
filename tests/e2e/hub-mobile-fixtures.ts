@@ -1,6 +1,6 @@
 import { test as base, expect, type APIRequestContext, type Page } from "@playwright/test";
 import { execFileSync, spawn } from "node:child_process";
-import { mkdtemp, mkdir, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 export type HubMobileFixture = {
@@ -10,16 +10,24 @@ export type HubMobileFixture = {
   workspaces: Record<"a" | "b", string>;
 };
 
-export const test = base.extend<{ hub: HubMobileFixture }>({
-  hub: [async ({}, use) => {
+export const test = base.extend<{ hub: HubMobileFixture; withoutAgentCli: boolean }>({
+  withoutAgentCli: [false, { option: true }],
+  hub: [async ({ withoutAgentCli }, use) => {
     // Short paths matter for real Unix-domain SSH/GnuPG agent sockets on macOS.
     const root = await realpath(await mkdtemp("/tmp/uatu-hm-"));
     const home = path.join(root, "home");
     await mkdir(home);
+    let toolPath = process.env.UATU_HUB_MOBILE_TOOL_PATH ?? "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
+    if (withoutAgentCli) {
+      const tools = path.join(root, "tools"); await mkdir(tools);
+      const bun = execFileSync("bun", ["-e", "process.stdout.write(process.execPath)"], { encoding: "utf8" });
+      await symlink(bun, path.join(tools, "bun"));
+      toolPath = `${tools}:/usr/bin:/bin:/usr/sbin:/sbin`;
+    }
     // Do not inherit the invoking Hub's projected Git/SSH wrappers, agents,
     // provider credentials, or the developer's personal config directories.
     const env: NodeJS.ProcessEnv = {
-      PATH: process.env.UATU_HUB_MOBILE_TOOL_PATH ?? "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+      PATH: toolPath,
       HOME: home,
       XDG_CONFIG_HOME: path.join(home, ".config"),
       XDG_DATA_HOME: path.join(home, ".local", "share"),

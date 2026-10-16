@@ -176,3 +176,31 @@ Tests below are under `tests/mobile-hub-review/` unless stated otherwise.
    services or authorization correctness is certified. Full final browser rerun
    after cross-workspace expansion and remote access/version capture await lead
    update. **User approval and accepted exceptions remain entirely pending.**
+# Approved independent live UX regression flows — 2026-10-16
+
+Use the isolated production fixtures in `mobile-live-ux-review.e2e.ts` for these
+flows; do not perform destructive testing against the preserved live services.
+
+1. Workspace More → direct Edit workspace credentials → Review → browser Back →
+   Cancel; verify raw host draft, workspace URL and original retained DOM.
+2. Workspace information → Manage credential assignments and hosts → Back;
+   compare global Settings → Manage workspace credentials → workspace → Back.
+3. Empty Clone → type draft → Set up repository credentials → token editor →
+   Back → return. Repeat with an explicitly added disposable token: draft and
+   no-selection remain, and no clone/workspace submission occurs.
+4. Empty Create Workspace → type raw draft → credential setup → key selection →
+   Cancel/Back; retain parent, folder/display names and explicit Git consent.
+5. Expand clone Credential safety details by keyboard; verify same UID, runtime
+   files, shared agents, bypassable configuration, other-assignment access and
+   consequential stop/delete warnings remain available after dismissal.
+6. Verify Navigation contains Auto-hide, Handle and Preview File Controls;
+   Credentials contains tools and workspace management. Agent accounts,
+   Notifications, account/security and old detail links remain distinct.
+7. In the missing-CLI fixture, open Chat: one unavailable summary, separate
+   agent states, full errors and named retries. Account setup links preserve the
+   workspace and explicitly cannot install CLI tools.
+8. At 320/390 and short landscape, keyboard-activate Preview Text size; verify
+   44px targets, wrapping without overflow and all prior controls retained.
+9. Populate a real disposable repository, token and second worktree; inspect
+   family disclosure, branch management, state-correct Stop/Forget and caller
+   origins. Check fine-pointer desktop and native-inset exclusion separately.

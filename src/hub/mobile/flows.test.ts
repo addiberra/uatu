@@ -98,6 +98,54 @@ function accountFixture() {
   };
   return { snapshot, api, calls };
 }
+
+test("workspace credentials open directly and Cancel returns to workspace actions, not global assignments", async () => {
+  const h = harness(); await h.ui.ready;
+  h.ui.showDetail({ kind: "workspace", id: "a" }); await settle();
+  h.click("assign"); await settle();
+  expect(h.region().querySelector('select[name="authentication"]')).not.toBeNull();
+  h.click("cancel-sheet"); await settle();
+  expect(h.region().querySelector("h1")?.textContent).toBe("Workspace a");
+  expect(h.region().querySelector('[data-flow="rename"]')).not.toBeNull();
+  expect(h.region().textContent).not.toContain("Workspace Assignments");
+  expect(h.mutations("assignWorkspace")).toHaveLength(0);
+});
+
+test("canceling a pending direct credential read fences its editor and keeps workspace context", async () => {
+  let resolve!: (value: ReadResult<PublicCredentialDto[]>) => void;
+  let pending: Promise<ReadResult<PublicCredentialDto[]>> | undefined;
+  const h = harness({ readCredentials: () => pending ?? Promise.resolve(available([ssh()])) }); await h.ui.ready;
+  h.ui.showDetail({ kind: "workspace", id: "a" }); await settle();
+  pending = new Promise(done => { resolve = done; }); h.click("assign");
+  expect(h.region().textContent).toContain("Loading repository credentials"); h.click("cancel-sheet");
+  resolve(available([ssh()])); await settle();
+  expect(h.region().querySelector("h1")?.textContent).toBe("Workspace a");
+  expect(h.region().querySelector("select")).toBeNull(); expect(h.mutations("assignWorkspace")).toHaveLength(0);
+});
+
+test("workspace actions precede disclosed technical facts and empty clone offers setup, not unusable commands", async () => {
+  const h = harness({ readCredentials: async () => available([]) }); await h.ui.ready;
+  h.ui.showDetail({ kind: "workspace", id: "a" }); await settle();
+  const content = h.region().querySelector(".mh-flow-content")!;
+  expect(content.querySelector("details [data-workspace-assignments]")).not.toBeNull();
+  expect(content.innerHTML.indexOf('data-flow="rename"')).toBeLessThan(content.innerHTML.indexOf("<details"));
+  h.ui.showDetail({ kind: "clone" }); await settle();
+  expect(h.region().querySelector('[data-flow="unlock"]')).toBeNull();
+  expect(h.region().querySelector('[data-flow="add-auth-host"]')).toBeNull();
+  expect(h.region().querySelector('[data-flow="setup-credentials"]')).not.toBeNull();
+  expect(h.region().querySelector(".mh-safety-disclosure:not([open])")).not.toBeNull();
+});
+
+test("empty-catalog creation setup preserves raw draft and consent without creating or starting", async () => {
+  const h = harness({ readCredentials: async () => available([]) }); await h.ui.ready;
+  h.ui.showDetail({ kind: "add-workspace" }); h.click("create"); await settle();
+  h.set("parent", "/draft/parent"); h.set("folderName", "not/yet-valid"); h.set("displayName", "Draft workspace");
+  h.click("setup-credentials"); expect(h.region().textContent).toContain("Set up repository credentials");
+  h.click("ssh"); h.click("generate"); expect(h.input("passphrase").type).toBe("password");
+  h.click("cancel-sheet"); h.click("cancel-sheet"); h.click("cancel-sheet"); await settle();
+  expect(h.input("parent").value).toBe("/draft/parent"); expect(h.input("folderName").value).toBe("not/yet-valid"); expect(h.input("displayName").value).toBe("Draft workspace");
+  expect(h.mutations("createWorkspace")).toHaveLength(0); expect(h.mutations("generateSsh")).toHaveLength(0); expect(h.mutations("startWorkspace")).toHaveLength(0);
+});
 test("agent accounts are separate capability pages with search, conditional fields and secret clearing on refusal", async () => {
   const f = accountFixture(), h = harness({ agentAccounts: f.api }); await h.ui.ready;
   h.ui.showDetail({ kind: "agent", id: "opencode" }); await settle();
@@ -418,7 +466,7 @@ describe("assignment, workspace and account flows", () => {
     expect(facts(h.region())).toContainEqual(["Folder", "/projects/a"]); expect(facts(h.region())).toContainEqual(["Status", "stopped"]);
     expect([...h.region().querySelectorAll("h1,h2")].filter(el => el.textContent === "Atlas")).toHaveLength(1);
     expect(facts(h.region())).toContainEqual(["Host", "two.invalid"]); expect(facts(h.region())).toContainEqual(["Credential", "SSH identity"]);
-    h.click("assign"); await settle();
+    h.click("manage-assignments"); await settle();
     expect([...h.region().querySelectorAll("h1,h2")].filter(el => el.textContent === "Atlas")).toHaveLength(1);
     for (const key of ["edit-auth-a-0", "edit-auth-a-1", "remove-a-0", "remove-a-1", "remove-a-2", "edit-a", "new-a"]) expect(h.region().querySelectorAll(`[data-flow="${key}"]`)).toHaveLength(1);
   });
@@ -525,8 +573,10 @@ describe("onboarding and clone lifecycle", () => {
   });
   test("clone optional configuration stays visible without an accordion", async () => {
     const h = harness(); await h.ui.ready; h.ui.showDetail({ kind: "clone" }); await settle();
-    expect(h.region().querySelector("details, summary")).toBeNull();
+    expect(h.region().querySelectorAll("details")).toHaveLength(1);
+    expect(h.region().querySelector("details")?.classList.contains("mh-safety-disclosure")).toBe(true);
     for (const name of ["authentication", "host", "signing", "start"]) expect(h.region().querySelector(`[name="${name}"]`)).not.toBeNull();
+    expect(h.region().querySelector('details [name="authentication"]')).toBeNull();
   });
   test("Default Folder picker returns to its typed editor from a child; Up is only hierarchy navigation", async () => {
     const h = harness(); await h.ui.ready;

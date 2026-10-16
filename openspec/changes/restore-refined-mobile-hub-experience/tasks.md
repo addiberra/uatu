@@ -245,6 +245,18 @@ deployment. Pending historical visual tasks do not bar authorized implementation
 but remain acceptance obligations. These are implementation stages, not a request
 to stage any Git files.
 
+## 24. Approved independent live UX corrections (2026-10-16)
+
+- [x] 24.1 Present workspace More actions first with optional technical details; preserve Rename, branch/worktree, credentials, state-correct Stop/Forget and confirmations.
+- [x] 24.2 Open workspace credentials directly and clearly label the global management destination.
+- [x] 24.3 Repair workspace/global caller Back and Cancel, nested review drafts and route/task-history consistency.
+- [x] 24.4 Group Navigation preferences and repository Credentials tools/assignments; preserve saved deep links, Agent accounts, Notifications, two-destination dock and desktop.
+- [x] 24.5 Provide truthful empty credential setup and draft-preserving return across onboarding/clone; expose only applicable add-host/unlock controls without submission.
+- [x] 24.6 Consolidate unavailable Chat with agent-specific recovery, installation versus login guidance, full errors and independent retry semantics.
+- [x] 24.7 Keep labeled Preview text sizing accessible at 320/390/landscape without dropping controls or targets.
+- [x] 24.8 Make clone safety concise with accessible full facts and unchanged relevant confirmations.
+- [ ] 24.9 Verify meaningful red/green regressions and production Chromium/WebKit visual flows with populated credentials/multiple worktrees, keyboard/history/retention and desktop scope; inspect actual images and record exact results/limits. Lead review, push/deploy and final human/physical-device acceptance remain separate gates.
+
 ### Historical reconciliation checkpoint — 2026-09-10
 
 **31/36 complete; 7.1, 7.4, 8.1, 8.2, 8.3 remain pending.** See

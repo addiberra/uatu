@@ -4,6 +4,7 @@ import type { AuthenticationSelection } from "../onboarding";
 import { absolute, action, check, checked, displayName, field, folderName, group, infoRows, listRow, select, text, value, type FlowEnvironment } from "./flow-ui";
 import { credentialChoices, validateSelected } from "./workspace-flows";
 import { createFolderPicker } from "./folder-picker";
+import { supportsRole } from "./credential-flows";
 
 export type ConfigurationDraft = { displayName: string; folderName: string; authentication: AuthenticationSelection[]; signing: string; start: boolean; init: boolean };
 export const technicalField = (name: string, label: string, value = "", attrs = "") => field(name, label, value, "text", `autocapitalize="none" autocorrect="off" spellcheck="false" inputmode="${name === "host" || name === "url" ? "url" : "text"}" ${attrs}`);
@@ -15,7 +16,9 @@ function authenticationRow(catalog: PublicCredentialDto[], auth?: Authentication
   return `<div data-auth-row>${select("authentication", "Git authentication", credentialChoices(catalog, "authentication", auth?.credentialId, "None"), auth?.credentialId)}${technicalField("host", "Authentication host", auth?.host ?? "")}</div>`;
 }
 export function configurationFields(catalog: PublicCredentialDto[], draft: ConfigurationDraft): string {
-  return `<div data-auth-list>${(draft.authentication.length ? draft.authentication : [undefined]).map(auth => authenticationRow(catalog, auth)).join("")}</div>${action("add-auth-host", "Add another authentication host")}` + select("signing", "Commit signing", credentialChoices(catalog, "signing", draft.signing, "None"), draft.signing) + check("start", "Start after configuration", draft.start);
+  const usable = (role: "authentication" | "signing") => catalog.some(c => c.enabled && supportsRole(c, role));
+  return (!usable("authentication") && !usable("signing") ? text("No usable repository credentials are saved on this Hub. Credentials are optional for public repositories; private access and signing may need setup.") + action("setup-credentials", "Set up repository credentials") : "")
+    + `<div data-auth-list>${(draft.authentication.length ? draft.authentication : [undefined]).map(auth => authenticationRow(catalog, auth)).join("")}</div>${usable("authentication") ? action("add-auth-host", "Add another authentication host") : ""}` + select("signing", "Commit signing", credentialChoices(catalog, "signing", draft.signing, "None"), draft.signing) + check("start", "Start after configuration", draft.start);
 }
 export function readConfiguration(root: HTMLElement, catalog: PublicCredentialDto[], draft: ConfigurationDraft): ConfigurationDraft {
   const signing = value(root, "signing"); validateSelected(catalog, signing, "signing");
@@ -28,20 +31,28 @@ export function readConfiguration(root: HTMLElement, catalog: PublicCredentialDt
   if (new Set(authentication.map(a => a.host)).size !== authentication.length) throw new Error("Choose only one authentication credential per host.");
   return { ...draft, authentication, signing, start: checked(root, "start") };
 }
+/** Navigation captures raw non-secret drafts; validation belongs to Review. */
+function captureConfiguration(root: HTMLElement, draft: ConfigurationDraft): ConfigurationDraft {
+  return { ...draft, folderName: value(root, "folderName"), displayName: value(root, "displayName"), signing: value(root, "signing"), start: checked(root, "start"), init: checked(root, "init"), authentication: [...root.querySelectorAll<HTMLElement>("[data-auth-row]")].map(row => ({ credentialId: value(row, "authentication"), host: value(row, "host") })) };
+}
 export function bindAuthenticationHost(root: HTMLElement, catalog: PublicCredentialDto[] = []) {
+  const updateAddHost = () => {
+    const add = root.querySelector<HTMLButtonElement>('[data-flow="add-auth-host"]');
+    if (add) add.hidden = ![...root.querySelectorAll<HTMLSelectElement>('[name="authentication"]')].some(input => catalog.some(c => c.id === input.value && c.enabled && supportsRole(c, "authentication")));
+  };
   const update = () => root.querySelectorAll<HTMLElement>("[data-auth-row]").forEach(row => {
     const authentication = row.querySelector<HTMLSelectElement>('[name="authentication"]');
     const host = row.querySelector<HTMLInputElement>('[name="host"]');
     if (host && authentication) {
       const context = () => { host.disabled = !authentication.value; host.placeholder = authentication.value ? "github.com" : "Select a credential first"; host.setAttribute("aria-description", authentication.value ? "Host for the selected Git authentication credential" : "Choose a Git authentication credential first to edit its host"); };
-      context(); authentication.onchange = context;
+      context(); authentication.onchange = () => { context(); updateAddHost(); };
     }
   });
   root.querySelector('[data-flow="add-auth-host"]')?.addEventListener("click", () => {
     root.querySelector("[data-auth-list]")?.insertAdjacentHTML("beforeend", authenticationRow(catalog)); update();
-  }); update();
+  }); update(); updateAddHost();
 }
-export function createOnboardingFlows(env: FlowEnvironment) {
+export function createOnboardingFlows(env: FlowEnvironment, setupCredentials: (back: (created?: PublicCredentialDto) => void) => void) {
   const { backend } = env;
   const pickFolder = createFolderPicker(env);
   let browseGeneration = 0;
@@ -70,6 +81,9 @@ export function createOnboardingFlows(env: FlowEnvironment) {
         draft = { ...readConfiguration(root, catalog, draft), displayName: displayName(value(root, "displayName")), init: git !== true && checked(root, "init") };
         if (git === false && !draft.init) throw new Error("Confirm Git initialization before adding a non-Git folder.");
         reviewConfiguration("Add Existing Folder", path, draft, catalog, () => backend.configureExisting({ path, displayName: draft.displayName, authentication: draft.authentication, signing: draft.signing || null, init: draft.init, start: draft.start }), editor);
+      } }, { "setup-credentials": () => {
+        draft = captureConfiguration(task, draft);
+        setupCredentials(created => { if (created) catalog = [...catalog.filter(c => c.id !== created.id), created]; editor(); });
       } }); bindAuthenticationHost(task, catalog);
     }; editor();
   }
@@ -101,9 +115,13 @@ export function createOnboardingFlows(env: FlowEnvironment) {
             draft = { ...readConfiguration(root, catalog, draft), folderName: folderName(value(root, "folderName")), displayName: displayName(value(root, "displayName")), init: checked(root, "init") };
             if (!draft.init) throw new Error("Confirm folder creation and Git initialization.");
             reviewConfiguration("Create Workspace", `${destination.replace(/\/$/, "")}/${draft.folderName}`, draft, catalog, () => backend.createWorkspace({ parent: destination, folderName: draft.folderName, displayName: draft.displayName, authentication: draft.authentication, signing: draft.signing || null, start: draft.start, gitInitConsent: "confirmed" }), editor);
-          } }, { browse: () => {
+          } }, { "setup-credentials": () => {
             destination = value(task, "parent");
-            draft = { ...draft, folderName: value(task, "folderName"), displayName: value(task, "displayName"), signing: value(task, "signing"), start: checked(task, "start"), init: checked(task, "init"), authentication: [...task.querySelectorAll<HTMLElement>("[data-auth-row]")].map(row => ({ credentialId: value(row, "authentication"), host: value(row, "host") })) };
+            draft = captureConfiguration(task, draft);
+            setupCredentials(created => { if (created) catalog = [...catalog.filter(c => c.id !== created.id), created]; editor(); });
+          }, browse: () => {
+            destination = value(task, "parent");
+            draft = captureConfiguration(task, draft);
             env.sheet.close();
             browse(destination.startsWith("/") ? destination : defaults.effective, selected => { destination = selected; editor(); }, editor);
           } }); bindAuthenticationHost(task, catalog);

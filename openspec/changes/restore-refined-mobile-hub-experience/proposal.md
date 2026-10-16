@@ -14,6 +14,17 @@ The implemented touch Hub does not reproduce the approved refined reference: des
 
 ## Capabilities
 
+### Approved live UX review corrections (2026-10-16)
+
+Implement the eight reviewed flow corrections: action-first workspace management;
+direct workspace credential editing with caller-correct Back/Cancel; cohesive
+Navigation and repository Credentials Settings groups; truthful empty credential
+setup with draft-preserving return; consolidated, actionable agent unavailability;
+narrow Preview text controls; and concise clone safety with complete disclosure.
+Preserve all operations, safety facts, deep links, desktop behavior and retained
+workspace ownership. Commit verified milestones locally; push and deployment wait
+for lead review. Final human/physical-device acceptance remains open.
+
 ### New Capabilities
 
 - `mobile-hub-continuity`: Same-document, frame-free workspace retention across touch Hub and Settings visits, including route ownership, focus isolation, async work, and invalidation.

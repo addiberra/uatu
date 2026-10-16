@@ -36,7 +36,7 @@ async function harness() {
     sendCloneInput: () => new Promise(resolve => { input = resolve; }),
   };
   const owner = createFlowEnvironment(root, backend, sheet, { user: () => "reviewer", home() {}, navigate() {}, changed() {}, openWorkspace() {}, authLost: () => owner.invalidate() });
-  const clone = createCloneFlow(owner.env, () => {}, () => {});
+  const clone = createCloneFlow(owner.env, () => {}, () => {}, () => {});
   const click = (key: string) => {
     const button = (modal ?? root).querySelector<HTMLButtonElement>(`[data-flow="${key}"], [data-action="${key}"]`);
     if (!button) throw Error(`Missing ${key}`); button.click();

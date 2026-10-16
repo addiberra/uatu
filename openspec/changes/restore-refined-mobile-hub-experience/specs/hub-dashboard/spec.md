@@ -166,6 +166,32 @@ When a Hub-served session's chat reports no usable agent login, it SHALL offer a
 
 ## ADDED Requirements
 
+### Requirement: Reviewed mobile management flows preserve context
+Workspace More SHALL show workspace-labeled actions before optional technical
+facts. Workspace credential editing SHALL open directly and return to its caller
+on Cancel/Back; nested Review Back SHALL preserve drafts. Global assignment
+management SHALL be clearly named and retain its own caller. Settings SHALL group
+Navigation preferences together and repository credential tools/assignments with
+Credentials, preserving existing deep links and distinct Agent accounts and
+Notifications. Empty credential catalogs SHALL explain optional setup and offer
+draft-preserving contextual setup without automatic submission. Inapplicable
+add-host/unlock commands SHALL not be offered. Unavailable Chat SHALL provide one
+summary, agent-specific recovery and full errors with independent retries, clearly
+distinguishing CLI installation from account login. Preview text sizing SHALL stay
+labeled and keyboard/touch accessible at 320px without dropping other controls.
+Clone SHALL use concise contextual safety with accessible complete shared-UID
+facts and unchanged consequential confirmations. Desktop SHALL remain unchanged.
+
+#### Scenario: Workspace credentials return to their caller
+- **WHEN** a user opens workspace More, edits credentials and cancels or presses Back
+- **THEN** the workspace action page and its URL remain consistent
+- **AND** Review Back retains the draft without mutation or workspace replacement
+
+#### Scenario: Empty catalog setup preserves onboarding
+- **WHEN** an onboarding user follows credential setup and returns
+- **THEN** non-secret draft fields remain unchanged and no workspace or clone is submitted
+- **AND** full credential safety facts remain accessible in clone
+
 ### Requirement: Touch Hub overview and tasks form one coherent experience
 The touch dashboard SHALL use the refined reference's compact brand header, Workspaces heading, Hub-context and running-count subtitle, Running and Ready to start group labels outside cards, icon-led workspace rows, and plus-led Add Workspace action. Workspace cards SHALL clearly distinguish identity, path, status, primary Open/Start action, and a labeled circular secondary-action affordance. The authenticated version SHALL remain available in subordinate authenticated context without replacing the Hub-context subtitle. Existing shell, assignment, and readiness information SHALL remain reachable without losing the reference's primary hierarchy.
 

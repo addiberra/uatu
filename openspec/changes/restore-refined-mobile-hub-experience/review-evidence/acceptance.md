@@ -196,3 +196,12 @@ Task **8.3 remains unchecked** for final version-specific acceptance. Tasks 7.1,
 requirement to seek separate integration authorization is now satisfied by the
 2026-10-15 decision above; it does not complete those evidence obligations or
 authorize spec sync/archive.
+# 2026-10-16 independent live UX findings — implementation authorization
+
+The user's “Implement” authorizes correction of all eight reviewed findings,
+including planning alignment and local verified commits. It is not final visual
+or physical-device acceptance. The lead independently reviews the resulting
+candidate before push or deployment. Existing live 4717/8445 and synthetic
+4718/8446 resources remain unchanged by this correction work. Historical visual,
+golden, broader Chat and archive-integrity gates are not waived or completed.
+See `live-ux-corrections.md` for version, evidence and current limitations.

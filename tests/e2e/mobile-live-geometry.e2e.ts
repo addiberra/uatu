@@ -181,7 +181,12 @@ for (const variant of [
     // including after the overview's per-user notice was dismissed.
     for (const url of ["/settings?detail=assignments", "/clone"]) {
       await page.goto(`${hub.origin}${url}`); await facts(".mh-flow-page .mh-safety-details");
-      await expect(page.locator(".mh-flow-page .mh-safety-disclosure")).toHaveCount(0);
+      if (url === "/clone") {
+        const disclosure = page.locator(".mh-flow-page .mh-safety-disclosure");
+        await expect(disclosure).not.toHaveAttribute("open");
+        await disclosure.locator("summary").focus(); await page.keyboard.press("Enter");
+        await expect(disclosure).toHaveAttribute("open", ""); await facts(".mh-flow-page .mh-safety-details");
+      } else await expect(page.locator(".mh-flow-page .mh-safety-disclosure")).toHaveCount(0);
     }
     await page.goto(`${hub.origin}/settings`);
     await expect(page.locator(".mh-page [data-shared-uid]")).toHaveCount(0);

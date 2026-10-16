@@ -80,7 +80,18 @@ export function createCredentialFlows(env: FlowEnvironment) {
       "pgp-generate": () => create("openpgp", false), "pgp-import": () => create("openpgp", true), token: () => create("token", false),
     }, { icon: "key", subtitle: "Choose how to add this key" });
   }
-  function create(type: CredentialRecord["type"], importing: boolean) {
+  /** Nested onboarding setup stays in the caller's ephemeral task history.
+   * Completion returns to the draft; it never selects or submits it. */
+  function setup(back: (created?: PublicCredentialDto) => void) {
+    const choose = () => env.task("Set up repository credentials", advisory(env.user(), false) + text("Optional for public repositories. Add credentials for private Git access or commit signing, then return to your unchanged workspace draft.") + group("Credential type", listRow("ssh", "SSH key", "Authentication and signing", "key") + listRow("openpgp", "OpenPGP key", "Commit signing", "key") + listRow("token", "HTTPS / provider token", "Repository access", "key")), undefined, {
+      ssh: () => key("ssh"), openpgp: () => key("openpgp"), token: () => create("token", false, back, choose),
+    }, back, { cancelLabel: "Back to workspace draft" });
+    const key = (type: "ssh" | "openpgp") => env.task(type === "ssh" ? "Add SSH key" : "Add OpenPGP key", action("generate", "Generate key") + action("import", "Import key"), undefined, {
+      generate: () => create(type, false, back, () => key(type)), import: () => create(type, true, back, () => key(type)),
+    }, choose, { cancelLabel: "Back" });
+    choose();
+  }
+  function create(type: CredentialRecord["type"], importing: boolean, completedSetup?: (credential: PublicCredentialDto) => void, cancel?: () => void) {
     const title = `${type === "token" ? "Add" : importing ? "Import" : "Generate"} ${type === "ssh" ? "SSH key" : type === "openpgp" ? "OpenPGP key" : "HTTPS / provider token"}`;
     const source = text("Choose one source: upload a file or paste a private key below.") + field("file", "Private key file (preferred)", "", "file") + '<label class="mh-field mh-paste">Or paste a private key<textarea name="paste" data-secret autocomplete="off" autocorrect="off" autocapitalize="none" inputmode="text" spellcheck="false" aria-label="Private key, masked"></textarea></label>';
     const capabilities = type === "ssh" ? check("cap", "SSH authentication", true, "ssh-authentication") + check("cap", "SSH signing", false, "ssh-signing") : type === "token" ? check("cap", "HTTPS Git", true, "https-git") + check("cap", "GitHub CLI", false, "github-cli") + check("cap", "GitLab CLI", false, "gitlab-cli") : text("Purpose: OpenPGP signing.");
@@ -92,7 +103,7 @@ export function createCredentialFlows(env: FlowEnvironment) {
         if (type !== "token" && !importing && !passphrase) throw new Error("A passphrase is required when generating a key.");
         const caps = values(root, "cap"); if (type !== "openpgp" && !caps.length) throw new Error("Select at least one purpose.");
         const source = importing ? privateKeySource(root.querySelector<HTMLInputElement>('[name="file"]')?.files?.[0], value(root, "paste")) : null;
-        const completed = (credential: PublicCredentialDto) => { env.sheet.close(); env.changed(); env.navigate({ kind: "credential", id: credential.id }); };
+        const completed = (credential: PublicCredentialDto) => { env.sheet.close(); env.changed(); if (completedSetup) completedSetup(credential); else env.navigate({ kind: "credential", id: credential.id }); };
         // Snapshot intent and clear secrets before the asynchronous adapter call.
         if (type === "ssh") {
           const intent = { name, passphrase, capabilities: caps as SshCredentialRecord["capabilities"] }; clearSecrets(root);
@@ -109,7 +120,7 @@ export function createCredentialFlows(env: FlowEnvironment) {
           await env.mutate(() => backend.createToken({ name, host, token, capabilities, ...(username ? { username } : {}) }), completed, root);
         }
       } finally { clearSecrets(root); }
-    } });
+    } }, {}, cancel);
   }
   function unlock(target: KeyTarget, next: () => void, cancel?: () => void, title = "Unlock credential", continuation?: "reviewed-clone") {
     const description = continuation === "reviewed-clone" ? "Unlock to continue the reviewed clone using the options you already authorized." : "Unlocking alone does not start a workspace or a clone job.";
@@ -234,5 +245,5 @@ export function createCredentialFlows(env: FlowEnvironment) {
     };
      env.page(t.tool, group("Used for", infoRows([{ label: "Use", value: toolPurposes[t.tool] }])) + group("Installation", infoRows([{ label: "Detected executable", value: t.path ?? "Not found", mono: !!t.path }, { label: "Version", value: t.version ?? "Unavailable" }]) + listRow(`override-${t.tool}`, "Executable location", "View saved setting or use a different installation", "settings")) + group("Check installation", listRow(`test-${t.tool}`, `Recheck ${t.tool} setup`, "Reprobe installed tools and local services; no remote access tests", "settings")), commands, { icon: "settings", subtitle: toolPurposes[t.tool] });
   }
-  return { chooser, detail, tools, toolDetail, unlock };
+  return { chooser, setup, detail, tools, toolDetail, unlock };
 }

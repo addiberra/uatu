@@ -160,6 +160,27 @@ See the updated `review-evidence/integration-map.md` for source seams and checks
 
 All wire additions ship with `api/openapi.yaml`, `api/operations.yaml`, relevant streaming inventory, contract/route/revision tests and documentation. Prefer additive optional fields/endpoints over changing existing clients. No new backend authorization model is intended; if needed, return to planning rather than quietly expanding scope.
 
+### D11. Approved independent live UX review corrections (2026-10-16)
+
+Workspace More opens a compact, workspace-labeled action group before optional
+technical details. Edit workspace credentials opens the editor directly; global
+assignment navigation explicitly says Manage workspace credentials. Caller-owned
+return callbacks and the existing ephemeral task history preserve workspace vs
+global origin, nested review drafts and safe cancellation without URL mismatch.
+Settings groups Auto-hide, Handle and Preview controls under Navigation, and tools
+and assignments under repository Credentials; keep old detail routes valid.
+Empty catalogs explain optional credentials, offer contextual setup and return to
+the unchanged draft without submission. Add-host and unlock commands appear only
+when applicable. Touch Chat has one unavailable summary with agent-specific
+recovery, complete errors and independent retries; missing CLI installation is not
+account login. Desktop Chat presentation remains unchanged. Preview text sizing
+stays labeled and keyboard/touch reachable at 320px. Clone uses concise contextual
+safety and native full disclosure, retaining every shared-UID fact and consequential
+confirmation. Verify actual production documents in Chromium/WebKit, populated
+credentials and multi-checkout fixtures, 320/390 and landscape, keyboard/history/
+draft retention, desktop scope and real image review. No service change, push, new
+dependency or personal provider login is authorized.
+
 ## Risks / Trade-offs
 
 ### User-requested iOS UX correction (2026-09-10)

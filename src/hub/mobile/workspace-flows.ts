@@ -54,7 +54,8 @@ export function createWorkspaceFlows(env: FlowEnvironment, start: (workspace: Wo
           if (name === w.displayName) { env.sheet.error("No changes to the display name."); return; }
           return env.mutate(() => backend.renameWorkspace({ workspaceId: id, displayName: name }), () => { env.sheet.close(); env.changed(); workspace(id); }, root);
         } }),
-        assign: () => assignments(id),
+        assign: () => { if (w.parentId) assignments(w.parentId, () => workspace(id)); else loadEditor(w); },
+        "manage-assignments": () => assignments(id, () => workspace(id)),
         worktrees: () => worktrees.show(w.parentId ?? id, () => workspace(id)),
         stop: () => env.confirm("Stop workspace?", text(`Stop ${w.displayName}? Its shells will be terminated. Registration and files remain.`), { label: "Stop", run: root => env.mutate(() => backend.stopWorkspace(id), result => { env.sheet.close(); env.changed(); env.task("Workspace stopped", text(result.status === "already-stopped" ? "This workspace was already stopped." : "Its session has stopped. Registration and files remain."), undefined, {}, () => workspace(id)); }, root) }),
         forget: () => env.confirm("Forget registration?", text(`Forget ${w.displayName}? This removes its registration and personal workspace state, not files on disk. Its folder remains at ${w.path}. A running workspace must be stopped separately.`), { label: "Forget", run: root => env.mutate(() => backend.forgetWorkspace(id), result => { env.sheet.close(); env.changed(); env.home(); env.task("Registration forgotten", text(result.status === "not-found" ? "This registration was already absent." : "The registration was removed. Workspace files were not deleted.")); }, root) }),
@@ -65,7 +66,10 @@ export function createWorkspaceFlows(env: FlowEnvironment, start: (workspace: Wo
         const signing = w.assignments.find(a => a.role === "signing");
         return group("Git authentication", auths.length ? auths.map(a => infoRows([{ label: "Host", value: a.host, mono: true }, { label: "Credential", value: name(a.credentialId) }])).join("") : infoRows([{ label: "Credential", value: "None assigned" }])) + group("Commit signing", infoRows([{ label: "Credential", value: signing ? name(signing.credentialId) : "None assigned" }]));
       };
-      env.page(w.displayName, group("Workspace information", infoRows([{ label: "Folder", value: w.path, mono: true }, { label: "Status", value: w.runtime.status, tone: w.runtime.status === "running" ? "positive" : "neutral" }, { label: "Branch", value: branchLabel(w.branch) }, { label: "Stable ID", value: w.id, mono: true }])) + (w.credentialRestartRequired ? text("Credential changes require a workspace restart.") : "") + shellText + `<div data-workspace-assignments>${assignmentText("loading")}</div>` + text("Assignment presence is not credential readiness.") + action("assign", "Edit workspace credentials") + action("rename", "Rename display name") + (backend.worktrees && (w.createWorktree || w.parentId) ? listRow("worktrees", "Branches and worktrees", "Create, register and manage checkouts", "branch") : "") + (w.availability ? text(`Checkout ${w.availability}. Resolve its identity before Open or Start.`) : action("open", w.runtime.status === "running" ? "Open" : "Start")) + (w.runtime.status === "running" ? action("stop", "Stop workspace", true) : action("forget", "Forget registration", true)), actions, { primaryAction: "open" });
+      env.page(w.displayName, text(`${w.runtime.status === "running" ? "Running" : "Stopped"} · ${branchLabel(w.branch)}`)
+        + group("Workspace actions", action("rename", "Rename display name") + (backend.worktrees && (w.createWorktree || w.parentId) ? listRow("worktrees", "Branches and worktrees", "Create, register and manage checkouts", "branch") : "") + action("assign", w.parentId ? "Manage inherited workspace credentials" : "Edit workspace credentials") + (w.availability ? text(`Checkout ${w.availability}. Resolve its identity before Open or Start.`) : action("open", w.runtime.status === "running" ? "Open" : "Start")) + (w.runtime.status === "running" ? action("stop", "Stop workspace", true) : action("forget", "Forget registration", true)))
+        + (w.credentialRestartRequired ? text("Credential changes require a workspace restart.") : "")
+        + `<details class="mh-safety-disclosure"><summary>Workspace information and credentials</summary>` + group("Workspace information", infoRows([{ label: "Folder", value: w.path, mono: true }, { label: "Status", value: w.runtime.status }, { label: "Branch", value: branchLabel(w.branch) }, { label: "Stable ID", value: w.id, mono: true }])) + shellText + `<div data-workspace-assignments>${assignmentText("loading")}</div>` + text("Assignment presence is not credential readiness.") + action("manage-assignments", "Manage credential assignments and hosts") + `</details>`, actions, { primaryAction: "open" });
       // Name enrichment must not replace usable workspace facts with a catalog
       // error page, or rerender the page and disrupt a focused command/form.
       const region = env.root.querySelector<HTMLElement>("[data-workspace-assignments]")!;
@@ -83,40 +87,52 @@ export function createWorkspaceFlows(env: FlowEnvironment, start: (workspace: Wo
       })();
     }, () => workspace(id));
   }
-  function assignments(selectedId?: string) {
-    env.page("Workspace Assignments", text("Loading assignments…"));
+  function loadEditor(w: WorkspaceView) {
+    env.task("Edit workspace credentials", text("Loading repository credentials…"));
+    const current = env.current();
+    const failed = (message: string) => env.task("Edit workspace credentials", text(message), { label: "Retry", run: () => loadEditor(w) });
+    void backend.readCredentials().then(result => {
+      if (!current()) return;
+      if (result.status === "available") editAssignments(w, result.value, "edit-current", undefined, () => workspace(w.id));
+      else if (result.problem.kind === "unauthorized") env.authLost();
+      else failed(result.problem.message);
+    }).catch(() => { if (current()) failed("Repository credentials could not be loaded."); });
+  }
+  function assignments(selectedId?: string, caller?: () => void) {
+    env.page("Workspace Assignments", text("Loading assignments…"), { "flow-back": caller ?? (() => selectedId ? assignments() : env.home()) });
     void env.read(() => backend.readWorkspaces(), workspaces => {
       void env.read(() => backend.readCredentials(), catalog => {
         const selected = selectedId ? workspaces.find(w => w.id === selectedId) : null;
         const rows = selected ? [selected] : workspaces;
         const actions: Record<string, () => unknown> = {};
-        if (selected) actions["flow-back"] = () => assignments();
+        if (selected) actions["flow-back"] = caller ?? (() => assignments());
         const html = rows.map(w => {
           if (!selected) {
             actions[`workspace-${w.id}`] = () => assignments(w.id);
             return listRow(`workspace-${w.id}`, w.displayName, `${w.runtime.status} · ${w.assignments.length} assignments · ${w.path}`);
           }
           if (w.parentId) {
-            actions["parent-policy"] = () => assignments(w.parentId);
+            actions["parent-policy"] = () => assignments(w.parentId, () => assignments(selectedId, caller));
             return group("Inherited credentials", text("This linked checkout uses its parent workspace's live credential policy. Editing the parent affects all its linked checkouts.") + listRow("parent-policy", "Manage parent workspace credentials", w.parentId));
           }
-          actions[`new-${w.id}`] = () => editAssignments(w, catalog, "assign-new");
-          actions[`edit-${w.id}`] = () => editAssignments(w, catalog, "edit-current");
+          const returnToAssignments = () => assignments(selectedId, caller);
+          actions[`new-${w.id}`] = () => editAssignments(w, catalog, "assign-new", undefined, returnToAssignments);
+          actions[`edit-${w.id}`] = () => editAssignments(w, catalog, "edit-current", undefined, returnToAssignments);
           const current = w.assignments.map((a, index) => {
             const c = catalog.find(c => c.id === a.credentialId);
             actions[`remove-${w.id}-${index}`] = () => env.confirm("Remove assignment?", text(`Remove ${a.role}${a.role === "authentication" ? ` on ${a.host}` : ""} from ${w.displayName}?${w.runtime.status === "running" ? " Stopping this workspace terminates its shells before the assignment changes." : ""}`), { label: "Remove", run: async () => {
-              env.sheet.close(); await env.coordinated("Stop and remove assignment?", stop => backend.removeAssignment({ assignment: a, stop }), () => assignments(selectedId));
+              env.sheet.close(); await env.coordinated("Stop and remove assignment?", stop => backend.removeAssignment({ assignment: a, stop }), returnToAssignments);
             } });
-            if (a.role === "authentication") actions[`edit-auth-${w.id}-${index}`] = () => editAssignments(w, catalog, "edit-current", a);
+            if (a.role === "authentication") actions[`edit-auth-${w.id}-${index}`] = () => editAssignments(w, catalog, "edit-current", a, returnToAssignments);
             return group(a.role === "authentication" ? "Git authentication" : "Commit signing", infoRows([...(a.role === "authentication" ? [{ label: "Host", value: a.host, mono: true }] : []), { label: "Credential", value: c?.name ?? "Missing credential" }]) + (a.role === "authentication" ? action(`edit-auth-${w.id}-${index}`, `Edit authentication on ${a.host}`) : "") + action(`remove-${w.id}-${index}`, a.role === "authentication" ? `Remove authentication on ${a.host}` : "Remove signing assignment", true));
           }).join("");
           return group("Workspace information", infoRows([{ label: "Folder", value: w.path, mono: true }, { label: "Status", value: w.runtime.status }])) + (current || text("No credentials assigned")) + action(`edit-${w.id}`, "Edit workspace credentials") + action(`new-${w.id}`, "Add authentication host");
         }).join("");
         env.page(selected ? selected.displayName : "Workspace Assignments", advisory(env.user()) + (html ? selected ? html : group("Workspaces", html) : text("No registered workspaces.")), actions, selected ? { primaryAction: `edit-${selected.id}`, secondaryAction: `new-${selected.id}` } : undefined);
-      }, () => assignments(selectedId));
-    }, () => assignments(selectedId));
+      }, () => assignments(selectedId, caller));
+    }, () => assignments(selectedId, caller));
   }
-  function editAssignments(w: WorkspaceView, catalog: PublicCredentialDto[], mode: AssignWorkspaceIntent["mode"], authentication?: AuthenticationCredentialAssignment) {
+  function editAssignments(w: WorkspaceView, catalog: PublicCredentialDto[], mode: AssignWorkspaceIntent["mode"], authentication?: AuthenticationCredentialAssignment, done: () => void = () => assignments(w.id)) {
     const auths = w.assignments.filter((a): a is AuthenticationCredentialAssignment => a.role === "authentication");
     const auth = authentication ?? auths[0];
     const draft: AssignmentDraft = mode === "edit-current" ? { authentication: auth?.credentialId ?? "", host: auth?.host ?? "", signing: w.assignments.find(a => a.role === "signing")?.credentialId ?? "" } : { authentication: "", host: "", signing: "" };
@@ -128,7 +144,7 @@ export function createWorkspaceFlows(env: FlowEnvironment, start: (workspace: Wo
         const intent = assignmentIntent(w, mode, draft);
         if (!intent) { env.sheet.error("No changes to the workspace credentials."); return; }
         const replacesHost = intent.selection.authentication && auths.some(a => a.host === intent.selection.authentication!.host);
-        env.task("Review changes", assignmentReview(w, catalog, intent) + group("What happens next", infoRows([{ label: "When credentials are used", value: w.runtime.status === "running" ? "A restart may be needed" : "Next time this workspace starts", detail: "Applying defaults does not unlock credentials or check repository access." }])), { label: replacesHost ? "Apply and replace" : "Apply", run: review => env.mutate(() => backend.assignWorkspace(intent), () => { env.sheet.close(); env.changed(); assignments(w.id); }, review) }, {}, editor, { cancelLabel: "Back to edit" });
+        env.task("Review changes", assignmentReview(w, catalog, intent) + group("What happens next", infoRows([{ label: "When credentials are used", value: w.runtime.status === "running" ? "A restart may be needed" : "Next time this workspace starts", detail: "Applying defaults does not unlock credentials or check repository access." }])), { label: replacesHost ? "Apply and replace" : "Apply", run: review => env.mutate(() => backend.assignWorkspace(intent), () => { env.sheet.close(); env.changed(); done(); }, review) }, {}, editor, { cancelLabel: "Back to edit" });
       } });
       const authSelect = task.querySelector<HTMLSelectElement>('[name="authentication"]')!;
       const host = task.querySelector<HTMLInputElement>('[name="host"]')!;

@@ -122,3 +122,24 @@ explicit review rather than invented policy. Missing scenarios remain named gaps
 integration task set. Automated tests and historical reports do not sign off
 final visual/device acceptance. Keep the synthetic reviewer separate, preserve
 both running services and report actual live evidence before any scoped rollout.
+# Approved live UX correction overlay — 2026-10-16
+
+The existing inventory remains authoritative. Workspace More now starts with
+Rename, applicable branch/worktree management, direct credential editing and
+state-correct lifecycle actions; technical/shell/assignment facts are in the
+named Workspace information and credentials disclosure. That disclosure retains
+assignment removal and per-host management. Workspace Cancel/Back returns to the
+workspace; global Manage workspace credentials retains the global assignment
+caller. Nested Review Back preserves the raw draft.
+
+Settings groups repository credential tools and assignment management with
+Credentials and all three device navigation preferences under Navigation. Agent
+accounts and Notifications remain separate; existing detail URLs are unchanged.
+Empty onboarding/clone credentials explain optional setup and offer a nested
+setup task returning to the unchanged draft, never auto-selecting a new credential
+or submitting a workspace/clone. Clone safety is concise with native full details.
+Chat unavailability has one summary and agent-labeled recovery/errors; missing
+CLI installation is explicitly distinct from account login. Preview text size
+has a labeled, wrapping touch group with 44px controls, including at 320px.
+
+Evidence and outstanding gates: `review-evidence/live-ux-corrections.md`.

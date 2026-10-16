@@ -1,7 +1,7 @@
 import type { CloneIntent, CloneStreamEvent, KeyTarget } from "./backend";
 import type { CloneJobResult } from "../clone-jobs";
 import { normalizeProviderHost, type PublicCredentialDto } from "../credential-types";
-import { absolute, action, advisory, clearSecrets, displayName, field, folderName, group, hubForeground, infoRows, required, select, sharedUidKey, showContextualError, text, value, type FlowEnvironment } from "./flow-ui";
+import { absolute, action, credentialSafetyNotice, clearSecrets, displayName, field, folderName, group, hubForeground, infoRows, required, select, sharedUidKey, showContextualError, text, value, type FlowEnvironment } from "./flow-ui";
 import { bindAuthenticationHost, configurationFacts, configurationFields, readConfiguration, technicalField, type ConfigurationDraft } from "./onboarding-flows";
 
 export type CloneDraft = CloneIntent;
@@ -56,7 +56,7 @@ export function cloneCredentialCompatible(c: PublicCredentialDto, remote: string
 }
 /** One accepted job, independent of view visibility. Navigation is not cancel;
  * reconnect replays by event id and never submits a replacement job. */
-export function createCloneFlow(env: FlowEnvironment, unlock: (target: KeyTarget, next: () => void, cancel?: () => void, title?: string, continuation?: "reviewed-clone") => void, inspectFolder: (path: string) => void) {
+export function createCloneFlow(env: FlowEnvironment, unlock: (target: KeyTarget, next: () => void, cancel?: () => void, title?: string, continuation?: "reviewed-clone") => void, inspectFolder: (path: string) => void, setupCredentials: (back: (created?: PublicCredentialDto) => void) => void) {
   const backend = env.backend;
   let draft = emptyCloneDraft();
   let catalog: PublicCredentialDto[] = [];
@@ -113,15 +113,21 @@ export function createCloneFlow(env: FlowEnvironment, unlock: (target: KeyTarget
     if (attempt) { renderRecovery(); return; }
     const choices = [{ value: "", label: "No clone identity" }, ...catalog.filter(c => (c.type === "ssh" && c.capabilities.includes("ssh-authentication")) || (c.type === "token" && c.capabilities.includes("https-git"))).map(c => ({ value: c.id, label: `${c.name} · ${c.type}${c.enabled ? "" : " · Disabled"}`, disabled: !c.enabled }))];
     if (draft.credentialId && !choices.some(c => c.value === draft.credentialId)) choices.push({ value: draft.credentialId, label: "Missing clone identity; choose a replacement", disabled: true });
-    const root = env.page("Clone Repository", advisory(env.user()) + technicalField("url", "Remote URL", draft.url, 'autocomplete="off"') + technicalField("dest", "Destination parent", draft.dest) + technicalField("folderName", "Checkout folder name", draft.folderName) + field("displayName", "Workspace display name", draft.displayName) + group("Clone identity", select("cloneCredential", "One-time clone credential", choices, draft.credentialId ?? "") + text("The clone identity is separate from credentials used after setup.") + action("unlock", "Unlock selected clone identity")) + group("Credentials used after setup (optional)", configurationFields(catalog, configuration())) + action("review", "Review clone") + (actionProblem ? text(actionProblem) : ""), {
+    const root = env.page("Clone Repository", credentialSafetyNotice(env.user()) + technicalField("url", "Remote URL", draft.url, 'autocomplete="off"') + technicalField("dest", "Destination parent", draft.dest) + technicalField("folderName", "Checkout folder name", draft.folderName) + field("displayName", "Workspace display name", draft.displayName) + group("Clone identity", select("cloneCredential", "One-time clone credential", choices, draft.credentialId ?? "") + text("The clone identity is separate from credentials used after setup.") + `<span data-clone-unlock></span>`) + group("Credentials used after setup (optional)", configurationFields(catalog, configuration())) + action("review", "Review clone") + (actionProblem ? text(actionProblem) : ""), {
       "flow-back": back,
       review: () => { try { snapshot(root, true); review(); } catch (e) { localError(e, true); } },
       unlock: () => { snapshot(root); const c = catalog.find(c => c.id === draft.credentialId); if (!c || c.type !== "ssh" || !c.enabled) { localError(new Error("Select an enabled SSH clone identity to unlock. Tokens do not support passphrase unlock."), true); return; } unlock({ id: c.id, type: "ssh" }, () => renderForm(), () => renderForm(), "Unlock Clone Identity"); },
       inspect: env.home,
+      "setup-credentials": () => { snapshot(root); setupCredentials(created => { if (created) catalog = [...catalog.filter(c => c.id !== created.id), created]; renderForm(); }); },
     }, { primaryAction: "review" });
     bindAuthenticationHost(root, catalog);
+    const updateUnlock = () => {
+      const selected = catalog.find(c => c.id === draft.credentialId);
+      root.querySelector("[data-clone-unlock]")!.innerHTML = selected?.enabled && selected.type === "ssh" ? action("unlock", "Unlock selected clone identity") : "";
+    };
+    updateUnlock();
     root.oninput = () => { dirty = true; snapshot(root); };
-    root.onchange = () => { dirty = true; snapshot(root); };
+    root.onchange = () => { dirty = true; snapshot(root); updateUnlock(); };
   }
   function localError(error: unknown, reveal = false) { showContextualError(env.root, error instanceof Error ? error.message : "The clone form is invalid.", { reveal }); }
   function review() {

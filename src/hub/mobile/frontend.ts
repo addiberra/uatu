@@ -189,11 +189,11 @@ export function mountMobileHub(root: HTMLElement, backend: MobileHubBackend, cal
     const catalog = credentialSafetyNotice(identity?.user ?? "") + `<div data-credential-catalog>${credentialCatalog()}</div>`;
     const accounts = section("Agent accounts", destination("agent-accounts", "Agent accounts", "device", "OpenCode and Claude Code · Shared by all Hub users"));
     return `<h1>Settings</h1>${identity ? button("identity", `<img src="${esc(brandLogoUrl)}" alt=""/><span><strong>${esc(identity.user)}</strong><small>${esc(identity.host)}</small><small class="mh-running">${authenticationProblem ? "Connection unconfirmed" : "● Connected"}</small></span>`, "mh-identity") : ""}`
-      + section("Credentials", `${catalog}${button("add-credential", "Add Credential", "mh-text-action")}`) + note("Secure access for your workspaces. Stored only on this hub.") + accounts
-      + section("Workspaces", destination("default-folder", "Default Folder", "folder", folderNotice, folderValue, "blue") + destination("preview-side", "Preview File Controls", "preview", "Placement on this device", prefs.previewSide === "left" ? "Left" : "Right") + destination("auto-hide", "Navigation Auto-hide", "hub", "", prefs.autoHide ? "After 7 seconds" : "Until I close it"))
+      + section("Credentials", `${catalog}${button("add-credential", "Add Credential", "mh-text-action")}` + destination("tools", "Credential Tools", "key") + destination("assignments", "Manage workspace credentials", "folder", "Authentication hosts and commit signing")) + note("Repository access and signing. Stored only on this hub.") + accounts
+      + section("Workspaces", destination("default-folder", "Default Folder", "folder", folderNotice, folderValue, "blue"))
+      + section("Navigation", destination("auto-hide", "Navigation Auto-hide", "hub", "", prefs.autoHide ? "After 7 seconds" : "Until I close it") + destination("handle", "Navigation Handle", "hub", "Side and vertical placement") + destination("preview-side", "Preview File Controls", "preview", "Placement on this device", prefs.previewSide === "left" ? "Left" : "Right"))
       + section("Notifications", destination("notifications", "Notifications", "device", "This device and Hub login"))
-      + section("Account", destination("security", "Session Security", "shield", "", "", "purple"))
-      + section("More settings", destination("handle", "Navigation Handle", "hub", "Side and vertical placement") + destination("tools", "Credential Tools", "key") + destination("assignments", "Workspace Assignments", "folder"));
+      + section("Account", destination("security", "Session Security", "shield", "", "", "purple"));
   }
   function render() {
     if (disposed) return;
