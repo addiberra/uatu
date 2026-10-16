@@ -76,6 +76,10 @@ export type OpenCodeV2Fake = {
   pauseEvents(paused: boolean): void;
   appendHistory(sessionId: string, count: number): void;
   loseNextBackgroundResponse(): void;
+  loseNextPromptResponse(): void;
+  loseNextResumeResponse(): void;
+  refuseNextBackground(): void;
+  launchShellOnNextSteer(sessionId: string): void;
   loseNextWorkerResponse(): void;
   wakeParent(sessionId: string): void;
   state(): { eventSubscribers: number; sessions: Record<string, OpenCodeV2FakeSessionState>; shells: Record<string, { removed: boolean; waiter: string; captured: boolean; outputAvailable: boolean }>; unhandled: string[]; calls: string[] };
@@ -116,6 +120,8 @@ export function startOpenCodeV2Fake(options: { directory: string; password?: str
   const workers = new Map<string, { parent: SessionState; child: SessionState; message: StoredMessage; background: boolean; settled: boolean }>();
   const shells = new Map<string, { parent: SessionState; message: StoredMessage; background: boolean; removed: boolean; exited: boolean; waiter: "pending" | "exited" | "failed"; captured: boolean; captureBeforeRemove: boolean; output: string | null }>();
   let loseBackground = false;
+  let losePrompt = false, loseResume = false, refuseBackground = false;
+  const shellAfterAdmission = new Set<string>();
   let loseWorker = false;
   let counter = 0;
   let clock = 0;
@@ -411,6 +417,8 @@ export function startOpenCodeV2Fake(options: { directory: string; password?: str
         delivery: body.delivery === "queue" ? "queue" : "steer",
         resume: body.resume === true,
       });
+      if (body.delivery === "steer" && shellAfterAdmission.delete(sessionID)) launchShell(sessionID, false);
+      if (body.delivery === "steer" && losePrompt) { losePrompt = false; return new Response("lost prompt acknowledgement after application", { status: 502 }); }
       return enveloped(entry);
     }
     if (sub === "POST command") {
@@ -446,9 +454,11 @@ export function startOpenCodeV2Fake(options: { directory: string; password?: str
         startTurn(session, entry => entry.delivery === "steer");
       }
       if (workers.has(sessionID) && loseWorker) { loseWorker = false; return new Response("truncated response", { status: 502 }); }
+      if (url.searchParams.get("resume") === "true" && loseResume) { loseResume = false; return new Response("lost resume acknowledgement after application", { status: 502 }); }
       return Response.json({ interrupted: wasRunning });
     }
     if (sub === "POST background") {
+      if (refuseBackground) { refuseBackground = false; return Response.json({ _tag: "SessionNotFoundError", sessionID, message: "Fixture refuses backgrounding" }, { status: 404 }); }
       for (const shell of shells.values()) {
         if (shell.parent !== session || shell.background || shell.captured) continue;
         shell.background = true;
@@ -541,6 +551,8 @@ export function startOpenCodeV2Fake(options: { directory: string; password?: str
       workers.clear();
       shells.clear();
       loseBackground = false;
+      losePrompt = loseResume = refuseBackground = false;
+      shellAfterAdmission.clear();
       loseWorker = false;
       eventsPaused = false;
     },
@@ -560,6 +572,10 @@ export function startOpenCodeV2Fake(options: { directory: string; password?: str
       emit("session.message.content.updated", { sessionID: sessionId, messageID: session.messages.at(-1)!.id, content: session.messages.at(-1)!.content });
     },
     loseNextBackgroundResponse() { loseBackground = true; },
+    loseNextPromptResponse() { losePrompt = true; },
+    loseNextResumeResponse() { loseResume = true; },
+    refuseNextBackground() { refuseBackground = true; },
+    launchShellOnNextSteer(sessionId) { if (!sessions.has(sessionId)) throw new Error("Unknown fixture parent"); shellAfterAdmission.add(sessionId); },
     loseNextWorkerResponse() { loseWorker = true; },
     wakeParent(sessionId) {
       const session = sessions.get(sessionId);

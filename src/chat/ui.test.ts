@@ -33,6 +33,48 @@ if (process.env[CHILD_PROCESS_FLAG] !== "1") {
   });
 } else {
 describe("chat reversible-history composer", () => {
+  test("primary-unknown input reconciles read-only without restoring a resubmittable failed draft", async () => {
+    const { document, window } = parseHTML(html);
+    installDomGlobals(document, window);
+    document.documentElement.setAttribute("data-ui-mode", "desktop");
+    document.documentElement.setAttribute("data-chat-panel", "open");
+    const select = document.querySelector<HTMLSelectElement>("#chat-conversation-select")!;
+    let selected = "";
+    Object.defineProperty(select, "value", { configurable: true, get: () => selected, set: value => { selected = String(value); } });
+    let calls = 0, pendingRequest: string | undefined, readsAfterUnknown = 0;
+    const { ChatTransportError } = await import("./client");
+    const api = {
+      status: async () => [{ agent: { id: "test", name: "Test" }, availability: { state: "ready", version: "test", agent: { id: "test", name: "Test", capabilities: ["steering", "send-now", "background-blocking-work"] } } }],
+      conversations: async () => [conversation("one"), conversation("two")], commands: async () => [], models: async () => [], modes: async () => [],
+      snapshot: async (id: string) => {
+        if (pendingRequest) readsAfterUnknown++;
+        return { ...snapshot(id), queued: id === "one" && pendingRequest ? [{ id: "native", requestId: pendingRequest, text: "Keep this input", queuedAt: 1, delivery: "steer", paused: true, unconfirmed: true }] : [] };
+      },
+      prompt: async (_id: string, requestId: string) => { calls++; pendingRequest = requestId; throw new ChatTransportError("Operation outcome unknown", 409, "operation_outcome_unknown"); },
+      stream: () => ({ close() {} }), inventoryStream: () => ({ close() {} }), attachmentUrl: (id: string) => `/api/chat/attachments/${id}`,
+    } as unknown as ChatApiClient;
+    const { initChat } = await import(`./ui.ts?unknown-input-ui=${Date.now()}`);
+    initChat(api);
+    try {
+      await waitUntil(() => select.querySelector('option[value="one"]') !== null);
+      select.value = "one"; select.dispatchEvent(new window.Event("change", { bubbles: true }));
+      const input = document.querySelector<HTMLTextAreaElement>("#chat-input")!;
+      await waitUntil(() => !input.disabled);
+      input.value = "Keep this input";
+      input.dispatchEvent(new window.Event("input", { bubbles: true }));
+      document.querySelector("#chat-composer")!.dispatchEvent(new window.Event("submit", { bubbles: true, cancelable: true }));
+      await waitUntil(() => calls === 1 && readsAfterUnknown > 0, () => `calls=${calls}, recovery reads=${readsAfterUnknown}`);
+      expect(input.value).toBe("");
+      expect(document.querySelector("#chat-action-feedback")?.textContent).toContain("unconfirmed");
+      expect(document.querySelector("#chat-composer-error")?.textContent).not.toContain("Draft restored");
+      await waitUntil(() => document.querySelector("#chat-queue")?.textContent?.includes("Keep this input") === true);
+      expect(document.querySelectorAll('#chat-queue [data-chat-queued-id="native"] button')).toHaveLength(0);
+      window.dispatchEvent(new window.Event("online"));
+      await Promise.resolve();
+      expect(calls).toBe(1);
+    } finally { window.dispatchEvent(new window.Event("pagehide")); }
+  });
+
   test("dispatches local history operations and keeps composer state private and recoverable", async () => {
     const { document, window } = parseHTML(html);
     installDomGlobals(document, window);
@@ -2157,6 +2199,42 @@ describe("a typed command's silent run", () => {
 });
 
 describe("chat running work reachable without a disclosure", () => {
+  test("Continue requires a running blocker, not a pending tool, detached worker, or merely active parent", async () => {
+    const { document, window } = parseHTML(html);
+    installDomGlobals(document, window);
+    document.documentElement.setAttribute("data-ui-mode", "desktop");
+    document.documentElement.setAttribute("data-chat-panel", "open");
+    stubConversationSelect(document);
+    let stream: { event(event: unknown, cursor: string): void } | undefined;
+    const tool = { id: "tool:blocker", type: "tool", createdAt: 2, name: "subagent", status: "pending", input: "{}" };
+    const api = taskApi(document, { items: () => [tool], onStream: (_id, handlers) => { stream = handlers; } });
+    api.status = async () => [{ agent: { id: "test", name: "Test" }, availability: { state: "ready", version: "test", agent: { id: "test", name: "Test", capabilities: ["background-tasks", "background-blocking-work", "subagents"] } } }];
+    api.snapshot = async id => ({ ...snapshot(id), conversation: { ...conversation(id), status: "running" }, items: [tool as import("./types").ToolItem] });
+    let sequence = 0;
+    const emit = (body: Record<string, unknown>) => { sequence++; stream!.event({ generation: "g", sequence, conversationId: "one", ...body }, `cursor-one-${sequence}`); };
+    const action = document.querySelector<HTMLButtonElement>("#chat-continue-workers")!;
+    try {
+      const { initChat } = await import(`./ui.ts?blocker-gating=${Date.now()}`);
+      initChat(api);
+      await waitUntil(() => stream !== undefined, () => "waiting for parent stream");
+      expect(action.hidden).toBe(true);
+      emit({ type: "item.upsert", item: { ...tool, status: "running" } });
+      await waitUntil(() => !action.hidden, () => "running foreground tool should offer Continue");
+      emit({ type: "item.upsert", item: { id: "task:detached", type: "background_task", taskId: "detached", createdAt: 2, description: "Detached", taskType: "agent", status: "running", toolUseId: "blocker", childConversationId: "child" } });
+      await waitUntil(() => action.hidden === true, () => "detached worker is not blocking even before its launcher restatement");
+      emit({ type: "item.upsert", item: { id: "task:detached", type: "background_task", taskId: "detached", createdAt: 2, description: "Detached", taskType: "agent", status: "completed", foreground: true, toolUseId: "blocker", childConversationId: "child" } });
+      await waitUntil(() => document.querySelector<HTMLElement>("#chat-background-tasks")!.hidden === true, () => "settled task should leave the background list");
+      expect(action.hidden).toBe(true);
+      emit({ type: "item.upsert", item: { ...tool, status: "completed" } });
+      emit({ type: "item.upsert", item: { id: "tool:shell", type: "command", createdAt: 3, command: "fixture", status: "running" } });
+      await waitUntil(() => !action.hidden, () => "running shell should offer Continue");
+      emit({ type: "conversation.status", status: "completed" });
+      await waitUntil(() => action.hidden === true, () => "idle parent must not offer Continue on a stale tool");
+    } finally {
+      window.dispatchEvent(new Event("pagehide"));
+    }
+  });
+
   const shellTask = (taskId: string, status: "running" | "completed", createdAt = 2) => ({
     id: `task:${taskId}`, type: "background_task", createdAt, taskId, description: `Task ${taskId}`, taskType: "local_bash",
     toolUseId: `toolu_${taskId}`, status, outputFile: `/tmp/tasks/${taskId}.output`,

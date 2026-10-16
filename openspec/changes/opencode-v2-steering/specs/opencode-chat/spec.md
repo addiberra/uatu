@@ -6,20 +6,34 @@
 ## MODIFIED Requirements
 
 ### Requirement: Chat composer actions keep a stable responsive layout
-The Chat composer SHALL present context usage, one flexible configuration trigger, routine status, a persistent visible Send action, and a separate Stop action. A capability-gated delivery selector SHALL precede Send where supported. Send SHALL NOT become Stop while work runs. Each submission control SHALL have a target at least 44×44 CSS pixels with at least 8px separation from adjacent submission controls and a visible keyboard-focus indicator. Stop SHALL remain in place but disabled when no turn is live. Routine lifecycle changes and opening the delivery menu MUST NOT move or resize these controls at an unchanged panel width.
+The Chat composer SHALL present context usage, one flexible configuration trigger, routine status, a persistent visible Send action, and a separate Stop action, subject to the compact touch layout below. A capability-gated delivery selector SHALL precede Send where supported. Send SHALL NOT become Stop while work runs. Each submission control SHALL have a target at least 44×44 CSS pixels with at least 8px separation from adjacent submission controls and a visible keyboard-focus indicator. Stop SHALL remain in place but disabled when no turn is live. Routine lifecycle changes and opening the delivery menu MUST NOT move or resize these controls at unchanged panel dimensions and keyboard/editing state.
 
-Wide panels SHALL use one non-wrapping rail. At narrow widths the composer SHALL use two deliberate rails: context/configuration/status above delivery/Send/Stop. The configuration label SHALL truncate as needed, without shrinking submission targets or causing horizontal overflow. Resizing MAY switch the entire rail arrangement; individual controls MUST NOT wrap independently. Actionable failures SHALL remain explanatory text outside the routine status footprint, without horizontally reordering the controls. Textarea autosizing remains independent of rail stability.
+Wide panels SHALL use one non-wrapping rail. At narrow widths steering-capable composers SHALL use two deliberate rails: context/configuration/status above delivery/Send/Stop. Composers without a delivery selector SHALL keep one compact rail without reserving an empty delivery row. The configuration label SHALL truncate as needed, without shrinking submission targets or causing horizontal overflow. Resizing MAY switch the entire rail arrangement; individual controls MUST NOT wrap independently. Actionable failures SHALL remain explanatory text outside the routine status footprint, without horizontally reordering the controls. Textarea autosizing remains independent of rail stability.
+
+When the touch software-keyboard visual band is at most 450px, or a touch landscape band is at most 390px with width at least 600px, the composer SHALL instead use a single compact row containing the text input and submission controls, hiding routine configuration/status chrome. Short touch headers SHALL omit the identity row. Parent-composer viewport handling SHALL keep the header and submission controls within the available visual band without scrolling the outer surface; transcript and dock scrolling remain separate. Existing interaction-request answering behavior is unchanged. Hardware-keyboard editing SHALL retain the bottom safe-area inset without doubling it under a software keyboard.
 
 #### Scenario: Routine lifecycle keeps trailing controls stationary
-- **WHEN** a prompt moves through ready, sending, working, cancelling, and ready states at an unchanged Chat-panel width
+- **WHEN** a prompt moves through ready, sending, working, cancelling, and ready states at unchanged Chat-panel dimensions and keyboard/editing state
 - **THEN** the status, Send, Stop, and supported delivery selector retain their dimensions and positions
 - **AND** Stop is enabled only during live work and unavailable during its cancellation request
 
 #### Scenario: Narrow desktop panel truncates configuration
-- **WHEN** a desktop or touch Chat panel is too narrow for one rail
+- **WHEN** a desktop or non-compact touch Chat panel is too narrow for one rail
 - **THEN** the submission controls occupy one separate non-wrapping row below settings/status
 - **AND** their minimum target sizes and separation are preserved without horizontal overflow
 - **AND** the configuration label truncates to its available width
+
+#### Scenario: Non-steering narrow composer stays compact
+- **WHEN** an agent without steering is shown in a composer at most 30rem wide outside compact touch keyboard/short-landscape mode
+- **THEN** settings, status, Send and Stop share one rail with no empty selector row
+
+#### Scenario: Delivery choice explains its shortcuts and restores focus
+- **WHEN** the delivery menu opens
+- **THEN** its current choice has a visible check and the device-appropriate submit hint (Enter on desktop, Send / Ctrl+Enter on touch), and the other choice has Alt+Enter
+- **AND** Escape restores the previously focused control, including the composer on touch
+- **AND** the selector title explains Send's delivery and whether Enter submits or adds a newline, or why selection is disabled while idle
+- **AND** busy Send's accessible name says Send as steer, Send to queue, or Queue message as appropriate
+- **AND** enabled Send text has at least 4.5:1 contrast in light and dark themes
 
 #### Scenario: Context usage does not displace the trailing action
 - **WHEN** context usage becomes available or its displayed value changes
@@ -34,6 +48,21 @@ Wide panels SHALL use one non-wrapping rail. At narrow widths the composer SHALL
 #### Scenario: Gap taps do not activate adjacent actions
 - **WHEN** a touch lands in the gap between submission controls
 - **THEN** no prompt or cancellation is sent, even if the browser attempts to retarget that tap
+
+#### Scenario: An outside delivery-menu tap consumes activation
+- **WHEN** a touch user taps outside the open delivery menu over an underlying Revert or other action
+- **THEN** the menu closes without activating that action or altering the draft
+- **AND** Escape retains its existing focus-restoration behavior
+
+#### Scenario: Compact parent composer stays in the keyboard band
+- **WHEN** loaded work is shown at 390px width with a 380px or 450px visual band, or at 844px landscape width with a 230px band
+- **THEN** Send, delivery selection and Stop remain fully inside the band with their target sizes and gaps preserved
+- **AND** at least 40% of that band remains available to the transcript in the tested standard-size layout
+
+#### Scenario: Loaded hardware-keyboard portrait preserves conversation space
+- **WHEN** the 390×844 touch parent composer is focused without a software keyboard, with 47px top and 34px bottom safe insets, workers and pending messages
+- **THEN** the aggregate dock is capped at 24% of visual height and the transcript retains at least 40% of visual height in the standard-size layout
+- **AND** the composer respects the bottom safe inset and its submission controls remain reachable
 
 ### Requirement: The workspace API exposes normalized chat operations
 The workspace API SHALL provide authenticated operations to list, create, and read conversations; start a prompt turn; remove a queued message; change a pending message's delivery; send a pending message now; cancel the active turn; answer a pending permission; and answer or reject a structured question. Mutation requests SHALL be origin-protected under cookie authentication, SHALL validate conversation ownership against the workspace directory, and SHALL use client-generated request identifiers to make network retries idempotent. Provider-specific payloads and credentials MUST NOT be exposed as the public contract when a normalized UatuCode representation exists.
@@ -269,7 +298,7 @@ A control the surface offers the user to start an operation — a picker such as
 ### Requirement: Chat supports reversible conversation undo and redo
 When the connected agent declares reversible-history support, Chat SHALL offer local `/undo` and `/redo` commands that operate on the selected conversation and MUST NOT send those command strings as ordinary prompts or provider-defined slash commands. Each visible user turn in the main transcript SHALL also offer a direct Revert message action. Undo SHALL stage the previous visible user turn as the conversation's revert boundary; direct Revert SHALL stage the selected visible user turn in one boundary mutation rather than repeated Undo mutations. Both SHALL hide the boundary turn and all later work from the current transcript and restore affected workspace files through the agent's revert operation. The invoking client SHALL receive the boundary turn's non-synthetic prompt text and any still-available attachments as an editable composer draft; other clients' private drafts MUST NOT be overwritten.
 
-If work is running, Undo SHALL interrupt it before changing the boundary. Messages queued behind that work MUST NOT be admitted between interruption and the completed revert. Existing pending messages SHALL remain visible and removable but paused while a revert is staged. They SHALL resume only after Redo clears the revert or after the user submits a replacement prompt, with that replacement admitted before the older held queue resumes. When the agent declares `steering`, the replacement SHALL be sent as a steer. Messages held in the workspace's queue SHALL stay pending rather than being discarded. Steers already pending with the agent SHALL be delivered together with the replacement, the oldest first. When Undo succeeds while steers are pending, Chat's undo confirmation SHALL name those steers and say that they will be delivered together with the replacement.
+If work is running, Undo SHALL interrupt it before changing the boundary. Messages queued behind that work MUST NOT be admitted between interruption and the completed revert. Existing pending messages SHALL remain visible and removable but paused while a revert is staged. They SHALL resume only after Redo clears the revert or after the user submits a replacement prompt, with that replacement admitted before the older held queue resumes. When the agent declares `steering`, the replacement SHALL be sent as a steer. Messages held in the workspace's queue SHALL stay pending rather than being discarded. Steers already pending with the agent SHALL be delivered together with the replacement, the oldest first. When Undo succeeds while steers are pending, Chat's undo confirmation SHALL count those steers without repeating their message text and say that they will be delivered together with the replacement.
 
 Repeated Undo SHALL move the boundary backward one visible user turn at a time. While a boundary is staged, Chat SHALL list the hidden user turns from the boundary onward and offer a Restore message action for each. Redo SHALL move forward one hidden user turn at a time. Restoring a selected hidden turn SHALL make history current through that turn in one mutation by staging the following hidden user turn, or SHALL clear the boundary when the selected turn is newest. The invoking client's composer SHALL receive the next boundary turn when one remains and SHALL clear when the original transcript is fully restored. Submitting a replacement prompt while a revert is staged SHALL commit the reverted history before starting the replacement turn, after which the hidden turns can no longer be restored by Redo or Restore.
 
@@ -353,9 +382,9 @@ Every successful boundary change SHALL reconcile the authoritative conversation 
 - **AND** the messages held in the workspace's queue remain pending
 - **AND** steers already pending with the agent are delivered with the replacement, the oldest first
 
-#### Scenario: The undo confirmation names pending steers
+#### Scenario: The undo confirmation counts pending steers
 - **WHEN** the agent declares `steering` and Undo succeeds while steers are pending
-- **THEN** Chat's undo confirmation names each pending steer
+- **THEN** Chat's undo confirmation counts pending steers without repeating their message text
 - **AND** says they will be delivered together with the replacement prompt
 
 #### Scenario: Other clients reconcile without losing private drafts
@@ -412,9 +441,9 @@ A message submitted with attachments while the conversation is running SHALL kee
 ### Requirement: OpenCode 2.x conversations can steer the running turn
 An agent that can deliver a message into its running turn at the next safe step boundary, and can withdraw or switch a message before then, SHALL declare the `steering` capability. The OpenCode 2.x agent SHALL declare it. The OpenCode 1.x agent and the Claude Code agent SHALL NOT declare it.
 
-While a conversation whose agent declares `steering` is running or has pending messages, the composer SHALL offer two deliveries. Send and Enter submit with the default delivery. ⌥Enter (Option/Alt+Enter) submits with the other one. A separate labelled selector preceding Send SHALL offer Steer and Queue by name and display the current choice. Selecting a delivery SHALL preserve the draft without submitting it. The default delivery SHALL be a per-device preference, initially steer. Opening the menu SHALL NOT change control footprints or rail order. The selector SHALL support keyboard navigation, dismissal and visible focus, and menu choices SHALL be at least 44px high. On capable conversations it SHALL remain visible but disabled while idle with no pending messages; on other agents it SHALL be absent. The delivery choice SHALL apply only to prompts: skills, slash commands, and `/reload` are always held in the workspace's queue. While the conversation is idle, submission SHALL be unchanged.
+While a conversation whose agent declares `steering` is running or has pending messages, the composer SHALL offer two deliveries. Send and desktop Enter submit with the default delivery. Touch Enter SHALL insert a newline, idle or busy, including while a command candidate is shown; Ctrl/Command+Enter explicitly submits with the default delivery. ⌥Enter (Option/Alt+Enter) submits with the other delivery where the choice is offered. A separate labelled selector preceding Send SHALL offer Steer and Queue by name and display the current choice. Selecting a delivery SHALL preserve the draft without submitting it. The default delivery SHALL be a per-device preference, initially steer. Opening the menu SHALL NOT change control footprints or rail order. The selector SHALL support keyboard navigation, dismissal and visible focus, and menu choices SHALL be at least 44px high. On capable conversations it SHALL remain visible but disabled while idle with no pending messages; on other agents it SHALL be absent. The delivery choice SHALL apply only to prompts: skills, slash commands, and `/reload` are always held in the workspace's queue. Idle submission retains immediate-delivery semantics with these device-specific keys.
 
-A steer SHALL be handed to the agent at once and kept pending by the agent until the agent delivers it. Steers SHALL be delivered before any held message. The dock SHALL list the user's pending steers, from any client of the conversation, labelled "Steer", and SHALL NOT list the agent's own internal inbox entries. A steer SHALL NOT appear in the timeline until the agent reports it delivered, at which point it SHALL appear as an ordinary user message. While steers are pending, the dock SHALL note that they run with the conversation's model and mode as they stand when they are delivered.
+A steer SHALL be handed to the agent at once and kept pending by the agent until the agent delivers it. Steers SHALL be delivered before any held message. The expanded dock SHALL list the user's pending steers, from any client of the conversation, labelled "Steer", and SHALL NOT list the agent's own internal inbox entries. A steer SHALL NOT appear in the timeline until the agent reports it delivered, at which point it SHALL appear as an ordinary user message. Outside compact keyboard/short-landscape mode, pending steers SHALL carry the dock note that they run with the conversation's model and mode as they stand when they are delivered.
 
 For each pending entry, the user SHALL be able to:
 - switch a queued message to steer, which hands it to the agent as a steer at once; on a dormant queue or an idle conversation this is how a held message is sent now;
@@ -425,17 +454,35 @@ Withdrawing a steer SHALL complete only when the agent confirms the withdrawal. 
 
 Skills, slash commands, and `/reload` in the queue SHALL NOT offer the switch to steer.
 
-Cancelling the turn SHALL leave pending steers with the agent and SHALL present them as paused. A steer is paused when it was pending before the conversation last became idle. A paused steer SHALL offer Send now, which resumes the agent so that it delivers its pending steers. The control SHALL say that every paused steer is delivered together. Submitting a new steer SHALL also resume delivery of paused steers.
+Cancelling the turn SHALL leave pending steers with the agent and SHALL present them as paused. A steer is paused when it was pending before the conversation last became idle. The dock SHALL offer one action labelled `Send N paused steers now`, which resumes the agent so that it delivers every pending steer. Submitting a new steer SHALL also resume delivery of paused steers.
+
+The expanded pending dock SHALL have a sticky count header identifying total pending messages, steers and queued messages. Its desktop scroll budget SHALL use 40% of the actual measured panel height, capped at 25rem, rather than an assumed viewport height. On touch, all work tracks and pending messages SHALL share a contained scroll budget of at most 35% of visual height, 25% at tablet widths from 48rem, or 24% while editing without a software keyboard. The pending list SHALL show a bottom fade only while content remains below. Entries SHALL lead with a distinct Steer or Queue badge and a separate Paused chip where applicable. Timing labels SHALL say `Next step`, `After this turn`, or `Sends after your next message` for paused entries. Dock actions SHALL have at least 36px targets on desktop and 44px on touch, visible focus outlines, and accessible names quoting their message. Successful move, send and remove actions SHALL produce polite composer feedback. An already-delivered refusal SHALL appear once as neutral informational feedback, not duplicate red errors.
+
+When pending messages exist, software-keyboard mode or short touch landscape SHALL collapse the work dock to a pending-count summary rather than hide it. Any paused-steer batch Send action SHALL retain a 44px target, and the count-only replacement warning SHALL remain readable while typing or editing a pending entry. Entry details and the routine model-at-delivery note MAY be hidden in this compact state; the replacement warning SHALL NOT be hidden. Dock growth SHALL reserve its final bounded layout height before a visual reveal, respect reduced motion, and preserve a remote-update reading anchor and deliberate bottom pinning. Sending a prompt SHALL retain the existing explicit jump-to-latest behavior.
 
 When the workspace attaches to a conversation, or reconnects to the agent, it SHALL reconcile the pending steers with the agent's own list, so the dock shows steers raised while the stream was interrupted or by another client.
+
+#### Scenario: Short desktop budgets use the panel rather than the window
+- **WHEN** six long pending messages occupy a 1280px-wide desktop window at 600px or 480px height, or the panel is shorter than its window
+- **THEN** the queue is bounded by the measured panel height and Send and Stop remain inside that panel and hit-testable
+
+#### Scenario: Keyboard retains pending safety information
+- **WHEN** a replacement is staged with paused steers, or a pending message is edited into the focused touch composer
+- **THEN** compact pending counts remain visible while typing
+- **AND** any paused-steer batch Send action and replacement warning remain available above the composer
+
+#### Scenario: Dock growth preserves reading intent with either motion preference
+- **WHEN** remote work grows the dock while the user reads an earlier message, then the user deliberately returns to latest and submits a prompt
+- **THEN** the earlier reading anchor survives the remote update and the submitted exchange remains bottom-pinned through dock growth
+- **AND** reduced motion omits the reveal animation without changing these positioning rules
 
 #### Scenario: Steering is offered only where declared
 - **WHEN** a running conversation's agent declares `steering`
 - **THEN** the composer offers steer and queue delivery
 - **AND** on a conversation whose agent does not declare it, no steer choice appears and busy submissions queue
 
-#### Scenario: Enter steers by default
-- **WHEN** the default delivery preference has not been changed and the user presses Enter while the agent works
+#### Scenario: Desktop Enter steers by default
+- **WHEN** the default delivery preference has not been changed and the desktop user presses Enter while the agent works
 - **THEN** the message is handed to the agent as a steer
 - **AND** the dock lists it labelled "Steer", ahead of any queued messages
 
@@ -445,8 +492,13 @@ When the workspace attaches to a conversation, or reconnects to the agent, it SH
 
 #### Scenario: The default delivery is a per-device choice
 - **WHEN** the user changes the default delivery to queue on one device
-- **THEN** Enter queues on that device
+- **THEN** desktop Enter or touch Ctrl/Command+Enter queues on that device
 - **AND** other devices keep their own default
+
+#### Scenario: Touch Enter is always a newline
+- **WHEN** a touch user presses unmodified Enter while idle, busy, or viewing a command candidate
+- **THEN** a newline is inserted without a prompt mutation
+- **AND** Send or Ctrl/Command+Enter remains the explicit submission path
 
 #### Scenario: The delivery menu is available on touch
 - **WHEN** the user opens the separate delivery selector while the agent works
@@ -468,8 +520,18 @@ When the workspace attaches to a conversation, or reconnects to the agent, it SH
 - **THEN** it appears only in the dock
 - **AND** the timeline contains no user message for it
 
+#### Scenario: Duplicate or image-only entries remain distinguishable
+- **WHEN** pending entries have duplicate text or only attachments
+- **THEN** their action names include distinct human-readable pending-message numbers
+- **AND** a pending entry retains its number across reordering, delivery switches and sibling removal during the current client view
+
+#### Scenario: Repeated successful mutations each announce once
+- **WHEN** the user successfully removes, moves or sends two pending messages in succession
+- **THEN** each success produces one polite live update even if the words are identical
+- **AND** later routine paints do not replay the retained note
+
 #### Scenario: Pending steers note the model they run with
-- **WHEN** at least one steer is pending
+- **WHEN** at least one steer is pending outside compact keyboard/short-landscape mode
 - **THEN** the dock says that steers run with the conversation's model and mode at delivery
 
 #### Scenario: A queued message is switched to steer
@@ -503,7 +565,7 @@ When the workspace attaches to a conversation, or reconnects to the agent, it SH
 - **AND** the steers remain in the dock presented as paused
 
 #### Scenario: Send now wakes paused steers together
-- **WHEN** steers are paused and the user chooses Send now on one of them
+- **WHEN** steers are paused and the user chooses the dock's Send N paused steers now action
 - **THEN** the agent resumes and delivers every paused steer
 - **AND** the control said beforehand that all paused steers go together
 

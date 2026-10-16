@@ -42,6 +42,30 @@ type Inventory = { operations: Array<{ operationId: string; domain: string; meth
 type Streaming = { channels: Record<string, unknown>; schemas: Record<string, object> };
 
 describe("API contract structure", () => {
+  test("unconfirmed pending input stays explicit in the closed public queue payload", async () => {
+    const { parseQueuedMessages } = await import("../src/chat/validation");
+    const spec = await readYaml<{ components: { schemas: Record<string, object> } }>("api/openapi.yaml");
+    const validate = createAjv().compile(schemaForAjv(spec.components.schemas.QueuedMessage, spec.components.schemas));
+    const entry = { id: "native", text: "Keep input", delivery: "steer", queuedAt: 1, unconfirmed: true };
+    expect(validate(entry), JSON.stringify(validate.errors)).toBe(true);
+    expect(parseQueuedMessages([entry])).toEqual([entry]);
+    for (const unconfirmed of [false, "true", null]) {
+      expect(validate({ ...entry, unconfirmed })).toBe(false);
+      expect(() => parseQueuedMessages([{ ...entry, unconfirmed }])).toThrow();
+    }
+  });
+  test("personal chat preferences have closed versioned wire contracts matching runtime validation", async () => {
+    const { parsePersonalChatPreferencesUpdate } = await import("../src/hub/personal-chat-preferences");
+    const spec = await readYaml<{ components: { schemas: Record<string, object> } }>("api/openapi.yaml");
+    const validate = createAjv().compile(schemaForAjv(spec.components.schemas.UpdatePersonalChatPreferencesRequest, spec.components.schemas));
+    const valid = { version: 1, expectedRevision: 0, autoBackgroundOnSteer: false };
+    expect(validate(valid)).toBe(true);
+    expect(parsePersonalChatPreferencesUpdate(valid)).toEqual(valid);
+    for (const invalid of [{ ...valid, user: "bob" }, { ...valid, version: 2 }, { ...valid, expectedRevision: -1 }, { ...valid, autoBackgroundOnSteer: "false" }, {}]) {
+      expect(validate(invalid)).toBe(false);
+      expect(() => parsePersonalChatPreferencesUpdate(invalid)).toThrow();
+    }
+  });
   test("background task uncertainty and child inspection agree across strict wire validators", async () => {
     const { parseConversationItem } = await import("../src/chat/validation");
     const openapi = await readYaml<{ components: { schemas: Record<string, object> } }>("api/openapi.yaml");

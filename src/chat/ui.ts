@@ -21,19 +21,25 @@ import { insertCommand, localHistoryOperation, matchingCommands, slashCommandQue
 import { LatestRefresh } from "./latest-refresh";
 import { navigateWorkspaceFileReference, resolveWorkspaceFileReference } from "./file-references";
 import { READER_CLOSED, QueueDockRenderer, RevertedMessagesDockRenderer, TimelineRenderer, decorateAttachmentImages, decorateFileLinks, formatElapsed, latestTodoEntries, pendingSteerReplacementNote, statusLabel, subagentEntries, subagentLabel, workingLabel } from "./timeline-renderer";
-import { backgroundStatusLabel, runningBackgroundTasks } from "./background-tasks";
+import { backgroundStatusLabel, backgroundTasksByTool, runningBackgroundTasks } from "./background-tasks";
 import { pausedStatusLabel, pausedWakeups, pendingWakeups, scheduledStatusLabel, wakeupFireTime } from "./scheduled-wakeups";
 import { RunningWorkDisclosure } from "./running-work-disclosure";
+import { CompactDisclosure, compactWorkers, workerSummary } from "./compact-work";
+import { createTouchChatOptions } from "./touch-options";
 import { SilentRunFollower, TaskInspectionPanel, formatTaskElapsed, taskForChild, taskById, taskInspection, type OpenTaskInspection } from "./task-inspection";
 import { composerRoutineState, formatUsd, latestPlanReport, latestRateLimit, planChip, planHasRows, planName, planReadoutRows, sessionTotalsTitle, standingSentence, usageAsOf, usageStale, type RateLimitStanding } from "./composer-status";
 import { buildPlanRowNodes, currentUsageReport, initUsagePaneControls, noteUsageReport, onUsageChange, onUsageRead, readStatusText, readUsageNow, refreshUsageIfStale, revealUsagePane, usageReadState, usageReadable } from "./usage-pane";
 import { isLiveConversationStatus } from "./types";
+import { hasVerifiedBlockingWork } from "./blocking-work";
+import { automaticBackgroundNote } from "./automatic-background";
+import type { AutomaticBackgroundFeedback, BackgroundTaskItem } from "./types";
 import { contextReadout } from "./context-readout";
 import { buildReceiptRows, buildReceiptTotal, parseReceiptView, receiptHeading, subagentTrackSummary, subagentTranscriptTitle, type ReceiptView } from "./receipt-view";
 import { formatTokens, totalTokens } from "./usage";
 import { resolveSessionTotals, type ConversationTotals } from "./conversation-totals";
 import {
   addAcceptedDraft,
+  markDraftUnconfirmed,
   applyChatEvent,
   confirmAcceptedDraft,
   dropQueuedMessage,
@@ -56,6 +62,7 @@ import { dateTime, nextLocalMidnight } from "./dates";
 import { watchPinnedDayLabels } from "./pinned-day";
 
 const PRESENTATION_KEY = "uatu:chat-presentation";
+const TOO_LATE = "Too late — already delivered";
 const SAVE_DEBOUNCE_MS = 400;
 const MAX_EXPANDED_ENTRIES = 400;
 const REFRESH_RETRY_INITIAL_MS = 100;
@@ -136,6 +143,7 @@ export function initChat(api = new ChatApiClient()): void {
   const deliveryToggle = document.querySelector<HTMLButtonElement>("#chat-delivery-toggle");
   const deliveryLabel = document.querySelector<HTMLElement>("#chat-delivery-label");
   const deliveryMenu = document.querySelector<HTMLElement>("#chat-delivery-menu");
+  const deliveryBackdrop = document.querySelector<HTMLElement>("#chat-delivery-backdrop");
   const form = document.querySelector<HTMLFormElement>("#chat-composer");
   const input = document.querySelector<HTMLTextAreaElement>("#chat-input");
   const commandMenu = document.querySelector<HTMLElement>("#chat-command-menu");
@@ -317,6 +325,7 @@ export function initChat(api = new ChatApiClient()): void {
     return Boolean(match) && commands.some(command => command.name === match![1] && command.kind !== "local-operation");
   };
   let projection: ChatProjection | null = null;
+  const unconfirmedInputs = new Map<string, ChatProjection["acceptedDrafts"]>();
   const stagedConfigurations = new Map<string, ConversationConfiguration>();
   let configurationPicker: ChatConfigurationPickerController | null = null;
   let stream: ChatEventStream | null = null;
@@ -1024,8 +1033,64 @@ export function initChat(api = new ChatApiClient()): void {
   };
 
   const backgroundTasks = document.querySelector<HTMLDetailsElement>("#chat-background-tasks");
+  const subagents = document.querySelector<HTMLDetailsElement>("#chat-subagents");
   const backgroundTasksLabel = document.querySelector<HTMLElement>("#chat-background-tasks-label");
   const backgroundTasksItems = document.querySelector<HTMLElement>("#chat-background-tasks-items");
+  const compactWorkersList = document.querySelector<HTMLDetailsElement>("#chat-compact-workers");
+  const compactWorkersLabel = document.querySelector<HTMLElement>("#chat-compact-workers-label");
+  const compactWorkersItems = document.querySelector<HTMLElement>("#chat-compact-workers-items");
+  const compactWorkerState = new CompactDisclosure();
+  const compactPendingState = new CompactDisclosure();
+  compactWorkersList?.addEventListener("toggle", () => compactWorkerState.toggled(compactWorkersList.open));
+  const compactShellRows = document.createElement("ul");
+  compactShellRows.className = "chat-compact-shells";
+  const workerHomes = [subagents, backgroundTasks].filter((node): node is HTMLDetailsElement => Boolean(node)).map(node => {
+    const home = document.createComment("desktop worker track");
+    node.before(home);
+    return { node, home };
+  });
+  const syncCompactWork = () => {
+    if (!compactWorkersList || !compactWorkersItems || !compactWorkersLabel) return;
+    const touch = document.documentElement.dataset.uiMode === "touch";
+    for (const { node, home } of workerHomes) {
+      if (touch) { if (node.parentElement !== compactWorkersItems) compactWorkersItems.append(node); }
+      else if (node.previousSibling !== home) home.after(node);
+    }
+    compactWorkersList.hidden = !touch;
+    if (!touch) return;
+    const workers = compactWorkers(projection?.items ?? []);
+    compactWorkersLabel.textContent = workerSummary(workers);
+    compactWorkersList.hidden = workers.length === 0;
+    compactWorkersList.open = compactWorkerState.paint(projection?.conversationId ?? null);
+    if (compactShellRows.parentElement !== compactWorkersItems) compactWorkersItems.append(compactShellRows);
+    const shellItems = (projection?.items ?? []).filter(item => workers.some(worker => worker.id === item.id) && (item.type === "command" || item.type === "tool" && /^(shell|bash|local_bash)$/i.test(item.name)));
+    const signature = JSON.stringify(shellItems);
+    if (compactShellRows.dataset.signature === signature) return;
+    compactShellRows.dataset.signature = signature;
+    compactShellRows.replaceChildren(...shellItems.map(item => {
+      const row = document.createElement("li");
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "chat-subagent-open";
+      button.dataset.inspectWorkerItem = item.id;
+      button.textContent = item.type === "tool" ? item.input || item.name : item.type === "command" ? item.command : "";
+      const status = document.createElement("span");
+      status.textContent = item.type === "tool" || item.type === "command" ? item.status : "";
+      row.append(button, status);
+      return row;
+    }));
+  };
+  compactShellRows.addEventListener("click", event => {
+    const id = (event.target as Element).closest<HTMLElement>("[data-inspect-worker-item]")?.dataset.inspectWorkerItem;
+    if (!id) return;
+    expanded.add(id);
+    scheduleRender();
+    requestAnimationFrame(() => {
+      const node = jumpToPrompt(id, false);
+      const details = node instanceof HTMLDetailsElement ? node : node?.querySelector("details");
+      if (details) details.open = true;
+    });
+  });
 
   /**
    * Both pinned lists of running work open when running work first appears
@@ -1039,8 +1104,13 @@ export function initChat(api = new ChatApiClient()): void {
   const trackRunningWork = (list: HTMLDetailsElement | null) => {
     const disclosure = new RunningWorkDisclosure(list?.open ?? false);
     list?.addEventListener("toggle", () => disclosure.toggled(list.open));
-    return (runningCount: number) => {
-      if (list && disclosure.paint(projection?.conversationId ?? null, runningCount) && !list.open) list.open = true;
+    return (runningCount: number, collapseAutomatic = false) => {
+      if (document.documentElement.dataset.uiMode === "touch") {
+        if (list) list.open = true;
+        return;
+      }
+      const next = disclosure.paint(projection?.conversationId ?? null, runningCount, collapseAutomatic);
+      if (list && next !== undefined) list.open = next;
     };
   };
   const discloseBackgroundTasks = trackRunningWork(backgroundTasks);
@@ -1062,8 +1132,43 @@ export function initChat(api = new ChatApiClient()): void {
   const continueWorkers = document.querySelector<HTMLButtonElement>("#chat-continue-workers");
   const backgroundFeedback = document.querySelector<HTMLElement>("#chat-background-feedback");
   const backgroundNotes = new Map<string, string>();
+  const automaticNotes = new Map<string, string>();
+  const actionFeedback = document.querySelector<HTMLElement>("#chat-action-feedback");
+  const recordAutomaticBackground = (conversationId: string, result: AutomaticBackgroundFeedback) => {
+    const note = automaticBackgroundNote(result.automaticBackground);
+    if (note) automaticNotes.set(conversationId, note);
+    else automaticNotes.delete(conversationId);
+    syncControls();
+  };
+  const confirmChatAction = (title: string, message: string, accept: string, invoker?: HTMLElement): Promise<boolean> => {
+    const dialog = document.querySelector<HTMLDialogElement>("#chat-action-confirm");
+    if (!dialog || dialog.open) return Promise.resolve(false);
+    // WebKit pointer activation need not focus its button. Capture the
+    // actual invoker rather than the unrelated control still holding focus.
+    const previousFocus = invoker ?? document.activeElement;
+    const inspection = previousFocus instanceof HTMLElement && drilldownTask?.contains(previousFocus) ? child?.task : undefined;
+    dialog.querySelector("#chat-action-confirm-title")!.textContent = title;
+    dialog.querySelector("#chat-action-confirm-body")!.textContent = message;
+    dialog.querySelector("#chat-action-confirm-accept")!.textContent = accept;
+    dialog.returnValue = "cancel";
+    return new Promise(resolve => {
+      const onKey = (event: KeyboardEvent) => { if (event.key === "Escape") event.stopPropagation(); };
+      dialog.addEventListener("keydown", onKey);
+      dialog.addEventListener("close", () => {
+        dialog.removeEventListener("keydown", onKey);
+        const survivingInspection = inspection && child?.task?.taskId === inspection.taskId && child.task.conversationId === inspection.conversationId
+          ? drilldownTask?.querySelector<HTMLElement>("[data-task-result], [data-stop-task]:not(:disabled)") ?? drilldownBack ?? drilldownTimeline : null;
+        (previousFocus instanceof HTMLElement && previousFocus.isConnected ? previousFocus : survivingInspection ?? input)?.focus({ preventScroll: true });
+        resolve(dialog.returnValue === "confirm");
+      }, { once: true });
+      dialog.showModal();
+    });
+  };
+  const hasBlockingWork = () => {
+    return Boolean(projection && hasVerifiedBlockingWork(projection.status, projection.items));
+  };
   continueWorkers?.addEventListener("click", async () => {
-    if (!projection || !declares("background-blocking-work") || !isLiveConversationStatus(projection.status) || cancelling || backgrounding.has(projection.conversationId)) return;
+    if (!projection || !declares("background-blocking-work") || !hasBlockingWork() || cancelling || backgrounding.has(projection.conversationId)) return;
     const id = projection.conversationId;
     backgrounding.add(id);
     backgroundNotes.set(id, "Requesting background work…");
@@ -1080,19 +1185,23 @@ export function initChat(api = new ChatApiClient()): void {
       syncControls();
     }
   });
+  continueWorkers?.addEventListener("mousedown", event => keepTouchComposerFocus(event));
   const syncBackgroundTasks = () => {
     if (!backgroundTasks || !backgroundTasksLabel || !backgroundTasksItems) return;
     // The open drill-down's strip reads the same items; it keeps its own
     // change check, so it is asked before this list's early return.
     syncTaskInspection();
-    const entries = projection && declares("background-tasks") ? runningBackgroundTasks(projection.items) : [];
+    const touch = document.documentElement.dataset.uiMode === "touch";
+    const entries = projection && declares("background-tasks") ? touch
+      ? projection.items.filter((item): item is BackgroundTaskItem => item.type === "background_task" && !item.foreground)
+      : runningBackgroundTasks(projection.items) : [];
     for (const item of projection?.items ?? []) {
       if (item.type === "background_task" && item.status !== "running") stoppingTasks.delete(item.taskId);
     }
     // Ahead of the unchanged-signature return: the rule reads every paint,
     // since the conversation it is keyed on can change under one signature.
     discloseBackgroundTasks(entries.length);
-    const signature = entries.map(entry => [entry.taskId, entry.description, entry.progress ?? "", entry.childConversationId ?? "", entry.stateUncertain ? "uncertain" : "", stoppingTasks.has(entry.taskId) ? "stopping" : ""].join("\u0001")).join("\u0002");
+    const signature = `${touch}:` + entries.map(entry => [entry.id, entry.taskId, entry.status, entry.description, entry.progress ?? "", entry.childConversationId ?? "", entry.stateUncertain ? "uncertain" : "", stoppingTasks.has(entry.taskId) ? "stopping" : ""].join("\u0001")).join("\u0002");
     if (signature === paintedBackgroundTasks) return;
     const focused = document.activeElement;
     const focusedTask = focused instanceof HTMLElement && backgroundTasksItems.contains(focused)
@@ -1113,7 +1222,7 @@ export function initChat(api = new ChatApiClient()): void {
     backgroundTasksLabel.textContent = backgroundStatusLabel(entries);
     backgroundTasksItems.replaceChildren(...entries.map(entry => {
       const row = document.createElement("li");
-      row.className = "is-running";
+      row.className = `is-${entry.status}`;
       row.dataset.backgroundTask = entry.taskId;
       // A running task's description is the way in: an agent task opens its
       // transcript, a shell task its output (spec: a running task is
@@ -1131,10 +1240,10 @@ export function initChat(api = new ChatApiClient()): void {
         text.setAttribute("aria-label", `${target.view === "transcript" ? "Open the transcript of" : "Show the output of"} ${entry.description}`);
       }
       row.append(text);
-      if (entry.stateUncertain || entry.progress) {
+      if (entry.stateUncertain || entry.status !== "running" || entry.progress) {
         const progress = document.createElement("span");
         progress.className = "chat-background-task-progress";
-        progress.textContent = entry.stateUncertain ? "Status unavailable — reconnecting" : entry.progress!;
+        progress.textContent = entry.stateUncertain ? "Status unavailable — reconnecting" : entry.status !== "running" ? entry.status : entry.progress!;
         row.append(progress);
       } else {
         // With no progress note the elapsed time IS the progress line (D6). A
@@ -1154,10 +1263,10 @@ export function initChat(api = new ChatApiClient()): void {
       stop.type = "button";
       stop.className = "chat-task-stop";
       stop.dataset.stopTask = entry.taskId;
-      stop.textContent = stoppingTasks.has(entry.taskId) ? "Stopping…" : "Stop";
+      stop.textContent = stoppingTasks.has(entry.taskId) ? "Stopping…" : declares("background-blocking-work") ? "Stop worker" : "Stop";
       stop.disabled = stoppingTasks.has(entry.taskId) || entry.stateUncertain === true;
       stop.setAttribute("aria-label", declares("background-blocking-work") ? `Stop worker: ${entry.description}` : `Stop ${entry.description}`);
-      row.append(stop);
+      if (entry.status === "running") row.append(stop);
       return row;
     }));
     backgroundTasks.hidden = false;
@@ -1172,12 +1281,16 @@ export function initChat(api = new ChatApiClient()): void {
   // One stop path for every control that offers it: the composer row and the
   // drill-down's strip both name the task, and the in-flight guard is shared
   // so neither can send the stop twice.
-  const requestStopTask = (taskId: string) => {
+  const requestStopTask = async (taskId: string, invoker: HTMLElement) => {
     if (!projection || stoppingTasks.has(taskId)) return;
     const source = projection;
     const task = taskById(source.items, taskId);
     if (!task || task.status !== "running" || task.stateUncertain) return;
-    if (declares("background-blocking-work") && task.taskType === "shell" && !window.confirm("Stop this shell worker? This removes its provider record and output. OpenCode may report failed rather than cancelled; missing output cannot be recovered after reload.")) return;
+    if (declares("background-blocking-work") && task.taskType === "shell") {
+      if (!await confirmChatAction("Stop shell worker?", "This removes its provider record and output. OpenCode may report failed rather than cancelled; missing output cannot be recovered after reload.", "Stop shell worker", invoker)) return;
+      const current = taskById(projection?.items ?? [], taskId);
+      if (projection?.conversationId !== source.conversationId || current?.status !== "running" || current.stateUncertain || stoppingTasks.has(taskId)) return;
+    }
     const asynchronous = declares("background-blocking-work");
     // The agent reports the stop as the task settling, which is what moves
     // the row out of this list; until then the control stays inert.
@@ -1223,12 +1336,15 @@ export function initChat(api = new ChatApiClient()): void {
   backgroundTasksItems?.addEventListener("click", event => {
     const target = (event.target as Element | null)?.closest<HTMLButtonElement>("[data-stop-task], [data-inspect-task]");
     if (!target) return;
-    if (target.dataset.stopTask !== undefined) requestStopTask(target.dataset.stopTask);
+    if (target.dataset.stopTask !== undefined) requestStopTask(target.dataset.stopTask, target);
     else if (target.dataset.inspectTask !== undefined) inspectTask(target.dataset.inspectTask);
+  });
+  backgroundTasksItems?.addEventListener("mousedown", event => {
+    if ((event.target as Element).closest("[data-stop-task], [data-inspect-task]")) keepTouchComposerFocus(event);
   });
   drilldownTask?.addEventListener("click", event => {
     const button = (event.target as Element | null)?.closest<HTMLButtonElement>("[data-stop-task], [data-task-result]");
-    if (button?.dataset.stopTask !== undefined) requestStopTask(button.dataset.stopTask);
+    if (button?.dataset.stopTask !== undefined) requestStopTask(button.dataset.stopTask, button);
     else if (button?.dataset.taskResult) {
       pendingRequestJump = button.dataset.taskResult;
       closeChildConversation();
@@ -1363,7 +1479,6 @@ export function initChat(api = new ChatApiClient()): void {
     });
   });
 
-  const subagents = document.querySelector<HTMLDetailsElement>("#chat-subagents");
   const subagentsLabel = document.querySelector<HTMLElement>("#chat-subagents-label");
   const subagentsItems = document.querySelector<HTMLElement>("#chat-subagents-items");
   const dismissButton = document.querySelector<HTMLButtonElement>("#chat-subagents-dismiss");
@@ -1543,7 +1658,13 @@ export function initChat(api = new ChatApiClient()): void {
     const entries = all.filter(entry => !dismissed.has(entry.id));
     // Finished entries stay listed until dismissed, but they are not running
     // work: only a run that has not settled opens the track.
-    discloseSubagents(entries.filter(entry => entry.status === "running" || entry.status === "pending").length);
+    const touchBackground = document.documentElement.dataset.uiMode === "touch" && declares("background-blocking-work")
+      ? runningBackgroundTasks(projection?.items ?? []) : [];
+    const touchWorkers = new Set(touchBackground.flatMap(task => task.childConversationId ? [task.childConversationId] : []));
+    // On touch the open background list already exposes these workers. Keep
+    // their richer subagent track available, but collapsed by default.
+    const foregroundRunning = entries.filter(entry => (entry.status === "running" || entry.status === "pending") && (!entry.conversationId || !touchWorkers.has(entry.conversationId))).length;
+    discloseSubagents(foregroundRunning, touchBackground.length > 0 && foregroundRunning === 0);
     const signature = entries
       .map(entry => [entry.id, entry.status, entry.subagent ?? "", entry.description, entry.conversationId ?? "", entry.model ?? "", entry.usage ? String(totalTokens(entry.usage)) : "", entry.usage?.costUsd ?? "", entry.progress ?? ""].join("\u0001"))
       .join("\u0002");
@@ -1612,6 +1733,12 @@ export function initChat(api = new ChatApiClient()): void {
         note.className = "chat-subagent-attribution";
         note.textContent = attribution;
         row.append(note);
+      }
+      if (document.documentElement.dataset.uiMode === "touch") {
+        const outcome = document.createElement("span");
+        outcome.className = "chat-worker-outcome";
+        outcome.textContent = entry.status;
+        row.append(outcome);
       }
       return row;
     }));
@@ -1896,14 +2023,17 @@ export function initChat(api = new ChatApiClient()): void {
       sendNow: declares("send-now"),
       running: isLiveConversationStatus(projection?.status),
       replacement: projection?.reversibleHistory?.staged === true,
+      ...(document.documentElement.dataset.uiMode === "touch" ? { compactOpen: compactPendingState.paint(projection?.conversationId ?? null) } : {}),
       isCommand: isListedCommand,
       ...(queueNoteElement ? { note: queueNoteElement } : {}),
     });
+    syncQueueOverflow();
     syncHistoryControls();
     rendering = false;
     syncTaskList();
     syncSubagents();
     syncBackgroundTasks();
+    syncCompactWork();
     syncScheduledWakeups();
     syncOutstandingRequests();
     syncContextIndicator();
@@ -2013,6 +2143,7 @@ export function initChat(api = new ChatApiClient()): void {
   const showComposerError = (message: string | null) => {
     composerError.textContent = message ?? "";
     composerError.hidden = !message;
+    composerError.classList.toggle("is-notice", message === TOO_LATE);
   };
   // Composer errors belong to the conversation they happened in: an upload
   // that fails after the user switched away must not flash its refusal into
@@ -2683,7 +2814,7 @@ export function initChat(api = new ChatApiClient()): void {
   const usagePaneSection = document.querySelector('.sidebar-pane[data-pane-id="usage"]');
   if (usagePaneSection) planPinObserver.observe(usagePaneSection, { attributes: true, attributeFilter: ["hidden", "class"] });
 
-  const syncRoutineStatus = () => {
+  const syncRoutineStatus = (announceEvent = false) => {
     const conversationStatus = projection?.status;
     const { stateName, label } = composerRoutineState({
       status: conversationStatus,
@@ -2733,7 +2864,7 @@ export function initChat(api = new ChatApiClient()): void {
     composerStatus.setAttribute("aria-label", label);
     composerStatus.title = stateName === "working" ? workingText() : label;
     const announcement = composerNote ?? label;
-    if (announcement !== lastRoutineAnnouncement) {
+    if (announceEvent || announcement !== lastRoutineAnnouncement) {
       lastRoutineAnnouncement = announcement;
       composerStatusLive.textContent = announcement;
     }
@@ -2766,7 +2897,9 @@ export function initChat(api = new ChatApiClient()): void {
     if (stop) {
       stop.disabled = cancelling || !projection || !running;
       const workers = declares("background-blocking-work") && projection?.items.some(item => item.type === "background_task");
+      stop.classList.toggle("has-worker-scope", declares("background-blocking-work"));
       stop.setAttribute("aria-label", workers ? "Stop parent" : "Stop response");
+      stop.textContent = workers ? "Stop parent" : "Stop";
       stop.title = workers ? "Stop the parent and still-blocking work. Detached workers continue; their later notifications can wake the parent again." : "Stop";
     }
     if (backgroundAction && continueWorkers) {
@@ -2775,9 +2908,16 @@ export function initChat(api = new ChatApiClient()): void {
         backgroundNotes.delete(activeId);
       }
       const note = activeId ? backgroundNotes.get(activeId) ?? "" : "";
-      backgroundAction.hidden = !declares("background-blocking-work") || !projection || !running && !note;
-      continueWorkers.disabled = !running || cancelling || !activeId || backgrounding.has(activeId);
+      const blocking = hasBlockingWork();
+      backgroundAction.hidden = !declares("background-blocking-work") || !projection || !blocking && !note;
+      continueWorkers.hidden = !blocking;
+      continueWorkers.disabled = !blocking || cancelling || !activeId || backgrounding.has(activeId);
       if (backgroundFeedback && backgroundFeedback.textContent !== note) backgroundFeedback.textContent = note;
+    }
+    if (actionFeedback) {
+      const note = activeId ? automaticNotes.get(activeId) ?? "" : "";
+      actionFeedback.hidden = !note;
+      if (actionFeedback.textContent !== note) actionFeedback.textContent = note;
     }
     // Keep the selector's space across lifecycle changes. Idle delivery is
     // unchanged; only a steering-capable conversation exposes the preference.
@@ -2794,9 +2934,11 @@ export function initChat(api = new ChatApiClient()): void {
     syncRoutineStatus();
   };
 
-  const noteComposer = (message: string | null) => {
+  const noteComposer = (message: string | null, announceEvent = false) => {
     composerNote = message;
-    syncRoutineStatus();
+    // Explicit successful mutations are events, even when their words repeat.
+    // Routine paints still deduplicate against the resulting current note.
+    syncRoutineStatus(announceEvent);
   };
 
   const displayedConfiguration = (): ConversationConfiguration => {
@@ -2933,6 +3075,9 @@ export function initChat(api = new ChatApiClient()): void {
 
   const installConversationSnapshot = (snapshot: ConversationSnapshot, acceptedDrafts: ChatProjection["acceptedDrafts"], token: number) => {
     projection = projectionFromSnapshot(snapshot, acceptedDrafts);
+    const unknown = projection.acceptedDrafts.filter(draft => draft.unconfirmed);
+    if (unknown.length) unconfirmedInputs.set(snapshot.conversation.id, unknown);
+    else unconfirmedInputs.delete(snapshot.conversation.id);
     const carried = removedRows.get(snapshot.conversation.id);
     if (carried) projection = { ...projection, removedIds: carried };
     historyRefreshRequired.delete(snapshot.conversation.id);
@@ -3054,7 +3199,7 @@ export function initChat(api = new ChatApiClient()): void {
     unestablishedStartup = openingStartup ? { conversationId: id, generation: token } : null;
     stream?.close();
     stream = null;
-    const acceptedDrafts = projection?.conversationId === id ? projection.acceptedDrafts : [];
+    const acceptedDrafts = projection?.conversationId === id ? projection.acceptedDrafts : unconfirmedInputs.get(id) ?? [];
     if (projection) {
       presentation.drafts[projection.conversationId] = input.value;
       const currentAnchor = anchor.currentAnchor();
@@ -3334,6 +3479,7 @@ export function initChat(api = new ChatApiClient()): void {
   configurationPicker = createChatConfigurationPicker({
     dialog: configurationDialog,
     trigger: configurationTrigger,
+    returnFocus: () => document.documentElement.dataset.uiMode === "touch" ? document.querySelector<HTMLElement>("#chat-options-toggle") ?? configurationTrigger : configurationTrigger,
     surface,
     search: configurationSearch,
     modelsSection: configurationModelsSection,
@@ -3355,6 +3501,7 @@ export function initChat(api = new ChatApiClient()): void {
     refreshCatalogsOnUse();
     configurationPicker?.open();
   });
+  createTouchChatOptions(() => { refreshCatalogsOnUse(); configurationPicker?.open(); });
   renderConfiguration();
   // With one agent there is no choice to offer; with more, creation asks.
   // The menu shows every offered agent with its availability, so an
@@ -3509,8 +3656,13 @@ export function initChat(api = new ChatApiClient()): void {
   // elsewhere, or a stale echo a reload left behind — so the local copy
   // reconciles to that instead of stranding buttons that can only ever 409;
   // and a 409 carrying the already-delivered code is said as such ("Too late").
-  const TOO_LATE = "Too late — already delivered";
-  const queueActionFailed = (error: unknown, conversationId: string, messageId: string) => {
+  const queueActionFailed = (error: unknown, conversationId: string, messageId: string, steerAction: boolean) => {
+    if (error instanceof ChatTransportError && (error.code === "operation_outcome_unknown" || steerAction && (error.status === undefined || error.status >= 500)) || error instanceof ChatConnectionInterruptedError) {
+      automaticNotes.set(conversationId, "Steer/resume acceptance unconfirmed. Refreshing status; do not repeat this action.");
+      syncControls();
+      void refreshSelectedConversation(conversationId);
+      return;
+    }
     if (error instanceof ChatTransportError && error.status === 409) {
       if (projection?.conversationId === conversationId) {
         projection = dropQueuedMessage(projection, messageId);
@@ -3520,7 +3672,6 @@ export function initChat(api = new ChatApiClient()): void {
         // Streamed delivery can land after this response and clear the
         // transient announcement. Keep the refusal visible at the composer.
         setComposerError(TOO_LATE, conversationId);
-        announce(TOO_LATE, true);
         noteComposer(TOO_LATE);
         return;
       }
@@ -3563,19 +3714,29 @@ export function initChat(api = new ChatApiClient()): void {
   const keepTouchComposerFocus = (event: MouseEvent) => {
     if (document.documentElement.dataset.uiMode === "touch" && document.activeElement === input) event.preventDefault();
   };
-  queueDockElement.addEventListener("mousedown", event => {
-    if ((event.target as Element).closest(".chat-queued-action")) keepTouchComposerFocus(event);
+  document.querySelector("#chat-work-dock")?.addEventListener("mousedown", event => {
+    if ((event.target as Element).closest("summary")) keepTouchComposerFocus(event as MouseEvent);
   });
-  queueDockElement.addEventListener("click", event => {
+  queueDockElement.addEventListener("mousedown", event => {
+    if ((event.target as Element).closest(".chat-queued-action, [data-pending-toggle]")) keepTouchComposerFocus(event);
+  });
+  queueDockElement.addEventListener("click", async event => {
+    if ((event.target as Element).closest("[data-pending-toggle]")) {
+      compactPendingState.toggled(!compactPendingState.paint(projection?.conversationId ?? null));
+      scheduleRender();
+      return;
+    }
     const target = (event.target as Element).closest<HTMLButtonElement>("[data-queue-remove], [data-queue-edit], [data-queue-steer], [data-queue-queue], [data-queue-send-now]");
     if (!target || !projection) return;
     const conversationId = projection.conversationId;
     const { queueRemove, queueEdit, queueSteer, queueQueue, queueSendNow } = target.dataset;
+    const steerAction = declares("steering") && (queueSteer !== undefined || queueSendNow !== undefined);
     const messageId = queueRemove ?? queueEdit ?? queueSteer ?? queueQueue ?? queueSendNow!;
     const entry = projection.queued.find(candidate => candidate.id === messageId);
     const pausedSteers = projection.queued.filter(candidate => candidate.delivery === "steer" && candidate.paused).length;
     if ((queueSendNow !== undefined || queueSteer !== undefined) && entry?.delivery === "queue" && pausedSteers
-      && !window.confirm(`Send this queued message now? This also sends all ${pausedSteers} paused steer${pausedSteers === 1 ? "" : "s"}. Other queued messages stay held.`)) return;
+      && !await confirmChatAction("Send queued message now?", `This also sends all ${pausedSteers} paused steer${pausedSteers === 1 ? "" : "s"}. Other queued messages stay held.`, "Send now", target)) return;
+    if (projection?.conversationId !== conversationId || !projection.queued.some(candidate => candidate.id === messageId)) return;
     target.disabled = true;
     const operation: Promise<unknown> = queueRemove !== undefined
       ? api.removeQueued(conversationId, messageId, newRequestId())
@@ -3587,9 +3748,20 @@ export function initChat(api = new ChatApiClient()): void {
             ? api.changeDelivery(conversationId, messageId, newRequestId(), "queue")
             : api.sendNow(conversationId, messageId, newRequestId());
     void operation
-      .catch(error => queueActionFailed(error, conversationId, messageId))
+      .then(result => {
+        if (result && typeof result === "object") recordAutomaticBackground(conversationId, result as AutomaticBackgroundFeedback);
+        if (activeConversationId() !== conversationId) return;
+        noteComposer(queueRemove !== undefined ? "Pending message removed" : queueEdit !== undefined ? "Pending message moved to composer" : queueQueue !== undefined ? "Message moved to queue" : queueSteer !== undefined ? "Message sent as steer" : entry?.delivery === "steer" ? `${pausedSteers} paused steers sent` : "Queued message sent now", true);
+      })
+      .catch(error => queueActionFailed(error, conversationId, messageId, steerAction))
       .finally(() => { target.disabled = false; });
   });
+
+  function syncQueueOverflow() {
+    if (!queueDockElement) return;
+    queueDockElement.classList.toggle("has-more-below", queueDockElement.scrollHeight - queueDockElement.clientHeight - queueDockElement.scrollTop > 1);
+  }
+  queueDockElement.addEventListener("scroll", syncQueueOverflow, { passive: true });
 
   // The delivery Enter uses while a steering conversation is busy, and its
   // separate selection-only menu (D10). The preference is per device and
@@ -3601,22 +3773,36 @@ export function initChat(api = new ChatApiClient()): void {
   }
   function syncDeliveryMenu(): void {
     const preferred = readDeliveryPreference(presentationLocalStorage());
+    const touch = document.documentElement.dataset.uiMode === "touch";
     const label = preferred === "steer" ? "Steer" : "Queue";
     if (deliveryLabel) deliveryLabel.textContent = label;
     deliveryToggle?.setAttribute("aria-label", `Delivery: ${label}`);
-    if (deliveryToggle) deliveryToggle.title = `Delivery: ${label}`;
+    if (deliveryToggle) deliveryToggle.title = deliveryChoiceOffered() ? touch ? `Send: ${label}; Enter adds a new line` : `Send and Enter: ${label}` : "Delivery applies while working or messages are pending; idle messages send immediately";
+    const sendAction = localHistoryOperation(input?.value ?? "", commands, declares("reversible-history")) ? "Send message" : isLiveConversationStatus(projection?.status)
+      ? declares("steering") && preferred === "steer" && !isListedCommand(input?.value ?? "") ? "Send as steer" : declares("steering") ? "Send to queue" : "Queue message"
+      : "Send message";
+    send?.setAttribute("aria-label", sendAction);
+    if (send) send.title = sendAction;
     for (const item of deliveryMenu?.querySelectorAll<HTMLButtonElement>("[data-delivery-choice]") ?? []) {
       item.setAttribute("aria-checked", String(item.dataset.deliveryChoice === preferred));
+      const shortcutText = item.dataset.deliveryChoice === preferred ? touch ? "Send / Ctrl+Enter" : "Enter" : "Alt+Enter";
+      item.setAttribute("aria-label", `${item.dataset.deliveryChoice === "steer" ? "Steer, next step" : "Queue, after this turn"}, ${shortcutText}`);
+      const shortcut = item.querySelector<HTMLElement>(".chat-delivery-shortcut");
+      if (shortcut) shortcut.textContent = shortcutText;
     }
   }
   const onDeliveryMenuOutside = (event: Event) => {
+    // Keep the touch backdrop until click: removing it at pointerdown lets
+    // the same gesture activate whatever destructive control lies beneath.
+    if (event.target === deliveryBackdrop) return;
     if (deliveryMenu && !deliveryMenu.contains(event.target as Node) && !deliveryToggle?.contains(event.target as Node)) closeDeliveryMenu();
   };
+  let deliveryPreviousFocus: HTMLElement | null = null;
   const onDeliveryMenuKey = (event: KeyboardEvent) => {
     if (event.key === "Escape") {
       event.preventDefault();
       closeDeliveryMenu();
-      deliveryToggle?.focus();
+      (deliveryPreviousFocus?.isConnected ? deliveryPreviousFocus : deliveryToggle)?.focus();
       return;
     }
     // Touch can leave focus in the composer while the menu is open. Do not
@@ -3642,6 +3828,7 @@ export function initChat(api = new ChatApiClient()): void {
     choices[next]?.focus();
   };
   function closeDeliveryMenu(): void {
+    if (deliveryBackdrop) deliveryBackdrop.hidden = true;
     if (!deliveryMenu || deliveryMenu.hidden) return;
     deliveryMenu.hidden = true;
     deliveryToggle?.setAttribute("aria-expanded", "false");
@@ -3649,11 +3836,14 @@ export function initChat(api = new ChatApiClient()): void {
     document.removeEventListener("keydown", onDeliveryMenuKey, true);
   }
   deliveryToggle?.addEventListener("mousedown", keepTouchComposerFocus);
+  deliveryToggle?.addEventListener("pointerdown", () => { deliveryPreviousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null; });
   deliveryToggle?.addEventListener("click", event => {
     if (!deliveryMenu) return;
     if (!deliveryMenu.hidden) { closeDeliveryMenu(); return; }
+    if (event.detail === 0) deliveryPreviousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : deliveryToggle;
     syncDeliveryMenu();
     deliveryMenu.hidden = false;
+    if (deliveryBackdrop) deliveryBackdrop.hidden = document.documentElement.dataset.uiMode !== "touch";
     deliveryToggle.setAttribute("aria-expanded", "true");
     // A touch choice keeps the composer (and keyboard) focused so opening
     // the menu does not change the rail's layout. Keyboard users still land
@@ -3665,6 +3855,11 @@ export function initChat(api = new ChatApiClient()): void {
     document.addEventListener("keydown", onDeliveryMenuKey, true);
   });
   deliveryMenu?.addEventListener("mousedown", keepTouchComposerFocus);
+  deliveryBackdrop?.addEventListener("click", event => {
+    event.preventDefault();
+    event.stopPropagation();
+    closeDeliveryMenu();
+  });
   deliveryMenu?.addEventListener("click", event => {
     const choice = (event.target as Element).closest<HTMLButtonElement>("[data-delivery-choice]");
     if (!choice) return;
@@ -3674,7 +3869,8 @@ export function initChat(api = new ChatApiClient()): void {
     writeDeliveryPreference(presentationLocalStorage(), delivery);
     syncDeliveryMenu();
     closeDeliveryMenu();
-    noteComposer(delivery === "steer" ? "Send or Enter steers while the agent works" : "Send or Enter queues while the agent works");
+    const action = document.documentElement.dataset.uiMode === "touch" ? "Send or Ctrl+Enter" : "Send or Enter";
+    noteComposer(delivery === "steer" ? `${action} steers while the agent works` : `${action} queues while the agent works`);
     input.focus();
   });
 
@@ -3814,6 +4010,7 @@ export function initChat(api = new ChatApiClient()): void {
     // compatibility click altogether in WebKit. Mouse, pen and touch still
     // activate normally; radios, links and summaries keep ordinary focus.
     container.addEventListener("mousedown", event => {
+      if ((event.target as Element).closest("[data-history-revert]")) keepTouchComposerFocus(event);
       if (!document.documentElement.hasAttribute("data-chat-answering")) return;
       if (!(event.target as Element).closest?.(REQUEST_ANSWER_CONTROLS)) return;
       event.preventDefault();
@@ -4347,13 +4544,12 @@ export function initChat(api = new ChatApiClient()): void {
       renderCommandMenu();
       return;
     }
-    if (commandMatch && (event.key === "Enter" || event.key === "Tab") && !event.metaKey && !event.ctrlKey) {
+    if (commandMatch && (event.key === "Tab" || event.key === "Enter" && document.documentElement.dataset.uiMode !== "touch") && !event.metaKey && !event.ctrlKey) {
       event.preventDefault();
       chooseCommand(commandIndex);
       return;
     }
     if (commandMatch && event.key === "Escape") { event.preventDefault(); closeCommandMenu(); return; }
-    const running = isLiveConversationStatus(projection?.status);
     // ⌥Enter submits with the delivery Enter does not use (D10), only while
     // the choice exists; otherwise it is an ordinary Enter.
     if (event.key === "Enter" && event.altKey && !event.shiftKey && !event.isComposing && deliveryChoiceOffered()) {
@@ -4363,7 +4559,7 @@ export function initChat(api = new ChatApiClient()): void {
       return;
     }
     if (event.key === "Enter" && !event.shiftKey && !event.isComposing
-      && (event.metaKey || event.ctrlKey || document.documentElement.dataset.uiMode !== "touch" || running)) {
+      && (event.metaKey || event.ctrlKey || document.documentElement.dataset.uiMode !== "touch")) {
       event.preventDefault();
       form.requestSubmit();
     }
@@ -4429,6 +4625,10 @@ export function initChat(api = new ChatApiClient()): void {
     // Captured for the round trip: a failure landing after a switch belongs
     // to the conversation whose turn was being cancelled.
     const conversationId = projection.conversationId;
+    if (document.documentElement.dataset.uiMode === "touch" && declares("background-blocking-work") && projection.items.some(item => item.type === "background_task")) {
+      if (!await confirmChatAction("Stop parent?", "Stops the parent and its still-blocking foreground work. Detached workers continue; their later notifications can wake the parent again.", "Stop parent", stop)) return;
+      if (projection?.conversationId !== conversationId || !isLiveConversationStatus(projection.status) || cancelling) return;
+    }
     cancelling = true;
     setComposerError(null, conversationId);
     noteComposer("Cancelling...");
@@ -4781,6 +4981,8 @@ export function initChat(api = new ChatApiClient()): void {
     // submission's one-off choice (⌥Enter, the menu). The workspace decides
     // whether it steers, holds, or dispatches, and reports which.
     const delivery: MessageDelivery | undefined = declares("steering") ? submissionDelivery ?? readDeliveryPreference(presentationLocalStorage()) : undefined;
+    const uncertainHubSteer = Boolean(document.querySelector('meta[name="uatu-hub"]')) && !isListedCommand(text)
+      && (projection.reversibleHistory?.staged === true || delivery === "steer" && (isLiveConversationStatus(projection.status) || projection.queued.length > 0));
     // Optimistic send: the message shows immediately and the input clears;
     // on failure the draft is removed and the text restored.
     projection = addAcceptedDraft(projection, { requestId, messageId: `pending:${requestId}`, text, ...(attachmentRefs.length ? { attachments: attachmentRefs } : {}) });
@@ -4866,6 +5068,7 @@ export function initChat(api = new ChatApiClient()): void {
         scheduleRender(true);
       }
       noteComposer(accepted.pending ? accepted.delivery === "steer" ? "Steer sent — joins the turn at its next step" : "Queued — sends when the agent is ready" : "Message accepted");
+      recordAutomaticBackground(conversationId, accepted);
       // Addressed to the submitted conversation, not the selection: the
       // acceptance may land after a switch, and clearing the selected
       // conversation's own error would erase an unrelated reason.
@@ -4874,6 +5077,24 @@ export function initChat(api = new ChatApiClient()): void {
       for (const staged of stagedAttachments) URL.revokeObjectURL(staged.previewUrl);
       releaseAttachmentReserve();
     } catch (error) {
+      const primaryUnknown = error instanceof ChatTransportError && error.code === "operation_outcome_unknown"
+        || uncertainHubSteer && (error instanceof ChatConnectionInterruptedError || error instanceof ChatTransportError && (error.status === undefined || error.status >= 500));
+      if (primaryUnknown) {
+        retryRequests.delete(conversationId);
+        const draft = { requestId, messageId: `pending:${requestId}`, text, ...(attachmentRefs.length ? { attachments: attachmentRefs } : {}), unconfirmed: true as const };
+        unconfirmedInputs.set(conversationId, [...(unconfirmedInputs.get(conversationId) ?? []).filter(entry => entry.requestId !== requestId), draft]);
+        if (projection?.conversationId === conversationId) {
+          projection = markDraftUnconfirmed(projection, requestId);
+          scheduleRender();
+        }
+        automaticNotes.set(conversationId, "Steer acceptance unconfirmed. Refreshing status; do not repeat this input.");
+        for (const staged of stagedAttachments) URL.revokeObjectURL(staged.previewUrl);
+        releaseAttachmentReserve();
+        submitting = false;
+        syncControls();
+        void refreshSelectedConversation(conversationId);
+        return;
+      }
       const message = messageOf(error);
       announce(message, true);
       retryRequests.set(conversationId, { text, requestId, attachments: attachmentKey });
@@ -4909,13 +5130,43 @@ export function initChat(api = new ChatApiClient()): void {
     submitting = false;
     syncControls();
   });
+  const workDock = document.querySelector<HTMLElement>("#chat-work-dock");
+  let dockHeight: number | null = null;
+  let dockGrowth: Animation | null = null;
   const observer = typeof ResizeObserver === "function" ? new ResizeObserver(() => {
+    syncQueueOverflow();
+    if (workDock && document.documentElement.dataset.uiMode === "touch") {
+      // Text enlargement can make fixed chrome taller than its percentage
+      // budget. Secondary work yields before the primary composer does.
+      const header = surface.querySelector<HTMLElement>(".chat-header");
+      const available = `${Math.max(0, surface.clientHeight - form.getBoundingClientRect().height - (header?.getBoundingClientRect().height ?? 0) - 48)}px`;
+      if (workDock.style.getPropertyValue("--chat-work-available") !== available) workDock.style.setProperty("--chat-work-available", available);
+    }
+    if (workDock && !dockGrowth) {
+      const height = workDock.getBoundingClientRect().height;
+      const previous = dockHeight;
+      dockHeight = height;
+      if (previous !== null && height > previous + 1
+        && document.documentElement.dataset.uiMode === "touch"
+        && !window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+        // Reserve the final bounded height before revealing new chrome. An
+        // animated layout height interleaves native scroll clamps with prompt
+        // echo removal and can mistake those clamps for reader movement.
+        dockGrowth = workDock.animate({ clipPath: [`inset(0 0 ${height - previous}px 0)`, "inset(0)"] }, { duration: 160, easing: "ease-out" });
+        dockGrowth.onfinish = () => { dockGrowth = null; parentScroll.request(); };
+      }
+    }
     if (!chatSurfaceActive()) return;
     parentScroll.request();
     childScroll?.request();
   }) : null;
   observer?.observe(items);
   observer?.observe(timeline);
+  observer?.observe(queueDockElement);
+  observer?.observe(form);
+  const chatHeader = surface.querySelector<HTMLElement>(".chat-header");
+  if (chatHeader) observer?.observe(chatHeader);
+  if (workDock) observer?.observe(workDock);
   if (drilldownItems) observer?.observe(drilldownItems);
   if (drilldownTimeline) observer?.observe(drilldownTimeline);
   // Only the day being read keeps its pinned label; see pinned-day.ts.

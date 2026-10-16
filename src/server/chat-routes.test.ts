@@ -13,6 +13,8 @@ import { MetricsRegistry } from "../debug/metrics";
 import { activeGauge, closedCounter, openedCounter, reconnectedCounter } from "../debug/stream-metrics";
 import { buildRoutes } from "./routes";
 import { MultiAgentChatService } from "../chat/agents";
+import { createChildPolicyAuthority, readChildPolicyBootstrap, CHILD_POLICY_HEADER } from "../hub/child-policy";
+import type { ChatActionContext } from "../chat/types";
 
 const TOKEN = "chat-test-token";
 // The conversation route opens with an `open` event naming the cursor its
@@ -66,7 +68,11 @@ class FakeChatService implements WorkspaceChatService {
     return { snapshot: handoff.snapshot, events: handoff.subscription };
   }
   selectedDelivery: MessageDelivery | undefined;
-  async prompt(id: string, requestId: string, _text: string, model?: ModelSelection, agent?: string, _variant?: string, attachments?: MessageAttachment[], delivery?: MessageDelivery) {
+  actionContexts: Array<ChatActionContext | undefined> = [];
+  operationReceipts: Array<string | undefined> = [];
+  async prompt(id: string, requestId: string, _text: string, model?: ModelSelection, agent?: string, _variant?: string, attachments?: MessageAttachment[], delivery?: MessageDelivery, context?: ChatActionContext, operationReceipt?: string) {
+    this.actionContexts.push(context);
+    this.operationReceipts.push(operationReceipt);
     this.require(id);
     this.selectedModel = model;
     this.selectedAgent = agent;
@@ -100,7 +106,8 @@ class FakeChatService implements WorkspaceChatService {
   }
   switches: Array<{ messageId: string; delivery: MessageDelivery }> = [];
   sent: string[] = [];
-  async changeDelivery(id: string, messageId: string, _requestId: string, delivery: MessageDelivery) {
+  async changeDelivery(id: string, messageId: string, _requestId: string, delivery: MessageDelivery, context?: ChatActionContext) {
+    this.actionContexts.push(context);
     this.require(id);
     if (messageId === "steered") throw new SteerAlreadyDeliveredError();
     if (messageId === "command") throw new CommandSteeringError();
@@ -228,7 +235,7 @@ class FakeChatService implements WorkspaceChatService {
   private require(id: string) { if (id !== "local") throw new ConversationNotFoundError(); }
 }
 
-function routes(chatService = new FakeChatService(), basePath = "/", chatKeepaliveMs?: number, metrics?: MetricsRegistry) {
+function routes(chatService = new FakeChatService(), basePath = "/", chatKeepaliveMs?: number, metrics?: MetricsRegistry, childPolicy?: ReturnType<typeof readChildPolicyBootstrap>) {
   const repo = path.resolve(import.meta.dir, "..", "..");
   // The real router over the single-agent fake: route tests exercise the
   // qualifying seam exactly as production does. The fake keeps owning the
@@ -248,6 +255,7 @@ function routes(chatService = new FakeChatService(), basePath = "/", chatKeepali
   return buildRoutes({
     mode: "prod",
     basePath,
+    childPolicy,
     ...(chatKeepaliveMs === undefined ? {} : { chatKeepaliveMs }),
     ...(metrics === undefined ? {} : { metrics }),
     assets: {
@@ -279,6 +287,41 @@ function request(pathname: string, init: RequestInit = {}, params?: Record<strin
 }
 
 describe("workspace chat routes", () => {
+  test("an opaque operation receipt is only a dedup identifier and never unsigned principal or automatic-policy authority", async () => {
+    const service = new FakeChatService();
+    const table = routes(service, "/s/project/");
+    const path = "/s/project/api/chat/conversations/opencode:local/prompts";
+    const handler = table["/s/project/api/chat/conversations/:conversationId/prompts"] as { POST(request: Request): Promise<Response> };
+    const token = `opr_${"a".repeat(43)}`;
+    const send = (headers: Record<string, string>) => handler.POST(request(path, { method: "POST", headers: { origin: "http://127.0.0.1:4711", "content-type": "application/json", "x-uatu-hub-operation-receipt": token, ...headers }, body: '{"requestId":"correlation","text":"Fixture","delivery":"steer"}' }, { conversationId: "opencode:local" }));
+    const accepted = await send({});
+    expect(accepted.status).toBe(202);
+    expect(await accepted.json()).not.toHaveProperty("automaticBackground");
+    expect(service.actionContexts).toEqual([undefined]);
+    expect(service.operationReceipts).toEqual([token]);
+    expect((await send({ [CHILD_POLICY_HEADER]: "workspace-credential-forged-policy" })).status).toBe(403);
+    expect((await send({ origin: "https://foreign.example" })).status).toBe(403);
+    expect(service.operationReceipts).toHaveLength(1);
+  });
+  test("verified child-bound policy crosses qualified prompt dispatch without becoming shared response metadata", async () => {
+    const authority = createChildPolicyAuthority("project", "/s/project/");
+    const service = new FakeChatService();
+    const table = routes(service, "/s/project/", undefined, undefined, readChildPolicyBootstrap(authority.bootstrap()));
+    const path = "/s/project/api/chat/conversations/opencode:local/prompts";
+    const body = JSON.stringify({ requestId: "request", text: "steer", delivery: "steer" });
+    const policy = authority.sign({ method: "POST", pathname: path, body }, { principal: "alice", revision: 1, autoBackgroundOnSteer: true });
+    const handler = table["/s/project/api/chat/conversations/:conversationId/prompts"] as { POST(request: Request): Promise<Response> };
+    const send = (envelope: string, text = body) => handler.POST(request(path, { method: "POST", headers: { origin: "http://127.0.0.1:4711", "content-type": "application/json", [CHILD_POLICY_HEADER]: envelope }, body: text }, { conversationId: "opencode:local" }));
+    const response = await send(policy);
+    expect(response.status).toBe(202);
+    expect(service.actionContexts).toEqual([{ receiptScope: "alice", automaticBackground: "on" }]);
+    expect(JSON.stringify(await response.json())).not.toContain("alice");
+    expect((await send(policy, body.replace("steer\"}", "queue\"}"))).status).toBe(403);
+    expect((await send("workspace-token-forgery")).status).toBe(403);
+    expect(service.actionContexts).toHaveLength(1);
+    const untrusted = routes(service, "/s/project/")["/s/project/api/chat/conversations/:conversationId/prompts"] as typeof handler;
+    expect((await untrusted.POST(request(path, { method: "POST", headers: { origin: "http://127.0.0.1:4711", "content-type": "application/json", [CHILD_POLICY_HEADER]: policy }, body }, { conversationId: "opencode:local" }))).status).toBe(403);
+  });
   test("requires the child credential for every read without starting chat", async () => {
     let calls = 0;
     const service = new FakeChatService();

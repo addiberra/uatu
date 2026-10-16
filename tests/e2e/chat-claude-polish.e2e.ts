@@ -93,6 +93,10 @@ const skillTool = (id: string, createdAt: number, skill: string, status: "runnin
  * collapse it.
  */
 async function openTaskList(page: Page) {
+  if (await page.locator("html").getAttribute("data-ui-mode") === "touch") {
+    const compact = page.locator("#chat-compact-workers");
+    if (await compact.getAttribute("open") === null) await compact.locator(":scope > summary").click();
+  }
   const list = page.locator("#chat-background-tasks");
   await expect(list).toBeVisible();
   await expect(list).toHaveAttribute("open", "");
@@ -1343,6 +1347,7 @@ for (const touch of [false, true]) {
       const label = page.locator("#chat-context-usage-label");
       await expect(label).toHaveText("213k");
       await expect(page.locator("#chat-context-usage")).toHaveAttribute("data-fill", "unknown");
+      if (touch) await page.locator("#chat-options-toggle").click();
       await page.locator("#chat-context-usage > summary").click();
       await expect(page.locator("#chat-context-usage-breakdown")).toContainText("Limit unavailable");
       await capture(page, testInfo, "context-limit-unavailable");
@@ -1388,6 +1393,7 @@ test.describe("Claude Code plan readout at phone width", () => {
     await page.locator("#chat-conversation-select").selectOption(seeded.conversation.id);
     const summary = page.locator("#chat-plan-usage-summary");
     await expect(summary).toHaveText("Session 9% · Week 25%");
+    await page.locator("#chat-options-toggle").click();
     await summary.click();
     const readout = page.locator("#chat-plan-readout");
     await expect(readout).toBeVisible();

@@ -150,6 +150,48 @@ describe("OpenCode 2.x provider: identity and catalogs", () => {
 });
 
 describe("OpenCode 2.x provider: sessions", () => {
+  test("post-admission fresh worker evidence cannot join a read begun before the action", async () => {
+    const fixture = JSON.parse(readFileSync(path.join(import.meta.dir, "../../../../tests/fixtures/opencode-v2/background-2.0.29.json"), "utf8"));
+    let release!: () => void, entered!: () => void, reads = 0;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    const server = fakeOpenCode({
+      "GET /api/session/:id": ({ path }) => session(path.split("/").at(-1)!, path.endsWith("ses_child") ? { parentID: "ses_parent" } : {}),
+      "GET /api/session/ses_parent/message": async () => {
+        const first = reads++ === 0;
+        if (first) { entered(); await gate; }
+        return { data: first ? [] : [fixture.stored], cursor: {} };
+      },
+      "GET /api/session/ses_parent/inbox": () => ({ data: [] }),
+      "GET /api/session/active": () => ({}),
+    });
+    const provider = server.provider();
+    const earlier = provider.reconcileBackgroundTasks("ses_parent");
+    await started;
+    const fresh = provider.reconcileBackgroundTasks("ses_parent", { fresh: true });
+    release();
+    expect(await earlier).toEqual([]);
+    expect(await fresh).toEqual([expect.objectContaining({ status: "completed", resultId: fixture.stored.id })]);
+    expect(reads).toBe(2);
+    await provider.dispose();
+  });
+  test("steer and resume response loss is unknown, explicit refusal stays definitive, and resume preserves native acceptance evidence", async () => {
+    for (const operation of ["prompt", "interrupt"] as const) {
+      for (const refused of [false, true]) {
+        const server = fakeOpenCode({
+          [`POST /api/session/ses_parent/${operation}`]: () => refused ? notFound("ses_parent") : new Response("lost after application", { status: 502 }),
+        });
+        const provider = server.provider();
+        const mutation = operation === "prompt" ? provider.prompt("ses_parent", { id: "stable", text: "steer", delivery: "steer" }) : provider.interrupt("ses_parent", { resume: true });
+        await expect(mutation).rejects.toMatchObject({ ...(refused ? { _tag: "SessionNotFoundError" } : { name: "OperationOutcomeUnknownError" }) });
+        expect(server.requests("POST", `/api/session/ses_parent/${operation}`)).toHaveLength(1);
+      }
+    }
+    for (const interrupted of [true, false]) {
+      const server = fakeOpenCode({ "POST /api/session/ses_parent/interrupt": () => ({ interrupted }) });
+      expect(await server.provider().interrupt("ses_parent", { resume: true })).toEqual({ interrupted });
+    }
+  });
   test("background-all is one parent-scoped native mutation, including an accepted empty no-op", async () => {
     const server = fakeOpenCode({
       "GET /api/session/ses_parent": () => session("ses_parent"),

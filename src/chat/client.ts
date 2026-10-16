@@ -1,4 +1,6 @@
 import { appUrl } from "../shared/app-url";
+import type { AutomaticBackgroundFeedback } from "./types";
+import { parseAutomaticBackground } from "./validation";
 import { liveChannel } from "../shell/live";
 import type { LiveChannel } from "../shell/live-channel";
 import type {
@@ -164,12 +166,12 @@ export class ChatApiClient {
     configuration: ConversationConfiguration;
     conversation?: ConversationSummary;
     operation?: "reload";
-  }> {
+  } & AutomaticBackgroundFeedback> {
     return this.mutate(
       appUrl(`/api/chat/conversations/${encodeURIComponent(conversationId)}/prompts`),
       { requestId, text, ...(model ? { model } : {}), ...(mode ? { mode } : {}), ...(variant ? { variant } : {}), ...(attachments?.length ? { attachments } : {}), ...(delivery ? { delivery } : {}) },
       value => {
-        const result = value as { messageId: string; pending?: unknown; delivery?: unknown; configuration?: unknown; conversation?: unknown; operation?: unknown };
+        const result = value as { messageId: string; pending?: unknown; delivery?: unknown; configuration?: unknown; conversation?: unknown; operation?: unknown; automaticBackground?: unknown };
         return {
           messageId: result.messageId,
           pending: result.pending === true,
@@ -177,6 +179,7 @@ export class ChatApiClient {
           ...(result.operation === "reload" ? { operation: "reload" as const } : {}),
           configuration: parseConversationConfiguration(result.configuration),
           ...(result.conversation ? { conversation: parseConversationSummary(result.conversation) } : {}),
+          ...parseAutomaticBackground(result.automaticBackground),
         };
       },
     );
@@ -221,7 +224,7 @@ export class ChatApiClient {
   // Switch a pending message between steer and queue (opencode-v2-steering
   // D7, D8). The answer names the entry as it now stands: a switched message
   // can come back under a new id.
-  changeDelivery(conversationId: string, messageId: string, requestId: string, delivery: MessageDelivery): Promise<{ messageId: string; delivery: MessageDelivery }> {
+  changeDelivery(conversationId: string, messageId: string, requestId: string, delivery: MessageDelivery): Promise<{ messageId: string; delivery: MessageDelivery } & AutomaticBackgroundFeedback> {
     return this.mutate(
       appUrl(`/api/chat/conversations/${encodeURIComponent(conversationId)}/queue/${encodeURIComponent(messageId)}`),
       { requestId, delivery },
@@ -232,7 +235,7 @@ export class ChatApiClient {
 
   // Send a pending message now (D8): a steer on a steering agent, a dispatch
   // ahead of the queue on one with send-now alone.
-  sendNow(conversationId: string, messageId: string, requestId: string): Promise<{ messageId: string; delivery: MessageDelivery }> {
+  sendNow(conversationId: string, messageId: string, requestId: string): Promise<{ messageId: string; delivery: MessageDelivery } & AutomaticBackgroundFeedback> {
     return this.mutate(
       appUrl(`/api/chat/conversations/${encodeURIComponent(conversationId)}/queue/${encodeURIComponent(messageId)}/send-now`),
       { requestId },
@@ -466,10 +469,10 @@ export class ChatApiClient {
   }
 }
 
-function parseDeliveryResult(value: unknown): { messageId: string; delivery: MessageDelivery } {
-  const result = value as { messageId?: unknown; delivery?: unknown };
+function parseDeliveryResult(value: unknown): { messageId: string; delivery: MessageDelivery } & AutomaticBackgroundFeedback {
+  const result = value as { messageId?: unknown; delivery?: unknown; automaticBackground?: unknown };
   if (typeof result.messageId !== "string" || (result.delivery !== "steer" && result.delivery !== "queue")) {
     throw new ChatTransportError("Chat returned an invalid delivery result");
   }
-  return { messageId: result.messageId, delivery: result.delivery };
+  return { messageId: result.messageId, delivery: result.delivery, ...parseAutomaticBackground(result.automaticBackground) };
 }

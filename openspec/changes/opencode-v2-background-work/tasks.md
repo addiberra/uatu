@@ -1,5 +1,7 @@
 ## 1. Preserve the integration baseline and pin the contract
 
+The later authoritative UX audit is tracked additively in `../opencode-v2-steering/ux-audit-tasks.md`. It tightens visible-blocker gating, control presentation, confirmation and settlement feedback without replacing the historical evidence below.
+
 - [x] 1.1 Before implementation, record dirty paths/content hashes and the current `opencode-v2-steering` status; confirm this change is applied on top of its retained work, not by resetting it. Verify no existing completed task or UX test is removed, and record the actual API revision for coordinated increment.
 - [x] 1.2 Add source-shaped V2.0.29 background fixtures under `tests/fixtures/opencode-v2/` with provenance to design evidence 3 and the installed 2.0.28 client contract. Cover native launch/progress/success, converted foreground call, child execution terminal, pending/delivered/stored synthetic result, shell metadata, and background 204. Verify fixtures contain no credentials/private prompts and no fabricated job endpoint or generation field.
 - [x] 1.3 Write failing contract/normalization tests for completed launcher plus running child and completed/error/cancelled worker results before implementing the fold. Verify these fail for the current false-finished/raw-notice behavior, using `bun test src/chat/opencode/v2/normalization.test.ts src/chat/tool-detail.test.ts` and recording the red result.
@@ -113,7 +115,7 @@ The test-hub reader check waits for intrinsic-size transcript geometry to settle
 
 ## Independent-review corrections (Sol continuation)
 
-The independent SolHigh review found four actionable gaps despite its passing focused suite. Each was reproduced before correction; the preceding automated checkpoint is historical, not independent approval of these corrections. **Task 8.2 remains unchecked pending independent re-review**, and 8.1 remains the separately authorized real-provider gate. Overall task status stays **35/37**.
+The independent SolHigh review found four actionable gaps despite its passing focused suite. Each was reproduced before correction; the preceding automated checkpoint is historical, not independent approval of these corrections. **At this checkpoint task 8.2 remained unchecked pending independent re-review**, and 8.1 remained the separately authorized real-provider gate, for **35/37** tasks. The subsequent closure and native acceptance below supersede that pending status.
 
 | Finding / affected tasks | Test-first correction and primary evidence |
 | --- | --- |
@@ -252,3 +254,12 @@ are this task artifact and the corresponding acceptance-status text in
 outside the repo. Independent implementation review (8.2) remains complete.
 Publication-safety review by the lead and separate commit/push execution remain
 pending; **nothing has been committed or published**.
+
+## Mobile UX parity and review closure — 2026-10-16
+
+- [x] Preserve automatic/deliberate disclosure provenance with the retained DOM open state across A→B selection; detach B without duplicating automatic expansion or altering A's worker. Unit and both-engine regressions pass; the lead confirms independent closure.
+- [x] Align touch background visibility with the shared work-dock budget: hardware-keyboard access through contained scrolling, hidden tracks/Continue under software keyboard or short landscape, pending safety information retained, and restored access on leaving compact mode.
+- [x] Document touch parent-stop scope confirmation without changing native stop targets, detached-worker behavior, receipts, ownership or desktop cancellation. Preserve focus/first-touch behavior for visible controls and rail separation.
+- [x] Close the independent short-desktop and loaded hardware-keyboard budget findings and animated bottom-pin race. Steering's `ux-audit-tasks.md` records RED/GREEN logs, ordered clean acceptance (**5,183 unit passes / 17 skips; 139 browser passes**), actual screenshot comparisons and the lead-confirmed independent re-review (**244 focused unit passes**, fresh Chromium/WebKit checks and twelve zero-distance pin cycles).
+
+Current independent browser evidence is `uatu-independent-mobile-final/results.json` and its screenshots under the approved temporary `opencode/` root. Test/screenshot outputs remain outside OpenSpec. Physical iOS/Android keyboards, autocorrect, rubber-banding, assistive technology and Dynamic Type remain unverified; prior native-provider acceptance is historical and was not rerun for mobile UX. This documentation-only parity update adds no product edits, configuration/authentication changes, existing-hub operations or publication.

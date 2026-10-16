@@ -7,6 +7,50 @@ today — **OpenCode** and **Claude Code** — and every conversation belongs
 to exactly one of them, chosen when the conversation is created and fixed
 for its life. One agent being missing or broken never blocks the other.
 
+## Personal Hub chat preferences
+
+The workspace Hub menu links to **Settings → Personal chat preferences**.
+The stored **Automatically background blocking work when steering** preference
+defaults ON only for an absent account record. It belongs to your account on
+that Hub across devices and workspaces, not other users, machine agent logins,
+workspace defaults or standalone chat. Saved OFF survives Hub restart.
+Settings refreshes on entry/focus/reconnect; stale saves show a conflict rather
+than overwriting another device. Unreadable persisted state reports unavailable
+instead of resetting OFF. The API is authenticated, no-store and versioned,
+with server-selected identity and compare-revision writes.
+
+With verified private Hub-to-child trust, ON considers one background request
+after an accepted composer steer, Queue → Steer, held Send now, paused-batch
+Send now, or submitted Undo/revert replacement. It never runs on job starts,
+ordinary idle/queued sends, preference selection or replacement staging alone.
+The request affects all native eligible blocking work, including shells.
+Admission/resume and backgrounding are separate, non-atomic operations: native
+resume may cancel blockers first, and neither acceptance nor backgrounding
+promises immediate steer delivery or worker completion. Other users can see
+the shared-work effects without having their personal preference changed.
+
+Missing child trust or unreadable preferences makes automation explicitly
+unavailable, not ON or OFF; an otherwise accepted steer stays accepted.
+Refused, unavailable and unknown follow-ups are reported separately and never
+restore an accepted input as a failed draft. An uncertain primary admission is
+retained as unconfirmed text/attachments and reconciled read-only, not resent.
+Late evidence never schedules a delayed background request. Same-account,
+same-request retries retain the first policy/outcome only while the bounded
+in-memory receipt survives (15 minutes after settlement by default, or less
+under count/byte pressure). Expiry, eviction and adapter/process restart end
+that protection; reload/reconnect never automatically replays the mutation.
+After refreshing evidence, explicit Continue is a fresh action, not a resend.
+
+Unknown steer/resume retention does not depend on automation being available.
+When private child trust is unavailable, the Hub still keeps accounts' operation
+identifiers separate without sending unsigned account identity or automation
+permission. The first degraded feedback snapshot is also memory-bounded (up to
+15 minutes from the proxy decision, or less under capacity pressure); losing
+either that snapshot or the child receipt ends composite replay protection.
+Queue → Steer and Send now response loss or server errors show persistent
+unconfirmed guidance for the current page and refresh state read-only, leaving
+an unrelated composing draft untouched. Reconnect/reload does not replay them.
+
 ## Prerequisites
 
 ### OpenCode
@@ -56,6 +100,36 @@ conversation holds no process. Conversations resume from Claude Code's
 own session storage (`~/.claude/projects/...`), which uatu reads but
 never writes.
 
+### Sending, steering and queued messages
+
+**Send** submits; the separate **Stop** cancels the current response. On
+OpenCode V2, choose **Steer — Next step** or **Queue — After this turn**.
+The selector changes only your device preference. Desktop Enter uses that choice;
+on touch devices Enter always adds a newline and Ctrl/Command+Enter submits.
+Alt/Option+Enter uses the other choice. The menu shows the current shortcuts.
+Idle messages send immediately, so the selector is disabled then. Claude Code
+and OpenCode V1 queue busy follow-ups without offering steering.
+
+The pending dock counts steers and queued messages. Each entry has its delivery
+badge, a separate **Paused** chip when applicable, and message-specific actions.
+For duplicate text and image-only entries, accessible action names also identify
+a stable pending-message number while that entry remains in the dock. Each
+successful action announces once, even when you repeat the same kind of action.
+Paused messages wait for your next message or an explicit send action.
+**Send N paused steers now** wakes them together. Sending a queued message as a
+steer also wakes paused steers; its label and confirmation explain that effect.
+Other dormant queued messages remain held. Undo's count-only warning explains
+which batch will accompany the replacement, without repeating message text.
+
+On touch screens, work tracks share a bounded, independently scrollable dock.
+Short keyboard/landscape layouts use a single-row composer and compact counts;
+paused-batch Send and replacement warnings remain available while typing.
+Dismiss the delivery menu with an outside tap without activating controls below it.
+
+Edit returns an entry to the composer only after withdrawal succeeds. If
+delivery wins first, **Too late — already delivered** is informational: your
+private draft stays intact and the delivered message appears only once.
+
 ### Background workers (OpenCode V2)
 
 OpenCode V2 exposes native background-worker inspection and controls. Automated
@@ -76,19 +150,47 @@ When supported, **Continue while workers run** explicitly moves **all eligible
 blocking jobs in the parent**, including shell commands, to the background.
 It does not stop them, submit or clear your draft, or change delivery/model
 selection. Acceptance is not a worker count; nothing eligible is a valid no-op.
-Ordinary Send never backgrounds work automatically.
+Outside the verified personal Hub steer case above, Send never backgrounds
+work automatically; standalone retains explicit Continue only.
+The action appears only with running blocker evidence, not merely because the
+parent is generating or already has detached workers. **What continues?** and
+the button tooltip explain its all-eligible scope. Feedback disappears after
+the parent and workers settle. On touch, Continue and its explanation are in
+**Chat options**, alongside settings/context/usage; configuration opens the
+same single picker after options closes. Worker details remain reachable with
+a hardware keyboard. With the software
+keyboard open, or in short landscape layouts, work tracks and Continue are
+hidden to preserve conversation and composer space; dismiss the keyboard or
+leave short landscape to reach those controls. Pending counts, paused-batch
+Send and replacement warnings remain visible while typing.
+Touch has one initially collapsed pending summary and one worker summary.
+Pending counts distinguish steers from queued input; worker counts distinguish
+confirmed working, finished (including failed/stopped), and uncertain
+occurrences, without counting launcher aliases twice. Expanded details retain
+task/cost references, outcomes and inspection. Deliberate expansion is kept per
+conversation within this page's bounded presentation cache; new work and
+settlement do not open details. Replacement/batch warnings, applicable batch
+Send and actionable operation feedback stay outside the collapse. Desktop
+retains its existing tracks and automatic expansion: detachment collapses only
+an automatically opened duplicate track, not one deliberately reopened.
 
 **Stop parent** affects the current parent execution and its still-blocking
 dependencies, not detached workers. **Stop worker** targets that verified
 worker only. An accepted request stays **Stopping…** until the provider reports
 its outcome. A later provider-owned completion notification can wake the
 parent again; Stop is not a permanent ban on future turns.
+On touch devices, Stop parent with worker records opens an in-app explanation
+and confirmation before cancelling; Cancel leaves all work untouched.
 
 Stopping a shell removes its provider record and output. If removal prevents
 final capture, OpenCode can report **failed**, even after the process exited.
 An already confirmed completed report stays completed. Output already received
 can remain in the open view, but missing provider output cannot be recovered
 after reload; there is no persistent output archive.
+An in-app confirmation explains this destructive effect. Cancel or Escape
+closes only that confirmation, restores focus and makes no stop request.
+If the shell settles while confirmation is open, focus returns to the surviving
+inspection action rather than the parent composer.
 
 Reconnect reads history, pending results and current execution evidence.
 Complete history is reused only within a connected event generation, invalidated

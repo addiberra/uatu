@@ -3,7 +3,7 @@
 ### Requirement: Background work is a distinct conversation state
 Where an agent declares that it can run work in the background, Chat SHALL present live background tasks as a state of the conversation distinct from working and idle: the composer status SHALL name how many tasks run, a list SHALL name each task with its description and progress where reported, each confirmed running and controllable task SHALL offer a stop action, and a settled task SHALL appear in the timeline as a row with its outcome and summary. The state SHALL be populated when an existing conversation with live background work is opened, and SHALL clear when the agent authoritatively reports no live tasks. An agent that does not declare the capability SHALL show none of it.
 
-Background tasks SHALL remain visible while the parent also has a foreground turn. When only background work remains, the parent composer SHALL remain usable without requiring those workers to finish. If recovery cannot establish current task state, Chat SHALL distinguish last-known state from current evidence, show that status is unavailable, and withhold controls whose target cannot be verified. Missing or failed reads alone MUST NOT be reported as successful completion or cancellation. A later successful reconciliation SHALL clear the uncertainty.
+Background tasks SHALL remain visible while the parent also has a foreground turn, subject to the compact touch visibility rules in "Background inspection and controls remain accessible and workspace-confined". When only background work remains, the parent composer SHALL remain usable without requiring those workers to finish. If recovery cannot establish current task state, Chat SHALL distinguish last-known state from current evidence, show that status is unavailable, and withhold controls whose target cannot be verified. Missing or failed reads alone MUST NOT be reported as successful completion or cancellation. A later successful reconciliation SHALL clear the uncertainty.
 
 #### Scenario: Background tasks are listed while they run
 - **WHEN** a conversation's agent reports one or more live background tasks
@@ -117,7 +117,7 @@ Recovery SHALL be read-only with respect to execution: it MUST NOT prompt, inter
 - **THEN** Uatu reports uncertainty and retains available history without claiming durable execution or fabricating a final result
 
 ### Requirement: Users explicitly continue the parent while all eligible blocking jobs run
-For OpenCode V2 that declares backgrounding support, Chat SHALL offer a distinct action labelled `Continue while workers run` while a parent turn is active. Its explanation SHALL state that it backgrounds all eligible blocking jobs in that parent, including shell commands, without stopping them. It SHALL use the provider's native parent-wide background operation and MUST NOT imply selected-child scope or an exact eligible count the provider does not report. If nothing remains eligible, the action SHALL be a harmless accepted no-op.
+For OpenCode V2 that declares backgrounding support, Chat SHALL offer a distinct action labelled `Continue while workers run` only while an active parent has running blocking tool/command or confirmed foreground-task evidence. Pending tools, a merely generating parent, and launchers already correlated to detached, settled or uncertain workers SHALL NOT expose it. A tooltip and collapsed explanation SHALL state that it backgrounds all eligible blocking jobs in that parent, including shell commands, without stopping them. It SHALL use the provider's native parent-wide background operation and MUST NOT imply selected-child scope or an exact eligible count the provider does not report. If nothing remains eligible when the request reaches the provider, the action SHALL be a harmless accepted no-op. Accepted feedback SHALL clear once the parent and workers settle and no background request is in flight.
 
 The mutation SHALL be authenticated, workspace-confined, origin-protected under cookie authentication, and agent-qualified. It SHALL deduplicate a client request identifier while its in-memory receipt is retained. Its acceptance SHALL NOT be represented as proof that a specific worker is running. If the provider may have applied a dispatched mutation but its response is lost, Uatu SHALL retain an explicit unknown outcome within the same bounded receipt lifetime rather than discard it as an ordinary retryable error. A retained unknown outcome SHALL produce explanatory uncertainty, not a false acceptance, and retries against that retained receipt SHALL not dispatch again. Concurrent duplicate actions SHALL be suppressed within that retention scope.
 
@@ -134,6 +134,10 @@ The action MUST NOT cancel a parent or worker, send or clear a draft, change mod
 #### Scenario: No eligible blocker remains
 - **WHEN** all blockers finish just before the background request reaches OpenCode
 - **THEN** the accepted no-op neither invents running workers nor raises a task failure
+
+#### Scenario: A busy parent has no running blocker
+- **WHEN** the parent is generating, has only pending tools, or has already detached its workers
+- **THEN** Continue is absent rather than suggesting another background operation
 
 #### Scenario: Retrying a lost response does not affect newer jobs
 - **WHEN** Uatu has recorded the outcome, the browser response is lost, and the same client request identifier is retried while that receipt is still retained after another blocker appears
@@ -161,9 +165,18 @@ The action MUST NOT cancel a parent or worker, send or clear a draft, change mod
 ### Requirement: Parent stop and worker stop have explicit separate effects
 For V2 background work, Chat SHALL distinguish parent interruption from stopping one verified worker. Parent Stop SHALL interrupt the current parent execution without explicitly waking pending input, leave held queue/steer behavior governed by the existing cancellation contract, and not stop detached workers. The UI SHALL explain that still-blocking foreground work can be cancelled by parent interruption and that future provider-owned worker notifications can wake the parent again. With no parent execution, parent Stop SHALL remain disabled rather than become a stop-all-workers action.
 
+On touch, activating Stop parent with worker records SHALL first open an in-app scope explanation and confirmation. Cancelling SHALL make no cancellation request; confirmation SHALL recheck that the same parent still has live work before acting. Desktop parent-stop behavior and native cancellation scope remain unchanged.
+
 Worker Stop SHALL resolve the selected task under its verified parent/workspace and target only that worker's native execution. A known stale, settled, uncertain, foreign, or unrelated task target SHALL be refused without redirecting the request to a newer child occurrence. Worker-stop receipts SHALL use the same bounded retention, preservation of transport-ambiguous outcomes, and no-automatic-replay behavior specified for backgrounding; deduplication SHALL NOT be promised after expiry, eviction, adapter recreation, or process restart. An accepted interruption SHALL show pending stopping feedback until authoritative settlement; it SHALL NOT overwrite a confirmed completed result with stopped. Native effects on a worker's own blocking descendants remain provider semantics, not a new stop-all operation.
 
 Native shell Stop removes the provider's shell record and output. The UI SHALL explain before activation that output can become unavailable and the provider may report a failed result rather than cancellation. Removal acknowledgement or a missing output record SHALL NOT alone establish a cancelled job. Uatu SHALL preserve a confirmed completed result if capture and completion already won the race; if removal prevents the final capture and the provider reports error, it SHALL present failed with output-unavailable context rather than force completed or stopped.
+
+Shell Stop SHALL use an in-app confirmation with Cancel initially focused. Escape SHALL cancel that confirmation without closing the child/output view, restore the invoking control or surviving equivalent, and send no mutation. Confirmation SHALL revalidate current task state before dispatch.
+
+#### Scenario: Touch parent-stop confirmation explains detached work
+- **WHEN** a touch user activates Stop parent with worker records present
+- **THEN** the confirmation explains still-blocking work, continuing detached workers and possible later provider wakeup
+- **AND** Cancel leaves work untouched while confirmation cancels only the same still-live parent execution
 
 #### Scenario: Stop parent with mixed workers
 - **WHEN** the parent has both still-blocking foreground children and detached background children and the user selects Stop parent
@@ -214,6 +227,10 @@ Native shell work affected by backgrounding SHALL retain inspectable already-rec
 
 Desktop pointer, keyboard, and touch users SHALL be able to inspect workers, return to the parent, request backgrounding, and stop a verified worker using labelled controls with visible focus, at least 44 CSS pixel targets and 8 CSS pixel gaps between adjacent mutation actions. State and failure SHALL be conveyed in words, not colour or animation alone. Reduced-motion preferences SHALL be respected. Dynamic updates SHALL NOT steal focus, discard reading position, or replace the existing separate Send, delivery selector, and Stop actions. Opening a child SHALL move focus into its view; return SHALL restore the invoking control or a logical surviving equivalent. Layered output Escape SHALL NOT also dismiss its owning child view.
 
+The live worker list SHALL remain reachable through the bounded scrollable work dock while composing without a software keyboard, except in short touch landscape. With the software keyboard open, or in a visual band at most 390px high and at least 600px wide, worker/subagent tracks and Continue SHALL be hidden to preserve conversation and composer space; dismissing the keyboard or leaving short landscape SHALL restore access. Compact pending counts, any paused-batch Send action and replacement warnings follow the steering dock's safety rules and SHALL remain available while typing. The secondary subagent presentation SHOULD stay collapsed by default when the open background list already exposes the same workers. Worker Stop and parent Stop SHALL be distinctly labelled; routine worker appearance SHALL preserve the reserved composer control geometry. Expanded touch work tracks SHALL keep the prompt rail from covering worker actions.
+
+The shared touch work dock SHALL observe the visual-height budgets and final-height reservation specified by the steering composer/dock contract, rather than separately budgeting each track. This includes the 24% cap during hardware-keyboard editing and reduced-motion handling. These compact-layout rules do not change worker execution, ownership, stop targets or the existing interaction-request answering flow.
+
 #### Scenario: A child excluded from the picker opens reliably
 - **WHEN** a user opens a verified background child from its running task or historical result on desktop or touch
 - **THEN** its exact transcript opens with the parent still selected and a first-class way back
@@ -224,9 +241,32 @@ Desktop pointer, keyboard, and touch users SHALL be able to inspect workers, ret
 - **THEN** the parent and draft remain intact and Retry can open the same child after recovery
 
 #### Scenario: Keyboard and touch control separation
-- **WHEN** a narrow desktop or touch user navigates the task controls by keyboard or taps adjacent action targets and gaps
+- **WHEN** a narrow desktop or touch user navigates visible task controls by keyboard or taps adjacent action targets and gaps
 - **THEN** inspection, Continue, worker Stop, Send, and parent Stop remain distinguishable and reachable without overlapping hit regions
 - **AND** focus restoration and status announcements do not submit a draft or trigger another action
+
+#### Scenario: Continue is first-touch usable while composing
+- **WHEN** the touch composer is focused in a layout where Continue is visible and the user taps Continue while workers run
+- **THEN** that first tap submits exactly one background request without losing the composing draft or its focus
+
+#### Scenario: Keyboard and short landscape defer worker controls, not pending safety
+- **WHEN** a touch parent composer enters software-keyboard mode or short landscape with live workers and pending messages
+- **THEN** worker tracks and Continue are hidden while the compact pending counts, paused-batch Send and replacement warning remain available as applicable
+- **AND** leaving that compact state restores worker access without stopping work or losing the draft
+
+#### Scenario: Foreground work becomes a duplicate background presentation
+- **WHEN** foreground work is detached on touch and its subagent track was expanded automatically
+- **THEN** the duplicate subagent track collapses while the background controls remain open
+- **AND** a track deliberately reopened by the user remains open
+
+#### Scenario: Automatic expansion survives a conversation switch
+- **WHEN** conversation A automatically opens its foreground track, the user selects B without touching the disclosure, and B's foreground work is detached
+- **THEN** the retained open state remains classified as automatic and the duplicate track collapses in B
+- **AND** provenance for a deliberately opened retained track stays deliberate
+
+#### Scenario: Shell settles while confirmation is open
+- **WHEN** settlement removes the invoking shell Stop control before the user dismisses its confirmation
+- **THEN** Escape keeps the inspection open, sends no removal and restores its surviving result action or logical inspection equivalent before the composer
 
 #### Scenario: Shell output and stop remain owned by the task
 - **WHEN** a native shell job is backgrounded alongside subagents

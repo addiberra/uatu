@@ -104,6 +104,16 @@ describe("task inspection panel", () => {
     view.close();
   });
 
+  for (const taskType of ["agent", "shell"]) test(`${taskType} inspection explicitly names Stop worker`, () => {
+    const view = panel();
+    const task = item({ taskId: "native", taskType, description: "Fixture worker" });
+    view.show({ conversationId: "one", taskId: task.taskId, view: "transcript" }, task);
+    const stop = hosts().strip.querySelector<HTMLButtonElement>("[data-stop-task]")!;
+    expect(stop.textContent).toBe("Stop worker");
+    expect(stop.getAttribute("aria-label")).toBe("Stop worker: Fixture worker");
+    view.close();
+  });
+
   test("an agent task's strip names the task, its type, progress, elapsed, spend, and Stop; it ticks and settles into one line", () => {
     const view = panel();
     const task = item({ taskId: "ada2b", description: "Review renderer", taskType: "local_agent", subagentType: "explore", createdAt: now - 65_000, childConversationId: "sub:p:ada2b", progress: "Reading the tests", usage: { totalTokens: 13_122, toolUses: 1, durationMs: 4_000 } });

@@ -11,6 +11,16 @@ async function control(request: APIRequestContext, body: Record<string, unknown>
   return response.json();
 }
 
+async function revealTouchWorkers(page: Page) {
+  if (await page.locator("html").getAttribute("data-ui-mode") !== "touch") return;
+  const workers = page.locator("#chat-compact-workers");
+  if (!await workers.getAttribute("open").then(value => value !== null)) await workers.locator(":scope > summary").tap();
+}
+
+async function revealTouchContinue(page: Page) {
+  if (await page.locator("html").getAttribute("data-ui-mode") === "touch") await page.locator("#chat-options-toggle").tap();
+}
+
 async function boot(page: Page, request: APIRequestContext, preview = true) {
   await request.post("/__e2e/reset");
   await control(request, { action: "agents", stack: "opencode-v2", backgroundPreview: preview });
@@ -29,6 +39,31 @@ async function boot(page: Page, request: APIRequestContext, preview = true) {
   return conversationId;
 }
 
+async function settleDuringShellConfirmation(page: Page, request: APIRequestContext) {
+  const conversationId = await boot(page, request);
+  const shell = await control(request, { op: "launchShell", conversationId });
+  await revealTouchWorkers(page);
+  await page.locator(`[data-background-task="${shell.taskId}"] [data-inspect-task]`).click();
+  await expect(page.locator("#chat-drilldown-output-text")).toContainText("safe shell output");
+  await page.locator("#chat-drilldown-task [data-stop-task]").click();
+  const confirmation = page.getByRole("dialog", { name: "Stop shell worker?" });
+  await expect(confirmation).toBeVisible();
+  await control(request, { op: "shellPhase", shellId: shell.shellId, shellPhase: "capture" });
+  const result = page.locator("#chat-drilldown-task [data-task-result]");
+  await expect(result).toBeAttached();
+  await expect(page.locator("#chat-drilldown-task [data-stop-task]")).toHaveCount(0);
+  await page.keyboard.press("Escape");
+  await expect(confirmation).toBeHidden();
+  await expect(page.locator("#chat-drilldown")).toBeVisible();
+  await expect(result).toBeFocused();
+  expect((await control(request, { op: "state" })).calls.filter((call: string) => call.startsWith("DELETE /api/shell/"))).toHaveLength(0);
+}
+
+test("settlement during shell confirmation restores the surviving inspection action", async ({ page, request }, testInfo) => {
+  await settleDuringShellConfirmation(page, request);
+  await captureScreenshot(page, testInfo, "review-shell-confirmation-focus-desktop");
+});
+
 test("Continue feedback clears after parent and workers settle", async ({ page, request }) => {
   const conversationId = await boot(page, request);
   const worker = await control(request, { op: "launchWorker", conversationId, background: false });
@@ -41,6 +76,33 @@ test("Continue feedback clears after parent and workers settle", async ({ page, 
   await expect(page.locator("#chat-background-feedback")).toBeEmpty();
   await control(request, { op: "wakeParent", conversationId });
   await expect(page.locator("#chat-background-feedback")).toBeEmpty();
+});
+
+for (const theme of ["light", "dark"] as const) test(`background audit desktop ${theme}`, async ({ page, request }, testInfo) => {
+  await page.setViewportSize({ width: 1600, height: 1000 });
+  await page.emulateMedia({ colorScheme: theme });
+  const conversationId = await boot(page, request);
+  const stopBeforeWorkers = (await page.locator("#chat-stop").boundingBox())!;
+  const worker = await control(request, { op: "launchWorker", conversationId, background: false });
+  const sibling = await control(request, { op: "launchWorker", conversationId });
+  const proceed = page.getByRole("button", { name: "Continue while workers run", exact: true });
+  await expect(proceed).toBeVisible();
+  const stopWithWorkers = (await page.locator("#chat-stop").boundingBox())!;
+  expect(stopWithWorkers.width).toBe(stopBeforeWorkers.width);
+  expect(stopWithWorkers.x).toBe(stopBeforeWorkers.x);
+  await expect(proceed).toHaveClass(/chat-secondary-button/);
+  await expect(page.locator(".chat-background-help")).not.toHaveAttribute("open");
+  await captureScreenshot(page, testInfo, `audit-background-desktop-${theme}-blocking`);
+  await proceed.click();
+  await expect(page.locator("#chat-background-tasks-items [data-inspect-task]")).toHaveCount(2);
+  await expect(proceed).toBeHidden();
+  await captureScreenshot(page, testInfo, `audit-background-desktop-${theme}-detached`);
+  await control(request, { op: "finish", conversationId });
+  await control(request, { op: "settleWorker", childId: worker.childId });
+  await control(request, { op: "settleWorker", childId: sibling.childId });
+  await expect(page.locator("#chat-background-action")).toBeHidden();
+  for (const group of await page.locator("#chat-items details.chat-activity-group:not([open]) > summary").all()) await group.click();
+  await captureScreenshot(page, testInfo, `audit-background-desktop-${theme}-settled`);
 });
 
 test("Continue is parent-wide, keeps the draft, and inspection survives worker failure", async ({ page, request }) => {
@@ -92,9 +154,14 @@ for (const [workerState, outcome] of [["completed", "completed"], ["error", "fai
     const row = page.locator(`[data-background-task="${worker.taskId}"]`);
     await expect(row).toBeVisible();
     if (workerState === "cancelled") {
+      const acknowledged = page.waitForResponse(response => response.url().includes("/tasks/") && response.url().endsWith("/stop"));
       await row.locator("[data-stop-task]").click();
       await expect(row.locator("[data-stop-task]")).toHaveText("Stopping…");
       await expect(row.locator("[data-stop-task]")).toBeDisabled();
+      // Stopping is immediate UI feedback, not proof the provider dispatched.
+      // Count native requests only after admission acknowledges, before the
+      // test emits settlement. Keep the exact target and sibling assertions.
+      expect((await acknowledged).ok()).toBe(true);
       const state = await control(request, { op: "state" });
       expect(state.calls.filter((call: string) => call.startsWith("POST ") && call.includes("/interrupt"))).toEqual([`POST /api/session/${worker.childId}/interrupt?resume=false`]);
       expect(state.sessions[sibling.childId].running).toBe(true);
@@ -228,10 +295,27 @@ test("Stop parent cancels blocking children, preserves detached work and paused 
 });
 
 test("an accepted no-op invents no tasks; unadvertised capability offers no Continue", async ({ page, request }) => {
-  await boot(page, request);
+  const conversationId = await boot(page, request);
+  await expect(page.getByRole("button", { name: "Continue while workers run", exact: true })).toBeHidden();
+  const worker = await control(request, { op: "launchWorker", conversationId, background: false });
+  let release!: () => void;
+  let entered!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const dispatched = new Promise<void>(resolve => { entered = resolve; });
+  await page.route("**/api/chat/conversations/*/background", async route => { entered(); await gate; await route.continue(); }, { times: 1 });
+  const accepted = page.waitForResponse(response => response.url().endsWith("/background") && response.request().method() === "POST");
   await page.getByRole("button", { name: "Continue while workers run", exact: true }).click();
+  await dispatched;
+  await control(request, { op: "settleWorker", childId: worker.childId });
+  release();
+  // The request is deliberately held before dispatch. Await its real no-op
+  // acknowledgement before inspecting accepted feedback, not elapsed time.
+  const response = await accepted;
+  expect(response.ok()).toBe(true);
+  expect(await response.json()).toEqual({ accepted: true });
   await expect(page.locator("#chat-background-feedback")).toContainText("Request accepted");
   await expect(page.locator("#chat-background-tasks-items [data-inspect-task]")).toHaveCount(0);
+  expect((await control(request, { op: "state" })).calls.filter((call: string) => call.startsWith("POST ") && call.includes("/background"))).toHaveLength(1);
   await boot(page, request, false);
   await expect(page.getByRole("button", { name: "Continue while workers run", exact: true })).toHaveCount(0);
 });
@@ -247,12 +331,18 @@ for (const phase of ["running", "exit", "captureBeforeRemove"] as const) {
     await page.locator(`[data-background-task="${shell.taskId}"] [data-inspect-task]`).click();
     await expect(page.locator("#chat-drilldown-output-text")).toContainText("safe shell output");
     if (phase !== "running") await control(request, { op: "shellPhase", shellId: shell.shellId, shellPhase: phase });
-    let explanation = "";
-    page.once("dialog", async dialog => { explanation = dialog.message(); await dialog.accept(); });
     const removed = page.waitForResponse(response => response.url().includes("/tasks/") && response.url().endsWith("/stop"));
     await page.locator("#chat-drilldown-task [data-stop-task]").click();
+    const confirmation = page.getByRole("dialog", { name: "Stop shell worker?" });
+    await expect(confirmation).toContainText("removes its provider record and output");
+    await page.keyboard.press("Escape");
+    await expect(confirmation).toBeHidden();
+    await expect(page.locator("#chat-drilldown")).toBeVisible();
+    await expect(page.locator("#chat-drilldown-task [data-stop-task]")).toBeFocused();
+    expect((await control(request, { op: "state" })).calls.filter((call: string) => call.startsWith("DELETE /api/shell/"))).toHaveLength(0);
+    await page.locator("#chat-drilldown-task [data-stop-task]").click();
+    await confirmation.getByRole("button", { name: "Stop shell worker", exact: true }).click();
     expect((await removed).ok()).toBe(true);
-    expect(explanation).toContain("removes its provider record and output");
     if (phase !== "captureBeforeRemove") {
       await expect(page.locator("#chat-drilldown-task [data-stop-task]")).toHaveText("Stopping…");
       await control(request, { op: "shellPhase", shellId: shell.shellId, shellPhase: "capture" });
@@ -276,8 +366,8 @@ for (const kind of ["child", "shell"] as const) test(`unknown ${kind} stop stays
   await control(request, { op: "loseWorkerResponse" });
   let requestId = "";
   page.on("request", request => { if (request.url().includes("/tasks/") && request.url().endsWith("/stop")) requestId = request.postDataJSON().requestId; });
-  if (kind === "shell") page.once("dialog", dialog => dialog.accept());
   await page.locator(`[data-background-task="${worker.taskId}"] [data-stop-task]`).click();
+  if (kind === "shell") await page.getByRole("dialog", { name: "Stop shell worker?" }).getByRole("button", { name: "Stop shell worker", exact: true }).click();
   await expect(page.locator("#chat-state")).toContainText("Outcome unknown");
   const retry = await page.request.post(`/api/chat/conversations/${encodeURIComponent(conversationId)}/tasks/${encodeURIComponent(worker.taskId)}/stop`, { headers: { origin: new URL(page.url()).origin }, data: { requestId } });
   expect(retry.status()).toBe(409);
@@ -442,7 +532,70 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`worker cont
     const page = await browser.newPage({ baseURL, viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true, reducedMotion: "reduce" });
     await use(page); await browser.close();
   } });
-  test("inspect and Stop have separate targets; settlement keeps the child open", async ({ page, request }, testInfo) => {
+  test("settlement during shell confirmation restores the surviving inspection action", async ({ page, request }, testInfo) => {
+    await settleDuringShellConfirmation(page, request);
+    await captureScreenshot(page, testInfo, `review-shell-confirmation-focus-${engine}`);
+  });
+  test("Continue activates on its first touch while composing", async ({ page, request }, testInfo) => {
+    const conversationId = await boot(page, request);
+    await control(request, { op: "launchWorker", conversationId, background: false });
+    const input = page.locator("#chat-input");
+    await input.fill("Keep this composing draft");
+    await input.focus();
+    await revealTouchContinue(page);
+    const proceed = page.getByRole("button", { name: "Continue while workers run", exact: true });
+    await expect(input).toBeFocused();
+    await expect(proceed).toBeVisible();
+    await proceed.tap();
+    await expect.poll(async () => (await control(request, { op: "state" })).calls.filter((call: string) => call.startsWith("POST ") && call.includes("/background")).length).toBe(1);
+    await expect(page.locator("#chat-background-tasks-items [data-inspect-task]")).toHaveCount(1);
+    await expect(input).toHaveValue("Keep this composing draft");
+    await expect(input).toBeFocused();
+    await captureScreenshot(page, testInfo, `review-continue-first-touch-${engine}`);
+  });
+  test("touch work stays collapsed across conversations before and after detachment", async ({ page, request }, testInfo) => {
+    const firstId = await boot(page, request);
+    const firstWorker = await control(request, { op: "launchWorker", conversationId: firstId, background: false });
+    const track = page.locator("#chat-compact-workers");
+    await expect(track).not.toHaveAttribute("open");
+    // No disclosure interaction: B must not inherit an automatic expansion.
+    await page.getByRole("button", { name: "New conversation", exact: true }).click();
+    await expect(page.locator("#chat-conversation-select")).not.toHaveValue(firstId);
+    const secondId = await page.locator("#chat-conversation-select").inputValue();
+    await page.locator("#chat-input").fill("Start conversation B work");
+    const prompted = page.waitForResponse(response => response.url().endsWith("/prompts"));
+    await page.locator("#chat-send").tap();
+    expect((await prompted).ok()).toBe(true);
+    await control(request, { op: "launchWorker", conversationId: secondId, background: false });
+    await expect(track).not.toHaveAttribute("open");
+    await revealTouchContinue(page);
+    await page.getByRole("button", { name: "Continue while workers run", exact: true }).tap();
+    await expect(page.locator("#chat-background-tasks-items [data-inspect-task]")).toHaveCount(1);
+    await expect(track).not.toHaveAttribute("open");
+    const state = await control(request, { op: "state" });
+    expect(state.calls.filter((call: string) => call.startsWith("POST ") && call.includes("/background"))).toEqual([`POST /api/session/${secondId.replace(/^opencode:/, "")}/background`]);
+    expect(state.sessions[firstWorker.childId].running).toBe(true);
+    await captureScreenshot(page, testInfo, `rereview-conversation-switch-${engine}`);
+  });
+  for (const deliberate of [false, true]) test(`touch detachment ${deliberate ? "preserves deliberate expansion" : "never expands collapsed workers"}`, async ({ page, request }, testInfo) => {
+    const conversationId = await boot(page, request);
+    await control(request, { op: "launchWorker", conversationId, background: false });
+    const track = page.locator("#chat-compact-workers");
+    await expect(track).not.toHaveAttribute("open");
+    if (deliberate) {
+      await page.locator("#chat-stop").focus();
+      await track.locator(":scope > summary").tap();
+      await expect(track).toHaveAttribute("open");
+    }
+    await revealTouchContinue(page);
+    await page.getByRole("button", { name: "Continue while workers run", exact: true }).tap();
+    await expect(page.locator("#chat-background-tasks-items [data-inspect-task]")).toHaveCount(1);
+    if (deliberate) await expect(track).toHaveAttribute("open");
+    else await expect(track).not.toHaveAttribute("open");
+    await captureScreenshot(page, testInfo, `review-detached-${deliberate ? "deliberate" : "automatic"}-${engine}`);
+  });
+  for (const theme of ["light", "dark"] as const) test(`inspect and Stop have separate targets; settlement keeps the child open (${theme})`, async ({ page, request }, testInfo) => {
+    await page.emulateMedia({ colorScheme: theme });
     const errors: string[] = [];
     page.on("pageerror", error => errors.push(error.message));
     page.on("console", message => { if (message.type() === "error") errors.push(message.text()); });
@@ -450,18 +603,21 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`worker cont
     const conversationId = await boot(page, request);
     const worker = await control(request, { op: "launchWorker", conversationId });
     const sibling = await control(request, { op: "launchWorker", conversationId });
+    await revealTouchWorkers(page);
     const row = page.locator(`[data-background-task="${worker.taskId}"]`);
     const inspect = row.locator("[data-inspect-task]");
     const stop = row.locator("[data-stop-task]");
+    const nextStop = page.locator(`[data-background-task="${sibling.taskId}"] [data-stop-task]`);
+    await expect(nextStop).toBeVisible();
     await expect(inspect).toBeVisible();
     const a = (await inspect.boundingBox())!;
     const b = (await stop.boundingBox())!;
-    const nextStop = page.locator(`[data-background-task="${sibling.taskId}"] [data-stop-task]`);
-    await expect(nextStop).toBeVisible();
     const c = (await nextStop.boundingBox())!;
     expect(c.y - (b.y + b.height)).toBeGreaterThanOrEqual(8);
     for (const box of [a, b]) { expect(box.width).toBeGreaterThanOrEqual(44); expect(box.height).toBeGreaterThanOrEqual(44); }
     expect(b.x - (a.x + a.width)).toBeGreaterThanOrEqual(8);
+    await expect(page.locator("#chat-compact-workers")).toHaveAttribute("open");
+    await captureScreenshot(page, testInfo, `audit-background-${engine}-touch-${theme}-running`);
     await expect(page.locator("#chat-composer-status-live")).toHaveAttribute("aria-live", "polite");
     await page.touchscreen.tap(a.x + a.width + 4, a.y + a.height / 2);
     expect((await control(request, { op: "state" })).calls.some((call: string) => call.startsWith("POST ") && call.includes("/interrupt"))).toBe(false);
@@ -482,7 +638,7 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`worker cont
     await page.setViewportSize({ width: 390, height: 844 });
     await control(request, { op: "settleWorker", childId: worker.childId, text: "Touch fixture complete" });
     await expect(page.locator("#chat-drilldown-task")).toContainText("finished");
-    await captureScreenshot(page, testInfo, `background-${engine}-settled`);
+    await captureScreenshot(page, testInfo, `audit-background-${engine}-touch-${theme}-settled`);
     // The unchanged generic usage probe asks this no-usage-capability fixture
     // once and receives its documented unsupported response. No other page,
     // console or chat-network error is accepted.

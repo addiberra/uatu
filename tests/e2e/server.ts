@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { ChatAdapter } from "../../src/chat/adapter";
+import { consumeChildPolicyDescriptor } from "../../src/hub/child-policy-bootstrap";
 import { MultiAgentChatService } from "../../src/chat/agents";
 import { LazyChatService, type AgentRuntime } from "../../src/chat/service";
 import { createOpenCodeV2Provider } from "../../src/chat/opencode/v2/provider";
@@ -37,6 +38,8 @@ const E2E_PORT = e2ePort();
 // process's child routes through it. Unset, nothing below changes.
 const E2E_BASE_PATH = normalizeBasePath(process.env.UATU_E2E_BASE_PATH ?? "/");
 const E2E_HUB_CHILD = E2E_BASE_PATH !== "/";
+const privateBootstrap = Bun.argv.includes("--hub-policy-bootstrap");
+const childPolicy = privateBootstrap ? await consumeChildPolicyDescriptor() : null;
 import { safeGit } from "../../src/document/git-base-ref";
 import { normalizeBasePath, stripBasePath } from "../../src/shared/base-path";
 import { createNavigationFetchHandler, INTERNAL_SHELL_PATH, spaShellResponse } from "../../src/server/navigation";
@@ -463,7 +466,7 @@ async function handleE2EChat(request: Request): Promise<Response> {
     // fake OpenCode's controls (`opencode` action).
     stack?: "opencode-v2";
     backgroundPreview?: boolean;
-    op?: "step" | "finish" | "raceDeliverOnCancel" | "state" | "launchWorker" | "settleWorker" | "disconnect" | "pauseEvents" | "reconnectEvents" | "appendHistory" | "loseBackgroundResponse" | "loseWorkerResponse" | "launchShell" | "shellPhase" | "wakeParent";
+    op?: "step" | "finish" | "raceDeliverOnCancel" | "state" | "launchWorker" | "settleWorker" | "disconnect" | "pauseEvents" | "reconnectEvents" | "appendHistory" | "loseBackgroundResponse" | "loseWorkerResponse" | "launchShell" | "shellPhase" | "wakeParent" | "losePromptResponse" | "loseResumeResponse" | "refuseBackground" | "launchShellOnNextSteer";
     shellId?: string;
     shellPhase?: "exit" | "capture" | "captureBeforeRemove";
     background?: boolean;
@@ -515,6 +518,15 @@ async function handleE2EChat(request: Request): Promise<Response> {
     // ids arrive qualified or bare; the fake works in bare session ids.
     case "opencode":
       switch (body.op) {
+        case "losePromptResponse":
+          openCodeV2Fake.loseNextPromptResponse(); return Response.json({ ok: true });
+        case "loseResumeResponse":
+          openCodeV2Fake.loseNextResumeResponse(); return Response.json({ ok: true });
+        case "refuseBackground":
+          openCodeV2Fake.refuseNextBackground(); return Response.json({ ok: true });
+        case "launchShellOnNextSteer":
+          if (body.conversationId) { openCodeV2Fake.launchShellOnNextSteer(body.conversationId); return Response.json({ ok: true }); }
+          break;
         case "wakeParent":
           if (body.conversationId) { openCodeV2Fake.wakeParent(body.conversationId); return Response.json({ ok: true }); }
           break;
@@ -743,6 +755,7 @@ server = Bun.serve({
       chatService,
       getWorkspaceCredential: () => watchSession.getTerminalToken(),
       basePath: E2E_BASE_PATH,
+      childPolicy: childPolicy?.basePath === E2E_BASE_PATH ? childPolicy : undefined,
       // A hub owns its origin root, as production's child invocation declares.
       ...(E2E_HUB_CHILD ? { manifestScope: "origin" as const } : {}),
       handleE2EReset,
@@ -859,7 +872,7 @@ const fetchFallback = buildFetchFallback({
 
 // The readiness line the spawning fixture waits for. A hub child announces
 // its prefixed session URL, the shape the hub's backend contract expects.
-console.log(E2E_HUB_CHILD ? `http://127.0.0.1:${server.port}${E2E_BASE_PATH}` : `http://127.0.0.1:${server.port}`);
+console.log(E2E_HUB_CHILD ? `http://127.0.0.1:${server.port}${E2E_BASE_PATH}${privateBootstrap ? `?t=${encodeURIComponent(watchSession.getTerminalToken())}` : ""}` : `http://127.0.0.1:${server.port}`);
 
 let shuttingDown = false;
 const shutdown = async () => {

@@ -21,6 +21,9 @@ import type { CoverageAnnotations } from "../coverage-annotations";
  * V2 native background work additionally uses `session.background` (all
  * eligible parent blockers), `session.active`/`session.get`/`message.list`
  * and all synthetic `session.inbox.list` entries for read-only recovery.
+ * Verified personal Hub steering may make one `session.background` call
+ * after acknowledged native prompt/resume; it adds no job-start automation
+ * or SDK endpoint. Composite unknowns retain receipts and reconcile read-only.
  * `session.interrupt({resume:false})` targets a verified child occurrence;
  * `shell.get`/`shell.output`/`shell.remove` inspect or remove owned shell work.
  * Removal deletes output and may fail pending capture; neither shell exit nor

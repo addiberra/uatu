@@ -12,6 +12,17 @@ afterEach(() => {
 });
 
 describe("chat API client", () => {
+  test("automatic background outcomes preserve accepted primary fields on prompt and delivery actions", async () => {
+    for (const automaticBackground of ["not-needed", "accepted", "unavailable", "failed", "unknown"] as const) {
+      const client = new ChatApiClient(async () => Response.json({ messageId: "message", pending: true, delivery: "steer", configuration: {}, automaticBackground }));
+      expect(await client.prompt("opencode:parent", "request", "steer", undefined, undefined, undefined, undefined, "steer"))
+        .toEqual({ messageId: "message", pending: true, delivery: "steer", configuration: {}, automaticBackground });
+      expect(await client.changeDelivery("opencode:parent", "message", "switch", "steer")).toEqual({ messageId: "message", delivery: "steer", automaticBackground });
+      expect(await client.sendNow("opencode:parent", "message", "resume")).toEqual({ messageId: "message", delivery: "steer", automaticBackground });
+    }
+    const malformed = new ChatApiClient(async () => Response.json({ messageId: "message", delivery: "steer", automaticBackground: "finished-all-workers" }));
+    await expect(malformed.sendNow("opencode:parent", "message", "resume")).rejects.toBeInstanceOf(ChatTransportError);
+  });
   test("explicit backgrounding uses the qualified base path and never replays an unknown response", async () => {
     Reflect.set(globalThis, "document", { querySelector: () => ({ getAttribute: () => "/s/work/" }) });
     resetAppBasePathForTests();

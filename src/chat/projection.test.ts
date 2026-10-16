@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { ChatEvent, ConversationSnapshot } from "./types";
 import { ConversationProjection } from "./adapter";
-import { addAcceptedDraft, applyChatEvent, confirmAcceptedDraft, dropQueuedMessage, noteQueuedMessage, prependSnapshot, projectionFromSnapshot, refreshFromSnapshot } from "./projection";
+import { addAcceptedDraft, applyChatEvent, confirmAcceptedDraft, dropQueuedMessage, noteQueuedMessage, prependSnapshot, projectionFromSnapshot, refreshFromSnapshot, markDraftUnconfirmed } from "./projection";
 import { ConversationReplay } from "./replay";
 import { contextReadout } from "./context-readout";
 
@@ -15,6 +15,15 @@ const snapshot = (items: ConversationSnapshot["items"] = []): ConversationSnapsh
 });
 
 describe("chat projection", () => {
+  test("unconfirmed input stays read-only through refresh until native identity/request evidence reconciles it", () => {
+    const draft = { requestId: "request", messageId: "pending:request", text: "keep text", attachments: [{ id: "attachment", name: "image.png", mimeType: "image/png" }] };
+    const initial = addAcceptedDraft(projectionFromSnapshot(snapshot()), draft);
+    const unknown = markDraftUnconfirmed(initial, "request");
+    expect(unknown.acceptedDrafts).toEqual([{ ...draft, unconfirmed: true }]);
+    const refreshed = projectionFromSnapshot(snapshot(), unknown.acceptedDrafts);
+    expect(refreshed.acceptedDrafts).toEqual(unknown.acceptedDrafts);
+    expect(projectionFromSnapshot({ ...snapshot(), queued: [{ id: "native", requestId: "request", text: "keep text", delivery: "steer", queuedAt: 1 }] }, refreshed.acceptedDrafts).acceptedDrafts).toEqual([]);
+  });
   test("a window correction survives replay duplicates and snapshot recovery without replacing usage", () => {
     const usage = { id: "usage", type: "assistant_message" as const, markdown: "", createdAt: 2, usage: { input: 250_000 }, model: { providerId: "anthropic", modelId: "opus" }, contextKey: "q1" };
     const initial = projectionFromSnapshot(snapshot([usage]));

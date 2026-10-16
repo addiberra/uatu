@@ -15,6 +15,7 @@ import { PWA_ICON_VERSION } from "../pwa/icons";
 import { worktreeDialogScript } from "../shell/worktree-dialog";
 import { createDashboardGroups, dashboardGroupsStyle } from "./dashboard-groups";
 import { agentAccountsPaneStyle, createAgentAccountsPane } from "./agent-accounts-pane";
+import { createPersonalChatPreferencesPane } from "./personal-chat-preferences-pane";
 import { LOCAL_CREDENTIAL_ASSIGNMENT_WARNING, SCP_REMOTE_PATTERN } from "./credential-presentation";
 
 // Inline the brand SVG (the file ships a fixed navy fill; the dark-scheme
@@ -255,6 +256,9 @@ const SHARED_STYLE = `
   .form-stack label > input, .form-stack label > textarea, .form-stack label > select { display: block; margin-top: 0.2rem; }
   .choice-row { display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: center; }
   .choice-row label { display: inline-flex; gap: 0.35rem; align-items: center; color: var(--text-strong); }
+  #personal-chat-preferences-form .choice-row { flex-wrap: nowrap; }
+  #personal-chat-auto-background { width: 2.75rem; height: 2.75rem; min-width: 2.75rem; margin: 0; }
+  #personal-chat-preferences-form button { min-width: 2.75rem; min-height: 2.75rem; }
   .credential-create { border-top: 1px solid var(--border-soft); }
   .credential-create summary { cursor: pointer; padding: 0.6rem 1rem; font-size: 0.78rem; font-weight: 600; }
   .credential-card { border-bottom: 1px solid var(--border-soft); }
@@ -688,7 +692,18 @@ function authenticatedPage(pageName: AuthenticatedPage, authenticatedUser: strin
   <div id="agent-accounts"><p class="empty">Checking agent logins…</p></div>
 </section>
 `;
-  const settings = `${credentials}${agentAccounts}<section class="pane">
+  const personalChat = `<section class="pane" id="personal-chat-preferences-pane">
+  <div class="pane-header"><h2>Personal chat preferences</h2></div>
+  <form id="personal-chat-preferences-form" class="form-stack">
+    <p class="row-detail">For your account on this Hub, across devices and workspaces; not other users. This does not change machine-wide agent logins or workspace defaults.</p>
+    <label class="choice-row"><input id="personal-chat-auto-background" type="checkbox" disabled aria-describedby="personal-chat-preferences-help" /> Automatically background blocking work when steering</label>
+    <p id="personal-chat-preferences-help" class="row-detail">Default ON. After accepted steer actions (including Queue → Steer, Send now and submitted replacements), not job starts, all eligible blocking jobs, including shell commands, can continue without being stopped. Shared workspace effects are visible to other users, without changing their preferences. Native resume may cancel blockers first; backgrounding is not atomic or a guarantee of immediate delivery. Standalone keeps explicit Continue.</p>
+    <p id="personal-chat-preferences-status" class="row-detail" role="status">Loading…</p>
+    <p id="personal-chat-preferences-error" class="local-error" role="alert" hidden></p>
+    <div><button type="submit" class="primary" disabled>Save chat preference</button></div>
+  </form>
+</section>`;
+  const settings = `${personalChat}${credentials}${agentAccounts}<section class="pane">
   <div class="pane-header"><h2>Workspace defaults</h2></div>
   <form id="workspace-defaults-form" class="form-stack">
     <p id="workspace-defaults-status" class="row-detail" style="margin: 0;">Loading…</p>
@@ -723,6 +738,7 @@ const dashboardGroupsStyle = document.createElement("style");
 dashboardGroupsStyle.textContent = ${JSON.stringify(dashboardGroupsStyle)};
 document.head.append(dashboardGroupsStyle);
 const createAgentAccountsPane = ${createAgentAccountsPane.toString()};
+const createPersonalChatPreferencesPane = ${createPersonalChatPreferencesPane.toString()};
 const agentAccountsStyle = document.createElement("style");
 agentAccountsStyle.textContent = ${JSON.stringify(agentAccountsPaneStyle)};
 document.head.append(agentAccountsStyle);
@@ -2718,6 +2734,7 @@ function initWorkspaceDefaults() {
 }
 function initSettingsPage() {
   initSharedUidAdvisory();
+  createPersonalChatPreferencesPane(document, window).start();
   initWorkspaceDefaults();
   const agentAccountsPane = createAgentAccountsPane();
   agentAccountsPane.start();

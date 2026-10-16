@@ -58,7 +58,9 @@ function projectionWith(items: ConversationItem[], overrides: Partial<ChatProjec
 for (const name of ["subagent", "shell"]) test(`${name} result follows its launcher even when the worker start timestamp predates the tool row`, () => {
   const host = dom.document.createElement("div") as unknown as HTMLElement;
   const worker: ConversationItem = { id: "task:worker", type: "background_task", taskId: "worker", createdAt: 1, description: "Fixture work", taskType: name === "shell" ? "shell" : "agent", toolUseId: "launch", status: "completed", summary: "Canonical report" };
-  const launcher: ConversationItem = { id: "tool:launch", type: "tool", createdAt: 2, name, status: "completed", input: "{}" };
+  const launcher: ConversationItem = name === "shell"
+    ? { id: "tool:launch", type: "command", createdAt: 2, command: "fixture", status: "completed" }
+    : { id: "tool:launch", type: "tool", createdAt: 2, name, status: "completed", input: "{}" };
   new TimelineRenderer().render(host, projectionWith([worker, launcher]), new Set(["task:worker"]));
   const ids = Array.from(host.querySelectorAll("[data-chat-item-id]")).map(node => node.getAttribute("data-chat-item-id"));
   expect(ids.indexOf("tool:launch")).toBeLessThan(ids.indexOf("task:worker"));
@@ -514,6 +516,14 @@ describe("TimelineRenderer", () => {
 
     renderer.render(host, projectionWith([]), new Set());
     expect(host.querySelector('[data-chat-item-id="draft-r1"]')).toBeNull();
+  });
+
+  test("unconfirmed inputs retain their text without claiming sending or delivery", () => {
+    const host = target();
+    new TimelineRenderer().render(host, projectionWith([], { status: "idle", acceptedDrafts: [{ requestId: "uncertain", messageId: "pending:uncertain", text: "Keep this text", unconfirmed: true }] }), new Set());
+    expect(host.textContent).toContain("Keep this text");
+    expect(host.textContent).toContain("Acceptance unconfirmed");
+    expect(host.textContent).not.toMatch(/Sending|Delivered|Working/);
   });
 
   test("switching conversations clears the previous timeline", () => {
@@ -992,9 +1002,54 @@ describe("presentation details", () => {
   });
 
   describe("the queue dock under steering (opencode-v2-steering D10)", () => {
+    test("unconfirmed entries expose no resend/edit/remove or batch resume action", () => {
+      const host = target();
+      new QueueDockRenderer().render(host, [{ id: "uncertain", text: "Keep text", queuedAt: 1, delivery: "steer", paused: true, unconfirmed: true }], { steering: true, sendNow: true, running: false, isCommand: () => false });
+      expect(host.textContent).toContain("Acceptance unconfirmed");
+      expect(host.querySelectorAll("button")).toHaveLength(0);
+    });
     const queued = (overrides: Partial<import("./types").QueuedMessage> & { id: string }): import("./types").QueuedMessage => ({ text: overrides.id, queuedAt: 1, delivery: "queue", ...overrides });
     const steering = { steering: true, sendNow: true, running: true, isCommand: (text: string) => text.startsWith("/") };
     const actions = (node: Element) => [...node.querySelectorAll("button")].map(button => button.textContent?.trim());
+
+    test("duplicate text and image-only actions have stable human-readable discriminators", () => {
+      const host = target();
+      const dock = new QueueDockRenderer();
+      const entries = [queued({ id: "first", text: "Same prompt" }), queued({ id: "second", text: "Same prompt" }), queued({ id: "image-a", text: "" }), queued({ id: "image-b", text: "" })];
+      dock.render(host, entries, steering);
+      const labels = () => [...host.querySelectorAll("[data-queue-remove]")].map(node => node.getAttribute("aria-label"));
+      expect(labels()).toEqual(["Remove “Same prompt”, pending message 1", "Remove “Same prompt”, pending message 2", "Remove “Image attachment”, pending message 3", "Remove “Image attachment”, pending message 4"]);
+      dock.render(host, [entries[3]!, entries[1]!], steering);
+      expect(labels()).toEqual(["Remove “Image attachment”, pending message 4", "Remove “Same prompt”, pending message 2"]);
+    });
+
+    test("dock counts pending deliveries and offers one contextual paused batch action", () => {
+      const host = target();
+      new QueueDockRenderer().render(host, [queued({ id: "a", text: "First", delivery: "steer", paused: true }), queued({ id: "b", text: "Second", delivery: "steer", paused: true }), queued({ id: "c", text: "Later" })], steering);
+      expect(host.querySelector(".chat-queue-header")?.textContent).toContain("3 pending · 2 steers · 1 queued");
+      expect(host.querySelectorAll("[data-queue-send-now]")).toHaveLength(1);
+      expect(host.querySelector("[data-queue-send-now]")?.textContent).toBe("Send 2 paused steers now");
+      expect(host.querySelector('[data-queue-remove="a"]')?.getAttribute("aria-label")).toBe("Remove “First”");
+      expect(host.querySelector('[data-chat-queued-id="a"] .chat-queued-badge')?.textContent).toBe("Steer");
+      expect(host.querySelector('[data-chat-queued-id="a"] .chat-queued-paused')?.textContent).toBe("Paused");
+      expect(host.querySelector('[data-chat-queued-id="c"]')?.textContent).toContain("After this turn");
+    });
+
+    test("compact pending details collapse independently of replacement and paused batch safety", () => {
+      const host = target();
+      const note = document.createElement("p"); host.append(note);
+      const dock = new QueueDockRenderer();
+      const entries = [queued({ id: "a", text: "First", delivery: "steer", paused: true }), queued({ id: "b", text: "Second", delivery: "steer", paused: true })];
+      dock.render(host, entries, { ...steering, note, replacement: true, compactOpen: false });
+      expect(host.querySelector("[data-pending-toggle]")?.getAttribute("aria-expanded")).toBe("false");
+      expect(host.querySelector<HTMLElement>(".chat-queue-items")?.hidden).toBe(true);
+      expect(note.hidden).toBe(false);
+      expect(note.textContent).toContain("2 pending steers will be delivered together with your replacement");
+      expect(host.querySelector(".chat-queue-header [data-queue-send-now]")?.textContent).toBe("Send 2 paused steers now");
+      dock.render(host, entries, { ...steering, note, replacement: true, compactOpen: true });
+      expect(host.querySelector<HTMLElement>(".chat-queue-items")?.hidden).toBe(false);
+      expect(host.querySelector("[data-pending-toggle]")?.getAttribute("aria-expanded")).toBe("true");
+    });
 
     test("steers render before queued entries, labelled, with a paused note, and the model note shows only while a steer is pending", () => {
       const dock = new QueueDockRenderer();
@@ -1006,9 +1061,9 @@ describe("presentation details", () => {
       expect(entries.map(entry => entry.classList.contains("is-held"))).toEqual([false, true, false]);
       expect(entries.map(entry => entry.classList.contains("is-steer"))).toEqual([true, false, true]);
       expect(entries.map(entry => entry.querySelector(".chat-queued-tag")?.textContent)).toEqual([
-        expect.stringMatching(/^Steer\b/),
-        expect.stringMatching(/^Queue\b.*paused/i),
-        expect.stringMatching(/^Steer\b.*paused/i),
+        "Next step",
+        "Sends after your next message",
+        "Sends after your next message",
       ]);
       expect(entries.map(entry => entry.hasAttribute("data-paused"))).toEqual([false, true, true]);
       expect(note.hidden).toBe(false);
@@ -1027,13 +1082,13 @@ describe("presentation details", () => {
       const entry = (id: string) => host.querySelector(`[data-chat-queued-id="${id}"]`)!;
       // A steering agent while the turn runs.
       dock.render(host, [queued({ id: "held-1", text: "later" }), queued({ id: "held-2", text: "/review all" }), queued({ id: "msg_1", text: "steer", delivery: "steer" }), queued({ id: "msg_2", text: "stranded", delivery: "steer", paused: true })], steering);
-      expect(actions(entry("held-1"))).toEqual(["Steer", "Edit", "Remove"]);
+      expect(actions(entry("held-1"))).toEqual(["Steer + paused steers", "Edit", "Remove"]);
       expect(entry("held-1").querySelector("[data-queue-steer='held-1']")).not.toBeNull();
       expect(actions(entry("held-2"))).toEqual(["Edit", "Remove"]);
       expect(actions(entry("msg_1"))).toEqual(["Queue", "Edit", "Remove"]);
       expect(entry("msg_1").querySelector("[data-queue-queue='msg_1']")).not.toBeNull();
-      expect(actions(entry("msg_2"))).toEqual(["Send now (all paused steers)", "Queue", "Edit", "Remove"]);
-      expect(entry("msg_2").querySelector("[data-queue-send-now='msg_2']")).not.toBeNull();
+      expect(actions(entry("msg_2"))).toEqual(["Queue", "Edit", "Remove"]);
+      expect(host.querySelector(".chat-queue-header [data-queue-send-now='msg_2']")).not.toBeNull();
       // The same agent at rest (dormant or idle): a queued message is sent
       // now, which steers it; a command still cannot be steered.
       dock.render(host, [queued({ id: "held-1", text: "later", paused: true }), queued({ id: "held-2", text: "/review all", paused: true })], { ...steering, running: false });

@@ -1,0 +1,567 @@
+import type { APIRequestContext, Page, TestInfo } from "@playwright/test";
+import { expect, test as base } from "./fixtures";
+import { withEngineBrowsers } from "./page-diagnostics";
+import { evidencePath, recordEvidence, saveEvidence } from "./evidence";
+import { openChatPanel } from "./chat-helpers";
+
+const test = withEngineBrowsers(base);
+
+async function captureScreenshot(page: Page, testInfo: TestInfo, name: string) {
+  await page.evaluate(() => document.fonts.ready);
+  const target = evidencePath(testInfo, `${name}.png`);
+  await page.screenshot({ path: target, animations: "disabled", caret: "hide" });
+  await recordEvidence(testInfo, target);
+}
+
+async function control(request: APIRequestContext, body: Record<string, unknown>) {
+  const response = await request.post("/__e2e/chat", { data: { action: "opencode", ...body } });
+  expect(response.ok()).toBe(true);
+  return response.json();
+}
+
+async function fakeViewport(page: Page) {
+  await page.addInitScript(size => {
+    const viewport = Object.assign(new EventTarget(), { height: size.height, width: size.width, offsetTop: 0, offsetLeft: 0, scale: 1, pageTop: 0 });
+    Object.defineProperty(window, "visualViewport", { configurable: true, value: viewport });
+  }, page.viewportSize()!);
+}
+
+async function visualHeight(page: Page, height: number) {
+  await page.evaluate(height => {
+    const viewport = window.visualViewport!;
+    Object.defineProperty(viewport, "height", { configurable: true, value: height });
+    Object.defineProperty(viewport, "width", { configurable: true, value: innerWidth });
+    viewport.dispatchEvent(new Event("resize"));
+  }, height);
+  await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+  await expect.poll(() => page.locator("#chat-surface").evaluate(element => parseFloat(element.style.getPropertyValue("--chat-visual-height"))))
+    .toBeLessThanOrEqual(height);
+}
+
+async function safeAreas(page: Page, insets: { top: number; bottom: number; left: number; right: number }) {
+  await page.route("**/*", async route => {
+    if (!["stylesheet", "script", "document"].includes(route.request().resourceType())) return route.fallback();
+    const response = await route.fetch();
+    if (!/css|javascript|html/.test(response.headers()["content-type"] ?? "")) return route.fulfill({ response });
+    const body = (await response.text()).replace(/env\(\s*safe-area-inset-(top|right|bottom|left)\s*(,[^()]*(\([^()]*\))?[^()]*)?\)/g, (_match, edge: keyof typeof insets) => `${insets[edge]}px`);
+    await route.fulfill({ response, body });
+  });
+}
+
+async function boot(page: Page, request: APIRequestContext) {
+  await request.post("/__e2e/reset");
+  await request.post("/__e2e/chat", { data: { action: "agents", stack: "opencode-v2", backgroundPreview: true } });
+  const { token } = await request.get("/__e2e/terminal-token").then(response => response.json());
+  await page.goto(`/?t=${encodeURIComponent(token)}`);
+  await expect(page.locator("#connection-state .connection-label")).toHaveText("Connected");
+  if (await page.locator("html").getAttribute("data-ui-mode") === "touch") await page.locator("#touch-tab-chat").tap();
+  else await openChatPanel(page);
+  await expect(page.locator("#chat-state")).not.toContainText("Loading chat");
+  await page.getByRole("button", { name: "New conversation", exact: true }).click();
+  await expect(page.locator("#chat-conversation-select")).not.toHaveValue("");
+  return page.locator("#chat-conversation-select").inputValue();
+}
+
+async function submit(page: Page, text: string, delivery: "steer" | "queue" = "steer") {
+  const touch = await page.locator("html").getAttribute("data-ui-mode") === "touch";
+  const activate = async (selector: string) => touch ? page.locator(selector).tap() : page.locator(selector).click();
+  await page.locator("#chat-input").fill(text);
+  const toggle = page.locator("#chat-delivery-toggle");
+  if (await toggle.isEnabled() && (await page.locator("#chat-delivery-label").textContent())?.toLowerCase() !== delivery) {
+    await activate("#chat-delivery-toggle");
+    await activate(`[data-delivery-choice="${delivery}"]`);
+  }
+  const accepted = page.waitForResponse(response => response.url().endsWith("/prompts"));
+  await activate("#chat-send");
+  expect((await accepted).ok()).toBe(true);
+  await expect(page.locator("#chat-input")).toHaveValue("");
+}
+
+async function loaded(page: Page, request: APIRequestContext) {
+  const id = await boot(page, request);
+  for (let index = 1; index <= 3; index++) {
+    await submit(page, `Question ${index}`);
+    await control(request, { op: "finish", conversationId: id, text: `Answer ${index}. ${"Readable conversation content. ".repeat(12)}` });
+    await expect(page.locator("#chat-items")).toContainText(`Answer ${index}.`);
+  }
+  await submit(page, "Start the work");
+  await submit(page, "Steer one");
+  await submit(page, "Steer two");
+  await submit(page, "Queued work", "queue");
+  await expect(page.locator(".chat-queued-message")).toHaveCount(3);
+  await control(request, { op: "launchWorker", conversationId: id, background: false });
+  await control(request, { op: "launchWorker", conversationId: id });
+  await expect(page.locator("#chat-background-tasks-items [data-inspect-task]")).toHaveCount(1);
+  return id;
+}
+
+async function containedControls(page: Page, height: number) {
+  await expect.poll(() => page.locator(".chat-header").evaluate(element => element.getBoundingClientRect().top)).toBeGreaterThanOrEqual(0);
+  for (const id of ["chat-send", "chat-delivery-toggle", "chat-stop"]) {
+    const control = page.locator(`#${id}`);
+    await expect(control).toBeVisible();
+    await expect.poll(() => control.evaluate(element => element.getBoundingClientRect().bottom)).toBeLessThanOrEqual(height);
+    const box = (await control.boundingBox())!;
+    expect(box.height).toBeGreaterThanOrEqual(44);
+    expect(await control.evaluate(element => { const b = element.getBoundingClientRect(); const hit = document.elementFromPoint(b.x + b.width / 2, b.y + b.height / 2); return hit === element || element.contains(hit); })).toBe(true);
+  }
+  expect(await page.locator("#chat-surface").evaluate(element => element.scrollTop)).toBe(0);
+}
+
+for (const engine of ["chromium", "webkit"] as const) test.describe(`mobile layout ${engine}`, () => {
+  test("compact disclosures retain deliberate state and leave safety outside the collapse", async ({ page, request }, testInfo) => {
+    const id = await loaded(page, request);
+    const pending = page.locator("[data-pending-toggle]");
+    const workers = page.locator("#chat-compact-workers");
+    await expect(pending).toHaveText("3 pending · 2 steers · 1 queued");
+    await expect(pending).toHaveAttribute("aria-expanded", "false");
+    await expect(page.locator("#chat-queue-items")).toBeHidden();
+    await expect(workers).not.toHaveAttribute("open");
+    await expect(page.locator("#chat-compact-workers-label")).toHaveText("2 working · 0 finished");
+    await pending.tap();
+    await workers.locator(":scope > summary").tap();
+    await expect(page.locator("#chat-queue-items")).toBeVisible();
+    await expect(workers).toHaveAttribute("open");
+    await page.getByRole("button", { name: "New conversation", exact: true }).tap();
+    await expect(page.locator("#chat-conversation-select")).not.toHaveValue(id);
+    await page.locator("#chat-conversation-select").selectOption(id);
+    await expect(pending).toHaveAttribute("aria-expanded", "true");
+    await expect(workers).toHaveAttribute("open");
+    await pending.tap();
+    await workers.locator(":scope > summary").tap();
+    const reverted = page.waitForResponse(response => response.url().endsWith("/revert"));
+    await page.locator("#chat-items").getByRole("button", { name: "Revert message", exact: true }).last().tap();
+    expect((await reverted).ok()).toBe(true);
+    await expect(page.locator("#chat-queue-items")).toBeHidden();
+    await expect(page.locator("#chat-queue-note")).toContainText("delivered together with your replacement");
+    await expect(page.getByRole("button", { name: "Send 2 paused steers now", exact: true })).toBeVisible();
+    await captureScreenshot(page, testInfo, `mobile-${engine}-compact-disclosures`);
+  });
+
+  test("touch options owns one layer, consumes outside taps, and hands off to the single picker", async ({ page, request }) => {
+    await loaded(page, request);
+    const options = page.locator("#chat-options-toggle");
+    const menu = page.locator("#chat-options-menu");
+    await page.locator("#chat-input").fill("Keep this draft");
+    await page.locator("#chat-input").focus();
+    await options.tap();
+    await expect(menu).toBeVisible();
+    await expect(options).toHaveAttribute("aria-expanded", "true");
+    const send = (await page.locator("#chat-send").boundingBox())!;
+    await page.touchscreen.tap(send.x + send.width / 2, send.y + send.height / 2);
+    await expect(menu).toBeHidden();
+    await expect(page.locator("#chat-input")).toHaveValue("Keep this draft");
+    await options.tap();
+    await page.locator("#chat-options-configuration").tap();
+    await expect(menu).toBeHidden();
+    await expect(page.locator("#chat-configuration-dialog")).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(page.locator("#chat-configuration-dialog")).toBeHidden();
+    await expect(options).toBeFocused();
+    await options.click();
+    await page.keyboard.press("Escape");
+    await expect(menu).toBeHidden();
+    await expect(options).toBeFocused();
+  });
+
+  for (const enlarged of [false, true]) test(`expanded compact dock and options retain target and visual bounds${enlarged ? " with enlarged text" : ""}`, async ({ page, request }, testInfo) => {
+    await loaded(page, request);
+    await page.locator("#chat-input").blur();
+    if (enlarged) await page.addStyleTag({ content: "html { font-size: 200% !important; }" });
+    await page.locator("[data-pending-toggle]").tap();
+    await page.locator("#chat-compact-workers > summary").tap();
+    await expect(page.locator("#chat-queue-items")).toBeVisible();
+    const dock = await page.locator("#chat-work-dock").boundingBox();
+    const band = await page.locator("#chat-surface").evaluate(element => parseFloat(element.style.getPropertyValue("--chat-visual-height")));
+    await saveEvidence(testInfo, `compact-${engine}-${enlarged ? "enlarged" : "standard"}-bounds.json`, JSON.stringify(await page.evaluate(() => Object.fromEntries(["chat-surface", "chat-composer", "chat-work-dock", "chat-options-toggle", "chat-send", "chat-delivery-toggle", "chat-stop"].map(id => {
+      const node = document.getElementById(id)!;
+      const rect = node.getBoundingClientRect(); const style = getComputedStyle(node);
+      return [id, { x: rect.x, y: rect.y, width: rect.width, height: rect.height, maxHeight: style.maxHeight, minHeight: style.minHeight, available: style.getPropertyValue("--chat-work-available") }];
+    }))), null, 2));
+    await captureScreenshot(page, testInfo, `compact-${engine}-${enlarged ? "enlarged" : "standard"}-expanded`);
+    expect(dock!.height).toBeLessThanOrEqual(band * 0.35 + 1);
+    for (const id of ["chat-options-toggle", "chat-send", "chat-delivery-toggle", "chat-stop"]) {
+      const target = page.locator(`#${id}`);
+      const box = (await target.boundingBox())!;
+      expect(box.width).toBeGreaterThanOrEqual(44); expect(box.height).toBeGreaterThanOrEqual(44);
+      expect(box.x).toBeGreaterThanOrEqual(0); expect(box.x + box.width).toBeLessThanOrEqual(390);
+      expect(box.y + box.height).toBeLessThanOrEqual(844);
+    }
+    await page.locator("#chat-options-toggle").tap();
+    const menu = (await page.locator("#chat-options-menu").boundingBox())!;
+    expect(menu.y).toBeGreaterThanOrEqual(0); expect(menu.y + menu.height).toBeLessThanOrEqual(844);
+    expect(menu.x).toBeGreaterThanOrEqual(0); expect(menu.x + menu.width).toBeLessThanOrEqual(390);
+    await page.locator("#chat-options-configuration").scrollIntoViewIfNeeded();
+    const settings = (await page.locator("#chat-options-configuration").boundingBox())!;
+    expect(settings.width).toBeGreaterThanOrEqual(44); expect(settings.height).toBeGreaterThanOrEqual(44);
+    await captureScreenshot(page, testInfo, `compact-${engine}-${enlarged ? "enlarged" : "standard"}-options`);
+  });
+  test.use({ page: async ({ launchBrowser, baseURL }, use) => {
+    const browser = await launchBrowser(engine);
+    const page = await browser.newPage({ baseURL, viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true, reducedMotion: "reduce" });
+    await fakeViewport(page);
+    await use(page);
+    await browser.close();
+  } });
+
+  test("outside delivery-menu touch dismisses without activating Revert", async ({ page, request }, testInfo) => {
+    await boot(page, request);
+    await submit(page, "Start the work");
+    await page.locator("#chat-input").fill("Private draft");
+    const mutations: string[] = [];
+    page.on("request", request => { if (request.method() === "POST" && /\/(revert|undo|prompts)$/.test(request.url())) mutations.push(new URL(request.url()).pathname); });
+    await page.locator("#chat-delivery-toggle").tap();
+    await expect(page.locator("#chat-delivery-menu")).toBeVisible();
+    const revert = (await page.locator("#chat-items").getByRole("button", { name: "Revert message", exact: true }).boundingBox())!;
+    await page.touchscreen.tap(revert.x + revert.width / 2, revert.y + revert.height / 2);
+    await expect(page.locator("#chat-delivery-menu")).toBeHidden();
+    expect(mutations).toEqual([]);
+    await expect(page.locator("#chat-input")).toHaveValue("Private draft");
+    await expect(page.locator("#chat-items")).toContainText("Start the work");
+    await captureScreenshot(page, testInfo, `mobile-${engine}-outside-dismiss`);
+  });
+
+  for (const size of [{ width: 844, height: 390 }, { width: 667, height: 375 }]) test(`landscape hard limit ${size.width}x${size.height}`, async ({ page, request }, testInfo) => {
+    await loaded(page, request);
+    await page.locator("#chat-input").blur();
+    await page.setViewportSize(size);
+    await visualHeight(page, size.height);
+    await containedControls(page, size.height);
+    await captureScreenshot(page, testInfo, `mobile-${engine}-landscape-${size.width}`);
+  });
+
+  for (const height of [450, 380]) test(`portrait keyboard hard limit ${height}`, async ({ page, request }, testInfo) => {
+    await loaded(page, request);
+    await page.locator("#chat-input").focus();
+    await visualHeight(page, height);
+    await containedControls(page, height);
+    await captureScreenshot(page, testInfo, `mobile-${engine}-keyboard-${height}`);
+  });
+
+  test("keyboard keeps paused batch counts and replacement warning readable", async ({ page, request }, testInfo) => {
+    await loaded(page, request);
+    const reverted = page.waitForResponse(response => response.url().endsWith("/revert"));
+    await page.locator("#chat-items").getByRole("button", { name: "Revert message", exact: true }).last().tap();
+    expect((await reverted).ok()).toBe(true);
+    await expect(page.locator("#chat-queue-note")).toContainText("delivered together with your replacement");
+    await visualHeight(page, 380);
+    await expect(page.locator("#chat-queue")).toBeVisible();
+    await expect(page.locator(".chat-queue-header")).toContainText("3 pending");
+    const batch = page.getByRole("button", { name: "Send 2 paused steers now", exact: true });
+    await expect(batch).toBeVisible();
+    for (const selector of ["#chat-queue-note", ".chat-queue-header"]) {
+      await expect.poll(() => page.locator(selector).evaluate(element => element.getBoundingClientRect().top)).toBeGreaterThanOrEqual(0);
+      await expect.poll(() => page.locator(selector).evaluate(element => element.getBoundingClientRect().bottom)).toBeLessThanOrEqual(380);
+    }
+    expect((await batch.boundingBox())!.height).toBeGreaterThanOrEqual(44);
+    await captureScreenshot(page, testInfo, `mobile-${engine}-replacement-keyboard`);
+  });
+
+  test("editing a dock entry keeps pending counts visible while typing", async ({ page, request }, testInfo) => {
+    await loaded(page, request);
+    await page.locator("[data-pending-toggle]").tap();
+    await page.locator('[data-delivery="queue"] [data-queue-edit]').tap();
+    await expect(page.locator("#chat-input")).toHaveValue("Queued work");
+    await expect(page.locator("#chat-input")).toBeFocused();
+    await visualHeight(page, 380);
+    await expect(page.locator("#chat-queue")).toBeVisible();
+    await expect(page.locator(".chat-queue-header")).toContainText("2 pending");
+    await containedControls(page, 380);
+    await captureScreenshot(page, testInfo, `mobile-${engine}-edit-keyboard`);
+  });
+
+  for (const scene of [
+    { width: 390, height: 844, visual: 380 },
+    { width: 390, height: 844, visual: 450 },
+    { width: 844, height: 390, visual: 390 },
+    { width: 844, height: 390, visual: 230 },
+    { width: 768, height: 1024, visual: 700 },
+    { width: 1024, height: 768, visual: 500 },
+  ]) for (const expanded of [false, true]) test(`conversation budget ${scene.width}x${scene.height} visual ${scene.visual}${expanded ? " expanded" : " collapsed"}`, async ({ page, request }, testInfo) => {
+    await safeAreas(page, scene.width === 390 ? { top: 47, bottom: 34, left: 0, right: 0 } : scene.width === 844 ? { top: 0, bottom: 21, left: 47, right: 47 } : { top: 24, bottom: 20, left: 0, right: 0 });
+    await loaded(page, request);
+    if (expanded) {
+      await page.locator("#chat-input").blur();
+      await page.locator("[data-pending-toggle]").tap();
+      await page.locator("#chat-compact-workers > summary").tap();
+    }
+    await page.setViewportSize({ width: scene.width, height: scene.height });
+    if (scene.visual < scene.height) await page.locator("#chat-input").focus();
+    else await page.locator("#chat-input").blur();
+    await visualHeight(page, scene.visual);
+    await containedControls(page, scene.visual);
+    await expect(page.locator("[data-pending-toggle]")).toHaveAttribute("aria-expanded", String(expanded));
+    if (expanded) await expect(page.locator("#chat-compact-workers")).toHaveAttribute("open");
+    else await expect(page.locator("#chat-compact-workers")).not.toHaveAttribute("open");
+    await expect.poll(() => page.locator("#chat-timeline").evaluate(element => element.clientHeight)).toBeGreaterThanOrEqual(scene.visual * (scene.width === 390 || scene.width === 844 ? 0.4 : 0.35));
+    const metrics = await page.locator("#chat-surface").evaluate(element => ({ surface: element.clientHeight, scrollTop: element.scrollTop, dock: document.querySelector("#chat-work-dock")!.getBoundingClientRect().height, timeline: document.querySelector("#chat-timeline")!.getBoundingClientRect().height }));
+    const hardwareEditing = await page.locator("html").evaluate(node => node.hasAttribute("data-chat-editing") && !node.hasAttribute("data-chat-keyboard"));
+    const cap = hardwareEditing ? 0.24 : scene.width >= 768 ? 0.25 : 0.35;
+    expect(metrics.dock).toBeLessThanOrEqual(scene.visual * cap + 1);
+    await saveEvidence(testInfo, `mobile-${engine}-${scene.width}-${scene.visual}.json`, JSON.stringify(metrics, null, 2));
+    await page.locator("#chat-delivery-toggle").tap();
+    for (const choice of await page.locator("[data-delivery-choice]").all()) {
+      const box = (await choice.boundingBox())!;
+      expect(box.y).toBeGreaterThanOrEqual(0);
+      expect(box.y + box.height).toBeLessThanOrEqual(scene.visual);
+    }
+    await captureScreenshot(page, testInfo, `mobile-${engine}-${scene.width}-${scene.visual}-menu`);
+    await page.keyboard.press("Escape");
+    if (await page.locator("#chat-options-toggle").isVisible()) {
+      await page.locator("#chat-options-toggle").tap();
+      const options = (await page.locator("#chat-options-menu").boundingBox())!;
+      expect(options.y).toBeGreaterThanOrEqual(0);
+      expect(options.y + options.height).toBeLessThanOrEqual(scene.visual);
+      expect(options.x).toBeGreaterThanOrEqual(0);
+      expect(options.x + options.width).toBeLessThanOrEqual(scene.width);
+      await captureScreenshot(page, testInfo, `mobile-${engine}-${scene.width}-${scene.visual}-options`);
+    }
+    await page.keyboard.press("Escape");
+  });
+
+  test("landscape keyboard shares space with the replacement warning and paused batch", async ({ page, request }, testInfo) => {
+    await safeAreas(page, { top: 0, bottom: 21, left: 47, right: 47 });
+    await loaded(page, request);
+    const reverted = page.waitForResponse(response => response.url().endsWith("/revert"));
+    await page.locator("#chat-items").getByRole("button", { name: "Revert message", exact: true }).last().tap();
+    expect((await reverted).ok()).toBe(true);
+    await page.setViewportSize({ width: 844, height: 390 });
+    await visualHeight(page, 230);
+    await containedControls(page, 230);
+    await expect(page.locator("#chat-queue-note")).toBeVisible();
+    const batch = page.getByRole("button", { name: "Send 2 paused steers now", exact: true });
+    expect((await batch.boundingBox())!.height).toBeGreaterThanOrEqual(44);
+    await expect.poll(() => page.locator("#chat-timeline").evaluate(element => element.clientHeight)).toBeGreaterThanOrEqual(230 * 0.4);
+    await captureScreenshot(page, testInfo, `mobile-${engine}-landscape-replacement-230`);
+  });
+
+  for (const width of [667, 844]) for (const activation of ["click", "tap", "keyboard"] as const) test(`landscape Revert ${activation} activates once at ${width}px`, async ({ page, request }) => {
+    await safeAreas(page, { top: 0, bottom: 21, left: width === 844 ? 47 : 0, right: width === 844 ? 47 : 0 });
+    await loaded(page, request);
+    await page.setViewportSize({ width, height: width === 844 ? 390 : 375 });
+    await visualHeight(page, width === 844 ? 390 : 375);
+    await page.locator("#chat-input").fill("Private landscape draft");
+    const responses: number[] = [];
+    page.on("response", response => { if (response.url().endsWith("/revert")) responses.push(response.status()); });
+    const revert = page.locator("#chat-items").getByRole("button", { name: "Revert message", exact: true }).last();
+    if (activation === "keyboard") { await revert.focus(); await page.keyboard.press("Enter"); }
+    else await revert[activation]();
+    await expect.poll(() => responses).toEqual([200]);
+    await expect(page.locator("#chat-queue-note")).toContainText("delivered together with your replacement");
+    // History Revert restores the selected message as the replacement;
+    // unlike queue Edit, it does not concatenate the prior composer text.
+    await expect(page.locator("#chat-input")).toHaveValue("Start the work");
+  });
+
+  test("hardware-keyboard editing reserves bottom safe area without doubling software-keyboard inset", async ({ page, request }, testInfo) => {
+    await safeAreas(page, { top: 47, bottom: 34, left: 0, right: 0 });
+    await boot(page, request);
+    await page.locator("#chat-input").fill("Hardware keyboard draft");
+    await expect(page.locator("html")).not.toHaveAttribute("data-chat-keyboard");
+    expect(await page.locator("#chat-composer").evaluate(element => parseFloat(getComputedStyle(element).paddingBottom))).toBeGreaterThanOrEqual(34);
+    expect((await page.locator("#chat-send").boundingBox())!.y + 44).toBeLessThanOrEqual(844 - 34);
+    await captureScreenshot(page, testInfo, `mobile-${engine}-hardware-safe-area`);
+    await visualHeight(page, 450);
+    expect(await page.locator("#chat-composer").evaluate(element => parseFloat(getComputedStyle(element).paddingBottom))).toBeLessThan(10);
+    await containedControls(page, 450);
+    await captureScreenshot(page, testInfo, `mobile-${engine}-safe-hardware-to-software`);
+  });
+
+  test("loaded hardware-keyboard portrait retains forty percent conversation", async ({ page, request }, testInfo) => {
+    await safeAreas(page, { top: 47, bottom: 34, left: 0, right: 0 });
+    await loaded(page, request);
+    await page.locator("#chat-input").fill("Hardware keyboard draft");
+    await expect(page.locator("html")).not.toHaveAttribute("data-chat-keyboard");
+    await expect.poll(() => page.locator("#chat-timeline").evaluate(element => element.clientHeight)).toBeGreaterThanOrEqual(844 * 0.4);
+    await containedControls(page, 844 - 34);
+    const metrics = await page.locator("#chat-surface").evaluate(element => ({ surface: element.clientHeight, transcript: document.querySelector("#chat-timeline")!.clientHeight, dock: document.querySelector("#chat-work-dock")!.getBoundingClientRect().height, composer: document.querySelector("#chat-composer")!.getBoundingClientRect().height }));
+    await saveEvidence(testInfo, `review-${engine}-hardware-budget.json`, JSON.stringify(metrics, null, 2));
+    await captureScreenshot(page, testInfo, `review-${engine}-hardware-budget`);
+  });
+
+  test.describe("short desktop", () => {
+    test.use({ page: async ({ launchBrowser, baseURL }, use) => {
+      const browser = await launchBrowser(engine);
+      const page = await browser.newPage({ baseURL, viewport: { width: 1280, height: 720 }, reducedMotion: "reduce" });
+      await use(page);
+      await browser.close();
+    } });
+    for (const height of [600, 480]) test(`pending dock preserves Send and Stop at 1280x${height}`, async ({ page, request }, testInfo) => {
+      await boot(page, request);
+      await submit(page, "Start desktop work");
+      for (let index = 0; index < 6; index++) await submit(page, `${index}: ${"Long pending message. ".repeat(18)}`, "queue");
+      await page.setViewportSize({ width: 1280, height });
+      await containedControls(page, height);
+      const metrics = await page.locator("#chat-surface").evaluate(element => ({ surface: element.clientHeight, dock: document.querySelector("#chat-queue")!.clientHeight, transcript: document.querySelector("#chat-timeline")!.clientHeight }));
+      expect(metrics.dock).toBeLessThanOrEqual(metrics.surface * 0.4 + 1);
+      await saveEvidence(testInfo, `review-${engine}-desktop-${height}.json`, JSON.stringify(metrics, null, 2));
+      await captureScreenshot(page, testInfo, `review-${engine}-desktop-${height}`);
+    });
+  });
+
+  test("plain touch Enter inserts a newline both idle and busy; explicit modifier sends", async ({ page, request }) => {
+    await boot(page, request);
+    const input = page.locator("#chat-input");
+    await input.fill("Idle line");
+    await input.press("Enter");
+    await expect(input).toHaveValue("Idle line\n");
+    await submit(page, "Start work");
+    const prompts: string[] = [];
+    page.on("request", request => { if (request.url().endsWith("/prompts")) prompts.push(request.postData() ?? ""); });
+    await input.fill("Busy line");
+    await input.press("Enter");
+    await expect(input).toHaveValue("Busy line\n");
+    expect(prompts).toEqual([]);
+    await page.locator("#chat-delivery-toggle").tap();
+    await expect(page.locator('[data-delivery-choice="steer"]')).toContainText("Ctrl+Enter");
+    await page.keyboard.press("Escape");
+    const accepted = page.waitForResponse(response => response.url().endsWith("/prompts"));
+    await input.press("Control+Enter");
+    expect((await accepted).ok()).toBe(true);
+    await expect(input).toHaveValue("");
+  });
+
+  test("parent Stop explains its scope in the app before touch cancellation", async ({ page, request }, testInfo) => {
+    const id = await boot(page, request);
+    await submit(page, "Start parent");
+    await control(request, { op: "launchWorker", conversationId: id, background: false });
+    const detached = await control(request, { op: "launchWorker", conversationId: id });
+    const stop = page.getByRole("button", { name: "Stop parent", exact: true });
+    await stop.tap();
+    const dialog = page.getByRole("dialog", { name: "Stop parent?", exact: true });
+    await expect(dialog).toBeVisible();
+    await expect(dialog).toContainText("Detached workers continue");
+    await expect(dialog).toContainText("still-blocking");
+    await captureScreenshot(page, testInfo, `mobile-${engine}-parent-stop-scope`);
+    await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
+    expect((await control(request, { op: "state" })).calls.filter((call: string) => call.includes("/interrupt"))).toEqual([]);
+    await stop.tap();
+    const cancelled = page.waitForResponse(response => response.url().endsWith("/cancel"));
+    await dialog.getByRole("button", { name: "Stop parent", exact: true }).click();
+    expect((await cancelled).ok()).toBe(true);
+    expect((await control(request, { op: "state" })).sessions[detached.childId].running).toBe(true);
+  });
+
+  test("dock scrolling contains overscroll instead of chaining to the transcript", async ({ page, request }) => {
+    await loaded(page, request);
+    expect(await page.locator("#chat-queue").evaluate(element => getComputedStyle(element).overscrollBehaviorY)).toBe("contain");
+    expect(await page.locator("#chat-work-dock").evaluate(element => getComputedStyle(element).overscrollBehaviorY)).toBe("contain");
+  });
+
+  test("dock growth animates its bounded height and respects reduced motion", async ({ page, request }) => {
+    const id = await boot(page, request);
+    await submit(page, "Current work");
+    await page.emulateMedia({ reducedMotion: "no-preference" });
+    await expect.poll(() => page.evaluate(() => matchMedia("(prefers-reduced-motion: reduce)").matches)).toBe(false);
+    const growing = page.evaluate(() => new Promise<void>(resolve => {
+      const dock = document.querySelector("#chat-work-dock")!;
+      const observer = new ResizeObserver(() => {
+        if (dock.getAnimations().some(animation => animation.playState === "running")) {
+          observer.disconnect();
+          resolve();
+        }
+      });
+      observer.observe(dock);
+    }));
+    await control(request, { op: "launchWorker", conversationId: id });
+    await expect(page.locator("#chat-background-tasks-items [data-inspect-task]")).toHaveCount(1);
+    await growing;
+    await page.locator("#chat-work-dock").evaluate(element => Promise.all(element.getAnimations().map(animation => animation.finished)));
+    await page.emulateMedia({ reducedMotion: "reduce" });
+    await expect.poll(() => page.evaluate(() => matchMedia("(prefers-reduced-motion: reduce)").matches)).toBe(true);
+    await control(request, { op: "launchWorker", conversationId: id });
+    await expect(page.locator("#chat-background-tasks-items [data-inspect-task]")).toHaveCount(2);
+    expect(await page.locator("#chat-work-dock").evaluate(element => element.getAnimations().length)).toBe(0);
+  });
+
+  for (const motion of ["reduce", "no-preference"] as const) test(`dock growth preserves a real reading anchor and keeps deliberate bottom pinning (${motion})`, async ({ page, request }, testInfo) => {
+    await page.emulateMedia({ reducedMotion: motion });
+    const id = await boot(page, request);
+    for (let index = 1; index <= 4; index++) {
+      await submit(page, `History prompt ${index}`);
+      await control(request, { op: "finish", conversationId: id, text: `History answer ${index}. ${"Readable history sentence. ".repeat(25)}` });
+      await expect(page.locator("#chat-items")).toContainText(`History answer ${index}.`);
+    }
+    await submit(page, "Current work");
+    const timeline = page.locator("#chat-timeline");
+    await expect.poll(() => timeline.evaluate(element => element.scrollHeight - element.clientHeight - element.scrollTop)).toBeLessThanOrEqual(2);
+    await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+    const anchor = page.locator("#chat-items .chat-user-message").nth(1);
+    await anchor.evaluate(element => { const timeline = document.querySelector<HTMLElement>("#chat-timeline")!; timeline.scrollTop += element.getBoundingClientRect().top - timeline.getBoundingClientRect().top - 40; });
+    const offset = () => anchor.evaluate(element => element.getBoundingClientRect().top - document.querySelector("#chat-timeline")!.getBoundingClientRect().top);
+    await expect.poll(offset).toBeGreaterThanOrEqual(35);
+    const before = await offset();
+    // A remote worker update grows chrome without the deliberate jump to
+    // latest that submitting one's own prompt correctly requests.
+    await control(request, { op: "launchWorker", conversationId: id });
+    await expect(page.locator("#chat-background-tasks-items [data-inspect-task]")).toHaveCount(1);
+    await expect.poll(offset).toBeCloseTo(before, 0);
+    const afterGrowth = await offset();
+    await timeline.evaluate(element => {
+      const trace: unknown[] = [];
+      (window as any).__dockScrollTrace = trace;
+      const sample = (event: string) => trace.push({ event, time: performance.now(), top: element.scrollTop, client: element.clientHeight, total: element.scrollHeight, dock: document.querySelector("#chat-work-dock")!.getBoundingClientRect().height });
+      element.addEventListener("scroll", () => sample("scroll"));
+      new ResizeObserver(() => sample("resize")).observe(element);
+      sample("before-pin");
+    });
+    await timeline.evaluate(element => { element.scrollTop = element.scrollHeight; });
+    await submit(page, "Next steer while pinned");
+    await expect(page.locator(".chat-queued-message")).toHaveCount(1);
+    try {
+      await expect.poll(() => timeline.evaluate(element => element.scrollHeight - element.clientHeight - element.scrollTop)).toBeLessThanOrEqual(2);
+    } finally {
+      await saveEvidence(testInfo, `mobile-${engine}-scroll-trace-${motion}.json`, JSON.stringify(await page.evaluate(() => (window as any).__dockScrollTrace), null, 2));
+    }
+    await saveEvidence(testInfo, `mobile-${engine}-reading-anchor-${motion}.json`, JSON.stringify({ before, afterGrowth, bottomDistance: await timeline.evaluate(element => element.scrollHeight - element.clientHeight - element.scrollTop) }, null, 2));
+    await captureScreenshot(page, testInfo, `review-${engine}-bottom-pinned-${motion}`);
+  });
+
+  test("touch work controls have readable text, targets, and native-highlight-free feedback", async ({ page, request }) => {
+    await loaded(page, request);
+    for (const selector of [".chat-task-stop", ".chat-queued-action", "#chat-delivery-toggle", "[data-delivery-choice]"]) {
+      const control = page.locator(selector).first();
+      expect(await control.evaluate(element => getComputedStyle(element).getPropertyValue("-webkit-tap-highlight-color"))).toMatch(/rgba\(0, 0, 0, 0\)|transparent/);
+    }
+    expect(await page.locator(".chat-task-stop").first().evaluate(element => parseFloat(getComputedStyle(element).fontSize))).toBeGreaterThanOrEqual(13);
+    expect(await page.locator("#chat-conversation-select").evaluate(element => parseFloat(getComputedStyle(element).fontSize))).toBeGreaterThanOrEqual(16);
+    await page.locator("#chat-compact-workers > summary").tap();
+    const open = page.locator(".chat-subagent-open").first();
+    expect((await open.boundingBox())!.height).toBeGreaterThanOrEqual(44);
+    await page.locator("#chat-delivery-toggle").tap();
+    expect(await page.locator(".chat-delivery-hint").first().evaluate(element => parseFloat(getComputedStyle(element).fontSize))).toBeGreaterThanOrEqual(13);
+  });
+
+  test("expanded workers leave Stop clear of the prompt rail", async ({ page, request }) => {
+    await loaded(page, request);
+    await expect(page.locator("#chat-prompt-rail")).toBeVisible();
+    await page.locator("#chat-compact-workers > summary").tap();
+    await expect(page.locator("#chat-compact-workers")).toHaveAttribute("open", "");
+    await expect(page.locator("#chat-prompt-rail")).toBeHidden();
+    const stop = page.locator("#chat-background-tasks .chat-task-stop").first();
+    expect(await stop.evaluate(element => { const box = element.getBoundingClientRect(); return element.contains(document.elementFromPoint(box.right - 2, box.y + box.height / 2)); })).toBe(true);
+  });
+
+  test("320px dark layout wraps pending text and keeps delivery choices inside the keyboard band", async ({ page, request }, testInfo) => {
+    await loaded(page, request);
+    await submit(page, "LongPending".repeat(24), "queue");
+    await page.emulateMedia({ colorScheme: "dark" });
+    await page.setViewportSize({ width: 320, height: 568 });
+    await visualHeight(page, 568);
+    await page.locator("#chat-input").blur();
+    await expect.poll(() => page.locator("#chat-surface").evaluate(element => element.scrollWidth - element.clientWidth)).toBeLessThanOrEqual(1);
+    await captureScreenshot(page, testInfo, `mobile-${engine}-320-dark-wrap`);
+    await page.locator("#chat-input").focus();
+    await visualHeight(page, 380);
+    await containedControls(page, 380);
+    await page.locator("#chat-delivery-toggle").tap();
+    for (const choice of await page.locator("[data-delivery-choice]").all()) {
+      const box = (await choice.boundingBox())!;
+      expect(box.x).toBeGreaterThanOrEqual(0);
+      expect(box.x + box.width).toBeLessThanOrEqual(320);
+      expect(box.y).toBeGreaterThanOrEqual(0);
+      expect(box.y + box.height).toBeLessThanOrEqual(380);
+    }
+    await captureScreenshot(page, testInfo, `mobile-${engine}-320-dark-keyboard-menu`);
+  });
+});

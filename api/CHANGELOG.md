@@ -2,6 +2,34 @@
 
 Entries are ordered newest first. Every entry has Hub and workspace revisions, a compatibility classification, and migration guidance. Use `None` when no migration is required. An entry is headed `Unreleased` until the release that ships it; the release-prep step replaces that with the version tag (`v0.7.0`), so a consumer can tell which revision pair a given uatu version speaks. An additive change that lands after a pair has shipped gets its own entry under the same pair, stamped with its own release, rather than being appended to the shipped entry.
 
+## Hub 11 / Workspace 27 - Unreleased
+
+Compatibility: breaking (workspace)
+
+### Changes
+
+- Closed `QueuedMessage` payloads can carry `unconfirmed:true` when steer admission or paused-batch resume may have applied. Retain the input and attachments, suppress repeat/edit/remove/batch mutations, and recover state read-only. Inbox presence confirms admission, not a batch resume. Late acknowledgements may update visible state but never initiate a delayed background follow-up.
+- Internal same-build steer action responses can carry `automaticBackground`: `not-needed`, `accepted`, `unavailable`, `failed` or `unknown`. Primary acceptance survives partial/unknown background outcomes; accepted means only native request acknowledgement, not delivery, affected counts or worker completion.
+- Retained composite receipts are initiating-account scoped and snapshot the first policy. Accepted and primary/follow-up unknown results remain bounded by the existing 1,000-entry, 512 KiB, 15-minute in-memory receipt limits. Expiry, eviction, adapter recreation or process restart end receipt protection. Unknown handles are bounded by the existing pending dock; no durable journal or reconnect/reload mutation replay is introduced.
+- Native steer/resume unknown receipts remain retained even without automatic-policy context. Missing private child trust does not merge authenticated accounts: a separate opaque internal operation key preserves deduplication without asserting a principal or enabling automation. The original client correlation ID is preserved; degraded Hub feedback snapshots have their own bounded first-decision lifetime. Queue → Steer / Send now browser transport loss and 5xx show persistent page-local unconfirmed guidance and read-only recovery.
+
+### Migration
+
+Strict workspace payload consumers must regenerate for revision 27 and preserve the unconfirmed marker explicitly. Do not treat an uncertain action as a failed draft to resubmit. Hub revision remains 11; personal preference endpoints are additive. Policy production and compact touch integration are implemented. The degraded-receipt correction changes no public body/response fields or policy authority.
+
+## Hub 11 / Workspace 26 - Unreleased (personal chat preferences)
+
+Compatibility: additive
+
+### Changes
+
+- `hubGetPersonalChatPreferences` and `hubUpdatePersonalChatPreferences` read/save the authenticated account's chat preference across its Hub devices and workspaces, independently of operator/workspace/device state. The closed version-1 contract uses compare-revision writes; stale saves return 409 with only that account's current state. Responses are no-store.
+- Missing records default ON; corrupt/unreadable/unsupported persisted state is unavailable and never silently resets saved OFF. Cookie mutations require same origin; caller-selected identity is not supported.
+
+### Migration
+
+None. These are new operations; existing wire contracts and revision identities are unchanged. Automatic dispatch integration is separate from preference persistence.
+
 ## Hub 11 / Workspace 26 - Unreleased
 
 Compatibility: breaking (workspace)

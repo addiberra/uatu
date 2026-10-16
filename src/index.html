@@ -818,6 +818,11 @@
             <button id="chat-requests-jump" class="chat-requests-jump" type="button" hidden></button>
           </div>
           <nav id="chat-prompt-rail" class="chat-prompt-rail" aria-label="Jump to a prompt" hidden></nav>
+          <div id="chat-work-dock" class="chat-work-dock">
+          <details id="chat-compact-workers" class="chat-task-list chat-compact-workers" hidden>
+            <summary id="chat-compact-workers-label"></summary>
+            <div id="chat-compact-workers-items"></div>
+          </details>
           <details id="chat-subagents" class="chat-task-list chat-subagents" hidden>
             <summary><span id="chat-subagents-label"></span><button id="chat-subagents-dismiss" class="chat-track-dismiss" type="button" hidden>Dismiss finished</button></summary>
             <ul id="chat-subagents-items"></ul>
@@ -830,8 +835,8 @@
                live task with a stop control. Settled tasks leave this list
                and take a row in the timeline instead. -->
           <section id="chat-background-action" class="chat-background-action" hidden>
-            <button id="chat-continue-workers" type="button" aria-describedby="chat-background-explanation">Continue while workers run</button>
-            <p id="chat-background-explanation">Moves all eligible blocking jobs in this conversation to the background, including shell commands. It does not stop them.</p>
+            <button id="chat-continue-workers" class="chat-secondary-button" type="button" aria-describedby="chat-background-explanation" title="Moves all eligible blocking jobs, including shell commands, to the background without stopping them.">Continue while workers run</button>
+            <details class="chat-background-help"><summary>What continues?</summary><p id="chat-background-explanation">Moves all eligible blocking jobs in this conversation to the background, including shell commands. It does not stop them.</p></details>
             <p id="chat-background-feedback" role="status" aria-live="polite"></p>
           </section>
           <details id="chat-background-tasks" class="chat-task-list chat-background-tasks" hidden>
@@ -863,10 +868,18 @@
                  configuration at delivery, not the composer's staged one. -->
             <p id="chat-queue-note" class="chat-queue-note" role="note" hidden></p>
           </div>
+          </div>
           <!-- The selected agent has no usable login: said where a message
                is typed, with the way to log in (the Hub's Settings, or the
                agent's own command outside a Hub). -->
           <div id="chat-login-notice" class="chat-login-notice" role="status" hidden></div>
+          <div id="chat-delivery-backdrop" class="chat-delivery-backdrop" aria-hidden="true" hidden></div>
+          <div id="chat-options-backdrop" class="chat-options-backdrop" aria-hidden="true" hidden></div>
+          <section id="chat-options-menu" class="chat-options-menu" role="dialog" aria-label="Chat options" hidden>
+            <button id="chat-options-configuration" type="button">Chat settings</button>
+            <div id="chat-options-content"></div>
+            <p>Hub automatic backgrounding follows your personal Settings. Eligible blocking jobs include shell commands; shared work remains collaborative. Standalone uses explicit Continue.</p>
+          </section>
           <form id="chat-composer" class="chat-composer" hidden>
             <label class="sr-only" id="chat-input-label" for="chat-input">Send a message</label>
             <div id="chat-command-menu" class="chat-command-menu" role="listbox" aria-label="Slash commands" hidden></div>
@@ -875,8 +888,10 @@
             <div id="chat-attachments" class="chat-attachments" role="list" aria-label="Pending attachments" hidden></div>
             <textarea id="chat-input" rows="1" placeholder="Send a message…" aria-describedby="chat-composer-error" aria-controls="chat-command-menu" aria-expanded="false" aria-autocomplete="list"></textarea>
             <p id="chat-composer-error" class="chat-composer-error" hidden></p>
+            <p id="chat-action-feedback" class="chat-composer-error is-notice" role="status" aria-live="polite" hidden></p>
             <input id="chat-attach-input" type="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden>
             <div class="chat-composer-actions">
+              <button id="chat-options-toggle" class="chat-options-toggle" type="button" aria-label="Chat options" aria-haspopup="dialog" aria-controls="chat-options-menu" aria-expanded="false">⋯</button>
               <!-- Visible even when the selected model cannot see images (then
                    inactive, naming the model): the model choice flips often,
                    and a control that appears and disappears with it would be
@@ -921,8 +936,8 @@
                 </button>
                 <button id="chat-stop" class="chat-stop-button" type="button" aria-label="Stop response" title="Stop response" disabled>Stop</button>
                 <div id="chat-delivery-menu" class="chat-delivery-menu" role="menu" aria-label="Delivery" hidden>
-                  <button type="button" role="menuitemradio" aria-checked="true" data-delivery-choice="steer"><span class="chat-delivery-name">Steer</span><span class="chat-delivery-hint">Joins the running turn at its next step</span></button>
-                  <button type="button" role="menuitemradio" aria-checked="false" data-delivery-choice="queue"><span class="chat-delivery-name">Queue</span><span class="chat-delivery-hint">Sends when the agent is ready</span></button>
+                  <button type="button" role="menuitemradio" aria-checked="true" data-delivery-choice="steer"><span class="chat-delivery-name">Steer</span><span class="chat-delivery-shortcut">Enter</span><span class="chat-delivery-hint">Next step</span></button>
+                  <button type="button" role="menuitemradio" aria-checked="false" data-delivery-choice="queue"><span class="chat-delivery-name">Queue</span><span class="chat-delivery-shortcut">Alt+Enter</span><span class="chat-delivery-hint">After this turn</span></button>
                 </div>
               </span>
               <!-- Chips the login reports beside the status: plan utilization
@@ -1004,6 +1019,16 @@
               <figcaption id="chat-image-viewer-name" class="chat-image-viewer-name"></figcaption>
             </figure>
             <button id="chat-image-viewer-close" class="chat-image-viewer-close" type="button" aria-label="Close preview">&#x00d7;</button>
+          </dialog>
+          <dialog id="chat-action-confirm" class="chat-action-confirm" aria-labelledby="chat-action-confirm-title" aria-describedby="chat-action-confirm-body">
+            <form method="dialog">
+              <h2 id="chat-action-confirm-title"></h2>
+              <p id="chat-action-confirm-body"></p>
+              <div class="chat-action-confirm-buttons">
+                <button type="submit" class="chat-secondary-button" value="cancel" autofocus>Cancel</button>
+                <button id="chat-action-confirm-accept" type="submit" class="chat-secondary-button" value="confirm">Confirm</button>
+              </div>
+            </form>
           </dialog>
           <dialog id="chat-configuration-dialog" class="chat-configuration-dialog" aria-labelledby="chat-configuration-title">
             <div class="chat-configuration-sheet">

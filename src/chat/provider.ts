@@ -324,6 +324,8 @@ export interface ChatProvider {
    * would retarget the turn being steered (D6).
    */
   prompt(sessionId: string, input: { id: string; text: string; delivery: MessageDelivery; attachments?: ProviderAttachment[]; model?: ModelSelection; mode?: string; variant?: string }): Promise<{ messageId: string }>;
+  /** Native identity known before dispatch, for read-only unknown recovery. */
+  promptIdentity?(identity: string): string;
   /**
    * `text`, when set, is what the user's row reads as because the provider
    * sent something other than the typed command — a 2.x skill runs as a
@@ -348,7 +350,7 @@ export interface ChatProvider {
    * no option, leaves them pending (Cancel, D9). Agents without an inbox
    * ignore the option.
    */
-  interrupt(sessionId: string, options?: { resume?: boolean }): Promise<void>;
+  interrupt(sessionId: string, options?: { resume?: boolean }): Promise<void | { interrupted: boolean }>;
   /**
    * The user's steers the agent still holds for this session, in enqueue
    * order — what the adapter's pending-steer map is rebuilt from on attach
@@ -393,7 +395,7 @@ export interface ChatProvider {
   /** Scoped evidence, including terminal results and uncertain last-known rows.
    * Unlike a live-only list, absence is never an instruction to cancel a task.
    */
-  reconcileBackgroundTasks?(sessionId: string): Promise<import("./types").BackgroundTaskItem[]>;
+  reconcileBackgroundTasks?(sessionId: string, options?: { fresh?: boolean }): Promise<import("./types").BackgroundTaskItem[]>;
   backgroundBlockingWork?(sessionId: string): Promise<void>;
   /**
    * Stop one running background task; the agent reports the stop as that

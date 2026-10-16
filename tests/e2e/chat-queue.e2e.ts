@@ -31,14 +31,18 @@ test.describe("chat message queue", () => {
   test.beforeEach(async ({ page, request }) => bootChat(page, request));
 
   test("non-steering busy conversations can enqueue with visible Send without stopping", async ({ page, request }, testInfo) => {
+    await page.setViewportSize({ width: 1100, height: 900 });
     await page.getByRole("button", { name: "New conversation" }).click();
     await expect(page.locator("#chat-conversation-select")).not.toHaveValue("");
     await send(page, "Start the work");
     await expect(page.locator("#chat-stop")).toBeEnabled();
     await expect(page.locator("#chat-delivery-toggle")).toBeHidden();
+    const configuration = (await page.locator("#chat-configuration-trigger").boundingBox())!;
+    const sendGroup = (await page.locator("#chat-send-group").boundingBox())!;
+    expect(Math.abs(configuration.y + configuration.height / 2 - sendGroup.y - sendGroup.height / 2)).toBeLessThan(1);
     await page.locator("#chat-input").fill("Queue by clicking Send");
     const accepted = page.waitForResponse(response => response.url().endsWith("/prompts"));
-    await page.getByRole("button", { name: "Send message", exact: true }).click();
+    await page.getByRole("button", { name: "Queue message", exact: true }).click();
     expect((await accepted).ok()).toBe(true);
     await expect(page.locator("#chat-queue .is-held")).toContainText("Queue by clicking Send");
     await expect(page.locator("#chat-stop")).toBeEnabled();
@@ -135,7 +139,7 @@ test.describe("chat message queue", () => {
     await captureScreenshot(page, testInfo, "claude-dormant-send-now");
 
     const sent = page.waitForResponse(response => response.url().endsWith("/send-now"));
-    await held.filter({ hasText: "Send this now" }).getByRole("button", { name: "Send now", exact: true }).click();
+    await held.filter({ hasText: "Send this now" }).getByRole("button", { name: "Send now “Send this now”", exact: true }).click();
     expect((await sent).status()).toBe(200);
     await expect(page.locator("#chat-items").getByText("Send this now", { exact: true })).toHaveCount(1);
     await expect(held).toHaveText([/Held first/, /Held last/]);

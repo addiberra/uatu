@@ -81,6 +81,11 @@ const items = [
 ] as const;
 
 describe("chat domain validation", () => {
+  test("unconfirmed pending admission is an explicit true-only marker", () => {
+    const entry = { id: "held", text: "Keep text", queuedAt: 1, delivery: "queue", paused: true, unconfirmed: true } as const;
+    expect(parseQueuedMessages([entry])).toEqual([entry]);
+    for (const unconfirmed of [false, "true", null]) expect(() => parseQueuedMessages([{ ...entry, unconfirmed }])).toThrow();
+  });
   test("a permission's future-approval patterns are optional strings", () => {
     const permission = items[6];
     // Present: the agent's own pattern beside the request's resource.

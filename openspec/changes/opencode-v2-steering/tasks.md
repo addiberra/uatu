@@ -1,5 +1,16 @@
 Each slice is written test first: write the named test and watch it fail, implement until it passes, then run the module's test file. The design references (D1–D13) point to design.md.
 
+The completed tasks below retain historical implementation evidence. The later authoritative UX audit revises per-entry paused Send now to one dock batch action, named Undo warnings to counts, and responsive/menu presentation. Its additive criteria and verification live in `ux-audit-tasks.md`; current behavior is in the updated design and delta specs.
+
+## Mobile UX parity and independent-review closure — 2026-10-16
+
+- [x] Keep desktop submission keys and delivery semantics; make touch Enter a newline idle/busy, with explicit Send or Ctrl/Command+Enter and accurate menu hints. Retain cancellation/command/queue assertions.
+- [x] Bound short-desktop queues by actual panel height; share touch track budgets (35%, tablet 25%, hardware editing 24%) and retain safe-area padding. Compact keyboard/short-landscape layouts preserve submission targets, pending counts, paused-batch Send and replacement warnings while hiding routine chrome/worker tracks.
+- [x] Reproduce the animated dock bottom-pin race, then reserve final layout height before the reduced-motion-aware reveal. Retain remote reading anchors and deliberate send-to-latest behavior; do not relax positioning assertions.
+- [x] Complete ordered clean CI, four-file browser acceptance, type/build and strict validation; reconcile the independent review and actual screenshots. Evidence and physical-device gaps are recorded in `ux-audit-tasks.md` below its historical checkpoints.
+
+Latest implementation acceptance: **5,183 pass / 17 skip / 0 fail** in documented clean-tool CI; **139 browser pass** across steering, queue, background and mobile layout suites; typecheck/build pass. Lead-confirmed independent Sol High re-review closes both mobile P2s and reports **244 focused unit passes**; its fresh browser evidence verifies actual-panel budgeting, hardware transcript space, keyboard/pan geometry and twelve zero-distance pin cycles. This does not claim real-device or assistive-technology acceptance. All test artifacts remain outside OpenSpec; no product edits or publication accompany this parity update.
+
 ## 1. Wire contract and capabilities
 
 - [x] 1.1 Add tests in `src/chat/validation.test.ts`:

@@ -396,7 +396,17 @@ export class OpenCodeV2Provider implements ChatProvider {
     return normalized;
   }
 
-  reconcileBackgroundTasks(sessionId: string): Promise<import("../../types").BackgroundTaskItem[]> {
+  reconcileBackgroundTasks(sessionId: string, options?: { fresh?: boolean }): Promise<import("../../types").BackgroundTaskItem[]> {
+    if (options?.fresh) {
+      const read = () => {
+        // An older in-flight inventory is not post-action evidence. Invalidate
+        // reuse (including child execution boundaries) before the new read.
+        this.historyReuse.invalidate();
+        return this.reconcileBackgroundTasks(sessionId);
+      };
+      const previous = this.backgroundReads.get(sessionId);
+      return previous ? previous.catch(() => undefined).then(read) : read();
+    }
     const pending = this.backgroundReads.get(sessionId);
     if (pending) return pending;
     const read = this.readBackgroundTasks(sessionId).finally(() => {
@@ -746,6 +756,8 @@ export class OpenCodeV2Provider implements ChatProvider {
     await Promise.allSettled(this.backgroundReads.values());
   }
 
+  promptIdentity(identity: string): string { return stableProviderId("msg", identity); }
+
   async prompt(sessionId: string, input: { id: string; text: string; delivery: MessageDelivery; attachments?: ProviderAttachment[]; model?: ModelSelection; mode?: string; variant?: string }): Promise<{ messageId: string }> {
     this.historyReuse.invalidate(sessionId);
     // Session-level, not prompt fields: the prompt input carries neither a
@@ -767,7 +779,7 @@ export class OpenCodeV2Provider implements ChatProvider {
     // Known before the request goes out: the server can announce the row
     // before it answers, and the row must already read as a prompt's.
     this.rememberPromptId(messageId);
-    const admitted = await this.client.session.prompt({
+    const dispatch = () => this.client.session.prompt({
       sessionID: sessionId,
       id: messageId,
       text: input.text,
@@ -775,6 +787,7 @@ export class OpenCodeV2Provider implements ChatProvider {
       delivery: input.delivery,
       resume: true,
     });
+    const admitted = input.delivery === "steer" ? await this.backgroundMutation(dispatch) : await dispatch();
     if (admitted.id !== messageId) this.rememberPromptId(admitted.id);
     return { messageId: admitted.id };
   }
@@ -891,10 +904,11 @@ export class OpenCodeV2Provider implements ChatProvider {
     }
   }
 
-  async interrupt(sessionId: string, options?: { resume?: boolean }): Promise<void> {
+  async interrupt(sessionId: string, options?: { resume?: boolean }): Promise<{ interrupted: boolean }> {
     // `resume: true` wakes steer-scope input only; omitted or false wakes
     // nothing. Pending input is never deleted by an interrupt (2.0.28).
-    await this.client.session.interrupt({ sessionID: sessionId, ...(options?.resume === undefined ? {} : { resume: options.resume }) });
+    const dispatch = () => this.client.session.interrupt({ sessionID: sessionId, ...(options?.resume === undefined ? {} : { resume: options.resume }) });
+    return options?.resume === true ? await this.backgroundMutation(dispatch) : await dispatch();
   }
 
   async backgroundBlockingWork(sessionId: string): Promise<void> {
@@ -944,8 +958,8 @@ export class OpenCodeV2Provider implements ChatProvider {
     }
   }
 
-  private async backgroundMutation(operation: () => Promise<unknown>): Promise<void> {
-    try { await operation(); }
+  private async backgroundMutation<T>(operation: () => Promise<T>): Promise<T> {
+    try { return await operation(); }
     catch (error) {
       // Only explicit non-application responses are ordinary retryable errors.
       // An unknown/server/transport failure after dispatch might follow effects.

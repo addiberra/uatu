@@ -3,7 +3,7 @@ import { describe, expect, test } from "bun:test";
 import { BackgroundTasksUnsupportedError, ChatQueueFullError, CommandAttachmentsError, CommandSteeringError, ConversationRenameUnsupportedError, deriveConversationTitle, InteractionConflictError, InvalidConversationTitleError, InvalidModeSelectionError, InvalidModelSelectionError, InvalidVariantSelectionError, ChatAdapter, parseSlashCommand, QueuedMessageNotHeldError, ReversibleHistoryUnsupportedError, ScheduledWakeupsUnsupportedError, SendNowUnavailableError, SendNowUnsupportedError, SteerAlreadyDeliveredError, SteeringUnsupportedError, SteerWithdrawalUnconfirmedError, UnknownAttachmentError, UsageUnsupportedError } from "./adapter";
 import { createClaudeEventMemory, normalizeClaudeMessage } from "./claude/normalization";
 import { createProviderEventMemory, normalizeProviderEvent, normalizeProviderMessage, storedMessageUsage, storedPromptId, type ProviderEvent, type ProviderMessage } from "./opencode/v1/normalization";
-import type { ChatAgent } from "./types";
+import type { ChatAgent, ChatActionContext } from "./types";
 import type {
   InboxDelta,
   NormalizedProviderEvent,
@@ -5760,7 +5760,7 @@ describe("steering (opencode-v2-steering)", () => {
   // A fake shaped like the OpenCode 2.x agent: it declares steering and
   // send-now, keeps an inbox the adapter can list and cancel, and announces
   // inbox changes as the 2.x normalizer would — as `inbox` deltas.
-  function steering(options: { capabilities?: Array<"steering" | "send-now">; steerWithdrawTimeoutMs?: number } = {}) {
+  function steering(options: { capabilities?: Array<"steering" | "send-now" | "background-blocking-work">; steerWithdrawTimeoutMs?: number; automaticBackgroundTimeoutMs?: number; steerAdmissionTimeoutMs?: number; receiptEntries?: number; receiptBytes?: number; receiptTtlMs?: number; now?: () => number } = {}) {
     const provider = new FakeProvider();
     provider.agent = { ...provider.agent, capabilities: [...provider.agent.capabilities, ...(options.capabilities ?? ["steering", "send-now"])] };
     provider.sessions = [fixtureSession("session")];
@@ -5775,7 +5775,7 @@ describe("steering (opencode-v2-steering)", () => {
       return accepted;
     };
     let n = 0;
-    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g", id: () => `id-${++n}`, coalesceWindowMs: 1, steerWithdrawTimeoutMs: options.steerWithdrawTimeoutMs ?? 60 });
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g", id: () => `id-${++n}`, coalesceWindowMs: 1, steerWithdrawTimeoutMs: options.steerWithdrawTimeoutMs ?? 60, automaticBackgroundTimeoutMs: options.automaticBackgroundTimeoutMs, steerAdmissionTimeoutMs: options.steerAdmissionTimeoutMs, receiptEntries: options.receiptEntries, receiptBytes: options.receiptBytes, receiptTtlMs: options.receiptTtlMs, now: options.now });
     const inbox = (delta: InboxDelta, eventType = `session.inbox.${delta.kind === "pending" ? "enqueued" : delta.kind === "delivery" ? "delivery.changed" : delta.outcome}`) => {
       if (delta.kind === "settled") provider.pendingInbox = provider.pendingInbox.filter(entry => entry.id !== delta.id);
       if (delta.kind === "pending" && delta.delivery === "steer" && !provider.pendingInbox.some(entry => entry.id === delta.id)) provider.pendingInbox = [...provider.pendingInbox, { id: delta.id, text: delta.text, delivery: "steer", at: delta.at }];
@@ -5787,6 +5787,373 @@ describe("steering (opencode-v2-steering)", () => {
     return { provider, adapter, inbox, steer, queue, queued };
   }
   // The queue events a subscriber saw, as `kind:messageId`.
+  for (const outcome of ["accepted", "primary-unknown", "follow-up-unknown"] as const) {
+    for (const boundary of ["ttl", "entries", "bytes", "recreation"] as const) test(`composite ${outcome} receipt protection ends at ${boundary}, never by read-side replay`, async () => {
+      let clock = 0, backgrounds = 0;
+      const { provider, adapter: initial } = steering({ capabilities: ["steering", "send-now", "background-blocking-work"], now: () => clock,
+        ...(boundary === "entries" ? { receiptEntries: 1 } : boundary === "bytes" ? { receiptBytes: 360 } : {}),
+      });
+      let adapter = initial;
+      const prepare = () => {
+        adapter.projectionForTests("session").statusUpdate("running");
+        adapter.projectionForTests("session").apply({ kind: "upsert", item: { id: "tool:shell", type: "tool", name: "shell", status: "running", createdAt: 1 } });
+      };
+      prepare();
+      const admit = provider.prompt.bind(provider);
+      provider.prompt = async (...args) => { const result = await admit(...args); if (outcome === "primary-unknown") throw new OperationOutcomeUnknownError(); return result; };
+      Object.assign(provider, { backgroundBlockingWork: async () => { backgrounds++; if (outcome === "follow-up-unknown") throw new OperationOutcomeUnknownError(); } });
+      const context: ChatActionContext = { receiptScope: "alice", automaticBackground: "on" };
+      const send = async (id = "original") => {
+        try { return await adapter.prompt("session", id, "Retain input", undefined, undefined, undefined, undefined, "steer", context); }
+        catch (error) { expect(outcome).toBe("primary-unknown"); expect(error).toBeInstanceOf(OperationOutcomeUnknownError); return "unknown"; }
+      };
+      const first = await send();
+      expect(await send()).toEqual(first);
+      expect(provider.prompts).toHaveLength(1);
+      if (boundary === "ttl") {
+        clock = 899_999; expect(await send()).toEqual(first); expect(provider.prompts).toHaveLength(1);
+        clock = 900_000;
+      } else if (boundary === "recreation") {
+        await adapter.dispose();
+        let id = 100;
+        adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "restart-equivalent", id: () => `recreated-${++id}`, now: () => clock });
+        prepare();
+      } else await send(boundary === "bytes" ? "evict-original-".padEnd(220, "x") : "evict-original");
+      const beforeReads = provider.prompts.length;
+      await adapter.history("session");
+      const { events } = await adapter.subscribe("session"); events.cancel();
+      expect(provider.prompts).toHaveLength(beforeReads);
+      prepare();
+      await send(); // explicit repeat after protection ended; not an automatic retry
+      expect(provider.prompts).toHaveLength(boundary === "entries" || boundary === "bytes" ? 3 : 2);
+      expect(backgrounds).toBe(outcome === "primary-unknown" ? 0 : provider.prompts.length);
+      if (outcome !== "primary-unknown") {
+        const prompts = provider.prompts.length;
+        await adapter.backgroundBlockingWork("session", "fresh-explicit-continue").catch(error => { expect(error).toBeInstanceOf(OperationOutcomeUnknownError); });
+        expect(provider.prompts).toHaveLength(prompts);
+        expect(backgrounds).toBe(prompts + 1);
+      }
+      await adapter.dispose();
+    });
+  }
+  test("fresh parent history supplies a running shell before its streamed tool frame arrives", async () => {
+    const { adapter, provider } = steering({ capabilities: ["steering", "send-now", "background-blocking-work"] });
+    adapter.projectionForTests("session").statusUpdate("running");
+    provider.readMessages = async () => ({ items: [{ info: { id: "shell-message", role: "assistant", time: { created: 1 } }, parts: [{ id: "shell", type: "tool", tool: "shell", state: { status: "running", input: { command: "fixture only" } } }] } as never] });
+    let backgrounds = 0;
+    Object.assign(provider, { reconcileBackgroundTasks: async () => [], backgroundBlockingWork: async () => { backgrounds++; } });
+    const result = await adapter.prompt("session", "fresh-shell", "steer", undefined, undefined, undefined, undefined, "steer", { receiptScope: "alice", automaticBackground: "on" });
+    expect(result.automaticBackground).toBe("accepted");
+    expect(backgrounds).toBe(1);
+    await adapter.dispose();
+  });
+
+  test("standalone native steer ambiguity is retained without any automatic-policy context", async () => {
+    const { adapter, provider } = steering({ capabilities: ["steering", "background-blocking-work"] });
+    adapter.projectionForTests("session").statusUpdate("running");
+    let admissions = 0, backgrounds = 0;
+    provider.prompt = async () => { admissions++; throw new OperationOutcomeUnknownError(); };
+    Object.assign(provider, { backgroundBlockingWork: async () => { backgrounds++; } });
+    const send = () => adapter.prompt("session", "standalone-id", "Preserve unknown input", undefined, undefined, undefined, undefined, "steer");
+    await expect(send()).rejects.toBeInstanceOf(OperationOutcomeUnknownError);
+    await expect(send()).rejects.toBeInstanceOf(OperationOutcomeUnknownError);
+    expect(admissions).toBe(1); expect(backgrounds).toBe(0);
+    await adapter.dispose();
+  });
+
+  test("automatic eligibility excludes pending, generating, detached, settled and uncertain work; failed evidence preserves admission", async () => {
+    for (const kind of ["pending", "generating", "detached", "settled", "uncertain", "unavailable", "empty-race"] as const) {
+      const { adapter, provider } = steering({ capabilities: ["steering", "send-now", "background-blocking-work"] });
+      const projection = adapter.projectionForTests("session"); projection.statusUpdate("running");
+      if (kind !== "generating") projection.apply({ kind: "upsert", item: { id: "tool:call", type: "tool", name: "task", status: kind === "pending" ? "pending" : "running", createdAt: 1 } });
+      let backgrounds = 0;
+      Object.assign(provider, {
+        reconcileBackgroundTasks: async () => {
+          if (kind === "unavailable") throw new Error("read failed");
+          if (!["detached", "settled", "uncertain"].includes(kind)) return [];
+          return [{ id: "worker", type: "background_task", taskId: "worker", toolUseId: "call", description: kind, status: kind === "settled" ? "completed" : "running", foreground: kind !== "detached", stateUncertain: kind === "uncertain", createdAt: 1 }];
+        },
+        // The evidence can qualify even when the native inventory has raced
+        // to empty. Its successful no-op acknowledgement is still accepted.
+        backgroundBlockingWork: async () => { backgrounds++; },
+      });
+      const result = await adapter.prompt("session", kind, "Keep accepted input", undefined, undefined, undefined, undefined, "steer", { receiptScope: "alice", automaticBackground: "on" });
+      expect(result).toMatchObject({ pending: true, delivery: "steer", automaticBackground: kind === "unavailable" ? "unavailable" : kind === "empty-race" ? "accepted" : "not-needed" });
+      expect(backgrounds).toBe(kind === "empty-race" ? 1 : 0);
+      expect(provider.prompts).toHaveLength(1);
+      await adapter.dispose();
+    }
+  });
+
+  test("automatic policy cannot background idle sends, queue/command admissions, no-op conversions, standalone or unsupported agents", async () => {
+    for (const kind of ["idle", "queue", "command", "no-op", "standalone", "no-steering", "no-background"] as const) {
+      const capabilities = kind === "no-steering" ? ["background-blocking-work"] as const : kind === "no-background" ? ["steering"] as const : ["steering", "background-blocking-work"] as const;
+      const { adapter, provider } = steering({ capabilities: [...capabilities] });
+      let backgrounds = 0;
+      Object.assign(provider, { backgroundBlockingWork: async () => { backgrounds++; } });
+      const projection = adapter.projectionForTests("session");
+      if (kind !== "idle") projection.statusUpdate("running");
+      projection.apply({ kind: "upsert", item: { id: "tool:shell", type: "tool", name: "shell", status: "running", createdAt: 1 } });
+      const context = kind === "standalone" ? undefined : { receiptScope: "alice", automaticBackground: "on" as const };
+      const result = await adapter.prompt("session", "primary", kind === "command" ? "/review fixture" : "Fixture input", undefined, undefined, undefined, undefined, kind === "queue" ? "queue" : "steer", context);
+      if (kind === "no-op") {
+        expect(backgrounds).toBe(1);
+        const noOp = await adapter.changeDelivery("session", result.messageId, "already-steer", "steer", context);
+        expect(noOp).not.toHaveProperty("automaticBackground");
+      } else expect(result).not.toHaveProperty("automaticBackground");
+      expect(backgrounds).toBe(kind === "no-op" ? 1 : 0);
+      await adapter.dispose();
+    }
+  });
+
+  test("automatic held conversion retains attachment and message identity before follow-up and serializes parent Stop afterward", async () => {
+    const { adapter, provider } = steering({ capabilities: ["steering", "send-now", "background-blocking-work"] });
+    const stored = { id: "11111111-2222-4333-8444-555555555555", mimeType: "image/png", absolutePath: "/fixture/attachment.png" };
+    (adapter as unknown as { resolveAttachment: () => Promise<typeof stored> }).resolveAttachment = async () => stored;
+    const projection = adapter.projectionForTests("session"); projection.statusUpdate("running");
+    const held = await adapter.prompt("session", "held", "Image input", undefined, undefined, undefined, [{ id: stored.id, name: "fixture.png", mimeType: stored.mimeType }], "queue");
+    projection.apply({ kind: "upsert", item: { id: "tool:shell", type: "tool", name: "shell", status: "running", createdAt: 1 } });
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const calls: string[] = [];
+    let nativeId: string | undefined;
+    const admit = provider.prompt.bind(provider);
+    provider.prompt = async (...args) => { const accepted = await admit(...args); nativeId = accepted.messageId; calls.push("admitted"); return accepted; };
+    Object.assign(provider, { backgroundBlockingWork: async () => {
+      expect(provider.prompts[0]).toMatchObject({ id: nativeId, attachments: [expect.objectContaining({ id: stored.id })] });
+      calls.push("background"); await gate;
+    } });
+    provider.interrupt = async (_id, options) => { expect(options).toEqual({ resume: false }); calls.push("stop"); };
+    const conversion = adapter.changeDelivery("session", held.messageId, "convert", "steer", { receiptScope: "alice", automaticBackground: "on" });
+    await waitUntil(() => calls.includes("background"));
+    const stop = adapter.abort("session", "stop-after-convert");
+    expect(calls).toEqual(["admitted", "background"]);
+    release();
+    expect(await conversion).toMatchObject({ messageId: nativeId, automaticBackground: "accepted" });
+    await stop;
+    expect(calls).toEqual(["admitted", "background", "stop"]);
+    expect(provider.prompts).toHaveLength(1);
+    await adapter.dispose();
+  });
+
+  test("unknown batch resume remains unconfirmed despite inbox presence and cannot be resent under a fresh ID", async () => {
+    const { adapter, provider, steer } = steering({ capabilities: ["steering", "send-now", "background-blocking-work"] });
+    const projection = adapter.projectionForTests("session");
+    projection.statusUpdate("running");
+    const first = await steer("first", "first paused");
+    await steer("second", "second paused");
+    projection.statusUpdate("completed");
+    let resumes = 0, backgrounds = 0;
+    provider.interrupt = async () => { resumes++; throw new OperationOutcomeUnknownError(); };
+    Object.assign(provider, { backgroundBlockingWork: async () => { backgrounds++; } });
+    const context: ChatActionContext = { receiptScope: "alice", automaticBackground: "on" };
+    await expect(adapter.sendNow("session", first.messageId, "resume", context)).rejects.toBeInstanceOf(OperationOutcomeUnknownError);
+    const uncertain = await adapter.history("session");
+    expect(uncertain.queued).toHaveLength(2);
+    expect(uncertain.queued?.every(entry => entry.unconfirmed)).toBe(true);
+    await expect(adapter.sendNow("session", first.messageId, "fresh-resume", context)).rejects.toBeInstanceOf(OperationOutcomeUnknownError);
+    expect(resumes).toBe(1);
+    projection.statusUpdate("running");
+    expect((await adapter.history("session")).queued?.some(entry => entry.unconfirmed)).toBe(false);
+    expect(provider.prompts).toHaveLength(2);
+    expect(backgrounds).toBe(0);
+    await adapter.dispose();
+  });
+
+  test("unknown composer admission retains a bounded unconfirmed handle and original request identity for reload recovery", async () => {
+    const { adapter, provider } = steering({ capabilities: ["steering", "send-now", "background-blocking-work"] });
+    adapter.projectionForTests("session").statusUpdate("running");
+    provider.prompt = async () => { throw new OperationOutcomeUnknownError(); };
+    provider.listPendingInbox = async () => { throw new Error("read unavailable"); };
+    const context: ChatActionContext = { receiptScope: "alice", automaticBackground: "on" };
+    await expect(adapter.prompt("session", "original-request", "Keep this input", undefined, undefined, undefined, undefined, "steer", context)).rejects.toBeInstanceOf(OperationOutcomeUnknownError);
+    const snapshot = await adapter.history("session");
+    expect(snapshot.queued).toEqual([expect.objectContaining({ requestId: "original-request", text: "Keep this input", delivery: "steer", unconfirmed: true })]);
+    const id = snapshot.queued![0]!.id;
+    await expect(adapter.sendNow("session", id, "fresh-id", context)).rejects.toBeInstanceOf(OperationOutcomeUnknownError);
+    await expect(adapter.removeQueued("session", id, "remove-id")).rejects.toBeInstanceOf(OperationOutcomeUnknownError);
+    await adapter.dispose();
+  });
+
+  test("unknown held-to-steer admission blocks fresh-ID resend and queue release until read-only confirmation", async () => {
+    const { adapter, provider, queue } = steering({ capabilities: ["steering", "send-now", "background-blocking-work"] });
+    adapter.projectionForTests("session").statusUpdate("running");
+    const held = await queue("held", "preserve text");
+    const admit = provider.prompt.bind(provider);
+    provider.prompt = async (...args) => { await admit(...args); throw new OperationOutcomeUnknownError(); };
+    provider.listPendingInbox = async () => { throw new Error("read unavailable"); };
+    let backgrounds = 0;
+    Object.assign(provider, { backgroundBlockingWork: async () => { backgrounds++; } });
+    const context: ChatActionContext = { receiptScope: "alice", automaticBackground: "on" };
+    await expect(adapter.changeDelivery("session", held.messageId, "switch", "steer", context)).rejects.toBeInstanceOf(OperationOutcomeUnknownError);
+    await expect(adapter.sendNow("session", held.messageId, "new-id", context)).rejects.toBeInstanceOf(OperationOutcomeUnknownError);
+    await expect(adapter.removeQueued("session", held.messageId, "remove")).rejects.toBeInstanceOf(OperationOutcomeUnknownError);
+    expect(provider.prompts).toHaveLength(1);
+    const unconfirmed = await adapter.history("session");
+    expect(unconfirmed.queued).toEqual([expect.objectContaining({ id: held.messageId, text: "preserve text", unconfirmed: true })]);
+    provider.listPendingInbox = async () => provider.pendingInbox;
+    const recovered = await adapter.history("session");
+    expect(recovered.queued).toEqual([expect.objectContaining({ text: "preserve text", delivery: "steer" })]);
+    expect(recovered.queued?.[0]).not.toHaveProperty("unconfirmed");
+    expect(backgrounds).toBe(0);
+    expect(provider.prompts).toHaveLength(1);
+    await adapter.dispose();
+  });
+
+  test("primary admission unknown is retained without a second prompt or a late follow-up", async () => {
+    for (const unknown of ["transport", "timeout"] as const) {
+      const { adapter, provider } = steering({ capabilities: ["steering", "send-now", "background-blocking-work"], steerAdmissionTimeoutMs: 10 });
+      const projection = adapter.projectionForTests("session");
+      projection.statusUpdate("running");
+      projection.apply({ kind: "upsert", item: { id: "tool:shell", type: "tool", name: "shell", status: "running", createdAt: 1 } });
+      const admit = provider.prompt.bind(provider);
+      let release!: () => void, backgrounds = 0;
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      provider.prompt = async (...args) => {
+        const accepted = await admit(...args);
+        if (unknown === "transport") throw new OperationOutcomeUnknownError();
+        await gate;
+        return accepted;
+      };
+      Object.assign(provider, { backgroundBlockingWork: async () => { backgrounds++; } });
+      const context: ChatActionContext = { receiptScope: "alice", automaticBackground: "on" };
+      const send = () => adapter.prompt("session", "uncertain", "keep this text", undefined, undefined, undefined, undefined, "steer", context);
+      await expect(send()).rejects.toBeInstanceOf(OperationOutcomeUnknownError);
+      await expect(send()).rejects.toBeInstanceOf(OperationOutcomeUnknownError);
+      expect(provider.prompts).toHaveLength(1);
+      release();
+      await gate;
+      await Promise.resolve();
+      expect(backgrounds).toBe(0);
+      const snapshot = await adapter.history("session");
+      expect(snapshot.queued?.map(message => message.text)).toEqual(["keep this text"]);
+      await adapter.dispose();
+    }
+  });
+
+  test("every accepted steer transition follows once under ON and never under OFF, including one follow-up per batch resume", async () => {
+    for (const action of ["composer", "convert", "held-now", "paused-now", "replacement"] as const) for (const enabled of [true, false]) {
+      const { adapter, provider, queue, steer } = steering({ capabilities: ["steering", "send-now", "background-blocking-work"] });
+      const context: ChatActionContext = { receiptScope: "alice", automaticBackground: enabled ? "on" : "off" };
+      const projection = adapter.projectionForTests("session");
+      projection.statusUpdate("running");
+      projection.apply({ kind: "upsert", item: { id: "tool:shell", type: "tool", name: "shell", status: "running", createdAt: 1 } });
+      const calls: string[] = [];
+      const admit = provider.prompt.bind(provider);
+      provider.prompt = async (...args) => { const accepted = await admit(...args); calls.push("admit"); return accepted; };
+      Object.assign(provider, {
+        backgroundBlockingWork: async () => { calls.push("background"); },
+        // Replacement reconciliation correctly discards the old transcript.
+        // Fresh provider evidence, not that discarded tool row, qualifies.
+        reconcileBackgroundTasks: async () => [{ id: "worker:live", type: "background_task", taskId: "live", description: "Still blocking", status: "running", foreground: true, createdAt: 1 }],
+      });
+      let result: { automaticBackground?: string };
+      if (action === "composer" || action === "replacement") {
+        if (action === "replacement") {
+          provider.agent.capabilities.push("reversible-history");
+          provider.getReversibleHistoryState = async () => ({ staged: true, canUndo: false, canRedo: true, revertedMessages: [] });
+          const unchanged = async (): Promise<ReversibleHistoryResult> => ({ outcome: "nothing-to-undo", state: { staged: true, canUndo: false, canRedo: true, revertedMessages: [] } });
+          provider.undo = unchanged;
+          provider.redo = unchanged;
+          provider.revert = unchanged;
+          provider.restore = unchanged;
+        }
+        result = await adapter.prompt("session", "primary", "steer", undefined, undefined, undefined, undefined, action === "replacement" ? "queue" : "steer", context);
+      } else if (action === "paused-now") {
+        const first = await steer("first", "first paused");
+        await steer("second", "second paused");
+        projection.statusUpdate("completed");
+        calls.length = 0;
+        provider.interrupt = async (_id, options) => {
+          expect(options).toEqual({ resume: true }); calls.push("resume"); projection.statusUpdate("running");
+        };
+        result = await adapter.sendNow("session", first.messageId, "resume", context);
+        expect(provider.prompts).toHaveLength(2);
+      } else {
+        const held = await queue("held", "held input");
+        expect(calls).toEqual([]);
+        result = action === "convert" ? await adapter.changeDelivery("session", held.messageId, "convert", "steer", context)
+          : await adapter.sendNow("session", held.messageId, "send-now", context);
+      }
+      expect(calls, `${action}, policy ${enabled ? "ON" : "OFF"}`).toEqual([action === "paused-now" ? "resume" : "admit", ...(enabled ? ["background"] : [])]);
+      expect(result.automaticBackground).toBe(enabled ? "accepted" : undefined);
+      await adapter.dispose();
+    }
+  });
+
+  test("late eligibility never backgrounds after its bound, and dispatched unknown follows remain receipt-protected", async () => {
+    for (const stage of ["evidence", "background"] as const) {
+      const { adapter, provider } = steering({ capabilities: ["steering", "send-now", "background-blocking-work"], automaticBackgroundTimeoutMs: 10 });
+      adapter.projectionForTests("session").statusUpdate("running");
+      adapter.projectionForTests("session").apply({ kind: "upsert", item: { id: "tool:shell", type: "tool", name: "shell", status: "running", createdAt: 1 } });
+      let release!: () => void, backgrounds = 0;
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      if (stage === "evidence") Object.assign(provider, { reconcileBackgroundTasks: async () => { await gate; return []; } });
+      Object.assign(provider, { backgroundBlockingWork: async () => { backgrounds++; if (stage === "background") await gate; } });
+      const context = { receiptScope: "alice", automaticBackground: "on" as const };
+      const send = () => adapter.prompt("session", "bounded", "steer", undefined, undefined, undefined, undefined, "steer", context);
+      const result = await send();
+      expect(result).toMatchObject({ pending: true, delivery: "steer", automaticBackground: stage === "evidence" ? "unavailable" : "unknown" });
+      release();
+      await gate;
+      await Promise.resolve();
+      expect(await send()).toEqual(result);
+      expect(provider.prompts).toHaveLength(1);
+      expect(backgrounds).toBe(stage === "evidence" ? 0 : 1);
+      const { snapshot, events } = await adapter.subscribe("session");
+      expect(snapshot.queued?.map(message => message.text)).toEqual(["steer"]);
+      events.cancel();
+      await adapter.dispose();
+    }
+  });
+
+  test("verified personal ON follows confirmed steer acceptance once and scopes receipts to the account", async () => {
+    const { adapter, provider } = steering({ capabilities: ["steering", "send-now", "background-blocking-work"] });
+    adapter.projectionForTests("session").statusUpdate("running");
+    adapter.projectionForTests("session").apply({ kind: "upsert", item: { id: "tool:shell", type: "tool", name: "shell", status: "running", createdAt: 1 } });
+    const calls: string[] = [];
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const admit = provider.prompt.bind(provider);
+    provider.prompt = async (...args) => { const result = await admit(...args); calls.push("admitted"); await gate; calls.push("acknowledged"); return result; };
+    Object.assign(provider, { backgroundBlockingWork: async () => { calls.push("background"); } });
+    const policy: ChatActionContext = { receiptScope: "alice", automaticBackground: "on" };
+    const send = (context = policy) => adapter.prompt("session", "same-id", "steer", undefined, undefined, undefined, undefined, "steer", context);
+    const pending = send();
+    await waitUntil(() => calls.includes("admitted"));
+    expect(calls).toEqual(["admitted"]);
+    release();
+    const result = await pending;
+    expect(result).toMatchObject({ pending: true, delivery: "steer", automaticBackground: "accepted" });
+    expect(calls).toEqual(["admitted", "acknowledged", "background"]);
+    expect(await send({ ...policy, automaticBackground: "off" })).toEqual(result);
+    expect(calls).toHaveLength(3);
+    const other = await send({ ...policy, receiptScope: "bob", automaticBackground: "off" });
+    expect(other).not.toHaveProperty("automaticBackground");
+    expect(provider.prompts).toHaveLength(2);
+    expect(calls.filter(call => call === "background")).toHaveLength(1);
+    await adapter.dispose();
+  });
+
+  test("accepted steer survives automatic background refusal and missing evidence without becoming a failed prompt", async () => {
+    const { adapter, provider } = steering({ capabilities: ["steering", "send-now", "background-blocking-work"] });
+    const policy = { receiptScope: "alice", automaticBackground: "on" as const };
+    adapter.projectionForTests("session").statusUpdate("running");
+    Object.assign(provider, { backgroundBlockingWork: async () => {} });
+    const send = (id: string) => adapter.prompt("session", id, "steer", undefined, undefined, undefined, undefined, "steer", policy);
+    expect(await send("none")).toMatchObject({ pending: true, automaticBackground: "not-needed" });
+    adapter.projectionForTests("session").apply({ kind: "upsert", item: { id: "tool:shell", type: "tool", name: "shell", status: "running", createdAt: 1 } });
+    let calls = 0;
+    Object.assign(provider, { backgroundBlockingWork: async () => { calls++; throw new Error("private provider refusal details"); } });
+    const refused = await send("refused");
+    expect(refused).toMatchObject({ pending: true, delivery: "steer", automaticBackground: "failed" });
+    expect(JSON.stringify(refused)).not.toContain("private provider refusal");
+    expect(await send("refused")).toEqual(refused);
+    expect(calls).toBe(1);
+    expect(provider.prompts).toHaveLength(2);
+    await adapter.dispose();
+  });
+
   async function watchQueue(adapter: ChatAdapter): Promise<{ changes: string[]; stop: () => void }> {
     const { events } = await adapter.subscribe("session");
     const changes: string[] = [];

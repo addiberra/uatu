@@ -271,9 +271,10 @@ export class TaskInspectionPanel {
       stop.type = "button";
       stop.className = "chat-task-stop";
       stop.dataset.stopTask = task.taskId;
-      stop.textContent = stopping ? "Stopping…" : "Stop";
+      const nativeWorker = task.taskType === "agent" || task.taskType === "shell";
+      stop.textContent = stopping ? "Stopping…" : nativeWorker ? "Stop worker" : "Stop";
       stop.disabled = stopping;
-      stop.setAttribute("aria-label", `Stop ${task.description}`);
+      stop.setAttribute("aria-label", nativeWorker ? `Stop worker: ${task.description}` : `Stop ${task.description}`);
       line.append(stop);
     }
     const facts = document.createElement("div");

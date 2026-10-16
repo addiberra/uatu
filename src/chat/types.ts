@@ -172,6 +172,14 @@ export type ChatAccountChange =
 // prompting is possible, and the composer lists the wakeups with a release.
 export type ConversationStatus = "idle" | "sending" | "running" | "completed" | "interrupted" | "failed" | "background" | "retrying" | "compacting" | "scheduled";
 
+/** Server-only, verified Hub context; never included in shared replay/DTOs. */
+export type ChatActionContext = Readonly<{
+  receiptScope: string;
+  automaticBackground: "on" | "off" | "unavailable";
+}>;
+export type AutomaticBackgroundOutcome = "not-needed" | "accepted" | "unavailable" | "failed" | "unknown";
+export type AutomaticBackgroundFeedback = { automaticBackground?: AutomaticBackgroundOutcome };
+
 /** A turn is in flight: the composer offers Cancel, a new prompt is held. */
 export function isLiveConversationStatus(status: ConversationStatus | undefined): boolean {
   return status === "running" || status === "sending" || status === "retrying" || status === "compacting";
@@ -874,6 +882,8 @@ export type QueuedMessage = {
   // on its own — a held message behind a cancellation or a staged revert, or
   // a steer enqueued before the conversation last went idle (design D3).
   paused?: true;
+  // Admission/resume may have applied. Read-only reconciliation, never resend.
+  unconfirmed?: true;
   requestId?: string;
   // Attachment references held with the message; delivered exactly as
   // submitted, discarded with the message on removal.

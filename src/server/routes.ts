@@ -38,6 +38,9 @@ import type { createTerminalServer } from "../terminal/server";
 import { handleTerminalSessionsRoute } from "../terminal/sessions-route";
 import { joinBasePath, stripBasePath } from "../shared/base-path";
 import { DOCUMENT_NOT_READABLE_ERROR } from "../shared/document-errors";
+import { CHILD_POLICY_HEADER, CHAT_ACTION_BODY_BYTES, isChildPolicyAction, type readChildPolicyBootstrap } from "../hub/child-policy";
+import { CHAT_OPERATION_RECEIPT_HEADER, validChatOperationReceipt } from "../shared/chat-operation-receipt";
+import type { ChatActionContext } from "../chat/types";
 import { CHILD_CONVERSATION_OPEN_EVENT, CHILD_ACTIVITY_EVENT, CHILD_ACTIVITY_PATH } from "../shared/live-protocol";
 import { findDocument, isViewMode } from "../shared/types";
 import { parseWatchContext, type WatchContext } from "../shared/watch-context";
@@ -78,6 +81,7 @@ export type RouteAssets = {
 };
 
 type BaseDeps = {
+  childPolicy?: ReturnType<typeof readChildPolicyBootstrap>;
   assets: RouteAssets;
   // Factory rather than direct reference: the e2e harness re-creates the
   // session on every `/__e2e/reset`, so the routes must read through to the
@@ -157,6 +161,30 @@ export function buildRoutes(deps: BuildRoutesDeps): Serve.Routes<unknown, string
       : buildE2ERoutes(deps, p);
 
   return {
+    [p("/api/internal/hub-policy-proof")]: {
+      POST: async (request: Request) => {
+        if (!isAllowedOrigin(request.headers.get("origin"), new URL(request.url))) return new Response(null, { status: 403 });
+        if (!deps.childPolicy || !request.body) return new Response(null, { status: 503 });
+        const reader = request.body.getReader();
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const timeout = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("proof timeout")), 500); });
+        try {
+          let text = "", bytes = 0;
+          const decoder = new TextDecoder();
+          for (;;) {
+            const chunk = await Promise.race([reader.read(), timeout]);
+            if (chunk.done) break;
+            bytes += chunk.value.byteLength;
+            if (bytes > 1024) return new Response(null, { status: 413 });
+            text += decoder.decode(chunk.value, { stream: true });
+          }
+          const data = JSON.parse(text);
+          if (!data || Object.keys(data).join() !== "challenge" || typeof data.challenge !== "string") return new Response(null, { status: 400 });
+          return Response.json({ proof: deps.childPolicy.proof(data.challenge) }, { headers: { "cache-control": "no-store" } });
+        } catch { return new Response(null, { status: 400 }); }
+        finally { clearTimeout(timer); void reader.cancel().catch(() => undefined); }
+      },
+    },
     [p("/assets/mermaid.min.js")]: new Response(Bun.file(assets.mermaid), {
       headers: {
         "content-type": "application/javascript; charset=utf-8",
@@ -483,7 +511,7 @@ const CHAT_ID_LIMIT = 512;
 const CHAT_CURSOR_LIMIT = 2_048;
 const CHAT_PROMPT_BYTES = 64 * 1024;
 const CHAT_TITLE_BYTES = 200;
-const CHAT_BODY_BYTES = 128 * 1024;
+const CHAT_BODY_BYTES = CHAT_ACTION_BODY_BYTES;
 const CHAT_KEEPALIVE_MS = 15_000;
 const CHAT_ATTACHMENT_NAME_BYTES = 200;
 // Multipart framing around the one file field: boundaries, headers, the
@@ -938,7 +966,7 @@ function buildChatRoutes(deps: BuildRoutesDeps, p: (path: string) => string) {
       },
     },
     [p("/api/chat/conversations/:conversationId/prompts")]: {
-      POST: async (request: RouteRequest) => chatMutation(request, ["requestId", "text", "model", "mode", "variant", "attachments", "delivery"], async (id, body) => {
+      POST: async (request: RouteRequest) => chatMutation(request, ["requestId", "text", "model", "mode", "variant", "attachments", "delivery"], async (id, body, context, operationReceipt) => {
         const requestId = bodyIdentity(body, "requestId");
         if (requestId instanceof Response) return requestId;
         if (typeof body.text !== "string") return chatError(400, "text must be a string");
@@ -966,7 +994,7 @@ function buildChatRoutes(deps: BuildRoutesDeps, p: (path: string) => string) {
         // workspace decides and reports what it did.
         const delivery = parseDelivery(body.delivery);
         if (delivery instanceof Response) return delivery;
-        return run(() => deps.chatService.prompt(id, requestId, body.text as string, model, mode, variant, attachments, delivery), 202);
+        return run(() => deps.chatService.prompt(id, requestId, body.text as string, model, mode, variant, attachments, delivery, context, operationReceipt), 202);
       }),
     },
     // Multipart rather than JSON: image bytes ride the request as a file
@@ -1093,7 +1121,7 @@ function buildChatRoutes(deps: BuildRoutesDeps, p: (path: string) => string) {
         return requestId instanceof Response ? requestId : run(() => deps.chatService.removeQueued(id, messageId, requestId));
       }),
       // Switches a pending message between steer and queue (D7, D8).
-      PATCH: async (request: RouteRequest) => chatMutation(request, ["requestId", "delivery"], async (id, body) => {
+      PATCH: async (request: RouteRequest) => chatMutation(request, ["requestId", "delivery"], async (id, body, context, operationReceipt) => {
         const messageId = routeIdentity(request, "messageId");
         if (messageId instanceof Response) return messageId;
         const requestId = bodyIdentity(body, "requestId");
@@ -1101,16 +1129,16 @@ function buildChatRoutes(deps: BuildRoutesDeps, p: (path: string) => string) {
         const delivery = parseDelivery(body.delivery);
         if (delivery instanceof Response) return delivery;
         if (delivery === undefined) return chatError(400, "delivery must be steer or queue");
-        return run(() => deps.chatService.changeDelivery(id, messageId, requestId, delivery));
+        return run(() => deps.chatService.changeDelivery(id, messageId, requestId, delivery, context, operationReceipt));
       }),
     },
     // Sends a pending message now (D8).
     [p("/api/chat/conversations/:conversationId/queue/:messageId/send-now")]: {
-      POST: async (request: RouteRequest) => chatMutation(request, ["requestId"], async (id, body) => {
+      POST: async (request: RouteRequest) => chatMutation(request, ["requestId"], async (id, body, context, operationReceipt) => {
         const messageId = routeIdentity(request, "messageId");
         if (messageId instanceof Response) return messageId;
         const requestId = bodyIdentity(body, "requestId");
-        return requestId instanceof Response ? requestId : run(() => deps.chatService.sendNow(id, messageId, requestId));
+        return requestId instanceof Response ? requestId : run(() => deps.chatService.sendNow(id, messageId, requestId, context, operationReceipt));
       }),
     },
     [p("/api/chat/conversations/:conversationId/permissions/:interactionId")]: {
@@ -1198,24 +1226,54 @@ function buildChatRoutes(deps: BuildRoutesDeps, p: (path: string) => string) {
   async function chatMutation(
     request: RouteRequest,
     keys: string[],
-    operation: (id: string, body: Record<string, unknown>) => Promise<Response>,
+    operation: (id: string, body: Record<string, unknown>, context?: ChatActionContext, operationReceipt?: string) => Promise<Response>,
   ): Promise<Response> {
     const rejected = mutationGate(request);
     if (rejected) return rejected;
     const id = routeIdentity(request, "conversationId");
     if (id instanceof Response) return id;
-    const body = await parseJsonObject(request, keys);
-    return body instanceof Response ? body : operation(id, body);
+    let context: ChatActionContext | undefined;
+    let body: Record<string, unknown> | Response;
+    try {
+      body = await parseJsonObject(request, keys, text => {
+        const envelope = request.headers.get(CHILD_POLICY_HEADER);
+        if (envelope === null) return;
+        if (!deps.childPolicy) throw new Error("Hub policy trust unavailable");
+        const policy = deps.childPolicy.verify({ method: request.method, pathname: new URL(request.url).pathname, body: text }, envelope);
+        context = { receiptScope: policy.principal, automaticBackground: policy.unavailable ? "unavailable" : policy.autoBackgroundOnSteer ? "on" : "off" };
+      });
+    } catch { return chatError(403, "invalid Hub chat policy"); }
+    if (body instanceof Response) return body;
+    // This is an untrusted operation identifier, not a verified principal or
+    // policy. It never creates ChatActionContext and cannot enable automation.
+    const token = !context && isChildPolicyAction(request.method, new URL(request.url).pathname, deps.basePath ?? "/")
+      ? request.headers.get(CHAT_OPERATION_RECEIPT_HEADER) : null;
+    if (token !== null && !validChatOperationReceipt(token)) return chatError(400, "invalid operation receipt identifier");
+    return operation(id, body, context, token ?? undefined);
   }
 }
 
-async function parseJsonObject(request: Request, allowedKeys: string[]): Promise<Record<string, unknown> | Response> {
+async function parseJsonObject(request: Request, allowedKeys: string[], onText?: (text: string) => void): Promise<Record<string, unknown> | Response> {
   if (!(request.headers.get("content-type") ?? "").toLowerCase().startsWith("application/json")) {
     return chatError(415, "content-type must be application/json");
   }
   let text: string;
-  try { text = await request.text(); } catch { return chatError(400, "invalid request body"); }
-  if (Buffer.byteLength(text) > CHAT_BODY_BYTES) return chatError(413, "request body is too large");
+  const reader = request.body?.getReader();
+  try {
+    text = "";
+    let bytes = 0;
+    const decoder = new TextDecoder();
+    if (reader) for (;;) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      bytes += chunk.value.byteLength;
+      if (bytes > CHAT_BODY_BYTES) return chatError(413, "request body is too large");
+      text += decoder.decode(chunk.value, { stream: true });
+    }
+    text += decoder.decode();
+  } catch { return chatError(400, "invalid request body"); }
+  finally { if (reader) void reader.cancel().catch(() => undefined); }
+  onText?.(text);
   let value: unknown;
   try { value = text ? JSON.parse(text) : {}; } catch { return chatError(400, "invalid JSON body"); }
   if (!value || typeof value !== "object" || Array.isArray(value)) return chatError(400, "request body must be an object");

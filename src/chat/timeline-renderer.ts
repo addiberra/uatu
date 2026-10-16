@@ -173,7 +173,7 @@ export class TimelineRenderer {
     for (const result of [...visible]) {
       if (result.type !== "background_task") continue;
       const resultIndex = visible.indexOf(result);
-      const launcherIndex = visible.findLastIndex(item => item.type === "tool" && workers.get(item.id) === result);
+      const launcherIndex = visible.findLastIndex(item => (item.type === "tool" || item.type === "command") && workers.get(item.id) === result);
       if (launcherIndex <= resultIndex) continue;
       visible.splice(resultIndex, 1);
       visible.splice(launcherIndex, 0, result);
@@ -324,7 +324,7 @@ export class TimelineRenderer {
       }
       ordered.push(node);
     };
-    for (const segment of activitySegments(visible, projection.status, projection.acceptedDrafts.length > 0)) {
+    for (const segment of activitySegments(visible, projection.status, projection.acceptedDrafts.some(draft => !draft.unconfirmed))) {
       if (!segment.group) {
         for (const item of segment.items) {
           const node = nodes.get(item.id);
@@ -1108,7 +1108,7 @@ export function decorateAttachmentImages(root: HTMLElement): void {
 }
 
 function renderDraft(draft: AcceptedDraft): string {
-  const label = draft.messageId.startsWith("pending:") ? "Sending…" : "Delivered, waiting for agent history";
+  const label = draft.unconfirmed ? "Acceptance unconfirmed — refreshing status" : draft.messageId.startsWith("pending:") ? "Sending…" : "Delivered, waiting for agent history";
   return `<article class="chat-item chat-user-message is-pending" data-chat-item-id="draft-${escapeHtmlAttribute(draft.requestId)}">${renderMessageAttachments(draft.attachments)}${draft.text ? `<p>${escapeHtml(draft.text)}</p>` : ""}<small>${label}</small></article>`;
 }
 
@@ -1125,6 +1125,8 @@ export type QueueDockContext = {
   note?: HTMLElement;
   replacement?: boolean;
   pausedSteers?: number;
+  // Defined only on touch; desktop retains the established open list.
+  compactOpen?: boolean;
 };
 
 export const STEER_MODEL_NOTE = "Steers run with the conversation's model and mode as they stand when delivered.";
@@ -1132,16 +1134,11 @@ export const STEER_MODEL_NOTE = "Steers run with the conversation's model and mo
 export function pendingSteerReplacementNote(queued: readonly QueuedMessage[]): string {
   const steers = queued.filter(entry => entry.delivery === "steer");
   if (!steers.length) return "";
-  const names = steers.map(entry => {
-    const text = entry.text || "Image attachment";
-    return `“${text.length > 40 ? `${text.slice(0, 39)}…` : text}”`;
-  });
-  return `${steers.length === 1 ? "Pending steer" : "Pending steers"} ${names.join(", ")} will be delivered together with your replacement.`;
+  return `${steers.length} pending steer${steers.length === 1 ? "" : "s"} will be delivered together with your replacement.`;
 }
 
 function queuedTag(entry: QueuedMessage): string {
-  if (entry.delivery === "steer") return entry.paused ? "Steer — paused until the agent is woken" : "Steer — joins the running turn at its next step";
-  return entry.paused ? "Queue — paused" : "Queued — sends when the agent is ready";
+  return entry.paused ? "Sends after your next message" : entry.delivery === "steer" ? "Next step" : "After this turn";
 }
 
 // The entry's own actions, in rail order (switch or send first, then edit,
@@ -1150,12 +1147,11 @@ function queuedTag(entry: QueuedMessage): string {
 export function queuedActions(entry: QueuedMessage, context: QueueDockContext): Array<[string, string]> {
   const actions: Array<[string, string]> = [];
   if (entry.delivery === "steer") {
-    if (entry.paused) actions.push(["data-queue-send-now", "Send now (all paused steers)"]);
     actions.push(["data-queue-queue", "Queue"]);
   } else if (context.steering) {
     // On a steering agent, Send now IS the switch to steer (D8); a command
     // cannot go to the agent's inbox either way.
-    if (!context.isCommand(entry.text)) actions.push(context.running ? ["data-queue-steer", "Steer"] : ["data-queue-send-now", context.pausedSteers ? "Send now + paused steers" : "Send now"]);
+    if (!context.isCommand(entry.text)) actions.push(context.running ? ["data-queue-steer", context.pausedSteers ? "Steer + paused steers" : "Steer"] : ["data-queue-send-now", context.pausedSteers ? "Send now + paused steers" : "Send now"]);
   } else if (context.sendNow && !context.running) {
     actions.push(["data-queue-send-now", "Send now"]);
   }
@@ -1166,11 +1162,12 @@ export function queuedActions(entry: QueuedMessage, context: QueueDockContext): 
 // A pending message is not a timeline item: it renders in the dock above the
 // composer with its delivery label and its actions, and only becomes a
 // transcript entry when the agent delivers it.
-function renderQueued(entry: QueuedMessage, context: QueueDockContext): string {
+function renderQueued(entry: QueuedMessage, context: QueueDockContext, discriminator?: number): string {
   const id = escapeHtmlAttribute(entry.id);
   const classes = `chat-queued-message ${entry.delivery === "steer" ? "is-steer" : "is-held"}`;
-  const buttons = queuedActions(entry, context).map(([attribute, label]) => `<button type="button" class="chat-queued-action${attribute === "data-queue-remove" ? " chat-queued-remove" : ""}" ${attribute}="${id}">${escapeHtml(label)}</button>`).join("");
-  return `<article class="${classes}" role="listitem" data-chat-queued-id="${id}" data-delivery="${entry.delivery}"${entry.paused ? " data-paused" : ""}>${renderMessageAttachments(entry.attachments)}${entry.text ? `<p>${escapeHtml(entry.text)}</p>` : ""}<footer class="chat-queued-row"><small class="chat-queued-tag">${escapeHtml(queuedTag(entry))}</small><span class="chat-queued-actions">${buttons}</span></footer></article>`;
+  const message = entry.text.trim() ? entry.text : "Image attachment";
+  const buttons = (entry.unconfirmed ? [] : queuedActions(entry, context)).map(([attribute, label]) => `<button type="button" class="chat-queued-action${attribute === "data-queue-remove" ? " chat-queued-remove" : ""}" aria-label="${escapeHtmlAttribute(`${label} “${message}”${discriminator === undefined ? "" : `, pending message ${discriminator}`}`)}" ${attribute}="${id}">${escapeHtml(label)}</button>`).join("");
+  return `<article class="${classes}" role="listitem" data-chat-queued-id="${id}" data-delivery="${entry.delivery}"${entry.paused ? " data-paused" : ""}><div class="chat-queued-heading"><strong class="chat-queued-badge">${entry.delivery === "steer" ? "Steer" : "Queue"}</strong>${entry.unconfirmed ? '<span class="chat-queued-paused">Acceptance unconfirmed</span>' : entry.paused ? '<span class="chat-queued-paused">Paused</span>' : ""}<small class="chat-queued-tag">${entry.unconfirmed ? "Refreshing status; do not repeat this action" : escapeHtml(queuedTag(entry))}</small></div>${renderMessageAttachments(entry.attachments)}${entry.text ? `<p>${escapeHtml(entry.text)}</p>` : ""}<footer class="chat-queued-row"><span class="chat-queued-actions">${buttons}</span></footer></article>`;
 }
 
 /**
@@ -1181,26 +1178,53 @@ function renderQueued(entry: QueuedMessage, context: QueueDockContext): string {
  * reader has scrolled it.
  */
 export class QueueDockRenderer {
-  private readonly entries = new Map<string, { node: HTMLElement; html: string }>();
+  private readonly entries = new Map<string, { node: HTMLElement; html: string; number: number; disambiguated: boolean }>();
+  private nextPendingNumber = 0;
   private replacementWarningShown = false;
 
   render(target: HTMLElement, queued: readonly QueuedMessage[], context: QueueDockContext = { steering: false, sendNow: false, running: true, isCommand: () => false }): void {
     context = { ...context, pausedSteers: queued.filter(entry => entry.delivery === "steer" && entry.paused).length };
+    let header = target.querySelector<HTMLElement>(":scope > .chat-queue-header");
+    if (!header) {
+      header = target.ownerDocument.createElement("div");
+      header.className = "chat-queue-header";
+      target.prepend(header);
+    }
+    const steers = queued.filter(entry => entry.delivery === "steer").length;
+    const paused = queued.some(entry => entry.unconfirmed) ? undefined : queued.find(entry => entry.delivery === "steer" && entry.paused);
+    const counts = `<span>${queued.length} pending</span><span class="chat-queue-breakdown"> · ${steers} steer${steers === 1 ? "" : "s"} · ${queued.length - steers} queued</span>`;
+    const heading = context.compactOpen === undefined ? `<strong>${counts}</strong>` : `<button type="button" class="chat-pending-toggle" data-pending-toggle aria-expanded="${context.compactOpen}" aria-controls="chat-queue-items">${counts}</button>`;
+    const headerHtml = `${heading}${paused ? `<button type="button" class="chat-queued-action" data-queue-send-now="${escapeHtmlAttribute(paused.id)}">Send ${context.pausedSteers} paused steer${context.pausedSteers === 1 ? "" : "s"} now</button>` : ""}`;
+    if (header.innerHTML !== headerHtml) header.innerHTML = headerHtml;
     // The entries live in the dock's own list; the note sits beside it, so
     // the list holds list items only.
     let list = target.querySelector<HTMLElement>(":scope > .chat-queue-items");
     if (!list) {
       list = target.ownerDocument.createElement("div");
       list.className = "chat-queue-items";
+      list.id = "chat-queue-items";
       list.setAttribute("role", "list");
-      target.prepend(list);
+      header.after(list);
     }
+    list.hidden = context.compactOpen === false;
     const ordered: HTMLElement[] = [];
+    const textCounts = new Map<string, number>();
+    const accessibleText = (text: string) => text.trim().replace(/\s+/g, " ");
+    for (const entry of queued) {
+      const text = accessibleText(entry.text);
+      textCounts.set(text, (textCounts.get(text) ?? 0) + 1);
+    }
     for (const entry of queued) {
       // Rebuilt when anything shown changes — text, attachments, delivery,
       // paused state, or the actions the context allows — and kept otherwise.
-      const html = renderQueued(entry, context);
       const existing = this.entries.get(entry.id);
+      // Once disambiguated, a pending entry keeps its client-local number
+      // through reorder, delivery switches and sibling removal. State is
+      // bounded by the live dock, not a lifetime tombstone map.
+      const number = existing?.number ?? ++this.nextPendingNumber;
+      const text = accessibleText(entry.text);
+      const disambiguated = existing?.disambiguated === true || !text || (textCounts.get(text) ?? 0) > 1;
+      const html = renderQueued(entry, context, disambiguated ? number : undefined);
       if (existing && existing.html === html) {
         ordered.push(existing.node);
         continue;
@@ -1208,7 +1232,7 @@ export class QueueDockRenderer {
       const node = buildNode(html);
       decorateAttachmentImages(node);
       existing?.node.remove();
-      this.entries.set(entry.id, { node, html });
+      this.entries.set(entry.id, { node, html, number, disambiguated });
       ordered.push(node);
     }
     const live = new Set(queued.map(entry => entry.id));
@@ -1231,8 +1255,9 @@ export class QueueDockRenderer {
       const steering = queued.some(entry => entry.delivery === "steer");
       context.note.hidden = !steering;
       const replacementNote = context.replacement ? pendingSteerReplacementNote(queued) : "";
-      const note = replacementNote ? `${replacementNote} ${STEER_MODEL_NOTE}` : STEER_MODEL_NOTE;
-      if (steering && context.note.textContent !== note) context.note.textContent = note;
+      const note = `${replacementNote ? `<span class="chat-queue-replacement">${escapeHtml(replacementNote)} </span>` : ""}<span class="chat-queue-model-note">${escapeHtml(STEER_MODEL_NOTE)}</span>`;
+      context.note.classList.toggle("is-replacement", Boolean(replacementNote));
+      if (steering && context.note.innerHTML !== note) context.note.innerHTML = note;
       // The replacement warning must be visible before the user submits,
       // not buried below the entries in the dock's scrollable list.
       if (replacementNote) {
@@ -1248,6 +1273,7 @@ export class QueueDockRenderer {
 
   reset(): void {
     this.entries.clear();
+    this.nextPendingNumber = 0;
     this.replacementWarningShown = false;
   }
 }
