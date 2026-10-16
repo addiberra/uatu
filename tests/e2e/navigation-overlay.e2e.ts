@@ -1,6 +1,6 @@
 import type { Page } from "@playwright/test";
 import { expect, test } from "./fixtures";
-import { openNavigationPreferences, showSurface } from "./navigation-helpers";
+import { openNavigation, openNavigationPreferences, showSurface } from "./navigation-helpers";
 import { test as hubTest, loginHub, hubPost } from "./hub-mobile-fixtures";
 
 // Bun's development loader itself requires sessionStorage. Exercise production
@@ -346,7 +346,12 @@ test("Terminal input and unseen output survive dismissal with overlay-only contr
   await expect(page.locator(".terminal-pane-host .xterm").first()).toBeVisible();
   const session = await page.locator(".terminal-pane").first().getAttribute("data-session-id");
   const background = await page.locator(".xterm").first().evaluate(element => getComputedStyle(element).backgroundColor);
-  await expect(page.locator("#touch-tab-bar")).toHaveCSS("color", "rgb(244, 250, 255)");
+  // The bright label token belongs to inactive tabs, not the glass container's
+  // slightly cooler foreground. The selected pale pill has dark text instead.
+  await expect(page.locator("#touch-tab-bar")).toHaveCSS("color", "rgb(239, 249, 255)");
+  await expect(page.locator("#touch-tab-preview .touch-tab-label")).toHaveCSS("color", "rgb(244, 250, 255)");
+  await expect(page.locator("#touch-tab-terminal .touch-tab-label")).toHaveCSS("color", "rgb(18, 48, 73)");
+  await expect(page.locator("#touch-tab-terminal")).toHaveCSS("background-color", "rgb(199, 236, 255)");
   await page.locator(".xterm-helper-textarea").first().focus();
   await page.keyboard.type("sleep 2; echo navigation-$((21*2))");
   await page.keyboard.press("Enter");
@@ -438,14 +443,30 @@ test("keyboard and zoom viewport bounds clamp the handle and lift navigation wit
   await expect(page.locator(".app-shell")).toHaveCSS("padding-bottom", "0px");
 });
 
-test("unavailable Terminal remains a disabled fourth tab without changing other surfaces", async ({ page }) => {
-  await page.route("**/api/state", async route => {
+test("unavailable Terminal remains a disabled fourth tab without changing other surfaces", async ({ page, request }) => {
+  await request.post("/__e2e/reset");
+  // Force boot's document-context refetch instead of depending on whether a
+  // preceding test happened to persist its selection before this page opened.
+  expect((await request.patch("/api/personal-state", { data: { documentPath: "README.md", follow: false } })).ok()).toBe(true);
+  const statePaths: (string | null)[] = [];
+  let terminalCreates = 0;
+  page.on("request", request => {
+    if (new URL(request.url()).pathname === "/api/terminal/sessions" && request.method() === "POST") terminalCreates += 1;
+  });
+  // The endpoint includes contextual query parameters during resume. An exact
+  // URL glob doubled only the first read and let the enabled backend win later.
+  await page.route(url => url.pathname === "/api/state", async route => {
+    statePaths.push(new URL(route.request().url()).searchParams.get("documentPath"));
     const response = await route.fetch();
     await route.fulfill({ response, json: { ...await response.json(), terminal: "disabled" } });
   });
   await page.addInitScript(() => localStorage.setItem("uatu:presentation:v1:%2F:uatu:active-tab", "terminal"));
   await boot(page);
   await expect(page.locator("#touch-tab-terminal")).toBeDisabled();
+  expect(statePaths).toContain(null);
+  expect(statePaths).toContain("README.md");
+  await expect(page.locator(".terminal-pane")).toHaveCount(0);
+  expect(terminalCreates).toBe(0);
   await expect(page.locator("#touch-tab-bar [role=tab]")).toHaveCount(4);
   await expect(page.locator("html")).toHaveAttribute("data-active-tab", "preview");
   await page.locator("#touch-tab-preview").focus();
@@ -479,32 +500,56 @@ hubTest("confirmed Hub shares only navigation preferences across workspaces and 
   await expect(page.locator("#navigation-hub")).toBeVisible();
   await expect(page.locator("#navigation-preferences")).toHaveCount(0);
   await expect(page.locator("#navigation-hub")).toHaveAttribute("href", `${hub.origin}/`);
-  await page.locator("#touch-tab-files").click();
+  await showSurface(page, "files");
   const other = await context.newPage();
   await other.goto(`${hub.origin}/s/${ids[1]}/`);
   await expect(other.locator("#navigation-hub")).toBeVisible();
   await expect(other.locator("html")).toHaveAttribute("data-active-tab", "preview");
   const settings = await context.newPage();
   await settings.goto(`${hub.origin}/settings`);
-  await settings.locator("#navigation-side").selectOption("right");
-  await settings.locator("#navigation-auto-hide").selectOption("false");
-  await settings.locator("#navigation-preview-side").selectOption("right");
+  const root = settings.locator("#mobile-hub-root");
+  const preference = async (action: "handle" | "auto-hide" | "preview-side") => {
+    const title = { handle: "Navigation Handle", "auto-hide": "Navigation Auto-hide", "preview-side": "Preview File Controls" }[action];
+    await root.locator(`[data-action="${action}"]`).click();
+    const editor = root.getByRole("region", { name: title, exact: true });
+    await expect(editor).toBeVisible();
+    return editor;
+  };
+  const savePreference = async (action: "handle" | "auto-hide" | "preview-side", choice: string) => {
+    const editor = await preference(action);
+    await editor.getByRole("radio", { name: choice, exact: true }).check();
+    await editor.getByRole("button", { name: "Save", exact: true }).click();
+    await expect(editor).toBeHidden();
+  };
+  await savePreference("handle", "Right");
+  await savePreference("auto-hide", "Until I close it");
+  await savePreference("preview-side", "Right");
+  expect(await settings.evaluate(() => localStorage.getItem("uatu:presentation:v1:%2F:navigation"))).toBeNull();
   await expect(page.locator("#navigation-handle")).toHaveAttribute("data-side", "right");
   await expect(other.locator("#navigation-handle")).toHaveAttribute("data-side", "right");
+  await expect(other.locator("#preview-file-navigation")).toHaveAttribute("data-side", "right");
   await expect(page.locator("html")).toHaveAttribute("data-active-tab", "files");
   await expect(other.locator("html")).toHaveAttribute("data-active-tab", "preview");
   const before = await other.locator("#preview-path").textContent();
+  await openNavigation(page);
   await page.locator("#navigation-close").click();
   await page.locator("#navigation-handle").focus();
   await page.keyboard.press("Home");
   await expect(other.locator("#navigation-handle")).toHaveAttribute("data-side", "left");
-  await expect(settings.locator("#navigation-side")).toHaveValue("left");
+  const handle = await preference("handle");
+  await expect(handle.getByRole("radio", { name: "Left", exact: true })).toBeChecked();
+  await handle.getByRole("button", { name: "Cancel", exact: true }).click();
   await expect(other.locator("#preview-path")).toHaveText(before!);
   await other.reload();
   await expect(other.locator("#navigation-hub")).toBeVisible();
   await expect(other.locator("#navigation-handle")).toHaveAttribute("data-side", "left");
-  await expect(settings.locator("#navigation-auto-hide")).toHaveValue("false");
-  await expect(settings.locator("#navigation-preview-side")).toHaveValue("right");
+  await expect(other.locator("#preview-file-navigation")).toHaveAttribute("data-side", "right");
+  const autoHide = await preference("auto-hide");
+  await expect(autoHide.getByRole("radio", { name: "Until I close it", exact: true })).toBeChecked();
+  await autoHide.getByRole("button", { name: "Cancel", exact: true }).click();
+  const preview = await preference("preview-side");
+  await expect(preview.getByRole("radio", { name: "Right", exact: true })).toBeChecked();
+  await preview.getByRole("button", { name: "Cancel", exact: true }).click();
   await settings.close();
   await other.close();
 });

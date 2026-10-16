@@ -214,6 +214,19 @@ Keep production-facing delta specs unsynced until implemented and verified.
   unwaived for separately scoped follow-up; none of their assertions was changed.
   The archive mismatch and all seven release/manual gates remain separate.
 
+  The lead then explicitly assigned those five navigation cases. Correct label
+  targets and focused Settings editors preserve the original checks. A saved-
+  document repro established that the unavailable-Terminal double missed queried
+  state reads; pathname matching now covers the actual boot with unchanged
+  deadlines, disabled/fallback/keyboard assertions and no PTY creation. Corrected
+  editor setup also exposed a genuine direct-entry preference-scope omission:
+  direct Hub/Settings now selects the existing Hub scope before mounting, without
+  changing authentication state. Final verification is 59 pass / 0 fail / 1
+  original platform skip across all 60 navigation cases, 138/138 CI-isolated units,
+  all affected type checks and a production build. The evidence record retains
+  red probes and the separate ad-hoc shared-process DOM-fixture coupling; no
+  broader test-harness work, baseline change or release/manual waiver is included.
+
 ## 23. Controlled live candidate handoff
 
 - [ ] 23.1 After sections 18–22 establish capability parity and gates, deliver the live candidate identity, endpoint/action matrix, checks/limits, rollback and separately labeled synthetic review instructions; verify every upstream capability remains reachable and no mock success can be mistaken for a live operation. Obtain version-specific acceptance under 8.3 rather than treating integration authorization as certification.

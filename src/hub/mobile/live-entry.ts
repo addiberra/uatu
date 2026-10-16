@@ -8,6 +8,7 @@ import { onCurrentSessionRunning } from "../../shell/session-running";
 import { liveChannel, registerRecoveryWork } from "../../shell/live";
 import { createTaskHistory } from "./task-history";
 import { unregisterLegacyServiceWorkers } from "../../shell/pwa";
+import { confirmNavigationHubScope } from "../../shell/navigation-preferences";
 import "./styles.css";
 import "./coordinator.css";
 
@@ -18,6 +19,9 @@ export function eligibleMobileHub(): boolean {
 /** Direct Hub entry owns no workspace, stream, or fabricated Return target.
  * Canonical Open crosses a document boundary; its workspace entry owns retention. */
 export function mountLiveHub(root: HTMLElement) {
+  // This document passed the Hub's authentication gate, just like a workspace
+  // entry. Select its shared preference scope before the frontend reads it.
+  confirmNavigationHubScope();
   const { backend, transport } = createLiveBackendRuntime();
   const tasks = createTaskHistory(history, () => location.href);
   let restoring = false, context: string | undefined, authenticated = true;

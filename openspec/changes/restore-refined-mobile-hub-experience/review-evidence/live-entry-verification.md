@@ -726,3 +726,131 @@ ignored. This is self-review, not independent validation. The corrected eleven
 Chat cases are ready for independent review; the newly observed navigation
 failures, archive mismatch and seven release/manual gates still need the lead.
 No push, deployment, service restart/reset, spec sync or archive was performed.
+
+### Assigned navigation compatibility and direct Settings scope — 2026-10-16
+
+The lead independently approved `5741f05` and explicitly assigned the five
+navigation failures above, without authorizing redesign, new baselines or unrelated
+suite expansion. This follow-up starts from that clean commit. Existing services,
+the Chat correction and the seven release/manual gates remain unchanged.
+
+Fresh unchanged-source reproduction:
+
+```sh
+UATU_E2E_BASE_PORT=24000 UATU_E2E_HUB_BASE_PORT=25000 UATU_E2E_WORKSPACE_PREFIX=nav-compat-red bun node_modules/@playwright/test/cli.js test -c playwright.mobile.config.ts tests/e2e/navigation-overlay.e2e.ts --grep 'overlay-only contrast|unavailable Terminal|confirmed Hub shares' --workers=1 --trace=retain-on-failure --output=test-results/nav-compat-red
+```
+
+**1 passed / 5 failed** (5.4 minutes), reproducing every assigned category. The
+five fresh isolated WebKit availability repeats, by contrast, all passed. A
+saved-document regression then reproduced the availability failure on demand:
+
+```sh
+UATU_E2E_BASE_PORT=24001 UATU_E2E_WORKSPACE_PREFIX=nav-availability-saved-red bun node_modules/@playwright/test/cli.js test -c playwright.mobile.config.ts tests/e2e/navigation-overlay.e2e.ts --project=mobile-webkit --grep 'unavailable Terminal' --workers=1 --trace=retain-on-failure --output=test-results/nav-availability-saved-red
+```
+
+Root causes and corrections:
+
+- **Palette, both engines:** the exact `#f4faff` bright-label token was asserted
+  on the glass container. The container's existing foreground is `#eff9ff`;
+  inactive labels use `--text-subtle: #f4faff`, while the selected Terminal pill
+  has `#123049` text on `#c7ecff`. Those rules were introduced together in
+  `c259efb` and match the refined reference contract's bright inactive labels,
+  deep-blue glass and pale selected capsule (`reference-contract.md`, Terminal
+  overlay). Assertions now target the actual inactive label and independently
+  check container, selected label and selected background. No palette/style or
+  golden changed. The original live PTY/input/unseen-output, one pane/session,
+  exact output count and unchanged xterm-background checks remain.
+- **Unavailable Terminal:** `loadInitialState` refetches contextual state when
+  resuming a saved document. The old `**/api/state` route doubled only the bare
+  endpoint. Targeted response instrumentation captured `terminal: "disabled"`
+  on that first read, then `terminal: "enabled"` on
+  `?documentPath=README.md&compareTarget=base&scope=folder`. The final payload
+  correctly controlled the real one-shot Terminal setup. Whether the preceding
+  test had persisted its document explained the apparent intermittency; this was
+  not a delayed-disable defect or a reason to wait longer. The regression now
+  explicitly seeds the saved document, matches this endpoint by pathname for
+  both reads, and still requires the actual disabled fourth tab, Preview fallback
+  and keyboard traversal. It additionally requires both read forms, zero panes
+  and zero PTY-create requests. The original 10s expectation/30s test deadlines
+  are unchanged; no wait for a mock marker substitutes for UI availability.
+- **Settings, both engines:** legacy selects are replaced by the actual focused
+  radio editors with explicit Save/Cancel. This uncovered a **real product bug**:
+  direct mobile Hub/Settings entry had never selected the Hub preference scope.
+  A narrow probe found all three saved values under the standalone
+  `uatu:presentation:v1:%2F:navigation` key, while workspace handles correctly
+  stayed left listening to `uatu:navigation:v1:hub`. The corrected editor test
+  failed in both engines after Save, and the separate scope probe failed too.
+  Direct entry now calls the existing `confirmNavigationHubScope()` before
+  mounting the frontend, matching the legacy authenticated Hub and confirmed
+  workspace preference owner. It does not change global authentication state,
+  backend authority, storage format, defaults or migrate/overwrite another scope.
+  The browser regression preserves two different selected surfaces, document
+  identity, cross-page Home reset, exact current editor values and reload
+  persistence. It additionally requires that no standalone key was written and
+  that actual Preview file controls use the shared right placement before/after
+  reload. Navigation is explicitly reopened before using a dismissed control.
+
+The first compatibility-only focused run passed the four palette/availability
+cases but failed both real Settings propagation cases (**4 passed / 2 failed**).
+After scope confirmation the six focused cases passed in both engines (**6/6**,
+35.5s). Self-review then narrowed confirmation to the preference owner alone,
+avoiding an unnecessary global authentication-availability change. The final
+full matrix below uses that narrower call and the extra actual-Preview checks.
+Temporary response/storage instrumentation was removed. Primary logs are
+`.local/nav-compat-red.log`, `.local/nav-availability-red.log`,
+`.local/nav-availability-saved-red.log`, `.local/nav-compat-focused.log`,
+`.local/nav-scope-probe.log` and `.local/nav-compat-scope-fixed.log`, with traces
+in the corresponding ignored `test-results/` directories.
+
+Final-source verification:
+
+```sh
+UATU_E2E_BASE_PORT=24000 UATU_E2E_HUB_BASE_PORT=25000 UATU_E2E_WORKSPACE_PREFIX=nav-compat-full bun node_modules/@playwright/test/cli.js test -c playwright.mobile.config.ts tests/e2e/navigation-overlay.e2e.ts --workers=1 --trace=retain-on-failure --output=test-results/nav-compat-full
+bun test --parallel=4 src/shell/navigation-preferences.test.ts src/shell/navigation-cold-boot.test.ts src/shell/personal-state.test.ts src/shell/hub-nav.test.ts src/terminal/panel.test.ts src/hub/mobile/frontend.test.ts src/hub/mobile/task-view.test.ts src/shared/browser-bundle-discipline.test.ts tests/evidence-discipline.test.ts
+bun run typecheck
+bun node_modules/typescript/bin/tsc --ignoreConfig --noEmit --target ESNext --module ESNext --moduleResolution Bundler --resolveJsonModule --strict --types bun-types --skipLibCheck src/styles.d.ts tests/e2e/navigation-overlay.e2e.ts
+bun node_modules/typescript/bin/tsc --noEmit -p tests/mobile-hub-review/tsconfig.json
+bun node_modules/typescript/bin/tsc --noEmit -p tests/tsconfig.worktree.json
+bun run build
+```
+
+The full **60-case** matrix is **59 passed / 0 failed / 1 existing platform skip**
+(2.0 minutes), no retries or deadline changes. Chromium and WebKit both pass the
+real PTY/output, deterministic unavailable-Terminal and real-Hub Settings-sharing
+cases. WebKit Reduced Transparency emulation remains explicitly unsupported, not
+a new skipped failure. All earlier idle/dismissal, keyboard/focus, attention,
+storage-denial, zoom/viewport, responsive and desktop checks also ran. The broader
+Chat suite was not edited or rerun in this follow-up; its independently approved
+two 37-case passes remain the previous checkpoint's evidence.
+
+The documented CI-style per-file-isolated unit run passes **138/138**, 1,460
+assertions across nine files. An initial ad-hoc shared-process combination of the
+same files was **91 passed / 47 failed**: the Terminal DOM fixture encountered
+retained Hub availability without `window.location.origin`; incomplete overlay
+initialization then left a preference listener calling missing `getComputedStyle`
+in subsequent frontend fixtures. The failure stacks name those unchanged fixture
+paths, not the direct-entry mount. No unit fixture or assertion was changed under
+this browser-suite assignment. That shared-process harness coupling remains
+separate and is not relabeled green by the isolated run. Primary outputs are
+`.local/nav-compat-units.log` and `.local/nav-compat-units-isolated.log`.
+
+Main, explicit E2E, review and worktree type checking pass. Production build passes
+with only the existing unsupported CSS `highlight` selector warnings. No compiled
+runtime smoke or running-service update is claimed for this follow-up. Build
+output is `.local/nav-compat-build.log`; full browser output is
+`.local/nav-compat-full.log`. The actual Settings propagation browser regression
+is the correct seam for the direct-entry caller omission; the owner units alone
+would not catch a caller that forgot scope confirmation.
+
+Author self-review and publication-safety review found no additional issue in
+the bounded correction. The only product change is preference-scope confirmation
+at direct entry; no authentication/authorization behavior, wire contract, desktop
+renderer, workspace interior, palette, default/format/migration or operator
+configuration changes. Original timing, geometry, semantic state and output
+assertions remain, with stronger label/availability/scope checks. No temporary
+instrumentation, raw traces, secrets or unapproved personal data are staged.
+Existing listeners remain PID 40235 on 4717 and PID 37505 on 4718; their HTTPS
+services were untouched. The five assigned browser failures are corrected, not
+waived. This is self-verification pending independent review; the archive mismatch
+and seven manual/release gates remain open. No push, deployment, spec sync or
+archive was performed.
