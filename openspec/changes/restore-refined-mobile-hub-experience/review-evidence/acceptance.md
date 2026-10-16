@@ -16,6 +16,14 @@ failed; API contracts are 212/212. Task reconciliation is 93/100, with all seven
 remaining gates and the unwaived Chat/archive blockers named in that evidence.
 These are self-verification, not a new independent review.
 
+The final-review correction over clean `4ddb012` repairs inventory live refresh
+and Settings identity branding. The correction's 503-unit/8-browser focused
+results, 74/74 sequential live and 342/342 synthetic browser results, and the
+earlier unwaived 70/74 concurrent run are recorded separately in
+`live-entry-verification.md`. Direct/retained/managed-B inventory tests use real
+Hub routes and temporary Git repositories; image checks load the production
+routes. These are not a new user decision, deployed identity or visual approval.
+
 The deployed live/synthetic versions have not changed. This source checkpoint is
 not a newly served candidate, final visual acceptance, a golden approval or a
 physical/native-device result. Tasks 8.3 and 23.2 stay open, along with the named

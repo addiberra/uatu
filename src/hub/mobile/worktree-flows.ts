@@ -1,6 +1,7 @@
 import type { WorktreeCheckout, WorktreeInventory, WorktreeOperationResult, WorktreeRefs } from "../../shared/worktree-contract";
 import { initialWorktreeBase, validWorktreeBranch } from "../../shared/worktree-branches";
-import { action, check, checked, field, group, infoRows, listRow, select, showContextualError, text, value, type FlowActions, type FlowEnvironment } from "./flow-ui";
+import { WORKTREES_INVALIDATED_EVENT } from "../../shell/worktree-live";
+import { action, bind, check, checked, field, group, infoRows, listRow, select, showContextualError, text, value, type FlowActions, type FlowEnvironment } from "./flow-ui";
 
 /** Presentation only. Inventory identity, provenance, local-data fences and
  * all Git/registration/lifecycle effects stay with the upstream service. */
@@ -13,15 +14,70 @@ export function createWorktreeFlows(env: FlowEnvironment) {
   }
   function render(inventory: WorktreeInventory, back: () => void) {
     const source = inventory.sourceWorkspaceId;
-    const actions: FlowActions = { "flow-back": back, refresh: () => show(source, back), create: () => create(inventory, back) };
-    let body = text("Linked checkouts inherit their parent workspace's credentials and settings. Creating or registering a checkout does not copy conversations.");
-    if (inventory.status !== "ready") body += text(inventory.error?.message ?? "Inventory is not ready. Refresh before performing an operation.");
-    body += group("Checkouts", inventory.checkouts.map((checkout, index) => {
-      actions[`checkout-${index}`] = () => detail(inventory, checkout, back);
-      return listRow(`checkout-${index}`, checkout.branch ?? (checkout.detached ? "Detached checkout" : "Branch unavailable"), `${checkout.main ? "Main" : checkout.ownership} · ${checkout.availability} · ${checkout.running ? "Running" : "Stopped"} · ${checkout.path}`);
-    }).join("") || text("No checkouts reported."));
-    if (inventory.status === "ready") body += action("create", "Create branch or worktree");
-    env.page("Branches and worktrees", body + action("refresh", "Refresh checkouts"), actions);
+    const actions: FlowActions = { "flow-back": back, refresh: () => invalidate(), create: () => create(inventory, back) };
+    const content = () => {
+      let body = text("Linked checkouts inherit their parent workspace's credentials and settings. Creating or registering a checkout does not copy conversations.");
+      if (inventory.status !== "ready") body += text(inventory.error?.message ?? "Inventory is not ready. Refresh before performing an operation.");
+      body += group("Checkouts", inventory.checkouts.map((checkout, index) => {
+        actions[`checkout-${index}`] = () => detail(inventory, checkout, back);
+        return listRow(`checkout-${index}`, checkout.branch ?? (checkout.detached ? "Detached checkout" : "Branch unavailable"), `${checkout.main ? "Main" : checkout.ownership} · ${checkout.availability} · ${checkout.running ? "Running" : "Stopped"} · ${checkout.path}`);
+      }).join("") || text("No checkouts reported."));
+      if (inventory.status === "ready") body += action("create", "Create branch or worktree");
+      return body + action("refresh", "Refresh checkouts");
+    };
+    const page = env.page("Branches and worktrees", `<div data-worktree-inventory>${content()}</div>`, actions);
+    const current = env.current();
+    let stopped = false, queued = false, reading = false, revision = 0;
+    function invalidate() {
+      revision++;
+      if (stopped || queued || reading || !current()) return;
+      queued = true;
+      queueMicrotask(() => { queued = false; if (!stopped && current()) void reload(); });
+    }
+    async function reload() {
+      reading = true;
+      const region = page.querySelector("[data-worktree-inventory]")!;
+      region.setAttribute("aria-busy", "true");
+      const captured = revision;
+      await env.read(async () => {
+        try {
+          const result = await api!.inventory(source);
+          // Ignore an obsolete connection failure, but never an authoritative
+          // unauthorized verdict. The transport also owns its auth fence.
+          return captured !== revision && result.status === "unavailable" && result.problem.kind !== "unauthorized"
+            ? { status: "available" as const, value: inventory } : result;
+        } catch (error) {
+          if (captured !== revision) return { status: "available" as const, value: inventory };
+          throw error;
+        }
+      }, next => {
+        if (stopped || captured !== revision) return;
+        // Update only the list. Keep page identity, scroll and native focus;
+        // no editor/task can be replaced by an inventory response.
+        const focused = page.ownerDocument.activeElement as HTMLElement | null;
+        const key = focused?.dataset.flow;
+        const oldCheckout = key?.startsWith("checkout-") ? inventory.checkouts[Number(key.slice(9))]?.checkoutId : undefined;
+        const scroller = page.querySelector<HTMLElement>(".mh-flow-content")!;
+        const scroll = scroller.scrollTop;
+        inventory = next;
+        page.querySelector("[data-worktree-inventory]")!.innerHTML = content();
+        bind(page, actions);
+        const nextKey = oldCheckout ? `checkout-${inventory.checkouts.findIndex(checkout => checkout.checkoutId === oldCheckout)}` : key;
+        if (key && focused && !focused.isConnected) (page.querySelector<HTMLElement>(`[data-flow="${nextKey}"]`) ?? page.querySelector<HTMLElement>("h1"))?.focus({ preventScroll: true });
+        scroller.scrollTop = scroll;
+      }, () => show(source, back));
+      reading = false;
+      region.removeAttribute("aria-busy");
+      if (!stopped && current() && captured !== revision) invalidate();
+    }
+    const target = page.ownerDocument.defaultView!;
+    let stopWatching: (() => void) | undefined;
+    target.addEventListener(WORKTREES_INVALIDATED_EVENT, invalidate);
+    // A Hub refresh revalidates this read-only page too. Editors/results own
+    // neither callback and remain untouched.
+    env.onRefresh(invalidate);
+    env.onLeave(() => { stopped = true; target.removeEventListener(WORKTREES_INVALIDATED_EVENT, invalidate); stopWatching?.(); });
+    stopWatching = api?.watchInventory?.(source, invalidate);
   }
   const facts = (checkout: WorktreeCheckout) => infoRows([
     { label: "Branch", value: checkout.branch ?? (checkout.detached ? "Detached HEAD" : "Unavailable") },

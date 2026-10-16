@@ -88,6 +88,10 @@ export interface FlowEnvironment {
   authLost(): void;
   openWorkspace(id: string): void;
   current(): () => boolean;
+  /** Release page-owned observers before navigation, a task, or invalidation. */
+  onLeave(cleanup: () => void): void;
+  /** Revalidate a mounted read-only page through the existing Hub refresh. */
+  onRefresh(refresh: () => void): void;
 }
 
 export function createFlowEnvironment(root: HTMLElement, backend: MobileHubBackend, sheet: SheetPort, hooks: {
@@ -100,6 +104,9 @@ export function createFlowEnvironment(root: HTMLElement, backend: MobileHubBacke
   const mutations = new WeakMap<HTMLElement, object>();
   let pageBack: () => unknown = hooks.home;
   let pageBackLabel = "Back";
+  const pageCleanups = new Set<() => void>();
+  const pageRefresh = new Set<() => void>();
+  const releasePage = () => { const cleanups = [...pageCleanups]; pageCleanups.clear(); pageRefresh.clear(); for (const cleanup of cleanups) cleanup(); };
   const problem = (p: BackendProblem) => {
     if (p.kind === "unauthorized") hooks.authLost();
     return p.kind === "rate-limited" ? `${p.message} Retry after ${p.retryAfterSeconds} seconds.` : p.message;
@@ -108,7 +115,10 @@ export function createFlowEnvironment(root: HTMLElement, backend: MobileHubBacke
     backend, root, sheet, ...hooks,
     authContext() { if (hooks.authContext) return hooks.authContext(); const captured = authenticationGeneration, user = hooks.user(); return { user, current: () => captured === authenticationGeneration && user === hooks.user() }; },
     current() { const captured = generation, task = taskGeneration, node = activeTask?.isConnected ? activeTask : undefined; return () => captured === generation && task === taskGeneration && (!node || node.isConnected) && hubForeground(root); },
+    onLeave(cleanup) { pageCleanups.add(cleanup); },
+    onRefresh(refresh) { pageRefresh.add(refresh); },
     page(title, body, actions = {}, presentation) {
+      releasePage();
       generation++;
       mutations.delete(root);
       root.removeAttribute("aria-busy");
@@ -194,6 +204,7 @@ export function createFlowEnvironment(root: HTMLElement, backend: MobileHubBacke
     },
   };
   function openTask(presentation: TaskPresentation, title: string, body: string, primary?: Parameters<FlowEnvironment["task"]>[2], actions: FlowActions = {}, cancel?: () => void) {
+    releasePage();
     taskGeneration++;
     const route = generation, task = taskGeneration;
     const current = () => route === generation && task === taskGeneration && hubForeground(root);
@@ -210,6 +221,6 @@ export function createFlowEnvironment(root: HTMLElement, backend: MobileHubBacke
     bind(taskRoot, { ...actions, "dismiss-advisory": () => dismissAdvisory(hooks.user(), taskRoot) });
     return taskRoot;
   }
-  const clear = () => { pageBack = hooks.home; pageBackLabel = "Back"; clearSecrets(root); root.onclick = null; root.oninput = null; root.onchange = null; root.replaceChildren(); root.hidden = true; };
-  return { env, invalidate() { authenticationGeneration++; generation++; sheet.close(); clear(); }, leave() { generation++; clear(); }, begin() { generation++; clear(); root.hidden = false; root.scrollTop = 0; }, };
+  const clear = () => { releasePage(); pageBack = hooks.home; pageBackLabel = "Back"; clearSecrets(root); root.onclick = null; root.oninput = null; root.onchange = null; root.replaceChildren(); root.hidden = true; };
+  return { env, refresh() { for (const refresh of [...pageRefresh]) refresh(); }, invalidate() { authenticationGeneration++; generation++; sheet.close(); clear(); }, leave() { generation++; clear(); }, begin() { generation++; clear(); root.hidden = false; root.scrollTop = 0; }, };
 }

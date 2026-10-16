@@ -90,6 +90,7 @@ export function mountLiveWorkspace(bootWorkspace: () => Promise<void>) {
     else if (result.status === "unavailable" && result.problem.kind === "not-found") transport.workspaceChanged(workspaceId, "removed");
   })().finally(() => { checking = undefined; });
   const coordinator = mountMobileCoordinator({ hubRoot, workspaceRoot, backend, workspaceId, basePath, eligible: eligibleMobileHub,
+    brandLogoUrl: hubUrl("/hub-assets/logo.svg"),
     notifications: liveNotificationSettings({ workspaceId, beforeRegister: unregisterLegacyServiceWorkers }), revealNavigation: () => reveal(),
     async bootWorkspace() {
       confirmAuthenticatedHubContext();

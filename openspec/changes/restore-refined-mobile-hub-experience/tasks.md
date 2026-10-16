@@ -166,6 +166,14 @@ Keep production-facing delta specs unsynced until implemented and verified.
 - [x] 21.1 Connect Start/Stop/Rename/Forget with existing session/registry services; verify no-assignment confirmation, inherited assignments, all-required-unlocks then one authorized Start, disabled/unavailable refusal, restart-required, Stop shell termination warning, partial results and Forget preserving files. Back/Return never starts a stopped checkout.
 - [x] 21.2 Connect remote browsing/default folder/existing registration/create and folder maintenance; verify explicit Git-init consent, separate folder/display names, collisions/path validation, nested registrations, coordinated-stop failure, cancellation/drafts and retained-path/registration/start-failure recovery in isolated temporary repositories.
 - [x] 21.3 Reuse upstream worktree API and operation ownership for inventory/refs/fetch/create/open/register/forget/preflight-delete/delete; adapt presentation only through the mobile task owner. Verify HTTP-200 refusals, stable checkout identity, inherited credentials, external/owned/missing/replaced paths, active sessions, dirty/untracked/ignored/local data, exact confirmations, no force bypass, branch/path collisions, operation ids and live inventory refresh. Keep single-checkout card compact and desktop dialog behavior intact.
+
+  Final-review correction over `4ddb012` supplies the formerly missing inventory
+  invalidation consumer and production observer lifecycle. New real-Git browser
+  checks cover direct inventory, retained A and managed B without a second stream;
+  unit regressions cover burst/stale/error/auth and editor/departure ownership.
+  See `review-evidence/live-entry-verification.md` for exact current commands,
+  results and the bounded cross-workspace reconciliation behavior. This fixes a
+  defect in the completed task, not a new acceptance or deployment approval.
 - [x] 21.4 Implement owner-bound clone attempt admission/reconciliation before wiring submit; verify duplicate same-attempt returns original job, conflicting reuse is refused, concurrent requests and lost responses cannot create two jobs, fenced not-accepted cannot later execute, and pending/expired/unavailable/restart recovery never permits blind resubmission. Publish additive API/retention semantics and test legacy callers without attempt ids, auth/CSRF and cross-owner rejection through API contracts.
 - [x] 21.5 Connect clone submit/events/replay/input/cancel to real job owners after 21.4; verify separate clone identity vs retained assignments, unlock without unauthorized submission, all prompts masked, one accepted job through detours/reload hints, lost acceptance reconciliation, disconnect/replay and cancel/finish race. Exercise success, retained checkout, failed registration/start/cleanup and expired job in isolated fixtures, preserving all authoritative partial facts.
 

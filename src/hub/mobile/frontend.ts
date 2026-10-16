@@ -38,6 +38,7 @@ export type MobileHubReturnTarget = Pick<WorkspaceView, "id" | "displayName" | "
 
 /** A scoped presentation owner. Coordinator owns history, eligibility and retained workspace lifetime. */
 export function mountMobileHub(root: HTMLElement, backend: MobileHubBackend, callbacks: MobileHubCallbacks) {
+  const brandLogoUrl = callbacks.brandLogoUrl ?? appUrl("/assets/uatu-logo.svg");
   let route: MobileHubRoute = "hub";
   let identity: HubIdentity | null = null;
   // Keep authenticated ownership across a connection outage, even while the
@@ -187,7 +188,7 @@ export function mountMobileHub(root: HTMLElement, backend: MobileHubBackend, cal
     const folderNotice = defaultFolder.status === "ready" && defaultFolder.value.configured && !defaultFolder.value.configuredAvailable ? "Saved folder unavailable; using fallback" : "";
     const catalog = advisory(identity?.user ?? "") + `<div data-credential-catalog>${credentialCatalog()}</div>`;
     const accounts = section("Agent accounts", destination("agent-accounts", "Agent accounts", "device", "OpenCode and Claude Code · Shared by all Hub users"));
-    return `<h1>Settings</h1>${identity ? button("identity", `<img src="${esc(appUrl("/assets/uatu-logo.svg"))}" alt=""/><span><strong>${esc(identity.user)}</strong><small>${esc(identity.host)}</small><small class="mh-running">${authenticationProblem ? "Connection unconfirmed" : "● Connected"}</small></span>`, "mh-identity") : ""}`
+    return `<h1>Settings</h1>${identity ? button("identity", `<img src="${esc(brandLogoUrl)}" alt=""/><span><strong>${esc(identity.user)}</strong><small>${esc(identity.host)}</small><small class="mh-running">${authenticationProblem ? "Connection unconfirmed" : "● Connected"}</small></span>`, "mh-identity") : ""}`
       + section("Credentials", `${catalog}${button("add-credential", "Add Credential", "mh-text-action")}`) + note("Secure access for your workspaces. Stored only on this hub.") + accounts
       + section("Workspaces", destination("default-folder", "Default Folder", "folder", folderNotice, folderValue, "blue") + destination("preview-side", "Preview File Controls", "preview", "Placement on this device", prefs.previewSide === "left" ? "Left" : "Right") + destination("auto-hide", "Navigation Auto-hide", "hub", "", prefs.autoHide ? "After 7 seconds" : "Until I close it"))
       + section("Notifications", destination("notifications", "Notifications", "device", "This device and Hub login"))
@@ -202,7 +203,7 @@ export function mountMobileHub(root: HTMLElement, backend: MobileHubBackend, cal
     const previousScroll = page.scrollTop;
     page.querySelectorAll<HTMLDetailsElement>("details[data-family]").forEach(detail => disclosures.set(detail.dataset.family!, detail.open));
     clearSecrets(page);
-    page.innerHTML = `<header class="mh-brand"><img src="${esc(callbacks.brandLogoUrl ?? appUrl("/assets/uatu-logo.svg"))}" alt=""/><span>UatuCode</span></header><main>${signedOut ? login() : !identity ? `<h1>UatuCode</h1>${workspaces.status === "unavailable" ? `<div role="alert">${note(workspaces.problem.message)}${button("refresh", "Retry", "mh-text-action")}</div>` : note("Connecting to hub…")}` : route === "hub" ? dashboard() : settings()}</main>${identity ? dock() : ""}`;
+    page.innerHTML = `<header class="mh-brand"><img src="${esc(brandLogoUrl)}" alt=""/><span>UatuCode</span></header><main>${signedOut ? login() : !identity ? `<h1>UatuCode</h1>${workspaces.status === "unavailable" ? `<div role="alert">${note(workspaces.problem.message)}${button("refresh", "Retry", "mh-text-action")}</div>` : note("Connecting to hub…")}` : route === "hub" ? dashboard() : settings()}</main>${identity ? dock() : ""}`;
     page.querySelector<HTMLElement>("main")!.inert = !!flows.detail;
     if (flows.detail) page.querySelector("main")!.setAttribute("aria-hidden", "true");
     else page.querySelector("main")!.removeAttribute("aria-hidden");
@@ -415,6 +416,7 @@ export function mountMobileHub(root: HTMLElement, backend: MobileHubBackend, cal
     finally { loginBusy = false; if (!disposed && captured === generation) render(); }
   }
   async function refresh() {
+    flows.refresh();
     const captured = ++readGeneration; let lifecycle = generation;
     const current = () => !disposed && captured === readGeneration && lifecycle === generation;
     workspaces = { status: "loading", previous: workspaces.status === "ready" ? workspaces.value : workspaces.previous };

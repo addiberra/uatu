@@ -42,6 +42,7 @@ export function mountMobileCoordinator(options: {
   workspaceId: string; basePath: string;
   bootWorkspace(): Promise<void>; revealNavigation(): void;
   eligible(): boolean;
+  brandLogoUrl?: string;
   notifications?: import("./notifications").MobileNotificationSettings;
 }) {
   const { hubRoot, workspaceRoot, backend, workspaceId, basePath } = options;
@@ -183,6 +184,7 @@ export function mountMobileCoordinator(options: {
     return true;
   };
   const view = mountMobileHub(hubRoot, backend, {
+    brandLogoUrl: options.brandLogoUrl,
     notifications: options.notifications,
     navigateWorkspace: id => { void openWorkspace(id); },
     returnToWorkspace: id => { void openWorkspace(id); },

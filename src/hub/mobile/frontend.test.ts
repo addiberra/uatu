@@ -68,6 +68,13 @@ function changeSelect(root: HTMLElement, value: string) {
 
 const overviewKey = (id = "key", enabled = true): Extract<PublicCredentialDto, { type: "ssh" }> => ({ id, type: "ssh", name: `Identity ${id}`, enabled, createdAt: "2026-01-01", capabilities: ["ssh-authentication"], metadata: { fingerprint: "public-only", publicKey: "public-only" }, assignments: [], readiness: [{ layer: "credential", status: "ready", message: "Unlocked (prose is not a fact)" }] });
 const keyFacts = (id: string, lock: "locked" | "unlocked" | "unknown"): CredentialFacts => ({ id, type: "ssh", protection: { status: "known", value: "unprotected" }, lock: lock === "unknown" ? { status: "unknown" } : { status: "known", value: lock }, userId: { status: "not-applicable" } });
+test("Settings uses the supplied branding for every image, including identity", async () => {
+  const h = harness({}, { brandLogoUrl: "/hub-assets/logo.svg" });
+  await h.ui.ready; h.ui.show("settings");
+  const images = [...h.root.querySelectorAll("img")];
+  expect(images).toHaveLength(2);
+  expect(images.map(image => image.getAttribute("src"))).toEqual(["/hub-assets/logo.svg", "/hub-assets/logo.svg"]);
+});
 describe("Settings overview explicit credential facts", () => {
   test("a transient authentication read cannot discard a pending credential command or its result", async () => {
     let authReads = 0, resolve!: (value: import("./backend").OperationResult<ReturnType<typeof overviewKey>>) => void;

@@ -1,5 +1,9 @@
 # Live operations checkpoint — 2026-10-15
 
+Historical adapter checkpoint. Later production assembly and the final-review
+inventory/branding corrections are recorded in `live-entry-verification.md`;
+the unmounted/dependency status below applies to this earlier checkpoint only.
+
 Self-verification, not independent review or version-specific visual acceptance.
 Continues the preserved unfinished work after `9b1cdc4`. Existing live and
 synthetic services, operator configuration and personal credentials are untouched.

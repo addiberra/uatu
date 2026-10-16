@@ -11,6 +11,10 @@ remain unchanged. Planning does not change or restart either running service.
 
 ## What to use
 
+- [Production entry and final-review correction evidence](live-entry-verification.md):
+  exact live/synthetic checks, inventory/branding corrections over `4ddb012`,
+  provenance and unwaived release/manual gaps. Candidate source is not deployed.
+
 - The actual reviewer: `bun tests/mobile-hub-review/manage.ts start` (local-only
   by default). Do not start it over another owned instance. See
   [hosting instructions](../../../../tests/mobile-hub-review/hosting.md).

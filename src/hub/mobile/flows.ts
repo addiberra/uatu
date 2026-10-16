@@ -49,7 +49,7 @@ export function createMobileHubFlows(root: HTMLElement, backend: MobileHubBacken
   }
   function leave() { detail = null; clone.hide(); accounts.stop(); stopNotifications(); owner.leave(); }
   return {
-    show, leave,
+    show, leave, refresh: owner.refresh,
     get detail() { return detail; },
     workspaceInvalidated(id: string) { if (detail && ((detail.kind === "workspace" && detail.id === id) || detail.kind === "assignments")) show(detail); },
     invalidate() { detail = null; clone.reset(); accounts.stop(); stopNotifications(); owner.invalidate(); },

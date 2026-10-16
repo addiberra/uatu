@@ -29,6 +29,100 @@ async function mount(overrides: Partial<MobileWorktrees> = {}) {
   return { ui, model, api };
 }
 
+test("an open inventory consumes existing invalidations without manual Refresh or a Hub detail remount", async () => {
+  let reads = 0;
+  let current = inventory;
+  const { ui } = await mount({ inventory: async () => { reads++; return { status: "available", value: current }; } });
+  const heading = root.querySelector(".mh-flow-page h1");
+  expect(reads).toBe(1);
+  current = { ...inventory, checkouts: [...inventory.checkouts, { ...checkout, checkoutId: "external", branch: "external/new" }] };
+  window.dispatchEvent(new window.Event("uatu:worktrees-invalidated"));
+  await ui.refresh(); await settle();
+  expect(root.textContent).toContain("external/new");
+  expect(reads).toBe(2);
+  expect(root.querySelector(".mh-flow-page h1")).toBe(heading);
+});
+
+test("burst invalidations serialize reads, discard superseded payloads and cannot replace a creation draft", async () => {
+  let reads = 0, watching = 0;
+  let resolve!: (result: import("./backend").ReadResult<WorktreeInventory>) => void;
+  let live!: () => void;
+  await mount({
+    inventory: async () => { reads++; if (reads === 1) return { status: "available", value: inventory }; return new Promise(done => { resolve = done; }); },
+    watchInventory: (_source, invalidated) => { watching++; live = invalidated; return () => { watching--; }; },
+  });
+  expect(watching).toBe(1);
+  live(); live(); window.dispatchEvent(new window.Event("uatu:worktrees-invalidated")); await settle();
+  expect(reads).toBe(2);
+  live(); live();
+  resolve({ status: "available", value: { ...inventory, checkouts: [{ ...checkout, branch: "superseded" }] } }); await settle();
+  expect(root.textContent).not.toContain("superseded"); expect(reads).toBe(3);
+  click("create");
+  const task = root.querySelector(".mh-task"), draft = root.querySelector<HTMLInputElement>('[name="branch"]')!;
+  draft.value = "keep-this-draft";
+  expect(watching).toBe(0);
+  live(); window.dispatchEvent(new window.Event("uatu:worktrees-invalidated"));
+  resolve({ status: "available", value: { ...inventory, checkouts: [] } }); await settle();
+  expect(reads).toBe(3); expect(root.querySelector(".mh-task")).toBe(task); expect(draft.value).toBe("keep-this-draft");
+});
+
+test("a superseded failed refresh cannot retire the observer before the newer inventory is read", async () => {
+  let reads = 0;
+  let resolve!: (result: import("./backend").ReadResult<WorktreeInventory>) => void;
+  await mount({ inventory: async () => {
+    reads++;
+    if (reads === 2) return new Promise(done => { resolve = done; });
+    return { status: "available", value: reads === 1 ? inventory : { ...inventory, checkouts: [{ ...checkout, branch: "newer-facts" }] } };
+  } });
+  window.dispatchEvent(new window.Event("uatu:worktrees-invalidated")); await settle();
+  window.dispatchEvent(new window.Event("uatu:worktrees-invalidated"));
+  resolve({ status: "unavailable", problem: { kind: "unavailable", message: "Obsolete failure" } }); await settle();
+  expect(reads).toBe(3); expect(root.textContent).toContain("newer-facts"); expect(root.textContent).not.toContain("Obsolete failure");
+});
+
+test("the existing Hub refresh revalidates only the mounted inventory, never an active editor", async () => {
+  let reads = 0;
+  const { ui } = await mount({ inventory: async () => ({ status: "available", value: ++reads === 1 ? inventory : { ...inventory, checkouts: [{ ...checkout, branch: "other-repository-update" }] } }) });
+  await ui.refresh(); await settle();
+  expect(reads).toBe(2); expect(root.textContent).toContain("other-repository-update");
+  click("create");
+  const task = root.querySelector(".mh-task");
+  await ui.refresh(); await settle();
+  expect(reads).toBe(2); expect(root.querySelector(".mh-task")).toBe(task);
+});
+
+test("superseding an inventory read never suppresses authoritative unauthorized recovery", async () => {
+  let reads = 0, watching = 0;
+  let resolve!: (result: import("./backend").ReadResult<WorktreeInventory>) => void;
+  await mount({
+    inventory: async () => { reads++; if (reads === 1) return { status: "available", value: inventory }; return new Promise(done => { resolve = done; }); },
+    watchInventory: () => { watching++; return () => { watching--; }; },
+  });
+  window.dispatchEvent(new window.Event("uatu:worktrees-invalidated")); await settle();
+  window.dispatchEvent(new window.Event("uatu:worktrees-invalidated"));
+  resolve({ status: "unavailable", problem: { kind: "unauthorized", message: "Session revoked" } }); await settle();
+  expect(watching).toBe(0); expect(reads).toBe(2);
+  expect(root.querySelector(".mh-login")).not.toBeNull(); expect(root.textContent).not.toContain(checkout.path);
+});
+
+test.each(["leave", "invalidate", "destroy"] as const)("%s releases live inventory and fences its late response", async boundary => {
+  let reads = 0, watching = 0;
+  let resolve!: (result: import("./backend").ReadResult<WorktreeInventory>) => void;
+  const { ui, model } = await mount({
+    inventory: async () => { reads++; if (reads === 1) return { status: "available", value: inventory }; return new Promise(done => { resolve = done; }); },
+    watchInventory: () => { watching++; return () => { watching--; }; },
+  });
+  window.dispatchEvent(new window.Event("uatu:worktrees-invalidated")); await settle();
+  expect(reads).toBe(2);
+  if (boundary === "leave") ui.show("settings");
+  else if (boundary === "destroy") ui.destroy();
+  else await model.backend.signOut();
+  await settle(); expect(watching).toBe(0);
+  window.dispatchEvent(new window.Event("uatu:worktrees-invalidated"));
+  resolve({ status: "available", value: { ...inventory, checkouts: [{ ...checkout, branch: "late-secret-checkout" }] } }); await settle();
+  expect(root.textContent).not.toContain("late-secret-checkout"); expect(reads).toBe(2);
+});
+
 test.each(["missing", "replaced"] as const)("%s checkout exposes facts and safe forget but never Open or Register", async availability => {
   await mount({ inventory: async () => ({ status: "available", value: { ...inventory, checkouts: [{ ...checkout, availability, ownership: "uncertain" }] } }) });
   click("checkout-0");

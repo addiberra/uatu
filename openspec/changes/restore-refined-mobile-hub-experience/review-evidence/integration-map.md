@@ -9,7 +9,8 @@ The later implementation supersedes the planned gaps in the table below:
 and eligible Hub touch workspaces install `mobile/live-entry.ts` before the
 single app import. The authenticated Hub documents use a bundled product entry;
 their desktop controller is gated only for the selected phone presentation.
-Direct phone Hub entry has no resident workspace or broker stream. Canonical Open
+Direct phone Hub entry has no resident workspace; it holds a broker stream only
+while its worktree inventory is open. Canonical Open
 enters a workspace document; ordinary same-workspace detours then retain its root.
 The reviewer still replaces only the workspace entry with its fail-closed test
 transport; no review controller, globals or xterm instrumentation ships.
@@ -23,6 +24,15 @@ Start preparation is independently fenced by its target's workspace generation.
 Phone Notifications has one inline enrollment owner; the desktop dialog is not
 also mounted inside a retained workspace. All named live adapters, including
 Agent accounts and worktrees, are connected rather than stubbed.
+
+Final-review correction over `4ddb012`: inventory consumes the existing DOM
+invalidation relay with page-scoped cleanup and serialized/stale-fenced reads.
+It does not replace hub-nav's existing topic consumer. Direct inventory borrows
+the existing channel/recovery implementation for one temporary stream; managed B
+behind retained A uses five-second visible-inventory reconciliation, not a second
+stream or a new broker contract. Editors/tasks stop these observers. All rendered
+branding uses the assembly-supplied URL, including Settings identity. Exact new
+checks and remaining gates are in `live-entry-verification.md`.
 
 No new wire fields were needed for this assembly: published Hub/workspace
 revisions remain **14/24**. The internal non-secret HTMLBundle template and logo

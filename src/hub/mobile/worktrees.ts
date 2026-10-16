@@ -3,6 +3,8 @@ import type { OperationResult, ReadResult } from "./backend";
 
 /** Existing worktree service contract, not a parallel Git/lifecycle owner. */
 export interface MobileWorktrees {
+  /** Optional live adapter; synthetic callers can use the existing DOM event. */
+  watchInventory?(sourceWorkspaceId: string, invalidated: () => void): () => void;
   inventory(sourceWorkspaceId: string): Promise<ReadResult<WorktreeInventory>>;
   fetch(sourceWorkspaceId: string): Promise<OperationResult<WorktreeRefsResponse>>;
   create(intent: WorktreeCreateRequest): Promise<OperationResult<WorktreeOperationResult>>;

@@ -13,8 +13,9 @@ The existing live/synthetic services and private parallel runtime are unchanged.
   compiled product HTMLBundle. The pre-paint phone decision uses the existing
   scoped presentation key and coarse-pointer default. Only that selected phone
   branch skips/removes the legacy controller/forms; desktop rendering stays intact.
-- Direct Hub entry owns task history and read refresh, but no fabricated workspace
-  or stream. Auth loss stops background refresh from replacing a login draft.
+- Direct Hub entry owns task history and read refresh, but no fabricated workspace.
+  Its open inventory holds a scoped worktrees-only broker subscription; outside
+  that page it owns no stream. Auth loss stops refresh replacing a login draft.
   Canonical Open establishes the workspace document; subsequent ordinary detours
   retain it. Mode escape, cross-workspace Open and invalidation reload boundaries
   remain explicit.
@@ -405,8 +406,9 @@ bun test src/hub/mobile tests/mobile-hub-review src/pwa \
   src/shell/bounded-fetch.test.ts src/shell/chat-login-link.test.ts
 ```
 
-No product source or public contract changed after `781902c`; the final corrections
-are test isolation, current-flow assertions and evidence. Together with the real
+At this earlier checkpoint, no product source or public contract changed after
+`781902c`; those corrections are test isolation, current-flow assertions and
+evidence. Together with the real
 Hub 66-case result and tightened multi-key Start repeat (**2/2**), current API
 contracts, full synthetic matrix, all three TypeScript projects and build/smoke,
 this completes the scoped automated gate 22.2. It is not an all-repository,
@@ -449,3 +451,105 @@ Task reconciliation is **93/100 complete**: 18.4, 20.1–20.3, 21.1–21.2, 21.5
 have current cross-engine evidence; 22.2 has the current complete scoped checks;
 22.4 records the unwaived historical failures and the seven remaining gates in
 the table. This closes evidence reconciliation, not those release blockers.
+
+### Final-review inventory and branding corrections — 2026-10-16
+
+This bounded correction starts from clean `4ddb012`. The lead supplied an
+independent review identifying missing mobile inventory invalidation and the
+Settings identity logo's wrong route. The checks below are correction-author
+self-verification, not renewed independent approval or a served-version update.
+
+- The mounted inventory now consumes `uatu:worktrees-invalidated` and explicit
+  Hub refreshes. A single serialized read coalesces bursts and takes at most one
+  trailing refresh; superseded success/connection-failure results cannot replace
+  newer facts. Unauthorized results still invalidate authentication.
+- Page lifecycle cleanup releases observers before a detail change, editor,
+  confirmation, navigation, invalidation or destroy. List updates preserve the
+  page/heading, native action focus by checkout identity and its scrolling owner;
+  pending reads cannot replace an editor/draft or resurrect departed content.
+- Retained A uses hub-nav's existing event relay **without replacing its topic
+  consumer** (`subscribe` replaces a key, it does not refcount). Direct Hub
+  inventory uses the existing channel/recovery modules for one temporary
+  worktrees-only stream. Managing B while A remains retained uses bounded
+  five-second visible-inventory reconciliation because the existing wire scopes
+  worktrees to the stream's workspace. It opens no second stream, changes no wire
+  contract and stops before an editor or page departure. This is not a new
+  repository-wide poll or a broker/service replacement.
+- Header and Settings identity use the same supplied branding URL. Production
+  direct and retained entries supply `/hub-assets/logo.svg`; synthetic entry
+  retains its existing base-scoped asset fallback.
+
+Red evidence: the original event + Hub-refresh regression kept **one** inventory
+read and omitted the new checkout; the supplied-brand unit and both production
+browser engines found `/assets/uatu-logo.svg` on the identity image. A further
+red test showed obsolete failed revalidation retiring the observer before its
+newer read. The added retained-B check exposed the stream-scope gap; its first
+Chromium iteration also caught an unsettled initial response, so the final test
+waits for initial inventory/attach readiness before changing Git. Initial browser
+setup also omitted the credential API needed by the real read adapter; enabling
+that fixture option restored the actual route rather than bypassing a refusal.
+
+Executed on the correction:
+
+```sh
+bun test src/hub/mobile src/shell/worktree-live.test.ts src/shell/live.test.ts src/shell/live-channel.test.ts src/shell/recovery.test.ts src/shared/browser-bundle-discipline.test.ts src/shared/app-url-discipline.test.ts
+bun run typecheck
+bun node_modules/typescript/bin/tsc --noEmit -p tests/mobile-hub-review/tsconfig.json
+bun node_modules/typescript/bin/tsc --noEmit -p tests/tsconfig.worktree.json
+bunx --no-install openspec validate restore-refined-mobile-hub-experience --strict
+UATU_E2E_HUB_BASE_PORT=23000 bun node_modules/@playwright/test/cli.js test -c playwright.mobile-live.config.ts tests/e2e/mobile-live-inventory.e2e.ts --output=test-results/finalreview-inventory-stable
+bun run api:validate
+bun run build
+```
+
+Focused units: **503 passed**, 4,471 assertions, 42 files. All three TypeScript
+projects, strict change validation and whitespace checks pass. The focused real
+Hub/Git browser suite passed **8/8**, Chromium/WebKit: all rendered Hub images
+resolve on `/`, `/settings`, direct Settings detail and `/clone`, plus retained
+Settings; external checkout discovery works for direct, retained A and managed B;
+one stream, stable heading/focus, exact draft/task identity, direct stream cleanup
+and continued hub-nav invalidations after leaving inventory are asserted.
+
+Production build and API validation pass (only the existing CSS `highlight` and
+`WorkspaceConflict.allOf` warnings). The compiled smoke also passed using a new
+private HOME under the approved temporary root, `env -i` with HOME/TMPDIR/PATH
+and `PLAYWRIGHT_BROWSERS_PATH` pointing to the installed cache, then `bun run
+smoke`. It covers auth/assets, document/live delivery, desktop worktree entry and
+compiled phone Hub → workspace → Settings → Return without page errors. Local
+logs are `.local/finalreview-build.log` and `.local/finalreview-smoke.log`; raw
+logs/runtime paths are not committed. No public payload/revision changed.
+
+Self-review against the repository conventions, task 21.3 and supplied defect
+report found no additional blocking issue after the stale-read and shared-key
+corrections above. No new dependency, endpoint, credential effect or authorization
+bypass was introduced. This is author self-review, not independent validation.
+
+Final stable-source browser commands:
+
+```sh
+UATU_MOBILE_REVIEW_PORT=4793 bun node_modules/@playwright/test/cli.js test -c playwright.mobile-hub-review.config.ts --output=tests/mobile-hub-review/results/finalreview-matrix
+bun node_modules/@playwright/test/cli.js test -c playwright.mobile-live.config.ts --output=test-results/finalreview-live-serial
+```
+
+Synthetic: **342/342 passed**, both engines (9.5 minutes). Live, run after the
+other browser jobs finished: **74/74 passed**, both engines (3.3 minutes), no
+retries or deadline/assertion changes. The existing account/platform/PTY/clone
+doubles retain their stated provenance; Git inventory and credential/folder APIs
+use disposable real resources. These are not personal-provider/device tests.
+
+The earlier concurrent expanded live run was **70 passed / 4 failed** (9.2
+minutes): two Chromium worktree timeouts, a WebKit workspace translation wait
+and a pending WebKit OpenPGP generation. All four categories passed in both
+engines in the unchanged-deadline isolation command below (**8/8**, 1.4 minutes),
+then the complete sequential 74-case run passed. Resource contention is plausible
+but not established as each original failure's cause; that failed run remains
+recorded rather than relabeled green. Its output is retained at
+`.local/finalreview-live-complete.log` and `test-results/finalreview-live-complete`.
+
+```sh
+bun node_modules/@playwright/test/cli.js test -c playwright.mobile-live.config.ts --grep 'compact checkout More|exact disclosed|production phone entry retains|phone openpgp' --trace=retain-on-failure --output=test-results/finalreview-failed-isolation
+```
+
+No baseline/golden, auth/operator configuration, dependency, archived evidence or
+existing live/synthetic service changed. The seven release/manual gates above,
+historical Chat-touch failures and archive-digest mismatch remain unwaived.
