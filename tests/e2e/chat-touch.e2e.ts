@@ -4,7 +4,7 @@ import type { ConversationItem } from "../../src/chat/types";
 import { chooseChatModel, installClipboardMock, openChatConfiguration, openChatPanel, readClipboardMock } from "./chat-helpers";
 import { captureScreenshot } from "./evidence";
 import { expect, test } from "./fixtures";
-import { showSurface } from "./navigation-helpers";
+import { openNavigation, showSurface } from "./navigation-helpers";
 
 test.use({ viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true });
 
@@ -20,7 +20,7 @@ async function boot(page: Page, request: APIRequestContext, seed?: { items: Conv
   const token = await request.get("/__e2e/terminal-token").then(response => response.json()) as { token: string };
   await page.goto(`/?t=${encodeURIComponent(token.token)}`);
   await expect(page.locator("html")).toHaveAttribute("data-ui-mode", "touch");
-  await page.locator("#touch-tab-chat").click();
+  await showSurface(page, "chat");
   await expect(page.locator("#chat-surface")).toBeVisible();
   await expect(page.locator("#chat-conversation-select")).toHaveValue(snapshot.conversation.id);
   await expect(page.locator("body")).toHaveCSS("overflow", "hidden");
@@ -108,7 +108,7 @@ async function bootWithPinnedTracks(page: Page, request: APIRequestContext, hist
   const token = await request.get("/__e2e/terminal-token").then(response => response.json()) as { token: string };
   await page.goto(`/?t=${encodeURIComponent(token.token)}`);
   await expect(page.locator("html")).toHaveAttribute("data-ui-mode", "touch");
-  await page.locator("#touch-tab-chat").click();
+  await showSurface(page, "chat");
   await expect(page.locator("#chat-surface")).toBeVisible();
   await page.locator("#chat-conversation-select").selectOption(parent.conversation.id);
   await expect(page.locator("#chat-items")).toContainText("work through the list");
@@ -179,7 +179,7 @@ test("four tabs preserve chat state and keyboard navigation", async ({ page, req
   await page.locator("#chat-input").fill("persistent touch draft");
   await expect(page.locator("#touch-tab-bar")).toBeHidden();
   await page.locator("#chat-input").blur();
-  await page.locator("#navigation-handle").click();
+  await openNavigation(page);
   await expect(page.locator("#touch-tab-bar")).toBeVisible();
   for (const tab of ["files", "preview", "chat"] as const) {
     await page.locator(`#touch-tab-${tab}`).click();
@@ -302,13 +302,10 @@ test("a subagent transcript pushes as a screen and the back gesture pops it", as
   await expect(drilldown).toBeVisible();
   await expect(page.locator("#chat-drilldown-items")).toContainText("child findings");
   // A layer within the Chat tab, not a way out of it: the navigation is still
-  // there and Chat is still the selected tab. The bar idles away on its own
-  // timer, so reopen it before asserting it is present rather than racing it.
-  const navigation = page.locator("#touch-tab-bar");
-  if (await navigation.getAttribute("data-open") !== "true") {
-    await page.locator("#navigation-handle").click();
-  }
-  await expect(navigation).toBeVisible();
+  // there and Chat is still the selected tab. Content interaction dismisses
+  // the overlay, so reopen it without selecting a surface or popping the child.
+  await openNavigation(page);
+  await expect(drilldown).toBeVisible();
   await expect(page.locator("#touch-tab-chat")).toHaveAttribute("aria-selected", "true");
   // The picker is behind the pushed screen and still on the parent — a
   // subagent is never one of its entries.
@@ -705,15 +702,14 @@ test("answering a request on touch puts the chrome under the keyboard and brings
     };
   })).toEqual({ composerBottom: true, tasksBottom: true });
 
-  // And with the keyboard gone the surface is the whole screen again, minus
-  // the tab bar the blur brought back — so the height is read against the bar
-  // rather than pinned to 844.
+  // With the keyboard gone the surface fills the visual viewport. Navigation
+  // is an overlay, not a reserved gutter; reopening it must not shrink Chat.
   await setVisualViewport(page, { height: 844 });
-  await expect(page.locator("#touch-tab-bar")).toBeVisible();
+  await openNavigation(page);
   await expect.poll(() => page.evaluate(() => {
     const composer = document.querySelector("#chat-composer")!.getBoundingClientRect();
-    const tabs = document.querySelector("#touch-tab-bar")!.getBoundingClientRect();
-    return Math.round(composer.bottom - tabs.top);
+    const viewport = window.visualViewport!;
+    return Math.abs(composer.bottom - viewport.offsetTop - viewport.height);
   })).toBeLessThanOrEqual(1);
   await expect(page.locator("#chat-composer")).toBeVisible();
   await expect(page.locator("#chat-task-list")).toBeVisible();
@@ -847,7 +843,9 @@ for (const drilldown of [false, true]) {
       await expect(page.locator("html")).not.toHaveAttribute("data-chat-answering", "");
       await expect(page.locator("html")).not.toHaveAttribute("data-chat-editing", "");
       await setVisualViewport(page, { height: 844 });
-      await expect(page.locator("#touch-tab-bar")).toBeVisible();
+      // Resolution releases Chat's hold; automatic navigation dismissal is
+      // independent and requires an explicit reopen, not a synthetic focusout.
+      await openNavigation(page);
       await expect.poll(stillScrollTop(timeline)).toBe(true);
 
       // Originally at the live end: answering is a temporary positioning
@@ -886,7 +884,7 @@ for (const drilldown of [false, true]) {
     await card.locator("[data-question-primary]").tap();
     await expect(card.locator("[data-question-custom-input]")).toHaveCount(0);
     await setVisualViewport(page, { height: 844 });
-    await expect(page.locator("#touch-tab-bar")).toBeVisible();
+    await openNavigation(page);
     await expect.poll(stillScrollTop(timeline)).toBe(true);
     const heightBeforeAppend = await timeline.evaluate(element => element.scrollHeight);
     await control(request, { action: "item", conversationId: owner, item: {
@@ -949,13 +947,13 @@ for (const drilldown of [false, true]) {
       // Release setup focus before Playwright scrolls the next radio into
       // view; the direct field-to-field transfer is exercised below.
       await card.locator("[data-question-custom-input]").evaluate(element => (element as HTMLElement).blur());
-      // Blur resumes following and restores the tab bar through a height
-      // transition. Let both settle before Playwright scrolls the next radio
-      // into view; otherwise WebKit can scroll the outer chat surface during
-      // setup, displacing the entire timeline before the transfer is tested.
+      // Blur resumes following and restores Chat's full viewport height, not
+      // the dismissed overlay. Let it settle before Playwright scrolls the next
+      // radio into view; otherwise WebKit can scroll the outer chat surface
+      // during setup, displacing the timeline before the transfer is tested.
       await expect(page.locator("html")).not.toHaveAttribute("data-chat-answering", "");
       await expect.poll(() => page.locator("#chat-surface").evaluate(element => Math.abs(
-        element.getBoundingClientRect().bottom - document.querySelector("#touch-tab-bar")!.getBoundingClientRect().top,
+        element.getBoundingClientRect().bottom - window.visualViewport!.offsetTop - window.visualViewport!.height,
       ))).toBeLessThan(0.5);
       await expect.poll(stillScrollTop(timeline)).toBe(true);
     }
@@ -1200,7 +1198,7 @@ test("the touch chooser files both agents' conversations under their days", asyn
   const token = await request.get("/__e2e/terminal-token").then(response => response.json()) as { token: string };
   await page.goto(`/?t=${encodeURIComponent(token.token)}`);
   await expect(page.locator("html")).toHaveAttribute("data-ui-mode", "touch");
-  await page.locator("#touch-tab-chat").click();
+  await showSurface(page, "chat");
   const select = page.locator("#chat-conversation-select");
   await expect(select).toHaveValue(today.conversation.id);
   await expect(select.locator("optgroup")).toHaveCount(2);
@@ -1225,17 +1223,24 @@ test("day separators and wrapped slash-command descriptions fit the touch layout
   }]);
   const items: ConversationItem[] = [
     ...withReplies(messages("yesterday", 6, at(1, 12))),
-    ...withReplies(messages("today", 2, at(0, 0) + 60_000)),
+    // The overlay reserves no 56px gutter. Keep enough content AFTER the target
+    // reply to put it at the top without hitting the timeline's scroll limit.
+    ...withReplies(messages("today", 3, at(0, 0) + 60_000)),
   ];
   await boot(page, request, { items });
   const separators = page.locator("#chat-items > .chat-day-separator");
   await expect(separators).toHaveText(["Yesterday", "Today"]);
   // Yesterday pinned over one of its replies: only the label covers it; the
   // reply shows and takes taps on either side of the label.
-  await page.locator('[data-chat-item-id="message:yesterday-3-reply"]').evaluate(element => {
+  const placement = await page.locator('[data-chat-item-id="message:yesterday-3-reply"]').evaluate(element => {
     const timeline = element.closest<HTMLElement>(".chat-timeline")!;
-    timeline.scrollTop += element.getBoundingClientRect().top - timeline.getBoundingClientRect().top - 2;
+    const requested = timeline.scrollTop + element.getBoundingClientRect().top - timeline.getBoundingClientRect().top - 2;
+    const maximum = timeline.scrollHeight - timeline.clientHeight;
+    timeline.scrollTop = requested;
+    return { requested, maximum, actual: timeline.scrollTop };
   });
+  expect(placement.requested).toBeLessThanOrEqual(placement.maximum);
+  expect(Math.abs(placement.actual - placement.requested)).toBeLessThanOrEqual(1);
   const pinned = () => separators.first().evaluate(element => {
     const timeline = element.closest(".chat-timeline")!.getBoundingClientRect();
     const row = element.getBoundingClientRect();
@@ -1259,7 +1264,7 @@ test("day separators and wrapped slash-command descriptions fit the touch layout
     description: `${"Review the diff for correctness bugs, reuse, simplification, and efficiency cleanups at the chosen effort level. ".repeat(2)}End of review.`,
   }, { name: "overlong-hint", kind: "skill", argumentHint: overlong, description: "One token wider than the menu." }] });
   await page.reload();
-  await page.locator("#touch-tab-chat").click();
+  await showSurface(page, "chat");
   const input = page.locator("#chat-input");
   await input.fill("/code-review-with");
   const menu = page.locator("#chat-command-menu");

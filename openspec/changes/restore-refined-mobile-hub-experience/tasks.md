@@ -198,6 +198,22 @@ Keep production-facing delta specs unsynced until implemented and verified.
   evidence, retained failures and required lead decisions. No historical failure,
   pixel baseline or physical/native check is waived by this status update.
 
+  The lead subsequently assigned bounded diagnosis/correction of the eleven
+  Chat-touch failures in 22.4, without authorizing Chat redesign or historical
+  baseline changes. The fresh run reproduced all eleven: eight obsolete automatic
+  bar-reopening expectations, two old reserved-gutter setup waits, and a pinned-day
+  fixture whose requested scroll exceeded the new full-height timeline's range.
+  Explicit navigation helpers and sufficient trailing fixture content preserve
+  the original answer/follow/scroll and exact pinned-reply assertions. The first
+  complete corrected serial run and original-command repeat each pass 37/37;
+  shared-navigation verification is recorded separately in
+  `review-evidence/live-entry-verification.md`, not inherited as green.
+  That additional suite is 54 pass / 5 fail / 1 existing platform skip: two exact
+  Terminal-color mismatches, two legacy Settings-selector waits, and one WebKit
+  unavailable-Terminal failure whose cause is not established. These remain
+  unwaived for separately scoped follow-up; none of their assertions was changed.
+  The archive mismatch and all seven release/manual gates remain separate.
+
 ## 23. Controlled live candidate handoff
 
 - [ ] 23.1 After sections 18–22 establish capability parity and gates, deliver the live candidate identity, endpoint/action matrix, checks/limits, rollback and separately labeled synthetic review instructions; verify every upstream capability remains reachable and no mock success can be mistaken for a live operation. Obtain version-specific acceptance under 8.3 rather than treating integration authorization as certification.

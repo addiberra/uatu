@@ -599,3 +599,130 @@ checkpoint's evidence, not new runs for this two-callback correction; no broad
 rerun was needed. Task 21.3 is complete again on this focused evidence. The seven
 release/manual gates, historical failures and no-push/no-deployment boundary
 remain unchanged. This correction was self-reviewed, not independently approved.
+
+### Bounded historical Chat-touch reconciliation — 2026-10-16
+
+The lead explicitly assigned diagnosis/correction of the eleven Chat-touch
+failures under 22.4, starting from clean `d54422e`. This supersedes only the
+earlier pending Chat scope decision, not the archive-digest or seven remaining
+release/manual gates. No Chat redesign, baseline replacement or service change
+was authorized or performed.
+
+Fresh unchanged-source reproduction:
+
+```sh
+UATU_E2E_BASE_PORT=24000 UATU_E2E_WORKSPACE_PREFIX=chat-touch-diagnosis bun node_modules/@playwright/test/cli.js test --project=e2e tests/e2e/chat-touch.e2e.ts --workers=1 --output=test-results/chat-touch-diagnosis-red
+```
+
+**26 passed / 11 failed** (2.8 minutes), matching the retained categories. The
+fixture listener was checked free; the existing live/synthetic services stayed
+untouched. Primary output is `.local/chat-touch-diagnosis-red.log` and the named
+ignored Playwright output directory.
+
+Root causes and bounded corrections:
+
+- **Eight resolution/refresh cases:** assertions expected the navigation bar to
+  reopen after keyboard dismissal. Upstream `c3a8306` used CSS to hide its reserved
+  bar while editing, so blur revealed it automatically. The approved overlay
+  contract (`openspec/specs/touch-navigation/spec.md`, overlay and automatic
+  dismissal requirements) instead keeps content-dismissed navigation closed until
+  explicitly reopened. The shared `openNavigation` helper drives the real handle
+  without selecting a surface or popping a child. Existing answer/reject/removal,
+  editing-clearance, subsequent-output follow and raw-scroll-release assertions
+  remain; boot/reload surface selection uses the existing explicit surface helper.
+- **Two field-transfer cases:** setup compared Chat's bottom to the old reserved
+  bar's top. The dismissed bar has no box, producing a measured **844px** difference
+  throughout the wait. Setup now compares to the visual viewport bottom with the
+  unchanged **0.5px** bound. The related keyboard/blur case also requires full-height Chat
+  after explicit navigation reopening, within **1px**, rather than the obsolete
+  Chat/bar alignment. Field transfer,
+  keyboard clearance, retained focus, native-scroll correction and foreground
+  recovery assertions are unchanged.
+- **Pinned-day identity:** investigated independently with frame-by-frame geometry,
+  not by accepting the observed prompt identity. A throwaway fixture probe requested
+  scrollTop **530.296875**, but the full-height timeline's maximum was **494**;
+  it clamped immediately and stayed there over twenty frames. Only restoring the
+  upstream **56px** reserved gutter in that probe raised the maximum to **550**
+  and made both hit points return the expected reply. The test now seeds one more
+  trailing Today prompt/reply, preserving the exact expected
+  `message:yesterday-3-reply` identity on both sides, day texts, sticky/width bounds
+  and slash-command wrapping checks. New setup assertions require the requested
+  scroll to fit the real range and be achieved within **1px**. The probe and its
+  CSS override were removed; logs remain at `.local/chat-touch-pinned-probe.log`
+  and `.local/chat-touch-pinned-differential.log`.
+
+`src/chat/viewport.ts`, `pinned-day.ts` and `timeline-renderer.ts` are unchanged
+against upstream `c3a8306`; the bounded correction changes tests/helpers only.
+No geometry threshold, timeout, golden, product behavior or original semantic
+identity assertion was loosened.
+
+The first corrected focused run was **11 passed / 1 failed**: parent-answer reached
+the later appended-output check but hit the original 30s test deadline before the
+new item attached. The isolated traced parent-answer run passed unchanged in
+5.7s (8.7s including startup). Its original cause is not established, and the
+partial run is not relabeled green. Logs: `.local/chat-touch-corrected-focused.log`
+and `.local/chat-touch-parent-answer.log`.
+
+The complete serial Chat-touch run with failure traces passes **37/37** (1.2
+minutes), including the formerly blocked follow/scroll assertions after explicit
+navigation reopening. The original-command repeat also passes **37/37** (56.5s),
+without tracing or retries. Main type checking and explicit strict type checking
+of the changed E2E files pass; the focused anchor/coordinated-scroll/viewport/
+pinned-day/navigation/evidence units pass **77/77**, 322 assertions across seven
+files.
+
+Executed verification commands (each browser run uses its own ignored output):
+
+```sh
+UATU_E2E_BASE_PORT=24000 UATU_E2E_WORKSPACE_PREFIX=chat-touch-complete bun node_modules/@playwright/test/cli.js test --project=e2e tests/e2e/chat-touch.e2e.ts --workers=1 --trace=retain-on-failure --output=test-results/chat-touch-complete
+UATU_E2E_BASE_PORT=24001 UATU_E2E_WORKSPACE_PREFIX=chat-touch-final bun node_modules/@playwright/test/cli.js test --project=e2e tests/e2e/chat-touch.e2e.ts --workers=1 --output=test-results/chat-touch-final
+bun test src/chat/anchor.test.ts src/chat/coordinated-scroll.test.ts src/chat/viewport.test.ts src/chat/pinned-day.test.ts src/shell/navigation-preferences.test.ts src/shell/navigation-cold-boot.test.ts tests/evidence-discipline.test.ts
+bun run typecheck
+bun node_modules/typescript/bin/tsc --ignoreConfig --noEmit --target ESNext --module ESNext --moduleResolution Bundler --resolveJsonModule --strict --types bun-types --skipLibCheck src/styles.d.ts tests/e2e/chat-touch.e2e.ts tests/e2e/navigation-helpers.ts
+bun node_modules/@fission-ai/openspec/bin/openspec.js validate restore-refined-mobile-hub-experience --strict
+git diff --check
+```
+
+Additional shared-navigation verification:
+
+```sh
+UATU_E2E_BASE_PORT=24000 UATU_E2E_HUB_BASE_PORT=25000 UATU_E2E_WORKSPACE_PREFIX=chat-touch-navigation bun node_modules/@playwright/test/cli.js test -c playwright.mobile.config.ts tests/e2e/navigation-overlay.e2e.ts --workers=1 --output=test-results/chat-touch-navigation
+```
+
+**54 passed / 5 failed / 1 skipped** (5.8 minutes), Chromium/WebKit. This is
+**not** a green navigation matrix. The existing skip is WebKit's unsupported
+Reduced Transparency media emulation. The five failures are outside the assigned
+eleven Chat cases and remain unwaived for a lead-scoped follow-up:
+
+- Both engines stop the Terminal input/unseen-output test at line 349: expected
+  `rgb(244, 250, 255)`, actual `rgb(239, 249, 255)`. The latter is the existing
+  `#eff9ff` rule in `src/styles.css:8387`; both this rule and the exact-color test
+  are unchanged from `d54422e`. Its later input/unseen-output checks are blocked,
+  not certified by this run. No palette expectation or styling was changed.
+- Both engines time out at line 489 waiting for legacy Settings `#navigation-side`.
+  The mobile Settings frontend no longer renders that legacy select; this test
+  and its direct selector are also unchanged from `d54422e`. No selector or
+  deadline was changed in that separate suite.
+- WebKit's unavailable-Terminal case at line 448 receives an enabled tab after
+  its `/api/state` double sets `terminal: "disabled"`. Chromium passes. The cause
+  is **not established**; this is not assumed to be another obsolete assertion
+  or called a product pass. It requires separate diagnosis.
+
+These three cases use their own unchanged local boot/direct controls, not either
+changed navigation helper at their failing steps. Primary evidence is
+`.local/chat-touch-navigation.log` and the per-case `error-context.md` files in
+`test-results/chat-touch-navigation/`. The plain final Chat run used a separate
+listener/workspace while this additional matrix was finishing; it did not share
+fixture state. Logs for both complete Chat passes are
+`.local/chat-touch-complete.log` and `.local/chat-touch-final.log`.
+
+Author self-review found no further issue in the four-file correction. It changes
+only E2E setup/helpers and this evidence/task reconciliation: no product source,
+dependency, configuration, API, archived evidence, reference image or golden
+changed. No force actions, skipped Chat cases, longer deadlines or relaxed
+geometry/semantic assertions were introduced. Diff/metadata publication review
+found no new secrets or unapproved personal data; raw runtime artifacts remain
+ignored. This is self-review, not independent validation. The corrected eleven
+Chat cases are ready for independent review; the newly observed navigation
+failures, archive mismatch and seven release/manual gates still need the lead.
+No push, deployment, service restart/reset, spec sync or archive was performed.

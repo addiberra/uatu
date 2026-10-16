@@ -33,20 +33,26 @@ export async function keepNavigationOpen(page: Page): Promise<void> {
 }
 
 /**
- * Reveal a surface, reopening the bar first if it has been dismissed.
+ * Reopen navigation without changing the selected surface or drill-down.
  *
- * A closed bar fades to `opacity: 0` rather than unmounting, and Playwright
- * still reports it visible, so gate the reopen on `data-open` instead.
+ * Dismissal fades the bar before setting `hidden`. Playwright still reports
+ * it visible during that fade, so gate the reopen on `data-open` instead.
  */
-export async function showSurface(
-  page: Page,
-  tab: "files" | "preview" | "chat" | "terminal",
-): Promise<void> {
+export async function openNavigation(page: Page): Promise<void> {
   const bar = page.locator("#touch-tab-bar");
   if (await bar.getAttribute("data-open") !== "true") {
     await page.locator("#navigation-handle").click();
   }
   await expect(bar).toHaveAttribute("data-open", "true");
+  await expect(bar).toBeVisible();
+}
+
+/** Reveal a surface, reopening the bar first if it has been dismissed. */
+export async function showSurface(
+  page: Page,
+  tab: "files" | "preview" | "chat" | "terminal",
+): Promise<void> {
+  await openNavigation(page);
   await page.locator(`#touch-tab-${tab}`).click();
 }
 
