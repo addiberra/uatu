@@ -93,7 +93,7 @@ export function createWorktreeFlows(env: FlowEnvironment) {
   ]);
   function detail(inventory: WorktreeInventory, checkout: WorktreeCheckout, back: () => void) {
     const sourceWorkspaceId = inventory.sourceWorkspaceId, reference = checkout.workspaceId ?? checkout.checkoutId;
-    const actions: FlowActions = { "flow-back": () => render(inventory, back), refresh: () => show(sourceWorkspaceId, back) };
+    const actions: FlowActions = { "flow-back": () => show(sourceWorkspaceId, back), refresh: () => show(sourceWorkspaceId, back) };
     let body = facts(checkout);
     const run = (call: () => ReturnType<NonNullable<typeof api>["open"]>, context?: HTMLElement) => env.mutate(call, result => outcome(sourceWorkspaceId, result, back), context);
     if (checkout.availability === "present" && inventory.status === "ready") {
@@ -171,7 +171,7 @@ export function createWorktreeFlows(env: FlowEnvironment) {
         root.querySelector('[name="base"]')!.closest("label")!.replaceWith(holder.firstElementChild!);
       }
       showContextualError(root, result.ok ? "Remote branches fetched. Review your selection before creating." : result.error.message);
-    }, root) }, () => render(inventory, back));
+    }, root) }, () => show(inventory.sourceWorkspaceId, back));
     const update = () => { const input = root.querySelector<HTMLInputElement>('[name="branch"]')!; input.disabled = value(root, "mode") !== "new-branch"; input.closest("label")!.hidden = input.disabled; };
     root.addEventListener("change", update); update();
   }

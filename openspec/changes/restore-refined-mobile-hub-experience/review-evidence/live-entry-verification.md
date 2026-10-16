@@ -553,3 +553,49 @@ bun node_modules/@playwright/test/cli.js test -c playwright.mobile-live.config.t
 No baseline/golden, auth/operator configuration, dependency, archived evidence or
 existing live/synthetic service changed. The seven release/manual gates above,
 historical Chat-touch failures and archive-digest mismatch remain unwaived.
+
+### Renewed-review inventory resume correction — 2026-10-16
+
+Follow-up over `b25858a`, not renewed approval: stopping inventory observation
+while an editor/detail was active was correct, but editor Cancel and checkout
+detail Back then rendered the old snapshot. Retained A's existing subscription
+does not replay those missed invalidations. Task 21.3 was reopened for this gap.
+
+Both return callbacks now call the existing authoritative `show` read instead
+of cached `render`. No new observer, timer, stream or history/draft owner was
+introduced. Active editing remains untouched; the existing page-generation
+guard fences late reads. Eight new unit cases went red on unchanged read counts:
+editor/detail resume plus earlier refreshes completing late with success,
+unavailable results or thrown errors. Both browsers also went red when the new
+checkout created during editing remained absent after Cancel.
+
+Current checks:
+
+```sh
+bun test src/hub/mobile/worktree-flows.test.ts
+bun test src/hub/mobile/worktree-flows.test.ts src/hub/mobile/flows.test.ts src/hub/mobile/live-worktree-watch.test.ts src/hub/mobile/frontend.test.ts src/hub/mobile/task-integration.test.ts src/hub/mobile/task-history.test.ts src/hub/mobile/coordinator-context.test.ts src/shared/browser-bundle-discipline.test.ts
+bun node_modules/@playwright/test/cli.js test -c playwright.mobile-live.config.ts tests/e2e/mobile-live-inventory.e2e.ts --output=test-results/inventory-resume-green
+bun node_modules/@playwright/test/cli.js test -c playwright.mobile-live.config.ts tests/e2e/mobile-live-accounts.e2e.ts --grep 'compact checkout More|phone worktree deletion|phone fetch refusal' --output=test-results/inventory-resume-operations
+bun run typecheck
+bun node_modules/typescript/bin/tsc --noEmit -p tests/mobile-hub-review/tsconfig.json
+bun node_modules/typescript/bin/tsc --noEmit -p tests/tsconfig.worktree.json
+```
+
+**19/19 worktree units**, **169/169 focused tests** (1,608 assertions, eight
+files), **10/10 Chromium/WebKit browser cases**, and all three TypeScript
+projects pass. The new real-Hub/Git case receives invalidation while each child
+view is active, preserves the editor draft/detail identity until explicit return,
+then requires a fresh read/new checkout with the same workspace root and exactly
+one stream. It does not depend on a later invalidation or manual Refresh.
+The additional **6/6** focused real-route worktree operation cases also pass in
+both engines: creation/clean deletion, local-data acknowledgement and fetch
+refusal/draft retention/forget/register. No existing deadline was changed.
+
+Red browser output: `.local/inventory-resume-red.log` and
+`test-results/inventory-resume-red`; green: `.local/inventory-resume-green.log`
+and `test-results/inventory-resume-green`. Existing deadlines/assertions and
+baselines were preserved. Earlier 503/74/342/build/smoke results above remain that
+checkpoint's evidence, not new runs for this two-callback correction; no broad
+rerun was needed. Task 21.3 is complete again on this focused evidence. The seven
+release/manual gates, historical failures and no-push/no-deployment boundary
+remain unchanged. This correction was self-reviewed, not independently approved.

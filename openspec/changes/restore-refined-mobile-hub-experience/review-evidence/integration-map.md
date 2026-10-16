@@ -34,6 +34,11 @@ stream or a new broker contract. Editors/tasks stop these observers. All rendere
 branding uses the assembly-supplied URL, including Settings identity. Exact new
 checks and remaining gates are in `live-entry-verification.md`.
 
+The renewed-review follow-up over `b25858a` also re-reads inventory on editor
+Cancel and checkout-detail Back, rather than restoring a snapshot that missed
+events while inactive. It reuses the guarded read owner without another stream;
+the linked evidence separates this focused verification from prior broad runs.
+
 No new wire fields were needed for this assembly: published Hub/workspace
 revisions remain **14/24**. The internal non-secret HTMLBundle template and logo
 are static assets, not authenticated data APIs. Template extraction self-fetches

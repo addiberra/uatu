@@ -34,6 +34,56 @@ test("all rendered phone branding images resolve on production Hub routes and re
   await checkImages();
 });
 
+test("retained inventory reconciles changes missed during editor and checkout detail before resuming", async ({ hubContext, hub }) => {
+  const page = await hubContext.newPage(), source = hub.workspaces[0]!;
+  const git = (args: string[]) => exec("git", ["-C", source.path, ...args]);
+  const folders: string[] = [];
+  let reads = 0;
+  page.on("request", request => { if (new URL(request.url()).pathname === "/api/hub/worktrees") reads++; });
+  await page.addInitScript(() => {
+    (window as any).inventoryResumeInvalidations = 0;
+    window.addEventListener("uatu:worktrees-invalidated", () => { (window as any).inventoryResumeInvalidations++; });
+  });
+  try {
+    await page.goto("/s/mobile-inventory/README.md");
+    await expect(page.locator("#preview-path")).toHaveText("README.md");
+    await expect(page.locator("#connection-state .connection-label")).toHaveText("Connected");
+    await expect.poll(() => page.evaluate(() => (window as any).inventoryResumeInvalidations)).toBeGreaterThan(0);
+    const workspace = await page.locator("#mobile-workspace-root").elementHandle();
+    await expect.poll(() => page.locator("#mobile-workspace-root").evaluate(el => el.getBoundingClientRect().x)).toBe(0);
+    if (await page.locator("#navigation-handle").isVisible()) await page.locator("#navigation-handle").click();
+    await page.locator("#navigation-hub").click();
+    await page.locator('[data-action="info:mobile-inventory"]').click();
+    await page.getByRole("button", { name: /Branches and worktrees/ }).click();
+    await expect(page.getByRole("button", { name: "Create branch or worktree", exact: true })).toBeVisible();
+    for (const child of ["editor", "detail"] as const) {
+      await expect(page.locator("[data-worktree-inventory]")).not.toHaveAttribute("aria-busy", "true");
+      const before = reads, branch = `resume-${child}`, folder = path.join(path.dirname(source.path), branch);
+      if (child === "editor") {
+        await page.getByRole("button", { name: "Create branch or worktree", exact: true }).click();
+        await page.getByLabel("New branch name").fill("preserved-until-cancel");
+      } else await page.getByRole("button", { name: /^main,/ }).click();
+      const childRoot = await page.locator(child === "editor" ? ".mh-task" : ".mh-flow-page h1").elementHandle();
+      const invalidations = await page.evaluate(() => (window as any).inventoryResumeInvalidations);
+      await git(["worktree", "add", "-b", branch, folder, "main"]); folders.push(folder);
+      await expect.poll(() => page.evaluate(() => (window as any).inventoryResumeInvalidations)).toBeGreaterThan(invalidations);
+      expect(reads).toBe(before);
+      expect(await childRoot!.evaluate(el => el.isConnected)).toBe(true);
+      if (child === "editor") await expect(page.getByLabel("New branch name")).toHaveValue("preserved-until-cancel");
+      expect((await openEventSources(page)).filter(url => url.includes("/api/hub/live?"))).toHaveLength(1);
+      if (child === "editor") await page.getByRole("button", { name: "Cancel", exact: true }).click();
+      else await page.locator('.mh-flow-page [data-flow="flow-back"]').click();
+      await expect(page.getByRole("button", { name: new RegExp(`^${branch},`) })).toBeVisible();
+      expect(reads).toBeGreaterThan(before);
+      expect(await workspace!.evaluate(el => el === document.querySelector("#mobile-workspace-root"))).toBe(true);
+      expect((await openEventSources(page)).filter(url => url.includes("/api/hub/live?"))).toHaveLength(1);
+    }
+  } finally {
+    await page.close();
+    for (const folder of folders) await git(["worktree", "remove", folder]);
+  }
+});
+
 for (const entry of ["direct", "retained", "retained-other"] as const) test(`${entry} inventory follows external Git changes through its existing refresh owner on one stream without replacing a draft`, async ({ hubContext, hub }) => {
   test.setTimeout(60_000);
   const page = await hubContext.newPage(), source = hub.workspaces[entry === "retained-other" ? 1 : 0]!;

@@ -43,6 +43,45 @@ test("an open inventory consumes existing invalidations without manual Refresh o
   expect(root.querySelector(".mh-flow-page h1")).toBe(heading);
 });
 
+test.each(["editor", "detail"] as const)("returning from %s re-reads invalidations missed while it was inactive", async child => {
+  let reads = 0, current = inventory;
+  await mount({ inventory: async () => { reads++; return { status: "available", value: current }; } });
+  click(child === "editor" ? "create" : "checkout-0");
+  const childRoot = root.querySelector(child === "editor" ? ".mh-task" : ".mh-flow-page h1");
+  const draft = root.querySelector<HTMLInputElement>('[name="branch"]');
+  if (draft) draft.value = "do-not-discard-while-editing";
+  current = { ...inventory, checkouts: [{ ...checkout, branch: "changed-during-detour" }] };
+  window.dispatchEvent(new window.Event("uatu:worktrees-invalidated")); await settle();
+  expect(reads).toBe(1); expect(childRoot?.isConnected).toBe(true);
+  if (draft) expect(draft.value).toBe("do-not-discard-while-editing");
+  click(child === "editor" ? "cancel-sheet" : "flow-back"); await settle();
+  expect(reads).toBe(2); expect(root.textContent).toContain("changed-during-detour");
+});
+
+for (const child of ["editor", "detail"] as const) test.each(["success", "failure", "throw"] as const)(`${child} resume fences an earlier refresh's late %s`, async outcome => {
+  let reads = 0;
+  let resolve!: (result: import("./backend").ReadResult<WorktreeInventory>) => void, reject!: (error: Error) => void;
+  await mount({ inventory: async () => {
+    reads++;
+    if (reads === 2) return new Promise((done, fail) => { resolve = done; reject = fail; });
+    return { status: "available", value: reads === 1 ? inventory : { ...inventory, checkouts: [{ ...checkout, branch: "fresh-after-resume" }] } };
+  } });
+  window.dispatchEvent(new window.Event("uatu:worktrees-invalidated")); await settle();
+  expect(reads).toBe(2);
+  click(child === "editor" ? "create" : "checkout-0");
+  window.dispatchEvent(new window.Event("uatu:worktrees-invalidated")); await settle();
+  expect(reads).toBe(2);
+  click(child === "editor" ? "cancel-sheet" : "flow-back"); await settle();
+  expect(reads).toBe(3); expect(root.textContent).toContain("fresh-after-resume");
+  const heading = root.querySelector(".mh-flow-page h1");
+  if (outcome === "throw") reject(new Error("Obsolete refresh failure"));
+  else resolve(outcome === "success" ? { status: "available", value: { ...inventory, checkouts: [{ ...checkout, branch: "obsolete-checkout" }] } } : { status: "unavailable", problem: { kind: "unavailable", message: "Obsolete refresh failure" } });
+  await settle();
+  expect(root.querySelector(".mh-flow-page h1")).toBe(heading);
+  expect(root.textContent).toContain("fresh-after-resume");
+  expect(root.textContent).not.toContain("obsolete-checkout"); expect(root.textContent).not.toContain("Obsolete refresh failure");
+});
+
 test("burst invalidations serialize reads, discard superseded payloads and cannot replace a creation draft", async () => {
   let reads = 0, watching = 0;
   let resolve!: (result: import("./backend").ReadResult<WorktreeInventory>) => void;

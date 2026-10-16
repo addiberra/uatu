@@ -24,6 +24,13 @@ earlier unwaived 70/74 concurrent run are recorded separately in
 Hub routes and temporary Git repositories; image checks load the production
 routes. These are not a new user decision, deployed identity or visual approval.
 
+Renewed review then identified missed invalidations on inventory resume. The
+follow-up over `b25858a` re-reads on editor Cancel and detail Back; its current
+evidence is 169 focused tests and 10/10 production-route Chromium/WebKit cases,
+plus three type checks, in the renewed-review section of that record. Task 21.3
+was reopened until these passed. This does not renew the earlier broad checks
+or change any acceptance/deployment decision.
+
 The deployed live/synthetic versions have not changed. This source checkpoint is
 not a newly served candidate, final visual acceptance, a golden approval or a
 physical/native-device result. Tasks 8.3 and 23.2 stay open, along with the named

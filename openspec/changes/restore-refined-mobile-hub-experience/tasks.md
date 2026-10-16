@@ -174,6 +174,14 @@ Keep production-facing delta specs unsynced until implemented and verified.
   See `review-evidence/live-entry-verification.md` for exact current commands,
   results and the bounded cross-workspace reconciliation behavior. This fixes a
   defect in the completed task, not a new acceptance or deployment approval.
+
+  Renewed review found cached inventory on editor Cancel/detail Back after missed
+  invalidations. This task was reopened until the resume correction passed:
+  both paths now re-read through the existing guarded owner. Eight new unit
+  regressions failed before the fix; the focused repeat passes 169 tests and
+  the production Chromium/WebKit inventory suite passes 10/10, including real
+  changes during both detours. See the renewed-review section of the same
+  evidence record. No broad prior result or reviewer approval is newly inferred.
 - [x] 21.4 Implement owner-bound clone attempt admission/reconciliation before wiring submit; verify duplicate same-attempt returns original job, conflicting reuse is refused, concurrent requests and lost responses cannot create two jobs, fenced not-accepted cannot later execute, and pending/expired/unavailable/restart recovery never permits blind resubmission. Publish additive API/retention semantics and test legacy callers without attempt ids, auth/CSRF and cross-owner rejection through API contracts.
 - [x] 21.5 Connect clone submit/events/replay/input/cancel to real job owners after 21.4; verify separate clone identity vs retained assignments, unlock without unauthorized submission, all prompts masked, one accepted job through detours/reload hints, lost acceptance reconciliation, disconnect/replay and cancel/finish race. Exercise success, retained checkout, failed registration/start/cleanup and expired job in isolated fixtures, preserving all authoritative partial facts.
 
