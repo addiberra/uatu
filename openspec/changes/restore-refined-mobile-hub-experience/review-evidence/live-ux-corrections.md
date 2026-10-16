@@ -8,6 +8,11 @@ not independent validation or final human acceptance. No push, deployment,
 personal/provider login, new dependency or global configuration change is part
 of this work. Existing live and synthetic services are preserved.
 
+Implementation commit: `8c7d9f3`, tree
+`dec1345897ee109bea342e2eb48359d3efb85701`. The lead reported independent approval
+of that exact staged tree, with no findings, 182 tests and eight inspected PNGs.
+This is separately reported review provenance, not final human UX acceptance.
+
 ## Implementation
 
 - Workspace actions precede optional information; all original technical,
@@ -74,6 +79,12 @@ agent/provider executable can run there.
   repositories/tokens only, not personal/provider credentials.
 - `bun run build` — passed (`verified-build.log`); existing unsupported
   `highlight` selector warnings remain. Local build only, no service update.
+  Rebuilt after committing: `committed-build.log` identifies **8c7d9f3**;
+  local `dist/uatu` SHA-256 is
+  `a5ba345df3f5817655a15ed9afa6d9d8aae271d0950612ffb0ed114d778ad81f`.
+- `bun test src/preview src/shell/tab-bar.test.ts src/shell/navigation-preferences.test.ts`
+  — **168 passed**, 16 files (`verified-preview-navigation.log`). This overlaps
+  some focused tests above; counts are not added into a fabricated unique total.
 - The existing `auditBundle()` check from
   `tests/mobile-hub-review/isolation-audit.ts` was called directly for
   `src/index.html`, `src/hub/mobile/live-entry.ts` and
@@ -84,14 +95,48 @@ agent/provider executable can run there.
 - `git diff --check` and `openspec validate restore-refined-mobile-hub-experience --strict`
   — passed.
 
-The first broader browser run (`final-browser.log`) used changing source and
-finished **103 passed / 1 failed**. Its failure was test-fixture setup, before the
-external-Stop test body: `hub e2e server did not reset within 20s`. It is not a
-current all-green claim. A frozen-source full rerun uses a separate verified-free
-port range (23200–23209, standalone 23300); its result is recorded separately.
+### Broader matrix: unresolved, not green
 
-Tasks 24.1–24.8 are verified by these focused checks; 24.9 remains open until the
-broader current-production-source matrix and final evidence reconciliation finish.
+All matrix invocations use `bunx playwright test -c playwright.mobile-live.config.ts`
+with these files: `mobile-live-ux-review mobile-live-geometry mobile-live-inventory
+mobile-live-continuity mobile-live-operations mobile-live-credentials
+mobile-live-accounts mobile-live-notifications`.
+
+1. The first broader run (`final-browser.log`) used changing source and finished
+   **103 passed / 1 failed**. Its failure was fixture setup, before the external-Stop
+   body: `hub e2e server did not reset within 20s`. It is not a current green claim.
+2. The frozen-production-source rerun used
+   `UATU_E2E_HUB_BASE_PORT=23200 UATU_E2E_BASE_PORT=23300`, output
+   `verified-browser/`. Native completion reported exit **1**, **102 passed /
+   2 failed** in 17.8 minutes. Chromium failed at the Remove confirmation click
+   in coordinated assignment removal (30s test timeout), and retained dark-mode
+   entry remained at “Waiting for viewable files” instead of README (10s assertion
+   timeout), followed by incomplete fixture Hub shutdown. WebKit passed these
+   cases. The previous external-Stop setup failure did not recur.
+3. With unchanged source/tests/budgets, the exact two failed Chromium cases were
+   run using `--grep 'coordinated assignment removal|dark.*production overview'
+   --repeat-each=2 --trace=on` against `mobile-live-continuity mobile-live-geometry`.
+   **4 passed** (`failure-reproduction.log`, `failure-reproduction/`). This does
+   not establish a cause or waive the full-run failures.
+4. A final full run on the same port range added `--trace=retain-on-failure`, output
+   `final-frozen-browser/`. The foreground shell command exceeded its **1,200,000ms**
+   limit before suite completion. Its log records **78 passes and 8 failures**;
+   there is no completed 104-test summary. Later WebKit failures include HTTP-500
+   session starts reporting disposable Git repositories as non-Git, page-fixture
+   setup timeouts and desktop navigation timeout. Preserve these traces/error
+   contexts for diagnosis; do not infer they are harmless resource flakes.
+
+Product/source fingerprints stayed unchanged throughout the frozen runs. The
+test-only focus/no-auto-submit enhancements were separately verified by the
+16-test run above; the final full run included them. No assertion, timeout,
+baseline or product behavior was changed to obtain a pass. The full-run failures
+are not yet reproducible in the isolated four-case check, and their root cause
+remains unconfirmed. Other users' processes/services were not stopped to improve
+test conditions. Reliable broader verification and diagnosis are a lead handoff
+blocker, not a completed acceptance gate.
+
+Tasks **24.1–24.8 are verified; 24.9 remains unchecked**. No further product edit
+was made after independent approval. Existing historical/manual gates stay open.
 
 ### Actual image inspection
 

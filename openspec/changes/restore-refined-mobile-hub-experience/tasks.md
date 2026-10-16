@@ -256,6 +256,7 @@ to stage any Git files.
 - [x] 24.7 Keep labeled Preview text sizing accessible at 320/390/landscape without dropping controls or targets.
 - [x] 24.8 Make clone safety concise with accessible full facts and unchanged relevant confirmations.
 - [ ] 24.9 Verify meaningful red/green regressions and production Chromium/WebKit visual flows with populated credentials/multiple worktrees, keyboard/history/retention and desktop scope; inspect actual images and record exact results/limits. Lead review, push/deploy and final human/physical-device acceptance remain separate gates.
+  - Focused current-source checks and independent staged-tree review pass. Remains open: the frozen broader matrix finished 102/104 passing, the two failing Chromium cases passed twice in isolation, and the final full diagnostic run timed out with additional setup/session-start failures. No test/budget/baseline was weakened. Implementation is committed as `8c7d9f3`; exact provenance, traces and remaining blocker are in `review-evidence/live-ux-corrections.md`.
 
 ### Historical reconciliation checkpoint — 2026-09-10
 
