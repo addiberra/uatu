@@ -11,9 +11,18 @@ remain unchanged. Planning does not change or restart either running service.
 
 ## What to use
 
+- [Production geometry and contextual safety correction](geometry-correction.md):
+  independently approved source now deployed as `80a2e3d`; fixes the spacing and
+  Settings defects found by visual inspection. Final user acceptance remains open.
+
+- [Current isolated live deployment and visual comparison packet](deployment-verification.md):
+  frozen `80a2e3d`, corrected geometry/compact safety, real-backend checks, preserved OLD
+  synthetic service and explicit remaining human/historical-baseline gates.
+
 - [Production entry and final-review correction evidence](live-entry-verification.md):
   exact live/synthetic checks, inventory/branding corrections over `4ddb012`,
-  provenance and unwaived release/manual gaps. Candidate source is not deployed.
+  provenance and unwaived release/manual gaps. Its source-only deployment status
+  is superseded by the dated deployment packet above.
 
 - The actual reviewer: `bun tests/mobile-hub-review/manage.ts start` (local-only
   by default). Do not start it over another owned instance. See

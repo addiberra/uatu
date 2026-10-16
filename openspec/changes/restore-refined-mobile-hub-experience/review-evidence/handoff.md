@@ -1,5 +1,13 @@
 # Frontend review handoff — phone access confirmed, approval pending
 
+**Current live handoff:** [2026-10-16 deployment and comparison packet](deployment-verification.md).
+The named live `80a2e3d` candidate is ready for testing at the existing private
+live URL with unchanged credentials; the separate OLD synthetic service remains
+unchanged. The record below is historical frontend-only hosting evidence, not
+the current live version or a final acceptance decision.
+The geometry/compact-safety correction is verified live; preceding473514d and
+the original initial-artifact backup remain available as distinct history.
+
 > Start with the [current evidence index](README.md) and [current verification](verification.md). Status and generated-artifact paths below are historical at pre-cleanup commit `373ef6350032f6a0f2a91c2037ebafb553bc002f`; they do not assert fresh passes or close pending gates.
 
 2026-09-10. **Mock backend; do not enter real credentials.** Actual frontend,

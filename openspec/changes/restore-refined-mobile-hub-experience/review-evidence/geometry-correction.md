@@ -1,8 +1,11 @@
 # Production geometry and contextual safety correction — 2026-10-16
 
-**Source-only correction; not deployed or user-accepted.**
-The live executable remains `473514d`. No service, route, installed dependency,
-configuration or authentication policy was changed by this correction.
+**Independently approved source correction, now deployed under separate scoped
+lead authorization; not user-accepted.** The current frozen live executable is
+`80a2e3d`; see [current deployment/rollback evidence](deployment-verification.md).
+The source-verification record below predates that service action: at that point
+live remained473514d. No route, dependency, configuration or authentication policy
+was changed by the correction or subsequent live-only deployment.
 The lead reports independent approval of the seven code/test files, 53 focused
 checks, typechecks and inspected images; the final provenance reconciliation
 below addresses the review's separator-space observation.
@@ -12,7 +15,8 @@ below addresses the review's separator-space observation.
 The lead's image inspection of the deployed dashboard/Settings comparison caught
 real design defects, not approved fidelity exceptions. This record supersedes
 the geometry, broken metadata wrapping and overview safety-layout caveats in
-[the deployment packet](deployment-verification.md) **for corrected source only**.
+[the preceding473514d deployment record](deployment-verification.md) for corrected
+source, subsequently confirmed in the actual deployed80a2e3d screenshots.
 The packet's original observations, checks and historical limitations remain.
 
 The first production-browser regression was run before the fix and failed:

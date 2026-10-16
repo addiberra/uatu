@@ -1,5 +1,13 @@
 # Production mobile entry checkpoint
 
+Current service status is recorded separately in [the 2026-10-16 deployment packet](deployment-verification.md).
+Frozen `80a2e3d` is now deployed only to the lead-confirmed isolated live Hub;
+synthetic remains unchanged. Source-only/no-deployment statements in the dated
+checks below remain historical, not current service or acceptance claims.
+The preceding473514d artifact is retained for rollback. The approved
+[geometry correction](geometry-correction.md) and current deployment checks do
+not complete human acceptance or missing historical/native evidence.
+
 This is candidate-source implementation and self-verification, not independent
 review, deployment approval, final visual acceptance or a physical-device test.
 The existing live/synthetic services and private parallel runtime are unchanged.

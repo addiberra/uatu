@@ -3,7 +3,23 @@
 **Final acceptance remains open.** The 2026-10-15 user decision authorizes live
 integration, not visual/device certification, service rollout, spec sync or archive.
 
-## Current bounded live-facts slice — 2026-10-15
+## Current served candidate — 2026-10-16
+
+The explicitly scoped isolated live deployment is verified: clean source
+`80a2e3d2c76467264589589a7726beaf857c3a03`, frozen version
+`v0.8.0-mobile-live.80a2e3d · 80a2e3d`, artifact SHA-256
+`6e03bc128c45b14a0fcf57f0fdbad72e49f6f6fcbf289831262426f68ee44a57`.
+The same private URL/login now serves the real refined phone frontend. Synthetic
+review remains OLD and unchanged. See [deployment, comparisons and open gates](deployment-verification.md)
+for primary checks, private evidence links, rollback and explicit visual limits.
+The independently approved [geometry/safety correction](geometry-correction.md)
+is now deployed: nine current live-browser scenarios pass. The preceding473514d
+artifact is the default rollback; its former layout defects are resolved, with
+historical observations retained. Task status remains95/100, human gates open.
+This current block supersedes earlier no-live-mount/no-deployment statements;
+the historical results below remain at their original checkpoints.
+
+## Historical bounded live-facts slice — 2026-10-15
 
 **Approved metadata checkpoint:** the lead confirms renewed independent approval
 after the SSH lock/facts and checkout-file corrections, reporting **121 tests
@@ -40,7 +56,7 @@ to the real workspace clients. Same-document coordination retains one workspace
 through ordinary Hub/Settings detours; reload, cross-workspace replacement,
 Stop/removal and authentication invalidation remain distinct boundaries.
 
-The new frontend is not yet wired to live Hub management operations. Workspace
+At that earlier checkpoint the new frontend was not yet wired to live Hub management operations. Workspace
 interior layouts and controls are not redesigned. Review hosting defaults to
 local-only; an optional public origin requires explicit local configuration.
 

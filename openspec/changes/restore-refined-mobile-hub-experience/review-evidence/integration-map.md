@@ -1,5 +1,12 @@
 # Task 1.3 — scoped same-document integration audit
 
+**2026-10-16 status:** the complete live adapter/entry candidate `80a2e3d` is now
+deployed to the explicitly assigned isolated live Hub. See [deployment evidence](deployment-verification.md).
+The approved geometry/compact-safety correction is live; preceding473514d is
+preserved for rollback, and the separate OLD synthetic service remains unchanged.
+The endpoint/action matrix below remains the implementation map; older
+candidate-source/no-service-update descriptions are checkpoint history.
+
 ## Current live integration plan — 2026-10-15
 
 ### Production-entry implementation (candidate source, not deployed)

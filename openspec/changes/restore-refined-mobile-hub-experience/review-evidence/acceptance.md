@@ -1,5 +1,23 @@
 # Design authorization and frontend acceptance record
 
+## Served live candidate — 2026-10-16; awaiting user decision
+
+The lead renewed the exact live-only task23.2 scope for independently approved
+source `80a2e3d`, frozen from that commit and now served as
+`v0.8.0-mobile-live.80a2e3d · 80a2e3d`; executable SHA-256
+`6e03bc128c45b14a0fcf57f0fdbad72e49f6f6fcbf289831262426f68ee44a57`.
+The existing private URL and reviewer login are unchanged; the OLD synthetic
+service was not restarted/refreshed. [Deployment evidence](deployment-verification.md)
+records current checks, before/after comparisons, visual differences and rollback.
+Previous473514d is preserved as default rollback and historical evidence; its
+geometry/wrapping/expanded-safety findings are corrected, not newly approved
+exceptions. Source review/deployment authorization is not user visual acceptance.
+Task 23.2 is complete; task 23.1's technical handoff is delivered, while its
+version-specific acceptance stays open under 8.3. **No final human visual,
+interaction, physical-device or native approval is recorded.** Older source-only
+and preserve-both-services statements below describe their earlier checkpoints,
+not the current deployed identity or current authorization.
+
 ## Implementation checkpoint — not a served-version acceptance
 
 The subsequent user assignment authorizes milestone commits of verified live
