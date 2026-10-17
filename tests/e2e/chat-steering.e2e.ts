@@ -166,10 +166,8 @@ test.describe("steering an OpenCode 2.x turn", () => {
       expect(await button.getAttribute("aria-label")).toContain("“Audit pending");
     }
     await captureScreenshot(page, testInfo, `audit-dock-${mode}-${theme}`);
-    await page.locator("#chat-delivery-toggle").click();
-    await expect(page.locator("#chat-delivery-menu")).toBeVisible();
+    await expect(page.locator("#chat-delivery-toggle, #chat-delivery-menu")).toHaveCount(0);
     await captureScreenshot(page, testInfo, `audit-composer-${mode}-${theme}`);
-    await page.keyboard.press("Escape");
     await scroller.evaluate(element => { element.scrollTop = element.scrollHeight; });
     await expect(scroller).not.toHaveClass(/has-more-below/);
     await expect(queue.locator(".chat-queue-header")).toBeInViewport();
@@ -220,24 +218,15 @@ test.describe("steering an OpenCode 2.x turn", () => {
 
   test("composer explains current shortcuts and selected delivery with readable Send contrast", async ({ page, request }, testInfo) => {
     await newConversation(page);
-    await expect(page.locator("#chat-delivery-toggle")).toBeDisabled();
-    await expect(page.locator("#chat-delivery-toggle")).toHaveAttribute("title", /idle messages send immediately/);
+    await expect(page.locator("#chat-delivery-toggle")).toHaveCount(0);
     await submit(page, "Start the work");
     await expect(page.locator("#chat-stop")).toBeEnabled();
     await page.locator("#chat-input").fill("Keep preference draft");
-    await page.locator("#chat-delivery-toggle").click();
-    const queue = page.getByRole("menuitemradio", { name: /^Queue/ });
-    await queue.click();
-    await expect(page.locator("#chat-delivery-toggle")).toHaveAttribute("title", "Enter: Queue; tap Send steers; hold 2 seconds queues");
+    await page.evaluate(() => localStorage.setItem("uatu:presentation:v1:%2F:chat-delivery", "queue"));
+    await page.locator("#chat-input").fill("Keep preference draft updated");
     await expect(page.locator("#chat-send")).toHaveAttribute("aria-label", "Send as steer; hold 2 seconds to queue");
-    await page.locator("#chat-delivery-toggle").focus();
-    await page.locator("#chat-delivery-toggle").press("Enter");
-    await expect(queue).toHaveAttribute("aria-checked", "true");
-    await expect(queue).toContainText("Enter");
-    await expect(page.getByRole("menuitemradio", { name: /^Steer/ })).toContainText("Alt+Enter");
-    expect(await queue.evaluate(element => getComputedStyle(element.querySelector(".chat-delivery-name")!, "::before").content)).toContain("✓");
-    await page.keyboard.press("Escape");
-    await expect(page.locator("#chat-delivery-toggle")).toBeFocused();
+    await expect(page.locator("#chat-send-help")).toContainText("Enter: Queue; Alt+Enter: Steer");
+    await expect(page.locator("#chat-send")).toHaveAttribute("aria-describedby", "chat-send-help");
     await page.emulateMedia({ colorScheme: "dark" });
     const contrast = await page.locator("#chat-send").evaluate(element => {
       const colors = getComputedStyle(element);
@@ -252,7 +241,7 @@ test.describe("steering an OpenCode 2.x turn", () => {
     await captureScreenshot(page, testInfo, "audit-composer-enabled-dark");
   });
 
-  test("visible Queue fallback submits while only Stop cancels", async ({ page, request }, testInfo) => {
+  test("keyboard Queue submits while only Stop cancels", async ({ page, request }, testInfo) => {
     const conversationId = await newConversation(page);
     const send = page.locator("#chat-send");
     const stop = page.getByRole("button", { name: "Stop response", exact: true });
@@ -267,16 +256,12 @@ test.describe("steering an OpenCode 2.x turn", () => {
       if (/\/(prompts|cancel)$/.test(request.url())) mutations.push(request.url());
     });
     await input.fill("Later, please");
-    await page.locator("#chat-delivery-toggle").click();
-    await page.getByRole("menuitemradio", { name: /^Queue/ }).click();
     await expect(input).toHaveValue("Later, please");
     await expect(input).toBeFocused();
-    await expect(page.locator("#chat-delivery-toggle")).toContainText("Queue");
     expect(mutations).toEqual([]);
     await captureScreenshot(page, testInfo, "steering-separated-actions-desktop");
     const queued = page.waitForResponse(response => response.url().endsWith("/prompts"));
-    await page.locator("#chat-delivery-toggle").click();
-    await page.locator("#chat-queue-draft").click();
+    await input.press("Alt+Enter");
     expect(await (await queued).json()).toMatchObject({ pending: true, delivery: "queue" });
     await expect(held(page)).toContainText("Later, please");
     expect((await fakeSession(request, conversationId))?.running).toBe(true);
@@ -291,46 +276,29 @@ test.describe("steering an OpenCode 2.x turn", () => {
     await expect(held(page)).toHaveAttribute("data-paused");
   });
 
-  test("delivery choices support menu keys and dismiss when keyboard focus leaves", async ({ page, request }, testInfo) => {
+  test("Space hold is keyboard-accessible, Escape cancels, Enter remains quick Send", async ({ page, request }, testInfo) => {
     await startTurn(page, request);
-    const toggle = page.locator("#chat-delivery-toggle");
-    const menu = page.locator("#chat-delivery-menu");
-    const steer = menu.locator("[data-delivery-choice='steer']");
-    const queue = menu.locator("[data-delivery-choice='queue']");
-    await toggle.focus();
-    await toggle.press("Enter");
-    await expect(steer).toBeFocused();
-    await captureScreenshot(page, testInfo, "steering-keyboard-menu");
-    await page.keyboard.press("ArrowDown");
-    await expect(queue).toBeFocused();
-    await page.keyboard.press("ArrowDown");
-    await expect(steer).toBeFocused();
-    await page.keyboard.press("End");
-    await expect(queue).toBeFocused();
-    await page.keyboard.press("Home");
-    await expect(steer).toBeFocused();
-    await page.keyboard.press("ArrowUp");
-    await expect(queue).toBeFocused();
+    const send = page.locator("#chat-send");
+    await page.locator("#chat-input").fill("Keyboard held draft");
+    await send.focus();
+    await page.clock.install();
+    await page.keyboard.down("Space");
+    await page.clock.runFor(350);
+    await captureScreenshot(page, testInfo, "steering-keyboard-hold");
     await page.keyboard.press("Escape");
-    await expect(menu).toBeHidden();
-    await expect(toggle).toBeFocused();
-    await toggle.press("Enter");
-    await page.keyboard.press("Shift+Tab");
-    await expect(menu).toBeHidden();
-    await expect(page.locator("#chat-configuration-trigger")).toBeFocused();
-    // Choosing a default with no draft is not a submission.
-    await toggle.focus();
-    await toggle.press("Enter");
-    await page.keyboard.press("ArrowDown");
-    await page.keyboard.press("Enter");
-    await expect(menu).toBeHidden();
-    await expect(page.locator("#chat-input")).toBeFocused();
-    expect(await submit(page, "Keyboard queued")).toMatchObject({ delivery: "queue" });
+    await page.keyboard.up("Space");
+    await page.clock.runFor(2100);
+    await expect(dock(page)).toHaveCount(0);
+    await expect(send).toBeFocused();
+    await expect(page.locator("#chat-input")).toHaveValue("Keyboard held draft");
+    const accepted = page.waitForResponse(response => response.url().endsWith("/prompts"));
+    await send.press("Enter");
+    expect(await (await accepted).json()).toMatchObject({ delivery: "steer" });
   });
 
   test("Enter steers by default: the steer waits in the dock and joins the timeline only at the step boundary", async ({ page, request }, testInfo) => {
     const conversationId = await startTurn(page, request);
-    await expect(page.locator("#chat-delivery-toggle")).toBeVisible();
+    await expect(page.locator("#chat-delivery-toggle")).toHaveCount(0);
     expect(await submit(page, "Use the other approach")).toMatchObject({ pending: true, delivery: "steer" });
     const steer = steers(page).filter({ hasText: "Use the other approach" });
     await expect(steer).toHaveCount(1);
@@ -615,7 +583,7 @@ for (const browserName of ["chromium", "webkit"] as const) test.describe(`steeri
     await page.setViewportSize({ width: 320, height: 740 });
     await bootChat(page, request);
     const conversationId = await newConversation(page);
-    const controls = ["#chat-send", "#chat-delivery-toggle", "#chat-stop"];
+    const controls = ["#chat-send", "#chat-stop"];
     const boxes = async () => Promise.all(controls.map(async selector => {
       const box = await page.locator(selector).boundingBox();
       expect(box).not.toBeNull();
@@ -644,20 +612,8 @@ for (const browserName of ["chromium", "webkit"] as const) test.describe(`steeri
           expect(box.y).toEqual(before[0]!.y);
         }
       }
-      // Both ends of the edge nearest Send, inside the rounded corners,
-      // belong only to Delivery, not Stop.
-      for (const y of [10, before[0]!.height - 10]) {
-        await page.locator("#chat-delivery-toggle").tap({ position: { x: before[1]!.width - 2, y } });
-        await expect(page.locator("#chat-delivery-menu")).toBeVisible();
-        for (const choice of await page.locator("[data-delivery-choice]").all()) {
-          expect((await choice.boundingBox())!.height).toBeGreaterThanOrEqual(44);
-        }
-        await page.locator("[data-delivery-choice='queue']").tap();
-        await expect(page.locator("#chat-input")).toHaveValue("Unsent draft");
-        await expect(page.locator("#chat-input")).toBeFocused();
-      }
       // The empty gap before Stop is not a hidden extension of its hit area.
-      await page.touchscreen.tap(before[2]!.x - 4, before[2]!.y + 22);
+      await page.touchscreen.tap(before[1]!.x - 4, before[1]!.y + 22);
       expect(await boxes()).toEqual(before);
       expect(mutations).toEqual([]);
       expect((await fakeSession(request, conversationId))?.running).toBe(true);
@@ -665,11 +621,8 @@ for (const browserName of ["chromium", "webkit"] as const) test.describe(`steeri
       await captureScreenshot(page, testInfo, `steering-separated-${width}-${browserName}`);
     }
     // Hardware-keyboard navigation on touch retains the same safe semantics.
-    await page.locator("#chat-delivery-toggle").focus();
-    await page.keyboard.press("Enter");
-    await expect(page.locator("[data-delivery-choice='queue']")).toBeFocused();
-    await page.keyboard.press("Home");
-    await page.keyboard.press("Enter");
+    await page.locator("#chat-send").focus();
+    await expect(page.locator("#chat-send")).toHaveAttribute("aria-describedby", "chat-send-help");
     await expect(page.locator("#chat-input")).toHaveValue("Unsent draft");
     expect(mutations).toEqual([]);
     const accepted = page.waitForResponse(response => response.url().endsWith("/prompts"));
@@ -693,13 +646,9 @@ for (const browserName of ["chromium", "webkit"] as const) test.describe(`steeri
     await expect(page.locator("#chat-stop")).toBeEnabled();
     const sendChoice = async (text: string, delivery: "steer" | "queue") => {
       await input.fill(text);
-      await page.locator("#chat-delivery-toggle").tap();
       const accepted = page.waitForResponse(response => response.url().endsWith("/prompts"));
-      await page.locator(`#chat-delivery-menu [data-delivery-choice='${delivery}']`).tap();
-      await expect(input).toHaveValue(text);
       if (delivery === "queue") {
-        await page.locator("#chat-delivery-toggle").tap();
-        await page.locator("#chat-queue-draft").tap();
+        await input.press("Alt+Enter");
       } else await page.locator("#chat-send").tap();
       expect(await (await accepted).json()).toMatchObject({ pending: true, delivery });
       await expect(input).toHaveValue("");
@@ -749,7 +698,7 @@ for (const browserName of ["chromium", "webkit"] as const) test.describe(`steeri
     await expect(page.locator("#chat-items")).toContainText("Held touch work");
   });
 
-  test("separate touch delivery selects without sending and keeps the rails stable", async ({ page, request }, testInfo) => {
+  test("touch hold queues without menus and keeps the rails stable", async ({ page, request }, testInfo) => {
     await request.post("/__e2e/reset");
     await control(request, { action: "agents", stack: "opencode-v2" });
     const token = await request.get("/__e2e/terminal-token").then(response => response.json()) as { token: string };
@@ -769,44 +718,27 @@ for (const browserName of ["chromium", "webkit"] as const) test.describe(`steeri
     const rail = page.locator(".chat-composer-actions");
     const before = await rail.boundingBox();
     const sendBefore = await page.locator("#chat-send").boundingBox();
-    const toggle = page.locator("#chat-delivery-toggle");
-    await expect(toggle).toBeVisible();
-    await toggle.tap();
-    const menu = page.locator("#chat-delivery-menu");
-    await expect(menu).toBeVisible();
-    await expect(menu.locator("[data-delivery-choice]")).toHaveText([/Steer/, /Queue/]);
-    await expect(menu.locator("[data-delivery-choice='steer']")).toHaveAttribute("aria-checked", "true");
-    await captureScreenshot(page, testInfo, `steering-touch-menu-${browserName}`);
+    await expect(page.locator("#chat-delivery-toggle, #chat-delivery-menu")).toHaveCount(0);
+    await captureScreenshot(page, testInfo, `steering-touch-inline-${browserName}`);
     const after = await rail.boundingBox();
     const sendAfter = await page.locator("#chat-send").boundingBox();
     expect(after!.height).toBeCloseTo(before!.height, 0);
     expect(after!.y).toBeCloseTo(before!.y, 0);
     expect(sendAfter!.x).toBeCloseTo(sendBefore!.x, 0);
     expect(sendAfter!.width).toBeCloseTo(sendBefore!.width, 0);
-    await toggle.tap();
-    await expect(menu).toBeHidden();
-
-    // Choosing Queue only sets the keyboard default. The fallback queues now.
+    // Holding is the only touch Queue affordance, and does not move Send.
     await input.fill("Later, please");
-    await toggle.tap();
-    await page.keyboard.press("Escape");
-    await expect(input).toBeFocused();
-    await expect(menu).toBeHidden();
-    await toggle.tap();
     const queued = page.waitForResponse(response => response.url().endsWith("/prompts"));
-    await menu.locator("[data-delivery-choice='queue']").tap();
-    await expect(input).toHaveValue("Later, please");
-    await expect(input).toBeFocused();
-    await toggle.tap();
-    await page.locator("#chat-queue-draft").tap();
+    const box = (await page.locator("#chat-send").boundingBox())!;
+    await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+    await page.mouse.down();
     expect(await (await queued).json()).toMatchObject({ pending: true, delivery: "queue" });
-    await expect(menu).toBeHidden();
+    await page.mouse.up();
     await expect(held(page).filter({ hasText: "Later, please" })).toHaveCount(1);
     await input.fill("Also later");
     const again = page.waitForResponse(response => response.url().endsWith("/prompts"));
-    await input.press("Control+Enter");
+    await input.press("Alt+Enter");
     expect(await (await again).json()).toMatchObject({ pending: true, delivery: "queue" });
-    await toggle.tap();
-    await expect(menu.locator("[data-delivery-choice='queue']")).toHaveAttribute("aria-checked", "true");
+    await expect(page.locator("#chat-send-help")).toContainText("Alt+Enter: Queue");
   });
 });

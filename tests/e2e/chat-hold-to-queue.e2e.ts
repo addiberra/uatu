@@ -10,6 +10,7 @@ test("/btw answers natively without foreground admission or interruption", async
   await boot(page, request);
   const before = await request.post("/__e2e/chat", { data: { action: "opencode", op: "state" } }).then(response => response.json());
   await page.locator("#chat-input").fill("/btw What does the current task mean?");
+  await expect(page.locator("#chat-send-help")).not.toContainText("Hold Send");
   const answer = page.waitForResponse(response => response.url().endsWith("/aside"));
   await page.locator("#chat-send").click();
   expect((await answer).ok()).toBe(true);
@@ -119,17 +120,24 @@ test("idle hold dispatches normally without inventing a pending queue entry", as
   await expect(page.locator(".chat-queued-message")).toHaveCount(0);
   await expect(page.locator("#chat-items")).toContainText("Idle held draft");
 });
-test("tap steers despite saved Queue keyboard preference; fallback queues without holding", async ({ page, request }) => {
+test("tap steers despite saved Queue keyboard preference; Space hold queues without a menu", async ({ page, request }) => {
   await boot(page, request);
   await page.locator("#chat-input").fill("Tap is steer");
-  await page.locator("#chat-delivery-toggle").click();
-  await page.locator('[data-delivery-choice="queue"]').click();
+  await page.evaluate(() => localStorage.setItem("uatu:presentation:v1:%2F:chat-delivery", "queue"));
   await page.locator("#chat-send").click();
   await expect(page.locator('.chat-queued-message[data-delivery="steer"]')).toHaveCount(1);
   await page.locator("#chat-input").fill("Accessible queue");
-  await page.locator("#chat-delivery-toggle").click();
-  await page.locator("#chat-queue-draft").click();
+  await page.locator("#chat-send").focus();
+  await page.keyboard.down("Space");
   await expect(page.locator('.chat-queued-message[data-delivery="queue"]')).toHaveCount(1);
+  await page.keyboard.up("Space");
+  await expect(page.locator('.chat-queued-message[data-delivery="queue"]')).toHaveCount(1);
+  await page.locator("#chat-input").fill("Saved keyboard queue");
+  await page.locator("#chat-input").press("Enter");
+  await expect(page.locator('.chat-queued-message[data-delivery="queue"]')).toHaveCount(2);
+  await page.locator("#chat-input").fill("One-shot keyboard steer");
+  await page.locator("#chat-input").press("Alt+Enter");
+  await expect(page.locator('.chat-queued-message[data-delivery="steer"]')).toHaveCount(2);
 });
 test("two-second hold queues before release once with fixed target and upward countdown", async ({ page, request }, testInfo) => {
   await boot(page, request);
@@ -145,6 +153,23 @@ test("two-second hold queues before release once with fixed target and upward co
   await expect(page.locator("#chat-input")).toHaveValue("");
   await expect(page.locator(".chat-queued-message")).toHaveCount(1);
 });
+for (const cancellation of ["early Space release", "keyboard focus leaves Send"] as const) {
+  test(`${cancellation} never sends through a later native click or timer`, async ({ page, request }) => {
+    await boot(page, request);
+    await page.locator("#chat-input").fill("Keep keyboard draft");
+    await page.locator("#chat-send").focus();
+    await page.clock.install();
+    await page.keyboard.down("Space");
+    await page.clock.runFor(350);
+    if (cancellation === "keyboard focus leaves Send") await page.keyboard.press("Tab");
+    await page.keyboard.up("Space");
+    await page.clock.runFor(2100);
+    await expect(page.locator(".chat-queued-message")).toHaveCount(0);
+    await expect(page.locator("#chat-input")).toHaveValue("Keep keyboard draft");
+    await expect(page.locator("#chat-stop")).toBeEnabled();
+    await expect(page.locator(".chat-hold-upward")).toBeHidden();
+  });
+}
 for (const cancellation of ["early release", "drag out", "Escape", "blur", "draft change", "lost capture", "pointercancel", "visibilitychange", "layout change"] as const) {
   test(`${cancellation} cancels a deliberate hold without steering`, async ({ page, request }) => {
     await boot(page, request);
@@ -188,7 +213,9 @@ test("touch inline controls retain real labels and minimum targets", async ({ pa
   await page.setViewportSize({ width: 390, height: 844 });
   await page.addInitScript(() => localStorage.setItem("uatu:presentation:v1:%2F:uatu:ui-mode", "touch"));
   await boot(page, request);
-  const metrics = await page.evaluate(() => Object.fromEntries(["chat-attach", "chat-configuration-trigger", "chat-send", "chat-delivery-toggle", "chat-stop"].map(id => {
+  await expect(page.locator("#chat-options-toggle, #chat-options-menu, #chat-delivery-toggle, #chat-delivery-menu")).toHaveCount(0);
+  await expect(page.locator("#chat-context-usage")).toBeHidden();
+  const metrics = await page.evaluate(() => Object.fromEntries(["chat-attach", "chat-configuration-trigger", "chat-send", "chat-stop"].map(id => {
     const box = document.getElementById(id)!.getBoundingClientRect();
     return [id, { width: box.width, height: box.height, right: box.right }];
   })));
@@ -216,7 +243,8 @@ test("touch inline controls retain real labels and minimum targets", async ({ pa
     await expect(page.locator("#chat-input")).toHaveValue("Hold without losing this draft");
   }
 });
-test("inline context uses the latest occupancy, not output or cumulative session tokens", async ({ page, request }) => {
+test("inline context uses the latest occupancy, not output or cumulative session tokens", async ({ page, request }, info) => {
+  await page.setViewportSize({ width: 390, height: 844 });
   await page.addInitScript(() => localStorage.setItem("uatu:presentation:v1:%2F:uatu:ui-mode", "touch"));
   await boot(page, request, false, false);
   const conversationId = await page.locator("#chat-conversation-select").inputValue();
@@ -228,6 +256,10 @@ test("inline context uses the latest occupancy, not output or cumulative session
   ]) expect((await request.post("/__e2e/chat", { data: { action: "item", conversationId, item } })).ok()).toBe(true);
   await expect(page.locator("#chat-inline-context")).toHaveText("25% · 25k/100k context");
   await expect(page.locator("#chat-inline-context")).toHaveAttribute("title", "25,000 tokens in context; 100,000 reported limit");
+  for (const theme of ["light", "dark"] as const) {
+    await page.emulateMedia({ colorScheme: theme });
+    await captureScreenshot(page, info, `inline-context-known-${theme}`);
+  }
 });
 }
 for (const engine of ["chromium", "webkit"] as const) test.describe(`B composer ${engine}`, () => {

@@ -6939,33 +6939,6 @@ html[data-ui-mode="desktop"][data-notification-chat] .chat-expand-strip {
   height: 2.75rem;
 }
 
-.chat-delivery-toggle {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 0.3rem;
-  width: 5rem;
-  height: 2.75rem;
-  min-width: 2.75rem;
-  padding: 0;
-  border: 1px solid var(--border-medium);
-  border-radius: 0.5rem;
-  background: var(--surface);
-  color: var(--text-strong);
-  font: inherit;
-  font-size: 0.8em;
-  cursor: pointer;
-}
-
-.chat-delivery-toggle[hidden] {
-  display: none;
-}
-
-.chat-delivery-toggle:focus-visible,
-.chat-delivery-toggle[aria-expanded="true"] {
-  background: var(--surface-muted);
-}
-
 .chat-stop-button {
   width: 3.25rem;
   min-width: 2.75rem;
@@ -6980,89 +6953,11 @@ html[data-ui-mode="desktop"][data-notification-chat] .chat-expand-strip {
   cursor: pointer;
 }
 
-.chat-stop-button:disabled,
-.chat-delivery-toggle:disabled { opacity: 0.5; cursor: default; }
+.chat-stop-button:disabled { opacity: 0.5; cursor: default; }
 .chat-stop-button:hover:not(:disabled) { background: var(--surface-muted); }
 .chat-stop-button.has-worker-scope { width: 5.5rem; padding-inline: 0.5rem; }
 .chat-send-group button { touch-action: manipulation; }
 .chat-send-group button:focus-visible { outline: 0.125rem solid var(--accent); outline-offset: 0.125rem; }
-
-.chat-delivery-menu {
-  position: absolute;
-  right: 0;
-  bottom: calc(100% + 0.4rem);
-  z-index: 5;
-  display: flex;
-  flex-direction: column;
-  min-width: 13rem;
-  padding: 0.3rem;
-  border: 1px solid var(--border-medium);
-  border-radius: 0.6rem;
-  background: var(--surface-raised);
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
-}
-
-.chat-delivery-backdrop {
-  position: fixed;
-  inset: 0;
-  z-index: 4;
-  background: transparent;
-  touch-action: manipulation;
-}
-.chat-delivery-backdrop[hidden] { display: none; }
-.chat-send-group:has(.chat-delivery-menu:not([hidden])) .chat-delivery-toggle {
-  position: relative;
-  z-index: 5;
-}
-
-.chat-delivery-menu[hidden] {
-  display: none;
-}
-
-.chat-delivery-menu [role="menuitemradio"] {
-  min-height: 2.75rem;
-  display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 0.1rem;
-  padding: 0.4rem 0.6rem;
-  border: none;
-  border-radius: 0.4rem;
-  background: none;
-  color: var(--text-strong);
-  font: inherit;
-  text-align: left;
-  cursor: pointer;
-}
-
-.chat-delivery-menu [role="menuitemradio"]:focus-visible {
-  background: var(--surface-muted);
-}
-@media (hover: hover) {
-  .chat-delivery-toggle:hover,
-  .chat-delivery-menu [role="menuitemradio"]:hover { background: var(--surface-muted); }
-}
-
-.chat-delivery-name::before {
-  content: "○";
-  display: inline-block;
-  width: 1.4rem;
-}
-
-.chat-delivery-menu [role="menuitemradio"][aria-checked="true"] .chat-delivery-name::before {
-  content: "✓";
-}
-
-.chat-delivery-shortcut {
-  margin-inline-start: 1.4rem;
-  font-size: 0.75em;
-  color: var(--text-subtle);
-}
-
-.chat-delivery-hint {
-  color: var(--text-subtle);
-  font-size: 0.75em;
-}
 
 /* The liveness pulse shared by the timeline's working line and the composer's
    background-work state. */
@@ -8784,19 +8679,17 @@ html[data-ui-mode="touch"] .chat-composer-actions:has(> .chat-attach-button) {
     grid-row: 2;
     justify-self: end;
   }
-  .chat-composer-actions:has(#chat-delivery-toggle[hidden]),
-  html[data-ui-mode="touch"] .chat-composer-actions:has(#chat-delivery-toggle[hidden]) {
+  .chat-composer-actions:has(.chat-send-group:not([data-steering])) {
     grid-template-columns: auto minmax(0, 1fr) auto auto;
   }
-  .chat-composer-actions:has(> .chat-attach-button):has(#chat-delivery-toggle[hidden]),
-  html[data-ui-mode="touch"] .chat-composer-actions:has(> .chat-attach-button):has(#chat-delivery-toggle[hidden]) {
+  .chat-composer-actions:has(> .chat-attach-button):has(.chat-send-group:not([data-steering])) {
     grid-template-columns: 2.25rem auto minmax(0, 1fr) auto auto;
   }
-  .chat-composer-actions:has(#chat-delivery-toggle[hidden]) > .chat-send-group {
+  .chat-composer-actions:has(.chat-send-group:not([data-steering])) > .chat-send-group {
     grid-column: 4;
     grid-row: 1;
   }
-  .chat-composer-actions:has(> .chat-attach-button):has(#chat-delivery-toggle[hidden]) > .chat-send-group {
+  .chat-composer-actions:has(> .chat-attach-button):has(.chat-send-group:not([data-steering])) > .chat-send-group {
     grid-column: 5;
   }
 }
@@ -10698,24 +10591,19 @@ html[data-ui-mode="touch"][data-chat-wide-short] .chat-queue[hidden] { display: 
 html[data-ui-mode="touch"][data-chat-wide-short] .chat-queue-header { display: contents; }
 html[data-ui-mode="touch"][data-chat-wide-short] .chat-queue-note { flex: 1 1 0; min-width: 0; padding: 0; }
 
-html[data-ui-mode="touch"] :is(.chat-task-stop, .chat-queued-action, .chat-delivery-toggle, [data-delivery-choice]) {
+html[data-ui-mode="touch"] :is(.chat-task-stop, .chat-queued-action) {
   -webkit-tap-highlight-color: transparent;
 }
-html[data-ui-mode="touch"] :is(.chat-task-stop, .chat-queued-action, .chat-delivery-toggle, [data-delivery-choice]):active {
+html[data-ui-mode="touch"] :is(.chat-task-stop, .chat-queued-action):active {
   background: var(--surface-muted);
 }
-html[data-ui-mode="touch"] :is(.chat-task-stop, .chat-delivery-hint) { font-size: 0.8125rem; }
+html[data-ui-mode="touch"] .chat-task-stop { font-size: 0.8125rem; }
 html[data-ui-mode="touch"] .chat-background-action button { font: inherit; }
 html[data-ui-mode="touch"] .chat-conversation-controls select { font-size: 1rem; }
 /* Touch keeps one deliberate worker disclosure and one pending disclosure.
    Their existing rows/handlers remain the inspection and mutation owners. */
 .chat-queue-items[hidden] { display: none; }
-.chat-options-toggle, .chat-options-menu, .chat-options-backdrop { display: none; }
-.chat-header-options { display: flex; flex: 0 0 auto; align-items: center; }
-.chat-header-options:empty { display: none; }
-html[data-ui-mode="touch"] .chat-options-toggle { display: inline-flex; align-items: center; justify-content: center; min-width: 44px; min-height: 44px; border: 1px solid var(--border-soft); border-radius: 8px; color: inherit; background: var(--surface); font: inherit; }
 html[data-ui-mode="touch"] .chat-composer-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
-html[data-ui-mode="touch"] .chat-options-toggle { flex: 0 0 44px; }
 .chat-composer-notices:not(:has(> :not([hidden]))) { display: none; }
 /* Feedback owns a bounded, keyboard-scrollable band, never the draft's flex
    remainder. The leading unresolved notice stays visible as work settles. */
@@ -10735,7 +10623,6 @@ html[data-ui-mode="touch"]:is([data-chat-compact], [data-chat-wide-short]) .chat
   grid-row: 1;
 }
 html[data-ui-mode="touch"]:is([data-chat-compact], [data-chat-wide-short]) #chat-send { width: 2.75rem; }
-html[data-ui-mode="touch"]:is([data-chat-compact], [data-chat-wide-short]) .chat-delivery-toggle { width: 4rem; }
 html[data-ui-mode="touch"]:is([data-chat-compact], [data-chat-wide-short]) .chat-composer-notices {
   grid-column: 1 / -1;
   grid-row: 2;
@@ -10756,34 +10643,6 @@ html[data-ui-mode="touch"]:is([data-chat-compact], [data-chat-wide-short]) .chat
 html[data-ui-mode="touch"] .chat-send-group { margin-left: auto; max-width: 100%; height: auto; min-height: 44px; flex-wrap: wrap; justify-content: flex-end; }
 html[data-ui-mode="touch"] .chat-composer-status { align-self: flex-end; }
 html[data-ui-mode="touch"] #chat-configuration-trigger { display: none; }
-html[data-ui-mode="touch"] .chat-options-backdrop:not([hidden]) { display: block; position: fixed; inset: 0; z-index: 120; }
-html[data-ui-mode="touch"] .chat-options-menu:not([hidden]) {
-  display: block;
-  position: absolute;
-  z-index: 121;
-  bottom: var(--chat-options-bottom, 120px);
-  left: max(8px, env(safe-area-inset-left));
-  right: max(8px, env(safe-area-inset-right));
-  max-height: var(--chat-options-height, calc(var(--chat-visual-height) - 144px));
-  overflow: auto;
-  overscroll-behavior: contain;
-  border: 1px solid var(--border-soft);
-  border-radius: 12px;
-  padding: 8px;
-  background: var(--surface-raised);
-  box-shadow: 0 8px 32px #0005;
-}
-html[data-ui-mode="touch"] .chat-options-menu button,
-html[data-ui-mode="touch"] .chat-options-menu summary { min-width: 44px; min-height: 44px; font: inherit; }
-html[data-ui-mode="touch"] .chat-options-menu p { font-size: 0.85em; color: var(--text-subtle); }
-html[data-ui-mode="touch"] #chat-options-content { display: flex; flex-direction: column; gap: 8px; }
-html[data-ui-mode="touch"] #chat-options-content .chat-context-breakdown { position: static; max-width: 100%; }
-html[data-ui-mode="touch"] #chat-options-content .chat-plan-readout { position: static; max-width: 100%; max-height: none; }
-html[data-ui-mode="touch"] #chat-options-content .chat-background-action { padding: 0; }
-html[data-ui-mode="touch"][data-chat-keyboard] #chat-options-content .chat-background-action { display: none; }
-@media (max-height: 32rem) and (orientation: landscape) {
-  html[data-ui-mode="touch"] #chat-options-content .chat-background-action { display: none; }
-}
 .chat-compact-workers[hidden] { display: none; }
 .chat-pending-toggle {
   min-width: 44px;
@@ -10834,19 +10693,20 @@ html[data-ui-mode="touch"] .chat-work-dock :is(.chat-queue, #chat-task-list-item
 html[data-ui-mode="touch"] .chat-composer-actions { flex-wrap: nowrap; width: 100%; gap: 8px; }
 html[data-ui-mode="touch"] #chat-attach { display: inline-flex; flex: 0 0 44px; width: 44px; height: 44px; align-items: center; justify-content: center; }
 html[data-ui-mode="touch"] #chat-configuration-trigger { display: flex; flex: 1 1 0; width: 0; min-width: 44px; min-height: 44px; padding: 3px 6px; flex-direction: column; justify-content: center; gap: 2px; overflow: hidden; }
+html[data-ui-mode="touch"] #chat-configuration-done { min-width: 44px; min-height: 44px; }
 html[data-ui-mode="touch"] #chat-configuration-trigger > :is(.chat-configuration-summary, .chat-configuration-details) { display: none; }
 html[data-ui-mode="touch"] :is(.chat-inline-configuration, .chat-inline-context) { display: block; max-width: 100%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 11px; line-height: 16px; text-align: left; }
 html[data-ui-mode="touch"] .chat-inline-context { color: var(--accent); }
 html[data-ui-mode="touch"] .chat-composer-status { display: none; }
 html[data-ui-mode="touch"] .chat-send-group { flex: 0 0 auto; display: flex; flex-wrap: nowrap; gap: 8px; margin: 0; min-height: 44px; height: 44px; }
-html[data-ui-mode="touch"] :is(#chat-send, #chat-delivery-toggle, #chat-stop) { flex: 0 0 44px; width: 44px; min-width: 44px; min-height: 44px; padding-inline: 2px; box-sizing: border-box; font-size: 11px; }
+html[data-ui-mode="touch"] :is(#chat-send, #chat-stop) { flex: 0 0 44px; width: 44px; min-width: 44px; min-height: 44px; padding-inline: 2px; box-sizing: border-box; font-size: 11px; }
 html[data-ui-mode="touch"] #chat-send { order: 0; }
-html[data-ui-mode="touch"] #chat-delivery-toggle { order: 1; }
 html[data-ui-mode="touch"] #chat-stop { order: 2; }
-html[data-ui-mode="touch"] #chat-delivery-label { display: none; }
-html[data-ui-mode="touch"] #chat-delivery-toggle svg { width: 12px; height: 12px; }
-html[data-ui-mode="touch"] .chat-delivery-menu { order: 3; }
-html[data-ui-mode="touch"] .chat-delivery-menu button { min-height: 44px; }
+/* Occupancy is already in the picker pill on touch; retain desktop breakdown. */
+html[data-ui-mode="touch"] #chat-context-usage { display: none; }
+/* Keep unique account usage controls on their own row, not squeezed inline. */
+html[data-ui-mode="touch"] .chat-composer-actions:has(> .chat-composer-chips:not([hidden])) { flex-wrap: wrap; }
+html[data-ui-mode="touch"] .chat-composer-chips { flex: 0 0 100%; }
 html[data-ui-mode="touch"]:is([data-chat-compact], [data-chat-wide-short]) .chat-composer { display: grid; grid-template-columns: minmax(0, 1fr); gap: 0; padding-block: 0; }
 html[data-ui-mode="touch"]:is([data-chat-compact], [data-chat-wide-short]) .chat-composer textarea { grid-row: 1; grid-column: 1; width: 100%; }
 html[data-ui-mode="touch"]:is([data-chat-compact], [data-chat-wide-short]) .chat-composer-actions { display: flex; grid-row: 2; grid-column: 1 / -1; margin-top: 0; }

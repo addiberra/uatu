@@ -22,10 +22,7 @@ export async function openChatPanel(page: Page): Promise<void> {
 export async function openChatConfiguration(page: Page): Promise<void> {
   const dialog = page.locator("#chat-configuration-dialog");
   if (!await dialog.isVisible()) {
-    if (await page.locator("html").getAttribute("data-ui-mode") === "touch") {
-      if (await page.locator("#chat-options-menu").isHidden()) await page.locator("#chat-options-toggle").click();
-      await page.locator("#chat-options-configuration").click();
-    } else await page.locator("#chat-configuration-trigger").click();
+    await page.locator("#chat-configuration-trigger").click();
   }
   await expect(dialog).toBeVisible();
 }

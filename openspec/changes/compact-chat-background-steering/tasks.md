@@ -52,7 +52,75 @@
 - [x] 7.4 Verify pinned native V2 side-generation and TUI /btw semantics, implement a capability-gated side answer if it cannot execute agent tools or mutate foreground/history; otherwise report the specific blocking decision.
 - [x] 7.5 Align approved mock (remove redundant still-frame footer), specs and CHAT documentation; run clean CI, type/build/API/strict-spec checks and relevant Chromium/WebKit browser evidence. Independent review/publication/deployment remain lead-owned.
 
-### Approved B revision verification (2026-10-17)
+## 8. Approved redundant-control cleanup (2026-10-17)
+
+- [x] 8.1 Remove top Options trigger/panel, relocation wiring and dead styles; keep the real inline picker, attachments, standalone Continue/help and unique account usage reachable without duplicate touch context/model presentation.
+- [x] 8.2 Remove Send delivery dropdown; preserve two-second pointer Queue, cancellation guards, existing keyboard preference/Alt+Enter and touch newline, adding described Space-hold Queue with native quick Enter on Send.
+- [x] 8.3 Remove Restore finished without a replacement control; retain persisted view-only Dismiss, hidden counts and provider/timeline results.
+- [x] 8.4 Present the personal Hub setting as a compact labelled switch, one-line scope helper, collapsed Learn more and explicit compact Save; preserve existing default ON/account/save/conflict/error policy.
+- [x] 8.5 Complete clean CI, type/build/API/strict-spec checks and chat/Hub Chromium/WebKit geometry, theme, keyboard and history evidence; inspect actual renders and report additional redundancy candidates without removing them. Independent review/publication/deployment remain lead-owned. Full browser coverage retains the separately reproduced baseline failures below; this does not claim an all-green suite.
+
+### Cleanup verification (2026-10-17)
+
+Implementation self-verification, not independent review. Evidence is retained in
+approved scratch `opencode/composer-cleanup-20261017/`; nothing was committed,
+pushed, installed, deployed or changed on a user Hub. The pre-existing untracked
+`tmp/chat-ui-options/` remains untouched and excluded from publication.
+
+- `ci-acceptance.log`: **5,275 pass / 16 skip / 0 fail** across 298 files.
+  Typecheck, fresh build, API validation and strict change validation pass;
+  `api-tests-acceptance.log`: **208 pass / 0 fail**;
+  `source-compiled-acceptance.log`: **16 pass / 0 fail**. Existing highlight
+  selector and OpenAPI composition warnings remain.
+- `browser-acceptance.log`: **610 pass / 5 fail** across the full 615-case
+  non-performance chat/Hub suite, Chromium/WebKit and desktop/touch. All five
+  failures reproduce on an untouched archive of `50da1e8`, using existing
+  dependencies and isolated test ports: `baseline-browser.log` reproduces the
+  desktop picker-details assertion and two old touch subagent-list selectors;
+  `baseline-shell-browser.log` reproduces two more old touch-list selectors.
+  These unrelated test files/assertions were left unchanged.
+- `perf.log`: **16 pass / 4 fail**. All four failures time out on the same
+  hidden desktop subagent-list selector before measuring touch-child work;
+  `baseline-perf.log` reproduces all four on untouched `50da1e8`. Full browser
+  acceptance is therefore not green: baseline test migration/desktop-width
+  diagnosis needs separate lead scope, not relaxed assertions in this cleanup.
+- `browser-corrections.log`: **15 pass / 0 fail** for the last targeted
+  corrections; every case also passes in the final 615-case run. Coverage
+  includes Space hold/cancellation, saved keyboard delivery, truthful context,
+  real picker focus restoration, and retained timeline report/child inspection
+  after persisted Dismiss with no Restore control. Touch returns composing
+  focus after a tap; keyboard activation restores the actual inline picker.
+- `screenshots-acceptance/` and the Playwright report retain phone/tablet,
+  short keyboard/landscape, desktop, enlarged text, light/dark, two-second hold,
+  model picker, known-context and compact account-switch evidence. Selected
+  actual phone/tablet/desktop renders were inspected against both supplied
+  screenshots. Physical-device, assistive-technology and live/paid-model
+  validation remain unperformed.
+- Earlier diagnostic failures remain in the logs. One unchanged file-watcher
+  test timed out during the first concurrent CI/browser run; its file then
+  passed 22/22 unchanged and both subsequent full CI runs passed. Its intermittent
+  cause is not established. Cleanup corrections preserve the non-steering
+  desktop rail, cancel raw touch-gap holds, keep touch picker Done at 44px,
+  and test the actual picker backdrop/focus ownership rather than the removed
+  Options layer. No timeout or acceptance threshold was relaxed.
+
+## 9. User-approved summary text simplification (2026-10-17)
+
+- [x] 9.1 Test first, then change successful personal-setting status to **Saved**, retaining the scoped helper, visible switch state, explicit Save, pending locks and separate conflict/read/write-failure messages.
+- [x] 9.2 Test first, then omit zero-count worker summary segments while retaining working/finished/unknown/hidden counts, terminal failure/stop distinctions, a hidden-only count and a nonblank **No workers** fallback for empty conversations.
+- [x] 9.3 Run targeted unit and Chromium/WebKit Settings/worker/disclosure checks, inspect updated renders, and pass typecheck/diff checks without repeating the known baseline-failure matrix or changing unrelated behavior.
+
+Follow-up evidence: approved scratch `opencode/composer-labels-20261017/`.
+`red.log` records **5 pass / 4 expected regression failures** before implementation;
+`unit.log` records **11 pass / 0 fail** afterward. `browser.log` records
+**12 pass / 0 fail**, including switch state, persistence, conflict/unavailable
+handling, both touch engines, hidden-only/empty accessibility labels and the
+existing mixed-worker viewport/theme matrix. Typecheck and `git diff --check`
+pass; `screenshots/` retains the simplified Saved status and zero-free summaries.
+Full CI and the separately confirmed baseline failures above were not rerun for
+this bounded text follow-up. No commit, deployment or live-Hub change was made.
+
+### Approved B revision verification (2026-10-17; historical, before cleanup)
 
 All 32 implementation tasks are complete. This is implementation self-verification, not independent review. Final evidence is retained in approved scratch `opencode/composer-b-finish-20261017/` (under the environment's approved temporary root), with exact paths, corrections, native-source references and limitations in `handoff.md`. The inherited dirty implementation and untracked `tmp/chat-ui-options/` mock were preserved; the latter remains excluded from publication.
 

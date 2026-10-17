@@ -721,7 +721,6 @@
               <h2 id="chat-title" class="sr-only">Chat</h2>
             </div>
             <div class="chat-conversation-controls">
-              <span id="chat-header-options" class="chat-header-options"></span>
               <label class="sr-only" for="chat-conversation-select">Conversation</label>
               <select id="chat-conversation-select" aria-label="Conversation"></select>
               <button id="chat-conversation-unseen-count" class="chat-conversation-unseen-count" type="button" hidden>
@@ -876,13 +875,6 @@
                is typed, with the way to log in (the Hub's Settings, or the
                agent's own command outside a Hub). -->
           <div id="chat-login-notice" class="chat-login-notice" role="status" hidden></div>
-          <div id="chat-delivery-backdrop" class="chat-delivery-backdrop" aria-hidden="true" hidden></div>
-          <div id="chat-options-backdrop" class="chat-options-backdrop" aria-hidden="true" hidden></div>
-          <section id="chat-options-menu" class="chat-options-menu" role="dialog" aria-label="Chat options" hidden>
-            <button id="chat-options-configuration" type="button">Chat settings</button>
-            <div id="chat-options-content"></div>
-            <p>Hub automatic backgrounding follows your personal Settings. Eligible blocking jobs include shell commands; shared work remains collaborative. Standalone uses explicit Continue.</p>
-          </section>
           <form id="chat-composer" class="chat-composer" hidden>
             <label class="sr-only" id="chat-input-label" for="chat-input">Send a message</label>
             <div id="chat-command-menu" class="chat-command-menu" role="listbox" aria-label="Slash commands" hidden></div>
@@ -897,7 +889,6 @@
             </div>
             <input id="chat-attach-input" type="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden>
             <div class="chat-composer-actions">
-              <button id="chat-options-toggle" class="chat-options-toggle" type="button" aria-label="Chat options" aria-haspopup="dialog" aria-controls="chat-options-menu" aria-expanded="false">⋯</button>
               <!-- Visible even when the selected model cannot see images (then
                    inactive, naming the model): the model choice flips often,
                    and a control that appears and disappears with it would be
@@ -932,22 +923,13 @@
               </button>
               <span id="chat-composer-status" class="chat-composer-status" data-state="ready" aria-label="Ready" title="Ready" role="img"></span>
               <span id="chat-composer-status-live" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></span>
-              <!-- Delivery only selects; Send always submits, even while busy.
-                   Stop has its own separated target and never replaces Send. -->
+              <span id="chat-send-help" class="sr-only">Hold Send or Space for 2 seconds to queue. Release partway or press Escape to cancel. Enter activates Send immediately.</span>
+              <!-- Send and Stop retain separate targets. -->
               <span id="chat-send-group" class="chat-send-group">
-                <button id="chat-delivery-toggle" class="chat-delivery-toggle" type="button" aria-haspopup="menu" aria-controls="chat-delivery-menu" aria-expanded="false" aria-label="Delivery: Steer" title="Delivery: Steer" hidden>
-                  <span id="chat-delivery-label">Steer</span>
-                  <svg viewBox="0 0 12 12" width="10" height="10" aria-hidden="true"><path d="M3 4.5 6 7.5l3-3" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
-                </button>
-                <button id="chat-send" class="chat-primary-button" type="submit" aria-label="Send message" title="Send message" disabled>
+                <button id="chat-send" class="chat-primary-button" type="submit" aria-label="Send message" aria-describedby="chat-send-help" title="Send message" disabled>
                   <span class="chat-send-label">Send</span>
                 </button>
                 <button id="chat-stop" class="chat-stop-button" type="button" aria-label="Stop response" title="Stop response" disabled>Stop</button>
-                <div id="chat-delivery-menu" class="chat-delivery-menu" role="menu" aria-label="Delivery" hidden>
-                  <button type="button" role="menuitemradio" aria-checked="true" data-delivery-choice="steer"><span class="chat-delivery-name">Steer</span><span class="chat-delivery-shortcut">Enter</span><span class="chat-delivery-hint">Next step</span></button>
-                  <button type="button" role="menuitemradio" aria-checked="false" data-delivery-choice="queue"><span class="chat-delivery-name">Queue</span><span class="chat-delivery-shortcut">Alt+Enter</span><span class="chat-delivery-hint">After this turn</span></button>
-                  <button type="button" role="menuitem" id="chat-queue-draft">Queue message now</button>
-                </div>
               </span>
               <!-- Chips the login reports beside the status: plan utilization
                    and a standing rate limit. Their own row under the actions,

@@ -253,7 +253,7 @@ test("composer stays flush with separate Send and Stop on a stable narrow action
 
   const geometry = await page.locator(".chat-composer-actions").evaluate(actions => {
     const send = actions.querySelector<HTMLElement>("#chat-send")!.getBoundingClientRect();
-    const trigger = document.querySelector<HTMLElement>("#chat-options-toggle")!.getBoundingClientRect();
+    const trigger = document.querySelector<HTMLElement>("#chat-configuration-trigger")!.getBoundingClientRect();
     const header = document.querySelector<HTMLElement>(".chat-header")!.getBoundingClientRect();
     const status = actions.querySelector<HTMLElement>("#chat-configuration-trigger")!.getBoundingClientRect();
     const bounds = actions.getBoundingClientRect();
@@ -274,10 +274,8 @@ test("composer stays flush with separate Send and Stop on a stable narrow action
       margin: style.margin,
     };
   });
-  // Options has one stable header target; status and submission retain their
-  // composer rail without an empty settings row or shrunken touch targets.
-  expect(geometry.triggerTop).toBeGreaterThanOrEqual(geometry.headerTop);
-  expect(geometry.triggerBottom).toBeLessThanOrEqual(geometry.headerBottom);
+  // One real inline picker shares the Send rail, without a duplicate header.
+  expect(geometry.triggerBottom).toBeCloseTo(geometry.sendBottom, 0);
   expect(geometry.triggerWidth).toBeGreaterThanOrEqual(44);
   expect(geometry.triggerHeight).toBeGreaterThanOrEqual(44);
   expect(Math.abs(geometry.statusBottom - geometry.sendBottom)).toBeLessThanOrEqual(2);
@@ -432,7 +430,7 @@ test("software-keyboard geometry keeps the composer in the visual viewport", asy
   expect(sheetGeometry.top).toBeGreaterThanOrEqual(0);
   expect(sheetGeometry.bottom).toBeLessThanOrEqual(sheetGeometry.visualHeight + 1);
   await page.locator("#chat-configuration-done").click();
-  await expect(page.locator("#chat-options-toggle")).toBeFocused();
+  await expect(page.locator("#chat-configuration-trigger")).toBeFocused();
   await expect(page.locator("#chat-input")).toHaveCSS("font-size", "16px");
   await page.locator("#chat-input").focus();
   await expect(page.locator("html")).toHaveAttribute("data-chat-editing", "");
@@ -1192,7 +1190,6 @@ test.describe("rate-limit standing in touch mode", () => {
     await expect(page.locator('[data-chat-item-id="notice:rate-limit"]')).toHaveCount(0);
     await captureScreenshot(page, testInfo, "touch-rate-limit-warning");
     // It opens here too, and the readout stays clear of the composer.
-    await page.locator("#chat-options-toggle").click();
     await summary.click();
     await expect(page.locator("#chat-plan-readout-standing")).toBeVisible();
     await captureScreenshot(page, testInfo, "touch-rate-limit-warning-readout");

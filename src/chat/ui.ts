@@ -8,7 +8,7 @@ import { registerBackInterceptor } from "../shell/history";
 import { onManualRecovery, registerRecoveryWork, requestManualRecovery } from "../shell/live";
 import { onWorkspaceCredentialRefresh } from "../terminal/client";
 import { ChatApiClient, ChatConnectionInterruptedError, ChatTransportError, STEER_ALREADY_DELIVERED_CODE, type ChatEventStream } from "./client";
-import { otherDelivery, readDeliveryPreference, writeDeliveryPreference } from "./delivery-preference";
+import { otherDelivery, readDeliveryPreference } from "./delivery-preference";
 import { TimelineAnchorController, type AnchorGeometry, type TimelineAnchor } from "./anchor";
 import { CoordinatedScrollOwner, type RevealOptions } from "./coordinated-scroll";
 import { ChatViewportController } from "./viewport";
@@ -26,7 +26,6 @@ import { pausedStatusLabel, pausedWakeups, pendingWakeups, scheduledStatusLabel,
 import { RunningWorkDisclosure } from "./running-work-disclosure";
 import { CompactDisclosure, compactWorkers, workerSummary } from "./compact-work";
 import { CompactWorkersView } from "./compact-workers-view";
-import { createTouchChatOptions } from "./touch-options";
 import { SilentRunFollower, TaskInspectionPanel, formatTaskElapsed, taskForChild, taskById, taskInspection, type OpenTaskInspection } from "./task-inspection";
 import { composerRoutineState, formatUsd, latestPlanReport, latestRateLimit, planChip, planHasRows, planName, planReadoutRows, sessionTotalsTitle, standingSentence, usageAsOf, usageStale, type RateLimitStanding } from "./composer-status";
 import { buildPlanRowNodes, currentUsageReport, initUsagePaneControls, noteUsageReport, onUsageChange, onUsageRead, readStatusText, readUsageNow, refreshUsageIfStale, revealUsagePane, usageReadState, usageReadable } from "./usage-pane";
@@ -142,10 +141,6 @@ export function initChat(api = new ChatApiClient()): void {
   const revertedItems = document.querySelector<HTMLElement>("#chat-reverted-items");
   const queueDockElement = document.querySelector<HTMLElement>("#chat-queue");
   const queueNoteElement = document.querySelector<HTMLElement>("#chat-queue-note");
-  const deliveryToggle = document.querySelector<HTMLButtonElement>("#chat-delivery-toggle");
-  const deliveryLabel = document.querySelector<HTMLElement>("#chat-delivery-label");
-  const deliveryMenu = document.querySelector<HTMLElement>("#chat-delivery-menu");
-  const deliveryBackdrop = document.querySelector<HTMLElement>("#chat-delivery-backdrop");
   const form = document.querySelector<HTMLFormElement>("#chat-composer");
   const input = document.querySelector<HTMLTextAreaElement>("#chat-input");
   const commandMenu = document.querySelector<HTMLElement>("#chat-command-menu");
@@ -1044,12 +1039,11 @@ export function initChat(api = new ChatApiClient()): void {
   const compactWorkerState = new CompactDisclosure();
   const compactPendingState = new CompactDisclosure();
   compactWorkersList?.addEventListener("toggle", () => compactWorkerState.toggled(compactWorkersList.open));
-  const compactView = compactWorkersItems ? new CompactWorkersView(compactWorkersItems, restore => {
+  const compactView = compactWorkersItems ? new CompactWorkersView(compactWorkersItems, () => {
     if (!projection) return;
     const dismissed = new Set(presentation.dismissedSubagents[projection.conversationId] ?? []);
     for (const worker of compactWorkers(projection.items)) {
-      if (restore) { dismissed.delete(worker.id); for (const reference of worker.references) dismissed.delete(reference); }
-      else if (worker.state !== "working" && worker.state !== "unknown") { dismissed.add(worker.id); for (const reference of worker.references) dismissed.add(reference); }
+      if (worker.state !== "working" && worker.state !== "unknown") { dismissed.add(worker.id); for (const reference of worker.references) dismissed.add(reference); }
     }
     presentation.dismissedSubagents[projection.conversationId] = [...dismissed];
     save(); syncCompactWork();
@@ -1063,12 +1057,12 @@ export function initChat(api = new ChatApiClient()): void {
     const dismissed = new Set(projection ? presentation.dismissedSubagents[projection.conversationId] ?? [] : []);
     const workers = allWorkers.filter(worker => worker.state === "working" || worker.state === "unknown" || !dismissed.has(worker.id) && !worker.references.some(id => dismissed.has(id)));
     const hiddenCount = allWorkers.length - workers.length;
-    const summary = `${workerSummary(workers) || "0 working · 0 finished"}${hiddenCount ? ` · ${hiddenCount} hidden` : ""}`;
+    const summary = workerSummary(workers, hiddenCount);
     compactWorkersLabel.textContent = summary;
     compactWorkersLabel.setAttribute("aria-label", `Workers: ${summary}`);
     compactWorkersList.hidden = allWorkers.length === 0;
     compactWorkersList.open = compactWorkerState.paint(projection?.conversationId ?? null);
-    compactView?.paint(projection?.conversationId ?? null, workers, stoppingTasks, declares("background-tasks"), hiddenCount);
+    compactView?.paint(projection?.conversationId ?? null, workers, stoppingTasks, declares("background-tasks"));
   };
   compactWorkersItems?.addEventListener("mousedown", event => keepTouchComposerFocus(event));
   compactWorkersList?.querySelector("summary")?.addEventListener("mousedown", event => keepTouchComposerFocus(event));
@@ -2955,14 +2949,8 @@ export function initChat(api = new ChatApiClient()): void {
       actionFeedback.hidden = !note;
       if (actionFeedback.textContent !== note) actionFeedback.textContent = note;
     }
-    // Keep the selector's space across lifecycle changes. Idle delivery is
-    // unchanged; only a steering-capable conversation exposes the preference.
-    if (deliveryToggle) {
-      deliveryToggle.hidden = !declares("steering");
-      deliveryToggle.disabled = !deliveryChoiceOffered();
-      if (deliveryToggle.hidden || deliveryToggle.disabled) closeDeliveryMenu();
-      syncDeliveryMenu();
-    }
+    syncSendDescription();
+    sendGroup?.toggleAttribute("data-steering", declares("steering"));
     configurationTrigger.disabled = submitting || !projection || catalogLoading;
     configurationTrigger.toggleAttribute("aria-busy", catalogLoading);
     syncHistoryControls();
@@ -3545,7 +3533,6 @@ export function initChat(api = new ChatApiClient()): void {
     configurationPicker?.open();
   });
   configurationTrigger.addEventListener("mousedown", event => keepTouchComposerFocus(event));
-  createTouchChatOptions(() => { refreshCatalogsOnUse(); configurationPicker?.open(); });
   renderConfiguration();
   // With one agent there is no choice to offer; with more, creation asks.
   // The menu shows every offered agent with its availability, so an
@@ -3811,127 +3798,30 @@ export function initChat(api = new ChatApiClient()): void {
   }
   queueDockElement.addEventListener("scroll", syncQueueOverflow, { passive: true });
 
-  // The delivery Enter uses while a steering conversation is busy, and its
-  // separate selection-only menu (D10). The preference is per device and
-  // read on every submission; ⌥Enter overrides it once.
+  // Preserve existing per-device keyboard delivery; Alt+Enter overrides once.
   let requestedDelivery: MessageDelivery | undefined;
-  // A declaration, not a const: syncControls reads it before this point runs.
   function deliveryChoiceOffered(): boolean {
     return Boolean(projection) && declares("steering") && (isLiveConversationStatus(projection?.status) || (projection?.queued.length ?? 0) > 0);
   }
-  function syncDeliveryMenu(): void {
+  function sendSupportsHold(): boolean {
+    const draft = input?.value ?? "";
+    return declares("steering") && !/^\/btw(?:\s|$)/.test(draft.trim()) && !localHistoryOperation(draft, commands, declares("reversible-history"));
+  }
+  function syncSendDescription(): void {
     const preferred = readDeliveryPreference(presentationLocalStorage());
     const touch = document.documentElement.dataset.uiMode === "touch";
     const label = preferred === "steer" ? "Steer" : "Queue";
-    if (deliveryLabel) deliveryLabel.textContent = label;
-    deliveryToggle?.setAttribute("aria-label", `Send options. Keyboard delivery: ${label}`);
-    if (deliveryToggle) deliveryToggle.title = deliveryChoiceOffered() ? touch ? `Ctrl+Enter: ${label}; Enter adds a new line; tap Send steers` : `Enter: ${label}; tap Send steers; hold 2 seconds queues` : "Delivery applies while working or messages are pending; idle messages send immediately";
     const sendAction = /^\/btw(?:\s|$)/.test(input?.value.trim() ?? "") ? "Ask side question" : localHistoryOperation(input?.value ?? "", commands, declares("reversible-history")) ? "Send message" : isLiveConversationStatus(projection?.status)
       ? declares("steering") && !isListedCommand(input?.value ?? "") && currentPendingAttachments().length === 0 ? "Send as steer; hold 2 seconds to queue" : declares("steering") ? "Send to queue" : "Queue message"
       : "Send message";
     send?.setAttribute("aria-label", sendAction);
     if (send) send.title = sendAction;
-    const queueDraft = document.querySelector<HTMLButtonElement>("#chat-queue-draft");
-    if (queueDraft) {
-      queueDraft.disabled = send?.disabled ?? true;
-      queueDraft.textContent = isLiveConversationStatus(projection?.status) || (projection?.queued.length ?? 0) > 0 ? "Queue message now" : "Send message now (idle)";
-    }
-    for (const item of deliveryMenu?.querySelectorAll<HTMLButtonElement>("[data-delivery-choice]") ?? []) {
-      item.setAttribute("aria-checked", String(item.dataset.deliveryChoice === preferred));
-      const shortcutText = item.dataset.deliveryChoice === preferred ? touch ? "Ctrl+Enter" : "Enter" : "Alt+Enter";
-      item.setAttribute("aria-label", `${item.dataset.deliveryChoice === "steer" ? "Steer, next step" : "Queue, after this turn"}, ${shortcutText}`);
-      const shortcut = item.querySelector<HTMLElement>(".chat-delivery-shortcut");
-      if (shortcut) shortcut.textContent = shortcutText;
-    }
+    const help = document.querySelector<HTMLElement>("#chat-send-help");
+    const keys = sendSupportsHold() && !isListedCommand(input?.value ?? "") && currentPendingAttachments().length === 0
+      ? `${touch ? "Ctrl+Enter" : "Enter"}: ${label}; Alt+Enter: ${preferred === "steer" ? "Queue" : "Steer"} while working`
+      : `${touch ? "Ctrl+Enter" : "Enter"} sends`;
+    if (help) help.textContent = `${sendSupportsHold() ? "Hold Send or Space for 2 seconds to queue; release partway or Escape cancels. " : ""}Enter activates Send immediately. In the message field, ${keys}.${touch ? " Enter adds a new line." : ""}`;
   }
-  const onDeliveryMenuOutside = (event: Event) => {
-    // Keep the touch backdrop until click: removing it at pointerdown lets
-    // the same gesture activate whatever destructive control lies beneath.
-    if (event.target === deliveryBackdrop) return;
-    if (deliveryMenu && !deliveryMenu.contains(event.target as Node) && !deliveryToggle?.contains(event.target as Node)) closeDeliveryMenu();
-  };
-  let deliveryPreviousFocus: HTMLElement | null = null;
-  const onDeliveryMenuKey = (event: KeyboardEvent) => {
-    if (event.key === "Escape") {
-      event.preventDefault();
-      closeDeliveryMenu();
-      (deliveryPreviousFocus?.isConnected ? deliveryPreviousFocus : deliveryToggle)?.focus();
-      return;
-    }
-    // Touch can leave focus in the composer while the menu is open. Do not
-    // intercept its editing keys unless focus is actually in the menu.
-    if (!deliveryMenu?.contains(document.activeElement)) return;
-    if (event.key === "Tab") {
-      closeDeliveryMenu();
-      deliveryToggle?.focus();
-      // Let Tab move naturally from the disclosure into the surrounding UI.
-      return;
-    }
-    const choices = Array.from(deliveryMenu.querySelectorAll<HTMLButtonElement>("button:not(:disabled)"));
-    const index = choices.indexOf(document.activeElement as HTMLButtonElement);
-    let next: number;
-    switch (event.key) {
-      case "ArrowDown": next = (index + 1) % choices.length; break;
-      case "ArrowUp": next = (index - 1 + choices.length) % choices.length; break;
-      case "Home": next = 0; break;
-      case "End": next = choices.length - 1; break;
-      default: return;
-    }
-    event.preventDefault();
-    choices[next]?.focus();
-  };
-  function closeDeliveryMenu(): void {
-    if (deliveryBackdrop) deliveryBackdrop.hidden = true;
-    if (!deliveryMenu || deliveryMenu.hidden) return;
-    deliveryMenu.hidden = true;
-    deliveryToggle?.setAttribute("aria-expanded", "false");
-    document.removeEventListener("pointerdown", onDeliveryMenuOutside, true);
-    document.removeEventListener("keydown", onDeliveryMenuKey, true);
-  }
-  deliveryToggle?.addEventListener("mousedown", keepTouchComposerFocus);
-  deliveryToggle?.addEventListener("pointerdown", () => { deliveryPreviousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null; });
-  deliveryToggle?.addEventListener("click", event => {
-    if (!deliveryMenu) return;
-    if (!deliveryMenu.hidden) { closeDeliveryMenu(); return; }
-    if (event.detail === 0) deliveryPreviousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : deliveryToggle;
-    syncDeliveryMenu();
-    deliveryMenu.hidden = false;
-    if (deliveryBackdrop) deliveryBackdrop.hidden = document.documentElement.dataset.uiMode !== "touch";
-    deliveryToggle.setAttribute("aria-expanded", "true");
-    // A touch choice keeps the composer (and keyboard) focused so opening
-    // the menu does not change the rail's layout. Keyboard users still land
-    // on the current choice.
-    if (event.detail === 0 || document.documentElement.dataset.uiMode !== "touch") {
-      deliveryMenu.querySelector<HTMLButtonElement>("[aria-checked='true']")?.focus();
-    }
-    document.addEventListener("pointerdown", onDeliveryMenuOutside, true);
-    document.addEventListener("keydown", onDeliveryMenuKey, true);
-  });
-  deliveryMenu?.addEventListener("mousedown", keepTouchComposerFocus);
-  deliveryBackdrop?.addEventListener("click", event => {
-    event.preventDefault();
-    event.stopPropagation();
-    closeDeliveryMenu();
-  });
-  deliveryMenu?.addEventListener("click", event => {
-    if ((event.target as Element).closest("#chat-queue-draft")) {
-      closeDeliveryMenu();
-      requestedDelivery = "queue";
-      form.requestSubmit();
-      return;
-    }
-    const choice = (event.target as Element).closest<HTMLButtonElement>("[data-delivery-choice]");
-    if (!choice) return;
-    const delivery: MessageDelivery = choice.dataset.deliveryChoice === "queue" ? "queue" : "steer";
-    // Selection never sends or stops work. Send (or Enter) is the explicit
-    // submission action, regardless of whether a draft is already present.
-    writeDeliveryPreference(presentationLocalStorage(), delivery);
-    syncDeliveryMenu();
-    closeDeliveryMenu();
-    const action = document.documentElement.dataset.uiMode === "touch" ? "Ctrl+Enter" : "Enter";
-    noteComposer(delivery === "steer" ? `${action} steers while the agent works` : `${action} queues while the agent works`);
-    input.focus();
-  });
 
   revertedItems?.addEventListener("pointerdown", event => {
     if (event.pointerType === "touch" && (event.target as Element).closest("[data-history-restore]")) event.preventDefault();
@@ -4679,6 +4569,7 @@ export function initChat(api = new ChatApiClient()): void {
   let holdTimer: ReturnType<typeof setTimeout> | null = null;
   let holdFrame = 0;
   let suppressPointerClick = false;
+  let ownedSpace = false;
   const submitDelivery = (delivery: MessageDelivery) => {
     requestedDelivery = delivery;
     form.requestSubmit();
@@ -4725,7 +4616,7 @@ export function initChat(api = new ChatApiClient()): void {
   };
   send.addEventListener("pointerdown", event => {
     suppressPointerClick = false;
-    if (!declares("steering") || /^\/btw(?:\s|$)/.test(input.value.trim()) || localHistoryOperation(input.value, commands, declares("reversible-history"))) return;
+    if (!sendSupportsHold()) return;
     if (!event.isPrimary || event.button !== 0 || !hold.begin(event.pointerId, performance.now())) return;
     event.preventDefault(); // Keep the composing field and mobile keyboard owned.
     suppressPointerClick = true;
@@ -4756,8 +4647,25 @@ export function initChat(api = new ChatApiClient()): void {
     submitDelivery("steer");
   });
   send.addEventListener("keydown", event => {
-    if (event.repeat && (event.key === "Enter" || event.key === " ")) event.preventDefault();
+    if (event.key === " " && !event.repeat) ownedSpace = false;
+    if (event.key === " " && sendSupportsHold()) {
+      event.preventDefault();
+      ownedSpace = true;
+      if (event.repeat || holdPointer !== null || !hold.begin(-1, performance.now())) return;
+      holdPointer = -1;
+      paintHold();
+      holdTimer = setTimeout(() => { hold.check(performance.now()); clearHoldVisual(); }, 2000);
+    } else if (event.repeat && event.key === "Enter") event.preventDefault();
   });
+  send.addEventListener("keyup", event => {
+    if (event.key !== " " || !ownedSpace) return;
+    ownedSpace = false;
+    event.preventDefault(); // Suppress Space's native click, including after Escape.
+    if (holdPointer !== -1) return;
+    hold.release(-1, performance.now());
+    cancelHold();
+  });
+  send.addEventListener("blur", () => { if (holdPointer === -1) cancelHold(); });
   document.addEventListener("keydown", event => {
     if (event.key !== "Escape" || holdPointer === null) return;
     event.preventDefault(); event.stopImmediatePropagation(); cancelHold();
@@ -4777,7 +4685,7 @@ export function initChat(api = new ChatApiClient()): void {
       return touch.clientX >= box.left && touch.clientX < box.right
         && touch.clientY >= box.top && touch.clientY < box.bottom;
     });
-    if (!hit) event.preventDefault();
+    if (!hit) { event.preventDefault(); cancelHold(); }
   }, { passive: false });
   stop?.addEventListener("mousedown", keepTouchComposerFocus);
   stop?.addEventListener("click", async () => {

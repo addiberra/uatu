@@ -53,7 +53,7 @@ test("a Settings-only read failure does not promise saved ON automation is disab
   await expect(error).toContainText("cannot confirm");
   await expect(error).toContainText("saved preferences may still apply");
   await expect(error).not.toContainText("is skipped");
-  await expect(settings.getByLabel("Automatically background blocking work when steering")).toBeDisabled();
+  await expect(settings.getByLabel("Keep workers running when I steer")).toBeDisabled();
   await childChatControl(workspace, { action: "opencode", op: "launchShell", conversationId, background: false });
   await page.locator("#chat-input").fill("Steer under the saved server policy");
   await page.locator("#chat-send").click();
@@ -197,7 +197,7 @@ test("same-account devices share retained receipts while a stale ON display cann
   const { workspace, conversationId, post } = await setup(hub, hubContext);
   const staleSettings = await hubContext.newPage();
   await staleSettings.goto(`${hub.origin}/settings`);
-  await expect(staleSettings.getByLabel("Automatically background blocking work when steering")).toBeChecked();
+  await expect(staleSettings.getByLabel("Keep workers running when I steer")).toBeChecked();
   const other = await browser.newContext();
   try {
     const login = await other.newPage(); await signIn(login, hub);
@@ -212,7 +212,7 @@ test("same-account devices share retained receipts while a stale ON display cann
     await childChatControl(workspace, { action: "opencode", op: "launchShell", conversationId, background: false });
     const endpoint = `${workspace.sessionUrl}api/chat/conversations/${encodeURIComponent(conversationId)}/prompts`;
     expect(await (await other.request.post(endpoint, { headers: { origin: hub.origin }, data: body })).json()).toEqual(accepted);
-    await expect(staleSettings.getByLabel("Automatically background blocking work when steering")).toBeChecked();
+    await expect(staleSettings.getByLabel("Keep workers running when I steer")).toBeChecked();
     expect(await (await post("/prompts", { ...body, requestId: "new-after-off", text: "Fresh OFF input" })).json()).not.toHaveProperty("automaticBackground");
     const state = await childChatControl(workspace, { action: "opencode", op: "state" }) as { calls: string[] };
     const mutations = state.calls.slice(before.calls.length).filter(call => call.startsWith("POST "));

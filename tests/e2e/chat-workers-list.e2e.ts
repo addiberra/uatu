@@ -17,11 +17,42 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`canonical w
     await use(page); await browser.close();
   } });
 
+  test("finished-only dismissal keeps a named hidden count and an empty conversation has a nonblank fallback", async ({ page, request }) => {
+    await request.post("/__e2e/reset");
+    await request.post("/__e2e/chat", { data: { action: "agents", count: 2 } });
+    const empty = await request.post("/__e2e/chat", { data: { action: "seed", agent: "claude", title: "Empty", items: [] } }).then(response => response.json());
+    const finished = await request.post("/__e2e/chat", { data: { action: "seed", agent: "claude", title: "Finished", items: [
+      { id: "failed", type: "background_task", taskId: "failed", status: "failed", description: "Failed worker", createdAt: 1 },
+      { id: "stopped", type: "background_task", taskId: "stopped", status: "stopped", description: "Stopped worker", createdAt: 2 },
+    ] } }).then(response => response.json());
+    const { token } = await request.get("/__e2e/terminal-token").then(response => response.json());
+    await page.goto(`/?t=${encodeURIComponent(token)}`);
+    await page.locator("#touch-tab-chat").tap();
+    await page.locator("#chat-conversation-select").selectOption(finished.conversation.id);
+    const track = page.locator("#chat-compact-workers");
+    const summary = page.locator("#chat-compact-workers-label");
+    await expect(summary).toHaveText("2 finished");
+    await summary.tap();
+    await track.getByRole("button", { name: "Dismiss finished", exact: true }).tap();
+    await expect(summary).toHaveText("2 hidden");
+    await expect(summary).toHaveAttribute("aria-label", "Workers: 2 hidden");
+    await page.locator("#chat-conversation-select").selectOption(empty.conversation.id);
+    await expect(track).toBeHidden();
+    await expect(summary).toHaveText("No workers");
+    await expect(summary).toHaveAttribute("aria-label", "Workers: No workers");
+    await page.locator("#chat-conversation-select").selectOption(finished.conversation.id);
+    await expect(summary).toHaveText("2 hidden");
+  });
+
   for (const theme of ["light", "dark"] as const) test(`20 mixed jobs use one readable list with reachable constrained controls (${theme})`, async ({ page, request }, info) => {
     test.setTimeout(60_000); // One fixture captures the complete viewport/theme matrix.
     await page.emulateMedia({ colorScheme: theme });
     await request.post("/__e2e/reset");
     await request.post("/__e2e/chat", { data: { action: "agents", count: 2 } });
+    const child = await request.post("/__e2e/chat", { data: {
+      action: "seed", agent: "claude", child: true, title: "Retained worker transcript",
+      items: [{ id: "child-answer", type: "assistant_message", createdAt: 1, markdown: "Retained child inspection after dismissal." }],
+    } }).then(response => response.json());
     const now = Date.now();
     const items: ConversationItem[] = [
       { id: "user", type: "user_message", createdAt: now - 1_500_000, text: "Build independent themes, audit contrast and add JSON backup and restore." },
@@ -30,6 +61,8 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`canonical w
         id: `job:${index}`, type: "background_task", taskId: `worker-${index}`, createdAt: now - (21 - index) * 60_000,
         description: index === 18 ? "Build independent theme module with accessible palettes and persistent preferences" : index === 19 ? "bun test contrast accessibility --reporter detailed" : ["Add three theme palettes", "Run independent contrast audit", "Write usage documentation", "Validate JSON backup and restore"][index % 4]!,
         status: index >= 18 ? "running" : index % 5 === 0 ? "failed" : index % 4 === 0 ? "stopped" : "completed",
+        ...(index < 18 ? { summary: `Retained worker report ${index}` } : {}),
+        ...(index === 16 ? { childConversationId: child.conversation.id } : {}),
         taskType: index === 19 || index === 17 ? "shell" : "agent", outputFile: "fixture-output",
         ...(index === 18 ? { toolUseIds: ["alias-a", "alias-b"], progress: "Editing themes/dark.css" } : {}),
       })),
@@ -76,16 +109,29 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`canonical w
     await expect(track.locator('[data-worker-id="job:18"] .chat-worker-model')).toHaveText("GPT-6.1 Sol");
     await expect(track.locator('[data-worker-id="job:18"] .chat-worker-tokens')).toHaveText("Σ 229k");
     await track.getByRole("button", { name: "Dismiss finished", exact: true }).tap();
-    await expect(summary).toHaveText("2 working · 0 finished · 18 hidden");
+    await expect(summary).toHaveText("2 working · 18 hidden");
     await expect(rows).toHaveCount(2);
     await page.reload();
     await page.locator("#touch-tab-chat").tap();
-    await expect(summary).toHaveText("2 working · 0 finished · 18 hidden");
+    await expect(summary).toHaveText("2 working · 18 hidden");
     await expect(rows).toHaveCount(2);
     if (await track.getAttribute("open") === null) await summary.tap();
-    await track.getByRole("button", { name: "Restore finished (18)", exact: true }).tap();
-    await expect(summary).toHaveText("2 working · 18 finished");
-    await expect(rows).toHaveCount(20);
+    await expect(track.getByRole("button", { name: /Restore finished/ })).toHaveCount(0);
+    await expect(track.getByRole("button", { name: "Dismiss finished", exact: true })).toBeHidden();
+    await captureScreenshot(page, info, `workers-${engine}-${theme}-dismissed-no-restore`);
+    // Dismissal changes only this overview. Provider results and timeline stay.
+    await expect(page.locator('#chat-items [data-chat-item-id="job:17"]')).toHaveCount(1);
+    const result = page.locator('#chat-items [data-chat-item-id="job:17"]');
+    const group = result.locator("xpath=ancestor::details").first();
+    if (await group.getAttribute("open") === null) await group.locator(":scope > summary").tap();
+    await result.locator(":scope > summary").tap();
+    await expect(result).toContainText("Retained worker report 17");
+    const childResult = page.locator('#chat-items [data-chat-item-id="job:16"]');
+    await childResult.locator(":scope > summary").tap();
+    await childResult.locator("[data-open-conversation]").tap();
+    await expect(page.locator("#chat-drilldown-items")).toContainText("Retained child inspection after dismissal.");
+    await page.keyboard.press("Escape");
+    await expect(page.locator("#chat-drilldown")).toBeHidden();
     await summary.tap();
     await page.locator("#chat-input").fill("Preserve this private composing draft");
 
@@ -122,7 +168,7 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`canonical w
     await request.post("/__e2e/chat", { data: { action: "item", conversationId: snapshot.conversation.id, item: { ...items.find(item => item.id === "job:18"), stateUncertain: true } } });
     await summary.tap();
     await expect(track.locator('[data-state="unknown"] [data-stop-task]')).toBeDisabled();
-    await expect(summary).toHaveText("1 working · 18 finished · 1 unknown");
+    await expect(summary).toHaveText("1 working · 1 unknown · 18 hidden");
     await page.setViewportSize({ width: 390, height: 844 });
     await page.locator("#chat-input").blur();
     await page.evaluate(() => {

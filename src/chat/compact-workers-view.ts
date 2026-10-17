@@ -15,18 +15,19 @@ export class CompactWorkersView {
   private readonly dismiss = document.createElement("button");
   private conversation: string | null = null;
 
-  constructor(private readonly host: HTMLElement, onDismiss?: (restore: boolean) => void) {
+  constructor(private readonly host: HTMLElement, onDismiss?: () => void) {
     this.active.setAttribute("aria-label", "Active workers");
     this.finished.setAttribute("aria-label", "Finished workers, newest first");
     this.history.className = "chat-workers-history";
     this.history.append(this.label, this.finished);
     this.dismiss.type = "button";
     this.dismiss.className = "chat-workers-dismiss";
-    this.dismiss.addEventListener("click", () => onDismiss?.(this.dismiss.dataset.restore === "true"));
+    this.dismiss.textContent = "Dismiss finished";
+    this.dismiss.addEventListener("click", () => onDismiss?.());
     host.replaceChildren(this.active, this.history, this.dismiss);
   }
 
-  paint(conversation: string | null, workers: readonly CompactWorker[], stopping: ReadonlySet<string>, canStop: boolean, hiddenCount = 0): void {
+  paint(conversation: string | null, workers: readonly CompactWorker[], stopping: ReadonlySet<string>, canStop: boolean): void {
     const focused = document.activeElement;
     const focusedRow = focused instanceof Element && this.host.contains(focused) ? focused.closest<HTMLElement>("[data-worker-id]") : null;
     if (conversation !== this.conversation) {
@@ -111,9 +112,7 @@ export class CompactWorkersView {
     }).filter(Boolean);
     this.label.textContent = `Finished ${settled.length} · ${outcomes.join(" · ")} · newest first`;
     this.history.hidden = settled.length === 0;
-    this.dismiss.hidden = !settled.length && !hiddenCount;
-    this.dismiss.dataset.restore = String(hiddenCount > 0);
-    this.dismiss.textContent = hiddenCount ? `Restore finished (${hiddenCount})` : "Dismiss finished";
+    this.dismiss.hidden = !settled.length;
     if (focusedRow && (!(focused as Element).isConnected || (focused as Element).matches(":disabled") || !this.history.open && this.finished.contains(focusedRow))) {
       const surviving = this.rows.get(focusedRow.dataset.workerId!);
       const target = surviving && this.active.contains(surviving) ? surviving.querySelector<HTMLElement>(".chat-worker-inspect") : this.host.parentElement?.querySelector<HTMLElement>(":scope > summary");

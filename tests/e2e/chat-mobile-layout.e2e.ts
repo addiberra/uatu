@@ -67,15 +67,9 @@ async function submit(page: Page, text: string, delivery: "steer" | "queue" = "s
   const touch = await page.locator("html").getAttribute("data-ui-mode") === "touch";
   const activate = async (selector: string) => touch ? page.locator(selector).tap() : page.locator(selector).click();
   await page.locator("#chat-input").fill(text);
-  const toggle = page.locator("#chat-delivery-toggle");
-  if (await toggle.isEnabled() && (await page.locator("#chat-delivery-label").textContent())?.toLowerCase() !== delivery) {
-    await activate("#chat-delivery-toggle");
-    await activate(`[data-delivery-choice="${delivery}"]`);
-  }
   const accepted = page.waitForResponse(response => response.url().endsWith("/prompts"));
   if (delivery === "queue") {
-    await activate("#chat-delivery-toggle");
-    await activate("#chat-queue-draft");
+    await page.locator("#chat-input").press("Alt+Enter");
   } else await activate("#chat-send");
   expect((await accepted).ok()).toBe(true);
   await expect(page.locator("#chat-input")).toHaveValue("");
@@ -102,7 +96,7 @@ async function loaded(page: Page, request: APIRequestContext) {
 async function containedControls(page: Page, height: number) {
   await expect.poll(() => page.locator(".chat-header").evaluate(element => element.getBoundingClientRect().top)).toBeGreaterThanOrEqual(0);
   const touch = await page.locator("html").getAttribute("data-ui-mode") === "touch";
-  for (const id of [...(touch ? ["chat-options-toggle"] : []), "chat-send", "chat-delivery-toggle", "chat-stop"]) {
+  for (const id of [...(touch ? ["chat-configuration-trigger"] : []), "chat-send", "chat-stop"]) {
     const control = page.locator(`#${id}`);
     await expect(control).toBeVisible();
     await expect.poll(() => control.evaluate(element => element.getBoundingClientRect().bottom)).toBeLessThanOrEqual(height);
@@ -133,7 +127,7 @@ async function workControlExposure(control: Locator) {
 }
 
 for (const engine of ["chromium", "webkit"] as const) test.describe(`mobile layout ${engine}`, () => {
-  for (const scene of [{ width: 390, height: 844, visual: 380 }, { width: 844, height: 390, visual: 230 }]) test(`uncertain feedback preserves draft width and options ${scene.width}`, async ({ page, request }, testInfo) => {
+  for (const scene of [{ width: 390, height: 844, visual: 380 }, { width: 844, height: 390, visual: 230 }]) test(`uncertain feedback preserves draft width and inline picker ${scene.width}`, async ({ page, request }, testInfo) => {
     const id = await loaded(page, request);
     await page.route("**/prompts", async route => {
       const response = await route.fetch();
@@ -151,8 +145,8 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`mobile layo
     expect((await page.locator("#chat-input").boundingBox())!.width).toBeGreaterThanOrEqual(140);
     await containedControls(page, scene.visual);
     expect(await page.locator("#chat-timeline").evaluate(element => element.clientHeight)).toBeGreaterThanOrEqual(scene.visual * 0.4);
-    await page.locator("#chat-options-toggle").tap();
-    await expect(page.locator("#chat-options-configuration")).toBeVisible();
+    await page.locator("#chat-configuration-trigger").tap();
+    await expect(page.locator("#chat-configuration-dialog")).toBeVisible();
     await expect(page.locator("#chat-attach")).toBeVisible();
     await page.keyboard.press("Escape");
     await expect(page.locator("#chat-input")).toHaveValue("Keep this editable draft");
@@ -169,7 +163,7 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`mobile layo
     await expect(pending).toHaveAttribute("aria-expanded", "false");
     await expect(page.locator("#chat-queue-items")).toBeHidden();
     await expect(workers).not.toHaveAttribute("open");
-    await expect(page.locator("#chat-compact-workers-label")).toHaveText("2 working · 0 finished");
+    await expect(page.locator("#chat-compact-workers-label")).toHaveText("2 working");
     await pending.tap();
     await workers.locator(":scope > summary").tap();
     await expect(page.locator("#chat-queue-items")).toBeVisible();
@@ -190,33 +184,40 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`mobile layo
     await captureScreenshot(page, testInfo, `mobile-${engine}-compact-disclosures`);
   });
 
-  test("touch options owns one layer, consumes outside taps, and hands off to the single picker", async ({ page, request }) => {
+  test("inline picker owns one layer, consumes outside taps and restores its real invoker", async ({ page, request }) => {
     await loaded(page, request);
-    const options = page.locator("#chat-options-toggle");
-    const menu = page.locator("#chat-options-menu");
+    const options = page.locator("#chat-configuration-trigger");
+    const menu = page.locator("#chat-configuration-dialog");
+    await expect(page.locator("#chat-options-toggle, #chat-options-menu")).toHaveCount(0);
     await page.locator("#chat-input").fill("Keep this draft");
     await page.locator("#chat-input").focus();
     await options.tap();
     await expect(menu).toBeVisible();
     await expect(options).toHaveAttribute("aria-expanded", "true");
-    const send = (await page.locator("#chat-send").boundingBox())!;
-    await page.touchscreen.tap(send.x + send.width / 2, send.y + send.height / 2);
+    const mutations: string[] = [];
+    page.on("request", request => { if (request.method() === "POST" && /\/(prompts|cancel)$/.test(request.url())) mutations.push(request.url()); });
+    // The picker is a bottom sheet, unlike the removed floating Options box.
+    // Its real outside region is above the sheet, not over the covered Send.
+    const sheet = (await page.locator(".chat-configuration-sheet").boundingBox())!;
+    expect(sheet.y).toBeGreaterThan(8);
+    await page.touchscreen.tap(8, 8);
     await expect(menu).toBeHidden();
+    expect(mutations).toEqual([]);
     await expect(page.locator("#chat-input")).toHaveValue("Keep this draft");
     await options.tap();
-    await page.locator("#chat-options-configuration").tap();
-    await expect(menu).toBeHidden();
-    await expect(page.locator("#chat-configuration-dialog")).toBeVisible();
+    await expect(menu).toBeVisible();
     await page.keyboard.press("Escape");
     await expect(page.locator("#chat-configuration-dialog")).toBeHidden();
-    await expect(options).toBeFocused();
-    await options.click();
+    await expect(page.locator("#chat-input")).toBeFocused();
+    // Touch preserves composing focus; keyboard activation owns the real pill.
+    await options.focus();
+    await options.press("Enter");
     await page.keyboard.press("Escape");
     await expect(menu).toBeHidden();
     await expect(options).toBeFocused();
   });
 
-  for (const enlarged of [false, true]) test(`expanded compact dock and options retain target and visual bounds${enlarged ? " with enlarged text" : ""}`, async ({ page, request }, testInfo) => {
+  for (const enlarged of [false, true]) test(`expanded compact dock and picker retain target and visual bounds${enlarged ? " with enlarged text" : ""}`, async ({ page, request }, testInfo) => {
     await loaded(page, request);
     await page.locator("#chat-input").blur();
     if (enlarged) await page.addStyleTag({ content: "html { font-size: 200% !important; }" });
@@ -228,28 +229,28 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`mobile layo
     await expect(page.locator(".chat-worker-model").first()).toHaveCSS("font-size", `${11 * scale}px`);
     const dock = await page.locator("#chat-work-dock").boundingBox();
     const band = await page.locator("#chat-surface").evaluate(element => parseFloat(element.style.getPropertyValue("--chat-visual-height")));
-    await saveEvidence(testInfo, `compact-${engine}-${enlarged ? "enlarged" : "standard"}-bounds.json`, JSON.stringify(await page.evaluate(() => Object.fromEntries(["chat-surface", "chat-composer", "chat-work-dock", "chat-options-toggle", "chat-send", "chat-delivery-toggle", "chat-stop"].map(id => {
+    await saveEvidence(testInfo, `compact-${engine}-${enlarged ? "enlarged" : "standard"}-bounds.json`, JSON.stringify(await page.evaluate(() => Object.fromEntries(["chat-surface", "chat-composer", "chat-work-dock", "chat-configuration-trigger", "chat-send", "chat-stop"].map(id => {
       const node = document.getElementById(id)!;
       const rect = node.getBoundingClientRect(); const style = getComputedStyle(node);
       return [id, { x: rect.x, y: rect.y, width: rect.width, height: rect.height, maxHeight: style.maxHeight, minHeight: style.minHeight, available: style.getPropertyValue("--chat-work-available") }];
     }))), null, 2));
     await captureScreenshot(page, testInfo, `compact-${engine}-${enlarged ? "enlarged" : "standard"}-expanded`);
     expect(dock!.height).toBeLessThanOrEqual(band * 0.35 + 1);
-    for (const id of ["chat-options-toggle", "chat-send", "chat-delivery-toggle", "chat-stop"]) {
+    for (const id of ["chat-configuration-trigger", "chat-send", "chat-stop"]) {
       const target = page.locator(`#${id}`);
       const box = (await target.boundingBox())!;
       expect(box.width).toBeGreaterThanOrEqual(44); expect(box.height).toBeGreaterThanOrEqual(44);
       expect(box.x).toBeGreaterThanOrEqual(0); expect(box.x + box.width).toBeLessThanOrEqual(390);
       expect(box.y + box.height).toBeLessThanOrEqual(844);
     }
-    await page.locator("#chat-options-toggle").tap();
-    const menu = (await page.locator("#chat-options-menu").boundingBox())!;
+    await page.locator("#chat-configuration-trigger").tap();
+    const menu = (await page.locator("#chat-configuration-dialog").boundingBox())!;
     expect(menu.y).toBeGreaterThanOrEqual(0); expect(menu.y + menu.height).toBeLessThanOrEqual(844);
     expect(menu.x).toBeGreaterThanOrEqual(0); expect(menu.x + menu.width).toBeLessThanOrEqual(390);
-    await page.locator("#chat-options-configuration").scrollIntoViewIfNeeded();
-    const settings = (await page.locator("#chat-options-configuration").boundingBox())!;
+    await page.locator("#chat-configuration-done").scrollIntoViewIfNeeded();
+    const settings = (await page.locator("#chat-configuration-done").boundingBox())!;
     expect(settings.width).toBeGreaterThanOrEqual(44); expect(settings.height).toBeGreaterThanOrEqual(44);
-    await captureScreenshot(page, testInfo, `compact-${engine}-${enlarged ? "enlarged" : "standard"}-options`);
+    await captureScreenshot(page, testInfo, `compact-${engine}-${enlarged ? "enlarged" : "standard"}-picker`);
   });
   test.use({ page: async ({ launchBrowser, baseURL }, use) => {
     const browser = await launchBrowser(engine);
@@ -259,17 +260,17 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`mobile layo
     await browser.close();
   } });
 
-  test("outside delivery-menu touch dismisses without activating Revert", async ({ page, request }, testInfo) => {
+  test("outside picker touch dismisses without activating Revert", async ({ page, request }, testInfo) => {
     await boot(page, request);
     await submit(page, "Start the work");
     await page.locator("#chat-input").fill("Private draft");
     const mutations: string[] = [];
     page.on("request", request => { if (request.method() === "POST" && /\/(revert|undo|prompts)$/.test(request.url())) mutations.push(new URL(request.url()).pathname); });
-    await page.locator("#chat-delivery-toggle").tap();
-    await expect(page.locator("#chat-delivery-menu")).toBeVisible();
+    await page.locator("#chat-configuration-trigger").tap();
+    await expect(page.locator("#chat-configuration-dialog")).toBeVisible();
     const revert = (await page.locator("#chat-items").getByRole("button", { name: "Revert message", exact: true }).boundingBox())!;
     await page.touchscreen.tap(revert.x + revert.width / 2, revert.y + revert.height / 2);
-    await expect(page.locator("#chat-delivery-menu")).toBeHidden();
+    await expect(page.locator("#chat-configuration-dialog")).toBeHidden();
     expect(mutations).toEqual([]);
     await expect(page.locator("#chat-input")).toHaveValue("Private draft");
     await expect(page.locator("#chat-items")).toContainText("Start the work");
@@ -368,22 +369,14 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`mobile layo
       expect(workerHeader.y).toBeGreaterThanOrEqual(scene.width === 390 ? 47 : scene.width === 844 ? 0 : 24);
     } else expect(metrics.dock).toBeLessThanOrEqual(scene.visual * cap + 1);
     await saveEvidence(testInfo, `mobile-${engine}-${scene.width}-${scene.visual}.json`, JSON.stringify(metrics, null, 2));
-    await page.locator("#chat-delivery-toggle").tap();
-    for (const choice of await page.locator("[data-delivery-choice]").all()) {
-      const box = (await choice.boundingBox())!;
-      expect(box.y).toBeGreaterThanOrEqual(0);
-      expect(box.y + box.height).toBeLessThanOrEqual(scene.visual);
-    }
-    await captureScreenshot(page, testInfo, `mobile-${engine}-${scene.width}-${scene.visual}-menu`);
-    await page.keyboard.press("Escape");
-    if (await page.locator("#chat-options-toggle").isVisible()) {
-      await page.locator("#chat-options-toggle").tap();
-      const options = (await page.locator("#chat-options-menu").boundingBox())!;
+    await page.locator("#chat-configuration-trigger").tap();
+    {
+      const options = (await page.locator("#chat-configuration-dialog").boundingBox())!;
       expect(options.y).toBeGreaterThanOrEqual(0);
       expect(options.y + options.height).toBeLessThanOrEqual(scene.visual);
       expect(options.x).toBeGreaterThanOrEqual(0);
       expect(options.x + options.width).toBeLessThanOrEqual(scene.width);
-      await captureScreenshot(page, testInfo, `mobile-${engine}-${scene.width}-${scene.visual}-options`);
+      await captureScreenshot(page, testInfo, `mobile-${engine}-${scene.width}-${scene.visual}-picker`);
     }
     await page.keyboard.press("Escape");
   });
@@ -590,9 +583,7 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`mobile layo
     await input.press("Enter");
     await expect(input).toHaveValue("Busy line\n");
     expect(prompts).toEqual([]);
-    await page.locator("#chat-delivery-toggle").tap();
-    await expect(page.locator('[data-delivery-choice="steer"]')).toContainText("Ctrl+Enter");
-    await page.keyboard.press("Escape");
+    await expect(page.locator("#chat-send-help")).toContainText("Ctrl+Enter: Steer");
     const accepted = page.waitForResponse(response => response.url().endsWith("/prompts"));
     await input.press("Control+Enter");
     expect((await accepted).ok()).toBe(true);
@@ -711,7 +702,7 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`mobile layo
 
   test("touch work controls have readable text, targets, and native-highlight-free feedback", async ({ page, request }) => {
     await loaded(page, request);
-    for (const selector of [".chat-task-stop", ".chat-queued-action", "#chat-delivery-toggle", "[data-delivery-choice]"]) {
+    for (const selector of [".chat-task-stop", ".chat-queued-action"]) {
       const control = page.locator(selector).first();
       expect(await control.evaluate(element => getComputedStyle(element).getPropertyValue("-webkit-tap-highlight-color"))).toMatch(/rgba\(0, 0, 0, 0\)|transparent/);
     }
@@ -725,8 +716,6 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`mobile layo
     expect((await dense.boundingBox())!.height).toBeGreaterThanOrEqual(29);
     expect((await dense.boundingBox())!.height).toBeLessThan(44);
     expect((await page.locator(".chat-worker-row .chat-task-stop").first().boundingBox())!.height).toBeGreaterThanOrEqual(44);
-    await page.locator("#chat-delivery-toggle").tap();
-    expect(await page.locator(".chat-delivery-hint").first().evaluate(element => parseFloat(getComputedStyle(element).fontSize))).toBeGreaterThanOrEqual(13);
   });
 
   test("expanded workers leave Stop clear of the prompt rail", async ({ page, request }) => {
@@ -739,7 +728,7 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`mobile layo
     expect(await stop.evaluate(element => { const box = element.getBoundingClientRect(); return element.contains(document.elementFromPoint(box.right - 2, box.y + box.height / 2)); })).toBe(true);
   });
 
-  test("320px dark layout wraps pending text and keeps delivery choices inside the keyboard band", async ({ page, request }, testInfo) => {
+  test("320px dark layout wraps pending text and keeps the picker inside the keyboard band", async ({ page, request }, testInfo) => {
     await loaded(page, request);
     await submit(page, "LongPending".repeat(24), "queue");
     await page.emulateMedia({ colorScheme: "dark" });
@@ -751,14 +740,14 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`mobile layo
     await page.locator("#chat-input").focus();
     await visualHeight(page, 380);
     await containedControls(page, 380);
-    await page.locator("#chat-delivery-toggle").tap();
-    for (const choice of await page.locator("[data-delivery-choice]").all()) {
+    await page.locator("#chat-configuration-trigger").tap();
+    for (const choice of [page.locator("#chat-configuration-dialog")]) {
       const box = (await choice.boundingBox())!;
       expect(box.x).toBeGreaterThanOrEqual(0);
       expect(box.x + box.width).toBeLessThanOrEqual(320);
       expect(box.y).toBeGreaterThanOrEqual(0);
       expect(box.y + box.height).toBeLessThanOrEqual(380);
     }
-    await captureScreenshot(page, testInfo, `mobile-${engine}-320-dark-keyboard-menu`);
+    await captureScreenshot(page, testInfo, `mobile-${engine}-320-dark-keyboard-picker`);
   });
 });

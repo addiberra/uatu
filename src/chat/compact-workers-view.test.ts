@@ -3,21 +3,22 @@ import { parseHTML } from "linkedom";
 import { compactWorkers } from "./compact-work";
 import { CompactWorkersView } from "./compact-workers-view";
 
-test("finished dismissal and restoration are view actions, never worker mutation", () => {
+test("finished dismissal is view-only and exposes no Restore control", () => {
   const { document, window } = parseHTML('<html><body><div id="workers"></div></body></html>');
   const previous = new Map(["document", "Element"].map(key => [key, Reflect.get(globalThis, key)]));
   Reflect.set(globalThis, "document", document); Reflect.set(globalThis, "Element", window.Element);
   try {
-    const choices: boolean[] = [];
+    let choices = 0;
     const host = document.getElementById("workers")! as unknown as HTMLElement;
-    const view = new CompactWorkersView(host, restore => choices.push(restore));
+    const view = new CompactWorkersView(host, () => choices++);
     const workers = compactWorkers([{ type: "background_task", id: "done", taskId: "done", description: "Finished task", status: "completed", createdAt: 1 }]);
     view.paint("parent", workers, new Set(), true);
     const button = host.querySelector<HTMLButtonElement>(".chat-workers-dismiss")!;
     expect(button.textContent).toBe("Dismiss finished"); button.click();
-    view.paint("parent", [], new Set(), true, 1);
-    expect(button.textContent).toBe("Restore finished (1)"); button.click();
-    expect(choices).toEqual([false, true]);
+    view.paint("parent", [], new Set(), true);
+    expect(button.hidden).toBe(true);
+    expect(host.textContent).not.toContain("Restore finished");
+    expect(choices).toBe(1);
     expect(workers[0]?.state).toBe("completed");
   } finally { for (const [key, value] of previous) Reflect.set(globalThis, key, value); }
 });

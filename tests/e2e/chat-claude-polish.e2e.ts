@@ -96,6 +96,9 @@ async function openTaskList(page: Page) {
   if (await page.locator("html").getAttribute("data-ui-mode") === "touch") {
     const compact = page.locator("#chat-compact-workers");
     if (await compact.getAttribute("open") === null) await compact.locator(":scope > summary").click();
+    await expect(compact).toBeVisible();
+    await expect(compact).toHaveAttribute("open", "");
+    return compact;
   }
   const list = page.locator("#chat-background-tasks");
   await expect(list).toBeVisible();
@@ -1347,9 +1350,13 @@ for (const touch of [false, true]) {
       const label = page.locator("#chat-context-usage-label");
       await expect(label).toHaveText("213k");
       await expect(page.locator("#chat-context-usage")).toHaveAttribute("data-fill", "unknown");
-      if (touch) await page.locator("#chat-options-toggle").click();
-      await page.locator("#chat-context-usage > summary").click();
-      await expect(page.locator("#chat-context-usage-breakdown")).toContainText("Limit unavailable");
+      if (touch) {
+        await expect(page.locator("#chat-inline-context")).toContainText("limit unknown");
+        await expect(page.locator("#chat-context-usage")).toBeHidden();
+      } else {
+        await page.locator("#chat-context-usage > summary").click();
+        await expect(page.locator("#chat-context-usage-breakdown")).toContainText("Limit unavailable");
+      }
       await capture(page, testInfo, "context-limit-unavailable");
       await control(request, { action: "item", conversationId: id, item: {
         id: "window:live", type: "context_window", createdAt: 3, model, limit: 1_000_000,
@@ -1393,7 +1400,6 @@ test.describe("Claude Code plan readout at phone width", () => {
     await page.locator("#chat-conversation-select").selectOption(seeded.conversation.id);
     const summary = page.locator("#chat-plan-usage-summary");
     await expect(summary).toHaveText("Session 9% · Week 25%");
-    await page.locator("#chat-options-toggle").click();
     await summary.click();
     const readout = page.locator("#chat-plan-readout");
     await expect(readout).toBeVisible();

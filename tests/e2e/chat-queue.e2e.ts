@@ -37,6 +37,7 @@ test.describe("chat message queue", () => {
     await send(page, "Start the work");
     await expect(page.locator("#chat-stop")).toBeEnabled();
     await expect(page.locator("#chat-delivery-toggle")).toBeHidden();
+    await expect(page.locator("#chat-send-help")).not.toContainText(/Steer|Hold Send|Alt\+Enter/);
     const configuration = (await page.locator("#chat-configuration-trigger").boundingBox())!;
     const sendGroup = (await page.locator("#chat-send-group").boundingBox())!;
     expect(Math.abs(configuration.y + configuration.height / 2 - sendGroup.y - sendGroup.height / 2)).toBeLessThan(1);

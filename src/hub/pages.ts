@@ -256,9 +256,20 @@ const SHARED_STYLE = `
   .form-stack label > input, .form-stack label > textarea, .form-stack label > select { display: block; margin-top: 0.2rem; }
   .choice-row { display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: center; }
   .choice-row label { display: inline-flex; gap: 0.35rem; align-items: center; color: var(--text-strong); }
-  #personal-chat-preferences-form .choice-row { flex-wrap: nowrap; }
-  #personal-chat-auto-background { width: 2.75rem; height: 2.75rem; min-width: 2.75rem; margin: 0; }
-  #personal-chat-preferences-form button { min-width: 2.75rem; min-height: 2.75rem; }
+  #personal-chat-preferences-form { gap: 0.4rem; }
+  #personal-chat-preferences-form p { margin: 0; }
+  #personal-chat-preferences-form .personal-chat-switch { display: flex; gap: 0.65rem; align-items: center; min-height: 44px; color: var(--text-strong); font-size: 0.85rem; cursor: pointer; }
+  #personal-chat-preferences-form .personal-chat-switch input { appearance: none; -webkit-appearance: none; flex: 0 0 44px; width: 44px; height: 44px; min-height: 44px; margin: 0; padding: 0; border: 0; border-radius: 0; background: transparent; position: relative; cursor: pointer; }
+  .personal-chat-switch input::before { content: ""; position: absolute; inset: 10px 0; border: 1px solid var(--text-subtle); border-radius: 14px; background: var(--surface-muted); }
+  .personal-chat-switch input::after { content: ""; position: absolute; width: 18px; height: 18px; top: 13px; left: 3px; border-radius: 50%; background: var(--text-strong); }
+  .personal-chat-switch input:checked::before { background: var(--accent); border-color: var(--accent); }
+  .personal-chat-switch input:checked::after { left: 23px; background: white; }
+  .personal-chat-switch input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .personal-chat-switch input:disabled { opacity: 0.5; cursor: default; }
+  .personal-chat-learn summary { display: flex; align-items: center; min-height: 44px; width: fit-content; color: var(--text-subtle); font-size: 0.75rem; cursor: pointer; }
+  .personal-chat-learn summary::before { content: "▸ "; margin-right: 0.4rem; }
+  .personal-chat-learn[open] summary::before { content: "▾ "; }
+  #personal-chat-preferences-form button { min-width: 44px; min-height: 44px; }
   .credential-create { border-top: 1px solid var(--border-soft); }
   .credential-create summary { cursor: pointer; padding: 0.6rem 1rem; font-size: 0.78rem; font-weight: 600; }
   .credential-card { border-bottom: 1px solid var(--border-soft); }
@@ -695,12 +706,12 @@ function authenticatedPage(pageName: AuthenticatedPage, authenticatedUser: strin
   const personalChat = `<section class="pane" id="personal-chat-preferences-pane">
   <div class="pane-header"><h2>Personal chat preferences</h2></div>
   <form id="personal-chat-preferences-form" class="form-stack">
-    <p class="row-detail">For your account on this Hub, across devices and workspaces; not other users. This does not change machine-wide agent logins or workspace defaults.</p>
-    <label class="choice-row"><input id="personal-chat-auto-background" type="checkbox" disabled aria-describedby="personal-chat-preferences-help" /> Automatically background blocking work when steering</label>
-    <p id="personal-chat-preferences-help" class="row-detail">Default ON. After accepted steer actions (including Queue → Steer, Send now and submitted replacements), not job starts, all eligible blocking jobs, including shell commands, can continue without being stopped. Shared workspace effects are visible to other users, without changing their preferences. Native resume may cancel blockers first; backgrounding is not atomic or a guarantee of immediate delivery. Standalone keeps explicit Continue.</p>
+    <label class="personal-chat-switch"><input id="personal-chat-auto-background" type="checkbox" role="switch" disabled aria-describedby="personal-chat-preferences-help" /><span>Keep workers running when I steer</span></label>
+    <p id="personal-chat-preferences-help" class="row-detail">Applies to your account on this Hub.</p>
+    <details class="personal-chat-learn"><summary>Learn more</summary><p class="row-detail">Default ON, across devices and workspaces; not other users. This does not change machine-wide agent logins or workspace defaults. After accepted steer actions (including Queue → Steer, Send now and submitted replacements), not job starts, all eligible blocking jobs, including shell commands, can continue without being stopped. Shared workspace effects are visible to other users, without changing their preferences. Native resume may cancel blockers first; backgrounding is not atomic or a guarantee of immediate delivery. Standalone keeps explicit Continue.</p></details>
     <p id="personal-chat-preferences-status" class="row-detail" role="status">Loading…</p>
     <p id="personal-chat-preferences-error" class="local-error" role="alert" hidden></p>
-    <div><button type="submit" class="primary" disabled>Save chat preference</button></div>
+    <div><button type="submit" class="primary" disabled>Save</button></div>
   </form>
 </section>`;
   const settings = `${personalChat}${credentials}${agentAccounts}<section class="pane">

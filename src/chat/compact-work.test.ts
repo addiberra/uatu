@@ -41,7 +41,7 @@ test("canonical executions fold launcher aliases but keep repeated occurrences a
   expect(workerSummary(workers)).toBe("1 working · 2 finished · 1 unknown");
   expect(workers.find(worker => worker.id === "first")?.state).toBe("failed");
   expect(workers.find(worker => worker.id === "third")?.state).toBe("stopped");
-  expect(workerSummary([])).toBe("");
+  expect(workerSummary([])).toBe("No workers");
 });
 
 test("pending/generating is not confirmed working and failed tools are finished, not successful", () => {
@@ -50,7 +50,20 @@ test("pending/generating is not confirmed working and failed tools are finished,
     { type: "command", id: "shell", command: "fixture", status: "error" },
     { type: "text", id: "text", text: "generating" },
   ] as ConversationItem[]);
-  expect(workerSummary(workers)).toBe("0 working · 0 finished · 1 unknown");
+  expect(workerSummary(workers)).toBe("1 unknown");
+});
+
+test("worker summaries omit zero segments without losing hidden or terminal outcomes", () => {
+  const workers = compactWorkers([
+    { type: "background_task", id: "live", taskId: "live", description: "Live", status: "running", createdAt: 1 },
+    { type: "background_task", id: "failed", taskId: "failed", description: "Failed", status: "failed", createdAt: 2 },
+    { type: "background_task", id: "stopped", taskId: "stopped", description: "Stopped", status: "stopped", createdAt: 3 },
+  ]);
+  expect(workerSummary(workers.filter(worker => worker.state === "working"))).toBe("1 working");
+  expect(workerSummary(workers.filter(worker => worker.state !== "working"))).toBe("2 finished");
+  expect(workerSummary([], 3)).toBe("3 hidden");
+  expect(workerSummary(workers, 3)).toBe("1 working · 2 finished · 3 hidden");
+  expect(workerSummary([])).toBe("No workers");
 });
 
 test("active workers precede newest-first history; only real background shell tasks are workers", () => {

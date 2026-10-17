@@ -16,7 +16,7 @@ export function createPersonalChatPreferencesPane(document: Document, window: Wi
     if (!value || value.version !== 1 || !Number.isSafeInteger(value.revision) || (value.revision as number) < 0 || typeof value.autoBackgroundOnSteer !== "boolean") throw new Error("Personal chat preferences are unavailable.");
     revision = value.revision as number;
     input.checked = value.autoBackgroundOnSteer;
-    status.textContent = "Saved: " + (input.checked ? "ON" : "OFF") + " for your account on this Hub.";
+    status.textContent = "Saved";
   };
   const reload = async () => {
     if (saving) return;

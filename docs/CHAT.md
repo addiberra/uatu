@@ -10,14 +10,18 @@ for its life. One agent being missing or broken never blocks the other.
 ## Personal Hub chat preferences
 
 The workspace Hub menu links to **Settings → Personal chat preferences**.
-The stored **Automatically background blocking work when steering** preference
+The compact **Keep workers running when I steer** switch
 defaults ON only for an absent account record. It belongs to your account on
 that Hub across devices and workspaces, not other users, machine agent logins,
 workspace defaults or standalone chat. Saved OFF survives Hub restart.
 Settings refreshes on entry/focus/reconnect; stale saves show a conflict rather
 than overwriting another device. Unreadable persisted state reports unavailable
 instead of resetting OFF. The API is authenticated, no-store and versioned,
-with server-selected identity and compare-revision writes.
+with server-selected identity and compare-revision writes. Changes take effect
+only after **Save**. The one-line helper names the account scope; **Learn more**
+keeps the all-jobs, shared-workspace and native-resume caveats available.
+Successful reads and saves say **Saved**; the switch shows ON/OFF. Conflicts,
+unavailable settings and unconfirmed saves keep their explanatory messages.
 
 With verified private Hub-to-child trust, ON considers one background request
 after an accepted composer steer, Queue → Steer, held Send now, paused-batch
@@ -110,12 +114,13 @@ pointer cancellation, leaving the tab, moving the target or changing the
 draft/conversation/configuration cancels without sending.
 The countdown rises above the finger; the Send target never moves. Idle held
 sends dispatch normally, rather than inventing a pending queue entry.
-**Send options → Queue message now** offers the same action without holding.
-Its Steer/Queue radio choices change only your device's **keyboard** preference.
-Desktop Enter uses that choice;
+There is no Send dropdown. Keyboard users can hold Space on Send for the same
+two-second Queue action; Enter activates Send immediately. Escape cancels the
+hold and preserves focus. Send's accessible description explains these keys.
+Desktop Enter in the message field uses the existing per-device preference;
 on touch devices Enter always adds a newline and Ctrl/Command+Enter submits.
-Alt/Option+Enter uses the other choice. The menu shows the current shortcuts.
-Idle messages send immediately, so the selector is disabled then. Claude Code
+Alt/Option+Enter uses the other choice. Send's accessible description names the
+current shortcuts. Idle messages send immediately. Claude Code
 and OpenCode V1 queue busy follow-ups without offering steering. Pending images
 and native commands queue rather than being labelled as a text steer; replacement
 submission retains the native staged-revert semantics.
@@ -158,9 +163,10 @@ which batch will accompany the replacement, without repeating message text.
 On touch screens, work tracks share a bounded, independently scrollable dock.
 Short keyboard/landscape layouts use compact input controls and counts;
 uncertain feedback has its own scrollable band (a bounded column in landscape),
-so it cannot consume the draft field. Chat options stays in the conversation header.
-paused-batch Send and replacement warnings remain available while typing.
-Dismiss the delivery menu with an outside tap without activating controls below it.
+so it cannot consume the draft field. The inline model/context pill opens the
+real configuration picker directly, without a second Options panel or context
+circle. Paused-batch Send and replacement warnings remain available while typing.
+Outside picker taps dismiss it without activating controls below it.
 
 Edit returns an entry to the composer only after withdrawal succeeds. If
 delivery wins first, **Too late — already delivered** is informational: your
@@ -191,20 +197,20 @@ work automatically; standalone retains explicit Continue only.
 The action appears only with running blocker evidence, not merely because the
 parent is generating or already has detached workers. **What continues?** and
 the button tooltip explain its all-eligible scope. Feedback disappears after
-the parent and workers settle. On touch, Continue and its explanation are in
-**Chat options**, alongside settings/context/usage; configuration opens the
-same single picker after options closes. The worker summary remains reachable
+the parent and workers settle. Continue and its explanation remain in the work
+dock; account usage stays beneath the inline actions when reported. The model
+pill opens the single picker directly. The worker summary remains reachable
 with hardware or software keyboards and in short landscape. Its header keeps
 a 44px touch target; deliberate expansion uses a sheet over the transcript
 when space is constrained, without discarding the draft or forcing keyboard
-blur. Continue retains its existing suppression in software-keyboard and short
-landscape layouts. Pending counts, paused-batch Send and replacement warnings
+blur. Pending counts, paused-batch Send and replacement warnings
 remain available while typing.
 Touch has one initially collapsed pending summary and one worker summary.
 Pending counts distinguish steers from queued input; worker counts distinguish
 confirmed working, finished (including failed/stopped), and unknown occurrences.
 Counts and rows use the same deduplicated executions: actual background shell
-tasks count, ordinary foreground commands do not. Expansion shows active work
+tasks count, ordinary foreground commands do not. Zero-count categories are
+omitted; a hidden-only summary names the hidden count. Expansion shows active work
 first, then a separately collapsed **Finished** history ordered newest first
 from available execution timestamps. Rows open inspection or retained results;
 launch references and their costs remain in the transcript/timeline. Names use
@@ -214,8 +220,9 @@ unknown, finished, failed and stopped glyphs. **Stop worker** is a separate
 rows use the explicitly approved 29px density tradeoff; rows with Stop grow to
 fit that target. **Dismiss finished** hides only this device's per-conversation
 view using the existing persisted dismissal state, never provider history.
-**Restore finished** brings hidden rows back; summaries count visible rows and
-name the hidden count separately. Σ usage is cumulative, not context occupancy.
+There is no Restore finished control. Results and their inspection remain in
+the timeline; summaries count visible rows and name the hidden count separately.
+Σ usage is cumulative, not context occupancy.
 Deliberate worker expansion is kept per conversation within this page's bounded
 presentation cache; new work and settlement do not open details.
 Replacement/batch warnings, applicable batch Send and actionable operation

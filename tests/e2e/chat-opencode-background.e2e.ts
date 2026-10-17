@@ -18,7 +18,7 @@ async function revealTouchWorkers(page: Page) {
 }
 
 async function revealTouchContinue(page: Page) {
-  if (await page.locator("html").getAttribute("data-ui-mode") === "touch") await page.locator("#chat-options-toggle").tap();
+  await page.locator("#chat-continue-workers").scrollIntoViewIfNeeded();
 }
 
 async function boot(page: Page, request: APIRequestContext, preview = true) {
@@ -115,7 +115,7 @@ test("Continue is parent-wide, keeps the draft, and inspection survives worker f
   expect((await upload).status()).toBe(201);
   const attachments = await page.locator("#chat-attachments").textContent();
   const configuration = await page.locator("#chat-configuration-summary").textContent();
-  const delivery = await page.locator("#chat-delivery-toggle").getAttribute("aria-label");
+  const delivery = await page.locator("#chat-send-help").textContent();
   const proceed = page.getByRole("button", { name: "Continue while workers run", exact: true });
   await expect(proceed).toBeVisible();
   await expect(page.locator("#chat-background-action")).toContainText("including shell commands");
@@ -124,7 +124,7 @@ test("Continue is parent-wide, keeps the draft, and inspection survives worker f
   await expect(page.locator("#chat-input")).toHaveValue("Keep this draft");
   await expect(page.locator("#chat-attachments")).toHaveText(attachments!);
   await expect(page.locator("#chat-configuration-summary")).toHaveText(configuration!);
-  expect(await page.locator("#chat-delivery-toggle").getAttribute("aria-label")).toBe(delivery);
+  expect(await page.locator("#chat-send-help").textContent()).toBe(delivery);
   const state = await control(request, { op: "state" });
   expect(state.calls.filter((call: string) => call.startsWith("POST ") && call.includes("/background"))).toHaveLength(1);
   await page.locator("#chat-background-tasks-items [data-inspect-task]").click();
@@ -263,8 +263,6 @@ test("Stop parent cancels blocking children, preserves detached work and paused 
   const foreground = await control(request, { op: "launchWorker", conversationId, background: false });
   const detached = await control(request, { op: "launchWorker", conversationId });
   await page.locator("#chat-input").fill("Pending steer");
-  await page.locator("#chat-delivery-toggle").click();
-  await page.getByRole("menuitemradio", { name: /^Steer/ }).click();
   await page.locator("#chat-send").click();
   await expect(page.locator("#chat-input")).toHaveValue("");
   await page.locator("#chat-input").fill("Held queue");

@@ -132,6 +132,31 @@ Native /btw must use verified V2 session generation without admitting history, i
 
 Pinned verification: [V2.0.29 TUI handler](https://github.com/anomalyco/opencode/blob/v2.0.29/packages/tui/src/feature-plugins/prompt/btw.tsx) invokes `session.generate` with concise/no-tools/no-actions instructions and explicitly documents that a returned tool call yields empty text rather than execution. [SessionGenerate](https://github.com/anomalyco/opencode/blob/v2.0.29/packages/core/src/session/generate.ts) previews history and makes one `llm.generate` call, without invoking the prepared executor or session runner/admission. [Model request preparation](https://github.com/anomalyco/opencode/blob/v2.0.29/packages/core/src/session/model-request.ts) advertises definitions and exposes a separate executor that this path never calls. Native plugin hooks still run; arbitrary installed plugin code is not newly sandboxed. Installed client 2.0.28 exposes the endpoint; the local CLI symlink was observed at 2.0.32, not the earlier 2.0.29. No runtime was changed or invoked. Personal side answers stay page-local rather than entering workspace-shared receipts, avoiding cross-account same-ID disclosure.
 
+### D8. Approved removal of redundant controls (2026-10-17)
+
+This refinement supersedes D1/D7's Options panel and split-menu fallback, and
+the earlier composer/steering requirements' visible delivery selector clauses.
+Remove their triggers, layers, relocation wiring and dead styles. Keep one real
+inline picker with model/mode/effort and actual context; omit the duplicate touch
+context circle. Attach, Send and Stop remain separate. Pointer hold keeps its
+two-second upward indicator and all cancellation guards. Space on focused Send
+uses the same hold; Enter activates quick Send. A concise aria-describedby names
+hold/cancel and existing message-field shortcuts, without adding visible menus.
+Account usage remains outside the removed panel and explicit Continue/help stays
+in the work dock, including standalone. No delivery, worker or server authority
+changes are introduced.
+
+Remove Restore finished without a replacement control. Dismiss finished retains
+existing per-conversation view persistence and visible/hidden counts; provider
+results and timeline inspection remain intact. Other redundancies are candidates
+for user review, not permission for further removal.
+
+Personal Settings uses a compact 44px switch labelled **Keep workers running when
+I steer**, helper **Applies to your account on this Hub.**, and compact explicit
+**Save**. The existing save/conflict/failure/pending semantics remain unchanged;
+this is not autosave. All-jobs/shell, account scope, default ON, shared-workspace
+and non-atomic native-resume caveats stay in collapsed **Learn more**.
+
 ## Risks / Trade-offs
 
 - [ON for existing accounts changes behavior] → Clearly scoped personal setting, explicit all-jobs disclosure, OFF retained across devices, action-time server resolution, no job-start automation.
