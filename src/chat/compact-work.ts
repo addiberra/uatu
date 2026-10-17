@@ -4,6 +4,7 @@ import { subagentEntries } from "./timeline-renderer";
 import type { ConversationItem } from "./types";
 import { workerIsActive, workerState, type WorkerState } from "./worker-state";
 import { taskById } from "./task-inspection";
+import { totalTokens } from "./usage";
 
 /** Deliberate touch state, independent of the desktop automatic disclosure. */
 export class CompactDisclosure {
@@ -38,6 +39,8 @@ export type CompactWorker = {
   taskId?: string;
   stoppable?: boolean;
   conversationId?: string;
+  model?: string;
+  tokens?: number;
 };
 
 /** A projection fold, not another worker lifecycle or a task-id tombstone map. */
@@ -52,7 +55,8 @@ export function compactWorkers(items: readonly ConversationItem[]): CompactWorke
        id: item.id, state: workerState(item.status, item.stateUncertain), references: [],
        name: item.description, kind: shellTask(item.taskType) ? "shell" : "agent",
        since: item.createdAt, settledAt: item.createdAt + (item.usage?.durationMs ?? 0),
-       progress: item.progress, taskId: item.taskId, stoppable: !item.foreground && taskById(items, item.taskId)?.id === item.id, conversationId: item.childConversationId,
+        progress: item.progress, taskId: item.taskId, stoppable: !item.foreground && taskById(items, item.taskId)?.id === item.id, conversationId: item.childConversationId,
+        tokens: item.usage?.totalTokens,
      });
   }
   for (const entry of subagentEntries(items)) {
@@ -62,11 +66,21 @@ export function compactWorkers(items: readonly ConversationItem[]): CompactWorke
     const item = items.find(item => item.id === entry.id);
     if (item?.type === "background_task" && shellTask(item.taskType) && item.foreground) continue;
     const canonical = aliases.get(entry.id);
-    if (canonical) { workers.get(canonical.id)?.references.push(entry.id); continue; }
+    if (canonical) {
+      const worker = workers.get(canonical.id);
+      if (worker) {
+        worker.references.push(entry.id);
+        worker.model ??= entry.model;
+        // One occurrence's reported spend, not a sum of launcher aliases.
+        worker.tokens ??= entry.usage ? totalTokens(entry.usage) : undefined;
+      }
+      continue;
+    }
     workers.set(entry.id, {
       id: entry.id, state: workerState(entry.status), references: [entry.id],
       name: entry.description, kind: "agent", since: item?.createdAt ?? 0,
       settledAt: item?.createdAt ?? 0, progress: entry.progress, conversationId: entry.conversationId,
+      model: entry.model, tokens: entry.usage ? totalTokens(entry.usage) : undefined,
     });
   }
   return [...workers.values()].sort((a, b) => {

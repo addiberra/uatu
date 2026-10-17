@@ -102,13 +102,47 @@ never writes.
 
 ### Sending, steering and queued messages
 
-**Send** submits; the separate **Stop** cancels the current response. On
-OpenCode V2, choose **Steer — Next step** or **Queue — After this turn**.
-The selector changes only your device preference. Desktop Enter uses that choice;
+**Send** taps steer ordinary text while OpenCode V2 is busy; the separate
+**Stop** cancels the current response. Hold Send continuously for **2 seconds**
+to queue automatically, exactly once without releasing. Releasing an intentional
+hold (250ms–2s), dragging outside the original button, Escape, lost capture,
+pointer cancellation, leaving the tab, moving the target or changing the
+draft/conversation/configuration cancels without sending.
+The countdown rises above the finger; the Send target never moves. Idle held
+sends dispatch normally, rather than inventing a pending queue entry.
+**Send options → Queue message now** offers the same action without holding.
+Its Steer/Queue radio choices change only your device's **keyboard** preference.
+Desktop Enter uses that choice;
 on touch devices Enter always adds a newline and Ctrl/Command+Enter submits.
 Alt/Option+Enter uses the other choice. The menu shows the current shortcuts.
 Idle messages send immediately, so the selector is disabled then. Claude Code
-and OpenCode V1 queue busy follow-ups without offering steering.
+and OpenCode V1 queue busy follow-ups without offering steering. Pending images
+and native commands queue rather than being labelled as a text steer; replacement
+submission retains the native staged-revert semantics.
+
+Touch keeps Attach and a two-line **agent · mode · model · effort** pill inline.
+Only declared/selected values appear; long names truncate with the full identity
+available to assistive technology and the familiar model chooser on activation.
+The second line shows actual context occupancy and known used/limit, or states
+what is unreported; it never substitutes cumulative worker/session usage.
+
+### Side questions with /btw
+
+OpenCode V2 offers `/btw <question>` as a native one-shot answer from existing
+session context, independently of foreground work. It admits no user message,
+does not interrupt/resume/background the parent, and executes no agent tool loop.
+Answers stay page-local, outside provider history: **Side answer ready** opens
+the response without stealing focus while it is generated. Empty native text is
+reported honestly (the model may have attempted a tool call). Pending attachments
+are refused and retained; V1/Claude do not offer this command, and typing it there
+is refused rather than sent as an ordinary prompt. No automatic replay/retry is
+performed. Like native inference it may consume model usage; these tests use only
+the scripted fake, not a paid/live model. User-installed native plugins retain
+their existing hooks; this is not a new sandbox against arbitrary plugin code.
+If inference fails while you compose a newer draft, that draft stays unchanged;
+**Side question failed** retains the original question and failure for inspection.
+
+### Pending messages
 
 The pending dock counts steers and queued messages. Each entry has its delivery
 badge, a separate **Paused** chip when applicable, and message-specific actions.
@@ -174,9 +208,14 @@ tasks count, ordinary foreground commands do not. Expansion shows active work
 first, then a separately collapsed **Finished** history ordered newest first
 from available execution timestamps. Rows open inspection or retained results;
 launch references and their costs remain in the transcript/timeline. Names use
-14px type and metadata 13px at the default reading scale, with distinct working,
+14px type and compact model/Σ cumulative-token columns (11px at default scale), with distinct working,
 unknown, finished, failed and stopped glyphs. **Stop worker** is a separate
-44px target with an 8px gap; unknown execution state disables it.
+44px target with an 8px gap; unknown execution state disables it. Inspection-only
+rows use the explicitly approved 29px density tradeoff; rows with Stop grow to
+fit that target. **Dismiss finished** hides only this device's per-conversation
+view using the existing persisted dismissal state, never provider history.
+**Restore finished** brings hidden rows back; summaries count visible rows and
+name the hidden count separately. Σ usage is cumulative, not context occupancy.
 Deliberate worker expansion is kept per conversation within this page's bounded
 presentation cache; new work and settlement do not open details.
 Replacement/batch warnings, applicable batch Send and actionable operation

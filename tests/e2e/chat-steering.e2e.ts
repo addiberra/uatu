@@ -101,8 +101,8 @@ test.describe("steering an OpenCode 2.x turn", () => {
     const removed = page.waitForResponse(response => response.url().includes("/queue/") && response.request().method() === "DELETE");
     await held(page).first().locator("[data-queue-remove]").click();
     expect((await removed).ok()).toBe(true);
-    await expect(held(page)).toHaveCount(1);
-    await expect(held(page).locator("[data-queue-remove]")).toHaveAttribute("aria-label", survivorLabel!);
+    await expect(held(page)).toHaveCount(3);
+    await expect(held(page).getByRole("button", { name: survivorLabel!, exact: true })).toHaveAttribute("aria-label", survivorLabel!);
     await saveEvidence(testInfo, "review-unique-pending-actions.json", JSON.stringify({ labelsBeforeRemoval: labels, retainedLabel: survivorLabel }, null, 2));
     await captureScreenshot(page, testInfo, "review-unique-pending-actions");
   });
@@ -228,8 +228,8 @@ test.describe("steering an OpenCode 2.x turn", () => {
     await page.locator("#chat-delivery-toggle").click();
     const queue = page.getByRole("menuitemradio", { name: /^Queue/ });
     await queue.click();
-    await expect(page.locator("#chat-delivery-toggle")).toHaveAttribute("title", "Send and Enter: Queue");
-    await expect(page.locator("#chat-send")).toHaveAttribute("aria-label", "Send to queue");
+    await expect(page.locator("#chat-delivery-toggle")).toHaveAttribute("title", "Enter: Queue; tap Send steers; hold 2 seconds queues");
+    await expect(page.locator("#chat-send")).toHaveAttribute("aria-label", "Send as steer; hold 2 seconds to queue");
     await page.locator("#chat-delivery-toggle").focus();
     await page.locator("#chat-delivery-toggle").press("Enter");
     await expect(queue).toHaveAttribute("aria-checked", "true");
@@ -252,7 +252,7 @@ test.describe("steering an OpenCode 2.x turn", () => {
     await captureScreenshot(page, testInfo, "audit-composer-enabled-dark");
   });
 
-  test("visible Send uses the selected delivery while only Stop cancels", async ({ page, request }, testInfo) => {
+  test("visible Queue fallback submits while only Stop cancels", async ({ page, request }, testInfo) => {
     const conversationId = await newConversation(page);
     const send = page.locator("#chat-send");
     const stop = page.getByRole("button", { name: "Stop response", exact: true });
@@ -275,7 +275,8 @@ test.describe("steering an OpenCode 2.x turn", () => {
     expect(mutations).toEqual([]);
     await captureScreenshot(page, testInfo, "steering-separated-actions-desktop");
     const queued = page.waitForResponse(response => response.url().endsWith("/prompts"));
-    await send.click();
+    await page.locator("#chat-delivery-toggle").click();
+    await page.locator("#chat-queue-draft").click();
     expect(await (await queued).json()).toMatchObject({ pending: true, delivery: "queue" });
     await expect(held(page)).toContainText("Later, please");
     expect((await fakeSession(request, conversationId))?.running).toBe(true);
@@ -614,7 +615,7 @@ for (const browserName of ["chromium", "webkit"] as const) test.describe(`steeri
     await page.setViewportSize({ width: 320, height: 740 });
     await bootChat(page, request);
     const conversationId = await newConversation(page);
-    const controls = ["#chat-delivery-toggle", "#chat-send", "#chat-stop"];
+    const controls = ["#chat-send", "#chat-delivery-toggle", "#chat-stop"];
     const boxes = async () => Promise.all(controls.map(async selector => {
       const box = await page.locator(selector).boundingBox();
       expect(box).not.toBeNull();
@@ -646,7 +647,7 @@ for (const browserName of ["chromium", "webkit"] as const) test.describe(`steeri
       // Both ends of the edge nearest Send, inside the rounded corners,
       // belong only to Delivery, not Stop.
       for (const y of [10, before[0]!.height - 10]) {
-        await page.locator("#chat-delivery-toggle").tap({ position: { x: before[0]!.width - 2, y } });
+        await page.locator("#chat-delivery-toggle").tap({ position: { x: before[1]!.width - 2, y } });
         await expect(page.locator("#chat-delivery-menu")).toBeVisible();
         for (const choice of await page.locator("[data-delivery-choice]").all()) {
           expect((await choice.boundingBox())!.height).toBeGreaterThanOrEqual(44);
@@ -696,7 +697,10 @@ for (const browserName of ["chromium", "webkit"] as const) test.describe(`steeri
       const accepted = page.waitForResponse(response => response.url().endsWith("/prompts"));
       await page.locator(`#chat-delivery-menu [data-delivery-choice='${delivery}']`).tap();
       await expect(input).toHaveValue(text);
-      await page.locator("#chat-send").tap();
+      if (delivery === "queue") {
+        await page.locator("#chat-delivery-toggle").tap();
+        await page.locator("#chat-queue-draft").tap();
+      } else await page.locator("#chat-send").tap();
       expect(await (await accepted).json()).toMatchObject({ pending: true, delivery });
       await expect(input).toHaveValue("");
     };
@@ -782,7 +786,7 @@ for (const browserName of ["chromium", "webkit"] as const) test.describe(`steeri
     await toggle.tap();
     await expect(menu).toBeHidden();
 
-    // Choosing Queue only sets the default; Send and Enter use it.
+    // Choosing Queue only sets the keyboard default. The fallback queues now.
     await input.fill("Later, please");
     await toggle.tap();
     await page.keyboard.press("Escape");
@@ -793,7 +797,8 @@ for (const browserName of ["chromium", "webkit"] as const) test.describe(`steeri
     await menu.locator("[data-delivery-choice='queue']").tap();
     await expect(input).toHaveValue("Later, please");
     await expect(input).toBeFocused();
-    await page.locator("#chat-send").tap();
+    await toggle.tap();
+    await page.locator("#chat-queue-draft").tap();
     expect(await (await queued).json()).toMatchObject({ pending: true, delivery: "queue" });
     await expect(menu).toBeHidden();
     await expect(held(page).filter({ hasText: "Later, please" })).toHaveCount(1);

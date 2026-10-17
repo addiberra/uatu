@@ -12,6 +12,20 @@ afterEach(() => {
 });
 
 describe("chat API client", () => {
+  test("native side answers use qualified base paths and closed responses without retry", async () => {
+    Reflect.set(globalThis, "document", { querySelector: () => ({ getAttribute: () => "/s/work/" }) });
+    resetAppBasePathForTests();
+    const calls: Array<{ url: string; body: unknown }> = [];
+    const client = new ChatApiClient((async (url, init) => {
+      calls.push({ url: String(url), body: JSON.parse(String(init?.body)) });
+      return Response.json({ text: "Side answer" });
+    }) as typeof fetch);
+    expect(await client.generate("opencode:c/1", "side", "Why?")).toEqual({ text: "Side answer" });
+    expect(calls).toEqual([{ url: "/s/work/api/chat/conversations/opencode%3Ac%2F1/aside", body: { requestId: "side", question: "Why?" } }]);
+    for (const body of [{ text: 1 }, { text: "answer", history: true }, {}]) {
+      await expect(new ChatApiClient(async () => Response.json(body)).generate("opencode:c", "side", "Why?")).rejects.toBeInstanceOf(ChatTransportError);
+    }
+  });
   test("automatic background outcomes preserve accepted primary fields on prompt and delivery actions", async () => {
     for (const automaticBackground of ["not-needed", "accepted", "unavailable", "failed", "unknown"] as const) {
       const client = new ChatApiClient(async () => Response.json({ messageId: "message", pending: true, delivery: "steer", configuration: {}, automaticBackground }));

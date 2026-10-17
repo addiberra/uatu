@@ -41,6 +41,7 @@ import { DOCUMENT_NOT_READABLE_ERROR } from "../shared/document-errors";
 import { CHILD_POLICY_HEADER, CHAT_ACTION_BODY_BYTES, isChildPolicyAction, type readChildPolicyBootstrap } from "../hub/child-policy";
 import { CHAT_OPERATION_RECEIPT_HEADER, validChatOperationReceipt } from "../shared/chat-operation-receipt";
 import type { ChatActionContext } from "../chat/types";
+import { SideGenerationUnsupportedError } from "../chat/adapter";
 import { CHILD_CONVERSATION_OPEN_EVENT, CHILD_ACTIVITY_EVENT, CHILD_ACTIVITY_PATH } from "../shared/live-protocol";
 import { findDocument, isViewMode } from "../shared/types";
 import { parseWatchContext, type WatchContext } from "../shared/watch-context";
@@ -1170,6 +1171,15 @@ function buildChatRoutes(deps: BuildRoutesDeps, p: (path: string) => string) {
         return run(() => deps.chatService.backgroundBlockingWork!(id, requestId));
       }),
     },
+    [p("/api/chat/conversations/:conversationId/aside")]: {
+      POST: async (request: RouteRequest) => chatMutation(request, ["requestId", "question"], async (id, body) => {
+        const requestId = bodyIdentity(body, "requestId");
+        if (requestId instanceof Response) return requestId;
+        if (typeof body.question !== "string" || !body.question.trim() || Buffer.byteLength(body.question) > 16_384) return chatError(400, "question must contain 1–16384 bytes");
+        if (!deps.chatService.generate) return chatError(409, "Side answers are not supported by this agent");
+        return run(() => deps.chatService.generate!(id, requestId, body.question as string));
+      }),
+    },
     [p("/api/chat/conversations/:conversationId/wakeups/:wakeupId/cancel")]: {
       POST: async (request: RouteRequest) => chatMutation(request, ["requestId"], async (id, body) => {
         const wakeupId = routeIdentity(request, "wakeupId");
@@ -1400,6 +1410,7 @@ function parseNameSelection(value: unknown, noun: "mode" | "variant"): string | 
 }
 
 function normalizedChatError(error: unknown): Response {
+  if (error instanceof SideGenerationUnsupportedError) return chatError(409, error.message);
   if (error instanceof ConversationNotFoundError) return chatError(404, "conversation not found");
   if (error instanceof HistoryChangedError) return chatError(409, error.message);
   if (error instanceof UnknownAgentError) return chatError(404, error.message);

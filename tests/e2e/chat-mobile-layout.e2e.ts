@@ -73,7 +73,10 @@ async function submit(page: Page, text: string, delivery: "steer" | "queue" = "s
     await activate(`[data-delivery-choice="${delivery}"]`);
   }
   const accepted = page.waitForResponse(response => response.url().endsWith("/prompts"));
-  await activate("#chat-send");
+  if (delivery === "queue") {
+    await activate("#chat-delivery-toggle");
+    await activate("#chat-queue-draft");
+  } else await activate("#chat-send");
   expect((await accepted).ok()).toBe(true);
   await expect(page.locator("#chat-input")).toHaveValue("");
 }
@@ -220,6 +223,9 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`mobile layo
     await page.locator("[data-pending-toggle]").tap();
     await page.locator("#chat-compact-workers > summary").tap();
     await expect(page.locator("#chat-queue-items")).toBeVisible();
+    const scale = enlarged ? 2 : 1;
+    await expect(page.locator(".chat-worker-name").first()).toHaveCSS("font-size", `${14 * scale}px`);
+    await expect(page.locator(".chat-worker-model").first()).toHaveCSS("font-size", `${11 * scale}px`);
     const dock = await page.locator("#chat-work-dock").boundingBox();
     const band = await page.locator("#chat-surface").evaluate(element => parseFloat(element.style.getPropertyValue("--chat-visual-height")));
     await saveEvidence(testInfo, `compact-${engine}-${enlarged ? "enlarged" : "standard"}-bounds.json`, JSON.stringify(await page.evaluate(() => Object.fromEntries(["chat-surface", "chat-composer", "chat-work-dock", "chat-options-toggle", "chat-send", "chat-delivery-toggle", "chat-stop"].map(id => {
@@ -712,8 +718,13 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`mobile layo
     expect(await page.locator(".chat-task-stop").first().evaluate(element => parseFloat(getComputedStyle(element).fontSize))).toBeGreaterThanOrEqual(13);
     expect(await page.locator("#chat-conversation-select").evaluate(element => parseFloat(getComputedStyle(element).fontSize))).toBeGreaterThanOrEqual(16);
     await page.locator("#chat-compact-workers > summary").tap();
-    const open = page.locator(".chat-worker-inspect").first();
+    const open = page.locator(".chat-worker-row:has(.chat-task-stop) .chat-worker-inspect").first();
+    // Only inspection-only rows use the approved 29px density exception.
     expect((await open.boundingBox())!.height).toBeGreaterThanOrEqual(44);
+    const dense = page.locator(".chat-worker-row:not(:has(.chat-task-stop)) .chat-worker-inspect").first();
+    expect((await dense.boundingBox())!.height).toBeGreaterThanOrEqual(29);
+    expect((await dense.boundingBox())!.height).toBeLessThan(44);
+    expect((await page.locator(".chat-worker-row .chat-task-stop").first().boundingBox())!.height).toBeGreaterThanOrEqual(44);
     await page.locator("#chat-delivery-toggle").tap();
     expect(await page.locator(".chat-delivery-hint").first().evaluate(element => parseFloat(getComputedStyle(element).fontSize))).toBeGreaterThanOrEqual(13);
   });

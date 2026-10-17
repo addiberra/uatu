@@ -389,6 +389,9 @@ export function startOpenCodeV2Fake(options: { directory: string; password?: str
     const sub = `${request.method} ${rest}`;
 
     if (sub === "GET ") return enveloped(session.info);
+    // Pinned SessionGenerate makes one inference, admits no inbox/history
+    // entry, runs no tool executor and leaves the foreground runner alone.
+    if (sub === "POST generate") return enveloped({ text: "A native side answer from the existing context." });
     if (sub === "PATCH ") {
       if (typeof body.title === "string") {
         session.info.title = body.title;

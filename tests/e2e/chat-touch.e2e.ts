@@ -255,7 +255,7 @@ test("composer stays flush with separate Send and Stop on a stable narrow action
     const send = actions.querySelector<HTMLElement>("#chat-send")!.getBoundingClientRect();
     const trigger = document.querySelector<HTMLElement>("#chat-options-toggle")!.getBoundingClientRect();
     const header = document.querySelector<HTMLElement>(".chat-header")!.getBoundingClientRect();
-    const status = actions.querySelector<HTMLElement>("#chat-composer-status")!.getBoundingClientRect();
+    const status = actions.querySelector<HTMLElement>("#chat-configuration-trigger")!.getBoundingClientRect();
     const bounds = actions.getBoundingClientRect();
     const composer = actions.closest(".chat-composer")!;
     const style = getComputedStyle(composer);
@@ -1075,6 +1075,11 @@ test("history prepend and activity expansion preserve semantic position", async 
   const timeline = page.locator("#chat-timeline");
   await timeline.evaluate(element => { element.scrollTop = 0; element.dispatchEvent(new Event("scroll")); });
   const anchor = page.locator(`[data-chat-item-id="${latest[0]!.id}"]`);
+  // Establish the click's reading position before measuring: initial follow
+  // layout can still settle, and click() otherwise scrolls Load older into view
+  // after the baseline was captured. Keep the exact anchor assertion below.
+  await page.locator("#chat-load-older").scrollIntoViewIfNeeded();
+  await expect.poll(stillScrollTop(timeline)).toBe(true);
   const before = await anchor.evaluate(element => element.getBoundingClientRect().top);
   const olderResponse = page.waitForResponse(response => response.url().includes("cursor=older"));
   await page.locator("#chat-load-older").click();

@@ -893,6 +893,7 @@
             <div id="chat-composer-notices" class="chat-composer-notices" role="region" aria-label="Composer feedback and errors; scroll for all messages" tabindex="0">
               <p id="chat-action-feedback" class="chat-composer-error is-notice" role="status" aria-live="polite" hidden></p>
               <p id="chat-composer-error" class="chat-composer-error" hidden></p>
+              <button id="chat-aside-ready" class="chat-secondary-button" type="button" hidden>Side answer ready</button>
             </div>
             <input id="chat-attach-input" type="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden>
             <div class="chat-composer-actions">
@@ -915,7 +916,9 @@
                 </summary>
                 <dl id="chat-context-usage-breakdown" class="chat-context-breakdown"></dl>
               </details>
-              <button id="chat-configuration-trigger" class="chat-configuration-trigger" type="button" aria-haspopup="dialog" aria-controls="chat-configuration-dialog" aria-expanded="false" disabled>
+              <button id="chat-configuration-trigger" class="chat-configuration-trigger" type="button" aria-haspopup="dialog" aria-controls="chat-configuration-dialog" aria-describedby="chat-inline-context" aria-expanded="false" disabled>
+                <span id="chat-inline-configuration" class="chat-inline-configuration"></span>
+                <span id="chat-inline-context" class="chat-inline-context">Context not reported</span>
                 <span id="chat-configuration-summary" class="chat-configuration-summary">Chat settings</span>
                 <span id="chat-configuration-details" class="chat-configuration-details" hidden>
                   <span id="chat-configuration-mode-summary" class="chat-configuration-detail"></span>
@@ -943,6 +946,7 @@
                 <div id="chat-delivery-menu" class="chat-delivery-menu" role="menu" aria-label="Delivery" hidden>
                   <button type="button" role="menuitemradio" aria-checked="true" data-delivery-choice="steer"><span class="chat-delivery-name">Steer</span><span class="chat-delivery-shortcut">Enter</span><span class="chat-delivery-hint">Next step</span></button>
                   <button type="button" role="menuitemradio" aria-checked="false" data-delivery-choice="queue"><span class="chat-delivery-name">Queue</span><span class="chat-delivery-shortcut">Alt+Enter</span><span class="chat-delivery-hint">After this turn</span></button>
+                  <button type="button" role="menuitem" id="chat-queue-draft">Queue message now</button>
                 </div>
               </span>
               <!-- Chips the login reports beside the status: plan utilization
@@ -1057,6 +1061,13 @@
                 </label>
               </footer>
             </div>
+          </dialog>
+          <dialog id="chat-aside-dialog" class="chat-aside-dialog" aria-labelledby="chat-aside-title">
+            <h2 id="chat-aside-title">/btw · Side answer</h2>
+            <p id="chat-aside-question"></p>
+            <p class="chat-aside-note">One-shot answer from existing context. Not added to conversation history; no agent tool execution.</p>
+            <div id="chat-aside-answer"></div>
+            <button id="chat-aside-close" class="chat-secondary-button" type="button">Close side answer</button>
           </dialog>
         </section>
       </div>

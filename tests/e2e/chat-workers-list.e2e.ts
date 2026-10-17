@@ -33,7 +33,7 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`canonical w
         taskType: index === 19 || index === 17 ? "shell" : "agent", outputFile: "fixture-output",
         ...(index === 18 ? { toolUseIds: ["alias-a", "alias-b"], progress: "Editing themes/dark.css" } : {}),
       })),
-      { id: "tool:alias-a", type: "tool", createdAt: now, name: "task", input: '{"description":"Launch theme worker"}', status: "completed" },
+      { id: "tool:alias-a", type: "tool", createdAt: now, name: "task", input: '{"description":"Launch theme worker"}', status: "completed", model: "GPT-6.1 Sol", usage: { input: 220000, output: 9000 } },
       { id: "tool:alias-b", type: "tool", createdAt: now, name: "task", input: '{"description":"Observe same execution"}', status: "completed" },
       { id: "foreground", type: "command", createdAt: now, command: "cat index.html styles.css USAGE.md; node --check app.js", status: "completed" },
     ];
@@ -55,7 +55,7 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`canonical w
     for (const row of await track.locator('[data-state="working"]').all()) {
       const inspect = (await row.locator(".chat-worker-inspect").boundingBox())!;
       const stop = (await row.locator("[data-stop-task]").boundingBox())!;
-      expect(inspect.height).toBeGreaterThanOrEqual(44);
+      expect(inspect.height).toBeGreaterThanOrEqual(44); // Mutation-bearing rows retain full safe targets.
       expect(stop.height).toBeGreaterThanOrEqual(44);
       expect(stop.x - inspect.x - inspect.width).toBeGreaterThanOrEqual(8);
     }
@@ -65,10 +65,27 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`canonical w
     expect(await page.locator("#chat-timeline").evaluate(node => node.clientHeight)).toBeGreaterThanOrEqual(844 * 0.4);
     await captureScreenshot(page, info, `workers-${engine}-${theme}-active-first`);
     await track.locator(".chat-workers-history > summary").tap();
+    for (const row of await track.locator('.chat-workers-history [data-worker-id]').all()) {
+      expect((await row.locator(".chat-worker-inspect").boundingBox())!.height).toBeGreaterThanOrEqual(29);
+      expect((await row.locator(".chat-worker-inspect").boundingBox())!.height).toBeLessThan(44);
+    }
     expect(await track.locator(".chat-workers-history [data-worker-id]").evaluateAll(nodes => nodes.map(node => (node as HTMLElement).dataset.workerId))).toEqual(Array.from({ length: 18 }, (_, i) => `job:${17 - i}`));
     const scrollContainers = await page.locator("#chat-work-dock").evaluate(node => [node, ...node.querySelectorAll("*")].filter(element => element.getBoundingClientRect().height > 0 && /auto|scroll/.test(getComputedStyle(element).overflowY)).map(element => element.id || element.className));
     expect(scrollContainers).toEqual(["chat-work-dock"]);
     await captureScreenshot(page, info, `workers-${engine}-${theme}-history`);
+    await expect(track.locator('[data-worker-id="job:18"] .chat-worker-model')).toHaveText("GPT-6.1 Sol");
+    await expect(track.locator('[data-worker-id="job:18"] .chat-worker-tokens')).toHaveText("Σ 229k");
+    await track.getByRole("button", { name: "Dismiss finished", exact: true }).tap();
+    await expect(summary).toHaveText("2 working · 0 finished · 18 hidden");
+    await expect(rows).toHaveCount(2);
+    await page.reload();
+    await page.locator("#touch-tab-chat").tap();
+    await expect(summary).toHaveText("2 working · 0 finished · 18 hidden");
+    await expect(rows).toHaveCount(2);
+    if (await track.getAttribute("open") === null) await summary.tap();
+    await track.getByRole("button", { name: "Restore finished (18)", exact: true }).tap();
+    await expect(summary).toHaveText("2 working · 18 finished");
+    await expect(rows).toHaveCount(20);
     await summary.tap();
     await page.locator("#chat-input").fill("Preserve this private composing draft");
 

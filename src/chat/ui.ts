@@ -35,6 +35,7 @@ import { hasVerifiedBlockingWork } from "./blocking-work";
 import { AutomaticBackgroundNotices } from "./automatic-background";
 import type { AutomaticBackgroundFeedback, BackgroundTaskItem } from "./types";
 import { contextReadout } from "./context-readout";
+import { HoldToQueue } from "./hold-to-queue";
 import { buildReceiptRows, buildReceiptTotal, parseReceiptView, receiptHeading, subagentTrackSummary, subagentTranscriptTitle, type ReceiptView } from "./receipt-view";
 import { formatTokens, totalTokens } from "./usage";
 import { resolveSessionTotals, type ConversationTotals } from "./conversation-totals";
@@ -1043,18 +1044,31 @@ export function initChat(api = new ChatApiClient()): void {
   const compactWorkerState = new CompactDisclosure();
   const compactPendingState = new CompactDisclosure();
   compactWorkersList?.addEventListener("toggle", () => compactWorkerState.toggled(compactWorkersList.open));
-  const compactView = compactWorkersItems ? new CompactWorkersView(compactWorkersItems) : null;
+  const compactView = compactWorkersItems ? new CompactWorkersView(compactWorkersItems, restore => {
+    if (!projection) return;
+    const dismissed = new Set(presentation.dismissedSubagents[projection.conversationId] ?? []);
+    for (const worker of compactWorkers(projection.items)) {
+      if (restore) { dismissed.delete(worker.id); for (const reference of worker.references) dismissed.delete(reference); }
+      else if (worker.state !== "working" && worker.state !== "unknown") { dismissed.add(worker.id); for (const reference of worker.references) dismissed.add(reference); }
+    }
+    presentation.dismissedSubagents[projection.conversationId] = [...dismissed];
+    save(); syncCompactWork();
+  }) : null;
   const syncCompactWork = () => {
     if (!compactWorkersList || !compactWorkersItems || !compactWorkersLabel) return;
     const touch = document.documentElement.dataset.uiMode === "touch";
     compactWorkersList.hidden = !touch;
     if (!touch) return;
-    const workers = compactWorkers(projection?.items ?? []);
-    compactWorkersLabel.textContent = workerSummary(workers);
-    compactWorkersLabel.setAttribute("aria-label", `Workers: ${workerSummary(workers)}`);
-    compactWorkersList.hidden = workers.length === 0;
+    const allWorkers = compactWorkers(projection?.items ?? []);
+    const dismissed = new Set(projection ? presentation.dismissedSubagents[projection.conversationId] ?? [] : []);
+    const workers = allWorkers.filter(worker => worker.state === "working" || worker.state === "unknown" || !dismissed.has(worker.id) && !worker.references.some(id => dismissed.has(id)));
+    const hiddenCount = allWorkers.length - workers.length;
+    const summary = `${workerSummary(workers) || "0 working · 0 finished"}${hiddenCount ? ` · ${hiddenCount} hidden` : ""}`;
+    compactWorkersLabel.textContent = summary;
+    compactWorkersLabel.setAttribute("aria-label", `Workers: ${summary}`);
+    compactWorkersList.hidden = allWorkers.length === 0;
     compactWorkersList.open = compactWorkerState.paint(projection?.conversationId ?? null);
-    compactView?.paint(projection?.conversationId ?? null, workers, stoppingTasks, declares("background-tasks"));
+    compactView?.paint(projection?.conversationId ?? null, workers, stoppingTasks, declares("background-tasks"), hiddenCount);
   };
   compactWorkersItems?.addEventListener("mousedown", event => keepTouchComposerFocus(event));
   compactWorkersList?.querySelector("summary")?.addEventListener("mousedown", event => keepTouchComposerFocus(event));
@@ -1766,6 +1780,15 @@ export function initChat(api = new ChatApiClient()): void {
     // The newest report or carrier, scanned from the tail — it is almost
     // always right at the end of a long timeline (see context-readout.ts).
     const readout = contextReadout(projection?.items ?? [], models, displayedConfiguration().model);
+    const inlineContext = document.querySelector<HTMLElement>("#chat-inline-context");
+    if (inlineContext) {
+      const qualifier = readout?.window?.source === "estimate" ? "~" : "";
+      inlineContext.textContent = !readout || !declares("context") ? "Context not reported"
+        : readout.limit === undefined ? `${formatTokens(readout.used)} context · limit unknown`
+        : `${qualifier}${Math.round((readout.fraction ?? 0) * 100)}% · ${formatTokens(readout.used)}/${formatTokens(readout.limit)} context`;
+      inlineContext.title = !readout || !declares("context") ? "Context occupancy has not been reported"
+        : `${readout.used.toLocaleString()} tokens in context; ${readout.limit === undefined ? "limit unknown" : `${readout.limit.toLocaleString()} ${readout.window?.source ?? "reported"} limit`}${readout.window?.freshness === "cached" ? " (cached)" : ""}`;
+    }
     const reportingModel = readout?.model ? modelValue(readout.model) : "";
     const windowKey = JSON.stringify([readout?.limit, readout?.window]);
     if (readout?.source === paintedSource && reportingModel === paintedUsageModel && windowKey === paintedWindowKey) return;
@@ -2870,6 +2893,8 @@ export function initChat(api = new ChatApiClient()): void {
     }
   };
 
+  const sideAnswers = new Map<string, { question: string; text: string; failed?: boolean }>();
+  const sideGenerating = new Set<string>();
   const syncControls = () => {
     const status = projection?.status ?? null;
     if (status !== lastStatus) {
@@ -2892,6 +2917,12 @@ export function initChat(api = new ChatApiClient()): void {
     // an empty draft sendable (image-only prompts are accepted end to end),
     // and an upload still in flight counts — submission waits for it.
     const activeId = activeConversationId();
+    const asideButton = document.querySelector<HTMLButtonElement>("#chat-aside-ready");
+    if (asideButton) {
+      asideButton.hidden = !activeId || !sideAnswers.has(activeId) && !sideGenerating.has(activeId);
+      asideButton.disabled = Boolean(activeId && sideGenerating.has(activeId));
+      asideButton.textContent = activeId && sideGenerating.has(activeId) ? "Answering /btw…" : activeId && sideAnswers.get(activeId)?.failed ? "Side question failed" : "Side answer ready";
+    }
     if (activeId && !running
       && !projection?.items.some(item => item.type === "background_task" && item.status === "running")) {
       automaticNotes.clearSuccessful(activeId);
@@ -2990,6 +3021,13 @@ export function initChat(api = new ChatApiClient()): void {
     // the agent itself declares. A delegation without a declared default is
     // said once in the dialog ("Let ... choose"), not echoed here.
     const displayedMode = configuration.mode ?? defaultMode?.name;
+    const inlineConfiguration = document.querySelector<HTMLElement>("#chat-inline-configuration");
+    if (inlineConfiguration) {
+      inlineConfiguration.textContent = [displayedMode ? configurationOptionLabel(displayedMode) : agent?.name,
+        declares("models") ? configurationSummary.textContent : undefined,
+        configuration.variant ? configurationOptionLabel(configuration.variant) : undefined].filter(Boolean).join(" · ");
+      inlineConfiguration.title = [agent?.name, inlineConfiguration.textContent].filter(Boolean).join(" · ");
+    }
     const showMode = offersMode && Boolean(displayedMode);
     const showReasoning = offersReasoning && Boolean(configuration.variant);
     configurationModeSummary.hidden = !showMode;
@@ -3484,7 +3522,7 @@ export function initChat(api = new ChatApiClient()): void {
   configurationPicker = createChatConfigurationPicker({
     dialog: configurationDialog,
     trigger: configurationTrigger,
-    returnFocus: () => document.documentElement.dataset.uiMode === "touch" ? document.querySelector<HTMLElement>("#chat-options-toggle") ?? configurationTrigger : configurationTrigger,
+    returnFocus: () => configurationTrigger,
     surface,
     search: configurationSearch,
     modelsSection: configurationModelsSection,
@@ -3506,6 +3544,7 @@ export function initChat(api = new ChatApiClient()): void {
     refreshCatalogsOnUse();
     configurationPicker?.open();
   });
+  configurationTrigger.addEventListener("mousedown", event => keepTouchComposerFocus(event));
   createTouchChatOptions(() => { refreshCatalogsOnUse(); configurationPicker?.open(); });
   renderConfiguration();
   // With one agent there is no choice to offer; with more, creation asks.
@@ -3785,16 +3824,21 @@ export function initChat(api = new ChatApiClient()): void {
     const touch = document.documentElement.dataset.uiMode === "touch";
     const label = preferred === "steer" ? "Steer" : "Queue";
     if (deliveryLabel) deliveryLabel.textContent = label;
-    deliveryToggle?.setAttribute("aria-label", `Delivery: ${label}`);
-    if (deliveryToggle) deliveryToggle.title = deliveryChoiceOffered() ? touch ? `Send: ${label}; Enter adds a new line` : `Send and Enter: ${label}` : "Delivery applies while working or messages are pending; idle messages send immediately";
-    const sendAction = localHistoryOperation(input?.value ?? "", commands, declares("reversible-history")) ? "Send message" : isLiveConversationStatus(projection?.status)
-      ? declares("steering") && preferred === "steer" && !isListedCommand(input?.value ?? "") ? "Send as steer" : declares("steering") ? "Send to queue" : "Queue message"
+    deliveryToggle?.setAttribute("aria-label", `Send options. Keyboard delivery: ${label}`);
+    if (deliveryToggle) deliveryToggle.title = deliveryChoiceOffered() ? touch ? `Ctrl+Enter: ${label}; Enter adds a new line; tap Send steers` : `Enter: ${label}; tap Send steers; hold 2 seconds queues` : "Delivery applies while working or messages are pending; idle messages send immediately";
+    const sendAction = /^\/btw(?:\s|$)/.test(input?.value.trim() ?? "") ? "Ask side question" : localHistoryOperation(input?.value ?? "", commands, declares("reversible-history")) ? "Send message" : isLiveConversationStatus(projection?.status)
+      ? declares("steering") && !isListedCommand(input?.value ?? "") && currentPendingAttachments().length === 0 ? "Send as steer; hold 2 seconds to queue" : declares("steering") ? "Send to queue" : "Queue message"
       : "Send message";
     send?.setAttribute("aria-label", sendAction);
     if (send) send.title = sendAction;
+    const queueDraft = document.querySelector<HTMLButtonElement>("#chat-queue-draft");
+    if (queueDraft) {
+      queueDraft.disabled = send?.disabled ?? true;
+      queueDraft.textContent = isLiveConversationStatus(projection?.status) || (projection?.queued.length ?? 0) > 0 ? "Queue message now" : "Send message now (idle)";
+    }
     for (const item of deliveryMenu?.querySelectorAll<HTMLButtonElement>("[data-delivery-choice]") ?? []) {
       item.setAttribute("aria-checked", String(item.dataset.deliveryChoice === preferred));
-      const shortcutText = item.dataset.deliveryChoice === preferred ? touch ? "Send / Ctrl+Enter" : "Enter" : "Alt+Enter";
+      const shortcutText = item.dataset.deliveryChoice === preferred ? touch ? "Ctrl+Enter" : "Enter" : "Alt+Enter";
       item.setAttribute("aria-label", `${item.dataset.deliveryChoice === "steer" ? "Steer, next step" : "Queue, after this turn"}, ${shortcutText}`);
       const shortcut = item.querySelector<HTMLElement>(".chat-delivery-shortcut");
       if (shortcut) shortcut.textContent = shortcutText;
@@ -3823,7 +3867,7 @@ export function initChat(api = new ChatApiClient()): void {
       // Let Tab move naturally from the disclosure into the surrounding UI.
       return;
     }
-    const choices = Array.from(deliveryMenu.querySelectorAll<HTMLButtonElement>("[data-delivery-choice]"));
+    const choices = Array.from(deliveryMenu.querySelectorAll<HTMLButtonElement>("button:not(:disabled)"));
     const index = choices.indexOf(document.activeElement as HTMLButtonElement);
     let next: number;
     switch (event.key) {
@@ -3870,6 +3914,12 @@ export function initChat(api = new ChatApiClient()): void {
     closeDeliveryMenu();
   });
   deliveryMenu?.addEventListener("click", event => {
+    if ((event.target as Element).closest("#chat-queue-draft")) {
+      closeDeliveryMenu();
+      requestedDelivery = "queue";
+      form.requestSubmit();
+      return;
+    }
     const choice = (event.target as Element).closest<HTMLButtonElement>("[data-delivery-choice]");
     if (!choice) return;
     const delivery: MessageDelivery = choice.dataset.deliveryChoice === "queue" ? "queue" : "steer";
@@ -3878,7 +3928,7 @@ export function initChat(api = new ChatApiClient()): void {
     writeDeliveryPreference(presentationLocalStorage(), delivery);
     syncDeliveryMenu();
     closeDeliveryMenu();
-    const action = document.documentElement.dataset.uiMode === "touch" ? "Send or Ctrl+Enter" : "Send or Enter";
+    const action = document.documentElement.dataset.uiMode === "touch" ? "Ctrl+Enter" : "Enter";
     noteComposer(delivery === "steer" ? `${action} steers while the agent works` : `${action} queues while the agent works`);
     input.focus();
   });
@@ -4615,6 +4665,107 @@ export function initChat(api = new ChatApiClient()): void {
   surface.addEventListener("focusin", syncEditingFocus);
   surface.addEventListener("focusout", () => queueMicrotask(syncEditingFocus));
   send.addEventListener("mousedown", keepTouchComposerFocus);
+  attachButton?.addEventListener("mousedown", keepTouchComposerFocus);
+  const holdVisual = document.createElement("span");
+  holdVisual.className = "chat-hold-upward";
+  holdVisual.setAttribute("aria-hidden", "true");
+  holdVisual.hidden = true;
+  const holdCap = document.createElement("span");
+  holdCap.className = "chat-hold-cap";
+  holdVisual.append(holdCap);
+  sendGroup?.append(holdVisual);
+  let holdPointer: number | null = null;
+  let holdBounds: DOMRect | null = null;
+  let holdTimer: ReturnType<typeof setTimeout> | null = null;
+  let holdFrame = 0;
+  let suppressPointerClick = false;
+  const submitDelivery = (delivery: MessageDelivery) => {
+    requestedDelivery = delivery;
+    form.requestSubmit();
+  };
+  const hold = new HoldToQueue(() => {
+    if (!projection || send.disabled || submitting || cancelling || document.hidden || !document.hasFocus()) return null;
+    const box = send.getBoundingClientRect();
+    return JSON.stringify([selectionGeneration, projection.conversationId, input.value,
+      currentPendingAttachments(), attachmentStaging.has(projection.conversationId), displayedConfiguration(),
+      box.left, box.top, box.width, box.height]);
+  }, submitDelivery);
+  const clearHoldVisual = () => {
+    if (holdTimer !== null) clearTimeout(holdTimer);
+    holdTimer = null;
+    cancelAnimationFrame(holdFrame);
+    holdVisual.hidden = true;
+    send.classList.remove("is-holding");
+  };
+  const cancelHold = () => {
+    hold.cancel();
+    clearHoldVisual();
+    const pointer = holdPointer;
+    holdPointer = null;
+    holdBounds = null;
+    if (pointer !== null && send.hasPointerCapture(pointer)) send.releasePointerCapture(pointer);
+  };
+  const paintHold = () => {
+    const now = performance.now();
+    const progress = hold.progress(now);
+    if (progress === null) { clearHoldVisual(); return; }
+    if (progress === 1) { hold.check(now); clearHoldVisual(); return; }
+    const box = send.getBoundingClientRect();
+    const viewportTop = window.visualViewport?.offsetTop ?? 0;
+    holdVisual.style.left = `${box.left - (sendGroup?.getBoundingClientRect().left ?? box.left)}px`;
+    holdVisual.style.width = `${box.width}px`;
+    const extension = Math.min(84, Math.max(0, box.top - viewportTop - 8));
+    holdVisual.style.height = `${box.height + extension}px`;
+    holdVisual.style.top = `${box.top - (sendGroup?.getBoundingClientRect().top ?? box.top) - extension}px`;
+    holdVisual.style.setProperty("--hold-progress", String(progress));
+    holdCap.textContent = `${isLiveConversationStatus(projection?.status) ? "Queue" : "Send"}\n${((1 - progress) * 2).toFixed(1)}s`;
+    holdVisual.hidden = false;
+    send.classList.add("is-holding");
+    holdFrame = requestAnimationFrame(paintHold);
+  };
+  send.addEventListener("pointerdown", event => {
+    suppressPointerClick = false;
+    if (!declares("steering") || /^\/btw(?:\s|$)/.test(input.value.trim()) || localHistoryOperation(input.value, commands, declares("reversible-history"))) return;
+    if (!event.isPrimary || event.button !== 0 || !hold.begin(event.pointerId, performance.now())) return;
+    event.preventDefault(); // Keep the composing field and mobile keyboard owned.
+    suppressPointerClick = true;
+    holdPointer = event.pointerId;
+    holdBounds = send.getBoundingClientRect();
+    send.setPointerCapture(event.pointerId);
+    paintHold();
+    holdTimer = setTimeout(() => { hold.check(performance.now()); clearHoldVisual(); }, 2000);
+  });
+  send.addEventListener("pointermove", event => {
+    if (event.pointerId !== holdPointer) return;
+    const box = holdBounds;
+    if (!box) return;
+    if (event.clientX < box.left || event.clientX >= box.right || event.clientY < box.top || event.clientY >= box.bottom) cancelHold();
+  });
+  send.addEventListener("pointerup", event => {
+    if (event.pointerId !== holdPointer) return;
+    hold.release(event.pointerId, performance.now());
+    cancelHold();
+  });
+  send.addEventListener("pointercancel", cancelHold);
+  send.addEventListener("lostpointercapture", cancelHold);
+  send.addEventListener("contextmenu", event => event.preventDefault());
+  send.addEventListener("click", event => {
+    event.preventDefault();
+    if (event.detail > 0 && suppressPointerClick) { suppressPointerClick = false; return; }
+    if (holdPointer !== null) { cancelHold(); return; }
+    submitDelivery("steer");
+  });
+  send.addEventListener("keydown", event => {
+    if (event.repeat && (event.key === "Enter" || event.key === " ")) event.preventDefault();
+  });
+  document.addEventListener("keydown", event => {
+    if (event.key !== "Escape" || holdPointer === null) return;
+    event.preventDefault(); event.stopImmediatePropagation(); cancelHold();
+  }, true);
+  window.addEventListener("blur", cancelHold);
+  window.addEventListener("pagehide", cancelHold);
+  document.addEventListener("visibilitychange", cancelHold);
+  input.addEventListener("input", cancelHold);
   // Mobile browsers can adjust a gap tap onto a nearby button. Use the raw
   // touch coordinates (click/pointer coordinates may already be adjusted)
   // to suppress only these misses; actual controls keep their native events.
@@ -4807,6 +4958,21 @@ export function initChat(api = new ChatApiClient()): void {
     }
   };
 
+  const asideButton = document.querySelector<HTMLButtonElement>("#chat-aside-ready");
+  const asideDialog = document.querySelector<HTMLDialogElement>("#chat-aside-dialog");
+  asideButton?.addEventListener("mousedown", keepTouchComposerFocus);
+  asideButton?.addEventListener("click", () => {
+    const id = activeConversationId();
+    const answer = id ? sideAnswers.get(id) : undefined;
+    if (!answer || !asideDialog) return;
+    asideDialog.querySelector("#chat-aside-question")!.textContent = answer.question;
+    asideDialog.querySelector("#chat-aside-answer")!.textContent = answer.text.trim() || "No text answer returned. The model may have attempted a tool call; side answers do not execute tools.";
+    asideDialog.showModal();
+    document.querySelector<HTMLElement>("#chat-aside-close")?.focus();
+  });
+  document.querySelector("#chat-aside-close")?.addEventListener("click", () => asideDialog?.close());
+  asideDialog?.addEventListener("close", () => { if (asideButton && !asideButton.hidden) asideButton.focus({ preventScroll: true }); });
+
   form.addEventListener("submit", async event => {
     event.preventDefault();
     // Every submission path, including requestSubmit from keyboard shortcuts,
@@ -4816,6 +4982,33 @@ export function initChat(api = new ChatApiClient()): void {
     const submissionDelivery = requestedDelivery;
     requestedDelivery = undefined;
     if (!projection || submitting || cancelling) return;
+    const aside = /^\/btw(?:\s+([\s\S]*))?$/.exec(input.value.trim());
+    if (aside) {
+      const conversationId = projection.conversationId;
+      const question = aside[1]?.trim();
+      if (!declares("side-generation")) { setComposerError("/btw side answers are not supported by this agent. Nothing was sent."); return; }
+      if (!question) { setComposerError("Add a side question after /btw. Nothing was sent."); return; }
+      if (currentPendingAttachments().length || attachmentStaging.has(conversationId)) { setComposerError("/btw uses existing conversation context only. Remove pending images before asking a side question."); return; }
+      if (sideGenerating.has(conversationId)) { setComposerError("A side answer is already in progress for this conversation."); return; }
+      const captured = input.value;
+      sideGenerating.add(conversationId);
+      input.value = "";
+      presentation.drafts[conversationId] = "";
+      save(); autosize(input); closeCommandMenu(); setComposerError(null); syncControls();
+      try {
+        const answer = await api.generate(conversationId, newRequestId(), question);
+        boundedSet(sideAnswers, conversationId, { question, text: answer.text }, 200);
+      } catch (error) {
+        // No automatic replay; preserve newer edits and the original question.
+        const newer = activeConversationId() === conversationId ? input.value : presentation.drafts[conversationId] ?? "";
+        const failure = `Side answer failed: ${messageOf(error)}. No conversation message was sent. No automatic retry was made.`;
+        boundedSet(sideAnswers, conversationId, { question, text: failure, failed: true }, 200);
+        presentation.drafts[conversationId] = newer ? newer : captured;
+        if (activeConversationId() === conversationId) { input.value = presentation.drafts[conversationId]!; autosize(input); }
+        save(); setComposerError(failure, conversationId);
+      } finally { sideGenerating.delete(conversationId); syncControls(); }
+      return;
+    }
     const operation = localHistoryOperation(input.value, commands, declares("reversible-history"));
     if (operation) {
       const conversationId = projection.conversationId;
@@ -4989,7 +5182,7 @@ export function initChat(api = new ChatApiClient()): void {
     // Named only to a steering agent: the device default, or this
     // submission's one-off choice (⌥Enter, the menu). The workspace decides
     // whether it steers, holds, or dispatches, and reports which.
-    const delivery: MessageDelivery | undefined = declares("steering") ? submissionDelivery ?? readDeliveryPreference(presentationLocalStorage()) : undefined;
+    const delivery: MessageDelivery | undefined = declares("steering") ? attachmentRefs.length ? "queue" : submissionDelivery ?? readDeliveryPreference(presentationLocalStorage()) : undefined;
     const uncertainHubSteer = Boolean(document.querySelector('meta[name="uatu-hub"]')) && !isListedCommand(text)
       && (projection.reversibleHistory?.staged === true || delivery === "steer" && (isLiveConversationStatus(projection.status) || projection.queued.length > 0));
     // Optimistic send: the message shows immediately and the input clears;

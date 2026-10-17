@@ -24,6 +24,8 @@ import type { CoverageAnnotations } from "../coverage-annotations";
  * Verified personal Hub steering may make one `session.background` call
  * after acknowledged native prompt/resume; it adds no job-start automation
  * or SDK endpoint. Composite unknowns retain receipts and reconcile read-only.
+ * `/btw` separately uses native `session.generate`: one inference from current
+ * context, no prompt admission, interruption or agent tool execution loop.
  * `session.interrupt({resume:false})` targets a verified child occurrence;
  * `shell.get`/`shell.output`/`shell.remove` inspect or remove owned shell work.
  * Removal deletes output and may fail pending capture; neither shell exit nor

@@ -1,4 +1,4 @@
-## ADDED Requirements
+## MODIFIED Requirements
 
 ### Requirement: Hub accounts have personal synchronized chat preferences
 The authenticated Hub Settings page SHALL provide a Personal chat preferences section with **Automatically background blocking work when steering**, default ON when the account has no saved value. The setting SHALL apply to the initiating account on that Hub across its devices and workspaces, persist across Hub restart, and never change another account's saved preference. The section SHALL distinguish this scope from machine-wide agent logins and workspace defaults, explain that automatic backgrounding follows accepted steer actions rather than job starts, and disclose that all eligible blocking jobs, including shell commands, can continue without being stopped.

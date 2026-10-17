@@ -23,6 +23,26 @@ import { OpenCodeNotificationLifecycle } from "./opencode/notification-lifecycle
 import type { AgentNotificationEvent } from "./notifications";
 import { notificationPipeline } from "../../tests/notification-pipeline";
 
+test("side answers preserve foreground/history, never share cached personal responses and reject foreign/unsupported sessions", async () => {
+  const provider = new FakeProvider();
+  provider.agent.capabilities.push("side-generation");
+  provider.sessions.push(fixtureSession("local", process.cwd(), 1), fixtureSession("foreign", "/outside-workspace", 2));
+  const calls: string[] = [];
+  provider.generate = async (_id, question) => { calls.push(question); return "Independent answer"; };
+  const adapter = new ChatAdapter({ provider, workspacePath: process.cwd() });
+  const before = await adapter.history("local");
+  expect(await adapter.generate("local", "request", "Why?")).toEqual({ text: "Independent answer" });
+  expect(await adapter.generate("local", "request", "Why?")).toEqual({ text: "Independent answer" });
+  expect(calls).toHaveLength(2);
+  expect(calls[0]).toContain("Do not call any tools and do not take any actions.");
+  expect((await adapter.history("local")).items).toEqual(before.items);
+  expect(provider.prompts).toEqual([]); expect(provider.interrupts).toEqual([]);
+  await expect(adapter.generate("foreign", "request", "Why?")).rejects.toBeInstanceOf(ConversationNotFoundError);
+  provider.agent.capabilities = [];
+  await expect(adapter.generate("local", "other", "Why?")).rejects.toThrow("Side answers are not supported");
+  await expect(adapter.prompt("local", "prompt", "/btw Why?")).rejects.toThrow("separate side-answer action");
+});
+
 class EventQueue implements AsyncIterable<ProviderEvent> {
   private values: ProviderEvent[] = [];
   private waiters: Array<(result: IteratorResult<ProviderEvent>) => void> = [];
@@ -85,6 +105,7 @@ class FakeProvider implements ChatProvider {
   pendingInbox: PendingInboxEntry[] = [];
   cancelledInbox: string[] = [];
   listPendingInbox?: ChatProvider["listPendingInbox"];
+  generate?: ChatProvider["generate"];
   cancelInbox?: ChatProvider["cancelInbox"];
   modelSwitches: Array<{ sessionId: string; selection: ModelSelection }> = [];
   renameSession?: ChatProvider["renameSession"];

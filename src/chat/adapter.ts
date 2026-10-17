@@ -82,6 +82,10 @@ export class UsageUnsupportedError extends Error {
   }
 }
 
+export class SideGenerationUnsupportedError extends Error {
+  constructor(message = "Side answers are not supported by this agent") { super(message); this.name = "SideGenerationUnsupportedError"; }
+}
+
 export class BackgroundTasksUnsupportedError extends Error {
   constructor() {
     super("this agent does not run background tasks");
@@ -570,7 +574,10 @@ export class ChatAdapter {
   }
 
   async commands(): Promise<ChatCommand[]> {
-    const commands = await this.provider.listCommands();
+    const upstream = await this.provider.listCommands();
+    const commands = this.agent().capabilities.includes("side-generation")
+      ? [...upstream.filter(command => command.name !== "btw"), { name: "btw", description: "Ask a side question without changing the conversation", argumentHint: "question", kind: "local-operation" as const }]
+      : upstream.filter(command => command.name !== "btw");
     if (!this.agent().capabilities.includes("reversible-history")) return commands;
     const localNames = new Set(REVERSIBLE_HISTORY_COMMANDS.map(command => command.name));
     return [...commands.filter(command => !localNames.has(command.name)), ...REVERSIBLE_HISTORY_COMMANDS];
@@ -1070,6 +1077,7 @@ export class ChatAdapter {
     operation?: "reload";
     automaticBackground?: AutomaticBackgroundOutcome;
   }> {
+    if (/^\/btw(?:\s|$)/.test(text.trim())) throw new SideGenerationUnsupportedError("Use the separate side-answer action for /btw; it is never sent to conversation history");
     if (!text.trim() && !attachments?.length) throw new Error("prompt must not be empty");
     context = context ? { ...context } : undefined;
     return this.steerActionReceipt(this.actionReceiptKey("prompt", conversationId, requestId, context, operationReceipt), () =>
@@ -2397,6 +2405,20 @@ export class ChatAdapter {
     }));
     if ("unknown" in result) throw new OperationOutcomeUnknownError();
     return result;
+  }
+
+  async generate(conversationId: string, _requestId: string, question: string): Promise<{ text: string }> {
+    await this.requireSession(conversationId);
+    if (!this.provider.generate || !this.agent().capabilities.includes("side-generation")) throw new SideGenerationUnsupportedError();
+    // Independent of admission: do not wait for or interrupt a foreground turn.
+    // Do not cache personal side questions in workspace-shared action receipts.
+    // The initiating page guards concurrent clicks and never replays on reconnect.
+    return { text: await this.provider.generate!(conversationId, [
+      "The user is asking a quick side question about the conversation so far.",
+      "Answer directly and concisely in markdown from what you already know.",
+      "Do not call any tools and do not take any actions.",
+      "", question,
+    ].join("\n")) };
   }
 
   private actionReceiptKey(action: string, conversationId: string, requestId: string, context?: ChatActionContext, operationReceipt?: string): string {

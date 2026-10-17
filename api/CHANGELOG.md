@@ -2,6 +2,19 @@
 
 Entries are ordered newest first. Every entry has Hub and workspace revisions, a compatibility classification, and migration guidance. Use `None` when no migration is required. An entry is headed `Unreleased` until the release that ships it; the release-prep step replaces that with the version tag (`v0.7.0`), so a consumer can tell which revision pair a given uatu version speaks. An additive change that lands after a pair has shipped gets its own entry under the same pair, stamped with its own release, rather than being appended to the shipped entry.
 
+## Hub 11 / Workspace 28 - Unreleased (native side answers)
+
+Compatibility: additive
+
+### Changes
+
+- OpenCode V2 declares `side-generation`. Internal authenticated, origin-checked `POST /api/chat/conversations/:conversationId/aside` accepts only `{requestId, question}` (nonempty, at most 16,384 UTF-8 bytes) and returns only `{text}` with no-store. It uses native `session.generate`, not prompt/interrupt/background, and does not admit conversation history or run an agent tool loop. Missing capability returns 409; foreign conversations return 404. V1/Claude do not offer the command.
+- `/btw` uses the isolated action and page-local answer presentation. A tool-call-only native result can be empty; no Uatu tool executor or automatic retry is introduced. Personal side answers are not cached in shared workspace receipts. The initiating page prevents concurrent duplicate clicks; a fresh explicit request performs fresh inference, without a durable exactly-once claim.
+
+### Migration
+
+None. Same-build web clients use the new endpoint; it remains an excluded internal child route, not a public Hub operation. Existing personal background policy and strict pending-input contracts remain unchanged.
+
 ## Hub 11 / Workspace 27 - Unreleased
 
 Compatibility: breaking (workspace)

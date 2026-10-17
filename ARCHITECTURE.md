@@ -781,7 +781,8 @@ Conversation status is `idle`, `sending`, `running`, `completed`, `interrupted`,
 Send stays a labelled submit button while busy for every agent; only the
 separate Stop button cancels. The steering-capability-gated delivery selector
 shows Steer/Queue and only changes the device preference, never submits the
-draft. Send and desktop Enter use that preference; touch Enter always inserts
+draft. The menu also has a separate immediate Queue draft action. Tapping Send
+steers ordinary busy text independently of the keyboard preference; desktop Enter uses that preference; touch Enter always inserts
 a newline, Ctrl/Command+Enter submits, and Option/Alt+Enter uses the other one.
 Submission controls have at least 44px targets and 8px gaps. Narrow composer
 widths (up to 30rem content width) use a dedicated second action rail when a
@@ -797,7 +798,29 @@ shows a check and the device's submit shortcut; the other shows Alt+Enter. Send'
 identifies busy delivery. Its dedicated fill token keeps white text above 4.5:1
 contrast in both themes. Touch composer and
 dock actions preserve focus through `mousedown`, not cancelled touch
-`pointerdown` (which suppresses activation in WebKit). While a revert is
+`pointerdown` for native clicks (which suppresses activation in WebKit). The
+explicit hold controller instead owns pointer activation: quick release steers,
+250ms–2s release cancels, and a two-second continuous hold queues once. It
+validates draft/configuration/selection/attachment identity and active locks on
+every frame and timer, including fixed target geometry, cancels on visibility/blur/capture/drag/Escape, and consumes
+the later click. The pointer-transparent 84px upward fill does not move the hit
+target. Keyboard/assistive clicks and the immediate Queue menu need no hold.
+Touch keeps Attach and the original configuration picker trigger inline, with
+real mode/model/effort and `contextReadout` occupancy; context breakdown and
+less-used actions remain in header options.
+
+The V2-only `side-generation` capability routes `/btw` through the authenticated,
+closed-body `/aside` action to native `session.generate`, outside the admission
+lane and shared mutation receipts. The pinned 2.0.29 flow previews context and
+makes one model-generation call without executing its advertised tool executor;
+installed plugin hooks still run. No prompt, history write, parent interrupt or
+background call is substituted. Answers and failed questions remain bounded
+page-local state, opened deliberately without completion-time focus theft.
+Concurrent side requests are guarded per conversation; failures preserve newer
+drafts exactly, and reconnect never replays inference. V1/Claude and pending
+attachments are refused rather than falling through to ordinary admission.
+
+While a revert is
 staged, the dock keeps the count-only steer replacement warning visibly above
 its entries, rather than announcing it only to assistive technology. Entering
 that warning state reveals the dock's top once, including when it was already

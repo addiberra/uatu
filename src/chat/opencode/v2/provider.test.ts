@@ -73,10 +73,20 @@ const skillInfo = (id: string, overrides: { name?: string; description?: string 
 const notFound = (sessionID: string) => Response.json({ _tag: "SessionNotFoundError", sessionID, message: `Session not found: ${sessionID}` }, { status: 404 });
 
 describe("OpenCode 2.x provider: identity and catalogs", () => {
+  test("side generation uses the native isolated endpoint, never prompt/interrupt/background", async () => {
+    const server = fakeOpenCode({
+      "POST /api/session/ses/generate": call => {
+        expect(call.body).toEqual({ prompt: "Side question" });
+        return { data: { text: "Side answer" } };
+      },
+    });
+    expect(await server.provider().generate("ses", "Side question")).toBe("Side answer");
+    expect(server.calls.map(call => `${call.method} ${call.path}`)).toEqual(["POST /api/session/ses/generate"]);
+  });
   test("declares the capabilities the 2.x stack backs", () => {
     const { provider } = fakeOpenCode({});
     expect(provider().describe()).toMatchObject({ id: "opencode", name: "OpenCode" });
-    expect(provider().describe().capabilities).toEqual(["modes", "models", "commands", "questions", "permissions", "subagents", "variants", "context", "conversation-rename", "attachments", "reversible-history", "steering", "send-now", "background-tasks", "background-blocking-work"]);
+    expect(provider().describe().capabilities).toEqual(["modes", "models", "commands", "questions", "permissions", "subagents", "variants", "context", "conversation-rename", "attachments", "reversible-history", "steering", "send-now", "background-tasks", "background-blocking-work", "side-generation"]);
     expect(provider().describe().permissionScopeNote).toContain("until OpenCode restarts");
   });
 

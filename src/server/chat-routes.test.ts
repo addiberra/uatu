@@ -35,6 +35,8 @@ class FakeChatService implements WorkspaceChatService {
   rejectAnswers: Error | null = null;
   stoppedTasks: string[] = [];
   backgrounded: string[] = [];
+  generated: string[] = [];
+  async generate(id: string, _requestId: string, question: string) { this.require(id); this.generated.push(question); return { text: "Side answer" }; }
   async backgroundBlockingWork(id: string, _requestId: string): Promise<{ accepted: true }> {
     this.require(id); this.backgrounded.push(id); return { accepted: true };
   }
@@ -958,6 +960,32 @@ describe("workspace chat routes", () => {
     const unknown = await send({ requestId: "ambiguous" });
     expect(unknown.status).toBe(409);
     expect(await unknown.json()).toMatchObject({ code: "operation_outcome_unknown" });
+  });
+
+  test("side answers authenticate and validate a closed bounded request without prompt dispatch", async () => {
+    const service = new FakeChatService();
+    const handler = routes(service)["/api/chat/conversations/:conversationId/aside"] as { POST(request: Request): Promise<Response> };
+    const send = (body: Record<string, unknown>, id = "opencode:local") => handler.POST(request(`/api/chat/conversations/${id}/aside`, { method: "POST", headers: { origin: "http://127.0.0.1:4711", "content-type": "application/json" }, body: JSON.stringify(body) }, { conversationId: id }));
+    const result = await send({ requestId: "q", question: "Why?" });
+    expect(result.status).toBe(200); expect(result.headers.get("cache-control")).toBe("no-store");
+    expect(await result.json()).toEqual({ text: "Side answer" });
+    for (const body of [{ question: "Why?" }, { requestId: "q", question: "" }, { requestId: "q", question: "x".repeat(16385) }, { requestId: "q", question: "Why?", tools: true }]) expect((await send(body)).status).toBe(400);
+    expect((await send({ requestId: "q", question: "Why?" }, "opencode:foreign")).status).toBe(404);
+    expect(service.generated).toEqual(["Why?"]); expect(service.prompts).toBe(0); expect(service.backgrounded).toEqual([]);
+  });
+  test("relocated side answers refuse unauthenticated and foreign-origin access before inference", async () => {
+    const service = new FakeChatService();
+    const handler = routes(service, "/s/project/")["/s/project/api/chat/conversations/:conversationId/aside"] as { POST(request: Request): Promise<Response> };
+    const pathname = "/s/project/api/chat/conversations/opencode:local/aside";
+    const params = { conversationId: "opencode:local" };
+    const init = { method: "POST", headers: { origin: "http://127.0.0.1:4711", "content-type": "application/json" }, body: JSON.stringify({ requestId: "side", question: "Why?" }) };
+    const unauthenticated = new Request(`http://127.0.0.1:4711${pathname}`, init) as Request & { params: typeof params };
+    unauthenticated.params = params;
+    expect((await handler.POST(unauthenticated)).status).toBe(401);
+    expect((await handler.POST(request(pathname, { ...init, headers: { ...init.headers, origin: "https://foreign.invalid" } }, params))).status).toBe(403);
+    expect(service.generated).toEqual([]);
+    expect((await handler.POST(request(pathname, init, params))).status).toBe(200);
+    expect(service.generated).toEqual(["Why?"]);
   });
   test("relocated background mutation refuses missing credentials and foreign origins before dispatch", async () => {
     const service = new FakeChatService();

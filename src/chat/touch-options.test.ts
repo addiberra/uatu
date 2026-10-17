@@ -16,7 +16,7 @@ test("compact touch uses the same options control in the header, not the suppres
     dispose = createTouchChatOptions(() => {});
     expect(document.getElementById("chat-header-options")!.contains(toggle)).toBe(true);
     expect(document.querySelectorAll("#chat-options-toggle")).toHaveLength(1);
-    expect(document.getElementById("chat-options-content")!.contains(document.getElementById("chat-attach"))).toBe(true);
+    expect(document.getElementById("chat-composer")!.contains(document.getElementById("chat-attach"))).toBe(true);
     window.dispatchEvent(new window.Event("pagehide"));
     expect(disconnected).toBe(0);
   } finally {

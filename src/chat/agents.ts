@@ -5,7 +5,7 @@ import type { ChatActionContext, AutomaticBackgroundFeedback } from "./types";
 import { qualifyNotificationEvent } from "./notifications";
 import type { WorkspaceChatService } from "./service";
 import { ConversationNotFoundError } from "./workspace";
-import { BackgroundTasksUnsupportedError } from "./adapter";
+import { BackgroundTasksUnsupportedError, SideGenerationUnsupportedError } from "./adapter";
 import type {
   AgentChatStatus,
   BackgroundTaskOutput,
@@ -127,6 +127,7 @@ export interface MultiAgentWorkspaceChatService {
   respondQuestion(id: string, interactionId: string, requestId: string, outcome: QuestionOutcome): Promise<{ outcome: QuestionOutcome }>;
   stopTask(id: string, taskId: string, requestId: string): Promise<{ stopped: true }>;
   backgroundBlockingWork?(id: string, requestId: string): Promise<{ accepted: true }>;
+  generate?(id: string, requestId: string, question: string): Promise<{ text: string }>;
   release(id: string, requestId: string): Promise<{ released: true }>;
   cancelWakeup(id: string, wakeupId: string, requestId: string): Promise<{ cancelled: true }>;
   taskOutput(id: string, taskId: string, options: { tailBytes: number }): Promise<BackgroundTaskOutput | null>;
@@ -423,6 +424,11 @@ export class MultiAgentChatService implements MultiAgentWorkspaceChatService {
     const { agent, conversationId } = this.resolve(id);
     if (!agent.service.backgroundBlockingWork) throw new BackgroundTasksUnsupportedError();
     return agent.service.backgroundBlockingWork(conversationId, requestId);
+  }
+  async generate(id: string, requestId: string, question: string) {
+    const { agent, conversationId } = this.resolve(id);
+    if (!agent.service.generate) throw new SideGenerationUnsupportedError();
+    return agent.service.generate(conversationId, requestId, question);
   }
 
   async release(id: string, requestId: string) {

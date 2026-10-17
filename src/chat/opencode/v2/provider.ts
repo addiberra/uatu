@@ -131,7 +131,7 @@ export class OpenCodeV2Provider implements ChatProvider {
       // `steering` and `send-now` ride the 2.x session inbox: a steer is an
       // inbox entry OpenCode delivers at the next step boundary and can
       // cancel before then (opencode-v2-steering D2).
-      capabilities: ["modes", "models", "commands", "questions", "permissions", "subagents", "variants", "context", "conversation-rename", "attachments", "reversible-history", "steering", "send-now", "background-tasks", "background-blocking-work"],
+      capabilities: ["modes", "models", "commands", "questions", "permissions", "subagents", "variants", "context", "conversation-rename", "attachments", "reversible-history", "steering", "send-now", "background-tasks", "background-blocking-work", "side-generation"],
       permissionScopeNote: OPENCODE_PERMISSION_SCOPE_NOTE,
     };
   }
@@ -914,6 +914,11 @@ export class OpenCodeV2Provider implements ChatProvider {
   async backgroundBlockingWork(sessionId: string): Promise<void> {
     if (!await this.getSession(sessionId)) throw new BackgroundTaskUnavailableError("Background parent is unavailable");
     await this.backgroundMutation(() => this.client.session.background({ sessionID: sessionId }));
+  }
+
+  async generate(sessionId: string, prompt: string): Promise<string> {
+    const result = await this.client.session.generate({ sessionID: sessionId, prompt });
+    return result.text;
   }
 
   async stopTask(sessionId: string, taskId: string): Promise<void> {

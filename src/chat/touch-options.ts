@@ -12,7 +12,7 @@ export function createTouchChatOptions(openConfiguration: () => void): (() => vo
   if (!toggle || !menu || !content || !backdrop || !configuration || !original) return;
   const toggleHome = document.createComment("composer options control");
   toggle.before(toggleHome);
-  const homes = ["chat-attach", "chat-context-usage", "chat-background-action", "chat-composer-chips"].flatMap(id => {
+  const homes = ["chat-context-usage", "chat-background-action", "chat-composer-chips"].flatMap(id => {
     const node = document.getElementById(id);
     if (!node) return [];
     const home = document.createComment("desktop options control"); node.before(home);

@@ -397,6 +397,8 @@ export interface ChatProvider {
    */
   reconcileBackgroundTasks?(sessionId: string, options?: { fresh?: boolean }): Promise<import("./types").BackgroundTaskItem[]>;
   backgroundBlockingWork?(sessionId: string): Promise<void>;
+  /** Native one-shot context answer, with no admission, tool loop or turn interruption. */
+  generate?(sessionId: string, prompt: string): Promise<string>;
   /**
    * Stop one running background task; the agent reports the stop as that
    * task settling. Optional: only an agent declaring `background-tasks`.

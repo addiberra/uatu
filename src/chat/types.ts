@@ -60,6 +60,7 @@ export type ChatCapability =
   | "background-tasks"
   // Explicitly background every eligible blocker in the parent, including shells.
   | "background-blocking-work"
+  | "side-generation"
   // The agent can schedule future turns for itself (a wakeup, a cron, a
   // loop) and reports them: the session is held while they are pending,
   // each is a timeline row that follows its life, a fired one starts a

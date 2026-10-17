@@ -320,6 +320,13 @@ export class ChatApiClient {
     });
   }
 
+  generate(conversationId: string, requestId: string, question: string): Promise<{ text: string }> {
+    return this.mutate(appUrl(`/api/chat/conversations/${encodeURIComponent(conversationId)}/aside`), { requestId, question }, value => {
+      if (!value || typeof value !== "object" || Object.keys(value).length !== 1 || typeof (value as { text?: unknown }).text !== "string") throw new Error("Invalid side answer");
+      return { text: (value as { text: string }).text };
+    });
+  }
+
   cancelWakeup(conversationId: string, wakeupId: string, requestId: string): Promise<unknown> {
     return this.mutate(appUrl(`/api/chat/conversations/${encodeURIComponent(conversationId)}/wakeups/${encodeURIComponent(wakeupId)}/cancel`), { requestId }, value => value);
   }

@@ -2,6 +2,15 @@ import { expect, test } from "bun:test";
 import { CompactDisclosure, compactWorkers, workerSummary } from "./compact-work";
 import type { ConversationItem } from "./types";
 
+test("canonical worker uses real launcher model and cumulative spend without double-counting aliases", () => {
+  const workers = compactWorkers([
+    { type: "tool", id: "tool:launch", name: "task", status: "completed", input: '{"description":"Task"}', model: "GPT-6.1 Sol", usage: { input: 200, output: 50 }, createdAt: 1 },
+    { type: "background_task", id: "worker", taskId: "native", toolUseId: "launch", status: "running", description: "Worker", createdAt: 1 },
+  ]);
+  expect(workers).toHaveLength(1);
+  expect(workers[0]).toMatchObject({ model: "GPT-6.1 Sol", tokens: 250 });
+});
+
 test("touch disclosure is deliberate, conversation-scoped, and survives settlement and reselection", () => {
   const state = new CompactDisclosure();
   expect(state.paint("a")).toBe(false);

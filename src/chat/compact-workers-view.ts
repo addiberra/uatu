@@ -1,6 +1,7 @@
 import type { CompactWorker } from "./compact-work";
 import { workerIsActive, workerStateLabel } from "./worker-state";
 import { formatTaskElapsed } from "./task-inspection";
+import { formatTokens } from "./usage";
 
 const glyphs = { working: "●", unknown: "◌", completed: "✓", failed: "×", stopped: "■" };
 
@@ -11,17 +12,21 @@ export class CompactWorkersView {
   private readonly label = document.createElement("summary");
   private readonly finished = document.createElement("ul");
   private readonly rows = new Map<string, HTMLLIElement>();
+  private readonly dismiss = document.createElement("button");
   private conversation: string | null = null;
 
-  constructor(private readonly host: HTMLElement) {
+  constructor(private readonly host: HTMLElement, onDismiss?: (restore: boolean) => void) {
     this.active.setAttribute("aria-label", "Active workers");
     this.finished.setAttribute("aria-label", "Finished workers, newest first");
     this.history.className = "chat-workers-history";
     this.history.append(this.label, this.finished);
-    host.replaceChildren(this.active, this.history);
+    this.dismiss.type = "button";
+    this.dismiss.className = "chat-workers-dismiss";
+    this.dismiss.addEventListener("click", () => onDismiss?.(this.dismiss.dataset.restore === "true"));
+    host.replaceChildren(this.active, this.history, this.dismiss);
   }
 
-  paint(conversation: string | null, workers: readonly CompactWorker[], stopping: ReadonlySet<string>, canStop: boolean): void {
+  paint(conversation: string | null, workers: readonly CompactWorker[], stopping: ReadonlySet<string>, canStop: boolean, hiddenCount = 0): void {
     const focused = document.activeElement;
     const focusedRow = focused instanceof Element && this.host.contains(focused) ? focused.closest<HTMLElement>("[data-worker-id]") : null;
     if (conversation !== this.conversation) {
@@ -39,7 +44,7 @@ export class CompactWorkersView {
         const inspect = document.createElement("button");
         inspect.type = "button";
         inspect.className = "chat-worker-inspect";
-        for (const part of ["glyph", "name", "meta"]) {
+        for (const part of ["glyph", "name", "meta", "model", "tokens"]) {
           const span = document.createElement("span");
           span.className = `chat-worker-${part}`;
           if (part === "glyph") span.setAttribute("aria-hidden", "true");
@@ -54,6 +59,7 @@ export class CompactWorkersView {
       inspect.dataset.workerItem = worker.id;
       if (worker.taskId) inspect.dataset.inspectTask = worker.taskId;
       inspect.title = worker.name;
+      inspect.setAttribute("aria-label", [worker.name, workerStateLabel(worker.state), worker.model, worker.tokens === undefined ? undefined : `${worker.tokens.toLocaleString()} cumulative tokens`].filter(Boolean).join(" · "));
       // The handler looks up the current row model, not a stale closure.
       inspect.querySelector(".chat-worker-glyph")!.textContent = glyphs[worker.state];
       inspect.querySelector(".chat-worker-name")!.textContent = worker.name;
@@ -71,6 +77,12 @@ export class CompactWorkersView {
         meta.append(" · ", time);
       }
       if (worker.progress) meta.append(` · ${worker.progress}`);
+      const model = inspect.querySelector<HTMLElement>(".chat-worker-model")!;
+      model.textContent = worker.model ?? "—";
+      model.title = worker.model ?? "Model not reported";
+      const tokens = inspect.querySelector<HTMLElement>(".chat-worker-tokens")!;
+      tokens.textContent = worker.tokens === undefined ? "—" : `Σ ${formatTokens(worker.tokens)}`;
+      tokens.title = worker.tokens === undefined ? "Cumulative usage not reported" : `${worker.tokens.toLocaleString()} cumulative tokens, not context occupancy`;
       inspect.dataset.kind = worker.kind;
       let stop = row.querySelector<HTMLButtonElement>("[data-stop-task]");
       if (worker.taskId && worker.stoppable && workerIsActive(worker.state) && canStop) {
@@ -99,6 +111,9 @@ export class CompactWorkersView {
     }).filter(Boolean);
     this.label.textContent = `Finished ${settled.length} · ${outcomes.join(" · ")} · newest first`;
     this.history.hidden = settled.length === 0;
+    this.dismiss.hidden = !settled.length && !hiddenCount;
+    this.dismiss.dataset.restore = String(hiddenCount > 0);
+    this.dismiss.textContent = hiddenCount ? `Restore finished (${hiddenCount})` : "Dismiss finished";
     if (focusedRow && (!(focused as Element).isConnected || (focused as Element).matches(":disabled") || !this.history.open && this.finished.contains(focusedRow))) {
       const surviving = this.rows.get(focusedRow.dataset.workerId!);
       const target = surviving && this.active.contains(surviving) ? surviving.querySelector<HTMLElement>(".chat-worker-inspect") : this.host.parentElement?.querySelector<HTMLElement>(":scope > summary");
