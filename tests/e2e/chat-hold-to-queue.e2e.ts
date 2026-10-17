@@ -5,7 +5,60 @@ import { openChatPanel } from "./chat-helpers";
 import { captureScreenshot, saveEvidence } from "./evidence";
 
 const test = withEngineBrowsers(base);
-function cases() {
+function cases(engine: "chromium" | "webkit") {
+test("native touch tap steers once and a focused touch-page pointer hold queues", async ({ launchBrowser, baseURL, request }, info) => {
+  const browser = await launchBrowser(engine);
+  const touch = await browser.newPage({ baseURL, viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
+  await touch.addInitScript(() => {
+    const viewport = Object.assign(new EventTarget(), { height: 844, width: 390, offsetTop: 0, offsetLeft: 0, scale: 1 });
+    Object.defineProperty(window, "visualViewport", { configurable: true, value: viewport });
+  });
+  try {
+    await boot(touch, request);
+    await touch.locator("#chat-input").fill("Native quick tap");
+    await touch.locator("#chat-send").tap();
+    await expect(touch.locator('.chat-queued-message[data-delivery="steer"]')).toHaveCount(1);
+    await touch.locator("#chat-input").fill("Touch-page pointer hold");
+    await touch.locator("#chat-input").focus();
+    const target = await press(touch);
+    await expect(touch.locator(".chat-hold-upward")).toBeVisible();
+    expect((await touch.locator(".chat-hold-upward").boundingBox())!.y).toBeLessThanOrEqual(target.y - 80);
+    await expect(touch.locator("#chat-input")).toBeFocused();
+    await captureScreenshot(touch, info, `touch-page-${engine}-pointer-hold`);
+    await expect(touch.locator('.chat-queued-message[data-delivery="queue"]')).toHaveCount(1);
+    await touch.mouse.up();
+    await expect(touch.locator(".chat-queued-message")).toHaveCount(2);
+    const conversationId = await touch.locator("#chat-conversation-select").inputValue();
+    for (let i = 0; i < 12; i++) expect((await request.post("/__e2e/chat", { data: { action: "opencode", op: "launchWorker", conversationId } })).ok()).toBe(true);
+    await expect(touch.locator("#chat-compact-workers [data-worker-id]")).toHaveCount(12);
+    await touch.locator("#chat-compact-workers > summary").tap();
+    await touch.locator("#chat-input").fill("Queue past expanded workers");
+    await touch.locator("#chat-input").focus();
+    await touch.evaluate(() => {
+      Object.assign(window.visualViewport!, { height: 380 });
+      window.visualViewport!.dispatchEvent(new Event("resize"));
+    });
+    await expect(touch.locator("html")).toHaveAttribute("data-chat-keyboard");
+    await press(touch);
+    await expect(touch.locator(".chat-hold-upward")).toBeVisible();
+    await captureScreenshot(touch, info, `touch-page-${engine}-hold-over-expanded-workers`);
+    const feedbackOnTop = await touch.locator(".chat-hold-upward").evaluate(node => {
+      // Temporarily hit-test the paint layer; the real visual stays transparent
+      // to pointers. A bounding box alone cannot detect another layer covering it.
+      const element = node as HTMLElement;
+      const previous = element.style.pointerEvents;
+      element.style.pointerEvents = "auto";
+      const box = element.getBoundingClientRect();
+      const hit = document.elementFromPoint(box.x + box.width / 2, box.y + 18);
+      element.style.pointerEvents = previous;
+      return element.contains(hit);
+    });
+    await expect(touch.locator('.chat-queued-message[data-delivery="queue"]')).toHaveCount(2);
+    await touch.mouse.up();
+    await expect(touch.locator(".chat-queued-message")).toHaveCount(3);
+    expect(feedbackOnTop).toBe(true);
+  } finally { await touch.close(); }
+});
 test("/btw answers natively without foreground admission or interruption", async ({ page, request }) => {
   await boot(page, request);
   const before = await request.post("/__e2e/chat", { data: { action: "opencode", op: "state" } }).then(response => response.json());
@@ -231,7 +284,7 @@ test("touch inline controls retain real labels and minimum targets", async ({ pa
     await page.emulateMedia({ colorScheme: theme, reducedMotion: "reduce" });
     await page.locator("#chat-input").fill("Hold without losing this draft");
     const button = await press(page);
-    await page.waitForTimeout(500); // Capture the intentional quarter-hold.
+    await expect.poll(() => page.locator(".chat-hold-upward").evaluate(node => Number((node as HTMLElement).style.getPropertyValue("--hold-progress")))).toBeGreaterThanOrEqual(0.25);
     await page.evaluate(box => {
       const finger = document.createElement("div"); finger.id = "simulated-finger";
       Object.assign(finger.style, { position: "fixed", pointerEvents: "none", zIndex: "9999", left: `${box.x + box.width / 2 - 29}px`, top: `${box.y + box.height / 2 - 29}px`, width: "58px", height: "58px", borderRadius: "50%", background: "#c6947f80", border: "1px solid #be826a99" });
@@ -269,5 +322,78 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`B composer 
     await use(page);
     await browser.close();
   } });
-  cases();
+  cases(engine);
+});
+
+test("native Chromium touch hold keeps capture across repaints and queues exactly once", async ({ launchBrowser, baseURL, request }, info) => {
+  const browser = await launchBrowser("chromium");
+  const page = await browser.newPage({ baseURL, viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
+  try {
+    await request.post("/__e2e/reset");
+    await request.post("/__e2e/chat", { data: { action: "agents", stack: "opencode-v2", backgroundPreview: true } });
+    const { token } = await request.get("/__e2e/terminal-token").then(response => response.json());
+    await page.goto(`/?t=${encodeURIComponent(token)}`);
+    await page.locator("#touch-tab-chat").tap();
+    await page.getByRole("button", { name: "New conversation", exact: true }).tap();
+    await expect(page.locator("#chat-state")).toContainText("Started new conversation with OpenCode.");
+    await page.locator("#chat-input").fill("Start native touch work");
+    await page.locator("#chat-send").tap();
+    await expect(page.locator("#chat-stop")).toBeEnabled();
+    const conversationId = await page.locator("#chat-conversation-select").inputValue();
+    await page.locator("#chat-input").fill("Native touch queue");
+    await page.locator("#chat-input").focus();
+    await page.evaluate(() => {
+      const events: string[] = [];
+      (window as any).__holdEvents = events;
+      for (const name of ["pointerdown", "pointerup", "pointercancel", "gotpointercapture", "lostpointercapture", "contextmenu", "selectstart"])
+        document.getElementById("chat-send")!.addEventListener(name, event => events.push(`${name}:${event.isTrusted}:${(event as PointerEvent).pointerType ?? ""}`));
+    });
+    const box = (await page.locator("#chat-send").boundingBox())!;
+    const cdp = await page.context().newCDPSession(page);
+    await cdp.send("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: [{ x: box.x + box.width / 2, y: box.y + box.height / 2 }] });
+    await expect(page.locator(".chat-hold-upward")).toBeVisible();
+    await expect.poll(() => page.locator(".chat-hold-upward").evaluate(node => Number((node as HTMLElement).style.getPropertyValue("--hold-progress")))).toBeGreaterThan(0.1);
+    // Real live-channel repaints, not direct calls into the gesture controller.
+    for (let i = 0; i < 3; i++) expect((await request.post("/__e2e/chat", { data: { action: "opencode", op: "appendHistory", conversationId, count: 1 } })).ok()).toBe(true);
+    await expect(page.locator("#chat-items")).toContainText("Historical fixture answer 0");
+    const visual = (await page.locator(".chat-hold-upward").boundingBox())!;
+    expect(visual.y).toBeLessThanOrEqual(box.y - 80);
+    expect(await page.locator("#chat-send").boundingBox()).toEqual(box);
+    // Check every clipping ancestor, not just the nominal bar rectangle.
+    expect(await page.locator(".chat-hold-upward").evaluate(node => {
+      const bar = node.getBoundingClientRect();
+      for (let parent = node.parentElement; parent; parent = parent.parentElement) {
+        if (/hidden|clip|auto|scroll/.test(getComputedStyle(parent).overflowY)) {
+          const rect = parent.getBoundingClientRect();
+          if (bar.top < rect.top || bar.bottom > rect.bottom) return false;
+        }
+      }
+      return true;
+    })).toBe(true);
+    await captureScreenshot(page, info, "native-touch-held-live-repaint");
+    await expect(page.locator('.chat-queued-message[data-delivery="queue"]')).toHaveCount(1);
+    await cdp.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+    await expect(page.locator(".chat-queued-message")).toHaveCount(1);
+    await expect(page.locator("#chat-input")).toHaveValue("");
+    const events = await page.evaluate(() => (window as any).__holdEvents as string[]);
+    expect(events).toContain("pointerdown:true:touch");
+    expect(events).not.toContain("pointercancel:true:touch");
+    await page.clock.install();
+    for (const cancellation of ["early release", "native cancel", "drag away"] as const) {
+      await page.locator("#chat-input").fill(`Keep native draft: ${cancellation}`);
+      const current = (await page.locator("#chat-send").boundingBox())!;
+      await cdp.send("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: [{ x: current.x + current.width / 2, y: current.y + current.height / 2 }] });
+      await page.clock.runFor(350);
+      if (cancellation === "drag away") await cdp.send("Input.dispatchTouchEvent", { type: "touchMove", touchPoints: [{ x: current.x - 20, y: current.y }] });
+      await cdp.send("Input.dispatchTouchEvent", { type: cancellation === "native cancel" ? "touchCancel" : "touchEnd", touchPoints: [] });
+      await page.clock.runFor(2100);
+      await expect(page.locator(".chat-queued-message")).toHaveCount(1);
+      await expect(page.locator("#chat-input")).toHaveValue(`Keep native draft: ${cancellation}`);
+      await expect(page.locator(".chat-hold-upward")).toBeHidden();
+    }
+    const allEvents = await page.evaluate(() => (window as any).__holdEvents as string[]);
+    expect(allEvents).toContain("pointercancel:true:touch");
+    expect(allEvents.some(event => event.startsWith("selectstart:"))).toBe(false);
+    await saveEvidence(info, "native-touch-events.json", JSON.stringify(allEvents));
+  } finally { await page.close(); }
 });

@@ -17,6 +17,78 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`canonical w
     await use(page); await browser.close();
   } });
 
+  test("one finished plus twenty hidden stays compact, including after dismissal", async ({ page, request }, info) => {
+    await request.post("/__e2e/reset");
+    await request.post("/__e2e/chat", { data: { action: "agents", count: 2 } });
+    const snapshot = await request.post("/__e2e/chat", { data: { action: "seed", agent: "claude", title: "Compact finished overview", items: Array.from({ length: 20 }, (_, i) => ({
+      id: `old-${i}`, type: "background_task", taskId: `old-${i}`, description: `Earlier task ${i}`, status: "completed", createdAt: i + 1,
+    })) } }).then(response => response.json());
+    const { token } = await request.get("/__e2e/terminal-token").then(response => response.json());
+    await page.goto(`/?t=${encodeURIComponent(token)}`);
+    await page.locator("#touch-tab-chat").tap();
+    const track = page.locator("#chat-compact-workers");
+    const summary = track.locator(":scope > summary");
+    const dismiss = track.getByRole("button", { name: "Dismiss finished", exact: true });
+    await dismiss.tap();
+    await expect(track).not.toHaveAttribute("open");
+    expect((await request.post("/__e2e/chat", { data: { action: "item", conversationId: snapshot.conversation.id, item: {
+      id: "new-finished", type: "background_task", taskId: "new-finished", toolUseId: "new-launch", description: "Research browser backup restore", status: "completed", createdAt: Date.now(), usage: { totalTokens: 230000, toolUses: 4, durationMs: 1000 },
+    } } })).ok()).toBe(true);
+    expect((await request.post("/__e2e/chat", { data: { action: "item", conversationId: snapshot.conversation.id, item: {
+      id: "tool:new-launch", type: "tool", name: "task", status: "completed", createdAt: Date.now(), model: "gpt-6-astra", input: '{"description":"Research browser backup restore"}',
+    } } })).ok()).toBe(true);
+    await expect(page.locator("#chat-compact-workers-label")).toHaveText("1 finished · 20 hidden");
+    await summary.tap();
+    await expect(track.locator(".chat-worker-model")).toHaveText("gpt-6-astra");
+    await expect(track.locator(".chat-worker-tokens")).toHaveText("Σ 230k");
+    for (const theme of ["light", "dark"] as const) for (const width of [390, 320]) {
+      await page.emulateMedia({ colorScheme: theme });
+      await page.setViewportSize({ width, height: 844 });
+      await page.evaluate(width => {
+        Object.assign(window.visualViewport!, { height: 844, width });
+        window.visualViewport!.dispatchEvent(new Event("resize"));
+      }, width);
+      await expect(track.locator("[data-worker-id]")).toHaveCount(1);
+      expect((await track.boundingBox())!.height).toBeLessThanOrEqual(60);
+      const header = (await summary.boundingBox())!;
+      const action = (await dismiss.boundingBox())!;
+      expect(action.y).toBe(header.y);
+      expect(action.x).toBeGreaterThan(header.x + header.width / 2);
+      expect((await track.locator(".chat-worker-row").boundingBox())!.height).toBeLessThanOrEqual(28);
+      expect(await summary.evaluate(node => getComputedStyle(node, "::before").content)).toBe('""');
+      await captureScreenshot(page, info, `workers-${engine}-${theme}-${width}-one-finished-20-hidden`);
+    }
+    for (const scene of [
+      { width: 390, height: 844, visual: 450 }, { width: 390, height: 844, visual: 380 },
+      { width: 844, height: 390, visual: 230 },
+    ]) {
+      await page.setViewportSize({ width: scene.width, height: scene.height });
+      await page.locator("#chat-input").fill("Preserve compact-card draft");
+      await page.locator("#chat-input").focus();
+      await page.evaluate(scene => {
+        Object.assign(window.visualViewport!, { height: scene.visual, width: scene.width });
+        window.visualViewport!.dispatchEvent(new Event("resize"));
+      }, scene);
+      await expect(page.locator("html")).toHaveAttribute(scene.width < 600 ? "data-chat-keyboard" : "data-chat-wide-short");
+      expect((await track.boundingBox())!.height).toBeLessThanOrEqual(60);
+      expect((await page.locator("#chat-work-dock").boundingBox())!.height).toBeLessThanOrEqual(62);
+      await expect(page.locator("#chat-input")).toBeFocused();
+      await captureScreenshot(page, info, `workers-${engine}-one-finished-${scene.width}-vv${scene.visual}`);
+    }
+    await dismiss.tap();
+    await expect(page.locator("#chat-compact-workers-label")).toHaveText("21 hidden");
+    await expect(track.locator("[data-worker-id]")).toHaveCount(0);
+    expect((await track.boundingBox())!.height).toBeLessThanOrEqual(30);
+    expect((await page.locator("#chat-work-dock").boundingBox())!.height).toBeLessThanOrEqual(32);
+    await expect(track).toHaveAttribute("open"); // Dismiss never toggles the parent.
+    expect(await summary.evaluate(node => {
+      const rect = node.getBoundingClientRect();
+      return node.contains(document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2));
+    })).toBe(true);
+    await captureScreenshot(page, info, `workers-${engine}-all-dismissed-vv230`);
+    await expect(page.locator('#chat-items [data-chat-item-id="new-finished"]')).toHaveCount(1);
+  });
+
   test("finished-only dismissal keeps a named hidden count and an empty conversation has a nonblank fallback", async ({ page, request }) => {
     await request.post("/__e2e/reset");
     await request.post("/__e2e/chat", { data: { action: "agents", count: 2 } });
@@ -35,11 +107,11 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`canonical w
     await summary.tap();
     await track.getByRole("button", { name: "Dismiss finished", exact: true }).tap();
     await expect(summary).toHaveText("2 hidden");
-    await expect(summary).toHaveAttribute("aria-label", "Workers: 2 hidden");
+    await expect(track.locator(":scope > summary")).toHaveAttribute("aria-label", "Workers: 2 hidden");
     await page.locator("#chat-conversation-select").selectOption(empty.conversation.id);
     await expect(track).toBeHidden();
     await expect(summary).toHaveText("No workers");
-    await expect(summary).toHaveAttribute("aria-label", "Workers: No workers");
+    await expect(track.locator(":scope > summary")).toHaveAttribute("aria-label", "Workers: No workers");
     await page.locator("#chat-conversation-select").selectOption(finished.conversation.id);
     await expect(summary).toHaveText("2 hidden");
   });
@@ -76,44 +148,44 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`canonical w
     await page.locator("#touch-tab-chat").tap();
     const track = page.locator("#chat-compact-workers");
     const summary = track.locator(":scope > summary");
+    const label = track.locator("#chat-compact-workers-label");
     const rows = track.locator("[data-worker-id]");
-    await expect(summary).toHaveText("2 working · 18 finished");
-    expect((await summary.boundingBox())!.height).toBeGreaterThanOrEqual(44);
+    await expect(label).toHaveText("2 working · 18 finished");
+    expect((await summary.boundingBox())!.height).toBeLessThanOrEqual(40);
     await expect(rows).toHaveCount(20);
     await expect(track).not.toHaveAttribute("open");
     await captureScreenshot(page, info, `workers-${engine}-${theme}-closed`);
     await summary.tap();
-    await expect(track.locator(".chat-workers-history")).not.toHaveAttribute("open");
+    await expect(track.locator("details")).toHaveCount(0);
+    await expect(track.locator("ul")).toHaveCount(1);
     await expect(track.locator('[data-state="working"]')).toHaveCount(2);
     for (const row of await track.locator('[data-state="working"]').all()) {
       const inspect = (await row.locator(".chat-worker-inspect").boundingBox())!;
       const stop = (await row.locator("[data-stop-task]").boundingBox())!;
-      expect(inspect.height).toBeGreaterThanOrEqual(44); // Mutation-bearing rows retain full safe targets.
+      expect(inspect.height).toBeLessThanOrEqual(28); // Only Stop needs the separate full target.
       expect(stop.height).toBeGreaterThanOrEqual(44);
       expect(stop.x - inspect.x - inspect.width).toBeGreaterThanOrEqual(8);
     }
     await expect(track).not.toContainText("node --check");
     expect(await track.locator(".chat-worker-name").evaluateAll(nodes => [...new Set(nodes.map(node => getComputedStyle(node).fontSize))])).toEqual(["14px"]);
     expect(await track.locator(".chat-worker-meta").evaluateAll(nodes => [...new Set(nodes.map(node => getComputedStyle(node).fontSize))])).toEqual(["13px"]);
-    expect(await page.locator("#chat-timeline").evaluate(node => node.clientHeight)).toBeGreaterThanOrEqual(844 * 0.4);
+    await expect.poll(() => page.locator("#chat-timeline").evaluate(node => node.clientHeight)).toBeGreaterThanOrEqual(844 * 0.4);
     await captureScreenshot(page, info, `workers-${engine}-${theme}-active-first`);
-    await track.locator(".chat-workers-history > summary").tap();
-    for (const row of await track.locator('.chat-workers-history [data-worker-id]').all()) {
-      expect((await row.locator(".chat-worker-inspect").boundingBox())!.height).toBeGreaterThanOrEqual(29);
-      expect((await row.locator(".chat-worker-inspect").boundingBox())!.height).toBeLessThan(44);
+    for (const row of await track.locator('[data-state="completed"], [data-state="failed"], [data-state="stopped"]').all()) {
+      expect((await row.boundingBox())!.height).toBeLessThanOrEqual(28);
     }
-    expect(await track.locator(".chat-workers-history [data-worker-id]").evaluateAll(nodes => nodes.map(node => (node as HTMLElement).dataset.workerId))).toEqual(Array.from({ length: 18 }, (_, i) => `job:${17 - i}`));
+    expect(await rows.evaluateAll(nodes => nodes.map(node => (node as HTMLElement).dataset.workerId))).toEqual(["job:18", "job:19", ...Array.from({ length: 18 }, (_, i) => `job:${17 - i}`)]);
     const scrollContainers = await page.locator("#chat-work-dock").evaluate(node => [node, ...node.querySelectorAll("*")].filter(element => element.getBoundingClientRect().height > 0 && /auto|scroll/.test(getComputedStyle(element).overflowY)).map(element => element.id || element.className));
     expect(scrollContainers).toEqual(["chat-work-dock"]);
     await captureScreenshot(page, info, `workers-${engine}-${theme}-history`);
     await expect(track.locator('[data-worker-id="job:18"] .chat-worker-model')).toHaveText("GPT-6.1 Sol");
     await expect(track.locator('[data-worker-id="job:18"] .chat-worker-tokens')).toHaveText("Σ 229k");
     await track.getByRole("button", { name: "Dismiss finished", exact: true }).tap();
-    await expect(summary).toHaveText("2 working · 18 hidden");
+    await expect(label).toHaveText("2 working · 18 hidden");
     await expect(rows).toHaveCount(2);
     await page.reload();
     await page.locator("#touch-tab-chat").tap();
-    await expect(summary).toHaveText("2 working · 18 hidden");
+    await expect(label).toHaveText("2 working · 18 hidden");
     await expect(rows).toHaveCount(2);
     if (await track.getAttribute("open") === null) await summary.tap();
     await expect(track.getByRole("button", { name: /Restore finished/ })).toHaveCount(0);
@@ -168,14 +240,13 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`canonical w
     await request.post("/__e2e/chat", { data: { action: "item", conversationId: snapshot.conversation.id, item: { ...items.find(item => item.id === "job:18"), stateUncertain: true } } });
     await summary.tap();
     await expect(track.locator('[data-state="unknown"] [data-stop-task]')).toBeDisabled();
-    await expect(summary).toHaveText("1 working · 1 unknown · 18 hidden");
+    await expect(label).toHaveText("1 working · 1 unknown · 18 hidden");
     await page.setViewportSize({ width: 390, height: 844 });
     await page.locator("#chat-input").blur();
     await page.evaluate(() => {
       Object.assign(window.visualViewport!, { height: 844, width: 390 });
       window.visualViewport!.dispatchEvent(new Event("resize"));
     });
-    if (await track.locator(".chat-workers-history").getAttribute("open") !== null) await track.locator(".chat-workers-history > summary").tap();
     await captureScreenshot(page, info, `workers-${engine}-${theme}-unknown`);
     // The same twenty-job snapshot on a fine-pointer desktop preserves the
     // established tracks and keeps primary controls in short windows.

@@ -1038,7 +1038,10 @@ export function initChat(api = new ChatApiClient()): void {
   const compactWorkersItems = document.querySelector<HTMLElement>("#chat-compact-workers-items");
   const compactWorkerState = new CompactDisclosure();
   const compactPendingState = new CompactDisclosure();
-  compactWorkersList?.addEventListener("toggle", () => compactWorkerState.toggled(compactWorkersList.open));
+  compactWorkersList?.addEventListener("toggle", () => {
+    compactWorkerState.toggled(compactWorkersList.open);
+    compactWorkersList.querySelector("summary")?.setAttribute("aria-expanded", String(compactWorkersList.open));
+  });
   const compactView = compactWorkersItems ? new CompactWorkersView(compactWorkersItems, () => {
     if (!projection) return;
     const dismissed = new Set(presentation.dismissedSubagents[projection.conversationId] ?? []);
@@ -1059,9 +1062,10 @@ export function initChat(api = new ChatApiClient()): void {
     const hiddenCount = allWorkers.length - workers.length;
     const summary = workerSummary(workers, hiddenCount);
     compactWorkersLabel.textContent = summary;
-    compactWorkersLabel.setAttribute("aria-label", `Workers: ${summary}`);
+    compactWorkersList.querySelector("summary")?.setAttribute("aria-label", `Workers: ${summary}`);
     compactWorkersList.hidden = allWorkers.length === 0;
     compactWorkersList.open = compactWorkerState.paint(projection?.conversationId ?? null);
+    compactWorkersList.querySelector("summary")?.setAttribute("aria-expanded", String(compactWorkersList.open));
     compactView?.paint(projection?.conversationId ?? null, workers, stoppingTasks, declares("background-tasks"));
   };
   compactWorkersItems?.addEventListener("mousedown", event => keepTouchComposerFocus(event));
@@ -5332,7 +5336,9 @@ export function initChat(api = new ChatApiClient()): void {
       // Text enlargement can make fixed chrome taller than its percentage
       // budget. Secondary work yields before the primary composer does.
       const header = surface.querySelector<HTMLElement>(".chat-header");
-      const available = `${Math.max(0, surface.clientHeight - form.getBoundingClientRect().height - (header?.getBoundingClientRect().height ?? 0) - 48)}px`;
+      const visualHeight = window.visualViewport?.height ?? window.innerHeight;
+      const readingBudget = visualHeight * (surface.clientWidth >= 768 ? 0.35 : 0.4);
+      const available = `${Math.max(0, surface.clientHeight - form.getBoundingClientRect().height - (header?.getBoundingClientRect().height ?? 0) - Math.max(48, readingBudget))}px`;
       if (workDock.style.getPropertyValue("--chat-work-available") !== available) workDock.style.setProperty("--chat-work-available", available);
       workDock.style.setProperty("--chat-workers-bottom", `${form.getBoundingClientRect().height}px`);
       const headerBottom = (header?.getBoundingClientRect().bottom ?? surface.getBoundingClientRect().top) - surface.getBoundingClientRect().top;

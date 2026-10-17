@@ -7,36 +7,31 @@ const glyphs = { working: "●", unknown: "◌", completed: "✓", failed: "×",
 
 /** One keyed row per projected occurrence. Streaming paints retain tap targets. */
 export class CompactWorkersView {
-  private readonly active = document.createElement("ul");
-  private readonly history = document.createElement("details");
-  private readonly label = document.createElement("summary");
-  private readonly finished = document.createElement("ul");
+  private readonly list = document.createElement("ul");
   private readonly rows = new Map<string, HTMLLIElement>();
   private readonly dismiss = document.createElement("button");
-  private conversation: string | null = null;
 
   constructor(private readonly host: HTMLElement, onDismiss?: () => void) {
-    this.active.setAttribute("aria-label", "Active workers");
-    this.finished.setAttribute("aria-label", "Finished workers, newest first");
-    this.history.className = "chat-workers-history";
-    this.history.append(this.label, this.finished);
+    this.list.setAttribute("aria-label", "Workers, active first");
     this.dismiss.type = "button";
     this.dismiss.className = "chat-workers-dismiss";
     this.dismiss.textContent = "Dismiss finished";
-    this.dismiss.addEventListener("click", () => onDismiss?.());
-    host.replaceChildren(this.active, this.history, this.dismiss);
+    this.dismiss.addEventListener("click", event => {
+      event.preventDefault(); // The header action must not toggle its disclosure.
+      event.stopPropagation();
+      onDismiss?.();
+    });
+    host.replaceChildren(this.list);
+    host.parentElement?.querySelector(":scope > summary")?.append(this.dismiss);
   }
 
   paint(conversation: string | null, workers: readonly CompactWorker[], stopping: ReadonlySet<string>, canStop: boolean): void {
     const focused = document.activeElement;
     const focusedRow = focused instanceof Element && this.host.contains(focused) ? focused.closest<HTMLElement>("[data-worker-id]") : null;
-    if (conversation !== this.conversation) {
-      this.history.open = false;
-      this.conversation = conversation;
-    }
     const ids = new Set(workers.map(worker => worker.id));
     for (const [id, row] of this.rows) if (!ids.has(id)) { row.remove(); this.rows.delete(id); }
-    for (const worker of workers) {
+    const ordered = [...workers.filter(worker => workerIsActive(worker.state)), ...workers.filter(worker => !workerIsActive(worker.state))];
+    for (const [index, worker] of ordered.entries()) {
       let row = this.rows.get(worker.id);
       if (!row) {
         row = document.createElement("li");
@@ -100,22 +95,15 @@ export class CompactWorkersView {
         stop.setAttribute("aria-label", `Stop worker: ${worker.name}`);
         stop.title = worker.state === "unknown" ? "Status unknown — refresh before stopping" : `Stop worker: ${worker.name}`;
       } else stop?.remove();
-      const list = workerIsActive(worker.state) ? this.active : this.finished;
       // Append only where order actually changed; do not detach a focused row.
-      const index = workers.filter(candidate => workerIsActive(candidate.state) === workerIsActive(worker.state)).findIndex(candidate => candidate.id === worker.id);
-      if (list.children[index] !== row) list.insertBefore(row, list.children[index] ?? null);
+      if (this.list.children[index] !== row) this.list.insertBefore(row, this.list.children[index] ?? null);
     }
     const settled = workers.filter(worker => !workerIsActive(worker.state));
-    const outcomes = ["completed", "failed", "stopped"].map(state => {
-      const count = settled.filter(worker => worker.state === state).length;
-      return count ? `${count} ${workerStateLabel(state)}` : "";
-    }).filter(Boolean);
-    this.label.textContent = `Finished ${settled.length} · ${outcomes.join(" · ")} · newest first`;
-    this.history.hidden = settled.length === 0;
     this.dismiss.hidden = !settled.length;
-    if (focusedRow && (!(focused as Element).isConnected || (focused as Element).matches(":disabled") || !this.history.open && this.finished.contains(focusedRow))) {
+    if (focused === this.dismiss && this.dismiss.hidden) this.host.parentElement?.querySelector<HTMLElement>(":scope > summary")?.focus({ preventScroll: true });
+    if (focusedRow && (!(focused as Element).isConnected || (focused as Element).matches(":disabled"))) {
       const surviving = this.rows.get(focusedRow.dataset.workerId!);
-      const target = surviving && this.active.contains(surviving) ? surviving.querySelector<HTMLElement>(".chat-worker-inspect") : this.host.parentElement?.querySelector<HTMLElement>(":scope > summary");
+      const target = surviving ? surviving.querySelector<HTMLElement>(".chat-worker-inspect") : this.host.parentElement?.querySelector<HTMLElement>(":scope > summary");
       target?.focus({ preventScroll: true });
     }
   }

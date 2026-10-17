@@ -1,3 +1,64 @@
+## Current explicit refinement: unified dense worker overview
+
+- [x] Replace nested Finished/history/footer with one compact chevron header, right-aligned Dismiss finished and one keyed active-first list; retain canonical counts, model/Σ usage, persisted hiding and timeline inspection.
+- [x] Verify 28px settled rows, independent 44px Stop controls, one scroller and content-sized short/empty cards across phone/keyboard/landscape/short-desktop matrices, with screenshot comparison.
+- [x] Investigate the reported hold animation on the real scripted provider stack: distinguish reproduced failures from passing supported cases, verify native Chromium touch plus Chromium/WebKit pointer/keyboard cancellation and exactly-once Queue, and report native WebKit long-touch tooling limits.
+- [x] Run full unit CI, typecheck/build, API contracts and strict OpenSpec validation plus affected browser regressions; report remaining failures without weakening tests.
+
+Evidence for this refinement is retained in approved scratch
+`opencode/compact-ui-6c2fa84/`. The flat-list unit regression failed before the
+fix (`workers-red.log`); the oversized card came from native summary padding,
+nested Finished details and a footer Dismiss action. Flattening the list also
+exposed the old dock budget's 48px reading reserve: it did not guarantee the
+required 40% phone transcript band. The measured budget now reserves that band
+(35% on tablet) without changing desktop layout.
+
+Hold was not removed or reproduced as broken: the unchanged HEAD baseline passed
+44 Chromium/WebKit cases (`hold-baseline.log`). The 17-case focused refinement
+run passed (`final-targeted.log`), including native Chromium trusted touch
+down/up/cancel/capture, early release/drag-away, live provider repaints and
+exactly-once Queue; native event evidence and visually reviewed phone/keyboard/
+landscape screenshots are in `screenshots-final/`. WebKit native taps and real
+pointer holds pass, but Playwright's WebKit public API does not expose native
+long-touch down/up: that on-device behavior remains unverified. Existing
+capability gates exclude OpenCode V1/Claude and bypass /btw/local history actions;
+no hold-delivery implementation or provider/API contract was changed.
+
+Clean-environment unit CI passes: **5,276 pass / 17 skip / 0 fail**
+(`unit-ci-clean-alone.log`), with system Git/SSH rather than inherited Hub
+credential wrappers. The inherited-environment run had four credential-test
+failures; the first clean run, concurrent with browsers, had one unrelated
+tracked-but-ignored filesystem-watcher timeout. That unchanged file passes all
+23 checks in isolation, and full clean CI passes without concurrent browsers;
+the timeout's cause is not established. No watcher assertion or timeout changed.
+Typecheck/build and the disposable compiled Hub/child smoke pass; API contracts
+pass 208/208 and schema validation passes (one existing lint warning). Strict
+change validation and all 56 main specs pass. The first 348-case browser run
+passed 342 and failed six obsolete inspection-height expectations; those were
+updated to the explicit density requirement, retaining 44px Stop and 8px gaps.
+
+Final frozen-product evidence: `unit-ci-acceptance.log` again passes **5,276 /
+17 skip / 0 fail**. `browser-verified.log` passes **359/360**, including all
+47 hold and eight worker-overview cases and the phone/keyboard/landscape/short-
+desktop and Hub-switcher checks. The remaining failure is WebKit staying on
+`/login` during the unchanged Hub sign-in fixture, before reaching Settings or
+the changed chat UI. The unchanged preferences file then passes **12/12** in
+three traced isolated repeats (`hub-preferences-diagnostic.log`); its login
+failure cause remains unestablished. This is not a blanket clean-browser claim.
+The full report is retained at `browser-report/` and the failure context at
+`hub-login-failure/`. The known performance-project baseline was not rerun or
+modified. Independent lead review remains required before publication.
+
+The final native-touch fixture waits for the completed-creation announcement
+before filling its initial draft: an earlier run typed before asynchronous
+conversation selection completed and stalled on an empty, disabled Send, before
+any hold. No timeout was increased. A separate intermediate run mixed an earlier
+count-span label assertion with the later accessible-summary markup; all final
+worker checks use the native summary's label/expanded state. Final native taps
+and pointer holds also verify that feedback paints above an expanded 12-worker
+keyboard sheet and still queues once, not just that its rectangle exists.
+`typecheck-final.log`, `build-final.log` and `compiled-smoke-final.log` pass.
+
 ## 1. Preserve the integration baseline
 
 - [x] 1.1 Before implementation, record HEAD/status and hashes of pre-existing dirty files in task-owned approved scratch, compare with the planning baseline and identify any intervening work; verify changes are confined to this feature and preserve completed steering/background audit tests and artifacts.

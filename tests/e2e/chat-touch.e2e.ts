@@ -15,7 +15,7 @@ async function control(request: APIRequestContext, body: Record<string, unknown>
 
 async function inspectTouchWorker(page: Page, name: string): Promise<void> {
   const inspect = page.locator("#chat-compact-workers").getByTitle(name, { exact: true });
-  if (!await inspect.isVisible()) await page.locator(".chat-workers-history > summary").click();
+  if (!await inspect.isVisible()) await page.locator("#chat-compact-workers > summary").click();
   await inspect.click();
 }
 
@@ -145,7 +145,6 @@ async function bootWithPinnedTracks(page: Page, request: APIRequestContext, hist
   await expect(page.locator("#chat-task-list")).toBeVisible();
   await page.locator("#chat-compact-workers > summary").click();
   await expect(page.locator("#chat-compact-workers")).toBeVisible();
-  await page.locator(".chat-workers-history > summary").click();
   // Expanded, so "hidden" in these cases is about the keyboard rule rather
   // than about a closed <details>. Set rather than tapped: a tap lands on a
   // track row, and the point here is the geometry, not the summary's hit area.

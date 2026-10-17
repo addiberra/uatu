@@ -200,8 +200,8 @@ the button tooltip explain its all-eligible scope. Feedback disappears after
 the parent and workers settle. Continue and its explanation remain in the work
 dock; account usage stays beneath the inline actions when reported. The model
 pill opens the single picker directly. The worker summary remains reachable
-with hardware or software keyboards and in short landscape. Its header keeps
-a 44px touch target; deliberate expansion uses a sheet over the transcript
+with hardware or software keyboards and in short landscape. Its compact header
+uses a small chevron; deliberate expansion uses a content-sized sheet over the transcript
 when space is constrained, without discarding the draft or forcing keyboard
 blur. Pending counts, paused-batch Send and replacement warnings
 remain available while typing.
@@ -210,15 +210,16 @@ Pending counts distinguish steers from queued input; worker counts distinguish
 confirmed working, finished (including failed/stopped), and unknown occurrences.
 Counts and rows use the same deduplicated executions: actual background shell
 tasks count, ordinary foreground commands do not. Zero-count categories are
-omitted; a hidden-only summary names the hidden count. Expansion shows active work
-first, then a separately collapsed **Finished** history ordered newest first
-from available execution timestamps. Rows open inspection or retained results;
+omitted; a hidden-only summary names the hidden count. Expansion shows one flat
+list: active work first, then finished work ordered newest first from available
+execution timestamps, without a second disclosure. Rows open inspection or retained results;
 launch references and their costs remain in the transcript/timeline. Names use
 14px type and compact model/Σ cumulative-token columns (11px at default scale), with distinct working,
 unknown, finished, failed and stopped glyphs. **Stop worker** is a separate
-44px target with an 8px gap; unknown execution state disables it. Inspection-only
-rows use the explicitly approved 29px density tradeoff; rows with Stop grow to
-fit that target. **Dismiss finished** hides only this device's per-conversation
+44px target with an 8px gap; unknown execution state disables it. Inspection
+targets and settled rows use the explicitly approved 28px density tradeoff;
+only a row containing Stop grows to fit that separate action. **Dismiss finished**
+stays on the right of the same compact header, not in a footer, and hides only this device's per-conversation
 view using the existing persisted dismissal state, never provider history.
 There is no Restore finished control. Results and their inspection remain in
 the timeline; summaries count visible rows and name the hidden count separately.

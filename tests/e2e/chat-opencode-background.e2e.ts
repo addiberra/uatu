@@ -612,7 +612,9 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`worker cont
     const b = (await stop.boundingBox())!;
     const c = (await nextStop.boundingBox())!;
     expect(c.y - (b.y + b.height)).toBeGreaterThanOrEqual(8);
-    for (const box of [a, b]) { expect(box.width).toBeGreaterThanOrEqual(44); expect(box.height).toBeGreaterThanOrEqual(44); }
+    for (const box of [a, b]) expect(box.width).toBeGreaterThanOrEqual(44);
+    expect(a.height).toBeLessThanOrEqual(28); // Explicitly approved dense inspection.
+    expect(b.height).toBeGreaterThanOrEqual(44); // Worker mutation remains independently safe.
     expect(b.x - (a.x + a.width)).toBeGreaterThanOrEqual(8);
     await expect(page.locator("#chat-compact-workers")).toHaveAttribute("open");
     await captureScreenshot(page, testInfo, `audit-background-${engine}-touch-${theme}-running`);

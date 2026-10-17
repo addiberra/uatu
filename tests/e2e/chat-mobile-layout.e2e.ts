@@ -365,7 +365,7 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`mobile layo
       expect(dock.y).toBeGreaterThanOrEqual(0);
       expect(dock.y + dock.height).toBeLessThanOrEqual(composer.y + 1);
       const workerHeader = (await page.locator("#chat-compact-workers > summary").boundingBox())!;
-      expect(workerHeader.height).toBeGreaterThanOrEqual(44);
+      expect(workerHeader.height).toBeGreaterThanOrEqual(28);
       expect(workerHeader.y).toBeGreaterThanOrEqual(scene.width === 390 ? 47 : scene.width === 844 ? 0 : 24);
     } else expect(metrics.dock).toBeLessThanOrEqual(scene.visual * cap + 1);
     await saveEvidence(testInfo, `mobile-${engine}-${scene.width}-${scene.visual}.json`, JSON.stringify(metrics, null, 2));
@@ -710,11 +710,11 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`mobile layo
     expect(await page.locator("#chat-conversation-select").evaluate(element => parseFloat(getComputedStyle(element).fontSize))).toBeGreaterThanOrEqual(16);
     await page.locator("#chat-compact-workers > summary").tap();
     const open = page.locator(".chat-worker-row:has(.chat-task-stop) .chat-worker-inspect").first();
-    // Only inspection-only rows use the approved 29px density exception.
-    expect((await open.boundingBox())!.height).toBeGreaterThanOrEqual(44);
+    // Inspection stays dense even beside a separate full-height Stop target.
+    expect((await open.boundingBox())!.height).toBeLessThanOrEqual(28);
     const dense = page.locator(".chat-worker-row:not(:has(.chat-task-stop)) .chat-worker-inspect").first();
-    expect((await dense.boundingBox())!.height).toBeGreaterThanOrEqual(29);
-    expect((await dense.boundingBox())!.height).toBeLessThan(44);
+    expect((await dense.boundingBox())!.height).toBeGreaterThanOrEqual(26);
+    expect((await dense.boundingBox())!.height).toBeLessThanOrEqual(28);
     expect((await page.locator(".chat-worker-row .chat-task-stop").first().boundingBox())!.height).toBeGreaterThanOrEqual(44);
   });
 
