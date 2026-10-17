@@ -159,7 +159,7 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`mobile layo
     const id = await loaded(page, request);
     const pending = page.locator("[data-pending-toggle]");
     const workers = page.locator("#chat-compact-workers");
-    await expect(pending).toHaveText("3 pending · 2 steers · 1 queued");
+    await expect(pending).toHaveText("2 steers · 1 queued");
     await expect(pending).toHaveAttribute("aria-expanded", "false");
     await expect(page.locator("#chat-queue-items")).toBeHidden();
     await expect(workers).not.toHaveAttribute("open");
@@ -302,7 +302,7 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`mobile layo
     await expect(page.locator("#chat-queue-note")).toContainText("delivered together with your replacement");
     await visualHeight(page, 380);
     await expect(page.locator("#chat-queue")).toBeVisible();
-    await expect(page.locator(".chat-queue-header")).toContainText("3 pending");
+    await expect(page.locator(".chat-queue-header")).toContainText("2 steers · 1 queued");
     const batch = page.getByRole("button", { name: "Send 2 paused steers now", exact: true });
     await expect(batch).toBeVisible();
     for (const selector of ["#chat-queue-note", ".chat-queue-header"]) {
@@ -321,7 +321,7 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`mobile layo
     await expect(page.locator("#chat-input")).toBeFocused();
     await visualHeight(page, 380);
     await expect(page.locator("#chat-queue")).toBeVisible();
-    await expect(page.locator(".chat-queue-header")).toContainText("2 pending");
+    await expect(page.locator(".chat-queue-header")).toContainText("2 steers");
     await containedControls(page, 380);
     await captureScreenshot(page, testInfo, `mobile-${engine}-edit-keyboard`);
   });

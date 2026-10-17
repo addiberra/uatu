@@ -228,3 +228,62 @@ Primary final browser evidence is the completed Playwright report in `compact-re
 | 6.3 | CHAT/architecture/SDK comments updated; `compact-api-final-2.log` 208/208, typecheck/build, schema and coverage pass. Schema has one pre-existing composition warning; build has existing `highlight` selector warnings. Earlier retry timeout passed unchanged in clean-environment reruns. Unchanged Mermaid blocks were not edited/re-rendered. |
 | 6.4 | `compact-ci-final-2.log`: 5,246 pass / 17 skip / 0 fail; `compact-browser-acceptance.log`: 265 pass / 0 fail in 3.6 minutes (owned job exited successfully); API 208/208, type/build/source-compiled checks pass. `compact-test-preservation.log` reconstructs baseline test files and confirms only approved touch-default scenario replacements. Real model validation unauthorized/unperformed. |
 | 6.5 | Main specs synchronized in prerequisite order, with only approved Hub/touch exceptions reconciled. All original and delta scenario names retained; 56 main specs validate, all three active changes validate strictly, `git diff --check` passes. `compact-scope-audit.log` records preservation. No archive/publication. |
+
+## 10. Current screenshot corrections (2026-10-17)
+
+- [x] 10.1 Reproduce first: both engines fail dense pending geometry (60px header, 109px card), outward growth (constant 84px extension), and hidden-only worker-card removal.
+- [x] 10.2 Compact touch pending text to nonzero categories without redundant totals; measured single-entry header/card become 32px/64px. Keep 32px inline pending targets, 8px gaps, existing confirmations and 44px composer/paused-batch Send/Stop.
+- [x] 10.3 Remove dismissed-count wording and hide the entire worker card when no visible workers remain, preserving persisted dismissal and timeline inspection.
+- [x] 10.4 Grow the viewport-owned pointer-transparent envelope from 56px to 104px with bottom-up fill and an above-finger countdown. Preserve fixed target, two-second exactly-once dispatch, all cancellation guards and reduced-motion information.
+- [x] 10.5 Run all 202 steering/worker/hold/mobile-layout browser checks successfully, including all prior 47 hold checks. Capture light/dark phone, 380/450px portrait and 230px landscape frame/occlusion evidence; retain existing 480px desktop, safe-area, focus and anchor coverage.
+- [x] 10.6 Validate clean isolated unit CI (5,278 pass / 16 skip), API (208 pass), typecheck, build, contract structure and strict specs (60 valid). Native macOS watcher timing failures in intermediate runs passed isolated and in the final owned-temporary-directory CI run; no observer tests or product behavior were changed.
+- [ ] 10.7 Resolve wider-suite pre-existing blockers before declaring the entire chat suite green: 637 functional passes / five failures reproduced on unchanged c2641ce (desktop configuration-details expectation; two hidden-child responsiveness cases; two touch-child shell cases). Performance adds 16 passes / four touch-child setup failures using the same unchanged hidden desktop-worker selectors. Preserve these tests; lead review decides their separate correction. Native iPhone/Safari hold/callout verification remains unperformed.
+
+Evidence is retained under the task-owned scratch directory
+`/private/var/folders/kd/gws6pqw92ss4lfbdk23n0jxc0000gn/T/opencode/currentfixes-evidence/`:
+`before/`, `chat-final-results/`, `baseline-results/`, `perf-results/`,
+`chat-e2e-final.log`, `baseline-failures.log`, `chat-perf.log`,
+`ci-owned-temp-final.log`, `api-tests.log` and `specs.log`.
+No commit, publication, dependency installation or user-Hub mutation was performed.
+
+## 11. Independent-review enlarged pending text correction
+
+- [x] 11.1 Reproduce the reported 200% multiline overlap first: four Chromium/WebKit light/dark cases fail glyph-rectangle separation with 28px text, 20px leading and approximately 13px overlap.
+- [x] 11.2 Use proportional 1.25rem leading: default text remains 14px/20px and the simple header/card remain exactly 32px/64px; 200% becomes 28px/40px with at least 7px between glyph rectangles. The long-message example grows naturally from 184px to 356px rather than using a fixed card height.
+- [x] 11.3 Cover 320px and 390px, light/dark and both engines, including real 640×320 mixed/image-only attachments, unbroken wrapping, independent 32px mutation targets and 8px gaps. Contain pending attachment rows/thumbnails so those cards and their dock have no horizontal overflow. Check replacement-warning lines and batch actions through actual clipping/occlusion hit tests after deliberate scrolling.
+- [x] 11.4 Verify 238 browser checks, 203 targeted unit checks, clean full CI (5,278 pass / 16 skip), typecheck, build, strict active-change validation and diff hygiene. Visually inspect final enlarged multiline, narrow real-image/action, replacement-warning and unchanged default-density captures.
+
+Evidence is retained under
+`/private/var/folders/kd/gws6pqw92ss4lfbdk23n0jxc0000gn/T/opencode/currentfixes-scaled-pending/`:
+`red.log` / `before/`, `browser-verified.log`, `unit-verified.log`,
+`ci-verified.log`, `results/` and selected `frames/`.
+
+The standard-text 40% conversation checks remain intact and pass in constrained
+viewports; enlarged ordinary pending work also retains that floor. Additional
+200% replacement-warning measurement reports 227px of an 844px band (about 27%),
+identical with the old and corrected leading; safety text and actions are
+reachable by scrolling. At 320px/200%, WebKit's separate conversation header
+reports 328px scroll width; the pending cards/dock no longer overflow. These
+other enlarged-chrome issues are recorded, not silently folded into the pending
+text fix. The earlier wider-suite blockers and native-iPhone caveat still apply.
+
+## 12. Independent-review post-replacement action wrapping correction
+
+- [x] 12.1 Reproduce after replacement, not just before: all four 320px/200% light/dark Chromium/WebKit cases fail with a 328px scroll width in the 320px dock. `Send now + paused steers` forces a 286.89px footer/action into 238px of card content.
+- [x] 12.2 Remove footer/action-group automatic minimum-content floors, bound widths to the card and wrap long action labels without truncation. Preserve 32px target minimums and independent 8px gaps. Keep proportional pending text leading and normal 32px/64px header/card density.
+- [x] 12.3 Use a named inline-size container with a 12rem threshold to let enlarged paused-batch headers scroll away rather than consume nearly the entire action viewport. Normal-size sticky counts remain unchanged; no transcript-budget or conversation-header correction is included.
+- [x] 12.4 Verify post-replacement dock/card widths and zero horizontal panning, then expose every pending mutation target completely within every clipping ancestor. Check focus, full rectangle intersections and five on-target hit points, with captures clear of the dock fade. Test 320px/390px, 200%, light/dark and both engines.
+- [x] 12.5 Exercise the long action's real confirmation: unchanged paused-steer/other-queued-message warning; Cancel makes no send-now request, changes no pending entries and preserves the replacement draft; confirmation sends exactly once, resumes the paused steer and leaves the other two queued messages held.
+- [x] 12.6 Verify 238 browser checks, 203 targeted unit checks, clean CI (5,278 pass / 16 skip), typecheck, build, strict active-change validation and diff hygiene. Visually inspect final wrapped-action/focus captures in both engines and unchanged default-density captures.
+
+Evidence is retained under
+`/private/var/folders/kd/gws6pqw92ss4lfbdk23n0jxc0000gn/T/opencode/currentfixes-wrapped-actions/`:
+`red.log`, `before/`, `browser-final.log`, `unit-final.log`, `ci-final.log`,
+`results/` and selected `frames/`. Replacement width and per-action intersection
+JSON accompany the screenshots. The corrected 320px dock is 320px wide with
+320px scroll width; the long action/footer are 238px wide, and the wrapped
+238×62px action is completely visible and unobstructed when exposed.
+
+No user-Hub mutation, commit or publication was performed. The separately
+recorded enlarged replacement transcript budget and conversation-header overflow
+remain outside this correction; no universal enlarged-text 40% guarantee is claimed.

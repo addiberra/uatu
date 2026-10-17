@@ -172,6 +172,40 @@ Short and empty lists, including constrained overlays, use content-sized height.
 Dismissal remains persisted view-only state; timeline history stays inspectable.
 No provider, API or hold-delivery semantics change is part of this refinement.
 
+### D11. Approved dense pending cards and visibly growing hold (2026-10-17)
+
+Supersede D8/D10's visible hidden-count wording: summaries count only visible
+working, unknown and finished occurrences, with the whole worker card absent
+when every settled occurrence is dismissed. Persisted dismissal and provider
+history/inspection stay unchanged; no Restore or replacement menu is added.
+
+Touch pending summaries omit zero categories and redundant totals: `1 queued`
+or `2 steers · 1 queued`. A 32px header and 32px inline pending actions are the
+approved density exception; maintain an independent 8px gap before Remove and
+existing confirmations. Compact delivery labels share the message line when
+space permits, instead of requiring three rows. Send/Stop remain separate 44px
+targets. Do not remove other information without user review.
+Pending message leading scales with root text size: 0.875rem type with 1.25rem
+leading preserves the default 14px/20px appearance and yields 28px/40px at 200%.
+Multiline and image-containing cards grow naturally within the existing dock
+scroller; enlarged glyph lines must not overlap.
+Footers/action groups have shrinkable minimums and bounded widths; action labels
+wrap rather than retaining an overflowing nowrap minimum. The 32px target minimum
+and 8px gaps remain. A named inline-size container uses a 12rem threshold so an
+enlarged paused-batch header scrolls away rather than leaving too little visible
+space for a whole wrapped action; standard-size sticky behavior is preserved.
+No confirmation, paused-batch admission or other delivery logic changes.
+
+The previous implementation placed a static 84px envelope above Send and animated
+only its internal fill. The approved refinement visibly grows the envelope from
+56px to 104px above the original button across the two-second hold, with the
+countdown above the finger from the first frames and bottom-to-top progress.
+Mount that pointer-transparent visual at the viewport, outside composer/dock
+clipping; the target and layout never move. Reduced motion retains a full static
+extension and changing countdown. Dispatch/cancellation and personal automation
+semantics are unchanged. Chromium trusted touch and WebKit pointer tests are
+browser evidence, not native iOS gesture/callout verification.
+
 ## Risks / Trade-offs
 
 - [ON for existing accounts changes behavior] → Clearly scoped personal setting, explicit all-jobs disclosure, OFF retained across devices, action-time server resolution, no job-start automation.

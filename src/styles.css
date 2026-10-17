@@ -10687,10 +10687,32 @@ html[data-ui-mode="touch"] .chat-work-dock :is(.chat-queue, #chat-task-list-item
 #chat-configuration-trigger[hidden] { display: none !important; }
 .chat-send-group { position: relative; }
 #chat-send { touch-action: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
-.chat-hold-upward { position: absolute; bottom: 0; z-index: 125; pointer-events: none; overflow: hidden; border-radius: 12px 12px 6px 6px; background: #245b91; color: white; box-shadow: 0 0 0 1px #ffffff80, 0 -4px 12px #0003; }
+.chat-hold-upward { position: fixed; z-index: 125; pointer-events: none; overflow: hidden; border-radius: 12px 12px 6px 6px; background: #245b91; color: white; box-shadow: 0 0 0 1px #ffffff80, 0 -4px 12px #0003; }
 .chat-hold-upward[hidden] { display: none; }
 .chat-hold-upward::before { content: ""; position: absolute; inset: 0; background: #167c62; transform: scaleY(var(--hold-progress, 0)); transform-origin: bottom; }
 .chat-hold-cap { position: absolute; top: 8px; inset-inline: 0; text-align: center; white-space: pre-line; font-size: 12px; line-height: 20px; font-weight: 600; font-variant-numeric: tabular-nums; }
+/* Pending inspection/mutations use the explicitly approved 32px density
+   tradeoff. Send/Stop remain 44px; Remove keeps an independent 8px gap. */
+html[data-ui-mode="touch"] .chat-queue { container: chat-pending / inline-size; gap: 4px; padding-top: 0; }
+html[data-ui-mode="touch"] .chat-queue-header { top: 0; gap: 8px; padding-block: 0; min-height: 32px; }
+html[data-ui-mode="touch"] .chat-pending-toggle { min-height: 32px; }
+html[data-ui-mode="touch"] .chat-queued-message { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 8px; padding: 4px 8px; }
+html[data-ui-mode="touch"] .chat-queued-heading { display: contents; }
+html[data-ui-mode="touch"] .chat-queued-badge { border: 0; padding: 0; font-size: 0.75rem; }
+html[data-ui-mode="touch"] .chat-queued-tag { font-size: 0.6875rem; }
+html[data-ui-mode="touch"] .chat-queued-message > p { flex: 1 1 120px; font-size: 0.875rem; line-height: 1.25rem; }
+html[data-ui-mode="touch"] .chat-queued-message > .chat-message-attachments { flex: 1 1 100%; min-width: 0; }
+html[data-ui-mode="touch"] .chat-queued-message .chat-message-attachment { min-width: 0; max-width: 100%; }
+html[data-ui-mode="touch"] .chat-queued-message .chat-attachment-view { min-width: 0; max-width: 100%; }
+html[data-ui-mode="touch"] .chat-queued-message .chat-message-attachment-thumb { max-width: min(8rem, 100%); box-sizing: border-box; }
+html[data-ui-mode="touch"] .chat-queued-message > .chat-queued-row { flex: 1 1 100%; min-width: 0; max-width: 100%; margin-top: 0; }
+html[data-ui-mode="touch"] .chat-queued-actions { min-width: 0; max-width: 100%; gap: 8px; }
+html[data-ui-mode="touch"] .chat-queued-message .chat-queued-action { min-width: 32px; min-height: 32px; max-width: 100%; box-sizing: border-box; padding: 2px 6px; font-size: 0.75rem; white-space: normal; overflow-wrap: anywhere; }
+/* Enlarged batch chrome must scroll away to expose a whole wrapped action.
+   A text-relative threshold preserves normal-size sticky count behavior. */
+@container chat-pending (max-width: 12rem) {
+  html[data-ui-mode="touch"] .chat-queue-header:has([data-queue-send-now]) { position: static; }
+}
 #chat-send.is-holding { box-shadow: inset 0 2px 4px #0005; }
 html[data-ui-mode="touch"] .chat-composer-actions { flex-wrap: nowrap; width: 100%; gap: 8px; }
 html[data-ui-mode="touch"] #chat-attach { display: inline-flex; flex: 0 0 44px; width: 44px; height: 44px; align-items: center; justify-content: center; }

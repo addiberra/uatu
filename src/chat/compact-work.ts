@@ -89,10 +89,10 @@ export function compactWorkers(items: readonly ConversationItem[]): CompactWorke
   });
 }
 
-export function workerSummary(workers: readonly CompactWorker[], hiddenCount = 0): string {
+export function workerSummary(workers: readonly CompactWorker[]): string {
   const count = (state: CompactWorker["state"]) => workers.filter(worker => worker.state === state).length;
   const working = count("working");
   const unknown = count("unknown");
   const finished = workers.filter(worker => !workerIsActive(worker.state)).length;
-  return [working && `${working} working`, finished && `${finished} finished`, unknown && `${unknown} unknown`, hiddenCount > 0 && `${hiddenCount} hidden`].filter(Boolean).join(" · ") || "No workers";
+  return [working && `${working} working`, finished && `${finished} finished`, unknown && `${unknown} unknown`].filter(Boolean).join(" · ") || "No workers";
 }

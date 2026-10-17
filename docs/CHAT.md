@@ -112,7 +112,11 @@ to queue automatically, exactly once without releasing. Releasing an intentional
 hold (250ms–2s), dragging outside the original button, Escape, lost capture,
 pointer cancellation, leaving the tab, moving the target or changing the
 draft/conversation/configuration cancels without sending.
-The countdown rises above the finger; the Send target never moves. Idle held
+The countdown clears the finger immediately; its pointer-transparent envelope
+grows upward from 56px to 104px above the fixed Send target while filling
+bottom-to-top. Reduced motion keeps the full extension and live countdown
+without the growth. The visual is viewport-owned, outside composer/dock clipping.
+The Send target never moves. Idle held
 sends dispatch normally, rather than inventing a pending queue entry.
 There is no Send dropdown. Keyboard users can hold Space on Send for the same
 two-second Queue action; Enter activates Send immediately. Escape cancels the
@@ -206,11 +210,28 @@ when space is constrained, without discarding the draft or forcing keyboard
 blur. Pending counts, paused-batch Send and replacement warnings
 remain available while typing.
 Touch has one initially collapsed pending summary and one worker summary.
-Pending counts distinguish steers from queued input; worker counts distinguish
+Pending counts distinguish steers from queued input without repeating the total
+or zero categories (for example, **1 queued** or **2 steers · 1 queued**).
+Its header uses a 32px target; compact cards share the delivery label and message
+line where they fit, followed by inline actions. Pending actions use the explicitly
+approved 32px density tradeoff with independent 8px gaps, including before Remove;
+existing confirmation safeguards remain unchanged. Composer Send/Stop and
+paused-batch Send stay 44px.
+Pending message leading scales with text enlargement (14px type/20px leading at
+default size, 28px/40px at 200%); multiline cards grow naturally inside the dock
+scroller instead of overlapping lines or imposing a fixed card height.
+Queued image rows and thumbnails stay within the card width when text is enlarged.
+Pending footers and action groups can shrink to the card width; long labels such
+as **Send now + paused steers** wrap without truncation. When a paused-batch
+header would crowd out enlarged actions in a text-relative narrow container
+(up to 12rem), it scrolls with the dock instead of remaining sticky. Normal-size
+sticky counts, confirmation wording and paused-batch delivery semantics stay intact.
+Worker counts distinguish
 confirmed working, finished (including failed/stopped), and unknown occurrences.
 Counts and rows use the same deduplicated executions: actual background shell
 tasks count, ordinary foreground commands do not. Zero-count categories are
-omitted; a hidden-only summary names the hidden count. Expansion shows one flat
+omitted. Dismissed counts are not shown; when no visible workers remain the whole
+worker card disappears. Expansion shows one flat
 list: active work first, then finished work ordered newest first from available
 execution timestamps, without a second disclosure. Rows open inspection or retained results;
 launch references and their costs remain in the transcript/timeline. Names use
@@ -222,7 +243,7 @@ only a row containing Stop grows to fit that separate action. **Dismiss finished
 stays on the right of the same compact header, not in a footer, and hides only this device's per-conversation
 view using the existing persisted dismissal state, never provider history.
 There is no Restore finished control. Results and their inspection remain in
-the timeline; summaries count visible rows and name the hidden count separately.
+the timeline; summaries count only visible rows.
 Σ usage is cumulative, not context occupancy.
 Deliberate worker expansion is kept per conversation within this page's bounded
 presentation cache; new work and settlement do not open details.

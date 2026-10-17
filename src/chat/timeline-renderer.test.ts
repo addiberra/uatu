@@ -1035,6 +1035,17 @@ describe("presentation details", () => {
       expect(host.querySelector('[data-chat-queued-id="c"]')?.textContent).toContain("After this turn");
     });
 
+    test("compact pending counts omit redundant totals and zero delivery categories", () => {
+      const host = target();
+      const dock = new QueueDockRenderer();
+      dock.render(host, [queued({ id: "a", text: "Later" })], { ...steering, compactOpen: false });
+      expect(host.querySelector("[data-pending-toggle]")?.textContent).toBe("1 queued");
+      dock.render(host, [queued({ id: "b", text: "Next", delivery: "steer" })], { ...steering, compactOpen: true });
+      expect(host.querySelector("[data-pending-toggle]")?.textContent).toBe("1 steer");
+      dock.render(host, [queued({ id: "a", text: "Later" }), queued({ id: "b", text: "Next", delivery: "steer" })], { ...steering, compactOpen: true });
+      expect(host.querySelector("[data-pending-toggle]")?.textContent).toBe("1 steer · 1 queued");
+    });
+
     test("compact pending details collapse independently of replacement and paused batch safety", () => {
       const host = target();
       const note = document.createElement("p"); host.append(note);

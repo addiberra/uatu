@@ -1059,11 +1059,10 @@ export function initChat(api = new ChatApiClient()): void {
     const allWorkers = compactWorkers(projection?.items ?? []);
     const dismissed = new Set(projection ? presentation.dismissedSubagents[projection.conversationId] ?? [] : []);
     const workers = allWorkers.filter(worker => worker.state === "working" || worker.state === "unknown" || !dismissed.has(worker.id) && !worker.references.some(id => dismissed.has(id)));
-    const hiddenCount = allWorkers.length - workers.length;
-    const summary = workerSummary(workers, hiddenCount);
+    const summary = workerSummary(workers);
     compactWorkersLabel.textContent = summary;
     compactWorkersList.querySelector("summary")?.setAttribute("aria-label", `Workers: ${summary}`);
-    compactWorkersList.hidden = allWorkers.length === 0;
+    compactWorkersList.hidden = workers.length === 0;
     compactWorkersList.open = compactWorkerState.paint(projection?.conversationId ?? null);
     compactWorkersList.querySelector("summary")?.setAttribute("aria-expanded", String(compactWorkersList.open));
     compactView?.paint(projection?.conversationId ?? null, workers, stoppingTasks, declares("background-tasks"));
@@ -4567,7 +4566,9 @@ export function initChat(api = new ChatApiClient()): void {
   const holdCap = document.createElement("span");
   holdCap.className = "chat-hold-cap";
   holdVisual.append(holdCap);
-  sendGroup?.append(holdVisual);
+  // A viewport-owned visual cannot be clipped by the composer or work sheet.
+  // It remains pointer-transparent; Send retains the original hit rectangle.
+  document.body.append(holdVisual);
   let holdPointer: number | null = null;
   let holdBounds: DOMRect | null = null;
   let holdTimer: ReturnType<typeof setTimeout> | null = null;
@@ -4607,11 +4608,14 @@ export function initChat(api = new ChatApiClient()): void {
     if (progress === 1) { hold.check(now); clearHoldVisual(); return; }
     const box = send.getBoundingClientRect();
     const viewportTop = window.visualViewport?.offsetTop ?? 0;
-    holdVisual.style.left = `${box.left - (sendGroup?.getBoundingClientRect().left ?? box.left)}px`;
+    holdVisual.style.left = `${box.left}px`;
     holdVisual.style.width = `${box.width}px`;
-    const extension = Math.min(84, Math.max(0, box.top - viewportTop - 8));
+    const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    // The cap clears a finger immediately, then the whole envelope rises as
+    // the deadline approaches; progress also fills upward inside that envelope.
+    const extension = Math.min(reducedMotion ? 104 : 56 + 48 * progress, Math.max(0, box.top - viewportTop - 8));
     holdVisual.style.height = `${box.height + extension}px`;
-    holdVisual.style.top = `${box.top - (sendGroup?.getBoundingClientRect().top ?? box.top) - extension}px`;
+    holdVisual.style.top = `${box.top - extension}px`;
     holdVisual.style.setProperty("--hold-progress", String(progress));
     holdCap.textContent = `${isLiveConversationStatus(projection?.status) ? "Queue" : "Send"}\n${((1 - progress) * 2).toFixed(1)}s`;
     holdVisual.hidden = false;

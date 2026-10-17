@@ -1,7 +1,7 @@
 import type { APIRequestContext, Page } from "@playwright/test";
 
 import { openChatPanel } from "./chat-helpers";
-import { captureScreenshot, saveEvidence } from "./evidence";
+import { captureScreenshot, recordEvidence, saveEvidence } from "./evidence";
 import { expect, test as base } from "./fixtures";
 import { withEngineBrowsers } from "./page-diagnostics";
 
@@ -145,7 +145,7 @@ test.describe("steering an OpenCode 2.x turn", () => {
     const queue = page.locator("#chat-queue");
     const scroller = mode === "touch" ? page.locator("#chat-work-dock") : queue;
     await scroller.evaluate(element => { element.scrollTop = 0; });
-    await expect(queue.locator(".chat-queue-header")).toContainText("5 pending · 2 steers · 3 queued");
+    await expect(queue.locator(".chat-queue-header")).toContainText(mode === "touch" ? "2 steers · 3 queued" : "5 pending · 2 steers · 3 queued");
     await expect(scroller).toHaveClass(/has-more-below/);
     const metrics = await scroller.evaluate(element => ({ height: element.clientHeight, viewport: innerHeight }));
     expect(metrics.height).toBeGreaterThan(135);
@@ -161,8 +161,8 @@ test.describe("steering an OpenCode 2.x turn", () => {
     })), null, 2));
     for (const button of await queue.locator(".chat-queued-message button").all()) {
       const box = (await button.boundingBox())!;
-      expect(box.height).toBeGreaterThanOrEqual(mode === "touch" ? 44 : 36);
-      expect(box.width).toBeGreaterThanOrEqual(mode === "touch" ? 44 : 36);
+      expect(box.height).toBeGreaterThanOrEqual(mode === "touch" ? 32 : 36);
+      expect(box.width).toBeGreaterThanOrEqual(mode === "touch" ? 32 : 36);
       expect(await button.getAttribute("aria-label")).toContain("“Audit pending");
     }
     await captureScreenshot(page, testInfo, `audit-dock-${mode}-${theme}`);
@@ -696,6 +696,348 @@ for (const browserName of ["chromium", "webkit"] as const) test.describe(`steeri
     }).toBe(true);
     await control(request, { action: "opencode", op: "finish", conversationId });
     await expect(page.locator("#chat-items")).toContainText("Held touch work");
+  });
+
+  for (const theme of ["light", "dark"] as const) test(`pending overview is dense and omits zero counts (${theme})`, async ({ page, request }, info) => {
+    await page.emulateMedia({ colorScheme: theme });
+    await bootChat(page, request);
+    await startTurn(page, request);
+    await submit(page, "Add middle theme", "Alt+Enter");
+    const header = page.locator(".chat-queue-header");
+    await page.locator("[data-pending-toggle]").tap();
+    const card = held(page).first();
+    const dimensions = { header: await header.boundingBox(), card: await card.boundingBox() };
+    await saveEvidence(info, `pending-${browserName}-${theme}-dimensions.json`, JSON.stringify(dimensions, null, 2));
+    await captureScreenshot(page, info, `pending-${browserName}-${theme}-density`);
+    expect(dimensions.header!.height).toBeCloseTo(32, 0);
+    expect(dimensions.card!.height).toBeCloseTo(64, 0);
+    await expect(header).toHaveText(/1 queued/);
+    await expect(header).not.toContainText(/0 steers|1 pending/);
+    const actions = await card.locator("button").all();
+    for (let index = 0; index < actions.length; index++) {
+      const rect = (await actions[index]!.boundingBox())!;
+      expect(rect.height).toBeGreaterThanOrEqual(32);
+      if (index > 0) { const previous = (await actions[index - 1]!.boundingBox())!; expect(rect.x - previous.x - previous.width).toBeGreaterThanOrEqual(8); }
+    }
+    // Readable content, one scroll owner and transcript budget survive keyboards.
+    const scenes = [{ width: 390, height: 844, visual: 450 }, { width: 390, height: 844, visual: 380 }, { width: 844, height: 390, visual: 230 }];
+    for (const scene of scenes) {
+      await page.setViewportSize({ width: scene.width, height: scene.height });
+      await page.locator("#chat-input").fill("Keep this draft");
+      await page.locator("#chat-input").focus();
+      await page.evaluate(scene => {
+        const viewport = Object.assign(new EventTarget(), { height: scene.visual, width: scene.width, offsetTop: 0, offsetLeft: 0, scale: 1 });
+        Object.defineProperty(window, "visualViewport", { configurable: true, value: viewport });
+        viewport.dispatchEvent(new Event("resize"));
+        window.dispatchEvent(new Event("resize"));
+      }, scene);
+      await expect(page.locator("html")).toHaveAttribute(scene.width < 600 ? "data-chat-keyboard" : "data-chat-wide-short");
+      expect((await page.locator("#chat-timeline").boundingBox())!.height).toBeGreaterThanOrEqual(scene.visual * 0.4);
+      await expect(page.locator("#chat-input")).toBeFocused();
+      await expect(page.locator("#chat-input")).toHaveValue("Keep this draft");
+      await captureScreenshot(page, info, `pending-${browserName}-${theme}-${scene.width}-vv${scene.visual}`);
+    }
+  });
+
+  for (const theme of ["light", "dark"] as const) for (const width of [390, 320]) test(`enlarged pending text has separate glyph lines and reachable image/actions (${theme} ${width})`, async ({ page, request }, info) => {
+    const evidence = `pending-${browserName}-${theme}-${width}`;
+    await page.emulateMedia({ colorScheme: theme });
+    await page.setViewportSize({ width, height: 844 });
+    await bootChat(page, request);
+    await startTurn(page, request);
+    await submit(page, "Readable first line\nSecond line with descenders gyjp\nThird line stays separate\nA_long_unbroken_message_must_wrap_without_horizontal_overflow", "Alt+Enter");
+    const image = Buffer.from(await page.evaluate(() => {
+      const canvas = document.createElement("canvas"); canvas.width = 640; canvas.height = 320;
+      const context = canvas.getContext("2d")!; context.fillStyle = "#286cb9"; context.fillRect(0, 0, 640, 320);
+      context.fillStyle = "white"; context.font = "32px sans-serif"; context.fillText("Pending image", 24, 64);
+      return canvas.toDataURL("image/png").split(",")[1]!;
+    }), "base64");
+    for (const text of ["Image and message\nAnother readable line", ""]) {
+      const upload = page.waitForResponse(response => response.url().endsWith("/attachments") && response.request().method() === "POST");
+      await page.locator("#chat-attach-input").setInputFiles({ name: "pending.png", mimeType: "image/png", buffer: image });
+      expect((await upload).status()).toBe(201);
+      await submit(page, text, "Alt+Enter");
+    }
+    await expect(held(page)).toHaveCount(3);
+    await page.locator("[data-pending-toggle]").click();
+    await expect(page.locator("[data-pending-toggle]")).toHaveAttribute("aria-expanded", "true");
+    await expect(held(page).first()).toBeVisible();
+    const before = (await held(page).first().boundingBox())!.height;
+    await page.evaluate(() => { document.documentElement.style.fontSize = "200%"; });
+    const glyphs = await held(page).locator(":scope > p").evaluateAll(paragraphs => paragraphs.map(paragraph => {
+      const text = paragraph.firstChild!;
+      const lines: Array<{ top: number; bottom: number; text: string }> = [];
+      for (let index = 0; index < (text.textContent?.length ?? 0); index++) {
+        const char = text.textContent![index]!;
+        if (/\s/.test(char)) continue;
+        const range = document.createRange(); range.setStart(text, index); range.setEnd(text, index + 1);
+        const rect = range.getBoundingClientRect();
+        const previous = lines.at(-1);
+        if (previous && Math.abs(previous.top - rect.top) < 1) { previous.bottom = Math.max(previous.bottom, rect.bottom); previous.text += char; }
+        else lines.push({ top: rect.top, bottom: rect.bottom, text: char });
+      }
+      const style = getComputedStyle(paragraph);
+      return { font: style.fontSize, lineHeight: style.lineHeight, lines };
+    }));
+    await saveEvidence(info, `${evidence}-200pct-glyphs.json`, JSON.stringify({ beforeHeight: before, enlargedHeight: (await held(page).first().boundingBox())!.height, paragraphs: glyphs }, null, 2));
+    await captureScreenshot(page, info, `${evidence}-200pct`);
+    await page.locator("#chat-work-dock").evaluate(node => { node.scrollTop = 100; });
+    await captureScreenshot(page, info, `${evidence}-200pct-scrolled-text`);
+    expect(glyphs[0]!.lines.length).toBeGreaterThanOrEqual(4);
+    for (const paragraph of glyphs) {
+      expect(paragraph.font).toBe("28px");
+      for (let index = 1; index < paragraph.lines.length; index++) expect(paragraph.lines[index]!.top).toBeGreaterThanOrEqual(paragraph.lines[index - 1]!.bottom);
+    }
+    expect((await held(page).first().boundingBox())!.height).toBeGreaterThan(before);
+    await saveEvidence(info, `${evidence}-200pct-widths.json`, JSON.stringify(await page.locator("#chat-surface").evaluate(node => ({
+      width: node.clientWidth, scrollWidth: node.scrollWidth,
+      overflowing: [...node.querySelectorAll<HTMLElement>("*")].filter(element => element.scrollWidth > element.clientWidth + 1 && getComputedStyle(element).overflowX === "visible").map(element => ({
+        tag: element.id || element.className || element.tagName, width: element.clientWidth, scrollWidth: element.scrollWidth,
+      })),
+    })), null, 2));
+    expect(await page.locator("#chat-work-dock").evaluate(node => node.scrollWidth <= node.clientWidth)).toBe(true);
+    if (width === 390) expect(await page.locator("#chat-surface").evaluate(node => node.scrollWidth <= node.clientWidth)).toBe(true);
+    for (const card of await held(page).all()) {
+      expect(await card.evaluate(node => node.scrollWidth <= node.clientWidth)).toBe(true);
+      const buttons = await card.locator(".chat-queued-action").all();
+      for (const [index, button] of buttons.entries()) {
+        await button.scrollIntoViewIfNeeded();
+        const box = (await button.boundingBox())!;
+        expect(box.width).toBeGreaterThanOrEqual(32); expect(box.height).toBeGreaterThanOrEqual(32);
+        if (index > 0) {
+          const previous = (await buttons[index - 1]!.boundingBox())!;
+          expect(box.y > previous.y + 1 ? box.y - previous.y - previous.height : box.x - previous.x - previous.width).toBeGreaterThanOrEqual(8);
+        }
+        expect(await button.evaluate(node => { const box = node.getBoundingClientRect(); return node.contains(document.elementFromPoint(box.x + box.width / 2, box.y + box.height / 2)); })).toBe(true);
+      }
+    }
+    await captureScreenshot(page, info, `${evidence}-200pct-image-actions`);
+    // Enlarged cards grow naturally inside the dock's one scroller.
+    const scroller = page.locator("#chat-work-dock");
+    expect(await scroller.evaluate(node => node.scrollHeight > node.clientHeight)).toBe(true);
+    expect((await page.locator("#chat-timeline").boundingBox())!.height).toBeGreaterThanOrEqual(844 * 0.4);
+    await expect(page.locator("#chat-send, #chat-stop")).toHaveCount(2);
+    await expect(held(page)).toHaveCount(3); // Inspecting and scrolling never mutates pending work.
+    await expect(held(page).locator(".chat-message-attachments")).toHaveCount(2);
+    await expect.poll(() => held(page).locator("img").evaluateAll(images => images.map(image => image.naturalWidth))).toEqual([640, 640]);
+    await expect(held(page).last().locator(":scope > p")).toHaveCount(0); // Image-only case.
+    // Replacement/batch safety remains readable and reachable at the same scale.
+    await submit(page, "Pause this steer with the replacement");
+    const reverted = page.waitForResponse(response => response.url().endsWith("/revert"));
+    await page.locator("#chat-items").getByRole("button", { name: "Revert message", exact: true }).last().click();
+    expect((await reverted).ok()).toBe(true);
+    const warning = page.locator("#chat-queue-note");
+    await expect(warning).toContainText("delivered together with your replacement");
+    await warning.scrollIntoViewIfNeeded();
+    await expect(warning).toBeInViewport({ ratio: 1 });
+    // Reveal text below the sticky count/batch header, not merely within the
+    // viewport bounds behind that header. This is a deliberate dock scroll.
+    await warning.evaluate(node => {
+      const dock = node.closest(".chat-work-dock")!;
+      const header = dock.querySelector(".chat-queue-header")!;
+      dock.scrollTop += node.getBoundingClientRect().top - Math.max(dock.getBoundingClientRect().top, header.getBoundingClientRect().bottom) - 4;
+    });
+    expect(await warning.locator(".chat-queue-replacement").evaluate(node => {
+      const range = document.createRange(); range.setStart(node.firstChild!, 0); range.setEnd(node.firstChild!, 1);
+      const box = range.getBoundingClientRect();
+      return node.contains(document.elementFromPoint(box.x + box.width / 2, box.y + box.height / 2));
+    })).toBe(true);
+    await captureScreenshot(page, info, `${evidence}-200pct-warning-text`);
+    const warningLines = await warning.locator(".chat-queue-replacement").evaluate(node => {
+      const dock = node.closest(".chat-work-dock")!;
+      const header = dock.querySelector(".chat-queue-header")!;
+      const range = document.createRange(); range.selectNodeContents(node);
+      return [...range.getClientRects()].map((_, index) => {
+        const before = range.getClientRects()[index]!;
+        dock.scrollTop += before.top - Math.max(dock.getBoundingClientRect().top, header.getBoundingClientRect().bottom) - 4;
+        const line = range.getClientRects()[index]!;
+        return node.contains(document.elementFromPoint(line.x + line.width / 2, line.y + line.height / 2));
+      });
+    });
+    expect(warningLines.length).toBeGreaterThan(1);
+    expect(warningLines.every(Boolean)).toBe(true);
+    const batch = page.getByRole("button", { name: "Send 1 paused steer now", exact: true });
+    await batch.scrollIntoViewIfNeeded();
+    expect((await batch.boundingBox())!.height).toBeGreaterThanOrEqual(44);
+    expect(await batch.evaluate(node => { const box = node.getBoundingClientRect(); return node.contains(document.elementFromPoint(box.x + box.width / 2, box.y + box.height / 2)); })).toBe(true);
+    // The documented 40% floor applies to standard text. Keep the enlarged
+    // warning reachable too, and record its budget without inventing a new
+    // enlarged-text floor or silently changing unrelated replacement chrome.
+    const enlargedWarningHeight = (await page.locator("#chat-timeline").boundingBox())!.height;
+    const previousLeading = await page.addStyleTag({ content: 'html[data-ui-mode="touch"] .chat-queued-message > p { line-height: 20px; }' });
+    await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+    const previousWarningHeight = (await page.locator("#chat-timeline").boundingBox())!.height;
+    await previousLeading.evaluate(node => node.remove());
+    await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+    expect(enlargedWarningHeight).toBeCloseTo(previousWarningHeight, 0);
+    await saveEvidence(info, `${evidence}-200pct-warning-budget.json`, JSON.stringify({ visualHeight: 844, enlargedWarningHeight, previousWarningHeight }, null, 2));
+    await captureScreenshot(page, info, `${evidence}-200pct-warning`);
+    // Revert changes queued-entry labels to the longer paused-batch action.
+    // Recheck the real post-replacement state, not only the earlier short labels.
+    const replacementWidths = await scroller.evaluate(node => ({
+      width: node.clientWidth, scrollWidth: node.scrollWidth,
+      cards: [...node.querySelectorAll<HTMLElement>(".chat-queued-message")].map(card => ({
+        width: card.clientWidth, scrollWidth: card.scrollWidth,
+        footer: card.querySelector("footer")!.getBoundingClientRect().width,
+        actions: [...card.querySelectorAll(".chat-queued-action")].map(action => ({ text: action.textContent, width: action.getBoundingClientRect().width })),
+      })),
+    }));
+    await saveEvidence(info, `${evidence}-200pct-replacement-widths.json`, JSON.stringify(replacementWidths, null, 2));
+    expect(replacementWidths.scrollWidth).toBeLessThanOrEqual(replacementWidths.width);
+    for (const card of replacementWidths.cards) expect(card.scrollWidth).toBeLessThanOrEqual(card.width);
+    expect(await scroller.evaluate(node => { node.scrollLeft = 1000; return node.scrollLeft; })).toBe(0);
+    for (const [cardIndex, card] of (await held(page).all()).entries()) {
+      const actions = await card.locator(".chat-queued-action").all();
+      for (const [index, action] of actions.entries()) {
+        await action.focus();
+        await expect(action).toBeFocused();
+        await action.scrollIntoViewIfNeeded();
+        await action.evaluate(node => {
+          const dock = node.closest(".chat-work-dock")!;
+          const header = dock.querySelector(".chat-queue-header")!;
+          const box = node.getBoundingClientRect();
+          const style = getComputedStyle(node);
+          const ring = Math.max(2, (parseFloat(style.outlineWidth) || 0) + (parseFloat(style.outlineOffset) || 0));
+          const fade = dock.classList.contains("has-more-below") ? parseFloat(getComputedStyle(dock, "::after").height) || 0 : 0;
+          const top = Math.max(dock.getBoundingClientRect().top, header.getBoundingClientRect().bottom) + ring;
+          const bottom = dock.getBoundingClientRect().bottom - ring - fade;
+          if (box.top < top) dock.scrollTop += box.top - top;
+          else if (box.bottom > bottom) dock.scrollTop += box.bottom - bottom;
+        });
+        const visible = await action.evaluate(node => {
+          const box = node.getBoundingClientRect();
+          const ancestors = [];
+          let left = Math.max(0, box.left), right = Math.min(innerWidth, box.right);
+          let top = Math.max(0, box.top), bottom = Math.min(innerHeight, box.bottom);
+          for (let parent = node.parentElement; parent; parent = parent.parentElement) {
+            const style = getComputedStyle(parent), rect = parent.getBoundingClientRect();
+            ancestors.push({ tag: parent.id || parent.className || parent.tagName, top: rect.top, bottom: rect.bottom, height: parent.clientHeight, overflow: style.overflow });
+            if (/hidden|clip|auto|scroll/.test(style.overflowX)) { left = Math.max(left, rect.left + parent.clientLeft); right = Math.min(right, rect.left + parent.clientLeft + parent.clientWidth); }
+            if (/hidden|clip|auto|scroll/.test(style.overflowY)) { top = Math.max(top, rect.top + parent.clientTop); bottom = Math.min(bottom, rect.top + parent.clientTop + parent.clientHeight); }
+          }
+          const centerX = box.left + box.width / 2, centerY = box.top + box.height / 2;
+          const points = [[box.left + 2, centerY], [box.right - 2, centerY], [centerX, box.top + 2], [centerX, box.bottom - 2], [centerX, centerY]];
+          return { width: box.width, height: box.height, visibleWidth: right - left, visibleHeight: bottom - top,
+            top: box.top, bottom: box.bottom, ancestors,
+            header: node.closest(".chat-work-dock")!.querySelector(".chat-queue-header")!.getBoundingClientRect().toJSON(),
+            unoccluded: points.every(([x, y]) => node.contains(document.elementFromPoint(x!, y!))) };
+        });
+        await saveEvidence(info, `${evidence}-200pct-replacement-card-${cardIndex}-action-${index}.json`, JSON.stringify(visible, null, 2));
+        expect(visible.width).toBeGreaterThanOrEqual(32); expect(visible.height).toBeGreaterThanOrEqual(32);
+        expect(visible.visibleWidth).toBeCloseTo(visible.width, 0); expect(visible.visibleHeight).toBeCloseTo(visible.height, 0);
+        expect(visible.unoccluded).toBe(true);
+        if (index > 0) {
+          const box = (await action.boundingBox())!, previous = (await actions[index - 1]!.boundingBox())!;
+          expect(box.y > previous.y + 1 ? box.y - previous.y - previous.height : box.x - previous.x - previous.width).toBeGreaterThanOrEqual(8);
+        }
+        if (index === 0) await captureScreenshot(page, info, `${evidence}-200pct-replacement-card-${cardIndex}`);
+      }
+    }
+    const sendNow = held(page).first().locator("[data-queue-send-now]");
+    await expect(sendNow).toHaveText("Send now + paused steers");
+    const mutations: string[] = [];
+    page.on("request", request => { if (request.method() === "POST" && request.url().endsWith("/send-now")) mutations.push(request.url()); });
+    const replacementDraft = await page.locator("#chat-input").inputValue();
+    await sendNow.click();
+    const confirmation = page.getByRole("dialog", { name: "Send queued message now?" });
+    await expect(confirmation).toContainText("also sends all 1 paused steer");
+    await expect(confirmation).toContainText("Other queued messages stay held");
+    await captureScreenshot(page, info, `${evidence}-200pct-replacement-confirmation`);
+    await confirmation.getByRole("button", { name: "Cancel", exact: true }).click();
+    expect(mutations).toHaveLength(0);
+    await expect(held(page)).toHaveCount(3);
+    await expect(steers(page)).toHaveCount(1);
+    await expect(page.locator("#chat-input")).toHaveValue(replacementDraft);
+    await sendNow.click();
+    const sent = page.waitForResponse(response => response.url().endsWith("/send-now"));
+    await confirmation.getByRole("button", { name: "Send now", exact: true }).click();
+    expect((await sent).ok()).toBe(true);
+    expect(mutations).toHaveLength(1);
+    await expect(steers(page)).toHaveCount(0);
+    await expect(held(page)).toHaveCount(2);
+    await expect(page.locator("#chat-items")).toContainText("Pause this steer with the replacement");
+    await expect(page.locator("#chat-items")).toContainText("Readable first line");
+  });
+
+  for (const theme of ["light", "dark"] as const) for (const scene of [
+    { width: 390, height: 844, visual: 844 }, { width: 390, height: 844, visual: 450 },
+    { width: 390, height: 844, visual: 380 }, { width: 844, height: 390, visual: 230 },
+  ]) test(`hold extension grows above the finger without clipping or moving Send (${theme} ${scene.width} vv${scene.visual})`, async ({ page, request }, info) => {
+    await page.emulateMedia({ colorScheme: theme });
+    await bootChat(page, request);
+    await startTurn(page, request);
+    const send = page.locator("#chat-send");
+    await expect(send).toBeDisabled();
+    await page.locator("#chat-input").fill("Later, please");
+    await page.locator("#chat-input").focus();
+    await page.setViewportSize({ width: scene.width, height: scene.height });
+    await page.evaluate(scene => {
+      const viewport = Object.assign(new EventTarget(), { height: scene.visual, width: scene.width, offsetTop: 0, offsetLeft: 0, scale: 1 });
+      Object.defineProperty(window, "visualViewport", { configurable: true, value: viewport });
+      window.dispatchEvent(new Event("resize"));
+    }, scene);
+    await expect(send).toBeEnabled();
+    // Wait for viewport ownership/layout before pinning the immutable target.
+    await page.waitForTimeout(150);
+    const original = (await send.boundingBox())!;
+    const accepted: unknown[] = [];
+    page.on("response", async response => { if (response.url().endsWith("/prompts")) accepted.push(await response.json()); });
+    const touch = browserName === "chromium" ? await page.context().newCDPSession(page) : null;
+    if (touch) await touch.send("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: [{ x: original.x + original.width / 2, y: original.y + original.height / 2 }] });
+    else {
+      await page.mouse.move(original.x + original.width / 2, original.y + original.height / 2);
+      await page.mouse.down();
+    }
+    await page.evaluate(original => {
+      const finger = document.createElement("span"); finger.id = "test-finger";
+      finger.style.cssText = `position:fixed;pointer-events:none;z-index:126;left:${original.x - 7}px;top:${original.y + 8}px;width:58px;height:58px;border-radius:50%;background:#c6947f80;border:1px solid #be826a99`;
+      document.body.append(finger);
+    }, original);
+    const frames = [];
+    const start = performance.now();
+    for (const ms of [200, 300, 1000, 1800]) {
+      await page.waitForTimeout(Math.max(0, ms - (performance.now() - start)));
+      frames.push(await page.locator(".chat-hold-upward").evaluate((node, original) => {
+        const box = node.getBoundingClientRect();
+        const cap = node.querySelector(".chat-hold-cap")!.getBoundingClientRect();
+        const ancestors = [];
+        for (let parent = node.parentElement; parent; parent = parent.parentElement) {
+          const style = getComputedStyle(parent), rect = parent.getBoundingClientRect();
+          ancestors.push({ tag: parent.id || parent.className || parent.tagName, overflow: style.overflow, z: style.zIndex,
+            clips: /(hidden|clip|auto|scroll)/.test(style.overflowY) && (box.top < rect.top || box.bottom > rect.bottom) });
+        }
+        // Hit-test with only this pointer-transparent visual temporarily participating.
+        node.style.pointerEvents = "auto";
+        const hit = document.elementFromPoint(box.x + box.width / 2, box.y + 4);
+        const unoccluded = hit === node || node.contains(hit);
+        node.style.pointerEvents = "";
+        return { top: box.top, bottom: box.bottom, height: box.height, capBottom: cap.bottom, text: node.textContent,
+          extension: original.y - box.top, unoccluded, ancestors };
+      }, original));
+      const path = info.outputPath(`hold-${browserName}-${theme}-${scene.width}-vv${scene.visual}-${ms}ms.png`);
+      await page.screenshot({ path });
+      await recordEvidence(info, path);
+    }
+    await saveEvidence(info, `hold-${browserName}-${theme}-${scene.width}-vv${scene.visual}-frames.json`, JSON.stringify({ original, frames }, null, 2));
+    expect(await send.boundingBox()).toEqual(original);
+    expect(frames[0]!.extension).toBeGreaterThanOrEqual(48);
+    expect(frames[1]!.extension).toBeLessThan(frames[2]!.extension);
+    expect(frames[2]!.extension).toBeLessThan(frames[3]!.extension);
+    expect(frames[3]!.extension).toBeGreaterThanOrEqual(84);
+    for (const frame of frames) {
+      expect(frame.capBottom).toBeLessThan(original.y);
+      expect(frame.bottom).toBeCloseTo(original.y + original.height, 0);
+      expect(frame.ancestors.filter(ancestor => ancestor.clips)).toEqual([]);
+      expect(frame.unoccluded).toBe(true);
+    }
+    await expect.poll(() => accepted.length).toBe(1);
+    expect(accepted[0]).toMatchObject({ pending: true, delivery: "queue" });
+    if (touch) { await touch.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] }); await touch.detach(); }
+    else await page.mouse.up();
+    await page.locator("#test-finger").evaluate(node => node.remove());
+    await page.waitForTimeout(100);
+    expect(accepted).toHaveLength(1);
+    await expect(held(page)).toHaveCount(1);
   });
 
   test("touch hold queues without menus and keeps the rails stable", async ({ page, request }, testInfo) => {

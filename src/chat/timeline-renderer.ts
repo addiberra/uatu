@@ -1193,7 +1193,10 @@ export class QueueDockRenderer {
     }
     const steers = queued.filter(entry => entry.delivery === "steer").length;
     const paused = queued.some(entry => entry.unconfirmed) ? undefined : queued.find(entry => entry.delivery === "steer" && entry.paused);
-    const counts = `<span>${queued.length} pending</span><span class="chat-queue-breakdown"> · ${steers} steer${steers === 1 ? "" : "s"} · ${queued.length - steers} queued</span>`;
+    const breakdown = [steers > 0 && `${steers} steer${steers === 1 ? "" : "s"}`, queued.length > steers && `${queued.length - steers} queued`].filter(Boolean).join(" · ");
+    const counts = context.compactOpen === undefined
+      ? `<span>${queued.length} pending</span><span class="chat-queue-breakdown">${breakdown ? ` · ${breakdown}` : ""}</span>`
+      : `<span>${breakdown || "No pending messages"}</span>`;
     const heading = context.compactOpen === undefined ? `<strong>${counts}</strong>` : `<button type="button" class="chat-pending-toggle" data-pending-toggle aria-expanded="${context.compactOpen}" aria-controls="chat-queue-items">${counts}</button>`;
     const headerHtml = `${heading}${paused ? `<button type="button" class="chat-queued-action" data-queue-send-now="${escapeHtmlAttribute(paused.id)}">Send ${context.pausedSteers} paused steer${context.pausedSteers === 1 ? "" : "s"} now</button>` : ""}`;
     if (header.innerHTML !== headerHtml) header.innerHTML = headerHtml;

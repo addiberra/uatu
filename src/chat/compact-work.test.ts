@@ -53,7 +53,7 @@ test("pending/generating is not confirmed working and failed tools are finished,
   expect(workerSummary(workers)).toBe("1 unknown");
 });
 
-test("worker summaries omit zero segments without losing hidden or terminal outcomes", () => {
+test("worker summaries describe only visible work without losing terminal outcomes", () => {
   const workers = compactWorkers([
     { type: "background_task", id: "live", taskId: "live", description: "Live", status: "running", createdAt: 1 },
     { type: "background_task", id: "failed", taskId: "failed", description: "Failed", status: "failed", createdAt: 2 },
@@ -61,8 +61,7 @@ test("worker summaries omit zero segments without losing hidden or terminal outc
   ]);
   expect(workerSummary(workers.filter(worker => worker.state === "working"))).toBe("1 working");
   expect(workerSummary(workers.filter(worker => worker.state !== "working"))).toBe("2 finished");
-  expect(workerSummary([], 3)).toBe("3 hidden");
-  expect(workerSummary(workers, 3)).toBe("1 working · 2 finished · 3 hidden");
+  expect(workerSummary(workers)).toBe("1 working · 2 finished");
   expect(workerSummary([])).toBe("No workers");
 });
 

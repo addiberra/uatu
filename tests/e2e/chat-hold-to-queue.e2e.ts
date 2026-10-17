@@ -22,6 +22,7 @@ test("native touch tap steers once and a focused touch-page pointer hold queues"
     await touch.locator("#chat-input").focus();
     const target = await press(touch);
     await expect(touch.locator(".chat-hold-upward")).toBeVisible();
+    await expect.poll(async () => target.y - (await touch.locator(".chat-hold-upward").boundingBox())!.y, { intervals: [25] }).toBeGreaterThanOrEqual(80);
     expect((await touch.locator(".chat-hold-upward").boundingBox())!.y).toBeLessThanOrEqual(target.y - 80);
     await expect(touch.locator("#chat-input")).toBeFocused();
     await captureScreenshot(touch, info, `touch-page-${engine}-pointer-hold`);
@@ -197,6 +198,7 @@ test("two-second hold queues before release once with fixed target and upward co
   await page.locator("#chat-input").fill("Held draft");
   const before = await press(page);
   await expect(page.locator(".chat-hold-upward")).toBeVisible();
+  await expect.poll(async () => before.y - (await page.locator(".chat-hold-upward").boundingBox())!.y, { intervals: [25] }).toBeGreaterThanOrEqual(80);
   const extension = (await page.locator(".chat-hold-upward").boundingBox())!;
   expect(extension.y).toBeLessThanOrEqual(before.y - 80);
   expect(await page.locator("#chat-send").boundingBox()).toEqual(before);
@@ -285,6 +287,7 @@ test("touch inline controls retain real labels and minimum targets", async ({ pa
     await page.locator("#chat-input").fill("Hold without losing this draft");
     const button = await press(page);
     await expect.poll(() => page.locator(".chat-hold-upward").evaluate(node => Number((node as HTMLElement).style.getPropertyValue("--hold-progress")))).toBeGreaterThanOrEqual(0.25);
+    expect((await page.locator(".chat-hold-upward").boundingBox())!.height).toBeCloseTo(button.height + 104, 0);
     await page.evaluate(box => {
       const finger = document.createElement("div"); finger.id = "simulated-finger";
       Object.assign(finger.style, { position: "fixed", pointerEvents: "none", zIndex: "9999", left: `${box.x + box.width / 2 - 29}px`, top: `${box.y + box.height / 2 - 29}px`, width: "58px", height: "58px", borderRadius: "50%", background: "#c6947f80", border: "1px solid #be826a99" });
@@ -356,6 +359,7 @@ test("native Chromium touch hold keeps capture across repaints and queues exactl
     // Real live-channel repaints, not direct calls into the gesture controller.
     for (let i = 0; i < 3; i++) expect((await request.post("/__e2e/chat", { data: { action: "opencode", op: "appendHistory", conversationId, count: 1 } })).ok()).toBe(true);
     await expect(page.locator("#chat-items")).toContainText("Historical fixture answer 0");
+    await expect.poll(async () => box.y - (await page.locator(".chat-hold-upward").boundingBox())!.y, { intervals: [25] }).toBeGreaterThanOrEqual(80);
     const visual = (await page.locator(".chat-hold-upward").boundingBox())!;
     expect(visual.y).toBeLessThanOrEqual(box.y - 80);
     expect(await page.locator("#chat-send").boundingBox()).toEqual(box);

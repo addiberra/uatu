@@ -37,7 +37,7 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`canonical w
     expect((await request.post("/__e2e/chat", { data: { action: "item", conversationId: snapshot.conversation.id, item: {
       id: "tool:new-launch", type: "tool", name: "task", status: "completed", createdAt: Date.now(), model: "gpt-6-astra", input: '{"description":"Research browser backup restore"}',
     } } })).ok()).toBe(true);
-    await expect(page.locator("#chat-compact-workers-label")).toHaveText("1 finished · 20 hidden");
+    await expect(page.locator("#chat-compact-workers-label")).toHaveText("1 finished");
     await summary.tap();
     await expect(track.locator(".chat-worker-model")).toHaveText("gpt-6-astra");
     await expect(track.locator(".chat-worker-tokens")).toHaveText("Σ 230k");
@@ -76,20 +76,15 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`canonical w
       await captureScreenshot(page, info, `workers-${engine}-one-finished-${scene.width}-vv${scene.visual}`);
     }
     await dismiss.tap();
-    await expect(page.locator("#chat-compact-workers-label")).toHaveText("21 hidden");
+    await expect(track).toBeHidden();
     await expect(track.locator("[data-worker-id]")).toHaveCount(0);
-    expect((await track.boundingBox())!.height).toBeLessThanOrEqual(30);
     expect((await page.locator("#chat-work-dock").boundingBox())!.height).toBeLessThanOrEqual(32);
     await expect(track).toHaveAttribute("open"); // Dismiss never toggles the parent.
-    expect(await summary.evaluate(node => {
-      const rect = node.getBoundingClientRect();
-      return node.contains(document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2));
-    })).toBe(true);
     await captureScreenshot(page, info, `workers-${engine}-all-dismissed-vv230`);
     await expect(page.locator('#chat-items [data-chat-item-id="new-finished"]')).toHaveCount(1);
   });
 
-  test("finished-only dismissal keeps a named hidden count and an empty conversation has a nonblank fallback", async ({ page, request }) => {
+  test("finished-only dismissal hides the whole overview and persists through reselection", async ({ page, request }) => {
     await request.post("/__e2e/reset");
     await request.post("/__e2e/chat", { data: { action: "agents", count: 2 } });
     const empty = await request.post("/__e2e/chat", { data: { action: "seed", agent: "claude", title: "Empty", items: [] } }).then(response => response.json());
@@ -106,14 +101,15 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`canonical w
     await expect(summary).toHaveText("2 finished");
     await summary.tap();
     await track.getByRole("button", { name: "Dismiss finished", exact: true }).tap();
-    await expect(summary).toHaveText("2 hidden");
-    await expect(track.locator(":scope > summary")).toHaveAttribute("aria-label", "Workers: 2 hidden");
+    await expect(track).toBeHidden();
+    await expect(page.locator("#chat-surface")).not.toContainText(/\d+ hidden/);
     await page.locator("#chat-conversation-select").selectOption(empty.conversation.id);
     await expect(track).toBeHidden();
     await expect(summary).toHaveText("No workers");
     await expect(track.locator(":scope > summary")).toHaveAttribute("aria-label", "Workers: No workers");
     await page.locator("#chat-conversation-select").selectOption(finished.conversation.id);
-    await expect(summary).toHaveText("2 hidden");
+    await expect(track).toBeHidden();
+    await expect(page.locator('#chat-items [data-chat-item-id="failed"]')).toHaveCount(1);
   });
 
   for (const theme of ["light", "dark"] as const) test(`20 mixed jobs use one readable list with reachable constrained controls (${theme})`, async ({ page, request }, info) => {
@@ -181,11 +177,11 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`canonical w
     await expect(track.locator('[data-worker-id="job:18"] .chat-worker-model')).toHaveText("GPT-6.1 Sol");
     await expect(track.locator('[data-worker-id="job:18"] .chat-worker-tokens')).toHaveText("Σ 229k");
     await track.getByRole("button", { name: "Dismiss finished", exact: true }).tap();
-    await expect(label).toHaveText("2 working · 18 hidden");
+    await expect(label).toHaveText("2 working");
     await expect(rows).toHaveCount(2);
     await page.reload();
     await page.locator("#touch-tab-chat").tap();
-    await expect(label).toHaveText("2 working · 18 hidden");
+    await expect(label).toHaveText("2 working");
     await expect(rows).toHaveCount(2);
     if (await track.getAttribute("open") === null) await summary.tap();
     await expect(track.getByRole("button", { name: /Restore finished/ })).toHaveCount(0);
@@ -240,7 +236,7 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`canonical w
     await request.post("/__e2e/chat", { data: { action: "item", conversationId: snapshot.conversation.id, item: { ...items.find(item => item.id === "job:18"), stateUncertain: true } } });
     await summary.tap();
     await expect(track.locator('[data-state="unknown"] [data-stop-task]')).toBeDisabled();
-    await expect(label).toHaveText("1 working · 1 unknown · 18 hidden");
+    await expect(label).toHaveText("1 working · 1 unknown");
     await page.setViewportSize({ width: 390, height: 844 });
     await page.locator("#chat-input").blur();
     await page.evaluate(() => {
