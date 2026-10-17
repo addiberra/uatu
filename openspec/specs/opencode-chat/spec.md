@@ -1634,7 +1634,7 @@ A subagent's timeline row and its row in the composer's subagent list SHALL stat
 ### Requirement: The composer's subagent list counts subagents and tasks distinctly
 On desktop the composer's subagent list SHALL keep one row per task, and its summary line SHALL NOT count a subagent once per task it was given. Where every task went to its own subagent the summary SHALL count subagents as it does today. Where a subagent was given more than one task, the summary SHALL state the number of distinct subagents and the number of tasks.
 
-On touch, the compact worker disclosure SHALL replace duplicate pinned subagent/background lists. Its summary SHALL count canonical worker execution occurrences rather than launcher aliases, while expanded details SHALL preserve distinct task/launch references and existing model/cost attribution. Historical timeline launch/result records SHALL remain available; consolidation SHALL NOT create a second lifecycle or combine separate worker executions into one.
+On touch, the compact worker disclosure SHALL replace duplicate pinned subagent/background lists with one canonical row projection and renderer. The summary and rows SHALL count the same worker execution occurrences rather than launcher aliases. Ordinary foreground shell commands SHALL remain in the timeline and SHALL NOT count as workers; actual background shell tasks SHALL count. Historical timeline launch/result records, distinct task references and their model/cost attribution SHALL remain available through inspection and the timeline; consolidation SHALL NOT create a second lifecycle or combine separate worker executions into one.
 
 #### Scenario: One task per subagent reads as before
 - **WHEN** a desktop conversation launched four subagents with one task each and all have finished
@@ -1648,7 +1648,7 @@ On touch, the compact worker disclosure SHALL replace duplicate pinned subagent/
 #### Scenario: Touch worker summary avoids launcher duplicates
 - **WHEN** two launching task references refer to the same confirmed live worker occurrence
 - **THEN** the touch summary counts one working occurrence
-- **AND** expanding it preserves both task references and their attribution without duplicating the worker's execution state
+- **AND** expanding it shows one inspection row, with both launch references and their attribution retained in the timeline rather than duplicate worker rows
 
 ### Requirement: Chat composer actions keep a stable responsive layout
 The Chat composer SHALL present context usage, one flexible configuration trigger, routine status, a persistent visible Send action, and a separate Stop action, subject to the compact touch layout below. A capability-gated delivery selector SHALL precede Send where supported. Send SHALL NOT become Stop while work runs. Each submission control SHALL have a target at least 44×44 CSS pixels with at least 8px separation from adjacent submission controls and a visible keyboard-focus indicator. Stop SHALL remain in place but disabled when no turn is live. Routine lifecycle changes and opening the delivery menu MUST NOT move or resize these controls at unchanged panel dimensions and keyboard/editing state.
@@ -3118,6 +3118,8 @@ Touch chat SHALL show at most one initially collapsed pending-message summary an
 
 Expanded pending details SHALL retain delivery order and existing edit/remove/convert/Send now actions. Expanded worker details SHALL retain inspection, truthful terminal outcomes, available shell output and existing parent/worker-stop safeguards. Replacement consequences, paused-batch warnings and applicable batch Send, and actionable operation failure/uncertainty SHALL remain visible outside collapsed details. Desktop disclosure defaults SHALL remain unchanged. The collapsed touch defaults are an explicit exception to earlier automatic-running-track expansion behavior.
 
+Expanded worker details SHALL show confirmed working and unknown workers first, followed by a separately collapsed Finished history ordered newest first from available execution timestamps. Each occurrence SHALL have one whole-row inspection target, readable names of at least 14px and metadata of at least 13px, with state-specific glyphs distinguishing working, unknown, finished, failed and stopped. A settled glyph SHALL NOT imply live work. Headers and inspection/Stop targets SHALL remain at least 44px tall with 8px separation from Stop. Only current owned, confirmed live background workers SHALL offer enabled Stop worker; an unknown outcome SHALL disable Stop. Settled results SHALL remain accessible. Only live workers SHALL cause the parent Stop label to read Stop parent. Known successful automatic-background acknowledgements MAY clear on status change or complete settlement; failed, unavailable and unknown outcomes SHALL remain persistent.
+
 #### Scenario: Loaded touch chat starts compact
 - **WHEN** a touch conversation has two pending steers, one queued message, two working and four confirmed terminal worker occurrences
 - **THEN** its pending and worker summaries are collapsed and show their respective counts
@@ -3145,7 +3147,7 @@ Expanded pending details SHALL retain delivery order and existing edit/remove/co
 ### Requirement: Compact touch composition preserves safe targets and conversation space
 Touch chat SHALL keep Send and Stop distinct, retain operable capability-gated delivery selection and existing submission shortcuts, and put less-used settings/context/help/actions behind an accessible touch options menu rather than reducing touch target size. Visible action targets SHALL be at least 44×44 CSS pixels, with at least 8px separation between adjacent mutation actions, visible focus and non-overlapping hit regions. Opening configuration from the menu SHALL use the existing single adaptive picker rather than stack another options layer. Unsupported actions SHALL be absent, and explicit Continue SHALL remain available in layouts where worker controls are supported and blocking evidence exists, regardless of the account's automatic preference.
 
-The entire dock SHALL retain the existing aggregate visual-height caps: 35%, 25% from 48rem width, and 24% during hardware-keyboard editing. Standard-size loaded phone layouts SHALL leave at least 40% of the visual band for the transcript; the tested tablet layouts SHALL leave at least 35%. Software-keyboard and short-landscape states SHALL retain existing worker-control/Continue suppression while keeping pending counts, replacement warnings and applicable paused-batch Send reachable. Safe-area handling, measured desktop geometry, explicit bottom pinning, remote reading anchors and interaction-request answering SHALL be preserved. Larger text SHALL retain readable warnings and reachable primary controls using scrolling/reduced secondary content rather than shrunken targets.
+The in-flow dock SHALL retain the existing aggregate visual-height caps: 35%, 25% from 48rem width, and 24% during hardware-keyboard editing. Standard-size loaded phone layouts SHALL leave at least 40% of the visual band for the transcript; the tested tablet layouts SHALL leave at least 35%. Software-keyboard and short-landscape states SHALL retain a 44px worker summary; deliberate expansion MAY overlay the transcript above the composer when inline details cannot meet those budgets. The dock SHALL have one scroller rather than nested worker lists. Opening and closing the overlay SHALL preserve composing drafts and owned focus without forced keyboard blur. Composer Send/Stop, delivery/options controls and existing pending replacement/batch safety SHALL remain reachable; explicit Continue suppression in constrained states SHALL remain unchanged. Safe-area handling, measured desktop geometry, explicit bottom pinning, remote reading anchors and interaction-request answering SHALL be preserved. Larger text SHALL retain readable warnings and reachable primary controls using scrolling/reduced secondary content rather than shrunken targets.
 
 Menus SHALL fit the visual viewport, support keyboard navigation and one-layer Escape with invoker restoration, and consume outside touch dismissal without activating underlying actions. Visible controls SHALL activate reliably on the first tap during composition without discarding drafts or attachment/configuration state. Live updates and reduced-motion presentation SHALL NOT steal focus or fabricate completion announcements.
 
@@ -3168,6 +3170,20 @@ Menus SHALL fit the visual viewport, support keyboard navigation and one-layer E
 - **WHEN** pending/worker details expand, collapse or settle while the reader is remotely scrolled or explicitly bottom-pinned
 - **THEN** the current reading anchor or explicit bottom-pin intention is preserved respectively
 - **AND** controls remain hit-testable after final layout reservation and reduced-motion handling
+
+### Requirement: Desktop work shares measured panel space
+Desktop worker tracks and pending messages SHALL share an aggregate scroller capped at 40% of the actual measured chat panel height and 25rem. The aggregate SHALL yield further to reserve the lesser of 12rem or 35% of that panel for the transcript while keeping the composer fully visible. Existing desktop disclosure defaults, per-track rem caps, drafts, focus and reading intent SHALL remain intact. A newly staged replacement warning SHALL be revealed once after composer layout settles; subsequent updates SHALL respect deliberate dock scrolling.
+
+#### Scenario: Detached worker and pending steer coexist in a short split
+- **WHEN** default-split desktop chat has a running turn, one pending steer and one detached worker at 1280×600 or 1280×480
+- **THEN** Send and Stop are fully inside the measured panel and center-hit-testable without collapsing tracks
+- **AND** the transcript retains its reserved space, the draft/focus survives resizing, and a subsequent Revert reveals its replacement consequence
+
+#### Scenario: Long history cannot compress actionable work into a sliver
+- **WHEN** long history, a live worker and pending input coexist in a short desktop panel
+- **THEN** non-empty work reserves at least max(52px, 3.25rem) when feasible, yielding transcript space down to its reserved floor first
+- **AND** keyboard navigation can expose the full 44px worker action and its visible focus outline within every clipping ancestor
+- **AND** if the measured remaining space cannot fit that minimum, an accessible 44px Show work entry opens a scrollable sheet above the composer, with Close work/Escape restoring the entry while retaining drafts and warnings
 
 ### Requirement: Accepted Hub steer actions can automatically background eligible work
 For an initiating Hub account whose authoritative personal preference is ON, chat SHALL consider one automatic native background-all follow-up after a confirmed steer action on an agent supporting both steering and background-blocking-work. This includes new composer steers, Queue → Steer, Send now of held input or paused steers, and submitted Undo/revert replacement steers. A paused batch resume SHALL result in at most one follow-up per accepted user action, not per resumed message. The initiating user's policy SHALL apply even in a workspace shared with users having different preferences, without changing those users' settings.
@@ -3246,6 +3262,18 @@ Native steer/resume unknown retention SHALL remain active without automatic-poli
 - **WHEN** A and B issue actions in the same conversation using the same client request identifier but opposite personal preferences
 - **THEN** neither receives the other's personal action receipt or policy metadata
 - **AND** each action uses its own authenticated initiating-account scope while conversation/worker state remains shared
+
+#### Scenario: Unrelated mutations preserve unresolved operation feedback
+
+- **WHEN** Remove, a delivery change or a later successful steer follows an unknown, failed or unavailable automatic-background outcome
+- **THEN** the unresolved feedback remains tied to its source operation and is not cleared by the unrelated result or ordinary status settlement
+- **AND** constrained touch layouts retain visible, scrollable feedback without consuming the usable draft field or hiding the options entry point
+
+#### Scenario: Settings browser cannot read saved policy
+
+- **WHEN** the Settings browser fails to read personal preferences
+- **THEN** it reports that it cannot confirm the saved setting, without promising automation is disabled
+- **AND** saved server policy continues to govern independently admitted steers in other tabs or devices
 
 #### Scenario: Unknown retention survives unavailable bootstrap
 - **WHEN** native steer admission or resume applies but its acknowledgement is lost while private Hub policy trust is unavailable

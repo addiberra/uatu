@@ -13,6 +13,12 @@ async function control(request: APIRequestContext, body: Record<string, unknown>
   return response.json();
 }
 
+async function inspectTouchWorker(page: Page, name: string): Promise<void> {
+  const inspect = page.locator("#chat-compact-workers").getByTitle(name, { exact: true });
+  if (!await inspect.isVisible()) await page.locator(".chat-workers-history > summary").click();
+  await inspect.click();
+}
+
 async function boot(page: Page, request: APIRequestContext, seed?: { items: ConversationItem[]; older?: ConversationItem[] }): Promise<string> {
   await request.post("/__e2e/reset");
   const snapshot = await control(request, { action: "seed", title: "Touch chat", items: seed?.items ?? [], older: seed?.older ?? [] });
@@ -138,19 +144,18 @@ async function bootWithPinnedTracks(page: Page, request: APIRequestContext, hist
 
   await expect(page.locator("#chat-task-list")).toBeVisible();
   await page.locator("#chat-compact-workers > summary").click();
-  await expect(page.locator("#chat-subagents")).toBeVisible();
-  await expect(page.locator("#chat-background-tasks")).toBeVisible();
+  await expect(page.locator("#chat-compact-workers")).toBeVisible();
+  await page.locator(".chat-workers-history > summary").click();
   // Expanded, so "hidden" in these cases is about the keyboard rule rather
   // than about a closed <details>. Set rather than tapped: a tap lands on a
   // track row, and the point here is the geometry, not the summary's hit area.
   await page.evaluate(() => {
-    for (const id of ["chat-task-list", "chat-subagents", "chat-background-tasks"]) {
+    for (const id of ["chat-task-list"]) {
       document.querySelector<HTMLDetailsElement>(`#${id}`)!.open = true;
     }
   });
   await expect(page.locator("#chat-task-list-items li")).toHaveCount(6);
-  await expect(page.locator("#chat-subagents-items li")).toHaveCount(1);
-  await expect(page.locator("#chat-background-tasks-items li")).toHaveCount(1);
+  await expect(page.locator("#chat-compact-workers-items [data-worker-id]")).toHaveCount(2);
   return id;
 }
 
@@ -248,7 +253,8 @@ test("composer stays flush with separate Send and Stop on a stable narrow action
 
   const geometry = await page.locator(".chat-composer-actions").evaluate(actions => {
     const send = actions.querySelector<HTMLElement>("#chat-send")!.getBoundingClientRect();
-    const trigger = actions.querySelector<HTMLElement>("#chat-options-toggle")!.getBoundingClientRect();
+    const trigger = document.querySelector<HTMLElement>("#chat-options-toggle")!.getBoundingClientRect();
+    const header = document.querySelector<HTMLElement>(".chat-header")!.getBoundingClientRect();
     const status = actions.querySelector<HTMLElement>("#chat-composer-status")!.getBoundingClientRect();
     const bounds = actions.getBoundingClientRect();
     const composer = actions.closest(".chat-composer")!;
@@ -257,16 +263,24 @@ test("composer stays flush with separate Send and Stop on a stable narrow action
       sendTop: send.top,
       sendBottom: send.bottom,
       triggerBottom: trigger.bottom,
+      triggerTop: trigger.top,
+      triggerWidth: trigger.width,
+      triggerHeight: trigger.height,
+      headerTop: header.top,
+      headerBottom: header.bottom,
       statusBottom: status.bottom,
       sendRight: send.right,
       boundsRight: bounds.right,
       margin: style.margin,
     };
   });
-  // Compact touch puts options and submission on one rail, rather than
-  // retaining an empty settings rail; targets themselves are not shrunk.
-  expect(Math.abs(geometry.sendBottom - geometry.triggerBottom)).toBeLessThanOrEqual(2);
-  expect(Math.abs(geometry.statusBottom - geometry.triggerBottom)).toBeLessThanOrEqual(2);
+  // Options has one stable header target; status and submission retain their
+  // composer rail without an empty settings row or shrunken touch targets.
+  expect(geometry.triggerTop).toBeGreaterThanOrEqual(geometry.headerTop);
+  expect(geometry.triggerBottom).toBeLessThanOrEqual(geometry.headerBottom);
+  expect(geometry.triggerWidth).toBeGreaterThanOrEqual(44);
+  expect(geometry.triggerHeight).toBeGreaterThanOrEqual(44);
+  expect(Math.abs(geometry.statusBottom - geometry.sendBottom)).toBeLessThanOrEqual(2);
   expect(geometry.sendRight).toBeLessThanOrEqual(geometry.boundsRight + 1);
   expect(geometry.margin).toBe("0px");
 
@@ -297,7 +311,7 @@ test("a subagent transcript pushes as a screen and the back gesture pops it", as
 
   await expect(page.locator("#chat-compact-workers")).toBeVisible();
   await page.locator("#chat-compact-workers > summary").click();
-  await page.getByRole("button", { name: "explore · Review renderer" }).click();
+  await inspectTouchWorker(page, "Review renderer");
 
   const drilldown = page.locator("#chat-drilldown");
   await expect(drilldown).toBeVisible();
@@ -367,7 +381,7 @@ test("a request the parent is waiting on stays reachable over the pushed screen"
   // is pushed over it and the card can no longer be reached.
   await expect(page.locator('[data-chat-item-id="permission:p1"]')).toBeVisible();
   await page.locator("#chat-compact-workers > summary").click({ position: { x: 8, y: 8 } });
-  await page.getByRole("button", { name: "explore · Review renderer" }).click();
+  await inspectTouchWorker(page, "Review renderer");
   await expect(page.locator("#chat-drilldown")).toBeVisible();
 
   // Asserted by what is painted, not by `toBeVisible`: the pushed screen
@@ -497,10 +511,11 @@ test("a keyboard the platform pans for is still a keyboard", async ({ page, requ
   await expect(page.locator("#chat-task-list-items")).toBeHidden();
   await expect(page.locator("#chat-subagents-items")).toBeHidden();
   await expect(page.locator("#chat-background-tasks-items")).toBeHidden();
-  // Worker controls yield under the keyboard; the transcript/composer owns
-  // this band. Pending safety is tested separately in the loaded matrix.
+  // Deliberately expanded workers use a sheet, retaining summary/Stop access
+  // without displacing the composer or blurring its draft.
   await expect(page.locator("#chat-task-list summary")).toBeHidden();
-  await expect(page.locator("#chat-compact-workers > summary")).toBeHidden();
+  await expect(page.locator("#chat-compact-workers > summary")).toBeVisible();
+  await expect(page.locator("#chat-compact-workers [data-stop-task]")).toBeVisible();
 });
 
 test("pinch zoom does not collapse progress tracks as a keyboard", async ({ page, request }) => {
@@ -514,7 +529,7 @@ test("pinch zoom does not collapse progress tracks as a keyboard", async ({ page
   await expect(page.locator("html")).not.toHaveAttribute("data-chat-keyboard");
   await expect(surface).toHaveCSS("--chat-visual-height", normalHeight);
   await expect(page.locator("#chat-task-list-items")).toBeVisible();
-  await expect(page.locator("#chat-background-tasks-items")).toBeVisible();
+  await expect(page.locator("#chat-compact-workers-items")).toBeVisible();
   await setVisualViewport(page, { height: 460, offsetTop: 0, scale: 1 });
   await expect(page.locator("html")).toHaveAttribute("data-chat-keyboard", "");
   await expect(page.locator("#chat-task-list-items")).toBeHidden();
@@ -713,8 +728,7 @@ test("answering a request on touch puts the chrome under the keyboard and brings
   })).toBeLessThanOrEqual(1);
   await expect(page.locator("#chat-composer")).toBeVisible();
   await expect(page.locator("#chat-task-list")).toBeVisible();
-  await expect(page.locator("#chat-subagents")).toBeVisible();
-  await expect(page.locator("#chat-background-tasks")).toBeVisible();
+  await expect(page.locator("#chat-compact-workers")).toBeVisible();
 });
 test("the transcript holds still while an answer is typed", async ({ page, request }) => {
   // iOS autoscrolls a scroller natively while a caret or selection handle is
@@ -799,7 +813,7 @@ async function bootAnswerOwner(page: Page, request: APIRequestContext, drilldown
       input: JSON.stringify({ description: "Answer owner", subagent_type: "explore", prompt: "go" }), childConversationId: owner,
     } });
     await page.locator("#chat-compact-workers > summary").click();
-    await page.getByRole("button", { name: "explore · Answer owner" }).click();
+    await inspectTouchWorker(page, "Answer owner");
     await expect(page.locator("#chat-drilldown")).toBeVisible();
   }
   const timeline = page.locator(drilldown ? "#chat-drilldown-timeline" : "#chat-timeline");
@@ -932,7 +946,7 @@ for (const drilldown of [false, true]) {
         input: JSON.stringify({ description: "Answer owner", subagent_type: "explore", prompt: "go" }), childConversationId: owner,
       } });
       await page.locator("#chat-compact-workers > summary").click();
-      await page.getByRole("button", { name: "explore · Answer owner" }).click();
+      await inspectTouchWorker(page, "Answer owner");
       await expect(page.locator("#chat-drilldown")).toBeVisible();
     }
     const timeline = page.locator(drilldown ? "#chat-drilldown-timeline" : "#chat-timeline");

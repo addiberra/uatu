@@ -2,6 +2,8 @@ import { boundedSet } from "../shared/bounded-map";
 import { backgroundTasksByTool } from "./background-tasks";
 import { subagentEntries } from "./timeline-renderer";
 import type { ConversationItem } from "./types";
+import { workerIsActive, workerState, type WorkerState } from "./worker-state";
+import { taskById } from "./task-inspection";
 
 /** Deliberate touch state, independent of the desktop automatic disclosure. */
 export class CompactDisclosure {
@@ -26,39 +28,57 @@ export class CompactDisclosure {
 
 export type CompactWorker = {
   id: string;
-  state: "working" | "finished" | "uncertain";
+  state: WorkerState;
   references: string[];
+  name: string;
+  kind: "agent" | "shell";
+  since: number;
+  settledAt: number;
+  progress?: string;
+  taskId?: string;
+  stoppable?: boolean;
+  conversationId?: string;
 };
 
 /** A projection fold, not another worker lifecycle or a task-id tombstone map. */
 export function compactWorkers(items: readonly ConversationItem[]): CompactWorker[] {
+  const shellTask = (type?: string) => /^(shell|local_bash|bash)$/i.test(type ?? "");
   const aliases = backgroundTasksByTool(items);
   const workers = new Map<string, CompactWorker>();
   for (const item of items) {
     if (item.type !== "background_task") continue;
-    workers.set(item.id, { id: item.id, state: item.stateUncertain ? "uncertain" : item.status === "running" ? "working" : "finished", references: [] });
+    if (item.foreground && shellTask(item.taskType)) continue;
+     workers.set(item.id, {
+       id: item.id, state: workerState(item.status, item.stateUncertain), references: [],
+       name: item.description, kind: shellTask(item.taskType) ? "shell" : "agent",
+       since: item.createdAt, settledAt: item.createdAt + (item.usage?.durationMs ?? 0),
+       progress: item.progress, taskId: item.taskId, stoppable: !item.foreground && taskById(items, item.taskId)?.id === item.id, conversationId: item.childConversationId,
+     });
   }
-  const add = (id: string, status: string, canonical?: string) => {
-    const worker = canonical ? workers.get(canonical) : undefined;
-    if (worker) { worker.references.push(id); return; }
-    workers.set(id, { id, state: status === "running" ? "working" : ["completed", "failed", "stopped", "error", "idle"].includes(status) ? "finished" : "uncertain", references: [id] });
-  };
   for (const entry of subagentEntries(items)) {
     // Only proven launcher aliases can merge occurrences. A child can run
     // repeatedly, so a shared child id alone is not a deduplication key.
     if (workers.has(entry.id)) continue;
-    add(entry.id, entry.status, aliases.get(entry.id)?.id);
+    const item = items.find(item => item.id === entry.id);
+    if (item?.type === "background_task" && shellTask(item.taskType) && item.foreground) continue;
+    const canonical = aliases.get(entry.id);
+    if (canonical) { workers.get(canonical.id)?.references.push(entry.id); continue; }
+    workers.set(entry.id, {
+      id: entry.id, state: workerState(entry.status), references: [entry.id],
+      name: entry.description, kind: "agent", since: item?.createdAt ?? 0,
+      settledAt: item?.createdAt ?? 0, progress: entry.progress, conversationId: entry.conversationId,
+    });
   }
-  for (const item of items) {
-    if (item.type !== "command" && !(item.type === "tool" && /^(shell|bash|local_bash|Bash)$/i.test(item.name))) continue;
-    add(item.id, item.status, aliases.get(item.id)?.id);
-  }
-  return [...workers.values()];
+  return [...workers.values()].sort((a, b) => {
+    const rank = (worker: CompactWorker) => worker.state === "working" ? 0 : worker.state === "unknown" ? 1 : 2;
+    return rank(a) - rank(b) || (workerIsActive(a.state) ? a.since - b.since : b.settledAt - a.settledAt) || a.id.localeCompare(b.id);
+  });
 }
 
 export function workerSummary(workers: readonly CompactWorker[]): string {
   if (!workers.length) return "";
   const count = (state: CompactWorker["state"]) => workers.filter(worker => worker.state === state).length;
-  const uncertain = count("uncertain");
-  return `${count("working")} working · ${count("finished")} finished${uncertain ? ` · ${uncertain} uncertain` : ""}`;
+  const unknown = count("unknown");
+  const finished = workers.filter(worker => !workerIsActive(worker.state)).length;
+  return `${count("working")} working · ${finished} finished${unknown ? ` · ${unknown} unknown` : ""}`;
 }

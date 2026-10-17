@@ -3,9 +3,16 @@ import { parseHTML } from "linkedom";
 
 import { SILENT_RUN_QUIET_MS, SILENT_RUN_REFRESH_MS, SILENT_RUN_SETTLE_READS, SilentRunFollower, TASK_OUTPUT_BACKOFF_MAX_MS, TASK_OUTPUT_REFRESH_MS, TaskInspectionPanel, formatTaskElapsed, runningTaskForChild, taskInspection, taskSettledLabel, taskUsageLabel, type TaskInspectionTimers } from "./task-inspection";
 import type { BackgroundTaskItem, BackgroundTaskOutput } from "./types";
-import { taskForChild } from "./task-inspection";
+import { taskById, taskForChild } from "./task-inspection";
 
 describe("task inspection facts", () => {
+  test("a reused provider id stops only the latest occurrence and opens the selected historical occurrence", () => {
+    const earlier = item({ id: "early", taskId: "reused", status: "completed", createdAt: 1 });
+    const latest = item({ id: "late", taskId: "reused", status: "running", createdAt: 2 });
+    expect(taskById([earlier, latest], "reused")).toBe(latest);
+    expect(taskById([earlier, latest], "reused", "early")).toBe(earlier);
+    expect(taskById([earlier, latest], "reused", "missing")).toBeUndefined();
+  });
   test("historical result and joined launcher inspection retain their occurrence when the child is reused", () => {
     const earlier = item({ id: "task:early", taskId: "early", childConversationId: "child", status: "completed", createdAt: 1, toolUseId: "call-early", toolUseIds: ["call-early", "call-joined"] });
     const latest = item({ id: "task:latest", taskId: "latest", childConversationId: "child", status: "running", createdAt: 2, toolUseId: "call-latest" });

@@ -1,5 +1,6 @@
 import { appUrl } from "../shared/app-url";
 import { backgroundTasksByTool } from "./background-tasks";
+import { workerStateLabel } from "./worker-state";
 import type { BackgroundTaskItem } from "./types";
 import { escapeHtml, escapeHtmlAttribute } from "../shared/html";
 import { loginActionMarkup, type LoginAction } from "./login-action";
@@ -1265,7 +1266,29 @@ export class QueueDockRenderer {
         // Moving the note before the list alone leaves it clipped when the
         // reader was at the bottom. Reveal once on entry into this state;
         // subsequent queue updates must respect the reader's own scrolling.
-        if (!this.replacementWarningShown) target.scrollTop = 0;
+        if (!this.replacementWarningShown) {
+          target.scrollTop = 0;
+          const note = context.note;
+          // The queue may itself sit below live tracks in the aggregate dock.
+          // Reveal the consequence once there too, without panning the surface
+          // or stealing later deliberate dock/transcript scrolling.
+          const reveal = () => {
+            if (!target.isConnected || !this.replacementWarningShown) return;
+            const dock = target.parentElement;
+            if (dock?.clientHeight === 0 && document.documentElement.hasAttribute("data-chat-work-constrained")) dock.dispatchEvent(new Event("chat-work-reveal"));
+            if (!dock?.classList.contains("chat-work-dock") || dock.clientHeight <= 0) return;
+            const warning = note.querySelector(".chat-queue-replacement") ?? note;
+            const bounds = warning.getBoundingClientRect();
+            const visible = dock.getBoundingClientRect();
+            const top = visible.top + dock.clientTop;
+            const bottom = top + dock.clientHeight;
+            if (bounds.top < top) dock.scrollTop += Math.floor(bounds.top - top);
+            else if (bounds.bottom > bottom) dock.scrollTop += Math.ceil(Math.min(bounds.top - top, bounds.bottom - bottom));
+          };
+          // Undo also restores text into the composer, changing the aggregate
+          // space after this renderer returns. Measure that final layout.
+          if (typeof requestAnimationFrame === "function") requestAnimationFrame(reveal);
+        }
       } else if (list.nextElementSibling !== context.note) list.after(context.note);
       this.replacementWarningShown = Boolean(replacementNote);
     }
@@ -1382,7 +1405,7 @@ export function renderItem(item: ConversationItem, open: boolean, activeRequest:
   if (item.type === "background_task") {
     const outcome = item.status === "completed" ? "completed" : item.status === "failed" ? "failed" : item.status === "stopped" ? "cancelled" : "running";
     const body = deferClosed && !open ? "" : `${item.summary ? `<pre class="chat-task-summary">${escapeHtml(item.summary)}</pre>` : ""}${item.toolUseId ? `<p class="chat-tool-meta"><button type="button" data-chat-jump="tool:${escapeHtmlAttribute(item.toolUseId)}">Go to launch</button></p>` : ""}${allowSubagents && item.childConversationId ? `<button type="button" data-open-conversation="${escapeHtmlAttribute(item.childConversationId)}">Open transcript</button>` : ""}`;
-    return activityShell(id, outcome, backgroundTaskLabel(item), item.description, body, open, false, readerClosed, stamp, item.status === "stopped" ? "stopped" : undefined);
+    return activityShell(id, outcome, backgroundTaskLabel(item), item.description, body, open, false, readerClosed, stamp, workerStateLabel(item.status, item.stateUncertain));
   }
   // A wakeup the agent scheduled for itself, drawn at every point of its
   // life: pending with its fire time, fired with a link to the turn it
@@ -1528,7 +1551,7 @@ function renderTool(item: ToolItem, open: boolean, readerClosed: boolean, todo: 
   const subagentCost = detail.kind === "agent" && item.usage?.costUsd ? ` · ${formatUsd(item.usage.costUsd)}` : "";
   const subject = detail.kind === "todo" ? todo?.task : `${toolSubject(detail) ?? ""}${subagentCost}` || undefined;
   const outcome = worker?.status === "stopped" ? "cancelled" : worker?.status ?? item.status;
-  const state = worker?.stateUncertain ? "Status unavailable — reconnecting" : worker?.status === "running" ? "Started in background" : worker?.status;
+  const state = worker ? worker.stateUncertain ? "unknown · Status unavailable — reconnecting" : worker.status === "running" ? "working · Started in background" : workerStateLabel(worker.status) : undefined;
   return activityShell(escapeHtmlAttribute(item.id), outcome, label, subject, body, open, autoOpen(item.status, item.output) && !readerClosed, readerClosed, timestampAttribute(item.createdAt), state ?? activityStatusText(item.status, item.elapsedMs));
 }
 
@@ -1642,7 +1665,7 @@ function activityShell(id: string, status: string, label: string, subject: strin
 /** "Background task finished" / "failed" / "stopped", or "Background task" while it runs. */
 export function backgroundTaskLabel(item: Extract<ConversationItem, { type: "background_task" }>): string {
   const noun = item.taskType === "local_agent" ? "Background agent" : item.taskType === "local_workflow" ? "Background workflow" : "Background task";
-  return item.status === "completed" ? `${noun} finished` : item.status === "failed" ? `${noun} failed` : item.status === "stopped" ? `${noun} stopped` : noun;
+  return item.status === "running" ? noun : `${noun} ${workerStateLabel(item.status, item.stateUncertain)}`;
 }
 
 /** "running · 12s" for a tool the agent reports elapsed time for, else the bare status. */

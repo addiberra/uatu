@@ -840,6 +840,17 @@ test.describe("desktop OpenCode chat", () => {
 });
 
 test("the chat backend starts only when the panel opens", async ({ page, request }) => {
+  // The preceding page's inventory source lingers after disconnect. Reset
+  // restarts retained broker sources, whose catalog read calls status even
+  // without a new browser request. Begin this cold-start test only after the
+  // old source is actually released, rather than resetting its counters early.
+  const inventoryState = async () => {
+    const stats = await control(request, { action: "stats" }) as { inventorySubscribers: number; pendingInventorySubscriptions: number };
+    return { active: stats.inventorySubscribers, pending: stats.pendingInventorySubscriptions };
+  };
+  const beforeRelease = await inventoryState();
+  await expect.poll(inventoryState, { message: "previous page's inventory source released before cold-start reset" }).toEqual({ active: 0, pending: 0 });
+  await test.info().attach("cold-start-isolation", { body: JSON.stringify({ beforeRelease, readyForReset: await inventoryState() }), contentType: "application/json" });
   await request.post("/__e2e/reset");
   const token = await request.get("/__e2e/terminal-token").then(response => response.json()) as { token: string };
   // Chat initializes once the workspace state has loaded and the URL

@@ -143,13 +143,14 @@ test.describe("steering an OpenCode 2.x turn", () => {
     for (let index = 1; index <= 5; index++) await submit(page, `Audit pending ${index}: preserve this longer message for a readable dock`, index > 2 ? "Alt+Enter" : "Enter");
     if (mode === "touch") await page.locator("[data-pending-toggle]").click();
     const queue = page.locator("#chat-queue");
-    await queue.evaluate(element => { element.scrollTop = 0; });
+    const scroller = mode === "touch" ? page.locator("#chat-work-dock") : queue;
+    await scroller.evaluate(element => { element.scrollTop = 0; });
     await expect(queue.locator(".chat-queue-header")).toContainText("5 pending · 2 steers · 3 queued");
-    await expect(queue).toHaveClass(/has-more-below/);
-    const metrics = await queue.evaluate(element => ({ height: element.clientHeight, viewport: innerHeight }));
+    await expect(scroller).toHaveClass(/has-more-below/);
+    const metrics = await scroller.evaluate(element => ({ height: element.clientHeight, viewport: innerHeight }));
     expect(metrics.height).toBeGreaterThan(135);
     expect(metrics.height).toBeLessThanOrEqual(metrics.viewport * 0.4 + 1);
-    await saveEvidence(testInfo, `audit-dock-${mode}-${theme}-metrics.json`, JSON.stringify(await queue.evaluate(element => ({
+    await saveEvidence(testInfo, `audit-dock-${mode}-${theme}-metrics.json`, JSON.stringify(await scroller.evaluate(element => ({
       clientHeight: element.clientHeight,
       scrollHeight: element.scrollHeight,
       header: element.querySelector(".chat-queue-header")?.textContent,
@@ -169,8 +170,8 @@ test.describe("steering an OpenCode 2.x turn", () => {
     await expect(page.locator("#chat-delivery-menu")).toBeVisible();
     await captureScreenshot(page, testInfo, `audit-composer-${mode}-${theme}`);
     await page.keyboard.press("Escape");
-    await queue.evaluate(element => { element.scrollTop = element.scrollHeight; });
-    await expect(queue).not.toHaveClass(/has-more-below/);
+    await scroller.evaluate(element => { element.scrollTop = element.scrollHeight; });
+    await expect(scroller).not.toHaveClass(/has-more-below/);
     await expect(queue.locator(".chat-queue-header")).toBeInViewport();
   });
 
@@ -734,6 +735,12 @@ for (const browserName of ["chromium", "webkit"] as const) test.describe(`steeri
     await page.locator("#chat-send").tap();
     await expect(page.locator("#chat-items")).toContainText("Touch replacement");
     await expect(held(page)).toHaveText([/Held touch work/]);
+    // The echoed replacement is optimistic; finish only after the fake
+    // provider has actually resumed its turn, not while admission is in flight.
+    await expect.poll(async () => {
+      const state = await control(request, { action: "opencode", op: "state" }) as { sessions: Record<string, { running: boolean }> };
+      return state.sessions[conversationId.replace(/^opencode:/, "")]?.running;
+    }).toBe(true);
     await control(request, { action: "opencode", op: "finish", conversationId });
     await expect(page.locator("#chat-items")).toContainText("Held touch work");
   });

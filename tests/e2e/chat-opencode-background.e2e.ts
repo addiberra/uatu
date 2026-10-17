@@ -144,7 +144,7 @@ test("Continue is parent-wide, keeps the draft, and inspection survives worker f
   await expect(report).toContainText("failed");
 });
 
-for (const [workerState, outcome] of [["completed", "completed"], ["error", "failed"], ["cancelled", "stopped"]] as const) {
+for (const [workerState, outcome] of [["completed", "finished"], ["error", "failed"], ["cancelled", "stopped"]] as const) {
   test(`native worker ${workerState} settles independently; Stop acknowledgement is not settlement`, async ({ page, request }) => {
     const conversationId = await boot(page, request);
     const worker = await control(request, { op: "launchWorker", conversationId });
@@ -548,7 +548,7 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`worker cont
     await expect(proceed).toBeVisible();
     await proceed.tap();
     await expect.poll(async () => (await control(request, { op: "state" })).calls.filter((call: string) => call.startsWith("POST ") && call.includes("/background")).length).toBe(1);
-    await expect(page.locator("#chat-background-tasks-items [data-inspect-task]")).toHaveCount(1);
+    await expect(page.locator("#chat-compact-workers-items [data-inspect-task]")).toHaveCount(1);
     await expect(input).toHaveValue("Keep this composing draft");
     await expect(input).toBeFocused();
     await captureScreenshot(page, testInfo, `review-continue-first-touch-${engine}`);
@@ -570,7 +570,7 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`worker cont
     await expect(track).not.toHaveAttribute("open");
     await revealTouchContinue(page);
     await page.getByRole("button", { name: "Continue while workers run", exact: true }).tap();
-    await expect(page.locator("#chat-background-tasks-items [data-inspect-task]")).toHaveCount(1);
+    await expect(page.locator("#chat-compact-workers-items [data-inspect-task]")).toHaveCount(1);
     await expect(track).not.toHaveAttribute("open");
     const state = await control(request, { op: "state" });
     expect(state.calls.filter((call: string) => call.startsWith("POST ") && call.includes("/background"))).toEqual([`POST /api/session/${secondId.replace(/^opencode:/, "")}/background`]);
@@ -589,7 +589,7 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`worker cont
     }
     await revealTouchContinue(page);
     await page.getByRole("button", { name: "Continue while workers run", exact: true }).tap();
-    await expect(page.locator("#chat-background-tasks-items [data-inspect-task]")).toHaveCount(1);
+    await expect(page.locator("#chat-compact-workers-items [data-inspect-task]")).toHaveCount(1);
     if (deliberate) await expect(track).toHaveAttribute("open");
     else await expect(track).not.toHaveAttribute("open");
     await captureScreenshot(page, testInfo, `review-detached-${deliberate ? "deliberate" : "automatic"}-${engine}`);
@@ -625,6 +625,12 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`worker cont
     // target in an 8px gap. It must never choose the destructive Stop.
     if (await page.locator("#chat-drilldown").isVisible()) await page.keyboard.press("Escape");
     await expect(page.locator("#chat-drilldown")).toBeHidden();
+    // Hardware-keyboard Stop keeps focus on the same worker's surviving
+    // inspection action, never a disabled control or the document body.
+    await stop.focus();
+    await page.keyboard.press("Enter");
+    await expect(stop).toBeDisabled();
+    await expect(inspect).toBeFocused();
     // Model the reduced visual viewport of an onscreen keyboard. This checks
     // reachability, not a claim of real iOS/Android keyboard validation.
     await page.locator("#chat-input").focus();

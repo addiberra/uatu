@@ -27,9 +27,11 @@ test("canonical executions fold launcher aliases but keep repeated occurrences a
     { type: "tool", id: "tool:shell", name: "shell", status: "running", input: "fixture" },
   ] as ConversationItem[];
   const workers = compactWorkers(items);
-  expect(workers).toHaveLength(5);
+  expect(workers).toHaveLength(4);
   expect(workers.find(worker => worker.id === "first")?.references).toEqual(["tool:one", "tool:two"]);
-  expect(workerSummary(workers)).toBe("2 working · 2 finished · 1 uncertain");
+  expect(workerSummary(workers)).toBe("1 working · 2 finished · 1 unknown");
+  expect(workers.find(worker => worker.id === "first")?.state).toBe("failed");
+  expect(workers.find(worker => worker.id === "third")?.state).toBe("stopped");
   expect(workerSummary([])).toBe("");
 });
 
@@ -39,5 +41,18 @@ test("pending/generating is not confirmed working and failed tools are finished,
     { type: "command", id: "shell", command: "fixture", status: "error" },
     { type: "text", id: "text", text: "generating" },
   ] as ConversationItem[]);
-  expect(workerSummary(workers)).toBe("0 working · 1 finished · 1 uncertain");
+  expect(workerSummary(workers)).toBe("0 working · 0 finished · 1 unknown");
+});
+
+test("active workers precede newest-first history; only real background shell tasks are workers", () => {
+  const workers = compactWorkers([
+    { type: "background_task", id: "old", taskId: "old", description: "Old result", status: "completed", createdAt: 1 },
+    { type: "background_task", id: "new", taskId: "new", taskType: "local_bash", description: "Background test suite", status: "failed", createdAt: 10 },
+    { type: "command", id: "foreground", command: "pwd", status: "running", createdAt: 11 },
+    { type: "background_task", id: "foreground-shell", taskId: "fg-shell", taskType: "shell", foreground: true, description: "Blocking command", status: "running", createdAt: 11 },
+    { type: "background_task", id: "live", taskId: "live", description: "Live worker", status: "running", createdAt: 12 },
+  ] as ConversationItem[]);
+  expect(workers.map(worker => worker.id)).toEqual(["live", "new", "old"]);
+  expect(workers[1]?.kind).toBe("shell");
+  expect(workers[1]?.name).toBe("Background test suite");
 });

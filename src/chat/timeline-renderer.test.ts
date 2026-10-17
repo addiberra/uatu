@@ -1748,6 +1748,7 @@ describe("background task rows and tool elapsed time", () => {
     expect(host.querySelector('[data-chat-item-id="task:live"]')).toBeNull();
     const row = host.querySelector('[data-chat-item-id="task:completed"]')!;
     expect(row.querySelector("summary > span")?.textContent).toBe("Background task finished");
+    expect(row.querySelector(".chat-activity-status")?.textContent).toBe("finished");
     expect(row.querySelector(".chat-activity-subject")?.textContent).toBe("Sleep for 20 seconds then echo done");
     expect(row.querySelector(".chat-task-summary")?.textContent).toBe("done");
     expect(row.className).toContain("is-completed");

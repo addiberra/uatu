@@ -34,7 +34,7 @@ export function createPersonalChatPreferencesPane(document: Document, window: Wi
       revision = null;
       input.disabled = button.disabled = true;
       status.textContent = "Personal chat preferences are unavailable.";
-      showPersonalError("Personal chat preferences are unavailable. Automatic backgrounding is skipped until they can be read; steering remains available.");
+      showPersonalError("Personal chat preferences are unavailable on this page; it cannot confirm the saved setting. Existing saved preferences may still apply to steering in other tabs or devices. Refresh to confirm before changing the setting.");
     }
   };
   form.onsubmit = async event => {

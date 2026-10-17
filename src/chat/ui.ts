@@ -25,13 +25,14 @@ import { backgroundStatusLabel, backgroundTasksByTool, runningBackgroundTasks } 
 import { pausedStatusLabel, pausedWakeups, pendingWakeups, scheduledStatusLabel, wakeupFireTime } from "./scheduled-wakeups";
 import { RunningWorkDisclosure } from "./running-work-disclosure";
 import { CompactDisclosure, compactWorkers, workerSummary } from "./compact-work";
+import { CompactWorkersView } from "./compact-workers-view";
 import { createTouchChatOptions } from "./touch-options";
 import { SilentRunFollower, TaskInspectionPanel, formatTaskElapsed, taskForChild, taskById, taskInspection, type OpenTaskInspection } from "./task-inspection";
 import { composerRoutineState, formatUsd, latestPlanReport, latestRateLimit, planChip, planHasRows, planName, planReadoutRows, sessionTotalsTitle, standingSentence, usageAsOf, usageStale, type RateLimitStanding } from "./composer-status";
 import { buildPlanRowNodes, currentUsageReport, initUsagePaneControls, noteUsageReport, onUsageChange, onUsageRead, readStatusText, readUsageNow, refreshUsageIfStale, revealUsagePane, usageReadState, usageReadable } from "./usage-pane";
 import { isLiveConversationStatus } from "./types";
 import { hasVerifiedBlockingWork } from "./blocking-work";
-import { automaticBackgroundNote } from "./automatic-background";
+import { AutomaticBackgroundNotices } from "./automatic-background";
 import type { AutomaticBackgroundFeedback, BackgroundTaskItem } from "./types";
 import { contextReadout } from "./context-readout";
 import { buildReceiptRows, buildReceiptTotal, parseReceiptView, receiptHeading, subagentTrackSummary, subagentTranscriptTitle, type ReceiptView } from "./receipt-view";
@@ -405,7 +406,7 @@ export function initChat(api = new ChatApiClient()): void {
   const syncTaskInspection = () => {
     if (!taskPanel || !child?.task) return;
     const owner = projection?.conversationId === child.task.conversationId ? projection : null;
-    taskPanel.sync(owner ? taskById(owner.items, child.task.taskId) : undefined, stoppingTasks.has(child.task.taskId));
+    taskPanel.sync(owner ? taskById(owner.items, child.task.taskId, child.task.itemId) : undefined, stoppingTasks.has(child.task.taskId));
   };
   let childGeneration = 0;
   // A run that streams nothing — the review a typed command launches — or
@@ -1042,47 +1043,43 @@ export function initChat(api = new ChatApiClient()): void {
   const compactWorkerState = new CompactDisclosure();
   const compactPendingState = new CompactDisclosure();
   compactWorkersList?.addEventListener("toggle", () => compactWorkerState.toggled(compactWorkersList.open));
-  const compactShellRows = document.createElement("ul");
-  compactShellRows.className = "chat-compact-shells";
-  const workerHomes = [subagents, backgroundTasks].filter((node): node is HTMLDetailsElement => Boolean(node)).map(node => {
-    const home = document.createComment("desktop worker track");
-    node.before(home);
-    return { node, home };
-  });
+  const compactView = compactWorkersItems ? new CompactWorkersView(compactWorkersItems) : null;
   const syncCompactWork = () => {
     if (!compactWorkersList || !compactWorkersItems || !compactWorkersLabel) return;
     const touch = document.documentElement.dataset.uiMode === "touch";
-    for (const { node, home } of workerHomes) {
-      if (touch) { if (node.parentElement !== compactWorkersItems) compactWorkersItems.append(node); }
-      else if (node.previousSibling !== home) home.after(node);
-    }
     compactWorkersList.hidden = !touch;
     if (!touch) return;
     const workers = compactWorkers(projection?.items ?? []);
     compactWorkersLabel.textContent = workerSummary(workers);
+    compactWorkersLabel.setAttribute("aria-label", `Workers: ${workerSummary(workers)}`);
     compactWorkersList.hidden = workers.length === 0;
     compactWorkersList.open = compactWorkerState.paint(projection?.conversationId ?? null);
-    if (compactShellRows.parentElement !== compactWorkersItems) compactWorkersItems.append(compactShellRows);
-    const shellItems = (projection?.items ?? []).filter(item => workers.some(worker => worker.id === item.id) && (item.type === "command" || item.type === "tool" && /^(shell|bash|local_bash)$/i.test(item.name)));
-    const signature = JSON.stringify(shellItems);
-    if (compactShellRows.dataset.signature === signature) return;
-    compactShellRows.dataset.signature = signature;
-    compactShellRows.replaceChildren(...shellItems.map(item => {
-      const row = document.createElement("li");
-      const button = document.createElement("button");
-      button.type = "button";
-      button.className = "chat-subagent-open";
-      button.dataset.inspectWorkerItem = item.id;
-      button.textContent = item.type === "tool" ? item.input || item.name : item.type === "command" ? item.command : "";
-      const status = document.createElement("span");
-      status.textContent = item.type === "tool" || item.type === "command" ? item.status : "";
-      row.append(button, status);
-      return row;
-    }));
+    compactView?.paint(projection?.conversationId ?? null, workers, stoppingTasks, declares("background-tasks"));
   };
-  compactShellRows.addEventListener("click", event => {
-    const id = (event.target as Element).closest<HTMLElement>("[data-inspect-worker-item]")?.dataset.inspectWorkerItem;
+  compactWorkersItems?.addEventListener("mousedown", event => keepTouchComposerFocus(event));
+  compactWorkersList?.querySelector("summary")?.addEventListener("mousedown", event => keepTouchComposerFocus(event));
+  surface.addEventListener("keydown", event => {
+    const root = document.documentElement;
+    if (event.key !== "Escape" || event.defaultPrevented || !compactWorkersList?.open || child
+      || root.dataset.uiMode !== "touch" || !root.matches("[data-chat-keyboard], [data-chat-short], [data-chat-wide-short]")) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const owned = compactWorkersList.contains(document.activeElement);
+    compactWorkersList.open = false;
+    compactWorkerState.toggled(false);
+    if (owned) compactWorkersList.querySelector<HTMLElement>(":scope > summary")?.focus({ preventScroll: true });
+  });
+  compactWorkersItems?.addEventListener("click", event => {
+    const stop = (event.target as Element).closest<HTMLButtonElement>("[data-stop-task]");
+    if (stop) { if (!stop.disabled) void requestStopTask(stop.dataset.stopTask!, stop, stop.dataset.stopItem); return; }
+    const id = (event.target as Element).closest<HTMLElement>("[data-worker-item]")?.dataset.workerItem;
     if (!id) return;
+    const worker = compactWorkers(projection?.items ?? []).find(worker => worker.id === id);
+    if (!worker) return;
+    const task = worker.taskId ? taskById(projection?.items ?? [], worker.taskId, worker.id) : undefined;
+    const target = task ? taskInspection(task) : undefined;
+    if (task && target && (target.view === "transcript" || taskById(projection?.items ?? [], task.taskId)?.id === task.id)) { inspectTask(task.taskId, task.id); return; }
+    if (worker.conversationId) { openChildConversation(worker.conversationId, worker.name); return; }
     expanded.add(id);
     scheduleRender();
     requestAnimationFrame(() => {
@@ -1132,12 +1129,10 @@ export function initChat(api = new ChatApiClient()): void {
   const continueWorkers = document.querySelector<HTMLButtonElement>("#chat-continue-workers");
   const backgroundFeedback = document.querySelector<HTMLElement>("#chat-background-feedback");
   const backgroundNotes = new Map<string, string>();
-  const automaticNotes = new Map<string, string>();
+  const automaticNotes = new AutomaticBackgroundNotices();
   const actionFeedback = document.querySelector<HTMLElement>("#chat-action-feedback");
-  const recordAutomaticBackground = (conversationId: string, result: AutomaticBackgroundFeedback) => {
-    const note = automaticBackgroundNote(result.automaticBackground);
-    if (note) automaticNotes.set(conversationId, note);
-    else automaticNotes.delete(conversationId);
+  const recordAutomaticBackground = (conversationId: string, operationId: string, result: AutomaticBackgroundFeedback) => {
+    automaticNotes.record(conversationId, operationId, result.automaticBackground);
     syncControls();
   };
   const confirmChatAction = (title: string, message: string, accept: string, invoker?: HTMLElement): Promise<boolean> => {
@@ -1192,11 +1187,10 @@ export function initChat(api = new ChatApiClient()): void {
     // change check, so it is asked before this list's early return.
     syncTaskInspection();
     const touch = document.documentElement.dataset.uiMode === "touch";
-    const entries = projection && declares("background-tasks") ? touch
-      ? projection.items.filter((item): item is BackgroundTaskItem => item.type === "background_task" && !item.foreground)
-      : runningBackgroundTasks(projection.items) : [];
-    for (const item of projection?.items ?? []) {
-      if (item.type === "background_task" && item.status !== "running") stoppingTasks.delete(item.taskId);
+    const entries = projection && declares("background-tasks") && !touch ? runningBackgroundTasks(projection.items) : [];
+    for (const taskId of stoppingTasks) {
+      const current = taskById(projection?.items ?? [], taskId);
+      if (current && current.status !== "running") stoppingTasks.delete(taskId);
     }
     // Ahead of the unchanged-signature return: the rule reads every paint,
     // since the conversation it is keyed on can change under one signature.
@@ -1263,6 +1257,7 @@ export function initChat(api = new ChatApiClient()): void {
       stop.type = "button";
       stop.className = "chat-task-stop";
       stop.dataset.stopTask = entry.taskId;
+      stop.dataset.stopItem = entry.id;
       stop.textContent = stoppingTasks.has(entry.taskId) ? "Stopping…" : declares("background-blocking-work") ? "Stop worker" : "Stop";
       stop.disabled = stoppingTasks.has(entry.taskId) || entry.stateUncertain === true;
       stop.setAttribute("aria-label", declares("background-blocking-work") ? `Stop worker: ${entry.description}` : `Stop ${entry.description}`);
@@ -1281,15 +1276,15 @@ export function initChat(api = new ChatApiClient()): void {
   // One stop path for every control that offers it: the composer row and the
   // drill-down's strip both name the task, and the in-flight guard is shared
   // so neither can send the stop twice.
-  const requestStopTask = async (taskId: string, invoker: HTMLElement) => {
+  const requestStopTask = async (taskId: string, invoker: HTMLElement, itemId?: string) => {
     if (!projection || stoppingTasks.has(taskId)) return;
     const source = projection;
     const task = taskById(source.items, taskId);
-    if (!task || task.status !== "running" || task.stateUncertain) return;
+    if (!task || itemId !== undefined && task.id !== itemId || task.status !== "running" || task.stateUncertain) return;
     if (declares("background-blocking-work") && task.taskType === "shell") {
       if (!await confirmChatAction("Stop shell worker?", "This removes its provider record and output. OpenCode may report failed rather than cancelled; missing output cannot be recovered after reload.", "Stop shell worker", invoker)) return;
       const current = taskById(projection?.items ?? [], taskId);
-      if (projection?.conversationId !== source.conversationId || current?.status !== "running" || current.stateUncertain || stoppingTasks.has(taskId)) return;
+      if (projection?.conversationId !== source.conversationId || current?.id !== task.id || current.status !== "running" || current.stateUncertain || stoppingTasks.has(taskId)) return;
     }
     const asynchronous = declares("background-blocking-work");
     // The agent reports the stop as the task settling, which is what moves
@@ -1297,6 +1292,7 @@ export function initChat(api = new ChatApiClient()): void {
     stoppingTasks.add(taskId);
     paintedBackgroundTasks = null;
     syncBackgroundTasks();
+    syncCompactWork();
     void api.stopTask(source.conversationId, taskId, newRequestId()).catch(async error => {
       stoppingTasks.delete(taskId);
       const message = error instanceof ChatTransportError && error.status !== undefined && error.code !== "operation_outcome_unknown"
@@ -1313,6 +1309,7 @@ export function initChat(api = new ChatApiClient()): void {
       if (!asynchronous) stoppingTasks.delete(taskId);
       paintedBackgroundTasks = null;
       syncBackgroundTasks();
+      syncCompactWork();
     });
   };
   /**
@@ -1320,23 +1317,23 @@ export function initChat(api = new ChatApiClient()): void {
    * agent task, titled as its subagents-track row is, and the task view for
    * a shell task, titled by the command.
    */
-  const inspectTask = (taskId: string) => {
+  const inspectTask = (taskId: string, itemId?: string) => {
     if (!projection) return;
     const source = projection;
-    const task = taskById(source.items, taskId);
+    const task = taskById(source.items, taskId, itemId);
     const target = task ? taskInspection(task) : undefined;
     if (!task || !target) return;
     if (target.view === "transcript") {
       const known = subagentEntries(source.items).some(entry => entry.conversationId === target.conversationId);
-      openChildConversation(target.conversationId, known ? subagentLabelFor(target.conversationId, source) : task.description, false, { conversationId: source.conversationId, taskId, view: "transcript" });
+      openChildConversation(target.conversationId, known ? subagentLabelFor(target.conversationId, source) : task.description, false, { conversationId: source.conversationId, taskId, itemId: task.id, view: "transcript" });
       return;
     }
-    openChildConversation(`task-output:${taskId}`, task.description, false, { conversationId: source.conversationId, taskId, view: "output" });
+    openChildConversation(`task-output:${taskId}`, task.description, false, { conversationId: source.conversationId, taskId, itemId: task.id, view: "output" });
   };
   backgroundTasksItems?.addEventListener("click", event => {
     const target = (event.target as Element | null)?.closest<HTMLButtonElement>("[data-stop-task], [data-inspect-task]");
     if (!target) return;
-    if (target.dataset.stopTask !== undefined) requestStopTask(target.dataset.stopTask, target);
+    if (target.dataset.stopTask !== undefined) requestStopTask(target.dataset.stopTask, target, target.dataset.stopItem);
     else if (target.dataset.inspectTask !== undefined) inspectTask(target.dataset.inspectTask);
   });
   backgroundTasksItems?.addEventListener("mousedown", event => {
@@ -1344,7 +1341,7 @@ export function initChat(api = new ChatApiClient()): void {
   });
   drilldownTask?.addEventListener("click", event => {
     const button = (event.target as Element | null)?.closest<HTMLButtonElement>("[data-stop-task], [data-task-result]");
-    if (button?.dataset.stopTask !== undefined) requestStopTask(button.dataset.stopTask, button);
+    if (button?.dataset.stopTask !== undefined) requestStopTask(button.dataset.stopTask, button, button.dataset.stopItem);
     else if (button?.dataset.taskResult) {
       pendingRequestJump = button.dataset.taskResult;
       closeChildConversation();
@@ -1655,7 +1652,7 @@ export function initChat(api = new ChatApiClient()): void {
     }
     const all = projection ? subagentEntries(projection.items) : [];
     const dismissed = projection ? dismissedSubagents(projection.conversationId) : new Set<string>();
-    const entries = all.filter(entry => !dismissed.has(entry.id));
+    const entries = document.documentElement.dataset.uiMode === "touch" ? [] : all.filter(entry => !dismissed.has(entry.id));
     // Finished entries stay listed until dismissed, but they are not running
     // work: only a run that has not settled opens the track.
     const touchBackground = document.documentElement.dataset.uiMode === "touch" && declares("background-blocking-work")
@@ -1665,7 +1662,9 @@ export function initChat(api = new ChatApiClient()): void {
     // their richer subagent track available, but collapsed by default.
     const foregroundRunning = entries.filter(entry => (entry.status === "running" || entry.status === "pending") && (!entry.conversationId || !touchWorkers.has(entry.conversationId))).length;
     discloseSubagents(foregroundRunning, touchBackground.length > 0 && foregroundRunning === 0);
-    const signature = entries
+    // Touch has no desktop rows, but its open inspection still follows live
+    // launcher metadata (including the child's model/cost attribution).
+    const signature = `${document.documentElement.dataset.uiMode}:` + (document.documentElement.dataset.uiMode === "touch" ? all : entries)
       .map(entry => [entry.id, entry.status, entry.subagent ?? "", entry.description, entry.conversationId ?? "", entry.model ?? "", entry.usage ? String(totalTokens(entry.usage)) : "", entry.usage?.costUsd ?? "", entry.progress ?? ""].join("\u0001"))
       .join("\u0002");
     if (signature === paintedSubagents) return;
@@ -2050,6 +2049,7 @@ export function initChat(api = new ChatApiClient()): void {
     }
     applyFocusAfterPaint(renderer, items);
     reconcileAnswerAfterPaint();
+    syncDesktopWorkLayout();
   };
 
   const scheduleRender = (newContent = false, captureCurrent = true, incremental = false) => {
@@ -2874,6 +2874,7 @@ export function initChat(api = new ChatApiClient()): void {
     const status = projection?.status ?? null;
     if (status !== lastStatus) {
       composerNote = null;
+      if (projection) automaticNotes.clearSuccessful(projection.conversationId);
       lastStatus = status;
     }
     const running = isLiveConversationStatus(projection?.status);
@@ -2891,12 +2892,16 @@ export function initChat(api = new ChatApiClient()): void {
     // an empty draft sendable (image-only prompts are accepted end to end),
     // and an upload still in flight counts — submission waits for it.
     const activeId = activeConversationId();
+    if (activeId && !running
+      && !projection?.items.some(item => item.type === "background_task" && item.status === "running")) {
+      automaticNotes.clearSuccessful(activeId);
+    }
     const hasContent = Boolean(input.value.trim()) || currentPendingAttachments().length > 0
       || (activeId !== null && attachmentStaging.has(activeId));
     send.disabled = submitting || cancelling || !projection || !hasContent;
     if (stop) {
       stop.disabled = cancelling || !projection || !running;
-      const workers = declares("background-blocking-work") && projection?.items.some(item => item.type === "background_task");
+      const workers = declares("background-blocking-work") && projection?.items.some(item => item.type === "background_task" && item.status === "running");
       stop.classList.toggle("has-worker-scope", declares("background-blocking-work"));
       stop.setAttribute("aria-label", workers ? "Stop parent" : "Stop response");
       stop.textContent = workers ? "Stop parent" : "Stop";
@@ -2915,7 +2920,7 @@ export function initChat(api = new ChatApiClient()): void {
       if (backgroundFeedback && backgroundFeedback.textContent !== note) backgroundFeedback.textContent = note;
     }
     if (actionFeedback) {
-      const note = activeId ? automaticNotes.get(activeId) ?? "" : "";
+      const note = activeId ? automaticNotes.text(activeId) : "";
       actionFeedback.hidden = !note;
       if (actionFeedback.textContent !== note) actionFeedback.textContent = note;
     }
@@ -3656,9 +3661,9 @@ export function initChat(api = new ChatApiClient()): void {
   // elsewhere, or a stale echo a reload left behind — so the local copy
   // reconciles to that instead of stranding buttons that can only ever 409;
   // and a 409 carrying the already-delivered code is said as such ("Too late").
-  const queueActionFailed = (error: unknown, conversationId: string, messageId: string, steerAction: boolean) => {
+  const queueActionFailed = (error: unknown, conversationId: string, messageId: string, steerAction: boolean, operationId: string) => {
     if (error instanceof ChatTransportError && (error.code === "operation_outcome_unknown" || steerAction && (error.status === undefined || error.status >= 500)) || error instanceof ChatConnectionInterruptedError) {
-      automaticNotes.set(conversationId, "Steer/resume acceptance unconfirmed. Refreshing status; do not repeat this action.");
+      automaticNotes.unconfirmed(conversationId, operationId, "Steer/resume acceptance unconfirmed. Refreshing status; do not repeat this action.");
       syncControls();
       void refreshSelectedConversation(conversationId);
       return;
@@ -3738,28 +3743,32 @@ export function initChat(api = new ChatApiClient()): void {
       && !await confirmChatAction("Send queued message now?", `This also sends all ${pausedSteers} paused steer${pausedSteers === 1 ? "" : "s"}. Other queued messages stay held.`, "Send now", target)) return;
     if (projection?.conversationId !== conversationId || !projection.queued.some(candidate => candidate.id === messageId)) return;
     target.disabled = true;
+    const operationId = newRequestId();
     const operation: Promise<unknown> = queueRemove !== undefined
-      ? api.removeQueued(conversationId, messageId, newRequestId())
+      ? api.removeQueued(conversationId, messageId, operationId)
       : queueEdit !== undefined
-        ? api.removeQueued(conversationId, messageId, newRequestId()).then(() => { if (entry) loadIntoComposer(conversationId, entry); })
+        ? api.removeQueued(conversationId, messageId, operationId).then(() => { if (entry) loadIntoComposer(conversationId, entry); })
         : queueSteer !== undefined
-          ? api.changeDelivery(conversationId, messageId, newRequestId(), "steer")
+          ? api.changeDelivery(conversationId, messageId, operationId, "steer")
           : queueQueue !== undefined
-            ? api.changeDelivery(conversationId, messageId, newRequestId(), "queue")
-            : api.sendNow(conversationId, messageId, newRequestId());
+            ? api.changeDelivery(conversationId, messageId, operationId, "queue")
+            : api.sendNow(conversationId, messageId, operationId);
     void operation
       .then(result => {
-        if (result && typeof result === "object") recordAutomaticBackground(conversationId, result as AutomaticBackgroundFeedback);
+        if (result && typeof result === "object") recordAutomaticBackground(conversationId, operationId, result as AutomaticBackgroundFeedback);
         if (activeConversationId() !== conversationId) return;
         noteComposer(queueRemove !== undefined ? "Pending message removed" : queueEdit !== undefined ? "Pending message moved to composer" : queueQueue !== undefined ? "Message moved to queue" : queueSteer !== undefined ? "Message sent as steer" : entry?.delivery === "steer" ? `${pausedSteers} paused steers sent` : "Queued message sent now", true);
       })
-      .catch(error => queueActionFailed(error, conversationId, messageId, steerAction))
+      .catch(error => queueActionFailed(error, conversationId, messageId, steerAction, operationId))
       .finally(() => { target.disabled = false; });
   });
 
   function syncQueueOverflow() {
     if (!queueDockElement) return;
-    queueDockElement.classList.toggle("has-more-below", queueDockElement.scrollHeight - queueDockElement.clientHeight - queueDockElement.scrollTop > 1);
+    const touch = document.documentElement.dataset.uiMode === "touch";
+    const scroller = touch ? queueDockElement.parentElement! : queueDockElement;
+    if (touch) queueDockElement.classList.remove("has-more-below");
+    scroller.classList.toggle("has-more-below", scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop > 1);
   }
   queueDockElement.addEventListener("scroll", syncQueueOverflow, { passive: true });
 
@@ -4334,7 +4343,7 @@ export function initChat(api = new ChatApiClient()): void {
     const previous = child;
     if (!previous) {
       childInvoker = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-      const attribute = ["data-inspect-task", "data-open-conversation"].find(name => childInvoker?.hasAttribute(name));
+      const attribute = ["data-worker-item", "data-inspect-task", "data-open-conversation"].find(name => childInvoker?.hasAttribute(name));
       const row = childInvoker?.closest<HTMLElement>("[data-chat-item-id]")?.dataset.chatItemId;
       childInvokerSelector = attribute ? `${row ? `[data-chat-item-id="${CSS.escape(row)}"] ` : ""}[${attribute}="${CSS.escape(childInvoker!.getAttribute(attribute)!)}"]` : null;
     }
@@ -4357,7 +4366,7 @@ export function initChat(api = new ChatApiClient()): void {
     if (taskPanel) {
       if (link) {
         const owner = projection?.conversationId === link.conversationId ? projection : null;
-        taskPanel.show(link, owner ? taskById(owner.items, link.taskId) : undefined, stoppingTasks.has(link.taskId));
+        taskPanel.show(link, owner ? taskById(owner.items, link.taskId, link.itemId) : undefined, stoppingTasks.has(link.taskId));
       } else taskPanel.close();
     }
     // A task's output view has no transcript: the timeline stays out of the
@@ -4625,7 +4634,7 @@ export function initChat(api = new ChatApiClient()): void {
     // Captured for the round trip: a failure landing after a switch belongs
     // to the conversation whose turn was being cancelled.
     const conversationId = projection.conversationId;
-    if (document.documentElement.dataset.uiMode === "touch" && declares("background-blocking-work") && projection.items.some(item => item.type === "background_task")) {
+    if (document.documentElement.dataset.uiMode === "touch" && declares("background-blocking-work") && projection.items.some(item => item.type === "background_task" && item.status === "running")) {
       if (!await confirmChatAction("Stop parent?", "Stops the parent and its still-blocking foreground work. Detached workers continue; their later notifications can wake the parent again.", "Stop parent", stop)) return;
       if (projection?.conversationId !== conversationId || !isLiveConversationStatus(projection.status) || cancelling) return;
     }
@@ -5068,7 +5077,7 @@ export function initChat(api = new ChatApiClient()): void {
         scheduleRender(true);
       }
       noteComposer(accepted.pending ? accepted.delivery === "steer" ? "Steer sent — joins the turn at its next step" : "Queued — sends when the agent is ready" : "Message accepted");
-      recordAutomaticBackground(conversationId, accepted);
+      recordAutomaticBackground(conversationId, requestId, accepted);
       // Addressed to the submitted conversation, not the selection: the
       // acceptance may land after a switch, and clearing the selected
       // conversation's own error would erase an unrelated reason.
@@ -5087,7 +5096,7 @@ export function initChat(api = new ChatApiClient()): void {
           projection = markDraftUnconfirmed(projection, requestId);
           scheduleRender();
         }
-        automaticNotes.set(conversationId, "Steer acceptance unconfirmed. Refreshing status; do not repeat this input.");
+        automaticNotes.unconfirmed(conversationId, requestId, "Steer acceptance unconfirmed. Refreshing status; do not repeat this input.");
         for (const staged of stagedAttachments) URL.revokeObjectURL(staged.previewUrl);
         releaseAttachmentReserve();
         submitting = false;
@@ -5131,9 +5140,92 @@ export function initChat(api = new ChatApiClient()): void {
     syncControls();
   });
   const workDock = document.querySelector<HTMLElement>("#chat-work-dock");
+  function syncDesktopWorkLayout() {
+    if (!surface || !form || !input || typeof getComputedStyle !== "function") return;
+    const root = document.documentElement;
+    const dock = surface.querySelector<HTMLElement>("#chat-work-dock");
+    const toggle = surface.querySelector<HTMLButtonElement>("#chat-work-toggle");
+    const close = surface.querySelector<HTMLButtonElement>("#chat-work-close");
+    const transcript = surface.querySelector<HTMLElement>(".chat-transcript-area");
+    if (!dock || !toggle || !close || !transcript) return;
+    const desktop = root.dataset.uiMode === "desktop";
+    if (!desktop) {
+      for (const attribute of ["data-chat-has-work", "data-chat-work-constrained", "data-chat-work-expanded"]) root.removeAttribute(attribute);
+      toggle.hidden = close.hidden = true;
+      return;
+    }
+    const hasWork = [...dock.children].some(child => child !== close && !(child as HTMLElement).hidden && getComputedStyle(child).display !== "none");
+    root.toggleAttribute("data-chat-has-work", hasWork);
+    const fixed = [...surface.children].reduce((height, child) => {
+      if (child === dock || child === transcript) return height;
+      const css = getComputedStyle(child);
+      if (css.display === "none" || ["absolute", "fixed"].includes(css.position)) return height;
+      return height + child.getBoundingClientRect().height + (parseFloat(css.marginTop) || 0) + (parseFloat(css.marginBottom) || 0);
+    }, 0);
+    const floor = parseFloat(getComputedStyle(transcript).minHeight) || 0;
+    const minimum = parseFloat(getComputedStyle(dock).minHeight) || 52;
+    const constrained = hasWork && surface.clientHeight - fixed - floor < minimum;
+    root.toggleAttribute("data-chat-work-constrained", constrained);
+    if (!constrained) {
+      root.removeAttribute("data-chat-work-expanded");
+      if (document.activeElement === close) (dock.querySelector<HTMLElement>("[data-inspect-task]") ?? input).focus({ preventScroll: true });
+    }
+    const open = constrained && root.hasAttribute("data-chat-work-expanded");
+    toggle.hidden = !constrained || open;
+    close.hidden = !open;
+    toggle.setAttribute("aria-expanded", String(open));
+    if (desktop) {
+      const top = surface.querySelector(".chat-header")!.getBoundingClientRect().bottom - surface.getBoundingClientRect().top;
+      dock.style.setProperty("--chat-workers-top", `${top}px`);
+      dock.style.setProperty("--chat-workers-bottom", `${surface.getBoundingClientRect().bottom - form.getBoundingClientRect().top}px`);
+    }
+  }
+  const expandDesktopWork = (focus = true) => {
+    if (!document.documentElement.hasAttribute("data-chat-work-constrained")) return;
+    document.documentElement.setAttribute("data-chat-work-expanded", "");
+    syncDesktopWorkLayout();
+    if (focus) surface.querySelector<HTMLElement>("#chat-work-close")?.focus({ preventScroll: true });
+  };
+  const closeDesktopWork = () => {
+    document.documentElement.removeAttribute("data-chat-work-expanded");
+    syncDesktopWorkLayout();
+    surface.querySelector<HTMLElement>("#chat-work-toggle")?.focus({ preventScroll: true });
+  };
+  surface.querySelector("#chat-work-toggle")?.addEventListener("click", () => expandDesktopWork());
+  surface.querySelector("#chat-work-close")?.addEventListener("click", closeDesktopWork);
+  workDock?.addEventListener("chat-work-reveal", () => expandDesktopWork(false));
+  workDock?.addEventListener("focusin", () => {
+    if (document.documentElement.dataset.uiMode !== "desktop" || typeof requestAnimationFrame !== "function") return;
+    requestAnimationFrame(() => {
+      const focused = document.activeElement as HTMLElement | null;
+      if (!focused || !workDock.contains(focused)) return;
+      const css = getComputedStyle(focused);
+      const ring = (parseFloat(css.outlineWidth) || 0) + Math.max(0, parseFloat(css.outlineOffset) || 0);
+      // Native focus scrolling exposes the border box, not its exterior ring.
+      // Correct only this explicit focus move, inside each work scroller.
+      for (let parent = focused.parentElement; parent; parent = parent.parentElement) {
+        if (/(auto|scroll|hidden)/.test(getComputedStyle(parent).overflowY)) {
+          const box = focused.getBoundingClientRect();
+          const top = parent.getBoundingClientRect().top + parent.clientTop;
+          const bottom = top + parent.clientHeight;
+          if (box.top - ring < top) parent.scrollTop += Math.floor(box.top - ring - top);
+          else if (box.bottom + ring > bottom) parent.scrollTop += Math.ceil(box.bottom + ring - bottom);
+        }
+        if (parent === workDock) break;
+      }
+    });
+  });
+  surface.addEventListener("keydown", event => {
+    if (event.key === "Escape" && !event.defaultPrevented && document.documentElement.hasAttribute("data-chat-work-expanded")) {
+      if (surface.querySelector("dialog[open], #chat-drilldown:not([hidden])")) return;
+      event.preventDefault(); event.stopPropagation(); closeDesktopWork();
+    }
+  });
+  workDock?.addEventListener("scroll", syncQueueOverflow, { passive: true });
   let dockHeight: number | null = null;
   let dockGrowth: Animation | null = null;
   const observer = typeof ResizeObserver === "function" ? new ResizeObserver(() => {
+    syncDesktopWorkLayout();
     syncQueueOverflow();
     if (workDock && document.documentElement.dataset.uiMode === "touch") {
       // Text enlargement can make fixed chrome taller than its percentage
@@ -5141,6 +5233,9 @@ export function initChat(api = new ChatApiClient()): void {
       const header = surface.querySelector<HTMLElement>(".chat-header");
       const available = `${Math.max(0, surface.clientHeight - form.getBoundingClientRect().height - (header?.getBoundingClientRect().height ?? 0) - 48)}px`;
       if (workDock.style.getPropertyValue("--chat-work-available") !== available) workDock.style.setProperty("--chat-work-available", available);
+      workDock.style.setProperty("--chat-workers-bottom", `${form.getBoundingClientRect().height}px`);
+      const headerBottom = (header?.getBoundingClientRect().bottom ?? surface.getBoundingClientRect().top) - surface.getBoundingClientRect().top;
+      workDock.style.setProperty("--chat-workers-top", `${Math.max(0, headerBottom)}px`);
     }
     if (workDock && !dockGrowth) {
       const height = workDock.getBoundingClientRect().height;

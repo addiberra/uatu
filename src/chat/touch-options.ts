@@ -1,14 +1,17 @@
 import { onUiModeChange } from "../shell/ui-mode";
 
 /** One touch layer; existing controls keep their handlers and capability gates. */
-export function createTouchChatOptions(openConfiguration: () => void): void {
+export function createTouchChatOptions(openConfiguration: () => void): (() => void) | undefined {
   const toggle = document.querySelector<HTMLButtonElement>("#chat-options-toggle");
   const menu = document.querySelector<HTMLElement>("#chat-options-menu");
   const content = document.querySelector<HTMLElement>("#chat-options-content");
   const backdrop = document.querySelector<HTMLElement>("#chat-options-backdrop");
   const configuration = document.querySelector<HTMLButtonElement>("#chat-options-configuration");
   const original = document.querySelector<HTMLButtonElement>("#chat-configuration-trigger");
+  const header = document.querySelector<HTMLElement>("#chat-header-options");
   if (!toggle || !menu || !content || !backdrop || !configuration || !original) return;
+  const toggleHome = document.createComment("composer options control");
+  toggle.before(toggleHome);
   const homes = ["chat-attach", "chat-context-usage", "chat-background-action", "chat-composer-chips"].flatMap(id => {
     const node = document.getElementById(id);
     if (!node) return [];
@@ -46,11 +49,18 @@ export function createTouchChatOptions(openConfiguration: () => void): void {
   const layout = () => {
     const touch = document.documentElement.dataset.uiMode === "touch";
     for (const { node, home } of homes) {
-      if (touch) content.append(node); else home.after(node);
+      if (touch) { if (node.parentElement !== content) content.append(node); }
+      else if (node.previousSibling !== home) home.after(node);
     }
+    // Keep one stable header target throughout keyboard motion. Moving this
+    // control only when the device UI mode changes avoids a moving tap target.
+    const ownedFocus = document.activeElement === toggle;
+    if (touch && header) { if (toggle.parentElement !== header) header.append(toggle); }
+    else if (toggle.previousSibling !== toggleHome) toggleHome.after(toggle);
+    if (touch && ownedFocus) toggle.focus({ preventScroll: true });
     if (!touch) close();
   };
-  layout(); onUiModeChange(layout);
+  layout(); const stopMode = onUiModeChange(layout);
   toggle.addEventListener("mousedown", event => {
     if (document.activeElement?.id === "chat-input") event.preventDefault();
   });
@@ -93,4 +103,10 @@ export function createTouchChatOptions(openConfiguration: () => void): void {
     const node = document.getElementById(id); if (node) observer?.observe(node);
   }
   window.visualViewport?.addEventListener("resize", measure);
+  // A mobile pagehide can freeze a page that will be reused. Keep its
+  // observers subscribed; explicit disposal is only for actual teardown.
+  return () => {
+    close(); stopMode(); observer?.disconnect();
+    window.visualViewport?.removeEventListener("resize", measure);
+  };
 }

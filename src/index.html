@@ -721,6 +721,7 @@
               <h2 id="chat-title" class="sr-only">Chat</h2>
             </div>
             <div class="chat-conversation-controls">
+              <span id="chat-header-options" class="chat-header-options"></span>
               <label class="sr-only" for="chat-conversation-select">Conversation</label>
               <select id="chat-conversation-select" aria-label="Conversation"></select>
               <button id="chat-conversation-unseen-count" class="chat-conversation-unseen-count" type="button" hidden>
@@ -763,6 +764,7 @@
                the pinned tracks, the outstanding-request pill, and the
                composer below stay the parent's and stay live. -->
           <div class="chat-transcript-area">
+            <button id="chat-work-toggle" class="chat-work-toggle chat-secondary-button" type="button" aria-controls="chat-work-dock" aria-expanded="false" hidden>Show work</button>
             <div id="chat-timeline" class="chat-timeline" role="log" aria-live="polite" aria-relevant="additions text" tabindex="0">
               <button id="chat-load-older" class="chat-secondary-button chat-load-older" type="button" hidden>Load older messages</button>
               <div id="chat-items"></div>
@@ -818,8 +820,9 @@
             <button id="chat-requests-jump" class="chat-requests-jump" type="button" hidden></button>
           </div>
           <nav id="chat-prompt-rail" class="chat-prompt-rail" aria-label="Jump to a prompt" hidden></nav>
-          <div id="chat-work-dock" class="chat-work-dock">
-          <details id="chat-compact-workers" class="chat-task-list chat-compact-workers" hidden>
+          <div id="chat-work-dock" class="chat-work-dock" role="region" aria-label="Work and pending messages">
+          <button id="chat-work-close" class="chat-work-close chat-secondary-button" type="button" hidden>Close work</button>
+          <details id="chat-compact-workers" class="chat-compact-workers" hidden>
             <summary id="chat-compact-workers-label"></summary>
             <div id="chat-compact-workers-items"></div>
           </details>
@@ -887,8 +890,10 @@
                  uploaded at attach time and referenced by id at send. -->
             <div id="chat-attachments" class="chat-attachments" role="list" aria-label="Pending attachments" hidden></div>
             <textarea id="chat-input" rows="1" placeholder="Send a message…" aria-describedby="chat-composer-error" aria-controls="chat-command-menu" aria-expanded="false" aria-autocomplete="list"></textarea>
-            <p id="chat-composer-error" class="chat-composer-error" hidden></p>
-            <p id="chat-action-feedback" class="chat-composer-error is-notice" role="status" aria-live="polite" hidden></p>
+            <div id="chat-composer-notices" class="chat-composer-notices" role="region" aria-label="Composer feedback and errors; scroll for all messages" tabindex="0">
+              <p id="chat-action-feedback" class="chat-composer-error is-notice" role="status" aria-live="polite" hidden></p>
+              <p id="chat-composer-error" class="chat-composer-error" hidden></p>
+            </div>
             <input id="chat-attach-input" type="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden>
             <div class="chat-composer-actions">
               <button id="chat-options-toggle" class="chat-options-toggle" type="button" aria-label="Chat options" aria-haspopup="dialog" aria-controls="chat-options-menu" aria-expanded="false">⋯</button>

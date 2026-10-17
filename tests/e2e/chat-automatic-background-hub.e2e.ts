@@ -38,6 +38,29 @@ test("trusted personal ON backgrounds once after actual composer steer admission
   expect(mutations.filter(call => call.includes("/prompt"))).toHaveLength(2);
   expect(mutations.filter(call => call.includes("/interrupt"))).toHaveLength(0);
   await expect(page.locator("#chat-input")).toHaveValue("");
+  await childChatControl(workspace, { action: "opencode", op: "finish", conversationId });
+  await expect(page.locator("#chat-stop")).toBeDisabled();
+  await expect(page.locator("#chat-action-feedback")).toBeHidden();
+});
+
+test("a Settings-only read failure does not promise saved ON automation is disabled in another tab", async ({ hub, hubContext }) => {
+  const { workspace, page, conversationId } = await setup(hub, hubContext);
+  const settings = await hubContext.newPage();
+  await settings.route("**/api/hub/settings/chat-preferences", route => route.request().method() === "GET"
+    ? route.fulfill({ status: 503, json: { error: "browser-specific read unavailable" } }) : route.fallback());
+  await settings.goto(`${hub.origin}/settings`);
+  const error = settings.locator("#personal-chat-preferences-error");
+  await expect(error).toContainText("cannot confirm");
+  await expect(error).toContainText("saved preferences may still apply");
+  await expect(error).not.toContainText("is skipped");
+  await expect(settings.getByLabel("Automatically background blocking work when steering")).toBeDisabled();
+  await childChatControl(workspace, { action: "opencode", op: "launchShell", conversationId, background: false });
+  await page.locator("#chat-input").fill("Steer under the saved server policy");
+  await page.locator("#chat-send").click();
+  await expect(page.locator("#chat-action-feedback")).toContainText("background request acknowledged");
+  const state = await childChatControl(workspace, { action: "opencode", op: "state" }) as { calls: string[] };
+  expect(state.calls.filter(call => call.startsWith("POST ") && call.includes("/background"))).toHaveLength(1);
+  await expect(error).toContainText("saved preferences may still apply");
 });
 
 test("one accepted Hub steer backgrounds all eligible shells and children, not already detached work", async ({ hub, hubContext }) => {
@@ -165,6 +188,9 @@ for (const outcome of ["lost-primary", "lost-background", "refused-background"] 
   const mutations = state.calls.slice(before.calls.length).filter(call => call.startsWith("POST "));
   expect(mutations.filter(call => call.includes("/prompt"))).toHaveLength(1);
   expect(mutations.filter(call => call.includes("/background"))).toHaveLength(outcome === "lost-primary" ? 0 : 1);
+  await childChatControl(workspace, { action: "opencode", op: "finish", conversationId });
+  await expect(page.locator("#chat-stop")).toBeDisabled();
+  await expect(page.locator("#chat-action-feedback")).toContainText(outcome === "lost-primary" ? "unconfirmed" : outcome === "lost-background" ? "could not be confirmed" : "was refused");
 });
 
 test("same-account devices share retained receipts while a stale ON display cannot override saved OFF", async ({ hub, hubContext, browser }) => {

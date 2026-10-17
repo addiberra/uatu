@@ -45,6 +45,9 @@ test("personal preferences show confirmed saved state, conflicts and unavailable
   failure = true;
   await pane.reload();
   expect(error.textContent).toContain("unavailable");
+  expect(error.textContent).toContain("cannot confirm");
+  expect(error.textContent).toContain("saved preferences may still apply");
+  expect(error.textContent).not.toContain("is skipped");
   expect(input.disabled).toBe(true);
   pane.stop();
 });

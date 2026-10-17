@@ -11,6 +11,7 @@
 // Timers are injected so the lifecycle can be tested without waiting.
 
 import { formatTokens } from "./usage";
+import { workerStateLabel } from "./worker-state";
 import type { BackgroundTaskItem, BackgroundTaskOutput, BackgroundTaskUsage, ConversationItem } from "./types";
 
 /** Where selecting a running task's row leads. */
@@ -47,8 +48,9 @@ export function runningTaskForChild(items: readonly ConversationItem[], conversa
   return items.find((item): item is BackgroundTaskItem => item.type === "background_task" && item.status === "running" && item.childConversationId === conversationId);
 }
 
-export function taskById(items: readonly ConversationItem[], taskId: string): BackgroundTaskItem | undefined {
-  return items.find((item): item is BackgroundTaskItem => item.type === "background_task" && item.taskId === taskId);
+export function taskById(items: readonly ConversationItem[], taskId: string, itemId?: string): BackgroundTaskItem | undefined {
+  const tasks = items.filter((item): item is BackgroundTaskItem => item.type === "background_task" && item.taskId === taskId);
+  return itemId === undefined ? tasks.sort((a, b) => b.createdAt - a.createdAt || b.id.localeCompare(a.id))[0] : tasks.find(item => item.id === itemId);
 }
 
 /** "0:07" / "1:05" / "1:02:03" — a clock, since the strip is watched rather than read once. */
@@ -68,7 +70,7 @@ export function taskUsageLabel(usage: BackgroundTaskUsage): string {
 
 /** Outcome only: the report body belongs to the canonical timeline result. */
 export function taskSettledLabel(task: BackgroundTaskItem): string {
-  return task.status === "completed" ? "finished" : task.status === "failed" ? "failed" : task.status === "stopped" ? "stopped" : "running";
+  return workerStateLabel(task.status, task.stateUncertain);
 }
 
 // How often the output pane re-reads the tail while the task runs. The file
@@ -118,7 +120,7 @@ export type TaskInspectionOptions = {
   timers?: TaskInspectionTimers;
 };
 
-export type OpenTaskInspection = { conversationId: string; taskId: string; view: TaskInspection["view"] };
+export type OpenTaskInspection = { conversationId: string; taskId: string; itemId?: string; view: TaskInspection["view"] };
 
 export class TaskInspectionPanel {
   private readonly hosts: TaskInspectionHosts;
@@ -170,7 +172,7 @@ export class TaskInspectionPanel {
 
   /** Shows the panel for a task; `sync` then keeps it current. */
   show(link: OpenTaskInspection, task: BackgroundTaskItem | undefined, stopping = false): void {
-    if (this.current && (this.current.taskId !== link.taskId || this.current.view !== link.view)) this.close();
+    if (this.current && (this.current.conversationId !== link.conversationId || this.current.taskId !== link.taskId || this.current.itemId !== link.itemId || this.current.view !== link.view)) this.close();
     this.current = link;
     this.following = true;
     this.outputFailures = 0;
@@ -271,6 +273,7 @@ export class TaskInspectionPanel {
       stop.type = "button";
       stop.className = "chat-task-stop";
       stop.dataset.stopTask = task.taskId;
+      stop.dataset.stopItem = task.id;
       const nativeWorker = task.taskType === "agent" || task.taskType === "shell";
       stop.textContent = stopping ? "Stopping…" : nativeWorker ? "Stop worker" : "Stop";
       stop.disabled = stopping;

@@ -5220,6 +5220,48 @@ body.is-resizing-chat .chat-resizer {
 
 .chat-work-dock { display: contents; }
 
+/* Desktop tracks and pending input spend one measured panel budget. The
+   aggregate yields before the transcript/composer, without changing each
+   track's disclosure state or its rem-based expanded-list cap. */
+html[data-ui-mode="desktop"] .chat-work-dock {
+  display: block;
+  flex: 0 1 auto;
+  min-height: 0;
+  max-height: min(calc(var(--chat-panel-height, 0px) * 0.4), 25rem);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+html[data-ui-mode="desktop"][data-chat-has-work] .chat-work-dock {
+  min-height: max(52px, 3.25rem);
+}
+html[data-ui-mode="desktop"] :is(#chat-background-tasks-items, #chat-subagents-items, #chat-task-list-items, #chat-scheduled-wakeups-items) {
+  padding-top: 0.25rem;
+  padding-right: 0.25rem;
+  padding-bottom: 0.25rem;
+  scroll-padding-block: 0.25rem;
+}
+html[data-ui-mode="desktop"] .chat-work-dock { scroll-padding-block: 0.25rem; }
+html[data-ui-mode="desktop"] .chat-work-dock button { scroll-margin-block: 0.25rem; }
+html[data-ui-mode="desktop"] .chat-work-dock button:focus-visible { outline-offset: 0; }
+.chat-work-toggle, .chat-work-close { display: none; }
+html[data-ui-mode="desktop"][data-chat-work-constrained] .chat-work-toggle:not([hidden]) {
+  display: block; position: absolute; z-index: 31; top: 0.25rem; right: 0.5rem;
+  min-height: 44px; min-width: 44px;
+}
+html[data-ui-mode="desktop"][data-chat-work-constrained]:not([data-chat-work-expanded]) .chat-work-dock { display: none; }
+html[data-ui-mode="desktop"][data-chat-work-expanded] .chat-work-dock {
+  position: absolute; z-index: 32;
+  inset: var(--chat-workers-top) 0 var(--chat-workers-bottom);
+  max-height: none;
+  background: var(--surface-raised);
+}
+html[data-ui-mode="desktop"][data-chat-work-expanded] .chat-work-close:not([hidden]) {
+  display: block; min-height: 44px; margin: 0.25rem;
+}
+html[data-ui-mode="desktop"] .chat-transcript-area {
+  min-height: min(12rem, calc(var(--chat-panel-height, 0px) * 0.35));
+}
+
 /* Assistant messages render into `.markdown-body`, which github-markdown-css
    pins at an absolute `font-size: 16px` — no scale on the surface can reach
    it. Scoped to the chat surface (0,2,0 beats the vendored 0,1,0, and we sit
@@ -9192,7 +9234,8 @@ html[data-ui-mode="touch"] .chat-work-dock {
   font-size: 0.8em;
 }
 
-.chat-queue.has-more-below::after {
+.chat-queue.has-more-below::after,
+html[data-ui-mode="touch"] .chat-work-dock.has-more-below::after {
   content: "";
   position: sticky;
   bottom: 0;
@@ -9201,6 +9244,7 @@ html[data-ui-mode="touch"] .chat-work-dock {
   background: linear-gradient(transparent, var(--surface-raised));
   pointer-events: none;
 }
+html[data-ui-mode="touch"] .chat-work-dock.has-more-below::after { display: block; height: 1rem; grid-column: 1 / -1; }
 
 .chat-queue-items:empty {
   display: none;
@@ -9711,7 +9755,7 @@ html[data-chat-keyboard] .chat-reverted-items {
   display: none;
 }
 
-html[data-ui-mode="touch"][data-chat-keyboard] .chat-work-dock > :not(#chat-queue),
+html[data-ui-mode="touch"][data-chat-keyboard] .chat-work-dock > :not(#chat-queue):not(#chat-compact-workers),
 html[data-ui-mode="touch"][data-chat-keyboard] .chat-queue-items,
 html[data-ui-mode="touch"][data-chat-keyboard] .chat-queue-breakdown,
 html[data-ui-mode="touch"][data-chat-keyboard] .chat-queue-model-note,
@@ -10635,7 +10679,7 @@ html[data-ui-mode="touch"]:is([data-chat-compact], [data-chat-wide-short]) .chat
 html[data-ui-mode="touch"]:is([data-chat-compact], [data-chat-wide-short]) .chat-composer-actions { display: contents; }
 html[data-ui-mode="touch"]:is([data-chat-compact], [data-chat-wide-short]) .chat-composer-actions > :not(.chat-send-group) { display: none; }
 html[data-ui-mode="touch"]:is([data-chat-compact], [data-chat-wide-short]) .chat-send-group { flex: 0 0 auto; }
-html[data-ui-mode="touch"][data-chat-wide-short] .chat-work-dock > :not(#chat-queue),
+html[data-ui-mode="touch"][data-chat-wide-short] .chat-work-dock > :not(#chat-queue):not(#chat-compact-workers),
 html[data-ui-mode="touch"][data-chat-wide-short] .chat-queue-items,
 html[data-ui-mode="touch"][data-chat-wide-short] .chat-queue-breakdown,
 html[data-ui-mode="touch"][data-chat-wide-short] .chat-queue-model-note,
@@ -10667,9 +10711,48 @@ html[data-ui-mode="touch"] .chat-conversation-controls select { font-size: 1rem;
    Their existing rows/handlers remain the inspection and mutation owners. */
 .chat-queue-items[hidden] { display: none; }
 .chat-options-toggle, .chat-options-menu, .chat-options-backdrop { display: none; }
+.chat-header-options { display: flex; flex: 0 0 auto; align-items: center; }
+.chat-header-options:empty { display: none; }
 html[data-ui-mode="touch"] .chat-options-toggle { display: inline-flex; align-items: center; justify-content: center; min-width: 44px; min-height: 44px; border: 1px solid var(--border-soft); border-radius: 8px; color: inherit; background: var(--surface); font: inherit; }
 html[data-ui-mode="touch"] .chat-composer-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 html[data-ui-mode="touch"] .chat-options-toggle { flex: 0 0 44px; }
+.chat-composer-notices:not(:has(> :not([hidden]))) { display: none; }
+/* Feedback owns a bounded, keyboard-scrollable band, never the draft's flex
+   remainder. The leading unresolved notice stays visible as work settles. */
+html[data-ui-mode="touch"]:is([data-chat-compact], [data-chat-wide-short]) .chat-composer {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 2px 8px;
+}
+html[data-ui-mode="touch"]:is([data-chat-compact], [data-chat-wide-short]) .chat-composer textarea {
+  grid-column: 1;
+  grid-row: 1;
+  width: 100%;
+  box-sizing: border-box;
+}
+html[data-ui-mode="touch"]:is([data-chat-compact], [data-chat-wide-short]) .chat-send-group {
+  grid-column: 2;
+  grid-row: 1;
+}
+html[data-ui-mode="touch"]:is([data-chat-compact], [data-chat-wide-short]) #chat-send { width: 2.75rem; }
+html[data-ui-mode="touch"]:is([data-chat-compact], [data-chat-wide-short]) .chat-delivery-toggle { width: 4rem; }
+html[data-ui-mode="touch"]:is([data-chat-compact], [data-chat-wide-short]) .chat-composer-notices {
+  grid-column: 1 / -1;
+  grid-row: 2;
+  min-width: 0;
+  max-height: 44px;
+  overflow: auto;
+  overscroll-behavior: contain;
+  overflow-wrap: anywhere;
+}
+html[data-ui-mode="touch"]:is([data-chat-compact], [data-chat-wide-short]) .chat-composer-notices > p { margin: 0; }
+@media (min-width: 600px) {
+  html[data-ui-mode="touch"][data-chat-wide-short] .chat-composer:has(.chat-composer-notices > :not([hidden])) {
+    grid-template-columns: minmax(140px, 1fr) minmax(140px, 25%) auto;
+  }
+  html[data-ui-mode="touch"][data-chat-wide-short] .chat-composer-notices { grid-column: 2; grid-row: 1; }
+  html[data-ui-mode="touch"][data-chat-wide-short] .chat-composer:has(.chat-composer-notices > :not([hidden])) .chat-send-group { grid-column: 3; }
+}
 html[data-ui-mode="touch"] .chat-send-group { margin-left: auto; max-width: 100%; height: auto; min-height: 44px; flex-wrap: wrap; justify-content: flex-end; }
 html[data-ui-mode="touch"] .chat-composer-status { align-self: flex-end; }
 html[data-ui-mode="touch"] #chat-configuration-trigger { display: none; }
@@ -10717,19 +10800,69 @@ html[data-ui-mode="touch"][data-chat-keyboard] #chat-options-content .chat-backg
 .chat-pending-toggle::before { content: "▸ "; }
 .chat-pending-toggle[aria-expanded="true"]::before { content: "▾ "; }
 .chat-pending-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-html[data-ui-mode="touch"] #chat-compact-workers-items > details > summary { display: none; }
-html[data-ui-mode="touch"] #chat-compact-workers-items > details { border: 0; padding: 0; }
-html[data-ui-mode="touch"] #chat-compact-workers-items {
-  max-height: calc(var(--chat-visual-height) * 0.25);
-  overflow: auto;
+/* The dock is the only scroller. Worker rows never inherit desktop tracks. */
+html[data-ui-mode="touch"] :is(#chat-subagents, #chat-background-tasks) { display: none; }
+html[data-ui-mode="touch"] .chat-work-dock :is(.chat-queue, #chat-task-list-items, #chat-scheduled-wakeups-items, .chat-reverted-items) { max-height: none; overflow: visible; }
+.chat-compact-workers { margin: 0 0.5rem; border: 1px solid var(--border-soft); border-radius: 0.65rem; background: var(--surface-raised); font-size: 0.875rem; }
+.chat-compact-workers > summary,
+.chat-workers-history > summary { position: sticky; top: 0; z-index: 2; min-height: 2.75rem; padding: 0.65rem 0.5rem; background: var(--surface-raised); cursor: pointer; font-size: 0.8125rem; }
+.chat-workers-history > summary { top: 2.75rem; z-index: 1; border-top: 1px solid var(--border-soft); }
+#chat-compact-workers-items ul { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 0.5rem; }
+#chat-compact-workers-items { padding: 0 0.5rem 0.5rem; }
+.chat-workers-history { margin-top: 0.5rem; }
+.chat-workers-history[hidden] { display: none; }
+.chat-worker-row { display: flex; align-items: center; gap: 0.5rem; min-width: 0; }
+.chat-worker-inspect { flex: 1 1 0; min-width: 0; min-height: 2.75rem; padding: 0.125rem 0; display: grid; grid-template-columns: 1rem minmax(0, 1fr); column-gap: 0.375rem; border: 0; border-radius: 0.25rem; background: transparent; color: var(--text); text-align: left; font: inherit; cursor: pointer; }
+.chat-worker-glyph { grid-row: 1 / 3; align-self: center; color: var(--text-subtle); }
+.chat-worker-name { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 0.875rem; line-height: 1.25rem; }
+.chat-worker-meta { grid-column: 2; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 0.8125rem; line-height: 1.125rem; color: var(--text-subtle); }
+.chat-worker-row[data-state="working"] .chat-worker-glyph { color: var(--accent); }
+.chat-worker-row[data-state="failed"] .chat-worker-glyph { color: var(--danger, #c44); }
+.chat-worker-row .chat-task-stop { flex: 0 0 auto; min-width: 2.75rem; min-height: 2.75rem; font-size: 0.8125rem; }
+.chat-worker-inspect:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+/* Closed summaries share a band while typing; warnings still span its width.
+   On wide/short screens the worker header shares the conversation header,
+   leaving the original pending/batch warning band and transcript budget intact. */
+html[data-ui-mode="touch"][data-chat-keyboard]:not([data-chat-wide-short]) .chat-work-dock:has(#chat-compact-workers:not([open]):not([hidden])) {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  column-gap: 0.5rem;
+  padding-inline: 0.5rem;
 }
-html[data-ui-mode="touch"] .chat-compact-shells { list-style: none; margin: 0; padding: 0; }
-html[data-ui-mode="touch"] .chat-compact-shells li { display: flex; align-items: center; gap: 8px; }
-html[data-ui-mode="touch"] .chat-worker-outcome { color: var(--text-subtle); font-size: 0.8em; }
-html[data-ui-mode="touch"][data-chat-keyboard] #chat-compact-workers { display: none; }
-@media (max-height: 32rem) and (orientation: landscape) {
-  html[data-ui-mode="touch"] #chat-compact-workers { display: none; }
+html[data-ui-mode="touch"][data-chat-keyboard]:not([data-chat-wide-short]) .chat-work-dock:has(#chat-compact-workers:not([open]):not([hidden])):has(.chat-queue-header [data-queue-send-now]) {
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1.1fr);
 }
+html[data-ui-mode="touch"][data-chat-keyboard]:not([data-chat-wide-short]) .chat-work-dock:has(#chat-compact-workers:not([open]):not([hidden])):not(:has(.chat-queue:not([hidden]))) {
+  grid-template-columns: minmax(0, 1fr);
+}
+html[data-ui-mode="touch"][data-chat-keyboard]:not([data-chat-wide-short]) .chat-work-dock:has(#chat-compact-workers:not([open]):not([hidden])) :is(.chat-queue:not([hidden]), .chat-queue-header) { display: contents; }
+html[data-ui-mode="touch"][data-chat-keyboard]:not([data-chat-wide-short]) .chat-work-dock:has(#chat-compact-workers:not([open]):not([hidden])) .chat-queue-header > button { min-width: 2.75rem; white-space: normal; }
+html[data-ui-mode="touch"][data-chat-keyboard]:not([data-chat-wide-short]) #chat-compact-workers:not([open]) { margin: 0; }
+html[data-ui-mode="touch"][data-chat-keyboard]:not([data-chat-wide-short]) #chat-compact-workers > summary { padding-block: 0.25rem; line-height: 1.125rem; }
+html[data-ui-mode="touch"][data-chat-keyboard]:not([data-chat-wide-short]) .chat-work-dock:has(#chat-compact-workers:not([open]):not([hidden])) .chat-queue-note { grid-column: 1 / -1; }
+html[data-ui-mode="touch"][data-chat-wide-short] .chat-surface:has(#chat-compact-workers:not([open]):not([hidden])) .chat-conversation-controls { padding-inline-end: 13.5rem; }
+html[data-ui-mode="touch"][data-chat-wide-short] #chat-compact-workers:not([open]):not([hidden]) {
+  position: absolute;
+  top: 0;
+  right: max(0.5rem, env(safe-area-inset-right));
+  width: 13rem;
+  margin: 0;
+  border: 0;
+  z-index: 2;
+}
+/* A deliberate expansion overlays the transcript on constrained viewports.
+   Composer/draft and its focus remain owned; no synthetic keyboard blur. */
+html[data-ui-mode="touch"]:not([data-chat-answering]):is([data-chat-keyboard], [data-chat-short], [data-chat-wide-short]) .chat-work-dock:has(#chat-compact-workers[open]:not([hidden])) {
+  position: absolute;
+  z-index: 30;
+  inset: max(var(--chat-workers-top, 44px), env(safe-area-inset-top)) max(0px, env(safe-area-inset-right)) var(--chat-workers-bottom, 7rem) max(0px, env(safe-area-inset-left));
+  max-height: none;
+  background: var(--surface-raised);
+  border-block: 1px solid var(--border-soft);
+}
+/* Interaction forms retain the keyboard band; a worker sheet must never
+   cover the question/permission controls the user is answering. */
+html[data-ui-mode="touch"][data-chat-answering] #chat-compact-workers { display: none; }
 html[data-ui-mode="touch"] .chat-subagent-open { min-height: 2.75rem; }
 html[data-ui-mode="touch"] .chat-surface:has(#chat-work-dock > details[open]:not([hidden])) #chat-prompt-rail {
   visibility: hidden;

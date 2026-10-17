@@ -122,7 +122,9 @@ Other dormant queued messages remain held. Undo's count-only warning explains
 which batch will accompany the replacement, without repeating message text.
 
 On touch screens, work tracks share a bounded, independently scrollable dock.
-Short keyboard/landscape layouts use a single-row composer and compact counts;
+Short keyboard/landscape layouts use compact input controls and counts;
+uncertain feedback has its own scrollable band (a bounded column in landscape),
+so it cannot consume the draft field. Chat options stays in the conversation header.
 paused-batch Send and replacement warnings remain available while typing.
 Dismiss the delivery menu with an outside tap without activating controls below it.
 
@@ -157,30 +159,57 @@ parent is generating or already has detached workers. **What continues?** and
 the button tooltip explain its all-eligible scope. Feedback disappears after
 the parent and workers settle. On touch, Continue and its explanation are in
 **Chat options**, alongside settings/context/usage; configuration opens the
-same single picker after options closes. Worker details remain reachable with
-a hardware keyboard. With the software
-keyboard open, or in short landscape layouts, work tracks and Continue are
-hidden to preserve conversation and composer space; dismiss the keyboard or
-leave short landscape to reach those controls. Pending counts, paused-batch
-Send and replacement warnings remain visible while typing.
+same single picker after options closes. The worker summary remains reachable
+with hardware or software keyboards and in short landscape. Its header keeps
+a 44px touch target; deliberate expansion uses a sheet over the transcript
+when space is constrained, without discarding the draft or forcing keyboard
+blur. Continue retains its existing suppression in software-keyboard and short
+landscape layouts. Pending counts, paused-batch Send and replacement warnings
+remain available while typing.
 Touch has one initially collapsed pending summary and one worker summary.
 Pending counts distinguish steers from queued input; worker counts distinguish
-confirmed working, finished (including failed/stopped), and uncertain
-occurrences, without counting launcher aliases twice. Expanded details retain
-task/cost references, outcomes and inspection. Deliberate expansion is kept per
-conversation within this page's bounded presentation cache; new work and
-settlement do not open details. Replacement/batch warnings, applicable batch
-Send and actionable operation feedback stay outside the collapse. Desktop
+confirmed working, finished (including failed/stopped), and unknown occurrences.
+Counts and rows use the same deduplicated executions: actual background shell
+tasks count, ordinary foreground commands do not. Expansion shows active work
+first, then a separately collapsed **Finished** history ordered newest first
+from available execution timestamps. Rows open inspection or retained results;
+launch references and their costs remain in the transcript/timeline. Names use
+14px type and metadata 13px at the default reading scale, with distinct working,
+unknown, finished, failed and stopped glyphs. **Stop worker** is a separate
+44px target with an 8px gap; unknown execution state disables it.
+Deliberate worker expansion is kept per conversation within this page's bounded
+presentation cache; new work and settlement do not open details.
+Replacement/batch warnings, applicable batch Send and actionable operation
+feedback stay outside the collapse. Only known successful automatic-background
+acknowledgements clear on status change or complete settlement; failed,
+unavailable and unknown guidance remains tied to its source operation; unrelated
+Remove, delivery changes or later successful steers cannot clear it. A Settings
+read failure means that page cannot confirm the saved preference, not that the
+server has disabled a saved ON policy in another tab or device. Desktop
 retains its existing tracks and automatic expansion: detachment collapses only
 an automatically opened duplicate track, not one deliberately reopened.
+Desktop tracks and pending messages share a scrollable aggregate capped at
+40% of the measured chat panel (and 25rem), yielding further to keep the
+composer fully visible and reserve the lesser of 12rem or 35% for the transcript.
+The individual expanded-list rem caps remain. A new replacement warning is
+revealed once within that aggregate after the restored draft has laid out;
+later updates respect deliberate work-dock scrolling.
+Non-empty desktop work reserves at least 52px (3.25rem when larger) so a full
+44px action and visible focus ring can be exposed. The transcript yields to
+its reserved floor first. If the measured remaining space cannot fit that
+minimum, **Show work** opens a scrollable sheet above the composer rather than
+clipping actions; **Close work** or Escape restores the entry. Drafts and
+persistent feedback stay intact. Keyboard focus reveals the complete action
+and ring within the work scrollers, without panning the outer surface.
 
 **Stop parent** affects the current parent execution and its still-blocking
 dependencies, not detached workers. **Stop worker** targets that verified
 worker only. An accepted request stays **Stopping…** until the provider reports
 its outcome. A later provider-owned completion notification can wake the
 parent again; Stop is not a permanent ban on future turns.
-On touch devices, Stop parent with worker records opens an in-app explanation
-and confirmation before cancelling; Cancel leaves all work untouched.
+On touch devices, Stop parent with live worker records opens an in-app explanation
+and confirmation before cancelling; settled history alone neither relabels Stop
+nor triggers that confirmation. Cancel leaves all work untouched.
 
 Stopping a shell removes its provider record and output. If removal prevents
 final capture, OpenCode can report **failed**, even after the process exited.
