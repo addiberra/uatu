@@ -171,6 +171,44 @@ describe("question form interactions", () => {
     expect(input.value).toBe("  custom  ");
   });
 
+  // GitHub #520: every tab of an all-optional step form wore the answered
+  // tick from the start, because an optional question left empty counts as
+  // answered for gating. The tick states a real choice; gating still treats
+  // an optional empty as answerable.
+  test("a step's tick states a real choice, not an optional question left empty", () => {
+    const form = renderForm([
+      choice({ header: "Scope", allowFreeForm: false, optional: true }),
+      choice({ header: "Details", options: [{ label: "X", description: "" }], optional: true }),
+    ]);
+    const tabs = [...form.querySelectorAll<HTMLButtonElement>("[data-question-tab]")];
+    expect(tabs.every(tab => !tab.classList.contains("is-answered"))).toBe(true);
+    // Gating still accepts the all-empty form: optional questions are
+    // answerable as-is.
+    expect(form.querySelector<HTMLButtonElement>("[data-question-primary]")!.disabled).toBe(false);
+
+    const first = form.querySelector<HTMLInputElement>('[data-question-panel="0"] [data-question-provider-option]')!;
+    first.checked = true;
+    syncQuestionControl(first);
+    expect(tabs[0]!.classList.contains("is-answered")).toBe(true);
+    expect(tabs[1]!.classList.contains("is-answered")).toBe(false);
+  });
+
+  // GitHub #520: the whole question used to be readable only inside the
+  // one-line ellipsised tab strip — a provider family maps it into the
+  // header — because the stepped legend was screen-reader-only. The legend
+  // is the question's statement in the panel, visible and full.
+  test("the stepped panel states its question in a visible, full legend", () => {
+    const form = renderForm([
+      choice({ header: "Scope", allowFreeForm: false }),
+      choice({ header: "Details", options: [{ label: "X", description: "" }] }),
+    ]);
+    for (const panel of [...form.querySelectorAll<HTMLElement>("[data-question-panel]")]) {
+      const legend = panel.querySelector<HTMLElement>("legend")!;
+      expect(legend.classList.contains("sr-only")).toBe(false);
+      expect(legend.textContent).toContain(panel.getAttribute("data-question-panel") === "0" ? "Scope" : "Details");
+    }
+  });
+
   test("keeps mirrored parent and drill-down forms independent while retaining child ownership", () => {
     const parent = renderForm([choice()], "child", "parent");
     const child = renderForm([choice()], "child", "child");

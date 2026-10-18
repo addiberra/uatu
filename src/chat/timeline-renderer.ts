@@ -1761,7 +1761,13 @@ function renderQuestion(item: QuestionRequest, open: boolean, active: boolean, o
       ? `<label class="chat-question-option chat-question-custom-option"><input type="${type}" name="${question.multiple ? `q-${index}-custom-choice` : `q-${index}`}" data-question-custom-toggle aria-controls="${escapeHtmlAttribute(customInputId)}" aria-expanded="false"><span class="chat-question-option-text"><span class="chat-question-option-label">Type your own answer</span></span></label><label class="chat-question-custom-editor" data-question-custom-editor for="${escapeHtmlAttribute(customInputId)}" hidden><span class="sr-only">Type your own answer</span><input id="${escapeHtmlAttribute(customInputId)}" name="q-${index}-custom-text" type="text" data-question-custom-input autocomplete="off"></label>`
       : "";
     const hints = [question.multiple ? "choose one or more" : "", question.optional ? "optional" : ""].filter(Boolean);
-    return `<fieldset class="chat-question-panel" data-question-panel="${index}"${question.optional ? ` data-question-optional="true"` : ""}${index === 0 ? "" : " hidden"}><legend${stepped ? ` class="sr-only"` : ""}>${escapeHtml(question.header)}</legend><p>${escapeHtml(question.prompt)}${hints.length ? ` <span class="chat-question-hint">${escapeHtml(hints.join(" · "))}</span>` : ""}</p>${options}${custom}</fieldset>`;
+    // The legend stays visible on every panel: one provider family names the
+    // field with the whole question in it — the long text rides in the
+    // header, the short label in the prompt — so a screen-reader-only legend
+    // left the full question readable nowhere but a one-line ellipsised tab
+    // (GitHub #520). A visible legend wraps it in the panel, for either
+    // mapping's shape.
+    return `<fieldset class="chat-question-panel" data-question-panel="${index}"${question.optional ? ` data-question-optional="true"` : ""}${index === 0 ? "" : " hidden"}><legend>${escapeHtml(question.header)}</legend><p>${escapeHtml(question.prompt)}${hints.length ? ` <span class="chat-question-hint">${escapeHtml(hints.join(" · "))}</span>` : ""}</p>${options}${custom}</fieldset>`;
   }).join("");
   // Same receding as a permission: a resolved question carries its outcome in
   // the summary and drops the answered form. Its prompts stay in the collapsed
