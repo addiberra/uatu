@@ -225,11 +225,13 @@ export function mountMobileHub(root: HTMLElement, backend: MobileHubBackend, cal
       + section("Notifications", destination("notifications", "Notifications", "device", "This device and Hub login"))
       + section("Account", destination("security", "Session Security", "shield", "", "", "purple"));
   }
+  let renderedPage = "";
   function render() {
     if (disposed) return;
     if (sheet) { renderDeferred = true; revalidationNotice(); return; }
     renderDeferred = false;
     const activeAction = page.contains(root.ownerDocument.activeElement) ? (root.ownerDocument.activeElement as HTMLElement)?.dataset.action : undefined;
+    const focusedFamily = (root.ownerDocument.activeElement as HTMLElement | null)?.closest<HTMLDetailsElement>("details[data-family]")?.dataset.family;
     const safetySummary = page.querySelector(".mh-safety-disclosure > summary");
     const safetyFocused = !!safetySummary && root.ownerDocument.activeElement === safetySummary;
     const previousScroll = page.scrollTop;
@@ -237,7 +239,14 @@ export function mountMobileHub(root: HTMLElement, backend: MobileHubBackend, cal
     const safety = page.querySelector<HTMLDetailsElement>(".mh-safety-disclosure");
     if (safety) disclosures.set("credential-safety", safety.open);
     clearSecrets(page);
-    page.innerHTML = `<header class="mh-brand"><img src="${esc(brandLogoUrl)}" alt=""/><span>UatuCode</span></header><main>${signedOut ? login() : !identity ? `<h1>UatuCode</h1>${workspaces.status === "unavailable" ? `<div role="alert">${note(workspaces.problem.message)}${button("refresh", "Retry", "mh-text-action")}</div>` : note("Connecting to hub…")}` : route === "hub" ? dashboard() : settings()}</main>${identity ? dock() : ""}`;
+    const markup = `<header class="mh-brand"><img src="${esc(brandLogoUrl)}" alt=""/><span>UatuCode</span></header><main>${signedOut ? login() : !identity ? `<h1>UatuCode</h1>${workspaces.status === "unavailable" ? `<div role="alert">${note(workspaces.problem.message)}${button("refresh", "Retry", "mh-text-action")}</div>` : note("Connecting to hub…")}` : route === "hub" ? dashboard() : settings()}</main>${identity ? dock() : ""}`;
+    // Native disclosure state is already owned by the mounted nodes. Background
+    // reads of identical presentation must not detach keyboard/AX owners.
+    // A different principal must replace them even when its list looks identical.
+    const signature = markup.replace(/(<details\b[^>]*?) open(?=>)/g, "$1") + JSON.stringify([authenticatedUser, flows.detail]);
+    if (signature === renderedPage) { revalidationNotice(); return; }
+    renderedPage = signature;
+    page.innerHTML = markup;
     page.querySelector<HTMLElement>("main")!.inert = !!flows.detail;
     if (flows.detail) page.querySelector("main")!.setAttribute("aria-hidden", "true");
     else page.querySelector("main")!.removeAttribute("aria-hidden");
@@ -247,7 +256,9 @@ export function mountMobileHub(root: HTMLElement, backend: MobileHubBackend, cal
     page.querySelector<HTMLFormElement>(".mh-login")?.addEventListener("submit", event => { event.preventDefault(); void signIn(); });
     if (loginBusy) page.querySelectorAll<HTMLInputElement>(".mh-login input").forEach(input => { input.disabled = true; });
     page.scrollTop = previousScroll;
-    if (activeAction) [...page.querySelectorAll<HTMLElement>("[data-action]")].find(el => el.dataset.action === activeAction)?.focus();
+    const replacement = activeAction ? [...page.querySelectorAll<HTMLElement>("[data-action]")].find(el => el.dataset.action === activeAction && !el.hasAttribute("disabled")) : focusedFamily ? [...page.querySelectorAll<HTMLDetailsElement>("[data-family]")].find(el => el.dataset.family === focusedFamily)?.querySelector<HTMLElement>("summary") : undefined;
+    if (replacement) replacement.focus({ preventScroll: true });
+    else if (activeAction || focusedFamily) { const heading = page.querySelector<HTMLElement>("main h1"); heading?.setAttribute("tabindex", "-1"); heading?.focus({ preventScroll: true }); }
     if (safetyFocused) safetyDisclosure?.querySelector<HTMLElement>("summary")?.focus({ preventScroll: true });
     revalidationNotice();
   }
@@ -456,13 +467,15 @@ export function mountMobileHub(root: HTMLElement, backend: MobileHubBackend, cal
     flows.refresh();
     const captured = ++readGeneration; let lifecycle = generation;
     const current = () => !disposed && captured === readGeneration && lifecycle === generation;
-    workspaces = { status: "loading", previous: workspaces.status === "ready" ? workspaces.value : workspaces.previous };
-    if (target) targetUnavailable = true;
+    // Keep verified controls available while revalidating. Open/Start still
+    // check current backend facts; failed reads render the existing retry state.
+    if (workspaces.status !== "ready") workspaces = { status: "loading", previous: workspaces.previous };
     render();
     try {
       const auth = await backend.readAuthentication(); if (!current()) return;
       if (auth.status === "unavailable") {
         if (auth.problem.kind === "unauthorized") { invalidateAuthentication(); return; }
+        if (target) targetUnavailable = true;
         // A failed revalidation is not loss of authentication. Keep the
         // authenticated command/draft owner mounted; writes still meet the
         // server's authorization boundary and can report their actual result.
@@ -493,7 +506,7 @@ export function mountMobileHub(root: HTMLElement, backend: MobileHubBackend, cal
         }),
         load(() => backend.readDefaultFolder(), value => { defaultFolder = value; }),
       ]);
-    } catch { if (current()) { authenticationProblem = "Could not connect to this hub."; workspaces = { status: "unavailable", problem: { kind: "unavailable", message: authenticationProblem } }; if (!identity) { if (flows.detail) requestedDetail = flows.detail; closeSheet(false); flows.leave(); loginError = authenticationProblem; } render(); } }
+    } catch { if (current()) { if (target) targetUnavailable = true; authenticationProblem = "Could not connect to this hub."; workspaces = { status: "unavailable", problem: { kind: "unavailable", message: authenticationProblem } }; if (!identity) { if (flows.detail) requestedDetail = flows.detail; closeSheet(false); flows.leave(); loginError = authenticationProblem; } render(); } }
   }
   // Parent is safe navigation context supplied by a restored history entry,
   // not inferred from a previous visit or the child's URL on direct entry.

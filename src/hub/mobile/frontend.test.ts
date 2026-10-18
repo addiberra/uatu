@@ -59,6 +59,54 @@ function harness(overrides: Partial<MobileHubBackend> = {}, callbackOverrides: P
   return { root, ui, click, starts, opens, returns, invalidate: (event: Invalidation) => invalidate(event), setRows: (next: WorkspaceView[]) => { rows = next; } };
 }
 const settle = async () => { for (let i = 0; i < 12; i++) await Promise.resolve(); };
+test("changed principal replaces identical dashboard owners even when workspace facts arrive first", async () => {
+  let user = "Reviewer";
+  const h = harness({ readAuthentication: async () => available({ status: "authenticated", identity: { user, host: "synthetic.invalid", version: "test-version" } }) });
+  await h.ui.ready;
+  const original = h.root.querySelector<HTMLElement>('[data-action="info:a"]')!;
+  original.focus(); user = "Other reviewer";
+  await h.ui.refresh();
+  expect(original.isConnected).toBe(false);
+  expect(h.root.querySelector('[data-action="info:a"]')).not.toBe(original);
+});
+test("background refresh retains focused workspace controls and family summary nodes", async () => {
+  const h = harness();
+  h.setRows([{ ...workspace("a", true), repositoryId: "repo" }, { ...workspace("b"), parentId: "a", repositoryId: "repo" }]);
+  await h.ui.ready;
+  const family = h.root.querySelector<HTMLDetailsElement>("[data-family]")!;
+  family.open = true;
+  for (const selector of ['[data-action="info:a"]', '[data-action="open:a"]', '[data-family] > summary']) {
+    const control = h.root.querySelector<HTMLElement>(selector)!; control.focus();
+    const refresh = h.ui.refresh();
+    expect(control.isConnected).toBe(true);
+    await refresh;
+    expect(h.root.querySelector(selector)).toBe(control);
+    expect(document.activeElement).toBe(control);
+    expect(h.root.querySelector<HTMLDetailsElement>("[data-family]")!.open).toBe(true);
+  }
+});
+test("changed and removed workspaces refresh facts with a meaningful focus fallback", async () => {
+  const h = harness(); await h.ui.ready;
+  h.root.querySelector<HTMLElement>('[data-action="info:a"]')!.focus();
+  h.setRows([{ ...workspace("a", true), displayName: "Updated" }]); await h.ui.refresh();
+  expect(h.root.textContent).toContain("Updated");
+  expect((document.activeElement as HTMLElement)?.dataset.action).toBe("info:a");
+  h.setRows([]); await h.ui.refresh();
+  expect(h.root.querySelector("[data-workspace]")).toBeNull();
+  expect(document.activeElement).toBe(h.root.querySelector("main h1"));
+});
+test("changed family facts preserve collapsed disclosure and summary focus", async () => {
+  const h = harness();
+  const rows = [{ ...workspace("a", true), repositoryId: "repo" }, { ...workspace("b"), parentId: "a", repositoryId: "repo" }];
+  h.setRows(rows); await h.ui.ready;
+  h.root.querySelector<HTMLDetailsElement>("[data-family]")!.open = false;
+  h.root.querySelector<HTMLElement>("[data-family] > summary")!.focus();
+  h.setRows(rows.map(row => ({ ...row, displayName: "Renamed family" })));
+  await h.ui.refresh();
+  expect(!!h.root.querySelector<HTMLDetailsElement>("[data-family]")!.open).toBe(false);
+  expect(document.activeElement === h.root.querySelector("[data-family] > summary")).toBe(true);
+  expect(h.root.querySelector("[data-family] > summary")!.textContent).toContain("Renamed family");
+});
 function changeSelect(root: HTMLElement, value: string) {
   root.querySelectorAll<HTMLInputElement>('input[type="radio"]').forEach(input => {
     input.checked = input.value === value;
@@ -400,6 +448,22 @@ describe("mobile Hub scoped composition", () => {
 });
 
 describe("stable Return and explicit workspace intents", () => {
+  test.each(["unavailable", "throw"] as const)("auth %s disables Return only after revalidation fails and recovers on verified facts", async failure => {
+    let resolve!: (value: Awaited<ReturnType<MobileHubBackend["readAuthentication"]>>) => void;
+    let reject!: (reason: Error) => void;
+    let pending = false;
+    const h = harness({ readAuthentication: () => pending ? new Promise((yes, no) => { resolve = yes; reject = no; }) : Promise.resolve(available({ status: "authenticated", identity: { user: "Reviewer", host: "synthetic.invalid", version: "test-version" } })) });
+    await h.ui.ready; h.ui.setReturnTarget(workspace("a", true));
+    pending = true; const read = h.ui.refresh();
+    expect(h.root.querySelector<HTMLButtonElement>('[data-action="return"]')!.disabled).toBe(false);
+    if (failure === "throw") reject(new Error("Offline"));
+    else resolve({ status: "unavailable", problem: { kind: "unavailable", message: "Offline" } });
+    await read;
+    expect(h.root.querySelector<HTMLButtonElement>('[data-action="return"]')!.disabled).toBe(true);
+    h.click("return"); expect(h.returns).toEqual([]);
+    pending = false; await h.ui.refresh();
+    expect(h.root.querySelector<HTMLButtonElement>('[data-action="return"]')!.disabled).toBe(false);
+  });
   test("authentication outage keeps the sole Retry with its error", async () => {
     const h = harness({ readAuthentication: async () => ({ status: "unavailable", problem: { kind: "unavailable", message: "Synthetic outage" } }) });
     await h.ui.ready;

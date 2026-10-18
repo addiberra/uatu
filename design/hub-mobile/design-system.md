@@ -40,6 +40,25 @@ navigation. This is ordinary list scrolling, not a pinned creation toolbar.
 Dock placement, Return identity, preferences and safe-area measurements remain
 owned by their existing modules.
 
+Background Hub reads retain the last verified workspace list while pending;
+identical presentation keeps its mounted keyboard/disclosure owners. Changed
+facts restore the matching action or family summary; a removed control falls
+back to the page heading. Failed reads still expose the existing Retry state.
+A changed authenticated user replaces the previous user's mounted owners even
+when the workspace presentation is identical.
+Clone progress uses a persistent atomic status region for phase, cancellation
+request and outcome text; ordinary output does not rewrite its announcement.
+Clone's required fields, authentication host and Rename display name associate
+local validation with their field through `aria-invalid` and `aria-describedby`.
+Correction clears that field's description without replacing the draft or
+clearing a different operation's alert. Other operation failures remain alerts;
+this is bounded field validation, not a general server-error mapping.
+Repeated failed validation updates the field's existing description to match
+the current failure. Selecting no authentication credential clears an obsolete
+host error before disabling its field. Return remains available during pending
+revalidation, but failed authentication revalidation disables it until current
+workspace facts are verified again; an outage does not sign the user out.
+
 ## Product modules and ownership
 
 ```text

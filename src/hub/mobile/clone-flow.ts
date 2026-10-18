@@ -1,7 +1,7 @@
 import type { CloneIntent, CloneStreamEvent, KeyTarget } from "./backend";
 import type { CloneJobResult } from "../clone-jobs";
 import { normalizeProviderHost, type PublicCredentialDto } from "../credential-types";
-import { absolute, action, check, credentialSafetyNotice, clearSecrets, displayName, field, folderName, group, hubForeground, infoRows, required, select, sharedUidKey, showContextualError, text, value, type FlowEnvironment } from "./flow-ui";
+import { absolute, action, check, credentialSafetyNotice, clearSecrets, displayName, field, folderName, group, hubForeground, infoRows, required, select, sharedUidKey, showContextualError, text, value, validateField, type FlowEnvironment } from "./flow-ui";
 import { bindAuthenticationHost, configurationFacts, configurationFields, readConfiguration, technicalField, type ConfigurationDraft } from "./onboarding-flows";
 
 export type CloneDraft = CloneIntent;
@@ -103,7 +103,7 @@ export function createCloneFlow(env: FlowEnvironment, unlock: (target: KeyTarget
         throw error;
       }
       draft = { ...base, retainedAuthentication: config.authentication, signing: config.signing || null, start: config.start };
-      draft = validateCloneDraft(draft);
+      draft = { ...draft, url: validateField(root, "url", raw => required(raw, "Remote URL")), dest: validateField(root, "dest", absolute), folderName: validateField(root, "folderName", folderName), displayName: validateField(root, "displayName", displayName) };
       const credential = draft.credentialId ? catalog.find(c => c.id === draft.credentialId) : null;
       if (draft.credentialId && (!credential || !credential.enabled || !cloneCredentialCompatible(credential, draft.url))) throw new Error("Selected clone identity is missing, disabled, or incompatible. Choose a compatible credential explicitly.");
     } else {
@@ -297,7 +297,7 @@ export function createCloneFlow(env: FlowEnvironment, unlock: (target: KeyTarget
       reconcile: () => { if (attempt && unavailableJob) { unsubscribe?.(); unsubscribe = null; jobId = null; afterEventId = 0; attempt.state = "unknown"; renderRecovery(); void reconcile(); } },
       edit: () => { if (result) newOptions(); },
     };
-    env.page("Clone Progress", text(`Job ${jobId}`) + '<p class="mh-note" data-clone-status></p><pre class="mh-clone-output" aria-label="Clone output"></pre><p class="mh-note" data-clone-problem role="status"></p>' + '<div data-clone-result></div><div data-clone-actions></div>', actions);
+    env.page("Clone Progress", text(`Job ${jobId}`) + '<p class="mh-note" data-clone-status role="status" aria-atomic="true"></p><pre class="mh-clone-output" aria-label="Clone output"></pre><p class="mh-note" data-clone-problem role="status"></p>' + '<div data-clone-result></div><div data-clone-actions></div>', actions);
     updateProgress();
   }
   function updateProgress() {
@@ -330,9 +330,12 @@ export function createCloneFlow(env: FlowEnvironment, unlock: (target: KeyTarget
         button.textContent = primary === "open" ? "Open workspace" : primary === "inspect" ? "Workspace information" : primary === "folder" ? "Inspect checkout location" : "Reconcile original attempt";
       }
     }
-    status.textContent = result ? resultText(result) : cancelPending ? "Cancellation requested. Waiting for the terminal result…" : `Phase: ${phase}`;
+    const statusText = result ? resultText(result) : cancelPending ? "Cancellation requested. Waiting for the terminal result…" : `Phase: ${phase}`;
+    if (status.textContent !== statusText) status.textContent = statusText;
     const outputElement = env.root.querySelector(".mh-clone-output")!; outputElement.textContent = output;
-    env.root.querySelector("[data-clone-problem]")!.textContent = [streamProblem, actionProblem, inputUncertain && !inputPending ? "Input acceptance is unknown. Further input is blocked, including after reconnect." : ""].filter(Boolean).join(" ");
+    const problem = env.root.querySelector("[data-clone-problem]")!;
+    const problemText = [streamProblem, actionProblem, inputUncertain && !inputPending ? "Input acceptance is unknown. Further input is blocked, including after reconnect." : ""].filter(Boolean).join(" ");
+    if (problem.textContent !== problemText) problem.textContent = problemText;
     if (phase !== "cloning" || result || unavailableJob) clearSecrets(env.root);
     env.root.querySelectorAll<HTMLInputElement | HTMLButtonElement>('[name="response"], [data-flow="send"], [data-flow="cancel"]').forEach(el => { el.disabled = !!result || unavailableJob || (el.dataset.flow === "cancel" ? cancelPending : phase !== "cloning" || cancelPending || inputPending || inputUncertain); });
   }

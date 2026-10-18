@@ -51,10 +51,15 @@ async function harness() {
 test("completion during held cancel preserves status/output/result nodes and exposes outcome actions", async () => {
   const h = await harness();
   const status = h.root.querySelector("[data-clone-status]"), output = h.root.querySelector(".mh-clone-output"), result = h.root.querySelector("[data-clone-result]"), toolbar = h.root.querySelector(".mh-flow-toolbar"), more = h.root.querySelector('[data-flow="more"]');
+  expect(status?.getAttribute("role")).toBe("status");
+  expect(status?.getAttribute("aria-atomic")).toBe("true");
+  const textNode = status!.firstChild;
+  h.receive({ type: "job-event", event: { id: 2, type: "output", data: { output: "quiet log" } } });
+  expect(status!.firstChild).toBe(textNode);
   h.click("cancel"); h.click("commit-sheet");
   expect(status?.textContent).toContain("Waiting for the terminal result");
   const secret = h.root.querySelector<HTMLInputElement>('[name="response"]')!; secret.value = "DISPOSABLE";
-  h.receive({ type: "job-event", event: { id: 2, type: "result", data: { status: "succeeded", workspaceId: "new", target: "/checkout", running: true } } });
+  h.receive({ type: "job-event", event: { id: 3, type: "result", data: { status: "succeeded", workspaceId: "new", target: "/checkout", running: true } } });
   for (const [selector, node] of [["[data-clone-status]", status], [".mh-clone-output", output], ["[data-clone-result]", result], [".mh-flow-toolbar", toolbar], ['[data-flow="more"]', more]] as const) expect(h.root.querySelector(selector)).toBe(node);
   expect(status?.textContent).toContain("registered and running"); expect(secret.value).toBe(""); expect(secret.isConnected).toBe(false);
   expect(h.root.querySelectorAll('.mh-flow-content [data-flow="open"]')).toHaveLength(1);

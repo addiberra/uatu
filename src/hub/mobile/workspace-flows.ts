@@ -1,6 +1,6 @@
 import type { AssignWorkspaceIntent, AssignmentSelection, WorkspaceView } from "./backend";
 import { normalizeProviderHost, type AuthenticationCredentialAssignment, type PublicCredentialDto } from "../credential-types";
-import { action, advisory, displayName, field, group, infoRows, listRow, required, rowAction, select, text, value, type FlowEnvironment } from "./flow-ui";
+import { action, advisory, displayName, field, group, infoRows, listRow, required, rowAction, select, text, value, validateField, type FlowEnvironment } from "./flow-ui";
 import { supportsRole } from "./credential-flows";
 import { branchLabel, branchSummary } from "./workspace-presentation";
 import { createWorktreeFlows } from "./worktree-flows";
@@ -50,7 +50,7 @@ export function createWorkspaceFlows(env: FlowEnvironment, start: (workspace: Wo
       const actions: Record<string, () => unknown> = {
         open: () => { if (!w.availability) start(w); },
         rename: () => env.task("Rename workspace", text("Changes the display name, not its folder or stable URL.") + field("name", "Display name", w.displayName), { label: "Save", run: root => {
-          const name = displayName(value(root, "name"));
+          const name = validateField(root, "name", displayName);
           if (name === w.displayName) { env.sheet.error("No changes to the display name."); return; }
           return env.mutate(() => backend.renameWorkspace({ workspaceId: id, displayName: name }), () => { env.sheet.close(); env.changed(); workspace(id); }, root);
         } }),

@@ -68,7 +68,16 @@ test("optional clone credentials preserve drafts and reveal validation without h
   await expect(details).toHaveAttribute("open");
   await expect(page.getByRole("alert")).toContainText("Enter an authentication host");
   await expect(host).toBeVisible();
+  await expect(host).toHaveAttribute("aria-invalid", "true");
+  await expect(host).toHaveAccessibleDescription("Enter an authentication host.");
+  await auth.selectOption("");
+  await expect(host).toBeDisabled(); await expect(host).not.toHaveAttribute("aria-invalid");
+  // Empty alerts are display:none, so assert the persistent DOM owner directly.
+  await expect(page.locator(".mh-flow-error")).toBeEmpty();
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  await auth.selectOption("ssh-open");
   await host.fill("github.com");
+  await expect(host).not.toHaveAttribute("aria-invalid");
   await start.uncheck();
   await summary.click();
   await review.click();

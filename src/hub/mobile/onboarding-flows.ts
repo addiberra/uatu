@@ -1,7 +1,7 @@
 import type { FolderListing, OnboardingOutcome, ReadResult } from "./backend";
 import { normalizeProviderHost, type PublicCredentialDto } from "../credential-types";
 import type { AuthenticationSelection } from "../onboarding";
-import { absolute, action, check, checked, displayName, field, folderName, group, infoRows, listRow, select, text, value, type FlowEnvironment } from "./flow-ui";
+import { absolute, action, check, checked, displayName, field, folderName, group, infoRows, listRow, select, text, value, validateField, type FlowEnvironment } from "./flow-ui";
 import { credentialChoices, validateSelected } from "./workspace-flows";
 import { createFolderPicker } from "./folder-picker";
 import { supportsRole } from "./credential-flows";
@@ -20,13 +20,18 @@ export function configurationFields(catalog: PublicCredentialDto[], draft: Confi
   return (!usable("authentication") && !usable("signing") ? text("No usable repository credentials are saved on this Hub. Credentials are optional for public repositories; private access and signing may need setup.") + action("setup-credentials", "Set up repository credentials") : "")
     + `<div data-auth-list>${(draft.authentication.length ? draft.authentication : [undefined]).map(auth => authenticationRow(catalog, auth)).join("")}</div>${usable("authentication") ? action("add-auth-host", "Add another authentication host") : ""}` + select("signing", "Commit signing", credentialChoices(catalog, "signing", draft.signing, "None"), draft.signing) + (options.includeStart === false ? "" : check("start", "Start after configuration", draft.start));
 }
+function authenticationHost(row: HTMLElement, raw: string): string {
+  if (!value(row, "authentication")) return raw.trim();
+  if (!raw.trim()) throw new Error("Enter an authentication host.");
+  return normalizeProviderHost(raw.trim());
+}
 export function readConfiguration(root: HTMLElement, catalog: PublicCredentialDto[], draft: ConfigurationDraft): ConfigurationDraft {
   const signing = value(root, "signing"); validateSelected(catalog, signing, "signing");
   const authentication = [...root.querySelectorAll<HTMLElement>("[data-auth-row]")].flatMap(row => {
-    const credentialId = value(row, "authentication"), host = value(row, "host").trim();
+    const credentialId = value(row, "authentication");
     validateSelected(catalog, credentialId, "authentication");
-    if (credentialId && !host) throw new Error("Enter an authentication host.");
-    return credentialId ? [{ credentialId, host: normalizeProviderHost(host) }] : [];
+    const host = validateField(row, "host", raw => authenticationHost(row, raw));
+    return credentialId ? [{ credentialId, host }] : [];
   });
   if (new Set(authentication.map(a => a.host)).size !== authentication.length) throw new Error("Choose only one authentication credential per host.");
   return { ...draft, authentication, signing, start: checked(root, "start") };
@@ -45,7 +50,12 @@ export function bindAuthenticationHost(root: HTMLElement, catalog: PublicCredent
     const host = row.querySelector<HTMLInputElement>('[name="host"]');
     if (host && authentication) {
       const context = () => { host.disabled = !authentication.value; host.placeholder = authentication.value ? "github.com" : "Select a credential first"; host.setAttribute("aria-description", authentication.value ? "Host for the selected Git authentication credential" : "Choose a Git authentication credential first to edit its host"); };
-      context(); authentication.onchange = () => { context(); updateAddHost(); };
+      context(); authentication.onchange = () => {
+        context(); updateAddHost();
+        // A dependency change can make a previously required host irrelevant.
+        // Recheck existing validation only; selecting a credential is not Submit.
+        if (host.hasAttribute("aria-invalid")) try { validateField(row, "host", raw => authenticationHost(row, raw)); } catch { /* Keep the field's current failure for Review. */ }
+      };
     }
   });
   root.querySelector('[data-flow="add-auth-host"]')?.addEventListener("click", () => {

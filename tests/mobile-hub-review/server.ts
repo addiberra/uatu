@@ -30,6 +30,11 @@ export async function buildWorkspaceAssets(): Promise<ReviewAssets> {
     assets.set(path, { body: path === "/index.html" ? await output.text() : output, type: output.type });
   }
   if (!assets.has("/index.html")) throw new Error("Review build has no actual workspace document");
+  const direct = await Bun.build({ entrypoints: [new URL("./direct-hub-entry.ts", import.meta.url).pathname], target: "browser", naming: "direct-hub.[ext]", plugins: [{ name: "direct-hub-synthetic-rpc", setup(build) {
+    build.onResolve({ filter: /^\.\/live-backend$/ }, args => args.importer.endsWith("/mobile/live-entry.ts") ? { path: new URL("./direct-hub-backend.ts", import.meta.url).pathname } : undefined);
+  } }] });
+  if (!direct.success) throw new AggregateError(direct.logs, "Direct Hub review build failed");
+  for (const output of direct.outputs) assets.set(`/${output.path.replace(/^.*\//, "")}`, { body: output, type: output.type });
   const staticAssets = [
     ["/assets/uatu-logo.svg", "../../src/assets/uatu-logo.svg", "image/svg+xml"],
     ["/assets/icon-192.png", "../../src/assets/icon-192.png", "image/png"],

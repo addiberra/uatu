@@ -23,6 +23,47 @@ export function required(input: string, label: string): string { if (!input.trim
 export function absolute(input: string): string { const path = required(input, "Absolute folder path"); if (!path.startsWith("/") || /[\u0000-\u001f]/.test(path)) throw new Error("Enter an absolute folder path."); return path; }
 export function displayName(input: string): string { const name = required(input, "Display name"); if ([...name].length > 64 || /[\p{Cc}\p{Cf}]/u.test(name)) throw new Error("Use 1–64 visible characters for the display name."); return name; }
 export function folderName(input: string): string { const name = required(input, "Folder name"); if (name === "." || name === ".." || /[\/\\\p{Cc}\p{Cf}]/u.test(name)) throw new Error("Enter one folder name, without separators or control characters."); return name; }
+/** Field-local validation only: server/operation errors keep their alert owner.
+ * Rechecking a corrected field never submits, focuses, or retains its value. */
+const fieldErrors = new WeakMap<Element, { description: HTMLElement; validate: (value: string) => unknown; clear: () => void }>();
+export function validateField<T>(root: HTMLElement, name: string, validate: (value: string) => T): T {
+  const input = root.querySelector<HTMLInputElement | HTMLSelectElement>(`[name="${name}"]`)!;
+  try { const result = validate(input.value); fieldErrors.get(input)?.clear(); return result; }
+  catch (error) {
+    const message = error instanceof Error ? error.message : "Invalid form input.";
+    const existing = fieldErrors.get(input);
+    if (existing) { existing.validate = validate; existing.description.textContent = message; }
+    else {
+      const description = root.ownerDocument.createElement("span");
+      description.id = `mh-field-error-${crypto.randomUUID()}`;
+      // The existing alert is the visible/announced error. A referenced hidden
+      // description keeps field association after another alert replaces it,
+      // without showing the same message twice or creating a second live region.
+      description.hidden = true;
+      description.textContent = message;
+      (input.closest("label") ?? input).after(description);
+      input.setAttribute("aria-invalid", "true");
+      input.setAttribute("aria-describedby", [input.getAttribute("aria-describedby"), description.id].filter(Boolean).join(" "));
+      const correct = () => {
+        try { fieldErrors.get(input)?.validate(input.value); } catch { return; }
+        clear();
+      };
+      const clear = () => {
+        input.removeAttribute("aria-invalid");
+        const remaining = input.getAttribute("aria-describedby")?.split(/\s+/).filter(id => id !== description.id).join(" ");
+        if (remaining) input.setAttribute("aria-describedby", remaining); else input.removeAttribute("aria-describedby");
+        description.remove();
+        const alert = root.closest<HTMLElement>(".mh-flow-page, .mh-sheet")?.querySelector(".mh-flow-error, .mh-sheet-error") ?? root.querySelector(".mh-flow-error, .mh-sheet-error");
+        if (alert?.textContent === description.textContent) alert.textContent = "";
+        input.removeEventListener("input", correct); input.removeEventListener("change", correct);
+        fieldErrors.delete(input);
+      };
+      fieldErrors.set(input, { description, validate, clear });
+      input.addEventListener("input", correct); input.addEventListener("change", correct);
+    }
+    throw error;
+  }
+}
 export function hubForeground(root: HTMLElement): boolean {
   const hub = root.closest<HTMLElement>(".mh-root");
   return !hub || (!hub.hidden && !hub.inert);
