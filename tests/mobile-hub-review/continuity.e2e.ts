@@ -434,7 +434,9 @@ test("populated commit direct load and document/hash history delegate to the ori
 test("detail history restores its own scroller after an asynchronous read, without booting a workspace", async ({ page }) => {
   await page.goto("/settings");
   await expect(page.locator("#mobile-hub-root h1:visible")).toHaveText(["Settings"]);
+  await page.locator('[data-action="repository-credentials"]').click();
   await page.locator('[data-action="tools"]').click();
+  expect(await page.evaluate(() => history.state?.mobileHub?.parent)).toBe("repository-credentials");
   const detail = page.locator(".mh-flow-content");
   await expect.poll(() => detail.evaluate(el => el.scrollHeight - el.clientHeight)).toBeGreaterThan(180);
   await detail.evaluate(el => { el.scrollTop = 160; });

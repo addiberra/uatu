@@ -321,13 +321,13 @@ describe("mobile Hub scoped composition", () => {
     expect(css).toContain("prefers-reduced-transparency");
     expect(css).toContain("forced-colors");
   });
-  test("reference hierarchy uses vector folders, branch rows, circular actions and icon docks", async () => {
+  test("reference hierarchy uses vector folders, branch rows, explicit Details and icon docks", async () => {
     const h = harness(); await h.ui.ready;
     expect(h.root.querySelector("h1")?.textContent).toBe("Workspaces");
     expect(h.root.querySelector(".mh-subtitle")?.textContent).toBe("synthetic.invalid · 1 session running");
     expect([...h.root.querySelectorAll(".mh-section > h2")].map(el => el.textContent)).toEqual(["Running1", "Ready to start1"]);
     expect(h.root.querySelectorAll('.mh-folder svg[data-icon="folder"]')).toHaveLength(2);
-    expect(h.root.querySelectorAll('.mh-more svg[data-icon="more"]')).toHaveLength(2);
+    expect([...h.root.querySelectorAll('.mh-workspace-details')].map(el => el.textContent)).toEqual(["Details", "Details"]);
     expect(h.root.querySelector('.mh-status svg[data-icon="branch"]')).not.toBeNull();
     expect(h.root.querySelectorAll(".mh-dock .mh-tab svg")).toHaveLength(2);
     expect(h.root.querySelector(".mh-return")).toBeNull();
@@ -373,7 +373,7 @@ describe("mobile Hub scoped composition", () => {
     expect(h.root.querySelector(".mh-workspace-copy img")).toBeNull();
     expect(h.root.querySelector('[data-action="info:b"]')?.getAttribute("aria-label")).toContain("/projects/b");
   });
-  test("workspace ellipsis directly opens complete detail and Back restores its trigger", async () => {
+  test("workspace Details directly opens complete detail and Back restores its trigger", async () => {
     const h = harness(); await h.ui.ready; h.click("info:a"); await settle();
     expect(h.root.querySelector('[role="dialog"]')).toBeNull();
     expect(h.root.querySelector('.mh-flow-page')?.textContent).toContain("editor · Attached");
@@ -384,6 +384,18 @@ describe("mobile Hub scoped composition", () => {
     expect(h.root.querySelector('[data-action^="manage:"]')).toBeNull();
     h.root.querySelector<HTMLButtonElement>('[data-flow="flow-back"]')!.click();
     expect(document.activeElement?.getAttribute("data-action")).toBe("info:a");
+  });
+  test.each([undefined, "missing", "replaced"] as const)("Details stays explicit and available for running/stopped and %s checkouts", async availability => {
+    const h = harness(); h.setRows([{ ...workspace("a", true), availability }, { ...workspace("b"), availability }]); await h.ui.ready;
+    for (const id of ["a", "b"]) {
+      const details = h.root.querySelector<HTMLButtonElement>(`[data-action="info:${id}"]`)!;
+      expect(details.textContent).toBe("Details");
+      expect(details.getAttribute("aria-label")).toBe(`Details for Duplicate name, /projects/${id}`);
+      expect(details.disabled).toBe(false);
+    }
+    expect(h.root.querySelector('[data-action="open:a"]')?.textContent).toBe("Open");
+    expect(h.root.querySelector<HTMLButtonElement>('[data-action="open:a"]')?.disabled).toBe(Boolean(availability));
+    expect(h.root.querySelector<HTMLButtonElement>('[data-action="start:b"]')?.disabled).toBe(Boolean(availability));
   });
 });
 

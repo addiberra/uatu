@@ -29,6 +29,17 @@ Every action has one natural home. Settings uses top Back and contextual options
 Only genuinely frequent controls need special lower-screen placement. Current
 values stay accurate; controls never open themselves merely because a page appeared.
 
+Workspace cards expose a text **Details** action with workspace name and full
+path in its accessible name. It opens the existing full-page information and
+management view directly; Back restores the card trigger and Hub scroll. The
+tinted **Open** / **Start** command remains separate and prominent; unavailable
+checkouts still allow Details while their session command is disabled.
+The Hub list scrollport ends above the measured dock with an 8px gap, so the
+trailing Add Workspace explanation scrolls into clear space rather than under
+navigation. This is ordinary list scrolling, not a pinned creation toolbar.
+Dock placement, Return identity, preferences and safe-area measurements remain
+owned by their existing modules.
+
 ## Product modules and ownership
 
 ```text

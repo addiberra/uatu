@@ -49,16 +49,23 @@ for (const size of [{ width: 390, height: 844, text: 100 }, { width: 390, height
     await expect(page.locator('.mh-workspace h3 button')).toHaveCount(0);
     await page.locator('[data-action="settings"]').click();
     const credential = page.locator('[data-action="add-credential"]');
-    await expect(credential).toHaveCount(1); await expect(page.locator('.mh-group [data-action="add-credential"]')).toHaveCount(1);
+    const repositoryCredentials = page.locator('[data-action="repository-credentials"]');
+    await expect(credential).toHaveCount(0); await expect(repositoryCredentials).toHaveCount(1);
     await expect(page.locator('[data-action="sign-out"]')).toHaveCount(0);
     await page.locator('.mh-page').evaluate(el => { el.scrollTop = el.scrollHeight; });
     const last = page.locator('.mh-page main > :last-child');
     await expect.poll(async () => (await last.boundingBox())!.y + (await last.boundingBox())!.height <= (await page.locator('.mh-dock').boundingBox())!.y).toBe(true);
+    await repositoryCredentials.click();
+    await expect(credential).toHaveCount(1); await expect(page.locator('.mh-group [data-action="add-credential"]')).toHaveCount(1);
     await credential.click();
     const back = page.locator('[data-flow="flow-back"]');
     await expect(back).toHaveCount(1); await expect(page.locator('.mh-flow-header [data-flow="flow-back"]')).toBeVisible();
     await expect(page.locator('.mh-overview-toolbar')).toHaveCount(0);
     await back.click();
+    await expect(page.locator('.mh-flow-page h1')).toHaveText('Repository credentials');
+    await expect(credential).toHaveCount(1);
+    await back.click();
+    await expect(page.locator('.mh-flow-page')).toBeHidden();
     await page.locator('[data-action="preview-side"]').click();
     const modal = activeTask(page); await expect(modal).toBeVisible();
     await expect(page.locator('.mh-page')).toHaveJSProperty('inert', true);
@@ -68,7 +75,7 @@ for (const size of [{ width: 390, height: 844, text: 100 }, { width: 390, height
     await expect(modal).not.toHaveAttribute('aria-modal', 'true');
     expect(await modal.evaluate(el => el.contains(document.activeElement))).toBe(true);
     await page.keyboard.press('Escape'); await expect(modal).toHaveCount(0);
-    await expect(credential).toHaveCount(1);
+    await expect(credential).toHaveCount(0); await expect(repositoryCredentials).toHaveCount(1);
     await page.locator('[data-action="default-folder"]').click();
     const primary = page.locator('[data-flow="edit"]');
     await expect(primary).toHaveCount(1); await expect(primary).toBeVisible();
@@ -138,7 +145,7 @@ for (const size of [{ width: 390, height: 664, text: 100 }, { width: 390, height
   });
 }
 
-test('login submit and unavailable Retry have one contextual action; workspace ellipsis has no detour', async ({ page, request }) => {
+test('login submit and unavailable Retry have one contextual action; workspace Details has no detour', async ({ page, request }) => {
   await request.post('/review/reset', { data: { scenario: 'signed-out' } });
   await page.setViewportSize({ width: 390, height: 664 }); await page.goto('/');
   const submit = page.locator('.mh-login button[type="submit"]');

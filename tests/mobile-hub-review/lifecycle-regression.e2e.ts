@@ -8,6 +8,7 @@ for (const submitted of [false, true]) test(`history foreground clears retained 
   await expect(page.locator("#preview")).toContainText("Synthetic review document");
   await page.locator("#navigation-hub").click();
   await page.locator('[data-action="settings"]').click();
+  await page.locator('[data-action="repository-credentials"]').click();
   await page.locator('[data-action="add-credential"]').click();
   await credentialCreation(page, 'ssh', true);
   await page.getByLabel("Name", { exact: true }).fill("Late import");
@@ -17,8 +18,9 @@ for (const submitted of [false, true]) test(`history foreground clears retained 
     await request.post("/review/control/hold", { data: ["importSsh"] });
     await page.getByRole("button", { name: "Import", exact: true }).click();
   }
-  // Hub, Settings, credential chooser and its owned editor each add an entry.
-  await page.evaluate(() => history.go(-4));
+  // Hub, Settings, Repository credentials, credential chooser and its owned
+  // editor each add an entry. Return all the way to the retained workspace.
+  await page.evaluate(() => history.go(-5));
   await expect(page.locator("#mobile-hub-root")).toBeHidden();
   expect(await page.evaluate(() => (window as any).oldSecret.value)).toBe("");
   expect(await page.evaluate(() => (window as any).oldSecret.isConnected)).toBe(false);
@@ -56,6 +58,7 @@ test("first dependent stop survives second stop failure without discarding activ
   await expect(page.locator("#preview")).toContainText("Synthetic review document");
   await page.locator("#navigation-hub").click();
   await page.locator('[data-action="settings"]').click();
+  await page.locator('[data-action="repository-credentials"]').click();
   await page.locator('[data-action="credential:token-github"]').click();
   await moreAction(page, 'Disable');
   await activeTask(page, 'confirmation').getByRole("button", { name: "Disable", exact: true }).click();
@@ -73,6 +76,7 @@ test("successful stop and remove retains the active assignment result", async ({
   await expect(page.locator("#preview")).toContainText("Synthetic review document");
   await page.locator("#navigation-hub").click();
   await page.locator('[data-action="settings"]').click();
+  await page.locator('[data-action="repository-credentials"]').click();
   await page.locator('[data-action="assignments"]').click();
   await page.locator('[data-flow="workspace-atlas"]').click();
   await page.locator('[data-flow="remove-atlas-0"]').click();
