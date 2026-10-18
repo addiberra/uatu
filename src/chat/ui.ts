@@ -31,10 +31,11 @@ import { SilentRunFollower, TaskInspectionPanel, formatTaskElapsed, taskForChild
 import { composerRoutineState, formatUsd, latestPlanReport, latestRateLimit, planChip, planHasRows, planName, planReadoutRows, sessionTotalsTitle, standingSentence, usageAsOf, usageStale, type RateLimitStanding } from "./composer-status";
 import { buildPlanRowNodes, currentUsageReport, initUsagePaneControls, noteUsageReport, onUsageChange, onUsageRead, readStatusText, readUsageNow, refreshUsageIfStale, revealUsagePane, usageReadState, usageReadable } from "./usage-pane";
 import { isLiveConversationStatus } from "./types";
-import { AutomaticBackgroundNotices } from "./automatic-background";
+import { AutomaticBackgroundNotices, actionOrigin, automaticBackgroundNote } from "./automatic-background";
 import type { AutomaticBackgroundFeedback, BackgroundTaskItem } from "./types";
 import { contextReadout } from "./context-readout";
 import { HoldToQueue } from "./hold-to-queue";
+import { QueueDiscovery } from "./queue-discovery";
 import { buildReceiptRows, buildReceiptTotal, parseReceiptView, receiptHeading, subagentTrackSummary, subagentTranscriptTitle, type ReceiptView } from "./receipt-view";
 import { formatTokens, totalTokens } from "./usage";
 import { resolveSessionTotals, type ConversationTotals } from "./conversation-totals";
@@ -1136,9 +1137,16 @@ export function initChat(api = new ChatApiClient()): void {
   // an enabled button that would send the stop twice.
   const stoppingTasks = new Set<string>();
   const automaticNotes = new AutomaticBackgroundNotices();
+  const queueDiscovery = new QueueDiscovery(presentationLocalStorage());
   const actionFeedback = document.querySelector<HTMLElement>("#chat-action-feedback");
-  const recordAutomaticBackground = (conversationId: string, operationId: string, result: AutomaticBackgroundFeedback) => {
-    automaticNotes.record(conversationId, operationId, result.automaticBackground);
+  const recordAutomaticBackground = (conversationId: string, operationId: string, result: AutomaticBackgroundFeedback, action: string, text: string) => {
+    if (result.automaticBackground === "unknown") {
+      checkUnconfirmedAction(conversationId, operationId, action, text, "automatic backgrounding");
+      return;
+    }
+    if (result.automaticBackground === "failed" || result.automaticBackground === "unavailable") {
+      automaticNotes.unconfirmed(conversationId, operationId, `${actionOrigin(action, text)}: ${automaticBackgroundNote(result.automaticBackground)}`);
+    } else automaticNotes.record(conversationId, operationId, result.automaticBackground);
     syncControls();
   };
   const confirmChatAction = (title: string, message: string, accept: string, invoker?: HTMLElement): Promise<boolean> => {
@@ -2019,7 +2027,6 @@ export function initChat(api = new ChatApiClient()): void {
       isCommand: isListedCommand,
       ...(queueNoteElement ? { note: queueNoteElement } : {}),
     });
-    syncQueueOverflow();
     syncHistoryControls();
     rendering = false;
     syncTaskList();
@@ -2027,6 +2034,7 @@ export function initChat(api = new ChatApiClient()): void {
     syncBackgroundTasks();
     syncCompactWork();
     syncScheduledWakeups();
+    syncQueueOverflow();
     syncOutstandingRequests();
     syncContextIndicator();
     syncPromptRail();
@@ -3653,11 +3661,17 @@ export function initChat(api = new ChatApiClient()): void {
   // elsewhere, or a stale echo a reload left behind — so the local copy
   // reconciles to that instead of stranding buttons that can only ever 409;
   // and a 409 carrying the already-delivered code is said as such ("Too late").
-  const queueActionFailed = (error: unknown, conversationId: string, messageId: string, steerAction: boolean, operationId: string) => {
-    if (error instanceof ChatTransportError && (error.code === "operation_outcome_unknown" || steerAction && (error.status === undefined || error.status >= 500)) || error instanceof ChatConnectionInterruptedError) {
-      automaticNotes.unconfirmed(conversationId, operationId, "Steer/resume acceptance unconfirmed. Refreshing status; do not repeat this action.");
+  const checkUnconfirmedAction = (conversationId: string, operationId: string, action: string, text: string, subject = "acceptance") => {
+    automaticNotes.unconfirmed(conversationId, operationId, action, text, subject);
+    syncControls();
+    void refreshSelectedConversation(conversationId).then(available => {
+      automaticNotes.checked(conversationId, operationId, available);
       syncControls();
-      void refreshSelectedConversation(conversationId);
+    });
+  };
+  const queueActionFailed = (error: unknown, conversationId: string, messageId: string, steerAction: boolean, operationId: string, action: string, text: string) => {
+    if (error instanceof ChatTransportError && (error.code === "operation_outcome_unknown" || steerAction && (error.status === undefined || error.status >= 500)) || error instanceof ChatConnectionInterruptedError) {
+      checkUnconfirmedAction(conversationId, operationId, action, text);
       return;
     }
     if (error instanceof ChatTransportError && error.status === 409) {
@@ -3747,18 +3761,46 @@ export function initChat(api = new ChatApiClient()): void {
             : api.sendNow(conversationId, messageId, operationId);
     void operation
       .then(result => {
-        if (result && typeof result === "object") recordAutomaticBackground(conversationId, operationId, result as AutomaticBackgroundFeedback);
+        if (result && typeof result === "object") recordAutomaticBackground(conversationId, operationId, result as AutomaticBackgroundFeedback,
+          queueSteer !== undefined ? "Queue → Steer" : queueSendNow !== undefined ? "Send now" : "Pending action", entry?.text ?? "");
         if (activeConversationId() !== conversationId) return;
         noteComposer(null);
       })
-      .catch(error => queueActionFailed(error, conversationId, messageId, steerAction, operationId))
+      .catch(error => queueActionFailed(error, conversationId, messageId, steerAction, operationId,
+        queueSteer !== undefined ? "Queue → Steer" : queueSendNow !== undefined ? "Send now" : queueQueue !== undefined ? "Steer → Queue" : queueEdit !== undefined ? "Edit pending message" : "Remove pending message", entry?.text ?? ""))
       .finally(() => { target.disabled = false; });
   });
 
   function syncQueueOverflow() {
     if (!queueDockElement) return;
     const touch = document.documentElement.dataset.uiMode === "touch";
-    const scroller = touch ? queueDockElement.parentElement! : queueDockElement;
+    const scroller = queueDockElement.parentElement!;
+    if (touch) {
+      const workerHeading = compactWorkersList?.hidden ? null : compactWorkersList?.querySelector("summary");
+      const pendingHeading = queueDockElement.hidden ? null : queueDockElement.querySelector(".chat-queue-header");
+      const workerHeight = workerHeading?.getBoundingClientRect().height ?? 0;
+      const pendingHeight = pendingHeading?.getBoundingClientRect().height ?? 0;
+      scroller.style.setProperty("--chat-worker-heading-height", `${workerHeight}px`);
+      const sharedRow = document.documentElement.hasAttribute("data-chat-short") && compactWorkersList?.open && !queueDockElement.hidden;
+      const height = sharedRow ? Math.max(workerHeight, pendingHeight) : workerHeight + pendingHeight;
+      scroller.toggleAttribute("data-headings-tight", scroller.clientHeight < height + 46);
+      // Enlarged batch headings can scroll away. Reserving their height as
+      // sticky padding would make a complete replacement warning unrevealable.
+      const pinned = (heading: Element | null | undefined, size: number) => heading && (typeof getComputedStyle !== "function" || getComputedStyle(heading).position === "sticky") ? size : 0;
+      const workerPin = pinned(workerHeading, workerHeight), pendingPin = pinned(pendingHeading, pendingHeight);
+      scroller.style.setProperty("--chat-work-heading-height", `${sharedRow ? Math.max(workerPin, pendingPin) : workerPin + pendingPin}px`);
+    } else {
+      scroller.removeAttribute("data-headings-tight");
+      // A constrained dock is display:none. Keep its last measured heading
+      // budget so hiding it cannot oscillate the Show work decision.
+      if (typeof getComputedStyle === "function" && getComputedStyle(scroller).display === "none") return;
+      let height = 0;
+      for (const heading of scroller.querySelectorAll<HTMLElement>(":scope > details:not([hidden]) > summary, :scope > #chat-queue:not([hidden]) > .chat-queue-header")) {
+        heading.style.setProperty("--chat-heading-top", `${height}px`);
+        height += heading.getBoundingClientRect().height;
+      }
+      scroller.style.setProperty("--chat-work-heading-height", `${height}px`);
+    }
     if (touch) queueDockElement.classList.remove("has-more-below");
     scroller.classList.toggle("has-more-below", scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop > 1);
   }
@@ -3783,6 +3825,10 @@ export function initChat(api = new ChatApiClient()): void {
     send?.setAttribute("aria-label", sendAction);
     if (send) send.title = sendAction;
     const help = document.querySelector<HTMLElement>("#chat-send-help");
+    const discovery = document.querySelector<HTMLElement>("#chat-queue-discovery");
+    if (discovery) discovery.hidden = !queueDiscovery.visible(!send?.disabled && isLiveConversationStatus(projection?.status)
+      && sendSupportsHold() && !isListedCommand(input?.value ?? "") && currentPendingAttachments().length === 0
+      && !attachmentStaging.has(activeConversationId() ?? "") && Boolean(input?.value.trim()));
     const keys = sendSupportsHold() && !isListedCommand(input?.value ?? "") && currentPendingAttachments().length === 0
       ? `${touch ? "Ctrl+Enter" : "Enter"}: ${label}; Alt+Enter: ${preferred === "steer" ? "Queue" : "Steer"} while working`
       : `${touch ? "Ctrl+Enter" : "Enter"} sends`;
@@ -4541,6 +4587,7 @@ export function initChat(api = new ChatApiClient()): void {
   let holdFrame = 0;
   let suppressPointerClick = false;
   let ownedSpace = false;
+  let requestedByHold = false;
   const submitDelivery = (delivery: MessageDelivery) => {
     requestedDelivery = delivery;
     form.requestSubmit();
@@ -4551,7 +4598,7 @@ export function initChat(api = new ChatApiClient()): void {
     return JSON.stringify([selectionGeneration, projection.conversationId, input.value,
       currentPendingAttachments(), attachmentStaging.has(projection.conversationId), displayedConfiguration(),
       box.left, box.top, box.width, box.height]);
-  }, submitDelivery);
+  }, delivery => { requestedByHold = delivery === "queue"; submitDelivery(delivery); });
   const clearHoldVisual = () => {
     if (holdTimer !== null) clearTimeout(holdTimer);
     holdTimer = null;
@@ -4889,6 +4936,8 @@ export function initChat(api = new ChatApiClient()): void {
     // refusing this attempt, and keep accepted submissions' delivery local
     // across awaits (such as attachment staging).
     const submissionDelivery = requestedDelivery;
+    const submissionByHold = requestedByHold;
+    requestedByHold = false;
     requestedDelivery = undefined;
     if (!projection || submitting || cancelling) return;
     const aside = /^\/btw(?:\s+([\s\S]*))?$/.exec(input.value.trim());
@@ -5179,7 +5228,8 @@ export function initChat(api = new ChatApiClient()): void {
         scheduleRender(true);
       }
       noteComposer(null);
-      recordAutomaticBackground(conversationId, requestId, accepted);
+      queueDiscovery.accepted(submissionByHold && accepted.pending && accepted.delivery === "queue");
+      recordAutomaticBackground(conversationId, requestId, accepted, "Steer", text);
       // Addressed to the submitted conversation, not the selection: the
       // acceptance may land after a switch, and clearing the selected
       // conversation's own error would erase an unrelated reason.
@@ -5198,12 +5248,11 @@ export function initChat(api = new ChatApiClient()): void {
           projection = markDraftUnconfirmed(projection, requestId);
           scheduleRender();
         }
-        automaticNotes.unconfirmed(conversationId, requestId, "Steer acceptance unconfirmed. Refreshing status; do not repeat this input.");
         for (const staged of stagedAttachments) URL.revokeObjectURL(staged.previewUrl);
         releaseAttachmentReserve();
         submitting = false;
         syncControls();
-        void refreshSelectedConversation(conversationId);
+        checkUnconfirmedAction(conversationId, requestId, "Steer", text);
         return;
       }
       const message = messageOf(error);
@@ -5265,7 +5314,8 @@ export function initChat(api = new ChatApiClient()): void {
       return height + child.getBoundingClientRect().height + (parseFloat(css.marginTop) || 0) + (parseFloat(css.marginBottom) || 0);
     }, 0);
     const floor = parseFloat(getComputedStyle(transcript).minHeight) || 0;
-    const minimum = parseFloat(getComputedStyle(dock).minHeight) || 52;
+    const minimum = Math.max(parseFloat(getComputedStyle(dock).minHeight) || 52,
+      (parseFloat(dock.style.getPropertyValue("--chat-work-heading-height")) || 0) + Math.max(48, (parseFloat(getComputedStyle(root).fontSize) || 16) * 3) + 2);
     const constrained = hasWork && surface.clientHeight - fixed - floor < minimum;
     root.toggleAttribute("data-chat-work-constrained", constrained);
     if (!constrained) {
@@ -5308,8 +5358,9 @@ export function initChat(api = new ChatApiClient()): void {
       for (let parent = focused.parentElement; parent; parent = parent.parentElement) {
         if (/(auto|scroll|hidden)/.test(getComputedStyle(parent).overflowY)) {
           const box = focused.getBoundingClientRect();
-          const top = parent.getBoundingClientRect().top + parent.clientTop;
-          const bottom = top + parent.clientHeight;
+          const top = parent.getBoundingClientRect().top + parent.clientTop
+            + (parent === workDock ? parseFloat(parent.style.getPropertyValue("--chat-work-heading-height")) || 0 : 0);
+          const bottom = parent.getBoundingClientRect().top + parent.clientTop + parent.clientHeight - 1;
           if (box.top - ring < top) parent.scrollTop += Math.floor(box.top - ring - top);
           else if (box.bottom + ring > bottom) parent.scrollTop += Math.ceil(box.bottom + ring - bottom);
         }

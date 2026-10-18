@@ -147,7 +147,7 @@ test.describe("steering an OpenCode 2.x turn", () => {
     for (let index = 1; index <= 5; index++) await submit(page, `Audit pending ${index}: preserve this longer message for a readable dock`, index > 2 ? "Alt+Enter" : "Enter");
     if (mode === "touch") await page.locator("[data-pending-toggle]").click();
     const queue = page.locator("#chat-queue");
-    const scroller = mode === "touch" ? page.locator("#chat-work-dock") : queue;
+    const scroller = page.locator("#chat-work-dock");
     await scroller.evaluate(element => { element.scrollTop = 0; });
     await expect(queue.locator(".chat-queue-header")).toContainText(mode === "touch" ? "2 steers · 3 queued" : "5 pending · 2 steers · 3 queued");
     await expect(scroller).toHaveClass(/has-more-below/);
@@ -526,7 +526,7 @@ test.describe("steering an OpenCode 2.x turn", () => {
   test("Revert reveals its replacement warning in an already-scrolled dock without stealing subsequent scroll", async ({ page, request }, testInfo) => {
     await startTurn(page, request);
     for (let index = 1; index <= 6; index++) await submit(page, `Pending steer ${index}`);
-    const queue = page.locator("#chat-queue");
+    const queue = page.locator("#chat-work-dock");
     const note = page.locator("#chat-queue-note");
     await queue.evaluate(element => { element.scrollTop = element.scrollHeight; });
     expect(await queue.evaluate(element => element.scrollTop)).toBeGreaterThan(0);
@@ -838,6 +838,12 @@ for (const browserName of ["chromium", "webkit"] as const) test.describe(`steeri
       chrome: [...node.children].map(child => ({ id: child.id, height: child.getBoundingClientRect().height, display: getComputedStyle(child).display, position: getComputedStyle(child).position })),
     })), null, 2));
     await warning.scrollIntoViewIfNeeded();
+    await saveEvidence(info, `${evidence}-200pct-warning-exposure.json`, JSON.stringify(await warning.evaluate(node => {
+      const dock = node.closest(".chat-work-dock")!;
+      return { warning: node.getBoundingClientRect().toJSON(), dock: dock.getBoundingClientRect().toJSON(), scroll: dock.scrollTop,
+        heading: dock.querySelector(".chat-queue-header")!.getBoundingClientRect().toJSON(),
+        styles: [dock, node.parentElement!, dock.querySelector(".chat-queue-header")!].map(e => ({ tag: e.id || e.className, display: getComputedStyle(e).display, position: getComputedStyle(e).position, container: getComputedStyle(e).container, padding: getComputedStyle(e).scrollPaddingTop })) };
+    }), null, 2));
     await expect(warning).toBeInViewport({ ratio: 1 });
     // Reveal text below the sticky count/batch header, not merely within the
     // viewport bounds behind that header. This is a deliberate dock scroll.
@@ -927,6 +933,7 @@ for (const browserName of ["chromium", "webkit"] as const) test.describe(`steeri
           const centerX = box.left + box.width / 2, centerY = box.top + box.height / 2;
           const points = [[box.left + 2, centerY], [box.right - 2, centerY], [centerX, box.top + 2], [centerX, box.bottom - 2], [centerX, centerY]];
           return { width: box.width, height: box.height, visibleWidth: right - left, visibleHeight: bottom - top,
+            occludedBy: points.map(([x, y]) => { const hit = document.elementFromPoint(x!, y!); return { x, y, hit: hit?.outerHTML.slice(0, 220), owned: node.contains(hit) }; }),
             top: box.top, bottom: box.bottom, ancestors,
             header: node.closest(".chat-work-dock")!.querySelector(".chat-queue-header")!.getBoundingClientRect().toJSON(),
             unoccluded: points.every(([x, y]) => node.contains(document.elementFromPoint(x!, y!))) };

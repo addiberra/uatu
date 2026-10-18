@@ -62,18 +62,20 @@ describe("chat reversible-history composer", () => {
       };
       const feedback = document.querySelector<HTMLElement>("#chat-action-feedback")!;
       submit("First steer");
-      await waitUntil(() => feedback.textContent!.includes("could not be confirmed"));
+      await waitUntil(() => feedback.textContent!.includes("Status checked; automatic backgrounding still unconfirmed"));
+      expect(feedback.textContent).toContain('Steer “First steer”');
       const remove = document.querySelector<HTMLButtonElement>('[data-queue-remove="unrelated"]')!;
       remove.dispatchEvent(new window.Event("click", { bubbles: true }));
       await waitUntil(() => removes === 1 && !remove.disabled);
       expect(feedback.hidden).toBe(false);
-      expect(feedback.textContent).toContain("could not be confirmed");
+      expect(feedback.textContent).toContain("automatic backgrounding still unconfirmed");
       submit("Another steer");
       await waitUntil(() => prompts === 2 && document.querySelector("#chat-queue")!.textContent!.includes("Another steer"));
       expect(feedback.textContent).not.toContain("acknowledged");
       parent!.event({ type: "conversation.status", generation: "g", sequence: 1, conversationId: "one", status: "completed" }, "cursor-one-1");
       await waitUntil(() => document.querySelector<HTMLButtonElement>("#chat-stop")!.disabled);
-      expect(feedback.textContent).toContain("could not be confirmed");
+      expect(feedback.textContent).toContain("automatic backgrounding still unconfirmed");
+      expect(feedback.textContent).toContain('Steer “First steer”');
       expect(removes).toBe(1);
     } finally { window.dispatchEvent(new window.Event("pagehide")); }
   });

@@ -1109,7 +1109,7 @@ export function decorateAttachmentImages(root: HTMLElement): void {
 }
 
 function renderDraft(draft: AcceptedDraft): string {
-  const label = draft.unconfirmed ? "Acceptance unconfirmed — refreshing status" : draft.messageId.startsWith("pending:") ? "Sending…" : "Delivered, waiting for agent history";
+  const label = draft.unconfirmed ? "Acceptance unconfirmed — do not repeat" : draft.messageId.startsWith("pending:") ? "Sending…" : "Delivered, waiting for agent history";
   return `<article class="chat-item chat-user-message is-pending" data-chat-item-id="draft-${escapeHtmlAttribute(draft.requestId)}">${renderMessageAttachments(draft.attachments)}${draft.text ? `<p>${escapeHtml(draft.text)}</p>` : ""}<small>${label}</small></article>`;
 }
 
@@ -1168,7 +1168,7 @@ function renderQueued(entry: QueuedMessage, context: QueueDockContext, discrimin
   const classes = `chat-queued-message ${entry.delivery === "steer" ? "is-steer" : "is-held"}`;
   const message = entry.text.trim() ? entry.text : "Image attachment";
   const buttons = (entry.unconfirmed ? [] : queuedActions(entry, context)).map(([attribute, label]) => `<button type="button" class="chat-queued-action${attribute === "data-queue-remove" ? " chat-queued-remove" : ""}" aria-label="${escapeHtmlAttribute(`${label} “${message}”${discriminator === undefined ? "" : `, pending message ${discriminator}`}`)}" ${attribute}="${id}">${escapeHtml(label)}</button>`).join("");
-  return `<article class="${classes}" role="listitem" data-chat-queued-id="${id}" data-delivery="${entry.delivery}"${entry.paused ? " data-paused" : ""}><div class="chat-queued-heading"><strong class="chat-queued-badge">${entry.delivery === "steer" ? "Steer" : "Queue"}</strong>${entry.unconfirmed ? '<span class="chat-queued-paused">Acceptance unconfirmed</span>' : entry.paused ? '<span class="chat-queued-paused">Paused</span>' : ""}<small class="chat-queued-tag">${entry.unconfirmed ? "Refreshing status; do not repeat this action" : escapeHtml(queuedTag(entry))}</small></div>${renderMessageAttachments(entry.attachments)}${entry.text ? `<p>${escapeHtml(entry.text)}</p>` : ""}<footer class="chat-queued-row"><span class="chat-queued-actions">${buttons}</span></footer></article>`;
+  return `<article class="${classes}" role="listitem" data-chat-queued-id="${id}" data-delivery="${entry.delivery}"${entry.paused ? " data-paused" : ""}><div class="chat-queued-heading"><strong class="chat-queued-badge">${entry.delivery === "steer" ? "Steer" : "Queue"}</strong>${entry.unconfirmed ? '<span class="chat-queued-paused">Acceptance unconfirmed</span>' : entry.paused ? '<span class="chat-queued-paused">Paused</span>' : ""}<small class="chat-queued-tag">${entry.unconfirmed ? "Do not repeat this pending message" : escapeHtml(queuedTag(entry))}</small></div>${renderMessageAttachments(entry.attachments)}${entry.text ? `<p>${escapeHtml(entry.text)}</p>` : ""}<footer class="chat-queued-row"><span class="chat-queued-actions">${buttons}</span></footer></article>`;
 }
 
 /**
@@ -1199,7 +1199,33 @@ export class QueueDockRenderer {
       : `<span>${breakdown || "No pending messages"}</span>`;
     const heading = context.compactOpen === undefined ? `<strong>${counts}</strong>` : `<button type="button" class="chat-pending-toggle" data-pending-toggle aria-expanded="${context.compactOpen}" aria-controls="chat-queue-items">${counts}</button>`;
     const headerHtml = `${heading}${paused ? `<button type="button" class="chat-queued-action" data-queue-send-now="${escapeHtmlAttribute(paused.id)}">Send ${context.pausedSteers} paused steer${context.pausedSteers === 1 ? "" : "s"} now</button>` : ""}`;
-    if (header.innerHTML !== headerHtml) header.innerHTML = headerHtml;
+    if (header.innerHTML !== headerHtml) {
+      // Counts/expansion can change between pointerdown and click. Keep the
+      // actual action nodes, not merely a replacement's restored focus.
+      const next = target.ownerDocument.createElement("div");
+      next.innerHTML = headerHtml;
+      const previous = [...header.children];
+      const ordered = [...next.children].map(candidate => {
+        const existing = previous.find(node => node.tagName === candidate.tagName
+          && ["data-pending-toggle", "data-queue-send-now"].every(key => node.getAttribute(key) === candidate.getAttribute(key)));
+        if (!existing) return candidate;
+        for (const attribute of [...existing.attributes]) {
+          // The request handler owns this transient lock until its finally;
+          // a count repaint must not admit the same batch action twice.
+          if (attribute.name === "disabled" && existing.tagName === "BUTTON") continue;
+          if (!candidate.hasAttribute(attribute.name)) existing.removeAttribute(attribute.name);
+        }
+        for (const attribute of [...candidate.attributes]) existing.setAttribute(attribute.name, attribute.value);
+        if (existing.innerHTML !== candidate.innerHTML) existing.innerHTML = candidate.innerHTML;
+        return existing;
+      });
+      let cursor = header.firstElementChild;
+      for (const node of ordered) {
+        if (node === cursor) cursor = cursor.nextElementSibling;
+        else header.insertBefore(node, cursor);
+      }
+      for (const node of previous) if (!ordered.includes(node)) node.remove();
+    }
     // The entries live in the dock's own list; the note sits beside it, so
     // the list holds list items only.
     let list = target.querySelector<HTMLElement>(":scope > .chat-queue-items");
@@ -1283,8 +1309,8 @@ export class QueueDockRenderer {
             const warning = note.querySelector(".chat-queue-replacement") ?? note;
             const bounds = warning.getBoundingClientRect();
             const visible = dock.getBoundingClientRect();
-            const top = visible.top + dock.clientTop;
-            const bottom = top + dock.clientHeight;
+            const top = visible.top + dock.clientTop + (dock.hasAttribute("data-headings-tight") ? 0 : parseFloat(dock.style.getPropertyValue("--chat-work-heading-height")) || 0);
+            const bottom = visible.top + dock.clientTop + dock.clientHeight;
             if (bounds.top < top) dock.scrollTop += Math.floor(bounds.top - top);
             else if (bounds.bottom > bottom) dock.scrollTop += Math.ceil(Math.min(bounds.top - top, bounds.bottom - bottom));
           };

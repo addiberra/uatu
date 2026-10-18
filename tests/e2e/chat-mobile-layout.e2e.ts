@@ -141,7 +141,8 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`mobile layo
     await page.locator("#chat-input").focus();
     await visualHeight(page, scene.visual);
     const warning = page.locator("#chat-action-feedback");
-    await expect(warning).toContainText("could not be confirmed");
+    await expect(warning).toContainText("automatic backgrounding still unconfirmed");
+    await expect(warning).toContainText("Steer with uncertain background outcome");
     await expect(warning).toBeVisible();
     expect((await page.locator("#chat-input").boundingBox())!.width).toBeGreaterThanOrEqual(140);
     await containedControls(page, scene.visual);
@@ -153,7 +154,8 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`mobile layo
     await expect(page.locator("#chat-input")).toHaveValue("Keep this editable draft");
     await captureScreenshot(page, testInfo, `mobile-${engine}-unknown-${scene.width}`);
     await control(request, { op: "finish", conversationId: id });
-    await expect(warning).toContainText("could not be confirmed");
+    await expect(warning).toContainText("automatic backgrounding still unconfirmed");
+    await expect(warning).toContainText("Steer with uncertain background outcome");
   });
 
   test("compact disclosures retain deliberate state and leave safety outside the collapse", async ({ page, request }, testInfo) => {
@@ -482,7 +484,8 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`mobile layo
       expect((await toggle.boundingBox())!.height).toBeGreaterThanOrEqual(44);
       expect(await page.locator("#chat-timeline").evaluate(node => node.clientHeight)).toBeGreaterThanOrEqual(168);
       expect((await page.locator("#chat-composer").boundingBox())!.y + (await page.locator("#chat-composer").boundingBox())!.height).toBeLessThanOrEqual(480);
-      await expect(page.locator("#chat-action-feedback")).toContainText("could not be confirmed");
+      await expect(page.locator("#chat-action-feedback")).toContainText("automatic backgrounding still unconfirmed");
+      await expect(page.locator("#chat-action-feedback")).toContainText("One pending steer");
       await toggle.focus();
       await page.keyboard.press("Enter");
       await expect(page.locator("#chat-work-close")).toBeFocused();
@@ -543,6 +546,10 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`mobile layo
         await expect(page.locator("#chat-background-tasks")).toHaveAttribute("open");
         await saveEvidence(testInfo, `combined-${engine}-${height}.json`, JSON.stringify(await surface.evaluate(node => ({ panel: node.clientHeight, scroll: node.scrollHeight, transcript: document.querySelector("#chat-timeline")!.clientHeight, dock: document.querySelector("#chat-work-dock")!.getBoundingClientRect().height, composerBottom: document.querySelector("#chat-composer")!.getBoundingClientRect().bottom })), null, 2));
         await captureScreenshot(page, testInfo, `combined-${engine}-desktop-${height}`);
+        // The shared heading band can require the existing explicit work
+        // sheet sooner than nested lists did. Verify the same full action.
+        const workToggle = page.locator("#chat-work-toggle");
+        if (await workToggle.isVisible()) await workToggle.click();
         const stop = page.locator("#chat-background-tasks [data-stop-task]").first();
         await stop.scrollIntoViewIfNeeded();
         await stop.focus();
@@ -558,6 +565,7 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`mobile layo
         expect(exposure.ring).toBeGreaterThan(0);
         for (const gap of [exposure.top, exposure.bottom, exposure.left, exposure.right]) expect(gap).toBeGreaterThanOrEqual(0);
         await captureScreenshot(page, testInfo, `worker-exposure-${engine}-${height}`);
+        if (await page.locator("#chat-work-close").isVisible()) await page.locator("#chat-work-close").click();
         await page.locator("#chat-input").focus();
       }
       await page.locator("#chat-work-dock").evaluate(node => { node.scrollTop = 0; });
@@ -572,7 +580,9 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`mobile layo
       await control(request, { op: "launchWorker", conversationId: id });
       await expect(page.locator("#chat-background-tasks-items > li")).toHaveCount(2);
       expect(await page.locator("#chat-work-dock").evaluate(node => node.scrollTop)).toBe(0);
-      await expect(warning).not.toBeInViewport();
+      // Replacement safety precedes the expanded bodies in the shared grid;
+      // a live worker update must still leave the deliberate top scroll alone.
+      await expect(warning).toBeInViewport();
     });
   });
 

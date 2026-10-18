@@ -55,6 +55,15 @@ either that snapshot or the child receipt ends composite replay protection.
 Queue → Steer and Send now response loss or server errors show persistent
 unconfirmed guidance for the current page and refresh state read-only, leaving
 an unrelated composing draft untouched. Reconnect/reload does not replay them.
+Warnings name the originating action and a short plain-text message excerpt
+(a short operation identifier for attachment-only inputs). “Checking conversation
+status” lasts only for the read; its completion says either “Status checked;
+acceptance still unconfirmed” or that the status check was unavailable. A status
+read alone is not an acceptance receipt. Unrelated successes do not clear these
+warnings. Notice excerpts are page-local and bounded to 20 operations in each of
+100 conversations; neither receipts nor excerpts are persisted.
+Multiple warnings share the existing focusable, bounded scrolling feedback
+region rather than displacing the message field or primary actions.
 
 ## Prerequisites
 
@@ -122,6 +131,11 @@ sends dispatch normally, rather than inventing a pending queue entry.
 There is no Send dropdown. Keyboard users can hold Space on Send for the same
 two-second Queue action; Enter activates Send immediately. Escape cancels the
 hold and preserves focus. Send's accessible description explains these keys.
+A compact “Tap to steer · hold to queue” hint appears only with an eligible
+ordinary-text draft while work is running. An accepted held queue submission
+retires it for this browser/base path, not the account. Cancellation, refusal,
+an uncertain outcome and an ordinary tap do not retire it. If browser storage
+is unavailable, successful use is remembered only for the current page.
 Desktop Enter in the message field uses the existing per-device preference;
 on touch devices Enter always adds a newline and Ctrl/Command+Enter submits.
 Alt/Option+Enter uses the other choice. Send's accessible description names the
@@ -178,6 +192,18 @@ Other dormant queued messages remain held. Undo's count-only warning explains
 which batch will accompany the replacement, without repeating message text.
 
 On touch screens, work tracks share a bounded, independently scrollable dock.
+Its worker and pending summaries stay visible together above expanded contents,
+including while the software keyboard is open. Both summaries share the dock's
+single scroll owner; expanding a track does not move it to a top sheet.
+Desktop likewise keeps its existing worker disclosures and pending header in a
+shared leading band, with expanded contents using the dock rather than nested
+list scrollers. Disclosure defaults and the explicit constrained Show work
+fallback are unchanged.
+Short expanded touch bands put the two summaries side by side. If the measured
+dock cannot fit its heading band plus a complete 44px action, the headings scroll
+with the contents so Stop remains fully reachable; transcript/safe-area budgets
+are not enlarged to pin secondary chrome. Narrow enlarged paused-batch headings
+likewise retain their existing scroll-away behavior.
 Short keyboard/landscape layouts use compact input controls and counts;
 uncertain feedback has its own scrollable band (a bounded column in landscape),
 so it cannot consume the draft field. The inline model/context pill opens the

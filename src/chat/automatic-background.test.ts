@@ -1,6 +1,33 @@
 import { expect, test } from "bun:test";
 import { AutomaticBackgroundNotices, automaticBackgroundNote } from "./automatic-background";
 
+test("uncertain action retains a bounded plain excerpt and truthful read lifecycle", () => {
+  const notices = new AutomaticBackgroundNotices();
+  notices.unconfirmed("parent", "source", "Queue → Steer", "<img onerror=bad>\n" + "long ".repeat(100));
+  expect(notices.text("parent")).toContain('Queue → Steer “<img onerror=bad>');
+  expect(notices.text("parent").length).toBeLessThan(260);
+  expect(notices.text("parent")).toContain("Checking conversation status");
+  notices.checked("parent", "source", true);
+  expect(notices.text("parent")).toContain("Status checked; acceptance still unconfirmed");
+  notices.record("parent", "unrelated", "accepted");
+  expect(notices.text("parent")).toContain("<img onerror=bad>");
+  notices.unconfirmed("parent", "attachment", "Send now", "");
+  expect(notices.text("parent")).toContain("attachment-only message");
+  notices.checked("parent", "attachment", false);
+  expect(notices.text("parent")).toContain("Status check unavailable");
+});
+
+test("notice memory is bounded across conversations and operations", () => {
+  const notices = new AutomaticBackgroundNotices();
+  for (let conversation = 0; conversation < 101; conversation++) {
+    for (let operation = 0; operation < 21; operation++) notices.unconfirmed(`c${conversation}`, `op${operation}`, "Steer", `message ${operation}`);
+  }
+  expect(notices.text("c0")).toBe("");
+  expect(notices.text("c100")).not.toContain("message 0”");
+  expect(notices.text("c100").match(/acceptance unconfirmed/g)).toHaveLength(20);
+  expect(notices.text("c100")).toContain("message 20”");
+});
+
 test("automatic feedback preserves accepted steer without claiming delivery, worker counts or completion", () => {
   expect(automaticBackgroundNote(undefined)).toBe("");
   expect(automaticBackgroundNote("accepted")).toBe("");

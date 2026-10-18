@@ -44,6 +44,39 @@ Standard-size phone/short-landscape layouts retain 40%, and ordinary enlarged
 pending work retains its tested reading floor; no universal enlarged-text 40%
 guarantee is claimed.
 
+The approved critique refinement keeps worker and pending headings together
+at the dock edge before either expanded body. Touch details and the queue are
+flattened into the existing single grid/scroller; measured heading heights
+reserve focus-scroll space, including after keyboard resize. Native worker
+disclosure semantics and per-conversation state remain unchanged. Pending
+header actions retain DOM identity across count/expansion paints. This
+supersedes the short expanded-header scroll-away rule above; enlarged paused
+batch headers retain their existing text-relative scroll-away exception.
+Desktop similarly groups its existing disclosure headings with pending counts,
+without changing their defaults or explicit constrained Show work fallback;
+expanded tracks use the dock's aggregate budget instead of nested list caps.
+Replacement warnings precede either expanded body in both modes.
+Short expanded touch bands share one summary row. When the measured dock cannot
+fit that row plus a whole 44px action, headings scroll with the contents, retaining
+the earlier smallest-band action-access exception rather than spending the
+transcript/safe-area budget. Desktop's explicit constrained fallback now accounts
+for its actual heading band plus a full action. Long desktop composer feedback
+uses the existing focusable notice region's bounded scrolling, not clipped primary
+controls. Container sizing for enlarged paused-batch chrome is owned by the dock
+now that the queue itself is flattened; its content-relative threshold is preserved.
+
+An eligible ordinary-text busy draft teaches “Tap to steer · hold to queue”.
+Only accepted held queue use retires the hint, using a browser/base-path learning
+bit with page-local fallback if storage is unavailable. No account API is added.
+Uncertain warnings name their action and bounded plain-text excerpt (or short
+attachment-only operation identifier). Read progress follows the actual snapshot
+promise, then reports checked-but-unconfirmed or unavailable; a snapshot does
+not masquerade as a mutation receipt. Notices remain page-local, with at most
+20 operations per conversation and 100 conversations, unaffected by unrelated
+success. Question cards paint above date markers without changing timeline
+geometry. Settings help explicitly distinguishes absent standalone Hub
+automation/manual chat Continue from available native facilities/background API.
+
 Pinned native evidence: [question tool](https://github.com/anomalyco/opencode/blob/v2.0.29/packages/core/src/tool/plugin/question.ts)
 awaits `Form.ask` and does not register a backgroundable Job.
 [Job.backgroundAll](https://github.com/anomalyco/opencode/blob/v2.0.29/packages/core/src/job.ts)

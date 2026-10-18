@@ -31,6 +31,12 @@ A continuous two-second pointer or focused-Send Space hold SHALL automatically s
 - **THEN** it respectively steers once, sends nothing, or queues automatically once before release
 - **AND** subsequent click, release and timer events cannot duplicate that action
 
+#### Scenario: First eligible busy draft teaches queueing once
+- **WHEN** an unlearned browser has a valid ordinary-text draft while working and hold-to-queue is supported
+- **THEN** compact accessible copy says “Tap to steer · hold to queue” without a menu
+- **AND** only an accepted held queue submission retires it for this browser/base path; cancellation, refusal, uncertainty and tap do not
+- **AND** unavailable browser storage falls back to page-local learning without an account API
+
 #### Scenario: A stale or inactive hold never sends
 - **WHEN** the tab loses visibility/focus, a pointer is cancelled or leaves the original button, Escape is pressed, or the owned conversation/draft/configuration changes
 - **THEN** the hold and any delayed timer are cancelled without steering or queueing
@@ -113,6 +119,16 @@ Expanded worker details SHALL show one flat list: confirmed working and unknown 
 - **WHEN** Undo/revert has staged a replacement and paused steers would resume together with the replacement or batch Send
 - **THEN** pending counts, the applicable batch action and the full replacement/batch consequence remain readable without expanding details, including while typing
 - **AND** no hidden warning is treated as user confirmation
+
+#### Scenario: Expanded workers retain the pending overview
+- **WHEN** six or more workers and pending messages are expanded on touch or desktop, including while the touch keyboard is open
+- **THEN** worker and pending summaries remain visible together at the dock edge with one scroller for expanded content below
+- **AND** summary action identity, composing focus, reading anchors, safe areas and existing transcript budgets are preserved
+- **AND** short touch bands share one heading row; if the measured budget cannot contain it plus a complete 44px action, headings scroll away to expose that action rather than consume transcript space
+
+#### Scenario: Enlarged question options remain readable beneath date history
+- **WHEN** question options intersect a sticky date marker on a 390px touch viewport at 200% root text size
+- **THEN** the marker does not paint over the interactive question content and keyboard answering remains available without changing scroll-anchor geometry
 
 #### Scenario: Settled and uncertain workers remain truthful
 - **WHEN** the retained worker set includes a failure, a stopped worker and one unresolved outcome
@@ -218,6 +234,12 @@ Native steer/resume unknown retention SHALL remain active without automatic-poli
 - **WHEN** the provider confirms the steer but definitively refuses its background follow-up
 - **THEN** the action reports the accepted steer and failed/unavailable follow-up separately with explanatory text
 - **AND** the accepted message is neither restored to the draft nor requeued/resubmitted
+
+#### Scenario: Uncertain action feedback identifies its source and actual status read
+- **WHEN** a primary or automatic-background outcome is unknown
+- **THEN** the warning names the originating action and bounded safe plain-text excerpt or short attachment-only identifier
+- **AND** checking language follows the real read-only snapshot request and changes to checked-but-unconfirmed or check-unavailable when it settles, never implying that the read confirmed the mutation
+- **AND** unrelated success does not dismiss the warning; notices remain bounded and page-local, without persisted receipts, automatic resend or duplicate controls
 
 #### Scenario: Upstream background response is lost after application
 - **WHEN** native backgrounding may have applied but Uatu cannot confirm its response

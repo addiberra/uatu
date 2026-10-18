@@ -17,6 +17,23 @@ const { QueueDockRenderer, RevertedMessagesDockRenderer, TimelineRenderer, mater
 // say about a running run is checked where the entries are built.
 const { subagentTrackSummary } = await import("./receipt-view");
 
+test("pending header actions retain DOM identity through count and expansion changes", () => {
+  const host = dom.document.createElement("div") as unknown as HTMLElement;
+  const renderer = new QueueDockRenderer();
+  const queued = [{ id: "a", text: "First", queuedAt: 1, delivery: "steer" as const, paused: true as const }];
+  const context = { steering: true, sendNow: true, running: false, isCommand: () => false, compactOpen: false };
+  renderer.render(host, queued, context);
+  const toggle = host.querySelector("[data-pending-toggle]");
+  const resume = host.querySelector("[data-queue-send-now]");
+  resume?.setAttribute("disabled", "");
+  renderer.render(host, [...queued, { id: "b", text: "Second", queuedAt: 2, delivery: "steer", paused: true as const }], { ...context, compactOpen: true });
+  expect(host.querySelector("[data-pending-toggle]")).toBe(toggle);
+  expect(host.querySelector("[data-queue-send-now]")).toBe(resume);
+  expect(toggle?.getAttribute("aria-expanded")).toBe("true");
+  expect(resume?.textContent).toBe("Send 2 paused steers now");
+  expect(resume?.hasAttribute("disabled")).toBe(true);
+});
+
 test("closed activity defers its body and find materializes current sanitized content", () => {
   const previousFilter = Reflect.get(globalThis, "NodeFilter");
   Reflect.set(globalThis, "NodeFilter", { SHOW_TEXT: 4 });

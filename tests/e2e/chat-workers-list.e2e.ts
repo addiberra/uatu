@@ -6,6 +6,12 @@ import { openChatPanel } from "./chat-helpers";
 
 const test = withEngineBrowsers(base);
 
+// Touch tracks project their summary/body into the dock grid; display:contents
+// has no border box. Measure the actual rendered track, not that wrapper.
+async function trackHeight(track: import("@playwright/test").Locator): Promise<number> {
+  return track.evaluate(node => [...node.children].reduce((height, child) => height + child.getBoundingClientRect().height, 0));
+}
+
 for (const engine of ["chromium", "webkit"] as const) test.describe(`canonical workers ${engine}`, () => {
   test.use({ page: async ({ launchBrowser, baseURL }, use) => {
     const browser = await launchBrowser(engine);
@@ -49,7 +55,7 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`canonical w
         window.visualViewport!.dispatchEvent(new Event("resize"));
       }, width);
       await expect(track.locator("[data-worker-id]")).toHaveCount(1);
-      expect((await track.boundingBox())!.height).toBeLessThanOrEqual(60);
+      expect(await trackHeight(track)).toBeLessThanOrEqual(60);
       const header = (await summary.boundingBox())!;
       const action = (await dismiss.boundingBox())!;
       expect(action.y).toBe(header.y);
@@ -70,7 +76,7 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`canonical w
         window.visualViewport!.dispatchEvent(new Event("resize"));
       }, scene);
       await expect(page.locator("html")).toHaveAttribute(scene.width < 600 ? "data-chat-keyboard" : "data-chat-wide-short");
-      expect((await track.boundingBox())!.height).toBeLessThanOrEqual(60);
+      expect(await trackHeight(track)).toBeLessThanOrEqual(60);
       expect((await page.locator("#chat-work-dock").boundingBox())!.height).toBeLessThanOrEqual(62);
       await expect(page.locator("#chat-input")).toBeFocused();
       await captureScreenshot(page, info, `workers-${engine}-one-finished-${scene.width}-vv${scene.visual}`);
