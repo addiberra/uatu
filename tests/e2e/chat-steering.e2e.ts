@@ -4,6 +4,7 @@ import { openChatPanel } from "./chat-helpers";
 import { captureScreenshot, recordEvidence, saveEvidence } from "./evidence";
 import { expect, test as base } from "./fixtures";
 import { withEngineBrowsers } from "./page-diagnostics";
+import { expectWorkTranscriptBudget } from "./work-panel-assertions";
 
 const test = withEngineBrowsers(base);
 
@@ -156,18 +157,18 @@ test.describe("steering an OpenCode 2.x turn", () => {
     for (let index = 1; index <= 5; index++) await submit(page, `Audit pending ${index}: preserve this longer message for a readable dock`, index > 2 ? "Alt+Enter" : "Enter");
     await inspectPending(page);
     const queue = page.locator("#chat-queue");
-    const scroller = page.locator("#chat-work-dock");
+    const scroller = page.locator("#chat-queue-content");
     await scroller.evaluate(element => { element.scrollTop = 0; });
     await expect(queue.locator(".chat-queue-header")).toContainText("2 steers · 3 queued");
     await expect(dock(page)).toHaveCount(5);
-    await expect(scroller).toHaveClass(/has-more-below/);
+    await expect(queue).toHaveClass(/has-more-below/);
     const metrics = await scroller.evaluate(element => ({ height: element.clientHeight, viewport: innerHeight }));
     expect(metrics.height).toBeGreaterThan(135);
     expect(metrics.height).toBeLessThanOrEqual(metrics.viewport * 0.4 + 1);
     await saveEvidence(testInfo, `audit-dock-${mode}-${theme}-metrics.json`, JSON.stringify(await scroller.evaluate(element => ({
       clientHeight: element.clientHeight,
       scrollHeight: element.scrollHeight,
-      header: element.querySelector(".chat-queue-header")?.textContent,
+      header: element.parentElement!.querySelector(".chat-queue-header")?.textContent,
       actions: Array.from(element.querySelectorAll<HTMLButtonElement>(".chat-queued-message button")).map(button => {
         const rect = button.getBoundingClientRect();
         return { text: button.textContent, label: button.getAttribute("aria-label"), width: rect.width, height: rect.height };
@@ -183,7 +184,7 @@ test.describe("steering an OpenCode 2.x turn", () => {
     await expect(page.locator("#chat-delivery-toggle, #chat-delivery-menu")).toHaveCount(0);
     await captureScreenshot(page, testInfo, `audit-composer-${mode}-${theme}`);
     await scroller.evaluate(element => { element.scrollTop = element.scrollHeight; });
-    await expect(scroller).not.toHaveClass(/has-more-below/);
+    await expect(queue).not.toHaveClass(/has-more-below/);
     await expect(queue.locator(".chat-queue-header")).toBeInViewport();
   });
 
@@ -444,7 +445,7 @@ test.describe("steering an OpenCode 2.x turn", () => {
     expect((await fakeSession(request, conversationId))?.pending.map(entry => entry.payload.text)).toEqual(["First steer", "Second steer"]);
     await expect(page.locator("#chat-queue .chat-queued-message[data-paused]")).toHaveCount(3);
     await expect(steers(page).first().locator(".chat-queued-paused")).toHaveText("Paused");
-    const wake = page.locator(".chat-queue-header [data-queue-send-now]");
+    const wake = page.locator(".chat-queue-batch [data-queue-send-now]");
     await expect(wake).toHaveText("Send 2 paused steers now");
     await captureScreenshot(page, testInfo, "steering-paused-after-cancel");
 
@@ -541,7 +542,7 @@ test.describe("steering an OpenCode 2.x turn", () => {
     await startTurn(page, request);
     for (let index = 1; index <= 6; index++) await submit(page, `Pending steer ${index}`);
     await inspectPending(page);
-    const queue = page.locator("#chat-work-dock");
+    const queue = page.locator("#chat-queue-content");
     const note = page.locator("#chat-queue-note");
     await queue.evaluate(element => { element.scrollTop = element.scrollHeight; });
     expect(await queue.evaluate(element => element.scrollTop)).toBeGreaterThan(0);
@@ -730,7 +731,7 @@ for (const browserName of ["chromium", "webkit"] as const) test.describe(`steeri
     const dimensions = { header: await header.boundingBox(), card: await card.boundingBox() };
     await saveEvidence(info, `pending-${browserName}-${theme}-dimensions.json`, JSON.stringify(dimensions, null, 2));
     await captureScreenshot(page, info, `pending-${browserName}-${theme}-density`);
-    expect(dimensions.header!.height).toBeCloseTo(32, 0);
+    expect(dimensions.header!.height).toBeCloseTo(28, 0);
     expect(dimensions.card!.height).toBeCloseTo(64, 0);
     await expect(header).toHaveText(/1 queued/);
     await expect(header).not.toContainText(/0 steers|1 pending/);
@@ -753,7 +754,7 @@ for (const browserName of ["chromium", "webkit"] as const) test.describe(`steeri
         window.dispatchEvent(new Event("resize"));
       }, scene);
       await expect(page.locator("html")).toHaveAttribute(scene.width < 600 ? "data-chat-keyboard" : "data-chat-wide-short");
-      expect((await page.locator("#chat-timeline").boundingBox())!.height).toBeGreaterThanOrEqual(scene.visual * 0.4);
+      await expectWorkTranscriptBudget(page, scene.visual);
       await expect(page.locator("#chat-input")).toBeFocused();
       await expect(page.locator("#chat-input")).toHaveValue("Keep this draft");
       await captureScreenshot(page, info, `pending-${browserName}-${theme}-${scene.width}-vv${scene.visual}`);
@@ -802,7 +803,7 @@ for (const browserName of ["chromium", "webkit"] as const) test.describe(`steeri
     }));
     await saveEvidence(info, `${evidence}-200pct-glyphs.json`, JSON.stringify({ beforeHeight: before, enlargedHeight: (await held(page).first().boundingBox())!.height, paragraphs: glyphs }, null, 2));
     await captureScreenshot(page, info, `${evidence}-200pct`);
-    await page.locator("#chat-work-dock").evaluate(node => { node.scrollTop = 100; });
+    await page.locator("#chat-queue-content").evaluate(node => { node.scrollTop = 100; });
     await captureScreenshot(page, info, `${evidence}-200pct-scrolled-text`);
     expect(glyphs[0]!.lines.length).toBeGreaterThanOrEqual(4);
     for (const paragraph of glyphs) {
@@ -818,6 +819,12 @@ for (const browserName of ["chromium", "webkit"] as const) test.describe(`steeri
     })), null, 2));
     expect(await page.locator("#chat-work-dock").evaluate(node => node.scrollWidth <= node.clientWidth)).toBe(true);
     if (width === 390) expect(await page.locator("#chat-surface").evaluate(node => node.scrollWidth <= node.clientWidth)).toBe(true);
+    // Load lazy thumbnails through real viewport entry before checking action
+    // geometry; a decode during those checks can resize the card mid-scroll.
+    for (const image of await held(page).locator("img").all()) {
+      await image.scrollIntoViewIfNeeded();
+      await expect.poll(() => image.evaluate(node => node.naturalWidth)).toBe(640);
+    }
     for (const card of await held(page).all()) {
       expect(await card.evaluate(node => node.scrollWidth <= node.clientWidth)).toBe(true);
       const buttons = await card.locator(".chat-queued-action").all();
@@ -833,8 +840,8 @@ for (const browserName of ["chromium", "webkit"] as const) test.describe(`steeri
       }
     }
     await captureScreenshot(page, info, `${evidence}-200pct-image-actions`);
-    // Enlarged cards grow naturally inside the dock's one scroller.
-    const scroller = page.locator("#chat-work-dock");
+    // Enlarged cards grow inside Pending's independent content pane.
+    const scroller = page.locator("#chat-queue-content");
     expect(await scroller.evaluate(node => node.scrollHeight > node.clientHeight)).toBe(true);
     expect((await page.locator("#chat-timeline").boundingBox())!.height).toBeGreaterThanOrEqual(844 * 0.4);
     await expect(page.locator("#chat-send, #chat-stop")).toHaveCount(2);
@@ -856,17 +863,19 @@ for (const browserName of ["chromium", "webkit"] as const) test.describe(`steeri
     })), null, 2));
     await warning.scrollIntoViewIfNeeded();
     await saveEvidence(info, `${evidence}-200pct-warning-exposure.json`, JSON.stringify(await warning.evaluate(node => {
-      const dock = node.closest(".chat-work-dock")!;
+      const dock = node.closest(".chat-queue-content")!;
       return { warning: node.getBoundingClientRect().toJSON(), dock: dock.getBoundingClientRect().toJSON(), scroll: dock.scrollTop,
-        heading: dock.querySelector(".chat-queue-header")!.getBoundingClientRect().toJSON(),
-        styles: [dock, node.parentElement!, dock.querySelector(".chat-queue-header")!].map(e => ({ tag: e.id || e.className, display: getComputedStyle(e).display, position: getComputedStyle(e).position, container: getComputedStyle(e).container, padding: getComputedStyle(e).scrollPaddingTop })) };
+        work: node.closest(".chat-work-dock")!.getAttribute("style"),
+        tracks: [...node.closest(".chat-work-dock")!.children].map(child => ({ id: child.id, box: child.getBoundingClientRect().toJSON(), style: child.getAttribute("style"), display: getComputedStyle(child).display, min: getComputedStyle(child).minHeight, max: getComputedStyle(child).maxHeight, margin: getComputedStyle(child).margin, padding: getComputedStyle(child).padding, basis: getComputedStyle(child).flexBasis })),
+        heading: node.closest(".chat-queue")!.querySelector(".chat-queue-header")!.getBoundingClientRect().toJSON(),
+        styles: [dock, node.parentElement!, node.closest(".chat-queue")!.querySelector(".chat-queue-header")!].map(e => ({ tag: e.id || e.className, display: getComputedStyle(e).display, position: getComputedStyle(e).position, container: getComputedStyle(e).container, padding: getComputedStyle(e).scrollPaddingTop })) };
     }), null, 2));
     await expect(warning).toBeInViewport({ ratio: 1 });
     // Reveal text below the sticky count/batch header, not merely within the
     // viewport bounds behind that header. This is a deliberate dock scroll.
     await warning.evaluate(node => {
-      const dock = node.closest(".chat-work-dock")!;
-      const header = dock.querySelector(".chat-queue-header")!;
+      const dock = node.closest(".chat-queue-content")!;
+      const header = node.closest(".chat-queue")!.querySelector(".chat-queue-header")!;
       dock.scrollTop += node.getBoundingClientRect().top - Math.max(dock.getBoundingClientRect().top, header.getBoundingClientRect().bottom) - 4;
     });
     expect(await warning.locator(".chat-queue-replacement").evaluate(node => {
@@ -876,8 +885,8 @@ for (const browserName of ["chromium", "webkit"] as const) test.describe(`steeri
     })).toBe(true);
     await captureScreenshot(page, info, `${evidence}-200pct-warning-text`);
     const warningLines = await warning.locator(".chat-queue-replacement").evaluate(node => {
-      const dock = node.closest(".chat-work-dock")!;
-      const header = dock.querySelector(".chat-queue-header")!;
+      const dock = node.closest(".chat-queue-content")!;
+      const header = node.closest(".chat-queue")!.querySelector(".chat-queue-header")!;
       const range = document.createRange(); range.selectNodeContents(node);
       return [...range.getClientRects()].map((_, index) => {
         const before = range.getClientRects()[index]!;
@@ -925,8 +934,8 @@ for (const browserName of ["chromium", "webkit"] as const) test.describe(`steeri
         await expect(action).toBeFocused();
         await action.scrollIntoViewIfNeeded();
         await action.evaluate(node => {
-          const dock = node.closest(".chat-work-dock")!;
-          const header = dock.querySelector(".chat-queue-header")!;
+          const dock = node.closest(".chat-queue-content")!;
+          const header = node.closest(".chat-queue")!.querySelector(".chat-queue-header")!;
           const box = node.getBoundingClientRect();
           const style = getComputedStyle(node);
           const ring = Math.max(2, (parseFloat(style.outlineWidth) || 0) + (parseFloat(style.outlineOffset) || 0));

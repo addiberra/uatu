@@ -198,16 +198,35 @@ Finished workers use dense single rows. Legacy subagent/background summaries
 are not repeated above this card. Inspection, history and saved dismissal remain
 available.
 Pending is a separate compact disclosure **below** the worker card, before the
-composer—not a heading between the worker header and rows. With Pending closed,
-only the bounded worker body scrolls, leaving its header and Pending visible.
-Opening Pending, a replacement warning, the explicit desktop work sheet or
-another independent work track uses
-the aggregate dock scroller instead; the worker body then has no nested scroll
-trap. Short visual bands can scroll headings away to expose whole actions.
-The existing transcript/safe-area budgets and desktop's explicit constrained
-Show work fallback remain; work never moves to a touch top sheet. Routine model
+composer—not a heading between the worker header and rows. Both cards use the
+same header, chevron and surface styling. Each open content pane scrolls on its
+own, without moving either header, the other pane or the transcript; there is
+no shared outer scroller. Long lists divide the measured budget, while short
+or collapsed lists yield unused space. Reverted history, TODOs and scheduled
+wakeups also remeasure when opened; their bounded panes include the header,
+borders, content gap and outer margins so actions remain scroll-reachable.
+Normal transcript/safe-area budgets remain wherever the measured minimum
+headers, whole actions and composer leave that space. For example, a 230px
+landscape keyboard band has a 44px app header, 46px composer and 72px for two
+closed cards plus spacing: only 68px remains, not the normal 92px (40%). Both
+cards stay visible; touch does not switch to Show work or hide their headers.
+If the screen cannot physically fit whole actions, the transcript
+yields first; the pane you focus or touch then receives priority while both
+headers and the composer remain available. Desktop's explicit constrained
+Show work sheet may cover the chat header, never the composer; work never
+moves to a touch top sheet. Routine model
 timing notes stay inside expanded Pending, while replacement/batch consequences
-remain available when collapsed.
+remain available in its content pane when collapsed. Batch actions live below
+the count header so they cannot change its disclosure styling or scroll away
+the worker header.
+Selecting a card header also grants its body action space; allocation happens
+after the native click so moving the header cannot swallow a touch. In enlarged
+short landscape, physical 44px chrome/action minima replace rem-scaled empty
+space, and inter-card spacing can yield to retain both headers and a whole
+selected action. Pending restores its content offset after disclosure changes,
+scoped to the conversation for the current session; other conversations start
+with their own offset. Neither restoration nor pane selection moves the sibling
+scroll position or the transcript.
 Short keyboard/landscape layouts use compact input controls and counts;
 uncertain feedback has its own scrollable band (a bounded column in landscape),
 so it cannot consume the draft field. The inline model/context pill opens the
@@ -259,23 +278,23 @@ remain available while typing.
 Touch has one initially collapsed pending summary and one worker summary.
 Pending counts distinguish steers from queued input without repeating the total
 or zero categories (for example, **1 queued** or **2 steers · 1 queued**).
-Its header uses a 32px target; compact cards share the delivery label and message
+Its header matches Workers' 28px minimum; compact cards share the delivery label and message
 line where they fit, followed by inline actions. Pending actions use the explicitly
 approved 32px density tradeoff with independent 8px gaps, including before Remove;
 existing confirmation safeguards remain unchanged. Composer Send/Stop and
 paused-batch Send stay 44px.
 Pending message leading scales with text enlargement (14px type/20px leading at
-default size, 28px/40px at 200%); multiline cards grow naturally inside the dock
-scroller instead of overlapping lines or imposing a fixed card height.
+default size, 28px/40px at 200%); multiline cards grow naturally inside Pending's
+independent pane instead of overlapping lines or imposing a fixed card height.
 Queued image rows and thumbnails stay within the card width when text is enlarged.
 Pending footers and action groups can shrink to the card width; long labels such
-as **Send now + paused steers** wrap without truncation. When a paused-batch
-header would crowd out enlarged actions in a text-relative narrow container
-(up to 12rem), it scrolls with the dock instead of remaining sticky. Normal-size
-sticky counts, confirmation wording and paused-batch delivery semantics stay intact.
+as **Send now + paused steers** wrap without truncation. Paused-batch actions
+scroll inside Pending's content pane, never in its count header. Counts stay
+visible; confirmation wording and paused-batch delivery semantics stay intact.
 As before, enlarged replacement warnings may take extra space from the transcript
 to keep their full text and controls reachable; the 40% phone/short-landscape
-reading guarantee applies to standard text, not every enlarged safety state.
+reading budget applies whenever whole actions and headers physically fit; a
+smaller band prioritizes the pane being used without overlapping the composer.
 Worker counts distinguish
 confirmed working, finished (including failed/stopped), and unknown occurrences.
 Counts and rows use the same deduplicated executions: actual background shell

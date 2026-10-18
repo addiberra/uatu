@@ -13,6 +13,7 @@ import type { ChatModel, ConversationItem } from "../../src/chat/types";
 import { openChatConfiguration, openChatPanel, openChatWorkers } from "./chat-helpers";
 import { captureScreenshot as capture } from "./evidence";
 import { expect, test } from "./fixtures";
+import { expectWorkControlVisible } from "./work-panel-assertions";
 
 async function control(request: APIRequestContext, body: Record<string, unknown>): Promise<any> {
   const response = await request.post("/__e2e/chat", { data: body });
@@ -1527,6 +1528,9 @@ test.describe("Claude Code scheduled wakeups (fixture-driven)", () => {
     await expect(row.locator(".chat-wakeup-label")).toHaveText("Recurring wakeup paused");
     await expect(row.locator(".chat-wakeup-message")).toContainText("restores this schedule");
     await capture(page, testInfo, "paused-cron-reopened");
+    const cancel = panel.getByRole("button", { name: /Cancel wakeup/ });
+    await cancel.scrollIntoViewIfNeeded();
+    await expectWorkControlVisible(cancel);
     const cancelRequest = page.waitForResponse(response => response.url().includes("/wakeups/c1/cancel"));
     await panel.getByRole("button", { name: /Cancel wakeup/ }).click();
     expect((await cancelRequest).status()).toBe(200);

@@ -1702,7 +1702,7 @@ When the touch software-keyboard visual band is at most 450px, or a touch landsc
 #### Scenario: Compact parent composer stays in the keyboard band
 - **WHEN** loaded work is shown at 390px width with a 380px or 450px visual band, or at 844px landscape width with a 230px band
 - **THEN** Send, delivery selection and Stop remain fully inside the band with their target sizes and gaps preserved
-- **AND** at least 40% of that band remains available to the transcript in the tested standard-size layout
+- **AND** at least 40% of that band remains available to the transcript wherever measured minimum headers, whole actions and composer physically permit it; insufficient short bands keep both card headers visible and yield conversation space instead
 
 #### Scenario: Loaded hardware-keyboard portrait preserves conversation space
 - **WHEN** the 390×844 touch parent composer is focused without a software keyboard, with 47px top and 34px bottom safe insets, workers and pending messages
@@ -2698,7 +2698,7 @@ Skills, slash commands, and `/reload` in the queue SHALL NOT offer the switch to
 
 Cancelling the turn SHALL leave pending steers with the agent and SHALL present them as paused. A steer is paused when it was pending before the conversation last became idle. The dock SHALL offer one action labelled `Send N paused steers now`, which resumes the agent so that it delivers every pending steer. Submitting a new steer SHALL also resume delivery of paused steers.
 
-The expanded pending dock SHALL have a sticky count header identifying total pending messages, steers and queued messages. Its desktop scroll budget SHALL use 40% of the actual measured panel height, capped at 25rem, rather than an assumed viewport height. On touch, all work tracks and pending messages SHALL share a contained scroll budget of at most 35% of visual height, 25% at tablet widths from 48rem, or 24% while editing without a software keyboard. The pending list SHALL show a bottom fade only while content remains below. Entries SHALL lead with a distinct Steer or Queue badge and a separate Paused chip where applicable. Timing labels SHALL say `Next step`, `After this turn`, or `Sends after your next message` for paused entries. Dock actions SHALL have at least 36px targets on desktop and 44px on touch, visible focus outlines, and accessible names quoting their message. Successful move, send and remove actions SHALL produce polite composer feedback. An already-delivered refusal SHALL appear once as neutral informational feedback, not duplicate red errors.
+The pending card SHALL have an always-visible count header outside its own contained content scrollport. Worker and pending cards SHALL share only a height budget, never an aggregate scroller, as specified by Desktop work shares measured panel space. Desktop normally uses 40% of measured panel height capped at 25rem; touch normally uses 35% of visual height, 25% at tablet widths from 48rem, or 24% during hardware editing. The pending list SHALL show a bottom fade only while content remains below. Entries SHALL retain distinct Steer/Queue badges, Paused chips and existing timing labels. Pending actions SHALL retain the approved compact 32px touch / 36px desktop targets, independent 8px gaps, visible focus outlines and contextual accessible names. Successful mutations SHALL not add confirmation notices; refusals and unknown receipts SHALL retain operation-scoped feedback without duplicate red errors.
 
 When pending messages exist, software-keyboard mode or short touch landscape SHALL collapse the work dock to a pending-count summary rather than hide it. Any paused-steer batch Send action SHALL retain a 44px target, and the count-only replacement warning SHALL remain readable while typing or editing a pending entry. Entry details and the routine model-at-delivery note MAY be hidden in this compact state; the replacement warning SHALL NOT be hidden. Dock growth SHALL reserve its final bounded layout height before a visual reveal, respect reduced motion, and preserve a remote-update reading anchor and deliberate bottom pinning. Sending a prompt SHALL retain the existing explicit jump-to-latest behavior.
 
@@ -3147,14 +3147,21 @@ Expanded worker details SHALL show confirmed working and unknown workers first, 
 ### Requirement: Compact touch composition preserves safe targets and conversation space
 Touch chat SHALL keep Send and Stop distinct, retain operable capability-gated delivery selection and existing submission shortcuts, and put less-used settings/context/help/actions behind an accessible touch options menu rather than reducing touch target size. Visible action targets SHALL be at least 44×44 CSS pixels, with at least 8px separation between adjacent mutation actions, visible focus and non-overlapping hit regions. Opening configuration from the menu SHALL use the existing single adaptive picker rather than stack another options layer. Unsupported actions SHALL be absent, and explicit Continue SHALL remain available in layouts where worker controls are supported and blocking evidence exists, regardless of the account's automatic preference.
 
-The in-flow dock SHALL retain the existing aggregate visual-height caps: 35%, 25% from 48rem width, and 24% during hardware-keyboard editing. Standard-size loaded phone layouts SHALL leave at least 40% of the visual band for the transcript; the tested tablet layouts SHALL leave at least 35%. Software-keyboard and short-landscape states SHALL retain a 44px worker summary; deliberate expansion MAY overlay the transcript above the composer when inline details cannot meet those budgets. The dock SHALL have one scroller rather than nested worker lists. Opening and closing the overlay SHALL preserve composing drafts and owned focus without forced keyboard blur. Composer Send/Stop, delivery/options controls and existing pending replacement/batch safety SHALL remain reachable; explicit Continue suppression in constrained states SHALL remain unchanged. Safe-area handling, measured desktop geometry, explicit bottom pinning, remote reading anchors and interaction-request answering SHALL be preserved. Larger text SHALL retain readable warnings and reachable primary controls using scrolling/reduced secondary content rather than shrunken targets.
+The in-flow dock SHALL retain its normal aggregate visual-height caps: 35%, 25% from 48rem width, and 24% during hardware-keyboard editing. Loaded phone layouts SHALL leave at least 40% of the visual band for the transcript, and tested tablet layouts at least 35%, wherever measured minimum headers, whole action rows and composer physically permit it. In insufficient short bands the transcript SHALL yield space while both card headers and composer remain visible; touch SHALL NOT introduce a Show work fallback or hide either header. The worker disclosure SHALL remain below the transcript and above the composer through focus, repaint, keyboard show/hide, viewport resize and pan, rather than implicitly becoming a top sheet or reordering those regions. The sibling cards SHALL have independently scrolling content panes and no shared outer scroller, remaining content-sized for short lists. Opening and closing details SHALL preserve composing drafts and owned focus without forced keyboard blur. Composer Attach/picker/Send/Stop and existing pending replacement/batch safety SHALL remain reachable. Safe-area handling, measured desktop geometry, explicit bottom pinning, remote reading anchors and interaction-request answering SHALL be preserved. Larger text SHALL retain readable warnings and reachable primary controls using scrolling/reduced secondary content rather than shrunken targets.
 
 Menus SHALL fit the visual viewport, support keyboard navigation and one-layer Escape with invoker restoration, and consume outside touch dismissal without activating underlying actions. Visible controls SHALL activate reliably on the first tap during composition without discarding drafts or attachment/configuration state. Live updates and reduced-motion presentation SHALL NOT steal focus or fabricate completion announcements.
+
+Explicit Continue SHALL retain its existing constrained-state suppression; this layout change SHALL NOT alter delivery or Continue semantics.
 
 #### Scenario: Keyboard and landscape keep conversation space
 - **WHEN** loaded touch chat uses 390px width with a 380px or 450px visual band, or 844px landscape width with a 230px visual band and the existing safe-area fixtures
 - **THEN** Send, supported delivery and Stop fit inside the visual band with their minimum targets/gaps
-- **AND** at least 40% remains for the transcript while pending replacement/batch safety remains reachable
+- **AND** at least 40% remains wherever measured minimum chrome permits it; insufficient short bands retain both headers and reachable pending replacement/batch safety instead
+
+#### Scenario: Two closed cards in the insufficient landscape keyboard band
+- **WHEN** a 230px visual band has a 44px app header, 46px composer and two closed cards plus spacing requiring 72px
+- **THEN** 68px remains for conversation rather than the infeasible 92px normal floor
+- **AND** both card headers and composer actions remain fully visible without a touch Show work fallback
 
 #### Scenario: Hardware keyboard and tablet budgets stay bounded
 - **WHEN** loaded 390×844 chat is focused without a software keyboard, or the tested 768×1024 and 1024×768 tablet layouts are used
@@ -3172,7 +3179,22 @@ Menus SHALL fit the visual viewport, support keyboard navigation and one-layer E
 - **AND** controls remain hit-testable after final layout reservation and reduced-motion handling
 
 ### Requirement: Desktop work shares measured panel space
-Desktop worker tracks and pending messages SHALL share an aggregate scroller capped at 40% of the actual measured chat panel height and 25rem. The aggregate SHALL yield further to reserve the lesser of 12rem or 35% of that panel for the transcript while keeping the composer fully visible. Existing desktop disclosure defaults, per-track rem caps, drafts, focus and reading intent SHALL remain intact. A newly staged replacement warning SHALL be revealed once after composer layout settles; subsequent updates SHALL respect deliberate dock scrolling.
+Worker and pending cards SHALL share a measured height budget, not a scrollport. Their headers SHALL match in height, padding, typography, custom chevron, border, radius and color. Each header SHALL remain outside its independently scrolling content pane; scrolling either pane SHALL NOT move the other pane's header or scroll offset, the transcript, or the composer. The outer dock SHALL NOT scroll. Long content SHALL share available space and short or collapsed content SHALL yield unused space. Desktop's normal budget remains 40% of actual panel height capped at 25rem, reserving the lesser of 12rem or 35% for the transcript. Touch retains its normal phone/tablet reading budget and safe insets. Physically insufficient space SHALL yield transcript space, then prioritize a whole actionable row in the explicitly focused/touched pane while retaining both headers and the unobstructed composer. The existing explicit desktop Show work fallback MAY cover the chat header but SHALL NOT overlap the composer. Disclosure state, keyed controls, focus and independent reading offsets SHALL survive unrelated worker/pending updates. Replacement warnings SHALL reveal once inside the pending pane, never by scrolling the shared dock.
+
+#### Scenario: Independent saturated work cards
+- **WHEN** twenty workers and twenty pending messages coexist in any of the four disclosure combinations, including enlarged text
+- **THEN** wheel and touch scrolling within either open content pane leave the other pane and transcript offsets unchanged
+- **AND** both headers remain fully visible, pending actions can be fully exposed through every clipping ancestor, and Send/Stop remain accessible
+
+#### Scenario: Header taps expose constrained actions without focus assistance
+- **WHEN** both panels are expanded in a 230px landscape keyboard band at normal or 200% text and the user activates either header
+- **THEN** the selected pane receives enough independent scroll space to fully expose its action targets, without requiring programmatic action focus
+- **AND** both headers and composer actions remain visible, worker Stop stays reachable by selecting Workers, and parent Stop/Cancel remains operable
+
+#### Scenario: Pending disclosure scroll remains conversation-local
+- **WHEN** a reader scrolls Pending, closes and reopens it, or returns from another conversation
+- **THEN** its saved session offset is restored after allocation without replacing keyed controls or changing the sibling or transcript offsets
+- **AND** another conversation does not inherit that offset
 
 #### Scenario: Detached worker and pending steer coexist in a short split
 - **WHEN** default-split desktop chat has a running turn, one pending steer and one detached worker at 1280×600 or 1280×480

@@ -75,6 +75,7 @@ test.describe("chat message queue", () => {
     await expect(page.locator("#chat-queue .is-held")).toHaveCount(2);
 
     // Removing a held message deletes it before it ever reaches the agent.
+    await page.locator("[data-pending-toggle]").click();
     const removal = page.waitForResponse(response => response.url().includes("/queue/") && response.request().method() === "DELETE");
     await page.locator("#chat-queue .is-held", { hasText: "Refine the plan" }).locator("[data-queue-remove]").click();
     expect((await removal).status()).toBe(200);
@@ -137,6 +138,7 @@ test.describe("chat message queue", () => {
     await expect(page.locator("#chat-composer-status")).toHaveAttribute("aria-label", "Cancelled");
     await expect(held.locator("[data-queue-send-now]")).toHaveCount(3);
     await expect(page.locator("#chat-queue .is-held[data-paused]")).toHaveCount(3);
+    await page.locator("[data-pending-toggle]").click();
     await captureScreenshot(page, testInfo, "claude-dormant-send-now");
 
     const sent = page.waitForResponse(response => response.url().endsWith("/send-now"));

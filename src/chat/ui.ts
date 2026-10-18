@@ -1034,9 +1034,15 @@ export function initChat(api = new ChatApiClient()): void {
   const compactWorkersItems = document.querySelector<HTMLElement>("#chat-compact-workers-items");
   const compactWorkerState = new CompactDisclosure();
   const compactPendingState = new CompactDisclosure();
+  const pendingScrollPositions = new Map<string, number>();
+  let pendingPaintedConversation: string | null = null;
+  let pendingPaintedOpen = false;
+  let pendingScrollRestore: { conversation: string; top: number } | null = null;
   compactWorkersList?.addEventListener("toggle", () => {
     compactWorkerState.toggled(compactWorkersList.open);
     compactWorkersList.querySelector("summary")?.setAttribute("aria-expanded", String(compactWorkersList.open));
+    syncQueueOverflow();
+    syncDesktopWorkLayout();
   });
   const compactView = compactWorkersItems ? new CompactWorkersView(compactWorkersItems, () => {
     if (!projection) return;
@@ -1061,6 +1067,7 @@ export function initChat(api = new ChatApiClient()): void {
     compactWorkersList.open = compactWorkerState.paint(projection?.conversationId ?? null);
     compactWorkersList.querySelector("summary")?.setAttribute("aria-expanded", String(compactWorkersList.open));
     compactView?.paint(projection?.conversationId ?? null, workers, stoppingTasks, declares("background-tasks"));
+    syncQueueOverflow();
   };
   compactWorkersItems?.addEventListener("mousedown", event => keepTouchComposerFocus(event));
   compactWorkersList?.querySelector("summary")?.addEventListener("mousedown", event => keepTouchComposerFocus(event));
@@ -1760,15 +1767,30 @@ export function initChat(api = new ChatApiClient()): void {
     // Reconcile the current snapshot before revealing a retained output window.
     renderer.setShellOutputsHidden(false);
     revertedDock?.render(projection?.reversibleHistory?.revertedMessages ?? []);
+    const pendingPane = queueDockElement.querySelector<HTMLElement>(".chat-queue-content");
+    if (pendingPaintedConversation && pendingPaintedOpen && !pendingScrollRestore && !queueDockElement.hidden && pendingPane?.clientHeight) {
+      boundedSet(pendingScrollPositions, pendingPaintedConversation, pendingPane.scrollTop, 200);
+    }
+    const pendingConversation = projection?.conversationId ?? null;
+    const pendingOpen = compactPendingState.paint(pendingConversation);
+    const restorePending = pendingOpen && (pendingConversation !== pendingPaintedConversation || !pendingPaintedOpen);
     queueDock.render(queueDockElement, projection?.queued ?? [], {
       steering: declares("steering"),
       sendNow: declares("send-now"),
       running: isLiveConversationStatus(projection?.status),
       replacement: projection?.reversibleHistory?.staged === true,
-      compactOpen: compactPendingState.paint(projection?.conversationId ?? null),
+      compactOpen: pendingOpen,
       isCommand: isListedCommand,
       ...(queueNoteElement ? { note: queueNoteElement } : {}),
     });
+    if (pendingConversation !== pendingPaintedConversation || restorePending) {
+      pendingScrollRestore = pendingConversation && pendingOpen && !projection?.reversibleHistory?.staged
+        ? { conversation: pendingConversation, top: pendingScrollPositions.get(pendingConversation) ?? 0 } : null;
+      const pane = queueDockElement.querySelector<HTMLElement>(".chat-queue-content");
+      if (pane) pane.scrollTop = pendingScrollRestore?.top ?? 0;
+    }
+    pendingPaintedConversation = pendingConversation;
+    pendingPaintedOpen = pendingOpen;
     syncHistoryControls();
     rendering = false;
     syncTaskList();
@@ -1793,7 +1815,16 @@ export function initChat(api = new ChatApiClient()): void {
     applyFocusAfterPaint(renderer, items);
     reconcileAnswerAfterPaint();
     syncDesktopWorkLayout();
+    restorePendingScroll();
   };
+
+  function restorePendingScroll() {
+    if (!pendingScrollRestore || pendingPaintedConversation !== pendingScrollRestore.conversation || !pendingPaintedOpen) return;
+    const pane = queueDockElement?.querySelector<HTMLElement>(".chat-queue-content");
+    if (!pane?.clientHeight) return;
+    pane.scrollTop = pendingScrollRestore.top;
+    pendingScrollRestore = null;
+  }
 
   const scheduleRender = (newContent = false, captureCurrent = true, incremental = false) => {
     renderDirty = true;
@@ -3474,6 +3505,10 @@ export function initChat(api = new ChatApiClient()): void {
   });
   queueDockElement.addEventListener("click", async event => {
     if ((event.target as Element).closest("[data-pending-toggle]")) {
+      const pane = queueDockElement.querySelector<HTMLElement>(".chat-queue-content");
+      if (projection && compactPendingState.paint(projection.conversationId) && pane?.clientHeight) {
+        boundedSet(pendingScrollPositions, projection.conversationId, pane.scrollTop, 200);
+      }
       compactPendingState.toggled(!compactPendingState.paint(projection?.conversationId ?? null));
       scheduleRender();
       return;
@@ -3514,24 +3549,92 @@ export function initChat(api = new ChatApiClient()): void {
 
   function syncQueueOverflow() {
     if (!queueDockElement) return;
-    const touch = document.documentElement.dataset.uiMode === "touch";
     const scroller = queueDockElement.parentElement!;
-    // The card keeps its own header and rows. Pending is a separate footer,
-    // never a second heading projected between those rows. Preserve the last
+    // Both cards retain their own header and content pane. Preserve the last
     // measurement while desktop's constrained dock is hidden.
     if (typeof getComputedStyle === "function" && getComputedStyle(scroller).display === "none") return;
     const workerHeading = compactWorkersList?.hidden ? null : compactWorkersList?.querySelector("summary");
     const pendingHeading = queueDockElement.hidden ? null : queueDockElement.querySelector(".chat-queue-header");
     const workerHeight = workerHeading?.getBoundingClientRect().height ?? 0;
     const pendingHeight = pendingHeading?.getBoundingClientRect().height ?? 0;
-    scroller.toggleAttribute("data-headings-tight", scroller.clientHeight < workerHeight + pendingHeight + 46);
-    const pinned = workerHeading && (typeof getComputedStyle !== "function" || getComputedStyle(workerHeading).position === "sticky") ? workerHeight : 0;
-    scroller.style.setProperty("--chat-work-heading-height", `${pinned}px`);
-    scroller.style.setProperty("--chat-pending-footer-height", queueDockElement.dataset.expanded === "false" ? `${pendingHeight + 8}px` : "0px");
-    if (touch) queueDockElement.classList.remove("has-more-below");
-    scroller.classList.toggle("has-more-below", scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop > 1);
+    const workerItems = compactWorkersList?.querySelector<HTMLElement>("#chat-compact-workers-items");
+    const queueContent = queueDockElement.querySelector<HTMLElement>(".chat-queue-content");
+    const workerBody = compactWorkersList?.open && workerHeight ? workerItems?.scrollHeight ?? 0 : 0;
+    const queueBody = pendingHeight ? queueContent?.scrollHeight ?? 0 : 0;
+    const workerFloor = workerHeight ? workerHeight + 2 + Math.min(48, workerBody) : 0;
+    const queueActionHeight = Math.max(32, ...[...queueContent?.querySelectorAll<HTMLElement>(".chat-queued-action") ?? []].map(button => button.getBoundingClientRect().height));
+    const warning = queueContent?.querySelector<HTMLElement>(".chat-queue-note.is-replacement:not([hidden])");
+    const batch = queueContent?.querySelector<HTMLElement>(".chat-queue-batch:not([hidden])");
+    const safetyHeight = warning ? warning.getBoundingClientRect().height + (batch?.getBoundingClientRect().height ?? 0) + 8 : 0;
+    const queueFloor = pendingHeight ? pendingHeight + 2 + Math.min(Math.max(queueActionHeight + 8, safetyHeight), queueBody) : 0;
+    // Reverted history, TODOs and wakeups retain their own bounded contents;
+    // none may silently restore the old shared-scroller fallback.
+    let extraHeight = 0;
+    let extraHeadings = 0;
+    let extraCount = 0;
+    for (const track of scroller.querySelectorAll<HTMLDetailsElement>(":scope > #chat-reverted, :scope > #chat-task-list, :scope > #chat-scheduled-wakeups")) {
+      if (track.hidden || typeof getComputedStyle === "function" && getComputedStyle(track).display === "none") continue;
+      const heading = track.querySelector("summary")?.getBoundingClientRect().height ?? 0;
+      const body = track.querySelector<HTMLElement>(":scope > ul, :scope > .chat-reverted-items");
+      const actionHeight = Math.max(44, ...[...body?.querySelectorAll("button") ?? []].map(button => button.getBoundingClientRect().height));
+      const css = typeof getComputedStyle === "function" ? getComputedStyle(track) : track.style;
+      const border = (parseFloat(css.borderTopWidth) || 0) + (parseFloat(css.borderBottomWidth) || 0);
+      const margin = (parseFloat(css.marginTop) || 0) + (parseFloat(css.marginBottom) || 0);
+      const gap = track.open ? parseFloat(css.rowGap) || 0 : 0;
+      const height = heading + (track.open ? Math.min(body?.scrollHeight ?? 0, actionHeight + 8) + gap : 0) + border;
+      track.style.setProperty("--chat-track-floor", `${height}px`);
+      track.style.setProperty("--chat-track-heading", `${heading + border}px`);
+      extraHeight += height + margin;
+      extraHeadings += heading + border + margin;
+      extraCount++;
+    }
+    const set = (name: string, value: number) => {
+      const pixels = `${value}px`;
+      if (scroller.style.getPropertyValue(name) !== pixels) scroller.style.setProperty(name, pixels);
+    };
+    set("--chat-worker-natural", workerHeight ? workerHeight + workerBody + 2 : 0);
+    set("--chat-queue-natural", pendingHeight ? pendingHeight + queueBody + 2 : 0);
+    set("--chat-worker-floor", workerFloor);
+    set("--chat-worker-heading", workerHeight + 2);
+    set("--chat-queue-heading", pendingHeight + 2);
+    set("--chat-queue-floor", queueFloor);
+    const queueActionFloor = pendingHeight ? pendingHeight + 2 + Math.min(queueBody, queueActionHeight + 8) : 0;
+    const preferredQueueFloor = pendingHeight ? pendingHeight + 2 + Math.min(queueBody, Math.max(queueActionHeight + 8, (warning?.getBoundingClientRect().height ?? 0) + 8)) : 0;
+    const dockCss = typeof getComputedStyle === "function" ? getComputedStyle(scroller) : scroller.style;
+    const cardCount = Number(workerHeight > 0) + Number(pendingHeight > 0) + extraCount;
+    const gapCount = Math.max(0, cardCount - 1);
+    const normalGap = parseFloat(dockCss.getPropertyValue("--chat-work-gap-base")) || 0;
+    const padding = (parseFloat(dockCss.paddingTop) || 0) + (parseFloat(dockCss.paddingBottom) || 0);
+    const fullFloor = workerFloor + queueFloor + gapCount * normalGap + padding + extraHeight;
+    set("--chat-work-full-floor", fullFloor);
+    const hardAvailable = parseFloat(scroller.style.getPropertyValue("--chat-work-hard-available"));
+    const cramped = (document.documentElement.dataset.uiMode === "touch" || document.documentElement.hasAttribute("data-chat-work-expanded"))
+      && Number.isFinite(hardAvailable) && fullFloor > hardAvailable;
+    scroller.toggleAttribute("data-work-cramped", cramped);
+    const active = scroller.dataset.workActive;
+    const effectiveExtras = cramped && active !== "history" ? extraHeadings : extraHeight;
+    // Keep the whole warning wherever it fits. Only a genuinely insufficient
+    // band scrolls warning lines, while retaining one complete action target.
+    const queueCompactFloor = cramped
+      ? Math.max(queueActionFloor, Math.min(preferredQueueFloor, hardAvailable - (workerHeight ? workerHeight + 2 : 0) - effectiveExtras - padding))
+      : preferredQueueFloor;
+    set("--chat-queue-compact-floor", queueCompactFloor);
+    const selectedCore = (active === "queue" ? workerHeight ? workerHeight + 2 : 0 : workerFloor)
+      + (active === "queue" ? queueCompactFloor : pendingHeight ? pendingHeight + 2 : 0) + effectiveExtras;
+    // Only inter-card whitespace yields after the reading band is exhausted;
+    // header text, action targets and the composer keep their measured sizes.
+    const gap = cramped && gapCount ? Math.max(0, Math.min(normalGap, (hardAvailable - selectedCore - padding) / gapCount)) : normalGap;
+    const gaps = gapCount * gap + padding;
+    set("--chat-work-gap", gap);
+    set("--chat-work-spacing", gaps);
+    set("--chat-work-extras", effectiveExtras);
+    set("--chat-work-floor", cramped
+      ? selectedCore + gaps
+      : fullFloor);
+    scroller.classList.remove("has-more-below");
+    queueDockElement.classList.toggle("has-more-below", !!queueContent && queueContent.scrollHeight - queueContent.clientHeight - queueContent.scrollTop > 1);
   }
-  queueDockElement.addEventListener("scroll", syncQueueOverflow, { passive: true });
+  queueDockElement.addEventListener("scroll", syncQueueOverflow, { passive: true, capture: true });
 
   // Preserve existing per-device keyboard delivery; Alt+Enter overrides once.
   let requestedDelivery: MessageDelivery | undefined;
@@ -5018,6 +5121,25 @@ export function initChat(api = new ChatApiClient()): void {
     syncControls();
   });
   const workDock = document.querySelector<HTMLElement>("#chat-work-dock");
+  // Secondary native disclosures can change their content without changing
+  // their capped outer box, so ResizeObserver alone cannot discover opening.
+  workDock?.addEventListener("toggle", () => {
+    syncQueueOverflow();
+    syncDesktopWorkLayout();
+  }, true);
+  const prioritizeWorkPane = (event: Event) => {
+    const target = event.target as Element | null;
+    // Header geometry can move when priority changes. Finish the native tap
+    // before reallocating it, otherwise pointerup lands on a different row.
+    if (event.type !== "click" && target?.closest("summary, .chat-queue-header")) return;
+    if (target?.closest("#chat-queue")) workDock?.setAttribute("data-work-active", "queue");
+    else if (target?.closest("#chat-compact-workers")) workDock?.setAttribute("data-work-active", "workers");
+    else if (target?.closest("#chat-reverted, #chat-task-list, #chat-scheduled-wakeups")) workDock?.setAttribute("data-work-active", "history");
+    syncQueueOverflow();
+  };
+  workDock?.addEventListener("pointerdown", prioritizeWorkPane);
+  workDock?.addEventListener("focusin", prioritizeWorkPane);
+  workDock?.addEventListener("click", prioritizeWorkPane, true);
   function syncDesktopWorkLayout() {
     if (!surface || !form || !input || typeof getComputedStyle !== "function") return;
     const root = document.documentElement;
@@ -5032,6 +5154,8 @@ export function initChat(api = new ChatApiClient()): void {
       toggle.hidden = close.hidden = true;
       return;
     }
+    dock.style.removeProperty("--chat-work-hard-available");
+    dock.style.removeProperty("--chat-work-available");
     const hasWork = [...dock.children].some(child => child !== close && !(child as HTMLElement).hidden && getComputedStyle(child).display !== "none");
     root.toggleAttribute("data-chat-has-work", hasWork);
     const fixed = [...surface.children].reduce((height, child) => {
@@ -5041,8 +5165,7 @@ export function initChat(api = new ChatApiClient()): void {
       return height + child.getBoundingClientRect().height + (parseFloat(css.marginTop) || 0) + (parseFloat(css.marginBottom) || 0);
     }, 0);
     const floor = parseFloat(getComputedStyle(transcript).minHeight) || 0;
-    const minimum = Math.max(parseFloat(getComputedStyle(dock).minHeight) || 52,
-      (parseFloat(dock.style.getPropertyValue("--chat-work-heading-height")) || 0) + Math.max(48, (parseFloat(getComputedStyle(root).fontSize) || 16) * 3) + 2);
+    const minimum = Math.max(52, parseFloat(dock.style.getPropertyValue("--chat-work-full-floor")) || 0);
     const constrained = hasWork && surface.clientHeight - fixed - floor < minimum;
     root.toggleAttribute("data-chat-work-constrained", constrained);
     if (!constrained) {
@@ -5054,9 +5177,8 @@ export function initChat(api = new ChatApiClient()): void {
     close.hidden = !open;
     toggle.setAttribute("aria-expanded", String(open));
     if (desktop) {
-      const top = surface.querySelector(".chat-header")!.getBoundingClientRect().bottom - surface.getBoundingClientRect().top;
-      dock.style.setProperty("--chat-workers-top", `${top}px`);
       dock.style.setProperty("--chat-workers-bottom", `${surface.getBoundingClientRect().bottom - form.getBoundingClientRect().top}px`);
+      if (open) dock.style.setProperty("--chat-work-hard-available", `${Math.max(0, surface.clientHeight - (surface.getBoundingClientRect().bottom - form.getBoundingClientRect().top) - 60)}px`);
     }
   }
   const expandDesktopWork = (focus = true) => {
@@ -5072,28 +5194,35 @@ export function initChat(api = new ChatApiClient()): void {
   };
   surface.querySelector("#chat-work-toggle")?.addEventListener("click", () => expandDesktopWork());
   surface.querySelector("#chat-work-close")?.addEventListener("click", closeDesktopWork);
-  workDock?.addEventListener("chat-work-reveal", () => expandDesktopWork(false));
-  workDock?.addEventListener("focusin", () => {
-    if (document.documentElement.dataset.uiMode !== "desktop" || typeof requestAnimationFrame !== "function") return;
-    requestAnimationFrame(() => {
+  workDock?.addEventListener("chat-work-reveal", () => {
+    syncQueueOverflow();
+    syncDesktopWorkLayout();
+    expandDesktopWork(false);
+  });
+  const revealWorkFocus = () => {
       const focused = document.activeElement as HTMLElement | null;
-      if (!focused || !workDock.contains(focused)) return;
+      if (!focused || !focused.closest("#chat-compact-workers-items, .chat-queue-content, #chat-reverted-items, #chat-task-list-items, #chat-scheduled-wakeups-items") || !workDock?.contains(focused)) return;
       const css = getComputedStyle(focused);
       const ring = (parseFloat(css.outlineWidth) || 0) + Math.max(0, parseFloat(css.outlineOffset) || 0);
       // Native focus scrolling exposes the border box, not its exterior ring.
       // Correct only this explicit focus move, inside each work scroller.
       for (let parent = focused.parentElement; parent; parent = parent.parentElement) {
-        if (/(auto|scroll|hidden)/.test(getComputedStyle(parent).overflowY)) {
+        if (/(auto|scroll)/.test(getComputedStyle(parent).overflowY)) {
           const box = focused.getBoundingClientRect();
-          const top = parent.getBoundingClientRect().top + parent.clientTop
-            + (parent === workDock ? parseFloat(parent.style.getPropertyValue("--chat-work-heading-height")) || 0 : 0);
+          const top = parent.getBoundingClientRect().top + parent.clientTop;
           const bottom = parent.getBoundingClientRect().top + parent.clientTop + parent.clientHeight - 1;
           if (box.top - ring < top) parent.scrollTop += Math.floor(box.top - ring - top);
           else if (box.bottom + ring > bottom) parent.scrollTop += Math.ceil(box.bottom + ring - bottom);
         }
         if (parent === workDock) break;
       }
-    });
+  };
+  workDock?.addEventListener("focusin", () => {
+    if (document.activeElement?.closest("#chat-compact-workers-items, .chat-queue-content")) {
+      dockGrowth?.cancel();
+      dockGrowth = null;
+    }
+    if (typeof requestAnimationFrame === "function") requestAnimationFrame(() => requestAnimationFrame(revealWorkFocus));
   });
   surface.addEventListener("keydown", event => {
     if (event.key === "Escape" && !event.defaultPrevented && document.documentElement.hasAttribute("data-chat-work-expanded")) {
@@ -5101,16 +5230,14 @@ export function initChat(api = new ChatApiClient()): void {
       event.preventDefault(); event.stopPropagation(); closeDesktopWork();
     }
   });
-  workDock?.addEventListener("scroll", syncQueueOverflow, { passive: true });
   let dockHeight: number | null = null;
   let dockGrowth: Animation | null = null;
   const observer = typeof ResizeObserver === "function" ? new ResizeObserver(() => {
-    syncDesktopWorkLayout();
     syncQueueOverflow();
+    syncDesktopWorkLayout();
     if (workDock && document.documentElement.dataset.uiMode === "touch") {
       // Text enlargement can make fixed chrome taller than its percentage
       // budget. Secondary work yields before the primary composer does.
-      const header = surface.querySelector<HTMLElement>(".chat-header");
       const visualHeight = window.visualViewport?.height ?? window.innerHeight;
       const readingBudget = visualHeight * (surface.clientWidth >= 768 && !document.documentElement.hasAttribute("data-chat-wide-short") ? 0.35 : 0.4);
       // clientHeight includes safe-area padding. Count all in-flow chrome, not
@@ -5129,16 +5256,18 @@ export function initChat(api = new ChatApiClient()): void {
         && queueDockElement.querySelector(".chat-queue-note.is-replacement:not([hidden])") !== null;
       const available = `${Math.max(0, surface.clientHeight - fixed - (enlargedReplacement ? 48 : Math.max(48, readingBudget)))}px`;
       if (workDock.style.getPropertyValue("--chat-work-available") !== available) workDock.style.setProperty("--chat-work-available", available);
-      workDock.style.setProperty("--chat-workers-bottom", `${form.getBoundingClientRect().height}px`);
-      const headerBottom = (header?.getBoundingClientRect().bottom ?? surface.getBoundingClientRect().top) - surface.getBoundingClientRect().top;
-      workDock.style.setProperty("--chat-workers-top", `${Math.max(0, headerBottom)}px`);
+      const hardAvailable = `${Math.max(0, surface.clientHeight - fixed)}px`;
+      if (workDock.style.getPropertyValue("--chat-work-hard-available") !== hardAvailable) workDock.style.setProperty("--chat-work-hard-available", hardAvailable);
     }
+    restorePendingScroll();
+    if (typeof requestAnimationFrame === "function") requestAnimationFrame(revealWorkFocus);
     if (workDock && !dockGrowth) {
       const height = workDock.getBoundingClientRect().height;
       const previous = dockHeight;
       dockHeight = height;
       if (previous !== null && height > previous + 1
         && document.documentElement.dataset.uiMode === "touch"
+        && !document.activeElement?.closest("#chat-compact-workers-items, .chat-queue-content")
         && !window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
         // Reserve the final bounded height before revealing new chrome. An
         // animated layout height interleaves native scroll clamps with prompt

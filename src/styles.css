@@ -5229,7 +5229,8 @@ html[data-ui-mode="desktop"] .chat-work-dock {
   grid-auto-rows: max-content;
   flex: 0 1 auto;
   min-height: 0;
-  max-height: min(calc(var(--chat-panel-height, 0px) * 0.4), 25rem);
+  --chat-work-budget: min(calc(var(--chat-panel-height, 0px) * 0.4), 25rem);
+  max-height: var(--chat-work-budget);
   overflow-y: auto;
   overscroll-behavior: contain;
 }
@@ -5245,7 +5246,6 @@ html[data-ui-mode="desktop"] .chat-work-dock button { scroll-margin-block: 0.25r
 html[data-ui-mode="desktop"] .chat-work-dock button:focus-visible { outline-offset: 0; }
 /* Keep each disclosure's header and contents together on both device modes. */
 html[data-ui-mode="desktop"] .chat-work-dock :is(#chat-background-tasks-items, #chat-subagents-items, #chat-task-list-items, #chat-scheduled-wakeups-items, .chat-reverted-items) { max-height: none; overflow: visible; }
-html[data-ui-mode="desktop"] .chat-work-dock { scroll-padding-top: var(--chat-work-heading-height, 0px); scroll-padding-bottom: var(--chat-pending-footer-height, 0px); }
 html[data-ui-mode="desktop"] .chat-work-close { order: -3; }
 html[data-ui-mode="desktop"] .chat-composer-notices { max-height: 3rem; overflow: auto; overflow-wrap: anywhere; }
 .chat-work-toggle, .chat-work-close { display: none; }
@@ -5256,8 +5256,9 @@ html[data-ui-mode="desktop"][data-chat-work-constrained] .chat-work-toggle:not([
 html[data-ui-mode="desktop"][data-chat-work-constrained]:not([data-chat-work-expanded]) .chat-work-dock { display: none; }
 html[data-ui-mode="desktop"][data-chat-work-expanded] .chat-work-dock {
   position: absolute; z-index: 32;
-  inset: var(--chat-workers-top) 0 var(--chat-workers-bottom);
+  inset: 0 0 var(--chat-workers-bottom);
   max-height: none;
+  --chat-work-budget: calc(var(--chat-panel-height) - var(--chat-workers-bottom) - 60px);
   background: var(--surface-raised);
 }
 html[data-ui-mode="desktop"][data-chat-work-expanded] .chat-work-close:not([hidden]) {
@@ -9661,7 +9662,6 @@ html[data-chat-keyboard] .chat-reverted-items {
 }
 
 html[data-ui-mode="touch"][data-chat-keyboard] .chat-work-dock > :not(#chat-queue):not(#chat-compact-workers),
-html[data-ui-mode="touch"][data-chat-keyboard] .chat-queue-items,
 html[data-ui-mode="touch"][data-chat-keyboard] .chat-queue-breakdown,
 html[data-ui-mode="touch"][data-chat-keyboard] .chat-queue-model-note,
 html[data-ui-mode="touch"][data-chat-keyboard] .chat-queue-note:not(.is-replacement) {
@@ -10523,15 +10523,17 @@ html[data-ui-mode="touch"][data-chat-editing]:not([data-chat-keyboard]) .chat-co
   padding-bottom: calc(0.45rem + env(safe-area-inset-bottom));
 }
 html[data-ui-mode="touch"][data-chat-editing]:not([data-chat-keyboard]) .chat-work-dock {
-  max-height: min(calc(var(--chat-visual-height) * 0.24), var(--chat-work-available, 100vh));
+  --chat-work-budget: min(calc(var(--chat-visual-height) * 0.24), var(--chat-work-available, 100vh));
+  max-height: var(--chat-work-budget);
 }
 html[data-ui-mode="touch"] .chat-work-dock {
   flex-shrink: 0;
-  max-height: min(calc(var(--chat-visual-height) * 0.35), var(--chat-work-available, 100vh));
+  --chat-work-budget: min(calc(var(--chat-visual-height) * 0.35), var(--chat-work-available, 100vh));
+  max-height: var(--chat-work-budget);
 }
 @media (min-width: 48rem) {
   html[data-ui-mode="touch"] .chat-work-dock {
-    max-height: min(calc(var(--chat-visual-height) * 0.25), var(--chat-work-available, 100vh));
+    --chat-work-budget: min(calc(var(--chat-visual-height) * 0.25), var(--chat-work-available, 100vh));
   }
 }
 
@@ -10566,7 +10568,6 @@ html[data-ui-mode="touch"]:is([data-chat-compact], [data-chat-wide-short]) .chat
 html[data-ui-mode="touch"]:is([data-chat-compact], [data-chat-wide-short]) .chat-composer-actions > :not(.chat-send-group) { display: none; }
 html[data-ui-mode="touch"]:is([data-chat-compact], [data-chat-wide-short]) .chat-send-group { flex: 0 0 auto; }
 html[data-ui-mode="touch"][data-chat-wide-short] .chat-work-dock > :not(#chat-queue):not(#chat-compact-workers),
-html[data-ui-mode="touch"][data-chat-wide-short] .chat-queue-items,
 html[data-ui-mode="touch"][data-chat-wide-short] .chat-queue-breakdown,
 html[data-ui-mode="touch"][data-chat-wide-short] .chat-queue-model-note,
 html[data-ui-mode="touch"][data-chat-wide-short] .chat-queue-note:not(.is-replacement) { display: none; }
@@ -10649,11 +10650,11 @@ html[data-ui-mode="touch"] #chat-configuration-trigger { display: none; }
   text-align: left;
   cursor: pointer;
 }
-.chat-pending-toggle::before { content: "▸ "; }
-.chat-pending-toggle[aria-expanded="true"]::before { content: "▾ "; }
+.chat-pending-toggle::before { content: ""; width: 5px; height: 5px; flex: 0 0 5px; border-right: 1.5px solid currentColor; border-bottom: 1.5px solid currentColor; transform: rotate(-45deg); opacity: 0.65; margin-right: 3px; }
+.chat-pending-toggle[aria-expanded="true"]::before { transform: rotate(45deg); }
 .chat-pending-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 /* Every device uses the canonical occurrence list. */
-html[data-ui-mode="touch"] .chat-work-dock :is(.chat-queue, #chat-task-list-items, #chat-scheduled-wakeups-items, .chat-reverted-items) { max-height: none; overflow: visible; }
+html[data-ui-mode="touch"] .chat-work-dock :is(#chat-task-list-items, #chat-scheduled-wakeups-items, .chat-reverted-items) { max-height: none; overflow: visible; }
 .chat-compact-workers { margin: 0 0.5rem; border: 1px solid var(--border-soft); border-radius: 0.65rem; background: var(--surface-raised); font-size: 0.875rem; }
 .chat-compact-workers > summary { position: sticky; top: 0; z-index: 2; display: flex; align-items: center; gap: 6px; min-height: 1.75rem; padding: 0 8px; background: var(--surface-raised); color: var(--text-subtle); cursor: pointer; font-size: 0.8125rem; line-height: 1.25rem; list-style: none; border-radius: inherit; }
 .chat-compact-workers > summary::-webkit-details-marker { display: none; }
@@ -10662,34 +10663,51 @@ html[data-ui-mode="touch"] .chat-work-dock :is(.chat-queue, #chat-task-list-item
 .chat-compact-workers[open] > summary::before { transform: rotate(45deg); }
 #chat-compact-workers-label { min-width: 0; }
 .chat-compact-workers > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
-/* One scroller, one bordered worker card. The compact pending footer stays
-   below that card; expanding Pending returns its contents to ordinary flow. */
-.chat-work-dock { row-gap: 8px; padding-bottom: 4px; }
-html:is([data-ui-mode="touch"], [data-ui-mode="desktop"]) .chat-work-dock { display: flex; flex-direction: column; overflow: hidden; }
-.chat-compact-workers { display: flex; flex-direction: column; flex: 0 1 auto; min-width: 0; min-height: 30px; overflow: hidden; background: var(--surface-muted); }
+/* Sibling cards share a budget, never a scrollport. Intrinsic measurements
+   let short cards yield their unused share to the other content pane. */
+.chat-work-dock { --chat-work-gap-base: 8px; row-gap: var(--chat-work-gap, var(--chat-work-gap-base)); padding-bottom: 4px; }
+html:is([data-ui-mode="touch"], [data-ui-mode="desktop"]) .chat-work-dock { display: flex; flex-direction: column; overflow: clip; }
+.chat-compact-workers { display: flex; flex-direction: column; flex: 0 1 auto; min-width: 0; min-height: 30px; overflow: clip; background: var(--surface-muted); }
 /* Only the native details content wrapper is transparent to flex sizing;
    the disclosure itself remains the real, bordered header-and-rows card. */
 .chat-compact-workers::details-content { display: contents; }
 .chat-compact-workers > summary { flex: 0 0 auto; position: static; background: var(--surface-muted); }
 .chat-compact-workers:not([open]) > #chat-compact-workers-items { display: none; }
-#chat-compact-workers-items { min-height: 0; overflow: auto; overscroll-behavior: contain; scroll-padding-block: 4px; }
+#chat-compact-workers-items { min-height: 0; overflow: auto; overscroll-behavior: contain; overflow-anchor: none; scroll-padding-block: 4px; }
 .chat-compact-workers > summary { border-radius: 0.65rem 0.65rem 0 0; }
 .chat-compact-workers:not([open]) > summary { border-radius: inherit; }
-.chat-work-dock .chat-queue { margin: 0 0.5rem; padding: 0 8px; border: 1px solid var(--border-soft); border-radius: 6px; min-width: 0; max-height: none; overflow: visible; }
-.chat-work-dock .chat-queue { flex: 0 0 auto; }
+html:is([data-ui-mode="touch"], [data-ui-mode="desktop"]) .chat-work-dock .chat-queue { margin: 0 0.5rem; padding: 0; border: 1px solid var(--border-soft); border-radius: 0.65rem; min-width: 0; min-height: var(--chat-queue-heading, 28px); overflow: hidden; background: var(--surface-muted); display: flex; flex-direction: column; flex: 0 1 auto; gap: 0; }
+html:is([data-ui-mode="touch"], [data-ui-mode="desktop"]) .chat-work-dock .chat-queue[hidden] { display: none; }
 .chat-work-dock .chat-queue[data-expanded="false"] .chat-queue-note:not(.is-replacement) { display: none; }
 .chat-work-dock .chat-queue[data-expanded="false"]:not(:has(.is-replacement:not([hidden]))) { gap: 0; }
-/* Expanded pending messages (or independent non-worker tracks/warnings) use
-   one aggregate scroller instead. No nested worker scrollport traps wheel,
-   touch or keyboard movement while inspecting the pending list. */
-html:is([data-ui-mode="touch"], [data-ui-mode="desktop"]) .chat-work-dock:is([data-headings-tight]:has(> #chat-compact-workers[open]), :has(> .chat-work-close:not([hidden]), > .chat-queue[data-expanded="true"]:not([hidden]), > .chat-queue .is-replacement:not([hidden]), > :is(#chat-task-list, #chat-scheduled-wakeups, #chat-reverted):not([hidden]))) { overflow-y: auto; }
-.chat-work-dock:is([data-headings-tight]:has(> #chat-compact-workers[open]), :has(> .chat-work-close:not([hidden]), > .chat-queue[data-expanded="true"]:not([hidden]), > .chat-queue .is-replacement:not([hidden]), > :is(#chat-task-list, #chat-scheduled-wakeups, #chat-reverted):not([hidden]))) .chat-compact-workers { flex-shrink: 0; overflow: visible; }
-.chat-work-dock:is([data-headings-tight]:has(> #chat-compact-workers[open]), :has(> .chat-work-close:not([hidden]), > .chat-queue[data-expanded="true"]:not([hidden]), > .chat-queue .is-replacement:not([hidden]), > :is(#chat-task-list, #chat-scheduled-wakeups, #chat-reverted):not([hidden]))) #chat-compact-workers-items { overflow: visible; }
-.chat-work-dock .chat-queue-header { top: 0; padding-block: 0; min-height: 32px; border-radius: inherit; }
-.chat-work-dock .chat-pending-toggle { min-height: 32px; font-weight: 400; }
+html:is([data-ui-mode="touch"], [data-ui-mode="desktop"]) .chat-work-dock { min-height: min(var(--chat-work-floor, 0px), var(--chat-work-hard-available, 100vh)); }
+html[data-ui-mode="desktop"][data-chat-has-work] .chat-work-dock { min-height: var(--chat-work-floor, 52px); }
+.chat-work-dock { --chat-card-space: calc(max(var(--chat-work-budget), var(--chat-work-floor, 0px)) - var(--chat-work-extras, 0px) - var(--chat-work-spacing, 4px)); }
+.chat-work-dock .chat-compact-workers { min-height: var(--chat-worker-floor, 30px); max-height: max(calc(var(--chat-card-space) / 2), calc(var(--chat-card-space) - var(--chat-queue-natural, 0px))); }
+html:is([data-ui-mode="touch"], [data-ui-mode="desktop"]) .chat-work-dock .chat-queue { max-height: max(calc(var(--chat-card-space) / 2), calc(var(--chat-card-space) - var(--chat-worker-natural, 0px))); }
+html:is([data-ui-mode="touch"], [data-ui-mode="desktop"]) .chat-work-dock .chat-queue-header { display: flex; position: static; flex: 0 0 auto; padding: 0 8px; min-height: 28px; border-radius: inherit; background: var(--surface-muted); color: var(--text-subtle); font-size: 0.8125rem; line-height: 1.25rem; }
+html:is([data-ui-mode="touch"], [data-ui-mode="desktop"]) .chat-work-dock .chat-pending-toggle { display: flex; align-items: center; gap: 6px; min-height: 28px; font-weight: 400; }
+.chat-queue-content { min-height: 0; overflow-y: auto; overscroll-behavior: contain; overflow-anchor: none; padding: 0 8px; scroll-padding-block: 4px; }
+.chat-queue-content[hidden] { display: none; }
+.chat-queue-batch .chat-queued-action { min-height: 44px; margin-block: 4px; }
+.chat-queue-batch[hidden] { display: none; }
+.chat-work-dock .chat-queue.has-more-below::after { position: absolute; inset: auto 0 0; height: 1rem; margin: 0; }
+.chat-work-dock .chat-queue { position: relative; }
+html:is([data-ui-mode="touch"], [data-ui-mode="desktop"]) .chat-work-dock .chat-queue { min-height: var(--chat-queue-floor, 30px); align-items: stretch; overflow: clip; }
+.chat-work-dock .chat-pending-toggle:focus-visible { outline-offset: -2px; }
+/* When even the transcript's entire band cannot fit two whole action rows,
+   keep both headers and the composer visible. Explicitly interacting with a
+   pane lends it the complete action row; the other pane remains scrollable. */
+html:is([data-ui-mode="touch"], [data-ui-mode="desktop"]) .chat-work-dock[data-work-cramped]:not([data-work-active="queue"]) .chat-queue { min-height: var(--chat-queue-heading); }
+html:is([data-ui-mode="touch"], [data-ui-mode="desktop"]) .chat-work-dock[data-work-cramped][data-work-active="queue"] .chat-compact-workers { min-height: var(--chat-worker-heading); }
+html:is([data-ui-mode="touch"], [data-ui-mode="desktop"]) .chat-work-dock[data-work-cramped][data-work-active="queue"] .chat-queue { min-height: var(--chat-queue-compact-floor); }
+html:is([data-ui-mode="touch"], [data-ui-mode="desktop"]) .chat-work-dock > :is(#chat-reverted, #chat-task-list, #chat-scheduled-wakeups):not([hidden]) { display: flex; flex-direction: column; flex: 0 1 auto; min-height: var(--chat-track-floor); max-height: var(--chat-track-floor); overflow: clip; }
+.chat-work-dock > :is(#chat-reverted, #chat-task-list, #chat-scheduled-wakeups)::details-content { display: contents; }
+.chat-work-dock > :is(#chat-reverted, #chat-task-list, #chat-scheduled-wakeups) > summary { flex: 0 0 auto; position: static; }
+html:is([data-ui-mode="touch"], [data-ui-mode="desktop"]) .chat-work-dock :is(#chat-reverted-items, #chat-task-list-items, #chat-scheduled-wakeups-items) { min-height: 0; max-height: none; overflow-y: auto; overscroll-behavior: contain; }
+html:is([data-ui-mode="touch"], [data-ui-mode="desktop"]) .chat-work-dock[data-work-cramped]:not([data-work-active="history"]) > :is(#chat-reverted, #chat-task-list, #chat-scheduled-wakeups):not([hidden]) { min-height: var(--chat-track-heading); }
 .chat-work-dock .chat-queue-items { max-height: none; overflow: visible; min-width: 0; }
 .chat-work-dock .chat-queue-items[hidden] { display: none; }
-html[data-ui-mode="touch"] .chat-work-dock { scroll-padding-top: var(--chat-work-heading-height, 0px); scroll-padding-bottom: var(--chat-pending-footer-height, 0px); }
 .chat-queue-discovery { margin: 0; color: var(--text-subtle); font-size: 0.8125rem; line-height: 1.4; }
 .chat-queue-discovery[hidden] { display: none; }
 #chat-compact-workers-items ul { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 0.5rem; }
@@ -10748,7 +10766,7 @@ html[data-ui-mode="touch"] :is(.chat-inline-configuration, .chat-inline-context)
 html[data-ui-mode="touch"] .chat-inline-context { color: var(--accent); }
 html[data-ui-mode="touch"] .chat-composer-status { display: none; }
 html[data-ui-mode="touch"] .chat-send-group { flex: 0 0 auto; display: flex; flex-wrap: nowrap; gap: 8px; margin: 0; min-height: 44px; height: 44px; }
-html[data-ui-mode="touch"] :is(#chat-send, #chat-stop) { flex: 0 0 44px; width: 44px; min-width: 44px; min-height: 44px; padding-inline: 2px; box-sizing: border-box; font-size: 11px; }
+html[data-ui-mode="touch"] :is(#chat-send, #chat-stop) { flex: 0 0 44px; width: 44px; height: 44px; min-width: 44px; min-height: 44px; padding-inline: 2px; box-sizing: border-box; font-size: 11px; }
 html[data-ui-mode="touch"] #chat-send { order: 0; }
 html[data-ui-mode="touch"] #chat-stop { order: 2; }
 /* Occupancy is already in the picker pill on touch; retain desktop breakdown. */
@@ -10773,12 +10791,17 @@ html[data-ui-mode="touch"][data-chat-compact]:not([data-chat-wide-short]) .chat-
 }
 /* A worker disclosure retains its bottom dock across keyboard and orientation
    changes. Resizing an already-open list is not a request for a top sheet. */
-/* At the smallest visual bands a whole 44px action outranks pinning chrome. */
-.chat-work-dock[data-headings-tight] :is(summary, .chat-queue-header) { position: static !important; }
-html[data-ui-mode="touch"] .chat-work-dock[data-headings-tight] { scroll-padding-top: 0; }
+/* At the smallest visual bands conversation space yields before fixed headers. */
 /* Interaction forms retain the keyboard band; a worker sheet must never
    cover the question/permission controls the user is answering. */
 html[data-ui-mode="touch"][data-chat-answering] #chat-compact-workers { display: none; }
+/* Fixed physical target minima, not rem-scaled empty chrome, leave room for
+   both headers and a whole selected action at enlarged landscape text. */
+html[data-ui-mode="touch"][data-chat-wide-short] .chat-conversation-controls > :is(select, button):not([hidden]) { min-height: 44px; height: 44px; padding-block: 0; }
+html[data-ui-mode="touch"][data-chat-wide-short] .chat-composer textarea { height: 44px !important; min-height: 44px; max-height: 44px; }
+html[data-ui-mode="touch"][data-chat-wide-short] .chat-composer-actions { min-height: 44px; }
+html[data-ui-mode="touch"][data-chat-wide-short] :is(.chat-compact-workers > summary, .chat-workers-dismiss) { min-height: 28px; }
+html[data-ui-mode="touch"][data-chat-wide-short] .chat-worker-row .chat-task-stop { min-height: 44px; height: 44px; padding-block: 0; align-self: flex-start; }
 html[data-ui-mode="touch"] .chat-subagent-open { min-height: 2.75rem; }
 html[data-ui-mode="touch"] .chat-surface:has(#chat-work-dock > details[open]:not([hidden])) #chat-prompt-rail {
   visibility: hidden;

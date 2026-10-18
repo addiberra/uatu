@@ -1,0 +1,98 @@
+import { test as base, expect } from "./fixtures";
+import { attachPageDiagnosticsOnFailure, withEngineBrowsers } from "./page-diagnostics";
+import { expectWorkControlVisible, expectWorkLayoutReady } from "./work-panel-assertions";
+import { captureScreenshot, saveEvidence } from "./evidence";
+
+const test = withEngineBrowsers(base);
+attachPageDiagnosticsOnFailure(test);
+
+for (const engine of ["chromium", "webkit"] as const) {
+  for (const enlarged of [false, true]) test(`header taps expose short-screen actions without focus assistance: ${engine} ${enlarged ? 200 : 100}%`, async ({ launchBrowser, request, baseURL }, info) => {
+    const browser = await launchBrowser(engine);
+    const page = await browser.newPage({ baseURL, viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true, reducedMotion: "reduce" });
+    await page.addInitScript(() => Object.defineProperty(window, "visualViewport", { configurable: true, value: Object.assign(new EventTarget(), { height: 844, width: 390, offsetTop: 0, offsetLeft: 0, scale: 1 }) }));
+    try {
+      await request.post("/__e2e/reset");
+      await request.post("/__e2e/chat", { data: { action: "agents", stack: "opencode-v2", backgroundPreview: true } });
+      const { token } = await request.get("/__e2e/terminal-token").then(r => r.json());
+      await page.goto(`/?t=${encodeURIComponent(token)}`);
+      await expect(page.locator("#connection-state .connection-label")).toHaveText("Connected");
+      await expect(page.locator("html")).toHaveAttribute("data-ui-mode", "touch");
+      await page.locator("#touch-tab-chat").tap();
+      await expect(page.locator("#touch-tab-chat")).toHaveAttribute("aria-selected", "true");
+      await page.getByRole("button", { name: "New conversation", exact: true }).tap();
+      await expect(page.locator("#chat-conversation-select")).not.toHaveValue("");
+      await page.locator("#chat-input").fill("Check independent action access");
+      await page.locator("#chat-send").tap();
+      await expect(page.locator("#chat-stop")).toBeEnabled();
+      const conversationId = await page.locator("#chat-conversation-select").inputValue();
+      for (let i = 0; i < 12; i++) await request.post("/__e2e/chat", { data: { action: "opencode", op: "launchWorker", conversationId } });
+      for (let i = 0; i < 10; i++) {
+        await page.locator("#chat-input").fill(`Follow-up ${i}`);
+        const accepted = page.waitForResponse(r => r.url().endsWith("/prompts") && r.request().method() === "POST");
+        await page.locator("#chat-input").press("Alt+Enter"); await accepted;
+        await expect(page.locator(".chat-queued-message")).toHaveCount(i + 1);
+      }
+      const workers = page.locator("#chat-compact-workers > summary"), pending = page.locator("[data-pending-toggle]");
+      await workers.tap(); await pending.tap();
+      const offsets = () => page.evaluate(() => Object.fromEntries(["chat-compact-workers-items", "chat-queue-content", "chat-work-dock", "chat-timeline"].map(id => [id, document.getElementById(id)!.scrollTop])));
+      await page.locator("#chat-compact-workers-items").evaluate(n => n.scrollTop = 140);
+      await page.locator("#chat-queue-content").evaluate(n => n.scrollTop = 140);
+      const before = await offsets();
+      await pending.tap(); await expect(pending).toHaveAttribute("aria-expanded", "false");
+      await pending.tap(); await expect(pending).toHaveAttribute("aria-expanded", "true");
+      await expect.poll(offsets).toEqual(before);
+      await workers.tap(); await expect(page.locator("#chat-compact-workers")).not.toHaveAttribute("open");
+      await workers.tap(); await expect(page.locator("#chat-compact-workers")).toHaveAttribute("open", "");
+      await expect.poll(offsets).toEqual(before);
+
+      await page.getByRole("button", { name: "New conversation", exact: true }).tap();
+      await expect(page.locator("#chat-conversation-select")).not.toHaveValue(conversationId);
+      await page.locator("#chat-input").fill("A separate conversation");
+      await page.locator("#chat-send").tap();
+      await expect(page.locator("#chat-stop")).toBeEnabled();
+      await page.locator("#chat-input").fill("Separate pending entry");
+      const separate = page.waitForResponse(r => r.url().endsWith("/prompts") && r.request().method() === "POST");
+      await page.locator("#chat-input").press("Alt+Enter"); await separate;
+      await pending.tap();
+      await expect.poll(() => page.locator("#chat-queue-content").evaluate(n => n.scrollTop)).toBe(0);
+      await page.locator("#chat-conversation-select").selectOption(conversationId);
+      await expect(page.locator(".chat-queued-message")).toHaveCount(10);
+      await expect(pending).toHaveAttribute("aria-expanded", "true");
+      await expect.poll(() => page.locator("#chat-queue-content").evaluate(n => n.scrollTop)).toBe(140);
+
+      if (enlarged) await page.addStyleTag({ content: "html { font-size: 200% !important }" });
+      await page.setViewportSize({ width: 844, height: 390 });
+      await page.evaluate(() => { Object.assign(window.visualViewport!, { width: 844, height: 230 }); window.visualViewport!.dispatchEvent(new Event("resize")); });
+      await expectWorkLayoutReady(page);
+      await saveEvidence(info, "short-minimum-geometry.json", JSON.stringify(await page.evaluate(() => [...document.querySelectorAll<HTMLElement>("#chat-surface > *, #chat-compact-workers > summary, #chat-compact-workers-items, #chat-queue, #chat-queue-content, #chat-composer > *")].map(n => ({ id: n.id, tag: n.tagName, box: n.getBoundingClientRect().toJSON(), style: n.getAttribute("style"), min: getComputedStyle(n).minHeight, max: getComputedStyle(n).maxHeight, gap: getComputedStyle(n).rowGap, scrollHeight: n.scrollHeight }))), null, 2));
+      await expectWorkControlVisible(workers); await expectWorkControlVisible(pending);
+      // Native header activation, not action.focus(), must lend this pane a
+      // whole action row even when the other expanded body consumes the band.
+      await pending.tap(); await expect(pending).toHaveAttribute("aria-expanded", "false");
+      await pending.tap(); await expect(pending).toHaveAttribute("aria-expanded", "true");
+      await expect.poll(() => page.locator("#chat-queue-content").evaluate(n => n.clientHeight)).toBeGreaterThanOrEqual(await page.locator("[data-queue-remove]").first().evaluate(n => n.getBoundingClientRect().height));
+      await page.locator("#chat-queue-content").evaluate(n => n.scrollTop = n.scrollHeight);
+      const remove = page.locator("[data-queue-remove]").last();
+      await expectWorkControlVisible(remove);
+      const removal = page.waitForResponse(r => r.request().method() === "DELETE" && r.url().includes("/queue/"));
+      await remove.tap(); expect((await removal).ok()).toBe(true);
+      await expect(page.locator(".chat-queued-message")).toHaveCount(9);
+      await workers.tap(); await workers.tap();
+      await page.locator("#chat-compact-workers-items").evaluate(n => n.scrollTop = 0);
+      const stop = page.locator("#chat-compact-workers [data-stop-task]").first();
+      await expectWorkControlVisible(stop);
+      await expectWorkControlVisible(workers); await expectWorkControlVisible(pending);
+      await expectWorkControlVisible(page.locator("#chat-configuration-trigger"));
+      await expectWorkControlVisible(page.locator("#chat-attach"));
+      await expectWorkControlVisible(page.locator("#chat-send"));
+      await expectWorkControlVisible(page.locator("#chat-stop"));
+      await page.locator("#chat-stop").tap();
+      await expect(page.getByRole("dialog", { name: "Stop parent?" })).toBeVisible();
+      await page.getByRole("button", { name: "Cancel", exact: true }).tap();
+      await expect(page.locator("#chat-stop")).toBeEnabled();
+      await saveEvidence(info, "interaction-geometry.json", JSON.stringify(await page.locator("#chat-work-dock").evaluate(n => ({ style: n.getAttribute("style"), active: n.getAttribute("data-work-active"), children: [...n.children].map(c => ({ id: c.id, box: c.getBoundingClientRect().toJSON() })) })), null, 2));
+      await captureScreenshot(page, info, `header-actions-${engine}-${enlarged ? 200 : 100}`);
+    } finally { await page.close(); }
+  });
+}

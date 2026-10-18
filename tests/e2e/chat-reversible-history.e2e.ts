@@ -3,6 +3,7 @@ import type { APIRequestContext, Browser, Page } from "@playwright/test";
 import type { ChatCapability, ConversationItem, ConversationSnapshot } from "../../src/chat/types";
 import { openChatPanel } from "./chat-helpers";
 import { expect, test } from "./fixtures";
+import { expectWorkControlVisible } from "./work-panel-assertions";
 
 const CAPABILITIES: ChatCapability[] = ["commands", "attachments", "reversible-history"];
 const PNG = Array.from(Buffer.from(
@@ -228,8 +229,13 @@ test.describe("reversible Chat history", () => {
     await expect(page.locator("#chat-queue .is-held")).toHaveCount(2);
     await expect(page.locator("#chat-items")).not.toContainText("older queued turn");
 
+    await page.locator("[data-pending-toggle]").click();
+    await expect(page.locator("[data-pending-toggle]")).toHaveAttribute("aria-expanded", "true");
     const removal = page.waitForResponse(response => response.request().method() === "DELETE" && response.url().includes("/queue/"));
-    await page.locator("#chat-queue .is-held", { hasText: "remove this queued turn" }).locator("[data-queue-remove]").click();
+    const remove = page.locator("#chat-queue .is-held", { hasText: "remove this queued turn" }).locator("[data-queue-remove]");
+    await remove.scrollIntoViewIfNeeded();
+    await expectWorkControlVisible(remove);
+    await remove.click();
     expect((await removal).status()).toBe(200);
     await expect(page.locator("#chat-queue .is-held")).toHaveCount(1);
 

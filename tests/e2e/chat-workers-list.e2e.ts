@@ -3,6 +3,7 @@ import { test as base, expect } from "./fixtures";
 import { withEngineBrowsers } from "./page-diagnostics";
 import { captureScreenshot } from "./evidence";
 import { openChatPanel } from "./chat-helpers";
+import { expectWorkControlVisible } from "./work-panel-assertions";
 
 const test = withEngineBrowsers(base);
 
@@ -276,10 +277,13 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`canonical w
       await summary.tap();
       const dock = page.locator("#chat-work-dock");
       expect(await dock.evaluate(node => getComputedStyle(node).position)).not.toBe("absolute");
-      const transcript = (await page.locator(".chat-transcript-area").boundingBox())!;
-      expect((await dock.boundingBox())!.y).toBeGreaterThanOrEqual(transcript.y + transcript.height - 1);
+      await expect.poll(() => dock.evaluate(node => {
+        const transcript = document.querySelector(".chat-transcript-area")!.getBoundingClientRect();
+        return node.getBoundingClientRect().top - transcript.bottom;
+      })).toBeGreaterThanOrEqual(-1);
       const stop = track.locator('[data-state="working"] [data-stop-task]').first();
       await stop.scrollIntoViewIfNeeded();
+      await expectWorkControlVisible(stop);
       expect(await stop.evaluate(node => { const rect = node.getBoundingClientRect(); return node.contains(document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2)); })).toBe(true);
       await expect(page.locator("#chat-input")).toHaveValue("Preserve this private composing draft");
       await expect(page.locator("#chat-input")).toBeFocused();

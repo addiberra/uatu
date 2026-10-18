@@ -1126,7 +1126,7 @@ export type QueueDockContext = {
   note?: HTMLElement;
   replacement?: boolean;
   pausedSteers?: number;
-  // Defined only on touch; desktop retains the established open list.
+  // Shared disclosure state; omitted by callers without compact presentation.
   compactOpen?: boolean;
 };
 
@@ -1199,7 +1199,7 @@ export class QueueDockRenderer {
       ? `<span>${queued.length} pending</span><span class="chat-queue-breakdown">${breakdown ? ` · ${breakdown}` : ""}</span>`
       : `<span>${breakdown || "No pending messages"}</span>`;
     const heading = context.compactOpen === undefined ? `<strong>${counts}</strong>` : `<button type="button" class="chat-pending-toggle" data-pending-toggle aria-expanded="${context.compactOpen}" aria-controls="chat-queue-items">${counts}</button>`;
-    const headerHtml = `${heading}${paused ? `<button type="button" class="chat-queued-action" data-queue-send-now="${escapeHtmlAttribute(paused.id)}">Send ${context.pausedSteers} paused steer${context.pausedSteers === 1 ? "" : "s"} now</button>` : ""}`;
+    const headerHtml = heading;
     if (header.innerHTML !== headerHtml) {
       // Counts/expansion can change between pointerdown and click. Keep the
       // actual action nodes, not merely a replacement's restored focus.
@@ -1227,15 +1227,42 @@ export class QueueDockRenderer {
       }
       for (const node of previous) if (!ordered.includes(node)) node.remove();
     }
-    // The entries live in the dock's own list; the note sits beside it, so
-    // the list holds list items only.
-    let list = target.querySelector<HTMLElement>(":scope > .chat-queue-items");
+    // Only this content pane scrolls. Counts stay outside it; batch safety and
+    // notes stay outside the list's accessible list semantics.
+    let content = target.querySelector<HTMLElement>(":scope > .chat-queue-content");
+    if (!content) {
+      content = target.ownerDocument.createElement("div");
+      content.id = "chat-queue-content";
+      content.className = "chat-queue-content";
+      header.after(content);
+      const initialList = target.querySelector<HTMLElement>(":scope > .chat-queue-items");
+      if (initialList) content.append(initialList);
+    }
+    let batch = content.querySelector<HTMLElement>(":scope > .chat-queue-batch");
+    if (!batch) {
+      batch = target.ownerDocument.createElement("div");
+      batch.className = "chat-queue-batch";
+      content.prepend(batch);
+    }
+    batch.hidden = !paused;
+    if (paused) {
+      let action = batch.querySelector<HTMLButtonElement>("button");
+      if (action?.dataset.queueSendNow !== paused.id) {
+        action = target.ownerDocument.createElement("button");
+        action.type = "button";
+        action.className = "chat-queued-action";
+        action.dataset.queueSendNow = paused.id;
+        batch.replaceChildren(action);
+      }
+      action.textContent = `Send ${context.pausedSteers} paused steer${context.pausedSteers === 1 ? "" : "s"} now`;
+    } else batch.replaceChildren();
+    let list = content.querySelector<HTMLElement>(":scope > .chat-queue-items");
     if (!list) {
       list = target.ownerDocument.createElement("div");
       list.className = "chat-queue-items";
       list.id = "chat-queue-items";
       list.setAttribute("role", "list");
-      header.after(list);
+      content.append(list);
     }
     list.hidden = context.compactOpen === false;
     const ordered: HTMLElement[] = [];
@@ -1283,6 +1310,7 @@ export class QueueDockRenderer {
     }
     target.hidden = queued.length === 0;
     if (context.note) {
+      if (context.note.parentElement !== content) content.append(context.note);
       const steering = queued.some(entry => entry.delivery === "steer");
       context.note.hidden = !steering;
       const replacementNote = context.replacement ? pendingSteerReplacementNote(queued) : "";
@@ -1297,27 +1325,19 @@ export class QueueDockRenderer {
         // reader was at the bottom. Reveal once on entry into this state;
         // subsequent queue updates must respect the reader's own scrolling.
         if (!this.replacementWarningShown) {
-          target.scrollTop = 0;
-          const note = context.note;
-          // The queue may itself sit below live tracks in the aggregate dock.
-          // Reveal the consequence once there too, without panning the surface
-          // or stealing later deliberate dock/transcript scrolling.
+          content.scrollTop = 0;
+          // Revealing safety information must not move the sibling workers or
+          // transcript. A constrained desktop can still reveal its work sheet.
           const reveal = () => {
             if (!target.isConnected || !this.replacementWarningShown) return;
             const dock = target.parentElement;
-            if (dock?.clientHeight === 0 && document.documentElement.hasAttribute("data-chat-work-constrained")) dock.dispatchEvent(new Event("chat-work-reveal"));
-            if (!dock?.classList.contains("chat-work-dock") || dock.clientHeight <= 0) return;
-            const warning = note.querySelector(".chat-queue-replacement") ?? note;
-            const bounds = warning.getBoundingClientRect();
-            const visible = dock.getBoundingClientRect();
-            const top = visible.top + dock.clientTop + (dock.hasAttribute("data-headings-tight") ? 0 : parseFloat(dock.style.getPropertyValue("--chat-work-heading-height")) || 0);
-            const bottom = visible.top + dock.clientTop + dock.clientHeight;
-            if (bounds.top < top) dock.scrollTop += Math.floor(bounds.top - top);
-            else if (bounds.bottom > bottom) dock.scrollTop += Math.ceil(Math.min(bounds.top - top, bounds.bottom - bottom));
+            if (dock?.classList.contains("chat-work-dock")) dock.dataset.workActive = "queue";
+            dock?.dispatchEvent(new Event("chat-work-reveal"));
+            content.scrollTop = 0;
           };
           // Undo also restores text into the composer, changing the aggregate
           // space after this renderer returns. Measure that final layout.
-          if (typeof requestAnimationFrame === "function") requestAnimationFrame(reveal);
+          if (typeof requestAnimationFrame === "function") requestAnimationFrame(() => requestAnimationFrame(reveal));
         }
       } else if (list.nextElementSibling !== context.note) list.after(context.note);
       this.replacementWarningShown = Boolean(replacementNote);

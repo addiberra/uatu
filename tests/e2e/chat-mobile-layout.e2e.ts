@@ -3,6 +3,7 @@ import { expect, test as base } from "./fixtures";
 import { attachPageDiagnosticsOnFailure, withEngineBrowsers } from "./page-diagnostics";
 import { evidencePath, recordEvidence, saveEvidence } from "./evidence";
 import { openChatPanel } from "./chat-helpers";
+import { expectWorkControlVisible, expectWorkTranscriptBudget } from "./work-panel-assertions";
 
 const test = withEngineBrowsers(base);
 attachPageDiagnosticsOnFailure(test);
@@ -146,7 +147,14 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`mobile layo
     await expect(warning).toBeVisible();
     expect((await page.locator("#chat-input").boundingBox())!.width).toBeGreaterThanOrEqual(140);
     await containedControls(page, scene.visual);
-    expect(await page.locator("#chat-timeline").evaluate(element => element.clientHeight)).toBeGreaterThanOrEqual(scene.visual * 0.4);
+    await expectWorkTranscriptBudget(page, scene.visual);
+    if (scene.visual === 230) {
+      // Both closed headers (30 + 30), their 8px gap and 4px bottom padding
+      // plus 44px app header and 46px composer leave 68px, not the usual 92.
+      await expect.poll(() => page.locator("#chat-timeline").evaluate(element => element.clientHeight)).toBe(68);
+      await expectWorkControlVisible(page.locator("#chat-compact-workers > summary"));
+      await expectWorkControlVisible(page.locator("[data-pending-toggle]"));
+    }
     await page.locator("#chat-configuration-trigger").tap();
     await expect(page.locator("#chat-configuration-dialog")).toBeVisible();
     await expect(page.locator("#chat-attach")).toBeVisible();
@@ -356,12 +364,29 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`mobile layo
       const node = document.getElementById(id)!; const box = node.getBoundingClientRect();
       return [id, { top: box.top, height: box.height, bottom: box.bottom, maxHeight: getComputedStyle(node).maxHeight }];
     }))), null, 2));
-    await expect.poll(() => page.locator("#chat-timeline").evaluate(element => element.clientHeight)).toBeGreaterThanOrEqual(scene.visual * (scene.width === 390 || scene.width === 844 ? 0.4 : 0.35));
+    // Independent pinned headers and whole actions take precedence only when
+    // the normal reading share is physically infeasible. Derive that minimum
+    // from real controls, not the implementation's budget custom properties.
+    const requiredWork = await page.locator("#chat-work-dock").evaluate(dock => {
+      const workers = dock.querySelector<HTMLDetailsElement>("#chat-compact-workers")!;
+      const queue = dock.querySelector<HTMLElement>("#chat-queue")!;
+      const header = (card: Element, selector: string) => card.querySelector(selector)!.getBoundingClientRect().height + 2;
+      const workerBody = workers.open ? Math.min(48, workers.querySelector<HTMLElement>("#chat-compact-workers-items")!.scrollHeight) : 0;
+      const content = queue.querySelector<HTMLElement>(".chat-queue-content")!;
+      const action = Math.max(32, ...[...content.querySelectorAll(".chat-queued-action")].map(button => button.getBoundingClientRect().height));
+      return header(workers, "summary") + workerBody + header(queue, ".chat-queue-header") + Math.min(content.scrollHeight, action + 8) + 12;
+    });
+    const reading = await page.locator("#chat-surface").evaluate(element => {
+      const dock = document.querySelector("#chat-work-dock")!.getBoundingClientRect().height;
+      const transcript = document.querySelector(".chat-transcript-area")!.getBoundingClientRect().height;
+      return { height: element.clientHeight, fixed: element.clientHeight - dock - transcript };
+    });
+    await expect.poll(() => page.locator("#chat-timeline").evaluate(element => element.clientHeight)).toBeGreaterThanOrEqual(Math.min(scene.visual * (scene.width === 390 || scene.width === 844 ? 0.4 : 0.35), Math.max(0, reading.height - reading.fixed - requiredWork)) - 1);
     const metrics = await page.locator("#chat-surface").evaluate(element => ({ surface: element.clientHeight, scrollTop: element.scrollTop, dock: document.querySelector("#chat-work-dock")!.getBoundingClientRect().height, overlay: getComputedStyle(document.querySelector("#chat-work-dock")!).position === "absolute", timeline: document.querySelector("#chat-timeline")!.getBoundingClientRect().height }));
     const hardwareEditing = await page.locator("html").evaluate(node => node.hasAttribute("data-chat-editing") && !node.hasAttribute("data-chat-keyboard"));
     const cap = hardwareEditing ? 0.24 : scene.width >= 768 ? 0.25 : 0.35;
     expect(metrics.overlay).toBe(false);
-    expect(metrics.dock).toBeLessThanOrEqual(scene.visual * cap + 1);
+    expect(metrics.dock).toBeLessThanOrEqual(Math.max(scene.visual * cap, requiredWork) + 1);
     const dock = (await page.locator("#chat-work-dock").boundingBox())!;
     const transcript = (await page.locator(".chat-transcript-area").boundingBox())!;
     expect(dock.y).toBeGreaterThanOrEqual(transcript.y + transcript.height - 1);
@@ -401,7 +426,12 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`mobile layo
     await expect(page.locator("#chat-queue-note")).toBeVisible();
     const batch = page.getByRole("button", { name: "Send 2 paused steers now", exact: true });
     expect((await batch.boundingBox())!.height).toBeGreaterThanOrEqual(44);
-    await expect.poll(() => page.locator("#chat-timeline").evaluate(element => element.clientHeight)).toBeGreaterThanOrEqual(230 * 0.4);
+    await expectWorkTranscriptBudget(page, 230);
+    await expectWorkControlVisible(page.locator("#chat-compact-workers > summary"));
+    await expectWorkControlVisible(page.locator("[data-pending-toggle]"));
+    await batch.focus();
+    await expectWorkControlVisible(batch);
+    await containedControls(page, 230);
     await captureScreenshot(page, testInfo, `mobile-${engine}-landscape-replacement-230`);
   });
 
@@ -577,8 +607,8 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`mobile layo
       const warning = page.locator("#chat-queue-note .chat-queue-replacement");
       await expect(warning).toContainText("delivered together with your replacement");
       await warning.scrollIntoViewIfNeeded();
+      await saveEvidence(testInfo, `combined-warning-${engine}.json`, JSON.stringify(await page.evaluate(() => ({ root: document.documentElement.getAttributeNames().map(name => [name, document.documentElement.getAttribute(name)]), nodes: Object.fromEntries(["chat-work-dock", "chat-compact-workers", "chat-reverted", "chat-queue", "chat-queue-content", "chat-queue-note", "chat-composer"].map(id => { const node = document.getElementById(id)!; const box = node.getBoundingClientRect(); return [id, { top: box.top, bottom: box.bottom, clientHeight: node.clientHeight, scrollHeight: node.scrollHeight, scrollTop: node.scrollTop, style: node.getAttribute("style"), display: getComputedStyle(node).display, min: getComputedStyle(node).minHeight, max: getComputedStyle(node).maxHeight }]; })) })), null, 2));
       await expect(warning).toBeInViewport({ ratio: 1 });
-      await saveEvidence(testInfo, `combined-warning-${engine}.json`, JSON.stringify(await page.evaluate(() => Object.fromEntries(["chat-work-dock", "chat-queue", "chat-queue-note"].map(id => { const node = document.getElementById(id)!; const box = node.getBoundingClientRect(); return [id, { top: box.top, bottom: box.bottom, clientHeight: node.clientHeight, scrollHeight: node.scrollHeight, scrollTop: node.scrollTop }]; }))), null, 2));
       await expect(page.locator("#chat-input")).toHaveValue("Start desktop work");
       await captureScreenshot(page, testInfo, `combined-${engine}-desktop-replacement-warning`);
       await page.locator("#chat-work-dock").evaluate(node => { node.scrollTop = 0; });

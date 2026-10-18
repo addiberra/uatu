@@ -77,7 +77,7 @@ request to restore their superseded Continue/success notices or touch overlay.
 ## Previous explicit refinement: unified dense worker overview
 
 - [x] Replace nested Finished/history/footer with one compact chevron header, right-aligned Dismiss finished and one keyed active-first list; retain canonical counts, model/Σ usage, persisted hiding and timeline inspection.
-- [x] Verify 28px settled rows, independent 44px Stop controls, one scroller and content-sized short/empty cards across phone/keyboard/landscape/short-desktop matrices, with screenshot comparison.
+- [x] Verify 28px settled rows, independent 44px Stop controls, independently scrolling sibling content panes and content-sized short/empty cards across phone/keyboard/landscape/short-desktop matrices, with screenshot comparison (the user's independent-pane decision supersedes the earlier single-scroller contract).
 - [x] Investigate the reported hold animation on the real scripted provider stack: distinguish reproduced failures from passing supported cases, verify native Chromium touch plus Chromium/WebKit pointer/keyboard cancellation and exactly-once Queue, and report native WebKit long-touch tooling limits.
 - [x] Run full unit CI, typecheck/build, API contracts and strict OpenSpec validation plus affected browser regressions; report remaining failures without weakening tests.
 

@@ -1063,6 +1063,26 @@ describe("presentation details", () => {
       expect(host.querySelector("[data-pending-toggle]")?.textContent).toBe("1 steer · 1 queued");
     });
 
+    test("queue updates retain their own content pane, keyed controls and scroll intent", () => {
+      const host = target();
+      const dock = new QueueDockRenderer();
+      const first = queued({ id: "first", text: "Keep my reading position" });
+      dock.render(host, [first], { ...steering, compactOpen: true });
+      const content = host.querySelector<HTMLElement>(".chat-queue-content")!;
+      const header = host.querySelector(".chat-queue-header");
+      const remove = content.querySelector<HTMLElement>("[data-queue-remove]")!;
+      content.scrollTop = 123;
+      host.scrollTop = 0;
+      dock.render(host, [first, queued({ id: "second", text: "A new pending message" })], { ...steering, compactOpen: true });
+      expect(host.querySelector(".chat-queue-content")).toBe(content);
+      expect(host.querySelector(".chat-queue-header")).toBe(header);
+      expect(content.querySelector("[data-queue-remove]")).toBe(remove);
+      expect(header?.parentElement).toBe(host);
+      expect(content.contains(header)).toBe(false);
+      expect(content.scrollTop).toBe(123);
+      expect(host.scrollTop).toBe(0);
+    });
+
     test("compact pending details collapse independently of replacement and paused batch safety", () => {
       const host = target();
       const note = document.createElement("p"); host.append(note);
@@ -1073,10 +1093,15 @@ describe("presentation details", () => {
       expect(host.querySelector<HTMLElement>(".chat-queue-items")?.hidden).toBe(true);
       expect(note.hidden).toBe(false);
       expect(note.textContent).toContain("2 pending steers will be delivered together with your replacement");
-      expect(host.querySelector(".chat-queue-header [data-queue-send-now]")?.textContent).toBe("Send 2 paused steers now");
+      expect(host.querySelector(".chat-queue-content [data-queue-send-now]")?.textContent).toBe("Send 2 paused steers now");
+      expect(host.querySelector(".chat-queue-header [data-queue-send-now]")).toBeNull();
+      const batchAction = host.querySelector<HTMLButtonElement>(".chat-queue-batch button")!;
+      batchAction.disabled = true;
       dock.render(host, entries, { ...steering, note, replacement: true, compactOpen: true });
       expect(host.querySelector<HTMLElement>(".chat-queue-items")?.hidden).toBe(false);
       expect(host.querySelector("[data-pending-toggle]")?.getAttribute("aria-expanded")).toBe("true");
+      expect(host.querySelector(".chat-queue-batch button")).toBe(batchAction);
+      expect(batchAction.disabled).toBe(true);
     });
 
     test("steers render before queued entries, labelled, with a paused note, and the model note shows only while a steer is pending", () => {
@@ -1116,7 +1141,7 @@ describe("presentation details", () => {
       expect(actions(entry("msg_1"))).toEqual(["Queue", "Edit", "Remove"]);
       expect(entry("msg_1").querySelector("[data-queue-queue='msg_1']")).not.toBeNull();
       expect(actions(entry("msg_2"))).toEqual(["Queue", "Edit", "Remove"]);
-      expect(host.querySelector(".chat-queue-header [data-queue-send-now='msg_2']")).not.toBeNull();
+      expect(host.querySelector(".chat-queue-content [data-queue-send-now='msg_2']")).not.toBeNull();
       // The same agent at rest (dormant or idle): a queued message is sent
       // now, which steers it; a command still cannot be steered.
       dock.render(host, [queued({ id: "held-1", text: "later", paused: true }), queued({ id: "held-2", text: "/review all", paused: true })], { ...steering, running: false });

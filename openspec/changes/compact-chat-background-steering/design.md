@@ -17,7 +17,7 @@ provider admission/backgrounding APIs, question handling or hold delivery.
   counts and view-only dismissal retain their existing density and behavior.
 - The constrained touch CSS previously promoted any open worker disclosure
   to an absolute top overlay during keyboard/short-viewport changes. The dock
-  now stays in normal bottom order, with its existing shared scroller and
+  now stays in normal bottom order, with independently scrolling card content and
   measured reading budget. Desktop's explicit Show work fallback is unchanged.
 - `/btw` uses a small transcript-edge progress/ready/error notice rather than
   a composer block. Its native modal reader uses `renderChatMarkdown` and the
@@ -36,13 +36,27 @@ provider admission/backgrounding APIs, question handling or hold delivery.
 
 The in-flow correction also counts surface safe-area padding and all measured
 chrome before allocating the dock budget; short landscape uses the 40% phone
-reading floor rather than the tablet ratio. Short expanded worker headers scroll
-away within that dock so a complete 44px Stop remains exposable without an overlay.
+reading floor rather than the tablet ratio. Both card headers remain outside
+their content scrollports so neither folds into the other's viewport.
 The existing enlarged replacement-warning exception is preserved: its warning
 and batch controls may take space from the reading floor instead of being clipped.
-Standard-size phone/short-landscape layouts retain 40%, and ordinary enlarged
+Phone/short-landscape layouts retain 40% wherever the measured minimum chrome
+and whole action rows physically fit. In a 230px keyboard band, the 44px app
+header, 46px composer and two closed cards plus spacing (72px) leave only 68px,
+not 92px. The user explicitly chose visible sibling cards over more transcript
+space: do not hide headers or introduce a touch Show work fallback. Open panes
+may require further transcript space to expose whole actions. Ordinary enlarged
 pending work retains its tested reading floor; no universal enlarged-text 40%
 guarantee is claimed.
+
+Header activation selects a constrained pane as well as its body. Priority is
+applied on the native header click, not pointerdown/focus, because reallocating
+between pointerdown and pointerup moves the target and can swallow touch input.
+At enlarged short landscape, 44px physical chrome/Stop minima replace rem-scaled
+empty space; measured inter-card spacing yields only when necessary to retain
+both headers and a whole selected action. Pending saves disclosure scroll
+positions in a bounded, conversation-keyed session map and restores after the
+pane's final allocation, without replaying a deferred reset over a user's scroll.
 
 The user's supplied B reference supersedes the critique attempt to pin both
 headings before the bodies. Desktop and touch share one canonical worker card:
@@ -53,16 +67,25 @@ Active rows keep two lines (title, then agent/model/cumulative tokens) and separ
 Pending is a distinct compact disclosure below the complete card, before the
 composer. It never interrupts the worker header and rows.
 
-With Pending collapsed, the worker body is the dock's sole scrollport; its card
-header and separate pending footer remain in flow. Expanded Pending, replacement
-warnings, the explicit desktop work sheet or independent work tracks switch to aggregate dock scrolling, disabling
-the worker body's overflow. This retains one primary scroller without interleaved
-headings or trapped nested lists. Short bands can scroll secondary headings away
-to expose whole actions rather than spend the existing transcript/safe-area
-budget. Desktop's constrained Show work fallback remains. Native disclosure state,
+The user's explicit independent-pane request supersedes the earlier single-scroller
+contract. Workers and Pending are coherent sibling cards with matching 28px
+minimum headers, padding, type, custom chevrons, borders, radii and surface colors.
+Each content pane scrolls independently with containment; the outer dock never
+scrolls. Shared measured height is divided between long bodies, and short or
+collapsed content yields its unused share. Headers remain visible above their
+own content, with Pending below Workers and above the composer. Normal reading
+budgets remain; physically insufficient bands yield transcript space before
+clipping actions or overlapping the composer. If two whole action rows still
+cannot fit, explicit focus/pointer interaction lends space to the active pane
+while both headers stay visible. Desktop's explicit Show work sheet can cover
+the chat header, never the composer. Native disclosure state,
 keyed pending actions, inspection/history, dismissal persistence and bounded
 composer feedback remain unchanged. Routine model notes appear only with expanded
 Pending; replacement/batch safety remains available while collapsed.
+Paused-batch Send lives in the pending content pane, not in its count header,
+and remains available while entries are collapsed. Reverted history, TODOs and
+wakeups retain independently bounded content rather than restoring an outer
+scroller; a replacement consequence is revealed only within Pending.
 
 An eligible ordinary-text busy draft teaches “Tap to steer · hold to queue”.
 Only accepted held queue use retires the hint, using a browser/base-path learning
@@ -95,7 +118,7 @@ See proposal.md, “Why”. This is a planning-only successor to the two active 
 ### Observed seams and evidence
 
 - `src/index.html:821–938` has separate task/Continue/subagent/pending sections and composer rails. `ui.ts:1092–1102` already distinguishes running blocking evidence from pending tools and detached/uncertain launchers. `running-work-disclosure.ts` automatically expands new running work; `background-tasks.ts` folds launcher aliases but the pinned list currently includes running background tasks only. Completed history and task inspection already exist: consolidate their presentation, do not create a second worker lifecycle store.
-- `tests/e2e/chat-mobile-layout.e2e.ts` preserves controls at 390px width / 380–450px visual heights and 844px landscape / 230px visual height; loaded layouts require 40% phone / 35% tablet transcript space. The existing active designs cap the aggregate dock at 35% visual height, 25% at width ≥48rem, and 24% during hardware-keyboard editing. Existing audit tests cover safe insets, outside-menu tap consumption, replacement warnings, focus, remote reading and bottom pinning.
+- `tests/e2e/chat-mobile-layout.e2e.ts` preserves controls at 390px width / 380–450px visual heights and 844px landscape / 230px visual height; loaded layouts require 40% phone / 35% tablet transcript space wherever minimum chrome physically permits it. Short-screen assertions measure irreducible panel/chrome space independently of the dock's current rendered height; the closed-card 230px case explicitly requires 68px. The existing active designs cap the aggregate dock at 35% visual height, 25% at width ≥48rem, and 24% during hardware-keyboard editing, yielding only when minimum headers/actions cannot fit. Existing audit tests cover safe insets, outside-menu tap consumption, replacement warnings, focus, remote reading and bottom pinning.
 - `src/hub/preferences.ts:1–6` explicitly stores Hub-wide host preferences, not personal state. `personal-state.ts` keys user plus workspace and serves per-workspace browser state; it is not an account-level setting. `auth.ts:35–40` supplies stable configured user names through cookie/bearer sessions. `server.ts:1622–1653` demonstrates server-selected `session.user`, closed patch validation and serialized writes. There is no observed account-level chat-preference API to reuse unchanged.
 - Settings (`pages.ts:684–709`) mixes clearly machine-wide agent accounts, workspace defaults and devices. Add a separately labelled personal section. The workspace Hub menu (`shell/hub-nav.ts:679–686,864–877`) currently links dashboard/sign-out, not Settings; add a stable Settings link through its existing keyed reconciliation/focus behavior.
 - The authenticated Hub workspace branch checks origin before proxying (`hub/server.ts:1592–1689`). `proxy.ts:75–95` currently copies most caller headers verbatim and shapes Host/Origin; it carries no trustworthy per-user policy to the child. Child chat routes require the workspace credential and origin (`server/routes.ts:498–509`), then dispatch agent-qualified IDs through `service.ts`. A browser-selected user, shared adapter flag, or unsigned copied header would be an unsafe authority for personal preference.
@@ -119,11 +142,11 @@ Use a single pending disclosure with aggregate counts and ordered steer/queue de
 
 The worker summary and keyed rows consume the same canonical execution projection, not separate desktop widgets re-parented into touch. Ordinary foreground shell tools/commands are not workers; background shell tasks are. `finished` means confirmed terminal (completed/failed/stopped), not necessarily successful. Expanded rows show one flat list: live/unknown work first, then newest-first finished work, with single-line inspection, state-specific glyphs, 14px names/11px metadata and separate Stop worker targets. Historical launch/cost distinctions remain in the timeline and inspection. Unknown state is separately named and never included in confirmed working/finished counts. Use retained projection/history, not an all-history fetch per repaint or a new lifecycle store; older paged results remain reachable in the timeline.
 
-Keep replacement warnings, paused-batch consequences/action and actionable unknown/failure text outside hidden detail. Only known successful automatic acknowledgements clear on a status transition or complete settlement; uncertainty and failures remain persistent. All dock contents share its one scroller. At software-keyboard/short-landscape budgets keep the compact worker summary: closed portrait summaries share a band with pending controls, while the closed wide/short summary shares the conversation header. Deliberate expansion overlays the transcript above the composer rather than hiding worker Stop, with content-sized height so short/empty lists do not reserve unused space. Preserve draft/focus without forced keyboard blur. Explicit Continue retains its existing constrained-state suppression. Do not add an always-visible multi-line Continue explanation.
+Keep replacement warnings, paused-batch consequences/action and actionable unknown/failure text outside hidden detail. Only known successful automatic acknowledgements clear on a status transition or complete settlement; uncertainty and failures remain persistent. Workers and Pending retain separate content scrollports and fixed headers in every disclosure combination; the outer dock never scrolls. At software-keyboard/short-landscape budgets both sibling cards remain below the transcript and above the composer. When minimum headers/actions cannot fit alongside the normal reading floor, conversation space yields rather than hiding either card or opening a touch sheet. Short/empty lists remain content-sized. Preserve draft/focus without forced keyboard blur. Explicit Continue retains its existing constrained-state suppression. Do not add an always-visible multi-line Continue explanation.
 
 The touch composer keeps Send and Stop distinct and supported delivery selection discoverable/operable; less-used configuration/context/help/actions move to one touch options menu. Configuration still opens the existing single adaptive picker after the options layer closes. Explain the personal preference and all-jobs effect in Settings and concise help; explicit Continue remains reachable when supported and blockers are evidenced, including when automatic backgrounding is OFF or has failed. Menu contents are viewport-bounded and scrollable, with no empty capability entries.
 
-Composer and worker Stop targets remain ≥44×44px with ≥8px separation between adjacent mutation actions; worker header, Dismiss finished and inspection targets use the explicitly approved compact density exception. Preserve device-specific Enter/Ctrl+Enter/Alt+Enter behavior, aria-expanded/controls, keyboard navigation, visible focus, reduced motion, one-layer Escape, invoker restoration and first-tap reliability during composition. Outside taps consume activation rather than clicking through. Reuse measured dock/composer geometry and final-height reservation: 35% / 25% / 24% caps above, ≥40% phone / ≥35% tablet transcript in the existing standard-size matrix. At extreme text enlargement prefer scrollable secondary content and reachable primary actions, not clipped warnings or shrunken targets. Preserve safe areas, user reading anchors and bottom-pin intent on disclosure/worker changes.
+Composer and worker Stop targets remain ≥44×44px with ≥8px separation between adjacent mutation actions; worker header, Dismiss finished and inspection targets use the explicitly approved compact density exception. Preserve device-specific Enter/Ctrl+Enter/Alt+Enter behavior, aria-expanded/controls, keyboard navigation, visible focus, reduced motion, one-layer Escape, invoker restoration and first-tap reliability during composition. Outside taps consume activation rather than clicking through. Reuse measured dock/composer geometry and final-height reservation: 35% / 25% / 24% normal caps above, ≥40% phone / ≥35% tablet transcript wherever measured minimum headers/actions and composer physically permit it. Keep both cards visible in insufficient short bands, allowing less conversation space rather than adding touch Show work. At extreme text enlargement prefer scrollable secondary content and reachable primary actions, not clipped warnings or shrunken targets. Preserve safe areas, user reading anchors and bottom-pin intent on disclosure/worker changes.
 
 Alternative rejected: shrinking rows/buttons or leaving two auto-expanded worker lists; either sacrifices touch safety or keeps the original density problem.
 
