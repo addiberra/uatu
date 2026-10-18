@@ -108,6 +108,11 @@ motion token; reduced transparency and forced colors have explicit recipes.
 Selection color is not a shortcut for styling a primary action. Positive tone
 must not make an uncommitted review look already applied.
 
+Positive status text (Running and Connected) uses `--mh-positive`: light
+`#1c7835` gives 5.54:1 on the white surface and 4.94:1 on canvas. Dark
+`#65d881` retains 8.26:1 on surface and 9.84:1 on canvas. Increased contrast
+inherits these text colors; switch fills remain separate `--mh-switch-on` roles.
+
 ### Measured layout is not a theme
 
 `--mh-keyboard-clearance`, dock/toolbar heights, prompt height and visible height

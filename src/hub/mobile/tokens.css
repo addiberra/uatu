@@ -12,7 +12,8 @@
   --mh-action-subtle: #edf6ff;
   --mh-line: #dedde3;
   --mh-selected: rgb(226 240 255 / 75%);
-  --mh-positive: #218c3e;
+  /* Small positive text: >=4.9:1 on canvas, >=5.5:1 on surface; switch fills stay separate. */
+  --mh-positive: #1c7835;
   --mh-danger: #b3261e;
   --mh-warning: #986500;
   --mh-warning-background: #fff6d8;
