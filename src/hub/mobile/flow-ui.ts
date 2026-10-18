@@ -1,8 +1,8 @@
 import { escapeHtml as esc } from "../../shared/html";
 import type { BackendProblem, MobileHubBackend, OperationResult, ReadResult, StopConsent, CoordinatedResult } from "./backend";
 export { readiness } from "./readiness";
-export { infoRows, type InfoRow, text, action, listRow, group, field, check, select } from "./design-system";
-import { text, action } from "./design-system";
+export { infoRows, type InfoRow, text, action, rowAction, listRow, group, field, check, select } from "./design-system";
+import { text, action, type SettingsTint } from "./design-system";
 import { mobileHubIcon, type MobileHubIcon } from "./icons";
 import type { TaskPort, TaskPresentation } from "./task-view";
 
@@ -10,11 +10,11 @@ export type MobileHubDetail =
   | { kind: "credential"; id: string }
   | { kind: "workspace"; id: string }
   | { kind: "agent"; id: "opencode" | "claude" }
-  | { kind: "notifications" | "agent-accounts" | "add-credential" | "tools" | "assignments" | "default-folder" | "devices" | "security" | "add-workspace" | "clone" | "folders" };
+  | { kind: "repository-credentials" | "notifications" | "agent-accounts" | "add-credential" | "tools" | "assignments" | "default-folder" | "devices" | "security" | "add-workspace" | "clone" | "folders" };
 export type FlowActions = Record<string, () => unknown>;
 export type SheetPort = TaskPort;
 export type { TaskPort } from "./task-view";
-export interface FlowPresentation { icon?: MobileHubIcon; subtitle?: string; primaryAction?: string; secondaryAction?: string; backLabel?: string; actionPlacement?: "frequent" }
+export interface FlowPresentation { icon?: MobileHubIcon; /** Tile color behind `icon`; green unless the object is a folder-like workspace. */ tint?: SettingsTint; subtitle?: string; primaryAction?: string; secondaryAction?: string; backLabel?: string; actionPlacement?: "frequent" }
 export const value = (root: ParentNode, name: string) => root.querySelector<HTMLInputElement | HTMLSelectElement>(`[name="${name}"]`)?.value ?? "";
 export const checked = (root: ParentNode, name: string) => root.querySelector<HTMLInputElement>(`[name="${name}"]`)?.checked ?? false;
 export const values = (root: ParentNode, name: string) => [...root.querySelectorAll<HTMLInputElement>(`[name="${name}"]:checked`)].map(input => input.value);
@@ -143,7 +143,7 @@ export function createFlowEnvironment(root: HTMLElement, backend: MobileHubBacke
       root.oninput = null; root.onchange = null;
       root.classList.toggle("mh-object-detail", !!presentation?.icon);
       const heading = `<h1 tabindex="-1">${esc(title)}</h1>`;
-      root.innerHTML = `<div class="mh-flow-content"><header class="mh-flow-header"><nav aria-label="Page navigation"><button type="button" class="mh-flow-back" data-flow="flow-back">${mobileHubIcon("back")}<span>${esc(pageBackLabel)}</span></button></nav>${presentation?.icon ? `<span class="mh-tile mh-green">${mobileHubIcon(presentation.icon)}</span>` : ""}${heading}${presentation?.subtitle ? text(presentation.subtitle) : ""}</header>${body}<p class="mh-flow-error" role="alert"></p></div>${presentation?.actionPlacement === "frequent" ? '<nav class="mh-flow-toolbar" aria-label="Page actions"></nav>' : ""}`;
+      root.innerHTML = `<div class="mh-flow-content"><header class="mh-flow-header"><nav aria-label="Page navigation"><button type="button" class="mh-flow-back" data-flow="flow-back">${mobileHubIcon("back")}<span>${esc(pageBackLabel)}</span></button></nav>${presentation?.icon ? `<span class="mh-tile mh-${esc(presentation.tint ?? "green")}">${mobileHubIcon(presentation.icon)}</span>` : ""}${heading}${presentation?.subtitle ? text(presentation.subtitle) : ""}</header>${body}<p class="mh-flow-error" role="alert"></p></div>${presentation?.actionPlacement === "frequent" ? '<nav class="mh-flow-toolbar" aria-label="Page actions"></nav>' : ""}`;
       const toolbar = root.querySelector<HTMLElement>(".mh-flow-toolbar");
       for (const key of new Set([presentation?.secondaryAction, presentation?.primaryAction])) {
         if (!key || key === "flow-back") continue;

@@ -18,7 +18,7 @@ export function createTaskHistory(history: Pick<History, "state" | "back" | "pus
   };
   return {
     write,
-    open(context: { route: string; scroll?: number }) { write({ mobileHub: { route: context.route, ...(context.scroll === undefined ? {} : { scroll: context.scroll }), task: true } }, closing?.write?.url ?? url(), false); },
+    open(context: { route: string; scroll?: number; parent?: "repository-credentials" }) { write({ mobileHub: { route: context.route, ...(context.scroll === undefined ? {} : { scroll: context.scroll }), ...(context.parent === "repository-credentials" ? { parent: context.parent } : {}), task: true } }, closing?.write?.url ?? url(), false); },
     get contextUrl() { return closing?.write?.url ?? url(); },
     close() {
       if (disposed || closing || !history.state?.mobileHub?.task) return;

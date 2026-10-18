@@ -9,6 +9,9 @@ export const text = (value: string) => `<p class="mh-note">${esc(value)}</p>`;
 export type ActionHierarchy = "primary" | "secondary" | "destructive";
 /** Commands default to secondary; the flow owner promotes its most likely action. */
 export const action = (key: string, label: string, hierarchy: ActionHierarchy | boolean = "secondary") => `<button type="button" data-flow="${esc(key)}" class="mh-text-action${hierarchy === true || hierarchy === "destructive" ? " mh-destructive" : hierarchy === "primary" ? " mh-commit" : ""}">${esc(label)}</button>`;
+/** In-group command row: left-aligned blue text, inset hairline, no fill. Keys
+ * stay stable; `attribute` picks the shell's data-action or a flow's data-flow. */
+export const rowAction = (key: string, label: string, destructive = false, attribute: "flow" | "action" = "flow") => `<button type="button" data-${attribute}="${esc(key)}" class="mh-row-action${destructive ? " mh-destructive" : ""}">${esc(label)}</button>`;
 /** Verified empty collections only, never loading or unavailable information.
  * Keep operations outside the composition, owned by the surrounding flow. */
 export const emptyState = (symbol: MobileHubIcon, title: string, explanation: string) => `<div class="mh-empty-state">${icon(symbol)}<h2>${esc(title)}</h2><p>${esc(explanation)}</p></div>`;

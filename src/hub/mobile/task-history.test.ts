@@ -26,6 +26,14 @@ test("Back-to-edit replacement stays in one entry and stores no form state", asy
   await Promise.resolve(); expect(h.backs).toBe(0); expect(h.entries).toHaveLength(3);
   expect(h.history.state).toEqual({ mobileHub: { route: "settings", task: true } });
 });
+test("task expiry retains only the safe catalog parent and scroll, never extra context", () => {
+  const h = harness();
+  const context = { route: "settings", parent: "repository-credentials" as const, scroll: 120, draft: "not-history" };
+  h.owner.open(context);
+  expect(h.history.state).toEqual({ mobileHub: { route: "settings", parent: "repository-credentials", scroll: 120, task: true } });
+  h.owner.close();
+  expect(h.history.state).toEqual({ mobileHub: { route: "settings", parent: "repository-credentials", scroll: 120 } });
+});
 test("an unrelated history traversal wins over a queued task result", async () => {
   const h = harness(); h.owner.open({ route: "settings" }); h.owner.close(); await Promise.resolve();
   h.owner.write({ mobileHub: { route: "settings" } }, "/settings?detail=credential&id=stale", false);

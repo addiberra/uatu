@@ -10,7 +10,7 @@ export function mobileHubRoute(url: URL): MobileHubRoute | null {
   return null;
 }
 
-const detailKinds = new Set(["notifications", "agent-accounts", "add-credential", "tools", "assignments", "default-folder", "devices", "security", "add-workspace", "clone", "folders"]);
+const detailKinds = new Set(["repository-credentials", "notifications", "agent-accounts", "add-credential", "tools", "assignments", "default-folder", "devices", "security", "add-workspace", "clone", "folders"]);
 /** Only frontend identities belong in route context, never filesystem authority
  * or form/secret drafts. Unknown/malformed queries fall back to the overview. */
 export function mobileHubDetail(url: URL): MobileHubDetail | undefined {
@@ -111,7 +111,7 @@ export function mountMobileCoordinator(options: {
     hubRoot.hidden = false; hubRoot.inert = active;
     hubRoot.setAttribute("aria-hidden", String(active));
   };
-  const showHub = (route: MobileHubRoute, push = true, detail?: MobileHubDetail) => {
+  const showHub = (route: MobileHubRoute, push = true, detail?: MobileHubDetail, parent?: "repository-credentials") => {
     cancelScrollRestore();
     intent++;
     if (workspaceForeground() && visited && location.pathname.startsWith(basePath)) {
@@ -121,7 +121,7 @@ export function mountMobileCoordinator(options: {
     currentRoute = route;
     presentation(false);
     restoringTaskHistory = true;
-    try { view.show(route, detail); } finally { restoringTaskHistory = false; }
+    try { view.show(route, detail, parent); } finally { restoringTaskHistory = false; }
     if (push) taskHistory.write({ mobileHub: { route } }, mobileHubPath(route, detail), false);
   };
   const loseAccess = (preserveManagement = false) => {
@@ -200,17 +200,17 @@ export function mountMobileCoordinator(options: {
       if (open) taskContextUrl = new URL(taskHistory.contextUrl, location.href).href;
       else taskContextUrl = undefined;
       if (restoringTaskHistory) return;
-      if (open) taskHistory.open({ route: currentRoute, scroll: history.state?.mobileHub?.scroll });
+      if (open) taskHistory.open({ route: currentRoute, scroll: history.state?.mobileHub?.scroll, parent: history.state?.mobileHub?.parent === "repository-credentials" ? "repository-credentials" : undefined });
       else taskHistory.close();
     },
-    detailChanged: detail => {
+    detailChanged: (detail, parent) => {
       cancelScrollRestore();
       intent++;
       const path = mobileHubPath(currentRoute, detail);
       // Refuse to serialize an unvalidated identity, even if a future flow
       // accidentally hands the coordinator a raw host path.
       if (detail && !mobileHubDetail(new URL(path, location.origin))) return;
-      taskHistory.write({ mobileHub: { route: currentRoute } }, path, false);
+      taskHistory.write({ mobileHub: { route: currentRoute, ...(parent ? { parent } : {}) } }, path, false);
     },
     authenticated: () => { if (!boot) { invalidated = false; workspaceRoot.removeAttribute("data-access-invalidated"); } },
   });
@@ -230,7 +230,7 @@ export function mountMobileCoordinator(options: {
         // draft still owns a task entry; its next Back must land on the safe
         // base detail rather than skip Add Workspace (or its other caller).
         // No history.forward() promise may race the eventual result/navigation.
-        taskHistory.open({ route: currentRoute, scroll: history.state?.mobileHub?.scroll });
+        taskHistory.open({ route: currentRoute, scroll: history.state?.mobileHub?.scroll, parent: history.state?.mobileHub?.parent === "repository-credentials" ? "repository-credentials" : undefined });
       }
     } finally { restoringTaskHistory = false; }
     return true;
@@ -244,7 +244,8 @@ export function mountMobileCoordinator(options: {
       const route = mobileHubRoute(new URL(location.href));
       if (route) {
         if (unwindTask()) return true;
-        showHub(route, false, mobileHubDetail(new URL(location.href)));
+        const parent = event.state?.mobileHub?.parent === "repository-credentials" ? "repository-credentials" : undefined;
+        showHub(route, false, mobileHubDetail(new URL(location.href)), parent);
         restoreHubScroll(event.state?.mobileHub?.scroll);
         return true;
       }

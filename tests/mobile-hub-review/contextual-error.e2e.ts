@@ -20,13 +20,18 @@ test("Settings catalog retry completes while typing without stealing native focu
     const response = await route.fetch(); await held; await route.fulfill({ response });
   });
   await page.goto("/settings");
+  await page.locator('[data-action="repository-credentials"]').click();
   await page.locator('[data-action="retry-credentials"]').click();
   const initialReads = workspaces;
   await page.locator('[data-action="add-credential"]').click();
   await page.locator('[data-flow="token"]').click();
   const name = page.getByRole("textbox", { name: "Name", exact: true });
-  await name.fill("Live draft"); release();
-  await expect(page.locator("[data-credential-catalog] [data-credential-id]").first()).toBeAttached();
+  await name.fill("Live draft");
+  const completion = page.waitForResponse(response => response.url().endsWith("/readCredentials"));
+  release(); await (await completion).finished();
+  expect(catalogs).toBe(2);
+  // Retry belongs to the catalog even after navigating onward to the editor.
+  // Its late result must preserve the live creation draft rather than remount it.
   await expect(name).toBeFocused();
   await page.keyboard.type(" continued");
   await expect(name).toHaveValue("Live draft continued");

@@ -34,7 +34,7 @@
 .mh-root .mh-folder path { stroke-width: 1.8; }
 .mh-root .mh-workspace-copy { grid-column: 1 / -1; padding-right: 31px; min-width: 0; }
 .mh-root .mh-workspace h3 { font-size: var(--mh-type-body); margin: 0 0 1px; line-height: 1.35; font-weight: 650; overflow-wrap: anywhere; }
-.mh-root .mh-workspace p { font-size: var(--mh-type-secondary); line-height: 1.4; margin: 0; color: var(--mh-muted); overflow-wrap: anywhere; }
+.mh-root .mh-workspace p { font-size: var(--mh-type-secondary); line-height: 1.4; margin: 0; color: var(--mh-muted); overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
 .mh-root .mh-more { position: absolute; right: 7px; top: 11px; width: var(--mh-target); display: grid; place-items: center; }
 .mh-root .mh-more .mh-icon, .mh-root .mh-tab .mh-icon { width: 22px; height: 24px; }
 .mh-root .mh-status { display: flex; flex-wrap: wrap; align-content: center; align-items: center; gap: var(--mh-space-1) var(--mh-space-2); color: var(--mh-muted); font-size: var(--mh-type-secondary); min-width: 0; overflow-wrap: anywhere; }
@@ -72,7 +72,19 @@
 .mh-root .mh-value { color: var(--mh-muted); font-size: var(--mh-type-control); text-align: right; flex-shrink: 0; max-width: 38%; overflow-wrap: anywhere; }
 .mh-root .mh-destination > .mh-icon { width: 12px; height: 16px; color: var(--mh-muted); }
 .mh-root .mh-text-action { display: block; padding: var(--mh-space-3) var(--mh-space-4); width: calc(100% - 2 * var(--mh-space-4)); margin: var(--mh-space-3) var(--mh-space-4); border-radius: var(--mh-radius-button); background: var(--mh-action-subtle); text-align: center; font-weight: 600; }
+.mh-root .mh-text-action[hidden] { display: none; }
+.mh-root .mh-clone-credentials { margin-block: var(--mh-space-6); }
+.mh-root .mh-clone-credentials > summary { color: var(--mh-action); }
 .mh-root .mh-destination + .mh-text-action { border-top: .5px solid var(--mh-line); }
+/* In-group command rows: blue text at the text column, no fill. Hairlines start
+   at the text column of the row below them, like destination separators. */
+.mh-root .mh-row-action { display: block; width: 100%; position: relative; min-height: 56px; padding: var(--mh-space-3) var(--mh-space-4); color: var(--mh-action); font-size: var(--mh-type-body); }
+.mh-root .mh-row-action.mh-destructive { color: var(--mh-danger); }
+.mh-root .mh-group > * + .mh-row-action::before, .mh-root .mh-row-action + .mh-list-row::before { content: ""; position: absolute; top: 0; left: var(--mh-space-4); right: 0; border-top: .5px solid var(--mh-line); }
+.mh-root .mh-row-action + .mh-list-row { position: relative; }
+.mh-root .mh-row-action + .mh-destination::before { content: ""; position: absolute; top: 0; left: 58px; right: 0; border-top: .5px solid var(--mh-line); }
+/* A verified empty catalog inside a group is one quiet row, not a full-height state. */
+.mh-root .mh-empty-row { display: flex; align-items: center; min-height: 56px; margin: 0; padding: var(--mh-space-3) var(--mh-space-4); }
 /* mh-sheet is a compatibility hook shared by tasks, never a drawer recipe. */
 .mh-root .mh-confirmation-backdrop { position: absolute; z-index: 5; inset: 0 0 var(--mh-keyboard-clearance); background: var(--mh-scrim); display: flex; align-items: center; justify-content: center; padding: var(--mh-space-5); }
 .mh-root .mh-task { background: var(--mh-canvas); width: 100%; display: flex; flex-direction: column; overflow: hidden; }
@@ -98,6 +110,10 @@
 .mh-root .mh-field input::placeholder, .mh-root .mh-field textarea::placeholder { color: var(--mh-muted); opacity: 1; }
 .mh-root .mh-field input:disabled, .mh-root .mh-field select:disabled, .mh-root .mh-field textarea:disabled { opacity: .6; border-style: dashed; cursor: not-allowed; }
 .mh-root .mh-field [aria-invalid="true"] { border-color: var(--mh-danger); outline-color: var(--mh-danger); }
+/* Fields inside a captioned group are rows of that surface, not loose cards. */
+.mh-root .mh-group .mh-field { background: transparent; border-radius: 0; margin: 0; position: relative; }
+.mh-root .mh-group .mh-check { position: relative; }
+.mh-root .mh-group .mh-field + .mh-field::before, .mh-root .mh-group .mh-field + .mh-check::before, .mh-root .mh-group .mh-check + .mh-field::before { content: ""; position: absolute; top: 0; left: var(--mh-space-4); right: 0; border-top: .5px solid var(--mh-line); }
 .mh-root .mh-sheet-error, .mh-root .mh-flow-error { color: var(--mh-danger); font-size: var(--mh-type-secondary); margin: var(--mh-space-3) var(--mh-space-4); overflow-wrap: anywhere; }
 .mh-root .mh-sheet-error:empty, .mh-root .mh-flow-error:empty { display: none; }
 .mh-root .mh-sheet footer { display: flex; gap: var(--mh-space-3); padding: var(--mh-space-3) var(--mh-space-5) max(var(--mh-space-4), env(safe-area-inset-bottom)); border-top: .5px solid var(--mh-line); flex: 0 0 auto; }
@@ -121,6 +137,10 @@
 /* Entry focus orients readers; interactive controls retain focus-visible rings. */
 .mh-root .mh-editor header h1[tabindex="-1"]:focus { outline: none; }
 .mh-root .mh-flow-header > .mh-tile { margin-bottom: var(--mh-space-3); }
+/* Object detail pages center the contextual icon, title and summary; Back stays at the start. */
+.mh-root .mh-object-detail .mh-flow-header { text-align: center; }
+.mh-root .mh-object-detail .mh-flow-header > .mh-tile { margin-inline: auto; width: 56px; height: 56px; border-radius: var(--mh-radius-group); }
+.mh-root .mh-object-detail .mh-flow-header > .mh-tile .mh-icon { width: 32px; height: 34px; }
 .mh-root .mh-flow-back { display: flex; align-items: center; gap: var(--mh-space-1); padding: 10px var(--mh-space-3); font-size: var(--mh-type-control); }
 .mh-root .mh-flow-back .mh-icon { width: 12px; height: 18px; }
 .mh-root .mh-check { display: flex; gap: var(--mh-space-3); align-items: center; padding: var(--mh-space-3) var(--mh-space-4); min-height: var(--mh-target); font-size: var(--mh-type-body); overflow-wrap: anywhere; }
@@ -223,6 +243,10 @@
   .mh-root .mh-dock, .mh-root .mh-group, .mh-root .mh-sheet, .mh-root .mh-advisory { border: 1px solid CanvasText; background: Canvas; }
   .mh-root .mh-selected { outline: 2px solid Highlight; }
   .mh-root .mh-text-action, .mh-root .mh-commit, .mh-root .mh-cancel, .mh-root .mh-primary { border: 1px solid ButtonText; }
+  .mh-root .mh-row-action { color: ButtonText; text-decoration: underline; text-underline-offset: .2em; }
+  .mh-root .mh-row-action.mh-destructive { text-decoration-style: double; border: 1px solid ButtonText; }
+  .mh-root .mh-row-action::before, .mh-root .mh-group .mh-field::before, .mh-root .mh-group .mh-check::before, .mh-root .mh-group > .mh-credential-notice::before, .mh-root .mh-group > .mh-safety-disclosure::before { border-top-color: CanvasText; }
+  .mh-root .mh-field input, .mh-root .mh-field textarea { border-color: ButtonText; }
   .mh-root .mh-tile { color: ButtonText; border: 1px solid ButtonText; }
   .mh-root .mh-field select { appearance: auto; background-image: none; }
 }
@@ -249,6 +273,10 @@
 .mh-root .mh-credential-notice p { margin: 0; flex: 1; }
 .mh-root .mh-credential-notice button { flex: none; padding-inline: var(--mh-space-1); }
 .mh-root .mh-safety-disclosure { font-size: var(--mh-type-secondary); }
+/* Inside the Credentials group the advisory and disclosure are subordinate last rows. */
+.mh-root .mh-group > .mh-credential-notice { position: relative; padding-top: var(--mh-space-3); }
+.mh-root .mh-group > .mh-safety-disclosure { position: relative; }
+.mh-root .mh-group > * + .mh-credential-notice::before, .mh-root .mh-group > :not(.mh-credential-notice) + .mh-safety-disclosure::before { content: ""; position: absolute; top: 0; left: var(--mh-space-4); right: 0; border-top: .5px solid var(--mh-line); }
 .mh-root .mh-safety-disclosure > summary { color: var(--mh-action); }
 .mh-root .mh-safety-disclosure .mh-safety-details { padding-top: 0; }
 .mh-root .mh-safety-disclosure .mh-note { margin-inline: 0; }

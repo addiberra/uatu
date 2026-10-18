@@ -141,17 +141,52 @@ label and boundary, never automatic primary promotion. Pressed, disabled and foc
 states accompany the visual hierarchy. Header Back/Cancel and navigation rows
 retain their distinct navigation treatment. Do not use size alone for emphasis.
 
+`rowAction(key, label, destructive?)` is the in-group command row: left-aligned
+blue text on the white group surface with an inset hairline above it and no fill,
+for commands that live beside navigation rows (Add Credential, Rename display
+name). The destructive variant reads red; the owning flow still confirms. Pass
+`"action"` as the fourth argument only in the shell overview, which dispatches
+`data-action`; flows keep `data-flow`. A flow's `primaryAction` promotes a
+standalone `action()` capsule, never a row.
+
 Use `emptyState("folder", "No subfolders", explanation)` for a verified empty
 collection, not for loading or failed reads. The shared composition has a
 decorative icon, heading and supporting text; operations remain outside it with
 their existing owner. The folder picker explains that files are hidden and its
 existing Choose button selects this folder. Never call a directory empty based
 only on the absence of subfolders, and never duplicate Choose within the message.
+On the Repository credentials page, an empty catalog is one quiet
+`mh-note mh-empty-row` line above its Add row rather than a full-height composition.
+
+### Settings → Repository credentials
+
+Settings has one Repository credentials destination, with the total catalog count
+only after a successful read (including zero). Agent accounts remains a separate,
+direct destination. Settings never expands the repository inventory or its
+management actions. A full-page detail uses the incumbent Back, object header,
+grouped catalog/status rows, Add Credential row, and management destinations for
+Credential Tools and Manage workspace credentials. Existing credential sharing
+notices and persistent safety details live on that page, unchanged.
+
+Loading, empty and recoverable error states belong to the credential catalog;
+they do not block other Settings destinations. Status enrichment updates text
+without remounting focused rows or drafts. Back restores the Settings scroll
+position; credential editors retain their existing Save/Cancel semantics. Browser
+history stores the `repository-credentials` destination and, for children reached
+from it, that safe parent identity. Back/Forward restores this parent; direct
+child links do not acquire one from an earlier visit. History never stores
+credential material or drafts. Earlier overview screenshots showing expanded inventory are
+historical evidence, not the current layout authority.
 
 ## State and accessibility contract
 
 - Rendering a primitive emits no change events and performs no storage/network work.
 - Switches and radio selections remain drafts until the existing Save/Review/Apply.
+- Clone keeps optional post-setup authentication/hosts and signing in a native
+  disclosure. Closing it preserves its values; invalid assignments reopen it on
+  Review. One-time clone identity, credential safety information and explicit
+  Start consent remain outside it. Add another authentication host stays hidden
+  until an enabled authentication credential is selected.
 - Editor entry focuses a noninteractive heading, never a field or native picker.
 - Only centered confirmations trap Tab. Underlying views are inactive during tasks.
 - Pending Back cannot reopen a resubmittable editor or lose its operation result.

@@ -81,8 +81,13 @@ test("failed sign-out retains authentication and returns keyboard focus to its S
 
 test("every branch variant and duplicate path remains truthful through history and information without Start", async ({ page, request }) => {
   await reset(request, "branches"); await setup(request, "stopWorkspace", ["atlas"]); await page.goto("/");
-  const labels = { atlas: "review/main", notes: "draft · no commits", "branch-0": "Detached · abc1234", "branch-1": "Not a Git repository", "branch-2": "Loading branch…", "branch-3": "Branch unavailable: Synthetic metadata unavailable." };
+  // Cards carry compact facts; the verbose unavailable message stays on Information.
+  const labels = { atlas: "review/main", notes: "draft · no commits", "branch-0": "Detached · abc1234", "branch-1": "Not a Git repository", "branch-2": "Loading branch…", "branch-3": "Branch unknown" };
   for (const [id, label] of Object.entries(labels)) await expect(page.locator(`[data-workspace="${id}"] .mh-status`)).toHaveText(label);
+  await page.locator('[data-action="info:branch-3"]').click(); await expect(page.locator('.mh-flow-header .mh-note')).toHaveText("Stopped · Branch unknown");
+  await page.locator('.mh-flow-page .mh-safety-disclosure summary').click();
+  await expect(page.locator('.mh-flow-page .mh-info-row').filter({ has: page.locator('dt', { hasText: /^Branch$/ }) }).locator('.mh-info-value')).toHaveText("Branch unavailable: Synthetic metadata unavailable.");
+  await button(page, "Back").click(); await expect(page.locator('[data-action="info:branch-3"]')).toBeFocused();
   await page.locator('[data-action="info:branch-0"]').click(); await expect(page.locator('.mh-flow-page')).toContainText("/synthetic/branch-0");
   await expect(page.locator('.mh-flow-page')).toContainText("Detached · abc1234"); await button(page, "Back").click();
   await button(page, "Settings").click(); await page.goBack(); await expect(page.locator('[data-workspace="notes"] .mh-status')).toHaveText("draft · no commits");
@@ -97,15 +102,32 @@ test("OpenPGP generation preserves draft and sheet context through local and mis
   await control(request, "setToolState", ["gpg", "missing"]); await page.getByLabel("Passphrase", { exact: true }).fill("DISPOSABLE-SIGNER");
   await control(request, "hold", ["generateOpenPgp"]);
   try {
-    await button(page, "Generate").click(); const before = await body.evaluate(el => el.scrollTop);
+    await button(page, "Generate").click(); const before = await body.evaluate(el => {
+      // Observe the reveal request with the new error already laid out, before
+      // native scroll rounding. This tests geometry, not a font-specific offset.
+      const native = Object.getOwnPropertyDescriptor(Element.prototype, "scrollTop")!;
+      Object.defineProperty(el, "scrollTop", { configurable: true, get() { return native.get!.call(this); }, set(top) {
+        const alert = this.querySelector('[role="alert"]')!.getBoundingClientRect(), pane = this.getBoundingClientRect();
+        this.dataset.revealGeometry = JSON.stringify({ before: native.get!.call(this), requested: top, clipped: Math.max(0, alert.bottom - pane.bottom) });
+        native.set!.call(this, top);
+      } });
+      return el.scrollTop;
+    });
     await expect(page.getByLabel("Passphrase", { exact: true })).toHaveValue(""); await control(request, "settle", ["generateOpenPgp", false]);
     await expect(activeTask(page).getByRole("alert")).toContainText("Required synthetic key tooling unavailable");
     expect(await name!.evaluate(el => el.isConnected)).toBe(true); await expect(page.getByLabel("User ID (name and email)")).toHaveValue("Exceptional <signer@mock.invalid>");
-    // The longer error needs a six-pixel reveal in this short viewport. The
-    // contextual-error owner must reveal only the clipped amount, not reset
+    // The contextual-error owner must reveal only the clipped amount, not reset
     // the editor or scroll the document/Settings behind it.
     const reveal = await body.evaluate(el => { const error = el.querySelector('[role="alert"]')!.getBoundingClientRect(), pane = el.getBoundingClientRect(); return { top: el.scrollTop, bottom: error.bottom, paneBottom: pane.bottom, paneTop: pane.top, errorTop: error.top, documentTop: document.scrollingElement!.scrollTop, settingsTop: document.querySelector('.mh-page')!.scrollTop }; });
-    expect(reveal.top).toBe(before + 6);
+    const geometry = JSON.parse((await body.getAttribute("data-reveal-geometry"))!);
+    await test.info().attach("error-reveal-geometry", { body: JSON.stringify({ before, geometry, reveal }), contentType: "application/json" });
+    console.log("OpenPGP error reveal geometry", JSON.stringify({ before, geometry, reveal }));
+    // Chromium may anchor the pane when the error grows, during the geometry
+    // read itself. The explicit reveal must add exactly the remaining clip to
+    // that native position, never reset the pane or add a fixed offset.
+    expect(geometry.before).toBeGreaterThanOrEqual(before); expect(geometry.clipped).toBeGreaterThan(0);
+    expect(geometry.requested).toBe(geometry.before + geometry.clipped);
+    expect(reveal.top).toBe(Math.round(geometry.requested));
     expect(Math.round(reveal.bottom)).toBe(Math.round(reveal.paneBottom));
     expect(reveal.errorTop).toBeGreaterThanOrEqual(reveal.paneTop);
     expect(reveal.documentTop).toBe(0); expect(reveal.settingsTop).toBe(0);

@@ -1,7 +1,7 @@
 import type { CloneIntent, CloneStreamEvent, KeyTarget } from "./backend";
 import type { CloneJobResult } from "../clone-jobs";
 import { normalizeProviderHost, type PublicCredentialDto } from "../credential-types";
-import { absolute, action, credentialSafetyNotice, clearSecrets, displayName, field, folderName, group, hubForeground, infoRows, required, select, sharedUidKey, showContextualError, text, value, type FlowEnvironment } from "./flow-ui";
+import { absolute, action, check, credentialSafetyNotice, clearSecrets, displayName, field, folderName, group, hubForeground, infoRows, required, select, sharedUidKey, showContextualError, text, value, type FlowEnvironment } from "./flow-ui";
 import { bindAuthenticationHost, configurationFacts, configurationFields, readConfiguration, technicalField, type ConfigurationDraft } from "./onboarding-flows";
 
 export type CloneDraft = CloneIntent;
@@ -61,6 +61,7 @@ export function createCloneFlow(env: FlowEnvironment, unlock: (target: KeyTarget
   let draft = emptyCloneDraft();
   let catalog: PublicCredentialDto[] = [];
   let loaded = false, dirty = false, visible = false;
+  let credentialsOpen = false;
   let generation = 0, streamGeneration = 0, reconciliationGeneration = 0;
   let attempt: Attempt | null = null, reconciling = false;
   let jobId: string | null = null, afterEventId = 0;
@@ -94,7 +95,13 @@ export function createCloneFlow(env: FlowEnvironment, unlock: (target: KeyTarget
     const base = { ...draft, url: secretProblem ? "" : rawUrl, dest: value(root, "dest"), folderName: value(root, "folderName"), displayName: value(root, "displayName"), credentialId: value(root, "cloneCredential") || null };
     if (secretProblem && validate) throw new Error(secretProblem);
     if (validate) {
-      const config = readConfiguration(root, catalog, configuration());
+      let config: ConfigurationDraft;
+      try { config = readConfiguration(root, catalog, configuration()); }
+      catch (error) {
+        const disclosure = root.querySelector<HTMLDetailsElement>("[data-clone-credentials]");
+        if (disclosure) { disclosure.open = true; credentialsOpen = true; }
+        throw error;
+      }
       draft = { ...base, retainedAuthentication: config.authentication, signing: config.signing || null, start: config.start };
       draft = validateCloneDraft(draft);
       const credential = draft.credentialId ? catalog.find(c => c.id === draft.credentialId) : null;
@@ -113,7 +120,9 @@ export function createCloneFlow(env: FlowEnvironment, unlock: (target: KeyTarget
     if (attempt) { renderRecovery(); return; }
     const choices = [{ value: "", label: "No clone identity" }, ...catalog.filter(c => (c.type === "ssh" && c.capabilities.includes("ssh-authentication")) || (c.type === "token" && c.capabilities.includes("https-git"))).map(c => ({ value: c.id, label: `${c.name} · ${c.type}${c.enabled ? "" : " · Disabled"}`, disabled: !c.enabled }))];
     if (draft.credentialId && !choices.some(c => c.value === draft.credentialId)) choices.push({ value: draft.credentialId, label: "Missing clone identity; choose a replacement", disabled: true });
-    const root = env.page("Clone Repository", credentialSafetyNotice(env.user()) + technicalField("url", "Remote URL", draft.url, 'autocomplete="off"') + technicalField("dest", "Destination parent", draft.dest) + technicalField("folderName", "Checkout folder name", draft.folderName) + field("displayName", "Workspace display name", draft.displayName) + group("Clone identity", select("cloneCredential", "One-time clone credential", choices, draft.credentialId ?? "") + text("The clone identity is separate from credentials used after setup.") + `<span data-clone-unlock></span>`) + group("Credentials used after setup (optional)", configurationFields(catalog, configuration())) + action("review", "Review clone") + (actionProblem ? text(actionProblem) : ""), {
+    // Fields sit in captioned groups; the sharing notice and safety disclosure
+    // are the trailing rows of the credential group they explain, as in Settings.
+    const root = env.page("Clone Repository", group("Repository", technicalField("url", "Remote URL", draft.url, 'autocomplete="off"') + technicalField("dest", "Destination parent", draft.dest) + technicalField("folderName", "Checkout folder name", draft.folderName)) + group("Workspace", field("displayName", "Workspace display name", draft.displayName)) + group("Clone identity", select("cloneCredential", "One-time clone credential", choices, draft.credentialId ?? "") + text("The clone identity is separate from credentials used after setup.") + `<span data-clone-unlock></span>` + credentialSafetyNotice(env.user())) + `<details class="mh-group mh-clone-credentials" data-clone-credentials${credentialsOpen ? " open" : ""}><summary>Credentials used after setup (optional)</summary>${configurationFields(catalog, configuration(), { includeStart: false })}</details>` + group("After clone", check("start", "Start after configuration", draft.start)) + action("review", "Review clone") + (actionProblem ? text(actionProblem) : ""), {
       "flow-back": back,
       review: () => { try { snapshot(root, true); review(); } catch (e) { localError(e, true); } },
       unlock: () => { snapshot(root); const c = catalog.find(c => c.id === draft.credentialId); if (!c || c.type !== "ssh" || !c.enabled) { localError(new Error("Select an enabled SSH clone identity to unlock. Tokens do not support passphrase unlock."), true); return; } unlock({ id: c.id, type: "ssh" }, () => renderForm(), () => renderForm(), "Unlock Clone Identity"); },
@@ -121,9 +130,14 @@ export function createCloneFlow(env: FlowEnvironment, unlock: (target: KeyTarget
       "setup-credentials": () => { snapshot(root); setupCredentials(created => { if (created) catalog = [...catalog.filter(c => c.id !== created.id), created]; renderForm(); }); },
     }, { primaryAction: "review" });
     bindAuthenticationHost(root, catalog);
+    root.querySelector<HTMLDetailsElement>("[data-clone-credentials]")!.ontoggle = event => { credentialsOpen = (event.currentTarget as HTMLDetailsElement).open; };
     const updateUnlock = () => {
       const selected = catalog.find(c => c.id === draft.credentialId);
-      root.querySelector("[data-clone-unlock]")!.innerHTML = selected?.enabled && selected.type === "ssh" ? action("unlock", "Unlock selected clone identity") : "";
+      const slot = root.querySelector("[data-clone-unlock]")!;
+      const available = !!selected?.enabled && selected.type === "ssh";
+      // A text field's deferred change can fire during an Unlock click. Keep
+      // its target mounted unless availability actually changes.
+      if (available !== !!slot.querySelector('[data-flow="unlock"]')) slot.innerHTML = available ? action("unlock", "Unlock selected clone identity") : "";
     };
     updateUnlock();
     root.oninput = () => { dirty = true; snapshot(root); };

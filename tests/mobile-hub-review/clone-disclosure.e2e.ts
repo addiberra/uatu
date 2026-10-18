@@ -1,0 +1,78 @@
+import { expect, test } from "@playwright/test";
+
+test.beforeEach(async ({ request }) => {
+  expect((await request.post("/review/reset", { data: { scenario: "mixed" } })).ok()).toBe(true);
+});
+
+test("optional clone credentials preserve drafts and reveal validation without hiding consent", async ({ page, request }) => {
+  await page.goto("/clone");
+  const details = page.locator("[data-clone-credentials]");
+  const summary = details.locator("summary");
+  const start = page.getByLabel("Start after configuration", { exact: true });
+  const auth = page.getByRole("combobox", { name: "Git authentication", exact: true }).first();
+  const host = page.getByLabel("Authentication host", { exact: true }).first();
+  const add = page.getByRole("button", { name: "Add another authentication host", exact: true });
+  const review = page.getByRole("button", { name: "Review clone", exact: true });
+  await expect(details).not.toHaveAttribute("open");
+  await expect(start).not.toBeChecked();
+  expect(await start.evaluate(el => !el.closest("details"))).toBe(true);
+  expect(await page.getByLabel("One-time clone credential").evaluate(el => !el.closest("[data-clone-credentials]"))).toBe(true);
+  for (const selector of [".mh-credential-notice", ".mh-safety-disclosure"]) {
+    expect(await page.locator(selector).evaluate(el => !el.closest("[data-clone-credentials]"))).toBe(true);
+  }
+  await page.getByLabel("Remote URL", { exact: true }).fill("https://github.com/review/disclosure.git");
+  await page.getByLabel("Checkout folder name", { exact: true }).fill("disclosure");
+  await page.getByLabel("Workspace display name", { exact: true }).fill("Disclosure review");
+  await page.getByRole("combobox", { name: "One-time clone credential", exact: true }).selectOption("token-github");
+  await summary.click();
+  await expect(auth).toHaveValue("");
+  await expect(host).toBeDisabled();
+  await expect(add).toBeHidden();
+  await auth.selectOption("ssh-open");
+  await expect(host).toBeEnabled();
+  await expect(add).toBeVisible();
+  await host.fill("github.com");
+  await page.getByRole("combobox", { name: "Commit signing", exact: true }).selectOption("pgp-locked");
+  await start.check();
+  await summary.click();
+  await expect(host).toBeHidden();
+  await summary.click();
+  await expect(host).toHaveValue("github.com");
+  await expect(page.getByRole("combobox", { name: "Commit signing", exact: true })).toHaveValue("pgp-locked");
+  await auth.selectOption("");
+  await expect(host).toBeDisabled();
+  await expect(add).toBeHidden();
+  await auth.selectOption("ssh-open");
+  await expect(host).toHaveValue("github.com");
+  await add.click();
+  await expect(page.getByRole("combobox", { name: "Git authentication", exact: true })).toHaveCount(2);
+  await summary.click();
+  await review.click();
+  const task = page.getByRole("region", { name: "Review Clone", exact: true });
+  await expect(task).toContainText("Start after clone explicitly requested");
+  await expect(task).toContainText("github.com");
+  await task.getByRole("button", { name: "Back to edit", exact: true }).click();
+  await expect(details).not.toHaveAttribute("open");
+  await expect(start).toBeChecked();
+  await expect(page.getByLabel("Remote URL", { exact: true })).toHaveValue("https://github.com/review/disclosure.git");
+  await expect(page.getByLabel("Destination parent", { exact: true })).toHaveValue("/synthetic");
+  await expect(page.getByLabel("Checkout folder name", { exact: true })).toHaveValue("disclosure");
+  await expect(page.getByLabel("Workspace display name", { exact: true })).toHaveValue("Disclosure review");
+  await expect(page.getByRole("combobox", { name: "One-time clone credential", exact: true })).toHaveValue("token-github");
+  await summary.click();
+  await expect(host).toHaveValue("github.com");
+  await expect(page.getByRole("combobox", { name: "Commit signing", exact: true })).toHaveValue("pgp-locked");
+  await host.fill("");
+  await summary.click();
+  await review.click();
+  await expect(details).toHaveAttribute("open");
+  await expect(page.getByRole("alert")).toContainText("Enter an authentication host");
+  await expect(host).toBeVisible();
+  await host.fill("github.com");
+  await start.uncheck();
+  await summary.click();
+  await review.click();
+  await expect(task).toContainText("Register the completed checkout stopped");
+  const state = await (await request.get("/review/state")).json();
+  expect(state.log.filter((row: { method: string }) => row.method === "submitClone")).toHaveLength(0);
+});

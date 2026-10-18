@@ -136,7 +136,8 @@ for (const variant of [
           const status = await page.locator(".mh-runtime").evaluate(el => { const r = el.getBoundingClientRect(), parent = el.closest(".mh-workspace")!.getBoundingClientRect(); return { height: r.height, line: parseFloat(getComputedStyle(el).lineHeight), left: r.left - parent.left, right: parent.right - r.right, text: el.textContent }; });
           expect(status.text).toBe("● Running"); expect(status.height).toBeLessThanOrEqual(status.line + 1);
           expect(status.left).toBeGreaterThanOrEqual(0); expect(status.right).toBeGreaterThanOrEqual(0);
-          await expect(page.locator(".mh-branch")).toHaveText("main · no commits");
+          // Running cards carry only the runtime fact; the branch stays on Information.
+          await expect(page.locator(".mh-branch")).toHaveCount(0);
           continue;
         }
         const disclosure = page.locator(".mh-safety-disclosure"), summary = disclosure.locator("summary");

@@ -17,7 +17,8 @@
   --mh-warning: #986500;
   --mh-warning-background: #fff6d8;
   --mh-field-background: var(--mh-canvas);
-  --mh-field-line: var(--mh-muted);
+  /* Field/switch boundary: softer than --mh-muted, >=3:1 against the white group and canvas fill (WCAG 1.4.11). */
+  --mh-field-line: #8a8992;
   --mh-switch-on: #34c759;
   --mh-switch-off: #85858d;
   --mh-switch-line: #248a3d;
@@ -63,11 +64,11 @@
     --mh-muted: #b2b1bc; --mh-action: #70b1ff; --mh-action-subtle: #22364e;
     --mh-line: #42424b; --mh-material: rgb(40 40 49 / 85%);
     --mh-selected: #283e57; --mh-positive: #65d881; --mh-danger: #ffaaa3;
-    --mh-warning: #dbb66b; --mh-warning-background: #342c1b;
+    --mh-warning: #dbb66b; --mh-warning-background: #342c1b; --mh-field-line: #7d7c87;
   }
 }
 @media (prefers-contrast: more) {
-  .mh-root { --mh-switch-on: #248a3d; --mh-line: var(--mh-muted); }
+  .mh-root { --mh-switch-on: #248a3d; --mh-line: var(--mh-muted); --mh-field-line: var(--mh-muted); }
 }
 @media (prefers-reduced-motion: reduce) {
   .mh-root { --mh-motion: 0ms; }

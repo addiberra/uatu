@@ -15,10 +15,10 @@ export function configurationFacts(catalog: PublicCredentialDto[], authenticatio
 function authenticationRow(catalog: PublicCredentialDto[], auth?: AuthenticationSelection) {
   return `<div data-auth-row>${select("authentication", "Git authentication", credentialChoices(catalog, "authentication", auth?.credentialId, "None"), auth?.credentialId)}${technicalField("host", "Authentication host", auth?.host ?? "")}</div>`;
 }
-export function configurationFields(catalog: PublicCredentialDto[], draft: ConfigurationDraft): string {
+export function configurationFields(catalog: PublicCredentialDto[], draft: ConfigurationDraft, options: { includeStart?: boolean } = {}): string {
   const usable = (role: "authentication" | "signing") => catalog.some(c => c.enabled && supportsRole(c, role));
   return (!usable("authentication") && !usable("signing") ? text("No usable repository credentials are saved on this Hub. Credentials are optional for public repositories; private access and signing may need setup.") + action("setup-credentials", "Set up repository credentials") : "")
-    + `<div data-auth-list>${(draft.authentication.length ? draft.authentication : [undefined]).map(auth => authenticationRow(catalog, auth)).join("")}</div>${usable("authentication") ? action("add-auth-host", "Add another authentication host") : ""}` + select("signing", "Commit signing", credentialChoices(catalog, "signing", draft.signing, "None"), draft.signing) + check("start", "Start after configuration", draft.start);
+    + `<div data-auth-list>${(draft.authentication.length ? draft.authentication : [undefined]).map(auth => authenticationRow(catalog, auth)).join("")}</div>${usable("authentication") ? action("add-auth-host", "Add another authentication host") : ""}` + select("signing", "Commit signing", credentialChoices(catalog, "signing", draft.signing, "None"), draft.signing) + (options.includeStart === false ? "" : check("start", "Start after configuration", draft.start));
 }
 export function readConfiguration(root: HTMLElement, catalog: PublicCredentialDto[], draft: ConfigurationDraft): ConfigurationDraft {
   const signing = value(root, "signing"); validateSelected(catalog, signing, "signing");

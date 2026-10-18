@@ -68,12 +68,26 @@ function changeSelect(root: HTMLElement, value: string) {
 
 const overviewKey = (id = "key", enabled = true): Extract<PublicCredentialDto, { type: "ssh" }> => ({ id, type: "ssh", name: `Identity ${id}`, enabled, createdAt: "2026-01-01", capabilities: ["ssh-authentication"], metadata: { fingerprint: "public-only", publicKey: "public-only" }, assignments: [], readiness: [{ layer: "credential", status: "ready", message: "Unlocked (prose is not a fact)" }] });
 const keyFacts = (id: string, lock: "locked" | "unlocked" | "unknown"): CredentialFacts => ({ id, type: "ssh", protection: { status: "known", value: "unprotected" }, lock: lock === "unknown" ? { status: "unknown" } : { status: "known", value: lock }, userId: { status: "not-applicable" } });
-test("runtime and branch remain separate whole labels with textual separation", async () => {
+test("running cards show only the green runtime fact; stopped cards show the branch row", async () => {
   const h = harness(); await h.ui.ready;
-  const status = h.root.querySelector('.mh-workspace[data-workspace="a"] .mh-status')!;
-  expect(status.querySelector(".mh-runtime")?.textContent).toBe("● Running");
-  expect(status.querySelector(".mh-branch")?.textContent).toBe("feature/test");
-  expect(status.textContent).toBe("● Running feature/test");
+  const running = h.root.querySelector('.mh-workspace[data-workspace="a"] .mh-status')!;
+  expect(running.querySelector(".mh-runtime")?.textContent).toBe("● Running");
+  expect(running.querySelector(".mh-runtime")?.classList.contains("mh-running")).toBe(true);
+  expect(running.classList.contains("mh-running")).toBe(false);
+  expect(running.querySelector(".mh-branch")).toBeNull();
+  expect(running.textContent).toBe("● Running");
+  const stopped = h.root.querySelector('.mh-workspace[data-workspace="b"] .mh-status')!;
+  expect(stopped.querySelector(".mh-runtime")).toBeNull();
+  expect(stopped.querySelector(".mh-branch")?.textContent).toBe("feature/test");
+  expect(stopped.textContent).toBe("feature/test");
+});
+test("cards compact long paths visibly while keeping the full path in title and accessible name", async () => {
+  const long = "/srv/hub/workspaces/team/a-long-project-name";
+  const h = harness(); h.setRows([{ ...workspace("a", true), path: long }, workspace("b")]); await h.ui.ready;
+  const path = h.root.querySelector('.mh-workspace[data-workspace="a"] .mh-workspace-copy p')!;
+  expect(path.textContent).toBe("…/team/a-long-project-name"); expect(path.getAttribute("title")).toBe(long);
+  expect(h.root.querySelector('[data-action="info:a"]')?.getAttribute("aria-label")).toContain(long);
+  expect(h.root.querySelector('.mh-workspace[data-workspace="b"] .mh-workspace-copy p')?.textContent).toBe("/projects/b");
 });
 test("Settings uses the supplied branding for every image, including identity", async () => {
   const h = harness({}, { brandLogoUrl: "/hub-assets/logo.svg" });
@@ -82,7 +96,45 @@ test("Settings uses the supplied branding for every image, including identity", 
   expect(images).toHaveLength(2);
   expect(images.map(image => image.getAttribute("src"))).toEqual(["/hub-assets/logo.svg", "/hub-assets/logo.svg"]);
 });
-describe("Settings overview explicit credential facts", () => {
+describe("Repository credentials destination and explicit facts", () => {
+  test("history restores an explicit catalog parent, while direct entry and unrelated details keep their own Back", async () => {
+    const entries: Array<{ detail: import("./flows").MobileHubDetail | null; parent?: "repository-credentials" }> = [];
+    const h = harness({}, { detailChanged: (detail, parent) => entries.push({ detail, parent }) });
+    await h.ui.ready; h.ui.show("settings"); h.click("repository-credentials"); h.click("add-credential");
+    expect(entries.at(-1)).toEqual({ detail: { kind: "add-credential" }, parent: "repository-credentials" });
+    h.ui.show("settings", { kind: "repository-credentials" }); // Browser Back.
+    const entry = entries.at(-1)!;
+    h.ui.show("settings", entry.detail!, entry.parent); // Browser Forward.
+    h.root.querySelector<HTMLButtonElement>('[data-flow="flow-back"]')!.click();
+    expect(h.root.querySelector(".mh-flow-page h1")?.textContent).toBe("Repository credentials");
+    h.ui.show("settings", { kind: "add-credential" }); // Direct entry has no parent.
+    h.root.querySelector<HTMLButtonElement>('[data-flow="flow-back"]')!.click();
+    expect(h.root.querySelector<HTMLElement>(".mh-flow-page")!.hidden).toBe(true);
+    h.ui.show("settings", { kind: "security" }, "repository-credentials");
+    await settle(); h.root.querySelector<HTMLButtonElement>('[data-flow="flow-back"]')!.click();
+    expect(h.root.querySelector<HTMLElement>(".mh-flow-page")!.hidden).toBe(true);
+    h.invalidate({ scope: "authentication", reason: "unauthorized", generation: 100 });
+    h.ui.show("settings", { kind: "add-credential" }, "repository-credentials");
+    expect(h.root.textContent).toContain("Sign in required");
+    expect(h.root.querySelector<HTMLElement>(".mh-flow-page")!.hidden).toBe(true);
+  });
+  test("an unresolved catalog omits the count without blocking Settings and refresh updates the destination count", async () => {
+    let finish!: (value: ReadResult<PublicCredentialDto[]>) => void;
+    let rows: PublicCredentialDto[] | undefined;
+    const h = harness({ readCredentials: () => rows ? Promise.resolve(available(rows)) : new Promise(resolve => { finish = resolve; }), readCredentialFacts: async target => available(keyFacts(target.id, "locked")) });
+    await settle(); h.ui.show("settings");
+    expect(h.root.querySelector('[data-action="repository-credentials"] .mh-value')?.textContent).toBe("");
+    expect(h.root.querySelector('[data-action="agent-accounts"]')).not.toBeNull();
+    h.click("handle"); expect(h.root.querySelector(".mh-task")).not.toBeNull(); h.click("cancel-sheet");
+    h.click("repository-credentials"); expect(h.root.querySelector("[data-credential-catalog]")?.textContent).toContain("Loading credentials…");
+    finish(available([overviewKey()])); await h.ui.ready; await settle();
+    expect(h.root.querySelector('[data-action="repository-credentials"] .mh-value')?.textContent).toBe("1");
+    expect(h.root.querySelectorAll("[data-credential-id]")).toHaveLength(1);
+    rows = []; await h.ui.refresh();
+    expect(h.root.querySelector('[data-action="repository-credentials"] .mh-value')?.textContent).toBe("0");
+    expect(h.root.querySelectorAll("[data-credential-id]")).toHaveLength(0);
+    expect(h.root.querySelector("[data-credential-catalog]")?.textContent).toContain("No credentials yet.");
+  });
   test("a transient authentication read cannot discard a pending credential command or its result", async () => {
     let authReads = 0, resolve!: (value: import("./backend").OperationResult<ReturnType<typeof overviewKey>>) => void;
     let catalog: ReturnType<typeof overviewKey>[] = [];
@@ -109,7 +161,7 @@ describe("Settings overview explicit credential facts", () => {
     let catalogs = 0;
     let finish!: (value: ReadResult<PublicCredentialDto[]>) => void;
     const h = harness({ readCredentials: async () => { if (++catalogs === 1) throw new Error("offline"); return new Promise(resolve => { finish = resolve; }); } });
-    await h.ui.ready; h.ui.show("settings"); h.click("retry-credentials");
+    await h.ui.ready; h.ui.show("settings"); h.click("repository-credentials"); h.click("retry-credentials");
     h.invalidate({ scope: "authentication", reason: "unauthorized", generation: 100 });
     finish(available([overviewKey("old-owner")])); await settle();
     expect(h.root.textContent).toContain("Sign in required");
@@ -119,11 +171,11 @@ describe("Settings overview explicit credential facts", () => {
     let catalogs = 0, workspaceReads = 0;
     let finish!: (value: ReadResult<PublicCredentialDto[]>) => void;
     const h = harness({ readWorkspaces: async () => { workspaceReads++; return available([]); }, readCredentials: async () => { if (++catalogs === 1) throw new Error("offline"); return new Promise(resolve => { finish = resolve; }); }, readCredentialFacts: async target => available(keyFacts(target.id, "locked")) });
-    await h.ui.ready; h.ui.show("settings");
+    await h.ui.ready; h.ui.show("settings"); h.click("repository-credentials");
     expect(h.root.querySelectorAll('[data-action="retry-credentials"]').length).toBe(1);
     expect(h.root.querySelector('.mh-group [data-action="add-credential"]')).not.toBeNull();
     expect(h.root.querySelector('.mh-overview-toolbar')).toBeNull();
-    h.click("retry-credentials"); h.click("handle");
+    h.click("retry-credentials"); h.root.querySelector<HTMLButtonElement>('[data-flow="flow-back"]')!.click(); h.click("handle");
     const input = h.root.querySelector<HTMLInputElement>('input[data-pref="position"]')!;
     input.value = "31"; input.focus();
     const sheet = h.root.querySelector(".mh-sheet");
@@ -131,11 +183,13 @@ describe("Settings overview explicit credential facts", () => {
     expect(workspaceReads).toBe(1); expect(catalogs).toBe(2);
     expect(h.root.querySelector(".mh-sheet")).toBe(sheet);
     expect(input.value).toBe("31"); expect(document.activeElement).toBe(input);
+    expect(h.root.querySelector('[data-action="repository-credentials"] .mh-value')?.textContent).toBe("1");
+    h.click("cancel-sheet"); h.click("repository-credentials");
     expect(h.root.querySelector('[data-credential-id="key"] .mh-value')?.textContent).toBe("Locked");
   });
   test("concise lock values remain separate from disabled state and ignore diagnostic prose", async () => {
     const h = harness({ readCredentials: async () => available([overviewKey("locked"), overviewKey("open", false), overviewKey("unknown")]), readCredentialFacts: async target => available(keyFacts(target.id, target.id === "open" ? "unlocked" : target.id === "locked" ? "locked" : "unknown")) });
-    await h.ui.ready; h.ui.show("settings"); await settle();
+    await h.ui.ready; h.ui.show("settings"); h.click("repository-credentials"); await settle();
     expect(h.root.querySelector('[data-credential-id="locked"] .mh-value')?.textContent).toBe("Locked");
     expect(h.root.querySelector('[data-credential-id="open"] .mh-value')?.textContent).toBe("Unlocked");
     expect(h.root.querySelector('[data-credential-id="open"] .mh-row-copy small')?.textContent).toBe("SSH key · Disabled");
@@ -144,33 +198,35 @@ describe("Settings overview explicit credential facts", () => {
   test("fact arrival preserves exact focused row, scroll, and a separate preference draft", async () => {
     const resolve = new Map<string, (value: ReadResult<CredentialFacts>) => void>();
     const h = harness({ readCredentials: async () => available([overviewKey("one"), overviewKey("two")]), readCredentialFacts: target => new Promise(r => { resolve.set(target.id, r); }) });
-    await h.ui.ready; h.ui.show("settings"); const page = h.root.querySelector<HTMLElement>(".mh-page")!;
+    await h.ui.ready; h.ui.show("settings"); h.click("repository-credentials"); const page = h.root.querySelector<HTMLElement>(".mh-flow-content")!;
     const row = h.root.querySelector<HTMLElement>('[data-credential-id="one"]')!; page.scrollTop = 140; row.focus();
     resolve.get("one")!(available(keyFacts("one", "locked"))); await settle();
     expect(h.root.querySelector('[data-credential-id="one"]')).toBe(row); expect(document.activeElement).toBe(row); expect(page.scrollTop).toBe(140);
+    h.root.querySelector<HTMLButtonElement>('[data-flow="flow-back"]')!.click();
+    const settings = h.root.querySelector<HTMLElement>(".mh-page")!; settings.scrollTop = 90;
     h.click("preview-side"); changeSelect(h.root, "right"); const select = h.root.querySelector<HTMLElement>('input[value="right"]')!; select.focus();
     const modal = h.root.querySelector(".mh-sheet"); resolve.get("two")!(available(keyFacts("two", "unlocked"))); await settle();
-    expect(h.root.querySelector(".mh-sheet")).toBe(modal); expect(document.activeElement).toBe(select); expect(h.root.querySelector<HTMLInputElement>('input[type="radio"]:checked')?.value).toBe("right"); expect(page.scrollTop).toBe(140);
+    expect(h.root.querySelector(".mh-sheet")).toBe(modal); expect(document.activeElement).toBe(select); expect(h.root.querySelector<HTMLInputElement>('input[type="radio"]:checked')?.value).toBe("right"); expect(settings.scrollTop).toBe(90);
     h.click("cancel-sheet"); expect(getNavigationPreferences().previewSide).toBe("left");
   });
   test("older refresh completions cannot overwrite newer facts", async () => {
     const resolve: Array<(value: ReadResult<CredentialFacts>) => void> = [];
     const h = harness({ readCredentials: async () => available([overviewKey()]), readCredentialFacts: () => new Promise(r => { resolve.push(r); }) });
-    await h.ui.ready; h.ui.show("settings"); await h.ui.refresh();
+    await h.ui.ready; h.ui.show("settings"); h.click("repository-credentials"); await h.ui.refresh();
     resolve[1]!(available(keyFacts("key", "unlocked"))); await settle(); resolve[0]!(available(keyFacts("key", "locked"))); await settle();
     expect(h.root.querySelector('[data-credential-id="key"] .mh-value')?.textContent).toBe("Unlocked");
   });
   test("old-identity facts and authoritative unauthorized results cannot resurrect protected summaries", async () => {
     let user = "Alice"; let old!: (value: ReadResult<CredentialFacts>) => void;
     const h = harness({ readAuthentication: async () => available({ status: "authenticated", identity: { user, host: "hub.invalid", version: "test" } }), readCredentials: async () => available([overviewKey()]), readCredentialFacts: () => user === "Alice" ? new Promise(r => { old = r; }) : Promise.resolve(available(keyFacts("key", "unknown"))) });
-    await h.ui.ready; user = "Bob"; await h.ui.refresh(); h.ui.show("settings"); old(available(keyFacts("key", "unlocked"))); await settle();
+    await h.ui.ready; user = "Bob"; await h.ui.refresh(); h.ui.show("settings"); h.click("repository-credentials"); old(available(keyFacts("key", "unlocked"))); await settle();
     expect(h.root.querySelector('[data-credential-id="key"] .mh-value')?.textContent).toBe("Unknown");
     h.invalidate({ scope: "authentication", generation: 1, reason: "unauthorized" }); expect(h.root.querySelector("[data-credential-id]")).toBeNull();
     expect(h.root.textContent).toContain("Sign in required");
   });
   test("unavailable or mismatched facts show Unknown instead of fabricated lock state", async () => {
     const h = harness({ readCredentials: async () => available([overviewKey("offline"), overviewKey("mismatch")]), readCredentialFacts: async target => target.id === "offline" ? { status: "unavailable", problem: { kind: "unavailable", message: "Offline" } } : available(keyFacts("another-id", "unlocked")) });
-    await h.ui.ready; h.ui.show("settings"); await settle();
+    await h.ui.ready; h.ui.show("settings"); h.click("repository-credentials"); await settle();
     expect([...h.root.querySelectorAll("[data-credential-id] .mh-value")].map(el => el.textContent)).toEqual(["Unknown", "Unknown"]);
   });
   test("an authoritative unauthorized fact read revokes the overview rather than exposing stale metadata", async () => {
@@ -286,6 +342,30 @@ describe("mobile Hub scoped composition", () => {
     expect(branchLabel({ kind: "non-git" })).toBe("Not a Git repository");
     expect(branchLabel({ kind: "loading" })).toBe("Loading branch…");
     expect(branchLabel({ kind: "unavailable", message: "Offline" })).toBe("Branch unavailable: Offline");
+  });
+  test("stopped cards show compact branch copy; Information keeps the verbose message", async () => {
+    const h = harness(); h.setRows([workspace("a", true), { ...workspace("b"), branch: { kind: "unavailable", message: "Offline" } }, { ...workspace("c"), branch: { kind: "non-git" } }]);
+    await h.ui.ready;
+    expect(h.root.querySelector('.mh-workspace[data-workspace="b"] .mh-branch')?.textContent).toBe("Branch unknown");
+    expect(h.root.querySelector('.mh-workspace[data-workspace="c"] .mh-branch')?.textContent).toBe("Not a Git repository");
+    h.click("info:b"); await settle();
+    const page = h.root.querySelector(".mh-flow-page")!;
+    expect(page.querySelector(".mh-flow-header .mh-note")?.textContent).toBe("Stopped · Branch unknown");
+    const branchRow = [...page.querySelectorAll("details .mh-info-row")].find(row => row.querySelector("dt")?.textContent === "Branch")!;
+    expect(branchRow.querySelector(".mh-info-value")?.textContent).toBe("Branch unavailable: Offline");
+  });
+  test("family rows keep the branch on a running checkout; equal names stay told apart by distinct paths", async () => {
+    const h = harness(); h.setRows([
+      { ...workspace("a", true), path: "/srv/hub/workspaces/team-a/shared-project-name" },
+      { ...workspace("b"), path: "/srv/hub/workspaces/team-b/shared-project-name" },
+      { ...workspace("c", true), parentId: "a", path: "/srv/hub/workspaces/team-a/shared-project-name-wt", branch: { kind: "named", name: "topic" } },
+    ]);
+    await h.ui.ready;
+    const family = h.root.querySelector('details[data-family] .mh-workspace[data-workspace="c"] .mh-status')!;
+    expect(family.querySelector(".mh-runtime")?.textContent).toBe("● Running");
+    expect(family.querySelector(".mh-branch")?.textContent).toBe("topic");
+    expect(h.root.querySelector('.mh-workspace[data-workspace="a"] .mh-workspace-copy p')?.textContent).toBe("…/team-a/shared-project-name");
+    expect(h.root.querySelector('.mh-workspace[data-workspace="b"] .mh-workspace-copy p')?.textContent).toBe("…/team-b/shared-project-name");
   });
   test("untrusted long labels stay text and duplicate names have distinct path labels", async () => {
     const h = harness(); h.setRows([{ ...workspace("a", true), displayName: '<img src=x onerror=alert(1)>' + "long".repeat(30) }, workspace("b")]);
@@ -407,12 +487,22 @@ describe("stable Return and explicit workspace intents", () => {
 
 describe("Settings and browser-owned preference sheets", () => {
   test("a safety disclosure stays open and focused through overview refresh", async () => {
-    const h = harness(); await h.ui.ready; h.ui.show("settings");
+    const h = harness(); await h.ui.ready; h.ui.show("settings"); h.click("repository-credentials");
     const disclosure = h.root.querySelector<HTMLDetailsElement>(".mh-safety-disclosure")!;
     disclosure.open = true; disclosure.querySelector<HTMLElement>("summary")!.focus();
     await h.ui.refresh();
     expect(h.root.querySelector<HTMLDetailsElement>(".mh-safety-disclosure")!.open).toBe(true);
     expect(document.activeElement).toBe(h.root.querySelector(".mh-safety-disclosure > summary"));
+  });
+  test("an empty catalog is one quiet row inside the Credentials group, not a full-height state", async () => {
+    const h = harness(); await h.ui.ready; h.click("settings"); h.click("repository-credentials");
+    const section = h.root.querySelector(".mh-flow-page .mh-section")!;
+    const row = section.querySelector(".mh-group .mh-empty-row")!;
+    expect(row.textContent).toBe("No credentials yet. Add one for Git authentication or commit signing.");
+    expect(row.classList.contains("mh-note")).toBe(true);
+    expect(h.root.querySelector(".mh-empty-state")).toBeNull();
+    expect(section.querySelector(".mh-group .mh-row-action[data-action=\"add-credential\"]")).not.toBeNull();
+    expect(section.innerHTML.indexOf("mh-empty-row")).toBeLessThan(section.innerHTML.indexOf('data-action="add-credential"'));
   });
   test("overview is grouped destinations rather than inline forms", async () => {
     const h = harness(); await h.ui.ready; h.click("settings");
@@ -420,11 +510,15 @@ describe("Settings and browser-owned preference sheets", () => {
     expect([...h.root.querySelectorAll(".mh-section > h2")].map(el => el.textContent)).toEqual(["Credentials", "Agent accounts", "Workspaces", "Navigation", "Notifications", "Account"]);
     const section = (name: string) => [...h.root.querySelectorAll(".mh-section")].find(el => el.querySelector("h2")?.textContent === name)!;
     for (const key of ["auto-hide", "handle", "preview-side"]) expect(section("Navigation").querySelector(`[data-action="${key}"]`)).not.toBeNull();
-    for (const key of ["tools", "assignments"]) expect(section("Credentials").querySelector(`[data-action="${key}"]`)).not.toBeNull();
-    expect(h.root.querySelector('[data-shared-uid]')?.closest(".mh-section")?.querySelector("h2")?.textContent).toBe("Credentials");
+    expect(section("Credentials").querySelectorAll("button")).toHaveLength(1);
+    expect(section("Credentials").querySelector('[data-action="repository-credentials"] .mh-value')?.textContent).toBe("0");
+    expect(section("Agent accounts").querySelector('[data-action="agent-accounts"]')).not.toBeNull();
+    expect(h.root.querySelector('[data-shared-uid], [data-action="add-credential"], [data-credential-id]')).toBeNull();
     expect(h.root.querySelector("input,select")).toBeNull();
+    h.click("repository-credentials");
+    for (const key of ["tools", "assignments"]) expect(h.root.querySelector(`.mh-flow-page [data-action="${key}"]`)).not.toBeNull();
+    expect(h.root.querySelector('.mh-flow-page [data-shared-uid]')).not.toBeNull();
     h.click("add-credential");
-    expect(h.root.querySelector<HTMLButtonElement>('[data-action="add-credential"]')?.disabled).toBe(false);
     expect(h.root.querySelector(".mh-flow-page h1")?.textContent).toBe("Add Credential");
     expect(h.root.querySelector('[role="dialog"]')).toBeNull();
   });

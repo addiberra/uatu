@@ -1,8 +1,8 @@
 import type { AssignWorkspaceIntent, AssignmentSelection, WorkspaceView } from "./backend";
 import { normalizeProviderHost, type AuthenticationCredentialAssignment, type PublicCredentialDto } from "../credential-types";
-import { action, advisory, displayName, field, group, infoRows, listRow, required, select, text, value, type FlowEnvironment } from "./flow-ui";
+import { action, advisory, displayName, field, group, infoRows, listRow, required, rowAction, select, text, value, type FlowEnvironment } from "./flow-ui";
 import { supportsRole } from "./credential-flows";
-import { branchLabel } from "./workspace-presentation";
+import { branchLabel, branchSummary } from "./workspace-presentation";
 import { createWorktreeFlows } from "./worktree-flows";
 
 export type AssignmentDraft = { authentication: string; host: string; signing: string };
@@ -66,10 +66,13 @@ export function createWorkspaceFlows(env: FlowEnvironment, start: (workspace: Wo
         const signing = w.assignments.find(a => a.role === "signing");
         return group("Git authentication", auths.length ? auths.map(a => infoRows([{ label: "Host", value: a.host, mono: true }, { label: "Credential", value: name(a.credentialId) }])).join("") : infoRows([{ label: "Credential", value: "None assigned" }])) + group("Commit signing", infoRows([{ label: "Credential", value: signing ? name(signing.credentialId) : "None assigned" }]));
       };
-      env.page(w.displayName, text(`${w.runtime.status === "running" ? "Running" : "Stopped"} · ${branchLabel(w.branch)}`)
-        + group("Workspace actions", action("rename", "Rename display name") + (backend.worktrees && (w.createWorktree || w.parentId) ? listRow("worktrees", "Branches and worktrees", "Create, register and manage checkouts", "branch") : "") + action("assign", w.parentId ? "Manage inherited workspace credentials" : "Edit workspace credentials") + (w.availability ? text(`Checkout ${w.availability}. Resolve its identity before Open or Start.`) : action("open", w.runtime.status === "running" ? "Open" : "Start")) + (w.runtime.status === "running" ? action("stop", "Stop workspace", true) : action("forget", "Forget registration", true)))
+      // Detail-page grammar: centered folder icon, title, muted summary, then one
+      // filled Open/Start capsule above plain command rows; the destructive
+      // command sits in its own group. Labels are located by name in tests.
+      env.page(w.displayName, group("Workspace actions", (w.availability ? text(`Checkout ${w.availability}. Resolve its identity before Open or Start.`) : action("open", w.runtime.status === "running" ? "Open" : "Start")) + rowAction("rename", "Rename display name") + (backend.worktrees && (w.createWorktree || w.parentId) ? listRow("worktrees", "Branches and worktrees", "Create, register and manage checkouts", "branch") : "") + rowAction("assign", w.parentId ? "Manage inherited workspace credentials" : "Edit workspace credentials"))
+        + group(w.runtime.status === "running" ? "Session" : "Registration", w.runtime.status === "running" ? rowAction("stop", "Stop workspace", true) : rowAction("forget", "Forget registration", true))
         + (w.credentialRestartRequired ? text("Credential changes require a workspace restart.") : "")
-        + `<details class="mh-safety-disclosure"><summary>Workspace information and credentials</summary>` + group("Workspace information", infoRows([{ label: "Folder", value: w.path, mono: true }, { label: "Status", value: w.runtime.status }, { label: "Branch", value: branchLabel(w.branch) }, { label: "Stable ID", value: w.id, mono: true }])) + shellText + `<div data-workspace-assignments>${assignmentText("loading")}</div>` + text("Assignment presence is not credential readiness.") + action("manage-assignments", "Manage credential assignments and hosts") + `</details>`, actions, { primaryAction: "open" });
+        + `<details class="mh-safety-disclosure"><summary>Workspace information and credentials</summary>` + group("Workspace information", infoRows([{ label: "Folder", value: w.path, mono: true }, { label: "Status", value: w.runtime.status }, { label: "Branch", value: branchLabel(w.branch) }, { label: "Stable ID", value: w.id, mono: true }])) + shellText + `<div data-workspace-assignments>${assignmentText("loading")}</div>` + text("Assignment presence is not credential readiness.") + action("manage-assignments", "Manage credential assignments and hosts") + `</details>`, actions, { primaryAction: "open", icon: "folder", tint: "blue", subtitle: `${w.runtime.status === "running" ? "Running" : "Stopped"} · ${branchSummary(w.branch)}` });
       // Name enrichment must not replace usable workspace facts with a catalog
       // error page, or rerender the page and disrupt a focused command/form.
       const region = env.root.querySelector<HTMLElement>("[data-workspace-assignments]")!;

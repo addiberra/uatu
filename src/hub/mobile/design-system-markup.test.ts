@@ -21,6 +21,19 @@ test("navigation has disclosure; immediate and context actions do not", () => {
   expect(document.querySelector(".mh-destructive")?.textContent).toBe("Remove");
 });
 
+test("row actions are plain left-aligned commands with stable keys and a named destructive variant", () => {
+  const value = '"><img src=x onerror="bad"> &';
+  const { document } = parseHTML(ui.rowAction(value, value) + ui.rowAction("stop", "Stop workspace", true) + ui.rowAction("add-credential", "Add Credential", false, "action"));
+  expect(document.querySelector("img,[onerror],svg")).toBeNull();
+  expect(document.querySelectorAll("button[type=button].mh-row-action").length).toBe(3);
+  expect(document.querySelector("[data-flow]")?.getAttribute("data-flow")).toBe(value);
+  expect(document.querySelector("[data-flow]")?.textContent).toBe(value);
+  expect(document.querySelector(".mh-destructive")?.textContent).toBe("Stop workspace");
+  expect(document.querySelector('[data-action="add-credential"]')?.classList.contains("mh-destructive")).toBe(false);
+  expect(document.querySelector('[data-action="add-credential"]')?.hasAttribute("data-flow")).toBe(false);
+  expect(compatibility.rowAction).toBe(ui.rowAction);
+});
+
 test("all plain-text seams escape caller strings and preserve exact keys", () => {
   const value = '\"><img src=x onerror="bad"> &';
   const html = ui.text(value) + ui.action(value, value) + ui.group(value, ui.text(value), 2)

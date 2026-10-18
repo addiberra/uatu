@@ -384,7 +384,7 @@ describe("credential flow validation and security", () => {
     expect(sharedUidKey("å@example.invalid")).toBe(`uatu.hub.notice.shared-uid-v1:${Buffer.from("å@example.invalid").toString("base64url")}`);
   });
   test("shared-UID dismissal in Settings applies to Clone for the same authenticated user", async () => {
-    const h = harness(); await h.ui.ready; h.ui.show("settings"); expect(h.root.querySelector("[data-shared-uid]")).not.toBeNull(); h.click("dismiss-advisory");
+    const h = harness(); await h.ui.ready; h.ui.show("settings", { kind: "repository-credentials" }); expect(h.root.querySelector("[data-shared-uid]")).not.toBeNull(); h.click("dismiss-advisory");
     h.ui.showDetail({ kind: "clone" }); await settle(); expect(h.region().querySelector("[data-shared-uid]")).toBeNull();
   });
 });
@@ -571,12 +571,18 @@ describe("onboarding and clone lifecycle", () => {
     h.click("rename"); await settle(); expect(h.input("name").value).toBe("a");
     expect(h.mutations("renameFolder")).toHaveLength(0);
   });
-  test("clone optional configuration stays visible without an accordion", async () => {
+  test("clone discloses optional credentials without hiding identity, safety or start consent", async () => {
     const h = harness(); await h.ui.ready; h.ui.showDetail({ kind: "clone" }); await settle();
-    expect(h.region().querySelectorAll("details")).toHaveLength(1);
-    expect(h.region().querySelector("details")?.classList.contains("mh-safety-disclosure")).toBe(true);
+    expect(h.region().querySelectorAll("details")).toHaveLength(2);
+    const optional = h.region().querySelector("[data-clone-credentials]")!;
+    expect(optional.hasAttribute("open")).toBe(false);
+    expect(optional.querySelector("summary")?.textContent).toBe("Credentials used after setup (optional)");
     for (const name of ["authentication", "host", "signing", "start"]) expect(h.region().querySelector(`[name="${name}"]`)).not.toBeNull();
-    expect(h.region().querySelector('details [name="authentication"]')).toBeNull();
+    for (const name of ["authentication", "host", "signing"]) expect(optional.querySelector(`[name="${name}"]`)).not.toBeNull();
+    expect(optional.querySelector('[name="start"], [name="cloneCredential"], .mh-safety-disclosure, .mh-credential-notice')).toBeNull();
+    expect(h.region().querySelector(".mh-safety-disclosure")).not.toBeNull();
+    expect(h.input("start").hasAttribute("checked")).toBe(false);
+    expect(h.region().querySelector<HTMLButtonElement>('[data-flow="add-auth-host"]')?.hidden).toBe(true);
   });
   test("Default Folder picker returns to its typed editor from a child; Up is only hierarchy navigation", async () => {
     const h = harness(); await h.ui.ready;

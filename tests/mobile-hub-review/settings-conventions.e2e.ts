@@ -1,10 +1,11 @@
 import { expect, test } from "@playwright/test";
 import { activeTask } from './navigation';
 
-test("Settings keeps grouped Add Credential and accessible two-choice preferences", async ({ page, request }) => {
+test("Settings keeps a repository destination and accessible two-choice preferences", async ({ page, request }) => {
   await request.post("/review/reset", { data: { scenario: "mixed" } });
   await page.goto("/settings");
-  await expect(page.locator('.mh-group [data-action="add-credential"]')).toHaveCount(1);
+  await expect(page.locator('.mh-group [data-action="repository-credentials"]')).toHaveCount(1);
+  await expect(page.locator('[data-action="add-credential"]')).toHaveCount(0);
   await expect(page.locator(".mh-overview-toolbar")).toHaveCount(0);
   await page.locator('[data-action="preview-side"]').click();
   const sheet = activeTask(page);

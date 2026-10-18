@@ -4,7 +4,7 @@ import { createSyntheticBackend } from "../../../tests/mobile-hub-review/backend
 import { createFlowEnvironment, type SheetPort } from "./flow-ui";
 import { createTaskView } from "./task-view";
 import { createWorkspaceFlows } from "./workspace-flows";
-import { branchLabel, workspaceAssignmentLabels } from "./workspace-presentation";
+import { branchLabel, branchSummary, compactPath, compactPaths, workspaceAssignmentLabels } from "./workspace-presentation";
 import type { BranchState, MobileHubBackend, WorkspaceView } from "./backend";
 import type { PublicCredentialDto } from "../credential-types";
 
@@ -51,6 +51,33 @@ test.each([
   [{ kind: "detached", commit: "abc123" }, "Detached · abc123"], [{ kind: "non-git" }, "Not a Git repository"],
   [{ kind: "loading" }, "Loading branch…"], [{ kind: "unavailable", message: "Denied" }, "Branch unavailable: Denied"],
 ] as [BranchState, string][])("truthful branch presentation %j", (branch, label) => { expect(branchLabel(branch)).toBe(label); });
+
+test("card summary shortens only the unavailable message; the verbose fact stays on Information", () => {
+  expect(branchSummary({ kind: "unavailable", message: "Denied" })).toBe("Branch unknown");
+  expect(branchLabel({ kind: "unavailable", message: "Denied" })).toBe("Branch unavailable: Denied");
+  for (const branch of [{ kind: "named", name: "main" }, { kind: "unborn", name: "next" }, { kind: "detached", commit: "abc123" }, { kind: "non-git" }, { kind: "loading" }] as BranchState[]) expect(branchSummary(branch)).toBe(branchLabel(branch));
+});
+
+test.each([
+  ["/projects/a", "/projects/a"],
+  ["/home/studio/Projects/northstar-is-forty", "/home/studio/Projects/northstar-is-forty"],
+  ["/home/studio/Projects/northstar-is-forty-one", "…/Projects/northstar-is-forty-one"],
+  ["/srv/hub/workspaces/team/a-long-project-name/", "…/team/a-long-project-name"],
+  ["/one-segment-that-is-longer-than-forty-characters", "/one-segment-that-is-longer-than-forty-characters"],
+  ["/", "/"],
+  ["C:\\Users\\studio\\Projects\\northstar-is-long-enough", "…\\Projects\\northstar-is-long-enough"],
+])("compactPath(%s) keeps short paths and trims long ones to the last two segments", (path, compact) => {
+  expect(compactPath(path)).toBe(compact);
+});
+
+test("compactPaths keeps colliding card labels distinct by growing leading segments", () => {
+  const paths = ["/srv/hub/workspaces/team-a/shared-project-name", "/srv/hub/workspaces/team-b/shared-project-name", "/srv/hub/workspaces/team-a/other-project-name", "/projects/short"];
+  expect(compactPaths(paths)).toEqual(["…/team-a/shared-project-name", "…/team-b/shared-project-name", "…/team-a/other-project-name", "/projects/short"]);
+  const twins = ["/srv/hub/workspaces/alpha/team/shared-project-name", "/srv/hub/checkouts/beta/team/shared-project-name", "/srv/hub/checkouts/beta/team/shared-project-name"];
+  expect(compactPaths(twins)).toEqual(["…/alpha/team/shared-project-name", "…/beta/team/shared-project-name", "…/beta/team/shared-project-name"]);
+  expect(compactPaths(["/a/b", "/a/b"])).toEqual(["/a/b", "/a/b"]);
+  expect(compactPaths([])).toEqual([]);
+});
 
 test("assignment labels retain separate hosts and roles without duplicating defaults", () => {
   expect(workspaceAssignmentLabels(assignments, catalog)).toEqual(["AUTH: Shared identity · one.invalid", "AUTH: Shared identity · two.invalid", "SIGNING: Shared identity"]);

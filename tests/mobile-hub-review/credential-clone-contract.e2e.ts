@@ -17,8 +17,8 @@ async function submit(page: Page) { await button(page, "Review clone").click(); 
 async function hints(page: Page) { return page.evaluate(() => Object.entries(sessionStorage).filter(([key]) => key.startsWith("uatu.hub.clone-attempt-v2:")).map(([key, raw]) => ({ key, ...JSON.parse(raw) }))); }
 test.beforeEach(async ({ request }) => { expect((await request.post("/review/reset", { data: { scenario: "mixed" } })).ok()).toBe(true); });
 
-test("Settings overview uses concise explicit lock facts, independent Disabled, and a truthful detail fallback", async ({ page, request }) => {
-  await page.goto("/settings");
+test("Repository catalog uses concise explicit lock facts, independent Disabled, and a truthful detail fallback", async ({ page, request }) => {
+  await page.goto("/settings?detail=repository-credentials");
   const row = page.locator('[data-credential-id="ssh-locked"]');
   await expect(row.locator(".mh-value")).toHaveText("Locked");
   await expect(page.locator('[data-credential-id="ssh-open"] .mh-value')).toHaveText("Unlocked");
@@ -42,24 +42,29 @@ test("Settings overview uses concise explicit lock facts, independent Disabled, 
   await expect(page.locator(".mh-flow-header")).toContainText("Disabled");
 });
 
-test("late overview facts preserve focused row identity, Settings scroll, and an open preference draft", async ({ page, request }) => {
+test("late catalog facts preserve focused row identity, catalog scroll, and an open Settings preference draft", async ({ page, request }) => {
   await control(request, "hold", ["readCredentialFacts"]);
   try {
-    await page.goto("/settings"); const row = page.locator('[data-credential-id="ssh-locked"]'); await expect(row.locator(".mh-value")).toHaveText("Loading…");
-    const handle = await row.elementHandle(); const scroll = page.locator(".mh-page");
+    await page.goto("/settings?detail=repository-credentials"); const row = page.locator('[data-credential-id="ssh-locked"]'); await expect(row.locator(".mh-value")).toHaveText("Loading…");
+    const handle = await row.elementHandle(); const scroll = page.locator(".mh-flow-content");
     await scroll.evaluate(el => { el.scrollTop = 100; }); await row.focus(); const before = await scroll.evaluate(el => el.scrollTop);
     await control(request, "settle", ["readCredentialFacts", false]); await expect(row.locator(".mh-value")).toHaveText("Locked");
     expect(await handle!.evaluate(el => el === document.querySelector('[data-credential-id="ssh-locked"]'))).toBe(true);
     await expect(row).toBeFocused(); expect(await scroll.evaluate(el => el.scrollTop)).toBe(before);
+    await button(page, "Back").click();
+    const settings = page.locator(".mh-page");
     await page.locator('[data-action="preview-side"]').click(); const side = page.getByRole("radio", { name: "Right", exact: true });
-    await side.check(); await side.focus(); const field = await side.elementHandle(); const formScroll = await scroll.evaluate(el => el.scrollTop);
+    await side.check(); await side.focus(); const field = await side.elementHandle(); const formScroll = await settings.evaluate(el => el.scrollTop);
     await control(request, "hold", ["readCredentialFacts"]); await control(request, "setKeyState", ["ssh-locked", "unlocked"]);
     await expect.poll(async () => (await state(request)).pending.some((p: { method: string; count: number }) => p.method === "readCredentialFacts" && p.count >= 5)).toBe(true);
     await control(request, "settle", ["readCredentialFacts", false]);
-    await expect(row.locator(".mh-value")).toHaveText("Unlocked"); expect(await field!.evaluate(el => el.isConnected)).toBe(true);
-    await expect(side).toBeChecked(); await expect(side).toBeFocused(); expect(await scroll.evaluate(el => el.scrollTop)).toBe(formScroll);
+    await expect.poll(async () => (await state(request)).pending.filter((p: { method: string }) => p.method === "readCredentialFacts").length).toBe(0);
+    expect(await field!.evaluate(el => el.isConnected)).toBe(true);
+    await expect(side).toBeChecked(); await expect(side).toBeFocused(); expect(await settings.evaluate(el => el.scrollTop)).toBe(formScroll);
     await button(page, "Cancel").click(); await expect(page.locator('[data-action="preview-side"]')).toBeFocused();
     await expect(page.locator('[data-action="preview-side"] .mh-value')).toHaveText("Left");
+    await page.locator('[data-action="repository-credentials"]').click();
+    await expect(row.locator(".mh-value")).toHaveText("Unlocked");
   } finally { await control(request, "settle", ["readCredentialFacts", false]); }
 });
 

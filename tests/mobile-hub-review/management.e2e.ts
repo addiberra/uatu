@@ -198,6 +198,31 @@ test("onboarding registration failure reports retained checkout without fabricat
   await expect(button(page, "Configure this folder")).toBeVisible();
 });
 
+test("clone unlock survives a pending text-field change and cancel preserves the draft", async ({ page, request }) => {
+  await page.goto("/clone");
+  await page.getByLabel("Remote URL").fill("git@github.com:review/example.git");
+  await page.getByLabel("Checkout folder name").fill("unlock-review");
+  await page.getByLabel("One-time clone credential").selectOption("ssh-locked");
+  // Keep the edited text field focused: its deferred change fires during the
+  // Unlock pointer gesture, between mousedown and click in a real browser.
+  const name = page.getByLabel("Workspace display name");
+  await name.fill("Pending name edit");
+  await expect(name).toBeFocused();
+  await button(page, "Unlock selected clone identity").click();
+  await expect(page.getByLabel("Passphrase", { exact: true })).toBeVisible();
+  await page.getByLabel("Passphrase", { exact: true }).fill("DISPOSABLE-CANCELLED-UNLOCK");
+  await button(page, "Cancel").click();
+  await expect(page.getByLabel("Remote URL")).toHaveValue("git@github.com:review/example.git");
+  await expect(page.getByLabel("Checkout folder name")).toHaveValue("unlock-review");
+  await expect(name).toHaveValue("Pending name edit");
+  await expect(page.getByLabel("One-time clone credential")).toHaveValue("ssh-locked");
+  await expect(page.getByLabel("Passphrase", { exact: true })).toHaveCount(0);
+  const current = await state(request);
+  expect(current.model.jobs).toEqual([]);
+  expect(current.log.filter((entry: { method: string }) => entry.method === "unlockCredential" || entry.method === "submitClone")).toEqual([]);
+  expect(JSON.stringify(current)).not.toContain("DISPOSABLE-CANCELLED-UNLOCK");
+});
+
 test("clone independent unlock submits once; masked input replays on same job and cancellation cleans", async ({ page, request }) => {
   await page.goto("/clone");
   await page.getByLabel("Remote URL").fill("git@github.com:review/example.git");

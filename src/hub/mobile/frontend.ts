@@ -5,10 +5,10 @@ import { escapeHtml as esc } from "../../shared/html";
 import { appUrl } from "../../shared/app-url";
 import { DEFAULT_NAVIGATION_PLACEMENT, getNavigationPreferences, setNavigationPreferences, onNavigationPreferencesChange } from "../../shell/navigation-preferences";
 import { mobileHubIcon as icon } from "./icons";
-import { group as section, text as note, destinationRow as destination, choiceGroup as choices, emptyState } from "./design-system";
+import { group as section, text as note, destinationRow as destination, choiceGroup as choices, emptyState, rowAction } from "./design-system";
 import { createMobileHubFlows, type MobileHubDetail } from "./flows";
 import { credentialSafetyNotice, clearSecrets, dismissAdvisory, field as flowField, showContextualError } from "./flow-ui";
-import { branchLabel } from "./workspace-presentation";
+import { branchSummary, compactPaths } from "./workspace-presentation";
 import { mobileWorkspaceGroups, type MobileWorkspaceGroup } from "./workspace-groups";
 export { branchLabel } from "./workspace-presentation";
 import { observeMobileHubLayout } from "./layout";
@@ -16,7 +16,7 @@ import { createTaskView, type TaskPresentation } from "./task-view";
 export type { MobileHubDetail } from "./flows";
 
 export type MobileHubRoute = "hub" | "settings";
-export type MobileHubDestination = { kind: "credential"; id: string } | { kind: "notifications" | "agent-accounts" | "add-credential" | "tools" | "assignments" | "default-folder" | "devices" | "security" | "add-workspace" | "folders" };
+export type MobileHubDestination = { kind: "credential"; id: string } | { kind: "repository-credentials" | "notifications" | "agent-accounts" | "add-credential" | "tools" | "assignments" | "default-folder" | "devices" | "security" | "add-workspace" | "folders" };
 export interface MobileHubCallbacks {
   brandLogoUrl?: string;
   notifications?: import("./notifications").MobileNotificationSettings;
@@ -31,7 +31,7 @@ export interface MobileHubCallbacks {
   taskChanged?(open: boolean): void;
   /** Safe detail identity only. The coordinator serializes validated context,
    * never credential secrets or arbitrary host paths into history. */
-  detailChanged?(detail: MobileHubDetail | null): void;
+  detailChanged?(detail: MobileHubDetail | null, parent?: "repository-credentials"): void;
   authenticated?(): void;
 }
 export type MobileHubReturnTarget = Pick<WorkspaceView, "id" | "displayName" | "path" | "runtime">;
@@ -93,19 +93,28 @@ export function mountMobileHub(root: HTMLElement, backend: MobileHubBackend, cal
     open: (title, body, primary, cancel, presentation) => openSheet(title, body, primary, cancel, presentation), close: () => closeSheet(false), busy, error: sheetError,
   }, {
     notifications: callbacks.notifications,
+    repositoryCredentials: env => {
+      env.page("Repository credentials", section("Credentials", `<div data-credential-catalog>${credentialCatalog()}</div>`
+        + rowAction("add-credential", "Add Credential", false, "action"))
+        + section("Management", destination("tools", "Credential Tools", "key") + destination("assignments", "Manage workspace credentials", "folder", "Authentication hosts and commit signing"))
+        + credentialSafetyNotice(identity?.user ?? ""), {}, { icon: "key", subtitle: "Repository access and signing. Stored only on this hub." });
+      const safety = flowRoot.querySelector<HTMLDetailsElement>(".mh-safety-disclosure")!;
+      safety.open = disclosures.get("credential-safety") ?? false;
+      env.onLeave(() => disclosures.set("credential-safety", safety.open));
+    },
     user: () => identity?.user ?? "", home: () => { render(); }, changed: () => { void refresh(); },
     authContext: () => { const captured = generation, user = authenticatedUser ?? ""; return { user, current: () => !disposed && generation === captured && authenticatedUser === user }; },
     authLost: invalidateAuthentication, openWorkspace: id => { void openWorkspace(id); },
     startWorkspace: w => { if (w.runtime.status === "running") void openWorkspace(w.id); else void start(w); },
-    detailChanged: detail => {
-      if (callbacks.detailChanged) callbacks.detailChanged(detail);
+    detailChanged: (detail, parent) => {
+      if (callbacks.detailChanged) callbacks.detailChanged(detail, parent);
       else if (detail?.kind === "credential") callbacks.openDestination?.(detail);
       else if (detail && detail.kind !== "workspace" && detail.kind !== "clone" && detail.kind !== "agent") callbacks.openDestination?.({ kind: detail.kind });
       render();
       if (!detail && overviewTriggerAction) [...page.querySelectorAll<HTMLElement>("[data-action]")].find(el => el.dataset.action === overviewTriggerAction)?.focus({ preventScroll: true });
     },
   });
-  const deferredDestinations = new Set(["notifications", "agent-accounts", "add-credential", "tools", "assignments", "default-folder", "devices", "security", "add-workspace", "folders"]);
+  const deferredDestinations = new Set(["repository-credentials", "notifications", "agent-accounts", "add-credential", "tools", "assignments", "default-folder", "devices", "security", "add-workspace", "folders"]);
   // Local chrome composition seam: label is trusted product HTML and attrs are
   // developer-owned markup with escaped interpolations, never raw user input.
   const button = (action: string, label: string, cls = "", attrs = "") => {
@@ -121,7 +130,7 @@ export function mountMobileHub(root: HTMLElement, backend: MobileHubBackend, cal
   /** Facts update only their existing status text. Never remount an overview,
    * steal focus, or recreate a task draft when a subordinate read completes. */
   function updateCredentialStatus(c: PublicCredentialDto) {
-    const row = [...page.querySelectorAll<HTMLElement>("[data-credential-id]")].find(el => el.dataset.credentialId === c.id);
+    const row = [...flowRoot.querySelectorAll<HTMLElement>("[data-credential-id]")].find(el => el.dataset.credentialId === c.id);
     const value = row?.querySelector<HTMLElement>(".mh-value");
     if (!value) return;
     value.textContent = credentialStatus(c);
@@ -144,16 +153,24 @@ export function mountMobileHub(root: HTMLElement, backend: MobileHubBackend, cal
   function dock() {
     return `<nav class="mh-dock" aria-label="Hub navigation">${target ? button("return", `<small>Return to</small><strong>${esc(target.displayName)}</strong>`, "mh-return", `title="${esc(target.path)}" aria-label="Return to ${esc(target.displayName)}, ${esc(target.path)}" ${targetUnavailable || target.runtime.status !== "running" ? "disabled" : ""}`) : ""}${(["hub", "settings"] as const).map(item => button(item, `${icon(item)}<span>${item === "hub" ? "Hub" : "Settings"}</span>`, `mh-tab ${route === item ? "mh-selected" : ""}`, route === item ? 'aria-current="page"' : "")).join("")}</nav>`;
   }
-  function workspaceRow(w: WorkspaceView) {
+  /** Running cards show only the green runtime fact (reference `01-hub.png`);
+   * the branch stays on stopped cards, on multi-checkout rows where it tells
+   * checkouts apart, and verbatim on the Information page. */
+  let pathLabels = new Map<string, string>();
+  function workspaceRow(w: WorkspaceView, family = false) {
     const running = w.runtime.status === "running";
-    return `<article class="mh-workspace" data-workspace="${esc(w.id)}"><span class="mh-folder">${icon("folder")}</span><div class="mh-workspace-copy"><h3>${esc(w.displayName)}</h3><p>${esc(w.path)}</p></div>${button(`info:${w.id}`, icon("more"), "mh-more", `aria-label="Information and actions for ${esc(w.displayName)}, ${esc(w.path)}"`)}<div class="mh-status ${running && !w.availability ? "mh-running" : ""}">${w.availability ? esc(`Checkout ${w.availability}`) : `${running ? '<span class="mh-runtime"><span aria-hidden="true">●</span> Running</span> ' : ""}<span class="mh-branch">${icon("branch")}<span>${esc(branchLabel(w.branch))}</span></span>`}</div>${button(`${running ? "open" : "start"}:${w.id}`, running ? "Open" : "Start", "mh-primary", w.availability ? 'disabled aria-description="Checkout unavailable; inspect Information and actions"' : "")}</article>`;
+    const shownPath = pathLabels.get(w.id) ?? w.path;
+    const runtime = running ? '<span class="mh-runtime mh-running"><span aria-hidden="true">●</span> Running</span>' : "";
+    const branch = !running || family ? `<span class="mh-branch">${icon("branch")}<span>${esc(branchSummary(w.branch))}</span></span>` : "";
+    return `<article class="mh-workspace" data-workspace="${esc(w.id)}"><span class="mh-folder">${icon("folder")}</span><div class="mh-workspace-copy"><h3>${esc(w.displayName)}</h3><p title="${esc(w.path)}">${esc(shownPath)}</p></div>${button(`info:${w.id}`, icon("more"), "mh-more", `aria-label="Information and actions for ${esc(w.displayName)}, ${esc(w.path)}"`)}<div class="mh-status">${w.availability ? esc(`Checkout ${w.availability}`) : [runtime, branch].filter(Boolean).join(" ")}</div>${button(`${running ? "open" : "start"}:${w.id}`, running ? "Open" : "Start", "mh-primary", w.availability ? 'disabled aria-description="Checkout unavailable; inspect Information and actions"' : "")}</article>`;
   }
   function workspaceGroup(group: MobileWorkspaceGroup) {
     if (group.checkouts.length === 1) return workspaceRow(group.checkouts[0]!);
-    return `<details class="mh-workspace-family" data-family="${esc(group.id)}"${(disclosures.get(group.id) ?? group.running) ? " open" : ""}><summary>${icon("folder")}<span><strong>${esc(group.main.displayName)}</strong><small>${group.checkouts.length} checkouts · ${group.checkouts.filter(w => w.runtime.status === "running").length} running</small></span>${icon("chevron")}</summary><div class="mh-checkouts">${group.checkouts.map(workspaceRow).join("")}</div></details>`;
+    return `<details class="mh-workspace-family" data-family="${esc(group.id)}"${(disclosures.get(group.id) ?? group.running) ? " open" : ""}><summary>${icon("folder")}<span><strong>${esc(group.main.displayName)}</strong><small>${group.checkouts.length} checkouts · ${group.checkouts.filter(w => w.runtime.status === "running").length} running</small></span>${icon("chevron")}</summary><div class="mh-checkouts">${group.checkouts.map(w => workspaceRow(w, true)).join("")}</div></details>`;
   }
   function dashboard() {
     const rows = workspaces.status === "ready" ? workspaces.value : [];
+    pathLabels = new Map(compactPaths(rows.map(w => w.path)).map((label, index) => [rows[index]!.id, label]));
     const running = rows.filter(w => w.runtime.status === "running");
     const groups = mobileWorkspaceGroups(rows);
     const active = groups.filter(group => group.running), stopped = groups.filter(group => !group.running);
@@ -161,7 +178,7 @@ export function mountMobileHub(root: HTMLElement, backend: MobileHubBackend, cal
     return `<h1>Workspaces</h1><p class="mh-subtitle">${identity ? esc(identity.host) : ""}${workspaces.status === "ready" ? ` · ${running.length} session${running.length === 1 ? "" : "s"} running` : ""}</p>${target && (targetUnavailable || target.runtime.status === "stopped") ? note(`${target.displayName} ${targetUnavailable ? "is unavailable. Refresh to check its status." : "has stopped. Use Start below to open it again."}`) : ""}${workspaces.status === "loading" ? note("Loading workspaces…") : workspaces.status === "unavailable" ? `<div role="alert">${note(workspaces.problem.message)}${button("refresh", "Retry", "mh-text-action")}</div>` : `${active.length ? section("Running", active.map(workspaceGroup).join(""), running.length) : ""}${stopped.length ? section("Ready to start", stopped.map(workspaceGroup).join(""), stopped.reduce((count, group) => count + group.checkouts.length, 0)) : ""}${collection}`}${button("add-workspace", `${icon("plus")}<span>Add Workspace<small>Existing folder, new project, or clone</small></span>`, "mh-add")}`;
   }
   function credentialCatalog() {
-    if (credentials.status === "ready" && !credentials.value.length) return emptyState("key", "No credentials", "Add a credential to set up Git authentication or commit signing on this Hub.");
+    if (credentials.status === "ready" && !credentials.value.length) return `<p class="mh-note mh-empty-row">No credentials yet. Add one for Git authentication or commit signing.</p>`;
     return credentials.status === "ready" ? credentials.value.map(c => {
       const type = c.type === "ssh" ? "SSH key" : c.type === "openpgp" ? "OpenPGP key" : "HTTPS / provider token";
       return destination(`credential:${c.id}`, c.name, "key", `${type}${c.enabled ? "" : " · Disabled"}`, credentialStatus(c), "green", c.id);
@@ -170,7 +187,7 @@ export function mountMobileHub(root: HTMLElement, backend: MobileHubBackend, cal
   async function retryCredentials() {
     const captured = ++credentialReadGeneration, lifecycle = generation, reads = readGeneration;
     const current = () => !disposed && root.isConnected && captured === credentialReadGeneration && lifecycle === generation && reads === readGeneration;
-    const update = () => { const region = page.querySelector("[data-credential-catalog]"); if (region) { const top = page.scrollTop; region.innerHTML = credentialCatalog(); page.scrollTop = top; } };
+    const update = updateCredentialCatalog;
     credentials = { status: "loading" }; update();
     try {
       const result = await backend.readCredentials();
@@ -182,14 +199,27 @@ export function mountMobileHub(root: HTMLElement, backend: MobileHubBackend, cal
     if (credentials.status === "ready") for (const c of credentials.value) { credentialFacts.set(c.id, { status: "loading" }); void loadCredentialFacts(c, current); }
     update();
   }
+  function updateCredentialCatalog() {
+    const region = flowRoot.querySelector("[data-credential-catalog]");
+    if (region) {
+      const pane = flowRoot.querySelector<HTMLElement>(".mh-flow-content")!;
+      const top = pane.scrollTop;
+      const focused = region.contains(root.ownerDocument.activeElement) ? (root.ownerDocument.activeElement as HTMLElement).dataset.action : undefined;
+      region.innerHTML = credentialCatalog();
+      pane.scrollTop = top;
+      if (focused) [...region.querySelectorAll<HTMLElement>("[data-action]")].find(el => el.dataset.action === focused)?.focus({ preventScroll: true });
+    }
+    const count = page.querySelector<HTMLElement>('[data-action="repository-credentials"] .mh-value');
+    if (count) count.textContent = credentials.status === "ready" ? String(credentials.value.length) : "";
+  }
   function settings() {
     const prefs = getNavigationPreferences();
     const folderValue = defaultFolder.status === "ready" ? defaultFolder.value.effective.split("/").filter(Boolean).at(-1) || "/" : defaultFolder.status === "loading" ? "Loading…" : "Unavailable";
     const folderNotice = defaultFolder.status === "ready" && defaultFolder.value.configured && !defaultFolder.value.configuredAvailable ? "Saved folder unavailable; using fallback" : "";
-    const catalog = credentialSafetyNotice(identity?.user ?? "") + `<div data-credential-catalog>${credentialCatalog()}</div>`;
+    const catalog = destination("repository-credentials", "Repository credentials", "key", "Repository access and signing", credentials.status === "ready" ? String(credentials.value.length) : "");
     const accounts = section("Agent accounts", destination("agent-accounts", "Agent accounts", "device", "OpenCode and Claude Code · Shared by all Hub users"));
     return `<h1>Settings</h1>${identity ? button("identity", `<img src="${esc(brandLogoUrl)}" alt=""/><span><strong>${esc(identity.user)}</strong><small>${esc(identity.host)}</small><small class="mh-running">${authenticationProblem ? "Connection unconfirmed" : "● Connected"}</small></span>`, "mh-identity") : ""}`
-      + section("Credentials", `${catalog}${button("add-credential", "Add Credential", "mh-text-action")}` + destination("tools", "Credential Tools", "key") + destination("assignments", "Manage workspace credentials", "folder", "Authentication hosts and commit signing")) + note("Repository access and signing. Stored only on this hub.") + accounts
+      + section("Credentials", catalog) + accounts
       + section("Workspaces", destination("default-folder", "Default Folder", "folder", folderNotice, folderValue, "blue"))
       + section("Navigation", destination("auto-hide", "Navigation Auto-hide", "hub", "", prefs.autoHide ? "After 7 seconds" : "Until I close it") + destination("handle", "Navigation Handle", "hub", "Side and vertical placement") + destination("preview-side", "Preview File Controls", "preview", "Placement on this device", prefs.previewSide === "left" ? "Left" : "Right"))
       + section("Notifications", destination("notifications", "Notifications", "device", "This device and Hub login"))
@@ -459,12 +489,15 @@ export function mountMobileHub(root: HTMLElement, backend: MobileHubBackend, cal
             credentialFacts.set(c.id, { status: "loading" });
             void loadCredentialFacts(c, current);
           }
+          updateCredentialCatalog();
         }),
         load(() => backend.readDefaultFolder(), value => { defaultFolder = value; }),
       ]);
     } catch { if (current()) { authenticationProblem = "Could not connect to this hub."; workspaces = { status: "unavailable", problem: { kind: "unavailable", message: authenticationProblem } }; if (!identity) { if (flows.detail) requestedDetail = flows.detail; closeSheet(false); flows.leave(); loginError = authenticationProblem; } render(); } }
   }
-  function show(next: MobileHubRoute, detail?: MobileHubDetail) { scroll[route] = page.scrollTop; closeSheet(false); flows.leave(); route = next; requestedDetail = identity ? undefined : detail; if (detail && identity) flows.show(detail); render(); page.scrollTop = scroll[route]; }
+  // Parent is safe navigation context supplied by a restored history entry,
+  // not inferred from a previous visit or the child's URL on direct entry.
+  function show(next: MobileHubRoute, detail?: MobileHubDetail, parent?: "repository-credentials") { scroll[route] = page.scrollTop; closeSheet(false); flows.leave(); route = next; requestedDetail = identity ? undefined : detail; if (detail && identity) flows.show(detail, false, parent); render(); page.scrollTop = scroll[route]; }
   /** Call before foregrounding a workspace through history/direct dispatch.
    * Clears secret task inputs, not accepted operations or clone subscriptions. */
   function suspend() { closeSheet(false); flows.leave(); }
