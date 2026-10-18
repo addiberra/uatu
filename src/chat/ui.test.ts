@@ -69,7 +69,8 @@ describe("chat reversible-history composer", () => {
       expect(feedback.hidden).toBe(false);
       expect(feedback.textContent).toContain("could not be confirmed");
       submit("Another steer");
-      await waitUntil(() => prompts === 2 && feedback.textContent!.includes("background request acknowledged"));
+      await waitUntil(() => prompts === 2 && document.querySelector("#chat-queue")!.textContent!.includes("Another steer"));
+      expect(feedback.textContent).not.toContain("acknowledged");
       parent!.event({ type: "conversation.status", generation: "g", sequence: 1, conversationId: "one", status: "completed" }, "cursor-one-1");
       await waitUntil(() => document.querySelector<HTMLButtonElement>("#chat-stop")!.disabled);
       expect(feedback.textContent).toContain("could not be confirmed");
@@ -2267,7 +2268,7 @@ describe("a typed command's silent run", () => {
 });
 
 describe("chat running work reachable without a disclosure", () => {
-  test("Continue requires a running blocker, not a pending tool, detached worker, or merely active parent", async () => {
+  test("pending/running tools, detached workers and an idle parent never introduce a manual Continue control", async () => {
     const { document, window } = parseHTML(html);
     installDomGlobals(document, window);
     document.documentElement.setAttribute("data-ui-mode", "desktop");
@@ -2280,24 +2281,26 @@ describe("chat running work reachable without a disclosure", () => {
     api.snapshot = async id => ({ ...snapshot(id), conversation: { ...conversation(id), status: "running" }, items: [tool as import("./types").ToolItem] });
     let sequence = 0;
     const emit = (body: Record<string, unknown>) => { sequence++; stream!.event({ generation: "g", sequence, conversationId: "one", ...body }, `cursor-one-${sequence}`); };
-    const action = document.querySelector<HTMLButtonElement>("#chat-continue-workers")!;
+    const absent = () => expect(document.querySelector("#chat-continue-workers, .chat-background-help")).toBeNull();
     try {
       const { initChat } = await import(`./ui.ts?blocker-gating=${Date.now()}`);
       initChat(api);
       await waitUntil(() => stream !== undefined, () => "waiting for parent stream");
-      expect(action.hidden).toBe(true);
+      absent();
       emit({ type: "item.upsert", item: { ...tool, status: "running" } });
-      await waitUntil(() => !action.hidden, () => "running foreground tool should offer Continue");
+      absent();
       emit({ type: "item.upsert", item: { id: "task:detached", type: "background_task", taskId: "detached", createdAt: 2, description: "Detached", taskType: "agent", status: "running", toolUseId: "blocker", childConversationId: "child" } });
-      await waitUntil(() => action.hidden === true, () => "detached worker is not blocking even before its launcher restatement");
+      await waitUntil(() => document.querySelectorAll("#chat-background-tasks-items [data-inspect-task]").length === 1);
+      absent();
       emit({ type: "item.upsert", item: { id: "task:detached", type: "background_task", taskId: "detached", createdAt: 2, description: "Detached", taskType: "agent", status: "completed", foreground: true, toolUseId: "blocker", childConversationId: "child" } });
       await waitUntil(() => document.querySelector<HTMLElement>("#chat-background-tasks")!.hidden === true, () => "settled task should leave the background list");
-      expect(action.hidden).toBe(true);
+      absent();
       emit({ type: "item.upsert", item: { ...tool, status: "completed" } });
       emit({ type: "item.upsert", item: { id: "tool:shell", type: "command", createdAt: 3, command: "fixture", status: "running" } });
-      await waitUntil(() => !action.hidden, () => "running shell should offer Continue");
+      absent();
       emit({ type: "conversation.status", status: "completed" });
-      await waitUntil(() => action.hidden === true, () => "idle parent must not offer Continue on a stale tool");
+      await waitUntil(() => document.querySelector<HTMLButtonElement>("#chat-stop")!.disabled);
+      absent();
     } finally {
       window.dispatchEvent(new Event("pagehide"));
     }

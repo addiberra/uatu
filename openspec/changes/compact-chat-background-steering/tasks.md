@@ -1,4 +1,80 @@
-## Current explicit refinement: unified dense worker overview
+## Independent-review side-reader link correction (2026-10-18)
+
+- [x] 14.1 Reproduce the reported README link reload in both engines at the real reader click seam; retain page identity, draft, originating conversation and exactly one native generate as meaningful outcomes.
+- [x] 14.2 Reuse normal chat decoration/resolution and pointer/Enter/Space interaction wiring; guard current reader/conversation, close the modal before normal preview navigation, preserve reopening/focus behavior and leave safe external/rejected-reference policy unchanged.
+- [x] 14.3 Verify desktop/touch Chromium/WebKit relative, encoded and qualified/line-number references, external-tab behavior, unsafe/forged/traversing references and Hub-prefix navigation; run final relevant browsers, clean units, API/type/build/strict-spec checks and inspect retained renders. Return evidence for lead re-review without publication or live-Hub/model activity.
+
+Correction evidence is retained in approved scratch `opencode/side-reader-links-20261018/`.
+`red.log` reproduces the actual app reload in both engines through changed document
+time origins; `green.log` passes afterward. `browser-acceptance.log` passes
+**121/121** affected Chromium/WebKit browser cases with no retries, including the
+four desktop/touch link cases and the Hub-prefixed case. They retain the original
+document, conversation, draft and answer through pointer/Enter/Space file actions,
+reopening and an intercepted external-tab action; exactly one native generate
+occurs, with no extra prompt/interrupt/background call. Closed-reader retained
+markup cannot trigger a file action. Unsafe/forged attributes and rejected paths
+are not promoted; normal shared URL/resolution policy is unchanged.
+
+`ci-acceptance.log` passes **5,277 / 17 skip / 0 fail**; `api-acceptance.log` passes
+**208 / 0 fail**. Typecheck, build, API/schema and all **60** strict spec/change
+items pass, and final product hashes match. One preceding unchanged watcher
+timeout passed **22/22** in isolation and in final full CI; its intermittent
+cause remains unestablished. Earlier new-test fixture mistakes (hidden touch-tab
+and hidden-role lookup) were corrected without increasing timeouts or weakening
+outcome checks. Actual desktop/mobile reader and qualified-file preview renders
+were inspected. This closes the implementation response to the independent MED
+finding; independent re-review remains lead-owned. The prior broad-suite baseline
+bottom-pin limitation remains documented and was neither altered nor claimed fixed.
+
+## Current screenshot UX refinement (2026-10-18)
+
+- [x] 13.1 Reproduce silent-success/worker-row/side-notice regressions at existing seams; remove successful send/dock/automatic-background confirmations while retaining operation-scoped failure/unknown guidance and unchanged API outcomes.
+- [x] 13.2 Remove all manual Continue/help chat UI without replacement menus; keep backend contracts, authenticated automatic policy and explicit question answering unchanged; migrate manual-background UI tests to their existing HTTP API seam while retaining native call/receipt/lifecycle assertions.
+- [x] 13.3 Use two-line active worker title/reported-agent/model/cumulative usage and short Stop with semantic worker names, 44px targets and 8px gaps; retain dense settled rows, canonical counts/dismissal and bottom in-flow dock across keyboard/viewport changes.
+- [x] 13.4 Finish mobile safe-Markdown side-reader, large-table/URL/XSS, visual-viewport/pan/safe-inset, selection/reading-anchor and stale-conversation regressions; inspect actual Chromium/WebKit screenshots against supplied symptoms. The original attachment files were not mounted in this worker; direct comparison to those originals remains part of lead review, not a claimed pixel comparison here.
+- [x] 13.5 Complete clean CI, relevant browser suites, API/type/build/strict-spec checks and final documentation/artifact parity; record exact evidence, failures and limitations. Independent review/publication/deployment remain lead-owned. Browser acceptance retains the separately reproduced baseline failure below; this is not an all-green browser claim.
+
+Final evidence is retained in approved scratch `opencode/screenshot-ux-20261018/`.
+`ci-closed.log` passes **5,277 / 17 skip / 0 fail** and `api-closed.log` passes
+**208 / 0 fail**. Typecheck, fresh build, API/schema validation and all **60**
+strict spec/change items pass in their `*-closed.log` files. Product hashes in
+`product-acceptance.sha256` were verified after the checks. The earlier disposable
+compiled Hub/child smoke passes; existing build/OpenAPI warnings remain.
+
+The final nine-file Chromium/WebKit browser run (`browser-closed.log`) reports
+**327 pass / 1 fail**, including all revised reader, worker, question, steering,
+hold, safe-area/keyboard/landscape/short-desktop and trusted/degraded receipt
+cases. Its only failure is the existing WebKit bottom-pin assertion ending
+24px short. An untouched archive of **3d28b86**, using its original test and
+source with existing dependencies and isolated ports, reproduces the identical
+failure **6/20** times (`baseline-anchor.log`). Shared scroll-owner code and the
+meaningful anchor assertion remain unchanged; no blanket clean-browser claim
+or heuristic scroll override is introduced. The underlying native/layout cause
+is not established and remains a separate lead decision, alongside the earlier
+wider-suite baseline issues recorded below.
+
+Final side-reader fixes were red-capable in both engines: safe-inset bounds
+(`reader-safe-red.log`, then six passing reader checks) and a ready button active
+during a delayed selection snapshot (`reader-loading-red.log`, then **12/12**
+repeated mobile/stale-conversation checks). The original form question remains
+pending with active or settled workers, without automatic reply/cancel requests.
+Pinned native v2.0.29 evidence and hashes are in `native-evidence.md`; no model
+was called. Actual final phone/pan/landscape, question/no-worker, small-notice,
+two-line/dense-row and enlarged-safety renders were visually inspected.
+
+Intermediate failures remain in the diagnostic logs: obsolete success waits,
+the real safe-area reading-budget gap, reader Escape/focus/inset/loading fixes,
+one unchanged PTY cleanup timeout and one fixture port collision. No timeout,
+40% standard reading threshold or meaningful warning/anchor assertion was
+weakened. Temporary scroll instrumentation was removed after baseline comparison.
+Physical-device, assistive-technology and paid/live-model checks remain
+unperformed. No user Hub, configuration, dependency, commit or deployment was
+changed. Additional redundancy candidates were recorded, not removed.
+
+Earlier sections below are historical completed-work/evidence ledgers, not a
+request to restore their superseded Continue/success notices or touch overlay.
+
+## Previous explicit refinement: unified dense worker overview
 
 - [x] Replace nested Finished/history/footer with one compact chevron header, right-aligned Dismiss finished and one keyed active-first list; retain canonical counts, model/Σ usage, persisted hiding and timeline inspection.
 - [x] Verify 28px settled rows, independent 44px Stop controls, one scroller and content-sized short/empty cards across phone/keyboard/landscape/short-desktop matrices, with screenshot comparison.

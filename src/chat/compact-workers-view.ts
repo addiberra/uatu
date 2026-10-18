@@ -55,12 +55,13 @@ export class CompactWorkersView {
       inspect.dataset.workerItem = worker.id;
       if (worker.taskId) inspect.dataset.inspectTask = worker.taskId;
       inspect.title = worker.name;
-      inspect.setAttribute("aria-label", [worker.name, workerStateLabel(worker.state), worker.model, worker.tokens === undefined ? undefined : `${worker.tokens.toLocaleString()} cumulative tokens`].filter(Boolean).join(" · "));
+      inspect.setAttribute("aria-label", [worker.name, worker.agent, workerStateLabel(worker.state), worker.model, worker.tokens === undefined ? undefined : `${worker.tokens.toLocaleString()} cumulative tokens`].filter(Boolean).join(" · "));
       // The handler looks up the current row model, not a stale closure.
       inspect.querySelector(".chat-worker-glyph")!.textContent = glyphs[worker.state];
       inspect.querySelector(".chat-worker-name")!.textContent = worker.name;
       const meta = inspect.querySelector<HTMLElement>(".chat-worker-meta")!;
-      meta.textContent = [worker.kind === "shell" ? "Shell worker" : "Agent", workerStateLabel(worker.state)].join(" · ");
+      meta.textContent = worker.kind === "shell" ? "Shell" : worker.agent ?? "Agent";
+      meta.title = [meta.textContent, workerStateLabel(worker.state), worker.progress].filter(Boolean).join(" · ");
       if (worker.since) {
         const time = document.createElement("span");
         if (workerIsActive(worker.state)) {
@@ -70,9 +71,8 @@ export class CompactWorkersView {
           const clock = new Date(worker.settledAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
           time.textContent = worker.settledAt === worker.since ? `Started ${clock}` : clock;
         }
-        meta.append(" · ", time);
+        if (!workerIsActive(worker.state)) meta.append(" · ", time);
       }
-      if (worker.progress) meta.append(` · ${worker.progress}`);
       const model = inspect.querySelector<HTMLElement>(".chat-worker-model")!;
       model.textContent = worker.model ?? "—";
       model.title = worker.model ?? "Model not reported";
@@ -90,7 +90,7 @@ export class CompactWorkersView {
         }
         stop.dataset.stopTask = worker.taskId;
         stop.dataset.stopItem = worker.id;
-        stop.textContent = stopping.has(worker.taskId) ? "Stopping…" : "Stop worker";
+        stop.textContent = stopping.has(worker.taskId) ? "Stopping…" : "Stop";
         stop.disabled = worker.state === "unknown" || stopping.has(worker.taskId);
         stop.setAttribute("aria-label", `Stop worker: ${worker.name}`);
         stop.title = worker.state === "unknown" ? "Status unknown — refresh before stopping" : `Stop worker: ${worker.name}`;

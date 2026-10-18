@@ -816,6 +816,14 @@ makes one model-generation call without executing its advertised tool executor;
 installed plugin hooks still run. No prompt, history write, parent interrupt or
 background call is substituted. Answers and failed questions remain bounded
 page-local state, opened deliberately without completion-time focus theft.
+The transcript-edge side notice is separate from composer feedback. Its bounded
+visual-viewport reader uses `renderChatMarkdown` and the normal sanitizer, with
+local horizontal table/code scrolling and native modal focus/Escape behavior.
+Side answers also use normal chat's `decorateFileLinks` and shared item-interaction
+wiring, with a current-reader/conversation guard. The file action resolves against
+current watched roots, closes the reader before normal preview navigation and
+does not return focus over that preview. No separate URL resolver or root-relative
+navigation is introduced; external-link sanitization and behavior remain shared.
 Concurrent side requests are guarded per conversation; failures preserve newer
 drafts exactly, and reconnect never replays inference. V1/Claude and pending
 attachments are refused rather than falling through to ordinary admission.
@@ -854,11 +862,11 @@ notice. A bounded silent timeout resolves through inbox/history evidence.
 The dock has sticky delivery counts, leading delivery/Paused badges, plain
 timing labels, and an overflow-only bottom fade within a roughly 40%-height
 scroll budget. Dock targets are 2.25rem desktop / 2.75rem touch; accessible
-action names quote the message, with polite success feedback and focus rings.
+action names quote the message, with silent success and visible focus rings.
 Duplicate text and image-only entries gain client-local `pending message N`
 discriminators retained while pending across reorder, switches and sibling
-removal. Explicit mutation success writes one live update per event, including
-repeated identical words; ordinary paints continue to deduplicate the note.
+removal. Errors and unknown results remain readable; successful send/dock and
+automatic-background receipts do not create confirmation notices.
 Desktop Enter uses the device preference (`delivery-preference.ts`, initially steer),
 Alt+Enter the other; selection and submission remain separate. Undo replacements
 steer, with a count-only warning explaining older paused steers deliver together.
@@ -901,19 +909,23 @@ What each agent's SDK declares that the timeline does not handle is recorded, no
 ### OpenCode generations
 
 **V2 native background work.** The provider declares `background-tasks` and
-`background-blocking-work`; unsupported V1/Claude views do not gain Continue.
-Continue requires an active parent plus running tool/command or confirmed
-foreground-task evidence. Pending tools and known detached/settled/uncertain worker
-launchers do not qualify; the provider still decides exact eligibility.
-Its tooltip/collapsed explanation names all eligible jobs, including shells.
-Feedback clears after parent/workers settle, with no request in flight.
+`background-blocking-work`. The manual background API remains, but chat has no
+Continue button or disclosure. Only the existing authenticated Hub policy can
+automatically follow an accepted steer with backgrounding; standalone gets no
+replacement UI. Native `question` awaits `Form.ask`, not `Job.block`, and is not
+detachable by `Job.backgroundAll`. Unanswered foreground questions keep their
+execution waiting while detached children can continue; child questions retain
+their existing parent mirroring. No automatic form cancellation is introduced.
 Shell removal and queued batch-wake confirmation use an in-app dialog, with
 Cancel focused and layered Escape. Shell targets are revalidated on acceptance.
 If settlement removes the invoker while confirmation is open, focus returns to
 the surviving inspection action before falling back to the composer. Pointer
 invokers are captured explicitly because WebKit need not focus clicked buttons.
-Touch preserves composing focus through Continue activation as well as worker
-actions. On desktop, detachment collapses only an automatically expanded duplicate
+Touch preserves composing focus through worker actions. Its disclosure remains
+in the bottom in-flow dock across keyboard/viewport changes, never implicitly
+promoted to a top overlay. Active rows use two lines for title and reported
+agent/model/cumulative usage; Stop stays 44px with 8px separation. Settled rows
+remain dense. On desktop, detachment collapses only an automatically expanded duplicate
 subagent track; a deliberate user reopening remains open. Desktop expansion
 provenance travels with the retained DOM open state across conversation switches;
 changing the selection is not treated as a deliberate opening. Touch instead

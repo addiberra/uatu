@@ -1,3 +1,61 @@
+## Current screenshot refinement (2026-10-18)
+
+This refinement supersedes earlier manual-Continue, successful-feedback,
+single-line-active-row and constrained touch-sheet presentation decisions below.
+It changes only UI presentation and its regressions, not Hub settings, policy,
+provider admission/backgrounding APIs, question handling or hold delivery.
+
+- Successful send/dock/automatic-background results create no confirmation
+  notices. Failed, unavailable and unknown receipts remain operation-scoped;
+  later unrelated success cannot resolve an earlier uncertainty.
+- Continue and What continues are removed in desktop, touch and standalone,
+  without a replacement menu. Manual backgrounding remains an existing API.
+  Standalone has no automatic personal Hub policy.
+- Active worker rows put the title on line one and actual reported agent,
+  model and cumulative tokens on line two. Stop is visibly short, semantically
+  worker-specific, and retains its 44px target/8px gap. Settled rows, canonical
+  counts and view-only dismissal retain their existing density and behavior.
+- The constrained touch CSS previously promoted any open worker disclosure
+  to an absolute top overlay during keyboard/short-viewport changes. The dock
+  now stays in normal bottom order, with its existing shared scroller and
+  measured reading budget. Desktop's explicit Show work fallback is unchanged.
+- `/btw` uses a small transcript-edge progress/ready/error notice rather than
+  a composer block. Its native modal reader uses `renderChatMarkdown` and the
+  normal sanitizer, with selectable text, local wide-table/code scrolling and
+  actual visual-viewport bounds independent of the question-answering surface's
+  larger layout height, including top/bottom safe insets. Completion preserves drafts/selection/reading position;
+  stale responses stay with their originating conversation and stale readers close.
+  The reader's header owns Close so initial focus does not reveal the answer's
+  end. Modal Escape takes precedence over the expanded-worker handler.
+  Workspace references reuse normal chat's decoration, resolver and pointer/
+  Enter/Space interaction wiring. A reader/conversation guard owns activation;
+  its optional pre-navigation hook closes the modal before the normal appUrl-
+  aware preview action. File navigation does not restore focus over Preview,
+  and reopening the retained answer restores normal Escape/invoker behavior.
+  External and rejected-reference policy stays with the existing shared code.
+
+The in-flow correction also counts surface safe-area padding and all measured
+chrome before allocating the dock budget; short landscape uses the 40% phone
+reading floor rather than the tablet ratio. Short expanded worker headers scroll
+away within that dock so a complete 44px Stop remains exposable without an overlay.
+The existing enlarged replacement-warning exception is preserved: its warning
+and batch controls may take space from the reading floor instead of being clipped.
+Standard-size phone/short-landscape layouts retain 40%, and ordinary enlarged
+pending work retains its tested reading floor; no universal enlarged-text 40%
+guarantee is claimed.
+
+Pinned native evidence: [question tool](https://github.com/anomalyco/opencode/blob/v2.0.29/packages/core/src/tool/plugin/question.ts)
+awaits `Form.ask` and does not register a backgroundable Job.
+[Job.backgroundAll](https://github.com/anomalyco/opencode/blob/v2.0.29/packages/core/src/job.ts)
+releases registered blocking-job waits, not unanswered question forms. A
+foreground question cannot make its own execution proceed unanswered; detached
+children can still work. Existing adapter parent mirroring/reply routing for
+child questions remains unchanged. [SessionGenerate](https://github.com/anomalyco/opencode/blob/v2.0.29/packages/core/src/session/generate.ts)
+previews context and calls generation without invoking an agent tool executor
+or foreground runner; `/btw` therefore supports a separate contextual answer,
+not a second orchestrated task or an automatic answer/cancellation of a form.
+No live model/runtime invocation or broader orchestration change is authorized.
+
 ## Context
 
 See proposal.md, “Why”. This is a planning-only successor to the two active OpenCode changes, not a new implementation baseline. Discovery used HEAD `cb3079764601dd55366c4cddea87f7d49b68f7b2` (five commits after `32e6d73`) plus 26 pre-existing modified/untracked files. Their SHA-256 baseline was verified before planning; no existing file is part of this proposal's writes.

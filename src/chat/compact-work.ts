@@ -33,6 +33,7 @@ export type CompactWorker = {
   references: string[];
   name: string;
   kind: "agent" | "shell";
+  agent?: string;
   since: number;
   settledAt: number;
   progress?: string;
@@ -53,7 +54,7 @@ export function compactWorkers(items: readonly ConversationItem[]): CompactWorke
     if (item.foreground && shellTask(item.taskType)) continue;
      workers.set(item.id, {
        id: item.id, state: workerState(item.status, item.stateUncertain), references: [],
-       name: item.description, kind: shellTask(item.taskType) ? "shell" : "agent",
+       name: item.description, kind: shellTask(item.taskType) ? "shell" : "agent", agent: item.subagentType,
        since: item.createdAt, settledAt: item.createdAt + (item.usage?.durationMs ?? 0),
         progress: item.progress, taskId: item.taskId, stoppable: !item.foreground && taskById(items, item.taskId)?.id === item.id, conversationId: item.childConversationId,
         tokens: item.usage?.totalTokens,
@@ -71,6 +72,7 @@ export function compactWorkers(items: readonly ConversationItem[]): CompactWorke
       if (worker) {
         worker.references.push(entry.id);
         worker.model ??= entry.model;
+        worker.agent ??= entry.subagent;
         // One occurrence's reported spend, not a sum of launcher aliases.
         worker.tokens ??= entry.usage ? totalTokens(entry.usage) : undefined;
       }
@@ -78,7 +80,7 @@ export function compactWorkers(items: readonly ConversationItem[]): CompactWorke
     }
     workers.set(entry.id, {
       id: entry.id, state: workerState(entry.status), references: [entry.id],
-      name: entry.description, kind: "agent", since: item?.createdAt ?? 0,
+      name: entry.description, kind: "agent", agent: entry.subagent, since: item?.createdAt ?? 0,
       settledAt: item?.createdAt ?? 0, progress: entry.progress, conversationId: entry.conversationId,
       model: entry.model, tokens: entry.usage ? totalTokens(entry.usage) : undefined,
     });

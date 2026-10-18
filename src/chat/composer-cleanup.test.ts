@@ -8,6 +8,7 @@ test("composer has one real picker, no Options or delivery menus, and described 
   expect(html.match(/id="chat-configuration-trigger"/g)).toHaveLength(1);
   expect(html).toContain('aria-describedby="chat-send-help"');
   expect(html).toContain('id="chat-send-help"');
-  expect(html).toContain('id="chat-continue-workers"');
+  expect(html).not.toContain('id="chat-continue-workers"');
+  expect(html).not.toContain("What continues?");
   expect(html).toContain('id="chat-plan-usage"');
 });

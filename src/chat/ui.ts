@@ -26,11 +26,11 @@ import { pausedStatusLabel, pausedWakeups, pendingWakeups, scheduledStatusLabel,
 import { RunningWorkDisclosure } from "./running-work-disclosure";
 import { CompactDisclosure, compactWorkers, workerSummary } from "./compact-work";
 import { CompactWorkersView } from "./compact-workers-view";
+import { renderChatMarkdown } from "./markdown";
 import { SilentRunFollower, TaskInspectionPanel, formatTaskElapsed, taskForChild, taskById, taskInspection, type OpenTaskInspection } from "./task-inspection";
 import { composerRoutineState, formatUsd, latestPlanReport, latestRateLimit, planChip, planHasRows, planName, planReadoutRows, sessionTotalsTitle, standingSentence, usageAsOf, usageStale, type RateLimitStanding } from "./composer-status";
 import { buildPlanRowNodes, currentUsageReport, initUsagePaneControls, noteUsageReport, onUsageChange, onUsageRead, readStatusText, readUsageNow, refreshUsageIfStale, revealUsagePane, usageReadState, usageReadable } from "./usage-pane";
 import { isLiveConversationStatus } from "./types";
-import { hasVerifiedBlockingWork } from "./blocking-work";
 import { AutomaticBackgroundNotices } from "./automatic-background";
 import type { AutomaticBackgroundFeedback, BackgroundTaskItem } from "./types";
 import { contextReadout } from "./context-readout";
@@ -1071,7 +1071,7 @@ export function initChat(api = new ChatApiClient()): void {
   compactWorkersList?.querySelector("summary")?.addEventListener("mousedown", event => keepTouchComposerFocus(event));
   surface.addEventListener("keydown", event => {
     const root = document.documentElement;
-    if (event.key !== "Escape" || event.defaultPrevented || !compactWorkersList?.open || child
+    if (event.key !== "Escape" || event.defaultPrevented || !compactWorkersList?.open || child || surface.querySelector("dialog[open]")
       || root.dataset.uiMode !== "touch" || !root.matches("[data-chat-keyboard], [data-chat-short], [data-chat-wide-short]")) return;
     event.preventDefault();
     event.stopPropagation();
@@ -1135,11 +1135,6 @@ export function initChat(api = new ChatApiClient()): void {
   // Stops in flight, by task id: a rebuild mid-request must not hand back
   // an enabled button that would send the stop twice.
   const stoppingTasks = new Set<string>();
-  const backgrounding = new Set<string>();
-  const backgroundAction = document.querySelector<HTMLElement>("#chat-background-action");
-  const continueWorkers = document.querySelector<HTMLButtonElement>("#chat-continue-workers");
-  const backgroundFeedback = document.querySelector<HTMLElement>("#chat-background-feedback");
-  const backgroundNotes = new Map<string, string>();
   const automaticNotes = new AutomaticBackgroundNotices();
   const actionFeedback = document.querySelector<HTMLElement>("#chat-action-feedback");
   const recordAutomaticBackground = (conversationId: string, operationId: string, result: AutomaticBackgroundFeedback) => {
@@ -1170,28 +1165,6 @@ export function initChat(api = new ChatApiClient()): void {
       dialog.showModal();
     });
   };
-  const hasBlockingWork = () => {
-    return Boolean(projection && hasVerifiedBlockingWork(projection.status, projection.items));
-  };
-  continueWorkers?.addEventListener("click", async () => {
-    if (!projection || !declares("background-blocking-work") || !hasBlockingWork() || cancelling || backgrounding.has(projection.conversationId)) return;
-    const id = projection.conversationId;
-    backgrounding.add(id);
-    backgroundNotes.set(id, "Requesting background work…");
-    syncControls();
-    try {
-      await api.backgroundBlockingWork(id, newRequestId());
-      backgroundNotes.set(id, "Request accepted. If no eligible jobs remained, nothing changed.");
-    } catch (error) {
-      backgroundNotes.set(id, error instanceof ChatTransportError && error.status !== undefined && error.code !== "operation_outcome_unknown"
-        ? `Request failed: ${messageOf(error)}` : "Outcome unknown; refreshing. This action will not be replayed automatically.");
-    } finally {
-      await refreshSelectedConversation(id);
-      backgrounding.delete(id);
-      syncControls();
-    }
-  });
-  continueWorkers?.addEventListener("mousedown", event => keepTouchComposerFocus(event));
   const syncBackgroundTasks = () => {
     if (!backgroundTasks || !backgroundTasksLabel || !backgroundTasksItems) return;
     // The open drill-down's strip reads the same items; it keeps its own
@@ -1269,7 +1242,7 @@ export function initChat(api = new ChatApiClient()): void {
       stop.className = "chat-task-stop";
       stop.dataset.stopTask = entry.taskId;
       stop.dataset.stopItem = entry.id;
-      stop.textContent = stoppingTasks.has(entry.taskId) ? "Stopping…" : declares("background-blocking-work") ? "Stop worker" : "Stop";
+      stop.textContent = stoppingTasks.has(entry.taskId) ? "Stopping…" : "Stop";
       stop.disabled = stoppingTasks.has(entry.taskId) || entry.stateUncertain === true;
       stop.setAttribute("aria-label", declares("background-blocking-work") ? `Stop worker: ${entry.description}` : `Stop ${entry.description}`);
       if (entry.status === "running") row.append(stop);
@@ -2914,11 +2887,13 @@ export function initChat(api = new ChatApiClient()): void {
     // an empty draft sendable (image-only prompts are accepted end to end),
     // and an upload still in flight counts — submission waits for it.
     const activeId = activeConversationId();
+    const openAside = document.querySelector<HTMLDialogElement>("#chat-aside-dialog[open]");
+    if (openAside && openAside.dataset.conversation !== activeId) openAside.close();
     const asideButton = document.querySelector<HTMLButtonElement>("#chat-aside-ready");
     if (asideButton) {
       asideButton.hidden = !activeId || !sideAnswers.has(activeId) && !sideGenerating.has(activeId);
-      asideButton.disabled = Boolean(activeId && sideGenerating.has(activeId));
-      asideButton.textContent = activeId && sideGenerating.has(activeId) ? "Answering /btw…" : activeId && sideAnswers.get(activeId)?.failed ? "Side question failed" : "Side answer ready";
+      asideButton.disabled = !projection || Boolean(activeId && sideGenerating.has(activeId));
+      asideButton.textContent = activeId && sideGenerating.has(activeId) ? "Side answer…" : activeId && sideAnswers.get(activeId)?.failed ? "Side question failed" : "Side answer ready";
     }
     if (activeId && !running
       && !projection?.items.some(item => item.type === "background_task" && item.status === "running")) {
@@ -2934,18 +2909,6 @@ export function initChat(api = new ChatApiClient()): void {
       stop.setAttribute("aria-label", workers ? "Stop parent" : "Stop response");
       stop.textContent = workers ? "Stop parent" : "Stop";
       stop.title = workers ? "Stop the parent and still-blocking work. Detached workers continue; their later notifications can wake the parent again." : "Stop";
-    }
-    if (backgroundAction && continueWorkers) {
-      if (activeId && !running && !backgrounding.has(activeId)
-        && !projection?.items.some(item => item.type === "background_task" && item.status === "running")) {
-        backgroundNotes.delete(activeId);
-      }
-      const note = activeId ? backgroundNotes.get(activeId) ?? "" : "";
-      const blocking = hasBlockingWork();
-      backgroundAction.hidden = !declares("background-blocking-work") || !projection || !blocking && !note;
-      continueWorkers.hidden = !blocking;
-      continueWorkers.disabled = !blocking || cancelling || !activeId || backgrounding.has(activeId);
-      if (backgroundFeedback && backgroundFeedback.textContent !== note) backgroundFeedback.textContent = note;
     }
     if (actionFeedback) {
       const note = activeId ? automaticNotes.text(activeId) : "";
@@ -3786,7 +3749,7 @@ export function initChat(api = new ChatApiClient()): void {
       .then(result => {
         if (result && typeof result === "object") recordAutomaticBackground(conversationId, operationId, result as AutomaticBackgroundFeedback);
         if (activeConversationId() !== conversationId) return;
-        noteComposer(queueRemove !== undefined ? "Pending message removed" : queueEdit !== undefined ? "Pending message moved to composer" : queueQueue !== undefined ? "Message moved to queue" : queueSteer !== undefined ? "Message sent as steer" : entry?.delivery === "steer" ? `${pausedSteers} paused steers sent` : "Queued message sent now", true);
+        noteComposer(null);
       })
       .catch(error => queueActionFailed(error, conversationId, messageId, steerAction, operationId))
       .finally(() => { target.disabled = false; });
@@ -3939,7 +3902,7 @@ export function initChat(api = new ChatApiClient()): void {
    * the parent's against the parent — which is what keeps the parent
    * answerable while a child is open.
    */
-  const wireItemInteractions = (container: HTMLElement, sourceProjection: () => ChatProjection | null, stage: { renderer: TimelineRenderer; rerender: () => void }, scroll: CoordinatedScrollOwner) => {
+  const wireItemInteractions = (container: HTMLElement, sourceProjection: () => ChatProjection | null, stage: { renderer: TimelineRenderer; rerender: () => void; beforeFileNavigation?: () => void }, scroll: CoordinatedScrollOwner) => {
     // "Allow always" is confirmed one step deeper, on the same card, where
     // it shows the rule the agent will actually install. The stage is this
     // timeline's own (the drill-down keeps its own renderer), and nothing
@@ -3987,7 +3950,10 @@ export function initChat(api = new ChatApiClient()): void {
       }
       if (target.dataset.fileRef) {
         const reference = resolveWorkspaceFileReference(target.dataset.fileRef, appState.roots);
-        if (reference) void navigateWorkspaceFileReference(reference);
+        if (reference) {
+          stage.beforeFileNavigation?.();
+          void navigateWorkspaceFileReference(reference);
+        }
         return;
       }
       const itemElement = target.closest<HTMLElement>("[data-chat-item-id]");
@@ -4876,18 +4842,45 @@ export function initChat(api = new ChatApiClient()): void {
 
   const asideButton = document.querySelector<HTMLButtonElement>("#chat-aside-ready");
   const asideDialog = document.querySelector<HTMLDialogElement>("#chat-aside-dialog");
+  const asideContent = asideDialog?.querySelector<HTMLElement>("#chat-aside-answer");
+  if (asideContent) wireItemInteractions(asideContent,
+    () => asideDialog?.open && asideDialog.dataset.conversation === projection?.conversationId ? projection : null,
+    { renderer, rerender: () => scheduleRender(false), beforeFileNavigation: () => asideDialog?.close("file") }, parentScroll);
+  const syncAsideViewport = () => {
+    if (!asideDialog?.open) return;
+    const viewport = window.visualViewport;
+    asideDialog.style.setProperty("--chat-aside-top", `${(viewport?.offsetTop ?? 0) + 12}px`);
+    asideDialog.style.setProperty("--chat-aside-height", `${Math.max(0, (viewport?.height ?? window.innerHeight) - 24)}px`);
+    asideDialog.style.setProperty("--chat-aside-bottom", `${(viewport?.offsetTop ?? 0) + (viewport?.height ?? window.innerHeight) - 12}px`);
+  };
+  window.visualViewport?.addEventListener("resize", syncAsideViewport);
+  window.visualViewport?.addEventListener("scroll", syncAsideViewport);
+  window.addEventListener("resize", syncAsideViewport);
   asideButton?.addEventListener("mousedown", keepTouchComposerFocus);
   asideButton?.addEventListener("click", () => {
     const id = activeConversationId();
     const answer = id ? sideAnswers.get(id) : undefined;
-    if (!answer || !asideDialog) return;
+    if (!projection || !answer || !asideDialog) return;
     asideDialog.querySelector("#chat-aside-question")!.textContent = answer.question;
-    asideDialog.querySelector("#chat-aside-answer")!.textContent = answer.text.trim() || "No text answer returned. The model may have attempted a tool call; side answers do not execute tools.";
+    const content = asideDialog.querySelector<HTMLElement>("#chat-aside-answer")!;
+    content.classList.add("markdown-body");
+    const text = answer.text.trim() || "No text answer returned. The model may have attempted a tool call; side answers do not execute tools.";
+    if (answer.failed) content.textContent = text;
+    else {
+      content.innerHTML = renderChatMarkdown(text);
+      decorateFileLinks(content);
+    }
+    asideDialog.dataset.conversation = id!;
+    asideDialog.returnValue = "";
     asideDialog.showModal();
-    document.querySelector<HTMLElement>("#chat-aside-close")?.focus();
+    syncAsideViewport();
+    document.querySelector<HTMLElement>("#chat-aside-close")?.focus({ preventScroll: true });
+    asideDialog.scrollTop = 0;
   });
   document.querySelector("#chat-aside-close")?.addEventListener("click", () => asideDialog?.close());
-  asideDialog?.addEventListener("close", () => { if (asideButton && !asideButton.hidden) asideButton.focus({ preventScroll: true }); });
+  asideDialog?.addEventListener("close", () => {
+    if (asideDialog.returnValue !== "file" && asideDialog.dataset.conversation === activeConversationId() && asideButton && !asideButton.hidden) asideButton.focus({ preventScroll: true });
+  });
 
   form.addEventListener("submit", async event => {
     event.preventDefault();
@@ -5185,7 +5178,7 @@ export function initChat(api = new ChatApiClient()): void {
         renderConfiguration();
         scheduleRender(true);
       }
-      noteComposer(accepted.pending ? accepted.delivery === "steer" ? "Steer sent — joins the turn at its next step" : "Queued — sends when the agent is ready" : "Message accepted");
+      noteComposer(null);
       recordAutomaticBackground(conversationId, requestId, accepted);
       // Addressed to the submitted conversation, not the selection: the
       // acceptance may land after a switch, and clearing the selected
@@ -5341,8 +5334,22 @@ export function initChat(api = new ChatApiClient()): void {
       // budget. Secondary work yields before the primary composer does.
       const header = surface.querySelector<HTMLElement>(".chat-header");
       const visualHeight = window.visualViewport?.height ?? window.innerHeight;
-      const readingBudget = visualHeight * (surface.clientWidth >= 768 ? 0.35 : 0.4);
-      const available = `${Math.max(0, surface.clientHeight - form.getBoundingClientRect().height - (header?.getBoundingClientRect().height ?? 0) - Math.max(48, readingBudget))}px`;
+      const readingBudget = visualHeight * (surface.clientWidth >= 768 && !document.documentElement.hasAttribute("data-chat-wide-short") ? 0.35 : 0.4);
+      // clientHeight includes safe-area padding. Count all in-flow chrome, not
+      // just header/composer, so removing a sheet cannot spend the reading floor.
+      const css = getComputedStyle(surface);
+      const fixed = [...surface.children].reduce((height, child) => {
+        if (child === workDock || child.classList.contains("chat-transcript-area")) return height;
+        const style = getComputedStyle(child);
+        if (style.display === "none" || ["absolute", "fixed"].includes(style.position)) return height;
+        return height + child.getBoundingClientRect().height + (parseFloat(style.marginTop) || 0) + (parseFloat(style.marginBottom) || 0);
+      }, (parseFloat(css.paddingTop) || 0) + (parseFloat(css.paddingBottom) || 0));
+      // Enlarged replacement safety already permits the reading floor to
+      // yield: its complete warning/batch controls must remain scroll-reachable.
+      // Ordinary enlarged pending work and standard text retain their floor.
+      const enlargedReplacement = parseFloat(getComputedStyle(document.documentElement).fontSize) > 16
+        && queueDockElement.querySelector(".chat-queue-note.is-replacement:not([hidden])") !== null;
+      const available = `${Math.max(0, surface.clientHeight - fixed - (enlargedReplacement ? 48 : Math.max(48, readingBudget)))}px`;
       if (workDock.style.getPropertyValue("--chat-work-available") !== available) workDock.style.setProperty("--chat-work-available", available);
       workDock.style.setProperty("--chat-workers-bottom", `${form.getBoundingClientRect().height}px`);
       const headerBottom = (header?.getBoundingClientRect().bottom ?? surface.getBoundingClientRect().top) - surface.getBoundingClientRect().top;

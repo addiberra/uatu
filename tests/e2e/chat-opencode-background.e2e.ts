@@ -17,8 +17,17 @@ async function revealTouchWorkers(page: Page) {
   if (!await workers.getAttribute("open").then(value => value !== null)) await workers.locator(":scope > summary").tap();
 }
 
-async function revealTouchContinue(page: Page) {
-  await page.locator("#chat-continue-workers").scrollIntoViewIfNeeded();
+// Manual backgrounding remains an API contract, not a chat control. Drive the
+// browser HTTP boundary so response-loss/receipt tests retain their real route.
+async function backgroundViaAPI(page: Page, conversationId: string, requestId = crypto.randomUUID()) {
+  return page.evaluate(async ({ conversationId, requestId }) => {
+    try {
+      const response = await fetch(`/api/chat/conversations/${encodeURIComponent(conversationId)}/background`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ requestId }),
+      });
+      return { status: response.status, body: await response.json() };
+    } catch { return { status: 0, body: null }; }
+  }, { conversationId, requestId });
 }
 
 async function boot(page: Page, request: APIRequestContext, preview = true) {
@@ -64,18 +73,19 @@ test("settlement during shell confirmation restores the surviving inspection act
   await captureScreenshot(page, testInfo, "review-shell-confirmation-focus-desktop");
 });
 
-test("Continue feedback clears after parent and workers settle", async ({ page, request }) => {
+test("manual background API stays available without Continue or success feedback", async ({ page, request }) => {
   const conversationId = await boot(page, request);
   const worker = await control(request, { op: "launchWorker", conversationId, background: false });
-  await page.getByRole("button", { name: "Continue while workers run", exact: true }).click();
-  await expect(page.locator("#chat-background-feedback")).toContainText("Request accepted");
+  await expect(page.getByRole("button", { name: "Continue while workers run", exact: true })).toHaveCount(0);
+  await expect(page.locator(".chat-background-help")).toHaveCount(0);
+  expect((await backgroundViaAPI(page, conversationId)).status).toBe(200);
   await control(request, { op: "finish", conversationId });
   await control(request, { op: "settleWorker", childId: worker.childId });
   await expect(page.locator("#chat-background-tasks-items [data-inspect-task]")).toHaveCount(0);
   await expect(page.locator("#chat-background-action")).toBeHidden();
-  await expect(page.locator("#chat-background-feedback")).toBeEmpty();
+  await expect(page.locator("#chat-background-feedback")).toHaveCount(0);
   await control(request, { op: "wakeParent", conversationId });
-  await expect(page.locator("#chat-background-feedback")).toBeEmpty();
+  await expect(page.locator("#chat-background-feedback")).toHaveCount(0);
 });
 
 for (const theme of ["light", "dark"] as const) test(`background audit desktop ${theme}`, async ({ page, request }, testInfo) => {
@@ -86,14 +96,13 @@ for (const theme of ["light", "dark"] as const) test(`background audit desktop $
   const worker = await control(request, { op: "launchWorker", conversationId, background: false });
   const sibling = await control(request, { op: "launchWorker", conversationId });
   const proceed = page.getByRole("button", { name: "Continue while workers run", exact: true });
-  await expect(proceed).toBeVisible();
+  await expect(proceed).toHaveCount(0);
   const stopWithWorkers = (await page.locator("#chat-stop").boundingBox())!;
   expect(stopWithWorkers.width).toBe(stopBeforeWorkers.width);
   expect(stopWithWorkers.x).toBe(stopBeforeWorkers.x);
-  await expect(proceed).toHaveClass(/chat-secondary-button/);
-  await expect(page.locator(".chat-background-help")).not.toHaveAttribute("open");
+  await expect(page.locator(".chat-background-help")).toHaveCount(0);
   await captureScreenshot(page, testInfo, `audit-background-desktop-${theme}-blocking`);
-  await proceed.click();
+  expect((await backgroundViaAPI(page, conversationId)).status).toBe(200);
   await expect(page.locator("#chat-background-tasks-items [data-inspect-task]")).toHaveCount(2);
   await expect(proceed).toBeHidden();
   await captureScreenshot(page, testInfo, `audit-background-desktop-${theme}-detached`);
@@ -105,7 +114,7 @@ for (const theme of ["light", "dark"] as const) test(`background audit desktop $
   await captureScreenshot(page, testInfo, `audit-background-desktop-${theme}-settled`);
 });
 
-test("Continue is parent-wide, keeps the draft, and inspection survives worker failure", async ({ page, request }) => {
+test("manual background API is parent-wide, keeps the draft, and inspection survives worker failure", async ({ page, request }) => {
   const conversationId = await boot(page, request);
   const worker = await control(request, { op: "launchWorker", conversationId, background: false });
   await page.locator("#chat-input").fill("Keep this draft");
@@ -117,9 +126,8 @@ test("Continue is parent-wide, keeps the draft, and inspection survives worker f
   const configuration = await page.locator("#chat-configuration-summary").textContent();
   const delivery = await page.locator("#chat-send-help").textContent();
   const proceed = page.getByRole("button", { name: "Continue while workers run", exact: true });
-  await expect(proceed).toBeVisible();
-  await expect(page.locator("#chat-background-action")).toContainText("including shell commands");
-  await proceed.click();
+  await expect(proceed).toHaveCount(0);
+  expect((await backgroundViaAPI(page, conversationId)).status).toBe(200);
   await expect(page.locator("#chat-background-tasks-items [data-inspect-task]")).toHaveCount(1);
   await expect(page.locator("#chat-input")).toHaveValue("Keep this draft");
   await expect(page.locator("#chat-attachments")).toHaveText(attachments!);
@@ -243,8 +251,8 @@ for (const boundary of ["browser", "upstream"] as const) {
       if (boundary === "browser") await route.abort("connectionreset");
       else await route.fulfill({ response });
     });
-    await page.getByRole("button", { name: "Continue while workers run", exact: true }).click();
-    await expect(page.locator("#chat-background-feedback")).toContainText("Outcome unknown");
+    const first = await backgroundViaAPI(page, conversationId);
+    expect(first.status).toBe(boundary === "browser" ? 0 : 409);
     await control(request, { op: "launchWorker", conversationId, background: false });
     const retry = await page.request.post(`/api/chat/conversations/${encodeURIComponent(conversationId)}/background`, { headers: { origin: new URL(page.url()).origin }, data: { requestId } });
     expect(retry.status()).toBe(boundary === "browser" ? 200 : 409);
@@ -302,16 +310,17 @@ test("an accepted no-op invents no tasks; unadvertised capability offers no Cont
   const dispatched = new Promise<void>(resolve => { entered = resolve; });
   await page.route("**/api/chat/conversations/*/background", async route => { entered(); await gate; await route.continue(); }, { times: 1 });
   const accepted = page.waitForResponse(response => response.url().endsWith("/background") && response.request().method() === "POST");
-  await page.getByRole("button", { name: "Continue while workers run", exact: true }).click();
+  const pending = backgroundViaAPI(page, conversationId);
   await dispatched;
   await control(request, { op: "settleWorker", childId: worker.childId });
   release();
   // The request is deliberately held before dispatch. Await its real no-op
   // acknowledgement before inspecting accepted feedback, not elapsed time.
   const response = await accepted;
+  await pending;
   expect(response.ok()).toBe(true);
   expect(await response.json()).toEqual({ accepted: true });
-  await expect(page.locator("#chat-background-feedback")).toContainText("Request accepted");
+  await expect(page.locator("#chat-background-feedback")).toHaveCount(0);
   await expect(page.locator("#chat-background-tasks-items [data-inspect-task]")).toHaveCount(0);
   expect((await control(request, { op: "state" })).calls.filter((call: string) => call.startsWith("POST ") && call.includes("/background"))).toHaveLength(1);
   await boot(page, request, false);
@@ -324,7 +333,7 @@ for (const phase of ["running", "exit", "captureBeforeRemove"] as const) {
     await control(request, { op: "launchWorker", conversationId, background: false });
     await control(request, { op: "launchWorker", conversationId, background: false });
     const shell = await control(request, { op: "launchShell", conversationId, background: false });
-    await page.getByRole("button", { name: "Continue while workers run", exact: true }).click();
+    expect((await backgroundViaAPI(page, conversationId)).status).toBe(200);
     await expect(page.locator("#chat-background-tasks-items [data-inspect-task]")).toHaveCount(3);
     await page.locator(`[data-background-task="${shell.taskId}"] [data-inspect-task]`).click();
     await expect(page.locator("#chat-drilldown-output-text")).toContainText("safe shell output");
@@ -397,7 +406,7 @@ test("historical result inspection stays on the selected occurrence when its chi
   await expect(report).toContainText("Earlier worker report");
 });
 
-test("narrow keyboard Continue suppresses duplicates and worker updates do not steal draft focus", async ({ page, request }) => {
+test("narrow keyboard worker updates do not steal draft focus without a manual Continue control", async ({ page, request }) => {
   // Desktop below 900px intentionally yields Chat to Preview; exercise a
   // narrow split panel above that existing layout guard instead.
   await page.setViewportSize({ width: 1100, height: 900 });
@@ -405,19 +414,11 @@ test("narrow keyboard Continue suppresses duplicates and worker updates do not s
   const conversationId = await boot(page, request);
   const worker = await control(request, { op: "launchWorker", conversationId, background: false });
   await page.locator("#chat-input").fill("Keyboard draft stays here");
-  let release!: () => void;
-  const gate = new Promise<void>(resolve => { release = resolve; });
-  await page.route("**/api/chat/conversations/*/background", async route => { await gate; await route.continue(); });
   const proceed = page.getByRole("button", { name: "Continue while workers run", exact: true });
-  await proceed.focus();
-  await expect(proceed).toBeFocused();
-  const box = (await proceed.boundingBox())!;
-  expect(box.height).toBeGreaterThanOrEqual(44);
-  expect(box.width).toBeGreaterThanOrEqual(44);
-  await proceed.press("Enter");
-  await expect(proceed).toBeDisabled();
+  await expect(proceed).toHaveCount(0);
+  await page.locator("#chat-input").focus();
+  expect((await backgroundViaAPI(page, conversationId)).status).toBe(200);
   await expect(page.locator("#chat-input")).toHaveValue("Keyboard draft stays here");
-  release();
   const row = page.locator(`[data-background-task="${worker.taskId}"]`);
   await expect(row).toBeVisible();
   const inspect = (await row.locator("[data-inspect-task]").boundingBox())!;
@@ -534,17 +535,16 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`worker cont
     await settleDuringShellConfirmation(page, request);
     await captureScreenshot(page, testInfo, `review-shell-confirmation-focus-${engine}`);
   });
-  test("Continue activates on its first touch while composing", async ({ page, request }, testInfo) => {
+  test("background API updates preserve touch composing without a Continue control", async ({ page, request }, testInfo) => {
     const conversationId = await boot(page, request);
     await control(request, { op: "launchWorker", conversationId, background: false });
     const input = page.locator("#chat-input");
     await input.fill("Keep this composing draft");
     await input.focus();
-    await revealTouchContinue(page);
     const proceed = page.getByRole("button", { name: "Continue while workers run", exact: true });
     await expect(input).toBeFocused();
-    await expect(proceed).toBeVisible();
-    await proceed.tap();
+    await expect(proceed).toHaveCount(0);
+    expect((await backgroundViaAPI(page, conversationId)).status).toBe(200);
     await expect.poll(async () => (await control(request, { op: "state" })).calls.filter((call: string) => call.startsWith("POST ") && call.includes("/background")).length).toBe(1);
     await expect(page.locator("#chat-compact-workers-items [data-inspect-task]")).toHaveCount(1);
     await expect(input).toHaveValue("Keep this composing draft");
@@ -566,8 +566,7 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`worker cont
     expect((await prompted).ok()).toBe(true);
     await control(request, { op: "launchWorker", conversationId: secondId, background: false });
     await expect(track).not.toHaveAttribute("open");
-    await revealTouchContinue(page);
-    await page.getByRole("button", { name: "Continue while workers run", exact: true }).tap();
+    expect((await backgroundViaAPI(page, secondId)).status).toBe(200);
     await expect(page.locator("#chat-compact-workers-items [data-inspect-task]")).toHaveCount(1);
     await expect(track).not.toHaveAttribute("open");
     const state = await control(request, { op: "state" });
@@ -585,8 +584,7 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`worker cont
       await track.locator(":scope > summary").tap();
       await expect(track).toHaveAttribute("open");
     }
-    await revealTouchContinue(page);
-    await page.getByRole("button", { name: "Continue while workers run", exact: true }).tap();
+    expect((await backgroundViaAPI(page, conversationId)).status).toBe(200);
     await expect(page.locator("#chat-compact-workers-items [data-inspect-task]")).toHaveCount(1);
     if (deliberate) await expect(track).toHaveAttribute("open");
     else await expect(track).not.toHaveAttribute("open");
@@ -613,7 +611,8 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`worker cont
     const c = (await nextStop.boundingBox())!;
     expect(c.y - (b.y + b.height)).toBeGreaterThanOrEqual(8);
     for (const box of [a, b]) expect(box.width).toBeGreaterThanOrEqual(44);
-    expect(a.height).toBeLessThanOrEqual(28); // Explicitly approved dense inspection.
+    expect(a.height).toBeLessThanOrEqual(48); // Active title and metadata use two lines.
+    expect(a.height).toBeGreaterThanOrEqual(40);
     expect(b.height).toBeGreaterThanOrEqual(44); // Worker mutation remains independently safe.
     expect(b.x - (a.x + a.width)).toBeGreaterThanOrEqual(8);
     await expect(page.locator("#chat-compact-workers")).toHaveAttribute("open");

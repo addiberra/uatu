@@ -107,7 +107,7 @@ test.describe("steering an OpenCode 2.x turn", () => {
     await captureScreenshot(page, testInfo, "review-unique-pending-actions");
   });
 
-  test("each successful removal announces once without replay on routine worker updates", async ({ page, request }) => {
+  test("successful removals update the dock silently without replay on routine worker updates", async ({ page, request }) => {
     const conversationId = await startTurn(page, request);
     await submit(page, "Remove first", "Alt+Enter");
     await submit(page, "Remove second", "Alt+Enter");
@@ -118,6 +118,8 @@ test.describe("steering an OpenCode 2.x turn", () => {
       (window as unknown as { removalAnnouncements: string[] }).removalAnnouncements = messages;
       new MutationObserver(() => { if (live.textContent === "Pending message removed") messages.push(live.textContent); }).observe(live, { childList: true, subtree: true, characterData: true });
     });
+    let deletes = 0;
+    page.on("request", request => { if (request.method() === "DELETE" && request.url().includes("/queue/")) deletes++; });
     for (const text of ["Remove first", "Remove second"]) {
       const removed = page.waitForResponse(response => response.url().includes("/queue/") && response.request().method() === "DELETE");
       await held(page).filter({ hasText: text }).locator("[data-queue-remove]").click();
@@ -125,10 +127,12 @@ test.describe("steering an OpenCode 2.x turn", () => {
     }
     await expect(held(page)).toHaveCount(0);
     const announcements = () => page.evaluate(() => (window as unknown as { removalAnnouncements: string[] }).removalAnnouncements);
-    await expect.poll(announcements).toEqual(["Pending message removed", "Pending message removed"]);
+    expect(await announcements()).toEqual([]);
+    expect(deletes).toBe(2);
     await control(request, { action: "opencode", op: "launchWorker", conversationId });
     await expect(page.locator("#chat-subagents")).toContainText("Inspect safe fixture");
-    expect(await announcements()).toEqual(["Pending message removed", "Pending message removed"]);
+    expect(await announcements()).toEqual([]);
+    expect(deletes).toBe(2);
   });
 
   for (const mode of ["desktop", "touch"] as const) for (const theme of ["light", "dark"] as const) test(`audited dock targets, sticky counts and overflow on ${mode} ${theme}`, async ({ page, request }, testInfo) => {
@@ -828,6 +832,11 @@ for (const browserName of ["chromium", "webkit"] as const) test.describe(`steeri
     expect((await reverted).ok()).toBe(true);
     const warning = page.locator("#chat-queue-note");
     await expect(warning).toContainText("delivered together with your replacement");
+    await saveEvidence(info, `${evidence}-200pct-replacement-budget.json`, JSON.stringify(await page.locator("#chat-surface").evaluate(node => ({
+      surface: node.clientHeight, dock: document.querySelector("#chat-work-dock")!.getBoundingClientRect().height,
+      warning: document.querySelector("#chat-queue-note")!.getBoundingClientRect().height,
+      chrome: [...node.children].map(child => ({ id: child.id, height: child.getBoundingClientRect().height, display: getComputedStyle(child).display, position: getComputedStyle(child).position })),
+    })), null, 2));
     await warning.scrollIntoViewIfNeeded();
     await expect(warning).toBeInViewport({ ratio: 1 });
     // Reveal text below the sticky count/batch header, not merely within the

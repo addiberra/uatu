@@ -21,13 +21,48 @@ async function setup(hub: HubE2EInfo, hubContext: BrowserContext) {
   return { workspace, page, conversationId, base, post };
 }
 
+test("side-reader workspace navigation preserves the Hub workspace prefix and page-local answer", async ({ hub, hubContext }) => {
+  const { workspace, page, conversationId } = await setup(hub, hubContext);
+  const prefix = new URL(workspace.sessionUrl).pathname;
+  const documentState = await hubContext.request.get(`${workspace.sessionUrl}api/state`).then(response => response.json());
+  const qualified = `${documentState.roots[0].path}/README.md:1`;
+  const before = await childChatControl(workspace, { action: "opencode", op: "state" }) as { calls: string[] };
+  await page.route("**/aside", async route => {
+    const response = await route.fetch();
+    await route.fulfill({ response, json: { text: `Retained workspace answer. [workspace](README.md) [qualified](${encodeURI(qualified)})` } });
+  });
+  await page.locator("#chat-input").fill("/btw Show the workspace file");
+  const generated = page.waitForResponse(response => response.url().endsWith("/aside"));
+  await page.locator("#chat-send").click(); expect((await generated).ok()).toBe(true);
+  await page.locator("#chat-input").fill("Preserved Hub draft");
+  const identity = await page.evaluate(() => performance.timeOrigin);
+  for (const name of ["workspace", "qualified"]) {
+    await page.locator("#chat-aside-ready").click();
+    const link = page.locator("#chat-aside-answer").getByRole("button", { name, exact: true });
+    if (name === "qualified") { await link.focus(); await link.press("Enter"); }
+    else await link.click();
+    await expect(page.locator("#chat-aside-dialog")).toBeHidden();
+    await expect.poll(() => new URL(page.url()).pathname).toBe(`${prefix}README.md`);
+    await expect(page.locator("#preview-path")).toHaveText("README.md");
+    await expect(page.locator("#chat-input")).toHaveValue("Preserved Hub draft");
+    await expect(page.locator("#chat-conversation-select")).toHaveValue(conversationId);
+    expect(await page.evaluate(() => performance.timeOrigin)).toBe(identity);
+  }
+  await page.locator("#chat-aside-ready").click();
+  await expect(page.locator("#chat-aside-answer")).toContainText("Retained workspace answer.");
+  const after = await childChatControl(workspace, { action: "opencode", op: "state" }) as { calls: string[] };
+  expect(after.calls.slice(before.calls.length).filter(call => call.startsWith("POST"))).toEqual([expect.stringMatching(/\/generate$/)]);
+});
+
 test("trusted personal ON backgrounds once after actual composer steer admission through the real provider stack", async ({ hub, hubContext }) => {
   const { workspace, page, conversationId } = await setup(hub, hubContext);
   await childChatControl(workspace, { action: "opencode", op: "launchShell", conversationId, background: false });
   // A fresh device's established delivery default is steer.
   await page.locator("#chat-input").fill("Steer fixture turn");
+  const admitted = page.waitForResponse(response => response.url().endsWith("/prompts") && response.request().method() === "POST");
   await page.locator("#chat-send").click();
-  await expect(page.locator("#chat-action-feedback")).toContainText("background request acknowledged");
+  expect(await (await admitted).json()).toMatchObject({ pending: true, delivery: "steer", automaticBackground: "accepted" });
+  await expect(page.locator("#chat-action-feedback")).toBeHidden();
   const state = await childChatControl(workspace, { action: "opencode", op: "state" }) as { calls: string[] };
   const mutations = state.calls.filter(call => call.startsWith("POST "));
   const prompt = mutations.findLastIndex(call => call.includes("/prompt"));
@@ -56,8 +91,10 @@ test("a Settings-only read failure does not promise saved ON automation is disab
   await expect(settings.getByLabel("Keep workers running when I steer")).toBeDisabled();
   await childChatControl(workspace, { action: "opencode", op: "launchShell", conversationId, background: false });
   await page.locator("#chat-input").fill("Steer under the saved server policy");
+  const admitted = page.waitForResponse(response => response.url().endsWith("/prompts") && response.request().method() === "POST");
   await page.locator("#chat-send").click();
-  await expect(page.locator("#chat-action-feedback")).toContainText("background request acknowledged");
+  expect(await (await admitted).json()).toMatchObject({ pending: true, delivery: "steer", automaticBackground: "accepted" });
+  await expect(page.locator("#chat-action-feedback")).toBeHidden();
   const state = await childChatControl(workspace, { action: "opencode", op: "state" }) as { calls: string[] };
   expect(state.calls.filter(call => call.startsWith("POST ") && call.includes("/background"))).toHaveLength(1);
   await expect(error).toContainText("saved preferences may still apply");

@@ -78,6 +78,112 @@ test("/btw answers natively without foreground admission or interruption", async
   await expect(page.locator("#chat-items")).not.toContainText("What does the current task mean?");
   await expect(page.locator("#chat-stop")).toBeEnabled();
 });
+test("side reader uses safe chat markdown with locally scrolling tables", async ({ page, request }, info) => {
+  await boot(page, request);
+  const columns = Array.from({ length: 16 }, (_, i) => `Column ${i}`);
+  const text = `# Side heading\n\n**Important** and *emphasis*, \`inline\`, [safe link](https://example.com).\n\n\`\`\`js\nconst value = 1;\n\`\`\`\n\n| ${columns.join(" | ")} |\n| ${columns.map(() => "---").join(" | ")} |\n| ${columns.map(() => "Wide selectable cell content").join(" | ")} |\n\n[bad](javascript:alert(1)) <script>window.sideXss = true</script><img src=x onerror="window.sideXss=true">\n\nhttps://example.com/${"long".repeat(100)}`;
+  await page.route("**/aside", route => route.fulfill({ json: { text } }));
+  await page.locator("#chat-input").fill("/btw Format this answer");
+  await page.locator("#chat-send").click();
+  const notice = page.locator("#chat-aside-ready");
+  await expect(notice).toHaveText("Side answer ready");
+  expect(await notice.evaluate(node => Boolean(node.closest("#chat-composer-notices")))).toBe(false);
+  await page.locator("#chat-input").fill("Keep my selection");
+  await notice.click();
+  const reader = page.locator("#chat-aside-dialog");
+  const answer = page.locator("#chat-aside-answer");
+  await expect(answer.locator("h1")).toHaveText("Side heading");
+  await expect(answer.locator("strong")).toHaveText("Important");
+  await expect(answer.locator("em")).toHaveText("emphasis");
+  await expect(answer.locator("pre code")).toContainText("const value = 1;");
+  await expect(answer.locator("table")).toHaveCount(1);
+  await expect(answer.locator('script, [onerror], a[href^="javascript:"]')).toHaveCount(0);
+  expect(await page.evaluate(() => (window as unknown as { sideXss?: boolean }).sideXss)).toBeUndefined();
+  expect(await reader.evaluate(node => node.scrollWidth - node.clientWidth)).toBeLessThanOrEqual(1);
+  expect(await answer.locator("table").evaluate(node => node.scrollWidth > node.clientWidth)).toBe(true);
+  await captureScreenshot(page, info, `safe-side-reader-${engine}`);
+  await page.keyboard.press("Escape");
+  await expect(reader).toBeHidden();
+  await expect(notice).toBeFocused();
+  await expect(page.locator("#chat-input")).toHaveValue("Keep my selection");
+});
+for (const mode of ["desktop", "touch"] as const) test(`side-reader workspace links open in-app without losing the answer or admitting another prompt (${mode})`, async ({ launchBrowser, baseURL, request }, info) => {
+  const browser = await launchBrowser(engine);
+  const page = await browser.newPage({ baseURL, viewport: { width: mode === "touch" ? 390 : 1280, height: 844 }, hasTouch: mode === "touch", isMobile: mode === "touch" });
+  try {
+    await boot(page, request);
+    const conversation = await page.locator("#chat-conversation-select").inputValue();
+    const state = await page.request.get("/api/state").then(response => response.json());
+    const qualified = `${state.roots[0].path}/guides/setup.md:3`;
+    const before = await request.post("/__e2e/chat", { data: { action: "opencode", op: "state" } }).then(response => response.json());
+    const mutations: string[] = [];
+    page.on("request", request => { if (request.method() === "POST" && /\/(aside|prompts)$/.test(request.url())) mutations.push(new URL(request.url()).pathname); });
+    await page.context().route("https://example.test/side-review", route => route.fulfill({ contentType: "text/html", body: "External fixture only" }));
+    await page.route("**/aside", async route => {
+      const response = await route.fetch();
+      await route.fulfill({ response, json: { text: `Retained side answer. [workspace](README.md) [qualified](${encodeURI(qualified)}) [encoded](guides%2Fsetup.md) [external](https://example.test/side-review) [escaped](..%2FREADME.md) [malformed](%E0%A4%A) [unsafe](javascript:alert(1)) <a href="javascript:alert(1)" data-file-ref="README.md" onclick="window.sideXss=true">forged</a>` } });
+    });
+    await page.locator("#chat-input").fill("/btw Find the workspace document");
+    const generated = page.waitForResponse(response => response.url().endsWith("/aside"));
+    await page.locator("#chat-send").click(); await generated;
+    await page.locator("#chat-input").fill("Keep this exact draft");
+    const documentIdentity = await page.evaluate(() => performance.timeOrigin);
+    const reader = page.locator("#chat-aside-dialog");
+    const answer = page.locator("#chat-aside-answer");
+    const reopen = async () => {
+      if (mode === "touch" && await page.locator("html").getAttribute("data-active-tab") !== "chat") await page.locator("#touch-tab-chat").click();
+      await page.locator("#chat-aside-ready").click();
+      await expect(answer).toContainText("Retained side answer.");
+    };
+    await reopen();
+    for (const label of ["workspace", "qualified", "encoded"]) {
+      const link = answer.getByRole("button", { name: label, exact: true });
+      await expect(link).not.toHaveAttribute("href");
+      await expect(link).toHaveAttribute("tabindex", "0");
+    }
+    for (const label of ["escaped", "malformed", "unsafe", "forged"]) await expect(answer.getByText(label, { exact: true })).not.toHaveAttribute("data-file-ref");
+    await expect(answer.locator('script, [onclick], a[href^="javascript:"]')).toHaveCount(0);
+    await captureScreenshot(page, info, `side-links-${engine}-${mode}-reader`);
+    await answer.getByRole("button", { name: "workspace", exact: true }).click();
+    expect(await page.evaluate(() => performance.timeOrigin)).toBe(documentIdentity);
+    await expect(reader).toBeHidden();
+    await expect(page.locator("#preview-path")).toHaveText("README.md");
+    if (mode === "touch") await expect(page.locator("html")).toHaveAttribute("data-active-tab", "preview");
+    await reopen();
+    const qualifiedLink = answer.getByRole("button", { name: "qualified", exact: true });
+    await expect(qualifiedLink).toHaveAttribute("data-file-ref", qualified);
+    await qualifiedLink.focus(); await qualifiedLink.press("Enter");
+    await expect(reader).toBeHidden();
+    await expect(page.locator("#preview-path")).toHaveText("guides/setup.md");
+    await expect(page.locator('#preview .uatu-cl[data-ln="3"]')).toHaveClass(/chat-file-line-target/);
+    await captureScreenshot(page, info, `side-links-${engine}-${mode}-qualified-preview`);
+    await reopen();
+    await answer.getByRole("button", { name: "encoded", exact: true }).focus();
+    await answer.getByRole("button", { name: "encoded", exact: true }).press("Space");
+    await expect(reader).toBeHidden();
+    await expect(page.locator("#preview-path")).toHaveText("guides/setup.md");
+    await reopen();
+    const external = answer.getByRole("link", { name: "external", exact: true });
+    await expect(external).toHaveAttribute("target", "_blank");
+    expect((await external.getAttribute("rel"))!.split(/\s+/)).toEqual(expect.arrayContaining(["noopener", "noreferrer"]));
+    const popupReady = page.waitForEvent("popup"); await external.click();
+    const popup = await popupReady; await popup.waitForLoadState();
+    expect(popup.url()).toBe("https://example.test/side-review"); await popup.close();
+    await expect(reader).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(page.locator("#chat-aside-ready")).toBeFocused();
+    // Retained markup is not activation authority once its reader is closed.
+    await answer.getByRole("button", { name: "workspace", exact: true, includeHidden: true }).evaluate(node => (node as HTMLElement).click());
+    await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => resolve())));
+    await expect(page.locator("#preview-path")).toHaveText("guides/setup.md");
+    await expect(page.locator("#chat-input")).toHaveValue("Keep this exact draft");
+    await expect(page.locator("#chat-conversation-select")).toHaveValue(conversation);
+    expect(await page.evaluate(() => performance.timeOrigin)).toBe(documentIdentity);
+    expect(mutations).toEqual([expect.stringMatching(/\/aside$/)]);
+    const after = await request.post("/__e2e/chat", { data: { action: "opencode", op: "state" } }).then(response => response.json());
+    expect(after.calls.slice(before.calls.length).filter((call: string) => call.startsWith("POST"))).toEqual([expect.stringMatching(/\/generate$/)]);
+  } finally { await browser.close(); }
+});
 test("side completion preserves composing focus and concurrent requests never duplicate inference", async ({ page, request }) => {
   await boot(page, request);
   let release!: () => void;
@@ -86,7 +192,7 @@ test("side completion preserves composing focus and concurrent requests never du
   await page.route("**/aside", async route => { calls++; await gate; await route.continue(); });
   await page.locator("#chat-input").fill("/btw First side question");
   await page.locator("#chat-send").click();
-  await expect(page.locator("#chat-aside-ready")).toHaveText("Answering /btw…");
+  await expect(page.locator("#chat-aside-ready")).toHaveText("Side answer…");
   await page.locator("#chat-input").fill("/btw Second side question");
   await page.locator("#chat-send").click();
   await expect(page.locator("#chat-composer-error")).toContainText("already in progress");
@@ -99,6 +205,129 @@ test("side completion preserves composing focus and concurrent requests never du
   await expect(page.locator("#chat-input")).toBeFocused();
   await expect(page.locator("#chat-aside-dialog")).not.toBeVisible();
 });
+test("mobile side reader stays inside the visual viewport and completion preserves reading and selection", async ({ launchBrowser, baseURL, request }, info) => {
+  const browser = await launchBrowser(engine);
+  const page = await browser.newPage({ baseURL, viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true, reducedMotion: "reduce" });
+  await page.addInitScript(() => {
+    Object.defineProperty(window, "visualViewport", { configurable: true, value: Object.assign(new EventTarget(), { width: 390, height: 844, offsetTop: 0, offsetLeft: 0, scale: 1 }) });
+  });
+  await page.route("**/*", async route => {
+    if (!["stylesheet", "script", "document"].includes(route.request().resourceType())) return route.fallback();
+    const response = await route.fetch();
+    const body = (await response.text()).replace(/env\(\s*safe-area-inset-(top|bottom)\s*(,[^()]*(\([^()]*\))?[^()]*)?\)/g, (_match, edge: string) => `var(--reader-safe-${edge}, ${edge === "top" ? "47px" : "34px"})`);
+    await route.fulfill({ response, body });
+  });
+  try {
+    await boot(page, request);
+    const conversationId = await page.locator("#chat-conversation-select").inputValue();
+    await request.post("/__e2e/chat", { data: { action: "opencode", op: "appendHistory", conversationId, count: 60 } });
+    await request.post("/__e2e/chat", { data: { action: "opencode", op: "launchWorker", conversationId } });
+    await page.locator("#chat-compact-workers > summary").tap();
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let calls = 0;
+    await page.route("**/aside", async route => {
+      calls++;
+      const response = await route.fetch();
+      await gate;
+      await route.fulfill({ response, json: { text: `# Readable answer\n\n**Formatted** \`inline\` [safe](https://example.com).\n\n| ${Array.from({ length: 16 }, (_, i) => `Field ${i}`).join(" | ")} |\n| ${Array(16).fill("---").join(" | ")} |\n| ${Array(16).fill("Long cell content").join(" | ")} |\n\n\`\`\`js\n${"const sample = 'selectable';\n".repeat(20)}\`\`\`\n\n[unsafe](javascript:alert(1)) <img src=x onerror="window.sideXss=true"><script>window.sideXss=true</script>\n\n${"Retained paragraph with https://example.com/" + "long".repeat(100)}` } });
+    });
+    await page.locator("#chat-input").fill("/btw Explain while work continues");
+    await page.locator("#chat-send").tap();
+    const notice = page.locator("#chat-aside-ready");
+    await expect(notice).toHaveText("Side answer…");
+    await page.locator("#chat-input").fill("Keep this selected draft");
+    await page.locator("#chat-input").evaluate(node => (node as HTMLTextAreaElement).setSelectionRange(5, 9));
+    await page.locator("#chat-timeline").evaluate(node => { node.scrollTop = 100; });
+    const scrollTop = await page.locator("#chat-timeline").evaluate(node => node.scrollTop);
+    await captureScreenshot(page, info, `side-notice-working-${engine}`);
+    release();
+    await expect(notice).toHaveText("Side answer ready");
+    await expect(page.locator("#chat-input")).toBeFocused();
+    expect(await page.locator("#chat-input").evaluate(node => [(node as HTMLTextAreaElement).selectionStart, (node as HTMLTextAreaElement).selectionEnd])).toEqual([5, 9]);
+    expect(await page.locator("#chat-timeline").evaluate(node => node.scrollTop)).toBe(scrollTop);
+    expect(calls).toBe(1);
+    const noticeBox = (await notice.boundingBox())!;
+    const stopBox = (await page.locator("#chat-compact-workers [data-stop-task]").first().boundingBox())!;
+    expect(noticeBox.height).toBeGreaterThanOrEqual(44);
+    expect(noticeBox.y + noticeBox.height).toBeLessThanOrEqual(stopBox.y);
+    await captureScreenshot(page, info, `side-notice-ready-${engine}`);
+    const native = await request.post("/__e2e/chat", { data: { action: "opencode", op: "state" } }).then(response => response.json());
+    expect(native.calls.filter((call: string) => call.startsWith("POST") && /\/(generate|background|interrupt)(\?|$)/.test(call))).toEqual([expect.stringMatching(/\/generate$/)]);
+    for (const scene of [{ width: 390, height: 844, visual: 450, top: 0 }, { width: 390, height: 844, visual: 380, top: 28 }, { width: 844, height: 390, visual: 230, top: 16 }]) {
+      await page.setViewportSize({ width: scene.width, height: scene.height });
+      await notice.tap();
+      await page.evaluate(scene => {
+        document.documentElement.style.setProperty("--reader-safe-top", scene.width === 390 ? "47px" : "0px");
+        document.documentElement.style.setProperty("--reader-safe-bottom", scene.width === 390 ? "34px" : "21px");
+        Object.assign(window.visualViewport!, { width: scene.width, height: scene.visual, offsetTop: scene.top });
+        window.visualViewport!.dispatchEvent(new Event("resize")); window.visualViewport!.dispatchEvent(new Event("scroll"));
+      }, scene);
+      const reader = page.locator("#chat-aside-dialog");
+      await expect(reader).toBeVisible();
+      expect(await reader.evaluate(node => node.scrollTop)).toBe(0);
+      await expect.poll(async () => (await reader.boundingBox())!.y).toBeGreaterThanOrEqual(scene.top + 11);
+      const rect = (await reader.boundingBox())!;
+      expect(rect.y).toBeGreaterThanOrEqual(scene.width === 390 ? 47 : scene.top + 11);
+      expect(rect.y + rect.height).toBeLessThanOrEqual(scene.top + scene.visual - 11);
+      expect(await reader.evaluate(node => node.scrollWidth - node.clientWidth)).toBeLessThanOrEqual(1);
+      await expect(reader.locator("h1")).toHaveText("Readable answer");
+      await expect(reader.locator('script, [onerror], a[href^="javascript:"]')).toHaveCount(0);
+      expect(await reader.locator("table").evaluate(node => node.scrollWidth > node.clientWidth)).toBe(true);
+      expect(await reader.locator("a").first().getAttribute("href")).toBe("https://example.com");
+      await reader.locator("strong").evaluate(node => { const range = document.createRange(); range.selectNodeContents(node); const selection = window.getSelection()!; selection.removeAllRanges(); selection.addRange(range); });
+      expect(await page.evaluate(() => window.getSelection()?.toString())).toBe("Formatted");
+      await captureScreenshot(page, info, `side-reader-mobile-${engine}-${scene.width}-vv${scene.visual}-pan${scene.top}`);
+      await page.keyboard.press("Escape");
+      await expect(reader).toBeHidden();
+      await expect(page.locator("#chat-compact-workers")).toHaveAttribute("open");
+      await expect(notice).toBeFocused();
+      await expect(page.locator("#chat-input")).toHaveValue("Keep this selected draft");
+    }
+  } finally { await browser.close(); }
+});
+test("a stale side callback stays with its original conversation and switching closes its reader", async ({ page, request }) => {
+  await boot(page, request);
+  const original = await page.locator("#chat-conversation-select").inputValue();
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  await page.route("**/aside", async route => { const response = await route.fetch(); await gate; await route.fulfill({ response }); });
+  await page.locator("#chat-input").fill("/btw Original conversation question");
+  await page.locator("#chat-send").click();
+  await expect(page.locator("#chat-aside-ready")).toHaveText("Side answer…");
+  await page.getByRole("button", { name: "New conversation", exact: true }).click();
+  await expect(page.locator("#chat-state")).toContainText("Started new conversation");
+  const other = await page.locator("#chat-conversation-select").inputValue();
+  expect(other).not.toBe(original);
+  await page.locator("#chat-input").fill("Other conversation draft");
+  const done = page.waitForResponse(response => response.url().endsWith("/aside"));
+  release(); await done;
+  await expect(page.locator("#chat-aside-ready")).toBeHidden();
+  await expect(page.locator("#chat-aside-dialog")).not.toBeVisible();
+  await expect(page.locator("#chat-input")).toHaveValue("Other conversation draft");
+  let releaseRead!: () => void;
+  let readStarted!: () => void;
+  const readGate = new Promise<void>(resolve => { releaseRead = resolve; });
+  const reading = new Promise<void>(resolve => { readStarted = resolve; });
+  await page.route(`**/api/chat/conversations/${encodeURIComponent(original)}?*`, async route => {
+    const response = await route.fetch(); readStarted(); await readGate; await route.fulfill({ response });
+  }, { times: 1 });
+  await page.locator("#chat-conversation-select").selectOption(original);
+  await reading;
+  try {
+    await expect(page.locator("#chat-aside-ready")).toBeDisabled();
+    await expect(page.locator("#chat-aside-dialog")).not.toBeVisible();
+  } finally { releaseRead(); }
+  await expect(page.locator("#chat-aside-ready")).toHaveText("Side answer ready");
+  await expect(page.locator("#chat-aside-ready")).toBeEnabled();
+  await page.locator("#chat-aside-ready").click();
+  await expect(page.locator("#chat-aside-question")).toHaveText("Original conversation question");
+  // Native modal UI prevents clicking behind the reader; exercise selection
+  // reconciliation directly, as a deleted/reselected conversation can do.
+  await page.locator("#chat-conversation-select").evaluate((node, id) => { (node as HTMLSelectElement).value = id; node.dispatchEvent(new Event("change", { bubbles: true })); }, other);
+  await expect(page.locator("#chat-aside-dialog")).not.toBeVisible();
+  await expect(page.locator("#chat-input")).toHaveValue("Other conversation draft");
+});
 test("failed side inference retains the question without changing a newer draft or replaying", async ({ page, request }) => {
   await boot(page, request);
   let release!: () => void;
@@ -107,7 +336,7 @@ test("failed side inference retains the question without changing a newer draft 
   await page.route("**/aside", async route => { calls++; await gate; await route.fulfill({ status: 503, json: { error: "Scripted side failure" } }); });
   await page.locator("#chat-input").fill("/btw Retain this side question");
   await page.locator("#chat-send").click();
-  await expect(page.locator("#chat-aside-ready")).toHaveText("Answering /btw…");
+  await expect(page.locator("#chat-aside-ready")).toHaveText("Side answer…");
   await page.locator("#chat-input").fill("My exact newer draft");
   release();
   await expect(page.locator("#chat-aside-ready")).toHaveText("Side question failed");

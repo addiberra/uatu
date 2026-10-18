@@ -817,6 +817,7 @@
                  composer alone put these on top of them. -->
             <button id="chat-latest" class="chat-latest" type="button" aria-label="Jump to latest messages" hidden>Latest</button>
             <button id="chat-requests-jump" class="chat-requests-jump" type="button" hidden></button>
+            <button id="chat-aside-ready" class="chat-aside-ready" type="button" aria-haspopup="dialog" aria-controls="chat-aside-dialog" aria-live="polite" hidden>Side answer ready</button>
           </div>
           <nav id="chat-prompt-rail" class="chat-prompt-rail" aria-label="Jump to a prompt" hidden></nav>
           <div id="chat-work-dock" class="chat-work-dock" role="region" aria-label="Work and pending messages">
@@ -836,11 +837,6 @@
           <!-- Work the agent left running in the background: one row per
                live task with a stop control. Settled tasks leave this list
                and take a row in the timeline instead. -->
-          <section id="chat-background-action" class="chat-background-action" hidden>
-            <button id="chat-continue-workers" class="chat-secondary-button" type="button" aria-describedby="chat-background-explanation" title="Moves all eligible blocking jobs, including shell commands, to the background without stopping them.">Continue while workers run</button>
-            <details class="chat-background-help"><summary>What continues?</summary><p id="chat-background-explanation">Moves all eligible blocking jobs in this conversation to the background, including shell commands. It does not stop them.</p></details>
-            <p id="chat-background-feedback" role="status" aria-live="polite"></p>
-          </section>
           <details id="chat-background-tasks" class="chat-task-list chat-background-tasks" hidden>
             <summary><span id="chat-background-tasks-label"></span></summary>
             <ul id="chat-background-tasks-items" aria-label="Background tasks"></ul>
@@ -885,7 +881,6 @@
             <div id="chat-composer-notices" class="chat-composer-notices" role="region" aria-label="Composer feedback and errors; scroll for all messages" tabindex="0">
               <p id="chat-action-feedback" class="chat-composer-error is-notice" role="status" aria-live="polite" hidden></p>
               <p id="chat-composer-error" class="chat-composer-error" hidden></p>
-              <button id="chat-aside-ready" class="chat-secondary-button" type="button" hidden>Side answer ready</button>
             </div>
             <input id="chat-attach-input" type="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden>
             <div class="chat-composer-actions">
@@ -1045,11 +1040,13 @@
             </div>
           </dialog>
           <dialog id="chat-aside-dialog" class="chat-aside-dialog" aria-labelledby="chat-aside-title">
-            <h2 id="chat-aside-title">/btw · Side answer</h2>
+            <header class="chat-aside-header">
+              <h2 id="chat-aside-title">/btw · Side answer</h2>
+              <button id="chat-aside-close" class="chat-secondary-button" type="button" aria-label="Close side answer">Close</button>
+            </header>
             <p id="chat-aside-question"></p>
             <p class="chat-aside-note">One-shot answer from existing context. Not added to conversation history; no agent tool execution.</p>
             <div id="chat-aside-answer"></div>
-            <button id="chat-aside-close" class="chat-secondary-button" type="button">Close side answer</button>
           </dialog>
         </section>
       </div>

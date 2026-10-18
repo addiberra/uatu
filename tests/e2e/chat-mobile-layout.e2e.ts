@@ -111,7 +111,8 @@ async function workControlExposure(control: Locator) {
   return control.evaluate(node => {
     const box = node.getBoundingClientRect();
     const style = getComputedStyle(node);
-    const ring = parseFloat(style.outlineWidth) + Math.max(0, parseFloat(style.outlineOffset));
+    const ring = node.matches(":focus-visible") && style.outlineStyle !== "none"
+      ? Math.max(0, parseFloat(style.outlineWidth) + parseFloat(style.outlineOffset)) : 0;
     let top = 0, bottom = innerHeight, left = 0, right = innerWidth;
     const clips: unknown[] = [];
     for (let parent = node.parentElement; parent; parent = parent.parentElement) {
@@ -357,17 +358,22 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`mobile layo
     const metrics = await page.locator("#chat-surface").evaluate(element => ({ surface: element.clientHeight, scrollTop: element.scrollTop, dock: document.querySelector("#chat-work-dock")!.getBoundingClientRect().height, overlay: getComputedStyle(document.querySelector("#chat-work-dock")!).position === "absolute", timeline: document.querySelector("#chat-timeline")!.getBoundingClientRect().height }));
     const hardwareEditing = await page.locator("html").evaluate(node => node.hasAttribute("data-chat-editing") && !node.hasAttribute("data-chat-keyboard"));
     const cap = hardwareEditing ? 0.24 : scene.width >= 768 ? 0.25 : 0.35;
-    if (metrics.overlay) {
-      // Explicit worker expansion uses the transcript as a sheet, not extra
-      // in-flow chrome. Primary composer targets remain checked above.
-      const dock = (await page.locator("#chat-work-dock").boundingBox())!;
-      const composer = (await page.locator("#chat-composer").boundingBox())!;
-      expect(dock.y).toBeGreaterThanOrEqual(0);
-      expect(dock.y + dock.height).toBeLessThanOrEqual(composer.y + 1);
-      const workerHeader = (await page.locator("#chat-compact-workers > summary").boundingBox())!;
-      expect(workerHeader.height).toBeGreaterThanOrEqual(28);
-      expect(workerHeader.y).toBeGreaterThanOrEqual(scene.width === 390 ? 47 : scene.width === 844 ? 0 : 24);
-    } else expect(metrics.dock).toBeLessThanOrEqual(scene.visual * cap + 1);
+    expect(metrics.overlay).toBe(false);
+    expect(metrics.dock).toBeLessThanOrEqual(scene.visual * cap + 1);
+    const dock = (await page.locator("#chat-work-dock").boundingBox())!;
+    const transcript = (await page.locator(".chat-transcript-area").boundingBox())!;
+    expect(dock.y).toBeGreaterThanOrEqual(transcript.y + transcript.height - 1);
+    if (expanded) {
+      const stop = page.locator("#chat-compact-workers [data-stop-task]").first();
+      await stop.scrollIntoViewIfNeeded();
+      await stop.focus();
+      const exposure = await workControlExposure(stop);
+      expect(exposure.height).toBeGreaterThanOrEqual(44);
+      expect(exposure.top).toBeGreaterThanOrEqual(-1);
+      expect(exposure.bottom).toBeGreaterThanOrEqual(-1);
+      expect(await stop.evaluate(node => { const box = node.getBoundingClientRect(); return node.contains(document.elementFromPoint(box.x + box.width / 2, box.y + box.height / 2)); })).toBe(true);
+      await captureScreenshot(page, testInfo, `mobile-${engine}-${scene.width}-${scene.visual}-bottom-workers`);
+    }
     await saveEvidence(testInfo, `mobile-${engine}-${scene.width}-${scene.visual}.json`, JSON.stringify(metrics, null, 2));
     await page.locator("#chat-configuration-trigger").tap();
     {
@@ -710,8 +716,9 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`mobile layo
     expect(await page.locator("#chat-conversation-select").evaluate(element => parseFloat(getComputedStyle(element).fontSize))).toBeGreaterThanOrEqual(16);
     await page.locator("#chat-compact-workers > summary").tap();
     const open = page.locator(".chat-worker-row:has(.chat-task-stop) .chat-worker-inspect").first();
-    // Inspection stays dense even beside a separate full-height Stop target.
-    expect((await open.boundingBox())!.height).toBeLessThanOrEqual(28);
+    // Active actionable rows use title + metadata within the Stop footprint.
+    expect((await open.boundingBox())!.height).toBeGreaterThanOrEqual(40);
+    expect((await open.boundingBox())!.height).toBeLessThanOrEqual(48);
     const dense = page.locator(".chat-worker-row:not(:has(.chat-task-stop)) .chat-worker-inspect").first();
     expect((await dense.boundingBox())!.height).toBeGreaterThanOrEqual(26);
     expect((await dense.boundingBox())!.height).toBeLessThanOrEqual(28);

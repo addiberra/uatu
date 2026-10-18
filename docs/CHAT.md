@@ -43,7 +43,8 @@ same-request retries retain the first policy/outcome only while the bounded
 in-memory receipt survives (15 minutes after settlement by default, or less
 under count/byte pressure). Expiry, eviction and adapter/process restart end
 that protection; reload/reconnect never automatically replays the mutation.
-After refreshing evidence, explicit Continue is a fresh action, not a resend.
+After refreshing evidence, an explicit background API request is a fresh action,
+not a resend; chat no longer offers a manual Continue control.
 
 Unknown steer/resume retention does not depend on automation being available.
 When private child trust is unavailable, the Hub still keeps accounts' operation
@@ -141,7 +142,11 @@ OpenCode V2 offers `/btw <question>` as a native one-shot answer from existing
 session context, independently of foreground work. It admits no user message,
 does not interrupt/resume/background the parent, and executes no agent tool loop.
 Answers stay page-local, outside provider history: **Side answer ready** opens
-the response without stealing focus while it is generated. Empty native text is
+the response from a small transcript-edge notice, without a composer block or
+completion-time focus/scroll change. The reader uses the same sanitized Markdown
+as normal chat, with selectable text and locally scrolling tables/code. It opens
+at the answer's beginning with Close in its header; Escape closes only the reader,
+retaining an expanded worker list, and returns focus to the notice. Empty native text is
 reported honestly (the model may have attempted a tool call). Pending attachments
 are refused and retained; V1/Claude do not offer this command, and typing it there
 is refused rather than sent as an ordinary prompt. No automatic replay/retry is
@@ -151,13 +156,21 @@ their existing hooks; this is not a new sandbox against arbitrary plugin code.
 If inference fails while you compose a newer draft, that draft stays unchanged;
 **Side question failed** retains the original question and failure for inspection.
 
+Workspace file references in side answers use the same watched-file resolution
+and pointer/Enter/Space actions as normal chat, including qualified paths and
+line numbers. Opening one closes the reader and brings the file into the existing
+Preview surface without reloading the app; the draft, conversation and page-local
+answer remain available. Hub workspace URL prefixes are preserved. Safe external
+links retain normal new-tab behavior; malformed, traversing or unrecognized
+references are not promoted into workspace file actions.
+
 ### Pending messages
 
 The pending dock counts steers and queued messages. Each entry has its delivery
 badge, a separate **Paused** chip when applicable, and message-specific actions.
 For duplicate text and image-only entries, accessible action names also identify
 a stable pending-message number while that entry remains in the dock. Each
-successful action announces once, even when you repeat the same kind of action.
+successful action updates the dock silently; errors and uncertain outcomes remain visible.
 Paused messages wait for your next message or an explicit send action.
 **Send N paused steers now** wakes them together. Sending a queued message as a
 steer also wakes paused steers; its label and confirmation explain that effect.
@@ -192,21 +205,25 @@ The settled inspection strip links back to that result instead of repeating
 the report. Pending worker permissions/questions remain visible in workspace
 attention even before you open their parent conversation.
 
-When supported, **Continue while workers run** explicitly moves **all eligible
-blocking jobs in the parent**, including shell commands, to the background.
-It does not stop them, submit or clear your draft, or change delivery/model
-selection. Acceptance is not a worker count; nothing eligible is a valid no-op.
-Outside the verified personal Hub steer case above, Send never backgrounds
-work automatically; standalone retains explicit Continue only.
-The action appears only with running blocker evidence, not merely because the
-parent is generating or already has detached workers. **What continues?** and
-the button tooltip explain its all-eligible scope. Feedback disappears after
-the parent and workers settle. Continue and its explanation remain in the work
-dock; account usage stays beneath the inline actions when reported. The model
+Chat has no manual **Continue while workers run** or **What continues?** control.
+The existing background API remains unchanged: it requests all eligible blocking
+jobs, including shells, without stopping them; acceptance can be a no-op.
+Only the verified personal Hub steer policy automatically backgrounds work.
+Standalone has neither that account policy nor a manual chat background control;
+native agent facilities and the existing API remain available.
+
+A native question is not backgroundable work: OpenCode 2.0.29 awaits its form
+answer before that tool completes. Detached children can keep working while the
+parent waits, and child questions remain mirrored into the parent for answering.
+Uatu neither answers nor cancels questions automatically. `/btw` asks a separate
+one-shot question about existing context while work continues; it does not bypass
+an unanswered foreground tool question or execute a new agent task.
+
+Account usage stays beneath the inline actions when reported. The model
 pill opens the single picker directly. The worker summary remains reachable
 with hardware or software keyboards and in short landscape. Its compact header
-uses a small chevron; deliberate expansion uses a content-sized sheet over the transcript
-when space is constrained, without discarding the draft or forcing keyboard
+uses a small chevron; expansion stays in the bottom dock through keyboard resize
+and viewport pan, without flipping above the conversation or forcing keyboard
 blur. Pending counts, paused-batch Send and replacement warnings
 remain available while typing.
 Touch has one initially collapsed pending summary and one worker summary.
@@ -226,6 +243,9 @@ as **Send now + paused steers** wrap without truncation. When a paused-batch
 header would crowd out enlarged actions in a text-relative narrow container
 (up to 12rem), it scrolls with the dock instead of remaining sticky. Normal-size
 sticky counts, confirmation wording and paused-batch delivery semantics stay intact.
+As before, enlarged replacement warnings may take extra space from the transcript
+to keep their full text and controls reachable; the 40% phone/short-landscape
+reading guarantee applies to standard text, not every enlarged safety state.
 Worker counts distinguish
 confirmed working, finished (including failed/stopped), and unknown occurrences.
 Counts and rows use the same deduplicated executions: actual background shell
@@ -236,10 +256,12 @@ list: active work first, then finished work ordered newest first from available
 execution timestamps, without a second disclosure. Rows open inspection or retained results;
 launch references and their costs remain in the transcript/timeline. Names use
 14px type and compact model/Σ cumulative-token columns (11px at default scale), with distinct working,
-unknown, finished, failed and stopped glyphs. **Stop worker** is a separate
+unknown, finished, failed and stopped glyphs. Active rows with Stop put the task title first
+and actual reported agent, model and cumulative tokens on a second line; missing
+agent/model/usage is not invented. **Stop** is a separate
 44px target with an 8px gap; unknown execution state disables it. Inspection
-targets and settled rows use the explicitly approved 28px density tradeoff;
-only a row containing Stop grows to fit that separate action. **Dismiss finished**
+targets on settled rows use the explicitly approved 28px density tradeoff;
+active rows use two lines within the 44px action height. **Dismiss finished**
 stays on the right of the same compact header, not in a footer, and hides only this device's per-conversation
 view using the existing persisted dismissal state, never provider history.
 There is no Restore finished control. Results and their inspection remain in
@@ -248,8 +270,8 @@ the timeline; summaries count only visible rows.
 Deliberate worker expansion is kept per conversation within this page's bounded
 presentation cache; new work and settlement do not open details.
 Replacement/batch warnings, applicable batch Send and actionable operation
-feedback stay outside the collapse. Only known successful automatic-background
-acknowledgements clear on status change or complete settlement; failed,
+feedback stay outside the collapse. Successful sends, queue actions and
+automatic-background outcomes produce no confirmation notices; failed,
 unavailable and unknown guidance remains tied to its source operation; unrelated
 Remove, delivery changes or later successful steers cannot clear it. A Settings
 read failure means that page cannot confirm the saved preference, not that the

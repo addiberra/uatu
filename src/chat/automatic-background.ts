@@ -2,11 +2,11 @@ import type { AutomaticBackgroundOutcome } from "./types";
 
 export function automaticBackgroundNote(outcome?: AutomaticBackgroundOutcome): string {
   switch (outcome) {
-    case "accepted": return "Steer accepted; background request acknowledged. Jobs may still be running.";
-    case "not-needed": return "Steer accepted; no confirmed blocking work was observed.";
-    case "unavailable": return "Steer accepted; automatic backgrounding is unavailable. Refresh status; explicit Continue remains available when supported.";
-    case "failed": return "Steer accepted; automatic backgrounding was refused. Refresh status; explicit Continue remains available when supported.";
-    case "unknown": return "Steer accepted; automatic backgrounding could not be confirmed. Refreshing status. Do not repeat the steer.";
+    case "accepted":
+    case "not-needed": return "";
+    case "unavailable": return "Automatic backgrounding is unavailable. Refresh status; the steer was not repeated.";
+    case "failed": return "Automatic backgrounding was refused. Refresh status; the steer was not repeated.";
+    case "unknown": return "Automatic backgrounding could not be confirmed. Refreshing status. Do not repeat the steer.";
     default: return "";
   }
 }
@@ -18,7 +18,11 @@ export class AutomaticBackgroundNotices {
 
   record(conversation: string, operation: string, outcome?: AutomaticBackgroundOutcome): void {
     if (outcome === undefined) return;
-    this.put(conversation, operation, automaticBackgroundNote(outcome), outcome === "accepted" || outcome === "not-needed");
+    if (outcome === "accepted" || outcome === "not-needed") {
+      this.conversations.get(conversation)?.delete(operation);
+      return;
+    }
+    this.put(conversation, operation, automaticBackgroundNote(outcome), false);
   }
 
   unconfirmed(conversation: string, operation: string, text: string): void {

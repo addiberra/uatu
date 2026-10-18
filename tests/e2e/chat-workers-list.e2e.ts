@@ -112,6 +112,45 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`canonical w
     await expect(page.locator('#chat-items [data-chat-item-id="failed"]')).toHaveCount(1);
   });
 
+  test("unanswered questions survive worker/keyboard updates without manual Continue or automatic replies", async ({ page, request }, info) => {
+    await request.post("/__e2e/reset");
+    await request.post("/__e2e/chat", { data: { action: "agents", count: 2 } });
+    const question: ConversationItem = { id: "question:waiting", type: "question", createdAt: 3, requestId: "waiting", status: "pending", questions: [{ header: "Approach", prompt: "Which approach should I use?", multiple: false, allowFreeForm: true, options: [{ label: "Minimal", description: "Small change" }] }] };
+    const worker: ConversationItem = { id: "worker:ongoing", type: "background_task", taskId: "ongoing", description: "Audit", subagentType: "security-reviewer", taskType: "agent", status: "running", createdAt: 2 };
+    const snapshot = await request.post("/__e2e/chat", { data: { action: "seed", agent: "claude", title: "Question with independent work", items: [
+      { id: "message:start", type: "user_message", createdAt: 1, text: "Work independently and ask me about the remaining choice." },
+      worker, { id: "tool:question", type: "tool", name: "question", status: "running", createdAt: 3, input: "{}" }, question,
+    ] } }).then(response => response.json());
+    const { token } = await request.get("/__e2e/terminal-token").then(response => response.json());
+    await page.goto(`/?t=${encodeURIComponent(token)}`);
+    await page.locator("#touch-tab-chat").tap();
+    const mutations: string[] = [];
+    page.on("request", request => { if (request.method() === "POST" && /\/(questions|background|cancel|stop)(\/|$)/.test(new URL(request.url()).pathname)) mutations.push(request.url()); });
+    const card = page.locator('[data-chat-item-id="question:waiting"]');
+    const track = page.locator("#chat-compact-workers");
+    await expect(card.getByRole("button", { name: "Answer", exact: true })).toBeAttached();
+    await track.locator(":scope > summary").tap();
+    await expect(track.locator(".chat-worker-meta")).toHaveText("security-reviewer");
+    for (const height of [450, 380, 844]) {
+      await page.locator("#chat-input").fill("Preserved foreground draft");
+      await page.evaluate(height => {
+        Object.assign(window.visualViewport!, { height, offsetTop: height === 380 ? 24 : 0 });
+        window.visualViewport!.dispatchEvent(new Event("resize"));
+        window.visualViewport!.dispatchEvent(new Event("scroll"));
+      }, height);
+      await expect(page.locator("#chat-continue-workers, .chat-background-help")).toHaveCount(0);
+      expect(await page.locator("#chat-work-dock").evaluate(node => getComputedStyle(node).position)).not.toBe("absolute");
+      await expect(card.getByRole("button", { name: "Answer", exact: true })).toBeAttached();
+      await expect(page.locator("#chat-input")).toHaveValue("Preserved foreground draft");
+      await captureScreenshot(page, info, `question-worker-${engine}-vv${height}`);
+    }
+    await request.post("/__e2e/chat", { data: { action: "item", conversationId: snapshot.conversation.id, item: { ...worker, status: "completed" } } });
+    await expect(page.locator("#chat-compact-workers-label")).toHaveText("1 finished");
+    await expect(card.getByRole("button", { name: "Answer", exact: true })).toBeAttached();
+    expect(mutations).toEqual([]);
+    await captureScreenshot(page, info, `question-no-active-worker-${engine}`);
+  });
+
   for (const theme of ["light", "dark"] as const) test(`20 mixed jobs use one readable list with reachable constrained controls (${theme})`, async ({ page, request }, info) => {
     test.setTimeout(60_000); // One fixture captures the complete viewport/theme matrix.
     await page.emulateMedia({ colorScheme: theme });
@@ -158,7 +197,10 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`canonical w
     for (const row of await track.locator('[data-state="working"]').all()) {
       const inspect = (await row.locator(".chat-worker-inspect").boundingBox())!;
       const stop = (await row.locator("[data-stop-task]").boundingBox())!;
-      expect(inspect.height).toBeLessThanOrEqual(28); // Only Stop needs the separate full target.
+      expect(inspect.height).toBeLessThanOrEqual(48); // Active titles and metadata share two lines.
+      expect(inspect.height).toBeGreaterThanOrEqual(40);
+      expect(await row.locator(".chat-worker-meta").isVisible()).toBe(true);
+      expect(await row.locator("[data-stop-task]").textContent()).toBe("Stop");
       expect(stop.height).toBeGreaterThanOrEqual(44);
       expect(stop.x - inspect.x - inspect.width).toBeGreaterThanOrEqual(8);
     }
@@ -218,12 +260,19 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`canonical w
         window.visualViewport!.dispatchEvent(new Event("resize"));
       }, scene);
       await expect(summary).toBeVisible();
+      // An already-open disclosure must stay below the transcript on focus,
+      // keyboard resize and viewport pan, rather than becoming a top overlay.
+      expect(await page.locator("#chat-work-dock").evaluate(node => getComputedStyle(node).position)).not.toBe("absolute");
       if (scene.width < 600 && scene.visual < scene.height) {
         // Without pending work the surviving keyboard header owns the band,
         // not one half of an otherwise empty two-column summary layout.
         expect((await summary.boundingBox())!.width).toBeGreaterThan(scene.width - 50);
       }
       await summary.tap();
+      const dock = page.locator("#chat-work-dock");
+      expect(await dock.evaluate(node => getComputedStyle(node).position)).not.toBe("absolute");
+      const transcript = (await page.locator(".chat-transcript-area").boundingBox())!;
+      expect((await dock.boundingBox())!.y).toBeGreaterThanOrEqual(transcript.y + transcript.height - 1);
       const stop = track.locator('[data-state="working"] [data-stop-task]').first();
       await stop.scrollIntoViewIfNeeded();
       expect(await stop.evaluate(node => { const rect = node.getBoundingClientRect(); return node.contains(document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2)); })).toBe(true);
