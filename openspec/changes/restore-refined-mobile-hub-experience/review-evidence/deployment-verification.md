@@ -1,6 +1,61 @@
-# Isolated live candidate 80a2e3d — 2026-10-16
+# Isolated live deployment verification
 
-## Current deployment: reviewed geometry and compact safety correction
+## Fresh persistent recreation — 2026-10-18
+
+The user approved a **fresh disposable deployment**, acknowledging that the old
+temporary runtime and edits were unavailable. This recreation does not recover
+or preserve that old state. Earlier deployment sections below are historical.
+
+| Field | Verified value |
+| --- | --- |
+| Frozen source | Clean `44eb5e5d101d84603487044c0943ec712cda7735`, before this documentation edit |
+| Embedded version | `v0.8.0-mobile-ux.44eb5e5 · 44eb5e5` |
+| Binary SHA-256 | `f5c532f9d7e3e6a71b30c00823e45bc433cc188e68193cb7a5e4435aa0181b78` |
+| Runtime | Private durable user-data directory; isolated binary, HOME, config, state and logs |
+| Fixtures | New `atlas-docs`, `beacon-app`, `cedar-notes` local Git repositories; document/image/code examples, `main` and `review/alternate`; no remotes |
+| Access | Existing live tailnet HTTPS route and user-selected login reused; loopback listener only |
+
+Compiled-binary smoke passed **before launch**, including child assets, document
+and live-stream delivery, worktree registration, desktop menus and mobile
+Settings/Return. Existing CSS `highlight` warnings did not fail the build.
+
+Live checks passed in **three browser contexts**:
+
+- Actual tailnet HTTPS: Chromium at320px and WebKit at390px. Both covered
+  anonymous401, login, source/version API, action-first workspace information
+  and More, direct credential editing with Cancel/browser Back, Settings groups,
+  Clone's compact notice and expanded safety facts, loaded README image,
+  preview text scaling, unavailable Chat agents with setup navigation, and Return
+  retaining the exact workspace root node.
+- Loopback: Chromium desktop1280 covered anonymous401, login, source/version,
+  README preview and decoded image.
+- All contexts had zero page errors; each logged out only its own session and
+  verified protected401 afterward. A separate loopback inspection login also
+  signed out. Fixtures were registered/started through the supported API with
+  browser cookies and same-origin CSRF handling. No clone or provider login was
+  submitted and no credentials or terminal sessions were created.
+
+A scoped per-user LaunchAgent supervises the Hub and starts at GUI login, not
+before login at system boot. State and fixtures are outside temporary storage.
+Reboot and automatic workspace-session resumption were not tested. The existing
+live Serve route was reused without route changes; the old synthetic service
+was **not recreated** and its existing route was left alone. No Funnel or global
+service changes were made. No tools/dependencies were installed.
+
+Private operational handoff, checksums, browser scripts/logs and captures are
+retained with the durable runtime, outside Git. Config/state/log files are
+owner-only; the handoff contains scoped status/start/stop commands and unchanged
+login details. There is **no previous-runtime rollback** for this fresh setup.
+Isolated HOME/config and an empty inherited SSH-agent socket are hygiene, not an
+OS sandbox: terminal/project processes retain the user's OS privileges.
+
+These are self-verification results, not independent validation, full-suite
+re-execution, physical-device testing or human acceptance. The previously
+reported104/104 source browser run was not rerun as part of this deployment.
+
+## Historical isolated live candidate 80a2e3d — 2026-10-16
+
+### Historical deployment: reviewed geometry and compact safety correction
 
 **Ready for live testing; final human/native acceptance remains open.** The lead
 renewed task 23.2's exact live-only authorization for independently approved
