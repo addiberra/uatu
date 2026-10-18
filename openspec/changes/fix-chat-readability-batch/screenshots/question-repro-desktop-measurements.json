@@ -1,0 +1,64 @@
+{
+  "wide": {
+    "statement": {
+      "text": "Before I continue refactoring the renderer, pick which of th",
+      "lines": 4,
+      "scrollWidth": 370,
+      "clientWidth": 370
+    },
+    "statementStyle": {
+      "srOnly": false,
+      "element": "legend"
+    },
+    "clippingAncestor": null,
+    "tabs": [
+      {
+        "label": "Before I continue refactoring the render",
+        "lines": 2,
+        "marker": "none"
+      },
+      {
+        "label": "Before I continue refactoring the render",
+        "lines": 2,
+        "marker": "none"
+      },
+      {
+        "label": "Before I continue refactoring the render",
+        "lines": 2,
+        "marker": "none"
+      },
+      {
+        "label": "Before I continue refactoring the render",
+        "lines": 2,
+        "marker": "none"
+      }
+    ],
+    "options": [
+      {
+        "option": "Timeline renderingHow to",
+        "inputType": "radio",
+        "indicatorVisible": true
+      },
+      {
+        "option": "Usage readoutsToken and ",
+        "inputType": "radio",
+        "indicatorVisible": true
+      },
+      {
+        "option": "Terminal paletteANSI col",
+        "inputType": "radio",
+        "indicatorVisible": true
+      },
+      {
+        "option": "Find in surface⌘F matchi",
+        "inputType": "radio",
+        "indicatorVisible": true
+      },
+      {
+        "option": "Type your own answer",
+        "inputType": "radio",
+        "indicatorVisible": true
+      }
+    ]
+  }
+}

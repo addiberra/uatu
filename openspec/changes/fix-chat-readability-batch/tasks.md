@@ -1,0 +1,24 @@
+## 1. #464 — billion-scale token formatting
+
+- [x] 1.1 Add the `B` branch (one decimal, ≥ 1e9) to `formatTokens` in `src/chat/usage.ts`, preserving `k`/`M` behavior below — verified by `bun test src/chat/usage.test.ts`
+- [x] 1.2 Add colocated `src/chat/usage.test.ts` covering representative values and rounding boundaries (boundary values just below 1e9 stay on `M`; `840`, `12.4k`, `1.2M`, `1.0B` representative forms) — verified by `bun test src/chat/usage.test.ts` (9 pass)
+- [x] 1.3 Confirm exact totals stay reachable at each consumer (receipt titles, `toLocaleString()` details, context breakdown) and record findings in the completion report — verified by code inspection notes
+
+## 2. #524 — skill rows name their skill
+
+- [x] 2.1 Read `input.id` as the skill name in `src/chat/tool-detail.ts`'s skill case, after `name`/`skill` — verified by `bun test src/chat/tool-detail.test.ts`
+- [x] 2.2 Add the id-only regression fixture in `src/chat/tool-detail.test.ts` — verified by `bun test src/chat/tool-detail.test.ts`
+- [x] 2.3 Add the collapsed-row assertion (subject carries the name exactly once, body unchanged) and forked-transcript navigation check for id-only payloads in `src/chat/timeline-renderer.test.ts` — verified by `bun test src/chat/timeline-renderer.test.ts` (existing tests included)
+
+## 3. #520 — multi-select question form
+
+- [x] 3.1 Reproduce the truncated question and ambiguous tick states in the browser — reproduced from the user's live OpenCode multi-question form: long question text rides in the question's header (single-line ellipsised in the tab strip), the stepped legend was screen-reader-only, and every optional step wore an unearned ✓. Evidence: the user's screenshot plus `screenshots/question-repro-*.png`/`*.json` measured before and after — verified against the issue's reported symptoms
+- [x] 3.2 Localized fix: the active panel states its question fully in a visible legend (wrapped, unclipped — `timeline-renderer.ts`), and a tab earns its ✓ only from a real selection while optional-empty gating of the Answer button is unchanged (`question-form.ts`), with narrow/touch and wide viewport interaction coverage — verified by `bun test src/chat/question-form.test.ts` and `bun run test:e2e:no-perf tests/e2e/chat-question-readability.e2e.ts` (2 pass: touch-narrow, desktop-wide)
+
+## 4. Verification and completion
+
+- [x] 4.1 Targeted unit pass over touched surfaces (`usage`, `tool-detail`, `timeline-renderer`, claude `normalization`/`provider` tests) and `bun run typecheck` — verified by clean runs (typecheck exit 0; full `bun run test:ci` 5091 pass; the only failures are the documented hub-credential projection-hazard tests, reproduced identically on the base checkout with the projection env present)
+- [x] 4.2 Targeted e2e for the chat surface (and #520 coverage if kept) — verified by clean Playwright runs: chat-requests/chat-panels/chat-agents/chat-question-readability (48 pass), chat-claude-polish/chat-touch (82 pass), chat-cost-receipt (1 pass)
+- [x] 4.3 Independent review (fresh-context reviewer) of the full diff against the specs — verified by review findings addressed or answered (verdict: specs satisfied; the three actionable findings — the e2e's unexercised multi-select step and its comment — are fixed, the design.md duplicate bullet removed; finding 7, a resolved form again collapsing the long header into the collapsed row, is recorded as a follow-up, not spec-required)
+- [x] 4.4 One commit per issue (#464, #524, #520 if kept), release-note discipline checked against the latest stable tag (visible `fix` vs override) — verified by `git log` inspection (07f1870, 891f6e1, bdd206f, plus the change folder as 3716cc8; the broken behavior exists in stable v0.8.0 for all three, so each is a visible `fix(chat)` with no Release Please override needed)
+- [x] 4.5 Report exactly which issues are fully resolved and any deferred work; PR publication and issue closing await explicit user approval — verified by the completion report
