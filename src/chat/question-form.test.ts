@@ -235,4 +235,22 @@ describe("question form interactions", () => {
     expect(collectQuestionAnswers(parent)).toEqual([["A"]]);
     expect(collectQuestionAnswers(child)).toEqual([["child answer"]]);
   });
+
+  // A mirrored pending question renders in both surfaces (parent and
+  // drill-down share item.id), so the panel id carries the rendering
+  // surface's conversation: duplicate document ids would leave one form's
+  // tabs pointing at the other's fieldset.
+  test("panel ids are unique per rendered surface, and tabs point at their own fieldset", () => {
+    const stepped = [
+      choice({ header: "Scope", allowFreeForm: false }),
+      choice({ header: "Details", options: [{ label: "X", description: "" }] }),
+    ];
+    const parent = renderForm(stepped, "child", "parent");
+    const child = renderForm(stepped, "child", "child");
+    const parentPanel = parent.querySelector<HTMLElement>("[data-question-panel]")!;
+    const childPanel = child.querySelector<HTMLElement>("[data-question-panel]")!;
+    expect(parentPanel.id).not.toBe(childPanel.id);
+    expect(parent.querySelectorAll("[data-question-tab]")[0]!.getAttribute("aria-controls")).toBe(parentPanel.id);
+    expect(child.querySelectorAll("[data-question-tab]")[0]!.getAttribute("aria-controls")).toBe(childPanel.id);
+  });
 });

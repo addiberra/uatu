@@ -244,7 +244,7 @@ export class TimelineRenderer {
       // auto-open rule for the rest of the run, so a tool that keeps talking
       // cannot reopen a row the reader shut.
       const readerClosed = entry?.node.hasAttribute(READER_CLOSED) ?? false;
-      const markup = (defer: boolean) => renderItem(item, open, active, todo, duration, origin, readerClosed, allowSubagents, completedAssistant, allowRevert, this.permissionScopeNote, defer, confirming, linkedTool, this.loginAction);
+      const markup = (defer: boolean) => renderItem(item, open, active, todo, duration, origin, readerClosed, allowSubagents, completedAssistant, allowRevert, this.permissionScopeNote, defer, confirming, linkedTool, this.loginAction, projection.conversationId ?? "");
       const node = buildNode(markup(this.deferClosedActivity));
       if (this.deferClosedActivity && node.matches("details.chat-activity:not([open])")) {
         node.setAttribute("data-chat-lazy", "");
@@ -1207,7 +1207,7 @@ export class RevertedMessagesDockRenderer {
 
 type RequestOrigin = { conversationId: string; label: string };
 
-export function renderItem(item: ConversationItem, open: boolean, activeRequest: boolean, todo?: TodoSummary, durationMs?: number, origin?: RequestOrigin, readerClosed = false, allowSubagents = true, completedAssistant = false, allowRevert = false, permissionScopeNote?: string, deferClosed = false, confirming = false, linkedTool?: ToolItem, loginAction?: LoginAction): string {
+export function renderItem(item: ConversationItem, open: boolean, activeRequest: boolean, todo?: TodoSummary, durationMs?: number, origin?: RequestOrigin, readerClosed = false, allowSubagents = true, completedAssistant = false, allowRevert = false, permissionScopeNote?: string, deferClosed = false, confirming = false, linkedTool?: ToolItem, loginAction?: LoginAction, surfaceId = ""): string {
   const id = escapeHtmlAttribute(item.id);
   const stamp = timestampAttribute(item.createdAt);
   // A prompt a scheduled wakeup submitted opens that wakeup's turn. It is
@@ -1284,7 +1284,7 @@ export function renderItem(item: ConversationItem, open: boolean, activeRequest:
     return `<section class="chat-item chat-task-progress" data-chat-item-id="${id}"${stamp} aria-label="Task progress"><header class="chat-task-progress-header">Tasks <span class="chat-task-progress-count">${done}/${item.entries.length}</span></header><ol class="chat-task-list">${rows}</ol></section>`;
   }
   if (item.type === "permission") return renderPermission(item, open, activeRequest, origin, allowSubagents, permissionScopeNote, confirming, linkedTool);
-  if (item.type === "question") return renderQuestion(item, open, activeRequest, origin, allowSubagents);
+  if (item.type === "question") return renderQuestion(item, open, activeRequest, origin, allowSubagents, surfaceId);
   if (item.type === "tool") return renderTool(item, open, readerClosed, todo, allowSubagents, deferClosed);
   // A command's text is the subject, not the label. As a label it lands in the
   // summary's non-shrinking slot, so a long pipeline overruns the row instead
@@ -1741,7 +1741,7 @@ function permissionOutcomeLabel(outcome: PermissionOutcome | undefined, item?: E
   return "Resolved";
 }
 
-function renderQuestion(item: QuestionRequest, open: boolean, active: boolean, origin?: RequestOrigin, allowSubagents = true): string {
+function renderQuestion(item: QuestionRequest, open: boolean, active: boolean, origin?: RequestOrigin, allowSubagents = true, surfaceId = ""): string {
   const pending = item.status === "pending";
   // Questions are stepped through one at a time behind a tab strip, the way
   // OpenCode's own client presents them. Stacking every question at once buries
@@ -1755,7 +1755,11 @@ function renderQuestion(item: QuestionRequest, open: boolean, active: boolean, o
   // was which — and the legend states the question whole.
   const stepLabel = (question: StructuredQuestion) => question.prompt.length <= question.header.length ? question.prompt : question.header;
   const statement = (question: StructuredQuestion) => stepLabel(question) === question.prompt ? question.header : question.prompt;
-  const panelId = (index: number) => `question-${item.id.replace(/[^a-z0-9_-]+/gi, "-")}-${index}`;
+  // A mirrored pending question renders in both the parent and the child
+  // transcript (ChatAdapter.mirrorToParent), sharing item.id — the panel id
+  // carries the rendering surface's conversation too, so the document never
+  // holds duplicate ids and each form's tabs point at their own fieldset.
+  const panelId = (index: number) => `question-${surfaceId.replace(/[^a-z0-9_-]+/gi, "-")}-${item.id.replace(/[^a-z0-9_-]+/gi, "-")}-${index}`;
   const tabs = stepped
     ? `<div class="chat-question-tabs" role="tablist">${item.questions.map((question, index) => `<button type="button" role="tab" class="chat-question-tab${index === 0 ? " is-active" : ""}" data-question-tab="${index}" aria-selected="${index === 0}" aria-controls="${escapeHtmlAttribute(panelId(index))}">${escapeHtml(stepLabel(question))}<span class="sr-only chat-question-tab-answered">, answered</span></button>`).join("")}</div>`
     : "";

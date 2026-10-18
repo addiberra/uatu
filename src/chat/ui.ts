@@ -3629,12 +3629,15 @@ export function initChat(api = new ChatApiClient()): void {
     });
     // A step change is spoken, not just shown: with all tabs alike and the
     // panel swapping above the focus point, a screen-reader user otherwise
-    // hears nothing while the question under their hands changes.
-    const announceQuestionStep = (form: HTMLFormElement) => {
+    // hears nothing while the question under their hands changes. Spoken to
+    // the surface that owns the form — answering from a subagent drill-down
+    // must update the child's status line, not displace the parent's.
+    const announceQuestionStep = (source: ChatProjection, form: HTMLFormElement) => {
+      const speak = announceFailureFor(source);
       const panels = [...form.querySelectorAll<HTMLElement>("[data-question-panel]")];
       const activeIndex = Math.max(0, panels.findIndex(panel => !panel.hidden));
       const label = panels[activeIndex]?.querySelector(".chat-question-step")?.textContent?.trim().replace(/\s+/g, " ");
-      announce(label ? `Question ${activeIndex + 1} of ${panels.length}: ${label}` : "");
+      speak(label ? `Question ${activeIndex + 1} of ${panels.length}: ${label}` : "");
     };
 
     container.addEventListener("change", event => {
@@ -3672,7 +3675,8 @@ export function initChat(api = new ChatApiClient()): void {
       const tab = (event.target as Element).closest<HTMLButtonElement>("[data-question-tab]");
       if (!tab?.form) return;
       showQuestionPanel(tab.form, Number(tab.dataset.questionTab));
-      announceQuestionStep(tab.form);
+      const source = sourceProjection();
+      if (source) announceQuestionStep(source, tab.form);
     });
     container.addEventListener("submit", event => {
       const questionForm = event.target as HTMLFormElement;
@@ -3687,7 +3691,7 @@ export function initChat(api = new ChatApiClient()): void {
       // button is "Next" here, so submitting the form means "go on".
       if (activeIndex < panels.length - 1) {
         showQuestionPanel(questionForm, activeIndex + 1);
-        announceQuestionStep(questionForm);
+        announceQuestionStep(source, questionForm);
         return;
       }
       const answers = collectQuestionAnswers(questionForm);
