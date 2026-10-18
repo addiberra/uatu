@@ -41,6 +41,17 @@ the only statement. Skill-loading rows parse their input in
   outside any evidence we hold. Evidence basis to be stated in the PR.
 - **One commit per issue** on this worktree's branch, so review and revert
   stay clean and release-note attribution stays truthful.
+- **Post-critique polish rides the #520 commit**: an independent
+  impeccable critique of the rendered result (dual assessment, 27/40)
+  found five presentation debts in the fixed card. All five are folded
+  in: step pills render the shorter of prompt/header (four identical
+  ellipsised sentences told nothing about which step was which); the
+  Next/Answer button takes the primary treatment and Reject demotes to a
+  quiet action stating its consequence; the answered tick reaches the
+  accessibility tree and step changes are announced ("Question 2 of 4:
+  …"); the Answer button no longer disables — submit routes through the
+  missing-check that jumps and says what is owed; and the panel fronts
+  its full statement with the step label as an eyebrow.
 - **#520's gate resolved to a confirmed, localized fix**: the reproduction
   came from a live OpenCode multi-question form the user captured
   mid-session — its mapping puts the long question text in the structured

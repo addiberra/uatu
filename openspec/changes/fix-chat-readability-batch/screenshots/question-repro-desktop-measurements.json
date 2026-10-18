@@ -1,8 +1,8 @@
 {
   "wide": {
     "statement": {
-      "text": "Before I continue refactoring the renderer, pick which of th",
-      "lines": 4,
+      "text": "Q1 — Priorities optionalBefore I continue refactoring the re",
+      "lines": 8,
       "scrollWidth": 370,
       "clientWidth": 370
     },
@@ -13,23 +13,23 @@
     "clippingAncestor": null,
     "tabs": [
       {
-        "label": "Before I continue refactoring the render",
-        "lines": 2,
+        "label": "Q1 — Priorities, answered",
+        "lines": 1,
         "marker": "none"
       },
       {
-        "label": "Before I continue refactoring the render",
-        "lines": 2,
+        "label": "Q2 — Priorities, answered",
+        "lines": 1,
         "marker": "none"
       },
       {
-        "label": "Before I continue refactoring the render",
-        "lines": 2,
+        "label": "Q3 — Priorities, answered",
+        "lines": 1,
         "marker": "none"
       },
       {
-        "label": "Before I continue refactoring the render",
-        "lines": 2,
+        "label": "Q4 — Priorities, answered",
+        "lines": 1,
         "marker": "none"
       }
     ],

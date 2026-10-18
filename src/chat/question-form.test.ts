@@ -50,7 +50,10 @@ function renderForm(questions: StructuredQuestion[] = [choice()], owner = "paren
 }
 
 describe("question form interactions", () => {
-  test("reveals and focuses custom text but requires non-whitespace content", () => {
+  // The primary button stays enabled: an unanswered or blank step is caught
+  // by the submit path, which jumps to the missing panel and says what is
+  // still owed (GitHub #520 critique — a greyed button named nobody).
+  test("reveals and focuses custom text and trims its draft", () => {
     const form = renderForm();
     const toggle = form.querySelector<HTMLInputElement>("[data-question-custom-toggle]")!;
     const editor = form.querySelector<HTMLElement>("[data-question-custom-editor]")!;
@@ -69,14 +72,14 @@ describe("question form interactions", () => {
     expect(toggle.getAttribute("aria-expanded")).toBe("true");
     expect(focused).toBe(true);
     expect(focusOptions).toEqual({ preventScroll: true });
-    expect(primary.disabled).toBe(true);
+    expect(primary.disabled).toBe(false);
 
     input.value = "   ";
     syncQuestionControl(input);
-    expect(primary.disabled).toBe(true);
+    expect(primary.disabled).toBe(false);
+    expect(collectQuestionAnswers(form)).toEqual([[]]);
     input.value = "  a custom answer  ";
     syncQuestionControl(input);
-    expect(primary.disabled).toBe(false);
     expect(collectQuestionAnswers(form)).toEqual([["a custom answer"]]);
   });
 
@@ -196,17 +199,22 @@ describe("question form interactions", () => {
   // GitHub #520: the whole question used to be readable only inside the
   // one-line ellipsised tab strip — a provider family maps it into the
   // header — because the stepped legend was screen-reader-only. The legend
-  // is the question's statement in the panel, visible and full.
-  test("the stepped panel states its question in a visible, full legend", () => {
+  // is the question's statement in the panel, visible and full, fronted by
+  // the step's short label; the tab pill carries the same short label.
+  test("the stepped panel states its question in a visible, full legend fronted by the label", () => {
     const form = renderForm([
-      choice({ header: "Scope", allowFreeForm: false }),
-      choice({ header: "Details", options: [{ label: "X", description: "" }] }),
+      choice({ header: "Scope", prompt: "Should I include scope checks in this pass", allowFreeForm: false }),
+      choice({ header: "Details", prompt: "How much detail do you want in the report", options: [{ label: "X", description: "" }] }),
     ]);
     for (const panel of [...form.querySelectorAll<HTMLElement>("[data-question-panel]")]) {
       const legend = panel.querySelector<HTMLElement>("legend")!;
       expect(legend.classList.contains("sr-only")).toBe(false);
-      expect(legend.textContent).toContain(panel.getAttribute("data-question-panel") === "0" ? "Scope" : "Details");
+      expect(legend.querySelector(".chat-question-step")?.textContent).toContain(panel.getAttribute("data-question-panel") === "0" ? "Scope" : "Details");
+      expect(legend.querySelector(".chat-question-statement")?.textContent).toContain(panel.getAttribute("data-question-panel") === "0" ? "Should I include scope checks" : "How much detail");
     }
+    // The tab pill names the step by the short label, not the long question.
+    const tabs = [...form.querySelectorAll<HTMLButtonElement>("[data-question-tab]")];
+    expect(tabs.map(tab => tab.textContent!.replace(", answered", ""))).toEqual(["Scope", "Details"]);
   });
 
   test("keeps mirrored parent and drill-down forms independent while retaining child ownership", () => {

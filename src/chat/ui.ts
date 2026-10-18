@@ -3627,6 +3627,16 @@ export function initChat(api = new ChatApiClient()): void {
         target.click();
       }
     });
+    // A step change is spoken, not just shown: with all tabs alike and the
+    // panel swapping above the focus point, a screen-reader user otherwise
+    // hears nothing while the question under their hands changes.
+    const announceQuestionStep = (form: HTMLFormElement) => {
+      const panels = [...form.querySelectorAll<HTMLElement>("[data-question-panel]")];
+      const activeIndex = Math.max(0, panels.findIndex(panel => !panel.hidden));
+      const label = panels[activeIndex]?.querySelector(".chat-question-step")?.textContent?.trim().replace(/\s+/g, " ");
+      announce(label ? `Question ${activeIndex + 1} of ${panels.length}: ${label}` : "");
+    };
+
     container.addEventListener("change", event => {
       const input = event.target as HTMLInputElement;
       const form = input.form;
@@ -3662,6 +3672,7 @@ export function initChat(api = new ChatApiClient()): void {
       const tab = (event.target as Element).closest<HTMLButtonElement>("[data-question-tab]");
       if (!tab?.form) return;
       showQuestionPanel(tab.form, Number(tab.dataset.questionTab));
+      announceQuestionStep(tab.form);
     });
     container.addEventListener("submit", event => {
       const questionForm = event.target as HTMLFormElement;
@@ -3676,12 +3687,13 @@ export function initChat(api = new ChatApiClient()): void {
       // button is "Next" here, so submitting the form means "go on".
       if (activeIndex < panels.length - 1) {
         showQuestionPanel(questionForm, activeIndex + 1);
+        announceQuestionStep(questionForm);
         return;
       }
       const answers = collectQuestionAnswers(questionForm);
-      // The button is disabled until every step is satisfied, so this only
-      // catches a form submitted some other way (Enter in the free-form field).
-      // An optional question may go unanswered; every other one must not.
+      // The primary button stays enabled, so every submit routes through this
+      // check: an optional question may go unanswered; every other one must
+      // not. The form jumps to the first missing panel and says what is owed.
       const missing = answers.flatMap((answer, index) => answer.length === 0 && !item.questions[index]?.optional ? [index] : []);
       if (missing.length > 0) {
         showQuestionPanel(questionForm, missing[0]!);

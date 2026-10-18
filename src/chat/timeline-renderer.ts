@@ -12,7 +12,7 @@ import type { AcceptedDraft, ChatProjection } from "./projection";
 import { formatUsd } from "./usage";
 import { wakeupRowLabel } from "./scheduled-wakeups";
 import { dateTime, dayLabel, fullDate, knownTime, localDayKey, localDaysBetween, nextLocalMidnight, weekdayClock } from "./dates";
-import { LOGIN_FAILED_NOTICE_CODE, isLiveConversationStatus, isRateLimitStanding, type ActivityStatus, type ConversationItem, type ConversationStatus, type MessageAttachment, type PermissionOutcome, type QueuedMessage, type QuestionRequest, type RevertedUserMessage, type TokenUsage, type ToolItem } from "./types";
+import { LOGIN_FAILED_NOTICE_CODE, isLiveConversationStatus, isRateLimitStanding, type ActivityStatus, type ConversationItem, type ConversationStatus, type MessageAttachment, type PermissionOutcome, type QueuedMessage, type QuestionRequest, type RevertedUserMessage, type StructuredQuestion, type TokenUsage, type ToolItem } from "./types";
 
 type RenderedEntry = { node: HTMLElement; item: ConversationItem; active: boolean; variant: string; shellVariant?: string };
 const deferredBodies = new WeakMap<HTMLElement, () => void>();
@@ -1747,8 +1747,17 @@ function renderQuestion(item: QuestionRequest, open: boolean, active: boolean, o
   // OpenCode's own client presents them. Stacking every question at once buries
   // the later ones and makes a partly-filled form look broken.
   const stepped = item.questions.length > 1;
+  // A step is named by whichever of the two strings a provider mapping puts
+  // the short label in; the longer one is the question stated in full. One
+  // provider family (GitHub #520) splits them the other way round from the
+  // obvious one, so the pill renders the *label* — four pills printing one
+  // identical ellipsised sentence told the reader nothing about which step
+  // was which — and the legend states the question whole.
+  const stepLabel = (question: StructuredQuestion) => question.prompt.length <= question.header.length ? question.prompt : question.header;
+  const statement = (question: StructuredQuestion) => stepLabel(question) === question.prompt ? question.header : question.prompt;
+  const panelId = (index: number) => `question-${item.id.replace(/[^a-z0-9_-]+/gi, "-")}-${index}`;
   const tabs = stepped
-    ? `<div class="chat-question-tabs" role="tablist">${item.questions.map((question, index) => `<button type="button" role="tab" class="chat-question-tab${index === 0 ? " is-active" : ""}" data-question-tab="${index}" aria-selected="${index === 0}">${escapeHtml(question.header)}</button>`).join("")}</div>`
+    ? `<div class="chat-question-tabs" role="tablist">${item.questions.map((question, index) => `<button type="button" role="tab" class="chat-question-tab${index === 0 ? " is-active" : ""}" data-question-tab="${index}" aria-selected="${index === 0}" aria-controls="${escapeHtmlAttribute(panelId(index))}">${escapeHtml(stepLabel(question))}<span class="sr-only chat-question-tab-answered">, answered</span></button>`).join("")}</div>`
     : "";
   // A checkbox and a radio read almost identically inside a styled row, so the
   // legend says which it is — otherwise there is nothing telling you more than
@@ -1761,19 +1770,21 @@ function renderQuestion(item: QuestionRequest, open: boolean, active: boolean, o
       ? `<label class="chat-question-option chat-question-custom-option"><input type="${type}" name="${question.multiple ? `q-${index}-custom-choice` : `q-${index}`}" data-question-custom-toggle aria-controls="${escapeHtmlAttribute(customInputId)}" aria-expanded="false"><span class="chat-question-option-text"><span class="chat-question-option-label">Type your own answer</span></span></label><label class="chat-question-custom-editor" data-question-custom-editor for="${escapeHtmlAttribute(customInputId)}" hidden><span class="sr-only">Type your own answer</span><input id="${escapeHtmlAttribute(customInputId)}" name="q-${index}-custom-text" type="text" data-question-custom-input autocomplete="off"></label>`
       : "";
     const hints = [question.multiple ? "choose one or more" : "", question.optional ? "optional" : ""].filter(Boolean);
-    // The legend stays visible on every panel: one provider family names the
-    // field with the whole question in it — the long text rides in the
-    // header, the short label in the prompt — so a screen-reader-only legend
-    // left the full question readable nowhere but a one-line ellipsised tab
-    // (GitHub #520). A visible legend wraps it in the panel, for either
-    // mapping's shape.
-    return `<fieldset class="chat-question-panel" data-question-panel="${index}"${question.optional ? ` data-question-optional="true"` : ""}${index === 0 ? "" : " hidden"}><legend>${escapeHtml(question.header)}</legend><p>${escapeHtml(question.prompt)}${hints.length ? ` <span class="chat-question-hint">${escapeHtml(hints.join(" · "))}</span>` : ""}</p>${options}${custom}</fieldset>`;
+    // The legend carries the step's label with its hints, then the question
+    // stated in full: whichever mapping put the length in the header or the
+    // prompt, the panel shows the whole question wrapped — a screen-reader-
+    // only legend left it readable nowhere but a one-line ellipsised tab
+    // (GitHub #520). Fieldset legends must be the first element child, so
+    // the label leads inside the legend rather than below the question.
+    const stepLine = `<span class="chat-question-step">${escapeHtml(stepLabel(question))}${hints.length ? ` <span class="chat-question-hint">${escapeHtml(hints.join(" · "))}</span>` : ""}</span>`;
+    const statementLine = statement(question) === stepLabel(question) ? "" : `<span class="chat-question-statement">${escapeHtml(statement(question))}</span>`;
+    return `<fieldset class="chat-question-panel" data-question-panel="${index}" id="${escapeHtmlAttribute(panelId(index))}"${question.optional ? ` data-question-optional="true"` : ""}${index === 0 ? "" : " hidden"}><legend>${stepLine}${statementLine}</legend>${options}${custom}</fieldset>`;
   }).join("");
   // Same receding as a permission: a resolved question carries its outcome in
   // the summary and drops the answered form. Its prompts stay in the collapsed
   // body so what was asked remains reachable.
   const resolvedBody = item.questions.map(question => `<p class="chat-request-asked">${escapeHtml(question.prompt)}</p>`).join("");
-  const body = pending && active ? `<form data-question-form>${tabs}${questions}<div class="chat-request-actions"><button type="submit" data-question-primary disabled>${stepped ? "Next" : "Answer"}</button><button type="button" data-question-reject>Reject</button></div></form>` : pending ? `<p class="chat-request-outcome">Waiting its turn — answer the newest request first.</p>` : resolvedBody;
+  const body = pending && active ? `<form data-question-form>${tabs}${questions}<div class="chat-request-actions"><button type="submit" data-question-primary class="chat-primary-button">${stepped ? "Next" : "Answer"}</button><button type="button" data-question-reject title="Declines this question set — the agent is told and continues without answers">Reject</button></div></form>` : pending ? `<p class="chat-request-outcome">Waiting its turn — answer the newest request first.</p>` : resolvedBody;
   const state = requestState(item.status, active);
   const summaryTrace = state === "resolved" ? ` <span class="chat-request-trace">${item.outcome?.kind === "rejected" ? "Rejected" : "Answered"}</span>` : requestBadge(state);
   // A dialog or elicitation says who is asking above the form, offers the

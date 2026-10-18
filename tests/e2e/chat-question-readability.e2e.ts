@@ -170,6 +170,12 @@ async function assertDistinctSelection(page: Page, name: string): Promise<void> 
   expect.soft(ticks[2] !== "none" && ticks[2] !== '""', `${name}: the multi-select step ticks its tab`).toBe(true);
   expect.soft(ticks[0] !== "none" && ticks[0] !== '""', `${name}: the radio step keeps its tick`).toBe(true);
   expect.soft([1, 3].every(step => ticks[step] === "none" || ticks[step] === '""'), `${name}: untouched steps stay unticked`).toBe(true);
+  // The pills name the steps apart — the critique's P1: four identical
+  // ellipsised sentences told the reader nothing about which step was which.
+  const labels = await card.locator(".chat-question-tab").evaluateAll(tabList =>
+    (tabList as HTMLElement[]).map(tab => (tab.childNodes[0]?.textContent ?? "").trim()));
+  expect.soft(new Set(labels).size, `${name}: tab pills name distinct steps`).toBe(4);
+  expect.soft(labels.every(text => /^Q\d+ — Priorities$/.test(text)), `${name}: pills carry the short step label, not the long statement`).toBe(true);
 
   const read = (selector: string) => visiblePanel.locator(selector).first().evaluate((label: HTMLElement) => {
     const input = label.querySelector<HTMLInputElement>("input")!;
@@ -211,6 +217,9 @@ async function runRepro(page: Page, request: APIRequestContext, testInfo: TestIn
     await captureScreenshot(page, testInfo, `question-repro-${label}-${viewport.name}`);
     await assertReadable(page, `${label}/${viewport.name}`);
     await assertDistinctSelection(page, `${label}/${viewport.name}`);
+    // The chosen-vs-unchosen pair: the critique's evidence gap — the visible
+    // capture for each viewport shows the form with a real selection made.
+    await captureScreenshot(page, testInfo, `question-repro-${label}-${viewport.name}-chosen`);
   }
   await writeFile(evidencePath(testInfo, `question-repro-${label}-measurements.json`), JSON.stringify(evidence, null, 2));
   await recordEvidence(testInfo, evidencePath(testInfo, `question-repro-${label}-measurements.json`));

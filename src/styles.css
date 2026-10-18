@@ -6870,6 +6870,15 @@ html[data-ui-mode="desktop"][data-notification-chat] .chat-expand-strip {
   background: var(--accent);
 }
 
+/* Inside a request card the shared `.chat-request button` rule would
+   out-specify the single class above and flatten the primary back to grey. */
+.chat-request .chat-primary-button,
+.chat-request button.chat-primary-button {
+  border-color: var(--accent);
+  color: white;
+  background: var(--accent);
+}
+
 /* Icon-only in both chromes: the up arrow IS the action, in the accent blue
    for send and queue alike — the aria-label and title state which one this
    press is, and the label span stays in the DOM for assistive tech. */
@@ -9249,6 +9258,31 @@ body.terminal-transcript-open .touch-tab-bar {
 .chat-question-tab.is-answered::before {
   content: "✓ ";
   color: var(--accent);
+}
+
+/* The answered state rides the tab in words as well as the visual tick, so
+   it reaches the accessibility tree; spoken only when a tick is real. */
+.chat-question-tab .chat-question-tab-answered {
+  display: none;
+}
+
+.chat-question-tab.is-answered .chat-question-tab-answered {
+  display: inline;
+}
+
+.chat-question-panel legend {
+  color: var(--text-strong);
+}
+
+.chat-question-panel .chat-question-step,
+.chat-question-panel .chat-question-statement {
+  display: block;
+}
+
+.chat-question-panel .chat-question-statement {
+  margin-top: 0.15rem;
+  font-size: 0.92em;
+  overflow-wrap: anywhere;
 }
 
 .chat-question-tab.is-active {
