@@ -489,9 +489,15 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`mobile layo
       await toggle.focus();
       await page.keyboard.press("Enter");
       await expect(page.locator("#chat-work-close")).toBeFocused();
-      const stop = page.locator("#chat-background-tasks [data-stop-task]").first();
+      await page.locator("#chat-compact-workers > summary").click();
+      const stop = page.locator("#chat-compact-workers [data-stop-task]").first();
       await stop.scrollIntoViewIfNeeded();
       await stop.focus();
+      // Opening the native disclosure used a pointer; establish keyboard
+      // modality before asserting its focus-visible ring.
+      await page.keyboard.press(engine === "webkit" ? "Alt+Shift+Tab" : "Shift+Tab");
+      await page.keyboard.press(engine === "webkit" ? "Alt+Tab" : "Tab");
+      await expect(stop).toBeFocused();
       await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
       const exposure = await workControlExposure(stop);
       expect(exposure.height).toBeGreaterThanOrEqual(44);
@@ -522,8 +528,8 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`mobile layo
       await submit(page, "Start desktop work");
       await submit(page, "One pending steer");
       await control(request, { op: "launchWorker", conversationId: id });
-      await expect(page.locator("#chat-subagents")).toHaveAttribute("open");
-      await expect(page.locator("#chat-background-tasks")).toHaveAttribute("open");
+      await page.locator("#chat-compact-workers > summary").click();
+      await expect(page.locator("#chat-compact-workers")).toHaveAttribute("open");
       await expect(page.locator(".chat-queued-message")).toHaveCount(1);
       await page.locator("#chat-input").fill("Keep this desktop draft");
       for (const height of [844, 600, 480]) {
@@ -542,15 +548,13 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`mobile layo
         expect(await page.locator("#chat-timeline").evaluate(node => node.clientHeight)).toBeGreaterThanOrEqual(Math.min(192, height * 0.35));
         await expect(page.locator("#chat-input")).toBeFocused();
         await expect(page.locator("#chat-input")).toHaveValue("Keep this desktop draft");
-        await expect(page.locator("#chat-subagents")).toHaveAttribute("open");
-        await expect(page.locator("#chat-background-tasks")).toHaveAttribute("open");
+        await expect(page.locator("#chat-compact-workers")).toHaveAttribute("open");
         await saveEvidence(testInfo, `combined-${engine}-${height}.json`, JSON.stringify(await surface.evaluate(node => ({ panel: node.clientHeight, scroll: node.scrollHeight, transcript: document.querySelector("#chat-timeline")!.clientHeight, dock: document.querySelector("#chat-work-dock")!.getBoundingClientRect().height, composerBottom: document.querySelector("#chat-composer")!.getBoundingClientRect().bottom })), null, 2));
         await captureScreenshot(page, testInfo, `combined-${engine}-desktop-${height}`);
-        // The shared heading band can require the existing explicit work
-        // sheet sooner than nested lists did. Verify the same full action.
+        // The bounded card retains the existing explicit work fallback.
         const workToggle = page.locator("#chat-work-toggle");
         if (await workToggle.isVisible()) await workToggle.click();
-        const stop = page.locator("#chat-background-tasks [data-stop-task]").first();
+        const stop = page.locator("#chat-compact-workers [data-stop-task]").first();
         await stop.scrollIntoViewIfNeeded();
         await stop.focus();
         // macOS WebKit's full-control keyboard traversal uses Option+Tab.
@@ -572,16 +576,18 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`mobile layo
       await page.locator("#chat-items").getByRole("button", { name: "Revert message", exact: true }).last().click();
       const warning = page.locator("#chat-queue-note .chat-queue-replacement");
       await expect(warning).toContainText("delivered together with your replacement");
+      await warning.scrollIntoViewIfNeeded();
       await expect(warning).toBeInViewport({ ratio: 1 });
       await saveEvidence(testInfo, `combined-warning-${engine}.json`, JSON.stringify(await page.evaluate(() => Object.fromEntries(["chat-work-dock", "chat-queue", "chat-queue-note"].map(id => { const node = document.getElementById(id)!; const box = node.getBoundingClientRect(); return [id, { top: box.top, bottom: box.bottom, clientHeight: node.clientHeight, scrollHeight: node.scrollHeight, scrollTop: node.scrollTop }]; }))), null, 2));
       await expect(page.locator("#chat-input")).toHaveValue("Start desktop work");
       await captureScreenshot(page, testInfo, `combined-${engine}-desktop-replacement-warning`);
       await page.locator("#chat-work-dock").evaluate(node => { node.scrollTop = 0; });
       await control(request, { op: "launchWorker", conversationId: id });
-      await expect(page.locator("#chat-background-tasks-items > li")).toHaveCount(2);
+      await expect(page.locator("#chat-compact-workers-items [data-worker-id]")).toHaveCount(2);
       expect(await page.locator("#chat-work-dock").evaluate(node => node.scrollTop)).toBe(0);
-      // Replacement safety precedes the expanded bodies in the shared grid;
-      // a live worker update must still leave the deliberate top scroll alone.
+      // Updates preserve deliberate top scrolling. The warning stays
+      // reachable below the intact card, rather than interleaved with rows.
+      await warning.scrollIntoViewIfNeeded();
       await expect(warning).toBeInViewport();
     });
   });
@@ -717,7 +723,9 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`mobile layo
   });
 
   test("touch work controls have readable text, targets, and native-highlight-free feedback", async ({ page, request }) => {
-    await loaded(page, request);
+    const conversationId = await loaded(page, request);
+    const finished = await control(request, { op: "launchWorker", conversationId });
+    await control(request, { op: "settleWorker", childId: finished.childId, workerState: "completed" });
     for (const selector of [".chat-task-stop", ".chat-queued-action"]) {
       const control = page.locator(selector).first();
       expect(await control.evaluate(element => getComputedStyle(element).getPropertyValue("-webkit-tap-highlight-color"))).toMatch(/rgba\(0, 0, 0, 0\)|transparent/);
@@ -729,7 +737,9 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`mobile layo
     // Active actionable rows use title + metadata within the Stop footprint.
     expect((await open.boundingBox())!.height).toBeGreaterThanOrEqual(40);
     expect((await open.boundingBox())!.height).toBeLessThanOrEqual(48);
-    const dense = page.locator(".chat-worker-row:not(:has(.chat-task-stop)) .chat-worker-inspect").first();
+    // Foreground active workers may have no Stop; density follows lifecycle,
+    // not the availability of that action.
+    const dense = page.locator('.chat-worker-row[data-state="completed"] .chat-worker-inspect').first();
     expect((await dense.boundingBox())!.height).toBeGreaterThanOrEqual(26);
     expect((await dense.boundingBox())!.height).toBeLessThanOrEqual(28);
     expect((await page.locator(".chat-worker-row .chat-task-stop").first().boundingBox())!.height).toBeGreaterThanOrEqual(44);

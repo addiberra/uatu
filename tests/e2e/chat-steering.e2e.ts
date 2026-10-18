@@ -75,6 +75,13 @@ const dock = (page: Page) => page.locator("#chat-queue .chat-queued-message");
 const steers = (page: Page) => page.locator("#chat-queue .chat-queued-message[data-delivery='steer']");
 const held = (page: Page) => page.locator("#chat-queue .chat-queued-message[data-delivery='queue']");
 
+async function inspectPending(page: Page): Promise<void> {
+  const pending = page.locator("[data-pending-toggle]");
+  await expect(pending).toBeVisible();
+  if (await pending.getAttribute("aria-expanded") === "false") await pending.click();
+  await expect(pending).toHaveAttribute("aria-expanded", "true");
+}
+
 test.describe("steering an OpenCode 2.x turn", () => {
   test.beforeEach(async ({ page, request }) => bootChat(page, request));
 
@@ -92,6 +99,7 @@ test.describe("steering an OpenCode 2.x turn", () => {
       expect((await accepted).ok()).toBe(true);
     }
     await expect(dock(page)).toHaveCount(4);
+    await inspectPending(page);
     const removes = page.locator("#chat-queue [data-queue-remove]");
     const labels = await removes.evaluateAll(nodes => nodes.map(node => node.getAttribute("aria-label")));
     expect(new Set(labels).size).toBe(4);
@@ -112,6 +120,7 @@ test.describe("steering an OpenCode 2.x turn", () => {
     await submit(page, "Remove first", "Alt+Enter");
     await submit(page, "Remove second", "Alt+Enter");
     await expect(held(page)).toHaveCount(2);
+    await inspectPending(page);
     await page.evaluate(() => {
       const live = document.querySelector("#chat-composer-status-live")!;
       const messages: string[] = [];
@@ -130,7 +139,7 @@ test.describe("steering an OpenCode 2.x turn", () => {
     expect(await announcements()).toEqual([]);
     expect(deletes).toBe(2);
     await control(request, { action: "opencode", op: "launchWorker", conversationId });
-    await expect(page.locator("#chat-subagents")).toContainText("Inspect safe fixture");
+    await expect(page.locator("#chat-compact-workers")).toContainText("Inspect safe fixture");
     expect(await announcements()).toEqual([]);
     expect(deletes).toBe(2);
   });
@@ -145,11 +154,12 @@ test.describe("steering an OpenCode 2.x turn", () => {
       document.documentElement.dataset.activeTab = "chat";
     }, { mode, theme });
     for (let index = 1; index <= 5; index++) await submit(page, `Audit pending ${index}: preserve this longer message for a readable dock`, index > 2 ? "Alt+Enter" : "Enter");
-    if (mode === "touch") await page.locator("[data-pending-toggle]").click();
+    await inspectPending(page);
     const queue = page.locator("#chat-queue");
     const scroller = page.locator("#chat-work-dock");
     await scroller.evaluate(element => { element.scrollTop = 0; });
-    await expect(queue.locator(".chat-queue-header")).toContainText(mode === "touch" ? "2 steers · 3 queued" : "5 pending · 2 steers · 3 queued");
+    await expect(queue.locator(".chat-queue-header")).toContainText("2 steers · 3 queued");
+    await expect(dock(page)).toHaveCount(5);
     await expect(scroller).toHaveClass(/has-more-below/);
     const metrics = await scroller.evaluate(element => ({ height: element.clientHeight, viewport: innerHeight }));
     expect(metrics.height).toBeGreaterThan(135);
@@ -345,6 +355,7 @@ test.describe("steering an OpenCode 2.x turn", () => {
     expect(await submit(page, "Held later", "Alt+Enter")).toMatchObject({ delivery: "queue" });
     // Steers list first.
     await expect(dock(page)).toHaveText([/Steer me/, /Held first/, /Held later/]);
+    await inspectPending(page);
     await captureScreenshot(page, testInfo, "steering-dock-mixed");
 
     // Queued → steer: the message leaves the workspace's queue for the inbox.
@@ -369,6 +380,7 @@ test.describe("steering an OpenCode 2.x turn", () => {
     expect(await submit(page, "Remove me")).toMatchObject({ delivery: "steer" });
     expect(await submit(page, "Edit me instead")).toMatchObject({ delivery: "steer" });
     await expect(steers(page)).toHaveCount(2);
+    await inspectPending(page);
 
     const removal = page.waitForResponse(response => response.url().includes("/queue/") && response.request().method() === "DELETE");
     await steers(page).filter({ hasText: "Remove me" }).locator("[data-queue-remove]").click();
@@ -393,6 +405,7 @@ test.describe("steering an OpenCode 2.x turn", () => {
       expect(await submit(page, "Too late to change")).toMatchObject({ delivery: "steer" });
       const steer = steers(page).filter({ hasText: "Too late to change" });
       await expect(steer).toHaveCount(1);
+      await inspectPending(page);
       const inboxId = await steer.getAttribute("data-chat-queued-id");
       await page.locator("#chat-input").fill("My private draft");
       // OpenCode delivers the entry as the cancel arrives, and confirms no cancel.
@@ -459,6 +472,7 @@ test.describe("steering an OpenCode 2.x turn", () => {
     const cancelled = page.waitForResponse(response => response.url().endsWith("/cancel"));
     await page.locator("#chat-stop").click();
     expect((await cancelled).ok()).toBe(true);
+    await inspectPending(page);
     const action = held(page).filter({ hasText: "Send selected queue" }).locator("[data-queue-send-now]");
     await expect(action).toHaveText("Send now + paused steers");
     await action.click();
@@ -526,6 +540,7 @@ test.describe("steering an OpenCode 2.x turn", () => {
   test("Revert reveals its replacement warning in an already-scrolled dock without stealing subsequent scroll", async ({ page, request }, testInfo) => {
     await startTurn(page, request);
     for (let index = 1; index <= 6; index++) await submit(page, `Pending steer ${index}`);
+    await inspectPending(page);
     const queue = page.locator("#chat-work-dock");
     const note = page.locator("#chat-queue-note");
     await queue.evaluate(element => { element.scrollTop = element.scrollHeight; });
@@ -549,6 +564,7 @@ test.describe("steering an OpenCode 2.x turn", () => {
     expect(await submit(page, "/reload")).toMatchObject({ pending: true, delivery: "queue" });
     const command = held(page).filter({ hasText: "/reload" });
     await expect(command).toHaveCount(1);
+    await inspectPending(page);
     await expect(command.locator("[data-queue-steer]")).toHaveCount(0);
     await expect(command.locator("[data-queue-send-now]")).toHaveCount(0);
     await expect(command.locator("[data-queue-remove]")).toHaveCount(1);
@@ -571,6 +587,7 @@ test.describe("steering an OpenCode 2.x turn", () => {
     await expect(dock(page).nth(0)).toHaveAttribute("data-delivery", "steer");
     await expect(dock(page).nth(1)).toHaveAttribute("data-delivery", "queue");
     await expect(page.locator("#chat-queue .chat-queued-message[data-paused]")).toHaveCount(2);
+    await inspectPending(page);
     await expect(page.locator("#chat-queue-note")).toBeVisible();
   });
 });

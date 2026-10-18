@@ -6,10 +6,9 @@ import { openChatPanel } from "./chat-helpers";
 
 const test = withEngineBrowsers(base);
 
-// Touch tracks project their summary/body into the dock grid; display:contents
-// has no border box. Measure the actual rendered track, not that wrapper.
+// Measure the real card, including its border and bounded body.
 async function trackHeight(track: import("@playwright/test").Locator): Promise<number> {
-  return track.evaluate(node => [...node.children].reduce((height, child) => height + child.getBoundingClientRect().height, 0));
+  return track.evaluate(node => node.getBoundingClientRect().height);
 }
 
 for (const engine of ["chromium", "webkit"] as const) test.describe(`canonical workers ${engine}`, () => {
@@ -220,7 +219,7 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`canonical w
     }
     expect(await rows.evaluateAll(nodes => nodes.map(node => (node as HTMLElement).dataset.workerId))).toEqual(["job:18", "job:19", ...Array.from({ length: 18 }, (_, i) => `job:${17 - i}`)]);
     const scrollContainers = await page.locator("#chat-work-dock").evaluate(node => [node, ...node.querySelectorAll("*")].filter(element => element.getBoundingClientRect().height > 0 && /auto|scroll/.test(getComputedStyle(element).overflowY)).map(element => element.id || element.className));
-    expect(scrollContainers).toEqual(["chat-work-dock"]);
+    expect(scrollContainers).toEqual(["chat-compact-workers-items"]);
     await captureScreenshot(page, info, `workers-${engine}-${theme}-history`);
     await expect(track.locator('[data-worker-id="job:18"] .chat-worker-model')).toHaveText("GPT-6.1 Sol");
     await expect(track.locator('[data-worker-id="job:18"] .chat-worker-tokens')).toHaveText("Σ 229k");
@@ -299,8 +298,7 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`canonical w
       window.visualViewport!.dispatchEvent(new Event("resize"));
     });
     await captureScreenshot(page, info, `workers-${engine}-${theme}-unknown`);
-    // The same twenty-job snapshot on a fine-pointer desktop preserves the
-    // established tracks and keeps primary controls in short windows.
+    // The same canonical card is used on fine-pointer desktop too.
     const desktop = await page.context().browser()!.newPage({ viewport: { width: 1280, height: 844 }, hasTouch: false, isMobile: false, colorScheme: theme });
     try {
       const desktopUrl = new URL(page.url());
@@ -309,7 +307,7 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`canonical w
       await expect(desktop.locator("#connection-state .connection-label")).toHaveText("Connected");
       await openChatPanel(desktop);
       await desktop.locator("#chat-conversation-select").selectOption(snapshot.conversation.id);
-      await expect(desktop.locator("#chat-compact-workers")).toBeHidden();
+      await expect(desktop.locator("#chat-compact-workers")).toBeVisible();
       for (const height of [844, 600, 480]) {
         await desktop.setViewportSize({ width: 1280, height });
         await expect(desktop.locator("#chat-send")).toBeVisible();

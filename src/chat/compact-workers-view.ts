@@ -53,7 +53,10 @@ export class CompactWorkersView {
       if (worker.taskId) row.dataset.backgroundTask = worker.taskId;
       const inspect = row.firstElementChild as HTMLButtonElement;
       inspect.dataset.workerItem = worker.id;
-      if (worker.taskId) inspect.dataset.inspectTask = worker.taskId;
+      if (worker.taskId) {
+        inspect.dataset.inspectTask = worker.taskId;
+        inspect.dataset.inspectView = worker.kind === "shell" ? "output" : "transcript";
+      }
       inspect.title = worker.name;
       inspect.setAttribute("aria-label", [worker.name, worker.agent, workerStateLabel(worker.state), worker.model, worker.tokens === undefined ? undefined : `${worker.tokens.toLocaleString()} cumulative tokens`].filter(Boolean).join(" · "));
       // The handler looks up the current row model, not a stale closure.
@@ -71,7 +74,7 @@ export class CompactWorkersView {
           const clock = new Date(worker.settledAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
           time.textContent = worker.settledAt === worker.since ? `Started ${clock}` : clock;
         }
-        if (!workerIsActive(worker.state)) meta.append(" · ", time);
+        if (!workerIsActive(worker.state) || worker.kind === "shell") meta.append(" · ", time);
       }
       const model = inspect.querySelector<HTMLElement>(".chat-worker-model")!;
       model.textContent = worker.model ?? "—";

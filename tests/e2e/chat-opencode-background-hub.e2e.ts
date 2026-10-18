@@ -1,5 +1,5 @@
 import { childChatControl, expect, openEventSources, openSessionTab, test } from "./hub-fixtures";
-import { openChatPanel } from "./chat-helpers";
+import { openChatPanel, openChatWorkers } from "./chat-helpers";
 import type { Page } from "@playwright/test";
 
 test.use({ hubWorkspaces: ["alpha", "beta"] });
@@ -32,6 +32,7 @@ test("native V2 workers keep another workspace working and return through one st
   await parent.reload();
   await openChatPanel(parent);
   await expect(parent.locator("#chat-items")).toContainText("Historical fixture answer 59");
+  await openChatWorkers(parent);
   const row = parent.locator(`[data-background-task="${worker.taskId}"]`);
   await expect(row).toBeVisible();
   await parent.locator("#chat-input").fill("Preserved workspace draft");
@@ -84,5 +85,5 @@ test("native V2 workers keep another workspace working and return through one st
   const offset = await timeline.evaluate((element, id) => element.querySelector<HTMLElement>(`[data-chat-item-id="${CSS.escape(id)}"]`)!.getBoundingClientRect().top - element.getBoundingClientRect().top, anchor.id);
   expect(Math.abs(offset - anchor.offset)).toBeLessThan(4);
   await expect(parent.locator(`[data-chat-item-id="task:${worker.taskId}"]`)).toHaveCount(1);
-  await expect(parent.locator("#chat-background-tasks-items [data-inspect-task]")).toHaveCount(0);
+  await expect(parent.locator('#chat-compact-workers-items .chat-worker-row:is([data-state="working"], [data-state="unknown"]) [data-inspect-task]')).toHaveCount(0);
 });

@@ -122,9 +122,10 @@ Expanded worker details SHALL show one flat list: confirmed working and unknown 
 
 #### Scenario: Expanded workers retain the pending overview
 - **WHEN** six or more workers and pending messages are expanded on touch or desktop, including while the touch keyboard is open
-- **THEN** worker and pending summaries remain visible together at the dock edge with one scroller for expanded content below
+- **THEN** one bordered canonical worker card contains its header and rows, and a separate compact Pending disclosure follows the card before the composer, without duplicate desktop subagent/background summaries
+- **AND** with Pending collapsed only the bounded worker body scrolls, leaving the card header and Pending footer visible; expanded Pending, replacement warnings, the explicit desktop work sheet or independent work tracks use one aggregate dock scroller without nested worker scrolling
 - **AND** summary action identity, composing focus, reading anchors, safe areas and existing transcript budgets are preserved
-- **AND** short touch bands share one heading row; if the measured budget cannot contain it plus a complete 44px action, headings scroll away to expose that action rather than consume transcript space
+- **AND** short bands may scroll secondary headings away to expose complete actions rather than consume transcript space; Pending never appears between the worker header and its rows
 
 #### Scenario: Enlarged question options remain readable beneath date history
 - **WHEN** question options intersect a sticky date marker on a 390px touch viewport at 200% root text size

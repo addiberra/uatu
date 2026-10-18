@@ -1,5 +1,5 @@
 import type { APIRequestContext, Page } from "@playwright/test";
-import { openChatPanel } from "./chat-helpers";
+import { openChatPanel, openChatWorkers } from "./chat-helpers";
 import { test as base, expect } from "./fixtures";
 import { withEngineBrowsers } from "./page-diagnostics";
 import { captureScreenshot } from "./evidence";
@@ -12,10 +12,11 @@ async function control(request: APIRequestContext, body: Record<string, unknown>
 }
 
 async function revealTouchWorkers(page: Page) {
-  if (await page.locator("html").getAttribute("data-ui-mode") !== "touch") return;
-  const workers = page.locator("#chat-compact-workers");
-  if (!await workers.getAttribute("open").then(value => value !== null)) await workers.locator(":scope > summary").tap();
+  await openChatWorkers(page);
 }
+
+const liveWorkerInspections = '#chat-compact-workers-items .chat-worker-row:is([data-state="working"], [data-state="unknown"]) [data-inspect-task]';
+const activeTask = (page: Page, taskId: string) => page.locator(`.chat-worker-row:is([data-state="working"], [data-state="unknown"])[data-background-task="${taskId}"]`);
 
 // Manual backgrounding remains an API contract, not a chat control. Drive the
 // browser HTTP boundary so response-loss/receipt tests retain their real route.
@@ -81,7 +82,7 @@ test("manual background API stays available without Continue or success feedback
   expect((await backgroundViaAPI(page, conversationId)).status).toBe(200);
   await control(request, { op: "finish", conversationId });
   await control(request, { op: "settleWorker", childId: worker.childId });
-  await expect(page.locator("#chat-background-tasks-items [data-inspect-task]")).toHaveCount(0);
+  await expect(page.locator(liveWorkerInspections)).toHaveCount(0);
   await expect(page.locator("#chat-background-action")).toBeHidden();
   await expect(page.locator("#chat-background-feedback")).toHaveCount(0);
   await control(request, { op: "wakeParent", conversationId });
@@ -103,7 +104,7 @@ for (const theme of ["light", "dark"] as const) test(`background audit desktop $
   await expect(page.locator(".chat-background-help")).toHaveCount(0);
   await captureScreenshot(page, testInfo, `audit-background-desktop-${theme}-blocking`);
   expect((await backgroundViaAPI(page, conversationId)).status).toBe(200);
-  await expect(page.locator("#chat-background-tasks-items [data-inspect-task]")).toHaveCount(2);
+  await expect(page.locator(liveWorkerInspections)).toHaveCount(2);
   await expect(proceed).toBeHidden();
   await captureScreenshot(page, testInfo, `audit-background-desktop-${theme}-detached`);
   await control(request, { op: "finish", conversationId });
@@ -128,14 +129,15 @@ test("manual background API is parent-wide, keeps the draft, and inspection surv
   const proceed = page.getByRole("button", { name: "Continue while workers run", exact: true });
   await expect(proceed).toHaveCount(0);
   expect((await backgroundViaAPI(page, conversationId)).status).toBe(200);
-  await expect(page.locator("#chat-background-tasks-items [data-inspect-task]")).toHaveCount(1);
+  await expect(page.locator(liveWorkerInspections)).toHaveCount(1);
   await expect(page.locator("#chat-input")).toHaveValue("Keep this draft");
   await expect(page.locator("#chat-attachments")).toHaveText(attachments!);
   await expect(page.locator("#chat-configuration-summary")).toHaveText(configuration!);
   expect(await page.locator("#chat-send-help").textContent()).toBe(delivery);
   const state = await control(request, { op: "state" });
   expect(state.calls.filter((call: string) => call.startsWith("POST ") && call.includes("/background"))).toHaveLength(1);
-  await page.locator("#chat-background-tasks-items [data-inspect-task]").click();
+  await openChatWorkers(page);
+  await page.locator(liveWorkerInspections).click();
   await expect(page.locator("#chat-drilldown-items")).toContainText("Check fixture");
   await control(request, { op: "settleWorker", childId: worker.childId, workerState: "error", text: "Fixture failed safely" });
   await expect(page.locator("#chat-drilldown-task")).toContainText("failed");
@@ -147,7 +149,7 @@ test("manual background API is parent-wide, keeps the draft, and inspection surv
   await expect(page.locator(".chat-task-summary", { hasText: "Fixture failed safely" })).toHaveCount(1);
   await page.reload();
   await openChatPanel(page);
-  await expect(page.locator("#chat-background-tasks-items [data-inspect-task]")).toHaveCount(0);
+  await expect(page.locator(liveWorkerInspections)).toHaveCount(0);
   const report = page.locator(`[data-chat-item-id="task:${worker.taskId}"]`);
   await expect(report).toContainText("failed");
 });
@@ -159,7 +161,8 @@ for (const [workerState, outcome] of [["completed", "finished"], ["error", "fail
     const sibling = await control(request, { op: "launchWorker", conversationId });
     await control(request, { op: "finish", conversationId, text: "Parent finished" });
     await expect(page.locator("#chat-stop")).toBeDisabled();
-    const row = page.locator(`[data-background-task="${worker.taskId}"]`);
+    await openChatWorkers(page);
+    const row = activeTask(page, worker.taskId);
     await expect(row).toBeVisible();
     if (workerState === "cancelled") {
       const acknowledged = page.waitForResponse(response => response.url().includes("/tasks/") && response.url().endsWith("/stop"));
@@ -176,7 +179,7 @@ for (const [workerState, outcome] of [["completed", "finished"], ["error", "fail
     }
     await control(request, { op: "settleWorker", childId: worker.childId, workerState, text: `Report ${outcome}` });
     await expect(row).toHaveCount(0);
-    await expect(page.locator("#chat-background-tasks-items [data-inspect-task]")).toHaveCount(1);
+    await expect(page.locator(liveWorkerInspections)).toHaveCount(1);
     await expect(page.locator(`[data-chat-item-id="task:${worker.taskId}"]`)).toContainText(outcome);
     expect((await control(request, { op: "state" })).sessions[sibling.childId].running).toBe(true);
   });
@@ -186,19 +189,20 @@ test("a sibling settling or launching preserves the focused surviving worker con
   const conversationId = await boot(page, request);
   const a = await control(request, { op: "launchWorker", conversationId });
   const b = await control(request, { op: "launchWorker", conversationId });
-  const row = page.locator(`[data-background-task="${a.taskId}"]`);
+  await openChatWorkers(page);
+  const row = activeTask(page, a.taskId);
   const inspect = row.locator("[data-inspect-task]");
   const stop = row.locator("[data-stop-task]");
   await inspect.focus();
   await control(request, { op: "settleWorker", childId: b.childId, text: "Sibling finished" });
-  await expect(page.locator(`[data-background-task="${b.taskId}"]`)).toHaveCount(0);
+  await expect(activeTask(page, b.taskId)).toHaveCount(0);
   await expect(inspect).toBeFocused();
   await stop.focus();
   const c = await control(request, { op: "launchWorker", conversationId });
-  await expect(page.locator(`[data-background-task="${c.taskId}"]`)).toBeVisible();
+  await expect(activeTask(page, c.taskId)).toBeVisible();
   await expect(stop).toBeFocused();
   await control(request, { op: "settleWorker", childId: c.childId });
-  await expect(page.locator(`[data-background-task="${c.taskId}"]`)).toHaveCount(0);
+  await expect(activeTask(page, c.taskId)).toHaveCount(0);
   await expect(stop).toBeFocused();
   expect((await control(request, { op: "state" })).calls.some((call: string) => call.startsWith("POST ") && call.includes("/interrupt"))).toBe(false);
 });
@@ -219,7 +223,8 @@ test("completion wins a delayed worker Stop response; an idle parent can prompt 
     admitted();
     await gate; await route.fulfill({ response });
   });
-  const row = page.locator(`[data-background-task="${worker.taskId}"]`);
+  await openChatWorkers(page);
+  const row = activeTask(page, worker.taskId);
   await row.locator("[data-stop-task]").click();
   await expect(row.locator("[data-stop-task]")).toHaveText("Stopping…");
   await stopAdmitted;
@@ -259,7 +264,7 @@ for (const boundary of ["browser", "upstream"] as const) {
     await page.unroute("**/api/chat/conversations/*/background");
     await control(request, { op: "disconnect" });
     await page.reload(); await openChatPanel(page);
-    await expect(page.locator("#chat-background-tasks-items [data-inspect-task]")).toHaveCount(1);
+    await expect(page.locator(liveWorkerInspections)).toHaveCount(1);
     const state = await control(request, { op: "state" });
     expect(state.calls.filter((call: string) => call.startsWith("POST ") && call.includes("/background"))).toHaveLength(1);
   });
@@ -321,7 +326,7 @@ test("an accepted no-op invents no tasks; unadvertised capability offers no Cont
   expect(response.ok()).toBe(true);
   expect(await response.json()).toEqual({ accepted: true });
   await expect(page.locator("#chat-background-feedback")).toHaveCount(0);
-  await expect(page.locator("#chat-background-tasks-items [data-inspect-task]")).toHaveCount(0);
+  await expect(page.locator(liveWorkerInspections)).toHaveCount(0);
   expect((await control(request, { op: "state" })).calls.filter((call: string) => call.startsWith("POST ") && call.includes("/background"))).toHaveLength(1);
   await boot(page, request, false);
   await expect(page.getByRole("button", { name: "Continue while workers run", exact: true })).toHaveCount(0);
@@ -334,7 +339,8 @@ for (const phase of ["running", "exit", "captureBeforeRemove"] as const) {
     await control(request, { op: "launchWorker", conversationId, background: false });
     const shell = await control(request, { op: "launchShell", conversationId, background: false });
     expect((await backgroundViaAPI(page, conversationId)).status).toBe(200);
-    await expect(page.locator("#chat-background-tasks-items [data-inspect-task]")).toHaveCount(3);
+    await expect(page.locator(liveWorkerInspections)).toHaveCount(3);
+    await openChatWorkers(page);
     await page.locator(`[data-background-task="${shell.taskId}"] [data-inspect-task]`).click();
     await expect(page.locator("#chat-drilldown-output-text")).toContainText("safe shell output");
     if (phase !== "running") await control(request, { op: "shellPhase", shellId: shell.shellId, shellPhase: phase });
@@ -358,7 +364,7 @@ for (const phase of ["running", "exit", "captureBeforeRemove"] as const) {
     await expect(page.locator("#chat-drilldown-output-note")).toContainText("Output unavailable");
     await expect(page.locator("#chat-drilldown-output-text")).toContainText("safe shell output");
     await page.keyboard.press("Escape");
-    await expect(page.locator("#chat-background-tasks-items [data-inspect-task]")).toHaveCount(2);
+    await expect(page.locator(liveWorkerInspections)).toHaveCount(2);
     const state = await control(request, { op: "state" });
     expect(state.calls.filter((call: string) => call.startsWith("POST ") && call.includes("/background"))).toHaveLength(1);
     expect(state.calls.filter((call: string) => call.startsWith("DELETE /api/shell/"))).toHaveLength(1);
@@ -373,13 +379,14 @@ for (const kind of ["child", "shell"] as const) test(`unknown ${kind} stop stays
   await control(request, { op: "loseWorkerResponse" });
   let requestId = "";
   page.on("request", request => { if (request.url().includes("/tasks/") && request.url().endsWith("/stop")) requestId = request.postDataJSON().requestId; });
-  await page.locator(`[data-background-task="${worker.taskId}"] [data-stop-task]`).click();
+  await openChatWorkers(page);
+  await activeTask(page, worker.taskId).locator("[data-stop-task]").click();
   if (kind === "shell") await page.getByRole("dialog", { name: "Stop shell worker?" }).getByRole("button", { name: "Stop shell worker", exact: true }).click();
   await expect(page.locator("#chat-state")).toContainText("Outcome unknown");
   const retry = await page.request.post(`/api/chat/conversations/${encodeURIComponent(conversationId)}/tasks/${encodeURIComponent(worker.taskId)}/stop`, { headers: { origin: new URL(page.url()).origin }, data: { requestId } });
   expect(retry.status()).toBe(409);
   await page.reload(); await openChatPanel(page);
-  await expect(page.locator("#chat-background-tasks-items [data-inspect-task]")).toHaveCount(1);
+  await expect(page.locator(liveWorkerInspections)).toHaveCount(1);
   const state = await control(request, { op: "state" });
   const calls = state.calls.filter((call: string) => kind === "child" ? call.startsWith("POST ") && call.includes("/interrupt") : call.startsWith("DELETE /api/shell/"));
   expect(calls).toHaveLength(1);
@@ -392,6 +399,7 @@ test("historical result inspection stays on the selected occurrence when its chi
   await expect(page.locator(`[data-chat-item-id="task:${first.taskId}"]`)).toContainText("finished");
   const later = await control(request, { op: "launchWorker", conversationId, childId: first.childId });
   expect(later.childId).toBe(first.childId);
+  await openChatWorkers(page);
   await expect(page.locator(`[data-background-task="${later.taskId}"]`)).toBeVisible();
   for (const group of await page.locator("#chat-items details.chat-activity-group:not([open]) > summary").all()) await group.click();
   const report = page.locator(`[data-chat-item-id="task:${first.taskId}"]`);
@@ -406,20 +414,21 @@ test("historical result inspection stays on the selected occurrence when its chi
   await expect(report).toContainText("Earlier worker report");
 });
 
-test("narrow keyboard worker updates do not steal draft focus without a manual Continue control", async ({ page, request }) => {
+test("narrow keyboard worker updates do not steal draft focus without a manual Continue control", async ({ page, request, browserName }) => {
   // Desktop below 900px intentionally yields Chat to Preview; exercise a
   // narrow split panel above that existing layout guard instead.
   await page.setViewportSize({ width: 1100, height: 900 });
   await page.emulateMedia({ reducedMotion: "reduce" });
   const conversationId = await boot(page, request);
   const worker = await control(request, { op: "launchWorker", conversationId, background: false });
+  await openChatWorkers(page);
   await page.locator("#chat-input").fill("Keyboard draft stays here");
   const proceed = page.getByRole("button", { name: "Continue while workers run", exact: true });
   await expect(proceed).toHaveCount(0);
   await page.locator("#chat-input").focus();
   expect((await backgroundViaAPI(page, conversationId)).status).toBe(200);
   await expect(page.locator("#chat-input")).toHaveValue("Keyboard draft stays here");
-  const row = page.locator(`[data-background-task="${worker.taskId}"]`);
+  const row = activeTask(page, worker.taskId);
   await expect(row).toBeVisible();
   const inspect = (await row.locator("[data-inspect-task]").boundingBox())!;
   const stop = (await row.locator("[data-stop-task]").boundingBox())!;
@@ -427,7 +436,7 @@ test("narrow keyboard worker updates do not steal draft focus without a manual C
   expect(stop.height).toBeGreaterThanOrEqual(44);
   expect(stop.x - inspect.x - inspect.width).toBeGreaterThanOrEqual(8);
   await row.locator("[data-inspect-task]").focus();
-  await page.keyboard.press("Tab");
+  await page.keyboard.press(browserName === "webkit" ? "Alt+Tab" : "Tab");
   await expect(row.locator("[data-stop-task]")).toBeFocused();
   expect(await row.locator("[data-stop-task]").evaluate(element => getComputedStyle(element).outlineStyle)).not.toBe("none");
   await page.locator("#chat-input").focus();
@@ -442,6 +451,7 @@ test("provider reconnect recovers a missed pending result while another parent i
   const conversationId = await boot(page, request);
   const worker = await control(request, { op: "launchWorker", conversationId });
   await control(request, { op: "finish", conversationId });
+  await openChatWorkers(page);
   await expect(page.locator(`[data-background-task="${worker.taskId}"]`)).toBeVisible();
   await page.getByRole("button", { name: "New conversation" }).click();
   await expect(page.locator("#chat-conversation-select")).not.toHaveValue(conversationId);
@@ -461,7 +471,7 @@ test("provider reconnect recovers a missed pending result while another parent i
   await page.locator("#chat-conversation-select").selectOption(conversationId);
   const result = page.locator(`[data-chat-item-id="task:${worker.taskId}"]`);
   await expect(result).toContainText("finished");
-  await expect(page.locator("#chat-background-tasks-items [data-inspect-task]")).toHaveCount(0);
+  await expect(page.locator(liveWorkerInspections)).toHaveCount(0);
   for (const group of await page.locator("#chat-items details.chat-activity-group:not([open]) > summary").all()) await group.click();
   await result.locator("> summary").click();
   await expect(result).toContainText("Missed completion recovered");
@@ -492,7 +502,7 @@ test("an oldest-page launch survives return and a terminal result racing the bro
   await control(request, { op: "settleWorker", childId: worker.childId, text: "Result won the stale snapshot" });
   release();
   await expect(page.locator(`[data-chat-item-id="task:${worker.taskId}"]`)).toContainText("finished");
-  await expect(page.locator("#chat-background-tasks-items [data-inspect-task]")).toHaveCount(0);
+  await expect(page.locator(liveWorkerInspections)).toHaveCount(0);
   await expect(page.locator("#chat-input")).toHaveValue("Draft on paged parent");
   await page.locator("#chat-load-older").click();
   await expect(page.locator(`[data-chat-item-id="task:${worker.taskId}"]`)).toHaveCount(1);
@@ -502,6 +512,7 @@ test("an oldest-page launch survives return and a terminal result racing the bro
 test("keyboard child inspection retries the exact hidden child and returns focus without losing the parent draft", async ({ page, request }) => {
   const conversationId = await boot(page, request);
   const worker = await control(request, { op: "launchWorker", conversationId });
+  await openChatWorkers(page);
   await page.locator("#chat-input").fill("Preserved reading draft");
   const inspect = page.locator(`[data-background-task="${worker.taskId}"] [data-inspect-task]`);
   await expect(inspect).toBeVisible();

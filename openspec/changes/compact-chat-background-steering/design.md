@@ -44,26 +44,25 @@ Standard-size phone/short-landscape layouts retain 40%, and ordinary enlarged
 pending work retains its tested reading floor; no universal enlarged-text 40%
 guarantee is claimed.
 
-The approved critique refinement keeps worker and pending headings together
-at the dock edge before either expanded body. Touch details and the queue are
-flattened into the existing single grid/scroller; measured heading heights
-reserve focus-scroll space, including after keyboard resize. Native worker
-disclosure semantics and per-conversation state remain unchanged. Pending
-header actions retain DOM identity across count/expansion paints. This
-supersedes the short expanded-header scroll-away rule above; enlarged paused
-batch headers retain their existing text-relative scroll-away exception.
-Desktop similarly groups its existing disclosure headings with pending counts,
-without changing their defaults or explicit constrained Show work fallback;
-expanded tracks use the dock's aggregate budget instead of nested list caps.
-Replacement warnings precede either expanded body in both modes.
-Short expanded touch bands share one summary row. When the measured dock cannot
-fit that row plus a whole 44px action, headings scroll with the contents, retaining
-the earlier smallest-band action-access exception rather than spending the
-transcript/safe-area budget. Desktop's explicit constrained fallback now accounts
-for its actual heading band plus a full action. Long desktop composer feedback
-uses the existing focusable notice region's bounded scrolling, not clipped primary
-controls. Container sizing for enlarged paused-batch chrome is owned by the dock
-now that the queue itself is flattened; its content-relative threshold is preserved.
+The user's supplied B reference supersedes the critique attempt to pin both
+headings before the bodies. Desktop and touch share one canonical worker card:
+its real bordered disclosure contains its header and keyed rows. Legacy desktop
+subagent/background renderers are removed, not hidden behind another summary.
+Active rows keep two lines (title, then agent/model/cumulative tokens) and separate
+44px Stop targets where supported; settled rows remain dense single lines.
+Pending is a distinct compact disclosure below the complete card, before the
+composer. It never interrupts the worker header and rows.
+
+With Pending collapsed, the worker body is the dock's sole scrollport; its card
+header and separate pending footer remain in flow. Expanded Pending, replacement
+warnings, the explicit desktop work sheet or independent work tracks switch to aggregate dock scrolling, disabling
+the worker body's overflow. This retains one primary scroller without interleaved
+headings or trapped nested lists. Short bands can scroll secondary headings away
+to expose whole actions rather than spend the existing transcript/safe-area
+budget. Desktop's constrained Show work fallback remains. Native disclosure state,
+keyed pending actions, inspection/history, dismissal persistence and bounded
+composer feedback remain unchanged. Routine model notes appear only with expanded
+Pending; replacement/batch safety remains available while collapsed.
 
 An eligible ordinary-text busy draft teaches “Tap to steer · hold to queue”.
 Only accepted held queue use retires the hint, using a browser/base-path learning

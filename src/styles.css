@@ -5233,9 +5233,7 @@ html[data-ui-mode="desktop"] .chat-work-dock {
   overflow-y: auto;
   overscroll-behavior: contain;
 }
-html[data-ui-mode="desktop"][data-chat-has-work] .chat-work-dock {
-  min-height: max(52px, calc(var(--chat-work-heading-height, 0px) + 3rem + 2px));
-}
+html[data-ui-mode="desktop"][data-chat-has-work] .chat-work-dock { min-height: 52px; }
 html[data-ui-mode="desktop"] :is(#chat-background-tasks-items, #chat-subagents-items, #chat-task-list-items, #chat-scheduled-wakeups-items) {
   padding-top: 0.25rem;
   padding-right: 0.25rem;
@@ -5245,22 +5243,9 @@ html[data-ui-mode="desktop"] :is(#chat-background-tasks-items, #chat-subagents-i
 html[data-ui-mode="desktop"] .chat-work-dock { scroll-padding-block: 0.25rem; }
 html[data-ui-mode="desktop"] .chat-work-dock button { scroll-margin-block: 0.25rem; }
 html[data-ui-mode="desktop"] .chat-work-dock button:focus-visible { outline-offset: 0; }
-/* Desktop retains its disclosures/defaults, but their summaries share the
-   same leading band as pending counts. Only the dock scrolls expanded work. */
-html[data-ui-mode="desktop"] .chat-work-dock > :is(details, .chat-queue):not([hidden]) { display: contents; overflow: visible; }
-html[data-ui-mode="desktop"] .chat-work-dock > details::details-content { display: contents; }
-html[data-ui-mode="desktop"] .chat-work-dock > details > summary,
-html[data-ui-mode="desktop"] .chat-work-dock .chat-queue-header {
-  order: -2; position: sticky; top: var(--chat-heading-top, 0px); z-index: 2;
-  margin: 0 1rem; padding-block: 0.4rem; background: var(--surface-raised);
-}
-html[data-ui-mode="desktop"] .chat-work-dock > details:not([open]) > :not(summary) { display: none; }
-html[data-ui-mode="desktop"] .chat-work-dock > details > :not(summary),
-html[data-ui-mode="desktop"] .chat-work-dock .chat-queue-items {
-  max-height: none; overflow: visible; margin-inline: 1rem;
-}
+/* Keep each disclosure's header and contents together on both device modes. */
 html[data-ui-mode="desktop"] .chat-work-dock :is(#chat-background-tasks-items, #chat-subagents-items, #chat-task-list-items, #chat-scheduled-wakeups-items, .chat-reverted-items) { max-height: none; overflow: visible; }
-html[data-ui-mode="desktop"] .chat-work-dock { scroll-padding-top: var(--chat-work-heading-height, 0px); }
+html[data-ui-mode="desktop"] .chat-work-dock { scroll-padding-top: var(--chat-work-heading-height, 0px); scroll-padding-bottom: var(--chat-pending-footer-height, 0px); }
 html[data-ui-mode="desktop"] .chat-work-close { order: -3; }
 html[data-ui-mode="desktop"] .chat-composer-notices { max-height: 3rem; overflow: auto; overflow-wrap: anywhere; }
 .chat-work-toggle, .chat-work-close { display: none; }
@@ -10667,8 +10652,7 @@ html[data-ui-mode="touch"] #chat-configuration-trigger { display: none; }
 .chat-pending-toggle::before { content: "▸ "; }
 .chat-pending-toggle[aria-expanded="true"]::before { content: "▾ "; }
 .chat-pending-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-/* The dock is the only scroller. Worker rows never inherit desktop tracks. */
-html[data-ui-mode="touch"] :is(#chat-subagents, #chat-background-tasks) { display: none; }
+/* Every device uses the canonical occurrence list. */
 html[data-ui-mode="touch"] .chat-work-dock :is(.chat-queue, #chat-task-list-items, #chat-scheduled-wakeups-items, .chat-reverted-items) { max-height: none; overflow: visible; }
 .chat-compact-workers { margin: 0 0.5rem; border: 1px solid var(--border-soft); border-radius: 0.65rem; background: var(--surface-raised); font-size: 0.875rem; }
 .chat-compact-workers > summary { position: sticky; top: 0; z-index: 2; display: flex; align-items: center; gap: 6px; min-height: 1.75rem; padding: 0 8px; background: var(--surface-raised); color: var(--text-subtle); cursor: pointer; font-size: 0.8125rem; line-height: 1.25rem; list-style: none; border-radius: inherit; }
@@ -10678,26 +10662,40 @@ html[data-ui-mode="touch"] .chat-work-dock :is(.chat-queue, #chat-task-list-item
 .chat-compact-workers[open] > summary::before { transform: rotate(45deg); }
 #chat-compact-workers-label { min-width: 0; }
 .chat-compact-workers > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
-/* One scroll owner, with both native disclosures' headings before either
-   expanded body. Desktop retains its separate disclosure headings above. */
-html[data-ui-mode="touch"] .chat-work-dock :is(.chat-compact-workers, .chat-queue) { display: contents; overflow: visible; container: none; }
-html[data-ui-mode="touch"] .chat-compact-workers::details-content { display: contents; }
-html[data-ui-mode="touch"] .chat-work-dock :is(.chat-compact-workers, .chat-queue)[hidden] { display: none; }
-html[data-ui-mode="touch"] .chat-compact-workers > summary { order: -3; margin-inline: 0.5rem; outline: 1px solid var(--border-soft); outline-offset: -1px; border-radius: 0.65rem; }
-html[data-ui-mode="touch"] .chat-work-dock .chat-queue-header { order: -2; position: sticky; top: var(--chat-worker-heading-height, 0px); z-index: 2; padding-inline: 0.5rem; background: var(--surface-raised); }
-html[data-ui-mode="touch"] #chat-compact-workers-items { margin-inline: 0.5rem; background: var(--surface-raised); }
-/* Flattening the queue must retain its original content inset, including
-   room for WebKit's overlay-scrollbar hit region beside pending actions. */
-html[data-ui-mode="touch"] .chat-work-dock :is(.chat-queue-items, .chat-queue-note) { margin-inline: 0.55rem; min-width: 0; }
-html:is([data-ui-mode="touch"], [data-ui-mode="desktop"]) .chat-work-dock .chat-queue-note.is-replacement { order: -1; }
-html:is([data-ui-mode="touch"], [data-ui-mode="desktop"]) .chat-work-dock .chat-queue-items { order: 1; }
-html:is([data-ui-mode="touch"], [data-ui-mode="desktop"]) .chat-work-dock .chat-queue-note:not(.is-replacement) { order: 2; }
-html[data-ui-mode="touch"] .chat-compact-workers:not([open]) > #chat-compact-workers-items { display: none; }
-html[data-ui-mode="touch"] .chat-work-dock { scroll-padding-top: var(--chat-work-heading-height, 0px); }
+/* One scroller, one bordered worker card. The compact pending footer stays
+   below that card; expanding Pending returns its contents to ordinary flow. */
+.chat-work-dock { row-gap: 8px; padding-bottom: 4px; }
+html:is([data-ui-mode="touch"], [data-ui-mode="desktop"]) .chat-work-dock { display: flex; flex-direction: column; overflow: hidden; }
+.chat-compact-workers { display: flex; flex-direction: column; flex: 0 1 auto; min-width: 0; min-height: 30px; overflow: hidden; background: var(--surface-muted); }
+/* Only the native details content wrapper is transparent to flex sizing;
+   the disclosure itself remains the real, bordered header-and-rows card. */
+.chat-compact-workers::details-content { display: contents; }
+.chat-compact-workers > summary { flex: 0 0 auto; position: static; background: var(--surface-muted); }
+.chat-compact-workers:not([open]) > #chat-compact-workers-items { display: none; }
+#chat-compact-workers-items { min-height: 0; overflow: auto; overscroll-behavior: contain; scroll-padding-block: 4px; }
+.chat-compact-workers > summary { border-radius: 0.65rem 0.65rem 0 0; }
+.chat-compact-workers:not([open]) > summary { border-radius: inherit; }
+.chat-work-dock .chat-queue { margin: 0 0.5rem; padding: 0 8px; border: 1px solid var(--border-soft); border-radius: 6px; min-width: 0; max-height: none; overflow: visible; }
+.chat-work-dock .chat-queue { flex: 0 0 auto; }
+.chat-work-dock .chat-queue[data-expanded="false"] .chat-queue-note:not(.is-replacement) { display: none; }
+.chat-work-dock .chat-queue[data-expanded="false"]:not(:has(.is-replacement:not([hidden]))) { gap: 0; }
+/* Expanded pending messages (or independent non-worker tracks/warnings) use
+   one aggregate scroller instead. No nested worker scrollport traps wheel,
+   touch or keyboard movement while inspecting the pending list. */
+html:is([data-ui-mode="touch"], [data-ui-mode="desktop"]) .chat-work-dock:is([data-headings-tight]:has(> #chat-compact-workers[open]), :has(> .chat-work-close:not([hidden]), > .chat-queue[data-expanded="true"]:not([hidden]), > .chat-queue .is-replacement:not([hidden]), > :is(#chat-task-list, #chat-scheduled-wakeups, #chat-reverted):not([hidden]))) { overflow-y: auto; }
+.chat-work-dock:is([data-headings-tight]:has(> #chat-compact-workers[open]), :has(> .chat-work-close:not([hidden]), > .chat-queue[data-expanded="true"]:not([hidden]), > .chat-queue .is-replacement:not([hidden]), > :is(#chat-task-list, #chat-scheduled-wakeups, #chat-reverted):not([hidden]))) .chat-compact-workers { flex-shrink: 0; overflow: visible; }
+.chat-work-dock:is([data-headings-tight]:has(> #chat-compact-workers[open]), :has(> .chat-work-close:not([hidden]), > .chat-queue[data-expanded="true"]:not([hidden]), > .chat-queue .is-replacement:not([hidden]), > :is(#chat-task-list, #chat-scheduled-wakeups, #chat-reverted):not([hidden]))) #chat-compact-workers-items { overflow: visible; }
+.chat-work-dock .chat-queue-header { top: 0; padding-block: 0; min-height: 32px; border-radius: inherit; }
+.chat-work-dock .chat-pending-toggle { min-height: 32px; font-weight: 400; }
+.chat-work-dock .chat-queue-items { max-height: none; overflow: visible; min-width: 0; }
+.chat-work-dock .chat-queue-items[hidden] { display: none; }
+html[data-ui-mode="touch"] .chat-work-dock { scroll-padding-top: var(--chat-work-heading-height, 0px); scroll-padding-bottom: var(--chat-pending-footer-height, 0px); }
 .chat-queue-discovery { margin: 0; color: var(--text-subtle); font-size: 0.8125rem; line-height: 1.4; }
 .chat-queue-discovery[hidden] { display: none; }
 #chat-compact-workers-items ul { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 0.5rem; }
 #chat-compact-workers-items { padding: 0 8px; }
+/* Reserve Stop's keyboard ring without enlarging finished-only history. */
+#chat-compact-workers-items:has(.chat-task-stop) { padding-block: 2px; }
 .chat-worker-row { display: flex; align-items: center; gap: 0.5rem; min-width: 0; }
 .chat-worker-inspect { flex: 1 1 0; min-width: 0; min-height: 2.75rem; padding: 0.125rem 0; display: grid; grid-template-columns: 1rem minmax(0, 1fr); column-gap: 0.375rem; border: 0; border-radius: 0.25rem; background: transparent; color: var(--text); text-align: left; font: inherit; cursor: pointer; }
 .chat-worker-glyph { grid-row: 1 / 3; align-self: center; color: var(--text-subtle); }
@@ -10773,35 +10771,8 @@ html[data-ui-mode="touch"][data-chat-compact]:not([data-chat-wide-short]) .chat-
   html[data-ui-mode="touch"][data-chat-wide-short] .chat-composer:has(.chat-composer-notices > :not([hidden])) .chat-composer-actions { grid-row: 1; grid-column: 3; }
   html[data-ui-mode="touch"][data-chat-wide-short] .chat-composer:has(.chat-composer-notices > :not([hidden])) .chat-composer-notices { grid-row: 1; grid-column: 2; }
 }
-/* Closed summaries share a band while typing; warnings still span its width.
-   On wide/short screens the worker header shares the conversation header,
-   leaving the original pending/batch warning band and transcript budget intact. */
-html[data-ui-mode="touch"][data-chat-keyboard]:not([data-chat-wide-short]) .chat-work-dock:has(#chat-compact-workers:not([open]):not([hidden])) {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-  column-gap: 0.5rem;
-  padding-inline: 0.5rem;
-}
-html[data-ui-mode="touch"][data-chat-keyboard]:not([data-chat-wide-short]) .chat-work-dock:has(#chat-compact-workers:not([open]):not([hidden])):has(.chat-queue-header [data-queue-send-now]) {
-  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1.1fr);
-}
-html[data-ui-mode="touch"][data-chat-keyboard]:not([data-chat-wide-short]) .chat-work-dock:has(#chat-compact-workers:not([open]):not([hidden])):not(:has(.chat-queue:not([hidden]))) {
-  grid-template-columns: minmax(0, 1fr);
-}
-html[data-ui-mode="touch"][data-chat-keyboard]:not([data-chat-wide-short]) .chat-work-dock:has(#chat-compact-workers:not([open]):not([hidden])) :is(.chat-queue:not([hidden]), .chat-queue-header) { display: contents; }
-html[data-ui-mode="touch"][data-chat-keyboard]:not([data-chat-wide-short]) .chat-work-dock:has(#chat-compact-workers:not([open]):not([hidden])) .chat-queue-header > button { min-width: 2.75rem; white-space: normal; }
-html[data-ui-mode="touch"][data-chat-keyboard]:not([data-chat-wide-short]) #chat-compact-workers:not([open]) { margin: 0; }
-html[data-ui-mode="touch"][data-chat-keyboard]:not([data-chat-wide-short]) #chat-compact-workers > summary { padding-block: 0; line-height: 1.25rem; }
-html[data-ui-mode="touch"][data-chat-keyboard]:not([data-chat-wide-short]) .chat-work-dock:has(#chat-compact-workers:not([open]):not([hidden])) .chat-queue-note { grid-column: 1 / -1; }
 /* A worker disclosure retains its bottom dock across keyboard and orientation
    changes. Resizing an already-open list is not a request for a top sheet. */
-html[data-ui-mode="touch"][data-chat-short] #chat-compact-workers[open] > summary { position: sticky; }
-/* A short expanded band shares one heading row before the worker body. */
-html[data-ui-mode="touch"][data-chat-short] .chat-work-dock:has(#chat-compact-workers[open]:not([hidden])):has(.chat-queue:not([hidden])) { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
-html[data-ui-mode="touch"][data-chat-short] .chat-work-dock:has(#chat-compact-workers[open]) .chat-compact-workers > summary { grid-column: 1; grid-row: 1; margin-right: 0; }
-html[data-ui-mode="touch"][data-chat-short] .chat-work-dock:has(#chat-compact-workers[open]) .chat-queue-header { grid-column: 2; grid-row: 1; top: 0; }
-html[data-ui-mode="touch"][data-chat-short] .chat-work-dock > details > :not(summary),
-html[data-ui-mode="touch"][data-chat-short] .chat-work-dock :is(.chat-queue-items, .chat-queue-note) { grid-column: 1 / -1; }
 /* At the smallest visual bands a whole 44px action outranks pinning chrome. */
 .chat-work-dock[data-headings-tight] :is(summary, .chat-queue-header) { position: static !important; }
 html[data-ui-mode="touch"] .chat-work-dock[data-headings-tight] { scroll-padding-top: 0; }
@@ -10826,11 +10797,11 @@ html[data-ui-mode="touch"] .chat-surface:has(#chat-work-dock > details[open]:not
 .chat-worker-meta { display: none; }
 .chat-worker-model, .chat-worker-tokens { color: var(--text-subtle); font-size: 0.6875rem; line-height: 1rem; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .chat-worker-tokens { text-align: right; font-variant-numeric: tabular-nums; }
-.chat-worker-row:has(.chat-task-stop) .chat-worker-inspect { min-height: 44px; grid-template-rows: 1.25rem 1rem; row-gap: 0; }
-.chat-worker-row:has(.chat-task-stop) .chat-worker-glyph { grid-row: 1 / 3; }
-.chat-worker-row:has(.chat-task-stop) .chat-worker-name { grid-column: 2 / -1; grid-row: 1; }
-.chat-worker-row:has(.chat-task-stop) .chat-worker-meta { display: block; grid-column: 2; grid-row: 2; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-subtle); font-size: 0.8125rem; line-height: 1rem; }
-.chat-worker-row:has(.chat-task-stop) :is(.chat-worker-model, .chat-worker-tokens) { grid-row: 2; }
+.chat-worker-row:is([data-state="working"], [data-state="unknown"]) .chat-worker-inspect { min-height: 44px; grid-template-rows: 1.25rem 1rem; row-gap: 0; }
+.chat-worker-row:is([data-state="working"], [data-state="unknown"]) .chat-worker-glyph { grid-row: 1 / 3; }
+.chat-worker-row:is([data-state="working"], [data-state="unknown"]) .chat-worker-name { grid-column: 2 / -1; grid-row: 1; }
+.chat-worker-row:is([data-state="working"], [data-state="unknown"]) .chat-worker-meta { display: block; grid-column: 2; grid-row: 2; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-subtle); font-size: 0.8125rem; line-height: 1rem; }
+.chat-worker-row:is([data-state="working"], [data-state="unknown"]) :is(.chat-worker-model, .chat-worker-tokens) { grid-row: 2; }
 .chat-workers-dismiss { flex: 0 0 auto; margin-left: auto; min-height: 1.75rem; padding: 0; border: 0; background: transparent; color: var(--accent); font: inherit; font-size: 0.75rem; cursor: pointer; }
 .chat-workers-dismiss[hidden], #chat-aside-ready[hidden] { display: none; }
 .chat-aside-dialog { position: fixed; top: var(--chat-aside-top, 12px); left: 50%; bottom: auto; margin: 0; transform: translateX(-50%); box-sizing: border-box; width: min(42rem, calc(100vw - 24px)); max-width: calc(100vw - 24px); max-height: var(--chat-aside-height, calc(100dvh - 24px)); overflow: auto; overscroll-behavior: contain; color: var(--text); background: var(--surface-raised); border: 1px solid var(--border-soft); border-radius: 12px; padding: 16px; overflow-wrap: anywhere; }

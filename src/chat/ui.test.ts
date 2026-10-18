@@ -1955,7 +1955,7 @@ describe("chat running-task inspection", () => {
     } finally { window.dispatchEvent(new window.Event("pagehide")); }
   });
 
-  test("a running agent task's row and its subagents-track row open the child transcript under a strip that stops the task", async () => {
+  test("one canonical running agent row opens the child transcript under a strip that stops the task", async () => {
     const { document, window } = parseHTML(html);
     installDomGlobals(document, window);
     document.documentElement.setAttribute("data-ui-mode", "desktop");
@@ -1969,13 +1969,12 @@ describe("chat running-task inspection", () => {
     try {
       const { initChat } = await import(`./ui.ts?task-inspection-agent-ui-test=${Date.now()}`);
       initChat(api);
-      const inspect = () => document.querySelector<HTMLButtonElement>('#chat-background-tasks [data-inspect-task="ada2b"]');
-      await waitUntil(() => inspect() != null, () => document.querySelector("#chat-background-tasks")?.textContent ?? "no task list");
+      const inspect = () => document.querySelector<HTMLButtonElement>('#chat-compact-workers [data-inspect-task="ada2b"]');
+      await waitUntil(() => inspect() != null, () => document.querySelector("#chat-compact-workers")?.textContent ?? "no task list");
       expect(inspect()!.dataset.inspectView).toBe("transcript");
-      // The subagents track already offers the running run, with its progress.
-      const trackRow = document.querySelector<HTMLButtonElement>('#chat-subagents [data-open-conversation="child"]')!;
-      expect(trackRow).not.toBeNull();
-      expect(document.querySelector("#chat-subagents .chat-subagent-progress")?.textContent).toBe("Reading the tests");
+      expect(document.querySelectorAll('#chat-compact-workers [data-worker-id]')).toHaveLength(1);
+      expect(document.querySelector("#chat-subagents, #chat-background-tasks")).toBeNull();
+      expect(inspect()!.querySelector(".chat-worker-meta")?.getAttribute("title")).toContain("Reading the tests");
 
       click(inspect()!);
       expect(drilldown.hidden).toBe(false);
@@ -1999,8 +1998,8 @@ describe("chat running-task inspection", () => {
       expect(drilldown.hidden).toBe(true);
       expect(strip.hidden).toBe(true);
 
-      // The track row leads to the same transcript with the same strip.
-      click(document.querySelector<HTMLButtonElement>('#chat-subagents [data-open-conversation="child"]')!);
+      // Reopening the same keyed row retains the strip and in-flight stop.
+      click(inspect()!);
       expect(drilldown.hidden).toBe(false);
       expect(strip.hidden).toBe(false);
       expect(strip.dataset.taskId).toBe("ada2b");
@@ -2032,13 +2031,13 @@ describe("chat running-task inspection", () => {
     try {
       const { initChat } = await import(`./ui.ts?task-inspection-shell-ui-test=${Date.now()}`);
       initChat(api);
-      const inspect = () => document.querySelector<HTMLButtonElement>('#chat-background-tasks [data-inspect-task="bgjpa"]');
-      await waitUntil(() => inspect() != null, () => document.querySelector("#chat-background-tasks")?.textContent ?? "no task list");
+      const inspect = () => document.querySelector<HTMLButtonElement>('#chat-compact-workers [data-inspect-task="bgjpa"]');
+      await waitUntil(() => inspect() != null, () => document.querySelector("#chat-compact-workers")?.textContent ?? "no task list");
       expect(inspect()!.dataset.inspectView).toBe("output");
       // A shell task reports no progress at all, so the elapsed readout is
       // the row's only live signal (D6) — without it the row says nothing
       // about the task between launch and settle.
-      const elapsed = document.querySelector<HTMLElement>('#chat-background-tasks [data-background-task="bgjpa"] .chat-background-task-elapsed');
+      const elapsed = document.querySelector<HTMLElement>('#chat-compact-workers [data-background-task="bgjpa"] [data-elapsed-since]');
       expect(elapsed).not.toBeNull();
       expect(elapsed!.textContent).toMatch(/^\d+:\d\d(:\d\d)?$/);
       expect(elapsed!.dataset.elapsedSince).toBe("2");
@@ -2091,8 +2090,8 @@ describe("chat running-task inspection", () => {
     });
     const { initChat } = await import(`./ui.ts?${label}=${Date.now()}`);
     initChat(api);
-    const inspect = () => document.querySelector<HTMLButtonElement>('#chat-background-tasks [data-inspect-task="bgjpa"]');
-    await waitUntil(() => inspect() != null, () => document.querySelector("#chat-background-tasks")?.textContent ?? "no task list");
+    const inspect = () => document.querySelector<HTMLButtonElement>('#chat-compact-workers [data-inspect-task="bgjpa"]');
+    await waitUntil(() => inspect() != null, () => document.querySelector("#chat-compact-workers")?.textContent ?? "no task list");
     inspect()!.dispatchEvent(new window.Event("click", { bubbles: true }) as unknown as Event);
     const line = document.querySelector<HTMLElement>("#chat-drilldown-state")!;
     await waitUntil(() => line.textContent === "workspace did not answer", () => line.textContent ?? "no drill-down line");
@@ -2169,11 +2168,11 @@ describe("a typed command's silent run", () => {
     try {
       const { initChat } = await import(`./ui.ts?silent-run-ui-test=${Date.now()}`);
       initChat(api);
-      const trackRow = () => document.querySelector<HTMLButtonElement>('#chat-subagents [data-open-conversation="child"]');
-      await waitUntil(() => trackRow() != null, () => document.querySelector("#chat-subagents")?.textContent ?? "no track");
-      expect(trackRow()!.textContent).toBe("/code-review");
+      const trackRow = () => document.querySelector<HTMLButtonElement>('#chat-compact-workers [data-inspect-task="rv"]');
+      await waitUntil(() => trackRow() != null, () => document.querySelector("#chat-compact-workers")?.textContent ?? "no track");
+      expect(trackRow()!.querySelector(".chat-worker-name")?.textContent).toBe("/code-review");
       // Not background work: no composer list, and no row in the timeline.
-      expect(document.querySelector<HTMLElement>("#chat-background-tasks")!.hidden).toBe(true);
+      expect(document.querySelector("#chat-background-tasks")).toBeNull();
       expect(document.querySelector('#chat-items [data-chat-item-id="task:rv"]')).toBeNull();
 
       click(trackRow()!);
@@ -2239,8 +2238,8 @@ describe("a typed command's silent run", () => {
     try {
       const { initChat } = await import(`./ui.ts?silent-run-settle-ui-test=${Date.now()}`);
       initChat(api);
-      const trackRow = () => document.querySelector<HTMLButtonElement>('#chat-subagents [data-open-conversation="child"]');
-      await waitUntil(() => trackRow() != null, () => document.querySelector("#chat-subagents")?.textContent ?? "no track");
+      const trackRow = () => document.querySelector<HTMLButtonElement>('#chat-compact-workers [data-inspect-task="rv"]');
+      await waitUntil(() => trackRow() != null, () => document.querySelector("#chat-compact-workers")?.textContent ?? "no track");
       click(trackRow()!);
       await waitUntil(() => items().includes("Review step 1") && streamed != null, items);
       expect(childReads.length).toBe(1);
@@ -2292,10 +2291,10 @@ describe("chat running work reachable without a disclosure", () => {
       emit({ type: "item.upsert", item: { ...tool, status: "running" } });
       absent();
       emit({ type: "item.upsert", item: { id: "task:detached", type: "background_task", taskId: "detached", createdAt: 2, description: "Detached", taskType: "agent", status: "running", toolUseId: "blocker", childConversationId: "child" } });
-      await waitUntil(() => document.querySelectorAll("#chat-background-tasks-items [data-inspect-task]").length === 1);
+      await waitUntil(() => document.querySelectorAll("#chat-compact-workers-items [data-inspect-task]").length === 1);
       absent();
       emit({ type: "item.upsert", item: { id: "task:detached", type: "background_task", taskId: "detached", createdAt: 2, description: "Detached", taskType: "agent", status: "completed", foreground: true, toolUseId: "blocker", childConversationId: "child" } });
-      await waitUntil(() => document.querySelector<HTMLElement>("#chat-background-tasks")!.hidden === true, () => "settled task should leave the background list");
+      await waitUntil(() => document.querySelector('#chat-compact-workers [data-background-task="detached"]')?.getAttribute("data-state") === "completed", () => "settled task should remain as finished history, not active work");
       absent();
       emit({ type: "item.upsert", item: { ...tool, status: "completed" } });
       emit({ type: "item.upsert", item: { id: "tool:shell", type: "command", createdAt: 3, command: "fixture", status: "running" } });
@@ -2313,7 +2312,7 @@ describe("chat running work reachable without a disclosure", () => {
     toolUseId: `toolu_${taskId}`, status, outputFile: `/tmp/tasks/${taskId}.output`,
   });
 
-  test("both lists open on their first running work; a user collapse holds until the work is over, and a new conversation opens them afresh", async () => {
+  test("the canonical desktop card starts collapsed and preserves deliberate state across work and conversation changes", async () => {
     const { document, window } = parseHTML(html);
     installDomGlobals(document, window);
     document.documentElement.setAttribute("data-ui-mode", "desktop");
@@ -2334,8 +2333,7 @@ describe("chat running work reachable without a disclosure", () => {
       sequences.set(conversationId, sequence);
       streams.get(conversationId)!.event({ type: "item.upsert", generation: "g", sequence, conversationId, item }, `cursor-${conversationId}-${sequence}`);
     };
-    const tasks = document.querySelector<HTMLDetailsElement>("#chat-background-tasks")!;
-    const track = document.querySelector<HTMLDetailsElement>("#chat-subagents")!;
+    const tasks = document.querySelector<HTMLDetailsElement>("#chat-compact-workers")!;
     // What the browser does after `open` changes, a task later: linkedom
     // fires no `toggle`, so the tests deliver it as the page would see it.
     const toggle = (list: HTMLDetailsElement) => list.dispatchEvent(new window.Event("toggle") as unknown as Event);
@@ -2345,52 +2343,48 @@ describe("chat running work reachable without a disclosure", () => {
       const { initChat } = await import(`./ui.ts?running-work-disclosure-ui-test=${Date.now()}`);
       initChat(api);
       await waitUntil(() => !tasks.hidden && streams.has("one"), () => tasks.textContent ?? "no task list");
-      // Reachable at once: no disclosure click stands between the running
-      // task and its inspect and Stop controls.
-      expect(tasks.open).toBe(true);
-      expect(track.hidden).toBe(false);
-      expect(track.open).toBe(true);
+      // Desktop now shares touch's deliberate compact disclosure default.
+      expect(tasks.open).toBe(false);
+      expect(document.querySelector("#chat-subagents, #chat-background-tasks")).toBeNull();
       expect(tasks.querySelector('[data-inspect-task="a"]')).not.toBeNull();
       expect(tasks.querySelector('[data-stop-task="a"]')).not.toBeNull();
-      // The open's own event lands afterwards; it is not a choice the user made.
+      tasks.open = true;
       toggle(tasks);
-      toggle(track);
 
-      // The user collapses both; more running work does not reopen them.
+      // A deliberate collapse survives new work and settlement.
       collapse(tasks);
-      collapse(track);
       upsert("one", shellTask("b", "running", 3));
       upsert("one", { id: "tool:toolu_t", type: "tool", createdAt: 3, name: "task", status: "running", input: JSON.stringify({ description: "Audit docs", subagent_type: "explore", prompt: "go" }) });
       await waitUntil(() => tasks.querySelector('[data-background-task="b"]') != null, () => tasks.textContent ?? "no task list");
       await settle();
       expect(tasks.open).toBe(false);
-      expect(track.open).toBe(false);
 
-      // The work ends: the collapse ends with it, and the next work opens.
+      // Finished work stays in the same card without undoing the collapse.
       upsert("one", shellTask("a", "completed"));
       upsert("one", shellTask("b", "completed", 3));
       upsert("one", { id: "tool:toolu_s", type: "tool", createdAt: 2, name: "task", status: "completed", input: JSON.stringify({ description: "Read the tree", subagent_type: "explore", prompt: "go" }) });
       upsert("one", { id: "tool:toolu_t", type: "tool", createdAt: 3, name: "task", status: "completed", input: JSON.stringify({ description: "Audit docs", subagent_type: "explore", prompt: "go" }) });
-      await waitUntil(() => tasks.hidden === true, () => tasks.textContent ?? "task list");
-      // Finished subagents stay listed until dismissed, but are not running
-      // work: they neither open the track nor keep a collapse alive.
-      expect(track.hidden).toBe(false);
-      expect(track.open).toBe(false);
+      await waitUntil(() => tasks.querySelector('[data-state="working"]') === null, () => tasks.textContent ?? "task list");
+      expect(tasks.hidden).toBe(false);
+      expect(tasks.open).toBe(false);
       upsert("one", shellTask("c", "running", 4));
       upsert("one", { id: "tool:toolu_u", type: "tool", createdAt: 4, name: "task", status: "running", input: JSON.stringify({ description: "Check links", subagent_type: "explore", prompt: "go" }) });
       await waitUntil(() => !tasks.hidden, () => "no task list");
       await settle();
-      expect(tasks.open).toBe(true);
-      expect(track.open).toBe(true);
+      expect(tasks.open).toBe(false);
+      tasks.open = true;
       toggle(tasks);
 
-      // A collapse is a choice about this conversation's work: the next
-      // conversation's running work is shown open.
-      collapse(tasks);
+      // Another conversation starts collapsed, and returning restores the
+      // first conversation's explicit expansion rather than inheriting it.
       const select = document.querySelector<HTMLSelectElement>("#chat-conversation-select")!;
       select.value = "two";
       select.dispatchEvent(new window.Event("change") as unknown as Event);
       await waitUntil(() => tasks.querySelector('[data-background-task="z"]') != null, () => tasks.textContent ?? "no task list");
+      expect(tasks.open).toBe(false);
+      select.value = "one";
+      select.dispatchEvent(new window.Event("change") as unknown as Event);
+      await waitUntil(() => tasks.querySelector('[data-background-task="a"]') != null);
       expect(tasks.open).toBe(true);
     } finally {
       await Bun.sleep(20);

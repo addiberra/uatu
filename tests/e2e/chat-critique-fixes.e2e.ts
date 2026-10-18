@@ -50,7 +50,7 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`critique re
     await page.reload(); await expect(input).toHaveValue("Already learned"); await expect(hint).toBeHidden();
   });
 
-  test("expanded dock retains both counts, focus and one scroller above worker contents", async ({ page, request }) => {
+  test("expanded Pending retains focus and one scroller after the intact worker card", async ({ page, request }) => {
     await boot(page, request);
     const id = await page.locator("#chat-conversation-select").inputValue();
     await page.locator("#chat-input").fill("Pending message"); await page.locator("#chat-send").click();
@@ -64,15 +64,17 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`critique re
     await expect(pending).toHaveAttribute("aria-expanded", "true");
     for (const keyboard of [false, true]) {
       if (keyboard) await page.evaluate(() => { Object.assign(window.visualViewport!, { height: 380 }); window.visualViewport!.dispatchEvent(new Event("resize")); });
-      await expect.poll(() => page.locator("#chat-work-dock").evaluate(dock => {
-        const w = dock.querySelector("#chat-compact-workers > summary")!.getBoundingClientRect();
+      expect(await page.locator("#chat-work-dock").evaluate(dock => {
+        const card = dock.querySelector("#chat-compact-workers")!.getBoundingClientRect();
         const p = dock.querySelector(".chat-queue-header")!.getBoundingClientRect();
-        const r = dock.getBoundingClientRect();
-        const separate = p.y >= w.bottom - 1 || p.x >= w.right - 1 || w.x >= p.right - 1;
-        return w.y >= r.y - 1 && p.y >= r.y - 1 && w.bottom <= r.bottom + 1 && p.bottom <= r.bottom + 1 && separate;
+        return p.top >= card.bottom + 7 && getComputedStyle(dock.querySelector("#chat-compact-workers-items")!).overflowY === "visible";
       })).toBe(true);
       await page.locator("#chat-work-dock").evaluate(e => { e.scrollTop = e.scrollHeight; });
-      await expect(workers).toBeInViewport(); await expect(pending).toBeInViewport();
+      // Expanded Pending may scroll its heading away; verify reachability,
+      // not the superseded requirement to pin both disclosure headings.
+      await pending.scrollIntoViewIfNeeded();
+      await expect(pending).toBeInViewport();
+      await workers.scrollIntoViewIfNeeded(); await expect(workers).toBeInViewport();
       expect(await page.locator("#chat-work-dock").evaluate(e => e.clientHeight)).toBeLessThanOrEqual((keyboard ? 380 : 844) * .4 + 1);
     }
   });
@@ -135,7 +137,7 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`critique re
     } finally { release(); }
   });
 
-  test("desktop worker and pending headings share the dock's single scroll owner", async ({ launchBrowser, baseURL, request }) => {
+  test("desktop uses the same bordered worker card and separate pending footer", async ({ launchBrowser, baseURL, request }) => {
     const browser = await launchBrowser(engine);
     const desktop = await browser.newPage({ baseURL, viewport: { width: 1280, height: 900 }, reducedMotion: "reduce" });
     try {
@@ -143,15 +145,16 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`critique re
       await desktop.locator("#chat-input").fill("Pending desktop input"); await desktop.locator("#chat-send").click();
       const id = await desktop.locator("#chat-conversation-select").inputValue();
       for (let i = 0; i < 8; i++) await request.post("/__e2e/chat", { data: { action: "opencode", op: "launchWorker", conversationId: id } });
-      await expect(desktop.locator("#chat-background-tasks-items > li")).toHaveCount(8);
+      await expect(desktop.locator("#chat-compact-workers-items li")).toHaveCount(8);
+      await desktop.locator("#chat-compact-workers > summary").click();
       for (const scroll of [false, true]) {
-        if (scroll) await desktop.locator("#chat-work-dock").evaluate(e => { e.scrollTop = e.scrollHeight; });
+        if (scroll) await desktop.locator("#chat-compact-workers-items").evaluate(e => { e.scrollTop = e.scrollHeight; });
         await expect.poll(() => desktop.locator("#chat-work-dock").evaluate(dock => {
           const r = dock.getBoundingClientRect();
-          return ["#chat-subagents > summary", "#chat-background-tasks > summary", ".chat-queue-header"].every(selector => {
+          return ["#chat-compact-workers > summary", ".chat-queue-header"].every(selector => {
             const box = dock.querySelector(selector)!.getBoundingClientRect();
             return box.top >= r.top - 1 && box.bottom <= r.bottom + 1;
-          }) && getComputedStyle(dock.querySelector("#chat-background-tasks-items")!).overflowY === "visible";
+          }) && dock.querySelector("#chat-subagents, #chat-background-tasks") === null;
         })).toBe(true);
       }
     } finally { await desktop.close(); }

@@ -826,20 +826,9 @@
             <summary><span id="chat-compact-workers-label"></span></summary>
             <div id="chat-compact-workers-items"></div>
           </details>
-          <details id="chat-subagents" class="chat-task-list chat-subagents" hidden>
-            <summary><span id="chat-subagents-label"></span><button id="chat-subagents-dismiss" class="chat-track-dismiss" type="button" hidden>Dismiss finished</button></summary>
-            <ul id="chat-subagents-items"></ul>
-          </details>
           <details id="chat-task-list" class="chat-task-list" hidden>
             <summary><span id="chat-task-list-label"></span></summary>
             <ul id="chat-task-list-items"></ul>
-          </details>
-          <!-- Work the agent left running in the background: one row per
-               live task with a stop control. Settled tasks leave this list
-               and take a row in the timeline instead. -->
-          <details id="chat-background-tasks" class="chat-task-list chat-background-tasks" hidden>
-            <summary><span id="chat-background-tasks-label"></span></summary>
-            <ul id="chat-background-tasks-items" aria-label="Background tasks"></ul>
           </details>
           <!-- The agent's own future turns, while its session is held for
                them: one row per pending wakeup (prompt, whether it recurs,

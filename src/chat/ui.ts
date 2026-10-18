@@ -20,10 +20,9 @@ import { newRequestId } from "./ids";
 import { insertCommand, localHistoryOperation, matchingCommands, slashCommandQuery, type LocalHistoryOperation } from "./slash-commands";
 import { LatestRefresh } from "./latest-refresh";
 import { navigateWorkspaceFileReference, resolveWorkspaceFileReference } from "./file-references";
-import { READER_CLOSED, QueueDockRenderer, RevertedMessagesDockRenderer, TimelineRenderer, decorateAttachmentImages, decorateFileLinks, formatElapsed, latestTodoEntries, pendingSteerReplacementNote, statusLabel, subagentEntries, subagentLabel, workingLabel } from "./timeline-renderer";
-import { backgroundStatusLabel, backgroundTasksByTool, runningBackgroundTasks } from "./background-tasks";
+import { READER_CLOSED, QueueDockRenderer, RevertedMessagesDockRenderer, TimelineRenderer, decorateAttachmentImages, decorateFileLinks, formatElapsed, latestTodoEntries, pendingSteerReplacementNote, statusLabel, subagentEntries, workingLabel } from "./timeline-renderer";
+import { backgroundTasksByTool, runningBackgroundTasks } from "./background-tasks";
 import { pausedStatusLabel, pausedWakeups, pendingWakeups, scheduledStatusLabel, wakeupFireTime } from "./scheduled-wakeups";
-import { RunningWorkDisclosure } from "./running-work-disclosure";
 import { CompactDisclosure, compactWorkers, workerSummary } from "./compact-work";
 import { CompactWorkersView } from "./compact-workers-view";
 import { renderChatMarkdown } from "./markdown";
@@ -36,7 +35,7 @@ import type { AutomaticBackgroundFeedback, BackgroundTaskItem } from "./types";
 import { contextReadout } from "./context-readout";
 import { HoldToQueue } from "./hold-to-queue";
 import { QueueDiscovery } from "./queue-discovery";
-import { buildReceiptRows, buildReceiptTotal, parseReceiptView, receiptHeading, subagentTrackSummary, subagentTranscriptTitle, type ReceiptView } from "./receipt-view";
+import { buildReceiptRows, buildReceiptTotal, parseReceiptView, receiptHeading, subagentTranscriptTitle, type ReceiptView } from "./receipt-view";
 import { formatTokens, totalTokens } from "./usage";
 import { resolveSessionTotals, type ConversationTotals } from "./conversation-totals";
 import {
@@ -1030,10 +1029,6 @@ export function initChat(api = new ChatApiClient()): void {
     taskList.hidden = false;
   };
 
-  const backgroundTasks = document.querySelector<HTMLDetailsElement>("#chat-background-tasks");
-  const subagents = document.querySelector<HTMLDetailsElement>("#chat-subagents");
-  const backgroundTasksLabel = document.querySelector<HTMLElement>("#chat-background-tasks-label");
-  const backgroundTasksItems = document.querySelector<HTMLElement>("#chat-background-tasks-items");
   const compactWorkersList = document.querySelector<HTMLDetailsElement>("#chat-compact-workers");
   const compactWorkersLabel = document.querySelector<HTMLElement>("#chat-compact-workers-label");
   const compactWorkersItems = document.querySelector<HTMLElement>("#chat-compact-workers-items");
@@ -1054,10 +1049,9 @@ export function initChat(api = new ChatApiClient()): void {
   }) : null;
   const syncCompactWork = () => {
     if (!compactWorkersList || !compactWorkersItems || !compactWorkersLabel) return;
-    const touch = document.documentElement.dataset.uiMode === "touch";
-    compactWorkersList.hidden = !touch;
-    if (!touch) return;
-    const allWorkers = compactWorkers(projection?.items ?? []);
+    const allWorkers = compactWorkers(projection?.items ?? [])
+      .filter(worker => worker.kind === "agent" && declares("subagents") || Boolean(worker.taskId) && declares("background-tasks"))
+      .map(worker => declares("context") ? worker : { ...worker, tokens: undefined });
     const dismissed = new Set(projection ? presentation.dismissedSubagents[projection.conversationId] ?? [] : []);
     const workers = allWorkers.filter(worker => worker.state === "working" || worker.state === "unknown" || !dismissed.has(worker.id) && !worker.references.some(id => dismissed.has(id)));
     const summary = workerSummary(workers);
@@ -1091,7 +1085,7 @@ export function initChat(api = new ChatApiClient()): void {
     const task = worker.taskId ? taskById(projection?.items ?? [], worker.taskId, worker.id) : undefined;
     const target = task ? taskInspection(task) : undefined;
     if (task && target && (target.view === "transcript" || taskById(projection?.items ?? [], task.taskId)?.id === task.id)) { inspectTask(task.taskId, task.id); return; }
-    if (worker.conversationId) { openChildConversation(worker.conversationId, worker.name); return; }
+    if (worker.conversationId) { openChildConversation(worker.conversationId, subagentLabelFor(worker.conversationId, projection)); return; }
     expanded.add(id);
     scheduleRender();
     requestAnimationFrame(() => {
@@ -1101,38 +1095,6 @@ export function initChat(api = new ChatApiClient()): void {
     });
   });
 
-  /**
-   * Both pinned lists of running work open when running work first appears
-   * in them, so a task's inspect and Stop controls are a tap away rather
-   * than behind a disclosure; a user's collapse of running work is held
-   * until that work is over (see running-work-disclosure.ts). Opening sets
-   * `open` and nothing else — no focus moves and the timeline is not
-   * scrolled; the list's rows are height-bounded, so the composer's
-   * displacement stays capped.
-   */
-  const trackRunningWork = (list: HTMLDetailsElement | null) => {
-    const disclosure = new RunningWorkDisclosure(list?.open ?? false);
-    list?.addEventListener("toggle", () => disclosure.toggled(list.open));
-    return (runningCount: number, collapseAutomatic = false) => {
-      if (document.documentElement.dataset.uiMode === "touch") {
-        if (list) list.open = true;
-        return;
-      }
-      const next = disclosure.paint(projection?.conversationId ?? null, runningCount, collapseAutomatic);
-      if (list && next !== undefined) list.open = next;
-    };
-  };
-  const discloseBackgroundTasks = trackRunningWork(backgroundTasks);
-
-  /**
-   * Work the agent left running in the background, pinned above the
-   * composer with a stop control per task (spec: each task is listed with a
-   * stop action). Settled tasks leave the list and take a timeline row.
-   * Rebuilt only on change, for the same tap reason as the other tracks.
-   */
-  // Null forces a repaint: an empty list's signature is the empty string,
-  // so the string itself cannot double as the "never painted" marker.
-  let paintedBackgroundTasks: string | null = null;
   // Stops in flight, by task id: a rebuild mid-request must not hand back
   // an enabled button that would send the stop twice.
   const stoppingTasks = new Set<string>();
@@ -1174,95 +1136,10 @@ export function initChat(api = new ChatApiClient()): void {
     });
   };
   const syncBackgroundTasks = () => {
-    if (!backgroundTasks || !backgroundTasksLabel || !backgroundTasksItems) return;
-    // The open drill-down's strip reads the same items; it keeps its own
-    // change check, so it is asked before this list's early return.
     syncTaskInspection();
-    const touch = document.documentElement.dataset.uiMode === "touch";
-    const entries = projection && declares("background-tasks") && !touch ? runningBackgroundTasks(projection.items) : [];
     for (const taskId of stoppingTasks) {
       const current = taskById(projection?.items ?? [], taskId);
       if (current && current.status !== "running") stoppingTasks.delete(taskId);
-    }
-    // Ahead of the unchanged-signature return: the rule reads every paint,
-    // since the conversation it is keyed on can change under one signature.
-    discloseBackgroundTasks(entries.length);
-    const signature = `${touch}:` + entries.map(entry => [entry.id, entry.taskId, entry.status, entry.description, entry.progress ?? "", entry.childConversationId ?? "", entry.stateUncertain ? "uncertain" : "", stoppingTasks.has(entry.taskId) ? "stopping" : ""].join("\u0001")).join("\u0002");
-    if (signature === paintedBackgroundTasks) return;
-    const focused = document.activeElement;
-    const focusedTask = focused instanceof HTMLElement && backgroundTasksItems.contains(focused)
-      ? focused.closest<HTMLElement>("[data-background-task]")?.dataset.backgroundTask : undefined;
-    const focusedAction = focused instanceof HTMLElement && focused.hasAttribute("data-stop-task") ? "data-stop-task" : "data-inspect-task";
-    paintedBackgroundTasks = signature;
-    if (entries.length === 0) {
-      backgroundTasks.hidden = true;
-      // Emptied as well as hidden: a summary kept from the last task is read
-      // out by anything that reaches the label without seeing the `hidden`
-      // attribute, and it comes back on the next open still naming work that
-      // has long finished.
-      backgroundTasksLabel.textContent = "";
-      backgroundTasksItems.replaceChildren();
-      if (focusedTask) timeline.focus({ preventScroll: true });
-      return;
-    }
-    backgroundTasksLabel.textContent = backgroundStatusLabel(entries);
-    backgroundTasksItems.replaceChildren(...entries.map(entry => {
-      const row = document.createElement("li");
-      row.className = `is-${entry.status}`;
-      row.dataset.backgroundTask = entry.taskId;
-      // A running task's description is the way in: an agent task opens its
-      // transcript, a shell task its output (spec: a running task is
-      // inspected). Settled tasks never reach this list.
-      const target = taskInspection(entry);
-      const text = document.createElement(target ? "button" : "span");
-      text.className = "chat-background-task-text";
-      text.textContent = entry.description;
-      text.title = entry.description;
-      if (target && text instanceof HTMLButtonElement) {
-        text.type = "button";
-        text.classList.add("chat-background-task-inspect");
-        text.dataset.inspectTask = entry.taskId;
-        text.dataset.inspectView = target.view;
-        text.setAttribute("aria-label", `${target.view === "transcript" ? "Open the transcript of" : "Show the output of"} ${entry.description}`);
-      }
-      row.append(text);
-      if (entry.stateUncertain || entry.status !== "running" || entry.progress) {
-        const progress = document.createElement("span");
-        progress.className = "chat-background-task-progress";
-        progress.textContent = entry.stateUncertain ? "Status unavailable — reconnecting" : entry.status !== "running" ? entry.status : entry.progress!;
-        row.append(progress);
-      } else {
-        // With no progress note the elapsed time IS the progress line (D6). A
-        // shell task never reports progress at all — the CLI emits no
-        // `task_progress` for `local_bash` — so without this the row has no
-        // live signal whatsoever, and a reader cannot tell a task that is
-        // working from one that is wedged. The readout is stamped with the
-        // launch time and ticked by the shared second clock, never a timer
-        // of its own: one row or ten, it is the same tick.
-        const elapsed = document.createElement("span");
-        elapsed.className = "chat-background-task-progress chat-background-task-elapsed";
-        elapsed.dataset.elapsedSince = String(entry.createdAt);
-        elapsed.textContent = formatTaskElapsed(Date.now() - entry.createdAt);
-        row.append(elapsed);
-      }
-      const stop = document.createElement("button");
-      stop.type = "button";
-      stop.className = "chat-task-stop";
-      stop.dataset.stopTask = entry.taskId;
-      stop.dataset.stopItem = entry.id;
-      stop.textContent = stoppingTasks.has(entry.taskId) ? "Stopping…" : "Stop";
-      stop.disabled = stoppingTasks.has(entry.taskId) || entry.stateUncertain === true;
-      stop.setAttribute("aria-label", declares("background-blocking-work") ? `Stop worker: ${entry.description}` : `Stop ${entry.description}`);
-      if (entry.status === "running") row.append(stop);
-      return row;
-    }));
-    backgroundTasks.hidden = false;
-    if (focusedTask) {
-      const row = backgroundTasksItems.querySelector<HTMLElement>(`[data-background-task="${CSS.escape(focusedTask)}"]`);
-      const control = row?.querySelector<HTMLButtonElement>(`[${focusedAction}]:not(:disabled)`)
-        ?? row?.querySelector<HTMLButtonElement>("[data-inspect-task]")
-        ?? backgroundTasksItems.querySelector<HTMLButtonElement>("[data-inspect-task]");
-      (control ?? timeline).focus({ preventScroll: true });
     }
   };
   // One stop path for every control that offers it: the composer row and the
@@ -1282,7 +1159,6 @@ export function initChat(api = new ChatApiClient()): void {
     // The agent reports the stop as the task settling, which is what moves
     // the row out of this list; until then the control stays inert.
     stoppingTasks.add(taskId);
-    paintedBackgroundTasks = null;
     syncBackgroundTasks();
     syncCompactWork();
     void api.stopTask(source.conversationId, taskId, newRequestId()).catch(async error => {
@@ -1299,7 +1175,6 @@ export function initChat(api = new ChatApiClient()): void {
       }
     }).finally(() => {
       if (!asynchronous) stoppingTasks.delete(taskId);
-      paintedBackgroundTasks = null;
       syncBackgroundTasks();
       syncCompactWork();
     });
@@ -1322,15 +1197,6 @@ export function initChat(api = new ChatApiClient()): void {
     }
     openChildConversation(`task-output:${taskId}`, task.description, false, { conversationId: source.conversationId, taskId, itemId: task.id, view: "output" });
   };
-  backgroundTasksItems?.addEventListener("click", event => {
-    const target = (event.target as Element | null)?.closest<HTMLButtonElement>("[data-stop-task], [data-inspect-task]");
-    if (!target) return;
-    if (target.dataset.stopTask !== undefined) requestStopTask(target.dataset.stopTask, target, target.dataset.stopItem);
-    else if (target.dataset.inspectTask !== undefined) inspectTask(target.dataset.inspectTask);
-  });
-  backgroundTasksItems?.addEventListener("mousedown", event => {
-    if ((event.target as Element).closest("[data-stop-task], [data-inspect-task]")) keepTouchComposerFocus(event);
-  });
   drilldownTask?.addEventListener("click", event => {
     const button = (event.target as Element | null)?.closest<HTMLButtonElement>("[data-stop-task], [data-task-result]");
     if (button?.dataset.stopTask !== undefined) requestStopTask(button.dataset.stopTask, button, button.dataset.stopItem);
@@ -1468,16 +1334,7 @@ export function initChat(api = new ChatApiClient()): void {
     });
   });
 
-  const subagentsLabel = document.querySelector<HTMLElement>("#chat-subagents-label");
-  const subagentsItems = document.querySelector<HTMLElement>("#chat-subagents-items");
-  const dismissButton = document.querySelector<HTMLButtonElement>("#chat-subagents-dismiss");
-  const discloseSubagents = trackRunningWork(subagents);
   const requestsJump = document.querySelector<HTMLButtonElement>("#chat-requests-jump");
-  // Finished subagents stay until explicitly dismissed — nothing retires
-  // them on a timer. Dismissals persist with the rest of the per-conversation
-  // presentation, so a reload does not resurrect an already-dismissed strip.
-  const dismissedSubagents = (conversationId: string): Set<string> =>
-    new Set(presentation.dismissedSubagents[conversationId] ?? []);
   // One policy for what a drill-down is titled, read from the structured
   // entries rather than scraped from whichever markup happens to carry the
   // text — the track row and the timeline row must produce the same title.
@@ -1487,28 +1344,6 @@ export function initChat(api = new ChatApiClient()): void {
     // one task; the transcript is the whole agent.
     return source ? subagentTranscriptTitle(subagentEntries(source.items), source.items, conversationId) : "Subagent";
   };
-  subagentsItems?.addEventListener("click", event => {
-    const open = (event.target as Element).closest<HTMLElement>("[data-open-conversation]");
-    if (open?.dataset.openConversation) openChildConversation(open.dataset.openConversation, subagentLabelFor(open.dataset.openConversation, projection));
-  });
-  dismissButton?.addEventListener("click", event => {
-    event.preventDefault();
-    if (!projection) return;
-    const dismissed = dismissedSubagents(projection.conversationId);
-    for (const entry of subagentEntries(projection.items)) {
-      if (entry.status !== "running" && entry.status !== "pending") dismissed.add(entry.id);
-    }
-    presentation.dismissedSubagents[projection.conversationId] = [...dismissed];
-    save();
-    syncSubagents();
-    syncOutstandingRequests();
-  });
-
-  /**
-   * Running and finished subagents, pinned beside the task list. A fan-out of
-   * three subagents is three rows that would otherwise scroll away, and while
-   * they run there is nothing else saying how many are still going.
-   */
   /**
    * Outstanding requests, pinned so they cannot scroll away. Ten permissions in
    * one turn left a user unable to tell which still needed them; per-card
@@ -1629,38 +1464,7 @@ export function initChat(api = new ChatApiClient()): void {
     jumpToRequestCard(id);
   });
 
-  // Same rebuild-only-on-change rule as the task list, for the same tap
-  // reason — these rows are buttons, and a button replaced mid-tap is a
-  // button that never fires.
-  let paintedSubagents = "";
-  const syncSubagents = () => {
-    if (!subagents || !subagentsLabel || !subagentsItems) return;
-    if (!declares("subagents")) {
-      discloseSubagents(0);
-      paintedSubagents = "";
-      subagents.hidden = true;
-      subagentsItems.replaceChildren();
-      return;
-    }
-    const all = projection ? subagentEntries(projection.items) : [];
-    const dismissed = projection ? dismissedSubagents(projection.conversationId) : new Set<string>();
-    const entries = document.documentElement.dataset.uiMode === "touch" ? [] : all.filter(entry => !dismissed.has(entry.id));
-    // Finished entries stay listed until dismissed, but they are not running
-    // work: only a run that has not settled opens the track.
-    const touchBackground = document.documentElement.dataset.uiMode === "touch" && declares("background-blocking-work")
-      ? runningBackgroundTasks(projection?.items ?? []) : [];
-    const touchWorkers = new Set(touchBackground.flatMap(task => task.childConversationId ? [task.childConversationId] : []));
-    // On touch the open background list already exposes these workers. Keep
-    // their richer subagent track available, but collapsed by default.
-    const foregroundRunning = entries.filter(entry => (entry.status === "running" || entry.status === "pending") && (!entry.conversationId || !touchWorkers.has(entry.conversationId))).length;
-    discloseSubagents(foregroundRunning, touchBackground.length > 0 && foregroundRunning === 0);
-    // Touch has no desktop rows, but its open inspection still follows live
-    // launcher metadata (including the child's model/cost attribution).
-    const signature = `${document.documentElement.dataset.uiMode}:` + (document.documentElement.dataset.uiMode === "touch" ? all : entries)
-      .map(entry => [entry.id, entry.status, entry.subagent ?? "", entry.description, entry.conversationId ?? "", entry.model ?? "", entry.usage ? String(totalTokens(entry.usage)) : "", entry.usage?.costUsd ?? "", entry.progress ?? ""].join("\u0001"))
-      .join("\u0002");
-    if (signature === paintedSubagents) return;
-    paintedSubagents = signature;
+  const syncSubagentTitle = () => {
     // The open transcript's title states the same cost as the row: a running
     // subagent's price moves while its transcript is open, and a title
     // computed once at the click would keep the earlier figure. A task's
@@ -1672,68 +1476,6 @@ export function initChat(api = new ChatApiClient()): void {
         drilldownTitle.textContent = label;
       }
     }
-    if (dismissButton) {
-      dismissButton.hidden = !entries.some(entry => entry.status !== "running" && entry.status !== "pending");
-    }
-    if (entries.length === 0) {
-      subagents.hidden = true;
-      subagentsItems.replaceChildren();
-      return;
-    }
-    subagentsLabel.textContent = subagentTrackSummary(entries);
-    subagentsItems.replaceChildren(...entries.map(entry => {
-      const row = document.createElement("li");
-      row.className = `is-${entry.status}`;
-      const text = subagentLabel(entry);
-      if (entry.conversationId) {
-        const open = document.createElement("button");
-        open.type = "button";
-        open.className = "chat-subagent-open";
-        open.dataset.openConversation = entry.conversationId;
-        open.textContent = text;
-        row.append(open);
-      } else {
-        const label = document.createElement("span");
-        label.className = "chat-subagent-label";
-        label.textContent = text;
-        row.append(label);
-      }
-      // What the subagent is doing right now, where the agent reports it —
-      // the model-written summary, or the tool it is using.
-      if (entry.progress) {
-        const progress = document.createElement("span");
-        progress.className = "chat-subagent-progress";
-        progress.textContent = entry.progress;
-        progress.title = entry.progress;
-        row.append(progress);
-      }
-      // What it ran and what it cost, after the description so the row still
-      // leads with what the subagent is doing. The model shows whenever the
-      // agent named it; the token figure only where the agent declares it
-      // reports usage, and only once it has reported some — an unattributed
-      // subagent stays a readable row rather than one asserting a zero.
-      const attribution = [
-        entry.model,
-        declares("context") && entry.usage ? `${formatTokens(totalTokens(entry.usage))} tokens` : undefined,
-        // The child's own price, where its session reported one. Zero is
-        // an unpriced model, not a free one, and is not asserted.
-        declares("context") && entry.usage?.costUsd ? formatUsd(entry.usage.costUsd) : undefined,
-      ].filter(Boolean).join(" · ");
-      if (attribution) {
-        const note = document.createElement("span");
-        note.className = "chat-subagent-attribution";
-        note.textContent = attribution;
-        row.append(note);
-      }
-      if (document.documentElement.dataset.uiMode === "touch") {
-        const outcome = document.createElement("span");
-        outcome.className = "chat-worker-outcome";
-        outcome.textContent = entry.status;
-        row.append(outcome);
-      }
-      return row;
-    }));
-    subagents.hidden = false;
   };
 
   /**
@@ -2023,14 +1765,14 @@ export function initChat(api = new ChatApiClient()): void {
       sendNow: declares("send-now"),
       running: isLiveConversationStatus(projection?.status),
       replacement: projection?.reversibleHistory?.staged === true,
-      ...(document.documentElement.dataset.uiMode === "touch" ? { compactOpen: compactPendingState.paint(projection?.conversationId ?? null) } : {}),
+      compactOpen: compactPendingState.paint(projection?.conversationId ?? null),
       isCommand: isListedCommand,
       ...(queueNoteElement ? { note: queueNoteElement } : {}),
     });
     syncHistoryControls();
     rendering = false;
     syncTaskList();
-    syncSubagents();
+    syncSubagentTitle();
     syncBackgroundTasks();
     syncCompactWork();
     syncScheduledWakeups();
@@ -2116,12 +1858,6 @@ export function initChat(api = new ChatApiClient()): void {
   // progress note, ticked by the same clock as the working lines: the rows
   // are rebuilt only when what they SAY changes, and the elapsed time is not
   // part of that, so the second hand writes into the row in place.
-  const tickBackgroundTaskElapsed = () => {
-    if (!chatSurfaceActive()) return;
-    for (const readout of backgroundTasksItems?.querySelectorAll<HTMLElement>("[data-elapsed-since]") ?? []) {
-      readout.textContent = formatTaskElapsed(Date.now() - Number(readout.dataset.elapsedSince));
-    }
-  };
 
   // The tick runs while anything on screen is working: the parent's turn, the
   // subagent in the drill-down, or a background task the turn left running. A
@@ -2134,7 +1870,12 @@ export function initChat(api = new ChatApiClient()): void {
   const syncWorkingTimer = () => {
     const tasksRunning = declares("background-tasks") && runningBackgroundTasks(projection?.items ?? []).length > 0;
     const working = chatSurfaceActive() && (isLiveConversationStatus(projection?.status) || isLiveConversationStatus(child?.projection?.status) || tasksRunning);
-    if (working && workingTimer === null) workingTimer = setInterval(() => { syncRoutineStatus(); tickWorkingLines(); tickBackgroundTaskElapsed(); }, 1_000);
+    if (working && workingTimer === null) workingTimer = setInterval(() => {
+      syncRoutineStatus(); tickWorkingLines();
+      for (const readout of compactWorkersItems?.querySelectorAll<HTMLElement>("[data-elapsed-since]") ?? []) {
+        readout.textContent = formatTaskElapsed(Date.now() - Number(readout.dataset.elapsedSince));
+      }
+    }, 1_000);
     if (!working && workingTimer !== null) {
       clearInterval(workingTimer);
       workingTimer = null;
@@ -3775,32 +3516,18 @@ export function initChat(api = new ChatApiClient()): void {
     if (!queueDockElement) return;
     const touch = document.documentElement.dataset.uiMode === "touch";
     const scroller = queueDockElement.parentElement!;
-    if (touch) {
-      const workerHeading = compactWorkersList?.hidden ? null : compactWorkersList?.querySelector("summary");
-      const pendingHeading = queueDockElement.hidden ? null : queueDockElement.querySelector(".chat-queue-header");
-      const workerHeight = workerHeading?.getBoundingClientRect().height ?? 0;
-      const pendingHeight = pendingHeading?.getBoundingClientRect().height ?? 0;
-      scroller.style.setProperty("--chat-worker-heading-height", `${workerHeight}px`);
-      const sharedRow = document.documentElement.hasAttribute("data-chat-short") && compactWorkersList?.open && !queueDockElement.hidden;
-      const height = sharedRow ? Math.max(workerHeight, pendingHeight) : workerHeight + pendingHeight;
-      scroller.toggleAttribute("data-headings-tight", scroller.clientHeight < height + 46);
-      // Enlarged batch headings can scroll away. Reserving their height as
-      // sticky padding would make a complete replacement warning unrevealable.
-      const pinned = (heading: Element | null | undefined, size: number) => heading && (typeof getComputedStyle !== "function" || getComputedStyle(heading).position === "sticky") ? size : 0;
-      const workerPin = pinned(workerHeading, workerHeight), pendingPin = pinned(pendingHeading, pendingHeight);
-      scroller.style.setProperty("--chat-work-heading-height", `${sharedRow ? Math.max(workerPin, pendingPin) : workerPin + pendingPin}px`);
-    } else {
-      scroller.removeAttribute("data-headings-tight");
-      // A constrained dock is display:none. Keep its last measured heading
-      // budget so hiding it cannot oscillate the Show work decision.
-      if (typeof getComputedStyle === "function" && getComputedStyle(scroller).display === "none") return;
-      let height = 0;
-      for (const heading of scroller.querySelectorAll<HTMLElement>(":scope > details:not([hidden]) > summary, :scope > #chat-queue:not([hidden]) > .chat-queue-header")) {
-        heading.style.setProperty("--chat-heading-top", `${height}px`);
-        height += heading.getBoundingClientRect().height;
-      }
-      scroller.style.setProperty("--chat-work-heading-height", `${height}px`);
-    }
+    // The card keeps its own header and rows. Pending is a separate footer,
+    // never a second heading projected between those rows. Preserve the last
+    // measurement while desktop's constrained dock is hidden.
+    if (typeof getComputedStyle === "function" && getComputedStyle(scroller).display === "none") return;
+    const workerHeading = compactWorkersList?.hidden ? null : compactWorkersList?.querySelector("summary");
+    const pendingHeading = queueDockElement.hidden ? null : queueDockElement.querySelector(".chat-queue-header");
+    const workerHeight = workerHeading?.getBoundingClientRect().height ?? 0;
+    const pendingHeight = pendingHeading?.getBoundingClientRect().height ?? 0;
+    scroller.toggleAttribute("data-headings-tight", scroller.clientHeight < workerHeight + pendingHeight + 46);
+    const pinned = workerHeading && (typeof getComputedStyle !== "function" || getComputedStyle(workerHeading).position === "sticky") ? workerHeight : 0;
+    scroller.style.setProperty("--chat-work-heading-height", `${pinned}px`);
+    scroller.style.setProperty("--chat-pending-footer-height", queueDockElement.dataset.expanded === "false" ? `${pendingHeight + 8}px` : "0px");
     if (touch) queueDockElement.classList.remove("has-more-below");
     scroller.classList.toggle("has-more-below", scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop > 1);
   }

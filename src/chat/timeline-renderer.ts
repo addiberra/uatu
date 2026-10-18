@@ -1184,6 +1184,7 @@ export class QueueDockRenderer {
   private replacementWarningShown = false;
 
   render(target: HTMLElement, queued: readonly QueuedMessage[], context: QueueDockContext = { steering: false, sendNow: false, running: true, isCommand: () => false }): void {
+    target.dataset.expanded = String(context.compactOpen !== false);
     context = { ...context, pausedSteers: queued.filter(entry => entry.delivery === "steer" && entry.paused).length };
     let header = target.querySelector<HTMLElement>(":scope > .chat-queue-header");
     if (!header) {

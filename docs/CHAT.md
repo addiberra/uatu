@@ -191,19 +191,23 @@ steer also wakes paused steers; its label and confirmation explain that effect.
 Other dormant queued messages remain held. Undo's count-only warning explains
 which batch will accompany the replacement, without repeating message text.
 
-On touch screens, work tracks share a bounded, independently scrollable dock.
-Its worker and pending summaries stay visible together above expanded contents,
-including while the software keyboard is open. Both summaries share the dock's
-single scroll owner; expanding a track does not move it to a top sheet.
-Desktop likewise keeps its existing worker disclosures and pending header in a
-shared leading band, with expanded contents using the dock rather than nested
-list scrollers. Disclosure defaults and the explicit constrained Show work
-fallback are unchanged.
-Short expanded touch bands put the two summaries side by side. If the measured
-dock cannot fit its heading band plus a complete 44px action, the headings scroll
-with the contents so Stop remains fully reachable; transcript/safe-area budgets
-are not enlarged to pin secondary chrome. Narrow enlarged paused-batch headings
-likewise retain their existing scroll-away behavior.
+Desktop and touch use the same compact worker card: one subtle border contains
+its disclosure header and rows. Active workers have a title followed by agent,
+model and cumulative tokens; available Stop actions remain separate 44px targets.
+Finished workers use dense single rows. Legacy subagent/background summaries
+are not repeated above this card. Inspection, history and saved dismissal remain
+available.
+Pending is a separate compact disclosure **below** the worker card, before the
+composer—not a heading between the worker header and rows. With Pending closed,
+only the bounded worker body scrolls, leaving its header and Pending visible.
+Opening Pending, a replacement warning, the explicit desktop work sheet or
+another independent work track uses
+the aggregate dock scroller instead; the worker body then has no nested scroll
+trap. Short visual bands can scroll headings away to expose whole actions.
+The existing transcript/safe-area budgets and desktop's explicit constrained
+Show work fallback remain; work never moves to a touch top sheet. Routine model
+timing notes stay inside expanded Pending, while replacement/batch consequences
+remain available when collapsed.
 Short keyboard/landscape layouts use compact input controls and counts;
 uncertain feedback has its own scrollable band (a bounded column in landscape),
 so it cannot consume the draft field. The inline model/context pill opens the

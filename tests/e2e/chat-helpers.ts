@@ -19,6 +19,22 @@ export async function openChatPanel(page: Page): Promise<void> {
   await expect(page.locator("#chat-timeline")).toBeVisible();
 }
 
+/** Deliberately reveal the canonical worker card before inspecting a row. */
+export async function openChatWorkers(page: Page): Promise<void> {
+  const card = page.locator("#chat-compact-workers");
+  await expect(card).toBeAttached();
+  await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+  const reveal = page.locator("#chat-work-toggle");
+  if (await reveal.isVisible()) await reveal.click();
+  await expect(card).toBeVisible();
+  if (await card.getAttribute("open") === null) {
+    const summary = card.locator(":scope > summary");
+    if (await page.locator("html").getAttribute("data-ui-mode") === "touch") await summary.tap();
+    else await summary.click();
+  }
+  await expect(card).toHaveAttribute("open", "");
+}
+
 export async function openChatConfiguration(page: Page): Promise<void> {
   const dialog = page.locator("#chat-configuration-dialog");
   if (!await dialog.isVisible()) {
