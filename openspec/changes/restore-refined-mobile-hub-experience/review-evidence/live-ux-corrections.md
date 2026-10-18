@@ -95,7 +95,7 @@ agent/provider executable can run there.
 - `git diff --check` and `openspec validate restore-refined-mobile-hub-experience --strict`
   — passed.
 
-### Broader matrix: unresolved, not green
+### Broader matrix: historical failures, resolved by unchanged full rerun
 
 All matrix invocations use `bunx playwright test -c playwright.mobile-live.config.ts`
 with these files: `mobile-live-ux-review mobile-live-geometry mobile-live-inventory
@@ -132,11 +132,58 @@ test-only focus/no-auto-submit enhancements were separately verified by the
 baseline or product behavior was changed to obtain a pass. The full-run failures
 are not yet reproducible in the isolated four-case check, and their root cause
 remains unconfirmed. Other users' processes/services were not stopped to improve
-test conditions. Reliable broader verification and diagnosis are a lead handoff
-blocker, not a completed acceptance gate.
+test conditions. At that checkpoint, reliable broader verification and diagnosis
+were a lead handoff blocker, not a completed acceptance gate.
 
-Tasks **24.1–24.8 are verified; 24.9 remains unchecked**. No further product edit
-was made after independent approval. Existing historical/manual gates stay open.
+At the October 16 checkpoint, tasks **24.1–24.8 were verified; 24.9 remained
+unchecked**. No further product edit was made after independent approval.
+
+### October 18 completion — 104/104 passed
+
+Resumed from clean `1bf578c`, with product code, tests and mobile-live configuration
+unchanged from independently approved implementation `8c7d9f3` (implementation
+tree `dec1345897ee109bea342e2eb48359d3efb85701`). The two private October 16
+handoff directories were unavailable; the tracked command and evidence above
+provided the frozen matrix definition.
+
+Application-independent health probes launched Chromium and WebKit sequentially,
+rendered an inline document and clicked its button: **both passed** (950ms and
+1,722ms). No installation, host remediation or configuration/service change was
+needed. This demonstrates recovered browser health, not the cause of the earlier
+host failures.
+
+The complete eight-file matrix above then completed natively: **104 passed,
+zero failed, zero retries, exit 0, 7.7 minutes** (52 per engine). Command:
+
+```sh
+UATU_E2E_HUB_BASE_PORT=23200 UATU_E2E_BASE_PORT=23300 \
+  PLAYWRIGHT_HTML_OUTPUT_DIR="$EVIDENCE/report" \
+  bunx playwright test -c playwright.mobile-live.config.ts \
+  mobile-live-ux-review mobile-live-geometry mobile-live-inventory \
+  mobile-live-continuity mobile-live-operations mobile-live-credentials \
+  mobile-live-accounts mobile-live-notifications \
+  --workers=1 --retries=0 --trace=retain-on-failure \
+  --output="$EVIDENCE/browser-results"
+```
+
+`EVIDENCE` denotes the private task-owned artifact directory supplied in the lead
+handoff. It retains `browser-health.log`, `browser-suite.log`, `report/` and
+`browser-results/`; screenshots/runtime details are not committed. Both prior
+Chromium failures (coordinated removal and retained dark-mode entry) passed in
+this complete run. Historical failures above remain factual; their root cause
+has not been established or waived as a blanket flake. No source, assertion,
+timeout or golden changed to obtain this pass, and no competing test run was
+started. Existing live and OLD synthetic services were not changed.
+
+Strict OpenSpec validation and `git diff --check` passed again. The prior unit,
+type, build, desktop and actual-image checks remain valid unchanged-source
+evidence, **not newly rerun checks**. The local build SHA-256 was rechecked and
+still matches the value above. Self-review of the scoped diff found no new
+product changes or publication-sensitive additions.
+
+Task **24.9 is now verified**, completing the eight-finding correction milestone.
+This is not independent lead review, push/deployment authorization, final human
+UX acceptance, physical-device/native execution or closure of historical gates.
 
 ### Actual image inspection
 
