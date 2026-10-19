@@ -4410,9 +4410,18 @@ export function initChat(api = new ChatApiClient()): void {
   const holdCap = document.createElement("span");
   holdCap.className = "chat-hold-cap";
   holdVisual.append(holdCap);
+  const holdOrigin = document.createElement("span");
+  holdOrigin.className = "chat-hold-origin";
+  holdOrigin.setAttribute("aria-hidden", "true");
+  holdOrigin.inert = true;
   // A viewport-owned visual cannot be clipped by the composer or work sheet.
-  // It remains pointer-transparent; Send retains the original hit rectangle.
-  document.body.append(holdVisual);
+  // The inert, zero-size probe shares its fixed containing block, but never
+  // moves with the envelope. Keep both nodes under the same lifecycle owner.
+  const mountHoldPortal = () => {
+    if (!holdOrigin.isConnected) document.body.append(holdOrigin);
+    if (!holdVisual.isConnected) document.body.append(holdVisual);
+  };
+  mountHoldPortal();
   let holdPointer: number | null = null;
   let holdBounds: DOMRect | null = null;
   let holdTimer: ReturnType<typeof setTimeout> | null = null;
@@ -4452,15 +4461,22 @@ export function initChat(api = new ChatApiClient()): void {
     if (progress === null) { clearHoldVisual(); return; }
     if (progress === 1) { hold.check(now); clearHoldVisual(); return; }
     const box = send.getBoundingClientRect();
-    const viewportTop = window.visualViewport?.offsetTop ?? 0;
-    holdVisual.style.left = `${box.left}px`;
-    holdVisual.style.width = `${box.width}px`;
+    // Read the stable fixed origin in the same client coordinate space
+    // as Send. Embedded WebKit can report client rects relative to the visual
+    // viewport while fixed CSS coordinates still use the layout viewport.
+    // Copying box.top directly then applies the keyboard pan a second time.
+    // Read before any paint writes: resetting the visible portal to zero
+    // first would synchronously flush layout on every animation frame.
+    const origin = holdOrigin.getBoundingClientRect();
+    const viewportTop = (window.visualViewport?.offsetTop ?? 0) + origin.top;
     const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     // The cap clears a finger immediately, then the whole envelope rises as
     // the deadline approaches; progress also fills upward inside that envelope.
     const extension = Math.min(reducedMotion ? 104 : 56 + 48 * progress, Math.max(0, box.top - viewportTop - 8));
+    holdVisual.style.width = `${box.width}px`;
     holdVisual.style.height = `${box.height + extension}px`;
-    holdVisual.style.top = `${box.top - extension}px`;
+    holdVisual.style.left = `${box.left - origin.left}px`;
+    holdVisual.style.top = `${box.top - extension - origin.top}px`;
     holdVisual.style.setProperty("--hold-progress", String(progress));
     holdCap.textContent = `${isLiveConversationStatus(projection?.status) ? "Queue" : "Send"}\n${((1 - progress) * 2).toFixed(1)}s`;
     holdVisual.hidden = false;
@@ -4470,6 +4486,7 @@ export function initChat(api = new ChatApiClient()): void {
   send.addEventListener("pointerdown", event => {
     suppressPointerClick = false;
     if (!sendSupportsHold()) return;
+    mountHoldPortal();
     if (!event.isPrimary || event.button !== 0 || !hold.begin(event.pointerId, performance.now())) return;
     event.preventDefault(); // Keep the composing field and mobile keyboard owned.
     suppressPointerClick = true;
@@ -4504,6 +4521,7 @@ export function initChat(api = new ChatApiClient()): void {
     if (event.key === " " && sendSupportsHold()) {
       event.preventDefault();
       ownedSpace = true;
+      mountHoldPortal();
       if (event.repeat || holdPointer !== null || !hold.begin(-1, performance.now())) return;
       holdPointer = -1;
       paintHold();
@@ -4524,7 +4542,12 @@ export function initChat(api = new ChatApiClient()): void {
     event.preventDefault(); event.stopImmediatePropagation(); cancelHold();
   }, true);
   window.addEventListener("blur", cancelHold);
-  window.addEventListener("pagehide", cancelHold);
+  window.addEventListener("pagehide", () => {
+    cancelHold();
+    holdOrigin.remove();
+    holdVisual.remove();
+  });
+  window.addEventListener("pageshow", mountHoldPortal);
   document.addEventListener("visibilitychange", cancelHold);
   input.addEventListener("input", cancelHold);
   // Mobile browsers can adjust a gap tap onto a nearby button. Use the raw

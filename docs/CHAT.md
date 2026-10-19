@@ -126,6 +126,11 @@ The countdown clears the finger immediately; its pointer-transparent envelope
 grows upward from 56px to 104px above the fixed Send target while filling
 bottom-to-top. Reduced motion keeps the full extension and live countdown
 without the growth. The visual is viewport-owned, outside composer/dock clipping.
+Its fixed origin is sampled from a stable, inert zero-size probe in Send's
+client-coordinate space before the frame's paint writes, avoiding repeated
+write/read layout flushes and a second keyboard-pan translation in embedded
+browsers. A layout change that
+moves Send still cancels the gesture; moving the feedback does not move its target.
 The Send target never moves. Idle held
 sends dispatch normally, rather than inventing a pending queue entry.
 There is no Send dropdown. Keyboard users can hold Space on Send for the same
@@ -211,7 +216,11 @@ either expanded, cards can use most of the region left after measured header,
 composer, notices and safe-area padding. Conversation keeps 20% of that region,
 bounded to 32–96px; whole actions can reduce it, down to the lesser of 16px or
 10% of the remaining region in an insufficient band. Short lists do not fill
-that capacity: they return unused height to conversation. Collapsing both cards
+that capacity: they return unused height to conversation. This expanded policy
+also applies while the composer stays focused with the software keyboard hidden;
+the collapsed hardware-editing percentage cap cannot override it. Adding a second
+or fifth pending entry grows the card naturally until the measured budget is full.
+Collapsing both cards
 restores the normal budget without changing the reading intention. For example, a 230px
 landscape keyboard band has a 44px app header, 46px composer and 72px for two
 closed cards plus spacing: only 68px remains, not the normal 92px (40%). Both
@@ -225,6 +234,11 @@ timing notes stay inside expanded Pending, while replacement/batch consequences
 remain available in its content pane when collapsed. Batch actions live below
 the count header so they cannot change its disclosure styling or scroll away
 the worker header.
+
+The [desktop screenshot gallery](screenshots/opencode-chat/README.md) covers the
+composer, workers, pending entries, hold countdown, inspection, questions, side
+reader, personal automation preference and uncertain/replacement feedback using
+synthetic fixtures only.
 Selecting a card header also grants its body action space; allocation happens
 after the native click so moving the header cannot swallow a touch. In enlarged
 short landscape, physical 44px chrome/action minima replace rem-scaled empty

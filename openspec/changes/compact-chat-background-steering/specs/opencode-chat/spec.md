@@ -26,6 +26,17 @@ For steering-capable agents, tapping Send SHALL explicitly steer ordinary busy t
 
 A continuous two-second pointer or focused-Send Space hold SHALL automatically submit Queue once, without waiting for release. Release before 250ms SHALL steer once; release from 250ms until two seconds SHALL cancel without sending. Drag outside the original fixed Send bounds, movement of the target, pointercancel, lost capture, window blur, page hiding, Escape, changed draft/attachments/configuration/selection, or active submission/cancellation locks SHALL invalidate the gesture and all stale timers. Keyboard focus leaving Send SHALL cancel its Space hold. Every timer/frame SHALL recheck current page visibility/focus and owned immutable draft identity before dispatch. The viewport-owned pointer-transparent visual envelope SHALL grow from 56px to 104px above the original target during the hold, bounded by visible viewport space, fill bottom-to-top and place the countdown above the finger without shifting layout or enlarging the hit area. It SHALL escape composer/dock clipping and remain unobstructed above the finger; a fixed-height envelope with internal fill alone SHALL NOT satisfy upward growth. Reduced motion SHALL retain the full extension, progress and countdown without envelope growth. Send SHALL expose concise aria-describedby instructions for hold/cancel and existing keyboard shortcuts; Enter on Send SHALL activate immediately. There SHALL be no visible Send/Steer/Queue dropdown or replacement menu. This supersedes earlier visible delivery-selector clauses, while preserving saved message-field keyboard preferences. Idle held Queue SHALL dispatch using existing normal idle semantics, not create fake pending input. Existing authoritative personal background policy SHALL govern accepted steer actions without a second browser background request.
 
+#### Scenario: Fixed and client viewport origins differ during a hold
+- **WHEN** a valid Send hold is painted with a nonzero fixed/client origin difference, including keyboard pan or magnification
+- **THEN** its visual bottom and horizontal anchor SHALL match the unchanged Send rectangle without applying the viewport displacement twice
+- **AND** keyboard opening/closing, pan or toolbar changes that move Send SHALL cancel without a later queued submission
+
+#### Scenario: Ongoing hold calibration does not alternate paint writes and layout reads
+- **WHEN** the unchanged Send target is held across animation frames
+- **THEN** fixed-origin geometry SHALL be read from a stable inert zero-size probe sharing the visual's fixed containing block before that frame's paint writes, without resetting the visible envelope for measurement
+- **AND** origin changes SHALL be sampled during the hold rather than using a stale gesture-start origin
+- **AND** the page-owned probe and visual SHALL be removed together on pagehide and restored for a retained page or subsequent gesture
+
 #### Scenario: Quick tap and intentional hold have distinct outcomes
 - **WHEN** a busy ordinary draft is tapped, intentionally held then released early, or continuously held for two seconds
 - **THEN** it respectively steers once, sends nothing, or queues automatically once before release
@@ -179,6 +190,11 @@ Explicit Continue SHALL retain its existing constrained-state suppression; this 
 Worker and pending cards SHALL share a measured height budget, not a scrollport. Their headers SHALL match in height, padding, typography, custom chevron, border, radius and color. Each header SHALL remain outside its independently scrolling content pane; scrolling either pane SHALL NOT move the other pane's header or scroll offset, the transcript, or the composer. The outer dock SHALL NOT scroll. Long content SHALL share available space and short or collapsed content SHALL yield unused space. With both cards collapsed, desktop's normal budget remains 40% of actual panel height capped at 25rem, reserving the lesser of 12rem or 35% for the transcript; touch retains its normal phone/tablet reading budget and safe insets.
 
 With either card expanded, the dock SHALL use the remaining measured panel height after all in-flow chrome, warnings, composer and safe-area padding, not a fixed viewport height. The preferred transcript reserve SHALL be 20% of that remaining region, bounded to 32–96 CSS pixels. Whole measured headers/actions MAY reduce that reserve, retaining at least the lesser of 16px or 10% of the remaining region where physically possible. The remaining capacity SHALL be available to the cards without forcing short lists to fill it. Both expanded long lists SHALL partition that capacity; a short or collapsed sibling SHALL yield its unused share. Collapsing both SHALL restore the normal reading budget without blank card height or a forced conversation jump. Expanded desktop cards SHALL NOT require Show work when their measured actions fit beside the small conversation strip.
+
+#### Scenario: Expanded pending entries grow while the keyboard is hidden
+- **WHEN** the touch composer remains focused without a software keyboard and expanded pending work grows from one to two to five entries beside busy workers
+- **THEN** the expanded measured budget supersedes the collapsed hardware-editing cap, making complete entries/actions visible wherever the remaining capacity permits
+- **AND** short or collapsed cards return unused height to the transcript
 
 Physically insufficient space SHALL prioritize a whole actionable row in the explicitly focused/touched pane while retaining both headers and the unobstructed composer. The existing explicit desktop Show work fallback MAY cover the chat header but SHALL NOT overlap the composer. Disclosure state, keyed controls, focus and independent reading offsets SHALL survive unrelated worker/pending updates. Replacement warnings SHALL reveal once inside the pending pane, never by scrolling the shared dock.
 

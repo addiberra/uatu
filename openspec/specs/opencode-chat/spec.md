@@ -3183,6 +3183,11 @@ Worker and pending cards SHALL share a measured height budget, not a scrollport.
 
 With either card expanded, the dock SHALL use the remaining measured panel height after all in-flow chrome, warnings, composer and safe-area padding, not a fixed viewport height. The preferred transcript reserve SHALL be 20% of that remaining region, bounded to 32–96 CSS pixels. Whole measured headers/actions MAY reduce that reserve, retaining at least the lesser of 16px or 10% of the remaining region where physically possible. The remaining capacity SHALL be available to the cards without forcing short lists to fill it. Both expanded long lists SHALL partition that capacity; a short or collapsed sibling SHALL yield its unused share. Collapsing both SHALL restore the normal reading budget without blank card height or a forced conversation jump. Expanded desktop cards SHALL NOT require Show work when their measured actions fit beside the small conversation strip.
 
+#### Scenario: Expanded pending entries grow while the keyboard is hidden
+- **WHEN** the touch composer remains focused without a software keyboard and expanded pending work grows from one to two to five entries beside busy workers
+- **THEN** the expanded measured budget supersedes the collapsed hardware-editing cap, making complete entries/actions visible wherever the remaining capacity permits
+- **AND** short or collapsed cards return unused height to the transcript
+
 Physically insufficient space SHALL prioritize a whole actionable row in the explicitly focused/touched pane while retaining both headers and the unobstructed composer. The existing explicit desktop Show work fallback MAY cover the chat header but SHALL NOT overlap the composer. Disclosure state, keyed controls, focus and independent reading offsets SHALL survive unrelated worker/pending updates. Replacement warnings SHALL reveal once inside the pending pane, never by scrolling the shared dock.
 
 #### Scenario: Independent saturated work cards

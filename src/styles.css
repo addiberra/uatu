@@ -10522,7 +10522,7 @@ html[data-ui-mode="touch"][data-active-tab="terminal"] .attention-notices {
 html[data-ui-mode="touch"][data-chat-editing]:not([data-chat-keyboard]) .chat-composer {
   padding-bottom: calc(0.45rem + env(safe-area-inset-bottom));
 }
-html[data-ui-mode="touch"][data-chat-editing]:not([data-chat-keyboard]) .chat-work-dock {
+html[data-ui-mode="touch"][data-chat-editing]:not([data-chat-keyboard]) .chat-work-dock:not([data-work-content-expanded]) {
   --chat-work-budget: min(calc(var(--chat-visual-height) * 0.24), var(--chat-work-available, 100vh));
   max-height: var(--chat-work-budget);
 }
@@ -10742,6 +10742,7 @@ html:is([data-ui-mode="touch"], [data-ui-mode="desktop"]) .chat-surface:has(.cha
 #chat-send { touch-action: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
 .chat-hold-upward { position: fixed; z-index: 125; pointer-events: none; overflow: hidden; border-radius: 12px 12px 6px 6px; background: #245b91; color: white; box-shadow: 0 0 0 1px #ffffff80, 0 -4px 12px #0003; }
 .chat-hold-upward[hidden] { display: none; }
+.chat-hold-origin { position: fixed; left: 0; top: 0; width: 0; height: 0; margin: 0; padding: 0; border: 0; visibility: hidden; pointer-events: none; }
 .chat-hold-upward::before { content: ""; position: absolute; inset: 0; background: #167c62; transform: scaleY(var(--hold-progress, 0)); transform-origin: bottom; }
 .chat-hold-cap { position: absolute; top: 8px; inset-inline: 0; text-align: center; white-space: pre-line; font-size: 12px; line-height: 20px; font-weight: 600; font-variant-numeric: tabular-nums; }
 /* Pending inspection/mutations use the explicitly approved 32px density

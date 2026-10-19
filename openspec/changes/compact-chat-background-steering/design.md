@@ -331,6 +331,19 @@ extension and changing countdown. Dispatch/cancellation and personal automation
 semantics are unchanged. Chromium trusted touch and WebKit pointer tests are
 browser evidence, not native iOS gesture/callout verification.
 
+The hold portal samples an inert, zero-size fixed-origin sibling before any
+frame paint writes, then maps Send's client rectangle into CSS coordinates.
+The probe shares the envelope's containing block and is measured each frame,
+not cached across viewport changes; neither node is reset for measurement.
+Both are removed on pagehide and restored for a retained page or the next
+gesture. This avoids assuming a shared visual/layout
+origin under embedded-WebKit keyboard pan; it also avoids hard-coded offset or
+scale corrections. Target movement still invalidates the immutable gesture.
+The hardware-editing percentage rule applies only to a collapsed work dock:
+otherwise its higher selector specificity could defeat the expanded measured
+capacity even with hundreds of unused transcript pixels. Sparse one/two/five
+entry growth is tested separately from saturated lists.
+
 ## Risks / Trade-offs
 
 - [ON for existing accounts changes behavior] → Clearly scoped personal setting, explicit all-jobs disclosure, OFF retained across devices, action-time server resolution, no job-start automation.
