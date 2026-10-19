@@ -121,6 +121,7 @@ async function instrumentContext(context: BrowserContext, log: Log, label: strin
 export type TestBrowser = Pick<Browser, "newContext" | "newPage" | "close" | "version">;
 
 type EngineBrowserFixtures = {
+  context: BrowserContext;
   /** One browser per engine per worker, a fresh context per test (see the
    *  header). Replaces `({ chromium, webkit })[engine].launch()`. */
   launchBrowser: (engine: Engine) => Promise<TestBrowser>;
@@ -136,6 +137,14 @@ type EngineBrowserWorkerFixtures = {
  *  WebKit gets one worker-scoped browser of its own, launched on first use. */
 export function withEngineBrowsers<T extends {}, W extends {}>(test: TestType<T, W>) {
   return test.extend<EngineBrowserFixtures, EngineBrowserWorkerFixtures>({
+    context: async ({ context }, use, testInfo) => {
+      // With config-owned tracing disabled, configured pages and manually
+      // created contexts both use the diagnostic helper as their sole owner.
+      const finish = process.env.UATU_LINUX_WEBKIT_DIAGNOSTIC === "1"
+        ? await recordLinuxWebKitDiagnostics(context, testInfo, "configured") : undefined;
+      try { await use(context); }
+      finally { await finish?.(); }
+    },
     _webkitBrowser: [async ({ playwright }, use) => {
       let launched: Promise<Browser> | undefined;
       // A failed launch is forgotten, so the worker's next test tries again
@@ -184,7 +193,8 @@ export function withEngineBrowsers<T extends {}, W extends {}>(test: TestType<T,
       });
       // A test that timed out never reached its own `finally`; its contexts
       // must not outlive it in the worker's browser.
-      await Promise.all([...opened].map(context => closeContext(context).catch(() => {})));
+      await Promise.all([...opened].map(context => process.env.UATU_LINUX_WEBKIT_DIAGNOSTIC === "1"
+        ? closeContext(context) : context.close().catch(() => {})));
     },
   });
 }

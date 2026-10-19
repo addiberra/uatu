@@ -27,6 +27,8 @@ export default defineConfig({
     testMatch: files,
     testIgnore: [],
     grep: /steering on touch \(webkit\).*enlarged pending text|header taps expose short-screen actions without focus assistance: webkit|reference work card owns its header and rows: webkit desktop/,
-    use: { ...base.use, trace: "on" },
+    // Playwright also auto-starts tracing on browser.newContext(), not just
+    // its configured page. The opt-in helper owns every diagnostic trace.
+    use: { ...base.use, trace: "off" },
   }],
 });

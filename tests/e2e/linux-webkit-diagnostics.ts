@@ -1,9 +1,23 @@
 import { appendFile, mkdir } from "node:fs/promises";
 import type { BrowserContext, TestInfo } from "@playwright/test";
 
+type Recording = { info: TestInfo; label: string; finish: Promise<() => Promise<void>> };
+const recordings = new WeakMap<BrowserContext, Recording>();
+
 // Explicitly opt-in from the temporary diagnostic job only. No production
 // instrumentation, text, form values, URLs, headers, or storage are collected.
-export async function recordLinuxWebKitDiagnostics(context: BrowserContext, info: TestInfo, label: string): Promise<() => Promise<void>> {
+export function recordLinuxWebKitDiagnostics(context: BrowserContext, info: TestInfo, label: string): Promise<() => Promise<void>> {
+  const existing = recordings.get(context);
+  if (existing) {
+    if (existing.info !== info || existing.label !== label) throw new Error("Diagnostic context already belongs to another recording");
+    return existing.finish;
+  }
+  const finish = startRecording(context, info, label);
+  recordings.set(context, { info, label, finish });
+  return finish;
+}
+
+async function startRecording(context: BrowserContext, info: TestInfo, label: string): Promise<() => Promise<void>> {
   const geometry = info.outputPath(`${label}-layout.jsonl`);
   await mkdir(info.outputDir, { recursive: true });
   let writes = Promise.resolve();
