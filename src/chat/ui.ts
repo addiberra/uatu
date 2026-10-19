@@ -3658,8 +3658,14 @@ export function initChat(api = new ChatApiClient()): void {
       const speak = source.conversationId === (child?.conversationId ?? null) ? announceQuestionStepChild : announceQuestionStep;
       const panels = [...form.querySelectorAll<HTMLElement>("[data-question-panel]")];
       const activeIndex = Math.max(0, panels.findIndex(panel => !panel.hidden));
-      const label = panels[activeIndex]?.querySelector(".chat-question-step")?.textContent?.trim().replace(/\s+/g, " ");
-      speak(label ? `Question ${activeIndex + 1} of ${panels.length}: ${label}` : "");
+      const panel = panels[activeIndex];
+      // The step's label names it; a mapping that leaves the label unnamed
+      // falls back to the statement itself rather than announcing a bare
+      // hint (or nothing) for the question that just opened.
+      const label = panel?.querySelector<HTMLElement>(".chat-question-step")?.textContent?.trim().replace(/\s+/g, " ");
+      const statement = panel?.querySelector<HTMLElement>(".chat-question-statement")?.textContent?.trim().replace(/\s+/g, " ");
+      const name = label || statement;
+      speak(name ? `Question ${activeIndex + 1} of ${panels.length}: ${name}` : "");
     };
 
     // Retire this conversation's owed-answer line once the step it held back
@@ -3744,7 +3750,10 @@ export function initChat(api = new ChatApiClient()): void {
       const missing = answers.flatMap((answer, index) => answer.length === 0 && !item.questions[index]?.optional ? [index] : []);
       if (missing.length > 0) {
         showQuestionPanel(questionForm, missing[0]!);
-        announceFailureFor(source)(`Still to answer: ${missing.map(index => item.questions[index]!.header).filter(Boolean).join(", ")}`, true);
+        // Name each owed step: a field without a label reads empty here
+        // otherwise, and the prompt always names it.
+        const owed = missing.map(index => item.questions[index]!.header || item.questions[index]!.prompt || "the current question").filter(Boolean).join(", ");
+        announceFailureFor(source)(`Still to answer: ${owed}`, true);
         return;
       }
       clearOwedAnswer(source);

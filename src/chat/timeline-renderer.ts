@@ -1754,8 +1754,10 @@ function renderQuestion(item: QuestionRequest, open: boolean, active: boolean, o
   // identical ellipsised sentence told the reader nothing about which step
   // was which — and the legend states the question whole. The header wins
   // ties: both normal mappings name the label in the header, so equal
-  // lengths must not collapse every pill onto the prompt again.
-  const stepLabel = (question: StructuredQuestion) => question.prompt.length < question.header.length ? question.prompt : question.header;
+  // lengths must not collapse every pill onto the prompt again. A missing
+  // header hands the name to the prompt — an empty pill names nothing, and
+  // the step's announcements and validation would all read empty too.
+  const stepLabel = (question: StructuredQuestion) => question.header === "" ? question.prompt : question.prompt.length < question.header.length ? question.prompt : question.header;
   const statement = (question: StructuredQuestion) => stepLabel(question) === question.prompt ? question.header : question.prompt;
   // A mirrored pending question renders in both the parent and the child
   // transcript (ChatAdapter.mirrorToParent), sharing item.id — the panel id

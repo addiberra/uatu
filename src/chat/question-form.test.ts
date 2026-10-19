@@ -253,4 +253,18 @@ describe("question form interactions", () => {
     expect(parent.querySelectorAll("[data-question-tab]")[0]!.getAttribute("aria-controls")).toBe(parentPanel.id);
     expect(child.querySelectorAll("[data-question-tab]")[0]!.getAttribute("aria-controls")).toBe(childPanel.id);
   });
+
+  // An OpenCode-v2 field without a description maps to an empty header: the
+  // pill, eyebrow, and announcements must still name the step — by the
+  // question itself rather than an empty label.
+  test("a step without a header is named by its prompt", () => {
+    const form = renderForm([
+      choice({ header: "", prompt: "Which surfaces should this pass cover", allowFreeForm: false }),
+      choice({ header: "Details", options: [{ label: "X", description: "" }] }),
+    ]);
+    const tabs = [...form.querySelectorAll<HTMLButtonElement>("[data-question-tab]")];
+    expect(tabs[0]!.textContent!.replace(", answered", "")).toBe("Which surfaces should this pass cover");
+    expect(tabs[1]!.textContent!.replace(", answered", "")).toBe("Details");
+    expect(form.querySelector(".chat-question-step")!.textContent).toContain("Which surfaces");
+  });
 });
