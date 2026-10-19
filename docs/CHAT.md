@@ -117,15 +117,18 @@ never writes.
 ### Sending, steering and queued messages
 
 **Send** taps steer ordinary text while OpenCode V2 is busy; the separate
-**Stop** cancels the current response. Hold Send continuously for **2 seconds**
-to queue automatically, exactly once without releasing. Releasing an intentional
-hold (250ms–2s), dragging outside the original button, Escape, lost capture,
+**Stop** cancels the current response. Hold Send continuously for **2.5 seconds**
+to queue automatically, exactly once without releasing: a silent **500ms arming
+delay** precedes the **2-second countdown**. Release before 500ms steers once.
+Releasing during the countdown (500ms–2499ms), dragging outside the original button, Escape, lost capture,
 pointer cancellation, leaving the tab, moving the target or changing the
 draft/conversation/configuration cancels without sending.
-The countdown clears the finger immediately; its pointer-transparent envelope
-grows upward from 56px to 104px above the fixed Send target while filling
-bottom-to-top. Reduced motion keeps the full extension and live countdown
-without the growth. The visual is viewport-owned, outside composer/dock clipping.
+No extension or progress appears during arming, so an ordinary tap never flashes
+the indicator. At 500ms the full pointer-transparent envelope appears 104px above
+the fixed Send target, limited by visible viewport space. Its outer bounds stay
+fixed while only the green fill moves bottom-to-top and the countdown runs from
+2.0s to zero. Reduced motion retains the same information and fixed bounds.
+The visual is viewport-owned, outside composer/dock clipping.
 Its fixed origin is sampled from a stable, inert zero-size probe in Send's
 client-coordinate space before the frame's paint writes, avoiding repeated
 write/read layout flushes and a second keyboard-pan translation in embedded
@@ -134,7 +137,7 @@ moves Send still cancels the gesture; moving the feedback does not move its targ
 The Send target never moves. Idle held
 sends dispatch normally, rather than inventing a pending queue entry.
 There is no Send dropdown. Keyboard users can hold Space on Send for the same
-two-second Queue action; Enter activates Send immediately. Escape cancels the
+2.5-second Queue action; Enter activates Send immediately. Escape cancels the
 hold and preserves focus. Send's accessible description explains these keys.
 A compact “Tap to steer · hold to queue” hint appears only with an eligible
 ordinary-text draft while work is running. An accepted held queue submission

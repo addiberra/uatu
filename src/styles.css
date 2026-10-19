@@ -10735,7 +10735,7 @@ html:is([data-ui-mode="touch"], [data-ui-mode="desktop"]) .chat-surface:has(.cha
 .chat-worker-row .chat-task-stop:focus-visible { outline-offset: -2px; }
 .chat-worker-inspect:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 
-/* Approved B: the target stays fixed; only a pointer-transparent extension rises. */
+/* Approved B: fixed target and full-height envelope; only the green fill rises. */
 .chat-inline-configuration, .chat-inline-context { display: none; }
 #chat-configuration-trigger[hidden] { display: none !important; }
 .chat-send-group { position: relative; }

@@ -230,7 +230,7 @@ keyboard sheet and still queues once, not just that its rectangle exists.
 
 ## 7. Approved B composer revision (2026-10-17)
 
-- [x] 7.1 Test and implement fixed-target tap-to-steer / two-second automatic Queue with early-hold cancellation, lifecycle/draft/selection guards and accessible split-menu fallback; retain keyboard delivery preferences and authoritative Hub policy.
+- [x] 7.1 Test and implement fixed-target tap-to-steer / automatic Queue (now 500ms arming plus two-second countdown) with early-hold cancellation and lifecycle/draft/selection guards; the later revision removes the split-menu fallback. Retain keyboard delivery preferences and authoritative Hub policy.
 - [x] 7.2 Test and implement inline attachment and actual model/mode/effort/context pill using the existing chooser and occupancy readout; verify phone, keyboard, landscape, tablet and desktop budgets.
 - [x] 7.3 Test and implement dense canonical worker rows with real model/cumulative usage, active-first ordering and persisted view-only Dismiss/Restore finished using the existing dismissal seam.
 - [x] 7.4 Verify pinned native V2 side-generation and TUI /btw semantics, implement a capability-gated side answer if it cannot execute agent tools or mutate foreground/history; otherwise report the specific blocking decision.
@@ -239,7 +239,7 @@ keyboard sheet and still queues once, not just that its rectangle exists.
 ## 8. Approved redundant-control cleanup (2026-10-17)
 
 - [x] 8.1 Remove top Options trigger/panel, relocation wiring and dead styles; keep the real inline picker, attachments, standalone Continue/help and unique account usage reachable without duplicate touch context/model presentation.
-- [x] 8.2 Remove Send delivery dropdown; preserve two-second pointer Queue, cancellation guards, existing keyboard preference/Alt+Enter and touch newline, adding described Space-hold Queue with native quick Enter on Send.
+- [x] 8.2 Remove Send delivery dropdown; preserve pointer Queue (now 500ms arming plus two-second countdown), cancellation guards, existing keyboard preference/Alt+Enter and touch newline, adding described Space-hold Queue with native quick Enter on Send.
 - [x] 8.3 Remove Restore finished without a replacement control; retain persisted view-only Dismiss, hidden counts and provider/timeline results.
 - [x] 8.4 Present the personal Hub setting as a compact labelled switch, one-line scope helper, collapsed Learn more and explicit compact Save; preserve existing default ON/account/save/conflict/error policy.
 - [x] 8.5 Complete clean CI, type/build/API/strict-spec checks and chat/Hub Chromium/WebKit geometry, theme, keyboard and history evidence; inspect actual renders and report additional redundancy candidates without removing them. Independent review/publication/deployment remain lead-owned. Full browser coverage retains the separately reproduced baseline failures below; this does not claim an all-green suite.
@@ -275,7 +275,7 @@ pushed, installed, deployed or changed on a user Hub. The pre-existing untracked
   after persisted Dismiss with no Restore control. Touch returns composing
   focus after a tap; keyboard activation restores the actual inline picker.
 - `screenshots-acceptance/` and the Playwright report retain phone/tablet,
-  short keyboard/landscape, desktop, enlarged text, light/dark, two-second hold,
+  short keyboard/landscape, desktop, enlarged text, light/dark, armed two-second countdown,
   model picker, known-context and compact account-switch evidence. Selected
   actual phone/tablet/desktop renders were inspected against both supplied
   screenshots. Physical-device, assistive-technology and live/paid-model
@@ -357,7 +357,7 @@ Primary final browser evidence is the completed Playwright report in `compact-re
 - [x] 10.1 Reproduce first: both engines fail dense pending geometry (60px header, 109px card), outward growth (constant 84px extension), and hidden-only worker-card removal.
 - [x] 10.2 Compact touch pending text to nonzero categories without redundant totals; measured single-entry header/card become 32px/64px. Keep 32px inline pending targets, 8px gaps, existing confirmations and 44px composer/paused-batch Send/Stop.
 - [x] 10.3 Remove dismissed-count wording and hide the entire worker card when no visible workers remain, preserving persisted dismissal and timeline inspection.
-- [x] 10.4 Grow the viewport-owned pointer-transparent envelope from 56px to 104px with bottom-up fill and an above-finger countdown. Preserve fixed target, two-second exactly-once dispatch, all cancellation guards and reduced-motion information.
+- [x] 10.4 Use the latest fixed-height viewport-owned pointer-transparent envelope: silent 500ms arming, then a full 104px extension with bottom-up green fill and an above-finger two-second countdown. Preserve fixed target, 2500ms exactly-once dispatch, all cancellation guards and reduced-motion information; this supersedes envelope growth.
 - [x] 10.5 Run all 202 steering/worker/hold/mobile-layout browser checks successfully, including all prior 47 hold checks. Capture light/dark phone, 380/450px portrait and 230px landscape frame/occlusion evidence; retain existing 480px desktop, safe-area, focus and anchor coverage.
 - [x] 10.6 Validate clean isolated unit CI (5,278 pass / 16 skip), API (208 pass), typecheck, build, contract structure and strict specs (60 valid). Native macOS watcher timing failures in intermediate runs passed isolated and in the final owned-temporary-directory CI run; no observer tests or product behavior were changed.
 - [ ] 10.7 Resolve wider-suite pre-existing blockers before declaring the entire chat suite green: 637 functional passes / five failures reproduced on unchanged c2641ce (desktop configuration-details expectation; two hidden-child responsiveness cases; two touch-child shell cases). Performance adds 16 passes / four touch-child setup failures using the same unchanged hidden desktop-worker selectors. Preserve these tests; lead review decides their separate correction. Native iPhone/Safari hold/callout verification remains unperformed.
@@ -414,7 +414,7 @@ remain outside this correction; no universal enlarged-text 40% guarantee is clai
 ## 13. Hold coordinate and sparse expanded-queue regressions
 
 - [x] 13.1 Reproduce the fixed/client-origin displacement and focused, keyboard-hidden one-to-two-entry clipping before fixing them. Restrict the hardware-editing cap to collapsed work and calibrate the hold portal against its painted origin; preserve existing gesture invalidation.
-- [x] 13.2 Check one/two/five-entry growth and collapsed space return; synthetic nonzero fixed origins, pan/scale, exact two-second single admission, keyboard opening/closing, viewport pan and toolbar movement cancellation. Chromium passes; local WebKit stalls before tab activation, not native iPhone verification.
+- [x] 13.2 Check one/two/five-entry growth and collapsed space return; synthetic nonzero fixed origins, pan/scale, single admission (now at 2500ms after silent arming), keyboard opening/closing, viewport pan and toolbar movement cancellation. Chromium passes; local WebKit stalls before tab activation, not native iPhone verification.
 - [x] 13.3 Preserve and run the existing hold/side-reader and reference-workdock checks: 31 Chromium cases, including desktop/phone, short bands, themes, 20+20 lists, 200% text and independent scrolling. The two new Chromium regression cases pass.
 - [x] 13.4 Add 13 privacy-reviewed, actual-rendered desktop PNGs and an indexed synthetic-fixture disclosure under `docs/screenshots/opencode-chat/`; retain opt-in capture tests, covering configuration, workers, queue, hold progression, inspection, questions, side reader, personal preference and uncertain/replacement feedback.
 - [x] 13.5 Verify chat unit suite (1,736 pass, 9 skip), typecheck, build, strict change/spec validation and diff hygiene. Build retains existing unsupported `::highlight` warnings. No API/auth behavior changed; no live Hub, paid generation, dependency installation or publication was used. Native iOS reproduction remains outstanding.

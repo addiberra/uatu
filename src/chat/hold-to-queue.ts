@@ -1,5 +1,9 @@
 import type { MessageDelivery } from "./types";
 
+export const HOLD_ARM_MS = 500;
+export const HOLD_COUNTDOWN_MS = 2000;
+export const HOLD_TOTAL_MS = HOLD_ARM_MS + HOLD_COUNTDOWN_MS;
+
 /** One pointer owns one immutable draft. Invalid state never becomes a tap. */
 export class HoldToQueue {
   private gesture: { pointer: number; start: number; identity: string } | null = null;
@@ -16,7 +20,7 @@ export class HoldToQueue {
   progress(now: number): number | null {
     if (!this.gesture) return null;
     if (this.identity() !== this.gesture.identity) { this.cancel(); return null; }
-    return Math.min(1, Math.max(0, (now - this.gesture.start) / 2000));
+    return Math.min(1, Math.max(0, (now - this.gesture.start - HOLD_ARM_MS) / HOLD_COUNTDOWN_MS));
   }
 
   check(now: number): void {
@@ -28,9 +32,10 @@ export class HoldToQueue {
   release(pointer: number, now: number): void {
     if (this.gesture?.pointer !== pointer) return;
     const progress = this.progress(now);
+    const tap = this.gesture !== null && now - this.gesture.start < HOLD_ARM_MS;
     this.cancel();
     if (progress === 1) this.deliver("queue");
-    else if (progress !== null && progress < 0.125) this.deliver("steer");
+    else if (progress !== null && tap) this.deliver("steer");
   }
 
   cancel(): void { this.gesture = null; }

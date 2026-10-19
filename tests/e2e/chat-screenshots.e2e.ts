@@ -8,6 +8,7 @@ import path from "node:path";
 test.skip(process.env.UATU_CAPTURE_CHAT_SCREENSHOTS !== "1", "Opt-in documentation screenshots");
 const folder = path.resolve("docs/screenshots/opencode-chat");
 async function shot(page: Page, name: string) {
+  if (process.env.UATU_CAPTURE_HOLD_ONLY === "1" && !name.startsWith("04-hold-")) return;
   await page.evaluate(() => document.fonts.ready);
   await page.screenshot({ path: path.join(folder, `${name}.png`), animations: "disabled" });
 }
@@ -90,15 +91,16 @@ test("desktop documentation gallery", async ({ page, request }) => {
   await page.clock.install(); await page.clock.pauseAt(new Date(Date.now() + 1000));
   const box = (await page.locator("#chat-send").boundingBox())!;
   await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2); await page.mouse.down();
-  await page.clock.runFor(500); await shot(page, "04-hold-quarter-dark");
+  await page.clock.runFor(1000); await shot(page, "04-hold-quarter-dark");
   const earlyEnvelope = (await page.locator(".chat-hold-upward").boundingBox())!;
   await page.clock.runFor(1100); await shot(page, "04-hold-near-dark");
-  expect((await page.locator(".chat-hold-upward").boundingBox())!.height).toBeGreaterThan(earlyEnvelope.height + 20);
+  expect(await page.locator(".chat-hold-upward").boundingBox()).toEqual(earlyEnvelope);
   const held = page.waitForResponse(response => response.url().endsWith("/prompts") && response.request().method() === "POST");
   await page.clock.runFor(400); expect((await held).ok()).toBe(true); await page.mouse.up();
   await page.clock.resume();
   await page.emulateMedia({ reducedMotion: "reduce" });
   await expect(page.locator('.chat-queued-message[data-delivery="queue"]')).toHaveCount(1);
+  if (process.env.UATU_CAPTURE_HOLD_ONLY === "1") return;
   for (let i = 3; i < 20; i++) await control(request, { action: "opencode", op: "launchWorker", conversationId });
   for (let i = 1; i < 20; i++) {
     await page.locator("#chat-input").fill(`Review follow-up ${i + 1}: preserve keyboard focus and saved tasks`);

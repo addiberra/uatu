@@ -241,7 +241,7 @@ test.describe("steering an OpenCode 2.x turn", () => {
     await page.locator("#chat-input").fill("Keep preference draft");
     await page.evaluate(() => localStorage.setItem("uatu:presentation:v1:%2F:chat-delivery", "queue"));
     await page.locator("#chat-input").fill("Keep preference draft updated");
-    await expect(page.locator("#chat-send")).toHaveAttribute("aria-label", "Send as steer; hold 2 seconds to queue");
+    await expect(page.locator("#chat-send")).toHaveAttribute("aria-label", "Send as steer; hold 2.5 seconds to queue");
     await expect(page.locator("#chat-send-help")).toContainText("Enter: Queue; Alt+Enter: Steer");
     await expect(page.locator("#chat-send")).toHaveAttribute("aria-describedby", "chat-send-help");
     await page.emulateMedia({ colorScheme: "dark" });

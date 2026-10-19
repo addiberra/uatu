@@ -70,11 +70,16 @@ test("hold portal matches Send when the fixed viewport origin differs from clien
   await page.clock.pauseAt(new Date(Date.now() + 1000));
   const send = (await page.locator("#chat-send").boundingBox())!;
   await page.mouse.move(send.x + send.width / 2, send.y + send.height / 2); await page.mouse.down();
-  await page.clock.runFor(400);
+  await page.clock.runFor(499);
+  await expect(page.locator(".chat-hold-upward")).toBeHidden();
+  await page.clock.runFor(1);
   await page.screenshot({ path: info.outputPath("hold-offset.png") });
   const visual = (await page.locator(".chat-hold-upward").boundingBox())!;
   expect(visual.x).toBeCloseTo(send.x, 0);
   expect(visual.y + visual.height).toBeCloseTo(send.y + send.height, 0);
+  expect(visual.height).toBeCloseTo(send.height + 104, 0);
+  await page.clock.runFor(500);
+  expect(await page.locator(".chat-hold-upward").boundingBox()).toEqual(visual);
   // A changing fixed paint origin must not translate the overlay twice.
   await page.evaluate(() => {
     document.documentElement.style.setProperty("--test-fixed-x", "-23px");
@@ -86,7 +91,9 @@ test("hold portal matches Send when the fixed viewport origin differs from clien
   const panned = (await page.locator(".chat-hold-upward").boundingBox())!;
   expect(panned.x).toBeCloseTo(send.x, 0);
   expect(panned.y + panned.height).toBeCloseTo(send.y + send.height, 0);
-  await page.clock.runFor(1399);
+  await page.clock.runFor(800);
+  expect(await page.locator(".chat-hold-upward").boundingBox()).toEqual(visual);
+  await page.clock.runFor(499);
   await expect(page.locator(".chat-queued-message")).toHaveCount(0);
   const accepted = page.waitForResponse(response => response.url().endsWith("/prompts") && response.request().method() === "POST");
   await page.clock.runFor(1);
@@ -109,7 +116,7 @@ test("hold portal matches Send when the fixed viewport origin differs from clien
     await page.clock.runFor(64);
     const current = (await page.locator("#chat-send").boundingBox())!;
     await page.mouse.move(current.x + current.width / 2, current.y + current.height / 2); await page.mouse.down();
-    await page.clock.runFor(350);
+    await page.clock.runFor(550);
     const anchored = (await page.locator(".chat-hold-upward").boundingBox())!;
     expect(anchored.y + anchored.height).toBeCloseTo(current.y + current.height, 0);
     await page.evaluate(change => {

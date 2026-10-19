@@ -422,16 +422,78 @@ test("tap steers despite saved Queue keyboard preference; Space hold queues with
   await page.locator("#chat-input").press("Alt+Enter");
   await expect(page.locator('.chat-queued-message[data-delivery="steer"]')).toHaveCount(2);
 });
-test("two-second hold queues before release once with fixed target and upward countdown", async ({ page, request }, testInfo) => {
+test("transient target movement during silent arming invalidates even a later tap", async ({ page, request }) => {
+  await boot(page, request);
+  await page.locator("#chat-input").fill("Retain after movement");
+  await page.clock.install();
+  await page.clock.pauseAt(new Date(Date.now() + 1000));
+  await press(page);
+  await page.clock.runFor(250);
+  await page.locator("#chat-send").evaluate(node => { node.style.transform = "translateX(-20px)"; });
+  await page.clock.runFor(32);
+  await page.locator("#chat-send").evaluate(node => { node.style.transform = ""; });
+  await page.clock.runFor(217);
+  await page.mouse.up();
+  await page.clock.runFor(3000);
+  await expect(page.locator(".chat-queued-message")).toHaveCount(0);
+  await expect(page.locator("#chat-input")).toHaveValue("Retain after movement");
+});
+for (const duration of [250, 499, 500]) test(`release at ${duration}ms respects arming without a duplicate native click`, async ({ page, request }) => {
+  await boot(page, request);
+  await page.locator("#chat-input").fill("Boundary draft");
+  await page.clock.install();
+  await page.clock.pauseAt(new Date(Date.now() + 1000));
+  await press(page);
+  await page.clock.runFor(duration);
+  if (duration < 500) await expect(page.locator(".chat-hold-upward")).toBeHidden();
+  else await expect(page.locator(".chat-hold-cap")).toHaveText("Queue\n2.0s");
+  const accepted = duration < 500
+    ? page.waitForResponse(response => response.url().endsWith("/prompts") && response.request().method() === "POST")
+    : null;
+  await page.mouse.up();
+  if (accepted) {
+    expect((await accepted).ok()).toBe(true);
+    await page.clock.runFor(32); // Paint the acknowledged projection before advancing past stale timers.
+  }
+  await page.clock.runFor(3000);
+  await expect(page.locator(".chat-hold-upward")).toBeHidden();
+  await expect(page.locator(".chat-queued-message")).toHaveCount(duration < 500 ? 1 : 0);
+  if (duration < 500) await expect(page.locator('.chat-queued-message[data-delivery="steer"]')).toHaveCount(1);
+  else await expect(page.locator("#chat-input")).toHaveValue("Boundary draft");
+});
+test("arming delays the fixed-height countdown and queues exactly at 2500ms", async ({ page, request }, testInfo) => {
   await boot(page, request);
   await page.locator("#chat-input").fill("Held draft");
+  await page.clock.install();
+  await page.clock.pauseAt(new Date(Date.now() + 1000));
   const before = await press(page);
+  await page.clock.runFor(499);
+  await expect(page.locator(".chat-hold-upward")).toBeHidden();
+  await expect(page.locator("#chat-send")).not.toHaveClass(/is-holding/);
+  await page.clock.runFor(1);
   await expect(page.locator(".chat-hold-upward")).toBeVisible();
-  await expect.poll(async () => before.y - (await page.locator(".chat-hold-upward").boundingBox())!.y, { intervals: [25] }).toBeGreaterThanOrEqual(80);
   const extension = (await page.locator(".chat-hold-upward").boundingBox())!;
-  expect(extension.y).toBeLessThanOrEqual(before.y - 80);
-  expect(await page.locator("#chat-send").boundingBox()).toEqual(before);
+  expect(extension.height).toBeCloseTo(before.height + 104, 0);
+  await expect(page.locator(".chat-hold-cap")).toHaveText("Queue\n2.0s");
+  let previousFill = 0;
+  for (const elapsed of [500, 1000]) {
+    await page.clock.runFor(elapsed);
+    expect(await page.locator(".chat-hold-upward").boundingBox()).toEqual(extension);
+    expect(await page.locator("#chat-send").boundingBox()).toEqual(before);
+    const fill = await page.locator(".chat-hold-upward").evaluate(node => new DOMMatrixReadOnly(getComputedStyle(node, "::before").transform).m22);
+    expect(fill).toBeGreaterThan(previousFill);
+    previousFill = fill;
+  }
+  const progress = await page.locator(".chat-hold-upward").evaluate(node => Number((node as HTMLElement).style.getPropertyValue("--hold-progress")));
+  expect(progress).toBeGreaterThan(0.74);
+  expect(progress).toBeLessThanOrEqual(0.75);
   await captureScreenshot(page, testInfo, "hold-upward");
+  await page.clock.runFor(499);
+  await expect(page.locator(".chat-queued-message")).toHaveCount(0);
+  const accepted = page.waitForResponse(response => response.url().endsWith("/prompts") && response.request().method() === "POST");
+  await page.clock.runFor(1);
+  expect((await accepted).ok()).toBe(true);
+  await page.clock.runFor(32);
   await expect(page.locator('.chat-queued-message[data-delivery="queue"]')).toHaveCount(1);
   await page.mouse.up();
   await expect(page.locator("#chat-input")).toHaveValue("");
@@ -444,7 +506,7 @@ for (const cancellation of ["early Space release", "keyboard focus leaves Send"]
     await page.locator("#chat-send").focus();
     await page.clock.install();
     await page.keyboard.down("Space");
-    await page.clock.runFor(350);
+    await page.clock.runFor(550);
     if (cancellation === "keyboard focus leaves Send") await page.keyboard.press("Tab");
     await page.keyboard.up("Space");
     await page.clock.runFor(2100);
@@ -460,7 +522,7 @@ for (const cancellation of ["early release", "drag out", "Escape", "blur", "draf
     await page.locator("#chat-input").fill("Keep this draft");
     await page.clock.install();
     const box = await press(page);
-    await page.clock.runFor(350); // Deterministic gesture time, not a readiness sleep.
+    await page.clock.runFor(550); // Armed deliberate hold, not a readiness sleep.
     if (cancellation === "drag out") await page.mouse.move(box.x - 20, box.y);
     if (cancellation === "Escape") await page.keyboard.press("Escape");
     if (cancellation === "blur") await page.evaluate(() => window.dispatchEvent(new Event("blur")));
@@ -515,6 +577,7 @@ test("touch inline controls retain real labels and minimum targets", async ({ pa
     await page.emulateMedia({ colorScheme: theme, reducedMotion: "reduce" });
     await page.locator("#chat-input").fill("Hold without losing this draft");
     const button = await press(page);
+    await expect(page.locator(".chat-hold-upward")).toBeVisible();
     await expect.poll(() => page.locator(".chat-hold-upward").evaluate(node => Number((node as HTMLElement).style.getPropertyValue("--hold-progress")))).toBeGreaterThanOrEqual(0.25);
     expect((await page.locator(".chat-hold-upward").boundingBox())!.height).toBeCloseTo(button.height + 104, 0);
     await page.evaluate(box => {
@@ -616,7 +679,7 @@ test("native Chromium touch hold keeps capture across repaints and queues exactl
       await page.locator("#chat-input").fill(`Keep native draft: ${cancellation}`);
       const current = (await page.locator("#chat-send").boundingBox())!;
       await cdp.send("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: [{ x: current.x + current.width / 2, y: current.y + current.height / 2 }] });
-      await page.clock.runFor(350);
+      await page.clock.runFor(550);
       if (cancellation === "drag away") await cdp.send("Input.dispatchTouchEvent", { type: "touchMove", touchPoints: [{ x: current.x - 20, y: current.y }] });
       await cdp.send("Input.dispatchTouchEvent", { type: cancellation === "native cancel" ? "touchCancel" : "touchEnd", touchPoints: [] });
       await page.clock.runFor(2100);

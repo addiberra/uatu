@@ -34,7 +34,7 @@ import { isLiveConversationStatus } from "./types";
 import { AutomaticBackgroundNotices, actionOrigin, automaticBackgroundNote } from "./automatic-background";
 import type { AutomaticBackgroundFeedback, BackgroundTaskItem } from "./types";
 import { contextReadout } from "./context-readout";
-import { HoldToQueue } from "./hold-to-queue";
+import { HoldToQueue, HOLD_ARM_MS, HOLD_COUNTDOWN_MS, HOLD_TOTAL_MS } from "./hold-to-queue";
 import { QueueDiscovery } from "./queue-discovery";
 import { buildReceiptRows, buildReceiptTotal, parseReceiptView, receiptHeading, subagentTranscriptTitle, type ReceiptView } from "./receipt-view";
 import { formatTokens, totalTokens } from "./usage";
@@ -3652,7 +3652,7 @@ export function initChat(api = new ChatApiClient()): void {
     const touch = document.documentElement.dataset.uiMode === "touch";
     const label = preferred === "steer" ? "Steer" : "Queue";
     const sendAction = /^\/btw(?:\s|$)/.test(input?.value.trim() ?? "") ? "Ask side question" : localHistoryOperation(input?.value ?? "", commands, declares("reversible-history")) ? "Send message" : isLiveConversationStatus(projection?.status)
-      ? declares("steering") && !isListedCommand(input?.value ?? "") && currentPendingAttachments().length === 0 ? "Send as steer; hold 2 seconds to queue" : declares("steering") ? "Send to queue" : "Queue message"
+      ? declares("steering") && !isListedCommand(input?.value ?? "") && currentPendingAttachments().length === 0 ? "Send as steer; hold 2.5 seconds to queue" : declares("steering") ? "Send to queue" : "Queue message"
       : "Send message";
     send?.setAttribute("aria-label", sendAction);
     if (send) send.title = sendAction;
@@ -3664,7 +3664,7 @@ export function initChat(api = new ChatApiClient()): void {
     const keys = sendSupportsHold() && !isListedCommand(input?.value ?? "") && currentPendingAttachments().length === 0
       ? `${touch ? "Ctrl+Enter" : "Enter"}: ${label}; Alt+Enter: ${preferred === "steer" ? "Queue" : "Steer"} while working`
       : `${touch ? "Ctrl+Enter" : "Enter"} sends`;
-    if (help) help.textContent = `${sendSupportsHold() ? "Hold Send or Space for 2 seconds to queue; release partway or Escape cancels. " : ""}Enter activates Send immediately. In the message field, ${keys}.${touch ? " Enter adds a new line." : ""}`;
+    if (help) help.textContent = `${sendSupportsHold() ? "Hold Send or Space: after 0.5 seconds, a 2-second queue countdown starts. Release before the countdown sends; release during it or Escape cancels. " : ""}Enter activates Send immediately. In the message field, ${keys}.${touch ? " Enter adds a new line." : ""}`;
   }
 
   revertedItems?.addEventListener("pointerdown", event => {
@@ -4425,6 +4425,7 @@ export function initChat(api = new ChatApiClient()): void {
   let holdPointer: number | null = null;
   let holdBounds: DOMRect | null = null;
   let holdTimer: ReturnType<typeof setTimeout> | null = null;
+  let holdArmTimer: ReturnType<typeof setTimeout> | null = null;
   let holdFrame = 0;
   let suppressPointerClick = false;
   let ownedSpace = false;
@@ -4442,7 +4443,9 @@ export function initChat(api = new ChatApiClient()): void {
   }, delivery => { requestedByHold = delivery === "queue"; submitDelivery(delivery); });
   const clearHoldVisual = () => {
     if (holdTimer !== null) clearTimeout(holdTimer);
+    if (holdArmTimer !== null) clearTimeout(holdArmTimer);
     holdTimer = null;
+    holdArmTimer = null;
     cancelAnimationFrame(holdFrame);
     holdVisual.hidden = true;
     send.classList.remove("is-holding");
@@ -4469,19 +4472,33 @@ export function initChat(api = new ChatApiClient()): void {
     // first would synchronously flush layout on every animation frame.
     const origin = holdOrigin.getBoundingClientRect();
     const viewportTop = (window.visualViewport?.offsetTop ?? 0) + origin.top;
-    const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-    // The cap clears a finger immediately, then the whole envelope rises as
-    // the deadline approaches; progress also fills upward inside that envelope.
-    const extension = Math.min(reducedMotion ? 104 : 56 + 48 * progress, Math.max(0, box.top - viewportTop - 8));
+    // The full envelope appears only after arming. Its bounds stay fixed;
+    // only the green fill advances, with room reserved above the finger.
+    const extension = Math.min(104, Math.max(0, box.top - viewportTop - 8));
     holdVisual.style.width = `${box.width}px`;
     holdVisual.style.height = `${box.height + extension}px`;
     holdVisual.style.left = `${box.left - origin.left}px`;
     holdVisual.style.top = `${box.top - extension - origin.top}px`;
     holdVisual.style.setProperty("--hold-progress", String(progress));
-    holdCap.textContent = `${isLiveConversationStatus(projection?.status) ? "Queue" : "Send"}\n${((1 - progress) * 2).toFixed(1)}s`;
+    holdCap.textContent = `${isLiveConversationStatus(projection?.status) ? "Queue" : "Send"}\n${((1 - progress) * HOLD_COUNTDOWN_MS / 1000).toFixed(1)}s`;
     holdVisual.hidden = false;
     send.classList.add("is-holding");
     holdFrame = requestAnimationFrame(paintHold);
+  };
+  const armHoldVisual = () => {
+    // Keep intent/geometry guards live during the silent delay too. A target
+    // that moves away and back must not turn an invalid gesture into a tap.
+    const validateArming = () => {
+      if (hold.progress(performance.now()) === null) { clearHoldVisual(); return; }
+      holdFrame = requestAnimationFrame(validateArming);
+    };
+    holdFrame = requestAnimationFrame(validateArming);
+    holdArmTimer = setTimeout(() => {
+      holdArmTimer = null;
+      cancelAnimationFrame(holdFrame);
+      paintHold();
+    }, HOLD_ARM_MS);
+    holdTimer = setTimeout(() => { hold.check(performance.now()); clearHoldVisual(); }, HOLD_TOTAL_MS);
   };
   send.addEventListener("pointerdown", event => {
     suppressPointerClick = false;
@@ -4493,8 +4510,7 @@ export function initChat(api = new ChatApiClient()): void {
     holdPointer = event.pointerId;
     holdBounds = send.getBoundingClientRect();
     send.setPointerCapture(event.pointerId);
-    paintHold();
-    holdTimer = setTimeout(() => { hold.check(performance.now()); clearHoldVisual(); }, 2000);
+    armHoldVisual();
   });
   send.addEventListener("pointermove", event => {
     if (event.pointerId !== holdPointer) return;
@@ -4524,8 +4540,7 @@ export function initChat(api = new ChatApiClient()): void {
       mountHoldPortal();
       if (event.repeat || holdPointer !== null || !hold.begin(-1, performance.now())) return;
       holdPointer = -1;
-      paintHold();
-      holdTimer = setTimeout(() => { hold.check(performance.now()); clearHoldVisual(); }, 2000);
+      armHoldVisual();
     } else if (event.repeat && event.key === "Enter") event.preventDefault();
   });
   send.addEventListener("keyup", event => {

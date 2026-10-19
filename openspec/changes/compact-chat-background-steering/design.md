@@ -251,7 +251,7 @@ Browser acceptance uses desktop plus Chromium/WebKit touch matrices: 390×844, v
 
 Worker disclosure/row dimensions below are superseded by D10; D8 removes the older Options, Restore and delivery-menu controls.
 
-This explicit implementation revision supersedes D1's hidden configuration/attachment controls and 44px worker inspection rows only. Keep attachment plus a two-line model/mode/effort and actual context pill inline, opening the existing chooser. Show measured occupancy and known limit, never cumulative usage as context. Keep less-used actions in header options. Send taps steer while busy regardless of saved keyboard delivery; Enter/Alt+Enter retain device preference and touch Enter remains newline. A continuous two-second press queues once (idle Queue dispatches normally, not fake pending). Release at 250ms–2s cancels, as do drag-out, pointer cancellation/lost capture, Escape, blur, hidden page and stale selection/draft/configuration. A non-layout-shifting extension rises 84px above the original Send target, filling bottom-to-top with countdown above the finger. Split-menu Queue is an immediate accessible alternative, with 44px targets and separate Stop. Commands and attachments retain queue semantics and truthful labels. Existing primary locks and authoritative per-account background policy remain unchanged.
+This explicit implementation revision supersedes D1's hidden configuration/attachment controls and 44px worker inspection rows only. Keep attachment plus a two-line model/mode/effort and actual context pill inline, opening the existing chooser. Show measured occupancy and known limit, never cumulative usage as context. Keep less-used actions in header options. Send taps steer while busy regardless of saved keyboard delivery; Enter/Alt+Enter retain device preference and touch Enter remains newline. A continuous press arms silently for 500ms, then counts down for two seconds and queues once at 2500ms (idle Queue dispatches normally, not fake pending). Release before 500ms steers; release at 500ms–2499ms cancels, as do drag-out, pointer cancellation/lost capture, Escape, blur, hidden page and stale selection/draft/configuration. At 500ms a non-layout-shifting fixed-height envelope appears 104px above the original Send target, with bottom-to-top green fill and countdown above the finger. The subsequent D8 revision removes the split-menu Queue alternative; 44px Send and separate Stop remain. Commands and attachments retain queue semantics and truthful labels. Existing primary locks and authoritative per-account background policy remain unchanged.
 
 The user explicitly accepts 29px worker inspection rows for a denser overview; mutation controls remain 44px with existing safeguards. Preserve canonical deduplication/status and model rendering. Finished disclosure stays compact and inspectable; Dismiss finished hides only local view using the existing per-conversation persistence seam, with Restore finished and counts based on visible occurrences. No provider history deletion. Persistent unknown/failure and replacement warnings remain outside collapsed details.
 
@@ -266,7 +266,7 @@ the earlier composer/steering requirements' visible delivery selector clauses.
 Remove their triggers, layers, relocation wiring and dead styles. Keep one real
 inline picker with model/mode/effort and actual context; omit the duplicate touch
 context circle. Attach, Send and Stop remain separate. Pointer hold keeps its
-two-second upward indicator and all cancellation guards. Space on focused Send
+500ms silent arming followed by a two-second fixed-envelope countdown and all cancellation guards. Space on focused Send
 uses the same hold; Enter activates quick Send. A concise aria-describedby names
 hold/cancel and existing message-field shortcuts, without adding visible menus.
 Account usage remains outside the removed panel and explicit Continue/help stays
@@ -321,14 +321,17 @@ enlarged paused-batch header scrolls away rather than leaving too little visible
 space for a whole wrapped action; standard-size sticky behavior is preserved.
 No confirmation, paused-batch admission or other delivery logic changes.
 
-The previous implementation placed a static 84px envelope above Send and animated
-only its internal fill. The approved refinement visibly grows the envelope from
-56px to 104px above the original button across the two-second hold, with the
-countdown above the finger from the first frames and bottom-to-top progress.
+The latest explicit refinement supersedes the earlier growing envelope. Arm for
+500ms without rendering extension/progress; a release before that boundary is a
+guarded tap. Then display the full envelope 104px above Send, bounded by visible
+viewport space, for a separate two-second countdown. Keep outer height, width and
+bottom anchor fixed from the first visible frame; only the green fill advances
+bottom-to-top and the label counts from 2.0s to zero. Release during the countdown
+cancels; continuous holding queues once at 2500ms.
 Mount that pointer-transparent visual at the viewport, outside composer/dock
 clipping; the target and layout never move. Reduced motion retains a full static
-extension and changing countdown. Dispatch/cancellation and personal automation
-semantics are unchanged. Chromium trusted touch and WebKit pointer tests are
+extension and changing countdown. Existing cancellation guards and personal automation
+semantics remain. Chromium trusted touch and WebKit pointer tests are
 browser evidence, not native iOS gesture/callout verification.
 
 The hold portal samples an inert, zero-size fixed-origin sibling before any

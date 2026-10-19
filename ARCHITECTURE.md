@@ -800,11 +800,14 @@ contrast in both themes. Touch composer and
 dock actions preserve focus through `mousedown`, not cancelled touch
 `pointerdown` for native clicks (which suppresses activation in WebKit). The
 explicit hold controller instead owns pointer activation: quick release steers,
-250ms–2s release cancels, and a two-second continuous hold queues once. It
+release before 500ms steers once, release during the following two-second countdown
+cancels, and a 2500ms continuous hold queues once. It
 validates draft/configuration/selection/attachment identity and active locks on
 every frame and timer, including fixed target geometry, cancels on visibility/blur/capture/drag/Escape, and consumes
-the later click. The pointer-transparent 84px upward fill does not move the hit
-target. Keyboard/assistive clicks and the immediate Queue menu need no hold.
+the later click. After silent arming, the pointer-transparent envelope appears
+104px above Send (bounded by viewport space) and stays fixed while its green fill
+rises. It does not move the hit target. Enter/assistive clicks need no hold;
+message-field Alt+Enter retains the immediate alternate delivery shortcut.
 Touch keeps Attach and the original configuration picker trigger inline, with
 real mode/model/effort and `contextReadout` occupancy; context breakdown and
 less-used actions remain in header options.
