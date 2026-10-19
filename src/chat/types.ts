@@ -377,6 +377,11 @@ export type SubagentLine = {
   usage?: TokenUsage;
 };
 
+/** Latest child execution and cumulative child-session cost, not task or parent cost.
+ * Null means unreported/incomplete; a reported zero remains zero. USD is the SDK unit.
+ */
+export type WorkerSessionReport = { model?: string; effort: string | null; costUsd: number | null };
+
 export type ToolItem = TimelineItemBase & {
   type: "tool";
   name: string;
@@ -400,6 +405,7 @@ export type ToolItem = TimelineItemBase & {
   // spend — nothing below is added into it — so these lines are what makes
   // the conversation's receipt whole. Absent when the subagent launched none.
   descendants?: SubagentLine[];
+  workerSession?: WorkerSessionReport;
   // How long the tool has been running, from the agent's own progress
   // heartbeat, when it reports one for a tool still producing no output.
   elapsedMs?: number;
@@ -785,6 +791,7 @@ export type BackgroundTaskItem = TimelineItemBase & {
   // The child conversation an agent task runs as (`sub:<parent>:<agentId>`),
   // known from the start edge — what makes a running subagent openable.
   childConversationId?: string;
+  workerSession?: WorkerSessionReport;
   // A run Claude Code forked in the foreground with no launching tool use of
   // its own — the review a typed command starts (design D13). It is a run,
   // not background work: the subagents track lists it and opens it, while the

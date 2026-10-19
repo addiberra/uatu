@@ -200,11 +200,46 @@ Other dormant queued messages remain held. Undo's count-only warning explains
 which batch will accompany the replacement, without repeating message text.
 
 Desktop and touch use the same compact worker card: one subtle border contains
-its disclosure header and rows. Active workers have a title followed by agent,
-model and cumulative tokens; available Stop actions remain separate 44px targets.
-Finished workers use dense single rows. Legacy subagent/background summaries
+its disclosure header and rows. Active workers show agent, model with latest-used
+reasoning effort, cumulative tokens and cumulative child-session cost (USD).
+Wide desktop rows align on one line with separate 28px Stop targets; touch keeps
+44px targets and normally two lines. Very narrow phones use a third metadata
+line rather than hiding the agent/model. Finished workers use dense rows.
+An explicit dash means **not reported**, with an accessible label and tooltip;
+shell tasks have no reasoning/session cost. Reported zero is `$0.00`, sub-cent
+costs retain four decimal places, and smaller nonzero costs show `<$0.0001`.
+Effort comes only from the child's own execution metadata: OpenCode 2.x reports
+`model.variant` on step-start/history assistant records. It is the agent's
+execution report, not an independent downstream provider echo. Current OpenCode
+1.x and Claude message history do not report applied effort; their configured
+selection, the parent's selection, and model-name guesses are never substituted.
+Cost comes only from an authoritative cumulative session aggregate: OpenCode 2.x
+`SessionInfo.cost` on the existing history metadata read and live
+`session.usage.updated.cost` snapshots. They replace rather than add to each other.
+The native total includes compaction usage and retains spend hidden by revert;
+visible assistant-message sums cannot establish that total and are never a fallback.
+Current Claude and OpenCode 1.x integrations do not provide this authoritative
+aggregate, so their worker session cost is not reported even when task/message
+prices are available. Missing aggregate data remains unknown, not a partial sum.
+OpenCode can itself report zero for unpriced models: this is a reported zero,
+not a promise of free billing. Reused-child occurrences repeat one session snapshot
+without adding it to task/parent receipts or including descendant costs. Recovery
+uses existing child-history accounting; inspection reuses its own bounded read,
+and parent refreshes revalidate cached child history at most every 30 seconds,
+not on every paint. Ordered live removals protect model/effort/token accounting
+from older refresh and inspection reads; a later live upsert may recreate the
+message. Removal fences are bounded: retiring one invalidates older reads first,
+and parent-cache eviction clears its fences. Native lifetime cost remains separate
+and is not reduced by message removal. Legacy subagent/background summaries
 are not repeated above this card. Inspection, history and saved dismissal remain
 available.
+
+Authority is pinned to the installed `@opencode/client` 2.0.28 contract and
+[OpenCode v2.0.28 projector](https://github.com/anomalyco/opencode/blob/026b106bc5d41b679ffc413264229c340871e4d3/packages/core/src/session/projector.ts#L58-L72):
+usage updates only the named session; step completion and compaction's
+[`UsageRecorded`](https://github.com/anomalyco/opencode/blob/026b106bc5d41b679ffc413264229c340871e4d3/packages/core/src/session/compaction.ts#L616-L622)
+add to that session, revert does not subtract spend, and `UsageUpdated` publishes
+the resulting aggregate. It is the agent's USD accounting, not a billing invoice.
 Pending is a separate compact disclosure **below** the worker card, before the
 composer—not a heading between the worker header and rows. Both cards use the
 same header, chevron and surface styling. Each open content pane scrolls on its
@@ -328,13 +363,15 @@ worker card disappears. Expansion shows one flat
 list: active work first, then finished work ordered newest first from available
 execution timestamps, without a second disclosure. Rows open inspection or retained results;
 launch references and their costs remain in the transcript/timeline. Names use
-14px type and compact model/Σ cumulative-token columns (11px at default scale), with distinct working,
-unknown, finished, failed and stopped glyphs. Active rows with Stop put the task title first
-and actual reported agent, model and cumulative tokens on a second line; missing
-agent/model/usage is not invented. **Stop** is a separate
-44px target with an 8px gap; unknown execution state disables it. Inspection
-targets on settled rows use the explicitly approved 28px density tradeoff;
-active rows use two lines within the 44px action height. **Dismiss finished**
+14px type and compact model/effort, Σ cumulative-token and session-USD columns
+(11px at default scale), with distinct working, unknown, finished, failed and
+stopped glyphs. Wide desktop rows align agent, title and metadata on one line,
+with separate 28px Stop/Inspect targets. Narrow desktop/touch rows put the title
+first and metadata below; very narrow phones wrap one additional line. Missing
+agent/model/usage/effort/cost is not invented. Touch **Stop** remains a separate
+44px target with an 8px gap; unknown execution state disables it. Settled rows
+retain the approved compact inspection density and narrow-width fallback.
+**Dismiss finished**
 stays on the right of the same compact header, not in a footer, and hides only this device's per-conversation
 view using the existing persisted dismissal state, never provider history.
 There is no Restore finished control. Results and their inspection remain in

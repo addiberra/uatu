@@ -4,7 +4,7 @@ import { AgentNotificationTracker, type AgentNotificationEvent } from "./notific
 import { boundedSet } from "../shared/bounded-map";
 import { ProviderUpdateCoalescer } from "./coalescer";
 import { ConversationInventoryBroadcaster, type ConversationInventorySubscription } from "./inventory-broadcaster";
-import type { InboxDelta, NormalizedProviderEvent, NormalizedProviderUpdate, NormalizedSessionLifecycle } from "./provider";
+import type { InboxDelta, NormalizedProviderEvent, NormalizedProviderUpdate, NormalizedSessionLifecycle, StoredMessageAccounting } from "./provider";
 import { describeToolDetail } from "./tool-detail";
 import { mergeAssistantMessage, sameUsage, TOKEN_USAGE_COMPONENTS } from "./usage";
 import { OperationOutcomeUnknownError, ReversibleHistoryTargetError, UnsupportedVariantSelectionError, type ChatProvider, type ProviderAttachment, type ProviderPermissionReply, type ProviderSession } from "./provider";
@@ -14,6 +14,7 @@ import { ProviderTextReconciler } from "./text-reconciler";
 import { isLiveConversationStatus } from "./types";
 import type { ChatActionContext, AutomaticBackgroundOutcome, AutomaticBackgroundFeedback } from "./types";
 import { hasVerifiedBlockingWork } from "./blocking-work";
+import { workerSessionReport, type WorkerMessageModel } from "./worker-session";
 import type {
   BackgroundTaskOutput,
   BackgroundTaskItem,
@@ -53,7 +54,7 @@ class PrimarySteerOutcomeUnknownError extends OperationOutcomeUnknownError {
 // call in practice; its cursor loop is the backstop, not the plan.
 const RECONSTRUCTION_READ_LIMIT = 10_000;
 const INVENTORY_SESSION_LIMIT = 2_048;
-type MessageModel = { model: string; createdAt: number };
+type MessageModel = WorkerMessageModel;
 type InventorySessionMetadata = {
   inWorkspace: boolean;
   parentId: string | null;
@@ -459,9 +460,9 @@ export class ChatAdapter {
   // stored read in flight would otherwise hand the removed launcher back and
   // bank it — the same race `removedChildAttribution` closes for messages.
   private readonly removedLaunchers = new Map<string, Set<string>>();
-  // Deletions that race a stored-history reconstruction must win over that
-  // stale read just as newer live usage does.
-  private readonly removedChildAttribution = new Map<string, Set<string>>();
+  // Ordered live removals survive both refresh and inspection reads until a
+  // later live upsert, explicit invalidation or bounded cache retirement.
+  private readonly removedChildAttribution = new Map<string, Map<string, number>>();
   private readonly attributionReconstructions = new Map<string, Promise<void>>();
   private readonly attributionEpochs = new Map<string, number>();
   // When each live-banked figure arrived, as a running sequence, so a
@@ -477,7 +478,8 @@ export class ChatAdapter {
   // only the post-eviction message — present, but missing everything before.
   // Only a successful stored read (merged with whatever landed live) earns the
   // mark, and only the mark lets history() skip the read.
-  private readonly completeAttributions = new Set<string>();
+  private readonly completeAttributions = new Map<string, number>();
+  private readonly childSessionCosts = new Map<string, { costUsd: number | null; highest: number; sequence: number }>();
   private eventCoalescer: ProviderUpdateCoalescer | null = null;
   private pumpController: AbortController | null = null;
   private pumpPromise: Promise<void> | null = null;
@@ -615,7 +617,16 @@ export class ChatAdapter {
     // re-applies such events idempotently.
     const replayCursor = this.projection(id).replay.latestCursor();
     const cursor = options.cursor ? decodeHistoryCursor(options.cursor) : undefined;
+    const readStartedAt = this.attributionSequence;
+    const parentId = session.parentId;
+    const attributionOwner = parentId ? this.projections.get(parentId) : undefined;
+    const inspectionKey = parentId ? attributionKey(parentId, id) : undefined;
+    const inspectionEpoch = inspectionKey ? this.attributionReadEpoch(inspectionKey) : undefined;
     const page = await this.provider.listMessages(id, { cursor: cursor?.provider, limit: options.limit ?? DEFAULT_PAGE_SIZE });
+    // An inspection predating parent eviction/revert cannot repopulate its cleared cache.
+    if (parentId && attributionOwner && this.projections.get(parentId) === attributionOwner && this.attributionEpochs.get(inspectionKey!) === inspectionEpoch) {
+      this.refreshInspectedChildAccounting(id, parentId, page.accounting, page.sessionCostUsd, readStartedAt);
+    }
     // Attaching reconciles the pending steers with the agent's own list, so a
     // steer raised by another client or while the stream was down is listed
     // (opencode-v2-steering D3). Only the first page: an older page is not
@@ -2196,7 +2207,7 @@ export class ChatAdapter {
     if (!parentId) return;
     const key = attributionKey(parentId, childId);
     // A read in flight for the old store must not bank what it finds.
-    this.attributionEpochs.set(key, (this.attributionEpochs.get(key) ?? 0) + 1);
+    this.attributionReadEpoch(key, true);
     this.childUsage.delete(key);
     this.childModels.delete(key);
     this.childPrompts.delete(key);
@@ -2663,11 +2674,10 @@ export class ChatAdapter {
     const key = attributionKey(parentId, childId);
     const existing = this.attributionReconstructions.get(key);
     if (existing) return existing;
-    const epoch = this.attributionEpochs.get(key) ?? 0;
+    const epoch = this.attributionReadEpoch(key);
     const pending = this.reconstructAttributionRead(key, childId, epoch, new Set([...ancestry, childId])).finally(() => {
       if (this.attributionReconstructions.get(key) === pending) {
         this.attributionReconstructions.delete(key);
-        this.attributionEpochs.delete(key);
       }
     });
     this.attributionReconstructions.set(key, pending);
@@ -2680,6 +2690,7 @@ export class ChatAdapter {
     const byPrompt = new Map<string, string>();
     let transcript: ChildTranscript;
     let descendantsIncomplete = false;
+    let sessionCostUsd: number | undefined;
     const readStartedAt = this.attributionSequence;
     try {
       // Every message, in one read: banking a partial tally would permanently
@@ -2695,9 +2706,10 @@ export class ChatAdapter {
       let paged: ConversationItem[] = [];
       do {
         const page = await this.provider.listMessages(childId, { cursor, limit: RECONSTRUCTION_READ_LIMIT });
+        sessionCostUsd = page.sessionCostUsd;
         for (const reported of page.accounting) {
           if (reported.usage) byMessage.set(reported.messageId, reported.usage);
-          if (reported.model) byModel.set(reported.messageId, { model: reported.model, createdAt: reported.createdAt });
+          if (reported.model) byModel.set(reported.messageId, { model: reported.model, createdAt: reported.createdAt, effort: reported.effort });
           if (reported.promptId) byPrompt.set(reported.messageId, reported.promptId);
         }
         complete ??= page.completeItems;
@@ -2725,7 +2737,7 @@ export class ChatAdapter {
     // Eviction clears every live value this read would merge. A completion
     // from before that boundary must not repopulate the cleared maps and mark
     // a potentially incomplete answer authoritative.
-    if ((this.attributionEpochs.get(key) ?? 0) !== epoch) return;
+    if (this.attributionEpochs.get(key) !== epoch) return;
     // Live events that landed while the read was in flight are newer than
     // the stored snapshot — for those the live figure wins, or the stale
     // snapshot would be banked permanently once the events fall behind the
@@ -2761,7 +2773,7 @@ export class ChatAdapter {
     const removedLaunchers = this.removedLaunchers.get(key);
     if (removedLaunchers) transcript.launchers = transcript.launchers.filter(launcher => !removedLaunchers.has(launcher.id));
     const removed = this.removedChildAttribution.get(key);
-    if (removed) for (const messageId of removed) {
+    if (removed) for (const messageId of removed.keys()) {
       byMessage.delete(messageId);
       byModel.delete(messageId);
       byPrompt.delete(messageId);
@@ -2770,13 +2782,13 @@ export class ChatAdapter {
     this.bankAttribution(this.childModels, key, byModel);
     this.bankAttribution(this.childPrompts, key, byPrompt);
     this.bankAttribution(this.childTranscripts, key, transcript);
+    if ((this.childSessionCosts.get(key)?.sequence ?? 0) <= readStartedAt) this.bankSessionCost(key, sessionCostUsd);
     if (descendantsIncomplete) return;
-    // Squared against the store from here on; only an eviction re-arms the read.
-    this.completeAttributions.add(key);
-    this.removedChildAttribution.delete(key);
+    // Squared against the store until eviction or the bounded refresh age.
+    this.completeAttributions.set(key, Date.now());
     this.removedLaunchers.delete(key);
     if (this.completeAttributions.size > MAX_CHILD_ATTRIBUTIONS) {
-      this.completeAttributions.delete(this.completeAttributions.values().next().value!);
+      this.completeAttributions.delete(this.completeAttributions.keys().next().value!);
     }
   }
 
@@ -2788,7 +2800,20 @@ export class ChatAdapter {
    */
   private bankAttribution<T>(map: Map<string, T>, key: string, value: T): void {
     const evicted = boundedSet(map, key, value, MAX_CHILD_ATTRIBUTIONS);
-    if (evicted !== undefined) this.completeAttributions.delete(evicted);
+    if (evicted !== undefined) {
+      this.completeAttributions.delete(evicted);
+      this.attributionEpochs.delete(evicted); // in-flight reads cannot outlive their cache's authority
+    }
+  }
+
+  private attributionReadEpoch(key: string, renew = false): number {
+    const known = this.attributionEpochs.get(key);
+    if (known !== undefined && !renew) return known;
+    // Never reuse an epoch after eviction: an absent entry cannot validate an
+    // older read, nor can a later read accidentally restore its authority.
+    const epoch = ++this.attributionSequence;
+    this.bankAttribution(this.attributionEpochs, key, epoch);
+    return epoch;
   }
 
   /**
@@ -2817,11 +2842,12 @@ export class ChatAdapter {
   private async attributeSubagent(
     conversationId: string,
     reported: { messageId: string; usage: TokenUsage; promptId?: string } | undefined,
-    assistantModel: { messageId: string; model: string; createdAt: number; promptId?: string } | undefined,
+    assistantModel: { messageId: string; model: string; createdAt: number; effort?: string; promptId?: string } | undefined,
+    sessionCostUsd: number | undefined,
     removedMessageId: string | undefined,
     coalescer: ProviderUpdateCoalescer,
   ): Promise<void> {
-    if (reported === undefined && assistantModel === undefined && removedMessageId === undefined) return;
+    if (reported === undefined && assistantModel === undefined && sessionCostUsd === undefined && removedMessageId === undefined) return;
     let parentId: string | null;
     try {
       parentId = await this.parentOf(conversationId);
@@ -2832,8 +2858,10 @@ export class ChatAdapter {
     const key = attributionKey(parentId, conversationId);
     if (assistantModel !== undefined) {
       const byMessage = this.childModels.get(key) ?? new Map<string, MessageModel>();
-      byMessage.set(assistantModel.messageId, { model: assistantModel.model, createdAt: assistantModel.createdAt });
+      if (!byMessage.has(assistantModel.messageId) && [...byMessage].every(([id, model]) => model.createdAt < assistantModel.createdAt || model.createdAt === assistantModel.createdAt && id < assistantModel.messageId)) this.bankSessionCost(key, undefined);
+      byMessage.set(assistantModel.messageId, { model: assistantModel.model, createdAt: assistantModel.createdAt, effort: assistantModel.effort });
       this.bankAttribution(this.childModels, key, byMessage);
+      this.stampArrival(key, assistantModel.messageId);
       this.removedChildAttribution.get(key)?.delete(assistantModel.messageId);
     }
     if (reported !== undefined) {
@@ -2875,12 +2903,19 @@ export class ChatAdapter {
       this.bankAttribution(this.childUsage, key, byMessage);
       this.childModels.get(key)?.delete(removedMessageId);
       this.childPrompts.get(key)?.delete(removedMessageId);
-      if (!this.completeAttributions.has(key)) {
-        const removed = this.removedChildAttribution.get(key) ?? new Set<string>();
-        removed.add(removedMessageId);
-        this.bankAttribution(this.removedChildAttribution, key, removed);
+      const removed = this.removedChildAttribution.get(key) ?? new Map<string, number>();
+      const sequence = this.stampArrival(key, removedMessageId);
+      const retired = boundedSet(removed, removedMessageId, sequence, MAX_CHILD_MESSAGE_REMOVALS);
+      if (retired !== undefined) {
+        // Retiring a fence first invalidates every older read. Only a future
+        // provider read or live update may reintroduce a retired identity.
+        this.attributionReadEpoch(key, true);
+        this.completeAttributions.delete(key);
+        this.attributionArrivals.get(key)?.delete(retired);
       }
+      this.bankAttribution(this.removedChildAttribution, key, removed);
     }
+    if (sessionCostUsd !== undefined) this.bankSessionCost(key, sessionCostUsd);
     this.decorateLauncherRows(parentId, conversationId, coalescer);
     // A subagent's spend is listed beneath every conversation above it: its
     // own rows carry it one level up, and each ancestor's row for the branch
@@ -2974,10 +3009,37 @@ export class ChatAdapter {
     await this.refreshAncestors(parentId, coalescer);
   }
 
-  private stampArrival(key: string, id: string): void {
+  private stampArrival(key: string, id: string): number {
     const arrivals = this.attributionArrivals.get(key) ?? new Map<string, number>();
-    arrivals.set(id, ++this.attributionSequence);
+    const sequence = ++this.attributionSequence;
+    arrivals.set(id, sequence);
     this.bankAttribution(this.attributionArrivals, key, arrivals);
+    return sequence;
+  }
+
+  /** Reuse an inspection's existing bounded history read; no extra transcript fetch. */
+  private refreshInspectedChildAccounting(childId: string, parentId: string, accounting: readonly StoredMessageAccounting[], sessionCostUsd: number | undefined, readStartedAt: number): void {
+    const key = attributionKey(parentId, childId);
+    if ((this.childSessionCosts.get(key)?.sequence ?? 0) <= readStartedAt) this.bankSessionCost(key, sessionCostUsd);
+    const usage = this.childUsage.get(key) ?? new Map<string, TokenUsage>();
+    const models = this.childModels.get(key) ?? new Map<string, MessageModel>();
+    for (const reported of accounting) {
+      if (this.removedChildAttribution.get(key)?.has(reported.messageId)) continue;
+      if ((this.attributionArrivals.get(key)?.get(reported.messageId) ?? 0) > readStartedAt) continue;
+      if (reported.usage) usage.set(reported.messageId, reported.usage);
+      if (reported.model) models.set(reported.messageId, { model: reported.model, createdAt: reported.createdAt, effort: reported.effort });
+    }
+    this.bankAttribution(this.childUsage, key, usage);
+    this.bankAttribution(this.childModels, key, models);
+    if (this.eventCoalescer) this.decorateLauncherRows(parentId, childId, this.eventCoalescer);
+  }
+
+  private bankSessionCost(key: string, costUsd: number | undefined): void {
+    if (typeof costUsd !== "number" || !Number.isFinite(costUsd) || costUsd < 0) costUsd = undefined;
+    const highest = Math.max(this.childSessionCosts.get(key)?.highest ?? 0, costUsd ?? 0);
+    // The native lifetime aggregate never decreases, including on revert.
+    // Ignore out-of-order/duplicated lower totals; never add snapshots together.
+    this.bankAttribution(this.childSessionCosts, key, { costUsd: costUsd === undefined ? null : highest, highest, sequence: ++this.attributionSequence });
   }
 
   /**
@@ -3056,10 +3118,14 @@ export class ChatAdapter {
 
   private launcherRowUpdates(parentId: string, conversationId: string, parent: ConversationProjection): NormalizedProviderUpdate[][] {
     const rows = launcherRows(parent.filter(item => item.type === "tool" && item.childConversationId === conversationId));
-    if (rows.length === 0) return [];
     const attributions = this.rowAttributions(parentId, conversationId, rows.map(taskRow));
-    return rows.flatMap((row, index) => {
-      const attribution = attributions[index]!;
+    const key = attributionKey(parentId, conversationId);
+    const workerSession = workerSessionReport(this.childSessionCosts.get(key)?.costUsd, this.childModels.get(key));
+    const backgroundUpdates: NormalizedProviderUpdate[][] = parent.filter(item => item.type === "background_task" && item.childConversationId === conversationId).flatMap(row =>
+      row.type === "background_task" && (this.childSessionCosts.get(key)?.costUsd != null || this.childUsage.get(key)?.size || this.childModels.get(key)?.size || row.workerSession) && !sameWorkerSession(row.workerSession, workerSession)
+        ? [[{ kind: "upsert" as const, item: { ...row, workerSession } }]] : []);
+    return [...backgroundUpdates, ...rows.flatMap((row, index) => {
+      const attribution = { ...attributions[index]!, workerSession };
       // Nothing new to say: most restatements change nothing until the turn's
       // token counts actually move, and an upsert that restates the row
       // verbatim still costs a replay frame for every subscriber.
@@ -3071,7 +3137,7 @@ export class ChatAdapter {
       // reverted message, a line that left — has to be put on as a
       // replacement: remove first, or the intentional clear is merged away.
       return [withdraws(row, attribution) ? [{ kind: "remove" as const, itemId: row.id }, { kind: "upsert" as const, item }] : [{ kind: "upsert" as const, item }]];
-    });
+    })];
   }
 
   projectionForTests(id: string): ConversationProjection {
@@ -3101,7 +3167,7 @@ export class ChatAdapter {
         // task's row changes which messages the earlier rows answer for.
         const settled = new Set<string>();
         for (const update of updates) {
-          if (update.kind !== "upsert" || update.item.type !== "tool" || !update.item.childConversationId) continue;
+          if (update.kind !== "upsert" || (update.item.type !== "tool" && update.item.type !== "background_task") || !update.item.childConversationId) continue;
           if (settled.has(update.item.childConversationId)) continue;
           settled.add(update.item.childConversationId);
           this.settleLauncherRows(conversationId, update.item.childConversationId, projection);
@@ -3160,7 +3226,7 @@ export class ChatAdapter {
         // reasoning parts emits. Attribution must see those; only an event
         // carrying nothing at all is skipped.
         if (normalized.updates.length === 0 && normalized.assistantUsage === undefined && normalized.assistantModel === undefined
-          && normalized.removedMessageId === undefined && normalized.configuration === undefined && normalized.revertLifecycle === undefined && !normalized.notificationTurns?.length) continue;
+          && normalized.sessionCostUsd === undefined && normalized.removedMessageId === undefined && normalized.configuration === undefined && normalized.revertLifecycle === undefined && !normalized.notificationTurns?.length) continue;
         // Confinement is checked per event as it arrives, never at flush time:
         // a session that moves out of the workspace must stop publishing from
         // that moment, and events received while it was confined stay valid.
@@ -3217,7 +3283,7 @@ export class ChatAdapter {
         // The same reasoning as the mirror, for cost rather than requests: a
         // subagent's model and token spend live in its own session, which the
         // parent's client never sees.
-        await this.attributeSubagent(normalized.conversationId, normalized.assistantUsage, normalized.assistantModel, normalized.removedMessageId, coalescer);
+        await this.attributeSubagent(normalized.conversationId, normalized.assistantUsage, normalized.assistantModel, normalized.sessionCostUsd, normalized.removedMessageId, coalescer);
         // And for the subagents a subagent launches itself: they are rows in
         // ITS timeline, so the conversation above it learns of them here.
         await this.trackLaunchers(normalized.conversationId, normalized.updates, coalescer);
@@ -3387,7 +3453,9 @@ export class ChatAdapter {
    */
   private async attributeLaunchers(id: string, items: ConversationItem[], complete?: readonly ConversationItem[]): Promise<void> {
     const unattributed = [...new Set(items.flatMap(item =>
-      item.type === "tool" && item.childConversationId && !this.completeAttributions.has(attributionKey(id, item.childConversationId))
+      // Reconcile on an existing parent refresh at most once per 30 seconds,
+      // including settled children changed while disconnected. No polling loop.
+      (item.type === "tool" || item.type === "background_task") && item.childConversationId && Date.now() - (this.completeAttributions.get(attributionKey(id, item.childConversationId)) ?? 0) >= 30_000
         ? [item.childConversationId]
         : []))];
     await Promise.all(unattributed.map(childId => this.reconstructAttribution(id, childId)));
@@ -3405,10 +3473,14 @@ export class ChatAdapter {
     }
     for (let index = 0; index < items.length; index += 1) {
       const item = items[index]!;
+      if ((item.type === "tool" || item.type === "background_task") && item.childConversationId) {
+        const key = attributionKey(id, item.childConversationId);
+        if (this.childSessionCosts.get(key)?.costUsd != null || this.childUsage.get(key)?.size || this.childModels.get(key)?.size || item.workerSession) items[index] = { ...item, workerSession: workerSessionReport(this.childSessionCosts.get(key)?.costUsd, this.childModels.get(key)) };
+      }
       if (item.type !== "tool") continue;
       const attribution = attributions.get(item.id);
       if (!attribution || Object.keys(attribution).length === 0) continue;
-      items[index] = { ...item, ...attribution };
+      items[index] = { ...items[index] as ToolItem, ...attribution };
     }
   }
 
@@ -3751,11 +3823,10 @@ export class ChatAdapter {
       // stale cursor resolves to a retention-gap resync, which is safe.
       this.projections.delete(candidateId);
       this.configurations.delete(candidateId);
-      const prefix = `${candidateId}${ATTRIBUTION_SEPARATOR}`;
-      for (const key of this.attributionReconstructions.keys()) {
-        if (key.startsWith(prefix)) this.attributionEpochs.set(key, (this.attributionEpochs.get(key) ?? 0) + 1);
-      }
+      forgetAttributions(this.attributionEpochs, candidateId);
+      forgetAttributions(this.attributionArrivals, candidateId);
       forgetAttributions(this.childUsage, candidateId);
+      forgetAttributions(this.childSessionCosts, candidateId);
       forgetAttributions(this.childModels, candidateId);
       forgetAttributions(this.childPrompts, candidateId);
       forgetAttributions(this.childTranscripts, candidateId);
@@ -4033,6 +4104,7 @@ export class ConversationProjection {
 }
 
 const MAX_CHILD_ATTRIBUTIONS = 512;
+const MAX_CHILD_MESSAGE_REMOVALS = 512;
 // NUL: a session id cannot contain one, so the two halves stay unambiguous.
 const ATTRIBUTION_SEPARATOR = "\u0000";
 
@@ -4046,7 +4118,7 @@ type Prompt = { id: string; text?: string };
 // A row (or nested launcher) that gave a subagent a task, with the prompt it gave.
 type TaskRow = { id: string; prompt?: string };
 type ChildTranscript = { prompts: Prompt[]; launchers: Launcher[] };
-type RowAttribution = { model?: string; usage?: TokenUsage; descendants?: SubagentLine[] };
+type RowAttribution = { model?: string; usage?: TokenUsage; descendants?: SubagentLine[]; workerSession?: ToolItem["workerSession"] };
 type LauncherRow = ToolItem & { childConversationId: string };
 
 /** The rows that launched subagents, oldest first — the order their tasks were given in. */
@@ -4180,7 +4252,11 @@ function sameLines(left: readonly SubagentLine[] | undefined, right: readonly Su
 }
 
 function sameAttribution(row: ToolItem, attribution: RowAttribution): boolean {
-  return row.model === attribution.model && sameUsage(row.usage, attribution.usage) && sameLines(row.descendants, attribution.descendants);
+  return row.model === attribution.model && sameUsage(row.usage, attribution.usage) && sameLines(row.descendants, attribution.descendants) && sameWorkerSession(row.workerSession, attribution.workerSession);
+}
+
+function sameWorkerSession(left: ToolItem["workerSession"], right: ToolItem["workerSession"]): boolean {
+  return left?.model === right?.model && left?.effort === right?.effort && left?.costUsd === right?.costUsd;
 }
 
 /** Whether the row states something the attribution no longer does — which an upsert's merge would keep. */

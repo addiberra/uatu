@@ -2,6 +2,7 @@ import type { CompactWorker } from "./compact-work";
 import { workerIsActive, workerStateLabel } from "./worker-state";
 import { formatTaskElapsed } from "./task-inspection";
 import { formatTokens } from "./usage";
+import { formatWorkerCost } from "./worker-session";
 
 const glyphs = { working: "●", unknown: "◌", completed: "✓", failed: "×", stopped: "■" };
 
@@ -40,7 +41,7 @@ export class CompactWorkersView {
         const inspect = document.createElement("button");
         inspect.type = "button";
         inspect.className = "chat-worker-inspect";
-        for (const part of ["glyph", "name", "meta", "model", "tokens"]) {
+        for (const part of ["glyph", "name", "meta", "model", "tokens", "cost"]) {
           const span = document.createElement("span");
           span.className = `chat-worker-${part}`;
           if (part === "glyph") span.setAttribute("aria-hidden", "true");
@@ -58,7 +59,9 @@ export class CompactWorkersView {
         inspect.dataset.inspectView = worker.kind === "shell" ? "output" : "transcript";
       }
       inspect.title = worker.name;
-      inspect.setAttribute("aria-label", [worker.name, worker.agent, workerStateLabel(worker.state), worker.model, worker.tokens === undefined ? undefined : `${worker.tokens.toLocaleString()} cumulative tokens`].filter(Boolean).join(" · "));
+      const effortLabel = worker.effort == null ? "Reasoning effort not reported" : `Last-used reasoning effort: ${worker.effort}`;
+      const costLabel = worker.costUsd == null ? "Subagent session cost not reported" : `Cumulative subagent session cost: ${worker.costUsd} USD`;
+      inspect.setAttribute("aria-label", [worker.name, worker.agent, workerStateLabel(worker.state), worker.model, worker.kind === "agent" ? effortLabel : undefined, worker.tokens === undefined ? undefined : `${worker.tokens.toLocaleString()} cumulative tokens`, worker.kind === "agent" ? costLabel : undefined].filter(Boolean).join(" · "));
       // The handler looks up the current row model, not a stale closure.
       inspect.querySelector(".chat-worker-glyph")!.textContent = glyphs[worker.state];
       inspect.querySelector(".chat-worker-name")!.textContent = worker.name;
@@ -77,11 +80,24 @@ export class CompactWorkersView {
         if (!workerIsActive(worker.state) || worker.kind === "shell") meta.append(" · ", time);
       }
       const model = inspect.querySelector<HTMLElement>(".chat-worker-model")!;
-      model.textContent = worker.model ?? "—";
-      model.title = worker.model ?? "Model not reported";
+      const modelName = document.createElement("span");
+      modelName.className = "chat-worker-model-name";
+      modelName.textContent = worker.model ?? "—";
+      const effort = document.createElement("span");
+      effort.className = "chat-worker-effort";
+      effort.textContent = worker.effort ?? "—";
+      effort.title = effortLabel;
+      effort.setAttribute("aria-label", effortLabel);
+      model.replaceChildren(modelName);
+      if (worker.kind === "agent") model.append(" · ", effort);
+      model.title = [worker.model ?? "Model not reported", worker.kind === "agent" ? effortLabel : undefined].filter(Boolean).join(" · ");
       const tokens = inspect.querySelector<HTMLElement>(".chat-worker-tokens")!;
       tokens.textContent = worker.tokens === undefined ? "—" : `Σ ${formatTokens(worker.tokens)}`;
       tokens.title = worker.tokens === undefined ? "Cumulative usage not reported" : `${worker.tokens.toLocaleString()} cumulative tokens, not context occupancy`;
+      const cost = inspect.querySelector<HTMLElement>(".chat-worker-cost")!;
+      cost.textContent = worker.kind === "agent" ? formatWorkerCost(worker.costUsd) : "—";
+      cost.title = worker.kind === "agent" ? costLabel : "Session cost not applicable to shell tasks";
+      cost.setAttribute("aria-label", cost.title);
       inspect.dataset.kind = worker.kind;
       let stop = row.querySelector<HTMLButtonElement>("[data-stop-task]");
       if (worker.taskId && worker.stoppable && workerIsActive(worker.state) && canStop) {

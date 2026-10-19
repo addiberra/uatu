@@ -2,6 +2,18 @@ import { expect, test } from "bun:test";
 import { CompactDisclosure, compactWorkers, workerSummary } from "./compact-work";
 import type { ConversationItem } from "./types";
 
+test("canonical aliases display child session metadata once, not task cost or a parent's selection", () => {
+  const workerSession = { model: "Latest model", effort: null, costUsd: 0.125 };
+  const workers = compactWorkers([
+    { type: "tool", id: "tool:a", name: "task", input: '{"description":"Review"}', status: "completed", model: "Old task model", usage: { costUsd: 12 }, workerSession, createdAt: 1 },
+    { type: "tool", id: "tool:b", name: "task", input: '{"description":"Review"}', status: "completed", workerSession, createdAt: 2 },
+    { type: "background_task", id: "canonical", taskId: "native", toolUseIds: ["a", "b"], description: "Review", status: "running", createdAt: 1 },
+  ]);
+  expect(workers).toHaveLength(1);
+  expect(workers[0]).toMatchObject({ model: "Latest model", effort: null, costUsd: 0.125 });
+  expect(compactWorkers([{ type: "background_task", id: "shell", taskId: "shell", taskType: "shell", description: "Tests", status: "running", workerSession, createdAt: 1 }])[0]).not.toHaveProperty("costUsd");
+});
+
 test("canonical worker uses real launcher model and cumulative spend without double-counting aliases", () => {
   const workers = compactWorkers([
     { type: "tool", id: "tool:launch", name: "task", status: "completed", input: '{"description":"Task"}', model: "GPT-6.1 Sol", usage: { input: 200, output: 50 }, createdAt: 1 },

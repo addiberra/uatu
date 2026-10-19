@@ -18,6 +18,52 @@ async function revealTouchWorkers(page: Page) {
 const liveWorkerInspections = '#chat-compact-workers-items .chat-worker-row:is([data-state="working"], [data-state="unknown"]) [data-inspect-task]';
 const activeTask = (page: Page, taskId: string) => page.locator(`.chat-worker-row:is([data-state="working"], [data-state="unknown"])[data-background-task="${taskId}"]`);
 
+for (const width of [320, 390, 1280]) for (const colorScheme of ["light", "dark"] as const) {
+  test(`worker latest effort and session cost at ${width}px ${colorScheme}`, async ({ browser, request, baseURL }, info) => {
+    const page = await browser.newPage({ baseURL, viewport: { width, height: 900 }, hasTouch: width < 600, isMobile: width < 600, colorScheme });
+    try {
+      if (width >= 600) await page.addInitScript(() => localStorage.setItem("uatu:presentation:v1:%2F:uatu:chat-panel", JSON.stringify({ open: true, fraction: 0.95 })));
+      const conversationId = await boot(page, request);
+      const worker = await control(request, { op: "launchWorker", conversationId });
+      await revealTouchWorkers(page);
+      const row = activeTask(page, worker.taskId);
+      await expect(row.locator(".chat-worker-cost")).toHaveText("—");
+      await expect(row.locator(".chat-worker-cost")).toHaveAttribute("aria-label", "Subagent session cost not reported");
+      await control(request, { op: "workerReport", childId: worker.childId, usedModel: "Fixture Model", usedEffort: "high", costUsd: 0 });
+      await expect(row.locator(".chat-worker-effort")).toHaveText("high");
+      await expect(row.locator(".chat-worker-cost")).toHaveText("$0.00");
+      await control(request, { op: "workerReport", childId: worker.childId, usedModel: "Fixture Model", usedEffort: "medium", costUsd: 0.0012 });
+      await expect(row.locator(".chat-worker-effort")).toHaveText("medium");
+      await expect(row.locator(".chat-worker-cost")).toHaveText("$0.0012");
+      await expect(row.locator(".chat-worker-tokens")).not.toHaveText("—");
+      const bounds = await row.evaluate(node => {
+        const parts = [node, ...node.querySelectorAll(".chat-worker-inspect, .chat-worker-model, .chat-worker-tokens, .chat-worker-cost, .chat-task-stop")];
+        return parts.map(part => { const b = part.getBoundingClientRect(); return { left: b.left, right: b.right, width: b.width, height: b.height }; });
+      });
+      expect(bounds.every(b => b.left >= 0 && b.right <= width)).toBe(true);
+      expect(bounds.at(-1)!.height).toBeGreaterThanOrEqual(width < 600 ? 44 : 28);
+      if (width >= 600) {
+        const paneWidth = await page.locator("#chat-work-dock").evaluate(node => node.clientWidth);
+        // At 1280px the preview's minimum width leaves a narrow desktop pane.
+        // The gallery separately exercises a genuinely wide >=40rem work pane.
+        if (paneWidth >= 640) expect(bounds[1]!.height).toBeLessThanOrEqual(30);
+        else expect(bounds[1]!.height).toBeGreaterThanOrEqual(44);
+      } else expect(await row.locator(".chat-worker-model-name").evaluate(node => node.clientWidth)).toBeGreaterThan(24);
+      await captureScreenshot(page, info, `worker-effort-cost-${width}-${colorScheme}`);
+      await control(request, { op: "workerReport", childId: worker.childId, usedModel: "Other Fixture" });
+      await expect(row.locator(".chat-worker-model-name")).toHaveText("Other Fixture");
+      await expect(row.locator(".chat-worker-effort")).toHaveText("—");
+      await expect(row.locator(".chat-worker-cost")).toHaveText("—");
+      // Recover from the native child history without opening its transcript.
+      await page.reload();
+      await expect(page.locator("#chat-conversation-select")).toHaveValue(conversationId);
+      await revealTouchWorkers(page);
+      await expect(activeTask(page, worker.taskId).locator(".chat-worker-model-name")).toHaveText("Other Fixture");
+      await expect(activeTask(page, worker.taskId).locator(".chat-worker-effort")).toHaveText("—");
+    } finally { await page.close(); }
+  });
+}
+
 // Manual backgrounding remains an API contract, not a chat control. Drive the
 // browser HTTP boundary so response-loss/receipt tests retain their real route.
 async function backgroundViaAPI(page: Page, conversationId: string, requestId = crypto.randomUUID()) {

@@ -342,6 +342,7 @@ export class OpenCodeV2Provider implements ChatProvider {
       items: [...normalized.values()].filter(({ item, index }) => index >= start && index < end
         || options.cursor === undefined && (item.type === "background_task" && item.status === "running" || liveLaunches.has(item.id))).map(({ item }) => item),
       accounting,
+      ...(typeof info?.cost === "number" && Number.isFinite(info.cost) && info.cost >= 0 ? { sessionCostUsd: info.cost } : {}),
       completeItems: [...normalized.values()].map(({ item }) => item),
       nextCursor: historyPageCursor(start, version),
     };

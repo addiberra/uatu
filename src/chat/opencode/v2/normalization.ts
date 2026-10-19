@@ -81,8 +81,7 @@ export function createOpenCodeV2Memory(options: { backgroundEntries?: number; ba
 const IGNORED: ReadonlySet<string> = new Set([
   "session.instructions.updated",
   "session.step.streamed",
-  // The session's running total; per-message figures ride `session.step.ended`.
-  "session.usage.updated",
+  // Internal increments are not totals; the projected total rides `session.usage.updated`.
   "session.usage.recorded",
   "session.viewed",
   "session.permissions",
@@ -170,6 +169,10 @@ export function createOpenCodeV2Mapper(directory: string): GenerationMapper<Open
     const { conversationId, eventId } = context;
     const createdAt = number(event.created) ?? context.createdAt;
     switch (event.type) {
+      case "session.usage.updated": {
+        const cost = number(data.cost);
+        return { conversationId, updates: [], ...(cost !== undefined && cost >= 0 ? { sessionCostUsd: cost } : {}) };
+      }
       case "session.created": {
         const child = optionalString(data.sessionID);
         const parent = optionalString(data.parentID);
@@ -295,7 +298,7 @@ export function createOpenCodeV2Mapper(directory: string): GenerationMapper<Open
         return {
           conversationId,
           updates: [],
-          ...(selection ? { assistantModel: { messageId, model: selection.modelId, createdAt: startedAt, ...(promptId === undefined ? {} : { promptId }) } } : {}),
+          ...(selection ? { assistantModel: { messageId, model: selection.modelId, createdAt: startedAt, ...(optionalString(model.variant) ? { effort: model.variant as string } : {}), ...(promptId === undefined ? {} : { promptId }) } } : {}),
         };
       }
       case "session.step.ended":
@@ -694,7 +697,8 @@ export function storedAccounting(value: unknown): StoredMessageAccounting | unde
   const usage = tokensToUsage(message.tokens, message.cost);
   const model = optionalString(record(message.model).id);
   if (usage === undefined && model === undefined) return undefined;
-  return { messageId, createdAt: timestamp(record(message.time).created, 0), ...(usage === undefined ? {} : { usage }), ...(model === undefined ? {} : { model }) };
+  const effort = optionalString(record(message.model).variant);
+  return { messageId, createdAt: timestamp(record(message.time).created, 0), ...(usage === undefined ? {} : { usage }), ...(model === undefined ? {} : { model }), ...(effort === undefined ? {} : { effort }) };
 }
 
 /** The id of a stored user record, or nothing: the prompt later assistant records answer. */

@@ -44,6 +44,7 @@ type SessionState = {
     model: { id: string; providerID: string; variant?: string };
     parentID?: string;
     revert?: { messageID: string };
+    cost?: number;
   };
   running: boolean;
   // Pending entries in enqueue order: not delivered, not cancelled.
@@ -72,6 +73,7 @@ export type OpenCodeV2Fake = {
   launchShell(sessionId: string, background: boolean): { shellId: string; taskId: string };
   shellPhase(shellId: string, phase: "exit" | "capture" | "captureBeforeRemove"): void;
   settleWorker(childId: string, state: "completed" | "error" | "cancelled", text: string): void;
+  workerReport(childId: string, model: string, effort: string | undefined, cost: number | undefined): void;
   disconnect(): void;
   pauseEvents(paused: boolean): void;
   appendHistory(sessionId: string, count: number): void;
@@ -268,6 +270,23 @@ export function startOpenCodeV2Fake(options: { directory: string; password?: str
     const entry: InboxEntry = { id: mint("msg"), sessionID: worker.parent.info.id, type: "synthetic", delivery: "steer", time: { created }, payload: { description: "Inspect safe fixture", text: `<subagent sessionID="${childId}" state="${state}">\n${text}\n</subagent>`, metadata: { source: "subagent", childID: childId, state, agent: "explore" } } };
     worker.parent.inbox.push(entry);
     emit("session.inbox.enqueued", { sessionID: worker.parent.info.id, inboxID: entry.id, item: entry });
+  }
+
+  // Synthetic execution metadata, never a paid model call or a parent's selection.
+  function workerReport(childId: string, model: string, effort: string | undefined, cost: number | undefined) {
+    const child = sessions.get(childId);
+    if (!child) throw new Error("Unknown fixture child");
+    const assistantMessageID = mint("msg");
+    const selected = { id: model, providerID: "fixture", ...(effort === undefined ? {} : { variant: effort }) };
+    const started = emit("session.step.started", { sessionID: childId, assistantMessageID, agent: "explore", model: selected, started: now() });
+    const tokens = { input: 1200, output: 100, reasoning: 20, cache: { read: 0, write: 0 } };
+    const completed = emit("session.step.ended", { sessionID: childId, assistantMessageID, finish: "tool-calls", tokens, ...(cost === undefined ? {} : { cost }) });
+    if (cost === undefined) delete child.info.cost;
+    else {
+      child.info.cost = (child.info.cost ?? 0) + cost;
+      emit("session.usage.updated", { sessionID: childId, cost: child.info.cost, tokens });
+    }
+    child.messages.push({ id: assistantMessageID, type: "assistant", time: { created: started, completed }, model: selected, agent: "explore", content: [], tokens, ...(cost === undefined ? {} : { cost }) });
   }
 
   function launchShell(sessionId: string, background: boolean) {
@@ -563,6 +582,7 @@ export function startOpenCodeV2Fake(options: { directory: string; password?: str
     launchShell,
     shellPhase,
     settleWorker,
+    workerReport,
     disconnect: closeStreams,
     pauseEvents(paused) { eventsPaused = paused; if (paused) closeStreams(); },
     appendHistory(sessionId, count) {

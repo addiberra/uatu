@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test, spyOn } from "bun:test";
 
 import { BackgroundTasksUnsupportedError, ChatQueueFullError, CommandAttachmentsError, CommandSteeringError, ConversationRenameUnsupportedError, deriveConversationTitle, InteractionConflictError, InvalidConversationTitleError, InvalidModeSelectionError, InvalidModelSelectionError, InvalidVariantSelectionError, ChatAdapter, parseSlashCommand, QueuedMessageNotHeldError, ReversibleHistoryUnsupportedError, ScheduledWakeupsUnsupportedError, SendNowUnavailableError, SendNowUnsupportedError, SteerAlreadyDeliveredError, SteeringUnsupportedError, SteerWithdrawalUnconfirmedError, UnknownAttachmentError, UsageUnsupportedError } from "./adapter";
 import { createClaudeEventMemory, normalizeClaudeMessage } from "./claude/normalization";
@@ -3789,6 +3789,7 @@ describe("pending permission recovery", () => {
     expect(row()).toEqual(expect.objectContaining({
       model: "claude-sonnet-4-5",
       usage: { input: 2_000, output: 25, cacheRead: 200, cacheWrite: 0, costUsd: 1 },
+      workerSession: { model: "claude-sonnet-4-5", effort: null, costUsd: null }, // message totals are not a session authority
     }));
 
     // A message that emits a second text part reports the SAME cumulative
@@ -4015,6 +4016,7 @@ describe("pending permission recovery", () => {
     provider.eventQueue.push(live("m2", "p2", 600, 0.3) as never);
     await waitUntil(() => rows()[1]?.usage?.input === 600);
     expect(rows().map(row => row.usage?.costUsd)).toEqual([0.5, 0.3]);
+    expect(rows().map(row => row.workerSession?.costUsd)).toEqual([null, null]); // no authoritative session aggregate
     await adapter.stopEventPump();
     await pump;
 
@@ -4026,6 +4028,203 @@ describe("pending permission recovery", () => {
     expect(reopened.map(row => row.usage)).toEqual([{ input: 1_000, output: 10, costUsd: 0.5 }, { input: 600, output: 6, costUsd: 0.3 }]);
     // Together the rows are what the session spent — no more.
     expect(reopened.reduce((sum, row) => sum + (row.usage?.costUsd ?? 0), 0)).toBeCloseTo(0.8);
+    expect(reopened.map(row => row.workerSession)).toEqual([
+      { model: "gpt-5.6-sol", effort: null, costUsd: null },
+      { model: "gpt-5.6-sol", effort: null, costUsd: null },
+    ]);
+  });
+
+  test("existing parent refresh ages session accounting; a child inspection refreshes it without a second child read", async () => {
+    const provider = new FakeProvider();
+    provider.sessions = [fixtureSession("parent"), { ...fixtureSession("child"), parentId: "parent" }];
+    provider.pages.set("first", { items: [taskRow("launch", 1, "Review")] });
+    let childStore = [reply("m1", 2, 100, 0)];
+    let sessionCostUsd: number | undefined = 0;
+    let reads = 0;
+    const readMessages = provider.readMessages.bind(provider);
+    provider.readMessages = async (id, options) => id === "child" ? (reads++, { items: childStore as never[] }) : readMessages(id, options);
+    const listMessages = provider.listMessages.bind(provider);
+    provider.listMessages = async (id, options) => ({ ...await listMessages(id, options), ...(id === "child" ? { sessionCostUsd } : {}) });
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g" });
+    const cost = async () => rowsOf((await adapter.history("parent")).items)[0]?.workerSession?.costUsd;
+    expect(await cost()).toBe(0);
+    expect(reads).toBe(1);
+    childStore = [...childStore, reply("m2", 3, 200, 0.5)];
+    sessionCostUsd = 0.5;
+    expect(await cost()).toBe(0);
+    expect(reads).toBe(1); // no all-history polling on each repaint/reselection
+    await adapter.history("child");
+    expect(await cost()).toBe(0.5);
+    expect(reads).toBe(2); // the inspection's own existing read was reused
+    childStore = [...childStore, reply("m3", 4, 300, 0.25)];
+    sessionCostUsd = 0.75;
+    const now = Date.now();
+    const clock = spyOn(Date, "now").mockReturnValue(now + 31_000);
+    try { expect(await cost()).toBe(0.75); } finally { clock.mockRestore(); }
+    expect(reads).toBe(3);
+    sessionCostUsd = undefined;
+    await adapter.history("child");
+    expect(await cost()).toBeNull(); // missing aggregate never falls back to a partial transcript sum
+    // A different parent never inherits a cached child's report.
+    provider.sessions.push(fixtureSession("other"));
+    provider.pages.set("first", { items: [] });
+    expect((await adapter.history("other")).items).toEqual([]);
+    await adapter.dispose();
+  });
+
+  test("native session snapshots replace rather than sum, include hidden compaction/reverted costs and stay child-scoped", async () => {
+    const provider = new FakeProvider();
+    provider.sessions = [fixtureSession("parent"), { ...fixtureSession("child"), parentId: "parent" }];
+    provider.pages.set("first", { items: [taskRow("a", 1, "First"), taskRow("b", 2, "Second", "child", true)] });
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g", coalesceWindowMs: 1 });
+    await adapter.history("parent");
+    const rows = () => rowsOf(adapter.projectionForTests("parent").items());
+    const pump = adapter.startEventPump();
+    const report = (conversationId: string, cost: number) => provider.eventQueue.push({ normalized: { conversationId, updates: [], eventType: "session.usage.updated", outcome: "handled", sessionCostUsd: cost } } as never);
+    report("parent", 999); // parent's receipt is never the child's cost
+    report("child", 0);
+    await waitUntil(() => rows().every(row => row.workerSession?.costUsd === 0));
+    report("child", 0.3);
+    report("child", 0.8); // includes cost not recoverable from visible message history
+    report("child", 0.8); // replay is replacement, not +0.8
+    report("child", 0.3); // out-of-order older cumulative snapshot
+    await waitUntil(() => rows().every(row => row.workerSession?.costUsd === 0.8));
+    await adapter.stopEventPump();
+    await pump;
+    expect(rows().map(row => row.workerSession?.costUsd)).toEqual([0.8, 0.8]);
+    expect(rows().map(row => row.usage)).toEqual([undefined, undefined]); // display snapshots never enter task receipts
+    await adapter.dispose();
+  });
+
+  for (const mode of ["periodic refresh", "inspection"] as const) test(`a removal racing ${mode} cannot resurrect child model, effort or tokens`, async () => {
+    const provider = new FakeProvider();
+    provider.sessions = [fixtureSession("parent"), { ...fixtureSession("child"), parentId: "parent" }];
+    provider.pages.set("first", { items: [taskRow("a", 1, "Review")] });
+    const snapshot: ProviderHistoryPage = { items: [], accounting: [
+      { messageId: "m1", model: "Old", effort: "high", createdAt: 1, usage: { input: 100 } },
+      { messageId: "m2", model: "Removed", effort: "medium", createdAt: 2, usage: { input: 200 } },
+    ], sessionCostUsd: 9 };
+    const list = provider.listMessages.bind(provider);
+    let hold = false;
+    let release: ((page: ProviderHistoryPage) => void) | undefined;
+    provider.listMessages = async (id, options) => id !== "child" ? list(id, options) : hold
+      ? new Promise<ProviderHistoryPage>(resolve => { release = resolve; }) : structuredClone(snapshot);
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g", coalesceWindowMs: 1 });
+    await adapter.history("parent");
+    const row = () => rowsOf(adapter.projectionForTests("parent").items())[0];
+    expect(row()?.workerSession).toEqual({ model: "Removed", effort: "medium", costUsd: 9 });
+    const pump = adapter.startEventPump();
+    const now = Date.now();
+    const clock = mode === "periodic refresh" ? spyOn(Date, "now").mockReturnValue(now + 31_000) : undefined;
+    try {
+      hold = true;
+      const pending = adapter.history(mode === "inspection" ? "child" : "parent");
+      await waitUntil(() => Boolean(release));
+      provider.eventQueue.push({ type: "message.removed", properties: { sessionID: "child", messageID: "m2" } } as never);
+      await waitUntil(() => row()?.workerSession?.model === "Old");
+      expect(row()?.workerSession).toEqual({ model: "Old", effort: "high", costUsd: 9 });
+      expect(row()?.usage?.input).toBe(100);
+      hold = false;
+      release!(structuredClone(snapshot)); // old provider read still contains removed m2
+      await pending;
+      const refreshed = rowsOf((await adapter.history("parent")).items)[0];
+      expect(refreshed?.workerSession).toEqual({ model: "Old", effort: "high", costUsd: 9 });
+      expect(refreshed?.usage?.input).toBe(100);
+      // A later actual event may legitimately recreate this provider message id.
+      provider.eventQueue.push({ normalized: { conversationId: "child", eventType: "message.updated", outcome: "handled", updates: [],
+        assistantModel: { messageId: "m2", model: "Restored", effort: "low", createdAt: 3 },
+        assistantUsage: { messageId: "m2", usage: { input: 50 } }, sessionCostUsd: 9,
+      } } as never);
+      await waitUntil(() => row()?.workerSession?.model === "Restored");
+      expect(row()?.workerSession).toEqual({ model: "Restored", effort: "low", costUsd: 9 });
+      expect(row()?.usage?.input).toBe(150);
+    } finally {
+      clock?.mockRestore();
+      await adapter.stopEventPump();
+      await pump;
+      await adapter.dispose();
+    }
+  });
+
+  for (const mode of ["periodic refresh", "inspection"] as const) test(`bounded removal fences reject older ${mode}, allow future source recovery and clear on conversation eviction`, async () => {
+    const provider = new FakeProvider();
+    provider.sessions = [fixtureSession("parent"), { ...fixtureSession("child"), parentId: "parent" }, fixtureSession("other")];
+    provider.pages.set("first", { items: [taskRow("a", 1, "Review")] });
+    let source: ProviderHistoryPage = { items: [], accounting: [
+      { messageId: "m1", model: "Old", effort: "high", createdAt: 1, usage: { input: 100 } },
+      { messageId: "m2", model: "Removed", effort: "medium", createdAt: 2, usage: { input: 200 } },
+    ], sessionCostUsd: 9 };
+    const list = provider.listMessages.bind(provider);
+    let hold = false;
+    let release: ((page: ProviderHistoryPage) => void) | undefined;
+    provider.listMessages = async (id, options) => id === "other" ? { items: [], accounting: [] } : id !== "child" ? list(id, options) : hold
+      ? new Promise<ProviderHistoryPage>(resolve => { release = resolve; }) : structuredClone(source);
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g", coalesceWindowMs: 1, maxProjections: 2 });
+    await adapter.history("parent");
+    const key = [...adapter["childModels"].keys()][0]!;
+    const row = () => rowsOf(adapter.projectionForTests("parent").items())[0];
+    const pump = adapter.startEventPump();
+    const now = Date.now();
+    const clock = mode === "periodic refresh" ? spyOn(Date, "now").mockReturnValue(now + 31_000) : undefined;
+    try {
+      hold = true;
+      const pending = adapter.history(mode === "inspection" ? "child" : "parent");
+      await waitUntil(() => Boolean(release));
+      const epoch = adapter["attributionEpochs"].get(key);
+      provider.eventQueue.push({ type: "message.removed", properties: { sessionID: "child", messageID: "m2" } } as never);
+      for (let i = 0; i < 600; i++) provider.eventQueue.push({ type: "message.removed", properties: { sessionID: "child", messageID: `removed-${i}` } } as never);
+      await waitUntil(() => adapter["removedChildAttribution"].get(key)?.has("removed-599") === true);
+      expect(adapter["removedChildAttribution"].get(key)?.size).toBeLessThanOrEqual(512);
+      expect(adapter["attributionArrivals"].get(key)?.size).toBeLessThanOrEqual(512);
+      expect(adapter["attributionEpochs"].get(key)).not.toBe(epoch);
+      await waitUntil(() => row()?.workerSession?.model === "Old");
+      hold = false;
+      release!({ ...structuredClone(source), sessionCostUsd: 99 }); // old read must not restore retired m2 or its cost snapshot
+      await pending;
+      expect(row()?.workerSession).toEqual({ model: "Old", effort: "high", costUsd: 9 });
+      expect(row()?.usage?.input).toBe(100);
+      source = { items: [], accounting: [{ messageId: "m2", model: "Fresh", effort: "low", createdAt: 3, usage: { input: 50 } }], sessionCostUsd: 9 };
+      expect(rowsOf((await adapter.history("parent")).items)[0]?.workerSession).toEqual({ model: "Fresh", effort: "low", costUsd: 9 });
+      await adapter.history("child"); // keep the child most recent so the next selection retires its parent
+      expect((await adapter.history("other")).items).toEqual([]); // evicts the original parent, not a cross-conversation tombstone
+      expect(adapter["removedChildAttribution"].has(key)).toBe(false);
+      expect(adapter["attributionArrivals"].has(key)).toBe(false);
+      expect(adapter["attributionEpochs"].has(key)).toBe(false);
+      expect(rowsOf((await adapter.history("parent")).items)[0]?.workerSession).toEqual({ model: "Fresh", effort: "low", costUsd: 9 });
+    } finally {
+      clock?.mockRestore();
+      await adapter.stopEventPump();
+      await pump;
+      await adapter.dispose();
+    }
+  });
+
+  test("a late child inspection cannot repopulate an evicted parent's session-cost cache", async () => {
+    const provider = new FakeProvider();
+    provider.sessions = [fixtureSession("parent"), { ...fixtureSession("child"), parentId: "parent" }, fixtureSession("other")];
+    provider.readMessages = async id => ({ items: id === "parent" ? [taskRow("a", 1, "Review")] as never[] : [] });
+    const list = provider.listMessages.bind(provider);
+    let hold = false;
+    let release: ((page: ProviderHistoryPage) => void) | undefined;
+    let sourceCost = 1;
+    provider.listMessages = async (id, options) => {
+      const page = await list(id, options);
+      if (id !== "child") return page;
+      if (hold) return new Promise<ProviderHistoryPage>(resolve => { release = resolve; });
+      return { ...page, sessionCostUsd: sourceCost };
+    };
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g", maxProjections: 2 });
+    await adapter.history("parent");
+    hold = true;
+    const inspection = adapter.history("child");
+    await waitUntil(() => Boolean(release));
+    await adapter.history("other"); // evicts parent while its child's read is pending
+    hold = false;
+    sourceCost = 2;
+    release!({ items: [], accounting: [], sessionCostUsd: 8 });
+    await inspection;
+    expect(rowsOf((await adapter.history("parent")).items)[0]?.workerSession?.costUsd).toBe(2);
+    await adapter.dispose();
   });
 
   test("a subagent that compacted during its first task bills the compaction to that task, not the next", async () => {

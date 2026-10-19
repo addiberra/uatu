@@ -10,6 +10,7 @@ test.skip(process.env.UATU_CAPTURE_CHAT_SCREENSHOTS !== "1", "Opt-in documentati
 const folder = path.resolve("docs/screenshots/opencode-chat");
 async function shot(page: Page, name: string) {
   if (process.env.UATU_CAPTURE_HOLD_ONLY === "1" && !name.startsWith("04-hold-")) return;
+  if (process.env.UATU_CAPTURE_WORKERS_ONLY === "1" && !/^(02-|03-|04-|05-|06-|07-|09-replacement-)/.test(name)) return;
   await page.evaluate(() => document.fonts.ready);
   await page.screenshot({ path: path.join(folder, `${name}.png`), animations: "disabled" });
 }
@@ -66,10 +67,12 @@ test("desktop documentation gallery", async ({ page, request }, info) => {
   const workers: string[] = [];
   for (let i = 0; i < 3; i++) {
     const worker = await control(request, { action: "opencode", op: "launchWorker", conversationId }); workers.push(worker.childId);
+    await control(request, { action: "opencode", op: "workerReport", childId: worker.childId, usedModel: "Fixture Model", usedEffort: i === 0 ? "medium" : "high", costUsd: i === 0 ? 0.0012 : 0 });
   }
   await control(request, { action: "opencode", op: "settleWorker", childId: workers[2], workerState: "completed" });
   await expect(page.locator("#chat-compact-workers-label")).toHaveText("2 working · 1 finished");
   await openChatWorkers(page);
+  for (const row of await page.locator(".chat-worker-inspect").all()) expect(await row.evaluate(node => node.getBoundingClientRect().height)).toBeLessThanOrEqual(28);
   await page.emulateMedia({ colorScheme: "dark" });
   await shot(page, "02-workers-dark");
   await page.locator("#chat-compact-workers [data-inspect-task]").first().click();

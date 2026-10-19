@@ -623,6 +623,19 @@ describe("OpenCode 2.x provider: history", () => {
     }
   });
 
+  test("session aggregate survives paging/revert independently of visible message costs; zero and missing stay distinct", async () => {
+    const provider = historyServer({ cost: 1.75, revert: { messageID: String(STORED[0]!.id) } }).provider();
+    const reverted = await provider.listMessages("ses_h", { limit: 1 });
+    expect(reverted.items).toEqual([]);
+    expect(reverted.accounting).toEqual([]);
+    expect(reverted.sessionCostUsd).toBe(1.75); // includes native compaction/reverted spend, not the visible page's sum
+    const zero = historyServer({ cost: 0 });
+    expect((await zero.provider().listMessages("ses_h", { limit: 1 })).sessionCostUsd).toBe(0);
+    expect(zero.requests("GET", "/api/session/ses_h")).toHaveLength(1); // reuse existing metadata read
+    expect((await historyServer({ cost: undefined }).provider().listMessages("ses_h", { limit: 1 })).sessionCostUsd).toBeUndefined();
+    expect((await historyServer({ cost: -1 }).provider().listMessages("ses_h", { limit: 1 })).sessionCostUsd).toBeUndefined();
+  });
+
   test("pages locally from the newest record and continues from the cursor", async () => {
     const provider = historyServer().provider();
     const newest = await provider.listMessages("ses_h", { limit: 2 });

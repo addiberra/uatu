@@ -1,6 +1,39 @@
 ## MODIFIED Requirements
 
 ### Requirement: Background work is a distinct conversation state
+
+Desktop and touch worker rows SHALL show latest execution-reported child model and
+reasoning effort, cumulative tokens and cumulative child-session cost in SDK USD.
+Parent/configured selections and model names SHALL NOT imply actual effort. The
+latest model/effort pair SHALL clear stale effort on an unreported newer execution.
+Execution reports SHALL NOT claim independent downstream-provider confirmation.
+Cost SHALL use authoritative native session snapshots including compaction/reverted
+spend, never partial message sums, excluding parent/descendants and never summing repeated session snapshots
+on canonical aliases or reused-child occurrences into receipts. Unreported/incomplete
+values SHALL use an accessibly labeled dash; explicit zero SHALL remain zero and
+sub-cent nonzero costs SHALL retain useful precision. Shell rows SHALL NOT invent
+subagent metadata. History recovery and existing inspection reads SHALL refresh
+metadata without per-render polling. Wide desktop rows SHALL align on one line;
+touch SHALL retain 44px Stop targets with minimal narrow-screen metadata wrapping.
+
+#### Scenario: Latest effort and cumulative session cost remain truthful
+- **WHEN** a child runs high then medium and produces multiple priced assistant calls
+- **THEN** medium is shown with the latest model and cost uses the authoritative cumulative session snapshot
+- **AND** a later model lacking effort clears medium rather than inheriting it
+- **AND** missing cost shows not reported while explicit reported zero shows zero
+- **AND** history recovery/inspection retains the same model/effort and cost semantics
+
+#### Scenario: Latest execution changes effort or model
+- **WHEN** a child runs high then medium, followed by another model with no reported effort
+- **THEN** its row shows medium after the second execution and not-reported effort with the new model after the third
+- **AND** the parent's configured effort never substitutes for missing child effort
+
+#### Scenario: Session cost is not a partial message sum or duplicated task cost
+- **WHEN** native cumulative session totals arrive, including compaction and reverted spend
+- **THEN** each snapshot replaces the prior total rather than adding to it
+- **AND** launcher aliases/repeated child occurrences do not add another cost to receipts
+- **AND** a provider without an authoritative aggregate remains not reported even when message prices are available, while explicit reported zero remains zero
+
 Where an agent declares that it can run work in the background, Chat SHALL present live background tasks as a state of the conversation distinct from working and idle: the composer status SHALL name how many tasks run, a list SHALL name each task with its description and progress where reported, each confirmed running and controllable task SHALL offer a stop action, and a settled task SHALL appear in the timeline as a row with its outcome and summary. The state SHALL be populated when an existing conversation with live background work is opened, and SHALL clear when the agent authoritatively reports no live tasks. An agent that does not declare the capability SHALL show none of it.
 
 Background tasks SHALL remain visible while the parent also has a foreground turn, subject to the compact touch visibility rules in "Background inspection and controls remain accessible and workspace-confined". When only background work remains, the parent composer SHALL remain usable without requiring those workers to finish. If recovery cannot establish current task state, Chat SHALL distinguish last-known state from current evidence, show that status is unavailable, and withhold controls whose target cannot be verified. Missing or failed reads alone MUST NOT be reported as successful completion or cancellation. A later successful reconciliation SHALL clear the uncertainty.

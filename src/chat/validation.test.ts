@@ -1,5 +1,15 @@
 import { describe, expect, test } from "bun:test";
 
+test("worker session metadata validates nullable effort/cost without replacing unknown with zero", () => {
+  const base = { id: "t", type: "tool", createdAt: 1, name: "task", status: "completed" } as const;
+  for (const workerSession of [{ effort: null, costUsd: null }, { model: "Fixture", effort: "medium", costUsd: 0 }]) {
+    expect(parseConversationItem({ ...base, workerSession })).toEqual({ ...base, workerSession });
+  }
+  for (const workerSession of [{ effort: null }, { costUsd: 0 }, { effort: "", costUsd: 0 }, { effort: null, costUsd: -1 }, { effort: null, costUsd: Number.NaN }]) {
+    expect(() => parseConversationItem({ ...base, workerSession })).toThrow();
+  }
+});
+
 import {
   parseAgentUsageReport,
   parseBackgroundTaskOutput,

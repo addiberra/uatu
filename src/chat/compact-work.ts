@@ -42,6 +42,8 @@ export type CompactWorker = {
   conversationId?: string;
   model?: string;
   tokens?: number;
+  effort?: string | null;
+  costUsd?: number | null;
 };
 
 /** A projection fold, not another worker lifecycle or a task-id tombstone map. */
@@ -84,6 +86,17 @@ export function compactWorkers(items: readonly ConversationItem[]): CompactWorke
       settledAt: item?.createdAt ?? 0, progress: entry.progress, conversationId: entry.conversationId,
       model: entry.model, tokens: entry.usage ? totalTokens(entry.usage) : undefined,
     });
+  }
+  const itemsById = new Map(items.map(item => [item.id, item]));
+  for (const worker of workers.values()) {
+    if (worker.kind !== "agent") continue;
+    const report = [worker.id, ...worker.references].map(id => itemsById.get(id))
+      .find(item => (item?.type === "tool" || item?.type === "background_task") && item.workerSession);
+    if (report?.type === "tool" || report?.type === "background_task") {
+      worker.model = report.workerSession?.model;
+      worker.effort = report.workerSession?.effort;
+      worker.costUsd = report.workerSession?.costUsd;
+    }
   }
   return [...workers.values()].sort((a, b) => {
     const rank = (worker: CompactWorker) => worker.state === "working" ? 0 : worker.state === "unknown" ? 1 : 2;

@@ -368,6 +368,15 @@ function expectSubagentLines(value: unknown, rowId: unknown): void {
  * stay absent, not arrive as some other type, since the readouts do
  * arithmetic on these.
  */
+function expectWorkerSession(value: unknown): void {
+  if (value === undefined) return;
+  const report = expectRecord(value, "worker session");
+  expectKeys(report, ["model", "effort", "costUsd"], "worker session");
+  expectOptionalString(report.model, "worker session model");
+  if (report.effort !== null) expectNonEmptyString(report.effort, "worker session effort");
+  if (report.costUsd !== null && (typeof report.costUsd !== "number" || !Number.isFinite(report.costUsd) || report.costUsd < 0)) throw new Error("worker session cost must be non-negative USD or null");
+}
+
 function expectTokenUsage(value: unknown, label: string): void {
   if (value === undefined) return;
   const usage = expectRecord(value, label);
@@ -428,7 +437,8 @@ export function parseConversationItem(value: unknown): ConversationItem {
       if (record.label !== undefined) expectNonEmptyString(record.label, "reasoning label");
       break;
     case "tool":
-      expectKeys(record, ["id", "type", "createdAt", "name", "status", "completedAt", "input", "output", "error", "childConversationId", "model", "usage", "descendants", "elapsedMs"], type);
+      expectKeys(record, ["id", "type", "createdAt", "name", "status", "completedAt", "input", "output", "error", "childConversationId", "model", "usage", "descendants", "elapsedMs", "workerSession"], type);
+      expectWorkerSession(record.workerSession);
       expectOptionalTimestamp(record.completedAt, "completedAt");
       expectNonEmptyString(record.name, "tool name");
       parseActivityStatus(record.status);
@@ -529,7 +539,8 @@ export function parseConversationItem(value: unknown): ConversationItem {
       expectContextWindow(record.window);
       break;
     case "background_task":
-      expectKeys(record, ["id", "type", "createdAt", "taskId", "description", "taskType", "toolUseId", "status", "progress", "summary", "subagentType", "prompt", "usage", "outputFile", "childConversationId", "foreground", "stateUncertain", "resultId", "toolUseIds"], type);
+      expectKeys(record, ["id", "type", "createdAt", "taskId", "description", "taskType", "toolUseId", "status", "progress", "summary", "subagentType", "prompt", "usage", "outputFile", "childConversationId", "foreground", "stateUncertain", "resultId", "toolUseIds", "workerSession"], type);
+      expectWorkerSession(record.workerSession);
       if (record.stateUncertain !== undefined && typeof record.stateUncertain !== "boolean") throw new Error("background task uncertainty must be a boolean");
       expectOptionalIdentity(record.resultId, "background result id");
       if (record.toolUseIds !== undefined) {

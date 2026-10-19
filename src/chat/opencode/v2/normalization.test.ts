@@ -3,9 +3,20 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 
 import { normalizeProviderEvent as normalizeV1 } from "../v1/normalization";
-import { createOpenCodeV2Memory, createOpenCodeV2Normalizer, formFieldToQuestion, normalizeStoredMessage, type OpenCodeV2Memory } from "./normalization";
+import { createOpenCodeV2Memory, createOpenCodeV2Normalizer, formFieldToQuestion, normalizeStoredMessage, storedAccounting, type OpenCodeV2Memory } from "./normalization";
 import { parseConversationItem } from "../../validation";
 import type { NormalizedProviderEvent, NormalizedProviderUpdate } from "../../provider";
+
+test("only assistant execution metadata reports effort, live and stored, not parent/user selection", () => {
+  const normalize = createOpenCodeV2Normalizer(process.cwd());
+  const event = normalize({ id: "event", type: "session.step.started", created: 5, data: { sessionID: "child", assistantMessageID: "a", started: 4, model: { providerID: "fixture", id: "model", variant: "medium" } } });
+  expect(event.assistantModel).toEqual({ messageId: "a", model: "model", createdAt: 4, effort: "medium" });
+  expect(storedAccounting({ id: "a", type: "assistant", time: { created: 4 }, model: { id: "model", variant: "none" }, cost: 0 })).toEqual({ messageId: "a", createdAt: 4, model: "model", effort: "none", usage: { costUsd: 0 } });
+  expect(storedAccounting({ id: "u", type: "user", model: { id: "model", variant: "high" } })).toBeUndefined();
+  expect(storedAccounting({ id: "b", type: "assistant", model: { id: "other" } })).not.toHaveProperty("effort");
+  expect(normalize({ id: "cost", type: "session.usage.updated", created: 6, data: { sessionID: "child", cost: 0, tokens: {} } })).toMatchObject({ conversationId: "child", sessionCostUsd: 0, updates: [] });
+  expect(normalize({ id: "missing", type: "session.usage.updated", created: 7, data: { sessionID: "child" } })).not.toHaveProperty("sessionCostUsd");
+});
 
 // Captured from a real OpenCode 2.0.13 `/api/event` stream (sandboxed home,
 // the free public model), workspace directory `/tmp/oc-v2-ws`. The shapes
