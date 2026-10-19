@@ -225,6 +225,9 @@ test.describe("desktop OpenCode chat", () => {
     await page.keyboard.press("Escape");
     await page.locator("#chat-send").click();
     await expect(page.locator("#chat-items")).toContainText("/reload now");
+    // The stream can echo the row before prompt acceptance reaches the UI.
+    // Complete only after acceptance, so this also checks its reload marker.
+    await expect(page.locator("#chat-configuration-trigger")).toBeEnabled();
     const reread = page.waitForResponse(response => response.url().includes("/chat/commands"));
     await control(request, { action: "status", conversationId: seeded.conversation.id, status: "completed" });
     await reread;

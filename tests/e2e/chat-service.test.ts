@@ -2,6 +2,20 @@ import { expect, test } from "bun:test";
 
 import { FakeE2EChatService } from "./chat-service";
 
+test("listed reload commands return the acceptance marker; ordinary prompts and skills do not", async () => {
+  const service = new FakeE2EChatService();
+  const { conversation: { id } } = await service.createConversation();
+  service.setExtraCommands([{ name: "reload", description: "Reload configuration", argumentHint: "", kind: "command" }]);
+  const accepted = await service.prompt(id, "reload", "/reload now");
+  expect(accepted).toMatchObject({ pending: false, operation: "reload" });
+  expect(await service.prompt(id, "reload", "/reload now")).toEqual(accepted);
+  service.publishStatus(id, "completed");
+  service.setExtraCommands([{ name: "reload", description: "A skill named reload", argumentHint: "", kind: "skill" }]);
+  expect(await service.prompt(id, "skill", "/reload now")).not.toHaveProperty("operation");
+  service.publishStatus(id, "completed");
+  expect(await service.prompt(id, "ordinary", "Please reload now")).not.toHaveProperty("operation");
+});
+
 test("Claude-shaped Send now applies the chosen message's frozen configuration and leaves the dormant backlog in order", async () => {
   const service = new FakeE2EChatService({ extraCapabilities: ["send-now"] });
   const { conversation: { id } } = await service.createConversation();

@@ -406,6 +406,7 @@ export class FakeE2EChatService implements WorkspaceChatService {
     delivery: MessageDelivery;
     conversation?: ConversationSummary;
     configuration: ConversationConfiguration;
+    operation?: "reload";
   }> {
     if (mode) this.promptModes.push(mode);
     if (variant) this.promptVariants.push(variant);
@@ -451,12 +452,17 @@ export class FakeE2EChatService implements WorkspaceChatService {
     if (JSON.stringify(previousConfiguration) !== JSON.stringify(configuration)) {
       this.replay.get(id)!.publish({ type: "conversation.configuration", configuration });
     }
+    // Tests listing the built-in reload command model its acceptance contract,
+    // not just its streamed row. Otherwise the UI correctly drops its pending
+    // reload guess as soon as this response lands, racing the test's completion.
+    const operation = /^\/reload(?:\s|$)/.test(text.trim()) && (await this.commands()).some(command => command.name === "reload" && command.kind === "command")
+      ? { operation: "reload" as const } : {};
     // A restored draft starts a replacement branch. Commit the hidden suffix
     // first, then admit this prompt before any older held messages resume.
     if (this.revertBoundaries.has(id)) {
       this.commitRevertedBranch(id);
       const messageId = this.dispatch(id, text, requestId, attachmentRefs);
-      const result = { messageId, pending: false, delivery: "queue" as const, configuration };
+      const result = { messageId, pending: false, delivery: "queue" as const, configuration, ...operation };
       this.receipts.set(key, result);
       return result;
     }
@@ -482,7 +488,7 @@ export class FakeE2EChatService implements WorkspaceChatService {
       this.conversations.set(id, renamed);
     }
     const messageId = this.dispatch(id, text, requestId, attachmentRefs);
-    const result = { messageId, pending: false, delivery: "queue" as const, configuration, ...(renamed ? { conversation: renamed } : {}) };
+    const result = { messageId, pending: false, delivery: "queue" as const, configuration, ...operation, ...(renamed ? { conversation: renamed } : {}) };
     this.receipts.set(key, result);
     return result;
   }

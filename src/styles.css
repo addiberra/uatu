@@ -10689,7 +10689,9 @@ html:is([data-ui-mode="touch"], [data-ui-mode="desktop"]) .chat-work-dock .chat-
 html:is([data-ui-mode="touch"], [data-ui-mode="desktop"]) .chat-work-dock .chat-pending-toggle { display: flex; align-items: center; gap: 6px; min-height: 28px; font-weight: 400; }
 .chat-queue-content { min-height: 0; overflow-y: auto; overscroll-behavior: contain; overflow-anchor: none; padding: 0 8px; scroll-padding-block: 4px; }
 .chat-queue-content[hidden] { display: none; }
-.chat-queue-batch .chat-queued-action { min-height: 44px; margin-block: 4px; }
+/* Batch actions live outside message cards, but need the same wrapping:
+   enlarged fallback fonts must not create a horizontal Pending scrollport. */
+.chat-queue-batch .chat-queued-action { min-height: 44px; margin-block: 4px; max-width: 100%; box-sizing: border-box; white-space: normal; overflow-wrap: anywhere; }
 .chat-queue-batch[hidden] { display: none; }
 .chat-work-dock .chat-queue.has-more-below::after { position: absolute; inset: auto 0 0; height: 1rem; margin: 0; }
 .chat-work-dock .chat-queue { position: relative; }

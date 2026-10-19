@@ -25,6 +25,7 @@
 // personal-state.e2e.ts under load, where this log costs nothing measurable.
 
 import { test as base, type Browser, type BrowserContext, type Page, type TestInfo, type TestType } from "@playwright/test";
+import { recordLinuxWebKitDiagnostics } from "./linux-webkit-diagnostics";
 
 type Engine = "chromium" | "webkit";
 
@@ -153,6 +154,11 @@ export function withEngineBrowsers<T extends {}, W extends {}>(test: TestType<T,
       }
       const log = logFor(testInfo);
       const opened = new Set<BrowserContext>();
+      const diagnosticClosers = new Map<BrowserContext, () => Promise<void>>();
+      const closeContext = async (context: BrowserContext) => {
+        try { await diagnosticClosers.get(context)?.(); }
+        finally { await context.close(); }
+      };
       let contexts = 0;
       await use(async engine => {
         const shared = engine === "chromium" ? chromiumBrowser : await _webkitBrowser();
@@ -164,18 +170,21 @@ export function withEngineBrowsers<T extends {}, W extends {}>(test: TestType<T,
           opened.add(context);
           context.once("close", () => opened.delete(context));
           await instrumentContext(context, log, `[${engine}#${++contexts}]`);
+          if (process.env.UATU_LINUX_WEBKIT_DIAGNOSTIC === "1" && engine === "webkit") {
+            diagnosticClosers.set(context, await recordLinuxWebKitDiagnostics(context, testInfo, `webkit-${contexts}`));
+          }
           return context;
         };
         return {
           newContext,
           newPage: async (...args: Parameters<Browser["newPage"]>) => (await newContext(...args)).newPage(),
-          close: async () => { await Promise.all([...opened].map(context => context.close())); },
+          close: async () => { await Promise.all([...opened].map(closeContext)); },
           version: () => shared.version(),
         };
       });
       // A test that timed out never reached its own `finally`; its contexts
       // must not outlive it in the worker's browser.
-      await Promise.all([...opened].map(context => context.close().catch(() => {})));
+      await Promise.all([...opened].map(context => closeContext(context).catch(() => {})));
     },
   });
 }
