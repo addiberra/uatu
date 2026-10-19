@@ -98,20 +98,44 @@ test("direct Open and Start still enter the intended workspace; Return survives 
   expect((await (await request.get("/review/state")).json()).log.filter((entry: { method: string }) => entry.method === "startWorkspace")).toHaveLength(1);
 });
 
-test("enlarged text and raised safe-area dock keep the bottom action reachable without changing preferences", async ({ page }) => {
+test("enlarged text and raised safe-area dock keep the bottom action reachable without changing preferences", async ({ page }, info) => {
   await page.setViewportSize({ width: 320, height: 568 });
   const preferences = { side: "right", position: 0.4, autoHide: false, previewSide: "right" };
   await page.addInitScript(value => localStorage.setItem("uatu:navigation:v1:hub", JSON.stringify(value)), preferences);
   await page.goto("/");
   // Browser stress of the occupied safe-area band, not physical iOS validation.
-  await page.addStyleTag({ content: "html { font-size: 200%; } .mh-root .mh-dock { bottom: 34px; }" });
-  await page.locator(".mh-page").evaluate(el => { el.scrollTop = el.scrollHeight; });
+  await expect(page.locator(".mh-add")).toBeVisible();
+  await page.evaluate(() => document.fonts.ready);
+  // Apply stress and scroll in one task, before ResizeObserver's scheduled RAF
+  // can reserve the newly occupied band. This reproduces the hosted ordering.
+  await page.locator(".mh-page").evaluate(el => {
+    const style = document.createElement("style");
+    style.textContent = "html { font-size: 200%; } .mh-root .mh-dock { bottom: 34px; }";
+    document.head.append(style); el.scrollTop = el.scrollHeight;
+  });
+  const measure = () => page.locator(".mh-page").evaluate(el => {
+    const root = el.closest<HTMLElement>(".mh-root")!, dock = root.querySelector(".mh-dock")!.getBoundingClientRect();
+    const pane = el.getBoundingClientRect(), add = el.querySelector(".mh-add")!.getBoundingClientRect();
+    return { clearance: parseFloat(root.style.getPropertyValue("--mh-dock-clearance")), occupied: root.getBoundingClientRect().bottom - dock.top,
+      pageTop: pane.top, pageBottom: pane.bottom, dockTop: dock.top, addTop: add.top, addBottom: add.bottom,
+      scrollTop: el.scrollTop, scrollHeight: el.scrollHeight, clientHeight: el.clientHeight, scrollWidth: el.scrollWidth, clientWidth: el.clientWidth };
+  });
+  const initial = await measure();
   const add = page.locator(".mh-add");
-  await expect.poll(() => add.evaluate(el => {
-    const dock = document.querySelector(".mh-dock")!.getBoundingClientRect(), r = el.getBoundingClientRect();
-    const scroll = document.querySelector(".mh-page")!;
-    return r.bottom <= dock.top - 8 && r.top >= scroll.getBoundingClientRect().top && scroll.scrollWidth <= scroll.clientWidth;
-  })).toBe(true);
+  let settled: Awaited<ReturnType<typeof measure>> | undefined;
+  try {
+    // Wait for the actual layout contract, not a delay or a guessed dock height.
+    await expect.poll(async () => { const g = await measure(); return { measured: g.clearance === g.occupied, aboveDock: g.pageBottom <= g.dockTop - 8 }; }).toEqual({ measured: true, aboveDock: true });
+    settled = await measure();
+    // A scroll to the old maximum cannot reach the new maximum after reflow.
+    await page.locator(".mh-page").evaluate(el => { el.scrollTop = el.scrollHeight; });
+    await expect.poll(async () => {
+      const g = await measure();
+      return { aboveDock: g.addBottom <= g.dockTop - 8, insideTop: g.addTop >= g.pageTop, insideBottom: g.addBottom <= g.pageBottom, noHorizontalOverflow: g.scrollWidth <= g.clientWidth };
+    }).toEqual({ aboveDock: true, insideTop: true, insideBottom: true, noHorizontalOverflow: true });
+  } finally {
+    await info.attach("enlarged-text-dock-geometry", { body: JSON.stringify({ initial, settled, final: await measure() }, null, 2), contentType: "application/json" });
+  }
   await add.click(); await expect(page.locator(".mh-flow-page h1")).toHaveText("Add Workspace");
   await page.locator('[data-flow="flow-back"]').click(); await expect(add).toBeFocused();
   expect(await page.evaluate(() => JSON.parse(localStorage.getItem("uatu:navigation:v1:hub")!))).toEqual(preferences);

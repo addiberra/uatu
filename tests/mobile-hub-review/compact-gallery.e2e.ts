@@ -22,12 +22,17 @@ for (const [scene, label] of galleryScenes) test(`compact gallery: ${label}`, as
       await page.goto("/");
       await expect(page.locator('[data-action="open:atlas"]')).toBeVisible();
       break;
-    case "settings":
+    case "settings": {
       await page.goto("/settings");
       await expect(page.getByRole("heading", { name: "Settings", exact: true })).toBeVisible();
-      await expect(page.locator('[data-action^="credential:"]').first()).toBeVisible();
+      const catalog = page.locator('[data-action="repository-credentials"]');
+      await expect(catalog).toBeVisible();
+      const snapshot = await (await request.get("/review/state")).json();
+      await expect(catalog.locator(".mh-value")).toHaveText(String(snapshot.model.credentials.length));
+      await expect(page.locator('[data-action^="credential:"]')).toHaveCount(0);
       await expect(page.locator('[data-action="devices"]')).toHaveCount(0);
       break;
+    }
     case "create-editor":
       await createEditor(page);
       await expect(page.getByRole("region", { name: "Create Workspace", exact: true }).locator("h1")).toBeFocused();

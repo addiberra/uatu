@@ -94,7 +94,7 @@ test("every branch variant and duplicate path remains truthful through history a
   expect(count(await state(request), "startWorkspace")).toBe(0); expect((await state(request)).model.workspaces.every(w => w.runtime.status === "stopped")).toBe(true);
 });
 
-test("OpenPGP generation preserves draft and sheet context through local and missing-tool errors", async ({ page, request }) => {
+for (const anchoring of ["native", "clipped"] as const) test(`OpenPGP generation preserves draft and sheet context through local and missing-tool errors (${anchoring})`, async ({ page, request }) => {
   await page.setViewportSize({ width: 390, height: 600 }); await page.goto("/settings?detail=add-credential"); await credentialCreation(page, 'openpgp');
   await page.getByLabel("Name", { exact: true }).fill("Exceptional signer"); await page.getByLabel("User ID (name and email)").fill("Exceptional <signer@mock.invalid>");
   await button(page, "Generate").click(); await expect(activeTask(page).getByRole("alert")).toContainText("passphrase is required"); expect(count(await state(request), "generateOpenPgp")).toBe(0);
@@ -102,7 +102,12 @@ test("OpenPGP generation preserves draft and sheet context through local and mis
   await control(request, "setToolState", ["gpg", "missing"]); await page.getByLabel("Passphrase", { exact: true }).fill("DISPOSABLE-SIGNER");
   await control(request, "hold", ["generateOpenPgp"]);
   try {
-    await button(page, "Generate").click(); const before = await body.evaluate(el => {
+    await button(page, "Generate").click();
+    await expect(page.getByLabel("Passphrase", { exact: true })).toHaveValue("");
+    const before = await body.evaluate((el, mode) => {
+      // Keep the native-anchoring case untouched. The second case starts at a
+      // known clipped position to exercise the owner's exact-delta reveal.
+      if (mode === "clipped") { el.style.overflowAnchor = "none"; el.scrollTop = 100; }
       // Observe the reveal request with the new error already laid out, before
       // native scroll rounding. This tests geometry, not a font-specific offset.
       const native = Object.getOwnPropertyDescriptor(Element.prototype, "scrollTop")!;
@@ -112,26 +117,33 @@ test("OpenPGP generation preserves draft and sheet context through local and mis
         native.set!.call(this, top);
       } });
       return el.scrollTop;
-    });
-    await expect(page.getByLabel("Passphrase", { exact: true })).toHaveValue(""); await control(request, "settle", ["generateOpenPgp", false]);
+    }, anchoring);
+    await control(request, "settle", ["generateOpenPgp", false]);
     await expect(activeTask(page).getByRole("alert")).toContainText("Required synthetic key tooling unavailable");
     expect(await name!.evaluate(el => el.isConnected)).toBe(true); await expect(page.getByLabel("User ID (name and email)")).toHaveValue("Exceptional <signer@mock.invalid>");
     // The contextual-error owner must reveal only the clipped amount, not reset
     // the editor or scroll the document/Settings behind it.
     const reveal = await body.evaluate(el => { const error = el.querySelector('[role="alert"]')!.getBoundingClientRect(), pane = el.getBoundingClientRect(); return { top: el.scrollTop, bottom: error.bottom, paneBottom: pane.bottom, paneTop: pane.top, errorTop: error.top, documentTop: document.scrollingElement!.scrollTop, settingsTop: document.querySelector('.mh-page')!.scrollTop }; });
-    const geometry = JSON.parse((await body.getAttribute("data-reveal-geometry"))!);
+    const geometry = JSON.parse((await body.getAttribute("data-reveal-geometry")) ?? "null");
     await test.info().attach("error-reveal-geometry", { body: JSON.stringify({ before, geometry, reveal }), contentType: "application/json" });
     console.log("OpenPGP error reveal geometry", JSON.stringify({ before, geometry, reveal }));
     // Chromium may anchor the pane when the error grows, during the geometry
     // read itself. The explicit reveal must add exactly the remaining clip to
     // that native position, never reset the pane or add a fixed offset.
-    expect(geometry.before).toBeGreaterThanOrEqual(before); expect(geometry.clipped).toBeGreaterThan(0);
-    expect(geometry.requested).toBe(geometry.before + geometry.clipped);
-    expect(reveal.top).toBe(Math.round(geometry.requested));
-    expect(Math.round(reveal.bottom)).toBe(Math.round(reveal.paneBottom));
+    if (anchoring === "clipped") expect(geometry).not.toBeNull();
+    if (geometry) {
+      expect(geometry.before).toBeGreaterThanOrEqual(before); expect(geometry.clipped).toBeGreaterThan(0);
+      expect(geometry.requested).toBe(geometry.before + geometry.clipped);
+      expect(reveal.top).toBe(Math.round(geometry.requested));
+      expect(Math.round(reveal.bottom)).toBe(Math.round(reveal.paneBottom));
+    }
+    // No setter is needed if native anchoring already exposed the whole alert.
+    expect(reveal.top).toBeGreaterThanOrEqual(before);
+    expect(Math.round(reveal.bottom)).toBeLessThanOrEqual(Math.round(reveal.paneBottom));
     expect(reveal.errorTop).toBeGreaterThanOrEqual(reveal.paneTop);
     expect(reveal.documentTop).toBe(0); expect(reveal.settingsTop).toBe(0);
     expect(await activeTask(page).evaluate(el => el.contains(document.activeElement))).toBe(true);
+    await body.evaluate(el => { delete (el as unknown as { scrollTop?: number }).scrollTop; });
     await page.keyboard.press("Tab"); expect(await activeTask(page).evaluate(el => el.contains(document.activeElement))).toBe(true);
     await control(request, "setToolState", ["gpg", "ready"]); await page.getByLabel("Passphrase", { exact: true }).fill("DISPOSABLE-SIGNER"); await button(page, "Generate").click();
     await expect(page.getByRole("heading", { name: "Exceptional signer", exact: true })).toBeVisible();

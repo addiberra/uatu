@@ -89,7 +89,7 @@ Use `--bun` and check the discovered test count. The server expects port 4703
 (override with `UATU_MOBILE_REVIEW_PORT`) and refuses reuse: stop the interactive
 reviewer first or select a free port.
 
-The current CI selection is **410 tests: 205 per engine across 35 source files**.
+The current CI selection is **412 tests: 206 per engine across 35 source files**.
 It retains navigation/history, workspace continuity, clone/credential lifecycle,
 keyboard/accessibility, layout/motion, preview, and gallery behavior assertions,
 including functional tests that also capture screenshots. Explicit exclusions:
@@ -107,6 +107,22 @@ This verifies real frontend clients against synthetic protocols, not live backen
 integration, screenshot goldens, visual approval, or a complete full-app matrix.
 Linux CI is the browser-verification path when macOS WebKit animation frames are
 blocked by a locked desktop; listing tests locally is not evidence they passed.
+
+Target the three failure clusters from run `39263570778` without changing the
+workflow or running the unrelated main E2E projects:
+
+```sh
+CI=true bunx --bun --no-install playwright test --config playwright.mobile-hub-review.config.ts --project=chromium --project=webkit compact-gallery.e2e.ts exceptional.e2e.ts workspace-details.e2e.ts --grep 'Settings overview|OpenPGP generation|enlarged text'
+```
+
+Settings gallery capture checks the counted Repository credentials destination
+without opening it or mutating the backend. OpenPGP error tests retain natural
+scroll anchoring and separately force a clipped pane to verify the exact reveal
+delta; unit tests also cover nonzero scroll positions and already-visible errors
+that require no scroll write. Enlarged-text stress waits for measured dock
+clearance before the final scroll and records initial, settled and final geometry
+(including on assertion failure). This distinguishes reflow/scroll ordering from
+actual overflow or unreachable actions without relaxing their geometry checks.
 
 Generated screenshots and native JSON reports stay in ignored local outputs:
 `results/artifacts/`, ordinary Playwright output directories, or legacy `evidence/`

@@ -87,6 +87,22 @@ for (const kind of ["flow", "sheet"]) test(`${kind} action error reveals only it
   expect(alert.textContent).toBe("Invalid input");
 });
 
+for (const kind of ["flow", "sheet"]) for (const geometry of [
+  { name: "below", top: 1000, bottom: 1040, expected: 865, writes: 1 },
+  { name: "above", top: -40, bottom: 0, expected: 85, writes: 1 },
+  { name: "already visible", top: 100, bottom: 140, expected: 125, writes: 0 },
+]) test(`${kind} ${geometry.name} error adds only the remaining clip to a nonzero scroll position`, () => {
+  const { document } = parseHTML(`<html><body><section><div class="mh-${kind === "flow" ? "flow-content" : "sheet-body"}"><p class="mh-${kind}-error" role="alert"></p></div></section></body></html>`);
+  const region = document.querySelector("section")! as unknown as HTMLElement;
+  const pane = region.firstElementChild as HTMLElement, alert = pane.querySelector<HTMLElement>("[role=alert]")!;
+  let scroll = 125, writes = 0;
+  Object.defineProperty(pane, "scrollTop", { get: () => scroll, set: value => { scroll = value; writes++; } });
+  pane.getBoundingClientRect = () => ({ top: 0, bottom: 300 }) as DOMRect;
+  alert.getBoundingClientRect = () => ({ top: geometry.top, bottom: geometry.bottom }) as DOMRect;
+  showContextualError(region, "Invalid input", { reveal: true });
+  expect(scroll).toBe(geometry.expected); expect(writes).toBe(geometry.writes);
+});
+
 test("a replaced mutation context does not reveal an old failure in the next form", async () => {
   const { document } = parseHTML('<html><body><section><p class="mh-flow-error" role="alert"></p></section></body></html>');
   const root = document.querySelector("section")! as unknown as HTMLElement;
