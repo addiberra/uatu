@@ -735,6 +735,23 @@ export function initChat(api = new ChatApiClient()): void {
   const announce = announcerFor(state);
   const announceChild = announcerFor(drilldownState);
 
+  // Step narration owns a live region of its own, beside each status line.
+  // The status line is shared with connection-interruption messaging, whose
+  // recovery affordance keys on the line's current text: a transient
+  // "Question 2 of 4" landed in it would strip the in-place Reconnect button
+  // while a stream is still down (and its clear() would not re-expose the
+  // owned message). Question steps are ambient, not actionable — they speak
+  // politely without displacing anything.
+  const stepAnnouncerFor = (target: HTMLElement | null): Announcer => {
+    const region = document.createElement("div");
+    region.className = "sr-only";
+    region.setAttribute("aria-live", "polite");
+    target?.parentNode?.insertBefore(region, target.nextSibling);
+    return announcerFor(region);
+  };
+  const announceQuestionStep = stepAnnouncerFor(state);
+  const announceQuestionStepChild = stepAnnouncerFor(drilldownState);
+
   // Connection-interruption messaging has a dedicated owner, PER STREAM. The
   // status line is shared with provider outages, validation refusals, and turn
   // failures — all of which the user still has to act on — so a reconnect may
@@ -3631,9 +3648,10 @@ export function initChat(api = new ChatApiClient()): void {
     // panel swapping above the focus point, a screen-reader user otherwise
     // hears nothing while the question under their hands changes. Spoken to
     // the surface that owns the form — answering from a subagent drill-down
-    // must update the child's status line, not displace the parent's.
-    const announceQuestionStep = (source: ChatProjection, form: HTMLFormElement) => {
-      const speak = announceFailureFor(source);
+    // announces beside that surface's status line, never into it, so a
+    // connection-interruption message and its Reconnect button stand.
+    const speakQuestionStep = (source: ChatProjection, form: HTMLFormElement) => {
+      const speak = source.conversationId === (child?.conversationId ?? null) ? announceQuestionStepChild : announceQuestionStep;
       const panels = [...form.querySelectorAll<HTMLElement>("[data-question-panel]")];
       const activeIndex = Math.max(0, panels.findIndex(panel => !panel.hidden));
       const label = panels[activeIndex]?.querySelector(".chat-question-step")?.textContent?.trim().replace(/\s+/g, " ");
@@ -3676,7 +3694,7 @@ export function initChat(api = new ChatApiClient()): void {
       if (!tab?.form) return;
       showQuestionPanel(tab.form, Number(tab.dataset.questionTab));
       const source = sourceProjection();
-      if (source) announceQuestionStep(source, tab.form);
+      if (source) speakQuestionStep(source, tab.form);
     });
     container.addEventListener("submit", event => {
       const questionForm = event.target as HTMLFormElement;
@@ -3691,7 +3709,7 @@ export function initChat(api = new ChatApiClient()): void {
       // button is "Next" here, so submitting the form means "go on".
       if (activeIndex < panels.length - 1) {
         showQuestionPanel(questionForm, activeIndex + 1);
-        announceQuestionStep(source, questionForm);
+        speakQuestionStep(source, questionForm);
         return;
       }
       const answers = collectQuestionAnswers(questionForm);
