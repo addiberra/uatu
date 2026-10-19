@@ -118,6 +118,10 @@ jobs:
             code=false
             while IFS= read -r file; do
               case "$file" in
+                .github/workflows/ci.yml)
+                  # Changes to this gate must exercise the jobs it controls.
+                  code=true
+                  ;;
                 docs/*|openspec/*|.claude/*|.opencode/*|desktop/macos/*|ARCHITECTURE.md|CHANGELOG.md|CLAUDE.md|CONTRIBUTING.md|README.md|SECURITY.md|LICENSE|LICENSES/*|.github/*)
                   ;;
                 *)
@@ -315,6 +319,66 @@ jobs:
           path: test-results
           if-no-files-found: ignore
 
+  mobile-functional:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.2
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Resolve Playwright version
+        id: playwright
+        run: echo "version=$(jq -r .version node_modules/playwright-core/package.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore Playwright Chromium and WebKit
+        id: browsers
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ runner.arch }}-${{ steps.playwright.outputs.version }}-chromium-webkit
+
+      - name: Install Playwright Chromium and WebKit
+        if: steps.browsers.outputs.cache-hit != 'true'
+        run: bunx playwright install --with-deps chromium webkit
+
+      - name: Install Playwright system dependencies
+        if: steps.browsers.outputs.cache-hit == 'true'
+        run: bunx playwright install-deps chromium webkit
+
+      - name: Save Playwright Chromium and WebKit
+        if: steps.browsers.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ steps.browsers.outputs.cache-primary-key }}
+
+      - name: Run mobile Hub functional tests in Chromium and WebKit
+        # The harness imports Bun file assets; Node cannot collect these tests.
+        # One worker preserves ownership of the shared synthetic backend.
+        run: bunx --bun --no-install playwright test --config playwright.mobile-hub-review.config.ts --project=chromium --project=webkit
+
+      - name: Upload mobile functional results on failure
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mobile-functional-results
+          path: tests/mobile-hub-review/results
+          retention-days: 3
+          if-no-files-found: ignore
+
   e2e-report:
     needs: [changes, e2e]
     # Only a failed run needs the HTML report, as before the split.
@@ -359,7 +423,7 @@ jobs:
   # only when every one of them passed, or all were skipped for a change
   # that touches no code.
   validate:
-    needs: [changes, unit, e2e]
+    needs: [changes, unit, e2e, mobile-functional]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -371,6 +435,7 @@ jobs:
           CODE: ${{ needs.changes.outputs.code }}
           UNIT: ${{ needs.unit.result }}
           E2E: ${{ needs.e2e.result }}
+          MOBILE_FUNCTIONAL: ${{ needs.mobile-functional.result }}
         run: |
           if [ "$CHANGES" != "success" ]; then
             echo "::error::Change classification finished '$CHANGES'."
@@ -378,7 +443,7 @@ jobs:
           fi
           if [ "$CODE" = "true" ]; then expected=success; else expected=skipped; fi
           failed=0
-          for job in "unit:$UNIT" "e2e:$E2E"; do
+          for job in "unit:$UNIT" "e2e:$E2E" "mobile-functional:$MOBILE_FUNCTIONAL"; do
             if [ "${job#*:}" != "$expected" ]; then
               echo "::error::Job ${job%%:*} finished '${job#*:}', expected '$expected'."
               failed=1

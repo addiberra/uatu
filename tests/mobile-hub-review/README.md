@@ -63,10 +63,50 @@ bunx --no-install playwright test --config tests/mobile-hub-review/compact-galle
 ```
 
 These focused browser configurations own disposable test ports, not the published
-reviewer. Run one suite at a time against shared fixtures. The older top-level
-`playwright.mobile-hub-review.config.ts` expects port 4703 and must not run while
-the interactive reviewer owns it; it includes historical/opt-in workflows and is
-not a claim of a currently complete full-app matrix.
+reviewer. Run one suite at a time against shared fixtures.
+
+### Chromium and WebKit functional CI
+
+The separate Ubuntu `mobile-functional` job in `.github/workflows/ci.yml` runs
+`playwright.mobile-hub-review.config.ts`, outside the main E2E configuration.
+It is required by `validate` for code changes, including edits to the CI workflow
+itself; changes classified as documentation-only skip it. Existing
+`workflow_dispatch` also runs it on the selected branch. The job uses the locked dependencies and the same
+Chromium/WebKit install and cache as the main E2E job, with a 30-minute job limit,
+one worker, no retries, and failure artifacts named `mobile-functional-results`
+(HTML report, traces and test output; retained for three days).
+
+Run or list the same selection without installing dependencies:
+
+```sh
+CI=true bunx --bun --no-install playwright test --config playwright.mobile-hub-review.config.ts --project=chromium --project=webkit
+CI=true bunx --bun --no-install playwright test --config playwright.mobile-hub-review.config.ts --project=chromium --project=webkit --list
+```
+
+The Bun runtime is required for file-asset imports in this harness; Node-based
+Playwright discovery can report import errors and zero tests while exiting successfully.
+Use `--bun` and check the discovered test count. The server expects port 4703
+(override with `UATU_MOBILE_REVIEW_PORT`) and refuses reuse: stop the interactive
+reviewer first or select a free port.
+
+The current CI selection is **410 tests: 205 per engine across 35 source files**.
+It retains navigation/history, workspace continuity, clone/credential lifecycle,
+keyboard/accessibility, layout/motion, preview, and gallery behavior assertions,
+including functional tests that also capture screenshots. Explicit exclusions:
+
+- `visual.e2e.ts` and `responsive.e2e.ts`: standalone diagnostic/evidence runners,
+  not registered Playwright tests (zero discovered cases).
+- `reference flow visual batch: …` in `workspace-reference-flow.e2e.ts` and
+  `existing-folder visual batch: …` in `existing-folder-reference-flow.e2e.ts`:
+  two opt-in screenshot-generation cases per engine, not functional gates. Their
+  neighboring functional cases remain included. Without `CI`, the top-level
+  configuration still discovers these opt-in batches for deliberate capture with
+  `UATU_REFERENCE_EVIDENCE` or `UATU_EXISTING_EVIDENCE`.
+
+This verifies real frontend clients against synthetic protocols, not live backend
+integration, screenshot goldens, visual approval, or a complete full-app matrix.
+Linux CI is the browser-verification path when macOS WebKit animation frames are
+blocked by a locked desktop; listing tests locally is not evidence they passed.
 
 Generated screenshots and native JSON reports stay in ignored local outputs:
 `results/artifacts/`, ordinary Playwright output directories, or legacy `evidence/`
