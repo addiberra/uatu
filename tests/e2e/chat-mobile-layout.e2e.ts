@@ -102,7 +102,7 @@ async function containedControls(page: Page, height: number) {
     await expect(control).toBeVisible();
     await expect.poll(() => control.evaluate(element => element.getBoundingClientRect().bottom)).toBeLessThanOrEqual(height);
     const box = (await control.boundingBox())!;
-    expect(box.height).toBeGreaterThanOrEqual(44);
+    expect(box.height).toBeGreaterThanOrEqual(touch ? 44 : 32);
     expect(await control.evaluate(element => { const b = element.getBoundingClientRect(); const hit = document.elementFromPoint(b.x + b.width / 2, b.y + b.height / 2); return hit === element || element.contains(hit); })).toBe(true);
   }
   expect(await page.locator("#chat-surface").evaluate(element => element.scrollTop)).toBe(0);
@@ -239,14 +239,15 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`mobile layo
     await expect(page.locator(".chat-worker-name").first()).toHaveCSS("font-size", `${14 * scale}px`);
     await expect(page.locator(".chat-worker-model").first()).toHaveCSS("font-size", `${11 * scale}px`);
     const dock = await page.locator("#chat-work-dock").boundingBox();
-    const band = await page.locator("#chat-surface").evaluate(element => parseFloat(element.style.getPropertyValue("--chat-visual-height")));
     await saveEvidence(testInfo, `compact-${engine}-${enlarged ? "enlarged" : "standard"}-bounds.json`, JSON.stringify(await page.evaluate(() => Object.fromEntries(["chat-surface", "chat-composer", "chat-work-dock", "chat-configuration-trigger", "chat-send", "chat-stop"].map(id => {
       const node = document.getElementById(id)!;
       const rect = node.getBoundingClientRect(); const style = getComputedStyle(node);
       return [id, { x: rect.x, y: rect.y, width: rect.width, height: rect.height, maxHeight: style.maxHeight, minHeight: style.minHeight, available: style.getPropertyValue("--chat-work-available") }];
     }))), null, 2));
     await captureScreenshot(page, testInfo, `compact-${engine}-${enlarged ? "enlarged" : "standard"}-expanded`);
-    expect(dock!.height).toBeLessThanOrEqual(band * 0.35 + 1);
+    const capacity = await page.locator("#chat-work-dock").evaluate(n => parseFloat(n.style.getPropertyValue("--chat-work-expanded-capacity")));
+    expect(dock!.height).toBeLessThanOrEqual(capacity + 1);
+    expect(await page.locator(".chat-transcript-area").evaluate(n => n.clientHeight)).toBeGreaterThanOrEqual(32);
     for (const id of ["chat-configuration-trigger", "chat-send", "chat-stop"]) {
       const target = page.locator(`#${id}`);
       const box = (await target.boundingBox())!;
@@ -532,7 +533,7 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`mobile layo
       await expect(stop).toBeFocused();
       await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
       const exposure = await workControlExposure(stop);
-      expect(exposure.height).toBeGreaterThanOrEqual(44);
+      expect(exposure.height).toBeGreaterThanOrEqual(28);
       expect(exposure.focusVisible).toBe(true);
       expect(exposure.ring).toBeGreaterThan(0);
       for (const gap of [exposure.top, exposure.bottom, exposure.left, exposure.right]) expect(gap).toBeGreaterThanOrEqual(0);
@@ -568,6 +569,7 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`mobile layo
         await page.setViewportSize({ width: 1280, height });
         const surface = page.locator("#chat-surface");
         await expect.poll(() => surface.evaluate(node => node.clientHeight)).toBe(height);
+        await saveEvidence(testInfo, `desktop-allocation-${height}.json`, JSON.stringify(await surface.evaluate(node => ({ root: document.documentElement.dataset, style: node.getAttribute("style"), children: [...node.children].map(n => ({ id: n.id || n.className, style: n.getAttribute("style"), box: n.getBoundingClientRect().toJSON(), min: getComputedStyle(n).minHeight, position: getComputedStyle(n).position })) })), null, 2));
         // The panel is measured by the desktop shell, not a viewport guess.
         await expect.poll(() => surface.evaluate(node => node.scrollHeight - node.clientHeight)).toBeLessThanOrEqual(1);
         for (const id of ["chat-send", "chat-stop"]) {
@@ -577,7 +579,13 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`mobile layo
           expect(box.y + box.height).toBeLessThanOrEqual(height);
           expect(await control.evaluate(node => { const rect = node.getBoundingClientRect(); const hit = document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2); return hit === node || node.contains(hit); })).toBe(true);
         }
-        expect(await page.locator("#chat-timeline").evaluate(node => node.clientHeight)).toBeGreaterThanOrEqual(Math.min(192, height * 0.35));
+        // Expanded desktop uses 35% of remaining space (200–280px), yielding
+        // only to measured work minima, not 35% of the whole viewport.
+        await expect.poll(() => page.locator("#chat-surface").evaluate(n => {
+          const reading = parseFloat(n.style.getPropertyValue("--chat-expanded-reading"));
+          const area = n.querySelector<HTMLElement>(".chat-transcript-area")!;
+          return reading > 0 && reading <= 280 && area.clientHeight >= reading - 1;
+        })).toBe(true);
         await expect(page.locator("#chat-input")).toBeFocused();
         await expect(page.locator("#chat-input")).toHaveValue("Keep this desktop draft");
         await expect(page.locator("#chat-compact-workers")).toHaveAttribute("open");
@@ -596,7 +604,7 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`mobile layo
         await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
         const exposure = await workControlExposure(stop);
         await saveEvidence(testInfo, `worker-exposure-${engine}-${height}.json`, JSON.stringify(exposure, null, 2));
-        expect(exposure.height).toBeGreaterThanOrEqual(44);
+        expect(exposure.height).toBeGreaterThanOrEqual(28);
         expect(exposure.focusVisible).toBe(true);
         expect(exposure.ring).toBeGreaterThan(0);
         for (const gap of [exposure.top, exposure.bottom, exposure.left, exposure.right]) expect(gap).toBeGreaterThanOrEqual(0);

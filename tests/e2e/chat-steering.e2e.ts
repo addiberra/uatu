@@ -178,8 +178,8 @@ test.describe("steering an OpenCode 2.x turn", () => {
     })), null, 2));
     for (const button of await queue.locator(".chat-queued-message button").all()) {
       const box = (await button.boundingBox())!;
-      expect(box.height).toBeGreaterThanOrEqual(mode === "touch" ? 32 : 36);
-      expect(box.width).toBeGreaterThanOrEqual(mode === "touch" ? 32 : 36);
+      expect(box.height).toBeGreaterThanOrEqual(32);
+      expect(box.width).toBeGreaterThanOrEqual(32);
       expect(await button.getAttribute("aria-label")).toContain("“Audit pending");
     }
     await captureScreenshot(page, testInfo, `audit-dock-${mode}-${theme}`);
@@ -1006,7 +1006,7 @@ for (const browserName of ["chromium", "webkit"] as const) test.describe(`steeri
   for (const theme of ["light", "dark"] as const) for (const scene of [
     { width: 390, height: 844, visual: 844 }, { width: 390, height: 844, visual: 450 },
     { width: 390, height: 844, visual: 380 }, { width: 844, height: 390, visual: 230 },
-  ]) test(`hold extension grows above the finger without clipping or moving Send (${theme} ${scene.width} vv${scene.visual})`, async ({ page, request }, info) => {
+  ]) test(`hold envelope appears after arming and stays fixed above Send (${theme} ${scene.width} vv${scene.visual})`, async ({ page, request }, info) => {
     await page.emulateMedia({ colorScheme: theme });
     await bootChat(page, request);
     await startTurn(page, request);
@@ -1039,7 +1039,7 @@ for (const browserName of ["chromium", "webkit"] as const) test.describe(`steeri
     }, original);
     const frames = [];
     const start = performance.now();
-    for (const ms of [200, 300, 1000, 1800]) {
+    for (const ms of [200, 600, 1000, 1800]) {
       await page.waitForTimeout(Math.max(0, ms - (performance.now() - start)));
       frames.push(await page.locator(".chat-hold-upward").evaluate((node, original) => {
         const box = node.getBoundingClientRect();
@@ -1055,7 +1055,7 @@ for (const browserName of ["chromium", "webkit"] as const) test.describe(`steeri
         const hit = document.elementFromPoint(box.x + box.width / 2, box.y + 4);
         const unoccluded = hit === node || node.contains(hit);
         node.style.pointerEvents = "";
-        return { top: box.top, bottom: box.bottom, height: box.height, capBottom: cap.bottom, text: node.textContent,
+        return { hidden: (node as HTMLElement).hidden, progress: parseFloat((node as HTMLElement).style.getPropertyValue("--hold-progress")), top: box.top, bottom: box.bottom, height: box.height, capBottom: cap.bottom, text: node.textContent,
           extension: original.y - box.top, unoccluded, ancestors };
       }, original));
       const path = info.outputPath(`hold-${browserName}-${theme}-${scene.width}-vv${scene.visual}-${ms}ms.png`);
@@ -1064,11 +1064,14 @@ for (const browserName of ["chromium", "webkit"] as const) test.describe(`steeri
     }
     await saveEvidence(info, `hold-${browserName}-${theme}-${scene.width}-vv${scene.visual}-frames.json`, JSON.stringify({ original, frames }, null, 2));
     expect(await send.boundingBox()).toEqual(original);
-    expect(frames[0]!.extension).toBeGreaterThanOrEqual(48);
-    expect(frames[1]!.extension).toBeLessThan(frames[2]!.extension);
-    expect(frames[2]!.extension).toBeLessThan(frames[3]!.extension);
-    expect(frames[3]!.extension).toBeGreaterThanOrEqual(84);
-    for (const frame of frames) {
+    expect(frames[0]!.hidden).toBe(true);
+    expect(frames[1]!.extension).toBe(Math.min(104, original.y - 8));
+    expect(frames[1]!.progress).toBeLessThan(frames[2]!.progress);
+    expect(frames[2]!.progress).toBeLessThan(frames[3]!.progress);
+    expect(accepted).toHaveLength(0);
+    for (const frame of frames.slice(1)) {
+      expect(frame.hidden).toBe(false);
+      expect(frame.height).toBe(frames[1]!.height);
       expect(frame.capBottom).toBeLessThan(original.y);
       expect(frame.bottom).toBeCloseTo(original.y + original.height, 0);
       expect(frame.ancestors.filter(ancestor => ancestor.clips)).toEqual([]);

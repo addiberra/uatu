@@ -230,7 +230,17 @@ With either card expanded, the dock SHALL use the remaining measured panel heigh
 - **THEN** the expanded measured budget supersedes the collapsed hardware-editing cap, making complete entries/actions visible wherever the remaining capacity permits
 - **AND** short or collapsed cards return unused height to the transcript
 
-Physically insufficient space SHALL prioritize a whole actionable row in the explicitly focused/touched pane while retaining both headers and the unobstructed composer. The existing explicit desktop Show work fallback MAY cover the chat header but SHALL NOT overlap the composer. Disclosure state, keyed controls, focus and independent reading offsets SHALL survive unrelated worker/pending updates. Replacement warnings SHALL reveal once inside the pending pane, never by scrolling the shared dock.
+Physically insufficient space SHALL prioritize a whole actionable row in the explicitly focused/touched pane while retaining both headers and the unobstructed composer. The emergency transcript strip MAY yield to zero to fit those measured minima. If primary chrome, both whole headers and that action still physically exceed the visual band, native vertical outer scrolling SHALL expose the controls without shrinking enlarged type: the touch surface or the explicit desktop overlay region. This physical-minimum exception supersedes the unconditional no-outer-scroll statements above; card bodies SHALL retain independent scrollports and touch SHALL NOT add Show work. The existing explicit desktop Show work fallback MAY cover the chat header but SHALL NOT overlap the composer; its own available region SHALL include Close work and all margins/gaps in its allocation. Disclosure state, keyed controls, focus and independent reading offsets SHALL survive unrelated worker/pending updates. Replacement warnings SHALL reveal once inside the pending pane, never by scrolling the shared dock in fitting geometry.
+
+#### Scenario: Enlarged physical minima exceed the visual band
+- **WHEN** 200% text at 390px width has only a 200px visual band and measured chrome, both headers and a whole selected action cannot fit
+- **THEN** native vertical surface scrolling exposes both cards and composer actions without reducing text, hiding a header or forcing a touch overlay
+- **AND** each card body retains its own scrollport and native header activation selects its actionable body without programmatic focus assistance
+- **AND** while this measured exception is active, viewport and foreground resync preserve native surface scrolling and keyboard focus reveal; when it ends, normal zero-offset surface behavior resumes
+
+#### Scenario: Enlarged explicit desktop work owns its budget
+- **WHEN** Show work opens with 200% text and twenty workers and pending messages at 1100×700 or 1440×480
+- **THEN** its measured region above the composer budgets Close work, both headers and independently scrolling action panes, using outer overlay scrolling only if their physical minima cannot fit
 
 #### Scenario: Independent saturated work cards
 - **WHEN** twenty workers and twenty pending messages coexist in any of the four disclosure combinations, including enlarged text

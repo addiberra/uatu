@@ -3550,11 +3550,16 @@ export function initChat(api = new ChatApiClient()): void {
   });
 
   function syncQueueOverflow() {
-    if (!queueDockElement) return;
+    if (!queueDockElement || !surface) return;
     const scroller = queueDockElement.parentElement!;
     // Both cards retain their own header and content pane. Preserve the last
     // measurement while desktop's constrained dock is hidden.
-    if (typeof getComputedStyle === "function" && getComputedStyle(scroller).display === "none") return;
+    if (typeof getComputedStyle === "function" && getComputedStyle(scroller).display === "none") {
+      // Hidden desktop work retains its intrinsic card measurements, but its
+      // inline reading allocation must still follow a resized panel.
+      syncExpandedWorkBudget(scroller, parseFloat(scroller.style.getPropertyValue("--chat-work-full-floor")) || 0);
+      return;
+    }
     const workerHeading = compactWorkersList?.hidden ? null : compactWorkersList?.querySelector("summary");
     const pendingHeading = queueDockElement.hidden ? null : queueDockElement.querySelector(".chat-queue-header");
     const workerHeight = workerHeading?.getBoundingClientRect().height ?? 0;
@@ -3607,7 +3612,11 @@ export function initChat(api = new ChatApiClient()): void {
     const gapCount = Math.max(0, cardCount - 1);
     const normalGap = parseFloat(dockCss.getPropertyValue("--chat-work-gap-base")) || 0;
     const padding = (parseFloat(dockCss.paddingTop) || 0) + (parseFloat(dockCss.paddingBottom) || 0);
-    const fullFloor = workerFloor + queueFloor + gapCount * normalGap + padding + extraHeight;
+    const close = scroller.querySelector<HTMLElement>("#chat-work-close");
+    const closeCss = close && !close.hidden ? getComputedStyle(close) : null;
+    const closeHeight = closeCss && closeCss.display !== "none"
+      ? close!.getBoundingClientRect().height + (parseFloat(closeCss.marginTop) || 0) + (parseFloat(closeCss.marginBottom) || 0) + normalGap : 0;
+    const fullFloor = workerFloor + queueFloor + gapCount * normalGap + padding + extraHeight + closeHeight;
     set("--chat-work-full-floor", fullFloor);
     syncExpandedWorkBudget(scroller, fullFloor);
     const hardAvailable = parseFloat(scroller.style.getPropertyValue("--chat-work-hard-available"));
@@ -3615,7 +3624,7 @@ export function initChat(api = new ChatApiClient()): void {
       && Number.isFinite(hardAvailable) && fullFloor > hardAvailable;
     scroller.toggleAttribute("data-work-cramped", cramped);
     const active = scroller.dataset.workActive;
-    const effectiveExtras = cramped && active !== "history" ? extraHeadings : extraHeight;
+    const effectiveExtras = (cramped && active !== "history" ? extraHeadings : extraHeight) + closeHeight;
     // Keep the whole warning wherever it fits. Only a genuinely insufficient
     // band scrolls warning lines, while retaining one complete action target.
     const queueCompactFloor = cramped
@@ -3634,6 +3643,18 @@ export function initChat(api = new ChatApiClient()): void {
     set("--chat-work-floor", cramped
       ? selectedCore + gaps
       : fullFloor);
+    if (cramped && document.documentElement.dataset.uiMode === "touch" && scroller.hasAttribute("data-work-content-expanded")) {
+      const reading = Math.max(0, Math.min(parseFloat(surface.style.getPropertyValue("--chat-expanded-reading")) || 0, hardAvailable - selectedCore - gaps));
+      surface.style.setProperty("--chat-expanded-reading", `${reading}px`);
+      set("--chat-work-expanded-capacity", Math.max(0, hardAvailable - reading));
+    }
+    // When primary chrome plus whole headers/action targets physically exceed
+    // the visual band, use native outer scrolling rather than clipping cards
+    // or shrinking enlarged text. Each body keeps its independent scrollport.
+    surface.toggleAttribute("data-work-overflow", document.documentElement.dataset.uiMode === "touch"
+      && Number.isFinite(hardAvailable) && selectedCore + gaps > hardAvailable + 1);
+    scroller.toggleAttribute("data-work-region-overflow", document.documentElement.hasAttribute("data-chat-work-expanded")
+      && Number.isFinite(hardAvailable) && selectedCore + gaps > hardAvailable + 1);
     scroller.classList.remove("has-more-below");
     queueDockElement.classList.toggle("has-more-below", !!queueContent && queueContent.scrollHeight - queueContent.clientHeight - queueContent.scrollTop > 1);
   }
@@ -5223,10 +5244,11 @@ export function initChat(api = new ChatApiClient()): void {
   workDock?.addEventListener("click", prioritizeWorkPane, true);
   function syncExpandedWorkBudget(dock: HTMLElement, minimumWork: number) {
     if (!surface || !queueDockElement || typeof getComputedStyle !== "function") return;
+    const overlay = document.documentElement.hasAttribute("data-chat-work-expanded");
     const expanded = !!compactWorkersList?.open && !compactWorkersList.hidden
       || !queueDockElement.hidden && queueDockElement.dataset.expanded === "true";
     dock.toggleAttribute("data-work-content-expanded", expanded);
-    if (!expanded) {
+    if (!expanded && !overlay) {
       dock.style.removeProperty("--chat-work-expanded-capacity");
       surface.style.removeProperty("--chat-expanded-reading");
       return;
@@ -5239,10 +5261,13 @@ export function initChat(api = new ChatApiClient()): void {
       return height + child.getBoundingClientRect().height + (parseFloat(style.marginTop) || 0) + (parseFloat(style.marginBottom) || 0);
     }, (parseFloat(css.paddingTop) || 0) + (parseFloat(css.paddingBottom) || 0));
     const compactDesktop = document.documentElement.dataset.uiMode === "desktop" && window.matchMedia("(pointer: fine) and (hover: hover)").matches;
-    const { reading, capacity } = expandedWorkBudget(surface.clientHeight - fixed, minimumWork, compactDesktop ? "desktop" : "comfortable");
+    const { reading, capacity: inlineCapacity } = expandedWorkBudget(surface.clientHeight - fixed, minimumWork, compactDesktop ? "desktop" : "comfortable");
+    const capacity = overlay && form
+      ? Math.max(0, form.getBoundingClientRect().top - surface.getBoundingClientRect().top)
+      : inlineCapacity;
     for (const [element, property, value] of [
       [dock, "--chat-work-expanded-capacity", capacity],
-      [dock, "--chat-work-hard-available", capacity],
+      [dock, "--chat-work-hard-available", overlay ? capacity : Math.max(0, surface.clientHeight - fixed)],
       [surface, "--chat-expanded-reading", reading],
     ] as const) {
       const pixels = `${value}px`;
@@ -5263,7 +5288,7 @@ export function initChat(api = new ChatApiClient()): void {
       toggle.hidden = close.hidden = true;
       return;
     }
-    if (!dock.hasAttribute("data-work-content-expanded")) dock.style.removeProperty("--chat-work-hard-available");
+    if (!dock.hasAttribute("data-work-content-expanded") && !root.hasAttribute("data-chat-work-expanded")) dock.style.removeProperty("--chat-work-hard-available");
     dock.style.removeProperty("--chat-work-available");
     const hasWork = [...dock.children].some(child => child !== close && !(child as HTMLElement).hidden && getComputedStyle(child).display !== "none");
     root.toggleAttribute("data-chat-has-work", hasWork);
@@ -5289,18 +5314,19 @@ export function initChat(api = new ChatApiClient()): void {
     toggle.setAttribute("aria-expanded", String(open));
     if (desktop) {
       dock.style.setProperty("--chat-workers-bottom", `${surface.getBoundingClientRect().bottom - form.getBoundingClientRect().top}px`);
-      if (open) dock.style.setProperty("--chat-work-hard-available", `${Math.max(0, surface.clientHeight - (surface.getBoundingClientRect().bottom - form.getBoundingClientRect().top) - 60)}px`);
     }
   }
   const expandDesktopWork = (focus = true) => {
     if (!document.documentElement.hasAttribute("data-chat-work-constrained")) return;
     document.documentElement.setAttribute("data-chat-work-expanded", "");
     syncDesktopWorkLayout();
+    syncQueueOverflow();
     if (focus) surface.querySelector<HTMLElement>("#chat-work-close")?.focus({ preventScroll: true });
   };
   const closeDesktopWork = () => {
     document.documentElement.removeAttribute("data-chat-work-expanded");
     syncDesktopWorkLayout();
+    syncQueueOverflow();
     surface.querySelector<HTMLElement>("#chat-work-toggle")?.focus({ preventScroll: true });
   };
   surface.querySelector("#chat-work-toggle")?.addEventListener("click", () => expandDesktopWork());
@@ -5392,6 +5418,8 @@ export function initChat(api = new ChatApiClient()): void {
     childScroll?.request();
   }) : null;
   observer?.observe(items);
+  // A hidden constrained dock cannot signal panel resizing itself.
+  observer?.observe(surface);
   observer?.observe(timeline);
   observer?.observe(queueDockElement);
   observer?.observe(form);

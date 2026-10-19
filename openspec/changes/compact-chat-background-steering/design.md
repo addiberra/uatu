@@ -108,6 +108,22 @@ both headers and a whole selected action. Pending saves disclosure scroll
 positions in a bounded, conversation-keyed session map and restores after the
 pane's final allocation, without replaying a deferred reset over a user's scroll.
 
+**Physical-minimum amendment.** Measure desktop Show work against its own region
+above the composer, including Close work, its margins and inter-row spacing;
+never reuse inline expanded capacity for that overlay. When the selected whole
+action plus both headers fits, the emergency transcript strip may yield to zero.
+Short portrait uses the same 44px physical input/control chrome as short landscape,
+without reducing enlarged type. Only when chrome, both whole headers and the
+selected action still physically exceed the visual band may native vertical outer
+scrolling expose them: the touch surface, or desktop's explicit overlay region.
+This narrow exception supersedes unconditional no-outer-scroll statements; card
+bodies retain separate scrollports, no touch Show work is added, and no control
+is clipped or painted over the composer. Not all controls can remain simultaneously
+onscreen in that physically impossible case (notably 390px/200% in a 200px band).
+While this measured exception owns surface scrolling, the viewport controller
+preserves its native reader/focus offset through resize, pan and foreground
+resync; after the exception ends, normal zero-offset touch behavior resumes.
+
 The user's supplied B reference supersedes the critique attempt to pin both
 headings before the bodies. Desktop and touch share one canonical worker card:
 its real bordered disclosure contains its header and keyed rows. Legacy desktop

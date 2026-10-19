@@ -45,7 +45,7 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`canonical w
     } } })).ok()).toBe(true);
     await expect(page.locator("#chat-compact-workers-label")).toHaveText("1 finished");
     await summary.tap();
-    await expect(track.locator(".chat-worker-model")).toHaveText("gpt-6-astra");
+    await expect(track.locator(".chat-worker-model-name")).toHaveText("gpt-6-astra");
     await expect(track.locator(".chat-worker-tokens")).toHaveText("Σ 230k");
     for (const theme of ["light", "dark"] as const) for (const width of [390, 320]) {
       await page.emulateMedia({ colorScheme: theme });
@@ -55,12 +55,13 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`canonical w
         window.visualViewport!.dispatchEvent(new Event("resize"));
       }, width);
       await expect(track.locator("[data-worker-id]")).toHaveCount(1);
-      expect(await trackHeight(track)).toBeLessThanOrEqual(60);
+      expect(await trackHeight(track)).toBeLessThanOrEqual(width <= 360 ? 80 : 60);
       const header = (await summary.boundingBox())!;
       const action = (await dismiss.boundingBox())!;
       expect(action.y).toBe(header.y);
       expect(action.x).toBeGreaterThan(header.x + header.width / 2);
-      expect((await track.locator(".chat-worker-row").boundingBox())!.height).toBeLessThanOrEqual(28);
+      // Narrow phones retain model/effort/tokens on a second metadata line.
+      expect((await track.locator(".chat-worker-row").boundingBox())!.height).toBeLessThanOrEqual(width <= 360 ? 48 : 28);
       expect(await summary.evaluate(node => getComputedStyle(node, "::before").content)).toBe('""');
       await captureScreenshot(page, info, `workers-${engine}-${theme}-${width}-one-finished-20-hidden`);
     }
@@ -213,7 +214,10 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`canonical w
     await expect(track).not.toContainText("node --check");
     expect(await track.locator(".chat-worker-name").evaluateAll(nodes => [...new Set(nodes.map(node => getComputedStyle(node).fontSize))])).toEqual(["14px"]);
     expect(await track.locator(".chat-worker-meta").evaluateAll(nodes => [...new Set(nodes.map(node => getComputedStyle(node).fontSize))])).toEqual(["13px"]);
-    await expect.poll(() => page.locator("#chat-timeline").evaluate(node => node.clientHeight)).toBeGreaterThanOrEqual(844 * 0.4);
+    // Expanded cards reserve 20% of the remaining region, clamped to 32–96px,
+    // rather than the superseded 40% of the full visual viewport.
+    await expect.poll(() => page.locator("#chat-timeline").evaluate(node => node.clientHeight)).toBeGreaterThanOrEqual(32);
+    expect(await page.locator("#chat-surface").evaluate(n => parseFloat(n.style.getPropertyValue("--chat-expanded-reading")))).toBe(96);
     await captureScreenshot(page, info, `workers-${engine}-${theme}-active-first`);
     for (const row of await track.locator('[data-state="completed"], [data-state="failed"], [data-state="stopped"]').all()) {
       expect((await row.boundingBox())!.height).toBeLessThanOrEqual(28);
@@ -222,7 +226,7 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`canonical w
     const scrollContainers = await page.locator("#chat-work-dock").evaluate(node => [node, ...node.querySelectorAll("*")].filter(element => element.getBoundingClientRect().height > 0 && /auto|scroll/.test(getComputedStyle(element).overflowY)).map(element => element.id || element.className));
     expect(scrollContainers).toEqual(["chat-compact-workers-items"]);
     await captureScreenshot(page, info, `workers-${engine}-${theme}-history`);
-    await expect(track.locator('[data-worker-id="job:18"] .chat-worker-model')).toHaveText("GPT-6.1 Sol");
+    await expect(track.locator('[data-worker-id="job:18"] .chat-worker-model-name')).toHaveText("GPT-6.1 Sol");
     await expect(track.locator('[data-worker-id="job:18"] .chat-worker-tokens')).toHaveText("Σ 229k");
     await track.getByRole("button", { name: "Dismiss finished", exact: true }).tap();
     await expect(label).toHaveText("2 working");

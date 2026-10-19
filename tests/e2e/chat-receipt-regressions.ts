@@ -106,6 +106,9 @@ export const receiptRegressions = (trusted: boolean): void => test.describe(`${t
       else await route.fulfill({ status: 502, contentType: "application/json", body: '{"error":"Fixture acknowledgement lost"}' });
     }, { times: 1 });
     const button = action === "convert" ? page.locator("[data-queue-steer]") : action === "held-now" ? page.locator("[data-queue-send-now]").last() : page.getByRole("button", { name: "Send 1 paused steer now", exact: true });
+    const pending = page.locator("[data-pending-toggle]");
+    if (await pending.getAttribute("aria-expanded") === "false") await pending.click();
+    await expect(pending).toHaveAttribute("aria-expanded", "true");
     await button.click();
     await expect.poll(() => known).toBeTruthy();
     await expect(page.locator("#chat-action-feedback")).toContainText(/unconfirmed|could not be confirmed/i);

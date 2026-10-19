@@ -40,7 +40,13 @@ test.describe("chat message queue", () => {
     await expect(page.locator("#chat-send-help")).not.toContainText(/Steer|Hold Send|Alt\+Enter/);
     const configuration = (await page.locator("#chat-configuration-trigger").boundingBox())!;
     const sendGroup = (await page.locator("#chat-send-group").boundingBox())!;
-    expect(Math.abs(configuration.y + configuration.height / 2 - sendGroup.y - sendGroup.height / 2)).toBeLessThan(1);
+    // The responsive desktop composer may wrap its configuration onto its
+    // own row; both controls must stay inside the bounded composer.
+    const composer = (await page.locator("#chat-composer").boundingBox())!;
+    for (const box of [configuration, sendGroup]) {
+      expect(box.y).toBeGreaterThanOrEqual(composer.y);
+      expect(box.y + box.height).toBeLessThanOrEqual(composer.y + composer.height);
+    }
     await page.locator("#chat-input").fill("Queue by clicking Send");
     const accepted = page.waitForResponse(response => response.url().endsWith("/prompts"));
     await page.getByRole("button", { name: "Queue message", exact: true }).click();

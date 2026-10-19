@@ -445,7 +445,11 @@ test("software-keyboard geometry keeps the composer in the visual viewport", asy
   await page.evaluate(() => window.visualViewport!.dispatchEvent(new Event("resize")));
   await expect(page.locator("#chat-surface")).toHaveCSS("--chat-visual-height", "460px");
   await expect(page.locator("#chat-reverted-items")).toBeHidden();
-  await expect(page.locator("#chat-queue")).toBeHidden();
+  // Pending remains present while composing; only physically impossible work
+  // minima permit outer scrolling, not ordinary software-keyboard geometry.
+  await expect(page.locator("#chat-queue")).toBeVisible();
+  await expect(page.locator("#chat-surface")).not.toHaveAttribute("data-work-overflow");
+  expect(await page.locator("#chat-surface").evaluate(n => n.scrollTop)).toBe(0);
   const geometry = await page.evaluate(() => {
     const composer = document.querySelector("#chat-composer")!.getBoundingClientRect();
     return { bottom: composer.bottom, visualHeight: window.visualViewport!.height, marginBottom: getComputedStyle(document.querySelector("#chat-composer")!).marginBottom };

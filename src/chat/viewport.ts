@@ -104,9 +104,12 @@ export class ChatViewportController {
       && this.lastHeight === surfaceHeight && this.lastVisualHeight === height;
     if (touch) {
       this.surface.style.removeProperty("--chat-panel-height");
-      // Only transcript/dock containers own scrolling. Browser caret reveal
-      // must not pan the surface's header or composer outside its hard band.
-      this.surface.scrollTop = 0;
+      // Normally only transcript/dock bodies scroll: caret reveal must not pan
+      // fixed chrome outside its hard band. The measured physical-minimum
+      // exception deliberately gives the surface native scroll ownership;
+      // viewport/foreground resync must not undo its reader or focus reveal.
+      // Once the exception ends, restore the normal zero-offset contract.
+      if (!this.surface.hasAttribute("data-work-overflow")) this.surface.scrollTop = 0;
       // Rewriting a value the surface already carries re-enters through our own
       // ResizeObserver, so each write has to be a real change.
       if (this.lastTop !== top) this.surface.style.setProperty("--chat-visual-top", `${top}px`);

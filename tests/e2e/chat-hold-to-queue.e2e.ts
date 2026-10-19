@@ -68,7 +68,8 @@ for (const coarse of [false, true]) test(`side reader minimises on live UI mode 
     await page.locator("#chat-send").click();
     const notice = page.locator("#chat-aside-ready"), reader = page.locator("#chat-aside-dialog"), input = page.locator("#chat-input");
     await expect(notice).toHaveText("Side answer ready");
-    const timeline = await page.locator("#chat-items").textContent();
+    const stableTimeline = () => page.locator("#chat-items [data-chat-item-id]").evaluateAll(nodes => nodes.map(n => ({ id: n.getAttribute("data-chat-item-id"), type: n.className, content: [...n.querySelectorAll("p, .markdown-body")].map(body => body.textContent) })));
+    const timeline = await stableTimeline();
     await notice.click();
     expect(await reader.evaluate(node => node.matches(":modal"))).toBe(false);
     await reader.evaluate(node => { node.scrollTop = 350; });
@@ -106,7 +107,7 @@ for (const coarse of [false, true]) test(`side reader minimises on live UI mode 
     expect(await reader.evaluate(node => node.scrollTop)).toBeGreaterThan(300);
     await expect(page.locator("#chat-aside-answer")).toContainText("retained mode-switch answer");
     await expect(input).toHaveValue("Preserved draft after mode switch");
-    expect(await page.locator("#chat-items").textContent()).toBe(timeline);
+    expect(await stableTimeline()).toEqual(timeline);
     expect(generations).toBe(1);
   } finally { await page.close(); }
 });

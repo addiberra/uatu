@@ -617,7 +617,7 @@ test.describe("chat panels and navigation", () => {
     await expect(track.locator(".chat-worker-name")).toHaveText("Review renderer");
     await expect(track.locator(".chat-worker-meta")).toHaveAttribute("title", /explore/);
     // The model still names itself; only the token figure is gated.
-    await expect(track.locator(".chat-worker-model")).toHaveText("claude-sonnet-4-5");
+    await expect(track.locator(".chat-worker-model-name")).toHaveText("claude-sonnet-4-5");
     await expect(track.locator(".chat-worker-tokens")).toHaveText("—");
     // Restored before leaving: this worker's service is shared with whatever
     // runs next against it, and a narrowed agent is this test's setup only.
@@ -651,12 +651,12 @@ test.describe("chat panels and navigation", () => {
     // Spend, so output counts here — unlike the context fill, which asks what
     // occupies the window right now.
     const attributed = rows.filter({ has: page.getByText("Review renderer", { exact: true }) });
-    await expect(attributed.locator(".chat-worker-model")).toHaveText("claude-sonnet-4-5");
+    await expect(attributed.locator(".chat-worker-model-name")).toHaveText("claude-sonnet-4-5");
     await expect(attributed.locator(".chat-worker-tokens")).toHaveText("Σ 17k");
     // The unattributed one stays a readable row and asserts no figure.
     const unattributed = rows.filter({ has: page.getByText("Audit styles", { exact: true }) });
     await expect(unattributed.locator(".chat-worker-meta")).toContainText("general");
-    await expect(unattributed.locator(".chat-worker-model")).toHaveText("—");
+    await expect(unattributed.locator(".chat-worker-model-name")).toHaveText("—");
     await expect(unattributed.locator(".chat-worker-tokens")).toHaveText("—");
   });
 

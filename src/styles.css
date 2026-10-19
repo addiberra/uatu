@@ -10715,9 +10715,21 @@ html:is([data-ui-mode="touch"], [data-ui-mode="desktop"]) .chat-work-dock[data-w
   max-height: var(--chat-work-budget);
   flex-shrink: 0;
 }
+/* Show work is an independent region above the composer, not the inline
+   transcript allocation. Its Close row is included in the measured budget. */
+html[data-ui-mode="desktop"][data-chat-work-expanded] .chat-work-dock {
+  --chat-work-budget: var(--chat-work-expanded-capacity, 0px);
+  max-height: none;
+  min-height: 0;
+}
+html[data-ui-mode="desktop"][data-chat-work-expanded] .chat-work-dock[data-work-region-overflow] { overflow-y: auto; }
+.chat-work-close { flex: 0 0 auto; }
+html[data-ui-mode="touch"] .chat-surface[data-work-overflow] { overflow-y: auto; }
+html[data-ui-mode="touch"] .chat-surface[data-work-overflow] .chat-work-dock { min-height: var(--chat-work-floor); }
 html:is([data-ui-mode="touch"], [data-ui-mode="desktop"]) .chat-surface:has(.chat-work-dock[data-work-content-expanded]) .chat-transcript-area {
   min-height: var(--chat-expanded-reading, 0px);
 }
+html[data-ui-mode="touch"] .chat-surface[data-work-overflow] .chat-transcript-area { min-height: 0; flex: 0 0 0; }
 .chat-queue-discovery { margin: 0; color: var(--text-subtle); font-size: 0.8125rem; line-height: 1.4; }
 .chat-queue-discovery[hidden] { display: none; }
 #chat-compact-workers-items ul { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 0.5rem; }
@@ -10808,8 +10820,8 @@ html[data-ui-mode="touch"][data-chat-compact]:not([data-chat-wide-short]) .chat-
 html[data-ui-mode="touch"][data-chat-answering] #chat-compact-workers { display: none; }
 /* Fixed physical target minima, not rem-scaled empty chrome, leave room for
    both headers and a whole selected action at enlarged landscape text. */
-html[data-ui-mode="touch"][data-chat-wide-short] .chat-conversation-controls > :is(select, button):not([hidden]) { min-height: 44px; height: 44px; padding-block: 0; }
-html[data-ui-mode="touch"][data-chat-wide-short] .chat-composer textarea { height: 44px !important; min-height: 44px; max-height: 44px; }
+html[data-ui-mode="touch"]:is([data-chat-wide-short], [data-chat-short]) .chat-conversation-controls > :is(select, button):not([hidden]) { min-height: 44px; height: 44px; padding-block: 0; }
+html[data-ui-mode="touch"]:is([data-chat-wide-short], [data-chat-short]) .chat-composer textarea { height: 44px !important; min-height: 44px; max-height: 44px; }
 html[data-ui-mode="touch"][data-chat-wide-short] .chat-composer-actions { min-height: 44px; }
 html[data-ui-mode="touch"][data-chat-wide-short] :is(.chat-compact-workers > summary, .chat-workers-dismiss) { min-height: 28px; }
 html[data-ui-mode="touch"][data-chat-wide-short] .chat-worker-row .chat-task-stop { min-height: 44px; height: 44px; padding-block: 0; align-self: flex-start; }
