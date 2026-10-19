@@ -269,10 +269,12 @@ test.describe("desktop", () => {
     await next.click();
     await expect(card.locator('[data-question-panel="1"]')).toBeHidden();
     await expect(page.locator("#chat-state")).toContainText("Still to answer");
-    // Answering the required step lets the optional empty pass through,
+    // Answering the required step retires the stale owed-answer line
+    // (nothing newer owns it), lets the optional empty pass through,
     // straight to Answer, which completes the set.
     await card.locator('.chat-question-panel:not([hidden]) .chat-question-option input').first().check();
     await next.click();
+    await expect(page.locator("#chat-state")).not.toContainText("Still to answer");
     await expect(card.locator('[data-question-panel="1"]')).toBeVisible();
     await expect(next).toHaveText("Answer");
     expect(await next.isDisabled()).toBe(false);

@@ -1552,6 +1552,10 @@ export function initChat(api = new ChatApiClient()): void {
         const note = document.createElement("span");
         note.className = "chat-subagent-attribution";
         note.textContent = attribution;
+        // The compact figure rounds a billion-scale run to 1.0B with no
+        // receipt behind it (unpriced subagents produce none), so the exact
+        // total stays one hover away.
+        if (declares("context") && entry.usage) note.title = `${totalTokens(entry.usage).toLocaleString()} tokens`;
         row.append(note);
       }
       return row;
@@ -3658,6 +3662,14 @@ export function initChat(api = new ChatApiClient()): void {
       speak(label ? `Question ${activeIndex + 1} of ${panels.length}: ${label}` : "");
     };
 
+    // Retire this conversation's owed-answer line once the step it held back
+    // becomes valid — but only while the line still reads as ours: a newer
+    // unrelated status (an outage, a refusal) is never spoken over.
+    const clearOwedAnswer = (source: ChatProjection) => {
+      const spoken = announceFailureFor(source);
+      if (spoken.current().startsWith("Still to answer")) spoken("");
+    };
+
     container.addEventListener("change", event => {
       const input = event.target as HTMLInputElement;
       const form = input.form;
@@ -3712,13 +3724,15 @@ export function initChat(api = new ChatApiClient()): void {
       // same message the final check speaks, rather than surfacing only at
       // the end and bouncing the reader back through the wizard (GitHub
       // review finding on the never-disabling Answer: the check now runs on
-      // the advance path too).
+      // the advance path too). Once the step passes, its stale owed-answer
+      // line is retired — only if nothing newer owns the status.
       if (activeIndex < panels.length - 1) {
         const step = item.questions[activeIndex]!;
         if (collectQuestionAnswers(questionForm)[activeIndex]!.length === 0 && !step.optional) {
           announceFailureFor(source)(`Still to answer: ${step.header || step.prompt || "the current question"}`, true);
           return;
         }
+        clearOwedAnswer(source);
         showQuestionPanel(questionForm, activeIndex + 1);
         speakQuestionStep(source, questionForm);
         return;
@@ -3733,6 +3747,7 @@ export function initChat(api = new ChatApiClient()): void {
         announceFailureFor(source)(`Still to answer: ${missing.map(index => item.questions[index]!.header).filter(Boolean).join(", ")}`, true);
         return;
       }
+      clearOwedAnswer(source);
       void resolveQuestion(source, item.id, { kind: "answered", answers });
     });
   };
