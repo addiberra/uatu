@@ -3,6 +3,7 @@ import { withEngineBrowsers } from "../e2e/page-diagnostics";
 import { recordLinuxWebKitDiagnostics } from "../e2e/linux-webkit-diagnostics";
 import type { Browser } from "@playwright/test";
 
+// Keep Playwright-only tests out of Bun's .spec.ts/.test.ts discovery.
 // Exercise the actual launchBrowser/diagnostic fixture path, substituting
 // Chromium for WebKit only in this regression so macOS can check ownership.
 const test = withEngineBrowsers(base).extend<{}, { _webkitBrowser: () => Promise<Browser> }>({

@@ -2,7 +2,8 @@ import { defineConfig } from "@playwright/test";
 import base from "./playwright.config";
 
 // Temporary Linux investigation, not a required-check configuration. Keep the
-// original test bodies, identities and per-test budgets; only select cases.
+// original seven test bodies, identities and per-test budgets. Two separate
+// test-only collection probes have no retries and a combined 210s ceiling.
 const files = [
   "**/chat-steering.e2e.ts",
   "**/chat-independent-panel-interaction.e2e.ts",
@@ -30,5 +31,17 @@ export default defineConfig({
     // Playwright also auto-starts tracing on browser.newContext(), not just
     // its configured page. The opt-in helper owns every diagnostic trace.
     use: { ...base.use, trace: "off" },
+  }, {
+    // Collection, not resolution: header-causality.json records baseline
+    // equivalence and one-variable resets; scroll-causality-*.json[l] records
+    // five native disclosure sequences, clamping geometry and write stacks.
+    name: "causal-probes",
+    testDir: "./tests/diagnostics",
+    testMatch: "linux-ui-causality.e2e.ts",
+    grep: /Linux causality probe:/,
+    metadata: { causalEngine: "webkit" },
+    retries: 0,
+    timeout: 150_000,
+    use: { ...base.use, trace: "off", actionTimeout: 10_000, navigationTimeout: 15_000 },
   }],
 });

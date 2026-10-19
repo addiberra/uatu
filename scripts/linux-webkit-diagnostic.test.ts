@@ -67,16 +67,25 @@ function list(config: string) {
   return ids;
 }
 
-test("diagnostic config selects seven existing WebKit test identities only", () => {
+test("diagnostic config preserves seven existing identities plus two isolated WebKit probes", async () => {
   const full = list("playwright.config.ts");
   const selected = list("playwright.webkit-diagnostic.config.ts");
-  expect(selected.size).toBe(7);
+  expect(selected.size).toBe(9);
   for (const [id, title] of selected) {
-    expect(full.get(id)).toBe(title);
-    expect(id.startsWith("e2e:")).toBe(true);
+    if (id.startsWith("causal-probes:")) {
+      expect(full.has(id)).toBe(false);
+      expect(title).toMatch(/^Linux causality probe: (native header intrinsic widths|disclosure transcript reset)$/);
+    } else {
+      expect(full.get(id)).toBe(title);
+      expect(id.startsWith("e2e:")).toBe(true);
+    }
   }
   const titles = [...selected.values()];
   expect(titles.filter(title => title.startsWith("enlarged pending text"))).toHaveLength(4);
   expect(titles.filter(title => title.startsWith("header taps") && title.includes("webkit"))).toHaveLength(2);
   expect(titles.filter(title => title === "reference work card owns its header and rows: webkit desktop")).toHaveLength(1);
+  expect(titles.filter(title => title.startsWith("Linux causality probe:"))).toHaveLength(2);
+  const config = await readFile(new URL("../playwright.webkit-diagnostic.config.ts", import.meta.url), "utf8");
+  expect(config).toContain('metadata: { causalEngine: "webkit" }');
+  expect(config).toContain('testDir: "./tests/diagnostics"');
 }, 30_000);

@@ -820,7 +820,7 @@ for (const browserName of ["chromium", "webkit"] as const) test.describe(`steeri
       })),
     })), null, 2));
     expect(await page.locator("#chat-work-dock").evaluate(node => node.scrollWidth <= node.clientWidth)).toBe(true);
-    if (width === 390) expect(await page.locator("#chat-surface").evaluate(node => node.scrollWidth <= node.clientWidth)).toBe(true);
+    expect(await page.locator("#chat-surface").evaluate(node => node.scrollWidth <= node.clientWidth)).toBe(true);
     // Load lazy thumbnails through real viewport entry before checking action
     // geometry; a decode during those checks can resize the card mid-scroll.
     for (const image of await held(page).locator("img").all()) {

@@ -13,5 +13,5 @@ export default defineConfig({
   retries: 0,
   outputDir: path.join(output, "results"),
   reporter: [["line"], ["json", { outputFile: path.join(output, "report.json") }]],
-  projects: diagnostic.projects!.map(project => ({ ...project, testMatch: "trace-lifecycle.spec.ts", grep: /.*/ })),
+  projects: diagnostic.projects!.filter(project => project.name === "e2e").map(project => ({ ...project, testMatch: "trace-lifecycle.e2e.ts", grep: /.*/ })),
 });
