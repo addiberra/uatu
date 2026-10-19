@@ -26,6 +26,7 @@ test("sparse pending entries grow from one to two to five beside busy workers", 
     for (let i = 0; i < 6; i++) await request.post("/__e2e/chat", { data: { action: "opencode", op: "launchWorker", conversationId } });
     await expect(page.locator("#chat-compact-workers [data-worker-id]")).toHaveCount(6);
     await page.locator("#chat-compact-workers > summary").click();
+    await expect(page.locator("#chat-compact-workers")).toHaveAttribute("open", "");
     const sizes: number[] = [];
     for (let count = 1; count <= 5; count++) {
       await page.locator("#chat-input").fill(`Follow-up ${count}`);
@@ -44,7 +45,9 @@ test("sparse pending entries grow from one to two to five beside busy workers", 
     expect(sizes[1]).toBeGreaterThan(sizes[0]! + 30);
     expect(sizes[2]).toBeGreaterThan(sizes[1]! + 30);
     await page.locator("[data-pending-toggle]").click();
+    await expect(page.locator("[data-pending-toggle]")).toHaveAttribute("aria-expanded", "false");
     await page.locator("#chat-compact-workers > summary").click();
+    await expect(page.locator("#chat-compact-workers")).not.toHaveAttribute("open");
     await expect.poll(() => page.locator("#chat-work-dock").evaluate(node => node.getBoundingClientRect().height)).toBeLessThan(80);
 });
 

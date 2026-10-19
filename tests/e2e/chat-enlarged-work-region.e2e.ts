@@ -39,6 +39,7 @@ for (const geometry of [
     await expect(page.locator(".chat-queued-message")).toHaveCount(20);
     await page.locator("#chat-compact-workers > summary").click();
     await page.locator("[data-pending-toggle]").click();
+    await expect(page.locator("[data-pending-toggle]")).toHaveAttribute("aria-expanded", "true");
     await page.setViewportSize({ width: geometry.width, height: geometry.height });
     await page.evaluate(g => {
       document.documentElement.style.fontSize = "200%";
@@ -64,7 +65,10 @@ for (const geometry of [
       await expectWorkControlVisible(page.locator(selector));
     }
     await page.locator("[data-pending-toggle]").click();
+    await expect(page.locator("[data-pending-toggle]")).toHaveAttribute("aria-expanded", "false");
     await page.locator("[data-pending-toggle]").click();
+    await expect(page.locator("[data-pending-toggle]")).toHaveAttribute("aria-expanded", "true");
+    await expectWorkLayoutReady(page);
     await page.locator(".chat-queue-content").evaluate(n => n.scrollTop = n.scrollHeight);
     await nativeReveal(".chat-queued-message:last-child [data-queue-remove]");
     const remove = page.locator("[data-queue-remove]").last();

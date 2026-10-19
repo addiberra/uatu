@@ -2,6 +2,7 @@ import type { Page, APIRequestContext } from "@playwright/test";
 import { test as base, expect } from "./fixtures";
 import { withEngineBrowsers } from "./page-diagnostics";
 import { openChatPanel } from "./chat-helpers";
+import { expectWorkControlVisible, expectWorkLayoutReady, expectWorkTranscriptBudget } from "./work-panel-assertions";
 const test = withEngineBrowsers(base);
 
 async function boot(page: Page, request: APIRequestContext) {
@@ -50,7 +51,7 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`critique re
     await page.reload(); await expect(input).toHaveValue("Already learned"); await expect(hint).toBeHidden();
   });
 
-  test("expanded Pending retains focus and one scroller after the intact worker card", async ({ page, request }) => {
+  test("expanded Pending retains focus and independent scrollers after the intact worker card", async ({ page, request }) => {
     await boot(page, request);
     const id = await page.locator("#chat-conversation-select").inputValue();
     await page.locator("#chat-input").fill("Pending message"); await page.locator("#chat-send").click();
@@ -64,18 +65,17 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`critique re
     await expect(pending).toHaveAttribute("aria-expanded", "true");
     for (const keyboard of [false, true]) {
       if (keyboard) await page.evaluate(() => { Object.assign(window.visualViewport!, { height: 380 }); window.visualViewport!.dispatchEvent(new Event("resize")); });
-      expect(await page.locator("#chat-work-dock").evaluate(dock => {
+      await expectWorkLayoutReady(page);
+      await expect.poll(() => page.locator("#chat-work-dock").evaluate(dock => {
         const card = dock.querySelector("#chat-compact-workers")!.getBoundingClientRect();
         const p = dock.querySelector(".chat-queue-header")!.getBoundingClientRect();
-        return p.top >= card.bottom + 7 && getComputedStyle(dock.querySelector("#chat-compact-workers-items")!).overflowY === "visible";
+        return p.top >= card.bottom + 7 && getComputedStyle(dock).overflowY === "clip"
+          && getComputedStyle(dock.querySelector("#chat-compact-workers-items")!).overflowY === "auto"
+          && getComputedStyle(dock.querySelector(".chat-queue-content")!).overflowY === "auto";
       })).toBe(true);
-      await page.locator("#chat-work-dock").evaluate(e => { e.scrollTop = e.scrollHeight; });
-      // Expanded Pending may scroll its heading away; verify reachability,
-      // not the superseded requirement to pin both disclosure headings.
-      await pending.scrollIntoViewIfNeeded();
-      await expect(pending).toBeInViewport();
-      await workers.scrollIntoViewIfNeeded(); await expect(workers).toBeInViewport();
-      expect(await page.locator("#chat-work-dock").evaluate(e => e.clientHeight)).toBeLessThanOrEqual((keyboard ? 380 : 844) * .4 + 1);
+      await expectWorkControlVisible(pending);
+      await expectWorkControlVisible(workers);
+      await expectWorkTranscriptBudget(page, keyboard ? 380 : 844);
     }
   });
 

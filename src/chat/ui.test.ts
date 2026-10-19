@@ -2529,6 +2529,19 @@ async function waitForQuestionCard(document: Document): Promise<HTMLElement> {
 let eventSourceConstructions = 0;
 
 function installDomGlobals(document: Document, window: Window): void {
+  // LinkeDOM has no media queries. Model a desktop fine pointer explicitly;
+  // layout and touch media behavior are exercised in the browser suites.
+  Object.defineProperty(window, "matchMedia", {
+    configurable: true,
+    value: (media: string) => ({
+      media,
+      matches: media === "(pointer: fine) and (hover: hover)",
+      onchange: null,
+      addListener() {}, removeListener() {},
+      addEventListener() {}, removeEventListener() {},
+      dispatchEvent() { return true; },
+    }),
+  });
   const browserGlobal = window as unknown as Record<string, unknown>;
   const values: Record<string, unknown> = {
     document,

@@ -215,7 +215,8 @@ for (const outcome of ["lost-primary", "lost-background", "refused-background"] 
   await page.locator("#chat-input").fill("Preserve uncertain fixture input");
   await page.locator("#chat-send").click();
   const body = (await sent).postDataJSON();
-  await expect(page.locator("#chat-action-feedback")).toContainText(outcome === "lost-primary" ? "unconfirmed" : outcome === "lost-background" ? "could not be confirmed" : "was refused");
+  await expect(page.locator("#chat-action-feedback")).toContainText(outcome === "refused-background" ? "was refused" : "unconfirmed");
+  if (outcome === "lost-background") await expect(page.locator("#chat-action-feedback")).toContainText("automatic backgrounding still unconfirmed. Do not repeat.");
   await expect(page.locator("#chat-input")).toHaveValue("");
   await expect(page.locator("#chat-queue")).toContainText("Preserve uncertain fixture input");
   const replay = await post("/prompts", body);
@@ -227,7 +228,7 @@ for (const outcome of ["lost-primary", "lost-background", "refused-background"] 
   expect(mutations.filter(call => call.includes("/background"))).toHaveLength(outcome === "lost-primary" ? 0 : 1);
   await childChatControl(workspace, { action: "opencode", op: "finish", conversationId });
   await expect(page.locator("#chat-stop")).toBeDisabled();
-  await expect(page.locator("#chat-action-feedback")).toContainText(outcome === "lost-primary" ? "unconfirmed" : outcome === "lost-background" ? "could not be confirmed" : "was refused");
+  await expect(page.locator("#chat-action-feedback")).toContainText(outcome === "refused-background" ? "was refused" : "unconfirmed");
 });
 
 test("same-account devices share retained receipts while a stale ON display cannot override saved OFF", async ({ hub, hubContext, browser }) => {
