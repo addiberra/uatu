@@ -1,7 +1,7 @@
-import type { FolderListing, OnboardingOutcome, ReadResult } from "./backend";
+import type { FolderListing, OnboardingOutcome, ReadResult, WorkspaceView } from "./backend";
 import { normalizeProviderHost, type PublicCredentialDto } from "../credential-types";
 import type { AuthenticationSelection } from "../onboarding";
-import { absolute, action, check, checked, displayName, field, folderName, group, infoRows, listRow, select, text, value, validateField, type FlowEnvironment } from "./flow-ui";
+import { absolute, action, advisory, check, checked, displayName, field, folderName, group, infoRows, listRow, rowAction, select, text, value, validateField, type FlowEnvironment } from "./flow-ui";
 import { credentialChoices, validateSelected } from "./workspace-flows";
 import { createFolderPicker } from "./folder-picker";
 import { supportsRole } from "./credential-flows";
@@ -62,7 +62,7 @@ export function bindAuthenticationHost(root: HTMLElement, catalog: PublicCredent
     root.querySelector("[data-auth-list]")?.insertAdjacentHTML("beforeend", authenticationRow(catalog)); update();
   }); update(); updateAddHost();
 }
-export function createOnboardingFlows(env: FlowEnvironment, setupCredentials: (back: (created?: PublicCredentialDto) => void) => void) {
+export function createOnboardingFlows(env: FlowEnvironment, setupCredentials: (back: (created?: PublicCredentialDto) => void) => void, startWorkspace: (workspace: WorkspaceView) => void) {
   const { backend } = env;
   const pickFolder = createFolderPicker(env);
   let browseGeneration = 0;
@@ -72,7 +72,7 @@ export function createOnboardingFlows(env: FlowEnvironment, setupCredentials: (b
       folders: () => env.navigate({ kind: "folders" }),
     });
   }
-  function outcome(result: OnboardingOutcome) {
+  function outcome(result: OnboardingOutcome, resume = false) {
     env.sheet.close(); env.changed();
     if (result.status === "failed") {
       env.page("Configuration needs attention", group("Outcome", infoRows([{ label: "Problem", value: result.message, detail: result.code, tone: "warning" }, ...(result.retainedPath ? [{ label: "Folder retained", value: result.retainedPath, mono: true, detail: "Use Existing folder to recover; creating another workspace is not an automatic retry." }] : []), ...(result.committedEntry ? [{ label: "Registration committed", value: result.committedEntry.displayName, detail: "Do not create a duplicate registration." }] : [])])) + (result.retainedPath ? action("recover", "Inspect retained folder") : "") + (result.committedEntry ? action("workspace", "Inspect registered workspace") : ""), {
@@ -80,6 +80,23 @@ export function createOnboardingFlows(env: FlowEnvironment, setupCredentials: (b
       }, { primaryAction: result.committedEntry ? "workspace" : result.retainedPath ? "recover" : undefined, secondaryAction: result.committedEntry && result.retainedPath ? "recover" : undefined }); return;
     }
     const r = result.result;
+    if (resume) {
+      // Registration success is not current runtime/readiness evidence. Read the
+      // saved workspace before exposing a command, then use the Hub's guarded
+      // Open/Start owner rather than issuing a second onboarding mutation.
+      const identity = group("Workspace", infoRows([{ label: "Display name", value: r.entry.displayName }, { label: "Folder", value: r.entry.path, mono: true }]));
+      env.page("Workspace configured", identity + text("Checking current session…"));
+      void env.read(() => backend.readWorkspace(r.entry.id), w => {
+        const running = w.runtime.status === "running";
+        env.page("Workspace configured", group("Workspace", infoRows([{ label: "Display name", value: w.displayName }, { label: "Folder", value: w.path, mono: true }, { label: "Session", value: running ? "Running" : "Stopped", tone: running ? "positive" : "neutral" }, { label: "Outcome", value: r.alreadyRegistered ? "The existing registration was retained." : "Registration and assignments are saved." }]))
+          + (r.startError ? text(`Start failed: ${r.startError}. The configured workspace remains available for an explicit Start.`) : "")
+          + (w.availability ? text(`Checkout ${w.availability}. Resolve its identity in Details before Open or Start.`) : action("resume", running ? "Open workspace" : "Start workspace"))
+          + action("inspect", "Workspace details"), {
+          resume: () => { if (!w.availability) startWorkspace(w); }, inspect: () => env.navigate({ kind: "workspace", id: w.id }),
+        }, { primaryAction: w.availability ? "inspect" : "resume", secondaryAction: w.availability ? undefined : "inspect" });
+      }, () => outcome(result, true));
+      return;
+    }
     env.page(r.alreadyRegistered ? "Already registered" : r.started ? "Workspace ready" : "Workspace configured", group("Workspace", infoRows([{ label: "Display name", value: r.entry.displayName }, { label: "Folder", value: r.entry.path, mono: true }, { label: "Outcome", value: r.alreadyRegistered ? "The existing registration was retained. No new start was requested by this result." : r.started ? "The requested workspace session started." : "Registration and assignments are saved. The workspace is stopped." }])) + (r.startError ? text(`Start failed: ${r.startError}. The configured workspace remains available for an explicit Start.`) : "") + action("inspect", "Workspace information") + (r.started ? action("open", "Open workspace") : ""), {
       inspect: () => env.navigate({ kind: "workspace", id: r.entry.id }), open: () => { if (r.started) env.openWorkspace(r.entry.id); },
     }, { primaryAction: r.started ? "open" : "inspect", secondaryAction: r.started ? "inspect" : undefined });
@@ -97,7 +114,16 @@ export function createOnboardingFlows(env: FlowEnvironment, setupCredentials: (b
       } }); bindAuthenticationHost(task, catalog);
     }; editor();
   }
-  function reviewConfiguration(title: string, path: string, draft: ConfigurationDraft, catalog: PublicCredentialDto[], call: () => ReturnType<typeof backend.configureExisting>, back: () => void) {
+  function reviewConfiguration(title: string, path: string, draft: ConfigurationDraft, catalog: PublicCredentialDto[], call: () => ReturnType<typeof backend.configureExisting>, back: () => void, create = false) {
+    if (create) {
+      env.task("Review Create Workspace", text("Draft only. Nothing is created until you confirm.")
+        + group("Destination & identity", infoRows([{ label: "Display name", value: draft.displayName }, { label: "Exact destination on Hub", value: path, mono: true }]))
+        + group("Changes on confirmation", infoRows([{ label: "Folder and Git", value: "Create a new folder and initialize Git", detail: "Folder creation and Git initialization explicitly authorized." }, { label: "Session", value: draft.start ? "Start after configuration explicitly requested" : "Register stopped; do not start" }]))
+        + configurationFacts(catalog, draft.authentication, draft.signing)
+        + (draft.start && !draft.authentication.length && !draft.signing ? text("No credentials are assigned. Git authentication and signing may be unavailable, but the workspace can still start.") : ""),
+      { label: draft.start ? "Create and start" : "Create stopped", run: root => env.mutate(call, result => outcome(result, true), root) }, {}, back, { cancelLabel: "Back to edit" });
+      return;
+    }
     env.task(`Review ${title}`, group("Workspace", infoRows([{ label: "Display name", value: draft.displayName }, { label: "Parent folder", value: path.slice(0, path.lastIndexOf("/")) || "/", mono: true }, { label: "Folder name", value: path.split("/").at(-1) || "/", mono: true }, { label: "Folder path", value: path, mono: true }])) + group("Setup", infoRows([{ label: "Git initialization", value: draft.init ? "Authorized" : "Not requested; existing repository required" }, { label: "Start", value: draft.start ? "Start after configuration" : "Register stopped; do not start" }])) + configurationFacts(catalog, draft.authentication, draft.signing) + (draft.start && !draft.authentication.length && !draft.signing ? text("No credentials are assigned. Git authentication and signing may be unavailable, but the workspace can still start.") : ""), { label: draft.start ? "Add and start" : "Add stopped", run: root => env.mutate(call, outcome, root) }, {}, back, { cancelLabel: "Back to edit" });
   }
   function newWorkspace(parent?: string) {
@@ -119,22 +145,43 @@ export function createOnboardingFlows(env: FlowEnvironment, setupCredentials: (b
       void read(() => backend.readCredentials(), catalog => {
         let draft: ConfigurationDraft = { displayName: "", folderName: "", authentication: [], signing: "", start: false, init: false };
         let destination = parent ?? defaults.effective;
+        let nameEdited = false;
+        let credentialsOpen = false;
         const editor = () => {
-          const task = env.task("Create Workspace", text("Creates a new folder and initializes Git. This is different from creating an empty folder.") + technicalField("parent", "Parent folder", destination) + action("browse", "Browse elsewhere") + technicalField("folderName", "New folder name", draft.folderName) + field("displayName", "Workspace display name", draft.displayName) + configurationFields(catalog, draft) + check("init", "Create the folder and initialize Git", draft.init), { label: "Review", run: root => {
-            destination = absolute(value(root, "parent"));
-            draft = { ...readConfiguration(root, catalog, draft), folderName: folderName(value(root, "folderName")), displayName: displayName(value(root, "displayName")), init: checked(root, "init") };
+          const task = env.task("Create Workspace", text("Creates a new folder and initializes Git. Review before anything changes.")
+            + group("Location & name", technicalField("parent", "Parent folder", destination) + rowAction("browse", "Browse elsewhere") + technicalField("folderName", "New folder name", draft.folderName) + field("displayName", "Workspace display name", draft.displayName) + text("Suggested from the folder name until you edit it. Changing the display name never renames the folder."))
+            + advisory(env.user(), false)
+            + `<details class="mh-group mh-setup-credentials" data-setup-credentials${credentialsOpen ? " open" : ""}><summary>Credentials used after setup (optional)</summary>${configurationFields(catalog, draft, { includeStart: false })}</details>`
+            + group("Create and start", check("init", "Create the folder and initialize Git", draft.init) + text("Required. Creates a new folder and Git repository at the reviewed destination.") + check("start", "Start after configuration", draft.start) + text("Off by default. Leave off to register the workspace stopped.")), { label: "Review", run: root => {
+            destination = validateField(root, "parent", absolute);
+            // Keep concealed drafts and consents intact even when validation
+            // fails; reveal optional errors without replacing their controls.
+            draft = captureConfiguration(root, draft);
+            credentialsOpen = disclosure.open;
+            let config: ConfigurationDraft;
+            try { config = readConfiguration(root, catalog, draft); }
+            catch (error) { disclosure.open = true; credentialsOpen = true; throw error; }
+            draft = { ...config, folderName: validateField(root, "folderName", folderName), displayName: validateField(root, "displayName", displayName), init: checked(root, "init") };
             if (!draft.init) throw new Error("Confirm folder creation and Git initialization.");
-            reviewConfiguration("Create Workspace", `${destination.replace(/\/$/, "")}/${draft.folderName}`, draft, catalog, () => backend.createWorkspace({ parent: destination, folderName: draft.folderName, displayName: draft.displayName, authentication: draft.authentication, signing: draft.signing || null, start: draft.start, gitInitConsent: "confirmed" }), editor);
+            reviewConfiguration("Create Workspace", `${destination.replace(/\/$/, "")}/${draft.folderName}`, draft, catalog, () => backend.createWorkspace({ parent: destination, folderName: draft.folderName, displayName: draft.displayName, authentication: draft.authentication, signing: draft.signing || null, start: draft.start, gitInitConsent: "confirmed" }), editor, true);
           } }, { "setup-credentials": () => {
             destination = value(task, "parent");
             draft = captureConfiguration(task, draft);
+            credentialsOpen = disclosure.open;
             setupCredentials(created => { if (created) catalog = [...catalog.filter(c => c.id !== created.id), created]; editor(); });
           }, browse: () => {
             destination = value(task, "parent");
             draft = captureConfiguration(task, draft);
+            credentialsOpen = disclosure.open;
             env.sheet.close();
             browse(destination.startsWith("/") ? destination : defaults.effective, selected => { destination = selected; editor(); }, editor);
           } }); bindAuthenticationHost(task, catalog);
+          const disclosure = task.querySelector<HTMLDetailsElement>("[data-setup-credentials]")!;
+          const name = task.querySelector<HTMLInputElement>('[name="displayName"]')!;
+          name.addEventListener("input", () => { nameEdited = true; });
+          task.querySelector<HTMLInputElement>('[name="folderName"]')!.addEventListener("input", event => {
+            if (!nameEdited) name.value = [...(event.target as HTMLInputElement).value.trim()].slice(0, 64).join("");
+          });
           if (defaults.configured && !defaults.configuredAvailable) task.querySelector(".mh-sheet-body")?.insertAdjacentHTML("afterbegin", text(`Saved default unavailable; using ${defaults.effective}. You can browse elsewhere.`));
         };
         editor();

@@ -76,8 +76,8 @@
 .mh-root .mh-destination > .mh-icon { width: 12px; height: 16px; color: var(--mh-muted); }
 .mh-root .mh-text-action { display: block; padding: var(--mh-space-3) var(--mh-space-4); width: calc(100% - 2 * var(--mh-space-4)); margin: var(--mh-space-3) var(--mh-space-4); border-radius: var(--mh-radius-button); background: var(--mh-action-subtle); text-align: center; font-weight: 600; }
 .mh-root .mh-text-action[hidden] { display: none; }
-.mh-root .mh-clone-credentials { margin-block: var(--mh-space-6); }
-.mh-root .mh-clone-credentials > summary { color: var(--mh-action); }
+.mh-root .mh-clone-credentials, .mh-root .mh-setup-credentials { margin-block: var(--mh-space-6); }
+.mh-root .mh-clone-credentials > summary, .mh-root .mh-setup-credentials > summary { color: var(--mh-action); }
 .mh-root .mh-destination + .mh-text-action { border-top: .5px solid var(--mh-line); }
 /* In-group command rows: blue text at the text column, no fill. Hairlines start
    at the text column of the row below them, like destination separators. */

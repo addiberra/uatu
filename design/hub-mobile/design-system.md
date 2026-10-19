@@ -215,6 +215,40 @@ historical evidence, not the current layout authority.
 
 ## State and accessibility contract
 
+### Reference flow: Hub → Create Workspace → Review → Outcome
+
+This local recipe refines new-workspace creation, not the whole product or the
+Existing folder and Clone editors. Keep the incumbent fonts, icons and tokens.
+
+- **Overview:** resume existing work first. Running/stopped grouping and the
+  separate Open/Start and Details actions remain; Add stays after the list.
+- **Editor:** group Location & name using native field primitives. Suggest the
+  folder name as the display name (at most 64 characters) only until the user
+  edits that field; even an explicitly cleared name is never overwritten.
+  Parent/folder/display name remain independent drafts.
+- **Optional setup:** authentication hosts and signing live in a native
+  disclosure, initially closed. Closing, reopening, picker/credential detours
+  and review Back retain configuration, disclosure state and consent. Invalid
+  optional values reopen it. Complete incumbent safety facts remain outside
+  and before those controls, never hidden by this disclosure.
+- **Consent:** Git initialization and Start remain outside optional setup,
+  unchecked by default. Review validates without creating anything. No added
+  automatic Start or credential assignment accompanies a suggested name.
+- **Review:** show the exact destination, display identity, folder/Git effect,
+  explicit initialization authorization, stopped/requested-start consequence,
+  and exact authentication host/credential and signing choices. Confirm is
+  **Create stopped** or **Create and start**. Back edits the same draft.
+- **Outcome:** saved registration is not runtime evidence. Read current workspace
+  state before offering **Open workspace** when running or **Start workspace**
+  when stopped. Both use the existing guarded Hub command owner, including
+  unassigned confirmation, credential readiness/unlock and authentication fences.
+  Details is secondary. Unknown/read failures expose Retry, not guessed state;
+  failed/partial mutations retain the existing recovery and reconciliation paths.
+
+The extra current-state read deliberately trades a brief loading state for a
+truthful next action. This recipe is verified in the synthetic harness, not a
+claim of live-backend or whole-product validation.
+
 - Rendering a primitive emits no change events and performs no storage/network work.
 - Switches and radio selections remain drafts until the existing Save/Review/Apply.
 - Clone keeps optional post-setup authentication/hosts and signing in a native

@@ -651,8 +651,36 @@ describe("onboarding and clone lifecycle", () => {
     expect(h.region().textContent).toContain("Git authentication"); expect(h.region().textContent).toContain("Commit signing"); expect(h.region().textContent).not.toContain("Retained signing");
     h.set("folderName", "folder"); h.set("displayName", "Display"); h.set("authentication", "token"); h.set("host", "git.example.invalid"); h.set("signing", "pgp"); h.input("init").checked = true;
     h.click("commit-sheet"); await settle(); expect(facts(h.region())).toContainEqual(["Host", "git.example.invalid"]); expect(facts(h.region())).toContainEqual(["Credential", "Provider identity"]); expect(facts(h.region())).toContainEqual(["Credential", "Signing identity"]);
-    expect(facts(h.region())).toContainEqual(["Display name", "Display"]); expect(facts(h.region())).toContainEqual(["Parent folder", "/projects"]); expect(facts(h.region())).toContainEqual(["Folder path", "/projects/folder"]); expect(facts(h.region())).toContainEqual(["Git initialization", "Authorized"]); expect(h.mutations("createWorkspace")).toHaveLength(0);
+    expect(facts(h.region())).toContainEqual(["Display name", "Display"]); expect(facts(h.region())).toContainEqual(["Exact destination on Hub", "/projects/folder"]); expect(facts(h.region())).toContainEqual(["Session", "Register stopped; do not start"]); expect(h.region().textContent).toContain("Folder creation and Git initialization explicitly authorized."); expect(h.mutations("createWorkspace")).toHaveLength(0);
     h.click("cancel-sheet"); expect(h.input("authentication").value).toBe("token"); expect(h.input("signing").value).toBe("pgp"); h.click("cancel-sheet"); expect(h.mutations("createWorkspace")).toHaveLength(0);
+  });
+  test("folder-derived display names stop following after any manual edit, including clearing", async () => {
+    const h = harness(); await h.ui.ready; h.ui.showDetail({ kind: "add-workspace" }); h.click("create"); await settle();
+    h.set("folderName", "first-folder"); expect(h.input("displayName").value).toBe("first-folder");
+    h.set("folderName", "x".repeat(80)); expect(h.input("displayName").value).toBe("x".repeat(64));
+    h.set("displayName", "Chosen name"); h.set("folderName", "second-folder"); expect(h.input("displayName").value).toBe("Chosen name");
+    h.set("displayName", ""); h.set("folderName", "third-folder"); expect(h.input("displayName").value).toBe("");
+    h.input("init").checked = true; h.click("commit-sheet"); await settle();
+    expect(h.input("displayName").getAttribute("aria-invalid")).toBe("true"); expect(h.mutations("createWorkspace")).toHaveLength(0);
+    h.set("displayName", "x".repeat(65)); h.click("commit-sheet"); await settle(); expect(h.region().textContent).toContain("1–64 visible characters");
+  });
+  test("creation outcome waits for verified runtime and keeps Start behind unassigned confirmation", async () => {
+    let release!: (result: ReadResult<WorkspaceView>) => void;
+    const pending = new Promise<ReadResult<WorkspaceView>>(resolve => { release = resolve; });
+    const h = harness({ readWorkspace: () => pending, createWorkspace: async () => completed({ status: "configured", result: { entry: w("new"), created: true, alreadyRegistered: false, createdFolder: true, started: false, startError: null } }), startWorkspace: async () => completed({ status: "running", workspaceId: "new" }) });
+    await h.ui.ready; h.ui.showDetail({ kind: "add-workspace" }); h.click("create"); await settle(); h.set("folderName", "new"); h.input("init").checked = true;
+    h.click("commit-sheet"); h.click("commit-sheet"); await settle();
+    expect(h.region().textContent).toContain("Checking current session"); expect(h.region().querySelector('[data-flow="resume"]')).toBeNull();
+    release(available(w("new"))); await settle();
+    expect(h.region().querySelector('[data-flow="resume"]')?.textContent).toBe("Start workspace"); expect(h.mutations("startWorkspace")).toHaveLength(0);
+    h.click("resume"); await settle(); expect(h.region().textContent).toContain("Start without credentials?"); expect(h.mutations("startWorkspace")).toHaveLength(0);
+    h.click("commit-sheet"); await settle(); expect(h.mutations("startWorkspace")[0]?.args).toEqual([{ workspaceId: "new", unassigned: "confirmed-without-credentials" }]);
+  });
+  test.each(["unavailable", "unauthorized"] as const)("outcome runtime %s never exposes an inferred Start", async kind => {
+    const h = harness({ readWorkspace: async () => ({ status: "unavailable", problem: { kind, message: "Cannot verify session" } }), createWorkspace: async () => completed({ status: "configured", result: { entry: w("new"), created: true, alreadyRegistered: false, createdFolder: true, started: false, startError: null } }) });
+    await h.ui.ready; h.ui.showDetail({ kind: "add-workspace" }); h.click("create"); await settle(); h.set("folderName", "new"); h.input("init").checked = true; h.click("commit-sheet"); h.click("commit-sheet"); await settle();
+    expect(h.root.querySelector('[data-flow="resume"]')).toBeNull(); expect(h.mutations("createWorkspace")).toHaveLength(1); expect(h.mutations("startWorkspace")).toHaveLength(0);
+    if (kind === "unavailable") { expect(h.region().textContent).toContain("Cannot verify session"); h.click("retry"); await settle(); expect(h.mutations("createWorkspace")).toHaveLength(1); }
   });
   test("empty folder creation is not workspace creation and collision stays contextual", async () => {
     const h = harness({ createFolder: async () => ({ status: "rejected", problem: { kind: "conflict", message: "Folder already exists" } }) }); await h.ui.ready;

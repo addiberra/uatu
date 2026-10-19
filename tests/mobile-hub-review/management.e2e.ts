@@ -188,7 +188,7 @@ test("onboarding registration failure reports retained checkout without fabricat
   await page.getByLabel("Workspace display name").fill("Retained review");
   await page.getByLabel("Create the folder and initialize Git").check();
   await button(page, "Review").click();
-  await button(page, "Add stopped").click();
+  await button(page, "Create stopped").click();
   await expect(page.getByRole("heading", { name: "Configuration needs attention" })).toBeVisible();
   await expect(page.locator(".mh-flow-page .mh-info-row").filter({ has: page.locator("dt", { hasText: /^Folder retained$/ }) }).locator(".mh-info-value")).toHaveText("/synthetic/retained-review");
   const model = (await state(request)).model;
