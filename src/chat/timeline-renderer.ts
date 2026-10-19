@@ -1752,8 +1752,10 @@ function renderQuestion(item: QuestionRequest, open: boolean, active: boolean, o
   // provider family (GitHub #520) splits them the other way round from the
   // obvious one, so the pill renders the *label* — four pills printing one
   // identical ellipsised sentence told the reader nothing about which step
-  // was which — and the legend states the question whole.
-  const stepLabel = (question: StructuredQuestion) => question.prompt.length <= question.header.length ? question.prompt : question.header;
+  // was which — and the legend states the question whole. The header wins
+  // ties: both normal mappings name the label in the header, so equal
+  // lengths must not collapse every pill onto the prompt again.
+  const stepLabel = (question: StructuredQuestion) => question.prompt.length < question.header.length ? question.prompt : question.header;
   const statement = (question: StructuredQuestion) => stepLabel(question) === question.prompt ? question.header : question.prompt;
   // A mirrored pending question renders in both the parent and the child
   // transcript (ChatAdapter.mirrorToParent), sharing item.id — the panel id
