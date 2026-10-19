@@ -11,6 +11,7 @@ import { appDocumentRelativePath, appUrl } from "../shared/app-url";
 import { carryNotificationTarget } from "../chat/notification-navigation";
 import { findDocumentById, findDocumentByRelativePath } from "./storage";
 import { loadDocument } from "../preview/mount";
+import { measurePreviewHeader } from "../preview/header";
 import { renderEmptyPreview } from "../preview/empty";
 import { renderSidebar } from "../sidebar/shell";
 import { setFollowEnabled, syncFollowToggle } from "./follow";
@@ -101,6 +102,7 @@ export function scrollToFragment(rawId: string) {
   for (const candidate of candidates) {
     const element = previewElement.querySelector(`[id="${cssEscape(candidate)}"]`);
     if (element instanceof HTMLElement) {
+      measurePreviewHeader();
       element.scrollIntoView({ behavior: "smooth", block: "start" });
       return;
     }

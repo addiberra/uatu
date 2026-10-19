@@ -43,6 +43,22 @@ export { previewTitleElement, previewPathElement, previewTypeElement, previewBas
 // just owns the throw-if-null query so all `#preview-*` chrome lives here.
 export { outlineToggleButton, copySourceButton };
 
+/** Wrapped titles/actions change the sticky occlusion at runtime. Publish the
+ * actual height for every scrollIntoView consumer, not only outline clicks. */
+export function initPreviewHeaderMeasurement(): void {
+  const header = previewTitleElement.closest<HTMLElement>(".preview-header");
+  if (!header) return;
+  new ResizeObserver(measurePreviewHeader).observe(header);
+  measurePreviewHeader();
+}
+
+/** A freshly mounted document may reveal its fragment before ResizeObserver
+ * delivery. Settle the scroll reservation before starting that reveal. */
+export function measurePreviewHeader(): void {
+  const header = previewTitleElement.closest<HTMLElement>(".preview-header");
+  if (header) document.documentElement.style.setProperty("--preview-header-height", `${header.getBoundingClientRect().height}px`);
+}
+
 // Hide the entire action-icon bar. Called when leaving document mode (commit /
 // empty previews) where neither copy-source nor an outline
 // makes sense. The Rendered-view + heading-count gating for the document case

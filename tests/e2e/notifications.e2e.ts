@@ -5,7 +5,8 @@ import path from "node:path";
 import { captureScreenshot } from "./evidence";
 import { childChatControl, expect, test } from "./hub-fixtures";
 
-test.use({ hubWorkspaces: ["alpha", "beta"] });
+// Touch workspace entry verifies both runtime and assignment facts before boot.
+test.use({ hubWorkspaces: ["alpha", "beta"], hubCredentials: true });
 
 test("enrollment preserves an unrelated root worker and explains the conflict", async ({ hub, hubContext }) => {
   await hubContext.addInitScript(() => Object.defineProperty(Notification, "permission", { configurable: true, value: "granted" }));

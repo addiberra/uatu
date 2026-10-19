@@ -62,7 +62,7 @@
      and the ≤900px stacked layout, where the shell is `overflow: visible` and
      the page scrolls. One token, because both selectors are live on a device
      that switches modes without reloading and they must not drift. */
-  --preview-scroll-inset: 9rem;
+  --preview-scroll-inset: max(9rem, calc(var(--preview-header-height, 0px) + 2rem));
   font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   /* Chrome background/foreground. When these change, keep the theme-color
      meta values in src/shell/theme.ts in sync. */
@@ -4152,7 +4152,7 @@ html:not([data-ui-mode="touch"]) .app-shell:has(.terminal-panel[data-dock="right
      145px height. This layout has scrolled the body since long before touch
      mode existed. */
   :root {
-    --preview-scroll-inset: 11.5rem;
+    --preview-scroll-inset: max(11.5rem, calc(var(--preview-header-height, 0px) + 2rem));
     scroll-padding-top: var(--preview-scroll-inset);
     /* The floating navigation covers the bottom strip without reserving a
        layout gutter, so a target revealed in the last screenful — where there
@@ -6670,6 +6670,9 @@ html[data-ui-mode="touch"] .chat-unavailable details[open] summary::before { con
   font-size: 12px;
 }
 .chat-shell-window[hidden] { display: none; }
+/* The floating touch navigation and its collapsed edge handle remain usable
+   above full-area output; desktop windows still clear the native-host frost. */
+html[data-ui-mode="touch"] .chat-shell-window { z-index: 89; }
 .chat-shell-window-header { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; flex-shrink: 0; padding: 2px 2px 8px; }
 .chat-shell-window-move { flex: 1 1 120px; min-width: 0; cursor: move; touch-action: none; }
 .chat-shell-window-title { font-family: var(--terminal-font-family); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -8908,15 +8911,11 @@ html[data-ui-mode="touch"] .chat-configuration-model {
    viewport scrollport. Without this an outline click or an in-page anchor
    scrolls the heading exactly under the sticky header (#183).
 
-   And the desktop 9rem is not the right number here. The preview header wraps
-   on narrow viewports: measured at 145.06px at 320-430px wide against 111.47px
-   on a 1280px desktop. Desktop's 144px reservation clears its 111px header by
-   ~32px (the 28px blur falloff plus breathing room); 11.5rem = 184px gives the
-   same clearance over the 145px worst case. Too small lands the target under
-   the frosted header — the bug — while too large only lands it slightly lower,
-   so the error is taken in the safe direction. */
+   Keep the narrow-layout floor, but measure the header: titles and action
+   wrapping can exceed the old 184px reservation. The measured block plus
+   2rem clears its 28px blur falloff as well as the header itself. */
 html[data-ui-mode="touch"] {
-  --preview-scroll-inset: 11.5rem;
+  --preview-scroll-inset: max(11.5rem, calc(var(--preview-header-height, 0px) + 2rem));
   scroll-padding-top: var(--preview-scroll-inset);
 }
 

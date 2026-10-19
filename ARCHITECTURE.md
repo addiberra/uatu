@@ -155,7 +155,12 @@ is occluded, without changing its persisted size. Xterm refits through its
 existing host ResizeObserver.
 
 The narrow desktop layout remains a scrolling stack with a safe-area-aware
-sticky preview header. Native macOS hosting retains its existing titlebar and
+sticky preview header. Its ResizeObserver publishes the actual wrapped header
+height; preview scroll padding clears that height plus the blur falloff, with
+the existing desktop/touch minimum reservations as floors.
+Fresh-document fragment reveals synchronously refresh that measurement before
+scrolling, rather than waiting for ResizeObserver delivery.
+Native macOS hosting retains its existing titlebar and
 frost stacking contract. During pinch zoom, the desktop controller retains the
 last normal-scale layout and lets the browser pan it. Switching to touch clears
 the desktop measurements and hands sizing back to the touch chat/terminal
@@ -856,7 +861,7 @@ reference for this UI is `design/hub-mobile/screenshots-refined/`.
 | Preview file controls | A persistent pill — **Files**, then Previous/Next arrows — in the Preview surface. Arrows hide for a single-file directory and disable at the ends; they never wrap |
 
 Because the bar floats, it covers a strip of the surface beneath it while open.
-Two consequences matter when working here:
+Three consequences matter when working here:
 
 - **Scroll reveals** must not land under it. `src/shell/tab-bar.ts` publishes the
   covered height as `--navigation-occluded`, and the scrollports consume it as
@@ -865,6 +870,9 @@ Two consequences matter when working here:
 - **Pointer events** in that strip go to the bar, not the document. Tests that
   need to activate content underneath should dismiss the navigation first or
   activate the target from the keyboard.
+- **Full-area shell output** follows the bar's measured bounds and stays below
+  the bar and edge handle. Covered surfaces, including a partially covered
+  composer, are inert; navigation and recovery controls remain operable.
 
 A closed bar fades to `opacity: 0` rather than unmounting, so `data-open` — not
 visibility — is the reliable signal for whether it is reachable.

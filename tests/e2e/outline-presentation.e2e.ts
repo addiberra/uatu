@@ -16,6 +16,7 @@ import fs from "node:fs/promises";
 
 import { expect, test } from "./fixtures";
 import { showSurface } from "./navigation-helpers";
+import { captureScreenshot } from "./evidence";
 import { waitForPreviewToSettle } from "./fixtures";
 import { openTreeFile, treeRow } from "./tree-helpers";
 import { workspacePath } from "./config";
@@ -180,7 +181,7 @@ test.describe("phone width resolves to the sheet", () => {
     await expectPinnedToViewport(page);
   });
 
-  test("selecting a heading jumps to it and dismisses the sheet", async ({ page }) => {
+  test("selecting a heading jumps to it and dismisses the sheet", async ({ page }, testInfo) => {
     await page.locator("#outline-toggle").click();
     await expectPresentation(page, "sheet");
 
@@ -214,6 +215,7 @@ test.describe("phone width resolves to the sheet", () => {
     // Landed, and landed clear of the sticky header rather than under it.
     expect(geometry!.headingTop).toBeGreaterThanOrEqual(geometry!.headerBottom);
     expect(geometry!.headingTop).toBeLessThan(geometry!.headerBottom + 120);
+    await captureScreenshot(page, testInfo, "outline-heading-clears-wrapped-header");
   });
 
   test("opening another document dismisses the sheet", async ({ page }) => {

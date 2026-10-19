@@ -3,6 +3,7 @@ import type { ActivityStatus, ConversationItem } from "../../src/chat/types";
 import { LIVE_ENVELOPE_EVENT } from "../../src/shared/live-protocol";
 import { expect } from "./fixtures";
 import { openChatPanel } from "./chat-helpers";
+import { keepNavigationOpen } from "./navigation-helpers";
 
 export type Shape = "command" | "bash";
 export const shell = (shape: Shape, output: string, status: ActivityStatus = "running", id = "shell:a"): ConversationItem => ({
@@ -25,6 +26,7 @@ export async function bootShell(page: Page, request: APIRequestContext, options:
   extra?: ConversationItem[];
 } = {}) {
   const { agent = "opencode", shape = "command", child = false, touch = false, output = log(120, true), status = "running" } = options;
+  await keepNavigationOpen(page);
   await request.post("/__e2e/reset");
   await control(request, { action: "agents", count: 2 });
   const item = shell(shape, output, status);
@@ -67,7 +69,9 @@ export async function openShellRow(timeline: Locator, id: string) {
     if (await group.count() && await group.getAttribute("open") === null) {
       // A pending request's sticky banner can cover the last working line.
       // Native keyboard activation opens it without a forced pointer click.
-      await group.locator("> summary").focus();
+      // Fixture activation must not scroll the outer transcript: a native
+      // focus reveal racing disclosure growth can pause its follow anchor.
+      await group.locator("> summary").evaluate(el => (el as HTMLElement).focus({ preventScroll: true }));
       await group.locator("> summary").press("Enter");
     }
     if (await row.getAttribute("open") === null) await row.locator("> summary").click();

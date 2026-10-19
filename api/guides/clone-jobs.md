@@ -27,7 +27,7 @@ After a lost response, POST `/api/hub/clone-attempts/{attemptId}/reconcile`:
   explicitly authorized submission must use a new id.
 - `pending` means admission is still running. Reconcile again, not resubmit.
 - `expired` means the accepted job has expired or a restart left admission
-  unresolved. It does **not** prove that no checkout or registration was created.
+  unresolved. It does not prove that no checkout or registration was created.
 - HTTP 503, malformed responses or connection loss leave acceptance unknown.
   Do not infer nonacceptance from a missing dashboard entry or missing job.
 

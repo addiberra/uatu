@@ -23,6 +23,7 @@ describe("static API site", () => {
   test("renders essential product, guide, and API content", async () => {
     expect(await readFile(join(output, "index.html"), "utf8")).toContain("UatuCode helps you follow the files agents are changing");
     expect(await readFile(join(output, "docs/guides/index.html"), "utf8")).toContain("Integration guides");
+    expect(await readFile(join(output, "docs/guides/clone-jobs/index.html"), "utf8")).toContain("It does not prove that no checkout or registration was created.");
     expect(await readFile(join(output, "docs/api/index.html"), "utf8")).toContain("Search operations");
   });
 

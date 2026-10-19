@@ -142,6 +142,24 @@ for (const configured of [false, true]) test(`covered prompt navigation is inert
   a.dispose();
 });
 
+test("partially covered composer is inert while the collapsed navigation handle stays operable", () => {
+  const composer = dom.document.querySelector("main > button") as unknown as HTMLElement;
+  const handle = dom.document.createElement("button") as unknown as HTMLElement;
+  handle.id = "navigation-handle";
+  dom.document.body.append(handle);
+  for (const node of [composer, handle]) node.getBoundingClientRect = () => ({
+    x: area.x, y: area.y + area.height - 20, width: 44, height: 44,
+    left: area.x, top: area.y + area.height - 20, right: area.x + 44, bottom: area.y + area.height + 24, toJSON() {},
+  });
+  window.configure({ workArea: () => area, touch: () => true });
+  const a = shell("a"); window.open(a);
+  expect(composer.closest("[inert]")).not.toBeNull();
+  expect(handle.closest("[inert]")).toBeNull();
+  window.close(false);
+  expect(composer.closest("[inert]")).toBeNull();
+  a.dispose();
+});
+
 test("covered Preview find is inert until moved into the active full-area window", () => {
   const find = dom.document.createElement("div") as unknown as HTMLElement;
   find.id = "find-bar";

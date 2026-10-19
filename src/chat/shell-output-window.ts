@@ -1,10 +1,11 @@
 import type { ShellOutputController } from "./shell-output";
 import { setChatInert } from "./inert";
 import { dateTime } from "./dates";
+import { navigationOverlayBounds, onNavigationOverlayBoundsChange } from "../shell/tab-bar";
 
 // These controls remain above or outside full-area output. Both coverage paths
 // share the exemption so recovery stays available alongside app navigation.
-const PERSISTENT_CONTROLS = "#touch-tab-bar, .sidebar-rail, .stale-client-notice";
+const PERSISTENT_CONTROLS = "#touch-tab-bar, #navigation-handle, .sidebar-rail, .stale-client-notice";
 
 export type ShellWindowGeometry = { x: number; y: number; width: number; height: number };
 export type ShellWindowOptions = {
@@ -54,8 +55,11 @@ function defaultWorkArea(): ShellWindowGeometry {
     const inset = Number.parseFloat(window.getComputedStyle(root).getPropertyValue("--titlebar-inset"));
     if (Number.isFinite(inset)) y = Math.max(y, inset);
   }
-  // Persistent navigation remains available, including the touch tab bar.
-  for (const node of document.querySelectorAll<HTMLElement>("#touch-tab-bar, .sidebar-rail")) {
+  // The touch bar floats above the viewport edge; reserve its actual bounds,
+  // not the old edge-flush gutter. The collapsed handle overlays the output.
+  const navigation = navigationOverlayBounds();
+  if (navigation) bottom = Math.min(bottom, navigation.top);
+  for (const node of document.querySelectorAll<HTMLElement>(".sidebar-rail")) {
     const rect = node.getBoundingClientRect();
     if (!rect.width || !rect.height) continue;
     if (rect.width > rect.height && rect.bottom >= bottom - 1) bottom = Math.min(bottom, rect.top);
@@ -159,6 +163,7 @@ export class ShellOutputWindow {
       event.preventDefault(); event.stopImmediatePropagation(); this.close();
     }, true);
     const layout = () => this.layout();
+    this.cleanup.push(onNavigationOverlayBoundsChange(layout));
     window.addEventListener("resize", layout);
     window.visualViewport?.addEventListener("resize", layout);
     window.visualViewport?.addEventListener("scroll", layout);
@@ -253,7 +258,10 @@ export class ShellOutputWindow {
         // Keep it inert until Find reparents it into the active window.
         if (this.touch() && node.id === "find-bar") { roots.push(node); continue; }
         const rect = node.getBoundingClientRect();
-        if (!node.querySelector(accessible) && rect.width && rect.height && rect.left >= area.x && rect.top >= area.y && rect.right <= area.x + area.width && rect.bottom <= area.y + area.height) roots.push(node);
+        // A surface extending behind the floating navigation can be only
+        // partly covered. Its controls are still unavailable while inspecting
+        // full-area output; containment would leave the composer focusable.
+        if (!node.querySelector(accessible) && rect.width && rect.height && rect.right > area.x && rect.bottom > area.y && rect.left < area.x + area.width && rect.top < area.y + area.height) roots.push(node);
         else walk(node);
       }
     };

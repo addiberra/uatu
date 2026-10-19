@@ -2,6 +2,7 @@ import type { Page } from "@playwright/test";
 import { test as baseTest, expect } from "./fixtures";
 import { attachPageDiagnosticsOnFailure, withEngineBrowsers } from "./page-diagnostics";
 import { openChatPanel } from "./chat-helpers";
+import { openNavigation } from "./navigation-helpers";
 import { captureScreenshot, saveEvidence } from "./evidence";
 import { chatWorkload } from "../fixtures/chat-performance";
 import { armConversationCommit, conversationCommit, stopConversationCommit } from "./chat-shell-performance-helpers";
@@ -56,6 +57,27 @@ const INTERACTION_GUARD_MS = 2 * INTERACTION_BUDGET_MS;
 attachPageDiagnosticsOnFailure(test);
 
 for (const engine of ["chromium", "webkit"] as const) {
+  test(`${engine} fixture disclosure activation preserves outer reading position`, async ({ launchBrowser, request, baseURL }) => {
+    const browser = await launchBrowser(engine);
+    const page = await browser.newPage({ baseURL, viewport: { width: 1440, height: 900 } });
+    try {
+      const { timeline } = await bootShell(page, request, { extra: Array.from({ length: 20 }, (_, i) => ({
+        id: `setup-history:${i}`, type: "assistant_message" as const, createdAt: i + 2,
+        markdown: `History ${i}\n\n${"Transcript context. ".repeat(30)}`,
+      })) });
+      const group = timeline.locator('[data-chat-item-id="shell:a"]').locator("xpath=ancestor::details[contains(@class,'chat-activity-group')]");
+      await group.evaluate(el => { (el as HTMLDetailsElement).open = false; });
+      await frames(page);
+      await timeline.focus();
+      await timeline.evaluate(el => { el.scrollTop = 700; });
+      await settleScroll(timeline);
+      const top = await timeline.evaluate(el => el.scrollTop);
+      await openShellRow(timeline, "shell:a");
+      await frames(page);
+      expect(await timeline.evaluate(el => el.scrollTop)).toBe(top);
+    } finally { await browser.close(); }
+  });
+
   for (const child of [false, true]) for (const collapsed of ["row", "group"] as const) test(`${engine} ${child ? "child" : "parent"} return focuses the visible collapsed ${collapsed} summary`, async ({ launchBrowser, request, baseURL }) => {
     const browser = await launchBrowser(engine);
     const page = await browser.newPage({ baseURL, viewport: { width: 1440, height: 1000 } });
@@ -141,6 +163,10 @@ for (const engine of ["chromium", "webkit"] as const) {
       }
       if (touch) {
         expect(await page.locator("#touch-tab-bar").evaluate(el => !!el.closest("[inert]"))).toBe(false);
+        await page.locator("#navigation-close").click();
+        await expect(page.locator("#touch-tab-bar")).toBeHidden();
+        expect(await page.locator("#navigation-handle").evaluate(el => !!el.closest("[inert]"))).toBe(false);
+        await openNavigation(page);
       } else {
         await window.getByRole("button", { name: "Restore size" }).click();
         await expect.poll(() => rail.evaluate(el => !!el.closest("[inert]"))).toBe(false);

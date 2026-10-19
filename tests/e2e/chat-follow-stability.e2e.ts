@@ -16,6 +16,7 @@ declare global {
     __activeCorrectionOwner?: number;
     __shellOwners: Map<HTMLElement, { snapshot(): { top: number; left: number; following: boolean; unseen: boolean } }>;
     __shellObservations: unknown[];
+    __shellStartupObservations: unknown[];
     __shellFrameTrace: { frame: number; phase: string; reader: boolean; frames: Array<Frame & { scroller: string; owner: number; desiredTop?: number }>;
       writes: Array<Write & { scroller: string; owner: number; correctionOwner?: number }> };
   }
@@ -59,7 +60,17 @@ for (const browserName of ["chromium", "webkit"] as const) for (const touch of [
             for (const method of ["pause", "observe"]) {
               const apply = entry.anchor[method]; entry.anchor[method] = function(geometry, movement) {
                 const shell = globalThis.__shellOwners?.get(scroller); const before = shell?.snapshot();
+                const recordStartup = !globalThis.__shellFrameTrace && /^chat-(?:drilldown-)?timeline$/.test(scroller.id);
+                const pinnedBefore = recordStartup ? entry.anchor.isPinned() : undefined;
                 const value = apply.call(this, geometry, movement);
+                if (recordStartup) {
+                  const startup = globalThis.__shellStartupObservations ??= [];
+                  startup.push({ scroller: scroller.id, method, movement, pinnedBefore, pinnedAfter: entry.anchor.isPinned(),
+                    top: geometry.scrollTop, extent: geometry.scrollHeight, height: geometry.clientHeight,
+                    previousTop: coordinated.previous.scrollTop, previousExtent: coordinated.previous.scrollHeight,
+                    focus: document.activeElement?.tagName, pending: coordinated.upwardPending });
+                  if (startup.length > 100) startup.shift();
+                }
                 if (shell && globalThis.__shellFrameTrace) (globalThis.__shellObservations ??= []).push({
                   phase: globalThis.__shellFrameTrace.phase, frame: globalThis.__shellFrameTrace.frame,
                   method, movement, geometry, before, after: shell.snapshot(),
@@ -244,6 +255,8 @@ for (const browserName of ["chromium", "webkit"] as const) for (const touch of [
       expect(errors).toEqual([]);
       console.log(`${browserName} ${touch ? "touch" : "desktop"} ${child ? "child" : "parent"} shell trace ${JSON.stringify(summaries)}`);
     } finally {
+      const startup = await page.evaluate(() => window.__shellStartupObservations).catch(() => undefined);
+      if (startup) await testInfo.attach("shell-startup-observations.json", { body: JSON.stringify(startup, null, 2), contentType: "application/json" });
       const trace = await page.evaluate(() => window.__shellFrameTrace).catch(() => undefined);
       if (trace) {
         const observations = await page.evaluate(() => window.__shellObservations);

@@ -28,6 +28,7 @@ import { initTabBar, navigationWorkspaceReady } from "./shell/tab-bar";
 import { initDesktopViewport } from "./shell/desktop-viewport";
 import { initChatPanel } from "./chat/surface";
 import { initChat } from "./chat/ui";
+import { initPreviewHeaderMeasurement } from "./preview/header";
 import { initPreviewFileNavigation } from "./preview/file-navigation";
 
 const appShellElement = document.querySelector<HTMLDivElement>(".app-shell");
@@ -100,6 +101,7 @@ initUiMode();
 initDesktopViewport();
 initTabBar();
 initChatPanel();
+initPreviewHeaderMeasurement();
 initPreviewFileNavigation();
 
 initActiveSurfaceTracking();
