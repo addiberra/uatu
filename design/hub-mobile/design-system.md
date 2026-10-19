@@ -218,7 +218,8 @@ historical evidence, not the current layout authority.
 ### Reference flow: Hub → Create Workspace → Review → Outcome
 
 This local recipe refines new-workspace creation, not the whole product or the
-Existing folder and Clone editors. Keep the incumbent fonts, icons and tokens.
+Clone editor. Existing folder uses the related recipe below. Keep the incumbent
+fonts, icons and tokens.
 
 - **Overview:** resume existing work first. Running/stopped grouping and the
   separate Open/Start and Details actions remain; Add stays after the list.
@@ -248,6 +249,40 @@ Existing folder and Clone editors. Keep the incumbent fonts, icons and tokens.
 The extra current-state read deliberately trades a brief loading state for a
 truthful next action. This recipe is verified in the synthetic harness, not a
 claim of live-backend or whole-product validation.
+
+### Reference flow: Hub → Existing folder → Review → Outcome
+
+- **Location & name:** show the exact selected Hub path as selectable information,
+  beside Choose another folder and the editable display name. There is no folder
+  creation or rename field. Suggest the folder basename, capped at 64 characters,
+  until the user edits the display name; an explicit empty edit also belongs to
+  the user. A different selection updates only an unedited suggestion.
+- **Picker detours:** Cancel or browser Back returns to the same editor with its
+  identity, optional configuration, disclosure state and consents. Choosing a
+  different folder refreshes the existing registration/repository facts and
+  clears Git-init consent: authorization is specific to the selected location.
+  Already registered folders retain the incumbent Details destination.
+- **Optional setup:** reuse the native credentials disclosure, initially closed,
+  with complete safety information outside and before it. Authentication hosts
+  and signing survive closed/reopened states and review Back. Review reopens
+  invalid optional fields with their current error. Start remains outside the
+  disclosure and unchecked by default.
+- **Repository effects:** keep the existing folder detection and explicit Git-init
+  guard. A known nonrepository requires consent; unknown status leaves backend
+  validation authoritative. Existing repositories request no initialization.
+  Review itself neither writes files nor registers or starts anything.
+- **Review:** show the exact selected path and display identity once, no folder
+  creation/rename, Git-init authorization, requested session effect and exact
+  credential choices (including None). Confirm is **Add stopped** or **Add and
+  start**. Back edits the same draft.
+- **Outcome:** reuse the current-state read and guarded Open/Start owner above;
+  Details is secondary. Registration is not proof of a running session. Pending,
+  rejected, indeterminate and partial results keep the existing single-dispatch,
+  reconciliation and retained-folder recovery owners, never an automatic retry,
+  duplicate registration or fallback folder creation.
+
+The synthetic existing-folder reference suite exercises this recipe. It does
+not establish live-backend or universal browser validation.
 
 - Rendering a primitive emits no change events and performs no storage/network work.
 - Switches and radio selections remain drafts until the existing Save/Review/Apply.

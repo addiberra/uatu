@@ -102,16 +102,43 @@ export function createOnboardingFlows(env: FlowEnvironment, setupCredentials: (b
     }, { primaryAction: r.started ? "open" : "inspect", secondaryAction: r.started ? "inspect" : undefined });
   }
   function configure(path: string, git: boolean | null, catalog: PublicCredentialDto[]) {
-    let draft: ConfigurationDraft = { displayName: path.split("/").filter(Boolean).at(-1) ?? "", folderName: "", authentication: [], signing: "", start: false, init: false };
+    const suggestedName = (path: string) => [...(path.split("/").filter(Boolean).at(-1) ?? "")].slice(0, 64).join("");
+    let draft: ConfigurationDraft = { displayName: suggestedName(path), folderName: "", authentication: [], signing: "", start: false, init: false };
+    let nameEdited = false;
+    let credentialsOpen = false;
     const editor = () => {
-      const task = env.task("Add Existing Folder", text(path) + field("displayName", "Workspace display name", draft.displayName) + configurationFields(catalog, draft) + (git !== true ? check("init", "Initialize Git in this folder", draft.init) + text(git === false ? "This folder is not a Git repository. Initializing Git changes this folder and requires your consent." : "Git status is not supplied for this location. The backend will validate it. Authorize Git initialization only if you intend to initialize this folder.") : ""), { label: "Review", run: root => {
-        draft = { ...readConfiguration(root, catalog, draft), displayName: displayName(value(root, "displayName")), init: git !== true && checked(root, "init") };
+      const task = env.task("Add Existing Folder", text("Register a folder already on this Hub. Review before anything changes.")
+        + group("Location & name", infoRows([{ label: "Selected folder on Hub", value: path, mono: true }]) + rowAction("browse", "Choose another folder") + field("displayName", "Workspace display name", draft.displayName) + text("Suggested from the selected folder until you edit it. Changing the display name never renames the folder."))
+        + advisory(env.user(), false)
+        + `<details class="mh-group mh-setup-credentials" data-setup-credentials${credentialsOpen ? " open" : ""}><summary>Credentials used after setup (optional)</summary>${configurationFields(catalog, draft, { includeStart: false })}</details>`
+        + group("Register and start", (git !== true ? check("init", "Initialize Git in this folder", draft.init) + text(git === false ? "This folder is not a Git repository. Initializing Git changes this folder and requires your consent." : "Git status is not supplied for this location. The backend will validate it. Authorize Git initialization only if you intend to initialize this folder.") : text("Existing Git repository. No folder creation, rename or Git initialization is requested.")) + check("start", "Start after configuration", draft.start) + text("Off by default. Leave off to register the workspace stopped.")), { label: "Review", run: root => {
+        draft = captureConfiguration(root, draft);
+        credentialsOpen = disclosure.open;
+        let config: ConfigurationDraft;
+        try { config = readConfiguration(root, catalog, draft); }
+        catch (error) { disclosure.open = true; credentialsOpen = true; throw error; }
+        draft = { ...config, displayName: validateField(root, "displayName", displayName), init: git !== true && checked(root, "init") };
         if (git === false && !draft.init) throw new Error("Confirm Git initialization before adding a non-Git folder.");
         reviewConfiguration("Add Existing Folder", path, draft, catalog, () => backend.configureExisting({ path, displayName: draft.displayName, authentication: draft.authentication, signing: draft.signing || null, init: draft.init, start: draft.start }), editor);
       } }, { "setup-credentials": () => {
         draft = captureConfiguration(task, draft);
+        credentialsOpen = disclosure.open;
         setupCredentials(created => { if (created) catalog = [...catalog.filter(c => c.id !== created.id), created]; editor(); });
+      }, browse: () => {
+        draft = captureConfiguration(task, draft);
+        credentialsOpen = disclosure.open;
+        env.sheet.close();
+        pickFolder(path, (_selected, listing) => loadConfiguration(listing, (selected, selectedGit, refreshedCatalog) => {
+          if (selected !== path) {
+            // Consent belongs to this exact folder, not a later selection.
+            draft.init = false;
+            if (!nameEdited) draft.displayName = suggestedName(selected);
+          }
+          path = selected; git = selectedGit; catalog = refreshedCatalog; editor();
+        }), editor);
       } }); bindAuthenticationHost(task, catalog);
+      const disclosure = task.querySelector<HTMLDetailsElement>("[data-setup-credentials]")!;
+      task.querySelector<HTMLInputElement>('[name="displayName"]')!.addEventListener("input", () => { nameEdited = true; });
     }; editor();
   }
   function reviewConfiguration(title: string, path: string, draft: ConfigurationDraft, catalog: PublicCredentialDto[], call: () => ReturnType<typeof backend.configureExisting>, back: () => void, create = false) {
@@ -124,7 +151,7 @@ export function createOnboardingFlows(env: FlowEnvironment, setupCredentials: (b
       { label: draft.start ? "Create and start" : "Create stopped", run: root => env.mutate(call, result => outcome(result, true), root) }, {}, back, { cancelLabel: "Back to edit" });
       return;
     }
-    env.task(`Review ${title}`, group("Workspace", infoRows([{ label: "Display name", value: draft.displayName }, { label: "Parent folder", value: path.slice(0, path.lastIndexOf("/")) || "/", mono: true }, { label: "Folder name", value: path.split("/").at(-1) || "/", mono: true }, { label: "Folder path", value: path, mono: true }])) + group("Setup", infoRows([{ label: "Git initialization", value: draft.init ? "Authorized" : "Not requested; existing repository required" }, { label: "Start", value: draft.start ? "Start after configuration" : "Register stopped; do not start" }])) + configurationFacts(catalog, draft.authentication, draft.signing) + (draft.start && !draft.authentication.length && !draft.signing ? text("No credentials are assigned. Git authentication and signing may be unavailable, but the workspace can still start.") : ""), { label: draft.start ? "Add and start" : "Add stopped", run: root => env.mutate(call, outcome, root) }, {}, back, { cancelLabel: "Back to edit" });
+    env.task(`Review ${title}`, text("Draft only. Nothing changes until you confirm.") + group("Location & identity", infoRows([{ label: "Display name", value: draft.displayName }, { label: "Exact selected folder on Hub", value: path, mono: true }])) + group("Changes on confirmation", infoRows([{ label: "Folder", value: "Use the selected folder; do not create or rename it" }, { label: "Git initialization", value: draft.init ? "Explicitly authorized in this folder if needed" : "Not requested; existing repository required" }, { label: "Session", value: draft.start ? "Start after configuration explicitly requested" : "Register stopped; do not start" }])) + configurationFacts(catalog, draft.authentication, draft.signing) + (draft.start && !draft.authentication.length && !draft.signing ? text("No credentials are assigned. Git authentication and signing may be unavailable, but the workspace can still start.") : ""), { label: draft.start ? "Add and start" : "Add stopped", run: root => env.mutate(call, result => outcome(result, true), root) }, {}, back, { cancelLabel: "Back to edit" });
   }
   function newWorkspace(parent?: string) {
     // Creation is one ephemeral task over Add Workspace, including its reads.
@@ -223,7 +250,7 @@ export function createOnboardingFlows(env: FlowEnvironment, setupCredentials: (b
       env.page("Manage Folders", `<nav aria-label="Folder location">${text(listing.path)}${listing.parent ? action("up", `Up to ${listing.parent}`) : ""}</nav>` + (folders ? group("Folders", folders) : emptyState("folder", "No subfolders", "Files aren’t shown here. Current folder actions are available below.")) + group("Current folder", action("choose", "Configure this folder") + action("elsewhere", "Browse elsewhere") + action("create", "Create empty folder") + action("workspace", "Create workspace here") + action("rename", "Rename folder") + action("remove", "Remove empty folder", true)), actions, { primaryAction: "choose", backLabel: "Back" });
     }, () => browse(path, choose, cancel));
   }
-  function loadConfiguration(listing: FolderListing) {
+  function loadConfiguration(listing: FolderListing, ready = configure) {
     // The listing has facts for children, not the selected folder. Ask the
     // adapter's configure-existing validation to decide repository status; the
     // explicit optional init consent below never silently initializes Git.
@@ -236,11 +263,11 @@ export function createOnboardingFlows(env: FlowEnvironment, setupCredentials: (b
           const name = listing.path.split("/").filter(Boolean).at(-1);
           const facts = parent.directories.find(d => d.name === name);
           if (!facts) { env.task("Folder unavailable", text("The selected folder changed. Browse again before configuring it.")); return; }
-          configure(listing.path, facts.git, catalog);
-        }, () => loadConfiguration(listing));
-        else configure(listing.path, null, catalog);
-      }, () => loadConfiguration(listing));
-    }, () => loadConfiguration(listing));
+          ready(listing.path, facts.git, catalog);
+        }, () => loadConfiguration(listing, ready));
+        else ready(listing.path, null, catalog);
+      }, () => loadConfiguration(listing, ready));
+    }, () => loadConfiguration(listing, ready));
   }
   function emptyFolder(parent: string, choose?: (path: string) => void, cancel: () => void = add) {
     env.task("Create Empty Folder", text(`Parent: ${parent}. This creates a folder only, without Git or workspace registration.`) + technicalField("name", "Folder name"), { label: "Create folder", run: root => {
