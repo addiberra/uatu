@@ -17,13 +17,17 @@ const PERF = /@perf\b/;
 // file order, which put the heavy chat-shell suites in one shard and left it
 // minutes behind the other. Instead, `UATU_E2E_LEG=1` runs the files below
 // and `UATU_E2E_LEG=2` runs every other file, so each test is in exactly one
-// leg and a new file lands in leg 2. The list balances the legs' worker time
-// as measured on CI; rebalance it when one leg's job runs clearly longer.
-// Unset, the project runs the whole suite.
+// leg and a new file lands in leg 2. Run 39258146264 had 408 tests in leg 1
+// (14.1m) versus 873 in leg 2 (cancelled at the 25m job limit). Moving the
+// three large new chat suites gives 636 versus 645. Counts guard against
+// drift (scripts/e2e-partition.test.ts); CI worker time remains the authority
+// for rebalancing, especially for suites that launch WebKit.
+// Unset, the project runs the whole suite. No test's project or identity changes.
 const LEG_ONE_FILES = [
-  "asciidoc", "chat-agents", "chat-cost-receipt", "chat-inventory-presentation",
-  "chat-panel", "chat-queue", "chat-reversible-history", "chat-shell-output",
-  "chat-shell-scrollback", "chat-touch", "chat-unavailable", "code-blocks",
+  "asciidoc", "chat-agents", "chat-cost-receipt", "chat-hold-to-queue",
+  "chat-inventory-presentation", "chat-mobile-layout", "chat-panel", "chat-queue",
+  "chat-reversible-history", "chat-shell-output", "chat-shell-scrollback",
+  "chat-steering", "chat-touch", "chat-unavailable", "code-blocks",
   "diff-view", "git-log", "identity", "ipad-desktop-viewport", "ipad",
   "metadata-card", "mobile", "notification-layout", "notification-presence",
   "notifications", "outline-presentation", "preview-renderers",

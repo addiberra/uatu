@@ -641,7 +641,10 @@ cancelled operation.
 Ignore-policy changes, observation failures, and authenticated explicit
 `POST /api/index/recover` requests rebuild affected roots. Replacements collect
 a coherent inventory before taking ownership, and current exposure rules apply
-to reads while recovery is pending. Automatic observation recovery has bounded
+to reads while recovery is pending. Policy-file revisions are checked across
+matcher loading and watcher readiness: an edit already present in the watcher's
+initial baseline still triggers reconciliation rather than waiting for another
+edit. Automatic observation recovery has bounded
 retries; the UI offers Retry indexing after failure. Browser transport recovery
 alone consumes current server state rather than starting another filesystem
 walk. There is no periodic document-tree rescan.

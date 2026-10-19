@@ -4,7 +4,7 @@ Entries are ordered newest first. Every entry has Hub and workspace revisions, a
 
 ## Hub 11 / Workspace 28 - Unreleased (native side answers)
 
-Compatibility: additive
+Compatibility: additive from workspace revision 27; breaking (workspace) from revision 24
 
 ### Changes
 
@@ -13,7 +13,7 @@ Compatibility: additive
 
 ### Migration
 
-None. Same-build web clients use the new endpoint; it remains an excluded internal child route, not a public Hub operation. Existing personal background policy and strict pending-input contracts remain unchanged.
+Strict workspace payload consumers upgrading from revision 24 must regenerate against revision 28, including the revision 25–27 pending-input and worker changes below. Preserve `delivery`, `paused`, `unconfirmed`, worker-session identity, and worker uncertainty; accept the new queue change kinds and recover unknown mutations read-only rather than resubmitting them. The Hub revision remains 11. Same-build web clients use the new side-answer endpoint; it remains an excluded internal child route, not a public Hub operation. Existing personal background policy and strict pending-input contracts remain unchanged.
 
 ## Hub 11 / Workspace 27 - Unreleased
 

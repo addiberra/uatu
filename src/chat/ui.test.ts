@@ -634,6 +634,7 @@ describe("catalog revisions", () => {
     const { initChat } = await import(`./ui.ts?catalog-revisions=${Math.random()}`);
     initChat(api);
     await waitUntil(() => reads.length === 1 && inventory !== undefined);
+    const selectionSettled = () => !document.querySelector("#chat-timeline")!.hasAttribute("aria-busy");
     return {
       reads,
       readAgents,
@@ -641,9 +642,17 @@ describe("catalog revisions", () => {
       context: () => document.querySelector("#chat-context")?.textContent,
       select: (id: string) => { const select = document.querySelector<HTMLSelectElement>("#chat-conversation-select")!; select.value = id; select.dispatchEvent(new Event("change", { bubbles: true })); },
       statusReads: () => statusReads,
+      selectionSettled,
       invalidate: (revision: string) => inventory!.invalidation({ type: "conversation.inventory", catalogs: { claude: revision } }),
       recover: () => inventory!.recovered?.(),
-      finish: () => { for (const read of reads) read.resolve([]); window.dispatchEvent(new Event("pagehide")); },
+      finish: async () => {
+        for (const read of reads) read.resolve([]);
+        // The context label can update before the selected snapshot's paint
+        // settles. Finish that read before flushing presentation on pagehide,
+        // so its late completion cannot save through the next fake window.
+        await waitUntil(selectionSettled, () => "catalog fixture selection to settle");
+        window.dispatchEvent(new Event("pagehide"));
+      },
     };
   }
 
@@ -663,7 +672,7 @@ describe("catalog revisions", () => {
       f.invalidate("g:2");
       await waitUntil(() => f.statusReads() > before);
       expect(f.reads).toHaveLength(2);
-    } finally { f.finish(); }
+    } finally { await f.finish(); }
   });
 
   test("a failed refresh leaves the same revision eligible for a later tick", async () => {
@@ -678,7 +687,7 @@ describe("catalog revisions", () => {
       f.reads[2]!.resolve([model(1_000_000)]);
       await waitUntil(() => f.label() === "15%");
       expect(f.reads).toHaveLength(3);
-    } finally { f.finish(); }
+    } finally { await f.finish(); }
   });
 
   test("matching ticks received before failure coalesce into one automatic retry", async () => {
@@ -695,7 +704,7 @@ describe("catalog revisions", () => {
       f.reads[2]!.resolve([model(1_000_000)]);
       await waitUntil(() => f.label() === "15%");
       expect(f.reads).toHaveLength(3);
-    } finally { f.finish(); }
+    } finally { await f.finish(); }
   });
 
   test("a queued retry does not loop on failure without another invalidation", async () => {
@@ -717,7 +726,7 @@ describe("catalog revisions", () => {
       await waitUntil(() => f.reads.length === 4);
       f.reads[3]!.resolve([model(1_000_000)]);
       await waitUntil(() => f.label() === "15%");
-    } finally { f.finish(); }
+    } finally { await f.finish(); }
   });
 
   test("an old queued retry cannot supersede the reconnect's newer refresh", async () => {
@@ -735,7 +744,7 @@ describe("catalog revisions", () => {
       expect(f.reads).toHaveLength(3);
       f.reads[2]!.resolve([model(1_000_000)]);
       await waitUntil(() => f.label() === "15%");
-    } finally { f.finish(); }
+    } finally { await f.finish(); }
   });
 
   test("a matching tick during a reconnect refresh retries that request if it fails", async () => {
@@ -754,7 +763,7 @@ describe("catalog revisions", () => {
       f.reads[3]!.resolve([model(1_000_000)]);
       await waitUntil(() => f.label() === "15%");
       expect(f.reads).toHaveLength(4);
-    } finally { f.finish(); }
+    } finally { await f.finish(); }
   });
 
   test("a newer revision can finish first without an older refresh overwriting it", async () => {
@@ -775,7 +784,7 @@ describe("catalog revisions", () => {
       await waitUntil(() => f.statusReads() > before);
       expect(f.label()).toBe("15%");
       expect(f.reads).toHaveLength(3);
-    } finally { f.finish(); }
+    } finally { await f.finish(); }
   });
 
   test("an inactive agent's revision uses its own catalog capabilities", async () => {
@@ -794,7 +803,8 @@ describe("catalog revisions", () => {
       expect(f.context()).toContain("Other");
       f.select("claude:one");
       await waitUntil(() => f.label() === "15%");
-    } finally { f.finish(); }
+    } finally { await f.finish(); }
+    expect(f.selectionSettled()).toBe(true);
   });
 });
 
