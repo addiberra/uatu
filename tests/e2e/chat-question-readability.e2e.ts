@@ -238,4 +238,47 @@ test.describe("desktop", () => {
 
   test("an agent's long four-question form reads whole and its ticks state real choices", ({ page, request }, testInfo) =>
     runRepro(page, request, testInfo, [{ name: "wide", width: 1400, height: 900 }], "desktop"));
+
+  // The never-disabling primary routes through validation on every press: a
+  // required step holds the wizard at itself with the owed-answer message,
+  // an optional empty steps on freely, and the button never greys.
+  test("a required step gates advancement and an optional empty passes", async ({ page, request }) => {
+    await request.post("/__e2e/reset");
+    const token = await request.get("/__e2e/terminal-token").then(r => r.json()) as { token: string };
+    const seeded = await request.post("/__e2e/chat", { data: { action: "seed", title: "Required step", items: [] } })
+      .then(r => r.json() as Promise<{ conversation: { id: string } }>);
+    await request.post("/__e2e/chat", { data: { action: "item", conversationId: seeded.conversation.id, item: {
+      id: "question:q-required", type: "question", createdAt: 1, requestId: "q-required", status: "pending",
+      questions: [
+        { prompt: "Q1 — Scope", header: "Which surfaces should this pass cover", multiple: false, allowFreeForm: false, options: [{ label: "Timeline only", description: "" }, { label: "Whole chat", description: "" }] },
+        { prompt: "Q2 — Depth", header: "How deep should coverage go", multiple: false, optional: true, allowFreeForm: false, options: [{ label: "Smoke", description: "" }, { label: "Thorough", description: "" }] },
+      ],
+    } } });
+    await page.goto(`/?t=${encodeURIComponent(token.token)}`);
+    await openChat(page);
+    await expect(page.locator("#chat-conversation-select")).toHaveValue(seeded.conversation.id, { timeout: 15_000 });
+    const card = page.locator('[data-chat-item-id="question:q-required"]');
+    const next = card.locator("[data-question-primary]");
+    await expect(next).toHaveText("Next");
+
+    // The button never greys.
+    await expect(next).toBeEnabled();
+    // An empty required step does not advance: the wizard stays, and the
+    // surface announcer says what is owed (spoken beside the status line —
+    // the card itself also carries the step's tick state, not this message).
+    await next.click();
+    await expect(card.locator('[data-question-panel="1"]')).toBeHidden();
+    await expect(page.locator("#chat-state")).toContainText("Still to answer");
+    // Answering the required step lets the optional empty pass through,
+    // straight to Answer, which completes the set.
+    await card.locator('.chat-question-panel:not([hidden]) .chat-question-option input').first().check();
+    await next.click();
+    await expect(card.locator('[data-question-panel="1"]')).toBeVisible();
+    await expect(next).toHaveText("Answer");
+    expect(await next.isDisabled()).toBe(false);
+    await next.click();
+    await expect(card.locator(".chat-request-trace")).toHaveText("Answered");
+    // A settled form drops the answered options: no residual selection state.
+    await expect(card.locator(".chat-question-option input:checked")).toHaveCount(0);
+  });
 });

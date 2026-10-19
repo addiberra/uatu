@@ -3706,8 +3706,19 @@ export function initChat(api = new ChatApiClient()): void {
       const panels = [...questionForm.querySelectorAll<HTMLElement>("[data-question-panel]")];
       const activeIndex = Math.max(0, panels.findIndex(panel => !panel.hidden));
       // Not on the last step yet: advance instead of submitting. The primary
-      // button is "Next" here, so submitting the form means "go on".
+      // button is "Next" here, so submitting the form means "go on" — but the
+      // step being left must carry its answer first, unless it is optional
+      // and may be left empty freely. A required empty stops here with the
+      // same message the final check speaks, rather than surfacing only at
+      // the end and bouncing the reader back through the wizard (GitHub
+      // review finding on the never-disabling Answer: the check now runs on
+      // the advance path too).
       if (activeIndex < panels.length - 1) {
+        const step = item.questions[activeIndex]!;
+        if (collectQuestionAnswers(questionForm)[activeIndex]!.length === 0 && !step.optional) {
+          announceFailureFor(source)(`Still to answer: ${step.header || step.prompt || "the current question"}`, true);
+          return;
+        }
         showQuestionPanel(questionForm, activeIndex + 1);
         speakQuestionStep(source, questionForm);
         return;
