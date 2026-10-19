@@ -1,6 +1,6 @@
 # OpenCode chat screenshots
 
-Actual application captures at **1440 × 1000 CSS pixels**, Chromium, light/dark themes. These are synthetic documentation fixtures, not personal conversations, provider benchmarks, native iPhone captures, or evidence of live-model acceptance. No paid generation or live Hub was used. Other frames retain source revision `01b9743` plus the hold-origin and expanded-editing fixes; the two hold frames use `a431cc8` plus this fixed-height/arming refinement.
+Actual application captures in Chromium, light/dark themes: desktop **1440 × 1000 CSS pixels**, mobile **390 × 844**. These are synthetic documentation fixtures, not personal conversations, provider benchmarks, native iPhone captures, or evidence of live-model acceptance. No paid generation or live Hub was used. Desktop gallery and mobile frames use `afdd26a` plus the desktop-density/nonmodal-reader refinement. The personal-preferences and unknown-receipt frames retain their earlier isolated Hub captures.
 
 The standard workspace contains only the E2E sample README/files. Model names, context figures, jobs, questions and answers are scripted. The preferences capture uses an isolated test Hub/account with an empty credential store. No authentication URLs, credentials, private filesystem paths, real costs, or original user photographs are included.
 
@@ -8,19 +8,21 @@ The standard workspace contains only the E2E sample README/files. Model names, c
 | --- | --- |
 | [Overview, light](01-overview-light.png) | Idle composer, selected fixture model, draft and 32% context occupancy. |
 | [Configuration, light](01-configuration-light.png) | Model, mode and Medium reasoning selection in the real picker. |
-| [Workers, dark](02-workers-dark.png) | Two active two-line rows, dense finished row, independent Stop and Inspect targets. |
-| [Expanded queue and workers, light](03-expanded-queue-workers-light.png) | Twenty jobs plus twenty pending entries; separate headers/body scrollports use the remaining region, leaving a small conversation strip. |
+| [Workers, dark](02-workers-dark.png) | Wide-pane aligned single-line active rows, dense finished row, independent 28px Stop and Inspect targets. Narrow panes retain two lines. |
+| [Expanded queue and workers, light](03-expanded-queue-workers-light.png) | Twenty jobs plus twenty pending entries; independent scrollports and headers, 32px pending actions and a useful 200–280px preferred desktop reading band. |
 | [Hold at 1.0 seconds, dark](04-hold-quarter-dark.png) | After 500ms silent arming, 0.5s into the countdown: the full envelope is already 104px above unchanged Send. |
 | [Hold at 2.1 seconds, dark](04-hold-near-dark.png) | Identical outer bounds, increased green fill; 0.4 seconds remain before the 2500ms queue deadline. Raw frames, not a fabricated animation. |
 | [Worker inspection, dark](05-worker-inspection-dark.png) | Child transcript, Back and scoped Stop worker, while the parent worker overview remains. |
 | [Question with running work, light](06-question-with-workers-light.png) | An unanswered choice remains actionable while an independent worker runs; the composer draft is retained. |
 | [Side answer ready, dark](07-side-answer-ready-dark.png) | `/btw` completion stays at the transcript edge, outside the composer. |
-| [Formatted side reader, dark](07-side-reader-dark.png) | Real sanitized Markdown heading, table, code and workspace reference; independent workers remain visible behind it. |
+| [Formatted side reader, dark](07-side-reader-dark.png) | Larger nonmodal reading window, real sanitized Markdown and workspace reference; composer/workers remain interactive, Minimise retains the answer. |
 | [Personal preferences, light](08-personal-preferences-light.png) | Account-level automatic-background preference and its explanation, in an isolated synthetic Hub. |
 | [Unknown receipt, dark](09-unknown-receipt-dark.png) | Lost native acknowledgement remains unconfirmed, with explicit “Do not repeat” feedback rather than a retry. |
 | [Replacement warning, light](09-replacement-warning-light.png) | Reverted history, paused-steer batch action, count-only replacement warning and distinct pending delivery badges. |
+| [Mobile side reader, light](10-mobile-side-reader-light.png) | Existing mobile modal with the same accessible Minimise action. |
+| [Mobile minimised answer, light](10-mobile-side-minimised-light.png) | Unblocked conversation and composer; the existing notice reopens the retained answer without inference. |
 
-Overview/configuration/question use the scripted chat-service fixture so all model metadata can be selected without inference. The other chat captures run the production adapter/provider against the local scripted OpenCode 2.x HTTP server. The side-reader response is replaced with deterministic Markdown after the native fixture request completes. Screenshots show rendered application states, not mock HTML.
+Overview/configuration/question use the scripted chat-service fixture so all model metadata can be selected without inference. The other chat captures run the production adapter/provider against the local scripted OpenCode 2.x HTTP server. Side-reader responses use deterministic Markdown (the desktop request completes against the native fixture first; mobile is browser-stubbed). Desktop gallery widens the actual chat split to demonstrate its container-based single-line density. Screenshots show rendered application states, not mock HTML.
 
 ## Regenerate
 

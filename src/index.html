@@ -869,6 +869,7 @@
             <textarea id="chat-input" rows="1" placeholder="Send a message…" aria-describedby="chat-composer-error" aria-controls="chat-command-menu" aria-expanded="false" aria-autocomplete="list"></textarea>
             <div id="chat-composer-notices" class="chat-composer-notices" role="region" aria-label="Composer feedback and errors; scroll for all messages" tabindex="0">
               <p id="chat-queue-discovery" class="chat-queue-discovery" hidden>Tap to steer · hold to queue</p>
+              <p id="chat-keyboard-hint" class="chat-keyboard-hint" hidden></p>
               <p id="chat-action-feedback" class="chat-composer-error is-notice" role="status" aria-live="polite" hidden></p>
               <p id="chat-composer-error" class="chat-composer-error" hidden></p>
             </div>
@@ -1032,7 +1033,7 @@
           <dialog id="chat-aside-dialog" class="chat-aside-dialog" aria-labelledby="chat-aside-title">
             <header class="chat-aside-header">
               <h2 id="chat-aside-title">/btw · Side answer</h2>
-              <button id="chat-aside-close" class="chat-secondary-button" type="button" aria-label="Close side answer">Close</button>
+              <button id="chat-aside-close" class="chat-secondary-button" type="button" aria-label="Minimise side answer">Minimise</button>
             </header>
             <p id="chat-aside-question"></p>
             <p class="chat-aside-note">One-shot answer from existing context. Not added to conversation history; no agent tool execution.</p>

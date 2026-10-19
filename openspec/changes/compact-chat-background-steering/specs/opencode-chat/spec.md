@@ -21,6 +21,40 @@ On touch, the compact worker disclosure SHALL replace duplicate pinned subagent/
 
 ## ADDED Requirements
 
+### Requirement: Desktop density follows input capability and actual pane width
+Compact desktop density SHALL require selected desktop UI mode and a primary fine pointer with hover. Explicit touch/comfortable mode and touch-first hybrid devices SHALL retain existing comfortable targets. Composer actions SHALL use consistent 32px controls, one row where the actual pane fits and a deliberate two-row layout below 34rem, retaining Attach, model/mode/effort, context, Send and Stop. At actual work-pane widths of at least 40rem active worker rows SHALL align status, agent, task, model, cumulative tokens and a separate 28px Stop; narrower panes SHALL retain two lines without removing metadata. Pending actions SHALL be 32px with 4px/8px padding and independent 8px gaps, inline when they fit and wrapped otherwise. Delivery and Paused labels, edit/replacement safeguards and unknown receipts SHALL remain available. No hidden counts, success notices or replacement action menu SHALL be introduced. These desktop target exceptions supersede the comfortable 44px target rules below.
+
+#### Scenario: Resizing the pane on a desktop does not turn it into touch UI
+- **WHEN** a fine-pointer desktop chat pane narrows inside a wide viewport
+- **THEN** composer controls deliberately reflow and worker metadata uses two lines while Stop remains separate and reachable
+- **AND** explicit comfortable mode retains its existing targets regardless of viewport width
+
+#### Scenario: Desktop keyboard guidance uses the actual delivery preference
+- **WHEN** steering/queueing is offered for an ordinary desktop message-field draft
+- **THEN** visible Enter and Alt+Enter hints SHALL match the saved preference and its one-shot inverse
+- **AND** idle or non-choice drafts SHALL show ordinary send/newline guidance without changing pointer hold timing
+
+### Requirement: Desktop expanded work retains a useful conversation band
+Compact desktop expanded cards SHALL prefer 35% of measured remaining layout height for conversation, bounded to 200–280px, rather than the comfortable 20%/32–96px reserve below. Whole measured headers/actions MAY reduce this reserve to the existing lesser-of-16px-or-10% emergency floor. Independent panel scrolling, headers, selected-pane short-window priority and reachable composer/Stop SHALL remain intact. Comfortable/touch expanded allocation SHALL remain unchanged.
+
+#### Scenario: Expanded desktop work shares remaining space with conversation
+- **WHEN** two long work panels expand with 720px remaining after fixed chrome and fitting action minima
+- **THEN** conversation retains 252px and the cards share 468px through separate scrollports
+- **AND** short windows yield conversation space to measured whole headers/actions rather than clipping Stop
+
+### Requirement: Side answers minimise without losing their answer
+Desktop side answers SHALL open a larger nonmodal native dialog without a blocker or focus trap; other app controls SHALL remain interactive. The window SHALL fit actual viewport and safe-area bounds and SHALL NOT cover the entire app or become a permanent pane. Mobile MAY retain its modal reader. Both SHALL offer Minimise, replacing the old hide-only Close action rather than duplicating it. Minimise SHALL retain the page-local answer and reading offset and make the existing conversation notice available to reopen without generation, foreground admission or history mutation. Desktop Escape SHALL minimise only from inside the reader; unrelated composing keys SHALL remain owned by the composer. Focus restoration SHALL not override unrelated current interaction. Switching conversation SHALL hide the reader, retain its reading offset, and preserve the existing conversation/file-action ownership guards. These window/minimisation rules supersede modal-only Escape wording below; sanitization and file/external-link policies remain unchanged.
+
+#### Scenario: Reading continues while the main app remains usable
+- **WHEN** a desktop side answer is open
+- **THEN** the user can click and type in the composer, act on pending messages and invoke Stop without dismissing the answer
+- **AND** minimising and reopening on either desktop or mobile restores the same answer/offset without another inference
+
+#### Scenario: Live UI-mode changes minimise the current native reader
+- **WHEN** the shell changes desktop to touch or touch to desktop while a side reader is open, including an explicit override on coarse-pointer hardware
+- **THEN** the existing UI-mode event SHALL minimise the reader, release native modal inertness and retain its answer/reading offset without taking focus from the shell's next interaction
+- **AND** deliberate reopening SHALL use native modal touch or nonmodal desktop semantics matching the newly chosen UI mode, not an ARIA-only substitution, without another generation or timeline mutation
+
 ### Requirement: Pointer Send steers and an armed two-second countdown queues
 For steering-capable agents, tapping Send SHALL explicitly steer ordinary busy text independently of the saved keyboard delivery preference. This supersedes the earlier selected-delivery rule for the visible Send button only. Desktop Enter, touch Ctrl/Command+Enter, Alt/Option+Enter, and touch plain-Enter newline semantics SHALL retain their existing preference behavior. Busy commands and attachment-bearing composer drafts SHALL queue with truthful labels; native staged-replacement semantics SHALL remain unchanged. Unsupported agents SHALL retain ordinary queued/idle behavior.
 

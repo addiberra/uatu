@@ -2,6 +2,13 @@ import { describe, expect, test } from "bun:test";
 import { expandedWorkBudget } from "./work-budget";
 
 describe("expanded work capacity", () => {
+  test("desktop reserves a useful reading band and yields in short windows", () => {
+    expect(expandedWorkBudget(720, 150, "desktop").reading).toBeCloseTo(252);
+    expect(expandedWorkBudget(720, 150, "desktop").capacity).toBeCloseTo(468);
+    expect(expandedWorkBudget(1000, 150, "desktop")).toEqual({ reading: 280, capacity: 720 });
+    expect(expandedWorkBudget(240, 150, "desktop")).toEqual({ reading: 90, capacity: 150 });
+    expect(expandedWorkBudget(100, 160, "desktop")).toEqual({ reading: 10, capacity: 90 });
+  });
   test("uses actual remaining layout pixels, not a viewport percentage cap", () => {
     expect(expandedWorkBudget(600, 150)).toEqual({ reading: 96, capacity: 504 });
     expect(expandedWorkBudget(300, 150)).toEqual({ reading: 60, capacity: 240 });

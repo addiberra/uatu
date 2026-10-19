@@ -1,4 +1,42 @@
-## Current screenshot refinement (2026-10-18)
+## Approved desktop density and side window (2026-10-19)
+
+This policy supersedes the desktop density, small expanded-reading-strip and
+modal-only reader decisions below. Comfortable/touch presentation is unchanged
+apart from the reader's Minimise action. No provider or backend policy changes.
+
+- Compact controls require selected desktop UI mode AND a primary fine pointer
+  with hover. Explicit touch mode and touch-first hybrids keep comfortable targets.
+  Container width, not viewport width, determines row composition: composer
+  controls deliberately use two rows below 34rem; active workers use one aligned
+  status/agent/task/model/cumulative-token row at 40rem and above, two below.
+- Desktop composer controls are 32px; worker Stop is 28px with an independent
+  8px gap and visible focus. Pending actions are 32px with 4px/8px padding,
+  inline when they fit, wrapped otherwise. Delivery/paused labels, receipt
+  warnings, replacement safeguards and all existing actions remain available.
+- A desktop keyboard hint reads the same saved preference as message-field
+  submission, reverses Alt+Enter accordingly, and uses ordinary send/newline
+  copy when no delivery choice exists. Pointer hold remains 500ms silent arming
+  plus a two-second countdown in a fixed 104px envelope, never a tap flash.
+- Expanded compact desktop reserves 35% of actual remaining height, preferred
+  200–280px. Whole header/action minima can reduce it to the existing emergency
+  floor (lesser of 16px or 10%). Comfortable/touch retains 20%, bounded 32–96px.
+  Both panels retain their independent scrollports and always-visible headers.
+- Desktop `/btw` opens a larger native nonmodal dialog, up to 56rem wide and
+  68% of screen height, bounded by the actual visual viewport/safe areas. There
+  is no blocker, focus trap, permanent second pane, drag/resize or saved layout.
+  Underlying compose, queue and Stop actions work without dismissing it.
+- Minimise replaces the old Close label on both desktop and mobile: both mean
+  hide, not discard. Mobile remains modal while open. The existing notice reopens
+  the same page-local answer and saved scroll position without generation or
+  history mutation. A new answer starts at the top. Escape is scoped to the
+  reader on desktop; focus restoration does not steal focus from another task.
+  Conversation ownership and normal sanitized Markdown/file navigation remain
+  authoritative; switching conversation hides the reader and retains its offset.
+  Live UI-mode changes also minimise via the existing shell mode subscription:
+  reopening deliberately uses native modal touch or nonmodal desktop semantics,
+  preserving the answer/offset without extra inference or shell focus theft.
+
+## Prior screenshot refinement (2026-10-18)
 
 This refinement supersedes earlier manual-Continue, successful-feedback,
 single-line-active-row and constrained touch-sheet presentation decisions below.

@@ -4,6 +4,7 @@ import { test, expect } from "./fixtures";
 import { openChatPanel, openChatWorkers } from "./chat-helpers";
 import type { Page, APIRequestContext } from "@playwright/test";
 import path from "node:path";
+import { captureScreenshot } from "./evidence";
 
 test.skip(process.env.UATU_CAPTURE_CHAT_SCREENSHOTS !== "1", "Opt-in documentation screenshots");
 const folder = path.resolve("docs/screenshots/opencode-chat");
@@ -23,9 +24,10 @@ async function enter(page: Page, request: APIRequestContext) {
   await openChatPanel(page);
 }
 
-test("desktop documentation gallery", async ({ page, request }) => {
+test("desktop documentation gallery", async ({ page, request }, info) => {
   test.setTimeout(90_000);
   await page.setViewportSize({ width: 1440, height: 1000 });
+  await page.addInitScript(() => localStorage.setItem("uatu:presentation:v1:%2F:uatu:chat-panel", JSON.stringify({ open: true, fraction: 0.8 })));
   await page.emulateMedia({ colorScheme: "light", reducedMotion: "reduce" });
   await request.post("/__e2e/reset");
   await control(request, { action: "agents" });
@@ -85,6 +87,9 @@ test("desktop documentation gallery", async ({ page, request }) => {
   await page.locator("#chat-aside-ready").click();
   await expect(page.locator("#chat-aside-answer table")).toBeVisible();
   await shot(page, "07-side-reader-dark");
+  await page.emulateMedia({ colorScheme: "light" });
+  await captureScreenshot(page, info, "desktop-side-reader-light");
+  await page.emulateMedia({ colorScheme: "dark" });
   await page.keyboard.press("Escape");
   await page.locator("#chat-input").fill("Queue the follow-up review");
   await page.emulateMedia({ reducedMotion: "no-preference" });
@@ -120,4 +125,32 @@ test("desktop documentation gallery", async ({ page, request }) => {
   await expect(page.locator("#chat-queue-note")).toContainText("delivered together with your replacement");
   await page.locator(".chat-queue-content").evaluate(node => { node.scrollTop = 0; });
   await shot(page, "09-replacement-warning-light");
+});
+
+test("mobile side answer minimises without losing the answer", async ({ browser, request, baseURL }, info) => {
+  const page = await browser.newPage({ baseURL, viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true, colorScheme: "light" });
+  try {
+    await request.post("/__e2e/reset");
+    await control(request, { action: "agents", stack: "opencode-v2" });
+    const { token } = await request.get("/__e2e/terminal-token").then(r => r.json());
+    await page.goto(`/?t=${encodeURIComponent(token)}`);
+    await page.locator("#touch-tab-chat").click();
+    await page.getByRole("button", { name: "New conversation", exact: true }).click();
+    await expect(page.locator("#chat-state")).toContainText("Started new conversation");
+    await page.route("**/aside", route => route.fulfill({ json: { text: "# Review checklist\n\nCheck **keyboard access** and saved task backup before merging.\n\n| Area | Check |\n| --- | --- |\n| Focus | Visible and stable |\n| Backup | Validate before restore |\n\nThe answer stays available from the conversation notice after minimising." } }));
+    await page.locator("#chat-input").fill("/btw Summarize the review checklist");
+    await page.locator("#chat-send").tap();
+    await expect(page.locator("#chat-aside-ready")).toHaveText("Side answer ready");
+    await page.locator("#chat-aside-ready").tap();
+    await expect(page.locator("#chat-aside-answer table")).toBeVisible();
+    await shot(page, "10-mobile-side-reader-light");
+    await page.emulateMedia({ colorScheme: "dark" });
+    await captureScreenshot(page, info, "mobile-side-reader-dark");
+    await page.emulateMedia({ colorScheme: "light" });
+    await page.locator("#chat-aside-close").tap();
+    await expect(page.locator("#chat-aside-dialog")).toBeHidden();
+    await shot(page, "10-mobile-side-minimised-light");
+    await page.locator("#chat-aside-ready").tap();
+    await expect(page.locator("#chat-aside-answer")).toContainText("Review checklist");
+  } finally { await page.close(); }
 });

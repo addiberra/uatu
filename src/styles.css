@@ -10855,3 +10855,72 @@ html[data-ui-mode="touch"] .chat-surface:has(#chat-work-dock > details[open]:not
 .chat-transcript-area:has(> #chat-aside-ready:not([hidden])) .chat-timeline { padding-bottom: 44px; scroll-padding-bottom: 44px; }
 .chat-aside-note { color: var(--text-subtle); font-size: 12px; }
 #chat-aside-close, #chat-aside-ready { min-height: 44px; min-width: 44px; }
+
+/* A reading window, not another workspace pane. Only touch uses the existing
+   modal backdrop. The composer and other app controls stay interactive. */
+.chat-aside-header { position: sticky; top: -16px; z-index: 2; padding-block: 8px; background: var(--surface-raised); }
+.chat-aside-dialog[data-presentation="window"] {
+  z-index: 110;
+  left: auto;
+  right: max(24px, env(safe-area-inset-right));
+  transform: none;
+  top: max(var(--chat-aside-top, 12px), 48px, env(safe-area-inset-top));
+  width: min(56rem, calc(100vw - 48px));
+  max-width: calc(100vw - 48px);
+  max-height: max(0px, min(68dvh, calc(var(--chat-aside-window-height, calc(100dvh - 72px)) - env(safe-area-inset-bottom))));
+  box-shadow: 0 12px 36px rgb(0 0 0 / 22%);
+}
+.chat-keyboard-hint { display: none; margin: 0; color: var(--text-subtle); font-size: 0.75rem; line-height: 1rem; }
+
+/* Density requires BOTH the chosen desktop mode and primary pointer/hover
+   capability. Explicit comfortable/touch mode and touch-first hybrids keep
+   their existing targets. Width decisions belong to the actual chat pane. */
+@media (pointer: fine) and (hover: hover) {
+  html[data-ui-mode="desktop"] .chat-composer { container: chat-composer / inline-size; }
+  html[data-ui-mode="desktop"] .chat-work-dock { container: chat-work / inline-size; }
+  html[data-ui-mode="desktop"] .chat-keyboard-hint:not([hidden]) { display: block; }
+  html[data-ui-mode="desktop"] .chat-composer-actions,
+  html[data-ui-mode="desktop"] .chat-composer-actions:has(> .chat-attach-button) {
+    grid-template-columns: 32px auto minmax(0, 1fr) 24px auto;
+    gap: 8px;
+  }
+  html[data-ui-mode="desktop"] :is(#chat-send, #chat-stop, #chat-attach, #chat-configuration-trigger, .chat-context-usage > summary) {
+    box-sizing: border-box; min-height: 32px; height: 32px; padding-block: 4px;
+  }
+  html[data-ui-mode="desktop"] #chat-attach { width: 32px; min-width: 32px; border-radius: 6px; }
+  html[data-ui-mode="desktop"] .chat-send-group { min-height: 32px; gap: 8px; flex-wrap: nowrap; }
+  html[data-ui-mode="desktop"] :is(#chat-send, #chat-stop) { min-width: 48px; font-size: 0.8125rem; white-space: nowrap; }
+  html[data-ui-mode="desktop"] .chat-composer-status { width: 24px; height: 24px; }
+  html[data-ui-mode="desktop"] .chat-worker-row { display: grid; grid-template-columns: minmax(0, 1fr) 64px; gap: 8px; }
+  html[data-ui-mode="desktop"] .chat-worker-row + .chat-worker-row { margin-top: 0; }
+  html[data-ui-mode="desktop"] .chat-worker-row .chat-task-stop { min-height: 28px; min-width: 28px; padding: 2px 8px; }
+  html[data-ui-mode="desktop"] .chat-queued-message { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; padding: 4px 8px; }
+  html[data-ui-mode="desktop"] .chat-queued-heading { display: contents; }
+  html[data-ui-mode="desktop"] .chat-queued-message > p { flex: 1 1 180px; min-width: 0; }
+  html[data-ui-mode="desktop"] .chat-queued-row { flex: 0 1 auto; min-width: 0; max-width: 100%; margin: 0; }
+  html[data-ui-mode="desktop"] .chat-queued-actions { gap: 8px; }
+  html[data-ui-mode="desktop"] .chat-queued-action { box-sizing: border-box; min-height: 32px; min-width: 32px; padding: 4px 8px; white-space: normal; overflow-wrap: anywhere; }
+  html[data-ui-mode="desktop"] .chat-queue-batch .chat-queued-action { min-height: 32px; }
+  @container chat-composer (max-width: 34rem) {
+    html[data-ui-mode="desktop"] .chat-composer-actions:has(> .chat-attach-button) { grid-template-columns: 32px minmax(0, 1fr) auto; }
+    html[data-ui-mode="desktop"] .chat-composer-actions > #chat-attach { grid-column: 1; grid-row: 1; }
+    html[data-ui-mode="desktop"] .chat-composer-actions > #chat-configuration-trigger { grid-column: 2 / -1; grid-row: 1; }
+    html[data-ui-mode="desktop"] .chat-composer-actions > #chat-context-usage { grid-column: 1 / 3; grid-row: 2; justify-self: start; }
+    html[data-ui-mode="desktop"] .chat-composer-actions > #chat-composer-status { grid-column: 2; grid-row: 2; justify-self: end; }
+    html[data-ui-mode="desktop"] .chat-composer-actions > #chat-send-group { grid-column: 3; grid-row: 2; }
+  }
+  @container chat-work (max-width: 34rem) {
+    html[data-ui-mode="desktop"] .chat-queued-row { flex-basis: 100%; }
+  }
+  @container chat-work (min-width: 40rem) {
+    html[data-ui-mode="desktop"] .chat-worker-row:is([data-state="working"], [data-state="unknown"]) .chat-worker-inspect {
+      min-height: 28px; grid-template-columns: 12px minmax(64px, 16%) minmax(0, 1fr) minmax(72px, 22%) 60px; grid-template-rows: auto; padding-block: 2px; column-gap: 8px;
+    }
+    html[data-ui-mode="desktop"] .chat-worker-row:is([data-state="working"], [data-state="unknown"]) .chat-worker-inspect > span { grid-row: 1; }
+    html[data-ui-mode="desktop"] .chat-worker-row:is([data-state="working"], [data-state="unknown"]) .chat-worker-glyph { grid-column: 1; }
+    html[data-ui-mode="desktop"] .chat-worker-row:is([data-state="working"], [data-state="unknown"]) .chat-worker-meta { grid-column: 2; }
+    html[data-ui-mode="desktop"] .chat-worker-row:is([data-state="working"], [data-state="unknown"]) .chat-worker-name { grid-column: 3; }
+    html[data-ui-mode="desktop"] .chat-worker-row:is([data-state="working"], [data-state="unknown"]) .chat-worker-model { grid-column: 4; }
+    html[data-ui-mode="desktop"] .chat-worker-row:is([data-state="working"], [data-state="unknown"]) .chat-worker-tokens { grid-column: 5; }
+  }
+}

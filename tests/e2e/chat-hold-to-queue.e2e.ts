@@ -6,6 +6,110 @@ import { captureScreenshot, saveEvidence } from "./evidence";
 
 const test = withEngineBrowsers(base);
 function cases(engine: "chromium" | "webkit") {
+for (const touch of [false, true]) test(`side answer minimises and reopens without regeneration (${touch ? "mobile" : "desktop"})`, async ({ launchBrowser, baseURL, request }) => {
+  const browser = await launchBrowser(engine);
+  const page = await browser.newPage({ baseURL, viewport: touch ? { width: 390, height: 844 } : { width: 1440, height: 1000 }, hasTouch: touch, isMobile: touch });
+  try {
+    await boot(page, request);
+    let generations = 0;
+    await page.route("**/aside", route => { generations++; return route.fulfill({ json: { text: Array.from({ length: 60 }, (_, i) => `Paragraph ${i}: retained answer and reading position.`).join("\n\n") } }); });
+    await page.locator("#chat-input").fill("/btw Keep this answer");
+    await page.locator("#chat-send").click();
+    await expect(page.locator("#chat-aside-ready")).toHaveText("Side answer ready");
+    await page.locator("#chat-aside-ready").click();
+    const reader = page.locator("#chat-aside-dialog");
+    await expect(reader).toHaveAttribute("aria-modal", touch ? "true" : "false");
+    if (!touch) {
+      await page.locator("#chat-input").click();
+      await page.locator("#chat-input").fill("Independent draft while reading");
+      await page.locator("#chat-input").press("Escape");
+      await expect(reader).toBeVisible();
+      await expect(page.locator("#chat-input")).toBeFocused();
+      await page.locator("#chat-input").press("Alt+Enter");
+      await expect(page.locator(".chat-queued-message")).toHaveCount(1);
+      await page.locator("[data-pending-toggle]").click();
+      await page.locator("[data-queue-remove]").click();
+      await expect(page.locator(".chat-queued-message")).toHaveCount(0);
+      await page.locator("#chat-stop").click();
+      await expect(page.locator("#chat-stop")).toBeDisabled();
+      await expect(reader).toBeVisible();
+    }
+    await reader.evaluate(node => { node.scrollTop = 350; });
+    await page.locator("#chat-aside-close").click();
+    await expect(reader).toBeHidden();
+    await expect(page.locator("#chat-aside-ready")).toBeFocused();
+    await page.locator("#chat-aside-ready").click();
+    expect(await reader.evaluate(node => node.scrollTop)).toBeGreaterThan(300);
+    expect(generations).toBe(1);
+    await expect(page.locator("#chat-items")).not.toContainText("Keep this answer");
+    if (!touch) {
+      await page.evaluate(async () => {
+        document.querySelector<HTMLButtonElement>("#chat-aside-close")!.click();
+        document.querySelector<HTMLElement>("#chat-input")!.focus();
+        await new Promise<void>(resolve => requestAnimationFrame(() => resolve()));
+      });
+      await expect(page.locator("#chat-input")).toBeFocused();
+      await page.locator("#chat-aside-ready").click();
+    }
+    await page.locator("#chat-aside-close").focus();
+    await page.keyboard.press("Escape");
+    await expect(reader).toBeHidden();
+  } finally { await page.close(); }
+});
+for (const coarse of [false, true]) test(`side reader minimises on live UI mode changes (${coarse ? "coarse" : "fine"} pointer)`, async ({ launchBrowser, baseURL, request }) => {
+  const browser = await launchBrowser(engine);
+  const page = await browser.newPage({ baseURL, viewport: { width: 1440, height: 1000 }, hasTouch: coarse, isMobile: coarse });
+  await page.addInitScript(() => localStorage.setItem("uatu:presentation:v1:%2F:uatu:ui-mode", "desktop"));
+  try {
+    await boot(page, request);
+    let generations = 0;
+    await page.route("**/aside", route => { generations++; return route.fulfill({ json: { text: Array.from({ length: 80 }, (_, i) => `Paragraph ${i}: retained mode-switch answer.`).join("\n\n") } }); });
+    await page.locator("#chat-input").fill("/btw Retain through mode changes");
+    await page.locator("#chat-send").click();
+    const notice = page.locator("#chat-aside-ready"), reader = page.locator("#chat-aside-dialog"), input = page.locator("#chat-input");
+    await expect(notice).toHaveText("Side answer ready");
+    const timeline = await page.locator("#chat-items").textContent();
+    await notice.click();
+    expect(await reader.evaluate(node => node.matches(":modal"))).toBe(false);
+    await reader.evaluate(node => { node.scrollTop = 350; });
+    // A real user override on coarse hardware must work too: do not infer
+    // presentation from pointer capability instead of the chosen UI mode.
+    if (coarse) await page.locator("#ui-mode-toggle").click();
+    else await page.locator("#ui-mode-toggle").evaluate(node => (node as HTMLButtonElement).click());
+    await expect(page.locator("html")).toHaveAttribute("data-ui-mode", "touch");
+    await expect(reader).toBeHidden();
+    expect(await reader.evaluate(node => node.matches(":modal"))).toBe(false);
+    await page.locator("#touch-tab-chat").click();
+    await input.click();
+    await input.fill("Preserved draft after mode switch");
+    await expect(input).toBeFocused();
+    await notice.click();
+    await expect(reader).toHaveAttribute("aria-modal", "true");
+    expect(await reader.evaluate(node => node.matches(":modal"))).toBe(true);
+    expect(await reader.evaluate(node => node.scrollTop)).toBeGreaterThan(300);
+    // A shell/settings mode event can occur while its current modal reader
+    // makes the toggle inert. Invoke the real toggle handler, not an ARIA or
+    // data-attribute mutation, then begin another interaction in that turn.
+    await page.evaluate(async () => {
+      document.querySelector<HTMLButtonElement>("#ui-mode-toggle")!.click();
+      document.querySelector<HTMLElement>("#chat-input")!.focus();
+      await new Promise<void>(resolve => requestAnimationFrame(() => resolve()));
+    });
+    await expect(page.locator("html")).toHaveAttribute("data-ui-mode", "desktop");
+    await expect(reader).toBeHidden();
+    expect(await reader.evaluate(node => node.matches(":modal"))).toBe(false);
+    await expect(input).toBeFocused();
+    await input.click(); // Native modal inertness/scroll locking is gone.
+    await notice.click();
+    await expect(reader).toHaveAttribute("aria-modal", "false");
+    expect(await reader.evaluate(node => node.matches(":modal"))).toBe(false);
+    expect(await reader.evaluate(node => node.scrollTop)).toBeGreaterThan(300);
+    await expect(page.locator("#chat-aside-answer")).toContainText("retained mode-switch answer");
+    await expect(input).toHaveValue("Preserved draft after mode switch");
+    expect(await page.locator("#chat-items").textContent()).toBe(timeline);
+    expect(generations).toBe(1);
+  } finally { await page.close(); }
+});
 test("native touch tap steers once and a focused touch-page pointer hold queues", async ({ launchBrowser, baseURL, request }, info) => {
   const browser = await launchBrowser(engine);
   const touch = await browser.newPage({ baseURL, viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });

@@ -4,6 +4,7 @@ import { createLoadingSignal } from "../preview/loading-signal";
 import { measureChatWork } from "./performance";
 import { appState } from "../shell/state";
 import { presentationLocalStorage } from "../shell/presentation-storage";
+import { onUiModeChange } from "../shell/ui-mode";
 import { registerBackInterceptor } from "../shell/history";
 import { onManualRecovery, registerRecoveryWork, requestManualRecovery } from "../shell/live";
 import { onWorkspaceCredentialRefresh } from "../terminal/client";
@@ -1074,7 +1075,7 @@ export function initChat(api = new ChatApiClient()): void {
   compactWorkersList?.querySelector("summary")?.addEventListener("mousedown", event => keepTouchComposerFocus(event));
   surface.addEventListener("keydown", event => {
     const root = document.documentElement;
-    if (event.key !== "Escape" || event.defaultPrevented || !compactWorkersList?.open || child || surface.querySelector("dialog[open]")
+    if (event.key !== "Escape" || event.defaultPrevented || !compactWorkersList?.open || child || surface.querySelector('dialog[open]:not([data-presentation="window"])')
       || root.dataset.uiMode !== "touch" || !root.matches("[data-chat-keyboard], [data-chat-short], [data-chat-wide-short]")) return;
     event.preventDefault();
     event.stopPropagation();
@@ -2669,7 +2670,7 @@ export function initChat(api = new ChatApiClient()): void {
     // and an upload still in flight counts — submission waits for it.
     const activeId = activeConversationId();
     const openAside = document.querySelector<HTMLDialogElement>("#chat-aside-dialog[open]");
-    if (openAside && openAside.dataset.conversation !== activeId) openAside.close();
+    if (openAside && openAside.dataset.conversation !== activeId) minimiseAside("switch");
     const asideButton = document.querySelector<HTMLButtonElement>("#chat-aside-ready");
     if (asideButton) {
       asideButton.hidden = !activeId || !sideAnswers.has(activeId) && !sideGenerating.has(activeId);
@@ -3657,6 +3658,12 @@ export function initChat(api = new ChatApiClient()): void {
     send?.setAttribute("aria-label", sendAction);
     if (send) send.title = sendAction;
     const help = document.querySelector<HTMLElement>("#chat-send-help");
+    const hint = document.querySelector<HTMLElement>("#chat-keyboard-hint");
+    const keyboardChoice = deliveryChoiceOffered() && sendSupportsHold() && !isListedCommand(input?.value ?? "") && currentPendingAttachments().length === 0;
+    if (hint) {
+      hint.hidden = !projection || touch || !window.matchMedia("(pointer: fine) and (hover: hover)").matches;
+      hint.textContent = keyboardChoice ? `Enter: ${label.toLowerCase()} · Alt+Enter: ${preferred === "steer" ? "queue" : "steer"}` : "Enter: send · Shift+Enter: new line";
+    }
     const discovery = document.querySelector<HTMLElement>("#chat-queue-discovery");
     if (discovery) discovery.hidden = !queueDiscovery.visible(!send?.disabled && isLiveConversationStatus(projection?.status)
       && sendSupportsHold() && !isListedCommand(input?.value ?? "") && currentPendingAttachments().length === 0
@@ -4760,14 +4767,31 @@ export function initChat(api = new ChatApiClient()): void {
   const asideButton = document.querySelector<HTMLButtonElement>("#chat-aside-ready");
   const asideDialog = document.querySelector<HTMLDialogElement>("#chat-aside-dialog");
   const asideContent = asideDialog?.querySelector<HTMLElement>("#chat-aside-answer");
+  // Page-local reading state, keyed by conversation and answer identity. A new
+  // answer starts at the top; minimising never admits a prompt or loses text.
+  const asidePositions = new Map<string, { answer: unknown; top: number }>();
+  let paintedAside: unknown;
+  let restoreAsideFocus = false;
+  function minimiseAside(reason = "") {
+    if (!asideDialog?.open) return;
+    const id = asideDialog.dataset.conversation;
+    if (id) boundedSet(asidePositions, id, { answer: paintedAside, top: asideDialog.scrollTop }, 200);
+    restoreAsideFocus = reason !== "mode" && asideDialog.contains(document.activeElement);
+    asideDialog.close(reason);
+  }
+  // A native modal/nonmodal dialog cannot change modality in place. Hide on
+  // the shell's real mode event; deliberate reopening chooses the new mode
+  // while retaining the answer/offset, without taking over shell focus.
+  onUiModeChange(() => minimiseAside("mode"));
   if (asideContent) wireItemInteractions(asideContent,
     () => asideDialog?.open && asideDialog.dataset.conversation === projection?.conversationId ? projection : null,
-    { renderer, rerender: () => scheduleRender(false), beforeFileNavigation: () => asideDialog?.close("file") }, parentScroll);
+    { renderer, rerender: () => scheduleRender(false), beforeFileNavigation: () => minimiseAside("file") }, parentScroll);
   const syncAsideViewport = () => {
     if (!asideDialog?.open) return;
     const viewport = window.visualViewport;
     asideDialog.style.setProperty("--chat-aside-top", `${(viewport?.offsetTop ?? 0) + 12}px`);
     asideDialog.style.setProperty("--chat-aside-height", `${Math.max(0, (viewport?.height ?? window.innerHeight) - 24)}px`);
+    asideDialog.style.setProperty("--chat-aside-window-height", `${Math.max(0, (viewport?.height ?? window.innerHeight) - 72)}px`);
     asideDialog.style.setProperty("--chat-aside-bottom", `${(viewport?.offsetTop ?? 0) + (viewport?.height ?? window.innerHeight) - 12}px`);
   };
   window.visualViewport?.addEventListener("resize", syncAsideViewport);
@@ -4789,14 +4813,31 @@ export function initChat(api = new ChatApiClient()): void {
     }
     asideDialog.dataset.conversation = id!;
     asideDialog.returnValue = "";
-    asideDialog.showModal();
+    paintedAside = answer;
+    const nonmodal = document.documentElement.dataset.uiMode === "desktop";
+    asideDialog.dataset.presentation = nonmodal ? "window" : "modal";
+    asideDialog.setAttribute("aria-modal", String(!nonmodal));
+    // Native close restoration belongs to the deliberate invoker, not the
+    // touch draft whose focus mousedown preserved until reader activation.
+    asideButton.focus({ preventScroll: true });
+    if (nonmodal) asideDialog.show(); else asideDialog.showModal();
     syncAsideViewport();
     document.querySelector<HTMLElement>("#chat-aside-close")?.focus({ preventScroll: true });
-    asideDialog.scrollTop = 0;
+    const saved = asidePositions.get(id!);
+    asideDialog.scrollTop = saved?.answer === answer ? saved.top : 0;
   });
-  document.querySelector("#chat-aside-close")?.addEventListener("click", () => asideDialog?.close());
+  document.querySelector("#chat-aside-close")?.addEventListener("click", () => minimiseAside());
+  asideDialog?.addEventListener("cancel", event => { event.preventDefault(); minimiseAside(); });
+  asideDialog?.addEventListener("keydown", event => {
+    if (event.key === "Escape" && asideDialog.dataset.presentation === "window") {
+      event.preventDefault(); event.stopPropagation(); minimiseAside();
+    }
+  });
   asideDialog?.addEventListener("close", () => {
-    if (asideDialog.returnValue !== "file" && asideDialog.dataset.conversation === activeConversationId() && asideButton && !asideButton.hidden) asideButton.focus({ preventScroll: true });
+    const focused = document.activeElement;
+    const mayRestore = focused === document.body || focused === asideButton || asideDialog.contains(focused);
+    if (restoreAsideFocus && mayRestore && asideDialog.returnValue !== "file" && asideDialog.dataset.conversation === activeConversationId() && asideButton && !asideButton.hidden) asideButton.focus({ preventScroll: true });
+    restoreAsideFocus = false;
   });
 
   form.addEventListener("submit", async event => {
@@ -5197,7 +5238,8 @@ export function initChat(api = new ChatApiClient()): void {
       if (style.display === "none" || ["absolute", "fixed"].includes(style.position)) return height;
       return height + child.getBoundingClientRect().height + (parseFloat(style.marginTop) || 0) + (parseFloat(style.marginBottom) || 0);
     }, (parseFloat(css.paddingTop) || 0) + (parseFloat(css.paddingBottom) || 0));
-    const { reading, capacity } = expandedWorkBudget(surface.clientHeight - fixed, minimumWork);
+    const compactDesktop = document.documentElement.dataset.uiMode === "desktop" && window.matchMedia("(pointer: fine) and (hover: hover)").matches;
+    const { reading, capacity } = expandedWorkBudget(surface.clientHeight - fixed, minimumWork, compactDesktop ? "desktop" : "comfortable");
     for (const [element, property, value] of [
       [dock, "--chat-work-expanded-capacity", capacity],
       [dock, "--chat-work-hard-available", capacity],
@@ -5295,7 +5337,7 @@ export function initChat(api = new ChatApiClient()): void {
   });
   surface.addEventListener("keydown", event => {
     if (event.key === "Escape" && !event.defaultPrevented && document.documentElement.hasAttribute("data-chat-work-expanded")) {
-      if (surface.querySelector("dialog[open], #chat-drilldown:not([hidden])")) return;
+      if (surface.querySelector('dialog[open]:not([data-presentation="window"]), #chat-drilldown:not([hidden])')) return;
       event.preventDefault(); event.stopPropagation(); closeDesktopWork();
     }
   });

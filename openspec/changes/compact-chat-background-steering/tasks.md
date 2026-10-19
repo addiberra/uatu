@@ -419,3 +419,33 @@ remain outside this correction; no universal enlarged-text 40% guarantee is clai
 - [x] 13.4 Add 13 privacy-reviewed, actual-rendered desktop PNGs and an indexed synthetic-fixture disclosure under `docs/screenshots/opencode-chat/`; retain opt-in capture tests, covering configuration, workers, queue, hold progression, inspection, questions, side reader, personal preference and uncertain/replacement feedback.
 - [x] 13.5 Verify chat unit suite (1,736 pass, 9 skip), typecheck, build, strict change/spec validation and diff hygiene. Build retains existing unsupported `::highlight` warnings. No API/auth behavior changed; no live Hub, paid generation, dependency installation or publication was used. Native iOS reproduction remains outstanding.
 - [x] 13.6 Address independent-review P2: replace per-frame envelope reset/read with a stable inert zero-size fixed-origin sibling, sampled before paint writes. Keep dynamic-origin/translated-containing-block calibration and gesture guards; remove both nodes on pagehide and restore on retained-page return or a subsequent gesture. Four 650ms Chromium desktop/mobile light/dark traces reduce the review's 42–45 `paintHold` Layout events to zero, with zero direct calibration style flushes. Frame-entry style resolution remains (39–40 events), not a claim of no browser style work. Re-run 22 targeted units, 37 browser cases, typecheck, build, strict changes and diff hygiene; keep the 13 reviewed PNGs unchanged because geometry and appearance are unchanged.
+## Desktop density and minimisable side window (2026-10-19)
+
+- [x] Address independent P2 mode-transition review: minimise an open reader through the existing shell UI-mode subscription in both directions, retaining answer/offset; verify native `:modal`, released inertness, chosen-mode overrides, no duplicate inference/timeline mutation and no shell focus theft on fine/coarse Chromium contexts.
+
+- [x] Apply desktop-mode + primary fine-pointer/hover density with container-based composer/worker reflow; retain comfortable/touch targets and all safety actions.
+- [x] Reserve a preferred 35%/200–280px desktop expanded conversation band with measured short-window yielding; retain the comfortable/touch budget unchanged.
+- [x] Show preference-derived desktop Enter/Alt+Enter guidance without altering hold timing or pointer delivery.
+- [x] Open a larger nonmodal desktop side reader; offer Minimise on desktop/mobile, retaining answer identity/offset and conversation ownership without inference/history mutation.
+- [x] Cover density, reverse keyboard preference, explicit comfortable mode, outside compose/queue/Stop interaction, retained reading position and scoped Escape in focused Chromium regressions; refresh affected synthetic documentation captures and add mobile examples.
+
+Verification is scoped, not a blanket clean-suite claim. The focused density +
+Chromium hold/side-reader selection passes 37 tests, and the opt-in desktop/mobile
+gallery passes two. Relevant unit tests, typecheck, build and strict change
+validation pass. No backend/API contracts changed; earlier API evidence below
+was not rerun. WebKit desktop/mobile attempts stall at initial native panel/tab
+activation before reaching the feature, as in prior local checks; native iPhone
+verification remains outstanding.
+
+Three additional mobile checks fail identically on an isolated `afdd26a` source
+archive and this change: the 200%/230px independent-panel case clips the Pending
+header by 5px after worker prioritisation, and both mixed-worker theme cases
+expect a 337.6px expanded transcript despite the existing approved 96px reserve.
+Their tests/requirements were preserved, not weakened. Baseline failure artifacts
+are in task scratch `desktop-density-btw-20261019/baseline-evidence/`.
+Mechanical design detection reports incumbent/global warnings, not a clean scan;
+no unrelated design system changes were made. Fresh independent review cleared
+the mode-lifecycle correction: both native modality directions, retained answer
+and 350px reading offset, one generation, released inertness and preserved draft
+and outside focus. Its focused checks passed 5 density/reader cases, 10 reader
+ownership cases and 11 units; these are separate runs, not an aggregate suite.
