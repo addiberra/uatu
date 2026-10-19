@@ -154,17 +154,19 @@ test.describe("steering an OpenCode 2.x turn", () => {
       document.documentElement.dataset.theme = theme;
       document.documentElement.dataset.activeTab = "chat";
     }, { mode, theme });
-    for (let index = 1; index <= 5; index++) await submit(page, `Audit pending ${index}: preserve this longer message for a readable dock`, index > 2 ? "Alt+Enter" : "Enter");
+    // Five short entries can now fit completely in the expanded capacity.
+    // Fill the supported inbox to keep this a real overflow/fade regression.
+    for (let index = 1; index <= 20; index++) await submit(page, `Audit pending ${index}: preserve this longer message for a readable dock`, index > 2 ? "Alt+Enter" : "Enter");
     await inspectPending(page);
     const queue = page.locator("#chat-queue");
     const scroller = page.locator("#chat-queue-content");
     await scroller.evaluate(element => { element.scrollTop = 0; });
-    await expect(queue.locator(".chat-queue-header")).toContainText("2 steers · 3 queued");
-    await expect(dock(page)).toHaveCount(5);
+    await expect(queue.locator(".chat-queue-header")).toContainText("2 steers · 18 queued");
+    await expect(dock(page)).toHaveCount(20);
     await expect(queue).toHaveClass(/has-more-below/);
     const metrics = await scroller.evaluate(element => ({ height: element.clientHeight, viewport: innerHeight }));
     expect(metrics.height).toBeGreaterThan(135);
-    expect(metrics.height).toBeLessThanOrEqual(metrics.viewport * 0.4 + 1);
+    await expectWorkTranscriptBudget(page, metrics.viewport);
     await saveEvidence(testInfo, `audit-dock-${mode}-${theme}-metrics.json`, JSON.stringify(await scroller.evaluate(element => ({
       clientHeight: element.clientHeight,
       scrollHeight: element.scrollHeight,
@@ -843,7 +845,7 @@ for (const browserName of ["chromium", "webkit"] as const) test.describe(`steeri
     // Enlarged cards grow inside Pending's independent content pane.
     const scroller = page.locator("#chat-queue-content");
     expect(await scroller.evaluate(node => node.scrollHeight > node.clientHeight)).toBe(true);
-    expect((await page.locator("#chat-timeline").boundingBox())!.height).toBeGreaterThanOrEqual(844 * 0.4);
+    await expectWorkTranscriptBudget(page, 844);
     await expect(page.locator("#chat-send, #chat-stop")).toHaveCount(2);
     await expect(held(page)).toHaveCount(3); // Inspecting and scrolling never mutates pending work.
     await expect(held(page).locator(".chat-message-attachments")).toHaveCount(2);

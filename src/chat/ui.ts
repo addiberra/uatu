@@ -25,6 +25,7 @@ import { backgroundTasksByTool, runningBackgroundTasks } from "./background-task
 import { pausedStatusLabel, pausedWakeups, pendingWakeups, scheduledStatusLabel, wakeupFireTime } from "./scheduled-wakeups";
 import { CompactDisclosure, compactWorkers, workerSummary } from "./compact-work";
 import { CompactWorkersView } from "./compact-workers-view";
+import { expandedWorkBudget } from "./work-budget";
 import { renderChatMarkdown } from "./markdown";
 import { SilentRunFollower, TaskInspectionPanel, formatTaskElapsed, taskForChild, taskById, taskInspection, type OpenTaskInspection } from "./task-inspection";
 import { composerRoutineState, formatUsd, latestPlanReport, latestRateLimit, planChip, planHasRows, planName, planReadoutRows, sessionTotalsTitle, standingSentence, usageAsOf, usageStale, type RateLimitStanding } from "./composer-status";
@@ -3607,6 +3608,7 @@ export function initChat(api = new ChatApiClient()): void {
     const padding = (parseFloat(dockCss.paddingTop) || 0) + (parseFloat(dockCss.paddingBottom) || 0);
     const fullFloor = workerFloor + queueFloor + gapCount * normalGap + padding + extraHeight;
     set("--chat-work-full-floor", fullFloor);
+    syncExpandedWorkBudget(scroller, fullFloor);
     const hardAvailable = parseFloat(scroller.style.getPropertyValue("--chat-work-hard-available"));
     const cramped = (document.documentElement.dataset.uiMode === "touch" || document.documentElement.hasAttribute("data-chat-work-expanded"))
       && Number.isFinite(hardAvailable) && fullFloor > hardAvailable;
@@ -5140,6 +5142,33 @@ export function initChat(api = new ChatApiClient()): void {
   workDock?.addEventListener("pointerdown", prioritizeWorkPane);
   workDock?.addEventListener("focusin", prioritizeWorkPane);
   workDock?.addEventListener("click", prioritizeWorkPane, true);
+  function syncExpandedWorkBudget(dock: HTMLElement, minimumWork: number) {
+    if (!surface || !queueDockElement || typeof getComputedStyle !== "function") return;
+    const expanded = !!compactWorkersList?.open && !compactWorkersList.hidden
+      || !queueDockElement.hidden && queueDockElement.dataset.expanded === "true";
+    dock.toggleAttribute("data-work-content-expanded", expanded);
+    if (!expanded) {
+      dock.style.removeProperty("--chat-work-expanded-capacity");
+      surface.style.removeProperty("--chat-expanded-reading");
+      return;
+    }
+    const css = getComputedStyle(surface);
+    const fixed = [...surface.children].reduce((height, child) => {
+      if (child === dock || child.classList.contains("chat-transcript-area")) return height;
+      const style = getComputedStyle(child);
+      if (style.display === "none" || ["absolute", "fixed"].includes(style.position)) return height;
+      return height + child.getBoundingClientRect().height + (parseFloat(style.marginTop) || 0) + (parseFloat(style.marginBottom) || 0);
+    }, (parseFloat(css.paddingTop) || 0) + (parseFloat(css.paddingBottom) || 0));
+    const { reading, capacity } = expandedWorkBudget(surface.clientHeight - fixed, minimumWork);
+    for (const [element, property, value] of [
+      [dock, "--chat-work-expanded-capacity", capacity],
+      [dock, "--chat-work-hard-available", capacity],
+      [surface, "--chat-expanded-reading", reading],
+    ] as const) {
+      const pixels = `${value}px`;
+      if (element.style.getPropertyValue(property) !== pixels) element.style.setProperty(property, pixels);
+    }
+  }
   function syncDesktopWorkLayout() {
     if (!surface || !form || !input || typeof getComputedStyle !== "function") return;
     const root = document.documentElement;
@@ -5154,7 +5183,7 @@ export function initChat(api = new ChatApiClient()): void {
       toggle.hidden = close.hidden = true;
       return;
     }
-    dock.style.removeProperty("--chat-work-hard-available");
+    if (!dock.hasAttribute("data-work-content-expanded")) dock.style.removeProperty("--chat-work-hard-available");
     dock.style.removeProperty("--chat-work-available");
     const hasWork = [...dock.children].some(child => child !== close && !(child as HTMLElement).hidden && getComputedStyle(child).display !== "none");
     root.toggleAttribute("data-chat-has-work", hasWork);
@@ -5164,7 +5193,9 @@ export function initChat(api = new ChatApiClient()): void {
       if (css.display === "none" || ["absolute", "fixed"].includes(css.position)) return height;
       return height + child.getBoundingClientRect().height + (parseFloat(css.marginTop) || 0) + (parseFloat(css.marginBottom) || 0);
     }, 0);
-    const floor = parseFloat(getComputedStyle(transcript).minHeight) || 0;
+    const floor = dock.hasAttribute("data-work-content-expanded")
+      ? parseFloat(surface.style.getPropertyValue("--chat-expanded-reading")) || 0
+      : parseFloat(getComputedStyle(transcript).minHeight) || 0;
     const minimum = Math.max(52, parseFloat(dock.style.getPropertyValue("--chat-work-full-floor")) || 0);
     const constrained = hasWork && surface.clientHeight - fixed - floor < minimum;
     root.toggleAttribute("data-chat-work-constrained", constrained);
@@ -5235,7 +5266,7 @@ export function initChat(api = new ChatApiClient()): void {
   const observer = typeof ResizeObserver === "function" ? new ResizeObserver(() => {
     syncQueueOverflow();
     syncDesktopWorkLayout();
-    if (workDock && document.documentElement.dataset.uiMode === "touch") {
+    if (workDock && document.documentElement.dataset.uiMode === "touch" && !workDock.hasAttribute("data-work-content-expanded")) {
       // Text enlargement can make fixed chrome taller than its percentage
       // budget. Secondary work yields before the primary composer does.
       const visualHeight = window.visualViewport?.height ?? window.innerHeight;

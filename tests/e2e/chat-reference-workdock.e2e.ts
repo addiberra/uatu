@@ -45,6 +45,12 @@ for (const engine of ["chromium", "webkit"] as const) for (const touch of [false
       const revealWork = async () => {
         // Viewport/text/disclosure changes schedule measured desktop layout.
         await expectWorkLayoutReady(page);
+        await expect.poll(() => page.locator("#chat-work-dock").evaluate(dock => {
+          const workers = dock.querySelector<HTMLDetailsElement>("#chat-compact-workers");
+          const queue = dock.querySelector<HTMLElement>("#chat-queue");
+          const expanded = !!workers?.open && !workers.hidden || !!queue && !queue.hidden && queue.dataset.expanded === "true";
+          return dock.hasAttribute("data-work-content-expanded") === expanded;
+        })).toBe(true);
         const reveal = page.locator("#chat-work-toggle");
         if (await reveal.isVisible()) await reveal.click();
       };
@@ -139,7 +145,15 @@ for (const engine of ["chromium", "webkit"] as const) for (const touch of [false
           await expect(card).toHaveJSProperty("open", workersOpen);
           if ((await pending.getAttribute("aria-expanded") === "true") !== queueOpen) await pending.click();
           await expect(pending).toHaveAttribute("aria-expanded", String(queueOpen));
+          await revealWork();
           await expectWorkLayoutReady(page);
+          if (!workersOpen && !queueOpen) {
+            const closed = await page.locator("#chat-compact-workers, #chat-queue").evaluateAll(cards => cards.map(card => {
+              const css = getComputedStyle(card);
+              return { actual: card.getBoundingClientRect().height, natural: card.querySelector("summary, .chat-queue-header")!.getBoundingClientRect().height + (parseFloat(css.borderTopWidth) || 0) + (parseFloat(css.borderBottomWidth) || 0) };
+            }));
+            for (const card of closed) expect(card.actual).toBeCloseTo(card.natural, 0);
+          }
           await fullyVisible(card.locator(":scope > summary"));
           await fullyVisible(pending);
           const scrollers = await page.locator("#chat-work-dock").evaluate(node => [node, ...node.querySelectorAll("*")].filter(child => child.getBoundingClientRect().height > 0 && /auto|scroll/.test(getComputedStyle(child).overflowY)).map(child => child.id));
@@ -150,6 +164,44 @@ for (const engine of ["chromium", "webkit"] as const) for (const touch of [false
             await fullyVisible(remove);
           }
           if (workersOpen && queueOpen) {
+            const budget = await page.locator("#chat-work-dock").evaluate(dock => {
+              const surface = document.querySelector<HTMLElement>("#chat-surface")!;
+              const transcript = document.querySelector<HTMLElement>(".chat-transcript-area")!;
+              const css = getComputedStyle(surface), px = (s: string) => parseFloat(s) || 0;
+              const fixed = [...surface.children].reduce((sum, node) => {
+                const style = getComputedStyle(node);
+                return node === dock || node === transcript || style.display === "none" || ["absolute", "fixed"].includes(style.position) ? sum : sum + node.getBoundingClientRect().height + px(style.marginTop) + px(style.marginBottom);
+              }, px(css.paddingTop) + px(css.paddingBottom));
+              return { remaining: surface.clientHeight - fixed, dock: dock.getBoundingClientRect().height, transcript: transcript.clientHeight, oldCap: document.documentElement.dataset.uiMode === "touch" ? (window.visualViewport?.height ?? innerHeight) * .35 : Math.min(surface.clientHeight * .4, 400) };
+            });
+            await saveEvidence(info, `expanded-budget-${enlarged ? "200" : "100"}.json`, JSON.stringify(budget, null, 2));
+            if (!enlarged) {
+              expect(budget.dock).toBeGreaterThan(budget.oldCap + 50);
+              expect(budget.transcript).toBeGreaterThanOrEqual(32);
+              expect(budget.transcript).toBeLessThanOrEqual(97);
+              expect(budget.dock + budget.transcript).toBeCloseTo(budget.remaining, 0);
+              // Reconstruct only 005cb41's original normal-size caps, so the
+              // evidence includes actual before/after layout, not just math.
+              const previous = await page.addStyleTag({ content: touch
+                ? 'html[data-ui-mode="touch"] .chat-work-dock { --chat-work-budget: calc(var(--chat-visual-height) * .35) !important; } html[data-ui-mode="touch"] .chat-transcript-area { min-height: 0 !important; }'
+                : 'html[data-ui-mode="desktop"] .chat-work-dock { --chat-work-budget: min(calc(var(--chat-panel-height) * .4), 25rem) !important; } html[data-ui-mode="desktop"] .chat-transcript-area { min-height: min(12rem, calc(var(--chat-panel-height) * .35)) !important; }' });
+              await expect.poll(() => page.locator("#chat-work-dock").evaluate(node => node.getBoundingClientRect().height)).toBeLessThanOrEqual(budget.oldCap + 1);
+              const before = await page.locator("#chat-work-dock").evaluate(node => node.getBoundingClientRect().height);
+              await captureScreenshot(page, info, `expanded-budget-${engine}-${touch ? "phone" : "desktop"}-previous-cap`);
+              await previous.evaluate(node => node.remove());
+              await expect.poll(() => page.locator("#chat-work-dock").evaluate(node => node.getBoundingClientRect().height)).toBeCloseTo(budget.dock, 0);
+              await saveEvidence(info, "expanded-budget-before-after.json", JSON.stringify({ before, after: budget.dock, conversation: budget.transcript, remaining: budget.remaining, baseline: "005cb41 normal-size CSS caps reconstructed over the same 20+20 state" }, null, 2));
+            }
+            // Resizing the transcript restores its coordinated reading anchor.
+            // Let that layout consequence finish before testing native scroll
+            // isolation; do not misattribute a pending restore to the wheel.
+            let previousState = "", stableState = 0;
+            await expect.poll(async () => {
+              const current = JSON.stringify(await scrollState());
+              stableState = current === previousState ? stableState + 1 : 0;
+              previousState = current;
+              return stableState;
+            }, { intervals: [100] }).toBeGreaterThanOrEqual(2);
             // Mobile WebKit does not expose wheel input. Its hardware-keyboard
             // PageDown performs native scroll routing through a pane action;
             // Chromium still covers real wheel and touch gestures below.

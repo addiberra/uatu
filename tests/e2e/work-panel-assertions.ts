@@ -60,7 +60,11 @@ export async function expectWorkTranscriptBudget(page: Page, visualHeight: numbe
     const normal = visualHeight * 0.4;
     const short = visualHeight <= 450 && document.documentElement.hasAttribute("data-chat-short");
     const physical = Math.max(0, surface.clientHeight - fixed - minimumWork);
-    const expected = short ? Math.min(normal, physical) : normal;
+    const remaining = Math.max(0, surface.clientHeight - fixed);
+    const expanded = !!dock.querySelector("#chat-compact-workers[open], #chat-queue[data-expanded='true']");
+    const preferredStrip = Math.min(remaining, 96, Math.max(32, remaining * .2));
+    const expandedStrip = Math.min(preferredStrip, Math.max(Math.min(16, remaining * .1), physical));
+    const expected = expanded ? expandedStrip : short ? Math.min(normal, physical) : normal;
     const visible = Math.min(transcript.clientHeight, timeline.clientHeight);
     return visible >= expected - 1 ? true : { visible, expected, normal, fixed, minimumWork, physical };
   }, visualHeight)).toBe(true);

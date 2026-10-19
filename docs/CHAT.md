@@ -205,8 +205,14 @@ no shared outer scroller. Long lists divide the measured budget, while short
 or collapsed lists yield unused space. Reverted history, TODOs and scheduled
 wakeups also remeasure when opened; their bounded panes include the header,
 borders, content gap and outer margins so actions remain scroll-reachable.
-Normal transcript/safe-area budgets remain wherever the measured minimum
-headers, whole actions and composer leave that space. For example, a 230px
+With both cards collapsed, normal transcript/safe-area budgets remain wherever
+the measured minimum headers, whole actions and composer leave that space. With
+either expanded, cards can use most of the region left after measured header,
+composer, notices and safe-area padding. Conversation keeps 20% of that region,
+bounded to 32–96px; whole actions can reduce it, down to the lesser of 16px or
+10% of the remaining region in an insufficient band. Short lists do not fill
+that capacity: they return unused height to conversation. Collapsing both cards
+restores the normal budget without changing the reading intention. For example, a 230px
 landscape keyboard band has a 44px app header, 46px composer and 72px for two
 closed cards plus spacing: only 68px remains, not the normal 92px (40%). Both
 cards stay visible; touch does not switch to Show work or hide their headers.
@@ -292,9 +298,10 @@ as **Send now + paused steers** wrap without truncation. Paused-batch actions
 scroll inside Pending's content pane, never in its count header. Counts stay
 visible; confirmation wording and paused-batch delivery semantics stay intact.
 As before, enlarged replacement warnings may take extra space from the transcript
-to keep their full text and controls reachable; the 40% phone/short-landscape
-reading budget applies whenever whole actions and headers physically fit; a
-smaller band prioritizes the pane being used without overlapping the composer.
+to keep their full text and controls reachable. The 40% phone/short-landscape
+reading budget applies to collapsed cards whenever whole actions and headers
+physically fit; expanded cards use the small conversation strip above. A smaller
+band prioritizes the pane being used without overlapping the composer.
 Worker counts distinguish
 confirmed working, finished (including failed/stopped), and unknown occurrences.
 Counts and rows use the same deduplicated executions: actual background shell
@@ -327,12 +334,12 @@ read failure means that page cannot confirm the saved preference, not that the
 server has disabled a saved ON policy in another tab or device. Desktop
 retains its existing tracks and automatic expansion: detachment collapses only
 an automatically opened duplicate track, not one deliberately reopened.
-Desktop tracks and pending messages share a scrollable aggregate capped at
-40% of the measured chat panel (and 25rem), yielding further to keep the
-composer fully visible and reserve the lesser of 12rem or 35% for the transcript.
-The individual expanded-list rem caps remain. A new replacement warning is
-revealed once within that aggregate after the restored draft has laid out;
-later updates respect deliberate work-dock scrolling.
+Desktop cards share only a measured capacity, never an outer scroller. When both
+are collapsed the cap is 40% of the measured chat panel (and 25rem), with the
+lesser of 12rem or 35% reserved for conversation. Expanded cards use the measured
+small-strip policy above and do not require Show work when normal in-flow actions
+fit. A new replacement warning is revealed once within Pending after the restored
+draft has laid out; later updates respect deliberate independent pane scrolling.
 Non-empty desktop work reserves at least 52px (3.25rem when larger) so a full
 44px action and visible focus ring can be exposed. The transcript yields to
 its reserved floor first. If the measured remaining space cannot fit that

@@ -10708,6 +10708,16 @@ html:is([data-ui-mode="touch"], [data-ui-mode="desktop"]) .chat-work-dock :is(#c
 html:is([data-ui-mode="touch"], [data-ui-mode="desktop"]) .chat-work-dock[data-work-cramped]:not([data-work-active="history"]) > :is(#chat-reverted, #chat-task-list, #chat-scheduled-wakeups):not([hidden]) { min-height: var(--chat-track-heading); }
 .chat-work-dock .chat-queue-items { max-height: none; overflow: visible; min-width: 0; }
 .chat-work-dock .chat-queue-items[hidden] { display: none; }
+/* Expanding lends the cards the measured remaining region, not all UI space.
+   Auto-sized flex cards still give short lists back to the conversation. */
+html:is([data-ui-mode="touch"], [data-ui-mode="desktop"]) .chat-work-dock[data-work-content-expanded] {
+  --chat-work-budget: var(--chat-work-expanded-capacity, 0px);
+  max-height: var(--chat-work-budget);
+  flex-shrink: 0;
+}
+html:is([data-ui-mode="touch"], [data-ui-mode="desktop"]) .chat-surface:has(.chat-work-dock[data-work-content-expanded]) .chat-transcript-area {
+  min-height: var(--chat-expanded-reading, 0px);
+}
 .chat-queue-discovery { margin: 0; color: var(--text-subtle); font-size: 0.8125rem; line-height: 1.4; }
 .chat-queue-discovery[hidden] { display: none; }
 #chat-compact-workers-items ul { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 0.5rem; }

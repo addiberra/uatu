@@ -35,19 +35,31 @@ provider admission/backgrounding APIs, question handling or hold delivery.
   External and rejected-reference policy stays with the existing shared code.
 
 The in-flow correction also counts surface safe-area padding and all measured
-chrome before allocating the dock budget; short landscape uses the 40% phone
+chrome before allocating the dock budget; collapsed short landscape uses the 40% phone
 reading floor rather than the tablet ratio. Both card headers remain outside
 their content scrollports so neither folds into the other's viewport.
 The existing enlarged replacement-warning exception is preserved: its warning
 and batch controls may take space from the reading floor instead of being clipped.
-Phone/short-landscape layouts retain 40% wherever the measured minimum chrome
+Collapsed phone/short-landscape layouts retain 40% wherever the measured minimum chrome
 and whole action rows physically fit. In a 230px keyboard band, the 44px app
 header, 46px composer and two closed cards plus spacing (72px) leave only 68px,
 not 92px. The user explicitly chose visible sibling cards over more transcript
 space: do not hide headers or introduce a touch Show work fallback. Open panes
-may require further transcript space to expose whole actions. Ordinary enlarged
-pending work retains its tested reading floor; no universal enlarged-text 40%
-guarantee is claimed.
+use the user-approved expanded policy below rather than the former 40% reading
+floor; no universal enlarged-text 40% guarantee is claimed.
+
+When either worker or pending card is expanded, measure remaining space after
+all in-flow chrome, composer/notices and safe-area padding. Reserve 20% of that
+region for conversation, bounded to 32–96px. If measured whole header/action
+minima need more, reduce the reserve, retaining the lesser of 16px or 10% of
+the region where physically possible. The rest is card capacity: two long lists
+partition it; short/closed lists yield their unused share, without blank height.
+For remaining regions of 600px, 300px and 140px (with fitting minima), conversation
+keeps 96px, 60px and 32px; cards may use 504px, 240px and 108px respectively.
+Collapsed cards restore the existing percentages. Desktop's Show work fallback
+is needed only when measured minima do not fit beside that applicable reserve.
+Native disclosure, focus ownership, per-pane offsets and coordinated transcript
+anchors remain unchanged; expansion is not a request to jump conversation.
 
 Header activation selects a constrained pane as well as its body. Priority is
 applied on the native header click, not pointerdown/focus, because reallocating
@@ -118,7 +130,7 @@ See proposal.md, “Why”. This is a planning-only successor to the two active 
 ### Observed seams and evidence
 
 - `src/index.html:821–938` has separate task/Continue/subagent/pending sections and composer rails. `ui.ts:1092–1102` already distinguishes running blocking evidence from pending tools and detached/uncertain launchers. `running-work-disclosure.ts` automatically expands new running work; `background-tasks.ts` folds launcher aliases but the pinned list currently includes running background tasks only. Completed history and task inspection already exist: consolidate their presentation, do not create a second worker lifecycle store.
-- `tests/e2e/chat-mobile-layout.e2e.ts` preserves controls at 390px width / 380–450px visual heights and 844px landscape / 230px visual height; loaded layouts require 40% phone / 35% tablet transcript space wherever minimum chrome physically permits it. Short-screen assertions measure irreducible panel/chrome space independently of the dock's current rendered height; the closed-card 230px case explicitly requires 68px. The existing active designs cap the aggregate dock at 35% visual height, 25% at width ≥48rem, and 24% during hardware-keyboard editing, yielding only when minimum headers/actions cannot fit. Existing audit tests cover safe insets, outside-menu tap consumption, replacement warnings, focus, remote reading and bottom pinning.
+- `tests/e2e/chat-mobile-layout.e2e.ts` preserves controls at 390px width / 380–450px visual heights and 844px landscape / 230px visual height; collapsed layouts require 40% phone / 35% tablet transcript space wherever minimum chrome physically permits it. Expanded layouts use the measured small-strip reserve above. Short-screen assertions measure irreducible panel/chrome space independently of the dock's current rendered height; the closed-card 230px case explicitly requires 68px. Collapsed docks retain 35% visual height, 25% at width ≥48rem, and 24% during hardware-keyboard editing, yielding only when minimum headers/actions cannot fit. Existing audit tests cover safe insets, outside-menu tap consumption, replacement warnings, focus, remote reading and bottom pinning.
 - `src/hub/preferences.ts:1–6` explicitly stores Hub-wide host preferences, not personal state. `personal-state.ts` keys user plus workspace and serves per-workspace browser state; it is not an account-level setting. `auth.ts:35–40` supplies stable configured user names through cookie/bearer sessions. `server.ts:1622–1653` demonstrates server-selected `session.user`, closed patch validation and serialized writes. There is no observed account-level chat-preference API to reuse unchanged.
 - Settings (`pages.ts:684–709`) mixes clearly machine-wide agent accounts, workspace defaults and devices. Add a separately labelled personal section. The workspace Hub menu (`shell/hub-nav.ts:679–686,864–877`) currently links dashboard/sign-out, not Settings; add a stable Settings link through its existing keyed reconciliation/focus behavior.
 - The authenticated Hub workspace branch checks origin before proxying (`hub/server.ts:1592–1689`). `proxy.ts:75–95` currently copies most caller headers verbatim and shapes Host/Origin; it carries no trustworthy per-user policy to the child. Child chat routes require the workspace credential and origin (`server/routes.ts:498–509`), then dispatch agent-qualified IDs through `service.ts`. A browser-selected user, shared adapter flag, or unsigned copied header would be an unsafe authority for personal preference.

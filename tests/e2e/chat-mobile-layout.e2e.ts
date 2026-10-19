@@ -381,12 +381,14 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`mobile layo
       const transcript = document.querySelector(".chat-transcript-area")!.getBoundingClientRect().height;
       return { height: element.clientHeight, fixed: element.clientHeight - dock - transcript };
     });
-    await expect.poll(() => page.locator("#chat-timeline").evaluate(element => element.clientHeight)).toBeGreaterThanOrEqual(Math.min(scene.visual * (scene.width === 390 || scene.width === 844 ? 0.4 : 0.35), Math.max(0, reading.height - reading.fixed - requiredWork)) - 1);
+    const remaining = Math.max(0, reading.height - reading.fixed);
+    const reserve = expanded ? Math.min(remaining, 96, Math.max(32, remaining * .2), Math.max(Math.min(16, remaining * .1), remaining - requiredWork)) : scene.visual * (scene.width === 390 || scene.width === 844 ? .4 : .35);
+    await expect.poll(() => page.locator("#chat-timeline").evaluate(element => element.clientHeight)).toBeGreaterThanOrEqual(Math.min(reserve, Math.max(0, remaining - requiredWork)) - 1);
     const metrics = await page.locator("#chat-surface").evaluate(element => ({ surface: element.clientHeight, scrollTop: element.scrollTop, dock: document.querySelector("#chat-work-dock")!.getBoundingClientRect().height, overlay: getComputedStyle(document.querySelector("#chat-work-dock")!).position === "absolute", timeline: document.querySelector("#chat-timeline")!.getBoundingClientRect().height }));
     const hardwareEditing = await page.locator("html").evaluate(node => node.hasAttribute("data-chat-editing") && !node.hasAttribute("data-chat-keyboard"));
     const cap = hardwareEditing ? 0.24 : scene.width >= 768 ? 0.25 : 0.35;
     expect(metrics.overlay).toBe(false);
-    expect(metrics.dock).toBeLessThanOrEqual(Math.max(scene.visual * cap, requiredWork) + 1);
+    expect(metrics.dock).toBeLessThanOrEqual(Math.max(expanded ? remaining - reserve : scene.visual * cap, requiredWork) + 1);
     const dock = (await page.locator("#chat-work-dock").boundingBox())!;
     const transcript = (await page.locator(".chat-transcript-area").boundingBox())!;
     expect(dock.y).toBeGreaterThanOrEqual(transcript.y + transcript.height - 1);

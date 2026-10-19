@@ -1,3 +1,50 @@
+## Expanded-card capacity amendment (2026-10-18)
+
+The user's explicit choice to keep a small conversation area while expanded
+cards use most available height supersedes the earlier universal 40% reserve
+only when either card is expanded. Historical acceptance counts below remain
+historical, not evidence for this amendment.
+
+- [x] Measure remaining panel pixels after in-flow chrome/composer/notices/safe areas; reserve 20% bounded to 32–96px, yielding to whole actions down to min(16px, 10% of remaining space). Keep independent scrolling, content-sized short lists and the existing collapsed policy.
+- [x] Update both active designs/specs and CHAT documentation with the explicit collapsed/expanded distinction; retain meaningful action, disclosure, focus and anchor tests.
+- [x] Verify the implementation with focused units, Chromium layout/action/anchor cases, an actual 005cb41 baseline comparison, typecheck/build and strict specifications; hand off evidence and runtime blockers without publication.
+- [ ] Complete fresh WebKit acceptance and independent review. Initial WebKit canonical worker counts did not converge; subsequent mobile activation stalled before layout assertions. No WebKit acceptance or independently validated completion is claimed.
+
+Evidence lives in `~/.cache/opencode/scratch/expanded-panel-budget-20261018/`.
+`baseline-red.log` runs archived **005cb41** product source with the focused
+capacity assertion (the unrelated viewport matrix is omitted): the expected
+increase fails at **360px**. `browser-acceptance.log` passes both final Chromium
+reference cases, including normal/200% disclosure combinations, native independent
+scrolling and keyed offset restoration; its following audit fixture failed only
+because five entries now fit without overflow. That fixture now fills the
+supported 20-message inbox, and `browser-pending-final.log` passes **10/10**
+target/density/enlarged-warning/image/action cases. `browser-final.log` additionally
+passes **15** Chromium safe-area/keyboard/tablet/anchor/motion cases before its
+intermediate reference-test failure. Together these are **27 distinct Chromium
+passes**, not an all-green aggregate or cross-engine run. Earlier reference-test
+failures exposed final flex shrinking and test scheduling assumptions; the final
+tests preserve scroll isolation, wait for applied disclosure/settled anchor state,
+and exercise desktop's existing insufficient-space sheet rather than hiding it.
+
+Final 20+20 geometry is **544.25px cards / 96px conversation** from a 640.25px
+remaining desktop region, versus the actual baseline's **360px / 280px**. Phone
+uses **508.47px / 96px** from 604.48px remaining; its reconstructed prior CSS-cap
+capture is 275.78px, not a second untouched-source baseline run. In the tested
+230px band, 44px header plus 46px composer leave 140px: the expanded policy keeps
+a truthful **14px** conversation region and gives cards **126px**, prioritizing
+the selected whole action while retaining both headers. Closed cards still leave
+the documented 68px in that band.
+
+`chat-units.log` passes **1,736 / 9 skip / 0 fail**; the new budget unit's missing
+implementation is recorded in `unit-red.log`. `typecheck-final.log` and
+`build-final.log` pass (existing highlight-selector build warnings remain).
+`specs-final.log` records the final strict check. No API behavior changed, so API
+contract suites were not rerun. The mechanical detector reports existing style
+warnings outside this change; no unrelated redesign was applied. Real-device,
+assistive-technology and paid/live-provider checks remain unperformed. Source
+and native test-server jobs are not left running; independent review/publication
+remain lead-owned.
+
 ## Independent-review side-reader link correction (2026-10-18)
 
 - [x] 14.1 Reproduce the reported README link reload in both engines at the real reader click seam; retain page identity, draft, originating conversation and exactly one native generate as meaningful outcomes.
