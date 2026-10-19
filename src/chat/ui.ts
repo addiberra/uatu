@@ -796,6 +796,24 @@ export function initChat(api = new ChatApiClient()): void {
         if (error instanceof ChatConnectionInterruptedError) owned.set(stream, message);
         speak(message, true);
       },
+      // Whether a stream of this surface is still down, even while another
+      // message (a validation refusal on an ordinary click) occupies the
+      // line in its place.
+      hasDown(): boolean {
+        return owned.size > 0;
+      },
+      // A transient message replaced this owner's interruption text: the
+      // stream is still down underneath, so the in-place recovery affordance
+      // stands beside the transient line until owned text returns.
+      keepRecoveryVisible(): void {
+        if (owned.size > 0 && speak.target) speak.target.append(reconnect);
+      },
+      // Speak the newest owned interruption again — a finished message left
+      // the line without retelling it while the stream is still down.
+      restoreOwned(): void {
+        const remaining = [...owned.values()].at(-1);
+        if (remaining !== undefined) speak(remaining, true);
+      },
       // This stream's transport is healthy again. Its message goes; if the
       // other stream is still interrupted, the line states that instead of
       // falling silent.
@@ -811,6 +829,10 @@ export function initChat(api = new ChatApiClient()): void {
   };
   const interruptions = interruptionsFor(announce);
   const childInterruptions = interruptionsFor(announceChild);
+  // The interruption owner for the surface a message belongs to, so a
+  // transient writer can preserve that surface's recovery affordances.
+  const interruptionsOwnerFor = (source: ChatProjection) =>
+    child && source.conversationId === child.conversationId ? childInterruptions : interruptions;
 
   const geometryOf = (scroller: HTMLElement, container: HTMLElement): AnchorGeometry => {
     const bounds = scroller.getBoundingClientRect();
@@ -3670,10 +3692,14 @@ export function initChat(api = new ChatApiClient()): void {
 
     // Retire this conversation's owed-answer line once the step it held back
     // becomes valid — but only while the line still reads as ours: a newer
-    // unrelated status (an outage, a refusal) is never spoken over.
+    // unrelated status (an outage, a refusal) is never spoken over. The
+    // interruption owner re-states its message when the blank replaces it.
     const clearOwedAnswer = (source: ChatProjection) => {
       const spoken = announceFailureFor(source);
-      if (spoken.current().startsWith("Still to answer")) spoken("");
+      if (spoken.current().startsWith("Still to answer")) {
+        spoken("");
+        interruptionsOwnerFor(source).restoreOwned();
+      }
     };
 
     container.addEventListener("change", event => {
@@ -3714,6 +3740,15 @@ export function initChat(api = new ChatApiClient()): void {
       const source = sourceProjection();
       if (source) speakQuestionStep(source, tab.form);
     });
+    // A required empty stops here with the owed-answer message the final
+    // check also speaks. During a connection interruption the message takes
+    // the status line's text, but the outage's recovery affordance stays
+    // beside it — the stream is still down underneath.
+    const speakOwedAnswer = (source: ChatProjection, message: string) => {
+      announceFailureFor(source)(message, true);
+      interruptionsOwnerFor(source).keepRecoveryVisible();
+    };
+
     container.addEventListener("submit", event => {
       const questionForm = event.target as HTMLFormElement;
       if (!questionForm.matches("form[data-question-form]")) return;
@@ -3735,7 +3770,7 @@ export function initChat(api = new ChatApiClient()): void {
       if (activeIndex < panels.length - 1) {
         const step = item.questions[activeIndex]!;
         if (collectQuestionAnswers(questionForm)[activeIndex]!.length === 0 && !step.optional) {
-          announceFailureFor(source)(`Still to answer: ${step.header || step.prompt || "the current question"}`, true);
+          speakOwedAnswer(source, `Still to answer: ${step.header || step.prompt || "the current question"}`);
           return;
         }
         clearOwedAnswer(source);
@@ -3753,7 +3788,7 @@ export function initChat(api = new ChatApiClient()): void {
         // Name each owed step: a field without a label reads empty here
         // otherwise, and the prompt always names it.
         const owed = missing.map(index => item.questions[index]!.header || item.questions[index]!.prompt || "the current question").filter(Boolean).join(", ");
-        announceFailureFor(source)(`Still to answer: ${owed}`, true);
+        speakOwedAnswer(source, `Still to answer: ${owed}`);
         return;
       }
       clearOwedAnswer(source);
