@@ -1,6 +1,7 @@
 import { test as base, expect } from "../e2e/fixtures";
 import { withEngineBrowsers } from "../e2e/page-diagnostics";
-import { headerGeometry, installScrollProbe, nativeIntrinsicWidths, scrollCheckpoint } from "./linux-ui-probe";
+import { headerGeometry, installScrollProbe, scrollCheckpoint } from "./linux-ui-probe";
+import { enlargedPendingFixture } from "../e2e/enlarged-pending-fixture";
 import type { APIRequestContext, Page, TestInfo } from "@playwright/test";
 import { writeFile } from "node:fs/promises";
 
@@ -41,94 +42,58 @@ function engine(info: TestInfo): "webkit" | "chromium" {
 test("Linux causality probe: native header intrinsic widths", async ({ launchBrowser, baseURL, request }, info) => {
   test.setTimeout(60_000);
   const browser = await launchBrowser(engine(info));
-  const page = await browser.newPage({ baseURL, viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true, reducedMotion: "reduce" });
   const observations: unknown[] = [];
   try {
-    await boot(page, request);
-    await queue(page, "Synthetic queued text\nSecond readable line");
-    await page.locator("[data-pending-toggle]").tap();
-    observations.push({ stage: "before-font-ready", geometry: await headerGeometry(page) });
-    await page.evaluate(() => document.fonts.ready.then(() => { document.documentElement.style.fontSize = "200%"; }));
-    observations.push({ stage: "enlarged-before-paint", geometry: await headerGeometry(page) });
-    // Clone real markup and stylesheets into a separate synthetic document.
-    // No experimental stylesheet ever touches the app or its reading state.
     for (const width of [390, 320]) {
-      await page.setViewportSize({ width, height: 844 });
-      await painted(page);
-      const actual = await headerGeometry(page);
-      const fixture = await page.evaluate(() => {
-        const root = document.querySelector("#chat-surface")!;
-        // Only the real header subtree is copied, including native options and labels.
-        // Do NOT inline computed widths: doing so would freeze auto/intrinsic sizing.
-        const surface = root.cloneNode(false) as HTMLElement;
-        surface.append(root.querySelector(".chat-header")!.cloneNode(true));
-        const styles = [...document.querySelectorAll("link[rel='stylesheet'], style")].map(node => {
-          const clone = node.cloneNode(true) as HTMLElement;
-          if (node instanceof HTMLLinkElement) clone.setAttribute("href", node.href);
-          return clone.outerHTML;
-        }).join("\n");
-        const attributes = (node: Element) => [...node.attributes].map(attr => [attr.name, attr.value]);
-        return { surface: surface.outerHTML, styles, viewport: document.querySelector('meta[name="viewport"]')?.outerHTML ?? "", html: attributes(document.documentElement), body: attributes(document.body) };
-      });
-      const isolated = await browser.newPage({ viewport: { width, height: 844 }, isMobile: true, hasTouch: true, reducedMotion: "reduce" });
-      try {
-        // Same fixture origin avoids null-origin/private-network stylesheet
-        // restrictions. This intercepted document runs no application script.
-        await isolated.route("**/__causal_header", route => route.fulfill({ contentType: "text/html", body: `<html><head>${fixture.viewport}${fixture.styles}</head><body>${fixture.surface}</body></html>` }));
-        await isolated.goto(`${baseURL}/__causal_header`);
-        await isolated.evaluate(fixture => {
-          for (const [name, value] of fixture.html) document.documentElement.setAttribute(name!, value!);
-          for (const [name, value] of fixture.body) document.body.setAttribute(name!, value!);
-          return document.fonts.ready.then(() => {});
-        }, fixture);
-        await painted(isolated);
-        const baseline = await headerGeometry(isolated);
-        const intrinsicWidths = await nativeIntrinsicWidths(isolated);
-        const comparable = actual.nodes.filter(n => ["chat-surface", "chat-header", "chat-conversation-controls", "chat-conversation-select", "chat-new-conversation"].includes(n.id)).map(n => {
-          const copied = baseline.nodes.find(other => other.id === n.id);
-          return { id: n.id, clientDelta: copied ? copied.client - n.client : null, scrollDelta: copied ? copied.scroll - n.scroll : null };
-        });
-        const overrides = [
-          ["select-min-width", "#chat-conversation-select {min-width:0!important}"],
-          ["select-flex-shrink", "#chat-conversation-select {flex-shrink:1!important}"],
-          ["parent-min-width", ".chat-conversation-controls {min-width:0!important}"],
-          ["parent-flex-shrink", ".chat-conversation-controls {flex-shrink:1!important}"],
-          ["select-inline-size", "#chat-conversation-select {inline-size:100%!important}"],
-          ["select-max-inline-size", "#chat-conversation-select {max-inline-size:100%!important}"],
-          ["select-box-sizing", "#chat-conversation-select {box-sizing:border-box!important}"],
-          ["parent-wrap", ".chat-conversation-controls {flex-wrap:wrap!important}"],
-          ["button-min-width", "#chat-new-conversation {min-width:0!important}"],
-          ["button-white-space", "#chat-new-conversation {white-space:normal!important}"],
-          ["button-overflow-wrap", "#chat-new-conversation {overflow-wrap:anywhere!important}"],
-          ["parent-position", ".chat-conversation-controls {position:relative!important}"],
-          ["label-inset", ".chat-conversation-controls label {inset:0 auto auto 0!important}"],
-          ["native-appearance-control", "#chat-conversation-select {appearance:none!important}"],
-        ];
-        const variants: unknown[] = [];
-        // Retain completed observations even if a later native operation times out.
-        const observation = { width, actual, baseline, comparable, baselineEquivalent: comparable.every(n => n.clientDelta !== null && n.scrollDelta !== null && Math.abs(n.clientDelta) <= 1 && Math.abs(n.scrollDelta) <= 1), intrinsicWidths, variants, nativeSelection: undefined as unknown };
-        observations.push(observation);
-        for (const [name, css] of overrides) {
-          const style = await isolated.addStyleTag({ content: css! });
-          await painted(isolated);
-          variants.push({ name, geometry: await headerGeometry(isolated) });
-          await style.evaluate(n => n.remove());
-          await painted(isolated);
-          variants.push({ name: `${name}:reset`, geometry: await headerGeometry(isolated) });
-        }
-        const picker = isolated.getByRole("combobox", { name: "Conversation", exact: true });
-        await expect(picker).toBeVisible();
-        await picker.focus();
-        await expect(picker).toBeFocused();
-        // selectOption uses the native select, preserving its selected value.
-        const selected = await picker.inputValue();
-        await picker.selectOption(selected);
-        observation.nativeSelection = await headerGeometry(isolated);
-      } finally { await isolated.close(); }
+      // Every intervention gets a fresh *real* failing fixture. Baselines are
+      // live route state, not an isolated clone with different native options.
+      const variants = [
+        ["control", ""],
+        ["focus-only", ""],
+        ["reselect-only", ""],
+        ["native-width-invalidation", ""],
+        ["label-anchor", ".chat-conversation-controls {position:relative!important} .chat-conversation-controls > label {inset:0 auto auto 0!important}"],
+        ["select-inline-containment", "#chat-conversation-select {contain:inline-size!important}"],
+        ["grid-definite-select", ".chat-conversation-controls {display:grid!important;grid-auto-flow:column;grid-template-columns:minmax(0,1fr);grid-auto-columns:auto} #chat-conversation-select {width:100%!important;max-width:100%!important;box-sizing:border-box}"],
+      ];
+      for (const [name, css] of variants) {
+        const page = await browser.newPage({ baseURL, viewport: { width, height: 844 }, isMobile: true, hasTouch: true, reducedMotion: "reduce" });
+        try {
+          await enlargedPendingFixture(page, request, width, "light");
+          // Match the failing assertion's preceding paints and pane scroll.
+          await painted(page);
+          await page.locator("#chat-queue-content").evaluate(n => { n.scrollTop = 100; });
+          await painted(page);
+          const before = await headerGeometry(page);
+          const picker = page.getByRole("combobox", { name: "Conversation", exact: true });
+          const selected = await picker.inputValue();
+          const events: string[] = [];
+          page.on("request", r => { if (/\/api\/chat\//.test(r.url()) && r.method() !== "GET") events.push(r.method()); });
+          await page.evaluate(() => {
+            Object.assign(window, { headerProbeEvents: [] });
+            for (const type of ["input", "change"]) document.querySelector("#chat-conversation-select")!.addEventListener(type, () => (window as unknown as { headerProbeEvents: string[] }).headerProbeEvents.push(type));
+          });
+          if (name === "focus-only") await picker.focus();
+          else if (name === "reselect-only") await picker.selectOption(selected);
+          else if (name === "native-width-invalidation") await picker.evaluate(node => {
+            const old = node.style.width;
+            node.style.width = `${node.getBoundingClientRect().width}px`;
+            void node.offsetWidth;
+            node.style.width = old;
+          });
+          else if (css) await page.addStyleTag({ content: css });
+          const immediate = await headerGeometry(page);
+          await painted(page);
+          const after = await headerGeometry(page);
+          observations.push({ width, name, before, immediate, after,
+            baselineOverflow: before.nodes.find(n => n.id === "chat-surface")!.scroll > width,
+            sameSelection: selected === await picker.inputValue(), mutations: events,
+            controlEvents: await page.evaluate(() => (window as unknown as { headerProbeEvents: string[] }).headerProbeEvents) });
+        } finally { await page.close(); }
+      }
     }
   } finally {
-    await attach(info, "header-causality", { engine: engine(info), meaning: "collection only; no resolution assertion", observations });
-    await page.close();
+    await attach(info, "header-causality", { engine: engine(info), meaning: "fresh live enlarged-pending fixture per intervention; only overflowing baselines support causal conclusions", observations });
   }
 });
 

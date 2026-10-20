@@ -3599,9 +3599,13 @@ export function initChat(api = new ChatApiClient()): void {
       const pixels = `${value}px`;
       if (scroller.style.getPropertyValue(name) !== pixels) scroller.style.setProperty(name, pixels);
     };
-    set("--chat-worker-natural", workerHeight ? workerHeight + workerBody + 2 : 0);
+    // Retain open measurements while native details hides its body. CSS uses
+    // [open] to switch to heading-only allocation before `toggle` is delivered.
+    if (compactWorkersList?.open || !workerHeight) {
+      set("--chat-worker-natural", workerHeight ? workerHeight + workerBody + 2 : 0);
+      set("--chat-worker-floor", workerFloor);
+    }
     set("--chat-queue-natural", pendingHeight ? pendingHeight + queueBody + 2 : 0);
-    set("--chat-worker-floor", workerFloor);
     set("--chat-worker-heading", workerHeight + 2);
     set("--chat-queue-heading", pendingHeight + 2);
     set("--chat-queue-floor", queueFloor);

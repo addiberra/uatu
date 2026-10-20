@@ -10682,9 +10682,16 @@ html:is([data-ui-mode="touch"], [data-ui-mode="desktop"]) .chat-work-dock .chat-
 .chat-work-dock .chat-queue[data-expanded="false"]:not(:has(.is-replacement:not([hidden]))) { gap: 0; }
 html:is([data-ui-mode="touch"], [data-ui-mode="desktop"]) .chat-work-dock { min-height: min(var(--chat-work-floor, 0px), var(--chat-work-hard-available, 100vh)); }
 html[data-ui-mode="desktop"][data-chat-has-work] .chat-work-dock { min-height: var(--chat-work-floor, 52px); }
-.chat-work-dock { --chat-card-space: calc(max(var(--chat-work-budget), var(--chat-work-floor, 0px)) - var(--chat-work-extras, 0px) - var(--chat-work-spacing, 4px)); }
+.chat-work-dock {
+  --chat-card-space: calc(max(var(--chat-work-budget), var(--chat-work-floor, 0px)) - var(--chat-work-extras, 0px) - var(--chat-work-spacing, 4px));
+  --chat-worker-share: var(--chat-worker-natural, var(--chat-worker-heading, 0px));
+}
+/* Native details closes before its deferred toggle event. Reclaim its share
+   in that very layout, not after the transcript has grown and clamped scroll.
+   Keep the measured open size for reopening; short lists still size naturally. */
+.chat-work-dock:has(> .chat-compact-workers:not([open]):not([hidden])) { --chat-worker-share: var(--chat-worker-heading, 0px); }
 .chat-work-dock .chat-compact-workers { min-height: var(--chat-worker-floor, 30px); max-height: max(calc(var(--chat-card-space) / 2), calc(var(--chat-card-space) - var(--chat-queue-natural, 0px))); }
-html:is([data-ui-mode="touch"], [data-ui-mode="desktop"]) .chat-work-dock .chat-queue { max-height: max(calc(var(--chat-card-space) / 2), calc(var(--chat-card-space) - var(--chat-worker-natural, 0px))); }
+html:is([data-ui-mode="touch"], [data-ui-mode="desktop"]) .chat-work-dock .chat-queue { max-height: max(calc(var(--chat-card-space) / 2), calc(var(--chat-card-space) - var(--chat-worker-share))); }
 html:is([data-ui-mode="touch"], [data-ui-mode="desktop"]) .chat-work-dock .chat-queue-header { display: flex; position: static; flex: 0 0 auto; padding: 0 8px; min-height: 28px; border-radius: inherit; background: var(--surface-muted); color: var(--text-subtle); font-size: 0.8125rem; line-height: 1.25rem; }
 html:is([data-ui-mode="touch"], [data-ui-mode="desktop"]) .chat-work-dock .chat-pending-toggle { display: flex; align-items: center; gap: 6px; min-height: 28px; font-weight: 400; }
 .chat-queue-content { min-height: 0; overflow-y: auto; overscroll-behavior: contain; overflow-anchor: none; padding: 0 8px; scroll-padding-block: 4px; }
@@ -10702,6 +10709,7 @@ html:is([data-ui-mode="touch"], [data-ui-mode="desktop"]) .chat-work-dock .chat-
    pane lends it the complete action row; the other pane remains scrollable. */
 html:is([data-ui-mode="touch"], [data-ui-mode="desktop"]) .chat-work-dock[data-work-cramped]:not([data-work-active="queue"]) .chat-queue { min-height: var(--chat-queue-heading); }
 html:is([data-ui-mode="touch"], [data-ui-mode="desktop"]) .chat-work-dock[data-work-cramped][data-work-active="queue"] .chat-compact-workers { min-height: var(--chat-worker-heading); }
+html:is([data-ui-mode="touch"], [data-ui-mode="desktop"]) .chat-work-dock .chat-compact-workers:not([open]) { min-height: var(--chat-worker-heading, 30px); }
 html:is([data-ui-mode="touch"], [data-ui-mode="desktop"]) .chat-work-dock[data-work-cramped][data-work-active="queue"] .chat-queue { min-height: var(--chat-queue-compact-floor); }
 html:is([data-ui-mode="touch"], [data-ui-mode="desktop"]) .chat-work-dock > :is(#chat-reverted, #chat-task-list, #chat-scheduled-wakeups):not([hidden]) { display: flex; flex-direction: column; flex: 0 1 auto; min-height: var(--chat-track-floor); max-height: var(--chat-track-floor); overflow: clip; }
 .chat-work-dock > :is(#chat-reverted, #chat-task-list, #chat-scheduled-wakeups)::details-content { display: contents; }

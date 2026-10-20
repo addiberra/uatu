@@ -5,6 +5,7 @@ import { captureScreenshot, recordEvidence, saveEvidence } from "./evidence";
 import { expect, test as base } from "./fixtures";
 import { withEngineBrowsers } from "./page-diagnostics";
 import { expectWorkTranscriptBudget } from "./work-panel-assertions";
+import { enlargedPendingFixture } from "./enlarged-pending-fixture";
 
 const test = withEngineBrowsers(base);
 
@@ -765,29 +766,7 @@ for (const browserName of ["chromium", "webkit"] as const) test.describe(`steeri
 
   for (const theme of ["light", "dark"] as const) for (const width of [390, 320]) test(`enlarged pending text has separate glyph lines and reachable image/actions (${theme} ${width})`, async ({ page, request }, info) => {
     const evidence = `pending-${browserName}-${theme}-${width}`;
-    await page.emulateMedia({ colorScheme: theme });
-    await page.setViewportSize({ width, height: 844 });
-    await bootChat(page, request);
-    await startTurn(page, request);
-    await submit(page, "Readable first line\nSecond line with descenders gyjp\nThird line stays separate\nA_long_unbroken_message_must_wrap_without_horizontal_overflow", "Alt+Enter");
-    const image = Buffer.from(await page.evaluate(() => {
-      const canvas = document.createElement("canvas"); canvas.width = 640; canvas.height = 320;
-      const context = canvas.getContext("2d")!; context.fillStyle = "#286cb9"; context.fillRect(0, 0, 640, 320);
-      context.fillStyle = "white"; context.font = "32px sans-serif"; context.fillText("Pending image", 24, 64);
-      return canvas.toDataURL("image/png").split(",")[1]!;
-    }), "base64");
-    for (const text of ["Image and message\nAnother readable line", ""]) {
-      const upload = page.waitForResponse(response => response.url().endsWith("/attachments") && response.request().method() === "POST");
-      await page.locator("#chat-attach-input").setInputFiles({ name: "pending.png", mimeType: "image/png", buffer: image });
-      expect((await upload).status()).toBe(201);
-      await submit(page, text, "Alt+Enter");
-    }
-    await expect(held(page)).toHaveCount(3);
-    await page.locator("[data-pending-toggle]").click();
-    await expect(page.locator("[data-pending-toggle]")).toHaveAttribute("aria-expanded", "true");
-    await expect(held(page).first()).toBeVisible();
-    const before = (await held(page).first().boundingBox())!.height;
-    await page.evaluate(() => { document.documentElement.style.fontSize = "200%"; });
+    const before = await enlargedPendingFixture(page, request, width, theme);
     const glyphs = await held(page).locator(":scope > p").evaluateAll(paragraphs => paragraphs.map(paragraph => {
       const text = paragraph.firstChild!;
       const lines: Array<{ top: number; bottom: number; text: string }> = [];

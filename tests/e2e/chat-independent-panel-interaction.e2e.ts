@@ -46,6 +46,39 @@ for (const engine of ["chromium", "webkit"] as const) {
       await workers.tap(); await expect(page.locator("#chat-compact-workers")).toHaveAttribute("open", "");
       await expect.poll(offsets).toEqual(before);
 
+      // Read the native [open] mutation in its microtask, before the deferred
+      // `toggle` handler can remeasure allocation or restore a clamped anchor.
+      // Pending is long enough to reclaim the closed card's entire share.
+      const nativeBefore = await page.evaluate(() => {
+        const timeline = document.getElementById("chat-timeline")!;
+        timeline.scrollTop = Math.min(60, timeline.scrollHeight - timeline.clientHeight);
+        const read = () => ({ top: timeline.scrollTop, range: timeline.scrollHeight - timeline.clientHeight,
+          dock: document.getElementById("chat-work-dock")!.getBoundingClientRect().height,
+          pending: document.getElementById("chat-queue")!.getBoundingClientRect().height });
+        const samples: ReturnType<typeof read>[] = [];
+        Object.assign(window, { nativeCloseGeometry: samples });
+        const observer = new MutationObserver(() => {
+          if (!document.querySelector<HTMLDetailsElement>("#chat-compact-workers")!.open) {
+            samples.push(read()); observer.disconnect();
+          }
+        });
+        observer.observe(document.getElementById("chat-compact-workers")!, { attributes: true, attributeFilter: ["open"] });
+        return read();
+      });
+      expect(nativeBefore.top).toBeGreaterThan(0);
+      await workers.tap();
+      await expect(page.locator("#chat-compact-workers")).not.toHaveAttribute("open");
+      const nativeClose = await page.evaluate(() => (window as unknown as { nativeCloseGeometry: typeof nativeBefore[] }).nativeCloseGeometry);
+      await saveEvidence(info, "native-close-geometry.json", JSON.stringify({ before: nativeBefore, samples: nativeClose }, null, 2));
+      expect(nativeClose).toHaveLength(1);
+      expect(nativeClose[0]!.range).toBeGreaterThanOrEqual(nativeBefore.top);
+      expect(nativeClose[0]!.top).toBe(nativeBefore.top);
+      expect(nativeClose[0]!.dock).toBeCloseTo(nativeBefore.dock, 0);
+      expect(nativeClose[0]!.pending).toBeGreaterThan(nativeBefore.pending);
+      await expect.poll(() => page.locator("#chat-timeline").evaluate(n => n.scrollTop)).toBe(nativeBefore.top);
+      await workers.tap();
+      await expect(page.locator("#chat-compact-workers")).toHaveAttribute("open", "");
+
       await page.getByRole("button", { name: "New conversation", exact: true }).tap();
       await expect(page.locator("#chat-conversation-select")).not.toHaveValue(conversationId);
       await page.locator("#chat-input").fill("A separate conversation");

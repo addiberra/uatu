@@ -78,28 +78,14 @@ export async function headerGeometry(page: Page) {
     return { viewport: innerWidth, fonts: document.fonts.status, active: document.activeElement?.id,
       nodes: [...document.querySelectorAll<HTMLElement>("#chat-surface, .chat-header, .chat-identity, .chat-conversation-controls, .chat-conversation-controls > *")].map(n => {
         const css = getComputedStyle(n), range = document.createRange(); range.selectNodeContents(n);
+        const box = n.getBoundingClientRect();
+        const hit = box.width && box.height && n.matches("button, select") ? document.elementFromPoint(box.x + box.width / 2, box.y + box.height / 2) : null;
         return { id: n.id || n.className || n.tagName, hidden: n.hidden, box: n.getBoundingClientRect().toJSON(), client: n.clientWidth, scroll: n.scrollWidth,
+          centerHit: hit ? n.contains(hit) : null,
           styles: Object.fromEntries(properties.map(property => [property, css.getPropertyValue(property)])),
           contentRects: [...range.getClientRects()].slice(0, 12).map(rect => rect.toJSON()),
           named: !!(n.getAttribute("aria-label") || (n instanceof HTMLSelectElement && n.labels?.length)),
           nativeSelect: n instanceof HTMLSelectElement ? { options: n.options.length, selectedIndex: n.selectedIndex, disabled: n.disabled } : undefined };
       }) };
   });
-}
-
-/** Intrinsic measurement clones exist only in the isolated synthetic page. */
-export async function nativeIntrinsicWidths(page: Page) {
-  return page.evaluate(() => ["chat-conversation-select", "chat-new-conversation"].map(id => {
-    const node = document.getElementById(id)!;
-    const css = getComputedStyle(node), clone = node.cloneNode(true) as HTMLElement;
-    clone.removeAttribute("id"); clone.setAttribute("aria-hidden", "true"); clone.tabIndex = -1;
-    clone.style.cssText = [...css].map(key => `${key}:${css.getPropertyValue(key)}`).join(";");
-    clone.style.cssText += ";position:absolute;inset:0 auto auto 0;visibility:hidden;min-width:0;max-width:none;flex:none";
-    document.body.append(clone);
-    try {
-      clone.style.width = "min-content"; const minContent = clone.getBoundingClientRect().width;
-      clone.style.width = "max-content"; const maxContent = clone.getBoundingClientRect().width;
-      return { id, minContent, maxContent, font: css.font, appearance: css.appearance };
-    } finally { clone.remove(); }
-  }));
 }

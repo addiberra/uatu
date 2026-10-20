@@ -32,8 +32,8 @@ export default defineConfig({
     // its configured page. The opt-in helper owns every diagnostic trace.
     use: { ...base.use, trace: "off" },
   }, {
-    // Collection, not resolution: header-causality.json records baseline
-    // equivalence and one-variable resets; scroll-causality-*.json[l] records
+    // Collection, not resolution: header-causality.json records fresh real
+    // enlarged-pending baselines and one-variable interventions; scroll-causality-*.json[l] records
     // five native disclosure sequences, clamping geometry and write stacks.
     name: "causal-probes",
     testDir: "./tests/diagnostics",
