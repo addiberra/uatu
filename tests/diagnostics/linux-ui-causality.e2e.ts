@@ -3,7 +3,7 @@ import { withEngineBrowsers } from "../e2e/page-diagnostics";
 import { headerGeometry, installScrollProbe, scrollCheckpoint } from "./linux-ui-probe";
 import { enlargedPendingFixture } from "../e2e/enlarged-pending-fixture";
 import type { APIRequestContext, Page, TestInfo } from "@playwright/test";
-import { writeFile } from "node:fs/promises";
+import { appendFile, writeFile } from "node:fs/promises";
 
 const test = withEngineBrowsers(base);
 test.describe.configure({ retries: 0, timeout: 150_000 });
@@ -33,67 +33,143 @@ async function queue(page: Page, text: string) {
   await page.locator("#chat-input").press("Alt+Enter");
   expect((await accepted).ok()).toBe(true);
 }
-async function painted(page: Page) { await page.screenshot({ animations: "disabled" }); }
+async function painted(page: Page) {
+  await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+  await page.screenshot({ animations: "disabled" });
+}
 function engine(info: TestInfo): "webkit" | "chromium" {
   // Only the separate local harness substitutes Chromium; Linux config pins WebKit.
   return info.project.metadata.causalEngine === "chromium" ? "chromium" : "webkit";
 }
 
-test("Linux causality probe: native header intrinsic widths", async ({ launchBrowser, baseURL, request }, info) => {
-  test.setTimeout(60_000);
+test("Linux causality probe: painted header DOM subtraction", async ({ launchBrowser, baseURL, request }, info) => {
+  test.setTimeout(90_000);
   const browser = await launchBrowser(engine(info));
   const observations: unknown[] = [];
+  const verdicts: unknown[] = [];
+  const stream = info.outputPath("header-subtraction.jsonl");
+  await writeFile(stream, "");
+  type Geometry = Awaited<ReturnType<typeof headerGeometry>>;
+  const mismatch = (before: Geometry, after: Geometry, sameFixture: boolean) => {
+    const reasons: string[] = [];
+    // Keep exact synthetic text: a displayed timestamp crossing a minute is
+    // a real baseline mismatch, not something to normalize into attribution.
+    for (const key of ["shape", "options", "selectedIndex", "queue"] as const) {
+      if (JSON.stringify(before.state[key]) !== JSON.stringify(after.state[key])) reasons.push(key);
+    }
+    if (sameFixture && (before.state.selected !== after.state.selected || !after.state.originalNodes)) reasons.push("native selection or original node identity");
+    if (before.nodes.length !== after.nodes.length) reasons.push("node count");
+    for (let i = 0; i < before.nodes.length; i++) {
+      const a = before.nodes[i]!, b = after.nodes[i];
+      if (!b || a.id !== b.id) { reasons.push(`node ${i}`); continue; }
+      if (JSON.stringify(a.styles) !== JSON.stringify(b.styles)) reasons.push(`${a.id}:styles`);
+      if (["x", "y", "width", "height"].some(key => Math.abs(a.box[key] - b.box[key]) > 1) || Math.abs(a.scroll - b.scroll) > 1 || Math.abs(a.client - b.client) > 1) reasons.push(`${a.id}:geometry`);
+    }
+    return reasons;
+  };
+  const record = async (page: Page, width: number, fixture: string, stage: string, captured?: Geometry) => {
+    if (stage.endsWith(":painted") || stage.endsWith(":restored-painted")) {
+      await page.screenshot({ path: info.outputPath(`${width}-${fixture}-${stage.replace(/:/g, "-")}.png`), animations: "disabled" });
+    }
+    const geometry = captured ?? await headerGeometry(page);
+    const surface = geometry.nodes.find(n => n.id === "chat-surface")!;
+    const sample = { width, fixture, stage, overflow: surface.scroll > surface.client + 1, geometry };
+    observations.push(sample);
+    await appendFile(stream, `${JSON.stringify(sample)}\n`);
+    return sample;
+  };
   try {
     for (const width of [390, 320]) {
-      // Every intervention gets a fresh *real* failing fixture. Baselines are
-      // live route state, not an isolated clone with different native options.
-      const variants = [
-        ["control", ""],
-        ["focus-only", ""],
-        ["reselect-only", ""],
-        ["native-width-invalidation", ""],
-        ["label-anchor", ".chat-conversation-controls {position:relative!important} .chat-conversation-controls > label {inset:0 auto auto 0!important}"],
-        ["select-inline-containment", "#chat-conversation-select {contain:inline-size!important}"],
-        ["grid-definite-select", ".chat-conversation-controls {display:grid!important;grid-auto-flow:column;grid-template-columns:minmax(0,1fr);grid-auto-columns:auto} #chat-conversation-select {width:100%!important;max-width:100%!important;box-sizing:border-box}"],
+      const targets = [
+        ["heading", "#chat-title"],
+        ["label", ".chat-conversation-controls > label"],
+        ["select", "#chat-conversation-select"],
+        ["rename", "#chat-rename-conversation"],
+        ["new", "#chat-new-conversation"],
+        ["collapse", "#chat-collapse"],
       ];
-      for (const [name, css] of variants) {
+      let reference: Geometry | undefined;
+      // No intervention shares a page/context with an earlier intervention.
+      for (const [name, selector] of [...targets, ["select-same-width-button", "#chat-conversation-select"], ["cumulative", ""]]) {
         const page = await browser.newPage({ baseURL, viewport: { width, height: 844 }, isMobile: true, hasTouch: true, reducedMotion: "reduce" });
         try {
-          await enlargedPendingFixture(page, request, width, "light");
-          // Match the failing assertion's preceding paints and pane scroll.
+        await enlargedPendingFixture(page, request, width, "light");
+        await painted(page);
+        await page.locator("#chat-queue-content").evaluate(n => { n.scrollTop = 100; });
+        await painted(page);
+        // Keep the actual nodes, listeners, options and insertion positions.
+        // Deliberately inaccessible temporary removals are diagnostic only.
+        await page.evaluate(() => {
+          const saved: Array<{ node: Element; marker: Comment; replacement?: Element }> = [];
+          const originals = [...document.querySelectorAll(".chat-header, .chat-header *")];
+          const originalChildren = originals.map(n => [...n.childNodes]);
+          Object.assign(window, { __headerSubtract: (selector: string, replace: boolean) => {
+            const node = document.querySelector<HTMLElement>(selector)!;
+            const sourceBox = node.getBoundingClientRect().toJSON();
+            const marker = document.createComment("diagnostic insertion point");
+            let replacement: HTMLElement | undefined;
+            if (replace) {
+              const css = getComputedStyle(node), box = node.getBoundingClientRect();
+              replacement = document.createElement("button");
+              replacement.textContent = (node as HTMLSelectElement).selectedOptions[0]?.textContent || "Conversation";
+              for (const property of Array.from(css)) replacement.style.setProperty(property, css.getPropertyValue(property));
+              replacement.style.setProperty("box-sizing", "border-box", "important");
+              for (const property of ["width", "min-width", "max-width"]) replacement.style.setProperty(property, `${box.width}px`, "important");
+              replacement.style.setProperty("height", `${box.height}px`, "important");
+              replacement.style.setProperty("flex", `0 0 ${box.width}px`, "important");
+              replacement.dataset.headerProbeReplacement = "true";
+            }
+            node.replaceWith(marker);
+            if (replacement) marker.after(replacement);
+            saved.push({ node, marker, replacement });
+            return { selector, replace, removed: !node.isConnected, sourceBox };
+          }, __headerRestore: () => {
+            for (const { node, marker, replacement } of saved.reverse()) {
+              replacement?.remove(); marker.replaceWith(node);
+            }
+            saved.length = 0;
+          }, __headerIdentity: () => originals.every((node, i) => node.isConnected && node.childNodes.length === originalChildren[i]!.length && [...node.childNodes].every((child, j) => child === originalChildren[i]![j])) });
+        });
+        const before = await record(page, width, name, "baseline:painted");
+        reference ??= before.geometry;
+        const baselineMismatch = mismatch(reference, before.geometry, false);
+        const replacementChecks: boolean[] = [];
+        const checkReplacement = (geometry: Geometry) => {
+          if (name !== "select-same-width-button") return;
+          const source = before.geometry.nodes.find(n => n.id === "chat-conversation-select")!.box;
+          const replacement = geometry.nodes.find(n => n.probeReplacement)!.box;
+          const delta = Math.max(Math.abs(source.width - replacement.width), Math.abs(source.height - replacement.height));
+          replacementChecks.push(delta <= 1);
+          expect.soft(delta, `${width}px ${name}: replacement dimensions differ from original`).toBeLessThanOrEqual(1);
+        };
+        const steps = name === "cumulative" ? targets : [[name, selector]];
+        let after: Awaited<ReturnType<typeof record>> | undefined;
+        for (const [step, target] of steps) {
+          const immediate = await headerGeometry(page, { selector: target, replace: name === "select-same-width-button" });
+          await record(page, width, name, `${step}:immediate`, immediate);
+          checkReplacement(immediate);
           await painted(page);
-          await page.locator("#chat-queue-content").evaluate(n => { n.scrollTop = 100; });
-          await painted(page);
-          const before = await headerGeometry(page);
-          const picker = page.getByRole("combobox", { name: "Conversation", exact: true });
-          const selected = await picker.inputValue();
-          const events: string[] = [];
-          page.on("request", r => { if (/\/api\/chat\//.test(r.url()) && r.method() !== "GET") events.push(r.method()); });
-          await page.evaluate(() => {
-            Object.assign(window, { headerProbeEvents: [] });
-            for (const type of ["input", "change"]) document.querySelector("#chat-conversation-select")!.addEventListener(type, () => (window as unknown as { headerProbeEvents: string[] }).headerProbeEvents.push(type));
-          });
-          if (name === "focus-only") await picker.focus();
-          else if (name === "reselect-only") await picker.selectOption(selected);
-          else if (name === "native-width-invalidation") await picker.evaluate(node => {
-            const old = node.style.width;
-            node.style.width = `${node.getBoundingClientRect().width}px`;
-            void node.offsetWidth;
-            node.style.width = old;
-          });
-          else if (css) await page.addStyleTag({ content: css });
-          const immediate = await headerGeometry(page);
-          await painted(page);
-          const after = await headerGeometry(page);
-          observations.push({ width, name, before, immediate, after,
-            baselineOverflow: before.nodes.find(n => n.id === "chat-surface")!.scroll > width,
-            sameSelection: selected === await picker.inputValue(), mutations: events,
-            controlEvents: await page.evaluate(() => (window as unknown as { headerProbeEvents: string[] }).headerProbeEvents) });
+          after = await record(page, width, name, `${step}:painted`);
+          checkReplacement(after.geometry);
+        }
+        const restoredImmediate = await headerGeometry(page, { restore: true });
+        await record(page, width, name, "restore:immediate", restoredImmediate);
+        await painted(page);
+        const restored = await record(page, width, name, "restore:restored-painted");
+        const restoreMismatch = mismatch(before.geometry, restored.geometry, true);
+        const valid = baselineMismatch.length === 0 && restoreMismatch.length === 0 && replacementChecks.every(Boolean);
+        const verdict = { width, fixture: name, baselineMismatch, restoreMismatch, replacementChecks, valid,
+          baselineOverflow: before.overflow, restoredOverflow: restored.overflow,
+          causalClearance: valid && before.overflow && !after!.overflow && restored.overflow };
+        verdicts.push(verdict);
+        await appendFile(stream, `${JSON.stringify({ verdict })}\n`);
         } finally { await page.close(); }
       }
     }
   } finally {
-    await attach(info, "header-causality", { engine: engine(info), meaning: "fresh live enlarged-pending fixture per intervention; only overflowing baselines support causal conclusions", observations });
+    await attach(info, "header-subtraction", { engine: engine(info), meaning: "fresh real fixture/context for every intervention and cumulative sweep; immediate mutation/measurement share a browser task; baseline mismatch or failed restoration invalidates attribution; only overflowing painted baselines and restored recurrence support causality; passing collection is not a fix", verdicts, observations });
+    await info.attach("header-subtraction-stream", { path: stream, contentType: "application/x-ndjson" });
+    await browser.close();
   }
 });
 

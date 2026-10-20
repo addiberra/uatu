@@ -71,21 +71,40 @@ export async function scrollCheckpoint(page: Page, label: string) {
   }, label);
 }
 
-/** No text, values, URLs or storage: only layout and native-control state. */
-export async function headerGeometry(page: Page) {
-  return page.evaluate(() => {
-    const properties = ["display", "position", "box-sizing", "width", "min-width", "max-width", "inline-size", "flex", "flex-basis", "flex-shrink", "flex-wrap", "grid-template-columns", "justify-content", "overflow-x", "white-space", "overflow-wrap", "font", "font-family", "font-size", "line-height", "appearance", "padding-left", "padding-right", "gap", "visibility", "clip", "clip-path"];
-    return { viewport: innerWidth, fonts: document.fonts.status, active: document.activeElement?.id,
-      nodes: [...document.querySelectorAll<HTMLElement>("#chat-surface, .chat-header, .chat-identity, .chat-conversation-controls, .chat-conversation-controls > *")].map(n => {
+/** Synthetic fixture text/selection, layout and native-control state only;
+ * never storage, authentication tokens or request URLs. */
+export async function headerGeometry(page: Page, action?: { selector?: string; replace?: boolean; restore?: boolean }) {
+  return page.evaluate(action => {
+    const probe = window as unknown as {
+      __headerSubtract: (selector: string, replace: boolean) => unknown;
+      __headerRestore: () => unknown;
+      __headerIdentity?: () => boolean;
+    };
+    // Mutation and layout measurement share one browser task: no assertion,
+    // protocol round-trip or rendering opportunity between them.
+    const mutation = action?.restore ? probe.__headerRestore() : action?.selector ? probe.__headerSubtract(action.selector, !!action.replace) : undefined;
+    const properties = ["display", "position", "top", "right", "bottom", "left", "transform", "contain", "box-sizing", "width", "height", "min-width", "max-width", "inline-size", "flex", "flex-basis", "flex-shrink", "flex-wrap", "grid-template-columns", "justify-content", "overflow-x", "overflow-y", "white-space", "overflow-wrap", "font", "font-family", "font-size", "line-height", "appearance", "padding-left", "padding-right", "gap", "visibility", "clip", "clip-path"];
+    const select = document.querySelector<HTMLSelectElement>("#chat-conversation-select");
+    const state = {
+      shape: [...document.querySelectorAll(".chat-header, .chat-header *")].map(n => ({ tag: n.tagName, id: n.id, class: n.getAttribute("class"), text: n.textContent, hidden: n.hasAttribute("hidden") })),
+      selected: select?.value, selectedIndex: select?.selectedIndex,
+      options: select ? [...select.options].map(n => n.textContent) : [],
+      queue: ["chat-queue-content", "chat-work-dock", "chat-timeline"].map(id => { const n = document.getElementById(id)!; return { id, top: n.scrollTop, left: n.scrollLeft }; }),
+      originalNodes: probe.__headerIdentity?.(),
+    };
+    return { mutation, state, viewport: innerWidth, fonts: document.fonts.status, active: document.activeElement?.id,
+      nodes: [...document.querySelectorAll<HTMLElement>("#chat-surface, .chat-header, .chat-header *, #chat-input, #chat-queue textarea")].map(n => {
         const css = getComputedStyle(n), range = document.createRange(); range.selectNodeContents(n);
         const box = n.getBoundingClientRect();
         const hit = box.width && box.height && n.matches("button, select") ? document.elementFromPoint(box.x + box.width / 2, box.y + box.height / 2) : null;
-        return { id: n.id || n.className || n.tagName, hidden: n.hidden, box: n.getBoundingClientRect().toJSON(), client: n.clientWidth, scroll: n.scrollWidth,
+        return { id: n.id || n.getAttribute("class") || n.tagName, hidden: n.hidden, box: n.getBoundingClientRect().toJSON(), client: n.clientWidth, scroll: n.scrollWidth,
+          probeReplacement: n.hasAttribute("data-header-probe-replacement"),
+          offsetParent: n.offsetParent ? { id: n.offsetParent.id || n.offsetParent.tagName, box: n.offsetParent.getBoundingClientRect().toJSON() } : null,
           centerHit: hit ? n.contains(hit) : null,
           styles: Object.fromEntries(properties.map(property => [property, css.getPropertyValue(property)])),
           contentRects: [...range.getClientRects()].slice(0, 12).map(rect => rect.toJSON()),
           named: !!(n.getAttribute("aria-label") || (n instanceof HTMLSelectElement && n.labels?.length)),
           nativeSelect: n instanceof HTMLSelectElement ? { options: n.options.length, selectedIndex: n.selectedIndex, disabled: n.disabled } : undefined };
       }) };
-  });
+  }, action);
 }

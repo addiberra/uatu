@@ -44,17 +44,17 @@ test("diagnostic workflow preserves triggers, publishing isolation and least pri
   const upload = job.steps.find((step: { uses?: string }) => step.uses?.startsWith("actions/upload-artifact@"));
   expect(upload.if).toBe("always()");
   expect(upload.with["retention-days"]).toBe(3);
-  const run = job.steps.find((step: { name: string }) => step.name === "Run only selected Linux WebKit cases");
+  const run = job.steps.find((step: { name: string }) => step.name === "Isolate painted Linux WebKit header overflow");
   expect(run["timeout-minutes"]).toBe(12);
   expect(run.env).toEqual({ UATU_LINUX_WEBKIT_DIAGNOSTIC: "1" });
 });
 
 type Suite = { specs?: { id: string; title: string; tests: { projectName: string }[] }[]; suites?: Suite[] };
-function list(config: string) {
+function list(config: string, flags: string[] = []) {
   const env = { ...process.env, CI: "true" };
   delete env.JEST_WORKER_ID;
   delete env.UATU_E2E_LEG;
-  const result = Bun.spawnSync([process.execPath, "run", "test:e2e", `--config=${config}`, "--list", "--reporter=json"], { cwd: root, env });
+  const result = Bun.spawnSync([process.execPath, "run", "test:e2e", `--config=${config}`, ...flags, "--list", "--reporter=json"], { cwd: root, env });
   expect(result.exitCode, result.stderr.toString()).toBe(0);
   const report = JSON.parse(result.stdout.toString());
   expect(report.errors).toEqual([]);
@@ -74,7 +74,7 @@ test("diagnostic config preserves seven existing identities plus two isolated We
   for (const [id, title] of selected) {
     if (id.startsWith("causal-probes:")) {
       expect(full.has(id)).toBe(false);
-      expect(title).toMatch(/^Linux causality probe: (native header intrinsic widths|disclosure transcript reset)$/);
+      expect(title).toMatch(/^Linux causality probe: (painted header DOM subtraction|disclosure transcript reset)$/);
     } else {
       expect(full.get(id)).toBe(title);
       expect(id.startsWith("e2e:")).toBe(true);
@@ -88,4 +88,16 @@ test("diagnostic config preserves seven existing identities plus two isolated We
   const config = await readFile(new URL("../playwright.webkit-diagnostic.config.ts", import.meta.url), "utf8");
   expect(config).toContain('metadata: { causalEngine: "webkit" }');
   expect(config).toContain('testDir: "./tests/diagnostics"');
+}, 30_000);
+
+test("actual manual workflow CLI selects only the painted header probe, not nine-case coverage", () => {
+  const run = job.steps.find((step: { name: string }) => step.name === "Isolate painted Linux WebKit header overflow");
+  const command = "bun run test:e2e --config=playwright.webkit-diagnostic.config.ts --project=causal-probes --grep='painted header DOM subtraction'";
+  expect(run.run).toBe(command);
+  // Parse exactly the permitted command shape; no shell execution or eval.
+  const match = /^bun run test:e2e --config=(\S+) --project=(\S+) --grep='([^']+)'$/.exec(run.run)!;
+  expect(match).not.toBeNull();
+  const selected = list(match[1]!, [`--project=${match[2]}`, `--grep=${match[3]}`]);
+  expect([...selected.values()]).toEqual(["Linux causality probe: painted header DOM subtraction"]);
+  expect([...selected.keys()][0]).toStartWith("causal-probes:");
 }, 30_000);

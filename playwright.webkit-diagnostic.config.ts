@@ -3,7 +3,7 @@ import base from "./playwright.config";
 
 // Temporary Linux investigation, not a required-check configuration. Keep the
 // original seven test bodies, identities and per-test budgets. Two separate
-// test-only collection probes have no retries and a combined 210s ceiling.
+// test-only collection probes have no retries and a combined 240s ceiling.
 const files = [
   "**/chat-steering.e2e.ts",
   "**/chat-independent-panel-interaction.e2e.ts",
@@ -32,8 +32,8 @@ export default defineConfig({
     // its configured page. The opt-in helper owns every diagnostic trace.
     use: { ...base.use, trace: "off" },
   }, {
-    // Collection, not resolution: header-causality.json records fresh real
-    // enlarged-pending baselines and one-variable interventions; scroll-causality-*.json[l] records
+    // Collection, not resolution: header-subtraction.json records fresh-fixture
+    // enlarged-pending baselines, removals and restorations; scroll-causality-*.json[l] records
     // five native disclosure sequences, clamping geometry and write stacks.
     name: "causal-probes",
     testDir: "./tests/diagnostics",
