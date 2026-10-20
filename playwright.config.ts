@@ -61,8 +61,10 @@ export default defineConfig({
   },
   // CI runs the suite in parallel jobs (shards of `e2e`, plus `perf`); each
   // writes a blob report that the workflow merges into one HTML report.
+  // Incremental stdout identifies in-flight tests even if a hard job timeout
+  // prevents blob finalization/upload. It logs test boundaries, never steps.
   reporter: process.env.CI
-    ? [["github"], ["blob"]]
+    ? [["./scripts/ci-progress-reporter.ts"], ["github"], ["blob"]]
     : [["list"], ["html", { open: "never" }]],
   use: {
     ...devices["Desktop Chrome"],
