@@ -789,6 +789,12 @@ export function initChat(api = new ChatApiClient()): void {
         reconnect.remove();
       }
     };
+    // A transient message replaced this owner's interruption text: the
+    // stream is still down underneath, so the in-place recovery affordance
+    // stands beside the transient line until owned text returns.
+    const keepRecoveryVisible = (): void => {
+      if (owned.size > 0 && speak.target) speak.target.append(reconnect);
+    };
     speak.spoken.add(sync);
     return {
       report(stream: string, error: unknown) {
@@ -802,12 +808,7 @@ export function initChat(api = new ChatApiClient()): void {
       hasDown(): boolean {
         return owned.size > 0;
       },
-      // A transient message replaced this owner's interruption text: the
-      // stream is still down underneath, so the in-place recovery affordance
-      // stands beside the transient line until owned text returns.
-      keepRecoveryVisible(): void {
-        if (owned.size > 0 && speak.target) speak.target.append(reconnect);
-      },
+      keepRecoveryVisible,
       // Speak the newest owned interruption again — a finished message left
       // the line without retelling it while the stream is still down.
       restoreOwned(): void {
@@ -821,7 +822,16 @@ export function initChat(api = new ChatApiClient()): void {
         const message = owned.get(stream);
         if (message === undefined) return;
         owned.delete(stream);
-        if (speak.current() !== message) return;
+        if (speak.current() !== message) {
+          // A transient message (a validation refusal on an ordinary click)
+          // displaced this owner's text; keepRecoveryVisible may have stood
+          // the recovery affordance beside it. With this stream recovered,
+          // the affordance stays only while the other stream is still down —
+          // otherwise the healthy connection must not offer a reconnect.
+          if (owned.size > 0) keepRecoveryVisible();
+          else sync();
+          return;
+        }
         const remaining = [...owned.values()].at(-1);
         speak(remaining ?? "", remaining !== undefined);
       },
