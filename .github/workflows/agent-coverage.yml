@@ -103,13 +103,13 @@ jobs:
         run: bun install --frozen-lockfile
       - name: Install diagnostic browsers and system libraries
         run: bunx playwright install --with-deps chromium webkit
-      # Collection only: this bounded run does not execute or certify the
-      # seven original regression cases. Normal CI selection is unchanged.
-      - name: Isolate painted Linux WebKit header overflow
+      # Execute the seven original regressions, eight native-header cases and
+      # four Chromium warning cases. The retained causal probes are not run.
+      - name: Verify Linux header and replacement warning regressions
         timeout-minutes: 12
         env:
           UATU_LINUX_WEBKIT_DIAGNOSTIC: "1"
-        run: bun run test:e2e --config=playwright.webkit-diagnostic.config.ts --project=causal-probes --grep='painted header DOM subtraction'
+        run: bun run test:e2e --config=playwright.webkit-diagnostic.config.ts --project=e2e
       - name: Preserve diagnostic reports and traces
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

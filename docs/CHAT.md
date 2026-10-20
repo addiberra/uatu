@@ -350,7 +350,14 @@ as **Send now + paused steers** wrap without truncation. Paused-batch actions
 scroll inside Pending's content pane, never in its count header. Counts stay
 visible; confirmation wording and paused-batch delivery semantics stay intact.
 As before, enlarged replacement warnings may take extra space from the transcript
-to keep their full text and controls reachable. The 40% phone/short-landscape
+to keep their full text and controls reachable. When the warning plus primary
+chrome cannot fit, the touch surface scrolls vertically; Pending keeps its own
+content pane and a whole warning, and the composer remains scroll-reachable.
+The warning's reading allocation includes the actual bottom fade height, so
+the scroll signal does not paint over its last line.
+The native conversation picker ellipsizes long selected titles within its own
+control; its option list retains the full titles and normal keyboard navigation.
+The 40% phone/short-landscape
 reading budget applies to collapsed cards whenever whole actions and headers
 physically fit; expanded cards use the small conversation strip above. A smaller
 band prioritizes the pane being used without overlapping the composer.

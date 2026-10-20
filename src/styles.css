@@ -5364,7 +5364,13 @@ html[data-ui-mode="desktop"][data-notification-chat] .chat-expand-strip {
 
 .chat-header .chat-conversation-controls select {
   flex: 1 1 auto;
+  width: 0;
   min-width: 0;
+  /* Bound the selected value, not the header or its neighboring controls.
+     The native option list retains each complete conversation title. */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .chat-conversation-controls,
@@ -8588,7 +8594,7 @@ html[data-ui-mode="touch"] .chat-conversation-controls select {
      actions. At enlarged text this basis puts the picker on its own row;
      the actions wrap below it instead of squeezing its anonymous content. */
   flex: 1 1 12rem;
-  width: auto;
+  width: 0;
   min-width: min(100%, 12rem);
   max-width: 100%;
   min-height: 44px;
@@ -10716,7 +10722,10 @@ html:is([data-ui-mode="touch"], [data-ui-mode="desktop"]) .chat-work-dock .chat-
    enlarged fallback fonts must not create a horizontal Pending scrollport. */
 .chat-queue-batch .chat-queued-action { min-height: 44px; margin-block: 4px; max-width: 100%; box-sizing: border-box; white-space: normal; overflow-wrap: anywhere; }
 .chat-queue-batch[hidden] { display: none; }
-.chat-work-dock .chat-queue.has-more-below::after { position: absolute; inset: auto 0 0; height: 1rem; margin: 0; }
+.chat-work-dock .chat-queue { --chat-queue-fade-size: 1rem; }
+.chat-work-dock .chat-queue::after { height: var(--chat-queue-fade-size); }
+.chat-work-dock .chat-queue.has-more-below::after { position: absolute; inset: auto 0 0; margin: 0; }
+.chat-work-dock .chat-queue-content { scroll-padding-bottom: calc(var(--chat-queue-fade-size) + 4px); }
 .chat-work-dock .chat-queue { position: relative; }
 html:is([data-ui-mode="touch"], [data-ui-mode="desktop"]) .chat-work-dock .chat-queue { min-height: var(--chat-queue-floor, 30px); align-items: stretch; overflow: clip; }
 .chat-work-dock .chat-pending-toggle:focus-visible { outline-offset: -2px; }

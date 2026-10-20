@@ -864,6 +864,15 @@ for (const browserName of ["chromium", "webkit"] as const) test.describe(`steeri
       const box = range.getBoundingClientRect();
       return node.contains(document.elementFromPoint(box.x + box.width / 2, box.y + box.height / 2));
     })).toBe(true);
+    // The fade is pointer-transparent, so glyph hit testing alone cannot
+    // prove that the final model/delivery sentence is visibly unobscured.
+    expect(await warning.evaluate(node => {
+      const queue = node.closest<HTMLElement>(".chat-queue")!;
+      const fadeHeight = queue.classList.contains("has-more-below") ? parseFloat(getComputedStyle(queue, "::after").height) || 0 : 0;
+      const clearBottom = queue.getBoundingClientRect().bottom - fadeHeight;
+      const range = document.createRange(); range.selectNodeContents(node);
+      return [...range.getClientRects()].every(box => box.bottom + 4 <= clearBottom);
+    })).toBe(true);
     await captureScreenshot(page, info, `${evidence}-200pct-warning-text`);
     const warningLines = await warning.locator(".chat-queue-replacement").evaluate(node => {
       const dock = node.closest(".chat-queue-content")!;

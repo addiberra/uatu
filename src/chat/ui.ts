@@ -3572,7 +3572,10 @@ export function initChat(api = new ChatApiClient()): void {
     const queueActionHeight = Math.max(32, ...[...queueContent?.querySelectorAll<HTMLElement>(".chat-queued-action") ?? []].map(button => button.getBoundingClientRect().height));
     const warning = queueContent?.querySelector<HTMLElement>(".chat-queue-note.is-replacement:not([hidden])");
     const batch = queueContent?.querySelector<HTMLElement>(".chat-queue-batch:not([hidden])");
-    const safetyHeight = warning ? warning.getBoundingClientRect().height + (batch?.getBoundingClientRect().height ?? 0) + 8 : 0;
+    // The pointer-transparent fade still paints over glyphs. Reserve its real
+    // size as well as the reading inset; hit testing alone cannot detect it.
+    const warningClearance = warning ? (parseFloat(getComputedStyle(queueDockElement, "::after").height) || 0) + 8 : 8;
+    const safetyHeight = warning ? warning.getBoundingClientRect().height + (batch?.getBoundingClientRect().height ?? 0) + warningClearance : 0;
     const queueFloor = pendingHeight ? pendingHeight + 2 + Math.min(Math.max(queueActionHeight + 8, safetyHeight), queueBody) : 0;
     // Reverted history, TODOs and wakeups retain their own bounded contents;
     // none may silently restore the old shared-scroller fallback.
@@ -3610,7 +3613,7 @@ export function initChat(api = new ChatApiClient()): void {
     set("--chat-queue-heading", pendingHeight + 2);
     set("--chat-queue-floor", queueFloor);
     const queueActionFloor = pendingHeight ? pendingHeight + 2 + Math.min(queueBody, queueActionHeight + 8) : 0;
-    const preferredQueueFloor = pendingHeight ? pendingHeight + 2 + Math.min(queueBody, Math.max(queueActionHeight + 8, (warning?.getBoundingClientRect().height ?? 0) + 8)) : 0;
+    const preferredQueueFloor = pendingHeight ? pendingHeight + 2 + Math.min(queueBody, Math.max(queueActionHeight + 8, (warning?.getBoundingClientRect().height ?? 0) + warningClearance)) : 0;
     const dockCss = typeof getComputedStyle === "function" ? getComputedStyle(scroller) : scroller.style;
     const cardCount = Number(workerHeight > 0) + Number(pendingHeight > 0) + extraCount;
     const gapCount = Math.max(0, cardCount - 1);
@@ -3629,9 +3632,12 @@ export function initChat(api = new ChatApiClient()): void {
     scroller.toggleAttribute("data-work-cramped", cramped);
     const active = scroller.dataset.workActive;
     const effectiveExtras = (cramped && active !== "history" ? extraHeadings : extraHeight) + closeHeight;
-    // Keep the whole warning wherever it fits. Only a genuinely insufficient
-    // band scrolls warning lines, while retaining one complete action target.
-    const queueCompactFloor = cramped
+    // Enlarged safety text must keep a whole readable warning. If primary
+    // chrome leaves less room, the existing outer-scroll exception exposes
+    // that warning and the composer instead of clipping the warning's pane.
+    const wholeWarning = warning && document.documentElement.dataset.uiMode === "touch"
+      && parseFloat(getComputedStyle(document.documentElement).fontSize) > 16;
+    const queueCompactFloor = cramped && !wholeWarning
       ? Math.max(queueActionFloor, Math.min(preferredQueueFloor, hardAvailable - (workerHeight ? workerHeight + 2 : 0) - effectiveExtras - padding))
       : preferredQueueFloor;
     set("--chat-queue-compact-floor", queueCompactFloor);
