@@ -39,7 +39,39 @@ for (const engine of ["chromium", "webkit"] as const) {
       await page.locator("#chat-compact-workers-items").evaluate(n => n.scrollTop = 140);
       await page.locator("#chat-queue-content").evaluate(n => n.scrollTop = 140);
       const before = await offsets();
+      expect(before["chat-timeline"]).toBeGreaterThan(0);
+      // A final-position poll misses a transient clamp followed by the owner's
+      // correction in the same render. Record the native position *before*
+      // each assignment as well as the mutation microtask and next paint.
+      await page.evaluate(() => {
+        const timeline = document.getElementById("chat-timeline")!;
+        const descriptor = Object.getOwnPropertyDescriptor(Element.prototype, "scrollTop")!;
+        const samples: Array<{ phase: string; top: number; range: number }> = [];
+        const read = (phase: string) => samples.push({ phase, top: descriptor.get!.call(timeline), range: timeline.scrollHeight - timeline.clientHeight });
+        Object.assign(window, { pendingCloseSamples: samples });
+        Object.defineProperty(timeline, "scrollTop", { configurable: true, get() { return descriptor.get!.call(this); }, set(top) {
+          read("before-position-write"); descriptor.set!.call(this, top);
+        } });
+        Object.assign(window, { pendingCloseDone: new Promise<void>(resolve => {
+          const observer = new MutationObserver(() => {
+            if (document.getElementById("chat-queue")!.dataset.expanded === "false") {
+              read("mutation"); observer.disconnect();
+              requestAnimationFrame(() => { read("frame"); delete (timeline as unknown as { scrollTop?: number }).scrollTop; resolve(); });
+            }
+          });
+          observer.observe(document.getElementById("chat-queue")!, { attributes: true, attributeFilter: ["data-expanded"] });
+        }) });
+      });
       await pending.tap(); await expect(pending).toHaveAttribute("aria-expanded", "false");
+      await page.evaluate(() => (window as unknown as { pendingCloseDone: Promise<void> }).pendingCloseDone);
+      const pendingClose = await page.evaluate(() => (window as unknown as { pendingCloseSamples: Array<{ phase: string; top: number; range: number }> }).pendingCloseSamples);
+      await saveEvidence(info, "pending-close-geometry.json", JSON.stringify({ before, samples: pendingClose }, null, 2));
+      expect(pendingClose.some(sample => sample.phase === "mutation")).toBe(true);
+      expect(pendingClose.some(sample => sample.phase === "frame")).toBe(true);
+      for (const sample of pendingClose) {
+        expect(sample.range).toBeGreaterThanOrEqual(before["chat-timeline"]!);
+        expect(sample.top).toBe(before["chat-timeline"]);
+      }
       await pending.tap(); await expect(pending).toHaveAttribute("aria-expanded", "true");
       await expect.poll(offsets).toEqual(before);
       await workers.tap(); await expect(page.locator("#chat-compact-workers")).not.toHaveAttribute("open");

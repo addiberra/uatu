@@ -8569,6 +8569,7 @@ html[data-ui-mode="touch"] .chat-header {
 html[data-ui-mode="touch"] .chat-conversation-controls {
   flex: 1 0 100%;
   min-width: 0;
+  flex-wrap: wrap;
 }
 
 html[data-ui-mode="touch"] .chat-header .eyebrow {
@@ -8583,11 +8584,21 @@ html[data-ui-mode="touch"] .chat-header .eyebrow {
 }
 
 html[data-ui-mode="touch"] .chat-conversation-controls select {
-  flex: 1 1 auto;
+  /* Native pickers need a readable value, not the few pixels left by the
+     actions. At enlarged text this basis puts the picker on its own row;
+     the actions wrap below it instead of squeezing its anonymous content. */
+  flex: 1 1 12rem;
   width: auto;
-  min-width: 0;
-  max-width: none;
+  min-width: min(100%, 12rem);
+  max-width: 100%;
+  min-height: 44px;
   padding-block: 0.35rem;
+}
+
+html[data-ui-mode="touch"] .chat-conversation-controls > button {
+  min-width: 44px;
+  min-height: 44px;
+  max-width: 100%;
 }
 
 html[data-ui-mode="touch"] .chat-rename-form {
@@ -10685,12 +10696,17 @@ html[data-ui-mode="desktop"][data-chat-has-work] .chat-work-dock { min-height: v
 .chat-work-dock {
   --chat-card-space: calc(max(var(--chat-work-budget), var(--chat-work-floor, 0px)) - var(--chat-work-extras, 0px) - var(--chat-work-spacing, 4px));
   --chat-worker-share: var(--chat-worker-natural, var(--chat-worker-heading, 0px));
+  --chat-queue-share: var(--chat-queue-natural, var(--chat-queue-heading, 0px));
 }
 /* Native details closes before its deferred toggle event. Reclaim its share
    in that very layout, not after the transcript has grown and clamped scroll.
    Keep the measured open size for reopening; short lists still size naturally. */
 .chat-work-dock:has(> .chat-compact-workers:not([open]):not([hidden])) { --chat-worker-share: var(--chat-worker-heading, 0px); }
-.chat-work-dock .chat-compact-workers { min-height: var(--chat-worker-floor, 30px); max-height: max(calc(var(--chat-card-space) / 2), calc(var(--chat-card-space) - var(--chat-queue-natural, 0px))); }
+/* Pending also closes before its next measured budget. Let Workers reclaim
+   that share immediately, including layouts forced inside the render. A
+   replacement warning remains visible when Pending's message list is closed. */
+.chat-work-dock:has(> .chat-queue[data-expanded="false"]):not(:has(> .chat-queue .is-replacement:not([hidden]))) { --chat-queue-share: var(--chat-queue-heading, 0px); }
+.chat-work-dock .chat-compact-workers { min-height: var(--chat-worker-floor, 30px); max-height: max(calc(var(--chat-card-space) / 2), calc(var(--chat-card-space) - var(--chat-queue-share, 0px))); }
 html:is([data-ui-mode="touch"], [data-ui-mode="desktop"]) .chat-work-dock .chat-queue { max-height: max(calc(var(--chat-card-space) / 2), calc(var(--chat-card-space) - var(--chat-worker-share))); }
 html:is([data-ui-mode="touch"], [data-ui-mode="desktop"]) .chat-work-dock .chat-queue-header { display: flex; position: static; flex: 0 0 auto; padding: 0 8px; min-height: 28px; border-radius: inherit; background: var(--surface-muted); color: var(--text-subtle); font-size: 0.8125rem; line-height: 1.25rem; }
 html:is([data-ui-mode="touch"], [data-ui-mode="desktop"]) .chat-work-dock .chat-pending-toggle { display: flex; align-items: center; gap: 6px; min-height: 28px; font-weight: 400; }
