@@ -5362,13 +5362,31 @@ html[data-ui-mode="desktop"][data-notification-chat] .chat-expand-strip {
   min-width: 0;
 }
 
-.chat-header .chat-conversation-controls select {
+.chat-conversation-picker {
   flex: 1 1 auto;
   width: 0;
   min-width: 0;
-  /* Bound the selected value, not the header or its neighboring controls.
-     The native option list retains each complete conversation title. */
-  overflow: hidden;
+  max-width: 100%;
+  /* Native selected-value painting can escape the select's own overflow
+     rules (Linux WebKit). Bound only that control, never header actions.
+     The native popup and complete option labels remain browser-owned. */
+  contain: paint;
+  border-radius: 0.45rem;
+}
+
+.chat-conversation-picker:focus-within {
+  /* Outside the paint boundary so keyboard focus is not clipped. Uses an
+     outline rather than a shadow, including in forced-colors mode. */
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.chat-header .chat-conversation-picker select {
+  display: block;
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -8589,7 +8607,7 @@ html[data-ui-mode="touch"] .chat-header .eyebrow {
   font-size: 0.68rem;
 }
 
-html[data-ui-mode="touch"] .chat-conversation-controls select {
+html[data-ui-mode="touch"] .chat-conversation-picker {
   /* Native pickers need a readable value, not the few pixels left by the
      actions. At enlarged text this basis puts the picker on its own row;
      the actions wrap below it instead of squeezing its anonymous content. */
@@ -8597,6 +8615,9 @@ html[data-ui-mode="touch"] .chat-conversation-controls select {
   width: 0;
   min-width: min(100%, 12rem);
   max-width: 100%;
+}
+
+html[data-ui-mode="touch"] .chat-conversation-controls select {
   min-height: 44px;
   padding-block: 0.35rem;
 }
@@ -10562,7 +10583,7 @@ html[data-ui-mode="touch"][data-chat-short] .chat-header {
 html[data-ui-mode="touch"][data-chat-short] .chat-header .chat-identity {
   display: none;
 }
-html[data-ui-mode="touch"][data-chat-short] .chat-conversation-controls > :is(select, button):not([hidden]) {
+html[data-ui-mode="touch"][data-chat-short] .chat-conversation-controls :is(select, button):not([hidden]) {
   min-height: 2.75rem;
 }
 
@@ -10855,7 +10876,7 @@ html[data-ui-mode="touch"][data-chat-compact]:not([data-chat-wide-short]) .chat-
 html[data-ui-mode="touch"][data-chat-answering] #chat-compact-workers { display: none; }
 /* Fixed physical target minima, not rem-scaled empty chrome, leave room for
    both headers and a whole selected action at enlarged landscape text. */
-html[data-ui-mode="touch"]:is([data-chat-wide-short], [data-chat-short]) .chat-conversation-controls > :is(select, button):not([hidden]) { min-height: 44px; height: 44px; padding-block: 0; }
+html[data-ui-mode="touch"]:is([data-chat-wide-short], [data-chat-short]) .chat-conversation-controls :is(select, button):not([hidden]) { min-height: 44px; height: 44px; padding-block: 0; }
 html[data-ui-mode="touch"]:is([data-chat-wide-short], [data-chat-short]) .chat-composer textarea { height: 44px !important; min-height: 44px; max-height: 44px; }
 html[data-ui-mode="touch"][data-chat-wide-short] .chat-composer-actions { min-height: 44px; }
 html[data-ui-mode="touch"][data-chat-wide-short] :is(.chat-compact-workers > summary, .chat-workers-dismiss) { min-height: 28px; }

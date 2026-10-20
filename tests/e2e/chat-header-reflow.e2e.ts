@@ -35,26 +35,37 @@ for (const engine of ["chromium", "webkit"] as const) {
             // paints. Force that paint before measuring, without retaining images.
             await page.screenshot({ animations: "disabled" });
             const geometry = await page.evaluate(() => {
-              const ids = ["chat-surface", "chat-work-dock", "chat-conversation-select", "chat-rename-conversation", "chat-new-conversation"];
-              return ids.map(id => {
-                const node = document.getElementById(id)!;
-                const box = node.getBoundingClientRect();
-                return { id, width: node.clientWidth, scroll: node.scrollWidth, box: box.toJSON(),
-                  font: getComputedStyle(node).fontSize,
-                  hit: node.contains(document.elementFromPoint(box.x + box.width / 2, box.y + box.height / 2)) };
-              });
+              const selectors = ["#chat-surface", "#chat-work-dock", ".chat-header", ".chat-conversation-controls", ".chat-conversation-picker", "#chat-conversation-select", ".chat-conversation-controls > button:not([hidden])"];
+              return selectors.flatMap(selector => [...document.querySelectorAll<HTMLElement>(selector)])
+                .filter(node => node.getClientRects().length > 0).map(node => {
+                  const id = node.id || node.className;
+                  const box = node.getBoundingClientRect();
+                  return { id, width: node.clientWidth, scroll: node.scrollWidth, box: box.toJSON(),
+                    font: getComputedStyle(node).fontSize,
+                    overflow: getComputedStyle(node).overflowX,
+                    contain: getComputedStyle(node).contain,
+                    hit: node.contains(document.elementFromPoint(box.x + box.width / 2, box.y + box.height / 2)) };
+                });
             });
             await saveEvidence(info, `header-${percent}-${info.attachments.length}.json`, JSON.stringify(geometry, null, 2));
             for (const node of geometry) {
               expect(node.box.left).toBeGreaterThanOrEqual(0);
               expect(node.box.right).toBeLessThanOrEqual(width);
-              if (node.id === "chat-surface" || node.id === "chat-work-dock") expect(node.scroll).toBeLessThanOrEqual(node.width);
+              if (["chat-surface", "chat-work-dock", "chat-header", "chat-conversation-controls"].includes(node.id)) {
+                expect(node.scroll).toBeLessThanOrEqual(node.width);
+                // The regression must not pass by clipping a header or its actions.
+                if (["chat-header", "chat-conversation-controls"].includes(node.id)) expect(["hidden", "clip"]).not.toContain(node.overflow);
+              }
               else {
                 expect(node.hit).toBe(true);
                 expect(node.box.height).toBeGreaterThanOrEqual(44);
               }
             }
             const select = geometry.find(node => node.id === "chat-conversation-select")!;
+            const wrapper = geometry.find(node => node.id === "chat-conversation-picker")!;
+            expect(wrapper.contain).toBe("paint");
+            expect(select.box.left).toBeGreaterThanOrEqual(wrapper.box.left);
+            expect(select.box.right).toBeLessThanOrEqual(wrapper.box.right);
             expect(select.font).toBe(`${16 * percent / 100}px`);
             // At 200% the readable 12rem basis exceeds the available row. The
             // native picker must own that row, not collapse between the actions.
@@ -70,6 +81,14 @@ for (const engine of ["chromium", "webkit"] as const) {
         // replace them with clipped replicas or inaccessible custom controls.
         await picker.focus();
         await expect(picker).toBeFocused();
+        const focus = await picker.evaluate(node => {
+          const wrapper = node.closest(".chat-conversation-picker")!;
+          const style = getComputedStyle(wrapper);
+          return { within: wrapper.matches(":focus-within"), outline: style.outlineStyle, width: parseFloat(style.outlineWidth), offset: parseFloat(style.outlineOffset) };
+        });
+        expect(focus).toMatchObject({ within: true, outline: "solid" });
+        expect(focus.width).toBeGreaterThanOrEqual(2);
+        expect(focus.offset).toBeGreaterThanOrEqual(0);
         await picker.press("Tab");
         await expect(page.getByRole("button", { name: "Rename conversation", exact: true })).toBeFocused();
         await page.keyboard.press("Tab");
@@ -97,11 +116,14 @@ for (const engine of ["chromium", "webkit"] as const) {
             await desktopPicker.selectOption(values[0]!);
             await desktopPicker.focus();
             await desktopPicker.press("Space");
+            await desktopPicker.press("ArrowDown");
             await desktopPicker.press("z");
             await desktopPicker.press("Enter");
             await expect(desktopPicker).toHaveValue(target);
             await expect(desktopPicker.locator("option:checked")).toContainText(title);
             await expect(desktopPicker).toBeFocused();
+            // The change reaches the conversation model, not just the DOM value.
+            await expect(desktop.locator("#chat-title")).toHaveText(title);
             expect(await desktopPicker.evaluate(node => {
               const control = node.getBoundingClientRect();
               const header = node.closest(".chat-header")!;

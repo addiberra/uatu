@@ -357,6 +357,11 @@ The warning's reading allocation includes the actual bottom fade height, so
 the scroll signal does not paint over its last line.
 The native conversation picker ellipsizes long selected titles within its own
 control; its option list retains the full titles and normal keyboard navigation.
+A shrinkable, paint-contained wrapper isolates native selected-value painting
+from the surrounding layout instead of relying on native control overflow rules. Header actions stay outside
+that boundary and continue to wrap; no header-level overflow clipping is added.
+The wrapper draws the focus outline outside its paint boundary. The labeled
+native select, complete option names, and browser-owned popup remain unchanged.
 The 40% phone/short-landscape
 reading budget applies to collapsed cards whenever whole actions and headers
 physically fit; expanded cards use the small conversation strip above. A smaller
