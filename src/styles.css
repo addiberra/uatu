@@ -8619,6 +8619,11 @@ html[data-ui-mode="touch"] .chat-conversation-picker {
 
 html[data-ui-mode="touch"] .chat-conversation-controls select {
   min-height: 44px;
+  /* macOS WebKit's native theme overrides min-height and padding, leaving
+     even a 32px-font select only 43px tall. An explicit block size keeps
+     the native control clickable throughout; the line + padding + border
+     budget also grows with enlarged text instead of fixing it at 44px. */
+  block-size: max(44px, calc(1lh + 0.7rem + 2px));
   padding-block: 0.35rem;
 }
 

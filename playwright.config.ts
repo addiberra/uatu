@@ -52,7 +52,7 @@ export default defineConfig({
   // CI re-runs failed tests up to twice so parallel-worker flakes don't
   // block PRs; real regressions still fail consistently. Locally `retries:
   // 0` keeps tests strict so flakes surface immediately. The per-project
-  // `trace` settings below keep debug artifacts for failures and retries,
+  // `trace` settings below keep debug artifacts on the first retry,
   // so chronic flakes remain investigable.
   retries: process.env.CI ? 2 : 0,
   timeout: 30_000,
@@ -76,10 +76,16 @@ export default defineConfig({
       grepInvert: PERF,
       ...legFiles(),
       use: {
-        // On CI, keep the trace of a test's first failing attempt; retries
-        // run untraced, so the attempt most likely to pass does not pay
-        // for tracing again. Locally (no retries) nothing is traced.
-        trace: process.env.CI ? "retain-on-first-failure" : "on-first-retry",
+        // Recording page activity and API calls on every first attempt, then
+        // discarding passing traces, is costly. Three paired CI-mode local runs
+        // cut hot scrollback medians by 38–44% with retry-only tracing; the
+        // complete Linux job must confirm the margin. Trace the first retry
+        // instead: a non-reproducing flake loses its original failing trace,
+        // but retains attempt timing and existing failure diagnostics.
+        // Configured pages also retain a screenshot on failure; manually
+        // opened contexts continue to use their existing diagnostic helpers.
+        trace: "on-first-retry",
+        screenshot: process.env.CI ? "only-on-failure" : "off",
       },
     },
     {

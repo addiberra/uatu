@@ -1,7 +1,7 @@
 import { test as base, expect } from "./fixtures";
 import { withEngineBrowsers, attachPageDiagnosticsOnFailure } from "./page-diagnostics";
 import { enlargedPendingFixture } from "./enlarged-pending-fixture";
-import { saveEvidence } from "./evidence";
+import { captureScreenshot, saveEvidence } from "./evidence";
 
 const test = withEngineBrowsers(base);
 attachPageDiagnosticsOnFailure(test);
@@ -34,6 +34,9 @@ for (const engine of ["chromium", "webkit"] as const) {
             // Linux WebKit can report a fitting layout before its native control
             // paints. Force that paint before measuring, without retaining images.
             await page.screenshot({ animations: "disabled" });
+            if (title === null && percent === 200 && info.attachments.length === 0) {
+              await captureScreenshot(page, info, `native-header-${engine}-${theme}-${width}`);
+            }
             const geometry = await page.evaluate(() => {
               const selectors = ["#chat-surface", "#chat-work-dock", ".chat-header", ".chat-conversation-controls", ".chat-conversation-picker", "#chat-conversation-select", ".chat-conversation-controls > button:not([hidden])"];
               return selectors.flatMap(selector => [...document.querySelectorAll<HTMLElement>(selector)])
@@ -44,7 +47,15 @@ for (const engine of ["chromium", "webkit"] as const) {
                     font: getComputedStyle(node).fontSize,
                     overflow: getComputedStyle(node).overflowX,
                     contain: getComputedStyle(node).contain,
-                    hit: node.contains(document.elementFromPoint(box.x + box.width / 2, box.y + box.height / 2)) };
+                    hit: node.contains(document.elementFromPoint(box.x + box.width / 2, box.y + box.height / 2)),
+                    // The select itself must receive hits at both block edges;
+                    // a taller wrapper with dead padding is not a touch target.
+                    // Stay one CSS pixel inside: Chromium rounds the paint
+                    // containment hit boundary at fractional layout edges.
+                    blockEdges: [box.top + 1, box.bottom - 1].map(y => {
+                      const target = document.elementFromPoint(box.x + box.width / 2, y);
+                      return { hit: node.contains(target), target: target?.id || target?.className };
+                    }) };
                 });
             });
             await saveEvidence(info, `header-${percent}-${info.attachments.length}.json`, JSON.stringify(geometry, null, 2));
@@ -63,6 +74,8 @@ for (const engine of ["chromium", "webkit"] as const) {
             }
             const select = geometry.find(node => node.id === "chat-conversation-select")!;
             const wrapper = geometry.find(node => node.id === "chat-conversation-picker")!;
+            expect(select.blockEdges.every(edge => edge.hit)).toBe(true);
+            expect(select.box.height).toBeGreaterThanOrEqual(wrapper.box.height);
             expect(wrapper.contain).toBe("paint");
             expect(select.box.left).toBeGreaterThanOrEqual(wrapper.box.left);
             expect(select.box.right).toBeLessThanOrEqual(wrapper.box.right);
@@ -89,11 +102,15 @@ for (const engine of ["chromium", "webkit"] as const) {
         expect(focus).toMatchObject({ within: true, outline: "solid" });
         expect(focus.width).toBeGreaterThanOrEqual(2);
         expect(focus.offset).toBeGreaterThanOrEqual(0);
-        await picker.press("Tab");
+        // macOS WebKit uses Option-Tab to include buttons when system Full
+        // Keyboard Access is off. Keep the same focus-order assertions on
+        // every host without changing the user's system preferences.
+        const nextControl = engine === "webkit" && process.platform === "darwin" ? "Alt+Tab" : "Tab";
+        await picker.press(nextControl);
         await expect(page.getByRole("button", { name: "Rename conversation", exact: true })).toBeFocused();
-        await page.keyboard.press("Tab");
+        await page.keyboard.press(nextControl);
         await expect(page.getByRole("button", { name: "New conversation", exact: true })).toBeFocused();
-        if (engine === "chromium" && width === 390) {
+        if (width === 390) {
           // A separate desktop context exercises the normal-sized native popup,
           // not merely the touch control's measured box at enlarged text.
           const desktop = await browser.newPage({ baseURL, viewport: { width: 1280, height: 900 }, isMobile: false, hasTouch: false });
