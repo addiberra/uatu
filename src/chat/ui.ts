@@ -3751,18 +3751,18 @@ export function initChat(api = new ChatApiClient()): void {
       const tab = (event.target as Element).closest<HTMLButtonElement>("[data-question-tab]");
       if (!tab?.form) return;
       const source = sourceProjection();
-      // Tab navigation leaves the current panel in whatever state it holds:
-      // if it now carries an answer (or is optional and may be left empty),
-      // its previously spoken owed-answer line is stale and goes — without
-      // touching a newer unrelated status.
+      // Tab navigation leaves the current panel in whatever state it holds.
+      // The owed-answer line goes stale only once no required step of the
+      // form is outstanding: an optional empty tab-switch with a required
+      // step still empty keeps the message alive — it names what is still
+      // owed, not what was just left.
       const leaving = tab.form.querySelector<HTMLElement>("[data-question-panel]:not([hidden])");
       if (source && leaving) {
-        const leavingIndex = Number(leaving.dataset.questionPanel);
         const itemId = tab.form.closest<HTMLElement>("[data-chat-item-id]")?.dataset.chatItemId;
         const item = source.items.find(candidate => candidate.id === itemId);
         if (item?.type === "question") {
-          const satisfied = collectQuestionAnswers(tab.form)[leavingIndex]!.length > 0 || item.questions[leavingIndex]?.optional === true;
-          if (satisfied) clearOwedAnswer(source);
+          const outstanding = collectQuestionAnswers(tab.form).flatMap((answer, index) => answer.length === 0 && !item.questions[index]?.optional ? [index] : []);
+          if (outstanding.length === 0) clearOwedAnswer(source);
         }
       }
       showQuestionPanel(tab.form, Number(tab.dataset.questionTab));

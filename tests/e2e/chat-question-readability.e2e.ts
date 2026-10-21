@@ -269,10 +269,15 @@ test.describe("desktop", () => {
     await next.click();
     await expect(card.locator('[data-question-panel="1"]')).toBeHidden();
     await expect(page.locator("#chat-state")).toContainText("Still to answer");
-    // Answering the required step retires the stale owed-answer line —
-    // through tab navigation here (the correction path the finding names):
-    // switching away from the now-satisfied panel clears it. The optional
-    // empty step then passes straight to Answer, which completes the set.
+    // Tabbing to the optional step without answering the required one keeps
+    // the owed message alive — it names what is still outstanding.
+    await card.locator('[data-question-tab="1"]').click();
+    await expect(card.locator('[data-question-panel="1"]')).toBeVisible();
+    await expect(page.locator("#chat-state")).toContainText("Still to answer");
+    // Answer the required step and leave it by tab: the line goes. The
+    // optional empty step then passes straight to Answer, which completes
+    // the set.
+    await card.locator('[data-question-tab="0"]').click();
     await card.locator('.chat-question-panel:not([hidden]) .chat-question-option input').first().check();
     await card.locator('[data-question-tab="1"]').click();
     await expect(page.locator("#chat-state")).not.toContainText("Still to answer");
