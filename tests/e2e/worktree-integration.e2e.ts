@@ -5,6 +5,7 @@ import path from "node:path";
 import type { Page } from "@playwright/test";
 import { test, expect, openEventSources, openHubMenu } from "./hub-fixtures";
 import { captureScreenshot, saveEvidence } from "./evidence";
+import { showSurface } from "./navigation-helpers";
 
 const exec = promisify(execFile);
 test.use({ hubWorktrees: true, hubWorkspaces: ["atlas-desktop", "atlas-touch"] });
@@ -33,7 +34,7 @@ async function ready(page: Page) {
 async function surface(page: Page, name: "Files" | "Preview" | "Terminal" | "Chat") {
   await ready(page);
   if (await page.locator("html").getAttribute("data-ui-mode") === "touch") {
-    await page.getByRole("tab", { name, exact: true }).click();
+    await showSurface(page, ({ Files: "files", Preview: "preview", Terminal: "terminal", Chat: "chat" } as const)[name]);
   } else if (name === "Chat" && await page.locator("#chat-expand").isVisible()) {
     await page.locator("#chat-expand").click();
   } else if (name === "Terminal" && !await page.locator("#terminal-panel").isVisible()) {

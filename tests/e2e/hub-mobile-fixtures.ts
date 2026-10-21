@@ -18,12 +18,12 @@ export const test = base.extend<{ hub: HubMobileFixture; withoutAgentCli: boolea
     const home = path.join(root, "home");
     await mkdir(home);
     let toolPath = process.env.UATU_HUB_MOBILE_TOOL_PATH ?? "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
-    if (withoutAgentCli) {
-      const tools = path.join(root, "tools"); await mkdir(tools);
-      const bun = execFileSync("bun", ["-e", "process.stdout.write(process.execPath)"], { encoding: "utf8" });
-      await symlink(bun, path.join(tools, "bun"));
-      toolPath = `${tools}:/usr/bin:/bin:/usr/sbin:/sbin`;
-    }
+    // setup-bun installs outside the system tool PATH on CI. Expose just Bun,
+    // not the invoking PATH (which can contain projected credential wrappers).
+    const tools = path.join(root, "tools"); await mkdir(tools);
+    const bun = execFileSync("bun", ["-e", "process.stdout.write(process.execPath)"], { encoding: "utf8" });
+    await symlink(bun, path.join(tools, "bun"));
+    toolPath = `${tools}:${withoutAgentCli ? "/usr/bin:/bin:/usr/sbin:/sbin" : toolPath}`;
     // Do not inherit the invoking Hub's projected Git/SSH wrappers, agents,
     // provider credentials, or the developer's personal config directories.
     const env: NodeJS.ProcessEnv = {

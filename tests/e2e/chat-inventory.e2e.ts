@@ -3,6 +3,7 @@ import type { APIRequestContext, Browser, BrowserContext, Page } from "@playwrig
 import type { ConversationItem, ConversationSnapshot } from "../../src/chat/types";
 import { chooseChatModel, openChatPanel } from "./chat-helpers";
 import { captureScreenshot } from "./evidence";
+import { showSurface } from "./navigation-helpers";
 import { expect, test } from "./fixtures";
 
 const PNG = Buffer.from(
@@ -123,7 +124,7 @@ async function bootRememberedStartup(previousPage: Page, request: APIRequestCont
   });
   const credential = await token(request);
   const activate = async (page: Page) => {
-    if (mode === "touch") await page.locator("#touch-tab-chat").click();
+    if (mode === "touch") await showSurface(page, "chat");
     else await openChatPanel(page);
   };
   await previousPage.goto(`/?t=${encodeURIComponent(credential)}`);
@@ -282,7 +283,7 @@ test.describe("live conversation inventory", () => {
         });
         const credential = await token(request);
         await previousPage.goto(`/?t=${encodeURIComponent(credential)}`);
-        if (mode === "touch") await previousPage.locator("#touch-tab-chat").click();
+        if (mode === "touch") await showSurface(previousPage, "chat");
         else await openChatPanel(previousPage);
         await expect(previousPage.locator("#chat-conversation-select")).toHaveValue(fallback.conversation.id);
         await previousPage.locator("#chat-conversation-select").selectOption(saved.conversation.id);
@@ -299,7 +300,7 @@ test.describe("live conversation inventory", () => {
           }), { id: saved.conversation.id, draft })).toBe(true);
         if (mode === "touch") {
           await previousPage.locator("#chat-input").blur();
-          await previousPage.locator("#touch-tab-files").click();
+          await showSurface(previousPage, "files");
         } else await previousPage.locator("#chat-collapse").click();
         await previousPage.close();
 
@@ -323,13 +324,13 @@ test.describe("live conversation inventory", () => {
         await expect(page.locator("html")).toHaveAttribute("data-ui-mode", mode);
         // Chat initializes lazily on activation; hide it again while the
         // controlled startup inventory is still empty.
-        if (mode === "touch") await page.locator("#touch-tab-chat").click();
+        if (mode === "touch") await showSurface(page, "chat");
         else await openChatPanel(page);
         await expect.poll(() => emptyReads).toBeGreaterThan(0);
         await expect(page.locator("#chat-state")).toContainText("No conversations yet");
         await expect(page.locator("#chat-items")).not.toContainText("Saved history:");
         await waitForInventoryIdle(request);
-        if (mode === "touch") await page.locator("#touch-tab-files").click();
+        if (mode === "touch") await showSurface(page, "files");
         else await page.locator("#chat-collapse").click();
         const otherControl = page.locator(mode === "touch" ? "#touch-tab-files" : "#chat-expand");
         await otherControl.focus();
@@ -367,7 +368,7 @@ test.describe("live conversation inventory", () => {
 
         // Hidden surfaces intentionally defer timeline/control rendering.
         // Reveal the already-read and subscribed conversation, not a selection.
-        if (mode === "touch") await page.locator("#touch-tab-chat").click();
+        if (mode === "touch") await showSurface(page, "chat");
         else await openChatPanel(page);
         await expect(page.locator("#chat-items")).toContainText("Saved history: the synthetic startup checklist is ready.");
         await expect(page.locator("#chat-composer")).not.toHaveAttribute("inert", "");

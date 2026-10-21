@@ -2,6 +2,8 @@ import { execFileSync } from "node:child_process";
 import { test, expect, loginHub, hubPost } from "./hub-mobile-fixtures";
 import { captureScreenshot } from "./evidence";
 
+test.use({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
+
 // Actual production Hub documents and real isolated APIs, not routed mock pages.
 for (const size of [{ width: 320, height: 568 }, { width: 390, height: 844 }, { width: 844, height: 390 }]) test.describe(`${size.width}`, () => {
   test.use({ viewport: size });
@@ -58,6 +60,7 @@ for (const size of [{ width: 320, height: 568 }, { width: 390, height: 844 }, { 
     await page.getByLabel("Remote URL", { exact: true }).fill("https://example.test/project.git");
     await page.getByLabel("Workspace display name", { exact: true }).fill("Preserved clone draft");
     await captureScreenshot(page, info, `clone-${size.width}`);
+    await page.locator("[data-clone-credentials] > summary").click();
     await page.locator('[data-flow="setup-credentials"]').click();
     await expect(page.locator(".mh-task")).toContainText("Set up repository credentials");
     await page.locator('.mh-task [data-flow="token"]').click();
@@ -89,7 +92,11 @@ for (const size of [{ width: 320, height: 568 }, { width: 390, height: 844 }, { 
     const nav = page.locator(".mh-section").filter({ has: page.getByRole("heading", { name: "Navigation", exact: true }) });
     for (const key of ["handle", "auto-hide", "preview-side"]) await expect(nav.locator(`[data-action="${key}"]`)).toHaveCount(1);
     const creds = page.locator(".mh-section").filter({ has: page.getByRole("heading", { name: "Credentials", exact: true }) });
-    for (const key of ["tools", "assignments"]) await expect(creds.locator(`[data-action="${key}"]`)).toHaveCount(1);
+    await expect(creds.locator('[data-action="repository-credentials"]')).toHaveCount(1);
+    await creds.locator('[data-action="repository-credentials"]').click();
+    await expect(page.locator(".mh-flow-page h1")).toHaveText("Repository credentials");
+    for (const key of ["tools", "assignments"]) await expect(page.locator(`.mh-flow-page [data-action="${key}"]`)).toHaveCount(1);
+    await page.locator('[data-action="settings"]').click();
     await expect(page.getByRole("heading", { name: "More settings", exact: true })).toHaveCount(0);
     await captureScreenshot(page, info, `settings-${size.width}`);
   });

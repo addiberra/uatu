@@ -54,6 +54,7 @@ async function deleteCredential(page: Page, credentialId: string): Promise<void>
 type StateWorkspace = {
   id: string;
   displayName: string;
+  path: string;
   running: boolean;
   parentId?: string;
   credentialRestartRequired: boolean;
@@ -101,7 +102,7 @@ async function revealStoppedChildren(page: Page, parentId: string): Promise<void
   await expect(disclosure).toHaveCount(1);
   await expect(async () => {
     if (await disclosure.getAttribute("open") === null) {
-      await disclosure.locator("summary").click({ timeout: 2_000 });
+      await disclosure.locator(":scope > summary").click({ timeout: 2_000 });
     }
     expect(await disclosure.getAttribute("open")).not.toBeNull();
   }).toPass({ timeout: 10_000 });
@@ -126,15 +127,24 @@ for (const touch of [false, true]) test.describe(touch ? "worktree credentials o
     // Fork from the dashboard: the repository heading's own fork control
     // opens the one client worktree dialog.
     await page.goto(`${hub.origin}/`);
+    const branch = "feature/inherits";
+    if (touch) {
+      await page.locator(`[data-action="info:${parentId}"]`).click();
+      await page.locator('[data-flow="worktrees"]').click();
+      await page.getByRole("button", { name: "Create branch or worktree", exact: true }).click();
+      await page.getByLabel("New branch name", { exact: true }).fill(branch);
+      await page.getByRole("button", { name: "Create worktree", exact: true }).click();
+      await expect(page.getByRole("heading", { name: "Worktree operation completed", exact: true })).toBeVisible();
+    } else {
     await page.getByRole("button", { name: `Add worktree to ${parentId}`, exact: true }).click();
     await page.getByRole("menuitem", { name: "New branch / worktree", exact: true }).click();
     const dialog = page.getByRole("dialog");
     await expect(dialog).toContainText(`New branch / worktree · ${parentId}`);
-    const branch = "feature/inherits";
     await dialog.getByLabel("Name", { exact: true }).fill(branch);
     await dialog.getByRole("button", { name: "Create", exact: true }).click();
     await expect(page.getByRole("dialog")).toHaveCount(0);
     await expect(page.locator("[data-worktree-confirmation]")).toContainText(`Created ${branch}`);
+    }
     const childId = await childIdFor(page, parentId, branch);
 
     // The state API never claims the child holds assignments; the row
@@ -147,6 +157,28 @@ for (const touch of [false, true]) test.describe(touch ? "worktree credentials o
     expect(child.credentialAssignments).toEqual({ authentication: [], signing: [] });
     expect(parent.credentialAssignments.authentication).toEqual([credentialName]);
 
+    if (touch) {
+      await page.locator('[data-action="hub"]').click();
+      const family = page.locator(".mh-workspace-family").filter({ has: page.locator(`[data-action="info:${parentId}"]`) });
+      if (await family.getAttribute("open") === null) await family.locator(":scope > summary").click();
+      await page.locator(`[data-action="info:${childId}"]`).click();
+      await expect(page.locator(".mh-flow-page h1")).toContainText(branch);
+      await expect(page.getByRole("button", { name: "Manage inherited workspace credentials", exact: true })).toBeVisible();
+      await page.locator('[data-flow="assign"]').click();
+      await expect(page.locator(".mh-flow-page h1")).toHaveText(parent.displayName);
+      await expect(page.locator(".mh-flow-page")).toContainText(credentialName);
+      await expect(page.locator(".mh-flow-page")).toContainText(parent.path);
+      expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+      for (const colorScheme of ["light", "dark"] as const) {
+        await page.emulateMedia({ colorScheme });
+        await captureScreenshot(page, info, `worktree-credentials-${label}-parent-policy-${colorScheme}`);
+      }
+      await deleteCredential(page, credentialId);
+      await page.locator('[data-flow="flow-back"]').click();
+      await page.locator('[data-flow="assign"]').click();
+      await expect(page.locator(".mh-flow-page h1")).toHaveText(parent.displayName);
+      await expect(page.locator(".mh-flow-page")).toContainText("No credentials assigned");
+    } else {
     await revealStoppedChildren(page, parentId);
     const childRow = rowFor(page, childId);
     const parentRow = rowFor(page, parentId);
@@ -171,6 +203,7 @@ for (const touch of [false, true]) test.describe(touch ? "worktree credentials o
     // With the parent's policy gone, the child's row says so too — still
     // through the parent, never through assignments of its own.
     await expect(childRow.locator(".row-detail")).toHaveText(`⊘ No credentials assigned · inherited from ${parent.displayName}`);
+    }
     expect(errors).toEqual([]);
     await page.close();
   });

@@ -53,7 +53,11 @@ export function createLiveAuthentication(transport: LiveTransport): Pick<MobileH
         if (object(value).revoked !== true) throw new Error("Invalid logout");
         return { status: "signed-out" as const };
       }, {});
-      if (result.status === "completed") transport.invalidate("signed-out");
+      if (result.status === "completed") {
+        // Match the login page's stale-visit cleanup before signed-out UI.
+        try { sessionStorage.removeItem("uatu.hub.return.v1"); } catch { /* Storage may be unavailable. */ }
+        transport.invalidate("signed-out");
+      }
       return result;
     }),
     readDevices: () => transport.read("/api/hub/sessions", decodeDevices),

@@ -97,17 +97,36 @@ for (const mobile of [false, true]) {
         expect.objectContaining({ id: b, running: false, displayName: "Shared workspace" }),
       ]));
       await page.reload();
-      await expect(page.locator(`#sessions a[href="/s/${a}/"]`)).toBeVisible();
-      await expect(page.locator("#workspaces")).toContainText(hub.workspaces.b);
+      if (mobile) {
+        await expect(page.locator(`[data-action="open:${a}"]`)).toBeVisible();
+        await expect(page.locator(`[data-workspace="${b}"] .mh-workspace-copy p`)).toHaveAttribute("title", hub.workspaces.b);
+      } else {
+        await expect(page.locator(`#sessions a[href="/s/${a}/"]`)).toBeVisible();
+        await expect(page.locator("#workspaces")).toContainText(hub.workspaces.b);
+      }
       await capture("dashboard-a-running-b-stopped");
-      await page.getByRole("link", { name: "Settings", exact: true }).click();
-      await expect(page.locator(".credential-card")).toHaveCount(4);
-      await expect(page.locator("#devices")).toContainText("this device");
-      await capture("settings");
-      await page.locator(".credential-card").filter({ hasText: "Baseline SSH" }).locator("summary").click();
-      await capture("settings-ssh-details");
-      await page.getByRole("link", { name: "Add workspace", exact: true }).click();
-      await expect(page.locator("#clone-form")).toBeVisible();
+      if (mobile) {
+        await page.locator('[data-action="settings"]').click();
+        await capture("settings");
+        await page.locator('[data-action="repository-credentials"]').click();
+        await expect(page.locator("[data-credential-id]")).toHaveCount(4);
+        await page.locator(`[data-credential-id="${ssh.id}"]`).click();
+        await expect(page.locator(".mh-flow-page h1")).toHaveText("Baseline SSH");
+        await capture("settings-ssh-details");
+        await page.goto(`${hub.origin}/settings?detail=devices`);
+        await expect(page.locator(".mh-flow-page")).toContainText("Current session");
+        await page.goto(`${hub.origin}/clone`);
+        await expect(page.getByRole("heading", { name: "Clone Repository", exact: true })).toBeVisible();
+      } else {
+        await page.getByRole("link", { name: "Settings", exact: true }).click();
+        await expect(page.locator(".credential-card")).toHaveCount(4);
+        await expect(page.locator("#devices")).toContainText("this device");
+        await capture("settings");
+        await page.locator(".credential-card").filter({ hasText: "Baseline SSH" }).locator("summary").click();
+        await capture("settings-ssh-details");
+        await page.getByRole("link", { name: "Add workspace", exact: true }).click();
+        await expect(page.locator("#clone-form")).toBeVisible();
+      }
       await capture("clone");
 
       await page.goto(`${hub.origin}/s/${a}/docs/guide.md`);
@@ -120,6 +139,13 @@ for (const mobile of [false, true]) {
       await post(`/api/hub/sessions/${b}/start`);
       const documentIds: string[] = [];
       for (const id of [a, b]) {
+        // Start confirms HTTP readiness; initial indexing is deliberately
+        // asynchronous. Wait for its explicit completion, not an empty snapshot.
+        await expect.poll(async () => {
+          const response = await request.get(`${hub.origin}/s/${id}/api/state`);
+          expect(response.ok()).toBe(true);
+          return (await response.json()).discovery.status;
+        }).toBe("ready");
         const response = await request.get(`${hub.origin}/s/${id}/api/state`);
         expect(response.ok()).toBe(true);
         const roots = (await response.json()).roots as RootGroup[];

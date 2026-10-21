@@ -10,6 +10,7 @@ import { promises as fs } from "node:fs";
 
 import { workspacePath } from "./config";
 import { revealTreeRow, treeRow } from "./tree-helpers";
+import { showSurface } from "./navigation-helpers";
 import { DOCUMENT_SELECTION_CLEARED_KEY } from "../../src/shell/selection-storage";
 
 const test = withEngineBrowsers(baseTest);
@@ -377,15 +378,15 @@ for (const input of ["pointer", "touch", "Enter", "Space", "ArrowLeft"] as const
     test.use(input === "touch" ? { viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true } : {});
     test("closes the document, retains directory focus, and reopening stays empty", async ({ page, request }) => {
       await bootSession(page, request);
-      if (input === "touch") await page.locator("#touch-tab-files").click();
+      if (input === "touch") await showSurface(page, "files");
       await treeRow(page, "README.md").click();
-      if (input === "touch") await page.locator("#touch-tab-files").click();
+      if (input === "touch") await showSurface(page, "files");
       await page.locator("#follow-toggle").click();
       await expect(page.locator("#follow-toggle")).toHaveAttribute("aria-pressed", "true");
       await fs.writeFile(workspacePath("guides", "setup.md"), "# Setup\n\nNative collapse fixture.\n", "utf8");
       await expect(page.locator("#preview")).toContainText("Native collapse fixture.");
       await expect(page.locator("#follow-toggle")).toHaveAttribute("aria-pressed", "true");
-      if (input === "touch") await page.locator("#touch-tab-files").click();
+      if (input === "touch") await showSurface(page, "files");
       const folder = treeRow(page, "guides/");
       await expect(folder).toHaveAttribute("aria-expanded", "true");
       if (input === "pointer") await folder.click();
@@ -396,9 +397,9 @@ for (const input of ["pointer", "touch", "Enter", "Space", "ArrowLeft"] as const
       await expectClosedDocument(page);
       if (input === "touch") {
         await expect(page.locator("#touch-tab-files")).toHaveAttribute("aria-selected", "true");
-        await page.locator("#touch-tab-preview").tap();
+        await showSurface(page, "preview");
         await expect(page.locator("#preview.empty")).toBeVisible();
-        await page.locator("#touch-tab-files").tap();
+        await showSurface(page, "files");
       }
       await folder.click();
       await expect(folder).toHaveAttribute("aria-expanded", "true");
@@ -603,13 +604,13 @@ for (const activation of ["pointer", "Enter", "Space", "touch"] as const) {
     test.use(activation === "touch" ? { viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true } : {});
     test("visible selected file performs manual navigation exactly once", async ({ page, request }) => {
       await bootSession(page, request);
-      if (activation === "touch") await page.locator("#touch-tab-files").click();
+      if (activation === "touch") await showSurface(page, "files");
       await treeRow(page, "README.md").click();
-      if (activation === "touch") await page.locator("#touch-tab-files").click();
+      if (activation === "touch") await showSurface(page, "files");
       await page.locator("#follow-toggle").click();
       await fs.writeFile(workspacePath("guides", "setup.md"), "# Setup\n\nActivation fixture.\n", "utf8");
       await expect(page.locator("#preview-path")).toHaveText("guides/setup.md");
-      if (activation === "touch") await page.locator("#touch-tab-files").click();
+      if (activation === "touch") await showSurface(page, "files");
       // No collapse/reopen setup: ancestor collapse now closes the document.
       await expect(treeRow(page, "guides/setup.md")).toHaveAttribute("aria-selected", "true");
       await expect(page.locator("#follow-toggle")).toHaveAttribute("aria-pressed", "true");
@@ -624,7 +625,7 @@ for (const activation of ["pointer", "Enter", "Space", "touch"] as const) {
       await expect(page.locator("#preview")).toContainText("Activation fixture.");
       if (activation === "touch") await expect(page.locator("#touch-tab-preview")).toHaveAttribute("aria-selected", "true");
       // A different-file activation stays library-driven, without a second read.
-      if (activation === "touch") await page.locator("#touch-tab-files").click();
+      if (activation === "touch") await showSurface(page, "files");
       if (activation === "Enter" || activation === "Space") {
         await treeRow(page, "guides/notes.adoc").focus();
         await page.keyboard.press(activation);
@@ -830,7 +831,7 @@ for (const browserName of ["chromium", "webkit"] as const) {
     try {
       const page = await browser.newPage({ baseURL, hasTouch: true, isMobile: true, viewport: { width: 390, height: 844 } });
       await bootSession(page, request);
-      await page.locator("#touch-tab-files").click();
+      await showSurface(page, "files");
       expect(await page.evaluate(() => matchMedia("(hover: none)").matches)).toBe(true);
       const background = (path: string) => treeRow(page, path).evaluate(element => getComputedStyle(element).backgroundColor);
       await expect(treeRow(page, "diagram.md")).toHaveAttribute("aria-selected", "false");
@@ -847,7 +848,7 @@ for (const browserName of ["chromium", "webkit"] as const) {
       await treeRow(page, "metadata/").tap();
       await treeRow(page, "diagram.md").tap();
       await expect(page.locator("#preview-path")).toHaveText("diagram.md");
-      await page.locator("#touch-tab-files").click();
+      await showSurface(page, "files");
       await expect(treeRow(page, "diagram.md")).toHaveAttribute("aria-selected", "true");
       expect(await background("diagram.md")).not.toBe(plain);
     } finally {

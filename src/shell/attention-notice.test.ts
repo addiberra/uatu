@@ -1,11 +1,31 @@
 import { expect, test } from "bun:test";
-import { AttentionNotices, attentionNoticeHref, QUIET_BEFORE_NOTICE_MS } from "./attention-notice";
+import { AttentionNotices, attentionNoticeHref, QUIET_BEFORE_NOTICE_MS, renderAttentionNotices } from "./attention-notice";
+import { parseHTML } from "linkedom";
+import { installWorkspacePresentationRoot } from "../hub/mobile/coordinator-context";
 import type { WorkspaceActivity } from "../shared/live-protocol";
 
 const quiet: WorkspaceActivity = { running: true, working: false, awaiting: false, finished: false };
 const waiting: WorkspaceActivity = { running: true, working: true, awaiting: true, finished: false };
 const finished: WorkspaceActivity = { running: true, working: false, awaiting: false, finished: true };
 const stopped: WorkspaceActivity = { running: false, working: false, awaiting: false, finished: false };
+
+test("notice overlays belong to the retained workspace's stacking and inertness owner", () => {
+  const { document } = parseHTML('<html><body><div id="workspace"></div></body></html>');
+  const doc = document as unknown as Document;
+  const workspace = doc.getElementById("workspace")!;
+  const uninstall = installWorkspacePresentationRoot(workspace);
+  try {
+    renderAttentionNotices(doc, [{ workspaceId: "beta" }], { label: id => id, dismiss() {} });
+    expect(doc.getElementById("attention-notices")?.parentElement).toBe(workspace);
+  } finally { uninstall(); }
+});
+
+test("notice overlays retain the body fallback outside a coordinator", () => {
+  const { document } = parseHTML("<html><body></body></html>");
+  const doc = document as unknown as Document;
+  renderAttentionNotices(doc, [{ workspaceId: "beta" }], { label: id => id, dismiss() {} });
+  expect(doc.getElementById("attention-notices")?.parentElement).toBe(doc.body);
+});
 
 // Each report comes a quiet period after the previous one unless a test says otherwise.
 function fixture(currentId = "alpha") {

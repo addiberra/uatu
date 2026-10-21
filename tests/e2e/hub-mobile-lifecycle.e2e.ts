@@ -1,13 +1,13 @@
 import type { Page } from "@playwright/test";
+import { readFile } from "node:fs/promises";
 import type { TerminalSessionInfo } from "../../src/terminal/server";
 import { test, expect, loginHub, hubPost } from "./hub-mobile-fixtures";
+import { showSurface } from "./navigation-helpers";
 
 test.use({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
 
 async function terminal(page: Page) {
-  const tab = page.getByRole("tab", { name: "Terminal", exact: true });
-  if (!(await tab.isVisible())) await page.locator("#navigation-handle").click();
-  await tab.click();
+  await showSurface(page, "terminal");
 }
 
 async function command(page: Page, text: string) {
@@ -75,16 +75,20 @@ test("independent Hub workspaces preserve real PTYs across navigation and never 
   expect(aSession.attached).toBe(true);
   expect(bSession.attached).toBe(true);
 
-  await command(page, "sleep 2; printf 'detached_%s_end\\n' \"$UATU_HUB_MARKER\"");
+  await command(page, "sleep 2; printf 'detached_%s_end\\n' \"$UATU_HUB_MARKER\"; printf '%s' \"$UATU_HUB_MARKER\" > .residency-marker");
   if (!(await page.locator("#navigation-hub").isVisible())) await page.locator("#navigation-handle").click();
   await page.locator("#navigation-hub").click();
   await expect(page).toHaveURL(`${hub.origin}/`);
-  await expect.poll(async () => (await inventory(a)).map(session => ({ id: session.id, attached: session.attached }))).toEqual([{ id: aSession.id, attached: false }]);
-  await page.waitForTimeout(2300);
+  // An ordinary resident Hub detour keeps the real client and its PTY socket,
+  // rather than manufacturing a historical Return that reconnects a new page.
+  await expect.poll(async () => (await inventory(a)).map(session => ({ id: session.id, attached: session.attached }))).toEqual([{ id: aSession.id, attached: true }]);
+  // Hidden xterm painting may pause; an owned file proves the same real shell
+  // continues executing while Hub is foreground, without a fixed sleep.
+  await expect.poll(() => readFile(`${hub.workspaces.a}/.residency-marker`, "utf8").catch(() => null)).toBe("alive");
   expect((await inventory(b)).map(session => ({ id: session.id, attached: session.attached }))).toEqual([{ id: bSession.id, attached: true }]);
-  await expect(page.locator("#sessions")).toContainText("detached");
-  await expect(page.locator("#hub-return")).toContainText("Return to A");
-  await page.locator("#hub-return").click();
+  await expect(page.locator('[data-workspace="' + a + '"]')).toContainText("Running");
+  await expect(page.locator('[data-action="return"]')).toHaveAccessibleName(`Return to A, ${hub.workspaces.a}`);
+  await page.locator('[data-action="return"]').click();
   // Return lands in workspace A. Once there, the workspace selects its default
   // document and advances the URL to it, exactly as arriving at `/s/<id>/`
   // directly does, so assert the workspace rather than racing that push.
@@ -107,7 +111,7 @@ test("independent Hub workspaces preserve real PTYs across navigation and never 
   await expect(page.locator(".terminal-pane-host")).toContainText("owner_alive_end");
   expect((await inventory(a)).map(session => session.id)).toEqual([aSession.id]);
   expect(creations.sort()).toEqual([`/s/${a}/api/terminal/sessions`, `/s/${b}/api/terminal/sessions`].sort());
-  expect(terminalUrls.length).toBeGreaterThanOrEqual(3);
+  expect(terminalUrls).toHaveLength(2);
   expect(terminalUrls.every(url => !url.searchParams.has("t") && url.searchParams.get("takeover") !== "1")).toBe(true);
   expect(forbiddenMutations).toEqual([]);
   await third.close();

@@ -44,11 +44,11 @@ html[data-workspace-foreground="false"] .mh-coordinator-workspace {
   cursor: pointer;
 }
 .mh-coordinator-loading h1 { font-size: 1.3rem; margin-top: 32px; }
-.mh-coordinator-workspace :where(.sidebar, .chat-surface, .terminal-panel, .touch-tab-bar, .navigation-handle, #preview-file-navigation, .uatu-outline) {
+.mh-coordinator-workspace :where(.sidebar, .chat-surface, .terminal-panel, .touch-tab-bar, .navigation-handle, #preview-file-navigation, .uatu-outline, .attention-notices) {
   translate: none;
   transition: translate 240ms cubic-bezier(.22, .61, .36, 1);
 }
-html[data-workspace-foreground="false"] .mh-coordinator-workspace :where(.sidebar, .chat-surface, .terminal-panel, .touch-tab-bar, .navigation-handle, #preview-file-navigation, .uatu-outline) {
+html[data-workspace-foreground="false"] .mh-coordinator-workspace :where(.sidebar, .chat-surface, .terminal-panel, .touch-tab-bar, .navigation-handle, #preview-file-navigation, .uatu-outline, .attention-notices) {
   translate: 100vw;
 }
 /* The selector's local fade remains separate, at its final bottom position. */
@@ -73,5 +73,5 @@ html[data-workspace-foreground="false"] .mh-coordinator-hub {
 }
 @media (prefers-reduced-motion: reduce) {
   .mh-coordinator-workspace, .mh-coordinator-hub,
-  html[data-ui-mode="touch"] .mh-coordinator-workspace :is(.sidebar, .chat-surface, .terminal-panel, .touch-tab-bar, .navigation-handle, #preview-file-navigation, .uatu-outline) { transition: none; }
+  html[data-ui-mode="touch"] .mh-coordinator-workspace :is(.sidebar, .chat-surface, .terminal-panel, .touch-tab-bar, .navigation-handle, #preview-file-navigation, .uatu-outline, .attention-notices) { transition: none; }
 }

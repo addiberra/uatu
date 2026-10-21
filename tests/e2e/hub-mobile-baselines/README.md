@@ -39,6 +39,12 @@ the repository's Playwright Chromium. The child uses a clean tool PATH rather
 than inheriting projected Hub credentials; `UATU_HUB_MOBILE_TOOL_PATH` can specify
 a different clean installation location. Missing real crypto tools fail rather
 than silently substituting fake implementations or skipping coverage.
+The fixture resolves Bun from the invoking environment and exposes only that
+executable through a temporary tool symlink, so CI's non-system Bun installation
+remains available without inheriting the invoking PATH or credential wrappers.
+Ordinary runs exercise the current touch interface (including focused credential
+and device pages) while retaining these historical pre-presentation images.
+They do not update the retained images or assert the retired touch markup.
 
 ## Coverage
 

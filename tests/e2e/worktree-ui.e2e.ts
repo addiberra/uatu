@@ -21,6 +21,7 @@ import type { Page } from "@playwright/test";
 
 import { test, expect, openHubMenu } from "./hub-fixtures";
 import { captureScreenshot, saveEvidence } from "./evidence";
+import { showSurface } from "./navigation-helpers";
 
 const exec = promisify(execFile);
 test.use({ hubWorktrees: true, hubWorkspaces: ["orbit-desktop", "orbit-touch"] });
@@ -39,7 +40,7 @@ async function ready(page: Page): Promise<void> {
 async function files(page: Page): Promise<void> {
   await ready(page);
   if (await page.locator("html").getAttribute("data-ui-mode") === "touch") {
-    await page.getByRole("tab", { name: "Files", exact: true }).click();
+    await showSurface(page, "files");
   }
 }
 
@@ -66,6 +67,14 @@ async function inventoryOf(page: Page, sourceWorkspaceId: string) {
     checkouts: { checkoutId: string; workspaceId?: string; path: string; branch: string; ownership: string; registered: boolean; running: boolean; availability: string }[];
     refs: { local: string[]; remote: string[] };
   };
+}
+
+async function mobileCheckout(page: Page, origin: string, parentId: string, branch: string) {
+  await page.goto(origin);
+  await page.locator(`[data-action="info:${parentId}"]`).click();
+  await page.locator('[data-flow="worktrees"]').click();
+  await page.getByRole("button", { name: new RegExp(`^${branch},`) }).click();
+  await expect(page.getByRole("heading", { name: "Checkout information", exact: true })).toBeVisible();
 }
 
 // The Active-groups dashboard folds stopped children behind
@@ -408,11 +417,23 @@ for (const touch of [false, true]) test.describe(touch ? "worktree dialog on tou
     // The dashboard's own row offers a re-read and no rebuild.
     const before = (await inventoryOf(page, parentId)).checkouts.length;
     await page.goto(`${hub.origin}/`);
-    await dashboard(page);
-    const missingRow = page.locator(`[data-workspace="${registered.workspaceId}"]`);
-    await expect(missingRow).toContainText("Nothing will be recreated.");
-    await missingRow.getByRole("button", { name: "Retry refresh", exact: true }).click();
-    await expect(missingRow).toContainText("Nothing will be recreated.");
+    if (touch) {
+      await page.locator(`[data-action="info:${registered.workspaceId}"]`).click();
+      await expect(page.locator(".mh-flow-page")).toContainText("Checkout missing");
+      await expect(page.locator('.mh-flow-page [data-flow="open"]')).toHaveCount(0);
+      await page.locator('[data-flow="worktrees"]').click();
+      const refreshed = page.waitForResponse(response => new URL(response.url()).pathname === "/api/hub/worktrees");
+      await page.getByRole("button", { name: "Refresh checkouts", exact: true }).click();
+      expect((await refreshed).ok()).toBe(true);
+      await expect(page.locator("[data-worktree-inventory]")).toContainText("agent/outside");
+      await expect(page.locator("[data-worktree-inventory]")).toContainText("missing");
+    } else {
+      await dashboard(page);
+      const missingRow = page.locator(`[data-workspace="${registered.workspaceId}"]`);
+      await expect(missingRow).toContainText("Nothing will be recreated.");
+      await missingRow.getByRole("button", { name: "Retry refresh", exact: true }).click();
+      await expect(missingRow).toContainText("Nothing will be recreated.");
+    }
     expect(existsSync(external)).toBe(false);
     expect((await inventoryOf(page, parentId)).checkouts).toHaveLength(before);
     await captureScreenshot(page, info, `worktree-ui-${label}-missing`);
@@ -444,6 +465,45 @@ for (const touch of [false, true]) test.describe(touch ? "worktree dialog on tou
     await writeFile(path.join(checkout.path, ".env"), "API_TOKEN=local-only\n");
     await mkdir(path.join(checkout.path, "node_modules", "left-pad"), { recursive: true });
     await writeFile(path.join(checkout.path, "node_modules", "left-pad", "index.js"), "module.exports = 1;\n");
+
+    if (touch) {
+      let deletes = 0;
+      page.on("request", request => { if (request.method() === "POST" && new URL(request.url()).pathname === "/api/hub/worktrees/delete") deletes++; });
+      const openDelete = async () => {
+        await mobileCheckout(page, hub.origin, parentId, branch);
+        await page.getByRole("button", { name: "Check deletion safety", exact: true }).click();
+        await expect(page.getByRole("heading", { name: "Delete worktree?", exact: true })).toBeVisible();
+      };
+      await openDelete();
+      const dialog = page.locator(".mh-sheet");
+      const acknowledgement = dialog.getByRole("switch", { name: "Permanently delete these files with the worktree", exact: true });
+      await expect(dialog).toContainText("The Git branch remains.");
+      await expect(dialog).toContainText("including everything inside each listed folder, and cannot be recovered");
+      for (const [category, count] of [["tracked", 1], ["untracked", 1], ["ignored", 2]] as const) {
+        const row = dialog.locator(".mh-info-row").filter({ has: page.getByText(category, { exact: true }) });
+        await expect(row.locator(".mh-info-value")).toHaveText(`${count} entries`);
+      }
+      for (const file of ["README.md", "scratch.txt", ".env", "node_modules/"]) await expect(dialog).toContainText(file);
+      await expect(acknowledgement).not.toBeChecked();
+      await captureScreenshot(page, info, `worktree-ui-${label}-delete-local-data`);
+      await dialog.getByRole("button", { name: "Delete worktree", exact: true }).click();
+      await expect(dialog.locator(".mh-sheet-error")).toContainText("Acknowledge");
+      expect(deletes).toBe(0);
+      expect(existsSync(path.join(checkout.path, "scratch.txt"))).toBe(true);
+      await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
+      expect(existsSync(path.join(checkout.path, ".env"))).toBe(true);
+      expect((await rowFor(page, parentId, branch)).registered).toBe(true);
+      await openDelete();
+      await acknowledgement.check();
+      await dialog.getByRole("button", { name: "Delete worktree", exact: true }).click();
+      await expect(page.getByRole("heading", { name: "Worktree operation completed", exact: true })).toBeVisible();
+      expect(deletes).toBe(1);
+      expect(existsSync(checkout.path)).toBe(false);
+      expect(await git(parent.path, ["rev-parse", branch])).toBe(head);
+      expect(errors).toEqual([]);
+      await page.close();
+      return;
+    }
 
     await page.goto(`${hub.origin}/`);
     await dashboard(page);
@@ -512,6 +572,76 @@ for (const touch of [false, true]) test.describe(touch ? "worktree dialog on tou
     const clean = await rowFor(page, parentId, "delete/clean");
     const dirty = await rowFor(page, parentId, "delete/dirty");
     const forgotten = await rowFor(page, parentId, "delete/forget");
+
+    if (touch) {
+      await mobileCheckout(page, hub.origin, parentId, "delete/clean");
+      await page.getByRole("button", { name: "Check deletion safety", exact: true }).click();
+      const dialog = page.locator(".mh-sheet");
+      await expect(dialog).toContainText("The Git branch remains.");
+      await expect(dialog).toContainText(clean.path);
+      await dialog.getByRole("button", { name: "Delete worktree", exact: true }).click();
+      await expect(page.getByRole("heading", { name: "Worktree operation completed", exact: true })).toBeVisible();
+      expect(existsSync(clean.path)).toBe(false);
+      expect(await git(parent.path, ["branch", "--list", "delete/clean"])).toContain("delete/clean");
+
+      expect((await page.request.post(`/api/hub/sessions/${forgotten.workspaceId}/start`)).ok()).toBe(true);
+      await page.goto(hub.origin);
+      const family = page.locator(".mh-workspace-family").filter({ has: page.locator(`[data-action="info:${parentId}"]`) });
+      if (await family.getAttribute("open") === null) await family.locator(":scope > summary").click();
+      const main = page.locator(`[data-workspace="${parentId}"]`), child = page.locator(`[data-workspace="${forgotten.workspaceId}"]`);
+      expect(Math.abs((await main.locator("h3").boundingBox())!.x - (await child.locator("h3").boundingBox())!.x)).toBeLessThan(1);
+      await expect(page.getByRole("button", { name: /^Configure / })).toHaveCount(0);
+      await expect(child.locator(".mh-workspace-details")).toBeVisible();
+      expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+      await mobileCheckout(page, hub.origin, parentId, "delete/forget");
+      await page.getByRole("button", { name: "Check deletion safety", exact: true }).click();
+      await expect(dialog).toContainText("terminates its shells first");
+      await expect(dialog.getByRole("button", { name: "Stop and delete worktree", exact: true })).toBeVisible();
+      await expect(dialog.getByRole("checkbox")).toHaveCount(0);
+      await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
+      expect(existsSync(forgotten.path)).toBe(true);
+      expect((await rowFor(page, parentId, "delete/forget")).running).toBe(true);
+
+      await writeFile(path.join(dirty.path, "draft.txt"), "work in progress\n");
+      await git(dirty.path, ["worktree", "lock", "--reason", "keep", dirty.path]);
+      await mobileCheckout(page, hub.origin, parentId, "delete/dirty");
+      await page.getByRole("button", { name: "Check deletion safety", exact: true }).click();
+      await expect(page.getByRole("heading", { name: "Worktree deletion refused", exact: true })).toBeVisible();
+      await expect(page.locator(".mh-flow-page")).toContainText("locked in Git");
+      await expect(page.locator(".mh-flow-page").getByRole("checkbox")).toHaveCount(0);
+      await expect(page.getByRole("button", { name: "Delete worktree", exact: true })).toHaveCount(0);
+      expect(existsSync(path.join(dirty.path, "draft.txt"))).toBe(true);
+      expect((await rowFor(page, parentId, "delete/dirty")).registered).toBe(true);
+
+      expect((await page.request.post(`/api/hub/sessions/${forgotten.workspaceId}/stop`)).ok()).toBe(true);
+      await mobileCheckout(page, hub.origin, parentId, "delete/forget");
+      await page.getByRole("button", { name: "Remove from Uatu", exact: true }).click();
+      await expect(dialog).toContainText("Checkout, branch, files and creation provenance remain.");
+      await dialog.getByRole("button", { name: "Stop and remove registration", exact: true }).click();
+      await expect(page.getByRole("heading", { name: "Worktree operation completed", exact: true })).toBeVisible();
+      expect(existsSync(forgotten.path)).toBe(true);
+      expect(await git(parent.path, ["branch", "--list", "delete/forget"])).toContain("delete/forget");
+      expect((await rowFor(page, parentId, "delete/forget")).registered).toBe(false);
+      await page.locator('[data-action="hub"]').click();
+      await expect(page.locator(`[data-workspace="${forgotten.workspaceId}"]`)).toHaveCount(0);
+
+      const standalone = path.join(path.dirname(parent.path), `${parentId}-standalone`);
+      await git(parent.path, ["worktree", "add", "-b", `${parentId}/standalone`, standalone, "main"]);
+      const configured = await page.request.post("/api/hub/workspaces/configure", { data: { path: standalone, displayName: `${parentId}-standalone` } });
+      expect(configured.ok()).toBe(true);
+      const entry = (await configured.json()).workspace;
+      expect(entry.createWorktree).not.toBe(true);
+      await page.reload();
+      const standaloneRow = page.locator(`[data-workspace="${entry.id}"]`);
+      await expect(standaloneRow).not.toContainText("Main checkout");
+      await expect(standaloneRow.locator(".mh-workspace-copy p")).toHaveAttribute("title", standalone);
+      await standaloneRow.locator(".mh-workspace-details").click();
+      await expect(page.locator('[data-flow="worktrees"]')).toHaveCount(0);
+      await captureScreenshot(page, info, `worktree-ui-${label}-standalone-linked`);
+      expect(errors).toEqual([]);
+      await page.close();
+      return;
+    }
 
     // The SAME dialog module, from the Hub dashboard this time.
     await page.goto(`${hub.origin}/`);
@@ -685,6 +815,46 @@ for (const touch of [false, true]) test.describe(touch ? "worktree dialog on tou
         else Reflect.deleteProperty(document, "visibilityState");
       }
     });
+    if (touch) {
+      await page.locator(`[data-action="info:${parentId}"]`).click();
+      await page.locator('[data-flow="worktrees"]').click();
+      await expect(page.getByRole("heading", { name: "Branches and worktrees", exact: true })).toBeVisible();
+      await expect.poll(async () => (await live()).states).toEqual([1]);
+      await expect.poll(async () => (await live()).messages).toBeGreaterThan(0);
+      await expect(page.locator("[data-worktree-inventory]")).not.toHaveAttribute("aria-busy", "true");
+      await expect(page.getByRole("button", { name: /^live\/dashboard-external,/ })).toHaveCount(0);
+      const before = await live();
+      const subscription = new URL(before.urls[0]!);
+      expect(subscription.searchParams.get("ws")).toBe(parentId);
+      expect(JSON.parse(subscription.searchParams.get("subs")!)).toContainEqual({ topic: "worktrees" });
+      const original = await page.locator(".mh-flow-page").elementHandle();
+      const originalBody = await page.locator("body").elementHandle();
+      const url = page.url();
+      let navigations = 0;
+      page.on("framenavigated", frame => { if (frame === page.mainFrame()) navigations++; });
+      const external = path.join(path.dirname(parent.path), `${parentId}-dashboard-live`);
+      await git(parent.path, ["worktree", "add", "-b", "live/dashboard-external", external, "main"]);
+      const checkout = page.getByRole("button", { name: /^live\/dashboard-external,/ });
+      await expect(checkout).toBeVisible({ timeout: 15_000 });
+      await expect(checkout).toContainText(external);
+      expect(await original!.evaluate(node => node === document.querySelector(".mh-flow-page"))).toBe(true);
+      expect(page.url()).toBe(url);
+      expect(navigations).toBe(0);
+      expect((await live()).messages).toBeGreaterThan(before.messages);
+      expect((await live()).states).toEqual([1]);
+      await captureScreenshot(page, info, `worktree-ui-${label}-dashboard-live-register`);
+      await checkout.click();
+      await expect(page.getByRole("button", { name: "Register workspace", exact: true })).toBeVisible();
+      await expect.poll(async () => (await live()).states).toEqual([2]);
+      await page.getByRole("button", { name: "Register workspace", exact: true }).click();
+      await page.locator(".mh-sheet").getByRole("button", { name: "Cancel", exact: true }).click();
+      await expect(page.locator(".mh-sheet")).toHaveCount(0);
+      await expect(page.getByRole("heading", { name: "Checkout information", exact: true })).toBeVisible();
+      expect(await originalBody!.evaluate(node => node === document.body)).toBe(true);
+      expect(errors).toEqual([]);
+      await page.close();
+      return;
+    }
     await page.getByRole("button", { name: `Add worktree to ${parentId}`, exact: true }).click();
     await page.getByRole("menuitem", { name: "Register worktree…", exact: true }).click();
     const dialog = page.getByRole("dialog");
@@ -849,6 +1019,11 @@ test.describe("the workspace picker on a phone-sized viewport", () => {
     await picker(page);
     const menu = page.locator("#hub-menu");
     const viewport = page.viewportSize()!;
+    // Opening the picker is an outside interaction: the floating navigation
+    // dismisses instead of reserving the old permanent bottom-bar gutter.
+    await expect(page.locator(".touch-tab-bar")).toHaveAttribute("data-open", "false");
+    await expect(page.locator(".touch-tab-bar")).toBeHidden();
+    await captureScreenshot(page, info, "worktree-ui-touch-selector-bounds");
     const metrics = await menu.evaluate(node => ({
       scrollHeight: node.scrollHeight,
       clientHeight: node.clientHeight,
@@ -858,10 +1033,9 @@ test.describe("the workspace picker on a phone-sized viewport", () => {
     // The fixture really does overflow — otherwise this proves nothing.
     expect(metrics.scrollHeight).toBeGreaterThan(metrics.clientHeight);
     expect(metrics.overflowY).toBe("auto");
-    // …and what is shown fits on the screen, above the tab bar.
+    // …and what is shown fits in the now-unoccluded viewport.
     expect(metrics.clientHeight).toBeLessThanOrEqual(viewport.height);
-    const tabBarTop = await page.locator(".touch-tab-bar").evaluate(node => node.getBoundingClientRect().top);
-    expect(metrics.top + metrics.clientHeight).toBeLessThanOrEqual(tabBarTop + 1);
+    expect(metrics.top + metrics.clientHeight).toBeLessThanOrEqual(viewport.height);
 
     // The group bands, the dividers and both fixed entries survive.
     await expect(menu.locator(".hub-menu-group")).not.toHaveCount(0);

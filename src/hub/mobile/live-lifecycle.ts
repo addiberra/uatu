@@ -23,7 +23,10 @@ export function createLiveLifecycle(transport: LiveTransport, reads: Pick<Mobile
         for (const id of new Set(workspace.value.assignments.map(row => row.credentialId))) {
           const credential = catalog.value.find(row => row.id === id);
           if (!credential || !credential.enabled) return { status: "rejected", problem: { kind: "conflict", message: "An assigned credential is missing or disabled. Review workspace credentials." } };
-          if (credential.type !== "token" && credential.facts?.lock === "locked") locked.push({ id, type: credential.type });
+          // Unknown is not evidence of an unlocked key. Ask for the explicit
+          // unlock before Start instead of turning a predictable locked-key
+          // refusal into an indeterminate mutation outcome.
+          if (credential.type !== "token" && credential.facts?.lock !== "unlocked") locked.push({ id, type: credential.type });
         }
         if (locked.length) return { status: "completed", value: { status: "requires-unlock", credentials: locked as [KeyTarget, ...KeyTarget[]] } };
       }

@@ -2,7 +2,7 @@ import { existsSync } from "node:fs";
 import path from "node:path";
 import { test, expect } from "./hub-fixtures";
 
-test.use({ hubWorkspaces: ["phone-operations"], hubCredentials: true, hubMobileFlows: true });
+test.use({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true, hubWorkspaces: ["phone-operations"], hubCredentials: true, hubMobileFlows: true });
 
 test("phone repository token lifecycle masks and clears its secret without creating an agent login", async ({ hubContext }) => {
   const page = await hubContext.newPage(); const agentWrites: string[] = [];
@@ -57,12 +57,12 @@ test("phone create requires explicit Git consent, separates folder and display i
   await page.getByRole("button", { name: "Review", exact: true }).click();
   await expect(page.locator(".mh-sheet-error")).toContainText("Git"); expect(creates).toBe(0);
   await page.getByRole("switch", { name: "Create the folder and initialize Git", exact: true }).check();
-  await page.getByRole("button", { name: "Review", exact: true }).click(); await page.getByRole("button", { name: "Add stopped", exact: true }).click();
+  await page.getByRole("button", { name: "Review", exact: true }).click(); await page.getByRole("button", { name: "Create stopped", exact: true }).click();
   await expect(page.getByRole("heading", { name: "Workspace configured", exact: true })).toBeVisible();
   expect(creates).toBe(1);
   const state = await (await hubContext.request.get("/api/hub/state")).json(); const created = state.workspaces.find((row: any) => row.displayName === "Phone display identity");
   expect(created).toMatchObject({ running: false, path: path.join(path.dirname(hub.workspaces[0]!.path), "phone-created-folder") });
-  await page.getByRole("button", { name: "Workspace information", exact: true }).click();
+  await page.getByRole("button", { name: "Workspace details", exact: true }).click();
   await page.getByRole("button", { name: "Forget registration", exact: true }).click();
   await expect(page.locator(".mh-sheet")).toContainText("not files on disk"); await page.getByRole("button", { name: "Forget", exact: true }).click();
   await expect(page.getByRole("heading", { name: "Registration forgotten", exact: true })).toBeVisible(); expect(existsSync(path.join(created.path, ".git"))).toBe(true);

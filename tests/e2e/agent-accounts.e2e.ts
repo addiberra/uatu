@@ -9,6 +9,7 @@ import type { Browser, Page } from "@playwright/test";
 
 import { openChatConfiguration, openChatPanel } from "./chat-helpers";
 import { captureScreenshot } from "./evidence";
+import { showSurface } from "./navigation-helpers";
 import { childChatControl, expect, openSessionTab, signIn, test, type HubE2EInfo, type HubE2EWorkspace } from "./hub-fixtures";
 import { FAKE_CLAUDE_CODE, FAKE_CLAUDE_EMAIL, FAKE_DEVICE_CODE } from "./agent-accounts-fake";
 
@@ -23,7 +24,7 @@ async function phoneChat(browser: Browser, hub: HubE2EInfo, workspace: HubE2EWor
   const page = await context.newPage();
   await signIn(page, hub);
   await page.goto(workspace.sessionUrl);
-  await page.locator("#touch-tab-chat").click();
+  await showSurface(page, "chat");
   await page.locator("#chat-conversation-select").selectOption(conversationId);
   return { page, close: () => context.close() };
 }

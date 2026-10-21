@@ -2,7 +2,7 @@ import { hubUrl } from "../../shared/app-url";
 import type { Fetcher } from "../../shell/bounded-fetch";
 import { SseFrameParser, type SseFrame } from "../live-sse";
 import type { CloneJobEvent, CloneJobResult } from "../clone-jobs";
-import type { CloneAttemptState, CloneSubmission, MobileHubBackend, OperationResult } from "./backend";
+import type { CloneAttemptState, CloneSubmission, KeyTarget, MobileHubBackend, OperationResult } from "./backend";
 import type { LiveTransport } from "./live-transport";
 import { boolean, nonempty, object, text } from "./live-values";
 
@@ -47,16 +47,29 @@ export function createLiveClone(transport: LiveTransport, credentials: Pick<Mobi
     reconcileCloneAttempt,
     async submitClone(intent): Promise<OperationResult<CloneSubmission>> {
       const generation = transport.generation();
-      if (intent.credentialId) {
+      const retainedIds = intent.start ? [...new Set([...intent.retainedAuthentication.map(row => row.credentialId), ...(intent.signing ? [intent.signing] : [])])] : [];
+      if (intent.credentialId || retainedIds.length) {
         const catalog = await credentials.readCredentials();
         if (generation !== transport.generation()) return { status: "indeterminate", message: "The authentication context changed. Reconcile before continuing." };
         if (catalog.status === "unavailable") return { status: "indeterminate", message: "The clone identity could not be checked. Reconcile this attempt before continuing." };
         const credential = catalog.value.find(row => row.id === intent.credentialId);
-        if (!credential || !credential.enabled || credential.type === "ssh" && credential.facts?.lock === "locked") {
+        let problem = intent.credentialId && (!credential || !credential.enabled) ? "The selected clone identity is missing or disabled." : "";
+        let unlock: KeyTarget | undefined = credential?.enabled && credential.type === "ssh" && credential.facts?.lock !== "unlocked" ? { id: credential.id, type: "ssh" } : undefined;
+        let purpose: "workspace-start" | undefined;
+        for (const id of retainedIds) {
+          const retained = catalog.value.find(row => row.id === id);
+          if (!retained || !retained.enabled) { problem = "A credential assigned after clone is missing or disabled. Review workspace credentials."; continue; }
+          if (!unlock && retained.type !== "token" && retained.facts?.lock !== "unlocked") {
+            unlock = { id: retained.id, type: retained.type };
+            purpose = "workspace-start";
+          }
+        }
+        if (problem || unlock) {
           const fenced = await reconcileCloneAttempt(intent);
-          if (fenced.status === "available" && fenced.value.status === "not-accepted") return credential?.enabled && credential.type === "ssh"
-            ? { status: "completed", value: { status: "requires-unlock", credential: { id: credential.id, type: "ssh" } } }
-            : { status: "rejected", problem: { kind: "conflict", message: "The selected clone identity is missing or disabled." } };
+          if (generation !== transport.generation()) return { status: "indeterminate", message: "The authentication context changed. Reconcile before continuing." };
+          if (fenced.status === "available" && fenced.value.status === "not-accepted") return problem
+            ? { status: "rejected", problem: { kind: "conflict", message: problem } }
+            : { status: "completed", value: { status: "requires-unlock", credential: unlock!, ...(purpose ? { purpose } : {}) } };
           if (fenced.status === "available" && fenced.value.status === "accepted") return { status: "completed", value: fenced.value };
           return { status: "indeterminate", message: "Reconcile this attempt before unlocking or submitting again." };
         }

@@ -98,6 +98,8 @@ Partition `popstate` dispatch before the workspace document-selection owner runs
 
 The retained target is A during A -> Hub -> Settings -> A, even when a management form concerns B. Opening another workspace is a distinct boundary, not a promise to retain A as a second resident SPA. Use the existing cross-workspace navigation lifetime for that case and identify the boundary in review evidence; do not claim an A/B residency feature. The later live integration must preserve canonical route fallbacks on the real server.
 
+Mobile Return is available only for the coordinator's resident workspace. A fresh or copied tab, a direct Hub/Settings load, or a full-document trip back to Hub has no resident target and shows normal Hub entry without Return; a historical visit hint must not manufacture one. Desktop's existing historical Return behavior remains separate. Authoritative Stop invalidates the resident workspace; restarting requires an explicit guarded Start and a new workspace document.
+
 ### D5. Reference-fidelity presentation, including complete workflows
 
 `reference-contract.md` is the visual authority and `screen-map.md` is the coverage inventory. Reconstruct the photographed composition with its explicit later amendments, not the CSS of the gallery itself. Keep current UatuCode branding and reference hierarchy, path treatment, folder/branch/ellipsis/navigation silhouettes and grouped Settings; later full-page editor and phone hierarchy decisions supersede the original task-sheet compositions. Existing fonts remain available for current code/terminal surfaces; no proprietary icon/font package or new dependency is assumed.

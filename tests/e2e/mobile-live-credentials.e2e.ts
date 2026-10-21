@@ -4,6 +4,8 @@ import path from "node:path";
 import { test, expect, loginHub, hubPost } from "./hub-mobile-fixtures";
 import type { PublicCredentialDto } from "../../src/hub/credential-types";
 
+test.use({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
+
 // Real CLI/credential owners and disposable private HOME; no personal keys,
 // remote authentication, paid provider or synthetic credential operation.
 for (const type of ["ssh", "openpgp"] as const) {

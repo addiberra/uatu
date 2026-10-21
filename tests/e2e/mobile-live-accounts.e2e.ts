@@ -2,7 +2,7 @@ import { writeFile } from "node:fs/promises";
 import path from "node:path";
 import { test, expect } from "./hub-fixtures";
 
-test.use({ hubAgentAccounts: true, hubCredentials: true, hubWorktrees: true, hubWorkspaces: ["mobile-accounts"] });
+test.use({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true, hubAgentAccounts: true, hubCredentials: true, hubWorktrees: true, hubWorkspaces: ["mobile-accounts"] });
 // Real production HTML, assets, authentication and APIs. Agent runtimes remain
 // disposable fakes; no personal provider is contacted.
 
@@ -99,12 +99,12 @@ test("phone login attempts expose code flow, clear a rejected code, cancel and r
   expect(page.url()).not.toContain("disposable-wrong-code");
 });
 
-test("compact checkout More owns creation and clean deletion through real worktree routes", async ({ hubContext }) => {
+test("compact checkout Details owns creation and clean deletion through real worktree routes", async ({ hubContext }) => {
   const page = await hubContext.newPage(); await page.goto("/");
   await expect(page.locator(".mh-workspace")).toHaveCount(1);
   await expect(page.locator(".mh-workspace-family")).toHaveCount(0);
   await expect(page.locator(".mh-page").getByRole("button", { name: /Rename|Create branch/ })).toHaveCount(0);
-  await page.locator(".mh-more").click();
+  await page.locator(".mh-workspace-details").click();
   await page.getByRole("button", { name: /Branches and worktrees/ }).click();
   await page.getByRole("button", { name: "Create branch or worktree", exact: true }).click();
   await page.getByLabel("New branch name").fill("phone-checkout");

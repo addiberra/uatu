@@ -18,6 +18,57 @@ afterEach(() => {
 const state = { version: "test", hubApiRevision: 13, workspaceApiRevision: 24, workspaces: [], identity: { user: "test-user", host: "test-host" } };
 const device = { handle: "abcdefghijklmnop", deviceLabel: "Test browser", current: true, issuedAt: 1 };
 
+test("confirmed mobile logout clears only this tab's stale Return hint before notifying the UI", async () => {
+  const savedStorage = Object.getOwnPropertyDescriptor(globalThis, "sessionStorage");
+  const values = new Map([["uatu.hub.return.v1", "stale-visit"], ["unrelated", "keep"]]);
+  const removed: string[] = [];
+  Object.defineProperty(globalThis, "sessionStorage", { configurable: true, value: { removeItem(key: string) { removed.push(key); values.delete(key); } } });
+  try {
+    let release!: (response: Response) => void;
+    const transport = createLiveTransport({ fetch: async () => new Promise(resolve => { release = resolve; }) });
+    let notified = false;
+    transport.subscribeInvalidation(() => { notified = true; expect(values.has("uatu.hub.return.v1")).toBe(false); });
+    const pending = createLiveAuthentication(transport).signOut();
+    expect(values.get("uatu.hub.return.v1")).toBe("stale-visit");
+    release(Response.json({ revoked: true }));
+    expect((await pending).status).toBe("completed");
+    expect(notified).toBe(true);
+    expect(removed).toEqual(["uatu.hub.return.v1"]);
+    expect([...values]).toEqual([["unrelated", "keep"]]);
+  } finally {
+    if (savedStorage) Object.defineProperty(globalThis, "sessionStorage", savedStorage); else Reflect.deleteProperty(globalThis, "sessionStorage");
+  }
+});
+
+test("rejected and indeterminate mobile logout preserve the Return hint and other storage", async () => {
+  const savedStorage = Object.getOwnPropertyDescriptor(globalThis, "sessionStorage");
+  const removed: string[] = [];
+  Object.defineProperty(globalThis, "sessionStorage", { configurable: true, value: { removeItem(key: string) { removed.push(key); } } });
+  try {
+    for (const [status, expected] of [[403, "rejected"], [500, "indeterminate"], [200, "indeterminate"]] as const) {
+      const transport = createLiveTransport({ fetch: async () => Response.json({ revoked: false }, { status }) });
+      expect((await createLiveAuthentication(transport).signOut()).status).toBe(expected);
+      expect(removed).toEqual([]);
+    }
+  } finally {
+    if (savedStorage) Object.defineProperty(globalThis, "sessionStorage", savedStorage); else Reflect.deleteProperty(globalThis, "sessionStorage");
+  }
+});
+
+test("unavailable tab storage cannot turn confirmed logout into a failed operation", async () => {
+  const savedStorage = Object.getOwnPropertyDescriptor(globalThis, "sessionStorage");
+  Object.defineProperty(globalThis, "sessionStorage", { configurable: true, get() { throw new Error("Storage unavailable"); } });
+  try {
+    const transport = createLiveTransport({ fetch: async () => Response.json({ revoked: true }) });
+    const events: Invalidation[] = [];
+    transport.subscribeInvalidation(event => events.push(event));
+    expect((await createLiveAuthentication(transport).signOut()).status).toBe("completed");
+    expect(events).toEqual([{ scope: "authentication", reason: "signed-out", generation: 1 }]);
+  } finally {
+    if (savedStorage) Object.defineProperty(globalThis, "sessionStorage", savedStorage); else Reflect.deleteProperty(globalThis, "sessionStorage");
+  }
+});
+
 test("cookie-only login verifies identity without retaining bearer credentials or accepting a redirect", async () => {
   const calls: Array<{ path: string; init: RequestInit }> = [];
   const auth = createLiveAuthentication(createLiveTransport({ fetch: async (path, init) => {

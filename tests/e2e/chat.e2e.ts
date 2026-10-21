@@ -48,9 +48,17 @@ test.describe("desktop OpenCode chat", () => {
 
     const input = page.locator("#chat-input");
     await input.fill("Initial prompt");
+    let releaseAcceptance!: () => void;
+    const acceptanceGate = new Promise<void>(resolve => { releaseAcceptance = resolve; });
+    await page.route("**/api/chat/conversations/*/prompts", async route => {
+      const response = await route.fetch();
+      await acceptanceGate;
+      await route.fulfill({ response });
+    }, { times: 1 });
     const firstResponse = page.waitForResponse(response => response.url().endsWith("/prompts"));
     await input.press("Enter");
-    await expect(configurationTrigger).toBeDisabled();
+    try { await expect(configurationTrigger).toBeDisabled(); }
+    finally { releaseAcceptance(); }
     const response = await firstResponse;
     expect(response.request().postDataJSON()).toMatchObject({ model: { providerId: "openai", modelId: "gpt-5" } });
     expect(await response.json()).toMatchObject({ held: false, conversation: { title: "Initial prompt" } });
@@ -223,8 +231,14 @@ test.describe("desktop OpenCode chat", () => {
     // the catalogs before the palette is opened again.
     await input.fill("/reload now");
     await page.keyboard.press("Escape");
+    const accepted = page.waitForResponse(response => response.url().endsWith("/prompts"));
     await page.locator("#chat-send").click();
     await expect(page.locator("#chat-items")).toContainText("/reload now");
+    // The optimistic user row is not admission: completing the fake turn
+    // before its prompt is accepted races idle -> completed against running.
+    const acceptance = await accepted;
+    expect(acceptance.ok()).toBe(true);
+    expect(await acceptance.json()).toMatchObject({ held: false, operation: "reload" });
     const reread = page.waitForResponse(response => response.url().includes("/chat/commands"));
     await control(request, { action: "status", conversationId: seeded.conversation.id, status: "completed" });
     await reread;
@@ -839,7 +853,14 @@ test.describe("desktop OpenCode chat", () => {
   });
 });
 
-test("the chat backend starts only when the panel opens", async ({ page, request }) => {
+// statusCalls is process-wide: a previous test's still-draining inventory
+// upstream can probe status after /__e2e/reset. This startup invariant needs a
+// fresh worker/server, not an already-used agent with live broker subscribers.
+const startupTest = test.extend<{}, { chatStartupIsolation: void }>({
+  chatStartupIsolation: [async ({}, use) => { await use(); }, { scope: "worker", auto: true }],
+});
+
+startupTest("the chat backend starts only when the panel opens", async ({ page, request }) => {
   await request.post("/__e2e/reset");
   const token = await request.get("/__e2e/terminal-token").then(response => response.json()) as { token: string };
   // Chat initializes once the workspace state has loaded and the URL

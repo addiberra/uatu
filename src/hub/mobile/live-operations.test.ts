@@ -45,8 +45,9 @@ test("missing parent or unavailable catalog cannot become empty assignments", as
   }
 });
 
-test("all required inherited unlocks precede one explicitly authorized Start", async () => {
+test.each(["locked", "unknown"])("all required inherited unlocks precede one explicitly authorized Start (%s)", async initialLock => {
   const catalog = [credential(), credential("pgp", "openpgp")];
+  catalog[0]!.facts.lock = initialLock;
   let starts = 0;
   const transport = createLiveTransport({ fetch: async (route, init) => {
     if (route.endsWith("state")) return Response.json({ version: "test", hubApiRevision: 13, workspaceApiRevision: 24, workspaces: [workspace("parent"), { ...workspace("child"), parentId: "parent" }] });

@@ -3,7 +3,7 @@ import { writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { Page } from "@playwright/test";
 
-test.use({ hubWorkspaces: ["mobile-a", "mobile-b"], hubCredentials: true });
+test.use({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true, hubWorkspaces: ["mobile-a", "mobile-b"], hubCredentials: true });
 
 async function navigation(page: Page) {
   await expect.poll(() => page.locator("#mobile-workspace-root").evaluate(el => el.getBoundingClientRect().x)).toBe(0);
@@ -197,7 +197,7 @@ test("coordinated assignment removal keeps its command owner while authoritative
   const token = await (await hubContext.request.post("/api/hub/credentials/token", { headers: { origin: info.origin }, data: { name: "Stop dependency fixture", host: "example.test", token: "disposable-fixture-token", capabilities: ["https-git"] } })).json();
   const assigned = await hubContext.request.post(`/api/hub/credentials/${token.credential.id}/assign`, { headers: { origin: info.origin }, data: { workspaceId: "mobile-a", role: "authentication", host: "example.test" } }); expect(assigned.ok()).toBe(true);
   const page = await hubContext.newPage(); await page.goto("/s/mobile-a/README.md"); await expect(page.locator("#preview-path")).toHaveText("README.md");
-  await hub(page); await page.locator('[data-action="settings"]').click(); await page.locator('[data-action="assignments"]').click();
+  await hub(page); await page.locator('[data-action="settings"]').click(); await page.locator('[data-action="repository-credentials"]').click(); await page.locator('[data-action="assignments"]').click();
   await page.locator('[data-flow="workspace-mobile-a"]').click();
   await page.getByRole("button", { name: "Remove authentication on example.test", exact: true }).click();
   await page.getByRole("button", { name: "Remove", exact: true }).click();

@@ -12,7 +12,7 @@ export function installWorkspaceInitialUrl(url: string) {
   return () => { initialUrl = undefined; };
 }
 /** Body-level workspace overlays keep their existing fallback outside a host. */
-export const workspaceOverlayHost = () => presentationRoot ?? document.body;
+export const workspaceOverlayHost = (doc?: Document) => presentationRoot ?? (doc ?? document).body;
 export function installWorkspacePresentationRoot(root: HTMLElement) {
   if (presentationRoot) throw new Error("A workspace presentation root is already installed");
   presentationRoot = root;

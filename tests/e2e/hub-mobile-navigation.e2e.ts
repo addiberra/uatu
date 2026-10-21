@@ -1,11 +1,26 @@
 import { test, expect, loginHub, hubPost } from "./hub-mobile-fixtures";
+import { openNavigation } from "./navigation-helpers";
+import type { Page } from "@playwright/test";
+
+async function residentHub(page: Page) {
+  await openNavigation(page);
+  await page.locator("#navigation-hub").click();
+  await expect(page.locator(".mh-page main > h1")).toHaveText("Workspaces");
+}
+async function signOut(page: Page) {
+  await page.locator('[data-action="settings"]').click();
+  await page.locator('[data-action="security"]').click();
+  await page.locator('[data-flow="signout"]').click();
+  await page.locator(".mh-sheet").getByRole("button", { name: "Sign out", exact: true }).click();
+  await expect(page.getByRole("button", { name: "Sign in", exact: true })).toBeVisible();
+}
 
 test.use({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
 
-test("real visits, copied context, management identity, stopped Return and sign-out navigation", async ({ page, context, hub }) => {
+test("resident Return preserves identity; fresh and copied tabs have no Return; Stop and sign-out revoke residency", async ({ page, context, hub }) => {
   test.setTimeout(180_000);
   await loginHub(page, hub);
-  await expect(page.locator("#hub-return")).toBeHidden();
+  await expect(page.locator('[data-action="return"]')).toHaveCount(0);
   const ids: string[] = [];
   for (const folder of Object.values(hub.workspaces)) {
     const result = await hubPost<{ workspace: { id: string } }>(page.request, hub, "/api/hub/workspaces/configure", { path: folder, displayName: "Shared", start: false });
@@ -13,15 +28,15 @@ test("real visits, copied context, management identity, stopped Return and sign-
   }
   const [a, b] = ids as [string, string];
   await page.reload();
-  await page.locator(`[data-disclosure="${a}-inactive"] > summary`).click();
-  const row = page.locator(`#workspaces .row[data-workspace="${a}"]`);
-  page.once("dialog", dialog => dialog.dismiss());
-  await row.getByRole("button", { name: "Start Shared", exact: true }).click();
+  const start = page.locator(`[data-action="start:${a}"]`);
+  await start.click();
+  await expect(page.locator(".mh-sheet")).toContainText("Start without credentials?");
+  await page.locator(".mh-sheet").getByRole("button", { name: "Cancel", exact: true }).click();
   expect((await (await page.request.get(`${hub.origin}/api/hub/state`)).json()).workspaces.every((w: { running: boolean }) => !w.running)).toBe(true);
   const opening = page.waitForRequest(request => request.isNavigationRequest()
     && request.url() === `${hub.origin}/s/${a}/`);
-  page.once("dialog", dialog => dialog.accept());
-  await row.getByRole("button", { name: "Start Shared", exact: true }).click();
+  await start.click();
+  await page.locator(".mh-sheet").getByRole("button", { name: "Start", exact: true }).click();
   await opening;
   await expect(page.locator("#hub-control")).not.toHaveAttribute("hidden");
   // Root startup may select the newest document asynchronously. Establish an
@@ -30,49 +45,47 @@ test("real visits, copied context, management identity, stopped Return and sign-
   await page.goto(destination);
   await expect(page.locator("#preview")).toContainText("Guide A");
   await expect.poll(() => page.evaluate(() => JSON.parse(sessionStorage.getItem("uatu.hub.return.v1") || "null")?.workspaceId)).toBe(a);
-  await page.goto(hub.origin);
-  await expect(page.locator("#hub-return")).toContainText(hub.workspaces.a);
+  const resident = await page.locator("#mobile-workspace-root").elementHandle();
+  await residentHub(page);
+  await expect(page.locator('[data-action="return"]')).toHaveAccessibleName(`Return to Shared, ${hub.workspaces.a}`);
   // A new tab without an opener shares authentication, not sessionStorage.
   const fresh = await context.newPage();
   await fresh.goto(hub.origin);
-  await expect(fresh.locator("#hub-return")).toBeHidden();
+  await expect(fresh.locator('[data-action="return"]')).toHaveCount(0);
   await fresh.close();
   const popupPromise = page.waitForEvent("popup");
   await page.evaluate(() => window.open("/settings", "_blank"));
   const inherited = await popupPromise;
-  await expect(inherited.locator("#hub-return")).toContainText(hub.workspaces.a);
+  await expect(inherited.locator('[data-action="return"]')).toHaveCount(0);
   await inherited.close();
-  await page.locator(`[data-disclosure="${b}-inactive"] > summary`).click();
-  const managed = page.locator(`[data-repository="${b}"]`);
-  page.once("dialog", dialog => dialog.accept("Managed B"));
-  await managed.getByRole("button", { name: "Rename workspace Shared" }).click();
-  await expect(managed).toContainText("Managed B");
-  await page.getByRole("navigation", { name: "Mobile Hub", exact: true }).getByRole("link", { name: "Settings", exact: true }).click();
-  await expect(page.locator("#hub-return")).toContainText("Return to Shared");
+  await page.locator(`[data-action="info:${b}"]`).click();
+  await page.locator('[data-flow="rename"]').click();
+  await page.getByLabel("Display name", { exact: true }).fill("Managed B");
+  await page.getByRole("button", { name: "Save", exact: true }).click();
+  await expect(page.locator(".mh-flow-page h1")).toHaveText("Managed B");
+  await page.locator('[data-action="settings"]').click();
+  await expect(page.locator('[data-action="return"]')).toHaveAccessibleName(`Return to Shared, ${hub.workspaces.a}`);
   await hubPost(page.request, hub, `/api/hub/workspaces/${a}/display-name`, { displayName: "Renamed A" });
-  await expect(page.locator("#hub-return")).toContainText("Renamed A");
-  await hubPost(page.request, hub, `/api/hub/sessions/${a}/stop`);
-  await expect(page.locator("#hub-return")).toContainText("stopped", { timeout: 20_000 });
-  page.once("dialog", dialog => dialog.dismiss());
-  await page.locator("#hub-return").click();
-  await expect(page).toHaveURL(`${hub.origin}/settings`);
-  page.once("dialog", dialog => dialog.accept());
-  await page.locator("#hub-return").click();
+  // Return revalidates the resident identity; re-entering Hub uses its current
+  // metadata rather than relying on the old desktop page's polling timer.
+  await page.locator('[data-action="return"]').click();
+  await residentHub(page);
+  await page.locator('[data-action="settings"]').click();
+  await expect(page.locator('[data-action="return"]')).toContainText("Renamed A");
+  await page.locator('[data-action="return"]').click();
   await expect(page).toHaveURL(destination);
-  await expect(page.locator("#preview")).toContainText("Guide A");
-  await page.goBack();
-  await expect(page).toHaveURL(`${hub.origin}/settings`);
-  await expect(page.locator(".nav-overlay")).toHaveCount(0);
-  await expect(page.locator("#hub-return")).toContainText("Renamed A");
-  await expect(page.locator("#hub-return")).toBeEnabled();
+  expect(await resident!.evaluate(node => node === document.querySelector("#mobile-workspace-root"))).toBe(true);
+  await residentHub(page);
   await hubPost(page.request, hub, `/api/hub/sessions/${a}/stop`);
+  await expect(page.locator("#mobile-workspace-root")).toHaveAttribute("data-access-invalidated", "");
+  await expect(page.locator('[data-action="return"]')).toBeDisabled();
+  await expect(page.locator("#mobile-workspace-root")).toHaveAttribute("inert", "");
   await hubPost(page.request, hub, `/api/hub/workspaces/${a}/forget`);
-  await expect(page.locator("#hub-return")).toBeHidden();
-  await page.locator("#devices summary").click();
-  const logout = page.waitForRequest(request => request.isNavigationRequest() && request.method() === "POST" && request.url() === `${hub.origin}/logout`);
-  await page.locator("#devices").getByRole("button", { name: "Sign out" }).click();
-  await logout;
-  await expect(page).toHaveURL(`${hub.origin}/login`);
+  await expect(page.locator('[data-action="return"]')).toBeDisabled();
+  await page.goto(hub.origin);
+  await expect(page.locator('[data-action="return"]')).toHaveCount(0);
+  await signOut(page);
+  expect((await page.request.get(`${hub.origin}/api/hub/state`)).status()).toBe(401);
   expect(await page.evaluate(() => sessionStorage.getItem("uatu.hub.return.v1"))).toBeNull();
 });
 
@@ -129,37 +142,37 @@ test.describe("bundle-independent recovery", () => {
   });
 });
 
-test("Hub page restoration clears obsolete opening UI and restores scroll without changing the visit", async ({ page, hub }) => {
+test("Hub history restores scroll and the same resident workspace without manufacturing a historical Return", async ({ page, hub }) => {
   test.setTimeout(60_000);
   await loginHub(page, hub);
   const a = (await hubPost<{ workspace: { id: string } }>(page.request, hub, "/api/hub/workspaces/configure", { path: hub.workspaces.a, displayName: "A", start: true })).workspace.id;
   await page.goto(`${hub.origin}/s/${a}/docs/guide.md`);
   await expect.poll(() => page.evaluate(() => sessionStorage.getItem("uatu.hub.return.v1"))).not.toBeNull();
-  await page.goto(`${hub.origin}/settings`);
-  await expect(page.locator("#hub-return")).toBeVisible();
-  await expect(page.locator("#devices")).toContainText("this device");
-  // Explicitly exercise the persisted-pageshow handler as well as actual
-  // document navigation; browser BFCache eligibility varies by engine.
-  await page.evaluate(() => {
-    const overlay = document.createElement("div");
-    overlay.className = "nav-overlay";
-    document.body.appendChild(overlay);
-    (document.getElementById("hub-return") as HTMLButtonElement).disabled = true;
-    window.dispatchEvent(new PageTransitionEvent("pageshow", { persisted: true }));
-  });
-  await expect(page.locator(".nav-overlay")).toHaveCount(0);
-  await expect(page.locator("#hub-return")).toBeEnabled();
-  await page.evaluate(() => scrollTo(0, 200));
-  await expect.poll(() => page.evaluate(() => scrollY)).toBe(200);
-  await page.locator('.hub-mobile-nav a[href="/"]').click();
+  const resident = await page.locator("#mobile-workspace-root").elementHandle();
+  await residentHub(page);
+  await page.locator('[data-action="settings"]').click();
+  await expect(page.locator('[data-action="return"]')).toBeEnabled();
+  await page.evaluate(() => window.dispatchEvent(new PageTransitionEvent("pageshow", { persisted: true })));
+  await expect(page.locator('[data-action="return"]')).toBeEnabled();
+  // Ensure a scrollable test surface independently of how many Settings rows
+  // this installation has; do not mistake window scroll for the Hub scroller.
+  await page.addStyleTag({ content: ".mh-page main { min-height: 1500px; }" });
+  await page.locator(".mh-page").evaluate(node => { node.scrollTop = 200; });
+  await expect.poll(() => page.locator(".mh-page").evaluate(node => node.scrollTop)).toBe(200);
+  await page.locator('[data-action="hub"]').click();
   await expect(page).toHaveURL(`${hub.origin}/`);
-  await page.locator('.hub-mobile-nav a[href="/settings"]').click();
+  await page.goBack();
   await expect(page).toHaveURL(`${hub.origin}/settings`);
-  await expect.poll(() => page.evaluate(() => scrollY)).toBe(200);
+  await expect.poll(() => page.locator(".mh-page").evaluate(node => node.scrollTop)).toBe(200);
+  await page.locator('[data-action="return"]').click();
+  await expect(page).toHaveURL(`${hub.origin}/s/${a}/docs/guide.md`);
+  expect(await resident!.evaluate(node => node === document.querySelector("#mobile-workspace-root"))).toBe(true);
+  await page.goto(`${hub.origin}/settings`);
+  await expect(page.locator('[data-action="return"]')).toHaveCount(0);
   expect(await page.evaluate(() => JSON.parse(sessionStorage.getItem("uatu.hub.return.v1")!).workspaceId)).toBe(a);
 });
 
-test("hanging Return reads are bounded and cannot disable Hub actions or restore an old login", async ({ page, hub }) => {
+test("a hanging workspace-switcher read cannot disable resident Return or restore an old login", async ({ page, hub }) => {
   test.setTimeout(120_000);
   await loginHub(page, hub);
   const result = await hubPost<{ workspace: { id: string } }>(page.request, hub, "/api/hub/workspaces/configure", { path: hub.workspaces.a, displayName: "A", start: true });
@@ -178,23 +191,20 @@ test("hanging Return reads are bounded and cannot disable Hub actions or restore
   await expect(page.locator("#preview")).toContainText("Guide A");
   await expect(page.locator("#hub-control")).not.toHaveAttribute("hidden");
   await expect(page.getByRole("navigation", { name: "Workspace navigation", exact: true })).toBeVisible();
-  await page.goto(hub.origin);
-  await expect(page.locator("#sessions")).toContainText("A");
-  await expect(page.getByRole("link", { name: /Add Workspace/ })).toBeVisible();
+  await residentHub(page);
+  await expect(page.locator('.mh-workspace[data-workspace]')).toContainText("A");
+  await expect(page.locator('[data-action="add-workspace"]')).toBeEnabled();
+  await expect(page.locator('[data-action="return"]')).toBeEnabled();
   await expect.poll(() => reads).toBeGreaterThan(0);
-  await page.waitForTimeout(3200);
-  await expect(page.locator("#hub-return")).toBeHidden();
-  await page.getByRole("navigation", { name: "Mobile Hub", exact: true }).getByRole("link", { name: "Settings" }).click();
-  await page.locator("form.sign-out.hub-mobile-only button").click();
-  await expect(page).toHaveURL(`${hub.origin}/login`);
+  await signOut(page);
   release();
   await page.unroute("**/api/hub/sessions");
   await loginHub(page, hub);
-  await expect(page.locator("#hub-return")).toBeHidden();
+  await expect(page.locator('[data-action="return"]')).toHaveCount(0);
   expect(await page.evaluate(() => sessionStorage.getItem("uatu.hub.return.v1"))).toBeNull();
 });
 
-test("Return uses masked credential recovery and reports real startup rejection before retry", async ({ page, hub }) => {
+test("fresh Hub entry has no historical Return and guarded Start masks credentials and refuses disabled assignments", async ({ page, hub }) => {
   test.setTimeout(120_000);
   page.setDefaultTimeout(15_000);
   await loginHub(page, hub);
@@ -206,35 +216,39 @@ test("Return uses masked credential recovery and reports real startup rejection 
   const key = (await post<{ credential: { id: string } }>("/api/hub/credentials/ssh/generate", { name: "Return identity", capabilities: ["ssh-authentication"], passphrase: "test-passphrase" })).credential;
   await post(`/api/hub/workspaces/${a}/credential-assignments`, { authentication: { credentialId: key.id, host: "github.com" } });
   await page.goto(`${hub.origin}/settings`);
-  await expect(page.locator("#hub-return")).toContainText("stopped");
+  await expect(page.locator('[data-action="return"]')).toHaveCount(0);
+  await page.locator('[data-action="hub"]').click();
   let starts = 0;
   page.on("request", request => { if (request.method() === "POST" && request.url().endsWith(`/${a}/start`)) starts++; });
-  await page.locator("#hub-return").click();
-  const unlock = page.getByRole("dialog");
-  await expect(unlock).toContainText("Unlock credentials");
-  await unlock.getByLabel("Return identity passphrase").fill("wrong-passphrase");
-  await unlock.getByRole("button", { name: "Unlock and resume" }).click();
-  await expect(unlock.locator("[role=alert]")).toBeVisible({ timeout: 30_000 });
-  await expect(unlock.getByLabel("Return identity passphrase")).toHaveValue("");
+  await page.locator(`[data-action="start:${a}"]`).click();
+  const unlock = page.locator(".mh-sheet");
+  await expect(unlock).toContainText("Unlock workspace credential");
+  await expect(unlock.locator("input[data-secret]")).toHaveAttribute("type", "password");
+  await unlock.locator("input[data-secret]").fill("wrong-passphrase");
+  await unlock.getByRole("button", { name: "Unlock", exact: true }).click();
+  await expect(unlock.locator(".mh-sheet-error")).toBeVisible({ timeout: 30_000 });
+  await expect(unlock.locator("input[data-secret]")).toHaveValue("");
   await unlock.getByRole("button", { name: "Cancel", exact: true }).click();
   expect(starts).toBe(0);
   await post(`/api/hub/credentials/${key.id}/disable`);
-  await page.locator("#hub-return").click();
-  await expect(page.locator("#return-error")).toContainText(/disabled|unavailable/);
-  await expect(page).toHaveURL(`${hub.origin}/settings`);
+  await page.locator(`[data-action="start:${a}"]`).click();
+  await expect(unlock).toContainText("missing or disabled");
+  expect(starts).toBe(0);
+  expect((await (await page.request.get(`${hub.origin}/api/hub/state`)).json()).workspaces[0].running).toBe(false);
+  await unlock.getByRole("button", { name: "Back", exact: true }).click();
   await post(`/api/hub/credentials/${key.id}/enable`);
-  await page.locator("#hub-return").click();
-  await unlock.getByLabel("Return identity passphrase").fill("test-passphrase");
-  await unlock.getByRole("button", { name: "Unlock and resume" }).click();
+  await page.locator(`[data-action="start:${a}"]`).click();
+  await unlock.locator("input[data-secret]").fill("test-passphrase");
+  await unlock.getByRole("button", { name: "Unlock", exact: true }).click();
   await expect(page).toHaveURL(`${hub.origin}/s/${a}/`);
-  expect(starts).toBe(2);
+  expect(starts).toBe(1);
 });
 
 test("real long-path rows retain loading, failure and slow-opening feedback", async ({ page, hub }) => {
   test.setTimeout(90_000);
   await loginHub(page, hub);
-  await expect(page.locator("#sessions")).toContainText("No checkouts running");
-  await expect(page.locator("#workspaces")).toContainText("No inactive repositories");
+  await expect(page.locator(".mh-page")).toContainText("No workspaces yet");
+  await expect(page.locator('[data-action="add-workspace"]')).toBeEnabled();
   const folderName = "long-workspace-path-".repeat(10);
   await hubPost(page.request, hub, "/api/hub/folders/create", { parent: hub.root, name: folderName });
   const longPath = (await hubPost<{ workspace: { id: string } }>(page.request, hub, "/api/hub/workspaces/configure", { path: `${hub.root}/${folderName}`, displayName: "Long path", init: true })).workspace;
@@ -249,76 +263,69 @@ test("real long-path rows retain loading, failure and slow-opening feedback", as
     await route.fulfill({ response });
   });
   await page.reload();
-  await expect(page.locator("#workspaces")).toContainText("Loading");
+  await expect(page.locator(".mh-page")).toContainText("Connecting to hub");
   releaseState();
-  await expect(page.locator("#workspaces")).toContainText(folderName);
-  await page.locator(`[data-disclosure="${longPath.id}-inactive"] > summary`).click();
+  await expect(page.locator(`[data-workspace="${longPath.id}"] .mh-workspace-copy p`)).toHaveAttribute("title", `${hub.root}/${folderName}`);
   expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
-  const secondary = page.locator("#workspaces .row").filter({ hasText: folderName }).locator("summary");
-  await secondary.click();
+  await page.locator(`[data-action="info:${longPath.id}"]`).click();
+  const secondary = page.locator('[data-flow="rename"]');
   await secondary.focus();
-  const oldSummary = (await secondary.elementHandle())!;
-  await expect.poll(() => oldSummary.evaluate(node => node.isConnected), { timeout: 10_000 }).toBe(false);
+  const focused = (await secondary.elementHandle())!;
+  await hubPost(page.request, hub, "/api/hub/workspaces/configure", { path: hub.workspaces.b, displayName: "Background addition", start: false });
+  await expect(page.locator(".mh-workspace")).toHaveCount(3);
+  expect(await focused.evaluate(node => node.isConnected)).toBe(true);
   await expect(secondary).toBeFocused();
-  await expect(secondary.locator("..")).toHaveAttribute("open");
+  await page.locator('[data-action="hub"]').click();
   failState = true;
-  await expect(page.locator("#action-error")).toBeVisible();
+  // Exercise the real live-entry refresh timer, not a fresh document's boot.
+  const failedRefresh = page.waitForResponse(response => new URL(response.url()).pathname === "/api/hub/state" && response.status() === 503);
+  await failedRefresh;
+  await expect(page.locator('.mh-page [role="alert"]')).toBeVisible();
   failState = false;
-  await expect(page.locator("#action-error")).toBeHidden();
+  await page.locator('[data-action="refresh"]').click();
+  await expect(page.locator(".mh-workspace")).toHaveCount(3);
+  await page.unrouteAll({ behavior: "wait" });
   let releaseStart!: () => void;
   const startGate = new Promise<void>(resolve => { releaseStart = resolve; });
   let releaseDocument!: () => void;
   const documentGate = new Promise<void>(resolve => { releaseDocument = resolve; });
   await page.route(`**/api/hub/sessions/${workspace.id}/start`, async route => {
-    const response = await route.fetch();
-    expect(response.ok()).toBe(true);
     await startGate;
-    await route.fulfill({ response });
-  });
-  await page.route(`**/s/${workspace.id}/`, async route => { await documentGate; await route.continue(); });
-  const openingLabels: string[] = [];
-  await page.exposeFunction("recordOpening", (label: string) => { openingLabels.push(label); });
-  await page.evaluate(() => {
-    new MutationObserver(() => {
-      const overlay = document.querySelector<HTMLElement>(".nav-overlay");
-      if (overlay && overlay.getBoundingClientRect().height > 0) {
-        (window as unknown as { recordOpening: (label: string) => void }).recordOpening(overlay.textContent || "");
-      }
-    }).observe(document.body, { childList: true });
-  });
-  page.once("dialog", dialog => dialog.accept());
-  await page.locator(`[data-disclosure="${workspace.id}-inactive"] > summary`).click();
-  await page.getByRole("button", { name: "Start Opening target" }).click();
-  await expect(page.getByRole("button", { name: "Start Opening target" })).toHaveText("Starting…");
-  await expect(page.getByRole("button", { name: "Start Opening target" })).toBeDisabled();
+    await route.continue();
+  }, { times: 1 });
+  await page.route(`**/s/${workspace.id}/api/state`, async route => { await documentGate; await route.continue(); }, { times: 1 });
+  await page.locator(`[data-action="start:${workspace.id}"]`).click();
+  await page.locator(".mh-sheet").getByRole("button", { name: "Start", exact: true }).click();
+  await expect(page.locator('.mh-sheet [data-action="commit-sheet"]')).toBeDisabled();
+  await expect(page.locator(".mh-sheet")).toHaveAttribute("aria-busy", "true");
   releaseStart();
-  // Locator evaluation waits for an impending navigation; observe the actual
-  // rendered indicator before its document is replaced instead.
-  await expect.poll(() => openingLabels.join(" ")).toContain("Opening Opening target");
+  await expect(page.getByRole("heading", { name: "Loading Opening target…", exact: true })).toBeVisible();
   releaseDocument();
-  await expect(page).toHaveURL(`${hub.origin}/s/${workspace.id}/`);
+  await expect(page).toHaveURL(new RegExp(`/s/${workspace.id}/`));
+  await expect(page.locator("#connection-state .connection-label")).toHaveText("Connected");
 });
 
 for (const viewport of [{ width: 320, height: 640 }, { width: 740, height: 390 }, { width: 1024, height: 1366 }]) {
   test(`touch Hub fits ${viewport.width}x${viewport.height}, live themes, enlarged text and titlebar`, async ({ page, hub }) => {
     await page.setViewportSize(viewport);
     await loginHub(page, hub);
-    await expect(page.locator(".hub-mobile-nav")).toBeVisible();
-    await expect(page.locator(".hub-nav")).toBeHidden();
+    await expect(page.locator(".mh-dock")).toBeVisible();
+    await expect(page.locator(".hub-nav")).toHaveCount(0);
     const colors: string[] = [];
     for (const colorScheme of ["dark", "light"] as const) {
       await page.emulateMedia({ colorScheme, reducedMotion: "reduce" });
-      colors.push(await page.locator("body").evaluate(node => getComputedStyle(node).backgroundColor));
+      colors.push(await page.locator(".mh-root").evaluate(node => getComputedStyle(node).backgroundColor));
       await page.evaluate(() => {
-        document.documentElement.style.fontSize = "200%";
+        const root = document.querySelector<HTMLElement>(".mh-root")!;
+        for (const [role, size] of Object.entries({ page: 34, detail: 26, editor: 26, body: 17, value: 17, control: 15, secondary: 13, label: 13, navigation: 11 })) root.style.setProperty(`--mh-type-${role}`, `${size * 2}px`);
         document.documentElement.style.setProperty("--titlebar-inset", "60px");
       });
       expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(viewport.width);
-      expect((await page.locator(".hub-header").boundingBox())!.y).toBeGreaterThanOrEqual(60);
-      const nav = page.locator(".hub-mobile-nav");
+      expect((await page.locator(".mh-brand").boundingBox())!.y).toBeGreaterThanOrEqual(60);
+      const nav = page.locator(".mh-dock");
       const box = (await nav.boundingBox())!;
       expect(box.y + box.height).toBeLessThanOrEqual(viewport.height);
-      for (const link of await nav.getByRole("link").all()) expect((await link.boundingBox())!.height).toBeGreaterThanOrEqual(44);
+      for (const button of await nav.getByRole("button").all()) expect((await button.boundingBox())!.height).toBeGreaterThanOrEqual(44);
     }
     expect(colors[0]).not.toBe(colors[1]);
   });

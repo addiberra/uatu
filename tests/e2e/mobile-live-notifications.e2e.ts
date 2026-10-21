@@ -1,7 +1,7 @@
 import { createECDH, randomBytes } from "node:crypto";
 import { test, expect } from "./hub-fixtures";
 
-test.use({ hubWorkspaces: ["phone-notifications"] });
+test.use({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true, hubWorkspaces: ["phone-notifications"] });
 
 test("phone notification permission/enrollment/disable remains device-scoped with exactly two dock destinations", async ({ hubContext }) => {
   const key = createECDH("prime256v1"); key.generateKeys();

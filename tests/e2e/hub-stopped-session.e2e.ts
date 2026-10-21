@@ -17,6 +17,7 @@ import { openChatPanel } from "./chat-helpers";
 import { captureScreenshot } from "./evidence";
 import { childChatControl, expect, openHubMenu, test, type HubE2EInfo, type HubE2EWorkspace } from "./hub-fixtures";
 import { treeRow } from "./tree-helpers";
+import { showSurface } from "./navigation-helpers";
 
 test.use({ hubWorkspaces: ["alpha", "beta"] });
 
@@ -78,11 +79,11 @@ async function openTab(context: BrowserContext, workspace: HubE2EWorkspace): Pro
 
 async function preview(page: Page, name: string, touch: boolean): Promise<void> {
   if (touch) {
-    await page.locator('#touch-tab-bar [data-tab="files"]').click();
+    await showSurface(page, "files");
   }
   await treeRow(page, name).click();
   if (touch) {
-    await page.locator('#touch-tab-bar [data-tab="preview"]').click();
+    await showSurface(page, "preview");
   }
   await expect(page.locator("#preview-path")).toHaveText(name);
 }
@@ -182,20 +183,35 @@ test.describe("desktop", () => {
 test.describe("phone", () => {
   test.use({ viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true });
 
-  test("touch mode: the Files tab's indicator reads Stopped and its tap starts the session", async ({ hub, hubContext }, testInfo) => {
+  test("touch mode: authoritative Stop revokes the retained workspace until an explicit guarded Start", async ({ hub, hubContext }, testInfo) => {
     const page = await openTab(hubContext, hub.workspaces[0]!);
     await stageWork(page, hub.workspaces[0]!, true);
+    let starts = 0;
+    page.on("request", request => { if (request.method() === "POST" && new URL(request.url()).pathname === "/api/hub/sessions/alpha/start") starts++; });
 
     await stopSession(hub, page, "alpha");
-    await page.locator('#touch-tab-bar [data-tab="files"]').click();
-    await expectStopped(page);
+    await expect(page.locator("#mobile-workspace-root")).toHaveAttribute("data-access-invalidated", "");
+    await expect(page.locator("#mobile-workspace-root")).toHaveAttribute("inert", "");
+    await expect(page.getByRole("heading", { name: "Ready to start 1", exact: true })).toBeVisible();
+    await expect(page.locator('[data-action="start:alpha"]')).toBeEnabled();
+    const state = await (await page.request.get(`${hub.origin}/api/hub/state`)).json();
+    expect(state.workspaces.find((workspace: { id: string }) => workspace.id === "alpha").running).toBe(false);
     await expectNotReloaded(page);
+    expect(starts).toBe(0);
     await shot(page, testInfo, "stopped-session-phone-stopped");
 
-    await indicator(page).tap();
-    await expectRecovered(page);
+    const start = page.locator('[data-action="start:alpha"]');
+    await start.click();
+    await expect(page.locator(".mh-sheet")).toContainText("Start without credentials?");
+    await page.getByRole("button", { name: "Cancel", exact: true }).click();
+    expect(starts).toBe(0);
+    await start.click();
+    await page.locator(".mh-sheet").getByRole("button", { name: "Start", exact: true }).click();
+    await expect(indicatorLabel(page)).toHaveText("Connected");
+    expect(starts).toBe(1);
+    expect(await page.evaluate(() => (window as unknown as { __uatuNoReload?: boolean }).__uatuNoReload)).toBeUndefined();
     await shot(page, testInfo, "stopped-session-phone-recovered");
-    await page.locator('#touch-tab-bar [data-tab="preview"]').click();
+    await showSurface(page, "preview");
     await expectWorkKept(page, true);
     await leaveTidy(page, true);
   });

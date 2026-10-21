@@ -168,8 +168,8 @@ function initNavigationOverlay(bar: HTMLElement): void {
   let longPressTimer: ReturnType<typeof setTimeout> | undefined;
   let openPreferences = () => {};
   // The bar floats over the surfaces and reserves no layout gutter, so the
-  // strip it covers has to be published for scroll reveals to avoid. Layout is
-  // untouched; only `scroll-padding-bottom` consumes this.
+  // strip it covers has to be published for scroll reveals and attention
+  // notices to avoid. Surface layout remains untouched.
   const publishOcclusion = () => {
     const covered = workspaceForeground() && bar.hasAttribute("data-navigation-ready") && open && !bar.hidden && uiMode() === "touch"
       ? Math.max(0, innerHeight - bar.getBoundingClientRect().top)

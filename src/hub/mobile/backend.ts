@@ -193,7 +193,7 @@ export type CloneAttemptState =
  * authorize blind resubmission. Read unavailability is not not-accepted. */
 export type CloneSubmission =
   | { status: "accepted"; jobId: string }
-  | { status: "requires-unlock"; credential: KeyTarget };
+  | { status: "requires-unlock"; credential: KeyTarget; purpose?: "workspace-start" };
 /** Cancellation acknowledgement is not the terminal job event. A job may have won the race. */
 export type CloneCancellation =
   | { status: "cancelled" | "terminal" }

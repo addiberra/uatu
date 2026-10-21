@@ -172,7 +172,7 @@ export function createCloneFlow(env: FlowEnvironment, unlock: (target: KeyTarget
         // continuation must mint a NEW id after unlock, not reuse this fence.
         retireReconciliation(); clearHint(operation); attempt = null;
         if (!isVisible()) { actionProblem = "Clone identity needs unlocking. Review the clone again to continue."; return; }
-        unlock(response.value.credential, () => { if (owner.current() && isVisible()) void submit(intent); }, () => renderForm(), "Unlock Clone Identity", "reviewed-clone");
+        unlock(response.value.credential, () => { if (owner.current() && isVisible()) void submit(intent); }, () => renderForm(), response.value.purpose === "workspace-start" ? "Unlock credentials to start after clone" : "Unlock Clone Identity", "reviewed-clone");
         return;
       }
       accept(operation, response.value.jobId);

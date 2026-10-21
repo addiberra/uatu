@@ -17,7 +17,7 @@
 .mh-root :focus-visible { outline: 3px solid var(--mh-action); outline-offset: 3px; }
 .mh-root :focus:not(:focus-visible) { outline: none; }
 .mh-root h1 { font-size: var(--mh-type-page); line-height: 1.15; letter-spacing: -.6px; margin: 0 0 var(--mh-space-2); font-weight: 700; overflow-wrap: anywhere; }
-.mh-root .mh-page { height: 100%; overflow: auto; overscroll-behavior: contain; padding: max(var(--mh-space-5), env(safe-area-inset-top)) max(var(--mh-space-5), env(safe-area-inset-right)) calc(var(--mh-keyboard-clearance) + var(--mh-dock-clearance) + var(--mh-overview-toolbar-height) + var(--mh-space-7)) max(var(--mh-space-5), env(safe-area-inset-left)); }
+.mh-root .mh-page { height: 100%; overflow: auto; overscroll-behavior: contain; padding: max(var(--mh-space-5), env(safe-area-inset-top), var(--titlebar-inset, 0px)) max(var(--mh-space-5), env(safe-area-inset-right)) calc(var(--mh-keyboard-clearance) + var(--mh-dock-clearance) + var(--mh-overview-toolbar-height) + var(--mh-space-7)) max(var(--mh-space-5), env(safe-area-inset-left)); }
 /* Hub content scrolls above the measured dock, not beneath its material. Keep
    the final Add Workspace explanation clear without pinning a second toolbar. */
 .mh-root .mh-page:has(.mh-add) { height: calc(100% - var(--mh-keyboard-clearance) - var(--mh-dock-clearance) - var(--mh-space-2)); padding-bottom: var(--mh-space-7); }
@@ -131,7 +131,7 @@
 .mh-root .mh-empty-state h2 { margin: 0; font-size: var(--mh-type-body); color: var(--mh-text); }
 .mh-root .mh-empty-state p { margin: 0; max-width: 34ch; font-size: var(--mh-type-secondary); color: var(--mh-muted); line-height: 1.5; }
 .mh-root .mh-confirmation .mh-commit.mh-destructive { background: var(--mh-surface); color: var(--mh-danger); border: 1px solid var(--mh-danger); }
-.mh-root .mh-flow-page { position: absolute; inset: 0; z-index: 1; overflow: hidden; overscroll-behavior: contain; background: var(--mh-canvas); padding: max(var(--mh-space-5), env(safe-area-inset-top)) max(var(--mh-space-5), env(safe-area-inset-right)) calc(var(--mh-keyboard-clearance) + var(--mh-dock-clearance) + var(--mh-flow-toolbar-height) + var(--mh-space-6)) max(var(--mh-space-5), env(safe-area-inset-left)); }
+.mh-root .mh-flow-page { position: absolute; inset: 0; z-index: 1; overflow: hidden; overscroll-behavior: contain; background: var(--mh-canvas); padding: max(var(--mh-space-5), env(safe-area-inset-top), var(--titlebar-inset, 0px)) max(var(--mh-space-5), env(safe-area-inset-right)) calc(var(--mh-keyboard-clearance) + var(--mh-dock-clearance) + var(--mh-flow-toolbar-height) + var(--mh-space-6)) max(var(--mh-space-5), env(safe-area-inset-left)); }
 .mh-root .mh-flow-page[hidden], .mh-root .mh-overview-toolbar[hidden] { display: none; }
 .mh-root .mh-page main[aria-hidden="true"] { visibility: hidden; }
 .mh-root .mh-flow-header { margin: 0 0 var(--mh-space-5); }

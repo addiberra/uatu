@@ -5,6 +5,8 @@ import { test, expect, loginHub, hubPost } from "./hub-mobile-fixtures";
 import { captureScreenshot, saveEvidence } from "./evidence";
 import { sharedUidWarning } from "../../src/hub/mobile/flow-ui";
 
+test.use({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
+
 // Real CLI Hub, production documents, bundled CSS and retained workspace shell.
 // Geometry assertions deliberately do not bless a screenshot/golden on update.
 test("isolated, production direct and retained overviews share the refined geometry", async ({ page, hub }, testInfo) => {
@@ -118,7 +120,7 @@ for (const variant of [
         await page.locator(`[data-action="${route}"]`).click();
         await expect(page.locator(".mh-page main > h1")).toHaveText(route === "hub" ? "Workspaces" : "Settings");
         if (route === "hub") await expect(page.locator(".mh-workspace")).toHaveCount(1);
-        else await expect(page.locator("[data-credential-id]")).toHaveCount(1);
+        else await expect(page.locator('[data-action="repository-credentials"] .mh-value')).toHaveText("1");
         await page.evaluate(() => document.fonts.ready);
         const geometry = await page.locator(".mh-page main").evaluate(main => {
           const heading = main.querySelector("h1")!.getBoundingClientRect();
@@ -140,6 +142,8 @@ for (const variant of [
           await expect(page.locator(".mh-branch")).toHaveCount(0);
           continue;
         }
+        await page.locator('[data-action="repository-credentials"]').click();
+        await expect(page.locator("[data-credential-id]")).toHaveCount(1);
         const disclosure = page.locator(".mh-safety-disclosure"), summary = disclosure.locator("summary");
         await expect(disclosure).not.toHaveAttribute("open");
         await summary.focus(); await summary.press("Enter"); await expect(disclosure).toHaveAttribute("open", "");
@@ -158,6 +162,7 @@ for (const variant of [
         if (entry === "retained" && await dismiss.count()) { await dismiss.click(); await expect(summary).toBeFocused(); }
         await summary.press("Enter"); await expect(disclosure).toHaveAttribute("open", ""); await facts(".mh-safety-disclosure");
         await summary.press("Enter");
+        await page.locator('[data-action="settings"]').click();
         for (const destination of ["agent-accounts", "notifications"] as const) {
           await page.locator(`[data-action="${destination}"]`).click();
           await expect(page.locator(".mh-flow-page h1")).toHaveText(destination === "agent-accounts" ? "Agent accounts" : "Notifications");
@@ -173,6 +178,7 @@ for (const variant of [
           await captureScreenshot(page, testInfo, `${entry}-${destination}-controls`);
           await page.locator('.mh-flow-page [data-flow="flow-back"]').click();
         }
+        await page.locator('[data-action="repository-credentials"]').click();
         await page.locator(`[data-credential-id="${credential.id}"]`).click();
         await expect(page.locator(".mh-flow-page h1")).toHaveText("Repository access"); await facts(".mh-flow-page .mh-safety-details");
         if (workspaceNode) expect(await workspaceNode.evaluate(el => el === document.querySelector("#mobile-workspace-root"))).toBe(true);
@@ -191,6 +197,7 @@ for (const variant of [
     }
     await page.goto(`${hub.origin}/settings`);
     await expect(page.locator(".mh-page [data-shared-uid]")).toHaveCount(0);
+    await page.locator('[data-action="repository-credentials"]').click();
     await expect(page.locator(".mh-safety-disclosure summary")).toBeVisible();
   });
 });

@@ -4,12 +4,36 @@ import { createLiveTransport } from "./live-transport";
 import { createLiveClone, decodeCloneAttempt, decodeCloneEvent } from "./live-clone";
 import type { CloneStreamEvent, CloneSubmissionIntent } from "./backend";
 import type { Fetcher } from "../../shell/bounded-fetch";
+import type { PublicCredentialDto } from "../credential-types";
 
 const saved = Object.getOwnPropertyDescriptor(globalThis, "document");
 beforeEach(() => { Object.defineProperty(globalThis, "document", { configurable: true, value: parseHTML('<html><head><meta name="uatu-hub" content="true"></head></html>').document }); });
 afterEach(() => { if (saved) Object.defineProperty(globalThis, "document", saved); else Reflect.deleteProperty(globalThis, "document"); });
 const credentials = { readCredentials: async () => ({ status: "available" as const, value: [] }) };
 const intent: CloneSubmissionIntent = { attemptId: "disposable-attempt", url: "https://example.test/repo", dest: "/fixtures", folderName: "repo", displayName: "Test", credentialId: null, retainedAuthentication: [], signing: null, start: false };
+
+test.each(["locked", "unknown"] as const)("clone-and-start requires explicit retained signing unlock before admission (%s)", async lock => {
+  const key: PublicCredentialDto = { id: "signing", name: "Start signing", type: "ssh", enabled: true, createdAt: "2026-10-15T00:00:00Z", capabilities: ["ssh-signing"], metadata: { publicKey: "ssh-ed25519 test", fingerprint: "test" }, assignments: [], readiness: [], facts: { protection: "protected", lock, userId: null } };
+  const calls: string[] = [];
+  const transport = createLiveTransport({ fetch: async url => { calls.push(url); return Response.json(url.endsWith("reconcile") ? { status: "not-accepted" } : { jobId: "new-job" }); } });
+  const clone = createLiveClone(transport, { readCredentials: async () => ({ status: "available", value: [key] }) });
+  expect(await clone.submitClone({ ...intent, signing: key.id, start: true })).toMatchObject({ status: "completed", value: { status: "requires-unlock", credential: { id: key.id, type: "ssh" }, purpose: "workspace-start" } });
+  expect(calls).toEqual(["/api/hub/clone-attempts/disposable-attempt/reconcile"]);
+  key.facts!.lock = "unlocked";
+  expect(await clone.submitClone({ ...intent, attemptId: "after-unlock", signing: key.id, start: true })).toEqual({ status: "completed", value: { status: "accepted", jobId: "new-job" } });
+  expect(calls).toEqual(["/api/hub/clone-attempts/disposable-attempt/reconcile", "/api/hub/clone-jobs"]);
+});
+
+test.each(["accepted", "pending", "expired"] as const)("retained-key unlock never bypasses an existing clone admission fence (%s)", async status => {
+  const key: PublicCredentialDto = { id: "signing", name: "Start signing", type: "ssh", enabled: true, createdAt: "2026-10-15T00:00:00Z", capabilities: ["ssh-signing"], metadata: { publicKey: "ssh-ed25519 test", fingerprint: "test" }, assignments: [], readiness: [], facts: { protection: "protected", lock: "locked", userId: null } };
+  const calls: string[] = [];
+  const transport = createLiveTransport({ fetch: async url => { calls.push(url); return Response.json({ status, ...(status === "accepted" ? { jobId: "original" } : {}) }); } });
+  const clone = createLiveClone(transport, { readCredentials: async () => ({ status: "available", value: [key] }) });
+  const result = await clone.submitClone({ ...intent, signing: key.id, start: true });
+  if (status === "accepted") expect(result).toEqual({ status: "completed", value: { status: "accepted", jobId: "original" } });
+  else expect(result.status).toBe("indeterminate");
+  expect(calls).toEqual(["/api/hub/clone-attempts/disposable-attempt/reconcile"]);
+});
 
 test("live clone omits null identity, preserves retained policy and never retries a lost write", async () => {
   const calls: string[] = [];

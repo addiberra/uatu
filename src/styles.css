@@ -10487,7 +10487,9 @@ html[data-ui-mode="touch"] .chat-surface[data-chat-rail] .chat-timeline {
 html[data-ui-mode="touch"] .attention-notices {
   left: calc(0.75rem + env(safe-area-inset-left));
   right: calc(0.75rem + env(safe-area-inset-right));
-  bottom: calc(var(--tab-bar-total) + 0.75rem);
+  /* The floating bar reserves no layout gutter. Keep notices above its
+     measured occlusion while open, and above the safe area while closed. */
+  bottom: calc(max(var(--navigation-occluded, 0px), env(safe-area-inset-bottom)) + 0.75rem);
   width: auto;
 }
 

@@ -3,7 +3,7 @@ import { promisify } from "node:util";
 import path from "node:path";
 import { test, expect, openEventSources } from "./hub-fixtures";
 
-test.use({ hubWorktrees: true, hubCredentials: true, hubWorkspaces: ["mobile-inventory", "mobile-other"] });
+test.use({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true, hubWorktrees: true, hubCredentials: true, hubWorkspaces: ["mobile-inventory", "mobile-other"] });
 const exec = promisify(execFile);
 
 test("all rendered phone branding images resolve on production Hub routes and retained Settings", async ({ hubContext }) => {

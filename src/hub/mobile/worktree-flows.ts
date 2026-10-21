@@ -120,10 +120,11 @@ export function createWorktreeFlows(env: FlowEnvironment) {
         let warning = facts(preflight.checkout) + text("Permanently remove this worktree's folder and Hub registration. The Git branch remains.");
         if (preflight.requiresStop) warning += text("This stops its Uatu activity and terminates its shells first. It cannot stop external applications.");
         if (data) {
+          warning += text("These files and folders will be permanently deleted with the worktree, including everything inside each listed folder, and cannot be recovered.");
           warning += group("Local files that will be discarded", (["tracked", "untracked", "ignored"] as const).map(category => data[category] ? infoRows([{ label: category, value: `${data[category]!.count} entries`, detail: data[category]!.sample.join(", ") }]) : "").join(""));
           warning += check("acknowledge", "Permanently delete these files with the worktree");
         }
-        env.confirm("Delete worktree?", warning, { label: "Delete worktree", run: root => {
+        env.confirm("Delete worktree?", warning, { label: preflight.requiresStop ? "Stop and delete worktree" : "Delete worktree", run: root => {
           if (data && !checked(root, "acknowledge")) throw new Error("Acknowledge the disclosed local files before deleting.");
           return env.mutate(() => api!.delete({ sourceWorkspaceId, reference, confirm: true, stop: preflight.requiresStop, ...(data ? { localDataFingerprint: data.fingerprint } : {}) }), result => outcome(sourceWorkspaceId, result, back), root);
         } }, {}, () => detail(inventory, checkout, back), { destructive: true });

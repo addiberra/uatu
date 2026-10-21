@@ -62,7 +62,9 @@ export const test = base.extend<TestFixtures, WorkerFixtures & WorkerOptions>({
   hubMobileFlows: [false, { option: true, scope: "worker" }],
   hubWorkspaces: [["alpha"], { option: true, scope: "worker" }],
   hubWorktrees: [false, { option: true, scope: "worker" }],
-  hubCredentials: [false, { option: true, scope: "worker" }],
+  // Touch workspace entry verifies assignments before boot. Production always
+  // exposes this API, so the default harness must too, even with no credentials.
+  hubCredentials: [true, { option: true, scope: "worker" }],
   hubPush: [false, { option: true, scope: "worker" }],
   hubAgentAccounts: [false, { option: true, scope: "worker" }],
 

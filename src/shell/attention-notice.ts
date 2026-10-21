@@ -24,6 +24,7 @@
 // answer is left to the switcher badge.
 
 import type { WorkspaceActivity } from "../shared/live-protocol";
+import { workspaceOverlayHost } from "../hub/mobile/coordinator-context";
 
 export type AttentionNotice = { workspaceId: string };
 
@@ -87,7 +88,7 @@ export function attentionNoticeHref(workspaceId: string): string {
 }
 
 /**
- * Renders the stack into `host` (created on first use, appended to <body>). Rebuilt on every change: at most one entry
+ * Renders the stack into the workspace overlay owner (body outside a coordinator). Rebuilt on every change: at most one entry
  * per workspace, so the stack is small. `label` names a workspace as the switcher does.
  */
 export function renderAttentionNotices(
@@ -103,7 +104,7 @@ export function renderAttentionNotices(
     host.setAttribute("aria-label", "Agents waiting in other workspaces");
     // Polite: a question elsewhere must not interrupt what the user is reading or typing here.
     host.setAttribute("aria-live", "polite");
-    doc.body.appendChild(host);
+    workspaceOverlayHost(doc).appendChild(host);
   }
   host.replaceChildren(...notices.map(notice => {
     const item = doc.createElement("div");

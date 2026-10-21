@@ -401,13 +401,14 @@ export class FakeE2EChatService implements WorkspaceChatService {
   async prompt(id: string, requestId: string, text: string, model?: ModelSelection, mode?: string, variant?: string, attachments?: MessageAttachment[]): Promise<{
     messageId: string;
     held: boolean;
+    operation?: "reload";
     conversation?: ConversationSummary;
     configuration: ConversationConfiguration;
   }> {
     if (mode) this.promptModes.push(mode);
     if (variant) this.promptVariants.push(variant);
     const key = `prompt:${id}:${requestId}`;
-    const existing = this.receipts.get(key) as { messageId: string; held: boolean; configuration: ConversationConfiguration; conversation?: ConversationSummary } | undefined;
+    const existing = this.receipts.get(key) as { messageId: string; held: boolean; operation?: "reload"; configuration: ConversationConfiguration; conversation?: ConversationSummary } | undefined;
     if (existing) return existing;
     const conversation = this.require(id);
     const previousConfiguration = this.configurations.get(id) ?? {};
@@ -422,6 +423,11 @@ export class FakeE2EChatService implements WorkspaceChatService {
     } else if (variant) configuration.variant = variant;
     this.promptConfigurations.push(structuredClone(configuration));
     this.promptAttempts.push(requestId);
+    // Match the acceptance contract of the provider's built-in reload. Without
+    // it the client correctly drops its guessed reload on acceptance, making
+    // catalog refresh depend on completion racing ahead of that acceptance.
+    const operation = /^\/reload(?:\s|$)/.test(text.trim()) && (await this.commands()).find(command => command.name === "reload")?.kind === "command"
+      ? { operation: "reload" as const } : {};
     if (this.failNextPrompt) {
       this.failNextPrompt = false;
     this.unavailable = null;
@@ -453,7 +459,7 @@ export class FakeE2EChatService implements WorkspaceChatService {
     if (this.revertBoundaries.has(id)) {
       this.commitRevertedBranch(id);
       const messageId = this.dispatch(id, text, requestId, attachmentRefs);
-      const result = { messageId, held: false, configuration };
+      const result = { messageId, held: false, configuration, ...operation };
       this.receipts.set(key, result);
       return result;
     }
@@ -479,7 +485,7 @@ export class FakeE2EChatService implements WorkspaceChatService {
       this.conversations.set(id, renamed);
     }
     const messageId = this.dispatch(id, text, requestId, attachmentRefs);
-    const result = { messageId, held: false, configuration, ...(renamed ? { conversation: renamed } : {}) };
+    const result = { messageId, held: false, configuration, ...operation, ...(renamed ? { conversation: renamed } : {}) };
     this.receipts.set(key, result);
     return result;
   }
