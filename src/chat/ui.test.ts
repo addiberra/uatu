@@ -2253,7 +2253,12 @@ describe("a question's owed-answer line", () => {
   // no stream event follows a resolution, so a status line can only move by
   // the interaction handlers themselves — unlike the connected e2e flow,
   // where the resolution event's own status clear would mask these outcomes.
-  const boot = async (options: { questions?: unknown[]; questionResults?: Array<() => Promise<unknown>> } = {}) => {
+  const boot = async (options: {
+    questions?: unknown[];
+    questionResults?: Array<() => Promise<unknown>>;
+    conversations?: string[];
+    itemsFor?: (conversationId: string) => unknown[];
+  } = {}) => {
     const { document, window } = parseHTML(html);
     installDomGlobals(document, window);
     document.documentElement.setAttribute("data-ui-mode", "desktop");
@@ -2262,14 +2267,16 @@ describe("a question's owed-answer line", () => {
     let questionCalls = 0;
     const questionResults = options.questionResults ?? [async () => ({})];
     const questionCallsRecord: Array<{ outcome: unknown; answers?: string[][] }> = [];
-    const api = questionApi(document, {
-      items: () => [{ id: "message:u", type: "user_message", createdAt: 1, text: "please answer" }, {
-        id: "question:q1", type: "question", createdAt: 2, requestId: "q1", status: "pending",
-        questions: options.questions ?? [{
-          prompt: "Which branch?", header: "Branch", multiple: false, allowFreeForm: true,
-          optional: false, options: [{ label: "main", description: "" }],
-        }],
+    const itemsFor = options.itemsFor ?? (() => [{ id: "message:u", type: "user_message", createdAt: 1, text: "please answer" }, {
+      id: "question:q1", type: "question", createdAt: 2, requestId: "q1", status: "pending",
+      questions: options.questions ?? [{
+        prompt: "Which branch?", header: "Branch", multiple: false, allowFreeForm: true,
+        optional: false, options: [{ label: "main", description: "" }],
       }],
+    }]);
+    const api = questionApi(document, {
+      conversations: options.conversations,
+      items: itemsFor,
     });
     Object.assign(api, {
       question: async (_conversationId: string, _interactionId: string, _requestId: string, outcome: unknown) => {
@@ -2325,6 +2332,94 @@ describe("a question's owed-answer line", () => {
       choice.dispatchEvent(new window.Event("change", { bubbles: true }));
       submitForm();
       expect(state()).not.toContain("Still to answer");
+    } finally {
+      window.dispatchEvent(new Event("pagehide"));
+    }
+  });
+
+  test("an invalid Next names the whole outstanding set, on the first gate and when repeated", async () => {
+    // Two required steps, neither answered: whatever raises the owed line —
+    // the advance gate or the final validation — must name both, and the
+    // line must not shrink to the step that was just left when Next repeats.
+    const { window, card, state } = await boot({ questions: [
+      { prompt: "Q1 — Scope", header: "Which surfaces", multiple: false, allowFreeForm: true, options: [{ label: "Timeline only", description: "" }] },
+      { prompt: "Q2 — Depth", header: "How deep", multiple: false, allowFreeForm: true, options: [{ label: "Smoke", description: "" }] },
+    ] });
+    try {
+      const form = card.querySelector("form[data-question-form]")!;
+      const submitForm = () => form.dispatchEvent(new window.Event("submit", { bubbles: true, cancelable: true }));
+      const goto = (index: number) => {
+        const tab = card.querySelector<HTMLElement>(`[data-question-tab="${index}"]`)!;
+        Object.defineProperty(tab, "form", { configurable: true, value: form });
+        tab.dispatchEvent(new window.Event("click", { bubbles: true }));
+      };
+      const panel = (index: string) => card.querySelector(`[data-question-panel="${index}"]`) as HTMLElement;
+
+      // The first invalid Next is the gate: it stops the advance and speaks
+      // the whole outstanding set, Q2 as much as Q1.
+      submitForm();
+      expect(state()).toContain("Still to answer");
+      expect(state()).toContain("Which surfaces");
+      expect(state()).toContain("How deep");
+      expect(panel("0").hidden).toBe(false);
+
+      // The final validation names the same full set.
+      goto(1);
+      submitForm();
+      expect(panel("0").hidden).toBe(false);
+      expect(state()).toContain("Which surfaces");
+      expect(state()).toContain("How deep");
+
+      // Repeating the invalid Next keeps the line naming Q2: the step just
+      // left (Q1) does not replace the whole outstanding set.
+      submitForm();
+      expect(panel("0").hidden).toBe(false);
+      expect(state()).toContain("Which surfaces");
+      expect(state()).toContain("How deep");
+    } finally {
+      window.dispatchEvent(new Event("pagehide"));
+    }
+  });
+
+  test("an in-flight rejection leaves another conversation's owed line standing", async () => {
+    // A reject whose request is still in the air, answered form gone for good:
+    // while it flies, the reader switches to a second conversation and raises
+    // the owed line for that one. When the reject eventually lands, its
+    // cleanup retires its own line only — the prefix the two share cannot be
+    // what follows it over the other conversation's raised line.
+    const rejectA = deferred<void>();
+    const { window, document, card, state } = await boot({
+      conversations: ["one", "two"],
+      itemsFor: conversationId => [
+        { id: "message:u", type: "user_message", createdAt: 1, text: "please answer" },
+        {
+          id: conversationId === "one" ? "question:q1" : "question:q2", type: "question", createdAt: 2,
+          requestId: conversationId, status: "pending",
+          questions: [{ prompt: "Which branch?", header: "Branch", multiple: false, allowFreeForm: true, options: [{ label: "main", description: "" }] }],
+        },
+      ],
+      questionResults: [() => rejectA.promise],
+    });
+    try {
+      // Conversation one raises the owed line, then its reject goes out and
+      // hangs in the api stub.
+      card.querySelector("form[data-question-form]")!.dispatchEvent(new window.Event("submit", { bubbles: true, cancelable: true }));
+      expect(state()).toContain("Still to answer");
+      card.querySelector<HTMLInputElement>("[data-question-reject]")!.dispatchEvent(new window.Event("click", { bubbles: true }));
+      await Bun.sleep(5);
+      // The reader switches to conversation two; its empty required submit
+      // raises the same-shared line for that conversation.
+      const select = document.querySelector<HTMLSelectElement>("#chat-conversation-select")!;
+      select.value = "two";
+      select.dispatchEvent(new window.Event("change", { bubbles: true }));
+      await waitUntil(() => document.querySelector('[data-chat-item-id="question:q2"] form[data-question-form]') != null);
+      document.querySelector<HTMLElement>('[data-chat-item-id="question:q2"]')!.querySelector("form[data-question-form]")!
+        .dispatchEvent(new window.Event("submit", { bubbles: true, cancelable: true }));
+      expect(state()).toContain("Still to answer");
+      // The hanging reject lands: conversation two's line stays standing.
+      rejectA.resolve();
+      await Bun.sleep(20);
+      expect(state()).toContain("Still to answer");
     } finally {
       window.dispatchEvent(new Event("pagehide"));
     }
@@ -2433,16 +2528,18 @@ function pendingQuestion(requestId: string, createdAt: number) {
   };
 }
 
-function questionApi(document: Document, options: { items?: () => unknown[]; stream?: (handlers: { resync(): void }) => void; capabilities?: string[] } = {}): ChatApiClient {
-  const items = options.items ?? (() => [{ id: "message:u", type: "user_message", createdAt: 1, text: "which branch?" }, pendingQuestion("q1", 2)]);
+function questionApi(document: Document, options: { items?: (conversationId: string) => unknown[]; stream?: (handlers: { resync(): void }) => void; capabilities?: string[]; conversations?: string[] } = {}): ChatApiClient {
+  const items = (conversationId: string) => options.items
+    ? options.items(conversationId)
+    : [{ id: "message:u", type: "user_message", createdAt: 1, text: "which branch?" }, pendingQuestion("q1", 2)];
   return {
     status: async () => ([{
       agent: { id: "test", name: "Test" },
       availability: { state: "ready", version: "test", agent: { id: "test", name: "Test", capabilities: options.capabilities ?? ["questions"] } },
     }]),
-    conversations: async () => [conversation("one")],
+    conversations: async () => (options.conversations ?? ["one"]).map(id => conversation(id)),
     commands: async () => [],
-    snapshot: async (id: string) => ({ ...snapshot(id), items: items() }),
+    snapshot: async (id: string) => ({ ...snapshot(id), items: items(id) }),
     stream: (_conversationId: string, _cursor: string, handlers: { resync(): void }) => {
       options.stream?.(handlers);
       return { close() {} };

@@ -3666,8 +3666,11 @@ export function initChat(api = new ChatApiClient()): void {
         // A successful rejection retires the form — and the owed-answer line
         // a required validation error may have left on the status region:
         // the same guarded cleanup the answer path runs, so a failure's own
-        // status and any newer unrelated message are never taken down.
-        void resolveQuestion(source, item.id, { kind: "rejected" }).then(resolved => { if (resolved) clearOwedAnswer(source); });
+        // status and any newer unrelated message are never taken down. The
+        // card's own item stays bound: the cleanup retires only the line
+        // this item's conversation raised, never one another conversation
+        // raised while the request sat in flight.
+        void resolveQuestion(source, item.id, { kind: "rejected" }).then(resolved => { if (resolved) clearOwedAnswer(source, item); });
       }
     });
     container.addEventListener("keydown", event => {
@@ -3712,10 +3715,22 @@ export function initChat(api = new ChatApiClient()): void {
     // becomes valid — but only while the line still reads as ours: a newer
     // unrelated status (an outage, a refusal) is never spoken over. The
     // interruption owner re-states its message when the blank replaces it.
-    const clearOwedAnswer = (source: ChatProjection) => {
+    // "Ours" is the conversation whose form raised the line, tracked beside
+    // the announcer: the same status line is one resource every conversation
+    // viewed on a surface speaks through, so a prefix match alone cannot
+    // separate one conversation's owed line from another's — an in-flight
+    // resolve landing after a switch (conversation A to B, or B back to A)
+    // would otherwise retire whatever validation the switched-to conversation
+    // raised behind it.
+    const owedAnswerOwner = new Map<Announcer, string>();
+    const conversationOfQuestion = (source: ChatProjection, item: Extract<ConversationItem, { type: "question" }>) =>
+      item.conversationId ?? source.conversationId;
+    const clearOwedAnswer = (source: ChatProjection, item: Extract<ConversationItem, { type: "question" }>) => {
       const spoken = announceFailureFor(source);
+      if (owedAnswerOwner.get(spoken) !== conversationOfQuestion(source, item)) return;
       if (spoken.current().startsWith("Still to answer")) {
         spoken("");
+        owedAnswerOwner.delete(spoken);
         interruptionsOwnerFor(source).restoreOwned();
       }
     };
@@ -3776,13 +3791,22 @@ export function initChat(api = new ChatApiClient()): void {
     // attached to the owned interruption before, never re-attached onto an
     // unrelated status. Repeated submits count as the known write they are:
     // while a stream of the surface is down, the affordance stands again on
-    // every press of an empty required step.
-    const speakOwedAnswer = (source: ChatProjection, message: string) => {
+    // every press of an empty required step. The message records the
+    // conversation whose form raised it: only that conversation may retire
+    // the line later.
+    const speakOwedAnswer = (source: ChatProjection, item: Extract<ConversationItem, { type: "question" }>, message: string) => {
+      const spoken = announceFailureFor(source);
+      owedAnswerOwner.set(spoken, conversationOfQuestion(source, item));
       const owner = interruptionsOwnerFor(source);
       const wasRecovering = owner.isShowingOwned();
-      announceFailureFor(source)(message, true);
+      spoken(message, true);
       if (wasRecovering || owner.hasDown()) owner.keepRecoveryVisible();
     };
+
+    // Name each owed step: a field without a label reads empty here
+    // otherwise, and the prompt always names it.
+    const owedStepNames = (outstanding: number[], item: Extract<ConversationItem, { type: "question" }>) =>
+      outstanding.map(index => item.questions[index]!.header || item.questions[index]!.prompt || "the current question").filter(Boolean).join(", ");
 
     // The owed-answer line follows the form's outstanding required steps as
     // they stand, wherever an interaction settles it: an optional empty never
@@ -3790,17 +3814,20 @@ export function initChat(api = new ChatApiClient()): void {
     // the refreshed message is spoken only while the line is still ours — a
     // newer unrelated status (an outage, a refusal) is never spoken over. Tab
     // navigation and the Next advance owe the line to the same whole form, so
-    // they settle it together here rather than in diverging copies.
+    // they settle it together here rather than in diverging copies. Each
+    // raising and refresh records which conversation owes the line, so a
+    // resolution landing after the reader switched conversations can never
+    // retire the line another conversation raised.
     const settleOwedAnswer = (source: ChatProjection, item: Extract<ConversationItem, { type: "question" }>, form: HTMLFormElement) => {
       const outstanding = collectQuestionAnswers(form).flatMap((answer, index) => answer.length === 0 && !item.questions[index]?.optional ? [index] : []);
       if (outstanding.length === 0) {
-        clearOwedAnswer(source);
+        clearOwedAnswer(source, item);
         return;
       }
-      const spoken = announceFailureFor(source);
-      if (spoken.current().startsWith("Still to answer")) {
-        speakOwedAnswer(source, `Still to answer: ${outstanding.map(index => item.questions[index]!.header || item.questions[index]!.prompt || "the current question").filter(Boolean).join(", ")}`);
-      }
+      // The refresh is spoken only while the line is still ours; a newer
+      // unrelated status is never spoken over.
+      if (!announceFailureFor(source).current().startsWith("Still to answer")) return;
+      speakOwedAnswer(source, item, `Still to answer: ${owedStepNames(outstanding, item)}`);
     };
 
     container.addEventListener("submit", event => {
@@ -3824,7 +3851,13 @@ export function initChat(api = new ChatApiClient()): void {
       if (activeIndex < panels.length - 1) {
         const step = item.questions[activeIndex]!;
         if (collectQuestionAnswers(questionForm)[activeIndex]!.length === 0 && !step.optional) {
-          speakOwedAnswer(source, `Still to answer: ${step.header || step.prompt || "the current question"}`);
+          // The advance holds on the step just left, but the line names the
+          // whole form's outstanding set, not that step alone: the final
+          // validation may already have listed later required steps, and
+          // repeating Next must not shrink the message to the one the
+          // reader is standing on.
+          const outstanding = collectQuestionAnswers(questionForm).flatMap((answer, index) => answer.length === 0 && !item.questions[index]?.optional ? [index] : []);
+          speakOwedAnswer(source, item, `Still to answer: ${owedStepNames(outstanding, item)}`);
           return;
         }
         // The advance retires the line only by the whole form's standing —
@@ -3842,13 +3875,10 @@ export function initChat(api = new ChatApiClient()): void {
       const missing = answers.flatMap((answer, index) => answer.length === 0 && !item.questions[index]?.optional ? [index] : []);
       if (missing.length > 0) {
         showQuestionPanel(questionForm, missing[0]!);
-        // Name each owed step: a field without a label reads empty here
-        // otherwise, and the prompt always names it.
-        const owed = missing.map(index => item.questions[index]!.header || item.questions[index]!.prompt || "the current question").filter(Boolean).join(", ");
-        speakOwedAnswer(source, `Still to answer: ${owed}`);
+        speakOwedAnswer(source, item, `Still to answer: ${owedStepNames(missing, item)}`);
         return;
       }
-      clearOwedAnswer(source);
+      clearOwedAnswer(source, item);
       void resolveQuestion(source, item.id, { kind: "answered", answers });
     });
   };

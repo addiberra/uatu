@@ -53,18 +53,29 @@ alike.
 A multi-question form whose required validation spoke the owed-answer line
 onto a surface's status region SHALL keep that line accurate as the form
 stands — wherever the reader navigates or submits — and SHALL speak it only
-while it is the region's current news. The line SHALL name the outstanding
-required steps, not the step last left.
+while it is the region's current news. The line SHALL name every outstanding
+required step of the form, including when raised or refreshed from the Next
+advance gate, never the step last left alone.
 
 #### Scenario: An optional empty step does not retire or rewrite a required step's line
 - **WHEN** a required step's Next has raised the owed-answer line, and the reader then presses Next past an optional empty step (or tabs across one)
 - **THEN** the line survives into the next step, still naming the required steps that remain outstanding
 - **AND** once no required step is outstanding, the line retires
 
+#### Scenario: The advance gate names the whole outstanding set
+- **WHEN** the reader presses Next on an empty required step while other required steps — earlier or later — are also unanswered, whether on the form's first gate or after the final validation already listed the full set
+- **THEN** the owed-answer line names every outstanding required step of the form, not only the step the advance stopped on
+- **AND** repeated presses keep naming that whole set instead of shrinking it to the step just left
+
 #### Scenario: A successful rejection retires the line it left behind
 - **WHEN** a question is rejected after a required validation error raised the owed-answer line
 - **THEN** the successful resolution retires that line along with the form
 - **AND** a failed rejection leaves the failure's own status standing, with no owed-line cleanup behind it
+
+#### Scenario: A landing resolution retires only its own conversation's line
+- **WHEN** a question's reject or answer is still in flight, the reader switches to another conversation whose required validation raises the owed-answer line, and the in-flight resolution then succeeds
+- **THEN** the line the switched-to conversation raised stays standing
+- **AND** the resolution retires only the line raised by the conversation of the question it resolved, whether the line is on its own surface or the surface it was answered from
 
 #### Scenario: An unrelated status is never spoken over
 - **WHEN** the status region holds a newer message an outside owner spoke — an outage, a refusal, a turn failure
