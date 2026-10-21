@@ -4,6 +4,7 @@ import path from "node:path";
 
 import { InvalidQuestionAnswerError, ReversibleHistoryTargetError } from "../../provider";
 import { createOpenCodeV2Provider, formAnswerFromChoices, type OpenCodeV2Provider } from "./provider";
+import { ChatAdapter } from "../../adapter";
 
 // The stored records of a real 2.0.13 session: user, assistant (read tool),
 // assistant (text), idle, user — see normalization.test.ts for provenance.
@@ -160,6 +161,85 @@ describe("OpenCode 2.x provider: identity and catalogs", () => {
 });
 
 describe("OpenCode 2.x provider: sessions", () => {
+  test("a saturated native stream keeps discovering and completing later workers through adapter recovery without reconnecting", async () => {
+    const fixture = JSON.parse(readFileSync(path.join(import.meta.dir, "../../../../tests/fixtures/opencode-v2/background-2.0.29.json"), "utf8"));
+    const encoder = new TextEncoder();
+    let stream!: ReadableStreamDefaultController<Uint8Array>;
+    let messages: unknown[] = [];
+    let pending: unknown[] = [];
+    let unavailable = false;
+    const frame = (type: string, data: unknown, created = 30) => stream.enqueue(encoder.encode(`data: ${JSON.stringify({ type, data, created, location: { directory: WORKSPACE } })}\n\n`));
+    const server = fakeOpenCode({
+      "GET /api/event": () => new Response(new ReadableStream<Uint8Array>({ start(controller) {
+        stream = controller;
+        // Exhaust the production 4 MiB live budget with valid bounded
+        // identities, below the SDK's 4,096-event subscriber queue capacity.
+        // These scoped child facts have no timeline rows to evict.
+        for (let i = 0; i < 2200; i++) frame("session.created", { sessionID: `filler${i}`.padEnd(500, "x"), parentID: "p".repeat(500) });
+        frame("server.connected", {});
+      } }), { headers: { "content-type": "text/event-stream" } }),
+      "GET /api/session": () => ({ data: [session("ses_parent")], cursor: {} }),
+      "GET /api/session/active": () => ({ ses_child: { status: "running" }, ses_later: { status: "running" } }),
+      "GET /api/session/:id": ({ path }) => session(path.split("/").at(-1)!, path.endsWith("ses_parent") ? {} : { parentID: "ses_parent" }),
+      "GET /api/session/ses_parent/message": () => unavailable ? new Response(null, { status: 503 }) : { data: messages, cursor: {} },
+      "GET /api/session/ses_parent/inbox": () => ({ data: pending }),
+      "GET /api/session/:id/message": () => ({ data: [], cursor: {} }),
+      "GET /api/permission/request": () => scoped([]),
+      "GET /api/form": () => scoped([]),
+    });
+    const provider = server.provider();
+    const nativeEvents = provider.events.bind(provider);
+    const liveWorkerIds: string[] = [];
+    provider.events = async function* (signal) {
+      for await (const event of nativeEvents(signal)) {
+        for (const update of event.updates) if (update.kind === "upsert" && update.item.type === "background_task") liveWorkerIds.push(update.item.id);
+        yield event;
+      }
+    };
+    const adapter = new ChatAdapter({ provider, workspacePath: WORKSPACE, generation: "saturation", coalesceWindowMs: 0 });
+    const pump = adapter.startEventPump();
+    const until = async (predicate: () => boolean) => {
+      const deadline = Date.now() + 4000;
+      while (!predicate() && Date.now() < deadline) await Bun.sleep(5);
+      if (!predicate()) throw new Error(`Saturation recovery stalled: ${JSON.stringify(rows().map(({ taskId, status, stateUncertain, resultId }) => ({ taskId, status, stateUncertain, resultId })))}; recent reads ${server.calls.slice(-12).map(call => `${call.method} ${call.path}`).join(", ")}`);
+      expect(predicate()).toBe(true);
+    };
+    const rows = () => adapter.projectionForTests("ses_parent").items().filter(item => item.type === "background_task");
+    try {
+      await until(() => !!stream && server.requests("GET", "/api/session/ses_parent/message").length > 0);
+      for (const [index, child] of ["ses_child", "ses_later"].entries()) {
+        const launch = structuredClone(fixture.launch);
+        launch.id = `launch${index}`;
+        launch.content[0].id = `worker${index}`;
+        launch.content[0].state.metadata.sessionID = child;
+        const result = structuredClone(fixture.pending);
+        result.id = `result${index}`;
+        result.payload.metadata.childID = child;
+        messages = [...messages, launch];
+        frame("session.message.content.updated", { sessionID: "ses_parent", messageID: launch.id, content: launch.content });
+        await until(() => rows().some(item => item.toolUseId === `worker${index}` && item.status === "running"));
+        // The saturated live detector cannot create this later row: only a
+        // successful authoritative read can discover it on this subscription.
+        expect(rows().find(item => item.toolUseId === `worker${index}`)).toMatchObject({ childConversationId: child, stateUncertain: false });
+        unavailable = true;
+        const reads = server.requests("GET", "/api/session/ses_parent/message").length;
+        frame("session.message.content.updated", { sessionID: "ses_parent", messageID: `invalidate${index}`, content: [] });
+        await until(() => server.requests("GET", "/api/session/ses_parent/message").length > reads && rows().some(item => item.toolUseId === `worker${index}` && item.stateUncertain));
+        expect(rows().find(item => item.toolUseId === `worker${index}`)?.status).toBe("running");
+        unavailable = false;
+        pending = [...pending, result];
+        frame("session.inbox.enqueued", { sessionID: "ses_parent", inboxID: result.id, item: result }, 41);
+        await until(() => rows().some(item => item.toolUseId === `worker${index}` && item.status === "completed"));
+        expect(rows().find(item => item.toolUseId === `worker${index}`)).toMatchObject({ resultId: result.id, summary: "Fixture checked.", stateUncertain: false });
+      }
+      expect(server.requests("GET", "/api/event")).toHaveLength(1);
+      expect(liveWorkerIds).toEqual([]);
+      expect(server.calls.every(call => call.method === "GET")).toBe(true);
+    } finally {
+      await adapter.dispose();
+      await pump;
+    }
+  }, 30_000);
   test("post-admission fresh worker evidence cannot join a read begun before the action", async () => {
     const fixture = JSON.parse(readFileSync(path.join(import.meta.dir, "../../../../tests/fixtures/opencode-v2/background-2.0.29.json"), "utf8"));
     let release!: () => void, entered!: () => void, reads = 0;

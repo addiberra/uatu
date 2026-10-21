@@ -984,7 +984,10 @@ only when execution boundaries disambiguate them; otherwise the readable
 result stays separate and affected work is uncertain. A settled report renders
 after its correlated launcher even if its retained start timestamp predates it.
 Stream correlation is
-bounded to 8,192 entries / 4 MiB; saturation discards the entire correlation
+bounded to 8,192 entries / 4 MiB of conservative serialized UTF-16 size.
+The byte ledger serializes only inserted or changed entries, subtracts their
+cached sizes on replacement/removal, and includes JSON escaping and collection
+overhead; unrelated events do not rescan retained history. Saturation discards the entire correlation
 cache rather than unsafe partial tombstones and relies on scoped recovery
 until reconnect. Complete-history folds are transient and precede pagination.
 

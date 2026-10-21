@@ -19,18 +19,47 @@ export class BackgroundWorkers {
   private readonly unmatched = new Map<string, { parent: string; worker: string; item: BackgroundTaskItem; correlatable: boolean }>();
   private readonly ended = new Map<string, number[]>();
   private readonly aliases = new Map<string, string>();
+  // Empty outer array and six collections. Each retained entry adds its
+  // serialized tuple (or notice string) plus a conservative comma allowance.
+  private bytes = 38;
+  private boundaries = 0;
+  private readonly sizes = new Map<object, Map<string, number>>();
+
+  private get unlimited(): boolean {
+    return this.budget.entries === Infinity && this.budget.bytes === Infinity;
+  }
+
+  private set<T>(map: Map<string, T>, key: string, value: T): void {
+    if (!this.unlimited) this.account(map, key, JSON.stringify([key, value]).length * 2 + 2);
+    map.set(key, value);
+  }
+
+  private account(collection: object, key: string, size: number): void {
+    let sizes = this.sizes.get(collection);
+    if (!sizes) this.sizes.set(collection, sizes = new Map());
+    this.bytes += size - (sizes.get(key) ?? 0);
+    if (size) sizes.set(key, size);
+    else sizes.delete(key);
+  }
+
+  private notice(key: string): void {
+    if (!this.unlimited) this.account(this.notices, key, JSON.stringify(key).length * 2 + 2);
+    this.notices.add(key);
+  }
 
   verifyChild(child: string, parent: string): void {
     if (this.recoveryOnly || !identity(child) || !identity(parent)) return;
-    this.parents.set(child, parent);
+    this.set(this.parents, child, parent);
     this.bound();
   }
 
   executionEnded(child: string, at: number): void {
     if (this.recoveryOnly || !this.parents.has(child)) return;
     const boundaries = this.ended.get(child) ?? [];
-    if (!boundaries.includes(at)) boundaries.push(at);
-    this.ended.set(child, boundaries);
+    if (boundaries.includes(at)) return;
+    boundaries.push(at);
+    this.boundaries++;
+    this.set(this.ended, child, boundaries);
     this.bound();
   }
 
@@ -60,8 +89,9 @@ export class BackgroundWorkers {
     const shared = [...this.tasks.values()].find(task => task.parent === parent && task.worker === child && task.item.status === "running"
       && !this.ended.get(child)?.some(end => end >= task.item.createdAt && end < startedAt));
     if (shared) {
-      this.aliases.set(callKey, shared.item.taskId);
+      this.set(this.aliases, callKey, shared.item.taskId);
       shared.item = { ...shared.item, toolUseIds: [...(shared.item.toolUseIds ?? [shared.item.toolUseId!]), call] };
+      this.set(this.tasks, shared.item.taskId, shared);
       return [{ kind: "upsert", item: shared.item }];
     }
     const item: BackgroundTaskItem = {
@@ -78,15 +108,17 @@ export class BackgroundWorkers {
     for (const previous of this.tasks.values()) {
       if (previous.parent !== parent || previous.worker !== child || previous.item.status !== "running") continue;
       previous.item = { ...previous.item, stateUncertain: true };
+      this.set(this.tasks, previous.item.taskId, previous);
       superseded.push({ kind: "upsert", item: previous.item });
     }
-    this.tasks.set(taskId, { parent, worker: child, item });
+    this.set(this.tasks, taskId, { parent, worker: child, item });
     const pending = [...this.unmatched.entries()].filter(([, result]) => result.correlatable && result.parent === parent && result.worker === child && result.item.createdAt >= item.createdAt);
     if (pending.length === 1) {
       const [key, result] = pending[0]!;
       this.unmatched.delete(key);
+      if (!this.unlimited) this.account(this.unmatched, key, 0);
       const settled = { ...item, status: result.item.status, summary: result.item.summary, resultId: result.item.resultId };
-      this.tasks.set(taskId, { parent, worker: child, item: settled });
+      this.set(this.tasks, taskId, { parent, worker: child, item: settled });
       return [{ kind: "remove", itemId: result.item.id }, { kind: "upsert", item: settled }];
     }
     return [...superseded, { kind: "upsert", item }];
@@ -135,16 +167,18 @@ export class BackgroundWorkers {
         description: optionalString(value.description) ?? "Background worker result",
         childConversationId: child, taskType: "agent", status, summary, resultId: id,
       };
-      this.unmatched.set(key, { parent, worker: child, item, correlatable: candidates.length === 0 });
-      this.notices.add(key);
+      this.set(this.unmatched, key, { parent, worker: child, item, correlatable: candidates.length === 0 });
+      this.notice(key);
       return [...candidates.map((task): NormalizedProviderUpdate => {
         task.item = { ...task.item, stateUncertain: true };
+        this.set(this.tasks, task.item.taskId, task);
         return { kind: "upsert", item: task.item };
       }), { kind: "upsert", item }];
     }
     const task = candidates[0]!;
     task.item = { ...task.item, status, summary, resultId: id };
-    this.notices.add(key);
+    this.set(this.tasks, task.item.taskId, task);
+    this.notice(key);
     return [{ kind: "upsert", item: task.item }];
   }
 
@@ -153,14 +187,16 @@ export class BackgroundWorkers {
     const maxBytes = this.budget.bytes ?? 4 * 1024 * 1024;
     if (maxEntries === Infinity && maxBytes === Infinity) return;
     const collections = [this.parents, this.tasks, this.notices, this.unmatched, this.ended, this.aliases];
-    const entries = collections.reduce((sum, values) => sum + values.size, 0)
-      + [...this.ended.values()].reduce((sum, values) => sum + values.length, 0);
-    if (entries <= maxEntries && JSON.stringify(collections.map(values => [...values])).length * 2 <= maxBytes) return;
+    const entries = collections.reduce((sum, values) => sum + values.size, 0) + this.boundaries;
+    if (entries <= maxEntries && this.bytes <= maxBytes) return;
     // Never evict only an old occurrence or its notice tombstone: the next
     // delayed result could then settle a newer run. On saturation the stream
     // becomes a trigger for scoped authoritative recovery until reconnect.
     // No provider mutation or polling is introduced by this fallback.
     collections.forEach(values => values.clear());
+    this.sizes.clear();
+    this.bytes = 38;
+    this.boundaries = 0;
     this.recoveryOnly = true;
   }
 }
