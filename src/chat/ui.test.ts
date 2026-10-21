@@ -2248,6 +2248,138 @@ describe("chat running work reachable without a disclosure", () => {
   });
 });
 
+describe("a question's owed-answer line", () => {
+  // Every case here drives the real wiring from a seed the fake api serves:
+  // no stream event follows a resolution, so a status line can only move by
+  // the interaction handlers themselves — unlike the connected e2e flow,
+  // where the resolution event's own status clear would mask these outcomes.
+  const boot = async (options: { questions?: unknown[]; questionResults?: Array<() => Promise<unknown>> } = {}) => {
+    const { document, window } = parseHTML(html);
+    installDomGlobals(document, window);
+    document.documentElement.setAttribute("data-ui-mode", "desktop");
+    document.documentElement.setAttribute("data-chat-panel", "open");
+    stubConversationSelect(document);
+    let questionCalls = 0;
+    const questionResults = options.questionResults ?? [async () => ({})];
+    const questionCallsRecord: Array<{ outcome: unknown; answers?: string[][] }> = [];
+    const api = questionApi(document, {
+      items: () => [{ id: "message:u", type: "user_message", createdAt: 1, text: "please answer" }, {
+        id: "question:q1", type: "question", createdAt: 2, requestId: "q1", status: "pending",
+        questions: options.questions ?? [{
+          prompt: "Which branch?", header: "Branch", multiple: false, allowFreeForm: true,
+          optional: false, options: [{ label: "main", description: "" }],
+        }],
+      }],
+    });
+    Object.assign(api, {
+      question: async (_conversationId: string, _interactionId: string, _requestId: string, outcome: unknown) => {
+        questionCallsRecord.push({ outcome, answers: (outcome as { answers?: string[][] })?.answers });
+        return await questionResults[Math.min(questionCalls++, questionResults.length - 1)]?.();
+      },
+    });
+    await import(`./ui.ts?owed-line=${Date.now()}`).then(({ initChat }) => initChat(api));
+    const card = await waitForQuestionCard(document);
+    const state = () => document.querySelector("#chat-state")?.textContent ?? "";
+    return { document, window, card, state, questionCallsRecord };
+  };
+
+  test("a Next advance keeps the line naming the required steps still outstanding", async () => {
+    const { window, card, state } = await boot({ questions: [
+      { prompt: "Q1 — Scope", header: "Which surfaces", multiple: false, allowFreeForm: true, options: [{ label: "Timeline only", description: "" }] },
+      { prompt: "Q2 — Depth", header: "How deep", multiple: false, optional: true, allowFreeForm: true, options: [{ label: "Smoke", description: "" }] },
+      { prompt: "Q3 — Report", header: "How reported", multiple: false, optional: true, allowFreeForm: true, options: [{ label: "Quiet", description: "" }] },
+    ] });
+    try {
+      const form = card.querySelector("form[data-question-form]")!;
+      const submitForm = () => form.dispatchEvent(new window.Event("submit", { bubbles: true, cancelable: true }));
+      // linkedom tracks no form association, so the tabs and radio are handed
+      // their form the way the other harness cases hand over one.
+      const goto = (index: number) => {
+        const tab = card.querySelector<HTMLElement>(`[data-question-tab="${index}"]`)!;
+        Object.defineProperty(tab, "form", { configurable: true, value: form });
+        tab.dispatchEvent(new window.Event("click", { bubbles: true }));
+      };
+      const panel = (index: string) => card.querySelector(`[data-question-panel="${index}"]`) as HTMLElement;
+
+      // The empty required step holds the wizard with the owed line naming it.
+      submitForm();
+      expect(state()).toContain("Still to answer");
+      expect(state()).toContain("Which surfaces");
+      // Tab to the optional empty step: the line stands, naming what is owed.
+      goto(1);
+      expect(panel("1").hidden).toBe(false);
+      expect(state()).toContain("Which surfaces");
+      // Next past the optional empty step: the advance must not clear the line
+      // while the required step stands unanswered — the tab path and the
+      // advance route must settle the same whole-form outstanding set.
+      submitForm();
+      expect(panel("2").hidden).toBe(false);
+      expect(state()).toContain("Still to answer");
+      expect(state()).toContain("Which surfaces");
+      // Answering the required step that holds the line retires it — nothing
+      // outstanding remains (Q2 and Q3 were optional).
+      goto(0);
+      const choice = card.querySelector<HTMLInputElement>('[data-question-panel="0"] input[type="radio"]')!;
+      Object.defineProperty(choice, "form", { configurable: true, value: form });
+      choice.checked = true;
+      choice.dispatchEvent(new window.Event("change", { bubbles: true }));
+      submitForm();
+      expect(state()).not.toContain("Still to answer");
+    } finally {
+      window.dispatchEvent(new Event("pagehide"));
+    }
+  });
+
+  test("a successful rejection retires the line a required submit raised", async () => {
+    const { window, card, state } = await boot();
+    try {
+      // The empty required question raises the owed line.
+      card.querySelector("form[data-question-form]")!.dispatchEvent(new window.Event("submit", { bubbles: true, cancelable: true }));
+      expect(state()).toContain("Still to answer");
+      expect(state()).toContain("Branch");
+      // Rejection resolves the request; the line a rejection leaves behind has
+      // no reader left, so the guarded cleanup retires it with the form.
+      card.querySelector<HTMLInputElement>("[data-question-reject]")!.dispatchEvent(new window.Event("click", { bubbles: true }));
+      await Bun.sleep(20);
+      expect(state()).not.toContain("Still to answer");
+    } finally {
+      window.dispatchEvent(new Event("pagehide"));
+    }
+  });
+
+  test("a failed rejection speaks the failure and keeps the line standing", async () => {
+    const { window, card, state } = await boot({ questionResults: [async () => { throw new Error("the question service refused"); }] });
+    try {
+      card.querySelector("form[data-question-form]")!.dispatchEvent(new window.Event("submit", { bubbles: true, cancelable: true }));
+      expect(state()).toContain("Still to answer");
+      card.querySelector<HTMLInputElement>("[data-question-reject]")!.dispatchEvent(new window.Event("click", { bubbles: true }));
+      await Bun.sleep(20);
+      // The failure is the status now: the line names it and stands.
+      expect(state()).toContain("the question service refused");
+    } finally {
+      window.dispatchEvent(new Event("pagehide"));
+    }
+  });
+
+  test("a successful rejection leaves a newer unrelated status alone", async () => {
+    // A failed rejection puts a refusal on the line; a later successful
+    // rejection of the still-pending question must not take that refusal down.
+    const { window, card, state } = await boot({ questionResults: [async () => { throw new Error("the question service refused"); }, async () => ({})] });
+    try {
+      card.querySelector("form[data-question-form]")!.dispatchEvent(new window.Event("submit", { bubbles: true, cancelable: true }));
+      expect(state()).toContain("Still to answer");
+      card.querySelector<HTMLInputElement>("[data-question-reject]")!.dispatchEvent(new window.Event("click", { bubbles: true }));
+      await Bun.sleep(20);
+      expect(state()).toContain("the question service refused");
+      card.querySelector<HTMLInputElement>("[data-question-reject]")!.dispatchEvent(new window.Event("click", { bubbles: true }));
+      await Bun.sleep(20);
+      expect(state()).toContain("the question service refused");
+    } finally {
+      window.dispatchEvent(new Event("pagehide"));
+    }
+  });
+});
+
 function taskApi(document: Document, options: {
   items: (conversationId: string) => unknown[];
   stop?: (taskId: string) => void;

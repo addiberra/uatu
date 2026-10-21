@@ -48,3 +48,24 @@ alike.
 #### Scenario: Selected and unselected options are told apart
 - **WHEN** a multi-select question is presented with some options chosen
 - **THEN** each chosen option reads as chosen and each unchosen option reads as unchosen, from the row's own presentation, at narrow and wide viewports
+
+### Requirement: The owed-answer line follows the form's outstanding required steps
+A multi-question form whose required validation spoke the owed-answer line
+onto a surface's status region SHALL keep that line accurate as the form
+stands — wherever the reader navigates or submits — and SHALL speak it only
+while it is the region's current news. The line SHALL name the outstanding
+required steps, not the step last left.
+
+#### Scenario: An optional empty step does not retire or rewrite a required step's line
+- **WHEN** a required step's Next has raised the owed-answer line, and the reader then presses Next past an optional empty step (or tabs across one)
+- **THEN** the line survives into the next step, still naming the required steps that remain outstanding
+- **AND** once no required step is outstanding, the line retires
+
+#### Scenario: A successful rejection retires the line it left behind
+- **WHEN** a question is rejected after a required validation error raised the owed-answer line
+- **THEN** the successful resolution retires that line along with the form
+- **AND** a failed rejection leaves the failure's own status standing, with no owed-line cleanup behind it
+
+#### Scenario: An unrelated status is never spoken over
+- **WHEN** the status region holds a newer message an outside owner spoke — an outage, a refusal, a turn failure
+- **THEN** the owed-answer settlement leaves it standing, whether the form was advanced, rejected, or answered

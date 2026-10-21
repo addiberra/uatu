@@ -289,4 +289,84 @@ test.describe("desktop", () => {
     // A settled form drops the answered options: no residual selection state.
     await expect(card.locator(".chat-question-option input:checked")).toHaveCount(0);
   });
+
+  // The advance branch owes its line to the whole form, not the step being
+  // left: a required Q1 failed Next earlier, then an optional empty Q2 behind
+  // Next must not clear the owed line while Q1 still stands. The tab path
+  // already keeps the form-wide outstanding set; the two must not diverge.
+  test("the Next advance keeps the owed line naming the required steps still outstanding", async ({ page, request }) => {
+    await request.post("/__e2e/reset");
+    const token = await request.get("/__e2e/terminal-token").then(r => r.json()) as { token: string };
+    const seeded = await request.post("/__e2e/chat", { data: { action: "seed", title: "Three steps", items: [] } })
+      .then(r => r.json() as Promise<{ conversation: { id: string } }>);
+    await request.post("/__e2e/chat", { data: { action: "item", conversationId: seeded.conversation.id, item: {
+      id: "question:q-steps", type: "question", createdAt: 1, requestId: "q-steps", status: "pending",
+      questions: [
+        { prompt: "Q1 — Scope", header: "Which surfaces should this pass cover", multiple: false, allowFreeForm: false, options: [{ label: "Timeline only", description: "" }, { label: "Whole chat", description: "" }] },
+        { prompt: "Q2 — Depth", header: "How deep should coverage go", multiple: false, optional: true, allowFreeForm: false, options: [{ label: "Smoke", description: "" }, { label: "Thorough", description: "" }] },
+        { prompt: "Q3 — Report", header: "How should results be reported", multiple: false, optional: true, allowFreeForm: false, options: [{ label: "Quiet", description: "" }, { label: "Verbose", description: "" }] },
+      ],
+    } } });
+    await page.goto(`/?t=${encodeURIComponent(token.token)}`);
+    await openChat(page);
+    await expect(page.locator("#chat-conversation-select")).toHaveValue(seeded.conversation.id, { timeout: 15_000 });
+    const card = page.locator('[data-chat-item-id="question:q-steps"]');
+    const next = card.locator("[data-question-primary]");
+
+    // The empty required step holds the wizard with the owed line naming it.
+    await next.click();
+    await expect(page.locator("#chat-state")).toContainText("Still to answer");
+    await expect(page.locator("#chat-state")).toContainText("Which surfaces should this pass cover");
+    // Tab to the optional empty step: the line stands, naming what is owed.
+    await card.locator('[data-question-tab="1"]').click();
+    await expect(page.locator("#chat-state")).toContainText("Which surfaces should this pass cover");
+    // Next past the optional empty step: the advance must not clear the line
+    // while the required step stands unanswered — the line names the form's
+    // outstanding required steps, and Q2 was never one of them.
+    await next.click();
+    await expect(card.locator('[data-question-panel="2"]')).toBeVisible();
+    await expect(page.locator("#chat-state")).toContainText("Still to answer");
+    await expect(page.locator("#chat-state")).toContainText("Which surfaces should this pass cover");
+    // Answer the required step that held the line: retiring it clears the
+    // line only once nothing is outstanding — Q2 and Q3 were optional.
+    await card.locator('[data-question-tab="0"]').click();
+    await card.locator('.chat-question-panel:not([hidden]) .chat-question-option input').first().check();
+    await next.click();
+    await expect(card.locator('[data-question-panel="1"]')).toBeVisible();
+    await expect(page.locator("#chat-state")).not.toContainText("Still to answer");
+    await next.click();
+    await expect(card.locator('[data-question-panel="2"]')).toBeVisible();
+    await next.click();
+    await expect(card.locator(".chat-request-trace")).toHaveText("Answered");
+  });
+
+  // A required validation error leaves the owed line on the status region.
+  // Rejecting the question retires the form — the line it was speaking has no
+  // reader left, so a successful rejection must retire it too, still through
+  // the guarded cleanup that never speaks over an unrelated status.
+  test("a successful rejection retires the owed-answer line it left behind", async ({ page, request }) => {
+    await request.post("/__e2e/reset");
+    const token = await request.get("/__e2e/terminal-token").then(r => r.json()) as { token: string };
+    const seeded = await request.post("/__e2e/chat", { data: { action: "seed", title: "Rejected question", items: [] } })
+      .then(r => r.json() as Promise<{ conversation: { id: string } }>);
+    await request.post("/__e2e/chat", { data: { action: "item", conversationId: seeded.conversation.id, item: {
+      id: "question:q-reject", type: "question", createdAt: 1, requestId: "q-reject", status: "pending",
+      questions: [
+        { prompt: "Q1 — Scope", header: "Which surfaces should this pass cover", multiple: false, allowFreeForm: false, options: [{ label: "Timeline only", description: "" }, { label: "Whole chat", description: "" }] },
+      ],
+    } } });
+    await page.goto(`/?t=${encodeURIComponent(token.token)}`);
+    await openChat(page);
+    await expect(page.locator("#chat-conversation-select")).toHaveValue(seeded.conversation.id, { timeout: 15_000 });
+    const card = page.locator('[data-chat-item-id="question:q-reject"]');
+
+    // The empty required question raises the owed line on the status region.
+    await card.locator("[data-question-primary]").click();
+    await expect(page.locator("#chat-state")).toContainText("Still to answer");
+    await expect(page.locator("#chat-state")).toContainText("Which surfaces should this pass cover");
+    // Rejecting resolves the form; the line must go with it.
+    await card.locator("[data-question-reject]").click();
+    await expect(card.locator(".chat-request-trace")).toHaveText("Rejected");
+    await expect(page.locator("#chat-state")).not.toContainText("Still to answer");
+  });
 });

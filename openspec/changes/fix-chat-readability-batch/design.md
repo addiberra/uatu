@@ -64,6 +64,17 @@ the only statement. Skill-loading rows parse their input in
   ties the tick to a real selection, leaving the optional-empty gating of
   the Answer button intact. Synthetic fixtures with short headers had
   hidden both defects; the e2e now seeds the live form's shape.
+- **Review round 2, one owned line for the whole form (#533 findings)**:
+  the owed-answer line stays a single status-region message that names what
+  the form still owes — not what was last left. Tab navigation and the Next
+  advance settle the same whole-form outstanding set through one helper, so
+  an optional empty behind Next can neither clear nor speech over a required
+  step's line. A successful rejection retires the line beside the form it
+  leaves (guarded, success-only: a failed rejection's own status and any
+  newer unrelated message stand untouched). The unit regression tests run
+  the wired handler in linkedom because the connected e2e flow's own
+  resolution event overwrites the status region, which would mask the
+  finding.
 
 ## Risks / Trade-offs
 
