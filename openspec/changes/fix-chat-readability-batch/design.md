@@ -69,12 +69,25 @@ the only statement. Skill-loading rows parse their input in
   the form still owes — not what was last left. Tab navigation and the Next
   advance settle the same whole-form outstanding set through one helper, so
   an optional empty behind Next can neither clear nor speech over a required
-  step's line. A successful rejection retires the line beside the form it
-  leaves (guarded, success-only: a failed rejection's own status and any
-  newer unrelated message stand untouched). The unit regression tests run
-  the wired handler in linkedom because the connected e2e flow's own
-  resolution event overwrites the status region, which would mask the
-  finding.
+  step's line, and the Next gate names the whole remaining set on first
+  press and on repeat. A successful rejection retires the line beside the
+  form it leaves (guarded, success-only: a failed rejection's own status and
+  any newer unrelated message stand untouched).
+- **Review round 3, per-question line ownership (#533 findings)**: the line
+  is a shared resource — every surface routes its status through one line,
+  and both timelines' wirings (parent's and drill-down's) can raise or
+  retire it — so ownership is recorded per surface against the exact
+  question request (conversation plus `requestId`) in one map shared by the
+  two wirings. A resolution landing after the reader switched conversations
+  — or after the same conversation asked a newer question — retires only the
+  line its own question request raised, never the newer validation behind
+  it; and because the map is shared and the resolve-time routing re-derives
+  the surface, a reject pressed in a drill-down that has since closed still
+  retires the parent surface's mirrored line it is bound to. The prefix the
+  owed messages share is a guard, never the ownership test. The unit
+  regression tests run the wired handler in linkedom because the connected
+  e2e flow's own resolution event overwrites the status region, which would
+  mask the finding.
 
 ## Risks / Trade-offs
 

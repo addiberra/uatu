@@ -72,10 +72,10 @@ advance gate, never the step last left alone.
 - **THEN** the successful resolution retires that line along with the form
 - **AND** a failed rejection leaves the failure's own status standing, with no owed-line cleanup behind it
 
-#### Scenario: A landing resolution retires only its own conversation's line
-- **WHEN** a question's reject or answer is still in flight, the reader switches to another conversation whose required validation raises the owed-answer line, and the in-flight resolution then succeeds
-- **THEN** the line the switched-to conversation raised stays standing
-- **AND** the resolution retires only the line raised by the conversation of the question it resolved, whether the line is on its own surface or the surface it was answered from
+#### Scenario: A landing resolution retires only the line its own question raised
+- **WHEN** a question's reject or answer is still in flight, and meanwhile another conversation's validation — or a newer question of the same conversation — raises the owed-answer line, and the in-flight resolution then succeeds
+- **THEN** the line the newer validation raised stays standing
+- **AND** the resolution retires only the line raised by the exact question request it resolved, with the parent's and the drill-down's timelines sharing the one ownership record, so a reject pressed in a drill-down that has since closed still retires the mirrored line on the surface the retirement's routing ends on
 
 #### Scenario: An unrelated status is never spoken over
 - **WHEN** the status region holds a newer message an outside owner spoke — an outage, a refusal, a turn failure

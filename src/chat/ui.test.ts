@@ -2258,6 +2258,7 @@ describe("a question's owed-answer line", () => {
     questionResults?: Array<() => Promise<unknown>>;
     conversations?: string[];
     itemsFor?: (conversationId: string) => unknown[];
+    capabilities?: string[];
   } = {}) => {
     const { document, window } = parseHTML(html);
     installDomGlobals(document, window);
@@ -2275,6 +2276,7 @@ describe("a question's owed-answer line", () => {
       }],
     }]);
     const api = questionApi(document, {
+      capabilities: options.capabilities,
       conversations: options.conversations,
       items: itemsFor,
     });
@@ -2285,7 +2287,10 @@ describe("a question's owed-answer line", () => {
       },
     });
     await import(`./ui.ts?owed-line=${Date.now()}`).then(({ initChat }) => initChat(api));
-    const card = await waitForQuestionCard(document);
+    // The first question card the timeline mounts, whichever requestId it
+    // carries — per-test items name their own questions.
+    await waitUntil(() => document.querySelector("[data-chat-item-id] form[data-question-form]") != null);
+    const card = document.querySelector<HTMLElement>("[data-chat-item-id] form[data-question-form]")!.closest<HTMLElement>("[data-chat-item-id]")!;
     const state = () => document.querySelector("#chat-state")?.textContent ?? "";
     return { document, window, card, state, questionCallsRecord };
   };
@@ -2382,12 +2387,12 @@ describe("a question's owed-answer line", () => {
   });
 
   test("an in-flight rejection leaves another conversation's owed line standing", async () => {
-    // A reject whose request is still in the air, answered form gone for good:
-    // while it flies, the reader switches to a second conversation and raises
-    // the owed line for that one. When the reject eventually lands, its
-    // cleanup retires its own line only — the prefix the two share cannot be
-    // what follows it over the other conversation's raised line.
-    const rejectA = deferred<void>();
+    // A reject whose request is still in the air: while it flies, the reader
+    // switches to a second conversation and raises the owed line for that
+    // one. When the reject eventually lands, its cleanup retires its own
+    // line only — the prefix the two messages share cannot be what lets it
+    // follow over the other conversation's raised line.
+    const rejectOne = deferred<void>();
     const { window, document, card, state } = await boot({
       conversations: ["one", "two"],
       itemsFor: conversationId => [
@@ -2395,18 +2400,20 @@ describe("a question's owed-answer line", () => {
         {
           id: conversationId === "one" ? "question:q1" : "question:q2", type: "question", createdAt: 2,
           requestId: conversationId, status: "pending",
-          questions: [{ prompt: "Which branch?", header: "Branch", multiple: false, allowFreeForm: true, options: [{ label: "main", description: "" }] }],
+          questions: [{
+            prompt: conversationId === "one" ? "Which branch?" : "Which region?", header: conversationId === "one" ? "Branch" : "Region",
+            multiple: false, allowFreeForm: true, options: [{ label: "main", description: "" }],
+          }],
         },
       ],
-      questionResults: [() => rejectA.promise],
+      questionResults: [() => rejectOne.promise],
     });
     try {
       // Conversation one raises the owed line, then its reject goes out and
       // hangs in the api stub.
       card.querySelector("form[data-question-form]")!.dispatchEvent(new window.Event("submit", { bubbles: true, cancelable: true }));
-      expect(state()).toContain("Still to answer");
+      expect(state()).toBe("Still to answer: Branch");
       card.querySelector<HTMLInputElement>("[data-question-reject]")!.dispatchEvent(new window.Event("click", { bubbles: true }));
-      await Bun.sleep(5);
       // The reader switches to conversation two; its empty required submit
       // raises the same-shared line for that conversation.
       const select = document.querySelector<HTMLSelectElement>("#chat-conversation-select")!;
@@ -2415,11 +2422,109 @@ describe("a question's owed-answer line", () => {
       await waitUntil(() => document.querySelector('[data-chat-item-id="question:q2"] form[data-question-form]') != null);
       document.querySelector<HTMLElement>('[data-chat-item-id="question:q2"]')!.querySelector("form[data-question-form]")!
         .dispatchEvent(new window.Event("submit", { bubbles: true, cancelable: true }));
-      expect(state()).toContain("Still to answer");
-      // The hanging reject lands: conversation two's line stays standing.
-      rejectA.resolve();
-      await Bun.sleep(20);
-      expect(state()).toContain("Still to answer");
+      expect(state()).toBe("Still to answer: Region");
+      // The hanging reject lands after one macrotask: every continuation
+      // beyond the resolve is a microtask, so settling past one timeout
+      // observes the cleanup deterministically — conversation two's line
+      // stays standing.
+      rejectOne.resolve();
+      await flush();
+      expect(state()).toBe("Still to answer: Region");
+    } finally {
+      window.dispatchEvent(new Event("pagehide"));
+    }
+  });
+
+  test("an old in-flight rejection does not erase a newer question's raised line (A to B to A)", async () => {
+    // The reader defers conversation A's rejection, switches to B, returns
+    // to A — where the conversation now carries a newer question — and
+    // raises that newer question's line. The old rejection landing then
+    // must not take the newer question's line down: the line's ownership
+    // names the exact question request that raised it, not merely the
+    // conversation both belong to.
+    const rejectOld = deferred<void>();
+    let firstVisit = true;
+    const questionItem = (requestId: string, header: string) => ({
+      id: `question:${requestId}`, type: "question", createdAt: 2, requestId, status: "pending",
+      questions: [{ prompt: header, header, multiple: false, allowFreeForm: true, options: [{ label: "main", description: "" }] }],
+    });
+    const { window, document, state } = await boot({
+      conversations: ["one", "two"],
+      itemsFor: conversationId => [
+        { id: "message:u", type: "user_message", createdAt: 1, text: "please answer" },
+        conversationId === "two"
+          ? questionItem("q-b", "B")
+          : questionItem(firstVisit ? "q-old" : "q-new", firstVisit ? "Old A" : "New A"),
+      ],
+      questionResults: [() => rejectOld.promise],
+    });
+    try {
+      const select = document.querySelector<HTMLSelectElement>("#chat-conversation-select")!;
+      const findCard = (requestId: string) => document.querySelector<HTMLElement>(`[data-chat-item-id="question:${requestId}"]`)!;
+      const submitCard = (cardElement: HTMLElement) => cardElement.querySelector("form[data-question-form]")!.dispatchEvent(new window.Event("submit", { bubbles: true, cancelable: true }));
+      const selectConversation = async (id: string, card: string) => {
+        select.value = id;
+        select.dispatchEvent(new window.Event("change", { bubbles: true }));
+        await waitUntil(() => document.querySelector(`[data-chat-item-id="question:${card}"] form[data-question-form]`) != null);
+      };
+
+      submitCard(findCard("q-old"));
+      expect(state()).toBe("Still to answer: Old A");
+      findCard("q-old").querySelector<HTMLInputElement>("[data-question-reject]")!.dispatchEvent(new window.Event("click", { bubbles: true }));
+      await selectConversation("two", "q-b");
+      submitCard(findCard("q-b"));
+      expect(state()).toBe("Still to answer: B");
+      firstVisit = false;
+      await selectConversation("one", "q-new");
+      submitCard(findCard("q-new"));
+      expect(state()).toBe("Still to answer: New A");
+      // The old rejection lands: the newer question's line stays standing.
+      rejectOld.resolve();
+      await flush();
+      expect(state()).toBe("Still to answer: New A");
+    } finally {
+      window.dispatchEvent(new Event("pagehide"));
+    }
+  });
+
+  test("a drilldown rejection retires the parent surface's mirrored validation line", async () => {
+    // A subagent's question mirrored onto the parent timeline raises the
+    // parent's line; the reject is pressed from the child's own drill-down
+    // and lands only after the drill-down closed. The retirement must find
+    // its way back to the parent surface's line: both wirings share the one
+    // ownership record, and the resolve-time surface routing ends at the
+    // parent once the drill-down is gone.
+    const rejectMirrored = deferred<void>();
+    const mirroredItem = {
+      id: "question:mirrored", type: "question", createdAt: 2, requestId: "mirrored",
+      conversationId: "child", status: "pending",
+      questions: [{ prompt: "Which import?", header: "Mirrored", multiple: false, allowFreeForm: true, options: [{ label: "main", description: "" }] }],
+    };
+    const { window, document, state } = await boot({
+      capabilities: ["questions", "subagents", "background-tasks"],
+      itemsFor: conversationId => conversationId === "one" ? [
+        { id: "message:u", type: "user_message", createdAt: 1, text: "ask the child" },
+        { id: "task:child", type: "background_task", createdAt: 1, taskId: "child", description: "The child", taskType: "local_agent", status: "running", childConversationId: "child", foreground: true },
+        mirroredItem,
+      ] : [mirroredItem],
+      questionResults: [() => rejectMirrored.promise],
+    });
+    try {
+      const click = (element: Element) => element.dispatchEvent(new window.Event("click", { bubbles: true }));
+      // The mirrored card raises the parent's line.
+      const parentCard = document.querySelector<HTMLElement>('[data-chat-item-id="question:mirrored"]')!;
+      parentCard.querySelector("form[data-question-form]")!.dispatchEvent(new window.Event("submit", { bubbles: true, cancelable: true }));
+      expect(state()).toBe("Still to answer: Mirrored");
+      // The reject goes out from the drill-down and hangs in the api stub;
+      // the reader closes the drill-down while it flies.
+      click(document.querySelector('#chat-subagents [data-open-conversation="child"]')!);
+      await waitUntil(() => document.querySelector('#chat-drilldown-items [data-chat-item-id="question:mirrored"] [data-question-reject]') != null);
+      click(document.querySelector('#chat-drilldown-items [data-chat-item-id="question:mirrored"] [data-question-reject]')!);
+      click(document.querySelector("#chat-drilldown-back")!);
+      // The rejection lands: the line it is bound to retires.
+      rejectMirrored.resolve();
+      await flush();
+      expect(state()).toBe("");
     } finally {
       window.dispatchEvent(new Event("pagehide"));
     }
@@ -2707,4 +2812,14 @@ async function waitUntil(predicate: () => boolean, describe = () => "Chat UI sta
     await Bun.sleep(1);
   }
   throw new Error(`timed out waiting for ${describe()}`);
+}
+
+/**
+ * One macrotask of settle: everything an already-started async resolution
+ * still owes the test runs as microtasks, which all drain before a timeout
+ * fires — so awaiting one timeout observes their outcome deterministically,
+ * unlike a sleep racing the chain at some arbitrary depth.
+ */
+function flush(): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, 0));
 }

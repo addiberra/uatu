@@ -5,9 +5,9 @@ max_score: 40
 na_heuristics: 
 p0_count: 0
 p1_count: 2
-target_identity: "file:/Users/andreas/src/github.com/addiberra/uatu-fork.worktrees/fix-chat-readability-batch/src/chat/timeline-renderer.ts"
+target_identity: "file:src/chat/timeline-renderer.ts"
 target_fingerprint: "sha256:5bd23184206176254115248e7fd69d494bda9158a316aa4f78b016a0b33ca9d4"
-target_path: /Users/andreas/src/github.com/addiberra/uatu-fork.worktrees/fix-chat-readability-batch/src/chat/timeline-renderer.ts
+target_path: src/chat/timeline-renderer.ts
 timestamp: 2026-10-18T16-20-39Z
 slug: src-chat-timeline-renderer-ts
 ---

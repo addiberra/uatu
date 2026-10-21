@@ -848,6 +848,19 @@ export function initChat(api = new ChatApiClient()): void {
   const interruptionsOwnerFor = (source: ChatProjection) =>
     child && source.conversationId === child.conversationId ? childInterruptions : interruptions;
 
+  // Which question request currently owns each surface's owed-answer line —
+  // the parent's line and the drill-down's are one resource each, shared by
+  // every conversation and card that surface shows, so the timeline wirings
+  // (one per surface, separate closures) must read and write this one map.
+  // The key is the exact question request — its conversation plus its
+  // requestId — not merely the conversation: one conversation can ask again
+  // (or carry a newer mirrored card) while an earlier question's resolve
+  // still sits in flight, and a resolution landing then must never retire
+  // the newer question's line.
+  const owedAnswerOwners = new Map<Announcer, string>();
+  const questionOwnershipKey = (source: ChatProjection, item: Extract<ConversationItem, { type: "question" }>) =>
+    `${item.conversationId ?? source.conversationId}\u0000${item.requestId}`;
+
   const geometryOf = (scroller: HTMLElement, container: HTMLElement): AnchorGeometry => {
     const bounds = scroller.getBoundingClientRect();
     return {
@@ -3668,7 +3681,8 @@ export function initChat(api = new ChatApiClient()): void {
         // the same guarded cleanup the answer path runs, so a failure's own
         // status and any newer unrelated message are never taken down. The
         // card's own item stays bound: the cleanup retires only the line
-        // this item's conversation raised, never one another conversation
+        // this exact question request raised, never one another question —
+        // of another conversation, or a newer one of this conversation —
         // raised while the request sat in flight.
         void resolveQuestion(source, item.id, { kind: "rejected" }).then(resolved => { if (resolved) clearOwedAnswer(source, item); });
       }
@@ -3715,22 +3729,18 @@ export function initChat(api = new ChatApiClient()): void {
     // becomes valid — but only while the line still reads as ours: a newer
     // unrelated status (an outage, a refusal) is never spoken over. The
     // interruption owner re-states its message when the blank replaces it.
-    // "Ours" is the conversation whose form raised the line, tracked beside
-    // the announcer: the same status line is one resource every conversation
-    // viewed on a surface speaks through, so a prefix match alone cannot
-    // separate one conversation's owed line from another's — an in-flight
-    // resolve landing after a switch (conversation A to B, or B back to A)
-    // would otherwise retire whatever validation the switched-to conversation
-    // raised behind it.
-    const owedAnswerOwner = new Map<Announcer, string>();
-    const conversationOfQuestion = (source: ChatProjection, item: Extract<ConversationItem, { type: "question" }>) =>
-      item.conversationId ?? source.conversationId;
+    // "Ours" is the exact question request that raised the line, tracked in
+    // the shared per-surface map (`owedAnswerOwners`): the prefix two cards'
+    // messages can share says nothing about who raised it, so retirement
+    // without an ownership check would take down whichever validation is on
+    // the line — another conversation's, or a newer question of this one —
+    // whenever an in-flight resolve lands after it.
     const clearOwedAnswer = (source: ChatProjection, item: Extract<ConversationItem, { type: "question" }>) => {
       const spoken = announceFailureFor(source);
-      if (owedAnswerOwner.get(spoken) !== conversationOfQuestion(source, item)) return;
+      if (owedAnswerOwners.get(spoken) !== questionOwnershipKey(source, item)) return;
       if (spoken.current().startsWith("Still to answer")) {
         spoken("");
-        owedAnswerOwner.delete(spoken);
+        owedAnswerOwners.delete(spoken);
         interruptionsOwnerFor(source).restoreOwned();
       }
     };
@@ -3791,12 +3801,13 @@ export function initChat(api = new ChatApiClient()): void {
     // attached to the owned interruption before, never re-attached onto an
     // unrelated status. Repeated submits count as the known write they are:
     // while a stream of the surface is down, the affordance stands again on
-    // every press of an empty required step. The message records the
-    // conversation whose form raised it: only that conversation may retire
-    // the line later.
+    // every press of an empty required step. The message records the exact
+    // question request that raised it (the shared `owedAnswerOwners` map,
+    // keyed per surface): only that question's resolution may retire the
+    // line later.
     const speakOwedAnswer = (source: ChatProjection, item: Extract<ConversationItem, { type: "question" }>, message: string) => {
       const spoken = announceFailureFor(source);
-      owedAnswerOwner.set(spoken, conversationOfQuestion(source, item));
+      owedAnswerOwners.set(spoken, questionOwnershipKey(source, item));
       const owner = interruptionsOwnerFor(source);
       const wasRecovering = owner.isShowingOwned();
       spoken(message, true);
@@ -3815,9 +3826,10 @@ export function initChat(api = new ChatApiClient()): void {
     // newer unrelated status (an outage, a refusal) is never spoken over. Tab
     // navigation and the Next advance owe the line to the same whole form, so
     // they settle it together here rather than in diverging copies. Each
-    // raising and refresh records which conversation owes the line, so a
-    // resolution landing after the reader switched conversations can never
-    // retire the line another conversation raised.
+    // raising and refresh records the exact question request that owes the
+    // line (the shared per-surface map), so a resolution landing after the
+    // reader switched conversations — or asked this conversation again — can
+    // never retire another question's line.
     const settleOwedAnswer = (source: ChatProjection, item: Extract<ConversationItem, { type: "question" }>, form: HTMLFormElement) => {
       const outstanding = collectQuestionAnswers(form).flatMap((answer, index) => answer.length === 0 && !item.questions[index]?.optional ? [index] : []);
       if (outstanding.length === 0) {
