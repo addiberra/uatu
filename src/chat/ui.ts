@@ -3762,7 +3762,18 @@ export function initChat(api = new ChatApiClient()): void {
         const item = source.items.find(candidate => candidate.id === itemId);
         if (item?.type === "question") {
           const outstanding = collectQuestionAnswers(tab.form).flatMap((answer, index) => answer.length === 0 && !item.questions[index]?.optional ? [index] : []);
-          if (outstanding.length === 0) clearOwedAnswer(source);
+          if (outstanding.length === 0) {
+            clearOwedAnswer(source);
+          } else {
+            // Outstanding required steps remain — but the line must name
+            // them as they stand: a satisfied step the message still names
+            // gets retired here, and the message refreshes to the current
+            // outstanding set, only while the line is still ours.
+            const spoken = announceFailureFor(source);
+            if (spoken.current().startsWith("Still to answer")) {
+              speakOwedAnswer(source, `Still to answer: ${outstanding.map(index => item.questions[index]!.header || item.questions[index]!.prompt || "the current question").filter(Boolean).join(", ")}`);
+            }
+          }
         }
       }
       showQuestionPanel(tab.form, Number(tab.dataset.questionTab));
