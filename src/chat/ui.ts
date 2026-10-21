@@ -3750,8 +3750,22 @@ export function initChat(api = new ChatApiClient()): void {
     container.addEventListener("click", event => {
       const tab = (event.target as Element).closest<HTMLButtonElement>("[data-question-tab]");
       if (!tab?.form) return;
-      showQuestionPanel(tab.form, Number(tab.dataset.questionTab));
       const source = sourceProjection();
+      // Tab navigation leaves the current panel in whatever state it holds:
+      // if it now carries an answer (or is optional and may be left empty),
+      // its previously spoken owed-answer line is stale and goes — without
+      // touching a newer unrelated status.
+      const leaving = tab.form.querySelector<HTMLElement>("[data-question-panel]:not([hidden])");
+      if (source && leaving) {
+        const leavingIndex = Number(leaving.dataset.questionPanel);
+        const itemId = tab.form.closest<HTMLElement>("[data-chat-item-id]")?.dataset.chatItemId;
+        const item = source.items.find(candidate => candidate.id === itemId);
+        if (item?.type === "question") {
+          const satisfied = collectQuestionAnswers(tab.form)[leavingIndex]!.length > 0 || item.questions[leavingIndex]?.optional === true;
+          if (satisfied) clearOwedAnswer(source);
+        }
+      }
+      showQuestionPanel(tab.form, Number(tab.dataset.questionTab));
       if (source) speakQuestionStep(source, tab.form);
     });
     // A required empty stops here with the owed-answer message the final
@@ -3759,12 +3773,14 @@ export function initChat(api = new ChatApiClient()): void {
     // the status line's text, but the outage's recovery affordance keeps
     // standing beside it exactly as it stood — attached only when it was
     // attached to the owned interruption before, never re-attached onto an
-    // unrelated status.
+    // unrelated status. Repeated submits count as the known write they are:
+    // while a stream of the surface is down, the affordance stands again on
+    // every press of an empty required step.
     const speakOwedAnswer = (source: ChatProjection, message: string) => {
       const owner = interruptionsOwnerFor(source);
       const wasRecovering = owner.isShowingOwned();
       announceFailureFor(source)(message, true);
-      if (wasRecovering) owner.keepRecoveryVisible();
+      if (wasRecovering || owner.hasDown()) owner.keepRecoveryVisible();
     };
 
     container.addEventListener("submit", event => {
