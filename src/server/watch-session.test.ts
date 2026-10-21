@@ -428,6 +428,9 @@ describe("watchSession scope", () => {
     } finally { await session.stop(); }
   });
 
+  // The first edit lands right after start and can precede the polling stat
+  // watcher's baseline; the observer's later check (POLL_BASELINE_SETTLE_MS)
+  // reports it then. Both waits must fit in the test's budget.
   test("editing .uatu.json ignore.exclude at runtime reapplies the new patterns", async () => {
     const tempDirectory = await mkdtemp(path.join(os.tmpdir(), "uatu-ignore-live-"));
     tempDirectories.push(tempDirectory);
@@ -464,7 +467,7 @@ describe("watchSession scope", () => {
     } finally {
       await session.stop();
     }
-  });
+  }, 15000);
 });
 
 // A deterministic replacement for the scheduler clock (performance.now/
