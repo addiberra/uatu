@@ -397,9 +397,9 @@ automatic-background outcomes produce no confirmation notices; failed,
 unavailable and unknown guidance remains tied to its source operation; unrelated
 Remove, delivery changes or later successful steers cannot clear it. A Settings
 read failure means that page cannot confirm the saved preference, not that the
-server has disabled a saved ON policy in another tab or device. Desktop
-retains its existing tracks and automatic expansion: detachment collapses only
-an automatically opened duplicate track, not one deliberately reopened.
+server has disabled a saved ON policy in another tab or device. Desktop and
+touch worker details start collapsed and expand only deliberately; that choice
+is retained per conversation across new work, settlement and detachment.
 Desktop cards share only a measured capacity, never an outer scroller. When both
 are collapsed the cap is 40% of the measured chat panel (and 25rem), with the
 lesser of 12rem or 35% reserved for conversation. Expanded cards use the measured

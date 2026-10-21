@@ -4,7 +4,7 @@ import { openChatPanel } from "./chat-helpers";
 import { captureScreenshot, recordEvidence, saveEvidence } from "./evidence";
 import { expect, test as base } from "./fixtures";
 import { withEngineBrowsers } from "./page-diagnostics";
-import { expectWorkTranscriptBudget } from "./work-panel-assertions";
+import { expectWorkLayoutReady, expectWorkTranscriptBudget } from "./work-panel-assertions";
 import { enlargedPendingFixture } from "./enlarged-pending-fixture";
 
 const test = withEngineBrowsers(base);
@@ -1010,7 +1010,7 @@ for (const browserName of ["chromium", "webkit"] as const) test.describe(`steeri
     }, scene);
     await expect(send).toBeEnabled();
     // Wait for viewport ownership/layout before pinning the immutable target.
-    await page.waitForTimeout(150);
+    await expectWorkLayoutReady(page);
     const original = (await send.boundingBox())!;
     const accepted: unknown[] = [];
     page.on("response", async response => { if (response.url().endsWith("/prompts")) accepted.push(await response.json()); });

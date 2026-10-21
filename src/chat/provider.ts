@@ -190,9 +190,14 @@ export type ProviderHistoryPage = {
   // Accounting for the stored messages underlying this page's items.
   accounting: StoredMessageAccounting[];
   // Providers that page locally over a fully loaded transcript can expose the
-  // complete normalized items, so a walker that needs the whole conversation
-  // (title derivation) avoids refetching the transcript once per page.
+  // complete visible normalized items, so a walker that needs the whole
+  // conversation (title derivation) avoids refetching it once per page.
   completeItems?: ConversationItem[];
+  // Internal evidence for inbox withdrawal, not a timeline/wire field. When
+  // visibility filtering can hide delivered inputs (for example a revert),
+  // absence from even completeItems cannot establish cancellation. Positive
+  // visible delivery evidence and explicit inbox settlements remain valid.
+  deliveryHistoryIncomplete?: true;
   nextCursor?: string;
 };
 

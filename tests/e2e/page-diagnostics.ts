@@ -25,7 +25,6 @@
 // personal-state.e2e.ts under load, where this log costs nothing measurable.
 
 import { test as base, type Browser, type BrowserContext, type Page, type TestInfo, type TestType } from "@playwright/test";
-import { recordLinuxWebKitDiagnostics } from "./linux-webkit-diagnostics";
 
 type Engine = "chromium" | "webkit";
 
@@ -121,7 +120,6 @@ async function instrumentContext(context: BrowserContext, log: Log, label: strin
 export type TestBrowser = Pick<Browser, "newContext" | "newPage" | "close" | "version">;
 
 type EngineBrowserFixtures = {
-  context: BrowserContext;
   /** One browser per engine per worker, a fresh context per test (see the
    *  header). Replaces `({ chromium, webkit })[engine].launch()`. */
   launchBrowser: (engine: Engine) => Promise<TestBrowser>;
@@ -137,14 +135,6 @@ type EngineBrowserWorkerFixtures = {
  *  WebKit gets one worker-scoped browser of its own, launched on first use. */
 export function withEngineBrowsers<T extends {}, W extends {}>(test: TestType<T, W>) {
   return test.extend<EngineBrowserFixtures, EngineBrowserWorkerFixtures>({
-    context: async ({ context }, use, testInfo) => {
-      // With config-owned tracing disabled, configured pages and manually
-      // created contexts both use the diagnostic helper as their sole owner.
-      const finish = process.env.UATU_LINUX_WEBKIT_DIAGNOSTIC === "1"
-        ? await recordLinuxWebKitDiagnostics(context, testInfo, "configured") : undefined;
-      try { await use(context); }
-      finally { await finish?.(); }
-    },
     _webkitBrowser: [async ({ playwright }, use) => {
       let launched: Promise<Browser> | undefined;
       // A failed launch is forgotten, so the worker's next test tries again
@@ -163,11 +153,6 @@ export function withEngineBrowsers<T extends {}, W extends {}>(test: TestType<T,
       }
       const log = logFor(testInfo);
       const opened = new Set<BrowserContext>();
-      const diagnosticClosers = new Map<BrowserContext, () => Promise<void>>();
-      const closeContext = async (context: BrowserContext) => {
-        try { await diagnosticClosers.get(context)?.(); }
-        finally { await context.close(); }
-      };
       let contexts = 0;
       await use(async engine => {
         const shared = engine === "chromium" ? chromiumBrowser : await _webkitBrowser();
@@ -179,22 +164,18 @@ export function withEngineBrowsers<T extends {}, W extends {}>(test: TestType<T,
           opened.add(context);
           context.once("close", () => opened.delete(context));
           await instrumentContext(context, log, `[${engine}#${++contexts}]`);
-          if (process.env.UATU_LINUX_WEBKIT_DIAGNOSTIC === "1" && engine === "webkit") {
-            diagnosticClosers.set(context, await recordLinuxWebKitDiagnostics(context, testInfo, `webkit-${contexts}`));
-          }
           return context;
         };
         return {
           newContext,
           newPage: async (...args: Parameters<Browser["newPage"]>) => (await newContext(...args)).newPage(),
-          close: async () => { await Promise.all([...opened].map(closeContext)); },
+          close: async () => { await Promise.all([...opened].map(context => context.close())); },
           version: () => shared.version(),
         };
       });
       // A test that timed out never reached its own `finally`; its contexts
       // must not outlive it in the worker's browser.
-      await Promise.all([...opened].map(context => process.env.UATU_LINUX_WEBKIT_DIAGNOSTIC === "1"
-        ? closeContext(context) : context.close().catch(() => {})));
+      await Promise.all([...opened].map(context => context.close().catch(() => {})));
     },
   });
 }

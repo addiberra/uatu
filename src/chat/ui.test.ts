@@ -33,6 +33,81 @@ if (process.env[CHILD_PROCESS_FLAG] !== "1") {
   });
 } else {
 describe("chat reversible-history composer", () => {
+  for (const firstOutcome of ["steer", "rejected", "unknown", "forced-steer", "queue-with-new-stage"] as const) test(`staged model survives ${firstOutcome} and the next queue uses it`, async () => {
+    const { document, window } = parseHTML(html);
+    installDomGlobals(document, window);
+    document.documentElement.setAttribute("data-ui-mode", "desktop");
+    document.documentElement.setAttribute("data-chat-panel", "open");
+    stubConversationSelect(document);
+    const values = new Map<string, string>();
+    Object.defineProperty(window, "localStorage", { configurable: true, value: {
+      getItem: (key: string) => values.get(key) ?? null,
+      setItem: (key: string, value: string) => values.set(key, value),
+      removeItem: (key: string) => values.delete(key),
+    } });
+    const { presentationLocalStorage } = await import("../shell/presentation-storage");
+    const storage = presentationLocalStorage();
+    storage?.setItem("chat-delivery", firstOutcome === "forced-steer" || firstOutcome === "queue-with-new-stage" ? "queue" : "steer");
+    const model = (name: string): ChatModel => ({ selection: { providerId: "test", modelId: name }, provider: "Test", name });
+    const a = model("A"), b = model("B"), c = model("C");
+    const calls: Array<{ model: unknown; delivery: unknown }> = [];
+    const first = deferred<Awaited<ReturnType<ChatApiClient["prompt"]>>>();
+    let parent: Parameters<ChatApiClient["stream"]>[2] | undefined;
+    const api = {
+      status: async () => [{ agent: { id: "test", name: "Test" }, availability: { state: "ready", version: "test", agent: { id: "test", name: "Test", capabilities: ["models", "steering"] } } }],
+      conversations: async () => [{ ...conversation("one"), status: "running" }], commands: async () => [], models: async () => [a, b, c], modes: async () => [],
+      snapshot: async () => ({ ...snapshot("one"), configuration: { model: a.selection }, conversation: { ...conversation("one"), status: "running" } }),
+      prompt: async (_id: string, _request: string, _text: string, selection: unknown, _mode: unknown, _variant: unknown, _attachments: unknown, delivery: unknown) => {
+        calls.push({ model: selection, delivery });
+        return calls.length === 1 ? first.promise : { messageId: `queued-${calls.length}`, pending: true, delivery: "queue", configuration: { model: selection } };
+      },
+      stream: (_id: string, _cursor: string, handlers: Parameters<ChatApiClient["stream"]>[2]) => { parent = handlers; return { close() {} }; }, inventoryStream: () => ({ close() {} }), attachmentUrl: (id: string) => `/api/chat/attachments/${id}`,
+    } as unknown as ChatApiClient;
+    const { initChat } = await import(`./ui.ts?staged-steer=${firstOutcome}-${Date.now()}`);
+    initChat(api);
+    try {
+      const input = document.querySelector<HTMLTextAreaElement>("#chat-input")!;
+      await waitUntil(() => !input.disabled && document.querySelector('[data-model-value="test/B"]') !== null);
+      const stage = (name: string) => document.querySelector(`[data-model-value="test/${name}"]`)!.dispatchEvent(new window.Event("click", { bubbles: true }));
+      const submit = (text: string) => {
+        input.value = text;
+        input.dispatchEvent(new window.Event("input", { bubbles: true }));
+        document.querySelector("#chat-composer")!.dispatchEvent(new window.Event("submit", { bubbles: true, cancelable: true }));
+      };
+      stage("B");
+      submit("First");
+      await waitUntil(() => calls.length === 1);
+      expect(calls[0]!.model).toEqual(b.selection);
+      if (firstOutcome === "queue-with-new-stage") stage("C");
+      if (firstOutcome === "unknown") {
+        const { ChatTransportError } = await import("./client");
+        first.reject(new ChatTransportError("Operation outcome unknown", 409, "operation_outcome_unknown"));
+      } else if (firstOutcome === "rejected") first.reject(new Error("Steer refused"));
+      else first.resolve({ messageId: "first", pending: true, delivery: firstOutcome === "queue-with-new-stage" ? "queue" : "steer", configuration: { model: firstOutcome === "queue-with-new-stage" ? b.selection : a.selection } });
+      await waitUntil(() => firstOutcome === "rejected"
+        ? document.querySelector("#chat-composer-error")!.textContent!.includes("Draft restored")
+        : firstOutcome === "unknown" ? document.querySelector("#chat-action-feedback")!.textContent!.includes("unconfirmed")
+        : document.querySelector("#chat-queue")!.textContent!.includes("First"));
+      const next = firstOutcome === "queue-with-new-stage" ? c : b;
+      expect(document.querySelector(`[data-model-value="test/${next.name}"]`)!.getAttribute("aria-pressed")).toBe("true");
+      storage?.setItem("chat-delivery", "queue");
+      submit("Next queued work");
+      await waitUntil(() => calls.length === 2);
+      expect(calls[1]).toEqual({ model: next.selection, delivery: "queue" });
+      await waitUntil(() => document.querySelector("#chat-queue")!.textContent!.includes("Next queued work"));
+      // A queue consumes that stage once: a later authoritative config is
+      // visible, not masked forever by the just-submitted staged selection.
+      parent!.event({ type: "conversation.configuration", generation: "g", sequence: 1, conversationId: "one", configuration: { model: a.selection } }, "cursor-one-1");
+      expect(document.querySelector('[data-model-value="test/A"]')!.getAttribute("aria-pressed")).toBe("true");
+      submit("Third queued work");
+      await waitUntil(() => calls.length === 3);
+      expect(calls[2]).toEqual({ model: a.selection, delivery: "queue" });
+    } finally {
+      storage?.removeItem("chat-delivery");
+      window.dispatchEvent(new window.Event("pagehide"));
+    }
+  });
+
   test("unrelated Remove and a later accepted steer cannot resolve an earlier unknown background operation", async () => {
     const { document, window } = parseHTML(html);
     installDomGlobals(document, window);

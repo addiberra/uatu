@@ -652,6 +652,15 @@ describe("OpenCode 2.x provider: history", () => {
     expect(page.items.map(item => item.type)).not.toContain("idle");
     expect(page.items.filter(item => item.type === "user_message")).toHaveLength(1);
   });
+
+  test("complete visible history cannot prove delivery absence across a revert boundary", async () => {
+    const boundary = String(STORED[0]!.id);
+    const reverted = await historyServer({ revert: { messageID: boundary } }).provider().listMessages("ses_h", { limit: 50 });
+    expect(reverted.completeItems).toEqual([]);
+    expect(reverted.deliveryHistoryIncomplete).toBe(true);
+    const unfiltered = await historyServer().provider().listMessages("ses_h", { limit: 50 });
+    expect(unfiltered.deliveryHistoryIncomplete).toBeUndefined();
+  });
 });
 
 describe("OpenCode 2.x provider: prompting and events", () => {

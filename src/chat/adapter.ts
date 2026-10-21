@@ -168,11 +168,11 @@ export class SteerAlreadyDeliveredError extends Error {
 }
 
 // The agent neither confirmed nor denied a withdrawal within the bounded
-// wait and still lists the entry: the steer stays in the dock, and the
-// mutation reports that rather than guessing (D7).
+// wait, and the available list/history cannot establish its outcome. The
+// mutation refuses to return or requeue the input rather than guessing (D7).
 export class SteerWithdrawalUnconfirmedError extends Error {
   constructor() {
-    super("the agent has not confirmed the withdrawal; the message is still pending");
+    super("the agent has not confirmed the withdrawal; delivery is unconfirmed, so the message was not returned or queued again");
     this.name = "SteerWithdrawalUnconfirmedError";
   }
 }
@@ -264,6 +264,8 @@ type PendingSteer = {
   // list that old cannot vouch for either way.
   tick: number;
 };
+
+type SteerAdmission = { id: string; held?: HeldMessage; terminal?: "delivered" | "cancelled"; retired?: true };
 
 // How long a withdrawal waits for the agent's own settlement before deciding
 // from its list and history (D7).
@@ -426,6 +428,9 @@ export class ChatAdapter {
   // Withdrawals waiting for the agent's settlement of an inbox entry (D7).
   private readonly steerSettlements = new Map<string, Map<string, (outcome: "delivered" | "cancelled") => void>>();
   private readonly deliveredSteers = new Map<string, true>();
+  // Only admissions currently awaiting acknowledgement: terminal events must
+  // win even when there was no pending event, or the delivered-id cache evicts.
+  private readonly admittingSteers = new Map<string, SteerAdmission>();
   private readonly steerWithdrawTimeoutMs: number;
   private readonly automaticBackgroundTimeoutMs: number;
   private readonly steerAdmissionTimeoutMs: number;
@@ -1005,6 +1010,8 @@ export class ChatAdapter {
   // nothing else would ever settle its adapter-level records. If it returns,
   // its activity is re-derived from new events.
   private forgetActivity(conversationId: string): void {
+    const admission = this.admittingSteers.get(conversationId);
+    if (admission) admission.retired = true;
     // Owned by it, or announced under it: a child's request appears in its
     // launching conversation, and that conversation's loss settles it too —
     // no child event is guaranteed to follow.
@@ -1058,6 +1065,7 @@ export class ChatAdapter {
   dispose(): Promise<void> {
     if (this.disposalPromise) return this.disposalPromise;
     this.disposed = true;
+    for (const admission of this.admittingSteers.values()) admission.retired = true;
     for (const recovery of this.backgroundRecoveries.values()) clearTimeout(recovery.timer);
     this.backgroundRecoveries.clear();
     for (const pending of this.revertReconciliations.values()) {
@@ -1225,7 +1233,7 @@ export class ChatAdapter {
    * once under the agent's id — the same id its inbox events will name — so
    * the dock, the bound, and the stream agree on one handle.
    */
-  private async admitSteer(conversationId: string, requestId: string, text: string, attachmentRefs: MessageAttachment[], queuedAt = Date.now(), sourceHeld?: HeldMessage): Promise<PendingSteer> {
+  private async admitSteer(conversationId: string, requestId: string, text: string, attachmentRefs: MessageAttachment[], queuedAt = Date.now(), sourceHeld?: HeldMessage): Promise<PendingSteer & { terminal?: "delivered" | "cancelled" }> {
     const providerAttachments = await this.locateAttachments(attachmentRefs);
     const projection = this.projection(conversationId);
     const previousStatus = projection.status;
@@ -1238,13 +1246,15 @@ export class ChatAdapter {
     let accepted: { messageId: string };
     const identity = this.id();
     const nativeId = this.provider.promptIdentity?.(identity) ?? identity;
-    const admission = this.provider.prompt(conversationId, { id: nativeId, text, delivery: "steer", ...(providerAttachments.length ? { attachments: providerAttachments } : {}) });
+    const fence: SteerAdmission = { id: nativeId, held: sourceHeld };
+    this.admittingSteers.set(conversationId, fence);
+    const admission = Promise.resolve().then(() => this.provider.prompt(conversationId, { id: nativeId, text, delivery: "steer", ...(providerAttachments.length ? { attachments: providerAttachments } : {}) }));
     try {
       accepted = await this.boundedSteerAdmission(admission, nativeId);
       if (waking && projection.status === "sending") projection.statusUpdate("running");
     } catch (error) {
       if (waking && projection.status === "sending") projection.statusUpdate(previousStatus);
-      if (error instanceof PrimarySteerOutcomeUnknownError && !this.disposed) {
+      if (error instanceof PrimarySteerOutcomeUnknownError && !this.disposed && !fence.terminal && !fence.retired) {
         if (sourceHeld) {
           sourceHeld.unconfirmedSteerId = nativeId;
           this.publishQueue(conversationId, { kind: "paused", messageId: sourceHeld.id });
@@ -1265,7 +1275,12 @@ export class ChatAdapter {
         }, () => undefined);
       }
       throw error;
+    } finally {
+      if (this.admittingSteers.get(conversationId) === fence) this.admittingSteers.delete(conversationId);
     }
+    // Acceptance is still receipt-keyed, but it cannot recreate terminal
+    // state. The terminal queue event also fences the client's local echo.
+    if (fence.terminal || fence.retired || this.disposed) return { id: accepted.messageId, text, queuedAt, requestId, tick: this.inboxClock, ...(fence.terminal ? { terminal: fence.terminal } : {}) };
     // The agent wakes for a steer: whatever was stranded delivers with it.
     this.lastSettledAt.delete(conversationId);
     return this.recordPendingSteer(conversationId, accepted.messageId, requestId, text, attachmentRefs, queuedAt);
@@ -1316,7 +1331,7 @@ export class ChatAdapter {
         const held = this.heldQueues.get(conversationId)?.find(entry => entry.id === messageId);
         if (!held) {
           if (this.pendingSteers.get(conversationId)?.some(entry => entry.id === messageId)) return { messageId, delivery: "steer" as const };
-          throw this.notPendingError(messageId);
+          throw this.notPendingError(conversationId, messageId);
         }
         const steered = await this.steerHeld(conversationId, held);
         return this.followAcceptedSteer(conversationId, { messageId: steered.id, delivery: "steer" as const }, context);
@@ -1326,7 +1341,7 @@ export class ChatAdapter {
         const held = this.heldQueues.get(conversationId)?.find(entry => entry.id === messageId);
         if (held?.unconfirmedSteerId) throw new PrimarySteerOutcomeUnknownError(held.unconfirmedSteerId);
         if (held) return { messageId, delivery: "queue" as const };
-        throw this.notPendingError(messageId);
+        throw this.notPendingError(conversationId, messageId);
       }
       await this.withdrawSteer(conversationId, steer);
       // Frozen now, as a submission would freeze it: the configuration the
@@ -1398,14 +1413,14 @@ export class ChatAdapter {
           return this.followAcceptedSteer(conversationId, { messageId, delivery: "steer" as const }, context);
         }
         const held = this.heldQueues.get(conversationId)?.find(entry => entry.id === messageId);
-        if (!held) throw this.notPendingError(messageId);
+        if (!held) throw this.notPendingError(conversationId, messageId);
         const steered = await this.steerHeld(conversationId, held);
         return this.followAcceptedSteer(conversationId, { messageId: steered.id, delivery: "steer" as const }, context);
       }
       if (this.turnActive(conversationId, projection)) throw new SendNowUnavailableError();
       const queue = this.heldQueues.get(conversationId) ?? [];
       const index = queue.findIndex(entry => entry.id === messageId);
-      if (index < 0) throw this.notPendingError(messageId);
+      if (index < 0) throw this.notPendingError(conversationId, messageId);
       const held = queue[index]!;
       await this.dispatchPrompt(conversationId, projection, session, {
         messageId: held.id,
@@ -1435,7 +1450,7 @@ export class ChatAdapter {
     const index = queue.indexOf(held);
     if (index >= 0) queue.splice(index, 1);
     if (queue.length === 0) this.heldQueues.delete(conversationId);
-    this.publishQueue(conversationId, { kind: "switched", messageId: steer.id });
+    this.publishQueue(conversationId, { kind: steer.terminal === "delivered" ? "delivered" : steer.terminal === "cancelled" ? "removed" : "switched", messageId: steer.id });
     this.publishPausedChanges(conversationId);
     return steer;
   }
@@ -1444,8 +1459,8 @@ export class ChatAdapter {
     if (!this.agent().capabilities.includes("steering")) throw new SteeringUnsupportedError();
   }
 
-  private notPendingError(messageId: string): Error {
-    return this.deliveredSteers.has(messageId) ? new SteerAlreadyDeliveredError() : new QueuedMessageNotHeldError();
+  private notPendingError(conversationId: string, messageId: string): Error {
+    return this.deliveredSteers.has(JSON.stringify([conversationId, messageId])) ? new SteerAlreadyDeliveredError() : new QueuedMessageNotHeldError();
   }
 
   /**
@@ -1463,32 +1478,71 @@ export class ChatAdapter {
     this.steerSettlements.set(conversationId, waiters);
     let settle!: (outcome: "delivered" | "cancelled" | "timeout") => void;
     const settled = new Promise<"delivered" | "cancelled" | "timeout">(resolve => { settle = resolve; });
-    waiters.set(steer.id, settle);
+    let deliveryObserved = false;
+    const observe = (outcome: "delivered" | "cancelled") => {
+      if (outcome === "delivered") deliveryObserved = true;
+      settle(outcome);
+    };
+    waiters.set(steer.id, observe);
     const timer = setTimeout(() => settle("timeout"), this.steerWithdrawTimeoutMs);
     let outcome: "delivered" | "cancelled" | "timeout";
     try {
       await this.provider.cancelInbox(conversationId, steer.id);
       outcome = await settled;
+      if (outcome === "timeout") {
+        // Keep observing through the read-side fallback: a delivery can
+        // overtake these reads and outlive the bounded delivered-id cache.
+        if (!this.provider.listPendingInbox) throw new SteerWithdrawalUnconfirmedError();
+        const listed = await this.provider.listPendingInbox(conversationId);
+        const rowId = `message:${steer.id}`;
+        const delivered = () => deliveryObserved || this.deliveredSteers.has(JSON.stringify([conversationId, steer.id])) || this.projection(conversationId).has(rowId);
+        if (delivered()) outcome = "delivered";
+        else {
+          if (listed.some(entry => entry.id === steer.id)) throw new SteerWithdrawalUnconfirmedError();
+          outcome = await this.steerHistoryOutcome(conversationId, steer.id);
+          if (delivered()) outcome = "delivered";
+        }
+      }
+      this.forgetSteer(conversationId, steer.id);
+      if (outcome === "delivered") {
+        this.rememberDelivered(conversationId, steer.id);
+        this.publishQueue(conversationId, { kind: "delivered", messageId: steer.id });
+        this.publishPausedChanges(conversationId);
+        throw new SteerAlreadyDeliveredError();
+      }
     } finally {
       clearTimeout(timer);
-      if (waiters.get(steer.id) === settle) waiters.delete(steer.id);
+      if (waiters.get(steer.id) === observe) waiters.delete(steer.id);
       if (waiters.size === 0) this.steerSettlements.delete(conversationId);
     }
-    if (outcome === "timeout") {
-      // No event: decide from the agent's list, then from history.
-      const listed = await this.provider.listPendingInbox?.(conversationId) ?? [];
-      if (listed.some(entry => entry.id === steer.id)) throw new SteerWithdrawalUnconfirmedError();
-      const page = await this.provider.listMessages(conversationId, { limit: DEFAULT_PAGE_SIZE });
-      const rowId = `message:${steer.id}`;
-      outcome = page.items.some(item => item.id === rowId) || this.projection(conversationId).has(rowId) ? "delivered" : "cancelled";
+  }
+
+  private async steerHistoryOutcome(conversationId: string, steerId: string): Promise<"delivered" | "cancelled"> {
+    const rowId = `message:${steerId}`;
+    const cursors = new Set<string>();
+    const pages = new Set<string>();
+    let cursor: string | undefined;
+    // Read-side recovery only: bounded even for a provider that repeats a
+    // page/cursor. Incomplete evidence leaves the steer unconfirmed, never
+    // authorizes an edit or conversion to submit it a second time.
+    for (let read = 0; read < 20; read++) {
+      const page = await this.provider.listMessages(conversationId, { cursor, limit: DEFAULT_PAGE_SIZE });
+      const items = page.completeItems ?? page.items;
+      if (items.some(item => item.id === rowId)) return "delivered";
+      if (page.deliveryHistoryIncomplete) throw new SteerWithdrawalUnconfirmedError();
+      if (page.completeItems !== undefined) return "cancelled";
+      const fingerprint = JSON.stringify(page.items.map(item => item.id));
+      if (pages.has(fingerprint)) throw new SteerWithdrawalUnconfirmedError();
+      pages.add(fingerprint);
+      if (!page.nextCursor) {
+        if (page.items.length >= DEFAULT_PAGE_SIZE) throw new SteerWithdrawalUnconfirmedError();
+        return "cancelled";
+      }
+      if (cursors.has(page.nextCursor)) throw new SteerWithdrawalUnconfirmedError();
+      cursors.add(page.nextCursor);
+      cursor = page.nextCursor;
     }
-    this.forgetSteer(conversationId, steer.id);
-    if (outcome === "delivered") {
-      this.rememberDelivered(steer.id);
-      this.publishQueue(conversationId, { kind: "delivered", messageId: steer.id });
-      this.publishPausedChanges(conversationId);
-      throw new SteerAlreadyDeliveredError();
-    }
+    throw new SteerWithdrawalUnconfirmedError();
   }
 
   private forgetSteer(conversationId: string, steerId: string): boolean {
@@ -1501,8 +1555,8 @@ export class ChatAdapter {
     return true;
   }
 
-  private rememberDelivered(steerId: string): void {
-    boundedSet(this.deliveredSteers, steerId, true, DELIVERED_STEERS_LIMIT);
+  private rememberDelivered(conversationId: string, steerId: string): void {
+    boundedSet(this.deliveredSteers, JSON.stringify([conversationId, steerId]), true, DELIVERED_STEERS_LIMIT);
   }
 
   /**
@@ -1542,13 +1596,25 @@ export class ChatAdapter {
     // Settled. A withdrawal waiting on this entry takes the outcome and
     // publishes the end itself; otherwise the dock learns it here.
     const waiter = this.steerSettlements.get(conversationId)?.get(delta.id);
-    if (delta.outcome === "delivered") this.rememberDelivered(delta.id);
+    const admission = this.admittingSteers.get(conversationId);
+    if (admission?.id === delta.id) {
+      admission.terminal = delta.outcome;
+      // A converted held message is the same submission, not a second
+      // queued copy to keep when settlement outruns acknowledgement/timeout.
+      const queue = this.heldQueues.get(conversationId);
+      const index = admission.held && queue ? queue.indexOf(admission.held) : -1;
+      if (queue && index >= 0) {
+        queue.splice(index, 1);
+        if (!queue.length) this.heldQueues.delete(conversationId);
+      }
+    }
+    if (delta.outcome === "delivered") this.rememberDelivered(conversationId, delta.id);
     if (waiter) {
       this.forgetSteer(conversationId, delta.id);
       waiter(delta.outcome);
       return;
     }
-    if (!this.forgetSteer(conversationId, delta.id)) return;
+    if (!this.forgetSteer(conversationId, delta.id) && admission?.id !== delta.id) return;
     this.publishQueue(conversationId, { kind: delta.outcome === "delivered" ? "delivered" : "removed", messageId: delta.id });
     this.publishPausedChanges(conversationId);
   }
@@ -1603,7 +1669,7 @@ export class ChatAdapter {
     for (const entry of gone) {
       const rowId = `message:${entry.id}`;
       const delivered = history.some(item => item.id === rowId) || projection.has(rowId);
-      if (delivered) this.rememberDelivered(entry.id);
+      if (delivered) this.rememberDelivered(conversationId, entry.id);
       this.publishQueue(conversationId, { kind: delivered ? "delivered" : "removed", messageId: entry.id });
     }
     for (const entry of added) this.publishQueue(conversationId, { kind: "steered", messageId: entry.id });
@@ -1631,7 +1697,7 @@ export class ChatAdapter {
       if (index < 0) {
         // A steer is withdrawn from the agent, which must confirm it (D7).
         const steer = this.pendingSteers.get(conversationId)?.find(entry => entry.id === messageId);
-        if (!steer) throw this.notPendingError(messageId);
+        if (!steer) throw this.notPendingError(conversationId, messageId);
         await this.withdrawSteer(conversationId, steer);
         this.publishQueue(conversationId, { kind: "removed", messageId });
         this.publishPausedChanges(conversationId);

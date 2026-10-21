@@ -344,6 +344,7 @@ export class OpenCodeV2Provider implements ChatProvider {
       accounting,
       ...(typeof info?.cost === "number" && Number.isFinite(info.cost) && info.cost >= 0 ? { sessionCostUsd: info.cost } : {}),
       completeItems: [...normalized.values()].map(({ item }) => item),
+      ...(boundaryId ? { deliveryHistoryIncomplete: true as const } : {}),
       nextCursor: historyPageCursor(start, version),
     };
   }

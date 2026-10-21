@@ -2651,7 +2651,6 @@ export function initChat(api = new ChatApiClient()): void {
     const status = projection?.status ?? null;
     if (status !== lastStatus) {
       composerNote = null;
-      if (projection) automaticNotes.clearSuccessful(projection.conversationId);
       lastStatus = status;
     }
     const running = isLiveConversationStatus(projection?.status);
@@ -2676,10 +2675,6 @@ export function initChat(api = new ChatApiClient()): void {
       asideButton.hidden = !activeId || !sideAnswers.has(activeId) && !sideGenerating.has(activeId);
       asideButton.disabled = !projection || Boolean(activeId && sideGenerating.has(activeId));
       asideButton.textContent = activeId && sideGenerating.has(activeId) ? "Side answer…" : activeId && sideAnswers.get(activeId)?.failed ? "Side question failed" : "Side answer ready";
-    }
-    if (activeId && !running
-      && !projection?.items.some(item => item.type === "background_task" && item.status === "running")) {
-      automaticNotes.clearSuccessful(activeId);
     }
     const hasContent = Boolean(input.value.trim()) || currentPendingAttachments().length > 0
       || (activeId !== null && attachmentStaging.has(activeId));
@@ -5078,6 +5073,7 @@ export function initChat(api = new ChatApiClient()): void {
     // staleness across a projection reload, where the revision restarts.
     const queueRevisionAtSubmit = projection.queueRevision;
     const configurationRevisionAtSubmit = projection.configurationRevision;
+    const stagedConfigurationAtSubmit = stagedConfigurations.get(conversationId);
     const projectionEpochAtSubmit = projectionEpoch;
     // Named only to a steering agent: the device default, or this
     // submission's one-off choice (⌥Enter, the menu). The workspace decides
@@ -5129,7 +5125,10 @@ export function initChat(api = new ChatApiClient()): void {
         }
       }
       retryRequests.delete(conversationId);
-      stagedConfigurations.delete(conversationId);
+      // A steer runs under the active turn's configuration, not this staged
+      // next-turn selection. Trust actual delivery (Undo can turn a requested
+      // queue into a steer), and never consume a newer choice made in flight.
+      if (accepted.delivery !== "steer" && stagedConfigurations.get(conversationId) === stagedConfigurationAtSubmit) stagedConfigurations.delete(conversationId);
       if (accepted.conversation) {
         conversations = conversations.map(conversation => conversation.id === accepted.conversation!.id ? accepted.conversation! : conversation);
         relabelConversationOption(accepted.conversation);
@@ -5143,7 +5142,7 @@ export function initChat(api = new ChatApiClient()): void {
         // this very commit's own event) is at least as new as this
         // response, and a retried request can carry a receipt replayed
         // from before all of it. Same authority rule as the queue echo.
-        if (!retriedRequest && projectionEpoch === projectionEpochAtSubmit && projection.configurationRevision === configurationRevisionAtSubmit) {
+        if (accepted.delivery !== "steer" && !retriedRequest && projectionEpoch === projectionEpochAtSubmit && projection.configurationRevision === configurationRevisionAtSubmit) {
           projection = { ...projection, configuration: accepted.configuration };
         }
         // A held acceptance moves the draft into the queue dock immediately;
@@ -5252,6 +5251,14 @@ export function initChat(api = new ChatApiClient()): void {
   workDock?.addEventListener("pointerdown", prioritizeWorkPane);
   workDock?.addEventListener("focusin", prioritizeWorkPane);
   workDock?.addEventListener("click", prioritizeWorkPane, true);
+  function measureSurfaceChromeHeight(container: HTMLElement, dock: HTMLElement, inset: number, transcript?: Element) {
+    return [...container.children].reduce((height, child) => {
+      if (child === dock || (transcript ? child === transcript : child.classList.contains("chat-transcript-area"))) return height;
+      const css = getComputedStyle(child);
+      if (css.display === "none" || ["absolute", "fixed"].includes(css.position)) return height;
+      return height + child.getBoundingClientRect().height + (parseFloat(css.marginTop) || 0) + (parseFloat(css.marginBottom) || 0);
+    }, inset);
+  }
   function syncExpandedWorkBudget(dock: HTMLElement, minimumWork: number) {
     if (!surface || !queueDockElement || typeof getComputedStyle !== "function") return;
     const overlay = document.documentElement.hasAttribute("data-chat-work-expanded");
@@ -5264,12 +5271,7 @@ export function initChat(api = new ChatApiClient()): void {
       return;
     }
     const css = getComputedStyle(surface);
-    const fixed = [...surface.children].reduce((height, child) => {
-      if (child === dock || child.classList.contains("chat-transcript-area")) return height;
-      const style = getComputedStyle(child);
-      if (style.display === "none" || ["absolute", "fixed"].includes(style.position)) return height;
-      return height + child.getBoundingClientRect().height + (parseFloat(style.marginTop) || 0) + (parseFloat(style.marginBottom) || 0);
-    }, (parseFloat(css.paddingTop) || 0) + (parseFloat(css.paddingBottom) || 0));
+    const fixed = measureSurfaceChromeHeight(surface, dock, (parseFloat(css.paddingTop) || 0) + (parseFloat(css.paddingBottom) || 0));
     const compactDesktop = document.documentElement.dataset.uiMode === "desktop" && window.matchMedia("(pointer: fine) and (hover: hover)").matches;
     const { reading, capacity: inlineCapacity } = expandedWorkBudget(surface.clientHeight - fixed, minimumWork, compactDesktop ? "desktop" : "comfortable");
     const capacity = overlay && form
@@ -5302,12 +5304,7 @@ export function initChat(api = new ChatApiClient()): void {
     dock.style.removeProperty("--chat-work-available");
     const hasWork = [...dock.children].some(child => child !== close && !(child as HTMLElement).hidden && getComputedStyle(child).display !== "none");
     root.toggleAttribute("data-chat-has-work", hasWork);
-    const fixed = [...surface.children].reduce((height, child) => {
-      if (child === dock || child === transcript) return height;
-      const css = getComputedStyle(child);
-      if (css.display === "none" || ["absolute", "fixed"].includes(css.position)) return height;
-      return height + child.getBoundingClientRect().height + (parseFloat(css.marginTop) || 0) + (parseFloat(css.marginBottom) || 0);
-    }, 0);
+    const fixed = measureSurfaceChromeHeight(surface, dock, 0, transcript);
     const floor = dock.hasAttribute("data-work-content-expanded")
       ? parseFloat(surface.style.getPropertyValue("--chat-expanded-reading")) || 0
       : parseFloat(getComputedStyle(transcript).minHeight) || 0;
@@ -5390,12 +5387,7 @@ export function initChat(api = new ChatApiClient()): void {
       // clientHeight includes safe-area padding. Count all in-flow chrome, not
       // just header/composer, so removing a sheet cannot spend the reading floor.
       const css = getComputedStyle(surface);
-      const fixed = [...surface.children].reduce((height, child) => {
-        if (child === workDock || child.classList.contains("chat-transcript-area")) return height;
-        const style = getComputedStyle(child);
-        if (style.display === "none" || ["absolute", "fixed"].includes(style.position)) return height;
-        return height + child.getBoundingClientRect().height + (parseFloat(style.marginTop) || 0) + (parseFloat(style.marginBottom) || 0);
-      }, (parseFloat(css.paddingTop) || 0) + (parseFloat(css.paddingBottom) || 0));
+      const fixed = measureSurfaceChromeHeight(surface, workDock, (parseFloat(css.paddingTop) || 0) + (parseFloat(css.paddingBottom) || 0));
       // Enlarged replacement safety already permits the reading floor to
       // yield: its complete warning/batch controls must remain scroll-reachable.
       // Ordinary enlarged pending work and standard text retain their floor.

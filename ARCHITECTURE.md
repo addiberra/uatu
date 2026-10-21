@@ -915,11 +915,14 @@ steer, with a count-only warning explaining older paused steers deliver together
 
 Touch work tracks share `#chat-work-dock`, bounded by `--chat-visual-height`
 (35%, 25% on tablets; 24% while editing without a software keyboard), with
-contained scrolling separate from the transcript. Desktop queue height uses
-40% of the measured panel height, not a fixed rem estimate of the viewport.
+independent Workers/Pending content scrollers separate from the transcript.
+Desktop queue height uses 40% of the measured panel height, not a fixed rem
+estimate of the viewport.
 Short visual bands compact the header/composer; keyboard/short-landscape mode
-reduces work to counts, paused-batch Send and the readable replacement warning.
-The outer surface cannot scroll; viewport corrections reset its scroll offset.
+keeps both cards available with compact chrome. The outer surface normally
+cannot scroll; only physically insufficient bands allow native scrolling to
+keep minimum action targets reachable. Viewport corrections preserve that
+exception's reader/focus reveal and reset the offset when it ends.
 Hardware-keyboard editing retains the bottom safe inset without doubling it
 under a software keyboard. A touch-only backdrop consumes outside delivery-menu
 taps through click. Touch Stop parent with worker records confirms its scope;
@@ -967,11 +970,10 @@ Touch preserves composing focus through worker actions. Its disclosure remains
 in the bottom in-flow dock across keyboard/viewport changes, never implicitly
 promoted to a top overlay. Active rows use two lines for title and reported
 agent/model/cumulative usage; Stop stays 44px with 8px separation. Settled rows
-remain dense. On desktop, detachment collapses only an automatically expanded duplicate
-subagent track; a deliberate user reopening remains open. Desktop expansion
-provenance travels with the retained DOM open state across conversation switches;
-changing the selection is not treated as a deliberate opening. Touch instead
-keeps one initially collapsed, deliberate per-conversation worker disclosure.
+remain dense. Desktop and touch share one initially collapsed, deliberate
+per-conversation worker disclosure. Its bounded page-local expansion state
+survives conversation switches; new work, settlement and detachment do not
+implicitly open or collapse it.
 V2 reserves the parent Stop footprint
 before workers appear; worker controls have horizontal and vertical 0.5rem gaps.
 `opencode/v2/background.ts` folds successful tool launches and authenticated

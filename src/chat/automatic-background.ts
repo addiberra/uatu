@@ -14,21 +14,23 @@ export function automaticBackgroundNote(outcome?: AutomaticBackgroundOutcome): s
 /** Page-local receipts, not execution state. Only the same operation can
  * resolve its uncertainty; unrelated mutations convey no such evidence. */
 export class AutomaticBackgroundNotices {
-  private readonly conversations = new Map<string, Map<string, { text: string; successful: boolean; origin?: string; subject?: string }>>();
+  private readonly conversations = new Map<string, Map<string, { text: string; origin?: string; subject?: string }>>();
 
   record(conversation: string, operation: string, outcome?: AutomaticBackgroundOutcome): void {
     if (outcome === undefined) return;
     if (outcome === "accepted" || outcome === "not-needed") {
-      this.conversations.get(conversation)?.delete(operation);
+      const notices = this.conversations.get(conversation);
+      notices?.delete(operation);
+      if (!notices?.size) this.conversations.delete(conversation);
       return;
     }
-    this.put(conversation, operation, automaticBackgroundNote(outcome), false);
+    this.put(conversation, operation, automaticBackgroundNote(outcome));
   }
 
   unconfirmed(conversation: string, operation: string, action: string, text?: string, subject = "acceptance"): void {
-    if (text === undefined) { this.put(conversation, operation, action, false); return; }
+    if (text === undefined) { this.put(conversation, operation, action); return; }
     const origin = actionOrigin(action, text || `attachment-only message · ${operation.replace(/[^a-zA-Z0-9-]/g, "").slice(-8) || "pending"}`);
-    this.put(conversation, operation, `${origin}: ${subject} unconfirmed. Checking conversation status; do not repeat.`, false);
+    this.put(conversation, operation, `${origin}: ${subject} unconfirmed. Checking conversation status; do not repeat.`);
     this.conversations.get(conversation)!.get(operation)!.origin = origin;
     this.conversations.get(conversation)!.get(operation)!.subject = subject;
   }
@@ -39,25 +41,17 @@ export class AutomaticBackgroundNotices {
     notice.text = `${notice.origin}: ${available ? `Status checked; ${notice.subject} still unconfirmed` : `Status check unavailable; ${notice.subject} unconfirmed`}. Do not repeat.`;
   }
 
-  private put(conversation: string, operation: string, text: string, successful: boolean): void {
+  private put(conversation: string, operation: string, text: string): void {
     let notices = this.conversations.get(conversation);
     if (!notices) this.conversations.set(conversation, notices = new Map());
-    notices.set(operation, { text, successful });
+    notices.set(operation, { text });
     // Page-local only, bounded across both conversations and operations.
     while (notices.size > 20) notices.delete(notices.keys().next().value!);
     while (this.conversations.size > 100) this.conversations.delete(this.conversations.keys().next().value!);
   }
 
-  clearSuccessful(conversation: string): void {
-    const notices = this.conversations.get(conversation);
-    if (!notices) return;
-    for (const [operation, notice] of notices) if (notice.successful) notices.delete(operation);
-    if (!notices.size) this.conversations.delete(conversation);
-  }
-
   text(conversation: string): string {
-    const notices = [...(this.conversations.get(conversation)?.values() ?? [])]
-      .sort((a, b) => Number(a.successful) - Number(b.successful));
+    const notices = [...(this.conversations.get(conversation)?.values() ?? [])];
     return [...new Set(notices.map(notice => notice.text))].join(" ");
   }
 }

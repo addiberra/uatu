@@ -81,6 +81,10 @@ for (const geometry of [
       await expectWorkControlVisible(page.locator(`#${id}`));
     }
     if (geometry.mode === "touch" && geometry.band === 200) {
+      // Drive the controller's 250ms settled resync and following frames
+      // deterministically; an already-correct offset alone cannot prove that
+      // the delayed pass preserved it.
+      await page.clock.install();
       const surface = page.locator("#chat-surface");
       const evidence: unknown[] = [];
       const record = async (event: string) => evidence.push(await surface.evaluate((n, event) => ({ event, scrollTop: n.scrollTop, overflow: n.hasAttribute("data-work-overflow"), band: window.visualViewport!.height, focused: document.activeElement?.id, controls: ["chat-send", "chat-stop"].map(id => ({ id, box: document.getElementById(id)!.getBoundingClientRect().toJSON() })) }), event));
@@ -95,7 +99,8 @@ for (const geometry of [
           else if (event === "visibilitychange") document.dispatchEvent(new Event(event));
           else window.dispatchEvent(new Event(event));
         }, event);
-        await page.waitForTimeout(300); // Includes the controller's 250ms settled resync.
+        await page.clock.runFor(300);
+        await expectWorkLayoutReady(page);
         expect(await surface.evaluate(n => n.scrollTop), event).toBe(visibleOffset);
         await expectWorkControlVisible(page.locator("#chat-send"));
         await expectWorkControlVisible(page.locator("#chat-stop"));
@@ -113,7 +118,8 @@ for (const geometry of [
         const offset = await surface.evaluate(n => n.scrollTop);
         for (let resize = 0; resize < 2; resize++) {
           await page.evaluate(() => window.visualViewport!.dispatchEvent(new Event("resize")));
-          await page.waitForTimeout(300);
+          await page.clock.runFor(300);
+          await expectWorkLayoutReady(page);
           await expect(page.locator(`#${id}`)).toBeFocused();
           await expectWorkControlVisible(page.locator(`#${id}`));
           expect(await surface.evaluate(n => n.scrollTop)).toBe(offset);
@@ -124,7 +130,8 @@ for (const geometry of [
       await page.locator("#chat-stop").evaluate(n => n.scrollIntoView({ block: "nearest" }));
       const offset = await surface.evaluate(n => n.scrollTop);
       await page.evaluate(() => window.dispatchEvent(new Event("resize")));
-      await page.waitForTimeout(300);
+      await page.clock.runFor(300);
+      await expectWorkLayoutReady(page);
       expect(await surface.evaluate(n => n.scrollTop)).toBe(offset);
       await expectWorkControlVisible(page.locator("#chat-stop"));
       await record("scrollIntoView-resize");

@@ -20,6 +20,7 @@ import { ConversationNotFoundError } from "./workspace";
 import { MetricsRegistry } from "../debug/metrics";
 import type { ConversationInventorySubscription } from "./inventory-broadcaster";
 import { OpenCodeNotificationLifecycle } from "./opencode/notification-lifecycle";
+import { createOpenCodeV2Provider } from "./opencode/v2/provider";
 import type { AgentNotificationEvent } from "./notifications";
 import { notificationPipeline } from "../../tests/notification-pipeline";
 
@@ -6677,6 +6678,193 @@ describe("steering (opencode-v2-steering)", () => {
     await adapter.stopEventPump();
     await pump;
     await adapter.dispose();
+  });
+
+  function revertedV2History(deliveredId: string, visibleId?: string) {
+    const fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const pathname = new URL(new Request(input, init).url).pathname;
+      if (pathname === "/api/session/session/message") return Response.json({ data: [
+        ...(visibleId ? [{ id: visibleId, type: "user", text: "visible delivered input", time: { created: 0 } }] : []),
+        { id: deliveredId, type: "user", text: "delivered then reverted elsewhere", time: { created: 1 } },
+      ], cursor: {} });
+      if (pathname === "/api/session/session") return Response.json({ data: { id: "session", location: { directory: process.cwd() }, time: { created: 1, updated: 2 }, revert: { messageID: deliveredId } } });
+      throw new Error(`Unexpected V2 history read: ${pathname}`);
+    }) as typeof globalThis.fetch;
+    return createOpenCodeV2Provider({ endpoint: "http://opencode.test", password: "test", directory: process.cwd(), fetch });
+  }
+
+  for (const action of ["remove", "edit", "convert"] as const) test(`real V2 reverted delivery cannot be ${action === "convert" ? "converted" : action === "edit" ? "returned to the draft" : "removed"} based on visible history absence`, async () => {
+    const { adapter, provider, steer } = steering({ steerWithdrawTimeoutMs: 1 });
+    adapter.projectionForTests("session").statusUpdate("running");
+    const accepted = await steer("original", "delivered then reverted elsewhere");
+    provider.pendingInbox = [];
+    const native = revertedV2History(accepted.messageId);
+    provider.listMessages = native.listMessages.bind(native);
+    try {
+      // Real provider filtering hides the delivered record, even from its
+      // complete visible transcript. The stream's delivery event was missed.
+      expect((await provider.listMessages("session", { limit: 50 })).completeItems).toEqual([]);
+      const withdrawal = action === "convert"
+        ? adapter.changeDelivery("session", accepted.messageId, "convert", "queue")
+        : adapter.removeQueued("session", accepted.messageId, action);
+      await expect(withdrawal).rejects.toBeInstanceOf(SteerWithdrawalUnconfirmedError);
+      await expect(withdrawal).rejects.toThrow("delivery is unconfirmed");
+      expect(adapter.pendingSteersForTests("session").map(entry => entry.id)).toEqual([accepted.messageId]);
+      expect(provider.prompts).toHaveLength(1);
+      const snapshot = await adapter.history("session");
+      expect(snapshot.queued?.filter(entry => entry.delivery === "queue") ?? []).toEqual([]);
+      expect(JSON.stringify(snapshot)).not.toContain("deliveryHistoryIncomplete");
+    } finally { await native.dispose?.(); await adapter.dispose(); }
+  });
+
+  test("real V2 visible delivery remains proven before a revert boundary", async () => {
+    const { adapter, provider, steer } = steering({ steerWithdrawTimeoutMs: 1 });
+    adapter.projectionForTests("session").statusUpdate("running");
+    const accepted = await steer("original", "visible delivered input");
+    provider.pendingInbox = [];
+    const native = revertedV2History("later-reverted-input", accepted.messageId);
+    provider.listMessages = native.listMessages.bind(native);
+    try {
+      await expect(adapter.removeQueued("session", accepted.messageId, "remove")).rejects.toBeInstanceOf(SteerAlreadyDeliveredError);
+      expect(provider.prompts).toHaveLength(1);
+      expect(adapter.pendingSteersForTests("session")).toEqual([]);
+    } finally { await native.dispose?.(); await adapter.dispose(); }
+  });
+
+  test("explicit cancellation still withdraws a steer while real V2 history has a revert boundary", async () => {
+    const { adapter, provider, steer, inbox } = steering();
+    const pump = adapter.startEventPump();
+    adapter.projectionForTests("session").statusUpdate("running");
+    const accepted = await steer("original", "not delivered");
+    const native = revertedV2History("earlier-delivered-input");
+    provider.listMessages = native.listMessages.bind(native);
+    provider.cancelInbox = async () => { inbox({ kind: "settled", id: accepted.messageId, outcome: "cancelled" }); };
+    try {
+      expect((await provider.listMessages("session", { limit: 50 })).completeItems).toEqual([]);
+      await expect(adapter.removeQueued("session", accepted.messageId, "remove")).resolves.toEqual({ removed: true });
+      expect(provider.prompts).toHaveLength(1);
+      expect(adapter.pendingSteersForTests("session")).toEqual([]);
+    } finally { await adapter.stopEventPump(); await pump; await native.dispose?.(); await adapter.dispose(); }
+  });
+
+  for (const history of ["complete", "paged"] as const) for (const action of ["remove", "edit", "convert"] as const) test(`missed delivery older than the latest ${history} page refuses ${action}, without resubmission`, async () => {
+    const { adapter, provider, steer } = steering({ steerWithdrawTimeoutMs: 1 });
+    adapter.projectionForTests("session").statusUpdate("running");
+    const accepted = await steer("original", "already delivered");
+    provider.pendingInbox = [];
+    const older: ConversationItem = { id: `message:${accepted.messageId}`, type: "user_message", text: "already delivered", createdAt: 1 };
+    const recent: ConversationItem[] = Array.from({ length: 50 }, (_, index) => ({ id: `message:recent-${index}`, type: "user_message", text: "newer", createdAt: index + 2 }));
+    provider.listMessages = async (_id, { cursor }) => history === "complete"
+      ? { items: recent, completeItems: [older, ...recent], accounting: [] }
+      : cursor ? { items: [older], accounting: [] } : { items: recent, nextCursor: "older", accounting: [] };
+    const withdrawal = action === "convert"
+      ? adapter.changeDelivery("session", accepted.messageId, "convert", "queue")
+      : adapter.removeQueued("session", accepted.messageId, action);
+    await expect(withdrawal).rejects.toBeInstanceOf(SteerAlreadyDeliveredError);
+    expect(provider.prompts).toHaveLength(1);
+    expect((await adapter.history("session")).queued ?? []).toEqual([]);
+    await adapter.dispose();
+  });
+
+  for (const announced of [true, false]) for (const outcome of ["delivered", "cancelled"] as const) test(`terminal ${outcome} before admission acknowledgement (${announced ? "announced" : "no pending event"}) never resurrects the steer`, async () => {
+    const { adapter, provider, steer, inbox } = steering();
+    const pump = adapter.startEventPump();
+    const watch = await watchQueue(adapter);
+    adapter.projectionForTests("session").statusUpdate("running");
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const admit = provider.prompt.bind(provider);
+    provider.prompt = async (...args) => { const result = await admit(...args); await gate; return result; };
+    const pending = steer("receipt", "fast settlement");
+    await waitUntil(() => provider.prompts.length === 1);
+    const id = provider.prompts[0]!.id;
+    if (announced) {
+      inbox({ kind: "pending", id, text: "fast settlement", delivery: "steer", at: 1 });
+      await waitUntil(() => provider.eventQueue.waiting);
+    }
+    inbox({ kind: "settled", id, outcome });
+    await waitUntil(() => provider.eventQueue.waiting);
+    const terminal = `${outcome === "delivered" ? "delivered" : "removed"}:${id}`;
+    await waitUntil(() => watch.changes.includes(terminal));
+    // Outlive the bounded delivered-id cache while the acknowledgement is
+    // still blocked: the admission's own terminal fence must keep winning.
+    for (let index = 0; index < 70; index++) inbox({ kind: "settled", id: `other-${index}`, outcome: "delivered" });
+    await waitUntil(() => provider.eventQueue.waiting);
+    release();
+    const accepted = await pending;
+    expect(await steer("receipt", "fast settlement")).toEqual(accepted);
+    expect(provider.prompts).toHaveLength(1);
+    expect(watch.changes.at(-1)).toBe(terminal);
+    expect(adapter.pendingSteersForTests("session")).toEqual([]);
+    expect((await adapter.history("session")).queued ?? []).toEqual([]);
+    watch.stop();
+    await adapter.stopEventPump(); await pump; await adapter.dispose();
+  });
+
+  for (const evidence of ["capped", "repeated-cursor", "repeated-page", "read-bound", "no-inbox-list"] as const) test(`withdrawal with ${evidence} evidence stays unconfirmed, never held or resubmitted`, async () => {
+    const { adapter, provider, steer } = steering({ steerWithdrawTimeoutMs: 1 });
+    adapter.projectionForTests("session").statusUpdate("running");
+    const accepted = await steer("original", "unknown delivery");
+    provider.pendingInbox = [];
+    let reads = 0;
+    provider.listMessages = async () => {
+      reads++;
+      const recent: ConversationItem[] = Array.from({ length: 50 }, (_, index) => ({ id: `message:${evidence === "read-bound" ? reads : "same"}-${index}`, type: "user_message", text: "newer", createdAt: index }));
+      return { items: recent, accounting: [], ...(evidence === "capped" ? {} : { nextCursor: evidence === "repeated-cursor" ? "same" : `older-${reads}` }) };
+    };
+    if (evidence === "no-inbox-list") provider.listPendingInbox = undefined;
+    await expect(adapter.changeDelivery("session", accepted.messageId, "convert", "queue")).rejects.toBeInstanceOf(SteerWithdrawalUnconfirmedError);
+    expect(provider.prompts).toHaveLength(1);
+    expect(adapter.pendingSteersForTests("session").map(entry => entry.id)).toEqual([accepted.messageId]);
+    expect(reads).toBeLessThanOrEqual(20);
+    if (evidence === "read-bound") expect(reads).toBe(20);
+    if (evidence === "no-inbox-list") expect(reads).toBe(0);
+    await adapter.dispose();
+  });
+
+  test("delivery during a held-to-steer admission timeout cannot leave the original held for resubmission", async () => {
+    const { adapter, provider, queue, inbox } = steering({ steerAdmissionTimeoutMs: 100 });
+    const pump = adapter.startEventPump();
+    const watch = await watchQueue(adapter);
+    await waitUntil(() => provider.eventQueue.waiting);
+    adapter.projectionForTests("session").statusUpdate("running");
+    const held = await queue("original", "deliver once");
+    expect(held.pending).toBe(true);
+    expect(provider.prompts).toHaveLength(0);
+    const admit = provider.prompt.bind(provider);
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    provider.prompt = async (...args) => { const result = await admit(...args); await gate; return result; };
+    const converting = adapter.changeDelivery("session", held.messageId, "convert", "steer");
+    const refused = converting.catch(error => error);
+    await waitUntil(() => provider.prompts.length === 1);
+    const id = provider.prompts[0]!.id;
+    inbox({ kind: "settled", id, outcome: "delivered" });
+    await waitUntil(() => watch.changes.includes(`delivered:${id}`));
+    expect(await refused).toBeInstanceOf(OperationOutcomeUnknownError);
+    release();
+    await gate;
+    expect((await adapter.history("session")).queued ?? []).toEqual([]);
+    expect(provider.prompts).toHaveLength(1);
+    expect(watch.changes.at(-1)).toBe(`delivered:${id}`);
+    watch.stop(); await adapter.stopEventPump(); await pump; await adapter.dispose();
+  });
+
+  test("a delivered event overtaking fallback history wins over apparent absence", async () => {
+    const { adapter, provider, steer, inbox } = steering({ steerWithdrawTimeoutMs: 1 });
+    const pump = adapter.startEventPump();
+    adapter.projectionForTests("session").statusUpdate("running");
+    const accepted = await steer("original", "racing delivery");
+    provider.pendingInbox = [];
+    provider.listMessages = async () => {
+      inbox({ kind: "settled", id: accepted.messageId, outcome: "delivered" });
+      for (let index = 0; index < 70; index++) inbox({ kind: "settled", id: `other-${index}`, outcome: "delivered" });
+      await waitUntil(() => provider.eventQueue.waiting);
+      return { items: [], completeItems: [], accounting: [] };
+    };
+    await expect(adapter.changeDelivery("session", accepted.messageId, "convert", "queue")).rejects.toBeInstanceOf(SteerAlreadyDeliveredError);
+    expect(provider.prompts).toHaveLength(1);
+    await adapter.stopEventPump(); await pump; await adapter.dispose();
   });
 
   test("with no confirmation before the bounded wait, the outcome comes from the agent's list and history", async () => {

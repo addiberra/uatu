@@ -47,26 +47,34 @@ for (const outcome of ["unknown", "failed", "unavailable"] as const) test(`${out
   notices.record("parent", "remove-unrelated");
   notices.record("parent", "queue-only-conversion");
   notices.record("parent", "later-steer", "accepted");
-  notices.clearSuccessful("parent");
   expect(notices.text("parent")).toBe(automaticBackgroundNote(outcome));
   expect(notices.text("other-parent")).toBe("");
   notices.record("parent", "source", "accepted");
-  notices.clearSuccessful("parent");
   expect(notices.text("parent")).toBe("");
 });
 
-test("primary-unknown guidance survives unrelated lifecycle cleanup and repeated outcomes do not duplicate text", () => {
+test("primary-unknown guidance survives unrelated outcomes and repeated outcomes do not duplicate text", () => {
   const notices = new AutomaticBackgroundNotices();
   notices.unconfirmed("parent", "primary", "Acceptance unconfirmed; do not repeat.");
   notices.record("parent", "a", "unknown");
   notices.record("parent", "b", "unknown");
-  notices.clearSuccessful("parent");
   expect(notices.text("parent")).toBe(`Acceptance unconfirmed; do not repeat. ${automaticBackgroundNote("unknown")}`);
 });
 
-test("unresolved feedback leads successful acknowledgements in the readable notice band", () => {
+test("successful acknowledgements never enter the readable notice band", () => {
   const notices = new AutomaticBackgroundNotices();
   notices.record("parent", "earlier-success", "accepted");
   notices.record("parent", "uncertain", "unknown");
   expect(notices.text("parent")).toBe(automaticBackgroundNote("unknown"));
+});
+
+test("failures and uncertainty keep operation order and successful resolution removes only its source", () => {
+  const notices = new AutomaticBackgroundNotices();
+  notices.record("parent", "first", "failed");
+  notices.record("parent", "second", "unknown");
+  notices.record("parent", "third", "unavailable");
+  expect(notices.text("parent")).toBe((["failed", "unknown", "unavailable"] as const).map(automaticBackgroundNote).join(" "));
+  notices.record("parent", "second", "accepted");
+  expect(notices.text("parent")).toBe(`${automaticBackgroundNote("failed")} ${automaticBackgroundNote("unavailable")}`);
+  expect(notices.text("other")).toBe("");
 });
