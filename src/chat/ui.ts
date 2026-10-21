@@ -802,6 +802,10 @@ export function initChat(api = new ChatApiClient()): void {
         if (error instanceof ChatConnectionInterruptedError) owned.set(stream, message);
         speak(message, true);
       },
+      // Whether the line is currently showing one of this owner's messages.
+      isShowingOwned(): boolean {
+        return speak.target !== null && owned.size > 0 && [...owned.values()].includes(speak.current());
+      },
       // Whether a stream of this surface is still down, even while another
       // message (a validation refusal on an ordinary click) occupies the
       // line in its place.
@@ -824,12 +828,12 @@ export function initChat(api = new ChatApiClient()): void {
         owned.delete(stream);
         if (speak.current() !== message) {
           // A transient message (a validation refusal on an ordinary click)
-          // displaced this owner's text; keepRecoveryVisible may have stood
-          // the recovery affordance beside it. With this stream recovered,
-          // the affordance stays only while the other stream is still down —
-          // otherwise the healthy connection must not offer a reconnect.
-          if (owned.size > 0) keepRecoveryVisible();
-          else sync();
+          // displaced this owner's text. While another stream of this
+          // surface is still down, preserve the affordance's current
+          // attached or detached state — re-attaching here would hang
+          // recovery on an unrelated status the user must act on first.
+          // When no interruptions remain at all, it goes.
+          if (owned.size === 0) sync();
           return;
         }
         const remaining = [...owned.values()].at(-1);
@@ -3752,11 +3756,15 @@ export function initChat(api = new ChatApiClient()): void {
     });
     // A required empty stops here with the owed-answer message the final
     // check also speaks. During a connection interruption the message takes
-    // the status line's text, but the outage's recovery affordance stays
-    // beside it — the stream is still down underneath.
+    // the status line's text, but the outage's recovery affordance keeps
+    // standing beside it exactly as it stood — attached only when it was
+    // attached to the owned interruption before, never re-attached onto an
+    // unrelated status.
     const speakOwedAnswer = (source: ChatProjection, message: string) => {
+      const owner = interruptionsOwnerFor(source);
+      const wasRecovering = owner.isShowingOwned();
       announceFailureFor(source)(message, true);
-      interruptionsOwnerFor(source).keepRecoveryVisible();
+      if (wasRecovering) owner.keepRecoveryVisible();
     };
 
     container.addEventListener("submit", event => {
