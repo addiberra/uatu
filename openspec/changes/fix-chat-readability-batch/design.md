@@ -110,6 +110,17 @@ the only statement. Skill-loading rows parse their input in
   mapping), so the red→green evidence runs through the wired-handler unit
   harness; the e2e owed-line assertions were retargeted to the
   tab-rendered labels.
+- **Review round 5, the resolution's own lifecycle (#533 spec finding)**:
+  the spec says only a successful resolution retires raised lines, so the
+  answer's cleanup moved behind `resolveQuestion` reporting success — the
+  same shape the reject path already had. While the api call hangs, a
+  raised line stands (the question is not resolved yet), and the reader
+  may re-raise the same pending request's line; a failed answer reports
+  its failure on the answering surface without silently erasing the
+  still-valid validation lines. The unit waits around resolutions use the
+  deterministic one-macrotask `flush()` drain rather than fixed sleeps,
+  and the whole-form outstanding predicate lives on one helper shared by
+  the settlement, the gate, and the final check.
 
 ## Risks / Trade-offs
 

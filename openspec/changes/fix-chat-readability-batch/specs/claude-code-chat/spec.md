@@ -67,6 +67,11 @@ advance gate, never the step last left alone.
 - **THEN** the owed-answer line names every outstanding required step of the form, not only the step the advance stopped on
 - **AND** repeated presses keep naming that whole set instead of shrinking it to the step just left
 
+#### Scenario: An in-flight answer retires nothing until it succeeds
+- **WHEN** an answer has gone out but its api call has not yet come back — or has come back failed, its failure reported on the surface the answer ran from
+- **THEN** the raised owed lines stay standing on every surface, still reporting the question's unanswered step
+- **AND** only the successful resolution retires them — including a line the same pending request raises while its answer hangs, with the reader free to navigate away and back in between
+
 #### Scenario: A successful rejection retires the line it left behind
 - **WHEN** a question is rejected after a required validation error raised the owed-answer line
 - **THEN** the successful resolution retires that line along with the form

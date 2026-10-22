@@ -2530,6 +2530,103 @@ describe("a question's owed-answer line", () => {
     }
   });
 
+  test("a failed answer leaves the parent's mirrored line standing", async () => {
+    // The answer's cleanup runs only once the resolution SUCCEEDS — the
+    // spec's boundary for retiring raised lines. An in-flight answer whose
+    // api call fails must leave the parent's still-valid validation line
+    // standing (both during the flight and after the failure), with the
+    // failure reported on the surface the answer ran from.
+    const answer = deferred<void>();
+    const mirroredItem = {
+      id: "question:mirrored", type: "question", createdAt: 2, requestId: "mirrored",
+      conversationId: "child", status: "pending",
+      questions: [{ prompt: "Which import?", header: "Mirrored", multiple: false, allowFreeForm: true, options: [{ label: "main", description: "" }] }],
+    };
+    const { window, document, state } = await boot({
+      capabilities: ["questions", "subagents", "background-tasks"],
+      itemsFor: conversationId => conversationId === "one" ? [
+        { id: "message:u", type: "user_message", createdAt: 1, text: "ask the child" },
+        { id: "task:child", type: "background_task", createdAt: 1, taskId: "child", description: "The child", taskType: "local_agent", status: "running", childConversationId: "child", foreground: true },
+        mirroredItem,
+      ] : [mirroredItem],
+      questionResults: [() => answer.promise],
+    });
+    try {
+      const click = (element: Element) => element.dispatchEvent(new window.Event("click", { bubbles: true }));
+      // The mirrored card raises the parent's line.
+      const parentForm = document.querySelector('[data-chat-item-id="question:mirrored"] form[data-question-form]')!;
+      parentForm.dispatchEvent(new window.Event("submit", { bubbles: true, cancelable: true }));
+      expect(state()).toBe("Still to answer: Mirrored");
+      // The answer goes out from the drill-down and hangs in the api stub.
+      click(document.querySelector('#chat-subagents [data-open-conversation="child"]')!);
+      await waitUntil(() => document.querySelector('#chat-drilldown-items [data-chat-item-id="question:mirrored"] form[data-question-form]') != null);
+      const childForm = document.querySelector('#chat-drilldown-items [data-chat-item-id="question:mirrored"] form[data-question-form]')!;
+      const choice = childForm.querySelector<HTMLInputElement>('[data-question-panel="0"] input[type="radio"]')!;
+      Object.defineProperty(choice, "form", { configurable: true, value: childForm });
+      choice.checked = true;
+      choice.dispatchEvent(new window.Event("change", { bubbles: true }));
+      childForm.dispatchEvent(new window.Event("submit", { bubbles: true, cancelable: true }));
+      // The unresolved answer has retired nothing: the parent's validation
+      // still stands.
+      expect(state()).toBe("Still to answer: Mirrored");
+      // The answer fails: the failure is the drill-down's status, and the
+      // parent's line — still reporting its unanswered step — stands.
+      answer.reject(new Error("the answer service refused"));
+      await flush();
+      expect(document.querySelector("#chat-drilldown-state")?.textContent).toContain("the answer service refused");
+      expect(state()).toBe("Still to answer: Mirrored");
+    } finally {
+      window.dispatchEvent(new Event("pagehide"));
+    }
+  });
+
+  test("a successful answer retires validation the same request raised while it flew", async () => {
+    // An in-flight answer does not make the question resolved yet: the
+    // reader can arrive back at the same pending question and raise its
+    // owed line again. When the answer then succeeds, that later-raised
+    // line is the resolution's to retire — the cleanup has to run on
+    // success, not before the api call went out.
+    const answer = deferred<void>();
+    const { window, document, card, state } = await boot({
+      conversations: ["one", "two"], questionResults: [() => answer.promise],
+      itemsFor: conversationId => [
+        { id: "message:u", type: "user_message", createdAt: 1, text: "please answer" },
+        {
+          id: `question:${conversationId}`, type: "question", createdAt: 2, requestId: conversationId, status: "pending",
+          questions: [{ prompt: "Which branch?", header: conversationId === "one" ? "Branch A" : "Branch B", multiple: false, allowFreeForm: true, options: [{ label: "main", description: "" }] }],
+        },
+      ],
+    });
+    try {
+      // Conversation one's question is answered; the api call hangs.
+      const form = card.querySelector("form[data-question-form]")!;
+      const choice = form.querySelector<HTMLInputElement>('input[type="radio"]')!;
+      Object.defineProperty(choice, "form", { configurable: true, value: form });
+      choice.checked = true;
+      choice.dispatchEvent(new window.Event("change", { bubbles: true }));
+      form.dispatchEvent(new window.Event("submit", { bubbles: true, cancelable: true }));
+      // The reader checks conversation two, comes back — the question still
+      // stands unanswered — and raises its line again.
+      const select = document.querySelector<HTMLSelectElement>("#chat-conversation-select")!;
+      select.value = "two";
+      select.dispatchEvent(new window.Event("change", { bubbles: true }));
+      await waitUntil(() => document.querySelector('[data-chat-item-id="question:two"] form[data-question-form]') != null);
+      select.value = "one";
+      select.dispatchEvent(new window.Event("change", { bubbles: true }));
+      await waitUntil(() => document.querySelector('[data-chat-item-id="question:one"] form[data-question-form]') != null);
+      const rebuiltForm = document.querySelector('[data-chat-item-id="question:one"] form[data-question-form]')!;
+      expect((rebuiltForm.querySelector("[data-question-primary]") as HTMLButtonElement).disabled).toBe(false);
+      rebuiltForm.dispatchEvent(new window.Event("submit", { bubbles: true, cancelable: true }));
+      expect(state()).toBe("Still to answer: Branch A");
+      // The hanging answer succeeds: the line its request now owns retires.
+      answer.resolve();
+      await flush();
+      expect(state()).toBe("");
+    } finally {
+      window.dispatchEvent(new Event("pagehide"));
+    }
+  });
+
   test("a drilldown answer retires the parent surface's mirrored line while the drilldown stays open", async () => {
     // The parent's mirrored card raises the owed line; the answer goes out
     // from the child's drill-down, which stays open when the resolution
@@ -2565,7 +2662,7 @@ describe("a question's owed-answer line", () => {
       choice.checked = true;
       choice.dispatchEvent(new window.Event("change", { bubbles: true }));
       childForm.dispatchEvent(new window.Event("submit", { bubbles: true, cancelable: true }));
-      await Bun.sleep(20);
+      await flush();
       // The answer resolved the request: the parent's line retires even
       // though the drill-down — the surface the resolve ran on — is open.
       expect(state()).toBe("");
@@ -2854,7 +2951,7 @@ describe("a question's owed-answer line", () => {
       // Rejection resolves the request; the line a rejection leaves behind has
       // no reader left, so the guarded cleanup retires it with the form.
       card.querySelector<HTMLInputElement>("[data-question-reject]")!.dispatchEvent(new window.Event("click", { bubbles: true }));
-      await Bun.sleep(20);
+      await flush();
       expect(state()).not.toContain("Still to answer");
     } finally {
       window.dispatchEvent(new Event("pagehide"));
@@ -2867,7 +2964,7 @@ describe("a question's owed-answer line", () => {
       card.querySelector("form[data-question-form]")!.dispatchEvent(new window.Event("submit", { bubbles: true, cancelable: true }));
       expect(state()).toContain("Still to answer");
       card.querySelector<HTMLInputElement>("[data-question-reject]")!.dispatchEvent(new window.Event("click", { bubbles: true }));
-      await Bun.sleep(20);
+      await flush();
       // The failure is the status now: the line names it and stands.
       expect(state()).toContain("the question service refused");
     } finally {
@@ -2883,10 +2980,10 @@ describe("a question's owed-answer line", () => {
       card.querySelector("form[data-question-form]")!.dispatchEvent(new window.Event("submit", { bubbles: true, cancelable: true }));
       expect(state()).toContain("Still to answer");
       card.querySelector<HTMLInputElement>("[data-question-reject]")!.dispatchEvent(new window.Event("click", { bubbles: true }));
-      await Bun.sleep(20);
+      await flush();
       expect(state()).toContain("the question service refused");
       card.querySelector<HTMLInputElement>("[data-question-reject]")!.dispatchEvent(new window.Event("click", { bubbles: true }));
-      await Bun.sleep(20);
+      await flush();
       expect(state()).toContain("the question service refused");
     } finally {
       window.dispatchEvent(new Event("pagehide"));

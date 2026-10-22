@@ -2,7 +2,7 @@
 target: "the changes this PR (#533)"
 total_score: 27
 max_score: 40
-na_heuristics: 
+na_heuristics:
 p0_count: 0
 p1_count: 2
 target_identity: "file:src/chat/timeline-renderer.ts"

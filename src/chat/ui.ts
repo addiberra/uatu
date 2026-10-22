@@ -3847,6 +3847,12 @@ export function initChat(api = new ChatApiClient()): void {
     const owedStepNames = (outstanding: number[], item: Extract<ConversationItem, { type: "question" }>) =>
       outstanding.map(index => questionStepLabel(item.questions[index]!) || "the current question").join(", ");
 
+    // Which of the form's required steps still owe answers — the one
+    // predicate the settlement, the advance gate, and the final validation
+    // all read, so the routes can never disagree about what is owed.
+    const outstandingRequired = (form: HTMLFormElement, item: Extract<ConversationItem, { type: "question" }>) =>
+      collectQuestionAnswers(form).flatMap((answer, index) => answer.length === 0 && !item.questions[index]?.optional ? [index] : []);
+
     // The owed-answer line follows the form's outstanding required steps as
     // they stand, wherever an interaction settles it: an optional empty never
     // retires a required one's line, a satisfied step stops being named, and
@@ -3859,7 +3865,7 @@ export function initChat(api = new ChatApiClient()): void {
     // reader switched conversations — or asked this conversation again — can
     // never retire another question's line.
     const settleOwedAnswer = (source: ChatProjection, item: Extract<ConversationItem, { type: "question" }>, form: HTMLFormElement) => {
-      const outstanding = collectQuestionAnswers(form).flatMap((answer, index) => answer.length === 0 && !item.questions[index]?.optional ? [index] : []);
+      const outstanding = outstandingRequired(form, item);
       if (outstanding.length === 0) {
         clearOwedAnswer(source, item);
         return;
@@ -3905,7 +3911,12 @@ export function initChat(api = new ChatApiClient()): void {
           // validation may already have listed later required steps, and
           // repeating Next must not shrink the message to the one the
           // reader is standing on.
-          const outstanding = collectQuestionAnswers(questionForm).flatMap((answer, index) => answer.length === 0 && !item.questions[index]?.optional ? [index] : []);
+          // The advance holds on the step just left, but the line names the
+          // whole form's outstanding set, not that step alone: the final
+          // validation may already have listed later required steps, and
+          // repeating Next must not shrink the message to the one the
+          // reader is standing on.
+          const outstanding = outstandingRequired(questionForm, item);
           speakOwedAnswer(source, item, `Still to answer: ${owedStepNames(outstanding, item)}`);
           return;
         }
@@ -3921,18 +3932,20 @@ export function initChat(api = new ChatApiClient()): void {
       // The primary button stays enabled, so every submit routes through this
       // check: an optional question may go unanswered; every other one must
       // not. The form jumps to the first missing panel and says what is owed.
-      const missing = answers.flatMap((answer, index) => answer.length === 0 && !item.questions[index]?.optional ? [index] : []);
+      const missing = outstandingRequired(questionForm, item);
       if (missing.length > 0) {
         showQuestionPanel(questionForm, missing[0]!);
         speakOwedAnswer(source, item, `Still to answer: ${owedStepNames(missing, item)}`);
         return;
       }
-      // Every answer is in: a successful completion ends the question, so
-      // its owed lines retire on every surface whose record matches — a
-      // line raised on the mirrored card's surface retires even when this
-      // submission ran on the other one.
-      clearOwedAnswersEverywhere(source, item);
-      void resolveQuestion(source, item.id, { kind: "answered", answers });
+      // Every answer is collected; but the question is not resolved yet —
+      // the lines stay standing while the api call flies, and the guarded
+      // cleanup runs only on success, exactly like the reject path: a
+      // failed answer's own status must not also silently remove the
+      // still-valid validation lines, and a line the same pending request
+      // raises while its answer hangs is the success's to retire on every
+      // surface whose record matches.
+      void resolveQuestion(source, item.id, { kind: "answered", answers }).then(resolved => { if (resolved) clearOwedAnswersEverywhere(source, item); });
     });
   };
 
