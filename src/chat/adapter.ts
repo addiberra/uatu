@@ -78,6 +78,7 @@ type InventorySessionMetadata = {
   title: string;
   deleted: boolean;
 };
+type HistoryCoverage = { signal: AbortSignal; assertCurrent: () => void; merge: (items: ConversationItem[]) => ConversationItem[]; changed: (id: string) => boolean; inboxReconciled: boolean };
 
 export class InteractionConflictError extends Error {
   constructor(message = "interaction request is stale or already resolved") {
@@ -446,6 +447,7 @@ export class ChatAdapter {
   // projection is warm; every miss recovers through the provider seam.
   private readonly configurations = new Map<string, ConversationConfiguration>();
   private readonly configurationReads = new Map<string, Promise<ConversationConfiguration>>();
+  private readonly nativeHistoryReads = new Map<string, { stream: AbortController | null; promise: Promise<ConversationSnapshot>; recovery: { dirty: boolean } }>();
   private readonly promptAdmissions = new Map<string, Promise<void>>();
   private readonly reversibleHistory = new Map<string, ReversibleHistoryState>();
   // Set before an interrupt or rewrite read. Provider idle events can arrive
@@ -672,7 +674,75 @@ export class ChatAdapter {
   }
 
   async history(id: string, options: { cursor?: string; limit?: number } = {}): Promise<ConversationSnapshot> {
+    if (!this.provider.waitForEventStream) return this.readHistory(id, options);
+    if (!this.pumpPromise) void this.startEventPump().catch(() => undefined);
+    const reusable = !options.cursor && options.limit === undefined;
+    const pending = this.nativeHistoryReads.get(id);
+    if (reusable && pending?.stream === this.pumpController) return pending.promise;
+    const recovery = { dirty: false };
+    const promise = this.readCoveredHistory(id, options, recovery);
+    if (reusable) {
+      const owner = { stream: this.pumpController, promise, recovery };
+      this.nativeHistoryReads.set(id, owner);
+      void promise.finally(() => { if (this.nativeHistoryReads.get(id) === owner) this.nativeHistoryReads.delete(id); }).catch(() => undefined);
+    }
+    return promise;
+  }
+
+  private async readCoveredHistory(id: string, options: { cursor?: string; limit?: number }, recovery: { dirty: boolean }): Promise<ConversationSnapshot> {
+    const stream = this.pumpController;
+    const lifetime = new AbortController();
+    const signal = AbortSignal.any([lifetime.signal, ...(stream ? [stream.signal] : [])]);
+    const timer = setTimeout(() => lifetime.abort(), 5_000);
+    let fence: ReturnType<ConversationProjection["beginHistoryRead"]> | undefined;
+    let ready = false;
+    let unavailable!: () => void;
+    const expired = new Promise<never>((_resolve, reject) => { unavailable = () => reject(new Error("Inbox recovery unavailable")); });
+    signal.addEventListener("abort", unavailable, { once: true });
+    try {
+      return await Promise.race([(async () => {
+        // V2 cannot replay the handshake gap. History AND inbox must be read
+        // after the native server.connected frame, on the same owned stream.
+        await this.provider.waitForEventStream!(signal);
+        // The provider resolves its barrier before yielding the handshake;
+        // let the adapter record that frame's generation before capturing it.
+        if (this.provider.reconcileBackgroundTasks) await this.backgroundReady;
+        signal.throwIfAborted();
+        ready = true;
+        const generation = this.backgroundStreamGeneration;
+        const assertCurrent = () => {
+          if (signal.aborted || this.disposed || this.pumpController !== stream || generation !== this.backgroundStreamGeneration) throw new Error("Inbox recovery unavailable");
+        };
+        // A delivery whose enqueue predates this subscription has no native
+        // payload to replay. Reread storage, never invent a row from dock text.
+        // The whole handoff, including rereads, shares one bounded lifetime.
+        let inboxReconciled = false;
+        while (true) {
+          recovery.dirty = false;
+          fence = this.projection(id).beginHistoryRead();
+          try {
+            const snapshot = await this.readHistory(id, options, { signal, assertCurrent, merge: fence.merge, changed: fence.changed, inboxReconciled });
+            inboxReconciled = true;
+            assertCurrent();
+            if (!recovery.dirty) return snapshot;
+          } finally { fence.release(); }
+        }
+      })(), expired]);
+    } catch (error) {
+      if (!ready || signal.aborted) throw new Error("Inbox recovery unavailable");
+      throw error;
+    }
+    finally {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", unavailable);
+      fence?.release();
+      lifetime.abort();
+    }
+  }
+
+  private async readHistory(id: string, options: { cursor?: string; limit?: number }, coverage?: HistoryCoverage): Promise<ConversationSnapshot> {
     const session = await this.requireSession(id);
+    coverage?.assertCurrent();
     // Captured before the provider reads: a pump event landing during them
     // advances the replay log, and a cursor taken afterwards would tell the
     // client's SSE handshake the event was already delivered when the items
@@ -685,7 +755,8 @@ export class ChatAdapter {
     const attributionOwner = parentId ? this.projections.get(parentId) : undefined;
     const inspectionKey = parentId ? attributionKey(parentId, id) : undefined;
     const inspectionEpoch = inspectionKey ? this.attributionReadEpoch(inspectionKey) : undefined;
-    const page = await this.provider.listMessages(id, { cursor: cursor?.provider, limit: options.limit ?? DEFAULT_PAGE_SIZE });
+    const page = await this.provider.listMessages(id, { cursor: cursor?.provider, limit: options.limit ?? DEFAULT_PAGE_SIZE, ...(coverage ? { signal: coverage.signal } : {}) });
+    coverage?.assertCurrent();
     // An inspection predating parent eviction/revert cannot repopulate its cleared cache.
     if (parentId && attributionOwner && this.projections.get(parentId) === attributionOwner && this.attributionEpochs.get(inspectionKey!) === inspectionEpoch) {
       this.refreshInspectedChildAccounting(id, parentId, page.accounting, page.sessionCostUsd, readStartedAt);
@@ -694,10 +765,14 @@ export class ChatAdapter {
     // steer raised by another client or while the stream was down is listed
     // (opencode-v2-steering D3). Only the first page: an older page is not
     // an attach.
-    if (!cursor) await this.reconcilePendingSteers(id, page.completeItems ?? page.items);
+    // A missing-payload delivery only requires a newer transcript. The inbox
+    // already reconciled under coverage keeps its newer ordered live deltas.
+    if (!cursor && !coverage?.inboxReconciled) await this.reconcilePendingSteers(id, page.completeItems ?? page.items, coverage);
+    coverage?.assertCurrent();
     // Some providers page locally after loading the complete transcript. Reuse
     // that complete source for recovery, never the bounded visible page.
     const configuration = await this.configuration(id);
+    coverage?.assertCurrent();
     const items = page.items.map(item => this.correlateSteerMessage(id, item));
     // A conversation's price is the sum of every message's, and the client
     // folds it from the usage carriers it holds — so the newest page alone
@@ -770,13 +845,14 @@ export class ChatAdapter {
           await this.backgroundReady;
           if (!this.backgroundConnected) throw new Error("Background stream is disconnected");
         }
-        recovered = await this.provider.reconcileBackgroundTasks(id);
+        recovered = await this.provider.reconcileBackgroundTasks(id, coverage ? { signal: coverage.signal } : undefined);
       }
       catch { recovered = []; }
+      coverage?.assertCurrent();
       const { byId, supersedes } = indexRecoveredBackgroundTasks(recovered);
       for (const known of [...this.projection(id).items(), ...items]) {
         if (known.type !== "background_task" || byId.has(known.id)) continue;
-        if (supersedes(known)) {
+        if (supersedes(known) && !coverage?.changed(known.id)) {
           this.projection(id).apply({ kind: "remove", itemId: known.id });
           const index = items.findIndex(item => item.id === known.id);
           if (index >= 0) items.splice(index, 1);
@@ -848,6 +924,7 @@ export class ChatAdapter {
     // fetched per render) — and in parallel, so a fan-out costs one round trip
     // rather than one each.
     await this.attributeLaunchers(id, items, page.completeItems);
+    coverage?.assertCurrent();
     // OpenCode 1.18 never emits `question.v2.asked`, so a pending question is
     // invisible to the event stream and only the provider knows about it.
     // Asking here is what makes an open question answerable at all. A failed
@@ -857,6 +934,7 @@ export class ChatAdapter {
     try {
       const questionTick = this.interactionClock;
       const pendingNow = await this.pendingQuestions(id);
+      coverage?.assertCurrent();
       for (const pending of pendingNow) {
         if (items.some(item => item.id === pending.id)) continue;
         items.push(pending);
@@ -869,7 +947,7 @@ export class ChatAdapter {
         const live = new Set(pendingNow.map(item => item.id));
         const projection = this.projection(id);
         for (const existing of projection.items()) {
-          if (existing.type !== "question" || existing.status !== "pending" || live.has(existing.id)) continue;
+          if (existing.type !== "question" || existing.status !== "pending" || live.has(existing.id) || coverage?.changed(existing.id)) continue;
           // Announced after the read began: the snapshot predates it, so it
           // stays on the timeline and its notification stays pending.
           if ((this.announced.get(existing.id)?.tick ?? 0) > questionTick) { if (!items.some(item => item.id === existing.id)) items.push(existing); continue; }
@@ -908,6 +986,7 @@ export class ChatAdapter {
     try {
       const permissionTick = this.interactionClock;
       const pendingNow = await this.pendingPermissions(id);
+      coverage?.assertCurrent();
       for (const pending of pendingNow) {
         if (items.some(item => item.id === pending.id)) continue;
         items.push(pending);
@@ -923,7 +1002,7 @@ export class ChatAdapter {
         const live = new Set(pendingNow.map(item => item.id));
         const projection = this.projection(id);
         for (const existing of projection.items()) {
-          if (existing.type !== "permission" || existing.status !== "pending" || live.has(existing.id)) continue;
+          if (existing.type !== "permission" || existing.status !== "pending" || live.has(existing.id) || coverage?.changed(existing.id)) continue;
           if ((this.announced.get(existing.id)?.tick ?? 0) > permissionTick) { if (!items.some(item => item.id === existing.id)) items.push(existing); continue; }
           projection.apply({ kind: "remove", itemId: existing.id });
           this.permissionCreatedAt.delete(existing.id);
@@ -944,7 +1023,11 @@ export class ChatAdapter {
         if (!vouchedGone && !items.some(item => item.id === existing.id)) items.push(existing);
       }
     }
+    coverage?.assertCurrent();
+    const reversibleHistory = await this.readReversibleHistoryState(id);
+    coverage?.assertCurrent();
     const projection = this.projection(id);
+    if (coverage) items.splice(0, items.length, ...coverage.merge(items));
     // The live-task snapshot above was taken before several awaits; a task
     // that settled in the projection meanwhile keeps its settled row.
     for (let index = 0; index < items.length; index += 1) {
@@ -965,7 +1048,14 @@ export class ChatAdapter {
       const current = projection.find(candidate => candidate.id === item.id);
       if (current?.type === "scheduled_wakeup" && (current.status === "fired" || current.status === "cancelled")) items[index] = current;
     }
-    projection.seed(items);
+    if (this.provider.waitForEventStream) {
+      // Recovery is also for clients already listening when V2 reconnects.
+      // Publish recovered values, not just a silent seed of the next snapshot.
+      for (const item of items) {
+        const current = projection.get(item.id);
+        if (!current || !sameConversationItems([current], [item])) projection.apply({ kind: "upsert", item });
+      }
+    } else projection.seed(items);
     if (this.provider.reconcileBackgroundTasks) this.syncBackgroundState(id);
     // A reopened conversation whose agent still holds live work is in the
     // background state, not idle: the list and the status must agree.
@@ -975,7 +1065,6 @@ export class ChatAdapter {
       // Likewise a session held for its wakeups is scheduled, not idle.
       projection.statusUpdate("scheduled");
     }
-    const reversibleHistory = await this.readReversibleHistoryState(id);
     return {
       conversation: this.summary(session, projection.status),
       configuration,
@@ -1791,7 +1880,7 @@ export class ChatAdapter {
    * empty, and leaves the map as it stands. With no turn live, listed steers
    * are stranded until something wakes the agent.
    */
-  private async reconcilePendingSteers(conversationId: string, history: readonly ConversationItem[] = []): Promise<void> {
+  private async reconcilePendingSteers(conversationId: string, history: readonly ConversationItem[] = [], coverage?: HistoryCoverage): Promise<void> {
     if (!this.provider.listPendingInbox || !this.agent().capabilities.includes("steering")) return;
     if (this.disposed) return;
     // Attach may precede the service's pump. Own and observe that pump, then
@@ -1800,7 +1889,7 @@ export class ChatAdapter {
     if (this.provider.waitForEventStream && !this.pumpPromise) void this.startEventPump().catch(() => undefined);
     const stream = this.provider.waitForEventStream ? this.pumpController : null;
     const lifetime = new AbortController();
-    const signal = stream ? AbortSignal.any([stream.signal, lifetime.signal]) : lifetime.signal;
+    const signal = AbortSignal.any([lifetime.signal, ...(stream ? [stream.signal] : []), ...(coverage ? [coverage.signal] : [])]);
     let unavailable!: () => void;
     const expired = new Promise<never>((_resolve, reject) => { unavailable = () => reject(new Error("Inbox recovery unavailable")); });
     signal.addEventListener("abort", unavailable, { once: true });
@@ -1820,6 +1909,7 @@ export class ChatAdapter {
       })(), expired]);
       // A late response belongs only to the connection that covered its read.
       if (signal.aborted || this.disposed || stream && this.pumpController !== stream) throw new Error("Inbox recovery unavailable");
+      coverage?.assertCurrent();
     } catch {
       // Native recovery needs both stream coverage and a successful list:
       // the stream cannot replay changes missed before its handshake. Keep
@@ -2971,6 +3061,14 @@ export class ChatAdapter {
     return pending;
   }
 
+  private invalidateNativeHistoryAccounting(): void {
+    // V2 has no replay. A previous generation's completeness (or pending
+    // reconstruction) cannot stand in for the child's current stored history.
+    this.completeAttributions.clear();
+    this.attributionReconstructions.clear();
+    for (const key of this.attributionEpochs.keys()) this.attributionEpochs.set(key, ++this.attributionSequence);
+  }
+
   private async reconstructAttributionRead(key: string, childId: string, epoch: number, ancestry: ReadonlySet<string>): Promise<void> {
     const byMessage = new Map<string, TokenUsage>();
     const byModel = new Map<string, MessageModel>();
@@ -3035,15 +3133,18 @@ export class ChatAdapter {
     // rebuilt live after an eviction, which the store read is squaring, not
     // replacing. A message the store dropped is handled where the drop is
     // seen: a removal event withdraws it, and a revert invalidates the
-    // child's tally outright. A model attributed live outranks the stored
-    // one either way.
+    // child's tally outright. V2 also orders models against this read, so
+    // pre-disconnect metadata cannot overrule its current stored evidence;
+    // legacy providers retain their live-model precedence.
     const live = this.childUsage.get(key);
     const arrivals = this.attributionArrivals.get(key);
     if (live) for (const [messageId, usage] of live) {
       if (!byMessage.has(messageId) || (arrivals?.get(messageId) ?? 0) > readStartedAt) byMessage.set(messageId, usage);
     }
     const liveModels = this.childModels.get(key);
-    if (liveModels) for (const [messageId, model] of liveModels) byModel.set(messageId, model);
+    if (liveModels) for (const [messageId, model] of liveModels) {
+      if (!this.provider.waitForEventStream || !byModel.has(messageId) || (arrivals?.get(messageId) ?? 0) > readStartedAt) byModel.set(messageId, model);
+    }
     // Which prompt a message answers never changes, so the store's word
     // stands and a live one only fills what the store did not say. Prompts
     // and launchers seen live during the read are newer than the transcript
@@ -3464,7 +3565,8 @@ export class ChatAdapter {
     this.eventCoalescer = coalescer;
     const reconcileInboxes = () => {
       for (const id of new Set([...this.projections.keys(), ...this.pendingSteers.keys()])) {
-        void this.reconcilePendingSteers(id).catch(() => undefined);
+        if (this.provider.waitForEventStream) void this.history(id).catch(() => undefined);
+        else void this.reconcilePendingSteers(id).catch(() => undefined);
       }
     };
     // Native V2 has no replay: subscribe before reading recovery truth, then
@@ -3474,8 +3576,8 @@ export class ChatAdapter {
     try {
       for await (const normalized of this.provider.events(signal)) {
         if (signal.aborted) break;
-        if (this.provider.waitForEventStream && normalized.eventType === "server.connected") reconcileInboxes();
-        if (this.provider.reconcileBackgroundTasks && normalized.eventType === "server.connected") {
+        if ((this.provider.reconcileBackgroundTasks || this.provider.waitForEventStream) && normalized.eventType === "server.connected") {
+          if (this.provider.waitForEventStream) this.invalidateNativeHistoryAccounting();
           this.backgroundConnected = true;
           this.backgroundReadyResolve?.();
           this.backgroundReadyResolve = undefined;
@@ -3490,6 +3592,7 @@ export class ChatAdapter {
             }
           }).catch(() => undefined);
         }
+        if (this.provider.waitForEventStream && normalized.eventType === "server.connected") reconcileInboxes();
         const interactionUpdate = normalized.updates.some(update => update.kind === "upsert" && (update.item.type === "permission" || update.item.type === "question")
           || update.kind === "remove" && /^(permission|question):/.test(update.itemId));
         if (this.provider.reconcileBackgroundTasks && normalized.conversationId && (interactionUpdate || /^(session\.(inbox\.(enqueued|delivered)|tool\.success|message\.content\.updated|execution\.(succeeded|failed|interrupted)))$/.test(normalized.eventType))) {
@@ -3557,6 +3660,13 @@ export class ChatAdapter {
           else timelineUpdates.push(update);
         }
         coalescer.push(normalized.conversationId, timelineUpdates);
+        if (this.provider.waitForEventStream && normalized.updates.some(update => update.kind === "inbox" && update.delta.kind === "settled"
+          && update.delta.outcome === "delivered" && !this.projection(normalized.conversationId!).has(`message:${update.delta.id}`)
+          && !timelineUpdates.some(candidate => candidate.kind === "upsert" && candidate.item.id === `message:${update.delta.id}`))) {
+          const reading = this.nativeHistoryReads.get(normalized.conversationId);
+          if (reading?.stream === this.pumpController) reading.recovery.dirty = true;
+          else void this.history(normalized.conversationId).catch(() => undefined);
+        }
         // OpenCode never emits `question.v2.asked`, so the arrival of the
         // `question` tool part is the only live signal that a question was
         // asked or answered. Ask the provider for the real pending set and
@@ -3587,6 +3697,7 @@ export class ChatAdapter {
       this.backgroundReadyResolve?.();
       this.backgroundReadyResolve = undefined;
       this.backgroundStreamGeneration++;
+      if (this.provider.waitForEventStream) this.invalidateNativeHistoryAccounting();
       for (const recovery of this.backgroundRecoveries.values()) { clearTimeout(recovery.timer); recovery.timer = undefined; }
       if (this.provider.reconcileBackgroundTasks && !this.disposed) {
         for (const projection of this.projections.values()) {
@@ -4203,6 +4314,30 @@ export class ConversationProjection {
   status: ConversationStatus = "idle";
   private readonly timeline = new Map<string, ConversationItem>();
   private readonly text = new ProviderTextReconciler();
+  // Only concurrent covered reads retain change fences. No permanent removal
+  // tombstones: each owner releases its set on completion, abort or deadline.
+  private readonly historyReads = new Set<Set<string>>();
+
+  beginHistoryRead() {
+    const changed = new Set<string>();
+    this.historyReads.add(changed);
+    return {
+      changed: (id: string) => changed.has(id),
+      merge: (items: ConversationItem[]) => {
+        const merged = new Map(items.map(item => [item.id, item]));
+        for (const id of changed) {
+          const current = this.timeline.get(id);
+          if (current) merged.set(id, current); else merged.delete(id);
+        }
+        return [...merged.values()].sort((left, right) => left.createdAt - right.createdAt);
+      },
+      release: () => { this.historyReads.delete(changed); },
+    };
+  }
+
+  private historyChanged(id: string): void {
+    for (const read of this.historyReads) read.add(id);
+  }
 
   constructor(
     readonly replay: ConversationReplay,
@@ -4253,6 +4388,8 @@ export class ConversationProjection {
   }
 
   replace(items: ConversationItem[]): ChatEvent {
+    for (const id of this.timeline.keys()) this.historyChanged(id);
+    for (const item of items) this.historyChanged(item.id);
     this.timeline.clear();
     this.text.clear();
     this.interactions?.cleared();
@@ -4263,6 +4400,7 @@ export class ConversationProjection {
   apply(update: NormalizedProviderUpdate): ChatEvent | undefined {
     if (update.kind === "upsert") return this.upsert(update.item);
     if (update.kind === "remove") {
+      this.historyChanged(update.itemId);
       this.timeline.delete(update.itemId);
       this.interactions?.settled(update.itemId);
       // A removed item's stream is over: its reconciler text goes with it,
@@ -4312,6 +4450,7 @@ export class ConversationProjection {
     const item = this.timeline.get(update.itemId);
     if (item?.type === "assistant_message") this.timeline.set(item.id, { ...item, markdown: currentText });
     else if (item?.type === "reasoning") this.timeline.set(item.id, { ...item, text: currentText });
+    this.historyChanged(update.itemId);
     return this.replay.publish({ type: "item.text_delta", itemId: update.itemId, delta });
   }
 
@@ -4334,6 +4473,7 @@ export class ConversationProjection {
     // resources — the plan itself is the content — and client validation
     // accepts empty resources exactly when a plan is present.
     if (merged.type === "permission" && merged.resources.length === 0 && merged.plan === undefined) return undefined;
+    this.historyChanged(item.id);
     this.timeline.set(item.id, merged);
     if ((merged.type === "permission" || merged.type === "question") && merged.status === "pending") this.interactions?.pending(merged.id);
     if (merged.type === "assistant_message") this.text.seed(merged.id.replace(/^part:/, ""), merged.markdown);

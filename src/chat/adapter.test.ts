@@ -21,10 +21,296 @@ import { MetricsRegistry } from "../debug/metrics";
 import type { ConversationInventorySubscription } from "./inventory-broadcaster";
 import { OpenCodeNotificationLifecycle } from "./opencode/notification-lifecycle";
 import { createOpenCodeV2Provider } from "./opencode/v2/provider";
+import { createOpenCodeV2Memory, createOpenCodeV2Normalizer } from "./opencode/v2/normalization";
 import type { AgentNotificationEvent } from "./notifications";
 import { notificationPipeline } from "../../tests/notification-pipeline";
 import { startOpenCodeV2Fake } from "../../tests/e2e/opencode-v2-fake";
 import { addAcceptedDraft, applyChatEvent, projectionFromSnapshot } from "./projection";
+
+test("real V2 initial history includes a steer delivered before the native handshake", async () => {
+  const directory = process.cwd();
+  const fake = startOpenCodeV2Fake({ directory });
+  let requested!: () => void, connect!: () => void;
+  const eventRequested = new Promise<void>(resolve => { requested = resolve; });
+  const connection = new Promise<void>(resolve => { connect = resolve; });
+  let historyBeforeConnected = 0, attaching = false;
+  const transport = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const request = new Request(input, init);
+    const pathname = new URL(request.url).pathname;
+    if (pathname === "/api/event") { requested(); await connection; }
+    if (attaching && pathname.endsWith("/message") && fake.state().eventSubscribers === 0) historyBeforeConnected++;
+    return fetch(request);
+  }) as typeof fetch;
+  const provider = createOpenCodeV2Provider({ endpoint: fake.url, password: fake.password, directory, fetch: transport });
+  const adapter = new ChatAdapter({ provider, workspacePath: directory, coalesceWindowMs: 0 });
+  try {
+    const session = await provider.createSession("Initial history coverage");
+    await adapter.prompt(session.id, "initial", "Initial work");
+    const steer = await adapter.prompt(session.id, "steer", "Delivered in the handshake gap", undefined, undefined, undefined, undefined, "steer");
+    attaching = true;
+    const reading = adapter.history(session.id);
+    await eventRequested;
+    fake.step(session.id);
+    connect();
+    const snapshot = await reading;
+    expect(snapshot.items.filter(item => item.id === `message:${steer.messageId}`)).toHaveLength(1);
+    expect(snapshot.queued).toEqual([]);
+    expect(historyBeforeConnected).toBe(0);
+  } finally { connect(); await adapter.dispose(); await fake.stop(); }
+});
+
+for (const reconnect of [false, true]) test(`real V2 disconnect aborts a snapshot's worker read and retains its ${reconnect ? "new-generation completion" : "uncertain owner"}`, async () => {
+  const directory = process.cwd();
+  const fake = startOpenCodeV2Fake({ directory });
+  let hold = false, captured!: () => void, release!: () => void, returned!: () => void;
+  const activeCaptured = new Promise<void>(resolve => { captured = resolve; });
+  const activeGate = new Promise<void>(resolve => { release = resolve; });
+  const activeReturned = new Promise<void>(resolve => { returned = resolve; });
+  let activeSignal: AbortSignal | undefined;
+  const transport = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const request = new Request(input, init);
+    const response = await fetch(request);
+    if (hold && new URL(request.url).pathname === "/api/session/active") {
+      hold = false;
+      const body = await response.text();
+      activeSignal = request.signal;
+      captured();
+      await activeGate; // Deliberately return a late result even after abort.
+      returned();
+      return new Response(body, { status: response.status, headers: response.headers });
+    }
+    return response;
+  }) as typeof fetch;
+  const provider = createOpenCodeV2Provider({ endpoint: fake.url, password: fake.password, directory, fetch: transport });
+  const adapter = new ChatAdapter({ provider, workspacePath: directory, coalesceWindowMs: 0 });
+  let reading: Promise<unknown> | undefined;
+  let pump: Promise<void> | undefined;
+  try {
+    const session = await provider.createSession("Worker snapshot generation");
+    await adapter.prompt(session.id, "initial", "Initial work");
+    const worker = fake.launchWorker(session.id, true);
+    expect((await adapter.history(session.id)).items).toContainEqual(expect.objectContaining({ taskId: worker.taskId, stateUncertain: false }));
+    hold = true;
+    reading = adapter.history(session.id).catch(error => error);
+    await activeCaptured;
+    fake.disconnect();
+    await adapter.stopEventPump();
+    expect(activeSignal?.aborted).toBe(true);
+    expect(await reading).toBeInstanceOf(Error);
+    const client = await adapter.subscribe(session.id);
+    expect(client.snapshot.items).toContainEqual(expect.objectContaining({ taskId: worker.taskId, status: "running", stateUncertain: true }));
+    let browser = projectionFromSnapshot(client.snapshot);
+    const clientPump = (async () => { for await (const event of client.events) browser = applyChatEvent(browser, event).projection; })();
+    try {
+      if (reconnect) {
+        fake.settleWorker(worker.childId, "completed", "Finished while disconnected");
+        pump = adapter.startEventPump();
+        // The current read must not coalesce with the still-pending old one.
+        await waitUntil(() => browser.items.some(item => item.type === "background_task" && item.taskId === worker.taskId && item.status === "completed"));
+        expect(fake.state().eventSubscribers).toBe(1);
+      }
+      release();
+      await activeReturned;
+      const current = await adapter.subscribe(session.id);
+      expect(current.snapshot.items).toContainEqual(expect.objectContaining({ taskId: worker.taskId, status: reconnect ? "completed" : "running", stateUncertain: !reconnect }));
+      current.events.cancel();
+    } finally { client.events.cancel(); await clientPump; }
+  } finally { release(); await reading; await adapter.dispose(); await pump; await fake.stop(); }
+});
+
+test("real V2 live delivery completion and worker metadata survive an older in-flight history snapshot", async () => {
+  const directory = process.cwd();
+  const fake = startOpenCodeV2Fake({ directory });
+  const provider = createOpenCodeV2Provider({ endpoint: fake.url, password: fake.password, directory });
+  let hold = false, captured!: () => void, release!: () => void;
+  const capturedPage = new Promise<void>(resolve => { captured = resolve; });
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const list = provider.listMessages.bind(provider);
+  provider.listMessages = async (...args) => {
+    const delayed = hold;
+    if (delayed) hold = false;
+    const page = await list(...args);
+    if (delayed) { captured(); await gate; }
+    return page;
+  };
+  const adapter = new ChatAdapter({ provider, workspacePath: directory, coalesceWindowMs: 0 });
+  let reading: ReturnType<ChatAdapter["history"]> | undefined;
+  try {
+    const session = await provider.createSession("Live history fence");
+    await adapter.prompt(session.id, "initial", "Initial work");
+    const worker = fake.launchWorker(session.id, true);
+    fake.workerReport(worker.childId, "old-model", "low", 0.1);
+    await adapter.history(session.id);
+    const client = await adapter.subscribe(session.id);
+    let browser = projectionFromSnapshot(client.snapshot);
+    const clientPump = (async () => { for await (const event of client.events) browser = applyChatEvent(browser, event).projection; })();
+    try {
+      const steer = await adapter.prompt(session.id, "steer", "Delivered while history waits", undefined, undefined, undefined, undefined, "steer");
+      await waitUntil(() => browser.queued.some(item => item.id === steer.messageId));
+      hold = true;
+      reading = adapter.history(session.id);
+      await capturedPage;
+      fake.step(session.id);
+      fake.workerReport(worker.childId, "latest-model", "high", 0.2);
+      await waitUntil(() => browser.items.some(item => item.type === "tool" && item.workerSession?.model === "latest-model" && item.workerSession.effort === "high"));
+      fake.settleWorker(worker.childId, "completed", "Completed during history read");
+      await waitUntil(() => browser.items.some(item => item.id === `message:${steer.messageId}`));
+      // The native final step reports its own default model and no effort or
+      // price. Those deliberate metadata clears outrank the older page too.
+      await waitUntil(() => browser.items.some(item => item.type === "tool" && item.workerSession?.model === "fake-model" && item.workerSession.effort === null && item.workerSession.costUsd === null)
+        && browser.items.some(item => item.type === "background_task" && item.taskId === worker.taskId && item.status === "completed"));
+      release();
+      const snapshot = await reading;
+      expect(snapshot.items.filter(item => item.id === `message:${steer.messageId}`)).toHaveLength(1);
+      expect(snapshot.queued).toEqual([]);
+      expect(browser.items.filter(item => item.id === `message:${steer.messageId}`)).toHaveLength(1);
+      expect(snapshot.items).toContainEqual(expect.objectContaining({ taskId: worker.taskId, status: "completed" }));
+      expect(snapshot.items).toContainEqual(expect.objectContaining({ id: `tool:${worker.callId}`, workerSession: { model: "fake-model", effort: null, costUsd: null } }));
+    } finally { client.events.cancel(); await clientPump; }
+  } finally { release(); await reading?.catch(() => undefined); await adapter.dispose(); await fake.stop(); }
+});
+
+test("real V2 reconnect refreshes child model effort and cost without reusing the previous generation", async () => {
+  const directory = process.cwd();
+  const fake = startOpenCodeV2Fake({ directory });
+  const provider = createOpenCodeV2Provider({ endpoint: fake.url, password: fake.password, directory });
+  const adapter = new ChatAdapter({ provider, workspacePath: directory, coalesceWindowMs: 0 });
+  let pump: Promise<void> | undefined;
+  try {
+    const session = await provider.createSession("Child recovery generation");
+    await adapter.prompt(session.id, "initial", "Initial work");
+    const worker = fake.launchWorker(session.id, true);
+    fake.workerReport(worker.childId, "old-model", "low", 0.1);
+    const initial = await adapter.history(session.id);
+    expect(initial.items).toContainEqual(expect.objectContaining({ id: `tool:${worker.callId}`, workerSession: { model: "old-model", effort: "low", costUsd: 0.1 } }));
+    const client = await adapter.subscribe(session.id);
+    let browser = projectionFromSnapshot(client.snapshot);
+    const clientPump = (async () => { for await (const event of client.events) browser = applyChatEvent(browser, event).projection; })();
+    try {
+      await adapter.stopEventPump();
+      fake.workerReport(worker.childId, "new-model", "high", 0.2);
+      pump = adapter.startEventPump();
+      await waitUntil(() => browser.items.some(item => item.type === "tool" && item.workerSession?.model === "new-model"));
+      expect(browser.items).toContainEqual(expect.objectContaining({ id: `tool:${worker.callId}`, workerSession: { model: "new-model", effort: "high", costUsd: 0.30000000000000004 } }));
+    } finally { client.events.cancel(); await clientPump; }
+  } finally { await adapter.dispose(); await pump; await fake.stop(); }
+});
+
+for (const kind of ["worker", "history"] as const) test(`real V2 abort releases a covered ${kind}-read owner even when its transport returns late`, async () => {
+  const directory = process.cwd();
+  const fake = startOpenCodeV2Fake({ directory });
+  let hold = false, captured!: () => void, release!: () => void;
+  const activeCaptured = new Promise<void>(resolve => { captured = resolve; });
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const transport = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const request = new Request(input, init);
+    const response = await fetch(request);
+    const pathname = new URL(request.url).pathname;
+    if (hold && (kind === "worker" ? pathname === "/api/session/active" : pathname.endsWith("/message"))) {
+      hold = false;
+      const body = await response.text();
+      captured();
+      await gate;
+      return new Response(body, { status: response.status, headers: response.headers });
+    }
+    return response;
+  }) as typeof fetch;
+  const provider = createOpenCodeV2Provider({ endpoint: fake.url, password: fake.password, directory, fetch: transport });
+  const adapter = new ChatAdapter({ provider, workspacePath: directory, coalesceWindowMs: 0 });
+  let reading: Promise<unknown> | undefined;
+  try {
+    const session = await provider.createSession("Bounded worker read ownership");
+    await adapter.prompt(session.id, "initial", "Initial work");
+    const worker = fake.launchWorker(session.id, true);
+    await adapter.history(session.id);
+    const target = kind === "worker" ? session : await provider.createSession("Cold covered history read");
+    const controller = new AbortController();
+    hold = true;
+    let settled = false;
+    reading = (kind === "worker" ? provider.reconcileBackgroundTasks!(target.id, { signal: controller.signal })
+      : provider.listMessages(target.id, { limit: 50, signal: controller.signal })).catch(error => error).finally(() => { settled = true; });
+    await activeCaptured;
+    controller.abort();
+    await flushUntil(() => settled);
+    expect(await reading).toBeInstanceOf(Error);
+    // A new current read is neither blocked on the retired owner nor forced
+    // to create another event subscription to recover its worker controls.
+    const snapshot = await adapter.history(target.id);
+    if (kind === "worker") expect(snapshot.items).toContainEqual(expect.objectContaining({ taskId: worker.taskId, status: "running", stateUncertain: false }));
+    else expect(snapshot.items).toEqual([]);
+    expect(fake.state().eventSubscribers).toBe(1);
+  } finally { release(); await reading; await adapter.dispose(); await fake.stop(); }
+});
+
+test("real V2 covered history preserves cursor validation and missing-session errors", async () => {
+  const directory = process.cwd();
+  const fake = startOpenCodeV2Fake({ directory });
+  const provider = createOpenCodeV2Provider({ endpoint: fake.url, password: fake.password, directory });
+  const adapter = new ChatAdapter({ provider, workspacePath: directory, coalesceWindowMs: 0 });
+  try {
+    const session = await provider.createSession("Covered history errors");
+    await expect(adapter.history(session.id, { cursor: "invalid" })).rejects.toThrow("invalid history cursor");
+    await expect(adapter.history("ses_missing")).rejects.toBeInstanceOf(ConversationNotFoundError);
+  } finally { await adapter.dispose(); await fake.stop(); }
+});
+
+test("real V2 resolved questions and public provider removals survive an older covered form read", async () => {
+  const directory = process.cwd();
+  const fake = startOpenCodeV2Fake({ directory });
+  let owner = "", pending = true, hold = false, captured!: () => void, release!: () => void;
+  const formCaptured = new Promise<void>(resolve => { captured = resolve; });
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const transport = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const request = new Request(input, init);
+    if (new URL(request.url).pathname === "/api/form") {
+      const data = pending ? [{ id: "frm_covered", sessionID: owner, title: "Choose", fields: [{ key: "choice", type: "string", label: "Choice" }] }] : [];
+      if (hold) { captured(); await gate; }
+      return Response.json({ data });
+    }
+    return fetch(request);
+  }) as typeof fetch;
+  const provider = createOpenCodeV2Provider({ endpoint: fake.url, password: fake.password, directory, fetch: transport });
+  const events = provider.events.bind(provider);
+  const normalize = createOpenCodeV2Normalizer(directory);
+  const memory = createOpenCodeV2Memory();
+  const injected: NormalizedProviderEvent[] = [];
+  // Extend the fake at the public event seam; the form frame still goes
+  // through the actual V2 normalizer, not a projection/private-state patch.
+  provider.events = async function* (signal) {
+    for await (const event of events(signal)) {
+      yield event;
+      while (injected.length) yield injected.shift()!;
+    }
+  };
+  const adapter = new ChatAdapter({ provider, workspacePath: directory, coalesceWindowMs: 0 });
+  let reading: ReturnType<ChatAdapter["history"]> | undefined;
+  try {
+    const session = await provider.createSession("Question history fence");
+    owner = session.id;
+    const initial = await adapter.prompt(session.id, "initial", "Initial work");
+    expect((await adapter.history(session.id)).items).toContainEqual(expect.objectContaining({ id: "question:frm_covered", status: "pending" }));
+    const client = await adapter.subscribe(session.id);
+    let browser = projectionFromSnapshot(client.snapshot);
+    const clientPump = (async () => { for await (const event of client.events) browser = applyChatEvent(browser, event).projection; })();
+    try {
+      hold = true;
+      reading = adapter.history(session.id);
+      await formCaptured;
+      pending = false;
+      injected.push(normalize({ id: "evt_form_cancelled", type: "form.cancelled", created: Date.now(), location: { directory }, data: { id: "frm_covered", sessionID: owner } }, memory));
+      // Exercise the seam's removal contract without claiming a stronger
+      // native V2 removal/replay protocol than the provider exposes.
+      injected.push({ conversationId: owner, eventType: "fixture.remove", outcome: "handled", updates: [{ kind: "remove", itemId: `message:${initial.messageId}` }] });
+      await provider.prompt(session.id, { id: "form-event-tick", text: "Explicit fake event tick", delivery: "steer" });
+      await waitUntil(() => browser.items.some(item => item.id === "question:frm_covered" && item.type === "question" && item.status === "resolved") && !browser.items.some(item => item.id === `message:${initial.messageId}`));
+      release();
+      const snapshot = await reading;
+      expect(snapshot.items).toContainEqual(expect.objectContaining({ id: "question:frm_covered", status: "resolved" }));
+      expect(snapshot.items.some(item => item.id === `message:${initial.messageId}`)).toBe(false);
+      expect(browser.items.filter(item => item.type === "question" && item.status === "pending")).toEqual([]);
+    } finally { client.events.cancel(); await clientPump; }
+  } finally { release(); await reading?.catch(() => undefined); await adapter.dispose(); await fake.stop(); }
+});
 
 test("real V2 reconnect establishes its subscription before reading the native inbox", async () => {
   const directory = process.cwd();
@@ -52,6 +338,9 @@ test("real V2 reconnect establishes its subscription before reading the native i
     await adapter.prompt(session.id, "initial", "Initial work");
     const steer = await adapter.prompt(session.id, "steer", "Old native instruction", undefined, undefined, undefined, undefined, "steer");
     const held = await adapter.prompt(session.id, "held", "Held until a later turn", undefined, undefined, undefined, undefined, "queue");
+    const client = await adapter.subscribe(session.id);
+    let browser = projectionFromSnapshot(client.snapshot);
+    const clientPump = (async () => { for await (const event of client.events) browser = applyChatEvent(browser, event).projection; })();
     await adapter.stopEventPump(); await pump;
     await waitUntil(() => fake.state().eventSubscribers === 0);
     reconnect = true;
@@ -64,6 +353,12 @@ test("real V2 reconnect establishes its subscription before reading the native i
     release();
     await waitUntil(() => inboxReads > 0 && adapter.pendingSteersForTests(session.id).some(entry => entry.id === external.messageId));
     expect(adapter.pendingSteersForTests(session.id).map(entry => entry.id)).toEqual([external.messageId]);
+    // Already-listening clients recover the entire missed handoff, without a
+    // manual history request or replaying any delivery operation.
+    try {
+      await waitUntil(() => browser.items.some(item => item.id === `message:${steer.messageId}`) && browser.queued.some(item => item.id === external.messageId));
+      expect(browser.items.filter(item => item.id === `message:${steer.messageId}`)).toHaveLength(1);
+    } finally { client.events.cancel(); await clientPump; }
     const snapshot = await adapter.history(session.id);
     expect(snapshot.items.filter(item => item.id === `message:${steer.messageId}`)).toHaveLength(1);
     expect(snapshot.queued?.map(entry => entry.id)).toEqual([external.messageId, held.messageId]);
@@ -184,7 +479,9 @@ for (const snapshotKind of ["stale", "empty"] as const) test(`real V2 initial at
     const external = await provider.prompt(session.id, { id: "external-during-read", text: "Newer than snapshot", delivery: "steer" });
     await waitUntil(() => !adapter.pendingSteersForTests(session.id).some(entry => entry.id === steer.messageId) && adapter.pendingSteersForTests(session.id).some(entry => entry.id === external.messageId));
     releaseList();
-    expect((await reading).queued?.map(entry => entry.id)).toEqual([external.messageId]);
+    const snapshot = await reading;
+    expect(snapshot.queued?.map(entry => entry.id)).toEqual([external.messageId]);
+    expect(snapshot.items.filter(item => item.id === `message:${steer.messageId}`)).toHaveLength(1);
     expect(adapter.pendingSteersForTests(session.id).map(entry => entry.id)).toEqual([external.messageId]);
     // This generation missed the original enqueue payload; its native stored
     // transcript, rather than an invented delivery row, supplies that input.

@@ -311,7 +311,7 @@ export interface ChatProvider {
   createSession(id: string, configuration?: ConversationConfiguration): Promise<ProviderSession>;
   getSession(id: string): Promise<ProviderSession | null>;
   getConversationConfiguration(sessionId: string): Promise<ConversationConfiguration>;
-  listMessages(sessionId: string, options: { cursor?: string; limit: number }): Promise<ProviderHistoryPage>;
+  listMessages(sessionId: string, options: { cursor?: string; limit: number; signal?: AbortSignal }): Promise<ProviderHistoryPage>;
   getReversibleHistoryState?(sessionId: string): Promise<ReversibleHistoryState>;
   undo?(sessionId: string): Promise<ReversibleHistoryResult>;
   redo?(sessionId: string): Promise<ReversibleHistoryResult>;
@@ -410,7 +410,7 @@ export interface ChatProvider {
   /** Scoped evidence, including terminal results and uncertain last-known rows.
    * Unlike a live-only list, absence is never an instruction to cancel a task.
    */
-  reconcileBackgroundTasks?(sessionId: string, options?: { fresh?: boolean }): Promise<import("./types").BackgroundTaskItem[]>;
+  reconcileBackgroundTasks?(sessionId: string, options?: { fresh?: boolean; signal?: AbortSignal }): Promise<import("./types").BackgroundTaskItem[]>;
   backgroundBlockingWork?(sessionId: string): Promise<void>;
   /** Native one-shot context answer, with no admission, tool loop or turn interruption. */
   generate?(sessionId: string, prompt: string): Promise<string>;

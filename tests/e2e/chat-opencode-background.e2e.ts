@@ -428,7 +428,8 @@ for (const kind of ["child", "shell"] as const) test(`unknown ${kind} stop stays
   await openChatWorkers(page);
   await activeTask(page, worker.taskId).locator("[data-stop-task]").click();
   if (kind === "shell") await page.getByRole("dialog", { name: "Stop shell worker?" }).getByRole("button", { name: "Stop shell worker", exact: true }).click();
-  await expect(page.locator("#chat-state")).toContainText("Outcome unknown");
+  await expect(page.locator("#chat-composer-error")).toBeVisible();
+  await expect(page.locator("#chat-composer-error")).toContainText("Outcome unknown");
   const retry = await page.request.post(`/api/chat/conversations/${encodeURIComponent(conversationId)}/tasks/${encodeURIComponent(worker.taskId)}/stop`, { headers: { origin: new URL(page.url()).origin }, data: { requestId } });
   expect(retry.status()).toBe(409);
   await page.reload(); await openChatPanel(page);

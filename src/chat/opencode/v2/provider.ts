@@ -60,6 +60,7 @@ export function createOpenCodeV2Provider(options: {
 export class OpenCodeV2Provider implements ChatProvider {
   private readonly historyReuse = new HistoryReuse<StoredMessage[]>();
   private readonly readLifetime = new AbortController();
+  private streamReads?: AbortController;
   private readonly backgroundReads = new Map<string, Promise<import("../../types").BackgroundTaskItem[]>>();
   private readonly notificationLifecycle = new OpenCodeNotificationLifecycle();
   // How many models the last catalog read offered; null before the first.
@@ -319,9 +320,10 @@ export class OpenCodeV2Provider implements ChatProvider {
    * newest user record before it (2.x names no prompt on an assistant
    * record either).
    */
-  async listMessages(sessionId: string, options: { cursor?: string; limit: number }): Promise<ProviderHistoryPage> {
-    const complete = await this.allMessages(sessionId);
-    const info = await this.lookupSession(sessionId);
+  async listMessages(sessionId: string, options: { cursor?: string; limit: number; signal?: AbortSignal }): Promise<ProviderHistoryPage> {
+    const signal = this.readSignal(options.signal);
+    const complete = await this.allMessages(sessionId, signal);
+    const info = await this.lookupSession(sessionId, signal);
     const boundaryId = stringValue(asRecord(asRecord(info).revert).messageID);
     const boundaryIndex = boundaryId ? complete.findIndex(message => messageIdentity(message) === boundaryId) : -1;
     const visible = boundaryIndex >= 0 ? complete.slice(0, boundaryIndex) : complete;
@@ -329,7 +331,8 @@ export class OpenCodeV2Provider implements ChatProvider {
     const end = historyPageEnd(options.cursor, version, visible.length);
     const start = Math.max(0, end - Math.max(1, options.limit));
     const page = visible.slice(start, end);
-    const normalized = await this.backgroundHistory(sessionId, visible);
+    const normalized = await this.backgroundHistory(sessionId, visible, signal);
+    signal.throwIfAborted();
     const liveLaunches = new Set([...normalized.values()].flatMap(({ item }) => item.type === "background_task" && item.status === "running"
       ? [...(item.toolUseIds ?? []), ...(item.toolUseId ? [item.toolUseId] : [])].map(id => `tool:${id}`) : []));
     const accounting: StoredMessageAccounting[] = [];
@@ -352,7 +355,7 @@ export class OpenCodeV2Provider implements ChatProvider {
     };
   }
 
-  private async backgroundHistory(sessionId: string, visible: StoredMessage[]) {
+  private async backgroundHistory(sessionId: string, visible: StoredMessage[], signal = this.readSignal()) {
     // A finite complete-history fold is discarded after this read; only
     // long-lived stream memory uses the retention budget/fallback.
     const workers = new BackgroundWorkers({ entries: Infinity, bytes: Infinity });
@@ -366,8 +369,8 @@ export class OpenCodeV2Provider implements ChatProvider {
         return child ? [child] : [];
       }) : []));
     for (const child of children) {
-      const session = await this.getSession(child);
-      if (session?.parentId !== sessionId) continue;
+      const session = await this.lookupSession(child, signal);
+      if (session?.parentID !== sessionId) continue;
       workers.verifyChild(child, sessionId);
       const launches = visible.flatMap(message => Array.isArray(message.content) ? message.content : [])
         .filter(part => asRecord(asRecord(asRecord(part).state).metadata).sessionID === child);
@@ -377,7 +380,7 @@ export class OpenCodeV2Provider implements ChatProvider {
         // launcher completes (or when another client continued the child).
         // An active child alone cannot verify that old occurrence.
         try {
-          for (const message of await this.allMessages(child)) {
+          for (const message of await this.allMessages(child, signal)) {
             if (message.type === "idle") workers.executionEnded(child, messageCreatedAt(message));
           }
         } catch { unavailableChildren.add(child); }
@@ -401,61 +404,90 @@ export class OpenCodeV2Provider implements ChatProvider {
     return normalized;
   }
 
-  reconcileBackgroundTasks(sessionId: string, options?: { fresh?: boolean }): Promise<import("../../types").BackgroundTaskItem[]> {
+  reconcileBackgroundTasks(sessionId: string, options?: { fresh?: boolean; signal?: AbortSignal }): Promise<import("../../types").BackgroundTaskItem[]> {
     if (options?.fresh) {
       const read = () => {
         // An older in-flight inventory is not post-action evidence. Invalidate
         // reuse (including child execution boundaries) before the new read.
         this.historyReuse.invalidate();
-        return this.reconcileBackgroundTasks(sessionId);
+        return this.reconcileBackgroundTasks(sessionId, { signal: options.signal });
       };
       const previous = this.backgroundReads.get(sessionId);
       return previous ? previous.catch(() => undefined).then(read) : read();
     }
     const pending = this.backgroundReads.get(sessionId);
     if (pending) return pending;
-    const read = this.readBackgroundTasks(sessionId).finally(() => {
+    const lifetime = new AbortController();
+    const signal = this.readSignal(AbortSignal.any([lifetime.signal, ...(options?.signal ? [options.signal] : [])]));
+    if (signal.aborted) return Promise.reject(new Error("Background recovery unavailable"));
+    const timer = setTimeout(() => lifetime.abort(), 5_000);
+    const read = this.coveredRead(signal, () => this.readBackgroundTasks(sessionId, signal)).finally(() => {
+      clearTimeout(timer);
+      lifetime.abort();
       if (this.backgroundReads.get(sessionId) === read) this.backgroundReads.delete(sessionId);
     });
     this.backgroundReads.set(sessionId, read);
     return read;
   }
 
-  private async readBackgroundTasks(sessionId: string): Promise<import("../../types").BackgroundTaskItem[]> {
-    if (!await this.getSession(sessionId)) throw new Error("Background parent is unavailable");
+  private async readBackgroundTasks(sessionId: string, signal: AbortSignal): Promise<import("../../types").BackgroundTaskItem[]> {
+    if (!await this.lookupSession(sessionId, signal)) throw new Error("Background parent is unavailable");
     const [history, pending, active] = await Promise.all([
-      this.allMessages(sessionId),
-      this.client.session.inbox.list({ sessionID: sessionId }, { signal: this.readLifetime.signal }),
-      this.client.session.active({ signal: this.readLifetime.signal }).catch(() => undefined),
+      this.allMessages(sessionId, signal),
+      this.client.session.inbox.list({ sessionID: sessionId }, { signal }),
+      this.client.session.active({ signal }).catch(() => undefined),
     ]);
     const stored = new Set(history.map(message => message.id));
     const notifications = (pending as unknown as StoredMessage[]).filter(entry => entry.type === "synthetic" && !stored.has(entry.id))
       .map(entry => ({ ...asRecord(entry.payload), id: entry.id, type: "synthetic", time: entry.time }));
-    const folded = await this.backgroundHistory(sessionId, [...history, ...notifications]);
+    const folded = await this.backgroundHistory(sessionId, [...history, ...notifications], signal);
     const tasks: import("../../types").BackgroundTaskItem[] = [];
     for (const { item } of folded.values()) {
       if (item.type !== "background_task") continue;
       if (item.status !== "running") { tasks.push({ ...item, stateUncertain: false }); continue; }
       let confirmed = !!item.childConversationId && active?.[item.childConversationId] !== undefined;
       if (item.taskType === "shell" && item.outputFile?.startsWith("shell:")) {
-        const shell = await this.client.shell.get({ id: item.outputFile.slice(6), ...this.scope }, { signal: this.readLifetime.signal }).catch(() => undefined);
+        const shell = await this.client.shell.get({ id: item.outputFile.slice(6), ...this.scope }, { signal }).catch(() => undefined);
         // Exit is not job settlement: capture may still be pending. The
         // unique owned shell remains controllable until its job result arrives.
         confirmed = shell?.data.metadata.sessionID === sessionId;
       }
       tasks.push({ ...item, stateUncertain: item.stateUncertain === true || !confirmed });
     }
+    signal.throwIfAborted();
     return tasks;
   }
 
-  private async allMessages(sessionId: string): Promise<StoredMessage[]> {
+  private readSignal(signal?: AbortSignal): AbortSignal {
+    return AbortSignal.any([this.readLifetime.signal, ...(this.streamReads ? [this.streamReads.signal] : []), ...(signal ? [signal] : [])]);
+  }
+
+  private async coveredRead<T>(signal: AbortSignal, read: () => Promise<T>): Promise<T> {
+    signal.throwIfAborted();
+    let aborted!: () => void;
+    const unavailable = new Promise<never>((_resolve, reject) => { aborted = () => reject(new Error("Native recovery unavailable")); });
+    signal.addEventListener("abort", aborted, { once: true });
+    // Retire the shared owner even if a transport ignores cancellation. The
+    // underlying read also checks this same signal before returning a value.
+    try {
+      const value = await Promise.race([read(), unavailable]);
+      signal.throwIfAborted();
+      return value;
+    } finally { signal.removeEventListener("abort", aborted); }
+  }
+
+  private async allMessages(sessionId: string, signal = this.readSignal()): Promise<StoredMessage[]> {
     // Reuse only inside a connected stream generation. Every normalized
     // session event invalidates its entry (including an in-flight read),
     // and reconnect starts cold because V2 offers no provider event replay.
-    return this.historyReuse.read(sessionId, this.streaming ? String(this.streamGeneration) : undefined, () => this.readAllMessages(sessionId));
+    signal.throwIfAborted();
+    const messages = await this.historyReuse.read(sessionId, this.streamConnected ? String(this.streamGeneration) : undefined,
+      () => this.coveredRead(signal, () => this.readAllMessages(sessionId, signal)));
+    signal.throwIfAborted();
+    return messages;
   }
 
-  private async readAllMessages(sessionId: string): Promise<StoredMessage[]> {
+  private async readAllMessages(sessionId: string, signal: AbortSignal): Promise<StoredMessage[]> {
     const finish = measureChatWork("opencode-read");
     try {
       const byId = new Map<string, StoredMessage>();
@@ -465,7 +497,8 @@ export class OpenCodeV2Provider implements ChatProvider {
         // first page.
         const page = await this.client.message.list(cursor
           ? { sessionID: sessionId, limit: 100, cursor }
-          : { sessionID: sessionId, order: "asc", limit: 100 }, { signal: this.readLifetime.signal });
+          : { sessionID: sessionId, order: "asc", limit: 100 }, { signal });
+        signal.throwIfAborted();
         for (const item of page.data as StoredMessage[]) byId.set(messageIdentity(item), item);
         cursor = page.data.length > 0 ? page.cursor.next ?? undefined : undefined;
       } while (cursor);
@@ -491,6 +524,9 @@ export class OpenCodeV2Provider implements ChatProvider {
 
   async *events(signal: AbortSignal): AsyncIterable<NormalizedProviderEvent> {
     this.historyReuse.invalidate();
+    this.backgroundReads.clear();
+    const reads = new AbortController();
+    this.streamReads = reads;
     // Memory scoped to the subscription: one pump, one memory.
     const memory = createOpenCodeV2Memory();
     // Live only once a frame has arrived: until the subscription's first
@@ -571,6 +607,10 @@ export class OpenCodeV2Provider implements ChatProvider {
       // pump's supervisor so it reconnects.
       if (!signal.aborted) throw error;
     } finally {
+      reads.abort();
+      if (this.streamReads === reads) this.streamReads = undefined;
+      this.historyReuse.invalidate();
+      this.backgroundReads.clear();
       this.streaming = false;
       this.streamOpen = false;
       this.streamConnected = false;
@@ -1175,10 +1215,11 @@ export class OpenCodeV2Provider implements ChatProvider {
    * another directory (the workspace never sees a foreign session). Only a
    * not-found answer is a miss; auth and server failures propagate.
    */
-  private async lookupSession(sessionId: string): Promise<SessionRecord | null> {
+  private async lookupSession(sessionId: string, signal = this.readLifetime.signal): Promise<SessionRecord | null> {
     let info: SessionRecord;
     try {
-      info = await this.client.session.get({ sessionID: sessionId }, { signal: this.readLifetime.signal }) as unknown as SessionRecord;
+      info = await this.client.session.get({ sessionID: sessionId }, { signal }) as unknown as SessionRecord;
+      signal.throwIfAborted();
     } catch (error) {
       if (isLookupMiss(error)) return null;
       throw new Error(`OpenCode session lookup failed: ${stringify(error)}`);
