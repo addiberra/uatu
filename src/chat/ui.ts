@@ -19,7 +19,7 @@ import { newRequestId } from "./ids";
 import { insertCommand, localHistoryOperation, matchingCommands, slashCommandQuery, type LocalHistoryOperation } from "./slash-commands";
 import { LatestRefresh } from "./latest-refresh";
 import { navigateWorkspaceFileReference, resolveWorkspaceFileReference } from "./file-references";
-import { READER_CLOSED, QueueDockRenderer, RevertedMessagesDockRenderer, TimelineRenderer, decorateAttachmentImages, decorateFileLinks, formatElapsed, latestTodoEntries, statusLabel, subagentEntries, subagentLabel, workingLabel } from "./timeline-renderer";
+import { READER_CLOSED, QueueDockRenderer, RevertedMessagesDockRenderer, TimelineRenderer, decorateAttachmentImages, decorateFileLinks, formatElapsed, latestTodoEntries, questionStepLabel, statusLabel, subagentEntries, subagentLabel, workingLabel } from "./timeline-renderer";
 import { backgroundStatusLabel, runningBackgroundTasks } from "./background-tasks";
 import { pausedStatusLabel, pausedWakeups, pendingWakeups, scheduledStatusLabel, wakeupFireTime } from "./scheduled-wakeups";
 import { RunningWorkDisclosure } from "./running-work-disclosure";
@@ -735,6 +735,23 @@ export function initChat(api = new ChatApiClient()): void {
   const announce = announcerFor(state);
   const announceChild = announcerFor(drilldownState);
 
+  // Step narration owns a live region of its own, beside each status line.
+  // The status line is shared with connection-interruption messaging, whose
+  // recovery affordance keys on the line's current text: a transient
+  // "Question 2 of 4" landed in it would strip the in-place Reconnect button
+  // while a stream is still down (and its clear() would not re-expose the
+  // owned message). Question steps are ambient, not actionable — they speak
+  // politely without displacing anything.
+  const stepAnnouncerFor = (target: HTMLElement | null): Announcer => {
+    const region = document.createElement("div");
+    region.className = "sr-only";
+    region.setAttribute("aria-live", "polite");
+    target?.parentNode?.insertBefore(region, target.nextSibling);
+    return announcerFor(region);
+  };
+  const announceQuestionStep = stepAnnouncerFor(state);
+  const announceQuestionStepChild = stepAnnouncerFor(drilldownState);
+
   // Connection-interruption messaging has a dedicated owner, PER STREAM. The
   // status line is shared with provider outages, validation refusals, and turn
   // failures — all of which the user still has to act on — so a reconnect may
@@ -772,12 +789,35 @@ export function initChat(api = new ChatApiClient()): void {
         reconnect.remove();
       }
     };
+    // A transient message replaced this owner's interruption text: the
+    // stream is still down underneath, so the in-place recovery affordance
+    // stands beside the transient line until owned text returns.
+    const keepRecoveryVisible = (): void => {
+      if (owned.size > 0 && speak.target) speak.target.append(reconnect);
+    };
     speak.spoken.add(sync);
     return {
       report(stream: string, error: unknown) {
         const message = messageOf(error);
         if (error instanceof ChatConnectionInterruptedError) owned.set(stream, message);
         speak(message, true);
+      },
+      // Whether the line is currently showing one of this owner's messages.
+      isShowingOwned(): boolean {
+        return speak.target !== null && owned.size > 0 && [...owned.values()].includes(speak.current());
+      },
+      // Whether a stream of this surface is still down, even while another
+      // message (a validation refusal on an ordinary click) occupies the
+      // line in its place.
+      hasDown(): boolean {
+        return owned.size > 0;
+      },
+      keepRecoveryVisible,
+      // Speak the newest owned interruption again — a finished message left
+      // the line without retelling it while the stream is still down.
+      restoreOwned(): void {
+        const remaining = [...owned.values()].at(-1);
+        if (remaining !== undefined) speak(remaining, true);
       },
       // This stream's transport is healthy again. Its message goes; if the
       // other stream is still interrupted, the line states that instead of
@@ -786,7 +826,16 @@ export function initChat(api = new ChatApiClient()): void {
         const message = owned.get(stream);
         if (message === undefined) return;
         owned.delete(stream);
-        if (speak.current() !== message) return;
+        if (speak.current() !== message) {
+          // A transient message (a validation refusal on an ordinary click)
+          // displaced this owner's text. While another stream of this
+          // surface is still down, preserve the affordance's current
+          // attached or detached state — re-attaching here would hang
+          // recovery on an unrelated status the user must act on first.
+          // When no interruptions remain at all, it goes.
+          if (owned.size === 0) sync();
+          return;
+        }
         const remaining = [...owned.values()].at(-1);
         speak(remaining ?? "", remaining !== undefined);
       },
@@ -794,6 +843,26 @@ export function initChat(api = new ChatApiClient()): void {
   };
   const interruptions = interruptionsFor(announce);
   const childInterruptions = interruptionsFor(announceChild);
+  // The interruption owner for the surface a message belongs to, so a
+  // transient writer can preserve that surface's recovery affordances.
+  const interruptionsOwnerFor = (source: ChatProjection) =>
+    child && source.conversationId === child.conversationId ? childInterruptions : interruptions;
+
+  // Which question request currently owns each surface's owed-answer line —
+  // the parent's line and the drill-down's are one resource each, shared by
+  // every conversation and card that surface shows, so the timeline wirings
+  // (one per surface, separate closures) must read and write this one map.
+  // The key is the exact question request — its conversation plus its
+  // requestId — not merely the conversation: one conversation can ask again
+  // (or carry a newer mirrored card) while an earlier question's resolve
+  // still sits in flight, and a resolution landing then must never retire
+  // the newer question's line. The record also carries the surface's own
+  // interruption owner, captured when the line was raised: a resolution
+  // landing on one surface retires the line on every surface whose record
+  // matches, and each retired line restores its own surface's affordances.
+  const owedAnswerOwners = new Map<Announcer, { key: string; owner: ReturnType<typeof interruptionsFor> }>();
+  const questionOwnershipKey = (source: ChatProjection, item: Extract<ConversationItem, { type: "question" }>) =>
+    `${item.conversationId ?? source.conversationId}\u0000${item.requestId}`;
 
   const geometryOf = (scroller: HTMLElement, container: HTMLElement): AnchorGeometry => {
     const bounds = scroller.getBoundingClientRect();
@@ -1535,6 +1604,10 @@ export function initChat(api = new ChatApiClient()): void {
         const note = document.createElement("span");
         note.className = "chat-subagent-attribution";
         note.textContent = attribution;
+        // The compact figure rounds a billion-scale run to 1.0B with no
+        // receipt behind it (unpriced subagents produce none), so the exact
+        // total stays one hover away.
+        if (declares("context") && entry.usage) note.title = `${totalTokens(entry.usage).toLocaleString()} tokens`;
         row.append(note);
       }
       return row;
@@ -3520,12 +3593,12 @@ export function initChat(api = new ChatApiClient()): void {
     catch (error) { announceFailureFor(source)(messageOf(error), true); disableCard(itemId, false); }
   };
 
-  const resolveQuestion = async (source: ChatProjection, itemId: string, outcome: QuestionOutcome) => {
+  const resolveQuestion = async (source: ChatProjection, itemId: string, outcome: QuestionOutcome): Promise<boolean> => {
     const item = source.items.find(candidate => candidate.id === itemId);
-    if (!item || item.type !== "question" || item.status !== "pending") return;
+    if (!item || item.type !== "question" || item.status !== "pending") return false;
     disableCard(itemId, true);
-    try { await api.question(item.conversationId ?? source.conversationId, item.requestId, newRequestId(), outcome); }
-    catch (error) { announceFailureFor(source)(messageOf(error), true); disableCard(itemId, false); }
+    try { await api.question(item.conversationId ?? source.conversationId, item.requestId, newRequestId(), outcome); return true; }
+    catch (error) { announceFailureFor(source)(messageOf(error), true); disableCard(itemId, false); return false; }
   };
 
   /**
@@ -3606,7 +3679,16 @@ export function initChat(api = new ChatApiClient()): void {
       } else if (item.type === "permission" && target.dataset.permissionOutcome) {
         void resolvePermission(source, item.id, target.dataset.permissionOutcome as PermissionOutcome);
       } else if (item.type === "question" && target.dataset.questionReject !== undefined) {
-        void resolveQuestion(source, item.id, { kind: "rejected" });
+        // A successful rejection retires the form — and the owed-answer line
+        // a required validation error may have left on the status region:
+        // the same guarded cleanup the answer path runs, but retiring the
+        // line on every surface whose record matches — the mirrored card's
+        // line may belong to the parent while the reject runs here. The
+        // card's own item stays bound: the cleanup retires only the lines
+        // this exact question request raised, never one another question —
+        // of another conversation, or a newer one of this one — raised
+        // while the request sat in flight.
+        void resolveQuestion(source, item.id, { kind: "rejected" }).then(resolved => { if (resolved) clearOwedAnswersEverywhere(source, item); });
       }
     });
     container.addEventListener("keydown", event => {
@@ -3627,6 +3709,67 @@ export function initChat(api = new ChatApiClient()): void {
         target.click();
       }
     });
+    // A step change is spoken, not just shown: with all tabs alike and the
+    // panel swapping above the focus point, a screen-reader user otherwise
+    // hears nothing while the question under their hands changes. Spoken to
+    // the surface that owns the form — answering from a subagent drill-down
+    // announces beside that surface's status line, never into it, so a
+    // connection-interruption message and its Reconnect button stand.
+    const speakQuestionStep = (source: ChatProjection, form: HTMLFormElement) => {
+      const speak = source.conversationId === (child?.conversationId ?? null) ? announceQuestionStepChild : announceQuestionStep;
+      const panels = [...form.querySelectorAll<HTMLElement>("[data-question-panel]")];
+      const activeIndex = Math.max(0, panels.findIndex(panel => !panel.hidden));
+      const panel = panels[activeIndex];
+      // The step's label names it; a mapping that leaves the label unnamed
+      // falls back to the statement itself rather than announcing a bare
+      // hint (or nothing) for the question that just opened.
+      const label = panel?.querySelector<HTMLElement>(".chat-question-step")?.textContent?.trim().replace(/\s+/g, " ");
+      const statement = panel?.querySelector<HTMLElement>(".chat-question-statement")?.textContent?.trim().replace(/\s+/g, " ");
+      const name = label || statement;
+      speak(name ? `Question ${activeIndex + 1} of ${panels.length}: ${name}` : "");
+    };
+
+    // Retire this conversation's owed-answer line once the step it held back
+    // becomes valid — but only while the line still reads as ours: a newer
+    // unrelated status (an outage, a refusal) is never spoken over. The
+    // interruption owner re-states its message when the blank replaces it.
+    // "Ours" is the exact question request that raised the line, tracked in
+    // the shared per-surface map (`owedAnswerOwners`): the prefix two cards'
+    // messages can share says nothing about who raised it, so retirement
+    // without an ownership check would take down whichever validation is on
+    // the line — another conversation's, or a newer question of this one —
+    // whenever an in-flight resolve lands after it.
+    const clearOwedAnswer = (source: ChatProjection, item: Extract<ConversationItem, { type: "question" }>) => {
+      const spoken = announceFailureFor(source);
+      const owner = owedAnswerOwners.get(spoken);
+      if (owner?.key !== questionOwnershipKey(source, item)) return;
+      if (spoken.current().startsWith("Still to answer")) {
+        spoken("");
+        owedAnswerOwners.delete(spoken);
+        owner.owner.restoreOwned();
+      }
+    };
+
+    // Resolving the question retires its raised line on EVERY surface whose
+    // ownership record matches — the parent's mirrored card can carry the
+    // line while the answer or reject goes out from the drill-down (and the
+    // reverse). Settling a form's local controls (the per-surface path
+    // above) retires one surface's line and must not reach past it; a
+    // resolution ends the question everywhere, so it matches records by the
+    // exact question request, never by the surface the resolve ran on.
+    // Still guarded by the prefix: a line a newer unrelated status has
+    // displaced — an outage, a refusal — keeps standing, and each retired
+    // line restores its own surface's interruption affordances.
+    const clearOwedAnswersEverywhere = (source: ChatProjection, item: Extract<ConversationItem, { type: "question" }>) => {
+      const key = questionOwnershipKey(source, item);
+      for (const [spoken, owner] of [...owedAnswerOwners]) {
+        if (owner.key !== key || !spoken.current().startsWith("Still to answer")) continue;
+        spoken("");
+        owedAnswerOwners.delete(spoken);
+        owner.owner.restoreOwned();
+      }
+    };
+
     container.addEventListener("change", event => {
       const input = event.target as HTMLInputElement;
       const form = input.form;
@@ -3661,8 +3804,87 @@ export function initChat(api = new ChatApiClient()): void {
     container.addEventListener("click", event => {
       const tab = (event.target as Element).closest<HTMLButtonElement>("[data-question-tab]");
       if (!tab?.form) return;
+      const source = sourceProjection();
+      // Tab navigation leaves the current panel in whatever state it holds.
+      // The owed-answer line goes stale only once no required step of the
+      // form is outstanding: an optional empty tab-switch with a required
+      // step still empty keeps the message alive — it names what is still
+      // owed, not what was just left.
+      const leaving = tab.form.querySelector<HTMLElement>("[data-question-panel]:not([hidden])");
+      if (source && leaving) {
+        const itemId = tab.form.closest<HTMLElement>("[data-chat-item-id]")?.dataset.chatItemId;
+        const item = source.items.find(candidate => candidate.id === itemId);
+        if (item?.type === "question") settleOwedAnswer(source, item, tab.form);
+      }
       showQuestionPanel(tab.form, Number(tab.dataset.questionTab));
+      if (source) speakQuestionStep(source, tab.form);
     });
+    // A required empty stops here with the owed-answer message the final
+    // check also speaks. During a connection interruption the message takes
+    // the status line's text, but the outage's recovery affordance keeps
+    // standing beside it exactly as it stood — attached only when it was
+    // attached to the owned interruption before, never re-attached onto an
+    // unrelated status. Repeated submits count as the known write they are:
+    // while a stream of the surface is down, the affordance stands again on
+    // every press of an empty required step. The message records the exact
+    // question request that raised it (the shared `owedAnswerOwners` map,
+    // keyed per surface): only that question's resolution may retire the
+    // line later.
+    const speakOwedAnswer = (source: ChatProjection, item: Extract<ConversationItem, { type: "question" }>, message: string) => {
+      const spoken = announceFailureFor(source);
+      const owner = interruptionsOwnerFor(source);
+      owedAnswerOwners.set(spoken, { key: questionOwnershipKey(source, item), owner });
+      const wasRecovering = owner.isShowingOwned();
+      spoken(message, true);
+      if (wasRecovering || owner.hasDown()) owner.keepRecoveryVisible();
+    };
+
+    // Name each owed step: the renderer's step-label selection — the short
+    // label whichever mapping carried it, header on ties, prompt fallback —
+    // the same names the tab strip prints, never a divergent header-first
+    // algorithm that repeats one long header for every step. A field with
+    // neither string reads "the current question" rather than empty.
+    const owedStepNames = (outstanding: number[], item: Extract<ConversationItem, { type: "question" }>) =>
+      outstanding.map(index => questionStepLabel(item.questions[index]!) || "the current question").join(", ");
+
+    // Which of the form's required steps still owe answers — the one
+    // predicate the settlement, the advance gate, and the final validation
+    // all read, so the routes can never disagree about what is owed.
+    const outstandingRequired = (form: HTMLFormElement, item: Extract<ConversationItem, { type: "question" }>) =>
+      collectQuestionAnswers(form).flatMap((answer, index) => answer.length === 0 && !item.questions[index]?.optional ? [index] : []);
+
+    // The owed-answer line follows the form's outstanding required steps as
+    // they stand, wherever an interaction settles it: an optional empty never
+    // retires a required one's line, a satisfied step stops being named, and
+    // the refreshed message is spoken only while the line is still ours — a
+    // newer unrelated status (an outage, a refusal) is never spoken over. Tab
+    // navigation and the Next advance owe the line to the same whole form, so
+    // they settle it together here rather than in diverging copies. Each
+    // raising and refresh records the exact question request that owes the
+    // line (the shared per-surface map), so a resolution landing after the
+    // reader switched conversations — or asked this conversation again — can
+    // never retire another question's line.
+    const settleOwedAnswer = (source: ChatProjection, item: Extract<ConversationItem, { type: "question" }>, form: HTMLFormElement) => {
+      const outstanding = outstandingRequired(form, item);
+      if (outstanding.length === 0) {
+        clearOwedAnswer(source, item);
+        return;
+      }
+      // A refresh may only touch a line this exact question already owns:
+      // two active forms of two owners share the surface's one status line,
+      // and merely navigating form B — tabs, or the advance past its
+      // optional empty step, with B's required step still outstanding — must
+      // not rewrite the line form A's validation raised, nor steal its
+      // ownership. B's own failed validation (the Next gate, the final
+      // check) is what may take the line over.
+      const spoken = announceFailureFor(source);
+      if (owedAnswerOwners.get(spoken)?.key !== questionOwnershipKey(source, item)) return;
+      // The refresh is spoken only while the line is still ours; a newer
+      // unrelated status is never spoken over.
+      if (!spoken.current().startsWith("Still to answer")) return;
+      speakOwedAnswer(source, item, `Still to answer: ${owedStepNames(outstanding, item)}`);
+    };
+
     container.addEventListener("submit", event => {
       const questionForm = event.target as HTMLFormElement;
       if (!questionForm.matches("form[data-question-form]")) return;
@@ -3673,22 +3895,57 @@ export function initChat(api = new ChatApiClient()): void {
       const panels = [...questionForm.querySelectorAll<HTMLElement>("[data-question-panel]")];
       const activeIndex = Math.max(0, panels.findIndex(panel => !panel.hidden));
       // Not on the last step yet: advance instead of submitting. The primary
-      // button is "Next" here, so submitting the form means "go on".
+      // button is "Next" here, so submitting the form means "go on" — but the
+      // step being left must carry its answer first, unless it is optional
+      // and may be left empty freely. A required empty stops here with the
+      // same message the final check speaks, rather than surfacing only at
+      // the end and bouncing the reader back through the wizard (GitHub
+      // review finding on the never-disabling Answer: the check now runs on
+      // the advance path too). Once the step passes, its stale owed-answer
+      // line is retired — only if nothing newer owns the status.
       if (activeIndex < panels.length - 1) {
+        const step = item.questions[activeIndex]!;
+        if (collectQuestionAnswers(questionForm)[activeIndex]!.length === 0 && !step.optional) {
+          // The advance holds on the step just left, but the line names the
+          // whole form's outstanding set, not that step alone: the final
+          // validation may already have listed later required steps, and
+          // repeating Next must not shrink the message to the one the
+          // reader is standing on.
+          // The advance holds on the step just left, but the line names the
+          // whole form's outstanding set, not that step alone: the final
+          // validation may already have listed later required steps, and
+          // repeating Next must not shrink the message to the one the
+          // reader is standing on.
+          const outstanding = outstandingRequired(questionForm, item);
+          speakOwedAnswer(source, item, `Still to answer: ${owedStepNames(outstanding, item)}`);
+          return;
+        }
+        // The advance retires the line only by the whole form's standing —
+        // an optional empty behind Next must not clear what a required step
+        // elsewhere still owes (the same settle the tab path runs).
+        settleOwedAnswer(source, item, questionForm);
         showQuestionPanel(questionForm, activeIndex + 1);
+        speakQuestionStep(source, questionForm);
         return;
       }
       const answers = collectQuestionAnswers(questionForm);
-      // The button is disabled until every step is satisfied, so this only
-      // catches a form submitted some other way (Enter in the free-form field).
-      // An optional question may go unanswered; every other one must not.
-      const missing = answers.flatMap((answer, index) => answer.length === 0 && !item.questions[index]?.optional ? [index] : []);
+      // The primary button stays enabled, so every submit routes through this
+      // check: an optional question may go unanswered; every other one must
+      // not. The form jumps to the first missing panel and says what is owed.
+      const missing = outstandingRequired(questionForm, item);
       if (missing.length > 0) {
         showQuestionPanel(questionForm, missing[0]!);
-        announceFailureFor(source)(`Still to answer: ${missing.map(index => item.questions[index]!.header).filter(Boolean).join(", ")}`, true);
+        speakOwedAnswer(source, item, `Still to answer: ${owedStepNames(missing, item)}`);
         return;
       }
-      void resolveQuestion(source, item.id, { kind: "answered", answers });
+      // Every answer is collected; but the question is not resolved yet —
+      // the lines stay standing while the api call flies, and the guarded
+      // cleanup runs only on success, exactly like the reject path: a
+      // failed answer's own status must not also silently remove the
+      // still-valid validation lines, and a line the same pending request
+      // raises while its answer hangs is the success's to retire on every
+      // surface whose record matches.
+      void resolveQuestion(source, item.id, { kind: "answered", answers }).then(resolved => { if (resolved) clearOwedAnswersEverywhere(source, item); });
     });
   };
 

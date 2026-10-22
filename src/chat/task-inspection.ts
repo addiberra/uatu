@@ -49,10 +49,14 @@ export function formatTaskElapsed(ms: number): string {
   return hours > 0 ? `${hours}:${pad(minutes)}:${pad(seconds % 60)}` : `${minutes}:${pad(seconds % 60)}`;
 }
 
+/** "1 tool use" / "3 tool uses" — the count beside the token figure. */
+export function taskUsesLabel(usage: BackgroundTaskUsage): string {
+  return usage.toolUses === 1 ? "1 tool use" : `${usage.toolUses} tool uses`;
+}
+
 /** "13.1k tokens · 1 tool use", as the agent's progress reports it. */
 export function taskUsageLabel(usage: BackgroundTaskUsage): string {
-  const uses = usage.toolUses === 1 ? "1 tool use" : `${usage.toolUses} tool uses`;
-  return `${formatTokens(usage.totalTokens)} tokens · ${uses}`;
+  return `${formatTokens(usage.totalTokens)} tokens · ${taskUsesLabel(usage)}`;
 }
 
 /** "finished · <summary>" / "failed" / "stopped": the strip's last line once the task settles. */
@@ -285,6 +289,10 @@ export class TaskInspectionPanel {
         const usage = document.createElement("span");
         usage.className = "chat-drilldown-task-usage";
         usage.textContent = taskUsageLabel(task.usage);
+        // The compact figure shortcuts a billion-scale run to "1.0B" —
+        // nearly 50M tokens of rounding — so the exact count stays one
+        // hover away, the pairing every other token figure keeps.
+        usage.title = `${task.usage.totalTokens.toLocaleString()} tokens · ${taskUsesLabel(task.usage)}`;
         facts.append(usage);
       }
     } else {

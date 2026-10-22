@@ -1288,6 +1288,40 @@ describe("subagent entries", () => {
     });
   });
 
+  // GitHub #524: the current Claude Code Skill tool names the skill by id
+  // alone (tool schema: "the skill ID must match an available skill"). That
+  // payload must parse down the same path as the older `skill`-keyed one:
+  // the collapsed row carries the name, the fork's transcript stays openable,
+  // and the expanded body stays as it was.
+  describe("a skill input naming the skill only by id", () => {
+    const skill = (extra: Partial<ToolItem> = {}): ConversationItem => ({
+      id: "tool:toolu_skill", type: "tool", createdAt: 1, name: "Skill", status: "completed",
+      input: JSON.stringify({ id: "code-review" }), output: "Based on my analysis...", ...extra,
+    });
+
+    test("carries the skill in the collapsed row's subject, stated once", () => {
+      const host = target();
+      new TimelineRenderer().render(host, projectionWith([skill()]), new Set(["tool:toolu_skill"]));
+      const summary = host.querySelector('[data-chat-item-id="tool:toolu_skill"] summary')!;
+      expect(summary.querySelector("span")?.textContent).toBe("Skill");
+      expect(summary.querySelector(".chat-activity-subject")?.textContent).toBe("code-review");
+      // The name is the subject, not repeated through the body: reading the
+      // row aloud says "Skill code-review", never "Skill code-review code-review".
+      const row = host.querySelector('[data-chat-item-id="tool:toolu_skill"]')!.textContent ?? "";
+      expect(row.match(/code-review/g)).toHaveLength(1);
+      expect(row).toContain("Based on my analysis...");
+    });
+
+    test("a forked one still offers its transcript and names the run in the track", () => {
+      const childId = "sub:parent:aaeeab292f002e3d7";
+      const host = target();
+      new TimelineRenderer().render(host, projectionWith([skill({ childConversationId: childId })]), new Set(["tool:toolu_skill"]));
+      expect(host.querySelector<HTMLButtonElement>("[data-open-conversation]")?.dataset.openConversation).toBe(childId);
+      const [entry] = subagentEntries([skill({ childConversationId: childId })]);
+      expect(subagentLabel(entry)).toBe("Skill · code-review");
+    });
+  });
+
   test("a task keeps its report but hides transcript navigation when subagents are unsupported", () => {
     const renderer = new TimelineRenderer();
     const host = target();
