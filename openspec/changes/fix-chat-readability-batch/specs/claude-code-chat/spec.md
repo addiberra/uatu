@@ -75,7 +75,26 @@ advance gate, never the step last left alone.
 #### Scenario: A landing resolution retires only the line its own question raised
 - **WHEN** a question's reject or answer is still in flight, and meanwhile another conversation's validation — or a newer question of the same conversation — raises the owed-answer line, and the in-flight resolution then succeeds
 - **THEN** the line the newer validation raised stays standing
-- **AND** the resolution retires only the line raised by the exact question request it resolved, with the parent's and the drill-down's timelines sharing the one ownership record, so a reject pressed in a drill-down that has since closed still retires the mirrored line on the surface the retirement's routing ends on
+- **AND** the resolution retires only the lines raised by the exact question request it resolved, with the parent's and the drill-down's timelines sharing the one ownership record, so a reject pressed in a drill-down that has since closed still retires the mirrored line on the surface the retirement's routing ends on
+
+#### Scenario: A resolution retires its raised line on every surface while it is open
+- **WHEN** a mirrored question's line was raised on the parent surface, and the answer or reject goes out from the drill-down whose surface stays open (or the reverse), and the resolution succeeds — with no stream event to clear the status itself
+- **THEN** the raised line retires on every surface whose record matches — the parent's included, the drill-down's included — whether the drill-down is open or has closed, so closing it never exposes a stale status
+- **AND** a line a newer unrelated status has displaced stays standing
+
+#### Scenario: Settling one surface's form leaves the other surface's line standing
+- **WHEN** both surfaces carry the mirrored card and the child surface's line stands for the child form's still-empty required step
+- **THEN** answering the parent form's controls and navigating within it retires only the parent's own line — the child's valid owed error stays standing
+
+#### Scenario: Navigation on one active form never steals another's line
+- **WHEN** two active question forms of two owners share the surface's one status line, one form's validation has raised the line, and the reader tabs across — or presses Next past the optional empty step of — the other form, whose own required step is still empty
+- **THEN** the line the first form's validation raised stays standing, unrewritten and unowned by the second form
+- **AND** the second form's own failed validation (the Next gate or the final check) may take the line over, after which its own settlements keep refreshing it
+
+#### Scenario: The owed line names steps by the labels the tabs render
+- **WHEN** a provider mapping puts the long question text in the header and the short label in the prompt, so each tab renders a distinct short label
+- **THEN** the owed-answer line names those same labels through the renderer's shared step-label selection, never a divergent algorithm repeating one long header per step
+- **AND** equal-length prompt and header pick the header, a missing header picks the prompt, and a step carrying neither reads "the current question"
 
 #### Scenario: An unrelated status is never spoken over
 - **WHEN** the status region holds a newer message an outside owner spoke — an outage, a refusal, a turn failure

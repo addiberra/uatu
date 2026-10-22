@@ -1741,31 +1741,39 @@ function permissionOutcomeLabel(outcome: PermissionOutcome | undefined, item?: E
   return "Resolved";
 }
 
+// A step is named by whichever of the two strings a provider mapping puts
+// the short label in; the longer one is the question stated in full. One
+// provider family (GitHub #520) splits them the other way round from the
+// obvious one, so the pill renders the *label* — four pills printing one
+// identical ellipsised sentence told the reader nothing about which step
+// was which — and the legend states the question whole. The header wins
+// ties: both normal mappings name the label in the header, so equal
+// lengths must not collapse every pill onto the prompt again. A missing
+// header hands the name to the prompt — an empty pill names nothing, and
+// the step's announcements and validation would all read empty too.
+// Shared, so every name a step earns — the pill, the panel eyebrow, the
+// owed-answer line's steps — is one selection, never two algorithms
+// drifting apart on the same question.
+export function questionStepLabel(question: StructuredQuestion): string {
+  return question.header === "" ? question.prompt : question.prompt.length < question.header.length ? question.prompt : question.header;
+}
+
 function renderQuestion(item: QuestionRequest, open: boolean, active: boolean, origin?: RequestOrigin, allowSubagents = true, surfaceId = ""): string {
   const pending = item.status === "pending";
   // Questions are stepped through one at a time behind a tab strip, the way
   // OpenCode's own client presents them. Stacking every question at once buries
   // the later ones and makes a partly-filled form look broken.
   const stepped = item.questions.length > 1;
-  // A step is named by whichever of the two strings a provider mapping puts
-  // the short label in; the longer one is the question stated in full. One
-  // provider family (GitHub #520) splits them the other way round from the
-  // obvious one, so the pill renders the *label* — four pills printing one
-  // identical ellipsised sentence told the reader nothing about which step
-  // was which — and the legend states the question whole. The header wins
-  // ties: both normal mappings name the label in the header, so equal
-  // lengths must not collapse every pill onto the prompt again. A missing
-  // header hands the name to the prompt — an empty pill names nothing, and
-  // the step's announcements and validation would all read empty too.
-  const stepLabel = (question: StructuredQuestion) => question.header === "" ? question.prompt : question.prompt.length < question.header.length ? question.prompt : question.header;
-  const statement = (question: StructuredQuestion) => stepLabel(question) === question.prompt ? question.header : question.prompt;
+  // A step's name comes from the shared selection above (comment there);
+  // the legend pairs that label with the question stated in full.
+  const statement = (question: StructuredQuestion) => questionStepLabel(question) === question.prompt ? question.header : question.prompt;
   // A mirrored pending question renders in both the parent and the child
   // transcript (ChatAdapter.mirrorToParent), sharing item.id — the panel id
   // carries the rendering surface's conversation too, so the document never
   // holds duplicate ids and each form's tabs point at their own fieldset.
   const panelId = (index: number) => `question-${surfaceId.replace(/[^a-z0-9_-]+/gi, "-")}-${item.id.replace(/[^a-z0-9_-]+/gi, "-")}-${index}`;
   const tabs = stepped
-    ? `<div class="chat-question-tabs" role="tablist">${item.questions.map((question, index) => `<button type="button" role="tab" class="chat-question-tab${index === 0 ? " is-active" : ""}" data-question-tab="${index}" aria-selected="${index === 0}" aria-controls="${escapeHtmlAttribute(panelId(index))}">${escapeHtml(stepLabel(question))}<span class="sr-only chat-question-tab-answered">, answered</span></button>`).join("")}</div>`
+    ? `<div class="chat-question-tabs" role="tablist">${item.questions.map((question, index) => `<button type="button" role="tab" class="chat-question-tab${index === 0 ? " is-active" : ""}" data-question-tab="${index}" aria-selected="${index === 0}" aria-controls="${escapeHtmlAttribute(panelId(index))}">${escapeHtml(questionStepLabel(question))}<span class="sr-only chat-question-tab-answered">, answered</span></button>`).join("")}</div>`
     : "";
   // A checkbox and a radio read almost identically inside a styled row, so the
   // legend says which it is — otherwise there is nothing telling you more than
@@ -1784,8 +1792,8 @@ function renderQuestion(item: QuestionRequest, open: boolean, active: boolean, o
     // only legend left it readable nowhere but a one-line ellipsised tab
     // (GitHub #520). Fieldset legends must be the first element child, so
     // the label leads inside the legend rather than below the question.
-    const stepLine = `<span class="chat-question-step">${escapeHtml(stepLabel(question))}${hints.length ? ` <span class="chat-question-hint">${escapeHtml(hints.join(" · "))}</span>` : ""}</span>`;
-    const statementLine = statement(question) === stepLabel(question) ? "" : `<span class="chat-question-statement">${escapeHtml(statement(question))}</span>`;
+    const stepLine = `<span class="chat-question-step">${escapeHtml(questionStepLabel(question))}${hints.length ? ` <span class="chat-question-hint">${escapeHtml(hints.join(" · "))}</span>` : ""}</span>`;
+    const statementLine = statement(question) === questionStepLabel(question) ? "" : `<span class="chat-question-statement">${escapeHtml(statement(question))}</span>`;
     return `<fieldset class="chat-question-panel" data-question-panel="${index}" id="${escapeHtmlAttribute(panelId(index))}"${question.optional ? ` data-question-optional="true"` : ""}${index === 0 ? "" : " hidden"}><legend>${stepLine}${statementLine}</legend>${options}${custom}</fieldset>`;
   }).join("");
   // Same receding as a permission: a resolved question carries its outcome in

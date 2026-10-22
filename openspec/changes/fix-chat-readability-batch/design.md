@@ -88,6 +88,28 @@ the only statement. Skill-loading rows parse their input in
   regression tests run the wired handler in linkedom because the connected
   e2e flow's own resolution event overwrites the status region, which would
   mask the finding.
+- **Review round 4, resolution retires everywhere, settlement stays local
+  (#533 findings)**: a resolution (a successful answer or reject) ends the
+  question everywhere, so it retires its raised lines on every surface
+  whose ownership record matches — the parent's mirrored card can carry the
+  line while the answer goes out from the drill-down whose surface stays
+  open; retiring per resolve-time surface left the parent's line stale
+  behind the open drill-down. Each retired line restores its own surface's
+  interruption affordances, captured on the record when the line was
+  raised. A settlement (a form's local controls: tabs, the advance past an
+  optional empty) stays per-surface and, when steps remain outstanding,
+  refreshes only a line its exact question already owns — two active forms
+  of two owners share one status line, and navigation on form B may never
+  rewrite form A's validation, while B's own failed validation may take the
+  line over. And the owed names use the renderer's shared step-label
+  selection (extracted as `questionStepLabel`), so the line speaks the same
+  distinct short labels the tab strip prints — a prompt shorter than the
+  header had been spoken as the repeated long header, diverging from the
+  pills. The e2e flows cannot observe these fixes (the resolution event
+  clears the status itself; the connected fixtures seed a different
+  mapping), so the red→green evidence runs through the wired-handler unit
+  harness; the e2e owed-line assertions were retargeted to the
+  tab-rendered labels.
 
 ## Risks / Trade-offs
 

@@ -19,7 +19,7 @@ import { newRequestId } from "./ids";
 import { insertCommand, localHistoryOperation, matchingCommands, slashCommandQuery, type LocalHistoryOperation } from "./slash-commands";
 import { LatestRefresh } from "./latest-refresh";
 import { navigateWorkspaceFileReference, resolveWorkspaceFileReference } from "./file-references";
-import { READER_CLOSED, QueueDockRenderer, RevertedMessagesDockRenderer, TimelineRenderer, decorateAttachmentImages, decorateFileLinks, formatElapsed, latestTodoEntries, statusLabel, subagentEntries, subagentLabel, workingLabel } from "./timeline-renderer";
+import { READER_CLOSED, QueueDockRenderer, RevertedMessagesDockRenderer, TimelineRenderer, decorateAttachmentImages, decorateFileLinks, formatElapsed, latestTodoEntries, questionStepLabel, statusLabel, subagentEntries, subagentLabel, workingLabel } from "./timeline-renderer";
 import { backgroundStatusLabel, runningBackgroundTasks } from "./background-tasks";
 import { pausedStatusLabel, pausedWakeups, pendingWakeups, scheduledStatusLabel, wakeupFireTime } from "./scheduled-wakeups";
 import { RunningWorkDisclosure } from "./running-work-disclosure";
@@ -856,8 +856,11 @@ export function initChat(api = new ChatApiClient()): void {
   // requestId — not merely the conversation: one conversation can ask again
   // (or carry a newer mirrored card) while an earlier question's resolve
   // still sits in flight, and a resolution landing then must never retire
-  // the newer question's line.
-  const owedAnswerOwners = new Map<Announcer, string>();
+  // the newer question's line. The record also carries the surface's own
+  // interruption owner, captured when the line was raised: a resolution
+  // landing on one surface retires the line on every surface whose record
+  // matches, and each retired line restores its own surface's affordances.
+  const owedAnswerOwners = new Map<Announcer, { key: string; owner: ReturnType<typeof interruptionsFor> }>();
   const questionOwnershipKey = (source: ChatProjection, item: Extract<ConversationItem, { type: "question" }>) =>
     `${item.conversationId ?? source.conversationId}\u0000${item.requestId}`;
 
@@ -3678,13 +3681,14 @@ export function initChat(api = new ChatApiClient()): void {
       } else if (item.type === "question" && target.dataset.questionReject !== undefined) {
         // A successful rejection retires the form — and the owed-answer line
         // a required validation error may have left on the status region:
-        // the same guarded cleanup the answer path runs, so a failure's own
-        // status and any newer unrelated message are never taken down. The
-        // card's own item stays bound: the cleanup retires only the line
+        // the same guarded cleanup the answer path runs, but retiring the
+        // line on every surface whose record matches — the mirrored card's
+        // line may belong to the parent while the reject runs here. The
+        // card's own item stays bound: the cleanup retires only the lines
         // this exact question request raised, never one another question —
-        // of another conversation, or a newer one of this conversation —
-        // raised while the request sat in flight.
-        void resolveQuestion(source, item.id, { kind: "rejected" }).then(resolved => { if (resolved) clearOwedAnswer(source, item); });
+        // of another conversation, or a newer one of this one — raised
+        // while the request sat in flight.
+        void resolveQuestion(source, item.id, { kind: "rejected" }).then(resolved => { if (resolved) clearOwedAnswersEverywhere(source, item); });
       }
     });
     container.addEventListener("keydown", event => {
@@ -3737,11 +3741,32 @@ export function initChat(api = new ChatApiClient()): void {
     // whenever an in-flight resolve lands after it.
     const clearOwedAnswer = (source: ChatProjection, item: Extract<ConversationItem, { type: "question" }>) => {
       const spoken = announceFailureFor(source);
-      if (owedAnswerOwners.get(spoken) !== questionOwnershipKey(source, item)) return;
+      const owner = owedAnswerOwners.get(spoken);
+      if (owner?.key !== questionOwnershipKey(source, item)) return;
       if (spoken.current().startsWith("Still to answer")) {
         spoken("");
         owedAnswerOwners.delete(spoken);
-        interruptionsOwnerFor(source).restoreOwned();
+        owner.owner.restoreOwned();
+      }
+    };
+
+    // Resolving the question retires its raised line on EVERY surface whose
+    // ownership record matches — the parent's mirrored card can carry the
+    // line while the answer or reject goes out from the drill-down (and the
+    // reverse). Settling a form's local controls (the per-surface path
+    // above) retires one surface's line and must not reach past it; a
+    // resolution ends the question everywhere, so it matches records by the
+    // exact question request, never by the surface the resolve ran on.
+    // Still guarded by the prefix: a line a newer unrelated status has
+    // displaced — an outage, a refusal — keeps standing, and each retired
+    // line restores its own surface's interruption affordances.
+    const clearOwedAnswersEverywhere = (source: ChatProjection, item: Extract<ConversationItem, { type: "question" }>) => {
+      const key = questionOwnershipKey(source, item);
+      for (const [spoken, owner] of [...owedAnswerOwners]) {
+        if (owner.key !== key || !spoken.current().startsWith("Still to answer")) continue;
+        spoken("");
+        owedAnswerOwners.delete(spoken);
+        owner.owner.restoreOwned();
       }
     };
 
@@ -3807,17 +3832,20 @@ export function initChat(api = new ChatApiClient()): void {
     // line later.
     const speakOwedAnswer = (source: ChatProjection, item: Extract<ConversationItem, { type: "question" }>, message: string) => {
       const spoken = announceFailureFor(source);
-      owedAnswerOwners.set(spoken, questionOwnershipKey(source, item));
       const owner = interruptionsOwnerFor(source);
+      owedAnswerOwners.set(spoken, { key: questionOwnershipKey(source, item), owner });
       const wasRecovering = owner.isShowingOwned();
       spoken(message, true);
       if (wasRecovering || owner.hasDown()) owner.keepRecoveryVisible();
     };
 
-    // Name each owed step: a field without a label reads empty here
-    // otherwise, and the prompt always names it.
+    // Name each owed step: the renderer's step-label selection — the short
+    // label whichever mapping carried it, header on ties, prompt fallback —
+    // the same names the tab strip prints, never a divergent header-first
+    // algorithm that repeats one long header for every step. A field with
+    // neither string reads "the current question" rather than empty.
     const owedStepNames = (outstanding: number[], item: Extract<ConversationItem, { type: "question" }>) =>
-      outstanding.map(index => item.questions[index]!.header || item.questions[index]!.prompt || "the current question").filter(Boolean).join(", ");
+      outstanding.map(index => questionStepLabel(item.questions[index]!) || "the current question").join(", ");
 
     // The owed-answer line follows the form's outstanding required steps as
     // they stand, wherever an interaction settles it: an optional empty never
@@ -3836,9 +3864,18 @@ export function initChat(api = new ChatApiClient()): void {
         clearOwedAnswer(source, item);
         return;
       }
+      // A refresh may only touch a line this exact question already owns:
+      // two active forms of two owners share the surface's one status line,
+      // and merely navigating form B — tabs, or the advance past its
+      // optional empty step, with B's required step still outstanding — must
+      // not rewrite the line form A's validation raised, nor steal its
+      // ownership. B's own failed validation (the Next gate, the final
+      // check) is what may take the line over.
+      const spoken = announceFailureFor(source);
+      if (owedAnswerOwners.get(spoken)?.key !== questionOwnershipKey(source, item)) return;
       // The refresh is spoken only while the line is still ours; a newer
       // unrelated status is never spoken over.
-      if (!announceFailureFor(source).current().startsWith("Still to answer")) return;
+      if (!spoken.current().startsWith("Still to answer")) return;
       speakOwedAnswer(source, item, `Still to answer: ${owedStepNames(outstanding, item)}`);
     };
 
@@ -3890,7 +3927,11 @@ export function initChat(api = new ChatApiClient()): void {
         speakOwedAnswer(source, item, `Still to answer: ${owedStepNames(missing, item)}`);
         return;
       }
-      clearOwedAnswer(source, item);
+      // Every answer is in: a successful completion ends the question, so
+      // its owed lines retire on every surface whose record matches — a
+      // line raised on the mirrored card's surface retires even when this
+      // submission ran on the other one.
+      clearOwedAnswersEverywhere(source, item);
       void resolveQuestion(source, item.id, { kind: "answered", answers });
     });
   };

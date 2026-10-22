@@ -316,17 +316,17 @@ test.describe("desktop", () => {
     // The empty required step holds the wizard with the owed line naming it.
     await next.click();
     await expect(page.locator("#chat-state")).toContainText("Still to answer");
-    await expect(page.locator("#chat-state")).toContainText("Which surfaces should this pass cover");
+    await expect(page.locator("#chat-state")).toContainText("Q1 — Scope"); // the owed names are the labels the tabs render
     // Tab to the optional empty step: the line stands, naming what is owed.
     await card.locator('[data-question-tab="1"]').click();
-    await expect(page.locator("#chat-state")).toContainText("Which surfaces should this pass cover");
+    await expect(page.locator("#chat-state")).toContainText("Q1 — Scope"); // the owed names are the labels the tabs render
     // Next past the optional empty step: the advance must not clear the line
     // while the required step stands unanswered — the line names the form's
     // outstanding required steps, and Q2 was never one of them.
     await next.click();
     await expect(card.locator('[data-question-panel="2"]')).toBeVisible();
     await expect(page.locator("#chat-state")).toContainText("Still to answer");
-    await expect(page.locator("#chat-state")).toContainText("Which surfaces should this pass cover");
+    await expect(page.locator("#chat-state")).toContainText("Q1 — Scope"); // the owed names are the labels the tabs render
     // Answer the required step that held the line: retiring it clears the
     // line only once nothing is outstanding — Q2 and Q3 were optional.
     await card.locator('[data-question-tab="0"]').click();
@@ -363,7 +363,7 @@ test.describe("desktop", () => {
     // The empty required question raises the owed line on the status region.
     await card.locator("[data-question-primary]").click();
     await expect(page.locator("#chat-state")).toContainText("Still to answer");
-    await expect(page.locator("#chat-state")).toContainText("Which surfaces should this pass cover");
+    await expect(page.locator("#chat-state")).toContainText("Q1 — Scope"); // the owed names are the labels the tabs render
     // Rejecting resolves the form; the line must go with it.
     await card.locator("[data-question-reject]").click();
     await expect(card.locator(".chat-request-trace")).toHaveText("Rejected");

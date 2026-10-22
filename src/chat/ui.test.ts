@@ -2316,18 +2316,18 @@ describe("a question's owed-answer line", () => {
       // The empty required step holds the wizard with the owed line naming it.
       submitForm();
       expect(state()).toContain("Still to answer");
-      expect(state()).toContain("Which surfaces");
+      expect(state()).toContain("Q1 — Scope");
       // Tab to the optional empty step: the line stands, naming what is owed.
       goto(1);
       expect(panel("1").hidden).toBe(false);
-      expect(state()).toContain("Which surfaces");
+      expect(state()).toContain("Q1 — Scope");
       // Next past the optional empty step: the advance must not clear the line
       // while the required step stands unanswered — the tab path and the
       // advance route must settle the same whole-form outstanding set.
       submitForm();
       expect(panel("2").hidden).toBe(false);
       expect(state()).toContain("Still to answer");
-      expect(state()).toContain("Which surfaces");
+      expect(state()).toContain("Q1 — Scope");
       // Answering the required step that holds the line retires it — nothing
       // outstanding remains (Q2 and Q3 were optional).
       goto(0);
@@ -2364,7 +2364,7 @@ describe("a question's owed-answer line", () => {
       // the whole outstanding set, Q2 as much as Q1.
       submitForm();
       expect(state()).toContain("Still to answer");
-      expect(state()).toContain("Which surfaces");
+      expect(state()).toContain("Q1 — Scope");
       expect(state()).toContain("How deep");
       expect(panel("0").hidden).toBe(false);
 
@@ -2372,14 +2372,14 @@ describe("a question's owed-answer line", () => {
       goto(1);
       submitForm();
       expect(panel("0").hidden).toBe(false);
-      expect(state()).toContain("Which surfaces");
+      expect(state()).toContain("Q1 — Scope");
       expect(state()).toContain("How deep");
 
       // Repeating the invalid Next keeps the line naming Q2: the step just
       // left (Q1) does not replace the whole outstanding set.
       submitForm();
       expect(panel("0").hidden).toBe(false);
-      expect(state()).toContain("Which surfaces");
+      expect(state()).toContain("Q1 — Scope");
       expect(state()).toContain("How deep");
     } finally {
       window.dispatchEvent(new Event("pagehide"));
@@ -2525,6 +2525,320 @@ describe("a question's owed-answer line", () => {
       rejectMirrored.resolve();
       await flush();
       expect(state()).toBe("");
+    } finally {
+      window.dispatchEvent(new Event("pagehide"));
+    }
+  });
+
+  test("a drilldown answer retires the parent surface's mirrored line while the drilldown stays open", async () => {
+    // The parent's mirrored card raises the owed line; the answer goes out
+    // from the child's drill-down, which stays open when the resolution
+    // lands (and no stream event follows to clear the status either way).
+    // The cleanup must retire the raising line wherever it lives — the
+    // resolve ran on the child surface, but the raised line belongs to the
+    // parent's — or closing the drill-down later exposes the stale status.
+    const mirroredItem = {
+      id: "question:mirrored", type: "question", createdAt: 2, requestId: "mirrored",
+      conversationId: "child", status: "pending",
+      questions: [{ prompt: "Which import?", header: "Mirrored", multiple: false, allowFreeForm: true, options: [{ label: "main", description: "" }] }],
+    };
+    const { window, document, state } = await boot({
+      capabilities: ["questions", "subagents", "background-tasks"],
+      itemsFor: conversationId => conversationId === "one" ? [
+        { id: "message:u", type: "user_message", createdAt: 1, text: "ask the child" },
+        { id: "task:child", type: "background_task", createdAt: 1, taskId: "child", description: "The child", taskType: "local_agent", status: "running", childConversationId: "child", foreground: true },
+        mirroredItem,
+      ] : [mirroredItem],
+    });
+    try {
+      const click = (element: Element) => element.dispatchEvent(new window.Event("click", { bubbles: true }));
+      // The mirrored card raises the parent's line.
+      const parentCard = document.querySelector<HTMLElement>('[data-chat-item-id="question:mirrored"]')!;
+      parentCard.querySelector("form[data-question-form]")!.dispatchEvent(new window.Event("submit", { bubbles: true, cancelable: true }));
+      expect(state()).toBe("Still to answer: Mirrored");
+      // The answer goes out from the drill-down, which stays open.
+      click(document.querySelector('#chat-subagents [data-open-conversation="child"]')!);
+      await waitUntil(() => document.querySelector('#chat-drilldown-items [data-chat-item-id="question:mirrored"] form[data-question-form]') != null);
+      const childForm = document.querySelector('#chat-drilldown-items [data-chat-item-id="question:mirrored"] form[data-question-form]')!;
+      const choice = childForm.querySelector<HTMLInputElement>('[data-question-panel="0"] input[type="radio"]')!;
+      Object.defineProperty(choice, "form", { configurable: true, value: childForm });
+      choice.checked = true;
+      choice.dispatchEvent(new window.Event("change", { bubbles: true }));
+      childForm.dispatchEvent(new window.Event("submit", { bubbles: true, cancelable: true }));
+      await Bun.sleep(20);
+      // The answer resolved the request: the parent's line retires even
+      // though the drill-down — the surface the resolve ran on — is open.
+      expect(state()).toBe("");
+      // Closing the drill-down then exposes the parent with no stale status.
+      click(document.querySelector("#chat-drilldown-back")!);
+      expect(state()).toBe("");
+    } finally {
+      window.dispatchEvent(new Event("pagehide"));
+    }
+  });
+
+  test("a drilldown rejection retires both surfaces' raised lines while the drilldown stays open", async () => {
+    // Both surfaces raised their own line for the one shared request; the
+    // reject is pressed in the drill-down, which stays open while it lands.
+    // Resolution retires the line on every surface it was raised on — not
+    // merely the one the reject ran from.
+    const rejectMirrored = deferred<void>();
+    const mirroredItem = {
+      id: "question:mirrored", type: "question", createdAt: 2, requestId: "mirrored",
+      conversationId: "child", status: "pending",
+      questions: [{ prompt: "Which import?", header: "Mirrored", multiple: false, allowFreeForm: true, options: [{ label: "main", description: "" }] }],
+    };
+    const { window, document, state } = await boot({
+      capabilities: ["questions", "subagents", "background-tasks"],
+      itemsFor: conversationId => conversationId === "one" ? [
+        { id: "message:u", type: "user_message", createdAt: 1, text: "ask the child" },
+        { id: "task:child", type: "background_task", createdAt: 1, taskId: "child", description: "The child", taskType: "local_agent", status: "running", childConversationId: "child", foreground: true },
+        mirroredItem,
+      ] : [mirroredItem],
+      questionResults: [() => rejectMirrored.promise],
+    });
+    try {
+      const click = (element: Element) => element.dispatchEvent(new window.Event("click", { bubbles: true }));
+      const drilldownState = () => document.querySelector("#chat-drilldown-state")?.textContent ?? "";
+      // The parent's card raises the parent's line.
+      const parentCard = document.querySelector<HTMLElement>('[data-chat-item-id="question:mirrored"]')!;
+      parentCard.querySelector("form[data-question-form]")!.dispatchEvent(new window.Event("submit", { bubbles: true, cancelable: true }));
+      expect(state()).toBe("Still to answer: Mirrored");
+      // The drill-down's card raises that surface's own line.
+      click(document.querySelector('#chat-subagents [data-open-conversation="child"]')!);
+      await waitUntil(() => document.querySelector('#chat-drilldown-items [data-chat-item-id="question:mirrored"] form[data-question-form]') != null);
+      document.querySelector('#chat-drilldown-items [data-chat-item-id="question:mirrored"] form[data-question-form]')!
+        .dispatchEvent(new window.Event("submit", { bubbles: true, cancelable: true }));
+      expect(drilldownState()).toBe("Still to answer: Mirrored");
+      // The reject goes out from the drill-down and hangs in the api stub;
+      // the drill-down stays open the whole time.
+      click(document.querySelector('#chat-drilldown-items [data-chat-item-id="question:mirrored"] [data-question-reject]')!);
+      // The rejection lands: both raised lines retire.
+      rejectMirrored.resolve();
+      await flush();
+      expect(state()).toBe("");
+      expect(drilldownState()).toBe("");
+    } finally {
+      window.dispatchEvent(new Event("pagehide"));
+    }
+  });
+
+  test("settling one surface's form leaves the other surface's owed line standing", async () => {
+    // Both surfaces carry the mirrored card, and both raised their line.
+    // The reader answers the parent's own form controls — a local settlement
+    // through tab navigation, not a submission — and the parent's line
+    // retires by that form's standing. The child surface's line reflects
+    // the child's own empty form: a settlement on one surface must never
+    // erase the other surface's still-valid owed error.
+    const mirroredItem = {
+      id: "question:mirrored", type: "question", createdAt: 2, requestId: "mirrored",
+      conversationId: "child", status: "pending",
+      questions: [
+        { prompt: "Which import?", header: "Mirrored", multiple: false, allowFreeForm: true, options: [{ label: "main", description: "" }] },
+        { prompt: "Notes?", header: "Notes", multiple: false, optional: true, allowFreeForm: true, options: [{ label: "ok", description: "" }] },
+      ],
+    };
+    const { window, document, state } = await boot({
+      capabilities: ["questions", "subagents", "background-tasks"],
+      itemsFor: conversationId => conversationId === "one" ? [
+        { id: "message:u", type: "user_message", createdAt: 1, text: "ask the child" },
+        { id: "task:child", type: "background_task", createdAt: 1, taskId: "child", description: "The child", taskType: "local_agent", status: "running", childConversationId: "child", foreground: true },
+        mirroredItem,
+      ] : [mirroredItem],
+    });
+    try {
+      const click = (element: Element) => element.dispatchEvent(new window.Event("click", { bubbles: true }));
+      const drilldownState = () => document.querySelector("#chat-drilldown-state")?.textContent ?? "";
+      // The drill-down's card raises that surface's line.
+      click(document.querySelector('#chat-subagents [data-open-conversation="child"]')!);
+      await waitUntil(() => document.querySelector('#chat-drilldown-items [data-chat-item-id="question:mirrored"] form[data-question-form]') != null);
+      document.querySelector('#chat-drilldown-items [data-chat-item-id="question:mirrored"] form[data-question-form]')!
+        .dispatchEvent(new window.Event("submit", { bubbles: true, cancelable: true }));
+      expect(drilldownState()).toBe("Still to answer: Mirrored");
+      // The parent's own form answers its required step, then tabs to the
+      // optional one — a settlement, not a submission.
+      const parentCard = document.querySelector<HTMLElement>('[data-chat-item-id="question:mirrored"]')!;
+      const form = parentCard.querySelector("form[data-question-form]")!;
+      const choice = form.querySelector<HTMLInputElement>('[data-question-panel="0"] input[type="radio"]')!;
+      Object.defineProperty(choice, "form", { configurable: true, value: form });
+      choice.checked = true;
+      choice.dispatchEvent(new window.Event("change", { bubbles: true }));
+      const tab = form.querySelector<HTMLElement>('[data-question-tab="1"]')!;
+      Object.defineProperty(tab, "form", { configurable: true, value: form });
+      tab.dispatchEvent(new window.Event("click", { bubbles: true }));
+      // The parent's line had nothing of its own on it; the child's line —
+      // raised for the child's still-empty form — must stand.
+      expect(state()).not.toContain("Still to answer");
+      expect(drilldownState()).toBe("Still to answer: Mirrored");
+    } finally {
+      window.dispatchEvent(new Event("pagehide"));
+    }
+  });
+
+  test("tab navigation on another active form leaves the owed line its owner raised", async () => {
+    // Two active forms of two different owners (a mirrored subagent
+    // question and the conversation's own question) share the surface's one
+    // status line. Form A's required validation raised the line; tabbing
+    // across form B — whose own required step is still empty, so its
+    // outstanding set is non-empty — must not rewrite the line with B's
+    // names nor hand B the line: the refresh goes to the question that
+    // already owns it, and B's own failed validation is what may establish
+    // B's ownership.
+    const { window, document, state } = await boot({
+      capabilities: ["questions", "subagents", "background-tasks"],
+      itemsFor: () => [
+        { id: "message:u", type: "user_message", createdAt: 1, text: "please answer" },
+        { id: "task:child", type: "background_task", createdAt: 1, taskId: "child", description: "The child", taskType: "local_agent", status: "running", childConversationId: "child", foreground: true },
+        {
+          id: "question:a", type: "question", createdAt: 2, requestId: "a1",
+          conversationId: "child", status: "pending",
+          questions: [{ prompt: "Which host?", header: "Host", multiple: false, allowFreeForm: true, options: [{ label: "a", description: "" }] }],
+        },
+        {
+          id: "question:b", type: "question", createdAt: 3, requestId: "b1", status: "pending",
+          questions: [
+            { prompt: "Which region?", header: "Region", multiple: false, allowFreeForm: true, options: [{ label: "eu", description: "" }] },
+            { prompt: "Notes?", header: "Notes", multiple: false, optional: true, allowFreeForm: true, options: [{ label: "ok", description: "" }] },
+          ],
+        },
+      ],
+    });
+    try {
+      const findForm = (itemId: string) => document.querySelector<HTMLElement>(`[data-chat-item-id="${itemId}"]`)!.querySelector("form[data-question-form]")!;
+      const goto = (form: HTMLFormElement, index: number) => {
+        const tab = document.querySelector<HTMLElement>(`[data-chat-item-id="question:b"] [data-question-tab="${index}"]`)!;
+        Object.defineProperty(tab, "form", { configurable: true, value: form });
+        tab.dispatchEvent(new window.Event("click", { bubbles: true }));
+      };
+      // Form A raises the surface line.
+      findForm("question:a").dispatchEvent(new window.Event("submit", { bubbles: true, cancelable: true }));
+      expect(state()).toBe("Still to answer: Host");
+      // Tab navigation across form B, whose required step is still empty:
+      // A's line is left standing, exactly as A spoke it.
+      goto(findForm("question:b") as HTMLFormElement, 1);
+      expect(state()).toBe("Still to answer: Host");
+    } finally {
+      window.dispatchEvent(new Event("pagehide"));
+    }
+  });
+
+  test("an optional Next advance on another active form leaves the owed line its owner raised", async () => {
+    // The same two-owner surface; the advance past form B's optional empty
+    // step is navigation, not a validation failure — it must no more take
+    // the line than tabbing does.
+    const { window, document, state } = await boot({
+      capabilities: ["questions", "subagents", "background-tasks"],
+      itemsFor: () => [
+        { id: "message:u", type: "user_message", createdAt: 1, text: "please answer" },
+        { id: "task:child", type: "background_task", createdAt: 1, taskId: "child", description: "The child", taskType: "local_agent", status: "running", childConversationId: "child", foreground: true },
+        {
+          id: "question:a", type: "question", createdAt: 2, requestId: "a1",
+          conversationId: "child", status: "pending",
+          questions: [{ prompt: "Which host?", header: "Host", multiple: false, allowFreeForm: true, options: [{ label: "a", description: "" }] }],
+        },
+        {
+          id: "question:b", type: "question", createdAt: 3, requestId: "b1", status: "pending",
+          questions: [
+            { prompt: "Notes?", header: "Notes", multiple: false, optional: true, allowFreeForm: true, options: [{ label: "ok", description: "" }] },
+            { prompt: "Which region?", header: "Region", multiple: false, allowFreeForm: true, options: [{ label: "eu", description: "" }] },
+          ],
+        },
+      ],
+    });
+    try {
+      const findForm = (itemId: string) => document.querySelector<HTMLElement>(`[data-chat-item-id="${itemId}"]`)!.querySelector("form[data-question-form]")!;
+      // Form A raises the surface line.
+      findForm("question:a").dispatchEvent(new window.Event("submit", { bubbles: true, cancelable: true }));
+      expect(state()).toBe("Still to answer: Host");
+      // Next past form B's optional empty step: navigation only, A's line
+      // stands.
+      findForm("question:b").dispatchEvent(new window.Event("submit", { bubbles: true, cancelable: true }));
+      expect(state()).toBe("Still to answer: Host");
+    } finally {
+      window.dispatchEvent(new Event("pagehide"));
+    }
+  });
+
+  test("a failed Next validation on the second form takes the line over from the first", async () => {
+    // The other side of the coin: a genuine failed validation on form B —
+    // the Next gate stopping on its empty required step — may establish B's
+    // ownership, rewriting the line with B's own outstanding set. From then
+    // on B settles its own line (finding 3's refresh path).
+    const { window, document, state } = await boot({
+      capabilities: ["questions", "subagents", "background-tasks"],
+      itemsFor: () => [
+        { id: "message:u", type: "user_message", createdAt: 1, text: "please answer" },
+        { id: "task:child", type: "background_task", createdAt: 1, taskId: "child", description: "The child", taskType: "local_agent", status: "running", childConversationId: "child", foreground: true },
+        {
+          id: "question:a", type: "question", createdAt: 2, requestId: "a1",
+          conversationId: "child", status: "pending",
+          questions: [{ prompt: "Which host?", header: "Host", multiple: false, allowFreeForm: true, options: [{ label: "a", description: "" }] }],
+        },
+        {
+          id: "question:b", type: "question", createdAt: 3, requestId: "b1", status: "pending",
+          questions: [
+            { prompt: "Which region?", header: "Region", multiple: false, allowFreeForm: true, options: [{ label: "eu", description: "" }] },
+            { prompt: "Notes?", header: "Notes", multiple: false, optional: true, allowFreeForm: true, options: [{ label: "ok", description: "" }] },
+          ],
+        },
+      ],
+    });
+    try {
+      const findForm = (itemId: string) => document.querySelector<HTMLElement>(`[data-chat-item-id="${itemId}"]`)!.querySelector("form[data-question-form]")!;
+      const goto = (form: HTMLFormElement, index: number) => {
+        const tab = document.querySelector<HTMLElement>(`[data-chat-item-id="question:b"] [data-question-tab="${index}"]`)!;
+        Object.defineProperty(tab, "form", { configurable: true, value: form });
+        tab.dispatchEvent(new window.Event("click", { bubbles: true }));
+      };
+      findForm("question:a").dispatchEvent(new window.Event("submit", { bubbles: true, cancelable: true }));
+      expect(state()).toBe("Still to answer: Host");
+      // B's Next gate stops on its empty required step: the line now names
+      // B's outstanding set, and B navigations keep refreshing it.
+      findForm("question:b").dispatchEvent(new window.Event("submit", { bubbles: true, cancelable: true }));
+      expect(state()).toBe("Still to answer: Region");
+      goto(findForm("question:b") as HTMLFormElement, 1);
+      expect(state()).toBe("Still to answer: Region");
+    } finally {
+      window.dispatchEvent(new Event("pagehide"));
+    }
+  });
+
+  test("the owed line names the steps by the labels the tabs render", async () => {
+    // The reproduced OpenCode mapping puts the long question text in the
+    // structured question's header and a short label in the prompt — the
+    // tab strip renders the short, distinct labels. The owed line speaks
+    // through the same selection, not a divergent header-first algorithm
+    // that repeats one long header for every step.
+    const { window, card, state } = await boot({ questions: [
+      { prompt: "Scope", header: "Which parts of the interface should this round polish", multiple: false, allowFreeForm: true, options: [{ label: "a", description: "" }] },
+      { prompt: "Depth", header: "Which parts of the interface should this round polish", multiple: false, allowFreeForm: true, options: [{ label: "b", description: "" }] },
+    ] });
+    try {
+      // The fixture is the reproduced shape: the tabs already show the two
+      // short, distinct labels.
+      const tabLabels = [...card.querySelectorAll<HTMLButtonElement>("[data-question-tab]")].map(tab => tab.textContent ?? "");
+      expect(tabLabels[0]).toContain("Scope");
+      expect(tabLabels[1]).toContain("Depth");
+      card.querySelector("form[data-question-form]")!.dispatchEvent(new window.Event("submit", { bubbles: true, cancelable: true }));
+      expect(state()).toBe("Still to answer: Scope, Depth");
+    } finally {
+      window.dispatchEvent(new Event("pagehide"));
+    }
+  });
+
+  test("the owed line's label ties go to the header and empty mappings fall back", async () => {
+    // The shared selection's edges: equal-length prompt and header pick the
+    // header (the normal mappings name the label there), a missing header
+    // hands the name to the prompt, and both missing speaks "the current
+    // question" rather than an empty name.
+    const { card, state } = await boot({ questions: [
+      { prompt: "Right one", header: "Left side", multiple: false, allowFreeForm: true, options: [{ label: "a", description: "" }] },
+      { prompt: "Which region?", header: "", multiple: false, allowFreeForm: true, options: [{ label: "b", description: "" }] },
+      { prompt: "", header: "", multiple: false, allowFreeForm: true, options: [{ label: "c", description: "" }] },
+    ] });
+    try {
+      card.querySelector("form[data-question-form]")!.dispatchEvent(new window.Event("submit", { bubbles: true, cancelable: true }));
+      expect(state()).toBe("Still to answer: Left side, Which region?, the current question");
     } finally {
       window.dispatchEvent(new Event("pagehide"));
     }
