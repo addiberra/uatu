@@ -883,6 +883,10 @@ export type MessageDelivery = "steer" | "queue";
 // the pending entry appears.
 export type QueuedMessage = {
   id: string;
+  // Server-owned opaque identity for this pending submission within its
+  // conversation. Preserved across delivery-handle changes, not a durable
+  // receipt or client/account identity. Older payloads may omit it.
+  submissionId?: string;
   text: string;
   queuedAt: number;
   delivery: MessageDelivery;

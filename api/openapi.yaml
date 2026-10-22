@@ -1,9 +1,9 @@
 openapi: 3.1.0
 info:
   title: UatuCode public API
-  version: 11.28.0-experimental
+  version: 11.29.0-experimental
   license: { name: MIT, identifier: MIT }
-  summary: Hub revision 11 and workspace revision 28
+  summary: Hub revision 11 and workspace revision 29
   description: |
     Canonical HTTP contract for the UatuCode Hub API, the only public API.
     Under `/s/{workspaceId}/` the Hub serves one family itself, personal
@@ -21,7 +21,7 @@ info:
     published snapshot is recorded in that snapshot's `contract.json`.
   x-uatu-revisions:
     hubApiRevision: 11
-    workspaceApiRevision: 28
+    workspaceApiRevision: 29
 servers:
   - url: https://{hubHost}
     variables:
@@ -2457,6 +2457,12 @@ components:
         original requestId links the submitting client's unconfirmed input.
       properties:
         id: { type: string }
+        submissionId:
+          type: string
+          minLength: 1
+          maxLength: 512
+          pattern: '^[^\u0000-\u001f\u007f]+$'
+          description: "Server-owned opaque identity of this pending submission within its conversation. Preserved across queue/steer handle changes, including uncertain admission and read-side recovery while known to this adapter. Newly recovered native entries start with their native ID. Not a client request ID, account identifier, mutation receipt or durable identity across adapter recreation. Optional for older payloads; fall back to id when absent. Retain numbering for live entries and a bounded recent-transition window only; use id, not submissionId, for actions."
         text: { type: string, description: Empty for an image-only message. }
         queuedAt: { type: number }
         delivery: { enum: [steer, queue] }

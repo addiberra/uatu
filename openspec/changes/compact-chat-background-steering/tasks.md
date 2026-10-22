@@ -1,3 +1,27 @@
+## Same-row touch conversation header (2026-10-22)
+
+- [x] Keep touch picker, Rename and New conversation on one row with a shrinkable paint-contained selected title, external focus ring, full native option strings/popup and 44px action targets; preserve desktop's text button and omit replacement menus.
+- [x] Contain short-landscape transcript navigation so Latest cannot obstruct header or sibling controls; verify all 12 Chromium/WebKit light/dark 320×844, 390×844 and actual 844×390 header cases, including long titles, 100%/200% text and keyboard activation. Align CHAT/proposal/design/specs and run typecheck and strict change validation. Preserve unrelated historical acceptance tasks.
+
+Evidence: `~/.cache/opencode/scratch/review-loop-20261022/round-3-fixes/ui/`.
+`landscape-red.log` reproduces a failed header-action hit in actual 844×390 at
+200% text: bottom-anchored Latest escapes its short transcript over the header.
+Touch-only transcript overflow containment fixes that paint/hit escape without
+changing z-index, reading allocation or header clipping. `landscape-confirm.log`
+passes **12/12** focused header cases with center and block-edge action hits,
+44px targets, long titles, text enlargement, native focus/popup and keyboard New
+conversation activation; its retained synthetic landscape captures were inspected.
+The fixture now reapplies and asserts the actual landscape viewport after seeding.
+Strict change validation and diff hygiene pass. The UI worker's initial typecheck
+reported two parallel-owned adapter fixture errors; after their correction, lead
+validation passes typecheck, 5,447 unit tests (16 skipped), 209 API tests and all
+59 strict OpenSpec items. Lead's header rerun passes all 12 cases, plus four
+focused steering cases; build and compiled smoke pass. The initial lead header
+run had one connection-setup timeout before geometry assertions; that isolated
+case and the unchanged full matrix then passed. This is local verification,
+not remote CI, physical iPhone or independent acceptance. Historical broader
+acceptance tasks remain unchanged.
+
 ## Expanded-card capacity amendment (2026-10-18)
 
 Current device acceptance (2026-10-19): **user-reported iPhone acceptance**; the user owns physical-device testing, so no additional agent physical-iPhone check is required. This supersedes the outstanding native-iPhone caveats in the historical run notes below without changing those runs' evidence. Automated WebKit acceptance remains a separate open item below. No agent physical test is claimed.

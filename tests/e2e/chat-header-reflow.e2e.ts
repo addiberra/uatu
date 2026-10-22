@@ -7,12 +7,16 @@ const test = withEngineBrowsers(base);
 attachPageDiagnosticsOnFailure(test);
 
 for (const engine of ["chromium", "webkit"] as const) {
-  for (const width of [320, 390]) for (const theme of ["light", "dark"] as const) {
+  for (const width of [320, 390, 844]) for (const theme of ["light", "dark"] as const) {
     test(`native conversation header reflows without painted overflow: ${engine} ${theme} ${width}`, async ({ launchBrowser, baseURL, request }, info) => {
       const browser = await launchBrowser(engine);
-      const page = await browser.newPage({ baseURL, viewport: { width, height: 844 }, isMobile: true, hasTouch: true, reducedMotion: "reduce" });
+      const page = await browser.newPage({ baseURL, viewport: { width, height: width === 844 ? 390 : 844 }, isMobile: true, hasTouch: true, reducedMotion: "reduce" });
       try {
         await enlargedPendingFixture(page, request, width, theme);
+        // The shared fixture seeds at 844px tall. Apply the actual landscape
+        // band afterward so this case cannot silently remain a square tablet.
+        if (width === 844) await page.setViewportSize({ width, height: 390 });
+        expect(page.viewportSize()).toEqual({ width, height: width === 844 ? 390 : 844 });
         const picker = page.getByRole("combobox", { name: "Conversation", exact: true });
         const selected = await picker.inputValue();
         const titles = [null,
@@ -34,8 +38,11 @@ for (const engine of ["chromium", "webkit"] as const) {
             // Linux WebKit can report a fitting layout before its native control
             // paints. Force that paint before measuring, without retaining images.
             await page.screenshot({ animations: "disabled" });
-            if (title === null && percent === 200 && info.attachments.length === 0) {
-              await captureScreenshot(page, info, `native-header-${engine}-${theme}-${width}`);
+            if ((title === null || title === titles.at(-1)) && percent === 100) {
+              await captureScreenshot(page, info, `native-header-${engine}-${theme}-${width}-${title ? "long" : "initial"}`);
+            }
+            if (width === 844 && title === titles.at(-1) && percent === 200) {
+              await captureScreenshot(page, info, `native-header-${engine}-${theme}-landscape-enlarged`);
             }
             const geometry = await page.evaluate(() => {
               const selectors = ["#chat-surface", "#chat-work-dock", ".chat-header", ".chat-conversation-controls", ".chat-conversation-picker", "#chat-conversation-select", ".chat-conversation-controls > button:not([hidden])"];
@@ -80,11 +87,15 @@ for (const engine of ["chromium", "webkit"] as const) {
             expect(select.box.left).toBeGreaterThanOrEqual(wrapper.box.left);
             expect(select.box.right).toBeLessThanOrEqual(wrapper.box.right);
             expect(select.font).toBe(`${16 * percent / 100}px`);
-            // At 200% the readable 12rem basis exceeds the available row. The
-            // native picker must own that row, not collapse between the actions.
-            if (percent === 200) {
-              const actions = geometry.filter(node => /chat-(rename|new)-conversation/.test(node.id));
-              for (const action of actions) expect(action.box.top).toBeGreaterThanOrEqual(select.box.bottom);
+            // The selected title gives up width, never another row. Keep all
+            // actions beside the native picker, including at enlarged text.
+            const actions = geometry.filter(node => /chat-(rename|new)-conversation/.test(node.id));
+            expect(actions).toHaveLength(2);
+            for (const action of actions) {
+              expect(action.box.top).toBeLessThan(select.box.bottom);
+              expect(action.box.bottom).toBeGreaterThan(select.box.top);
+              expect(action.box.width).toBeGreaterThanOrEqual(44);
+              expect(action.blockEdges.every(edge => edge.hit)).toBe(true);
             }
           }
         }
@@ -110,6 +121,8 @@ for (const engine of ["chromium", "webkit"] as const) {
         await expect(page.getByRole("button", { name: "Rename conversation", exact: true })).toBeFocused();
         await page.keyboard.press(nextControl);
         await expect(page.getByRole("button", { name: "New conversation", exact: true })).toBeFocused();
+        await page.keyboard.press("Enter");
+        await expect(picker).not.toHaveValue(selected);
         if (width === 390) {
           // A separate desktop context exercises the normal-sized native popup,
           // not merely the touch control's measured box at enlarged text.
@@ -141,6 +154,7 @@ for (const engine of ["chromium", "webkit"] as const) {
             await expect(desktopPicker).toBeFocused();
             // The change reaches the conversation model, not just the DOM value.
             await expect(desktop.locator("#chat-title")).toHaveText(title);
+            await captureScreenshot(desktop, info, `native-header-${engine}-${theme}-desktop-long`);
             expect(await desktopPicker.evaluate(node => {
               const control = node.getBoundingClientRect();
               const header = node.closest(".chat-header")!;

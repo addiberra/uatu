@@ -1778,6 +1778,7 @@ export function initChat(api = new ChatApiClient()): void {
     const pendingOpen = compactPendingState.paint(pendingConversation);
     const restorePending = pendingOpen && (pendingConversation !== pendingPaintedConversation || !pendingPaintedOpen);
     queueDock.render(queueDockElement, projection?.queued ?? [], {
+      conversationId: pendingConversation,
       withdrawalRetries: pendingConversation ? unconfirmedWithdrawals.get(pendingConversation) : undefined,
       pendingActions: pendingConversation ? queueActionsInFlight.get(pendingConversation) : undefined,
       steering: declares("steering"),

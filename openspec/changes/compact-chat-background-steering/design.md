@@ -1,3 +1,18 @@
+## Approved same-row touch conversation actions (2026-10-22)
+
+The touch header's controls do not wrap. The picker alone yields width inside
+its existing paint-contained wrapper with external focus ring. Rename and New
+conversation retain 44px targets; New conversation uses the existing SVG icon
+language and accessible name. Desktop retains its text label, native option
+strings/popup and keyboard behavior. No options panel is added. This supersedes
+the previous action-wrapping policy, including at 200% text on 320px phones.
+
+Touch transcript-edge floaters remain inside the transcript's paint/hit boundary.
+When the measured reading strip is shorter than Latest plus its bottom inset,
+the floater cannot escape upward over the header or into sibling work controls.
+This containment does not clip the header or its external picker focus ring,
+change reading allocation, or introduce a global stacking-order override.
+
 ## Approved desktop density and side window (2026-10-19)
 
 This policy supersedes the desktop density, small expanded-reading-strip and

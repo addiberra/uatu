@@ -370,8 +370,15 @@ the scroll signal does not paint over its last line.
 The native conversation picker ellipsizes long selected titles within its own
 control; its option list retains the full titles and normal keyboard navigation.
 A shrinkable, paint-contained wrapper isolates native selected-value painting
-from the surrounding layout instead of relying on native control overflow rules. Header actions stay outside
-that boundary and continue to wrap; no header-level overflow clipping is added.
+from the surrounding layout instead of relying on native control overflow rules.
+On touch, Rename and New conversation stay beside the picker on the same row,
+with 44px targets even at enlarged text. New conversation uses a plus SVG with
+the same accessible name; desktop keeps its text label. Long selected titles
+yield width instead of pushing actions onto another row. Header actions stay
+outside the paint boundary; no header-level overflow clipping is added.
+Touch transcript-edge navigation is contained within the transcript, so a
+Latest button taller than an enlarged short-landscape reading strip cannot
+paint or receive taps over the header or adjacent work controls.
 The wrapper draws the focus outline outside its paint boundary. The labeled
 native select, complete option names, and browser-owned popup remain unchanged.
 The 40% phone/short-landscape

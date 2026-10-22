@@ -5398,6 +5398,10 @@ html[data-ui-mode="desktop"][data-notification-chat] .chat-expand-strip {
   gap: 0.5rem;
 }
 
+.chat-new-conversation-icon {
+  display: none;
+}
+
 .chat-conversation-unseen-count {
   flex: 0 0 auto;
   display: grid;
@@ -8593,7 +8597,7 @@ html[data-ui-mode="touch"] .chat-header {
 html[data-ui-mode="touch"] .chat-conversation-controls {
   flex: 1 0 100%;
   min-width: 0;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
 }
 
 html[data-ui-mode="touch"] .chat-header .eyebrow {
@@ -8608,12 +8612,11 @@ html[data-ui-mode="touch"] .chat-header .eyebrow {
 }
 
 html[data-ui-mode="touch"] .chat-conversation-picker {
-  /* Native pickers need a readable value, not the few pixels left by the
-     actions. At enlarged text this basis puts the picker on its own row;
-     the actions wrap below it instead of squeezing its anonymous content. */
-  flex: 1 1 12rem;
+  /* The title truncates inside its paint boundary; actions never consume
+     a second row, even when the selected title or system text is large. */
+  flex: 1 1 0;
   width: 0;
-  min-width: min(100%, 12rem);
+  min-width: 0;
   max-width: 100%;
 }
 
@@ -8628,9 +8631,25 @@ html[data-ui-mode="touch"] .chat-conversation-controls select {
 }
 
 html[data-ui-mode="touch"] .chat-conversation-controls > button {
+  flex: 0 0 auto;
   min-width: 44px;
   min-height: 44px;
   max-width: 100%;
+}
+
+html[data-ui-mode="touch"] #chat-new-conversation {
+  display: grid;
+  place-items: center;
+  width: 44px;
+  padding-inline: 0;
+}
+
+html[data-ui-mode="touch"] .chat-new-conversation-icon {
+  display: block;
+}
+
+html[data-ui-mode="touch"] .chat-new-conversation-label {
+  display: none;
 }
 
 html[data-ui-mode="touch"] .chat-rename-form {
@@ -8653,6 +8672,13 @@ html[data-ui-mode="touch"] .chat-timeline {
   padding: 0.75rem 0.85rem;
   --chat-timeline-inset-top: 0.75rem;
   font-size: 0.9375rem;
+}
+
+html[data-ui-mode="touch"] .chat-transcript-area {
+  /* At enlarged short-landscape minima this region can be shorter than its
+     bottom-anchored navigation. Keep those floaters inside the transcript's
+     paint/hit boundary, never over the header or sibling work controls. */
+  overflow: clip;
 }
 
 /* Activity summaries are chrome, not prose — at full body size a run of tool

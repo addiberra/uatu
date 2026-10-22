@@ -1117,6 +1117,9 @@ function renderDraft(draft: AcceptedDraft): string {
 // (opencode-v2-steering D10): the agent's capabilities, whether the turn
 // runs, and whether an entry's text is a command (commands are never steered).
 export type QueueDockContext = {
+  // Explicit page scope. Null leaves a conversation; omission supports older
+  // callers without inheriting the last explicitly scoped conversation.
+  conversationId?: string | null;
   steering: boolean;
   sendNow: boolean;
   running: boolean;
@@ -1187,10 +1190,19 @@ function renderQueued(entry: QueuedMessage, context: QueueDockContext, discrimin
  */
 export class QueueDockRenderer {
   private readonly entries = new Map<string, { node: HTMLElement; html: string; number: number; disambiguated: boolean }>();
+  // Live identities plus at most 64 recently absent submissions bridge the
+  // empty snapshot between withdrawal and re-holding. No DOM is retained for
+  // absent entries; reset ends this conversation's numbering lifetime.
+  private readonly pendingNumbers = new Map<string, { number: number; disambiguated: boolean }>();
+  private conversationId: string | null | undefined;
   private nextPendingNumber = 0;
   private replacementWarningShown = false;
 
   render(target: HTMLElement, queued: readonly QueuedMessage[], context: QueueDockContext = { steering: false, sendNow: false, running: true, isCommand: () => false }): void {
+    if (context.conversationId !== this.conversationId) {
+      this.reset();
+      this.conversationId = context.conversationId;
+    }
     target.dataset.expanded = String(context.compactOpen !== false);
     context = { ...context, pausedSteers: queued.filter(entry => entry.delivery === "steer" && entry.paused).length };
     let header = target.querySelector<HTMLElement>(":scope > .chat-queue-header");
@@ -1274,21 +1286,38 @@ export class QueueDockRenderer {
     list.hidden = context.compactOpen === false;
     const ordered: HTMLElement[] = [];
     const textCounts = new Map<string, number>();
+    const submissionCounts = new Map<string, number>();
     const accessibleText = (text: string) => text.trim().replace(/\s+/g, " ");
     for (const entry of queued) {
       const text = accessibleText(entry.text);
       textCounts.set(text, (textCounts.get(text) ?? 0) + 1);
+      if (entry.submissionId) submissionCounts.set(entry.submissionId, (submissionCounts.get(entry.submissionId) ?? 0) + 1);
     }
+    const liveIdentities = new Set<string>();
+    const reservedNumbers = new Map(queued.flatMap(entry => {
+      const existing = this.entries.get(entry.id);
+      return existing ? [[existing.number, entry.id] as const] : [];
+    }));
+    const usedNumbers = new Set<number>();
     for (const entry of queued) {
       // Rebuilt when anything shown changes — text, attachments, delivery,
       // paused state, or the actions the context allows — and kept otherwise.
       const existing = this.entries.get(entry.id);
-      // Once disambiguated, a pending entry keeps its client-local number
-      // through reorder, delivery switches and sibling removal. State is
-      // bounded by the live dock, not a lifetime tombstone map.
-      const number = existing?.number ?? ++this.nextPendingNumber;
+      // Client correlation IDs and timestamps are not identity. Older frames
+      // use their native handle; malformed duplicate logical IDs also fall
+      // back to distinct native handles instead of aliasing concurrent rows.
+      const identity = entry.submissionId && submissionCounts.get(entry.submissionId) === 1
+        ? JSON.stringify(["submission", entry.submissionId]) : JSON.stringify(["native", entry.id]);
+      liveIdentities.add(identity);
+      const remembered = this.pendingNumbers.get(identity);
+      let number = remembered?.number ?? existing?.number;
+      if (number === undefined || usedNumbers.has(number) || reservedNumbers.has(number) && reservedNumbers.get(number) !== entry.id) number = ++this.nextPendingNumber;
+      usedNumbers.add(number);
       const text = accessibleText(entry.text);
-      const disambiguated = existing?.disambiguated === true || !text || (textCounts.get(text) ?? 0) > 1;
+      const disambiguated = existing?.disambiguated === true || remembered?.disambiguated === true || !text || (textCounts.get(text) ?? 0) > 1;
+      this.pendingNumbers.delete(identity);
+      this.pendingNumbers.set(identity, { number, disambiguated });
+      if (existing) { existing.number = number; existing.disambiguated = disambiguated; }
       const html = renderQueued(entry, context, disambiguated ? number : undefined);
       if (existing && existing.html === html) {
         ordered.push(existing.node);
@@ -1306,6 +1335,11 @@ export class QueueDockRenderer {
         entry.node.remove();
         this.entries.delete(id);
       }
+    }
+    let recent = this.pendingNumbers.size - liveIdentities.size;
+    for (const identity of this.pendingNumbers.keys()) {
+      if (recent <= 64) break;
+      if (!liveIdentities.has(identity)) { this.pendingNumbers.delete(identity); recent--; }
     }
     let cursor = list.firstElementChild;
     for (const node of ordered) {
@@ -1352,7 +1386,10 @@ export class QueueDockRenderer {
   }
 
   reset(): void {
+    for (const entry of this.entries.values()) entry.node.remove();
     this.entries.clear();
+    this.pendingNumbers.clear();
+    this.conversationId = undefined;
     this.nextPendingNumber = 0;
     this.replacementWarningShown = false;
   }

@@ -1051,6 +1051,111 @@ describe("presentation details", () => {
       expect(labels()).toEqual(["Remove “Image attachment”, pending message 4", "Remove “Same prompt”, pending message 2"]);
     });
 
+    for (const text of ["Same prompt", ""]) for (const gap of [false, true]) test(`pending submission numbers survive native delivery-ID changes${gap ? " and empty withdrawal snapshots" : ""} for ${text ? "duplicate text" : "image-only input"}`, () => {
+      const host = target();
+      const dock = new QueueDockRenderer();
+      const first = queued({ id: "native-first", submissionId: "original-first", requestId: "shared-request", queuedAt: 1, text });
+      const second = queued({ ...first, id: "native-second", submissionId: "original-second" });
+      const numbers = () => [...host.querySelectorAll("[data-queue-remove]")].map(node => node.getAttribute("aria-label")?.match(/pending message (\d+)/)?.[1]);
+      dock.render(host, [first, second], steering);
+      expect(numbers()).toEqual(["1", "2"]);
+      if (gap) dock.render(host, [], steering);
+      const held = { ...first, id: "fresh-held" };
+      dock.render(host, [second, held], steering);
+      expect(numbers()).toEqual(["2", "1"]);
+      expect(host.querySelector('[data-queue-remove="native-first"]')).toBeNull();
+      expect(host.querySelector('[data-queue-steer="fresh-held"]')).not.toBeNull();
+      if (gap) dock.render(host, [], steering);
+      const steered = { ...first, id: "fresh-steer", delivery: "steer" as const };
+      dock.render(host, [steered], steering);
+      expect(numbers()).toEqual(["1"]);
+      expect(host.querySelector('[data-queue-queue="fresh-steer"]')).not.toBeNull();
+      expect(host.querySelectorAll(".chat-queued-message")).toHaveLength(1);
+    });
+
+    test("pending numbering rejects client tuples and duplicate logical IDs as identity authority", () => {
+      const host = target();
+      const dock = new QueueDockRenderer();
+      const entries = ["one", "two", "three", "four"].map(id => queued({ id, text: "", requestId: "shared", queuedAt: 1, ...(id === "one" || id === "two" ? { submissionId: "unexpected-collision" } : {}) }));
+      const number = (id: string) => host.querySelector(`[data-queue-remove="${id}"]`)?.getAttribute("aria-label")?.match(/pending message (\d+)/)?.[1];
+      dock.render(host, entries, steering);
+      expect(entries.map(entry => number(entry.id))).toEqual(["1", "2", "3", "4"]);
+      dock.render(host, [...entries].reverse(), steering);
+      expect(entries.map(entry => number(entry.id))).toEqual(["1", "2", "3", "4"]);
+      expect(host.querySelectorAll(".chat-queued-message")).toHaveLength(4);
+      dock.render(host, [], steering);
+      // Unknown recovered handles cannot be matched by request ID, time,
+      // image/text content, or an absent logical identity.
+      dock.render(host, [queued({ id: "unknown-recovered", text: "", requestId: "shared", queuedAt: 1 })], steering);
+      expect(number("unknown-recovered")).toBe("5");
+    });
+
+    test("pending numbering retains live entries plus only 64 recent transitions without retaining absent DOM", () => {
+      const host = target();
+      const dock = new QueueDockRenderer();
+      const live = queued({ id: "live", submissionId: "live-submission", text: "" });
+      const metadata = dock as unknown as { pendingNumbers: Map<string, unknown>; entries: Map<string, unknown> };
+      for (let index = 0; index < 100; index++) {
+        dock.render(host, [live, queued({ id: `transient-${index}`, submissionId: `submission-${index}`, text: "" })], steering);
+        expect(host.querySelector('[data-queue-remove="live"]')?.getAttribute("aria-label")).toContain("pending message 1");
+        expect(metadata.pendingNumbers.size).toBeLessThanOrEqual(66);
+        expect(metadata.entries.size).toBe(2);
+        expect(host.querySelectorAll(".chat-queued-message")).toHaveLength(2);
+      }
+      dock.render(host, [], steering);
+      expect(metadata.pendingNumbers.size).toBe(64);
+      expect(metadata.entries.size).toBe(0);
+      expect(host.querySelectorAll(".chat-queued-message")).toHaveLength(0);
+      dock.render(host, [{ ...live, id: "live-native-after-gap" }, queued({ id: "transient-0", submissionId: "submission-0", text: "" })], steering);
+      expect(host.querySelector('[data-queue-remove="live-native-after-gap"]')?.getAttribute("aria-label")).toContain("pending message 1");
+      expect(host.querySelector('[data-queue-remove="transient-0"]')?.getAttribute("aria-label")).not.toContain("pending message 2");
+    });
+
+    test("reset ends conversation numbering and removes stale native action targets", () => {
+      const host = target();
+      const dock = new QueueDockRenderer();
+      dock.render(host, [queued({ id: "old-native", submissionId: "same-opaque-value", text: "" })], steering);
+      dock.reset();
+      dock.render(host, [queued({ id: "new-conversation-native", submissionId: "same-opaque-value", text: "" })], steering);
+      expect(host.querySelector('[data-queue-remove="old-native"]')).toBeNull();
+      expect(host.querySelector('[data-queue-remove="new-conversation-native"]')?.getAttribute("aria-label")).toContain("pending message 1");
+      expect(host.querySelectorAll(".chat-queued-message")).toHaveLength(1);
+    });
+
+    test("conversation boundaries reset numbering even through empty renders and omitted legacy scope", () => {
+      const host = target();
+      const dock = new QueueDockRenderer();
+      const first = queued({ id: "native-one", submissionId: "opaque-one", text: "" });
+      const second = queued({ id: "native-two", submissionId: "opaque-two", text: "" });
+      const number = (id: string) => host.querySelector(`[data-queue-remove="${id}"]`)?.getAttribute("aria-label")?.match(/pending message (\d+)/)?.[1];
+      dock.render(host, [first, second], { ...steering, conversationId: "one" });
+      expect(number(second.id)).toBe("2");
+      // An empty render in the same conversation is a transition gap, not
+      // a reset; a different conversation, even empty, is a hard boundary.
+      dock.render(host, [], { ...steering, conversationId: "one" });
+      dock.render(host, [second], { ...steering, conversationId: "one" });
+      expect(number(second.id)).toBe("2");
+      dock.render(host, [], { ...steering, conversationId: "two" });
+      dock.render(host, [second], { ...steering, conversationId: "two" });
+      expect(number(second.id)).toBe("1");
+      expect(host.querySelector('[data-queue-remove="native-one"]') === null).toBe(true);
+      dock.render(host, [second, first], { ...steering, conversationId: "two" });
+      expect(number(first.id)).toBe("2");
+      dock.render(host, [], { ...steering, conversationId: null });
+      dock.render(host, [first], { ...steering, conversationId: "two" });
+      expect(number(first.id)).toBe("1");
+      dock.render(host, [first, second], { ...steering, conversationId: "two" });
+      // Older callers remain unscoped, but cannot inherit the last explicit
+      // conversation's identities when they omit the new context field.
+      dock.render(host, [second], steering);
+      expect(number(second.id)).toBe("1");
+      dock.render(host, [second, first], steering);
+      expect(number(first.id)).toBe("2");
+      dock.render(host, [first], { ...steering, conversationId: "one" });
+      expect(number(first.id)).toBe("1");
+      expect(host.querySelectorAll(".chat-queued-message")).toHaveLength(1);
+    });
+
     test("dock counts pending deliveries and offers one contextual paused batch action", () => {
       const host = target();
       new QueueDockRenderer().render(host, [queued({ id: "a", text: "First", delivery: "steer", paused: true }), queued({ id: "b", text: "Second", delivery: "steer", paused: true }), queued({ id: "c", text: "Later" })], steering);

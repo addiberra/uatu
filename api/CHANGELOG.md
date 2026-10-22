@@ -2,6 +2,19 @@
 
 Entries are ordered newest first. Every entry has Hub and workspace revisions, a compatibility classification, and migration guidance. Use `None` when no migration is required. An entry is headed `Unreleased` until the release that ships it; the release-prep step replaces that with the version tag (`v0.7.0`), so a consumer can tell which revision pair a given uatu version speaks. An additive change that lands after a pair has shipped gets its own entry under the same pair, stamped with its own release, rather than being appended to the shipped entry.
 
+## Hub 11 / Workspace 29 - Unreleased (pending submission identity)
+
+Compatibility: breaking (workspace)
+
+### Changes
+
+- Closed `QueuedMessage` payloads can carry `submissionId`, a server-owned opaque identity scoped to one conversation's pending submission. Its initial held/native ID is preserved through queue/steer switches, uncertain admissions and recovery while known to the adapter. Newly recovered native entries without a known identity start with their native ID. It carries no account metadata and does not replace the original client `requestId` echo.
+- Pending action labels keep their number through native handle changes and intermediate empty withdrawal snapshots. The renderer retains live identities plus at most 64 recently absent identities, never absent DOM nodes. Conversation reset clears numbering. This is bounded presentation state, not durable identity or mutation deduplication; adapter recreation can lose a previously converted identity.
+
+### Migration
+
+Strict workspace payload consumers must regenerate against revision 29 because revision 28's closed `QueuedMessage` rejects the new property. Use `submissionId` only to correlate pending presentation within a conversation; fall back to `id` for older payloads or unexpected duplicate logical IDs. Continue targeting every mutation by the current `id`. Do not infer identity from client request IDs, timestamps, content, accounts or generations, and do not replay mutations. Retain live numbering and only a bounded recent-transition window, clearing it when switching conversations. Hub revision remains 11.
+
 ## Hub 11 / Workspace 28 - Unreleased (native side answers)
 
 Compatibility: additive from workspace revision 27; breaking (workspace) from revision 24

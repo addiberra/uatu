@@ -257,6 +257,7 @@ const MAX_HELD_TEXT_BYTES = 256 * 1024;
 // whatever the conversation drifts to while it waits.
 type HeldMessage = QueuedMessage & {
   delivery: "queue";
+  submissionId: string;
   requestId: string;
   model?: ModelSelection;
   mode?: string;
@@ -289,6 +290,7 @@ type PendingSteer = {
   resumeUnconfirmed?: true;
   withdrawalUnconfirmed?: true;
   id: string;
+  submissionId: string;
   text: string;
   queuedAt: number;
   requestId?: string;
@@ -299,7 +301,7 @@ type PendingSteer = {
   tick: number;
 };
 
-type SteerAdmission = { conversationId: string; id: string; held?: HeldMessage; terminal?: "delivered" | "cancelled"; retired?: true };
+type SteerAdmission = { conversationId: string; id: string; submissionId: string; held?: HeldMessage; terminal?: "delivered" | "cancelled"; retired?: true };
 
 // Total withdrawal budget for cancellation, terminal events and bounded
 // list/history recovery (D7).
@@ -1236,8 +1238,10 @@ export class ChatAdapter {
           const heldModel = variantModel ?? currentConfiguration.model;
           const heldMode = mode ?? currentConfiguration.mode;
           const heldVariant = variant ?? (model === undefined ? currentConfiguration.variant : undefined);
+          const heldId = this.id();
           const held: HeldMessage = {
-            id: this.id(),
+            id: heldId,
+            submissionId: heldId,
             text,
             queuedAt: Date.now(),
             delivery: "queue",
@@ -1293,7 +1297,8 @@ export class ChatAdapter {
     let accepted: { messageId: string };
     const identity = this.id();
     const nativeId = this.provider.promptIdentity?.(identity) ?? identity;
-    const fence: SteerAdmission = { conversationId, id: nativeId, held: sourceHeld };
+    const submissionId = sourceHeld?.submissionId ?? nativeId;
+    const fence: SteerAdmission = { conversationId, id: nativeId, submissionId, held: sourceHeld };
     const fenceKey = steerKey(conversationId, nativeId);
     // Retain request-local truth until the actual transport settles, not just
     // the admission deadline. Evicted requests cannot apply late evidence.
@@ -1318,7 +1323,7 @@ export class ChatAdapter {
         if (sourceHeld) {
           sourceHeld.unconfirmedSteerId = nativeId;
           this.publishQueue(conversationId, { kind: "paused", messageId: sourceHeld.id });
-        } else this.recordPendingSteer(conversationId, nativeId, requestId, text, attachmentRefs, queuedAt, true);
+        } else this.recordPendingSteer(conversationId, nativeId, submissionId, requestId, text, attachmentRefs, queuedAt, true);
         // Late acknowledgement is read-side evidence only. It must never
         // re-enter the composite operation or initiate a delayed follow-up.
         void admission.then(late => {
@@ -1331,7 +1336,7 @@ export class ChatAdapter {
             queue.splice(queue.indexOf(sourceHeld), 1);
             if (!queue.length) this.heldQueues.delete(conversationId);
           }
-          this.recordPendingSteer(conversationId, late.messageId, requestId, text, attachmentRefs, queuedAt);
+          this.recordPendingSteer(conversationId, late.messageId, submissionId, requestId, text, attachmentRefs, queuedAt);
         }, () => undefined).finally(releaseFence).catch(() => undefined);
       }
       throw error;
@@ -1340,16 +1345,16 @@ export class ChatAdapter {
     }
     // Acceptance is still receipt-keyed, but it cannot recreate terminal
     // state. The terminal queue event also fences the client's local echo.
-    if (fence.terminal || fence.retired || this.disposed) return { id: accepted.messageId, text, queuedAt, requestId, tick: this.inboxClock, ...(fence.terminal ? { terminal: fence.terminal } : {}) };
+    if (fence.terminal || fence.retired || this.disposed) return { id: accepted.messageId, submissionId, text, queuedAt, requestId, tick: this.inboxClock, ...(fence.terminal ? { terminal: fence.terminal } : {}) };
     // The agent wakes for a steer: whatever was stranded delivers with it.
     this.lastSettledAt.delete(conversationId);
-    return this.recordPendingSteer(conversationId, accepted.messageId, requestId, text, attachmentRefs, queuedAt);
+    return this.recordPendingSteer(conversationId, accepted.messageId, submissionId, requestId, text, attachmentRefs, queuedAt);
   }
 
-  private recordPendingSteer(conversationId: string, messageId: string, requestId: string, text: string, attachmentRefs: MessageAttachment[], queuedAt: number, unconfirmed?: true): PendingSteer {
+  private recordPendingSteer(conversationId: string, messageId: string, submissionId: string, requestId: string, text: string, attachmentRefs: MessageAttachment[], queuedAt: number, unconfirmed?: true): PendingSteer {
     const steers = this.pendingSteers.get(conversationId) ?? [];
     const existing = steers.find(entry => entry.id === messageId);
-    const steer: PendingSteer = { id: messageId, text, queuedAt: existing?.queuedAt ?? queuedAt, requestId, ...(attachmentRefs.length ? { attachments: attachmentRefs } : {}), ...(unconfirmed ? { unconfirmed } : {}), tick: ++this.inboxClock };
+    const steer: PendingSteer = { id: messageId, submissionId, text, queuedAt: existing?.queuedAt ?? queuedAt, requestId, ...(attachmentRefs.length ? { attachments: attachmentRefs } : {}), ...(unconfirmed ? { unconfirmed } : {}), tick: ++this.inboxClock };
     if (existing) {
       // The stream announced it before the acceptance answered: the entry is
       // there already, restated now with the request id the client waits for.
@@ -1411,6 +1416,7 @@ export class ChatAdapter {
         // A fresh id: the agent's inbox id named an entry it has now
         // cancelled, and a later dispatch must not reuse it.
         id: this.id(),
+        submissionId: steer.submissionId,
         text: steer.text,
         queuedAt: steer.queuedAt,
         delivery: "queue",
@@ -1665,7 +1671,8 @@ export class ChatAdapter {
         if (delta.attachments?.length) existing.attachments = delta.attachments; else delete existing.attachments;
         return;
       }
-      steers.push({ id: delta.id, text: delta.text, queuedAt: delta.at, ...(delta.attachments?.length ? { attachments: delta.attachments } : {}), tick: ++this.inboxClock });
+      const submissionId = this.admittingSteers.get(steerKey(conversationId, delta.id))?.submissionId ?? delta.id;
+      steers.push({ id: delta.id, submissionId, text: delta.text, queuedAt: delta.at, ...(delta.attachments?.length ? { attachments: delta.attachments } : {}), tick: ++this.inboxClock });
       this.pendingSteers.set(conversationId, steers);
       this.publishQueue(conversationId, { kind: "steered", messageId: delta.id });
       this.publishPausedChanges(conversationId);
@@ -1754,7 +1761,7 @@ export class ChatAdapter {
     if (current.length === 0 && listed.length > 0 && !this.turnActive(conversationId, projection) && !this.lastSettledAt.has(conversationId)) this.lastSettledAt.set(conversationId, Date.now());
     const next: PendingSteer[] = listed.filter(entry => entry.delivery === "steer").map(entry => {
       const known = current.find(candidate => candidate.id === entry.id) ?? confirmedHeld.get(entry.id);
-      return { id: entry.id, text: entry.text, queuedAt: known?.queuedAt ?? entry.at, ...(known?.requestId ? { requestId: known.requestId } : {}), ...(entry.attachments?.length ? { attachments: entry.attachments } : {}), ...(known && "withdrawalUnconfirmed" in known && known.withdrawalUnconfirmed ? { withdrawalUnconfirmed: true as const } : {}), ...(known && "resumeUnconfirmed" in known && known.resumeUnconfirmed && !this.turnActive(conversationId, projection) ? { resumeUnconfirmed: true as const } : {}), tick: known && "tick" in known ? known.tick : ++this.inboxClock };
+      return { id: entry.id, submissionId: known?.submissionId ?? this.admittingSteers.get(steerKey(conversationId, entry.id))?.submissionId ?? entry.id, text: entry.text, queuedAt: known?.queuedAt ?? entry.at, ...(known?.requestId ? { requestId: known.requestId } : {}), ...(entry.attachments?.length ? { attachments: entry.attachments } : {}), ...(known && "withdrawalUnconfirmed" in known && known.withdrawalUnconfirmed ? { withdrawalUnconfirmed: true as const } : {}), ...(known && "resumeUnconfirmed" in known && known.resumeUnconfirmed && !this.turnActive(conversationId, projection) ? { resumeUnconfirmed: true as const } : {}), tick: known && "tick" in known ? known.tick : ++this.inboxClock };
     });
     const nextIds = new Set(next.map(entry => entry.id));
     // Kept without the list's say: entries a withdrawal is waiting on (their
@@ -2011,15 +2018,15 @@ export class ChatAdapter {
   private queuedMessages(conversationId: string): QueuedMessage[] {
     const settledAt = this.lastSettledAt.get(conversationId);
     const heldPaused = this.deliveryPaused(conversationId);
-    const steers = (this.pendingSteers.get(conversationId) ?? []).map(({ id, text, queuedAt, requestId, attachments, unconfirmed, resumeUnconfirmed, withdrawalUnconfirmed }): QueuedMessage => ({
-      id, text, queuedAt, delivery: "steer",
+    const steers = (this.pendingSteers.get(conversationId) ?? []).map(({ id, submissionId, text, queuedAt, requestId, attachments, unconfirmed, resumeUnconfirmed, withdrawalUnconfirmed }): QueuedMessage => ({
+      id, submissionId, text, queuedAt, delivery: "steer",
       ...(unconfirmed || resumeUnconfirmed || withdrawalUnconfirmed || settledAt !== undefined && queuedAt <= settledAt ? { paused: true as const } : {}),
       ...(unconfirmed || resumeUnconfirmed || withdrawalUnconfirmed ? { unconfirmed: true as const } : {}),
       ...(requestId ? { requestId } : {}),
       ...(attachments?.length ? { attachments } : {}),
     }));
-    const held = (this.heldQueues.get(conversationId) ?? []).map(({ id, text, queuedAt, requestId, attachments, unconfirmedSteerId }): QueuedMessage => ({
-      id, text, queuedAt, delivery: "queue",
+    const held = (this.heldQueues.get(conversationId) ?? []).map(({ id, submissionId, text, queuedAt, requestId, attachments, unconfirmedSteerId }): QueuedMessage => ({
+      id, submissionId, text, queuedAt, delivery: "queue",
       ...(heldPaused || unconfirmedSteerId ? { paused: true as const } : {}),
       ...(unconfirmedSteerId ? { unconfirmed: true as const } : {}),
       requestId,

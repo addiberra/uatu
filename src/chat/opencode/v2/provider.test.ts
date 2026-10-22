@@ -4,7 +4,7 @@ import path from "node:path";
 
 import { InvalidQuestionAnswerError, ReversibleHistoryTargetError } from "../../provider";
 import { createOpenCodeV2Provider, formAnswerFromChoices, type OpenCodeV2Provider } from "./provider";
-import { ChatAdapter } from "../../adapter";
+import { ChatAdapter, SteerAlreadyDeliveredError, SteerWithdrawalUnconfirmedError } from "../../adapter";
 
 // The stored records of a real 2.0.13 session: user, assistant (read tool),
 // assistant (text), idle, user — see normalization.test.ts for provenance.
@@ -833,6 +833,124 @@ describe("OpenCode 2.x provider: prompting and events", () => {
     const server = fakeOpenCode({ "DELETE /api/session/:id/inbox/:inboxId": () => undefined });
     await server.provider().cancelInbox("ses_1", "msg_steer");
     expect(server.requests("DELETE", "/api/session/ses_1/inbox/msg_steer")).toHaveLength(1);
+  });
+
+  for (const outcome of ["delivered", "response-lost"] as const) test(`real V2 withdrawal with ${outcome} cannot convert a steer using cached empty history`, async () => {
+    let stream!: ReadableStreamDefaultController<Uint8Array>;
+    let messages: unknown[] = [];
+    const server = fakeOpenCode({
+      "GET /api/event": () => new Response(new ReadableStream<Uint8Array>({ start(controller) {
+        stream = controller;
+        controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({ type: "server.connected", data: {} })}\n\n`));
+      } }), { headers: { "content-type": "text/event-stream" } }),
+      "GET /api/session/ses": () => session("ses"),
+      "GET /api/session/ses/message": () => ({ data: messages, cursor: {} }),
+      "GET /api/session/ses/inbox": () => ({ data: [] }),
+      "POST /api/session/ses/prompt": ({ body }) => {
+        const input = body as { id: string; text: string; delivery: string };
+        return { id: input.id, sessionID: "ses", type: "user", time: { created: 1 }, payload: { text: input.text }, delivery: input.delivery };
+      },
+      // Native delivery has already removed the entry. Cancel's missing-id
+      // acknowledgement is a no-op, not proof that it was cancelled.
+      "DELETE /api/session/ses/inbox/:id": () => outcome === "response-lost" ? Response.json({ _tag: "UnknownError", message: "response lost" }, { status: 500 }) : undefined,
+    });
+    const provider = server.provider();
+    const controller = new AbortController();
+    const events = provider.events(controller.signal)[Symbol.asyncIterator]();
+    const adapter = new ChatAdapter({ provider, workspacePath: WORKSPACE, steerWithdrawTimeoutMs: 100 });
+    try {
+      await events.next();
+      adapter.projectionForTests("ses").statusUpdate("running");
+      const accepted = await adapter.prompt("ses", "original-request", "deliver once", undefined, undefined, undefined, undefined, "steer");
+      expect((await provider.listMessages("ses", { limit: 50 })).completeItems).toEqual([]);
+      const reads = server.requests("GET", "/api/session/ses/message").length;
+      // Persist delivery without releasing its delayed stream event.
+      if (outcome === "delivered") messages = [{ id: accepted.messageId, type: "user", text: "deliver once", time: { created: 2 } }];
+      const conversion = await adapter.changeDelivery("ses", accepted.messageId, "convert", "queue").catch(error => error);
+      const withdrawalReads = server.requests("GET", "/api/session/ses/message").length;
+      const pending = [...adapter.pendingSteersForTests("ses")];
+      const snapshot = await adapter.history("ses");
+      const prompts = server.requests("POST", "/api/session/ses/prompt").length;
+      // Complete the parent and cross the public admission lane with an
+      // independent submission. An incorrectly re-held steer would dispatch
+      // here with a new identity, duplicating the already-delivered text.
+      adapter.projectionForTests("ses").statusUpdate("completed");
+      await adapter.prompt("ses", "next-request", "independent next turn", undefined, undefined, undefined, undefined, "queue");
+      expect(server.requests("POST", "/api/session/ses/prompt").filter(call => (call.body as { text: string }).text === "deliver once")).toHaveLength(1);
+      expect(conversion).toBeInstanceOf(outcome === "delivered" ? SteerAlreadyDeliveredError : SteerWithdrawalUnconfirmedError);
+      expect(withdrawalReads).toBe(reads + (outcome === "delivered" ? 1 : 0));
+      if (outcome === "delivered") {
+        expect(pending).toEqual([]);
+        expect(snapshot.queued ?? []).toEqual([]);
+      } else {
+        // Empty history after an uncertain cancel response is not authority
+        // to re-hold input; keep its original inspectable handle instead.
+        expect(snapshot.queued).toEqual([expect.objectContaining({ id: accepted.messageId, requestId: "original-request", delivery: "steer", unconfirmed: true })]);
+      }
+      expect(prompts).toBe(1);
+    } finally {
+      stream.close();
+      await events.next();
+      await adapter.dispose();
+    }
+  });
+
+  for (const overlap of ["before-pending", "during-resolved", "during-pending"] as const) for (const outcome of ["success", "error"] as const) test(`cancel ${outcome} fences ${overlap} history reads from later reuse`, async () => {
+    let stream!: ReadableStreamDefaultController<Uint8Array>;
+    let releaseCancel!: () => void, cancelStarted!: () => void, releaseHistory!: () => void, historyStarted!: () => void;
+    const cancellation = new Promise<void>(resolve => { releaseCancel = resolve; });
+    const cancelling = new Promise<void>(resolve => { cancelStarted = resolve; });
+    const history = new Promise<void>(resolve => { releaseHistory = resolve; });
+    const reading = new Promise<void>(resolve => { historyStarted = resolve; });
+    let messages: unknown[] = [], reads = 0;
+    const server = fakeOpenCode({
+      "GET /api/event": () => new Response(new ReadableStream<Uint8Array>({ start(controller) {
+        stream = controller;
+        controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({ type: "server.connected", data: {} })}\n\n`));
+      } }), { headers: { "content-type": "text/event-stream" } }),
+      "GET /api/session/ses": () => session("ses"),
+      "GET /api/session/ses/message": async () => {
+        const snapshot = [...messages];
+        if (++reads === 1) { historyStarted(); await history; }
+        return { data: snapshot, cursor: {} };
+      },
+      "DELETE /api/session/ses/inbox/msg": async () => {
+        cancelStarted(); await cancellation;
+        return outcome === "error" ? Response.json({ _tag: "UnknownError", message: "response lost" }, { status: 500 }) : undefined;
+      },
+    });
+    const provider = server.provider();
+    const events = provider.events(new AbortController().signal)[Symbol.asyncIterator]();
+    try {
+      await events.next();
+      const oldRead = overlap === "before-pending" ? provider.listMessages("ses", { limit: 50 }) : undefined;
+      if (oldRead) await reading;
+      const cancel = provider.cancelInbox("ses", "msg").then(() => undefined, error => error);
+      await cancelling;
+      const overlappingRead = oldRead ?? provider.listMessages("ses", { limit: 50 });
+      await reading;
+      if (overlap === "during-resolved") {
+        releaseHistory();
+        expect((await overlappingRead).completeItems).toEqual([]);
+      }
+      // Native delivery wins while both its event and the cancel response
+      // are withheld. A pre-boundary read still owns an empty snapshot.
+      messages = [{ id: "msg", type: "user", text: "delivered", time: { created: 2 } }];
+      releaseCancel();
+      const result = await cancel;
+      if (outcome === "error") expect(result).toBeInstanceOf(Error);
+      else expect(result).toBeUndefined();
+      // The post-cancel read must finish independently of the older read.
+      const fresh = await provider.listMessages("ses", { limit: 50 });
+      expect(fresh.completeItems?.map(item => item.id)).toEqual(["message:msg"]);
+      releaseHistory(); await overlappingRead;
+      // Late completion cannot replace the new boundary's retained value.
+      expect((await provider.listMessages("ses", { limit: 50 })).completeItems).toEqual(fresh.completeItems);
+      expect(reads).toBe(2);
+    } finally {
+      releaseCancel(); releaseHistory();
+      stream.close(); await events.next(); await provider.dispose();
+    }
   });
 
   test("a retried prompt is the same message to OpenCode", async () => {

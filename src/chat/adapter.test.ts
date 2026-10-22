@@ -6016,7 +6016,7 @@ describe("steering (opencode-v2-steering)", () => {
   // A fake shaped like the OpenCode 2.x agent: it declares steering and
   // send-now, keeps an inbox the adapter can list and cancel, and announces
   // inbox changes as the 2.x normalizer would — as `inbox` deltas.
-  function steering(options: { capabilities?: Array<"steering" | "send-now" | "background-blocking-work">; steerWithdrawTimeoutMs?: number; automaticBackgroundTimeoutMs?: number; steerAdmissionTimeoutMs?: number; receiptEntries?: number; receiptBytes?: number; receiptTtlMs?: number; now?: () => number } = {}) {
+  function steering(options: { capabilities?: Array<"steering" | "send-now" | "background-blocking-work">; steerWithdrawTimeoutMs?: number; automaticBackgroundTimeoutMs?: number; steerAdmissionTimeoutMs?: number; receiptEntries?: number; receiptBytes?: number; receiptTtlMs?: number; now?: () => number; resolveAttachment?: ConstructorParameters<typeof ChatAdapter>[0]["resolveAttachment"] } = {}) {
     const provider = new FakeProvider();
     provider.agent = { ...provider.agent, capabilities: [...provider.agent.capabilities, ...(options.capabilities ?? ["steering", "send-now"])] };
     provider.sessions = [fixtureSession("session")];
@@ -6031,7 +6031,7 @@ describe("steering (opencode-v2-steering)", () => {
       return accepted;
     };
     let n = 0;
-    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g", id: () => `id-${++n}`, coalesceWindowMs: 1, steerWithdrawTimeoutMs: options.steerWithdrawTimeoutMs ?? 60, automaticBackgroundTimeoutMs: options.automaticBackgroundTimeoutMs, steerAdmissionTimeoutMs: options.steerAdmissionTimeoutMs, receiptEntries: options.receiptEntries, receiptBytes: options.receiptBytes, receiptTtlMs: options.receiptTtlMs, now: options.now });
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g", id: () => `id-${++n}`, coalesceWindowMs: 1, steerWithdrawTimeoutMs: options.steerWithdrawTimeoutMs ?? 60, automaticBackgroundTimeoutMs: options.automaticBackgroundTimeoutMs, steerAdmissionTimeoutMs: options.steerAdmissionTimeoutMs, receiptEntries: options.receiptEntries, receiptBytes: options.receiptBytes, receiptTtlMs: options.receiptTtlMs, now: options.now, resolveAttachment: options.resolveAttachment });
     const inbox = (delta: InboxDelta, eventType = `session.inbox.${delta.kind === "pending" ? "enqueued" : delta.kind === "delivery" ? "delivery.changed" : delta.outcome}`) => {
       if (delta.kind === "settled") provider.pendingInbox = provider.pendingInbox.filter(entry => entry.id !== delta.id);
       if (delta.kind === "pending" && delta.delivery === "steer" && !provider.pendingInbox.some(entry => entry.id === delta.id)) provider.pendingInbox = [...provider.pendingInbox, { id: delta.id, text: delta.text, delivery: "steer", at: delta.at }];
@@ -6181,7 +6181,7 @@ describe("steering (opencode-v2-steering)", () => {
       provider.listMessages = async () => { reads++; return { items: [], accounting: [] }; };
       await expect(adapter.removeQueued("session", accepted.messageId, "remove")).rejects.toBeInstanceOf(SteerWithdrawalUnconfirmedError);
       if (late === "resolve") resolve(); else reject(new Error("late transport rejection"));
-      await Bun.sleep(1);
+      await Promise.allSettled([transport]);
       expect(reads).toBe(0);
       expect(adapter.pendingSteersForTests("session")).toEqual([expect.objectContaining({ id: accepted.messageId, withdrawalUnconfirmed: true })]);
       expect((adapter as unknown as { steerSettlements: Map<string, unknown> }).steerSettlements.size).toBe(0);
@@ -6196,14 +6196,15 @@ describe("steering (opencode-v2-steering)", () => {
       provider.pendingInbox = [];
       let reads = 0, release!: () => void;
       const gate = new Promise<void>(resolve => { release = resolve; });
-      provider.listMessages = async () => {
+      let historyRead!: Promise<ProviderHistoryPage>;
+      provider.listMessages = () => historyRead = (async () => {
         reads++;
         await gate;
         return { items: [{ id: `message:page-${reads}`, type: "user_message", text: "other input", createdAt: 1 }], nextCursor: `next-${reads}`, accounting: [] };
-      };
+      })();
       await expect(adapter.removeQueued("session", accepted.messageId, "remove")).rejects.toBeInstanceOf(SteerWithdrawalUnconfirmedError);
       expect(reads).toBe(1);
-      release(); await Bun.sleep(1);
+      release(); await historyRead;
       expect(reads).toBe(1);
       expect(adapter.pendingSteersForTests("session")[0]?.withdrawalUnconfirmed).toBe(true);
     } finally { await adapter.dispose(); }
@@ -7189,12 +7190,13 @@ describe("steering (opencode-v2-steering)", () => {
       for (let index = 0; index < 70; index++) inbox({ kind: "settled", id: `other-${index}`, outcome: "delivered" });
       await liveEventsApplied(adapter, provider);
       release();
-      await gate; await Bun.sleep(1);
+      const admissions = (adapter as unknown as { admittingSteers: Map<string, unknown> }).admittingSteers;
+      await waitUntil(() => admissions.size === 0);
       expect(adapter.pendingSteersForTests("session").map(entry => entry.text)).toEqual(["another input"]);
       const pending = (await adapter.history("session")).queued ?? [];
       expect(pending.map(entry => entry.text)).toEqual(["another input"]);
       expect(provider.prompts).toHaveLength(2);
-      expect((adapter as unknown as { admittingSteers: Map<string, unknown> }).admittingSteers.size).toBe(0);
+      expect(admissions.size).toBe(0);
     } finally { await adapter.dispose(); await pump; }
   });
 
@@ -7320,6 +7322,188 @@ describe("steering (opencode-v2-steering)", () => {
     await adapter.stopEventPump();
     await pump;
     await adapter.dispose();
+  });
+
+  for (const imageOnly of [false, true]) test(`actual adapter queue DTOs preserve rendered pending numbers through conversion and withdrawal gaps for ${imageOnly ? "image-only" : "duplicate-text"} submissions`, async () => {
+    const { parseHTML } = await import("linkedom");
+    const { QueueDockRenderer } = await import("./timeline-renderer");
+    const { parseChatEvent, parseQueuedMessages } = await import("./validation");
+    const previousDocument = Reflect.get(globalThis, "document");
+    const { document } = parseHTML("<!doctype html><html><body></body></html>");
+    Reflect.set(globalThis, "document", document);
+    const stored = { id: "11111111-2222-4333-8444-555555555555", mimeType: "image/png", absolutePath: "/synthetic/pending.png" };
+    const { adapter, provider, inbox } = steering({ resolveAttachment: async id => id === stored.id ? stored : null });
+    const pump = adapter.startEventPump();
+    const dock = new QueueDockRenderer();
+    const host = document.createElement("div") as unknown as HTMLElement;
+    const context = { conversationId: "session", steering: true, sendNow: true, running: true, isCommand: () => false };
+    const { events, snapshot: emptySnapshot } = await adapter.subscribe("session");
+    const consumed = (async () => {
+      for await (const frame of events) if (frame.type === "conversation.queue") {
+        const parsed = parseChatEvent(JSON.parse(JSON.stringify(frame)));
+        if (parsed.type !== "conversation.queue") throw new Error("Expected queue frame");
+        dock.render(host, parsed.queued, context);
+      }
+    })();
+    const label = (id: string) => host.querySelector(`[data-queue-remove="${id}"]`)?.getAttribute("aria-label");
+    try {
+      adapter.projectionForTests("session").statusUpdate("running");
+      const text = imageOnly ? "" : "Same prompt";
+      const attachments = imageOnly ? [{ id: stored.id, name: "pending.png", mimeType: stored.mimeType }] : undefined;
+      const first = await adapter.prompt("session", "one", text, undefined, undefined, undefined, attachments, "queue");
+      const second = await adapter.prompt("session", "two", text, undefined, undefined, undefined, attachments, "queue");
+      await waitUntil(() => label(second.messageId)?.includes("pending message 2") === true);
+      const originalLabel = label(first.messageId);
+      const steered = await adapter.changeDelivery("session", first.messageId, "steer", "steer");
+      await waitUntil(() => label(steered.messageId) === originalLabel);
+      await adapter.removeQueued("session", second.messageId, "remove-sibling");
+      provider.cancelInbox = async (_session, id) => { inbox({ kind: "settled", id, outcome: "cancelled" }); };
+      const held = await adapter.changeDelivery("session", steered.messageId, "hold", "queue");
+      await waitUntil(() => label(held.messageId) === originalLabel);
+      expect(host.querySelectorAll(".chat-queued-message")).toHaveLength(1);
+      expect(host.querySelector(`[data-queue-remove="${steered.messageId}"]`) === null).toBe(true);
+      // Feed an actual empty DTO before reattaching, representing the
+      // withdrawal/reconnect gap independently of stream coalescing order.
+      dock.render(host, parseQueuedMessages(JSON.parse(JSON.stringify(emptySnapshot.queued))), context);
+      expect(host.querySelectorAll(".chat-queued-message")).toHaveLength(0);
+      // Reattach/snapshot over the existing public seam and strict parser.
+      const reconnect = await adapter.subscribe("session");
+      dock.render(host, parseQueuedMessages(JSON.parse(JSON.stringify(reconnect.snapshot.queued))), context);
+      reconnect.events.cancel();
+      expect(label(held.messageId)).toBe(originalLabel);
+      expect(reconnect.snapshot.queued?.[0]?.submissionId).toBe(first.messageId);
+      expect(reconnect.snapshot.queued?.[0]?.attachments ?? []).toEqual(attachments ?? []);
+    } finally {
+      events.cancel(); await consumed; await adapter.dispose(); await pump;
+      Reflect.set(globalThis, "document", previousDocument);
+    }
+  });
+
+  test("server submission identity survives both switches despite colliding client request IDs and timestamps", async () => {
+    const { adapter, provider, queued, inbox } = steering();
+    const pump = adapter.startEventPump();
+    const clock = spyOn(Date, "now").mockReturnValue(1234);
+    try {
+      adapter.projectionForTests("session").statusUpdate("running");
+      // Two accounts may use the same unscoped request ID. Distinct receipt
+      // scopes admit both; neither that ID nor the millisecond is identity.
+      const first = await adapter.prompt("session", "shared-request", "same text", undefined, undefined, undefined, undefined, "queue", { receiptScope: "account-one", automaticBackground: "off" });
+      const second = await adapter.prompt("session", "shared-request", "same text", undefined, undefined, undefined, undefined, "queue", { receiptScope: "account-two", automaticBackground: "off" });
+      const original = await queued();
+      expect(original.map(entry => entry.submissionId)).toEqual([first.messageId, second.messageId]);
+      expect(original.map(entry => entry.requestId)).toEqual(["shared-request", "shared-request"]);
+      expect(original.map(entry => entry.queuedAt)).toEqual([1234, 1234]);
+      const steered = await adapter.changeDelivery("session", second.messageId, "to-steer", "steer");
+      expect((await queued()).find(entry => entry.id === steered.messageId)?.submissionId).toBe(second.messageId);
+      provider.cancelInbox = async (_session, id) => { inbox({ kind: "settled", id, outcome: "cancelled" }); };
+      const held = await adapter.changeDelivery("session", steered.messageId, "to-queue", "queue");
+      expect((await queued()).find(entry => entry.id === held.messageId)?.submissionId).toBe(second.messageId);
+      const again = await adapter.changeDelivery("session", held.messageId, "again", "steer");
+      expect((await queued()).find(entry => entry.id === again.messageId)?.submissionId).toBe(second.messageId);
+      expect((await queued()).find(entry => entry.id === first.messageId)?.submissionId).toBe(first.messageId);
+    } finally { clock.mockRestore(); await adapter.dispose(); await pump; }
+  });
+
+  test("recovered native steers use native submission identity and preserve known identity on later reads", async () => {
+    const { adapter, provider, queued, inbox } = steering();
+    const pump = adapter.startEventPump();
+    try {
+      adapter.projectionForTests("session").statusUpdate("running");
+      provider.pendingInbox = [{ id: "external-native", text: "same", delivery: "steer", at: 1 }];
+      expect(await queued()).toEqual([expect.objectContaining({ id: "external-native", submissionId: "external-native" })]);
+      expect((await queued())[0]?.requestId).toBeUndefined();
+      provider.cancelInbox = async (_session, id) => { inbox({ kind: "settled", id, outcome: "cancelled" }); };
+      const held = await adapter.changeDelivery("session", "external-native", "hold", "queue");
+      const steered = await adapter.changeDelivery("session", held.messageId, "steer", "steer");
+      // The new native handle is listed on attach/reconnect. Known identity
+      // comes from server state, not the native enqueue time or client echo.
+      provider.pendingInbox = [{ id: steered.messageId, text: "same", delivery: "steer", at: 1 }, { id: "unknown-native", text: "same", delivery: "steer", at: 1 }];
+      const recovered = await queued();
+      expect(recovered.find(entry => entry.id === steered.messageId)?.submissionId).toBe("external-native");
+      expect(recovered.find(entry => entry.id === "unknown-native")).toEqual(expect.objectContaining({ submissionId: "unknown-native", text: "same", queuedAt: 1 }));
+      expect(recovered.find(entry => entry.id === "unknown-native")?.requestId).toBeUndefined();
+    } finally { await adapter.dispose(); await pump; }
+  });
+
+  test("a late acknowledgement with a canonical native ID retains the held submission identity", async () => {
+    const { adapter, provider, queue } = steering({ steerAdmissionTimeoutMs: 5 });
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    try {
+      adapter.projectionForTests("session").statusUpdate("running");
+      const held = await queue("original", "one submission");
+      const admit = provider.prompt.bind(provider);
+      provider.prompt = async (...args) => {
+        await admit(...args); await gate;
+        provider.pendingInbox = [{ id: "canonical-native", text: "one submission", delivery: "steer", at: 1 }];
+        return { messageId: "canonical-native" };
+      };
+      await expect(adapter.changeDelivery("session", held.messageId, "switch", "steer")).rejects.toBeInstanceOf(OperationOutcomeUnknownError);
+      release();
+      await waitUntil(() => adapter.pendingSteersForTests("session").some(entry => entry.id === "canonical-native"));
+      expect((await adapter.history("session")).queued).toEqual([expect.objectContaining({ id: "canonical-native", submissionId: held.messageId, requestId: "original" })]);
+      expect(provider.prompts).toHaveLength(1);
+    } finally { release(); await adapter.dispose(); }
+  });
+
+  for (const recovery of ["late-ack", "inbox-list", "pending-event"] as const) test(`held submission identity survives admission timeout and ${recovery} recovery`, async () => {
+    const { adapter, provider, queue, inbox } = steering({ steerAdmissionTimeoutMs: 5 });
+    const pump = adapter.startEventPump();
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const subscriptions: Array<{ cancel(): void }> = [];
+    try {
+      adapter.projectionForTests("session").statusUpdate("running");
+      const held = await queue("original", "one submission");
+      const admit = provider.prompt.bind(provider);
+      let completed!: () => void;
+      const acknowledged = new Promise<void>(resolve => { completed = resolve; });
+      provider.prompt = async (...args) => { const result = await admit(...args); await gate; completed(); return result; };
+      await expect(adapter.changeDelivery("session", held.messageId, "switch", "steer")).rejects.toBeInstanceOf(OperationOutcomeUnknownError);
+      const unknown = await adapter.subscribe("session"); subscriptions.push(unknown.events);
+      expect(unknown.snapshot.queued).toEqual([expect.objectContaining({ id: held.messageId, submissionId: held.messageId, unconfirmed: true })]);
+      const nativeId = provider.prompts[0]!.id;
+      if (recovery === "pending-event") {
+        inbox({ kind: "pending", id: nativeId, text: "one submission", delivery: "steer", at: 1 });
+        await liveEventsApplied(adapter, provider);
+      }
+      if (recovery !== "late-ack") {
+        const read = await adapter.history("session");
+        expect(read.queued).toEqual([expect.objectContaining({ id: nativeId, submissionId: held.messageId })]);
+      }
+      release(); await acknowledged;
+      await waitUntil(() => adapter.pendingSteersForTests("session").some(entry => entry.id === nativeId));
+      const confirmed = await adapter.history("session");
+      expect(confirmed.queued).toEqual([expect.objectContaining({ id: nativeId, submissionId: held.messageId })]);
+      expect(provider.prompts).toHaveLength(1);
+    } finally {
+      release(); for (const subscription of subscriptions) subscription.cancel();
+      await adapter.dispose(); await pump;
+    }
+  });
+
+  test("duplicate submissions retain their distinct original request IDs through both delivery switches", async () => {
+    const { adapter, provider, queue, queued, inbox } = steering();
+    const pump = adapter.startEventPump();
+    try {
+      adapter.projectionForTests("session").statusUpdate("running");
+      const first = await queue("submission-one", "same text");
+      const second = await queue("submission-two", "same text");
+      const steered = await adapter.changeDelivery("session", second.messageId, "switch-to-steer", "steer");
+      expect(steered.messageId).not.toBe(second.messageId);
+      expect(await queued()).toEqual([
+        expect.objectContaining({ id: steered.messageId, requestId: "submission-two", text: "same text", delivery: "steer" }),
+        expect.objectContaining({ id: first.messageId, requestId: "submission-one", text: "same text", delivery: "queue" }),
+      ]);
+      provider.cancelInbox = async (_session, id) => { inbox({ kind: "settled", id, outcome: "cancelled" }); };
+      const held = await adapter.changeDelivery("session", steered.messageId, "switch-to-queue", "queue");
+      expect(held.messageId).not.toBe(steered.messageId);
+      expect((await queued()).find(entry => entry.id === held.messageId)).toEqual(expect.objectContaining({ requestId: "submission-two", delivery: "queue" }));
+      const steeredAgain = await adapter.changeDelivery("session", held.messageId, "switch-again", "steer");
+      expect((await queued()).find(entry => entry.id === steeredAgain.messageId)).toEqual(expect.objectContaining({ requestId: "submission-two", delivery: "steer" }));
+      expect((await queued()).find(entry => entry.id === first.messageId)?.requestId).toBe("submission-one");
+      expect(provider.prompts).toHaveLength(2);
+    } finally { await adapter.dispose(); await pump; }
   });
 
   test("switching a held message to steer hands it to the agent with its attachments; a dormant queue stays dormant for the rest", async () => {

@@ -21,6 +21,19 @@ On touch, the compact worker disclosure SHALL replace duplicate pinned subagent/
 
 ## ADDED Requirements
 
+### Requirement: Touch conversation actions share the picker row
+Touch selected conversation titles SHALL truncate inside the paint-contained picker wrapper and SHALL NOT push Rename or New conversation onto another row. Both actions SHALL retain at least 44×44px touch targets and their existing accessible names. New conversation MAY use an SVG-only presentation. Native select option strings, browser-owned popup and keyboard selection, the external wrapper focus ring and desktop text-button behavior SHALL remain intact. No Options panel SHALL be added. Transcript-edge floating navigation SHALL NOT paint or receive hits over the header or sibling work controls when the reading strip becomes shorter than the floater.
+
+#### Scenario: Long selected titles preserve same-row actions
+- **WHEN** a 320px or 390px touch viewport shows a long spaced or unbroken selected title at normal or 200% root text size
+- **THEN** the picker, Rename and New conversation stay on one row without horizontal painted overflow
+- **AND** both actions retain full touch targets, keyboard access and the native option list's complete titles
+
+#### Scenario: Enlarged landscape navigation cannot obstruct header actions
+- **WHEN** an 844×390px touch viewport at 200% text allocates a short transcript strip while Latest is shown
+- **THEN** Rename and New conversation remain hit-testable at their centers and block edges
+- **AND** floating transcript navigation remains within its transcript paint/hit boundary rather than covering header or work controls
+
 ### Requirement: Desktop density follows input capability and actual pane width
 Compact desktop density SHALL require selected desktop UI mode and a primary fine pointer with hover. Explicit touch/comfortable mode and touch-first hybrid devices SHALL retain existing comfortable targets. Composer actions SHALL use consistent 32px controls, one row where the actual pane fits and a deliberate two-row layout below 34rem, retaining Attach, model/mode/effort, context, Send and Stop. At actual work-pane widths of at least 40rem active worker rows SHALL align status, agent, task, model, cumulative tokens and a separate 28px Stop; narrower panes SHALL retain two lines without removing metadata. Pending actions SHALL be 32px with 4px/8px padding and independent 8px gaps, inline when they fit and wrapped otherwise. Delivery and Paused labels, edit/replacement safeguards and unknown receipts SHALL remain available. No hidden counts, success notices or replacement action menu SHALL be introduced. These desktop target exceptions supersede the comfortable 44px target rules below.
 

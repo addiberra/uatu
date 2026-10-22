@@ -639,8 +639,9 @@ export function parseQueuedMessages(value: unknown): QueuedMessage[] {
   if (!Array.isArray(value)) throw new Error("queued messages must be an array");
   for (const entry of value) {
     const record = expectRecord(entry, "queued message");
-    expectKeys(record, ["id", "text", "queuedAt", "delivery", "paused", "unconfirmed", "requestId", "attachments"], "queued message");
+    expectKeys(record, ["id", "submissionId", "text", "queuedAt", "delivery", "paused", "unconfirmed", "requestId", "attachments"], "queued message");
     expectIdentity(record.id, "queued message id");
+    if (record.submissionId !== undefined) expectIdentity(record.submissionId, "queued message submissionId");
     expectString(record.text, "queued message text");
     expectTimestamp(record.queuedAt, "queued message queuedAt");
     expectOneOf(record.delivery, ["steer", "queue"], "queued message delivery");

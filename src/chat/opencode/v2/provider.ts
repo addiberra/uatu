@@ -991,7 +991,13 @@ export class OpenCodeV2Provider implements ChatProvider {
   }
 
   async cancelInbox(sessionId: string, inboxId: string): Promise<void> {
-    await this.client.session.inbox.cancel({ sessionID: sessionId, inboxID: inboxId });
+    // Missing-entry cancellation is a successful no-op, so only history
+    // read after the response can establish non-delivery. Fence reads on
+    // both sides: a read started during the request is not fresh evidence
+    // either, even if it completes after cancellation (or response loss).
+    this.historyReuse.invalidate(sessionId);
+    try { await this.client.session.inbox.cancel({ sessionID: sessionId, inboxID: inboxId }); }
+    finally { this.historyReuse.invalidate(sessionId); }
   }
 
   async replyPermission(sessionId: string, requestId: string, reply: ProviderPermissionReply): Promise<void> {

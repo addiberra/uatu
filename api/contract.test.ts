@@ -42,6 +42,32 @@ type Inventory = { operations: Array<{ operationId: string; domain: string; meth
 type Streaming = { channels: Record<string, unknown>; schemas: Record<string, object> };
 
 describe("API contract structure", () => {
+  test("pending submission identity agrees across closed wire validators without becoming a client receipt", async () => {
+    const { parseQueuedMessages, parseChatEvent } = await import("../src/chat/validation");
+    const spec = await readYaml<{ components: { schemas: Record<string, object> } }>("api/openapi.yaml");
+    const validate = createAjv().compile(schemaForAjv(spec.components.schemas.QueuedMessage, spec.components.schemas));
+    const legacy = { id: "current-native", text: "", delivery: "queue", queuedAt: 1, requestId: "unscoped-client-id" };
+    const entry = { ...legacy, submissionId: "original-held" };
+    expect(validate(entry), JSON.stringify(validate.errors)).toBe(true);
+    expect(parseQueuedMessages([entry])).toEqual([entry]);
+    expect(validate(legacy)).toBe(true);
+    expect(parseQueuedMessages([legacy])).toEqual([legacy]);
+    // Revision 28 was closed: adding even an optional response property
+    // requires the workspace-only revision bump for strict consumers.
+    const schema = spec.components.schemas.QueuedMessage as { properties: Record<string, object> };
+    const { submissionId: _newIdentity, ...oldProperties } = schema.properties;
+    const previous = createAjv().compile(schemaForAjv({ ...schema, properties: oldProperties }, spec.components.schemas));
+    expect(previous(legacy)).toBe(true);
+    expect(previous(entry)).toBe(false);
+    const event = { generation: "generation", sequence: 1, conversationId: "opencode:ses", type: "conversation.queue", queued: [entry], change: { kind: "switched", messageId: entry.id } };
+    expect(parseChatEvent(event)).toEqual(event);
+    for (const submissionId of ["", null, 123, "x".repeat(513), "invalid\nidentity"]) {
+      expect(validate({ ...entry, submissionId })).toBe(false);
+      expect(() => parseQueuedMessages([{ ...entry, submissionId }])).toThrow();
+    }
+    expect(validate({ ...entry, accountId: "not-part-of-identity" })).toBe(false);
+  });
+
   test("unconfirmed pending input stays explicit in the closed public queue payload", async () => {
     const { parseQueuedMessages } = await import("../src/chat/validation");
     const spec = await readYaml<{ components: { schemas: Record<string, object> } }>("api/openapi.yaml");
