@@ -298,7 +298,10 @@ export function initChat(api = new ChatApiClient()): void {
   const revertedDock = revertedShell && revertedLabel && revertedItems
     ? new RevertedMessagesDockRenderer(revertedShell, revertedLabel, revertedItems)
     : null;
-  let presentation = readPresentation();
+  // Keep read/write ownership with this page even if a host replaces its
+  // global window while an in-flight read still owes us a save after pagehide.
+  const presentationStorage = presentationLocalStorage();
+  let presentation = readPresentation(presentationStorage);
   let conversations: ConversationSummary[] = [];
   // Every offered agent with its availability, in server presentation order.
   let agentStatuses: AgentChatStatus[] = [];
@@ -1051,7 +1054,7 @@ export function initChat(api = new ChatApiClient()): void {
       expanded.delete(oldest);
     }
     presentation.expanded = [...expanded];
-    try { presentationLocalStorage()?.setItem(PRESENTATION_KEY, JSON.stringify(presentation)); } catch { /* best effort */ }
+    try { presentationStorage?.setItem(PRESENTATION_KEY, JSON.stringify(presentation)); } catch { /* best effort */ }
   };
 
   const save = () => {
@@ -1177,7 +1180,7 @@ export function initChat(api = new ChatApiClient()): void {
   // an enabled button that would send the stop twice.
   const stoppingTasks = new Set<string>();
   const automaticNotes = new AutomaticBackgroundNotices();
-  const queueDiscovery = new QueueDiscovery(presentationLocalStorage());
+  const queueDiscovery = new QueueDiscovery(presentationStorage);
   const actionFeedback = document.querySelector<HTMLElement>("#chat-action-feedback");
   const recordAutomaticBackground = (conversationId: string, operationId: string, result: AutomaticBackgroundFeedback, action: string, text: string) => {
     if (result.automaticBackground === "unknown") {
@@ -6358,9 +6361,9 @@ function autosize(input: HTMLTextAreaElement): void {
   input.style.height = `${Math.min(input.scrollHeight, 192)}px`;
 }
 
-function readPresentation(): Presentation {
+function readPresentation(storage: Storage | null): Presentation {
   try {
-    const raw = presentationLocalStorage()?.getItem(PRESENTATION_KEY);
+    const raw = storage?.getItem(PRESENTATION_KEY);
     if (!raw) return structuredClone(EMPTY_PRESENTATION);
     const value = JSON.parse(raw) as Partial<Presentation>;
     return {

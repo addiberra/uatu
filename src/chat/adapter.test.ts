@@ -23,6 +23,95 @@ import { OpenCodeNotificationLifecycle } from "./opencode/notification-lifecycle
 import { createOpenCodeV2Provider } from "./opencode/v2/provider";
 import type { AgentNotificationEvent } from "./notifications";
 import { notificationPipeline } from "../../tests/notification-pipeline";
+import { startOpenCodeV2Fake } from "../../tests/e2e/opencode-v2-fake";
+import { addAcceptedDraft, applyChatEvent, projectionFromSnapshot } from "./projection";
+
+for (const acknowledgement of ["lost", "late"] as const) for (const responseState of ["pending", "delivered"] as const) test(`real V2 enqueue before a ${acknowledgement} composer acknowledgement retires its optimistic echo (${responseState} before response)`, async () => {
+  const directory = process.cwd();
+  const fake = startOpenCodeV2Fake({ directory });
+  let release!: () => void, responseArrived!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const arrived = new Promise<void>(resolve => { responseArrived = resolve; });
+  let delayNextPrompt = false;
+  const delayedFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const response = await fetch(input, init);
+    const url = new URL(input instanceof Request ? input.url : input.toString());
+    if (delayNextPrompt && url.pathname.endsWith("/prompt")) { delayNextPrompt = false; responseArrived(); await gate; }
+    return response;
+  }) as typeof fetch;
+  const provider = createOpenCodeV2Provider({ endpoint: fake.url, password: fake.password, directory, fetch: delayedFetch });
+  const adapter = new ChatAdapter({ provider, workspacePath: directory, coalesceWindowMs: 0, steerAdmissionTimeoutMs: acknowledgement === "late" ? 80 : undefined });
+  const pump = adapter.startEventPump();
+  let clientPump: Promise<void> | undefined, cancelClient: (() => void) | undefined;
+  try {
+    await waitUntil(() => fake.state().eventSubscribers > 0);
+    const session = await provider.createSession("Lost acknowledgement");
+    await adapter.prompt(session.id, "initial", "Initial work");
+    const client = await adapter.subscribe(session.id);
+    cancelClient = () => client.events.cancel();
+    const draft = { requestId: "original-request", messageId: "pending:original-request", text: "Redirect work", unconfirmed: true as const };
+    let browser = addAcceptedDraft(projectionFromSnapshot(client.snapshot), draft);
+    clientPump = (async () => { for await (const event of client.events) browser = applyChatEvent(browser, event).projection; })();
+    if (acknowledgement === "lost") fake.loseNextPromptResponse();
+    delayNextPrompt = true;
+    const context: ChatActionContext = { receiptScope: "alice", automaticBackground: "on" };
+    const send = () => adapter.prompt(session.id, draft.requestId, draft.text, undefined, undefined, undefined, undefined, "steer", context);
+    const submission = send().catch(error => error);
+    await arrived;
+    await waitUntil(() => browser.queued.some(entry => entry.text === draft.text));
+    if (responseState === "delivered") {
+      fake.step(session.id);
+      await waitUntil(() => browser.items.some(item => item.type === "user_message" && item.text === draft.text));
+    }
+    if (acknowledgement === "lost") release();
+    expect(await submission).toBeInstanceOf(OperationOutcomeUnknownError);
+    await expect(send()).rejects.toBeInstanceOf(OperationOutcomeUnknownError);
+    release();
+    expect(browser.acceptedDrafts).toEqual([]);
+    // The unknown response can arrive after the draft's authoritative row.
+    // Reapplying that local echo must not resurrect it or retire another draft.
+    const other = { requestId: "new-draft-B", messageId: "pending:new-draft-B", text: "Private new input B" };
+    browser = addAcceptedDraft(addAcceptedDraft(browser, other), draft);
+    expect(browser.acceptedDrafts).toEqual([other]);
+    const pending = await adapter.history(session.id);
+    if (responseState === "pending") {
+      expect(pending.queued).toEqual([expect.objectContaining({ requestId: draft.requestId, delivery: "steer" })]);
+      expect(pending.queued![0]!).not.toHaveProperty("unconfirmed");
+      expect(pending.queued![0]!.submissionId).not.toBe(draft.requestId);
+    } else expect(pending.queued).toEqual([]);
+    expect(projectionFromSnapshot(pending, [draft]).acceptedDrafts).toEqual([]);
+    fake.step(session.id);
+    await waitUntil(() => browser.items.some(item => item.type === "user_message" && item.text === draft.text));
+    const delivered = await adapter.history(session.id);
+    expect(projectionFromSnapshot(delivered, [draft]).acceptedDrafts).toEqual([]);
+    expect(delivered.items.filter(item => item.type === "user_message" && item.text === draft.text)).toHaveLength(1);
+    expect(fake.state().calls.filter(call => call.includes("/prompt"))).toHaveLength(2);
+    expect(fake.state().calls.some(call => call.includes("/background") || call.includes("/interrupt?resume=true"))).toBe(false);
+  } finally { release(); cancelClient?.(); await clientPump; await adapter.dispose(); await pump; await fake.stop(); }
+});
+
+test("real V2 Stop with only native steers keeps a later Queue conversion dormant", async () => {
+  const directory = process.cwd();
+  const fake = startOpenCodeV2Fake({ directory });
+  const provider = createOpenCodeV2Provider({ endpoint: fake.url, password: fake.password, directory });
+  const adapter = new ChatAdapter({ provider, workspacePath: directory, coalesceWindowMs: 0 });
+  const pump = adapter.startEventPump();
+  try {
+    await waitUntil(() => fake.state().eventSubscribers > 0);
+    const session = await provider.createSession("Stop conversion");
+    await adapter.prompt(session.id, "initial", "Initial work");
+    const steer = await adapter.prompt(session.id, "steer", "Do this later", undefined, undefined, undefined, undefined, "steer");
+    await adapter.abort(session.id, "stop");
+    const before = fake.state().calls.filter(call => call.includes("/prompt")).length;
+    const converted = await adapter.changeDelivery(session.id, steer.messageId, "convert", "queue");
+    await admissionsApplied(adapter);
+    expect((await adapter.history(session.id)).queued).toEqual([
+      expect.objectContaining({ id: converted.messageId, text: "Do this later", delivery: "queue", paused: true }),
+    ]);
+    expect(fake.state().calls.filter(call => call.includes("/prompt"))).toHaveLength(before);
+    expect(fake.state().sessions[session.id]!.running).toBe(false);
+  } finally { await adapter.dispose(); await pump; await fake.stop(); }
+});
 
 test("side answers preserve foreground/history, never share cached personal responses and reject foreign/unsupported sessions", async () => {
   const provider = new FakeProvider();
@@ -6448,6 +6537,100 @@ describe("steering (opencode-v2-steering)", () => {
     await adapter.dispose();
   });
 
+  for (const evidence of ["pending-event", "inbox-list"] as const) test(`composer ${evidence} before lost acknowledgement preserves correlation without merging account request-ID collisions`, async () => {
+    const { adapter, provider, inbox } = steering();
+    const pump = adapter.startEventPump();
+    try {
+      adapter.projectionForTests("session").statusUpdate("running");
+      const admit = provider.prompt.bind(provider);
+      provider.prompt = async (...args) => {
+        const accepted = await admit(...args);
+        if (evidence === "pending-event") {
+          inbox({ kind: "pending", id: accepted.messageId, text: args[1].text, delivery: "steer", at: 1 });
+          await liveEventsApplied(adapter, provider);
+        } else await adapter.history("session");
+        throw new OperationOutcomeUnknownError();
+      };
+      for (const account of ["alice", "bob"]) {
+        const context: ChatActionContext = { receiptScope: account, automaticBackground: "on" };
+        const send = () => adapter.prompt("session", "same-request", "same text", undefined, undefined, undefined, undefined, "steer", context);
+        await expect(send()).rejects.toBeInstanceOf(OperationOutcomeUnknownError);
+        await expect(send()).rejects.toBeInstanceOf(OperationOutcomeUnknownError);
+      }
+      provider.pendingInbox.push({ id: "unrelated-native", text: "same text", delivery: "steer", at: 1 });
+      const snapshot = await adapter.history("session");
+      expect(snapshot.queued).toHaveLength(3);
+      expect(new Set(snapshot.queued!.map(entry => entry.submissionId)).size).toBe(3);
+      expect(snapshot.queued!.filter(entry => entry.requestId === "same-request")).toHaveLength(2);
+      expect(snapshot.queued!.find(entry => entry.id === "unrelated-native")).not.toHaveProperty("requestId");
+      expect(snapshot.queued!.some(entry => entry.unconfirmed)).toBe(false);
+      expect(provider.prompts).toHaveLength(2);
+    } finally { await adapter.dispose(); await pump; }
+  });
+
+  test("positive native enqueue before a timed-out composer response fences a later different-ID acknowledgement", async () => {
+    const { adapter, provider, inbox, steer } = steering({ steerAdmissionTimeoutMs: 10 });
+    const pump = adapter.startEventPump();
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let settled!: () => void;
+    const acknowledged = new Promise<void>(resolve => { settled = resolve; });
+    try {
+      adapter.projectionForTests("session").statusUpdate("running");
+      const admit = provider.prompt.bind(provider);
+      provider.prompt = async (...args) => {
+        const accepted = await admit(...args);
+        inbox({ kind: "pending", id: accepted.messageId, text: args[1].text, delivery: "steer", at: 1 });
+        await liveEventsApplied(adapter, provider);
+        await gate;
+        settled();
+        return { messageId: "different-native-key" };
+      };
+      await expect(steer("original-request", "original input")).rejects.toBeInstanceOf(OperationOutcomeUnknownError);
+      release(); await acknowledged;
+      const snapshot = await adapter.history("session");
+      expect(snapshot.queued).toEqual([expect.objectContaining({ id: provider.prompts[0]!.id, requestId: "original-request", text: "original input" })]);
+      expect(snapshot.queued![0]).not.toHaveProperty("unconfirmed");
+      expect(provider.prompts).toHaveLength(1);
+    } finally { release(); await adapter.dispose(); await pump; }
+  });
+
+  test("delivered composer correlation survives bounded terminal-cache eviction in later snapshots", async () => {
+    const { adapter, provider, inbox, steer } = steering();
+    const pump = adapter.startEventPump();
+    try {
+      adapter.projectionForTests("session").statusUpdate("running");
+      const accepted = await steer("original-request", "delivered input");
+      const row: ConversationItem = { id: `message:${accepted.messageId}`, type: "user_message", text: "delivered input", requestId: accepted.messageId, createdAt: 1 };
+      inbox({ kind: "settled", id: accepted.messageId, outcome: "delivered" });
+      provider.eventQueue.push({ normalized: { conversationId: "session", updates: [{ kind: "upsert", item: row }], outcome: "handled", eventType: "session.inbox.delivered" } });
+      await liveEventsApplied(adapter, provider);
+      for (let index = 0; index < 65; index++) inbox({ kind: "settled", id: `external-${index}`, outcome: "delivered" });
+      await liveEventsApplied(adapter, provider);
+      const { requestId: _request, ...stored } = row;
+      provider.listMessages = async () => ({ items: [stored], completeItems: [stored], accounting: [] });
+      const snapshot = await adapter.history("session");
+      expect(snapshot.items).toEqual([expect.objectContaining({ requestId: "original-request", text: "delivered input" })]);
+      expect(projectionFromSnapshot(snapshot, [{ requestId: "original-request", messageId: "pending:original-request", text: "delivered input", unconfirmed: true }]).acceptedDrafts).toEqual([]);
+    } finally { await adapter.dispose(); await pump; }
+  });
+
+  test("read-only delivery evidence during withdrawal retains the original composer correlation", async () => {
+    const { adapter, provider, steer } = steering({ steerWithdrawTimeoutMs: 30 });
+    try {
+      adapter.projectionForTests("session").statusUpdate("running");
+      const accepted = await steer("original-request", "deliver once");
+      provider.pendingInbox = [];
+      const row: ConversationItem = { id: `message:${accepted.messageId}`, type: "user_message", text: "deliver once", createdAt: 1 };
+      provider.listMessages = async () => ({ items: [row], completeItems: [row], accounting: [] });
+      await expect(adapter.changeDelivery("session", accepted.messageId, "too-late", "queue")).rejects.toBeInstanceOf(SteerAlreadyDeliveredError);
+      const snapshot = await adapter.history("session");
+      expect(snapshot.queued).toEqual([]);
+      expect(projectionFromSnapshot(snapshot, [{ requestId: "original-request", messageId: "pending:original-request", text: "deliver once", unconfirmed: true }]).acceptedDrafts).toEqual([]);
+      expect(provider.prompts).toHaveLength(1);
+    } finally { await adapter.dispose(); }
+  });
+
   test("native pending before a lost held conversion acknowledgement leaves one logical submission", async () => {
     const { adapter, provider, inbox, queue } = steering();
     const pump = adapter.startEventPump();
@@ -7029,6 +7212,29 @@ describe("steering (opencode-v2-steering)", () => {
     } finally { watch.stop(); await adapter.dispose(); await pump; }
   });
 
+  test("a new idle prompt after empty Stop clears dormancy only after acceptance", async () => {
+    const { adapter, provider, queue, queued, inbox } = steering();
+    const pump = adapter.startEventPump();
+    try {
+      await adapter.prompt("session", "start", "start");
+      await adapter.abort("session", "empty-stop");
+      const accept = provider.prompt.bind(provider);
+      provider.prompt = async () => { throw new Error("refused"); };
+      await expect(queue("refused", "refused prompt")).rejects.toThrow("refused");
+      provider.prompt = accept;
+      await queue("new", "new idle prompt");
+      inbox({ kind: "pending", id: "external-steer", text: "held in the new turn", delivery: "steer", at: Date.now() });
+      await liveEventsApplied(adapter, provider);
+      provider.cancelInbox = async (_id, id) => { inbox({ kind: "settled", id, outcome: "cancelled" }); };
+      const held = await adapter.changeDelivery("session", "external-steer", "hold", "queue");
+      expect(await queued()).toEqual([expect.objectContaining({ id: held.messageId, delivery: "queue" })]);
+      expect((await queued())[0]).not.toHaveProperty("paused");
+      adapter.projectionForTests("session").statusUpdate("completed");
+      await admissionsApplied(adapter);
+      expect(provider.prompts.map(input => input.text)).toEqual(["start", "new idle prompt", "held in the new turn"]);
+    } finally { await adapter.dispose(); await pump; }
+  });
+
   test("cancel interrupts without resuming: held messages go dormant, pending steers stay pending and paused, nothing delivers", async () => {
     const { adapter, provider, steer, queue, queued } = steering();
     expect((await adapter.prompt("session", "r-1", "start")).pending).toBe(false);
@@ -7044,6 +7250,41 @@ describe("steering (opencode-v2-steering)", () => {
       expect.objectContaining({ id: held.messageId, delivery: "queue", paused: true }),
     ]);
     await adapter.dispose();
+  });
+
+  for (const inventory of ["empty", "native", "mixed"] as const) for (const resume of ["switch", "send-now"] as const) test(`Stop with ${inventory} dock survives disconnect, late settlement and Queue conversion until explicit ${resume}`, async () => {
+    const { adapter, provider, steer, queue, queued, inbox } = steering();
+    let pump = adapter.startEventPump();
+    try {
+      await adapter.prompt("session", "start", "initial work");
+      const native = inventory === "empty" ? "late-native" : (await steer("original", "later input")).messageId;
+      if (inventory === "mixed") await queue("held", "other held input");
+      await adapter.abort("session", "stop");
+      await adapter.stopEventPump(); await pump;
+      provider.listPendingInbox = async () => { throw new Error("disconnected"); };
+      expect((await queued()).every(entry => entry.paused)).toBe(true);
+      // An enqueue raised elsewhere was not seen before Stop. Recovery is
+      // evidence of input, not a fresh submission or permission to resume.
+      if (inventory === "empty") provider.pendingInbox.push({ id: native, text: "later input", delivery: "steer", at: 1 });
+      provider.listPendingInbox = async () => provider.pendingInbox;
+      provider.eventQueue = new EventQueue();
+      pump = adapter.startEventPump();
+      expect((await queued()).every(entry => entry.paused)).toBe(true);
+      provider.cancelInbox = async (_session, id) => { inbox({ kind: "settled", id, outcome: "cancelled" }); };
+      const before = provider.prompts.length;
+      const converted = await adapter.changeDelivery("session", native, "hold", "queue");
+      provider.eventQueue.push({ type: "session.idle", data: { sessionID: "session" } });
+      await liveEventsApplied(adapter, provider);
+      await admissionsApplied(adapter);
+      expect((await queued()).find(entry => entry.id === converted.messageId)).toEqual(expect.objectContaining({ text: "later input", delivery: "queue", paused: true }));
+      expect(provider.prompts).toHaveLength(before);
+      const resumed = resume === "switch"
+        ? await adapter.changeDelivery("session", converted.messageId, "explicit-resume", "steer")
+        : await adapter.sendNow("session", converted.messageId, "explicit-resume");
+      expect(provider.prompts).toHaveLength(before + 1);
+      expect((await queued()).find(entry => entry.id === resumed.messageId)).toEqual(expect.objectContaining({ delivery: "steer", text: "later input" }));
+      if (inventory === "mixed") expect((await queued()).find(entry => entry.text === "other held input")).toEqual(expect.objectContaining({ paused: true }));
+    } finally { await adapter.dispose(); await pump; }
   });
 
   test("a replacement under a staged revert goes out as a steer on a steering agent, and dispatches as before on one without", async () => {

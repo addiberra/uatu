@@ -301,7 +301,7 @@ type PendingSteer = {
   tick: number;
 };
 
-type SteerAdmission = { conversationId: string; id: string; submissionId: string; held?: HeldMessage; terminal?: "delivered" | "cancelled"; retired?: true };
+type SteerAdmission = { conversationId: string; id: string; submissionId: string; requestId: string; held?: HeldMessage; terminal?: "delivered" | "cancelled"; retired?: true };
 
 // Total withdrawal budget for cancellation, terminal events and bounded
 // list/history recovery (D7).
@@ -466,7 +466,7 @@ export class ChatAdapter {
   private readonly publishedPaused = new Map<string, Set<string>>();
   // Withdrawals waiting for the agent's settlement of an inbox entry (D7).
   private readonly steerSettlements = new Map<string, Map<string, (outcome: "delivered" | "cancelled") => void>>();
-  private readonly deliveredSteers = new Map<string, true>();
+  private readonly deliveredSteers = new Map<string, string | true>();
   // Only admissions currently awaiting acknowledgement: terminal events must
   // win even when there was no pending event, or the delivered-id cache evicts.
   private readonly admittingSteers = new Map<string, SteerAdmission>();
@@ -682,7 +682,7 @@ export class ChatAdapter {
     // Some providers page locally after loading the complete transcript. Reuse
     // that complete source for recovery, never the bounded visible page.
     const configuration = await this.configuration(id);
-    const items = [...page.items];
+    const items = page.items.map(item => this.correlateSteerMessage(id, item));
     // A conversation's price is the sum of every message's, and the client
     // folds it from the usage carriers it holds — so the newest page alone
     // would present a partial figure that grows as older pages load. Where
@@ -1273,6 +1273,8 @@ export class ChatAdapter {
           ...(mode ? { mode } : {}),
           ...(variant ? { variant } : {}),
         });
+        this.dormantQueues.delete(conversationId);
+        this.publishPausedChanges(conversationId);
         return { ...dispatched, pending: false, delivery: "queue" };
       }));
   }
@@ -1298,7 +1300,7 @@ export class ChatAdapter {
     const identity = this.id();
     const nativeId = this.provider.promptIdentity?.(identity) ?? identity;
     const submissionId = sourceHeld?.submissionId ?? nativeId;
-    const fence: SteerAdmission = { conversationId, id: nativeId, submissionId, held: sourceHeld };
+    const fence: SteerAdmission = { conversationId, id: nativeId, submissionId, requestId, held: sourceHeld };
     const fenceKey = steerKey(conversationId, nativeId);
     // Retain request-local truth until the actual transport settles, not just
     // the admission deadline. Evicted requests cannot apply late evidence.
@@ -1574,9 +1576,9 @@ export class ChatAdapter {
         return delivered() ? "delivered" : result;
       };
       const outcome = await Promise.race([recover(), settled, deadline]);
+      if (outcome === "delivered") this.rememberDelivered(conversationId, steer.id);
       this.forgetSteer(conversationId, steer.id);
       if (outcome === "delivered") {
-        this.rememberDelivered(conversationId, steer.id);
         this.publishQueue(conversationId, { kind: "delivered", messageId: steer.id });
         this.publishPausedChanges(conversationId);
         throw new SteerAlreadyDeliveredError();
@@ -1586,8 +1588,8 @@ export class ChatAdapter {
       // have applied. Positive terminal evidence always outranks that failure.
       if (error instanceof SteerAlreadyDeliveredError) throw error;
       if (delivered()) {
-        this.forgetSteer(conversationId, steer.id);
         this.rememberDelivered(conversationId, steer.id);
+        this.forgetSteer(conversationId, steer.id);
         this.publishQueue(conversationId, { kind: "delivered", messageId: steer.id });
         this.publishPausedChanges(conversationId);
         throw new SteerAlreadyDeliveredError();
@@ -1652,7 +1654,28 @@ export class ChatAdapter {
   }
 
   private rememberDelivered(conversationId: string, steerId: string): void {
-    boundedSet(this.deliveredSteers, steerKey(conversationId, steerId), true, DELIVERED_STEERS_LIMIT);
+    const key = steerKey(conversationId, steerId);
+    const admission = this.admittingSteers.get(key);
+    const requestId = this.pendingSteers.get(conversationId)?.find(entry => entry.id === steerId)?.requestId
+      ?? (!admission?.retired ? admission?.requestId : undefined);
+    boundedSet(this.deliveredSteers, key, requestId ?? this.deliveredSteers.get(key) ?? true, DELIVERED_STEERS_LIMIT);
+  }
+
+  // Native ids, not client request ids, establish ownership. Keep the original
+  // correlation on delivered rows too, so a lost response cannot leave a
+  // browser's optimistic draft beside the accepted input after reload.
+  private correlateSteerMessage(conversationId: string, item: ConversationItem): ConversationItem {
+    if (item.type !== "user_message" || !item.id.startsWith("message:")) return item;
+    const id = item.id.slice("message:".length);
+    const key = steerKey(conversationId, id);
+    const admission = this.admittingSteers.get(key);
+    const delivered = this.deliveredSteers.get(key);
+    const current = this.projection(conversationId).get(item.id);
+    const requestId = this.pendingSteers.get(conversationId)?.find(entry => entry.id === id)?.requestId
+      ?? (!admission?.retired ? admission?.requestId : undefined)
+      ?? (typeof delivered === "string" ? delivered : undefined)
+      ?? (current?.type === "user_message" ? current.requestId : undefined);
+    return requestId ? { ...item, requestId } : item;
   }
 
   /**
@@ -1666,7 +1689,8 @@ export class ChatAdapter {
       // The dock lists the user's steers; the agent's own entries and its
       // natively queued input are not Uatu's queue.
       if (delta.delivery !== "steer") return;
-      const admission = this.admittingSteers.get(steerKey(conversationId, delta.id));
+      const fence = this.admittingSteers.get(steerKey(conversationId, delta.id));
+      const admission = fence?.retired ? undefined : fence;
       if (admission?.terminal || this.deliveredSteers.has(steerKey(conversationId, delta.id)) || this.projection(conversationId).has(`message:${delta.id}`)) return;
       const queue = this.heldQueues.get(conversationId) ?? [];
       const held = queue.find(entry => entry === admission?.held || entry.unconfirmedSteerId === delta.id);
@@ -1677,6 +1701,7 @@ export class ChatAdapter {
       const existing = steers.find(entry => entry.id === delta.id);
       if (existing) {
         existing.text = delta.text;
+        if (admission) existing.requestId = admission.requestId;
         existing.tick = ++this.inboxClock;
         delete existing.unconfirmed;
         if (delta.attachments?.length) existing.attachments = delta.attachments; else delete existing.attachments;
@@ -1685,7 +1710,8 @@ export class ChatAdapter {
         return;
       }
       const submissionId = held?.submissionId ?? admission?.submissionId ?? delta.id;
-      steers.push({ id: delta.id, submissionId, text: delta.text, queuedAt: held?.queuedAt ?? delta.at, ...(held ? { requestId: held.requestId } : {}), ...(delta.attachments?.length ? { attachments: delta.attachments } : {}), tick: ++this.inboxClock });
+      const requestId = held?.requestId ?? admission?.requestId;
+      steers.push({ id: delta.id, submissionId, text: delta.text, queuedAt: held?.queuedAt ?? delta.at, ...(requestId ? { requestId } : {}), ...(delta.attachments?.length ? { attachments: delta.attachments } : {}), tick: ++this.inboxClock });
       this.pendingSteers.set(conversationId, steers);
       this.publishQueue(conversationId, { kind: "steered", messageId: delta.id });
       this.publishPausedChanges(conversationId);
@@ -1777,7 +1803,10 @@ export class ChatAdapter {
     if (current.length === 0 && listed.length > 0 && !this.turnActive(conversationId, projection) && !this.lastSettledAt.has(conversationId)) this.lastSettledAt.set(conversationId, Date.now());
     const next: PendingSteer[] = listed.filter(entry => entry.delivery === "steer").map(entry => {
       const known = current.find(candidate => candidate.id === entry.id) ?? confirmedHeld.get(entry.id);
-      return { id: entry.id, submissionId: known?.submissionId ?? this.admittingSteers.get(steerKey(conversationId, entry.id))?.submissionId ?? entry.id, text: entry.text, queuedAt: known?.queuedAt ?? entry.at, ...(known?.requestId ? { requestId: known.requestId } : {}), ...(entry.attachments?.length ? { attachments: entry.attachments } : {}), ...(known && "withdrawalUnconfirmed" in known && known.withdrawalUnconfirmed ? { withdrawalUnconfirmed: true as const } : {}), ...(known && "resumeUnconfirmed" in known && known.resumeUnconfirmed && !this.turnActive(conversationId, projection) ? { resumeUnconfirmed: true as const } : {}), tick: known && "tick" in known ? known.tick : ++this.inboxClock };
+      const fence = this.admittingSteers.get(steerKey(conversationId, entry.id));
+      const admission = fence?.retired ? undefined : fence;
+      const requestId = known?.requestId ?? admission?.requestId;
+      return { id: entry.id, submissionId: known?.submissionId ?? admission?.submissionId ?? entry.id, text: entry.text, queuedAt: known?.queuedAt ?? entry.at, ...(requestId ? { requestId } : {}), ...(entry.attachments?.length ? { attachments: entry.attachments } : {}), ...(known && "withdrawalUnconfirmed" in known && known.withdrawalUnconfirmed ? { withdrawalUnconfirmed: true as const } : {}), ...(known && "resumeUnconfirmed" in known && known.resumeUnconfirmed && !this.turnActive(conversationId, projection) ? { resumeUnconfirmed: true as const } : {}), tick: known && "tick" in known ? known.tick : ++this.inboxClock };
     });
     const nextIds = new Set(next.map(entry => entry.id));
     // Kept without the list's say: entries a withdrawal is waiting on (their
@@ -2198,7 +2227,9 @@ export class ChatAdapter {
       // BEFORE the provider call — the interrupt's own idle event can reach
       // the pump before the interrupt request resolves, and an un-paused
       // queue would deliver into exactly the gap the user cancelled.
-      const paused = (this.heldQueues.get(conversationId)?.length ?? 0) > 0 && !this.dormantQueues.has(conversationId);
+      // Keep Stop's intent even with no held entries yet: converting a paused
+      // native steer to Queue later is not a new submission or a resume.
+      const paused = !this.dormantQueues.has(conversationId);
       if (paused) this.dormantQueues.add(conversationId);
       try {
         // Without resume: pending steers stay with the agent, unwoken, and
@@ -3338,7 +3369,7 @@ export class ChatAdapter {
         // Not gated on the abort signal: a graceful stop still applies
         // whatever the coalescer buffered in its final window.
         const projection = this.projection(conversationId);
-        for (const update of updates) projection.apply(update);
+        for (const update of updates) projection.apply(update.kind === "upsert" ? { ...update, item: this.correlateSteerMessage(conversationId, update.item) } : update);
         if (this.provider.reconcileBackgroundTasks) this.syncBackgroundState(conversationId);
         // A fast subagent can start and report inside one coalescer window:
         // its usage arrives while the parent's task row is still buffered, so
@@ -4100,6 +4131,10 @@ export class ConversationProjection {
 
   has(itemId: string): boolean {
     return this.timeline.has(itemId);
+  }
+
+  get(itemId: string): ConversationItem | undefined {
+    return this.timeline.get(itemId);
   }
 
   items(): ConversationItem[] {

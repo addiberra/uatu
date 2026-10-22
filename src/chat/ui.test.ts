@@ -1261,17 +1261,30 @@ describe("chat paused crons", () => {
 });
 
 describe("chat cost receipt", () => {
-  test("itemizes three ways, remembers the choice across conversations and a reload, and leaves an agent's own totals alone", async () => {
+  for (const pendingPriorSnapshot of [false, true]) test(`itemizes three ways, remembers the choice across conversations and a reload, and leaves an agent's own totals alone${pendingPriorSnapshot ? " with a prior page's snapshot still pending" : ""}`, async () => {
     // One storage across two boots: the second boot is the reload.
-    const stored = new Map<string, string>();
-    const storage = {
-      get length() { return stored.size; },
-      clear() { stored.clear(); },
-      getItem: (key: string) => stored.get(key) ?? null,
-      key: (index: number) => [...stored.keys()][index] ?? null,
-      removeItem: (key: string) => { stored.delete(key); },
-      setItem: (key: string, value: string) => { stored.set(key, String(value)); },
+    const priorSnapshot = deferred<void>();
+    let priorSnapshotRequested = false;
+    let priorSnapshotReleased = false;
+    let priorSaveCompleted = false;
+    const makeStorage = () => {
+      const stored = new Map<string, string>();
+      return {
+        get length() { return stored.size; },
+        clear() { stored.clear(); },
+        getItem: (key: string) => stored.get(key) ?? null,
+        key: (index: number) => [...stored.keys()][index] ?? null,
+        removeItem: (key: string) => { stored.delete(key); },
+        setItem: (key: string, value: string) => {
+          stored.set(key, String(value));
+          // Observe the old callback's real save regardless of which fixture it
+          // targets. The reload assertion below detects cross-page corruption.
+          if (priorSnapshotReleased && key.endsWith(":uatu:chat-presentation") && JSON.parse(value).receiptView === undefined) priorSaveCompleted = true;
+        },
+      };
     };
+    const storage = makeStorage();
+    const priorStorage = makeStorage();
     const Q = { providerId: "berget", modelId: "qwen" };
     const carrier = (id: string, costUsd: number, agent: string) => ({ id: `usage:${id}`, type: "assistant_message" as const, createdAt: 1, markdown: "", usage: { input: 1_000, output: 10, costUsd }, model: Q, agent });
     const task = (id: string, description: string, kind: string, conversationId: string, costUsd: number, descendants?: unknown[]) => ({
@@ -1298,7 +1311,7 @@ describe("chat cost receipt", () => {
     const boot = async (tag: string) => {
       const { document, window } = parseHTML(html);
       installDomGlobals(document, window);
-      Object.defineProperty(window, "localStorage", { configurable: true, value: storage });
+      Object.defineProperty(window, "localStorage", { configurable: true, value: tag === "prior" ? priorStorage : storage });
       document.documentElement.setAttribute("data-ui-mode", "desktop");
       document.documentElement.setAttribute("data-chat-panel", "open");
       const select = document.querySelector<HTMLSelectElement>("#chat-conversation-select")!;
@@ -1308,7 +1321,13 @@ describe("chat cost receipt", () => {
         status: async () => ([{ agent: { id: "test", name: "Test" }, availability: { state: "ready", version: "test", agent: { id: "test", name: "Test", capabilities: ["context", "subagents"] } } }]),
         conversations: async () => [conversation("one"), conversation("two"), conversation("tallied")],
         commands: async () => [],
-        snapshot: async (id: string) => ({ ...snapshot(id), items: itemsOf[id] ?? [] }),
+        snapshot: async (id: string) => {
+          if (tag === "prior") {
+            priorSnapshotRequested = true;
+            await priorSnapshot.promise;
+          }
+          return { ...snapshot(id), items: itemsOf[id] ?? [] };
+        },
         stream: () => ({ close() {} }),
         inventoryStream: () => ({ close() {} }),
         attachmentUrl: (id: string) => `/api/chat/attachments/${id}`,
@@ -1330,6 +1349,15 @@ describe("chat cost receipt", () => {
       };
     };
 
+    // Browser windows have separate realms. This harness replaces Bun's one
+    // global window; a pending callback must still save to its own page's store.
+    let priorOpened: Promise<void> | undefined;
+    if (pendingPriorSnapshot) {
+      const prior = await boot("prior");
+      priorOpened = prior.open("one", "$1.00");
+      await waitUntil(() => priorSnapshotRequested);
+      prior.window.dispatchEvent(new Event("pagehide"));
+    }
     const first = await boot("first");
     try {
       await first.open("one", "$1.00");
@@ -1383,6 +1411,14 @@ describe("chat cost receipt", () => {
       first.window.dispatchEvent(new Event("pagehide"));
     }
 
+    if (pendingPriorSnapshot) {
+      // Release an actual in-flight read after pagehide, not another lifecycle
+      // event. Wait for its normal queued save, not an arbitrary drain sleep.
+      priorSnapshotReleased = true;
+      priorSnapshot.resolve();
+      await priorOpened;
+      await waitUntil(() => priorSaveCompleted, () => "prior page's queued presentation save");
+    }
     // Reload: a fresh page over the same storage opens on the remembered choice.
     const second = await boot("second");
     try {
