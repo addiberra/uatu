@@ -1,7 +1,35 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { parseHTML } from "linkedom";
 import { compactWorkers } from "./compact-work";
 import { CompactWorkersView } from "./compact-workers-view";
+
+test("finished worker clocks render 24-hour evening and midnight even under an AM/PM locale", () => {
+  const { document, window } = parseHTML('<html><body><div id="workers"></div></body></html>');
+  const previous = new Map(["document", "Element"].map(key => [key, Reflect.get(globalThis, key)]));
+  Reflect.set(globalThis, "document", document); Reflect.set(globalThis, "Element", window.Element);
+  // Force an AM/PM locale while retaining the host timezone and the view's
+  // real formatting options. Local date construction makes this timezone-neutral.
+  const format = spyOn(Date.prototype, "toLocaleTimeString").mockImplementation(function(this: Date, _locales?: Intl.LocalesArgument, options?: Intl.DateTimeFormatOptions) {
+    return new Intl.DateTimeFormat("en-US", options).format(this);
+  });
+  try {
+    const host = document.getElementById("workers")! as unknown as HTMLElement;
+    const view = new CompactWorkersView(host);
+    const evening = new Date(2026, 9, 22, 19, 43).getTime();
+    const midnight = new Date(2026, 9, 23, 0, 0).getTime();
+    view.paint("parent", compactWorkers([
+      { type: "background_task", id: "evening", taskId: "evening", description: "Finished", status: "completed", createdAt: evening - 60_000, usage: { durationMs: 60_000, totalTokens: 0, toolUses: 0 } },
+      { type: "background_task", id: "midnight", taskId: "midnight", description: "Start only", status: "completed", createdAt: midnight },
+      { type: "background_task", id: "unknown", taskId: "unknown", description: "No timestamp", status: "completed", createdAt: 0 },
+    ]), new Set(), true);
+    expect(host.querySelector('[data-worker-id="evening"] .chat-worker-meta')!.textContent).toBe("Agent · 19:43");
+    expect(host.querySelector('[data-worker-id="midnight"] .chat-worker-meta')!.textContent).toBe("Agent · Started 00:00");
+    expect(host.querySelector('[data-worker-id="unknown"] .chat-worker-meta')!.textContent).toBe("Agent");
+  } finally {
+    format.mockRestore();
+    for (const [key, value] of previous) Reflect.set(globalThis, key, value);
+  }
+});
 
 test("running and finished workers share one flat list and a single compact header", () => {
   const { document, window } = parseHTML('<html><body><details open><summary>1 working · 1 finished</summary><div id="workers"></div></details></body></html>');

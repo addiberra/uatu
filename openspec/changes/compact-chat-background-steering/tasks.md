@@ -1,3 +1,34 @@
+## Review round 4 — approved fixed Steer default (2026-10-22)
+
+The user chose **Use fixed Steer default**, explicitly removing the configurable
+default requirement. This supersedes historical keyboard-preference tasks below;
+personal Hub automatic-background preferences and explicit API/dock delivery
+remain unchanged.
+
+- [x] Reproduce legacy saved Queue at existing public UI/shortcut seams, implement fixed desktop Enter / touch Ctrl/Command+Enter Steer and Alt/Option+Enter Queue where offered, and remove the unused preference helper/tests. Preserve touch newline, tap/hold timing and armed-release cancellation, command/attachment queueing, idle dispatch, staged configuration and unknown/no-replay safety. Align CHAT and governing active/main specs, run focused browser/unit checks, typecheck and strict validation; record evidence without publication or live services.
+
+Evidence: `~/.cache/opencode/scratch/review-loop-20261022/round-4-fixes/fixed-default/`.
+`red-delivery.log` shows legacy Queue producing a Queue request for Enter;
+`red-browser.log` shows the reversed hint. `green-browser-final.log` passes
+16 focused browser cases; `touch-hold-confirm.log` passes six further checks,
+including expanded Chromium/WebKit legacy-touch idle/busy/command-candidate
+newline and Ctrl/Command/Alt shortcuts after reload, exact 2500ms holds, and the
+existing idle/busy touch newline cases. The initial green attempt retained a
+new-test mistake: it expected an idle response to report Steer instead of the
+existing immediate dispatch's Queue result; the corrected test separately checks
+the requested delivery and immediate acceptance without changing the backend.
+`unit-complete.log` passes all 87 UI tests (509 assertions), including staged
+configuration, slash-path loss and uncertain/no-replay coverage; the 15 focused
+input/configuration cases also pass separately in `unit-focused.log`.
+Typecheck, all three active changes' strict validation, main opencode-chat strict
+validation and diff hygiene pass. Strict output retains the already-synchronized
+steering ADDED-header archive advisory; no archive was attempted. Impeccable's
+mechanical check reports no findings; final synthetic desktop and mobile renders
+were inspected. No new controls, layout height, storage deletion, API/revision
+changes, dependency installation, real Hub/model activity or publication. The
+four parallel-owned backend files were not edited by this worker. Full-root CI,
+physical-device acceptance and independent validation are not claimed here.
+
 ## Same-row touch conversation header (2026-10-22)
 
 - [x] Keep touch picker, Rename and New conversation on one row with a shrinkable paint-contained selected title, external focus ring, full native option strings/popup and 44px action targets; preserve desktop's text button and omit replacement menus.

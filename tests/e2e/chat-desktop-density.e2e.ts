@@ -1,9 +1,43 @@
 import { expect, test } from "./fixtures";
 import { openChatPanel, openChatWorkers } from "./chat-helpers";
 
+test("legacy Queue default cannot change Enter or Alt+Enter, including after reload", async ({ page, request }) => {
+  await page.addInitScript(() => localStorage.setItem("uatu:presentation:v1:%2F:chat-delivery", "queue"));
+  await request.post("/__e2e/reset");
+  await request.post("/__e2e/chat", { data: { action: "agents", stack: "opencode-v2" } });
+  const { token } = await request.get("/__e2e/terminal-token").then(r => r.json());
+  await page.goto(`/?t=${encodeURIComponent(token)}`);
+  await openChatPanel(page);
+  await page.getByRole("button", { name: "New conversation", exact: true }).click();
+  await expect(page.locator("#chat-state")).toContainText("Started new conversation");
+  const submit = async (text: string, key: string, delivery: string) => {
+    await page.locator("#chat-input").fill(text);
+    const accepted = page.waitForResponse(response => response.url().endsWith("/prompts"));
+    await page.locator("#chat-input").press(key);
+    const response = await accepted;
+    expect(response.request().postDataJSON()).toMatchObject({ text, delivery });
+    expect(await response.json()).toMatchObject({ delivery });
+  };
+  await page.locator("#chat-input").fill("Start work");
+  const started = page.waitForResponse(response => response.url().endsWith("/prompts"));
+  await page.locator("#chat-input").press("Enter");
+  expect((await started).request().postDataJSON()).toMatchObject({ delivery: "steer" });
+  expect(await (await started).json()).toMatchObject({ pending: false });
+  await expect(page.locator("#chat-stop")).toBeEnabled();
+  await submit("Steer despite legacy Queue", "Enter", "steer");
+  await submit("Queue explicitly", "Alt+Enter", "queue");
+  await page.reload();
+  await openChatPanel(page);
+  await submit("Still steer after reload", "Enter", "steer");
+  await submit("Still queue explicitly", "Alt+Enter", "queue");
+  expect(await page.evaluate(() => localStorage.getItem("uatu:presentation:v1:%2F:chat-delivery"))).toBe("queue");
+});
+
 for (const fraction of [0.4, 0.8]) test(`desktop density follows pane width (${fraction})`, async ({ page, request }) => {
   await page.setViewportSize({ width: 1440, height: 1000 });
   await page.addInitScript(fraction => localStorage.setItem("uatu:presentation:v1:%2F:uatu:chat-panel", JSON.stringify({ open: true, fraction })), fraction);
+  // An upgrading browser may still have the retired Queue default.
+  await page.addInitScript(() => localStorage.setItem("uatu:presentation:v1:%2F:chat-delivery", "queue"));
   await request.post("/__e2e/reset");
   await request.post("/__e2e/chat", { data: { action: "agents", stack: "opencode-v2", backgroundPreview: true } });
   const { token } = await request.get("/__e2e/terminal-token").then(r => r.json());
@@ -51,13 +85,21 @@ for (const fraction of [0.4, 0.8]) test(`desktop density follows pane width (${f
   await expect(page.locator("#chat-compact-workers > summary")).toBeInViewport();
   await expect(page.locator("[data-pending-toggle]")).toBeInViewport();
   await page.evaluate(() => localStorage.setItem("uatu:presentation:v1:%2F:chat-delivery", "queue"));
-  await input.fill("Use the saved keyboard preference");
-  await expect(page.locator("#chat-keyboard-hint")).toHaveText("Enter: queue · Alt+Enter: steer");
+  await input.fill("Ignore the retired keyboard preference");
+  await expect(page.locator("#chat-keyboard-hint")).toHaveText("Enter: steer · Alt+Enter: queue");
   await input.press("Enter");
-  await expect(page.locator('.chat-queued-message[data-delivery="queue"]')).toHaveCount(9);
+  await expect(page.locator('.chat-queued-message[data-delivery="steer"]')).toHaveCount(1);
   await input.fill("Use the one-time keyboard override");
   await input.press("Alt+Enter");
-  await expect(page.locator('.chat-queued-message[data-delivery="steer"]')).toHaveCount(1);
+  await expect(page.locator('.chat-queued-message[data-delivery="queue"]')).toHaveCount(9);
+  await page.reload();
+  await openChatPanel(page);
+  await expect(page.locator("#chat-keyboard-hint")).toHaveText("Enter: steer · Alt+Enter: queue");
+  await input.fill("Still steer after reload");
+  const accepted = page.waitForResponse(response => response.url().endsWith("/prompts"));
+  await input.press("Enter");
+  expect(await (await accepted).json()).toMatchObject({ pending: true, delivery: "steer" });
+  expect(await page.evaluate(() => localStorage.getItem("uatu:presentation:v1:%2F:chat-delivery"))).toBe("queue");
 });
 
 test("explicit comfortable mode keeps touch targets on a fine-pointer desktop", async ({ page, request }) => {

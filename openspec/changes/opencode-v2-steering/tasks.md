@@ -1,5 +1,15 @@
 Each slice is written test first: write the named test and watch it fail, implement until it passes, then run the module's test file. The design references (D1–D13) point to design.md.
 
+## Approved review-round-4 intent revision — 2026-10-22
+
+The user chose fixed Steer, removing the configurable-default requirement.
+Historical 6.1/9.1 preference tasks below record earlier work, not current
+acceptance. Desktop Enter and touch Ctrl/Command+Enter now steer; Alt/Option+Enter
+queues where offered. Legacy saved Queue is ignored, not deleted. Touch newline,
+tap/hold timing, mandatory command/attachment queueing and explicit HTTP/dock
+delivery remain unchanged. Implementation and verification are tracked in the
+successor `compact-chat-background-steering/tasks.md` review-round-4 ledger.
+
 The completed tasks below retain historical implementation evidence. The later authoritative UX audit revises per-entry paused Send now to one dock batch action, named Undo warnings to counts, and responsive/menu presentation. Its additive criteria and verification live in `ux-audit-tasks.md`; current behavior is in the updated design and delta specs.
 
 ## Mobile UX parity and independent-review closure — 2026-10-16

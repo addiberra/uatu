@@ -74,7 +74,7 @@ export class CompactWorkersView {
           time.dataset.elapsedSince = String(worker.since);
           time.textContent = formatTaskElapsed(Date.now() - worker.since);
         } else {
-          const clock = new Date(worker.settledAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+          const clock = new Date(worker.settledAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hourCycle: "h23" });
           time.textContent = worker.settledAt === worker.since ? `Started ${clock}` : clock;
         }
         if (!workerIsActive(worker.state) || worker.kind === "shell") meta.append(" · ", time);

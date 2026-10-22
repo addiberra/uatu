@@ -6448,6 +6448,197 @@ describe("steering (opencode-v2-steering)", () => {
     await adapter.dispose();
   });
 
+  test("native pending before a lost held conversion acknowledgement leaves one logical submission", async () => {
+    const { adapter, provider, inbox, queue } = steering();
+    const pump = adapter.startEventPump();
+    try {
+      adapter.projectionForTests("session").statusUpdate("running");
+      const held = await queue("held", "preserve text");
+      const admit = provider.prompt.bind(provider);
+      provider.listPendingInbox = async () => { throw new Error("read unavailable"); };
+      provider.prompt = async (...args) => {
+        const accepted = await admit(...args);
+        inbox({ kind: "pending", id: accepted.messageId, text: args[1].text, delivery: "steer", at: Date.now() });
+        await liveEventsApplied(adapter, provider);
+        throw new OperationOutcomeUnknownError();
+      };
+      await expect(adapter.changeDelivery("session", held.messageId, "switch", "steer")).rejects.toBeInstanceOf(OperationOutcomeUnknownError);
+      const snapshot = await adapter.history("session");
+      expect(snapshot.queued).toEqual([expect.objectContaining({ submissionId: held.messageId, requestId: "held", text: "preserve text", delivery: "steer" })]);
+      expect(snapshot.queued![0]).not.toHaveProperty("unconfirmed");
+      expect(provider.prompts).toHaveLength(1);
+    } finally { await adapter.dispose(); await pump; }
+  });
+
+  for (const outcome of ["delivered", "cancelled"] as const) test(`native ${outcome} after rejected held admission retires its original owner without a transport fence`, async () => {
+    const { adapter, provider, inbox, queue } = steering();
+    const pump = adapter.startEventPump();
+    try {
+      adapter.projectionForTests("session").statusUpdate("running");
+      const held = await queue("held", "original input");
+      const admit = provider.prompt.bind(provider);
+      provider.prompt = async (...args) => { await admit(...args); throw new OperationOutcomeUnknownError(); };
+      provider.listPendingInbox = async () => { throw new Error("read unavailable"); };
+      await expect(adapter.changeDelivery("session", held.messageId, "convert", "steer")).rejects.toBeInstanceOf(OperationOutcomeUnknownError);
+      await queue("other", "other held input");
+      inbox({ kind: "settled", id: provider.prompts[0]!.id, outcome });
+      await liveEventsApplied(adapter, provider);
+      expect((await adapter.history("session")).queued?.map(entry => entry.text)).toEqual(["other held input"]);
+      expect(provider.prompts).toHaveLength(1);
+      provider.prompt = admit;
+      provider.listPendingInbox = async () => provider.pendingInbox;
+      adapter.projectionForTests("session").statusUpdate("completed");
+      await queue("wake", "new idle input");
+      await waitUntil(() => provider.prompts.length === 2);
+      expect(provider.prompts.map(entry => entry.text)).toEqual(["original input", "other held input"]);
+    } finally { await adapter.dispose(); await pump; }
+  });
+
+  test("native listing during held conversion merges ownership before the acknowledgement is lost", async () => {
+    const { adapter, provider, queue } = steering();
+    try {
+      adapter.projectionForTests("session").statusUpdate("running");
+      const held = await queue("held", "original input");
+      const admit = provider.prompt.bind(provider);
+      provider.prompt = async (...args) => {
+        await admit(...args);
+        const listed = await adapter.history("session");
+        expect(listed.queued).toEqual([expect.objectContaining({ delivery: "steer", submissionId: held.messageId, requestId: "held" })]);
+        throw new OperationOutcomeUnknownError();
+      };
+      await expect(adapter.changeDelivery("session", held.messageId, "convert", "steer")).rejects.toBeInstanceOf(OperationOutcomeUnknownError);
+      provider.listPendingInbox = async () => { throw new Error("read unavailable"); };
+      const snapshot = await adapter.history("session");
+      expect(snapshot.queued).toHaveLength(1);
+      expect(snapshot.queued![0]).not.toHaveProperty("unconfirmed");
+    } finally { await adapter.dispose(); }
+  });
+
+  test("positive delivered history during a held admission cannot be resurrected by its lost acknowledgement", async () => {
+    const { adapter, provider, queue } = steering();
+    try {
+      adapter.projectionForTests("session").statusUpdate("running");
+      const held = await queue("held", "already delivered");
+      const admit = provider.prompt.bind(provider);
+      provider.prompt = async (...args) => {
+        const accepted = await admit(...args);
+        const row: ConversationItem = { id: `message:${accepted.messageId}`, type: "user_message", text: args[1].text, createdAt: 1 };
+        provider.listMessages = async () => ({ items: [row], completeItems: [row], accounting: [] });
+        expect((await adapter.history("session")).queued).toEqual([]);
+        throw new OperationOutcomeUnknownError();
+      };
+      await expect(adapter.changeDelivery("session", held.messageId, "convert", "steer")).rejects.toBeInstanceOf(OperationOutcomeUnknownError);
+      provider.listPendingInbox = async () => { throw new Error("read unavailable"); };
+      expect((await adapter.history("session")).queued).toEqual([]);
+      expect(provider.prompts).toHaveLength(1);
+    } finally { await adapter.dispose(); }
+  });
+
+  for (const timing of ["event-before-deadline", "event-after-deadline", "event-after-rejection"] as const) for (const outcome of ["delivered", "cancelled"] as const) test(`${timing} held conversion keeps one owner through native ${outcome} and releases later held input`, async () => {
+    const attachment = { id: "11111111-2222-4333-8444-555555555555", name: "fixture.png", mimeType: "image/png" };
+    const { adapter, provider, inbox, queue } = steering({ steerAdmissionTimeoutMs: 30, resolveAttachment: async () => ({ ...attachment, absolutePath: "/fixture/attachment.png" }) });
+    const pump = adapter.startEventPump();
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    try {
+      adapter.projectionForTests("session").statusUpdate("running");
+      provider.configurations.set("session", { model: provider.models[0]!.selection, mode: "build", variant: "high" });
+      const held = await adapter.prompt("session", "held", "original input", undefined, undefined, undefined, [attachment], "queue");
+      await queue("other", "other held input");
+      const admit = provider.prompt.bind(provider);
+      provider.listPendingInbox = async () => { throw new Error("read unavailable"); };
+      const pendingEvent = () => inbox({ kind: "pending", id: provider.prompts[0]!.id, text: "original input", delivery: "steer", attachments: [attachment], at: Date.now() });
+      provider.prompt = async (...args) => {
+        await admit(...args);
+        if (timing === "event-before-deadline") { pendingEvent(); await liveEventsApplied(adapter, provider); }
+        if (timing !== "event-after-rejection") await gate;
+        throw new OperationOutcomeUnknownError();
+      };
+      const convert = () => adapter.changeDelivery("session", held.messageId, "convert", "steer");
+      await expect(convert()).rejects.toBeInstanceOf(OperationOutcomeUnknownError);
+      await expect(convert()).rejects.toBeInstanceOf(OperationOutcomeUnknownError);
+      if (timing !== "event-before-deadline") { pendingEvent(); await liveEventsApplied(adapter, provider); }
+      const nativeId = provider.prompts[0]!.id;
+      const snapshot = await adapter.history("session");
+      expect(snapshot.queued).toEqual([
+        expect.objectContaining({ id: nativeId, submissionId: held.messageId, text: "original input", requestId: "held", attachments: [attachment], delivery: "steer" }),
+        expect.objectContaining({ text: "other held input", delivery: "queue" }),
+      ]);
+      expect(snapshot.queued![0]).not.toHaveProperty("unconfirmed");
+      expect(provider.prompts[0]).not.toHaveProperty("model");
+      expect(provider.prompts[0]).not.toHaveProperty("mode");
+      expect(provider.prompts[0]).not.toHaveProperty("variant");
+      if (outcome === "cancelled") {
+        provider.cancelInbox = async (_sessionId, id) => { provider.cancelledInbox.push(id); inbox({ kind: "settled", id, outcome }); };
+        await adapter.removeQueued("session", nativeId, "cancel");
+        expect(provider.cancelledInbox).toEqual([nativeId]);
+      } else { inbox({ kind: "settled", id: nativeId, outcome }); await liveEventsApplied(adapter, provider); }
+      release();
+      await liveEventsApplied(adapter, provider);
+      expect((await adapter.history("session")).queued?.map(entry => entry.text)).toEqual(["other held input"]);
+      expect(provider.prompts).toHaveLength(1);
+      provider.prompt = admit;
+      provider.listPendingInbox = async () => provider.pendingInbox;
+      adapter.projectionForTests("session").statusUpdate("completed");
+      await queue("wake", "new idle input");
+      await waitUntil(() => provider.prompts.length === 2);
+      expect(provider.prompts.map(entry => entry.text)).toEqual(["original input", "other held input"]);
+    } finally { release(); await adapter.dispose(); await pump; }
+  });
+
+  test("native pending confirmation of unknown admission wins over an older empty inbox read", async () => {
+    const { adapter, provider, inbox, steer } = steering();
+    const pump = adapter.startEventPump();
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    try {
+      adapter.projectionForTests("session").statusUpdate("running");
+      const admit = provider.prompt.bind(provider);
+      provider.prompt = async (...args) => { await admit(...args); throw new OperationOutcomeUnknownError(); };
+      await expect(steer("original", "uncertain input")).rejects.toBeInstanceOf(OperationOutcomeUnknownError);
+      let entered!: () => void;
+      const started = new Promise<void>(resolve => { entered = resolve; });
+      provider.listPendingInbox = async () => { entered(); await gate; return []; };
+      const read = adapter.history("session");
+      await started;
+      inbox({ kind: "pending", id: provider.prompts[0]!.id, text: "uncertain input", delivery: "steer", at: Date.now() });
+      await liveEventsApplied(adapter, provider);
+      release();
+      const snapshot = await read;
+      expect(snapshot.queued).toEqual([expect.objectContaining({ text: "uncertain input", delivery: "steer", requestId: "original" })]);
+      expect(snapshot.queued![0]).not.toHaveProperty("unconfirmed");
+      expect(provider.prompts).toHaveLength(1);
+    } finally { release(); await adapter.dispose(); await pump; }
+  });
+
+  test("native admission evidence settles a dormant held conversion without proving resume or releasing other input", async () => {
+    const { adapter, provider, inbox, queue } = steering();
+    const pump = adapter.startEventPump();
+    try {
+      adapter.projectionForTests("session").statusUpdate("running");
+      const held = await queue("held", "original input");
+      await queue("other", "other held input");
+      await adapter.abort("session", "stop");
+      const admit = provider.prompt.bind(provider);
+      provider.listPendingInbox = async () => { throw new Error("read unavailable"); };
+      provider.prompt = async (...args) => {
+        const accepted = await admit(...args);
+        inbox({ kind: "pending", id: accepted.messageId, text: args[1].text, delivery: "steer", at: Date.now() });
+        await liveEventsApplied(adapter, provider);
+        throw new OperationOutcomeUnknownError();
+      };
+      await expect(adapter.changeDelivery("session", held.messageId, "convert", "steer")).rejects.toBeInstanceOf(OperationOutcomeUnknownError);
+      const snapshot = await adapter.history("session");
+      expect(snapshot.queued).toEqual([
+        expect.objectContaining({ text: "original input", delivery: "steer", paused: true }),
+        expect.objectContaining({ text: "other held input", delivery: "queue", paused: true }),
+      ]);
+      expect(snapshot.queued![0]).not.toHaveProperty("unconfirmed");
+      expect(provider.interruptOptions).toEqual([{ resume: false }]);
+      expect(provider.prompts).toHaveLength(1);
+    } finally { await adapter.dispose(); await pump; }
+  });
+
   test("unknown held-to-steer admission blocks fresh-ID resend and queue release until read-only confirmation", async () => {
     const { adapter, provider, queue } = steering({ capabilities: ["steering", "send-now", "background-blocking-work"] });
     adapter.projectionForTests("session").statusUpdate("running");

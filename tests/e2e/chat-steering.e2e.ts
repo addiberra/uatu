@@ -234,7 +234,7 @@ test.describe("steering an OpenCode 2.x turn", () => {
     });
   }
 
-  test("composer explains current shortcuts and selected delivery with readable Send contrast", async ({ page, request }, testInfo) => {
+  test("composer explains fixed shortcuts despite legacy delivery with readable Send contrast", async ({ page, request }, testInfo) => {
     await newConversation(page);
     await expect(page.locator("#chat-delivery-toggle")).toHaveCount(0);
     await submit(page, "Start the work");
@@ -243,7 +243,7 @@ test.describe("steering an OpenCode 2.x turn", () => {
     await page.evaluate(() => localStorage.setItem("uatu:presentation:v1:%2F:chat-delivery", "queue"));
     await page.locator("#chat-input").fill("Keep preference draft updated");
     await expect(page.locator("#chat-send")).toHaveAttribute("aria-label", "Send as steer; hold 2.5 seconds to queue");
-    await expect(page.locator("#chat-send-help")).toContainText("Enter: Queue; Alt+Enter: Steer");
+    await expect(page.locator("#chat-send-help")).toContainText("Enter: Steer; Alt+Enter: Queue");
     await expect(page.locator("#chat-send")).toHaveAttribute("aria-describedby", "chat-send-help");
     await page.emulateMedia({ colorScheme: "dark" });
     const contrast = await page.locator("#chat-send").evaluate(element => {
@@ -603,6 +603,44 @@ for (const browserName of ["chromium", "webkit"] as const) test.describe(`steeri
     await use(page);
     await browser.close();
   } });
+
+  test("legacy Queue leaves touch Enter as newline and modified submission fixed", async ({ page, request }, testInfo) => {
+    await page.addInitScript(() => localStorage.setItem("uatu:presentation:v1:%2F:chat-delivery", "queue"));
+    await bootChat(page, request);
+    await newConversation(page);
+    const input = page.locator("#chat-input");
+    await input.fill("Idle newline");
+    await input.press("Enter");
+    await expect(input).toHaveValue("Idle newline\n");
+    expect(await submit(page, "Start work")).toMatchObject({ pending: false });
+    await expect(page.locator("#chat-stop")).toBeEnabled();
+    const prompts: unknown[] = [];
+    page.on("request", request => { if (request.url().endsWith("/prompts")) prompts.push(request.postDataJSON()); });
+    await input.fill("Keep newline");
+    await input.press("Enter");
+    await expect(input).toHaveValue("Keep newline\n");
+    expect(prompts).toHaveLength(0);
+    await input.fill("/reload");
+    await expect(page.locator("#chat-command-menu")).toBeVisible();
+    await input.press("Enter");
+    await expect(input).toHaveValue("/reload\n");
+    expect(prompts).toHaveLength(0);
+    for (const key of ["Control+Enter", "Meta+Enter", "Alt+Enter"]) {
+      await input.fill(`Explicit ${key}`);
+      const accepted = page.waitForResponse(response => response.url().endsWith("/prompts"));
+      await input.press(key);
+      expect(await (await accepted).json()).toMatchObject({ pending: true, delivery: key === "Alt+Enter" ? "queue" : "steer" });
+    }
+    await page.reload();
+    await page.locator("#touch-tab-chat").tap();
+    await expect(page.locator("#chat-stop")).toBeEnabled();
+    await input.fill("Reloaded touch steer");
+    const accepted = page.waitForResponse(response => response.url().endsWith("/prompts"));
+    await input.press("Control+Enter");
+    expect(await (await accepted).json()).toMatchObject({ pending: true, delivery: "steer" });
+    expect(prompts).toHaveLength(4);
+    await captureScreenshot(page, testInfo, `fixed-delivery-touch-${browserName}`);
+  });
 
   test("large separated targets keep narrow layouts stable and edge taps never stop work", async ({ page, request }, testInfo) => {
     await page.setViewportSize({ width: 320, height: 740 });

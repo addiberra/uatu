@@ -144,10 +144,11 @@ ordinary-text draft while work is running. An accepted held queue submission
 retires it for this browser/base path, not the account. Cancellation, refusal,
 an uncertain outcome and an ordinary tap do not retire it. If browser storage
 is unavailable, successful use is remembered only for the current page.
-Desktop Enter in the message field uses the existing per-device preference;
-on touch devices Enter always adds a newline and Ctrl/Command+Enter submits.
-Alt/Option+Enter uses the other choice. Send's accessible description names the
-current shortcuts. Idle messages send immediately. Claude Code
+Desktop Enter in the message field steers; on touch devices Enter always adds
+a newline and Ctrl/Command+Enter steers. Alt/Option+Enter queues where the
+delivery choice is available. These shortcuts are fixed: legacy saved delivery
+choices are ignored, not deleted, and there is no delivery-default setting.
+Send's accessible description names the shortcuts. Idle messages send immediately. Claude Code
 and OpenCode V1 queue busy follow-ups without offering steering. Pending images
 and native commands queue rather than being labelled as a text steer; replacement
 submission retains the native staged-revert semantics.

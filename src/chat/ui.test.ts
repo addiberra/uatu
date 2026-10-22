@@ -106,9 +106,12 @@ describe("chat reversible-history composer", () => {
       if (outcome === "path-lost") expect(document.querySelector("#chat-send")!.getAttribute("aria-label")).toContain("steer");
       const before = reads;
       const event = new window.Event("submit", { bubbles: true, cancelable: true });
-      const { presentationLocalStorage } = await import("../shell/presentation-storage");
-      if (outcome === "queue-500") presentationLocalStorage()?.setItem("chat-delivery", "queue");
-      document.querySelector("#chat-composer")!.dispatchEvent(event);
+      // Exercise explicit Queue, not the retired stored keyboard default.
+      if (outcome === "queue-500") {
+        const form = document.querySelector<HTMLFormElement>("#chat-composer")!;
+        form.requestSubmit = () => { form.dispatchEvent(event); };
+        input.dispatchEvent(Object.assign(new window.Event("keydown", { bubbles: true, cancelable: true }), { key: "Enter", altKey: true }));
+      } else document.querySelector("#chat-composer")!.dispatchEvent(event);
       await waitUntil(() => calls === 1);
       input.value = "New draft C";
       input.dispatchEvent(new window.Event("input", { bubbles: true }));
@@ -179,10 +182,15 @@ describe("chat reversible-history composer", () => {
       const input = document.querySelector<HTMLTextAreaElement>("#chat-input")!;
       await waitUntil(() => !input.disabled && document.querySelector('[data-model-value="test/B"]') !== null);
       const stage = (name: string) => document.querySelector(`[data-model-value="test/${name}"]`)!.dispatchEvent(new window.Event("click", { bubbles: true }));
-      const submit = (text: string) => {
+      const submit = (text: string, queue = false) => {
         input.value = text;
         input.dispatchEvent(new window.Event("input", { bubbles: true }));
-        document.querySelector("#chat-composer")!.dispatchEvent(new window.Event("submit", { bubbles: true, cancelable: true }));
+        const form = document.querySelector<HTMLFormElement>("#chat-composer")!;
+        const send = () => { form.dispatchEvent(new window.Event("submit", { bubbles: true, cancelable: true })); };
+        if (queue) {
+          form.requestSubmit = send;
+          input.dispatchEvent(Object.assign(new window.Event("keydown", { bubbles: true, cancelable: true }), { key: "Enter", altKey: true }));
+        } else send();
       };
       stage("B");
       submit("First");
@@ -201,7 +209,7 @@ describe("chat reversible-history composer", () => {
       const next = firstOutcome === "queue-with-new-stage" ? c : b;
       expect(document.querySelector(`[data-model-value="test/${next.name}"]`)!.getAttribute("aria-pressed")).toBe("true");
       storage?.setItem("chat-delivery", "queue");
-      submit("Next queued work");
+      submit("Next queued work", true);
       await waitUntil(() => calls.length === 2);
       expect(calls[1]).toEqual({ model: next.selection, delivery: "queue" });
       await waitUntil(() => document.querySelector("#chat-queue")!.textContent!.includes("Next queued work"));
@@ -209,7 +217,7 @@ describe("chat reversible-history composer", () => {
       // visible, not masked forever by the just-submitted staged selection.
       parent!.event({ type: "conversation.configuration", generation: "g", sequence: 1, conversationId: "one", configuration: { model: a.selection } }, "cursor-one-1");
       expect(document.querySelector('[data-model-value="test/A"]')!.getAttribute("aria-pressed")).toBe("true");
-      submit("Third queued work");
+      submit("Third queued work", true);
       await waitUntil(() => calls.length === 3);
       expect(calls[2]).toEqual({ model: a.selection, delivery: "queue" });
     } finally {

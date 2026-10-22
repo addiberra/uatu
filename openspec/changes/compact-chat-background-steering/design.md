@@ -1,3 +1,17 @@
+## Approved fixed Steer default (2026-10-22, review round 4)
+
+The user explicitly removed the configurable-default requirement. Desktop Enter
+and touch Ctrl/Command+Enter steer; Alt/Option+Enter queues where already offered.
+Touch Enter remains newline. Ignore, rather than migrate/delete, legacy saved
+delivery choices. Remove the unused preference helper and its function-only
+tests; verify actual submission through existing UI/shortcut seams. No Settings
+path, Send dropdown, new wire field or additional layout height is introduced.
+Tap steers and the unchanged 500ms arming plus two-second hold queues; armed
+release cancels. Mandatory command/attachment queueing, idle dispatch, explicit
+HTTP/dock delivery and other agents' queue behavior remain unchanged. This
+decision supersedes saved-keyboard-preference clauses below, not personal Hub
+automatic-background policy.
+
 ## Approved same-row touch conversation actions (2026-10-22)
 
 The touch header's controls do not wrap. The picker alone yields width inside
@@ -28,8 +42,8 @@ apart from the reader's Minimise action. No provider or backend policy changes.
   8px gap and visible focus. Pending actions are 32px with 4px/8px padding,
   inline when they fit, wrapped otherwise. Delivery/paused labels, receipt
   warnings, replacement safeguards and all existing actions remain available.
-- A desktop keyboard hint reads the same saved preference as message-field
-  submission, reverses Alt+Enter accordingly, and uses ordinary send/newline
+- A desktop keyboard hint states fixed Enter: steer / Alt+Enter: queue,
+  matching message-field submission, and uses ordinary send/newline
   copy when no delivery choice exists. Pointer hold remains 500ms silent arming
   plus a two-second countdown in a fixed 104px envelope, never a tap flash.
 - Expanded compact desktop reserves 35% of actual remaining height, preferred
@@ -320,7 +334,7 @@ Browser acceptance uses desktop plus Chromium/WebKit touch matrices: 390×844, v
 
 Worker disclosure/row dimensions below are superseded by D10; D8 removes the older Options, Restore and delivery-menu controls.
 
-This explicit implementation revision supersedes D1's hidden configuration/attachment controls and 44px worker inspection rows only. Keep attachment plus a two-line model/mode/effort and actual context pill inline, opening the existing chooser. Show measured occupancy and known limit, never cumulative usage as context. Keep less-used actions in header options. Send taps steer while busy regardless of saved keyboard delivery; Enter/Alt+Enter retain device preference and touch Enter remains newline. A continuous press arms silently for 500ms, then counts down for two seconds and queues once at 2500ms (idle Queue dispatches normally, not fake pending). Release before 500ms steers; release at 500ms–2499ms cancels, as do drag-out, pointer cancellation/lost capture, Escape, blur, hidden page and stale selection/draft/configuration. At 500ms a non-layout-shifting fixed-height envelope appears 104px above the original Send target, with bottom-to-top green fill and countdown above the finger. The subsequent D8 revision removes the split-menu Queue alternative; 44px Send and separate Stop remain. Commands and attachments retain queue semantics and truthful labels. Existing primary locks and authoritative per-account background policy remain unchanged.
+This explicit implementation revision supersedes D1's hidden configuration/attachment controls and 44px worker inspection rows only. Keep attachment plus a two-line model/mode/effort and actual context pill inline, opening the existing chooser. Show measured occupancy and known limit, never cumulative usage as context. Keep less-used actions in header options. Send taps steer while busy; the later approved fixed-default revision makes desktop Enter and touch Ctrl/Command+Enter steer, Alt/Option+Enter queue where offered, and touch Enter remain newline, ignoring legacy saved defaults. A continuous press arms silently for 500ms, then counts down for two seconds and queues once at 2500ms (idle Queue dispatches normally, not fake pending). Release before 500ms steers; release at 500ms–2499ms cancels, as do drag-out, pointer cancellation/lost capture, Escape, blur, hidden page and stale selection/draft/configuration. At 500ms a non-layout-shifting fixed-height envelope appears 104px above the original Send target, with bottom-to-top green fill and countdown above the finger. The subsequent D8 revision removes the split-menu Queue alternative; 44px Send and separate Stop remain. Commands and attachments retain queue semantics and truthful labels. Existing primary locks and authoritative per-account background policy remain unchanged.
 
 The user explicitly accepts 29px worker inspection rows for a denser overview; mutation controls remain 44px with existing safeguards. Preserve canonical deduplication/status and model rendering. Finished disclosure stays compact and inspectable; Dismiss finished hides only local view using the existing per-conversation persistence seam, with Restore finished and counts based on visible occurrences. No provider history deletion. Persistent unknown/failure and replacement warnings remain outside collapsed details.
 

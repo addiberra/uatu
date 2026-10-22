@@ -508,7 +508,7 @@ test("idle hold dispatches normally without inventing a pending queue entry", as
   await expect(page.locator(".chat-queued-message")).toHaveCount(0);
   await expect(page.locator("#chat-items")).toContainText("Idle held draft");
 });
-test("tap steers despite saved Queue keyboard preference; Space hold queues without a menu", async ({ page, request }) => {
+test("legacy Queue is ignored by tap and keyboard; Space hold queues without a menu", async ({ page, request }) => {
   await boot(page, request);
   await page.locator("#chat-input").fill("Tap is steer");
   await page.evaluate(() => localStorage.setItem("uatu:presentation:v1:%2F:chat-delivery", "queue"));
@@ -520,12 +520,12 @@ test("tap steers despite saved Queue keyboard preference; Space hold queues with
   await expect(page.locator('.chat-queued-message[data-delivery="queue"]')).toHaveCount(1);
   await page.keyboard.up("Space");
   await expect(page.locator('.chat-queued-message[data-delivery="queue"]')).toHaveCount(1);
-  await page.locator("#chat-input").fill("Saved keyboard queue");
+  await page.locator("#chat-input").fill("Fixed keyboard steer");
   await page.locator("#chat-input").press("Enter");
-  await expect(page.locator('.chat-queued-message[data-delivery="queue"]')).toHaveCount(2);
-  await page.locator("#chat-input").fill("One-shot keyboard steer");
-  await page.locator("#chat-input").press("Alt+Enter");
   await expect(page.locator('.chat-queued-message[data-delivery="steer"]')).toHaveCount(2);
+  await page.locator("#chat-input").fill("Explicit keyboard queue");
+  await page.locator("#chat-input").press("Alt+Enter");
+  await expect(page.locator('.chat-queued-message[data-delivery="queue"]')).toHaveCount(2);
 });
 test("transient target movement during silent arming invalidates even a later tap", async ({ page, request }) => {
   await boot(page, request);

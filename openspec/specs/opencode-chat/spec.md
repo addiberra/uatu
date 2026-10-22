@@ -1813,7 +1813,7 @@ Every message held in the workspace's queue SHALL stay held until delivery, what
 
 The user SHALL be able to cancel an active turn without deleting its completed history. Cancellation SHALL NOT deliver pending messages. They remain pending, removable, and visible, and are presented as paused. The queue stays dormant until the user next submits a prompt, which joins the end of the queue and resumes delivery from its head. The other ways out of the dormant state are switching an entry to steer and Send now. Transport failure SHALL preserve the draft until acceptance is known; uncertain Hub steer actions follow the unconfirmed, no-automatic-replay contract below.
 
-Send SHALL remain visible while work runs and SHALL submit the draft with the selected delivery, or queue it when steering is unsupported. A separate Stop button SHALL cancel active work without submitting or discarding an unsent draft. Changing delivery SHALL only change the per-device selection, never submit a message or cancel work. Send SHALL be unavailable for an empty draft, during submission, or while a cancellation request is pending. The shared submit path SHALL also refuse keyboard submission during cancellation, preserving the draft and discarding any one-shot delivery override from the refused attempt.
+Send SHALL remain visible while work runs and SHALL steer ordinary text on a steering agent, or queue when steering is unsupported. Explicit Queue submission SHALL remain available through the existing hold and Alt/Option+Enter paths; commands and attachments SHALL retain mandatory queue semantics. No configurable per-device default or delivery selector SHALL be required. A separate Stop button SHALL cancel active work without submitting or discarding an unsent draft. Send SHALL be unavailable for an empty draft, during submission, or while a cancellation request is pending. The shared submit path SHALL also refuse keyboard submission during cancellation, preserving the draft and discarding any one-shot delivery override from the refused attempt.
 
 #### Scenario: Visible Send works while busy for every agent
 - **WHEN** the user clicks or taps Send with a non-empty draft while work runs
@@ -1827,7 +1827,7 @@ Send SHALL remain visible while work runs and SHALL submit the draft with the se
 #### Scenario: Keyboard submission cannot bypass pending cancellation
 - **WHEN** a cancellation request is pending and the user presses Enter or Option/Alt+Enter
 - **THEN** no prompt is sent and the draft remains intact
-- **AND** after cancellation settles, a normal submission uses the device preference rather than any override from the refused attempt
+- **AND** after cancellation settles, a normal submission uses fixed Steer rather than any Queue override from the refused attempt
 
 The surface SHALL name the agent it is talking to, taking that name from what the agent reports rather than from fixed copy. Text presented to the user SHALL NOT assume a particular agent, so that installing a different agent changes the name shown and nothing else.
 
@@ -2711,7 +2711,7 @@ unless a single token is wider than the whole suggestion list.
 ### Requirement: OpenCode 2.x conversations can steer the running turn
 An agent that can deliver a message into its running turn at the next safe step boundary, and can withdraw or switch a message before then, SHALL declare the `steering` capability. The OpenCode 2.x agent SHALL declare it. The OpenCode 1.x agent and the Claude Code agent SHALL NOT declare it.
 
-While a conversation whose agent declares `steering` is running or has pending messages, the composer SHALL offer two deliveries. Send and desktop Enter submit with the default delivery. Touch Enter SHALL insert a newline, idle or busy, including while a command candidate is shown; Ctrl/Command+Enter explicitly submits with the default delivery. ⌥Enter (Option/Alt+Enter) submits with the other delivery where the choice is offered. A separate labelled selector preceding Send SHALL offer Steer and Queue by name and display the current choice. Selecting a delivery SHALL preserve the draft without submitting it. The default delivery SHALL be a per-device preference, initially steer. Opening the menu SHALL NOT change control footprints or rail order. The selector SHALL support keyboard navigation, dismissal and visible focus, and menu choices SHALL be at least 44px high. On capable conversations it SHALL remain visible but disabled while idle with no pending messages; on other agents it SHALL be absent. The delivery choice SHALL apply only to prompts: skills, slash commands, and `/reload` are always held in the workspace's queue. Idle submission retains immediate-delivery semantics with these device-specific keys.
+While a conversation whose agent declares `steering` is running or has pending messages, the composer SHALL offer two deliveries through fixed actions. Tap Send and desktop Enter SHALL steer. Touch Enter SHALL insert a newline, idle or busy, including while a command candidate is shown; Ctrl/Command+Enter SHALL explicitly steer. ⌥Enter (Option/Alt+Enter) SHALL queue where the choice is offered. Steer SHALL be the fixed keyboard default, not a per-device setting; legacy saved delivery choices SHALL be ignored without deleting browser settings. There SHALL be no delivery-default Settings path, Send dropdown, replacement selector or added layout height. The existing Send hold SHALL arm for 500ms, count down for two seconds and queue once at 2500ms; release during the armed countdown SHALL cancel. Commands and attachment-bearing drafts SHALL retain mandatory queue semantics, and idle submission SHALL retain immediate delivery. Explicit HTTP delivery and dock delivery actions, capability gates and unsupported agents' queued follow-ups SHALL remain unchanged.
 
 A steer SHALL be handed to the agent at once and kept pending by the agent until the agent delivers it. Steers SHALL be delivered before any held message. The expanded dock SHALL list the user's pending steers, from any client of the conversation, labelled "Steer", and SHALL NOT list the agent's own internal inbox entries. A steer SHALL NOT appear in the timeline until the agent reports it delivered, at which point it SHALL appear as an ordinary user message. Outside compact keyboard/short-landscape mode, pending steers SHALL carry the dock note that they run with the conversation's model and mode as they stand when they are delivered.
 
@@ -2751,19 +2751,19 @@ When the workspace attaches to a conversation, or reconnects to the agent, it SH
 - **THEN** the composer offers steer and queue delivery
 - **AND** on a conversation whose agent does not declare it, no steer choice appears and busy submissions queue
 
-#### Scenario: Desktop Enter steers by default
-- **WHEN** the default delivery preference has not been changed and the desktop user presses Enter while the agent works
+#### Scenario: Desktop Enter always steers ordinary text
+- **WHEN** the desktop user presses Enter with an ordinary-text draft while a steering agent works, including with a legacy saved Queue default
 - **THEN** the message is handed to the agent as a steer
 - **AND** the dock lists it labelled "Steer", ahead of any queued messages
 
-#### Scenario: Option+Enter uses the other delivery
-- **WHEN** the default delivery is steer and the user presses ⌥Enter while the agent works
+#### Scenario: Option+Enter explicitly queues
+- **WHEN** the user presses ⌥Enter while the steering delivery choice is offered, including with a legacy saved Queue default
 - **THEN** the message is held in the workspace's queue labelled "Queue"
 
-#### Scenario: The default delivery is a per-device choice
-- **WHEN** the user changes the default delivery to queue on one device
-- **THEN** desktop Enter or touch Ctrl/Command+Enter queues on that device
-- **AND** other devices keep their own default
+#### Scenario: Legacy delivery defaults are ignored after reload
+- **WHEN** a browser with a saved Queue default opens or reloads a steering conversation
+- **THEN** desktop Enter or touch Ctrl/Command+Enter steers ordinary text and Alt/Option+Enter queues where offered
+- **AND** hints describe these fixed shortcuts without changing saved browser settings or adding a configuration control
 
 #### Scenario: Touch Enter is always a newline
 - **WHEN** a touch user presses unmodified Enter while idle, busy, or viewing a command candidate
@@ -3076,7 +3076,7 @@ V2 background children SHALL open through the existing parent drill-down while r
 
 Native shell work affected by backgrounding SHALL retain inspectable already-received output and outcome through the task inspection surface within their existing retained view/history lifetime; reads and stops SHALL verify its workspace and parent ownership and SHALL NOT accept arbitrary output paths. When provider removal deletes output, the surface SHALL explain that further output is unavailable, preserve what is still locally available, and not promise that lost bytes can be recovered after reload. No persistent output archive is required. Both task inspection and result rendering SHALL preserve existing output safety and distinguish upstream truncation from output removal.
 
-Desktop pointer, keyboard, and touch users SHALL be able to inspect workers, return to the parent, request backgrounding, and stop a verified worker using labelled controls with visible focus, at least 44 CSS pixel targets and 8 CSS pixel gaps between adjacent mutation actions. State and failure SHALL be conveyed in words, not colour or animation alone. Reduced-motion preferences SHALL be respected. Dynamic updates SHALL NOT steal focus, discard reading position, or replace the existing separate Send, delivery selector, and Stop actions. Opening a child SHALL move focus into its view; return SHALL restore the invoking control or a logical surviving equivalent. Layered output Escape SHALL NOT also dismiss its owning child view.
+Desktop pointer, keyboard, and touch users SHALL be able to inspect workers, return to the parent, request backgrounding, and stop a verified worker using labelled controls with visible focus, at least 44 CSS pixel targets and 8 CSS pixel gaps between adjacent mutation actions. State and failure SHALL be conveyed in words, not colour or animation alone. Reduced-motion preferences SHALL be respected. Dynamic updates SHALL NOT steal focus, discard reading position, or replace the separate Send and Stop actions and fixed keyboard/hold delivery paths. Opening a child SHALL move focus into its view; return SHALL restore the invoking control or a logical surviving equivalent. Layered output Escape SHALL NOT also dismiss its owning child view.
 
 The live worker list SHALL remain reachable through the bounded scrollable work dock while composing without a software keyboard, except in short touch landscape. With the software keyboard open, or in a visual band at most 390px high and at least 600px wide, worker/subagent tracks and Continue SHALL be hidden to preserve conversation and composer space; dismissing the keyboard or leaving short landscape SHALL restore access. Compact pending counts, any paused-batch Send action and replacement warnings follow the steering dock's safety rules and SHALL remain available while typing. Touch SHALL use one deliberate compact worker disclosure rather than duplicate pinned worker presentations. Worker Stop and parent Stop SHALL be distinctly labelled; routine worker appearance SHALL preserve the reserved composer control geometry. Expanded touch work tracks SHALL keep the prompt rail from covering worker actions.
 

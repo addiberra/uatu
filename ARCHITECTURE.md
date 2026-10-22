@@ -75,9 +75,9 @@ disclosure rather than automatically opening new work. The same module folds
 retained canonical projection occurrences, not child IDs or launcher counts,
 and separately names uncertainty. Existing
 inspection/stop owners render expanded rows; warnings/batch actions remain
-outside collapse. `hold-to-queue.ts` owns the Send gesture, `queue-discovery.ts`
-owns its device-local learning hint, and `delivery-preference.ts` supplies the
-keyboard delivery preference. Attachment and configuration controls stay inline;
+outside collapse. `hold-to-queue.ts` owns the Send gesture and `queue-discovery.ts`
+owns its device-local learning hint. Keyboard submission uses fixed Steer with
+Alt/Option+Enter for Queue. Attachment and configuration controls stay inline;
 the existing picker and header options retain their own actions. Geometry
 continues through the measured work dock/viewport and coordinated scroll owner.
 
@@ -823,10 +823,10 @@ Conversation status is `idle`, `sending`, `running`, `completed`, `interrupted`,
 
 Send stays a labelled submit button while busy for every agent; only the
 separate Stop button cancels. There is no Send dropdown, delivery selector or
-immediate Queue draft menu action. Tapping Send steers ordinary busy text
-independently of the keyboard preference; desktop Enter uses that preference;
-touch Enter inserts a newline, Ctrl/Command+Enter submits, and Option/Alt+Enter
-uses the other delivery when the steering choice is available.
+immediate Queue draft menu action. Tapping Send and desktop Enter steer ordinary
+busy text. Touch Enter inserts a newline, Ctrl/Command+Enter steers, and
+Option/Alt+Enter queues when the steering choice is available. Legacy saved
+delivery defaults are ignored without deleting browser settings.
 Submission controls have at least 44px targets and 8px gaps. The compact composer
 keeps its inline controls and distinct Send/Stop actions across turn changes.
 Raw-touch hit checking suppresses gap taps that a mobile browser might snap
@@ -912,8 +912,7 @@ Duplicate text and image-only entries gain client-local `pending message N`
 discriminators retained while pending across reorder, switches and sibling
 removal. Errors and unknown results remain readable; successful send/dock and
 automatic-background receipts do not create confirmation notices.
-Desktop Enter uses the device preference (`delivery-preference.ts`, initially steer),
-Alt+Enter the other; selection and submission remain separate. Undo replacements
+Desktop Enter steers and Alt+Enter queues; no delivery-default setting remains. Undo replacements
 steer, with a count-only warning explaining older paused steers deliver together.
 
 Touch work tracks share `#chat-work-dock`, bounded by `--chat-visual-height`

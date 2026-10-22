@@ -9,7 +9,6 @@ import { registerBackInterceptor } from "../shell/history";
 import { onManualRecovery, registerRecoveryWork, requestManualRecovery } from "../shell/live";
 import { onWorkspaceCredentialRefresh } from "../terminal/client";
 import { ChatApiClient, ChatConnectionInterruptedError, ChatTransportError, STEER_ALREADY_DELIVERED_CODE, STEER_WITHDRAWAL_UNCONFIRMED_CODE, type ChatEventStream } from "./client";
-import { otherDelivery, readDeliveryPreference } from "./delivery-preference";
 import { TimelineAnchorController, type AnchorGeometry, type TimelineAnchor } from "./anchor";
 import { CoordinatedScrollOwner, type RevealOptions } from "./coordinated-scroll";
 import { ChatViewportController } from "./viewport";
@@ -3809,7 +3808,7 @@ export function initChat(api = new ChatApiClient()): void {
   }
   queueDockElement.addEventListener("scroll", syncQueueOverflow, { passive: true, capture: true });
 
-  // Preserve existing per-device keyboard delivery; Alt+Enter overrides once.
+  // Fixed keyboard delivery; Alt+Enter queues this submission only.
   let requestedDelivery: MessageDelivery | undefined;
   function deliveryChoiceOffered(): boolean {
     return Boolean(projection) && declares("steering") && (isLiveConversationStatus(projection?.status) || (projection?.queued.length ?? 0) > 0);
@@ -3819,9 +3818,7 @@ export function initChat(api = new ChatApiClient()): void {
     return declares("steering") && !sideQuestionOperation(draft) && !localHistoryOperation(draft, commands, declares("reversible-history"));
   }
   function syncSendDescription(): void {
-    const preferred = readDeliveryPreference(presentationLocalStorage());
     const touch = document.documentElement.dataset.uiMode === "touch";
-    const label = preferred === "steer" ? "Steer" : "Queue";
     const sendAction = sideQuestionOperation(input?.value ?? "") ? "Ask side question" : localHistoryOperation(input?.value ?? "", commands, declares("reversible-history")) ? "Send message" : isLiveConversationStatus(projection?.status)
       ? declares("steering") && !isListedCommand(input?.value ?? "") && currentPendingAttachments().length === 0 ? "Send as steer; hold 2.5 seconds to queue" : declares("steering") ? "Send to queue" : "Queue message"
       : "Send message";
@@ -3832,14 +3829,14 @@ export function initChat(api = new ChatApiClient()): void {
     const keyboardChoice = deliveryChoiceOffered() && sendSupportsHold() && !isListedCommand(input?.value ?? "") && currentPendingAttachments().length === 0;
     if (hint) {
       hint.hidden = !projection || touch || !window.matchMedia("(pointer: fine) and (hover: hover)").matches;
-      hint.textContent = keyboardChoice ? `Enter: ${label.toLowerCase()} · Alt+Enter: ${preferred === "steer" ? "queue" : "steer"}` : "Enter: send · Shift+Enter: new line";
+      hint.textContent = keyboardChoice ? "Enter: steer · Alt+Enter: queue" : "Enter: send · Shift+Enter: new line";
     }
     const discovery = document.querySelector<HTMLElement>("#chat-queue-discovery");
     if (discovery) discovery.hidden = !queueDiscovery.visible(!send?.disabled && isLiveConversationStatus(projection?.status)
       && sendSupportsHold() && !isListedCommand(input?.value ?? "") && currentPendingAttachments().length === 0
       && !attachmentStaging.has(activeConversationId() ?? "") && Boolean(input?.value.trim()));
     const keys = sendSupportsHold() && !isListedCommand(input?.value ?? "") && currentPendingAttachments().length === 0
-      ? `${touch ? "Ctrl+Enter" : "Enter"}: ${label}; Alt+Enter: ${preferred === "steer" ? "Queue" : "Steer"} while working`
+      ? `${touch ? "Ctrl+Enter" : "Enter"}: Steer; Alt+Enter: Queue while working`
       : `${touch ? "Ctrl+Enter" : "Enter"} sends`;
     if (help) help.textContent = `${sendSupportsHold() ? "Hold Send or Space: after 0.5 seconds, a 2-second queue countdown starts. Release before the countdown sends; release during it or Escape cancels. " : ""}Enter activates Send immediately. In the message field, ${keys}.${touch ? " Enter adds a new line." : ""}`;
   }
@@ -4707,11 +4704,11 @@ export function initChat(api = new ChatApiClient()): void {
       return;
     }
     if (commandMatch && event.key === "Escape") { event.preventDefault(); closeCommandMenu(); return; }
-    // ⌥Enter submits with the delivery Enter does not use (D10), only while
+    // ⌥Enter explicitly queues, only while
     // the choice exists; otherwise it is an ordinary Enter.
     if (event.key === "Enter" && event.altKey && !event.shiftKey && !event.isComposing && deliveryChoiceOffered()) {
       event.preventDefault();
-      requestedDelivery = otherDelivery(readDeliveryPreference(presentationLocalStorage()));
+      requestedDelivery = "queue";
       form.requestSubmit();
       return;
     }
@@ -5403,10 +5400,10 @@ export function initChat(api = new ChatApiClient()): void {
     const configurationRevisionAtSubmit = projection.configurationRevision;
     const stagedConfigurationAtSubmit = stagedConfigurations.get(conversationId);
     const projectionEpochAtSubmit = projectionEpoch;
-    // Named only to a steering agent: the device default, or this
-    // submission's one-off choice (⌥Enter, the menu). The workspace decides
+    // Named only to a steering agent: fixed Steer, or this
+    // submission's explicit Queue choice (⌥Enter or hold). The workspace decides
     // whether it steers, holds, or dispatches, and reports which.
-    const delivery: MessageDelivery | undefined = declares("steering") ? attachmentRefs.length ? "queue" : submissionDelivery ?? readDeliveryPreference(presentationLocalStorage()) : undefined;
+    const delivery: MessageDelivery | undefined = declares("steering") ? attachmentRefs.length ? "queue" : submissionDelivery ?? "steer" : undefined;
     // Native steer acceptance can outlive a lost browser response on either
     // standalone or Hub. Hub policy controls automation, not input safety.
     const potentiallyNativeSteer = declares("steering") && !isListedCommand(text)

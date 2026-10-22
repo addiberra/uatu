@@ -1320,10 +1320,12 @@ export class ChatAdapter {
       if (waking && projection.status === "sending") projection.statusUpdate(previousStatus);
       if (error instanceof PrimarySteerOutcomeUnknownError && !this.disposed && !fence.terminal && !fence.retired) {
         awaitingLateAcceptance = true;
-        if (sourceHeld) {
+        if (sourceHeld && this.heldQueues.get(conversationId)?.includes(sourceHeld)) {
           sourceHeld.unconfirmedSteerId = nativeId;
           this.publishQueue(conversationId, { kind: "paused", messageId: sourceHeld.id });
-        } else this.recordPendingSteer(conversationId, nativeId, submissionId, requestId, text, attachmentRefs, queuedAt, true);
+        } else if (!sourceHeld && !this.pendingSteers.get(conversationId)?.some(entry => entry.id === nativeId && !entry.unconfirmed)) {
+          this.recordPendingSteer(conversationId, nativeId, submissionId, requestId, text, attachmentRefs, queuedAt, true);
+        }
         // Late acknowledgement is read-side evidence only. It must never
         // re-enter the composite operation or initiate a delayed follow-up.
         void admission.then(late => {
@@ -1664,15 +1666,26 @@ export class ChatAdapter {
       // The dock lists the user's steers; the agent's own entries and its
       // natively queued input are not Uatu's queue.
       if (delta.delivery !== "steer") return;
+      const admission = this.admittingSteers.get(steerKey(conversationId, delta.id));
+      if (admission?.terminal || this.deliveredSteers.has(steerKey(conversationId, delta.id)) || this.projection(conversationId).has(`message:${delta.id}`)) return;
+      const queue = this.heldQueues.get(conversationId) ?? [];
+      const held = queue.find(entry => entry === admission?.held || entry.unconfirmedSteerId === delta.id);
+      if (held) {
+        queue.splice(queue.indexOf(held), 1);
+        if (!queue.length) this.heldQueues.delete(conversationId);
+      }
       const existing = steers.find(entry => entry.id === delta.id);
       if (existing) {
         existing.text = delta.text;
-        existing.queuedAt = delta.at;
+        existing.tick = ++this.inboxClock;
+        delete existing.unconfirmed;
         if (delta.attachments?.length) existing.attachments = delta.attachments; else delete existing.attachments;
+        this.publishQueue(conversationId, { kind: "steered", messageId: delta.id });
+        this.publishPausedChanges(conversationId);
         return;
       }
-      const submissionId = this.admittingSteers.get(steerKey(conversationId, delta.id))?.submissionId ?? delta.id;
-      steers.push({ id: delta.id, submissionId, text: delta.text, queuedAt: delta.at, ...(delta.attachments?.length ? { attachments: delta.attachments } : {}), tick: ++this.inboxClock });
+      const submissionId = held?.submissionId ?? admission?.submissionId ?? delta.id;
+      steers.push({ id: delta.id, submissionId, text: delta.text, queuedAt: held?.queuedAt ?? delta.at, ...(held ? { requestId: held.requestId } : {}), ...(delta.attachments?.length ? { attachments: delta.attachments } : {}), tick: ++this.inboxClock });
       this.pendingSteers.set(conversationId, steers);
       this.publishQueue(conversationId, { kind: "steered", messageId: delta.id });
       this.publishPausedChanges(conversationId);
@@ -1695,14 +1708,14 @@ export class ChatAdapter {
     const admission = this.admittingSteers.get(steerKey(conversationId, delta.id));
     if (admission?.id === delta.id) {
       admission.terminal = delta.outcome;
-      // A converted held message is the same submission, not a second
-      // queued copy to keep when settlement outruns acknowledgement/timeout.
-      const queue = this.heldQueues.get(conversationId);
-      const index = admission.held && queue ? queue.indexOf(admission.held) : -1;
-      if (queue && index >= 0) {
-        queue.splice(index, 1);
-        if (!queue.length) this.heldQueues.delete(conversationId);
-      }
+    }
+    // The held owner keeps the native identity even after a rejected
+    // transport releases its fence. Positive settlement retires it once.
+    const queue = this.heldQueues.get(conversationId);
+    const index = queue?.findIndex(entry => entry === admission?.held || entry.unconfirmedSteerId === delta.id) ?? -1;
+    if (queue && index >= 0) {
+      queue.splice(index, 1);
+      if (!queue.length) this.heldQueues.delete(conversationId);
     }
     if (delta.outcome === "delivered") this.rememberDelivered(conversationId, delta.id);
     if (waiter) {
@@ -1710,7 +1723,7 @@ export class ChatAdapter {
       waiter(delta.outcome);
       return;
     }
-    if (!this.forgetSteer(conversationId, delta.id) && admission?.id !== delta.id) return;
+    if (!this.forgetSteer(conversationId, delta.id) && admission?.id !== delta.id && index < 0) return;
     this.publishQueue(conversationId, { kind: delta.outcome === "delivered" ? "delivered" : "removed", messageId: delta.id });
     this.publishPausedChanges(conversationId);
   }
@@ -1740,12 +1753,15 @@ export class ChatAdapter {
     }
     const projection = this.projection(conversationId);
     const delivered = (id: string) => history.some(item => item.id === `message:${id}`) || projection.has(`message:${id}`) || this.deliveredSteers.has(steerKey(conversationId, id));
+    for (const admission of this.admittingSteers.values()) {
+      if (admission.conversationId === conversationId && delivered(admission.id)) admission.terminal = "delivered";
+    }
     listed = listed.filter(entry => !terminal.has(entry.id) && !delivered(entry.id));
     const current = this.pendingSteers.get(conversationId) ?? [];
     const confirmedHeld = new Map<string, HeldMessage>();
     const held = this.heldQueues.get(conversationId) ?? [];
     const remaining = held.filter(entry => {
-      const nativeId = entry.unconfirmedSteerId;
+      const nativeId = entry.unconfirmedSteerId ?? [...this.admittingSteers.values()].find(admission => admission.conversationId === conversationId && admission.held === entry && !admission.retired)?.id;
       if (!nativeId || !listed.some(candidate => candidate.id === nativeId && candidate.delivery === "steer")
         && !history.some(item => item.id === `message:${nativeId}`) && !projection.has(`message:${nativeId}`)) return true;
       confirmedHeld.set(nativeId, entry);
