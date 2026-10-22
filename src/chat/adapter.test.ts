@@ -6804,6 +6804,39 @@ describe("steering (opencode-v2-steering)", () => {
     await adapter.dispose();
   });
 
+  test("a new composer steer resumes a stopped held queue only after acceptance", async () => {
+    const { adapter, provider, steer, queue, queued, inbox } = steering();
+    const pump = adapter.startEventPump();
+    const watch = await watchQueue(adapter);
+    try {
+      await adapter.prompt("session", "start", "start");
+      const held = await queue("held", "held before Stop");
+      await adapter.abort("session", "stop");
+      const before = await queued();
+      const accept = provider.prompt.bind(provider);
+      provider.prompt = async () => { throw new Error("refused"); };
+      await expect(steer("refused", "refused steer")).rejects.toThrow("refused");
+      expect(await queued()).toEqual(before);
+      expect(provider.prompts).toHaveLength(1);
+      provider.prompt = accept;
+      const accepted = await steer("resume", "new composer steer");
+      expect(await queued()).toEqual([
+        expect.objectContaining({ id: accepted.messageId, delivery: "steer" }),
+        expect.objectContaining({ id: held.messageId, delivery: "queue" }),
+      ]);
+      expect((await queued()).find(entry => entry.id === held.messageId)).not.toHaveProperty("paused");
+      await waitUntil(() => watch.changes.includes(`resumed:${held.messageId}`));
+      // Acceptance wakes the turn; held delivery still waits for its end.
+      expect(provider.prompts).toHaveLength(2);
+      inbox({ kind: "settled", id: accepted.messageId, outcome: "delivered" });
+      await liveEventsApplied(adapter, provider);
+      adapter.projectionForTests("session").statusUpdate("completed");
+      await admissionsApplied(adapter);
+      expect(provider.prompts.map(input => input.text)).toEqual(["start", "new composer steer", "held before Stop"]);
+      expect(await queued()).toEqual([]);
+    } finally { watch.stop(); await adapter.dispose(); await pump; }
+  });
+
   test("cancel interrupts without resuming: held messages go dormant, pending steers stay pending and paused, nothing delivers", async () => {
     const { adapter, provider, steer, queue, queued } = steering();
     expect((await adapter.prompt("session", "r-1", "start")).pending).toBe(false);
@@ -6866,6 +6899,56 @@ describe("steering (opencode-v2-steering)", () => {
       await pump;
       await adapter.dispose();
     }
+  });
+
+  for (const bound of ["count", "UTF-8 bytes"] as const) test(`a staged replacement respects the shared ${bound} bound without double counting acceptance`, async () => {
+    const { adapter, provider, steer, queue, queued } = steering();
+    provider.agent.capabilities.push("reversible-history");
+    let state: ReversibleHistoryState = { staged: false, canUndo: true, canRedo: false, revertedMessages: [] };
+    provider.getReversibleHistoryState = async () => state;
+    provider.undo = async () => {
+      state = { staged: true, canUndo: false, canRedo: true, revertedMessages: [{ id: "message:old", text: "old" }] };
+      return { outcome: "changed", state };
+    };
+    provider.redo = provider.revert = provider.restore = async () => ({ outcome: "changed", state });
+    try {
+      adapter.projectionForTests("session").statusUpdate("running");
+      await steer("existing-steer", bound === "count" ? "existing steer" : "é".repeat(32 * 1024));
+      const held = await queue("existing-held", bound === "count" ? "held" : "🙂".repeat(48 * 1024 - 1));
+      if (bound === "count") for (let index = 0; index < 18; index++) await queue(`held-${index}`, "held");
+      await adapter.undo("session", "undo");
+      const before = await queued();
+      const staged = structuredClone(state);
+      const calls = provider.prompts.length;
+      // Four bytes remain in the byte case: three UTF-8 characters are six,
+      // not three bytes. Rejection must precede provider or staged mutation.
+      await expect(adapter.prompt("session", "overflow", bound === "count" ? "replacement" : "ééé")).rejects.toBeInstanceOf(ChatQueueFullError);
+      expect(await queued()).toEqual(before);
+      expect(state).toEqual(staged);
+      expect(provider.prompts).toHaveLength(calls);
+      if (bound === "count") await adapter.removeQueued("session", held.messageId, "make-room");
+      const accept = provider.prompt.bind(provider);
+      provider.prompt = async (id, input) => {
+        const result = await accept(id, input);
+        state = { staged: false, canUndo: true, canRedo: false, revertedMessages: [] };
+        return result;
+      };
+      const text = bound === "count" ? "replacement" : "🙂";
+      const accepted = await adapter.prompt("session", "at-bound", text);
+      expect(accepted).toEqual(expect.objectContaining({ pending: true, delivery: "steer" }));
+      // Retrying an already-counted replacement replays its receipt even at
+      // capacity; held messages must still wait for this resumed turn's end.
+      expect(await adapter.prompt("session", "at-bound", text)).toEqual(accepted);
+      await admissionsApplied(adapter);
+      expect(provider.prompts).toHaveLength(calls + 1);
+      const pending = await queued();
+      expect(pending.filter(entry => entry.id === accepted.messageId)).toHaveLength(1);
+      expect(state.staged).toBe(false);
+      expect(pending.length).toBe(bound === "count" ? 20 : 3);
+      if (bound === "UTF-8 bytes") expect(pending.reduce((bytes, entry) => bytes + Buffer.byteLength(entry.text), 0)).toBe(256 * 1024);
+      await expect(steer("over-bound", "x")).rejects.toBeInstanceOf(ChatQueueFullError);
+      expect(await queued()).toEqual(pending);
+    } finally { await adapter.dispose(); }
   });
 
   test("withdrawing a steer waits for the agent's confirmation: cancelled removes it or holds it in submission order with the current configuration", async () => {
@@ -7172,18 +7255,45 @@ describe("steering (opencode-v2-steering)", () => {
   test("a delivered event overtaking fallback history wins over apparent absence", async () => {
     const { adapter, provider, steer, inbox } = steering({ steerWithdrawTimeoutMs: 1 });
     const pump = adapter.startEventPump();
-    adapter.projectionForTests("session").statusUpdate("running");
-    const accepted = await steer("original", "racing delivery");
-    provider.pendingInbox = [];
-    provider.listMessages = async () => {
+    const watch = await watchQueue(adapter);
+    let releaseHistory!: () => void;
+    const historyGate = new Promise<void>(resolve => { releaseHistory = resolve; });
+    let startedHistory!: () => void;
+    const historyStarted = new Promise<void>(resolve => { startedHistory = resolve; });
+    let releaseDeadline!: () => void;
+    const deadlineGate = new Promise<void>(resolve => { releaseDeadline = resolve; });
+    const schedule = globalThis.setTimeout;
+    let timerSpy: ReturnType<typeof spyOn> | undefined;
+    try {
+      adapter.projectionForTests("session").statusUpdate("running");
+      const accepted = await steer("original", "racing delivery");
+      provider.pendingInbox = [];
+      provider.listMessages = async () => {
+        startedHistory();
+        await historyGate;
+        return { items: [], completeItems: [], accounting: [] };
+      };
+      // Gate the deadline callback, not its duration: explicitly schedule the
+      // delivery event before expiry, even when the test process is descheduled.
+      timerSpy = spyOn(globalThis, "setTimeout").mockImplementationOnce(((callback: (...args: unknown[]) => void, ms?: number, ...args: unknown[]) => {
+        expect(ms).toBe(1);
+        return schedule(() => { void deadlineGate.then(() => callback(...args)); }, ms);
+      }) as typeof setTimeout);
+      const withdrawal = adapter.changeDelivery("session", accepted.messageId, "convert", "queue");
+      const outcome = withdrawal.catch(error => error);
+      await historyStarted;
       inbox({ kind: "settled", id: accepted.messageId, outcome: "delivered" });
       for (let index = 0; index < 70; index++) inbox({ kind: "settled", id: `other-${index}`, outcome: "delivered" });
-      await waitUntil(() => provider.eventQueue.waiting);
-      return { items: [], completeItems: [], accounting: [] };
-    };
-    await expect(adapter.changeDelivery("session", accepted.messageId, "convert", "queue")).rejects.toBeInstanceOf(SteerAlreadyDeliveredError);
-    expect(provider.prompts).toHaveLength(1);
-    await adapter.stopEventPump(); await pump; await adapter.dispose();
+      await waitUntil(() => provider.eventQueue.waiting && watch.changes.includes(`delivered:${accepted.messageId}`));
+      releaseHistory();
+      expect(await outcome).toBeInstanceOf(SteerAlreadyDeliveredError);
+      expect(provider.prompts).toHaveLength(1);
+    } finally {
+      releaseHistory();
+      timerSpy?.mockRestore();
+      releaseDeadline();
+      watch.stop(); await adapter.dispose(); await pump;
+    }
   });
 
   test("with no confirmation before the bounded wait, the outcome comes from the agent's list and history", async () => {

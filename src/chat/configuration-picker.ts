@@ -134,7 +134,6 @@ export type ChatConfigurationPickerState = {
 export type ChatConfigurationPickerElements = {
   dialog: HTMLDialogElement;
   trigger: HTMLElement;
-  returnFocus?: () => HTMLElement;
   surface: HTMLElement;
   search: HTMLInputElement;
   modelsSection: HTMLElement;
@@ -528,7 +527,7 @@ export function createChatConfigurationPicker(
     const doc = elements.trigger.ownerDocument;
     const active = doc.activeElement;
     const stranded = !active || active === doc.body || elements.dialog.contains(active);
-    const invoker = elements.returnFocus?.() ?? elements.trigger;
+    const invoker = elements.trigger;
     if (stranded && doc.body.contains(invoker)) invoker.focus();
   };
 

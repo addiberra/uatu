@@ -3279,7 +3279,6 @@ export function initChat(api = new ChatApiClient()): void {
   configurationPicker = createChatConfigurationPicker({
     dialog: configurationDialog,
     trigger: configurationTrigger,
-    returnFocus: () => configurationTrigger,
     surface,
     search: configurationSearch,
     modelsSection: configurationModelsSection,

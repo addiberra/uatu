@@ -1176,6 +1176,9 @@ export class ChatAdapter {
           && !(text.startsWith("/") && parseSlashCommand(text, await this.provider.listCommands()) !== undefined);
         if (reversible?.staged) {
           if (steerable) {
+            // A replacement is another pending inbox entry, not an escape
+            // from the combined dock bound. Refuse before committing Undo.
+            this.assertDockCapacity(conversationId, text);
             // The replacement goes out as a steer with resume: the agent
             // commits the boundary, wakes, and delivers every pending steer
             // with it, oldest first. The held queue stays pending behind it.
@@ -1217,6 +1220,10 @@ export class ChatAdapter {
             // staged selection stays staged for the next queued or idle
             // submission, so nothing is committed here.
             const steered = await this.admitSteer(conversationId, requestId, text, attachmentRefs);
+            // A new composer submission resumes Stop's held queue, but a
+            // refused or unknown admission must leave that intent unchanged.
+            this.dormantQueues.delete(conversationId);
+            this.publishPausedChanges(conversationId);
             return this.followAcceptedSteer(conversationId, { messageId: steered.id, pending: true, delivery: "steer" as const, configuration: this.configurations.get(conversationId) ?? currentConfiguration }, context);
           }
           // The EFFECTIVE selections are resolved and frozen at submission, not
