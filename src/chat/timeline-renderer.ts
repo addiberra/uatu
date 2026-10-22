@@ -1181,6 +1181,57 @@ function renderQueued(entry: QueuedMessage, context: QueueDockContext, discrimin
   return `<article class="${classes}" role="listitem" data-chat-queued-id="${id}" data-delivery="${entry.delivery}"${entry.paused ? " data-paused" : ""}><div class="chat-queued-heading"><strong class="chat-queued-badge">${entry.delivery === "steer" ? "Steer" : "Queue"}</strong>${entry.unconfirmed ? '<span class="chat-queued-paused">Outcome unconfirmed</span>' : entry.paused ? '<span class="chat-queued-paused">Paused</span>' : ""}<small class="chat-queued-tag">${entry.unconfirmed ? "Do not repeat this pending message" : escapeHtml(queuedTag(entry))}</small></div>${renderMessageAttachments(entry.attachments)}${entry.text ? `<p>${escapeHtml(entry.text)}</p>` : ""}<footer class="chat-queued-row"><span class="chat-queued-actions">${buttons}</span></footer></article>`;
 }
 
+// Only pending-card shapes belong here. In particular, never move a live
+// control through the detached template: pointer gestures and focus belong
+// to the existing node, even when its accessible name changes.
+function patchQueuedCard(node: HTMLElement, next: HTMLElement, previousHtml: string): void {
+  const previous = buildNode(previousHtml);
+  node.className = next.className;
+  node.dataset.delivery = next.dataset.delivery;
+  node.toggleAttribute("data-paused", next.hasAttribute("data-paused"));
+  const heading = node.querySelector<HTMLElement>(".chat-queued-heading")!;
+  const nextHeading = next.querySelector<HTMLElement>(".chat-queued-heading")!;
+  if (heading.innerHTML !== nextHeading.innerHTML) heading.innerHTML = nextHeading.innerHTML;
+  // Compare undecorated markup, not the live thumbnail: image error handling
+  // may already have replaced it with a disabled, missing-image placeholder.
+  const attachments = ".chat-message-attachments";
+  if (previous.querySelector(attachments)?.outerHTML !== next.querySelector(attachments)?.outerHTML) {
+    node.querySelector(attachments)?.remove();
+    const images = next.querySelector<HTMLElement>(attachments);
+    if (images) { heading.after(images); decorateAttachmentImages(images); }
+  }
+  const text = node.querySelector(":scope > p");
+  const nextText = next.querySelector(":scope > p");
+  if (text?.textContent !== nextText?.textContent) {
+    if (text && nextText) text.textContent = nextText.textContent;
+    else if (nextText) node.querySelector("footer")!.before(nextText);
+    else text?.remove();
+  }
+  const actions = node.querySelector<HTMLElement>(".chat-queued-actions")!;
+  const key = (button: Element) => [...button.attributes].find(attribute => attribute.name.startsWith("data-queue-"));
+  const oldButtons = [...actions.querySelectorAll<HTMLButtonElement>("button")];
+  const ordered = [...next.querySelectorAll<HTMLButtonElement>(".chat-queued-actions button")].map(candidate => {
+    const action = key(candidate)!;
+    const existing = oldButtons.find(button => button.getAttribute(action.name) === action.value);
+    if (!existing) return candidate;
+    const previouslyDisabled = previous.querySelector<HTMLButtonElement>(`[${action.name}]`)?.disabled;
+    const disabled = candidate.disabled || existing.disabled && !previouslyDisabled;
+    existing.className = candidate.className;
+    existing.setAttribute("aria-label", candidate.getAttribute("aria-label")!);
+    existing.textContent = candidate.textContent;
+    existing.disabled = disabled;
+    return existing;
+  });
+  // Action order is fixed; insert only new actions, leaving surviving nodes
+  // connected even when an earlier action disappears.
+  for (const button of oldButtons) if (!ordered.includes(button)) button.remove();
+  let cursor = actions.firstElementChild;
+  for (const button of ordered) {
+    if (button === cursor) cursor = cursor.nextElementSibling;
+    else actions.insertBefore(button, cursor);
+  }
+}
+
 /**
  * Reconciles the queue dock — the strip docked to the composer that shows
  * what is pending: steers first, then the workspace's held queue (D5).
@@ -1284,6 +1335,9 @@ export class QueueDockRenderer {
       content.append(list);
     }
     list.hidden = context.compactOpen === false;
+    const active = target.ownerDocument.activeElement as HTMLElement | null;
+    const focusedCard = active?.closest<HTMLElement>("[data-chat-queued-id]");
+    const focusedIndex = focusedCard ? [...list.children].indexOf(focusedCard) : -1;
     const ordered: HTMLElement[] = [];
     const textCounts = new Map<string, number>();
     const submissionCounts = new Map<string, number>();
@@ -1300,8 +1354,8 @@ export class QueueDockRenderer {
     }));
     const usedNumbers = new Set<number>();
     for (const entry of queued) {
-      // Rebuilt when anything shown changes — text, attachments, delivery,
-      // paused state, or the actions the context allows — and kept otherwise.
+      // Native handles key cards and actions; logical submission identity
+      // below is only for numbering across an actual delivery conversion.
       const existing = this.entries.get(entry.id);
       // Client correlation IDs and timestamps are not identity. Older frames
       // use their native handle; malformed duplicate logical IDs also fall
@@ -1323,9 +1377,9 @@ export class QueueDockRenderer {
         ordered.push(existing.node);
         continue;
       }
-      const node = buildNode(html);
-      decorateAttachmentImages(node);
-      existing?.node.remove();
+      const node = existing?.node ?? buildNode(html);
+      if (existing) patchQueuedCard(node, buildNode(html), existing.html);
+      else decorateAttachmentImages(node);
       this.entries.set(entry.id, { node, html, number, disambiguated });
       ordered.push(node);
     }
@@ -1341,13 +1395,30 @@ export class QueueDockRenderer {
       if (recent <= 64) break;
       if (!liveIdentities.has(identity)) { this.pendingNumbers.delete(identity); recent--; }
     }
-    let cursor = list.firstElementChild;
-    for (const node of ordered) {
+    // Reorder siblings around the focused article, never detach its subtree.
+    // insertBefore on that article itself drops focus in browser engines.
+    const anchor = focusedCard && ordered.includes(focusedCard) ? focusedCard : null;
+    const anchorIndex = anchor ? ordered.indexOf(anchor) : -1;
+    if (anchor) {
+      let before = anchor;
+      for (let index = anchorIndex - 1; index >= 0; index--) {
+        const node = ordered[index]!;
+        if (node.nextElementSibling !== before) list.insertBefore(node, before);
+        before = node;
+      }
+    }
+    let cursor = anchor ? anchor.nextElementSibling : list.firstElementChild;
+    for (const node of ordered.slice(anchorIndex + 1)) {
       if (node === cursor) {
         cursor = cursor.nextElementSibling;
         continue;
       }
       list.insertBefore(node, cursor);
+    }
+    if (focusedIndex >= 0 && active && !active.isConnected) {
+      const fallback = anchor ?? ordered[Math.min(focusedIndex, ordered.length - 1)];
+      (fallback?.querySelector<HTMLButtonElement>("button:not(:disabled)")
+        ?? header.querySelector<HTMLButtonElement>("button:not(:disabled)"))?.focus({ preventScroll: true });
     }
     target.hidden = queued.length === 0;
     if (context.note) {

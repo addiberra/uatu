@@ -1199,6 +1199,85 @@ describe("presentation details", () => {
       expect(host.scrollTop).toBe(0);
     });
 
+    test("remote duplicate arrival, reorder and removal patch the original card and action nodes", () => {
+      const host = target();
+      const dock = new QueueDockRenderer();
+      const first = queued({ id: "first", text: "Same pending" });
+      const second = queued({ id: "remote", text: first.text });
+      dock.render(host, [first], { ...steering, compactOpen: true });
+      const card = host.querySelector('[data-chat-queued-id="first"]')!;
+      const remove = card.querySelector<HTMLButtonElement>("[data-queue-remove]")!;
+      const edit = card.querySelector("[data-queue-edit]");
+      const steer = card.querySelector("[data-queue-steer]");
+      remove.disabled = true; // handler-local lock, not yet in the snapshot
+      for (const entries of [[first, second], [second, { ...first, paused: true as const }], [first]]) {
+        dock.render(host, entries, { ...steering, compactOpen: true });
+        expect(host.querySelector('[data-chat-queued-id="first"]')).toBe(card);
+        expect(card.querySelector("[data-queue-remove]")).toBe(remove);
+        expect(card.querySelector("[data-queue-edit]")).toBe(edit);
+        expect(card.querySelector("[data-queue-steer]")).toBe(steer);
+        expect(remove.disabled).toBe(true);
+        expect(remove.getAttribute("aria-label")).toContain("pending message 1");
+      }
+      dock.render(host, [{ ...first, unconfirmed: true }], { ...steering, withdrawalRetries: new Set([first.id]), pendingActions: new Set([first.id]) });
+      expect(card.querySelector("[data-queue-remove]")).toBe(remove);
+      expect(remove.textContent).toBe("Retry withdrawal");
+      expect(remove.disabled).toBe(true);
+      expect(card.querySelector("[data-queue-edit]")).toBeNull();
+      expect(card.querySelector("[data-queue-steer]")).toBeNull();
+      dock.render(host, [{ ...first, unconfirmed: true }], steering);
+      expect(card.querySelectorAll("button")).toHaveLength(0);
+    });
+
+    test("action changes retain surviving native controls, apply locks and retire converted native IDs", () => {
+      const host = target();
+      const dock = new QueueDockRenderer();
+      const first = queued({ id: "native-first", submissionId: "submission", text: "Keep this" });
+      dock.render(host, [first], steering);
+      const card = host.querySelector("article")!;
+      const remove = card.querySelector<HTMLButtonElement>("[data-queue-remove]")!;
+      const edit = card.querySelector("[data-queue-edit]");
+      const steer = card.querySelector("[data-queue-steer]");
+      dock.render(host, [{ ...first, paused: true }], { ...steering, running: false, pendingActions: new Set([first.id]) });
+      expect(host.querySelector("article")).toBe(card);
+      expect(card.querySelector("[data-queue-remove]")).toBe(remove);
+      expect(card.querySelector("[data-queue-edit]")).toBe(edit);
+      expect(card.contains(steer)).toBe(false);
+      expect(card.querySelector("[data-queue-send-now]")).not.toBeNull();
+      expect(remove.disabled).toBe(true);
+      dock.render(host, [first], { ...steering, running: false });
+      expect(remove.disabled).toBe(false);
+      dock.render(host, [{ ...first, id: "native-converted", delivery: "steer" }], steering);
+      expect(host.contains(card)).toBe(false);
+      expect(host.querySelector('[data-queue-remove="native-first"]')).toBeNull();
+      expect(host.querySelector('[data-queue-queue="native-converted"]')).not.toBeNull();
+      expect(host.querySelector('[data-queue-remove="native-converted"]')).not.toBe(remove);
+    });
+
+    test("card patches preserve decorated attachment lifecycle until attachment content changes", () => {
+      const host = target();
+      const dock = new QueueDockRenderer();
+      const entry = queued({ id: "image", text: "Before", attachments: [{ id: "image/id", name: '<unsafe>.png', mimeType: "image/png" }] });
+      dock.render(host, [entry], steering);
+      const view = host.querySelector<HTMLButtonElement>("[data-attachment-view]")!;
+      const image = host.querySelector("img")!;
+      image.dispatchEvent(new dom.window.Event("error"));
+      expect(view.disabled).toBe(true);
+      expect(host.querySelector("img")).toBeNull();
+      dock.render(host, [{ ...entry, text: "After <script>unsafe</script>", paused: true }], steering);
+      expect(host.querySelector(".chat-attachment-view")).toBe(view);
+      expect(view.disabled).toBe(true);
+      expect(host.querySelector("img")).toBeNull();
+      expect(host.querySelector("article > p")?.textContent).toBe("After <script>unsafe</script>");
+      expect(host.querySelector("script")).toBeNull();
+      dock.render(host, [{ ...entry, attachments: [{ ...entry.attachments![0]!, id: "replacement" }] }], steering);
+      expect(host.querySelector(".chat-attachment-view")).not.toBe(view);
+      const replacement = host.querySelector("img")!;
+      expect(replacement.getAttribute("src")).toContain("/replacement");
+      replacement.dispatchEvent(new dom.window.Event("error"));
+      expect(host.querySelector("img")).toBeNull();
+    });
+
     test("compact pending details collapse independently of replacement and paused batch safety", () => {
       const host = target();
       const note = document.createElement("p"); host.append(note);
@@ -1284,11 +1363,13 @@ describe("presentation details", () => {
       const host = target();
       dock.render(host, [queued({ id: "held-1", text: "later" })], steering);
       const before = host.querySelector("[data-chat-queued-id='held-1']");
+      expect(before).not.toBeNull();
+      if (!before) throw new Error("Expected the original pending card");
       dock.render(host, [queued({ id: "held-1", text: "later" })], steering);
       expect(host.querySelector("[data-chat-queued-id='held-1']")).toBe(before);
       dock.render(host, [queued({ id: "held-1", text: "later", paused: true })], { ...steering, running: false });
       const after = host.querySelector("[data-chat-queued-id='held-1']")!;
-      expect(after).not.toBe(before);
+      expect(after).toBe(before);
       expect(after.hasAttribute("data-paused")).toBe(true);
       expect(actions(after)).toEqual(["Send now", "Edit", "Remove"]);
     });

@@ -90,6 +90,155 @@ for (const acknowledgement of ["lost", "late"] as const) for (const responseStat
   } finally { release(); cancelClient?.(); await clientPump; await adapter.dispose(); await pump; await fake.stop(); }
 });
 
+test("real V2 Queue conversion configuration failure leaves the original native instruction pending without cancellation", async () => {
+  const directory = process.cwd();
+  const fake = startOpenCodeV2Fake({ directory });
+  const provider = createOpenCodeV2Provider({ endpoint: fake.url, password: fake.password, directory });
+  const adapter = new ChatAdapter({ provider, workspacePath: directory, maxProjections: 1, coalesceWindowMs: 0 });
+  const pump = adapter.startEventPump();
+  const configuration = provider.getConversationConfiguration.bind(provider);
+  try {
+    if (!provider.listPendingInbox) throw new Error("V2 fixture requires pending inbox inspection");
+    const listPendingInbox = provider.listPendingInbox.bind(provider);
+    await waitUntil(() => fake.state().eventSubscribers > 0);
+    const session = await provider.createSession("Conversion configuration failure");
+    await adapter.prompt(session.id, "initial", "Initial work");
+    const steer = await adapter.prompt(session.id, "steer", "Retain this pending instruction", undefined, undefined, undefined, undefined, "steer");
+    const other = await provider.createSession("Other conversation");
+    await adapter.history(other.id); // Navigation evicts the original configuration.
+    let reads = 0;
+    provider.getConversationConfiguration = async id => {
+      if (id === session.id) { reads++; throw new Error("configuration temporarily unavailable"); }
+      return configuration(id);
+    };
+    const before = fake.state().calls.length;
+    await expect(adapter.changeDelivery(session.id, steer.messageId, "convert", "queue")).rejects.toThrow("configuration temporarily unavailable");
+    expect(reads).toBe(1);
+    expect((await listPendingInbox(session.id)).map(entry => entry.id)).toEqual([steer.messageId]);
+    expect(fake.state().calls.slice(before).some(call => call.startsWith("DELETE ") || call.includes("/prompt") || call.includes("/interrupt"))).toBe(false);
+    provider.getConversationConfiguration = configuration;
+    const snapshot = await adapter.history(session.id);
+    expect(snapshot.queued).toEqual([expect.objectContaining({ id: steer.messageId, text: "Retain this pending instruction", delivery: "steer" })]);
+    expect(snapshot.queued![0]).not.toHaveProperty("unconfirmed");
+    expect(snapshot.items.some(item => item.id === `message:${steer.messageId}`)).toBe(false);
+  } finally {
+    provider.getConversationConfiguration = configuration;
+    await adapter.dispose(); await pump; await fake.stop();
+  }
+});
+
+test("real V2 Queue conversion freezes image, model, mode and variant once before cancellation", async () => {
+  const directory = process.cwd();
+  const fake = startOpenCodeV2Fake({ directory });
+  const dispatches: Array<{ path: string; body: Record<string, unknown> }> = [];
+  const recordingFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const request = new Request(input, init);
+    if (request.method === "POST") dispatches.push({ path: new URL(request.url).pathname, body: await request.clone().json().catch(() => ({})) });
+    return fetch(request);
+  }) as typeof fetch;
+  const provider = createOpenCodeV2Provider({ endpoint: fake.url, password: fake.password, directory, fetch: recordingFetch });
+  const stored = { id: "11111111-2222-4333-8444-555555555555", mimeType: "image/png", absolutePath: "/fixture/11111111-2222-4333-8444-555555555555.png" };
+  const attachment = { id: stored.id, name: "frozen.png", mimeType: stored.mimeType };
+  const adapter = new ChatAdapter({ provider, workspacePath: directory, maxProjections: 1, coalesceWindowMs: 0, resolveAttachment: async id => id === stored.id ? stored : null });
+  const pump = adapter.startEventPump();
+  const configuration = provider.getConversationConfiguration.bind(provider);
+  try {
+    if (!provider.cancelInbox) throw new Error("V2 fixture requires inbox cancellation");
+    const cancel = provider.cancelInbox.bind(provider);
+    await waitUntil(() => fake.state().eventSubscribers > 0);
+    const frozen = { model: { providerId: "opencode", modelId: "fake-model" }, mode: "plan", variant: "high" };
+    const session = await provider.createSession("Frozen conversion", frozen);
+    await adapter.prompt(session.id, "initial", "Initial work");
+    const steer = await adapter.prompt(session.id, "image", "", undefined, undefined, undefined, [attachment], "steer");
+    const other = await provider.createSession("Other conversation");
+    await adapter.history(other.id);
+    let reads = 0;
+    provider.getConversationConfiguration = async id => { if (id === session.id) reads++; return configuration(id); };
+    provider.cancelInbox = async (id, inboxId) => {
+      expect(reads).toBe(1);
+      // Once withdrawal begins, another configuration read cannot be relied on.
+      provider.getConversationConfiguration = async () => { throw new Error("read after cancellation"); };
+      await cancel(id, inboxId);
+    };
+    const converted = await adapter.changeDelivery(session.id, steer.messageId, "convert", "queue");
+    expect(converted.messageId).not.toBe(steer.messageId);
+    expect((await adapter.history(session.id)).queued).toEqual([expect.objectContaining({ id: converted.messageId, text: "", attachments: [expect.objectContaining({ name: "frozen.png", mimeType: "image/png" })], delivery: "queue" })]);
+    const before = dispatches.length;
+    fake.finish(session.id);
+    await waitUntil(() => dispatches.slice(before).some(call => call.path.endsWith("/prompt")));
+    expect(dispatches.slice(before).find(call => call.path.endsWith("/model"))?.body).toEqual({ model: { id: "fake-model", providerID: "opencode", variant: "high" } });
+    expect(dispatches.slice(before).find(call => call.path.endsWith("/agent"))?.body).toEqual({ agent: "plan" });
+    const dispatched = dispatches.slice(before).find(call => call.path.endsWith("/prompt"))!.body;
+    expect(dispatched).toMatchObject({ text: "", files: [expect.objectContaining({ name: "frozen.png" })] });
+    expect(dispatched.id).not.toBe(steer.messageId);
+    await waitUntil(() => adapter.projectionForTests(session.id).has(`message:${dispatched.id}`));
+    await admissionsApplied(adapter);
+    expect(reads).toBe(1);
+  } finally {
+    provider.getConversationConfiguration = configuration;
+    await adapter.stopEventPump(); await pump; await adapter.dispose(); await fake.stop();
+  }
+});
+
+for (const outcome of ["unknown", "cancel-refused", "delivered-on-cancel", "delivered-during-configuration"] as const) test(`real V2 prepared Queue conversion keeps one owner when ${outcome}`, async () => {
+  const directory = process.cwd();
+  const fake = startOpenCodeV2Fake({ directory });
+  const transport = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const request = new Request(input, init);
+    if (outcome === "cancel-refused" && request.method === "DELETE" && new URL(request.url).pathname.includes("/inbox/")) return Response.json({ error: "cancellation refused" }, { status: 403 });
+    return fetch(request);
+  }) as typeof fetch;
+  const provider = createOpenCodeV2Provider({ endpoint: fake.url, password: fake.password, directory, fetch: transport });
+  const adapter = new ChatAdapter({ provider, workspacePath: directory, maxProjections: 1, coalesceWindowMs: 0, steerWithdrawTimeoutMs: 30 });
+  const pump = adapter.startEventPump();
+  const configuration = provider.getConversationConfiguration.bind(provider);
+  let release = () => {};
+  try {
+    if (!provider.listPendingInbox) throw new Error("V2 fixture requires pending inbox inspection");
+    const listPendingInbox = provider.listPendingInbox.bind(provider);
+    await waitUntil(() => fake.state().eventSubscribers > 0);
+    const session = await provider.createSession("Conversion race");
+    await adapter.prompt(session.id, "initial", "Initial work");
+    const steer = await adapter.prompt(session.id, "steer", "Deliver at most once", undefined, undefined, undefined, undefined, "steer");
+    const other = await provider.createSession("Other conversation");
+    await adapter.history(other.id);
+    let reads = 0;
+    provider.getConversationConfiguration = async id => {
+      const current = await configuration(id);
+      if (id === session.id) {
+        reads++;
+        if (outcome === "delivered-during-configuration") {
+          fake.step(session.id);
+          await waitUntil(() => adapter.projectionForTests(session.id).has(`message:${steer.messageId}`));
+        }
+      }
+      return current;
+    };
+    if (outcome === "unknown") provider.cancelInbox = async () => { await new Promise<void>(resolve => { release = resolve; }); throw new Error("cancel response unavailable"); };
+    else if (outcome === "delivered-on-cancel") fake.raceDeliverOnCancel(steer.messageId);
+    const conversion = adapter.changeDelivery(session.id, steer.messageId, "convert", "queue");
+    const uncertain = outcome === "unknown" || outcome === "cancel-refused";
+    await expect(conversion).rejects.toBeInstanceOf(uncertain ? SteerWithdrawalUnconfirmedError : SteerAlreadyDeliveredError);
+    expect(reads).toBe(1);
+    const snapshot = await adapter.history(session.id);
+    if (uncertain) {
+      expect(snapshot.queued).toEqual([expect.objectContaining({ id: steer.messageId, delivery: "steer", unconfirmed: true })]);
+      expect((await listPendingInbox(session.id)).map(entry => entry.id)).toEqual([steer.messageId]);
+      await expect(adapter.changeDelivery(session.id, steer.messageId, "retry-convert", "queue")).rejects.toBeInstanceOf(SteerWithdrawalUnconfirmedError);
+    } else {
+      expect(snapshot.queued).toEqual([]);
+      expect(snapshot.items.filter(item => item.id === `message:${steer.messageId}`)).toHaveLength(1);
+      expect(await listPendingInbox(session.id)).toEqual([]);
+    }
+    expect(fake.state().calls.filter(call => call.includes("/prompt"))).toHaveLength(2);
+    expect(fake.state().calls.some(call => call.includes("/interrupt"))).toBe(false);
+  } finally {
+    release();
+    provider.getConversationConfiguration = configuration;
+    await adapter.dispose(); await pump; await fake.stop();
+  }
+});
+
 test("real V2 Stop with only native steers keeps a later Queue conversion dormant", async () => {
   const directory = process.cwd();
   const fake = startOpenCodeV2Fake({ directory });
@@ -7422,6 +7571,51 @@ describe("steering (opencode-v2-steering)", () => {
     await adapter.stopEventPump();
     await pump;
     await adapter.dispose();
+  });
+
+  for (const bound of ["count", "UTF-8 bytes"] as const) test(`Queue conversion at the dock ${bound} bound transfers existing ownership without consuming another slot`, async () => {
+    const { adapter, provider, inbox, steer, queue, queued } = steering();
+    const pump = adapter.startEventPump();
+    try {
+      adapter.projectionForTests("session").statusUpdate("running");
+      const text = bound === "count" ? "later" : "é".repeat(32 * 1024);
+      const accepted = await steer("native", text);
+      for (let index = 0; index < (bound === "count" ? 19 : 3); index++) await queue(`held-${index}`, text);
+      provider.cancelInbox = async () => { inbox({ kind: "settled", id: accepted.messageId, outcome: "cancelled" }); };
+      const converted = await adapter.changeDelivery("session", accepted.messageId, "convert", "queue");
+      const pending = await queued();
+      expect(pending).toHaveLength(bound === "count" ? 20 : 4);
+      expect(pending.filter(entry => entry.id === converted.messageId)).toHaveLength(1);
+      expect(pending.every(entry => entry.delivery === "queue")).toBe(true);
+      if (bound === "UTF-8 bytes") expect(pending.reduce((bytes, entry) => bytes + Buffer.byteLength(entry.text), 0)).toBe(256 * 1024);
+      await expect(queue("over-bound", "x")).rejects.toBeInstanceOf(ChatQueueFullError);
+      expect(await queued()).toEqual(pending);
+    } finally { await adapter.stopEventPump(); await pump; await adapter.dispose(); }
+  });
+
+  test("Queue conversion freezes configuration when preparing withdrawal but retains pending attachment updates until cancellation", async () => {
+    const stored = { id: "11111111-2222-4333-8444-555555555555", mimeType: "image/png", absolutePath: "/fixture/11111111-2222-4333-8444-555555555555.png" };
+    const attachment = { id: stored.id, name: "updated.png", mimeType: stored.mimeType };
+    const { adapter, provider, inbox, steer, queued } = steering({ resolveAttachment: async id => id === stored.id ? stored : null });
+    const pump = adapter.startEventPump();
+    try {
+      const frozen = { model: { providerId: "anthropic", modelId: "claude" }, mode: "plan", variant: "high" };
+      provider.configurations.set("session", frozen);
+      adapter.projectionForTests("session").statusUpdate("running");
+      const accepted = await steer("original", "original instruction");
+      provider.cancelInbox = async () => {
+        provider.eventQueue.push({ normalized: { conversationId: "session", updates: [], outcome: "handled", eventType: "session.next.model.switched", configuration: { model: { providerId: "openai", modelId: "gpt" }, mode: "build", variant: "low" }, replaceModel: true } });
+        inbox({ kind: "pending", id: accepted.messageId, text: "updated instruction", attachments: [attachment], delivery: "steer", at: Date.now() });
+        await liveEventsApplied(adapter, provider);
+        inbox({ kind: "settled", id: accepted.messageId, outcome: "cancelled" });
+      };
+      const converted = await adapter.changeDelivery("session", accepted.messageId, "convert", "queue");
+      expect(await queued()).toEqual([expect.objectContaining({ id: converted.messageId, text: "updated instruction", attachments: [attachment] })]);
+      expect((await adapter.history("session")).configuration).toEqual({ model: { providerId: "openai", modelId: "gpt" }, mode: "build", variant: "low" });
+      adapter.projectionForTests("session").statusUpdate("completed");
+      await waitUntil(() => provider.prompts.length === 2);
+      expect(provider.prompts[1]).toMatchObject({ id: converted.messageId, text: "updated instruction", ...frozen, attachments: [expect.objectContaining({ id: stored.id })] });
+    } finally { await adapter.stopEventPump(); await pump; await adapter.dispose(); }
   });
 
   test("a steer the agent delivers first cannot be withdrawn: already delivered, nothing held, nothing sent twice; retries apply once", async () => {

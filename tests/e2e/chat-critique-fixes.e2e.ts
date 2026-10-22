@@ -77,6 +77,39 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`critique re
       await expectWorkControlVisible(workers);
       await expectWorkTranscriptBudget(page, keyboard ? 380 : 844);
     }
+    // A second client can add an identical pending message without touching
+    // this reader's keyboard focus. Its arrival adds the aria discriminator
+    // to the first card, but must not replace that card or its live actions.
+    const remove = page.locator("#chat-queue [data-queue-remove]").first();
+    const originalRemove = await remove.elementHandle();
+    const originalCard = await remove.locator("xpath=ancestor::article").elementHandle();
+    const originalId = await remove.getAttribute("data-queue-remove");
+    await remove.focus(); await expect(remove).toBeFocused();
+    const panes = await page.locator("#chat-queue-content").elementHandle();
+    const offsets = () => page.evaluate(() => ["chat-queue-content", "chat-compact-workers-items", "chat-timeline"].map(id => document.getElementById(id)!.scrollTop));
+    const beforeRemote = await offsets();
+    const { token } = await request.get("/__e2e/terminal-token").then(r => r.json());
+    expect(await page.evaluate(async ({ id, token }) => {
+      const response = await fetch(`/api/chat/conversations/${encodeURIComponent(id)}/prompts?t=${encodeURIComponent(token)}`, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ text: "Pending message", delivery: "steer", requestId: crypto.randomUUID() }),
+      });
+      return response.status;
+    }, { id, token })).toBe(202);
+    await expect(page.locator("#chat-queue .chat-queued-message")).toHaveCount(2);
+    await expect(remove).toHaveAttribute("aria-label", /pending message 1$/);
+    await expect(remove).toBeFocused();
+    expect(await remove.evaluate((node, previous) => node === previous, originalRemove)).toBe(true);
+    expect(await remove.locator("xpath=ancestor::article").evaluate((node, previous) => node === previous, originalCard)).toBe(true);
+    expect(await page.locator("#chat-queue-content").evaluate((node, previous) => node === previous, panes)).toBe(true);
+    expect(await offsets()).toEqual(beforeRemote);
+    await expect(workers.locator("..")).toHaveAttribute("open", "");
+    await expect(pending).toHaveAttribute("aria-expanded", "true");
+    const removed = page.waitForResponse(response => response.request().method() === "DELETE" && decodeURIComponent(new URL(response.url()).pathname).endsWith(`/queue/${originalId}`));
+    await page.keyboard.press("Enter");
+    expect((await removed).ok()).toBe(true);
+    await expect(page.locator("#chat-queue .chat-queued-message")).toHaveCount(1);
+    await expect(page.locator("#chat-queue [data-queue-remove]")).not.toHaveAttribute("data-queue-remove", originalId!);
   });
 
   test("enlarged question options never paint under the date pill", async ({ page, request }) => {

@@ -1388,8 +1388,9 @@ export class ChatAdapter {
    * Change a pending message's delivery (opencode-v2-steering D7, D8). Held
    * to steer hands the message to the agent now, with its attachments and
    * no frozen configuration; steer to held withdraws it from the agent and
-   * holds it at its submission-order position under the session's current
-   * configuration. Both run in the admission lane and are receipt-keyed.
+   * holds it at its submission-order position under the session configuration
+   * captured when preparing withdrawal. Both run in the admission lane and
+   * are receipt-keyed.
    */
   changeDelivery(conversationId: string, messageId: string, requestId: string, delivery: MessageDelivery, context?: ChatActionContext, operationReceipt?: string): Promise<{ messageId: string; delivery: MessageDelivery } & AutomaticBackgroundFeedback> {
     context = context ? { ...context } : undefined;
@@ -1412,14 +1413,17 @@ export class ChatAdapter {
         if (held) return { messageId, delivery: "queue" as const };
         throw this.notPendingError(conversationId, messageId);
       }
-      await this.withdrawSteer(conversationId, steer);
-      // Frozen now, as a submission would freeze it: the configuration the
-      // session has at the moment of withdrawal.
+      // Prepare the held configuration before asking for withdrawal.
+      // A failed configuration read must leave the native instruction
+      // untouched; after confirmed cancellation, holding it must
+      // not depend on another asynchronous read. Freeze once for this action.
       const configuration = await this.configuration(conversationId);
+      // A fresh id: the agent's cancelled inbox id must not be reused by a
+      // later dispatch. Allocate before the destructive operation as well.
+      const heldId = this.id();
+      await this.withdrawSteer(conversationId, steer);
       const held: HeldMessage = {
-        // A fresh id: the agent's inbox id named an entry it has now
-        // cancelled, and a later dispatch must not reuse it.
-        id: this.id(),
+        id: heldId,
         submissionId: steer.submissionId,
         text: steer.text,
         queuedAt: steer.queuedAt,
