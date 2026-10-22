@@ -23,6 +23,66 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`canonical w
     await use(page); await browser.close();
   } });
 
+  for (const action of ["Inspect", "Stop"] as const) test(`keyed worker ${action} focus survives sibling settlement and reorder`, async ({ page, request }) => {
+    await request.post("/__e2e/reset");
+    await request.post("/__e2e/chat", { data: { action: "agents", count: 2 } });
+    const sibling: ConversationItem = { id: "focus:a", type: "background_task", taskId: "focus-a", taskType: "agent", description: "Sibling A", status: "running", createdAt: 1 };
+    const worker: ConversationItem = { ...sibling, id: "focus:b", taskId: "focus-b", description: "Focused B", createdAt: 2 };
+    const snapshot = await request.post("/__e2e/chat", { data: { action: "seed", agent: "claude", title: "Keyed keyboard focus", items: [sibling, worker] } }).then(response => response.json());
+    const update = async (item: ConversationItem) => {
+      expect((await request.post("/__e2e/chat", { data: { action: "item", conversationId: snapshot.conversation.id, item } })).ok()).toBe(true);
+    };
+    const { token } = await request.get("/__e2e/terminal-token").then(response => response.json());
+    await page.goto(`/?t=${encodeURIComponent(token)}`);
+    await page.locator("#touch-tab-chat").tap();
+    const track = page.locator("#chat-compact-workers");
+    const header = track.locator(":scope > summary");
+    await header.tap();
+    const rows = track.locator("[data-worker-id]");
+    const row = track.locator('[data-worker-id="focus:b"]');
+    const inspect = row.locator(".chat-worker-inspect");
+    const stop = row.locator("[data-stop-task]");
+    const target = action === "Inspect" ? inspect : stop;
+    await target.focus();
+    const original = await target.elementHandle();
+    const originalRow = await row.elementHandle();
+    await expect(target).toBeFocused();
+    const timelineTop = await page.locator("#chat-timeline").evaluate(node => node.scrollTop);
+    for (const status of ["completed", "running", "failed", "running"] as const) {
+      await update({ ...sibling, status });
+      await expect.poll(() => rows.evaluateAll(nodes => nodes.map(node => (node as HTMLElement).dataset.workerId))).toEqual(status === "running" ? ["focus:a", "focus:b"] : ["focus:b", "focus:a"]);
+      await expect(target).toBeFocused();
+      expect(await target.evaluate((node, original) => node === original, original)).toBe(true);
+      expect(await row.evaluate((node, original) => node === original, originalRow)).toBe(true);
+      expect(await page.locator("#chat-timeline").evaluate(node => node.scrollTop)).toBe(timelineTop);
+    }
+    if (action === "Stop") {
+      await update({ ...worker, stateUncertain: true });
+      await expect(stop).toBeDisabled();
+      await expect(inspect).toBeFocused();
+      await update(worker);
+      await expect(stop).toBeEnabled();
+      await stop.focus();
+    }
+    await update({ ...worker, status: "completed" });
+    await expect(stop).toHaveCount(0);
+    await expect(inspect).toBeFocused();
+    // Programmatic dismissal leaves focus on the worker until repaint removes it.
+    await track.getByRole("button", { name: "Dismiss finished", exact: true }).evaluate((node: HTMLButtonElement) => node.click());
+    await expect(row).toHaveCount(0);
+    await expect(header).toBeFocused();
+    const dismiss = track.getByRole("button", { name: "Dismiss finished", exact: true });
+    // A new settled occurrence makes dismissal visible again without reviving B.
+    await update({ ...worker, id: "focus:c", taskId: "focus-c", status: "completed" });
+    await expect(dismiss).toBeVisible();
+    await dismiss.focus();
+    await dismiss.evaluate((node: HTMLButtonElement) => node.click());
+    await expect(dismiss).toBeHidden();
+    await expect(header).toBeFocused();
+    await expect(track).toHaveAttribute("open");
+    await expect(page.locator("#chat-stop")).toBeAttached(); // Foreground Stop remains a separate control.
+  });
+
   test("one finished plus twenty hidden stays compact, including after dismissal", async ({ page, request }, info) => {
     await request.post("/__e2e/reset");
     await request.post("/__e2e/chat", { data: { action: "agents", count: 2 } });

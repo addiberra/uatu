@@ -1,8 +1,10 @@
 # OpenCode chat screenshots
 
-Current acceptance: **user-reported iPhone acceptance**; the user owns physical-device testing. No agent physical-device test is claimed. Automated WebKit acceptance is tracked separately and remains unresolved until a fresh passing run is recorded; these Chromium gallery captures do not resolve it.
+Current acceptance: **user-reported iPhone acceptance**; the user owns physical-device testing. No agent physical-device test is claimed. Focused Chromium and WebKit header/focus regressions now pass; this is not a full WebKit-suite acceptance claim, and these older Chromium gallery captures are not WebKit evidence.
 
 Actual application captures in Chromium, light/dark themes: desktop **1440 × 1000 CSS pixels**, mobile **390 × 844**. These are synthetic documentation fixtures, not personal conversations, provider benchmarks, native iPhone captures, or evidence of live-model acceptance. No paid generation or live Hub was used. The nine frames containing workers use `2812932` plus the worker-effort/session-cost refinement. Unaffected overview, configuration, mobile side-answer and isolated Hub frames are retained from the preceding gallery capture.
+
+These frames predate the compact touch New conversation button and fixed keyboard shortcuts. See [current chat behavior](../../CHAT.md); the gallery has not been regenerated for those refinements.
 
 The standard workspace contains only the E2E sample README/files. Model names, context figures, jobs, questions and answers are scripted. The preferences capture uses an isolated test Hub/account with an empty credential store. No authentication URLs, credentials, private filesystem paths, real costs, or original user photographs are included.
 
@@ -52,7 +54,7 @@ UATU_CAPTURE_CHAT_SCREENSHOTS=1 UATU_CAPTURE_HOLD_ONLY=1 bunx playwright test \
   tests/e2e/chat-screenshots.e2e.ts --project=e2e --workers=1 --grep 'desktop documentation gallery'
 ```
 
-Normal tests skip these writers. Review image privacy and captions before publication. Capture helpers assert the key rendered states; the gallery itself is not independent validation. Hold/queue regressions live in `tests/e2e/chat-hold-queue-regressions.e2e.ts`; the reference-workdock suite covers normal/short/mobile/enlarged-text layouts and independent scrolling. Nonzero viewport/fixed-origin checks are synthetic. Physical iPhone testing is user-owned, with user-reported acceptance as noted above; no agent native-device result is claimed. Local automated WebKit stalled at initial tab activation before reaching these checks.
+Normal tests skip these writers. Review image privacy and captions before publication. Capture helpers assert the key rendered states; the gallery itself is not independent validation. Hold/queue regressions live in `tests/e2e/chat-hold-queue-regressions.e2e.ts`; the reference-workdock suite covers normal/short/mobile/enlarged-text layouts and independent scrolling. Nonzero viewport/fixed-origin checks are synthetic. Physical iPhone testing is user-owned, with user-reported acceptance as noted above; no agent native-device result is claimed. The earlier WebKit initial-tab runtime blocker is resolved; current focused checks remain separate from these captures.
 
 To refresh only the nine frames containing worker metadata, preserving unrelated images:
 

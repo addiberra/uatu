@@ -28,11 +28,11 @@ export class CompactWorkersView {
 
   paint(conversation: string | null, workers: readonly CompactWorker[], stopping: ReadonlySet<string>, canStop: boolean): void {
     const focused = document.activeElement;
-    const focusedRow = focused instanceof Element && this.host.contains(focused) ? focused.closest<HTMLElement>("[data-worker-id]") : null;
+    const focusedRow = focused instanceof Element && this.host.contains(focused) ? focused.closest<HTMLLIElement>("[data-worker-id]") : null;
     const ids = new Set(workers.map(worker => worker.id));
     for (const [id, row] of this.rows) if (!ids.has(id)) { row.remove(); this.rows.delete(id); }
     const ordered = [...workers.filter(worker => workerIsActive(worker.state)), ...workers.filter(worker => !workerIsActive(worker.state))];
-    for (const [index, worker] of ordered.entries()) {
+    for (const worker of ordered) {
       let row = this.rows.get(worker.id);
       if (!row) {
         row = document.createElement("li");
@@ -114,8 +114,24 @@ export class CompactWorkersView {
         stop.setAttribute("aria-label", `Stop worker: ${worker.name}`);
         stop.title = worker.state === "unknown" ? "Status unknown — refresh before stopping" : `Stop worker: ${worker.name}`;
       } else stop?.remove();
-      // Append only where order actually changed; do not detach a focused row.
-      if (this.list.children[index] !== row) this.list.insertBefore(row, this.list.children[index] ?? null);
+    }
+    // Reorder siblings around the focused row. Moving that row itself with
+    // insertBefore drops native focus even though its buttons remain connected.
+    const orderedRows = ordered.map(worker => this.rows.get(worker.id)!);
+    const anchor = focusedRow && orderedRows.includes(focusedRow) ? focusedRow : null;
+    const anchorIndex = anchor ? orderedRows.indexOf(anchor) : -1;
+    if (anchor) {
+      let before = anchor;
+      for (let index = anchorIndex - 1; index >= 0; index--) {
+        const row = orderedRows[index]!;
+        if (row.nextElementSibling !== before) this.list.insertBefore(row, before);
+        before = row;
+      }
+    }
+    let cursor = anchor ? anchor.nextElementSibling : this.list.firstElementChild;
+    for (const row of orderedRows.slice(anchorIndex + 1)) {
+      if (row === cursor) cursor = cursor.nextElementSibling;
+      else this.list.insertBefore(row, cursor);
     }
     const settled = workers.filter(worker => !workerIsActive(worker.state));
     this.dismiss.hidden = !settled.length;

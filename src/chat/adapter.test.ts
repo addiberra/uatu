@@ -239,6 +239,546 @@ for (const outcome of ["unknown", "cancel-refused", "delivered-on-cancel", "deli
   }
 });
 
+for (const acknowledgement of ["accepted", "lost"] as const) for (const nextPhase of ["running", "completed"] as const) test(`real V2 late Stop ${acknowledgement} acknowledgement preserves a newer parent execution (${nextPhase})`, async () => {
+  const directory = process.cwd();
+  const fake = startOpenCodeV2Fake({ directory });
+  let release!: () => void, arrived!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const responseArrived = new Promise<void>(resolve => { arrived = resolve; });
+  let delay = false;
+  const transport = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const request = new Request(input, init);
+    const response = await fetch(request);
+    if (delay && request.method === "POST" && new URL(request.url).pathname.endsWith("/interrupt")) {
+      delay = false; arrived(); await gate;
+      if (acknowledgement === "lost") throw new Error("old Stop response lost");
+    }
+    return response;
+  }) as typeof fetch;
+  const provider = createOpenCodeV2Provider({ endpoint: fake.url, password: fake.password, directory, fetch: transport });
+  const adapter = new ChatAdapter({ provider, workspacePath: directory, coalesceWindowMs: 0 });
+  const pump = adapter.startEventPump();
+  try {
+    await waitUntil(() => fake.state().eventSubscribers > 0);
+    const parent = await provider.createSession("Late Stop vs native wake");
+    await adapter.prompt(parent.id, "initial", "Initial work");
+    const held = await adapter.prompt(parent.id, "held", "Must remain paused", undefined, undefined, undefined, undefined, "queue");
+    const child = fake.launchWorker(parent.id, true);
+    await waitUntil(() => adapter.projectionForTests(parent.id).items().some(item => item.type === "background_task"));
+    delay = true;
+    const stopping = adapter.abort(parent.id, "stop").then(value => ({ value }), error => ({ error }));
+    await responseArrived;
+    await waitUntil(() => !["running", "sending"].includes(adapter.projectionForTests(parent.id).status));
+    fake.settleWorker(child.childId, "completed", "Detached worker completed");
+    fake.wakeParent(parent.id);
+    await waitUntil(() => adapter.projectionForTests(parent.id).status === "running");
+    if (nextPhase === "completed") {
+      fake.finish(parent.id);
+      await waitUntil(() => adapter.projectionForTests(parent.id).status === "completed");
+    }
+    release();
+    const result = await stopping;
+    if (acknowledgement === "lost") expect(result).toHaveProperty("error");
+    else expect(result).toEqual({ value: { cancelled: true } });
+    expect(adapter.projectionForTests(parent.id).status).toBe(nextPhase);
+    expect(fake.state().sessions[parent.id]!.running).toBe(nextPhase === "running");
+    expect(adapter.activity().working).toBe(nextPhase === "running");
+    const snapshot = await adapter.history(parent.id);
+    expect(snapshot.queued).toEqual([expect.objectContaining({ id: held.messageId, paused: true })]);
+    expect(fake.state().calls.filter(call => call.includes("/prompt"))).toHaveLength(1);
+    // The new run is stoppable in its own right; Stop is not a future-turn ban.
+    if (nextPhase === "running") {
+      await adapter.abort(parent.id, "stop-new-run");
+      expect(adapter.projectionForTests(parent.id).status).toBe("interrupted");
+      expect(fake.state().sessions[parent.id]!.running).toBe(false);
+    }
+  } finally { release(); await adapter.stopEventPump(); await pump; await adapter.dispose(); await fake.stop(); }
+});
+
+for (const acknowledgement of ["accepted", "lost"] as const) for (const nextPhase of ["running", "completed"] as const) test(`real V2 public snapshots and summaries retain newer ${nextPhase} truth across eviction and the old Stop ${acknowledgement} response`, async () => {
+  const directory = process.cwd();
+  const fake = startOpenCodeV2Fake({ directory });
+  let release!: () => void, arrived!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const responseArrived = new Promise<void>(resolve => { arrived = resolve; });
+  let delay = false;
+  const transport = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const request = new Request(input, init);
+    const response = await fetch(request);
+    if (delay && request.method === "POST" && new URL(request.url).pathname.endsWith("/interrupt")) {
+      delay = false; arrived(); await gate;
+      if (acknowledgement === "lost") throw new Error("old Stop response lost after eviction");
+    }
+    return response;
+  }) as typeof fetch;
+  const provider = createOpenCodeV2Provider({ endpoint: fake.url, password: fake.password, directory, fetch: transport });
+  const adapter = new ChatAdapter({ provider, workspacePath: directory, maxProjections: 1, coalesceWindowMs: 0 });
+  const pump = adapter.startEventPump();
+  try {
+    await waitUntil(() => fake.state().eventSubscribers > 0);
+    const parent = await provider.createSession("Evicted native wake");
+    await adapter.prompt(parent.id, "initial", "Initial work");
+    const child = fake.launchWorker(parent.id, true);
+    await waitUntil(() => adapter.projectionForTests(parent.id).items().some(item => item.type === "background_task"));
+    delay = true;
+    const stopping = adapter.abort(parent.id, "stop").then(value => ({ value }), error => ({ error }));
+    await responseArrived;
+    await waitUntil(() => !["running", "sending"].includes(adapter.projectionForTests(parent.id).status));
+    fake.settleWorker(child.childId, "completed", "Wake after Stop");
+    fake.wakeParent(parent.id);
+    await waitUntil(() => adapter.projectionForTests(parent.id).status === "running");
+    if (nextPhase === "completed") {
+      fake.finish(parent.id);
+      await waitUntil(() => adapter.projectionForTests(parent.id).status === "completed");
+    }
+    const other = await provider.createSession("Navigation");
+    await adapter.history(other.id);
+    release();
+    const result = await stopping;
+    if (acknowledgement === "lost") expect(result).toHaveProperty("error");
+    else expect(result).toEqual({ value: { cancelled: true } });
+    expect(fake.state().sessions[parent.id]!.running).toBe(nextPhase === "running");
+    expect(adapter.activity().working).toBe(nextPhase === "running");
+    expect((await adapter.listConversations()).find(conversation => conversation.id === parent.id)!.status).toBe(nextPhase);
+    expect((await adapter.getConversation(parent.id)).status).toBe(nextPhase);
+    expect((await adapter.history(parent.id)).conversation.status).toBe(nextPhase);
+    const client = await adapter.subscribe(parent.id);
+    expect(client.snapshot.conversation.status).toBe(nextPhase);
+    client.events.cancel();
+    if (nextPhase === "running") {
+      await adapter.abort(parent.id, "stop-new-run");
+      expect(fake.state().sessions[parent.id]!.running).toBe(false);
+    }
+  } finally { release(); await adapter.stopEventPump(); await pump; await adapter.dispose(); await fake.stop(); }
+});
+
+test("real V2 fresh views use live event truth, not an unknown stored run or an obsolete pre-completion phase", async () => {
+  const directory = process.cwd();
+  const fake = startOpenCodeV2Fake({ directory });
+  const provider = createOpenCodeV2Provider({ endpoint: fake.url, password: fake.password, directory });
+  const adapter = new ChatAdapter({ provider, workspacePath: directory, maxProjections: 1, coalesceWindowMs: 0 });
+  let pump: Promise<void> | undefined;
+  try {
+    const unknown = await provider.createSession("No observed execution");
+    await provider.prompt(unknown.id, { id: "external-initial", text: "Unobserved native run", delivery: "queue" });
+    expect(fake.state().sessions[unknown.id]!.running).toBe(true);
+    expect((await adapter.getConversation(unknown.id)).status).not.toBe("running");
+    expect((await adapter.history(unknown.id)).conversation.status).not.toBe("running");
+    expect(adapter.activity().working).toBe(false);
+    pump = adapter.startEventPump();
+    await waitUntil(() => fake.state().eventSubscribers > 0);
+    const observed = await provider.createSession("Observed execution");
+    await adapter.prompt(observed.id, "initial", "Observed native run");
+    await waitUntil(() => adapter.projectionForTests(observed.id).status === "running");
+    fake.finish(observed.id);
+    await waitUntil(() => adapter.projectionForTests(observed.id).status === "completed");
+    const other = await provider.createSession("Evict completed view");
+    await adapter.history(other.id);
+    expect((await adapter.getConversation(observed.id)).status).not.toBe("running");
+    expect((await adapter.history(observed.id)).conversation.status).not.toBe("running");
+    expect(adapter.activity().working).toBe(false);
+  } finally { await adapter.stopEventPump(); await pump; await adapter.dispose(); await fake.stop(); }
+});
+
+test("real V2 unrelated inbox and sibling activity do not suppress a valid Stop acknowledgement after projection eviction", async () => {
+  const directory = process.cwd();
+  const fake = startOpenCodeV2Fake({ directory });
+  let release!: () => void, arrived!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const responseArrived = new Promise<void>(resolve => { arrived = resolve; });
+  let delay = false;
+  const transport = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const request = new Request(input, init);
+    const response = await fetch(request);
+    if (delay && request.method === "POST" && new URL(request.url).pathname.endsWith("/interrupt")) {
+      delay = false; arrived(); await gate;
+    }
+    return response;
+  }) as typeof fetch;
+  const provider = createOpenCodeV2Provider({ endpoint: fake.url, password: fake.password, directory, fetch: transport });
+  const adapter = new ChatAdapter({ provider, workspacePath: directory, maxProjections: 1, coalesceWindowMs: 0 });
+  const pump = adapter.startEventPump();
+  try {
+    await waitUntil(() => fake.state().eventSubscribers > 0);
+    const parent = await provider.createSession("Stop parent");
+    const sibling = await provider.createSession("Other parent");
+    await adapter.prompt(parent.id, "initial", "Initial work");
+    const child = fake.launchWorker(parent.id, true);
+    await waitUntil(() => adapter.projectionForTests(parent.id).items().some(item => item.type === "background_task"));
+    delay = true;
+    const stopping = adapter.abort(parent.id, "stop");
+    await responseArrived;
+    await waitUntil(() => !["running", "sending"].includes(adapter.projectionForTests(parent.id).status));
+    fake.settleWorker(child.childId, "completed", "Notification is not a parent execution");
+    await waitUntil(() => adapter.projectionForTests(parent.id).items().some(item => item.type === "background_task" && item.status === "completed"));
+    await adapter.prompt(sibling.id, "sibling", "Unrelated running conversation");
+    await waitUntil(() => adapter.projectionForTests(sibling.id).status === "running");
+    await adapter.history(sibling.id); // Evict the captured parent projection.
+    release();
+    expect(await stopping).toEqual({ cancelled: true });
+    expect(adapter.projectionForTests(parent.id).status).toBe("interrupted");
+    expect(fake.state().sessions[parent.id]!.running).toBe(false);
+    expect(fake.state().sessions[sibling.id]!.running).toBe(true);
+  } finally { release(); await adapter.stopEventPump(); await pump; await adapter.dispose(); await fake.stop(); }
+});
+
+for (const firstDelivery of ["steer", "queue"] as const) test(`real V2 same-tick conversion preserves submission order (${firstDelivery} first)`, async () => {
+  const directory = process.cwd();
+  const fake = startOpenCodeV2Fake({ directory });
+  const provider = createOpenCodeV2Provider({ endpoint: fake.url, password: fake.password, directory });
+  const adapter = new ChatAdapter({ provider, workspacePath: directory, coalesceWindowMs: 0, steerWithdrawTimeoutMs: 80 });
+  let clock: ReturnType<typeof spyOn> | undefined;
+  try {
+    const session = await provider.createSession("Same tick order");
+    await adapter.prompt(session.id, "initial", "Initial work");
+    const tick = Date.now();
+    clock = spyOn(Date, "now").mockReturnValue(tick);
+    const first = await adapter.prompt(session.id, "first", "A", undefined, undefined, undefined, undefined, firstDelivery);
+    const second = await adapter.prompt(session.id, "second", "B", undefined, undefined, undefined, undefined, firstDelivery === "steer" ? "queue" : "steer");
+    const native = firstDelivery === "steer" ? first : second;
+    const converted = await adapter.changeDelivery(session.id, native.messageId, "convert", "queue");
+    expect(await adapter.changeDelivery(session.id, native.messageId, "convert", "queue")).toEqual(converted);
+    const queued = (await adapter.history(session.id)).queued!;
+    expect(queued.map(entry => entry.text)).toEqual(["A", "B"]);
+    expect(queued.map(entry => entry.queuedAt)).toEqual([tick, tick]);
+    expect(new Set(queued.map(entry => entry.submissionId)).size).toBe(2);
+  } finally { clock?.mockRestore(); await adapter.dispose(); await fake.stop(); }
+});
+
+test("real V2 native list order places an earlier recovered entry before a locally known admission", async () => {
+  const directory = process.cwd();
+  const fake = startOpenCodeV2Fake({ directory });
+  const provider = createOpenCodeV2Provider({ endpoint: fake.url, password: fake.password, directory });
+  const adapter = new ChatAdapter({ provider, workspacePath: directory, coalesceWindowMs: 0, steerWithdrawTimeoutMs: 80 });
+  try {
+    const session = await provider.createSession("Native order vs local discovery");
+    await adapter.prompt(session.id, "initial", "Initial work");
+    const external = await provider.prompt(session.id, { id: "external-B", text: "B external first", delivery: "steer" });
+    const known = await adapter.prompt(session.id, "local-A", "A locally known", undefined, undefined, undefined, undefined, "steer");
+    expect((await provider.listPendingInbox!(session.id)).map(entry => entry.id)).toEqual([external.messageId, known.messageId]);
+    expect((await adapter.history(session.id)).queued!.map(entry => entry.text)).toEqual(["B external first", "A locally known"]);
+  } finally { await adapter.dispose(); await fake.stop(); }
+});
+
+test("real V2 recovering native enqueue order does not rewrite an older held submission's original position", async () => {
+  const directory = process.cwd();
+  const fake = startOpenCodeV2Fake({ directory });
+  const provider = createOpenCodeV2Provider({ endpoint: fake.url, password: fake.password, directory });
+  const adapter = new ChatAdapter({ provider, workspacePath: directory, coalesceWindowMs: 0, steerWithdrawTimeoutMs: 80 });
+  try {
+    const session = await provider.createSession("Distinct ordering domains");
+    await adapter.prompt(session.id, "initial", "Initial work");
+    const held = await adapter.prompt(session.id, "held-A", "A original held", undefined, undefined, undefined, undefined, "queue");
+    const original = (await adapter.history(session.id)).queued![0]!;
+    const external = await provider.prompt(session.id, { id: "external-B", text: "B external", delivery: "steer" });
+    const native = await adapter.changeDelivery(session.id, held.messageId, "steer-A", "steer");
+    expect((await adapter.history(session.id)).queued!.map(entry => entry.text)).toEqual(["B external", "A original held"]);
+    await adapter.changeDelivery(session.id, external.messageId, "hold-B", "queue");
+    await adapter.changeDelivery(session.id, native.messageId, "hold-A", "queue");
+    const restored = (await adapter.history(session.id)).queued!;
+    expect(restored.map(entry => entry.text)).toEqual(["A original held", "B external"]);
+    expect(restored[0]!.submissionId).toBe(original.submissionId);
+    expect(restored[0]!.queuedAt).toBe(original.queuedAt);
+  } finally { await adapter.dispose(); await fake.stop(); }
+});
+
+test("real V2 native events order an earlier external enqueue before an admission whose HTTP acknowledgement arrived first", async () => {
+  const directory = process.cwd();
+  const fake = startOpenCodeV2Fake({ directory });
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  let holdEvents = false;
+  const transport = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const request = new Request(input, init);
+    const response = await fetch(request);
+    if (new URL(request.url).pathname === "/api/event" && response.body) {
+      return new Response(response.body.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
+        async transform(chunk, controller) { if (holdEvents) await gate; controller.enqueue(chunk); },
+      })), { status: response.status, headers: response.headers });
+    }
+    return response;
+  }) as typeof fetch;
+  const provider = createOpenCodeV2Provider({ endpoint: fake.url, password: fake.password, directory, fetch: transport });
+  const adapter = new ChatAdapter({ provider, workspacePath: directory, coalesceWindowMs: 0 });
+  const pump = adapter.startEventPump();
+  let clientPump: Promise<void> | undefined, cancelClient: (() => void) | undefined;
+  try {
+    await waitUntil(() => fake.state().eventSubscribers > 0);
+    const session = await provider.createSession("Native event order vs acknowledgement");
+    await adapter.prompt(session.id, "initial", "Initial work");
+    const client = await adapter.subscribe(session.id);
+    cancelClient = () => client.events.cancel();
+    let browser = projectionFromSnapshot(client.snapshot);
+    clientPump = (async () => { for await (const event of client.events) browser = applyChatEvent(browser, event).projection; })();
+    holdEvents = true;
+    await provider.prompt(session.id, { id: "external-B", text: "B external first", delivery: "steer" });
+    await adapter.prompt(session.id, "local-A", "A locally known", undefined, undefined, undefined, undefined, "steer");
+    await waitUntil(() => browser.queued.some(entry => entry.text === "A locally known"));
+    expect(browser.queued.map(entry => entry.text)).toEqual(["A locally known"]);
+    release(); holdEvents = false;
+    await waitUntil(() => browser.queued.some(entry => entry.text === "B external first"));
+    // No history/list reconciliation can mask stream ordering here.
+    expect(browser.queued.map(entry => entry.text)).toEqual(["B external first", "A locally known"]);
+  } finally { release(); cancelClient?.(); await clientPump; await adapter.stopEventPump(); await pump; await adapter.dispose(); await fake.stop(); }
+});
+
+for (const omitted of ["A", "B", "C"] as const) test(`real V2 a filtered native list retains uncertain ${omitted} at its stable neighbour position`, async () => {
+  const directory = process.cwd();
+  const fake = startOpenCodeV2Fake({ directory });
+  let filter = false, omittedId = "";
+  const transport = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const request = new Request(input, init);
+    if (request.method === "DELETE") return Response.json({ error: "cancellation refused" }, { status: 403 });
+    const response = await fetch(request);
+    if (filter && request.method === "GET" && new URL(request.url).pathname.endsWith("/inbox")) {
+      const body = await response.json() as { data: Array<{ id: string }> };
+      return Response.json({ ...body, data: body.data.filter(entry => entry.id !== omittedId) });
+    }
+    return response;
+  }) as typeof fetch;
+  const provider = createOpenCodeV2Provider({ endpoint: fake.url, password: fake.password, directory, fetch: transport });
+  const adapter = new ChatAdapter({ provider, workspacePath: directory, coalesceWindowMs: 0, steerWithdrawTimeoutMs: 60 });
+  try {
+    const session = await provider.createSession("Filtered native list");
+    await adapter.prompt(session.id, "initial", "Initial work");
+    for (const text of ["A", "B", "C"]) {
+      const accepted = await adapter.prompt(session.id, text, text, undefined, undefined, undefined, undefined, "steer");
+      if (text === omitted) omittedId = accepted.messageId;
+    }
+    await adapter.history(session.id); // Establish native list order first.
+    await expect(adapter.changeDelivery(session.id, omittedId, "uncertain", "queue")).rejects.toBeInstanceOf(SteerWithdrawalUnconfirmedError);
+    filter = true;
+    const snapshot = await adapter.history(session.id);
+    expect(snapshot.queued!.map(entry => entry.text)).toEqual(["A", "B", "C"]);
+    expect(snapshot.queued!.filter(entry => entry.id === omittedId)).toEqual([expect.objectContaining({ unconfirmed: true })]);
+    expect(fake.state().sessions[session.id]!.pending.map(entry => entry.id)).toHaveLength(3);
+    expect(snapshot.queued!.some(entry => "nativeOrderKnown" in entry)).toBe(false);
+    filter = false;
+    expect((await adapter.history(session.id)).queued!.map(entry => entry.text)).toEqual(["A", "B", "C"]);
+  } finally { await adapter.dispose(); await fake.stop(); }
+});
+
+test("real V2 a newer native enqueue survives an older list read without reordering that list", async () => {
+  const directory = process.cwd();
+  const fake = startOpenCodeV2Fake({ directory });
+  let release!: () => void, arrived!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const listArrived = new Promise<void>(resolve => { arrived = resolve; });
+  let delay = false;
+  const transport = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const request = new Request(input, init);
+    const response = await fetch(request);
+    if (delay && request.method === "GET" && new URL(request.url).pathname.endsWith("/inbox")) {
+      delay = false; arrived(); await gate;
+    }
+    return response;
+  }) as typeof fetch;
+  const provider = createOpenCodeV2Provider({ endpoint: fake.url, password: fake.password, directory, fetch: transport });
+  const adapter = new ChatAdapter({ provider, workspacePath: directory, coalesceWindowMs: 0 });
+  const pump = adapter.startEventPump();
+  let clientPump: Promise<void> | undefined, cancelClient: (() => void) | undefined;
+  try {
+    await waitUntil(() => fake.state().eventSubscribers > 0);
+    const session = await provider.createSession("List vs newer event");
+    await adapter.prompt(session.id, "initial", "Initial work");
+    const client = await adapter.subscribe(session.id);
+    cancelClient = () => client.events.cancel();
+    let browser = projectionFromSnapshot(client.snapshot);
+    clientPump = (async () => { for await (const event of client.events) browser = applyChatEvent(browser, event).projection; })();
+    await provider.prompt(session.id, { id: "external-B", text: "B", delivery: "steer" });
+    await adapter.prompt(session.id, "local-A", "A", undefined, undefined, undefined, undefined, "steer");
+    await waitUntil(() => browser.queued.length === 2);
+    delay = true;
+    const reading = adapter.history(session.id);
+    await listArrived;
+    await provider.prompt(session.id, { id: "external-C", text: "C", delivery: "steer" });
+    await waitUntil(() => browser.queued.some(entry => entry.text === "C"));
+    release();
+    expect((await reading).queued!.map(entry => entry.text)).toEqual(["B", "A", "C"]);
+    expect((await adapter.history(session.id)).queued!.map(entry => entry.text)).toEqual(["B", "A", "C"]);
+  } finally { release(); cancelClient?.(); await clientPump; await adapter.stopEventPump(); await pump; await adapter.dispose(); await fake.stop(); }
+});
+
+test("real V2 previously unknown native entries retain observed provider order through reverse withdrawal", async () => {
+  const directory = process.cwd();
+  const fake = startOpenCodeV2Fake({ directory });
+  const provider = createOpenCodeV2Provider({ endpoint: fake.url, password: fake.password, directory });
+  const adapter = new ChatAdapter({ provider, workspacePath: directory, coalesceWindowMs: 0, steerWithdrawTimeoutMs: 80 });
+  try {
+    const session = await provider.createSession("Recovered native order");
+    await adapter.prompt(session.id, "initial", "Initial work");
+    const first = await provider.prompt(session.id, { id: "z-first", text: "Z first", delivery: "steer" });
+    const second = await provider.prompt(session.id, { id: "a-second", text: "A second", delivery: "steer" });
+    const recovered = (await adapter.history(session.id)).queued!;
+    expect(recovered.map(entry => entry.text)).toEqual(["Z first", "A second"]);
+    expect(recovered.map(entry => entry.submissionId)).toEqual([first.messageId, second.messageId]);
+    // The list establishes only native ordering, not unavailable chronology
+    // against submissions that an earlier/different client did not record.
+    await adapter.prompt(session.id, "later", "Held later", undefined, undefined, undefined, undefined, "queue");
+    await adapter.changeDelivery(session.id, second.messageId, "hold-second", "queue");
+    await adapter.changeDelivery(session.id, first.messageId, "hold-first", "queue");
+    expect((await adapter.history(session.id)).queued!.map(entry => entry.text)).toEqual(["Z first", "A second", "Held later"]);
+  } finally { await adapter.dispose(); await fake.stop(); }
+});
+
+test("real V2 late held-to-steer acknowledgement and list recovery retain one submission-order owner", async () => {
+  const directory = process.cwd();
+  const fake = startOpenCodeV2Fake({ directory });
+  let release!: () => void, arrived!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const responseArrived = new Promise<void>(resolve => { arrived = resolve; });
+  let delay = false;
+  const transport = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const request = new Request(input, init);
+    const response = await fetch(request);
+    if (delay && request.method === "POST" && new URL(request.url).pathname.endsWith("/prompt")) {
+      delay = false; arrived(); await gate;
+    }
+    return response;
+  }) as typeof fetch;
+  const provider = createOpenCodeV2Provider({ endpoint: fake.url, password: fake.password, directory, fetch: transport });
+  const adapter = new ChatAdapter({ provider, workspacePath: directory, coalesceWindowMs: 0, steerAdmissionTimeoutMs: 30, steerWithdrawTimeoutMs: 80 });
+  let clock: ReturnType<typeof spyOn> | undefined;
+  try {
+    const session = await provider.createSession("Late conversion recovery");
+    await adapter.prompt(session.id, "initial", "Initial work");
+    clock = spyOn(Date, "now").mockReturnValue(Date.now());
+    const first = await adapter.prompt(session.id, "first", "A", undefined, undefined, undefined, undefined, "queue");
+    const second = await adapter.prompt(session.id, "second", "B", undefined, undefined, undefined, undefined, "steer");
+    await adapter.prompt(session.id, "third", "C", undefined, undefined, undefined, undefined, "queue");
+    const original = (await adapter.history(session.id)).queued!.find(entry => entry.text === "A")!;
+    delay = true;
+    const switching = adapter.changeDelivery(session.id, first.messageId, "switch-A", "steer");
+    const rejected = expect(switching).rejects.toBeInstanceOf(OperationOutcomeUnknownError);
+    await responseArrived; await rejected;
+    const recovered = (await adapter.history(session.id)).queued!;
+    expect(recovered.filter(entry => entry.text === "A")).toHaveLength(1);
+    // B entered the native inbox before held A was switched to Steer. Its
+    // native position differs from A's original held submission position.
+    expect(recovered.filter(entry => entry.delivery === "steer").map(entry => entry.text)).toEqual(["B", "A"]);
+    expect(recovered.find(entry => entry.text === "A")!.submissionId).toBe(original.submissionId);
+    const nativeA = recovered.find(entry => entry.text === "A")!.id;
+    release();
+    // Withdrawal is now independent of the old, uncertain composite receipt.
+    await adapter.changeDelivery(session.id, second.messageId, "hold-B", "queue");
+    await adapter.changeDelivery(session.id, nativeA, "hold-A", "queue");
+    const held = (await adapter.history(session.id)).queued!;
+    expect(held.map(entry => entry.text)).toEqual(["A", "B", "C"]);
+    expect(held.filter(entry => entry.submissionId === original.submissionId)).toHaveLength(1);
+    expect(held.find(entry => entry.text === "A")!.queuedAt).toBe(original.queuedAt);
+    await expect(adapter.changeDelivery(session.id, first.messageId, "switch-A", "steer")).rejects.toBeInstanceOf(OperationOutcomeUnknownError);
+  } finally { release(); clock?.mockRestore(); await adapter.dispose(); await fake.stop(); }
+});
+
+test("real V2 uncertain withdrawal preserves pending order and ownership across reconnect and explicit cancellation retry", async () => {
+  const directory = process.cwd();
+  const fake = startOpenCodeV2Fake({ directory });
+  let refuse = true;
+  const transport = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const request = new Request(input, init);
+    if (refuse && request.method === "DELETE") return Response.json({ error: "cancellation refused" }, { status: 403 });
+    return fetch(request);
+  }) as typeof fetch;
+  const provider = createOpenCodeV2Provider({ endpoint: fake.url, password: fake.password, directory, fetch: transport });
+  const adapter = new ChatAdapter({ provider, workspacePath: directory, coalesceWindowMs: 0, steerWithdrawTimeoutMs: 80 });
+  let clock: ReturnType<typeof spyOn> | undefined;
+  let pump: Promise<void> | undefined;
+  try {
+    const session = await provider.createSession("Uncertain withdrawal ordering");
+    await adapter.prompt(session.id, "initial", "Initial work");
+    clock = spyOn(Date, "now").mockReturnValue(Date.now());
+    const first = await adapter.prompt(session.id, "first", "A", undefined, undefined, undefined, undefined, "steer");
+    const second = await adapter.prompt(session.id, "second", "B", undefined, undefined, undefined, undefined, "queue");
+    await adapter.prompt(session.id, "third", "C", undefined, undefined, undefined, undefined, "steer");
+    await expect(adapter.changeDelivery(session.id, first.messageId, "uncertain", "queue")).rejects.toBeInstanceOf(SteerWithdrawalUnconfirmedError);
+    clock.mockRestore(); clock = undefined;
+    await adapter.abort(session.id, "stop");
+    pump = adapter.startEventPump();
+    await waitUntil(() => fake.state().eventSubscribers > 0);
+    await adapter.stopEventPump(); await pump;
+    pump = adapter.startEventPump();
+    await waitUntil(() => fake.state().eventSubscribers > 0);
+    const pending = (await adapter.history(session.id)).queued!;
+    expect(pending.filter(entry => entry.delivery === "steer").map(entry => entry.text)).toEqual(["A", "C"]);
+    expect(pending.filter(entry => entry.text === "A")).toEqual([expect.objectContaining({ unconfirmed: true, paused: true })]);
+    expect(pending.filter(entry => entry.id === second.messageId)).toHaveLength(1);
+    await expect(adapter.changeDelivery(session.id, first.messageId, "no-duplicate", "queue")).rejects.toBeInstanceOf(SteerWithdrawalUnconfirmedError);
+    refuse = false;
+    await adapter.removeQueued(session.id, first.messageId, "retry-remove");
+    const remaining = (await adapter.history(session.id)).queued!;
+    expect(remaining.map(entry => entry.text)).toEqual(["C", "B"]); // Native group, then held group.
+    expect(fake.state().calls.filter(call => call.includes("/prompt"))).toHaveLength(3);
+  } finally { clock?.mockRestore(); await adapter.stopEventPump(); await pump; await adapter.dispose(); await fake.stop(); }
+});
+
+for (const timestamps of ["equal", "increasing", "backwards"] as const) test(`real V2 repeated delivery switches preserve known order with ${timestamps} timestamps through Stop and reconnect`, async () => {
+  const directory = process.cwd();
+  const fake = startOpenCodeV2Fake({ directory });
+  const provider = createOpenCodeV2Provider({ endpoint: fake.url, password: fake.password, directory });
+  const adapter = new ChatAdapter({ provider, workspacePath: directory, coalesceWindowMs: 0, steerWithdrawTimeoutMs: 80 });
+  let clock: ReturnType<typeof spyOn> | undefined;
+  let pump: Promise<void> | undefined;
+  try {
+    const session = await provider.createSession("Repeated switches");
+    await adapter.prompt(session.id, "initial", "Initial work");
+    const base = Date.now();
+    let tick = base;
+    clock = spyOn(Date, "now").mockImplementation(() => tick);
+    const ids = new Map<string, string>();
+    const submissions = new Map<string, string | undefined>();
+    const stamps = new Map<string, number>();
+    for (const [index, text] of ["A", "B", "C", "D"].entries()) {
+      tick = base + (timestamps === "equal" ? 0 : timestamps === "increasing" ? index * 10 : -index * 10);
+      const accepted = await adapter.prompt(session.id, `submit-${text}`, text, undefined, undefined, undefined, undefined, index % 2 ? "queue" : "steer");
+      ids.set(text, accepted.messageId);
+      const entry = (await adapter.history(session.id)).queued!.find(entry => entry.text === text)!;
+      submissions.set(text, entry.submissionId);
+      stamps.set(text, entry.queuedAt);
+    }
+    const switchTo = async (text: string, delivery: MessageDelivery, request: string) => {
+      const result = await adapter.changeDelivery(session.id, ids.get(text)!, request, delivery);
+      ids.set(text, result.messageId);
+    };
+    // Withdraw the later native entry first, then the earlier one. Repeating
+    // both directions must not turn conversion order into submission order.
+    await switchTo("C", "queue", "hold-C");
+    await switchTo("A", "queue", "hold-A");
+    for (let round = 0; round < 2; round++) {
+      expect((await adapter.history(session.id)).queued!.map(entry => entry.text)).toEqual(["A", "B", "C", "D"]);
+      for (const text of ["D", "B", "A", "C"]) await switchTo(text, "steer", `steer-${round}-${text}`);
+      expect((await adapter.history(session.id)).queued!.map(entry => entry.text)).toEqual(["D", "B", "A", "C"]);
+      for (const text of ["B", "D", "C", "A"]) await switchTo(text, "queue", `hold-${round}-${text}`);
+    }
+    clock.mockRestore(); clock = undefined;
+    await adapter.abort(session.id, "stop");
+    pump = adapter.startEventPump();
+    await waitUntil(() => fake.state().eventSubscribers > 0);
+    await adapter.stopEventPump(); await pump;
+    pump = adapter.startEventPump();
+    await waitUntil(() => fake.state().eventSubscribers > 0);
+    const recovered = (await adapter.history(session.id)).queued!;
+    expect(recovered.map(entry => entry.text)).toEqual(["A", "B", "C", "D"]);
+    expect(recovered.every(entry => entry.paused)).toBe(true);
+    for (const entry of recovered) {
+      expect(entry.submissionId).toBe(submissions.get(entry.text));
+      expect(entry.queuedAt).toBe(stamps.get(entry.text)!);
+      expect(entry).not.toHaveProperty("submissionOrder");
+    }
+    // Explicitly wake in known submission order, then verify the real native
+    // batch is delivered once, with no additional prompt from the held queue.
+    for (const text of ["A", "B", "C", "D"]) await switchTo(text, "steer", `resume-${text}`);
+    fake.step(session.id);
+    await waitUntil(() => adapter.projectionForTests(session.id).items().filter(item => item.type === "user_message" && ["A", "B", "C", "D"].includes(item.text)).length === 4);
+    expect((await adapter.history(session.id)).queued).toEqual([]);
+    const messages = adapter.projectionForTests(session.id).items().filter(item => item.type === "user_message" && ["A", "B", "C", "D"].includes(item.text));
+    expect(messages.map(item => item.type === "user_message" ? item.text : "")).toEqual(["A", "B", "C", "D"]);
+    expect(new Set(messages.map(item => item.id)).size).toBe(4);
+  } finally {
+    clock?.mockRestore();
+    await adapter.stopEventPump(); await pump; await adapter.dispose(); await fake.stop();
+  }
+});
+
 test("real V2 Stop with only native steers keeps a later Queue conversion dormant", async () => {
   const directory = process.cwd();
   const fake = startOpenCodeV2Fake({ directory });
@@ -7539,8 +8079,8 @@ describe("steering (opencode-v2-steering)", () => {
     const watch = await watchQueue(adapter);
     provider.configurations.set("session", { model: { providerId: "anthropic", modelId: "claude" }, mode: "build" });
     adapter.projectionForTests("session").statusUpdate("running");
-    // Spaced by a clock tick each: submission order is by time, and three
-    // submissions in one millisecond would tie.
+    // Distinct timestamps cover the ordinary case; actual V2 regressions also
+    // cover same-tick submissions and wall-clock rollback.
     const older = await queue("q-1", "held first");
     await Bun.sleep(2);
     const steered = await steer("s-1", "steer me");
