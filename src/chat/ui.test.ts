@@ -33,6 +33,116 @@ if (process.env[CHILD_PROCESS_FLAG] !== "1") {
   });
 } else {
 describe("chat reversible-history composer", () => {
+  for (const status of ["running", "idle"] as const) test(`held command paths retain ${status} steering controls while actual commands do not`, async () => {
+    const { document, window } = parseHTML(html);
+    installDomGlobals(document, window);
+    document.documentElement.setAttribute("data-ui-mode", "desktop");
+    document.documentElement.setAttribute("data-chat-panel", "open");
+    stubConversationSelect(document);
+    const entries = ["/build", "/build notes", "/build/notes.md", "/unknown", "/Build", "/provider:build notes"];
+    const api = {
+      status: async () => [{ agent: { id: "test", name: "Test" }, availability: { state: "ready", version: "test", agent: { id: "test", name: "Test", capabilities: ["commands", "steering", "send-now"] } } }],
+      conversations: async () => [conversation("one")],
+      commands: async () => ["build", "provider:build"].map(name => ({ name, description: name, argumentHint: "", kind: "command" })),
+      models: async () => [], modes: async () => [],
+      snapshot: async () => ({ ...snapshot("one"), conversation: { ...conversation("one"), status }, queued: entries.map((text, index) => ({ id: `held-${index}`, text, queuedAt: 1, delivery: "queue" })) }),
+      stream: () => ({ close() {} }), inventoryStream: () => ({ close() {} }), attachmentUrl: () => "",
+    } as unknown as ChatApiClient;
+    const { initChat } = await import(`./ui.ts?command-path-controls=${Date.now()}`);
+    initChat(api);
+    try {
+      const select = document.querySelector<HTMLSelectElement>("#chat-conversation-select")!;
+      await waitUntil(() => select.querySelector('option[value="one"]') !== null);
+      select.value = "one";
+      select.dispatchEvent(new window.Event("change", { bubbles: true }));
+      const action = status === "running" ? "steer" : "send-now";
+      await waitUntil(() => document.querySelector(`[data-queue-${action}="held-3"]`) !== null);
+      await waitUntil(() => document.querySelector(`[data-queue-${action}="held-0"]`) === null);
+      for (const [index, expected] of [false, false, true, true, true, false].entries()) {
+        expect(!!document.querySelector(`[data-queue-${action}="held-${index}"]`), entries[index]).toBe(expected);
+      }
+    } finally { window.dispatchEvent(new window.Event("pagehide")); }
+  });
+  for (const outcome of ["lost", "invalid-json", "missing-ack", "gateway", "unknown", "refused-400", "refused-409", "path-lost", "command-refused", "queue-500"] as const) test(`standalone busy input preserves ${outcome} without replay or draft loss`, async () => {
+    const { document, window } = parseHTML(html);
+    installDomGlobals(document, window);
+    const values = new Map<string, string>();
+    Object.defineProperty(window, "localStorage", { configurable: true, value: {
+      getItem: (key: string) => values.get(key) ?? null,
+      setItem: (key: string, value: string) => values.set(key, value),
+      removeItem: (key: string) => values.delete(key),
+    } });
+    document.documentElement.setAttribute("data-ui-mode", "desktop");
+    document.documentElement.setAttribute("data-chat-panel", "open");
+    stubConversationSelect(document);
+    const { ChatApiClient } = await import("./client");
+    const response = deferred<Response>();
+    let calls = 0, reads = 0, requestId = "", delivery: unknown;
+    const transport = new ChatApiClient(async (_url, init) => {
+      calls++;
+      const body = JSON.parse(String(init?.body));
+      requestId = body.requestId; delivery = body.delivery;
+      return response.promise;
+    });
+    const running = { ...conversation("one"), status: "running" as const };
+    const api = {
+      status: async () => [{ agent: { id: "test", name: "Test" }, availability: { state: "ready", version: "test", agent: { id: "test", name: "Test", capabilities: ["commands", "steering", "background-blocking-work"] } } }],
+      conversations: async () => [running], commands: async () => [{ name: "build", description: "Build", argumentHint: "", kind: "command" }], models: async () => [], modes: async () => [],
+      snapshot: async () => { reads++; return { ...snapshot("one"), conversation: running }; },
+      prompt: transport.prompt.bind(transport), stream: () => ({ close() {} }), inventoryStream: () => ({ close() {} }), attachmentUrl: () => "",
+    } as unknown as ChatApiClient;
+    const { initChat } = await import(`./ui.ts?standalone-loss=${outcome}-${Date.now()}`);
+    initChat(api);
+    try {
+      const select = document.querySelector<HTMLSelectElement>("#chat-conversation-select")!;
+      await waitUntil(() => select.querySelector('option[value="one"]') !== null);
+      select.value = "one";
+      select.dispatchEvent(new window.Event("change", { bubbles: true }));
+      const input = document.querySelector<HTMLTextAreaElement>("#chat-input")!;
+      await waitUntil(() => !input.disabled && reads > 0);
+      const text = outcome === "path-lost" ? "/build/notes.md" : outcome === "command-refused" ? "/build notes" : "Original steer A";
+      input.value = text;
+      input.dispatchEvent(new window.Event("input", { bubbles: true }));
+      if (outcome === "path-lost") expect(document.querySelector("#chat-send")!.getAttribute("aria-label")).toContain("steer");
+      const before = reads;
+      const event = new window.Event("submit", { bubbles: true, cancelable: true });
+      const { presentationLocalStorage } = await import("../shell/presentation-storage");
+      if (outcome === "queue-500") presentationLocalStorage()?.setItem("chat-delivery", "queue");
+      document.querySelector("#chat-composer")!.dispatchEvent(event);
+      await waitUntil(() => calls === 1);
+      input.value = "New draft C";
+      input.dispatchEvent(new window.Event("input", { bubbles: true }));
+      const refused = outcome.startsWith("refused") || outcome === "command-refused" || outcome === "queue-500";
+      if (outcome === "lost" || outcome === "path-lost") response.reject(new TypeError("Failed to fetch"));
+      else if (outcome === "invalid-json") response.resolve(new Response("not json", { status: 202 }));
+      else if (outcome === "missing-ack") response.resolve(Response.json({}, { status: 202 }));
+      else response.resolve(Response.json({ error: "Refused or unknown", ...(outcome === "unknown" ? { code: "operation_outcome_unknown" } : {}) }, { status: outcome === "gateway" ? 502 : outcome === "queue-500" ? 500 : outcome === "refused-400" ? 400 : 409 }));
+      await waitUntil(() => refused ? document.querySelector("#chat-composer-error")!.textContent!.includes("Draft restored") : document.querySelector("#chat-action-feedback")!.textContent!.includes("Status checked"));
+      expect(document.querySelector('meta[name="uatu-hub"]')).toBeNull();
+      expect(delivery).toBe(outcome === "queue-500" ? "queue" : "steer");
+      if (refused) {
+        expect(input.value).toBe(`${text}\nNew draft C`);
+        expect(reads).toBe(before);
+        expect(document.querySelector("#chat-action-feedback")!.textContent).not.toContain("unconfirmed");
+      } else {
+        expect(input.value).toBe("New draft C");
+        expect(document.querySelector("#chat-composer-error")!.textContent).not.toContain("Draft restored");
+        const feedback = document.querySelector("#chat-action-feedback")!.textContent!;
+        expect(feedback).toContain(text);
+        expect(feedback).toContain(requestId);
+        expect(feedback).toContain("acceptance still unconfirmed");
+        expect(reads).toBe(before + 1);
+        await waitUntil(() => document.querySelector("#chat-items")!.textContent!.includes("Acceptance unconfirmed"));
+      }
+      window.dispatchEvent(new window.Event("online"));
+      await Promise.resolve();
+      expect(calls).toBe(1);
+    } finally {
+      const { presentationLocalStorage } = await import("../shell/presentation-storage");
+      presentationLocalStorage()?.removeItem("chat-delivery");
+      window.dispatchEvent(new window.Event("pagehide"));
+    }
+  });
   for (const firstOutcome of ["steer", "rejected", "unknown", "forced-steer", "queue-with-new-stage"] as const) test(`staged model survives ${firstOutcome} and the next queue uses it`, async () => {
     const { document, window } = parseHTML(html);
     installDomGlobals(document, window);

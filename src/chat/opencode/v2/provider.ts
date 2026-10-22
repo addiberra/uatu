@@ -984,8 +984,7 @@ export class OpenCodeV2Provider implements ChatProvider {
   async listPendingInbox(sessionId: string): Promise<PendingInboxEntry[]> {
     const entries = await this.client.session.inbox.list({ sessionID: sessionId });
     return (entries as Array<Record<string, unknown>>).flatMap(entry => {
-      if (entry.type !== "user" || entry.delivery !== "queue" && entry.delivery !== "steer") return [];
-      if (entry.delivery !== "steer") return [];
+      if (entry.type !== "user" || entry.delivery !== "steer") return [];
       const pending = pendingInboxEntry(entry);
       return pending ? [pending] : [];
     });

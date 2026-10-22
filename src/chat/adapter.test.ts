@@ -6119,6 +6119,96 @@ describe("steering (opencode-v2-steering)", () => {
     } finally { await adapter.dispose(); }
   });
 
+  for (const failure of ["response-lost", "cancel-hangs", "inbox-hangs", "history-hangs", "history-fails", "cancel-unavailable"] as const) test(`withdrawal ${failure} retains the draft and releases Stop within the total deadline`, async () => {
+    const { adapter, provider, steer, inbox } = steering({ steerWithdrawTimeoutMs: 10 });
+    const pump = adapter.startEventPump();
+    try {
+      adapter.projectionForTests("session").statusUpdate("running");
+      const accepted = await steer("original", "retain original input");
+      const never = new Promise<never>(() => {});
+      provider.cancelInbox = async (_session, id) => {
+        provider.cancelledInbox.push(id);
+        provider.pendingInbox = [];
+        if (failure === "response-lost") throw new Error("response lost after apply");
+        if (failure === "cancel-hangs") await never;
+      };
+      if (failure === "cancel-unavailable") provider.cancelInbox = undefined;
+      if (failure === "inbox-hangs") provider.listPendingInbox = () => never;
+      if (failure === "history-hangs") provider.listMessages = () => never;
+      if (failure === "history-fails") provider.listMessages = async () => { throw new Error("history unavailable"); };
+      const removal = adapter.removeQueued("session", accepted.messageId, "remove").catch(error => error);
+      const stop = adapter.abort("session", "stop");
+      expect(await Promise.race([removal, Bun.sleep(100).then(() => "deadline missed")])).toBeInstanceOf(SteerWithdrawalUnconfirmedError);
+      await Promise.race([stop, Bun.sleep(100)]);
+      expect(provider.interrupts).toEqual(["session"]);
+      // Snapshot recovery must not erase a cancellation whose HTTP response
+      // was lost, even when the agent now lists an empty inbox.
+      provider.listPendingInbox = async () => [];
+      provider.listMessages = async () => ({ items: [], accounting: [] });
+      expect((await adapter.history("session")).queued).toEqual([expect.objectContaining({ id: accepted.messageId, text: "retain original input", unconfirmed: true })]);
+      provider.cancelInbox = async (_session, id) => { provider.cancelledInbox.push(id); inbox({ kind: "settled", id, outcome: "cancelled" }); };
+      await expect(adapter.removeQueued("session", accepted.messageId, "explicit-retry")).resolves.toEqual({ removed: true });
+      expect(adapter.pendingSteersForTests("session")).toEqual([]);
+      expect(provider.prompts).toHaveLength(1);
+      expect(provider.cancelledInbox.every(id => id === accepted.messageId)).toBe(true);
+    } finally { await adapter.dispose(); await pump; }
+  });
+
+  for (const outcome of ["delivered", "cancelled"] as const) test(`terminal ${outcome} wins over a hung cancellation transport`, async () => {
+    const { adapter, provider, steer, inbox } = steering({ steerWithdrawTimeoutMs: 10 });
+    const pump = adapter.startEventPump();
+    try {
+      adapter.projectionForTests("session").statusUpdate("running");
+      const accepted = await steer("original", "settle once");
+      provider.cancelInbox = async (_session, id) => { inbox({ kind: "settled", id, outcome }); await new Promise(() => {}); };
+      const result = await adapter.removeQueued("session", accepted.messageId, "remove").catch(error => error);
+      if (outcome === "delivered") expect(result).toBeInstanceOf(SteerAlreadyDeliveredError);
+      else expect(result).toEqual({ removed: true });
+      expect(adapter.pendingSteersForTests("session")).toEqual([]);
+    } finally { await adapter.dispose(); await pump; }
+  });
+
+  for (const late of ["resolve", "reject"] as const) test(`a cancellation transport that ${late}s after the deadline cannot start fallback reads`, async () => {
+    const { adapter, provider, steer } = steering({ steerWithdrawTimeoutMs: 5 });
+    try {
+      adapter.projectionForTests("session").statusUpdate("running");
+      const accepted = await steer("original", "no delayed side effects");
+      let resolve!: () => void, reject!: (error: Error) => void;
+      const transport = new Promise<void>((yes, no) => { resolve = yes; reject = no; });
+      provider.cancelInbox = () => transport;
+      let reads = 0;
+      provider.listPendingInbox = async () => { reads++; return []; };
+      provider.listMessages = async () => { reads++; return { items: [], accounting: [] }; };
+      await expect(adapter.removeQueued("session", accepted.messageId, "remove")).rejects.toBeInstanceOf(SteerWithdrawalUnconfirmedError);
+      if (late === "resolve") resolve(); else reject(new Error("late transport rejection"));
+      await Bun.sleep(1);
+      expect(reads).toBe(0);
+      expect(adapter.pendingSteersForTests("session")).toEqual([expect.objectContaining({ id: accepted.messageId, withdrawalUnconfirmed: true })]);
+      expect((adapter as unknown as { steerSettlements: Map<string, unknown> }).steerSettlements.size).toBe(0);
+    } finally { await adapter.dispose(); }
+  });
+
+  test("paged withdrawal recovery shares the cancellation deadline and stops requesting pages after expiry", async () => {
+    const { adapter, provider, steer } = steering({ steerWithdrawTimeoutMs: 10 });
+    try {
+      adapter.projectionForTests("session").statusUpdate("running");
+      const accepted = await steer("original", "bound every recovery page");
+      provider.pendingInbox = [];
+      let reads = 0, release!: () => void;
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      provider.listMessages = async () => {
+        reads++;
+        await gate;
+        return { items: [{ id: `message:page-${reads}`, type: "user_message", text: "other input", createdAt: 1 }], nextCursor: `next-${reads}`, accounting: [] };
+      };
+      await expect(adapter.removeQueued("session", accepted.messageId, "remove")).rejects.toBeInstanceOf(SteerWithdrawalUnconfirmedError);
+      expect(reads).toBe(1);
+      release(); await Bun.sleep(1);
+      expect(reads).toBe(1);
+      expect(adapter.pendingSteersForTests("session")[0]?.withdrawalUnconfirmed).toBe(true);
+    } finally { await adapter.dispose(); }
+  });
+
   test("unconfirmed withdrawal stays inspectable and permits only an explicit withdrawal retry", async () => {
     const { adapter, provider, steer, queued } = steering({ steerWithdrawTimeoutMs: 1 });
     try {
@@ -6992,6 +7082,63 @@ describe("steering (opencode-v2-steering)", () => {
     if (evidence === "read-bound") expect(reads).toBe(20);
     if (evidence === "no-inbox-list") expect(reads).toBe(0);
     await adapter.dispose();
+  });
+
+  for (const source of ["held", "composer"] as const) for (const outcome of ["delivered", "cancelled"] as const) test(`${source} timeout then ${outcome} fences late acknowledgement beyond cache eviction and another admission`, async () => {
+    const { adapter, provider, queue, steer, inbox } = steering({ steerAdmissionTimeoutMs: 5 });
+    const pump = adapter.startEventPump();
+    try {
+      adapter.projectionForTests("session").statusUpdate("running");
+      const held = source === "held" ? await queue("original", "deliver once") : undefined;
+      const admit = provider.prompt.bind(provider);
+      let release!: () => void;
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      provider.prompt = async (...args) => { const result = await admit(...args); await gate; return result; };
+      await expect(held ? adapter.changeDelivery("session", held.messageId, "convert", "steer") : steer("original", "deliver once")).rejects.toBeInstanceOf(OperationOutcomeUnknownError);
+      const id = provider.prompts[0]!.id;
+      // A subsequent admission must not overwrite the original request fence.
+      provider.prompt = admit;
+      const second = await steer("second", "another input");
+      await adapter.abort("session", "stop");
+      await adapter.sendNow("session", second.messageId, "resume");
+      expect(provider.interruptOptions).toEqual([{ resume: false }, { resume: true }]);
+      inbox({ kind: "settled", id, outcome });
+      for (let index = 0; index < 70; index++) inbox({ kind: "settled", id: `other-${index}`, outcome: "delivered" });
+      await liveEventsApplied(adapter, provider);
+      release();
+      await gate; await Bun.sleep(1);
+      expect(adapter.pendingSteersForTests("session").map(entry => entry.text)).toEqual(["another input"]);
+      const pending = (await adapter.history("session")).queued ?? [];
+      expect(pending.map(entry => entry.text)).toEqual(["another input"]);
+      expect(provider.prompts).toHaveLength(2);
+      expect((adapter as unknown as { admittingSteers: Map<string, unknown> }).admittingSteers.size).toBe(0);
+    } finally { await adapter.dispose(); await pump; }
+  });
+
+  test("unanswered admission fences are bounded and evicted requests cannot apply late acknowledgement", async () => {
+    const { adapter, provider, steer, inbox } = steering({ steerAdmissionTimeoutMs: 1 });
+    const pump = adapter.startEventPump();
+    const releases: Array<() => void> = [];
+    try {
+      adapter.projectionForTests("session").statusUpdate("running");
+      const admit = provider.prompt.bind(provider);
+      provider.prompt = async (...args) => {
+        const accepted = await admit(...args);
+        await new Promise<void>(resolve => { releases.push(resolve); });
+        return accepted;
+      };
+      for (let index = 0; index < 66; index++) {
+        await expect(steer(`request-${index}`, `input-${index}`)).rejects.toBeInstanceOf(OperationOutcomeUnknownError);
+        inbox({ kind: "settled", id: provider.prompts.at(-1)!.id, outcome: "cancelled" });
+        await liveEventsApplied(adapter, provider);
+      }
+      const fences = (adapter as unknown as { admittingSteers: Map<string, unknown> }).admittingSteers;
+      expect(fences.size).toBe(64);
+      for (const release of releases) release();
+      await waitUntil(() => fences.size === 0);
+      expect(adapter.pendingSteersForTests("session")).toEqual([]);
+      expect(provider.prompts).toHaveLength(66);
+    } finally { for (const release of releases) release(); await adapter.dispose(); await pump; }
   });
 
   test("delivery during a held-to-steer admission timeout cannot leave the original held for resubmission", async () => {

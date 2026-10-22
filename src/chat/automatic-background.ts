@@ -24,15 +24,17 @@ export class AutomaticBackgroundNotices {
       if (!notices?.size) this.conversations.delete(conversation);
       return;
     }
-    this.put(conversation, operation, automaticBackgroundNote(outcome));
+    this.put(conversation, operation, { text: automaticBackgroundNote(outcome) });
   }
 
   unconfirmed(conversation: string, operation: string, action: string, text?: string, subject = "acceptance"): void {
-    if (text === undefined) { this.put(conversation, operation, action); return; }
+    if (text === undefined) { this.put(conversation, operation, { text: action }); return; }
     const origin = actionOrigin(action, text || `attachment-only message · ${operation.replace(/[^a-zA-Z0-9-]/g, "").slice(-8) || "pending"}`);
-    this.put(conversation, operation, `${origin}: ${subject} unconfirmed. Checking conversation status; ${subject === "withdrawal" ? "do not resubmit; you may retry withdrawal" : "do not repeat"}.`);
-    this.conversations.get(conversation)!.get(operation)!.origin = origin;
-    this.conversations.get(conversation)!.get(operation)!.subject = subject;
+    this.put(conversation, operation, {
+      text: `${origin}: ${subject} unconfirmed. Checking conversation status; ${subject === "withdrawal" ? "do not resubmit; you may retry withdrawal" : "do not repeat"}.`,
+      origin,
+      subject,
+    });
   }
 
   checked(conversation: string, operation: string, available: boolean): void {
@@ -41,10 +43,10 @@ export class AutomaticBackgroundNotices {
     notice.text = `${notice.origin}: ${available ? `Status checked; ${notice.subject} still unconfirmed` : `Status check unavailable; ${notice.subject} unconfirmed`}. ${notice.subject === "withdrawal" ? "Do not resubmit; you may retry withdrawal." : "Do not repeat."}`;
   }
 
-  private put(conversation: string, operation: string, text: string): void {
+  private put(conversation: string, operation: string, notice: { text: string; origin?: string; subject?: string }): void {
     let notices = this.conversations.get(conversation);
     if (!notices) this.conversations.set(conversation, notices = new Map());
-    notices.set(operation, { text });
+    notices.set(operation, notice);
     // Page-local only, bounded across both conversations and operations.
     while (notices.size > 20) notices.delete(notices.keys().next().value!);
     while (this.conversations.size > 100) this.conversations.delete(this.conversations.keys().next().value!);

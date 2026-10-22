@@ -18,7 +18,7 @@ import { setActiveTab } from "../shell/tab-bar";
 import { expandChatPanel, isChatPanelOpen } from "./surface";
 import { CHAT_SURFACE_ACTIVE_EVENT, chatSurfaceInView } from "./surface-visibility";
 import { newRequestId } from "./ids";
-import { insertCommand, localHistoryOperation, matchingCommands, slashCommandQuery, type LocalHistoryOperation } from "./slash-commands";
+import { insertCommand, localHistoryOperation, matchingCommands, parsePromptSlashCommand, sideQuestionOperation, slashCommandQuery, type LocalHistoryOperation } from "./slash-commands";
 import { LatestRefresh } from "./latest-refresh";
 import { navigateWorkspaceFileReference, resolveWorkspaceFileReference } from "./file-references";
 import { READER_CLOSED, QueueDockRenderer, RevertedMessagesDockRenderer, TimelineRenderer, decorateAttachmentImages, decorateFileLinks, formatElapsed, latestTodoEntries, pendingSteerReplacementNote, statusLabel, subagentEntries, workingLabel } from "./timeline-renderer";
@@ -318,11 +318,7 @@ export function initChat(api = new ChatApiClient()): void {
   let commands: ChatCommand[] = [];
   // Whether a dock entry's text runs as a listed command — what the adapter's
   // parseSlashCommand decides — so the dock offers no steer for one.
-  const isListedCommand = (text: string): boolean => {
-    if (!text.startsWith("/") || text.startsWith("//")) return false;
-    const match = /^\/([^\s/]+)/.exec(text);
-    return Boolean(match) && commands.some(command => command.name === match![1] && command.kind !== "local-operation");
-  };
+  const isListedCommand = (text: string): boolean => parsePromptSlashCommand(text, commands) !== undefined;
   let projection: ChatProjection | null = null;
   const unconfirmedInputs = new Map<string, ChatProjection["acceptedDrafts"]>();
   const unconfirmedWithdrawals = new Map<string, Map<string, { operation: string; entry: QueuedMessage }>>();
@@ -2878,7 +2874,7 @@ export function initChat(api = new ChatApiClient()): void {
   const installConversationSnapshot = (snapshot: ConversationSnapshot, acceptedDrafts: ChatProjection["acceptedDrafts"], token: number) => {
     projection = protectUnconfirmedWithdrawals(projectionFromSnapshot(snapshot, acceptedDrafts));
     const unknown = projection.acceptedDrafts.filter(draft => draft.unconfirmed);
-    if (unknown.length) unconfirmedInputs.set(snapshot.conversation.id, unknown);
+    if (unknown.length) boundedSet(unconfirmedInputs, snapshot.conversation.id, unknown.slice(-20), 100);
     else unconfirmedInputs.delete(snapshot.conversation.id);
     const carried = removedRows.get(snapshot.conversation.id);
     if (carried) projection = { ...projection, removedIds: carried };
@@ -3751,13 +3747,13 @@ export function initChat(api = new ChatApiClient()): void {
   }
   function sendSupportsHold(): boolean {
     const draft = input?.value ?? "";
-    return declares("steering") && !/^\/btw(?:\s|$)/.test(draft.trim()) && !localHistoryOperation(draft, commands, declares("reversible-history"));
+    return declares("steering") && !sideQuestionOperation(draft) && !localHistoryOperation(draft, commands, declares("reversible-history"));
   }
   function syncSendDescription(): void {
     const preferred = readDeliveryPreference(presentationLocalStorage());
     const touch = document.documentElement.dataset.uiMode === "touch";
     const label = preferred === "steer" ? "Steer" : "Queue";
-    const sendAction = /^\/btw(?:\s|$)/.test(input?.value.trim() ?? "") ? "Ask side question" : localHistoryOperation(input?.value ?? "", commands, declares("reversible-history")) ? "Send message" : isLiveConversationStatus(projection?.status)
+    const sendAction = sideQuestionOperation(input?.value ?? "") ? "Ask side question" : localHistoryOperation(input?.value ?? "", commands, declares("reversible-history")) ? "Send message" : isLiveConversationStatus(projection?.status)
       ? declares("steering") && !isListedCommand(input?.value ?? "") && currentPendingAttachments().length === 0 ? "Send as steer; hold 2.5 seconds to queue" : declares("steering") ? "Send to queue" : "Queue message"
       : "Send message";
     send?.setAttribute("aria-label", sendAction);
@@ -4956,10 +4952,10 @@ export function initChat(api = new ChatApiClient()): void {
     requestedByHold = false;
     requestedDelivery = undefined;
     if (!projection || submitting || cancelling) return;
-    const aside = /^\/btw(?:\s+([\s\S]*))?$/.exec(input.value.trim());
+    const aside = sideQuestionOperation(input.value);
     if (aside) {
       const conversationId = projection.conversationId;
-      const question = aside[1]?.trim();
+      const question = aside.question;
       if (!declares("side-generation")) { setComposerError("/btw side answers are not supported by this agent. Nothing was sent."); return; }
       if (!question) { setComposerError("Add a side question after /btw. Nothing was sent."); return; }
       if (currentPendingAttachments().length || attachmentStaging.has(conversationId)) { setComposerError("/btw uses existing conversation context only. Remove pending images before asking a side question."); return; }
@@ -5158,7 +5154,9 @@ export function initChat(api = new ChatApiClient()): void {
     // submission's one-off choice (⌥Enter, the menu). The workspace decides
     // whether it steers, holds, or dispatches, and reports which.
     const delivery: MessageDelivery | undefined = declares("steering") ? attachmentRefs.length ? "queue" : submissionDelivery ?? readDeliveryPreference(presentationLocalStorage()) : undefined;
-    const uncertainHubSteer = Boolean(document.querySelector('meta[name="uatu-hub"]')) && !isListedCommand(text)
+    // Native steer acceptance can outlive a lost browser response on either
+    // standalone or Hub. Hub policy controls automation, not input safety.
+    const potentiallyNativeSteer = declares("steering") && !isListedCommand(text)
       && (projection.reversibleHistory?.staged === true || delivery === "steer" && (isLiveConversationStatus(projection.status) || projection.queued.length > 0));
     // Optimistic send: the message shows immediately and the input clears;
     // on failure the draft is removed and the text restored.
@@ -5259,20 +5257,23 @@ export function initChat(api = new ChatApiClient()): void {
       releaseAttachmentReserve();
     } catch (error) {
       const primaryUnknown = error instanceof ChatTransportError && error.code === "operation_outcome_unknown"
-        || uncertainHubSteer && (error instanceof ChatConnectionInterruptedError || error instanceof ChatTransportError && (error.status === undefined || error.status >= 500));
+        || potentiallyNativeSteer && (error instanceof ChatConnectionInterruptedError || error instanceof ChatTransportError && (error.status === undefined || error.status >= 500));
       if (primaryUnknown) {
         retryRequests.delete(conversationId);
         const draft = { requestId, messageId: `pending:${requestId}`, text, ...(attachmentRefs.length ? { attachments: attachmentRefs } : {}), unconfirmed: true as const };
-        unconfirmedInputs.set(conversationId, [...(unconfirmedInputs.get(conversationId) ?? []).filter(entry => entry.requestId !== requestId), draft]);
+        const retained = [...(unconfirmedInputs.get(conversationId) ?? []).filter(entry => entry.requestId !== requestId), draft].slice(-20);
+        boundedSet(unconfirmedInputs, conversationId, retained, 100);
         if (projection?.conversationId === conversationId) {
           projection = markDraftUnconfirmed(projection, requestId);
+          const retainedIds = new Set(retained.map(entry => entry.requestId));
+          projection = { ...projection, acceptedDrafts: projection.acceptedDrafts.filter(entry => !entry.unconfirmed || retainedIds.has(entry.requestId)) };
           scheduleRender();
         }
         for (const staged of stagedAttachments) URL.revokeObjectURL(staged.previewUrl);
         releaseAttachmentReserve();
         submitting = false;
         syncControls();
-        checkUnconfirmedAction(conversationId, requestId, "Steer", text);
+        checkUnconfirmedAction(conversationId, requestId, `Steer (${requestId})`, text);
         return;
       }
       const message = messageOf(error);

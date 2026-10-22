@@ -173,6 +173,9 @@ export class ChatApiClient {
       { requestId, text, ...(model ? { model } : {}), ...(mode ? { mode } : {}), ...(variant ? { variant } : {}), ...(attachments?.length ? { attachments } : {}), ...(delivery ? { delivery } : {}) },
       value => {
         const result = value as { messageId: string; pending?: unknown; delivery?: unknown; configuration?: unknown; conversation?: unknown; operation?: unknown; automaticBackground?: unknown };
+        if (!result || typeof result.messageId !== "string" || !result.messageId) {
+          throw new ChatTransportError("Chat returned an invalid prompt acceptance");
+        }
         return {
           messageId: result.messageId,
           pending: result.pending === true,
