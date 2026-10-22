@@ -15,7 +15,7 @@ import type { AcceptedDraft, ChatProjection } from "./projection";
 import { formatUsd } from "./usage";
 import { wakeupRowLabel } from "./scheduled-wakeups";
 import { dateTime, dayLabel, fullDate, knownTime, localDayKey, localDaysBetween, nextLocalMidnight, weekdayClock } from "./dates";
-import { LOGIN_FAILED_NOTICE_CODE, isLiveConversationStatus, isRateLimitStanding, type ActivityStatus, type ConversationItem, type ConversationStatus, type MessageAttachment, type PermissionOutcome, type QueuedMessage, type QuestionRequest, type RevertedUserMessage, type TokenUsage, type ToolItem } from "./types";
+import { LOGIN_FAILED_NOTICE_CODE, isLiveConversationStatus, isRateLimitStanding, type ActivityStatus, type ConversationItem, type ConversationStatus, type MessageAttachment, type PermissionOutcome, type QueuedMessage, type QuestionRequest, type RevertedUserMessage, type StructuredQuestion, type TokenUsage, type ToolItem } from "./types";
 
 type RenderedEntry = { node: HTMLElement; item: ConversationItem; active: boolean; variant: string; shellVariant?: string };
 const deferredBodies = new WeakMap<HTMLElement, () => void>();
@@ -261,7 +261,7 @@ export class TimelineRenderer {
       // auto-open rule for the rest of the run, so a tool that keeps talking
       // cannot reopen a row the reader shut.
       const readerClosed = entry?.node.hasAttribute(READER_CLOSED) ?? false;
-      const markup = (defer: boolean) => renderItem(item, open, active, todo, duration, origin, readerClosed, allowSubagents, completedAssistant, allowRevert, this.permissionScopeNote, defer, confirming, linkedTool, this.loginAction, worker);
+      const markup = (defer: boolean) => renderItem(item, open, active, todo, duration, origin, readerClosed, allowSubagents, completedAssistant, allowRevert, this.permissionScopeNote, defer, confirming, linkedTool, this.loginAction, projection.conversationId ?? "", worker);
       const node = buildNode(markup(this.deferClosedActivity));
       if (this.deferClosedActivity && node.matches("details.chat-activity:not([open])")) {
         node.setAttribute("data-chat-lazy", "");
@@ -1449,7 +1449,7 @@ export class RevertedMessagesDockRenderer {
 
 type RequestOrigin = { conversationId: string; label: string };
 
-export function renderItem(item: ConversationItem, open: boolean, activeRequest: boolean, todo?: TodoSummary, durationMs?: number, origin?: RequestOrigin, readerClosed = false, allowSubagents = true, completedAssistant = false, allowRevert = false, permissionScopeNote?: string, deferClosed = false, confirming = false, linkedTool?: ToolItem, loginAction?: LoginAction, worker?: BackgroundTaskItem): string {
+export function renderItem(item: ConversationItem, open: boolean, activeRequest: boolean, todo?: TodoSummary, durationMs?: number, origin?: RequestOrigin, readerClosed = false, allowSubagents = true, completedAssistant = false, allowRevert = false, permissionScopeNote?: string, deferClosed = false, confirming = false, linkedTool?: ToolItem, loginAction?: LoginAction, surfaceId = "", worker?: BackgroundTaskItem): string {
   const id = escapeHtmlAttribute(item.id);
   const stamp = timestampAttribute(item.createdAt);
   // A prompt a scheduled wakeup submitted opens that wakeup's turn. It is
@@ -1526,7 +1526,7 @@ export function renderItem(item: ConversationItem, open: boolean, activeRequest:
     return `<section class="chat-item chat-task-progress" data-chat-item-id="${id}"${stamp} aria-label="Task progress"><header class="chat-task-progress-header">Tasks <span class="chat-task-progress-count">${done}/${item.entries.length}</span></header><ol class="chat-task-list">${rows}</ol></section>`;
   }
   if (item.type === "permission") return renderPermission(item, open, activeRequest, origin, allowSubagents, permissionScopeNote, confirming, linkedTool);
-  if (item.type === "question") return renderQuestion(item, open, activeRequest, origin, allowSubagents);
+  if (item.type === "question") return renderQuestion(item, open, activeRequest, origin, allowSubagents, surfaceId);
   if (item.type === "tool") return renderTool(item, open, readerClosed, todo, allowSubagents, deferClosed, worker);
   // A command's text is the subject, not the label. As a label it lands in the
   // summary's non-shrinking slot, so a long pipeline overruns the row instead
@@ -1985,14 +1985,39 @@ function permissionOutcomeLabel(outcome: PermissionOutcome | undefined, item?: E
   return "Resolved";
 }
 
-function renderQuestion(item: QuestionRequest, open: boolean, active: boolean, origin?: RequestOrigin, allowSubagents = true): string {
+// A step is named by whichever of the two strings a provider mapping puts
+// the short label in; the longer one is the question stated in full. One
+// provider family (GitHub #520) splits them the other way round from the
+// obvious one, so the pill renders the *label* — four pills printing one
+// identical ellipsised sentence told the reader nothing about which step
+// was which — and the legend states the question whole. The header wins
+// ties: both normal mappings name the label in the header, so equal
+// lengths must not collapse every pill onto the prompt again. A missing
+// header hands the name to the prompt — an empty pill names nothing, and
+// the step's announcements and validation would all read empty too.
+// Shared, so every name a step earns — the pill, the panel eyebrow, the
+// owed-answer line's steps — is one selection, never two algorithms
+// drifting apart on the same question.
+export function questionStepLabel(question: StructuredQuestion): string {
+  return question.header === "" ? question.prompt : question.prompt.length < question.header.length ? question.prompt : question.header;
+}
+
+function renderQuestion(item: QuestionRequest, open: boolean, active: boolean, origin?: RequestOrigin, allowSubagents = true, surfaceId = ""): string {
   const pending = item.status === "pending";
   // Questions are stepped through one at a time behind a tab strip, the way
   // OpenCode's own client presents them. Stacking every question at once buries
   // the later ones and makes a partly-filled form look broken.
   const stepped = item.questions.length > 1;
+  // A step's name comes from the shared selection above (comment there);
+  // the legend pairs that label with the question stated in full.
+  const statement = (question: StructuredQuestion) => questionStepLabel(question) === question.prompt ? question.header : question.prompt;
+  // A mirrored pending question renders in both the parent and the child
+  // transcript (ChatAdapter.mirrorToParent), sharing item.id — the panel id
+  // carries the rendering surface's conversation too, so the document never
+  // holds duplicate ids and each form's tabs point at their own fieldset.
+  const panelId = (index: number) => `question-${surfaceId.replace(/[^a-z0-9_-]+/gi, "-")}-${item.id.replace(/[^a-z0-9_-]+/gi, "-")}-${index}`;
   const tabs = stepped
-    ? `<div class="chat-question-tabs" role="tablist">${item.questions.map((question, index) => `<button type="button" role="tab" class="chat-question-tab${index === 0 ? " is-active" : ""}" data-question-tab="${index}" aria-selected="${index === 0}">${escapeHtml(question.header)}</button>`).join("")}</div>`
+    ? `<div class="chat-question-tabs" role="tablist">${item.questions.map((question, index) => `<button type="button" role="tab" class="chat-question-tab${index === 0 ? " is-active" : ""}" data-question-tab="${index}" aria-selected="${index === 0}" aria-controls="${escapeHtmlAttribute(panelId(index))}">${escapeHtml(questionStepLabel(question))}<span class="sr-only chat-question-tab-answered">, answered</span></button>`).join("")}</div>`
     : "";
   // A checkbox and a radio read almost identically inside a styled row, so the
   // legend says which it is — otherwise there is nothing telling you more than
@@ -2005,13 +2030,21 @@ function renderQuestion(item: QuestionRequest, open: boolean, active: boolean, o
       ? `<label class="chat-question-option chat-question-custom-option"><input type="${type}" name="${question.multiple ? `q-${index}-custom-choice` : `q-${index}`}" data-question-custom-toggle aria-controls="${escapeHtmlAttribute(customInputId)}" aria-expanded="false"><span class="chat-question-option-text"><span class="chat-question-option-label">Type your own answer</span></span></label><label class="chat-question-custom-editor" data-question-custom-editor for="${escapeHtmlAttribute(customInputId)}" hidden><span class="sr-only">Type your own answer</span><input id="${escapeHtmlAttribute(customInputId)}" name="q-${index}-custom-text" type="text" data-question-custom-input autocomplete="off"></label>`
       : "";
     const hints = [question.multiple ? "choose one or more" : "", question.optional ? "optional" : ""].filter(Boolean);
-    return `<fieldset class="chat-question-panel" data-question-panel="${index}"${question.optional ? ` data-question-optional="true"` : ""}${index === 0 ? "" : " hidden"}><legend${stepped ? ` class="sr-only"` : ""}>${escapeHtml(question.header)}</legend><p>${escapeHtml(question.prompt)}${hints.length ? ` <span class="chat-question-hint">${escapeHtml(hints.join(" · "))}</span>` : ""}</p>${options}${custom}</fieldset>`;
+    // The legend carries the step's label with its hints, then the question
+    // stated in full: whichever mapping put the length in the header or the
+    // prompt, the panel shows the whole question wrapped — a screen-reader-
+    // only legend left it readable nowhere but a one-line ellipsised tab
+    // (GitHub #520). Fieldset legends must be the first element child, so
+    // the label leads inside the legend rather than below the question.
+    const stepLine = `<span class="chat-question-step">${escapeHtml(questionStepLabel(question))}${hints.length ? ` <span class="chat-question-hint">${escapeHtml(hints.join(" · "))}</span>` : ""}</span>`;
+    const statementLine = statement(question) === questionStepLabel(question) ? "" : `<span class="chat-question-statement">${escapeHtml(statement(question))}</span>`;
+    return `<fieldset class="chat-question-panel" data-question-panel="${index}" id="${escapeHtmlAttribute(panelId(index))}"${question.optional ? ` data-question-optional="true"` : ""}${index === 0 ? "" : " hidden"}><legend>${stepLine}${statementLine}</legend>${options}${custom}</fieldset>`;
   }).join("");
   // Same receding as a permission: a resolved question carries its outcome in
   // the summary and drops the answered form. Its prompts stay in the collapsed
   // body so what was asked remains reachable.
   const resolvedBody = item.questions.map(question => `<p class="chat-request-asked">${escapeHtml(question.prompt)}</p>`).join("");
-  const body = pending && active ? `<form data-question-form>${tabs}${questions}<div class="chat-request-actions"><button type="submit" data-question-primary disabled>${stepped ? "Next" : "Answer"}</button><button type="button" data-question-reject>Reject</button></div></form>` : pending ? `<p class="chat-request-outcome">Waiting its turn — answer the newest request first.</p>` : resolvedBody;
+  const body = pending && active ? `<form data-question-form>${tabs}${questions}<div class="chat-request-actions"><button type="submit" data-question-primary class="chat-primary-button">${stepped ? "Next" : "Answer"}</button><button type="button" data-question-reject title="Declines this question set — the agent is told and continues without answers">Reject</button></div></form>` : pending ? `<p class="chat-request-outcome">Waiting its turn — answer the newest request first.</p>` : resolvedBody;
   const state = requestState(item.status, active);
   const summaryTrace = state === "resolved" ? ` <span class="chat-request-trace">${item.outcome?.kind === "rejected" ? "Rejected" : "Answered"}</span>` : requestBadge(state);
   // A dialog or elicitation says who is asking above the form, offers the
