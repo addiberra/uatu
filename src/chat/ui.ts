@@ -8,7 +8,7 @@ import { onUiModeChange } from "../shell/ui-mode";
 import { registerBackInterceptor } from "../shell/history";
 import { onManualRecovery, registerRecoveryWork, requestManualRecovery } from "../shell/live";
 import { onWorkspaceCredentialRefresh } from "../terminal/client";
-import { ChatApiClient, ChatConnectionInterruptedError, ChatTransportError, STEER_ALREADY_DELIVERED_CODE, type ChatEventStream } from "./client";
+import { ChatApiClient, ChatConnectionInterruptedError, ChatTransportError, STEER_ALREADY_DELIVERED_CODE, STEER_WITHDRAWAL_UNCONFIRMED_CODE, type ChatEventStream } from "./client";
 import { otherDelivery, readDeliveryPreference } from "./delivery-preference";
 import { TimelineAnchorController, type AnchorGeometry, type TimelineAnchor } from "./anchor";
 import { CoordinatedScrollOwner, type RevealOptions } from "./coordinated-scroll";
@@ -325,6 +325,11 @@ export function initChat(api = new ChatApiClient()): void {
   };
   let projection: ChatProjection | null = null;
   const unconfirmedInputs = new Map<string, ChatProjection["acceptedDrafts"]>();
+  const unconfirmedWithdrawals = new Map<string, Map<string, { operation: string; entry: QueuedMessage }>>();
+  type PendingQueueAction = { terminal?: true };
+  // Only live mutations own these fences. A terminal event can precede the
+  // HTTP response and must win even before an uncertainty notice exists.
+  const queueActionsInFlight = new Map<string, Map<string, PendingQueueAction>>();
   const stagedConfigurations = new Map<string, ConversationConfiguration>();
   let configurationPicker: ChatConfigurationPickerController | null = null;
   let stream: ChatEventStream | null = null;
@@ -1777,6 +1782,8 @@ export function initChat(api = new ChatApiClient()): void {
     const pendingOpen = compactPendingState.paint(pendingConversation);
     const restorePending = pendingOpen && (pendingConversation !== pendingPaintedConversation || !pendingPaintedOpen);
     queueDock.render(queueDockElement, projection?.queued ?? [], {
+      withdrawalRetries: pendingConversation ? unconfirmedWithdrawals.get(pendingConversation) : undefined,
+      pendingActions: pendingConversation ? queueActionsInFlight.get(pendingConversation) : undefined,
       steering: declares("steering"),
       sendNow: declares("send-now"),
       running: isLiveConversationStatus(projection?.status),
@@ -2847,8 +2854,29 @@ export function initChat(api = new ChatApiClient()): void {
     });
   };
 
+  const settleUnconfirmedWithdrawal = (conversationId: string, messageId: string) => {
+    const pending = queueActionsInFlight.get(conversationId)?.get(messageId);
+    if (pending) pending.terminal = true;
+    const withdrawals = unconfirmedWithdrawals.get(conversationId);
+    const notice = withdrawals?.get(messageId);
+    if (notice) automaticNotes.record(conversationId, notice.operation, "not-needed");
+    withdrawals?.delete(messageId);
+    if (!withdrawals?.size) unconfirmedWithdrawals.delete(conversationId);
+  };
+  const protectUnconfirmedWithdrawals = (current: ChatProjection): ChatProjection => {
+    const withdrawals = unconfirmedWithdrawals.get(current.conversationId);
+    if (withdrawals) {
+      const queued = [...current.queued];
+      for (const [id, notice] of withdrawals) {
+        if (current.items.some(item => item.id === `message:${id}`)) settleUnconfirmedWithdrawal(current.conversationId, id);
+        else if (!queued.some(entry => entry.id === id)) queued.push(notice.entry);
+      }
+      return { ...current, queued: queued.map(entry => withdrawals.has(entry.id) ? { ...entry, unconfirmed: true as const } : entry) };
+    }
+    return current;
+  };
   const installConversationSnapshot = (snapshot: ConversationSnapshot, acceptedDrafts: ChatProjection["acceptedDrafts"], token: number) => {
-    projection = projectionFromSnapshot(snapshot, acceptedDrafts);
+    projection = protectUnconfirmedWithdrawals(projectionFromSnapshot(snapshot, acceptedDrafts));
     const unknown = projection.acceptedDrafts.filter(draft => draft.unconfirmed);
     if (unknown.length) unconfirmedInputs.set(snapshot.conversation.id, unknown);
     else unconfirmedInputs.delete(snapshot.conversation.id);
@@ -2913,6 +2941,8 @@ export function initChat(api = new ChatApiClient()): void {
           if (renameInput && renameForm && !renameForm.hidden && document.activeElement !== renameInput) renameInput.value = event.conversation.title;
         }
         if (result.outcome === "applied") {
+          if (event.type === "conversation.queue" && (event.change.kind === "removed" || event.change.kind === "delivered")) settleUnconfirmedWithdrawal(conversationId, event.change.messageId);
+          if (event.type === "conversation.queue" || event.type === "item.upsert") projection = protectUnconfirmedWithdrawals(projection);
           announce("");
           scheduleRender(true, true, event.type === "item.text_delta" || (event.type === "item.upsert" && event.item.type === "assistant_message" && event.item.completedAt === undefined && isLiveConversationStatus(projection.status)));
         }
@@ -3438,14 +3468,29 @@ export function initChat(api = new ChatApiClient()): void {
       syncControls();
     });
   };
-  const queueActionFailed = (error: unknown, conversationId: string, messageId: string, steerAction: boolean, operationId: string, action: string, text: string) => {
+  const queueActionFailed = (error: unknown, conversationId: string, messageId: string, steerAction: boolean, operationId: string, action: string, text: string, entry: QueuedMessage, pending: PendingQueueAction) => {
+    if (error instanceof ChatTransportError && error.code === STEER_WITHDRAWAL_UNCONFIRMED_CODE) {
+      if (pending.terminal) return;
+      const withdrawals = unconfirmedWithdrawals.get(conversationId) ?? new Map<string, { operation: string; entry: QueuedMessage }>();
+      const previous = withdrawals.get(messageId);
+      if (previous) automaticNotes.record(conversationId, previous.operation, "not-needed");
+      withdrawals.set(messageId, { operation: operationId, entry });
+      boundedSet(unconfirmedWithdrawals, conversationId, withdrawals, 100);
+      if (projection?.conversationId === conversationId) {
+        projection = { ...projection, queued: projection.queued.map(entry => entry.id === messageId ? { ...entry, unconfirmed: true as const } : entry) };
+        scheduleRender();
+      }
+      checkUnconfirmedAction(conversationId, operationId, action, text, "withdrawal");
+      return;
+    }
     if (error instanceof ChatTransportError && (error.code === "operation_outcome_unknown" || steerAction && (error.status === undefined || error.status >= 500)) || error instanceof ChatConnectionInterruptedError) {
       checkUnconfirmedAction(conversationId, operationId, action, text);
       return;
     }
     if (error instanceof ChatTransportError && error.status === 409) {
+      settleUnconfirmedWithdrawal(conversationId, messageId);
       if (projection?.conversationId === conversationId) {
-        projection = dropQueuedMessage(projection, messageId);
+        projection = protectUnconfirmedWithdrawals(dropQueuedMessage(projection, messageId));
         scheduleRender();
       }
       if (error.code === STEER_ALREADY_DELIVERED_CODE) {
@@ -3517,16 +3562,38 @@ export function initChat(api = new ChatApiClient()): void {
     const steerAction = declares("steering") && (queueSteer !== undefined || queueSendNow !== undefined);
     const messageId = queueRemove ?? queueEdit ?? queueSteer ?? queueQueue ?? queueSendNow!;
     const entry = projection.queued.find(candidate => candidate.id === messageId);
+    if (!entry) return;
+    const withdrawalUnknown = unconfirmedWithdrawals.get(conversationId)?.has(messageId);
+    if (target.disabled || queueActionsInFlight.get(conversationId)?.has(messageId)) return;
+    if ((entry?.unconfirmed || withdrawalUnknown) && !(queueRemove !== undefined && withdrawalUnknown)) return;
     const pausedSteers = projection.queued.filter(candidate => candidate.delivery === "steer" && candidate.paused).length;
     if ((queueSendNow !== undefined || queueSteer !== undefined) && entry?.delivery === "queue" && pausedSteers
       && !await confirmChatAction("Send queued message now?", `This also sends all ${pausedSteers} paused steer${pausedSteers === 1 ? "" : "s"}. Other queued messages stay held.`, "Send now", target)) return;
     if (projection?.conversationId !== conversationId || !projection.queued.some(candidate => candidate.id === messageId)) return;
+    // A confirmation dialog yields to other actions and stream updates.
+    // Recheck the entry-wide lock and uncertainty after returning from it.
+    const currentEntry = projection.queued.find(candidate => candidate.id === messageId)!;
+    const currentWithdrawal = unconfirmedWithdrawals.get(conversationId)?.has(messageId);
+    if (queueActionsInFlight.get(conversationId)?.has(messageId)
+      || (currentEntry.unconfirmed || currentWithdrawal) && !(queueRemove !== undefined && currentWithdrawal)) return;
     target.disabled = true;
+    const inFlight = queueActionsInFlight.get(conversationId) ?? new Map<string, PendingQueueAction>();
+    const pendingAction: PendingQueueAction = {};
+    inFlight.set(messageId, pendingAction);
+    // Do not evict an outstanding action's fence. Finally releases it when
+    // the request finishes, rather than retaining terminal IDs globally.
+    queueActionsInFlight.set(conversationId, inFlight);
+    scheduleRender();
     const operationId = newRequestId();
     const operation: Promise<unknown> = queueRemove !== undefined
       ? api.removeQueued(conversationId, messageId, operationId)
       : queueEdit !== undefined
-        ? api.removeQueued(conversationId, messageId, operationId).then(() => { if (entry) loadIntoComposer(conversationId, entry); })
+        ? api.removeQueued(conversationId, messageId, operationId).then(() => {
+          // An uncertainty response from another pending action can overtake
+          // this callback. Withdrawal retry never implicitly edits/resubmits.
+          if (unconfirmedWithdrawals.get(conversationId)?.has(messageId)) throw new ChatTransportError("Withdrawal is still unconfirmed", 409, STEER_WITHDRAWAL_UNCONFIRMED_CODE);
+          if (entry) loadIntoComposer(conversationId, entry);
+        })
         : queueSteer !== undefined
           ? api.changeDelivery(conversationId, messageId, operationId, "steer")
           : queueQueue !== undefined
@@ -3534,14 +3601,26 @@ export function initChat(api = new ChatApiClient()): void {
             : api.sendNow(conversationId, messageId, operationId);
     void operation
       .then(result => {
+        if (queueRemove !== undefined && withdrawalUnknown && result && typeof result === "object" && "removed" in result && result.removed === true) {
+          settleUnconfirmedWithdrawal(conversationId, messageId);
+          if (projection?.conversationId === conversationId) {
+            projection = dropQueuedMessage(projection, messageId);
+            scheduleRender();
+          }
+        }
         if (result && typeof result === "object") recordAutomaticBackground(conversationId, operationId, result as AutomaticBackgroundFeedback,
           queueSteer !== undefined ? "Queue → Steer" : queueSendNow !== undefined ? "Send now" : "Pending action", entry?.text ?? "");
         if (activeConversationId() !== conversationId) return;
         noteComposer(null);
       })
       .catch(error => queueActionFailed(error, conversationId, messageId, steerAction, operationId,
-        queueSteer !== undefined ? "Queue → Steer" : queueSendNow !== undefined ? "Send now" : queueQueue !== undefined ? "Steer → Queue" : queueEdit !== undefined ? "Edit pending message" : "Remove pending message", entry?.text ?? ""))
-      .finally(() => { target.disabled = false; });
+        queueSteer !== undefined ? "Queue → Steer" : queueSendNow !== undefined ? "Send now" : queueQueue !== undefined ? "Steer → Queue" : queueEdit !== undefined ? "Edit pending message" : "Remove pending message", entry.text, entry, pendingAction))
+      .finally(() => {
+        target.disabled = false;
+        inFlight.delete(messageId);
+        if (!inFlight.size) queueActionsInFlight.delete(conversationId);
+        scheduleRender();
+      });
   });
 
   function syncQueueOverflow() {

@@ -1022,8 +1022,19 @@ describe("presentation details", () => {
     test("unconfirmed entries expose no resend/edit/remove or batch resume action", () => {
       const host = target();
       new QueueDockRenderer().render(host, [{ id: "uncertain", text: "Keep text", queuedAt: 1, delivery: "steer", paused: true, unconfirmed: true }], { steering: true, sendNow: true, running: false, isCommand: () => false });
-      expect(host.textContent).toContain("Acceptance unconfirmed");
+      expect(host.textContent).toContain("Outcome unconfirmed");
       expect(host.querySelectorAll("button")).toHaveLength(0);
+    });
+    test("only scoped withdrawal uncertainty offers a cancellation retry, disabled during an action", () => {
+      const host = target();
+      const dock = new QueueDockRenderer();
+      const entries = [{ id: "withdrawal", text: "Keep text", queuedAt: 1, delivery: "steer" as const, unconfirmed: true as const }, { id: "primary", text: "Admission unknown", queuedAt: 2, delivery: "steer" as const, unconfirmed: true as const }];
+      const context = { steering: true, sendNow: true, running: false, isCommand: () => false, withdrawalRetries: new Set(["withdrawal"]) };
+      dock.render(host, entries, context);
+      expect([...host.querySelectorAll("button")].map(button => button.textContent)).toEqual(["Retry withdrawal"]);
+      expect(host.querySelector<HTMLButtonElement>("button")!.disabled).toBe(false);
+      dock.render(host, entries, { ...context, pendingActions: new Set(["withdrawal"]) });
+      expect(host.querySelector<HTMLButtonElement>("button")!.disabled).toBe(true);
     });
     const queued = (overrides: Partial<import("./types").QueuedMessage> & { id: string }): import("./types").QueuedMessage => ({ text: overrides.id, queuedAt: 1, delivery: "queue", ...overrides });
     const steering = { steering: true, sendNow: true, running: true, isCommand: (text: string) => text.startsWith("/") };

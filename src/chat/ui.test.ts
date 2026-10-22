@@ -108,6 +108,131 @@ describe("chat reversible-history composer", () => {
     }
   });
 
+  for (const terminal of ["none", "removed", "delivered"] as const) for (const switched of [false, true]) for (const action of ["remove", "edit", "queue"] as const) {
+    if (terminal !== "none" && action !== "remove") continue;
+    const name = `unconfirmed withdrawal on ${action} ${switched ? "cannot affect a newly selected conversation" : "retains input and retries withdrawal only"}${terminal === "none" ? "" : ` after early ${terminal}`}`;
+    test(name, async () => {
+    // Chat intentionally survives pagehide. Keep its pending renders and save
+    // timers from writing through the next case's global DOM/storage fixture.
+    if (process.env.UATU_WITHDRAWAL_UI_CASE !== "1") {
+      const child = Bun.spawn({
+        cmd: [process.execPath, "test", import.meta.path, "-t", `${name}$`],
+        env: { ...process.env, UATU_WITHDRAWAL_UI_CASE: "1" },
+        stdout: "pipe", stderr: "pipe",
+      });
+      const [stdout, stderr, exitCode] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+      expect(exitCode, `${stdout}\n${stderr}`).toBe(0);
+      return;
+    }
+    const { document, window } = parseHTML(html);
+    installDomGlobals(document, window);
+    document.documentElement.setAttribute("data-ui-mode", "desktop");
+    document.documentElement.setAttribute("data-chat-panel", "open");
+    stubConversationSelect(document);
+    const { ChatApiClient } = await import("./client");
+    let mutations = 0, reads = 0;
+    const response = deferred<Response>();
+    const retryResponse = deferred<Response>();
+    const requests: Array<{ url: string; method?: string }> = [];
+    let parent: Parameters<ChatApiClient["stream"]>[2] | undefined;
+    const transport = new ChatApiClient(async (url, init) => {
+      mutations++;
+      requests.push({ url: String(url), method: init?.method });
+      return mutations === 1 ? response.promise : retryResponse.promise;
+    });
+    const api = {
+      status: async () => [{ agent: { id: "test", name: "Test" }, availability: { state: "ready", version: "test", agent: { id: "test", name: "Test", capabilities: ["steering", "send-now"] } } }],
+      conversations: async () => [conversation("one"), conversation("two")], commands: async () => [], models: async () => [], modes: async () => [],
+      snapshot: async (id: string) => { reads++; return { ...snapshot(id), queued: mutations === 1 && id === "one" ? [] : [{ id: "pending", text: id === "one" ? "Original pending input" : "Other conversation input", queuedAt: 1, delivery: "steer" }] }; },
+      removeQueued: transport.removeQueued.bind(transport), changeDelivery: transport.changeDelivery.bind(transport),
+      stream: (_id: string, _cursor: string, handlers: Parameters<ChatApiClient["stream"]>[2]) => { parent = handlers; return { close() {} }; }, inventoryStream: () => ({ close() {} }), attachmentUrl: () => "",
+    } as unknown as ChatApiClient;
+    const { initChat } = await import(`./ui.ts?withdrawal=${action}-${switched}-${Date.now()}`);
+    initChat(api);
+    try {
+      const input = document.querySelector<HTMLTextAreaElement>("#chat-input")!;
+      await waitUntil(() => !input.disabled && !!document.querySelector(`[data-queue-${action}="pending"]`));
+      const select = document.querySelector<HTMLSelectElement>("#chat-conversation-select")!;
+      if (select.value !== "one") {
+        select.value = "one";
+        select.dispatchEvent(new window.Event("change", { bubbles: true }));
+        await waitUntil(() => !!document.querySelector('[data-chat-queued-id="pending"]')?.textContent?.includes("Original pending input"));
+      }
+      input.value = "Draft typed meanwhile";
+      const before = reads;
+      const target = document.querySelector<HTMLButtonElement>(`[data-queue-${action}="pending"]`)!;
+      target.dispatchEvent(new window.Event("click", { bubbles: true }));
+      await waitUntil(() => mutations === 1);
+      if (terminal !== "none") {
+        parent!.event({ type: "conversation.queue", generation: "g", sequence: 1, conversationId: "one", queued: [], change: { kind: terminal, messageId: "pending" } }, "cursor-one-1");
+        if (terminal === "delivered") parent!.event({ type: "item.upsert", generation: "g", sequence: 2, conversationId: "one", item: { id: "message:pending", type: "user_message", text: "Original pending input", createdAt: 2 } }, "cursor-one-2");
+        await waitUntil(() => !document.querySelector('[data-chat-queued-id="pending"]'));
+      }
+      if (switched) {
+        const select = document.querySelector<HTMLSelectElement>("#chat-conversation-select")!;
+        select.value = "two";
+        select.dispatchEvent(new window.Event("change", { bubbles: true }));
+        await waitUntil(() => !!document.querySelector('[data-chat-queued-id="pending"]')?.textContent?.includes("Other conversation input"));
+        input.value = "Other conversation draft";
+      }
+      response.resolve(Response.json({ error: "the agent has not confirmed the withdrawal", code: "steer-withdrawal-unconfirmed" }, { status: 409 }));
+      if (terminal !== "none") {
+        await waitUntil(() => !target.disabled);
+        // Flush the response and any follow-on snapshot render, not a fixed
+        // elapsed-time guess, before checking for a resurrected dock entry.
+        await new Promise<void>(resolve => requestAnimationFrame(() => resolve()));
+        await new Promise<void>(resolve => requestAnimationFrame(() => resolve()));
+        expect(!!document.querySelector('[data-chat-queued-id="pending"]')).toBe(switched);
+        expect(document.querySelector("#chat-action-feedback")!.textContent).not.toContain("withdrawal");
+        expect(reads).toBe(before + (switched ? 1 : 0));
+        expect(input.value).toBe(switched ? "Other conversation draft" : "Draft typed meanwhile");
+        if (terminal === "delivered" && !switched) expect(document.querySelector("#chat-items")!.textContent).toContain("Original pending input");
+        expect(mutations).toBe(1);
+        expect(requests.map(request => request.method)).toEqual(["DELETE"]);
+        return;
+      }
+      if (switched) {
+        await waitUntil(() => !target.disabled);
+        expect(document.querySelector('[data-chat-queued-id="pending"]')!.textContent).toContain("Other conversation input");
+        expect(!!document.querySelector('[data-queue-remove="pending"]')).toBe(true);
+        expect(input.value).toBe("Other conversation draft");
+        expect(document.querySelector("#chat-action-feedback")!.textContent).not.toContain("withdrawal");
+        expect(mutations).toBe(1);
+        return;
+      }
+      await waitUntil(() => document.querySelector("#chat-action-feedback")!.textContent!.includes("withdrawal still unconfirmed"));
+      await waitUntil(() => document.querySelector('[data-queue-remove="pending"]')?.textContent === "Retry withdrawal");
+      expect(reads).toBe(before + 1);
+      expect(document.querySelector('[data-chat-queued-id="pending"]')!.textContent).toContain("Original pending input");
+      expect(input.value).toBe("Draft typed meanwhile");
+      expect(!!document.querySelector('[data-queue-remove="pending"]')).toBe(true);
+      expect(!!document.querySelector('[data-queue-edit="pending"]')).toBe(false);
+      expect(!!document.querySelector('[data-queue-queue="pending"]')).toBe(false);
+      expect(mutations).toBe(1);
+      const retry = document.querySelector<HTMLButtonElement>('[data-queue-remove="pending"]')!;
+      expect(retry.disabled).toBe(false);
+      retry.dispatchEvent(new window.Event("click", { bubbles: true }));
+      retry.dispatchEvent(new window.Event("click", { bubbles: true }));
+      await waitUntil(() => mutations === 2);
+      expect(requests.map(request => request.method)).toEqual([action === "queue" ? "PATCH" : "DELETE", "DELETE"]);
+      expect(requests[1]!.url).toBe(requests[0]!.url);
+      expect(input.value).toBe("Draft typed meanwhile");
+      if (action === "queue") {
+        retryResponse.resolve(Response.json({ error: "the message was already delivered", code: "steer-already-delivered" }, { status: 409 }));
+        await waitUntil(() => document.querySelector("#chat-composer-error")!.textContent!.includes("already delivered"));
+        parent!.event({ type: "item.upsert", generation: "g", sequence: 1, conversationId: "one", item: { id: "message:pending", type: "user_message", text: "Original pending input", createdAt: 2 } }, "cursor-one-1");
+      } else {
+        retryResponse.resolve(Response.json({ removed: true }));
+        parent!.event({ type: "conversation.queue", generation: "g", sequence: 1, conversationId: "one", queued: [], change: { kind: "removed", messageId: "pending" } }, "cursor-one-1");
+      }
+      await waitUntil(() => !document.querySelector('[data-chat-queued-id="pending"]'));
+      expect(input.value).toBe("Draft typed meanwhile");
+      expect(mutations).toBe(2);
+      await waitUntil(() => !document.querySelector("#chat-action-feedback")!.textContent!.includes("withdrawal still unconfirmed"));
+    } finally { window.dispatchEvent(new window.Event("pagehide")); }
+    });
+  }
+
   test("unrelated Remove and a later accepted steer cannot resolve an earlier unknown background operation", async () => {
     const { document, window } = parseHTML(html);
     installDomGlobals(document, window);

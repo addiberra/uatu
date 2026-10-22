@@ -105,6 +105,12 @@ This runs in the admission lane:
 
 The 204-on-missing behavior is why step 2 waits for the event instead of trusting the response. A message is never both delivered and returned or held.
 
+If confirmation remains unavailable, the route returns 409 with `steer-withdrawal-unconfirmed`. The entry stays inspectable with the existing `unconfirmed:true` marker. The browser preserves the draft and pending input and reads status without automatically retrying any mutation. For this withdrawal-specific uncertainty, **Retry withdrawal** explicitly repeats only cancellation against the original native inbox ID; edit, conversion and resubmission stay unavailable until confirmation. A per-entry action lock prevents duplicate clicks and conflicting actions while a request is in flight. Admission/resume uncertainty does not grant this exception.
+
+Each in-flight browser action also records explicit terminal queue events for its conversation and inbox ID. A terminal event observed before an HTTP uncertainty response prevents that response from recreating the notice or pending entry. The fence lasts only for that action, is not an evictable global terminal cache, and is never inferred from passive queue absence.
+
+Passive attach/reconnect reads never infer cancellation of an uncertain withdrawal from absence, even when visible history appears complete: it may exclude reverted delivery or predate cancellation. The adapter retains the entry until positive delivery evidence or settlement, or until an explicit withdrawal retry obtains sufficient post-cancellation inbox/history evidence through D7's bounded fallback. Inbox presence alone cannot settle withdrawal. Concurrent inbox snapshots fence delivered/cancelled entries until their reads finish, and delivered evidence from complete visible history or the live projection wins over a stale pending list. Retry classification is page-local, supplied by the scoped error rather than inferred from the shared public marker; a fresh page with only the generic marker stays conservatively read-only.
+
 A switched-back message takes its submission-order position in the held queue, and the session's configuration at the moment of withdrawal is frozen onto it.
 
 ### D8. Switching a held message to steer and Send now
@@ -156,7 +162,7 @@ The real manual pass targets installed OpenCode 2.0.29, as approved on 2026-10-1
 
 ## Risks / Trade-offs
 
-- [The wait for withdrawal confirmation could hang if the stream is down] → Bounded wait plus an `inbox.list` decision (D7). The mutation reports failure rather than guessing, and the steer stays in the dock.
+- [The wait for withdrawal confirmation could hang if the stream is down] → Bounded wait plus an `inbox.list`/history decision (D7). An uncertain result leaves the steer visible. The user can explicitly retry withdrawal only; no automatic cancellation, editing, conversion or original-message resubmission occurs.
 - [The derived paused state could disagree with OpenCode after a missed idle] → The paused state is recomputed from the projection status on every snapshot and reconnect, so at worst the label is stale and delivery is unaffected. Send now on a steer that is not actually stranded is a harmless wake.
 - [Undo replacement batches older paused steers with the replacement] → By decision (D6). A count-only confirmation explains the batch before submission.
 - [The timeline row moving from enqueue to delivery changes 2.x command id convergence] → D4 re-keys `reportEnqueuedUser`, and the existing command tests guard it.

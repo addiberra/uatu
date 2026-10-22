@@ -30,7 +30,7 @@ export class AutomaticBackgroundNotices {
   unconfirmed(conversation: string, operation: string, action: string, text?: string, subject = "acceptance"): void {
     if (text === undefined) { this.put(conversation, operation, action); return; }
     const origin = actionOrigin(action, text || `attachment-only message · ${operation.replace(/[^a-zA-Z0-9-]/g, "").slice(-8) || "pending"}`);
-    this.put(conversation, operation, `${origin}: ${subject} unconfirmed. Checking conversation status; do not repeat.`);
+    this.put(conversation, operation, `${origin}: ${subject} unconfirmed. Checking conversation status; ${subject === "withdrawal" ? "do not resubmit; you may retry withdrawal" : "do not repeat"}.`);
     this.conversations.get(conversation)!.get(operation)!.origin = origin;
     this.conversations.get(conversation)!.get(operation)!.subject = subject;
   }
@@ -38,7 +38,7 @@ export class AutomaticBackgroundNotices {
   checked(conversation: string, operation: string, available: boolean): void {
     const notice = this.conversations.get(conversation)?.get(operation);
     if (!notice?.origin) return;
-    notice.text = `${notice.origin}: ${available ? `Status checked; ${notice.subject} still unconfirmed` : `Status check unavailable; ${notice.subject} unconfirmed`}. Do not repeat.`;
+    notice.text = `${notice.origin}: ${available ? `Status checked; ${notice.subject} still unconfirmed` : `Status check unavailable; ${notice.subject} unconfirmed`}. ${notice.subject === "withdrawal" ? "Do not resubmit; you may retry withdrawal." : "Do not repeat."}`;
   }
 
   private put(conversation: string, operation: string, text: string): void {

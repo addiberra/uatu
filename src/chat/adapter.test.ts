@@ -1,4 +1,4 @@
-import { describe, expect, test, spyOn } from "bun:test";
+import { describe, expect, test, spyOn, jest } from "bun:test";
 
 import { BackgroundTasksUnsupportedError, ChatQueueFullError, CommandAttachmentsError, CommandSteeringError, ConversationRenameUnsupportedError, deriveConversationTitle, InteractionConflictError, InvalidConversationTitleError, InvalidModeSelectionError, InvalidModelSelectionError, InvalidVariantSelectionError, ChatAdapter, parseSlashCommand, QueuedMessageNotHeldError, ReversibleHistoryUnsupportedError, ScheduledWakeupsUnsupportedError, SendNowUnavailableError, SendNowUnsupportedError, SteerAlreadyDeliveredError, SteeringUnsupportedError, SteerWithdrawalUnconfirmedError, UnknownAttachmentError, UsageUnsupportedError } from "./adapter";
 import { createClaudeEventMemory, normalizeClaudeMessage } from "./claude/normalization";
@@ -219,6 +219,18 @@ function applyEvent(adapter: ChatAdapter, conversationId: string, event: Provide
 async function waitUntil(predicate: () => boolean): Promise<void> {
   for (let attempt = 0; attempt < 1_000 && !predicate(); attempt += 1) await Bun.sleep(1);
   expect(predicate()).toBe(true);
+}
+
+// For promise-only fixtures under a frozen clock: drain work without advancing
+// deadlines (Bun.sleep is itself controlled by native fake timers).
+async function flushUntil(predicate: () => boolean): Promise<void> {
+  for (let attempt = 0; attempt < 1_000 && !predicate(); attempt++) await Promise.resolve();
+  expect(predicate()).toBe(true);
+}
+
+async function admissionsApplied(adapter: ChatAdapter): Promise<void> {
+  const admissions = (adapter as unknown as { promptAdmissions: Map<string, Promise<void>> }).promptAdmissions;
+  await Promise.all([...admissions.values()]);
 }
 
 // Every live event pushed so far has been handled and its updates applied:
@@ -2392,17 +2404,24 @@ describe("prompt, abort, permission, and question mutations", () => {
     expect((await adapter.history("session")).items).toContainEqual({ ...task, stateUncertain: false });
     await adapter.dispose();
   });
-  test("recovery replaces a live joined-call identity with the canonical history worker, not a second worker", async () => {
+  for (const path of ["snapshot", "stream"] as const) for (const alias of ["joined-call", "result"] as const) test(`${path} recovery replaces a live ${alias} identity with the canonical history worker, not a second worker`, async () => {
     const provider = new FakeProvider();
     provider.sessions = [fixtureSession("session")];
-    const canonical = { id: "task:first", type: "background_task" as const, taskId: "first", createdAt: 1, description: "Worker", status: "running" as const, toolUseId: "first", toolUseIds: ["first", "joined"] };
+    const canonical = { id: "task:first", type: "background_task" as const, taskId: "first", createdAt: 1, description: "Worker", status: "running" as const, ...(alias === "result" ? { resultId: "result" } : { toolUseId: "first", toolUseIds: ["first", "joined"] }) };
     Object.assign(provider, { reconcileBackgroundTasks: async () => [canonical] });
     const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g" });
-    adapter.projectionForTests("session").apply({ kind: "upsert", item: { ...canonical, id: "task:joined", taskId: "joined", toolUseId: "joined", toolUseIds: undefined } });
-    const snapshot = await adapter.history("session");
-    expect(snapshot.items.filter(item => item.type === "background_task")).toEqual([canonical]);
-    expect(adapter.projectionForTests("session").items().filter(item => item.type === "background_task")).toEqual([canonical]);
-    await adapter.dispose();
+    adapter.projectionForTests("session").apply({ kind: "upsert", item: { ...canonical, id: "task:joined", taskId: "joined", ...(alias === "joined-call" ? { toolUseId: "joined", toolUseIds: undefined } : {}) } });
+    const pump = path === "stream" ? adapter.startEventPump() : undefined;
+    try {
+      if (path === "snapshot") {
+        const snapshot = await adapter.history("session");
+        expect(snapshot.items.filter(item => item.type === "background_task")).toEqual([canonical]);
+      } else {
+        provider.eventQueue.push({ type: "server.connected", data: {} });
+        await waitUntil(() => adapter.projectionForTests("session").has(canonical.id));
+      }
+      expect(adapter.projectionForTests("session").items().filter(item => item.type === "background_task")).toEqual([canonical]);
+    } finally { await adapter.dispose(); await pump; }
   });
   for (const evict of [false, true]) test(`idle-parent snapshot recovers an out-of-page worker and its pending result${evict ? " after projection eviction" : ""}`, async () => {
     const provider = new FakeProvider();
@@ -2562,12 +2581,15 @@ describe("prompt, abort, permission, and question mutations", () => {
     const provider = new FakeProvider();
     provider.sessions = [fixtureSession("session")];
     let reads = 0;
+    let configurationRead = false;
+    provider.getConversationConfiguration = async () => { configurationRead = true; return {}; };
     Object.assign(provider, { reconcileBackgroundTasks: async () => { reads++; return []; } });
     const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g" });
     const pump = adapter.startEventPump();
     await waitUntil(() => provider.eventQueue.waiting);
     const snapshot = adapter.history("session");
-    await Bun.sleep(20);
+    // Observe the actual gate rather than assuming a 20 ms scheduling window.
+    await waitUntil(() => configurationRead);
     expect(reads).toBe(0);
     provider.eventQueue.push({ type: "server.connected", data: {} });
     await snapshot;
@@ -2641,16 +2663,29 @@ describe("prompt, abort, permission, and question mutations", () => {
     provider.sessions = [fixtureSession("session")];
     let reads = 0;
     const item = { id: "task:worker", taskId: "worker", type: "background_task" as const, createdAt: 1, description: "Worker", status: "running" as const };
-    Object.assign(provider, { reconcileBackgroundTasks: async () => [{ ...item, stateUncertain: ++reads === 1 }] });
+    let release!: () => void;
+    const firstRead = new Promise<void>(resolve => { release = resolve; });
+    Object.assign(provider, { reconcileBackgroundTasks: async () => { const first = ++reads === 1; if (first) await firstRead; return [{ ...item, stateUncertain: first }]; } });
     const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g" });
     const pump = adapter.startEventPump();
-    provider.eventQueue.push({ type: "server.connected", data: {} });
-    await waitUntil(() => reads === 1);
-    await Bun.sleep(20);
-    expect(reads).toBe(1);
-    await waitUntil(() => reads === 2);
-    expect(adapter.projectionForTests("session").find(item => item.id === "task:worker")).toMatchObject({ stateUncertain: false });
-    await adapter.dispose(); await pump;
+    try {
+      provider.eventQueue.push({ type: "server.connected", data: {} });
+      await waitUntil(() => reads === 1);
+      jest.useFakeTimers();
+      release();
+      await flushUntil(() => [...(adapter as unknown as { backgroundRecoveries: Map<string, { timer?: unknown }> }).backgroundRecoveries.values()].some(recovery => recovery.timer !== undefined));
+      jest.advanceTimersByTime(999);
+      expect(reads).toBe(1);
+      jest.advanceTimersByTime(1);
+      // The next read validates the session directory through real filesystem
+      // IO; it is not a timer, so unfreeze after crossing the exact deadline.
+      jest.useRealTimers();
+      await waitUntil(() => reads === 2 && !(adapter.projectionForTests("session").find(item => item.id === "task:worker") as { stateUncertain?: boolean } | undefined)?.stateUncertain);
+      expect(adapter.projectionForTests("session").find(item => item.id === "task:worker")).toMatchObject({ stateUncertain: false });
+    } finally {
+      await adapter.dispose(); await pump;
+      jest.useRealTimers();
+    }
   });
   for (const expired of [false, true]) test(`background completion ${expired ? "uses a fresh read after an expired cursor" : "replays from a retained cursor"} without execution mutations`, async () => {
     const provider = new FakeProvider();
@@ -6008,6 +6043,124 @@ describe("steering (opencode-v2-steering)", () => {
     return { provider, adapter, inbox, steer, queue, queued };
   }
   // The queue events a subscriber saw, as `kind:messageId`.
+  for (const outcome of ["delivered", "cancelled"] as const) test(`a delayed inbox read cannot resurrect a ${outcome} steer or discard new pending entries`, async () => {
+    const { adapter, provider, inbox } = steering();
+    const pump = adapter.startEventPump();
+    try {
+      const accepted = { messageId: "old-steer" };
+      provider.pendingInbox = [{ id: accepted.messageId, text: "follow up", delivery: "steer", at: 1 }];
+      await adapter.history("session");
+      await liveEventsApplied(adapter, provider);
+      let release!: () => void, entered!: () => void;
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      const started = new Promise<void>(resolve => { entered = resolve; });
+      provider.listPendingInbox = async () => {
+        const captured = [...provider.pendingInbox, { id: "another-client", text: "new valid input", delivery: "steer" as const, at: 2 }];
+        entered();
+        await gate;
+        return captured;
+      };
+      const read = adapter.history("session");
+      await started;
+      inbox({ kind: "settled", id: accepted.messageId, outcome });
+      // Outlive the small delivered-id cache as well: the in-flight read's
+      // fence, not retained receipts/tombstones, must protect this snapshot.
+      for (let index = 0; index < 70; index++) inbox({ kind: "settled", id: `other-${index}`, outcome: "delivered" });
+      await liveEventsApplied(adapter, provider);
+      release();
+      expect((await read).queued?.map(entry => entry.id)).toEqual(["another-client"]);
+      expect((adapter as unknown as { inboxReads: Map<string, unknown> }).inboxReads.size).toBe(0);
+    } finally {
+      await adapter.dispose();
+      await pump;
+    }
+  });
+
+  test("confirmed read-side withdrawal fences an older inbox read even without a settlement event", async () => {
+    const { adapter, provider, steer } = steering({ steerWithdrawTimeoutMs: 1 });
+    try {
+      adapter.projectionForTests("session").statusUpdate("running");
+      const accepted = await steer("original", "withdraw me");
+      let release!: () => void, entered!: () => void;
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      const started = new Promise<void>(resolve => { entered = resolve; });
+      let reads = 0;
+      provider.listPendingInbox = async () => {
+        if (++reads > 1) return [];
+        const captured = [...provider.pendingInbox];
+        entered(); await gate; return captured;
+      };
+      const snapshot = adapter.history("session");
+      await started;
+      await adapter.removeQueued("session", accepted.messageId, "remove");
+      release();
+      expect((await snapshot).queued).toEqual([]);
+      expect(provider.cancelledInbox).toEqual([accepted.messageId]);
+    } finally { await adapter.dispose(); }
+  });
+
+  for (const source of ["visible", "complete", "projection"] as const) test(`delivered evidence in ${source} history wins over a stale inbox listing`, async () => {
+    const { adapter, provider, steer } = steering();
+    try {
+      adapter.projectionForTests("session").statusUpdate("running");
+      const accepted = await steer("original", "already delivered");
+      const row = { id: `message:${accepted.messageId}`, type: "user_message" as const, createdAt: 2, text: "already delivered" };
+      if (source === "projection") adapter.projectionForTests("session").apply({ kind: "upsert", item: row });
+      provider.listMessages = async () => ({ items: source === "visible" ? [row] : [], completeItems: source === "complete" ? [row] : source === "visible" ? [row] : [], accounting: [] });
+      const { events } = await adapter.subscribe("session");
+      const changes: string[] = [];
+      const consumed = (async () => { for await (const event of events) if (event.type === "conversation.queue") changes.push(event.change.kind); })();
+      const snapshot = await adapter.history("session");
+      expect(snapshot.queued).toEqual([]);
+      events.cancel(); await consumed;
+      expect(changes).toContain("delivered");
+      expect(changes).not.toContain("removed");
+      expect(provider.prompts).toHaveLength(1);
+    } finally { await adapter.dispose(); }
+  });
+
+  test("unconfirmed withdrawal stays inspectable and permits only an explicit withdrawal retry", async () => {
+    const { adapter, provider, steer, queued } = steering({ steerWithdrawTimeoutMs: 1 });
+    try {
+      adapter.projectionForTests("session").statusUpdate("running");
+      const accepted = await steer("original", "retain this input");
+      await expect(adapter.removeQueued("session", accepted.messageId, "first")).rejects.toBeInstanceOf(SteerWithdrawalUnconfirmedError);
+      expect(await queued()).toEqual([expect.objectContaining({ text: "retain this input", unconfirmed: true })]);
+      await expect(adapter.removeQueued("session", accepted.messageId, "second")).rejects.toBeInstanceOf(SteerWithdrawalUnconfirmedError);
+      await expect(adapter.changeDelivery("session", accepted.messageId, "convert", "queue")).rejects.toBeInstanceOf(SteerWithdrawalUnconfirmedError);
+      await expect(adapter.sendNow("session", accepted.messageId, "wake")).rejects.toBeInstanceOf(SteerWithdrawalUnconfirmedError);
+      expect(provider.cancelledInbox).toEqual([accepted.messageId, accepted.messageId]);
+      expect(provider.prompts).toHaveLength(1);
+      provider.pendingInbox = [];
+      expect(await queued()).toEqual([expect.objectContaining({ id: accepted.messageId, unconfirmed: true })]);
+      await expect(adapter.removeQueued("session", accepted.messageId, "confirmed-retry")).resolves.toEqual({ removed: true });
+      expect(await queued()).toEqual([]);
+    } finally { await adapter.dispose(); }
+  });
+
+  for (const outcome of ["cancelled", "delivered"] as const) test(`explicit withdrawal retry settles as ${outcome} without another prompt or inbox identity`, async () => {
+    const { adapter, provider, steer, inbox } = steering({ steerWithdrawTimeoutMs: 1 });
+    const pump = adapter.startEventPump();
+    try {
+      adapter.projectionForTests("session").statusUpdate("running");
+      const accepted = await steer("original", "retained original");
+      await expect(adapter.removeQueued("session", accepted.messageId, "first")).rejects.toBeInstanceOf(SteerWithdrawalUnconfirmedError);
+      provider.cancelInbox = async (_id, nativeId) => {
+        provider.cancelledInbox.push(nativeId);
+        inbox({ kind: "settled", id: nativeId, outcome });
+        if (outcome === "delivered") provider.listMessages = async () => ({ items: [{ id: `message:${nativeId}`, type: "user_message", text: "retained original", createdAt: 2 }], accounting: [] });
+      };
+      const retry = adapter.removeQueued("session", accepted.messageId, "explicit-retry");
+      if (outcome === "delivered") await expect(retry).rejects.toBeInstanceOf(SteerAlreadyDeliveredError);
+      else await expect(retry).resolves.toEqual({ removed: true });
+      const snapshot = await adapter.history("session");
+      expect(snapshot.queued).toEqual([]);
+      if (outcome === "delivered") expect(snapshot.items).toContainEqual(expect.objectContaining({ id: `message:${accepted.messageId}`, text: "retained original" }));
+      expect(provider.cancelledInbox).toEqual([accepted.messageId, accepted.messageId]);
+      expect(provider.prompts).toHaveLength(1);
+    } finally { await adapter.dispose(); await pump; }
+  });
+
   for (const outcome of ["accepted", "primary-unknown", "follow-up-unknown"] as const) {
     for (const boundary of ["ttl", "entries", "bytes", "recreation"] as const) test(`composite ${outcome} receipt protection ends at ${boundary}, never by read-side replay`, async () => {
       let clock = 0, backgrounds = 0;
@@ -6172,6 +6325,14 @@ describe("steering (opencode-v2-steering)", () => {
     const uncertain = await adapter.history("session");
     expect(uncertain.queued).toHaveLength(2);
     expect(uncertain.queued?.every(entry => entry.unconfirmed)).toBe(true);
+    const listed = provider.pendingInbox;
+    provider.pendingInbox = [];
+    const absent = await adapter.history("session");
+    expect(absent.queued).toHaveLength(2);
+    expect(absent.queued?.every(entry => entry.unconfirmed)).toBe(true);
+    await expect(adapter.removeQueued("session", first.messageId, "not-a-withdrawal-retry")).rejects.toBeInstanceOf(OperationOutcomeUnknownError);
+    expect(provider.cancelledInbox).toEqual([]);
+    provider.pendingInbox = listed;
     await expect(adapter.sendNow("session", first.messageId, "fresh-resume", context)).rejects.toBeInstanceOf(OperationOutcomeUnknownError);
     expect(resumes).toBe(1);
     projection.statusUpdate("running");
@@ -6561,7 +6722,7 @@ describe("steering (opencode-v2-steering)", () => {
     await adapter.abort("session", "cancel-1");
     expect(provider.interruptOptions).toEqual([{ resume: false }]);
     adapter.projectionForTests("session").statusUpdate("idle");
-    await Bun.sleep(20);
+    await admissionsApplied(adapter);
     expect(provider.prompts).toHaveLength(2);
     expect(await queued()).toEqual([
       expect.objectContaining({ id: steered.messageId, delivery: "steer", paused: true }),
@@ -6712,8 +6873,19 @@ describe("steering (opencode-v2-steering)", () => {
       expect(adapter.pendingSteersForTests("session").map(entry => entry.id)).toEqual([accepted.messageId]);
       expect(provider.prompts).toHaveLength(1);
       const snapshot = await adapter.history("session");
+      expect(snapshot.queued).toEqual([expect.objectContaining({ id: accepted.messageId, unconfirmed: true })]);
+      await expect(adapter.removeQueued("session", accepted.messageId, "explicit-withdrawal-retry")).rejects.toBeInstanceOf(SteerWithdrawalUnconfirmedError);
+      expect((await adapter.history("session")).queued).toEqual([expect.objectContaining({ id: accepted.messageId, unconfirmed: true })]);
+      expect(provider.cancelledInbox).toEqual([accepted.messageId, accepted.messageId]);
       expect(snapshot.queued?.filter(entry => entry.delivery === "queue") ?? []).toEqual([]);
       expect(JSON.stringify(snapshot)).not.toContain("deliveryHistoryIncomplete");
+      for (let index = 0; index < 70; index++) adapter.projectionForTests(`eviction-${index}`);
+      expect((await adapter.history("session")).queued).toEqual([expect.objectContaining({ id: accepted.messageId, unconfirmed: true })]);
+      const pump = adapter.startEventPump();
+      try {
+        await liveEventsApplied(adapter, provider);
+        expect((await adapter.history("session")).queued).toEqual([expect.objectContaining({ id: accepted.messageId, unconfirmed: true })]);
+      } finally { await adapter.stopEventPump(); await pump; }
     } finally { await native.dispose?.(); await adapter.dispose(); }
   });
 
@@ -6911,7 +7083,7 @@ describe("steering (opencode-v2-steering)", () => {
     expect((await queued()).map(entry => `${entry.id}:${entry.delivery}`)).toEqual([`${switched.messageId}:steer`, `${first.messageId}:queue`]);
     expect((await queued())[1]).toEqual(expect.objectContaining({ paused: true }));
     adapter.projectionForTests("session").statusUpdate("completed");
-    await Bun.sleep(20);
+    await admissionsApplied(adapter);
     expect(provider.prompts).toHaveLength(2);
     await waitUntil(() => watch.changes.includes(`switched:${switched.messageId}`));
     // Send now on a steering agent is the same operation.
@@ -6956,7 +7128,7 @@ describe("steering (opencode-v2-steering)", () => {
     await waitUntil(() => watch.changes.includes(`delivered:${second.messageId}`));
     // The rest stay dormant: the turn ending delivers nothing by itself.
     adapter.projectionForTests("session").statusUpdate("completed");
-    await Bun.sleep(20);
+    await admissionsApplied(adapter);
     expect(provider.prompts).toHaveLength(2);
     // Without send-now, or steering, the operations are refused outright.
     const plain = steering({ capabilities: [] });

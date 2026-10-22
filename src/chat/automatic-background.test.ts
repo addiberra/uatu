@@ -68,6 +68,16 @@ test("successful acknowledgements never enter the readable notice band", () => {
   expect(notices.text("parent")).toBe(automaticBackgroundNote("unknown"));
 });
 
+test("withdrawal uncertainty permits only explicit cancellation retry, not message resubmission", () => {
+  const notices = new AutomaticBackgroundNotices();
+  notices.unconfirmed("parent", "withdraw", "Remove pending message", "Original", "withdrawal");
+  expect(notices.text("parent")).toContain("do not resubmit; you may retry withdrawal");
+  notices.checked("parent", "withdraw", true);
+  expect(notices.text("parent")).toContain("withdrawal still unconfirmed. Do not resubmit; you may retry withdrawal.");
+  notices.unconfirmed("parent", "primary", "Steer", "Admission unknown");
+  expect(notices.text("parent")).toContain("Checking conversation status; do not repeat.");
+});
+
 test("failures and uncertainty keep operation order and successful resolution removes only its source", () => {
   const notices = new AutomaticBackgroundNotices();
   notices.record("parent", "first", "failed");

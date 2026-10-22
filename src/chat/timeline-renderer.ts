@@ -1126,6 +1126,10 @@ export type QueueDockContext = {
   note?: HTMLElement;
   replacement?: boolean;
   pausedSteers?: number;
+  // Page-local classification from a withdrawal-specific error, never inferred
+  // from the public unconfirmed marker (which also covers admission/resume).
+  withdrawalRetries?: Pick<ReadonlySet<string>, "has">;
+  pendingActions?: Pick<ReadonlySet<string>, "has">;
   // Shared disclosure state; omitted by callers without compact presentation.
   compactOpen?: boolean;
 };
@@ -1167,8 +1171,11 @@ function renderQueued(entry: QueuedMessage, context: QueueDockContext, discrimin
   const id = escapeHtmlAttribute(entry.id);
   const classes = `chat-queued-message ${entry.delivery === "steer" ? "is-steer" : "is-held"}`;
   const message = entry.text.trim() ? entry.text : "Image attachment";
-  const buttons = (entry.unconfirmed ? [] : queuedActions(entry, context)).map(([attribute, label]) => `<button type="button" class="chat-queued-action${attribute === "data-queue-remove" ? " chat-queued-remove" : ""}" aria-label="${escapeHtmlAttribute(`${label} “${message}”${discriminator === undefined ? "" : `, pending message ${discriminator}`}`)}" ${attribute}="${id}">${escapeHtml(label)}</button>`).join("");
-  return `<article class="${classes}" role="listitem" data-chat-queued-id="${id}" data-delivery="${entry.delivery}"${entry.paused ? " data-paused" : ""}><div class="chat-queued-heading"><strong class="chat-queued-badge">${entry.delivery === "steer" ? "Steer" : "Queue"}</strong>${entry.unconfirmed ? '<span class="chat-queued-paused">Acceptance unconfirmed</span>' : entry.paused ? '<span class="chat-queued-paused">Paused</span>' : ""}<small class="chat-queued-tag">${entry.unconfirmed ? "Do not repeat this pending message" : escapeHtml(queuedTag(entry))}</small></div>${renderMessageAttachments(entry.attachments)}${entry.text ? `<p>${escapeHtml(entry.text)}</p>` : ""}<footer class="chat-queued-row"><span class="chat-queued-actions">${buttons}</span></footer></article>`;
+  const actions: Array<[string, string]> = entry.unconfirmed
+    ? context.withdrawalRetries?.has(entry.id) ? [["data-queue-remove", "Retry withdrawal"]] : []
+    : queuedActions(entry, context);
+  const buttons = actions.map(([attribute, label]) => `<button type="button" class="chat-queued-action${attribute === "data-queue-remove" ? " chat-queued-remove" : ""}" aria-label="${escapeHtmlAttribute(`${label} “${message}”${discriminator === undefined ? "" : `, pending message ${discriminator}`}`)}" ${attribute}="${id}"${context.pendingActions?.has(entry.id) ? " disabled" : ""}>${escapeHtml(label)}</button>`).join("");
+  return `<article class="${classes}" role="listitem" data-chat-queued-id="${id}" data-delivery="${entry.delivery}"${entry.paused ? " data-paused" : ""}><div class="chat-queued-heading"><strong class="chat-queued-badge">${entry.delivery === "steer" ? "Steer" : "Queue"}</strong>${entry.unconfirmed ? '<span class="chat-queued-paused">Outcome unconfirmed</span>' : entry.paused ? '<span class="chat-queued-paused">Paused</span>' : ""}<small class="chat-queued-tag">${entry.unconfirmed ? "Do not repeat this pending message" : escapeHtml(queuedTag(entry))}</small></div>${renderMessageAttachments(entry.attachments)}${entry.text ? `<p>${escapeHtml(entry.text)}</p>` : ""}<footer class="chat-queued-row"><span class="chat-queued-actions">${buttons}</span></footer></article>`;
 }
 
 /**

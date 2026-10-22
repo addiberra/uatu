@@ -452,6 +452,17 @@ For each pending entry, the user SHALL be able to:
 
 Withdrawing a steer SHALL complete only when the agent confirms the withdrawal. If the agent delivers the steer first, the withdrawal SHALL fail, the message SHALL stay delivered, and the user SHALL be told it was already delivered. A message SHALL never be delivered twice.
 
+An unconfirmed withdrawal SHALL keep the pending entry and private draft visible. Absence from a passive inbox/history snapshot SHALL NOT by itself confirm cancellation. A client with withdrawal-specific uncertainty SHALL offer **Retry withdrawal**, which explicitly repeats only native cancellation of the same inbox ID. It SHALL NOT edit, convert, resubmit the original input, automatically retry any mutation, or allow concurrent actions on that entry. Admission/resume uncertainty SHALL remain read-only and SHALL NOT grant withdrawal retry.
+
+#### Scenario: Hidden delivery does not erase an uncertain withdrawal
+- **WHEN** a withdrawal is unconfirmed and a later inbox read is empty while V2 history hides reverted messages
+- **THEN** the original pending entry and attachments remain inspectable, and no removal is published based on that absence
+
+#### Scenario: An explicit withdrawal retry does not resend input
+- **WHEN** the user activates Retry withdrawal
+- **THEN** only cancellation of the original inbox ID is requested again, with no prompt or new message ID
+- **AND** confirmed cancellation removes the entry, confirmed delivery removes it with an already-delivered warning, and an inconclusive result keeps it visible
+
 Skills, slash commands, and `/reload` in the queue SHALL NOT offer the switch to steer.
 
 Cancelling the turn SHALL leave pending steers with the agent and SHALL present them as paused. A steer is paused when it was pending before the conversation last became idle. The dock SHALL offer one action labelled `Send N paused steers now`, which resumes the agent so that it delivers every pending steer. Submitting a new steer SHALL also resume delivery of paused steers.

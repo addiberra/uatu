@@ -296,6 +296,18 @@ Edit returns an entry to the composer only after withdrawal succeeds. If
 delivery wins first, **Too late — already delivered** is informational: your
 private draft stays intact and the delivered message appears only once.
 
+If withdrawal cannot be confirmed, the pending entry and private draft stay
+visible. Chat checks status read-only; an empty inbox or filtered/reverted
+history does not silently remove the uncertain input. **Retry withdrawal**
+explicitly retries cancellation of the same native inbox ID, never resubmits
+the message. Edit and Steer → Queue remain unavailable until confirmation;
+duplicate clicks cannot start concurrent actions on the entry. Cancellation
+confirmation removes it; delivery confirmation says **Too late — already
+delivered** and the message stays delivered once. An inconclusive retry leaves
+the entry visible. Admission/resume uncertainty remains read-only. The retry
+classification is page-local: after reload, a generic unconfirmed entry alone
+does not establish that withdrawal retry is safe.
+
 ### Background workers (OpenCode V2)
 
 OpenCode V2 exposes native background-worker inspection and controls. Automated

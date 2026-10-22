@@ -7,7 +7,7 @@ import { ConversationInventoryBroadcaster } from "../chat/inventory-broadcaster"
 import type { WorkspaceChatService } from "../chat/service";
 import { isLiveConversationStatus, type ChatAccountChange, type AgentUsageReport, type BackgroundTaskOutput, type UsageReadMode, type UsageReadResult, type ChatActivity, type ChatAvailability, type ConversationSnapshot, type ConversationStatus, type ConversationSummary, type MessageAttachment, type MessageDelivery, type ModelSelection, type PermissionOutcome, type QuestionOutcome, type ReversibleHistoryResult } from "../chat/types";
 import { ConversationNotFoundError } from "../chat/workspace";
-import { CommandSteeringError, ConversationRenameUnsupportedError, QueuedMessageNotHeldError, ReversibleHistoryUnsupportedError, ScheduledWakeupsUnsupportedError, SendNowUnavailableError, SendNowUnsupportedError, SteerAlreadyDeliveredError, SteeringUnsupportedError } from "../chat/adapter";
+import { CommandSteeringError, ConversationRenameUnsupportedError, QueuedMessageNotHeldError, ReversibleHistoryUnsupportedError, ScheduledWakeupsUnsupportedError, SendNowUnavailableError, SendNowUnsupportedError, SteerAlreadyDeliveredError, SteeringUnsupportedError, SteerWithdrawalUnconfirmedError } from "../chat/adapter";
 import { OperationOutcomeUnknownError, ReversibleHistoryTargetError, InvalidQuestionAnswerError, ReleaseUnavailableError, ScheduledWakeupUnavailableError } from "../chat/provider";
 import { MetricsRegistry } from "../debug/metrics";
 import { activeGauge, closedCounter, openedCounter, reconnectedCounter } from "../debug/stream-metrics";
@@ -102,6 +102,7 @@ class FakeChatService implements WorkspaceChatService {
   async removeQueued(id: string, messageId: string, _requestId: string) {
     this.require(id);
     if (messageId === "delivered") throw new QueuedMessageNotHeldError();
+    if (messageId === "unconfirmed") throw new SteerWithdrawalUnconfirmedError();
     if (messageId === "steered") throw new SteerAlreadyDeliveredError();
     this.removals.push(messageId);
     return { removed: true } as const;
@@ -112,6 +113,7 @@ class FakeChatService implements WorkspaceChatService {
     this.actionContexts.push(context);
     this.require(id);
     if (messageId === "steered") throw new SteerAlreadyDeliveredError();
+    if (messageId === "unconfirmed") throw new SteerWithdrawalUnconfirmedError();
     if (messageId === "command") throw new CommandSteeringError();
     if (messageId === "unsupported") throw new SteeringUnsupportedError();
     this.switches.push({ messageId, delivery });
@@ -765,6 +767,9 @@ describe("workspace chat routes", () => {
     const late = await send("steered");
     expect(late.status).toBe(409);
     expect(await late.json()).toEqual({ error: "the message was already delivered", code: "steer-already-delivered" });
+    const unconfirmed = await send("unconfirmed");
+    expect(unconfirmed.status).toBe(409);
+    expect(await unconfirmed.json()).toMatchObject({ code: "steer-withdrawal-unconfirmed" });
 
     const foreign = handler.DELETE(request("/api/chat/conversations/other/queue/held-1", {
       method: "DELETE", headers: { origin: "http://127.0.0.1:4711", "content-type": "application/json" }, body: JSON.stringify({ requestId: "remove-2" }),
@@ -809,6 +814,9 @@ describe("workspace chat routes", () => {
     expect(late.status).toBe(409);
     expect(await late.json()).toEqual({ error: "the message was already delivered", code: "steer-already-delivered" });
     const command = await send("command");
+    const unconfirmed = await send("unconfirmed", { requestId: "withdrawal-unknown", delivery: "queue" });
+    expect(unconfirmed.status).toBe(409);
+    expect(await unconfirmed.json()).toMatchObject({ code: "steer-withdrawal-unconfirmed" });
     expect(command.status).toBe(409);
     expect(await command.json()).toEqual({ error: "a command cannot be steered; it stays queued" });
     expect((await send("unsupported")).status).toBe(409);

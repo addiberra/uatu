@@ -1417,7 +1417,7 @@ function normalizedChatError(error: unknown): Response {
   if (error instanceof QueuedMessageNotHeldError) return chatError(409, error.message);
   // Its own code: the client says "too late" rather than "not held" (D7).
   if (error instanceof SteerAlreadyDeliveredError) return chatError(409, error.message, "steer-already-delivered");
-  if (error instanceof SteerWithdrawalUnconfirmedError) return chatError(409, error.message);
+  if (error instanceof SteerWithdrawalUnconfirmedError) return chatError(409, error.message, "steer-withdrawal-unconfirmed");
   if (error instanceof SteeringUnsupportedError) return chatError(409, error.message);
   if (error instanceof SendNowUnsupportedError) return chatError(409, error.message);
   if (error instanceof SendNowUnavailableError) return chatError(409, error.message);

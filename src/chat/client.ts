@@ -43,6 +43,7 @@ export class ChatTransportError extends Error {
 }
 
 export const STEER_ALREADY_DELIVERED_CODE = "steer-already-delivered";
+export const STEER_WITHDRAWAL_UNCONFIRMED_CODE = "steer-withdrawal-unconfirmed";
 
 // A transport gap the client is already recovering from — distinct from a
 // provider failure, a rejected turn, or invalid data, all of which need the

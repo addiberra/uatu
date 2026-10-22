@@ -2446,10 +2446,14 @@ components:
         A pending submission, not a timeline item. Queue is held by Uatu until
         the turn ends; steer is pending with a steering-capable agent for its
         native next-step boundary. Paused means no ordinary delivery is scheduled.
-        Unconfirmed takes precedence over delivery/paused labels: admission or
-        batch resume may have applied, so retain text/attachments, suppress
-        resend/edit/remove/batch actions and reconcile read-only. It neither
-        asserts native admission nor promises native work is paused. The
+        Unconfirmed takes precedence over delivery/paused labels: admission,
+        batch resume or withdrawal may have applied, so retain text/attachments, suppress
+        resend/edit/remove/batch actions and reconcile read-only. A client with
+        the scoped steer-withdrawal-unconfirmed error may offer an explicit
+        cancellation-only retry against the same inbox ID; the generic marker
+        alone does not grant this exception. No mutation is retried automatically.
+        It does not
+        assert native admission, confirm withdrawal, or promise native work is paused. The
         original requestId links the submitting client's unconfirmed input.
       properties:
         id: { type: string }

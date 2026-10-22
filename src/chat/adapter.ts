@@ -54,6 +54,22 @@ class PrimarySteerOutcomeUnknownError extends OperationOutcomeUnknownError {
 // call in practice; its cursor loop is the backstop, not the plan.
 const RECONSTRUCTION_READ_LIMIT = 10_000;
 const INVENTORY_SESSION_LIMIT = 2_048;
+
+// Recovery can learn a canonical worker identity after a live placeholder.
+// Share only alias matching; snapshot and stream callers own their distinct
+// missing-worker uncertainty and publication policies.
+function indexRecoveredBackgroundTasks(tasks: readonly BackgroundTaskItem[]) {
+  const byId = new Map(tasks.map(item => [item.id, item]));
+  const results = new Map(tasks.flatMap(item => item.resultId ? [[item.resultId, item.id] as const] : []));
+  const launches = new Map(tasks.flatMap(item => [...(item.toolUseIds ?? []), ...(item.toolUseId ? [item.toolUseId] : [])].map(call => [call, item.id] as const)));
+  return {
+    byId,
+    supersedes: (known: BackgroundTaskItem): boolean => Boolean(
+      known.resultId && results.has(known.resultId) && results.get(known.resultId) !== known.id
+      || known.toolUseId && launches.has(known.toolUseId) && launches.get(known.toolUseId) !== known.id),
+  };
+}
+
 type MessageModel = WorkerMessageModel;
 type InventorySessionMetadata = {
   inWorkspace: boolean;
@@ -254,6 +270,7 @@ type HeldMessage = QueuedMessage & {
 type PendingSteer = {
   unconfirmed?: true;
   resumeUnconfirmed?: true;
+  withdrawalUnconfirmed?: true;
   id: string;
   text: string;
   queuedAt: number;
@@ -431,6 +448,9 @@ export class ChatAdapter {
   // Only admissions currently awaiting acknowledgement: terminal events must
   // win even when there was no pending event, or the delivered-id cache evicts.
   private readonly admittingSteers = new Map<string, SteerAdmission>();
+  // Terminal fences live only for concurrent inbox reads, not a permanent
+  // tombstone cache. Each read releases its set on success or failure.
+  private readonly inboxReads = new Map<string, Set<Set<string>>>();
   private readonly steerWithdrawTimeoutMs: number;
   private readonly automaticBackgroundTimeoutMs: number;
   private readonly steerAdmissionTimeoutMs: number;
@@ -636,7 +656,7 @@ export class ChatAdapter {
     // steer raised by another client or while the stream was down is listed
     // (opencode-v2-steering D3). Only the first page: an older page is not
     // an attach.
-    if (!cursor) await this.reconcilePendingSteers(id, page.items);
+    if (!cursor) await this.reconcilePendingSteers(id, page.completeItems ?? page.items);
     // Some providers page locally after loading the complete transcript. Reuse
     // that complete source for recovery, never the bounded visible page.
     const configuration = await this.configuration(id);
@@ -715,13 +735,10 @@ export class ChatAdapter {
         recovered = await this.provider.reconcileBackgroundTasks(id);
       }
       catch { recovered = []; }
-      const byId = new Map(recovered.map(item => [item.id, item]));
-      const results = new Map(recovered.flatMap(item => item.resultId ? [[item.resultId, item.id] as const] : []));
-      const launches = new Map(recovered.flatMap(item => [...(item.toolUseIds ?? []), ...(item.toolUseId ? [item.toolUseId] : [])].map(call => [call, item.id] as const)));
+      const { byId, supersedes } = indexRecoveredBackgroundTasks(recovered);
       for (const known of [...this.projection(id).items(), ...items]) {
         if (known.type !== "background_task" || byId.has(known.id)) continue;
-        if (known.resultId && results.has(known.resultId) && results.get(known.resultId) !== known.id
-          || known.toolUseId && launches.has(known.toolUseId) && launches.get(known.toolUseId) !== known.id) {
+        if (supersedes(known)) {
           this.projection(id).apply({ kind: "remove", itemId: known.id });
           const index = items.findIndex(item => item.id === known.id);
           if (index >= 0) items.splice(index, 1);
@@ -1388,6 +1405,7 @@ export class ChatAdapter {
       if (capabilities.includes("steering")) {
         const steer = this.pendingSteers.get(conversationId)?.find(entry => entry.id === messageId);
         if (steer) {
+          if (steer.withdrawalUnconfirmed) throw new SteerWithdrawalUnconfirmedError();
           if (steer.unconfirmed || steer.resumeUnconfirmed) throw new PrimarySteerOutcomeUnknownError(steer.id);
           // A running turn takes its steers at its next boundary on its own;
           // interrupting it to wake them would stop the work being steered.
@@ -1471,7 +1489,8 @@ export class ChatAdapter {
    * when the agent delivered it first, so a message is never both delivered
    * and returned or held.
    */
-  private async withdrawSteer(conversationId: string, steer: PendingSteer): Promise<void> {
+  private async withdrawSteer(conversationId: string, steer: PendingSteer, retryWithdrawal = false): Promise<void> {
+    if (steer.withdrawalUnconfirmed && !retryWithdrawal) throw new SteerWithdrawalUnconfirmedError();
     if (steer.unconfirmed || steer.resumeUnconfirmed) throw new PrimarySteerOutcomeUnknownError(steer.id);
     if (!this.provider.cancelInbox) throw new SteeringUnsupportedError();
     const waiters = this.steerSettlements.get(conversationId) ?? new Map<string, (outcome: "delivered" | "cancelled") => void>();
@@ -1510,6 +1529,13 @@ export class ChatAdapter {
         this.publishPausedChanges(conversationId);
         throw new SteerAlreadyDeliveredError();
       }
+    } catch (error) {
+      if (error instanceof SteerWithdrawalUnconfirmedError) {
+        const current = this.pendingSteers.get(conversationId)?.find(entry => entry.id === steer.id);
+        if (current) current.withdrawalUnconfirmed = true;
+        this.publishPausedChanges(conversationId);
+      }
+      throw error;
     } finally {
       clearTimeout(timer);
       if (waiters.get(steer.id) === observe) waiters.delete(steer.id);
@@ -1546,6 +1572,7 @@ export class ChatAdapter {
   }
 
   private forgetSteer(conversationId: string, steerId: string): boolean {
+    for (const read of this.inboxReads.get(conversationId) ?? []) read.add(steerId);
     const steers = this.pendingSteers.get(conversationId);
     if (!steers) return false;
     const index = steers.findIndex(entry => entry.id === steerId);
@@ -1595,6 +1622,7 @@ export class ChatAdapter {
     }
     // Settled. A withdrawal waiting on this entry takes the outcome and
     // publishes the end itself; otherwise the dock learns it here.
+    for (const read of this.inboxReads.get(conversationId) ?? []) read.add(delta.id);
     const waiter = this.steerSettlements.get(conversationId)?.get(delta.id);
     const admission = this.admittingSteers.get(conversationId);
     if (admission?.id === delta.id) {
@@ -1629,13 +1657,22 @@ export class ChatAdapter {
   private async reconcilePendingSteers(conversationId: string, history: readonly ConversationItem[] = []): Promise<void> {
     if (!this.provider.listPendingInbox || !this.agent().capabilities.includes("steering")) return;
     const readTick = this.inboxClock;
+    const terminal = new Set<string>();
+    const reads = this.inboxReads.get(conversationId) ?? new Set<Set<string>>();
+    this.inboxReads.set(conversationId, reads);
+    reads.add(terminal);
     let listed: Awaited<ReturnType<NonNullable<ChatProvider["listPendingInbox"]>>>;
     try {
       listed = await this.provider.listPendingInbox(conversationId);
     } catch {
       return;
+    } finally {
+      reads.delete(terminal);
+      if (reads.size === 0) this.inboxReads.delete(conversationId);
     }
     const projection = this.projection(conversationId);
+    const delivered = (id: string) => history.some(item => item.id === `message:${id}`) || projection.has(`message:${id}`) || this.deliveredSteers.has(JSON.stringify([conversationId, id]));
+    listed = listed.filter(entry => !terminal.has(entry.id) && !delivered(entry.id));
     const current = this.pendingSteers.get(conversationId) ?? [];
     const confirmedHeld = new Map<string, HeldMessage>();
     const held = this.heldQueues.get(conversationId) ?? [];
@@ -1656,21 +1693,23 @@ export class ChatAdapter {
     if (current.length === 0 && listed.length > 0 && !this.turnActive(conversationId, projection) && !this.lastSettledAt.has(conversationId)) this.lastSettledAt.set(conversationId, Date.now());
     const next: PendingSteer[] = listed.filter(entry => entry.delivery === "steer").map(entry => {
       const known = current.find(candidate => candidate.id === entry.id) ?? confirmedHeld.get(entry.id);
-      return { id: entry.id, text: entry.text, queuedAt: known?.queuedAt ?? entry.at, ...(known?.requestId ? { requestId: known.requestId } : {}), ...(entry.attachments?.length ? { attachments: entry.attachments } : {}), ...(known && "resumeUnconfirmed" in known && known.resumeUnconfirmed && !this.turnActive(conversationId, projection) ? { resumeUnconfirmed: true as const } : {}), tick: known && "tick" in known ? known.tick : ++this.inboxClock };
+      return { id: entry.id, text: entry.text, queuedAt: known?.queuedAt ?? entry.at, ...(known?.requestId ? { requestId: known.requestId } : {}), ...(entry.attachments?.length ? { attachments: entry.attachments } : {}), ...(known && "withdrawalUnconfirmed" in known && known.withdrawalUnconfirmed ? { withdrawalUnconfirmed: true as const } : {}), ...(known && "resumeUnconfirmed" in known && known.resumeUnconfirmed && !this.turnActive(conversationId, projection) ? { resumeUnconfirmed: true as const } : {}), tick: known && "tick" in known ? known.tick : ++this.inboxClock };
     });
     const nextIds = new Set(next.map(entry => entry.id));
     // Kept without the list's say: entries a withdrawal is waiting on (their
     // settlement decides) and entries learned after the read began.
-    const kept = current.filter(entry => !nextIds.has(entry.id) && (entry.unconfirmed && !history.some(item => item.id === `message:${entry.id}`) && !projection.has(`message:${entry.id}`) || this.steerSettlements.get(conversationId)?.has(entry.id) || entry.tick > readTick));
+    // Absence in an attach/reconnect snapshot is not withdrawal confirmation:
+    // its history may be filtered, incomplete, or captured before cancellation.
+    // Only positive delivery evidence or settlement retires uncertain entries.
+    const kept = current.filter(entry => !nextIds.has(entry.id) && !terminal.has(entry.id) && !delivered(entry.id) && (entry.unconfirmed || entry.withdrawalUnconfirmed || entry.resumeUnconfirmed || this.steerSettlements.get(conversationId)?.has(entry.id) || entry.tick > readTick));
     const gone = current.filter(entry => !nextIds.has(entry.id) && !kept.includes(entry));
     const added = next.filter(entry => !current.some(candidate => candidate.id === entry.id));
     if (next.length + kept.length === 0) this.pendingSteers.delete(conversationId);
     else this.pendingSteers.set(conversationId, [...next, ...kept].sort((left, right) => left.queuedAt - right.queuedAt));
     for (const entry of gone) {
-      const rowId = `message:${entry.id}`;
-      const delivered = history.some(item => item.id === rowId) || projection.has(rowId);
-      if (delivered) this.rememberDelivered(conversationId, entry.id);
-      this.publishQueue(conversationId, { kind: delivered ? "delivered" : "removed", messageId: entry.id });
+      const wasDelivered = delivered(entry.id);
+      if (wasDelivered) this.rememberDelivered(conversationId, entry.id);
+      this.publishQueue(conversationId, { kind: wasDelivered ? "delivered" : "removed", messageId: entry.id });
     }
     for (const entry of added) this.publishQueue(conversationId, { kind: "steered", messageId: entry.id });
     for (const [nativeId, entry] of confirmedHeld) {
@@ -1698,7 +1737,9 @@ export class ChatAdapter {
         // A steer is withdrawn from the agent, which must confirm it (D7).
         const steer = this.pendingSteers.get(conversationId)?.find(entry => entry.id === messageId);
         if (!steer) throw this.notPendingError(conversationId, messageId);
-        await this.withdrawSteer(conversationId, steer);
+        // Remove is cancellation only, including an explicit retry against
+        // the same native inbox ID. Conversion never gets this exception.
+        await this.withdrawSteer(conversationId, steer, true);
         this.publishQueue(conversationId, { kind: "removed", messageId });
         this.publishPausedChanges(conversationId);
         return { removed: true as const };
@@ -1909,10 +1950,10 @@ export class ChatAdapter {
   private queuedMessages(conversationId: string): QueuedMessage[] {
     const settledAt = this.lastSettledAt.get(conversationId);
     const heldPaused = this.deliveryPaused(conversationId);
-    const steers = (this.pendingSteers.get(conversationId) ?? []).map(({ id, text, queuedAt, requestId, attachments, unconfirmed, resumeUnconfirmed }): QueuedMessage => ({
+    const steers = (this.pendingSteers.get(conversationId) ?? []).map(({ id, text, queuedAt, requestId, attachments, unconfirmed, resumeUnconfirmed, withdrawalUnconfirmed }): QueuedMessage => ({
       id, text, queuedAt, delivery: "steer",
-      ...(unconfirmed || resumeUnconfirmed || settledAt !== undefined && queuedAt <= settledAt ? { paused: true as const } : {}),
-      ...(unconfirmed || resumeUnconfirmed ? { unconfirmed: true as const } : {}),
+      ...(unconfirmed || resumeUnconfirmed || withdrawalUnconfirmed || settledAt !== undefined && queuedAt <= settledAt ? { paused: true as const } : {}),
+      ...(unconfirmed || resumeUnconfirmed || withdrawalUnconfirmed ? { unconfirmed: true as const } : {}),
       ...(requestId ? { requestId } : {}),
       ...(attachments?.length ? { attachments } : {}),
     }));
@@ -3407,16 +3448,13 @@ export class ChatAdapter {
       }).then(([tasks, interactions]) => {
         if (this.disposed || recovery.dirty || generation !== this.backgroundStreamGeneration) return;
         const projection = this.projection(id);
-        const ids = new Set(tasks.map(task => task.id));
-        const results = new Map(tasks.flatMap(item => item.resultId ? [[item.resultId, item.id] as const] : []));
-        const launches = new Map(tasks.flatMap(item => [...(item.toolUseIds ?? []), ...(item.toolUseId ? [item.toolUseId] : [])].map(call => [call, item.id] as const)));
+        const { byId, supersedes } = indexRecoveredBackgroundTasks(tasks);
         for (const known of projection.items()) {
-          if (known.type === "background_task" && (known.resultId && results.has(known.resultId) && results.get(known.resultId) !== known.id
-            || known.toolUseId && launches.has(known.toolUseId) && launches.get(known.toolUseId) !== known.id)) {
+          if (known.type === "background_task" && supersedes(known)) {
             projection.apply({ kind: "remove", itemId: known.id });
             continue;
           }
-          if (known.type === "background_task" && known.status === "running" && !ids.has(known.id)) projection.apply({ kind: "upsert", item: { ...known, stateUncertain: true } });
+          if (known.type === "background_task" && known.status === "running" && !byId.has(known.id)) projection.apply({ kind: "upsert", item: { ...known, stateUncertain: true } });
         }
         for (const item of tasks) projection.apply({ kind: "upsert", item });
         // Inventory recovery must expose already-pending child requests even

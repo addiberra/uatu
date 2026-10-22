@@ -69,12 +69,16 @@ Native steer/resume unknown retention is independent of policy context. Queue
 conversion/Send now browser transport failures and 5xx retain page-local
 uncertainty and recover read-only without disturbing the composing draft.
 
-Touch pending/worker disclosure state is separate from desktop automatic
-expansion. `compact-work.ts` folds retained canonical projection occurrences,
-not child IDs or launcher counts, and separately names uncertainty. Existing
+`CompactDisclosure` in `compact-work.ts` owns separate, deliberate per-conversation
+Workers and Pending expansion choices; desktop and touch share the worker
+disclosure rather than automatically opening new work. The same module folds
+retained canonical projection occurrences, not child IDs or launcher counts,
+and separately names uncertainty. Existing
 inspection/stop owners render expanded rows; warnings/batch actions remain
-outside collapse. `touch-options.ts` moves the existing secondary controls into
-one bounded layer and hands configuration off to the existing picker. Geometry
+outside collapse. `hold-to-queue.ts` owns the Send gesture, `queue-discovery.ts`
+owns its device-local learning hint, and `delivery-preference.ts` supplies the
+keyboard delivery preference. Attachment and configuration controls stay inline;
+the existing picker and header options retain their own actions. Geometry
 continues through the measured work dock/viewport and coordinated scroll owner.
 
 ## The 30-second map
@@ -818,25 +822,19 @@ labels. Neither a summary discovery nor a catalog refresh replaces occupancy.
 Conversation status is `idle`, `sending`, `running`, `completed`, `interrupted`, `failed`, plus four named states: `retrying` and `compacting` are live-turn states (the composer offers Cancel, a new prompt is held), `background` means no turn is running but the agent still holds live background work (prompting is possible), and `scheduled` means nothing runs but the agent's session holds future turns it scheduled for itself (prompting is possible; the composer lists the wakeups with a release). `isLiveConversationStatus()` in `types.ts` is the one rule for which statuses are live.
 
 Send stays a labelled submit button while busy for every agent; only the
-separate Stop button cancels. The steering-capability-gated delivery selector
-shows Steer/Queue and only changes the device preference, never submits the
-draft. The menu also has a separate immediate Queue draft action. Tapping Send
-steers ordinary busy text independently of the keyboard preference; desktop Enter uses that preference; touch Enter always inserts
-a newline, Ctrl/Command+Enter submits, and Option/Alt+Enter uses the other one.
-Submission controls have at least 44px targets and 8px gaps. Narrow composer
-widths (up to 30rem content width) use a dedicated second action rail when a
-delivery selector is present; non-steering composers stay on one compact rail.
-Wide composers share one rail. Turn status and menu opening keep that layout.
+separate Stop button cancels. There is no Send dropdown, delivery selector or
+immediate Queue draft menu action. Tapping Send steers ordinary busy text
+independently of the keyboard preference; desktop Enter uses that preference;
+touch Enter inserts a newline, Ctrl/Command+Enter submits, and Option/Alt+Enter
+uses the other delivery when the steering choice is available.
+Submission controls have at least 44px targets and 8px gaps. The compact composer
+keeps its inline controls and distinct Send/Stop actions across turn changes.
 Raw-touch hit checking suppresses gap taps that a mobile browser might snap
-onto a nearby action. Stop remains disabled in place while idle, and the
-delivery selector remains disabled in place when neither running nor pending.
+onto a nearby action. Stop remains disabled in place while idle.
 
-The delivery menu supports ArrowUp/ArrowDown, Home/End, Escape back to the
-previous focus (including the touch composer), and Tab out. Its checked choice
-shows a check and the device's submit shortcut; the other shows Alt+Enter. Send's accessible name
-identifies busy delivery. Its dedicated fill token keeps white text above 4.5:1
-contrast in both themes. Touch composer and
-dock actions preserve focus through `mousedown`, not cancelled touch
+Send's accessible name identifies busy delivery and describes hold-to-queue.
+Its dedicated fill token keeps white text above 4.5:1 contrast in both themes.
+Touch composer and dock actions preserve focus through `mousedown`, not cancelled touch
 `pointerdown` for native clicks (which suppresses activation in WebKit). The
 explicit hold controller instead owns pointer activation: quick release steers,
 release before 500ms steers once, release during the following two-second countdown
@@ -846,7 +844,12 @@ every frame and timer, including fixed target geometry, cancels on visibility/bl
 the later click. After silent arming, the pointer-transparent envelope appears
 104px above Send (bounded by viewport space) and stays fixed while its green fill
 rises. It does not move the hit target. Enter/assistive clicks need no hold;
-message-field Alt+Enter retains the immediate alternate delivery shortcut.
+holding Space on focused Send uses the same controller, and message-field
+Alt+Enter retains the immediate alternate delivery shortcut. `QueueDiscovery`
+shows the device-local learning hint for an eligible ordinary-text draft while
+working, then hides it after an accepted hold queues a pending message. Storage
+failure falls back to page-local learning; neither helper changes the public
+delivery API or owns provider admission.
 Touch keeps Attach and the original configuration picker trigger inline, with
 real mode/model/effort and `contextReadout` occupancy; context breakdown and
 less-used actions remain in header options.
@@ -924,9 +927,8 @@ cannot scroll; only physically insufficient bands allow native scrolling to
 keep minimum action targets reachable. Viewport corrections preserve that
 exception's reader/focus reveal and reset the offset when it ends.
 Hardware-keyboard editing retains the bottom safe inset without doubling it
-under a software keyboard. A touch-only backdrop consumes outside delivery-menu
-taps through click. Touch Stop parent with worker records confirms its scope;
-detached workers remain running. Expanded work tracks hide the prompt rail so
+under a software keyboard. Touch Stop parent with worker records confirms its
+scope; detached workers remain running. Expanded work tracks hide the prompt rail so
 it cannot cover Stop targets. Transcript anchoring remains with its coordinated
 scroll owner; sending a prompt deliberately requests latest, remote dock growth
 preserves the reading anchor.

@@ -890,7 +890,7 @@ export type QueuedMessage = {
   // on its own — a held message behind a cancellation or a staged revert, or
   // a steer enqueued before the conversation last went idle (design D3).
   paused?: true;
-  // Admission/resume may have applied. Read-only reconciliation, never resend.
+  // Admission/resume/withdrawal may have applied. Reconcile read-only, never resend.
   unconfirmed?: true;
   requestId?: string;
   // Attachment references held with the message; delivered exactly as
