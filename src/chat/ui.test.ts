@@ -226,9 +226,9 @@ describe("chat reversible-history composer", () => {
     }
   });
 
-  for (const terminal of ["none", "removed", "delivered"] as const) for (const switched of [false, true]) for (const action of ["remove", "edit", "queue"] as const) {
+  for (const failure of ["typed", "network", "server", "missing-ack"] as const) for (const terminal of ["none", "removed", "delivered"] as const) for (const switched of [false, true]) for (const action of ["remove", "edit", "queue"] as const) {
     if (terminal !== "none" && action !== "remove") continue;
-    const name = `unconfirmed withdrawal on ${action} ${switched ? "cannot affect a newly selected conversation" : "retains input and retries withdrawal only"}${terminal === "none" ? "" : ` after early ${terminal}`}`;
+    const name = `unconfirmed withdrawal on ${action} ${switched ? "cannot affect a newly selected conversation" : "retains input and retries withdrawal only"}${terminal === "none" ? "" : ` after early ${terminal}`}${failure === "typed" ? "" : ` after ${failure} failure`}`;
     test(name, async () => {
     // Chat intentionally survives pagehide. Keep its pending renders and save
     // timers from writing through the next case's global DOM/storage fixture.
@@ -293,7 +293,10 @@ describe("chat reversible-history composer", () => {
         await waitUntil(() => !!document.querySelector('[data-chat-queued-id="pending"]')?.textContent?.includes("Other conversation input"));
         input.value = "Other conversation draft";
       }
-      response.resolve(Response.json({ error: "the agent has not confirmed the withdrawal", code: "steer-withdrawal-unconfirmed" }, { status: 409 }));
+      if (failure === "network") response.reject(new TypeError("Failed to fetch"));
+      else if (failure === "missing-ack") response.resolve(Response.json({}));
+      else if (failure === "server") response.resolve(Response.json({ error: "Bad gateway" }, { status: 502 }));
+      else response.resolve(Response.json({ error: "the agent has not confirmed the withdrawal", code: "steer-withdrawal-unconfirmed" }, { status: 409 }));
       if (terminal !== "none") {
         await waitUntil(() => !target.disabled);
         // Flush the response and any follow-on snapshot render, not a fixed
@@ -348,6 +351,99 @@ describe("chat reversible-history composer", () => {
       expect(mutations).toBe(2);
       await waitUntil(() => !document.querySelector("#chat-action-feedback")!.textContent!.includes("withdrawal still unconfirmed"));
     } finally { window.dispatchEvent(new window.Event("pagehide")); }
+    });
+  }
+
+  for (const outcome of ["read-unavailable", "converted", "same-text-other-submission", "legacy-no-submission", "converted-unconfirmed", "refused-400", "refused-409", "programmer-error", "admission-unknown"] as const) {
+    const name = `lost withdrawal recovery distinguishes ${outcome}`;
+    test(name, async () => {
+      if (process.env.UATU_WITHDRAWAL_UI_CASE !== "1") {
+        const child = Bun.spawn({ cmd: [process.execPath, "test", import.meta.path, "-t", `${name}$`], env: { ...process.env, UATU_WITHDRAWAL_UI_CASE: "1" }, stdout: "pipe", stderr: "pipe" });
+        const [stdout, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+        expect(code, `${stdout}\n${stderr}`).toBe(0);
+        return;
+      }
+      const { document, window } = parseHTML(html);
+      installDomGlobals(document, window);
+      document.documentElement.setAttribute("data-ui-mode", "desktop");
+      document.documentElement.setAttribute("data-chat-panel", "open");
+      stubConversationSelect(document);
+      const { ChatApiClient } = await import("./client");
+      const admission = outcome === "admission-unknown";
+      const original = { id: "native-original", submissionId: outcome === "legacy-no-submission" ? undefined : "logical-original", text: "Original pending input", queuedAt: 1, delivery: admission ? "queue" as const : "steer" as const };
+      const replacement = { ...original, id: "held-new", delivery: "queue" as const,
+        submissionId: outcome === "same-text-other-submission" ? "logical-other" : original.submissionId,
+        ...(outcome === "converted-unconfirmed" ? { unconfirmed: true as const } : {}) };
+      let mutations = 0, reads = 0;
+      const response = deferred<Response>();
+      const recovery = deferred<ConversationSnapshot>();
+      const transport = new ChatApiClient(async () => { mutations++; return response.promise; });
+      const models: ChatModel[] = ["A", "B"].map(name => ({ selection: { providerId: "test", modelId: name }, provider: "Test", name, imageInput: true }));
+      const api = {
+        status: async () => [{ agent: { id: "test", name: "Test" }, availability: { state: "ready", version: "test", agent: { id: "test", name: "Test", capabilities: ["steering", "send-now", "models", "attachments"] } } }],
+        conversations: async () => [{ ...conversation("one"), status: "running" }], commands: async () => [], models: async () => models, modes: async () => [],
+        snapshot: async () => { reads++; return mutations ? recovery.promise : { ...snapshot("one"), conversation: { ...conversation("one"), status: "running" }, queued: [original] }; },
+        removeQueued: outcome === "programmer-error" ? async () => { throw new Error("Local programmer failure"); } : transport.removeQueued.bind(transport),
+        changeDelivery: transport.changeDelivery.bind(transport), stream: () => ({ close() {} }), inventoryStream: () => ({ close() {} }), attachmentUrl: () => "",
+        uploadAttachment: async () => ({ id: "private-attachment", mimeType: "image/png", sizeBytes: 3 }),
+      } as unknown as ChatApiClient;
+      const { initChat } = await import(`./ui.ts?withdrawal-recovery=${outcome}-${Date.now()}`);
+      initChat(api);
+      try {
+        const input = document.querySelector<HTMLTextAreaElement>("#chat-input")!;
+        const action = admission ? "steer" : "remove";
+        await waitUntil(() => !!document.querySelector(`[data-queue-${action}="native-original"]`));
+        input.value = "New private draft";
+        const before = reads;
+        const target = document.querySelector<HTMLButtonElement>(`[data-queue-${action}="native-original"]`)!;
+        target.dispatchEvent(new window.Event("click", { bubbles: true }));
+        await waitUntil(() => !!document.querySelector('[data-model-value="test/B"]'));
+        document.querySelector('[data-model-value="test/B"]')!.dispatchEvent(new window.Event("click", { bubbles: true }));
+        chooseFiles(document.querySelector<HTMLInputElement>("#chat-attach-input")!, [new File(["new"], "private-new.png", { type: "image/png" })]);
+        await waitUntil(() => document.querySelector("#chat-attachments")!.textContent!.includes("private-new.png"));
+        if (outcome === "programmer-error") {
+          await waitUntil(() => document.querySelector("#chat-state")!.textContent!.includes("Local programmer failure"));
+          expect(reads).toBe(before);
+          expect(mutations).toBe(0);
+        } else if (outcome.startsWith("refused")) {
+          response.resolve(Response.json({ error: "Definite refusal" }, { status: outcome === "refused-400" ? 400 : 409 }));
+          await waitUntil(() => document.querySelector("#chat-state")!.textContent!.includes("Definite refusal"));
+          expect(reads).toBe(before);
+        } else {
+          response.reject(new TypeError("Failed to fetch"));
+          await waitUntil(() => reads === before + 1);
+          await flush();
+          // The read is still pending: both the original target and any fresh
+          // Retry button must remain fenced, including synthetic double clicks.
+          target.dispatchEvent(new window.Event("click", { bubbles: true }));
+          const retry = document.querySelector<HTMLButtonElement>('[data-queue-remove="native-original"]');
+          if (retry) { expect(retry.disabled).toBe(true); retry.dispatchEvent(new window.Event("click", { bubbles: true })); }
+          expect(mutations).toBe(1);
+          if (outcome === "read-unavailable") recovery.reject(new Error("Read unavailable"));
+          else recovery.resolve({ ...snapshot("one"), queued: admission ? [{ ...original, unconfirmed: true }] : [replacement] });
+          await waitUntil(() => !target.disabled);
+          await flush();
+          if (outcome === "converted") {
+            expect(document.querySelector('[data-chat-queued-id="native-original"]')).toBeNull();
+            expect(document.querySelector('[data-queue-remove="held-new"]')?.textContent).toBe("Remove");
+            expect(document.querySelector("#chat-action-feedback")!.textContent).not.toContain("withdrawal still unconfirmed");
+          } else if (admission) {
+            expect(document.querySelectorAll('[data-chat-queued-id="native-original"] button')).toHaveLength(0);
+            expect(document.querySelector("#chat-action-feedback")!.textContent).not.toContain("withdrawal");
+          } else {
+            expect(document.querySelector('[data-queue-remove="native-original"]')?.textContent).toBe("Retry withdrawal");
+            expect(document.querySelector('[data-queue-edit="native-original"]')).toBeNull();
+            expect(document.querySelector('[data-queue-queue="native-original"]')).toBeNull();
+            if (outcome === "read-unavailable") expect(document.querySelector("#chat-action-feedback")!.textContent).toContain("Status check unavailable");
+          }
+          expect(reads).toBe(before + 1);
+        }
+        expect(document.querySelector("#chat-action-feedback")!.textContent).not.toContain("Draft restored");
+        expect(input.value).toBe("New private draft");
+        expect(document.querySelector("#chat-attachments")!.textContent).toContain("private-new.png");
+        expect(document.querySelector('[data-model-value="test/B"]')!.getAttribute("aria-pressed")).toBe("true");
+        if (outcome.startsWith("refused") || outcome === "programmer-error") expect(document.querySelector("#chat-action-feedback")!.textContent).not.toContain("withdrawal");
+      } finally { window.dispatchEvent(new window.Event("pagehide")); }
     });
   }
 

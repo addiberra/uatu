@@ -252,9 +252,10 @@ borders, content gap and outer margins so actions remain scroll-reachable.
 With both cards collapsed, normal transcript/safe-area budgets remain wherever
 the measured minimum headers, whole actions and composer leave that space. With
 either expanded, cards can use most of the region left after measured header,
-composer, notices and safe-area padding. Conversation keeps 20% of that region,
-bounded to 32–96px; whole actions can reduce it, down to the lesser of 16px or
-10% of the remaining region in an insufficient band. Short lists do not fill
+composer, notices and safe-area padding. Touch and comfortable-density layouts
+keep 20% of that region for conversation, bounded to 32–96px; whole actions can
+reduce it, down to the lesser of 16px or 10% of the remaining region in an
+insufficient band. Short lists do not fill
 that capacity: they return unused height to conversation. This expanded policy
 also applies while the composer stays focused with the software keyboard hidden;
 the collapsed hardware-editing percentage cap cannot override it. Adding a second
@@ -422,9 +423,11 @@ touch worker details start collapsed and expand only deliberately; that choice
 is retained per conversation across new work, settlement and detachment.
 Desktop cards share only a measured capacity, never an outer scroller. When both
 are collapsed the cap is 40% of the measured chat panel (and 25rem), with the
-lesser of 12rem or 35% reserved for conversation. Expanded cards use the measured
-small-strip policy above and do not require Show work when normal in-flow actions
-fit. A new replacement warning is revealed once within Pending after the restored
+lesser of 12rem or 35% reserved for conversation. Expanded fine-pointer/hover
+desktop cards prefer a 35% reading reserve, bounded to 200–280px; physical action
+minimums can reduce it. Touch and comfortable-density layouts use the smaller
+reserve described above. Expanded cards do not require Show work when normal
+in-flow actions fit. A new replacement warning is revealed once within Pending after the restored
 draft has laid out; later updates respect deliberate independent pane scrolling.
 Non-empty desktop work reserves at least 52px (3.25rem when larger) so a full
 44px action and visible focus ring can be exposed. The transcript yields to

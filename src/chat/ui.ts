@@ -2936,13 +2936,18 @@ export function initChat(api = new ChatApiClient()): void {
     if (withdrawals) {
       const queued = [...current.queued];
       for (const [id, notice] of withdrawals) {
-        if (current.items.some(item => item.id === `message:${id}`)) settleUnconfirmedWithdrawal(current.conversationId, id);
+        if (current.items.some(item => item.id === `message:${id}`) || withdrawalConverted(current, notice.entry)) settleUnconfirmedWithdrawal(current.conversationId, id);
         else if (!queued.some(entry => entry.id === id)) queued.push(notice.entry);
       }
       return { ...current, queued: queued.map(entry => withdrawals.has(entry.id) ? { ...entry, unconfirmed: true as const } : entry) };
     }
     return current;
   };
+  // A new held handle is positive conversion evidence only when the server
+  // links it to this submission. Missing/filtered history is not a receipt.
+  const withdrawalConverted = (current: ChatProjection, entry: QueuedMessage) => !!entry.submissionId
+    && !current.queued.some(candidate => candidate.id === entry.id)
+    && current.queued.some(candidate => candidate.submissionId === entry.submissionId && candidate.delivery === "queue" && !candidate.unconfirmed);
   const installConversationSnapshot = (snapshot: ConversationSnapshot, acceptedDrafts: ChatProjection["acceptedDrafts"], token: number) => {
     projection = protectUnconfirmedWithdrawals(projectionFromSnapshot(snapshot, acceptedDrafts));
     const unknown = projection.acceptedDrafts.filter(draft => draft.unconfirmed);
@@ -3530,29 +3535,29 @@ export function initChat(api = new ChatApiClient()): void {
   const checkUnconfirmedAction = (conversationId: string, operationId: string, action: string, text: string, subject = "acceptance") => {
     automaticNotes.unconfirmed(conversationId, operationId, action, text, subject);
     syncControls();
-    void refreshSelectedConversation(conversationId).then(available => {
+    return refreshSelectedConversation(conversationId).then(available => {
       automaticNotes.checked(conversationId, operationId, available);
       syncControls();
     });
   };
-  const queueActionFailed = (error: unknown, conversationId: string, messageId: string, steerAction: boolean, operationId: string, action: string, text: string, entry: QueuedMessage, pending: PendingQueueAction) => {
-    if (error instanceof ChatTransportError && error.code === STEER_WITHDRAWAL_UNCONFIRMED_CODE) {
+  const queueActionFailed = (error: unknown, conversationId: string, messageId: string, steerAction: boolean, withdrawalAction: boolean, operationId: string, action: string, text: string, entry: QueuedMessage, pending: PendingQueueAction) => {
+    if (error instanceof ChatTransportError && (error.code === STEER_WITHDRAWAL_UNCONFIRMED_CODE
+      || withdrawalAction && (error.status === undefined || error.status >= 500 || error.code === "operation_outcome_unknown"))) {
       if (pending.terminal) return;
+      if (projection?.conversationId === conversationId && withdrawalConverted(projection, entry)) return;
       const withdrawals = unconfirmedWithdrawals.get(conversationId) ?? new Map<string, { operation: string; entry: QueuedMessage }>();
       const previous = withdrawals.get(messageId);
       if (previous) automaticNotes.record(conversationId, previous.operation, "not-needed");
-      withdrawals.set(messageId, { operation: operationId, entry });
+      boundedSet(withdrawals, messageId, { operation: operationId, entry }, 20);
       boundedSet(unconfirmedWithdrawals, conversationId, withdrawals, 100);
       if (projection?.conversationId === conversationId) {
         projection = { ...projection, queued: projection.queued.map(entry => entry.id === messageId ? { ...entry, unconfirmed: true as const } : entry) };
         scheduleRender();
       }
-      checkUnconfirmedAction(conversationId, operationId, action, text, "withdrawal");
-      return;
+      return checkUnconfirmedAction(conversationId, operationId, action, text, "withdrawal");
     }
     if (error instanceof ChatTransportError && (error.code === "operation_outcome_unknown" || steerAction && (error.status === undefined || error.status >= 500)) || error instanceof ChatConnectionInterruptedError) {
-      checkUnconfirmedAction(conversationId, operationId, action, text);
-      return;
+      return checkUnconfirmedAction(conversationId, operationId, action, text);
     }
     if (error instanceof ChatTransportError && error.status === 409) {
       settleUnconfirmedWithdrawal(conversationId, messageId);
@@ -3630,6 +3635,7 @@ export function initChat(api = new ChatApiClient()): void {
     const messageId = queueRemove ?? queueEdit ?? queueSteer ?? queueQueue ?? queueSendNow!;
     const entry = projection.queued.find(candidate => candidate.id === messageId);
     if (!entry) return;
+    const withdrawalAction = entry.delivery === "steer" && (queueRemove !== undefined || queueEdit !== undefined || queueQueue !== undefined);
     const withdrawalUnknown = unconfirmedWithdrawals.get(conversationId)?.has(messageId);
     if (target.disabled || queueActionsInFlight.get(conversationId)?.has(messageId)) return;
     if ((entry?.unconfirmed || withdrawalUnknown) && !(queueRemove !== undefined && withdrawalUnknown)) return;
@@ -3680,7 +3686,7 @@ export function initChat(api = new ChatApiClient()): void {
         if (activeConversationId() !== conversationId) return;
         noteComposer(null);
       })
-      .catch(error => queueActionFailed(error, conversationId, messageId, steerAction, operationId,
+      .catch(error => queueActionFailed(error, conversationId, messageId, steerAction, withdrawalAction, operationId,
         queueSteer !== undefined ? "Queue → Steer" : queueSendNow !== undefined ? "Send now" : queueQueue !== undefined ? "Steer → Queue" : queueEdit !== undefined ? "Edit pending message" : "Remove pending message", entry.text, entry, pendingAction))
       .finally(() => {
         target.disabled = false;

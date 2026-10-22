@@ -220,7 +220,10 @@ export class ChatApiClient {
     return this.mutate(
       appUrl(`/api/chat/conversations/${encodeURIComponent(conversationId)}/queue/${encodeURIComponent(messageId)}`),
       { requestId },
-      value => value as { removed: boolean },
+      value => {
+        if (!value || typeof value !== "object" || (value as { removed?: unknown }).removed !== true) throw new Error("Chat returned an invalid removal acknowledgement");
+        return value as { removed: boolean };
+      },
       "DELETE",
     );
   }

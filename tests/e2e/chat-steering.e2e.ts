@@ -379,6 +379,68 @@ test.describe("steering an OpenCode 2.x turn", () => {
     await expect.poll(async () => (await fakeSession(request, conversationId))?.pending.map(entry => entry.payload.text)).toEqual(["Held later"]);
   });
 
+  test("lost native withdrawal response permits only manual cancellation of the original inbox ID", async ({ page, request }) => {
+    const conversationId = await startTurn(page, request);
+    await submit(page, "Keep original withdrawal text");
+    await inspectPending(page);
+    const entry = steers(page).filter({ hasText: "Keep original withdrawal text" });
+    const id = await entry.getAttribute("data-chat-queued-id");
+    const input = page.locator("#chat-input");
+    await input.fill("Newer private draft");
+    const mutations: Array<{ method: string; path: string }> = [];
+    page.on("request", request => {
+      if (request.url().includes("/queue/") && request.method() !== "GET") mutations.push({ method: request.method(), path: new URL(request.url()).pathname });
+    });
+    // Lose the browser request without a response. The server's fresh read
+    // still shows the native entry; it does not authorize editing/replay.
+    await page.route("**/queue/*", async route => {
+      if (route.request().method() === "DELETE" && mutations.length === 1) await route.abort("failed");
+      else await route.continue();
+    });
+    await entry.locator("[data-queue-edit]").click();
+    await expect(page.locator("#chat-action-feedback")).toContainText("Status checked; withdrawal still unconfirmed");
+    await expect(entry.locator("[data-queue-remove]")).toHaveText("Retry withdrawal");
+    await expect(entry.locator("[data-queue-edit], [data-queue-queue]")).toHaveCount(0);
+    await expect(input).toHaveValue("Newer private draft");
+    expect(mutations).toHaveLength(1);
+    expect((await fakeSession(request, conversationId))?.pending.map(entry => entry.id)).toContain(id);
+    const retry = page.waitForResponse(response => response.url().includes("/queue/") && response.request().method() === "DELETE");
+    await entry.locator("[data-queue-remove]").click();
+    expect((await retry).ok()).toBe(true);
+    await expect(entry).toHaveCount(0);
+    expect(mutations).toEqual([{ method: "DELETE", path: expect.stringContaining(encodeURIComponent(id!)) }, { method: "DELETE", path: mutations[0]!.path }]);
+    await expect(input).toHaveValue("Newer private draft");
+    expect((await fakeSession(request, conversationId))?.pending).toEqual([]);
+  });
+
+  test("server-applied conversion with a lost browser response does not resurrect the native withdrawal target", async ({ page, request }) => {
+    const conversationId = await startTurn(page, request);
+    await submit(page, "Convert once despite lost response");
+    await inspectPending(page);
+    const entry = steers(page).filter({ hasText: "Convert once despite lost response" });
+    const originalId = await entry.getAttribute("data-chat-queued-id");
+    await page.locator("#chat-input").fill("Private newer draft");
+    let patches = 0;
+    await page.route("**/queue/*", async route => {
+      if (route.request().method() !== "PATCH") return route.continue();
+      patches++;
+      const response = await route.fetch();
+      expect(response.ok()).toBe(true);
+      await route.abort("failed");
+    });
+    const lostResponse = page.waitForEvent("requestfailed", request => request.method() === "PATCH" && request.url().includes("/queue/"));
+    await entry.locator("[data-queue-queue]").click();
+    await lostResponse;
+    const converted = held(page).filter({ hasText: "Convert once despite lost response" });
+    await expect(converted).toHaveCount(1);
+    await expect(converted.locator("[data-queue-remove]")).toHaveText("Remove");
+    await expect(page.locator(`[data-chat-queued-id="${originalId}"]`)).toHaveCount(0);
+    await expect(page.locator("#chat-action-feedback")).not.toContainText("withdrawal still unconfirmed");
+    await expect(page.locator("#chat-input")).toHaveValue("Private newer draft");
+    expect(patches).toBe(1);
+    expect((await fakeSession(request, conversationId))?.pending).toEqual([]);
+  });
+
   test("a steer can be removed, or edited back into the composer, once OpenCode confirms the withdrawal", async ({ page, request }) => {
     const conversationId = await startTurn(page, request);
     expect(await submit(page, "Remove me")).toMatchObject({ delivery: "steer" });

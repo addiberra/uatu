@@ -151,6 +151,18 @@ describe("chat API client", () => {
     expect(late).toMatchObject({ status: 409, code: "steer-already-delivered" });
   });
 
+  test("requires a removal acknowledgement before editing can restore withdrawn input", async () => {
+    for (const value of [null, {}, { removed: "true" }, { removed: false }]) {
+      const client = new ChatApiClient(async () => Response.json(value));
+      const error = await client.removeQueued("one", "native-original", "request").catch(error => error);
+      expect(error).toBeInstanceOf(ChatTransportError);
+      expect(error.status).toBeUndefined();
+      expect(error.message).toContain("invalid removal acknowledgement");
+    }
+    const client = new ChatApiClient(async () => Response.json({ removed: true }));
+    expect(await client.removeQueued("one", "native-original", "request")).toEqual({ removed: true });
+  });
+
   test("posts reversible-history receipts through the base path and validates their results", async () => {
     Reflect.set(globalThis, "document", { querySelector: () => ({ getAttribute: () => "/s/work/" }) });
     resetAppBasePathForTests();
