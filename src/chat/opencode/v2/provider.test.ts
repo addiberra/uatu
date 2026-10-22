@@ -74,6 +74,53 @@ const skillInfo = (id: string, overrides: { name?: string; description?: string 
 const notFound = (sessionID: string) => Response.json({ _tag: "SessionNotFoundError", sessionID, message: `Session not found: ${sessionID}` }, { status: 404 });
 
 describe("OpenCode 2.x provider: identity and catalogs", () => {
+  test("event readiness requires a consumed native handshake in the current generation", async () => {
+    let push!: ReadableStreamDefaultController<Uint8Array>, opened!: () => void, heartbeat!: () => void;
+    let opening = new Promise<void>(resolve => { opened = resolve; });
+    const frame = (type: string) => push.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({ type, data: {} })}\n\n`));
+    const server = fakeOpenCode({
+      "GET /api/event": () => new Response(new ReadableStream<Uint8Array>({ start(controller) { push = controller; opened(); } }), { headers: { "content-type": "text/event-stream" } }),
+    });
+    const provider = server.provider();
+    const lifetime = new AbortController();
+    // A readiness read never creates a stream itself.
+    await expect(provider.waitForEventStream(lifetime.signal)).rejects.toThrow("unavailable");
+    expect(server.calls).toHaveLength(0);
+    let controller = new AbortController();
+    const consume = () => (async () => { for await (const event of provider.events(controller.signal)) if (event.eventType === "server.heartbeat") heartbeat(); })();
+    let pump = consume();
+    try {
+      await opening;
+      let ready = false;
+      const waiting = provider.waitForEventStream(lifetime.signal).then(() => { ready = true; });
+      const observed = new Promise<void>(resolve => { heartbeat = resolve; });
+      frame("server.heartbeat");
+      await observed;
+      expect(ready).toBe(false);
+      frame("server.connected");
+      await waiting;
+      expect(ready).toBe(true);
+      await provider.waitForEventStream(lifetime.signal);
+      controller.abort();
+      // Even before generator cleanup, an aborted generation is not ready.
+      await expect(provider.waitForEventStream(lifetime.signal)).rejects.toThrow("unavailable");
+      await pump;
+      opening = new Promise<void>(resolve => { opened = resolve; });
+      controller = new AbortController();
+      pump = consume();
+      await opening;
+      const cancelled = new AbortController();
+      const aborted = provider.waitForEventStream(cancelled.signal).catch(error => error);
+      cancelled.abort();
+      expect(await aborted).toBeInstanceOf(Error);
+      const ended = provider.waitForEventStream(lifetime.signal).catch(error => error);
+      push.close();
+      expect(await ended).toBeInstanceOf(Error);
+      await pump;
+      expect(server.requests("GET", "/api/event")).toHaveLength(2);
+    } finally { controller.abort(); await pump; await provider.dispose(); }
+  });
+
   test("side generation uses the native isolated endpoint, never prompt/interrupt/background", async () => {
     const server = fakeOpenCode({
       "POST /api/session/ses/generate": call => {

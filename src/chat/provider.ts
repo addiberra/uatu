@@ -318,6 +318,11 @@ export interface ChatProvider {
   revert?(sessionId: string, messageId: string): Promise<ReversibleHistoryResult>;
   restore?(sessionId: string, messageId: string): Promise<ReversibleHistoryResult>;
   events(signal: AbortSignal): AsyncIterable<NormalizedProviderEvent>;
+  /** Optional transport barrier: the currently consumed events() subscription
+   * can now receive native events. Rejects on abort or that generation ending;
+   * never starts a subscription. Providers without a handshake omit this.
+   */
+  waitForEventStream?(signal: AbortSignal): Promise<void>;
   /**
    * Retire the provider's own resources — live agent sessions, pending
    * tool callbacks, background probes. The adapter awaits this as part of
@@ -367,7 +372,7 @@ export interface ChatProvider {
    * and after a stream reconnect (D3). Optional: only an agent declaring
    * `steering`.
    */
-  listPendingInbox?(sessionId: string): Promise<PendingInboxEntry[]>;
+  listPendingInbox?(sessionId: string, options?: { signal?: AbortSignal }): Promise<PendingInboxEntry[]>;
   /**
    * Withdraw one pending inbox entry. The agent confirms on its stream with
    * a cancelled (or, if it got there first, delivered) settlement; a missing

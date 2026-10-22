@@ -1793,17 +1793,43 @@ export class ChatAdapter {
    */
   private async reconcilePendingSteers(conversationId: string, history: readonly ConversationItem[] = []): Promise<void> {
     if (!this.provider.listPendingInbox || !this.agent().capabilities.includes("steering")) return;
-    const readTick = this.inboxClock;
+    if (this.disposed) return;
+    // Attach may precede the service's pump. Own and observe that pump, then
+    // await its actual transport handshake, not generator construction. A
+    // connected read reuses the same subscription; V1/Claude need no barrier.
+    if (this.provider.waitForEventStream && !this.pumpPromise) void this.startEventPump().catch(() => undefined);
+    const stream = this.provider.waitForEventStream ? this.pumpController : null;
+    const lifetime = new AbortController();
+    const signal = stream ? AbortSignal.any([stream.signal, lifetime.signal]) : lifetime.signal;
+    let unavailable!: () => void;
+    const expired = new Promise<never>((_resolve, reject) => { unavailable = () => reject(new Error("Inbox recovery unavailable")); });
+    signal.addEventListener("abort", unavailable, { once: true });
+    const timer = setTimeout(() => lifetime.abort(), 5_000);
+    let readTick = this.inboxClock;
     const terminal = new Set<string>();
     const reads = this.inboxReads.get(conversationId) ?? new Set<Set<string>>();
     this.inboxReads.set(conversationId, reads);
     reads.add(terminal);
     let listed: Awaited<ReturnType<NonNullable<ChatProvider["listPendingInbox"]>>>;
     try {
-      listed = await this.provider.listPendingInbox(conversationId);
+      listed = await Promise.race([(async () => {
+        if (this.provider.waitForEventStream) await this.provider.waitForEventStream(signal);
+        signal.throwIfAborted();
+        readTick = this.inboxClock;
+        return this.provider.listPendingInbox!(conversationId, { signal });
+      })(), expired]);
+      // A late response belongs only to the connection that covered its read.
+      if (signal.aborted || this.disposed || stream && this.pumpController !== stream) throw new Error("Inbox recovery unavailable");
     } catch {
+      // Native recovery needs both stream coverage and a successful list:
+      // the stream cannot replay changes missed before its handshake. Keep
+      // known owners, but never claim their stale set is a current snapshot.
+      // Legacy providers retain their degraded-read contract.
+      if (this.provider.waitForEventStream) throw new Error("Inbox recovery unavailable");
       return;
     } finally {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", unavailable);
       reads.delete(terminal);
       if (reads.size === 0) this.inboxReads.delete(conversationId);
     }
@@ -3436,14 +3462,19 @@ export class ChatAdapter {
       },
     });
     this.eventCoalescer = coalescer;
-    // A (re)connect: the agent's inbox may have moved while no stream was
-    // listening, so every conversation this adapter knows is reconciled (D3).
-    for (const id of new Set([...this.projections.keys(), ...this.pendingSteers.keys()])) {
-      void this.reconcilePendingSteers(id).catch(() => undefined);
-    }
+    const reconcileInboxes = () => {
+      for (const id of new Set([...this.projections.keys(), ...this.pendingSteers.keys()])) {
+        void this.reconcilePendingSteers(id).catch(() => undefined);
+      }
+    };
+    // Native V2 has no replay: subscribe before reading recovery truth, then
+    // keep consuming deltas while the read is in flight (the inbox tick fence
+    // protects newer changes). Legacy providers have no readiness handshake.
+    if (!this.provider.waitForEventStream) reconcileInboxes();
     try {
       for await (const normalized of this.provider.events(signal)) {
         if (signal.aborted) break;
+        if (this.provider.waitForEventStream && normalized.eventType === "server.connected") reconcileInboxes();
         if (this.provider.reconcileBackgroundTasks && normalized.eventType === "server.connected") {
           this.backgroundConnected = true;
           this.backgroundReadyResolve?.();

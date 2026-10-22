@@ -26,6 +26,272 @@ import { notificationPipeline } from "../../tests/notification-pipeline";
 import { startOpenCodeV2Fake } from "../../tests/e2e/opencode-v2-fake";
 import { addAcceptedDraft, applyChatEvent, projectionFromSnapshot } from "./projection";
 
+test("real V2 reconnect establishes its subscription before reading the native inbox", async () => {
+  const directory = process.cwd();
+  const fake = startOpenCodeV2Fake({ directory });
+  let reconnect = false, inboxReads = 0, eventRequests = 0;
+  let requested!: () => void, release!: () => void;
+  const eventRequested = new Promise<void>(resolve => { requested = resolve; });
+  const eventGate = new Promise<void>(resolve => { release = resolve; });
+  const transport = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const request = new Request(input, init);
+    const pathname = new URL(request.url).pathname;
+    if (reconnect && pathname.endsWith("/inbox")) inboxReads++;
+    if (pathname === "/api/event") {
+      eventRequests++;
+      if (reconnect) { requested(); await eventGate; }
+    }
+    return fetch(request);
+  }) as typeof fetch;
+  const provider = createOpenCodeV2Provider({ endpoint: fake.url, password: fake.password, directory, fetch: transport });
+  const adapter = new ChatAdapter({ provider, workspacePath: directory, coalesceWindowMs: 0 });
+  let pump = adapter.startEventPump();
+  try {
+    await waitUntil(() => fake.state().eventSubscribers === 1);
+    const session = await provider.createSession("Reconnect handoff");
+    await adapter.prompt(session.id, "initial", "Initial work");
+    const steer = await adapter.prompt(session.id, "steer", "Old native instruction", undefined, undefined, undefined, undefined, "steer");
+    const held = await adapter.prompt(session.id, "held", "Held until a later turn", undefined, undefined, undefined, undefined, "queue");
+    await adapter.stopEventPump(); await pump;
+    await waitUntil(() => fake.state().eventSubscribers === 0);
+    reconnect = true;
+    pump = adapter.startEventPump();
+    await eventRequested;
+    // Instantiating an async generator (or starting a pump) is not a subscription.
+    expect(inboxReads).toBe(0);
+    fake.step(session.id);
+    const external = await provider.prompt(session.id, { id: "external-gap", text: "Another client's instruction", delivery: "steer" });
+    release();
+    await waitUntil(() => inboxReads > 0 && adapter.pendingSteersForTests(session.id).some(entry => entry.id === external.messageId));
+    expect(adapter.pendingSteersForTests(session.id).map(entry => entry.id)).toEqual([external.messageId]);
+    const snapshot = await adapter.history(session.id);
+    expect(snapshot.items.filter(item => item.id === `message:${steer.messageId}`)).toHaveLength(1);
+    expect(snapshot.queued?.map(entry => entry.id)).toEqual([external.messageId, held.messageId]);
+    await adapter.history(session.id);
+    expect(eventRequests).toBe(2); // Already-connected reads reuse this subscription.
+    expect(fake.state().calls.filter(call => call.includes("/prompt"))).toHaveLength(3);
+    expect(fake.state().calls.some(call => call.includes("resume=true") || call.includes("/background"))).toBe(false);
+  } finally { release(); await adapter.dispose(); await pump; await fake.stop(); }
+});
+
+for (const failure of ["http-503", "transport"] as const) test(`real V2 reconnect reports ${failure} inbox recovery unavailable after a successful handshake`, async () => {
+  const directory = process.cwd();
+  const fake = startOpenCodeV2Fake({ directory });
+  let reconnect = false, failInbox = false, failedReads = 0, subscriptions = 0;
+  const requests: string[] = [];
+  const subscribersAtFailure: number[] = [];
+  let requested!: () => void, release!: () => void;
+  const eventRequested = new Promise<void>(resolve => { requested = resolve; });
+  const eventGate = new Promise<void>(resolve => { release = resolve; });
+  const transport = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const request = new Request(input, init);
+    const pathname = new URL(request.url).pathname;
+    requests.push(`${request.method} ${pathname}`);
+    if (pathname === "/api/event") {
+      subscriptions++;
+      if (reconnect) { requested(); await eventGate; }
+    }
+    if (failInbox && request.method === "GET" && pathname.endsWith("/inbox")) {
+      failedReads++;
+      subscribersAtFailure.push(fake.state().eventSubscribers);
+      if (failure === "transport") throw new Error("Scripted inbox transport failure");
+      return Response.json({ error: "Scripted inbox unavailable" }, { status: 503 });
+    }
+    return fetch(request);
+  }) as typeof fetch;
+  const provider = createOpenCodeV2Provider({ endpoint: fake.url, password: fake.password, directory, fetch: transport });
+  const adapter = new ChatAdapter({ provider, workspacePath: directory, coalesceWindowMs: 0 });
+  let pump = adapter.startEventPump();
+  try {
+    await waitUntil(() => fake.state().eventSubscribers === 1);
+    const session = await provider.createSession("Failed reconnect read");
+    await adapter.prompt(session.id, "initial", "Initial work");
+    const steer = await adapter.prompt(session.id, "steer", "A delivered before handshake", undefined, undefined, undefined, undefined, "steer");
+    const held = await adapter.prompt(session.id, "held", "Retain the held owner", undefined, undefined, undefined, undefined, "queue");
+    await adapter.stopEventPump(); await pump;
+    await waitUntil(() => fake.state().eventSubscribers === 0);
+    reconnect = true;
+    failInbox = true;
+    pump = adapter.startEventPump();
+    await eventRequested;
+    fake.step(session.id);
+    const external = await provider.prompt(session.id, { id: "external-before-failed-read", text: "B pending before handshake", delivery: "steer" });
+    expect(fake.state().sessions[session.id]!.pending.map(entry => entry.id)).toEqual([external.messageId]);
+    const beforeRecovery = requests.length;
+    release();
+    await waitUntil(() => failedReads > 0);
+    // The live stream is healthy, but missed A/B changes cannot be recovered
+    // from it: V2 has no replay. A failed authoritative list is not current.
+    const result = await adapter.history(session.id).catch(error => error);
+    expect(result).toBeInstanceOf(Error);
+    expect((result as Error).message).toContain("Inbox recovery unavailable");
+    expect(subscribersAtFailure.every(count => count === 1)).toBe(true);
+    expect(adapter.pendingSteersForTests(session.id).map(entry => entry.id)).toEqual([steer.messageId]);
+    failInbox = false;
+    await adapter.stopEventPump(); await pump;
+    await waitUntil(() => fake.state().eventSubscribers === 0);
+    pump = adapter.startEventPump();
+    await waitUntil(() => adapter.pendingSteersForTests(session.id).some(entry => entry.id === external.messageId));
+    const recovered = await adapter.history(session.id);
+    expect(recovered.queued?.map(entry => entry.id)).toEqual([external.messageId, held.messageId]);
+    expect(recovered.items.filter(item => item.id === `message:${steer.messageId}`)).toHaveLength(1);
+    expect(adapter.pendingSteersForTests(session.id).map(entry => entry.id)).toEqual([external.messageId]);
+    expect(subscriptions).toBe(3);
+    expect(requests.slice(beforeRecovery).every(call => call.startsWith("GET "))).toBe(true);
+    expect(fake.state().calls.filter(call => call.includes("/prompt"))).toHaveLength(3);
+  } finally { release(); await adapter.dispose(); await pump; await fake.stop(); }
+});
+
+for (const snapshotKind of ["stale", "empty"] as const) test(`real V2 initial attach fences a late ${snapshotKind} inbox snapshot behind live delivery and enqueue`, async () => {
+  const directory = process.cwd();
+  const fake = startOpenCodeV2Fake({ directory });
+  let eventRequested!: () => void, connect!: () => void, listCaptured!: () => void, releaseList!: () => void;
+  const requested = new Promise<void>(resolve => { eventRequested = resolve; });
+  const connection = new Promise<void>(resolve => { connect = resolve; });
+  const captured = new Promise<void>(resolve => { listCaptured = resolve; });
+  const listGate = new Promise<void>(resolve => { releaseList = resolve; });
+  let lists = 0, subscriptions = 0;
+  const transport = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const request = new Request(input, init);
+    const pathname = new URL(request.url).pathname;
+    if (pathname === "/api/event") { subscriptions++; eventRequested(); await connection; }
+    const response = await fetch(request);
+    if (pathname.endsWith("/inbox")) {
+      lists++;
+      const body = await response.json() as { data: unknown[] };
+      // Both attach and connected recovery are in flight before live deltas.
+      if (lists === 2) listCaptured();
+      await listGate;
+      return Response.json(snapshotKind === "empty" ? { ...body, data: [] } : body);
+    }
+    return response;
+  }) as typeof fetch;
+  const provider = createOpenCodeV2Provider({ endpoint: fake.url, password: fake.password, directory, fetch: transport });
+  const adapter = new ChatAdapter({ provider, workspacePath: directory, coalesceWindowMs: 0 });
+  let reading: ReturnType<ChatAdapter["history"]> | undefined;
+  try {
+    const session = await provider.createSession("Initial read handoff");
+    await adapter.prompt(session.id, "initial", "Initial work");
+    const steer = await adapter.prompt(session.id, "steer", "Deliver during read", undefined, undefined, undefined, undefined, "steer");
+    const before = fake.state().calls.length;
+    reading = adapter.history(session.id); // No pump was started by the caller.
+    await requested;
+    expect(lists).toBe(0);
+    expect(fake.state().eventSubscribers).toBe(0);
+    connect();
+    await captured;
+    fake.step(session.id);
+    const external = await provider.prompt(session.id, { id: "external-during-read", text: "Newer than snapshot", delivery: "steer" });
+    await waitUntil(() => !adapter.pendingSteersForTests(session.id).some(entry => entry.id === steer.messageId) && adapter.pendingSteersForTests(session.id).some(entry => entry.id === external.messageId));
+    releaseList();
+    expect((await reading).queued?.map(entry => entry.id)).toEqual([external.messageId]);
+    expect(adapter.pendingSteersForTests(session.id).map(entry => entry.id)).toEqual([external.messageId]);
+    // This generation missed the original enqueue payload; its native stored
+    // transcript, rather than an invented delivery row, supplies that input.
+    expect((await adapter.history(session.id)).items.filter(item => item.id === `message:${steer.messageId}`)).toHaveLength(1);
+    expect(subscriptions).toBe(1);
+    expect(fake.state().calls.slice(before).filter(call => !call.startsWith("GET "))).toHaveLength(1); // Only the explicit external prompt.
+  } finally { connect(); releaseList(); await reading?.catch(() => undefined); await adapter.dispose(); await fake.stop(); }
+});
+
+for (const failure of ["refused", "disposed", "timeout"] as const) test(`real V2 ${failure} readiness releases attach without treating unread inbox state as empty`, async () => {
+  const directory = process.cwd();
+  const fake = startOpenCodeV2Fake({ directory });
+  let requested!: () => void;
+  const eventRequested = new Promise<void>(resolve => { requested = resolve; });
+  let lists = 0, closed = false;
+  const transport = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const request = new Request(input, init);
+    const pathname = new URL(request.url).pathname;
+    if (pathname.endsWith("/inbox")) lists++;
+    if (pathname === "/api/event") {
+      requested();
+      if (failure === "refused") return Response.json({ _tag: "UnauthorizedError", message: "Stream refused" }, { status: 401 });
+      let abort!: () => void;
+      return new Response(new ReadableStream<Uint8Array>({
+        start(controller) {
+          abort = () => { closed = true; controller.close(); request.signal.removeEventListener("abort", abort); };
+          request.signal.addEventListener("abort", abort, { once: true });
+        },
+        cancel() { closed = true; request.signal.removeEventListener("abort", abort); },
+      }), { headers: { "content-type": "text/event-stream" } });
+    }
+    return fetch(request);
+  }) as typeof fetch;
+  const provider = createOpenCodeV2Provider({ endpoint: fake.url, password: fake.password, directory, fetch: transport });
+  const adapter = new ChatAdapter({ provider, workspacePath: directory, coalesceWindowMs: 0 });
+  let reading: Promise<Awaited<ReturnType<ChatAdapter["history"]>> | Error> | undefined;
+  try {
+    const session = await provider.createSession("Unavailable subscription");
+    await adapter.prompt(session.id, "initial", "Initial work");
+    const steer = await adapter.prompt(session.id, "steer", "Retain on unavailable recovery", undefined, undefined, undefined, undefined, "steer");
+    const before = fake.state().calls.length;
+    reading = adapter.history(session.id).catch(error => error);
+    await eventRequested;
+    if (failure === "disposed") await adapter.dispose();
+    let timer!: ReturnType<typeof setTimeout>;
+    const stalled = new Promise<"still blocked">(resolve => { timer = setTimeout(() => resolve("still blocked"), failure === "timeout" ? 6_500 : 1_000); });
+    const result = await Promise.race([reading, stalled]).finally(() => clearTimeout(timer));
+    expect(result).not.toBe("still blocked");
+    if (failure !== "disposed") {
+      expect(result).toBeInstanceOf(Error);
+      expect((result as Error).message).toContain("Inbox recovery unavailable");
+    }
+    expect(adapter.pendingSteersForTests(session.id).map(entry => entry.id)).toEqual([steer.messageId]);
+    expect(lists).toBe(0);
+    expect(fake.state().calls.slice(before).every(call => call.startsWith("GET "))).toBe(true);
+    await adapter.dispose();
+    if (failure !== "refused") expect(closed).toBe(true);
+  } finally { await adapter.dispose(); await reading; await fake.stop(); }
+}, 10_000);
+
+test("real V2 an inbox read from an ended subscription cannot overwrite the next generation", async () => {
+  const directory = process.cwd();
+  const fake = startOpenCodeV2Fake({ directory });
+  let delay = false, captured!: () => void, release!: () => void, returned!: () => void;
+  const listCaptured = new Promise<void>(resolve => { captured = resolve; });
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const listReturned = new Promise<void>(resolve => { returned = resolve; });
+  const provider = createOpenCodeV2Provider({ endpoint: fake.url, password: fake.password, directory });
+  const list = provider.listPendingInbox!.bind(provider);
+  provider.listPendingInbox = async (...args) => {
+    const delayed = delay;
+    if (delayed) delay = false;
+    try {
+      // Delay this public inbox read's result, not an unrelated worker read
+      // of the same HTTP endpoint. The real V2 provider still performs I/O.
+      const entries = await list(...args);
+      if (delayed) { captured(); await gate; }
+      return entries;
+    } finally { if (delayed) returned(); }
+  };
+  const adapter = new ChatAdapter({ provider, workspacePath: directory, coalesceWindowMs: 0 });
+  let pump = adapter.startEventPump();
+  let reading: ReturnType<ChatAdapter["history"]> | undefined;
+  try {
+    await waitUntil(() => fake.state().eventSubscribers === 1);
+    const session = await provider.createSession("Ended read generation");
+    await adapter.prompt(session.id, "initial", "Initial work");
+    await adapter.prompt(session.id, "steer", "Old instruction", undefined, undefined, undefined, undefined, "steer");
+    delay = true;
+    reading = adapter.history(session.id);
+    void reading.catch(() => undefined); // Observe abort while stopEventPump drains.
+    await listCaptured;
+    await adapter.stopEventPump(); await pump;
+    // Stopping the covering stream releases attach even if its read transport
+    // refuses to return yet. Neither its last handshake nor its reply is fresh.
+    await expect(reading).rejects.toThrow("Inbox recovery unavailable");
+    await waitUntil(() => fake.state().eventSubscribers === 0);
+    fake.step(session.id);
+    const external = await provider.prompt(session.id, { id: "next-generation", text: "Current native instruction", delivery: "steer" });
+    pump = adapter.startEventPump();
+    await waitUntil(() => adapter.pendingSteersForTests(session.id).some(entry => entry.id === external.messageId));
+    release(); await listReturned;
+    expect(adapter.pendingSteersForTests(session.id).map(entry => entry.id)).toEqual([external.messageId]);
+    expect((await adapter.history(session.id)).queued?.map(entry => entry.id)).toEqual([external.messageId]);
+  } finally { release(); await reading?.catch(() => undefined); await adapter.dispose(); await pump; await fake.stop(); }
+});
+
 for (const acknowledgement of ["lost", "late"] as const) for (const responseState of ["pending", "delivered"] as const) test(`real V2 enqueue before a ${acknowledgement} composer acknowledgement retires its optimistic echo (${responseState} before response)`, async () => {
   const directory = process.cwd();
   const fake = startOpenCodeV2Fake({ directory });

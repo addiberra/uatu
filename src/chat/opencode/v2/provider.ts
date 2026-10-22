@@ -85,6 +85,9 @@ export class OpenCodeV2Provider implements ChatProvider {
   private readonly lateAdmissions = new Map<string, Array<{ localId: string; until: number }>>();
   private static readonly LATE_ADMISSION_MS = 60_000;
   private streaming = false;
+  private streamConnected = false;
+  private streamSignal?: AbortSignal;
+  private readonly streamReadyWaiters = new Set<(connected: boolean) => void>();
   // Ids this process minted itself (prompts, compactions). A row under one
   // of them is never a slash command's, however many admissions are
   // waiting: the server mints those.
@@ -470,6 +473,22 @@ export class OpenCodeV2Provider implements ChatProvider {
     } finally { finish(); }
   }
 
+  waitForEventStream(signal: AbortSignal): Promise<void> {
+    signal = AbortSignal.any([signal, this.readLifetime.signal, ...(this.streamSignal ? [this.streamSignal] : [])]);
+    if (signal.aborted || !this.streamOpen) return Promise.reject(new Error("Event stream unavailable"));
+    if (this.streamConnected) return Promise.resolve();
+    return new Promise<void>((resolve, reject) => {
+      const finish = (connected: boolean) => {
+        signal.removeEventListener("abort", aborted);
+        this.streamReadyWaiters.delete(finish);
+        if (connected) resolve(); else reject(new Error("Event stream unavailable"));
+      };
+      const aborted = () => finish(false);
+      this.streamReadyWaiters.add(finish);
+      signal.addEventListener("abort", aborted, { once: true });
+    });
+  }
+
   async *events(signal: AbortSignal): AsyncIterable<NormalizedProviderEvent> {
     this.historyReuse.invalidate();
     // Memory scoped to the subscription: one pump, one memory.
@@ -480,6 +499,8 @@ export class OpenCodeV2Provider implements ChatProvider {
     // that arrives, but must not be remembered for one that may be lost.
     this.streamGeneration += 1;
     this.streamOpen = true;
+    this.streamConnected = false;
+    this.streamSignal = signal;
     const source = this.client.event.subscribe({ signal })[Symbol.asyncIterator]();
     let next: ReturnType<typeof source.next> | undefined;
     try {
@@ -496,6 +517,12 @@ export class OpenCodeV2Provider implements ChatProvider {
         if (arrived.done) break;
         this.streaming = true;
         const event = arrived.value;
+        // Only the native handshake establishes readiness, never an injected
+        // event or merely constructing the subscription's async iterator.
+        if (asRecord(event).type === "server.connected") {
+          this.streamConnected = true;
+          for (const ready of this.streamReadyWaiters) ready(true);
+        }
         this.observeReload(event);
         // Normalization resolves every failure to an outcome, and anything
         // that still escapes must cost one event rather than ending the stream.
@@ -546,6 +573,9 @@ export class OpenCodeV2Provider implements ChatProvider {
     } finally {
       this.streaming = false;
       this.streamOpen = false;
+      this.streamConnected = false;
+      this.streamSignal = undefined;
+      for (const ready of this.streamReadyWaiters) ready(false);
       this.wake = undefined;
       // A row this stream never delivered is not coming on the next one:
       // the 2.x stream has no replay, so an admission still waiting would
@@ -754,6 +784,7 @@ export class OpenCodeV2Provider implements ChatProvider {
 
   async dispose(): Promise<void> {
     this.readLifetime.abort();
+    for (const ready of this.streamReadyWaiters) ready(false);
     this.historyReuse.dispose();
     await Promise.allSettled(this.backgroundReads.values());
   }
@@ -981,8 +1012,9 @@ export class OpenCodeV2Provider implements ChatProvider {
    * entries (synthetic, compaction, move) and natively queued input are not
    * the dock's: Uatu's queue is held in the workspace, never in this inbox.
    */
-  async listPendingInbox(sessionId: string): Promise<PendingInboxEntry[]> {
-    const entries = await this.client.session.inbox.list({ sessionID: sessionId });
+  async listPendingInbox(sessionId: string, options?: { signal?: AbortSignal }): Promise<PendingInboxEntry[]> {
+    const signal = options?.signal ? AbortSignal.any([options.signal, this.readLifetime.signal]) : this.readLifetime.signal;
+    const entries = await this.client.session.inbox.list({ sessionID: sessionId }, { signal });
     return (entries as Array<Record<string, unknown>>).flatMap(entry => {
       if (entry.type !== "user" || entry.delivery !== "steer") return [];
       const pending = pendingInboxEntry(entry);
