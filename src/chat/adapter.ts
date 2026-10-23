@@ -78,7 +78,7 @@ type InventorySessionMetadata = {
   title: string;
   deleted: boolean;
 };
-type HistoryCoverage = { signal: AbortSignal; assertCurrent: () => void; merge: (items: ConversationItem[]) => ConversationItem[]; changed: (id: string) => boolean; inboxReconciled: boolean };
+type HistoryCoverage = { signal: AbortSignal; assertCurrent: () => void; merge: (items: ConversationItem[]) => ConversationItem[]; changed: (id: string) => boolean; inboxReconciled: boolean; steerCorrelations: ReadonlyMap<string, string> };
 
 export class InteractionConflictError extends Error {
   constructor(message = "interaction request is stale or already resolved") {
@@ -690,6 +690,10 @@ export class ChatAdapter {
   }
 
   private async readCoveredHistory(id: string, options: { cursor?: string; limit?: number }, recovery: { dirty: boolean }): Promise<ConversationSnapshot> {
+    // Pin only already-known native identities for this bounded read owner.
+    // Pending owners can depart, and the global delivery cache can evict,
+    // before a native history row (including a dirty reread) is applied.
+    const steerCorrelations = this.snapshotSteerCorrelations(id);
     const stream = this.pumpController;
     const lifetime = new AbortController();
     const signal = AbortSignal.any([lifetime.signal, ...(stream ? [stream.signal] : [])]);
@@ -709,6 +713,7 @@ export class ChatAdapter {
         if (this.provider.reconcileBackgroundTasks) await this.backgroundReady;
         signal.throwIfAborted();
         ready = true;
+        for (const [nativeId, requestId] of this.snapshotSteerCorrelations(id)) steerCorrelations.set(nativeId, requestId);
         const generation = this.backgroundStreamGeneration;
         const assertCurrent = () => {
           if (signal.aborted || this.disposed || this.pumpController !== stream || generation !== this.backgroundStreamGeneration) throw new Error("Inbox recovery unavailable");
@@ -721,7 +726,7 @@ export class ChatAdapter {
           recovery.dirty = false;
           fence = this.projection(id).beginHistoryRead();
           try {
-            const snapshot = await this.readHistory(id, options, { signal, assertCurrent, merge: fence.merge, changed: fence.changed, inboxReconciled });
+            const snapshot = await this.readHistory(id, options, { signal, assertCurrent, merge: fence.merge, changed: fence.changed, inboxReconciled, steerCorrelations });
             inboxReconciled = true;
             assertCurrent();
             if (!recovery.dirty) return snapshot;
@@ -773,7 +778,7 @@ export class ChatAdapter {
     // that complete source for recovery, never the bounded visible page.
     const configuration = await this.configuration(id);
     coverage?.assertCurrent();
-    const items = page.items.map(item => this.correlateSteerMessage(id, item));
+    const items = page.items.map(item => this.correlateSteerMessage(id, item, coverage?.steerCorrelations));
     // A conversation's price is the sum of every message's, and the client
     // folds it from the usage carriers it holds — so the newest page alone
     // would present a partial figure that grows as older pages load. Where
@@ -1767,10 +1772,11 @@ export class ChatAdapter {
     return true;
   }
 
-  private rememberDelivered(conversationId: string, steerId: string): void {
+  private rememberDelivered(conversationId: string, steerId: string, knownRequestId?: string): void {
     const key = steerKey(conversationId, steerId);
     const admission = this.admittingSteers.get(key);
-    const requestId = this.pendingSteers.get(conversationId)?.find(entry => entry.id === steerId)?.requestId
+    const requestId = knownRequestId ?? this.pendingSteers.get(conversationId)?.find(entry => entry.id === steerId)?.requestId
+      ?? this.heldQueues.get(conversationId)?.find(entry => entry.unconfirmedSteerId === steerId || entry === admission?.held)?.requestId
       ?? (!admission?.retired ? admission?.requestId : undefined);
     boundedSet(this.deliveredSteers, key, requestId ?? this.deliveredSteers.get(key) ?? true, DELIVERED_STEERS_LIMIT);
   }
@@ -1778,14 +1784,33 @@ export class ChatAdapter {
   // Native ids, not client request ids, establish ownership. Keep the original
   // correlation on delivered rows too, so a lost response cannot leave a
   // browser's optimistic draft beside the accepted input after reload.
-  private correlateSteerMessage(conversationId: string, item: ConversationItem): ConversationItem {
+  private snapshotSteerCorrelations(conversationId: string): Map<string, string> {
+    const known = new Map<string, string>();
+    for (const [key, requestId] of this.deliveredSteers) {
+      if (typeof requestId !== "string") continue;
+      const [owner, nativeId] = JSON.parse(key) as [string, string];
+      if (owner === conversationId) known.set(nativeId, requestId);
+    }
+    for (const admission of this.admittingSteers.values()) {
+      if (admission.conversationId === conversationId && !admission.retired) known.set(admission.id, admission.requestId);
+    }
+    for (const held of this.heldQueues.get(conversationId) ?? []) {
+      if (held.unconfirmedSteerId) known.set(held.unconfirmedSteerId, held.requestId);
+    }
+    for (const pending of this.pendingSteers.get(conversationId) ?? []) {
+      if (pending.requestId) known.set(pending.id, pending.requestId);
+    }
+    return known;
+  }
+
+  private correlateSteerMessage(conversationId: string, item: ConversationItem, readCorrelations?: ReadonlyMap<string, string>): ConversationItem {
     if (item.type !== "user_message" || !item.id.startsWith("message:")) return item;
     const id = item.id.slice("message:".length);
     const key = steerKey(conversationId, id);
     const admission = this.admittingSteers.get(key);
     const delivered = this.deliveredSteers.get(key);
     const current = this.projection(conversationId).get(item.id);
-    const requestId = this.pendingSteers.get(conversationId)?.find(entry => entry.id === id)?.requestId
+    const requestId = readCorrelations?.get(id) ?? this.pendingSteers.get(conversationId)?.find(entry => entry.id === id)?.requestId
       ?? (!admission?.retired ? admission?.requestId : undefined)
       ?? (typeof delivered === "string" ? delivered : undefined)
       ?? (current?.type === "user_message" ? current.requestId : undefined);
@@ -1860,11 +1885,13 @@ export class ChatAdapter {
     // transport releases its fence. Positive settlement retires it once.
     const queue = this.heldQueues.get(conversationId);
     const index = queue?.findIndex(entry => entry === admission?.held || entry.unconfirmedSteerId === delta.id) ?? -1;
+    // Positive settlement transfers the original correlation before either
+    // pending owner (including an unknown Queue→Steer handoff) is removed.
+    if (delta.outcome === "delivered") this.rememberDelivered(conversationId, delta.id);
     if (queue && index >= 0) {
       queue.splice(index, 1);
       if (!queue.length) this.heldQueues.delete(conversationId);
     }
-    if (delta.outcome === "delivered") this.rememberDelivered(conversationId, delta.id);
     if (waiter) {
       this.forgetSteer(conversationId, delta.id);
       waiter(delta.outcome);
@@ -1982,11 +2009,15 @@ export class ChatAdapter {
     else this.pendingSteers.set(conversationId, merged);
     for (const entry of gone) {
       const wasDelivered = delivered(entry.id);
-      if (wasDelivered) this.rememberDelivered(conversationId, entry.id);
+      // The departing owner is no longer in pendingSteers. Transfer its
+      // correlation with the positive native delivery evidence, before it is
+      // lost; a client nonce never becomes the ownership/cache key.
+      if (wasDelivered) this.rememberDelivered(conversationId, entry.id, entry.requestId);
       this.publishQueue(conversationId, { kind: wasDelivered ? "delivered" : "removed", messageId: entry.id });
     }
     for (const entry of added) this.publishQueue(conversationId, { kind: "steered", messageId: entry.id });
     for (const [nativeId, entry] of confirmedHeld) {
+      if (!nextIds.has(nativeId)) this.rememberDelivered(conversationId, nativeId, entry.requestId);
       this.publishQueue(conversationId, { kind: nextIds.has(nativeId) ? "switched" : "delivered", messageId: nextIds.has(nativeId) ? nativeId : entry.id });
     }
     this.publishPausedChanges(conversationId);

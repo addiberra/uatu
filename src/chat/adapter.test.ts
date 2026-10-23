@@ -589,6 +589,275 @@ test("real V2 an inbox read from an ended subscription cannot overwrite the next
   } finally { release(); await reading?.catch(() => undefined); await adapter.dispose(); await pump; await fake.stop(); }
 });
 
+for (const origin of ["composer", "held"] as const) for (const delivery of ["stored", "covered", "covered-with-eviction"] as const) test(`real V2 lost steer acknowledgement keeps original ${origin} correlation after ${delivery} delivery recovery`, async () => {
+  const directory = process.cwd();
+  const fake = startOpenCodeV2Fake({ directory });
+  let blockEvents = false, requested!: () => void, release!: () => void;
+  const reconnect = new Promise<void>(resolve => { requested = resolve; });
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const transport = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const request = new Request(input, init);
+    if (blockEvents && new URL(request.url).pathname === "/api/event") { requested(); await gate; }
+    return fetch(request);
+  }) as typeof fetch;
+  const provider = createOpenCodeV2Provider({ endpoint: fake.url, password: fake.password, directory, fetch: transport });
+  let captureInbox = false, captured!: () => void, releaseInbox!: () => void;
+  const inboxCaptured = new Promise<void>(resolve => { captured = resolve; });
+  const inboxGate = new Promise<void>(resolve => { releaseInbox = resolve; });
+  const list = provider.listPendingInbox!.bind(provider);
+  provider.listPendingInbox = async (...args) => {
+    const entries = await list(...args);
+    if (captureInbox) { captured(); await inboxGate; }
+    return entries;
+  };
+  const stored = { id: "11111111-2222-4333-8444-555555555555", mimeType: "image/png", absolutePath: "/fixture/11111111-2222-4333-8444-555555555555.png" };
+  const attachment = { id: stored.id, name: "original.png", mimeType: stored.mimeType };
+  const adapter = new ChatAdapter({ provider, workspacePath: directory, coalesceWindowMs: 0, maxProjections: delivery === "covered-with-eviction" ? 1 : undefined, resolveAttachment: async id => id === stored.id ? stored : null });
+  let reading: ReturnType<ChatAdapter["history"]> | undefined;
+  try {
+    const session = await provider.createSession("Recovered original correlation");
+    await adapter.prompt(session.id, "initial", "Initial work");
+    const initial = await adapter.history(session.id);
+    await adapter.stopEventPump();
+    blockEvents = true;
+    void adapter.startEventPump().catch(() => undefined);
+    await reconnect;
+    const draft = { requestId: "original-client-request", messageId: "pending:original-client-request", text: "Accepted before recovery", attachments: [attachment], unconfirmed: true as const };
+    const held = origin === "held" ? await adapter.prompt(session.id, draft.requestId, draft.text, undefined, undefined, undefined, draft.attachments, "queue") : undefined;
+    fake.loseNextPromptResponse();
+    await expect(held ? adapter.changeDelivery(session.id, held.messageId, "switch-request-not-the-original", "steer")
+      : adapter.prompt(session.id, draft.requestId, draft.text, undefined, undefined, undefined, draft.attachments, "steer")).rejects.toBeInstanceOf(OperationOutcomeUnknownError);
+    let snapshot: Awaited<ReturnType<ChatAdapter["history"]>>;
+    if (delivery === "stored") {
+      fake.step(session.id);
+      release();
+      snapshot = await adapter.history(session.id);
+    } else {
+      const client = await adapter.subscribe(session.id);
+      let browser = projectionFromSnapshot(client.snapshot, [draft]);
+      const clientPump = (async () => { for await (const event of client.events) browser = applyChatEvent(browser, event).projection; })();
+      try {
+        captureInbox = true;
+        release();
+        reading = adapter.history(session.id);
+        void reading.catch(() => undefined);
+        await inboxCaptured;
+        fake.step(session.id); // This generation never saw the enqueue payload.
+        await waitUntil(() => browser.queued.length === 0);
+        if (delivery === "covered-with-eviction") {
+          client.events.cancel();
+          await clientPump; // Navigation permits eviction of the read's projection too.
+          // More than the bounded positive-delivery cache can retain. The
+          // first row has no stream payload/projection copy to rescue it.
+          const sibling = await provider.createSession("Unrelated bounded-cache pressure");
+          await adapter.prompt(sibling.id, "sibling-initial", "Other running work");
+          const observer = await adapter.subscribe(sibling.id);
+          let other = projectionFromSnapshot(observer.snapshot);
+          const observerPump = (async () => { for await (const event of observer.events) other = applyChatEvent(other, event).projection; })();
+          try {
+            for (let index = 0; index < 65; index++) {
+              const next = await adapter.prompt(sibling.id, `pressure-${index}`, `Other input ${index}`, undefined, undefined, undefined, undefined, "steer");
+              fake.step(sibling.id);
+              await waitUntil(() => other.items.some(item => item.id === `message:${next.messageId}`));
+            }
+          } finally { observer.events.cancel(); await observerPump; }
+        }
+        releaseInbox();
+        snapshot = await reading;
+        if (delivery !== "covered-with-eviction") {
+          await waitUntil(() => browser.items.some(item => item.type === "user_message" && item.text === draft.text));
+          expect(browser.items.find(item => item.type === "user_message" && item.text === draft.text)).toHaveProperty("requestId", draft.requestId);
+        } else {
+          const replacement = await adapter.subscribe(session.id);
+          expect(replacement.snapshot.items.find(item => item.type === "user_message" && item.text === draft.text)).toHaveProperty("requestId", draft.requestId);
+          replacement.events.cancel();
+        }
+      } finally { client.events.cancel(); await clientPump; }
+    }
+    const rows = snapshot.items.filter(item => item.type === "user_message" && item.text === draft.text);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toHaveProperty("requestId", draft.requestId);
+    const native = (await provider.listMessages(session.id, { limit: 100 })).items.find(item => item.id === rows[0]!.id);
+    if (native?.type !== "user_message") throw new Error("Expected the real native stored user row");
+    expect(rows[0]).toEqual({ ...native, requestId: draft.requestId }); // Native text, images and execution timestamp are unchanged.
+    expect(snapshot.configuration).toEqual(initial.configuration);
+    expect(snapshot.queued).toEqual([]);
+    expect(projectionFromSnapshot(snapshot, [draft]).acceptedDrafts).toEqual([]);
+    expect(fake.state().calls.filter(call => call.includes("/prompt"))).toHaveLength(delivery === "covered-with-eviction" ? 68 : 2);
+  } finally { release(); releaseInbox(); await reading?.catch(() => undefined); await adapter.dispose(); await fake.stop(); }
+});
+
+for (const projected of [false, true]) test(`real V2 bounded correlation expiry ${projected ? "preserves an already projected request" : "does not invent an expired request"}`, async () => {
+  const directory = process.cwd();
+  const fake = startOpenCodeV2Fake({ directory });
+  let unavailableSession = "";
+  const transport = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const request = new Request(input, init);
+    if (unavailableSession && new URL(request.url).pathname === `/api/session/${unavailableSession}/message`) return Response.json({ error: "History unavailable" }, { status: 503 });
+    return fetch(request);
+  }) as typeof fetch;
+  const provider = createOpenCodeV2Provider({ endpoint: fake.url, password: fake.password, directory, fetch: transport });
+  const adapter = new ChatAdapter({ provider, workspacePath: directory, coalesceWindowMs: 0 });
+  try {
+    const session = await provider.createSession("Bounded correlation authority");
+    await adapter.prompt(session.id, "initial", "Initial work");
+    await adapter.history(session.id);
+    await adapter.stopEventPump();
+    const draft = { requestId: "original-before-expiry", messageId: "pending:original-before-expiry", text: "Original input before expiry", unconfirmed: true as const };
+    fake.loseNextPromptResponse();
+    await expect(adapter.prompt(session.id, draft.requestId, draft.text, undefined, undefined, undefined, undefined, "steer")).rejects.toBeInstanceOf(OperationOutcomeUnknownError);
+    const client = await adapter.subscribe(session.id);
+    let browser = projectionFromSnapshot(client.snapshot);
+    const clientPump = (async () => { for await (const event of client.events) browser = applyChatEvent(browser, event).projection; })();
+    try {
+      if (projected) await adapter.history(session.id);
+      else {
+        unavailableSession = session.id;
+        await expect(adapter.history(session.id)).rejects.toBeInstanceOf(Error);
+      }
+      fake.step(session.id);
+      await waitUntil(() => browser.queued.length === 0);
+      if (projected) await waitUntil(() => browser.items.some(item => item.type === "user_message" && item.requestId === draft.requestId));
+      else await expect(adapter.history(session.id)).rejects.toBeInstanceOf(Error); // No successful read owner can pin the old evidence.
+      const sibling = await provider.createSession("Bounded evidence expiry pressure");
+      await adapter.prompt(sibling.id, "sibling-initial", "Other running work");
+      const observer = await adapter.subscribe(sibling.id);
+      let other = projectionFromSnapshot(observer.snapshot);
+      const observerPump = (async () => { for await (const event of observer.events) other = applyChatEvent(other, event).projection; })();
+      try {
+        for (let index = 0; index < 65; index++) {
+          const next = await adapter.prompt(sibling.id, `expire-${index}`, `Unrelated ${index}`, undefined, undefined, undefined, undefined, "steer");
+          fake.step(sibling.id);
+          await waitUntil(() => other.items.some(item => item.id === `message:${next.messageId}`));
+        }
+      } finally { observer.events.cancel(); await observerPump; }
+      unavailableSession = "";
+      const snapshot = await adapter.history(session.id);
+      const row = snapshot.items.find(item => item.type === "user_message" && item.text === draft.text);
+      expect(row).toBeDefined();
+      if (projected) expect(row).toHaveProperty("requestId", draft.requestId);
+      else expect(row).not.toHaveProperty("requestId");
+      expect(projectionFromSnapshot(snapshot, [draft]).acceptedDrafts).toEqual(projected ? [] : [draft]);
+      expect(snapshot.queued).toEqual([]);
+      expect(fake.state().calls.filter(call => call.includes("/prompt"))).toHaveLength(68);
+    } finally { client.events.cancel(); await clientPump; }
+  } finally { await adapter.dispose(); await fake.stop(); }
+});
+
+for (const acknowledgement of ["lost", "late"] as const) test(`real V2 ${acknowledgement} acknowledgement correlation survives an ended read and the next native generation`, async () => {
+  const directory = process.cwd();
+  const fake = startOpenCodeV2Fake({ directory });
+  let delayPrompt = false, releaseAck!: () => void, ackReturned!: () => void;
+  const ackGate = new Promise<void>(resolve => { releaseAck = resolve; });
+  const returned = new Promise<void>(resolve => { ackReturned = resolve; });
+  const transport = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const request = new Request(input, init);
+    const response = await fetch(request);
+    if (delayPrompt && new URL(request.url).pathname.endsWith("/prompt")) {
+      delayPrompt = false;
+      await ackGate;
+      ackReturned();
+    }
+    return response;
+  }) as typeof fetch;
+  const provider = createOpenCodeV2Provider({ endpoint: fake.url, password: fake.password, directory, fetch: transport });
+  let holdInbox = false, captured!: () => void, releaseInbox!: () => void;
+  const capturedRead = new Promise<void>(resolve => { captured = resolve; });
+  const inboxGate = new Promise<void>(resolve => { releaseInbox = resolve; });
+  const list = provider.listPendingInbox!.bind(provider);
+  provider.listPendingInbox = async (...args) => {
+    const entries = await list(...args);
+    if (holdInbox) { captured(); await inboxGate; }
+    return entries;
+  };
+  const adapter = new ChatAdapter({ provider, workspacePath: directory, coalesceWindowMs: 0, steerAdmissionTimeoutMs: 80 });
+  let reading: Promise<unknown> | undefined;
+  try {
+    const session = await provider.createSession("Correlation across native generations");
+    await adapter.prompt(session.id, "initial", "Initial work");
+    fake.launchWorker(session.id, false); // A late acknowledgement must not background this worker.
+    await adapter.history(session.id);
+    await adapter.stopEventPump();
+    if (acknowledgement === "lost") fake.loseNextPromptResponse(); else delayPrompt = true;
+    const draft = { requestId: "original-after-ended-read", messageId: "pending:original-after-ended-read", text: "Original submitted input", unconfirmed: true as const };
+    await expect(adapter.prompt(session.id, draft.requestId, draft.text, undefined, undefined, undefined, undefined, "steer", { receiptScope: "alice", automaticBackground: "on" })).rejects.toBeInstanceOf(OperationOutcomeUnknownError);
+    const client = await adapter.subscribe(session.id);
+    let browser = projectionFromSnapshot(client.snapshot, [draft]);
+    const clientPump = (async () => { for await (const event of client.events) browser = applyChatEvent(browser, event).projection; })();
+    try {
+      holdInbox = true;
+      reading = adapter.history(session.id).catch(error => error);
+      await capturedRead;
+      fake.step(session.id);
+      await waitUntil(() => browser.queued.length === 0);
+      await adapter.stopEventPump();
+      expect(await reading).toBeInstanceOf(Error);
+      holdInbox = false;
+      const recovered = await adapter.history(session.id);
+      releaseInbox();
+      releaseAck();
+      if (acknowledgement === "late") await returned;
+      const stable = await adapter.history(session.id);
+      for (const snapshot of [recovered, stable]) {
+        expect(snapshot.items.filter(item => item.type === "user_message" && item.requestId === draft.requestId)).toHaveLength(1);
+        expect(snapshot.queued).toEqual([]);
+        expect(projectionFromSnapshot(snapshot, [draft]).acceptedDrafts).toEqual([]);
+      }
+      expect(fake.state().calls.filter(call => call.includes("/prompt"))).toHaveLength(2);
+      expect(fake.state().calls.some(call => call.includes("/background") || call.includes("resume=true"))).toBe(false);
+    } finally { client.events.cancel(); await clientPump; }
+  } finally { releaseAck(); releaseInbox(); await reading; await adapter.dispose(); await fake.stop(); }
+});
+
+test("real V2 correlation is native-ID scoped across account nonce collisions and unavailable history", async () => {
+  const directory = process.cwd();
+  const fake = startOpenCodeV2Fake({ directory });
+  let failHistory = false;
+  const transport = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const request = new Request(input, init);
+    if (failHistory && new URL(request.url).pathname.endsWith("/message")) return Response.json({ error: "History unavailable" }, { status: 503 });
+    return fetch(request);
+  }) as typeof fetch;
+  const provider = createOpenCodeV2Provider({ endpoint: fake.url, password: fake.password, directory, fetch: transport });
+  const adapter = new ChatAdapter({ provider, workspacePath: directory, coalesceWindowMs: 0 });
+  try {
+    const session = await provider.createSession("Independent account submissions");
+    await adapter.prompt(session.id, "initial", "Initial work");
+    await adapter.history(session.id);
+    await adapter.stopEventPump();
+    const draft = { requestId: "same-client-nonce", messageId: "pending:same-client-nonce", text: "Identical input", unconfirmed: true as const };
+    for (const receiptScope of ["alice", "bob"]) {
+      fake.loseNextPromptResponse();
+      await expect(adapter.prompt(session.id, draft.requestId, draft.text, undefined, undefined, undefined, undefined, "steer", { receiptScope, automaticBackground: "off" })).rejects.toBeInstanceOf(OperationOutcomeUnknownError);
+    }
+    const external = await provider.prompt(session.id, { id: "external-identical-input", text: draft.text, delivery: "steer" });
+    const client = await adapter.subscribe(session.id);
+    let browser = projectionFromSnapshot(client.snapshot, [draft]);
+    const clientPump = (async () => { for await (const event of client.events) browser = applyChatEvent(browser, event).projection; })();
+    try {
+      const knownIds = browser.queued.map(entry => entry.id);
+      expect(new Set(knownIds).size).toBe(2);
+      expect(browser.queued.every(entry => entry.requestId === draft.requestId && entry.submissionId !== draft.requestId && entry.unconfirmed)).toBe(true);
+      failHistory = true;
+      await expect(adapter.history(session.id)).rejects.toBeInstanceOf(Error);
+      expect(browser.queued.map(entry => entry.id)).toEqual(knownIds);
+      expect(browser.items.some(item => item.type === "user_message" && item.text === draft.text)).toBe(false);
+      failHistory = false;
+      await adapter.stopEventPump();
+      fake.step(session.id);
+      const recovered = await adapter.history(session.id);
+      const rows = recovered.items.filter(item => item.type === "user_message" && item.text === draft.text);
+      expect(rows).toHaveLength(3);
+      expect(new Set(rows.map(item => item.id)).size).toBe(3);
+      for (const id of knownIds) expect(rows.find(item => item.id === `message:${id}`)).toHaveProperty("requestId", draft.requestId);
+      expect(rows.find(item => item.id === `message:${external.messageId}`)).not.toHaveProperty("requestId");
+      expect(projectionFromSnapshot(recovered, [draft]).acceptedDrafts).toEqual([]);
+      expect(fake.state().calls.filter(call => call.includes("/prompt"))).toHaveLength(4);
+      expect(fake.state().calls.some(call => call.includes("/background") || call.includes("resume=true"))).toBe(false);
+    } finally { client.events.cancel(); await clientPump; }
+  } finally { await adapter.dispose(); await fake.stop(); }
+});
+
 for (const acknowledgement of ["lost", "late"] as const) for (const responseState of ["pending", "delivered"] as const) test(`real V2 enqueue before a ${acknowledgement} composer acknowledgement retires its optimistic echo (${responseState} before response)`, async () => {
   const directory = process.cwd();
   const fake = startOpenCodeV2Fake({ directory });

@@ -235,7 +235,7 @@ and is not reduced by message removal. Legacy subagent/background summaries
 are not repeated above this card. Inspection, history and saved dismissal remain
 available.
 
-Authority is pinned to the installed `@opencode/client` 2.0.28 contract and
+The historical accounting-authority check used the `@opencode/client` 2.0.28 contract and
 [OpenCode v2.0.28 projector](https://github.com/anomalyco/opencode/blob/026b106bc5d41b679ffc413264229c340871e4d3/packages/core/src/session/projector.ts#L58-L72):
 usage updates only the named session; step completion and compaction's
 [`UsageRecorded`](https://github.com/anomalyco/opencode/blob/026b106bc5d41b679ffc413264229c340871e4d3/packages/core/src/session/compaction.ts#L616-L622)

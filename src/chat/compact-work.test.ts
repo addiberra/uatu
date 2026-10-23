@@ -2,6 +2,62 @@ import { expect, test } from "bun:test";
 import { CompactDisclosure, compactWorkers, workerSummary } from "./compact-work";
 import type { ConversationItem } from "./types";
 
+test("finished tool workers sort by reported completion, not launch time", () => {
+  const workers = compactWorkers([
+    { type: "tool", id: "tool:long", name: "task", status: "completed", input: '{"description":"Long worker"}', childConversationId: "reused-child", createdAt: 1000, completedAt: 9000 },
+    { type: "tool", id: "tool:short", name: "task", status: "completed", input: '{"description":"Short worker"}', childConversationId: "reused-child", createdAt: 2000, completedAt: 3000 },
+  ]);
+  expect(workers.map(({ id, settledAt }) => ({ id, settledAt }))).toEqual([
+    { id: "tool:long", settledAt: 9000 }, { id: "tool:short", settledAt: 3000 },
+  ]);
+});
+
+test("all terminal outcomes share completion ordering while active and unknown workers remain oldest first", () => {
+  const workers = compactWorkers([
+    { type: "tool", id: "done", name: "task", input: '{"description":"Done"}', status: "completed", createdAt: 1000, completedAt: 4000 },
+    { type: "tool", id: "failed", name: "task", input: '{"description":"Failed"}', status: "failed", createdAt: 2000, completedAt: 6000 },
+    { type: "tool", id: "stopped", name: "task", input: '{"description":"Stopped"}', status: "cancelled", createdAt: 3000, completedAt: 5000 },
+    { type: "tool", id: "working-new", name: "task", input: '{"description":"New"}', status: "running", createdAt: 20, completedAt: 1 },
+    { type: "tool", id: "working-old", name: "task", input: '{"description":"Old"}', status: "running", createdAt: 10, completedAt: 99 },
+    { type: "tool", id: "unknown-new", name: "task", input: '{"description":"New"}', status: "pending", createdAt: 40 },
+    { type: "tool", id: "unknown-old", name: "task", input: '{"description":"Old"}', status: "pending", createdAt: 30 },
+  ]);
+  expect(workers.map(worker => worker.id)).toEqual(["working-old", "working-new", "unknown-old", "unknown-new", "failed", "stopped", "done"]);
+  expect(workers.slice(-3).map(worker => worker.state)).toEqual(["failed", "stopped", "completed"]);
+});
+
+test("missing completion uses reported task execution duration then launch, with deterministic ties", () => {
+  const workers = compactWorkers([
+    { type: "tool", id: "b", name: "task", input: '{"description":"B"}', status: "completed", createdAt: 2000 },
+    { type: "background_task", id: "duration", taskId: "duration", description: "Duration", status: "completed", createdAt: 1000, usage: { durationMs: 4000, totalTokens: 12, toolUses: 1 } },
+    { type: "tool", id: "a", name: "task", input: '{"description":"A"}', status: "completed", createdAt: 2000 },
+    { type: "background_task", id: "zero-duration", taskId: "zero-duration", description: "Zero duration", status: "stopped", createdAt: 0, usage: { durationMs: 0, totalTokens: 0, toolUses: 0 } },
+  ]);
+  expect(workers.map(({ id, settledAt }) => ({ id, settledAt }))).toEqual([
+    { id: "duration", settledAt: 5000 }, { id: "a", settledAt: 2000 }, { id: "b", settledAt: 2000 },
+    { id: "zero-duration", settledAt: 0 },
+  ]);
+  expect(workers.find(worker => worker.id === "a")?.completedAt).toBeUndefined();
+  expect(workers.find(worker => worker.id === "duration")?.completedAt).toBeUndefined();
+  const ties: ConversationItem[] = [
+    { type: "tool", id: "b", name: "task", input: '{"description":"B"}', status: "completed", createdAt: 2000 },
+    { type: "tool", id: "a", name: "task", input: '{"description":"A"}', status: "completed", createdAt: 1000, completedAt: 2000 },
+  ];
+  expect(compactWorkers(ties).map(worker => worker.id)).toEqual(["a", "b"]);
+  expect(compactWorkers(ties.reverse()).map(worker => worker.id)).toEqual(["a", "b"]);
+});
+
+test("zero, equal-launch and backward completion timestamps remain raw provider facts", () => {
+  const workers = compactWorkers([
+    { type: "tool", id: "zero", name: "task", input: '{"description":"Zero"}', status: "completed", createdAt: 1000, completedAt: 0 },
+    { type: "tool", id: "same", name: "task", input: '{"description":"Same"}', status: "completed", createdAt: 2000, completedAt: 2000 },
+    { type: "tool", id: "backward", name: "task", input: '{"description":"Backward"}', status: "failed", createdAt: 9000, completedAt: 1000 },
+  ]);
+  expect(workers.map(({ id, settledAt }) => ({ id, settledAt }))).toEqual([
+    { id: "same", settledAt: 2000 }, { id: "backward", settledAt: 1000 }, { id: "zero", settledAt: 0 },
+  ]);
+});
+
 test("canonical aliases display child session metadata once, not task cost or a parent's selection", () => {
   const workerSession = { model: "Latest model", effort: null, costUsd: 0.125 };
   const workers = compactWorkers([

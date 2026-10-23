@@ -59,7 +59,10 @@ export type CompactWorker = {
   kind: "agent" | "shell";
   agent?: string;
   since: number;
+  // Sort clock: reported completion, latest reported execution, or launch.
   settledAt: number;
+  // Preserve terminal-clock provenance even when it equals launch (or zero).
+  completedAt?: number;
   progress?: string;
   taskId?: string;
   stoppable?: boolean;
@@ -104,10 +107,11 @@ export function compactWorkers(items: readonly ConversationItem[]): CompactWorke
       }
       continue;
     }
+    const completedAt = item?.type === "tool" ? item.completedAt : undefined;
     workers.set(entry.id, {
       id: entry.id, state: workerState(entry.status), references: [entry.id],
       name: entry.description, kind: "agent", agent: entry.subagent, since: item?.createdAt ?? 0,
-      settledAt: item?.createdAt ?? 0, progress: entry.progress, conversationId: entry.conversationId,
+      settledAt: completedAt ?? item?.createdAt ?? 0, completedAt, progress: entry.progress, conversationId: entry.conversationId,
       model: entry.model, tokens: entry.usage ? totalTokens(entry.usage) : undefined,
     });
   }

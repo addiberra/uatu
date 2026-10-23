@@ -232,7 +232,13 @@ for (const mode of ["desktop", "touch"] as const) test(`side-reader workspace li
     const generated = page.waitForResponse(response => response.url().endsWith("/aside"));
     await page.locator("#chat-send").click(); await generated;
     await page.locator("#chat-input").fill("Keep this exact draft");
-    const documentIdentity = await page.evaluate(() => performance.timeOrigin);
+    // WebKit's native timeOrigin can vary within one Document. Install once,
+    // after boot, so a new Document cannot inherit or recreate this identity.
+    const documentIdentity = await page.evaluate(() => {
+      const token = crypto.randomUUID();
+      Object.defineProperty(document, "__sideReaderIdentity", { value: token });
+      return token;
+    });
     const reader = page.locator("#chat-aside-dialog");
     const answer = page.locator("#chat-aside-answer");
     const reopen = async () => {
@@ -257,7 +263,7 @@ for (const mode of ["desktop", "touch"] as const) test(`side-reader workspace li
     await expect(answer.locator('script, [onclick], a[href^="javascript:"]')).toHaveCount(0);
     await captureScreenshot(page, info, `side-links-${engine}-${mode}-reader`);
     await answer.getByRole("button", { name: "workspace", exact: true }).click();
-    expect(await page.evaluate(() => performance.timeOrigin)).toBe(documentIdentity);
+    expect(await page.evaluate(() => (document as Document & { __sideReaderIdentity?: string }).__sideReaderIdentity)).toBe(documentIdentity);
     await expect(reader).toBeHidden();
     await expect(page.locator("#preview-path")).toHaveText("README.md");
     if (mode === "touch") {
@@ -293,7 +299,7 @@ for (const mode of ["desktop", "touch"] as const) test(`side-reader workspace li
     await expect(page.locator("#preview-path")).toHaveText("guides/setup.md");
     await expect(page.locator("#chat-input")).toHaveValue("Keep this exact draft");
     await expect(page.locator("#chat-conversation-select")).toHaveValue(conversation);
-    expect(await page.evaluate(() => performance.timeOrigin)).toBe(documentIdentity);
+    expect(await page.evaluate(() => (document as Document & { __sideReaderIdentity?: string }).__sideReaderIdentity)).toBe(documentIdentity);
     expect(mutations).toEqual([expect.stringMatching(/\/aside$/)]);
     const after = await request.post("/__e2e/chat", { data: { action: "opencode", op: "state" } }).then(response => response.json());
     expect(after.calls.slice(before.calls.length).filter((call: string) => call.startsWith("POST"))).toEqual([expect.stringMatching(/\/generate$/)]);

@@ -21,10 +21,16 @@ test("finished worker clocks render 24-hour evening and midnight even under an A
       { type: "background_task", id: "evening", taskId: "evening", description: "Finished", status: "completed", createdAt: evening - 60_000, usage: { durationMs: 60_000, totalTokens: 0, toolUses: 0 } },
       { type: "background_task", id: "midnight", taskId: "midnight", description: "Start only", status: "completed", createdAt: midnight },
       { type: "background_task", id: "unknown", taskId: "unknown", description: "No timestamp", status: "completed", createdAt: 0 },
+      { type: "tool", id: "same", name: "task", input: '{"description":"Instant completion"}', status: "completed", createdAt: midnight, completedAt: midnight },
+      { type: "tool", id: "zero", name: "task", input: '{"description":"Epoch completion"}', status: "completed", createdAt: 0, completedAt: 0 },
+      { type: "tool", id: "later", name: "task", input: '{"description":"Later finish"}', status: "completed", createdAt: midnight - 60_000, completedAt: midnight },
     ]), new Set(), true);
     expect(host.querySelector('[data-worker-id="evening"] .chat-worker-meta')!.textContent).toBe("Agent · 19:43");
     expect(host.querySelector('[data-worker-id="midnight"] .chat-worker-meta')!.textContent).toBe("Agent · Started 00:00");
     expect(host.querySelector('[data-worker-id="unknown"] .chat-worker-meta')!.textContent).toBe("Agent");
+    expect(host.querySelector('[data-worker-id="same"] .chat-worker-meta')!.textContent).toBe("Agent · 00:00");
+    expect(host.querySelector('[data-worker-id="later"] .chat-worker-meta')!.textContent).toBe("Agent · 00:00");
+    expect(host.querySelector('[data-worker-id="zero"] .chat-worker-meta')!.textContent).toBe(`Agent · ${new Intl.DateTimeFormat("en-US", { hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).format(new Date(0))}`);
   } finally {
     format.mockRestore();
     for (const [key, value] of previous) Reflect.set(globalThis, key, value);
