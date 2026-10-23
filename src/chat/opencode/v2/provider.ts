@@ -8,7 +8,7 @@ import { OPENCODE_PERMISSION_SCOPE_NOTE } from "../permission-scope";
 import { stableProviderId } from "../message-id";
 import { measureChatWork } from "../../performance";
 import { HistoryReuse, historyPageCursor, historyPageEnd, historyVersion } from "../../history-reuse";
-import { BackgroundTaskUnavailableError, OperationOutcomeUnknownError, InvalidQuestionAnswerError, ReversibleHistoryTargetError, type PendingInboxEntry } from "../../provider";
+import { BackgroundTaskUnavailableError, InterruptNotAppliedError, OperationOutcomeUnknownError, InvalidQuestionAnswerError, ReversibleHistoryTargetError, type PendingInboxEntry } from "../../provider";
 import type {
   ChatProvider,
   NormalizedProviderEvent,
@@ -981,7 +981,21 @@ export class OpenCodeV2Provider implements ChatProvider {
     // `resume: true` wakes steer-scope input only; omitted or false wakes
     // nothing. Pending input is never deleted by an interrupt (2.0.28).
     const dispatch = () => this.client.session.interrupt({ sessionID: sessionId, ...(options?.resume === undefined ? {} : { resume: options.resume }) });
-    return options?.resume === true ? await this.backgroundMutation(dispatch) : await dispatch();
+    if (options?.resume === true) return await this.backgroundMutation(dispatch);
+    try { return await dispatch(); }
+    catch (error) {
+      // Only explicit request/auth/session refusals or a socket that never
+      // connected prove non-application. A generic error, 5xx, or other native
+      // failure may follow side effects and must preserve Stop's queue intent.
+      if (isConnectionRefused(error) || [...causes(error)].some(record =>
+        ["InvalidRequestError", "UnauthorizedError", "ForbiddenError", "SessionNotFoundError"].includes(String(record._tag))
+        // The pinned client does not declare 403 on this route, so it keeps
+        // the HTTP status in ClientError.cause instead of decoding the tag.
+        || record.name === "ClientError" && record.reason === "UnexpectedStatus" && asRecord(record.cause).status === 403)) {
+        throw new InterruptNotAppliedError(failureText(error));
+      }
+      throw error;
+    }
   }
 
   async backgroundBlockingWork(sessionId: string): Promise<void> {

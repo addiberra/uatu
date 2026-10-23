@@ -10,6 +10,7 @@ Compatibility: breaking (workspace)
 
 - Closed `QueuedMessage` payloads can carry `submissionId`, a server-owned opaque identity scoped to one conversation's pending submission. Its initial held/native ID is preserved through queue/steer switches, uncertain admissions and recovery while known to the adapter. Newly recovered native entries without a known identity start with their native ID. It carries no account metadata and does not replace the original client `requestId` echo.
 - Pending action labels keep their number through native handle changes and intermediate empty withdrawal snapshots. The renderer retains live identities plus at most 64 recently absent identities, never absent DOM nodes. Conversation reset clears numbering. This is bounded presentation state, not durable identity or mutation deduplication; adapter recreation can lose a previously converted identity.
+- Pause bookkeeping follows observed settlement identity rather than wall time: late wake acknowledgements cannot erase a newer interruption. Confirmed or ambiguous Stop application retains held-queue dormancy; a delivery-only switch to Queue does not authorize restarting execution. This corrects existing behavior without adding payload fields.
 
 ### Migration
 

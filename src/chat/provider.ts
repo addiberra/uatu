@@ -242,6 +242,16 @@ export class OperationOutcomeUnknownError extends Error {
   }
 }
 
+/** Positive provider evidence that Stop was refused before application.
+ * An ordinary rejection, including a lost response, carries no such evidence.
+ */
+export class InterruptNotAppliedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "InterruptNotAppliedError";
+  }
+}
+
 /**
  * A release the session cannot take right now: a turn is running, or live
  * background work would die with it. A conflict with the current state —
@@ -364,6 +374,8 @@ export interface ChatProvider {
    * the steers it still holds (Send now on a paused steer, D8); `false`, or
    * no option, leaves them pending (Cancel, D9). Agents without an inbox
    * ignore the option.
+   * Stop may throw InterruptNotAppliedError only with definite non-application
+   * evidence. Other failures leave application unknown; false is a valid no-op.
    */
   interrupt(sessionId: string, options?: { resume?: boolean }): Promise<void | { interrupted: boolean }>;
   /**

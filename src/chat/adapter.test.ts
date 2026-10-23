@@ -14,7 +14,7 @@ import type {
   ProviderSession,
   StoredMessageAccounting,
 } from "./provider";
-import { OperationOutcomeUnknownError, ReversibleHistoryTargetError, UnsupportedVariantSelectionError } from "./provider";
+import { InterruptNotAppliedError, OperationOutcomeUnknownError, ReversibleHistoryTargetError, UnsupportedVariantSelectionError } from "./provider";
 import type { ChatCommand, ChatEvent, ChatModel, ConversationItem, MessageDelivery, ToolItem, ModelSelection, ReversibleHistoryResult, ReversibleHistoryState } from "./types";
 import { ConversationNotFoundError } from "./workspace";
 import { MetricsRegistry } from "../debug/metrics";
@@ -800,6 +800,133 @@ for (const outcome of ["unknown", "cancel-refused", "delivered-on-cancel", "deli
     provider.getConversationConfiguration = configuration;
     await adapter.dispose(); await pump; await fake.stop();
   }
+});
+
+for (const failure of [
+  { name: "validation", tag: "InvalidRequestError", status: 400, definite: true },
+  { name: "unauthorized", tag: "UnauthorizedError", status: 401, definite: true },
+  { name: "forbidden", tag: "ForbiddenError", status: 403, definite: true },
+  { name: "missing session", tag: "SessionNotFoundError", status: 404, definite: true },
+  { name: "connection refused", definite: true },
+  { name: "generic failed", definite: false },
+  { name: "network loss", definite: false },
+  { name: "HTTP 502", status: 502, definite: false },
+  { name: "native internal failure", tag: "UnknownError", status: 500, definite: false },
+] as const) test(`real V2 Stop ${failure.name} ${failure.definite ? "restores natural delivery" : "retains intent without stream settlement"}`, async () => {
+  const directory = process.cwd();
+  const fake = startOpenCodeV2Fake({ directory });
+  let refuse = false;
+  let interrupts = 0;
+  const transport = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const request = new Request(input, init);
+    if (refuse && new URL(request.url).pathname.endsWith("/interrupt")) {
+      interrupts++;
+      if ("status" in failure) return Response.json({ ...("tag" in failure ? { _tag: failure.tag } : {}), message: "Stop failed" }, { status: failure.status });
+      if (failure.name === "connection refused") throw Object.assign(new Error("Stop failed"), { code: "ECONNREFUSED" });
+      throw new Error(failure.name === "generic failed" ? "failed" : "socket lost");
+    }
+    return fetch(request);
+  }) as typeof fetch;
+  const provider = createOpenCodeV2Provider({ endpoint: fake.url, password: fake.password, directory, fetch: transport });
+  const adapter = new ChatAdapter({ provider, workspacePath: directory, coalesceWindowMs: 0 });
+  const pump = adapter.startEventPump();
+  try {
+    await waitUntil(() => fake.state().eventSubscribers > 0);
+    const session = await provider.createSession("Definite Stop refusal");
+    await adapter.prompt(session.id, "initial", "Initial work");
+    const held = await adapter.prompt(session.id, "held", "Natural next work", undefined, undefined, undefined, undefined, "queue");
+    refuse = true;
+    await expect(adapter.abort(session.id, "stop")).rejects.toBeDefined();
+    expect((await adapter.history(session.id)).conversation.status).toBe("running");
+    expect((await adapter.history(session.id)).queued).toEqual([expect.objectContaining({ id: held.messageId })]);
+    expect((await adapter.history(session.id)).queued![0]!.paused ?? false).toBe(!failure.definite);
+    fake.finish(session.id);
+    if (failure.definite) await waitUntil(() => fake.state().calls.filter(call => call.includes("/prompt")).length === 2);
+    else {
+      await waitUntil(() => adapter.projectionForTests(session.id).status === "completed");
+      await admissionsApplied(adapter);
+      expect((await adapter.history(session.id)).queued).toEqual([expect.objectContaining({ id: held.messageId, paused: true })]);
+      expect(fake.state().calls.filter(call => call.includes("/prompt"))).toHaveLength(1);
+    }
+    expect(interrupts).toBe(1);
+  } finally { await adapter.dispose(); await pump.catch(error => { if (!String(error).includes("operation was aborted")) throw error; }); await fake.stop(); }
+});
+
+test("real V2 late steer acknowledgement preserves an external interruption", async () => {
+  const directory = process.cwd();
+  const fake = startOpenCodeV2Fake({ directory });
+  let release!: () => void, arrived!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const accepted = new Promise<void>(resolve => { arrived = resolve; });
+  let hold = false;
+  const transport = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const request = new Request(input, init);
+    const response = await fetch(request);
+    if (hold && new URL(request.url).pathname.endsWith("/prompt")) {
+      hold = false; arrived(); await gate;
+    }
+    return response;
+  }) as typeof fetch;
+  const provider = createOpenCodeV2Provider({ endpoint: fake.url, password: fake.password, directory, fetch: transport });
+  const adapter = new ChatAdapter({ provider, workspacePath: directory, coalesceWindowMs: 0 });
+  const pump = adapter.startEventPump();
+  try {
+    await waitUntil(() => fake.state().eventSubscribers > 0);
+    const session = await provider.createSession("Late steer receipt");
+    await adapter.prompt(session.id, "initial", "Initial work");
+    hold = true;
+    const steering = adapter.prompt(session.id, "steer", "Pending through interruption", undefined, undefined, undefined, undefined, "steer");
+    await accepted;
+    await provider.interrupt(session.id, { resume: false });
+    await waitUntil(() => adapter.projectionForTests(session.id).status === "interrupted");
+    expect((await adapter.history(session.id)).queued).toEqual([expect.objectContaining({ paused: true })]);
+    release();
+    const result = await steering;
+    expect((await adapter.history(session.id)).queued).toEqual([
+      expect.objectContaining({ id: result.messageId, delivery: "steer", paused: true }),
+    ]);
+    expect(fake.state().sessions[session.id]!.running).toBe(false);
+  } finally { release(); await adapter.dispose(); await pump; await fake.stop(); }
+});
+
+test("real V2 confirmed Stop with a lost response keeps Queue conversion dormant", async () => {
+  const directory = process.cwd();
+  const fake = startOpenCodeV2Fake({ directory });
+  let release!: () => void, arrived!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const applied = new Promise<void>(resolve => { arrived = resolve; });
+  let loseStop = false;
+  const transport = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const request = new Request(input, init);
+    const response = await fetch(request);
+    if (loseStop && new URL(request.url).pathname.endsWith("/interrupt")) {
+      loseStop = false; arrived(); await gate;
+      throw new Error("Stop response lost after application");
+    }
+    return response;
+  }) as typeof fetch;
+  const provider = createOpenCodeV2Provider({ endpoint: fake.url, password: fake.password, directory, fetch: transport });
+  const adapter = new ChatAdapter({ provider, workspacePath: directory, coalesceWindowMs: 0 });
+  const pump = adapter.startEventPump();
+  try {
+    await waitUntil(() => fake.state().eventSubscribers > 0);
+    const session = await provider.createSession("Lost Stop response");
+    await adapter.prompt(session.id, "initial", "Initial work");
+    const steer = await adapter.prompt(session.id, "steer", "Must stay pending", undefined, undefined, undefined, undefined, "steer");
+    loseStop = true;
+    const stopping = adapter.abort(session.id, "stop").catch(error => error);
+    await applied;
+    await waitUntil(() => adapter.projectionForTests(session.id).status === "interrupted");
+    release();
+    expect(await stopping).toBeInstanceOf(Error);
+    const held = await adapter.changeDelivery(session.id, steer.messageId, "hold", "queue");
+    await admissionsApplied(adapter);
+    expect((await adapter.history(session.id)).queued).toEqual([
+      expect.objectContaining({ id: held.messageId, delivery: "queue", paused: true }),
+    ]);
+    expect(fake.state().sessions[session.id]!.running).toBe(false);
+    expect(fake.state().calls.filter(call => call.includes("/prompt"))).toHaveLength(2);
+  } finally { release(); await adapter.dispose(); await pump; await fake.stop(); }
 });
 
 for (const acknowledgement of ["accepted", "lost"] as const) for (const nextPhase of ["running", "completed"] as const) test(`real V2 late Stop ${acknowledgement} acknowledgement preserves a newer parent execution (${nextPhase})`, async () => {
@@ -4386,12 +4513,12 @@ describe("prompt, abort, permission, and question mutations", () => {
     expect(provider.prompts).toHaveLength(1);
     await expect(adapter.removeQueued("session", held.messageId, "remove-1")).resolves.toEqual({ removed: true });
 
-    // A failed interrupt leaves the turn running and must roll back only the
-    // pause this cancellation added — the next natural end still delivers.
+    // Positive pre-application refusal rolls back only this Stop's pause;
+    // an ordinary transport rejection cannot establish that fact.
     expect((await adapter.prompt("session", "r3", "third")).pending).toBe(false);
     const fourth = await adapter.prompt("session", "r4", "fourth");
     expect(fourth.pending).toBe(true);
-    provider.interrupt = async () => { throw new Error("interrupt refused"); };
+    provider.interrupt = async () => { throw new InterruptNotAppliedError("interrupt refused"); };
     await expect(adapter.abort("session", "cancel-2")).rejects.toThrow("interrupt refused");
     adapter.projectionForTests("session").statusUpdate("completed");
     for (let attempt = 0; attempt < 200 && provider.prompts.length < 3; attempt += 1) await new Promise(resolve => setTimeout(resolve, 1));
@@ -8381,6 +8508,97 @@ describe("steering (opencode-v2-steering)", () => {
     await bytes.adapter.dispose();
   });
 
+  for (const clock of ["same", "backward"] as const) test(`a timed-out resume's late receipt preserves a newer settlement (${clock} clock)`, async () => {
+    const { adapter, provider, steer, queued } = steering({ steerAdmissionTimeoutMs: 100 });
+    let release!: () => void, arrived!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const dispatched = new Promise<void>(resolve => { arrived = resolve; });
+    const now = Date.now();
+    const time = spyOn(Date, "now").mockReturnValue(now);
+    try {
+      adapter.projectionForTests("session").statusUpdate("running");
+      const pending = await steer("pending", "paused instruction");
+      adapter.projectionForTests("session").statusUpdate("interrupted");
+      provider.interrupt = async () => { arrived(); await gate; };
+      jest.useFakeTimers();
+      const resuming = adapter.sendNow("session", pending.messageId, "resume").catch(error => error);
+      await dispatched;
+      jest.advanceTimersByTime(100);
+      expect(await resuming).toBeInstanceOf(OperationOutcomeUnknownError);
+      jest.useRealTimers();
+      time.mockReturnValue(now - (clock === "backward" ? 10 : 0));
+      adapter.projectionForTests("session").statusUpdate("interrupted");
+      release();
+      const after = await queued();
+      expect(after).toEqual([expect.objectContaining({ id: pending.messageId, paused: true })]);
+      expect(after[0]).not.toHaveProperty("unconfirmed");
+      expect((await adapter.history("session")).conversation.status).toBe("interrupted");
+    } finally { release(); jest.useRealTimers(); time.mockRestore(); await adapter.dispose(); }
+  });
+
+  for (const path of ["composer", "switch", "send-now", "staged", "staged-queue", "resume"] as const) for (const clock of ["forward", "same", "backward"] as const) test(`a late ${path} wake receipt cannot erase a newer interruption (${clock} clock)`, async () => {
+    const { adapter, provider, steer, queue, queued, inbox } = steering(path === "staged-queue" ? { capabilities: [] } : {});
+    const pump = adapter.startEventPump();
+    let release!: () => void, arrived!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const accepted = new Promise<void>(resolve => { arrived = resolve; });
+    const now = Date.now();
+    const time = spyOn(Date, "now").mockReturnValue(now);
+    try {
+      await adapter.prompt("session", "start", "initial work");
+      const anchor = await queue("anchor", "held behind wake");
+      const pending = path === "staged-queue" ? undefined : await steer("original", "pending before wake");
+      const held = path === "switch" || path === "send-now" ? await queue("wake", "wake") : undefined;
+      await adapter.abort("session", "stop");
+      if (path === "staged" || path === "staged-queue") {
+        provider.agent.capabilities.push("reversible-history");
+        let state: ReversibleHistoryState = { staged: true, canUndo: false, canRedo: true, revertedMessages: [{ id: "message:old", text: "old" }] };
+        provider.getReversibleHistoryState = async () => state;
+        provider.undo = provider.redo = provider.revert = provider.restore = async () => ({ outcome: "changed", state });
+        const accept = provider.prompt.bind(provider);
+        provider.prompt = async (id, input) => {
+          const result = await accept(id, input);
+          state = { staged: false, canUndo: true, canRedo: false, revertedMessages: [] };
+          if (path === "staged") inbox({ kind: "pending", id: result.messageId, text: input.text, delivery: "steer", at: Date.now() });
+          adapter.projectionForTests("session").statusUpdate("running");
+          arrived(); await gate;
+          return result;
+        };
+      } else if (path === "resume") {
+        provider.interrupt = async (_id, options) => {
+          expect(options).toEqual({ resume: true });
+          adapter.projectionForTests("session").statusUpdate("running");
+          arrived(); await gate;
+        };
+      } else {
+        const accept = provider.prompt.bind(provider);
+        provider.prompt = async (id, input) => {
+          const result = await accept(id, input);
+          inbox({ kind: "pending", id: result.messageId, text: input.text, delivery: "steer", at: Date.now() });
+          adapter.projectionForTests("session").statusUpdate("running");
+          arrived(); await gate;
+          return result;
+        };
+      }
+      const waking = path === "switch" ? adapter.changeDelivery("session", held!.messageId, "wake", "steer")
+        : path === "send-now" ? adapter.sendNow("session", held!.messageId, "wake")
+        : path === "resume" ? adapter.sendNow("session", pending!.messageId, "wake")
+        : path === "staged-queue" ? queue("wake", "wake") : steer("wake", "wake");
+      await accepted;
+      await liveEventsApplied(adapter, provider);
+      time.mockReturnValue(now + (clock === "forward" ? 10 : clock === "backward" ? -10 : 0));
+      provider.eventQueue.push({ normalized: { conversationId: "session", updates: [{ kind: "status", status: "interrupted" }], outcome: "handled", eventType: "session.execution.interrupted" } });
+      await liveEventsApplied(adapter, provider);
+      expect((await queued()).filter(entry => entry.delivery === "steer").every(entry => entry.paused)).toBe(true);
+      release(); await waking;
+      await admissionsApplied(adapter);
+      const after = await queued();
+      expect(after.filter(entry => entry.delivery === "steer").map(entry => entry.paused)).toEqual(path === "resume" ? [true] : path === "staged-queue" ? [] : [true, true]);
+      expect(after.find(entry => entry.id === anchor.messageId)).toEqual(expect.objectContaining({ paused: true }));
+      expect((await adapter.history("session")).conversation.status).toBe("interrupted");
+    } finally { release(); time.mockRestore(); await adapter.dispose(); await pump; }
+  });
+
   test("a steer enqueued before the conversation last went idle reads paused; a new steer or a wake resumes it", async () => {
     const { adapter, provider, inbox, steer, queued } = steering();
     const pump = adapter.startEventPump();
@@ -8502,6 +8720,46 @@ describe("steering (opencode-v2-steering)", () => {
       expect.objectContaining({ id: held.messageId, delivery: "queue", paused: true }),
     ]);
     await adapter.dispose();
+  });
+
+  for (const application of ["confirmed", "unknown"] as const) for (const inventory of ["empty", "queued", "native", "mixed"] as const) for (const resume of ["prompt", "switch", "send-now"] as const) test(`lost ${application} Stop with ${inventory} dock stays dormant until explicit ${resume}`, async () => {
+    const { adapter, provider, steer, queue, queued, inbox } = steering();
+    const pump = adapter.startEventPump();
+    try {
+      await adapter.prompt("session", "initial", "initial work");
+      const original = inventory === "native" || inventory === "mixed" ? await steer("native", "native pending") : undefined;
+      if (inventory === "queued" || inventory === "mixed") await queue("held", "held pending");
+      let interrupts = 0;
+      provider.interrupt = async () => {
+        interrupts++;
+        if (application === "confirmed") adapter.projectionForTests("session").statusUpdate("interrupted");
+        throw new Error("Stop response lost");
+      };
+      await expect(adapter.abort("session", "stop")).rejects.toThrow("Stop response lost");
+      expect((await adapter.history("session")).conversation.status).toBe(application === "confirmed" ? "interrupted" : "running");
+      const before = provider.prompts.length;
+      // Later native settlement or inbox recovery is not restart authority,
+      // even when Stop had no queued entries at all when it was requested.
+      adapter.projectionForTests("session").statusUpdate("completed");
+      const native = original?.messageId ?? "recovered-native";
+      if (!original) inbox({ kind: "pending", id: native, text: "native pending", delivery: "steer", at: Date.now() });
+      await liveEventsApplied(adapter, provider);
+      provider.cancelInbox = async (_id, id) => { inbox({ kind: "settled", id, outcome: "cancelled" }); };
+      const converted = await adapter.changeDelivery("session", native, "hold-only", "queue");
+      await admissionsApplied(adapter);
+      expect((await queued()).every(entry => entry.paused)).toBe(true);
+      expect((await queued()).find(entry => entry.id === converted.messageId)).toEqual(expect.objectContaining({ delivery: "queue", paused: true }));
+      expect(provider.prompts).toHaveLength(before);
+      expect(interrupts).toBe(1);
+      const explicitResume = () => resume === "prompt" ? steer("explicit-resume", "new user instruction")
+        : resume === "switch" ? adapter.changeDelivery("session", converted.messageId, "explicit-resume", "steer")
+        : adapter.sendNow("session", converted.messageId, "explicit-resume");
+      const resumed = await explicitResume();
+      expect(await explicitResume()).toEqual(resumed);
+      expect(provider.prompts).toHaveLength(before + 1);
+      expect((await queued()).find(entry => entry.id === resumed.messageId)).toEqual(expect.objectContaining({ delivery: "steer" }));
+      expect((await queued()).find(entry => entry.id === resumed.messageId)).not.toHaveProperty("paused");
+    } finally { await adapter.dispose(); await pump; }
   });
 
   for (const inventory of ["empty", "native", "mixed"] as const) for (const resume of ["switch", "send-now"] as const) test(`Stop with ${inventory} dock survives disconnect, late settlement and Queue conversion until explicit ${resume}`, async () => {

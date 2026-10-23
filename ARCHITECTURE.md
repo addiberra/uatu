@@ -893,8 +893,10 @@ updates and replaces them from `inbox.list` on attach/reconnect. Only native
 delivery puts a steer in the transcript. One bound covers both owners:
 20 messages / 256 KiB, with steers listed before the held queue.
 
-Paused held messages reflect dormancy/revert; paused steers predate the latest
-idle/interrupted/completed transition without a wake. Cancel never resumes.
+Paused held messages reflect dormancy/revert. Pending steers stay paused after
+an idle/interrupted/completed transition until a later wake supersedes it.
+Settlement identity, not wall time, fences delayed wake acknowledgements.
+Cancel never resumes; confirmed or ambiguous Stop application retains dormancy.
 One dock-header `Send N paused steers now` action calls `interrupt({resume:true})`
 to wake every paused steer. Sending a held message now on a steering agent also
 wakes paused steers, explicitly named and confirmed in-app; the rest of a

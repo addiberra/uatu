@@ -59,7 +59,7 @@ A steer is handed to OpenCode at once with `session.prompt({ delivery: "steer", 
 
 The adapter keeps a per-conversation pending-steer map built from these deltas. It replaces the map from `session.inbox.list` when it attaches to a conversation (snapshot read) and after the provider stream reconnects, keeping `type: "user"` and `delivery: "steer"` entries only.
 
-**Paused.** OpenCode does not report a paused state, so the workspace derives it. A steer is paused when it is pending and was enqueued before the session's most recent transition to idle, interrupted, or completed. That transition is already tracked by the projection's status. This is the "stranded" rule. A held message is paused when `deliveryPaused()` is true: dormant, a revert mutation in progress, or a revert staged.
+**Paused.** OpenCode does not report a paused state, so the workspace derives it. Pending steers stay paused after the session settles idle, interrupted, or completed until a later live phase or accepted wake supersedes that settlement. Each delayed acknowledgement can clear only the settlement owner observed before its request, never a newer one; wall-clock timestamps do not establish this ordering. This is the "stranded" rule. A held message is paused when `deliveryPaused()` is true: dormant, a revert mutation in progress, or a revert staged. Confirmed or ambiguous Stop application retains dormancy; only positive evidence of non-application can restore the prior delivery state.
 
 ### D4. A steer enters the timeline when OpenCode delivers it
 
