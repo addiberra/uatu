@@ -27,6 +27,355 @@ import { notificationPipeline } from "../../tests/notification-pipeline";
 import { startOpenCodeV2Fake } from "../../tests/e2e/opencode-v2-fake";
 import { addAcceptedDraft, applyChatEvent, projectionFromSnapshot } from "./projection";
 
+test("real V2 reconnect removes the exact offline-reverted branch for existing and next subscribers", async () => {
+  const directory = process.cwd();
+  const fake = startOpenCodeV2Fake({ directory });
+  const provider = createOpenCodeV2Provider({ endpoint: fake.url, password: fake.password, directory });
+  const adapter = new ChatAdapter({ provider, workspacePath: directory, coalesceWindowMs: 0 });
+  let pump: Promise<void> | undefined;
+  try {
+    const session = await provider.createSession("Offline revert recovery");
+    const first = await adapter.prompt(session.id, "initial", "Branch to revert");
+    fake.finish(session.id);
+    await adapter.history(session.id);
+    const client = await adapter.subscribe(session.id);
+    let browser = projectionFromSnapshot(client.snapshot);
+    const events: ChatEvent[] = [];
+    const consuming = (async () => {
+      for await (const event of client.events) {
+        events.push(event);
+        browser = applyChatEvent(browser, event).projection;
+      }
+    })();
+    try {
+      const oldId = `message:${first.messageId}`;
+      expect(browser.items.some(item => item.id === oldId)).toBe(true);
+      await adapter.stopEventPump();
+      await provider.revert!(session.id, oldId);
+      pump = adapter.startEventPump();
+      const recovered = await adapter.history(session.id);
+      expect(recovered.reversibleHistory?.staged).toBe(true);
+      expect(recovered.items.some(item => item.id === oldId)).toBe(false);
+      // Await the stream effect, not a fixed delay or the HTTP result alone.
+      await waitUntil(() => events.some(event => event.type === "item.remove" && event.itemId === oldId));
+      expect(browser.items.some(item => item.id === oldId)).toBe(false);
+      const next = await adapter.subscribe(session.id);
+      try {
+        expect(next.snapshot.items.some(item => item.id === oldId)).toBe(false);
+        expect(next.snapshot.reversibleHistory?.staged).toBe(true);
+      } finally { next.events.cancel(); }
+      expect(events).toContainEqual(expect.objectContaining({ type: "resync", reason: "conversation-rewritten" }));
+      expect(fake.state().unhandled).toEqual([]);
+    } finally { client.events.cancel(); await consuming; }
+  } finally { await adapter.dispose(); await pump; await fake.stop(); }
+});
+
+test("real V2 paged recovery never treats omission as removal and restores an offline-unreverted prefix", async () => {
+  const directory = process.cwd();
+  const fake = startOpenCodeV2Fake({ directory });
+  const provider = createOpenCodeV2Provider({ endpoint: fake.url, password: fake.password, directory });
+  const adapter = new ChatAdapter({ provider, workspacePath: directory, coalesceWindowMs: 0 });
+  let pump: Promise<void> | undefined;
+  try {
+    const session = await provider.createSession("Paged revert coverage");
+    const first = await adapter.prompt(session.id, "initial", "Keep before paging");
+    fake.finish(session.id);
+    fake.appendHistory(session.id, 70); // Native AND visible pages, beyond the default 100.
+    const loaded = await adapter.history(session.id, { limit: 200 });
+    const oldest = `message:${first.messageId}`;
+    const newestPrompt = loaded.items.filter(item => item.type === "user_message").at(-1)!;
+    const client = await adapter.subscribe(session.id);
+    const events: ChatEvent[] = [];
+    let browser = projectionFromSnapshot(client.snapshot);
+    const consuming = (async () => {
+      for await (const event of client.events) {
+        events.push(event);
+        const result = applyChatEvent(browser, event);
+        if (result.outcome === "resync") {
+          // The browser's existing protocol reloads on rewrite; no new field.
+          const current = await adapter.subscribe(session.id);
+          browser = projectionFromSnapshot(current.snapshot);
+          current.events.cancel();
+        } else browser = result.projection;
+      }
+    })();
+    try {
+      const page = await adapter.history(session.id, { limit: 1 });
+      expect(page.olderCursor).toBeDefined();
+      expect(page.items.some(item => item.id === oldest)).toBe(false);
+      expect(browser.items.some(item => item.id === oldest)).toBe(true);
+      expect(events.some(event => event.type === "item.remove")).toBe(false);
+      await adapter.stopEventPump();
+      await provider.revert!(session.id, oldest);
+      pump = adapter.startEventPump();
+      await adapter.history(session.id);
+      await waitUntil(() => !browser.items.some(item => item.id === oldest) && browser.reversibleHistory?.staged === true);
+      expect(browser.items.some(item => item.id === newestPrompt.id)).toBe(false);
+      await adapter.stopEventPump();
+      await pump;
+      // Another subscription during the gap must not declare its metadata
+      // reconciled and thereby hide the restore from the reconnect owner.
+      await provider.restore!(session.id, newestPrompt.id);
+      const duringGap = await adapter.subscribe(session.id);
+      duringGap.events.cancel();
+      pump = adapter.startEventPump();
+      const restored = await adapter.history(session.id);
+      expect(restored.reversibleHistory?.staged).toBe(false);
+      await waitUntil(() => browser.items.some(item => item.id === oldest) && browser.reversibleHistory?.staged === false);
+      expect(browser.items.some(item => item.id === newestPrompt.id)).toBe(true);
+      const next = await adapter.subscribe(session.id);
+      try {
+        expect(next.snapshot.items.some(item => item.id === oldest)).toBe(true);
+        expect(next.snapshot.reversibleHistory?.staged).toBe(false);
+      } finally { next.events.cancel(); }
+      expect(fake.state().unhandled).toEqual([]);
+    } finally { client.events.cancel(); await consuming; }
+  } finally { await adapter.dispose(); await pump; await fake.stop(); }
+});
+
+for (const change of ["revert", "restore", "replacement", "replacement-before-events"] as const) test(`real V2 discards a captured history view when ${change} changes its exact boundary`, async () => {
+  const directory = process.cwd();
+  const fake = startOpenCodeV2Fake({ directory });
+  let holdEvents = false, releaseEvents!: () => void;
+  const eventGate = new Promise<void>(resolve => { releaseEvents = resolve; });
+  const transport = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const request = new Request(input, init);
+    const response = await fetch(request);
+    if (new URL(request.url).pathname !== "/api/event") return response;
+    return new Response(response.body!.pipeThrough(new TransformStream({
+      async transform(chunk, controller) { if (holdEvents) await eventGate; controller.enqueue(chunk); },
+    })), { status: response.status, headers: response.headers });
+  }) as typeof fetch;
+  const provider = createOpenCodeV2Provider({ endpoint: fake.url, password: fake.password, directory, fetch: transport });
+  const other = createOpenCodeV2Provider({ endpoint: fake.url, password: fake.password, directory });
+  let hold = false, captured!: () => void, release!: () => void;
+  const capture = new Promise<void>(resolve => { captured = resolve; });
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const list = provider.listMessages.bind(provider);
+  provider.listMessages = async (...args) => {
+    const delayed = hold;
+    if (delayed) hold = false;
+    const page = await list(...args);
+    if (delayed) { captured(); await gate; }
+    return page;
+  };
+  const adapter = new ChatAdapter({ provider, workspacePath: directory, coalesceWindowMs: 0 });
+  let reading: ReturnType<ChatAdapter["history"]> | undefined;
+  try {
+    const session = await provider.createSession("Boundary capture fence");
+    await adapter.prompt(session.id, "keep", "Keep this prefix");
+    fake.finish(session.id);
+    const branch = await other.prompt(session.id, { id: "branch", text: "Discard or restore this branch", delivery: "queue" });
+    fake.finish(session.id);
+    await adapter.history(session.id);
+    const branchId = `message:${branch.messageId}`;
+    if (change === "restore") {
+      await other.revert!(session.id, branchId);
+      await adapter.history(session.id);
+    }
+    const client = await adapter.subscribe(session.id);
+    const events: ChatEvent[] = [];
+    const consuming = (async () => { for await (const event of client.events) events.push(event); })();
+    try {
+      // For replacement, the staged boundary is intentionally NOT yet applied
+      // to Uatu's view: its exact exclusions must survive the dirty reread.
+      if (change.startsWith("replacement")) await other.revert!(session.id, branchId);
+      hold = true;
+      reading = adapter.history(session.id);
+      await capture;
+      holdEvents = change === "replacement-before-events";
+      let replacementId: string | undefined;
+      if (change === "revert") await other.revert!(session.id, branchId);
+      else if (change === "restore") await other.restore!(session.id, branchId);
+      else {
+        replacementId = (await other.prompt(session.id, { id: "external-replacement", text: "New turn after capture", delivery: "queue" })).messageId;
+        fake.finish(session.id);
+        if (!holdEvents) await waitUntil(() => events.some(event => event.type === "item.upsert" && event.item.type === "user_message" && event.item.text === "New turn after capture"));
+      }
+      release();
+      const recovered = await reading;
+      expect(recovered.reversibleHistory?.staged).toBe(change === "revert");
+      expect(recovered.items.some(item => item.id === branchId)).toBe(change === "restore");
+      const next = await adapter.subscribe(session.id);
+      try {
+        expect(next.snapshot.items.some(item => item.id === branchId)).toBe(change === "restore");
+        expect(next.snapshot.items.some(item => item.type === "user_message" && item.text === "Keep this prefix")).toBe(true);
+        if (replacementId) expect(next.snapshot.items.some(item => item.id === `message:${replacementId}`)).toBe(true);
+      } finally { next.events.cancel(); }
+      if (change === "restore") expect(events.some(event => event.type === "item.remove" && event.itemId === branchId)).toBe(false);
+      expect(fake.state().unhandled).toEqual([]);
+    } finally { client.events.cancel(); await consuming; }
+  } finally { release(); releaseEvents(); await reading?.catch(() => undefined); await adapter.dispose(); await other.dispose?.(); await fake.stop(); }
+});
+
+test("real V2 obsolete-generation revert exclusions cannot prune an offline-restored view", async () => {
+  const directory = process.cwd();
+  const fake = startOpenCodeV2Fake({ directory });
+  const provider = createOpenCodeV2Provider({ endpoint: fake.url, password: fake.password, directory });
+  const other = createOpenCodeV2Provider({ endpoint: fake.url, password: fake.password, directory });
+  let hold = false, captured!: () => void, release!: () => void, returned!: () => void;
+  const capture = new Promise<void>(resolve => { captured = resolve; });
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const lateReturn = new Promise<void>(resolve => { returned = resolve; });
+  const list = provider.listMessages.bind(provider);
+  provider.listMessages = async (...args) => {
+    const delayed = hold;
+    if (delayed) hold = false;
+    const page = await list(...args);
+    if (delayed) { captured(); await gate; returned(); }
+    return page;
+  };
+  const adapter = new ChatAdapter({ provider, workspacePath: directory, coalesceWindowMs: 0 });
+  let reading: Promise<unknown> | undefined, pump: Promise<void> | undefined;
+  try {
+    const session = await provider.createSession("Obsolete revert read");
+    const first = await adapter.prompt(session.id, "initial", "Restored branch");
+    fake.finish(session.id);
+    await adapter.history(session.id);
+    const oldId = `message:${first.messageId}`;
+    await other.revert!(session.id, oldId);
+    hold = true;
+    reading = adapter.history(session.id).catch(error => error);
+    await capture;
+    await adapter.stopEventPump();
+    expect(await reading).toBeInstanceOf(Error);
+    await other.restore!(session.id, oldId);
+    pump = adapter.startEventPump();
+    const current = await adapter.history(session.id);
+    expect(current.items.some(item => item.id === oldId)).toBe(true);
+    release();
+    await lateReturn;
+    const next = await adapter.subscribe(session.id);
+    try {
+      expect(next.snapshot.items.some(item => item.id === oldId)).toBe(true);
+      expect(next.snapshot.reversibleHistory?.staged).toBe(false);
+    } finally { next.events.cancel(); }
+    expect(fake.state().unhandled).toEqual([]);
+  } finally { release(); await reading; await adapter.dispose(); await pump; await other.dispose?.(); await fake.stop(); }
+});
+
+test("real V2 narrow revert recovery preserves uncertain original requests, held pause and newer terminal worker metadata", async () => {
+  const directory = process.cwd();
+  const fake = startOpenCodeV2Fake({ directory });
+  const transport = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const request = new Request(input, init);
+    if (request.method === "DELETE" && new URL(request.url).pathname.includes("/inbox/")) return Response.json({ error: "cancellation unavailable" }, { status: 503 });
+    return fetch(request);
+  }) as typeof fetch;
+  const provider = createOpenCodeV2Provider({ endpoint: fake.url, password: fake.password, directory, fetch: transport });
+  const other = createOpenCodeV2Provider({ endpoint: fake.url, password: fake.password, directory });
+  let hold = false, captured!: () => void, release!: () => void;
+  const capture = new Promise<void>(resolve => { captured = resolve; });
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const list = provider.listMessages.bind(provider);
+  provider.listMessages = async (...args) => {
+    const delayed = hold;
+    if (delayed) hold = false;
+    const page = await list(...args);
+    if (delayed) { captured(); await gate; }
+    return page;
+  };
+  const adapter = new ChatAdapter({ provider, workspacePath: directory, coalesceWindowMs: 0, steerWithdrawTimeoutMs: 80 });
+  let pump: Promise<void> | undefined;
+  let reading: ReturnType<ChatAdapter["history"]> | undefined;
+  try {
+    const session = await provider.createSession("Narrow recovery ownership");
+    await adapter.prompt(session.id, "prefix", "Keep the worker's prefix");
+    const worker = fake.launchWorker(session.id, true);
+    fake.workerReport(worker.childId, "old-model", "low", 0.25);
+    await adapter.history(session.id);
+    const client = await adapter.subscribe(session.id);
+    let browser = projectionFromSnapshot(client.snapshot);
+    const consuming = (async () => {
+      for await (const event of client.events) {
+        const result = applyChatEvent(browser, event);
+        if (result.outcome === "resync") {
+          const current = await adapter.subscribe(session.id);
+          browser = projectionFromSnapshot(current.snapshot);
+          current.events.cancel();
+        } else browser = result.projection;
+      }
+    })();
+    try {
+      fake.finish(session.id);
+      await waitUntil(() => browser.status === "background");
+      const branch = await other.prompt(session.id, { id: "branch", text: "Revert only this branch", delivery: "queue" });
+      await waitUntil(() => browser.status === "running");
+      fake.loseNextPromptResponse();
+      await expect(adapter.prompt(session.id, "original-client-request", "Keep pending native input", undefined, undefined, undefined, undefined, "steer")).rejects.toBeInstanceOf(OperationOutcomeUnknownError);
+      const pending = (await adapter.history(session.id)).queued!.find(entry => entry.requestId === "original-client-request")!;
+      expect(pending).toBeDefined();
+      const held = await adapter.prompt(session.id, "held-client-request", "Keep held input");
+      await expect(adapter.changeDelivery(session.id, pending.id, "uncertain-withdrawal", "queue")).rejects.toBeInstanceOf(SteerWithdrawalUnconfirmedError);
+      await adapter.stopEventPump();
+      await other.interrupt(session.id, { resume: false });
+      await other.revert!(session.id, `message:${branch.messageId}`);
+      const beforeRecovery = fake.state().calls.length;
+      hold = true;
+      pump = adapter.startEventPump();
+      reading = adapter.history(session.id);
+      void reading.catch(() => undefined);
+      await capture;
+      fake.settleWorker(worker.childId, "completed", "Terminal report during recovery");
+      fake.workerReport(worker.childId, "latest-model", "high", 0.5);
+      await waitUntil(() => browser.items.some(item => item.type === "background_task" && item.taskId === worker.taskId && item.status === "completed")
+        && browser.items.some(item => item.type === "tool" && item.workerSession?.model === "latest-model" && item.workerSession.costUsd === 0.75));
+      release();
+      const recovered = await reading;
+      expect(recovered.reversibleHistory?.staged).toBe(true);
+      expect(recovered.items.some(item => item.id === `message:${branch.messageId}`)).toBe(false);
+      for (const snapshot of [recovered, (await adapter.history(session.id))]) {
+        expect(snapshot.queued).toContainEqual(expect.objectContaining({ id: pending.id, requestId: "original-client-request", delivery: "steer", unconfirmed: true, paused: true }));
+        expect(snapshot.queued).toContainEqual(expect.objectContaining({ id: held.messageId, requestId: "held-client-request", paused: true }));
+        expect(snapshot.items).toContainEqual(expect.objectContaining({ taskId: worker.taskId, status: "completed" }));
+        expect(snapshot.items).toContainEqual(expect.objectContaining({ id: `tool:${worker.callId}`, workerSession: { model: "latest-model", effort: "high", costUsd: 0.75 } }));
+      }
+      expect(fake.state().calls.slice(beforeRecovery).every(call => call.startsWith("GET "))).toBe(true);
+      expect(fake.state().unhandled).toEqual([]);
+    } finally { client.events.cancel(); await consuming; }
+  } finally { release(); await reading?.catch(() => undefined); await adapter.dispose(); await pump; await other.dispose?.(); await fake.stop(); }
+});
+
+test("real V2 restores out-of-page rows when distinct non-user boundaries have identical reversible UI state", async () => {
+  const directory = process.cwd();
+  const fake = startOpenCodeV2Fake({ directory });
+  const provider = createOpenCodeV2Provider({ endpoint: fake.url, password: fake.password, directory });
+  const adapter = new ChatAdapter({ provider, workspacePath: directory, coalesceWindowMs: 0 });
+  try {
+    const session = await provider.createSession("Exact non-user boundary");
+    await adapter.prompt(session.id, "initial", "Prefix prompt");
+    const first = fake.finish(session.id, "Restored out-of-page assistant")!;
+    fake.appendHistory(session.id, 70);
+    const loaded = await adapter.history(session.id, { limit: 200 });
+    const oldAssistant = loaded.items.find(item => item.type === "assistant_message" && item.markdown === "Restored out-of-page assistant")!;
+    expect(oldAssistant).toBeDefined();
+    const lastAssistant = fake.state().sessions[session.id]!.messages.filter(message => message.type === "assistant").at(-1)!;
+    const stage = async (messageID: string) => {
+      // A different native client can stage a non-user record. The UI's turn
+      // list intentionally cannot encode that exact marker; native evidence can.
+      const response = await fetch(`${fake.url}/api/session/${session.id}/revert/stage`, {
+        method: "POST",
+        headers: { authorization: `Basic ${Buffer.from(`opencode:${fake.password}`).toString("base64")}`, "content-type": "application/json" },
+        body: JSON.stringify({ messageID }),
+      });
+      expect(response.ok).toBe(true);
+      await response.arrayBuffer();
+    };
+    await stage(first.assistantMessageId);
+    const hidden = await adapter.history(session.id, { limit: 1 });
+    const during = await adapter.subscribe(session.id);
+    expect(during.snapshot.items.some(item => item.id === oldAssistant.id)).toBe(false);
+    during.events.cancel();
+    await stage(lastAssistant.id);
+    const restored = await adapter.history(session.id, { limit: 1 });
+    expect(restored.reversibleHistory).toEqual(hidden.reversibleHistory);
+    const next = await adapter.subscribe(session.id);
+    try { expect(next.snapshot.items.some(item => item.id === oldAssistant.id)).toBe(true); }
+    finally { next.events.cancel(); }
+    expect(fake.state().unhandled).toEqual([]);
+  } finally { await adapter.dispose(); await fake.stop(); }
+});
+
 test("real V2 initial history includes a steer delivered before the native handshake", async () => {
   const directory = process.cwd();
   const fake = startOpenCodeV2Fake({ directory });

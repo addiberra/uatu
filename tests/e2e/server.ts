@@ -466,7 +466,8 @@ async function handleE2EChat(request: Request): Promise<Response> {
     // fake OpenCode's controls (`opencode` action).
     stack?: "opencode-v2";
     backgroundPreview?: boolean;
-    op?: "step" | "finish" | "raceDeliverOnCancel" | "state" | "launchWorker" | "settleWorker" | "workerReport" | "disconnect" | "pauseEvents" | "reconnectEvents" | "appendHistory" | "loseBackgroundResponse" | "loseWorkerResponse" | "launchShell" | "shellPhase" | "wakeParent" | "losePromptResponse" | "loseResumeResponse" | "refuseBackground" | "launchShellOnNextSteer";
+    op?: "step" | "finish" | "raceDeliverOnCancel" | "state" | "launchWorker" | "settleWorker" | "workerReport" | "disconnect" | "pauseEvents" | "reconnectEvents" | "externalRevert" | "appendHistory" | "loseBackgroundResponse" | "loseWorkerResponse" | "launchShell" | "shellPhase" | "wakeParent" | "losePromptResponse" | "loseResumeResponse" | "refuseBackground" | "launchShellOnNextSteer";
+    revertMessageId?: string | null;
     usedModel?: string;
     usedEffort?: string;
     costUsd?: number;
@@ -554,6 +555,12 @@ async function handleE2EChat(request: Request): Promise<Response> {
           openCodeV2Fake.pauseEvents(true); return Response.json({ ok: true });
         case "reconnectEvents":
           openCodeV2Fake.pauseEvents(false); return Response.json({ ok: true });
+        case "externalRevert":
+          if (body.conversationId && body.revertMessageId !== undefined) {
+            openCodeV2Fake.externalRevert(body.conversationId, body.revertMessageId);
+            return Response.json({ ok: true });
+          }
+          break;
         case "appendHistory":
           if (body.conversationId) { openCodeV2Fake.appendHistory(body.conversationId, body.count ?? 60); return Response.json({ ok: true }); }
           break;

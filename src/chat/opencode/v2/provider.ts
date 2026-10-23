@@ -332,6 +332,9 @@ export class OpenCodeV2Provider implements ChatProvider {
     const start = Math.max(0, end - Math.max(1, options.limit));
     const page = visible.slice(start, end);
     const normalized = await this.backgroundHistory(sessionId, visible, signal);
+    const allNormalized = boundaryIndex >= 0 ? await this.backgroundHistory(sessionId, complete, signal) : normalized;
+    const excludedItemIds = [...allNormalized.keys()].filter(id => !normalized.has(id));
+    const reversible = reversibleContext(complete, info);
     signal.throwIfAborted();
     const liveLaunches = new Set([...normalized.values()].flatMap(({ item }) => item.type === "background_task" && item.status === "running"
       ? [...(item.toolUseIds ?? []), ...(item.toolUseId ? [item.toolUseId] : [])].map(id => `tool:${id}`) : []));
@@ -350,9 +353,18 @@ export class OpenCodeV2Provider implements ChatProvider {
       accounting,
       ...(typeof info?.cost === "number" && Number.isFinite(info.cost) && info.cost >= 0 ? { sessionCostUsd: info.cost } : {}),
       completeItems: [...normalized.values()].map(({ item }) => item),
+      revertVisibility: { boundaryId: boundaryId ?? null, state: reversible.state, excludedItemIds },
       ...(boundaryId ? { deliveryHistoryIncomplete: true as const } : {}),
       nextCursor: historyPageCursor(start, version),
     };
+  }
+
+  async getHistoryRevertBoundary(sessionId: string, options: { signal: AbortSignal; expectedBoundary?: string | null }): Promise<string | null> {
+    const info = await this.lookupSession(sessionId, this.readSignal(options.signal));
+    if (!info) throw new Error("OpenCode session disappeared while reading revert boundary");
+    const boundary = stringValue(asRecord(info.revert).messageID) ?? null;
+    if (options.expectedBoundary !== undefined && options.expectedBoundary !== boundary) this.historyReuse.invalidate(sessionId);
+    return boundary;
   }
 
   private async backgroundHistory(sessionId: string, visible: StoredMessage[], signal = this.readSignal()) {
@@ -1201,27 +1213,7 @@ export class OpenCodeV2Provider implements ChatProvider {
     const messages = await this.allMessages(sessionId);
     const info = await this.lookupSession(sessionId);
     if (!info) throw new Error("OpenCode session disappeared while reading reversible history");
-    const turns = messages.flatMap((message): ReversibleTurn[] => {
-      try {
-        const item = normalizeStoredMessage(message).find(candidate => candidate.type === "user_message");
-        if (!item || item.type !== "user_message") return [];
-        const providerId = messageIdentity(message);
-        if (!providerId) return [];
-        return [{
-          id: item.id,
-          providerId,
-          draft: { text: item.text, ...(item.attachments?.length ? { attachments: item.attachments } : {}) },
-          summary: item.text.trim() || item.attachments?.map(attachment => attachment.name).join(", ") || "Message",
-        }];
-      } catch {
-        return [];
-      }
-    });
-    const boundaryId = stringValue(asRecord(info.revert).messageID);
-    const boundaryIndex = boundaryId ? turns.findIndex(turn => turn.providerId === boundaryId) : undefined;
-    const knownBoundary = boundaryIndex !== undefined && boundaryIndex >= 0 ? boundaryIndex : undefined;
-    const state = reversibleState(turns, knownBoundary, boundaryId !== undefined);
-    return { turns, ...(knownBoundary === undefined ? {} : { boundaryIndex: knownBoundary }), state };
+    return reversibleContext(messages, info);
   }
 
   /**
@@ -1245,6 +1237,30 @@ export class OpenCodeV2Provider implements ChatProvider {
     const directory = stringValue(asRecord(asRecord(info).location).directory);
     return directory !== undefined && path.resolve(directory) === this.workspace;
   }
+}
+
+function reversibleContext(messages: StoredMessage[], info: SessionRecord | null): ReversibleHistoryContext {
+  const turns = messages.flatMap((message): ReversibleTurn[] => {
+    try {
+      const item = normalizeStoredMessage(message).find(candidate => candidate.type === "user_message");
+      if (!item || item.type !== "user_message") return [];
+      const providerId = messageIdentity(message);
+      if (!providerId) return [];
+      return [{
+        id: item.id,
+        providerId,
+        draft: { text: item.text, ...(item.attachments?.length ? { attachments: item.attachments } : {}) },
+        summary: item.text.trim() || item.attachments?.map(attachment => attachment.name).join(", ") || "Message",
+      }];
+    } catch {
+      return [];
+    }
+  });
+  const boundaryId = stringValue(asRecord(info?.revert).messageID);
+  const boundaryIndex = boundaryId ? turns.findIndex(turn => turn.providerId === boundaryId) : undefined;
+  const knownBoundary = boundaryIndex !== undefined && boundaryIndex >= 0 ? boundaryIndex : undefined;
+  const state = reversibleState(turns, knownBoundary, boundaryId !== undefined);
+  return { turns, ...(knownBoundary === undefined ? {} : { boundaryIndex: knownBoundary }), state };
 }
 
 /**

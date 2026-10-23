@@ -611,7 +611,11 @@ complete trust model and network guidance.
 - **Chat reconnects or requests resync:** a brief disconnect replays
   retained events. A workspace restart or a long retention gap requires a
   fresh history snapshot automatically; completed agent history is not
-  deleted.
+  deleted. OpenCode 2.x has no native event replay: recovery reads history
+  after subscribing, reconciles exact native revert-boundary exclusions,
+  and requests a fresh view when that boundary changes. Missing rows in a
+  history page alone never authorize removal. Recovery does not replay a
+  prompt or resume paused work.
 - **A scheduled wakeup never fired:** a row that reads as lost means the
   workspace stopped or the process exited before it fired, so ask the
   agent to schedule it again. A row that reads as paused fires again once

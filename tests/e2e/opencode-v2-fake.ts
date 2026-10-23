@@ -76,6 +76,7 @@ export type OpenCodeV2Fake = {
   workerReport(childId: string, model: string, effort: string | undefined, cost: number | undefined): void;
   disconnect(): void;
   pauseEvents(paused: boolean): void;
+  externalRevert(sessionId: string, messageId: string | null): void;
   appendHistory(sessionId: string, count: number): void;
   loseNextBackgroundResponse(): void;
   loseNextPromptResponse(): void;
@@ -585,6 +586,15 @@ export function startOpenCodeV2Fake(options: { directory: string; password?: str
     workerReport,
     disconnect: closeStreams,
     pauseEvents(paused) { eventsPaused = paused; if (paused) closeStreams(); },
+    externalRevert(sessionId, messageId) {
+      const session = sessions.get(sessionId);
+      if (!session) throw new Error("Unknown fixture revert owner");
+      if (messageId === null) delete session.info.revert;
+      else {
+        if (!session.messages.some(message => message.id === messageId)) throw new Error("Unknown fixture revert boundary");
+        session.info.revert = { messageID: messageId };
+      }
+    },
     appendHistory(sessionId, count) {
       const session = sessions.get(sessionId);
       if (!session) throw new Error("Unknown fixture history owner");

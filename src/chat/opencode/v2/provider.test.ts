@@ -778,6 +778,43 @@ describe("OpenCode 2.x provider: history", () => {
     const page = await historyServer({ revert: { messageID: boundary } }).provider().listMessages("ses_h", { limit: 50 });
     expect(page.items.map(item => item.type)).not.toContain("idle");
     expect(page.items.filter(item => item.type === "user_message")).toHaveLength(1);
+    expect(page.revertVisibility).toEqual({
+      boundaryId: boundary,
+      state: { staged: true, canUndo: true, canRedo: true, revertedMessages: [{ id: `message:${boundary}`, text: String(STORED[4]!.text) }] },
+      excludedItemIds: [`message:${boundary}`],
+    });
+  });
+
+  test("revert visibility authority is independent of the requested page; an unknown boundary grants no exclusions", async () => {
+    const boundary = String(STORED[4]!.id);
+    const provider = historyServer({ revert: { messageID: boundary } }).provider();
+    const small = await provider.listMessages("ses_h", { limit: 1 });
+    const large = await provider.listMessages("ses_h", { limit: 50 });
+    expect(small.items).not.toEqual(large.items);
+    expect(small.revertVisibility).toEqual(large.revertVisibility);
+    expect((await historyServer({ revert: { messageID: "unknown-native-boundary" } }).provider().listMessages("ses_h", { limit: 1 })).revertVisibility).toEqual({
+      boundaryId: "unknown-native-boundary",
+      state: { staged: true, canUndo: false, canRedo: false, revertedMessages: [] },
+      excludedItemIds: [],
+    });
+    expect((await historyServer().provider().listMessages("ses_h", { limit: 1 })).revertVisibility?.excludedItemIds).toEqual([]);
+  });
+
+  test("boundary revalidation distinguishes unknown native markers that have identical UI state and honors read cancellation", async () => {
+    let marker = "unknown-native-A";
+    const server = fakeOpenCode({
+      "GET /api/session/:id": () => session("ses_h", { revert: { messageID: marker } }),
+      "GET /api/session/:id/message": () => ({ data: STORED, cursor: { next: null } }),
+    });
+    const provider = server.provider();
+    const page = await provider.listMessages("ses_h", { limit: 1 });
+    marker = "unknown-native-B";
+    const controller = new AbortController();
+    expect(page.revertVisibility?.boundaryId).toBe("unknown-native-A");
+    expect(await provider.getReversibleHistoryState("ses_h")).toEqual(page.revertVisibility!.state);
+    expect(await provider.getHistoryRevertBoundary("ses_h", { signal: controller.signal })).toBe("unknown-native-B");
+    controller.abort();
+    await expect(provider.getHistoryRevertBoundary("ses_h", { signal: controller.signal })).rejects.toThrow();
   });
 
   test("complete visible history cannot prove delivery absence across a revert boundary", async () => {

@@ -193,6 +193,11 @@ export type ProviderHistoryPage = {
   // complete visible normalized items, so a walker that needs the whole
   // conversation (title derivation) avoids refetching it once per page.
   completeItems?: ConversationItem[];
+  // Native revert authority from the SAME complete transcript and boundary
+  // read as this page, never inferred from omitted page rows. Exclusions name
+  // exact normalized identities in the hidden suffix; live-only rows and inbox
+  // ownership are outside this evidence. Internal only, not a wire field.
+  revertVisibility?: { boundaryId: string | null; state: ReversibleHistoryState; excludedItemIds: string[] };
   // Internal evidence for inbox withdrawal, not a timeline/wire field. When
   // visibility filtering can hide delivered inputs (for example a revert),
   // absence from even completeItems cannot establish cancellation. Positive
@@ -322,6 +327,11 @@ export interface ChatProvider {
   getSession(id: string): Promise<ProviderSession | null>;
   getConversationConfiguration(sessionId: string): Promise<ConversationConfiguration>;
   listMessages(sessionId: string, options: { cursor?: string; limit: number; signal?: AbortSignal }): Promise<ProviderHistoryPage>;
+  // Revalidates the exact native marker (including non-user/unknown targets)
+  // before covered recovery commits a page's revertVisibility evidence. A
+  // changed expected marker also invalidates any provider transcript reuse:
+  // its commit event may not have reached the subscribed stream yet.
+  getHistoryRevertBoundary?(sessionId: string, options: { signal: AbortSignal; expectedBoundary?: string | null }): Promise<string | null>;
   getReversibleHistoryState?(sessionId: string): Promise<ReversibleHistoryState>;
   undo?(sessionId: string): Promise<ReversibleHistoryResult>;
   redo?(sessionId: string): Promise<ReversibleHistoryResult>;

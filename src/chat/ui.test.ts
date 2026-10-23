@@ -2973,15 +2973,32 @@ describe("a question's owed-answer line", () => {
     conversations?: string[];
     itemsFor?: (conversationId: string) => unknown[];
     capabilities?: string[];
+    storedConversation?: string;
   } = {}) => {
     const { document, window } = parseHTML(html);
     installDomGlobals(document, window);
     document.documentElement.setAttribute("data-ui-mode", "desktop");
     document.documentElement.setAttribute("data-chat-panel", "open");
     stubConversationSelect(document);
+    const previousStorage = Object.getOwnPropertyDescriptor(window, "localStorage");
+    if (options.storedConversation) {
+      const values = new Map<string, string>();
+      Object.defineProperty(window, "localStorage", { configurable: true, value: {
+        getItem: (key: string) => values.get(key) ?? null,
+        setItem: (key: string, value: string) => values.set(key, value),
+        removeItem: (key: string) => values.delete(key),
+      } });
+      const { presentationLocalStorage } = await import("../shell/presentation-storage");
+      presentationLocalStorage()!.setItem("uatu:chat-presentation", JSON.stringify({ selectedId: options.storedConversation }));
+    }
+    const restoreStorage = () => {
+      if (!options.storedConversation) return;
+      if (previousStorage) Object.defineProperty(window, "localStorage", previousStorage);
+      else delete (window as unknown as { localStorage?: Storage }).localStorage;
+    };
     let questionCalls = 0;
     const questionResults = options.questionResults ?? [async () => ({})];
-    const questionCallsRecord: Array<{ outcome: unknown; answers?: string[][] }> = [];
+    const questionCallsRecord: Array<{ conversationId: string; interactionId: string; outcome: unknown; answers?: string[][] }> = [];
     const itemsFor = options.itemsFor ?? (() => [{ id: "message:u", type: "user_message", createdAt: 1, text: "please answer" }, {
       id: "question:q1", type: "question", createdAt: 2, requestId: "q1", status: "pending",
       questions: options.questions ?? [{
@@ -2995,8 +3012,8 @@ describe("a question's owed-answer line", () => {
       items: itemsFor,
     });
     Object.assign(api, {
-      question: async (_conversationId: string, _interactionId: string, _requestId: string, outcome: unknown) => {
-        questionCallsRecord.push({ outcome, answers: (outcome as { answers?: string[][] })?.answers });
+      question: async (conversationId: string, interactionId: string, _requestId: string, outcome: unknown) => {
+        questionCallsRecord.push({ conversationId, interactionId, outcome, answers: (outcome as { answers?: string[][] })?.answers });
         return await questionResults[Math.min(questionCalls++, questionResults.length - 1)]?.();
       },
     });
@@ -3006,7 +3023,7 @@ describe("a question's owed-answer line", () => {
     await waitUntil(() => document.querySelector("[data-chat-item-id] form[data-question-form]") != null);
     const card = document.querySelector<HTMLElement>("[data-chat-item-id] form[data-question-form]")!.closest<HTMLElement>("[data-chat-item-id]")!;
     const state = () => document.querySelector("#chat-state")?.textContent ?? "";
-    return { document, window, card, state, questionCallsRecord };
+    return { document, window, card, state, questionCallsRecord, restoreStorage };
   };
 
   test("a Next advance keeps the line naming the required steps still outstanding", async () => {
@@ -3149,7 +3166,7 @@ describe("a question's owed-answer line", () => {
     }
   });
 
-  test("an old in-flight rejection does not erase a newer question's raised line (A to B to A)", async () => {
+  for (const storedConversation of ["one", "two"]) test(`an old in-flight rejection does not erase a newer question's raised line (A to B to A) with stored ${storedConversation}`, async () => {
     // The reader defers conversation A's rejection, switches to B, returns
     // to A — where the conversation now carries a newer question — and
     // raises that newer question's line. The old rejection landing then
@@ -3162,7 +3179,8 @@ describe("a question's owed-answer line", () => {
       id: `question:${requestId}`, type: "question", createdAt: 2, requestId, status: "pending",
       questions: [{ prompt: header, header, multiple: false, allowFreeForm: true, options: [{ label: "main", description: "" }] }],
     });
-    const { window, document, state } = await boot({
+    const { window, document, card, state, questionCallsRecord, restoreStorage } = await boot({
+      storedConversation,
       conversations: ["one", "two"],
       itemsFor: conversationId => [
         { id: "message:u", type: "user_message", createdAt: 1, text: "please answer" },
@@ -3180,11 +3198,19 @@ describe("a question's owed-answer line", () => {
         select.value = id;
         select.dispatchEvent(new window.Event("change", { bubbles: true }));
         await waitUntil(() => document.querySelector(`[data-chat-item-id="question:${card}"] form[data-question-form]`) != null);
+        expect(select.value).toBe(id);
+        expect(findCard(card).dataset.chatItemId).toBe(`question:${card}`);
       };
 
+      // Restoring another selected conversation is valid. Establish A through
+      // the public picker rather than treating any mounted question as Old A.
+      expect(select.value).toBe(storedConversation);
+      expect(card.dataset.chatItemId).toBe(storedConversation === "one" ? "question:q-old" : "question:q-b");
+      await selectConversation("one", "q-old");
       submitCard(findCard("q-old"));
       expect(state()).toBe("Still to answer: Old A");
       findCard("q-old").querySelector<HTMLInputElement>("[data-question-reject]")!.dispatchEvent(new window.Event("click", { bubbles: true }));
+      expect(questionCallsRecord).toEqual([{ conversationId: "one", interactionId: "q-old", outcome: { kind: "rejected" }, answers: undefined }]);
       await selectConversation("two", "q-b");
       submitCard(findCard("q-b"));
       expect(state()).toBe("Still to answer: B");
@@ -3196,8 +3222,10 @@ describe("a question's owed-answer line", () => {
       rejectOld.resolve();
       await flush();
       expect(state()).toBe("Still to answer: New A");
+      expect(questionCallsRecord).toHaveLength(1);
     } finally {
       window.dispatchEvent(new Event("pagehide"));
+      restoreStorage();
     }
   });
 
