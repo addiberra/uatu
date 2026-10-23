@@ -2,6 +2,66 @@ import { test, expect, signIn } from "./hub-fixtures";
 import { chromium, webkit } from "@playwright/test";
 import { captureScreenshot } from "./evidence";
 
+for (const browserName of ["chromium", "webkit"] as const) test.describe(`${browserName} personal preference drafts`, () => {
+test("unsaved personal preference survives refresh and competing saves until explicitly saved", async ({ hub }, info) => {
+  const browser = await ({ chromium, webkit })[browserName].launch();
+  try {
+  const hubContext = await browser.newContext();
+  const a = await hubContext.newPage();
+  await signIn(a, hub);
+  const b = await hubContext.newPage();
+  await Promise.all([a.goto(`${hub.origin}/settings`), b.goto(`${hub.origin}/settings`)]);
+  const toggleA = a.getByRole("switch", { name: "Keep workers running when I steer" });
+  const toggleB = b.getByRole("switch", { name: "Keep workers running when I steer" });
+  const status = a.locator("#personal-chat-preferences-form").getByRole("status");
+  const saveA = a.locator("#personal-chat-preferences-form").getByRole("button", { name: "Save", exact: true });
+  const saveB = b.locator("#personal-chat-preferences-form").getByRole("button", { name: "Save", exact: true });
+  const persisted = async () => (await hubContext.request.get(`${hub.origin}/api/hub/settings/chat-preferences`)).json();
+  await expect(toggleA).toBeEnabled();
+  await expect(toggleB).toBeEnabled();
+  const initial = await persisted();
+  expect(initial).toMatchObject({ version: 1, autoBackgroundOnSteer: true });
+  await toggleA.uncheck();
+  await expect(status).toHaveText("Unsaved changes — Save to apply.");
+  const refreshed = a.waitForResponse(response => response.url().endsWith("/api/hub/settings/chat-preferences") && response.request().method() === "GET");
+  await a.evaluate(() => window.dispatchEvent(new Event("focus")));
+  await refreshed;
+  await expect(toggleA).not.toBeChecked();
+  await expect(status).toHaveText("Unsaved changes — Save to apply.");
+  expect(await persisted()).toEqual(initial);
+  await captureScreenshot(a, info, "personal-chat-unsaved-desktop");
+  await saveA.click();
+  await expect(status).toHaveText("Saved");
+  expect(await persisted()).toEqual({ version: 1, revision: initial.revision + 1, autoBackgroundOnSteer: false });
+
+  // Keep B intentionally stale. Its own ON selection must survive the conflict.
+  await b.evaluate(() => (document.querySelector("#personal-chat-preferences-form") as HTMLFormElement).requestSubmit());
+  await expect(b.locator("#personal-chat-preferences-error")).toContainText("another device");
+  await expect(toggleB).toBeChecked();
+  await expect(b.locator("#personal-chat-preferences-form").getByRole("status")).toHaveText("Unsaved changes — Save to apply.");
+  expect(await persisted()).toEqual({ version: 1, revision: initial.revision + 1, autoBackgroundOnSteer: false });
+  const conflict = b.locator("#personal-chat-preferences-form").getByRole("alert");
+  await toggleB.uncheck();
+  await expect(b.locator("#personal-chat-preferences-form").getByRole("status")).toHaveText("Saved");
+  await expect(conflict).toContainText("Changed on another device.");
+  await expect(conflict).toContainText("The saved setting is OFF.");
+  await expect(conflict).toContainText("Your choice already matches the saved setting.");
+  await expect(conflict).not.toContainText("unsaved");
+  await expect(conflict).not.toContainText("Save ");
+  await toggleB.check();
+  await expect(b.locator("#personal-chat-preferences-form").getByRole("status")).toHaveText("Unsaved changes — Save to apply.");
+  await expect(conflict).toContainText("The saved setting is OFF.");
+  await expect(conflict).toContainText("Your unsaved choice is kept");
+  await expect(conflict).toContainText("Save");
+  await expect(conflict).not.toContainText("already matches");
+  expect(await persisted()).toEqual({ version: 1, revision: initial.revision + 1, autoBackgroundOnSteer: false });
+  await saveB.click();
+  await expect(b.locator("#personal-chat-preferences-form").getByRole("status")).toHaveText("Saved");
+  expect(await persisted()).toEqual({ version: 1, revision: initial.revision + 2, autoBackgroundOnSteer: true });
+  } finally { await browser.close(); }
+});
+});
+
 test("personal chat preference saves across device pages and refreshes on focus", async ({ hubContext, hub }, testInfo) => {
   const a = await hubContext.newPage();
   const b = await hubContext.newPage();
@@ -37,7 +97,8 @@ test("stale personal save reports current own-account state and unavailable does
   // No focus invalidation: the second device is intentionally stale.
   await b.evaluate(() => (document.querySelector("#personal-chat-preferences-form") as HTMLFormElement).requestSubmit());
   await expect(b.locator("#personal-chat-preferences-error")).toContainText("another device");
-  await expect(b.getByLabel("Keep workers running when I steer")).not.toBeChecked();
+  await expect(b.getByLabel("Keep workers running when I steer")).toBeChecked();
+  await expect(b.locator("#personal-chat-preferences-status")).toHaveText("Unsaved changes — Save to apply.");
   await b.route("**/api/hub/settings/chat-preferences", route => route.fulfill({ status: 503, json: { error: "unavailable" } }));
   await b.evaluate(() => window.dispatchEvent(new Event("online")));
   await expect(b.getByLabel("Keep workers running when I steer")).toBeDisabled();
@@ -72,6 +133,8 @@ for (const browserName of ["chromium", "webkit"] as const) test.describe(`${brow
     await expect(pane.locator("#personal-chat-preferences-help")).toHaveText("Applies to your account on this Hub.");
     expect((await pane.boundingBox())!.height).toBeLessThan(340);
     await expect(input).toBeChecked();
+    const initial = await (await context.request.get(`${hub.origin}/api/hub/settings/chat-preferences`)).json();
+    expect(initial).toMatchObject({ version: 1, autoBackgroundOnSteer: true });
     for (const theme of ["light", "dark"] as const) {
       await page.emulateMedia({ colorScheme: theme });
       await captureScreenshot(page, info, `personal-chat-${browserName}-touch-on-${theme}`);
@@ -82,12 +145,20 @@ for (const browserName of ["chromium", "webkit"] as const) test.describe(`${brow
       expect(box.height).toBeGreaterThanOrEqual(44);
     }
     await input.tap();
-    await expect(page.locator("#personal-chat-preferences-status")).toHaveText("Saved");
+    await expect(page.locator("#personal-chat-preferences-status")).toHaveText("Unsaved changes — Save to apply.");
     await expect(input).not.toBeChecked();
+    const refreshed = page.waitForResponse(response => response.url().endsWith("/api/hub/settings/chat-preferences") && response.request().method() === "GET");
+    await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+    await refreshed;
+    await expect(input).not.toBeChecked();
+    await expect(page.locator("#personal-chat-preferences-status")).toHaveText("Unsaved changes — Save to apply.");
+    expect(await (await context.request.get(`${hub.origin}/api/hub/settings/chat-preferences`)).json()).toEqual(initial);
+    await captureScreenshot(page, info, `personal-chat-${browserName}-touch-unsaved`);
     await save.tap();
     await expect(input).toBeEnabled();
     await expect(page.locator("#personal-chat-preferences-status")).toHaveText("Saved");
     await expect(input).not.toBeChecked();
+    expect(await (await context.request.get(`${hub.origin}/api/hub/settings/chat-preferences`)).json()).toEqual({ version: 1, revision: initial.revision + 1, autoBackgroundOnSteer: false });
     for (const theme of ["light", "dark"] as const) {
       await page.emulateMedia({ colorScheme: theme });
       await captureScreenshot(page, info, `personal-chat-${browserName}-touch-${theme}`);

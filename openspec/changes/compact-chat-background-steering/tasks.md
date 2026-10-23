@@ -556,3 +556,30 @@ the mode-lifecycle correction: both native modality directions, retained answer
 and 350px reading offset, one generation, released inertness and preserved draft
 and outside focus. Its focused checks passed 5 density/reader cases, 10 reader
 ownership cases and 11 units; these are separate runs, not an aggregate suite.
+
+## PR-hosted screenshot evidence (2026-10-23)
+
+The user moved screenshot ownership to the [PR #519 description](https://github.com/tjakobsson/uatu/pull/519). Earlier completed capture tasks record historical work; they do not require keeping PNG copies in the current repository tree. Preserve the original captions and capture/privacy limitations without presenting these historical frames as current-head renders.
+
+- [x] Transfer all 15 original feature screenshots to GitHub PR attachments, verify their downloaded bytes against the reviewed originals, and remove the tracked PNGs without rewriting published history.
+- [x] Keep opt-in capture assertions and timing intact while writing future captures to ignored Playwright artifacts/report attachments; align the text-only guide and independently review the migration.
+
+## Mobile picker and release-critical critique follow-up (2026-10-23)
+
+The user confirmed that the iPhone model list was clipped and approved rendered WebKit/Chromium regression coverage, including reduced-height and restored viewports, scrolling and model selection. The subsequent independent design critique selected only the two release-critical follow-ups below; side-answer history and control typography remain outside this correction.
+
+- [x] Restore usable model-list space after Chat's deferred viewport layout and in short touch viewports, preserve complete touch targets, and independently review the browser regression and fix. Physical-iPhone acceptance remains user-owned.
+- [x] Make active versus next-turn configuration explicit before steering without changing native admission semantics, staged configuration, or the fixed keyboard delivery contract; verify through rendered UI and actual fixture admission.
+- [x] Report unsaved personal chat preference changes accurately and preserve/reconcile dirty choices during refresh, Save and conflicts; verify with isolated Hub UI fixtures while preserving account and revision protections.
+- [x] Remove the upstream-inherited generated Impeccable report and ignore future critique snapshots, keeping intentional project rules and unrelated local artifacts intact.
+- [ ] Recheck feature screenshots against the final reviewed source, keep historical originals and disclosures available in the PR, and obtain approval before publishing refreshed screenshot content.
+
+Two fresh independent Sol reviews found no Standards breaches or Spec violations
+in the correction delta; an optional local-variable rename was not a release
+blocker. Final combined checks passed typecheck, 554 focused unit/API/policy
+tests, 14 browser cases across Chromium/WebKit desktop/touch with zero retries,
+and all 60 strict OpenSpec checks. Separate implementation runs covered adjacent
+configuration, delivery, picker, header and touch cases; they are not added to
+the combined count. The native viewport-restoration regression reproduced a
+stale 304px picker after Chat returned to 648px; the fix restored 648px and seven
+complete rows. This is browser evidence, not physical-iPhone acceptance.

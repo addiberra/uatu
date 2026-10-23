@@ -329,6 +329,7 @@ export function initChat(api = new ChatApiClient()): void {
   // HTTP response and must win even before an uncertainty notice exists.
   const queueActionsInFlight = new Map<string, Map<string, PendingQueueAction>>();
   const stagedConfigurations = new Map<string, ConversationConfiguration>();
+  const configurationLabels = { summary: "Chat settings", inline: "", accessible: [] as string[] };
   let configurationPicker: ChatConfigurationPickerController | null = null;
   let stream: ChatEventStream | null = null;
   let inventoryStream: ChatEventStream | null = null;
@@ -2776,6 +2777,7 @@ export function initChat(api = new ChatApiClient()): void {
       if (actionFeedback.textContent !== note) actionFeedback.textContent = note;
     }
     syncSendDescription();
+    syncConfigurationScope();
     sendGroup?.toggleAttribute("data-steering", declares("steering"));
     configurationTrigger.disabled = submitting || !projection || catalogLoading;
     configurationTrigger.toggleAttribute("aria-busy", catalogLoading);
@@ -2799,6 +2801,34 @@ export function initChat(api = new ChatApiClient()): void {
       delete configuration.variant;
     }
     return configuration;
+  };
+
+  const syncConfigurationScope = () => {
+    // A held submission can commit conversation configuration before the
+    // running turn ends. These controls describe future turns, not evidence
+    // of the active turn's settings, even after the local stage is consumed.
+    const nextTurn = declares("steering") && (deliveryChoiceOffered() || projection?.reversibleHistory?.staged === true);
+    const staged = projection && stagedConfigurations.get(projection.conversationId);
+    const effective = projection?.configuration;
+    const changed = nextTurn && Boolean(staged && (
+      staged.model && (!effective?.model || !sameModel(staged.model, effective.model))
+      || staged.mode && staged.mode !== effective?.mode
+      || staged.variant && staged.variant !== effective?.variant
+    ));
+    const prefix = nextTurn ? "Next turn · " : "";
+    configurationSummary.textContent = prefix + configurationLabels.summary;
+    const inline = document.querySelector<HTMLElement>("#chat-inline-configuration");
+    if (inline) {
+      inline.textContent = prefix + configurationLabels.inline;
+      inline.title = [agent?.name, inline.textContent].filter(Boolean).join(" · ");
+    }
+    configurationTrigger.setAttribute("aria-label", configurationLabels.accessible.length
+      ? `Chat configuration. ${nextTurn ? "Next turn. " : ""}${configurationLabels.accessible.join(". ")}`
+      : "Chat settings");
+    const notice = document.querySelector<HTMLElement>("#chat-configuration-scope");
+    if (notice) notice.hidden = !changed;
+    configurationTrigger.setAttribute("aria-describedby", `chat-inline-context${changed ? " chat-configuration-scope" : ""}`);
+    send.setAttribute("aria-describedby", `chat-send-help${changed ? " chat-configuration-scope" : ""}`);
   };
 
   const setStagedConfiguration = (conversationId: string, configuration: ConversationConfiguration) => {
@@ -2826,22 +2856,18 @@ export function initChat(api = new ChatApiClient()): void {
     const displayedModel = configuration.model
       ? models.find(model => sameModel(model.selection, configuration.model!))
       : defaultModel;
-    configurationSummary.textContent = declares("models")
+    configurationLabels.summary = declares("models")
       ? (displayedModel ? modelChipName(displayedModel) : configuration.model ? `${configuration.model.providerId}/${configuration.model.modelId}` : `Let ${agent?.name ?? "OpenCode"} choose`)
       : "Chat settings";
     const offersMode = declares("modes") && modes.length > 0;
     const offersReasoning = declares("variants") && Boolean(displayedModel?.variants?.length);
-    // The chip states only what is in force: a chosen value, or a default
-    // the agent itself declares. A delegation without a declared default is
-    // said once in the dialog ("Let ... choose"), not echoed here.
+    // The chip states the selected value, or a default the agent declares.
+    // Steering keeps these choices for future turns. A delegation without a
+    // declared default is said once in the dialog ("Let ... choose"), not echoed here.
     const displayedMode = configuration.mode ?? defaultMode?.name;
-    const inlineConfiguration = document.querySelector<HTMLElement>("#chat-inline-configuration");
-    if (inlineConfiguration) {
-      inlineConfiguration.textContent = [displayedMode ? configurationOptionLabel(displayedMode) : agent?.name,
-        declares("models") ? configurationSummary.textContent : undefined,
-        configuration.variant ? configurationOptionLabel(configuration.variant) : undefined].filter(Boolean).join(" · ");
-      inlineConfiguration.title = [agent?.name, inlineConfiguration.textContent].filter(Boolean).join(" · ");
-    }
+    configurationLabels.inline = [displayedMode ? configurationOptionLabel(displayedMode) : agent?.name,
+      declares("models") ? configurationLabels.summary : undefined,
+      configuration.variant ? configurationOptionLabel(configuration.variant) : undefined].filter(Boolean).join(" · ");
     const showMode = offersMode && Boolean(displayedMode);
     const showReasoning = offersReasoning && Boolean(configuration.variant);
     configurationModeSummary.hidden = !showMode;
@@ -2849,14 +2875,13 @@ export function initChat(api = new ChatApiClient()): void {
     configurationVariantSummary.hidden = !showReasoning;
     configurationVariantValue.textContent = showReasoning ? configurationOptionLabel(configuration.variant!) : "";
     configurationDetails.hidden = !showMode && !showReasoning;
-    const accessibleValues = [
+    configurationLabels.accessible = [
       // An unlisted selection is the user's own typed id under an agent that
       // runs them; only elsewhere is it a model that went away.
       declares("models") ? `Model: ${displayedModel ? modelChipName(displayedModel) : configuration.model ? (declares("custom-model-id") ? `${configuration.model.modelId}, typed` : `${configuration.model.providerId}/${configuration.model.modelId}, unavailable`) : `chosen by ${agent?.name ?? "the agent"}`}` : "",
       offersMode ? `Mode: ${displayedMode ? configurationOptionLabel(displayedMode) : `chosen by ${agent?.name ?? "the agent"}`}` : "",
       offersReasoning ? `Reasoning: ${configuration.variant ? configurationOptionLabel(configuration.variant) : `chosen by ${agent?.name ?? "the agent"}`}` : "",
     ].filter(Boolean);
-    configurationTrigger.setAttribute("aria-label", accessibleValues.length > 0 ? `Chat configuration. ${accessibleValues.join(". ")}` : "Chat settings");
     configurationPicker?.update({
       agent,
       models,

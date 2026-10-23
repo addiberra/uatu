@@ -1,10 +1,10 @@
 import { test, expect, childChatControl, openSessionTab } from "./hub-fixtures";
 import { openChatPanel } from "./chat-helpers";
-import path from "node:path";
+import { captureScreenshot } from "./evidence";
 
 test.skip(process.env.UATU_CAPTURE_CHAT_SCREENSHOTS !== "1", "Opt-in documentation screenshots");
 test.use({ hubChatPolicy: true, hubCredentials: true, hubWorkspaces: ["screenshot-fixture"] });
-test("personal preferences and retained unknown receipt documentation", async ({ hub, hubContext }) => {
+test("personal preferences and retained unknown receipt documentation", async ({ hub, hubContext }, info) => {
   const settings = await hubContext.newPage();
   await settings.setViewportSize({ width: 1440, height: 1000 });
   await settings.emulateMedia({ colorScheme: "light", reducedMotion: "reduce" });
@@ -13,7 +13,7 @@ test("personal preferences and retained unknown receipt documentation", async ({
   await expect(settings.locator("body")).not.toContainText("Credentials could not be loaded");
   await settings.getByText("Learn more", { exact: true }).click();
   await settings.getByLabel("Keep workers running when I steer").scrollIntoViewIfNeeded();
-  await settings.screenshot({ path: path.resolve("docs/screenshots/opencode-chat/08-personal-preferences-light.png"), animations: "disabled" });
+  await captureScreenshot(settings, info, "08-personal-preferences-light");
   await settings.close();
   const workspace = hub.workspaces[0]!;
   await childChatControl(workspace, { action: "agents", stack: "opencode-v2", backgroundPreview: true });
@@ -32,6 +32,6 @@ test("personal preferences and retained unknown receipt documentation", async ({
   await page.locator("#chat-input").fill("Preserve the review checklist");
   await page.locator("#chat-send").click();
   await expect(page.locator("#chat-action-feedback")).toContainText("unconfirmed");
-  await page.screenshot({ path: path.resolve("docs/screenshots/opencode-chat/09-unknown-receipt-dark.png"), animations: "disabled" });
+  await captureScreenshot(page, info, "09-unknown-receipt-dark");
   await page.close();
 });

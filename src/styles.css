@@ -8790,6 +8790,12 @@ html[data-ui-mode="touch"] .chat-configuration-sheet {
   max-height: min(var(--chat-configuration-max-height), 42rem);
 }
 
+/* In a short visible band, keep the existing 44px targets and reclaim chrome
+   padding so a complete model row fits above the settings footer. */
+html[data-ui-mode="touch"][data-chat-short] :is(.chat-configuration-header, .chat-configuration-models-section, .chat-configuration-footer) {
+  padding-block: 0.25rem;
+}
+
 html[data-ui-mode="touch"] .chat-configuration-model {
   min-height: 3rem;
 }

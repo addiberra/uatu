@@ -250,7 +250,14 @@ describe("chat reversible-history composer", () => {
           input.dispatchEvent(Object.assign(new window.Event("keydown", { bubbles: true, cancelable: true }), { key: "Enter", altKey: true }));
         } else send();
       };
+      const scope = document.querySelector<HTMLElement>("#chat-configuration-scope")!;
+      const trigger = document.querySelector<HTMLButtonElement>("#chat-configuration-trigger")!;
+      expect(scope.hidden).toBe(true);
       stage("B");
+      expect(scope.hidden).toBe(false);
+      expect(scope.textContent).toBe("Steers keep the active turn’s settings. Changes apply to queued or new turns.");
+      expect(trigger.getAttribute("aria-label")).toContain("Next turn. Model: B");
+      expect(document.querySelector("#chat-send")!.getAttribute("aria-describedby")).toBe("chat-send-help chat-configuration-scope");
       submit("First");
       await waitUntil(() => calls.length === 1);
       expect(calls[0]!.model).toEqual(b.selection);
@@ -266,6 +273,7 @@ describe("chat reversible-history composer", () => {
         : document.querySelector("#chat-queue")!.textContent!.includes("First"));
       const next = firstOutcome === "queue-with-new-stage" ? c : b;
       expect(document.querySelector(`[data-model-value="test/${next.name}"]`)!.getAttribute("aria-pressed")).toBe("true");
+      expect(scope.hidden).toBe(false);
       storage?.setItem("chat-delivery", "queue");
       submit("Next queued work", true);
       await waitUntil(() => calls.length === 2);
@@ -275,6 +283,8 @@ describe("chat reversible-history composer", () => {
       // visible, not masked forever by the just-submitted staged selection.
       parent!.event({ type: "conversation.configuration", generation: "g", sequence: 1, conversationId: "one", configuration: { model: a.selection } }, "cursor-one-1");
       expect(document.querySelector('[data-model-value="test/A"]')!.getAttribute("aria-pressed")).toBe("true");
+      expect(scope.hidden).toBe(true);
+      expect(document.querySelector("#chat-send")!.getAttribute("aria-describedby")).toBe("chat-send-help");
       submit("Third queued work", true);
       await waitUntil(() => calls.length === 3);
       expect(calls[2]).toEqual({ model: a.selection, delivery: "queue" });
@@ -282,6 +292,55 @@ describe("chat reversible-history composer", () => {
       storage?.removeItem("chat-delivery");
       window.dispatchEvent(new window.Event("pagehide"));
     }
+  });
+
+  for (const scenario of ["mode", "reasoning", "unknown", "idle", "unsupported"] as const) test(`configuration scope explains ${scenario} without inventing active settings`, async () => {
+    const { document, window } = parseHTML(html);
+    installDomGlobals(document, window);
+    document.documentElement.setAttribute("data-ui-mode", "desktop");
+    document.documentElement.setAttribute("data-chat-panel", "open");
+    stubConversationSelect(document);
+    const model: ChatModel = { selection: { providerId: "test", modelId: "model" }, provider: "Test", name: "Model", variants: ["low", "high"] };
+    const configuration = scenario === "unknown" ? {} : { model: model.selection, mode: "build", variant: "low" };
+    const status = scenario === "idle" ? "idle" : "running";
+    let parent: Parameters<ChatApiClient["stream"]>[2] | undefined;
+    const api = {
+      status: async () => [{ agent: { id: "test", name: "Test" }, availability: { state: "ready", version: "test", agent: { id: "test", name: "Test", capabilities: ["models", "modes", "variants", ...(scenario === "unsupported" ? [] : ["steering"])] } } }],
+      conversations: async () => [{ ...conversation("one"), status }], commands: async () => [], models: async () => [model],
+      modes: async () => [{ name: "build", description: "Build" }, { name: "plan", description: "Plan" }],
+      snapshot: async () => ({ ...snapshot("one"), configuration, conversation: { ...conversation("one"), status } }),
+      stream: (_id: string, _cursor: string, handlers: Parameters<ChatApiClient["stream"]>[2]) => { parent = handlers; return { close() {} }; },
+      inventoryStream: () => ({ close() {} }), attachmentUrl: () => "",
+    } as unknown as ChatApiClient;
+    const { initChat } = await import(`./ui.ts?configuration-scope=${scenario}-${Date.now()}`);
+    initChat(api);
+    try {
+      const input = document.querySelector<HTMLTextAreaElement>("#chat-input")!;
+      await waitUntil(() => !input.disabled && !!parent);
+      const scope = document.querySelector<HTMLElement>("#chat-configuration-scope")!;
+      const trigger = document.querySelector<HTMLButtonElement>("#chat-configuration-trigger")!;
+      expect(scope.hidden).toBe(true);
+      const control = document.querySelector<HTMLSelectElement>(scenario === "reasoning" ? "#chat-configuration-variant" : "#chat-configuration-mode")!;
+      // Linkedom exposes select.value as read-only, unlike a browser.
+      Object.defineProperty(control, "value", { configurable: true, value: scenario === "reasoning" ? "high" : "plan" });
+      control.dispatchEvent(new window.Event("change", { bubbles: true }));
+      const steering = scenario !== "idle" && scenario !== "unsupported";
+      expect(scope.hidden).toBe(!steering);
+      expect(trigger.getAttribute("aria-label")!.includes("Next turn")).toBe(steering);
+      expect(trigger.getAttribute("aria-label")).toContain(scenario === "reasoning" ? "Reasoning: High" : "Mode: Plan");
+      if (scenario === "unknown") {
+        expect(trigger.getAttribute("aria-label")).toContain("Model: chosen by Test");
+        expect(scope.textContent).not.toContain("Build");
+      }
+      // A remote equal configuration hides the extra explanation without
+      // clearing the local choice or implying it retargeted a running turn.
+      parent!.event({ type: "conversation.configuration", generation: "g", sequence: 1, conversationId: "one", configuration: { ...configuration, ...(scenario === "reasoning" ? { variant: "high" } : { mode: "plan" }) } }, "cursor-one-1");
+      expect(scope.hidden).toBe(true);
+      parent!.event({ type: "conversation.status", generation: "g", sequence: 2, conversationId: "one", status: "completed" }, "cursor-one-2");
+      await waitUntil(() => !trigger.getAttribute("aria-label")!.includes("Next turn"));
+      expect(trigger.getAttribute("aria-label")).not.toContain("Next turn");
+      expect(trigger.getAttribute("aria-label")).toContain(scenario === "reasoning" ? "Reasoning: High" : "Mode: Plan");
+    } finally { window.dispatchEvent(new window.Event("pagehide")); }
   });
 
   for (const scenario of ["held", "absent", "failed-read", "incomplete-read", "edit", "steer", "queue", "delivered-code", "early-terminal", "read-terminal", "switched", "read-switched", "withdrawal-retry"] as const) {

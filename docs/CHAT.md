@@ -20,8 +20,12 @@ instead of resetting OFF. The API is authenticated, no-store and versioned,
 with server-selected identity and compare-revision writes. Changes take effect
 only after **Save**. The one-line helper names the account scope; **Learn more**
 keeps the all-jobs, shared-workspace and native-resume caveats available.
-Successful reads and saves say **Saved**; the switch shows ON/OFF. Conflicts,
-unavailable settings and unconfirmed saves keep their explanatory messages.
+The switch shows ON/OFF. Changing it shows **Unsaved changes — Save to apply**;
+returning to the confirmed saved value restores **Saved**. Refreshes preserve an
+unsaved choice without silently applying it or rebasing it onto a competing
+revision. A conflict keeps the choice and reports the saved setting for review
+before another explicit Save. Unavailable settings and unconfirmed saves retain
+their distinct explanatory messages; no background refresh replays a save.
 
 With verified private Hub-to-child trust, ON considers one background request
 after an accepted composer steer, Queue → Steer, held Send now, paused-batch
@@ -153,6 +157,13 @@ and OpenCode V1 queue busy follow-ups without offering steering. Pending images
 and native commands queue rather than being labelled as a text steer; replacement
 submission retains the native staged-revert semantics.
 
+While native steering is available, the configuration pill identifies **Next
+turn** choices. Changed model, mode and reasoning settings apply to queued or
+new turns; steers retain the active turn's settings. Differing staged choices
+show this distinction before submission and describe it to assistive technology.
+The pill does not invent the active turn's configuration from later queue
+admissions, and the extra explanation is absent for idle or unchanged settings.
+
 Touch keeps Attach and a two-line **agent · mode · model · effort** pill inline.
 Only declared/selected values appear; long names truncate with the full identity
 available to assistive technology and the familiar model chooser on activation.
@@ -279,10 +290,11 @@ remain available in its content pane when collapsed. Batch actions live below
 the count header so they cannot change its disclosure styling or scroll away
 the worker header.
 
-The [desktop screenshot gallery](screenshots/opencode-chat/README.md) covers the
+The [PR-hosted screenshot gallery](https://github.com/tjakobsson/uatu/pull/519) covers the
 composer, workers, pending entries, hold countdown, inspection, questions, side
 reader, personal automation preference and uncertain/replacement feedback using
-synthetic fixtures only.
+synthetic fixtures only. The [capture guide](screenshots/opencode-chat/README.md)
+records each gallery's source and limitations.
 Selecting a card header also grants its body action space; allocation happens
 after the native click so moving the header cannot swallow a touch. In enlarged
 short landscape, physical 44px chrome/action minima replace rem-scaled empty
@@ -297,6 +309,11 @@ so it cannot consume the draft field. The inline model/context pill opens the
 real configuration picker directly, without a second Options panel or context
 circle. Paused-batch Send and replacement warnings remain available while typing.
 Outside picker taps dismiss it without activating controls below it.
+The touch picker reflows when Chat's visible area changes, including after a
+short viewport expands again. Short layouts reduce spacing around the model
+list while retaining complete model rows and touch targets. Browser regressions
+cover resizing, scrolling to the last model and selecting it; physical-iPhone
+acceptance remains user-owned.
 
 Edit returns an entry to the composer only after withdrawal succeeds. If
 delivery wins first, **Too late — already delivered** is informational: your

@@ -1,18 +1,19 @@
 // Opt-in documentation captures: actual application + synthetic providers.
-// Normal test runs never rewrite repository images.
+// Captures are local Playwright artifacts and report attachments, not repository images.
 import { test, expect } from "./fixtures";
 import { openChatPanel, openChatWorkers } from "./chat-helpers";
-import type { Page, APIRequestContext } from "@playwright/test";
-import path from "node:path";
-import { captureScreenshot } from "./evidence";
+import type { Page, APIRequestContext, TestInfo } from "@playwright/test";
+import { captureScreenshot, evidencePath, recordEvidence } from "./evidence";
 
 test.skip(process.env.UATU_CAPTURE_CHAT_SCREENSHOTS !== "1", "Opt-in documentation screenshots");
-const folder = path.resolve("docs/screenshots/opencode-chat");
-async function shot(page: Page, name: string) {
+async function shot(page: Page, info: TestInfo, name: string) {
   if (process.env.UATU_CAPTURE_HOLD_ONLY === "1" && !name.startsWith("04-hold-")) return;
   if (process.env.UATU_CAPTURE_WORKERS_ONLY === "1" && !/^(02-|03-|04-|05-|06-|07-|09-replacement-)/.test(name)) return;
   await page.evaluate(() => document.fonts.ready);
-  await page.screenshot({ path: path.join(folder, `${name}.png`), animations: "disabled" });
+  // Keep timed hold frames free of captureScreenshot's settling delay.
+  const target = evidencePath(info, `${name}.png`);
+  await page.screenshot({ path: target, animations: "disabled" });
+  await recordEvidence(info, target);
 }
 async function control(request: APIRequestContext, data: Record<string, unknown>) {
   const response = await request.post("/__e2e/chat", { data });
@@ -43,16 +44,16 @@ test("desktop documentation gallery", async ({ page, request }, info) => {
   await page.locator("#chat-conversation-select").selectOption(seeded.conversation.id);
   await page.locator("#chat-input").fill("Add appearance preferences without changing saved tasks.");
   await expect(page.locator("#chat-configuration-summary")).toContainText("Review Model");
-  await shot(page, "01-overview-light");
+  await shot(page, info, "01-overview-light");
   await page.locator("#chat-configuration-trigger").click();
   await expect(page.locator("#chat-configuration-dialog")).toBeVisible();
-  await shot(page, "01-configuration-light");
+  await shot(page, info, "01-configuration-light");
   await page.keyboard.press("Escape");
   await control(request, { action: "item", conversationId: seeded.conversation.id, item: { id: "worker:audit", type: "background_task", taskId: "audit", description: "Audit keyboard navigation", subagentType: "reviewer", status: "running", createdAt: Date.now() } });
   await control(request, { action: "item", conversationId: seeded.conversation.id, item: { id: "question:theme", type: "question", requestId: "theme", status: "pending", createdAt: Date.now(), questions: [{ header: "Appearance", prompt: "Which appearance preference should be the default?", multiple: false, allowFreeForm: true, options: [{ label: "System", description: "Follow the device appearance" }, { label: "Light", description: "Always use the light palette" }] }] } });
   await expect(page.locator('[data-chat-item-id="question:theme"]')).toContainText("Which appearance");
   await openChatWorkers(page);
-  await shot(page, "06-question-with-workers-light");
+  await shot(page, info, "06-question-with-workers-light");
 
   // Native 2.x adapter, backed only by the local scripted OpenCode server.
   await request.post("/__e2e/reset");
@@ -74,10 +75,10 @@ test("desktop documentation gallery", async ({ page, request }, info) => {
   await openChatWorkers(page);
   for (const row of await page.locator(".chat-worker-inspect").all()) expect(await row.evaluate(node => node.getBoundingClientRect().height)).toBeLessThanOrEqual(28);
   await page.emulateMedia({ colorScheme: "dark" });
-  await shot(page, "02-workers-dark");
+  await shot(page, info, "02-workers-dark");
   await page.locator("#chat-compact-workers [data-inspect-task]").first().click();
   await expect(page.locator("#chat-drilldown")).toBeVisible();
-  await shot(page, "05-worker-inspection-dark");
+  await shot(page, info, "05-worker-inspection-dark");
   await page.locator("#chat-drilldown-back").click();
   await page.locator("#chat-input").fill("/btw Summarize the review checklist");
   await page.route("**/aside", async route => {
@@ -86,10 +87,10 @@ test("desktop documentation gallery", async ({ page, request }, info) => {
   });
   await page.locator("#chat-send").click();
   await expect(page.locator("#chat-aside-ready")).toHaveText("Side answer ready");
-  await shot(page, "07-side-answer-ready-dark");
+  await shot(page, info, "07-side-answer-ready-dark");
   await page.locator("#chat-aside-ready").click();
   await expect(page.locator("#chat-aside-answer table")).toBeVisible();
-  await shot(page, "07-side-reader-dark");
+  await shot(page, info, "07-side-reader-dark");
   await page.emulateMedia({ colorScheme: "light" });
   await captureScreenshot(page, info, "desktop-side-reader-light");
   await page.emulateMedia({ colorScheme: "dark" });
@@ -99,9 +100,9 @@ test("desktop documentation gallery", async ({ page, request }, info) => {
   await page.clock.install(); await page.clock.pauseAt(new Date(Date.now() + 1000));
   const box = (await page.locator("#chat-send").boundingBox())!;
   await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2); await page.mouse.down();
-  await page.clock.runFor(1000); await shot(page, "04-hold-quarter-dark");
+  await page.clock.runFor(1000); await shot(page, info, "04-hold-quarter-dark");
   const earlyEnvelope = (await page.locator(".chat-hold-upward").boundingBox())!;
-  await page.clock.runFor(1100); await shot(page, "04-hold-near-dark");
+  await page.clock.runFor(1100); await shot(page, info, "04-hold-near-dark");
   expect(await page.locator(".chat-hold-upward").boundingBox()).toEqual(earlyEnvelope);
   const held = page.waitForResponse(response => response.url().endsWith("/prompts") && response.request().method() === "POST");
   await page.clock.runFor(400); expect((await held).ok()).toBe(true); await page.mouse.up();
@@ -119,7 +120,7 @@ test("desktop documentation gallery", async ({ page, request }, info) => {
   if (await pending.getAttribute("aria-expanded") !== "true") await pending.click();
   await expect(page.locator("#chat-compact-workers [data-worker-id]")).toHaveCount(20);
   await page.emulateMedia({ colorScheme: "light" });
-  await shot(page, "03-expanded-queue-workers-light");
+  await shot(page, info, "03-expanded-queue-workers-light");
   // Stage a genuine replacement boundary; the warning is rendered by the app.
   await page.locator("[data-queue-remove]").last().click();
   await expect(page.locator(".chat-queued-message")).toHaveCount(19);
@@ -127,7 +128,7 @@ test("desktop documentation gallery", async ({ page, request }, info) => {
   expect((await page.request.post(`/api/chat/conversations/${encodeURIComponent(conversationId)}/undo`, { headers: { origin: new URL(page.url()).origin }, data: { requestId: "gallery-undo" } })).ok()).toBe(true);
   await expect(page.locator("#chat-queue-note")).toContainText("delivered together with your replacement");
   await page.locator(".chat-queue-content").evaluate(node => { node.scrollTop = 0; });
-  await shot(page, "09-replacement-warning-light");
+  await shot(page, info, "09-replacement-warning-light");
 });
 
 test("mobile side answer minimises without losing the answer", async ({ browser, request, baseURL }, info) => {
@@ -146,13 +147,13 @@ test("mobile side answer minimises without losing the answer", async ({ browser,
     await expect(page.locator("#chat-aside-ready")).toHaveText("Side answer ready");
     await page.locator("#chat-aside-ready").tap();
     await expect(page.locator("#chat-aside-answer table")).toBeVisible();
-    await shot(page, "10-mobile-side-reader-light");
+    await shot(page, info, "10-mobile-side-reader-light");
     await page.emulateMedia({ colorScheme: "dark" });
     await captureScreenshot(page, info, "mobile-side-reader-dark");
     await page.emulateMedia({ colorScheme: "light" });
     await page.locator("#chat-aside-close").tap();
     await expect(page.locator("#chat-aside-dialog")).toBeHidden();
-    await shot(page, "10-mobile-side-minimised-light");
+    await shot(page, info, "10-mobile-side-minimised-light");
     await page.locator("#chat-aside-ready").tap();
     await expect(page.locator("#chat-aside-answer")).toContainText("Review checklist");
   } finally { await page.close(); }
