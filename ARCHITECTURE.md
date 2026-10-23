@@ -914,7 +914,12 @@ notice. A bounded silent timeout resolves through inbox/history evidence.
 
 The dock has sticky delivery counts, leading delivery/Paused badges, plain
 timing labels, and an overflow-only bottom fade within a roughly 40%-height
-scroll budget. Dock targets are 2.25rem desktop / 2.75rem touch; accessible
+scroll budget. Touch pending-message actions use the approved 32px minimum
+height with 8px gaps; batch Send and worker Stop retain 44px minimum heights.
+Fine-pointer desktop uses 32px pending and batch actions and 28px worker Stop.
+Active/unknown worker Inspect has a 44px minimum height (28px in the wide
+fine-pointer desktop layout); settled rows retain compact inspection density
+with the existing narrow-width fallback. Accessible
 action names quote the message, with silent success and visible focus rings.
 Duplicate text and image-only entries gain client-local `pending message N`
 discriminators retained while pending across reorder, switches and sibling

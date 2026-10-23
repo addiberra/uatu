@@ -3,6 +3,89 @@ import { parseHTML } from "linkedom";
 import { compactWorkers, type CompactWorker } from "./compact-work";
 import { CompactWorkersView } from "./compact-workers-view";
 
+test("reported clock has its own suffix and the full kind and provenance remain in the metadata title", () => {
+  const { document, window } = parseHTML('<html><body><div id="workers"></div></body></html>');
+  const previous = new Map(["document", "Element"].map(key => [key, Reflect.get(globalThis, key)]));
+  Reflect.set(globalThis, "document", document); Reflect.set(globalThis, "Element", window.Element);
+  const format = spyOn(Date.prototype, "toLocaleTimeString").mockImplementation(() => "19:43");
+  try {
+    const host = document.getElementById("workers")! as unknown as HTMLElement;
+    const view = new CompactWorkersView(host);
+    const agent = "synthetic-long-agent-kind-with-no-breaks".repeat(8);
+    view.paint("parent", compactWorkers([
+      { type: "background_task", id: "report", taskId: "report", description: "Synthetic report", subagentType: agent, status: "completed", createdAt: 10, terminalReportedAt: 40, progress: "Report received" },
+    ]), new Set(), true);
+    const meta = host.querySelector<HTMLElement>(".chat-worker-meta")!;
+    expect(meta.title).toBe(`${agent} · Reported 19:43 · finished · Report received`);
+    expect(meta.querySelector(".chat-worker-kind")!.textContent).toBe(agent);
+    expect(meta.querySelector(".chat-worker-time > .chat-worker-clock")!.textContent).toBe("Reported 19:43");
+    expect(meta.textContent).toBe(`${agent} · Reported 19:43`);
+    expect(meta.querySelector("[data-elapsed-since]")).toBeNull();
+    expect(host.querySelector(".chat-worker-inspect")!.getAttribute("aria-label")).toContain("Synthetic report");
+  } finally {
+    format.mockRestore();
+    for (const [key, value] of previous) Reflect.set(globalThis, key, value);
+  }
+});
+
+test("active kind and shell elapsed time survive the clock suffix structure without stale report titles", () => {
+  const { document, window } = parseHTML('<html><body><div id="workers"></div></body></html>');
+  const previous = new Map(["document", "Element"].map(key => [key, Reflect.get(globalThis, key)]));
+  Reflect.set(globalThis, "document", document); Reflect.set(globalThis, "Element", window.Element);
+  const now = spyOn(Date, "now").mockReturnValue(65_000);
+  try {
+    const host = document.getElementById("workers")! as unknown as HTMLElement;
+    const view = new CompactWorkersView(host);
+    const workers = compactWorkers([
+      { type: "background_task", id: "shell", taskId: "shell", taskType: "shell", description: "Synthetic shell", status: "running", createdAt: 5_000 },
+      { type: "background_task", id: "agent", taskId: "agent", subagentType: "explore", description: "Synthetic agent", status: "running", createdAt: 5_000 },
+    ]);
+    view.paint("parent", workers.map(worker => ({ ...worker, state: "completed", terminalReportedAt: 60_000, settledAt: 60_000 })), new Set(), true);
+    view.paint("parent", workers, new Set(), true);
+    const shell = host.querySelector<HTMLElement>('[data-worker-id="shell"] .chat-worker-meta')!;
+    const agent = host.querySelector<HTMLElement>('[data-worker-id="agent"] .chat-worker-meta')!;
+    expect(shell.textContent).toBe("Shell · 1:00");
+    expect(shell.querySelector(".chat-worker-clock")!.getAttribute("data-elapsed-since")).toBe("5000");
+    expect(shell.title).toBe("Shell · 1:00 · working");
+    expect(agent.textContent).toBe("explore");
+    expect(agent.querySelector(".chat-worker-time")).toBeNull();
+    view.paint("parent", workers.map(worker => ({ ...worker, state: "unknown" })), new Set(), true);
+    expect(shell.textContent).toBe("Shell · 1:00");
+    expect(shell.title).toBe("Shell · 1:00 · unknown");
+    expect(shell.textContent).not.toContain("Reported");
+  } finally {
+    now.mockRestore();
+    for (const [key, value] of previous) Reflect.set(globalThis, key, value);
+  }
+});
+
+test("native terminal clocks say Reported, including zero/equal-launch, while missing clocks say Started", () => {
+  const { document, window } = parseHTML('<html><body><div id="workers"></div></body></html>');
+  const previous = new Map(["document", "Element"].map(key => [key, Reflect.get(globalThis, key)]));
+  Reflect.set(globalThis, "document", document); Reflect.set(globalThis, "Element", window.Element);
+  const format = spyOn(Date.prototype, "toLocaleTimeString").mockImplementation(() => "19:43");
+  try {
+    const host = document.getElementById("workers")! as unknown as HTMLElement;
+    const view = new CompactWorkersView(host);
+    view.paint("parent", compactWorkers([
+      { type: "background_task", id: "agent", taskId: "agent", description: "Agent", status: "completed", createdAt: 10, terminalReportedAt: 40 },
+      { type: "background_task", id: "shell", taskId: "shell", taskType: "shell", description: "Shell", status: "failed", createdAt: 10, terminalReportedAt: 10 },
+      { type: "background_task", id: "zero", taskId: "zero", description: "Epoch report", status: "stopped", createdAt: 0, terminalReportedAt: 0 },
+      { type: "background_task", id: "missing", taskId: "missing", description: "No clock", status: "completed", createdAt: 10 },
+      { type: "background_task", id: "unknown", taskId: "unknown", description: "Unknown time", status: "completed", createdAt: 0 },
+    ]), new Set(), true);
+    for (const id of ["agent", "shell", "zero"]) {
+      expect(host.querySelector(`[data-worker-id="${id}"] .chat-worker-meta`)!.textContent).toContain("Reported 19:43");
+      expect(host.querySelector(`[data-worker-id="${id}"] .chat-worker-meta`)!.textContent).not.toContain("Finished");
+    }
+    expect(host.querySelector('[data-worker-id="missing"] .chat-worker-meta')!.textContent).toBe("Agent · Started 19:43");
+    expect(host.querySelector('[data-worker-id="unknown"] .chat-worker-meta')!.textContent).toBe("Agent");
+  } finally {
+    format.mockRestore();
+    for (const [key, value] of previous) Reflect.set(globalThis, key, value);
+  }
+});
+
 test("finished worker clocks render 24-hour evening and midnight even under an AM/PM locale", () => {
   const { document, window } = parseHTML('<html><body><div id="workers"></div></body></html>');
   const previous = new Map(["document", "Element"].map(key => [key, Reflect.get(globalThis, key)]));

@@ -394,12 +394,22 @@ tasks count, ordinary foreground commands do not. Zero-count categories are
 omitted. Dismissed counts are not shown; when no visible workers remain the whole
 worker card disappears. Expansion shows one flat
 list: active work first, then finished work ordered newest first from available
-execution timestamps, without a second disclosure. Rows open inspection or retained results;
+execution timestamps, without a second disclosure. Native V2 terminal reports
+retain their provider clock and show **Reported** rather than an exact finish
+time: live events time inbox admission, stored messages time delivery, so recovery
+can change this clock and the finished order. A missing report clock falls back
+to reported execution duration, then launch (**Started**), never local receipt
+time or a launcher's completion. These clocks add no worker-state or accounting
+authority. A result awaiting launcher correlation has no known start; without a
+provider report clock it shows no time. Rows open inspection or retained results;
 launch references and their costs remain in the transcript/timeline. Names use
 14px type and compact model/effort, Σ cumulative-token and session-USD columns
 (11px at default scale), with distinct working, unknown, finished, failed and
 stopped glyphs. Wide desktop rows align agent, title and metadata on one line,
-with separate 28px Stop/Inspect targets. Narrow desktop/touch rows put the title
+with separate 28px Stop/Inspect targets. Visible wide timing captions retain the
+full clock and provenance label; long agent/kind prefixes may ellipsize, with the
+complete metadata also available in its tooltip. Settled timing metadata stays
+hidden on narrow layouts. Narrow desktop/touch rows put the title
 first and metadata below; very narrow phones wrap one additional line. Missing
 agent/model/usage/effort/cost is not invented. Touch **Stop** remains a separate
 44px target with an 8px gap; unknown execution state disables it. Settled rows

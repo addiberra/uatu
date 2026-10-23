@@ -2,6 +2,19 @@
 
 Entries are ordered newest first. Every entry has Hub and workspace revisions, a compatibility classification, and migration guidance. Use `None` when no migration is required. An entry is headed `Unreleased` until the release that ships it; the release-prep step replaces that with the version tag (`v0.7.0`), so a consumer can tell which revision pair a given uatu version speaks. An additive change that lands after a pair has shipped gets its own entry under the same pair, stamped with its own release, rather than being appended to the shipped entry.
 
+## Hub 11 / Workspace 30 - Unreleased (native worker report clocks)
+
+Compatibility: breaking (workspace)
+
+### Changes
+
+- Closed `background_task` items can carry optional `terminalReportedAt` in Unix epoch milliseconds. It preserves a native terminal notification's provider clock for newest-first finished ordering, including notification-first correlation. Zero is valid; missing/invalid clocks remain absent, never local receipt time or a missing-time zero fallback.
+- This is **not** execution completion: OpenCode V2 live inbox events time admission, while stored synthetic messages time delivery. Recovery can therefore change the available report clock and order. The clock adds no worker-state, usage, duration or cost authority. Launcher tool completion remains separate from the independent worker's report.
+
+### Migration
+
+Strict workspace consumers must regenerate against revision 30 because revision 29's closed background item rejects the new property. Preserve its optionality and report provenance. Prefer a worker's actual execution completion when available; otherwise use its terminal report, reported execution duration, then launch time for finished ordering. Label report clocks as **Reported**, not an exact finish time. Do not substitute an aliased launcher's end clock for its worker. Hub revision stays 11.
+
 ## Hub 11 / Workspace 29 - Unreleased (pending submission identity)
 
 Compatibility: breaking (workspace)

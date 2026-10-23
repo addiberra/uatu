@@ -117,7 +117,8 @@ export class BackgroundWorkers {
       const [key, result] = pending[0]!;
       this.unmatched.delete(key);
       if (!this.unlimited) this.account(this.unmatched, key, 0);
-      const settled = { ...item, status: result.item.status, summary: result.item.summary, resultId: result.item.resultId };
+      const settled = { ...item, status: result.item.status, summary: result.item.summary, resultId: result.item.resultId,
+        ...(result.item.terminalReportedAt === undefined ? {} : { terminalReportedAt: result.item.terminalReportedAt }) };
       this.set(this.tasks, taskId, { parent, worker: child, item: settled });
       return [{ kind: "remove", itemId: result.item.id }, { kind: "upsert", item: settled }];
     }
@@ -128,17 +129,19 @@ export class BackgroundWorkers {
     return array(content).flatMap(part => this.launch(parent, part, at));
   }
 
-  notification(parent: string, id: string, payload: unknown, at: number): NormalizedProviderUpdate[] | undefined {
+  // `at` also positions/correlates a row. Pass null when it is only a display
+  // fallback, not a provider report clock (including stored missing-time 0).
+  notification(parent: string, id: string, payload: unknown, at: number, terminalReportedAt: number | null = at): NormalizedProviderUpdate[] | undefined {
     if (this.recoveryOnly) {
       const source = record(record(payload).metadata).source;
       return source === "subagent" || source === "shell" ? [] : undefined;
     }
-    const result = this.foldNotification(parent, id, payload, at);
+    const result = this.foldNotification(parent, id, payload, at, terminalReportedAt);
     this.bound();
     return result;
   }
 
-  private foldNotification(parent: string, id: string, payload: unknown, at: number): NormalizedProviderUpdate[] | undefined {
+  private foldNotification(parent: string, id: string, payload: unknown, at: number, terminalReportedAt: number | null): NormalizedProviderUpdate[] | undefined {
     const value = record(payload);
     const metadata = record(value.metadata);
     const shell = metadata.source === "shell";
@@ -152,6 +155,7 @@ export class BackgroundWorkers {
     const status = metadata.state === "completed" ? (shell && (metadata.timeout === true || typeof metadata.signal === "string" || typeof metadata.exit === "number" && metadata.exit !== 0) ? "failed" : "completed")
       : metadata.state === "error" ? "failed" : metadata.state === "cancelled" ? "stopped" : undefined;
     if (!status) return;
+    const reportClock = terminalReportedAt !== null && Number.isFinite(terminalReportedAt) && terminalReportedAt >= 0 ? { terminalReportedAt } : {};
     const key = `${parent}:${id}`;
     if (this.notices.has(key)) return [];
     const candidates = [...this.tasks.values()].filter(task => task.parent === parent && task.worker === child && task.item.status === "running" && task.item.createdAt <= at);
@@ -165,7 +169,7 @@ export class BackgroundWorkers {
       const item: BackgroundTaskItem = {
         id: `task:${taskId}`, type: "background_task", taskId, createdAt: at,
         description: optionalString(value.description) ?? "Background worker result",
-        childConversationId: child, taskType: "agent", status, summary, resultId: id,
+        childConversationId: child, taskType: "agent", status, summary, resultId: id, ...reportClock,
       };
       this.set(this.unmatched, key, { parent, worker: child, item, correlatable: candidates.length === 0 });
       this.notice(key);
@@ -176,7 +180,7 @@ export class BackgroundWorkers {
       }), { kind: "upsert", item }];
     }
     const task = candidates[0]!;
-    task.item = { ...task.item, status, summary, resultId: id };
+    task.item = { ...task.item, status, summary, resultId: id, ...reportClock };
     this.set(this.tasks, task.item.taskId, task);
     this.notice(key);
     return [{ kind: "upsert", item: task.item }];

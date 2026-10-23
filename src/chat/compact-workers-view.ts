@@ -66,19 +66,28 @@ export class CompactWorkersView {
       inspect.querySelector(".chat-worker-glyph")!.textContent = glyphs[worker.state];
       inspect.querySelector(".chat-worker-name")!.textContent = worker.name;
       const meta = inspect.querySelector<HTMLElement>(".chat-worker-meta")!;
-      meta.textContent = worker.kind === "shell" ? "Shell" : worker.agent ?? "Agent";
-      meta.title = [meta.textContent, workerStateLabel(worker.state), worker.progress].filter(Boolean).join(" · ");
-      if (worker.since || worker.completedAt !== undefined) {
+      const kind = document.createElement("span");
+      kind.className = "chat-worker-kind";
+      kind.textContent = worker.kind === "shell" ? "Shell" : worker.agent ?? "Agent";
+      meta.replaceChildren(kind);
+      if (worker.since || worker.completedAt !== undefined || worker.terminalReportedAt !== undefined) {
         const time = document.createElement("span");
+        time.className = "chat-worker-clock";
         if (workerIsActive(worker.state)) {
           time.dataset.elapsedSince = String(worker.since);
           time.textContent = formatTaskElapsed(Date.now() - worker.since);
         } else {
           const clock = new Date(worker.settledAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hourCycle: "h23" });
-          time.textContent = worker.completedAt === undefined && worker.settledAt === worker.since ? `Started ${clock}` : clock;
+          time.textContent = worker.completedAt !== undefined ? clock : worker.terminalReportedAt !== undefined ? `Reported ${clock}` : worker.settledAt === worker.since ? `Started ${clock}` : clock;
         }
-        if (!workerIsActive(worker.state) || worker.kind === "shell") meta.append(" · ", time);
+        if (!workerIsActive(worker.state) || worker.kind === "shell") {
+          const suffix = document.createElement("span");
+          suffix.className = "chat-worker-time";
+          suffix.append(" · ", time);
+          meta.append(suffix);
+        }
       }
+      meta.title = [meta.textContent, workerStateLabel(worker.state), worker.progress].filter(Boolean).join(" · ");
       const model = inspect.querySelector<HTMLElement>(".chat-worker-model")!;
       const modelName = document.createElement("span");
       modelName.className = "chat-worker-model-name";

@@ -115,6 +115,194 @@ async function settleDuringShellConfirmation(page: Page, request: APIRequestCont
   expect((await control(request, { op: "state" })).calls.filter((call: string) => call.startsWith("DELETE /api/shell/"))).toHaveLength(0);
 }
 
+for (const engine of ["chromium", "webkit"] as const) for (const layout of ["touch", "desktop", "wide desktop"] as const) {
+  const touch = layout === "touch";
+  const wide = layout === "wide desktop";
+  const width = touch ? 320 : wide ? 1920 : 1280;
+  test(`native report clocks preserve ordering and contained controls: ${engine} ${layout}`, async ({ launchBrowser, request, baseURL }, info) => {
+    const browser = await launchBrowser(engine);
+    const page = await browser.newPage({ baseURL, viewport: { width, height: 844 }, hasTouch: touch, isMobile: touch });
+    try {
+      if (wide) await page.addInitScript(() => localStorage.setItem("uatu:presentation:v1:%2F:uatu:chat-panel", JSON.stringify({ open: true, fraction: 0.95 })));
+      const conversationId = await boot(page, request);
+      const shell = await control(request, { op: "launchShell", conversationId });
+      const worker = await control(request, { op: "launchWorker", conversationId });
+      const active = await control(request, { op: "launchWorker", conversationId });
+      await revealTouchWorkers(page);
+      const track = page.locator("#chat-compact-workers");
+      const activeRow = activeTask(page, active.taskId);
+      const inspect = activeRow.locator(".chat-worker-inspect");
+      const stop = activeRow.locator("[data-stop-task]");
+      await stop.focus();
+      const original = await stop.elementHandle();
+      await control(request, { op: "settleWorker", childId: worker.childId, text: "Safe native report" });
+      await expect(track.locator(`[data-background-task="${worker.taskId}"] .chat-worker-meta`)).toContainText(/Reported \d{2}:\d{2}/);
+      await control(request, { op: "shellPhase", shellId: shell.shellId, shellPhase: "capture" });
+      const assertReports = async () => {
+        await expect(page.locator("html")).toHaveAttribute("data-ui-mode", touch ? "touch" : "desktop");
+        const workWidth = await page.locator("#chat-work-dock").evaluate(node => node.clientWidth);
+        if (wide) {
+          expect(workWidth).toBeGreaterThanOrEqual(640);
+          expect(await page.evaluate(() => matchMedia("(pointer: fine)").matches)).toBe(true);
+        } else expect(workWidth).toBeLessThan(640);
+        await expect.poll(() => track.locator("[data-background-task]").evaluateAll(nodes => nodes.map(node => (node as HTMLElement).dataset.backgroundTask))).toEqual([active.taskId, shell.taskId, worker.taskId]);
+        for (const taskId of [shell.taskId, worker.taskId]) {
+          const row = track.locator(`[data-background-task="${taskId}"]`);
+          const meta = row.locator(".chat-worker-meta");
+          await expect(meta).toContainText(/Reported \d{2}:\d{2}/);
+          // Opposite explicit expectations are negative controls: hidden
+          // finished metadata is intentional except in a genuinely wide pane.
+          if (wide) {
+            await expect(meta).toBeVisible();
+            const clock = meta.locator(".chat-worker-clock");
+            await expect(clock).toHaveText(/^Reported \d{2}:\d{2}$/);
+            const glyphs = await clock.evaluate(node => {
+              const range = document.createRange(); range.selectNodeContents(node);
+              const meta = node.closest(".chat-worker-meta")!.getBoundingClientRect();
+              const rects = [...range.getClientRects()].map(rect => rect.toJSON());
+              return { text: node.textContent, meta: meta.toJSON(), rects, contained: rects.length === 1 && rects.every(rect => rect.left >= meta.left && rect.right <= meta.right && rect.top >= meta.top && rect.bottom <= meta.bottom) };
+            });
+            await info.attach(`native-clock-${taskId.replaceAll(":", "-")}.json`, { body: JSON.stringify(glyphs, null, 2), contentType: "application/json" });
+            expect(glyphs.contained, JSON.stringify(glyphs)).toBe(true);
+          } else {
+            await expect(meta).not.toBeVisible();
+            expect(await meta.evaluate(node => getComputedStyle(node).display)).toBe("none");
+          }
+          await expect(row.locator("[data-stop-task]")).toHaveCount(0);
+          await expect(row.locator(".chat-worker-inspect")).toBeVisible();
+          const geometry = await row.evaluate(node => {
+            const inspect = node.querySelector(".chat-worker-inspect")!;
+            const name = node.querySelector(".chat-worker-name")!;
+            const model = node.querySelector(".chat-worker-model")!;
+            const css = getComputedStyle(node);
+            return { row: node.getBoundingClientRect().height, inspect: inspect.getBoundingClientRect().height,
+              top: parseFloat(css.borderTopWidth), bottom: parseFloat(css.borderBottomWidth),
+              nameTop: name.getBoundingClientRect().top, modelTop: model.getBoundingClientRect().top,
+              modelRow: getComputedStyle(model).gridRowStart };
+          });
+          expect(geometry.top).toBe(1);
+          expect(geometry.row).toBe(geometry.inspect + geometry.top + geometry.bottom);
+          if (wide) {
+            expect(geometry.inspect).toBeLessThanOrEqual(28);
+            expect(geometry.row).toBeLessThanOrEqual(29);
+          } else {
+            expect(workWidth).toBeLessThanOrEqual(384);
+            expect(geometry.modelRow).toBe("2");
+            expect(geometry.modelTop).toBeGreaterThan(geometry.nameTop);
+            expect(geometry.row).toBeLessThanOrEqual(48);
+          }
+          const contained = await row.evaluate(node => {
+            const row = node.getBoundingClientRect();
+            return [...node.querySelectorAll(".chat-worker-inspect")].every(part => {
+              const box = part.getBoundingClientRect();
+              return box.left >= row.left - 1 && box.right <= row.right + 1 && box.top >= row.top - 1 && box.bottom <= row.bottom + 1 && part.scrollWidth <= part.clientWidth + 1;
+            });
+          });
+          expect(contained).toBe(true);
+        }
+        const a = (await inspect.boundingBox())!;
+        const b = (await stop.boundingBox())!;
+        expect(b.x - a.x - a.width).toBeGreaterThanOrEqual(8);
+        expect(b.height).toBeGreaterThanOrEqual(touch ? 44 : 28);
+        expect(a.height).toBeGreaterThanOrEqual(touch ? 44 : 28);
+        expect(b.x + b.width).toBeLessThanOrEqual(width);
+      };
+      await assertReports();
+      await expect(stop).toBeFocused();
+      expect(await stop.evaluate((node, original) => node === original, original)).toBe(true);
+      await captureScreenshot(page, info, `native-report-${engine}-${layout.replaceAll(" ", "-")}`);
+      await page.reload();
+      await expect(page.locator("#chat-conversation-select")).toHaveValue(conversationId);
+      await revealTouchWorkers(page);
+      await assertReports();
+      await inspect.click();
+      await expect(page.locator("#chat-drilldown-items")).toContainText("Check fixture");
+    } finally { await page.close(); await browser.close(); }
+  });
+}
+
+for (const engine of ["chromium", "webkit"] as const) test(`reported caption keeps its full suffix with a long kind and enlarged text: ${engine}`, async ({ launchBrowser, request, baseURL }, info) => {
+  const browser = await launchBrowser(engine);
+  const page = await browser.newPage({ baseURL, viewport: { width: 1920, height: 1000 }, timezoneId: "UTC" });
+  try {
+    await page.addInitScript(() => {
+      localStorage.setItem("uatu:presentation:v1:%2F:uatu:chat-panel", JSON.stringify({ open: true, fraction: 0.95 }));
+      localStorage.setItem("uatu:presentation:v1:%2F:uatu:ui-mode", "desktop");
+    });
+    await request.post("/__e2e/reset");
+    await request.post("/__e2e/chat", { data: { action: "agents", count: 2 } });
+    const agent = "synthetic-long-agent-kind-with-no-breaks".repeat(8);
+    const report = Date.UTC(2026, 9, 22, 19, 43);
+    const seed = await request.post("/__e2e/chat", { data: { action: "seed", agent: "claude", title: "Synthetic long report caption", items: [{
+      id: "long-report", type: "background_task", taskId: "long-report", taskType: "agent", description: "Synthetic worker report", subagentType: agent,
+      status: "completed", createdAt: report - 60_000, terminalReportedAt: report, usage: { totalTokens: 230000, toolUses: 1, durationMs: 60000 },
+      workerSession: { model: "Fixture Model", effort: "high", costUsd: 0.0012 },
+    }] } });
+    expect(seed.ok()).toBe(true);
+    const { token } = await request.get("/__e2e/terminal-token").then(response => response.json());
+    await page.goto(`/?t=${encodeURIComponent(token)}`);
+    await openChatPanel(page);
+    await openChatWorkers(page);
+    const row = page.locator('[data-worker-id="long-report"]');
+    const meta = row.locator(".chat-worker-meta");
+    const work = page.locator("#chat-work-dock");
+    const initialWork = await work.evaluate(node => node.clientWidth);
+    // Exercise the real pane at its existing rem-based wide threshold too.
+    const thresholdViewport = 1920 - initialWork + 640;
+    for (const scene of [
+      { name: "wide", width: 1920, font: 16, wide: true },
+      { name: "wide-threshold", width: thresholdViewport, font: 16, wide: true },
+      { name: "narrow", width: 1280, font: 16, wide: false },
+      { name: "enlarged-fallback", width: 1920, font: 32, wide: false },
+      { name: "enlarged-wide", width: 3200, font: 32, wide: true },
+    ]) {
+      await page.setViewportSize({ width: scene.width, height: 1000 });
+      await page.evaluate(font => { document.documentElement.style.fontSize = `${font}px`; }, scene.font);
+      await expect(page.locator("html")).toHaveAttribute("data-ui-mode", "desktop");
+      await expect(row.locator(".chat-worker-model-name")).toHaveText("Fixture Model");
+      await expect(row.locator(".chat-worker-effort")).toHaveText("high");
+      await expect(row.locator(".chat-worker-tokens")).toHaveText("Σ 230k");
+      await expect(row.locator(".chat-worker-cost")).toHaveText("$0.0012");
+      await expect(meta).toHaveText(`${agent} · Reported 19:43`);
+      await expect(meta).toHaveAttribute("title", `${agent} · Reported 19:43 · finished`);
+      const workWidth = await work.evaluate(node => node.clientWidth);
+      if (scene.wide) {
+        expect(workWidth).toBeGreaterThanOrEqual(40 * scene.font);
+        if (scene.name === "wide-threshold") expect(workWidth).toBeLessThanOrEqual(642);
+        await expect(meta).toBeVisible();
+        const geometry = await meta.evaluate(node => {
+          const box = node.getBoundingClientRect();
+          const clock = node.querySelector(".chat-worker-clock")!;
+          const kind = node.querySelector(".chat-worker-kind")!;
+          const range = document.createRange(); range.selectNodeContents(clock);
+          const rects = [...range.getClientRects()].map(rect => rect.toJSON());
+          return { meta: box.toJSON(), rects, font: getComputedStyle(node).fontSize,
+            kindElides: kind.scrollWidth > kind.clientWidth && getComputedStyle(kind).textOverflow === "ellipsis",
+            contained: rects.length === 1 && rects.every(rect => rect.left >= box.left && rect.right <= box.right && rect.top >= box.top && rect.bottom <= box.bottom) };
+        });
+        await info.attach(`long-kind-${scene.name}.json`, { body: JSON.stringify(geometry, null, 2), contentType: "application/json" });
+        expect(geometry.font).toBe(`${0.8125 * scene.font}px`);
+        expect(geometry.kindElides).toBe(true);
+        expect(geometry.contained, JSON.stringify(geometry)).toBe(true);
+        expect((await row.locator(".chat-worker-inspect").boundingBox())!.height).toBeLessThanOrEqual(scene.font === 16 ? 28 : 44);
+      } else {
+        expect(workWidth).toBeLessThan(40 * scene.font);
+        await expect(meta).not.toBeVisible();
+        expect(await meta.evaluate(node => getComputedStyle(node).display)).toBe("none");
+      }
+      const contained = await row.evaluate(node => {
+        const row = node.getBoundingClientRect();
+        return [...node.querySelectorAll(".chat-worker-inspect, .chat-worker-name, .chat-worker-model, .chat-worker-tokens, .chat-worker-cost")].every(part => {
+          const box = part.getBoundingClientRect();
+          return box.left >= row.left && box.right <= row.right && box.right <= innerWidth;
+        });
+      });
+      expect(contained).toBe(true);
+      await captureScreenshot(page, info, `long-kind-${engine}-${scene.name}`);
+    }
+  } finally { await page.close(); await browser.close(); }
+});
+
 test("settlement during shell confirmation restores the surviving inspection action", async ({ page, request }, testInfo) => {
   await settleDuringShellConfirmation(page, request);
   await captureScreenshot(page, testInfo, "review-shell-confirmation-focus-desktop");

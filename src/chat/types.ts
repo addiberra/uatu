@@ -763,6 +763,10 @@ export type BackgroundTaskItem = TimelineItemBase & {
   // Structured provider notification identity; deduplicates provisional/live
   // results against the same notification recovered with its launcher.
   resultId?: string;
+  // Provider clock for a terminal report (Unix epoch ms), not execution end.
+  // V2 live admission and stored delivery can differ. Absent without a valid
+  // provider clock; never filled from local receipt time or a zero fallback.
+  terminalReportedAt?: number;
   // Additional tool calls proven to share this worker occurrence. Each tool
   // remains a separate task/cost row; this worker is counted only once.
   toolUseIds?: string[];

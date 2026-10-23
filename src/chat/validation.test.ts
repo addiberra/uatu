@@ -46,6 +46,18 @@ test("tool and command completion timestamps are optional finite non-negative nu
   }
 });
 
+test("background terminal report timestamps are optional finite non-negative facts, not completion", () => {
+  const item = { id: "t", type: "background_task", taskId: "t", createdAt: 0, description: "Worker", status: "completed" } as const;
+  expect(parseConversationItem(item)).toEqual(item);
+  for (const terminalReportedAt of [0, 1, 1_789_466_400_000]) {
+    expect(parseConversationItem({ ...item, terminalReportedAt })).toEqual({ ...item, terminalReportedAt });
+  }
+  for (const terminalReportedAt of [null, -1, NaN, Infinity, "2026-09-15T10:00:00Z", true]) {
+    expect(() => parseConversationItem({ ...item, terminalReportedAt })).toThrow("terminalReportedAt must be a timestamp");
+  }
+  expect(() => parseConversationItem({ ...item, completedAt: 1 })).toThrow();
+});
+
 const summary = {
   id: "opencode:session-1",
   title: "Implement chat",

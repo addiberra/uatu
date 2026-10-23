@@ -42,6 +42,40 @@ type Inventory = { operations: Array<{ operationId: string; domain: string; meth
 type Streaming = { channels: Record<string, unknown>; schemas: Record<string, object> };
 
 describe("API contract structure", () => {
+  test("background terminal report clocks agree across closed wire validators and retain absence", async () => {
+    const { parseConversationItem, parseChatEvent } = await import("../src/chat/validation");
+    const spec = await readYaml<{ components: { schemas: Record<string, object> } }>("api/openapi.yaml");
+    const validate = createAjv().compile(schemaForAjv(spec.components.schemas.ConversationItem, spec.components.schemas));
+    const legacy = { id: "worker", type: "background_task", taskId: "worker", description: "Worker", status: "completed", createdAt: 0 };
+    expect(validate(legacy)).toBe(true);
+    expect(parseConversationItem(legacy)).toEqual(legacy);
+    for (const terminalReportedAt of [0, 40]) {
+      const item = { ...legacy, terminalReportedAt };
+      expect(validate(item), JSON.stringify(validate.errors)).toBe(true);
+      expect(parseConversationItem(item)).toEqual(item);
+      const event = { generation: "generation", sequence: 1, conversationId: "opencode:parent", type: "item.upsert", item };
+      expect(parseChatEvent(event)).toEqual(event);
+    }
+    for (const terminalReportedAt of [null, -1, "40", true]) {
+      expect(validate({ ...legacy, terminalReportedAt })).toBe(false);
+      expect(() => parseConversationItem({ ...legacy, terminalReportedAt })).toThrow();
+    }
+    // NaN/Infinity are not JSON wire numbers. Check the runtime guard too;
+    // the repository's non-strict Ajv intentionally accepts JS Infinity.
+    for (const terminalReportedAt of [NaN, Infinity]) expect(() => parseConversationItem({ ...legacy, terminalReportedAt })).toThrow();
+    expect(validate({ ...legacy, completedAt: 40 })).toBe(false);
+    // Revision 29's closed background item cannot accept this optional field.
+    const schema = spec.components.schemas.ConversationItem as { oneOf: Array<{ properties?: Record<string, unknown> }> };
+    const previous = { ...schema, oneOf: schema.oneOf.map(variant => {
+      if (!variant.properties?.terminalReportedAt) return variant;
+      const { terminalReportedAt: _clock, ...properties } = variant.properties;
+      return { ...variant, properties };
+    }) };
+    const old = createAjv().compile(schemaForAjv(previous, spec.components.schemas));
+    expect(old(legacy)).toBe(true);
+    expect(old({ ...legacy, terminalReportedAt: 40 })).toBe(false);
+  });
+
   test("pending submission identity agrees across closed wire validators without becoming a client receipt", async () => {
     const { parseQueuedMessages, parseChatEvent } = await import("../src/chat/validation");
     const spec = await readYaml<{ components: { schemas: Record<string, object> } }>("api/openapi.yaml");

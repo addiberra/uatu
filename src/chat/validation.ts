@@ -539,7 +539,8 @@ export function parseConversationItem(value: unknown): ConversationItem {
       expectContextWindow(record.window);
       break;
     case "background_task":
-      expectKeys(record, ["id", "type", "createdAt", "taskId", "description", "taskType", "toolUseId", "status", "progress", "summary", "subagentType", "prompt", "usage", "outputFile", "childConversationId", "foreground", "stateUncertain", "resultId", "toolUseIds", "workerSession"], type);
+      expectKeys(record, ["id", "type", "createdAt", "taskId", "description", "taskType", "toolUseId", "status", "progress", "summary", "subagentType", "prompt", "usage", "outputFile", "childConversationId", "foreground", "stateUncertain", "resultId", "toolUseIds", "workerSession", "terminalReportedAt"], type);
+      expectOptionalTimestamp(record.terminalReportedAt, "terminalReportedAt");
       expectWorkerSession(record.workerSession);
       if (record.stateUncertain !== undefined && typeof record.stateUncertain !== "boolean") throw new Error("background task uncertainty must be a boolean");
       expectOptionalIdentity(record.resultId, "background result id");

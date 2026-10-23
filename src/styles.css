@@ -11070,11 +11070,14 @@ html[data-ui-mode="touch"] .chat-surface:has(#chat-work-dock > details[open]:not
   }
   @container chat-work (min-width: 40rem) {
     html[data-ui-mode="desktop"] .chat-worker-row:is([data-state]) .chat-worker-inspect {
-      min-height: 28px; grid-template-columns: 12px minmax(48px, 12%) minmax(0, 1fr) minmax(100px, 25%) 52px 62px; grid-template-rows: auto; padding-block: 2px; column-gap: 8px;
+      min-height: 28px; grid-template-columns: 12px minmax(9rem, 12%) minmax(0, 1fr) minmax(100px, 25%) 52px 62px; grid-template-rows: auto; padding-block: 2px; column-gap: 8px;
     }
     html[data-ui-mode="desktop"] .chat-worker-row:is([data-state]) .chat-worker-inspect > span { grid-row: 1; }
     html[data-ui-mode="desktop"] .chat-worker-row:is([data-state]) .chat-worker-glyph { grid-column: 1; }
-    html[data-ui-mode="desktop"] .chat-worker-row:is([data-state]) .chat-worker-meta { display: block; grid-column: 2; }
+    /* Reserve the clock's provenance; only the bounded kind prefix may elide. */
+    html[data-ui-mode="desktop"] .chat-worker-row:is([data-state]) .chat-worker-meta { display: flex; grid-column: 2; }
+    html[data-ui-mode="desktop"] .chat-worker-kind { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+    html[data-ui-mode="desktop"] .chat-worker-time { flex: 0 0 auto; white-space: pre; }
     html[data-ui-mode="desktop"] .chat-worker-row:is([data-state]) .chat-worker-name { grid-column: 3; }
     html[data-ui-mode="desktop"] .chat-worker-row:is([data-state]) .chat-worker-model { grid-column: 4; }
     html[data-ui-mode="desktop"] .chat-worker-row:is([data-state]) .chat-worker-tokens { grid-column: 5; }

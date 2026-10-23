@@ -1,8 +1,46 @@
 import { expect, spyOn, test } from "bun:test";
 import { BackgroundWorkers } from "./background";
 import fc from "fast-check";
+import { compactWorkers } from "../../compact-work";
+import type { ConversationItem } from "../../types";
 
 const launch = (id: string, worker = id, command = "fixture") => ({ id, name: "shell", state: { status: "completed", input: { command }, metadata: { status: "running", shellID: worker } } });
+
+test.each(["shell", "subagent"])("native %s results sort newest report first, not newest launch", kind => {
+  const workers = new BackgroundWorkers();
+  const items = new Map<string, ConversationItem>();
+  const apply = (updates: ReturnType<BackgroundWorkers["launch"]> = []) => {
+    for (const update of updates) {
+      if (update.kind === "upsert") items.set(update.item.id, update.item);
+      if (update.kind === "remove") items.delete(update.itemId);
+    }
+  };
+  for (const [id, at] of [["long", 10], ["short", 20]] as const) {
+    workers.verifyChild(id, "parent");
+    const part = launch(id);
+    apply(workers.launch("parent", kind === "shell" ? part : { ...part, name: kind, state: { ...part.state, input: { description: "fixture" }, metadata: { sessionID: id, status: "running" } } }, at));
+  }
+  const finish = (id: string, at: number) => apply(workers.notification("parent", `notice-${id}`, { text: "Result", metadata: { source: kind, ...(kind === "shell" ? { shellID: id, exit: 0 } : { childID: id }), state: "completed" } }, at));
+  finish("short", 30);
+  finish("long", 40);
+  expect(compactWorkers([...items.values()]).map(({ name, settledAt }) => [name, settledAt])).toEqual([["fixture", 40], ["fixture", 30]]);
+  expect([...items.values()].filter(item => item.type === "background_task").map(item => item.terminalReportedAt)).toEqual([40, 30]);
+  expect([...items.values()].every(item => !("completedAt" in item) && !("usage" in item))).toBe(true);
+  expect(workers.notification("parent", "notice-long", { text: "duplicate", metadata: { source: kind, shellID: "long", childID: "long", state: "completed" } }, 99)).toEqual([]);
+});
+
+test("a relaunched worker has no previous report clock and duplicate old notices cannot settle it", () => {
+  const workers = new BackgroundWorkers();
+  workers.launch("parent", launch("old", "reused"), 10);
+  const payload = { text: "Done", metadata: { source: "shell", shellID: "reused", state: "completed", exit: 0 } };
+  expect(workers.notification("parent", "old-result", payload, 20)?.[0]).toMatchObject({ item: { status: "completed", terminalReportedAt: 20 } });
+  const next = workers.launch("parent", launch("new", "reused"), 30);
+  expect(next[0]).toMatchObject({ item: { status: "running", createdAt: 30 } });
+  if (next[0]?.kind !== "upsert") throw new Error("expected relaunched item");
+  expect(next[0].item).not.toHaveProperty("terminalReportedAt");
+  expect(workers.notification("parent", "old-result", payload, 40)).toEqual([]);
+  expect(workers.launch("parent", launch("new", "reused"), 50)).toEqual(next);
+});
 
 // Inspect the budget invariant without exposing accounting as provider API.
 function retained(workers: BackgroundWorkers) {

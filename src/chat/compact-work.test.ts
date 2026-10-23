@@ -12,6 +12,30 @@ test("finished tool workers sort by reported completion, not launch time", () =>
   ]);
 });
 
+test("native reports outrank duration and never borrow an aliased launcher's completion", () => {
+  const workers = compactWorkers([
+    { type: "background_task", id: "native", taskId: "native", toolUseId: "launch", description: "Native", status: "completed", createdAt: 10, terminalReportedAt: 40, usage: { durationMs: 900, totalTokens: 1, toolUses: 0 } },
+    { type: "tool", id: "tool:launch", name: "task", status: "completed", input: '{"description":"Launcher"}', createdAt: 10, completedAt: 999 },
+    { type: "tool", id: "foreground", name: "task", status: "completed", input: '{"description":"Foreground"}', createdAt: 20, completedAt: 50 },
+    { type: "background_task", id: "no-report", taskId: "no-report", toolUseId: "other-launch", description: "No report", status: "completed", createdAt: 5 },
+    { type: "tool", id: "tool:other-launch", name: "task", status: "completed", input: '{"description":"Other launcher"}', createdAt: 5, completedAt: 1000 },
+  ]);
+  expect(workers.map(({ id, settledAt }) => [id, settledAt])).toEqual([["foreground", 50], ["native", 40], ["no-report", 5]]);
+  expect(workers[1]).toMatchObject({ terminalReportedAt: 40, references: ["tool:launch"] });
+  expect(workers[1]?.completedAt).toBeUndefined();
+  expect(workers[2]?.completedAt).toBeUndefined();
+  expect(workers[2]?.terminalReportedAt).toBeUndefined();
+});
+
+test("invalid native report clocks fall back to launch without becoming completion evidence", () => {
+  for (const terminalReportedAt of [-1, NaN, Infinity]) {
+    const [worker] = compactWorkers([{ type: "background_task", id: "worker", taskId: "worker", status: "completed", description: "Worker", createdAt: 10, terminalReportedAt }]);
+    expect(worker).toMatchObject({ settledAt: 10 });
+    expect(worker?.terminalReportedAt).toBeUndefined();
+    expect(worker?.completedAt).toBeUndefined();
+  }
+});
+
 test("all terminal outcomes share completion ordering while active and unknown workers remain oldest first", () => {
   const workers = compactWorkers([
     { type: "tool", id: "done", name: "task", input: '{"description":"Done"}', status: "completed", createdAt: 1000, completedAt: 4000 },

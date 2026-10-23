@@ -1,9 +1,9 @@
 openapi: 3.1.0
 info:
   title: UatuCode public API
-  version: 11.29.0-experimental
+  version: 11.30.0-experimental
   license: { name: MIT, identifier: MIT }
-  summary: Hub revision 11 and workspace revision 29
+  summary: Hub revision 11 and workspace revision 30
   description: |
     Canonical HTTP contract for the UatuCode Hub API, the only public API.
     Under `/s/{workspaceId}/` the Hub serves one family itself, personal
@@ -21,7 +21,7 @@ info:
     published snapshot is recorded in that snapshot's `contract.json`.
   x-uatu-revisions:
     hubApiRevision: 11
-    workspaceApiRevision: 29
+    workspaceApiRevision: 30
 servers:
   - url: https://{hubHost}
     variables:
@@ -2386,6 +2386,7 @@ components:
             status: { enum: [running, completed, failed, stopped] }
             stateUncertain: { type: boolean, description: "Last-known state only; current execution is unverified and must not authorize Stop." }
             resultId: { type: string, minLength: 1, maxLength: 512, description: "Provider notification identity, stable across enqueue, delivery and history." }
+            terminalReportedAt: { type: number, minimum: 0, description: "Provider terminal-report clock in Unix epoch milliseconds, not execution completion. OpenCode V2 live events use inbox admission; stored synthetic messages use delivery, so recovery can change this clock and finished ordering. Absent without a valid provider timestamp; zero is valid. Never synthesize from local receipt time, launcher completion or missing-time fallbacks, or infer worker state, duration, usage or cost from it." }
             toolUseIds: { type: array, minItems: 1, items: { type: string, minLength: 1, maxLength: 512 }, description: "Launch calls known to share this worker occurrence; do not count each alias as another running worker." }
             progress: { type: string }
             summary: { type: string, description: "Canonical worker report, not launcher instructions." }

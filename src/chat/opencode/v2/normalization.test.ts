@@ -6,6 +6,7 @@ import { normalizeProviderEvent as normalizeV1 } from "../v1/normalization";
 import { createOpenCodeV2Memory, createOpenCodeV2Normalizer, formFieldToQuestion, normalizeStoredMessage, storedAccounting, type OpenCodeV2Memory } from "./normalization";
 import { parseConversationItem } from "../../validation";
 import type { NormalizedProviderEvent, NormalizedProviderUpdate } from "../../provider";
+import { compactWorkers } from "../../compact-work";
 
 test("only assistant execution metadata reports effort, live and stored, not parent/user selection", () => {
   const normalize = createOpenCodeV2Normalizer(process.cwd());
@@ -44,6 +45,88 @@ function run(events: Array<Record<string, unknown>>, memory: OpenCodeV2Memory = 
 function upserts(entry: NormalizedProviderEvent) {
   return entry.updates.filter((update): update is Extract<NormalizedProviderUpdate, { kind: "upsert" }> => update.kind === "upsert").map(update => update.item);
 }
+
+test("native terminal report clocks retain provider provenance live and stored, including zero but never fallbacks", () => {
+  const normalize = createOpenCodeV2Normalizer(WORKSPACE);
+  for (const kind of ["subagent", "shell"]) for (const stored of [false, true]) for (const noticeFirst of [false, true]) for (const clock of [40, 0, undefined, -1, NaN, Infinity]) {
+    // A shell notice without a known tool launch is indistinguishable from
+    // a user-shell note and intentionally cannot mint a background worker.
+    if (kind === "shell" && noticeFirst) continue;
+    const memory = createOpenCodeV2Memory();
+    memory.workers.verifyChild("child", "parent");
+    const part = { type: "tool", id: "call", name: kind, time: { created: 0, completed: 1 }, state: { status: "completed", input: { description: "Worker", command: "fixture" }, metadata: { status: "running", ...(kind === "shell" ? { shellID: "child" } : { sessionID: "child" }) } } };
+    const payload = { description: "Worker", text: "Result", metadata: { source: kind, state: "completed", ...(kind === "shell" ? { shellID: "child", exit: 0 } : { childID: "child" }) } };
+    const launch = () => stored
+      ? normalizeStoredMessage({ id: "launch", type: "assistant", time: { created: 0 }, content: [part] }, false, { workers: memory.workers, parent: "parent" })
+      : upserts(normalize({ id: "launch", type: "session.message.content.updated", created: 1, data: { sessionID: "parent", messageID: "launch", content: [part] } }, memory));
+    const notice = () => stored
+      ? normalizeStoredMessage({ id: "result", type: "synthetic", time: { created: clock }, ...payload }, false, { workers: memory.workers, parent: "parent" })
+      : upserts(normalize({ id: "result-event", type: "session.inbox.enqueued", created: clock, data: { sessionID: "parent", inboxID: "result", item: { type: "synthetic", payload } } }, memory));
+    if (!noticeFirst) launch();
+    const reported = notice().find(item => item.type === "background_task");
+    expect(reported).toBeDefined();
+    const valid = clock !== undefined && Number.isFinite(clock) && clock >= 0;
+    if (valid) expect(reported).toHaveProperty("terminalReportedAt", clock);
+    else expect(reported).not.toHaveProperty("terminalReportedAt");
+    expect(reported).not.toHaveProperty("completedAt");
+    expect(reported).not.toHaveProperty("usage");
+    if (noticeFirst) {
+      const correlated = launch().find(item => item.type === "background_task");
+      expect(correlated).toMatchObject({ status: "completed", resultId: "result" });
+      if (valid) expect(correlated).toHaveProperty("terminalReportedAt", clock);
+      else expect(correlated).not.toHaveProperty("terminalReportedAt");
+    }
+  }
+});
+
+test.each(["shell", "subagent"])("%s recovery uses stored delivery report time, not launcher end or an invented execution end", kind => {
+  const normalize = createOpenCodeV2Normalizer(WORKSPACE);
+  const memory = createOpenCodeV2Memory();
+  memory.workers.verifyChild("child", "parent");
+  const content = [{ type: "tool", id: "call", name: kind, time: { created: 10, completed: 12 }, state: { status: "completed", input: { description: "Worker", command: "fixture" }, metadata: { status: "running", ...(kind === "shell" ? { shellID: "child" } : { sessionID: "child" }) } } }];
+  const payload = { text: "Result", metadata: { source: kind, state: "completed", ...(kind === "shell" ? { shellID: "child", exit: 0 } : { childID: "child" }) } };
+  const launch = () => normalize({ id: "launch", type: "session.message.content.updated", created: 12, data: { sessionID: "parent", messageID: "launch", content } }, memory);
+  const notice = (created?: number) => normalize({ id: "report-event", type: "session.inbox.enqueued", created, data: { sessionID: "parent", inboxID: "result", item: { type: "synthetic", payload } } }, memory);
+  launch();
+  const live = compactWorkers(upserts(notice(40)))[0];
+  expect(live).toMatchObject({ since: 10, settledAt: 40, terminalReportedAt: 40 });
+  expect(live?.completedAt).toBeUndefined();
+
+  // A new projection is authoritative history recovery, not reuse of the live
+  // receipt clock. V2 stores the report's later delivery time in this record.
+  const recovered = createOpenCodeV2Memory();
+  recovered.workers.verifyChild("child", "parent");
+  const background = { workers: recovered.workers, parent: "parent" };
+  normalizeStoredMessage({ id: "launch", type: "assistant", time: { created: 12 }, content }, false, background);
+  const stored = normalizeStoredMessage({ id: "result", type: "synthetic", time: { created: 80 }, ...payload }, false, background);
+  expect(compactWorkers(stored)[0]).toMatchObject({ since: 10, settledAt: 80, terminalReportedAt: 80 });
+  expect(stored[0]).not.toHaveProperty("completedAt");
+
+  const missing = createOpenCodeV2Memory();
+  missing.workers.verifyChild("child", "parent");
+  normalize({ id: "launch", type: "session.message.content.updated", created: 12, data: { sessionID: "parent", messageID: "launch", content } }, missing);
+  const result = normalize({ id: "missing-time", type: "session.inbox.enqueued", data: { sessionID: "parent", inboxID: "result", item: { type: "synthetic", payload } } }, missing);
+  const [fallback] = compactWorkers(upserts(result));
+  expect(fallback).toMatchObject({ since: 10, settledAt: 10, state: "completed" });
+  expect(fallback?.terminalReportedAt).toBeUndefined();
+  expect(fallback?.completedAt).toBeUndefined();
+});
+
+test("a result-only native notice never presents receipt time as an unknown launch or finish", () => {
+  const normalize = createOpenCodeV2Normalizer(WORKSPACE);
+  for (const stored of [false, true]) for (const clock of [undefined, 40]) {
+    const memory = createOpenCodeV2Memory();
+    memory.workers.verifyChild("child", "parent");
+    const payload = { text: "Result", metadata: { source: "subagent", childID: "child", state: "completed" } };
+    const items = stored
+      ? normalizeStoredMessage({ id: "result", type: "synthetic", time: { created: clock }, ...payload }, false, { workers: memory.workers, parent: "parent" })
+      : upserts(normalize({ id: "notice", type: "session.inbox.enqueued", created: clock, data: { sessionID: "parent", inboxID: "result", item: { type: "synthetic", payload } } }, memory));
+    const [worker] = compactWorkers(items);
+    expect(worker).toMatchObject({ since: 0, settledAt: clock ?? 0 });
+    expect(worker?.completedAt).toBeUndefined();
+    expect(worker?.terminalReportedAt).toBe(clock);
+  }
+});
 
 describe("OpenCode 2.0.29 independent background lifecycle", () => {
   const fixture = JSON.parse(readFileSync(path.join(import.meta.dir, "../../../../tests/fixtures/opencode-v2/background-2.0.29.json"), "utf8"));

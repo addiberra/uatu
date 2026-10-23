@@ -59,10 +59,11 @@ export type CompactWorker = {
   kind: "agent" | "shell";
   agent?: string;
   since: number;
-  // Sort clock: reported completion, latest reported execution, or launch.
+  // Sort clock: execution completion, terminal report, duration, or launch.
   settledAt: number;
   // Preserve terminal-clock provenance even when it equals launch (or zero).
   completedAt?: number;
+  terminalReportedAt?: number;
   progress?: string;
   taskId?: string;
   stoppable?: boolean;
@@ -81,13 +82,17 @@ export function compactWorkers(items: readonly ConversationItem[]): CompactWorke
   for (const item of items) {
     if (item.type !== "background_task") continue;
     if (item.foreground && shellTask(item.taskType)) continue;
-     workers.set(item.id, {
-       id: item.id, state: workerState(item.status, item.stateUncertain), references: [],
-       name: item.description, kind: shellTask(item.taskType) ? "shell" : "agent", agent: item.subagentType,
-       since: item.createdAt, settledAt: item.createdAt + (item.usage?.durationMs ?? 0),
-        progress: item.progress, taskId: item.taskId, stoppable: !item.foreground && taskById(items, item.taskId)?.id === item.id, conversationId: item.childConversationId,
-        tokens: item.usage?.totalTokens,
-     });
+    const terminalReportedAt = item.terminalReportedAt !== undefined && Number.isFinite(item.terminalReportedAt) && item.terminalReportedAt >= 0 ? item.terminalReportedAt : undefined;
+    // A provisional result has a row timestamp, not a known launch. In
+    // particular its local display fallback must not become a worker clock.
+    const since = item.resultId && !item.toolUseId && !item.toolUseIds?.length ? 0 : item.createdAt;
+    workers.set(item.id, {
+      id: item.id, state: workerState(item.status, item.stateUncertain), references: [],
+      name: item.description, kind: shellTask(item.taskType) ? "shell" : "agent", agent: item.subagentType,
+      since, settledAt: terminalReportedAt ?? since + (item.usage?.durationMs ?? 0), terminalReportedAt,
+      progress: item.progress, taskId: item.taskId, stoppable: !item.foreground && taskById(items, item.taskId)?.id === item.id, conversationId: item.childConversationId,
+      tokens: item.usage?.totalTokens,
+    });
   }
   for (const entry of subagentEntries(items)) {
     // Only proven launcher aliases can merge occurrences. A child can run

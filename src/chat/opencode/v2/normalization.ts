@@ -218,7 +218,7 @@ export function createOpenCodeV2Mapper(directory: string): GenerationMapper<Open
           return { conversationId, updates: [{ kind: "inbox", delta }] };
         }
         if (item.type === "synthetic") {
-          const workers = conversationId ? memory?.workers.notification(conversationId, messageId, payload, createdAt) : undefined;
+          const workers = conversationId ? memory?.workers.notification(conversationId, messageId, payload, Math.max(0, createdAt), number(event.created) ?? null) : undefined;
           if (workers) return { conversationId, updates: workers };
           // A shell command's transcript is delivered to the model as a
           // synthetic note; the command item already shows it.
@@ -670,7 +670,7 @@ export function normalizeStoredMessage(value: unknown, mintUsageCarrier = true, 
       }];
     }
     case "synthetic": {
-      const workers = background?.workers.notification(background.parent, id, message, createdAt);
+      const workers = background?.workers.notification(background.parent, id, message, Math.max(0, createdAt), number(record(message.time).created) ?? null);
       if (workers) return workers.flatMap(update => update.kind === "upsert" ? [update.item] : []);
       // A shell transcript's note to the model is already the command item.
       if (optionalString(record(message.metadata).source) === "shell") return [];

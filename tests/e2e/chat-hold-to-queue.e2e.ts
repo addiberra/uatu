@@ -468,8 +468,10 @@ test("failed side inference retains the question without changing a newer draft 
   expect(calls).toBe(1);
 });
 async function boot(page: Page, request: APIRequestContext, start = true, native = true) {
-  await request.post("/__e2e/reset");
-  await request.post("/__e2e/chat", { data: { action: "agents", ...(native ? { stack: "opencode-v2", backgroundPreview: true } : {}) } });
+  const reset = await request.post("/__e2e/reset");
+  expect(reset.status()).toBe(200);
+  const agents = await request.post("/__e2e/chat", { data: { action: "agents", ...(native ? { stack: "opencode-v2", backgroundPreview: true } : {}) } });
+  expect(agents.status()).toBe(200);
   const { token } = await request.get("/__e2e/terminal-token").then(response => response.json());
   await page.goto(`/?t=${encodeURIComponent(token)}`);
   if (await page.locator("html").getAttribute("data-ui-mode") === "touch") await page.locator("#touch-tab-chat").click();
