@@ -311,7 +311,7 @@ test.describe("chat panels and navigation", () => {
     await expect(track.locator("summary")).toContainText("1 working · 1 finished");
     await expect(page.locator('[data-chat-item-id="part:parent"] [data-chat-copy="answer"]')).toHaveCount(0);
 
-    await expect(track).not.toHaveAttribute("open", "");
+    await expect(track).toHaveAttribute("open", "");
     await openChatWorkers(page);
     await expect(track.locator("li")).toHaveCount(2);
     const inspect = track.locator('.chat-worker-row[data-worker-id="tool:agent1"] .chat-worker-inspect');

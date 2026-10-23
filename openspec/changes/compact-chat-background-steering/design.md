@@ -1,3 +1,21 @@
+## Approved desktop auto-expansion (2026-10-23, review round 12)
+
+The user chose desktop auto-expansion, not initially collapsed cards in both
+modes. Selected `data-ui-mode`, not pointer-density media queries, owns this
+policy. Workers opens when visible working/unknown work first appears; Pending
+opens for any nonempty batch, including paused entries. Manual collapse holds
+while that card's current batch remains active/nonempty, even as more items
+arrive. Empty ends the batch veto; the next batch opens. Settlement leaves the
+current open state alone; finished-only history does not invent a new run.
+Touch starts collapsed and opens only deliberately. Keep separate mode choices
+in the existing bounded, 200-conversation page cache, retaining them on reselection
+without leaking between conversations or treating a mode change as a gesture.
+Null selection during refresh is not work ending. Observe actual native details
+state before repaint, so a human click cannot be overwritten before its deferred
+toggle arrives; matching programmatic echoes do not create manual choices.
+Keep the canonical flat worker card, pending counts, safety, focus, reading
+anchors, independent pane offsets and measured capacity unchanged.
+
 ## Approved fixed Steer default (2026-10-22, review round 4)
 
 The user explicitly removed the configurable-default requirement. Desktop Enter
@@ -233,7 +251,7 @@ See proposal.md, “Why”. This is a planning-only successor to the two active 
 
 ### D1. Touch has two compact disclosures, not smaller action targets
 
-Use a single pending disclosure with aggregate counts and ordered steer/queue details, and a single worker disclosure folding foreground/background subagent and native shell occurrences. Hide empty summaries. Both start collapsed on touch; new jobs, settlement and hydration update text without opening them. Explicit expansion/collapse is retained per conversation for the current page, survives repaint/reselection/viewport transitions and does not leak between conversations. Desktop keeps established auto-disclosure and task/subagent presentation.
+Use a single pending disclosure with aggregate counts and ordered steer/queue details, and a single worker disclosure folding foreground/background subagent and native shell occurrences. Hide empty summaries. Both start collapsed on touch; new jobs, settlement and hydration update text without opening them. Explicit expansion/collapse is retained per conversation for the current page, survives repaint/reselection/viewport transitions and does not leak between conversations. Desktop uses the same canonical cards and the explicit new-batch auto-expansion policy above, not duplicate task/subagent presentations.
 
 The worker summary and keyed rows consume the same canonical execution projection, not separate desktop widgets re-parented into touch. Ordinary foreground shell tools/commands are not workers; background shell tasks are. `finished` means confirmed terminal (completed/failed/stopped), not necessarily successful. Expanded rows show one flat list: live/unknown work first, then newest-first finished work, with single-line inspection, state-specific glyphs, 14px names/11px metadata and separate Stop worker targets. Historical launch/cost distinctions remain in the timeline and inspection. Unknown state is separately named and never included in confirmed working/finished counts. Use retained projection/history, not an all-history fetch per repaint or a new lifecycle store; older paged results remain reachable in the timeline.
 
@@ -245,7 +263,7 @@ Composer and worker Stop targets remain ≥44×44px with ≥8px separation betwe
 
 Alternative rejected: shrinking rows/buttons or leaving two auto-expanded worker lists; either sacrifices touch safety or keeps the original density problem.
 
-Desktop keeps its existing tracks/disclosure defaults inside one aggregate budget based on measured panel height, capped at 40%/25rem while the transcript reserves min(12rem, 35%). Non-empty work reserves max(52px, 3.25rem) for a complete action and visible focus ring; long transcript content yields to that floor rather than proportionally crushing the work viewport. If fixed chrome makes that minimum infeasible, Show work opens a non-modal sheet above the composer, with Close work/Escape restoring the entry and existing modal/inspection Escape precedence preserved. Focus correction scrolls only work ancestors; new replacement consequences reveal once after composer layout settles, without overriding subsequent deliberate scrolling.
+Desktop keeps its new-batch auto-disclosure defaults inside one aggregate budget based on measured panel height, capped at 40%/25rem while the transcript reserves min(12rem, 35%). Non-empty work reserves max(52px, 3.25rem) for a complete action and visible focus ring; long transcript content yields to that floor rather than proportionally crushing the work viewport. If fixed chrome makes that minimum infeasible, Show work opens a non-modal sheet above the composer, with Close work/Escape restoring the entry and existing modal/inspection Escape precedence preserved. Focus correction scrolls only work ancestors; new replacement consequences reveal once after composer layout settles, without overriding subsequent deliberate scrolling.
 
 ### D2. Dedicated personal Hub preference, synchronized without client authority
 
@@ -326,7 +344,7 @@ Alternative rejected: propagate background failure as prompt failure, roll back 
 
 The new `opencode-chat` additions explicitly narrow two active-change contracts: the earlier blanket “sending SHALL NOT implicitly background work” excludes the approved Hub automatic-steer case; touch automatic task expansion is replaced by collapsed summaries. Existing desktop behavior, queue/admission, worker lifecycle, stop/output safety, strict validators and API freshness remain. Prerequisite changes must be synced/archived before this successor, then their contradictory sentences/scenarios reconciled to these explicit scoped exceptions without dropping unaffected clauses. This is recorded now; do not edit their dirty artifacts during this planning workflow.
 
-Implement in vertical test-first slices: persistence/auth; authenticated context and policy isolation; composite action ordering/receipts; then compact presentation and geometry. Extend existing Hub integration/proxy/auth tests and `tests/e2e/opencode-v2-fake.ts` through the real provider/service/adapter, not only UI mocks. Script both transport-loss boundaries, resume batch/cancellation races, delayed acceptance, no eligible jobs, changing blockers, partial failure, late settlement, receipt expiry/eviction/recreation and two accounts sharing a workspace. Add direct child spoofing/base-path/foreign-parent tests. Preserve all meaningful mobile audit assertions; change only expectations explicitly replaced by collapsed touch defaults.
+Implement in vertical test-first slices: persistence/auth; authenticated context and policy isolation; composite action ordering/receipts; then compact presentation and geometry. Extend existing Hub integration/proxy/auth tests and `tests/e2e/opencode-v2-fake.ts` through the real provider/service/adapter, not only UI mocks. Script both transport-loss boundaries, resume batch/cancellation races, delayed acceptance, no eligible jobs, changing blockers, partial failure, late settlement, receipt expiry/eviction/recreation and two accounts sharing a workspace. Add direct child spoofing/base-path/foreign-parent tests. Preserve all meaningful mobile audit assertions; change only expectations explicitly replaced by collapsed touch defaults or the approved desktop new-batch auto-expansion decision. Closed-desktop geometry fixtures must deliberately collapse cards rather than dropping their closed-state cases.
 
 Browser acceptance uses desktop plus Chromium/WebKit touch matrices: 390×844, visual 450/380; 844×390 with visual 390/230; 667×375; 768×1024/700 and 1024×768/500, safe insets, hardware/software keyboards, light/dark, reduced motion and enlarged text. Capture geometry and screenshots through existing evidence helpers; check hit-testing and gaps, collapsed and expanded states, menu bounds, pending edit/replacement/batch, worker settlement while inspecting, focus restoration, child/output Escape, first-tap composition, reading anchors and bottom pinning. Scripted tests validate Uatu contracts, not independent native service semantics.
 

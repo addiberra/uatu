@@ -37,8 +37,11 @@ for (const geometry of [
       await page.locator("#chat-input").press("Alt+Enter"); await accepted;
     }
     await expect(page.locator(".chat-queued-message")).toHaveCount(20);
-    await page.locator("#chat-compact-workers > summary").click();
-    await page.locator("[data-pending-toggle]").click();
+    if (geometry.mode === "touch") {
+      await page.locator("#chat-compact-workers > summary").click();
+      await page.locator("[data-pending-toggle]").click();
+    }
+    await expect(page.locator("#chat-compact-workers")).toHaveAttribute("open");
     await expect(page.locator("[data-pending-toggle]")).toHaveAttribute("aria-expanded", "true");
     await page.setViewportSize({ width: geometry.width, height: geometry.height });
     await page.evaluate(g => {

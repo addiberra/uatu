@@ -2,7 +2,7 @@ import type { APIRequestContext, Locator, Page, TestInfo } from "@playwright/tes
 import { expect, test as base } from "./fixtures";
 import { attachPageDiagnosticsOnFailure, withEngineBrowsers } from "./page-diagnostics";
 import { evidencePath, recordEvidence, saveEvidence } from "./evidence";
-import { openChatPanel } from "./chat-helpers";
+import { openChatPanel, openChatWorkers } from "./chat-helpers";
 import { expectWorkControlVisible, expectWorkTranscriptBudget } from "./work-panel-assertions";
 
 const test = withEngineBrowsers(base);
@@ -127,6 +127,99 @@ async function workControlExposure(control: Locator) {
     return { height: box.height, ring, focusVisible: node.matches(":focus-visible"), top: box.top - ring - top, bottom: bottom - box.bottom - ring, left: box.left - ring - left, right: right - box.right - ring, clips };
   });
 }
+
+for (const engine of ["chromium", "webkit"] as const) for (const scene of [
+  { mode: "desktop", touch: false, width: 1280 },
+  { mode: "touch", touch: true, width: 390 },
+  { mode: "desktop", touch: true, width: 1024 },
+] as const) test.describe(`disclosure policy ${engine} ${scene.mode} ${scene.touch ? "coarse" : "fine"}`, () => {
+  test.use({ page: async ({ launchBrowser, baseURL }, use) => {
+    const browser = await launchBrowser(engine);
+    const page = await browser.newPage({ baseURL, viewport: { width: scene.width, height: 900 }, hasTouch: scene.touch, isMobile: scene.touch, reducedMotion: "reduce" });
+    await page.addInitScript(mode => {
+      localStorage.setItem("uatu:presentation:v1:%2F:uatu:ui-mode", mode);
+      localStorage.setItem("uatu:presentation:v1:%2F:uatu:chat-panel", JSON.stringify({ open: true, fraction: 0.8 }));
+    }, scene.mode);
+    // A 1024px desktop split needs the existing collapsed sidebar to fit its
+    // 340px Chat + 360px Preview minima. This is not a disclosure-policy gate.
+    if (scene.mode === "desktop" && scene.touch) await page.addInitScript(() => localStorage.setItem("uatu:presentation:v1:%2F:uatu:sidebar-collapsed", "1"));
+    await use(page); await browser.close();
+  } });
+  test("native pointer and keyboard choices survive live work; new desktop batches reopen", async ({ page, request }, info) => {
+    const id = await boot(page, request);
+    await submit(page, "Start disclosure policy work");
+    const worker = await control(request, { op: "launchWorker", conversationId: id });
+    const workers = page.locator("#chat-compact-workers");
+    const header = workers.locator(":scope > summary");
+    const pending = page.locator("[data-pending-toggle]");
+    await expect(page.locator("html")).toHaveAttribute("data-ui-mode", scene.mode);
+    await expect(workers.locator("[data-worker-id]")).toHaveCount(1);
+    if (scene.mode === "desktop") await expect(workers).toHaveAttribute("open");
+    else { await expect(workers).not.toHaveAttribute("open"); await header.tap(); }
+    // Delay only notification of the next native toggle, not its native click
+    // or DOM default. A stream paint must observe that click before writing open.
+    await workers.evaluate(node => node.addEventListener("toggle", event => event.stopImmediatePropagation(), { capture: true, once: true }));
+    if (scene.touch) await header.tap(); else await header.click();
+    await expect(workers).not.toHaveAttribute("open");
+    const sibling = await control(request, { op: "launchWorker", conversationId: id });
+    await expect(workers.locator("[data-worker-id]")).toHaveCount(2);
+    await expect(workers).not.toHaveAttribute("open");
+    await header.press("Enter");
+    await expect(workers).toHaveAttribute("open");
+    await header.press("Space");
+    await expect(workers).not.toHaveAttribute("open");
+    const third = await control(request, { op: "launchWorker", conversationId: id });
+    await expect(workers.locator("[data-worker-id]")).toHaveCount(3);
+    await expect(workers).not.toHaveAttribute("open");
+
+    await submit(page, "Pending first", "queue");
+    await expect(pending).toHaveAttribute("aria-expanded", String(scene.mode === "desktop"));
+    if (scene.mode === "desktop") await pending.click();
+    await submit(page, "Pending second", "queue");
+    await expect(pending).toHaveAttribute("aria-expanded", "false");
+    await page.locator("#chat-input").fill("Retain composing focus and draft");
+    await page.locator("#chat-input").focus();
+    const top = await page.locator("#chat-timeline").evaluate(node => node.scrollTop);
+    for (const child of [worker, sibling, third]) await control(request, { op: "settleWorker", childId: child.childId });
+    await expect(page.locator("#chat-compact-workers-label")).toHaveText("3 finished");
+    await expect(workers).not.toHaveAttribute("open");
+    await expect(page.locator("#chat-input")).toBeFocused();
+    expect(await page.locator("#chat-timeline").evaluate(node => node.scrollTop)).toBe(top);
+    await captureScreenshot(page, info, `disclosure-${engine}-${scene.mode}-${scene.touch}-collapsed`);
+    const next = await control(request, { op: "launchWorker", conversationId: id });
+    await expect(page.locator("#chat-compact-workers-label")).toHaveText("1 working · 3 finished");
+    if (scene.mode === "desktop") await expect(workers).toHaveAttribute("open");
+    else { await expect(workers).not.toHaveAttribute("open"); await header.tap(); }
+    await page.locator("#chat-input").focus();
+    await control(request, { op: "settleWorker", childId: next.childId });
+    await expect(page.locator("#chat-compact-workers-label")).toHaveText("4 finished");
+    await expect(workers).toHaveAttribute("open"); // settlement never forces it closed
+    await expect(page.locator("#chat-input")).toHaveValue("Retain composing focus and draft");
+    await expect(page.locator("#chat-input")).toBeFocused();
+    await expect(pending).toHaveAttribute("aria-expanded", "false");
+    await captureScreenshot(page, info, `disclosure-${engine}-${scene.mode}-${scene.touch}-settled-open`);
+    if (scene.mode === "desktop" && scene.touch) {
+      await page.getByRole("button", { name: "Switch to touch layout", exact: true }).tap();
+      await expect(page.locator("html")).toHaveAttribute("data-ui-mode", "touch");
+      await page.locator("#touch-tab-chat").tap();
+      await expect(workers).not.toHaveAttribute("open"); // desktop auto-open is not a touch choice
+      await expect(pending).toHaveAttribute("aria-expanded", "false");
+      await header.tap(); await pending.tap();
+      await expect(workers).toHaveAttribute("open");
+      await expect(pending).toHaveAttribute("aria-expanded", "true");
+      await page.locator("#touch-tab-files").tap();
+      await page.getByRole("button", { name: "Switch to desktop layout", exact: true }).tap();
+      await expect(page.locator("html")).toHaveAttribute("data-ui-mode", "desktop");
+      await expect(workers).toHaveAttribute("open");
+      await expect(pending).toHaveAttribute("aria-expanded", "false"); // touch's explicit open stays touch-local
+    }
+    await page.reload();
+    if (scene.mode === "touch") await page.locator("#touch-tab-chat").tap(); else await openChatPanel(page);
+    await expect(page.locator("#chat-compact-workers-label")).toHaveText("4 finished");
+    await expect(workers).not.toHaveAttribute("open"); // hydration of history alone is not new active work
+    await expect(pending).toHaveAttribute("aria-expanded", String(scene.mode === "desktop"));
+  });
+});
 
 for (const engine of ["chromium", "webkit"] as const) test.describe(`mobile layout ${engine}`, () => {
   for (const scene of [{ width: 390, height: 844, visual: 380 }, { width: 844, height: 390, visual: 230 }]) test(`uncertain feedback preserves draft width and inline picker ${scene.width}`, async ({ page, request }, testInfo) => {
@@ -493,6 +586,8 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`mobile layo
       await boot(page, request);
       await submit(page, "Start desktop work");
       for (let index = 0; index < 6; index++) await submit(page, `${index}: ${"Long pending message. ".repeat(18)}`, "queue");
+      await expect(page.locator("[data-pending-toggle]")).toHaveAttribute("aria-expanded", "true");
+      await page.locator("[data-pending-toggle]").click(); // explicit closed-card budget fixture
       await page.setViewportSize({ width: 1280, height });
       await containedControls(page, height);
       const metrics = await page.locator("#chat-surface").evaluate(element => ({ surface: element.clientHeight, dock: document.querySelector("#chat-queue")!.clientHeight, transcript: document.querySelector("#chat-timeline")!.clientHeight }));
@@ -510,6 +605,10 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`mobile layo
       await submit(page, "One pending steer");
       await page.unroute("**/prompts");
       await control(request, { op: "launchWorker", conversationId: id });
+      await expect(page.locator("#chat-compact-workers")).toHaveAttribute("open");
+      await page.locator("#chat-compact-workers > summary").click();
+      await expect(page.locator("[data-pending-toggle]")).toHaveAttribute("aria-expanded", "true");
+      await page.locator("[data-pending-toggle]").click();
       await page.locator("#chat-input").fill("Keep the draft and warning");
       await page.setViewportSize({ width: 1280, height: 480 });
       const toggle = page.locator("#chat-work-toggle");
@@ -522,7 +621,7 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`mobile layo
       await toggle.focus();
       await page.keyboard.press("Enter");
       await expect(page.locator("#chat-work-close")).toBeFocused();
-      await page.locator("#chat-compact-workers > summary").click();
+      await openChatWorkers(page);
       const stop = page.locator("#chat-compact-workers [data-stop-task]").first();
       await stop.scrollIntoViewIfNeeded();
       await stop.focus();
@@ -561,7 +660,6 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`mobile layo
       await submit(page, "Start desktop work");
       await submit(page, "One pending steer");
       await control(request, { op: "launchWorker", conversationId: id });
-      await page.locator("#chat-compact-workers > summary").click();
       await expect(page.locator("#chat-compact-workers")).toHaveAttribute("open");
       await expect(page.locator(".chat-queued-message")).toHaveCount(1);
       await page.locator("#chat-input").fill("Keep this desktop draft");
@@ -621,9 +719,33 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`mobile layo
       await expect(warning).toBeInViewport({ ratio: 1 });
       await expect(page.locator("#chat-input")).toHaveValue("Start desktop work");
       await captureScreenshot(page, testInfo, `combined-${engine}-desktop-replacement-warning`);
+      const warningProbe = await warning.evaluateHandle(node => {
+        const note = node.parentElement!;
+        const records: { target: string; removed: string[]; added: string[] }[] = [];
+        const observer = new MutationObserver(mutations => {
+          for (const mutation of mutations) records.push({
+            target: (mutation.target as HTMLElement).id || (mutation.target as HTMLElement).className,
+            removed: [...mutation.removedNodes].map(n => n.nodeName + ":" + n.textContent),
+            added: [...mutation.addedNodes].map(n => n.nodeName + ":" + n.textContent),
+          });
+        });
+        observer.observe(note.parentElement!, { childList: true, subtree: true });
+        return { node, note, html: note.innerHTML, text: node.textContent, records, observer };
+      });
       await page.locator("#chat-work-dock").evaluate(node => { node.scrollTop = 0; });
       await control(request, { op: "launchWorker", conversationId: id });
       await expect(page.locator("#chat-compact-workers-items [data-worker-id]")).toHaveCount(2);
+      const warningStability = await warningProbe.evaluate(probe => {
+        probe.observer.disconnect();
+        return { sameNode: probe.node === document.querySelector("#chat-queue-note .chat-queue-replacement"), connected: probe.node.isConnected, sameNote: probe.note === document.querySelector("#chat-queue-note"), beforeHTML: probe.html, afterHTML: probe.note.innerHTML, beforeText: probe.text, afterText: document.querySelector("#chat-queue-note .chat-queue-replacement")?.textContent, records: probe.records };
+      });
+      await saveEvidence(testInfo, `warning-stability-${engine}.json`, JSON.stringify(warningStability, null, 2));
+      expect(warningStability.sameNode).toBe(true);
+      expect(warningStability.connected).toBe(true);
+      expect(warningStability.sameNote).toBe(true);
+      expect(warningStability.afterHTML).toBe(warningStability.beforeHTML);
+      expect(warningStability.records.filter(record => record.target === "chat-queue-note")).toEqual([]);
+      await warningProbe.dispose();
       expect(await page.locator("#chat-work-dock").evaluate(node => node.scrollTop)).toBe(0);
       // Updates preserve deliberate top scrolling. The warning stays
       // reachable below the intact card, rather than interleaved with rows.

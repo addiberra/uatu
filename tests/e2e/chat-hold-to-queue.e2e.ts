@@ -1,7 +1,7 @@
 import type { APIRequestContext, Page } from "@playwright/test";
 import { expect, test as base } from "./fixtures";
 import { withEngineBrowsers } from "./page-diagnostics";
-import { openChatPanel } from "./chat-helpers";
+import { openChatPanel, openChatPending } from "./chat-helpers";
 import { captureScreenshot, saveEvidence } from "./evidence";
 
 const test = withEngineBrowsers(base);
@@ -27,7 +27,7 @@ for (const touch of [false, true]) test(`side answer minimises and reopens witho
       await expect(page.locator("#chat-input")).toBeFocused();
       await page.locator("#chat-input").press("Alt+Enter");
       await expect(page.locator(".chat-queued-message")).toHaveCount(1);
-      await page.locator("[data-pending-toggle]").click();
+      await openChatPending(page);
       await page.locator("[data-queue-remove]").click();
       await expect(page.locator(".chat-queued-message")).toHaveCount(0);
       await page.locator("#chat-stop").click();
@@ -237,7 +237,14 @@ for (const mode of ["desktop", "touch"] as const) test(`side-reader workspace li
     const answer = page.locator("#chat-aside-answer");
     const reopen = async () => {
       if (mode === "touch" && await page.locator("html").getAttribute("data-active-tab") !== "chat") await page.locator("#touch-tab-chat").click();
-      await page.locator("#chat-aside-ready").click();
+      const notice = page.locator("#chat-aside-ready");
+      await expect.poll(() => notice.evaluate(node => {
+        const box = node.getBoundingClientRect();
+        const transcript = node.closest(".chat-transcript-area")!.getBoundingClientRect();
+        return box.height >= 44 && box.top >= transcript.top && box.bottom <= transcript.bottom
+          && node.contains(document.elementFromPoint(box.x + box.width / 2, box.y + box.height / 2));
+      }), { message: "the whole side-answer target stays inside the transcript and receives native input" }).toBe(true);
+      await notice.click();
       await expect(answer).toContainText("Retained side answer.");
     };
     await reopen();
@@ -253,7 +260,10 @@ for (const mode of ["desktop", "touch"] as const) test(`side-reader workspace li
     expect(await page.evaluate(() => performance.timeOrigin)).toBe(documentIdentity);
     await expect(reader).toBeHidden();
     await expect(page.locator("#preview-path")).toHaveText("README.md");
-    if (mode === "touch") await expect(page.locator("html")).toHaveAttribute("data-active-tab", "preview");
+    if (mode === "touch") {
+      await expect(page.locator("html")).toHaveAttribute("data-active-tab", "preview");
+      await expect(page.locator("#chat-aside-ready")).not.toBeFocused();
+    }
     await reopen();
     const qualifiedLink = answer.getByRole("button", { name: "qualified", exact: true });
     await expect(qualifiedLink).toHaveAttribute("data-file-ref", qualified);

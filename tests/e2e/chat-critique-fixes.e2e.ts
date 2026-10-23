@@ -179,7 +179,7 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`critique re
       const id = await desktop.locator("#chat-conversation-select").inputValue();
       for (let i = 0; i < 8; i++) await request.post("/__e2e/chat", { data: { action: "opencode", op: "launchWorker", conversationId: id } });
       await expect(desktop.locator("#chat-compact-workers-items li")).toHaveCount(8);
-      await desktop.locator("#chat-compact-workers > summary").click();
+      await expect(desktop.locator("#chat-compact-workers")).toHaveAttribute("open");
       for (const scroll of [false, true]) {
         if (scroll) await desktop.locator("#chat-compact-workers-items").evaluate(e => { e.scrollTop = e.scrollHeight; });
         await expect.poll(() => desktop.locator("#chat-work-dock").evaluate(dock => {

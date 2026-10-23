@@ -1426,9 +1426,29 @@ export class QueueDockRenderer {
       const steering = queued.some(entry => entry.delivery === "steer");
       context.note.hidden = !steering;
       const replacementNote = context.replacement ? pendingSteerReplacementNote(queued) : "";
-      const note = `${replacementNote ? `<span class="chat-queue-replacement">${escapeHtml(replacementNote)} </span>` : ""}<span class="chat-queue-model-note">${escapeHtml(STEER_MODEL_NOTE)}</span>`;
       context.note.classList.toggle("is-replacement", Boolean(replacementNote));
-      if (steering && context.note.innerHTML !== note) context.note.innerHTML = note;
+      // Compare owned text, not escaped HTML against browser serialization
+      // (for example, &#39; serializes as '). Keep a warning being read attached
+      // through unrelated repaints and update real count changes in place.
+      let warning = context.note.querySelector<HTMLElement>(":scope > .chat-queue-replacement");
+      if (replacementNote) {
+        if (!warning) {
+          warning = target.ownerDocument.createElement("span");
+          warning.className = "chat-queue-replacement";
+          context.note.prepend(warning);
+        }
+        const text = `${replacementNote} `;
+        if (warning.textContent !== text) warning.textContent = text;
+      } else warning?.remove();
+      if (steering) {
+        let model = context.note.querySelector<HTMLElement>(":scope > .chat-queue-model-note");
+        if (!model) {
+          model = target.ownerDocument.createElement("span");
+          model.className = "chat-queue-model-note";
+          context.note.append(model);
+        }
+        if (model.textContent !== STEER_MODEL_NOTE) model.textContent = STEER_MODEL_NOTE;
+      }
       // The replacement warning must be visible before the user submits,
       // not buried below the entries in the dock's scrollable list.
       if (replacementNote) {

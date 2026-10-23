@@ -69,9 +69,15 @@ Native steer/resume unknown retention is independent of policy context. Queue
 conversion/Send now browser transport failures and 5xx retain page-local
 uncertainty and recover read-only without disturbing the composing draft.
 
-`CompactDisclosure` in `compact-work.ts` owns separate, deliberate per-conversation
-Workers and Pending expansion choices; desktop and touch share the worker
-disclosure rather than automatically opening new work. The same module folds
+`CompactDisclosure` in `compact-work.ts` owns Workers and Pending disclosure
+policy in a page-local, 200-conversation cache with separate desktop/touch choices.
+Touch starts collapsed. Selected desktop UI mode opens each new active-worker or
+nonempty pending batch; deliberate collapse holds until that batch ends, and
+settlement never forces collapse. Finished-only history is not a new batch.
+Native DOM state is observed before repaint so a human toggle cannot be
+overwritten while its deferred event is pending; matching programmatic toggle
+echoes and mode changes do not create user choices. Null selection during refresh
+does not end work. The same module folds
 retained canonical projection occurrences, not child IDs or launcher counts,
 and separately names uncertainty. Existing
 inspection/stop owners render expanded rows; warnings/batch actions remain
@@ -973,10 +979,13 @@ Touch preserves composing focus through worker actions. Its disclosure remains
 in the bottom in-flow dock across keyboard/viewport changes, never implicitly
 promoted to a top overlay. Active rows use two lines for title and reported
 agent/model/cumulative usage; Stop stays 44px with 8px separation. Settled rows
-remain dense. Desktop and touch share one initially collapsed, deliberate
-per-conversation worker disclosure. Its bounded page-local expansion state
-survives conversation switches; new work, settlement and detachment do not
-implicitly open or collapse it.
+remain dense. Desktop and touch share one canonical worker card, not duplicate
+tracks. Touch remains deliberately collapsed by default; desktop auto-opens a
+new visible working/unknown batch unless the user collapsed its current batch.
+Pending follows the same desktop policy for any entries, including paused ones.
+Per-conversation choices survive reselection independently for each UI mode;
+settlement leaves current expansion alone and permits the next desktop batch
+to open. Disclosure policy follows UI mode, not pointer-density media queries.
 V2 reserves the parent Stop footprint
 before workers appear; worker controls have horizontal and vertical 0.5rem gaps.
 `opencode/v2/background.ts` folds successful tool launches and authenticated

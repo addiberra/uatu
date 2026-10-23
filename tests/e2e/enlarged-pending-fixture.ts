@@ -1,6 +1,6 @@
 import type { APIRequestContext, Page } from "@playwright/test";
 import { expect } from "./fixtures";
-import { openChatPanel } from "./chat-helpers";
+import { openChatPanel, openChatPending } from "./chat-helpers";
 
 /** The real enlarged-pending route state, shared with the opt-in Linux probe.
  * Keep the conversation text, images, selection and render sequence identical. */
@@ -50,8 +50,7 @@ export async function enlargedPendingFixture(page: Page, request: APIRequestCont
   }
   const held = page.locator("#chat-queue .chat-queued-message[data-delivery='queue']");
   await expect(held).toHaveCount(3);
-  await page.locator("[data-pending-toggle]").click();
-  await expect(page.locator("[data-pending-toggle]")).toHaveAttribute("aria-expanded", "true");
+  await openChatPending(page);
   await expect(held.first()).toBeVisible();
   const beforeHeight = (await held.first().boundingBox())!.height;
   await page.evaluate(() => { document.documentElement.style.fontSize = "200%"; });

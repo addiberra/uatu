@@ -64,6 +64,14 @@ for (const engine of ["chromium", "webkit"] as const) for (const touch of [false
         const hit = document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2);
         return { open: (node as HTMLDetailsElement).open, centerHit: hit ? { tag: hit.tagName, id: hit.id, className: hit.className } : null, summary: r.toJSON(), visibility: document.visibilityState };
       }), null, 2));
+      if (!touch) {
+        // This fixture intentionally exercises closed cards, not the new-work
+        // desktop default. Establish that deliberate state through real controls.
+        await expect(card).toHaveAttribute("open");
+        await card.locator(":scope > summary").click({ position: { x: 8, y: 8 } });
+        await expect(pending).toHaveAttribute("aria-expanded", "true");
+        await pending.click();
+      }
       await expect(card).not.toHaveAttribute("open");
       await card.locator(":scope > summary").click({ position: { x: 8, y: 8 } });
       await expect(card).toHaveAttribute("open", "");
@@ -213,13 +221,47 @@ for (const engine of ["chromium", "webkit"] as const) for (const touch of [false
               await page.locator(`#${id}`).evaluate(node => node.scrollTop = 0);
               const before = await scrollState();
               const headerBefore = [await card.locator(":scope > summary").boundingBox(), await pending.boundingBox()];
-              if (nativeKey) await page.locator(`#${id} button`).first().press("PageDown");
-              else { await page.locator(`#${id}`).hover(); await page.mouse.wheel(0, 180); }
-              await expect.poll(async () => (await scrollState())[id]).toBeGreaterThan(0);
-              const after = await scrollState();
-              for (const other of Object.keys(before)) if (other !== id) expect(after[other]).toBe(before[other]);
-              expect([await card.locator(":scope > summary").boundingBox(), await pending.boundingBox()]).toEqual(headerBefore);
-              await fullyVisible(card.locator(":scope > summary")); await fullyVisible(pending);
+              // Keep a sticky record of sibling/header movement, including
+              // transient changes that return before native input settles.
+              const isolation = await page.evaluateHandle(({ id, before }) => {
+                const changes: { id: string; before: number; after: number }[] = [];
+                const headers = [...document.querySelectorAll("#chat-compact-workers > summary, [data-pending-toggle]")];
+                const headerRects = headers.map(node => JSON.stringify(node.getBoundingClientRect()));
+                const movedHeaders: number[] = [];
+                let frame = 0;
+                const sample = () => {
+                  for (const other of Object.keys(before)) if (other !== id) {
+                    const after = document.getElementById(other)!.scrollTop;
+                    if (after !== before[other] && !changes.some(change => change.id === other)) changes.push({ id: other, before: before[other]!, after });
+                  }
+                  headers.forEach((node, index) => {
+                    if (JSON.stringify(node.getBoundingClientRect()) !== headerRects[index] && !movedHeaders.includes(index)) movedHeaders.push(index);
+                  });
+                };
+                const tick = () => { sample(); frame = requestAnimationFrame(tick); };
+                document.addEventListener("scroll", sample, true);
+                tick();
+                return { changes, movedHeaders, stop: () => { cancelAnimationFrame(frame); document.removeEventListener("scroll", sample, true); sample(); } };
+              }, { id, before });
+              try {
+                if (nativeKey) await page.locator(`#${id} button`).first().press("PageDown");
+                else { await page.locator(`#${id}`).hover(); await page.mouse.wheel(0, 180); }
+                await expect.poll(async () => (await scrollState())[id]).toBeGreaterThan(0);
+                // PageDown may still animate after the first nonzero offset,
+                // even with reduced motion. Finish this pane's native input
+                // before asserting isolation or beginning the sibling's input.
+                let previous = -1, stable = 0;
+                await expect.poll(async () => {
+                  const current = (await scrollState())[id]!;
+                  stable = current === previous ? stable + 1 : 0; previous = current;
+                  return stable;
+                }, { intervals: [100] }).toBeGreaterThanOrEqual(3);
+                const after = await scrollState();
+                for (const other of Object.keys(before)) if (other !== id) expect(after[other], `${id} must not scroll ${other}`).toBe(before[other]);
+                expect(await isolation.evaluate(monitor => { monitor.stop(); return { offsets: monitor.changes, headers: monitor.movedHeaders }; })).toEqual({ offsets: [], headers: [] });
+                expect([await card.locator(":scope > summary").boundingBox(), await pending.boundingBox()]).toEqual(headerBefore);
+                await fullyVisible(card.locator(":scope > summary")); await fullyVisible(pending);
+              } finally { await isolation.evaluate(monitor => monitor.stop()); await isolation.dispose(); }
             }
             if (touch && engine === "chromium") {
               const session = await page.context().newCDPSession(page);

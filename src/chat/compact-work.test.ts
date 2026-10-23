@@ -37,6 +37,81 @@ test("touch disclosure is deliberate, conversation-scoped, and survives settleme
   expect(state.paint("a")).toBe(false);
 });
 
+test("desktop opens active batches, holds manual collapse until empty, and leaves settled history as-is", () => {
+  const state = new CompactDisclosure();
+  expect(state.paint("a", 0, "desktop")).toBe(false); // finished-only history
+  expect(state.paint("a", 1, "desktop")).toBe(true);
+  state.toggled(true); // delayed programmatic echo
+  state.toggled(false);
+  expect(state.paint("a", 2, "desktop")).toBe(false);
+  expect(state.paint(null, 0, "desktop")).toBe(false);
+  expect(state.paint("a", 1, "desktop")).toBe(false);
+  expect(state.paint("a", 0, "desktop")).toBe(false);
+  expect(state.paint("a", 1, "desktop")).toBe(true);
+  expect(state.paint("a", 0, "desktop")).toBe(true);
+  state.toggled(false); // closing finished history doesn't veto the next batch
+  expect(state.paint("a", 1, "desktop")).toBe(true);
+});
+
+test("work seen only on touch does not auto-open finished desktop history", () => {
+  const state = new CompactDisclosure();
+  expect(state.paint("a", 1, "touch")).toBe(false);
+  expect(state.paint("a", 0, "touch")).toBe(false);
+  expect(state.paint("a", 0, "desktop")).toBe(false);
+  expect(state.paint("a", 1, "touch")).toBe(false);
+  expect(state.paint("a", 1, "desktop")).toBe(true);
+});
+
+test("native collapse before deferred toggle is observed before live repaint, not overwritten", () => {
+  const state = new CompactDisclosure();
+  expect(state.paint("a", 1, "desktop", false)).toBe(true);
+  // Human closes the DOM; a stream repaint beats the browser's toggle task.
+  expect(state.paint("a", 2, "desktop", false)).toBe(false);
+  state.toggled(false);
+  state.toggled(false);
+  expect(state.paint("a", 3, "desktop", false)).toBe(false);
+  expect(state.paint("a", 0, "desktop", false)).toBe(false);
+  expect(state.paint("a", 1, "desktop", false)).toBe(true);
+});
+
+test("desktop and touch choices stay conversation-local and independent through mode flips", () => {
+  const state = new CompactDisclosure();
+  expect(state.paint("a", 1, "desktop")).toBe(true);
+  expect(state.paint("a", 1, "touch")).toBe(false);
+  state.toggled(false); // mode-write echo, not a desktop collapse
+  expect(state.paint("a", 1, "desktop")).toBe(true);
+  state.toggled(false);
+  expect(state.paint("b", 1, "desktop")).toBe(true);
+  state.toggled(true);
+  expect(state.paint("a", 1, "desktop")).toBe(false);
+  expect(state.paint("a", 1, "touch")).toBe(false);
+  state.toggled(true);
+  expect(state.paint("b", 1, "touch")).toBe(false);
+  expect(state.paint("a", 0, "touch")).toBe(true);
+  expect(state.paint("a", 1, "touch")).toBe(true);
+  // Ending/restarting work while touch is selected ends desktop's batch veto,
+  // without making the touch expansion a desktop user gesture.
+  expect(state.paint("a", 1, "desktop")).toBe(true);
+  expect(state.paint("b", 0, "desktop")).toBe(true);
+});
+
+test("page-local disclosure cache retains at most 200 conversation choices", () => {
+  const state = new CompactDisclosure();
+  state.paint("old");
+  state.toggled(true);
+  for (let index = 0; index < 200; index++) state.paint(`other-${index}`);
+  expect(state.paint("old")).toBe(false);
+});
+
+test("recently revisited conversation choices survive bounded-cache eviction", () => {
+  const state = new CompactDisclosure();
+  state.paint("hot"); state.toggled(true);
+  for (let index = 0; index < 199; index++) state.paint(`other-${index}`);
+  expect(state.paint("hot")).toBe(true);
+  state.paint("next");
+  expect(state.paint("hot")).toBe(true);
+});
+
 test("canonical executions fold launcher aliases but keep repeated occurrences and uncertain outcomes distinct", () => {
   const items = [
     { type: "tool", id: "tool:one", name: "task", status: "completed", input: '{"description":"First reference"}', childConversationId: "child" },

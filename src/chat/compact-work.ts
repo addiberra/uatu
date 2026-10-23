@@ -6,24 +6,48 @@ import { workerIsActive, workerState, type WorkerState } from "./worker-state";
 import { taskById } from "./task-inspection";
 import { totalTokens } from "./usage";
 
-/** Deliberate touch state, independent of the desktop automatic disclosure. */
+type DisclosureState = { open: boolean; active: boolean; collapsed: boolean };
+type DisclosureMode = "touch" | "desktop";
+
+/** Page-local conversation choices; desktop opens new batches, touch never does. */
 export class CompactDisclosure {
-  private readonly choices = new Map<string, boolean>();
+  private readonly choices = new Map<string, Record<DisclosureMode, DisclosureState>>();
   private conversation: string | null = null;
+  private mode: DisclosureMode = "touch";
   private open = false;
 
-  paint(conversation: string | null): boolean {
-    if (conversation !== null) {
-      this.conversation = conversation;
-      this.open = this.choices.get(conversation) ?? false;
+  paint(conversation: string | null, activeCount = 0, mode: DisclosureMode = "touch", actualOpen?: boolean): boolean {
+    // Native details.toggle is deferred. Observe a human click before repaint
+    // can overwrite it; a delayed echo of our last write matches known open.
+    if (actualOpen !== undefined) this.toggled(actualOpen);
+    // A refresh's temporary null selection is not the batch ending.
+    if (conversation === null) return this.open;
+    let states = this.choices.get(conversation);
+    if (!states) {
+      const closed = (): DisclosureState => ({ open: false, active: false, collapsed: false });
+      states = { desktop: closed(), touch: closed() };
     }
+    boundedSet(this.choices, conversation, states, 200);
+    const desktop = states.desktop;
+    const active = activeCount > 0;
+    const enteringDesktop = mode === "desktop" && (this.mode !== mode || this.conversation !== conversation);
+    if (mode === "desktop" && active && (!desktop.active || enteringDesktop) && !desktop.collapsed) desktop.open = true;
+    if (!active) desktop.collapsed = false;
+    desktop.active = active;
+    this.conversation = conversation;
+    this.mode = mode;
+    this.open = states[mode].open;
     return this.open;
   }
 
   toggled(open: boolean): void {
     if (open === this.open) return; // includes delayed echoes of our own writes
     this.open = open;
-    if (this.conversation) boundedSet(this.choices, this.conversation, open, 200);
+    const state = this.conversation && this.choices.get(this.conversation)?.[this.mode];
+    if (state) {
+      state.open = open;
+      state.collapsed = !open && state.active;
+    }
   }
 }
 

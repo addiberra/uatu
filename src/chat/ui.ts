@@ -1138,7 +1138,10 @@ export function initChat(api = new ChatApiClient()): void {
     compactWorkersLabel.textContent = summary;
     compactWorkersList.querySelector("summary")?.setAttribute("aria-label", `Workers: ${summary}`);
     compactWorkersList.hidden = workers.length === 0;
-    compactWorkersList.open = compactWorkerState.paint(projection?.conversationId ?? null);
+    const open = compactWorkerState.paint(projection?.conversationId ?? null,
+      workers.filter(worker => worker.state === "working" || worker.state === "unknown").length,
+      document.documentElement.dataset.uiMode === "touch" ? "touch" : "desktop", compactWorkersList.open);
+    if (compactWorkersList.open !== open) compactWorkersList.open = open;
     compactWorkersList.querySelector("summary")?.setAttribute("aria-expanded", String(compactWorkersList.open));
     compactView?.paint(projection?.conversationId ?? null, workers, stoppingTasks, declares("background-tasks"));
     syncQueueOverflow();
@@ -1846,7 +1849,8 @@ export function initChat(api = new ChatApiClient()): void {
       boundedSet(pendingScrollPositions, pendingPaintedConversation, pendingPane.scrollTop, 200);
     }
     const pendingConversation = projection?.conversationId ?? null;
-    const pendingOpen = compactPendingState.paint(pendingConversation);
+    const pendingOpen = compactPendingState.paint(pendingConversation, projection?.queued.length ?? 0,
+      document.documentElement.dataset.uiMode === "touch" ? "touch" : "desktop");
     const restorePending = pendingOpen && (pendingConversation !== pendingPaintedConversation || !pendingPaintedOpen);
     queueDock.render(queueDockElement, projection?.queued ?? [], {
       conversationId: pendingConversation,
@@ -3620,10 +3624,12 @@ export function initChat(api = new ChatApiClient()): void {
   queueDockElement.addEventListener("click", async event => {
     if ((event.target as Element).closest("[data-pending-toggle]")) {
       const pane = queueDockElement.querySelector<HTMLElement>(".chat-queue-content");
-      if (projection && compactPendingState.paint(projection.conversationId) && pane?.clientHeight) {
+      const open = compactPendingState.paint(projection?.conversationId ?? null, projection?.queued.length ?? 0,
+        document.documentElement.dataset.uiMode === "touch" ? "touch" : "desktop");
+      if (projection && open && pane?.clientHeight) {
         boundedSet(pendingScrollPositions, projection.conversationId, pane.scrollTop, 200);
       }
-      compactPendingState.toggled(!compactPendingState.paint(projection?.conversationId ?? null));
+      compactPendingState.toggled(!open);
       scheduleRender();
       return;
     }
@@ -5142,7 +5148,7 @@ export function initChat(api = new ChatApiClient()): void {
   // A native modal/nonmodal dialog cannot change modality in place. Hide on
   // the shell's real mode event; deliberate reopening chooses the new mode
   // while retaining the answer/offset, without taking over shell focus.
-  onUiModeChange(() => minimiseAside("mode"));
+  onUiModeChange(() => { minimiseAside("mode"); scheduleRender(); });
   if (asideContent) wireItemInteractions(asideContent,
     () => asideDialog?.open && asideDialog.dataset.conversation === projection?.conversationId ? projection : null,
     { renderer, rerender: () => scheduleRender(false), beforeFileNavigation: () => minimiseAside("file") }, parentScroll);
@@ -5716,8 +5722,6 @@ export function initChat(api = new ChatApiClient()): void {
   let dockHeight: number | null = null;
   let dockGrowth: Animation | null = null;
   const observer = typeof ResizeObserver === "function" ? new ResizeObserver(() => {
-    syncQueueOverflow();
-    syncDesktopWorkLayout();
     if (workDock && document.documentElement.dataset.uiMode === "touch" && !workDock.hasAttribute("data-work-content-expanded")) {
       // Text enlargement can make fixed chrome taller than its percentage
       // budget. Secondary work yields before the primary composer does.
@@ -5737,6 +5741,11 @@ export function initChat(api = new ChatApiClient()): void {
       const hardAvailable = `${Math.max(0, surface.clientHeight - fixed)}px`;
       if (workDock.style.getPropertyValue("--chat-work-hard-available") !== hardAvailable) workDock.style.setProperty("--chat-work-hard-available", hardAvailable);
     }
+    // Consume this surface's current capacity, not the zero-size measurement
+    // retained while another touch tab hid it. No further resize is guaranteed
+    // after restoring the budget, so overflow must settle in this same pass.
+    syncQueueOverflow();
+    syncDesktopWorkLayout();
     restorePendingScroll();
     if (typeof requestAnimationFrame === "function") requestAnimationFrame(revealWorkFocus);
     if (workDock && !dockGrowth) {

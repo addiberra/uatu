@@ -1,5 +1,5 @@
 import { expect, test } from "./fixtures";
-import { openChatPanel, openChatWorkers } from "./chat-helpers";
+import { openChatPanel, openChatPending, openChatWorkers } from "./chat-helpers";
 
 test("legacy Queue default cannot change Enter or Alt+Enter, including after reload", async ({ page, request }) => {
   await page.addInitScript(() => localStorage.setItem("uatu:presentation:v1:%2F:chat-delivery", "queue"));
@@ -58,7 +58,7 @@ for (const fraction of [0.4, 0.8]) test(`desktop density follows pane width (${f
     await input.fill(`Queued review ${i}`); await input.press("Alt+Enter");
     await expect(page.locator(".chat-queued-message")).toHaveCount(i + 1);
   }
-  await page.locator("[data-pending-toggle]").click();
+  await openChatPending(page);
   await expect(page.locator("#chat-keyboard-hint")).toHaveText("Enter: steer · Alt+Enter: queue");
   for (const selector of ["#chat-send", "#chat-stop", "#chat-attach", "#chat-configuration-trigger"]) {
     expect((await page.locator(selector).boundingBox())!.height).toBe(32);

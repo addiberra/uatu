@@ -1,3 +1,49 @@
+## Review round 12 — explicit desktop auto-expansion (2026-10-23)
+
+The user chose **desktop auto-expands**, with touch initially collapsed and
+deliberate current-batch collapse preserved. This supersedes the implementation's
+both-collapsed default, not the canonical worker card, independent scrolling,
+measured reading budget or touch disclosure contract. Historical task/evidence
+entries below remain unchanged.
+
+- [x] Restore desktop new-active-worker and nonempty-pending batch auto-expansion in CompactDisclosure/public initChat, preserving per-conversation/mode isolation, manual collapse until batch empty, null refresh, deferred native toggle handling, finished-only history and unchanged touch defaults. Align affected docs/main/delta/design/proposal, retain meaningful closed geometry/action/anchor tests, and verify focused units, Chromium/WebKit desktop/touch/coarse-desktop, typecheck and strict affected specs. No publication, installation or live services.
+
+Unified final verification: all 415 selected Chromium/WebKit cases pass (the
+original 403 identities plus all 12 header cases), including all six disclosure
+policy cases, stable replacement warnings, side-reader links and exact native
+scroll isolation. Fixture corrections preserve existing input and exact geometry
+assertions; no production changes followed the green core run. Full core passes
+5,618 tests with 16 skips, compact policy 13/13, API 209/209, strict specs 60/60,
+typecheck and build/smoke. Evidence: approved review-loop scratch
+`round-12-fixes/validation/final-broad/`. Independent review and publication remain
+lead-owned; unrelated historical pending tasks below remain unchanged.
+
+Earlier implementation-only handoff, before the unified fixes and final green
+verification (retained as historical evidence):
+
+Implementation and policy verification are complete; clean integrated acceptance
+remains blocked, so this task stays unchecked. Evidence is in approved task
+scratch `round-12-fixes/desktop-disclosure/` (`handoff.md`). Genuine worker and
+pending arrival RED checks fail closed before the fix. Final units pass 129 UI,
+22 compact/view, 27 budget/viewport/gesture and 208 renderer cases; typecheck,
+strict compact/main-chat validation and diff hygiene pass. All six final native
+Chromium/WebKit desktop/touch/coarse-desktop policy cases pass, including delayed
+toggle notification, mode isolation and finished-only hydration; public initChat
+units also cover rapid pending activation before paint. Actual desktop and touch
+renders were inspected in two bounded rounds.
+
+The broader run is 397/403, not clean: two touch side-reader link failures also
+reproduce on unchanged `81b9d2f`; two new coarse-desktop setups were corrected to
+respect the existing split-width guard and now pass. Final focused verification
+is 17/18: WebKit's short-desktop replacement warning still detaches during browser
+scrolling after a worker update. That case passed once on unchanged HEAD, so its
+cause is not established and is not labelled a baseline defect. The broader
+WebKit phone sibling-offset failure also passed in the final focused run without
+relaxing its exact assertion; its intermittent cause is likewise unestablished.
+Preserve these tests and resolve the remaining warning/side-reader blockers in
+lead follow-up before claiming complete clean acceptance. No full-root CI,
+publication, deployment, API/revision changes, installation or live services.
+
 ## Review round 4 — approved fixed Steer default (2026-10-22)
 
 The user chose **Use fixed Steer default**, explicitly removing the configurable

@@ -35,6 +35,14 @@ export async function openChatWorkers(page: Page): Promise<void> {
   await expect(card).toHaveAttribute("open", "");
 }
 
+/** Reveal pending actions under either UI-mode disclosure policy. */
+export async function openChatPending(page: Page): Promise<void> {
+  const toggle = page.locator("[data-pending-toggle]");
+  await expect(toggle).toHaveAttribute("aria-expanded", /^(true|false)$/);
+  if (await toggle.getAttribute("aria-expanded") === "false") await toggle.click();
+  await expect(toggle).toHaveAttribute("aria-expanded", "true");
+}
+
 export async function openChatConfiguration(page: Page): Promise<void> {
   const dialog = page.locator("#chat-configuration-dialog");
   if (!await dialog.isVisible()) {

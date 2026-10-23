@@ -3111,9 +3111,9 @@ The shared touch work dock SHALL observe the visual-height budgets and final-hei
 - **AND** a deliberately expanded worker disclosure remains open
 
 #### Scenario: Automatic expansion survives a conversation switch
-- **WHEN** desktop conversation A automatically opens its foreground track, the user selects B without touching the disclosure, and B's foreground work is detached
-- **THEN** the retained open state remains classified as automatic and the duplicate track collapses in B
-- **AND** provenance for a deliberately opened retained track stays deliberate; touch instead retains deliberate per-conversation compact state
+- **WHEN** desktop conversation A automatically opens its worker card and the user selects B without touching A's disclosure
+- **THEN** B uses its own active-batch state without inheriting A's automatic expansion or deliberate choices, and detachment does not close its canonical worker card
+- **AND** returning to A restores A's page-local state; touch choices remain separately deliberate per conversation
 
 #### Scenario: Shell settles while confirmation is open
 - **WHEN** settlement removes the invoking shell Stop control before the user dismisses its confirmation
@@ -3144,7 +3144,9 @@ Confirmed live V2 background work SHALL keep the existing workspace activity sum
 ### Requirement: Touch pending messages and workers use compact deliberate disclosures
 Touch chat SHALL show at most one initially collapsed pending-message summary and one initially collapsed worker summary, omitting an empty summary. Pending text SHALL identify the total and steer/queued breakdown, such as `3 pending · 2 steers · 1 queued`. Worker text SHALL identify confirmed working and finished occurrences, such as `2 working · 4 finished`; finished SHALL include terminal failures/stops without implying successful completion. Uncertain workers SHALL be separately named rather than counted as confirmed working or finished. New work, replay and settlement SHALL update the summaries without automatically expanding touch details. Deliberate per-conversation expansion SHALL survive repaint, reselection and viewport changes within the page without leaking to other conversations.
 
-Expanded pending details SHALL retain delivery order and existing edit/remove/convert/Send now actions. Expanded worker details SHALL retain inspection, truthful terminal outcomes, available shell output and existing parent/worker-stop safeguards. Replacement consequences, paused-batch warnings and applicable batch Send, and actionable operation failure/uncertainty SHALL remain visible outside collapsed details. Desktop disclosure defaults SHALL remain unchanged. The collapsed touch defaults are an explicit exception to earlier automatic-running-track expansion behavior.
+Expanded pending details SHALL retain delivery order and existing edit/remove/convert/Send now actions. Expanded worker details SHALL retain inspection, truthful terminal outcomes, available shell output and existing parent/worker-stop safeguards. Replacement consequences, paused-batch warnings and applicable batch Send, and actionable operation failure/uncertainty SHALL remain visible outside collapsed details. The collapsed touch defaults are an explicit exception to desktop automatic expansion.
+
+In selected desktop UI mode, Workers SHALL automatically open when a new batch of visible working or unknown occurrences first appears, and Pending SHALL automatically open for a new nonempty batch, including paused entries. Deliberate collapse SHALL hold until that card's active-worker or pending batch becomes empty; further arrivals SHALL NOT reopen it. Ending a batch SHALL leave its current open state alone and clear the collapse veto for the next batch. Finished-only history SHALL NOT invent a new active batch. Choices SHALL be retained separately per conversation and UI mode in a page-local cache bounded to 200 conversations, without inheriting another conversation's choice or treating automatic expansion, mode changes or delayed programmatic toggle echoes as user gestures. Null selection during refresh SHALL NOT end a batch. Native pointer/keyboard changes SHALL survive a live repaint before their deferred toggle event arrives. Policy SHALL follow `data-ui-mode`, not fine-pointer density; tablet desktop mode SHALL use desktop defaults. Canonical rows, independent pane offsets, focus and reading-anchor ownership SHALL remain unchanged.
 
 Expanded worker details SHALL show confirmed working and unknown workers first, followed by a separately collapsed Finished history ordered newest first from available execution timestamps. Each occurrence SHALL have one whole-row inspection target, readable names of at least 14px and metadata of at least 13px, with state-specific glyphs distinguishing working, unknown, finished, failed and stopped. A settled glyph SHALL NOT imply live work. Headers and inspection/Stop targets SHALL remain at least 44px tall with 8px separation from Stop. Only current owned, confirmed live background workers SHALL offer enabled Stop worker; an unknown outcome SHALL disable Stop. Settled results SHALL remain accessible. Only live workers SHALL cause the parent Stop label to read Stop parent. Known successful automatic-background acknowledgements MAY clear on status change or complete settlement; failed, unavailable and unknown outcomes SHALL remain persistent.
 
@@ -3152,6 +3154,21 @@ Expanded worker details SHALL show confirmed working and unknown workers first, 
 - **WHEN** a touch conversation has two pending steers, one queued message, two working and four confirmed terminal worker occurrences
 - **THEN** its pending and worker summaries are collapsed and show their respective counts
 - **AND** no second pinned worker list duplicates the same work
+
+#### Scenario: Desktop new work is reachable without disclosure
+- **WHEN** visible working/unknown workers or pending entries first appear in desktop UI mode, including on touch-first hardware explicitly using desktop mode
+- **THEN** the corresponding canonical card opens without moving focus
+- **AND** finished-only worker hydration stays initially collapsed and touch still starts collapsed
+
+#### Scenario: Desktop manual collapse belongs to its current batch
+- **WHEN** the user closes a desktop card and more active workers or pending entries arrive before its batch empties
+- **THEN** the card remains closed, including when repaint precedes the native toggle event
+- **AND** settlement leaves its current state alone, while the next batch after empty opens again
+
+#### Scenario: Mode changes and refresh do not create disclosure choices
+- **WHEN** a user switches UI modes or conversations, returns, or refresh temporarily clears selection while a batch remains active
+- **THEN** each conversation and mode retains its own page-local choice without automatic or delayed-toggle choice leakage
+- **AND** temporary null selection does not end the current desktop collapse veto
 
 #### Scenario: Work changes without opening details
 - **WHEN** a worker appears or settles, or the conversation rehydrates while its touch details are collapsed

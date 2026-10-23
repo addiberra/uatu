@@ -33,6 +33,64 @@ if (process.env[CHILD_PROCESS_FLAG] !== "1") {
   });
 } else {
 describe("chat reversible-history composer", () => {
+  test("touch surface return consumes fresh work capacity before deciding physical overflow", async () => {
+    const { document, window } = parseHTML(html);
+    installDomGlobals(document, window);
+    document.documentElement.setAttribute("data-ui-mode", "touch");
+    document.documentElement.setAttribute("data-active-tab", "chat");
+    stubConversationSelect(document);
+    const surface = document.querySelector<HTMLElement>(".chat-surface")!;
+    const dock = document.querySelector<HTMLElement>("#chat-work-dock")!;
+    let visible = true, height = 788;
+    Object.defineProperty(surface, "clientHeight", { configurable: true, get: () => visible ? height : 0 });
+    Object.defineProperty(surface, "clientWidth", { configurable: true, value: 390 });
+    for (const [selector, pixels] of [[".chat-header", 80], ["#chat-composer", 124]] as const) {
+      document.querySelector<HTMLElement>(selector)!.getBoundingClientRect = () => ({ height: visible ? pixels : 0 }) as DOMRect;
+    }
+    const previousStyle = Reflect.get(globalThis, "getComputedStyle");
+    const previousObserver = Reflect.get(globalThis, "ResizeObserver");
+    const observers: Array<{ targets: Element[]; resize(): void }> = [];
+    Reflect.set(globalThis, "getComputedStyle", (node: HTMLElement) => ({
+      display: node.hidden ? "none" : "block", position: "static", fontSize: "16px",
+      paddingTop: node === dock ? "2px" : "0px", paddingBottom: node === dock ? "2px" : "0px",
+      getPropertyValue: () => "0px",
+    }));
+    Reflect.set(globalThis, "ResizeObserver", class {
+      targets: Element[] = [];
+      constructor(readonly resize: () => void) { observers.push(this); }
+      observe(node: Element) { this.targets.push(node); }
+      disconnect() {}
+    });
+    const { initChat } = await import(`./ui.ts?touch-capacity-return=${Date.now()}`);
+    try {
+      initChat(questionApi(document, { items: () => [] }));
+      await waitUntil(() => document.querySelector('option[value="one"]') !== null);
+      const layout = observers.find(observer => observer.targets.includes(dock))!;
+      expect(layout).toBeDefined();
+      layout.resize();
+      expect(surface.hasAttribute("data-work-overflow")).toBe(false);
+      visible = false;
+      document.documentElement.setAttribute("data-active-tab", "preview");
+      layout.resize();
+      expect(dock.style.getPropertyValue("--chat-work-hard-available")).toBe("0px");
+      visible = true;
+      document.documentElement.setAttribute("data-active-tab", "chat");
+      // No extra observer notification is guaranteed after these writes.
+      layout.resize();
+      expect(dock.style.getPropertyValue("--chat-work-hard-available")).toBe("584px");
+      expect(surface.hasAttribute("data-work-overflow")).toBe(false);
+      expect(dock.hasAttribute("data-work-cramped")).toBe(false);
+      // Conversely, a genuinely too-small band must still enter native outer
+      // scrolling on the first measurement, not retain the old large capacity.
+      height = 100;
+      layout.resize();
+      expect(surface.hasAttribute("data-work-overflow")).toBe(true);
+    } finally {
+      window.dispatchEvent(new window.Event("pagehide"));
+      Reflect.set(globalThis, "getComputedStyle", previousStyle);
+      Reflect.set(globalThis, "ResizeObserver", previousObserver);
+    }
+  });
   for (const status of ["running", "idle"] as const) test(`held command paths retain ${status} steering controls while actual commands do not`, async () => {
     const { document, window } = parseHTML(html);
     installDomGlobals(document, window);
@@ -2772,7 +2830,61 @@ describe("chat running work reachable without a disclosure", () => {
     toolUseId: `toolu_${taskId}`, status, outputFile: `/tmp/tasks/${taskId}.output`,
   });
 
-  test("the canonical desktop card starts collapsed and preserves deliberate state across work and conversation changes", async () => {
+  for (const mode of ["desktop", "touch"] as const) test(`${mode} pending arrival and paused batch respect disclosure policy without hiding safety`, async () => {
+    const { document, window } = parseHTML(html);
+    installDomGlobals(document, window);
+    document.documentElement.setAttribute("data-ui-mode", mode);
+    document.documentElement.setAttribute("data-chat-panel", "open");
+    document.documentElement.setAttribute("data-active-tab", "chat");
+    stubConversationSelect(document);
+    let stream: { event(event: unknown, cursor: string): void } | undefined;
+    const api = taskApi(document, { items: () => [], onStream: (_id, handlers) => { stream = handlers; } });
+    api.status = async () => [{ agent: { id: "test", name: "Test" }, availability: { state: "ready", version: "test", agent: { id: "test", name: "Test", capabilities: ["steering", "send-now"] } } }];
+    let sequence = 0;
+    const queued = (count: number) => Array.from({ length: count }, (_, index) => ({ id: `pending-${index}`, text: `Pending ${index}`, delivery: "steer", paused: true, queuedAt: 1 }));
+    const emit = (count: number) => {
+      sequence++;
+      stream!.event({ type: "conversation.queue", generation: "g", sequence, conversationId: "one", queued: queued(count), change: { kind: "paused", messageId: "pending-0" } }, `cursor-one-${sequence}`);
+    };
+    const toggle = () => document.querySelector<HTMLButtonElement>("[data-pending-toggle]")!;
+    const click = (button: HTMLElement) => button.dispatchEvent(new window.Event("click", { bubbles: true }));
+    const open = () => toggle().getAttribute("aria-expanded");
+    try {
+      const { initChat } = await import(`./ui.ts?pending-disclosure=${mode}-${Date.now()}`);
+      initChat(api);
+      await waitUntil(() => stream !== undefined);
+      emit(1);
+      await waitUntil(() => document.querySelectorAll("[data-chat-queued-id]").length === 1);
+      expect(open()).toBe(String(mode === "desktop"));
+      // Two native activations can precede the scheduled paint. Each is a
+      // toggle, not two copies of a command derived from the last DOM paint.
+      click(toggle()); click(toggle());
+      await new Promise<void>(resolve => requestAnimationFrame(() => resolve()));
+      expect(open()).toBe(String(mode === "desktop"));
+      if (mode === "desktop") click(toggle());
+      await waitUntil(() => open() === "false");
+      emit(2);
+      await waitUntil(() => document.querySelectorAll("[data-chat-queued-id]").length === 2);
+      expect(open()).toBe("false");
+      // Paused-batch actions remain outside the collapsed entry list.
+      const batch = document.querySelector<HTMLElement>(".chat-queue-batch")!;
+      expect(batch.hidden).toBe(false);
+      expect(batch.querySelector('[data-queue-send-now="pending-0"]')?.textContent).toBe("Send 2 paused steers now");
+      expect(batch.closest("#chat-queue-items")).toBeNull();
+      emit(0);
+      await waitUntil(() => document.querySelectorAll("[data-chat-queued-id]").length === 0);
+      emit(1);
+      await waitUntil(() => document.querySelectorAll("[data-chat-queued-id]").length === 1);
+      expect(open()).toBe(String(mode === "desktop"));
+      if (mode === "touch") click(toggle());
+      await waitUntil(() => open() === "true");
+      emit(2);
+      await waitUntil(() => document.querySelectorAll("[data-chat-queued-id]").length === 2);
+      expect(open()).toBe("true");
+    } finally { window.dispatchEvent(new Event("pagehide")); }
+  });
+
+  test("desktop opens new work, holds a deliberate collapse for its batch and isolates conversation choices", async () => {
     const { document, window } = parseHTML(html);
     installDomGlobals(document, window);
     document.documentElement.setAttribute("data-ui-mode", "desktop");
@@ -2803,12 +2915,10 @@ describe("chat running work reachable without a disclosure", () => {
       const { initChat } = await import(`./ui.ts?running-work-disclosure-ui-test=${Date.now()}`);
       initChat(api);
       await waitUntil(() => !tasks.hidden && streams.has("one"), () => tasks.textContent ?? "no task list");
-      // Desktop now shares touch's deliberate compact disclosure default.
-      expect(tasks.open).toBe(false);
+      expect(tasks.open).toBe(true);
       expect(document.querySelector("#chat-subagents, #chat-background-tasks")).toBeNull();
       expect(tasks.querySelector('[data-inspect-task="a"]')).not.toBeNull();
       expect(tasks.querySelector('[data-stop-task="a"]')).not.toBeNull();
-      tasks.open = true;
       toggle(tasks);
 
       // A deliberate collapse survives new work and settlement.
@@ -2831,21 +2941,20 @@ describe("chat running work reachable without a disclosure", () => {
       upsert("one", { id: "tool:toolu_u", type: "tool", createdAt: 4, name: "task", status: "running", input: JSON.stringify({ description: "Check links", subagent_type: "explore", prompt: "go" }) });
       await waitUntil(() => !tasks.hidden, () => "no task list");
       await settle();
-      expect(tasks.open).toBe(false);
-      tasks.open = true;
-      toggle(tasks);
+      expect(tasks.open).toBe(true);
+      collapse(tasks);
 
-      // Another conversation starts collapsed, and returning restores the
-      // first conversation's explicit expansion rather than inheriting it.
+      // Another conversation's new work opens, but returning restores the
+      // first conversation's deliberate collapse of its still-active batch.
       const select = document.querySelector<HTMLSelectElement>("#chat-conversation-select")!;
       select.value = "two";
       select.dispatchEvent(new window.Event("change") as unknown as Event);
       await waitUntil(() => tasks.querySelector('[data-background-task="z"]') != null, () => tasks.textContent ?? "no task list");
-      expect(tasks.open).toBe(false);
+      expect(tasks.open).toBe(true);
       select.value = "one";
       select.dispatchEvent(new window.Event("change") as unknown as Event);
       await waitUntil(() => tasks.querySelector('[data-background-task="a"]') != null);
-      expect(tasks.open).toBe(true);
+      expect(tasks.open).toBe(false);
     } finally {
       await Bun.sleep(20);
       window.dispatchEvent(new Event("pagehide"));

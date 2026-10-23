@@ -1278,6 +1278,69 @@ describe("presentation details", () => {
       expect(host.querySelector("img")).toBeNull();
     });
 
+    test("replacement warning and model note retain identity without child mutations on unrelated repaints", async () => {
+      const host = target();
+      const note = document.createElement("p"); host.append(note);
+      const dock = new QueueDockRenderer();
+      const entries = [queued({ id: "a", text: "First", delivery: "steer", paused: true })];
+      const context = { ...steering, note, replacement: true, compactOpen: false };
+      dock.render(host, entries, context);
+      const warning = note.querySelector(".chat-queue-replacement");
+      const model = note.querySelector(".chat-queue-model-note");
+      const mutations: MutationRecord[] = [];
+      const observer = new dom.window.MutationObserver(records => mutations.push(...records as unknown as MutationRecord[]));
+      observer.observe(note, { childList: true, subtree: true });
+      const content = host.querySelector<HTMLElement>(".chat-queue-content")!;
+      content.scrollTop = 73;
+      dock.render(host, entries, context);
+      dock.render(host, [...entries, queued({ id: "held", text: "Unrelated pending" })], context);
+      await Promise.resolve();
+      observer.disconnect();
+      expect(note.querySelector(".chat-queue-replacement") === warning).toBe(true);
+      expect(note.querySelector(".chat-queue-model-note") === model).toBe(true);
+      expect(mutations).toHaveLength(0);
+      expect(content.scrollTop).toBe(73);
+    });
+
+    test("replacement warning updates text in place, retires on exit, and reveals only on entry", () => {
+      const host = target();
+      const note = document.createElement("p"); host.append(note);
+      const dock = new QueueDockRenderer();
+      const first = queued({ id: "a", text: "First", delivery: "steer", paused: true });
+      const second = queued({ id: "b", text: "Second", delivery: "steer", paused: true });
+      const context = { ...steering, note, replacement: true, compactOpen: false };
+      dock.render(host, [first], context);
+      const warning = note.querySelector(".chat-queue-replacement");
+      const model = note.querySelector(".chat-queue-model-note");
+      const content = host.querySelector<HTMLElement>(".chat-queue-content")!;
+      expect(content.scrollTop).toBe(0);
+      content.scrollTop = 91;
+      dock.render(host, [first, second], context);
+      expect(note.querySelector(".chat-queue-replacement") === warning).toBe(true);
+      expect(note.textContent).toContain("2 pending steers will be delivered together with your replacement.");
+      expect(content.scrollTop).toBe(91);
+      expect(host.querySelector<HTMLElement>(".chat-queue-items")?.hidden).toBe(true);
+      expect(note.hidden).toBe(false);
+      expect(host.querySelector(".chat-queue-batch button")?.textContent).toBe("Send 2 paused steers now");
+      dock.render(host, [first], { ...context, replacement: false });
+      expect(note.querySelector(".chat-queue-replacement")).toBeNull();
+      expect(note.querySelector(".chat-queue-model-note")).toBe(model);
+      expect(content.scrollTop).toBe(91);
+      dock.render(host, [first], context);
+      expect(note.textContent).toContain("1 pending steer will be delivered together with your replacement.");
+      expect(content.scrollTop).toBe(0);
+      dock.render(host, [], context);
+      expect(note.hidden).toBe(true);
+      expect(note.querySelector(".chat-queue-replacement")).toBeNull();
+      dock.render(host, [first], { ...context, conversationId: "next" });
+      expect(note.hidden).toBe(false);
+      expect(note.textContent).toContain("1 pending steer");
+      const freshNote = document.createElement("p");
+      dock.render(host, [first], { ...context, note: freshNote, conversationId: "next" });
+      expect(freshNote.querySelectorAll(".chat-queue-replacement")).toHaveLength(1);
+      expect(freshNote.querySelectorAll(".chat-queue-model-note")).toHaveLength(1);
+    });
+
     test("compact pending details collapse independently of replacement and paused batch safety", () => {
       const host = target();
       const note = document.createElement("p"); host.append(note);

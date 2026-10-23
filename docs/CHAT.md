@@ -410,17 +410,25 @@ view using the existing persisted dismissal state, never provider history.
 There is no Restore finished control. Results and their inspection remain in
 the timeline; summaries count only visible rows.
 Σ usage is cumulative, not context occupancy.
-Deliberate worker expansion is kept per conversation within this page's bounded
-presentation cache; new work and settlement do not open details.
+Touch's deliberate worker expansion is kept per conversation within this page's
+bounded presentation cache; new work and settlement do not open touch details.
 Replacement/batch warnings, applicable batch Send and actionable operation
 feedback stay outside the collapse. Successful sends, queue actions and
 automatic-background outcomes produce no confirmation notices; failed,
 unavailable and unknown guidance remains tied to its source operation; unrelated
 Remove, delivery changes or later successful steers cannot clear it. A Settings
 read failure means that page cannot confirm the saved preference, not that the
-server has disabled a saved ON policy in another tab or device. Desktop and
-touch worker details start collapsed and expand only deliberately; that choice
-is retained per conversation across new work, settlement and detachment.
+server has disabled a saved ON policy in another tab or device. In desktop UI
+mode, Workers opens when visible working or unknown work first appears; Pending
+opens when entries first appear, including paused entries. A deliberate collapse
+holds throughout that nonempty active-work or pending batch, including further
+arrivals. Once that batch is empty, the next batch opens again. Settlement alone
+never closes an open card, and finished-only history does not open Workers.
+Touch starts collapsed and opens only deliberately. Choices are page-local,
+bounded to 200 conversations and isolated by conversation and selected UI mode;
+switching modes is not a gesture, and temporary selection clearing during refresh
+does not end a batch. Tablet desktop mode follows desktop disclosure policy even
+when its touch-first controls retain comfortable density.
 Desktop cards share only a measured capacity, never an outer scroller. When both
 are collapsed the cap is 40% of the measured chat panel (and 25rem), with the
 lesser of 12rem or 35% reserved for conversation. Expanded fine-pointer/hover

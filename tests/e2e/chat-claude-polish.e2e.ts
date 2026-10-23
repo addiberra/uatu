@@ -500,7 +500,7 @@ test.describe("Claude Code chat polish (fixture-driven)", () => {
     await expect(workerNamed(page, "Watch the build")).toBeVisible();
   });
 
-  test("running work uses one deliberate disclosure and a user collapse survives new work", async ({ page, request }) => {
+  test("running work opens one desktop disclosure and a user collapse survives new work", async ({ page, request }) => {
     const id = await bootClaude(page, request, "Reachable running work", [
       { id: "message:u1", type: "user_message", createdAt: 1, text: "Run the suite and have an explorer read the tree" },
     ]);
@@ -511,8 +511,8 @@ test.describe("Claude Code chat polish (fixture-driven)", () => {
 
     const track = page.locator("#chat-compact-workers");
     await expect(track.locator("summary")).toContainText("2 working");
-    await expect(track).not.toHaveAttribute("open", "");
-    // Merely reporting work does not open a disclosure or move focus.
+    await expect(track).toHaveAttribute("open", "");
+    // New desktop work opens without moving focus.
     expect(await page.evaluate(() => document.activeElement?.id ?? "")).toBe(focusedBefore);
     await openTaskList(page);
     await expect(track.locator('[data-inspect-task="bgjpa"]')).toBeVisible();

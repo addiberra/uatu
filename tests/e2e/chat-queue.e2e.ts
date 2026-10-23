@@ -1,6 +1,6 @@
 import type { APIRequestContext, Page } from "@playwright/test";
 
-import { openChatPanel } from "./chat-helpers";
+import { openChatPanel, openChatPending } from "./chat-helpers";
 import { captureScreenshot } from "./evidence";
 import { expect, test } from "./fixtures";
 
@@ -81,7 +81,7 @@ test.describe("chat message queue", () => {
     await expect(page.locator("#chat-queue .is-held")).toHaveCount(2);
 
     // Removing a held message deletes it before it ever reaches the agent.
-    await page.locator("[data-pending-toggle]").click();
+    await openChatPending(page);
     const removal = page.waitForResponse(response => response.url().includes("/queue/") && response.request().method() === "DELETE");
     await page.locator("#chat-queue .is-held", { hasText: "Refine the plan" }).locator("[data-queue-remove]").click();
     expect((await removal).status()).toBe(200);
@@ -144,7 +144,7 @@ test.describe("chat message queue", () => {
     await expect(page.locator("#chat-composer-status")).toHaveAttribute("aria-label", "Cancelled");
     await expect(held.locator("[data-queue-send-now]")).toHaveCount(3);
     await expect(page.locator("#chat-queue .is-held[data-paused]")).toHaveCount(3);
-    await page.locator("[data-pending-toggle]").click();
+    await openChatPending(page);
     await captureScreenshot(page, testInfo, "claude-dormant-send-now");
 
     const sent = page.waitForResponse(response => response.url().endsWith("/send-now"));
