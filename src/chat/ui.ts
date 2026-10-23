@@ -3036,14 +3036,22 @@ export function initChat(api = new ChatApiClient()): void {
       recovered: () => { if (token === selectionGeneration) interruptions.clear("conversation"); },
     });
 
-  async function refreshSelectedConversation(id: string): Promise<boolean> {
+  async function refreshSelectedConversation(id: string, pendingEntry?: { id: string; action: PendingQueueAction }): Promise<boolean> {
     const token = selectionGeneration;
     const current = projection;
     if (!current || current.conversationId !== id || activeConversationId() !== id) return false;
     try {
-      return await runConversationRead("Updating conversation...", () => { void refreshSelectedConversation(id); }, async signal => {
-        const snapshot = await api.snapshot(id, undefined, signal);
+      return await runConversationRead("Updating conversation...", () => { void refreshSelectedConversation(id, pendingEntry); }, async signal => {
+        let snapshot = await api.snapshot(id, undefined, signal);
         if (signal.aborted || token !== selectionGeneration || projection?.conversationId !== id || activeConversationId() !== id) return false;
+        if (pendingEntry) {
+          // An omitted queue is legal on older snapshots, but is not evidence
+          // that a refused action's entry departed. Keep the current projection.
+          if (snapshot.conversation.id !== id || !Array.isArray(snapshot.queued)) throw new Error("Pending status check did not include the conversation queue.");
+          // A terminal event can overtake this read. Its positive evidence wins
+          // over an older snapshot while the action still owns its fence.
+          if (pendingEntry.action.terminal) snapshot = { ...snapshot, queued: snapshot.queued.filter(entry => entry.id !== pendingEntry.id) };
+        }
         const previousStream = stream;
         installConversationSnapshot(snapshot, projection.acceptedDrafts, token);
         if (conversationRefreshRecovery?.conversationId === id && conversationRefreshRecovery.token === token) {
@@ -3531,11 +3539,9 @@ export function initChat(api = new ChatApiClient()): void {
 
   // A pending entry's actions (opencode-v2-steering D10). The server answers
   // every one with a queue event that converges every client; nothing is
-  // changed optimistically. A 409 is the server stating the entry is not as
-  // the dock shows it — delivered while the click was in flight, removed
-  // elsewhere, or a stale echo a reload left behind — so the local copy
-  // reconciles to that instead of stranding buttons that can only ever 409;
-  // and a 409 carrying the already-delivered code is said as such ("Too late").
+  // changed optimistically. An ordinary 409 may only refuse the action while
+  // the server still holds the entry: reread before reconciling its ownership.
+  // Only positive already-delivered evidence removes it without that read.
   const checkUnconfirmedAction = (conversationId: string, operationId: string, action: string, text: string, subject = "acceptance") => {
     automaticNotes.unconfirmed(conversationId, operationId, action, text, subject);
     syncControls();
@@ -3544,7 +3550,7 @@ export function initChat(api = new ChatApiClient()): void {
       syncControls();
     });
   };
-  const queueActionFailed = (error: unknown, conversationId: string, messageId: string, steerAction: boolean, withdrawalAction: boolean, operationId: string, action: string, text: string, entry: QueuedMessage, pending: PendingQueueAction) => {
+  const queueActionFailed = async (error: unknown, conversationId: string, messageId: string, steerAction: boolean, withdrawalAction: boolean, operationId: string, action: string, text: string, entry: QueuedMessage, pending: PendingQueueAction) => {
     if (error instanceof ChatTransportError && (error.code === STEER_WITHDRAWAL_UNCONFIRMED_CODE
       || withdrawalAction && (error.status === undefined || error.status >= 500 || error.code === "operation_outcome_unknown"))) {
       if (pending.terminal) return;
@@ -3564,20 +3570,26 @@ export function initChat(api = new ChatApiClient()): void {
       return checkUnconfirmedAction(conversationId, operationId, action, text);
     }
     if (error instanceof ChatTransportError && error.status === 409) {
-      settleUnconfirmedWithdrawal(conversationId, messageId);
-      if (projection?.conversationId === conversationId) {
-        projection = protectUnconfirmedWithdrawals(dropQueuedMessage(projection, messageId));
-        scheduleRender();
-      }
       if (error.code === STEER_ALREADY_DELIVERED_CODE) {
+        settleUnconfirmedWithdrawal(conversationId, messageId);
+        if (projection?.conversationId === conversationId) {
+          projection = protectUnconfirmedWithdrawals(dropQueuedMessage(projection, messageId));
+          scheduleRender();
+        }
         // Streamed delivery can land after this response and clear the
         // transient announcement. Keep the refusal visible at the composer.
         setComposerError(TOO_LATE, conversationId);
-        noteComposer(TOO_LATE);
+        if (activeConversationId() === conversationId) noteComposer(TOO_LATE);
         return;
       }
+      if (pending.terminal) return;
+      const available = await refreshSelectedConversation(conversationId, { id: messageId, action: pending });
+      const message = `${messageOf(error)}${available ? "" : " Pending status could not be checked; no message was resent."}`;
+      setComposerError(message, conversationId);
+      if (activeConversationId() === conversationId) announce(message, true);
+      return;
     }
-    announce(messageOf(error), true);
+    if (activeConversationId() === conversationId) announce(messageOf(error), true);
   };
   // Edit: the entry leaves the dock first — removal or withdrawal — and the
   // composer takes its text and attachments only once that succeeded, so a

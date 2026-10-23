@@ -194,6 +194,10 @@ badge, a separate **Paused** chip when applicable, and message-specific actions.
 For duplicate text and image-only entries, accessible action names also identify
 a stable pending-message number while that entry remains in the dock. Each
 successful action updates the dock silently; errors and uncertain outcomes remain visible.
+An ordinary action refusal is not delivery evidence: the dock rereads the queue
+and keeps messages the server still holds. If that check fails or omits the
+queue, the current entry stays visible with an error. Nothing is automatically
+resent; an unconfirmed withdrawal still permits only an explicit withdrawal retry.
 Paused messages wait for your next message or an explicit send action.
 **Send N paused steers now** wakes them together. Sending a queued message as a
 steer also wakes paused steers; its label and confirmation explain that effect.

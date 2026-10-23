@@ -1,4 +1,6 @@
 import type { APIRequestContext, Locator, Page, TestInfo } from "@playwright/test";
+import type { ConversationSnapshot } from "../../src/chat/types";
+import type { OpenCodeV2FakeSessionState } from "./opencode-v2-fake";
 import { expect, test as base } from "./fixtures";
 import { attachPageDiagnosticsOnFailure, withEngineBrowsers } from "./page-diagnostics";
 import { evidencePath, recordEvidence, saveEvidence } from "./evidence";
@@ -76,10 +78,17 @@ async function submit(page: Page, text: string, delivery: "steer" | "queue" = "s
   await expect(page.locator("#chat-input")).toHaveValue("");
 }
 
-async function loaded(page: Page, request: APIRequestContext) {
+async function loaded(page: Page, request: APIRequestContext, { workersBeforeFinalTurn = false } = {}) {
   const id = await boot(page, request);
+  const launchWorkers = async () => {
+    await control(request, { op: "launchWorker", conversationId: id, background: false });
+    await control(request, { op: "launchWorker", conversationId: id });
+    await expect(page.locator("#chat-compact-workers-items [data-worker-item]")).toHaveCount(2);
+  };
   for (let index = 1; index <= 3; index++) {
     await submit(page, `Question ${index}`);
+    // This opt-in keeps the launches on the retained side of a later Revert.
+    if (workersBeforeFinalTurn && index === 3) await launchWorkers();
     await control(request, { op: "finish", conversationId: id, text: `Answer ${index}. ${"Readable conversation content. ".repeat(12)}` });
     await expect(page.locator("#chat-items")).toContainText(`Answer ${index}.`);
   }
@@ -88,9 +97,7 @@ async function loaded(page: Page, request: APIRequestContext) {
   await submit(page, "Steer two");
   await submit(page, "Queued work", "queue");
   await expect(page.locator(".chat-queued-message")).toHaveCount(3);
-  await control(request, { op: "launchWorker", conversationId: id, background: false });
-  await control(request, { op: "launchWorker", conversationId: id });
-  await expect(page.locator("#chat-compact-workers-items [data-worker-item]")).toHaveCount(2);
+  if (!workersBeforeFinalTurn) await launchWorkers();
   return id;
 }
 
@@ -512,10 +519,40 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`mobile layo
 
   test("landscape keyboard shares space with the replacement warning and paused batch", async ({ page, request }, testInfo) => {
     await safeAreas(page, { top: 0, bottom: 21, left: 47, right: 47 });
-    await loaded(page, request);
+    const id = await loaded(page, request, { workersBeforeFinalTurn: true });
+    const nativeMessages = async (): Promise<OpenCodeV2FakeSessionState["messages"]> => {
+      const state = await control(request, { op: "state" });
+      return state.sessions[id.replace(/^opencode:/, "")].messages;
+    };
+    const snapshot = async (): Promise<ConversationSnapshot> => {
+      const response = await page.request.get(`/api/chat/conversations/${encodeURIComponent(id)}`);
+      expect(response.ok()).toBe(true);
+      return response.json();
+    };
+    const stored = await nativeMessages();
+    const boundary = stored.findIndex(message => message.type === "user" && message.text === "Start the work");
+    const thirdQuestion = stored.findIndex(message => message.type === "user" && message.text === "Question 3");
+    // Question 3 is followed by exactly two launch records and its final answer,
+    // all before the final user turn. Read native storage, not injected DOM.
+    expect(thirdQuestion).toBeGreaterThanOrEqual(0);
+    expect(boundary - thirdQuestion).toBe(4);
+    const launches = stored.slice(thirdQuestion + 1, boundary - 1);
+    expect(launches.map(message => message.type)).toEqual(["assistant", "assistant"]);
+    const before = await snapshot();
+    const tools = before.items.filter(item => item.type === "tool" && item.name === "subagent");
+    expect(tools).toHaveLength(2);
     const reverted = page.waitForResponse(response => response.url().endsWith("/revert"));
     await page.locator("#chat-items").getByRole("button", { name: "Revert message", exact: true }).last().tap();
     expect((await reverted).ok()).toBe(true);
+    const after = await snapshot();
+    const boundaryId = `message:${stored[boundary]!.id}`;
+    expect(after.reversibleHistory?.revertedMessages.map(message => message.id)).toEqual([boundaryId]);
+    expect(after.items.some(item => item.id === boundaryId)).toBe(false);
+    expect(after.items.filter(item => item.type === "tool" && item.name === "subagent").map(item => item.id)).toEqual(tools.map(item => item.id));
+    const retained = (await nativeMessages()).slice(0, boundary);
+    expect(retained).toEqual(stored.slice(0, boundary));
+    await expect(page.locator("#chat-compact-workers-items [data-worker-item]")).toHaveCount(2);
+    await saveEvidence(testInfo, `landscape-${engine}-retained-launches.json`, JSON.stringify({ stored, boundaryId, launches, retained, tools, activeItemIds: after.items.map(item => item.id), reversibleHistory: after.reversibleHistory }, null, 2));
     await page.setViewportSize({ width: 844, height: 390 });
     await visualHeight(page, 230);
     await containedControls(page, 230);

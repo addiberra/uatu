@@ -284,6 +284,117 @@ describe("chat reversible-history composer", () => {
     }
   });
 
+  for (const scenario of ["held", "absent", "failed-read", "incomplete-read", "edit", "steer", "queue", "delivered-code", "early-terminal", "read-terminal", "switched", "read-switched", "withdrawal-retry"] as const) {
+    const name = `pending refusal reconciles ${scenario}`;
+    test(name, async () => {
+      if (process.env.UATU_PENDING_REFUSAL_CASE !== "1") {
+        const child = Bun.spawn({ cmd: [process.execPath, "test", import.meta.path, "-t", `${name}$`], env: { ...process.env, UATU_PENDING_REFUSAL_CASE: "1" }, stdout: "pipe", stderr: "pipe" });
+        const [stdout, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+        expect(code, `${stdout}\n${stderr}`).toBe(0);
+        return;
+      }
+      const { document, window } = parseHTML(html);
+      installDomGlobals(document, window);
+      document.documentElement.setAttribute("data-ui-mode", "desktop");
+      document.documentElement.setAttribute("data-chat-panel", "open");
+      stubConversationSelect(document);
+      const { ChatApiClient } = await import("./client");
+      const response = deferred<Response>(), recovery = deferred<ConversationSnapshot>();
+      const retry = scenario === "withdrawal-retry";
+      const action = retry ? "remove" : ["edit", "steer", "queue"].includes(scenario) ? scenario : "send-now";
+      const entry = { id: "native-original", text: "Still owned pending input", queuedAt: 1, delivery: scenario === "queue" || retry ? "steer" as const : "queue" as const, paused: true as const };
+      let mutations = 0, reads = 0;
+      const requests: string[] = [];
+      const transport = new ChatApiClient(async (url) => {
+        mutations++; requests.push(String(url));
+        if (retry && mutations === 1) return Response.json({ error: "Withdrawal unknown", code: "steer-withdrawal-unconfirmed" }, { status: 409 });
+        return response.promise;
+      });
+      let events: Parameters<ChatApiClient["stream"]>[2];
+      const api = {
+        status: async () => [{ agent: { id: "test", name: "Test" }, availability: { state: "ready", version: "test", agent: { id: "test", name: "Test", capabilities: ["steering", "send-now"] } } }],
+        conversations: async () => [conversation("one"), conversation("two")], commands: async () => [], models: async () => [], modes: async () => [],
+        snapshot: async (id: string) => {
+          reads++;
+          if (id === "two") return { ...snapshot(id), queued: [{ ...entry, text: "Other pending input" }] };
+          if (retry && mutations === 1) return { ...snapshot(id), queued: [] };
+          return mutations ? recovery.promise : { ...snapshot(id), conversation: { ...conversation(id), status: scenario === "steer" ? "running" : "idle" }, queued: [entry] };
+        },
+        sendNow: transport.sendNow.bind(transport), removeQueued: transport.removeQueued.bind(transport), changeDelivery: transport.changeDelivery.bind(transport),
+        stream: (_id: string, _cursor: string, handlers: typeof events) => { events = handlers; return { close() {} }; }, inventoryStream: () => ({ close() {} }), attachmentUrl: () => "",
+      } as unknown as ChatApiClient;
+      const { initChat } = await import(`./ui.ts?pending-refusal=${scenario}-${Date.now()}`);
+      initChat(api);
+      try {
+        const input = document.querySelector<HTMLTextAreaElement>("#chat-input")!;
+        await waitUntil(() => !!document.querySelector(`[data-queue-${action}="native-original"]`));
+        input.value = "Private draft";
+        const click = () => {
+          const target = document.querySelector<HTMLButtonElement>(`[data-queue-${action}="native-original"]`)!;
+          target.dispatchEvent(new window.Event("click", { bubbles: true }));
+          return target;
+        };
+        if (retry) {
+          click();
+          await waitUntil(() => document.querySelector('[data-queue-remove="native-original"]')?.textContent === "Retry withdrawal" && !document.querySelector<HTMLButtonElement>('[data-queue-remove="native-original"]')!.disabled);
+        }
+        const before = reads, expectedMutations = retry ? 2 : 1;
+        const target = click();
+        await waitUntil(() => mutations === expectedMutations);
+        const terminal = () => events!.event({ type: "conversation.queue", generation: "g", sequence: 1, conversationId: "one", queued: [], change: { kind: "delivered", messageId: entry.id } }, "cursor-terminal");
+        const switchConversation = async () => {
+          const select = document.querySelector<HTMLSelectElement>("#chat-conversation-select")!;
+          select.value = "two"; select.dispatchEvent(new window.Event("change", { bubbles: true }));
+          await waitUntil(() => !!document.querySelector('[data-chat-queued-id="native-original"]')?.textContent?.includes("Other pending input"));
+          input.value = "Other draft";
+        };
+        if (scenario === "early-terminal") terminal();
+        if (scenario === "switched") await switchConversation();
+        response.resolve(Response.json({ error: "Send now is unavailable while a turn is running", ...(scenario === "delivered-code" ? { code: "steer-already-delivered" } : {}) }, { status: 409 }));
+        const noRead = ["delivered-code", "early-terminal", "switched"].includes(scenario);
+        if (!noRead) {
+          await waitUntil(() => reads === before + 1);
+          await flush();
+          expect(target.disabled).toBe(true);
+          document.querySelector(`[data-queue-${action}="native-original"]`)?.dispatchEvent(new window.Event("click", { bubbles: true }));
+          expect(mutations).toBe(expectedMutations);
+          if (scenario === "read-terminal") terminal();
+          if (scenario === "read-switched") await switchConversation();
+          if (scenario === "failed-read") recovery.reject(new Error("Read unavailable"));
+          else recovery.resolve({ ...snapshot("one"), ...(scenario === "incomplete-read" ? {} : { queued: scenario === "absent" || retry ? [] : [entry] }) });
+        }
+        await waitUntil(() => !target.disabled);
+        await flush();
+        const switched = scenario === "switched" || scenario === "read-switched";
+        const departed = ["absent", "delivered-code", "early-terminal", "read-terminal"].includes(scenario);
+        const row = document.querySelector('[data-chat-queued-id="native-original"]');
+        expect(!!row).toBe(!departed);
+        expect(input.value).toBe(switched ? "Other draft" : "Private draft");
+        expect(mutations).toBe(expectedMutations);
+        if (switched) {
+          expect(row!.textContent).toContain("Other pending input");
+          expect(document.querySelector("#chat-composer-error")!.textContent).toBe("");
+          expect(document.querySelector("#chat-state")!.textContent).not.toContain("unavailable");
+        } else if (scenario !== "early-terminal") {
+          expect(document.querySelector("#chat-composer-error")!.textContent).toContain(scenario === "delivered-code" ? "already delivered" : "unavailable");
+          if (!departed) {
+            expect(document.querySelector<HTMLButtonElement>('[data-queue-remove="native-original"]')!.disabled).toBe(false);
+            if (retry) {
+              expect(requests[1]).toBe(requests[0]);
+              expect(document.querySelector('[data-queue-remove="native-original"]')!.textContent).toBe("Retry withdrawal");
+              expect(document.querySelector('[data-queue-edit="native-original"]')).toBeNull();
+            } else expect(document.querySelector<HTMLButtonElement>('[data-queue-edit="native-original"]')!.disabled).toBe(false);
+          }
+          if (scenario === "failed-read" || scenario === "incomplete-read") expect(document.querySelector("#chat-composer-error")!.textContent).toContain("could not be checked");
+          // Routine stream/status paints must not erase the refusal.
+          events!.event({ type: "conversation.status", generation: "g", sequence: scenario === "read-terminal" ? 2 : 1, conversationId: "one", status: "idle" }, "cursor-status");
+          await flush();
+          expect(document.querySelector("#chat-composer-error")!.textContent).toContain(scenario === "delivered-code" ? "already delivered" : "unavailable");
+        }
+      } finally { window.dispatchEvent(new window.Event("pagehide")); }
+    });
+  }
+
   for (const failure of ["typed", "network", "server", "missing-ack"] as const) for (const terminal of ["none", "removed", "delivered"] as const) for (const switched of [false, true]) for (const action of ["remove", "edit", "queue"] as const) {
     if (terminal !== "none" && action !== "remove") continue;
     const name = `unconfirmed withdrawal on ${action} ${switched ? "cannot affect a newly selected conversation" : "retains input and retries withdrawal only"}${terminal === "none" ? "" : ` after early ${terminal}`}${failure === "typed" ? "" : ` after ${failure} failure`}`;
@@ -465,8 +576,13 @@ describe("chat reversible-history composer", () => {
           expect(mutations).toBe(0);
         } else if (outcome.startsWith("refused")) {
           response.resolve(Response.json({ error: "Definite refusal" }, { status: outcome === "refused-400" ? 400 : 409 }));
-          await waitUntil(() => document.querySelector("#chat-state")!.textContent!.includes("Definite refusal"));
-          expect(reads).toBe(before);
+          if (outcome === "refused-409") {
+            await waitUntil(() => reads === before + 1);
+            recovery.resolve({ ...snapshot("one"), queued: [original] });
+            await waitUntil(() => document.querySelector("#chat-composer-error")!.textContent!.includes("Definite refusal"));
+            expect(document.querySelector('[data-chat-queued-id="native-original"]')).not.toBeNull();
+          } else await waitUntil(() => document.querySelector("#chat-state")!.textContent!.includes("Definite refusal"));
+          expect(reads).toBe(before + (outcome === "refused-409" ? 1 : 0));
         } else {
           response.reject(new TypeError("Failed to fetch"));
           await waitUntil(() => reads === before + 1);
