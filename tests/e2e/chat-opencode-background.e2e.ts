@@ -504,6 +504,133 @@ for (const boundary of ["browser", "upstream"] as const) {
   });
 }
 
+for (const engine of ["chromium", "webkit"] as const) for (const mode of ["touch", "desktop"] as const) {
+  test(`foreground-only parent Stop owns canonical scope and confirmation: ${engine} ${mode}`, async ({ launchBrowser, request, baseURL }) => {
+    const touch = mode === "touch";
+    const browser = await launchBrowser(engine);
+    const page = await browser.newPage({ baseURL, viewport: { width: touch ? 390 : 1280, height: 844 }, hasTouch: touch, isMobile: touch });
+    try {
+      const conversationId = await boot(page, request);
+      const nativeId = conversationId.replace(/^opencode:/, "");
+      // Stage input before launching the foreground dependency: sending a steer
+      // afterwards would intentionally background it and miss this regression.
+      await page.locator("#chat-input").fill("Pending foreground steer");
+      await page.locator("#chat-send").click();
+      await expect(page.locator("#chat-input")).toHaveValue("");
+      await page.locator("#chat-input").fill("Held foreground queue");
+      await expect(page.locator("#chat-send")).toBeEnabled();
+      await page.locator("#chat-input").press("Alt+Enter");
+      await expect(page.locator("#chat-input")).toHaveValue("");
+      await page.locator("#chat-input").fill("Foreground draft survives");
+      await expect(page.locator("#chat-send")).toBeEnabled();
+      const worker = await control(request, { op: "launchWorker", conversationId, background: false });
+      await openChatWorkers(page);
+      const row = page.locator('#chat-compact-workers-items .chat-worker-row[data-state="working"]');
+      await expect(row).toHaveCount(1);
+      await expect(row).toHaveAttribute("data-worker-id", `tool:${worker.callId}`);
+      await expect(row.locator("[data-stop-task]")).toHaveCount(0);
+      const readSnapshot = async () => {
+        // Share the page's normal authentication; the global request fixture
+        // has no authenticated chat cookie.
+        const response = await page.request.get(`/api/chat/conversations/${encodeURIComponent(conversationId)}`);
+        expect(response.ok()).toBe(true);
+        return response.json();
+      };
+      const before = await readSnapshot();
+      expect(before.items.filter((item: { type: string }) => item.type === "background_task")).toEqual([]);
+      expect(before.queued.map((entry: { text: string }) => entry.text)).toEqual(["Pending foreground steer", "Held foreground queue"]);
+      const nativeBefore = await control(request, { op: "state" });
+      const inspect = row.locator(".chat-worker-inspect");
+      await inspect.focus();
+      await control(request, { op: "workerReport", childId: worker.childId, usedModel: "Foreground fixture", costUsd: 0 });
+      await expect(row.locator(".chat-worker-model-name")).toHaveText("Foreground fixture");
+      await expect(inspect).toBeFocused();
+      const stop = page.locator("#chat-stop");
+      await expect(stop).toHaveAccessibleName("Stop parent");
+      await expect(stop).toHaveText("Stop parent");
+      await expect(stop).toHaveAttribute("title", /still-blocking work.*Detached workers continue.*wake the parent again/);
+      const mutations: string[] = [];
+      page.on("request", request => {
+        if (request.method() === "POST" && /\/(cancel|tasks\/[^/]+\/stop)$/.test(new URL(request.url()).pathname)) mutations.push(new URL(request.url()).pathname);
+      });
+      const confirmation = page.getByRole("dialog", { name: "Stop parent?", exact: true });
+      if (touch) {
+        for (const dismiss of ["cancel", "escape"] as const) {
+          await stop.click();
+          await expect(confirmation).toBeVisible();
+          await expect(confirmation.getByRole("button", { name: "Cancel", exact: true })).toBeFocused();
+          await expect(confirmation).toContainText("still-blocking foreground work");
+          await expect(confirmation).toContainText("Detached workers continue");
+          await expect(confirmation).toContainText("wake the parent again");
+          if (dismiss === "cancel") await confirmation.getByRole("button", { name: "Cancel", exact: true }).click();
+          else await page.keyboard.press("Escape");
+          await expect(confirmation).toBeHidden();
+          await expect(stop).toBeFocused();
+          await expect(page.locator("#chat-compact-workers")).toHaveAttribute("open", "");
+          expect(mutations).toEqual([]);
+          expect((await control(request, { op: "state" })).calls.filter((call: string) => call.startsWith("POST ") && call.includes("/interrupt"))).toEqual([]);
+        }
+      }
+      const cancelled = page.waitForResponse(response => response.url().endsWith("/cancel") && response.request().method() === "POST");
+      await stop.click();
+      if (touch) await confirmation.getByRole("button", { name: "Stop parent", exact: true }).click();
+      else await expect(confirmation).toBeHidden();
+      expect((await cancelled).ok()).toBe(true);
+      await expect(stop).toBeDisabled();
+      await expect(page.locator('#chat-compact-workers-items [data-state="working"]')).toHaveCount(0);
+      await expect(page.locator('#chat-compact-workers-items [data-state="failed"]')).toHaveCount(1);
+      await expect(stop).toHaveAccessibleName("Stop response");
+      await expect(page.locator("#chat-input")).toHaveValue("Foreground draft survives");
+      const after = await readSnapshot();
+      expect(after.queued.map((entry: { id: string }) => entry.id)).toEqual(before.queued.map((entry: { id: string }) => entry.id));
+      expect(after.queued.map((entry: { text: string }) => entry.text)).toEqual(before.queued.map((entry: { text: string }) => entry.text));
+      expect(mutations).toEqual([`/api/chat/conversations/${encodeURIComponent(conversationId)}/cancel`]);
+      const stopped = await control(request, { op: "state" });
+      expect(stopped.sessions[worker.childId].running).toBe(false);
+      expect(stopped.sessions[nativeId].pending.map((entry: { id: string }) => entry.id)).toEqual(nativeBefore.sessions[nativeId].pending.map((entry: { id: string }) => entry.id));
+      expect(stopped.calls.filter((call: string) => call.startsWith("POST ") && call.includes("/interrupt"))).toEqual([`POST /api/session/${nativeId}/interrupt?resume=false`]);
+      expect(stopped.calls.filter((call: string) => call.startsWith("POST ") && call.includes("/background"))).toEqual([]);
+
+      if (touch) {
+        const startForeground = async () => {
+          await page.getByRole("button", { name: "New conversation" }).click();
+          await expect(page.locator("#chat-state")).toContainText("Started new conversation with OpenCode");
+          const id = await page.locator("#chat-conversation-select").inputValue();
+          await page.locator("#chat-input").fill("Revalidate parent fixture");
+          await page.locator("#chat-send").click();
+          await expect(stop).toBeEnabled();
+          await control(request, { op: "launchWorker", conversationId: id, background: false });
+          await expect(stop).toHaveAccessibleName("Stop parent");
+          await stop.click();
+          await expect(confirmation).toBeVisible();
+          return id;
+        };
+        const settling = await startForeground();
+        await control(request, { op: "finish", conversationId: settling, text: "Parent settled during confirmation" });
+        await expect(stop).toBeDisabled();
+        await confirmation.getByRole("button", { name: "Stop parent", exact: true }).click();
+        await expect(confirmation).toBeHidden();
+        expect(mutations).toHaveLength(1);
+        const switching = await startForeground();
+        // Model a selection change arriving while the native modal owns input.
+        // This still uses the public select/change path, not application state.
+        await page.locator("#chat-conversation-select").evaluate((select: HTMLSelectElement, id) => {
+          select.value = id;
+          select.dispatchEvent(new Event("change", { bubbles: true }));
+        }, conversationId);
+        await expect(page.locator("#chat-conversation-select")).toHaveValue(conversationId);
+        await expect(page.locator("#chat-input")).toHaveValue("Foreground draft survives");
+        await confirmation.getByRole("button", { name: "Stop parent", exact: true }).click();
+        await expect(confirmation).toBeHidden();
+        expect(mutations).toHaveLength(1);
+        const revalidated = await control(request, { op: "state" });
+        expect(revalidated.sessions[switching.replace(/^opencode:/, "")].running).toBe(true);
+        expect(revalidated.calls.filter((call: string) => call.startsWith("POST ") && call.includes("/interrupt"))).toEqual([`POST /api/session/${nativeId}/interrupt?resume=false`]);
+      }
+    } finally { await page.close(); }
+  }, 60_000);
+}
+
 test("Stop parent cancels blocking children, preserves detached work and paused input; native wake preserves the draft", async ({ page, request }) => {
   const conversationId = await boot(page, request);
   const nativeId = conversationId.replace(/^opencode:/, "");

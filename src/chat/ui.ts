@@ -2726,6 +2726,10 @@ export function initChat(api = new ChatApiClient()): void {
 
   const sideAnswers = new Map<string, { question: string; text: string; failed?: boolean }>();
   const sideGenerating = new Set<string>();
+  // Use the same canonical occurrences as Workers, including foreground agents.
+  // Unknown workers remain inspectable, but are not confirmed live work.
+  const hasLiveWorkers = () => declares("background-blocking-work")
+    && compactWorkers(projection?.items ?? []).some(worker => worker.state === "working");
   const syncControls = () => {
     const status = projection?.status ?? null;
     if (status !== lastStatus) {
@@ -2760,7 +2764,7 @@ export function initChat(api = new ChatApiClient()): void {
     send.disabled = submitting || cancelling || !projection || !hasContent;
     if (stop) {
       stop.disabled = cancelling || !projection || !running;
-      const workers = declares("background-blocking-work") && projection?.items.some(item => item.type === "background_task" && item.status === "running");
+      const workers = hasLiveWorkers();
       stop.classList.toggle("has-worker-scope", declares("background-blocking-work"));
       stop.setAttribute("aria-label", workers ? "Stop parent" : "Stop response");
       stop.textContent = workers ? "Stop parent" : "Stop";
@@ -4969,7 +4973,7 @@ export function initChat(api = new ChatApiClient()): void {
     // Captured for the round trip: a failure landing after a switch belongs
     // to the conversation whose turn was being cancelled.
     const conversationId = projection.conversationId;
-    if (document.documentElement.dataset.uiMode === "touch" && declares("background-blocking-work") && projection.items.some(item => item.type === "background_task" && item.status === "running")) {
+    if (document.documentElement.dataset.uiMode === "touch" && hasLiveWorkers()) {
       if (!await confirmChatAction("Stop parent?", "Stops the parent and its still-blocking foreground work. Detached workers continue; their later notifications can wake the parent again.", "Stop parent", stop)) return;
       if (projection?.conversationId !== conversationId || !isLiveConversationStatus(projection.status) || cancelling) return;
     }

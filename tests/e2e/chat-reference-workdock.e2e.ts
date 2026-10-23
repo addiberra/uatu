@@ -202,16 +202,6 @@ for (const engine of ["chromium", "webkit"] as const) for (const touch of [false
               await expect.poll(() => page.locator("#chat-work-dock").evaluate(node => node.getBoundingClientRect().height)).toBeCloseTo(budget.dock, 0);
               await saveEvidence(info, "expanded-budget-before-after.json", JSON.stringify({ before, after: budget.dock, conversation: budget.transcript, remaining: budget.remaining, baseline: "005cb41 normal-size CSS caps reconstructed over the same 20+20 state" }, null, 2));
             }
-            // Resizing the transcript restores its coordinated reading anchor.
-            // Let that layout consequence finish before testing native scroll
-            // isolation; do not misattribute a pending restore to the wheel.
-            let previousState = "", stableState = 0;
-            await expect.poll(async () => {
-              const current = JSON.stringify(await scrollState());
-              stableState = current === previousState ? stableState + 1 : 0;
-              previousState = current;
-              return stableState;
-            }, { intervals: [100] }).toBeGreaterThanOrEqual(2);
             // Mobile WebKit does not expose wheel input. Its hardware-keyboard
             // PageDown performs native scroll routing through a pane action;
             // Chromium still covers real wheel and touch gestures below.
@@ -219,6 +209,30 @@ for (const engine of ["chromium", "webkit"] as const) for (const touch of [false
               const nativeKey = touch && engine === "webkit";
               if (nativeKey) await page.locator(`#${id} button`).first().focus();
               await page.locator(`#${id}`).evaluate(node => node.scrollTop = 0);
+              // Focus and restored layout can schedule resize/reading-anchor
+              // corrections. Wall-clock polling can look stable while rendering
+              // is paused: require three unchanged actual frames after setup,
+              // including pane/header geometry, before the pre-input baseline.
+              const ready = await page.evaluateHandle(() => {
+                let previous = "", stable = 0, frame = 0;
+                const sample = () => {
+                  const current = JSON.stringify({
+                    panes: ["chat-compact-workers-items", "chat-queue-content", "chat-work-dock", "chat-timeline"].map(id => {
+                      const node = document.getElementById(id)!;
+                      return [id, node.scrollTop, node.clientHeight, node.scrollHeight, node.getBoundingClientRect().toJSON()];
+                    }),
+                    headers: [...document.querySelectorAll("#chat-compact-workers > summary, [data-pending-toggle]")].map(node => node.getBoundingClientRect().toJSON()),
+                    active: document.querySelector("#chat-work-dock")?.getAttribute("data-work-active"),
+                  });
+                  stable = current === previous ? stable + 1 : 0; previous = current;
+                  if (stable < 3) frame = requestAnimationFrame(sample);
+                };
+                frame = requestAnimationFrame(sample);
+                return { get stable() { return stable; }, stop: () => cancelAnimationFrame(frame) };
+              });
+              try {
+                await expect.poll(() => ready.evaluate(state => state.stable)).toBeGreaterThanOrEqual(3);
+              } finally { await ready.evaluate(state => state.stop()); await ready.dispose(); }
               const before = await scrollState();
               const headerBefore = [await card.locator(":scope > summary").boundingBox(), await pending.boundingBox()];
               // Keep a sticky record of sibling/header movement, including

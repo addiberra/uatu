@@ -2903,6 +2903,171 @@ describe("a typed command's silent run", () => {
 });
 
 describe("chat running work reachable without a disclosure", () => {
+  test("touch foreground-only parent Stop explains native scope before cancelling the parent once", async () => {
+    const { document, window } = parseHTML(html);
+    installDomGlobals(document, window);
+    document.documentElement.setAttribute("data-ui-mode", "touch");
+    document.documentElement.setAttribute("data-active-tab", "chat");
+    stubConversationSelect(document);
+    const tool = { id: "tool:foreground", type: "tool" as const, createdAt: 2, name: "task", status: "running" as const,
+      input: JSON.stringify({ description: "Foreground analysis", subagent_type: "general", prompt: "Inspect" }) };
+    const cancelled: string[] = [], stopped: string[] = [];
+    const api = taskApi(document, { items: () => [tool], stop: id => { stopped.push(id); } });
+    api.status = async () => [{ agent: { id: "test", name: "Test" }, availability: { state: "ready", version: "test", agent: { id: "test", name: "Test", capabilities: ["background-blocking-work", "subagents"] } } }];
+    api.snapshot = async id => ({ ...snapshot(id), conversation: { ...conversation(id), status: "running" }, items: [tool] });
+    api.cancel = async id => { cancelled.push(id); return { cancelled: true }; };
+    const dialog = document.querySelector<HTMLDialogElement>("#chat-action-confirm")!;
+    dialog.showModal = () => { dialog.setAttribute("open", ""); };
+    const close = (value: string) => {
+      dialog.returnValue = value;
+      dialog.removeAttribute("open");
+      dialog.dispatchEvent(new window.Event("close"));
+    };
+    try {
+      const { initChat } = await import(`./ui.ts?foreground-parent-stop=${Date.now()}`);
+      initChat(api);
+      const stop = document.querySelector<HTMLButtonElement>("#chat-stop")!;
+      await waitUntil(() => !stop.disabled);
+      expect(document.querySelectorAll('#chat-compact-workers-items [data-state="working"]')).toHaveLength(1);
+      expect(document.querySelector("[data-stop-task]")).toBeNull();
+      expect(stop.getAttribute("aria-label")).toBe("Stop parent");
+      expect(stop.textContent).toBe("Stop parent");
+      expect(stop.title).toContain("still-blocking work");
+      stop.click();
+      expect(dialog.hasAttribute("open")).toBe(true);
+      expect(dialog.textContent).toContain("foreground work");
+      expect(dialog.textContent).toContain("Detached workers continue");
+      expect(dialog.textContent).toContain("wake the parent again");
+      expect(cancelled).toEqual([]);
+      close("cancel");
+      await flush();
+      expect(cancelled).toEqual([]);
+      stop.click();
+      close("confirm");
+      await flush();
+      expect(cancelled).toEqual(["one"]);
+      expect(stopped).toEqual([]);
+    } finally { window.dispatchEvent(new window.Event("pagehide")); }
+  });
+
+  test("parent Stop follows canonical confirmed worker truth through aliases, mixed work and settlement", async () => {
+    const { document, window } = parseHTML(html);
+    installDomGlobals(document, window);
+    document.documentElement.setAttribute("data-ui-mode", "touch");
+    document.documentElement.setAttribute("data-active-tab", "chat");
+    stubConversationSelect(document);
+    const launcher = { id: "tool:a", type: "tool" as const, createdAt: 2, name: "task", status: "running" as const, input: '{"description":"Aliased analysis"}' };
+    const canonical = { id: "task:canonical", type: "background_task" as const, taskId: "canonical", createdAt: 2,
+      description: "Aliased analysis", taskType: "agent", status: "running" as const, toolUseIds: ["a", "b"], stateUncertain: true };
+    const items = [launcher, { ...launcher, id: "tool:b" }, canonical];
+    let stream: { event(event: unknown, cursor: string): void } | undefined;
+    const api = taskApi(document, { items: () => items, onStream: (_id, handlers) => { stream = handlers; } });
+    api.status = async () => [{ agent: { id: "test", name: "Test" }, availability: { state: "ready", version: "test", agent: { id: "test", name: "Test", capabilities: ["background-blocking-work", "background-tasks", "subagents"] } } }];
+    api.snapshot = async id => ({ ...snapshot(id), conversation: { ...conversation(id), status: "running" }, items });
+    let sequence = 0;
+    const emit = (body: Record<string, unknown>) => { sequence++; stream!.event({ generation: "g", sequence, conversationId: "one", ...body }, `cursor-one-${sequence}`); };
+    const rows = (state: string) => document.querySelectorAll(`#chat-compact-workers-items [data-state="${state}"]`);
+    const stop = document.querySelector<HTMLButtonElement>("#chat-stop")!;
+    try {
+      const { initChat } = await import(`./ui.ts?canonical-parent-stop=${Date.now()}`);
+      initChat(api);
+      await waitUntil(() => stream !== undefined && !stop.disabled);
+      expect(rows("unknown")).toHaveLength(1);
+      expect(document.querySelector<HTMLButtonElement>("[data-stop-task]")!.disabled).toBe(true);
+      expect(stop.getAttribute("aria-label")).toBe("Stop response");
+      emit({ type: "item.upsert", item: { ...canonical, stateUncertain: false } });
+      await waitUntil(() => rows("working").length === 1);
+      expect(stop.getAttribute("aria-label")).toBe("Stop parent");
+      expect(document.querySelectorAll("[data-stop-task]")).toHaveLength(1);
+      const foreground = { ...launcher, id: "tool:foreground", input: '{"description":"Foreground analysis"}' };
+      emit({ type: "item.upsert", item: foreground });
+      await waitUntil(() => rows("working").length === 2);
+      expect(stop.getAttribute("aria-label")).toBe("Stop parent");
+      expect(document.querySelectorAll("[data-stop-task]")).toHaveLength(1);
+      emit({ type: "item.upsert", item: { ...canonical, stateUncertain: false, status: "completed" } });
+      await waitUntil(() => rows("completed").length === 1);
+      expect(rows("working")).toHaveLength(1);
+      expect(stop.getAttribute("aria-label")).toBe("Stop parent");
+      for (const [status, state] of [["cancelled", "stopped"], ["failed", "failed"], ["completed", "completed"]]) {
+        emit({ type: "item.upsert", item: { ...foreground, status } });
+        await waitUntil(() => rows(state!).length > 0 && rows("working").length === 0);
+        expect(stop.getAttribute("aria-label")).toBe("Stop response");
+        expect(document.querySelector("[data-stop-task]")).toBeNull();
+      }
+      emit({ type: "item.upsert", item: foreground });
+      await waitUntil(() => rows("working").length === 1);
+      emit({ type: "conversation.status", status: "completed" });
+      await waitUntil(() => stop.disabled);
+      expect(stop.getAttribute("aria-label")).toBe("Stop parent");
+    } finally { window.dispatchEvent(new window.Event("pagehide")); }
+  });
+
+  for (const change of ["settles", "switches"] as const) test(`touch parent Stop revalidates when its parent ${change} during confirmation`, async () => {
+    const { document, window } = parseHTML(html);
+    installDomGlobals(document, window);
+    document.documentElement.setAttribute("data-ui-mode", "touch");
+    document.documentElement.setAttribute("data-active-tab", "chat");
+    stubConversationSelect(document);
+    const tool = { id: "tool:foreground", type: "tool" as const, createdAt: 2, name: "task", status: "running" as const, input: '{"description":"Foreground analysis"}' };
+    let stream: { event(event: unknown, cursor: string): void } | undefined;
+    const cancelled: string[] = [];
+    const api = taskApi(document, { items: () => [tool], conversations: ["one", "two"], onStream: (_id, handlers) => { stream = handlers; } });
+    api.status = async () => [{ agent: { id: "test", name: "Test" }, availability: { state: "ready", version: "test", agent: { id: "test", name: "Test", capabilities: ["background-blocking-work", "subagents"] } } }];
+    api.snapshot = async id => ({ ...snapshot(id), conversation: { ...conversation(id), status: "running" }, items: [tool] });
+    api.cancel = async id => { cancelled.push(id); return { cancelled: true }; };
+    const dialog = document.querySelector<HTMLDialogElement>("#chat-action-confirm")!;
+    dialog.showModal = () => { dialog.setAttribute("open", ""); };
+    try {
+      const { initChat } = await import(`./ui.ts?parent-stop-revalidate=${change}-${Date.now()}`);
+      initChat(api);
+      const stop = document.querySelector<HTMLButtonElement>("#chat-stop")!;
+      await waitUntil(() => stream !== undefined && !stop.disabled);
+      stop.click();
+      expect(dialog.hasAttribute("open")).toBe(true);
+      if (change === "settles") {
+        stream!.event({ type: "conversation.status", generation: "g", sequence: 1, conversationId: "one", status: "completed" }, "cursor-one-1");
+        await waitUntil(() => stop.disabled);
+      } else {
+        const select = document.querySelector<HTMLSelectElement>("#chat-conversation-select")!;
+        select.value = "two";
+        select.dispatchEvent(new window.Event("change", { bubbles: true }));
+        await flush();
+        await waitUntil(() => !stop.disabled);
+      }
+      dialog.returnValue = "confirm";
+      dialog.removeAttribute("open");
+      dialog.dispatchEvent(new window.Event("close"));
+      await flush();
+      expect(cancelled).toEqual([]);
+    } finally { window.dispatchEvent(new window.Event("pagehide")); }
+  });
+
+  for (const [mode, supported] of [["desktop", true], ["desktop", false], ["touch", false]] as const) test(`${mode} foreground parent Stop retains direct cancellation with V2 scope ${supported ? "supported" : "unsupported"}`, async () => {
+    const { document, window } = parseHTML(html);
+    installDomGlobals(document, window);
+    document.documentElement.setAttribute("data-ui-mode", mode);
+    document.documentElement.setAttribute("data-chat-panel", "open");
+    document.documentElement.setAttribute("data-active-tab", "chat");
+    stubConversationSelect(document);
+    const tool = { id: "tool:foreground", type: "tool" as const, createdAt: 2, name: "task", status: "running" as const, input: '{"description":"Foreground analysis"}' };
+    const cancelled: string[] = [];
+    const api = taskApi(document, { items: () => [tool] });
+    api.status = async () => [{ agent: { id: "test", name: "Test" }, availability: { state: "ready", version: "test", agent: { id: "test", name: "Test", capabilities: supported ? ["background-blocking-work", "subagents"] : ["subagents"] } } }];
+    api.snapshot = async id => ({ ...snapshot(id), conversation: { ...conversation(id), status: "running" }, items: [tool] });
+    api.cancel = async id => { cancelled.push(id); return { cancelled: true }; };
+    try {
+      const { initChat } = await import(`./ui.ts?parent-stop-direct=${mode}-${supported}-${Date.now()}`);
+      initChat(api);
+      const stop = document.querySelector<HTMLButtonElement>("#chat-stop")!;
+      await waitUntil(() => !stop.disabled);
+      expect(stop.getAttribute("aria-label")).toBe(supported ? "Stop parent" : "Stop response");
+      stop.click();
+      await flush();
+      expect(document.querySelector("#chat-action-confirm[open]")).toBeNull();
+      expect(cancelled).toEqual(["one"]);
+    } finally { window.dispatchEvent(new window.Event("pagehide")); }
+  });
+
   test("pending/running tools, detached workers and an idle parent never introduce a manual Continue control", async () => {
     const { document, window } = parseHTML(html);
     installDomGlobals(document, window);

@@ -1,4 +1,5 @@
 import { describe, expect, test, spyOn, jest } from "bun:test";
+import { AsyncLocalStorage } from "node:async_hooks";
 
 import { BackgroundTasksUnsupportedError, ChatQueueFullError, CommandAttachmentsError, CommandSteeringError, ConversationRenameUnsupportedError, deriveConversationTitle, InteractionConflictError, InvalidConversationTitleError, InvalidModeSelectionError, InvalidModelSelectionError, InvalidVariantSelectionError, ChatAdapter, parseSlashCommand, QueuedMessageNotHeldError, ReversibleHistoryUnsupportedError, ScheduledWakeupsUnsupportedError, SendNowUnavailableError, SendNowUnsupportedError, SteerAlreadyDeliveredError, SteeringUnsupportedError, SteerWithdrawalUnconfirmedError, UnknownAttachmentError, UsageUnsupportedError } from "./adapter";
 import { createClaudeEventMemory, normalizeClaudeMessage } from "./claude/normalization";
@@ -722,6 +723,14 @@ for (const failure of ["http-503", "transport"] as const) test(`real V2 reconnec
   const directory = process.cwd();
   const fake = startOpenCodeV2Fake({ directory });
   let reconnect = false, failInbox = false, failedReads = 0, subscriptions = 0;
+  const inboxOwner = new AsyncLocalStorage<{ kind: "covered" | "background"; generation: number }>();
+  let holdBackground = true, backgroundReleased!: () => void, releaseBackground!: () => void;
+  const backgroundDone = new Promise<void>(resolve => { backgroundReleased = resolve; });
+  const backgroundGate = new Promise<void>(resolve => { releaseBackground = resolve; });
+  let delayedProbe: { generation: number; enteredWith: number; releasedWith?: number; aborted?: boolean } | undefined;
+  let handshakes = 0;
+  const handshakesAtFailure: number[] = [];
+  const reads: { owner: string; generation: number; enteredAt: number; enteredWith: number; abortedAtEntry: boolean; injectedAt?: number; injectedWith?: number }[] = [];
   const requests: string[] = [];
   const subscribersAtFailure: number[] = [];
   let requested!: () => void, release!: () => void;
@@ -735,15 +744,47 @@ for (const failure of ["http-503", "transport"] as const) test(`real V2 reconnec
       subscriptions++;
       if (reconnect) { requested(); await eventGate; }
     }
-    if (failInbox && request.method === "GET" && pathname.endsWith("/inbox")) {
+    const owner = inboxOwner.getStore();
+    const inbox = request.method === "GET" && pathname.endsWith("/inbox");
+    const read: typeof reads[number] | undefined = inbox ? { owner: owner?.kind ?? "unknown", generation: owner?.generation ?? -1, enteredAt: performance.now(), enteredWith: fake.state().eventSubscribers, abortedAtEntry: request.signal.aborted } : undefined;
+    if (read) reads.push(read);
+    // Background inventory also reads /inbox. Let a real old-generation probe
+    // reach the fault seam while the new stream is gated: it is not the
+    // authoritative pending-steer read this failure is meant to exercise.
+    if (inbox && owner?.kind === "background" && holdBackground) {
+      holdBackground = false;
+      delayedProbe = { generation: owner.generation, enteredWith: fake.state().eventSubscribers };
+      await backgroundGate;
+      delayedProbe.releasedWith = fake.state().eventSubscribers;
+      delayedProbe.aborted = request.signal.aborted;
+      backgroundReleased();
+    }
+    if (failInbox && inbox && owner?.kind === "covered") {
       failedReads++;
       subscribersAtFailure.push(fake.state().eventSubscribers);
+      handshakesAtFailure.push(handshakes);
+      read!.injectedAt = performance.now();
+      read!.injectedWith = fake.state().eventSubscribers;
       if (failure === "transport") throw new Error("Scripted inbox transport failure");
       return Response.json({ error: "Scripted inbox unavailable" }, { status: 503 });
     }
     return fetch(request);
   }) as typeof fetch;
   const provider = createOpenCodeV2Provider({ endpoint: fake.url, password: fake.password, directory, fetch: transport });
+  // Tag public calls without replacing their implementation or transport.
+  // Async ownership matters: a global /inbox flag can fault an unrelated old
+  // inventory probe after stop, and mistake that probe for reconnect recovery.
+  const listInbox = provider.listPendingInbox!.bind(provider);
+  provider.listPendingInbox = (...args) => inboxOwner.run({ kind: "covered", generation: subscriptions }, () => listInbox(...args));
+  const background = provider.reconcileBackgroundTasks!.bind(provider);
+  provider.reconcileBackgroundTasks = (...args) => inboxOwner.run({ kind: "background", generation: subscriptions }, () => background(...args));
+  const events = provider.events.bind(provider);
+  provider.events = async function* (signal) {
+    for await (const event of events(signal)) {
+      if (event.eventType === "server.connected") handshakes++;
+      yield event;
+    }
+  };
   const adapter = new ChatAdapter({ provider, workspacePath: directory, coalesceWindowMs: 0 });
   let pump = adapter.startEventPump();
   try {
@@ -752,16 +793,21 @@ for (const failure of ["http-503", "transport"] as const) test(`real V2 reconnec
     await adapter.prompt(session.id, "initial", "Initial work");
     const steer = await adapter.prompt(session.id, "steer", "A delivered before handshake", undefined, undefined, undefined, undefined, "steer");
     const held = await adapter.prompt(session.id, "held", "Retain the held owner", undefined, undefined, undefined, undefined, "queue");
+    await waitUntil(() => delayedProbe !== undefined);
     await adapter.stopEventPump(); await pump;
     await waitUntil(() => fake.state().eventSubscribers === 0);
     reconnect = true;
     failInbox = true;
     pump = adapter.startEventPump();
     await eventRequested;
+    releaseBackground();
+    await backgroundDone;
+    expect(delayedProbe).toEqual({ generation: 1, enteredWith: 1, releasedWith: 0, aborted: true });
     fake.step(session.id);
     const external = await provider.prompt(session.id, { id: "external-before-failed-read", text: "B pending before handshake", delivery: "steer" });
     expect(fake.state().sessions[session.id]!.pending.map(entry => entry.id)).toEqual([external.messageId]);
     const beforeRecovery = requests.length;
+    expect(reads.filter(read => read.owner === "covered" && read.generation === 2)).toEqual([]);
     release();
     await waitUntil(() => failedReads > 0);
     // The live stream is healthy, but missed A/B changes cannot be recovered
@@ -769,8 +815,11 @@ for (const failure of ["http-503", "transport"] as const) test(`real V2 reconnec
     const result = await adapter.history(session.id).catch(error => error);
     expect(result).toBeInstanceOf(Error);
     expect((result as Error).message).toContain("Inbox recovery unavailable");
-    expect(subscribersAtFailure.every(count => count === 1)).toBe(true);
+    expect(subscribersAtFailure.length).toBeGreaterThan(0);
+    expect(subscribersAtFailure.every(count => count === 1), JSON.stringify({ failure, subscribersAtFailure, handshakesAtFailure, reads })).toBe(true);
+    expect(handshakesAtFailure.every(generation => generation === 2)).toBe(true);
     expect(adapter.pendingSteersForTests(session.id).map(entry => entry.id)).toEqual([steer.messageId]);
+    expect(fake.state().sessions[session.id]!.pending.map(entry => entry.id)).toEqual([external.messageId]);
     failInbox = false;
     await adapter.stopEventPump(); await pump;
     await waitUntil(() => fake.state().eventSubscribers === 0);
@@ -783,7 +832,7 @@ for (const failure of ["http-503", "transport"] as const) test(`real V2 reconnec
     expect(subscriptions).toBe(3);
     expect(requests.slice(beforeRecovery).every(call => call.startsWith("GET "))).toBe(true);
     expect(fake.state().calls.filter(call => call.includes("/prompt"))).toHaveLength(3);
-  } finally { release(); await adapter.dispose(); await pump; await fake.stop(); }
+  } finally { releaseBackground(); release(); await adapter.dispose(); await pump; await fake.stop(); }
 });
 
 for (const snapshotKind of ["stale", "empty"] as const) test(`real V2 initial attach fences a late ${snapshotKind} inbox snapshot behind live delivery and enqueue`, async () => {

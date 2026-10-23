@@ -464,9 +464,10 @@ dependencies, not detached workers. **Stop worker** targets that verified
 worker only. An accepted request stays **Stopping…** until the provider reports
 its outcome. A later provider-owned completion notification can wake the
 parent again; Stop is not a permanent ban on future turns.
-On touch devices, Stop parent with live worker records opens an in-app explanation
-and confirmation before cancelling; settled history alone neither relabels Stop
-nor triggers that confirmation. Cancel leaves all work untouched.
+Confirmed working workers, including foreground agents, label the action **Stop parent**.
+On touch devices, it opens an in-app explanation and confirmation before cancelling;
+unknown workers and settled history alone neither relabel Stop nor trigger that
+confirmation. Cancel leaves all work untouched.
 
 Stopping a shell removes its provider record and output. If removal prevents
 final capture, OpenCode can report **failed**, even after the process exited.
