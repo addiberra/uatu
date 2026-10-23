@@ -572,7 +572,7 @@ The user confirmed that the iPhone model list was clipped and approved rendered 
 - [x] Make active versus next-turn configuration explicit before steering without changing native admission semantics, staged configuration, or the fixed keyboard delivery contract; verify through rendered UI and actual fixture admission.
 - [x] Report unsaved personal chat preference changes accurately and preserve/reconcile dirty choices during refresh, Save and conflicts; verify with isolated Hub UI fixtures while preserving account and revision protections.
 - [x] Remove the upstream-inherited generated Impeccable report and ignore future critique snapshots, keeping intentional project rules and unrelated local artifacts intact.
-- [ ] Recheck feature screenshots against the final reviewed source, keep historical originals and disclosures available in the PR, and obtain approval before publishing refreshed screenshot content.
+- [x] Recheck feature screenshots against the final reviewed source, show only current captures in the PR as subsequently requested, and obtain approval before publishing the refreshed description and images.
 
 Two fresh independent Sol reviews found no Standards breaches or Spec violations
 in the correction delta; an optional local-variable rename was not a release
@@ -583,3 +583,13 @@ configuration, delivery, picker, header and touch cases; they are not added to
 the combined count. The native viewport-restoration regression reproduced a
 stale 304px picker after Chat returned to 648px; the fix restored 648px and seven
 complete rows. This is browser evidence, not physical-iPhone acceptance.
+
+The user approved the current-only description shown directly in chat. The PR
+now contains 17 current captures from `6522fe5`, including restored-picker and
+next-turn-configuration frames, without a separate historical gallery. All 17
+anonymous attachment downloads match the captured source bytes; one identical
+preferences image reused its attachment. Independent publication review cleared
+the images, captions, provenance and documentation. Title and ready status are
+unchanged. Remote CI and CodeQL passed for `6522fe5`; the second browser leg first
+timed out downloading Ubuntu dependencies before tests, then passed on a fresh
+runner without changing tests, workers, retries or timeouts.

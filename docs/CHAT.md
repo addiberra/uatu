@@ -294,7 +294,7 @@ The [PR-hosted screenshot gallery](https://github.com/tjakobsson/uatu/pull/519) 
 composer, workers, pending entries, hold countdown, inspection, questions, side
 reader, personal automation preference and uncertain/replacement feedback using
 synthetic fixtures only. The [capture guide](screenshots/opencode-chat/README.md)
-records each gallery's source and limitations.
+records the capture source and limitations.
 Selecting a card header also grants its body action space; allocation happens
 after the native click so moving the header cannot swallow a touch. In enlarged
 short landscape, physical 44px chrome/action minima replace rem-scaled empty

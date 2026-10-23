@@ -1,12 +1,10 @@
 # OpenCode chat screenshots
 
-The feature's 15 historical screenshots belong in the [PR #519 description](https://github.com/tjakobsson/uatu/pull/519), not as tracked repository PNGs. The capture notes and caption index below describe those original frames; new captures are local test artifacts for review and optional PR attachment, not replacements for the historical evidence.
+The [PR #519 description](https://github.com/tjakobsson/uatu/pull/519) owns the feature screenshot gallery; PNGs are not tracked here. This index describes the 17 current captures prepared from committed feature source `6522fe54c5223cfca83b5673e71f9d020b4c48a7`. Publication requires image/caption review and user approval.
 
-Current acceptance: **user-reported iPhone acceptance**; the user owns physical-device testing. No agent physical-device test is claimed. Focused Chromium and WebKit header/focus regressions now pass; this is not a full WebKit-suite acceptance claim, and these older Chromium gallery captures are not WebKit evidence.
+Physical-iPhone retesting of the picker correction remains user-owned and pending. Chromium and WebKit browser regressions passed; the gallery itself is Chromium capture evidence, not physical-device or WebKit screenshot evidence.
 
-Actual application captures in Chromium, light/dark themes: desktop **1440 × 1000 CSS pixels**, mobile **390 × 844**. These are synthetic documentation fixtures, not personal conversations, provider benchmarks, native iPhone captures, or evidence of live-model acceptance. No paid generation or live Hub was used. The nine frames containing workers use `2812932` plus the worker-effort/session-cost refinement. Unaffected overview, configuration, mobile side-answer and isolated Hub frames are retained from the preceding gallery capture.
-
-These frames predate the compact touch New conversation button and fixed keyboard shortcuts. See [current chat behavior](../../CHAT.md); the gallery has not been regenerated for those refinements.
+Actual application captures in Chromium, light/dark themes: desktop **1440 × 1000 CSS pixels**, mobile **390 × 844**. The restored-picker frame uses **393 × 704 CSS pixels at 3× device scale**. These are synthetic documentation fixtures, not personal conversations, provider benchmarks, native iPhone captures or live-model acceptance. No paid generation or live Hub was used. See [current chat behavior](../../CHAT.md).
 
 The standard workspace contains only the E2E sample README/files. Model names, context figures, jobs, questions and answers are scripted. The preferences capture uses an isolated test Hub/account with an empty credential store. No authentication URLs, credentials, private filesystem paths, real costs, or original user photographs are included.
 
@@ -22,11 +20,13 @@ The standard workspace contains only the E2E sample README/files. Model names, c
 | Question with running work, light | An unanswered choice remains actionable while an independent worker runs; the composer draft is retained. |
 | Side answer ready, dark | `/btw` completion stays at the transcript edge, outside the composer. |
 | Formatted side reader, dark | Larger nonmodal reading window, real sanitized Markdown and workspace reference; composer/workers remain interactive, Minimise retains the answer. |
-| Personal preferences, light | Account-level automatic-background preference and its explanation, in an isolated synthetic Hub. |
-| Unknown receipt, dark | Lost native acknowledgement remains unconfirmed, with explicit “Do not repeat” feedback rather than a retry. |
-| Replacement warning, light | Reverted history, paused-steer batch action, count-only replacement warning and distinct pending delivery badges. |
+| Personal preferences, light | Account-level automatic-background preference and its explanation, in an isolated synthetic Hub. This saved-state frame does not demonstrate unsaved/conflict handling. |
+| Unknown receipt, dark | Expanded pending steer after a lost acknowledgement. Unconfirmed feedback is clipped; this frame does not fully display “Do not repeat.” |
+| Replacement warning, light | Reverted message, paused steer and nineteen queued entries with replacement warning. No worker overview is present in this state. |
 | Mobile side reader, light | Existing mobile modal with the same accessible Minimise action. |
 | Mobile minimised answer, light | Unblocked conversation and composer; the existing notice reopens the retained answer without inference. |
+| Mobile picker after viewport restoration | Picker restored from 360 to 704 CSS pixels while open, with complete model rows; not a physical-device keyboard capture. |
+| Next-turn settings before steering | Next turn Plan selection and visible pre-send explanation; the fixture verifies that the steer retains Build while queued work adopts Plan. |
 
 Overview/configuration/question use the scripted chat-service fixture so all model metadata can be selected without inference. The other chat captures run the production adapter/provider against the local scripted OpenCode 2.x HTTP server. Side-reader responses use deterministic Markdown (the desktop request completes against the native fixture first; mobile is browser-stubbed). Desktop gallery widens the actual chat split to demonstrate its container-based single-line density. Screenshots show rendered application states, not mock HTML.
 
@@ -41,7 +41,7 @@ cost unreported rather than guessing from configuration, message prices or model
 
 ## Capture local artifacts
 
-No gallery regeneration is needed for the PR migration: transfer the original 15 PNGs unchanged, with the historical disclosures above. When new captures are explicitly requested, use the repository's existing dependencies and Playwright browsers:
+When new captures are explicitly requested, use the repository's existing dependencies and Playwright browsers:
 
 ```sh
 UATU_CAPTURE_CHAT_SCREENSHOTS=1 bunx playwright test \
@@ -58,13 +58,20 @@ UATU_CAPTURE_CHAT_SCREENSHOTS=1 UATU_CAPTURE_HOLD_ONLY=1 bunx playwright test \
   tests/e2e/chat-screenshots.e2e.ts --project=e2e --workers=1 --grep 'desktop documentation gallery'
 ```
 
-Normal tests skip these writers. Review image privacy and captions before publication. Capture helpers assert the key rendered states; the gallery itself is not independent validation. Hold/queue regressions live in `tests/e2e/chat-hold-queue-regressions.e2e.ts`; the reference-workdock suite covers normal/short/mobile/enlarged-text layouts and independent scrolling. Nonzero viewport/fixed-origin checks are synthetic. Physical iPhone testing is user-owned, with user-reported acceptance as noted above; no agent native-device result is claimed. The earlier WebKit initial-tab runtime blocker is resolved; current focused checks remain separate from these captures.
+Normal tests skip these gallery writers. Review image privacy and captions before publication. Capture helpers assert key rendered states; the gallery itself is not independent validation. Hold/queue regressions live in `tests/e2e/chat-hold-queue-regressions.e2e.ts`; the reference-workdock suite covers normal/short/mobile/enlarged-text layouts and independent scrolling. Nonzero viewport/fixed-origin checks are synthetic. No agent native-device result is claimed.
 
-To select only the nine frames containing worker metadata from the desktop gallery writer:
+To select the nine-frame worker-focused subset from the desktop gallery writer:
 
 ```sh
 UATU_CAPTURE_CHAT_SCREENSHOTS=1 UATU_CAPTURE_WORKERS_ONLY=1 bunx playwright test \
   tests/e2e/chat-screenshots.e2e.ts --project=e2e --workers=1 --grep 'desktop documentation gallery'
 ```
 
-The selection flags filter the named gallery frames; the existing supplementary `desktop-side-reader-light` report attachment is still produced. The mobile test also attaches `mobile-side-reader-dark` when included in the run. Neither supplementary attachment is part of the original 15-frame gallery.
+The selection flags filter the named gallery frames; the supplementary `desktop-side-reader-light` report attachment is still produced. The mobile test also attaches `mobile-side-reader-dark` when included in the run. Neither supplementary attachment is selected for the PR gallery.
+
+The two additional picker/configuration frames come from normal regression evidence:
+
+```sh
+bunx playwright test tests/e2e/chat-mobile-picker-clipping.e2e.ts \
+  tests/e2e/chat-configuration-truth.e2e.ts --project=e2e
+```
