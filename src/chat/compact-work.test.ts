@@ -2,6 +2,33 @@ import { expect, test } from "bun:test";
 import { CompactDisclosure, compactWorkers, workerSummary } from "./compact-work";
 import type { ConversationItem } from "./types";
 
+test("worker projection timeline access grows linearly as retained occurrences double", () => {
+  const measure = (count: number) => {
+    const items: ConversationItem[] = Array.from({ length: count }, (_, index) => [
+      { type: "tool", id: `tool:launch-${index}`, name: "task", status: "completed", input: '{"description":"Worker"}', createdAt: index },
+      { type: "background_task", id: `worker-${index}`, taskId: `task-${index}`, toolUseId: `launch-${index}`, description: "Worker", status: "running", createdAt: index },
+    ] satisfies ConversationItem[]).flat();
+    let accesses = 0;
+    // Observe actual reads at the public timeline boundary, not helper calls
+    // or elapsed time. Both launcher correlation and task selection must scale.
+    const timeline = new Proxy(items, {
+      get(target, property, receiver) {
+        if (typeof property === "string" && /^(0|[1-9]\d*)$/.test(property)) accesses++;
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    const workers = compactWorkers(timeline);
+    expect(workers).toHaveLength(count);
+    expect(workers.every(worker => worker.stoppable && worker.references.length === 1)).toBe(true);
+    return accesses;
+  };
+  const small = measure(128);
+  const large = measure(256);
+  console.info(`compactWorkers timeline accesses: 128 workers=${small}; 256 workers=${large}`);
+  expect(small).toBeGreaterThan(0);
+  expect(large).toBeLessThan(small * 2.5);
+});
+
 test("finished tool workers sort by reported completion, not launch time", () => {
   const workers = compactWorkers([
     { type: "tool", id: "tool:long", name: "task", status: "completed", input: '{"description":"Long worker"}', childConversationId: "reused-child", createdAt: 1000, completedAt: 9000 },
@@ -101,6 +128,32 @@ test("canonical worker uses real launcher model and cumulative spend without dou
   ]);
   expect(workers).toHaveLength(1);
   expect(workers[0]).toMatchObject({ model: "GPT-6.1 Sol", tokens: 250 });
+});
+
+test("authoritative session reports clear historical model while preserving zero and unavailable metadata", () => {
+  const launcher: ConversationItem = { type: "tool", id: "tool:launch", name: "task", status: "completed", input: '{"description":"Worker"}', model: "Reported task model", createdAt: 1 };
+  const task = { type: "background_task", id: "worker", taskId: "native", toolUseId: "launch", description: "Worker", status: "running", createdAt: 1 } satisfies ConversationItem;
+  const [withoutReport] = compactWorkers([launcher, task]);
+  expect(withoutReport).toMatchObject({ model: "Reported task model" });
+  expect(withoutReport).not.toHaveProperty("effort");
+  expect(withoutReport).not.toHaveProperty("costUsd");
+  expect(compactWorkers([launcher, { ...task, workerSession: { model: "Latest execution", effort: "high", costUsd: 1 } }])[0])
+    .toMatchObject({ model: "Latest execution", effort: "high", costUsd: 1 });
+  for (const costUsd of [0, null]) {
+    // An omitted model in the authoritative report is not permission to
+    // resurrect a historical task model after execution metadata is withdrawn.
+    expect(compactWorkers([launcher, { ...task, workerSession: { effort: null, costUsd } }])[0])
+      .toMatchObject({ model: undefined, effort: null, costUsd });
+  }
+});
+
+test("duplicate item ids retain first launcher clocks and last session metadata", () => {
+  const workers = compactWorkers([
+    { type: "tool", id: "tool:duplicate", name: "task", status: "completed", input: '{"description":"First launcher"}', model: "Historical model", workerSession: { model: "Earlier report", effort: "high", costUsd: 1 }, createdAt: 10, completedAt: 30 },
+    { type: "tool", id: "tool:duplicate", name: "task", status: "completed", input: '{"description":"Restated launcher"}', model: "Restated model", workerSession: { effort: null, costUsd: 0 }, createdAt: 99, completedAt: 100 },
+  ]);
+  expect(workers).toHaveLength(1);
+  expect(workers[0]).toMatchObject({ name: "First launcher", since: 10, settledAt: 30, completedAt: 30, model: undefined, effort: null, costUsd: 0 });
 });
 
 test("touch disclosure is deliberate, conversation-scoped, and survives settlement and reselection", () => {
@@ -209,6 +262,45 @@ test("canonical executions fold launcher aliases but keep repeated occurrences a
   expect(workers.find(worker => worker.id === "first")?.state).toBe("failed");
   expect(workers.find(worker => worker.id === "third")?.state).toBe("stopped");
   expect(workerSummary([])).toBe("No workers");
+});
+
+test("reused task ids select only the newest occurrence with a descending-id tie-break", () => {
+  const items: ConversationItem[] = [
+    { type: "tool", id: "tool:old", name: "task", status: "completed", input: '{"description":"Old launcher"}', childConversationId: "child", createdAt: 1 },
+    { type: "background_task", id: "z-old", taskId: "reused", toolUseId: "old", description: "Old occurrence", status: "running", childConversationId: "child", createdAt: 1 },
+    { type: "tool", id: "tool:new-one", name: "task", status: "completed", input: '{"description":"New launcher"}', childConversationId: "child", createdAt: 2 },
+    { type: "tool", id: "tool:new-two", name: "task", status: "completed", input: '{"description":"Alias"}', childConversationId: "child", createdAt: 2 },
+    { type: "background_task", id: "a-new", taskId: "reused", toolUseIds: ["new-one", "new-two"], description: "New occurrence", status: "running", childConversationId: "child", createdAt: 2 },
+    { type: "background_task", id: "B-new", taskId: "reused", description: "Uncertain occurrence", status: "running", stateUncertain: true, childConversationId: "child", createdAt: 2 },
+  ];
+  for (const timeline of [items, [...items].reverse()]) {
+    const workers = compactWorkers(timeline);
+    expect(workers.map(({ id, state, stoppable }) => ({ id, state, stoppable }))).toEqual([
+      { id: "z-old", state: "working", stoppable: false },
+      { id: "a-new", state: "working", stoppable: false },
+      { id: "B-new", state: "unknown", stoppable: true },
+    ]);
+    expect(workers[0]?.references).toEqual(["tool:old"]);
+    expect(workers[1]?.references.toSorted()).toEqual(["tool:new-one", "tool:new-two"]);
+  }
+});
+
+test("latest foreground or terminal occurrences never authorize stopping an older background occurrence", () => {
+  const workers = compactWorkers([
+    { type: "background_task", id: "old-shell", taskId: "shell", taskType: "shell", description: "Old shell", status: "running", createdAt: 1 },
+    { type: "background_task", id: "foreground-shell", taskId: "shell", taskType: "shell", foreground: true, description: "Foreground shell", status: "running", createdAt: 2 },
+    { type: "background_task", id: "old-agent", taskId: "agent", description: "Old agent", status: "running", createdAt: 3 },
+    { type: "background_task", id: "foreground-agent", taskId: "agent", foreground: true, description: "Foreground agent", status: "running", createdAt: 4 },
+    { type: "background_task", id: "old-running", taskId: "terminal", description: "Old running", status: "running", createdAt: 5 },
+    { type: "background_task", id: "latest-terminal", taskId: "terminal", description: "Latest terminal", status: "completed", createdAt: 6 },
+  ]);
+  expect(workers.map(({ id, state, stoppable }) => ({ id, state, stoppable }))).toEqual([
+    { id: "old-shell", state: "working", stoppable: false },
+    { id: "old-agent", state: "working", stoppable: false },
+    { id: "foreground-agent", state: "working", stoppable: false },
+    { id: "old-running", state: "working", stoppable: false },
+    { id: "latest-terminal", state: "completed", stoppable: true },
+  ]);
 });
 
 test("pending/generating is not confirmed working and failed tools are finished, not successful", () => {

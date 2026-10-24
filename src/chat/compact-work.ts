@@ -1,9 +1,8 @@
 import { boundedSet } from "../shared/bounded-map";
 import { backgroundTasksByTool } from "./background-tasks";
 import { subagentEntries } from "./timeline-renderer";
-import type { ConversationItem } from "./types";
+import type { BackgroundTaskItem, ConversationItem } from "./types";
 import { workerIsActive, workerState, type WorkerState } from "./worker-state";
-import { taskById } from "./task-inspection";
 import { totalTokens } from "./usage";
 
 type DisclosureState = { open: boolean; active: boolean; collapsed: boolean };
@@ -77,6 +76,20 @@ export type CompactWorker = {
 /** A projection fold, not another worker lifecycle or a task-id tombstone map. */
 export function compactWorkers(items: readonly ConversationItem[]): CompactWorker[] {
   const shellTask = (type?: string) => /^(shell|local_bash|bash)$/i.test(type ?? "");
+  // Launcher lookup uses the first match; session metadata uses the last
+  // restatement. Keep both readings when a timeline contains duplicate ids.
+  const itemsById = new Map<string, { first: ConversationItem; last: ConversationItem }>();
+  const latestTasks = new Map<string, BackgroundTaskItem>();
+  for (const item of items) {
+    const known = itemsById.get(item.id);
+    if (known) known.last = item;
+    else itemsById.set(item.id, { first: item, last: item });
+    if (item.type !== "background_task") continue;
+    const latest = latestTasks.get(item.taskId);
+    // Match taskById's newest occurrence and descending-id tie-break,
+    // including foreground tasks which are not independently stoppable.
+    if (!latest || (latest.createdAt - item.createdAt || latest.id.localeCompare(item.id)) < 0) latestTasks.set(item.taskId, item);
+  }
   const aliases = backgroundTasksByTool(items);
   const workers = new Map<string, CompactWorker>();
   for (const item of items) {
@@ -90,7 +103,7 @@ export function compactWorkers(items: readonly ConversationItem[]): CompactWorke
       id: item.id, state: workerState(item.status, item.stateUncertain), references: [],
       name: item.description, kind: shellTask(item.taskType) ? "shell" : "agent", agent: item.subagentType,
       since, settledAt: terminalReportedAt ?? since + (item.usage?.durationMs ?? 0), terminalReportedAt,
-      progress: item.progress, taskId: item.taskId, stoppable: !item.foreground && taskById(items, item.taskId)?.id === item.id, conversationId: item.childConversationId,
+      progress: item.progress, taskId: item.taskId, stoppable: !item.foreground && latestTasks.get(item.taskId)?.id === item.id, conversationId: item.childConversationId,
       tokens: item.usage?.totalTokens,
     });
   }
@@ -98,7 +111,7 @@ export function compactWorkers(items: readonly ConversationItem[]): CompactWorke
     // Only proven launcher aliases can merge occurrences. A child can run
     // repeatedly, so a shared child id alone is not a deduplication key.
     if (workers.has(entry.id)) continue;
-    const item = items.find(item => item.id === entry.id);
+    const item = itemsById.get(entry.id)?.first;
     if (item?.type === "background_task" && shellTask(item.taskType) && item.foreground) continue;
     const canonical = aliases.get(entry.id);
     if (canonical) {
@@ -120,10 +133,9 @@ export function compactWorkers(items: readonly ConversationItem[]): CompactWorke
       model: entry.model, tokens: entry.usage ? totalTokens(entry.usage) : undefined,
     });
   }
-  const itemsById = new Map(items.map(item => [item.id, item]));
   for (const worker of workers.values()) {
     if (worker.kind !== "agent") continue;
-    const report = [worker.id, ...worker.references].map(id => itemsById.get(id))
+    const report = [worker.id, ...worker.references].map(id => itemsById.get(id)?.last)
       .find(item => (item?.type === "tool" || item?.type === "background_task") && item.workerSession);
     if (report?.type === "tool" || report?.type === "background_task") {
       worker.model = report.workerSession?.model;
