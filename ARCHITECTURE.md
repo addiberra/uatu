@@ -1000,24 +1000,51 @@ deduplicates pending/delivered/stored reports. Reused children are correlated
 only when execution boundaries disambiguate them; otherwise the readable
 result stays separate and affected work is uncertain. A settled report renders
 after its correlated launcher even if its retained start timestamp predates it.
-Stream correlation is
-bounded to 8,192 entries / 4 MiB of conservative serialized UTF-16 size.
+V2 prepares canonical envelope, launcher and notification facts once, before
+ownership-verification awaits. Normalization, child-reference discovery,
+background folding and Stop consume that same preparation. Native launcher
+clocks, worker kind and owning-message identity remain separate from display
+fallbacks; progress or lagging history cannot erase a known supersession.
+Consumed replay requires retained identity, stamp, semantic fingerprint and an
+occurrence link, not merely an old-looking timestamp.
+
+Live projection correlation and control evidence share a bound of 8,192 entries /
+4 MiB of conservative serialized UTF-16 payload, not a heap guarantee.
+The provider-lifetime control cohort uses up to 2,048 entries / 1 MiB within that
+aggregate, including sixteen-guard / 128 KiB admission headroom.
 The byte ledger serializes only inserted or changed entries, subtracts their
 cached sizes on replacement/removal, and includes JSON escaping and collection
-overhead; unrelated events do not rescan retained history. Saturation discards the entire correlation
-cache rather than unsafe partial tombstones and relies on scoped recovery
-until reconnect. Complete-history folds are transient and precede pagination.
+overhead; unrelated events do not rescan retained history. Projection saturation
+discards disposable correlation records and latches read-only recovery, without
+clearing retained control proof or known revocations. Healthy retained targets
+can remain controllable without reconnect. Missing, revoked or overflowed proof
+uses the existing uncertain state and withholds Stop consistently in live,
+history and reconciliation results. Target-specific unavailable stubs prevent
+silent readmission; reconnect does not erase them, and unretained targets may
+remain unavailable for the provider lifetime. Disposal ends that in-memory
+ownership lifetime. Complete-history folds are transient and precede pagination.
 
 `reconcileBackgroundTasks(parent)` reads complete history, all pending inbox
 entries, verified child/active evidence and owned shell records. Unlike
 Claude's authoritative live list, absence never means cancellation. The adapter
 waits for the connected marker, fences recovery generations and live updates,
-coalesces reads per parent, limits concurrent parents to four, and backs off
-uncertain/failed reads. Recovery updates workspace activity even for unselected
+coalesces reads per parent and limits concurrent parents to four. Failed reads
+retain backoff; unchanged successful-inconclusive recovery allows three reads
+per external cycle, then waits for new evidence, explicit refresh or reconnect.
+Verified discovery progress may extend recovery, but omission/alias flapping
+does not. Dirty updates use a 100 ms throttle and safe per-item fences instead
+of discarding every in-flight result. Recovery updates workspace activity even for unselected
 parents without making `ChatService.activity()` start a runtime. Recovery is
 read-only; child results/hydration do not emit top-level success notifications.
 Complete history uses the bounded provider cache only within a connected stream
 generation; session events invalidate it and disconnected reads remain fresh.
+Verified child parentage is reused in a connected-generation cache bounded to
+8,192 entries / 4 MiB; dynamic execution, accounting and revert evidence remains
+fresh. At most four underlying child-ownership SDK requests remain outstanding
+per provider across stream, history and Stop validation. Capacity releases only
+when the SDK promise settles, not when a deadline wrapper returns. Event child
+verification shares a one-second deadline and stream cancellation; a failed
+child check does not discard unrelated event content.
 Child execution boundaries also constrain unresolved worker occurrences: an
 active child may belong to a newer foreground run, so it does not reauthorize
 an old task. Stop revalidates fresh parent and child histories. Inventory
@@ -1037,8 +1064,11 @@ there is no persistent receipt or automatic replay. Native interrupt has no
 atomic generation precondition. Isolated real-provider acceptance passed on
 OpenCode 2.0.29/client 2.0.28, including mixed native worker/shell conversion,
 stop scopes, notification wakeup and disconnected-result recovery. That prior
-acceptance does not validate the new automatic Hub-steer sequence against a
-real model/service; its current acceptance is scripted only.
+acceptance does not validate the new automatic Hub-steer sequence or current
+prepared-event/control-cohort implementation against a real model/service.
+Their current acceptance uses scripted fixtures and the pinned client 2.1.2
+SDK with mock HTTP/SSE; it does not establish current native emission or
+cross-session ordering guarantees.
 Settled inspection strips show only the outcome and a link to the canonical
 parent result, not another copy of its report. Task-list repaint restores the
 focused surviving worker/action rather than leaving keyboard focus on the body.

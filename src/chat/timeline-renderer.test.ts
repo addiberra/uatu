@@ -1019,6 +1019,22 @@ describe("presentation details", () => {
   });
 
   describe("the queue dock under steering (opencode-v2-steering D10)", () => {
+    test("only token-eligible unknown admissions offer local discard, never withdrawal retry or resend", () => {
+      const { document } = parseHTML("<div id='host'></div>");
+      const host = document.querySelector<HTMLElement>("#host")!;
+      const unknown = { id: "unknown", text: "Keep text", queuedAt: 1, delivery: "steer" as const, unconfirmed: true as const, admissionUncertaintyId: "opaque-1" };
+      const dock = new QueueDockRenderer();
+      const context = { steering: true, sendNow: true, running: false, isCommand: () => false };
+      dock.render(host, [unknown, { ...unknown, id: "resume", admissionUncertaintyId: undefined }], context);
+      expect([...host.querySelectorAll("button")].map(button => button.textContent)).toEqual(["Discard local record"]);
+      expect(host.querySelector('[data-queue-discard="unknown"]')).not.toBeNull();
+      dock.render(host, [{ ...unknown, delivery: "queue" }], context);
+      expect(host.querySelector('[data-queue-discard="unknown"]')).not.toBeNull();
+      dock.render(host, [unknown], { ...context, pendingActions: new Set(["unknown"]) });
+      expect(host.querySelector<HTMLButtonElement>("button")!.disabled).toBe(true);
+      dock.render(host, [unknown], { ...context, withdrawalRetries: new Set(["unknown"]) });
+      expect([...host.querySelectorAll("button")].map(button => button.textContent)).toEqual(["Retry withdrawal"]);
+    });
     test("unconfirmed entries expose no resend/edit/remove or batch resume action", () => {
       const host = target();
       new QueueDockRenderer().render(host, [{ id: "uncertain", text: "Keep text", queuedAt: 1, delivery: "steer", paused: true, unconfirmed: true }], { steering: true, sendNow: true, running: false, isCommand: () => false });

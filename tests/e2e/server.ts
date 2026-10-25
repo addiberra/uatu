@@ -466,7 +466,7 @@ async function handleE2EChat(request: Request): Promise<Response> {
     // fake OpenCode's controls (`opencode` action).
     stack?: "opencode-v2";
     backgroundPreview?: boolean;
-    op?: "step" | "finish" | "raceDeliverOnCancel" | "state" | "launchWorker" | "settleWorker" | "workerReport" | "disconnect" | "pauseEvents" | "reconnectEvents" | "externalRevert" | "appendHistory" | "loseBackgroundResponse" | "loseWorkerResponse" | "launchShell" | "shellPhase" | "wakeParent" | "losePromptResponse" | "loseResumeResponse" | "refuseBackground" | "launchShellOnNextSteer";
+    op?: "step" | "finish" | "raceDeliverOnCancel" | "state" | "launchWorker" | "settleWorker" | "workerReport" | "disconnect" | "pauseEvents" | "reconnectEvents" | "externalRevert" | "appendHistory" | "loseBackgroundResponse" | "loseWorkerResponse" | "launchShell" | "shellPhase" | "wakeParent" | "losePromptResponse" | "unknownPromptBeforeAdmission" | "loseResumeResponse" | "refuseBackground" | "launchShellOnNextSteer";
     revertMessageId?: string | null;
     usedModel?: string;
     usedEffort?: string;
@@ -524,6 +524,8 @@ async function handleE2EChat(request: Request): Promise<Response> {
       switch (body.op) {
         case "losePromptResponse":
           openCodeV2Fake.loseNextPromptResponse(); return Response.json({ ok: true });
+        case "unknownPromptBeforeAdmission":
+          openCodeV2Fake.unknownNextPromptBeforeAdmission(); return Response.json({ ok: true });
         case "loseResumeResponse":
           openCodeV2Fake.loseNextResumeResponse(); return Response.json({ ok: true });
         case "refuseBackground":

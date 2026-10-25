@@ -228,6 +228,20 @@ export class ChatApiClient {
     );
   }
 
+  discardUnconfirmedSteer(conversationId: string, messageId: string, requestId: string, uncertaintyId: string): Promise<{ discarded: true; outcomeUnconfirmed: true }> {
+    return this.mutate(
+      appUrl(`/api/chat/conversations/${encodeURIComponent(conversationId)}/queue/${encodeURIComponent(messageId)}/discard-unconfirmed`),
+      { requestId, uncertaintyId },
+      value => {
+        if (!value || typeof value !== "object" || Array.isArray(value)
+          || Object.keys(value).some(key => key !== "discarded" && key !== "outcomeUnconfirmed")
+          || !("discarded" in value) || value.discarded !== true
+          || !("outcomeUnconfirmed" in value) || value.outcomeUnconfirmed !== true) throw new Error("Chat returned an invalid local discard acknowledgement");
+        return { discarded: true, outcomeUnconfirmed: true };
+      },
+    );
+  }
+
   // Switch a pending message between steer and queue (opencode-v2-steering
   // D7, D8). The answer names the entry as it now stands: a switched message
   // can come back under a new id.

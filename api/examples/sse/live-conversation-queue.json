@@ -20,6 +20,16 @@
             "queuedAt": 1792627200000,
             "delivery": "steer",
             "requestId": "client-correlation"
+          },
+          {
+            "id": "unknown-admission",
+            "submissionId": "unknown-admission",
+            "text": "Original may still arrive",
+            "queuedAt": 1792627200001,
+            "delivery": "steer",
+            "unconfirmed": true,
+            "admissionUncertaintyId": "opaque-server-token",
+            "requestId": "unknown-client-correlation"
           }
         ],
         "change": { "kind": "switched", "messageId": "current-native-inbox" }

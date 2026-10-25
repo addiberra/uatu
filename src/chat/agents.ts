@@ -113,6 +113,7 @@ export interface MultiAgentWorkspaceChatService {
     conversation?: AgentConversationSummary;
   } & AutomaticBackgroundFeedback>;
   removeQueued(id: string, messageId: string, requestId: string): Promise<{ removed: true }>;
+  discardUnconfirmedSteer(id: string, messageId: string, requestId: string, uncertaintyId: string): Promise<{ discarded: true; outcomeUnconfirmed: true }>;
   changeDelivery(id: string, messageId: string, requestId: string, delivery: MessageDelivery, context?: ChatActionContext, operationReceipt?: string): Promise<{ messageId: string; delivery: MessageDelivery } & AutomaticBackgroundFeedback>;
   sendNow(id: string, messageId: string, requestId: string, context?: ChatActionContext, operationReceipt?: string): Promise<{ messageId: string; delivery: MessageDelivery } & AutomaticBackgroundFeedback>;
   saveAttachment(bytes: Uint8Array): Promise<{ id: string; mimeType: string; sizeBytes: number }>;
@@ -353,6 +354,11 @@ export class MultiAgentChatService implements MultiAgentWorkspaceChatService {
   async removeQueued(id: string, messageId: string, requestId: string) {
     const { agent, conversationId } = this.resolve(id);
     return agent.service.removeQueued(conversationId, messageId, requestId);
+  }
+
+  async discardUnconfirmedSteer(id: string, messageId: string, requestId: string, uncertaintyId: string) {
+    const { agent, conversationId } = this.resolve(id);
+    return agent.service.discardUnconfirmedSteer(conversationId, messageId, requestId, uncertaintyId);
   }
 
   async changeDelivery(id: string, messageId: string, requestId: string, delivery: MessageDelivery, context?: ChatActionContext, operationReceipt?: string) {

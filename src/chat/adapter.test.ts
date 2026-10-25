@@ -1,5 +1,6 @@
 import { describe, expect, test, spyOn, jest } from "bun:test";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { realpath } from "node:fs/promises";
 
 import { BackgroundTasksUnsupportedError, ChatQueueFullError, CommandAttachmentsError, CommandSteeringError, ConversationRenameUnsupportedError, deriveConversationTitle, InteractionConflictError, InvalidConversationTitleError, InvalidModeSelectionError, InvalidModelSelectionError, InvalidVariantSelectionError, ChatAdapter, parseSlashCommand, QueuedMessageNotHeldError, ReversibleHistoryUnsupportedError, ScheduledWakeupsUnsupportedError, SendNowUnavailableError, SendNowUnsupportedError, SteerAlreadyDeliveredError, SteeringUnsupportedError, SteerWithdrawalUnconfirmedError, UnknownAttachmentError, UsageUnsupportedError } from "./adapter";
 import { createClaudeEventMemory, normalizeClaudeMessage } from "./claude/normalization";
@@ -27,6 +28,63 @@ import type { AgentNotificationEvent } from "./notifications";
 import { notificationPipeline } from "../../tests/notification-pipeline";
 import { startOpenCodeV2Fake } from "../../tests/e2e/opencode-v2-fake";
 import { addAcceptedDraft, applyChatEvent, projectionFromSnapshot } from "./projection";
+
+for (const kind of ["agent", "shell"] as const) for (const local of [false, true]) test(`real V2 ${local ? "local" : "external"} revert keeps live ${kind} but removes its hidden settlement`, async () => {
+  const directory = process.cwd(), fake = startOpenCodeV2Fake({ directory });
+  const provider = createOpenCodeV2Provider({ endpoint: fake.url, password: fake.password, directory });
+  const adapter = new ChatAdapter({ provider, workspacePath: directory, coalesceWindowMs: 0 });
+  try {
+    const parent = (await provider.createSession("Independent live work")).id;
+    const branch = await adapter.prompt(parent, "branch", "Hide this transcript, not live work", undefined, undefined, undefined, undefined, "steer");
+    const worker = kind === "agent" ? fake.launchWorker(parent, true) : fake.launchShell(parent, true);
+    const taskId = `task:${worker.taskId}`;
+    await adapter.history(parent);
+    const client = await adapter.subscribe(parent), events: ChatEvent[] = [];
+    const consuming = (async () => { for await (const event of client.events) events.push(event); })();
+    try {
+      if (local) await adapter.revert(parent, `message:${branch.messageId}`, "local-revert");
+      else { await provider.interrupt(parent, { resume: false }); fake.externalRevert(parent, branch.messageId); }
+      const snapshot = await adapter.history(parent);
+      expect(snapshot.items).toContainEqual(expect.objectContaining({ id: taskId, status: "running", stateUncertain: false }));
+      expect(snapshot.items.some(item => item.type === "user_message" || item.type === "tool")).toBe(false);
+      const next = await adapter.subscribe(parent);
+      try { expect(next.snapshot.items).toContainEqual(expect.objectContaining({ id: taskId, status: "running", stateUncertain: false })); }
+      finally { next.events.cancel(); }
+      await provider.stopTask!(parent, worker.taskId);
+      const settledFrom = events.length;
+      if ("childId" in worker) fake.settleWorker(worker.childId, "completed", "Hidden completion");
+      else { fake.shellPhase(worker.shellId, "exit"); fake.shellPhase(worker.shellId, "capture"); }
+      await waitUntil(() => !adapter.projectionForTests(parent).has(taskId));
+      expect(events.slice(settledFrom).some(event => event.type === "item.upsert" && event.item.type === "background_task" && event.item.status !== "running")).toBe(false);
+      expect((await adapter.history(parent)).items.some(item => item.id === taskId)).toBe(false);
+      fake.externalRevert(parent, null);
+      expect((await adapter.history(parent)).items).toContainEqual(expect.objectContaining({ id: taskId, status: kind === "agent" ? "completed" : "failed" }));
+      expect(fake.state().unhandled).toEqual([]);
+    } finally { client.events.cancel(); await consuming; }
+  } finally { await adapter.dispose(); await fake.stop(); }
+});
+
+test("real V2 reverted live worker survives reconnect as unknown without restoring revoked Stop", async () => {
+  const directory = process.cwd(), fake = startOpenCodeV2Fake({ directory });
+  const provider = createOpenCodeV2Provider({ endpoint: fake.url, password: fake.password, directory });
+  const adapter = new ChatAdapter({ provider, workspacePath: directory, coalesceWindowMs: 0 });
+  let pump: Promise<void> | undefined;
+  try {
+    const parent = (await provider.createSession("Live worker across native gap")).id;
+    const branch = await adapter.prompt(parent, "branch", "Reverted launch turn", undefined, undefined, undefined, undefined, "steer");
+    const worker = fake.launchWorker(parent, true), taskId = `task:${worker.taskId}`;
+    await adapter.history(parent);
+    await adapter.revert(parent, `message:${branch.messageId}`, "revert");
+    await adapter.stopEventPump();
+    pump = adapter.startEventPump();
+    const snapshot = await adapter.history(parent);
+    expect(snapshot.items).toContainEqual(expect.objectContaining({ id: taskId, status: "running", stateUncertain: true }));
+    await expect(provider.stopTask!(parent, worker.taskId)).rejects.toThrow(/unavailable|no longer/);
+    expect(fake.state().calls.filter(call => call.startsWith(`POST /api/session/${worker.childId}/interrupt`))).toEqual([]);
+    expect(fake.state().sessions[worker.childId]?.running).toBe(true);
+    expect(snapshot.items.some(item => item.type === "user_message" || item.type === "tool")).toBe(false);
+  } finally { await adapter.dispose(); await pump; await fake.stop(); }
+});
 
 test("real V2 reconnect removes the exact offline-reverted branch for existing and next subscribers", async () => {
   const directory = process.cwd();
@@ -69,6 +127,61 @@ test("real V2 reconnect removes the exact offline-reverted branch for existing a
       expect(fake.state().unhandled).toEqual([]);
     } finally { client.events.cancel(); await consuming; }
   } finally { await adapter.dispose(); await pump; await fake.stop(); }
+});
+
+test("real V2 delayed reconnect inventory cannot republish a worker after exact revert removal", async () => {
+  const directory = process.cwd();
+  const fake = startOpenCodeV2Fake({ directory });
+  const provider = createOpenCodeV2Provider({ endpoint: fake.url, password: fake.password, directory });
+  let hold = false, captured!: () => void, release!: () => void;
+  const capture = new Promise<void>(resolve => { captured = resolve; });
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const list = provider.listSessions.bind(provider);
+  provider.listSessions = async () => {
+    const result = await list();
+    if (hold) { captured(); await gate; }
+    return result;
+  };
+  let recoveries = 0;
+  const recover = provider.reconcileBackgroundTasks!.bind(provider);
+  provider.reconcileBackgroundTasks = async (...args) => { recoveries++; return recover(...args); };
+  const adapter = new ChatAdapter({ provider, workspacePath: directory, coalesceWindowMs: 0 });
+  let pump: Promise<void> | undefined;
+  try {
+    const parent = (await provider.createSession("Delayed inventory revert")).id;
+    const branch = await adapter.prompt(parent, "branch-to-revert", "Externally reverted turn");
+    const worker = fake.launchWorker(parent, true);
+    fake.settleWorker(worker.childId, "completed", "Terminal worker report");
+    fake.step(parent);
+    const taskId = `task:${worker.taskId}`;
+    expect((await adapter.history(parent)).items).toContainEqual(expect.objectContaining({ id: taskId, status: "completed" }));
+    const client = await adapter.subscribe(parent);
+    const events: ChatEvent[] = [];
+    const consuming = (async () => { for await (const event of client.events) events.push(event); })();
+    try {
+      await adapter.stopEventPump();
+      fake.externalRevert(parent, branch.messageId);
+      hold = true;
+      pump = adapter.startEventPump();
+      await capture;
+      const rewritten = await adapter.history(parent);
+      expect(rewritten.items.some(item => item.id === taskId)).toBe(false);
+      await waitUntil(() => events.some(event => event.type === "item.remove" && event.itemId === taskId));
+      const removal = events.findIndex(event => event.type === "item.remove" && event.itemId === taskId);
+      const beforeRelease = recoveries;
+      hold = false; release();
+      await waitUntil(() => recoveries > beforeRelease);
+      // Await the real recovery lane, not an early sample of its empty DOM.
+      const pending = (adapter as unknown as { backgroundPending: Set<Promise<unknown>> }).backgroundPending;
+      await Promise.all([...pending]);
+      expect(adapter.projectionForTests(parent).has(taskId)).toBe(false);
+      expect(events.slice(removal + 1).some(event => event.type === "item.upsert" && event.item.id === taskId)).toBe(false);
+      const next = await adapter.subscribe(parent);
+      try { expect(next.snapshot.items.some(item => item.id === taskId)).toBe(false); }
+      finally { next.events.cancel(); }
+      expect(fake.state().unhandled).toEqual([]);
+    } finally { client.events.cancel(); await consuming; }
+  } finally { release(); await adapter.dispose(); await pump; await fake.stop(); }
 });
 
 test("real V2 paged recovery never treats omission as removal and restores an offline-unreverted prefix", async () => {
@@ -2363,6 +2476,11 @@ async function flushUntil(predicate: () => boolean): Promise<void> {
   expect(predicate()).toBe(true);
 }
 
+// Let actual workspace-confinement IO settle without advancing fake deadlines.
+async function flushRecoveryIo(): Promise<void> {
+  for (let turn = 0; turn < 32; turn++) await realpath(process.cwd());
+}
+
 async function admissionsApplied(adapter: ChatAdapter): Promise<void> {
   const admissions = (adapter as unknown as { promptAdmissions: Map<string, Promise<void>> }).promptAdmissions;
   await Promise.all([...admissions.values()]);
@@ -3106,6 +3224,38 @@ describe("reversible history coordination", () => {
       setVisible: (next: ProviderMessage[]) => { visible = next; },
     };
   }
+
+  test("a completed Undo boundary invalidates an older worker read, including rows not previously projected", async () => {
+    const fixture = enabled({ staged: false, canUndo: true, canRedo: false }, [{ id: "old-prompt", type: "user", time: { created: 1 }, text: "old branch" }]);
+    fixture.provider.undo = async () => {
+      fixture.setState({ staged: true, canUndo: false, canRedo: true });
+      fixture.setVisible([]);
+      return { outcome: "changed", state: fixture.state() };
+    };
+    fixture.provider.redo = async () => ({ outcome: "nothing-to-redo", state: fixture.state() });
+    let reads = 0;
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    Object.assign(fixture.provider, { reconcileBackgroundTasks: async () => {
+      if (++reads !== 1) return [];
+      await gate;
+      return [{ id: "task:old-branch", type: "background_task", taskId: "old-branch", description: "Old branch", createdAt: 1, status: "running" }];
+    } });
+    const adapter = new ChatAdapter({ provider: fixture.provider, workspacePath: process.cwd(), generation: "g", coalesceWindowMs: 0 });
+    adapter.projectionForTests("session").apply({ kind: "upsert", item: { id: "message:old-prompt", type: "user_message", text: "old branch", createdAt: 1 } });
+    const pump = adapter.startEventPump();
+    try {
+      fixture.provider.eventQueue.push({ type: "server.connected", data: {} });
+      await waitUntil(() => reads === 1);
+      expect((await adapter.undo("session", "undo")).outcome).toBe("changed");
+      jest.useFakeTimers(); release(); await flushRecoveryIo();
+      expect(adapter.projectionForTests("session").has("task:old-branch")).toBe(false);
+      jest.advanceTimersByTime(100); await flushRecoveryIo();
+      expect(reads).toBe(2);
+      expect(adapter.projectionForTests("session").items()).toEqual([]);
+      expect(fixture.provider.prompts).toEqual([]);
+    } finally { release(); await adapter.dispose(); await pump; jest.useRealTimers(); }
+  });
 
   test("requires both the capability and every provider operation, and avoids interrupting a no-op", async () => {
     const incomplete = new FakeProvider();
@@ -4793,6 +4943,301 @@ describe("prompt, abort, permission, and question mutations", () => {
     expect(provider.interrupts).toEqual([]);
     await adapter.dispose(); await secondPump;
   });
+  test("successful inconclusive recovery has three reads per external cycle, not endless failure polling", async () => {
+    const provider = new FakeProvider();
+    provider.sessions = [fixtureSession("session")];
+    let reads = 0;
+    let release!: () => void;
+    const first = new Promise<void>(resolve => { release = resolve; });
+    const worker = { id: "task:unknown", type: "background_task" as const, taskId: "unknown", description: "Unknown", createdAt: 1, status: "running" as const, stateUncertain: true };
+    Object.assign(provider, { reconcileBackgroundTasks: async () => { if (++reads === 1) await first; return [worker]; } });
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g", coalesceWindowMs: 0 });
+    const pump = adapter.startEventPump();
+    try {
+      provider.eventQueue.push({ type: "server.connected", data: {} });
+      await waitUntil(() => reads === 1);
+      jest.useFakeTimers();
+      release();
+      await flushRecoveryIo();
+      for (let retry = 0; retry < 8; retry++) { jest.advanceTimersByTime(30_000); await flushRecoveryIo(); }
+      expect(reads).toBe(3);
+      expect(adapter.projectionForTests("session").get(worker.id)).toMatchObject({ status: "running", stateUncertain: true });
+      provider.eventQueue.push({ normalized: { conversationId: "session", eventType: "session.tool.success", outcome: "handled", updates: [] } });
+      await flushRecoveryIo();
+      expect(reads).toBe(4);
+      for (let retry = 0; retry < 4; retry++) { jest.advanceTimersByTime(30_000); await flushRecoveryIo(); }
+      expect(reads).toBe(6);
+      expect(provider.prompts).toEqual([]);
+      expect(provider.interrupts).toEqual([]);
+    } finally { release(); await adapter.dispose(); await pump; jest.useRealTimers(); }
+  });
+
+  test("dirty source bursts apply independent workers, preserve newer rows and coalesce one fixed-delay follow-up", async () => {
+    const provider = new FakeProvider();
+    provider.sessions = [fixtureSession("session")];
+    const existing = { id: "task:existing", type: "background_task" as const, taskId: "existing", description: "Existing", createdAt: 1, status: "running" as const };
+    const discovered = { ...existing, id: "task:discovered", taskId: "discovered", description: "Discovered" };
+    let reads = 0;
+    const releases: Array<() => void> = [];
+    Object.assign(provider, { reconcileBackgroundTasks: async () => {
+      reads++;
+      await new Promise<void>(resolve => releases.push(resolve));
+      return [existing, discovered];
+    } });
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g", coalesceWindowMs: 0 });
+    adapter.projectionForTests("session").apply({ kind: "upsert", item: existing });
+    const pump = adapter.startEventPump();
+    try {
+      provider.eventQueue.push({ type: "server.connected", data: {} });
+      await waitUntil(() => reads === 1);
+      provider.eventQueue.push({ normalized: { conversationId: "session", eventType: "session.tool.success", outcome: "handled", updates: [{ kind: "upsert", item: { ...existing, status: "completed", summary: "Newer terminal result" } }] } });
+      for (let event = 0; event < 100; event++) provider.eventQueue.push({ normalized: { conversationId: "session", eventType: "session.message.content.updated", outcome: "handled", updates: [] } });
+      await liveEventsApplied(adapter, provider);
+      await flushRecoveryIo();
+      jest.useFakeTimers();
+      releases.shift()!();
+      await flushRecoveryIo();
+      expect(adapter.projectionForTests("session").get(discovered.id)).toMatchObject({ status: "running" });
+      expect(adapter.projectionForTests("session").get(existing.id)).toMatchObject({ status: "completed", summary: "Newer terminal result" });
+      expect(reads).toBe(1);
+      jest.advanceTimersByTime(99);
+      await flushRecoveryIo();
+      expect(reads).toBe(1);
+      // Continuous arrivals do not move the already-scheduled deadline.
+      provider.eventQueue.push({ normalized: { conversationId: "session", eventType: "session.message.content.updated", outcome: "handled", updates: [] } });
+      await flushRecoveryIo();
+      jest.advanceTimersByTime(1);
+      await flushRecoveryIo();
+      expect(reads).toBe(2);
+      releases.shift()!();
+      await flushRecoveryIo();
+      jest.advanceTimersByTime(60_000);
+      await flushRecoveryIo();
+      expect(reads).toBe(2);
+    } finally {
+      const disposing = adapter.dispose();
+      releases.splice(0).forEach(release => release());
+      await disposing; await pump; jest.useRealTimers();
+    }
+  });
+
+  for (const alias of ["call", "result"] as const) for (const coalesceWindowMs of [0, 25]) test(`normalized transient ${alias} alias removal fences older recovery with ${coalesceWindowMs}ms coalescing without discarding independent workers`, async () => {
+    const provider = new FakeProvider();
+    provider.sessions = [fixtureSession("session")];
+    const occurrence = alias === "call" ? { toolUseId: "same-native-call" } : { resultId: "same-native-result" };
+    const placeholder = { id: "task:transient", type: "background_task" as const, taskId: "transient", description: "Transient", createdAt: 1, status: "running" as const, ...occurrence };
+    const canonical = { ...placeholder, id: "task:canonical", taskId: "canonical", description: "Old capture" };
+    const independent = { ...placeholder, id: "task:independent", taskId: "independent", toolUseId: "independent-call", resultId: "independent-result" };
+    let reads = 0;
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let fresh = false;
+    Object.assign(provider, { reconcileBackgroundTasks: async () => { if (++reads !== 1) return fresh ? [canonical, independent] : []; await gate; return [canonical, independent]; } });
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g", coalesceWindowMs });
+    const pump = adapter.startEventPump();
+    try {
+      provider.eventQueue.push({ type: "server.connected", data: {} });
+      await waitUntil(() => reads === 1);
+      const projection = adapter.projectionForTests("session");
+      if (coalesceWindowMs) jest.useFakeTimers();
+      provider.eventQueue.push({ normalized: { conversationId: "session", eventType: "session.tool.success", outcome: "handled", updates: [{ kind: "upsert", item: placeholder }] } });
+      if (!coalesceWindowMs) { await liveEventsApplied(adapter, provider); expect(projection.has(placeholder.id)).toBe(true); }
+      provider.eventQueue.push({ normalized: { conversationId: "session", eventType: "session.tool.success", outcome: "handled", updates: [{ kind: "remove", itemId: placeholder.id }] } });
+      if (coalesceWindowMs) {
+        await flushRecoveryIo();
+        expect(projection.has(placeholder.id)).toBe(false); // Upsert never materialized.
+        jest.advanceTimersByTime(coalesceWindowMs);
+        await flushRecoveryIo();
+      } else await liveEventsApplied(adapter, provider);
+      expect(projection.has(placeholder.id)).toBe(false);
+      jest.useFakeTimers(); release(); await flushRecoveryIo();
+      expect(projection.has(canonical.id)).toBe(false);
+      expect(projection.get(independent.id)).toMatchObject({ status: "running", toolUseId: "independent-call" });
+      // The removal fence belongs only to that read, not a permanent tombstone.
+      fresh = true;
+      jest.advanceTimersByTime(100); await flushRecoveryIo();
+      expect(reads).toBe(2);
+      expect(projection.get(canonical.id)).toMatchObject({ status: "running", ...occurrence });
+      expect(provider.prompts).toEqual([]);
+      expect(provider.interrupts).toEqual([]);
+    } finally { release(); await adapter.dispose(); await pump; jest.useRealTimers(); }
+  });
+
+  test("a deleted parent retires its in-flight worker recovery instead of restoring activity", async () => {
+    const provider = new FakeProvider();
+    provider.sessions = [fixtureSession("session")];
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let reads = 0;
+    Object.assign(provider, { reconcileBackgroundTasks: async () => {
+      reads++; await gate;
+      return [{ id: "task:deleted", type: "background_task", taskId: "deleted", description: "Deleted owner", createdAt: 1, status: "running" }];
+    } });
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g", coalesceWindowMs: 0 });
+    const pump = adapter.startEventPump();
+    try {
+      provider.eventQueue.push({ type: "server.connected", data: {} });
+      await waitUntil(() => reads === 1);
+      provider.sessions = [];
+      provider.eventQueue.push({ type: "session.deleted", data: { info: fixtureSession("session") } });
+      await liveEventsApplied(adapter, provider);
+      release();
+      await flushRecoveryIo();
+      expect(adapter.projectionForTests("session").has("task:deleted")).toBe(false);
+      expect(adapter.activity().working).toBe(false);
+      expect(reads).toBe(1);
+    } finally { release(); await adapter.dispose(); await pump; }
+  });
+
+  test("rejected recovery reads retain exponential error backoff, independently of the inconclusive budget", async () => {
+    const provider = new FakeProvider();
+    provider.sessions = [fixtureSession("session")];
+    let reads = 0;
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    Object.assign(provider, { reconcileBackgroundTasks: async () => { const read = ++reads; if (read === 1) await gate; if (read < 3) throw new Error("read unavailable"); return []; } });
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g" });
+    const pump = adapter.startEventPump();
+    try {
+      provider.eventQueue.push({ type: "server.connected", data: {} });
+      await waitUntil(() => reads === 1);
+      jest.useFakeTimers(); release(); await flushRecoveryIo();
+      jest.advanceTimersByTime(999); await flushRecoveryIo(); expect(reads).toBe(1);
+      jest.advanceTimersByTime(1); await flushRecoveryIo(); expect(reads).toBe(2);
+      jest.advanceTimersByTime(1_999); await flushRecoveryIo(); expect(reads).toBe(2);
+      jest.advanceTimersByTime(1); await flushRecoveryIo(); expect(reads).toBe(3);
+      jest.advanceTimersByTime(60_000); await flushRecoveryIo(); expect(reads).toBe(3);
+    } finally { release(); await adapter.dispose(); await pump; jest.useRealTimers(); }
+  });
+
+  test("verified discovery progress can continue beyond three reads without polling unchanged unknown work forever", async () => {
+    const provider = new FakeProvider();
+    provider.sessions = [fixtureSession("session")];
+    const unknown = { id: "task:unknown", type: "background_task" as const, taskId: "unknown", description: "Unknown", createdAt: 1, status: "running" as const, stateUncertain: true };
+    let reads = 0;
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    Object.assign(provider, { reconcileBackgroundTasks: async () => {
+      const read = ++reads; if (read === 1) await gate;
+      return [unknown, ...Array.from({ length: Math.min(read, 5) }, (_, index) => ({ ...unknown, id: `task:verified-${index}`, taskId: `verified-${index}`, stateUncertain: false }))];
+    } });
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g" });
+    const pump = adapter.startEventPump();
+    try {
+      provider.eventQueue.push({ type: "server.connected", data: {} });
+      await waitUntil(() => reads === 1);
+      jest.useFakeTimers(); release(); await flushRecoveryIo();
+      for (let probe = 0; probe < 12; probe++) { jest.advanceTimersByTime(30_000); await flushRecoveryIo(); }
+      expect(reads).toBe(7); // Five progress reads, then two unchanged probes.
+      expect(adapter.projectionForTests("session").get("task:verified-4")).toMatchObject({ stateUncertain: false });
+      expect(adapter.projectionForTests("session").get(unknown.id)).toMatchObject({ status: "running", stateUncertain: true });
+    } finally { release(); await adapter.dispose(); await pump; jest.useRealTimers(); }
+  });
+
+  for (const missing of ["omitted", "uncertain", "alias", "uncertain-alias"] as const) test(`unchanged worker ${missing}/reconfirmation flapping cannot reset its recovery cycle budget`, async () => {
+    const provider = new FakeProvider();
+    provider.sessions = [fixtureSession("session")];
+    const unknown = { id: "task:unknown", type: "background_task" as const, taskId: "unknown", description: "Unknown", createdAt: 1, status: "running" as const, stateUncertain: true };
+    const known = { ...unknown, id: "task:known", taskId: "known", toolUseId: "same-call", stateUncertain: false };
+    let reads = 0;
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    Object.assign(provider, { reconcileBackgroundTasks: async () => {
+      const read = ++reads; if (read === 1) await gate;
+      return [unknown, ...(read % 2 ? [known] : missing === "omitted" ? [] : missing === "uncertain" ? [{ ...known, stateUncertain: true }] : [{ ...known, id: "task:canonical", taskId: "canonical", stateUncertain: missing === "uncertain-alias" }])];
+    } });
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g" });
+    const pump = adapter.startEventPump();
+    try {
+      provider.eventQueue.push({ type: "server.connected", data: {} });
+      await waitUntil(() => reads === 1);
+      jest.useFakeTimers(); release(); await flushRecoveryIo();
+      for (let probe = 0; probe < 16; probe++) { jest.advanceTimersByTime(30_000); await flushRecoveryIo(); }
+      expect(reads).toBe(3);
+      expect(adapter.projectionForTests("session").get(unknown.id)).toMatchObject({ status: "running", stateUncertain: true });
+      expect(adapter.projectionForTests("session").get(known.id)).toMatchObject({ status: "running", stateUncertain: false });
+    } finally { release(); await adapter.dispose(); await pump; jest.useRealTimers(); }
+  });
+
+  for (const clock of ["start", "terminal-report"] as const) test(`new verified native ${clock} clocks can extend recovery while repeated old clocks cannot`, async () => {
+    const provider = new FakeProvider();
+    provider.sessions = [fixtureSession("session")];
+    const unknown = { id: "task:unknown", type: "background_task" as const, taskId: "unknown", description: "Unknown", createdAt: 1, status: "running" as const, stateUncertain: true };
+    let reads = 0;
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    Object.assign(provider, { reconcileBackgroundTasks: async () => {
+      const read = ++reads; if (read === 1) await gate;
+      const reported = read <= 5 ? read : read % 2 ? 5 : 4;
+      return [unknown, { ...unknown, id: "task:progress", taskId: "progress", stateUncertain: false,
+        ...(clock === "start" ? { createdAt: reported } : { status: "completed", terminalReportedAt: reported * 10 }) }];
+    } });
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g" });
+    const pump = adapter.startEventPump();
+    try {
+      provider.eventQueue.push({ type: "server.connected", data: {} });
+      await waitUntil(() => reads === 1);
+      jest.useFakeTimers(); release(); await flushRecoveryIo();
+      for (let probe = 0; probe < 12; probe++) { jest.advanceTimersByTime(30_000); await flushRecoveryIo(); }
+      expect(reads).toBe(7);
+      expect(adapter.projectionForTests("session").get("task:progress")).toMatchObject(clock === "start" ? { createdAt: 5 } : { status: "completed", terminalReportedAt: 50 });
+      expect(adapter.projectionForTests("session").get(unknown.id)).toMatchObject({ status: "running", stateUncertain: true });
+    } finally { release(); await adapter.dispose(); await pump; jest.useRealTimers(); }
+  });
+
+  test("zero-progress dirty redos share the three-read budget under continuous source bursts", async () => {
+    const provider = new FakeProvider();
+    provider.sessions = [fixtureSession("session")];
+    const worker = { id: "task:unknown", type: "background_task" as const, taskId: "unknown", description: "Unknown", createdAt: 1, status: "running" as const, stateUncertain: true };
+    let reads = 0;
+    const releases: Array<() => void> = [];
+    Object.assign(provider, { reconcileBackgroundTasks: async () => { reads++; await new Promise<void>(resolve => releases.push(resolve)); return [worker]; } });
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g", coalesceWindowMs: 0 });
+    const pump = adapter.startEventPump();
+    try {
+      provider.eventQueue.push({ type: "server.connected", data: {} });
+      await waitUntil(() => reads === 1);
+      jest.useFakeTimers();
+      for (let read = 0; read < 3; read++) {
+        for (let event = 0; event < 20; event++) provider.eventQueue.push({ normalized: { conversationId: "session", eventType: "session.message.content.updated", outcome: "handled", updates: [] } });
+        await flushRecoveryIo();
+        releases.shift()!(); await flushRecoveryIo();
+        jest.advanceTimersByTime(100); await flushRecoveryIo();
+      }
+      expect(reads).toBe(3);
+      jest.advanceTimersByTime(120_000); await flushRecoveryIo();
+      expect(reads).toBe(3);
+      expect(adapter.projectionForTests("session").get(worker.id)).toMatchObject({ stateUncertain: true });
+    } finally {
+      const disposing = adapter.dispose(); releases.splice(0).forEach(release => release());
+      await disposing; await pump; jest.useRealTimers();
+    }
+  });
+
+  test("a new connected generation immediately rearms the inconclusive cycle instead of inheriting its old timer", async () => {
+    const provider = new FakeProvider();
+    provider.sessions = [fixtureSession("session")];
+    let reads = 0;
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    Object.assign(provider, { reconcileBackgroundTasks: async () => {
+      if (++reads === 1) await gate;
+      return [{ id: "task:unknown", type: "background_task", taskId: "unknown", description: "Unknown", createdAt: 1, status: "running", stateUncertain: true }];
+    } });
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g", coalesceWindowMs: 0 });
+    const pump = adapter.startEventPump();
+    try {
+      provider.eventQueue.push({ type: "server.connected", data: {} });
+      await waitUntil(() => reads === 1);
+      jest.useFakeTimers(); release(); await flushRecoveryIo();
+      provider.eventQueue.push({ type: "server.connected", data: {} });
+      await flushRecoveryIo();
+      expect(reads).toBe(2);
+      for (let retry = 0; retry < 5; retry++) { jest.advanceTimersByTime(30_000); await flushRecoveryIo(); }
+      expect(reads).toBe(4);
+    } finally { release(); await adapter.dispose(); await pump; jest.useRealTimers(); }
+  });
+
   test("inconclusive recovery backs off and clears uncertainty after evidence returns", async () => {
     const provider = new FakeProvider();
     provider.sessions = [fixtureSession("session")];
@@ -8177,6 +8622,37 @@ describe("steering (opencode-v2-steering)", () => {
     const queued = async () => (await adapter.history("session")).queued ?? [];
     return { provider, adapter, inbox, steer, queue, queued };
   }
+  test("settlement retention is bounded without erasing dormant dock ownership on projection eviction", async () => {
+    const { adapter, provider, queue, steer } = steering();
+    try {
+      const original = adapter.projectionForTests("session");
+      original.statusUpdate("running");
+      const head = await queue("head", "hold head");
+      await queue("behind", "hold behind");
+      await steer("paused-steer", "already admitted steer");
+      await adapter.abort("session", "stop");
+      // More settled conversations than the historical inventory budget, and
+      // far more than the projection LRU. The dormant dock still owns its fence.
+      for (let index = 0; index < 2_100; index++) adapter.projectionForTests(`finished-${index}`).statusUpdate("completed");
+      expect(adapter.retainedSettlementsForTests()).toBeLessThanOrEqual(2_048);
+      expect(adapter.projectionForTests("session")).not.toBe(original);
+      expect((await adapter.history("session")).queued?.[0]).toMatchObject({ text: "already admitted steer", paused: true });
+      const admit = provider.prompt.bind(provider);
+      provider.prompt = async (...args) => {
+        const accepted = await admit(...args);
+        adapter.projectionForTests("session").statusUpdate("interrupted");
+        return accepted;
+      };
+      await adapter.sendNow("session", head.messageId, "manual-send");
+      expect((await adapter.history("session")).queued).toEqual([
+        expect.objectContaining({ text: "already admitted steer", delivery: "steer", paused: true }),
+        expect.objectContaining({ text: "hold head", delivery: "steer", paused: true }),
+        expect.objectContaining({ text: "hold behind", delivery: "queue", paused: true }),
+      ]);
+      expect(provider.prompts.map(entry => entry.text)).toEqual(["already admitted steer", "hold head"]);
+    } finally { await adapter.dispose(); }
+  });
+
   // The queue events a subscriber saw, as `kind:messageId`.
   for (const outcome of ["delivered", "cancelled"] as const) test(`a delayed inbox read cannot resurrect a ${outcome} steer or discard new pending entries`, async () => {
     const { adapter, provider, inbox } = steering();
@@ -8866,6 +9342,354 @@ describe("steering (opencode-v2-steering)", () => {
       expect(provider.interruptOptions).toEqual([{ resume: false }]);
       expect(provider.prompts).toHaveLength(1);
     } finally { await adapter.dispose(); await pump; }
+  });
+
+  for (const origin of ["held", "composer"] as const) test(`local discard of unknown ${origin} admission sends nothing, fences an old idle drain and permits explicit Send now`, async () => {
+    const { adapter, provider, queue, steer } = steering({ capabilities: ["steering", "send-now", "background-blocking-work"] });
+    let backgrounds = 0;
+    Object.assign(provider, { backgroundBlockingWork: async () => { backgrounds++; } });
+    try {
+      adapter.projectionForTests("session").statusUpdate("running");
+      const accept = provider.prompt.bind(provider);
+      let headId: string;
+      if (origin === "held") headId = (await queue("head", "head")).messageId;
+      else headId = "";
+      provider.prompt = async (sessionId, input) => { provider.prompts.push({ sessionId, ...input }); throw new OperationOutcomeUnknownError(); };
+      if (origin === "held") await expect(adapter.changeDelivery("session", headId, "convert", "steer")).rejects.toBeInstanceOf(OperationOutcomeUnknownError);
+      else {
+        await expect(steer("head", "head")).rejects.toBeInstanceOf(OperationOutcomeUnknownError);
+        headId = provider.prompts[0]!.id;
+      }
+      const behind = await queue("behind", "behind");
+      const entry = (await adapter.history("session")).queued!.find(item => item.id === headId)!;
+      expect(entry.admissionUncertaintyId).toEqual(expect.any(String));
+      const lookup = spyOn(provider, "getSession");
+      const discarding = adapter.discardUnconfirmedSteer("session", headId, "discard", entry.admissionUncertaintyId!);
+      // This drain is queued behind the discard but belongs to its old queue.
+      adapter.projectionForTests("session").statusUpdate("idle");
+      expect(await discarding).toEqual({ discarded: true, outcomeUnconfirmed: true });
+      await admissionsApplied(adapter);
+      expect(lookup).not.toHaveBeenCalled();
+      lookup.mockRestore();
+      expect(await adapter.discardUnconfirmedSteer("session", headId, "discard", entry.admissionUncertaintyId!)).toEqual({ discarded: true, outcomeUnconfirmed: true });
+      expect((await adapter.history("session")).queued).toEqual([expect.objectContaining({ id: behind.messageId, text: "behind", delivery: "queue" })]);
+      expect(provider.prompts.map(item => item.text)).toEqual(["head"]);
+      expect(provider.cancelledInbox).toEqual([]);
+      expect(provider.interrupts).toEqual([]);
+      expect(backgrounds).toBe(0);
+      provider.prompt = accept;
+      await adapter.sendNow("session", behind.messageId, "explicit-send");
+      expect(provider.prompts.map(item => item.text)).toEqual(["head", "behind"]);
+    } finally { await adapter.dispose(); }
+  });
+
+  test("discard rejects wrong and confirmed tokens, and cannot replay the original unknown request", async () => {
+    const { adapter, provider, steer } = steering();
+    try {
+      adapter.projectionForTests("session").statusUpdate("running");
+      provider.prompt = async (sessionId, input) => { provider.prompts.push({ sessionId, ...input }); throw new OperationOutcomeUnknownError(); };
+      await expect(steer("original", "original")).rejects.toBeInstanceOf(OperationOutcomeUnknownError);
+      const first = (await adapter.history("session")).queued![0]!;
+      await expect(adapter.discardUnconfirmedSteer("session", first.id, "wrong", "wrong-token")).rejects.toBeInstanceOf(InteractionConflictError);
+      expect((await adapter.history("session")).queued![0]!.admissionUncertaintyId).toBe(first.admissionUncertaintyId);
+      provider.pendingInbox = [{ id: first.id, text: first.text, delivery: "steer", at: 1 }];
+      expect((await adapter.history("session")).queued![0]).not.toHaveProperty("admissionUncertaintyId");
+      await expect(adapter.discardUnconfirmedSteer("session", first.id, "stale", first.admissionUncertaintyId!)).rejects.toBeInstanceOf(InteractionConflictError);
+      await expect(steer("original", "original")).rejects.toBeInstanceOf(OperationOutcomeUnknownError);
+      await expect(steer("second", "second")).rejects.toBeInstanceOf(OperationOutcomeUnknownError);
+      const second = (await adapter.history("session")).queued!.find(entry => entry.text === "second")!;
+      expect(second.admissionUncertaintyId).not.toBe(first.admissionUncertaintyId);
+      await adapter.discardUnconfirmedSteer("session", second.id, "discard", second.admissionUncertaintyId!);
+      // Reusing a client nonce for a different target must not return another
+      // entry's cached success or bypass this entry's changed-token check.
+      await expect(adapter.discardUnconfirmedSteer("session", first.id, "discard", first.admissionUncertaintyId!)).rejects.toBeInstanceOf(InteractionConflictError);
+      await expect(steer("second", "second")).rejects.toBeInstanceOf(OperationOutcomeUnknownError);
+      expect(provider.prompts.map(entry => entry.text)).toEqual(["original", "second"]);
+      expect(provider.cancelledInbox).toEqual([]);
+    } finally { await adapter.dispose(); }
+  });
+
+  test("a timed-out but still-pending admission offers no discard token until the transport settles unknown", async () => {
+    const { adapter, provider, steer } = steering({ steerAdmissionTimeoutMs: 10 });
+    let reject!: (error: Error) => void;
+    const pending = new Promise<{ messageId: string }>((_resolve, fail) => { reject = fail; });
+    try {
+      adapter.projectionForTests("session").statusUpdate("running");
+      provider.prompt = async (sessionId, input) => { provider.prompts.push({ sessionId, ...input }); return pending; };
+      jest.useFakeTimers();
+      const sending = steer("original", "original");
+      await flushRecoveryIo();
+      const during = (await adapter.history("session")).queued ?? [];
+      expect(during.every(entry => !entry.admissionUncertaintyId)).toBe(true);
+      jest.advanceTimersByTime(10);
+      await expect(sending).rejects.toBeInstanceOf(OperationOutcomeUnknownError);
+      const timedOut = (await adapter.history("session")).queued![0]!;
+      expect(timedOut).toMatchObject({ unconfirmed: true });
+      expect(timedOut).not.toHaveProperty("admissionUncertaintyId");
+      await expect(adapter.discardUnconfirmedSteer("session", timedOut.id, "pending-discard", "invented-token")).rejects.toBeInstanceOf(InteractionConflictError);
+      reject(new OperationOutcomeUnknownError());
+      await flushRecoveryIo();
+      const settled = (await adapter.history("session")).queued![0]!;
+      expect(settled.admissionUncertaintyId).toEqual(expect.any(String));
+      await adapter.discardUnconfirmedSteer("session", settled.id, "settled-discard", settled.admissionUncertaintyId!);
+      expect(provider.prompts).toHaveLength(1);
+    } finally { reject(new OperationOutcomeUnknownError()); await adapter.dispose(); jest.useRealTimers(); }
+  });
+
+  for (const uncertainty of ["resume", "withdrawal"] as const) test(`local discard never applies to ${uncertainty} uncertainty`, async () => {
+    const { adapter, provider, steer } = steering({ steerWithdrawTimeoutMs: 10 });
+    try {
+      adapter.projectionForTests("session").statusUpdate("running");
+      const accepted = await steer("steer", "native input");
+      if (uncertainty === "resume") {
+        adapter.projectionForTests("session").statusUpdate("interrupted");
+        provider.interrupt = async () => { throw new OperationOutcomeUnknownError(); };
+        await expect(adapter.sendNow("session", accepted.messageId, "resume")).rejects.toBeInstanceOf(OperationOutcomeUnknownError);
+      } else await expect(adapter.removeQueued("session", accepted.messageId, "withdraw")).rejects.toBeInstanceOf(SteerWithdrawalUnconfirmedError);
+      const entry = (await adapter.history("session")).queued![0]!;
+      expect(entry).toMatchObject({ unconfirmed: true });
+      expect(entry).not.toHaveProperty("admissionUncertaintyId");
+      const before = provider.cancelledInbox.length;
+      await expect(adapter.discardUnconfirmedSteer("session", entry.id, "discard", "invented-token")).rejects.toBeInstanceOf(InteractionConflictError);
+      expect(provider.cancelledInbox).toHaveLength(before);
+      expect(provider.prompts).toHaveLength(1);
+      expect((await adapter.history("session")).queued).toHaveLength(1);
+    } finally { await adapter.dispose(); }
+  });
+
+  test("discard fences a stale inbox read but preserves later positive native pending and delivered history", async () => {
+    const { adapter, provider, queue, inbox } = steering();
+    const pump = adapter.startEventPump();
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let reading: ReturnType<ChatAdapter["history"]> | undefined;
+    try {
+      adapter.projectionForTests("session").statusUpdate("running");
+      const head = await queue("head", "head");
+      await queue("behind", "behind");
+      provider.prompt = async (sessionId, input) => { provider.prompts.push({ sessionId, ...input }); throw new OperationOutcomeUnknownError(); };
+      await expect(adapter.changeDelivery("session", head.messageId, "convert", "steer")).rejects.toBeInstanceOf(OperationOutcomeUnknownError);
+      const uncertain = (await adapter.history("session")).queued![0]!;
+      const nativeId = provider.prompts[0]!.id;
+      let entered = false;
+      provider.listPendingInbox = async () => { entered = true; await gate; return [{ id: nativeId, text: "head", delivery: "steer", at: 1 }]; };
+      reading = adapter.history("session");
+      await waitUntil(() => entered);
+      await adapter.discardUnconfirmedSteer("session", head.messageId, "discard", uncertain.admissionUncertaintyId!);
+      release();
+      expect((await reading).queued?.map(entry => entry.text)).toEqual(["behind"]);
+      provider.listPendingInbox = async () => provider.pendingInbox;
+      inbox({ kind: "pending", id: nativeId, text: "head", delivery: "steer", at: 2 });
+      await liveEventsApplied(adapter, provider);
+      const native = (await adapter.history("session")).queued!;
+      expect(native.map(entry => entry.id)).not.toContain(head.messageId);
+      expect(native.filter(entry => entry.text === "head")).toEqual([expect.objectContaining({ id: nativeId, delivery: "steer" })]);
+      expect(native[0]).not.toHaveProperty("admissionUncertaintyId");
+      inbox({ kind: "settled", id: nativeId, outcome: "delivered" });
+      await liveEventsApplied(adapter, provider);
+      provider.pages.set("first", { items: [{ id: nativeId, type: "user", time: { created: 3 }, text: "head" }] });
+      const delivered = await adapter.history("session");
+      expect(delivered.items).toContainEqual(expect.objectContaining({ id: `message:${nativeId}`, type: "user_message", text: "head" }));
+      expect(delivered.queued?.map(entry => entry.text)).toEqual(["behind"]);
+      expect(provider.prompts).toHaveLength(1);
+      expect(provider.cancelledInbox).toEqual([]);
+    } finally { release(); await reading; await adapter.dispose(); await pump; }
+  });
+
+  test("discard Keep queued survives derived completion and drains only on a later normal idle transition", async () => {
+    const { adapter, provider, queue } = steering();
+    try {
+      adapter.projectionForTests("session").statusUpdate("running");
+      const head = await queue("head", "head");
+      await queue("behind", "behind");
+      const accept = provider.prompt.bind(provider);
+      provider.prompt = async (sessionId, input) => { provider.prompts.push({ sessionId, ...input }); throw new OperationOutcomeUnknownError(); };
+      await expect(adapter.changeDelivery("session", head.messageId, "convert", "steer")).rejects.toBeInstanceOf(OperationOutcomeUnknownError);
+      const entry = (await adapter.history("session")).queued![0]!;
+      await adapter.discardUnconfirmedSteer("session", head.messageId, "discard", entry.admissionUncertaintyId!);
+      const finished = { id: "task:finished", type: "background_task" as const, taskId: "finished", description: "Finished", createdAt: 1, status: "completed" as const };
+      adapter.projectionForTests("session").apply({ kind: "upsert", item: finished });
+      adapter.projectionForTests("session").statusUpdate("background");
+      Object.assign(provider, { reconcileBackgroundTasks: async () => [finished] });
+      expect((await adapter.history("session")).conversation.status).toBe("completed");
+      await admissionsApplied(adapter);
+      expect(provider.prompts.map(item => item.text)).toEqual(["head"]);
+      provider.prompt = accept;
+      adapter.projectionForTests("session").statusUpdate("idle");
+      await admissionsApplied(adapter);
+      expect(provider.prompts.map(item => item.text)).toEqual(["head", "behind"]);
+      expect((await adapter.history("session")).queued).toEqual([]);
+    } finally { await adapter.dispose(); }
+  });
+
+  for (const failure of ["unknown", "definite", "timeout"] as const) for (const release of ["idle", "explicit"] as const) test(`failed Send now (${failure}) preserves unrelated Keep queued input until ${release} evidence`, async () => {
+    const { adapter, provider, queue } = steering({ steerAdmissionTimeoutMs: 10 });
+    let rejectTransport!: (error: Error) => void;
+    const transport = new Promise<{ messageId: string }>((_resolve, reject) => { rejectTransport = reject; });
+    // Only the timeout case consumes this promise.
+    void transport.catch(() => undefined);
+    try {
+      adapter.projectionForTests("session").statusUpdate("running");
+      const head = await queue("head", "head");
+      const behind = await queue("behind", "behind");
+      const selected = await queue("selected", "selected");
+      const accept = provider.prompt.bind(provider);
+      provider.prompt = async (sessionId, input) => {
+        if (input.text === "behind") return accept(sessionId, input);
+        provider.prompts.push({ sessionId, ...input });
+        if (input.text === "selected" && failure === "timeout") return transport;
+        if (input.text === "selected" && failure === "definite") throw new Error("definite admission refusal");
+        throw new OperationOutcomeUnknownError();
+      };
+      await expect(adapter.changeDelivery("session", head.messageId, "convert", "steer")).rejects.toBeInstanceOf(OperationOutcomeUnknownError);
+      adapter.projectionForTests("session").statusUpdate("idle");
+      await admissionsApplied(adapter);
+      const unknown = (await adapter.history("session")).queued!.find(entry => entry.id === head.messageId)!;
+      await adapter.discardUnconfirmedSteer("session", head.messageId, "discard", unknown.admissionUncertaintyId!);
+      if (failure === "timeout") jest.useFakeTimers();
+      const sending = adapter.sendNow("session", selected.messageId, "send-selected").catch(error => error);
+      if (failure === "timeout") { await flushRecoveryIo(); jest.advanceTimersByTime(10); }
+      expect(await sending).toBeInstanceOf(failure === "definite" ? Error : OperationOutcomeUnknownError);
+      await admissionsApplied(adapter);
+      expect(provider.prompts.map(entry => [entry.text, entry.delivery])).toEqual([["head", "steer"], ["selected", "steer"]]);
+      expect((await adapter.history("session")).queued?.filter(entry => entry.delivery === "queue")).toEqual([
+        expect.objectContaining({ id: behind.messageId, paused: true }),
+        expect.objectContaining({ id: selected.messageId, paused: true }),
+      ]);
+      if (release === "idle") {
+        adapter.projectionForTests("session").statusUpdate("idle");
+        await admissionsApplied(adapter);
+      } else await adapter.sendNow("session", behind.messageId, "explicit-behind");
+      expect(provider.prompts.map(entry => entry.text)).toEqual(["head", "selected", "behind"]);
+      expect(provider.prompts.at(-1)!.delivery).toBe(release === "idle" ? "queue" : "steer");
+      expect(provider.cancelledInbox).toEqual([]);
+    } finally { rejectTransport(new OperationOutcomeUnknownError()); await adapter.dispose(); jest.useRealTimers(); }
+  });
+
+  for (const failure of ["configuration", "attachment"] as const) test(`${failure} preflight failure preserves Keep queued input across projection recreation`, async () => {
+    let attachmentAvailable = true;
+    const { adapter, provider, queue } = steering({ resolveAttachment: async id => attachmentAvailable && id === "asset" ? { id, mimeType: "image/png", absolutePath: `${process.cwd()}/fake-asset.png` } : null });
+    try {
+      adapter.projectionForTests("session").statusUpdate("running");
+      const head = await queue("head", "head");
+      const behind = await queue("behind", "behind");
+      const selected = await adapter.prompt("session", "selected", "selected", undefined, undefined, undefined,
+        failure === "attachment" ? [{ id: "asset", name: "asset.png", mimeType: "image/png" }] : undefined, "queue");
+      const accept = provider.prompt.bind(provider);
+      provider.prompt = async (sessionId, input) => { provider.prompts.push({ sessionId, ...input }); throw new OperationOutcomeUnknownError(); };
+      await expect(adapter.changeDelivery("session", head.messageId, "convert", "steer")).rejects.toBeInstanceOf(OperationOutcomeUnknownError);
+      adapter.projectionForTests("session").statusUpdate("idle");
+      await admissionsApplied(adapter);
+      const unknown = (await adapter.history("session")).queued!.find(entry => entry.id === head.messageId)!;
+      await adapter.discardUnconfirmedSteer("session", head.messageId, "discard", unknown.admissionUncertaintyId!);
+      for (let index = 0; index < 70; index++) adapter.projectionForTests(`preflight-evict-${index}`);
+      if (failure === "configuration") {
+        provider.getConversationConfiguration = async () => { throw new Error("configuration unavailable"); };
+        await expect(adapter.prompt("session", "new-draft", "preserve this draft", undefined, undefined, undefined, undefined, "steer")).rejects.toThrow("configuration unavailable");
+        provider.getConversationConfiguration = async () => ({});
+      } else {
+        attachmentAvailable = false;
+        await expect(adapter.sendNow("session", selected.messageId, "failed-preflight")).rejects.toBeInstanceOf(UnknownAttachmentError);
+        attachmentAvailable = true;
+      }
+      await admissionsApplied(adapter);
+      expect(provider.prompts.map(entry => entry.text)).toEqual(["head"]);
+      expect((await adapter.history("session")).queued).toEqual([
+        expect.objectContaining({ id: behind.messageId, paused: true }),
+        expect.objectContaining({ id: selected.messageId, paused: true }),
+      ]);
+      provider.prompt = accept;
+      await adapter.sendNow("session", selected.messageId, "explicit-selected");
+      expect(provider.prompts.map(entry => entry.text)).toEqual(["head", "selected"]);
+      adapter.projectionForTests("session").statusUpdate("idle");
+      await admissionsApplied(adapter);
+      expect(provider.prompts.map(entry => entry.text)).toEqual(["head", "selected", "behind"]);
+    } finally { await adapter.dispose(); }
+  });
+
+  test("discard rechecks exact ownership after a native confirmation overtakes its admission lane", async () => {
+    const { adapter, provider, queue, inbox } = steering();
+    const pump = adapter.startEventPump();
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    try {
+      adapter.projectionForTests("session").statusUpdate("running");
+      const head = await queue("head", "head");
+      const behind = await queue("behind", "behind");
+      provider.prompt = async (sessionId, input) => { provider.prompts.push({ sessionId, ...input }); throw new OperationOutcomeUnknownError(); };
+      await expect(adapter.changeDelivery("session", head.messageId, "convert", "steer")).rejects.toBeInstanceOf(OperationOutcomeUnknownError);
+      const entry = (await adapter.history("session")).queued![0]!;
+      const nativeId = provider.prompts[0]!.id;
+      provider.prompt = async (sessionId, input) => { provider.prompts.push({ sessionId, ...input }); await gate; return { messageId: input.id }; };
+      const sending = adapter.sendNow("session", behind.messageId, "send-other");
+      await waitUntil(() => provider.prompts.length === 2);
+      const discarding = adapter.discardUnconfirmedSteer("session", head.messageId, "discard", entry.admissionUncertaintyId!);
+      inbox({ kind: "pending", id: nativeId, text: "head", delivery: "steer", at: 1 });
+      await liveEventsApplied(adapter, provider);
+      release(); await sending;
+      await expect(discarding).rejects.toBeInstanceOf(InteractionConflictError);
+      expect((await adapter.history("session")).queued).toContainEqual(expect.objectContaining({ id: nativeId, text: "head", delivery: "steer" }));
+      expect(provider.cancelledInbox).toEqual([]);
+    } finally { release(); await adapter.dispose(); await pump; }
+  });
+
+  test("a genuinely unknown held head remains a no-replay barrier after idle and two empty history reads", async () => {
+    const { adapter, provider, queue } = steering();
+    try {
+      adapter.projectionForTests("session").statusUpdate("running");
+      const head = await queue("head", "head");
+      const behind = await queue("behind", "behind");
+      provider.prompt = async (sessionId, input) => {
+        provider.prompts.push({ sessionId, ...input });
+        throw new OperationOutcomeUnknownError(); // Nothing landed, but Uatu cannot know that.
+      };
+      await expect(adapter.changeDelivery("session", head.messageId, "convert", "steer")).rejects.toBeInstanceOf(OperationOutcomeUnknownError);
+      adapter.projectionForTests("session").statusUpdate("idle");
+      await admissionsApplied(adapter);
+      for (let read = 0; read < 2; read++) {
+        expect((await adapter.history("session")).queued).toEqual([
+          expect.objectContaining({ id: head.messageId, unconfirmed: true, paused: true }),
+          expect.objectContaining({ id: behind.messageId }),
+        ]);
+      }
+      await expect(adapter.removeQueued("session", head.messageId, "remove")).rejects.toBeInstanceOf(OperationOutcomeUnknownError);
+      await expect(adapter.sendNow("session", head.messageId, "send-now")).rejects.toBeInstanceOf(OperationOutcomeUnknownError);
+      await expect(adapter.changeDelivery("session", head.messageId, "convert-again", "steer")).rejects.toBeInstanceOf(OperationOutcomeUnknownError);
+      expect(provider.pendingInbox).toEqual([]);
+      expect(provider.prompts.map(entry => entry.text)).toEqual(["head"]);
+    } finally { await adapter.dispose(); }
+  });
+
+  test("inbox reconciliation during held dispatch cannot leave the accepted head queued for replay", async () => {
+    const { adapter, provider, queue } = steering();
+    let release!: () => void;
+    const dispatchGate = new Promise<void>(resolve => { release = resolve; });
+    try {
+      adapter.projectionForTests("session").statusUpdate("running");
+      const head = await queue("head", "head");
+      const second = await queue("second", "second");
+      provider.prompt = async (sessionId, input) => {
+        provider.prompts.push({ sessionId, ...input });
+        throw new OperationOutcomeUnknownError();
+      };
+      await expect(adapter.changeDelivery("session", second.messageId, "convert", "steer")).rejects.toBeInstanceOf(OperationOutcomeUnknownError);
+      const nativeId = provider.prompts[0]!.id;
+      provider.prompt = async (sessionId, input) => {
+        provider.prompts.push({ sessionId, ...input });
+        await dispatchGate;
+        return { messageId: input.id };
+      };
+      adapter.projectionForTests("session").statusUpdate("idle");
+      await waitUntil(() => provider.prompts.length === 2);
+      provider.pendingInbox = [{ id: nativeId, text: "second", delivery: "steer", at: 1 }];
+      expect((await adapter.history("session")).queued?.map(entry => entry.text)).toEqual(["second", "head"]);
+      release();
+      await admissionsApplied(adapter);
+      adapter.projectionForTests("session").statusUpdate("idle");
+      await admissionsApplied(adapter);
+      expect(provider.prompts.map(entry => entry.text)).toEqual(["second", "head"]);
+      expect((await adapter.history("session")).queued?.map(entry => entry.id)).not.toContain(head.messageId);
+    } finally { release(); await adapter.dispose(); }
   });
 
   test("unknown held-to-steer admission blocks fresh-ID resend and queue release until read-only confirmation", async () => {

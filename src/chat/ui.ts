@@ -337,6 +337,7 @@ export function initChat(api = new ChatApiClient()): void {
   // A stored reference is not an opened selection. Keep it inert across
   // missing inventories, even if creation cancels startup before it finishes.
   let hasSelectedConversation = false;
+  let failedOpeningConversationId: string | null = null;
   // A consumed startup restore is not deletion-recovery eligible until its
   // opening read succeeds. Keep this scoped to its current selection epoch.
   let unestablishedStartup: { conversationId: string; generation: number } | null = null;
@@ -2762,6 +2763,9 @@ export function initChat(api = new ChatApiClient()): void {
     }
     const hasContent = Boolean(input.value.trim()) || currentPendingAttachments().length > 0
       || (activeId !== null && attachmentStaging.has(activeId));
+    // Initial openings wait for a snapshot. After failure, keep that
+    // conversation's private draft editable through explicit read retries.
+    input.disabled = !projection && (!activeId || failedOpeningConversationId !== activeId);
     send.disabled = submitting || cancelling || !projection || !hasContent;
     if (stop) {
       stop.disabled = cancelling || !projection || !running;
@@ -2781,6 +2785,7 @@ export function initChat(api = new ChatApiClient()): void {
     sendGroup?.toggleAttribute("data-steering", declares("steering"));
     configurationTrigger.disabled = submitting || !projection || catalogLoading;
     configurationTrigger.toggleAttribute("aria-busy", catalogLoading);
+    if (renameButton) renameButton.disabled = !projection || selectedConversationDeleted;
     syncHistoryControls();
     olderButton.hidden = !projection?.olderCursor;
     syncRoutineStatus();
@@ -3098,6 +3103,7 @@ export function initChat(api = new ChatApiClient()): void {
     const openingStartup = deferredStartup || isUnestablishedStartup(id);
     supersedeStartupSelection();
     hasSelectedConversation = true;
+    if (failedOpeningConversationId !== id) failedOpeningConversationId = null;
     if (projection?.conversationId === id && stream && !historyRefreshRequired.has(id) && !selectedConversationDeleted) return true;
     // Navigation ends the outgoing hold before a fast snapshot can arrive
     // ahead of its clearing paint. Only an in-place refresh may renew it;
@@ -3163,6 +3169,7 @@ export function initChat(api = new ChatApiClient()): void {
         const snapshot = await api.snapshot(id, undefined, signal);
         if (token !== selectionGeneration) return false;
         installConversationSnapshot(snapshot, acceptedDrafts, token);
+        failedOpeningConversationId = null;
         unestablishedStartup = null;
         // The selection is settled; a ready agent stops polling, so this is
         // the moment mid-session command discoveries reach the completion
@@ -3171,6 +3178,10 @@ export function initChat(api = new ChatApiClient()): void {
         return true;
       });
     } catch (error) {
+      if (token === selectionGeneration && presentation.selectedId === id) {
+        failedOpeningConversationId = id;
+        syncControls();
+      }
       return false;
     }
   };
@@ -3672,6 +3683,50 @@ export function initChat(api = new ChatApiClient()): void {
       }
       compactPendingState.toggled(!open);
       scheduleRender();
+      return;
+    }
+    const discardTarget = (event.target as Element).closest<HTMLButtonElement>("[data-queue-discard]");
+    if (discardTarget && projection) {
+      const conversationId = projection.conversationId;
+      const messageId = discardTarget.dataset.queueDiscard!;
+      const eligible = (entry: QueuedMessage | undefined) => entry?.unconfirmed === true
+        && !!entry.admissionUncertaintyId && !unconfirmedWithdrawals.get(conversationId)?.has(messageId);
+      const entry = projection.queued.find(candidate => candidate.id === messageId);
+      if (!eligible(entry) || discardTarget.disabled || queueActionsInFlight.get(conversationId)?.has(messageId)) return;
+      const uncertaintyId = entry!.admissionUncertaintyId!;
+      if (!await confirmChatAction("Discard local record?", "Delivery of this message is unconfirmed. Removing Uatu’s local record does not cancel or resend it; the original may still arrive. Other messages will stay queued until you choose Send now or a later normal idle transition.", "Discard local record", discardTarget)) return;
+      const current = projection?.conversationId === conversationId ? projection.queued.find(candidate => candidate.id === messageId) : undefined;
+      if (!eligible(current) || current!.admissionUncertaintyId !== uncertaintyId || queueActionsInFlight.get(conversationId)?.has(messageId)) return;
+      const inFlight = queueActionsInFlight.get(conversationId) ?? new Map<string, PendingQueueAction>();
+      const pending: PendingQueueAction = {};
+      inFlight.set(messageId, pending);
+      queueActionsInFlight.set(conversationId, inFlight);
+      discardTarget.disabled = true;
+      scheduleRender();
+      const operationId = newRequestId();
+      try {
+        await api.discardUnconfirmedSteer(conversationId, messageId, operationId, uncertaintyId);
+        // A local-record acknowledgement cannot settle the original admission.
+        // Retain this operation's bounded, page-local notice even if selection
+        // changed; stream/snapshot paints and unrelated successes are not receipts.
+        const message = `Delivery remains unconfirmed; the original may still arrive. ${actionOrigin("Local record discarded", entry!.text)}. Discard did not cancel or resend it. Other messages were left queued.`;
+        automaticNotes.unconfirmed(conversationId, `discard:${operationId}`, message);
+        if (projection?.conversationId !== conversationId) return;
+        const remaining = projection.queued.find(candidate => candidate.id === messageId);
+        if (remaining?.admissionUncertaintyId === uncertaintyId && eligible(remaining)) projection = dropQueuedMessage(projection, messageId);
+        scheduleRender();
+        // This acknowledgement only removes a local row. Keep the original
+        // unknown receipt and every other draft/queue entry untouched.
+        syncControls();
+        if (document.activeElement === discardTarget || document.activeElement === document.body) input.focus({ preventScroll: true });
+      } catch (error) {
+        await refreshSelectedConversation(conversationId);
+        if (activeConversationId() === conversationId) announce(`${messageOf(error)} Delivery remains unconfirmed; no message was cancelled or resent.`, true);
+      } finally {
+        inFlight.delete(messageId);
+        if (!inFlight.size) queueActionsInFlight.delete(conversationId);
+        scheduleRender();
+      }
       return;
     }
     const target = (event.target as Element).closest<HTMLButtonElement>("[data-queue-remove], [data-queue-edit], [data-queue-steer], [data-queue-queue], [data-queue-send-now]");
@@ -5257,7 +5312,13 @@ export function initChat(api = new ChatApiClient()): void {
     const submissionByHold = requestedByHold;
     requestedByHold = false;
     requestedDelivery = undefined;
-    if (!projection || submitting || cancelling) return;
+    if (!projection) {
+      // The composer owns this transient notice; the conversation status
+      // may still own an interruption message and its Reconnect control.
+      noteComposer("Conversation history is not loaded. Nothing was sent; your draft was kept. Use Retry read or select another conversation.", true);
+      return;
+    }
+    if (submitting || cancelling) return;
     const aside = sideQuestionOperation(input.value);
     if (aside) {
       const conversationId = projection.conversationId;

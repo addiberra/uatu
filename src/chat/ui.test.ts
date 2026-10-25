@@ -4,7 +4,7 @@ import { parseHTML } from "linkedom";
 import type { ChatApiClient } from "./client";
 import type { RevealOptions } from "./coordinated-scroll";
 import { resetUsagePaneForTests } from "./usage-pane";
-import type { ChatCommand, ChatModel, ConversationSnapshot, ReversibleHistoryResult } from "./types";
+import type { ChatCommand, ChatModel, ConversationSnapshot, QueuedMessage, ReversibleHistoryResult } from "./types";
 
 const html = await Bun.file(`${import.meta.dir}/../index.html`).text();
 const savedGlobals = new Map<string, unknown>();
@@ -33,6 +33,545 @@ if (process.env[CHILD_PROCESS_FLAG] !== "1") {
   });
 } else {
 describe("chat reversible-history composer", () => {
+  test("opening readiness preserves drafts through failure, retry and switching", async () => {
+    const { document, window } = parseHTML(html);
+    installDomGlobals(document, window);
+    document.documentElement.setAttribute("data-ui-mode", "desktop");
+    document.documentElement.setAttribute("data-chat-panel", "open");
+    stubConversationSelect(document);
+    const previousStorage = Object.getOwnPropertyDescriptor(window, "localStorage");
+    const values = new Map<string, string>();
+    Object.defineProperty(window, "localStorage", { configurable: true, value: {
+      getItem: (key: string) => values.get(key) ?? null,
+      setItem: (key: string, value: string) => values.set(key, value),
+      removeItem: (key: string) => values.delete(key),
+    } });
+    const { presentationLocalStorage } = await import("../shell/presentation-storage");
+    presentationLocalStorage()!.setItem("uatu:chat-presentation", JSON.stringify({
+      selectedId: "one", drafts: { one: "Saved private draft" },
+    }));
+    const reads: Array<{ id: string; result: ReturnType<typeof deferred<ConversationSnapshot>> }> = [];
+    let prompts = 0;
+    const api = {
+      status: async () => [{ agent: { id: "test", name: "Test" }, availability: {
+        state: "ready", version: "test", agent: { id: "test", name: "Test", capabilities: [] },
+      } }],
+      conversations: async () => [conversation("one"), conversation("two")],
+      commands: async () => [], models: async () => [], modes: async () => [],
+      snapshot: async (id: string) => {
+        const result = deferred<ConversationSnapshot>();
+        reads.push({ id, result });
+        return result.promise;
+      },
+      prompt: async () => { prompts++; throw new Error("No submission was requested"); },
+      stream: () => ({ close() {} }), inventoryStream: () => ({ close() {} }), attachmentUrl: () => "",
+    } as unknown as ChatApiClient;
+    const { initChat } = await import(`./ui.ts?opening-readiness=${Date.now()}`);
+    initChat(api);
+    const input = document.querySelector<HTMLTextAreaElement>("#chat-input")!;
+    const send = document.querySelector<HTMLButtonElement>("#chat-send")!;
+    const select = document.querySelector<HTMLSelectElement>("#chat-conversation-select")!;
+    const choose = (id: string) => { select.value = id; select.dispatchEvent(new window.Event("change", { bubbles: true })); };
+    try {
+      await waitUntil(() => reads.length === 1);
+      expect(input.disabled).toBe(true);
+      expect(send.disabled).toBe(true);
+      expect(input.value).toBe("Saved private draft");
+      // Synthetic submission must not create a deferred send intent either.
+      document.querySelector<HTMLFormElement>("#chat-composer")!.dispatchEvent(new window.Event("submit", { bubbles: true, cancelable: true }));
+      expect(prompts).toBe(0);
+      reads[0]!.result.reject(new Error("synthetic opening failure"));
+      await waitUntil(() => !document.querySelector<HTMLElement>("#chat-surface > .chat-read-error")!.hidden);
+      expect(input.disabled).toBe(false);
+      expect(send.disabled).toBe(true);
+      expect(input.value).toBe("Saved private draft");
+      type(input, "Edited recovery draft");
+      const form = document.querySelector<HTMLFormElement>("#chat-composer")!;
+      form.requestSubmit = () => { form.dispatchEvent(new window.Event("submit", { bubbles: true, cancelable: true })); };
+      for (const altKey of [false, true]) {
+        const key = Object.assign(new window.Event("keydown", { bubbles: true, cancelable: true }), { key: "Enter", altKey });
+        input.dispatchEvent(key);
+        expect(key.defaultPrevented).toBe(true);
+        expect(document.querySelector("#chat-composer-status-live")!.textContent).toContain("Nothing was sent; your draft was kept.");
+        expect(document.querySelector("#chat-surface > .chat-read-error")!.textContent).toContain("synthetic opening failure");
+        expect(input.value).toBe("Edited recovery draft");
+        expect(prompts).toBe(0);
+      }
+      document.querySelector<HTMLButtonElement>("#chat-surface > .chat-read-error button")!.click();
+      await waitUntil(() => reads.length === 2);
+      expect(reads[1]!.id).toBe("one");
+      expect(input.disabled).toBe(false);
+      expect(send.disabled).toBe(true);
+      type(input, "Typed during retry");
+      reads[1]!.result.resolve(snapshot("one"));
+      await waitUntil(() => input.disabled === false);
+      await waitUntil(() => !send.disabled);
+      expect(input.value).toBe("Typed during retry");
+      expect(document.querySelector("#chat-composer-status-live")!.textContent).not.toContain("Conversation history is not loaded");
+      expect(prompts).toBe(0);
+      choose("two");
+      await waitUntil(() => reads.length === 3);
+      expect(input.disabled).toBe(true);
+      reads[2]!.result.resolve(snapshot("two"));
+      await waitUntil(() => input.disabled === false);
+      type(input, "Other private draft");
+      choose("one");
+      await waitUntil(() => reads.length === 4);
+      expect(input.disabled).toBe(true);
+      expect(input.value).toBe("Typed during retry");
+      reads[3]!.result.resolve(snapshot("one"));
+      await waitUntil(() => input.disabled === false);
+      expect(input.value).toBe("Typed during retry");
+      choose("two");
+      await waitUntil(() => reads.length === 5);
+      reads[4]!.result.resolve(snapshot("two"));
+      await waitUntil(() => input.disabled === false);
+      expect(input.value).toBe("Other private draft");
+      expect(prompts).toBe(0);
+    } finally {
+      window.dispatchEvent(new window.Event("pagehide"));
+      presentationLocalStorage()!.removeItem("uatu:chat-presentation");
+      document.documentElement.setAttribute("data-chat-panel", "collapsed");
+      if (previousStorage) Object.defineProperty(window, "localStorage", previousStorage);
+      else Reflect.deleteProperty(window, "localStorage");
+    }
+  });
+
+  test("Rename waits for the selected snapshot and preserves failure and deletion locks", async () => {
+    const { document, window } = parseHTML(html);
+    installDomGlobals(document, window);
+    document.documentElement.setAttribute("data-ui-mode", "desktop");
+    document.documentElement.setAttribute("data-chat-panel", "open");
+    stubConversationSelect(document);
+    const reads: Array<ReturnType<typeof deferred<ConversationSnapshot>>> = [];
+    let summaries = [conversation("one"), conversation("two")];
+    let inventory: Parameters<ChatApiClient["inventoryStream"]>[0] | undefined;
+    let renames = 0;
+    const api = questionApi(document, { capabilities: ["conversation-rename"] });
+    api.conversations = async () => summaries;
+    api.snapshot = async () => { const result = deferred<ConversationSnapshot>(); reads.push(result); return result.promise; };
+    api.inventoryStream = handlers => { inventory = handlers; return { close() {} }; };
+    api.renameConversation = async id => { renames++; return { conversation: conversation(id) }; };
+    const { initChat } = await import(`./ui.ts?rename-readiness=${Date.now()}`);
+    initChat(api);
+    const rename = document.querySelector<HTMLButtonElement>("#chat-rename-conversation")!;
+    const input = document.querySelector<HTMLTextAreaElement>("#chat-input")!;
+    const form = document.querySelector<HTMLFormElement>("#chat-rename-form")!;
+    const readError = document.querySelector<HTMLElement>("#chat-surface > .chat-read-error")!;
+    try {
+      await waitUntil(() => reads.length === 1 && Boolean(inventory));
+      expect(rename.isConnected).toBe(true);
+      expect(rename.disabled).toBe(true);
+      reads[0]!.reject(new Error("Rename history unavailable"));
+      await waitUntil(() => !readError.hidden);
+      expect(rename.disabled).toBe(true);
+      expect(input.disabled).toBe(false);
+      readError.querySelector<HTMLButtonElement>("button")!.click();
+      await waitUntil(() => reads.length === 2);
+      expect(rename.disabled).toBe(true);
+      reads[1]!.resolve(snapshot("one"));
+      await waitUntil(() => !rename.disabled);
+      expect(form.hidden).toBe(true);
+      expect(renames).toBe(0);
+      type(input, "Keep the selected conversation draft");
+      summaries = [conversation("two")];
+      inventory!.invalidation({ type: "conversation.inventory" });
+      await waitUntil(() => document.querySelector("#chat-surface")!.hasAttribute("data-selected-conversation-deleted"));
+      expect(rename.disabled).toBe(true);
+      expect(form.hidden).toBe(true);
+      expect(input.value).toBe("Keep the selected conversation draft");
+      expect(document.querySelector<HTMLButtonElement>("#chat-new-conversation")!.disabled).toBe(false);
+      summaries = [conversation("one"), conversation("two")];
+      inventory!.invalidation({ type: "conversation.inventory" });
+      await waitUntil(() => reads.length === 3);
+      expect(rename.disabled).toBe(true);
+      reads[2]!.resolve(snapshot("one"));
+      await waitUntil(() => !rename.disabled);
+      expect(input.value).toBe("Keep the selected conversation draft");
+      expect(renames).toBe(0);
+    } finally {
+      window.dispatchEvent(new window.Event("pagehide"));
+      document.documentElement.setAttribute("data-chat-panel", "collapsed");
+    }
+  });
+
+  for (const obsolete of ["success", "failure"] as const) test(`Rename cannot be enabled by an obsolete opening ${obsolete}`, async () => {
+    const { document, window } = parseHTML(html);
+    installDomGlobals(document, window);
+    document.documentElement.setAttribute("data-ui-mode", "desktop");
+    document.documentElement.setAttribute("data-chat-panel", "open");
+    stubConversationSelect(document);
+    const reads: Array<ReturnType<typeof deferred<ConversationSnapshot>>> = [];
+    let renames = 0;
+    const api = questionApi(document, { capabilities: ["conversation-rename"], conversations: ["one", "two"] });
+    api.snapshot = async () => { const result = deferred<ConversationSnapshot>(); reads.push(result); return result.promise; };
+    api.renameConversation = async id => { renames++; return { conversation: conversation(id) }; };
+    const { initChat } = await import(`./ui.ts?rename-obsolete=${obsolete}-${Date.now()}`);
+    initChat(api);
+    const select = document.querySelector<HTMLSelectElement>("#chat-conversation-select")!;
+    const rename = document.querySelector<HTMLButtonElement>("#chat-rename-conversation")!;
+    try {
+      await waitUntil(() => reads.length === 1);
+      expect(rename.disabled).toBe(true);
+      select.value = "two";
+      select.dispatchEvent(new window.Event("change", { bubbles: true }));
+      await waitUntil(() => reads.length === 2);
+      if (obsolete === "success") reads[0]!.resolve(snapshot("one"));
+      else reads[0]!.reject(new Error("Obsolete Rename opening failed"));
+      await flush();
+      expect(select.value).toBe("two");
+      expect(rename.disabled).toBe(true);
+      expect(document.querySelector<HTMLFormElement>("#chat-rename-form")!.hidden).toBe(true);
+      reads[1]!.resolve(snapshot("two"));
+      await waitUntil(() => !rename.disabled);
+      expect(select.value).toBe("two");
+      expect(renames).toBe(0);
+    } finally {
+      window.dispatchEvent(new window.Event("pagehide"));
+      document.documentElement.setAttribute("data-chat-panel", "collapsed");
+    }
+  });
+
+  for (const obsolete of ["success", "failure"] as const) test(`obsolete opening ${obsolete} cannot change another conversation's draft recovery`, async () => {
+    const { document, window } = parseHTML(html);
+    installDomGlobals(document, window);
+    document.documentElement.setAttribute("data-ui-mode", "desktop");
+    document.documentElement.setAttribute("data-chat-panel", "open");
+    stubConversationSelect(document);
+    const reads: Array<{ id: string; result: ReturnType<typeof deferred<ConversationSnapshot>> }> = [];
+    let prompts = 0;
+    const api = questionApi(document, { conversations: ["one", "two"], capabilities: [] });
+    api.snapshot = async id => {
+      const result = deferred<ConversationSnapshot>();
+      reads.push({ id, result });
+      return result.promise;
+    };
+    api.prompt = async () => { prompts++; throw new Error("No submission was requested"); };
+    const { initChat } = await import(`./ui.ts?obsolete-opening=${obsolete}-${Date.now()}`);
+    initChat(api);
+    const input = document.querySelector<HTMLTextAreaElement>("#chat-input")!;
+    const select = document.querySelector<HTMLSelectElement>("#chat-conversation-select")!;
+    const readError = document.querySelector<HTMLElement>("#chat-surface > .chat-read-error")!;
+    const choose = (id: string) => { select.value = id; select.dispatchEvent(new window.Event("change", { bubbles: true })); };
+    try {
+      await waitUntil(() => reads.length === 1);
+      choose("two");
+      await waitUntil(() => reads.length === 2);
+      reads[0]!.result.reject(new Error("Obsolete first opening"));
+      await flush();
+      expect(input.disabled).toBe(true);
+      expect(readError.hidden).toBe(true);
+      reads[1]!.result.reject(new Error("Second opening failed"));
+      await waitUntil(() => !readError.hidden);
+      expect(input.disabled).toBe(false);
+      type(input, "Second recovery draft");
+      readError.querySelector<HTMLButtonElement>("button")!.click();
+      await waitUntil(() => reads.length === 3);
+      expect(input.disabled).toBe(false);
+      choose("one");
+      await waitUntil(() => reads.length === 4);
+      expect(input.disabled).toBe(true);
+      reads[3]!.result.reject(new Error("Current first opening failed"));
+      await waitUntil(() => !readError.hidden);
+      expect(input.disabled).toBe(false);
+      type(input, "New first recovery draft");
+      if (obsolete === "success") reads[2]!.result.resolve(snapshot("two"));
+      else reads[2]!.result.reject(new Error("Obsolete second retry failed"));
+      await flush();
+      expect(select.value).toBe("one");
+      expect(input.disabled).toBe(false);
+      expect(input.value).toBe("New first recovery draft");
+      expect(readError.textContent).toContain("Current first opening failed");
+      expect(prompts).toBe(0);
+    } finally {
+      window.dispatchEvent(new window.Event("pagehide"));
+      document.documentElement.setAttribute("data-chat-panel", "collapsed");
+    }
+  });
+
+  test("draft recovery feedback preserves current connection interruption and Reconnect until recovery", async () => {
+    const { document, window } = parseHTML(html);
+    installDomGlobals(document, window);
+    document.documentElement.setAttribute("data-ui-mode", "desktop");
+    document.documentElement.setAttribute("data-chat-panel", "open");
+    stubConversationSelect(document);
+    let inventory: Parameters<ChatApiClient["inventoryStream"]>[0] | undefined;
+    let prompts = 0;
+    const api = questionApi(document, { capabilities: [], conversations: ["one", "two"] });
+    api.snapshot = async id => { throw new Error(`History unavailable for ${id}`); };
+    api.inventoryStream = handlers => { inventory = handlers; return { close() {} }; };
+    api.prompt = async () => { prompts++; throw new Error("No submission was requested"); };
+    const { ChatConnectionInterruptedError } = await import("./client");
+    const { initChat } = await import(`./ui.ts?recovery-reconnect=${Date.now()}`);
+    initChat(api);
+    const input = document.querySelector<HTMLTextAreaElement>("#chat-input")!;
+    const state = document.querySelector<HTMLElement>("#chat-state")!;
+    const notice = document.querySelector<HTMLElement>("#chat-composer-status-live")!;
+    const readError = document.querySelector<HTMLElement>("#chat-surface > .chat-read-error")!;
+    const form = document.querySelector<HTMLFormElement>("#chat-composer")!;
+    form.requestSubmit = () => { form.dispatchEvent(new window.Event("submit", { bubbles: true, cancelable: true })); };
+    try {
+      await waitUntil(() => Boolean(inventory) && !input.disabled);
+      for (const id of ["one", "two"]) {
+        if (id === "two") {
+          const select = document.querySelector<HTMLSelectElement>("#chat-conversation-select")!;
+          select.value = id;
+          select.dispatchEvent(new window.Event("change", { bubbles: true }));
+          await waitUntil(() => !readError.hidden && readError.textContent!.includes("History unavailable for two"));
+        }
+        const interruption = `Inventory connection interrupted for ${id}`;
+        inventory!.error(new ChatConnectionInterruptedError(interruption));
+        const interruptedLine = state.textContent;
+        expect(state.querySelector(".chat-reconnect-button")).not.toBeNull();
+        type(input, `Private recovery draft for ${id}`);
+        for (const altKey of [false, true]) {
+          const key = Object.assign(new window.Event("keydown", { bubbles: true, cancelable: true }), { key: "Enter", altKey });
+          input.dispatchEvent(key);
+          expect(key.defaultPrevented).toBe(true);
+          expect(state.querySelector(".chat-reconnect-button")).not.toBeNull();
+          expect(state.querySelector<HTMLButtonElement>(".chat-reconnect-button")!.disabled).toBe(false);
+          expect(state.textContent).toBe(interruptedLine);
+          expect(notice.textContent).toContain("Nothing was sent; your draft was kept.");
+          expect(notice.getAttribute("role")).toBe("status");
+          expect(notice.getAttribute("aria-live")).toBe("polite");
+          expect(notice.getAttribute("aria-atomic")).toBe("true");
+          expect(notice.hidden).toBe(false);
+          expect(notice.getAttribute("aria-hidden")).not.toBe("true");
+          expect(input.value).toBe(`Private recovery draft for ${id}`);
+          expect(readError.textContent).toContain(`History unavailable for ${id}`);
+          expect(readError.querySelector<HTMLButtonElement>("button")!.disabled).toBe(false);
+          expect(prompts).toBe(0);
+        }
+        inventory!.recovered?.();
+        expect(state.querySelector(".chat-reconnect-button")).toBeNull();
+        expect(state.textContent).not.toContain(interruption);
+        expect(readError.textContent).toContain(`History unavailable for ${id}`);
+        expect(input.disabled).toBe(false);
+      }
+    } finally {
+      window.dispatchEvent(new window.Event("pagehide"));
+      document.documentElement.setAttribute("data-chat-panel", "collapsed");
+    }
+  });
+
+  for (const operation of ["submit", "cancel", "side-answer", "refresh"] as const) test(`loaded composer stays editable during deferred ${operation}`, async () => {
+    const { document, window } = parseHTML(html);
+    installDomGlobals(document, window);
+    document.documentElement.setAttribute("data-ui-mode", "desktop");
+    document.documentElement.setAttribute("data-chat-panel", "open");
+    stubConversationSelect(document);
+    const response = deferred<unknown>();
+    let calls = 0, reads = 0, prompts = 0, streams = 0;
+    let handlers: { resync(): void } | undefined;
+    const running = { ...snapshot("one"), conversation: { ...conversation("one"), status: "running" as const } };
+    const api = {
+      status: async () => [{ agent: { id: "test", name: "Test" }, availability: {
+        state: "ready", version: "test", agent: { id: "test", name: "Test", capabilities: ["side-generation", "steering"] },
+      } }],
+      conversations: async () => [running.conversation], commands: async () => [], models: async () => [], modes: async () => [],
+      snapshot: async () => { reads++; return reads > 1 ? response.promise : running; },
+      prompt: async () => { prompts++; calls++; return response.promise; },
+      cancel: async () => { calls++; return response.promise; },
+      generate: async () => { calls++; return response.promise; },
+      stream: (_id: string, _cursor: string, next: { resync(): void }) => { streams++; handlers = next; return { close() {} }; },
+      inventoryStream: () => ({ close() {} }), attachmentUrl: () => "",
+    } as unknown as ChatApiClient;
+    const { initChat } = await import(`./ui.ts?editable-during=${operation}-${Date.now()}`);
+    initChat(api);
+    const input = document.querySelector<HTMLTextAreaElement>("#chat-input")!;
+    const send = document.querySelector<HTMLButtonElement>("#chat-send")!;
+    try {
+      await waitUntil(() => streams === 1);
+      expect(input.disabled).toBe(false);
+      type(input, operation === "side-answer" ? "/btw Original question" : "Original draft");
+      if (operation === "refresh") handlers!.resync();
+      else if (operation === "cancel") document.querySelector<HTMLButtonElement>("#chat-stop")!.click();
+      else document.querySelector<HTMLFormElement>("#chat-composer")!.dispatchEvent(new window.Event("submit", { bubbles: true, cancelable: true }));
+      await waitUntil(() => operation === "refresh" ? reads === 2 : calls === 1);
+      expect(input.disabled).toBe(false);
+      expect(input.readOnly).not.toBe(true);
+      type(input, "New private draft while waiting");
+      expect(input.disabled).toBe(false);
+      expect(input.value).toBe("New private draft while waiting");
+      if (operation === "submit" || operation === "cancel") expect(send.disabled).toBe(true);
+      response.resolve(operation === "refresh" ? running : operation === "side-answer" ? { text: "Side answer" }
+        : operation === "cancel" ? { cancelled: true } : { pending: true, delivery: "steer", messageId: "accepted", configuration: {} });
+      await waitUntil(() => operation === "refresh" ? streams === 2 : operation === "side-answer"
+        ? document.querySelector<HTMLButtonElement>("#chat-aside-ready")?.textContent === "Side answer ready" : !send.disabled);
+      expect(input.disabled).toBe(false);
+      expect(input.value).toBe("New private draft while waiting");
+      expect(prompts).toBe(operation === "submit" ? 1 : 0);
+    } finally {
+      document.documentElement.setAttribute("data-chat-panel", "collapsed");
+    }
+  });
+
+  for (const outcome of ["cancel", "confirm", "held-admission", "stale", "confirmed", "switch", "failure", "late-switch"] as const) test(`local discard confirmation preserves draft and pending ownership on ${outcome}`, async () => {
+    const { document, window } = parseHTML(html);
+    installDomGlobals(document, window);
+    document.documentElement.setAttribute("data-ui-mode", "desktop");
+    document.documentElement.setAttribute("data-chat-panel", "open");
+    stubConversationSelect(document);
+    const unknown = { id: "unknown", text: "Original uncertain input", queuedAt: 1, delivery: outcome === "held-admission" ? "queue" as const : "steer" as const, unconfirmed: true as const, admissionUncertaintyId: "opaque-1" };
+    const held = { id: "held", text: "Other pending input", queuedAt: 2, delivery: "queue" as const };
+    let stream: { event(event: unknown, cursor: string): void } | undefined;
+    let sequence = 0;
+    let entries: QueuedMessage[] = [unknown, held];
+    const calls: Array<{ url: string; body: Record<string, unknown> }> = [];
+    const response = deferred<Response>();
+    const { ChatApiClient } = await import("./client");
+    const transport = new ChatApiClient(async (url, init) => {
+      calls.push({ url: String(url), body: JSON.parse(String(init?.body)) });
+      return response.promise;
+    });
+    const api = taskApi(document, { items: () => [], conversations: ["one", "two"], onStream: (_id, handlers) => { stream = handlers; } });
+    api.snapshot = async id => ({ ...snapshot(id), queued: id === "one" ? entries : [] });
+    api.discardUnconfirmedSteer = transport.discardUnconfirmedSteer.bind(transport);
+    const dialog = document.querySelector<HTMLDialogElement>("#chat-action-confirm")!;
+    dialog.showModal = () => { dialog.setAttribute("open", ""); };
+    const changeConversation = () => {
+      const select = document.querySelector<HTMLSelectElement>("#chat-conversation-select")!;
+      select.value = "two";
+      select.dispatchEvent(new window.Event("change", { bubbles: true }));
+    };
+    const { initChat } = await import(`./ui.ts?discard-local=${outcome}-${Date.now()}`);
+    initChat(api);
+    try {
+      await waitUntil(() => document.querySelector('[data-queue-discard="unknown"]') !== null);
+      const input = document.querySelector<HTMLTextAreaElement>("#chat-input")!;
+      input.value = "Unrelated draft";
+      input.dispatchEvent(new window.Event("input", { bubbles: true }));
+      document.querySelector<HTMLButtonElement>('[data-queue-discard="unknown"]')!.click();
+      expect(dialog.hasAttribute("open")).toBe(true);
+      expect(dialog.querySelector("#chat-action-confirm-title")!.textContent).toBe("Discard local record?");
+      expect(dialog.querySelector("#chat-action-confirm-body")!.textContent).toBe("Delivery of this message is unconfirmed. Removing Uatu’s local record does not cancel or resend it; the original may still arrive. Other messages will stay queued until you choose Send now or a later normal idle transition.");
+      expect(calls).toEqual([]);
+      if (outcome === "switch") { changeConversation(); await flush(); }
+      if (outcome === "stale" || outcome === "confirmed") {
+        entries = [{ ...unknown, ...(outcome === "stale" ? { admissionUncertaintyId: "opaque-2" } : { admissionUncertaintyId: undefined, unconfirmed: undefined }) }, held];
+        sequence++;
+        stream!.event({ type: "conversation.queue", generation: "g", sequence, conversationId: "one", queued: entries, change: { kind: "enqueued", messageId: "unknown" } }, `cursor-one-${sequence}`);
+      }
+      dialog.returnValue = outcome === "cancel" ? "cancel" : "confirm";
+      dialog.removeAttribute("open");
+      dialog.dispatchEvent(new window.Event("close"));
+      await flush();
+      if (["cancel", "stale", "confirmed", "switch"].includes(outcome)) {
+        expect(calls).toEqual([]);
+      } else {
+        await waitUntil(() => calls.length === 1);
+        expect(calls[0]!.url).toBe("/api/chat/conversations/one/queue/unknown/discard-unconfirmed");
+        expect(calls[0]!.body).toEqual({ requestId: expect.any(String), uncertaintyId: "opaque-1" });
+        if (outcome === "late-switch") {
+          changeConversation(); await flush(); input.value = "Second conversation draft";
+        }
+        if (outcome === "failure") response.resolve(Response.json({ error: "Stale uncertainty token" }, { status: 409 }));
+        else { entries = [held]; response.resolve(Response.json({ discarded: true, outcomeUnconfirmed: true })); }
+        await flush();
+        if (outcome === "confirm" || outcome === "held-admission") {
+          await waitUntil(() => document.querySelector('[data-chat-queued-id="unknown"]') === null);
+          expect(document.querySelector('[data-chat-queued-id="held"]')).not.toBeNull();
+          expect(document.querySelector<HTMLElement>("#chat-action-feedback")!.hidden).toBe(false);
+          expect(document.querySelector("#chat-action-feedback")!.textContent).toContain("Delivery remains unconfirmed");
+        }
+      }
+      expect(input.value).toBe(outcome === "late-switch" ? "Second conversation draft" : outcome === "switch" ? "" : "Unrelated draft");
+      if (outcome === "cancel" || outcome === "failure") expect(document.querySelector('[data-chat-queued-id="unknown"]')).not.toBeNull();
+      expect(calls.length).toBeLessThanOrEqual(1);
+      if (outcome === "late-switch") {
+        const feedback = document.querySelector<HTMLElement>("#chat-action-feedback")!;
+        expect(feedback.hidden).toBe(true);
+        expect(feedback.textContent).not.toContain("Original uncertain input");
+        const select = document.querySelector<HTMLSelectElement>("#chat-conversation-select")!;
+        select.value = "one";
+        select.dispatchEvent(new window.Event("change", { bubbles: true }));
+        await waitUntil(() => !feedback.hidden && feedback.textContent!.includes("Delivery remains unconfirmed"));
+        expect(feedback.textContent).toContain("Original uncertain input");
+        expect(input.value).toBe("Unrelated draft");
+      }
+    } finally { window.dispatchEvent(new window.Event("pagehide")); }
+  });
+  test("local discard feedback survives late removal, status, snapshot and unrelated success without automation", async () => {
+    const { document, window } = parseHTML(html);
+    installDomGlobals(document, window);
+    document.documentElement.setAttribute("data-ui-mode", "desktop");
+    document.documentElement.setAttribute("data-chat-panel", "open");
+    stubConversationSelect(document);
+    const unknown: QueuedMessage = { id: "unknown", text: "Original uncertain input", queuedAt: 1, delivery: "steer", unconfirmed: true, admissionUncertaintyId: "opaque-1" };
+    const held: QueuedMessage = { id: "held", text: "Keep this queued", queuedAt: 2, delivery: "queue" };
+    const unrelated: QueuedMessage = { id: "unrelated", text: "Remove this separately", queuedAt: 3, delivery: "queue" };
+    let entries = [unknown, held, unrelated], reads = 0, removes = 0;
+    let stream: Parameters<ChatApiClient["stream"]>[2] | undefined;
+    const response = deferred<Response>();
+    const calls: Array<{ url: string; body: Record<string, unknown> }> = [];
+    const { ChatApiClient } = await import("./client");
+    const transport = new ChatApiClient(async (url, init) => {
+      calls.push({ url: String(url), body: JSON.parse(String(init?.body)) });
+      return response.promise;
+    });
+    // No Hub metadata, automatic preferences or background capability is needed.
+    const api = questionApi(document, { capabilities: [], conversations: ["one", "two"] });
+    api.snapshot = async id => { reads++; return { ...snapshot(id), queued: id === "one" ? entries : [] }; };
+    api.stream = (_id, _cursor, handlers) => { stream = handlers; return { close() {} }; };
+    api.discardUnconfirmedSteer = transport.discardUnconfirmedSteer.bind(transport);
+    api.removeQueued = async (_id, messageId) => { expect(messageId).toBe("unrelated"); removes++; entries = [held]; return { removed: true }; };
+    const dialog = document.querySelector<HTMLDialogElement>("#chat-action-confirm")!;
+    dialog.showModal = () => { dialog.setAttribute("open", ""); };
+    const { initChat } = await import(`./ui.ts?discard-feedback=${Date.now()}`);
+    initChat(api);
+    try {
+      await waitUntil(() => document.querySelector('[data-queue-discard="unknown"]') !== null);
+      const input = document.querySelector<HTMLTextAreaElement>("#chat-input")!;
+      type(input, "Unrelated private draft");
+      document.querySelector<HTMLButtonElement>('[data-queue-discard="unknown"]')!.click();
+      dialog.returnValue = "confirm";
+      dialog.removeAttribute("open");
+      dialog.dispatchEvent(new window.Event("close"));
+      await waitUntil(() => calls.length === 1);
+      entries = [held, unrelated];
+      response.resolve(Response.json({ discarded: true, outcomeUnconfirmed: true }));
+      await waitUntil(() => document.querySelector('[data-chat-queued-id="unknown"]') === null);
+      const feedback = document.querySelector<HTMLElement>("#chat-action-feedback")!;
+      const check = () => {
+        expect(feedback.hidden).toBe(false);
+        expect(feedback.textContent).toContain("Delivery remains unconfirmed");
+        expect(feedback.textContent).toContain("Original uncertain input");
+        expect(feedback.textContent).toContain("the original may still arrive");
+        expect(feedback.textContent).not.toContain("automatic backgrounding");
+        expect(input.value).toBe("Unrelated private draft");
+        expect(document.querySelector('[data-chat-queued-id="held"]')).not.toBeNull();
+        expect(document.querySelector('[data-chat-queued-id="unknown"]')).toBeNull();
+      };
+      // The acknowledgement wins first; its genuine later event is not a receipt
+      // confirming delivery, cancellation or non-arrival of the original input.
+      stream!.event({ type: "conversation.queue", generation: "g", sequence: 1, conversationId: "one", queued: entries, change: { kind: "removed", messageId: "unknown" } }, "cursor-one-1");
+      await flush();
+      check();
+      stream!.event({ type: "conversation.status", generation: "g", sequence: 2, conversationId: "one", status: "running" }, "cursor-one-2");
+      await flush();
+      check();
+      const previousStream = stream, previousReads = reads;
+      stream!.resync();
+      await waitUntil(() => reads > previousReads && stream !== previousStream);
+      await flush();
+      check();
+      const remove = document.querySelector<HTMLButtonElement>('[data-queue-remove="unrelated"]')!;
+      remove.click();
+      await waitUntil(() => removes === 1 && !remove.disabled);
+      check();
+      const select = document.querySelector<HTMLSelectElement>("#chat-conversation-select")!;
+      select.value = "two";
+      select.dispatchEvent(new window.Event("change", { bubbles: true }));
+      await waitUntil(() => Boolean(feedback.hidden));
+      expect(feedback.textContent).toBe("");
+      select.value = "one";
+      select.dispatchEvent(new window.Event("change", { bubbles: true }));
+      await waitUntil(() => !feedback.hidden && document.querySelector('[data-chat-queued-id="held"]') !== null);
+      check();
+      expect(calls).toEqual([{ url: "/api/chat/conversations/one/queue/unknown/discard-unconfirmed", body: { requestId: expect.any(String), uncertaintyId: "opaque-1" } }]);
+      expect(document.querySelector('meta[name="uatu-hub"]')).toBeNull();
+    } finally { window.dispatchEvent(new window.Event("pagehide")); }
+  });
   test("touch surface return consumes fresh work capacity before deciding physical overflow", async () => {
     const { document, window } = parseHTML(html);
     installDomGlobals(document, window);

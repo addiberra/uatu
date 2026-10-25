@@ -43,6 +43,13 @@ class FakeChatService implements WorkspaceChatService {
   released: string[] = [];
   cancelledWakeups: string[] = [];
   removals: string[] = [];
+  discards: Array<{ id: string; messageId: string; requestId: string; uncertaintyId: string }> = [];
+  async discardUnconfirmedSteer(id: string, messageId: string, requestId: string, uncertaintyId: string) {
+    this.require(id);
+    if (messageId !== "unknown" || uncertaintyId !== "opaque-1") throw new QueuedMessageNotHeldError();
+    this.discards.push({ id, messageId, requestId, uncertaintyId });
+    return { discarded: true, outcomeUnconfirmed: true } as const;
+  }
   reversibleMutations = { undo: 0, redo: 0, revert: 0, restore: 0 };
   private readonly reversibleReceipts = new Map<string, ReversibleHistoryResult>();
 
@@ -291,6 +298,28 @@ function request(pathname: string, init: RequestInit = {}, params?: Record<strin
 }
 
 describe("workspace chat routes", () => {
+  test("local discard validates closed scoped identities behind the ordinary mutation gate", async () => {
+    const service = new FakeChatService();
+    const handler = routes(service, "/s/project/")["/s/project/api/chat/conversations/:conversationId/queue/:messageId/discard-unconfirmed"] as { POST(request: Request): Promise<Response> };
+    const path = "/s/project/api/chat/conversations/opencode:local/queue/unknown/discard-unconfirmed";
+    const send = (body: unknown, params = { conversationId: "opencode:local", messageId: "unknown" }, origin = "http://127.0.0.1:4711") => handler.POST(request(path, { method: "POST", headers: { origin, "content-type": "application/json" }, body: JSON.stringify(body) }, params));
+    const valid = { requestId: "discard-1", uncertaintyId: "opaque-1" };
+    expect(await (await send(valid)).json()).toEqual({ discarded: true, outcomeUnconfirmed: true });
+    expect(service.discards).toEqual([{ id: "local", messageId: "unknown", ...valid }]);
+    for (const body of [{}, { requestId: "r" }, { uncertaintyId: "opaque-1" }, { ...valid, remove: true }, ...[null, 1, "", "x".repeat(513), "bad\nidentity"].flatMap(value => [{ ...valid, requestId: value }, { ...valid, uncertaintyId: value }])]) {
+      expect((await send(body)).status).toBe(400);
+    }
+    for (const params of [{ conversationId: "", messageId: "unknown" }, { conversationId: "opencode:local", messageId: "x".repeat(513) }, { conversationId: "opencode:local", messageId: "%00" }]) expect((await send(valid, params)).status).toBe(400);
+    expect((await send(valid, undefined, "https://foreign.example")).status).toBe(403);
+    expect((await handler.POST(new Request(`http://127.0.0.1:4711${path}`, { method: "POST" }))).status).toBe(401);
+    expect((await send(valid, { conversationId: "opencode:foreign", messageId: "unknown" })).status).toBe(404);
+    expect((await send({ ...valid, uncertaintyId: "stale" })).status).toBe(409);
+    expect((await send(valid, { conversationId: "opencode:local", messageId: "confirmed" })).status).toBe(409);
+    expect(service.discards).toHaveLength(1);
+    expect(service.removals).toEqual([]);
+    expect(service.sent).toEqual([]);
+    expect(service.backgrounded).toEqual([]);
+  });
   test("an opaque operation receipt is only a dedup identifier and never unsigned principal or automatic-policy authority", async () => {
     const service = new FakeChatService();
     const table = routes(service, "/s/project/");

@@ -640,7 +640,7 @@ export function parseQueuedMessages(value: unknown): QueuedMessage[] {
   if (!Array.isArray(value)) throw new Error("queued messages must be an array");
   for (const entry of value) {
     const record = expectRecord(entry, "queued message");
-    expectKeys(record, ["id", "submissionId", "text", "queuedAt", "delivery", "paused", "unconfirmed", "requestId", "attachments"], "queued message");
+    expectKeys(record, ["id", "submissionId", "text", "queuedAt", "delivery", "paused", "unconfirmed", "admissionUncertaintyId", "requestId", "attachments"], "queued message");
     expectIdentity(record.id, "queued message id");
     if (record.submissionId !== undefined) expectIdentity(record.submissionId, "queued message submissionId");
     expectString(record.text, "queued message text");
@@ -648,6 +648,10 @@ export function parseQueuedMessages(value: unknown): QueuedMessage[] {
     expectOneOf(record.delivery, ["steer", "queue"], "queued message delivery");
     if (record.paused !== undefined && record.paused !== true) throw new Error("queued message paused must be true when present");
     if (record.unconfirmed !== undefined && record.unconfirmed !== true) throw new Error("queued message unconfirmed must be true when present");
+    if (record.admissionUncertaintyId !== undefined) {
+      expectIdentity(record.admissionUncertaintyId, "queued message admissionUncertaintyId");
+      if (record.unconfirmed !== true) throw new Error("admission uncertainty requires an unconfirmed entry");
+    }
     if (record.requestId !== undefined) expectIdentity(record.requestId, "queued message requestId");
     if (record.attachments !== undefined) parseMessageAttachments(record.attachments, "queued message attachment");
   }

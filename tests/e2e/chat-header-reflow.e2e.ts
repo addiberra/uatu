@@ -168,3 +168,85 @@ for (const engine of ["chromium", "webkit"] as const) {
     });
   }
 }
+
+for (const engine of ["chromium", "webkit"] as const) test(`Rename waits for the current real snapshot without replaying a disabled click: ${engine}`, async ({ launchBrowser, baseURL, request }, info) => {
+  const browser = await launchBrowser(engine);
+  const page = await browser.newPage({ baseURL, viewport: { width: 1280, height: 900 }, reducedMotion: "reduce" });
+  try {
+    await enlargedPendingFixture(page, request, 1280, "light");
+    await page.evaluate(() => { document.documentElement.style.fontSize = "100%"; });
+    const picker = page.getByRole("combobox", { name: "Conversation", exact: true });
+    const input = page.locator("#chat-input");
+    const first = await picker.inputValue();
+    const snapshot = await page.request.get(`/api/chat/conversations/${encodeURIComponent(first)}`);
+    expect(snapshot.ok()).toBe(true);
+    const { conversation } = await snapshot.json();
+    expect(typeof conversation.title).toBe("string");
+    await input.fill("First private draft survives Rename");
+    await page.getByRole("button", { name: "New conversation", exact: true }).click();
+    await expect(picker).not.toHaveValue(first);
+    await expect(input).toBeEnabled();
+    const second = await picker.inputValue();
+    await input.fill("Second private draft stays separate");
+    const renameRequests: string[] = [];
+    page.on("request", request => {
+      if (request.method() === "PATCH" && new URL(request.url()).pathname.startsWith("/api/chat/conversations/")) renameRequests.push(new URL(request.url()).pathname);
+    });
+    const nativeRenames = async () => {
+      const state = await request.post("/__e2e/chat", { data: { action: "opencode", op: "state" } }).then(response => response.json()) as { calls: string[] };
+      return state.calls.filter(call => call.startsWith(`PATCH /api/session/${encodeURIComponent(first.replace(/^opencode:/, ""))}`)).length;
+    };
+    const before = await nativeRenames();
+    await page.evaluate(({ target }) => {
+      let release!: () => void;
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      Object.assign(window, { __renameSnapshotGate: { held: false, release: () => release() } });
+      const original = window.fetch.bind(window);
+      window.fetch = async (...args: Parameters<typeof fetch>) => {
+        const response = await original(...args);
+        const value = args[0];
+        const url = new URL(typeof value === "string" ? value : value instanceof URL ? value.href : value.url, location.href);
+        const method = args[1]?.method ?? (value instanceof Request ? value.method : "GET");
+        if (method === "GET" && url.pathname === `/api/chat/conversations/${encodeURIComponent(target)}`) {
+          (window as unknown as { __renameSnapshotGate: { held: boolean } }).__renameSnapshotGate.held = true;
+          await gate;
+        }
+        return response;
+      };
+    }, { target: first });
+    await picker.selectOption(first);
+    await page.waitForFunction(() => (window as unknown as { __renameSnapshotGate: { held: boolean } }).__renameSnapshotGate.held);
+    const rename = page.getByRole("button", { name: "Rename conversation", exact: true });
+    await expect(rename).toBeDisabled();
+    await expect(input).toHaveValue("First private draft survives Rename");
+    // Send real pointer input to the disabled native button. No forced
+    // locator activation or synthetic event can bypass its disabled state.
+    const box = (await rename.boundingBox())!;
+    await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+    await expect(page.locator("#chat-rename-form")).toBeHidden();
+    expect(renameRequests).toHaveLength(0);
+    expect(await nativeRenames()).toBe(before);
+    await page.evaluate(() => (window as unknown as { __renameSnapshotGate: { release(): void } }).__renameSnapshotGate.release());
+    await expect(rename).toBeEnabled();
+    await expect(page.locator("#chat-rename-form")).toBeHidden();
+    expect(renameRequests).toHaveLength(0);
+    expect(await nativeRenames()).toBe(before);
+    await rename.click();
+    await expect(page.locator("#chat-rename-title")).toHaveValue(conversation.title);
+    const title = "Only an explicit current-conversation Rename is applied";
+    await page.locator("#chat-rename-title").fill(title);
+    const accepted = page.waitForResponse(response => response.request().method() === "PATCH"
+      && new URL(response.url()).pathname === `/api/chat/conversations/${encodeURIComponent(first)}`);
+    await page.locator("#chat-rename-title").press("Enter");
+    expect((await accepted).ok()).toBe(true);
+    await expect(page.locator("#chat-rename-form")).toBeHidden();
+    await expect(page.locator("#chat-title")).toHaveText(title);
+    await expect(input).toHaveValue("First private draft survives Rename");
+    expect(renameRequests).toEqual([`/api/chat/conversations/${encodeURIComponent(first)}`]);
+    expect(await nativeRenames()).toBe(before + 1);
+    await picker.selectOption(second);
+    await expect(input).toHaveValue("Second private draft stays separate");
+    expect(renameRequests).toHaveLength(1);
+    await saveEvidence(info, "rename-readiness.json", JSON.stringify({ engine, first, second, browserRenameRequests: renameRequests.length, nativeRenameDelta: 1 }, null, 2));
+  } finally { await page.close(); }
+});

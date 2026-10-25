@@ -15,7 +15,9 @@ import {
   isLoginError,
   normalizeCanonicalEvent,
   normalizeEventWith,
-  normalizeToolPart,
+  normalizeEventEnvelopeWith,
+  providerEventEnvelope,
+  sessionLifecycleIdentity,
   number,
   optionalString,
   record,
@@ -29,7 +31,7 @@ import {
 import type { ConversationItem, MessageAttachment, MessageDelivery, StructuredQuestion, TokenUsage } from "../../types";
 import { LOGIN_FAILED_NOTICE_CODE } from "../../types";
 import type { InboxDelta, PendingInboxEntry } from "../../provider";
-import { BackgroundWorkers } from "./background";
+import { BackgroundWorkers, nativeProof, prepareNotification, prepareTool, type BackgroundControls, type LauncherEvidence, type NativeProof, type PreparedTool, type PreparedNotification } from "./background";
 
 export type { NormalizedProviderEvent };
 
@@ -72,8 +74,64 @@ export type OpenCodeV2Memory = ProviderEventMemory & {
   inbox: Map<string, { text: string; attachments?: MessageAttachment[] }>;
 };
 
-export function createOpenCodeV2Memory(options: { backgroundEntries?: number; backgroundBytes?: number } = {}): OpenCodeV2Memory {
-  return { ...createProviderEventMemory(), workers: new BackgroundWorkers({ entries: options.backgroundEntries, bytes: options.backgroundBytes }), toolNames: new Map(), toolInputs: new Map(), steps: new Map(), forms: new Map(), failures: new Map(), inbox: new Map() };
+export type V2Evidence = Readonly<{
+  session?: string; directory?: string;
+  lifecycle?: Readonly<{ kind: string; id?: string; parent?: string; directory?: string; proof?: NativeProof }>;
+  shutdown: boolean;
+  execution?: Readonly<{ phase: "started" | "ended"; proof?: NativeProof; historical: boolean }>;
+  notification?: Readonly<{ child: string; id: string; proof?: NativeProof; historical: boolean }>;
+  launchers: readonly LauncherEvidence[];
+}>;
+export type PreparedV2Event = { envelope: ReturnType<typeof providerEventEnvelope>; tools: ReadonlyMap<number, PreparedTool>; notification?: PreparedNotification; notificationId?: string; notificationProof?: NativeProof; evidence: V2Evidence };
+const PREPARED = Symbol("prepared V2 event");
+const preparation = (event: RecordValue) => (event as RecordValue & { [PREPARED]?: PreparedV2Event })[PREPARED];
+
+function snapshotTools(content: unknown, at: number, message?: string, event?: RecordValue): Map<number, PreparedTool> {
+  return new Map(array(content).flatMap((part, index) => record(part).type === "tool" ? [[index, prepareTool(part, at, "snapshot", message, event)] as const] : []));
+}
+
+export function prepareStoredMessage(value: unknown) {
+  const message = record(value);
+  const createdAt = timestamp(record(message.time).created, 0);
+  const notification = message.type === "synthetic" ? prepareNotification(message) : undefined;
+  return { message, createdAt, tools: snapshotTools(message.content, createdAt, optionalString(message.id)),
+    notification, notificationChild: notification?.source === "subagent" ? notification.worker : undefined };
+}
+
+function prepareV2Event(value: unknown, memory?: OpenCodeV2Memory, controls?: BackgroundControls): PreparedV2Event {
+  const envelope = providerEventEnvelope(value);
+  const { event, data, eventType, context } = envelope;
+  const session = context.conversationId;
+  const at = number(event.created) ?? context.createdAt;
+  let tools = new Map<number, PreparedTool>();
+  if (eventType === "session.message.content.updated") tools = snapshotTools(data.content, at, optionalString(data.messageID), event);
+  else if (["session.tool.called", "session.tool.progress", "session.tool.success", "session.tool.failed"].includes(eventType)) {
+    const call = optionalString(data.id), phase = eventType.slice("session.tool.".length) as LauncherEvidence["phase"];
+    const tool = prepareTool({ id: data.id, name: call ? memory?.toolNames.get(call) ?? data.tool ?? "tool" : "tool",
+      state: { ...data, status: phase === "success" ? "completed" : phase === "failed" ? "error" : "running", time: { end: at } } }, at, phase, optionalString(data.assistantMessageID), event, call ? memory?.toolInputs.get(call) : undefined);
+    if (session && phase === "called" && (controls?.historical("called", tool.fact.proof) || memory?.workers.invocationReplay(session, tool.fact))) tool.fact = Object.freeze({ ...tool.fact, historical: true });
+    tools.set(0, tool);
+  }
+  const lifecycleId = sessionLifecycleIdentity(data);
+  const birth = eventType === "session.created" ? { parent: optionalString(data.parentID),
+    directory: optionalString(record(data.location).directory) ?? optionalString(record(event.location).directory) } : undefined;
+  const lifecycle = ["session.created", "session.updated", "session.deleted", "session.moved"].includes(eventType)
+    ? Object.freeze({ kind: eventType, id: lifecycleId, ...(birth ? { ...birth, proof: nativeProof(event, { type: eventType, data, location: event.location }) } : {}) }) : undefined;
+  const executionPhase = /^session\.execution\.(started|succeeded|failed|interrupted)$/.test(eventType) ? eventType === "session.execution.started" ? "started" : "ended" : undefined;
+  const executionProof = executionPhase ? nativeProof(event, { type: eventType, session, error: data.error, reason: data.reason }) : undefined;
+  const notification = eventType === "session.inbox.enqueued" && record(data.item).type === "synthetic" ? prepareNotification(record(data.item).payload) : undefined;
+  const noticeId = optionalString(data.inboxID), child = notification?.source === "subagent" ? notification.worker : undefined;
+  const noticeProof = notification?.worker ? nativeProof(event, { session, id: noticeId, notification }) : undefined;
+  return { envelope, tools, notification, notificationId: noticeId, notificationProof: noticeProof, evidence: Object.freeze({ session, directory: optionalString(record(event.location).directory), lifecycle,
+    shutdown: eventType === "location.shutdown", launchers: Object.freeze([...tools.values()].map(tool => tool.fact)),
+    ...(executionPhase ? { execution: Object.freeze({ phase: executionPhase, proof: executionProof, historical: controls?.historical(executionPhase, executionProof) === true || !!session && (executionPhase === "ended" ? memory?.workers.terminalReplay(session, executionProof) : memory?.workers.startReplay(session, executionProof)) === true }) } : {}),
+    ...(eventType === "session.inbox.enqueued" && child && noticeId ? { notification: Object.freeze({ child, id: noticeId, proof: noticeProof, historical: controls?.historical("notification", noticeProof) === true || !!session && memory?.workers.notificationReplay(session, noticeId, noticeProof) === true }) } : {}),
+  }) };
+}
+
+export function createOpenCodeV2Memory(options: { backgroundEntries?: number; backgroundBytes?: number; controls?: BackgroundControls } = {}): OpenCodeV2Memory {
+  return { ...createProviderEventMemory(), workers: new BackgroundWorkers({ entries: options.backgroundEntries, bytes: options.backgroundBytes,
+    ...(options.controls ? { retained: () => options.controls!.usage, onSaturation: () => options.controls!.projectionSaturated() } : {}) }), toolNames: new Map(), toolInputs: new Map(), steps: new Map(), forms: new Map(), failures: new Map(), inbox: new Map() };
 }
 
 // 2.x wire types recognized as deliberately carrying nothing for the
@@ -218,7 +276,8 @@ export function createOpenCodeV2Mapper(directory: string): GenerationMapper<Open
           return { conversationId, updates: [{ kind: "inbox", delta }] };
         }
         if (item.type === "synthetic") {
-          const workers = conversationId ? memory?.workers.notification(conversationId, messageId, payload, Math.max(0, createdAt), number(event.created) ?? null) : undefined;
+          const prepared = preparation(event);
+          const workers = conversationId ? memory?.workers.notificationPrepared(conversationId, messageId, prepared?.notification, Math.max(0, createdAt), number(event.created) ?? null, prepared?.evidence.notification?.proof) : undefined;
           if (workers) return { conversationId, updates: workers };
           // A shell command's transcript is delivered to the model as a
           // synthetic note; the command item already shows it.
@@ -266,15 +325,16 @@ export function createOpenCodeV2Mapper(directory: string): GenerationMapper<Open
       }
       case "session.execution.started":
         if (memory && conversationId) memory.failures.delete(conversationId);
+        if (conversationId) memory?.workers.executionStarted(conversationId, preparation(event)?.evidence.execution?.proof);
         return { conversationId, updates: [{ kind: "status", status: "running" }] };
       case "session.execution.succeeded":
-        if (conversationId) memory?.workers.executionEnded(conversationId, createdAt);
+        if (conversationId) memory?.workers.executionEnded(conversationId, createdAt, preparation(event)?.evidence.execution?.proof);
         return { conversationId, updates: [{ kind: "status", status: "completed" }] };
       case "session.execution.interrupted":
-        if (conversationId) memory?.workers.executionEnded(conversationId, createdAt);
+        if (conversationId) memory?.workers.executionEnded(conversationId, createdAt, preparation(event)?.evidence.execution?.proof);
         return { conversationId, updates: [{ kind: "status", status: "interrupted" }] };
       case "session.execution.failed": {
-        if (conversationId) memory?.workers.executionEnded(conversationId, createdAt);
+        if (conversationId) memory?.workers.executionEnded(conversationId, createdAt, preparation(event)?.evidence.execution?.proof);
         const message = errorMessage(data.error) || "The turn failed";
         // A step that failed has already shown this message on its own
         // event; the turn's end repeats it. One red row, not two.
@@ -338,16 +398,15 @@ export function createOpenCodeV2Mapper(directory: string): GenerationMapper<Open
       case "session.tool.progress":
       case "session.tool.success":
       case "session.tool.failed": {
-        const callId = optionalString(data.id);
-        const name = callId ? memory?.toolNames.get(callId) : undefined;
-        if (!name) return undefined;
+        const callId = string(data.id, "tool call id");
+        const tool = preparation(event)?.tools.get(0);
+        if (!tool) return undefined;
+        if (memory && conversationId) memory.workers.observeLauncher(conversationId, tool.fact);
         if (memory && callId && event.type === "session.tool.called") remember(memory.toolInputs, callId, data.input);
-        const canonical = toCanonical(String(event.type), { ...data, tool: name }, event);
-        const normalized = canonical ? normalizeCanonicalEvent(canonical.type, canonical.data, { ...context, createdAt }) : undefined;
+        if (memory && conversationId && event.type === "session.tool.called") memory.workers.invocation(conversationId, tool.fact);
+        const normalized: KnownEvent = { conversationId, updates: [tool.update, ...stringArray(data.outputPaths).map((path, index): NormalizedProviderUpdate => ({ kind: "upsert", item: { id: `file:${callId}:${index}:${path}`, type: "file_change", createdAt, path, operation: "update" } }))] };
         if (normalized && memory && conversationId && event.type === "session.tool.success") {
-          normalized.updates.push(...memory.workers.launch(conversationId, {
-            id: callId, name, state: { ...data, status: "completed", input: data.input ?? memory.toolInputs.get(callId!) },
-          }, createdAt));
+          normalized.updates.push(...memory.workers.launchPrepared(conversationId, tool, createdAt));
         }
         return normalized;
       }
@@ -364,8 +423,9 @@ export function createOpenCodeV2Mapper(directory: string): GenerationMapper<Open
       case "session.message.content.updated": {
         const messageId = string(data.messageID, "message id");
         const skippedBlocks: string[] = [];
-        const updates = assistantContentUpdates(messageId, array(data.content), createdAt, skippedBlocks);
-        if (conversationId && memory) updates.push(...memory.workers.content(conversationId, data.content, createdAt));
+        const tools = preparation(event)?.tools ?? snapshotTools(data.content, createdAt, messageId);
+        const updates = assistantContentUpdates(messageId, array(data.content), createdAt, skippedBlocks, tools);
+        if (conversationId && memory) for (const tool of tools.values()) updates.push(...memory.workers.launchPrepared(conversationId, tool, createdAt));
         return { conversationId, updates, ...(skippedBlocks.length ? { skippedBlocks } : {}) };
       }
       case "form.created": {
@@ -455,9 +515,9 @@ function partIdentity(data: RecordValue, kind: "text" | "reasoning"): string {
  * assistant record, which is the same array. A part of any other type is
  * skipped; its type lands in `skipped` when the caller reports skips.
  */
-export function assistantContentUpdates(messageId: string, content: unknown[], createdAt: number, skipped?: string[]): NormalizedProviderUpdate[] {
+export function assistantContentUpdates(messageId: string, content: unknown[], createdAt: number, skipped?: string[], tools: ReadonlyMap<number, PreparedTool> = snapshotTools(content, createdAt, messageId)): NormalizedProviderUpdate[] {
   const ordinals = { text: 0, reasoning: 0 };
-  return content.flatMap((value): NormalizedProviderUpdate[] => {
+  return content.flatMap((value, index): NormalizedProviderUpdate[] => {
     const part = record(value);
     if (part.type === "text") {
       const identity = `${messageId}:text:${ordinals.text++}`;
@@ -482,14 +542,7 @@ export function assistantContentUpdates(messageId: string, content: unknown[], c
       return [{ kind: "text", itemId: item.id, identity, mode: "cumulative", text: text(part.text), item }];
     }
     if (part.type === "tool") {
-      const time = record(part.time);
-      return [normalizeToolPart({
-        id: part.id,
-        type: "tool",
-        name: part.name,
-        state: part.state,
-        time: { end: time.completed },
-      }, createdAt)];
+      return [tools.get(index)!.update];
     }
     skipped?.push(optionalString(part.type) ?? "unknown");
     return [];
@@ -602,9 +655,13 @@ function answerValues(value: unknown): string[] {
 }
 
 // Public boundary for a 2.x event stream, scoped to one workspace directory.
-export function createOpenCodeV2Normalizer(directory: string): (value: unknown, memory?: OpenCodeV2Memory) => NormalizedProviderEvent {
+export function createOpenCodeV2Normalizer(directory: string) {
   const mapper = createOpenCodeV2Mapper(directory);
-  return (value, memory) => normalizeEventWith(value, mapper, memory);
+  const prepared = (value: PreparedV2Event, memory?: OpenCodeV2Memory): NormalizedProviderEvent => normalizeEventEnvelopeWith({ ...value.envelope, event: { ...value.envelope.event, [PREPARED]: value } }, mapper, memory);
+  return Object.assign((value: unknown, memory?: OpenCodeV2Memory): NormalizedProviderEvent => {
+    try { return prepared(prepareV2Event(value, memory), memory); }
+    catch { return normalizeEventWith(value, mapper, memory); }
+  }, { prepare: prepareV2Event, prepared });
 }
 
 // ---------------------------------------------------------------------------
@@ -622,22 +679,22 @@ import { boundReplayedName, contractImageMime, errorMessage as storedErrorMessag
  * carrier, as on 1.x. Idle markers and agent/model/location switches carry
  * nothing for the timeline.
  */
-export function normalizeStoredMessage(value: unknown, mintUsageCarrier = true, background?: { workers: BackgroundWorkers; parent: string }): ConversationItem[] {
-  const message = record(value);
+export function normalizeStoredMessage(value: unknown, mintUsageCarrier = true, background?: { workers: BackgroundWorkers; parent: string }, prepared = prepareStoredMessage(value)): ConversationItem[] {
+  const { message, createdAt } = prepared;
   const id = string(message.id, "message id");
-  const createdAt = timestamp(record(message.time).created, 0);
   switch (message.type) {
     case "user": {
       const attachments = storedAttachments(message.files);
       return [{ id: `message:${id}`, type: "user_message", createdAt, text: text(message.text), ...(attachments.length ? { attachments } : {}) }];
     }
     case "assistant": {
-      const items = assistantContentUpdates(id, array(message.content), createdAt).flatMap(update => {
+      const tools = prepared.tools;
+      const items = assistantContentUpdates(id, array(message.content), createdAt, undefined, tools).flatMap(update => {
         if (update.kind === "upsert") return [update.item];
         if (update.kind === "text" && update.item) return [update.item];
         return [];
       });
-      if (background) items.push(...background.workers.content(background.parent, message.content, createdAt).flatMap(update => update.kind === "upsert" ? [update.item] : []));
+      if (background) for (const tool of tools.values()) items.push(...background.workers.launchPrepared(background.parent, tool, createdAt).flatMap(update => update.kind === "upsert" ? [update.item] : []));
       const usage = tokensToUsage(message.tokens, message.cost);
       if (usage && mintUsageCarrier) {
         const model = modelSelection(message.model);
@@ -670,7 +727,7 @@ export function normalizeStoredMessage(value: unknown, mintUsageCarrier = true, 
       }];
     }
     case "synthetic": {
-      const workers = background?.workers.notification(background.parent, id, message, Math.max(0, createdAt), number(record(message.time).created) ?? null);
+      const workers = background?.workers.notificationPrepared(background.parent, id, prepared.notification, Math.max(0, createdAt), number(record(message.time).created) ?? null);
       if (workers) return workers.flatMap(update => update.kind === "upsert" ? [update.item] : []);
       // A shell transcript's note to the model is already the command item.
       if (optionalString(record(message.metadata).source) === "shell") return [];

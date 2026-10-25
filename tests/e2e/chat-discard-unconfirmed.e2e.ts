@@ -1,0 +1,190 @@
+import type { APIRequestContext } from "@playwright/test";
+import { openChatPanel } from "./chat-helpers";
+import { captureScreenshot, saveEvidence } from "./evidence";
+import { expect, test as base } from "./fixtures";
+import { withEngineBrowsers } from "./page-diagnostics";
+
+const test = withEngineBrowsers(base);
+type NativeState = { calls: string[]; unhandled: string[]; sessions: Record<string, { running: boolean; pending: Array<{ id: string }>; messages: Array<{ type: string; text?: string }> }> };
+async function control(request: APIRequestContext, body: Record<string, unknown>) {
+  const response = await request.post("/__e2e/chat", { data: body });
+  expect(response.ok()).toBe(true);
+  return response.json();
+}
+
+type DiscardEventGate = {
+  target?: { conversationId: string; messageId: string };
+  pending: Array<() => void>;
+  removals: number;
+  release(): number;
+};
+
+// Delay genuine frames at the browser's public SSE boundary. Keep all frames
+// for the target conversation ordered; never invent native or queue evidence.
+function installDiscardEventGate() {
+  const scope = window as unknown as { discardEventGate: DiscardEventGate };
+  const gate: DiscardEventGate = scope.discardEventGate = {
+    pending: [], removals: 0,
+    release() {
+      gate.target = undefined;
+      const frames = gate.pending.splice(0);
+      for (const frame of frames) frame();
+      return frames.length;
+    },
+  };
+  const original = EventSource.prototype.addEventListener;
+  EventSource.prototype.addEventListener = function (type, listener, options) {
+    if (type !== "live" || !listener) return original.call(this, type, listener, options);
+    const source = this;
+    return original.call(this, type, event => {
+      const envelope = JSON.parse((event as MessageEvent).data);
+      const invoke = () => typeof listener === "function" ? listener.call(source, event) : listener.handleEvent(event);
+      if (gate.target && envelope.topic === "conversation" && envelope.key === gate.target.conversationId) {
+        const data = envelope.event?.data;
+        if (data?.type === "conversation.queue" && data.change?.kind === "removed" && data.change.messageId === gate.target.messageId) gate.removals++;
+        gate.pending.push(invoke);
+      } else invoke();
+    }, options);
+  };
+}
+
+for (const browserName of ["chromium", "webkit"] as const) for (const mode of ["desktop", "touch"] as const) test.describe(`local discard ${mode} ${browserName}`, () => {
+  test.use({ page: async ({ launchBrowser, baseURL }, use) => {
+    const browser = await launchBrowser(browserName);
+    const page = await browser.newPage({ baseURL, viewport: mode === "touch" ? { width: 390, height: 844 } : { width: 1360, height: 960 }, hasTouch: mode === "touch", isMobile: mode === "touch" });
+    await page.addInitScript(installDiscardEventGate);
+    await use(page);
+    await browser.close();
+  } });
+
+  test("confirms local-only removal without native writes or draining the held queue", async ({ page, request }, info) => {
+    await request.post("/__e2e/reset");
+    await control(request, { action: "agents", stack: "opencode-v2", backgroundPreview: true });
+    const { token } = await request.get("/__e2e/terminal-token").then(response => response.json()) as { token: string };
+    await page.goto(`/?t=${encodeURIComponent(token)}`);
+    await expect(page.locator("#connection-state .connection-label")).toHaveText("Connected");
+    if (mode === "touch") await page.locator("#touch-tab-chat").tap(); else await openChatPanel(page);
+    await page.getByRole("button", { name: "New conversation" }).click();
+    await expect(page.locator("#chat-conversation-select")).not.toHaveValue("");
+    const conversationId = await page.locator("#chat-conversation-select").inputValue();
+    const sessionID = conversationId.replace(/^opencode:/, "");
+    const chat = `/api/chat/conversations/${encodeURIComponent(conversationId)}`;
+    const post = (path: string, data: unknown) => request.post(`${chat}${path}?t=${encodeURIComponent(token)}`, { data, headers: { origin: new URL(page.url()).origin } });
+    const started = await post("/prompts", { requestId: "start", text: "Start fixture work" });
+    expect(started.ok(), await started.text()).toBe(true);
+    await expect(page.locator("#chat-stop")).toBeEnabled();
+    await control(request, { action: "opencode", op: "unknownPromptBeforeAdmission" });
+    const unknown = await post("/prompts", { requestId: "original-unknown", text: "Original uncertain input", delivery: "steer" });
+    expect(unknown.ok()).toBe(false);
+    const state = () => control(request, { action: "opencode", op: "state" }) as Promise<NativeState>;
+    expect((await state()).sessions[sessionID]!.pending).toEqual([]);
+    const heldAcceptance = await post("/prompts", { requestId: "held", text: "Other queued input", delivery: "queue" });
+    expect(heldAcceptance.ok()).toBe(true);
+    await saveEvidence(info, `discard-${mode}-${browserName}-before-settlement.json`, JSON.stringify({ acceptance: await heldAcceptance.json(), native: await state(), snapshot: await request.get(`${chat}?t=${encodeURIComponent(token)}`).then(response => response.json()) }, null, 2));
+    // A normal finish before discard legitimately drains held work. Stop the
+    // parent explicitly to establish idle/dormant setup instead; this says
+    // nothing about cancellation of the unknown admission.
+    expect((await post("/cancel", { requestId: "setup-stop-parent" })).ok()).toBe(true);
+    await saveEvidence(info, `discard-${mode}-${browserName}-settlement.json`, JSON.stringify({ native: await state(), snapshot: await request.get(`${chat}?t=${encodeURIComponent(token)}`).then(response => response.json()) }, null, 2));
+    await expect(page.locator("#chat-stop")).toBeDisabled();
+    const snapshot = await request.get(`${chat}?t=${encodeURIComponent(token)}`).then(response => response.json()) as { queued: Array<{ id: string; admissionUncertaintyId?: string }> };
+    const eligible = snapshot.queued.find(entry => entry.admissionUncertaintyId)!;
+    expect(eligible.admissionUncertaintyId).toEqual(expect.any(String));
+    const refused = await post(`/queue/${encodeURIComponent(eligible.id)}/discard-unconfirmed`, { requestId: "wrong-token", uncertaintyId: "stale-token" });
+    expect(refused.status()).toBe(409);
+    const toggle = page.locator("[data-pending-toggle]");
+    if (await toggle.getAttribute("aria-expanded") === "false") await toggle.click();
+    const discard = page.locator("[data-queue-discard]");
+    await expect(discard).toHaveCount(1);
+    const rowGeometry = await discard.boundingBox();
+    expect(rowGeometry!.height).toBeGreaterThanOrEqual(32);
+    const input = page.locator("#chat-input");
+    await input.fill("Keep my unrelated draft");
+    const mutations: Array<{ url: string; body: unknown }> = [];
+    page.on("request", req => { if (req.method() === "POST" && req.url().includes("/queue/")) mutations.push({ url: req.url(), body: req.postDataJSON() }); });
+    const before = await state();
+    if (mode === "touch") await discard.tap(); else { await discard.focus(); await discard.press("Enter"); }
+    const dialog = page.locator("#chat-action-confirm");
+    await expect(dialog).toBeVisible();
+    await expect(dialog).toHaveAccessibleName("Discard local record?");
+    await expect(dialog).toContainText("Removing Uatu’s local record does not cancel or resend it; the original may still arrive.");
+    await expect(dialog).toContainText("Other messages will stay queued until you choose Send now or a later normal idle transition.");
+    await expect(dialog.getByRole("button", { name: "Cancel", exact: true })).toBeFocused();
+    const geometry = await dialog.getByRole("button", { name: "Discard local record", exact: true }).boundingBox();
+    expect(geometry!.height).toBeGreaterThanOrEqual(mode === "touch" ? 44 : 24);
+    await captureScreenshot(page, info, `discard-${mode}-${browserName}-warning`);
+    if (mode === "touch") await dialog.getByRole("button", { name: "Cancel", exact: true }).tap(); else await page.keyboard.press("Escape");
+    await expect(dialog).not.toBeVisible();
+    await expect(discard).toBeFocused();
+    await expect(input).toHaveValue("Keep my unrelated draft");
+    expect(mutations).toEqual([]);
+    await page.evaluate(({ conversationId, messageId }) => {
+      (window as unknown as { discardEventGate: DiscardEventGate }).discardEventGate.target = { conversationId, messageId };
+    }, { conversationId, messageId: eligible.id });
+    if (mode === "touch") await discard.tap(); else await discard.press("Enter");
+    const accepted = page.waitForResponse(response => response.url().includes("/discard-unconfirmed"));
+    if (mode === "touch") await dialog.getByRole("button", { name: "Discard local record", exact: true }).tap();
+    else {
+      // macOS WebKit's default Tab mode skips buttons; Option+Tab includes them.
+      await page.keyboard.press(browserName === "webkit" ? "Alt+Tab" : "Tab");
+      await expect(dialog.getByRole("button", { name: "Discard local record", exact: true })).toBeFocused();
+      await page.keyboard.press("Enter");
+    }
+    const acknowledgement = await accepted;
+    expect(await acknowledgement.json()).toEqual({ discarded: true, outcomeUnconfirmed: true });
+    await expect(discard).toHaveCount(0);
+    await expect(page.locator("#chat-queue .chat-queued-message")).toHaveCount(1);
+    await expect(page.locator("#chat-queue")).toContainText("Other queued input");
+    await expect(input).toHaveValue("Keep my unrelated draft");
+    // First observe the acknowledgement's warning, then release its real SSE
+    // removal. This ordering deterministically caught the transient-status bug.
+    const feedback = page.locator("#chat-action-feedback");
+    await expect(feedback).toBeVisible();
+    await expect(feedback).toContainText("Delivery remains unconfirmed");
+    await page.waitForFunction(() => (window as unknown as { discardEventGate: DiscardEventGate }).discardEventGate.removals === 1);
+    const released = await page.evaluate(() => (window as unknown as { discardEventGate: DiscardEventGate }).discardEventGate.release());
+    expect(released).toBeGreaterThanOrEqual(1);
+    await expect(feedback).toBeVisible();
+    await expect(feedback).toContainText("Delivery remains unconfirmed");
+    await expect(feedback).toContainText("the original may still arrive");
+    await expect(feedback).toContainText("Discard did not cancel or resend it");
+    const after = await state();
+    const writes = (value: NativeState) => value.calls.filter(call => /^(POST|PATCH|DELETE) /.test(call));
+    expect(writes(after)).toEqual(writes(before));
+    expect(after.sessions[sessionID]!.running).toBe(false);
+    expect(after.sessions[sessionID]!.pending).toEqual([]);
+    expect(after.sessions[sessionID]!.messages.some(message => message.text === "Original uncertain input" || message.text === "Other queued input")).toBe(false);
+    expect(mutations).toHaveLength(1);
+    expect(mutations[0]!.url).toContain(`/queue/${encodeURIComponent(eligible.id)}/discard-unconfirmed`);
+    expect(mutations[0]!.body).toEqual({ requestId: expect.any(String), uncertaintyId: eligible.admissionUncertaintyId });
+    expect(after.unhandled).toEqual([]);
+    // The desktop notice band is deliberately scrollable. Its first visible
+    // line must carry uncertainty, not only the bounded message excerpt.
+    expect(await feedback.evaluate(node => {
+      const range = document.createRange();
+      const start = node.textContent!.indexOf("Delivery remains unconfirmed");
+      range.setStart(node.firstChild!, start);
+      range.setEnd(node.firstChild!, start + "Delivery remains unconfirmed".length);
+      const text = range.getBoundingClientRect();
+      const region = document.querySelector("#chat-composer-notices")!.getBoundingClientRect();
+      return text.top >= region.top && text.bottom <= region.bottom;
+    })).toBe(true);
+    await captureScreenshot(page, info, `discard-${mode}-${browserName}-held`);
+    if (mode === "desktop") {
+      const notices = page.locator("#chat-composer-notices");
+      await notices.focus();
+      await notices.press("End");
+      await expect.poll(() => notices.evaluate(node => node.scrollTop + node.clientHeight >= node.scrollHeight)).toBe(true);
+      await captureScreenshot(page, info, `discard-${mode}-${browserName}-notice-scrolled`);
+      await notices.press("Home");
+      await expect.poll(() => notices.evaluate(node => node.scrollTop)).toBe(0);
+    }
+    await saveEvidence(info, `discard-${mode}-${browserName}.json`, JSON.stringify({ writesBefore: writes(before), writesAfter: writes(after), mutations, geometry, rowGeometry, nativeSession: after.sessions[sessionID] }, null, 2));
+    // Only this explicit action is allowed to release the remaining held input.
+    await page.locator("[data-queue-send-now]").click();
+    await expect(page.locator("#chat-items")).toContainText("Other queued input");
+    await expect(input).toHaveValue("Keep my unrelated draft");
+    await expect(feedback).toBeVisible();
+    await expect(feedback).toContainText("Delivery remains unconfirmed");
+  });
+});

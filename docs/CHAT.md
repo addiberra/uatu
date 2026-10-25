@@ -42,6 +42,16 @@ unavailable, not ON or OFF; an otherwise accepted steer stays accepted.
 Refused, unavailable and unknown follow-ups are reported separately and never
 restore an accepted input as a failed draft. An uncertain primary admission is
 retained as unconfirmed text/attachments and reconciled read-only, not resent.
+Once an unknown admission has settled, an eligible pending entry offers
+**Discard local record**. Confirmation explains that this removes only Uatu's
+copy: it does not cancel or resend the original, which may still arrive. The
+original unknown receipt and native evidence remain intact. Other messages stay
+queued until explicit Send now or a later normal idle transition; discard itself
+does not send anything. This also covers a Queue entry whose attempted Send now
+or switch to Steer became unknown. Resume and withdrawal uncertainty do not gain
+this action. A timed-out request whose underlying transport never settles remains
+protected and has no discard action; retiring that still-pending ownership is
+outside the current scope.
 Late evidence never schedules a delayed background request. Same-account,
 same-request retries retain the first policy/outcome only while the bounded
 in-memory receipt survives (15 minutes after settlement by default, or less
@@ -119,6 +129,14 @@ own session storage (`~/.claude/projects/...`), which uatu reads but
 never writes.
 
 ### Sending, steering and queued messages
+
+Opening or restoring a conversation first loads its snapshot. Until it loads,
+Send and Rename stay disabled; any saved draft remains intact. The message
+field is disabled during initial loading. If the read fails, you can edit the draft,
+including while **Retry read** is pending, or choose another conversation.
+A send shortcut during draft-only recovery reports that nothing was sent and
+keeps the draft. Loading never submits input automatically. Once loaded, you can
+keep drafting while an earlier submission or cancellation is in flight.
 
 **Send** taps steer ordinary text while OpenCode V2 is busy; the separate
 **Stop** cancels the current response. Hold Send continuously for **2.5 seconds**
@@ -327,9 +345,19 @@ the message. Edit and Steer → Queue remain unavailable until confirmation;
 duplicate clicks cannot start concurrent actions on the entry. Cancellation
 confirmation removes it; delivery confirmation says **Too late — already
 delivered** and the message stays delivered once. An inconclusive retry leaves
-the entry visible. Admission/resume uncertainty remains read-only. The retry
+the entry visible. Resume uncertainty remains read-only; settled unknown
+admissions can offer the separate token-guarded local discard described above.
+The retry
 classification is page-local: after reload, a generic unconfirmed entry alone
 does not establish that withdrawal retry is safe.
+
+Read-only worker recovery separates failed reads from successful but inconclusive
+checks. Failures retain backoff. After three unchanged successful checks in an
+external recovery cycle, Chat waits for new source evidence, explicit refresh or
+reconnect instead of polling indefinitely. Verified new execution progress can
+continue discovery. Missing history or an exhausted check budget never means that
+work completed or input was not delivered. Ongoing updates are coalesced without
+discarding safe independent recovery results.
 
 ### Background workers (OpenCode V2)
 
@@ -486,6 +514,11 @@ On touch devices, it opens an in-app explanation and confirmation before cancell
 unknown workers and settled history alone neither relabel Stop nor trigger that
 confirmation. Cancel leaves all work untouched.
 
+Undo/Revert hides reverted transcript history, not independently verified live
+detached workers. Those workers remain inspectable and offer Stop when their
+exact current target is verified. Completed reverted history stays hidden;
+neither recovery nor a worker's later completion restores the reverted turn.
+
 Stopping a shell removes its provider record and output. If removal prevents
 final capture, OpenCode can report **failed**, even after the process exited.
 An already confirmed completed report stays completed. Output already received
@@ -504,6 +537,16 @@ unverified worker cannot be stopped. This is not a promise of execution survival
 across service restarts. Reused child sessions can have ambiguous results, and
 the native interruption API cannot atomically lock a particular execution
 generation against an external continuation.
+
+Stop also depends on bounded safety records identifying the particular worker
+run. Cleaning up display records does not disable targets whose verification
+evidence remains retained. If that evidence is missing, revoked or cannot fit,
+the target stays uncertain with Stop unavailable—even if a status read succeeds.
+History alone does not recreate lost control proof. Unretained targets can remain
+unavailable for the provider runtime's lifetime; reconnect does not erase known
+revocations. These internal limits do not prevent workers running or messages
+being sent. Chat does not automatically restart, cancel work or delete data to
+clear them.
 
 If a response is lost, Chat reports **Outcome unknown** and refreshes without
 replaying the mutation. Same-request retries are deduplicated only while the

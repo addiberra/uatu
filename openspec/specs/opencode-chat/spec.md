@@ -260,6 +260,8 @@ The API SHALL report every agent a workspace's Chat offers, and which capabiliti
 
 The API SHALL name a way of working a **mode**, and SHALL name the program Chat talks to an **agent**. These two SHALL NOT share a name in the route table, because they are not the same thing and a reader cannot tell them apart from the route alone.
 
+Workspace API31 SHALL expose the optional server-owned `QueuedMessage.admissionUncertaintyId` and the strict `POST /api/chat/conversations/:conversationId/queue/:messageId/discard-unconfirmed` body `{requestId, uncertaintyId}`. The acknowledgement SHALL be `{discarded: true, outcomeUnconfirmed: true}`. The route SHALL retain existing authentication, workspace/conversation ownership, cookie-origin and caller-scoped request-identity protections. Local discard SHALL reuse queue change `removed` only to describe local-record removal, never native cancellation. Hub API11 and bundled web revision3 SHALL remain unchanged by this contract revision.
+
 #### Scenario: Retried prompt does not run twice
 - **WHEN** a client retries a prompt mutation with the same request identifier after losing the response
 - **THEN** the server returns the original accepted result or current outcome
@@ -2722,6 +2724,8 @@ For each pending entry, the user SHALL be able to:
 
 Withdrawing a steer SHALL complete only when the agent confirms the withdrawal. If the agent delivers the steer first, the withdrawal SHALL fail, the message SHALL stay delivered, and the user SHALL be told it was already delivered. A message SHALL never be delivered twice.
 
+An unconfirmed withdrawal SHALL keep the pending entry and private draft visible. Absence from a passive inbox/history snapshot SHALL NOT by itself confirm cancellation. A client with withdrawal-specific uncertainty SHALL offer **Retry withdrawal**, which explicitly repeats only native cancellation of the same inbox ID. It SHALL NOT edit, convert, resubmit the original input, automatically retry any mutation, or allow concurrent actions on that entry. Admission/resume uncertainty SHALL NOT grant withdrawal retry. Resume uncertainty SHALL remain read-only; settled unknown admission MAY offer only the token-fenced local discard defined below.
+
 Skills, slash commands, and `/reload` in the queue SHALL NOT offer the switch to steer.
 
 Cancelling the turn SHALL leave pending steers with the agent and SHALL present them as paused. A steer is paused when it was pending before the conversation last became idle. The dock SHALL offer one action labelled `Send N paused steers now`, which resumes the agent so that it delivers every pending steer. Submitting a new steer SHALL also resume delivery of paused steers.
@@ -2731,6 +2735,15 @@ The pending card SHALL have an always-visible count header outside its own conta
 When pending messages exist, software-keyboard mode or short touch landscape SHALL collapse the work dock to a pending-count summary rather than hide it. Any paused-steer batch Send action SHALL retain a 44px target, and the count-only replacement warning SHALL remain readable while typing or editing a pending entry. Entry details and the routine model-at-delivery note MAY be hidden in this compact state; the replacement warning SHALL NOT be hidden. Dock growth SHALL reserve its final bounded layout height before a visual reveal, respect reduced motion, and preserve a remote-update reading anchor and deliberate bottom pinning. Sending a prompt SHALL retain the existing explicit jump-to-latest behavior.
 
 When the workspace attaches to a conversation, or reconnects to the agent, it SHALL reconcile the pending steers with the agent's own list, so the dock shows steers raised while the stream was interrupted or by another client.
+
+#### Scenario: Hidden delivery does not erase an uncertain withdrawal
+- **WHEN** a withdrawal is unconfirmed and a later inbox read is empty while V2 history hides reverted messages
+- **THEN** the original pending entry and attachments remain inspectable, and no removal is published based on that absence
+
+#### Scenario: An explicit withdrawal retry does not resend input
+- **WHEN** the user activates Retry withdrawal
+- **THEN** only cancellation of the original inbox ID is requested again, with no prompt or new message ID
+- **AND** confirmed cancellation removes the entry, confirmed delivery removes it with an already-delivered warning, and an inconclusive result keeps it visible
 
 #### Scenario: Short desktop budgets use the panel rather than the window
 - **WHEN** six long pending messages occupy a 1280px-wide desktop window at 600px or 480px height, or the panel is shorter than its window
@@ -3360,3 +3373,112 @@ Native steer/resume unknown retention SHALL remain active without automatic-poli
 - **WHEN** a Queue → Steer, held Send now or paused-batch Send now result is lost to browser transport failure or a server 5xx
 - **THEN** unconfirmed guidance remains visible through read-only reconciliation and later paints
 - **AND** the unrelated composing draft stays unchanged and reconnect/reload sends no automatic mutation retry
+
+### Requirement: Unknown steer admission has an explicit local-only escape
+A settled unknown steer admission SHALL offer confirmed local-only discard through a fresh server-owned `admissionUncertaintyId`. Discard SHALL preserve original unknown receipts and native evidence, leave other messages queued, and never cancel, resend or claim non-delivery of the original. Generic uncertainty, resume/withdrawal uncertainty and still-pending requests SHALL NOT authorize discard.
+
+#### Scenario: Eligibility identifies admission uncertainty rather than its delivery label
+- **WHEN** a pending steer or a held Queue entry's attempted steer admission settles unknown
+- **THEN** its eligible local record exposes a fresh opaque admission token
+- **AND** generic `unconfirmed`, confirmed admission and resume/withdrawal uncertainty do not grant this action or withdrawal retry
+
+#### Scenario: An indefinitely pending transport stays protected
+- **WHEN** Uatu times out but the upstream admission request remains pending indefinitely
+- **THEN** no discard token is exposed until that request actually settles unknown
+- **AND** neither local-ownership retirement, cancellation nor replay occurs automatically
+
+#### Scenario: Confirmation explains local-only removal
+- **WHEN** the user chooses Discard local record
+- **THEN** confirmation explains that delivery is unconfirmed, the original may still arrive, local removal neither cancels nor resends it, and other messages wait for Send now or a later normal idle transition
+- **AND** Cancel initially receives focus and conflicting per-entry actions are prevented
+
+#### Scenario: Target validation and retained receipts identify the exact action
+- **WHEN** the server receives a local-discard request
+- **THEN** it validates the exact token, local entry and submission/native-admission identity atomically with other queue admissions
+- **AND** retained receipts distinguish caller scope, conversation, message, token and request identifier without acknowledging another target
+
+#### Scenario: Nothing landed but the admission outcome remains unknown
+- **WHEN** a steer admission settles unknown, inbox/history remain empty, and another message is held behind it
+- **THEN** a token-eligible local discard can remove the uncertain local copy without restarting the workspace
+- **AND** no native send or cancellation occurs, the original receipt remains unknown, and the other message stays queued
+- **AND** no provider lookup, resume or background action occurs and removal is not reported as acceptance or non-delivery
+
+#### Scenario: Confirmation is cancelled or its target changes
+- **WHEN** the user cancels confirmation or the entry/token changes before confirmation completes
+- **THEN** no discard mutation is sent for the cancelled or changed target
+- **AND** the unrelated composing draft and other pending messages remain intact
+
+#### Scenario: Stale tokens and ineligible uncertainty are refused
+- **WHEN** a discard names an old token, another target, a confirmed/in-flight admission, or resume/withdrawal uncertainty
+- **THEN** the server refuses it without removing another record or invoking the provider
+
+#### Scenario: Discard does not release a previously scheduled drain
+- **WHEN** an idle drain was scheduled before local discard and runs afterward
+- **THEN** remaining held messages stay queued
+- **AND** explicit Send now or a later normal idle transition can deliver eligible remaining messages without replaying the discarded original
+- **AND** derived recovery completion or failed-action status rollback does not count as that transition
+
+#### Scenario: Late native evidence remains truthful
+- **WHEN** old reads or acknowledgements finish after discard, or the original later appears in native inbox/history
+- **THEN** the discarded held copy is not recreated and the original is not resent
+- **AND** genuine native evidence can be shown without claiming that local discard cancelled delivery
+- **AND** late evidence does not schedule delayed backgrounding
+
+### Requirement: Read-only uncertain-work recovery is bounded and progressive
+Read-only recovery SHALL distinguish failed reads from successful inconclusive evidence, bound unchanged successful probes to three per external cycle, and apply safe independent results under ongoing updates. New evidence, explicit refresh or reconnect SHALL permit recovery again. Budget exhaustion SHALL preserve uncertainty, not imply completion, cancellation, non-delivery or terminal failure. Recovery SHALL NOT replay mutations.
+
+#### Scenario: Successful inconclusive reads stop polling without inventing an outcome
+- **WHEN** three successful recovery reads in one external cycle leave the same uncertainty unresolved
+- **THEN** no further unchanged self-scheduled successful probe occurs until a new external trigger
+- **AND** uncertainty remains visible rather than being reported as completion or non-application
+
+#### Scenario: Failed reads retain backoff and later evidence rearms recovery
+- **WHEN** a recovery read fails, or new evidence/refresh/reconnect follows an exhausted inconclusive cycle
+- **THEN** failures retain their backoff and an eligible new external cycle can recover state
+- **AND** reconnect does not inherit a timer from the previous stream generation
+
+#### Scenario: Only genuine discovery progress extends the probe budget
+- **WHEN** recovery discovers verified new execution progress, or merely alternates omission and rediscovery of an unchanged known worker
+- **THEN** only genuine progress can extend the current cycle, not retries, housekeeping or unchanged rediscovery
+- **AND** saturated native-provider discovery remains recoverable without requiring reconnect
+
+#### Scenario: Dirty bursts do not starve independent recovery results
+- **WHEN** source events continue while recovery verifies an independent worker
+- **THEN** coalesced follow-ups remain throttled and the safe verified result is applied
+- **AND** newer rows, deleted parents, reverted boundaries and replacement generations are not overwritten or resurrected
+- **AND** dirty updates coalesce with a fixed 100ms throttle rather than a starvation-prone trailing-only debounce
+
+### Requirement: Worker Stop availability requires retained occurrence proof
+Worker Stop SHALL target a retained, verified native occurrence. Display-record cleanup and reconnect SHALL NOT erase known revocations. Missing, revoked or overflowed control proof SHALL produce uncertainty and withhold Stop; fresh history alone SHALL NOT restore trust. Healthy targets whose proof remains retained SHALL remain controllable without reconnect after projection saturation.
+
+#### Scenario: Retained controls remain usable after projection saturation
+- **WHEN** display/correlation records saturate but a worker's compatible control evidence remains retained and fresh validation succeeds
+- **THEN** that worker remains controllable after read-only recovery without reconnecting or clearing the projection recovery-only latch
+- **AND** Stop targets only that verified occurrence, never another run using the same child
+
+#### Scenario: Unverifiable control is shown consistently
+- **WHEN** control evidence is missing, revoked or overflowed
+- **THEN** live updates, history and reconciliation expose the existing uncertain state and withhold Stop
+- **AND** a successful status read alone does not resolve missing control proof or create an apparently certain row with a repeatedly failing Stop
+- **AND** workers continue running and message delivery remains available
+
+#### Scenario: Control proof has a bounded share of the live evidence budget
+- **WHEN** the provider retains control evidence alongside live display/correlation records
+- **THEN** control evidence uses at most 1 MiB and 2,048 entries within the existing aggregate 4 MiB and 8,192 live-entry budget
+- **AND** complete retained payload, aliases, witnesses, observations, indexes and stubs are accounted as serialized logical payload, not a claim about JavaScript heap size
+
+#### Scenario: Overflow does not silently readmit an old identity
+- **WHEN** a target's control evidence cannot be retained or grows beyond its budget
+- **THEN** it remains unavailable or compacts to a reserved unavailable/revoked stub without disabling healthy retained targets
+- **AND** age, eviction, progress, alias folding or lagging history cannot erase the contradiction and readmit that identity
+- **AND** unretained targets may remain unavailable for the provider lifetime; no automatic restart, cancellation or data deletion occurs
+
+#### Scenario: Revocation survives recovery and stream replacement
+- **WHEN** a known occurrence is superseded or revoked before Stop or during its validation, followed by progress, history recovery or reconnect
+- **THEN** the old target is refused without redirecting to a newer execution
+- **AND** stream replacement invalidates in-flight authorization but does not erase retained revocation; disposal ends the in-memory provider ownership lifetime
+
+#### Scenario: Proven replay differs from ambiguous old-looking evidence
+- **WHEN** a previously consumed invocation is identified by matching native identity, stamp, semantic fingerprint and its established occurrence link
+- **THEN** that proven replay does not invalidate an otherwise verified target
+- **AND** a first-seen ambiguous report or new/contradictory invocation is not treated as historical merely because its timestamp looks old

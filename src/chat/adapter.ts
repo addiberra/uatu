@@ -55,6 +55,42 @@ class PrimarySteerOutcomeUnknownError extends OperationOutcomeUnknownError {
 // call in practice; its cursor loop is the backstop, not the plan.
 const RECONSTRUCTION_READ_LIMIT = 10_000;
 const INVENTORY_SESSION_LIMIT = 2_048;
+// Successful but unresolved evidence is not a failed read. Give each external
+// recovery cycle an initial read and two delayed probes, then await new evidence.
+const BACKGROUND_INCONCLUSIVE_READ_LIMIT = 3;
+// A fixed throttle, not trailing debounce: new arrivals cannot postpone this
+// deadline. Dirty reads share the same finite inconclusive-cycle budget.
+const BACKGROUND_DIRTY_RETRY_MS = 100;
+
+// Cycle-local high-water marks, never provider metadata. In particular,
+// read-side uncertainty toggles cannot turn the same evidence into progress.
+type WorkerRecoveryProgress = { startedAt: number; reportedAt: number; terminal: boolean };
+type BackgroundRecovery = {
+  dirty: boolean;
+  running: boolean;
+  failures: number;
+  inconclusiveReads: number;
+  progress: Map<string, WorkerRecoveryProgress>;
+  timer?: ReturnType<typeof setTimeout>;
+};
+
+function workerRecoveryProgress(item: BackgroundTaskItem): WorkerRecoveryProgress {
+  return { startedAt: item.createdAt, reportedAt: item.status === "running" ? -Infinity : item.terminalReportedAt ?? -Infinity, terminal: item.status !== "running" };
+}
+
+function mergeWorkerRecoveryProgress(previous: WorkerRecoveryProgress | undefined, incoming: WorkerRecoveryProgress): WorkerRecoveryProgress {
+  if (!previous) return incoming;
+  const startedAt = Math.max(previous.startedAt, incoming.startedAt);
+  const reportedAt = Math.max(previous.reportedAt, incoming.reportedAt);
+  const terminal = previous.startedAt === startedAt && previous.terminal || incoming.startedAt === startedAt && incoming.terminal;
+  if (startedAt === previous.startedAt && reportedAt === previous.reportedAt && terminal === previous.terminal) return previous;
+  return { startedAt, reportedAt, terminal };
+}
+
+function workerRecoveryAliases(item: BackgroundTaskItem): string[] {
+  return [...(item.toolUseIds ?? []), ...(item.toolUseId ? [item.toolUseId] : [])].map(id => `call:${id}`)
+    .concat(item.resultId ? [`result:${item.resultId}`] : []);
+}
 
 // Recovery can learn a canonical worker identity after a live placeholder.
 // Share only alias matching; snapshot and stream callers own their distinct
@@ -267,6 +303,7 @@ type HeldMessage = QueuedMessage & {
   variant?: string;
   unconfirmedSteerId?: string;
 };
+type HeldQueue = HeldMessage[] & { deliveryEpoch?: object; awaitingFreshIdle?: true };
 
 function heldDispatchInput(held: HeldMessage) {
   return {
@@ -293,6 +330,7 @@ type PendingSteer = {
   // provisional in that order, independently of its original held position.
   nativeOrderKnown?: true;
   unconfirmed?: true;
+  admissionUncertaintyId?: string;
   resumeUnconfirmed?: true;
   withdrawalUnconfirmed?: true;
   id: string;
@@ -427,7 +465,7 @@ export class ChatAdapter {
   // still accept a prompt — while the hub's activity summary, by spec, counts
   // live background work as working.
   private readonly backgroundWork = new Set<string>();
-  private readonly backgroundRecoveries = new Map<string, { dirty: boolean; running: boolean; failures: number; timer?: ReturnType<typeof setTimeout> }>();
+  private readonly backgroundRecoveries = new Map<string, BackgroundRecovery>();
   private backgroundRecoveryCount = 0;
   private readonly backgroundPending = new Set<Promise<void>>();
   private backgroundStreamGeneration = 0;
@@ -460,7 +498,7 @@ export class ChatAdapter {
   // turn ends. Adapter-level like liveTurns, not projection state: a held
   // message must survive projection eviction, or an LRU pass would silently
   // drop text the user was promised would be delivered.
-  private readonly heldQueues = new Map<string, HeldMessage[]>();
+  private readonly heldQueues = new Map<string, HeldQueue>();
   // Queues a cancellation paused. A dormant queue keeps its messages visible
   // and removable but delivers nothing until the user's next submission
   // reactivates it — cancel means stop, not "start the next thing".
@@ -857,6 +895,7 @@ export class ChatAdapter {
     // list so the composer shows the state it is actually in (spec).
     // V2 supplies positive evidence, not an authoritative live-only list.
     // An omitted worker or failed read must never manufacture cancellation.
+    const nativeLiveTasks = new Set<string>();
     if (this.provider.reconcileBackgroundTasks) {
       let recovered: BackgroundTaskItem[];
       try {
@@ -866,8 +905,15 @@ export class ChatAdapter {
         }
         recovered = await this.provider.reconcileBackgroundTasks(id, coverage ? { signal: coverage.signal } : undefined);
       }
-      catch { recovered = []; }
+      catch {
+        recovered = [];
+        // An unavailable read does not settle independently running work.
+        if (this.provider.waitForEventStream) for (const known of this.projection(id).items()) {
+          if (known.type === "background_task" && known.status === "running" && !known.foreground) nativeLiveTasks.add(known.id);
+        }
+      }
       coverage?.assertCurrent();
+      if (this.provider.waitForEventStream) for (const task of recovered) if (task.status === "running" && !task.foreground) nativeLiveTasks.add(task.id);
       const { byId, supersedes } = indexRecoveredBackgroundTasks(recovered);
       for (const known of [...this.projection(id).items(), ...items]) {
         if (known.type !== "background_task" || byId.has(known.id)) continue;
@@ -1098,6 +1144,9 @@ export class ChatAdapter {
       if (visibility && page.completeItems) for (const itemId of coverage!.revertExclusions) {
         if (!visible.has(itemId) && !coverage!.changed(itemId)) excluded.add(itemId);
       }
+      // Only the separately recovered live inventory can override a task-row
+      // exclusion. Its hidden user/tool transcript remains excluded as before.
+      for (const itemId of nativeLiveTasks) excluded.delete(itemId);
       // Recovery of live-only rows above can carry an old task back into the
       // page. Only exact exclusions govern it, not absence from the page.
       for (let index = items.length - 1; index >= 0; index--) if (excluded.has(items[index]!.id)) items.splice(index, 1);
@@ -1216,6 +1265,9 @@ export class ChatAdapter {
   // nothing else would ever settle its adapter-level records. If it returns,
   // its activity is re-derived from new events.
   private forgetActivity(conversationId: string): void {
+    const recovery = this.backgroundRecoveries.get(conversationId);
+    if (recovery) clearTimeout(recovery.timer);
+    this.backgroundRecoveries.delete(conversationId);
     for (const [key, admission] of this.admittingSteers) if (admission.conversationId === conversationId) {
       admission.retired = true;
       this.admittingSteers.delete(key);
@@ -1485,12 +1537,25 @@ export class ChatAdapter {
       if (this.admittingSteers.get(fenceKey) === fence) this.admittingSteers.delete(fenceKey);
     };
     let awaitingLateAcceptance = false;
-    const admission = Promise.resolve().then(() => this.provider.prompt(conversationId, { id: nativeId, text, delivery: "steer", ...(providerAttachments.length ? { attachments: providerAttachments } : {}) }));
+    let transportSettled = false;
+    const admission = Promise.resolve().then(() => this.provider.prompt(conversationId, { id: nativeId, text, delivery: "steer", ...(providerAttachments.length ? { attachments: providerAttachments } : {}) }))
+      .then(value => { transportSettled = true; return value; }, error => { transportSettled = true; throw error; });
+    const exposeDiscard = () => {
+      if (this.disposed || fence.terminal || fence.retired) return;
+      const held = sourceHeld && this.heldQueues.get(conversationId)?.includes(sourceHeld) && sourceHeld.unconfirmedSteerId === nativeId ? sourceHeld : undefined;
+      const pending = this.pendingSteers.get(conversationId)?.find(entry => entry.id === nativeId && entry.unconfirmed);
+      const owner = held ?? pending;
+      if (!owner || owner.admissionUncertaintyId) return;
+      owner.admissionUncertaintyId = crypto.randomUUID();
+      this.publishQueue(conversationId, { kind: "paused", messageId: owner.id });
+    };
     try {
       accepted = await this.boundedSteerAdmission(admission, nativeId);
       if (waking && projection.status === "sending") projection.statusUpdate("running");
     } catch (error) {
-      if (waking && projection.status === "sending") projection.statusUpdate(previousStatus);
+      // Restoring optimistic admission state is not a new provider idle event:
+      // in particular it cannot release input deliberately kept after discard.
+      if (waking && projection.status === "sending") projection.statusUpdate(previousStatus, undefined, false);
       if (error instanceof PrimarySteerOutcomeUnknownError && !this.disposed && !fence.terminal && !fence.retired) {
         awaitingLateAcceptance = true;
         if (sourceHeld && this.heldQueues.get(conversationId)?.includes(sourceHeld)) {
@@ -1499,6 +1564,9 @@ export class ChatAdapter {
         } else if (!sourceHeld && !this.pendingSteers.get(conversationId)?.some(entry => entry.id === nativeId && !entry.unconfirmed)) {
           this.recordPendingSteer(conversationId, nativeId, submissionId, submissionOrder, requestId, text, attachmentRefs, queuedAt, true);
         }
+        // A still-running transport has not settled into an unknown outcome.
+        // Its pending owner stays read-only until that transport actually ends.
+        if (transportSettled) exposeDiscard();
         // Late acknowledgement is read-side evidence only. It must never
         // re-enter the composite operation or initiate a delayed follow-up.
         void admission.then(late => {
@@ -1512,7 +1580,7 @@ export class ChatAdapter {
             if (!queue.length) this.heldQueues.delete(conversationId);
           }
           this.recordPendingSteer(conversationId, late.messageId, submissionId, submissionOrder, requestId, text, attachmentRefs, queuedAt);
-        }, () => undefined).finally(releaseFence).catch(() => undefined);
+        }, exposeDiscard).finally(releaseFence).catch(() => undefined);
       }
       throw error;
     } finally {
@@ -1534,7 +1602,7 @@ export class ChatAdapter {
       // The stream announced it before the acceptance answered: the entry is
       // there already, restated now with the request id the client waits for.
       Object.assign(existing, steer);
-      if (!unconfirmed) delete existing.unconfirmed;
+      if (!unconfirmed) { delete existing.unconfirmed; delete existing.admissionUncertaintyId; }
     } else {
       steers.push(steer);
       this.pendingSteers.set(conversationId, steers);
@@ -1670,8 +1738,10 @@ export class ChatAdapter {
       if (index < 0) throw this.notPendingError(conversationId, messageId);
       const held = queue[index]!;
       await this.dispatchPrompt(conversationId, projection, session, heldDispatchInput(held));
-      queue.splice(queue.indexOf(held), 1);
-      if (queue.length === 0) this.heldQueues.delete(conversationId);
+      const current = this.heldQueues.get(conversationId);
+      const currentIndex = current?.indexOf(held) ?? -1;
+      if (currentIndex >= 0) current!.splice(currentIndex, 1);
+      if (current?.length === 0) this.heldQueues.delete(conversationId);
       this.publishQueue(conversationId, { kind: "delivered", messageId: held.id });
       this.publishPausedChanges(conversationId);
       return { messageId: held.id, delivery: "queue" as const };
@@ -1900,6 +1970,7 @@ export class ChatAdapter {
         if (admission) existing.requestId = admission.requestId;
         existing.tick = ++this.inboxClock;
         delete existing.unconfirmed;
+        delete existing.admissionUncertaintyId;
         if (delta.attachments?.length) existing.attachments = delta.attachments; else delete existing.attachments;
         if (!existing.nativeOrderKnown) {
           steers.splice(steers.indexOf(existing), 1);
@@ -2026,13 +2097,9 @@ export class ChatAdapter {
       return false;
     });
     if (remaining.length !== held.length) {
-      if (remaining.length) this.heldQueues.set(conversationId, remaining);
-      else this.heldQueues.delete(conversationId);
+      held.splice(0, held.length, ...remaining);
+      if (!held.length) this.heldQueues.delete(conversationId);
     }
-    // Steers learned of only now, on a session with no turn live, have
-    // nothing coming to deliver them: stranded until something wakes the
-    // agent. Steers already tracked keep the wake and settle bookkeeping.
-    if (current.length === 0 && listed.length > 0 && !this.turnActive(conversationId, projection) && !this.settledTurns.has(conversationId)) this.settledTurns.set(conversationId, {});
     const next: PendingSteer[] = listed.filter(entry => entry.delivery === "steer").map(entry => {
       const known = current.find(candidate => candidate.id === entry.id) ?? confirmedHeld.get(entry.id);
       const fence = this.admittingSteers.get(steerKey(conversationId, entry.id));
@@ -2064,6 +2131,10 @@ export class ChatAdapter {
     }
     if (merged.length === 0) this.pendingSteers.delete(conversationId);
     else this.pendingSteers.set(conversationId, merged);
+    // Steers learned of only now, on a session with no turn live, have
+    // nothing coming to deliver them: stranded until something wakes the
+    // agent. Register their owner before trimming historical settlements.
+    if (current.length === 0 && listed.length > 0 && !this.turnActive(conversationId, projection) && !this.settledTurns.has(conversationId)) this.rememberSettlement(conversationId);
     for (const entry of gone) {
       const wasDelivered = delivered(entry.id);
       // The departing owner is no longer in pendingSteers. Transfer its
@@ -2083,6 +2154,43 @@ export class ChatAdapter {
   /** The pending steers as the adapter holds them, for tests. */
   pendingSteersForTests(conversationId: string): readonly PendingSteer[] {
     return this.pendingSteers.get(conversationId) ?? [];
+  }
+
+  discardUnconfirmedSteer(conversationId: string, messageId: string, requestId: string, uncertaintyId: string): Promise<{ discarded: true; outcomeUnconfirmed: true }> {
+    // Capture before joining the lane. A confirmation/replacement while waiting
+    // must not turn this local-only operation into removal of another owner.
+    const held = this.heldQueues.get(conversationId)?.find(entry => entry.id === messageId);
+    const pending = this.pendingSteers.get(conversationId)?.find(entry => entry.id === messageId);
+    const owner = held ?? pending;
+    const nativeId = held?.unconfirmedSteerId ?? pending?.id;
+    const submissionId = owner?.submissionId;
+    return this.receipts.run(JSON.stringify(["discard-unconfirmed", conversationId, messageId, uncertaintyId, requestId]), () => this.enqueuePromptAdmission(conversationId, async () => {
+      this.requireSteering();
+      const queue = this.heldQueues.get(conversationId);
+      const steers = this.pendingSteers.get(conversationId);
+      if (!owner || !uncertaintyId || owner.admissionUncertaintyId !== uncertaintyId || owner.submissionId !== submissionId
+        || (held ? !queue?.includes(held) || held.unconfirmedSteerId !== nativeId
+          : !pending || !steers?.includes(pending) || !pending.unconfirmed || pending.resumeUnconfirmed || pending.withdrawalUnconfirmed)) {
+        throw new InteractionConflictError("admission uncertainty changed; refresh pending input");
+      }
+      const admission = this.admittingSteers.get(steerKey(conversationId, nativeId!));
+      if (admission && admission.submissionId === submissionId && (!held || admission.held === held)) admission.retired = true;
+      // Fence only already-running inbox snapshots. This is not a cancellation
+      // tombstone: future native pending/history evidence remains authoritative.
+      for (const read of this.inboxReads.get(conversationId) ?? []) read.add(nativeId!);
+      if (held) {
+        queue!.splice(queue!.indexOf(held), 1);
+        if (!queue!.length) this.heldQueues.delete(conversationId);
+      } else this.forgetSteer(conversationId, pending!.id);
+      const remaining = this.heldQueues.get(conversationId);
+      if (remaining?.length) {
+        remaining.deliveryEpoch = {};
+        remaining.awaitingFreshIdle = true;
+      }
+      this.publishQueue(conversationId, { kind: "removed", messageId });
+      this.publishPausedChanges(conversationId);
+      return { discarded: true as const, outcomeUnconfirmed: true as const };
+    }));
   }
 
   async removeQueued(conversationId: string, messageId: string, requestId: string): Promise<{ removed: true }> {
@@ -2313,17 +2421,19 @@ export class ChatAdapter {
   private queuedMessages(conversationId: string): QueuedMessage[] {
     const settled = this.settledTurns.has(conversationId);
     const heldPaused = this.deliveryPaused(conversationId);
-    const steers = (this.pendingSteers.get(conversationId) ?? []).map(({ id, submissionId, text, queuedAt, requestId, attachments, unconfirmed, resumeUnconfirmed, withdrawalUnconfirmed }): QueuedMessage => ({
+    const steers = (this.pendingSteers.get(conversationId) ?? []).map(({ id, submissionId, text, queuedAt, requestId, attachments, unconfirmed, admissionUncertaintyId, resumeUnconfirmed, withdrawalUnconfirmed }): QueuedMessage => ({
       id, submissionId, text, queuedAt, delivery: "steer",
       ...(unconfirmed || resumeUnconfirmed || withdrawalUnconfirmed || settled ? { paused: true as const } : {}),
       ...(unconfirmed || resumeUnconfirmed || withdrawalUnconfirmed ? { unconfirmed: true as const } : {}),
+      ...(unconfirmed && admissionUncertaintyId && !resumeUnconfirmed && !withdrawalUnconfirmed ? { admissionUncertaintyId } : {}),
       ...(requestId ? { requestId } : {}),
       ...(attachments?.length ? { attachments } : {}),
     }));
-    const held = (this.heldQueues.get(conversationId) ?? []).map(({ id, submissionId, text, queuedAt, requestId, attachments, unconfirmedSteerId }): QueuedMessage => ({
+    const held = (this.heldQueues.get(conversationId) ?? []).map(({ id, submissionId, text, queuedAt, requestId, attachments, unconfirmedSteerId, admissionUncertaintyId }): QueuedMessage => ({
       id, submissionId, text, queuedAt, delivery: "queue",
       ...(heldPaused || unconfirmedSteerId ? { paused: true as const } : {}),
       ...(unconfirmedSteerId ? { unconfirmed: true as const } : {}),
+      ...(unconfirmedSteerId && admissionUncertaintyId ? { admissionUncertaintyId } : {}),
       requestId,
       ...(attachments?.length ? { attachments } : {}),
     }));
@@ -2336,6 +2446,23 @@ export class ChatAdapter {
   // the departed head as still held until the next queue change.
   private publishQueue(conversationId: string, change: { kind: QueueChangeKind; messageId: string }): void {
     this.projection(conversationId).replay.publish({ type: "conversation.queue", queued: this.queuedMessages(conversationId), change });
+    this.trimSettlements();
+  }
+
+  private rememberSettlement(conversationId: string): void {
+    this.settledTurns.delete(conversationId);
+    this.settledTurns.set(conversationId, {});
+    this.trimSettlements();
+  }
+
+  private trimSettlements(): void {
+    for (const id of this.settledTurns.keys()) {
+      if (this.settledTurns.size <= INVENTORY_SESSION_LIMIT) break;
+      // Pending input and in-flight actions own their ordering fences even
+      // after projection eviction. Bound historical markers, not live owners.
+      if (this.heldQueues.has(id) || this.pendingSteers.has(id) || this.promptAdmissions.has(id) || this.stoppingTurns.has(id)) continue;
+      this.settledTurns.delete(id);
+    }
   }
 
   // The paused state is derived, so a change to what it derives from (a
@@ -2368,8 +2495,13 @@ export class ChatAdapter {
   // status plus a paused queue), not to whichever caller happened to trip it.
   private scheduleDelivery(conversationId: string): void {
     if (this.deliveryPaused(conversationId)) return;
-    if (!this.heldQueues.get(conversationId)?.length) return;
-    void this.enqueuePromptAdmission(conversationId, () => this.deliverNextHeld(conversationId)).catch(() => undefined);
+    const queue = this.heldQueues.get(conversationId);
+    if (!queue?.length) return;
+    const epoch = queue.deliveryEpoch;
+    void this.enqueuePromptAdmission(conversationId, () => {
+      if (this.heldQueues.get(conversationId) !== queue || queue.deliveryEpoch !== epoch) return Promise.resolve();
+      return this.deliverNextHeld(conversationId);
+    }).catch(() => undefined);
   }
 
   private async deliverNextHeld(conversationId: string): Promise<void> {
@@ -2411,8 +2543,12 @@ export class ChatAdapter {
     if (this.deliveryPaused(conversationId) || this.turnActive(conversationId, projection)) return;
     try {
       await this.dispatchPrompt(conversationId, projection, session, heldDispatchInput(held));
-      queue.shift();
-      if (queue.length === 0) this.heldQueues.delete(conversationId);
+      // History and inbox events reconcile outside the admission lane. Remove
+      // the accepted object from the current queue, not a captured array/head.
+      const current = this.heldQueues.get(conversationId);
+      const index = current?.indexOf(held) ?? -1;
+      if (index >= 0) current!.splice(index, 1);
+      if (current?.length === 0) this.heldQueues.delete(conversationId);
       this.publishQueue(conversationId, { kind: "delivered", messageId: held.id });
     } catch {
       // The provider refused the delivery. The message stays held and the
@@ -2426,6 +2562,7 @@ export class ChatAdapter {
 
   private deliveryPaused(conversationId: string): boolean {
     return this.dormantQueues.has(conversationId)
+      || this.heldQueues.get(conversationId)?.awaitingFreshIdle === true
       || this.reversibleMutations.has(conversationId)
       || this.revertReconciliations.has(conversationId)
       || this.reversibleHistory.get(conversationId)?.staged === true;
@@ -2441,6 +2578,7 @@ export class ChatAdapter {
     this.promptAdmissions.set(conversationId, tail);
     void tail.then(() => {
       if (this.promptAdmissions.get(conversationId) === tail) this.promptAdmissions.delete(conversationId);
+      this.trimSettlements();
     });
     return next;
   }
@@ -2774,6 +2912,13 @@ export class ChatAdapter {
       items.push(...page.items);
       cursor = page.nextCursor;
     } while (cursor !== undefined);
+    if (this.provider.waitForEventStream && this.provider.reconcileBackgroundTasks) {
+      let live: BackgroundTaskItem[];
+      try { live = await this.provider.reconcileBackgroundTasks(conversationId); }
+      catch { live = this.projection(conversationId).filter(item => item.type === "background_task" && item.status === "running" && !item.foreground).map(item => ({ ...item, stateUncertain: true })) as BackgroundTaskItem[]; }
+      if (isCurrent && !isCurrent()) throw new Error("reversible history reconciliation was cancelled");
+      for (const task of live) if (task.status === "running" && !task.foreground && !items.some(item => item.id === task.id)) items.push(task);
+    }
     if (!this.liveTurns.has(conversationId)) {
       for (let index = 0; index < items.length; index += 1) {
         const item = items[index]!;
@@ -3622,6 +3767,10 @@ export class ChatAdapter {
     return this.projection(id);
   }
 
+  retainedSettlementsForTests(): number {
+    return this.settledTurns.size;
+  }
+
   private async pump(signal: AbortSignal): Promise<void> {
     const coalescer = new ProviderUpdateCoalescer({
       windowMs: this.coalesceWindowMs,
@@ -3629,10 +3778,23 @@ export class ChatAdapter {
       // them, so a sparse frame landing right behind a full one cannot
       // strip what the full one carried (a 2.x tool call's input).
       mergeUpsert: mergeInteraction,
-      onFlush: (conversationId, updates) => {
+      onFlush: async (conversationId, updates) => {
         // Not gated on the abort signal: a graceful stop still applies
         // whatever the coalescer buffered in its final window.
         const projection = this.projection(conversationId);
+        if (this.provider.waitForEventStream && projection.reconciledHistoryVisibility?.state.staged) {
+          // Staged native transcript and live inventory have distinct owners.
+          // Reconcile their canonical views rather than publishing a hidden
+          // launcher or terminal result directly from a live update.
+          for (const update of updates) if (update.kind === "status") projection.apply(update);
+          try { await this.history(conversationId); }
+          catch {
+            if (!signal.aborted && this.projections.get(conversationId) === projection) for (const item of projection.items()) {
+              if (item.type === "background_task" && item.status === "running") projection.apply({ kind: "upsert", item: { ...item, stateUncertain: true } });
+            }
+          }
+          return;
+        }
         for (const update of updates) projection.apply(update.kind === "upsert" ? { ...update, item: this.correlateSteerMessage(conversationId, update.item) } : update);
         if (this.provider.reconcileBackgroundTasks) this.syncBackgroundState(conversationId);
         // A fast subagent can start and report inside one coalescer window:
@@ -3672,6 +3834,14 @@ export class ChatAdapter {
           this.backgroundReadyResolve?.();
           this.backgroundReadyResolve = undefined;
           this.backgroundStreamGeneration++;
+          for (const [id, recovery] of this.backgroundRecoveries) {
+            clearTimeout(recovery.timer);
+            recovery.timer = undefined;
+            recovery.failures = 0;
+            recovery.inconclusiveReads = 0;
+            recovery.progress = this.backgroundProgressBaseline(id);
+            recovery.dirty = true;
+          }
           this.drainBackgroundRecoveries();
           // Only an initialized, connected provider is read. Activity itself
           // remains memory-only and cannot start a runtime.
@@ -3749,6 +3919,13 @@ export class ChatAdapter {
           if (update.kind === "inbox") this.applyInboxDelta(normalized.conversationId, update.delta);
           else timelineUpdates.push(update);
         }
+        // A coalesced add/remove may never reach the timeline. Active reads
+        // still need its occurrence identity to respect the newer removal.
+        this.projections.get(normalized.conversationId)?.touchWorkerOccurrences(timelineUpdates);
+        if (this.provider.waitForEventStream && this.projections.get(normalized.conversationId)?.reconciledHistoryVisibility?.state.staged) {
+          const reading = this.nativeHistoryReads.get(normalized.conversationId);
+          if (reading?.stream === this.pumpController) reading.recovery.dirty = true;
+        }
         coalescer.push(normalized.conversationId, timelineUpdates);
         if (this.provider.waitForEventStream && normalized.updates.some(update => update.kind === "inbox" && update.delta.kind === "settled"
           && update.delta.outcome === "delivered" && !this.projection(normalized.conversationId!).has(`message:${update.delta.id}`)
@@ -3802,8 +3979,16 @@ export class ChatAdapter {
     if (this.disposed || !this.provider.reconcileBackgroundTasks) return;
     const existing = this.backgroundRecoveries.get(id);
     if (existing) { existing.dirty = true; return; }
-    this.backgroundRecoveries.set(id, { dirty: true, running: false, failures: 0 });
+    this.backgroundRecoveries.set(id, { dirty: true, running: false, failures: 0, inconclusiveReads: 0, progress: this.backgroundProgressBaseline(id) });
     this.drainBackgroundRecoveries();
+  }
+
+  private backgroundProgressBaseline(id: string): Map<string, WorkerRecoveryProgress> {
+    const progress = new Map<string, WorkerRecoveryProgress>();
+    for (const item of this.projections.get(id)?.filter(item => item.type === "background_task") ?? []) {
+      if (item.type === "background_task") progress.set(item.id, workerRecoveryProgress(item));
+    }
+    return progress;
   }
 
   private syncBackgroundState(id: string): void {
@@ -3811,7 +3996,7 @@ export class ChatAdapter {
     const running = projection.find(item => item.type === "background_task" && !item.foreground && item.status === "running") !== undefined;
     if (running) this.backgroundWork.add(id); else this.backgroundWork.delete(id);
     if (running && !isLiveConversationStatus(projection.status) && projection.status !== "background") projection.statusUpdate("background");
-    else if (!running && projection.status === "background") projection.statusUpdate("completed");
+    else if (!running && projection.status === "background") projection.statusUpdate("completed", undefined, false);
     this.activityMayHaveChanged();
   }
 
@@ -3825,6 +4010,8 @@ export class ChatAdapter {
       this.backgroundRecoveryCount++;
       const generation = this.backgroundStreamGeneration;
       const interactionTick = this.interactionClock;
+      const readProjection = this.projection(id);
+      const fence = readProjection.beginHistoryRead();
       const pending = this.requireSession(id).then(() => {
         if (this.disposed) throw new Error("Background recovery disposed");
         return Promise.all([
@@ -3832,20 +4019,57 @@ export class ChatAdapter {
           Promise.allSettled([this.pendingPermissions(id), this.pendingQuestions(id)]),
         ]);
       }).then(([tasks, interactions]) => {
-        if (this.disposed || recovery.dirty || generation !== this.backgroundStreamGeneration) return;
+        if (this.disposed || this.backgroundRecoveries.get(id) !== recovery || generation !== this.backgroundStreamGeneration) return;
         const projection = this.projection(id);
-        const { byId, supersedes } = indexRecoveredBackgroundTasks(tasks);
+        if (projection !== readProjection || !fence.current() || this.reversibleMutations.has(id) || this.revertReconciliations.has(id)) {
+          recovery.dirty = true;
+          recovery.inconclusiveReads++;
+          recovery.progress = this.backgroundProgressBaseline(id);
+          return;
+        }
+        // A busy source does not invalidate independent facts. Read-lifetime
+        // alias fences include rows added and removed entirely during the read.
+        const safeTasks = tasks.filter(item => !fence.changed(item.id) && !fence.workerChanged(item));
+        // Re-key high-water marks when history resolves a provisional alias;
+        // renaming the same occurrence is not discovery of a new worker.
+        const progressAliases = new Map<string, WorkerRecoveryProgress>();
+        for (const known of projection.filter(item => item.type === "background_task")) {
+          const marker = recovery.progress.get(known.id);
+          if (!marker || known.type !== "background_task") continue;
+          for (const alias of workerRecoveryAliases(known)) progressAliases.set(alias, mergeWorkerRecoveryProgress(progressAliases.get(alias), marker));
+        }
+        let progress = false;
+        for (const item of safeTasks) {
+          const aliases = workerRecoveryAliases(item);
+          let previous = recovery.progress.get(item.id);
+          for (const alias of aliases) {
+            const known = progressAliases.get(alias);
+            if (known) previous = mergeWorkerRecoveryProgress(previous, known);
+          }
+          // An uncertain canonical row can retire a confirmed placeholder.
+          // Transfer its prior evidence before pruning, without advancing it.
+          const marker = item.stateUncertain ? previous : mergeWorkerRecoveryProgress(previous, workerRecoveryProgress(item));
+          if (!marker) continue;
+          if (marker !== previous) progress = true;
+          recovery.progress.set(item.id, marker);
+          for (const alias of aliases) progressAliases.set(alias, mergeWorkerRecoveryProgress(progressAliases.get(alias), marker));
+        }
+        const { byId, supersedes } = indexRecoveredBackgroundTasks(safeTasks);
         for (const known of projection.items()) {
+          if (fence.changed(known.id)) continue;
           if (known.type === "background_task" && supersedes(known)) {
             projection.apply({ kind: "remove", itemId: known.id });
             continue;
           }
           if (known.type === "background_task" && known.status === "running" && !byId.has(known.id)) projection.apply({ kind: "upsert", item: { ...known, stateUncertain: true } });
         }
-        for (const item of tasks) projection.apply({ kind: "upsert", item });
+        for (const item of safeTasks) projection.apply({ kind: "upsert", item });
+        // At most one retained marker per projected worker row, including
+        // omitted rows kept uncertain. No growing retired-identity registry.
+        for (const id of recovery.progress.keys()) if (!projection.has(id)) recovery.progress.delete(id);
         // Inventory recovery must expose already-pending child requests even
         // when no parent is selected. Failed reads are unknown, not empty;
-        // stream generation/dirty fences above also govern these snapshots.
+        // per-item and stream-generation fences also govern these snapshots.
         for (const [index, type] of (["permission", "question"] as const).entries()) {
           if (!(type === "permission" ? this.provider.listPermissions : this.provider.listQuestions)) continue;
           const result = interactions[index]!;
@@ -3853,11 +4077,13 @@ export class ChatAdapter {
           const live = new Set(result.value.map(item => item.id));
           for (const known of projection.items()) {
             if (known.type !== type || known.status !== "pending" || live.has(known.id)
+              || fence.changed(known.id)
               || (this.announced.get(known.id)?.tick ?? 0) > interactionTick) continue;
             projection.apply({ kind: "remove", itemId: known.id });
             this.resolveAnnounced(known.id);
           }
           for (const item of result.value) {
+            if (fence.changed(item.id)) continue;
             if ((item.type === "permission" || item.type === "question") && !this.announced.has(item.id)) {
               this.announced.set(item.id, { owner: item.conversationId ?? id, destination: id, tick: ++this.interactionClock });
             }
@@ -3865,20 +4091,34 @@ export class ChatAdapter {
           }
         }
         this.syncBackgroundState(id);
-        recovery.failures = interactions.some(result => result.status === "rejected") || projection.find(item => item.type === "background_task" && item.status === "running" && item.stateUncertain === true) ? recovery.failures + 1 : 0;
+        recovery.failures = interactions.some(result => result.status === "rejected") ? recovery.failures + 1 : 0;
+        if (progress) recovery.inconclusiveReads = 0;
+        recovery.inconclusiveReads = recovery.dirty || projection.find(item => item.type === "background_task" && item.status === "running" && item.stateUncertain === true) ? recovery.inconclusiveReads + 1 : 0;
       }, () => {
-        if (this.disposed) return;
+        if (this.disposed || this.backgroundRecoveries.get(id) !== recovery || generation !== this.backgroundStreamGeneration) return;
         for (const known of this.projection(id).items()) {
-          if (known.type === "background_task" && known.status === "running") this.projection(id).apply({ kind: "upsert", item: { ...known, stateUncertain: true } });
+          if (known.type === "background_task" && known.status === "running" && !fence.changed(known.id)) this.projection(id).apply({ kind: "upsert", item: { ...known, stateUncertain: true } });
         }
         recovery.failures++;
       }).finally(() => {
+        fence.release();
         this.backgroundPending.delete(pending);
         this.backgroundRecoveryCount--;
         recovery.running = false;
         if (this.disposed) return;
+        if (this.backgroundRecoveries.get(id) !== recovery) { this.drainBackgroundRecoveries(); return; }
+        if (generation !== this.backgroundStreamGeneration) {
+          recovery.failures = 0;
+          recovery.inconclusiveReads = 0;
+          recovery.progress = this.backgroundProgressBaseline(id);
+          recovery.dirty = true;
+        }
         if (recovery.failures) {
           recovery.timer = setTimeout(() => { recovery.timer = undefined; this.drainBackgroundRecoveries(); }, Math.min(30_000, 1_000 * 2 ** Math.min(5, recovery.failures - 1)));
+          recovery.timer.unref?.();
+        } else if (recovery.inconclusiveReads >= BACKGROUND_INCONCLUSIVE_READ_LIMIT) this.backgroundRecoveries.delete(id);
+        else if (recovery.inconclusiveReads) {
+          recovery.timer = setTimeout(() => { recovery.timer = undefined; this.drainBackgroundRecoveries(); }, recovery.dirty ? BACKGROUND_DIRTY_RETRY_MS : 1_000 * 2 ** (recovery.inconclusiveReads - 1));
           recovery.timer.unref?.();
         } else if (!recovery.dirty && generation === this.backgroundStreamGeneration) this.backgroundRecoveries.delete(id);
         this.drainBackgroundRecoveries();
@@ -4280,7 +4520,7 @@ export class ChatAdapter {
       this.projections.set(id, existing);
       return existing;
     }
-    const projection = new ConversationProjection(new ConversationReplay(this.generation, id, this.replayBytes), status => {
+    const projection = new ConversationProjection(new ConversationReplay(this.generation, id, this.replayBytes), (status, sourceTransition) => {
       // `background` is not a live turn: the process is up for the tasks,
       // but the conversation accepts a prompt. Retrying and compacting are.
       const stop = this.stoppingTurns.get(id);
@@ -4296,12 +4536,18 @@ export class ChatAdapter {
       // The conversation settling strands its pending steers (D3);
       // a live turn takes its inbox at its boundaries, so nothing is stranded
       // while one runs.
-      if (status === "idle" || status === "completed" || status === "interrupted") this.settledTurns.set(id, {});
+      if (status === "idle" || status === "completed" || status === "interrupted") this.rememberSettlement(id);
       else if (isLiveConversationStatus(status)) this.settledTurns.delete(id);
       // A turn that ended on its own releases the next held message. Only
       // these two: an interruption leaves the queue dormant by decision, and
       // a failure must not restart a failing conversation by itself.
-      if (status === "idle" || status === "completed") this.scheduleDelivery(id);
+      if (status === "idle" || status === "completed") {
+        if (sourceTransition) {
+          const queue = this.heldQueues.get(id);
+          if (queue) delete queue.awaitingFreshIdle;
+        }
+        this.scheduleDelivery(id);
+      }
       this.publishPausedChanges(id);
       this.activityMayHaveChanged();
     }, {
@@ -4409,13 +4655,19 @@ export class ConversationProjection {
   private readonly text = new ProviderTextReconciler();
   // Only concurrent covered reads retain change fences. No permanent removal
   // tombstones: each owner releases its set on completion, abort or deadline.
-  private readonly historyReads = new Set<Set<string>>();
+  private readonly historyReads = new Set<{ changed: Set<string>; workerAliases: Set<string> }>();
+  private replacementRevision = 0;
 
   beginHistoryRead() {
     const changed = new Set<string>();
-    this.historyReads.add(changed);
+    const workerAliases = new Set<string>();
+    const read = { changed, workerAliases };
+    const revision = this.replacementRevision;
+    this.historyReads.add(read);
     return {
+      current: () => revision === this.replacementRevision,
       changed: (id: string) => changed.has(id),
+      workerChanged: (item: BackgroundTaskItem) => workerRecoveryAliases(item).some(alias => workerAliases.has(alias)),
       merge: (items: ConversationItem[]) => {
         const merged = new Map(items.map(item => [item.id, item]));
         for (const id of changed) {
@@ -4424,19 +4676,37 @@ export class ConversationProjection {
         }
         return [...merged.values()].sort((left, right) => left.createdAt - right.createdAt);
       },
-      release: () => { this.historyReads.delete(changed); },
+      release: () => { this.historyReads.delete(read); },
     };
   }
 
   private historyChanged(id: string): void {
-    for (const read of this.historyReads) read.add(id);
+    for (const read of this.historyReads) read.changed.add(id);
+  }
+
+  private touchWorker(item: ConversationItem | undefined): void {
+    if (item?.type !== "background_task" || !this.historyReads.size) return;
+    const aliases = workerRecoveryAliases(item);
+    for (const read of this.historyReads) for (const alias of aliases) read.workerAliases.add(alias);
+  }
+
+  // Source observation precedes coalescing; direct projection updates use the
+  // same fence below. Sets live only until their owning covered read releases.
+  touchWorkerOccurrences(updates: readonly NormalizedProviderUpdate[]): void {
+    if (!this.historyReads.size) return;
+    for (const update of updates) {
+      if (update.kind === "upsert") {
+        this.touchWorker(this.timeline.get(update.item.id));
+        this.touchWorker(update.item);
+      } else if (update.kind === "remove") this.touchWorker(this.timeline.get(update.itemId));
+    }
   }
 
   constructor(
     readonly replay: ConversationReplay,
     // Every status change flows through statusUpdate, so this single hook is
     // how the adapter keeps its eviction-proof live-turn set accurate.
-    private readonly onStatus?: (status: ConversationStatus) => void,
+    private readonly onStatus?: (status: ConversationStatus, sourceTransition: boolean) => void,
     // Every interaction request's lifecycle, so the adapter can keep an
     // eviction-proof record of what awaits the user.
     private readonly interactions?: ProjectionInteractionHooks,
@@ -4481,6 +4751,7 @@ export class ConversationProjection {
   }
 
   replace(items: ConversationItem[]): ChatEvent {
+    this.replacementRevision++;
     for (const id of this.timeline.keys()) this.historyChanged(id);
     for (const item of items) this.historyChanged(item.id);
     this.timeline.clear();
@@ -4493,6 +4764,7 @@ export class ConversationProjection {
   apply(update: NormalizedProviderUpdate): ChatEvent | undefined {
     if (update.kind === "upsert") return this.upsert(update.item);
     if (update.kind === "remove") {
+      this.touchWorker(this.timeline.get(update.itemId));
       this.historyChanged(update.itemId);
       this.timeline.delete(update.itemId);
       this.interactions?.settled(update.itemId);
@@ -4550,6 +4822,8 @@ export class ConversationProjection {
   upsert(item: ConversationItem): ChatEvent | undefined {
     const current = this.timeline.get(item.id);
     const merged = mergeInteraction(current, item);
+    this.touchWorker(current);
+    this.touchWorker(merged);
     // A settled request clears the adapter's record even when the frame is
     // dropped below for lack of content: that record outlives eviction, and a
     // recreated projection may see nothing of the request but its resolution.
@@ -4574,9 +4848,9 @@ export class ConversationProjection {
     return this.replay.publish({ type: "item.upsert", item: merged });
   }
 
-  statusUpdate(status: ConversationStatus, message?: string): ChatEvent {
+  statusUpdate(status: ConversationStatus, message?: string, sourceTransition = true): ChatEvent {
     this.status = status;
-    this.onStatus?.(status);
+    this.onStatus?.(status, sourceTransition);
     return this.replay.publish({ type: "conversation.status", status, message });
   }
 

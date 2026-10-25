@@ -493,6 +493,11 @@ export class FakeE2EChatService implements WorkspaceChatService {
     return result;
   }
 
+  async discardUnconfirmedSteer(id: string, _messageId: string, _requestId: string, _uncertaintyId: string): Promise<{ discarded: true; outcomeUnconfirmed: true }> {
+    this.require(id);
+    throw new QueuedMessageNotHeldError();
+  }
+
   async removeQueued(id: string, messageId: string, requestId: string): Promise<{ removed: true }> {
     const key = `unqueue:${id}:${requestId}`;
     const existing = this.receipts.get(key) as { removed: true } | undefined;

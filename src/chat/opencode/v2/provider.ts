@@ -21,8 +21,8 @@ import type {
   StoredMessageAccounting,
 } from "../../provider";
 import { pendingPermissionFields } from "../normalization";
-import { BackgroundWorkers } from "./background";
-import { createOpenCodeV2Memory, createOpenCodeV2Normalizer, formPresentation, modelSelection, normalizeStoredMessage, pendingInboxEntry, storedAccounting, storedPromptId, supportedFormFields } from "./normalization";
+import { BackgroundControls, BackgroundWorkers, launcherChanged, retainLauncherEvidence, sameLauncherIdentity, type ControlRead, type LauncherEvidence, type WorkerOccurrenceEvidence } from "./background";
+import { createOpenCodeV2Memory, createOpenCodeV2Normalizer, formPresentation, modelSelection, normalizeStoredMessage, pendingInboxEntry, prepareStoredMessage, storedAccounting, storedPromptId, supportedFormFields, type V2Evidence } from "./normalization";
 import type { ChatAccountChange, ChatAgent, ChatCommand, ChatLoginState, ChatMode, ChatModel, ConversationConfiguration, MessageDelivery, ModelSelection, RestoredDraft, ReversibleHistoryResult, ReversibleHistoryState } from "../../types";
 import { TASK_OUTPUT_TAIL_MAX_BYTES } from "../../types";
 
@@ -39,6 +39,19 @@ type StoredMessage = Record<string, unknown>;
 type SessionRecord = Record<string, unknown>;
 type ReversibleTurn = { id: string; providerId: string; draft: RestoredDraft; summary: string };
 type ReversibleHistoryContext = { turns: ReversibleTurn[]; boundaryIndex?: number; state: ReversibleHistoryState };
+type StopValidation = {
+  parent: string; taskId: string; child?: string; changed: boolean;
+  launchCalls?: readonly string[];
+  pendingChanges: Set<string>;
+  pendingLaunches: Map<string, { child?: string; call?: string; background?: boolean; selectedOnly?: boolean; evidence?: LauncherEvidence }>;
+  occurrence?: WorkerOccurrenceEvidence;
+  pendingChangeBytes: number;
+  pendingLaunchBytes: number;
+  pendingBytes: number;
+};
+type OwnershipCheck = { child: string; parent: string; changed: boolean };
+type ControlBasis = { basis: WorkerOccurrenceEvidence; revision: number };
+type BackgroundSnapshot = { tasks: import("../../types").BackgroundTaskItem[]; occurrences: ReadonlyMap<string, WorkerOccurrenceEvidence>; controls: ReadonlyMap<string, ControlBasis> };
 
 export function createOpenCodeV2Provider(options: {
   endpoint: string;
@@ -59,9 +72,20 @@ export function createOpenCodeV2Provider(options: {
 
 export class OpenCodeV2Provider implements ChatProvider {
   private readonly historyReuse = new HistoryReuse<StoredMessage[]>();
+  // Only verified, workspace-confined parentage is reusable; never session
+  // status, cost, timestamps, or failed checks. Match the live worker budget.
+  private readonly childParents = new HistoryReuse<readonly [string, string]>(4 * 1024 * 1024, 8_192);
+  // Provider-wide admission, including recovery and final Stop validation.
+  // Timed-out wrappers do not free slots held by an uncooperative transport.
+  private childLookupsOutstanding = 0;
+  // Only in-flight read-side authorizations, never a retained event ledger.
+  private readonly stopValidations = new Set<StopValidation>();
+  private readonly ownershipChecks = new Set<OwnershipCheck>();
   private readonly readLifetime = new AbortController();
   private streamReads?: AbortController;
-  private readonly backgroundReads = new Map<string, Promise<import("../../types").BackgroundTaskItem[]>>();
+  private readonly backgroundReads = new Map<string, Promise<BackgroundSnapshot>>();
+  private readonly controls = new BackgroundControls({ changed: () => this.eventMemory?.workers.enforceBudget() });
+  private eventMemory?: ReturnType<typeof createOpenCodeV2Memory>;
   private readonly notificationLifecycle = new OpenCodeNotificationLifecycle();
   // How many models the last catalog read offered; null before the first.
   private offeredModels: number | null = null;
@@ -321,19 +345,13 @@ export class OpenCodeV2Provider implements ChatProvider {
    * record either).
    */
   async listMessages(sessionId: string, options: { cursor?: string; limit: number; signal?: AbortSignal }): Promise<ProviderHistoryPage> {
+    const controlRead = this.beginControlRead(sessionId);
+    let completeRead = false;
+    try {
     const signal = this.readSignal(options.signal);
-    const complete = await this.allMessages(sessionId, signal);
-    const info = await this.lookupSession(sessionId, signal);
-    const boundaryId = stringValue(asRecord(asRecord(info).revert).messageID);
-    const boundaryIndex = boundaryId ? complete.findIndex(message => messageIdentity(message) === boundaryId) : -1;
-    const visible = boundaryIndex >= 0 ? complete.slice(0, boundaryIndex) : complete;
-    const version = historyVersion([visible, boundaryId]);
-    const end = historyPageEnd(options.cursor, version, visible.length);
+    const { complete, info, boundaryId, visible, normalized, excludedItemIds, version, end } = await this.readHistoryVisibility(sessionId, signal, controlRead, options.cursor);
     const start = Math.max(0, end - Math.max(1, options.limit));
     const page = visible.slice(start, end);
-    const normalized = await this.backgroundHistory(sessionId, visible, signal);
-    const allNormalized = boundaryIndex >= 0 ? await this.backgroundHistory(sessionId, complete, signal) : normalized;
-    const excludedItemIds = [...allNormalized.keys()].filter(id => !normalized.has(id));
     const reversible = reversibleContext(complete, info);
     signal.throwIfAborted();
     const liveLaunches = new Set([...normalized.values()].flatMap(({ item }) => item.type === "background_task" && item.status === "running"
@@ -347,6 +365,7 @@ export class OpenCodeV2Provider implements ChatProvider {
       const reported = storedAccounting(message);
       if (reported) accounting.push(newestPrompt === undefined ? reported : { ...reported, promptId: newestPrompt });
     }
+    completeRead = true;
     return {
       items: [...normalized.values()].filter(({ item, index }) => index >= start && index < end
         || options.cursor === undefined && (item.type === "background_task" && item.status === "running" || liveLaunches.has(item.id))).map(({ item }) => item),
@@ -357,6 +376,22 @@ export class OpenCodeV2Provider implements ChatProvider {
       ...(boundaryId ? { deliveryHistoryIncomplete: true as const } : {}),
       nextCursor: historyPageCursor(start, version),
     };
+    } finally { this.controls.endRead(controlRead, completeRead); }
+  }
+
+  private async readHistoryVisibility(sessionId: string, signal: AbortSignal, controlRead: ControlRead, cursor?: string) {
+    const complete = await this.allMessages(sessionId, signal);
+    const info = await this.lookupSession(sessionId, signal);
+    const boundaryId = stringValue(asRecord(asRecord(info).revert).messageID);
+    const boundaryIndex = boundaryId ? complete.findIndex(message => messageIdentity(message) === boundaryId) : -1;
+    const visible = boundaryIndex >= 0 ? complete.slice(0, boundaryIndex) : complete;
+    const version = historyVersion([visible, boundaryId]);
+    const end = historyPageEnd(cursor, version, visible.length);
+    const normalized = await this.backgroundHistory(sessionId, visible, signal, controlRead);
+    const allNormalized = boundaryIndex >= 0 ? await this.backgroundHistory(sessionId, complete, signal, controlRead) : normalized;
+    const excludedItemIds = [...allNormalized.keys()].filter(id => !normalized.has(id));
+    signal.throwIfAborted();
+    return { complete, info, boundaryId, visible, normalized, allNormalized, excludedItemIds, version, end };
   }
 
   async getHistoryRevertBoundary(sessionId: string, options: { signal: AbortSignal; expectedBoundary?: string | null }): Promise<string | null> {
@@ -367,26 +402,31 @@ export class OpenCodeV2Provider implements ChatProvider {
     return boundary;
   }
 
-  private async backgroundHistory(sessionId: string, visible: StoredMessage[], signal = this.readSignal()) {
+  private async backgroundHistory(sessionId: string, visible: StoredMessage[], signal = this.readSignal(), controlRead?: ControlRead, overlay = true) {
+    signal = AbortSignal.any([signal, AbortSignal.timeout(5_000)]);
     // A finite complete-history fold is discarded after this read; only
     // long-lived stream memory uses the retention budget/fallback.
     const workers = new BackgroundWorkers({ entries: Infinity, bytes: Infinity });
     const unavailableChildren = new Set<string>();
     // Only scoped session records establish child ownership. Tool metadata
     // supplies an identity to verify, never permission to read a foreign child.
-    const children = new Set(visible.flatMap(message => message.type === "synthetic" && asRecord(message.metadata).source === "subagent"
-      ? [stringValue(asRecord(message.metadata).childID)].filter((id): id is string => !!id) : Array.isArray(message.content)
-      ? message.content.flatMap(part => {
-        const child = stringValue(asRecord(asRecord(asRecord(part).state).metadata).sessionID);
+    const prepared = visible.map(prepareStoredMessage);
+    const children = new Set(prepared.flatMap(message => message.notificationChild ? [message.notificationChild] : [...message.tools.values()].flatMap(tool => {
+        const child = tool.fact.reportedChild;
+        const call = tool.fact.call;
+        // Bind identity before the execution-history await, not ownership:
+        // scoped session verification below still authorizes all reads.
+        if (child && call) for (const validation of this.stopValidations) {
+          if (validation.parent === sessionId && validation.taskId === `v2:${sessionId}:${call}`) this.bindStopChild(validation, child);
+        }
         return child ? [child] : [];
-      }) : []));
-    for (const child of children) {
-      const session = await this.lookupSession(child, signal);
-      if (session?.parentID !== sessionId) continue;
+      })));
+    const verified = new Set<string>();
+    await this.verifyChildren(children, sessionId, signal, child => verified.add(child));
+    for (const child of verified) {
       workers.verifyChild(child, sessionId);
-      const launches = visible.flatMap(message => Array.isArray(message.content) ? message.content : [])
-        .filter(part => asRecord(asRecord(asRecord(part).state).metadata).sessionID === child);
-      if (launches.length > 1 || launches.some(part => asRecord(asRecord(part).state).status === "completed" && asRecord(asRecord(asRecord(part).state).metadata).status === "running")) {
+      const launches = prepared.flatMap(message => [...message.tools.values()]).filter(tool => tool.fact.reportedChild === child);
+      if (launches.length > 1 || launches.some(tool => tool.fact.background === true)) {
         // An idle record is an execution boundary, not a worker report. It
         // constrains old-task authorization even before a newer foreground
         // launcher completes (or when another client continued the child).
@@ -398,9 +438,10 @@ export class OpenCodeV2Provider implements ChatProvider {
         } catch { unavailableChildren.add(child); }
       }
     }
+    signal.throwIfAborted();
     const normalized = new Map<string, { item: import("../../types").ConversationItem; index: number }>();
     visible.forEach((message, index) => {
-      for (const item of normalizeStoredMessage(message, true, { workers, parent: sessionId })) {
+      for (const item of normalizeStoredMessage(message, true, { workers, parent: sessionId }, prepared[index])) {
         // The stored-message seam returns items rather than remove operations.
         // Retire the notification-first placeholder as soon as the same
         // provider result has acquired its canonical launch identity.
@@ -413,16 +454,101 @@ export class OpenCodeV2Provider implements ChatProvider {
           ? { ...item, stateUncertain: true } : item, index });
       }
     });
-    return normalized;
+    if (overlay) for (const [id, entry] of normalized) if (entry.item.type === "background_task") normalized.set(id, { ...entry,
+      item: this.controls.project(entry.item, workers.occurrence(entry.item.taskId), controlRead, workers.controlWitnesses(entry.item.taskId)) });
+    this.eventMemory?.workers.enforceBudget();
+    return Object.assign(normalized, { occurrences: workers.evidenceSnapshot(), workers });
   }
 
-  reconcileBackgroundTasks(sessionId: string, options?: { fresh?: boolean; signal?: AbortSignal }): Promise<import("../../types").BackgroundTaskItem[]> {
+  async reconcileBackgroundTasks(sessionId: string, options?: { fresh?: boolean; signal?: AbortSignal }): Promise<import("../../types").BackgroundTaskItem[]> {
+    const signal = this.readSignal(AbortSignal.any([AbortSignal.timeout(5_000), ...(options?.signal ? [options.signal] : [])]));
+    const generation = this.streamGeneration;
+    // Stop still reads the complete private snapshot, including hidden native
+    // occurrences and their negative/control evidence. Only this public view
+    // uses the same exact exclusions and alias fold as transcript recovery.
+    const snapshot = await this.coveredRead(signal, () => this.backgroundSnapshot(sessionId, { ...options, signal }));
+    const initialBoundary = await this.coveredRead(signal, () => this.getHistoryRevertBoundary(sessionId, { signal }));
+    signal.throwIfAborted();
+    if (generation !== this.streamGeneration) throw new Error("Background visibility changed during recovery");
+    const copy = (item: import("../../types").BackgroundTaskItem) => ({ ...item, ...(item.toolUseIds ? { toolUseIds: [...item.toolUseIds] } : {}) });
+    if (initialBoundary === null || snapshot.tasks.length === 0) return snapshot.tasks.map(copy);
+    const controlRead = this.beginControlRead(sessionId);
+    let completeRead = false;
+    try {
+      const { boundaryId, normalized, allNormalized, excludedItemIds } = await this.coveredRead(signal, () => this.readHistoryVisibility(sessionId, signal, controlRead));
+      signal.throwIfAborted();
+      if (generation !== this.streamGeneration || initialBoundary !== boundaryId) throw new Error("Background visibility changed during recovery");
+      const excluded = new Set(excludedItemIds);
+      const tasks = snapshot.tasks.filter(task => !excluded.has(task.id)).map(task => {
+        const prefix = normalized.get(task.id)?.item;
+        // Failed/partial ownership coverage is not permission to republish an
+        // unclassified private row while native history is staged.
+        if (prefix?.type !== "background_task") throw new Error("Background visibility unavailable");
+        const fullOccurrence = snapshot.occurrences.get(task.taskId), visibleOccurrence = normalized.occurrences.get(task.taskId);
+        // Preserve newer pending/live results for an exactly retained native
+        // invocation. A reused id or folded hidden alias instead takes only
+        // its visible prefix; neither path changes the full private basis.
+        const sameOccurrence = fullOccurrence && visibleOccurrence && fullOccurrence.parent === visibleOccurrence.parent
+          && fullOccurrence.worker === visibleOccurrence.worker && fullOccurrence.kind === visibleOccurrence.kind
+          && fullOccurrence.launches.length === visibleOccurrence.launches.length
+          && fullOccurrence.launches.every(launch => visibleOccurrence.launches.some(visible => sameLauncherIdentity(launch, visible)));
+        const item = sameOccurrence && !(task.status === "running" && prefix.status !== "running") ? task : prefix;
+        const projected = item.status === "running" && sameOccurrence && (task.stateUncertain || prefix.stateUncertain)
+          ? { ...item, stateUncertain: true } : item;
+        // The complete fold may have revoked this prefix's control after its
+        // first projection. Respect that evidence without changing its basis.
+        return copy(this.controls.project(projected, visibleOccurrence, controlRead, normalized.workers.controlWitnesses(task.taskId)));
+      });
+      // History authority excludes transcript rows, not an independently live
+      // detached invocation. Its complete native identity must still match;
+      // current native state alone never restores a missing/revoked Stop basis.
+      const live: Array<{ item: import("../../types").BackgroundTaskItem; proof?: ControlBasis }> = [];
+      let active: Awaited<ReturnType<OpenCodeV2Client["session"]["active"]>> | undefined;
+      for (const task of snapshot.tasks) {
+        if (!excluded.has(task.id) || task.status !== "running" || task.foreground) continue;
+        const occurrence = snapshot.occurrences.get(task.taskId), currentOccurrence = allNormalized.occurrences.get(task.taskId);
+        const canonical = allNormalized.get(task.id)?.item, proof = snapshot.controls.get(task.taskId), current = this.controls.proof(task.taskId);
+        if (!occurrence || occurrence.uncertain || !currentOccurrence || currentOccurrence.uncertain
+          || canonical?.type !== "background_task" || canonical.status !== "running"
+          || occurrence.parent !== currentOccurrence.parent || occurrence.worker !== currentOccurrence.worker || occurrence.kind !== currentOccurrence.kind
+          || occurrence.launches.length !== currentOccurrence.launches.length
+          || !occurrence.launches.every(launch => currentOccurrence.launches.some(candidate => sameLauncherIdentity(launch, candidate)))) continue;
+        let confirmed = false;
+        if (task.taskType === "agent" && task.childConversationId === occurrence.worker) {
+          const child = await this.lookupChild(occurrence.worker, signal);
+          if (child?.parentID !== sessionId) throw new Error("Background visibility ownership unavailable");
+          active ??= await this.coveredRead(signal, () => this.client.session.active({ signal }));
+          confirmed = active[occurrence.worker] !== undefined;
+        } else if (task.taskType === "shell" && task.outputFile === `shell:${occurrence.worker}`) {
+          const shell = await this.coveredRead(signal, () => this.client.shell.get({ id: occurrence.worker, ...this.scope }, { signal }));
+          confirmed = shell.data.metadata.sessionID === sessionId;
+        }
+        signal.throwIfAborted();
+        // Visibility is not authorization. A gap/revocation can leave a known
+        // native worker inspectable, but must never recreate its Stop proof.
+        live.push({ item: { ...task, stateUncertain: !confirmed || canonical.stateUncertain === true || !proof || !current
+          || current.basis !== proof.basis || current.revision !== proof.revision }, proof });
+      }
+      const boundary = await this.coveredRead(signal, () => this.getHistoryRevertBoundary(sessionId, { signal, expectedBoundary: boundaryId ?? null }));
+      signal.throwIfAborted();
+      if (generation !== this.streamGeneration || boundary !== boundaryId) throw new Error("Background visibility changed during recovery");
+      for (const { item, proof } of live) {
+        const current = this.controls.proof(item.taskId);
+        tasks.push(copy(proof && current?.basis === proof.basis && current.revision === proof.revision ? item : { ...item, stateUncertain: true }));
+      }
+      completeRead = true;
+      return tasks;
+    } finally { this.controls.endRead(controlRead, completeRead); }
+  }
+
+  private backgroundSnapshot(sessionId: string, options?: { fresh?: boolean; signal?: AbortSignal }): Promise<BackgroundSnapshot> {
     if (options?.fresh) {
       const read = () => {
         // An older in-flight inventory is not post-action evidence. Invalidate
         // reuse (including child execution boundaries) before the new read.
+        options.signal?.throwIfAborted();
         this.historyReuse.invalidate();
-        return this.reconcileBackgroundTasks(sessionId, { signal: options.signal });
+        return this.backgroundSnapshot(sessionId, { signal: options.signal });
       };
       const previous = this.backgroundReads.get(sessionId);
       return previous ? previous.catch(() => undefined).then(read) : read();
@@ -433,7 +559,13 @@ export class OpenCodeV2Provider implements ChatProvider {
     const signal = this.readSignal(AbortSignal.any([lifetime.signal, ...(options?.signal ? [options.signal] : [])]));
     if (signal.aborted) return Promise.reject(new Error("Background recovery unavailable"));
     const timer = setTimeout(() => lifetime.abort(), 5_000);
-    const read = this.coveredRead(signal, () => this.readBackgroundTasks(sessionId, signal)).finally(() => {
+    const controlRead = this.beginControlRead(sessionId);
+    let completeRead = false;
+    const read = this.coveredRead(signal, () => this.readBackgroundTasks(sessionId, signal, controlRead)).then(snapshot => {
+      completeRead = true;
+      return snapshot;
+    }).finally(() => {
+      this.controls.endRead(controlRead, completeRead);
       clearTimeout(timer);
       lifetime.abort();
       if (this.backgroundReads.get(sessionId) === read) this.backgroundReads.delete(sessionId);
@@ -442,7 +574,7 @@ export class OpenCodeV2Provider implements ChatProvider {
     return read;
   }
 
-  private async readBackgroundTasks(sessionId: string, signal: AbortSignal): Promise<import("../../types").BackgroundTaskItem[]> {
+  private async readBackgroundTasks(sessionId: string, signal: AbortSignal, controlRead: ControlRead): Promise<BackgroundSnapshot> {
     if (!await this.lookupSession(sessionId, signal)) throw new Error("Background parent is unavailable");
     const [history, pending, active] = await Promise.all([
       this.allMessages(sessionId, signal),
@@ -452,7 +584,7 @@ export class OpenCodeV2Provider implements ChatProvider {
     const stored = new Set(history.map(message => message.id));
     const notifications = (pending as unknown as StoredMessage[]).filter(entry => entry.type === "synthetic" && !stored.has(entry.id))
       .map(entry => ({ ...asRecord(entry.payload), id: entry.id, type: "synthetic", time: entry.time }));
-    const folded = await this.backgroundHistory(sessionId, [...history, ...notifications], signal);
+    const folded = await this.backgroundHistory(sessionId, [...history, ...notifications], signal, controlRead, false);
     const tasks: import("../../types").BackgroundTaskItem[] = [];
     for (const { item } of folded.values()) {
       if (item.type !== "background_task") continue;
@@ -467,11 +599,265 @@ export class OpenCodeV2Provider implements ChatProvider {
       tasks.push({ ...item, stateUncertain: item.stateUncertain === true || !confirmed });
     }
     signal.throwIfAborted();
-    return tasks;
+    const projected = tasks.map(item => this.controls.project(item, folded.occurrences.get(item.taskId), controlRead, folded.workers.controlWitnesses(item.taskId)));
+    this.eventMemory?.workers.enforceBudget();
+    return { tasks: projected, occurrences: folded.occurrences, controls: new Map(projected.flatMap(item => {
+      const proof = this.controls.proof(item.taskId);
+      return proof ? [[item.taskId, proof] as const] : [];
+    })) };
+  }
+
+  private beginControlRead(parent: string): ControlRead {
+    const read = this.controls.beginRead(parent, this.controls.activeReads + this.ownershipChecks.size < 16, this.streamConnected);
+    this.eventMemory?.workers.enforceBudget();
+    return read;
   }
 
   private readSignal(signal?: AbortSignal): AbortSignal {
     return AbortSignal.any([this.readLifetime.signal, ...(this.streamReads ? [this.streamReads.signal] : []), ...(signal ? [signal] : [])]);
+  }
+
+  private invalidateChildParents(): void {
+    this.childParents.invalidate();
+  }
+
+  private bindStopChild(validation: StopValidation, child: string): void {
+    if (validation.child && validation.child !== child || validation.pendingChanges.has(child)) validation.changed = true;
+    validation.child = child;
+    validation.pendingChanges.clear();
+    validation.pendingBytes -= validation.pendingChangeBytes;
+    validation.pendingChangeBytes = 0;
+    for (const [key, launch] of validation.pendingLaunches) {
+      if (launch.child !== child && validation.occurrence && validation.launchCalls && !this.selectedStopCall(validation, launch.call)) {
+        const bytes = JSON.stringify([key, launch]).length * 2 + (validation.pendingLaunches.size > 1 ? 2 : 0);
+        validation.pendingLaunches.delete(key);
+        validation.pendingLaunchBytes -= bytes;
+        validation.pendingBytes -= bytes;
+      }
+    }
+    this.refreshStopBytes(validation);
+  }
+
+  private bindStopTask(validation: StopValidation, task: import("../../types").BackgroundTaskItem, occurrence?: WorkerOccurrenceEvidence, authoritative = false): void {
+    if (occurrence && (validation.occurrence || authoritative)) {
+      if (validation.occurrence && occurrence.launches.some(fact => launcherChanged(fact, validation.occurrence))) validation.changed = true;
+      // Freeze the first occurrence, never replace it with a later read/fold.
+      validation.occurrence ??= occurrence;
+      const additional = occurrence.launches.filter(fact => !validation.occurrence!.launches.some(prior => prior.call === fact.call));
+      if (additional.length) validation.occurrence = Object.freeze({ ...validation.occurrence, launches: Object.freeze([...validation.occurrence.launches, ...additional]) });
+      if (occurrence.uncertain) validation.changed = true;
+    }
+    validation.launchCalls = (validation.occurrence ?? occurrence)?.launches.map(launch => launch.call)
+      ?? (task.toolUseIds ? [...task.toolUseIds] : task.toolUseId ? [task.toolUseId] : []);
+    this.refreshStopBytes(validation);
+    if (task.childConversationId) this.bindStopChild(validation, task.childConversationId);
+    // A restated alias of this same occurrence is not a replacement launch.
+    // Only the provider's folded aliases establish that equivalence.
+    if (this.stopLaunchChanged(validation)) validation.changed = true;
+    // Until fresh recovery binds the selected occurrence, a stream row may
+    // already describe its replacement. Keep candidates for that comparison.
+    if (validation.occurrence || authoritative) this.clearStopEvidence(validation);
+    else this.refreshStopBytes(validation);
+  }
+
+  private stopLaunchChanged(validation: StopValidation): boolean {
+    return [...validation.pendingLaunches.values()].some(launch => launch.evidence && launcherChanged(launch.evidence, validation.occurrence)
+      || !!validation.child && (this.selectedStopCall(validation, launch.call)
+        ? launch.child !== validation.child || launch.background === false
+        : !launch.selectedOnly && !!validation.launchCalls && launch.child === validation.child));
+  }
+
+  private selectedStopCall(validation: StopValidation, call?: string): boolean {
+    return `v2:${validation.parent}:${call}` === validation.taskId || !!validation.launchCalls?.includes(call ?? "");
+  }
+
+  private clearStopEvidence(validation: StopValidation): void {
+    validation.pendingChanges.clear();
+    validation.pendingLaunches.clear();
+    validation.pendingChangeBytes = 0;
+    validation.pendingLaunchBytes = 0;
+    this.refreshStopBytes(validation);
+  }
+
+  private refreshStopBytes(validation: StopValidation): void {
+    // Exact logical retained payload, not JavaScript heap usage. Include the
+    // frozen baseline, aliases, identities, latch and every candidate field.
+    const base = () => JSON.stringify([validation.parent, validation.taskId, validation.child ?? null, validation.launchCalls ?? null, validation.occurrence ?? null, validation.changed, [], []]).length * 2;
+    validation.pendingBytes = base() + validation.pendingChangeBytes + validation.pendingLaunchBytes;
+    if (validation.pendingBytes <= 1024 * 1024 && this.stopEvidenceEntries(validation) <= 2_048) return;
+    validation.changed = true;
+    validation.occurrence = undefined;
+    validation.launchCalls = undefined;
+    validation.pendingChanges.clear(); validation.pendingLaunches.clear();
+    validation.pendingChangeBytes = validation.pendingLaunchBytes = 0;
+    validation.pendingBytes = base();
+  }
+
+  private stopEvidenceEntries(validation: StopValidation): number {
+    return validation.pendingChanges.size + validation.pendingLaunches.size + (validation.launchCalls?.length ?? 0) + (validation.occurrence?.launches.length ?? 0);
+  }
+
+  private revokeStop(validation: StopValidation): void { validation.changed = true; this.refreshStopBytes(validation); }
+
+  private reserveStopEvidence(validation: StopValidation, bytes: number, entries = 1): boolean {
+    // Four validations together stay within 8,192 entries / 4 MiB; overflow
+    // refuses authorization instead of forgetting a potentially relevant fact.
+    // The base above accounts identities, frozen occurrence, aliases and latch;
+    // candidates add their complete UTF-16 JSON entries and array separators.
+    // Each write accounts one complete entry plus its array separator.
+    if (this.stopEvidenceEntries(validation) + entries > 2_048 || validation.pendingBytes + bytes > 1024 * 1024) {
+      validation.changed = true;
+      this.clearStopEvidence(validation);
+      return false;
+    }
+    validation.pendingBytes += bytes;
+    return true;
+  }
+
+  private noteStopChange(validation: StopValidation, child: unknown): void {
+    if (validation.changed || typeof child !== "string" || !child || child.length > 512) return;
+    if (validation.child) { if (validation.child === child) this.revokeStop(validation); return; }
+    if (validation.pendingChanges.has(child)) return;
+    const bytes = JSON.stringify(child).length * 2 + (validation.pendingChanges.size ? 2 : 0);
+    // Before history identifies the child, retain candidate identities only.
+    if (!this.reserveStopEvidence(validation, bytes)) return;
+    validation.pendingChanges.add(child);
+    validation.pendingChangeBytes += bytes;
+  }
+
+  private noteStopLaunch(validation: StopValidation, child: unknown, call: unknown, background?: boolean, selectedOnly?: boolean, evidence?: LauncherEvidence): void {
+    if (validation.changed) return;
+    if (evidence?.historical) return;
+    if (evidence && launcherChanged(evidence, validation.occurrence)) { this.revokeStop(validation); return; }
+    const callId = typeof call === "string" && call.length <= 512 ? call : undefined;
+    const selected = this.selectedStopCall(validation, callId);
+    if (selected && background === false) { this.revokeStop(validation); return; }
+    if (selected && validation.child && typeof child === "string" && child !== validation.child) { this.revokeStop(validation); return; }
+    const childId = typeof child === "string" && child.length > 0 && child.length <= 512 ? child : undefined;
+    // A foreground restatement can omit the child. Retain its call identity
+    // until the authoritative fold tells us whether it is a selected alias.
+    if (!childId && (background !== false || !callId)) return;
+    if (validation.child) {
+      if (selected) {
+        if (childId !== validation.child || background === false) this.revokeStop(validation);
+        if (validation.occurrence?.launches.some(launch => launch.call === callId)) return;
+      }
+      if (validation.launchCalls && childId !== validation.child) return;
+    }
+    const key = JSON.stringify([childId, callId]);
+    const previous = validation.pendingLaunches.get(key);
+    const next = { child: childId, call: callId, background: previous?.background === false ? false : background ?? previous?.background,
+      selectedOnly: previous && !previous.selectedOnly ? undefined : selectedOnly,
+      evidence: evidence ? retainLauncherEvidence(previous?.evidence, { ...evidence, child: undefined, reportedChild: undefined, requestedChild: undefined, background: undefined, selectedOnly: undefined }) : previous?.evidence };
+    if (previous && JSON.stringify(previous) === JSON.stringify(next)) return;
+    const bytes = JSON.stringify([key, next]).length * 2 - (previous ? JSON.stringify([key, previous]).length * 2 : 0)
+      + (!previous && validation.pendingLaunches.size ? 2 : 0);
+    if (!this.reserveStopEvidence(validation, bytes, previous ? 0 : 1)) return;
+    validation.pendingLaunches.set(key, next);
+    validation.pendingLaunchBytes += bytes;
+  }
+
+  private observeStopEvent(evidence: V2Evidence): void {
+    if (this.stopValidations.size === 0 && this.ownershipChecks.size === 0) return;
+    const location = evidence.directory, parent = evidence.session;
+    const shutdown = evidence.shutdown && (!location || path.resolve(location) === this.workspace);
+    const lifecycle = evidence.lifecycle?.kind === "session.created" && this.controls.historical("created", evidence.lifecycle.proof) ? undefined : evidence.lifecycle;
+    // Cache eviction is global and conservative; authorization revocation is
+    // about the selected parent/child, even when its new location is foreign.
+    for (const check of this.ownershipChecks) {
+      if (shutdown || lifecycle && (lifecycle.id === check.parent || lifecycle.id === check.child)) check.changed = true;
+    }
+    for (const validation of this.stopValidations) {
+      if (shutdown || lifecycle && lifecycle.id === validation.parent) this.revokeStop(validation);
+      else if (lifecycle) this.noteStopChange(validation, lifecycle.id);
+    }
+    if (this.stopValidations.size === 0 || location && path.resolve(location) !== this.workspace) return;
+    for (const validation of this.stopValidations) {
+      if (evidence.execution && !evidence.execution.historical) this.noteStopChange(validation, parent);
+      if (parent !== validation.parent) continue;
+      if (evidence.notification && !evidence.notification.historical) this.noteStopChange(validation, evidence.notification.child);
+      for (const reference of evidence.launchers) {
+        if (reference.child || !reference.requestedChild) this.noteStopLaunch(validation, reference.child, reference.call, reference.background, reference.selectedOnly, reference);
+        if (reference.requestedChild && reference.requestedChild !== reference.child) this.noteStopLaunch(validation, reference.requestedChild, reference.call, reference.background, reference.requestedSelectedOnly, reference);
+      }
+    }
+  }
+
+  private observeStopWorkerUpdates(event: NormalizedProviderEvent, memory: ReturnType<typeof createOpenCodeV2Memory>): void {
+    for (const validation of this.stopValidations) {
+      if (event.conversationId !== validation.parent) continue;
+      for (const update of event.updates) {
+        if (update.kind !== "upsert" || update.item.type !== "background_task") continue;
+        const item = update.item;
+        if (item.taskId === validation.taskId) this.bindStopTask(validation, item, memory.workers.occurrence(item.taskId));
+        if (item.taskId === validation.taskId && (item.status !== "running" || item.stateUncertain)) this.revokeStop(validation);
+        // A cold stream can discover an alias before recovery finds its first
+        // launcher. Compare the retained facts after canonical identity binds.
+        if (validation.occurrence && validation.child && item.childConversationId === validation.child && item.taskId !== validation.taskId) {
+          const candidate = memory.workers.occurrence(item.taskId), basis = validation.occurrence;
+          const provenAlias = candidate && candidate.parent === basis.parent && candidate.worker === basis.worker && candidate.kind === basis.kind
+            && candidate.launches.length > 0 && candidate.launches.every(fact => basis.launches.some(prior => prior.call === fact.call
+            && prior.message !== undefined && fact.message === prior.message && prior.workerType === fact.workerType) && !launcherChanged(fact, basis));
+          if (!provenAlias) this.revokeStop(validation);
+        }
+      }
+    }
+  }
+
+  private lookupChild(sessionId: string, signal: AbortSignal): Promise<SessionRecord | null> {
+    signal.throwIfAborted();
+    // No pending queue: at capacity the stream preserves unrelated parts and
+    // history recovery reports unavailable until a real read settles.
+    if (this.childLookupsOutstanding >= 4) throw new Error("Child ownership lookup capacity unavailable");
+    this.childLookupsOutstanding++;
+    const read = this.lookupSession(sessionId, signal).finally(() => { this.childLookupsOutstanding--; });
+    // The actual SDK request owns the slot across deadline, reconnect, and
+    // disposal. Observe late rejection even if its caller already retired.
+    void read.catch(() => undefined);
+    return this.coveredRead(signal, () => read);
+  }
+
+  private async verifiedChild(child: string, parent: string, signal: AbortSignal): Promise<boolean> {
+    if (child.length > 512 || parent.length > 512) return false;
+    // Four recovery batches of four readers; no pending guard queue. These
+    // scoped guards retire with their wrappers, not the underlying I/O slots.
+    if (this.ownershipChecks.size + this.controls.activeReads >= 16) throw new Error("Child ownership check capacity unavailable");
+    const check: OwnershipCheck = { child, parent, changed: false };
+    this.ownershipChecks.add(check);
+    try {
+      const owner = await this.coveredRead(signal, () => this.childParents.read(child,
+        this.streamConnected ? String(this.streamGeneration) : undefined, async () => {
+          const info = await this.lookupChild(child, signal);
+          if (info?.parentID !== parent) throw UNVERIFIED_CHILD;
+          return [child, parent] as const;
+        }));
+      if (check.changed) throw new Error("Child ownership changed during read");
+      return owner[1] === parent;
+    } catch (error) {
+      if (error === UNVERIFIED_CHILD) return false;
+      throw error;
+    } finally {
+      this.ownershipChecks.delete(check);
+    }
+  }
+
+  private async verifyChildren(children: Set<string>, parent: string, signal: AbortSignal, verified: (child: string) => void, tolerateUnavailable = false): Promise<void> {
+    const pending = children.values();
+    // One deadline for the whole batch, not one timeout per child. Four
+    // readers match background recovery's concurrency budget.
+    await Promise.all(Array.from({ length: Math.min(4, children.size) }, async () => {
+      for (const child of pending) {
+        if (signal.aborted) break;
+        try {
+          if (await this.verifiedChild(child, parent, signal)) verified(child);
+        } catch (error) {
+          // Stream lookup failures must not eat unrelated parts of the frame;
+          // recovery retains its stronger failed-read-is-unknown contract.
+          if (!tolerateUnavailable) throw error;
+        }
+      }
+    }));
+    if (!tolerateUnavailable) signal.throwIfAborted();
   }
 
   private async coveredRead<T>(signal: AbortSignal, read: () => Promise<T>): Promise<T> {
@@ -536,11 +922,14 @@ export class OpenCodeV2Provider implements ChatProvider {
 
   async *events(signal: AbortSignal): AsyncIterable<NormalizedProviderEvent> {
     this.historyReuse.invalidate();
+    this.invalidateChildParents();
     this.backgroundReads.clear();
     const reads = new AbortController();
     this.streamReads = reads;
+    const streamReadSignal = this.readSignal(AbortSignal.any([signal, reads.signal]));
     // Memory scoped to the subscription: one pump, one memory.
-    const memory = createOpenCodeV2Memory();
+    const memory = createOpenCodeV2Memory({ controls: this.controls });
+    this.eventMemory = memory;
     // Live only once a frame has arrived: until the subscription's first
     // frame (`server.connected`), a row broadcast may not have reached this
     // listener at all, so an admission from that gap may wait for a row
@@ -563,6 +952,7 @@ export class OpenCodeV2Provider implements ChatProvider {
         if (!arrived) continue;
         next = undefined;
         if (arrived.done) break;
+        if (streamReadSignal.aborted) break;
         this.streaming = true;
         const event = arrived.value;
         // Only the native handshake establishes readiness, never an injected
@@ -575,27 +965,51 @@ export class OpenCodeV2Provider implements ChatProvider {
         // Normalization resolves every failure to an outcome, and anything
         // that still escapes must cost one event rather than ending the stream.
         let normalized: NormalizedProviderEvent;
+        let controlUpdates: ReturnType<BackgroundControls["observe"]> = [];
         try {
-          const raw = asRecord(event);
-          const location = stringValue(asRecord(raw.location).directory);
-          if (!location || path.resolve(location) === this.workspace) {
-            const data = asRecord(raw.data);
-            const parent = stringValue(data.sessionID);
-            const metadata = asRecord(asRecord(asRecord(data.item).payload).metadata);
-            const children = new Set<string>();
-            if (metadata.source === "subagent" && typeof metadata.childID === "string") children.add(metadata.childID);
-            const toolChild = stringValue(asRecord(data.metadata).sessionID);
-            if (toolChild) children.add(toolChild);
-            for (const part of Array.isArray(data.content) ? data.content : []) {
-              const child = stringValue(asRecord(asRecord(asRecord(part).state).metadata).sessionID);
-              if (child) children.add(child);
-            }
-            if (parent) for (const child of children) {
-              const session = await this.getSession(child);
-              if (session?.parentId === parent) memory.workers.verifyChild(child, parent);
-            }
+          // One synchronous canonical read precedes every ownership await.
+          const prepared = this.normalize.prepare(event, memory, this.controls);
+          const evidence = prepared.evidence;
+          controlUpdates = this.controls.observe(evidence, (!evidence.directory || path.resolve(evidence.directory) === this.workspace)
+            && (!evidence.lifecycle?.directory || path.resolve(evidence.lifecycle.directory) === this.workspace),
+            prepared.notification, prepared.notificationProof);
+          memory.workers.enforceBudget();
+          this.observeStopEvent(evidence);
+          if (evidence.lifecycle?.kind === "session.created") {
+            const id = evidence.lifecycle.id;
+            if (id) this.childParents.invalidate(id);
           }
-          normalized = this.normalize(event, memory);
+          // Membership changes invalidate even when the new location is
+          // foreign or absent; a sparse deletion cannot authorize old facts.
+          // Revoke ownership only: terminal occurrences, consumed notices,
+          // and the recovery-only latch must survive until this stream ends.
+          if (evidence.shutdown || evidence.lifecycle && evidence.lifecycle.kind !== "session.created") {
+            this.invalidateChildParents();
+            memory.workers.invalidateOwnership(evidence.shutdown ? undefined : evidence.lifecycle?.id);
+          }
+          const location = evidence.directory;
+          if (!location || path.resolve(location) === this.workspace) {
+            const parent = evidence.session;
+            // Persist negative evidence before any ownership await, including
+            // when Stop starts while that read is still pending. This never
+            // establishes ownership of a requested/replacement child.
+            if (parent) for (const launcher of evidence.launchers) memory.workers.observeLauncher(parent, launcher);
+            if (parent && evidence.notification) memory.workers.observeNotification(parent, evidence.notification.id, prepared.notification, evidence.notification.proof);
+            const children = new Set<string>();
+            if (evidence.notification) children.add(evidence.notification.child);
+            // Requested input.sessionID is only a veto hint, never ownership
+            // proof. Only reported child metadata enters scoped verification.
+            for (const launcher of evidence.launchers) if (launcher.reportedChild) children.add(launcher.reportedChild);
+            if (parent && children.size > 0) await this.verifyChildren(children, parent,
+              AbortSignal.any([streamReadSignal, AbortSignal.timeout(1_000)]), child => memory.workers.verifyChild(child, parent), true);
+          }
+          if (streamReadSignal.aborted) break;
+          normalized = this.normalize.prepared(prepared, memory);
+          normalized.updates = normalized.updates.map(update => update.kind === "upsert" && update.item.type === "background_task"
+            ? { ...update, item: this.controls.project(update.item, memory.workers.occurrence(update.item.taskId), undefined, memory.workers.controlWitnesses(update.item.taskId)) } : update);
+          for (const { parent, item } of controlUpdates) if (parent === normalized.conversationId && !normalized.updates.some(update => update.kind === "upsert" && update.item.id === item.id)) normalized.updates.push({ kind: "upsert", item });
+          memory.workers.enforceBudget();
+          this.observeStopWorkerUpdates(normalized, memory);
           const notificationTurns = this.notificationLifecycle.observe(event, normalized);
           if (notificationTurns.length > 0) { normalized.notificationTurns = notificationTurns; normalized.outcome = "handled"; }
           this.historyReuse.invalidate(normalized.conversationId);
@@ -607,6 +1021,12 @@ export class OpenCodeV2Provider implements ChatProvider {
           normalized = { updates: [], outcome: "unparseable", eventType: "" };
         }
         yield normalized;
+        // Child execution and workspace lifecycle facts revoke rows on their
+        // owning parent's timeline, never on the child's conversation.
+        for (const parent of new Set(controlUpdates.map(update => update.parent))) if (parent !== normalized.conversationId) yield {
+          conversationId: parent, outcome: "handled", eventType: normalized.eventType,
+          updates: controlUpdates.filter(update => update.parent === parent).map(({ item }) => ({ kind: "upsert" as const, item })),
+        };
         // After the yield, not before: the consumer has applied this event
         // by the time the generator resumes, so a command admission settled
         // here returns after the streamed row landed — and the caller's own
@@ -620,8 +1040,11 @@ export class OpenCodeV2Provider implements ChatProvider {
       if (!signal.aborted) throw error;
     } finally {
       reads.abort();
+      if (!this.readLifetime.signal.aborted) this.controls.observationGap();
+      if (this.eventMemory === memory) this.eventMemory = undefined;
       if (this.streamReads === reads) this.streamReads = undefined;
       this.historyReuse.invalidate();
+      this.invalidateChildParents();
       this.backgroundReads.clear();
       this.streaming = false;
       this.streamOpen = false;
@@ -838,7 +1261,9 @@ export class OpenCodeV2Provider implements ChatProvider {
     this.readLifetime.abort();
     for (const ready of this.streamReadyWaiters) ready(false);
     this.historyReuse.dispose();
+    this.childParents.dispose();
     await Promise.allSettled(this.backgroundReads.values());
+    this.controls.clear();
   }
 
   promptIdentity(identity: string): string { return stableProviderId("msg", identity); }
@@ -940,7 +1365,7 @@ export class OpenCodeV2Provider implements ChatProvider {
         // stream listening the row or the window decides, and without one
         // the caller hears the failure, having nothing else to wait for.
         dispatch.then(() => { if (!enqueued) resolve(undefined); }, (error: unknown) => {
-          if (!enqueued || isServerRefusal(error) || isConnectionRefused(error)) reject(error);
+          if (!enqueued || isServerRefusal(error) || isMutationNotApplied(error)) reject(error);
         });
       });
       // The window closed without a decision: the caller was told
@@ -971,7 +1396,7 @@ export class OpenCodeV2Provider implements ChatProvider {
         dispatch.catch((error: unknown) => {
           // The server's refusal, or the socket's: either way no row is
           // coming. A lost response is neither.
-          if (!isServerRefusal(error) && !isConnectionRefused(error)) return;
+          if (!isServerRefusal(error) && !isMutationNotApplied(error)) return;
           this.forgetLateAdmission(sessionId, messageId);
           const message = error instanceof Error && error.message ? error.message : "The command was refused";
           this.inject({ conversationId: sessionId, outcome: "handled", eventType: "session.command.refused", updates: [
@@ -999,11 +1424,7 @@ export class OpenCodeV2Provider implements ChatProvider {
       // Only explicit request/auth/session refusals or a socket that never
       // connected prove non-application. A generic error, 5xx, or other native
       // failure may follow side effects and must preserve Stop's queue intent.
-      if (isConnectionRefused(error) || [...causes(error)].some(record =>
-        ["InvalidRequestError", "UnauthorizedError", "ForbiddenError", "SessionNotFoundError"].includes(String(record._tag))
-        // The pinned client does not declare 403 on this route, so it keeps
-        // the HTTP status in ClientError.cause instead of decoding the tag.
-        || record.name === "ClientError" && record.reason === "UnexpectedStatus" && asRecord(record.cause).status === 403)) {
+      if (isMutationNotApplied(error)) {
         throw new InterruptNotAppliedError(failureText(error));
       }
       throw error;
@@ -1021,15 +1442,66 @@ export class OpenCodeV2Provider implements ChatProvider {
   }
 
   async stopTask(sessionId: string, taskId: string): Promise<void> {
+    if (sessionId.length > 512 || taskId.length > 512) throw new BackgroundTaskUnavailableError("Invalid worker identity");
+    if (this.controls.unavailable(taskId)) throw new BackgroundTaskUnavailableError("Worker is no longer confirmed: control evidence is unavailable");
+    if (this.stopValidations.size >= 4) throw new BackgroundTaskUnavailableError("Stop validation capacity unavailable");
+    const validation: StopValidation = { parent: sessionId, taskId, changed: false, pendingChanges: new Set(), pendingLaunches: new Map(),
+      pendingChangeBytes: 0, pendingLaunchBytes: 0, pendingBytes: 0, occurrence: this.controls.basis(taskId) ?? this.eventMemory?.workers.occurrence(taskId) };
+    if (validation.occurrence) {
+      validation.child = validation.occurrence.worker;
+      validation.launchCalls = validation.occurrence.launches.map(launch => launch.call);
+    }
+    this.refreshStopBytes(validation);
+    this.stopValidations.add(validation);
+    const stream = this.streamGeneration;
+    const signal = this.readSignal(AbortSignal.timeout(5_000));
+    let controlBasis = this.controls.proof(taskId);
+    const assertAuthorizationCurrent = () => {
+      const current = this.controls.proof(taskId);
+      if (this.controls.unavailable(taskId) || controlBasis && (!current || current.basis !== controlBasis.basis || current.revision !== controlBasis.revision)
+        || task && controlBasis && (task.taskType !== controlBasis.basis.kind
+          || (controlBasis.basis.kind === "agent" ? task.childConversationId !== controlBasis.basis.worker
+            : task.childConversationId !== undefined || task.outputFile !== `shell:${controlBasis.basis.worker}`))
+        || validation.changed || validation.occurrence?.uncertain || this.stopLaunchChanged(validation) || signal.aborted || stream !== this.streamGeneration) {
+        throw new BackgroundTaskUnavailableError("Worker is no longer confirmed: ownership or execution changed while validating Stop");
+      }
+    };
     // An inventory recovery begun before this request cannot authorize a
     // destructive mutation. Wait for it, then revalidate against fresh parent
     // evidence; concurrent stop requests may share that newer read.
-    await this.backgroundReads.get(sessionId)?.catch(() => undefined);
-    // Child execution boundaries authorize the occurrence too, so none of
-    // the parent/child histories used for this mutation may predate it.
-    this.historyReuse.invalidate();
-    const task = (await this.reconcileBackgroundTasks(sessionId)).find(task => task.taskId === taskId);
-    if (!task || task.status !== "running" || task.stateUncertain) throw new BackgroundTaskUnavailableError("Worker is no longer confirmed running");
+    let task: import("../../types").BackgroundTaskItem | undefined;
+    try {
+      await this.coveredRead(signal, async () => { await this.backgroundReads.get(sessionId)?.catch(() => undefined); });
+      assertAuthorizationCurrent();
+      // Child execution boundaries authorize the occurrence too, so none of
+      // the parent/child histories used for this mutation may predate it.
+      this.historyReuse.invalidate();
+      const snapshot = await this.backgroundSnapshot(sessionId, { signal });
+      controlBasis ??= snapshot.controls.get(taskId);
+      const selected = snapshot.tasks.find(task => task.taskId === taskId);
+      task = selected ? { ...selected, ...(selected.toolUseIds ? { toolUseIds: [...selected.toolUseIds] } : {}) } : undefined;
+      if (task) this.bindStopTask(validation, task, snapshot.occurrences.get(taskId), true);
+      assertAuthorizationCurrent();
+      if (!task || task.status !== "running" || task.stateUncertain || !controlBasis) throw new BackgroundTaskUnavailableError("Worker is no longer confirmed running");
+      if (task.childConversationId) {
+        // A cached immutable relationship helps reads, not destructive
+        // authorization. Re-read confinement after all execution evidence.
+        const child = await this.lookupChild(task.childConversationId, signal);
+        assertAuthorizationCurrent();
+        if (child?.parentID !== sessionId) throw new BackgroundTaskUnavailableError("Worker ownership is no longer confirmed");
+      }
+    } catch (error) {
+      assertAuthorizationCurrent();
+      throw error;
+    } finally {
+      this.stopValidations.delete(validation);
+      validation.launchCalls = undefined;
+      validation.occurrence = undefined;
+      this.clearStopEvidence(validation);
+    }
+    // No await separates this fence from dispatch. Revocation observed at
+    // any earlier await refuses the action rather than replaying validation.
+    assertAuthorizationCurrent();
     if (task.childConversationId) {
       // Native interrupt has no generation-conditional precondition. This
       // refuses known stale occurrences, not an external continuation racing
@@ -1067,8 +1539,7 @@ export class OpenCodeV2Provider implements ChatProvider {
     catch (error) {
       // Only explicit non-application responses are ordinary retryable errors.
       // An unknown/server/transport failure after dispatch might follow effects.
-      const tag = asRecord(error)._tag;
-      if (tag === "SessionNotFoundError" || tag === "UnauthorizedError" || tag === "ForbiddenError" || tag === "InvalidRequestError") throw error;
+      if (isMutationNotApplied(error)) throw error;
       throw new OperationOutcomeUnknownError();
     }
   }
@@ -1341,6 +1812,7 @@ function reversibleState(turns: ReversibleTurn[], boundaryIndex?: number, staged
 
 const CATALOG_ATTEMPTS = 8;
 const CATALOG_RETRY_MS = 250;
+const UNVERIFIED_CHILD = Symbol("Unverified child ownership");
 
 const BUILTIN_COMMANDS: ChatCommand[] = [
   { name: "compact", description: "Compact the conversation context", argumentHint: "", kind: "command" },
@@ -1397,6 +1869,14 @@ function isServerRefusal(error: unknown): boolean {
 function isConnectionRefused(error: unknown): boolean {
   for (const record of causes(error)) if (record.code === "ConnectionRefused" || record.code === "ECONNREFUSED") return true;
   return false;
+}
+
+function isMutationNotApplied(error: unknown): boolean {
+  return isConnectionRefused(error) || [...causes(error)].some(record =>
+    ["InvalidRequestError", "UnauthorizedError", "ForbiddenError", "SessionNotFoundError"].includes(String(record._tag))
+    // The pinned client does not declare 403 on these routes, so it keeps
+    // the status in ClientError.cause rather than decoding the server tag.
+    || record.name === "ClientError" && record.reason === "UnexpectedStatus" && asRecord(record.cause).status === 403);
 }
 
 function isLookupMiss(error: unknown): boolean {

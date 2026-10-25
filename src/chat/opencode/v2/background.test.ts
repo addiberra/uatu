@@ -1,10 +1,602 @@
 import { expect, spyOn, test } from "bun:test";
-import { BackgroundWorkers } from "./background";
+import { BackgroundControls, BackgroundWorkers, launcherChanged, nativeProof, prepareTool, retainLauncherEvidence, type WorkerOccurrenceEvidence } from "./background";
 import fc from "fast-check";
 import { compactWorkers } from "../../compact-work";
-import type { ConversationItem } from "../../types";
+import type { BackgroundTaskItem, ConversationItem } from "../../types";
+import { taskInspection } from "../../task-inspection";
 
 const launch = (id: string, worker = id, command = "fixture") => ({ id, name: "shell", state: { status: "completed", input: { command }, metadata: { status: "running", shellID: worker } } });
+
+function controlFixture(call: string, parent = "parent", worker = call, kind: "agent" | "shell" = "shell") {
+  const workers = new BackgroundWorkers();
+  const part = kind === "shell" ? launch(call, worker) : { id: call, name: "subagent", state: { status: "completed", input: { prompt: "fixture" }, metadata: { status: "running", sessionID: worker } } };
+  if (kind === "agent") workers.verifyChild(worker, parent);
+  workers.launchPrepared(parent, prepareTool({ ...part, time: { created: 10, completed: 20 } }, 10, "snapshot", `message:${call}`), 10);
+  const evidence = workers.occurrence(`v2:${parent}:${call}`)!;
+  const item: BackgroundTaskItem = { id: `task:${evidence.taskId}`, type: "background_task", taskId: evidence.taskId,
+    taskType: kind, ...(kind === "shell" ? { outputFile: `shell:${worker}` } : { childConversationId: worker }), toolUseId: call, description: "Fixture", status: "running", createdAt: 10 };
+  return { item, evidence };
+}
+
+function controlOracle(controls: BackgroundControls) {
+  const state = controls as unknown as { closed: boolean; projectionLost: boolean; scopes: Map<string, "retained" | "inventoried" | "gap">;
+    records: Map<string, { parent: string; taskId: string; unavailable?: true; aliases?: string[]; pendingCalls?: string[]; evidence?: WorkerOccurrenceEvidence; witnesses?: unknown[]; item?: BackgroundTaskItem }>;
+    reads: Map<number, unknown>; observations: Map<string, { witness?: unknown }> };
+  const bytes = JSON.stringify([state.closed, state.projectionLost, [...state.scopes], [...state.records], [...state.reads], [...state.observations]]).length * 2;
+  const entries = state.scopes.size + state.reads.size + [...state.observations.values()].reduce((sum, observation) => sum + 1 + (observation.witness ? 1 : 0), 0)
+    + [...state.records.values()].reduce((sum, record) => sum + 1 + (record.evidence?.launches.length ?? 0) + (record.witnesses?.length ?? 0) + (record.aliases?.length ?? 0) + (record.pendingCalls?.length ?? 0)
+      + (record.item ? 1 + (record.item.toolUseIds?.length ?? 0) : 0), 0);
+  expect(controls.usage).toEqual({ bytes, entries });
+  expect(bytes).toBeLessThanOrEqual(1024 * 1024);
+  expect(entries).toBeLessThanOrEqual(2_048);
+  return state;
+}
+
+test("initial parent creation and execution do not revoke a positively identified first worker", () => {
+  const fixture = controlFixture("initial", "parent", "child", "agent");
+  const controls = new BackgroundControls();
+  controls.observe({ shutdown: false, session: "parent", launchers: [], lifecycle: {
+    kind: "session.created", id: "parent", directory: "/ws", proof: nativeProof({ id: "parent-birth", created: 1 }, { session: "parent" }),
+  } }, true);
+  controls.observe({ shutdown: false, session: "parent", launchers: [], execution: {
+    phase: "started", historical: false, proof: nativeProof({ id: "parent-start", created: 2 }, { session: "parent" }),
+  } }, true);
+  expect(controls.project(fixture.item, fixture.evidence).stateUncertain).toBe(false);
+  expect(controls.unavailable(fixture.item.taskId)).toBe(false);
+  controlOracle(controls);
+});
+
+test("initial child creation waits for an exact occurrence-linked start instead of retiring the first identity", () => {
+  const fixture = controlFixture("initial-child", "parent", "child", "agent"), controls = new BackgroundControls();
+  const proof = nativeProof({ id: "first-start", created: 11 }, { session: "child" })!;
+  controls.observe({ shutdown: false, session: "child", launchers: [], lifecycle: { kind: "session.created", id: "child", parent: "parent", directory: "/ws",
+    proof: nativeProof({ id: "child-birth", created: 5 }, { session: "child", parent: "parent" }) } }, true);
+  expect(controls.project(fixture.item, fixture.evidence).stateUncertain).toBe(true);
+  expect(controls.unavailable(fixture.item.taskId)).toBe(false);
+  controls.observe({ shutdown: false, session: "child", launchers: [], execution: { phase: "started", historical: false, proof } }, true);
+  expect(controls.project(fixture.item, fixture.evidence).stateUncertain).toBe(true);
+  expect(controls.unavailable(fixture.item.taskId)).toBe(false);
+  const linked = { ...fixture.evidence, executionStart: proof };
+  const earlier = nativeProof({ id: "earlier-run", created: 6 }, { session: "child" })!;
+  expect(controls.project(fixture.item, { ...linked, executionStart: earlier }, undefined, [{ kind: "started", proof: earlier }]).stateUncertain).toBe(true);
+  const incomplete = { ...linked, launches: linked.launches.map(launch => ({ ...launch, inputFingerprint: undefined })) };
+  expect(controls.project(fixture.item, incomplete, undefined, [{ kind: "started", proof }]).stateUncertain).toBe(true);
+  expect(controls.unavailable(fixture.item.taskId)).toBe(false);
+  expect(controls.project(fixture.item, linked, undefined, [{ kind: "started", proof }]).stateUncertain).toBe(false);
+  controlOracle(controls);
+});
+
+test.each(["session.moved", "session.deleted", "session.updated", "foreign-birth", "new-generation"])("initial classification cannot launder destructive %s through old history", kind => {
+  const fixture = controlFixture("old", "parent", "child", "agent"), controls = new BackgroundControls();
+  const birth = kind === "foreign-birth" || kind === "new-generation";
+  controls.observe({ shutdown: false, session: "child", launchers: [], lifecycle: { kind: birth ? "session.created" : kind, id: "child", parent: "parent", directory: kind === "foreign-birth" ? "/foreign" : "/ws",
+    proof: nativeProof({ id: "changed", created: kind === "new-generation" ? 30 : 5 }, { kind }) } }, kind !== "foreign-birth");
+  expect(controls.project(fixture.item, fixture.evidence).stateUncertain).toBe(true);
+  expect(controls.unavailable(fixture.item.taskId)).toBe(true);
+  expect(controls.project(fixture.item, fixture.evidence).stateUncertain).toBe(true);
+  controlOracle(controls);
+});
+
+test("a positively identical pre-admission foreground snapshot can detach without rehabilitating an admitted identity", () => {
+  const fixture = controlFixture("detach", "parent", "child", "agent"), controls = new BackgroundControls();
+  const full = fixture.evidence.launches[0]!;
+  controls.observe({ shutdown: false, session: "parent", launchers: [{ ...full, background: false }] }, true);
+  expect(controls.project(fixture.item, fixture.evidence).stateUncertain).toBe(true);
+  expect(controls.unavailable(fixture.item.taskId)).toBe(false);
+  controls.observe({ shutdown: false, session: "parent", launchers: [full] }, true);
+  expect(controls.project(fixture.item, fixture.evidence).stateUncertain).toBe(false);
+  controls.observe({ shutdown: false, session: "parent", launchers: [{ ...full, background: false }] }, true);
+  controls.observe({ shutdown: false, session: "parent", launchers: [full] }, true);
+  expect(controls.project(fixture.item, fixture.evidence).stateUncertain).toBe(true);
+  expect(controls.unavailable(fixture.item.taskId)).toBe(true);
+  controlOracle(controls);
+});
+
+test.each(["child", "message", "workerType", "created", "inputFingerprint"] as const)("initial detachment cannot erase a mismatching native %s", field => {
+  const fixture = controlFixture("detach", "parent", "child", "agent"), controls = new BackgroundControls();
+  const full = fixture.evidence.launches[0]!;
+  const changed = { ...full, background: false, [field]: field === "created" ? 9 : field === "workerType" ? "shell" : "different" };
+  controls.observe({ shutdown: false, session: "parent", launchers: [changed] }, true);
+  controls.observe({ shutdown: false, session: "parent", launchers: [full] }, true);
+  expect(controls.project(fixture.item, fixture.evidence).stateUncertain).toBe(true);
+  expect(controls.unavailable(fixture.item.taskId)).toBe(true);
+  controlOracle(controls);
+});
+
+test("later live-scope inventory reserves unobserved work pending, without confusing it with cold history or a gap", () => {
+  const fixture = controlFixture("discovered"), controls = new BackgroundControls();
+  const initial = controls.beginRead("parent", true, true);
+  expect(initial.initialInventory).toBe(true);
+  expect(controls.project(fixture.item, fixture.evidence, initial).stateUncertain).toBe(false);
+  controls.endRead(initial, true);
+  const later = controlFixture("later"), read = controls.beginRead("parent", true, true);
+  expect(read.initialInventory).toBe(false);
+  expect(controls.project(later.item, later.evidence, read).stateUncertain).toBe(true);
+  expect(controls.unavailable(later.item.taskId)).toBe(false);
+  controls.observe({ shutdown: false, session: "parent", launchers: [...later.evidence.launches] }, true);
+  expect(controls.project(later.item, later.evidence, read).stateUncertain).toBe(false);
+  controls.endRead(read);
+  controls.observationGap();
+  expect(controls.project(later.item, later.evidence).stateUncertain).toBe(true);
+  controlOracle(controls);
+});
+
+test("a failed initial inventory does not discard the right to classify fresh cold evidence", () => {
+  const controls = new BackgroundControls(), fixture = controlFixture("cold-after-failed-read");
+  const failed = controls.beginRead("parent", true, true);
+  controls.endRead(failed);
+  const recovered = controls.beginRead("parent", true, true);
+  expect(recovered.initialInventory).toBe(true);
+  expect(controls.project(fixture.item, fixture.evidence, recovered).stateUncertain).toBe(false);
+  controls.endRead(recovered, true);
+  controlOracle(controls);
+});
+
+test("one live sibling does not consume the first complete inventory of previously unobserved cold work", () => {
+  const controls = new BackgroundControls(), live = controlFixture("live"), cold = controlFixture("preexisting");
+  expect(controls.project(live.item, live.evidence).stateUncertain).toBe(false);
+  const read = controls.beginRead("parent", true, true);
+  expect(read.initialInventory).toBe(true);
+  expect(controls.project(cold.item, cold.evidence, read).stateUncertain).toBe(false);
+  controls.endRead(read, true);
+  controlOracle(controls);
+});
+
+test("one child's consumed birth cannot launder a sibling candidate predating the parent's native generation", () => {
+  const controls = new BackgroundControls(), first = controlFixture("first"), stale = controlFixture("stale");
+  const birth = nativeProof({ id: "parent-birth", created: 5 }, { parent: "parent" })!;
+  controls.observe({ shutdown: false, session: "parent", launchers: [], lifecycle: { kind: "session.created", id: "parent", directory: "/ws", proof: birth } }, true);
+  expect(controls.project(first.item, first.evidence).stateUncertain).toBe(false);
+  const beforeBirth = { ...stale.evidence, launches: stale.evidence.launches.map(launch => ({ ...launch, created: 1 })) };
+  expect(controls.project(stale.item, beforeBirth).stateUncertain).toBe(true);
+  expect(controls.unavailable(stale.item.taskId)).toBe(true);
+  controlOracle(controls);
+});
+
+test("exact consumed native birth replay is not a new creation, but a new native event retires the admitted identity", () => {
+  const controls = new BackgroundControls(), fixture = controlFixture("original");
+  const lifecycle = { kind: "session.created", id: "parent", directory: "/ws", proof: nativeProof({ id: "birth", created: 5 }, { parent: "parent" })! };
+  controls.observe({ shutdown: false, session: "parent", launchers: [], lifecycle }, true);
+  expect(controls.project(fixture.item, fixture.evidence).stateUncertain).toBe(false);
+  controls.observe({ shutdown: false, session: "parent", launchers: [], lifecycle }, true);
+  expect(controls.project(fixture.item, fixture.evidence).stateUncertain).toBe(false);
+  controls.observe({ shutdown: false, session: "parent", launchers: [], lifecycle: { ...lifecycle, proof: { ...lifecycle.proof, id: "new-birth" } } }, true);
+  expect(controls.project(fixture.item, fixture.evidence).stateUncertain).toBe(true);
+  controlOracle(controls);
+});
+
+test("control growth reserves sticky identity stubs and isolates entry and byte overflow", () => {
+  for (const budget of [{ entries: 16 }, { bytes: 5_000 }]) {
+    const controls = new BackgroundControls(budget), healthy = controlFixture("healthy", "other"), growing = controlFixture("growing");
+    expect(controls.project(healthy.item, healthy.evidence).stateUncertain).toBe(false);
+    expect(controls.project(growing.item, growing.evidence).stateUncertain).toBe(false);
+    const launches = Array.from({ length: 32 }, (_, index) => ({ ...growing.evidence.launches[0]!, call: `alias${index}` }));
+    expect(controls.project({ ...growing.item, toolUseIds: launches.map(fact => fact.call) }, { ...growing.evidence, launches }).stateUncertain).toBe(true);
+    expect(controls.unavailable(growing.item.taskId)).toBe(true);
+    expect(controls.project(growing.item, growing.evidence).stateUncertain).toBe(true);
+    expect(controls.project(healthy.item, healthy.evidence).stateUncertain).toBe(false);
+    const state = controlOracle(controls);
+    expect(state.records.get(growing.item.taskId)).toEqual({ parent: "parent", taskId: growing.item.taskId, unavailable: true, aliases: ["growing"] });
+    expect(controls.usage.bytes).toBeLessThanOrEqual(budget.bytes ?? Infinity);
+    expect(controls.usage.entries).toBeLessThanOrEqual(budget.entries ?? Infinity);
+  }
+});
+
+test("control accounting covers guards, witnesses, aliases, provisional facts and tombstone containers", () => {
+  const controls = new BackgroundControls(), fixture = controlFixture("accounting");
+  const proof = nativeProof({ id: "native", created: 10 }, { input: "fixture" })!;
+  const read = controls.beginRead("parent");
+  expect(controls.project(fixture.item, fixture.evidence, read, [{ kind: "called", proof }]).stateUncertain).toBe(false);
+  controlOracle(controls);
+  controls.observe({ shutdown: false, session: "unrelated", launchers: [{ call: "other", phase: "progress", child: "elsewhere" }] }, true);
+  controlOracle(controls);
+  controls.endRead(read);
+  controlOracle(controls);
+  controls.observe({ shutdown: false, session: fixture.evidence.worker, execution: { phase: "ended", proof, historical: false }, launchers: [] }, true);
+  controls.project({ ...fixture.item, status: "completed" }, fixture.evidence);
+  expect(controls.project(fixture.item, fixture.evidence).stateUncertain).toBe(true);
+  controlOracle(controls);
+});
+
+test("pre-read contradictory facts survive sparse progress and later recovery reads", () => {
+  const controls = new BackgroundControls(), fixture = controlFixture("cold");
+  const snapshot = { ...fixture.evidence.launches[0]!, ran: 100 };
+  controls.observe({ shutdown: false, session: "parent", launchers: [snapshot] }, true);
+  controls.observe({ shutdown: false, session: "parent", launchers: [{ call: "cold", phase: "progress", child: "cold" }] }, true);
+  const read = controls.beginRead("parent");
+  expect(controls.project(fixture.item, fixture.evidence, read).stateUncertain).toBe(true);
+  controls.endRead(read);
+  expect(controls.project(fixture.item, fixture.evidence).stateUncertain).toBe(true);
+  controlOracle(controls);
+});
+
+test("pending call identities are charged and absence cannot resolve an unbound invocation", () => {
+  const controls = new BackgroundControls(), fixture = controlFixture("selected", "parent", "child", "agent");
+  controls.project(fixture.item, fixture.evidence);
+  controls.observe({ shutdown: false, session: "parent", launchers: [{ call: "new_call", phase: "called", workerType: "agent", message: "new_owner", requestedChild: "child", background: false }] }, true);
+  expect(controlOracle(controls).records.get(fixture.item.taskId)?.pendingCalls).toEqual(["new_call"]);
+  expect(controls.project(fixture.item, fixture.evidence).stateUncertain).toBe(true);
+  controlOracle(controls);
+});
+
+test("missing native kind or owner is unproven, while sparse facts cannot erase or contradict a proven identity", () => {
+  const fixture = controlFixture("identity", "parent", "child", "agent");
+  for (const candidate of [
+    { ...fixture.evidence, kind: undefined },
+    { ...fixture.evidence, launches: fixture.evidence.launches.map(launch => ({ ...launch, message: undefined })) },
+    { ...fixture.evidence, launches: fixture.evidence.launches.map(launch => ({ ...launch, workerType: undefined })) },
+    { ...fixture.evidence, launches: fixture.evidence.launches.map(launch => ({ ...launch, created: undefined })) },
+    { ...fixture.evidence, launches: fixture.evidence.launches.map(launch => ({ ...launch, inputFingerprint: undefined })) },
+    { ...fixture.evidence, launches: fixture.evidence.launches.map(launch => ({ ...launch, created: undefined, inputFingerprint: undefined })) },
+  ]) {
+    const controls = new BackgroundControls();
+    expect(controls.project(fixture.item, candidate).stateUncertain).toBe(true);
+    expect(controls.proof(fixture.item.taskId)).toBeUndefined();
+    controlOracle(controls);
+  }
+  const controls = new BackgroundControls();
+  expect(controls.project(fixture.item, fixture.evidence).stateUncertain).toBe(false);
+  const sparse = { call: "identity", phase: "progress" as const, child: "child" };
+  controls.observe({ shutdown: false, session: "parent", launchers: [sparse] }, true);
+  expect(controls.project(fixture.item, fixture.evidence).stateUncertain).toBe(false);
+  const changed = retainLauncherEvidence(fixture.evidence.launches[0], { ...sparse, message: "different_owner", workerType: "shell" });
+  expect(changed).toMatchObject({ message: "message:identity", workerType: "agent", conflicted: true });
+  controls.observe({ shutdown: false, session: "parent", launchers: [changed] }, true);
+  expect(controls.project(fixture.item, fixture.evidence).stateUncertain).toBe(true);
+  controlOracle(controls);
+});
+
+test("an unproven cold alias cannot seed missing owner evidence into another retained basis", () => {
+  const controls = new BackgroundControls(), original = controlFixture("original", "parent", "child", "agent"), alias = controlFixture("alias", "parent", "child", "agent");
+  expect(controls.project(original.item, original.evidence).stateUncertain).toBe(false);
+  const full = { ...original.evidence, launches: [...original.evidence.launches, ...alias.evidence.launches] };
+  const partial = { ...alias.evidence, launches: [...original.evidence.launches, ...alias.evidence.launches.map(launch => ({ ...launch, message: undefined }))] };
+  expect(controls.project(alias.item, partial).stateUncertain).toBe(true);
+  expect(controls.project(original.item, full).stateUncertain).toBe(false);
+  const replacement = { ...full, launches: full.launches.map(launch => launch.call === "alias" ? { ...launch, message: "replacement_owner" } : launch) };
+  expect(controls.project(original.item, replacement).stateUncertain).toBe(true);
+  controlOracle(controls);
+});
+
+test.each(["created", "inputFingerprint", "both"] as const)("a cold alias missing %s cannot weaken or enrich a complete retained invocation", field => {
+  const controls = new BackgroundControls(), original = controlFixture("original", "parent", "child", "agent"), alias = controlFixture("alias", "parent", "child", "agent");
+  expect(controls.project(original.item, original.evidence).stateUncertain).toBe(false);
+  const partial = { ...alias.evidence, launches: [...original.evidence.launches, ...alias.evidence.launches.map(launch => ({ ...launch,
+    ...(field !== "inputFingerprint" ? { created: undefined } : {}), ...(field !== "created" ? { inputFingerprint: undefined } : {}) }))] };
+  expect(controls.project(alias.item, partial).stateUncertain).toBe(true);
+  expect(controls.proof(alias.item.taskId)).toBeUndefined();
+  expect(controls.basis(original.item.taskId)?.launches).toHaveLength(1);
+  expect(controls.project(original.item, original.evidence).stateUncertain).toBe(false);
+  const complete = { ...alias.evidence, launches: [...original.evidence.launches, ...alias.evidence.launches] };
+  expect(controls.project(alias.item, complete).stateUncertain).toBe(false);
+  expect(controls.basis(original.item.taskId)?.launches).toHaveLength(2);
+  const changed = { ...complete, launches: complete.launches.map(launch => launch.call === "alias" ? { ...launch, inputFingerprint: "different-native-input" } : launch) };
+  expect(controls.project(original.item, changed).stateUncertain).toBe(true);
+  expect(controls.project(alias.item, complete).stateUncertain).toBe(true);
+  controlOracle(controls);
+});
+
+test("space released after a scope gap cannot admit previously uncovered aliases into a retained target", () => {
+  const controls = new BackgroundControls(), original = controlFixture("original", "parent", "child", "agent"), healthy = controlFixture("healthy");
+  const retired = controlFixture("retired"), launches = Array.from({ length: 4 }, (_, index) => ({ ...retired.evidence.launches[0]!, call: `retired${index}`, message: `retired_owner${index}` }));
+  const retiredEvidence = { ...retired.evidence, launches }, retiredItem = { ...retired.item, toolUseIds: launches.map(launch => launch.call) };
+  controls.project(original.item, original.evidence);
+  controls.project(healthy.item, healthy.evidence);
+  controls.project(retiredItem, retiredEvidence);
+  for (let index = 0; index < 2_049; index++) controls.observe({ shutdown: false, session: "parent", launchers: [{ call: `unknown${index}`, phase: "called", background: false }] }, true);
+  expect(controls.project(original.item, original.evidence).stateUncertain).toBe(false);
+  controls.project({ ...retiredItem, status: "completed" }, retiredEvidence);
+  const alias = controlFixture("alias", "parent", "child", "agent");
+  const candidate = { ...original.evidence, launches: [...original.evidence.launches, ...alias.evidence.launches] };
+  expect(controls.project({ ...original.item, toolUseIds: ["original", "alias"] }, candidate).stateUncertain).toBe(true);
+  expect(controls.project(healthy.item, healthy.evidence).stateUncertain).toBe(false);
+  controlOracle(controls);
+});
+
+test("terminal compaction cannot readmit a retired alias as a new canonical identity", () => {
+  const controls = new BackgroundControls(), fixture = controlFixture("original"), alias = controlFixture("alias", "parent", "original");
+  const evidence = { ...fixture.evidence, launches: [...fixture.evidence.launches, ...alias.evidence.launches] };
+  expect(controls.project({ ...fixture.item, toolUseIds: ["original", "alias"] }, evidence).stateUncertain).toBe(false);
+  controls.project({ ...fixture.item, status: "completed" }, evidence);
+  expect(controls.project(alias.item, alias.evidence).stateUncertain).toBe(true);
+  controlOracle(controls);
+});
+
+test("a retained cold alias can join canonical history but all published identities share revocation", () => {
+  const controls = new BackgroundControls(), fixture = controlFixture("original"), alias = controlFixture("alias", "parent", "original");
+  expect(controls.project(alias.item, alias.evidence).stateUncertain).toBe(false);
+  const evidence = { ...fixture.evidence, launches: [...fixture.evidence.launches, ...alias.evidence.launches] };
+  expect(controls.project({ ...fixture.item, toolUseIds: ["original", "alias"] }, evidence).stateUncertain).toBe(false);
+  controls.project({ ...fixture.item, status: "completed" }, evidence);
+  expect(controls.project(alias.item, alias.evidence).stateUncertain).toBe(true);
+  expect(controls.project(fixture.item, fixture.evidence).stateUncertain).toBe(true);
+  controlOracle(controls);
+});
+
+test("published row mutation cannot change private control payload or its accounting", () => {
+  const controls = new BackgroundControls(), fixture = controlFixture("private");
+  const projected = controls.project({ ...fixture.item, toolUseIds: ["private"] }, fixture.evidence);
+  projected.toolUseIds!.push("not-a-native-alias");
+  projected.description = "Changed by a consumer";
+  const updates = controls.observe({ shutdown: false, session: "parent", launchers: [{ ...fixture.evidence.launches[0]!, child: "replacement" }] }, true);
+  expect(updates[0]?.item.toolUseIds).toEqual(["private"]);
+  expect(updates[0]?.item.description).toBe("Fixture");
+  controlOracle(controls);
+});
+
+test("projection saturation and unclassified coverage overflow leave retained controls usable", () => {
+  const controls = new BackgroundControls({ entries: 12 }), retained = controlFixture("retained"), missing = controlFixture("missing");
+  expect(controls.project(retained.item, retained.evidence).stateUncertain).toBe(false);
+  const read = controls.beginRead("parent");
+  controls.projectionSaturated();
+  for (let i = 0; i < 30; i++) controls.observe({ shutdown: false, session: `unknown${i}`, execution: { phase: "started", historical: false }, launchers: [] }, true);
+  expect(read.failed).toBe(false);
+  expect(controls.project(retained.item, retained.evidence, read).stateUncertain).toBe(false);
+  expect(controls.project(missing.item, missing.evidence, read).stateUncertain).toBe(true);
+  controls.endRead(read);
+  controls.observe({ shutdown: false, session: "parent", launchers: [{ ...retained.evidence.launches[0]!, child: "replacement" }] }, true);
+  expect(controls.project(retained.item, retained.evidence).stateUncertain).toBe(true);
+  controlOracle(controls);
+});
+
+test("control observation gaps persist until disposal and guard admission never exceeds sixteen", () => {
+  const controls = new BackgroundControls(), fixture = controlFixture("gap");
+  expect(controls.project(fixture.item, fixture.evidence).stateUncertain).toBe(false);
+  const reads = Array.from({ length: 20 }, () => controls.beginRead("parent"));
+  expect(controls.activeReads).toBe(16);
+  expect(reads.filter(read => read.failed)).toHaveLength(4);
+  controls.observationGap();
+  expect(controls.project(fixture.item, fixture.evidence).stateUncertain).toBe(true);
+  for (const read of reads) controls.endRead(read);
+  expect(controls.activeReads).toBe(0);
+  controlOracle(controls);
+  controls.clear();
+  expect(controlOracle(controls).records.size).toBe(0);
+});
+
+test("idle entry and byte pressure preserve fresh guard headroom for retained controls", () => {
+  for (const padded of [false, true]) {
+    const controls = new BackgroundControls(), fixture = controlFixture("retained");
+    expect(controls.project(fixture.item, fixture.evidence).stateUncertain).toBe(false);
+    for (let index = 0; index < 2_049; index++) controls.observe({ shutdown: false,
+      session: padded ? `unknown${index}`.padEnd(512, "x") : `unknown${index}`, execution: { phase: "started", historical: false }, launchers: [] }, true);
+    expect(controls.activeReads).toBe(0);
+    const reads = Array.from({ length: 16 }, () => controls.beginRead("\ud800".repeat(512)));
+    expect(reads.every(read => !read.failed)).toBe(true);
+    expect(controls.project(fixture.item, fixture.evidence, reads[0]).stateUncertain).toBe(false);
+    expect(controls.beginRead("overflow").failed).toBe(true);
+    controlOracle(controls);
+    for (const read of reads) controls.endRead(read);
+    const later = controls.beginRead("parent");
+    expect(later.failed).toBe(false);
+    expect(controls.project(fixture.item, fixture.evidence, later).stateUncertain).toBe(false);
+    controls.endRead(later);
+    controlOracle(controls);
+    if (padded) {
+      const short = Array.from({ length: 16 }, () => controls.beginRead("parent"));
+      expect(short.every(read => !read.failed)).toBe(true);
+      for (let index = 0; index < 2_049; index++) controls.observe({ shutdown: false,
+        session: `more${index}`.padEnd(512, "y"), execution: { phase: "started", historical: false }, launchers: [] }, true);
+      for (const read of short) controls.endRead(read);
+      const long = Array.from({ length: 16 }, () => controls.beginRead("\ud800".repeat(512)));
+      expect(long.every(read => !read.failed)).toBe(true);
+      controlOracle(controls);
+      for (const read of long) controls.endRead(read);
+    }
+  }
+});
+
+test("actual controls and disposable projection jointly respect the live aggregate", () => {
+  const controls = new BackgroundControls({ changed: () => workers.enforceBudget() });
+  const workers = new BackgroundWorkers({ retained: () => controls.usage, onSaturation: () => controls.projectionSaturated() });
+  for (let index = 0; index < 2_200; index++) {
+    const fixture = controlFixture(`call${index}`);
+    controls.project(fixture.item, fixture.evidence);
+    workers.verifyChild(`child${index}`.padEnd(512, "x"), "parent".padEnd(512, "y"));
+    workers.enforceBudget();
+    const state = retained(workers), controlsState = controlOracle(controls);
+    const projectionEntries = [state.parents, state.tasks, state.notices, state.unmatched, state.ended, state.aliases, state.invocations, state.terminalProofs].reduce((sum, values) => sum + values.size, 0) + state.boundaries;
+    expect(state.bytes + controls.usage.bytes).toBeLessThanOrEqual(4 * 1024 * 1024);
+    expect(projectionEntries + controls.usage.entries).toBeLessThanOrEqual(8_192);
+    expect(controlsState.records.size).toBeLessThanOrEqual(2_048);
+  }
+  expect(retained(workers).recoveryOnly).toBe(true);
+});
+
+test("control-budget serialization scales with changed entries, not the retained collection", () => {
+  const stringify = JSON.stringify;
+  const work = (count: number) => {
+    const fixtures = Array.from({ length: count }, (_, index) => controlFixture(`call${index}`));
+    const controls = new BackgroundControls();
+    let characters = 0;
+    const spy = spyOn(JSON, "stringify").mockImplementation((value: unknown) => { const result = stringify(value); characters += result?.length ?? 0; return result; });
+    try { for (const fixture of fixtures) controls.project(fixture.item, fixture.evidence); }
+    finally { spy.mockRestore(); }
+    controlOracle(controls);
+    return characters;
+  };
+  expect(work(256)).toBeLessThan(work(128) * 2.2);
+});
+
+test.each([[0, null], [5, 5]] as const)("uncorrelated shell result at %s retains shell projection and output inspection", (at, reportClock) => {
+  const workers = new BackgroundWorkers();
+  const started = workers.launch("parent", launch("call", "sh1"), 10);
+  const result = workers.notification("parent", "result", { text: "<shell>\nCaptured output\n</shell>", metadata: { source: "shell", shellID: "sh1", state: "completed", exit: 0 } }, at, reportClock);
+  expect(started[0]).toMatchObject({ item: { status: "running", createdAt: 10 } });
+  expect(result).toHaveLength(1);
+  const update = result![0]!;
+  if (update.kind !== "upsert" || update.item.type !== "background_task") throw new Error("expected independent result");
+  expect(update.item).toMatchObject({ taskType: "shell", outputFile: "shell:sh1", summary: "Captured output", resultId: "result" });
+  expect(update.item).not.toHaveProperty("childConversationId");
+  expect(update.item).not.toHaveProperty("toolUseId");
+  if (reportClock === null) expect(update.item).not.toHaveProperty("terminalReportedAt");
+  expect(compactWorkers([update.item])).toMatchObject([{ kind: "shell", since: 0 }]);
+  expect(taskInspection(update.item)).toEqual({ view: "output" });
+  expect(workers.launch("parent", launch("call", "sh1"), 10)).toEqual(started);
+});
+
+test("settling a pending result also publishes uncertainty for the superseded occurrence", () => {
+  const workers = new BackgroundWorkers();
+  const items = new Map<string, ConversationItem>();
+  const apply = (updates: ReturnType<BackgroundWorkers["launch"]> = []) => {
+    for (const update of updates) {
+      if (update.kind === "upsert") items.set(update.item.id, update.item);
+      if (update.kind === "remove") items.delete(update.itemId);
+    }
+  };
+  workers.verifyChild("child", "parent");
+  const result = { text: "Report", metadata: { source: "subagent", childID: "child", state: "completed" } };
+  apply(workers.notification("parent", "r1", result, 15));
+  apply(workers.notification("parent", "r2", result, 25));
+  const part = (id: string) => ({ id, name: "subagent", state: { status: "completed", input: { description: id }, metadata: { status: "running", sessionID: "child" } } });
+  apply(workers.launch("parent", part("A"), 10));
+  expect(compactWorkers([...items.values()]).find(worker => worker.taskId === "v2:parent:A")?.state).toBe("working");
+  workers.executionEnded("child", 18);
+  const next = workers.launch("parent", part("B"), 20);
+  apply(next);
+  expect(next).toContainEqual(expect.objectContaining({ kind: "upsert", item: expect.objectContaining({ taskId: "v2:parent:A", stateUncertain: true }) }));
+  expect(items.get("task:v2:parent:A")).toMatchObject({ status: "running", stateUncertain: true });
+  expect(items.get("task:v2:parent:B")).toMatchObject({ status: "completed", resultId: "r2", terminalReportedAt: 25 });
+  expect(items.has("task:v2:parent:notification:r2")).toBe(false);
+  expect(items.get("task:v2:parent:notification:r1")).toMatchObject({ resultId: "r1" });
+  expect(compactWorkers([...items.values()]).find(worker => worker.taskId === "v2:parent:A")?.state).toBe("unknown");
+  expect(compactWorkers([...items.values()]).find(worker => worker.taskId === "v2:parent:B")?.state).toBe("completed");
+});
+
+test("a native-clock shell result waits silently for its scoped background launch", () => {
+  const workers = new BackgroundWorkers();
+  const payload = { text: "<shell>\nEarly result\n</shell>", metadata: { source: "shell", shellID: "sh1", state: "completed", exit: 0 } };
+  expect(workers.notification("parent", "result", payload, 15) ?? []).toEqual([]);
+  expect(workers.launch("other-parent", launch("foreign", "sh1"), 10)).toMatchObject([{ item: { status: "running" } }]);
+  const updates = workers.launch("parent", launch("call", "sh1"), 10);
+  expect(updates).toMatchObject([{ kind: "upsert", item: { taskType: "shell", outputFile: "shell:sh1", toolUseId: "call", status: "completed", resultId: "result", summary: "Early result", terminalReportedAt: 15 } }]);
+  const update = updates[0]!;
+  if (update.kind !== "upsert" || update.item.type !== "background_task") throw new Error("expected correlated shell");
+  expect(taskInspection(update.item)).toEqual({ view: "output" });
+  expect(compactWorkers([update.item])).toMatchObject([{ kind: "shell", state: "completed", since: 10, settledAt: 15 }]);
+  expect(workers.notification("parent", "result", payload, 30)).toEqual([]);
+});
+
+test.each([[100, null], [5, 5]] as const)("a prelaunch shell report with unproven occurrence at %s stays independent", (at, reportClock) => {
+  const workers = new BackgroundWorkers();
+  const payload = { text: "Old or undated result", metadata: { source: "shell", shellID: "reused", state: "completed", exit: 0 } };
+  expect(workers.notification("parent", "result", payload, at, reportClock)).toEqual([]);
+  const updates = workers.launch("parent", launch("new", "reused"), 10);
+  expect(updates).toHaveLength(2);
+  const items = updates.flatMap(update => update.kind === "upsert" ? [update.item] : []);
+  expect(items).toContainEqual(expect.objectContaining({ taskId: "v2:parent:new", status: "running" }));
+  const result = items.find(item => item.type === "background_task" && item.resultId === "result");
+  if (result?.type !== "background_task") throw new Error("expected independent shell result");
+  expect(result).toMatchObject({ taskType: "shell", outputFile: "shell:reused", status: "completed" });
+  expect(result).not.toHaveProperty("toolUseId");
+  expect(taskInspection(result)).toEqual({ view: "output" });
+  if (reportClock === null) expect(result).not.toHaveProperty("terminalReportedAt");
+  expect(compactWorkers(items).map(worker => [worker.taskId, worker.kind, worker.state])).toEqual([
+    ["v2:parent:new", "shell", "working"], ["v2:parent:notification:result", "shell", "completed"],
+  ]);
+  expect(workers.notification("parent", "result", payload, 200)).toEqual([]);
+});
+
+test("prior shell membership cannot make an undated old report settle a later occurrence", () => {
+  const workers = new BackgroundWorkers();
+  const items = new Map<string, ConversationItem>();
+  const apply = (updates: ReturnType<BackgroundWorkers["launch"]> = []) => {
+    for (const update of updates) {
+      if (update.kind === "upsert") items.set(update.item.id, update.item);
+      if (update.kind === "remove") items.delete(update.itemId);
+    }
+  };
+  const payload = { text: "Confirmed A result", metadata: { source: "shell", shellID: "reused", state: "completed", exit: 0 } };
+  apply(workers.launch("parent", launch("A", "reused"), 10));
+  apply(workers.notification("parent", "A-result", payload, 20));
+  apply(workers.notification("parent", "undated-old", { ...payload, text: "Old report without a native clock" }, 100, null));
+  const next = workers.launch("parent", launch("B", "reused"), 30);
+  apply(next);
+  expect(items.get("task:v2:parent:B")).toMatchObject({ status: "running", createdAt: 30 });
+  expect(items.get("task:v2:parent:B")).not.toHaveProperty("resultId");
+  const report = items.get("task:v2:parent:notification:undated-old");
+  if (report?.type !== "background_task") throw new Error("expected retained independent old report");
+  expect(report).toMatchObject({ taskType: "shell", outputFile: "shell:reused", summary: "Old report without a native clock", resultId: "undated-old" });
+  expect(report).not.toHaveProperty("toolUseId");
+  expect(report).not.toHaveProperty("terminalReportedAt");
+  expect(taskInspection(report)).toEqual({ view: "output" });
+  expect(compactWorkers([...items.values()]).find(worker => worker.taskId === "v2:parent:B")?.state).not.toBe("completed");
+  expect(items.get("task:v2:parent:A")).toMatchObject({ status: "completed", resultId: "A-result", terminalReportedAt: 20 });
+  checkBytes(workers);
+});
+
+test.each([0, 100])("an undated report at fallback %s arriving after shell reuse leaves the current occurrence uncertain", at => {
+  const workers = new BackgroundWorkers();
+  const payload = { text: "Report", metadata: { source: "shell", shellID: "reused", state: "completed", exit: 0 } };
+  workers.launch("parent", launch("A", "reused"), 10);
+  workers.notification("parent", "A-result", payload, 20);
+  workers.launch("parent", launch("B", "reused"), 30);
+  const updates = workers.notification("parent", "undated-old", payload, at, null);
+  expect(updates).toMatchObject([
+    { kind: "upsert", item: { taskId: "v2:parent:B", status: "running", stateUncertain: true } },
+    { kind: "upsert", item: { taskType: "shell", outputFile: "shell:reused", resultId: "undated-old" } },
+  ]);
+  const items = updates!.flatMap(update => update.kind === "upsert" ? [update.item] : []);
+  expect(compactWorkers(items).find(worker => worker.taskId === "v2:parent:B")?.state).toBe("unknown");
+  const report = items.find(item => item.type === "background_task" && item.resultId === "undated-old");
+  if (report?.type !== "background_task") throw new Error("expected independent undated report");
+  expect(report).not.toHaveProperty("terminalReportedAt");
+  expect(report).not.toHaveProperty("toolUseId");
+  expect(taskInspection(report)).toEqual({ view: "output" });
+  checkBytes(workers);
+});
+
+test("pending shell results cannot settle a verified agent with the same native identity", () => {
+  const workers = new BackgroundWorkers();
+  const payload = { text: "Shell result", metadata: { source: "shell", shellID: "shared-id", state: "completed", exit: 0 } };
+  expect(workers.notification("parent", "shell-result", payload, 15)).toEqual([]);
+  workers.verifyChild("shared-id", "parent");
+  expect(workers.launch("parent", { id: "agent", name: "subagent", state: { status: "completed", metadata: { status: "running", sessionID: "shared-id" } } }, 10)).toMatchObject([
+    { item: { taskType: "agent", childConversationId: "shared-id", status: "running" } },
+  ]);
+  expect(workers.launch("parent", launch("shell", "shared-id"), 10)).toMatchObject([
+    { item: { taskType: "shell", status: "completed", resultId: "shell-result" } },
+  ]);
+});
+
+test("an ambiguous reused-shell result preserves distinct unknown occurrences and output inspection", () => {
+  const workers = new BackgroundWorkers();
+  const items = new Map<string, ConversationItem>();
+  const apply = (updates: ReturnType<BackgroundWorkers["launch"]> = []) => {
+    for (const update of updates) if (update.kind === "upsert") items.set(update.item.id, update.item);
+  };
+  workers.verifyChild("reused", "parent");
+  apply(workers.launch("parent", launch("A", "reused"), 10));
+  workers.executionEnded("reused", 18);
+  apply(workers.launch("parent", launch("B", "reused"), 20));
+  apply(workers.notification("parent", "ambiguous", { text: "Ambiguous result", metadata: { source: "shell", shellID: "reused", state: "completed", exit: 0 } }, 25));
+  expect(items.get("task:v2:parent:A")).toMatchObject({ status: "running", stateUncertain: true });
+  expect(items.get("task:v2:parent:B")).toMatchObject({ status: "running", stateUncertain: true });
+  const result = items.get("task:v2:parent:notification:ambiguous");
+  if (result?.type !== "background_task") throw new Error("expected independent ambiguous result");
+  expect(result).toMatchObject({ taskType: "shell", outputFile: "shell:reused" });
+  expect(result).not.toHaveProperty("toolUseId");
+  expect(taskInspection(result)).toEqual({ view: "output" });
+  expect(compactWorkers([...items.values()]).map(worker => [worker.taskId, worker.kind, worker.state])).toEqual([
+    ["v2:parent:A", "shell", "unknown"], ["v2:parent:B", "shell", "unknown"], ["v2:parent:notification:ambiguous", "shell", "completed"],
+  ]);
+});
+
+test("silent prelaunch shell results consume the entry and byte budgets and latch recovery on saturation", () => {
+  for (const budget of [{ entries: 2 }, { bytes: 900 }]) {
+    const workers = new BackgroundWorkers(budget);
+    const state = retained(workers);
+    for (let i = 0; i < 10; i++) {
+      expect(workers.notification("parent", `result${i}`, { text: "Unconfirmed shell output", metadata: { source: "shell", shellID: `shell${i}`, state: "completed", exit: 0 } }, i)).toEqual([]);
+      checkBytes(workers);
+    }
+    expect(state.recoveryOnly).toBe(true);
+    expect([state.parents, state.tasks, state.notices, state.unmatched, state.ended, state.aliases].every(values => values.size === 0)).toBe(true);
+    expect(state.bytes).toBe(50);
+    expect(state.sizes.size).toBe(0);
+    expect(workers.launch("parent", launch("later", "shell0"), 0)).toEqual([]);
+  }
+});
 
 test.each(["shell", "subagent"])("native %s results sort newest report first, not newest launch", kind => {
   const workers = new BackgroundWorkers();
@@ -42,21 +634,144 @@ test("a relaunched worker has no previous report clock and duplicate old notices
   expect(workers.launch("parent", launch("new", "reused"), 50)).toEqual(next);
 });
 
+test.each(["created", "ran"])("same-call native %s advancement cannot reuse an old occurrence", clock => {
+  const workers = new BackgroundWorkers();
+  workers.verifyChild("child", "parent");
+  const part = { id: "call", name: "subagent", time: { created: 20, completed: 30 }, state: { status: "completed", input: { prompt: "First" }, metadata: { sessionID: "child", status: "running" } } };
+  workers.launch("parent", part, 30);
+  const before = workers.evidenceSnapshot().get("v2:parent:call");
+  const next = workers.launch("parent", { ...part, time: { ...part.time, [clock]: 81, completed: 90 } }, 90);
+  expect(next).toMatchObject([{ item: { taskId: "v2:parent:call", stateUncertain: true } }]);
+  expect(before?.launches[0]).toMatchObject({ created: 20, completed: 30 });
+  expect(before?.launches[0]).not.toHaveProperty("ran");
+});
+
+test("provisional snapshot evidence survives sparse progress and contradictory restatements", () => {
+  const part = { id: "call", name: "subagent", time: { created: 20, ran: 81, completed: 90 }, state: { status: "completed", input: { prompt: "New invocation" }, metadata: { sessionID: "child", status: "running" } } };
+  const snapshot = prepareTool(part, 100).fact;
+  const progress = prepareTool({ id: "call", name: "subagent", state: { status: "running", metadata: { sessionID: "child", status: "running" } } }, 110, "progress").fact;
+  const retained = retainLauncherEvidence(snapshot, progress);
+  expect(retained).toMatchObject({ phase: "snapshot", created: 20, ran: 81, completed: 90, inputFingerprint: snapshot.inputFingerprint });
+  const stale = prepareTool({ ...part, time: { created: 20, completed: 30 }, state: { ...part.state, input: { prompt: "Old invocation" } } }, 120).fact;
+  const both = retainLauncherEvidence(retained, stale);
+  expect(both.conflicted).toBe(true);
+  expect(both.proof).toBeUndefined();
+  expect(launcherChanged(both, { key: "old", taskId: "v2:parent:call", parent: "parent", worker: "child", launches: [stale] })).toBe(true);
+  expect(snapshot.ran).toBe(81);
+});
+
+test.each([false, true])("a foreground snapshot retires a known occurrence before background eligibility (missing child: %s)", missingChild => {
+  const workers = new BackgroundWorkers();
+  workers.verifyChild("child", "parent");
+  const part = { id: "call", name: "subagent", time: { created: 10, completed: 20 }, state: { status: "completed", metadata: { sessionID: "child", status: "running" } } };
+  workers.launch("parent", part, 20);
+  const before = workers.occurrence("v2:parent:call");
+  expect(workers.launch("parent", { ...part, state: { status: "running", input: { background: false }, metadata: missingChild ? {} : part.state.metadata } }, 30)).toEqual([]);
+  expect(before?.uncertain).not.toBe(true);
+  expect(workers.occurrence("v2:parent:call")).toMatchObject({ uncertain: true, worker: "child" });
+  workers.launch("parent", part, 40);
+  expect(workers.occurrence("v2:parent:call")?.uncertain).toBe(true);
+});
+
 // Inspect the budget invariant without exposing accounting as provider API.
 function retained(workers: BackgroundWorkers) {
   return workers as unknown as {
     parents: Map<string, unknown>; tasks: Map<string, unknown>; notices: Set<string>;
     unmatched: Map<string, unknown>; ended: Map<string, unknown>; aliases: Map<string, unknown>;
+    invocations: Map<string, unknown>; terminalProofs: Map<string, unknown>;
     bytes: number; recoveryOnly: boolean; sizes: Map<object, unknown>; boundaries: number;
   };
 }
 
 function checkBytes(workers: BackgroundWorkers) {
   const state = retained(workers);
-  const actual = JSON.stringify([state.parents, state.tasks, state.notices, state.unmatched, state.ended, state.aliases].map(values => [...values])).length * 2;
+  const actual = JSON.stringify([state.parents, state.tasks, state.notices, state.unmatched, state.ended, state.aliases, state.invocations, state.terminalProofs].map(values => [...values])).length * 2;
   expect(state.bytes).toBeGreaterThanOrEqual(actual);
-  expect(state.bytes).toBeLessThanOrEqual(actual + 12);
+  expect(state.bytes).toBeLessThanOrEqual(actual + 16);
 }
+
+test("occurrence-linked replay records share the worker ledger and its irreversible saturation latch", () => {
+  const workers = new BackgroundWorkers({ entries: 8 });
+  workers.verifyChild("child", "parent");
+  const part = { id: "call", name: "subagent", state: { status: "running", input: { prompt: 'Safe "fixture"' }, metadata: { sessionID: "child", status: "running" } } };
+  const fact = prepareTool(part, 10, "called", "message", { id: "invocation", created: 10, durable: { aggregateID: "parent", seq: 1, version: 1 } }).fact;
+  workers.invocation("parent", fact); checkBytes(workers);
+  expect(workers.invocationReplay("parent", fact)).toBe(false);
+  workers.launch("parent", { ...part, time: { created: 10, completed: 20 }, state: { ...part.state, status: "completed" } }, 20); checkBytes(workers);
+  expect(workers.invocationReplay("parent", fact)).toBe(true);
+  const proof = nativeProof({ id: "terminal", created: 30, durable: { aggregateID: "child", seq: 1, version: 1 } }, { child: "child", phase: "ended" });
+  workers.executionEnded("child", 30, proof); checkBytes(workers);
+  expect(workers.terminalReplay("child", proof)).toBe(true);
+  workers.invalidateOwnership("child"); checkBytes(workers);
+  expect(workers.invocationReplay("parent", fact)).toBe(true);
+  expect(workers.terminalReplay("child", proof)).toBe(true);
+  for (let index = 0; index < 10; index++) { workers.verifyChild(`peer${index}`, "parent"); checkBytes(workers); }
+  const state = retained(workers);
+  expect(state.recoveryOnly).toBe(true);
+  expect(workers.controlEvidenceAvailable).toBe(false);
+  expect([state.parents, state.tasks, state.notices, state.unmatched, state.ended, state.aliases, state.invocations, state.terminalProofs].every(values => values.size === 0)).toBe(true);
+  workers.invalidateOwnership(); workers.verifyChild("child", "parent");
+  expect(workers.invocationReplay("parent", fact)).toBe(false);
+  expect(workers.terminalReplay("child", proof)).toBe(false);
+  expect(state.recoveryOnly).toBe(true); checkBytes(workers);
+});
+
+test.each(["child", "parent", "foreign", undefined])("ownership invalidation revokes only affected verification (%s), preserving occurrence history", sessionId => {
+  const workers = new BackgroundWorkers();
+  const state = retained(workers);
+  workers.verifyChild("child", "parent");
+  workers.verifyChild("peer", "parent");
+  workers.verifyChild("foreign", "other-parent");
+  const part = (id: string) => ({ id, name: "subagent", state: { status: "completed", metadata: { status: "running", sessionID: "child" } } });
+  workers.launch("parent", part("A"), 10);
+  workers.launch("parent", part("alias"), 12);
+  workers.executionEnded("child", 18);
+  const payload = { text: "Confirmed result", metadata: { source: "subagent", childID: "child", state: "completed" } };
+  const terminal = workers.notification("parent", "result", payload, 20);
+  if (!terminal) throw new Error("expected verified terminal result");
+  workers.notification("parent", "unmatched", { text: "Pending result", metadata: { source: "subagent", childID: "peer", state: "completed" } }, 50);
+  const history = () => JSON.stringify([state.tasks, state.notices, state.unmatched, state.ended, state.aliases].map(values => [...values]));
+  const before = history();
+  const boundaries = state.boundaries;
+  workers.invalidateOwnership(sessionId);
+  expect(history()).toBe(before);
+  expect(state.boundaries).toBe(boundaries);
+  expect(state.recoveryOnly).toBe(false);
+  expect([...state.parents]).toEqual(sessionId === undefined ? [] : sessionId === "parent"
+    ? [["foreign", "other-parent"]]
+    : sessionId === "child" ? [["peer", "parent"], ["foreign", "other-parent"]]
+    : [["child", "parent"], ["peer", "parent"]]);
+  checkBytes(workers);
+  if (sessionId !== "foreign") {
+    expect(workers.launch("parent", part("A"), 100)).toEqual([]);
+    expect(workers.notification("parent", "unverified", payload, 100)).toBeUndefined();
+    workers.executionEnded("child", 100);
+    expect(history()).toBe(before);
+    workers.verifyChild("child", "parent");
+  }
+  expect(workers.launch("parent", part("A"), 100)).toEqual(terminal);
+  expect(workers.launch("parent", part("alias"), 100)).toEqual(terminal);
+  expect(workers.notification("parent", "result", payload, 100)).toEqual([]);
+  expect(history()).toBe(before);
+  checkBytes(workers);
+});
+
+test("a revoked running agent cannot republish trusted worker facts until its actual parent is reverified", () => {
+  const workers = new BackgroundWorkers();
+  const part = { id: "running", name: "subagent", state: { status: "completed", metadata: { status: "running", sessionID: "child" } } };
+  workers.verifyChild("child", "parent");
+  const running = workers.launch("parent", part, 10);
+  expect(running).toMatchObject([{ item: { status: "running", childConversationId: "child" } }]);
+  workers.invalidateOwnership("child");
+  expect(workers.launch("parent", part, 20)).toEqual([]);
+  expect(workers.notification("parent", "unverified", { text: "Unverified result", metadata: { source: "subagent", childID: "child", state: "completed" } }, 20)).toBeUndefined();
+  workers.verifyChild("child", "other-parent");
+  expect(workers.launch("parent", part, 20)).toEqual([]);
+  workers.invalidateOwnership("unrelated-lifecycle");
+  workers.verifyChild("child", "parent");
+  expect(workers.launch("parent", part, 20)).toEqual(running);
+  checkBytes(workers);
+});
 
 test("incremental byte ledger bounds the serialized oracle through replacements, aliases, results and deletions", () => {
   const workers = new BackgroundWorkers();
@@ -110,10 +825,16 @@ test("byte and entry saturation clear the complete ledger and never resume parti
     const state = retained(workers);
     for (let i = 0; i < 10; i++) workers.launch("parent", launch(`call${i}`), i);
     expect(state.recoveryOnly).toBe(true);
-    expect([state.parents, state.tasks, state.notices, state.unmatched, state.ended, state.aliases].every(values => values.size === 0)).toBe(true);
+    expect([state.parents, state.tasks, state.notices, state.unmatched, state.ended, state.aliases, state.invocations, state.terminalProofs].every(values => values.size === 0)).toBe(true);
     expect(state.sizes.size).toBe(0);
-    expect(state.bytes).toBe(38);
+    expect(state.bytes).toBe(50);
     expect(state.boundaries).toBe(0);
+    workers.invalidateOwnership("child");
+    workers.invalidateOwnership();
+    workers.verifyChild("child", "parent");
+    expect(state.recoveryOnly).toBe(true);
+    expect(state.parents.size).toBe(0);
+    expect(state.bytes).toBe(50);
     expect(workers.launch("parent", launch("later"), 20)).toEqual([]);
   }
 });

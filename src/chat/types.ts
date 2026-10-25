@@ -900,6 +900,8 @@ export type QueuedMessage = {
   paused?: true;
   // Admission/resume/withdrawal may have applied. Reconcile read-only, never resend.
   unconfirmed?: true;
+  // Server-issued only for settled unknown admission; never resume/withdrawal.
+  admissionUncertaintyId?: string;
   requestId?: string;
   // Attachment references held with the message; delivered exactly as
   // submitted, discarded with the message on removal.

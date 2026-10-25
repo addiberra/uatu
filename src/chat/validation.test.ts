@@ -103,6 +103,16 @@ const items = [
 ] as const;
 
 describe("chat domain validation", () => {
+  test("only an unconfirmed entry can carry a bounded admission uncertainty identity", () => {
+    const entry = { id: "unknown", text: "Keep text", queuedAt: 1, delivery: "steer", unconfirmed: true, admissionUncertaintyId: "opaque-1" } as const;
+    expect(parseQueuedMessages([entry])).toEqual([entry]);
+    for (const admissionUncertaintyId of ["", null, 1, "x".repeat(513), "bad\nidentity"]) {
+      expect(() => parseQueuedMessages([{ ...entry, admissionUncertaintyId }])).toThrow();
+    }
+    expect(() => parseQueuedMessages([{ ...entry, unconfirmed: undefined }])).toThrow();
+    expect(parseQueuedMessages([{ ...entry, delivery: "queue" }])).toEqual([{ ...entry, delivery: "queue" }]);
+  });
+
   test("unconfirmed pending admission is an explicit true-only marker", () => {
     const entry = { id: "held", text: "Keep text", queuedAt: 1, delivery: "queue", paused: true, unconfirmed: true } as const;
     expect(parseQueuedMessages([entry])).toEqual([entry]);

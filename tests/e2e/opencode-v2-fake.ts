@@ -80,6 +80,7 @@ export type OpenCodeV2Fake = {
   appendHistory(sessionId: string, count: number): void;
   loseNextBackgroundResponse(): void;
   loseNextPromptResponse(): void;
+  unknownNextPromptBeforeAdmission(): void;
   loseNextResumeResponse(): void;
   refuseNextBackground(): void;
   launchShellOnNextSteer(sessionId: string): void;
@@ -124,6 +125,7 @@ export function startOpenCodeV2Fake(options: { directory: string; password?: str
   const shells = new Map<string, { parent: SessionState; message: StoredMessage; background: boolean; removed: boolean; exited: boolean; waiter: "pending" | "exited" | "failed"; captured: boolean; captureBeforeRemove: boolean; output: string | null }>();
   let loseBackground = false;
   let losePrompt = false, loseResume = false, refuseBackground = false;
+  let unknownBeforeAdmission = false;
   const shellAfterAdmission = new Set<string>();
   let loseWorker = false;
   let counter = 0;
@@ -429,6 +431,10 @@ export function startOpenCodeV2Fake(options: { directory: string; password?: str
       return noContent();
     }
     if (sub === "POST prompt") {
+      if (body.delivery === "steer" && unknownBeforeAdmission) {
+        unknownBeforeAdmission = false;
+        return new Response("synthetic unknown response before fixture admission", { status: 500 });
+      }
       const files = Array.isArray(body.files)
         ? (body.files as Array<{ uri: string; name: string }>).map(file => ({ mime: mimeOf(file.name), name: file.name, source: { type: "uri" as const, uri: file.uri } }))
         : undefined;
@@ -575,6 +581,7 @@ export function startOpenCodeV2Fake(options: { directory: string; password?: str
       shells.clear();
       loseBackground = false;
       losePrompt = loseResume = refuseBackground = false;
+      unknownBeforeAdmission = false;
       shellAfterAdmission.clear();
       loseWorker = false;
       eventsPaused = false;
@@ -606,6 +613,7 @@ export function startOpenCodeV2Fake(options: { directory: string; password?: str
     },
     loseNextBackgroundResponse() { loseBackground = true; },
     loseNextPromptResponse() { losePrompt = true; },
+    unknownNextPromptBeforeAdmission() { unknownBeforeAdmission = true; },
     loseNextResumeResponse() { loseResume = true; },
     refuseNextBackground() { refuseBackground = true; },
     launchShellOnNextSteer(sessionId) { if (!sessions.has(sessionId)) throw new Error("Unknown fixture parent"); shellAfterAdmission.add(sessionId); },

@@ -58,6 +58,7 @@ class StubAgentService implements WorkspaceChatService {
     });
   }
   async removeQueued(id: string, messageId: string) { return this.record("removeQueued", [id, messageId], { removed: true as const }); }
+  async discardUnconfirmedSteer(id: string, messageId: string, requestId: string, uncertaintyId: string) { return this.record("discardUnconfirmedSteer", [id, messageId, requestId, uncertaintyId], { discarded: true as const, outcomeUnconfirmed: true as const }); }
   async changeDelivery(id: string, messageId: string, _requestId: string, delivery: MessageDelivery) { return this.record("changeDelivery", [id, messageId, delivery], { messageId, delivery }); }
   async sendNow(id: string, messageId: string) { return this.record("sendNow", [id, messageId], { messageId, delivery: "queue" as const }); }
   async saveAttachment(): Promise<{ id: string; mimeType: string; sizeBytes: number }> { throw new Error("unused: the router owns the store"); }

@@ -46,7 +46,11 @@ channels:
           restates the workspace-held message queue after a message is held,
           removed, or delivered, so every client shows the same queue at the
           same point in the stream. All three are ordered, replayable,
-          idempotent projections of conversation state. A resync never
+          idempotent projections of conversation state. An eligible unknown
+          admission may carry admissionUncertaintyId for explicit local-only
+          discard; its removed change does not confirm native cancellation,
+          non-delivery or original-operation failure. Other messages remain
+          queued and the original may still arrive. A resync never
           arrives as a data event. It arrives as a `resync` signal carrying
           the workspace's resync event.
           Background `item.upsert` payloads may carry `terminalReportedAt`,

@@ -38,6 +38,11 @@ function degradedReceiptState(session: RunningSession) {
   return state;
 }
 
+export function isLocalDiscardAction(method: string, pathname: string, basePath: string): boolean {
+  return method === "POST" && pathname.startsWith(basePath)
+    && /^api\/chat\/conversations\/[^/]+\/queue\/[^/]+\/discard-unconfirmed$/.test(pathname.slice(basePath.length));
+}
+
 // Structural subset of Bun.Server the bridge needs for the handshake.
 export type UpgradableServer = {
   upgrade(request: Request, options?: { data?: unknown }): boolean;
@@ -120,7 +125,8 @@ export async function proxyHttp(request: Request, session: RunningSession, polic
   const requestHeaders = forwardedHeaders(request, session);
   let requestBody: BodyInit | null = request.body;
   let policyUnavailable = false;
-  if (policy && isChildPolicyAction(request.method, requestUrl.pathname, session.basePath)) {
+  const localDiscard = isLocalDiscardAction(request.method, requestUrl.pathname, session.basePath);
+  if (policy && (localDiscard || isChildPolicyAction(request.method, requestUrl.pathname, session.basePath))) {
     const reader = request.body?.getReader();
     let text = "";
     try {
@@ -136,23 +142,39 @@ export async function proxyHttp(request: Request, session: RunningSession, polic
       text += decoder.decode();
     } catch { return Response.json({ error: "invalid request body" }, { status: 400 }); }
     finally { if (reader) void reader.cancel().catch(() => undefined); }
-    const envelope = signSessionChatPolicy(session, { method: request.method, pathname: requestUrl.pathname, body: text }, policy);
-    if (envelope) requestHeaders.set(CHILD_POLICY_HEADER, envelope);
-    else {
-      policyUnavailable = policy.autoBackgroundOnSteer || policy.unavailable === true;
-      // Preserve the original requestId for browser/projection correlation.
-      // Only the server-selected authenticated account selects this opaque
-      // receipt namespace. It carries no automation permission to the child.
+    if (localDiscard) {
+      // Discard has no correlation echo or automatic policy. Namespace only
+      // its operation ID using the Hub-verified caller, never caller headers.
+      // Preserve malformed IDs for the child's normal closed validator.
       let body: unknown;
-      try { body = JSON.parse(text); } catch { /* The child's closed validator owns body refusal. */ }
-      if (body && typeof body === "object" && "requestId" in body && typeof body.requestId === "string") {
-        const state = degradedReceiptState(session);
+      try { body = JSON.parse(text); } catch { /* Child owns JSON refusal. */ }
+      if (body && typeof body === "object" && !Array.isArray(body) && "requestId" in body
+        && typeof body.requestId === "string" && body.requestId.length > 0 && body.requestId.length <= 512
+        && !/[\u0000-\u001f\u007f]/.test(body.requestId)) {
         try {
-          const first = await state.identify({ principal: policy.principal, method: request.method, pathname: requestUrl.pathname, requestId: body.requestId }, policyUnavailable);
-          requestHeaders.set(CHAT_OPERATION_RECEIPT_HEADER, first.token);
-          policyUnavailable = first.unavailable;
+          const scoped = await degradedReceiptState(session).identify({ principal: policy.principal, method: request.method, pathname: requestUrl.pathname, requestId: body.requestId }, false);
+          text = JSON.stringify({ ...body, requestId: scoped.token });
+        } catch { return Response.json({ error: "operation receipt capacity unavailable" }, { status: 503, headers: { "cache-control": "no-store" } }); }
+      }
+    } else {
+      const envelope = signSessionChatPolicy(session, { method: request.method, pathname: requestUrl.pathname, body: text }, policy);
+      if (envelope) requestHeaders.set(CHILD_POLICY_HEADER, envelope);
+      else {
+        policyUnavailable = policy.autoBackgroundOnSteer || policy.unavailable === true;
+        // Preserve the original requestId for browser/projection correlation.
+        // Only the server-selected authenticated account selects this opaque
+        // receipt namespace. It carries no automation permission to the child.
+        let body: unknown;
+        try { body = JSON.parse(text); } catch { /* The child's closed validator owns body refusal. */ }
+        if (body && typeof body === "object" && "requestId" in body && typeof body.requestId === "string") {
+          const state = degradedReceiptState(session);
+          try {
+            const first = await state.identify({ principal: policy.principal, method: request.method, pathname: requestUrl.pathname, requestId: body.requestId }, policyUnavailable);
+            requestHeaders.set(CHAT_OPERATION_RECEIPT_HEADER, first.token);
+            policyUnavailable = first.unavailable;
+          }
+          catch { return Response.json({ error: "operation receipt capacity unavailable" }, { status: 503, headers: { "cache-control": "no-store" } }); }
         }
-        catch { return Response.json({ error: "operation receipt capacity unavailable" }, { status: 503, headers: { "cache-control": "no-store" } }); }
       }
     }
     requestBody = text;

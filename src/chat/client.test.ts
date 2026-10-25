@@ -12,6 +12,20 @@ afterEach(() => {
 });
 
 describe("chat API client", () => {
+  test("discard posts only the scoped uncertainty token and requires an explicit unknown-outcome acknowledgement", async () => {
+    Reflect.set(globalThis, "document", { querySelector: () => ({ getAttribute: () => "/s/work/" }) });
+    resetAppBasePathForTests();
+    const calls: Array<{ url: string; method: string | undefined; body: unknown }> = [];
+    const client = new ChatApiClient(async (url, init) => {
+      calls.push({ url: String(url), method: init?.method, body: JSON.parse(String(init?.body)) });
+      return Response.json({ discarded: true, outcomeUnconfirmed: true });
+    });
+    expect(await client.discardUnconfirmedSteer("opencode:c/1", "pending/1", "discard-1", "token-1")).toEqual({ discarded: true, outcomeUnconfirmed: true });
+    expect(calls).toEqual([{ url: "/s/work/api/chat/conversations/opencode%3Ac%2F1/queue/pending%2F1/discard-unconfirmed", method: "POST", body: { requestId: "discard-1", uncertaintyId: "token-1" } }]);
+    for (const body of [null, {}, { removed: true }, { discarded: true }, { discarded: true, outcomeUnconfirmed: false }, { discarded: "true", outcomeUnconfirmed: true }, { discarded: true, outcomeUnconfirmed: true, cancelled: true }]) {
+      await expect(new ChatApiClient(async () => Response.json(body)).discardUnconfirmedSteer("c", "m", "r", "u")).rejects.toBeInstanceOf(ChatTransportError);
+    }
+  });
   test("native side answers use qualified base paths and closed responses without retry", async () => {
     Reflect.set(globalThis, "document", { querySelector: () => ({ getAttribute: () => "/s/work/" }) });
     resetAppBasePathForTests();

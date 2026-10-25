@@ -42,6 +42,28 @@ type Inventory = { operations: Array<{ operationId: string; domain: string; meth
 type Streaming = { channels: Record<string, unknown>; schemas: Record<string, object> };
 
 describe("API contract structure", () => {
+  test("admission uncertainty is optional, closed, and restricted to unconfirmed entries in Workspace 31", async () => {
+    const { parseQueuedMessages } = await import("../src/chat/validation");
+    const { WORKSPACE_API_REVISION, HUB_API_REVISION, BUNDLED_WEB_REVISION } = await import("../src/shared/version");
+    expect([WORKSPACE_API_REVISION, HUB_API_REVISION, BUNDLED_WEB_REVISION]).toEqual([31, 11, 3]);
+    const spec = await readYaml<{ components: { schemas: Record<string, object> } }>("api/openapi.yaml");
+    const schema = spec.components.schemas.QueuedMessage as { properties: Record<string, object> };
+    const validate = createAjv().compile(schemaForAjv(schema, spec.components.schemas));
+    const entry = { id: "unknown", text: "Keep input", delivery: "steer", queuedAt: 1, unconfirmed: true, admissionUncertaintyId: "opaque-1" };
+    expect(validate(entry), JSON.stringify(validate.errors)).toBe(true);
+    expect(parseQueuedMessages([entry])).toEqual([entry]);
+    expect(validate({ ...entry, delivery: "queue" })).toBe(true);
+    expect(parseQueuedMessages([{ ...entry, delivery: "queue" }])).toEqual([{ ...entry, delivery: "queue" }]);
+    for (const invalid of [{ ...entry, unconfirmed: undefined }, ...["", null, 1, "x".repeat(513), "bad\nidentity"].map(admissionUncertaintyId => ({ ...entry, admissionUncertaintyId }))]) {
+      expect(validate(invalid)).toBe(false);
+      expect(() => parseQueuedMessages([invalid])).toThrow();
+    }
+    const { admissionUncertaintyId: _token, ...previousProperties } = schema.properties;
+    const previous = createAjv().compile(schemaForAjv({ ...schema, properties: previousProperties }, spec.components.schemas));
+    expect(previous(entry)).toBe(false);
+    const { admissionUncertaintyId: _value, ...legacy } = entry;
+    expect(previous(legacy)).toBe(true);
+  });
   test("background terminal report clocks agree across closed wire validators and retain absence", async () => {
     const { parseConversationItem, parseChatEvent } = await import("../src/chat/validation");
     const spec = await readYaml<{ components: { schemas: Record<string, object> } }>("api/openapi.yaml");
@@ -215,7 +237,7 @@ describe("API contract structure", () => {
   test("metadata revisions agree with OpenAPI and changelog", async () => {
     const [metadata, openapi, changelog] = await Promise.all([
       readJson<{ stability: "experimental" | "stable"; hubApiRevision: number; workspaceApiRevision: number }>("api/contract.json"),
-      readYaml<{ info: { version: string; "x-uatu-revisions": { hubApiRevision: number; workspaceApiRevision: number } } }>("api/openapi.yaml"),
+      readYaml<{ info: { version: string; summary: string; "x-uatu-revisions": { hubApiRevision: number; workspaceApiRevision: number } } }>("api/openapi.yaml"),
       Bun.file(new URL("CHANGELOG.md", new URL("./", import.meta.url))).text(),
     ]);
     expect(openapi.info["x-uatu-revisions"]).toEqual({
@@ -227,6 +249,7 @@ describe("API contract structure", () => {
     // publishes a document whose version names the previous generation.
     const tag = metadata.stability === "experimental" ? "-experimental" : "";
     expect(openapi.info.version).toBe(`${metadata.hubApiRevision}.${metadata.workspaceApiRevision}.0${tag}`);
+    expect(openapi.info.summary).toBe(`Hub revision ${metadata.hubApiRevision} and workspace revision ${metadata.workspaceApiRevision}`);
     expect(changelog).toContain(`## Hub ${metadata.hubApiRevision} / Workspace ${metadata.workspaceApiRevision}`);
     expect(changelog).toMatch(/Compatibility: (initial|additive|breaking)/);
     expect(changelog).toMatch(/### Migration\n\n\S/);

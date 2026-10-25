@@ -1,6 +1,6 @@
 ## Context
 
-See proposal.md, "Why". The current state that shapes this design:
+See proposal.md, "Why". The baseline below records the original API24 / OpenCode 2.0.28 investigation; its source locations and pre-steering behavior are historical. The current repository pins `@opencode/client` 2.1.2. D5 and the migration plan describe the current API31 contract; D14–D17 record the approved review-fix design.
 
 - **The archived decision.** `own-chat-message-queue` (archive 2026-08-23, design D1–D3) made every busy submission Uatu-held. The reason was that the OpenCode server pinned then could not withdraw an admitted input, and that design's Non-Goals said steer "may return later as an explicit action". OpenCode 2.x's session inbox can now list, cancel, and re-deliver pending input, so that reason no longer applies to 2.x. This change reverses the "no steer" decision for 2.x only. Every other decision in that design still holds: the workspace owns the queue, admission is serialized, cancel leaves the queue dormant, queue state rides the snapshot and event stream, and the dock sits at the composer.
 - **The adapter's queue** (`src/chat/adapter.ts`). `prompt()` (≈:897) holds a busy or behind-queue submission in `heldQueues` (≈:306), with its model, mode, and variant fixed at submission (≈:963–981). The bound is `MAX_HELD_MESSAGES = 20` and `MAX_HELD_TEXT_BYTES = 256 KiB` (≈:170). `scheduleDelivery`/`deliverNextHeld` (≈:1232–1294) release the head on an idle or completed transition, and `dormantQueues` pauses delivery. `removeQueued` (≈:1007) and `abort` (≈:1335) run through the per-conversation admission lane `enqueuePromptAdmission`. A staged revert dispatches the replacement immediately, ahead of the paused queue (≈:933–950). Every dispatch goes through `dispatchPrompt` (≈:1099), which calls `provider.prompt(..., delivery: "queue")` or `provider.command(...)`.
@@ -76,10 +76,12 @@ The adapter keeps a per-conversation pending-steer map built from these deltas. 
 - New routes:
   - `PATCH /api/chat/conversations/:id/queue/:messageId {requestId, delivery}` switches delivery.
   - `POST …/queue/:messageId/send-now {requestId}` sends a message now.
+  - `POST …/queue/:messageId/discard-unconfirmed {requestId, uncertaintyId}` removes only an eligible uncertain local admission record (D14).
   - The existing `DELETE` removes a steer as well as a held message.
 
-  All three are origin-protected, receipt-keyed, run in the admission lane, and are registered once in `src/server/routes.ts`. They are classified as internal session-child routes in the contract coverage, like the existing queue `DELETE`.
-- `WORKSPACE_API_REVISION` goes from 24 to 25. The code is at 24 and v0.8.0 shipped 24, so this needs a new `api/CHANGELOG.md` entry. `api/openapi.yaml`'s `QueuedMessage` and queue-event schemas are updated, and `validation.ts` accepts exactly the new keys and kinds.
+  All queue-entry mutations are origin-protected, receipt-keyed, run in the admission lane, and are registered once in `src/server/routes.ts`. They remain internal session-child exclusions in contract coverage.
+- `QueuedMessage.admissionUncertaintyId?: string` is an opaque server-issued eligibility token, not an inference from generic `unconfirmed`. The strict discard response is `{discarded: true, outcomeUnconfirmed: true}`. Queue change `removed` describes local-record removal without claiming native cancellation.
+- The original steering work introduced Workspace API25 from 24; intervening work reached 30. The strict admission-token/discard contract now requires Workspace API31, retaining Hub API11 and bundled web revision3. Update the API changelog, contract, schemas, examples and validators together.
 
 ### D6. Prompt admission decision table (adapter)
 
@@ -156,9 +158,45 @@ The existing check counts pending steers plus held messages against 20 messages 
 
 ### D13. Test harness
 
-The chat Playwright suites (`tests/e2e/chat-queue.e2e.ts` and the others) run against `FakeE2EChatService` (`tests/e2e/chat-service.ts`), which replaces the whole chat service. No fake OpenCode server exists in `tests/e2e/`; the only scripted 2.x server is the `fetch` stub in `src/chat/opencode/v2/provider.test.ts`. This change adds `tests/e2e/opencode-v2-fake.ts`. It is a small scripted HTTP plus SSE server that implements the 2.0.28 routes the provider calls (session, prompt with delivery and resume, inbox list/cancel, interrupt, switchModel/switchAgent, event stream), and it is driven through `/__e2e/chat` control calls. `tests/e2e/server.ts` registers it as an extra agent served by the real `ChatAdapter` and `OpenCodeV2Provider`. The Claude Send now flow uses the existing `FakeE2EChatService` (`claude` agent) extended with `send-now`. *Alternative rejected:* extending `FakeE2EChatService` with steering. It is cheaper, but it would not exercise the adapter or provider in e2e.
+Shared chat Playwright suites use `FakeE2EChatService` (`tests/e2e/chat-service.ts`). Steering and discard integration instead use `tests/e2e/opencode-v2-fake.ts`, a scripted HTTP/SSE native server registered by `tests/e2e/server.ts` behind the real `ChatAdapter` and `OpenCodeV2Provider`. Its route contract follows the current pinned client 2.1.2. Controls under `/__e2e/chat` include a failure before native admission, allowing a genuinely unknown outcome with nothing delivered. The Claude Send now flow retains the shared fake service. *Alternative rejected:* implementing all steering in the fake chat service, which would bypass adapter/provider integration.
 
-The real manual pass targets installed OpenCode 2.0.29, as approved on 2026-10-15. This changes only the real verification target: the SDK and scripted fake remain pinned to 2.0.28, and fake-server checks do not count as the real manual pass.
+The OpenCode 2.0.29 manual target approved on 2026-10-15 remains historical acceptance evidence, not proof of today's installed runtime. Scripted checks do not close outstanding real-agent or real-device checks. Discard coverage must include adapter races, strict HTTP validation and scoped receipts, cancellation of the confirmation, stale callbacks, draft preservation, and desktop/touch Chromium/WebKit interaction evidence.
+
+### D14. Explicit local discard for unknown admission
+
+Only a settled unknown **admission** exposes a fresh `admissionUncertaintyId`; an in-flight request, confirmed entry, resume uncertainty or withdrawal uncertainty does not. Eligibility includes a held Queue entry whose attempted switch to steer became unknown. The admission lane rechecks the exact entry, submission/native identity and token. Receipts identify conversation, message, token and request, with existing transport caller scoping retained. Stale tokens cannot turn local discard into native Remove.
+
+Accepted scope limitation: an adapter timeout does not retire an upstream request that is still pending. If that transport never settles, no discard token is exposed. Safe local-ownership retirement for indefinitely pending transports is deferred; no restart, cancellation or replay is performed automatically.
+
+`discardUnconfirmedSteer(conversationId, messageId, requestId, uncertaintyId)` returns `{discarded: true, outcomeUnconfirmed: true}`. It performs no provider lookup, prompt, cancel, resume or background action. It removes only local ownership, preserves the original unknown receipt, fences stale reads/acknowledgements and never replays the original. Genuine later inbox/history evidence remains representable without resurrecting the discarded held copy.
+
+The confirmation is titled **Discard local record?**, initially focuses Cancel, and explains: “Delivery of this message is unconfirmed. Removing Uatu’s local record does not cancel or resend it; the original may still arrive. Other messages will stay queued until you choose Send now or a later normal idle transition.” The browser rechecks the token after confirmation, preserves unrelated drafts and uses a per-entry action lock.
+
+Discard invalidates deferred drains scheduled before it. Remaining messages wait for explicit Send now or a genuinely later normal idle transition; derived recovery completion is not such a transition. Resume/withdrawal restrictions and same-native-ID explicit withdrawal retries remain unchanged. Missing inbox/history entries never establish non-delivery.
+
+### D15. Bounded, progressive read-only recovery
+
+Separate genuine read errors from successful but inconclusive evidence. Errors retain exponential backoff. An external recovery cycle permits three unchanged successful-inconclusive reads (initial plus two probes), then waits for new native/source evidence, explicit refresh or a new stream generation. This budget does not establish completion, cancellation or non-application. Verified discovery progress may continue recovery; retries and zero-progress housekeeping cannot reset the budget themselves.
+
+Dirty source updates coalesce through a fixed 100ms throttle rather than a trailing-only debounce. Apply safe per-item results despite unrelated updates, fencing newer occurrence aliases and rows. Structural replacement/revert, deletion and stream-generation changes invalidate affected stale reads. New connections reset the cycle and retire old timers. Saturation discovery must remain recoverable without requiring reconnect; no mutation is replayed.
+
+### D16. Queue identity and settlement retention
+
+After awaited dispatch, remove the accepted object from the **current** held queue by identity, not by shifting a previously captured array. This applies to automatic delivery and non-steering Send now, preserving FIFO and any concurrent reconciliation replacement.
+
+Settlement markers survive projection eviction while queue/in-flight owners need them. Historical retention is bounded to 2,048, with currently owned settled conversations pinned: total retained markers are at most `max(2,048, currently owned settled conversations)`, not a hard total of 2,048. Unowned historical conversations cannot grow the cache indefinitely.
+
+### D17. Bounded per-target Stop verification
+
+Stop targets a specific native worker occurrence, not whichever execution later happens to use the same child. Canonical event preparation supplies the same immutable identity, launcher clocks, aliases and replay evidence to normalization, background folding and authorization before ownership awaits. Progress, alias folding or lagging history cannot erase a known supersession or restore revoked trust. Proven consumed replay is distinct from first-seen ambiguous evidence; timestamps alone do not establish that an event is historical.
+
+Keep control evidence separately from disposable display/correlation records. Its provider-lifetime cohort reserves up to 1 MiB / 2,048 evidence entries **within**, not in addition to, the existing 4 MiB / 8,192 live-entry aggregate. Account complete retained entries, aliases, witnesses, observations, indexes and stubs as serialized logical payload, not a heap measurement. Projection saturation may retain its recovery-only latch without disabling healthy retained verified targets.
+
+Before offering an enabled Stop, reserve a retained control basis and enough space for an unavailable/revoked stub. Growth overflow compacts the affected target rather than forgetting its contradiction and silently readmitting it from history. No TTL or LRU expiry restores control trust. Terminal/deleted targets may compact to stubs; an old target identity must not be redirected to a newer execution. Unretained targets can remain unavailable for the provider lifetime. Stream replacement preserves known revocations while invalidating in-flight authorizations; disposal ends that in-memory ownership lifetime.
+
+Private recovery carries candidate occurrence evidence and the retained control-basis revision. It can confirm a compatible non-revoked target only with successful confinement/current-state reads, no unresolved conflict or observation gap, and scoped fences valid through dispatch. Fresh history or an empty ledger alone cannot reconstruct discarded ephemeral contradictions. Final uncached ownership verification remains required; native interrupt still has no atomic occurrence precondition after final validation.
+
+Live publication, history and reconciliation apply the same availability decision: retained verified targets may offer Stop; missing, revoked or overflowed targets use the existing `stateUncertain:true` presentation, withholding Stop rather than showing a certain row that repeatedly fails. These are limits on retained verification evidence, not worker execution or message delivery. No automatic restart, cancellation, mutation replay or data deletion is introduced. This policy was approved on 2026-10-25 and requires no new public field or API revision beyond Workspace31 / Hub11 / bundled web3.
 
 ## Risks / Trade-offs
 
@@ -173,7 +211,7 @@ The real manual pass targets installed OpenCode 2.0.29, as approved on 2026-10-1
 
 ## Migration Plan
 
-This is one deployable change with no data migration. The workspace API revision goes from 24 to 25, with an `api/CHANGELOG.md` entry. Strict consumers (web, Desktop WebView) ship the same assets, and the freshness handshake makes a stale pairing diagnosable. Rollback is a revert. The release note is a visible `feat(chat)`, because steering is new user-facing behavior.
+This is one deployable change with no data migration. Review fixes advance Workspace API30 to 31, retaining Hub API11 and bundled web revision3, with matching API changelog, schema, contract, example and validator changes. The original steering API24→25 transition remains historical context. Strict consumers require compatible contracts/assets; the freshness handshake makes a stale pairing diagnosable. Rollback is a normal revert. The release note remains a visible `feat(chat)`, because steering is new user-facing behavior. Local review fixes do not authorize deployment or alteration of saved native history.
 
 ## Open Questions
 

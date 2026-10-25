@@ -1146,6 +1146,8 @@ for (const browserName of ["chromium", "webkit"] as const) test.describe(`steeri
         return { hidden: (node as HTMLElement).hidden, progress: parseFloat((node as HTMLElement).style.getPropertyValue("--hold-progress")), top: box.top, bottom: box.bottom, height: box.height, capBottom: cap.bottom, text: node.textContent,
           extension: original.y - box.top, unoccluded, ancestors };
       }, original));
+      // Assert at the sample before potentially slow artifact I/O.
+      expect(accepted).toHaveLength(0);
       const path = info.outputPath(`hold-${browserName}-${theme}-${scene.width}-vv${scene.visual}-${ms}ms.png`);
       await page.screenshot({ path });
       await recordEvidence(info, path);
@@ -1156,7 +1158,6 @@ for (const browserName of ["chromium", "webkit"] as const) test.describe(`steeri
     expect(frames[1]!.extension).toBe(Math.min(104, original.y - 8));
     expect(frames[1]!.progress).toBeLessThan(frames[2]!.progress);
     expect(frames[2]!.progress).toBeLessThan(frames[3]!.progress);
-    expect(accepted).toHaveLength(0);
     for (const frame of frames.slice(1)) {
       expect(frame.hidden).toBe(false);
       expect(frame.height).toBe(frames[1]!.height);

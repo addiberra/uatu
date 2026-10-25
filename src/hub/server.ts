@@ -48,6 +48,7 @@ import { isPathAtOrBelow, normalizeAbsolutePath, pathsOverlap, type PathReservat
 import {
   bridgeWebSocketHandlers,
   childUrlFor,
+  isLocalDiscardAction,
   proxyHttp,
   upgradeToBridge,
   type BridgeData,
@@ -1698,6 +1699,10 @@ export function createHubFetchHandler(deps: HubDeps) {
       }
       if (request.headers.get("upgrade")?.toLowerCase() === "websocket") {
         return upgradeToBridge(request, server, running);
+      }
+      if (isLocalDiscardAction(request.method, url.pathname, running.basePath)) {
+        // Identity only: discard cannot consult or apply automatic policy.
+        return proxyHttp(request, running, { principal: session.user, revision: 0, autoBackgroundOnSteer: false });
       }
       if (isChildPolicyAction(request.method, url.pathname, running.basePath)) {
         let policy: VerifiedChatPolicy;

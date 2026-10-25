@@ -1134,6 +1134,16 @@ function buildChatRoutes(deps: BuildRoutesDeps, p: (path: string) => string) {
       }),
     },
     // Sends a pending message now (D8).
+    [p("/api/chat/conversations/:conversationId/queue/:messageId/discard-unconfirmed")]: {
+      POST: async (request: RouteRequest) => chatMutation(request, ["requestId", "uncertaintyId"], async (id, body) => {
+        const messageId = routeIdentity(request, "messageId");
+        if (messageId instanceof Response) return messageId;
+        const requestId = bodyIdentity(body, "requestId");
+        if (requestId instanceof Response) return requestId;
+        const uncertaintyId = bodyIdentity(body, "uncertaintyId");
+        return uncertaintyId instanceof Response ? uncertaintyId : run(() => deps.chatService.discardUnconfirmedSteer(id, messageId, requestId, uncertaintyId));
+      }),
+    },
     [p("/api/chat/conversations/:conversationId/queue/:messageId/send-now")]: {
       POST: async (request: RouteRequest) => chatMutation(request, ["requestId"], async (id, body, context, operationReceipt) => {
         const messageId = routeIdentity(request, "messageId");

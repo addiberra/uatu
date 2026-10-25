@@ -2,6 +2,21 @@
 
 Entries are ordered newest first. Every entry has Hub and workspace revisions, a compatibility classification, and migration guidance. Use `None` when no migration is required. An entry is headed `Unreleased` until the release that ships it; the release-prep step replaces that with the version tag (`v0.7.0`), so a consumer can tell which revision pair a given uatu version speaks. An additive change that lands after a pair has shipped gets its own entry under the same pair, stamped with its own release, rather than being appended to the shipped entry.
 
+## Hub 11 / Workspace 31 - Unreleased (explicit local discard)
+
+Compatibility: breaking (workspace)
+
+### Changes
+
+- Closed `QueuedMessage` payloads may carry `admissionUncertaintyId`, a fresh opaque server token only for classified settled unknown steer admission. In-flight admission, resume and withdrawal uncertainty do not qualify. Generic `unconfirmed` alone does not permit discard; the existing scoped cancellation-only withdrawal retry is unchanged.
+- Internal authenticated, origin-checked `POST /api/chat/conversations/:conversationId/queue/:messageId/discard-unconfirmed` accepts only `{requestId, uncertaintyId}` and returns only `{discarded:true, outcomeUnconfirmed:true}`. It refuses stale tokens and confirmed records. The existing `removed` queue change denotes local record removal, not native cancellation or delivery acknowledgement.
+- The Hub namespaces discard request IDs by its verified account, running workspace and operation path. The adapter also scopes its receipt to the conversation, message and uncertainty token. Client-supplied privileged headers grant no identity or policy authority; discard does not consult or apply automatic background preferences.
+- Discard never sends, cancels, resumes or backgrounds anything. The original may still arrive. Other messages stay queued until explicit Send now or a later normal idle transition; an old pending drain does not authorize delivery. Original unknown receipts remain unknown. Read-side absence never proves non-application.
+
+### Migration
+
+Strict workspace consumers must regenerate against revision 31 because revision 30's closed queue payload rejects the optional token. Confirm the local-only warning before sending the same entry's current token, and require both true acknowledgement fields. Do not fall back to ordinary Remove, restore the discarded copy into the draft, or replay the original operation. Hub revision remains 11 and bundled-web revision remains 3; the workspace revision participates in the matching-assets handshake. The new route remains covered by the existing internal workspace API exclusion rather than becoming a public Hub operation.
+
 ## Hub 11 / Workspace 30 - Unreleased (native worker report clocks)
 
 Compatibility: breaking (workspace)

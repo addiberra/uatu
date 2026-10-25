@@ -4,6 +4,7 @@ import { promises as fs } from "node:fs";
 import { workspacePath } from "./config";
 import { treeRow } from "./tree-helpers";
 import { standardBeforeEach } from "./fixtures";
+import type { StatePayload } from "../../src/shared/types";
 
 test.beforeEach(async ({ page, request }) => {
   await standardBeforeEach(page, request);
@@ -184,12 +185,16 @@ test("A document the server cannot read shows the permission notice once and loa
   test.skip(process.getuid?.() === 0, "chmod cannot deny root a read");
   // Permission denied will not clear on its own, so the server answers a final
   // 403 and the preview must neither retry nor say "Retrying". The denying
-  // chmod runs before the first selection, so a watcher event it may cause
-  // has nothing selected to reload. The restoring chmod runs while the file
+  // chmod changes ctime, but a polling watcher need not report that alone.
+  // Advance mtime too and await that indexed update in the browser before
+  // selection, so setup cannot reload the file while we measure its reads.
+  // The restoring chmod runs while the file
   // is selected, and a watcher that reports a pure mode change (chokidar in
   // fs.watch mode can) may reload it on its own, so the recovery check below
   // does not count reads exactly.
   const filePath = workspacePath("diagram.md");
+  const originalStat = await fs.stat(filePath);
+  const setupMtime = new Date(Math.ceil(originalStat.mtimeMs) + 1_000);
   let reads = 0;
   await page.route("**/api/document?*", route => {
     const id = new URL(route.request().url()).searchParams.get("id") ?? "";
@@ -199,6 +204,16 @@ test("A document the server cannot read shows the permission notice once and loa
 
   await fs.chmod(filePath, 0o000);
   try {
+    await fs.utimes(filePath, originalStat.atime, setupMtime);
+    await expect.poll(async () => {
+      const state: StatePayload = await page.request.get("/api/state").then(response => response.json());
+      const indexedDocument = state.roots.flatMap(root => root.docs).find(doc => doc.id === filePath);
+      if (indexedDocument?.mtimeMs !== setupMtime.getTime()) return false;
+      return page.evaluate(
+        generatedAt => Number(document.body.dataset.stateGeneratedAt ?? 0) >= generatedAt,
+        state.generatedAt,
+      );
+    }, { message: "permission setup's document update applied before selection" }).toBe(true);
     await treeRow(page, "diagram.md").click();
     await expect(page.locator("#preview")).toContainText(
       "Uatu doesn't have permission to read this file. Change its permissions, then select it again.",

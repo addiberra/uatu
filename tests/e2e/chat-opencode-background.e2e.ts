@@ -156,9 +156,10 @@ for (const engine of ["chromium", "webkit"] as const) for (const layout of ["tou
             await expect(meta).toBeVisible();
             const clock = meta.locator(".chat-worker-clock");
             await expect(clock).toHaveText(/^Reported \d{2}:\d{2}$/);
-            const glyphs = await clock.evaluate(node => {
+            const glyphs = await meta.evaluate(metaNode => {
+              const node = metaNode.querySelector(".chat-worker-clock")!;
               const range = document.createRange(); range.selectNodeContents(node);
-              const meta = node.closest(".chat-worker-meta")!.getBoundingClientRect();
+              const meta = metaNode.getBoundingClientRect();
               const rects = [...range.getClientRects()].map(rect => rect.toJSON());
               return { text: node.textContent, meta: meta.toJSON(), rects, contained: rects.length === 1 && rects.every(rect => rect.left >= meta.left && rect.right <= meta.right && rect.top >= meta.top && rect.bottom <= meta.bottom) };
             });

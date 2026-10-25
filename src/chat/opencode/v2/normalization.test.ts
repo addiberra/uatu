@@ -46,6 +46,74 @@ function upserts(entry: NormalizedProviderEvent) {
   return entry.updates.filter((update): update is Extract<NormalizedProviderUpdate, { kind: "upsert" }> => update.kind === "upsert").map(update => update.item);
 }
 
+test("native creation evidence retains envelope proof and confinement without inventing payload clocks", () => {
+  const normalize = createOpenCodeV2Normalizer(WORKSPACE);
+  const raw = { id: "birth", created: 3, type: "session.created", location: { directory: WORKSPACE },
+    data: { sessionID: "child", parentID: "parent", location: { directory: WORKSPACE } } };
+  expect(normalize.prepare(raw).evidence.lifecycle).toMatchObject({ kind: "session.created", id: "child", parent: "parent", directory: WORKSPACE,
+    proof: { id: "birth", created: 3 } });
+  expect(normalize.prepare({ ...raw, created: undefined, data: { ...raw.data, timestamp: 999 } }).evidence.lifecycle?.proof?.created).toBeUndefined();
+  expect(normalize.prepare({ ...raw, id: undefined }).evidence.lifecycle?.proof).toBeUndefined();
+});
+
+test("prepared V2 evidence shares accepted envelopes and lifecycle identity with normalization", () => {
+  const normalize = createOpenCodeV2Normalizer(WORKSPACE);
+  for (const properties of [false, true]) for (const sessionKey of ["sessionID", "sessionId"]) {
+    const memory = createOpenCodeV2Memory();
+    normalize({ type: "session.tool.input.started", data: { sessionID: "parent", id: "call", name: "subagent" } }, memory);
+    const raw = { id: "native", created: 8, type: "session.tool.progress", location: { directory: WORKSPACE },
+      [properties ? "properties" : "data"]: { [sessionKey]: "parent", id: "call", metadata: { sessionId: "child" } } };
+    const prepared = normalize.prepare(raw, memory);
+    expect(prepared.evidence.session).toBe("parent");
+    expect(prepared.evidence.launchers[0]).toMatchObject({ call: "call", child: "child" });
+    expect(normalize.prepared(prepared, memory)).toEqual(normalize(raw, memory));
+    (raw[properties ? "properties" : "data"] as Record<string, unknown>).sessionID = "changed";
+    expect(prepared.evidence.session).toBe("parent");
+  }
+  const lifecycle = normalize.prepare({ type: "session.updated", properties: { info: { id: "child", directory: "/foreign", title: "Moved", parentID: "other" } }, location: { directory: "/foreign" } });
+  expect(lifecycle.evidence.lifecycle).toEqual({ kind: "session.updated", id: "child" });
+  expect(normalize.prepared(lifecycle).updates).toEqual([]);
+});
+
+test("native proof replay requires an established occurrence and matching identity, stamp and semantics", () => {
+  const normalize = createOpenCodeV2Normalizer(WORKSPACE), memory = createOpenCodeV2Memory();
+  memory.workers.verifyChild("child", "parent");
+  normalize({ type: "session.tool.input.started", data: { sessionID: "parent", id: "call", name: "subagent" } }, memory);
+  const called = { id: "invocation", created: 10, durable: { aggregateID: "parent", seq: 1, version: 1 }, type: "session.tool.called", data: { sessionID: "parent", id: "call", assistantMessageID: "message", executed: true, input: { prompt: "First" } } };
+  normalize(called, memory);
+  expect(normalize.prepare(called, memory).evidence.launchers[0]?.historical).not.toBe(true);
+  normalize({ type: "session.message.content.updated", created: 20, data: { sessionID: "parent", messageID: "message", content: [{ type: "tool", id: "call", name: "subagent", time: { created: 10, completed: 20 }, state: { status: "completed", input: called.data.input, metadata: { sessionID: "child", status: "running" } } }] } }, memory);
+  expect(normalize.prepare(called, memory).evidence.launchers[0]?.historical).toBe(true);
+  for (const altered of [
+    { ...called, id: "new-invocation", created: 1 },
+    { ...called, durable: { ...called.durable, seq: 2 } },
+    { ...called, data: { ...called.data, input: { prompt: "Another request" } } },
+    { ...called, data: { ...called.data, executed: false } },
+  ]) expect(normalize.prepare(altered, memory).evidence.launchers[0]?.historical).not.toBe(true);
+  memory.workers.invalidateOwnership("child");
+  expect(normalize.prepare(called, memory).evidence.launchers[0]?.historical).toBe(true);
+});
+
+test("display fallback clocks never become launcher occurrence evidence", () => {
+  const normalize = createOpenCodeV2Normalizer(WORKSPACE);
+  const prepared = normalize.prepare({ type: "session.tool.success", data: { sessionID: "parent", id: "call", timestamp: 999, metadata: { sessionID: "child", status: "running" } } });
+  const fact = prepared.evidence.launchers[0]!;
+  expect(fact.created).toBeUndefined(); expect(fact.ran).toBeUndefined(); expect(fact.completed).toBeUndefined();
+  expect(fact.reportedCompletion).toBeUndefined(); expect(fact.proof).toBeUndefined();
+  const native = normalize.prepare({ type: "session.tool.success", created: 0, data: { sessionID: "parent", id: "call" } }).evidence.launchers[0]!;
+  expect(native.reportedCompletion).toBe(0);
+});
+
+test("an observed execution restart invalidates the established immutable occurrence before another Stop begins", () => {
+  const normalize = createOpenCodeV2Normalizer(WORKSPACE), memory = createOpenCodeV2Memory();
+  memory.workers.verifyChild("child", "parent");
+  normalize({ type: "session.message.content.updated", created: 20, data: { sessionID: "parent", messageID: "message", content: [{ type: "tool", id: "call", name: "subagent", time: { created: 10, completed: 20 }, state: { status: "completed", metadata: { sessionID: "child", status: "running" } } }] } }, memory);
+  const before = memory.workers.occurrence("v2:parent:call");
+  normalize({ id: "restart", type: "session.execution.started", created: 30, data: { sessionID: "child" } }, memory);
+  expect(before?.uncertain).not.toBe(true);
+  expect(memory.workers.occurrence("v2:parent:call")?.uncertain).toBe(true);
+});
+
 test("native terminal report clocks retain provider provenance live and stored, including zero but never fallbacks", () => {
   const normalize = createOpenCodeV2Normalizer(WORKSPACE);
   for (const kind of ["subagent", "shell"]) for (const stored of [false, true]) for (const noticeFirst of [false, true]) for (const clock of [40, 0, undefined, -1, NaN, Infinity]) {

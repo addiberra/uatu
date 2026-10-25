@@ -71,6 +71,7 @@ export interface WorkspaceChatService {
   } & AutomaticBackgroundFeedback>;
   /** Remove a held message, or withdraw a steer from the agent (D7). */
   removeQueued(id: string, messageId: string, requestId: string): Promise<{ removed: true }>;
+  discardUnconfirmedSteer(id: string, messageId: string, requestId: string, uncertaintyId: string): Promise<{ discarded: true; outcomeUnconfirmed: true }>;
   /** Switch a pending message between steer and queue (D7, D8). */
   changeDelivery(id: string, messageId: string, requestId: string, delivery: MessageDelivery, context?: ChatActionContext, operationReceipt?: string): Promise<{ messageId: string; delivery: MessageDelivery } & AutomaticBackgroundFeedback>;
   /** Send a pending message now (D8). */
@@ -303,6 +304,12 @@ export class LazyChatService implements WorkspaceChatService {
   async subscribe(id: string, options?: { cursor?: string; signal?: AbortSignal }) { return (await this.requireAdapter()).subscribe(id, options); }
   async prompt(id: string, requestId: string, text: string, model?: ModelSelection, mode?: string, variant?: string, attachments?: MessageAttachment[], delivery?: MessageDelivery, context?: ChatActionContext, operationReceipt?: string) { return (await this.requireAdapter()).prompt(id, requestId, text, model, mode, variant, attachments, delivery, context, operationReceipt); }
   async removeQueued(id: string, messageId: string, requestId: string) { return (await this.requireAdapter()).removeQueued(id, messageId, requestId); }
+  async discardUnconfirmedSteer(id: string, messageId: string, requestId: string, uncertaintyId: string) {
+    // Local ownership outlives runtime health. Never start/rebuild an adapter
+    // to discard a record only an already-existing adapter can hold.
+    if (this.disposed || !this.adapter) throw new ChatUnavailableError();
+    return this.adapter.discardUnconfirmedSteer(id, messageId, requestId, uncertaintyId);
+  }
   async changeDelivery(id: string, messageId: string, requestId: string, delivery: MessageDelivery, context?: ChatActionContext, operationReceipt?: string) { return (await this.requireAdapter()).changeDelivery(id, messageId, requestId, delivery, context, operationReceipt); }
   async sendNow(id: string, messageId: string, requestId: string, context?: ChatActionContext, operationReceipt?: string) { return (await this.requireAdapter()).sendNow(id, messageId, requestId, context, operationReceipt); }
   async saveAttachment(bytes: Uint8Array) {

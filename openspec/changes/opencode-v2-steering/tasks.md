@@ -1,4 +1,22 @@
-Each slice is written test first: write the named test and watch it fail, implement until it passes, then run the module's test file. The design references (D1–D13) point to design.md.
+Each slice is written test first: write the named test and watch it fail, implement until it passes, then run the module's test file. The design references (D1–D17) point to design.md.
+
+## PR519 inline-review follow-up — 2026-10-24
+
+This ledger adds acceptance for D14–D17 without replacing historical completed work or closing outstanding full-suite, real-agent or real-device checks below. Checks remain open until implementation, relevant verification and independent review support completion.
+
+- [x] R1. Unknown admission: verify adapter, HTTP and rendered-UI local discard with fresh admission-only tokens, exact target/receipt fencing, retained original unknown receipts/native evidence, no provider mutation or replay, and unchanged resume/withdrawal restrictions. Cover stale reads, late acknowledgements and confirmation cancellation. Durable visible feedback passed fresh independent review and all four desktop/touch Chromium/WebKit cases in the green full local run.
+- [x] R2. Keep queued: verify discard invalidates pre-existing deferred drains, preserves unrelated drafts/held entries, and leaves explicit Send now and later genuine idle transitions usable. Failed-action status rollback and derived recovery completion must not release kept input.
+- [x] R3. Duplicate delivery: reproduce reconciliation replacing the queue during dispatch, then verify exact-object removal from the current queue for automatic delivery and non-steering Send now, preserving FIFO without replay.
+- [x] R4. Recovery amplification/starvation: verify three unchanged successful-inconclusive reads per external cycle, real-error backoff, throttled dirty-burst progress, monotonic discovery-budget extensions, reconnect timers and structural/revert/deletion/generation fences. Preserve saturation discovery without reconnect.
+- [x] R5. Settlement retention: verify bounded unowned history plus pinned queue/in-flight owners across projection eviction; report the actual `max(2,048, currently owned settled conversations)` bound. R1–R5 implementation verification reached 530 adapter tests; the final fresh independent Sol High review passed 48 focused/adversarial checks without new findings. Full integrated acceptance remains R12.
+- [x] R6. Provider event verification/history reuse: verify bounded parentage reuse, concurrency/deadline/cancellation, unrelated event preservation on failed child lookup, fresh dynamic/revert metadata and lifecycle/generation invalidation. Ownership revocation preserves terminal evidence, notice tombstones and recovery-only saturation state. Fresh affected reviews verified current live-worker visibility separately from reverted history, five-second cancellation races, guard cleanup and actual-settlement SDK slots; the full local suite passed.
+- [x] R7. Definitive refusals: test actual-SDK-shaped connection refusal and undeclared 403 as not applied, while timeout/disconnect/5xx remain unknown without replay. Focused actual-SDK regressions and independent provider reviews confirmed classification; ongoing Stop-fence work remains R6/R12.
+- [x] R8. Background shell/report folding: verify correctly typed output-inspectable placeholders, bounded prelaunch buffering, native-clock/reused-ID uncertainty and superseded upserts; undated old reports must not settle a newer occurrence. Focused implementation checks and fresh independent Sol High review confirmed the corrected cases, including 24 background tests in independent review.
+- [x] R9. API31 and Hub integration: align strict schemas, validators, contract, examples and changelog while retaining Hub11/web3. Verify authenticated caller/workspace request-identity isolation, cookie-origin protections and production verified-principal handoff for discard. Actual Hub red/green coverage and independent transport/service reviews passed; the local-only service path does not require runtime startup.
+- [ ] R10. Browser evidence: verify real-adapter discard on desktop/touch Chromium and WebKit, approved readable warning, keyboard/focus/touch behavior, draft preservation, kept queue and no native writes. Keep current screenshots as PR attachments, not tracked generated files.
+- [x] R11. Documentation/spec alignment: reconcile approved proposal/design/delta/tasks, canonical chat requirements, `docs/CHAT.md` and affected architecture notes; preserve historical evidence and outstanding manual acceptance. Fresh independent reviews confirmed the per-target control policy, live-worker versus reverted-history distinction, read-recovery editing and Rename readiness. Strict canonical/change/API validations passed. Existing already-synced archive collision and unrelated OpenAPI lint warning remain disclosed; no archive was attempted.
+- [ ] R12. Integrated delivery: freeze the combined diff, run appropriate focused/cross-module/full checks without weakening limits, obtain fresh independent Sol High reviews, review publication safety, then commit/push normally. Present finding-by-finding PR text for approval before publication; report actual CI and unverified limitations.
+- [x] R13. Bounded per-target control proof (D17): verify retained healthy targets remain stoppable after projection saturation and read-only recovery without reconnect; missing/revoked/overflowed targets are uncertain with Stop withheld consistently in live/history/reconciliation. Check exact 1 MiB/2,048-entry control and 4 MiB/8,192-entry aggregate accounting, target-isolated overflow/stubs, revocation through progress/stale reads/reconnect, provider-lifetime limits and no silent readmission. Cold/pre-Stop/replay safety matrices and meaningful assertions were preserved; fresh independent Spec and Standards/bounds reviews and full local verification passed.
 
 ## Approved review-round-4 intent revision — 2026-10-22
 
@@ -140,9 +158,21 @@ Latest implementation acceptance: **5,183 pass / 17 skip / 0 fail** in documente
 
 - [x] 8.1 Update `src/chat/opencode/sdk-coverage.ts` (D12) and run `bun run coverage:agents`. Verify that the report lists the inbox events and operations as mapped, with `session.inbox.update` as deliberately unused.
 - [x] 8.2 Update `ARCHITECTURE.md` where it describes the chat queue (steer ownership, dock), and the `src/chat/` entry in `CLAUDE.md` if the module map changes. Verify by review.
-- [ ] 8.3 Run `bun run test:ci`, `bun run test:e2e`, and `bun run build`. All must pass.
+- [x] 8.3 Run `bun run test:ci`, `bun run test:e2e`, and `bun run build`. All must pass.
 
-  Latest verification (2026-10-15 continuation): installed the project's
+  Latest verification (2026-10-25): the frozen combined review corrections
+  passed 7,066 unit tests (16 skipped), 1,375 full browser/performance tests
+  (three opt-in documentation captures skipped), all 23 performance cases,
+  211 API tests, 60 strict OpenSpec items, typecheck, audit, 597-package
+  license checks, build and exact-binary smoke. No retries or test-setting
+  changes. All 54 source/test/documentation hashes remained unchanged.
+  Earlier intermittent login, scroll and timeout failures are not claimed
+  causally fixed by this green run. Live native-service, physical-device and
+  screen-reader speech acceptance remain unverified. Evidence is retained in
+  the task-owned `integration-checks/phase1-rename-final-20261025T140903Z` and
+  `integration-checks/final-browser-rename-final-20261025T141658Z` runs.
+
+  Historical verification (2026-10-15 continuation): installed the project's
   approved WebKit 26.6 (Playwright build 2359). Clean-tool-environment full
   CI passed: 5088 passed, 16 skipped, 0 failed across 285 files. Build,
   typecheck, and strict OpenSpec validation passed. Full E2E completed with
@@ -156,8 +186,8 @@ Latest implementation acceptance: **5,183 pass / 17 skip / 0 fail** in documente
   14/15; variant validation again received 401 once. Authentication behavior
   and test assertions were not weakened or changed. A subsequent complete
   inventory-file recheck passed 17/17, including the six previously not run.
-  This is not a passing
-  full E2E run, so the task remains open. Latest logs in the approved temporary
+  This was not a passing
+  full E2E run, so the task remained open at that checkpoint. Logs in the approved temporary
   `opencode/` directory: `steering-continuation-ci.log`,
   `steering-continuation-e2e.log`, `steering-continuation-rechecks.log`, and
   `steering-continuation-build.log`; the inventory recheck is recorded in
@@ -170,7 +200,7 @@ Latest implementation acceptance: **5,183 pass / 17 skip / 0 fail** in documente
   14/14). Full E2E had 876 passed and 75 failed: 72 lacked the installed
   WebKit executable; the other three (AsciiDoc nested TOC, chat lazy startup,
   and document-tree Follow navigation) passed an isolated six-test recheck.
-  These rechecks do not constitute a passing full run; this task stays open.
+  These rechecks did not constitute a passing full run or close this task.
   Logs: `steering-targeted-conclusive.log`, `steering-test-ci-clean.log`,
   `steering-full-e2e.log`, `steering-file-observer-recheck.log`, and
   `steering-e2e-failure-recheck.log` in the session's approved temporary

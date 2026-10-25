@@ -1,9 +1,9 @@
 openapi: 3.1.0
 info:
   title: UatuCode public API
-  version: 11.30.0-experimental
+  version: 11.31.0-experimental
   license: { name: MIT, identifier: MIT }
-  summary: Hub revision 11 and workspace revision 30
+  summary: Hub revision 11 and workspace revision 31
   description: |
     Canonical HTTP contract for the UatuCode Hub API, the only public API.
     Under `/s/{workspaceId}/` the Hub serves one family itself, personal
@@ -21,7 +21,7 @@ info:
     published snapshot is recorded in that snapshot's `contract.json`.
   x-uatu-revisions:
     hubApiRevision: 11
-    workspaceApiRevision: 30
+    workspaceApiRevision: 31
 servers:
   - url: https://{hubHost}
     variables:
@@ -2453,6 +2453,12 @@ components:
         the scoped steer-withdrawal-unconfirmed error may offer an explicit
         cancellation-only retry against the same inbox ID; the generic marker
         alone does not grant this exception. No mutation is retried automatically.
+        A server-issued admissionUncertaintyId permits explicit local-only discard
+        after warning that the original may still arrive. This never cancels or
+        resends native input and leaves other messages queued until explicit Send
+        now or a later normal idle transition. It is absent for in-flight admission,
+        resume and withdrawal uncertainty. Discard does not clear the original
+        unknown operation receipt or infer non-application from passive absence.
         It does not
         assert native admission, confirm withdrawal, or promise native work is paused. The
         original requestId links the submitting client's unconfirmed input.
@@ -2469,8 +2475,15 @@ components:
         delivery: { enum: [steer, queue] }
         paused: { const: true }
         unconfirmed: { const: true }
+        admissionUncertaintyId:
+          type: string
+          minLength: 1
+          maxLength: 512
+          pattern: '^[^\u0000-\u001f\u007f]+$'
+          description: "Opaque fresh server token for classified settled unknown admission only. Scope discard to the same conversation, current message id and token; a changed token or confirmed record is refused. Not cancellation or delivery evidence."
         requestId: { type: string }
         attachments: { type: array, maxItems: 8, items: { $ref: '#/components/schemas/MessageAttachment' } }
+      dependentRequired: { admissionUncertaintyId: [unconfirmed] }
       additionalProperties: false
     ChatEvent:
       oneOf:

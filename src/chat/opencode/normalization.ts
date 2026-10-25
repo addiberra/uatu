@@ -257,6 +257,18 @@ export function eventContext(event: RecordValue, data: RecordValue): EventContex
 // A canonical event: a 2.x type name over the canonical payload shape.
 export type CanonicalEvent = { type: string; data: RecordValue };
 
+/** Shared envelope reading; preserve nullish payload and identity precedence. */
+export function providerEventEnvelope(value: unknown) {
+  const event = record(value);
+  const data = record(event.data ?? event.properties);
+  return { event, data, eventType: optionalString(event.type) ?? "", context: eventContext(event, data) };
+}
+
+export function sessionLifecycleIdentity(data: RecordValue): string | undefined {
+  const info = record(data.info ?? data.session);
+  return optionalString(info.id ?? data.sessionID ?? data.sessionId);
+}
+
 /**
  * What one OpenCode generation contributes to normalization. `own` runs first
  * and handles what only that generation announces; otherwise `toCanonical`
@@ -275,11 +287,14 @@ export type GenerationMapper<Memory extends ProviderEventMemory = ProviderEventM
 // Public boundary. Every failure mode resolves to an outcome rather than an
 // exception, so one malformed payload costs one event instead of the pump.
 export function normalizeEventWith<Memory extends ProviderEventMemory>(value: unknown, mapper: GenerationMapper<Memory>, memory?: Memory): NormalizedProviderEvent {
-  const event = record(value);
-  const eventType = optionalString(event.type) ?? "";
+  const event = record(value), eventType = optionalString(event.type) ?? "";
+  try { return normalizeEventEnvelopeWith(providerEventEnvelope(value), mapper, memory); }
+  catch { return { conversationId: conversationIdOf(value), updates: [], outcome: "unparseable", eventType }; }
+}
+
+export function normalizeEventEnvelopeWith<Memory extends ProviderEventMemory>(envelope: ReturnType<typeof providerEventEnvelope>, mapper: GenerationMapper<Memory>, memory?: Memory): NormalizedProviderEvent {
+  const { event, data, eventType, context } = envelope;
   try {
-    const data = record(event.data ?? event.properties);
-    const context = eventContext(event, data);
     let matched = mapper.own(event, data, context, memory);
     let canonicalType: string | undefined;
     if (!matched) {
@@ -291,7 +306,7 @@ export function normalizeEventWith<Memory extends ProviderEventMemory>(value: un
     }
     if (matched) return { ...matched, outcome: matched.updates.length > 0 || matched.sessionLifecycle || matched.revertLifecycle ? "handled" : "ignored", eventType };
     return {
-      conversationId: conversationIdOf(value),
+      conversationId: conversationIdOf(event),
       updates: [],
       outcome: mapper.ignored.has(eventType) || CORE_IGNORED.has(canonicalType ?? eventType) ? "ignored" : "unrecognized",
       eventType,
@@ -299,7 +314,7 @@ export function normalizeEventWith<Memory extends ProviderEventMemory>(value: un
   } catch {
     // A recognized type whose payload lacks what its case requires. Reported,
     // never rethrown: the caller must keep consuming the stream.
-    return { conversationId: conversationIdOf(value), updates: [], outcome: "unparseable", eventType };
+    return { conversationId: conversationIdOf(event), updates: [], outcome: "unparseable", eventType };
   }
 }
 
@@ -520,7 +535,7 @@ export function compactionNoticeId(data: RecordValue, eventId: string): string {
 
 export function normalizeSessionLifecycle(kind: NormalizedSessionLifecycle["kind"], data: RecordValue): NormalizedSessionLifecycle {
   const info = record(data.info ?? data.session);
-  const id = string(info.id ?? data.sessionID ?? data.sessionId, "session id");
+  const id = string(sessionLifecycleIdentity(data), "session id");
   const directory = string(info.directory ?? record(info.location).directory, "session directory");
   if (typeof info.title !== "string") throw new Error("invalid OpenCode session title");
   const parent = info.parentID ?? info.parentId;

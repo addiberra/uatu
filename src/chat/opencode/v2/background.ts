@@ -1,6 +1,465 @@
 import type { BackgroundTaskItem } from "../../types";
 import type { NormalizedProviderUpdate } from "../../provider";
-import { array, number, optionalString, record, text } from "../normalization";
+import { createHash } from "node:crypto";
+import { array, number, optionalString, record, text, normalizeToolPart, type RecordValue } from "../normalization";
+import type { V2Evidence } from "./normalization";
+
+export type NativeProof = Readonly<{ id: string; created?: number; aggregate?: string; seq?: number; version?: number; fingerprint: string }>;
+export type LauncherEvidence = Readonly<{
+  call: string; child?: string; reportedChild?: string; requestedChild?: string; requestedSelectedOnly?: boolean; background?: boolean; selectedOnly?: boolean; workerType?: "agent" | "shell";
+  phase: "snapshot" | "called" | "progress" | "success" | "failed";
+  executed?: boolean;
+  // Part clocks and a typed terminal event's native clock stay distinguishable
+  // from each other and from the display-only `at` fallback.
+  message?: string; created?: number; ran?: number; completed?: number; reportedCompletion?: number; inputFingerprint?: string;
+  proof?: NativeProof; historical?: boolean;
+  conflicted?: boolean;
+}>;
+export type WorkerOccurrenceEvidence = Readonly<{ key: string; parent: string; worker: string; kind?: "agent" | "shell"; taskId: string; launches: readonly LauncherEvidence[]; executionStart?: NativeProof; executionEnd?: NativeProof; uncertain?: boolean }>;
+export type PreparedTool = { fact: LauncherEvidence; update: NormalizedProviderUpdate; name: string; description?: string; prompt?: string; agent?: string };
+export type PreparedNotification = Readonly<{ source: "subagent" | "shell"; worker?: string; status?: "completed" | "failed" | "stopped"; summary: string; description?: string; valid: boolean }>;
+
+export function prepareNotification(payload: unknown): PreparedNotification | undefined {
+  const value = record(payload), metadata = record(value.metadata);
+  if (metadata.source !== "subagent" && metadata.source !== "shell") return;
+  const shell = metadata.source === "shell";
+  const valid = !shell || !(metadata.exit != null && (typeof metadata.exit !== "number" || !Number.isFinite(metadata.exit))
+    || metadata.signal != null && typeof metadata.signal !== "string" || metadata.timeout != null && typeof metadata.timeout !== "boolean");
+  const status = metadata.state === "completed" ? (shell && (metadata.timeout === true || typeof metadata.signal === "string" || typeof metadata.exit === "number" && metadata.exit !== 0) ? "failed" : "completed")
+    : metadata.state === "error" ? "failed" : metadata.state === "cancelled" ? "stopped" : undefined;
+  const body = text(value.text);
+  return Object.freeze({ source: metadata.source, worker: optionalString(shell ? metadata.shellID : metadata.childID), status, valid,
+    description: optionalString(value.description), summary: shell ? body.replace(/^<shell\b[^\n]*>\n/, "").replace(/\n<\/shell>$/, "") : body.replace(/^<subagent\b[^\n]*>\n/, "").replace(/\n<\/subagent>$/, "") });
+}
+
+const digest = (value: string) => createHash("sha256").update(value).digest("hex");
+export function nativeProof(event: RecordValue, semantic: unknown): NativeProof | undefined {
+  const id = optionalString(event.id);
+  if (!identity(id) || event.created !== undefined && (number(event.created) === undefined || Number(event.created) < 0)) return;
+  const durable = record(event.durable);
+  if (event.durable !== undefined && (!identity(durable.aggregateID) || !Number.isSafeInteger(durable.seq) || Number(durable.seq) < 0 || !Number.isSafeInteger(durable.version) || Number(durable.version) < 1)) return;
+  return Object.freeze({ id, created: number(event.created), aggregate: optionalString(durable.aggregateID), seq: number(durable.seq), version: number(durable.version), fingerprint: digest(JSON.stringify(semantic)) });
+}
+function sameProof(left?: NativeProof, right?: NativeProof): boolean {
+  return !!left && !!right && JSON.stringify(left) === JSON.stringify(right);
+}
+
+/** One canonical tool read for timeline, worker projection, and authorization. */
+export function prepareTool(value: unknown, at: number, phase: LauncherEvidence["phase"] = "snapshot", message?: string, event?: RecordValue, rememberedInput?: unknown): PreparedTool {
+  const part = record(value), state = record(part.state), metadata = record(state.metadata), time = record(part.time);
+  const update = normalizeToolPart(part, at);
+  const name = update.kind === "upsert" && update.item.type === "tool" ? update.item.name : text(part.name ?? part.tool) || "tool";
+  const child = update.kind === "upsert" && update.item.type === "tool" ? update.item.childConversationId : name === "shell" ? optionalString(metadata.shellID) : undefined;
+  const input = record(state.input ?? rememberedInput);
+  const requestedChild = phase === "called" || phase === "snapshot" && !child && (state.status === "running" || state.status === "pending") ? optionalString(input.sessionID) : undefined;
+  const background = name !== "subagent" && name !== "tool" && name !== "shell" ? false : phase === "called" ? false
+    : phase === "snapshot" && state.status !== undefined ? state.status === "completed" && metadata.status === "running"
+      : phase === "success" && metadata.status === "running" ? true : undefined;
+  const serializedInput = update.kind === "upsert" && update.item.type === "tool" ? update.item.input : state.input === undefined ? undefined : JSON.stringify(state.input);
+  const fact: LauncherEvidence = { call: optionalString(part.id) ?? "", child, reportedChild: name === "shell" ? undefined : child, requestedChild, requestedSelectedOnly: requestedChild && name !== "subagent" ? true : undefined, background,
+    selectedOnly: name === "subagent" || name === "tool" ? undefined : true, phase, message,
+    ...(name === "subagent" ? { workerType: "agent" as const } : name === "shell" ? { workerType: "shell" as const } : {}),
+    ...(typeof state.executed === "boolean" ? { executed: state.executed } : {}),
+    ...(number(time.created) === undefined ? {} : { created: number(time.created) }),
+    ...(number(time.ran) === undefined ? {} : { ran: number(time.ran) }),
+    ...(number(time.completed) === undefined ? {} : { completed: number(time.completed) }),
+    ...(event && (phase === "success" || phase === "failed") && number(event.created) !== undefined && Number(event.created) >= 0 ? { reportedCompletion: Number(event.created) } : {}),
+    inputFingerprint: serializedInput === undefined ? undefined : digest(serializedInput) };
+  return { fact: Object.freeze({ ...fact, ...(event ? { proof: nativeProof(event, fact) } : {}) }), update, name,
+    description: optionalString(name === "shell" ? input.command : input.description), prompt: optionalString(input.prompt), agent: optionalString(input.agent) };
+}
+
+export function launcherChanged(fact: LauncherEvidence, occurrence?: WorkerOccurrenceEvidence): boolean {
+  if (fact.historical) return false;
+  const prior = occurrence?.launches.find(launch => launch.call === fact.call);
+  if (!prior) return false;
+  if (fact.conflicted) return true;
+  // These are native identities, not display labels. An alias has its own
+  // owning message; a reused call cannot acquire a different owner or kind.
+  const kind = prior.workerType ?? occurrence?.kind;
+  if (fact.workerType !== undefined && kind !== undefined && fact.workerType !== kind
+    || fact.message !== undefined && prior.message !== undefined && fact.message !== prior.message) return true;
+  if (fact.child && fact.child !== occurrence!.worker || fact.requestedChild && fact.requestedChild !== occurrence!.worker || fact.background === false) return true;
+  // A part's creation and run clocks are independent native evidence. A later
+  // run cannot hide behind the unchanged creation of a reused tool record.
+  const completed = prior.completed ?? prior.reportedCompletion;
+  return fact.phase === "snapshot" && (fact.inputFingerprint !== undefined && prior.inputFingerprint !== undefined && fact.inputFingerprint !== prior.inputFingerprint
+    || fact.created !== undefined && (prior.created !== undefined ? fact.created !== prior.created : completed !== undefined && fact.created > completed)
+    || fact.ran !== undefined && (prior.ran !== undefined ? fact.ran !== prior.ran : completed !== undefined && fact.ran > completed)
+    || fact.completed !== undefined && prior.completed !== undefined && fact.completed !== prior.completed);
+}
+
+/** Positive invocation identity for initial classification, not a replay test.
+ * Optional native clocks may enrich, but conflicting clocks never bind.
+ */
+export function sameLauncherIdentity(left: LauncherEvidence, right: LauncherEvidence): boolean {
+  return !left.conflicted && !right.conflicted && (["call", "child", "message", "workerType", "created", "inputFingerprint"] as const)
+    .every(key => left[key] !== undefined && left[key] === right[key])
+    && (["ran", "completed", "reportedCompletion"] as const).every(key => left[key] === undefined || right[key] === undefined || left[key] === right[key]);
+}
+
+/** Retain provisional invocation evidence until an authoritative occurrence
+ * can classify it. Sparse progress may enrich, never erase, a native fact.
+ * A merged summary is not itself a native event or replay proof.
+ */
+export function retainLauncherEvidence(previous: LauncherEvidence | undefined, next: LauncherEvidence): LauncherEvidence {
+  if (!previous) return next;
+  if (next.historical) return previous;
+  const conflict = (["message", "workerType", "created", "ran", "completed", "inputFingerprint"] as const).some(key => previous[key] !== undefined && next[key] !== undefined && previous[key] !== next[key]);
+  return Object.freeze({ ...previous, phase: previous.phase === "snapshot" || next.phase === "snapshot" ? "snapshot" : previous.phase,
+    message: previous.message ?? next.message, workerType: previous.workerType ?? next.workerType, created: previous.created ?? next.created, ran: previous.ran ?? next.ran,
+    completed: previous.completed ?? next.completed, reportedCompletion: previous.reportedCompletion ?? next.reportedCompletion,
+    inputFingerprint: previous.inputFingerprint ?? next.inputFingerprint,
+    ...(previous.conflicted || next.conflicted || conflict ? { conflicted: true } : {}), proof: undefined, historical: undefined });
+}
+
+export type ControlWitness = Readonly<{ kind: "called" | "started" | "ended" | "notification" | "created"; proof: NativeProof }>;
+export type ControlRead = { id: number; parent: string; start: number; failed: boolean; initialInventory?: boolean };
+type ControlRecord = { parent: string; taskId: string; unavailable?: true; pending?: true; pendingCalls?: readonly string[]; aliases?: readonly string[]; kind?: "agent" | "shell"; item?: BackgroundTaskItem; evidence?: WorkerOccurrenceEvidence; witnesses?: readonly ControlWitness[]; changed?: number };
+type ControlObservation = { parent?: string; child?: string; launch?: LauncherEvidence; calledAt?: number; witness?: ControlWitness;
+  lifecycle?: { kind: string; parent?: string; directory?: string; own: boolean }; backgroundObserved?: true };
+
+/** Provider-lifetime control evidence. Correlation may be discarded, but a
+ * published identity's revocation is never evicted or readmitted from history.
+ * All maps, aliases, witnesses and discovery observations share this budget.
+ */
+export class BackgroundControls {
+  private closed = false;
+  private projectionLost = false;
+  private sequence = 0;
+  private nextRead = 0;
+  private readonly scopes = new Map<string, "retained" | "inventoried" | "gap">();
+  private readonly records = new Map<string, ControlRecord>();
+  private readonly reads = new Map<number, ControlRead>();
+  private readonly observations = new Map<string, ControlObservation>();
+  private readonly sizes = new Map<object, Map<string | number, { bytes: number; entries: number }>>();
+  private tupleBytes = 0;
+  private entryCount = 0;
+  constructor(private readonly budget: { bytes?: number; entries?: number; changed?: () => void } = {}) {}
+
+  // A full ledger must still admit fresh reads for its retained targets.
+  // Leave room for sixteen guards, each with a <=512-code-unit parent and
+  // safe-integer counters (including worst-case JSON escaping). Tiny injected
+  // test budgets scale this reservation down; production reserves 128 KiB /
+  // sixteen entries inside, not in addition to, the 1 MiB / 2,048-entry cap.
+  private get readCapacity(): number {
+    return Math.min(16, Math.floor((this.budget.entries ?? 2_048) / 8), Math.floor((this.budget.bytes ?? 1024 * 1024) / (8 * 8_192)));
+  }
+
+  get usage(): { bytes: number; entries: number } {
+    const separators = [this.scopes, this.records, this.reads, this.observations].reduce((sum, map) => sum + Math.max(0, map.size - 1) * 2, 0);
+    return { bytes: JSON.stringify([this.closed, this.projectionLost, [], [], [], []]).length * 2 + this.tupleBytes + separators, entries: this.entryCount };
+  }
+  get activeReads(): number { return this.reads.size; }
+  basis(taskId: string): WorkerOccurrenceEvidence | undefined { return this.records.get(taskId)?.evidence; }
+  unavailable(taskId: string): boolean { return this.records.get(taskId)?.unavailable === true
+    || [...this.records.values()].some(record => record.unavailable && record.aliases?.some(call => `v2:${record.parent}:${call}` === taskId)); }
+  proof(taskId: string): { basis: WorkerOccurrenceEvidence; revision: number } | undefined {
+    const record = this.records.get(taskId);
+    return record?.evidence && !record.unavailable && !record.pending ? { basis: record.evidence, revision: record.changed ?? 0 } : undefined;
+  }
+  current(taskId: string): boolean { return !!this.proof(taskId); }
+
+  private cost(value: unknown): number {
+    const record = value as ControlRecord;
+    return 1 + (record.evidence?.launches.length ?? 0) + (record.witnesses?.length ?? 0) + (record.aliases?.length ?? 0) + (record.pendingCalls?.length ?? 0)
+      + (record.item ? 1 + (record.item.toolUseIds?.length ?? 0) : 0) + ((value as ControlObservation).witness ? 1 : 0);
+  }
+  private fits<K extends string | number, T>(map: Map<K, T>, key: K, value: T): boolean {
+    const old = this.sizes.get(map)?.get(key), usage = this.usage;
+    const bytes = usage.bytes + JSON.stringify([key, value]).length * 2 - (old?.bytes ?? 0) + (!map.has(key) && map.size ? 2 : 0);
+    const entries = usage.entries + this.cost(value) - (old?.entries ?? 0);
+    if (map === this.reads) return bytes <= (this.budget.bytes ?? 1024 * 1024) && entries <= (this.budget.entries ?? 2_048);
+    const readBytes = [...(this.sizes.get(this.reads)?.values() ?? [])].reduce((sum, size) => sum + size.bytes, 0) + Math.max(0, this.reads.size - 1) * 2;
+    // Account the permanent pool independently of guards' current string
+    // lengths, so short active guards cannot consume future guards' headroom.
+    return bytes - readBytes <= (this.budget.bytes ?? 1024 * 1024) - this.readCapacity * 8_192
+      && entries - this.reads.size <= (this.budget.entries ?? 2_048) - this.readCapacity;
+  }
+  private write<K extends string | number, T>(map: Map<K, T>, key: K, value: T): void {
+    let sizes = this.sizes.get(map);
+    if (!sizes) this.sizes.set(map, sizes = new Map());
+    const old = sizes.get(key), next = { bytes: JSON.stringify([key, value]).length * 2, entries: this.cost(value) };
+    this.tupleBytes += next.bytes - (old?.bytes ?? 0); this.entryCount += next.entries - (old?.entries ?? 0);
+    sizes.set(key, next); map.set(key, value);
+    this.budget.changed?.();
+  }
+  private remove<K extends string | number, T>(map: Map<K, T>, key: K): void {
+    const old = this.sizes.get(map)?.get(key);
+    if (old) { this.tupleBytes -= old.bytes; this.entryCount -= old.entries; this.sizes.get(map)!.delete(key); }
+    map.delete(key);
+  }
+  private gap(parent: string): void {
+    if (this.scopes.has(parent) || this.fits(this.scopes, parent, "gap")) this.write(this.scopes, parent, "gap");
+    else this.closed = true;
+  }
+  private put(record: ControlRecord): void {
+    const old = this.records.get(record.taskId);
+    if (old?.unavailable) return;
+    if (!this.scopes.has(record.parent)) {
+      if (!this.fits(this.scopes, record.parent, "retained")) { this.closed = true; return; }
+      this.write(this.scopes, record.parent, "retained");
+    }
+    if (this.fits(this.records, record.taskId, record)) { this.write(this.records, record.taskId, record); return; }
+    // A full basis is always larger than this identity-only stub. Reserve it
+    // before publication; growth failure never erases an admitted identity.
+    const aliases = old?.evidence?.launches.map(launch => launch.call) ?? old?.aliases ?? record.aliases;
+    const stub: ControlRecord = { parent: record.parent, taskId: record.taskId, unavailable: true, ...(aliases?.length ? { aliases } : {}) };
+    if (this.fits(this.records, record.taskId, stub)) this.write(this.records, record.taskId, stub);
+    else this.gap(record.parent);
+    // The failed growth may contain additional aliases for this wire identity.
+    // Without space for their tombstones, never admit them as unrelated tasks.
+    this.gap(record.parent);
+    if (old?.evidence) for (const other of this.records.values()) if (!other.unavailable && other.parent === old.parent
+      && other.evidence?.launches.some(launch => old.evidence!.launches.some(prior => prior.call === launch.call))) this.retire(other);
+  }
+  private retire(record: ControlRecord, witness?: ControlWitness): void {
+    if (record.unavailable || this.records.get(record.taskId)?.unavailable) return;
+    if (witness?.kind === "ended" || witness?.kind === "notification") for (const [key, observation] of this.observations) {
+      if (observation.parent === record.parent && record.evidence?.launches.some(launch => launch.call === observation.launch?.call)) this.remove(this.observations, key);
+    }
+    const witnesses = witness ? [...(record.witnesses ?? []), witness] : record.witnesses;
+    const aliases = record.evidence?.launches.map(launch => launch.call) ?? record.aliases;
+    const stub: ControlRecord = { parent: record.parent, taskId: record.taskId, unavailable: true, ...(aliases?.length ? { aliases } : {}), ...(witnesses?.length ? { witnesses } : {}) };
+    if (this.fits(this.records, record.taskId, stub)) this.write(this.records, record.taskId, stub);
+    else {
+      this.write(this.records, record.taskId, { parent: record.parent, taskId: record.taskId, unavailable: true });
+      this.gap(record.parent);
+    }
+    // A cold live alias can acquire a different canonical id in complete
+    // history. Every published identity sharing that proven occurrence must
+    // retain the same revocation, including when only one row is restated.
+    if (aliases) for (const other of this.records.values()) if (!other.unavailable && other.parent === record.parent
+      && other.evidence?.launches.some(launch => aliases.includes(launch.call))) this.retire(other, witness);
+  }
+  historical(kind: ControlWitness["kind"], proof?: NativeProof): boolean {
+    return !!proof && [...this.records.values()].some(record => record.witnesses?.some(witness => witness.kind === kind && sameProof(witness.proof, proof)));
+  }
+  projectionSaturated(): void { this.projectionLost = true; }
+  observationGap(): void {
+    this.closed = true;
+    for (const record of this.records.values()) this.retire(record);
+    for (const read of this.reads.values()) { read.failed = true; this.write(this.reads, read.id, read); }
+  }
+  beginRead(parent: string, admitted = true, classifyLive = false): ControlRead {
+    const read = { id: ++this.nextRead, parent, start: this.sequence, failed: !admitted,
+      ...(classifyLive ? { initialInventory: !this.scopes.has(parent) || this.scopes.get(parent) === "retained" } : {}) };
+    if (!admitted || parent.length > 512 || this.reads.size >= this.readCapacity || !this.fits(this.reads, read.id, read)) { read.failed = true; return read; }
+    this.write(this.reads, read.id, read); return read;
+  }
+  endRead(read: ControlRead, complete = false): void {
+    this.remove(this.reads, read.id);
+    // The first complete cold inventory is different from a later discovery
+    // racing buffered startup frames. Reuse the accounted scope, not a cache
+    // or time window; a gap survives for the provider's lifetime.
+    if (complete && !read.failed && read.initialInventory !== undefined && this.scopes.get(read.parent) !== "gap" && this.scopes.get(read.parent) !== "inventoried") {
+      if (this.fits(this.scopes, read.parent, "inventoried")) this.write(this.scopes, read.parent, "inventoried");
+      else this.gap(read.parent);
+    }
+  }
+  private note(key: string, observation: ControlObservation): Array<{ parent: string; item: BackgroundTaskItem }> {
+    const prior = this.observations.get(key);
+    let launch = observation.launch ? retainLauncherEvidence(prior?.launch, observation.launch) : prior?.launch;
+    if (prior?.launch && observation.launch && this.initialDetachment(prior, observation.launch)) launch = Object.freeze({ ...launch!, background: true });
+    if (prior?.backgroundObserved && observation.launch?.background === false && launch) launch = Object.freeze({ ...launch, conflicted: true });
+    const next = { ...prior, ...observation, launch, calledAt: observation.calledAt ?? prior?.calledAt,
+      ...(prior?.backgroundObserved || observation.launch?.background === true ? { backgroundObserved: true as const } : {}) };
+    if (this.fits(this.observations, key, next)) { this.write(this.observations, key, next); return []; }
+    const updates: Array<{ parent: string; item: BackgroundTaskItem }> = [];
+    // A known target must reserve its sticky unavailable stub before losing
+    // relevant ephemeral evidence. A scope gap alone only blocks admission;
+    // it cannot justify clearing a retained target's unresolved invocation.
+    for (const record of this.records.values()) {
+      const basis = record.evidence, fact = next.launch;
+      if (record.unavailable || !basis) continue;
+      const related = next.child === basis.worker || next.child === basis.parent || next.parent === basis.parent && fact && (
+        basis.launches.some(launch => launch.call === fact.call) || record.pendingCalls?.includes(fact.call)
+        || !fact.selectedOnly && fact.child === basis.worker || !fact.requestedSelectedOnly && fact.requestedChild === basis.worker
+        || !fact.child && !fact.requestedChild && fact.message !== undefined && basis.launches.some(launch => launch.message === fact.message)
+          && (fact.workerType === basis.kind || !fact.selectedOnly));
+      if (!related) continue;
+      if (record.item) updates.push({ parent: record.parent, item: { ...structuredClone(record.item), stateUncertain: true } });
+      this.retire(record);
+    }
+    if (observation.parent) this.gap(observation.parent); else this.closed = true;
+    return updates;
+  }
+  private initialDetachment(observation: ControlObservation, next: LauncherEvidence): boolean {
+    const previous = observation.launch, parent = observation.parent;
+    return !!previous && !!parent && !this.closed && !this.projectionLost && this.scopes.get(parent) !== "gap" && !observation.backgroundObserved
+      && previous.phase === "snapshot" && previous.background === false && next.phase === "snapshot" && next.background === true
+      && sameLauncherIdentity(previous, next) && ![...this.records.values()].some(record => record.parent === parent
+        && (record.taskId === `v2:${parent}:${previous.call}` || record.aliases?.includes(previous.call) || record.evidence?.launches.some(launch => launch.call === previous.call)));
+  }
+  observe(event: V2Evidence, own: boolean, report?: PreparedNotification, reportProof?: NativeProof): Array<{ parent: string; item: BackgroundTaskItem }> {
+    this.sequence++;
+    const updates: Array<{ parent: string; item: BackgroundTaskItem }> = [];
+    const lifecycle = event.lifecycle?.id;
+    for (const record of this.records.values()) {
+      if (record.unavailable || !record.evidence) continue;
+      const basis = record.evidence;
+      const birthReplay = event.lifecycle?.kind === "session.created" && record.witnesses?.some(witness => witness.kind === "created" && sameProof(witness.proof, event.lifecycle?.proof));
+      if (own && event.shutdown || lifecycle && !birthReplay && (lifecycle === record.parent || lifecycle === basis.worker)) this.retire(record);
+      else if (own && event.execution && !event.execution.historical && event.session === basis.worker && record.kind === "agent") this.retire(record, event.execution.proof ? { kind: event.execution.phase, proof: event.execution.proof } : undefined);
+      else if (own && event.session === record.parent) {
+        if (event.launchers.some(fact => launcherChanged(fact, basis))) this.retire(record);
+        else {
+          const pending = event.launchers.filter(fact => !fact.historical && !basis.launches.some(launch => launch.call === fact.call)
+            && (!fact.selectedOnly && fact.child === basis.worker || !fact.requestedSelectedOnly && fact.requestedChild === basis.worker));
+          if (pending.length) this.put({ ...record, pending: true, pendingCalls: Object.freeze([...new Set([...(record.pendingCalls ?? []), ...pending.map(fact => fact.call)])]), changed: this.sequence });
+        }
+        if (report?.valid && report.status && report.worker === basis.worker && record.kind === (report.source === "shell" ? "shell" : "agent") && !this.historical("notification", reportProof)) this.retire(record, reportProof ? { kind: "notification", proof: reportProof } : undefined);
+      }
+      if (record.item && !this.current(record.taskId)) updates.push({ parent: record.parent, item: { ...structuredClone(record.item), stateUncertain: true } });
+    }
+    if (event.shutdown && own) for (const read of this.reads.values()) { read.failed = true; this.write(this.reads, read.id, read); }
+    if (lifecycle) {
+      const { proof, kind, parent, directory } = event.lifecycle!;
+      updates.push(...this.note(JSON.stringify(["change", lifecycle, kind, proof]), { child: lifecycle, lifecycle: { kind, parent, directory, own },
+        ...(proof ? { witness: { kind: "created", proof } } : {}) }));
+    }
+    if (!own) return updates;
+    if (event.execution && !event.execution.historical && event.session) updates.push(...this.note(JSON.stringify(["change", event.session, event.execution.proof]), { child: event.session,
+      ...(event.execution.proof ? { witness: { kind: event.execution.phase, proof: event.execution.proof } } : {}) }));
+    if (event.session && report?.valid && report.status && report.worker && !this.historical("notification", reportProof)) updates.push(...this.note(JSON.stringify(["report", event.session, report.worker, reportProof]), { parent: event.session, child: report.worker,
+      ...(reportProof ? { witness: { kind: "notification", proof: reportProof } } : {}) }));
+    if (event.session) for (const fact of event.launchers) if (!fact.historical) updates.push(...this.note(JSON.stringify([fact.phase === "called" ? "invocation" : "launch", event.session, fact.call, fact.child ?? fact.requestedChild ?? ""]), { parent: event.session, launch: fact, ...(fact.phase === "called" ? { calledAt: this.sequence } : {}) }));
+    return updates;
+  }
+  private compatible(basis: WorkerOccurrenceEvidence, candidate: WorkerOccurrenceEvidence): boolean {
+    return basis.parent === candidate.parent && basis.worker === candidate.worker && basis.taskId === candidate.taskId && !candidate.uncertain
+      && !(basis.kind !== undefined && candidate.kind !== undefined && basis.kind !== candidate.kind)
+      && !candidate.launches.some(fact => launcherChanged(fact, basis));
+  }
+  private identityAvailable(candidate: WorkerOccurrenceEvidence): boolean {
+    return candidate.kind !== undefined && candidate.launches.length > 0
+      && candidate.launches.every(launch => launch.workerType === candidate.kind && identity(launch.message)
+        && launch.created !== undefined && launch.inputFingerprint !== undefined);
+  }
+  private consumed(fact: LauncherEvidence, candidate: WorkerOccurrenceEvidence, witnesses: readonly ControlWitness[]): boolean {
+    // Association proves a replay only while the invocation's immutable fields
+    // agree. A stale snapshot must not launder contradictory input or clocks.
+    return fact.phase === "called" && !!fact.proof && candidate.launches.some(launch => launch.call === fact.call)
+      && !launcherChanged({ ...fact, phase: "snapshot", background: undefined }, candidate)
+      && witnesses.some(witness => witness.kind === "called" && sameProof(witness.proof, fact.proof));
+  }
+  project(item: BackgroundTaskItem, candidate: WorkerOccurrenceEvidence | undefined, read?: ControlRead, witnesses: readonly ControlWitness[] = []): BackgroundTaskItem {
+    let record = this.records.get(item.taskId);
+    if (item.status !== "running") {
+      if (record) this.retire(record);
+      else this.put({ parent: candidate?.parent ?? read?.parent ?? "", taskId: item.taskId, unavailable: true, aliases: candidate?.launches.map(launch => launch.call) });
+      return { ...item, stateUncertain: false };
+    }
+    if (record?.unavailable) return { ...item, stateUncertain: true };
+    if (candidate) for (const other of this.records.values()) {
+      if (other.taskId === item.taskId || other.parent !== candidate.parent
+        || !candidate.launches.some(launch => other.aliases?.includes(launch.call) || other.evidence?.launches.some(prior => prior.call === launch.call))) continue;
+      if (other.unavailable || !other.evidence) return { ...item, stateUncertain: true };
+      if (other.evidence.worker !== candidate.worker || other.evidence.kind !== undefined && candidate.kind !== undefined && other.evidence.kind !== candidate.kind
+        || candidate.launches.some(fact => launcherChanged(fact, other.evidence))) {
+        this.retire(other);
+        if (record) this.retire(record);
+        else this.put({ parent: candidate.parent, taskId: item.taskId, unavailable: true, aliases: candidate.launches.map(launch => launch.call) });
+        return { ...item, stateUncertain: true };
+      }
+      // Do not enrich another retained basis from a candidate whose own
+      // identity is still unproven. Otherwise a missing alias owner becomes
+      // frozen before later authoritative recovery can bind that owner.
+      if (candidate.uncertain || !this.identityAvailable(candidate) || candidate.kind !== item.taskType) return { ...item, stateUncertain: true };
+      const additional = candidate.launches.filter(fact => !other.evidence!.launches.some(prior => prior.call === fact.call));
+      if (additional.length && (this.closed || this.scopes.get(other.parent) === "gap")) {
+        this.retire(other);
+        if (record) this.retire(record);
+        return { ...item, stateUncertain: true };
+      }
+      if (additional.length) this.put({ ...other, evidence: Object.freeze({ ...other.evidence, launches: Object.freeze([...other.evidence.launches, ...additional]) }) });
+      if (this.unavailable(other.taskId)) return { ...item, stateUncertain: true };
+    }
+    if (record?.evidence && candidate && !this.compatible(record.evidence, candidate)) { this.retire(record); return { ...item, stateUncertain: true }; }
+    const uncertain = !candidate || !this.identityAvailable(candidate) || candidate.kind !== item.taskType || candidate.uncertain === true || item.stateUncertain === true || read?.failed === true;
+    let unresolved = false;
+    if (!record && candidate && read?.initialInventory !== undefined) {
+      const startup = [...this.observations.values()].some(observation => observation.lifecycle?.kind === "session.created"
+        && (observation.child === candidate.parent || observation.child === candidate.worker));
+      if (!read.initialInventory || startup) unresolved = !candidate.launches.every(launch => [...this.observations.values()].some(observation => observation.parent === candidate.parent
+        && observation.launch?.background === true && sameLauncherIdentity(observation.launch, launch)));
+    }
+    // Facts observed before Stop are just as binding as facts seen during its
+    // reads. Compatible restatements cannot clear an unclassified invocation.
+    if (candidate) for (const observation of this.observations.values()) {
+      const fact = observation.launch;
+      if (!fact || observation.parent !== candidate.parent) continue;
+      if (this.consumed(fact, candidate, [...witnesses, ...(record?.witnesses ?? [])])) continue;
+      const selected = candidate.launches.some(launch => launch.call === fact.call);
+      if (!record && selected && candidate.launches.some(launch => this.initialDetachment(observation, launch))) { unresolved = true; continue; }
+      if (selected && launcherChanged(fact, candidate)) {
+        if (record) this.retire(record);
+        else this.put({ parent: candidate.parent, taskId: item.taskId, unavailable: true, aliases: candidate.launches.map(launch => launch.call) });
+        return { ...item, stateUncertain: true };
+      }
+      if (!selected && (!fact.selectedOnly && fact.child === candidate.worker || !fact.requestedSelectedOnly && fact.requestedChild === candidate.worker)) unresolved = true;
+    }
+    if (!record) {
+      let revoked = candidate?.uncertain === true || this.closed || this.projectionLost || this.scopes.get(candidate?.parent ?? read?.parent ?? "") === "gap";
+      const births: ControlWitness[] = [];
+      const initialChild = candidate && [...this.observations.values()].some(observation => observation.child === candidate.worker
+        && observation.lifecycle?.kind === "session.created" && observation.lifecycle.own && observation.lifecycle.parent === candidate.parent);
+      if (candidate && !revoked) for (const observation of this.observations.values()) {
+        if (observation.witness && observation.witness.kind !== "created" && (this.historical(observation.witness.kind, observation.witness.proof)
+          || witnesses.some(witness => witness.kind === observation.witness!.kind && sameProof(witness.proof, observation.witness!.proof)))) continue;
+        if (observation.child === candidate.worker || observation.child === candidate.parent) {
+          if (observation.lifecycle?.kind === "session.created" && observation.lifecycle.own) {
+            const birth = observation.witness?.proof;
+            if (!observation.lifecycle.directory || birth?.created === undefined || candidate.launches.some(launch => launch.created === undefined)) unresolved = true;
+            else if (candidate.launches.some(launch => launch.created! < birth.created!)
+              || observation.child === candidate.worker && observation.lifecycle.parent !== candidate.parent) revoked = true;
+            else if (observation.witness) {
+              births.push(observation.witness);
+              if (observation.child === candidate.worker && (!candidate.launches.every(launch => sameLauncherIdentity(launch, launch))
+                || candidate.executionStart?.created === undefined || candidate.executionStart.created < birth.created!
+                || !witnesses.some(witness => witness.kind === "started" && sameProof(witness.proof, candidate.executionStart)))) unresolved = true;
+            }
+          } else if (!observation.lifecycle && observation.child === candidate.parent) {
+            // The parent's turn is not this independently running worker's execution.
+          } else if (!observation.lifecycle && initialChild && observation.witness?.kind === "started") {
+            // A history fold may overtake the initial live launch. Keep its
+            // classification pending until that exact start binds the occurrence.
+            unresolved = true;
+          } else revoked = true;
+        }
+        const fact = observation.launch;
+        if (fact && observation.parent === candidate.parent) {
+          if (this.consumed(fact, candidate, witnesses)) continue;
+          const selected = candidate.launches.some(launch => launch.call === fact.call);
+          if (selected && candidate.launches.some(launch => this.initialDetachment(observation, launch))) { unresolved = true; continue; }
+          if (selected && (launcherChanged(fact, candidate) || read && (observation.calledAt ?? -1) > read.start)) revoked = true;
+          if (!selected && (!fact.selectedOnly && fact.child === candidate.worker || !fact.requestedSelectedOnly && fact.requestedChild === candidate.worker)) unresolved = true;
+        }
+      }
+      if (revoked) this.put({ parent: candidate?.parent ?? read?.parent ?? "", taskId: item.taskId, unavailable: true, aliases: candidate?.launches.map(launch => launch.call) });
+      else if (candidate && !uncertain && !unresolved) this.put({ parent: candidate.parent, taskId: item.taskId, kind: item.taskType === "shell" ? "shell" : "agent", item: structuredClone(item), evidence: candidate, witnesses: [...witnesses, ...births], changed: this.sequence });
+    } else if (candidate && !uncertain) {
+      const additional = candidate.launches.filter(fact => !record!.evidence!.launches.some(prior => prior.call === fact.call));
+      // Additional aliases need coverage of their own. Space freed by terminal
+      // compaction cannot prove a discarded invocation never referred to them.
+      if (additional.length && (this.closed || this.scopes.get(record.parent) === "gap")) {
+        this.retire(record);
+        return { ...item, stateUncertain: true };
+      }
+      const unique = witnesses.filter(witness => !record!.witnesses?.some(prior => prior.kind === witness.kind && sameProof(prior.proof, witness.proof)));
+      const resolved = record.pendingCalls?.length && record.pendingCalls.every(call => candidate.launches.some(launch => launch.call === call));
+      this.put({ ...record, item: structuredClone(item), ...(record.pending && resolved && !unresolved ? { pending: undefined, pendingCalls: undefined, changed: this.sequence } : {}),
+        evidence: additional.length ? Object.freeze({ ...record.evidence!, launches: Object.freeze([...record.evidence!.launches, ...additional]) }) : record.evidence,
+        witnesses: unique.length ? [...(record.witnesses ?? []), ...unique] : record.witnesses });
+    }
+    record = this.records.get(item.taskId);
+    return { ...item, stateUncertain: uncertain || unresolved || !record || !!record.unavailable || !!record.pending };
+  }
+  clear(): void {
+    this.scopes.clear(); this.records.clear(); this.reads.clear(); this.observations.clear(); this.sizes.clear(); this.tupleBytes = this.entryCount = 0;
+    this.closed = this.projectionLost = false;
+  }
+}
 
 function identity(value: unknown): value is string {
   return typeof value === "string" && value.length > 0 && value.length <= 512 && !/[\u0000-\u001f\u007f]/.test(value);
@@ -12,16 +471,18 @@ function identity(value: unknown): value is string {
  */
 export class BackgroundWorkers {
   private recoveryOnly = false;
-  constructor(private readonly budget: { entries?: number; bytes?: number } = {}) {}
+  constructor(private readonly budget: { entries?: number; bytes?: number; retained?: () => { bytes: number; entries: number }; onSaturation?: () => void } = {}) {}
   private readonly parents = new Map<string, string>();
-  private readonly tasks = new Map<string, { parent: string; worker: string; item: BackgroundTaskItem }>();
-  private readonly notices = new Set<string>();
-  private readonly unmatched = new Map<string, { parent: string; worker: string; item: BackgroundTaskItem; correlatable: boolean }>();
+  private readonly tasks = new Map<string, { parent: string; worker: string; item: BackgroundTaskItem; evidence: WorkerOccurrenceEvidence }>();
+  private readonly notices = new Map<string, { proof?: NativeProof; occurrence?: string }>();
+  private readonly invocations = new Map<string, { fact: LauncherEvidence; occurrence?: string }>();
+  private readonly terminalProofs = new Map<string, { proof?: NativeProof; occurrences: readonly string[]; started?: { proof: NativeProof; occurrence?: string } }>();
+  private readonly unmatched = new Map<string, { parent: string; worker: string; item: BackgroundTaskItem; correlatable: boolean; published: boolean }>();
   private readonly ended = new Map<string, number[]>();
   private readonly aliases = new Map<string, string>();
-  // Empty outer array and six collections. Each retained entry adds its
-  // serialized tuple (or notice string) plus a conservative comma allowance.
-  private bytes = 38;
+  // Empty outer array and eight collections. Each retained entry adds its
+  // complete serialized tuple plus a conservative comma allowance.
+  private bytes = 50;
   private boundaries = 0;
   private readonly sizes = new Map<object, Map<string, number>>();
 
@@ -42,9 +503,104 @@ export class BackgroundWorkers {
     else sizes.delete(key);
   }
 
-  private notice(key: string): void {
-    if (!this.unlimited) this.account(this.notices, key, JSON.stringify(key).length * 2 + 2);
-    this.notices.add(key);
+  private notice(key: string, proof?: NativeProof, occurrence?: string): void {
+    this.set(this.notices, key, { proof, occurrence });
+  }
+
+  evidenceSnapshot(): ReadonlyMap<string, WorkerOccurrenceEvidence> {
+    return new Map([...this.tasks].map(([id, task]) => [id, task.evidence]));
+  }
+
+  occurrence(taskId: string): WorkerOccurrenceEvidence | undefined { return this.tasks.get(taskId)?.evidence; }
+
+  controlWitnesses(taskId: string): ControlWitness[] {
+    const evidence = this.tasks.get(taskId)?.evidence;
+    if (!evidence) return [];
+    const witnesses: ControlWitness[] = [];
+    for (const invocation of this.invocations.values()) if (invocation.occurrence === evidence.key && invocation.fact.proof) witnesses.push({ kind: "called", proof: invocation.fact.proof });
+    if (evidence.executionStart) witnesses.push({ kind: "started", proof: evidence.executionStart });
+    if (evidence.executionEnd) witnesses.push({ kind: "ended", proof: evidence.executionEnd });
+    for (const notice of this.notices.values()) if (notice.occurrence === evidence.key && notice.proof) witnesses.push({ kind: "notification", proof: notice.proof });
+    return witnesses;
+  }
+
+  enforceBudget(): void { this.bound(); }
+
+  // Recovery can rebuild presentation after saturation, but cannot prove that
+  // a discarded contradiction never referred to the requested old identity.
+  get controlEvidenceAvailable(): boolean { return !this.recoveryOnly; }
+
+  /** Negative facts revoke a known occurrence without proving a new target's
+   * ownership or requiring a successful background launch/projection update.
+   */
+  observeLauncher(parent: string, fact: LauncherEvidence): void {
+    if (this.recoveryOnly || !identity(parent) || !identity(fact.call)) return;
+    const callKey = `v2:${parent}:${fact.call}`;
+    const known = this.tasks.get(this.aliases.get(callKey) ?? callKey);
+    if (known && launcherChanged(fact, known.evidence)) this.uncertain(known);
+    this.bound();
+  }
+
+  invocationReplay(parent: string, fact: LauncherEvidence): boolean {
+    const prior = this.invocations.get(`${parent}:${fact.call}`);
+    return !!prior?.occurrence && sameProof(prior.fact.proof, fact.proof);
+  }
+
+  invocation(parent: string, fact: LauncherEvidence): void {
+    if (this.recoveryOnly || !identity(parent) || !identity(fact.call) || this.invocationReplay(parent, fact)) return;
+    if (fact.selectedOnly && fact.workerType !== "shell") return;
+    for (const task of this.tasks.values()) if (task.parent === parent && task.evidence.launches.some(launch => launch.call === fact.call)) this.uncertain(task);
+    this.set(this.invocations, `${parent}:${fact.call}`, { fact });
+    this.bound();
+  }
+
+  terminalReplay(child: string, proof?: NativeProof): boolean {
+    const previous = this.terminalProofs.get(child);
+    return !!previous?.occurrences.length && sameProof(previous.proof, proof)
+      || [...this.tasks.values()].some(task => task.worker === child && sameProof(task.evidence.executionEnd, proof));
+  }
+
+  startReplay(child: string, proof?: NativeProof): boolean {
+    const previous = this.terminalProofs.get(child)?.started;
+    return !!previous?.occurrence && sameProof(previous.proof, proof)
+      || [...this.tasks.values()].some(task => task.worker === child && sameProof(task.evidence.executionStart, proof));
+  }
+
+  executionStarted(child: string, proof?: NativeProof): void {
+    if (this.recoveryOnly || !identity(child) || this.startReplay(child, proof)) return;
+    if (proof) this.set(this.terminalProofs, child, { ...(this.terminalProofs.get(child) ?? { occurrences: [] }), started: { proof } });
+    for (const task of this.tasks.values()) if (task.worker === child && task.item.taskType === "agent" && task.item.status === "running") this.uncertain(task, false);
+    this.bound();
+  }
+
+  notificationReplay(parent: string, id: string, proof?: NativeProof): boolean {
+    const previous = this.notices.get(`${parent}:${id}`);
+    return !!previous?.occurrence && sameProof(previous.proof, proof);
+  }
+
+  observeNotification(parent: string, id: string, prepared: PreparedNotification | undefined, proof?: NativeProof): void {
+    if (this.recoveryOnly || !prepared?.valid || !prepared.status || this.notificationReplay(parent, id, proof)) return;
+    for (const task of this.tasks.values()) if (task.parent === parent && task.worker === prepared.worker
+      && task.item.taskType === (prepared.source === "shell" ? "shell" : "agent") && task.item.status === "running") this.uncertain(task, false);
+    this.bound();
+  }
+
+  private uncertain(task: { parent: string; worker: string; item: BackgroundTaskItem; evidence: WorkerOccurrenceEvidence }, publish = true): void {
+    if (publish) task.item = { ...task.item, stateUncertain: true };
+    task.evidence = Object.freeze({ ...task.evidence, uncertain: true });
+    this.set(this.tasks, task.item.taskId, task);
+  }
+
+  /** Revoke verified edges touching this child or parent, or all edges when
+   * omitted. Retain occurrence evidence and the recovery-only latch; callers
+   * must verify current ownership again before trusting subsequent agent facts.
+   */
+  invalidateOwnership(sessionId?: string): void {
+    for (const [child, parent] of this.parents) {
+      if (sessionId !== undefined && child !== sessionId && parent !== sessionId) continue;
+      this.parents.delete(child);
+      if (!this.unlimited) this.account(this.parents, child, 0);
+    }
   }
 
   verifyChild(child: string, parent: string): void {
@@ -53,10 +609,16 @@ export class BackgroundWorkers {
     this.bound();
   }
 
-  executionEnded(child: string, at: number): void {
+  executionEnded(child: string, at: number, proof?: NativeProof): void {
     if (this.recoveryOnly || !this.parents.has(child)) return;
+    if (this.terminalReplay(child, proof)) return;
+    if (proof) this.set(this.terminalProofs, child, { ...this.terminalProofs.get(child), proof, occurrences: Object.freeze([...this.tasks.values()].filter(task => task.worker === child && task.item.taskType === "agent").map(task => task.evidence.key)) });
+    for (const task of this.tasks.values()) if (task.worker === child && task.item.taskType === "agent" && task.item.status === "running") {
+      if (proof && !task.evidence.executionEnd) task.evidence = Object.freeze({ ...task.evidence, executionEnd: proof });
+      this.uncertain(task, false);
+    }
     const boundaries = this.ended.get(child) ?? [];
-    if (boundaries.includes(at)) return;
+    if (boundaries.includes(at)) { this.bound(); return; }
     boundaries.push(at);
     this.boundaries++;
     this.set(this.ended, child, boundaries);
@@ -64,33 +626,38 @@ export class BackgroundWorkers {
   }
 
   launch(parent: string, value: unknown, at: number): NormalizedProviderUpdate[] {
+    return this.launchPrepared(parent, prepareTool(value, at), at);
+  }
+
+  launchPrepared(parent: string, prepared: PreparedTool, at: number): NormalizedProviderUpdate[] {
     if (this.recoveryOnly) return [];
-    const result = this.foldLaunch(parent, value, at);
+    this.observeLauncher(parent, prepared.fact);
+    if (this.recoveryOnly) return [];
+    const result = this.foldLaunch(parent, prepared, at);
     this.bound();
     return result;
   }
 
-  private foldLaunch(parent: string, value: unknown, at: number): NormalizedProviderUpdate[] {
-    const part = record(value);
-    const state = record(part.state);
-    const metadata = record(state.metadata);
-    const input = record(state.input);
-    const call = optionalString(part.id);
-    const shell = part.name === "shell";
-    const child = optionalString(shell ? metadata.shellID : metadata.sessionID);
-    if ((!shell && part.name !== "subagent") || !identity(call) || !identity(child) || !identity(parent) || (!shell && this.parents.get(child) !== parent)
-      || state.status !== "completed" || metadata.status !== "running") return [];
+  private foldLaunch(parent: string, prepared: PreparedTool, at: number): NormalizedProviderUpdate[] {
+    const { fact, name } = prepared;
+    const call = fact.call, child = fact.child, shell = name === "shell";
+    if ((!shell && name !== "subagent") || !identity(call) || !identity(child) || !identity(parent) || (!shell && this.parents.get(child) !== parent) || fact.background !== true) return [];
     const callKey = `v2:${parent}:${call}`;
     if (!identity(`task:${callKey}`)) return [];
     const taskId = this.aliases.get(callKey) ?? callKey;
     const known = this.tasks.get(taskId);
-    if (known) return [{ kind: "upsert", item: known.item }];
-    const startedAt = number(record(part.time).created) ?? at;
-    const shared = [...this.tasks.values()].find(task => task.parent === parent && task.worker === child && task.item.status === "running"
+    if (known) {
+      return [{ kind: "upsert", item: known.item }];
+    }
+    const invocation = this.invocations.get(`${parent}:${call}`);
+    const startedAt = fact.ran ?? fact.created ?? at;
+    const shared = [...this.tasks.values()].find(task => task.parent === parent && task.worker === child && task.item.taskType === (shell ? "shell" : "agent") && task.item.status === "running" && !task.evidence.uncertain
       && !this.ended.get(child)?.some(end => end >= task.item.createdAt && end < startedAt));
     if (shared) {
+      if (invocation) this.set(this.invocations, `${parent}:${call}`, { ...invocation, occurrence: shared.evidence.key });
       this.set(this.aliases, callKey, shared.item.taskId);
       shared.item = { ...shared.item, toolUseIds: [...(shared.item.toolUseIds ?? [shared.item.toolUseId!]), call] };
+      shared.evidence = Object.freeze({ ...shared.evidence, launches: Object.freeze([...shared.evidence.launches, fact]) });
       this.set(this.tasks, shared.item.taskId, shared);
       return [{ kind: "upsert", item: shared.item }];
     }
@@ -98,31 +665,44 @@ export class BackgroundWorkers {
       id: `task:${taskId}`, type: "background_task", taskId,
       createdAt: startedAt,
       toolUseId: call, ...(shell ? { outputFile: `shell:${child}` } : { childConversationId: child }), taskType: shell ? "shell" : "agent",
-      description: optionalString(shell ? input.command : input.description) ?? "Background worker",
-      ...(optionalString(input.agent) ? { subagentType: text(input.agent) } : {}),
-      ...(optionalString(input.prompt) ? { prompt: text(input.prompt) } : {}),
+      description: prepared.description ?? "Background worker",
+      ...(prepared.agent ? { subagentType: prepared.agent } : {}),
+      ...(prepared.prompt ? { prompt: prepared.prompt } : {}),
       status: "running",
       ...(this.ended.get(child)?.some(end => end >= startedAt) ? { stateUncertain: true } : {}),
     };
     const superseded: NormalizedProviderUpdate[] = [];
     for (const previous of this.tasks.values()) {
-      if (previous.parent !== parent || previous.worker !== child || previous.item.status !== "running") continue;
-      previous.item = { ...previous.item, stateUncertain: true };
-      this.set(this.tasks, previous.item.taskId, previous);
+      if (previous.parent !== parent || previous.worker !== child || previous.item.taskType !== item.taskType || previous.item.status !== "running") continue;
+      this.uncertain(previous);
       superseded.push({ kind: "upsert", item: previous.item });
     }
-    this.set(this.tasks, taskId, { parent, worker: child, item });
-    const pending = [...this.unmatched.entries()].filter(([, result]) => result.correlatable && result.parent === parent && result.worker === child && result.item.createdAt >= item.createdAt);
+    const started = !shell ? this.terminalProofs.get(child)?.started : undefined;
+    const evidence: WorkerOccurrenceEvidence = Object.freeze({ key: digest(JSON.stringify([parent, child, taskId, fact.workerType, fact.message, fact.created, fact.ran, fact.completed, fact.reportedCompletion])), parent, worker: child, kind: fact.workerType, taskId, launches: Object.freeze([fact]),
+      ...(started && !started.occurrence ? { executionStart: started.proof } : {}), ...(item.stateUncertain ? { uncertain: true } : {}) });
+    if (started && !started.occurrence) this.set(this.terminalProofs, child, { ...this.terminalProofs.get(child)!, started: { ...started, occurrence: evidence.key } });
+    if (invocation) this.set(this.invocations, `${parent}:${call}`, { ...invocation, occurrence: evidence.key });
+    this.set(this.tasks, taskId, { parent, worker: child, item, evidence });
+    const reports = [...this.unmatched.entries()].filter(([, result]) => result.parent === parent && result.worker === child && result.item.taskType === item.taskType);
+    const pending = reports.filter(([, result]) => result.correlatable && result.item.createdAt >= item.createdAt);
+    // Shell reports alone cannot establish background membership. Once a
+    // scoped launch proves it, reveal any reports which cannot safely join it.
+    const revealed: NormalizedProviderUpdate[] = [];
+    for (const [key, result] of reports) {
+      if (result.published || pending.length === 1 && pending[0]![0] === key) continue;
+      this.set(this.unmatched, key, { ...result, published: true });
+      revealed.push({ kind: "upsert", item: result.item });
+    }
     if (pending.length === 1) {
       const [key, result] = pending[0]!;
       this.unmatched.delete(key);
       if (!this.unlimited) this.account(this.unmatched, key, 0);
       const settled = { ...item, status: result.item.status, summary: result.item.summary, resultId: result.item.resultId,
         ...(result.item.terminalReportedAt === undefined ? {} : { terminalReportedAt: result.item.terminalReportedAt }) };
-      this.set(this.tasks, taskId, { parent, worker: child, item: settled });
-      return [{ kind: "remove", itemId: result.item.id }, { kind: "upsert", item: settled }];
+      this.set(this.tasks, taskId, { parent, worker: child, item: settled, evidence });
+      return [...superseded, ...revealed, ...(result.published ? [{ kind: "remove" as const, itemId: result.item.id }] : []), { kind: "upsert", item: settled }];
     }
-    return [...superseded, { kind: "upsert", item }];
+    return [...superseded, ...revealed, { kind: "upsert", item }];
   }
 
   content(parent: string, content: unknown, at: number): NormalizedProviderUpdate[] {
@@ -131,48 +711,47 @@ export class BackgroundWorkers {
 
   // `at` also positions/correlates a row. Pass null when it is only a display
   // fallback, not a provider report clock (including stored missing-time 0).
-  notification(parent: string, id: string, payload: unknown, at: number, terminalReportedAt: number | null = at): NormalizedProviderUpdate[] | undefined {
+  notification(parent: string, id: string, payload: unknown, at: number, terminalReportedAt: number | null = at, proof?: NativeProof): NormalizedProviderUpdate[] | undefined {
+    return this.notificationPrepared(parent, id, prepareNotification(payload), at, terminalReportedAt, proof);
+  }
+
+  notificationPrepared(parent: string, id: string, prepared: PreparedNotification | undefined, at: number, terminalReportedAt: number | null = at, proof?: NativeProof): NormalizedProviderUpdate[] | undefined {
     if (this.recoveryOnly) {
-      const source = record(record(payload).metadata).source;
-      return source === "subagent" || source === "shell" ? [] : undefined;
+      return prepared ? [] : undefined;
     }
-    const result = this.foldNotification(parent, id, payload, at, terminalReportedAt);
+    this.observeNotification(parent, id, prepared, proof);
+    if (this.recoveryOnly) return prepared ? [] : undefined;
+    const result = prepared ? this.foldNotification(parent, id, prepared, at, terminalReportedAt, proof) : undefined;
     this.bound();
     return result;
   }
 
-  private foldNotification(parent: string, id: string, payload: unknown, at: number, terminalReportedAt: number | null): NormalizedProviderUpdate[] | undefined {
-    const value = record(payload);
-    const metadata = record(value.metadata);
-    const shell = metadata.source === "shell";
-    const child = optionalString(shell ? metadata.shellID : metadata.childID);
-    if ((!shell && metadata.source !== "subagent") || !identity(child) || !identity(parent) || !identity(id) || !identity(`task:v2:${parent}:notification:${id}`) || (!shell && this.parents.get(child) !== parent)) return;
-    if (shell && (metadata.exit != null && (typeof metadata.exit !== "number" || !Number.isFinite(metadata.exit))
-      || metadata.signal != null && typeof metadata.signal !== "string"
-      || metadata.timeout != null && typeof metadata.timeout !== "boolean")) return;
-    // User-shell notes use the same source, but have no tool background launch.
-    if (shell && ![...this.tasks.values()].some(task => task.parent === parent && task.worker === child)) return;
-    const status = metadata.state === "completed" ? (shell && (metadata.timeout === true || typeof metadata.signal === "string" || typeof metadata.exit === "number" && metadata.exit !== 0) ? "failed" : "completed")
-      : metadata.state === "error" ? "failed" : metadata.state === "cancelled" ? "stopped" : undefined;
+  private foldNotification(parent: string, id: string, prepared: PreparedNotification, at: number, terminalReportedAt: number | null, proof?: NativeProof): NormalizedProviderUpdate[] | undefined {
+    const shell = prepared.source === "shell", child = prepared.worker;
+    if (!prepared.valid || !identity(child) || !identity(parent) || !identity(id) || !identity(`task:v2:${parent}:notification:${id}`) || (!shell && this.parents.get(child) !== parent)) return;
+    // User-shell notes use the same source. Retain them silently until a
+    // matching background launch establishes membership, under the same caps.
+    const published = !shell || [...this.tasks.values()].some(task => task.parent === parent && task.worker === child && task.item.taskType === "shell");
+    const { status, summary } = prepared;
     if (!status) return;
     const reportClock = terminalReportedAt !== null && Number.isFinite(terminalReportedAt) && terminalReportedAt >= 0 ? { terminalReportedAt } : {};
     const key = `${parent}:${id}`;
     if (this.notices.has(key)) return [];
-    const candidates = [...this.tasks.values()].filter(task => task.parent === parent && task.worker === child && task.item.status === "running" && task.item.createdAt <= at);
-    // Only validated metadata classifies a notification. Remove the provider's
-    // outer presentation envelope, not arbitrary markup in the report itself.
-    const body = text(value.text);
-    const summary = shell ? body.replace(/^<shell\b[^\n]*>\n/, "").replace(/\n<\/shell>$/, "")
-      : body.replace(/^<subagent\b[^\n]*>\n/, "").replace(/\n<\/subagent>$/, "");
-    if (candidates.length !== 1) {
+    const occurrences = [...this.tasks.values()].filter(task => task.parent === parent && task.worker === child && task.item.taskType === (shell ? "shell" : "agent"));
+    const undatedReuse = shell && reportClock.terminalReportedAt === undefined && occurrences.length > 1;
+    const candidates = occurrences.filter(task => task.item.status === "running" && (undatedReuse || task.item.createdAt <= at));
+    if (candidates.length !== 1 || undatedReuse) {
       const taskId = `v2:${parent}:notification:${id}`;
       const item: BackgroundTaskItem = {
         id: `task:${taskId}`, type: "background_task", taskId, createdAt: at,
-        description: optionalString(value.description) ?? "Background worker result",
-        childConversationId: child, taskType: "agent", status, summary, resultId: id, ...reportClock,
+        description: prepared.description ?? "Background worker result",
+        ...(shell ? { outputFile: `shell:${child}` } : { childConversationId: child }), taskType: shell ? "shell" : "agent", status, summary, resultId: id, ...reportClock,
       };
-      this.set(this.unmatched, key, { parent, worker: child, item, correlatable: candidates.length === 0 });
-      this.notice(key);
+      // Background membership permits display, not occurrence assignment:
+      // an undated shell report's fallback clock cannot settle a later run.
+      this.set(this.unmatched, key, { parent, worker: child, item, correlatable: candidates.length === 0 && (!shell || reportClock.terminalReportedAt !== undefined), published });
+      this.notice(key, proof);
+      if (!published) return [];
       return [...candidates.map((task): NormalizedProviderUpdate => {
         task.item = { ...task.item, stateUncertain: true };
         this.set(this.tasks, task.item.taskId, task);
@@ -182,15 +761,16 @@ export class BackgroundWorkers {
     const task = candidates[0]!;
     task.item = { ...task.item, status, summary, resultId: id, ...reportClock };
     this.set(this.tasks, task.item.taskId, task);
-    this.notice(key);
+    this.notice(key, proof, task.evidence.key);
     return [{ kind: "upsert", item: task.item }];
   }
 
   private bound(): void {
-    const maxEntries = this.budget.entries ?? 8_192;
-    const maxBytes = this.budget.bytes ?? 4 * 1024 * 1024;
+    const retained = this.budget.retained?.() ?? { entries: 0, bytes: 0 };
+    const maxEntries = (this.budget.entries ?? 8_192) - retained.entries;
+    const maxBytes = (this.budget.bytes ?? 4 * 1024 * 1024) - retained.bytes;
     if (maxEntries === Infinity && maxBytes === Infinity) return;
-    const collections = [this.parents, this.tasks, this.notices, this.unmatched, this.ended, this.aliases];
+    const collections = [this.parents, this.tasks, this.notices, this.unmatched, this.ended, this.aliases, this.invocations, this.terminalProofs];
     const entries = collections.reduce((sum, values) => sum + values.size, 0) + this.boundaries;
     if (entries <= maxEntries && this.bytes <= maxBytes) return;
     // Never evict only an old occurrence or its notice tombstone: the next
@@ -199,8 +779,9 @@ export class BackgroundWorkers {
     // No provider mutation or polling is introduced by this fallback.
     collections.forEach(values => values.clear());
     this.sizes.clear();
-    this.bytes = 38;
+    this.bytes = 50;
     this.boundaries = 0;
     this.recoveryOnly = true;
+    this.budget.onSaturation?.();
   }
 }
