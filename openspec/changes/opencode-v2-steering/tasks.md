@@ -2,7 +2,7 @@ Each slice is written test first: write the named test and watch it fail, implem
 
 ## PR519 inline-review follow-up — 2026-10-24
 
-This ledger adds acceptance for D14–D17 without replacing historical completed work or closing outstanding full-suite, real-agent or real-device checks below. Checks remain open until implementation, relevant verification and independent review support completion.
+This ledger adds acceptance for D14–D17 while preserving historical completed work and verification limitations. Checks require implementation, relevant verification and independent review, unless the user explicitly removes the requirement. The user removed the unperformed real-agent manual pass from delivery acceptance on 2026-10-25.
 
 - [x] R1. Unknown admission: verify adapter, HTTP and rendered-UI local discard with fresh admission-only tokens, exact target/receipt fencing, retained original unknown receipts/native evidence, no provider mutation or replay, and unchanged resume/withdrawal restrictions. Cover stale reads, late acknowledgements and confirmation cancellation. Durable visible feedback passed fresh independent review and all four desktop/touch Chromium/WebKit cases in the green full local run.
 - [x] R2. Keep queued: verify discard invalidates pre-existing deferred drains, preserves unrelated drafts/held entries, and leaves explicit Send now and later genuine idle transitions usable. Failed-action status rollback and derived recovery completion must not release kept input.
@@ -14,7 +14,7 @@ This ledger adds acceptance for D14–D17 without replacing historical completed
 - [x] R8. Background shell/report folding: verify correctly typed output-inspectable placeholders, bounded prelaunch buffering, native-clock/reused-ID uncertainty and superseded upserts; undated old reports must not settle a newer occurrence. Focused implementation checks and fresh independent Sol High review confirmed the corrected cases, including 24 background tests in independent review.
 - [x] R9. API31 and Hub integration: align strict schemas, validators, contract, examples and changelog while retaining Hub11/web3. Verify authenticated caller/workspace request-identity isolation, cookie-origin protections and production verified-principal handoff for discard. Actual Hub red/green coverage and independent transport/service reviews passed; the local-only service path does not require runtime startup.
 - [x] R10. Browser evidence: verify real-adapter discard on desktop/touch Chromium and WebKit, approved readable warning, keyboard/focus/touch behavior, draft preservation, kept queue and no native writes. All four full-run cases passed. Seven committed-source capture cases produced 19 current images from `3cf4b69`; independent privacy review and user approval preceded publication as PR attachments, with anonymous downloads verified against every image hash. No generated PNGs are tracked.
-- [x] R11. Documentation/spec alignment: reconcile approved proposal/design/delta/tasks, canonical chat requirements, `docs/CHAT.md` and affected architecture notes; preserve historical evidence and outstanding manual acceptance. Fresh independent reviews confirmed the per-target control policy, live-worker versus reverted-history distinction, read-recovery editing and Rename readiness. Strict canonical/change/API validations passed. Existing already-synced archive collision and unrelated OpenAPI lint warning remain disclosed; no archive was attempted.
+- [x] R11. Documentation/spec alignment: reconcile approved proposal/design/delta/tasks, canonical chat requirements, `docs/CHAT.md` and affected architecture notes; preserve historical evidence and manual-verification limitations. Fresh independent reviews confirmed the per-target control policy, live-worker versus reverted-history distinction, read-recovery editing and Rename readiness. Strict canonical/change/API validations passed. Existing already-synced archive collision and unrelated OpenAPI lint warning remain disclosed; no archive was attempted.
 - [x] R12. Integrated delivery: freeze the combined diff, run appropriate focused/cross-module/full checks without weakening limits, obtain fresh independent Sol High reviews, review publication safety, then commit/push normally. Implementation `3cf4b69` passed full local checks before its normal push; CI run `40203317503` and CodeQL passed. The complete PR body, 19 images/captions and finding-by-finding response were shown in chat and approved before publication. Readback preserved title/ready status and verified approved text and all attachment hashes. Native/manual, physical-device and speech checks remain unverified; no merge or deployment occurred.
 - [x] R13. Bounded per-target control proof (D17): verify retained healthy targets remain stoppable after projection saturation and read-only recovery without reconnect; missing/revoked/overflowed targets are uncertain with Stop withheld consistently in live/history/reconciliation. Check exact 1 MiB/2,048-entry control and 4 MiB/8,192-entry aggregate accounting, target-isolated overflow/stubs, revocation through progress/stale reads/reconnect, provider-lifetime limits and no silent readmission. Cold/pre-Stop/replay safety matrices and meaningful assertions were preserved; fresh independent Spec and Standards/bounds reviews and full local verification passed.
 
@@ -205,14 +205,16 @@ Latest implementation acceptance: **5,183 pass / 17 skip / 0 fail** in documente
   `steering-full-e2e.log`, `steering-file-observer-recheck.log`, and
   `steering-e2e-failure-recheck.log` in the session's approved temporary
   `opencode/` directory. No browser installation was attempted.
-- [ ] 8.4 Do one manual pass against a real OpenCode 2.0.29 binary (`bun run dev`; target change approved 2026-10-15):
+### Historical manual verification — not a delivery requirement
+
+The user removed former task 8.4 on 2026-10-25. No manual pass was performed;
+this removal does not claim real-agent acceptance. The former scope was a pass
+against OpenCode 2.0.29 (`bun run dev`; target approved 2026-10-15):
   - steer mid-turn;
   - steer → queue before the boundary;
   - the already-delivered race;
   - cancel, then Send now;
   - undo with a pending steer.
-
-  Record the results in the PR body.
 
   Target update (2026-10-15): the installed `opencode --version` reports
   `opencode v2.0.29`, now the approved real manual target. The SDK and fake
@@ -225,7 +227,8 @@ Latest implementation acceptance: **5,183 pass / 17 skip / 0 fail** in documente
   `chrome-for-testing` executable (`chromium-1246`) is missing. Only the
   project's WebKit installation was approved and installed; no additional
   browser was installed. The dev hub was stopped. None of the five real
-  manual scenarios above was exercised, so this task remains open.
+  manual scenarios above was exercised. This remains a verification limitation,
+  not an open delivery task.
   Startup evidence: `steering-continuation-dev.log` in the approved temporary
   `opencode/` directory; browser navigation returned the missing-executable
   error directly.

@@ -160,7 +160,7 @@ The existing check counts pending steers plus held messages against 20 messages 
 
 Shared chat Playwright suites use `FakeE2EChatService` (`tests/e2e/chat-service.ts`). Steering and discard integration instead use `tests/e2e/opencode-v2-fake.ts`, a scripted HTTP/SSE native server registered by `tests/e2e/server.ts` behind the real `ChatAdapter` and `OpenCodeV2Provider`. Its route contract follows the current pinned client 2.1.2. Controls under `/__e2e/chat` include a failure before native admission, allowing a genuinely unknown outcome with nothing delivered. The Claude Send now flow retains the shared fake service. *Alternative rejected:* implementing all steering in the fake chat service, which would bypass adapter/provider integration.
 
-The OpenCode 2.0.29 manual target approved on 2026-10-15 remains historical acceptance evidence, not proof of today's installed runtime. Scripted checks do not close outstanding real-agent or real-device checks. Discard coverage must include adapter races, strict HTTP validation and scoped receipts, cancellation of the confirmation, stale callbacks, draft preservation, and desktop/touch Chromium/WebKit interaction evidence.
+The user removed the OpenCode 2.0.29 manual pass as a delivery requirement on 2026-10-25. That pass was not performed, and its historical target is not proof of today's installed runtime. Scripted checks do not establish real-agent or physical-device behavior. Discard coverage must include adapter races, strict HTTP validation and scoped receipts, cancellation of the confirmation, stale callbacks, draft preservation, and desktop/touch Chromium/WebKit interaction evidence.
 
 ### D14. Explicit local discard for unknown admission
 
