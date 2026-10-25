@@ -1,10 +1,10 @@
 # OpenCode chat screenshots
 
-The [PR #519 description](https://github.com/tjakobsson/uatu/pull/519) owns the feature screenshot gallery; PNGs are not tracked here. This index describes the 17 current captures prepared from committed feature source `6522fe54c5223cfca83b5673e71f9d020b4c48a7`. Publication requires image/caption review and user approval.
+The [PR #519 description](https://github.com/tjakobsson/uatu/pull/519) owns the feature screenshot gallery; PNGs are not tracked here. This index describes 19 current captures prepared from committed implementation `3cf4b69547d24fd85737373eb8ba1e6c89bd0fe0`: the existing 17 purposes plus two local-discard frames. Publication requires image/caption review and user approval.
 
 Physical-iPhone retesting of the picker correction remains user-owned and pending. Chromium and WebKit browser regressions passed; the gallery itself is Chromium capture evidence, not physical-device or WebKit screenshot evidence.
 
-Actual application captures in Chromium, light/dark themes: desktop **1440 × 1000 CSS pixels**, mobile **390 × 844**. The restored-picker frame uses **393 × 704 CSS pixels at 3× device scale**. These are synthetic documentation fixtures, not personal conversations, provider benchmarks, native iPhone captures or live-model acceptance. No paid generation or live Hub was used. See [current chat behavior](../../CHAT.md).
+Actual application captures in Chromium, light/dark themes: desktop gallery **1440 × 1000 CSS pixels**, desktop discard **1360 × 960**, mobile **390 × 844**. The restored-picker frame uses **393 × 704 CSS pixels at 3× device scale** (1179 × 2112 PNG). These are synthetic documentation fixtures, not personal conversations, provider benchmarks, native iPhone captures or live-model acceptance. No paid generation or live Hub was used. See [current chat behavior](../../CHAT.md).
 
 The standard workspace contains only the E2E sample README/files. Model names, context figures, jobs, questions and answers are scripted. The preferences capture uses an isolated test Hub/account with an empty credential store. No authentication URLs, credentials, private filesystem paths, real costs, or original user photographs are included.
 
@@ -21,12 +21,14 @@ The standard workspace contains only the E2E sample README/files. Model names, c
 | Side answer ready, dark | `/btw` completion stays at the transcript edge, outside the composer. |
 | Formatted side reader, dark | Larger nonmodal reading window, real sanitized Markdown and workspace reference; composer/workers remain interactive, Minimise retains the answer. |
 | Personal preferences, light | Account-level automatic-background preference and its explanation, in an isolated synthetic Hub. This saved-state frame does not demonstrate unsaved/conflict handling. |
-| Unknown receipt, dark | Expanded pending steer after a lost acknowledgement. Unconfirmed feedback is clipped; this frame does not fully display “Do not repeat.” |
-| Replacement warning, light | Reverted message, paused steer and nineteen queued entries with replacement warning. No worker overview is present in this state. |
+| Unknown receipt, dark | Lost-acknowledgement fixture with an expanded pending steer. Receipt feedback beneath the composer is clipped; this frame does not fully display the unconfirmed-delivery or Do not repeat guidance. |
+| Replacement warning, light | After Undo, 19 scripted working tasks remain independently visible above one paused steer and 19 queued follow-ups with the replacement warning. |
 | Mobile side reader, light | Existing mobile modal with the same accessible Minimise action. |
 | Mobile minimised answer, light | Unblocked conversation and composer; the existing notice reopens the retained answer without inference. |
 | Mobile picker after viewport restoration | Picker restored from 360 to 704 CSS pixels while open, with complete model rows; not a physical-device keyboard capture. |
 | Next-turn settings before steering | Next turn Plan selection and visible pre-send explanation; the fixture verifies that the steer retains Build while queued work adopts Plan. |
+| Discard local record, desktop | Cancel-focused confirmation: removal does not cancel or resend the message; the original may still arrive. Other messages remain queued until Send now or a later normal idle transition. |
+| Durable discard guidance, touch | Synthetic fixture after local discard and release of the application's delayed SSE removal event: complete persistent uncertainty guidance, the unrelated draft, and one remaining held queued input. |
 
 Overview/configuration/question use the scripted chat-service fixture so all model metadata can be selected without inference. The other chat captures run the production adapter/provider against the local scripted OpenCode 2.x HTTP server. Side-reader responses use deterministic Markdown (the desktop request completes against the native fixture first; mobile is browser-stubbed). Desktop gallery widens the actual chat split to demonstrate its container-based single-line density. Screenshots show rendered application states, not mock HTML.
 
@@ -59,6 +61,17 @@ UATU_CAPTURE_CHAT_SCREENSHOTS=1 UATU_CAPTURE_HOLD_ONLY=1 bunx playwright test \
 ```
 
 Normal tests skip these gallery writers. Review image privacy and captions before publication. Capture helpers assert key rendered states; the gallery itself is not independent validation. Hold/queue regressions live in `tests/e2e/chat-hold-queue-regressions.e2e.ts`; the reference-workdock suite covers normal/short/mobile/enlarged-text layouts and independent scrolling. Nonzero viewport/fixed-origin checks are synthetic. No agent native-device result is claimed.
+
+The two local-discard frames come from the real-adapter regression against the
+scripted native server; the selected gallery uses Chromium desktop and touch:
+
+```sh
+bun run test:e2e tests/e2e/chat-discard-unconfirmed.e2e.ts \
+  --project=e2e --workers=1 --grep chromium
+```
+
+All seven committed-source capture cases passed. Scripted captures do not close
+outstanding native-service, physical-device or screen-reader speech checks.
 
 To select the nine-frame worker-focused subset from the desktop gallery writer:
 
