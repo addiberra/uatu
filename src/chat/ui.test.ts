@@ -491,6 +491,176 @@ describe("chat reversible-history composer", () => {
       }
     } finally { window.dispatchEvent(new window.Event("pagehide")); }
   });
+  for (const order of ["before-reopen", "after-reopen-intent", "token-change", "conversation-change", "removed-invoker", "replaced-dialog", "focus-reentry", "replace-during-focus"] as const) test(`local discard close ownership keeps cancelled A separate from confirmed B ${order}`, async () => {
+    const { document, window } = parseHTML(html);
+    installDomGlobals(document, window);
+    document.documentElement.setAttribute("data-ui-mode", "desktop");
+    document.documentElement.setAttribute("data-chat-panel", "open");
+    stubConversationSelect(document);
+    const a: QueuedMessage = { id: "a", text: "Uncertain A", queuedAt: 1, delivery: "steer", unconfirmed: true, admissionUncertaintyId: "token-a" };
+    const b: QueuedMessage = { ...a, id: "b", text: "Uncertain B", admissionUncertaintyId: "token-b" };
+    const held: QueuedMessage = { id: "held", text: "Keep held follower", queuedAt: 2, delivery: "queue", paused: true };
+    const calls: Array<{ id: string; token: string }> = [];
+    let stream: { event(event: unknown, cursor: string): void } | undefined;
+    let entries = [a, b, held];
+    const api = taskApi(document, { items: () => [], conversations: ["one", "two"], onStream: (_id, handlers) => { stream = handlers; } });
+    api.snapshot = async id => ({ ...snapshot(id), queued: id === "one" ? entries : [] });
+    api.discardUnconfirmedSteer = async (_id, id, _requestId, token) => {
+      calls.push({ id, token });
+      return { discarded: true, outcomeUnconfirmed: true };
+    };
+    let dialog = document.querySelector<HTMLDialogElement>("#chat-action-confirm")!;
+    let active: Element | null = null;
+    Object.defineProperty(document, "activeElement", { configurable: true, get: () => active });
+    const focusOrder: string[] = [];
+    let cancel = dialog.querySelector<HTMLButtonElement>('button[value="cancel"]')!;
+    const installDialog = () => {
+      Object.defineProperty(dialog, "open", { get: () => dialog.hasAttribute("open") });
+      cancel = dialog.querySelector<HTMLButtonElement>('button[value="cancel"]')!;
+      cancel.focus = () => { active = cancel; focusOrder.push("cancel"); };
+      dialog.showModal = () => { dialog.setAttribute("open", ""); cancel.focus(); };
+    };
+    installDialog();
+    const close = () => dialog.dispatchEvent(new window.Event("close"));
+    try {
+      const { initChat } = await import(`./ui.ts?close-ownership=${order}-${Date.now()}`);
+      initChat(api);
+      await waitUntil(() => document.querySelector('[data-queue-discard="b"]') !== null);
+      const input = document.querySelector<HTMLTextAreaElement>("#chat-input")!;
+      input.focus = () => { active = input; focusOrder.push("input"); };
+      type(input, "Unrelated draft");
+      const buttonA = document.querySelector<HTMLButtonElement>('[data-queue-discard="a"]')!;
+      const buttonB = document.querySelector<HTMLButtonElement>('[data-queue-discard="b"]')!;
+      let changeOnFocus = false;
+      buttonA.focus = () => {
+        active = buttonA; focusOrder.push("a");
+        if (changeOnFocus) {
+          changeOnFocus = false;
+          if (order === "replace-during-focus") {
+            const previous = dialog;
+            dialog = dialog.cloneNode(true) as HTMLDialogElement;
+            previous.replaceWith(dialog);
+            installDialog();
+            buttonB.click();
+          } else {
+            dialog.returnValue = "confirm";
+            buttonA.click();
+          }
+        }
+      };
+      buttonB.focus = () => { active = buttonB; focusOrder.push("b"); };
+      buttonA.click();
+      expect(document.activeElement).toBe(cancel);
+      // Native cancellation clears open/restores focus before its queued close.
+      dialog.dispatchEvent(new window.Event("cancel", { cancelable: true }));
+      dialog.returnValue = "cancel";
+      dialog.removeAttribute("open");
+      buttonA.focus();
+      if (order === "removed-invoker") buttonA.remove();
+      if (order === "before-reopen") close();
+      const previousDialog = dialog;
+      if (order === "replaced-dialog") {
+        dialog = dialog.cloneNode(true) as HTMLDialogElement;
+        previousDialog.replaceWith(dialog);
+        installDialog();
+      }
+      if (order === "replace-during-focus") {
+        changeOnFocus = true;
+        close();
+      } else buttonB.click();
+      if (order === "replaced-dialog") {
+        expect(dialog.open).toBe(true);
+        previousDialog.returnValue = "confirm";
+        previousDialog.dispatchEvent(new window.Event("close"));
+      } else if (order !== "before-reopen" && order !== "replace-during-focus") {
+        expect(dialog.open, "B must wait for A's close completion").toBe(false);
+        // Duplicate intents while closing must not form a modal queue.
+        buttonB.click();
+        changeOnFocus = order === "focus-reentry";
+        close();
+      }
+      await flush();
+      expect(calls).toEqual([]);
+      expect(dialog.open).toBe(true);
+      expect(document.activeElement).toBe(cancel);
+      expect(focusOrder.slice(-2)).toEqual([order === "removed-invoker" ? "input" : "a", "cancel"]);
+      // A concurrent request while B is open retains the existing refusal.
+      buttonA.click();
+      if (order === "token-change") {
+        entries = [a, { ...b, admissionUncertaintyId: "replacement-token" }, held];
+        stream!.event({ type: "conversation.queue", generation: "g", sequence: 1, conversationId: "one", queued: entries, change: { kind: "enqueued", messageId: "b" } }, "cursor-one-1");
+      } else if (order === "conversation-change") {
+        const select = document.querySelector<HTMLSelectElement>("#chat-conversation-select")!;
+        select.value = "two";
+        select.dispatchEvent(new window.Event("change", { bubbles: true }));
+        await flush();
+      }
+      dialog.returnValue = "confirm";
+      dialog.removeAttribute("open");
+      close();
+      await flush();
+      expect(calls).toEqual(order === "token-change" || order === "conversation-change" ? [] : [{ id: "b", token: "token-b" }]);
+      if (order === "before-reopen" || order === "after-reopen-intent" || order === "removed-invoker" || order === "replaced-dialog") expect(focusOrder).toContain("b");
+      expect(dialog.open).toBe(false);
+      if (order === "conversation-change") {
+        const select = document.querySelector<HTMLSelectElement>("#chat-conversation-select")!;
+        select.value = "one";
+        select.dispatchEvent(new window.Event("change", { bubbles: true }));
+        await flush();
+      }
+      expect(input.value).toBe("Unrelated draft");
+      if (order !== "removed-invoker") expect(document.querySelector('[data-queue-discard="a"]')).not.toBeNull();
+      expect(document.querySelector("#chat-queue")!.textContent).toContain("Keep held follower");
+    } finally { window.dispatchEvent(new window.Event("pagehide")); }
+  });
+
+  for (const action of ["shell Stop", "paused-batch Send"] as const) test(`shared confirmation ${action} cancels then authorizes its rendered action once`, async () => {
+    const { document, window } = parseHTML(html);
+    installDomGlobals(document, window);
+    document.documentElement.setAttribute("data-ui-mode", "desktop");
+    document.documentElement.setAttribute("data-chat-panel", "open");
+    stubConversationSelect(document);
+    const shell = { id: "task:shell", type: "background_task" as const, taskId: "shell", description: "Fixture shell", taskType: "shell", status: "running" as const, createdAt: 1 };
+    const queued: QueuedMessage[] = [
+      { id: "paused", text: "Paused steer", delivery: "steer", paused: true, queuedAt: 1 },
+      { id: "queued", text: "Queued input", delivery: "queue", paused: true, queuedAt: 2 },
+    ];
+    const api = taskApi(document, { items: () => action === "shell Stop" ? [shell] : [] });
+    api.status = async () => [{ agent: { id: "test", name: "Test" }, availability: { state: "ready", version: "test", agent: { id: "test", name: "Test", capabilities: ["background-tasks", "background-blocking-work", "steering", "send-now"] } } }];
+    api.snapshot = async id => ({ ...snapshot(id), items: action === "shell Stop" ? [shell] : [], queued: action === "paused-batch Send" ? queued : [] });
+    const calls: string[] = [];
+    api.stopTask = async (id, taskId) => { calls.push(`${id}/${taskId}`); };
+    api.sendNow = async (id, messageId) => { calls.push(`${id}/${messageId}`); return { messageId, delivery: "steer" }; };
+    const dialog = document.querySelector<HTMLDialogElement>("#chat-action-confirm")!;
+    Object.defineProperty(dialog, "open", { get: () => dialog.hasAttribute("open") });
+    dialog.showModal = () => { dialog.setAttribute("open", ""); };
+    const selector = action === "shell Stop" ? '#chat-compact-workers-items [data-stop-task="shell"]' : '[data-queue-send-now="queued"]';
+    try {
+      const { initChat } = await import(`./ui.ts?shared-confirmation=${action}-${Date.now()}`);
+      initChat(api);
+      await waitUntil(() => document.querySelector(selector) !== null);
+      const input = document.querySelector<HTMLTextAreaElement>("#chat-input")!;
+      type(input, "Keep draft");
+      const invoke = () => document.querySelector<HTMLButtonElement>(selector)!.click();
+      invoke();
+      expect(dialog.open).toBe(true);
+      expect(dialog.querySelector("#chat-action-confirm-title")!.textContent).toBe(action === "shell Stop" ? "Stop shell worker?" : "Send queued message now?");
+      dialog.returnValue = "cancel";
+      dialog.removeAttribute("open");
+      dialog.dispatchEvent(new window.Event("close"));
+      await flush();
+      expect(calls).toEqual([]);
+      invoke();
+      expect(dialog.open).toBe(true);
+      dialog.returnValue = "confirm";
+      dialog.removeAttribute("open");
+      dialog.dispatchEvent(new window.Event("close"));
+      await flush();
+      expect(calls).toEqual([action === "shell Stop" ? "one/shell" : "one/queued"]);
+      expect(input.value).toBe("Keep draft");
+    } finally { window.dispatchEvent(new window.Event("pagehide")); }
+  });
+
   test("local discard feedback survives late removal, status, snapshot and unrelated success without automation", async () => {
     const { document, window } = parseHTML(html);
     installDomGlobals(document, window);

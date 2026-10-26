@@ -80,6 +80,47 @@ function installDiscardEventGate() {
   };
 }
 
+type ConfirmationCloseGate = {
+  held: boolean;
+  nativeCloses: number;
+  focusAfterRelease?: "composer" | "other";
+  events: Array<{ type: string; trusted: boolean; open: boolean; value: string; confirmSubmitter: boolean }>;
+  release(): boolean;
+};
+
+// New ownership regression only: observe a genuine native close, hold its
+// delivery, then explicitly redispatch it (untrusted) after the next intent.
+// This controls dialog lifecycle, not provider evidence or HTTP receipts.
+function installConfirmationCloseGate() {
+  let held: Event | undefined;
+  const gate: ConfirmationCloseGate = {
+    held: false, nativeCloses: 0, events: [],
+    release() {
+      if (!held) throw new Error("No native close held");
+      const event = held;
+      const wasTrusted = event.isTrusted;
+      held = undefined;
+      gate.held = false;
+      document.querySelector("#chat-action-confirm")!.dispatchEvent(event);
+      // Observe restoration before the waiting next owner can open in a microtask.
+      gate.focusAfterRelease = document.activeElement?.id === "chat-input" ? "composer" : "other";
+      return wasTrusted;
+    },
+  };
+  (window as unknown as { confirmationCloseGate: ConfirmationCloseGate }).confirmationCloseGate = gate;
+  for (const type of ["cancel", "close", "submit"]) document.addEventListener(type, event => {
+    const dialog = document.querySelector<HTMLDialogElement>("#chat-action-confirm");
+    if (!dialog || !(event.target instanceof Node) || !dialog.contains(event.target)) return;
+    gate.events.push({ type, trusted: event.isTrusted, open: dialog.open, value: dialog.returnValue,
+      confirmSubmitter: type === "submit" && (event as SubmitEvent).submitter?.getAttribute("value") === "confirm" });
+    if (type === "close" && event.isTrusted && ++gate.nativeCloses === 1) {
+      held = event;
+      gate.held = true;
+      event.stopImmediatePropagation();
+    }
+  }, true);
+}
+
 for (const browserName of ["chromium", "webkit"] as const) for (const mode of ["desktop", "touch"] as const) test.describe(`local discard ${mode} ${browserName}`, () => {
   test.use({ page: async ({ launchBrowser, baseURL }, use) => {
     const browser = await launchBrowser(browserName);
@@ -218,6 +259,107 @@ for (const browserName of ["chromium", "webkit"] as const) for (const mode of ["
     await expect(input).toHaveValue("Keep my unrelated draft");
     await expect(feedback).toBeVisible();
     await expect(feedback).toContainText("Delivery remains unconfirmed");
+  });
+
+  test("close ownership keeps cancelled A separate from native-confirmed B with exactly one local HTTP mutation", async ({ page, request }, info) => {
+    await page.addInitScript(installConfirmationCloseGate);
+    await request.post("/__e2e/reset");
+    await control(request, { action: "agents", stack: "opencode-v2", backgroundPreview: true });
+    const { token } = await request.get("/__e2e/terminal-token").then(response => response.json()) as { token: string };
+    await page.goto(`/?t=${encodeURIComponent(token)}`);
+    await expect(page.locator("#connection-state .connection-label")).toHaveText("Connected");
+    if (mode === "touch") await page.locator("#touch-tab-chat").tap(); else await openChatPanel(page);
+    // Independent real HTTP/native-fake setup. Only the rendered UI may
+    // authorize either discard; two conversations make target ownership visible.
+    const prepare = async (owner: "A" | "B") => {
+      const previous = await page.locator("#chat-conversation-select").inputValue();
+      await page.getByRole("button", { name: "New conversation" }).click();
+      await expect(page.locator("#chat-conversation-select")).not.toHaveValue(previous);
+      await expect(page.locator("#chat-conversation-select")).not.toHaveValue("");
+      const conversationId = await page.locator("#chat-conversation-select").inputValue();
+      const chat = `/api/chat/conversations/${encodeURIComponent(conversationId)}`;
+      const post = (path: string, data: unknown) => request.post(`${chat}${path}?t=${encodeURIComponent(token)}`, { data, headers: { origin: new URL(page.url()).origin } });
+      expect((await post("/prompts", { requestId: `start-${owner}`, text: `Start fixture ${owner}` })).ok()).toBe(true);
+      await expect(page.locator("#chat-stop")).toBeEnabled();
+      await control(request, { action: "opencode", op: "unknownPromptBeforeAdmission" });
+      expect((await post("/prompts", { requestId: `unknown-${owner}`, text: `Uncertain ${owner}`, delivery: "steer" })).ok()).toBe(false);
+      expect((await post("/prompts", { requestId: `held-${owner}`, text: `Held follower ${owner}`, delivery: "queue" })).ok()).toBe(true);
+      expect((await post("/cancel", { requestId: `setup-stop-${owner}` })).ok()).toBe(true);
+      await expect(page.locator("#chat-stop")).toBeDisabled();
+      const snapshot = () => request.get(`${chat}?t=${encodeURIComponent(token)}`).then(response => response.json()) as Promise<{ queued: Array<{ id: string; admissionUncertaintyId?: string; text: string }> }>;
+      const eligible = (await snapshot()).queued.find(entry => entry.admissionUncertaintyId)!;
+      expect(eligible.admissionUncertaintyId).toEqual(expect.any(String));
+      return { conversationId, snapshot, eligible, path: `${chat}/queue/${encodeURIComponent(eligible.id)}/discard-unconfirmed` };
+    };
+    const a = await prepare("A");
+    const b = await prepare("B");
+    expect(b.conversationId).not.toBe(a.conversationId);
+    const input = page.locator("#chat-input");
+    await input.fill("Keep unrelated B draft");
+    const select = page.locator("#chat-conversation-select");
+    const reveal = async (messageId: string) => {
+      // selectOption changes the picker before its conversation snapshot paints.
+      // Match the actual target, not a still-rendered row from the old owner.
+      await expect(page.locator(`[data-queue-discard="${messageId}"]`)).toHaveCount(1);
+      const toggle = page.locator("[data-pending-toggle]");
+      if (await toggle.getAttribute("aria-expanded") === "false") await toggle.click();
+      await expect(page.locator(`[data-queue-discard="${messageId}"]`)).toBeVisible();
+    };
+    await select.selectOption(a.conversationId);
+    await reveal(a.eligible.id);
+    const discard = page.locator("[data-queue-discard]");
+    const dialog = page.locator("#chat-action-confirm");
+    const mutations: Array<{ isA: boolean; isB: boolean; requestId: boolean; sameBToken: boolean }> = [];
+    page.on("request", req => {
+      if (req.method() !== "POST" || !new URL(req.url()).pathname.endsWith("/discard-unconfirmed")) return;
+      const body = req.postDataJSON();
+      mutations.push({ isA: new URL(req.url()).pathname === a.path, isB: new URL(req.url()).pathname === b.path,
+        requestId: typeof body.requestId === "string", sameBToken: body.uncertaintyId === b.eligible.admissionUncertaintyId });
+    });
+    const before = await control(request, { action: "opencode", op: "state" }) as NativeState;
+    if (mode === "touch") await discard.tap(); else { await discard.focus(); await discard.press("Enter"); }
+    await expect(dialog.getByRole("button", { name: "Cancel", exact: true })).toBeFocused();
+    if (mode === "touch") await dialog.getByRole("button", { name: "Cancel", exact: true }).tap(); else await page.keyboard.press("Escape");
+    await expect(dialog).not.toBeVisible();
+    if (mode === "desktop") await expect(discard).toBeFocused();
+    await page.waitForFunction(() => (window as unknown as { confirmationCloseGate: ConfirmationCloseGate }).confirmationCloseGate.held);
+    await select.selectOption(b.conversationId);
+    await reveal(b.eligible.id);
+    await expect(input).toHaveValue("Keep unrelated B draft");
+    if (mode === "touch") await discard.tap(); else { await discard.focus(); await discard.press("Enter"); }
+    // Release after B intent, BEFORE expecting B visible: correct ownership
+    // serializes reopening behind A's real close completion.
+    await expect(dialog).not.toBeVisible();
+    expect(mutations).toEqual([]);
+    expect(await page.evaluate(() => (window as unknown as { confirmationCloseGate: ConfirmationCloseGate }).confirmationCloseGate.release())).toBe(true);
+    expect(await page.evaluate(() => (window as unknown as { confirmationCloseGate: ConfirmationCloseGate }).confirmationCloseGate.focusAfterRelease)).toBe("composer");
+    await expect(dialog).toBeVisible();
+    await expect(dialog.getByRole("button", { name: "Cancel", exact: true })).toBeFocused();
+    const accepted = page.waitForResponse(response => response.request().method() === "POST" && new URL(response.url()).pathname === b.path);
+    if (mode === "touch") await dialog.getByRole("button", { name: "Discard local record", exact: true }).tap();
+    else {
+      await page.keyboard.press(browserName === "webkit" ? "Alt+Tab" : "Tab");
+      await expect(dialog.getByRole("button", { name: "Discard local record", exact: true })).toBeFocused();
+      await page.keyboard.press("Enter");
+    }
+    expect(await (await accepted).json()).toEqual({ discarded: true, outcomeUnconfirmed: true });
+    await expect(discard).toHaveCount(0);
+    await expect(dialog).not.toBeVisible();
+    await expect(input).toHaveValue("Keep unrelated B draft");
+    const afterA = await a.snapshot(), afterB = await b.snapshot();
+    expect(afterA.queued.find(entry => entry.id === a.eligible.id)?.admissionUncertaintyId).toBe(a.eligible.admissionUncertaintyId);
+    expect(afterB.queued.some(entry => entry.id === b.eligible.id)).toBe(false);
+    expect(afterB.queued.map(entry => entry.text)).toEqual(["Held follower B"]);
+    expect(mutations).toEqual([{ isA: false, isB: true, requestId: true, sameBToken: true }]);
+    const after = await control(request, { action: "opencode", op: "state" }) as NativeState;
+    expect(nativeWrites(after)).toEqual(nativeWrites(before));
+    expect(after.unhandled).toEqual([]);
+    await page.waitForFunction(() => (window as unknown as { confirmationCloseGate: ConfirmationCloseGate }).confirmationCloseGate.nativeCloses === 2);
+    const lifecycle = await page.evaluate(() => (window as unknown as { confirmationCloseGate: ConfirmationCloseGate }).confirmationCloseGate.events);
+    expect(lifecycle.some(event => event.type === "close" && event.trusted)).toBe(true);
+    expect(lifecycle.some(event => event.type === "close" && !event.trusted)).toBe(true);
+    expect(lifecycle.some(event => event.type === "submit" && event.trusted && event.confirmSubmitter)).toBe(true);
+    await saveEvidence(info, `confirmation-ownership-${mode}-${browserName}.json`, JSON.stringify({ lifecycle, mutations, originalAStillUnconfirmed: true, bLocallyDiscarded: true, draftRetained: true }, null, 2));
   });
 
   test("held unknown admission visibly pauses its follower without Stop or native replay", async ({ page, request }, info) => {

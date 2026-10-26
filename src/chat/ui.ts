@@ -1197,9 +1197,20 @@ export function initChat(api = new ChatApiClient()): void {
     } else automaticNotes.record(conversationId, operationId, result.automaticBackground);
     syncControls();
   };
-  const confirmChatAction = (title: string, message: string, accept: string, invoker?: HTMLElement): Promise<boolean> => {
+  let pendingChatAction: { dialog: HTMLDialogElement; closed: Promise<void>; reopening: boolean; cancel(): void } | undefined;
+  const confirmChatAction = async (title: string, message: string, accept: string, invoker?: HTMLElement): Promise<boolean> => {
     const dialog = document.querySelector<HTMLDialogElement>("#chat-action-confirm");
-    if (!dialog || dialog.open) return Promise.resolve(false);
+    if (pendingChatAction && (!pendingChatAction.dialog.isConnected || pendingChatAction.dialog !== dialog)) pendingChatAction.cancel();
+    if (!dialog || dialog.open) return false;
+    if (pendingChatAction) {
+      // Native close clears open and restores focus before delivering close.
+      // Reserve at most one reopen intent; no next owner may consume that event.
+      const previous = pendingChatAction;
+      if (previous.reopening) return false;
+      previous.reopening = true;
+      await previous.closed;
+      if (!dialog.isConnected || document.querySelector("#chat-action-confirm") !== dialog || dialog.open || pendingChatAction) return false;
+    }
     // WebKit pointer activation need not focus its button. Capture the
     // actual invoker rather than the unrelated control still holding focus.
     const previousFocus = invoker ?? document.activeElement;
@@ -1208,17 +1219,44 @@ export function initChat(api = new ChatApiClient()): void {
     dialog.querySelector("#chat-action-confirm-body")!.textContent = message;
     dialog.querySelector("#chat-action-confirm-accept")!.textContent = accept;
     dialog.returnValue = "cancel";
-    return new Promise(resolve => {
+    return new Promise((resolve, reject) => {
+      let complete!: () => void;
+      const closed = new Promise<void>(done => { complete = done; });
+      const owner = { dialog, closed, reopening: false, cancel: () => settle(false, false) };
+      pendingChatAction = owner;
+      let settled = false;
       const onKey = (event: KeyboardEvent) => { if (event.key === "Escape") event.stopPropagation(); };
-      dialog.addEventListener("keydown", onKey);
-      dialog.addEventListener("close", () => {
+      const cleanup = () => {
         dialog.removeEventListener("keydown", onKey);
-        const survivingInspection = inspection && child?.task?.taskId === inspection.taskId && child.task.conversationId === inspection.conversationId
-          ? drilldownTask?.querySelector<HTMLElement>("[data-task-result], [data-stop-task]:not(:disabled)") ?? drilldownBack ?? drilldownTimeline : null;
-        (previousFocus instanceof HTMLElement && previousFocus.isConnected ? previousFocus : survivingInspection ?? input)?.focus({ preventScroll: true });
-        resolve(dialog.returnValue === "confirm");
-      }, { once: true });
-      dialog.showModal();
+        dialog.removeEventListener("close", onClose);
+      };
+      const settle = (confirmed: boolean, restoreFocus = true) => {
+        if (pendingChatAction !== owner || settled) return;
+        settled = true;
+        cleanup();
+        try {
+          if (restoreFocus) {
+            const survivingInspection = inspection && child?.task?.taskId === inspection.taskId && child.task.conversationId === inspection.conversationId
+              ? drilldownTask?.querySelector<HTMLElement>("[data-task-result], [data-stop-task]:not(:disabled)") ?? drilldownBack ?? drilldownTimeline : null;
+            (previousFocus instanceof HTMLElement && previousFocus.isConnected ? previousFocus : survivingInspection ?? input)?.focus({ preventScroll: true });
+          }
+        } finally {
+          pendingChatAction = undefined;
+          resolve(confirmed);
+          complete();
+        }
+      };
+      // Snapshot this owner's result before focus restoration can invoke UI code.
+      const onClose = () => settle(dialog.returnValue === "confirm");
+      dialog.addEventListener("keydown", onKey);
+      dialog.addEventListener("close", onClose, { once: true });
+      try { dialog.showModal(); }
+      catch (error) {
+        cleanup();
+        pendingChatAction = undefined;
+        complete();
+        reject(error);
+      }
     });
   };
   const syncBackgroundTasks = () => {
