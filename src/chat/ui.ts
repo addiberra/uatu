@@ -3694,7 +3694,7 @@ export function initChat(api = new ChatApiClient()): void {
       const entry = projection.queued.find(candidate => candidate.id === messageId);
       if (!eligible(entry) || discardTarget.disabled || queueActionsInFlight.get(conversationId)?.has(messageId)) return;
       const uncertaintyId = entry!.admissionUncertaintyId!;
-      if (!await confirmChatAction("Discard local record?", "Delivery of this message is unconfirmed. Removing Uatu’s local record does not cancel or resend it; the original may still arrive. Other messages will stay queued until you choose Send now or a later normal idle transition.", "Discard local record", discardTarget)) return;
+      if (!await confirmChatAction("Discard local record?", "Delivery of this message is unconfirmed. Removing Uatu’s local record does not cancel or resend it; the original may still arrive. Other messages will stay queued until you choose Send now or submit a new message, or a later normal idle transition occurs.", "Discard local record", discardTarget)) return;
       const current = projection?.conversationId === conversationId ? projection.queued.find(candidate => candidate.id === messageId) : undefined;
       if (!eligible(current) || current!.admissionUncertaintyId !== uncertaintyId || queueActionsInFlight.get(conversationId)?.has(messageId)) return;
       const inFlight = queueActionsInFlight.get(conversationId) ?? new Map<string, PendingQueueAction>();

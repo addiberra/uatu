@@ -4943,6 +4943,384 @@ describe("prompt, abort, permission, and question mutations", () => {
     expect(provider.interrupts).toEqual([]);
     await adapter.dispose(); await secondPump;
   });
+  async function exhaustedRecoveryFixture(terminal = false) {
+    const provider = new FakeProvider();
+    provider.sessions = [fixtureSession("session")];
+    const unknown = { id: "task:unknown", type: "background_task" as const, taskId: "unknown", description: "Unknown", createdAt: 1, status: "running" as const, stateUncertain: true };
+    const known = { ...unknown, id: "task:known", taskId: "known", toolUseId: "same-call", stateUncertain: false,
+      status: terminal ? "completed" as const : "running" as const, ...(terminal ? { terminalReportedAt: 2 } : {}) };
+    let reads = 0, release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    Object.assign(provider, { reconcileBackgroundTasks: async () => { if (++reads === 1) await gate; return [unknown, known]; } });
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g", coalesceWindowMs: 0 });
+    adapter.projectionForTests("session").apply({ kind: "upsert", item: known });
+    const pump = adapter.startEventPump();
+    provider.eventQueue.push({ type: "server.connected", data: {} });
+    await waitUntil(() => reads === 1);
+    jest.useFakeTimers();
+    release(); await flushRecoveryIo();
+    jest.advanceTimersByTime(1_000); await flushRecoveryIo();
+    jest.advanceTimersByTime(2_000); await flushRecoveryIo();
+    expect(reads).toBe(3);
+    return { adapter, provider, pump, unknown, known, reads: () => reads,
+      event: async (eventType = "session.tool.success", updates: NormalizedProviderEvent["updates"] = []) => {
+        provider.eventQueue.push({ normalized: { conversationId: "session", eventType, updates, outcome: "handled" } });
+        await flushRecoveryIo();
+        jest.advanceTimersByTime(0); await flushRecoveryIo();
+      },
+    };
+  }
+
+  test("exhausted recovery ignores chatter until thirty seconds after exhaustion and never polls a quiet parked cycle", async () => {
+    const f = await exhaustedRecoveryFixture();
+    const exhaustedAt = (f.adapter as unknown as { backgroundRecoveries: Map<string, { exhaustedAt: number }> }).backgroundRecoveries.get("session")!.exhaustedAt;
+    // Bun's fake timer clock still advances with confinement IO. Pin wall time
+    // independently so this asserts the exact boundary, not scheduler speed.
+    const now = spyOn(Date, "now").mockReturnValue(exhaustedAt);
+    try {
+      await f.event(); expect(f.reads()).toBe(3);
+      jest.advanceTimersByTime(29_999); now.mockReturnValue(exhaustedAt + 29_999); await f.event("session.message.content.updated"); expect(f.reads()).toBe(3);
+      jest.advanceTimersByTime(1); now.mockReturnValue(exhaustedAt + 30_000); await f.event(); expect(f.reads()).toBe(4);
+      jest.advanceTimersByTime(1_000); await flushRecoveryIo();
+      jest.advanceTimersByTime(2_000); await flushRecoveryIo(); expect(f.reads()).toBe(6);
+      jest.advanceTimersByTime(120_000); await flushRecoveryIo(); expect(f.reads()).toBe(6);
+      expect(f.adapter.projectionForTests("session").get(f.unknown.id)).toMatchObject({ status: "running", stateUncertain: true });
+    } finally { now.mockRestore(); await f.adapter.dispose(); await f.pump; jest.useRealTimers(); }
+  });
+
+  for (const evidence of ["worker", "refresh", "reconnect"] as const) test(`${evidence} evidence remains immediately usable during the exhausted recovery cooldown`, async () => {
+    const f = await exhaustedRecoveryFixture();
+    try {
+      if (evidence === "worker") await f.event("session.inbox.enqueued", [{ kind: "upsert", item: { ...f.known, createdAt: 2 } }]);
+      else if (evidence === "refresh") await f.adapter.history("session");
+      else { f.provider.eventQueue.push({ type: "server.connected", data: {} }); await flushRecoveryIo(); }
+      expect(f.reads()).toBe(4);
+      expect(f.provider.prompts).toEqual([]); expect(f.provider.interrupts).toEqual([]);
+    } finally { await f.adapter.dispose(); await f.pump; jest.useRealTimers(); }
+  });
+
+  for (const uncertain of [false, true]) test(`unchanged native worker rediscovery and ${uncertain ? "uncertain " : ""}alias flapping do not rearm an exhausted recovery cycle`, async () => {
+    const f = await exhaustedRecoveryFixture();
+    try {
+      let previous = f.known.id;
+      for (let index = 0; index < 6; index++) {
+        const id = `task:alias-${index}`;
+        const stateUncertain = uncertain && index % 2 === 0;
+        await f.event("session.inbox.enqueued", [{ kind: "remove", itemId: previous }, { kind: "upsert", item: { ...f.known, id, taskId: id, stateUncertain, createdAt: stateUncertain ? 0 : f.known.createdAt } }]);
+        previous = id;
+      }
+      expect(f.reads()).toBe(3);
+    } finally { await f.adapter.dispose(); await f.pump; jest.useRealTimers(); }
+  });
+
+  test("capacity rotation preserves an evicted live target's cooldown, including its exact boundary and fresh-evidence exits", async () => {
+    const f = await exhaustedRecoveryFixture();
+    const records = (f.adapter as unknown as { backgroundRecoveries: Map<string, { exhaustedAt?: number; progress: Map<string, unknown> }> }).backgroundRecoveries;
+    const parked = records.get("session")!;
+    const exhaustedAt = parked.exhaustedAt!;
+    const now = spyOn(Date, "now").mockReturnValue(exhaustedAt + 1);
+    const event = async (id: string, updates: NormalizedProviderEvent["updates"] = []) => {
+      f.provider.eventQueue.push({ normalized: { conversationId: id, eventType: "session.tool.success", updates, outcome: "handled" } });
+      await flushRecoveryIo(); jest.advanceTimersByTime(0); await flushRecoveryIo();
+    };
+    try {
+      for (let index = 1; index < 2_048; index++) records.set(`parked-${index}`, { ...parked, progress: new Map() });
+      f.provider.sessions.push(fixtureSession("fresh"), fixtureSession("another"), fixtureSession("new-worker"));
+      await event("fresh"); expect(f.reads()).toBe(4);
+      expect(records.has("session")).toBe(false);
+      expect(f.adapter.projectionForTests("session").get(f.unknown.id)).toMatchObject({ stateUncertain: true });
+      await f.event(); await event("another"); expect(f.reads()).toBe(4);
+      expect(records.size).toBe(2_048);
+      now.mockReturnValue(exhaustedAt + 29_999); await f.event(); expect(f.reads()).toBe(4);
+      // Explicit reads and genuinely new native invocation evidence remain
+      // usable even while incidental untracked cycles are conservatively held.
+      await f.adapter.history("session"); expect(f.reads()).toBe(5);
+      await event("new-worker", [{ kind: "upsert", item: { ...f.known, id: "task:new", taskId: "new", toolUseId: "new-native-call", createdAt: 2 } }]);
+      expect(f.reads()).toBe(6);
+      now.mockReturnValue(exhaustedAt + 30_000); await f.event(); expect(f.reads()).toBe(7);
+      expect(records.size).toBe(2_048);
+      expect(f.provider.prompts).toEqual([]); expect(f.provider.interrupts).toEqual([]);
+    } finally { now.mockRestore(); await f.adapter.dispose(); await f.pump; jest.useRealTimers(); }
+  });
+
+  for (const terminal of [false, true]) test(`split-flush ${terminal ? "terminal" : "running"} alias replacement retains native high-water knowledge until genuine new invocation evidence`, async () => {
+    const f = await exhaustedRecoveryFixture(terminal);
+    try {
+      await f.event("session.inbox.enqueued", [{ kind: "remove", itemId: f.known.id }]);
+      await f.event("session.inbox.enqueued", [{ kind: "upsert", item: { ...f.known, id: "task:alias", taskId: "alias" } }]);
+      expect(f.reads()).toBe(3);
+      await f.event("session.inbox.enqueued", [{ kind: "remove", itemId: "task:alias" }]);
+      await f.event("session.inbox.enqueued", [{ kind: "upsert", item: { ...f.known, id: "task:uncertain", taskId: "uncertain", stateUncertain: true, createdAt: 0 } }]);
+      await f.event("session.inbox.enqueued", [{ kind: "remove", itemId: "task:uncertain" }]);
+      await f.event("session.inbox.enqueued", [{ kind: "upsert", item: { ...f.known, id: "task:restated", taskId: "restated" } }]);
+      expect(f.reads()).toBe(3);
+      // A distinct native invocation, not a renamed UI row, is new evidence.
+      await f.event("session.inbox.enqueued", [{ kind: "upsert", item: { ...f.known, id: "task:new", taskId: "new", toolUseId: "new-native-call", status: "running", terminalReportedAt: undefined } }]);
+      expect(f.reads()).toBe(4);
+      expect(f.provider.prompts).toEqual([]); expect(f.provider.interrupts).toEqual([]);
+    } finally { await f.adapter.dispose(); await f.pump; jest.useRealTimers(); }
+  });
+
+  for (const renamed of [false, true]) test(`read-side unchanged ${renamed ? "alias" : "native"} rediscovery after source removal cannot renew the three-read cycle`, async () => {
+    const f = await exhaustedRecoveryFixture();
+    const records = (f.adapter as unknown as { backgroundRecoveries: Map<string, { exhaustedAt?: number; timer?: unknown; sourceProgress?: Map<string, unknown> }> }).backgroundRecoveries;
+    const exhaustedAt = records.get("session")!.exhaustedAt!;
+    const now = spyOn(Date, "now").mockReturnValue(exhaustedAt + 30_000);
+    const provider = f.provider as ChatProvider;
+    const reconcile = provider.reconcileBackgroundTasks!.bind(provider);
+    let recoveredId = f.known.id;
+    provider.reconcileBackgroundTasks = async (...args) => (await reconcile(...args)).map(item => item.id === f.known.id ? { ...item, id: recoveredId, taskId: recoveredId } : item);
+    try {
+      await f.event(); expect(f.reads()).toBe(4);
+      for (let index = 0; index < 6; index++) {
+        const previous = recoveredId;
+        recoveredId = renamed ? `read-alias-${index}` : f.known.id;
+        await f.event("session.inbox.enqueued", [{ kind: "remove", itemId: previous }]);
+        expect(records.get("session")?.sourceProgress?.has("call:same-call")).toBe(true);
+        const before = f.reads();
+        jest.advanceTimersByTime(2_000); await flushRecoveryIo();
+        if (f.reads() > before) expect(f.adapter.projectionForTests("session").get(recoveredId)).toMatchObject({ status: "running", stateUncertain: false });
+      }
+      expect(f.reads()).toBe(6);
+      expect(records.get("session")?.exhaustedAt).toEqual(expect.any(Number));
+      expect(records.get("session")?.timer).toBeUndefined();
+      expect(f.adapter.projectionForTests("session").get(f.unknown.id)).toMatchObject({ status: "running", stateUncertain: true });
+    } finally { now.mockRestore(); await f.adapter.dispose(); await f.pump; jest.useRealTimers(); }
+  });
+
+  for (const limit of ["count", "bytes"] as const) for (const verifiedStart of [false, true]) test(`read-side ${limit} fingerprint overflow cannot renew unchanged native rediscovery${verifiedStart ? " but a verified new worker start extends discovery" : ""}`, async () => {
+    const f = await exhaustedRecoveryFixture();
+    const records = (f.adapter as unknown as { backgroundRecoveries: Map<string, { exhaustedAt?: number; timer?: unknown; sourceProgressLost?: true }> }).backgroundRecoveries;
+    const exhaustedAt = records.get("session")!.exhaustedAt!;
+    const now = spyOn(Date, "now").mockReturnValue(exhaustedAt + 1);
+    const nativeCall = limit === "bytes" ? "x".repeat(20_000) : "removed-call-79";
+    let recoveredId = "overflow-original";
+    try {
+      for (let index = 0; index < (limit === "count" ? 80 : 1); index++) {
+        const id = `overflow-${index}`;
+        f.adapter.projectionForTests("session").apply({ kind: "upsert", item: { ...f.known, id, taskId: id, toolUseId: limit === "bytes" ? nativeCall : `removed-call-${index}` } });
+        await f.event("session.inbox.enqueued", [{ kind: "remove", itemId: id }]);
+      }
+      expect(records.get("session")?.sourceProgressLost).toBe(true);
+      const provider = f.provider as ChatProvider;
+      const reconcile = provider.reconcileBackgroundTasks!.bind(provider);
+      provider.reconcileBackgroundTasks = async (...args) => [...await reconcile(...args), { ...f.known, id: recoveredId, taskId: recoveredId, toolUseId: nativeCall },
+        ...(verifiedStart && f.reads() >= 5 ? [{ ...f.known, id: "verified-read-start", taskId: "verified-read-start", toolUseId: undefined, createdAt: 2 }] : [])];
+      now.mockReturnValue(exhaustedAt + 30_000); await f.event(); expect(f.reads()).toBe(4);
+      for (let index = 0; index < 6; index++) {
+        const previous = recoveredId; recoveredId = `overflow-read-${index}`;
+        await f.event("session.inbox.enqueued", [{ kind: "remove", itemId: previous }]);
+        const before = f.reads();
+        jest.advanceTimersByTime(2_000); await flushRecoveryIo();
+        if (f.reads() > before) expect(f.adapter.projectionForTests("session").get(recoveredId)).toMatchObject({ status: "running", stateUncertain: false });
+      }
+      expect(f.reads()).toBe(verifiedStart ? 7 : 6);
+      if (verifiedStart) expect(f.adapter.projectionForTests("session").get("verified-read-start")).toMatchObject({ createdAt: 2, status: "running", stateUncertain: false });
+      expect(records.get("session")?.exhaustedAt).toEqual(expect.any(Number));
+      expect(records.get("session")?.timer).toBeUndefined();
+    } finally { now.mockRestore(); await f.adapter.dispose(); await f.pump; jest.useRealTimers(); }
+  });
+
+  test("conclusive unchanged read evidence clears uncertainty and completes recovery without manufactured progress", async () => {
+    const f = await exhaustedRecoveryFixture();
+    const records = (f.adapter as unknown as { backgroundRecoveries: Map<string, { exhaustedAt?: number }> }).backgroundRecoveries;
+    const now = spyOn(Date, "now").mockReturnValue(records.get("session")!.exhaustedAt! + 30_000);
+    const provider = f.provider as ChatProvider;
+    const reconcile = provider.reconcileBackgroundTasks!.bind(provider);
+    provider.reconcileBackgroundTasks = async (...args) => (await reconcile(...args)).map(item => ({ ...item, stateUncertain: false }));
+    try {
+      await f.event(); expect(f.reads()).toBe(4);
+      expect(records.has("session")).toBe(false);
+      expect(f.adapter.projectionForTests("session").get(f.unknown.id)).toMatchObject({ status: "running", stateUncertain: false });
+      jest.advanceTimersByTime(120_000); await flushRecoveryIo(); expect(f.reads()).toBe(4);
+    } finally { now.mockRestore(); await f.adapter.dispose(); await f.pump; jest.useRealTimers(); }
+  });
+
+  test("newer source terminal state fences an older read while safe independent discovery still applies", async () => {
+    const f = await exhaustedRecoveryFixture();
+    const records = (f.adapter as unknown as { backgroundRecoveries: Map<string, { exhaustedAt?: number }> }).backgroundRecoveries;
+    const now = spyOn(Date, "now").mockReturnValue(records.get("session")!.exhaustedAt! + 30_000);
+    const provider = f.provider as ChatProvider;
+    const reconcile = provider.reconcileBackgroundTasks!.bind(provider);
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    provider.reconcileBackgroundTasks = async (...args) => { const tasks = await reconcile(...args); await gate; return [...tasks, { ...f.known, id: "independent", taskId: "independent", toolUseId: "independent-native-call" }]; };
+    try {
+      await f.event(); expect(f.reads()).toBe(4);
+      await f.event("session.inbox.enqueued", [{ kind: "upsert", item: { ...f.known, status: "completed", terminalReportedAt: 3 } }]);
+      release(); await flushRecoveryIo();
+      expect(f.adapter.projectionForTests("session").get(f.known.id)).toMatchObject({ status: "completed", terminalReportedAt: 3 });
+      expect(f.adapter.projectionForTests("session").get("independent")).toMatchObject({ status: "running", stateUncertain: false });
+      expect(f.provider.prompts).toEqual([]); expect(f.provider.interrupts).toEqual([]);
+    } finally { release(); now.mockRestore(); await f.adapter.dispose(); await f.pump; jest.useRealTimers(); }
+  });
+
+  test("retained terminal-report progress remains usable across split-flush row replacement", async () => {
+    const f = await exhaustedRecoveryFixture(true);
+    try {
+      await f.event("session.inbox.enqueued", [{ kind: "remove", itemId: f.known.id }]);
+      await f.event("session.inbox.enqueued", [{ kind: "upsert", item: { ...f.known, id: "terminal-alias", taskId: "terminal-alias" } }]);
+      expect(f.reads()).toBe(3);
+      await f.event("session.inbox.enqueued", [{ kind: "upsert", item: { ...f.known, id: "terminal-alias", taskId: "terminal-alias", terminalReportedAt: 3 } }]);
+      expect(f.reads()).toBe(4);
+    } finally { await f.adapter.dispose(); await f.pump; jest.useRealTimers(); }
+  });
+
+  test("projection eviction cannot turn an old native invocation into a fresh cooldown exception", async () => {
+    const f = await exhaustedRecoveryFixture();
+    try {
+      for (let index = 0; index < 70; index++) f.adapter.projectionForTests(`gone-${index}`);
+      await f.event("session.inbox.enqueued", [{ kind: "upsert", item: { ...f.known, id: "old-alias", taskId: "old-alias" } }]);
+      expect(f.reads()).toBe(3);
+      await f.event("session.inbox.enqueued", [{ kind: "upsert", item: { ...f.known, id: "fresh-alias", taskId: "fresh-alias", toolUseId: "new-native-call", createdAt: 2 } }]);
+      expect(f.reads()).toBe(4);
+    } finally { await f.adapter.dispose(); await f.pump; jest.useRealTimers(); }
+  });
+
+  for (const limit of ["count", "bytes"] as const) test(`removed native source fingerprints stay bounded by ${limit} without turning a retention gap into progress`, async () => {
+    const f = await exhaustedRecoveryFixture();
+    const records = (f.adapter as unknown as { backgroundRecoveries: Map<string, { sourceProgress: Map<string, unknown>; sourceProgressBytes: number; sourceProgressLost?: true }> }).backgroundRecoveries;
+    try {
+      for (let index = 0; index < (limit === "count" ? 70 : 1); index++) {
+        const id = `removed-${index}`;
+        const item = { ...f.known, id, taskId: id, toolUseId: limit === "bytes" ? "x".repeat(20_000) : `native-${index}` };
+        // Existing source knowledge, not a new launch event. Removing the row
+        // through the real stream must retain bounded invocation continuity.
+        f.adapter.projectionForTests("session").apply({ kind: "upsert", item });
+        await f.event("session.inbox.enqueued", [{ kind: "remove", itemId: id }]);
+      }
+      const record = records.get("session")!;
+      expect(record.sourceProgress.size).toBeLessThanOrEqual(64);
+      expect(record.sourceProgressBytes).toBeLessThanOrEqual(16 * 1024);
+      expect(record.sourceProgressBytes).toBe([...record.sourceProgress].reduce((bytes, entry) => bytes + Buffer.byteLength(JSON.stringify(entry)), 0));
+      expect(record.sourceProgressLost).toBe(true);
+      const alias = limit === "bytes" ? "x".repeat(20_000) : "native-69";
+      await f.event("session.inbox.enqueued", [{ kind: "upsert", item: { ...f.known, id: "gap-placeholder", taskId: "gap", toolUseId: alias, stateUncertain: true, createdAt: 0 } }]);
+      await f.event("session.inbox.enqueued", [{ kind: "upsert", item: { ...f.known, id: "gap-placeholder", taskId: "gap", toolUseId: alias } }]);
+      expect(f.reads()).toBe(3);
+      // Fresh native-call clock evidence is still eligible after metadata loss.
+      await f.event("session.inbox.enqueued", [{ kind: "upsert", item: { ...f.known, id: "fresh-proof", taskId: "fresh-proof", toolUseId: "fresh-native-call", createdAt: 2 } }]);
+      expect(f.reads()).toBe(4);
+    } finally { await f.adapter.dispose(); await f.pump; jest.useRealTimers(); }
+  });
+
+  for (const cleanup of ["reconnect", "dispose"] as const) test(`${cleanup} retires scalar cooldown fallback and source fingerprint ownership`, async () => {
+    const f = await exhaustedRecoveryFixture();
+    const state = f.adapter as unknown as { backgroundRecoveryFloorUntil: number; backgroundRecoverySourceStartedAt: number; backgroundRecoveries: Map<string, unknown> };
+    try {
+      // These scalars summarize lost scheduling metadata only, never workers.
+      state.backgroundRecoveryFloorUntil = Date.now() + 30_000;
+      state.backgroundRecoverySourceStartedAt = 1;
+      if (cleanup === "reconnect") { f.provider.eventQueue.push({ type: "server.connected", data: {} }); await flushRecoveryIo(); expect(f.reads()).toBe(4); }
+      else await f.adapter.dispose();
+      expect(state.backgroundRecoveryFloorUntil).toBe(0);
+      expect(state.backgroundRecoverySourceStartedAt).toBe(-Infinity);
+      if (cleanup === "dispose") expect(state.backgroundRecoveries.size).toBe(0);
+    } finally { await f.adapter.dispose(); await f.pump; jest.useRealTimers(); }
+  });
+
+  test("deletion retires split-flush source fingerprints and stale source frames cannot recreate recovery ownership", async () => {
+    const f = await exhaustedRecoveryFixture();
+    const records = (f.adapter as unknown as { backgroundRecoveries: Map<string, { sourceProgress?: Map<string, unknown> }> }).backgroundRecoveries;
+    try {
+      await f.event("session.inbox.enqueued", [{ kind: "remove", itemId: f.known.id }]);
+      expect(records.get("session")?.sourceProgress?.has("call:same-call")).toBe(true);
+      f.provider.sessions = [];
+      f.provider.eventQueue.push({ normalized: { eventType: "session.deleted", updates: [], outcome: "handled", sessionLifecycle: { kind: "deleted", id: "session", directory: process.cwd(), title: "Session", createdAt: 1, updatedAt: 1 } } });
+      await flushRecoveryIo();
+      expect(records.has("session")).toBe(false);
+      await f.event("session.inbox.enqueued", [{ kind: "upsert", item: { ...f.known, id: "stale-alias", taskId: "stale-alias" } }]);
+      expect(records.has("session")).toBe(false);
+      expect(f.reads()).toBe(3);
+    } finally { await f.adapter.dispose(); await f.pump; jest.useRealTimers(); }
+  });
+
+  for (const [readMs, eventMs] of [[0, 3_000], [300, 100]] as const) test(`exhausted recovery bounds unrelated chatter over sixty seconds with ${readMs}ms reads and ${eventMs}ms events`, async () => {
+    const provider = new FakeProvider();
+    provider.sessions = [fixtureSession("session")];
+    const worker = { id: "task:lost", type: "background_task" as const, taskId: "lost", description: "Lost worker", createdAt: 1, status: "running" as const, stateUncertain: true };
+    let reads = 0;
+    Object.assign(provider, { reconcileBackgroundTasks: async () => { reads++; if (readMs) await new Promise(resolve => setTimeout(resolve, readMs)); return [worker]; } });
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g", coalesceWindowMs: 0 });
+    adapter.projectionForTests("session").apply({ kind: "upsert", item: worker });
+    jest.useFakeTimers();
+    const pump = adapter.startEventPump();
+    try {
+      provider.eventQueue.push({ type: "server.connected", data: {} }); await flushRecoveryIo();
+      for (let elapsed = 100; elapsed <= 60_000; elapsed += 100) {
+        jest.advanceTimersByTime(100);
+        if (elapsed % eventMs === 0) provider.eventQueue.push({ normalized: { conversationId: "session", eventType: elapsed % (2 * eventMs) ? "session.tool.success" : "session.message.content.updated", updates: [], outcome: "handled" } });
+        await flushRecoveryIo();
+      }
+      expect(adapter.projectionForTests("session").get(worker.id)).toMatchObject({ status: "running", stateUncertain: true });
+      expect(provider.prompts).toEqual([]); expect(provider.interrupts).toEqual([]);
+      // Initial cycle plus at most two source-triggered cycles. The floor
+      // starts at exhaustion, not at cycle admission, and quiet never polls.
+      expect(reads).toBeLessThanOrEqual(9);
+    } finally {
+      const disposing = adapter.dispose(); jest.advanceTimersByTime(1_000); await flushRecoveryIo();
+      await disposing; await pump; jest.useRealTimers();
+    }
+  });
+
+  for (const cleanup of ["deleted", "evicted", "disposed"] as const) test(`parked recovery metadata is retired when its projection is ${cleanup}`, async () => {
+    const f = await exhaustedRecoveryFixture();
+    const records = (f.adapter as unknown as { backgroundRecoveries: Map<string, { exhaustedAt?: number; timer?: unknown }> }).backgroundRecoveries;
+    try {
+      expect(records.get("session")).toMatchObject({ exhaustedAt: expect.any(Number) });
+      expect(records.get("session")?.timer).toBeUndefined();
+      if (cleanup === "deleted") {
+        f.provider.eventQueue.push({ normalized: { eventType: "session.deleted", updates: [], outcome: "handled", sessionLifecycle: { kind: "deleted", id: "session", directory: process.cwd(), title: "Session", createdAt: 1, updatedAt: 1 } } });
+        await flushRecoveryIo();
+      } else if (cleanup === "evicted") for (let index = 0; index < 70; index++) f.adapter.projectionForTests(`evict-${index}`);
+      else await f.adapter.dispose();
+      expect(records.has("session")).toBe(false);
+    } finally { await f.adapter.dispose(); await f.pump; jest.useRealTimers(); }
+  });
+
+  test("recovery scheduling records have a hard 2048-entry bound including active and queued conversations", async () => {
+    const provider = new FakeProvider();
+    provider.sessions = Array.from({ length: 2_050 }, (_, index) => fixtureSession(`parent-${index}`));
+    let release!: () => void, maximum = 0, concurrent = 0;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    Object.assign(provider, { reconcileBackgroundTasks: async () => { maximum = Math.max(maximum, ++concurrent); await gate; concurrent--; return []; } });
+    const adapter = new ChatAdapter({ provider, workspacePath: process.cwd(), generation: "g" });
+    const records = (adapter as unknown as { backgroundRecoveries: Map<string, unknown> }).backgroundRecoveries;
+    const pump = adapter.startEventPump();
+    const classification = spyOn(provider, "listSessions");
+    try {
+      provider.eventQueue.push({ type: "server.connected", data: {} });
+      await waitUntil(() => records.size >= 2_048);
+      // Let the two remaining inventory candidates run their confinement reads.
+      await flushRecoveryIo();
+      expect(classification).toHaveBeenCalledTimes(1);
+      expect(records.size).toBe(2_048);
+      expect(maximum).toBe(4);
+    } finally { classification.mockRestore(); const disposing = adapter.dispose(); release(); await disposing; await pump; }
+    expect(records.size).toBe(0);
+  });
+
+  test("a full parked scheduling cohort admits new recovery by evicting only disposable parked metadata", async () => {
+    const f = await exhaustedRecoveryFixture();
+    const records = (f.adapter as unknown as { backgroundRecoveries: Map<string, { dirty: boolean; running: boolean; failures: number; inconclusiveReads: number; exhaustedAt?: number; progress: Map<string, unknown> }> }).backgroundRecoveries;
+    try {
+      // Populate only scheduling state, not worker/control evidence. The real
+      // exhausted session is the oldest parked record; a native event below
+      // exercises normal scheduler admission at the retained-count boundary.
+      const parked = records.get("session")!;
+      for (let index = 1; index < 2_048; index++) records.set(`parked-${index}`, { ...parked, progress: new Map() });
+      f.provider.sessions.push(fixtureSession("fresh"));
+      f.provider.eventQueue.push({ normalized: { conversationId: "fresh", eventType: "session.tool.success", updates: [], outcome: "handled" } });
+      await flushRecoveryIo();
+      expect(records.size).toBe(2_048);
+      expect(records.has("session")).toBe(false);
+      expect(records.has("fresh")).toBe(true);
+      expect(f.reads()).toBe(4);
+      expect(f.adapter.projectionForTests("session").get(f.unknown.id)).toMatchObject({ status: "running", stateUncertain: true });
+      expect(f.provider.prompts).toEqual([]); expect(f.provider.interrupts).toEqual([]);
+    } finally { await f.adapter.dispose(); await f.pump; jest.useRealTimers(); }
+  });
+
   test("successful inconclusive recovery has three reads per external cycle, not endless failure polling", async () => {
     const provider = new FakeProvider();
     provider.sessions = [fixtureSession("session")];
@@ -9342,6 +9720,103 @@ describe("steering (opencode-v2-steering)", () => {
       expect(provider.interruptOptions).toEqual([{ resume: false }]);
       expect(provider.prompts).toHaveLength(1);
     } finally { await adapter.dispose(); await pump; }
+  });
+
+  for (const evidence of ["snapshot", "event"] as const) test(`held unknown admission pauses followers until positive ${evidence} evidence without additional writes`, async () => {
+    const { adapter, provider, queue, inbox } = steering();
+    const pump = adapter.startEventPump();
+    const seen: ChatEvent[] = [];
+    const client = await adapter.subscribe("session");
+    const collecting = (async () => { for await (const event of client.events) seen.push(event); })();
+    try {
+      adapter.projectionForTests("session").statusUpdate("running");
+      const head = await queue("head", "head");
+      const behind = await queue("behind", "behind");
+      provider.prompt = async (sessionId, input) => { provider.prompts.push({ sessionId, ...input }); throw new OperationOutcomeUnknownError(); };
+      await expect(adapter.changeDelivery("session", head.messageId, "convert", "steer")).rejects.toBeInstanceOf(OperationOutcomeUnknownError);
+      adapter.projectionForTests("session").statusUpdate("idle");
+      await admissionsApplied(adapter);
+      expect(provider.prompts.map(item => item.text)).toEqual(["head"]);
+      expect((await adapter.history("session")).queued?.find(item => item.id === behind.messageId)).toMatchObject({ paused: true });
+      const nativeId = provider.prompts[0]!.id;
+      if (evidence === "snapshot") provider.pendingInbox = [{ id: nativeId, text: "head", delivery: "steer", at: 1 }];
+      else { inbox({ kind: "pending", id: nativeId, text: "head", delivery: "steer", at: 1 }); await liveEventsApplied(adapter, provider); }
+      expect((await adapter.history("session")).queued?.find(item => item.id === behind.messageId)).not.toHaveProperty("paused");
+      await flushRecoveryIo();
+      expect(seen.filter(event => event.type === "conversation.queue" && event.change.messageId === behind.messageId)
+        .flatMap(event => event.type === "conversation.queue" && ["paused", "resumed"].includes(event.change.kind) ? [event.change.kind] : [])).toEqual(["paused", "resumed"]);
+      expect(provider.prompts.map(item => item.text)).toEqual(["head"]);
+      expect(provider.cancelledInbox).toEqual([]);
+      expect(provider.interrupts).toEqual([]);
+    } finally { client.events.cancel(); await collecting; await adapter.dispose(); await pump; }
+  });
+
+  test("an uncertain held entry pauses only its held suffix, not earlier messages", async () => {
+    const { adapter, provider, queue } = steering();
+    try {
+      adapter.projectionForTests("session").statusUpdate("running");
+      const before = await queue("before", "before");
+      const head = await queue("head", "head");
+      const behind = await queue("behind", "behind");
+      provider.prompt = async (sessionId, input) => { provider.prompts.push({ sessionId, ...input }); throw new OperationOutcomeUnknownError(); };
+      await expect(adapter.changeDelivery("session", head.messageId, "convert", "steer")).rejects.toBeInstanceOf(OperationOutcomeUnknownError);
+      const pending = (await adapter.history("session")).queued!;
+      expect(pending.find(item => item.id === before.messageId)).not.toHaveProperty("paused");
+      expect(pending.find(item => item.id === head.messageId)).toMatchObject({ paused: true, unconfirmed: true });
+      expect(pending.find(item => item.id === behind.messageId)).toMatchObject({ paused: true });
+    } finally { await adapter.dispose(); }
+  });
+
+  test("pending-map unknown admission does not pause or block an otherwise deliverable held follower", async () => {
+    const { adapter, provider, queue, steer } = steering();
+    try {
+      adapter.projectionForTests("session").statusUpdate("running");
+      const accept = provider.prompt.bind(provider);
+      provider.prompt = async (sessionId, input) => { provider.prompts.push({ sessionId, ...input }); throw new OperationOutcomeUnknownError(); };
+      await expect(steer("original", "original")).rejects.toBeInstanceOf(OperationOutcomeUnknownError);
+      const behind = await queue("behind", "behind");
+      expect((await adapter.history("session")).queued?.find(item => item.id === behind.messageId)).not.toHaveProperty("paused");
+      provider.prompt = accept;
+      adapter.projectionForTests("session").statusUpdate("idle");
+      await admissionsApplied(adapter);
+      expect(provider.prompts.map(item => item.text)).toEqual(["original", "behind"]);
+    } finally { await adapter.dispose(); }
+  });
+
+  test("accepted explicit Queue after Stop and local discard resumes FIFO while rejected Queue preserves the barrier", async () => {
+    const { adapter, provider, queue } = steering();
+    try {
+      adapter.projectionForTests("session").statusUpdate("running");
+      const head = await queue("head", "head");
+      const behind = await queue("behind", "behind");
+      await adapter.abort("session", "stop");
+      const accept = provider.prompt.bind(provider);
+      provider.prompt = async (sessionId, input) => { provider.prompts.push({ sessionId, ...input }); throw new OperationOutcomeUnknownError(); };
+      await expect(adapter.changeDelivery("session", head.messageId, "convert", "steer")).rejects.toBeInstanceOf(OperationOutcomeUnknownError);
+      const unknown = (await adapter.history("session")).queued!.find(item => item.id === head.messageId)!;
+      const discarding = adapter.discardUnconfirmedSteer("session", head.messageId, "discard", unknown.admissionUncertaintyId!);
+      // This idle drain predates the discard's fresh-idle fence.
+      adapter.projectionForTests("session").statusUpdate("idle");
+      await discarding;
+      await admissionsApplied(adapter);
+      expect(provider.prompts.map(item => item.text)).toEqual(["head"]);
+      provider.prompt = accept;
+      expect(await queue("behind", "behind")).toMatchObject({ messageId: behind.messageId, pending: true, delivery: "queue" });
+      await admissionsApplied(adapter);
+      expect(provider.prompts.map(item => item.text)).toEqual(["head"]);
+      await expect(adapter.prompt("session", "invalid", "invalid", { providerId: "missing", modelId: "missing" }, undefined, undefined, undefined, "queue")).rejects.toBeInstanceOf(InvalidModelSelectionError);
+      await admissionsApplied(adapter);
+      expect(provider.prompts.map(item => item.text)).toEqual(["head"]);
+      expect((await adapter.history("session")).queued).toEqual([expect.objectContaining({ text: "behind", paused: true })]);
+      expect(await queue("new", "new")).toMatchObject({ pending: true, delivery: "queue" });
+      await admissionsApplied(adapter);
+      expect(provider.prompts.map(item => item.text)).toEqual(["head", "behind"]);
+      adapter.projectionForTests("session").statusUpdate("idle");
+      await admissionsApplied(adapter);
+      expect(provider.prompts.map(item => item.text)).toEqual(["head", "behind", "new"]);
+      expect(provider.cancelledInbox).toEqual([]);
+      expect(provider.interruptOptions).toEqual([{ resume: false }]);
+    } finally { await adapter.dispose(); }
   });
 
   for (const origin of ["held", "composer"] as const) test(`local discard of unknown ${origin} admission sends nothing, fences an old idle drain and permits explicit Send now`, async () => {

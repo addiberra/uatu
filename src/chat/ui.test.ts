@@ -444,7 +444,7 @@ describe("chat reversible-history composer", () => {
       document.querySelector<HTMLButtonElement>('[data-queue-discard="unknown"]')!.click();
       expect(dialog.hasAttribute("open")).toBe(true);
       expect(dialog.querySelector("#chat-action-confirm-title")!.textContent).toBe("Discard local record?");
-      expect(dialog.querySelector("#chat-action-confirm-body")!.textContent).toBe("Delivery of this message is unconfirmed. Removing Uatu’s local record does not cancel or resend it; the original may still arrive. Other messages will stay queued until you choose Send now or a later normal idle transition.");
+      expect(dialog.querySelector("#chat-action-confirm-body")!.textContent).toBe("Delivery of this message is unconfirmed. Removing Uatu’s local record does not cancel or resend it; the original may still arrive. Other messages will stay queued until you choose Send now or submit a new message, or a later normal idle transition occurs.");
       expect(calls).toEqual([]);
       if (outcome === "switch") { changeConversation(); await flush(); }
       if (outcome === "stale" || outcome === "confirmed") {

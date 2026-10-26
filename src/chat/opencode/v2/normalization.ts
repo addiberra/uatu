@@ -31,7 +31,7 @@ import {
 import type { ConversationItem, MessageAttachment, MessageDelivery, StructuredQuestion, TokenUsage } from "../../types";
 import { LOGIN_FAILED_NOTICE_CODE } from "../../types";
 import type { InboxDelta, PendingInboxEntry } from "../../provider";
-import { BackgroundWorkers, nativeProof, prepareNotification, prepareTool, type BackgroundControls, type LauncherEvidence, type NativeProof, type PreparedTool, type PreparedNotification } from "./background";
+import { BackgroundWorkers, nativeProof, prepareNotification, prepareTool, shellCommandFingerprint, type BackgroundControls, type LauncherEvidence, type NativeProof, type PreparedTool, type PreparedNotification } from "./background";
 
 export type { NormalizedProviderEvent };
 
@@ -80,6 +80,8 @@ export type V2Evidence = Readonly<{
   shutdown: boolean;
   execution?: Readonly<{ phase: "started" | "ended"; proof?: NativeProof; historical: boolean }>;
   notification?: Readonly<{ child: string; id: string; proof?: NativeProof; historical: boolean }>;
+  shellBirth?: Readonly<{ id: string; parent?: string; proof?: NativeProof; commandFingerprint?: string }>;
+  userShell?: Readonly<{ id: string; parent: string }>;
   launchers: readonly LauncherEvidence[];
 }>;
 export type PreparedV2Event = { envelope: ReturnType<typeof providerEventEnvelope>; tools: ReadonlyMap<number, PreparedTool>; notification?: PreparedNotification; notificationId?: string; notificationProof?: NativeProof; evidence: V2Evidence };
@@ -119,10 +121,22 @@ function prepareV2Event(value: unknown, memory?: OpenCodeV2Memory, controls?: Ba
     ? Object.freeze({ kind: eventType, id: lifecycleId, ...(birth ? { ...birth, proof: nativeProof(event, { type: eventType, data, location: event.location }) } : {}) }) : undefined;
   const executionPhase = /^session\.execution\.(started|succeeded|failed|interrupted)$/.test(eventType) ? eventType === "session.execution.started" ? "started" : "ended" : undefined;
   const executionProof = executionPhase ? nativeProof(event, { type: eventType, session, error: data.error, reason: data.reason }) : undefined;
-  const notification = eventType === "session.inbox.enqueued" && record(data.item).type === "synthetic" ? prepareNotification(record(data.item).payload) : undefined;
+  const report = eventType === "session.inbox.enqueued" && record(data.item).type === "synthetic" ? prepareNotification(record(data.item).payload) : undefined;
+  const notification = report?.source === "shell" && session && report.worker && memory?.workers.isUserShell(session, report.worker)
+    ? Object.freeze({ ...report, userShell: true as const }) : report;
   const noticeId = optionalString(data.inboxID), child = notification?.source === "subagent" ? notification.worker : undefined;
   const noticeProof = notification?.worker ? nativeProof(event, { session, id: noticeId, notification }) : undefined;
+  const shell = record(data.info), shellId = optionalString(shell.id);
+  // shell.created is an ephemeral native birth. session.shell.* instead
+  // describes the durable user-command transcript and is not birth evidence.
+  const shellBirth = eventType === "shell.created" && shellId && event.durable === undefined
+    ? Object.freeze({ id: shellId, parent: optionalString(record(shell.metadata).sessionID), proof: nativeProof(event, { type: eventType, info: shell }), commandFingerprint: shellCommandFingerprint(shell.command) }) : undefined;
+  const userShellId = optionalString(record(data.shell).id);
+  const userShell = (eventType === "session.shell.started" || eventType === "session.shell.ended") && session && userShellId
+    ? Object.freeze({ id: userShellId, parent: session }) : undefined;
   return { envelope, tools, notification, notificationId: noticeId, notificationProof: noticeProof, evidence: Object.freeze({ session, directory: optionalString(record(event.location).directory), lifecycle,
+    ...(shellBirth ? { shellBirth } : {}),
+    ...(userShell ? { userShell } : {}),
     shutdown: eventType === "location.shutdown", launchers: Object.freeze([...tools.values()].map(tool => tool.fact)),
     ...(executionPhase ? { execution: Object.freeze({ phase: executionPhase, proof: executionProof, historical: controls?.historical(executionPhase, executionProof) === true || !!session && (executionPhase === "ended" ? memory?.workers.terminalReplay(session, executionProof) : memory?.workers.startReplay(session, executionProof)) === true }) } : {}),
     ...(eventType === "session.inbox.enqueued" && child && noticeId ? { notification: Object.freeze({ child, id: noticeId, proof: noticeProof, historical: controls?.historical("notification", noticeProof) === true || !!session && memory?.workers.notificationReplay(session, noticeId, noticeProof) === true }) } : {}),
@@ -235,6 +249,12 @@ export function createOpenCodeV2Mapper(directory: string): GenerationMapper<Open
         const child = optionalString(data.sessionID);
         const parent = optionalString(data.parentID);
         if (child && parent) memory?.workers.verifyChild(child, parent);
+        return undefined;
+      }
+      case "session.shell.started":
+      case "session.shell.ended": {
+        const shell = optionalString(record(data.shell).id);
+        if (conversationId && shell) memory?.workers.observeUserShell(conversationId, shell);
         return undefined;
       }
       case "session.renamed": {

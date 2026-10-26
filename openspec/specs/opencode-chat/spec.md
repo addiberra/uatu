@@ -3387,9 +3387,15 @@ A settled unknown steer admission SHALL offer confirmed local-only discard throu
 - **THEN** no discard token is exposed until that request actually settles unknown
 - **AND** neither local-ownership retirement, cancellation nor replay occurs automatically
 
+#### Scenario: A held unconfirmed admission truthfully pauses blocked followers
+- **WHEN** a held entry's unconfirmed steer admission blocks automatic delivery of later held entries
+- **THEN** snapshots and live queue updates mark the blocked suffix paused and use truthful delivery wording
+- **AND** confirmation evidence can clear that presentation without sending or cancelling input
+- **AND** pending-map uncertainty alone does not pause otherwise deliverable held entries
+
 #### Scenario: Confirmation explains local-only removal
 - **WHEN** the user chooses Discard local record
-- **THEN** confirmation explains that delivery is unconfirmed, the original may still arrive, local removal neither cancels nor resends it, and other messages wait for Send now or a later normal idle transition
+- **THEN** confirmation explains that delivery is unconfirmed, the original may still arrive, local removal neither cancels nor resends it, and other messages wait for Send now, a newly accepted message submission, or a later normal idle transition
 - **AND** Cancel initially receives focus and conflicting per-entry actions are prevented
 
 #### Scenario: Target validation and retained receipts identify the exact action
@@ -3415,8 +3421,13 @@ A settled unknown steer admission SHALL offer confirmed local-only discard throu
 #### Scenario: Discard does not release a previously scheduled drain
 - **WHEN** an idle drain was scheduled before local discard and runs afterward
 - **THEN** remaining held messages stay queued
-- **AND** explicit Send now or a later normal idle transition can deliver eligible remaining messages without replaying the discarded original
+- **AND** explicit Send now, a newly accepted user submission, or a later normal idle transition can deliver eligible remaining messages without replaying the discarded original
 - **AND** derived recovery completion or failed-action status rollback does not count as that transition
+
+#### Scenario: Fresh Queue admission resumes held input after Stop and discard
+- **WHEN** Stop and local discard leave an idle conversation's remaining queue paused, and a new Queue submission passes validation and is accepted
+- **THEN** it joins the held queue and authorizes FIFO delivery from the existing head without replaying the discarded original
+- **AND** rejected submissions, cached retries and discard alone do not authorize this handoff
 
 #### Scenario: Late native evidence remains truthful
 - **WHEN** old reads or acknowledgements finish after discard, or the original later appears in native inbox/history
@@ -3429,8 +3440,15 @@ Read-only recovery SHALL distinguish failed reads from successful inconclusive e
 
 #### Scenario: Successful inconclusive reads stop polling without inventing an outcome
 - **WHEN** three successful recovery reads in one external cycle leave the same uncertainty unresolved
-- **THEN** no further unchanged self-scheduled successful probe occurs until a new external trigger
+- **THEN** no further unchanged self-scheduled successful probe occurs and bounded exhaustion metadata remains parked outside the runnable drain
 - **AND** uncertainty remains visible rather than being reported as completion or non-application
+
+#### Scenario: Unrelated activity cannot repeatedly replenish exhausted cycles
+- **WHEN** unrelated tool, content or interaction events continue after an inconclusive cycle is exhausted
+- **THEN** an externally triggered restart occurs no sooner than 30 seconds after exhaustion, without a recurring poll in a quiet session
+- **AND** genuinely new source worker evidence that changes retained knowledge, explicit refresh or reconnect can restart recovery immediately
+- **AND** unchanged rediscovery, recovery's own updates and bookkeeping do not replenish the budget
+- **AND** parked metadata has a count bound and deletion, eviction, disposal and generation cleanup
 
 #### Scenario: Failed reads retain backoff and later evidence rearms recovery
 - **WHEN** a recovery read fails, or new evidence/refresh/reconnect follows an exhausted inconclusive cycle
@@ -3450,6 +3468,23 @@ Read-only recovery SHALL distinguish failed reads from successful inconclusive e
 
 ### Requirement: Worker Stop availability requires retained occurrence proof
 Worker Stop SHALL target a retained, verified native occurrence. Display-record cleanup and reconnect SHALL NOT erase known revocations. Missing, revoked or overflowed control proof SHALL produce uncertainty and withhold Stop; fresh history alone SHALL NOT restore trust. Healthy targets whose proof remains retained SHALL remain controllable without reconnect after projection saturation.
+
+#### Scenario: New post-gap occurrences do not inherit global permanent refusal
+- **WHEN** a new live subscription positively observes native birth and matching invocation evidence for a genuinely new worker after an observation gap
+- **THEN** fresh ownership/current-state validation can admit that occurrence within the existing control budget without clearing pre-gap revocations
+- **AND** an observed ephemeral shell creation can anchor shell birth under the native live-only, non-replaying stream contract; a later content snapshot, unseen identifier or timestamp alone cannot
+- **AND** old identities, unresolved gaps and actual capacity closure remain protected, and in-flight authorizations are invalidated
+
+#### Scenario: Shell birth contradictions fence both retained and first-seen targets
+- **WHEN** a native shell birth contradicts a retained occurrence or a first-seen launcher claiming the same shell identifier
+- **THEN** the old or mismatched target remains uncertain and Stop sends no native removal, even if fresh shell inventory confirms ownership
+- **AND** an exact retained consumed birth replay is distinguished from a new or conflicting native proof
+- **AND** compatible tool creation and shell start clocks need not be equal; identity arrival or timestamps alone do not resolve a command contradiction
+
+#### Scenario: User-shell notes do not consume worker-control admission
+- **WHEN** typed user-command shell transcript events identify shell completion notes that are not background-worker reports
+- **THEN** command rendering is preserved without retaining each note in worker control observations or unpublished worker-report storage
+- **AND** unresolved prelaunch presentation payload has count/byte bounds while genuine worker notification-before-launch correlation and control contradictions remain safe
 
 #### Scenario: Retained controls remain usable after projection saturation
 - **WHEN** display/correlation records saturate but a worker's compatible control evidence remains retained and fresh validation succeeds

@@ -1024,13 +1024,39 @@ silent readmission; reconnect does not erase them, and unretained targets may
 remain unavailable for the provider lifetime. Disposal ends that in-memory
 ownership lifetime. Complete-history folds are transient and precede pagination.
 
+Observation gaps retire existing authorizations without globally closing future
+control admission. New post-gap targets require positive native birth and matching
+invocation proof under the live-only, non-replaying subscription contract;
+post-reconnect content snapshots alone cannot supply that proof. Existing
+revocations and actual capacity closure survive reconnect. Background-shell
+birth association also corroborates native command fingerprints, without
+requiring equal tool/shell clocks. Command-rewriting native hooks may leave that
+association unprovable, so controls remain unavailable rather than guessing.
+Typed user-command shell notes remain separate from background control/report retention, and
+unpublished prelaunch presentation payload is bounded to 128 entries / 256 KiB.
+Disposable user-shell classification is bounded to 128 identities / 64 KiB;
+unclassified delayed notes remain conservative. These subordinate stores remain
+within the aggregate accounting and do not forget genuine worker contradictions
+when presentation payload is evicted.
+
 `reconcileBackgroundTasks(parent)` reads complete history, all pending inbox
 entries, verified child/active evidence and owned shell records. Unlike
 Claude's authoritative live list, absence never means cancellation. The adapter
 waits for the connected marker, fences recovery generations and live updates,
 coalesces reads per parent and limits concurrent parents to four. Failed reads
 retain backoff; unchanged successful-inconclusive recovery allows three reads
-per external cycle, then waits for new evidence, explicit refresh or reconnect.
+per external cycle, then parks bounded scheduling metadata outside the runnable
+drain. Unrelated source activity can restart an exhausted cycle no sooner than
+30 seconds after exhaustion, without polling in quiet sessions. Genuine new
+worker evidence, explicit refresh or reconnect can restart it immediately.
+The scheduling cohort has at most 2,048 active/queued/parked records. Eviction
+carries exhausted deadlines into a scalar fallback instead of granting a fresh
+budget. Retained native high-water fingerprints supplement projected-row progress
+across removals and alias changes; source and read results use the same continuity.
+Their separate per-record limit is 64 entries / 16 KiB serialized-entry payload,
+at most 131,072 entries / 32 MiB across the cohort, not a JavaScript heap bound.
+Overflow keeps a conservative knowledge-gap marker. These recovery-scheduling
+records are separate from native worker-control authorization evidence.
 Verified discovery progress may extend recovery, but omission/alias flapping
 does not. Dirty updates use a 100 ms throttle and safe per-item fences instead
 of discarding every in-flight result. Recovery updates workspace activity even for unselected

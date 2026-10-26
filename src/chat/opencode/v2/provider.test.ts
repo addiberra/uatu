@@ -108,6 +108,182 @@ function nativeBackgroundStack() {
   return { fake, provider, adapter };
 }
 
+function observedNativeStream(provider: OpenCodeV2Provider) {
+  const lifetime = new AbortController(), events: import("../../provider").NormalizedProviderEvent[] = [];
+  const waiting = new Set<{ matches: (event: import("../../provider").NormalizedProviderEvent) => boolean; resolve: () => void }>();
+  const pump = (async () => {
+    for await (const event of provider.events(lifetime.signal)) {
+      events.push(event);
+      for (const waiter of waiting) if (waiter.matches(event)) { waiting.delete(waiter); waiter.resolve(); }
+    }
+  })();
+  void pump.catch(() => undefined);
+  return { lifetime, pump, seen: (matches: (event: import("../../provider").NormalizedProviderEvent) => boolean) =>
+    events.some(matches) ? Promise.resolve() : new Promise<void>(resolve => waiting.add({ matches, resolve })) };
+}
+
+for (const kind of ["agent", "shell"] as const) for (const reconnect of [false, true]) test(`new live ${kind} is stoppable ${reconnect ? "after a native observation gap" : "without a gap"}`, async () => {
+  const { fake, provider, adapter } = nativeBackgroundStack();
+  let stream = observedNativeStream(provider);
+  try {
+    await stream.seen(event => event.eventType === "server.connected");
+    const parent = (await provider.createSession("Fresh worker coverage")).id;
+    if (reconnect) {
+      fake.disconnect(); await stream.pump;
+      stream = observedNativeStream(provider);
+      await stream.seen(event => event.eventType === "server.connected");
+    }
+    const worker = kind === "agent" ? fake.launchWorker(parent, true) : fake.launchShell(parent, true);
+    await stream.seen(event => event.updates.some(update => update.kind === "upsert" && update.item.type === "background_task" && update.item.taskId === worker.taskId));
+    const rows = await provider.reconcileBackgroundTasks(parent, { fresh: true });
+    let failure: unknown;
+    try { await provider.stopTask(parent, worker.taskId); } catch (error) { failure = error; }
+    const calls = fake.state().calls.filter(call => "childId" in worker
+      ? call.startsWith(`POST /api/session/${worker.childId}/interrupt?`)
+      : call.startsWith(`DELETE /api/shell/${worker.shellId}?`));
+    expect(calls).toHaveLength(1);
+    expect(failure).toBeUndefined();
+    expect(rows).toContainEqual(expect.objectContaining({ taskId: worker.taskId, status: "running", stateUncertain: false }));
+    expect(fake.state().unhandled).toEqual([]);
+  } finally {
+    stream.lifetime.abort(); await stream.pump.catch(() => undefined);
+    await adapter.dispose(); await fake.stop();
+  }
+});
+
+for (const kind of ["agent", "shell"] as const) test(`history alone cannot authorize a ${kind} born while the native stream was disconnected`, async () => {
+  const { fake, provider, adapter } = nativeBackgroundStack();
+  let stream = observedNativeStream(provider);
+  try {
+    await stream.seen(event => event.eventType === "server.connected");
+    const parent = (await provider.createSession("Uncovered worker")).id;
+    fake.disconnect(); await stream.pump;
+    const worker = kind === "agent" ? fake.launchWorker(parent, true) : fake.launchShell(parent, true);
+    stream = observedNativeStream(provider);
+    await stream.seen(event => event.eventType === "server.connected");
+    expect(await provider.reconcileBackgroundTasks(parent, { fresh: true })).toContainEqual(expect.objectContaining({ taskId: worker.taskId, stateUncertain: true }));
+    await expect(provider.stopTask(parent, worker.taskId)).rejects.toThrow();
+    expect(fake.state().calls.filter(call => "childId" in worker
+      ? call.startsWith(`POST /api/session/${worker.childId}/interrupt?`)
+      : call.startsWith(`DELETE /api/shell/${worker.shellId}?`))).toEqual([]);
+    expect(fake.state().unhandled).toEqual([]);
+  } finally {
+    stream.lifetime.abort(); await stream.pump.catch(() => undefined);
+    await adapter.dispose(); await fake.stop();
+  }
+});
+
+for (const change of ["replay", "new-envelope", "command", "started", "foreign-parent", "foreign-scope", "missing-proof", "during-owned-read", "user-after-rebirth"] as const) {
+  test(`native shell rebirth fences the retained Stop: ${change}`, async () => {
+    const fixture = JSON.parse(readFileSync(path.join(import.meta.dir, "../../../../tests/fixtures/opencode-v2/background-2.0.29.json"), "utf8"));
+    let wire!: ReadableStreamDefaultController<Uint8Array>, armed = false, entered!: () => void, release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; }), started = new Promise<void>(resolve => { entered = resolve; });
+    const frame = (raw: unknown) => wire.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(raw)}\n\n`));
+    const shell = { id: "sh_fixture", status: "running", command: fixture.shell.content[0].state.input.command, metadata: { sessionID: "ses_parent" }, time: { started: 65 } };
+    const birth = { id: "shell-birth", created: 66, type: "shell.created", location: { directory: WORKSPACE }, data: { info: shell } };
+    const server = fakeOpenCode({
+      "GET /api/event": () => new Response(new ReadableStream<Uint8Array>({ start(controller) { wire = controller; frame({ type: "server.connected", data: {} }); } }), { headers: { "content-type": "text/event-stream" } }),
+      "GET /api/session/ses_parent": () => session("ses_parent"),
+      "GET /api/session/ses_parent/message": () => ({ data: [fixture.shell], cursor: {} }),
+      "GET /api/session/ses_parent/inbox": () => ({ data: [] }),
+      "GET /api/session/active": () => ({}),
+      "GET /api/shell/sh_fixture": async () => { const owned = scoped({ id: "sh_fixture", metadata: { sessionID: "ses_parent" } }); if (armed) { armed = false; entered(); await gate; } return owned; },
+      "DELETE /api/shell/sh_fixture": () => undefined,
+    });
+    const provider = server.provider();
+    let stream = observedNativeStream(provider), stop: Promise<void> | undefined;
+    const taskId = "v2:ses_parent:call_shell";
+    const barrier = async (label: string) => {
+      frame({ id: `barrier-${label}`, created: 100, type: "session.text.delta", location: { directory: WORKSPACE },
+        data: { sessionID: "ses_parent", assistantMessageID: `message-${label}`, id: `text-${label}`, delta: label } });
+      await stream.seen(event => event.updates.some(update => update.kind === "text" && update.text === label));
+    };
+    try {
+      await stream.seen(event => event.eventType === "server.connected");
+      wire.close(); await stream.pump;
+      stream = observedNativeStream(provider);
+      await stream.seen(event => event.eventType === "server.connected");
+      frame(birth);
+      frame({ id: "launcher", created: 80, type: "session.message.content.updated", location: { directory: WORKSPACE }, data: {
+        sessionID: "ses_parent", messageID: fixture.shell.id, content: fixture.shell.content } });
+      await stream.seen(event => event.updates.some(update => update.kind === "upsert" && update.item.type === "background_task" && update.item.taskId === taskId));
+      expect(await provider.reconcileBackgroundTasks("ses_parent", { fresh: true })).toContainEqual(expect.objectContaining({ taskId, stateUncertain: false }));
+      if (change === "during-owned-read") {
+        armed = true; stop = provider.stopTask("ses_parent", taskId); void stop.catch(() => undefined); await started;
+      }
+      const changed = structuredClone(birth) as { id?: string; created: number; type: string; location: { directory: string }; data: { info: typeof shell } };
+      if (["new-envelope", "during-owned-read", "user-after-rebirth"].includes(change)) changed.id = "different-birth";
+      if (change === "command") changed.data.info.command = "a replacement shell";
+      if (change === "started") changed.data.info.time.started = 95;
+      if (change === "foreign-parent") changed.data.info.metadata.sessionID = "foreign-parent";
+      if (change === "foreign-scope") changed.location.directory = "/foreign";
+      if (change === "missing-proof") delete changed.id;
+      frame(changed); await barrier("after-rebirth");
+      if (change === "user-after-rebirth") {
+        frame({ id: "user-shell", created: 101, type: "session.shell.ended", location: { directory: WORKSPACE }, data: { sessionID: "ses_parent", shell, output: { output: "User output" } } });
+        frame({ id: "user-note", created: 102, type: "session.inbox.enqueued", location: { directory: WORKSPACE }, data: { sessionID: "ses_parent", inboxID: "user-result", item: {
+          type: "synthetic", payload: { text: "User output", metadata: { source: "shell", shellID: "sh_fixture", state: "completed", exit: 0 } } } } });
+        await barrier("after-user-note");
+      }
+      release();
+      if (change === "replay") {
+        await provider.stopTask("ses_parent", taskId);
+        expect(server.requests("DELETE", "/api/shell/sh_fixture")).toHaveLength(1);
+      } else {
+        await expect(stop ?? provider.stopTask("ses_parent", taskId)).rejects.toThrow();
+        expect(server.requests("DELETE", "/api/shell/sh_fixture")).toHaveLength(0);
+        expect(await provider.reconcileBackgroundTasks("ses_parent", { fresh: true })).toContainEqual(expect.objectContaining({ taskId, stateUncertain: true }));
+      }
+    } finally {
+      release(); await stop?.catch(() => undefined);
+      stream.lifetime.abort(); await stream.pump.catch(() => undefined); await provider.dispose();
+    }
+  });
+}
+
+for (const change of ["compatible", "old-command", "missing-birth-command", "missing-launch-command", "alias-command"] as const) {
+  test(`first-seen public shell Stop binds its command despite fresh same-ID ownership: ${change}`, async () => {
+    let wire!: ReadableStreamDefaultController<Uint8Array>;
+    const frame = (raw: unknown) => wire.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(raw)}\n\n`));
+    const info = { id: "SH", status: "running", command: "NEW", metadata: { sessionID: "P" }, time: { started: 30 } };
+    const birth = { id: "new-birth", created: 31, type: "shell.created", location: { directory: WORKSPACE }, data: { info: {
+      ...info, command: change === "missing-birth-command" ? undefined : "NEW" } } };
+    const message = { id: "owning-message", type: "assistant", time: { created: change === "old-command" ? 10 : 29 }, content: [{ type: "tool", id: "call", name: "shell",
+      time: { created: change === "old-command" ? 10 : 29, completed: 32 }, state: { status: "completed", input: (change === "missing-launch-command" ? {} : { command: change === "old-command" ? "OLD" : "NEW" }) as Record<string, unknown>,
+        metadata: { shellID: "SH", status: "running" } } }] };
+    if (change === "alias-command") { const alias = structuredClone(message.content[0]!); alias.id = "alias"; alias.state.input.command = "OLD"; message.content.push(alias); }
+    const server = fakeOpenCode({
+      "GET /api/event": () => new Response(new ReadableStream<Uint8Array>({ start(controller) { wire = controller; frame({ type: "server.connected", data: {} }); } }), { headers: { "content-type": "text/event-stream" } }),
+      "GET /api/session/P": () => session("P"),
+      "GET /api/session/P/message": () => ({ data: [message], cursor: {} }),
+      "GET /api/session/P/inbox": () => ({ data: [] }),
+      "GET /api/session/active": () => ({}),
+      "GET /api/shell/SH": () => scoped(info),
+      "DELETE /api/shell/SH": () => undefined,
+    });
+    const provider = server.provider();
+    let stream = observedNativeStream(provider);
+    try {
+      await stream.seen(event => event.eventType === "server.connected");
+      wire.close(); await stream.pump;
+      stream = observedNativeStream(provider);
+      await stream.seen(event => event.eventType === "server.connected");
+      frame(birth);
+      frame({ id: "live-launch", created: 40, type: "session.message.content.updated", location: { directory: WORKSPACE }, data: { sessionID: "P", messageID: message.id, content: message.content } });
+      const taskId = "v2:P:call";
+      await stream.seen(event => event.updates.some(update => update.kind === "upsert" && update.item.type === "background_task" && update.item.taskId === taskId));
+      const rows = await provider.reconcileBackgroundTasks("P", { fresh: true });
+      let failure: unknown;
+      try { await provider.stopTask("P", taskId); } catch (error) { failure = error; }
+      expect(server.requests("DELETE", "/api/shell/SH")).toHaveLength(change === "compatible" ? 1 : 0);
+      expect(rows).toContainEqual(expect.objectContaining({ taskId, stateUncertain: change !== "compatible" }));
+      if (change === "compatible") expect(failure).toBeUndefined(); else expect(failure).toBeDefined();
+    } finally {
+      stream.lifetime.abort(); await stream.pump.catch(() => undefined); await provider.dispose();
+    }
+  });
+}
+
 for (const kind of ["agent", "shell"] as const) test(`reverted live ${kind} remains independently inspectable and stoppable until settlement`, async () => {
   const directory = process.cwd(), fake = startOpenCodeV2Fake({ directory });
   const provider = createOpenCodeV2Provider({ endpoint: fake.url, password: fake.password, directory }) as OpenCodeV2Provider;

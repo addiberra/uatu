@@ -46,7 +46,8 @@ Once an unknown admission has settled, an eligible pending entry offers
 **Discard local record**. Confirmation explains that this removes only Uatu's
 copy: it does not cancel or resend the original, which may still arrive. The
 original unknown receipt and native evidence remain intact. Other messages stay
-queued until explicit Send now or a later normal idle transition; discard itself
+queued until explicit Send now, a newly accepted message submission, or a later
+normal idle transition; discard itself
 does not send anything. This also covers a Queue entry whose attempted Send now
 or switch to Steer became unknown. Resume and withdrawal uncertainty do not gain
 this action. A timed-out request whose underlying transport never settles remains
@@ -359,6 +360,12 @@ continue discovery. Missing history or an exhausted check budget never means tha
 work completed or input was not delivered. Ongoing updates are coalesced without
 discarding safe independent recovery results.
 
+An exhausted cycle retains bounded scheduling state. Unrelated source activity
+can restart it no sooner than 30 seconds after exhaustion; quiet sessions do not
+poll automatically. Genuine new worker evidence, explicit refresh and reconnect
+can restart recovery immediately. Held entries blocked by an unconfirmed held
+admission are shown as paused, rather than promising ordinary delivery.
+
 ### Background workers (OpenCode V2)
 
 OpenCode V2 exposes native background-worker inspection and controls. Automated
@@ -547,6 +554,15 @@ unavailable for the provider runtime's lifetime; reconnect does not erase known
 revocations. These internal limits do not prevent workers running or messages
 being sent. Chat does not automatically restart, cancel work or delete data to
 clear them.
+
+Reconnect does not permanently disable controls for every future worker. A new
+occurrence needs positively observed native birth and matching invocation proof,
+plus fresh ownership and state checks. A content snapshot arriving after reconnect
+is not sufficient. If a native hook rewrites a shell command so its birth cannot
+be matched to the launcher, that target stays uncertain with Stop unavailable.
+User-command shell transcript notes are kept separate from
+background-worker report retention; ordinary shell use does not spend that
+worker-control budget.
 
 If a response is lost, Chat reports **Outcome unknown** and refreshes without
 replaying the mutation. Same-request retries are deduplicated only while the

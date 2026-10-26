@@ -301,6 +301,10 @@ export function startOpenCodeV2Fake(options: { directory: string; password?: str
     const message: StoredMessage = { id: mint("msg"), type: "assistant", time: { created }, content: [{ type: "tool", id: callId, name: "shell", time: { created }, state: { status: background ? "completed" : "running", input: { command: "printf 'safe shell output'" }, metadata: { shellID: shellId, status: "running" }, content: background ? [{ type: "text", text: "Command moved to the background." }] : [] } }] };
     shells.set(shellId, { parent, message, background, removed: false, exited: false, waiter: "pending", captured: false, captureBeforeRemove: false, output: "safe shell output" });
     parent.messages.push(message);
+    // Native ephemeral birth, as captured in real-2.0.13.json. Metadata is
+    // association only: the provider still verifies launcher and owned inventory.
+    emit("shell.created", { info: { id: shellId, status: "running", command: "printf 'safe shell output'", cwd: directory,
+      shell: "/bin/sh", file: `/fixture/${shellId}.out`, metadata: { sessionID: sessionId, background }, time: { started: created } } });
     emit("session.message.content.updated", { sessionID: sessionId, messageID: message.id, content: message.content });
     return { shellId, taskId: `v2:${sessionId}:${callId}` };
   }

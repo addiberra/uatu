@@ -1133,7 +1133,7 @@ function buildChatRoutes(deps: BuildRoutesDeps, p: (path: string) => string) {
         return run(() => deps.chatService.changeDelivery(id, messageId, requestId, delivery, context, operationReceipt));
       }),
     },
-    // Sends a pending message now (D8).
+    // Discards only a settled unknown admission's local record; never cancels or resends.
     [p("/api/chat/conversations/:conversationId/queue/:messageId/discard-unconfirmed")]: {
       POST: async (request: RouteRequest) => chatMutation(request, ["requestId", "uncertaintyId"], async (id, body) => {
         const messageId = routeIdentity(request, "messageId");
@@ -1144,6 +1144,7 @@ function buildChatRoutes(deps: BuildRoutesDeps, p: (path: string) => string) {
         return uncertaintyId instanceof Response ? uncertaintyId : run(() => deps.chatService.discardUnconfirmedSteer(id, messageId, requestId, uncertaintyId));
       }),
     },
+    // Sends a pending message now (D8).
     [p("/api/chat/conversations/:conversationId/queue/:messageId/send-now")]: {
       POST: async (request: RouteRequest) => chatMutation(request, ["requestId"], async (id, body, context, operationReceipt) => {
         const messageId = routeIdentity(request, "messageId");

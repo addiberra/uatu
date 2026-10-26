@@ -1,4 +1,4 @@
-import type { APIRequestContext } from "@playwright/test";
+import type { APIRequestContext, Page } from "@playwright/test";
 import { openChatPanel } from "./chat-helpers";
 import { captureScreenshot, saveEvidence } from "./evidence";
 import { expect, test as base } from "./fixtures";
@@ -11,6 +11,38 @@ async function control(request: APIRequestContext, body: Record<string, unknown>
   expect(response.ok()).toBe(true);
   return response.json();
 }
+
+async function heldAdmissionFixture(page: Page, request: APIRequestContext, mode: "desktop" | "touch") {
+  await request.post("/__e2e/reset");
+  await control(request, { action: "agents", stack: "opencode-v2", backgroundPreview: true });
+  const { token } = await request.get("/__e2e/terminal-token").then(response => response.json()) as { token: string };
+  await page.goto(`/?t=${encodeURIComponent(token)}`);
+  await expect(page.locator("#connection-state .connection-label")).toHaveText("Connected");
+  if (mode === "touch") await page.locator("#touch-tab-chat").tap(); else await openChatPanel(page);
+  await page.getByRole("button", { name: "New conversation" }).click();
+  await expect(page.locator("#chat-conversation-select")).not.toHaveValue("");
+  const conversationId = await page.locator("#chat-conversation-select").inputValue();
+  const sessionID = conversationId.replace(/^opencode:/, "");
+  const chat = `/api/chat/conversations/${encodeURIComponent(conversationId)}`;
+  const headers = { origin: new URL(page.url()).origin };
+  const post = (path: string, data: unknown) => request.post(`${chat}${path}?t=${encodeURIComponent(token)}`, { data, headers });
+  const snapshot = () => request.get(`${chat}?t=${encodeURIComponent(token)}`).then(response => response.json());
+  expect((await post("/prompts", { requestId: "start", text: "Start fixture work" })).ok()).toBe(true);
+  await expect(page.locator("#chat-stop")).toBeEnabled();
+  const headResponse = await post("/prompts", { requestId: "head", text: "Original uncertain held input", delivery: "queue" });
+  expect(headResponse.ok()).toBe(true);
+  const head = await headResponse.json() as { messageId: string };
+  expect((await post("/prompts", { requestId: "behind", text: "Other queued input", delivery: "queue" })).ok()).toBe(true);
+  const state = () => control(request, { action: "opencode", op: "state" }) as Promise<NativeState>;
+  const unknown = async () => {
+    await control(request, { action: "opencode", op: "unknownPromptBeforeAdmission" });
+    const result = await request.patch(`${chat}/queue/${encodeURIComponent(head.messageId)}?t=${encodeURIComponent(token)}`, { data: { requestId: "convert", delivery: "steer" }, headers });
+    expect(result.ok()).toBe(false);
+  };
+  return { conversationId, sessionID, post, snapshot, state, unknown, head };
+}
+
+const nativeWrites = (value: NativeState) => value.calls.filter(call => /^(POST|PATCH|DELETE) /.test(call));
 
 type DiscardEventGate = {
   target?: { conversationId: string; messageId: string };
@@ -108,7 +140,7 @@ for (const browserName of ["chromium", "webkit"] as const) for (const mode of ["
     await expect(dialog).toBeVisible();
     await expect(dialog).toHaveAccessibleName("Discard local record?");
     await expect(dialog).toContainText("Removing Uatu’s local record does not cancel or resend it; the original may still arrive.");
-    await expect(dialog).toContainText("Other messages will stay queued until you choose Send now or a later normal idle transition.");
+    await expect(dialog).toContainText("Other messages will stay queued until you choose Send now or submit a new message, or a later normal idle transition occurs.");
     await expect(dialog.getByRole("button", { name: "Cancel", exact: true })).toBeFocused();
     const geometry = await dialog.getByRole("button", { name: "Discard local record", exact: true }).boundingBox();
     expect(geometry!.height).toBeGreaterThanOrEqual(mode === "touch" ? 44 : 24);
@@ -186,5 +218,73 @@ for (const browserName of ["chromium", "webkit"] as const) for (const mode of ["
     await expect(input).toHaveValue("Keep my unrelated draft");
     await expect(feedback).toBeVisible();
     await expect(feedback).toContainText("Delivery remains unconfirmed");
+  });
+
+  test("held unknown admission visibly pauses its follower without Stop or native replay", async ({ page, request }, info) => {
+    const f = await heldAdmissionFixture(page, request, mode);
+    await f.unknown();
+    const toggle = page.locator("[data-pending-toggle]");
+    if (await toggle.getAttribute("aria-expanded") === "false") await toggle.click();
+    const head = page.locator("#chat-queue .chat-queued-message").filter({ hasText: "Original uncertain held input" });
+    const behind = page.locator("#chat-queue .chat-queued-message").filter({ hasText: "Other queued input" });
+    await expect(head).toHaveAttribute("data-paused", "");
+    await expect(head).toContainText("Outcome unconfirmed");
+    await expect(head).toContainText("Do not repeat this pending message");
+    await expect(behind).toHaveAttribute("data-paused", "");
+    await expect(behind.locator(".chat-queued-paused")).toHaveText("Paused");
+    await expect(behind.locator(".chat-queued-tag")).toHaveText("Blocked by unconfirmed admission");
+    await expect(behind).not.toContainText("Sends after your next message");
+    await expect(page.locator("#chat-stop")).toBeEnabled();
+    const before = await f.state();
+    const snapshot = await f.snapshot();
+    expect(snapshot.queued.find((entry: { text: string }) => entry.text === "Other queued input")).toMatchObject({ delivery: "queue", paused: true });
+    const after = await f.state();
+    expect(nativeWrites(after)).toEqual(nativeWrites(before));
+    expect(after.sessions[f.sessionID]!.running).toBe(true);
+    expect(after.sessions[f.sessionID]!.messages.some(message => message.text === "Original uncertain held input" || message.text === "Other queued input")).toBe(false);
+    expect(after.unhandled).toEqual([]);
+    await captureScreenshot(page, info, `held-unknown-${mode}-${browserName}`);
+  });
+
+  test("a fresh explicit Queue after Stop and local discard resumes the old head before the new message", async ({ page, request }, info) => {
+    const f = await heldAdmissionFixture(page, request, mode);
+    expect((await f.post("/cancel", { requestId: "stop" })).ok()).toBe(true);
+    await expect(page.locator("#chat-stop")).toBeDisabled();
+    await f.unknown();
+    const toggle = page.locator("[data-pending-toggle]");
+    if (await toggle.getAttribute("aria-expanded") === "false") await toggle.click();
+    const input = page.locator("#chat-input");
+    await input.fill("New explicit Queue");
+    const before = await f.state();
+    const discard = page.locator("[data-queue-discard]");
+    if (mode === "touch") await discard.tap(); else await discard.click();
+    const dialog = page.locator("#chat-action-confirm");
+    await expect(dialog.getByRole("button", { name: "Cancel", exact: true })).toBeFocused();
+    await expect(dialog).toContainText("submit a new message");
+    const discarding = page.waitForResponse(response => response.url().includes("/discard-unconfirmed"));
+    const confirm = dialog.getByRole("button", { name: "Discard local record", exact: true });
+    if (mode === "touch") await confirm.tap(); else await confirm.click();
+    expect((await discarding).ok()).toBe(true);
+    await expect(page.locator("#chat-queue .chat-queued-message")).toHaveCount(1);
+    await expect(page.locator("#chat-queue .chat-queued-message")).toHaveAttribute("data-paused", "");
+    await expect(input).toHaveValue("New explicit Queue");
+    await expect(page.locator("#chat-items")).not.toContainText("Other queued input");
+    const kept = await f.state();
+    expect(nativeWrites(kept)).toEqual(nativeWrites(before));
+    const submitted = page.waitForRequest(req => req.method() === "POST" && req.url().includes("/prompts") && req.postDataJSON().text === "New explicit Queue");
+    await input.press("Alt+Enter");
+    expect((await submitted).postDataJSON().delivery).toBe("queue");
+    await expect(page.locator("#chat-items")).toContainText("Other queued input");
+    await expect(page.locator("#chat-queue .chat-queued-message")).toHaveCount(1);
+    await expect(page.locator("#chat-queue")).toContainText("New explicit Queue");
+    await control(request, { action: "opencode", op: "finish", conversationId: f.conversationId, text: "First queued answer" });
+    await expect(page.locator("#chat-items")).toContainText("New explicit Queue");
+    await expect(page.locator("#chat-queue .chat-queued-message")).toHaveCount(0);
+    const after = await f.state();
+    expect(after.sessions[f.sessionID]!.messages.filter(message => message.type === "user").map(message => message.text)).toEqual(["Start fixture work", "Other queued input", "New explicit Queue"]);
+    expect(after.calls.filter(call => call.startsWith(`POST /api/session/${f.sessionID}/prompt`))).toHaveLength(4);
+    expect(after.unhandled).toEqual([]);
+    await expect(page.locator("#chat-action-feedback")).toContainText("Delivery remains unconfirmed");
+    await captureScreenshot(page, info, `discard-new-queue-${mode}-${browserName}`);
   });
 });

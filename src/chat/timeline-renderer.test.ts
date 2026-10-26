@@ -1378,6 +1378,28 @@ describe("presentation details", () => {
       expect(batchAction.disabled).toBe(true);
     });
 
+    test("held followers explain an unconfirmed admission barrier without changing ordinary cancellation or pending-steer guidance", () => {
+      const dock = new QueueDockRenderer();
+      const host = target();
+      const before = queued({ id: "before", text: "Before", paused: true });
+      const head = queued({ id: "head", text: "Unknown held admission", paused: true, unconfirmed: true, admissionUncertaintyId: "token" });
+      const behind = queued({ id: "behind", text: "Behind", paused: true });
+      const native = queued({ id: "native", text: "Unknown native steer", delivery: "steer", paused: true, unconfirmed: true });
+      const tag = (id: string) => host.querySelector(`[data-chat-queued-id="${id}"] .chat-queued-tag`)!.textContent;
+      dock.render(host, [native, before, head, behind], steering);
+      const follower = host.querySelector('[data-chat-queued-id="behind"]');
+      expect(tag("before")).toBe("Sends after your next message");
+      expect(tag("head")).toBe("Do not repeat this pending message");
+      expect(tag("behind")).toBe("Blocked by unconfirmed admission");
+      expect(follower?.querySelector(".chat-queued-paused")?.textContent).toBe("Paused");
+      // Positive native evidence changes the barrier, not the follower's DOM
+      // identity, controls or the original unknown-input warning.
+      dock.render(host, [native, { ...head, delivery: "steer", unconfirmed: undefined, admissionUncertaintyId: undefined }, { ...behind, paused: undefined }], steering);
+      expect(tag("behind")).toBe("After this turn");
+      expect(host.querySelector('[data-chat-queued-id="behind"]')).toBe(follower);
+      expect(tag("native")).toBe("Do not repeat this pending message");
+    });
+
     test("steers render before queued entries, labelled, with a paused note, and the model note shows only while a steer is pending", () => {
       const dock = new QueueDockRenderer();
       const host = target();

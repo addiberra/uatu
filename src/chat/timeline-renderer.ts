@@ -1145,7 +1145,8 @@ export function pendingSteerReplacementNote(queued: readonly QueuedMessage[]): s
   return `${steers.length} pending steer${steers.length === 1 ? "" : "s"} will be delivered together with your replacement.`;
 }
 
-function queuedTag(entry: QueuedMessage): string {
+function queuedTag(entry: QueuedMessage, heldAdmissionBlocked: boolean): string {
+  if (entry.paused && heldAdmissionBlocked) return "Blocked by unconfirmed admission";
   return entry.paused ? "Sends after your next message" : entry.delivery === "steer" ? "Next step" : "After this turn";
 }
 
@@ -1170,7 +1171,7 @@ export function queuedActions(entry: QueuedMessage, context: QueueDockContext): 
 // A pending message is not a timeline item: it renders in the dock above the
 // composer with its delivery label and its actions, and only becomes a
 // transcript entry when the agent delivers it.
-function renderQueued(entry: QueuedMessage, context: QueueDockContext, discriminator?: number): string {
+function renderQueued(entry: QueuedMessage, context: QueueDockContext, discriminator?: number, heldAdmissionBlocked = false): string {
   const id = escapeHtmlAttribute(entry.id);
   const classes = `chat-queued-message ${entry.delivery === "steer" ? "is-steer" : "is-held"}`;
   const message = entry.text.trim() ? entry.text : "Image attachment";
@@ -1179,7 +1180,7 @@ function renderQueued(entry: QueuedMessage, context: QueueDockContext, discrimin
       : entry.admissionUncertaintyId ? [["data-queue-discard", "Discard local record"]] : []
     : queuedActions(entry, context);
   const buttons = actions.map(([attribute, label]) => `<button type="button" class="chat-queued-action${attribute === "data-queue-remove" ? " chat-queued-remove" : ""}" aria-label="${escapeHtmlAttribute(`${label} “${message}”${discriminator === undefined ? "" : `, pending message ${discriminator}`}`)}" ${attribute}="${id}"${context.pendingActions?.has(entry.id) ? " disabled" : ""}>${escapeHtml(label)}</button>`).join("");
-  return `<article class="${classes}" role="listitem" data-chat-queued-id="${id}" data-delivery="${entry.delivery}"${entry.paused ? " data-paused" : ""}><div class="chat-queued-heading"><strong class="chat-queued-badge">${entry.delivery === "steer" ? "Steer" : "Queue"}</strong>${entry.unconfirmed ? '<span class="chat-queued-paused">Outcome unconfirmed</span>' : entry.paused ? '<span class="chat-queued-paused">Paused</span>' : ""}<small class="chat-queued-tag">${entry.unconfirmed ? "Do not repeat this pending message" : escapeHtml(queuedTag(entry))}</small></div>${renderMessageAttachments(entry.attachments)}${entry.text ? `<p>${escapeHtml(entry.text)}</p>` : ""}<footer class="chat-queued-row"><span class="chat-queued-actions">${buttons}</span></footer></article>`;
+  return `<article class="${classes}" role="listitem" data-chat-queued-id="${id}" data-delivery="${entry.delivery}"${entry.paused ? " data-paused" : ""}><div class="chat-queued-heading"><strong class="chat-queued-badge">${entry.delivery === "steer" ? "Steer" : "Queue"}</strong>${entry.unconfirmed ? '<span class="chat-queued-paused">Outcome unconfirmed</span>' : entry.paused ? '<span class="chat-queued-paused">Paused</span>' : ""}<small class="chat-queued-tag">${entry.unconfirmed ? "Do not repeat this pending message" : escapeHtml(queuedTag(entry, heldAdmissionBlocked))}</small></div>${renderMessageAttachments(entry.attachments)}${entry.text ? `<p>${escapeHtml(entry.text)}</p>` : ""}<footer class="chat-queued-row"><span class="chat-queued-actions">${buttons}</span></footer></article>`;
 }
 
 // Only pending-card shapes belong here. In particular, never move a live
@@ -1354,7 +1355,11 @@ export class QueueDockRenderer {
       return existing ? [[existing.number, entry.id] as const] : [];
     }));
     const usedNumbers = new Set<number>();
+    let heldAdmissionBlocked = false;
     for (const entry of queued) {
+      // Only an uncertain held admission blocks its held suffix. Native
+      // pending steers are a separate lane and do not imply this barrier.
+      if (entry.delivery === "queue" && entry.unconfirmed) heldAdmissionBlocked = true;
       // Native handles key cards and actions; logical submission identity
       // below is only for numbering across an actual delivery conversion.
       const existing = this.entries.get(entry.id);
@@ -1373,7 +1378,7 @@ export class QueueDockRenderer {
       this.pendingNumbers.delete(identity);
       this.pendingNumbers.set(identity, { number, disambiguated });
       if (existing) { existing.number = number; existing.disambiguated = disambiguated; }
-      const html = renderQueued(entry, context, disambiguated ? number : undefined);
+      const html = renderQueued(entry, context, disambiguated ? number : undefined, entry.delivery === "queue" && heldAdmissionBlocked);
       if (existing && existing.html === html) {
         ordered.push(existing.node);
         continue;

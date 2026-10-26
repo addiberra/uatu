@@ -58,6 +58,14 @@ const INVENTORY_SESSION_LIMIT = 2_048;
 // Successful but unresolved evidence is not a failed read. Give each external
 // recovery cycle an initial read and two delayed probes, then await new evidence.
 const BACKGROUND_INCONCLUSIVE_READ_LIMIT = 3;
+// Unrelated native chatter may rearm an exhausted cycle only after this floor.
+// Exhaustion itself never schedules a timer. These are disposable scheduling
+// records, not worker Stop/control evidence; all states share the inventory cap.
+const BACKGROUND_EXHAUSTED_COOLDOWN_MS = 30_000;
+// Cycle-owned invocation fingerprints survive split source removals. Both
+// bounds are logical serialized payload; overflow retains a conservative gap.
+const BACKGROUND_SOURCE_KEYS = 64;
+const BACKGROUND_SOURCE_BYTES = 16 * 1024;
 // A fixed throttle, not trailing debounce: new arrivals cannot postpone this
 // deadline. Dirty reads share the same finite inconclusive-cycle budget.
 const BACKGROUND_DIRTY_RETRY_MS = 100;
@@ -71,6 +79,11 @@ type BackgroundRecovery = {
   failures: number;
   inconclusiveReads: number;
   progress: Map<string, WorkerRecoveryProgress>;
+  exhaustedAt?: number;
+  sourceProgress?: Map<string, WorkerRecoveryProgress>;
+  sourceProgressBytes?: number;
+  sourceProgressLost?: true;
+  sourceStartedAt?: number;
   timer?: ReturnType<typeof setTimeout>;
 };
 
@@ -466,6 +479,11 @@ export class ChatAdapter {
   // live background work as working.
   private readonly backgroundWork = new Set<string>();
   private readonly backgroundRecoveries = new Map<string, BackgroundRecovery>();
+  // Losing disposable scheduling ownership never waives an exhausted floor.
+  // Scalars conservatively cover untracked conversations without a second
+  // per-conversation registry or any timer.
+  private backgroundRecoveryFloorUntil = 0;
+  private backgroundRecoverySourceStartedAt = -Infinity;
   private backgroundRecoveryCount = 0;
   private readonly backgroundPending = new Set<Promise<void>>();
   private backgroundStreamGeneration = 0;
@@ -1330,6 +1348,8 @@ export class ChatAdapter {
     this.admittingSteers.clear();
     for (const recovery of this.backgroundRecoveries.values()) clearTimeout(recovery.timer);
     this.backgroundRecoveries.clear();
+    this.backgroundRecoveryFloorUntil = 0;
+    this.backgroundRecoverySourceStartedAt = -Infinity;
     for (const pending of this.revertReconciliations.values()) {
       if (pending.timer !== null) clearTimeout(pending.timer);
     }
@@ -1428,7 +1448,7 @@ export class ChatAdapter {
           return { ...dispatched, pending: false, delivery: "queue" };
         }
         const busy = this.turnActive(conversationId, projection);
-        const queue = this.heldQueues.get(conversationId) ?? [];
+        const queue: HeldQueue = this.heldQueues.get(conversationId) ?? [];
         // Order is absolute: while anything is held, a new submission joins the
         // back of the queue even when the conversation is momentarily idle —
         // dormant after a cancellation, or between deliveries.
@@ -1480,6 +1500,10 @@ export class ChatAdapter {
           // immediately dispatched prompt commits it; delivery re-asserts the
           // same values on the wire.
           const configuration = this.commitConfiguration(conversationId, currentConfiguration, model, mode, variant);
+          // This newly accepted submission is explicit permission to resume
+          // kept input. Cached receipts and rejected/preflight-failed attempts
+          // never reach this handoff; discard and derived status cannot grant it.
+          delete queue.awaitingFreshIdle;
           this.publishQueue(conversationId, { kind: "held", messageId: held.id });
           this.publishPausedChanges(conversationId);
           if (!busy) this.scheduleDelivery(conversationId);
@@ -1561,6 +1585,7 @@ export class ChatAdapter {
         if (sourceHeld && this.heldQueues.get(conversationId)?.includes(sourceHeld)) {
           sourceHeld.unconfirmedSteerId = nativeId;
           this.publishQueue(conversationId, { kind: "paused", messageId: sourceHeld.id });
+          this.publishPausedChanges(conversationId);
         } else if (!sourceHeld && !this.pendingSteers.get(conversationId)?.some(entry => entry.id === nativeId && !entry.unconfirmed)) {
           this.recordPendingSteer(conversationId, nativeId, submissionId, submissionOrder, requestId, text, attachmentRefs, queuedAt, true);
         }
@@ -2429,9 +2454,11 @@ export class ChatAdapter {
       ...(requestId ? { requestId } : {}),
       ...(attachments?.length ? { attachments } : {}),
     }));
-    const held = (this.heldQueues.get(conversationId) ?? []).map(({ id, submissionId, text, queuedAt, requestId, attachments, unconfirmedSteerId, admissionUncertaintyId }): QueuedMessage => ({
+    const queue = this.heldQueues.get(conversationId) ?? [];
+    const blockedAt = queue.findIndex(entry => entry.unconfirmedSteerId !== undefined);
+    const held = queue.map(({ id, submissionId, text, queuedAt, requestId, attachments, unconfirmedSteerId, admissionUncertaintyId }, index): QueuedMessage => ({
       id, submissionId, text, queuedAt, delivery: "queue",
-      ...(heldPaused || unconfirmedSteerId ? { paused: true as const } : {}),
+      ...(heldPaused || blockedAt >= 0 && index >= blockedAt ? { paused: true as const } : {}),
       ...(unconfirmedSteerId ? { unconfirmed: true as const } : {}),
       ...(unconfirmedSteerId && admissionUncertaintyId ? { admissionUncertaintyId } : {}),
       requestId,
@@ -3795,7 +3822,11 @@ export class ChatAdapter {
           }
           return;
         }
+        const workerProgress = this.observeBackgroundSource(conversationId, projection, updates);
         for (const update of updates) projection.apply(update.kind === "upsert" ? { ...update, item: this.correlateSteerMessage(conversationId, update.item) } : update);
+        const recovery = this.backgroundRecoveries.get(conversationId);
+        if (recovery) for (const id of recovery.progress.keys()) if (!projection.has(id)) recovery.progress.delete(id);
+        if (workerProgress) this.scheduleBackgroundRecovery(conversationId, true);
         if (this.provider.reconcileBackgroundTasks) this.syncBackgroundState(conversationId);
         // A fast subagent can start and report inside one coalescer window:
         // its usage arrives while the parent's task row is still buffered, so
@@ -3834,12 +3865,20 @@ export class ChatAdapter {
           this.backgroundReadyResolve?.();
           this.backgroundReadyResolve = undefined;
           this.backgroundStreamGeneration++;
+          this.backgroundRecoveryFloorUntil = 0;
+          this.backgroundRecoverySourceStartedAt = -Infinity;
           for (const [id, recovery] of this.backgroundRecoveries) {
             clearTimeout(recovery.timer);
             recovery.timer = undefined;
             recovery.failures = 0;
             recovery.inconclusiveReads = 0;
+            delete recovery.exhaustedAt;
             recovery.progress = this.backgroundProgressBaseline(id);
+            delete recovery.sourceProgress;
+            delete recovery.sourceProgressBytes;
+            delete recovery.sourceProgressLost;
+            delete recovery.sourceStartedAt;
+            this.seedBackgroundSource(id, recovery);
             recovery.dirty = true;
           }
           this.drainBackgroundRecoveries();
@@ -3975,12 +4014,125 @@ export class ChatAdapter {
     }
   }
 
-  private scheduleBackgroundRecovery(id: string): void {
+  private scheduleBackgroundRecovery(id: string, workerProgress = false): void {
     if (this.disposed || !this.provider.reconcileBackgroundTasks) return;
     const existing = this.backgroundRecoveries.get(id);
-    if (existing) { existing.dirty = true; return; }
-    this.backgroundRecoveries.set(id, { dirty: true, running: false, failures: 0, inconclusiveReads: 0, progress: this.backgroundProgressBaseline(id) });
+    if (existing) {
+      if (existing.exhaustedAt !== undefined) {
+        if (!workerProgress && Date.now() - existing.exhaustedAt < BACKGROUND_EXHAUSTED_COOLDOWN_MS) return;
+        delete existing.exhaustedAt;
+        existing.inconclusiveReads = 0;
+      }
+      if (workerProgress) existing.inconclusiveReads = 0;
+      existing.dirty = true;
+      this.drainBackgroundRecoveries();
+      return;
+    }
+    if (!workerProgress && Date.now() < this.backgroundRecoveryFloorUntil) return;
+    if (this.backgroundRecoveries.size >= INVENTORY_SESSION_LIMIT) {
+      // Only inactive parked records are disposable here. Active/queued/error
+      // recovery keeps its place; overflow waits for another native trigger or
+      // an explicit snapshot, which remains independent of this scheduler.
+      const oldest = [...this.backgroundRecoveries].find(([, recovery]) => recovery.exhaustedAt !== undefined && !recovery.running);
+      if (!oldest) return;
+      this.retireBackgroundRecovery(oldest[0]);
+    }
+    const recovery: BackgroundRecovery = { dirty: true, running: false, failures: 0, inconclusiveReads: 0, progress: this.backgroundProgressBaseline(id),
+      ...(Date.now() < this.backgroundRecoveryFloorUntil ? { sourceProgressLost: true as const } : {}) };
+    this.seedBackgroundSource(id, recovery);
+    this.backgroundRecoveries.set(id, recovery);
     this.drainBackgroundRecoveries();
+  }
+
+  private retireBackgroundRecovery(id: string): void {
+    const recovery = this.backgroundRecoveries.get(id);
+    if (recovery?.exhaustedAt !== undefined) {
+      if (Date.now() >= this.backgroundRecoveryFloorUntil) this.backgroundRecoverySourceStartedAt = -Infinity;
+      this.backgroundRecoveryFloorUntil = Math.max(this.backgroundRecoveryFloorUntil, recovery.exhaustedAt + BACKGROUND_EXHAUSTED_COOLDOWN_MS);
+      this.backgroundRecoverySourceStartedAt = Math.max(this.backgroundRecoverySourceStartedAt, recovery.sourceStartedAt ?? -Infinity);
+      for (const marker of recovery.progress.values()) this.backgroundRecoverySourceStartedAt = Math.max(this.backgroundRecoverySourceStartedAt, marker.startedAt);
+    }
+    this.backgroundRecoveries.delete(id);
+  }
+
+  private retainBackgroundSource(recovery: BackgroundRecovery, item: BackgroundTaskItem, marker: WorkerRecoveryProgress): void {
+    recovery.sourceStartedAt = Math.max(recovery.sourceStartedAt ?? -Infinity, marker.startedAt);
+    const retained = recovery.sourceProgress ??= new Map();
+    for (const key of [`row:${item.id}`, ...workerRecoveryAliases(item)]) {
+      const previous = retained.get(key);
+      const next = mergeWorkerRecoveryProgress(previous, marker);
+      const bytes = Buffer.byteLength(JSON.stringify([key, next]));
+      const total = (recovery.sourceProgressBytes ?? 0) - (previous ? Buffer.byteLength(JSON.stringify([key, previous])) : 0) + bytes;
+      if ((!previous && retained.size >= BACKGROUND_SOURCE_KEYS) || total > BACKGROUND_SOURCE_BYTES) { recovery.sourceProgressLost = true; continue; }
+      retained.set(key, next);
+      recovery.sourceProgressBytes = total;
+    }
+  }
+
+  private seedBackgroundSource(id: string, recovery: BackgroundRecovery): void {
+    for (const item of this.projections.get(id)?.filter(item => item.type === "background_task") ?? []) {
+      if (item.type === "background_task") this.retainBackgroundSource(recovery, item, recovery.progress.get(item.id) ?? workerRecoveryProgress(item));
+    }
+  }
+
+  // Only source/coalescer updates call this, never recovery's own results.
+  // Compare retained high-water knowledge before applying native updates, so
+  // unchanged rediscovery, uncertainty flips and alias renames are not progress.
+  private observeBackgroundSource(id: string, projection: ConversationProjection, updates: readonly NormalizedProviderUpdate[]): boolean {
+    if (!this.provider.reconcileBackgroundTasks) return false;
+    const recovery = this.backgroundRecoveries.get(id);
+    if (recovery) for (const update of updates) {
+      if (update.kind !== "remove") continue;
+      const item = projection.get(update.itemId);
+      if (item?.type === "background_task") this.retainBackgroundSource(recovery, item,
+        recovery.progress.get(item.id) ?? recovery.sourceProgress?.get(`row:${item.id}`) ?? workerRecoveryProgress(item));
+    }
+    if (!updates.some(update => update.kind === "upsert" && update.item.type === "background_task")) return false;
+    const aliases = this.backgroundProgressAliases(recovery, projection);
+    let progress = false;
+    for (const update of updates) {
+      if (update.kind === "upsert" && update.item.type === "background_task"
+        && this.recordBackgroundProgress(recovery, update.item, aliases, projection.get(update.item.id))) progress = true;
+    }
+    return progress;
+  }
+
+  private backgroundProgressAliases(recovery: BackgroundRecovery | undefined, projection: ConversationProjection): Map<string, WorkerRecoveryProgress> {
+    const lost = recovery?.sourceProgressLost || !recovery && Date.now() < this.backgroundRecoveryFloorUntil;
+    const aliases = new Map(recovery?.sourceProgress);
+    for (const item of projection.filter(item => item.type === "background_task")) {
+      if (item.type !== "background_task") continue;
+      if (lost && item.stateUncertain && !workerRecoveryAliases(item).some(alias => recovery?.sourceProgress?.has(alias))) continue;
+      const marker = recovery?.progress.get(item.id) ?? workerRecoveryProgress(item);
+      for (const alias of workerRecoveryAliases(item)) aliases.set(alias, mergeWorkerRecoveryProgress(aliases.get(alias), marker));
+    }
+    return aliases;
+  }
+
+  // Source frames and safe reconciliation results share the same retained
+  // native high-water comparison. Read-side rediscovery cannot replenish its
+  // own budget after a source removal prunes the disposable projected marker.
+  private recordBackgroundProgress(recovery: BackgroundRecovery | undefined, item: BackgroundTaskItem, aliases: Map<string, WorkerRecoveryProgress>, current?: ConversationItem, verifiedDiscovery = false): boolean {
+    const nativeAliases = workerRecoveryAliases(item);
+    let previous = recovery?.progress.get(item.id) ?? recovery?.sourceProgress?.get(`row:${item.id}`) ?? (current?.type === "background_task" ? workerRecoveryProgress(current) : undefined);
+    for (const alias of nativeAliases) {
+      const marker = aliases.get(alias);
+      if (marker) previous = mergeWorkerRecoveryProgress(previous, marker);
+    }
+    const marker = item.stateUncertain ? previous : mergeWorkerRecoveryProgress(previous, workerRecoveryProgress(item));
+    if (!marker) return false;
+    const lost = recovery?.sourceProgressLost || !recovery && Date.now() < this.backgroundRecoveryFloorUntil;
+    const nativeBasis = nativeAliases.some(alias => aliases.has(alias));
+    // Verified first discovery may extend a read cycle. After a retention gap,
+    // both paths require retained-native progress or a newer verified start;
+    // changing a UI row or repeating an old result is not execution progress.
+    const discovery = nativeAliases.length > 0 || verifiedDiscovery;
+    const progress = marker !== previous && Boolean(previous && (!lost || nativeBasis)
+      || discovery && (!lost || item.createdAt > (recovery?.sourceStartedAt ?? this.backgroundRecoverySourceStartedAt)));
+    recovery?.progress.set(item.id, marker);
+    if (recovery) this.retainBackgroundSource(recovery, item, marker);
+    for (const alias of nativeAliases) aliases.set(alias, mergeWorkerRecoveryProgress(aliases.get(alias), marker));
+    return progress;
   }
 
   private backgroundProgressBaseline(id: string): Map<string, WorkerRecoveryProgress> {
@@ -4004,7 +4156,7 @@ export class ChatAdapter {
     if (this.disposed || !this.backgroundConnected) return;
     for (const [id, recovery] of this.backgroundRecoveries) {
       if (this.backgroundRecoveryCount >= 4) break;
-      if (recovery.running || recovery.timer) continue;
+      if (recovery.running || recovery.timer || recovery.exhaustedAt !== undefined) continue;
       recovery.running = true;
       recovery.dirty = false;
       this.backgroundRecoveryCount++;
@@ -4032,27 +4184,10 @@ export class ChatAdapter {
         const safeTasks = tasks.filter(item => !fence.changed(item.id) && !fence.workerChanged(item));
         // Re-key high-water marks when history resolves a provisional alias;
         // renaming the same occurrence is not discovery of a new worker.
-        const progressAliases = new Map<string, WorkerRecoveryProgress>();
-        for (const known of projection.filter(item => item.type === "background_task")) {
-          const marker = recovery.progress.get(known.id);
-          if (!marker || known.type !== "background_task") continue;
-          for (const alias of workerRecoveryAliases(known)) progressAliases.set(alias, mergeWorkerRecoveryProgress(progressAliases.get(alias), marker));
-        }
+        const progressAliases = this.backgroundProgressAliases(recovery, projection);
         let progress = false;
         for (const item of safeTasks) {
-          const aliases = workerRecoveryAliases(item);
-          let previous = recovery.progress.get(item.id);
-          for (const alias of aliases) {
-            const known = progressAliases.get(alias);
-            if (known) previous = mergeWorkerRecoveryProgress(previous, known);
-          }
-          // An uncertain canonical row can retire a confirmed placeholder.
-          // Transfer its prior evidence before pruning, without advancing it.
-          const marker = item.stateUncertain ? previous : mergeWorkerRecoveryProgress(previous, workerRecoveryProgress(item));
-          if (!marker) continue;
-          if (marker !== previous) progress = true;
-          recovery.progress.set(item.id, marker);
-          for (const alias of aliases) progressAliases.set(alias, mergeWorkerRecoveryProgress(progressAliases.get(alias), marker));
+          if (this.recordBackgroundProgress(recovery, item, progressAliases, undefined, true)) progress = true;
         }
         const { byId, supersedes } = indexRecoveredBackgroundTasks(safeTasks);
         for (const known of projection.items()) {
@@ -4116,8 +4251,17 @@ export class ChatAdapter {
         if (recovery.failures) {
           recovery.timer = setTimeout(() => { recovery.timer = undefined; this.drainBackgroundRecoveries(); }, Math.min(30_000, 1_000 * 2 ** Math.min(5, recovery.failures - 1)));
           recovery.timer.unref?.();
-        } else if (recovery.inconclusiveReads >= BACKGROUND_INCONCLUSIVE_READ_LIMIT) this.backgroundRecoveries.delete(id);
-        else if (recovery.inconclusiveReads) {
+        } else if (recovery.inconclusiveReads >= BACKGROUND_INCONCLUSIVE_READ_LIMIT) {
+          recovery.exhaustedAt = Date.now();
+          // Remember recovered knowledge without treating the read itself as
+          // a source-progress exception or extending the exhausted budget.
+          this.seedBackgroundSource(id, recovery);
+          recovery.dirty = false;
+          // Keep parked recency for bounded eviction, with no runnable entry
+          // or self-scheduled probe until an eligible external trigger arrives.
+          this.backgroundRecoveries.delete(id);
+          this.backgroundRecoveries.set(id, recovery);
+        } else if (recovery.inconclusiveReads) {
           recovery.timer = setTimeout(() => { recovery.timer = undefined; this.drainBackgroundRecoveries(); }, recovery.dirty ? BACKGROUND_DIRTY_RETRY_MS : 1_000 * 2 ** (recovery.inconclusiveReads - 1));
           recovery.timer.unref?.();
         } else if (!recovery.dirty && generation === this.backgroundStreamGeneration) this.backgroundRecoveries.delete(id);
@@ -4565,6 +4709,7 @@ export class ChatAdapter {
       // Evicted conversations lose their replay ring; a returning client's
       // stale cursor resolves to a retention-gap resync, which is safe.
       this.projections.delete(candidateId);
+      if (this.backgroundRecoveries.get(candidateId)?.exhaustedAt !== undefined) this.retireBackgroundRecovery(candidateId);
       this.configurations.delete(candidateId);
       forgetAttributions(this.attributionEpochs, candidateId);
       forgetAttributions(this.attributionArrivals, candidateId);

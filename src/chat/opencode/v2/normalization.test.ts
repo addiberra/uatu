@@ -7,6 +7,7 @@ import { createOpenCodeV2Memory, createOpenCodeV2Normalizer, formFieldToQuestion
 import { parseConversationItem } from "../../validation";
 import type { NormalizedProviderEvent, NormalizedProviderUpdate } from "../../provider";
 import { compactWorkers } from "../../compact-work";
+import { BackgroundControls, BackgroundWorkers, prepareTool } from "./background";
 
 test("only assistant execution metadata reports effort, live and stored, not parent/user selection", () => {
   const normalize = createOpenCodeV2Normalizer(process.cwd());
@@ -45,6 +46,91 @@ function run(events: Array<Record<string, unknown>>, memory: OpenCodeV2Memory = 
 function upserts(entry: NormalizedProviderEvent) {
   return entry.updates.filter((update): update is Extract<NormalizedProviderUpdate, { kind: "upsert" }> => update.kind === "upsert").map(update => update.item);
 }
+
+for (const [count, characters] of [[69, 30 * 1024], [2100, 1]]) test(`typed user-shell notes ${count}x${characters} preserve later worker-control admission`, () => {
+  const controls = new BackgroundControls(), memory = createOpenCodeV2Memory({ controls });
+  const normalize = createOpenCodeV2Normalizer(WORKSPACE);
+  const birth = FIXTURES.formsShellRenameDelete.find(event => event.type === "shell.created")!;
+  const ended = FIXTURES.formsShellRenameDelete.find(event => event.type === "session.shell.ended")!;
+  const notice = FIXTURES.formsShellRenameDelete.find(event => event.type === "session.inbox.enqueued" && (event.data as any).item.payload?.metadata?.source === "shell")!;
+  const apply = (raw: Record<string, unknown>) => {
+    const prepared = normalize.prepare(raw, memory, controls);
+    controls.observe(prepared.evidence, true, prepared.notification, prepared.notificationProof);
+    memory.workers.enforceBudget();
+    const normalized = normalize.prepared(prepared, memory);
+    memory.workers.enforceBudget();
+    return normalized;
+  };
+  for (let index = 0; index < count; index++) {
+    const created = structuredClone(birth) as any;
+    created.id = `birth-${index}`; created.created += index * 2;
+    created.data.info.id = `sh-${index}`;
+    expect(apply(created).updates).toEqual([]);
+    const terminal = structuredClone(ended) as any;
+    terminal.id = `end-${index}`; terminal.created += index * 2;
+    terminal.data.shell.id = `sh-${index}`;
+    terminal.data.output.output = "x".repeat(characters);
+    terminal.data.output.size = terminal.data.output.cursor = characters;
+    expect(upserts(apply(terminal))).toContainEqual(expect.objectContaining({ type: "command", output: "x".repeat(characters) }));
+    const report = structuredClone(notice) as any;
+    report.id = `evt-${index}`; report.created += index * 2;
+    report.data.inboxID = `msg-${index}`;
+    report.data.item.payload.metadata.shellID = terminal.data.shell.id;
+    // Deliberately no user-command prose: classification needs the typed event.
+    report.data.item.payload.text = "x".repeat(characters);
+    expect(apply(report).updates).toEqual([]);
+  }
+  expect(memory.workers.controlEvidenceAvailable).toBe(true);
+  const parent = (notice.data as any).sessionID;
+  const workers = new BackgroundWorkers();
+  const part = prepareTool({ id: "later", name: "shell", time: { created: 1, completed: 2 }, state: { status: "completed",
+    input: { command: "fixture" }, metadata: { shellID: "later-shell", status: "running" } } }, 1, "snapshot", "later-message");
+  const update = workers.launchPrepared(parent, part, 1)[0]!;
+  if (update.kind !== "upsert" || update.item.type !== "background_task") throw new Error("expected later worker");
+  expect(controls.project(update.item, workers.occurrence(update.item.taskId)).stateUncertain).toBe(false);
+  expect(controls.proof(update.item.taskId)).toBeDefined();
+  expect(controls.usage.bytes).toBeLessThanOrEqual(1024 * 1024);
+  expect(controls.usage.entries).toBeLessThanOrEqual(2_048);
+});
+
+test("only an ephemeral shell.created envelope supplies native shell birth, not durable user-shell transcript", () => {
+  const normalize = createOpenCodeV2Normalizer(WORKSPACE);
+  const birth = FIXTURES.formsShellRenameDelete.find(event => event.type === "shell.created")!;
+  expect(normalize.prepare(birth).evidence.shellBirth).toMatchObject({ id: (birth.data as any).info.id,
+    parent: (birth.data as any).info.metadata.sessionID, proof: { id: birth.id, created: birth.created } });
+  expect(normalize.prepare({ ...birth, durable: { aggregateID: "parent", seq: 1, version: 1 } }).evidence.shellBirth).toBeUndefined();
+  for (const raw of FIXTURES.formsShellRenameDelete.filter(event => /^session\.shell\./.test(String(event.type)))) expect(normalize.prepare(raw).evidence.shellBirth).toBeUndefined();
+});
+
+test("native shell birth and canonical launcher bind the exact command without retaining another command body", () => {
+  const normalize = createOpenCodeV2Normalizer(WORKSPACE);
+  const birth = structuredClone(FIXTURES.formsShellRenameDelete.find(event => event.type === "shell.created")!) as any;
+  const command = 'printf "quoted\\n😀"';
+  birth.data.info.command = command;
+  const tool = (input: unknown) => prepareTool({ id: "call", name: "shell", state: { status: "completed", input, metadata: { shellID: birth.data.info.id, status: "running" } } }, 1, "snapshot", "message");
+  const native = normalize.prepare(birth).evidence.shellBirth!;
+  expect(native.commandFingerprint).toMatch(/^[a-f0-9]{64}$/);
+  expect(native.commandFingerprint).toBe(tool({ command }).fact.commandFingerprint);
+  expect(native.commandFingerprint).not.toBe(tool({ command: `${command} ` }).fact.commandFingerprint);
+  expect(native).not.toHaveProperty("command");
+  for (const missing of [undefined, null, 1, {}]) {
+    birth.data.info.command = missing;
+    expect(normalize.prepare(birth).evidence.shellBirth?.commandFingerprint).toBeUndefined();
+    expect(tool({ command: missing }).fact.commandFingerprint).toBeUndefined();
+  }
+  expect(tool({}).fact.commandFingerprint).toBeUndefined();
+});
+
+test("user-shell classification requires an owned typed command, not prose, metadata absence or a foreign transcript", () => {
+  const normalize = createOpenCodeV2Normalizer(WORKSPACE), memory = createOpenCodeV2Memory();
+  const notice = FIXTURES.formsShellRenameDelete.find(event => event.type === "session.inbox.enqueued" && (event.data as any).item.payload?.metadata?.source === "shell")!;
+  const ended = FIXTURES.formsShellRenameDelete.find(event => event.type === "session.shell.ended")!;
+  expect(normalize.prepare(notice, memory).notification?.userShell).toBeUndefined();
+  normalize({ ...ended, location: { directory: "/foreign" } }, memory);
+  expect(normalize.prepare(notice, memory).notification?.userShell).toBeUndefined();
+  normalize(ended, memory);
+  expect(normalize.prepare(notice, memory).notification?.userShell).toBe(true);
+});
 
 test("native creation evidence retains envelope proof and confinement without inventing payload clocks", () => {
   const normalize = createOpenCodeV2Normalizer(WORKSPACE);

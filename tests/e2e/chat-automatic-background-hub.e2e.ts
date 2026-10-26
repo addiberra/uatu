@@ -1,11 +1,11 @@
 import { test, expect, childChatControl, openSessionTab, signIn } from "./hub-fixtures";
 import { openChatPanel } from "./chat-helpers";
-import type { BrowserContext } from "@playwright/test";
+import type { BrowserContext, Page, Request } from "@playwright/test";
 import type { HubE2EInfo } from "./hub-fixtures";
 
 test.use({ hubChatPolicy: true, hubWorkspaces: ["automatic"] });
 
-async function setup(hub: HubE2EInfo, hubContext: BrowserContext) {
+async function setup(hub: HubE2EInfo, hubContext: BrowserContext, beforeInitialPrompt?: (page: Page) => Promise<void>) {
   const workspace = hub.workspaces[0]!;
   await childChatControl(workspace, { action: "agents", stack: "opencode-v2", backgroundPreview: true });
   const page = await openSessionTab(hubContext, workspace);
@@ -13,12 +13,23 @@ async function setup(hub: HubE2EInfo, hubContext: BrowserContext) {
   await page.getByRole("button", { name: "New conversation" }).click();
   await expect(page.locator("#chat-conversation-select")).not.toHaveValue("");
   const conversationId = await page.locator("#chat-conversation-select").inputValue();
+  if (beforeInitialPrompt) await beforeInitialPrompt(page);
   await page.locator("#chat-input").fill("Start fixture turn");
   await page.locator("#chat-send").click();
   await expect(page.locator("#chat-stop")).toBeEnabled();
   const base = `${workspace.sessionUrl}api/chat/conversations/${encodeURIComponent(conversationId)}`;
   const post = (path: string, data: object) => hubContext.request.post(base + path, { data, headers: { origin: hub.origin } });
   return { workspace, page, conversationId, base, post };
+}
+
+async function submitComposerSteer(page: Page, base: string, afterArmed?: () => void) {
+  const submitted = page.waitForRequest(request => request.url() === `${base}/prompts` && request.method() === "POST");
+  const clicked = page.locator("#chat-send").click();
+  afterArmed?.();
+  await clicked;
+  const response = await (await submitted).response();
+  expect(response).not.toBeNull();
+  return response!;
 }
 
 test("side-reader workspace navigation preserves the Hub workspace prefix and page-local answer", async ({ hub, hubContext }) => {
@@ -54,28 +65,66 @@ test("side-reader workspace navigation preserves the Hub workspace prefix and pa
   expect(after.calls.slice(before.calls.length).filter(call => call.startsWith("POST"))).toEqual([expect.stringMatching(/\/generate$/)]);
 });
 
-test("trusted personal ON backgrounds once after actual composer steer admission through the real provider stack", async ({ hub, hubContext }) => {
-  const { workspace, page, conversationId } = await setup(hub, hubContext);
-  await childChatControl(workspace, { action: "opencode", op: "launchShell", conversationId, background: false });
-  // A fresh device's established delivery default is steer.
-  await page.locator("#chat-input").fill("Steer fixture turn");
-  const admitted = page.waitForResponse(response => response.url().endsWith("/prompts") && response.request().method() === "POST");
-  await page.locator("#chat-send").click();
-  expect(await (await admitted).json()).toMatchObject({ pending: true, delivery: "steer", automaticBackground: "accepted" });
-  await expect(page.locator("#chat-action-feedback")).toBeHidden();
-  const state = await childChatControl(workspace, { action: "opencode", op: "state" }) as { calls: string[] };
-  const mutations = state.calls.filter(call => call.startsWith("POST "));
-  const prompt = mutations.findLastIndex(call => call.includes("/prompt"));
-  const background = mutations.findIndex(call => call.includes("/background"));
-  expect(prompt).toBeGreaterThanOrEqual(0);
-  expect(background).toBeGreaterThan(prompt);
-  expect(mutations.filter(call => call.includes("/background"))).toHaveLength(1);
-  expect(mutations.filter(call => call.includes("/prompt"))).toHaveLength(2);
-  expect(mutations.filter(call => call.includes("/interrupt"))).toHaveLength(0);
-  await expect(page.locator("#chat-input")).toHaveValue("");
-  await childChatControl(workspace, { action: "opencode", op: "finish", conversationId });
-  await expect(page.locator("#chat-stop")).toBeDisabled();
-  await expect(page.locator("#chat-action-feedback")).toBeHidden();
+for (const heldInitialResponse of [false, true]) test(`trusted personal ON backgrounds once after actual composer steer admission through the real provider stack${heldInitialResponse ? " with the initial browser response held" : ""}`, async ({ hub, hubContext }) => {
+  let initialRequest: Request | undefined;
+  let fetchedInitial!: () => void, releaseInitial!: () => void, finishedInitial!: () => void;
+  const initialFetched = new Promise<void>(resolve => { fetchedInitial = resolve; });
+  const initialReleased = new Promise<void>(resolve => { releaseInitial = resolve; });
+  const initialFinished = new Promise<void>(resolve => { finishedInitial = resolve; });
+  try {
+    const preference = await hubContext.request.get(`${hub.origin}/api/hub/settings/chat-preferences`).then(response => response.json());
+    expect(preference.autoBackgroundOnSteer).toBe(true);
+    const { workspace, page, conversationId, base } = await setup(hub, hubContext, heldInitialResponse ? async page => {
+      await page.route("**/prompts", async route => {
+        if (initialRequest || route.request().method() !== "POST") { await route.continue(); return; }
+        initialRequest = route.request();
+        try {
+          // Hold only the real browser response. Native admission and SSE stay
+          // live; no payload, policy header or acknowledgement is manufactured.
+          const response = await route.fetch();
+          fetchedInitial();
+          await initialReleased;
+          await route.fulfill({ response });
+        } finally { finishedInitial(); }
+      });
+    } : undefined);
+    if (heldInitialResponse) {
+      await initialFetched;
+      const native = await childChatControl(workspace, { action: "opencode", op: "state" }) as { sessions: Record<string, { running: boolean }> };
+      expect(native.sessions[conversationId.replace(/^opencode:/, "")]!.running).toBe(true);
+    }
+    await childChatControl(workspace, { action: "opencode", op: "launchShell", conversationId, background: false });
+    // A fresh device's established delivery default is steer.
+    await page.locator("#chat-input").fill("Steer fixture turn");
+    if (heldInitialResponse) await expect(page.locator("#chat-send")).toBeDisabled();
+    // Both variants exercise the same waiter and real click. Release the
+    // initial response only after the second transaction waiter is armed.
+    const admitted = await submitComposerSteer(page, base, heldInitialResponse ? releaseInitial : undefined);
+    expect(await admitted.json()).toMatchObject({ pending: true, delivery: "steer", automaticBackground: "accepted" });
+    expect(admitted.request().postDataJSON().delivery).toBe("steer");
+    if (heldInitialResponse) {
+      expect(initialRequest!.postDataJSON().delivery).toBe("steer");
+      expect(admitted.request()).not.toBe(initialRequest);
+      expect(admitted.request().postDataJSON().requestId).not.toBe(initialRequest!.postDataJSON().requestId);
+    }
+    await expect(page.locator("#chat-action-feedback")).toBeHidden();
+    const state = await childChatControl(workspace, { action: "opencode", op: "state" }) as { calls: string[] };
+    const mutations = state.calls.filter(call => call.startsWith("POST "));
+    const prompt = mutations.findLastIndex(call => call.includes("/prompt"));
+    const background = mutations.findIndex(call => call.includes("/background"));
+    expect(prompt).toBeGreaterThanOrEqual(0);
+    expect(background).toBeGreaterThan(prompt);
+    expect(mutations.filter(call => call.includes("/background"))).toHaveLength(1);
+    expect(mutations.filter(call => call.includes("/prompt"))).toHaveLength(2);
+    expect(mutations.filter(call => call.includes("/interrupt"))).toHaveLength(0);
+    await expect(page.locator("#chat-input")).toHaveValue("");
+    await childChatControl(workspace, { action: "opencode", op: "finish", conversationId });
+    await expect(page.locator("#chat-stop")).toBeDisabled();
+    await expect(page.locator("#chat-action-feedback")).toBeHidden();
+  } finally {
+    releaseInitial();
+    if (initialRequest) await initialFinished;
+  }
 });
 
 test("a Settings-only read failure does not promise saved ON automation is disabled in another tab", async ({ hub, hubContext }) => {
