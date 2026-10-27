@@ -75,6 +75,7 @@ export class OpenCodeV2Provider implements ChatProvider {
   // Only verified, workspace-confined parentage is reusable; never session
   // status, cost, timestamps, or failed checks. Match the live worker budget.
   private readonly childParents = new HistoryReuse<readonly [string, string]>(4 * 1024 * 1024, 8_192);
+  private readonly childParentReads = new Map<string, { controller: AbortController; promise: Promise<readonly [string, string]>; users: number; settled: boolean }>();
   // Provider-wide admission, including recovery and final Stop validation.
   // Timed-out wrappers do not free slots held by an uncooperative transport.
   private childLookupsOutstanding = 0;
@@ -617,8 +618,12 @@ export class OpenCodeV2Provider implements ChatProvider {
     return AbortSignal.any([this.readLifetime.signal, ...(this.streamReads ? [this.streamReads.signal] : []), ...(signal ? [signal] : [])]);
   }
 
-  private invalidateChildParents(): void {
-    this.childParents.invalidate();
+  private invalidateChildParents(child?: string): void {
+    this.childParents.invalidate(child);
+    // Existing readers retain their independent lifecycle/ownership guards.
+    // Invalidating reuse for a sibling event must not cancel their requests.
+    if (child === undefined) this.childParentReads.clear();
+    else this.childParentReads.delete(child);
   }
 
   private bindStopChild(validation: StopValidation, child: string): void {
@@ -818,19 +823,36 @@ export class OpenCodeV2Provider implements ChatProvider {
   }
 
   private async verifiedChild(child: string, parent: string, signal: AbortSignal): Promise<boolean> {
+    signal.throwIfAborted();
     if (child.length > 512 || parent.length > 512) return false;
     // Four recovery batches of four readers; no pending guard queue. These
     // scoped guards retire with their wrappers, not the underlying I/O slots.
     if (this.ownershipChecks.size + this.controls.activeReads >= 16) throw new Error("Child ownership check capacity unavailable");
     const check: OwnershipCheck = { child, parent, changed: false };
     this.ownershipChecks.add(check);
+    let read = this.childParentReads.get(child);
+    if (!read) {
+      // The shared lookup belongs to its readers collectively, not the first
+      // caller's deadline or expected parent. Each reader checks its own parent.
+      const controller = new AbortController();
+      const sharedSignal = this.readSignal(controller.signal);
+      const promise = this.childParents.read(child, this.streamConnected ? String(this.streamGeneration) : undefined, async () => {
+        const info = await this.lookupChild(child, sharedSignal);
+        const actualParent = stringValue(info?.parentID);
+        if (!actualParent || ![...this.ownershipChecks].some(check => check.child === child && check.parent === actualParent && !check.changed)) throw UNVERIFIED_CHILD;
+        return [child, actualParent] as const;
+      });
+      read = { controller, promise, users: 0, settled: false };
+      this.childParentReads.set(child, read);
+      const owned = read;
+      void promise.finally(() => {
+        owned.settled = true;
+        if (this.childParentReads.get(child) === owned) this.childParentReads.delete(child);
+      }).catch(() => undefined);
+    }
+    read.users++;
     try {
-      const owner = await this.coveredRead(signal, () => this.childParents.read(child,
-        this.streamConnected ? String(this.streamGeneration) : undefined, async () => {
-          const info = await this.lookupChild(child, signal);
-          if (info?.parentID !== parent) throw UNVERIFIED_CHILD;
-          return [child, parent] as const;
-        }));
+      const owner = await this.coveredRead(signal, () => read.promise);
       if (check.changed) throw new Error("Child ownership changed during read");
       return owner[1] === parent;
     } catch (error) {
@@ -838,6 +860,13 @@ export class OpenCodeV2Provider implements ChatProvider {
       throw error;
     } finally {
       this.ownershipChecks.delete(check);
+      if (--read.users === 0 && !read.settled) {
+        read.controller.abort();
+        if (this.childParentReads.get(child) === read) {
+          this.childParentReads.delete(child);
+          this.childParents.invalidate(child);
+        }
+      }
     }
   }
 
@@ -977,7 +1006,7 @@ export class OpenCodeV2Provider implements ChatProvider {
           this.observeStopEvent(evidence);
           if (evidence.lifecycle?.kind === "session.created") {
             const id = evidence.lifecycle.id;
-            if (id) this.childParents.invalidate(id);
+            if (id) this.invalidateChildParents(id);
           }
           // Membership changes invalidate even when the new location is
           // foreign or absent; a sparse deletion cannot authorize old facts.

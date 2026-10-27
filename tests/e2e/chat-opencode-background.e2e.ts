@@ -18,6 +18,113 @@ async function revealTouchWorkers(page: Page) {
 const liveWorkerInspections = '#chat-compact-workers-items .chat-worker-row:is([data-state="working"], [data-state="unknown"]) [data-inspect-task]';
 const activeTask = (page: Page, taskId: string) => page.locator(`.chat-worker-row:is([data-state="working"], [data-state="unknown"])[data-background-task="${taskId}"]`);
 
+for (const engine of ["chromium", "webkit"] as const) test(`large resumed-worker recovery does not loop while reading: ${engine}`, async ({ launchBrowser, request, baseURL }) => {
+  const browser = await launchBrowser(engine);
+  const page = await browser.newPage({ baseURL, viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true, reducedMotion: "reduce" });
+  try {
+    const conversationId = await boot(page, request);
+    const worker = await control(request, { op: "launchWorker", conversationId });
+    await control(request, { op: "settleWorker", childId: worker.childId, text: "Large worker result. ".repeat(14_000) });
+    const resumed = await control(request, { op: "launchWorker", conversationId, childId: worker.childId });
+    await control(request, { op: "appendHistory", conversationId, count: 60 });
+    await page.reload();
+    await page.locator("#touch-tab-chat").tap();
+    await expect(page.locator("#chat-items")).toContainText("Historical fixture answer 59");
+    await revealTouchWorkers(page);
+    await expect(activeTask(page, resumed.taskId)).toBeVisible();
+    await control(request, { op: "workerReport", childId: worker.childId, usedModel: "Before recovery", usedEffort: "high", costUsd: 0.001 });
+    await expect(activeTask(page, resumed.taskId).locator(".chat-worker-model-name")).toHaveText("Before recovery");
+    await page.locator("#chat-input").fill("Keep this draft through recovery");
+    const timeline = page.locator("#chat-timeline");
+    await timeline.evaluate(node => {
+      for (const [type, y] of [["touchstart", 100], ["touchmove", 200]] as const) {
+        const event = new Event(type, { bubbles: true });
+        Object.defineProperty(event, "touches", { value: [{ identifier: 1, clientY: y }] });
+        node.dispatchEvent(event);
+      }
+      node.scrollTop = (node.scrollHeight - node.clientHeight) / 2;
+      node.dispatchEvent(new Event("touchend", { bubbles: true }));
+    });
+    const anchor = await timeline.evaluate(async node => {
+      let previous = "", stable = 0;
+      for (let frame = 0; frame < 120; frame++) {
+        await new Promise<void>(resolve => requestAnimationFrame(() => resolve()));
+        const top = node.getBoundingClientRect().top;
+        const row = [...node.querySelectorAll<HTMLElement>("[data-chat-item-id]")].find(row => row.getBoundingClientRect().top >= top)!;
+        const anchor = { id: row.dataset.chatItemId!, offset: row.getBoundingClientRect().top - top };
+        const geometry = JSON.stringify([node.scrollTop, node.scrollHeight, anchor]);
+        stable = geometry === previous ? stable + 1 : 0;
+        if (stable === 3) return anchor;
+        previous = geometry;
+      }
+      throw new Error("Reader geometry never settled before recovery");
+    });
+    let reads = 0;
+    page.on("request", request => {
+      const url = new URL(request.url());
+      if (request.method() === "GET" && decodeURIComponent(url.pathname).endsWith(`/api/chat/conversations/${conversationId}`) && !url.searchParams.has("cursor")) reads++;
+    });
+    await control(request, { op: "holdNextMessageRead", conversationId });
+    // A native restatement invalidates the connected-generation history cache.
+    await control(request, { op: "appendHistory", conversationId, count: 0 });
+    await control(request, { op: "resync", conversationId });
+    await expect.poll(async () => (await control(request, { op: "state" })).heldMessageRead).toBe(conversationId.replace(/^opencode:/, ""));
+    await control(request, { op: "workerReport", childId: worker.childId, usedModel: "Concurrent recovery report", usedEffort: "high", costUsd: 0.001 });
+    await expect.poll(async () => (await control(request, { op: "state", conversationId })).workerModels).toContain("Concurrent recovery report");
+    await control(request, { op: "releaseMessageRead" });
+    await expect(activeTask(page, resumed.taskId).locator(".chat-worker-model-name")).toHaveText("Concurrent recovery report");
+    await expect(page.locator('#chat-timeline[aria-busy="true"]')).toHaveCount(0);
+    // A fresh native update proves that recovery reattached a usable stream.
+    await control(request, { op: "workerReport", childId: worker.childId, usedModel: "After recovery", usedEffort: "medium", costUsd: 0.001 });
+    await expect(activeTask(page, resumed.taskId).locator(".chat-worker-model-name")).toHaveText("After recovery");
+    expect(reads).toBe(1);
+    await expect(page.locator("#chat-input")).toHaveValue("Keep this draft through recovery");
+    await expect.poll(() => timeline.evaluate((node, anchor) => {
+      const row = node.querySelector<HTMLElement>(`[data-chat-item-id="${CSS.escape(anchor.id)}"]`);
+      return row ? Math.abs(row.getBoundingClientRect().top - node.getBoundingClientRect().top - anchor.offset) : Infinity;
+    }, anchor)).toBeLessThan(2);
+  } finally {
+    await control(request, { op: "releaseMessageRead" });
+    await page.close(); await browser.close();
+  }
+});
+
+for (const engine of ["chromium", "webkit"] as const) test(`scrolling parent and child during worker reports does not restart snapshots: ${engine}`, async ({ launchBrowser, request, baseURL }) => {
+  const browser = await launchBrowser(engine);
+  const page = await browser.newPage({ baseURL, viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true });
+  try {
+    const conversationId = await boot(page, request);
+    const worker = await control(request, { op: "launchWorker", conversationId });
+    await control(request, { op: "appendHistory", conversationId, count: 60 });
+    await page.reload();
+    await page.locator("#touch-tab-chat").tap();
+    await expect(page.locator("#chat-items")).toContainText("Historical fixture answer 59");
+    await revealTouchWorkers(page);
+    await activeTask(page, worker.taskId).locator("[data-inspect-task]").click();
+    await expect(page.locator("#chat-drilldown-items")).toContainText("Check fixture");
+    const reads: string[] = [];
+    page.on("request", request => {
+      const url = new URL(request.url());
+      if (request.method() === "GET" && /\/api\/chat\/conversations\/[^/]+$/.test(url.pathname) && !url.searchParams.has("cursor")) reads.push(url.pathname);
+    });
+    for (let report = 0; report < 8; report++) {
+      await page.locator("#chat-drilldown-timeline").evaluate(node => {
+        node.dispatchEvent(new WheelEvent("wheel", { deltaY: -100, bubbles: true }));
+        node.scrollTop = Math.max(0, node.scrollTop - 100);
+      });
+      await control(request, { op: "workerReport", childId: worker.childId, usedModel: `Report ${report}`, usedEffort: "high", costUsd: report / 1000 });
+      await expect(page.locator("#chat-drilldown-task")).not.toContainText("Status unavailable");
+    }
+    await page.keyboard.press("Escape");
+    for (let scroll = 0; scroll < 8; scroll++) await page.locator("#chat-timeline").evaluate(node => {
+      node.dispatchEvent(new WheelEvent("wheel", { deltaY: -100, bubbles: true }));
+      node.scrollTop = Math.max(0, node.scrollTop - 100);
+    });
+    expect(reads.filter(path => decodeURIComponent(path).endsWith(`/${conversationId}`))).toEqual([]);
+    await expect(page.locator('#chat-timeline[aria-busy="true"]')).toHaveCount(0);
+  } finally { await page.close(); await browser.close(); }
+});
+
 for (const width of [320, 390, 1280]) for (const colorScheme of ["light", "dark"] as const) {
   test(`worker latest effort and session cost at ${width}px ${colorScheme}`, async ({ browser, request, baseURL }, info) => {
     const page = await browser.newPage({ baseURL, viewport: { width, height: 900 }, hasTouch: width < 600, isMobile: width < 600, colorScheme });

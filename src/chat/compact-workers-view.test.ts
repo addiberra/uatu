@@ -1,7 +1,40 @@
 import { expect, spyOn, test } from "bun:test";
 import { parseHTML } from "linkedom";
-import { compactWorkers, type CompactWorker } from "./compact-work";
+import { compactWorkers, workerSummary, type CompactWorker } from "./compact-work";
 import { CompactWorkersView } from "./compact-workers-view";
+
+test.each(["agent", "shell"] as const)("uncertain %s stays inspectable without Stop or a confirmed-working indicator", taskType => {
+  const { document, window } = parseHTML('<html><body><div id="workers"></div></body></html>');
+  const previous = new Map(["document", "Element"].map(key => [key, Reflect.get(globalThis, key)]));
+  Reflect.set(globalThis, "document", document); Reflect.set(globalThis, "Element", window.Element);
+  try {
+    const host = document.getElementById("workers")! as unknown as HTMLElement;
+    const view = new CompactWorkersView(host);
+    const items: import("./types").ConversationItem[] = [
+      { type: "background_task", id: "finished", taskId: "finished", taskType: "agent", description: "Finished worker", status: "completed", createdAt: 1 },
+      { type: "background_task", id: "active", taskId: "active", taskType, childConversationId: taskType === "agent" ? "child" : undefined, description: "Active worker", status: "running", createdAt: 2 },
+    ];
+    view.paint("parent", compactWorkers(items), new Set(), true);
+    const row = host.querySelector<HTMLElement>('[data-worker-id="active"]')!;
+    expect(row.querySelector("[data-stop-task]")).not.toBeNull();
+    const uncertain = compactWorkers(items.map(item => item.id === "active" ? { ...item, stateUncertain: true } : item));
+    view.paint("parent", uncertain, new Set(), true);
+    expect(workerSummary(uncertain)).toBe("1 finished · 1 unknown");
+    expect(row.dataset.state).toBe("unknown");
+    expect(row.querySelector("[data-inspect-task]")).not.toBeNull();
+    expect(row.querySelector(".chat-worker-glyph")!.textContent).toBe("◌");
+    expect(row.querySelector(".chat-worker-inspect")!.getAttribute("aria-label")).toMatch(/ · unknown(?: ·|$)/);
+    expect(row.querySelector(".chat-worker-inspect")!.getAttribute("aria-label")).not.toContain("working");
+    expect(row.querySelectorAll("[data-stop-task]").length).toBe(0);
+    const coldHost = document.createElement("div") as unknown as HTMLElement;
+    new CompactWorkersView(coldHost).paint("parent", uncertain, new Set(), true);
+    expect(coldHost.querySelectorAll("[data-stop-task]").length).toBe(0);
+    view.paint("parent", compactWorkers(items), new Set(), true);
+    expect(row.querySelector("[data-stop-task]")).not.toBeNull();
+  } finally {
+    for (const [key, value] of previous) Reflect.set(globalThis, key, value);
+  }
+});
 
 test("reported clock has its own suffix and the full kind and provenance remain in the metadata title", () => {
   const { document, window } = parseHTML('<html><body><div id="workers"></div></body></html>');
@@ -229,8 +262,8 @@ test.each(["unknown", "stopping", "completed", "removed", "dismiss"] as const)("
     view.paint("parent", transition === "removed" || transition === "dismiss" ? [] : [{ ...worker, state: transition === "stopping" ? "working" : transition }], transition === "stopping" ? new Set(["native"]) : new Set(), true);
     expect(focused).toBe(fallback);
     expect(focus).toHaveBeenCalledWith({ preventScroll: true });
-    if (transition === "unknown" || transition === "stopping") expect(stop!.disabled).toBe(true);
-    if (transition === "completed" || transition === "removed") expect(stop!.isConnected).toBe(false);
+    if (transition === "stopping") expect(stop!.disabled).toBe(true);
+    if (transition === "unknown" || transition === "completed" || transition === "removed") expect(stop!.isConnected).toBe(false);
     if (transition === "dismiss") expect(dismiss.hidden).toBe(true);
     focus.mockRestore();
   } finally { for (const [key, value] of previous) Reflect.set(globalThis, key, value); }

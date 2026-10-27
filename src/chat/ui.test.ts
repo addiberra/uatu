@@ -3741,7 +3741,7 @@ describe("chat running work reachable without a disclosure", () => {
       initChat(api);
       await waitUntil(() => stream !== undefined && !stop.disabled);
       expect(rows("unknown")).toHaveLength(1);
-      expect(document.querySelector<HTMLButtonElement>("[data-stop-task]")!.disabled).toBe(true);
+      expect(document.querySelector("[data-stop-task]")).toBeNull();
       expect(stop.getAttribute("aria-label")).toBe("Stop response");
       emit({ type: "item.upsert", item: { ...canonical, stateUncertain: false } });
       await waitUntil(() => rows("working").length === 1);

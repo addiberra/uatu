@@ -127,7 +127,7 @@ type InventorySessionMetadata = {
   title: string;
   deleted: boolean;
 };
-type HistoryCoverage = { signal: AbortSignal; assertCurrent: () => void; dirty: () => boolean; revertExclusions: Set<string>; merge: (items: ConversationItem[]) => ConversationItem[]; changed: (id: string) => boolean; inboxReconciled: boolean; markInboxReconciled: () => void; steerCorrelations: ReadonlyMap<string, string> };
+type HistoryCoverage = { signal: AbortSignal; assertCurrent: () => void; dirty: () => boolean; revertExclusions: Set<string>; merge: (items: ConversationItem[]) => ConversationItem[]; changed: (id: string) => boolean; conversation: () => ConversationSummary | undefined; inboxReconciled: boolean; markInboxReconciled: () => void; steerCorrelations: ReadonlyMap<string, string> };
 class HistoryReadChangedError extends Error {}
 
 export class InteractionConflictError extends Error {
@@ -788,7 +788,7 @@ export class ChatAdapter {
           recovery.dirty = false;
           fence = this.projection(id).beginHistoryRead();
           try {
-            const snapshot = await this.readHistory(id, options, { signal, assertCurrent, dirty: () => recovery.dirty, revertExclusions, merge: fence.merge, changed: fence.changed, inboxReconciled, markInboxReconciled: () => { inboxReconciled = true; }, steerCorrelations });
+            const snapshot = await this.readHistory(id, options, { signal, assertCurrent, dirty: () => recovery.dirty, revertExclusions, merge: fence.merge, changed: fence.changed, conversation: fence.conversation, inboxReconciled, markInboxReconciled: () => { inboxReconciled = true; }, steerCorrelations });
             inboxReconciled = true;
             assertCurrent();
             if (!recovery.dirty) return snapshot;
@@ -1195,10 +1195,15 @@ export class ChatAdapter {
       projection.statusUpdate("scheduled");
     }
     return {
-      conversation: this.summary(session, projection.status),
-      configuration,
+      conversation: { ...(coverage?.conversation() ?? this.summary(session, projection.status)), status: projection.status },
+      configuration: coverage ? this.configurations.get(id) ?? configuration : configuration,
       generation: this.generation,
-      cursor: replayCursor,
+      // Covered native reads merge every projected change through the final
+      // synchronous handoff above. Their snapshot already contains recovery
+      // publications, including rows larger than the replay ring. Starting
+      // before those publications can force another full read on every event.
+      // Legacy reads have no change fence and still need the earlier cursor.
+      cursor: coverage ? projection.replay.latestCursor() : replayCursor,
       items,
       // A client joining or reloading mid-run gets the same held queue a
       // client that watched it build presents.
@@ -2390,7 +2395,7 @@ export class ChatAdapter {
             if (!metadata.inWorkspace) throw new ConversationNotFoundError();
             this.rememberInventorySession(session.id, metadata, true);
             conversation = this.summary(session, projection.status);
-            projection.replay.publish({ type: "conversation.updated", conversation });
+            projection.conversationUpdate(conversation);
           }
         } catch { /* cosmetic — listConversations repairs default titles later */ }
       }
@@ -2623,7 +2628,7 @@ export class ChatAdapter {
       if (!metadata.inWorkspace) throw new ConversationNotFoundError();
       this.rememberInventorySession(renamed.id, metadata, true);
       const conversation = this.summary(renamed);
-      this.projection(conversationId).replay.publish({ type: "conversation.updated", conversation });
+      this.projection(conversationId).conversationUpdate(conversation);
       return { conversation };
     });
   }
@@ -4800,18 +4805,19 @@ export class ConversationProjection {
   private readonly text = new ProviderTextReconciler();
   // Only concurrent covered reads retain change fences. No permanent removal
   // tombstones: each owner releases its set on completion, abort or deadline.
-  private readonly historyReads = new Set<{ changed: Set<string>; workerAliases: Set<string> }>();
+  private readonly historyReads = new Set<{ changed: Set<string>; workerAliases: Set<string>; conversation?: ConversationSummary }>();
   private replacementRevision = 0;
 
   beginHistoryRead() {
     const changed = new Set<string>();
     const workerAliases = new Set<string>();
-    const read = { changed, workerAliases };
+    const read: { changed: Set<string>; workerAliases: Set<string>; conversation?: ConversationSummary } = { changed, workerAliases };
     const revision = this.replacementRevision;
     this.historyReads.add(read);
     return {
       current: () => revision === this.replacementRevision,
       changed: (id: string) => changed.has(id),
+      conversation: () => read.conversation,
       workerChanged: (item: BackgroundTaskItem) => workerRecoveryAliases(item).some(alias => workerAliases.has(alias)),
       merge: (items: ConversationItem[]) => {
         const merged = new Map(items.map(item => [item.id, item]));
@@ -4997,6 +5003,11 @@ export class ConversationProjection {
     this.status = status;
     this.onStatus?.(status, sourceTransition);
     return this.replay.publish({ type: "conversation.status", status, message });
+  }
+
+  conversationUpdate(conversation: ConversationSummary): ChatEvent {
+    for (const read of this.historyReads) read.conversation = conversation;
+    return this.replay.publish({ type: "conversation.updated", conversation });
   }
 
   requirePending(requestId: string, type: "permission" | "question"): void {
