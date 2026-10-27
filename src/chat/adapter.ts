@@ -1198,6 +1198,7 @@ export class ChatAdapter {
       conversation: { ...(coverage?.conversation() ?? this.summary(session, projection.status)), status: projection.status },
       configuration: coverage ? this.configurations.get(id) ?? configuration : configuration,
       generation: this.generation,
+      // Keep final covered-read merge through cursor capture await-free.
       // Covered native reads merge every projected change through the final
       // synchronous handoff above. Their snapshot already contains recovery
       // publications, including rows larger than the replay ring. Starting

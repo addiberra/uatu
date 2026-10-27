@@ -829,38 +829,42 @@ export class OpenCodeV2Provider implements ChatProvider {
     // scoped guards retire with their wrappers, not the underlying I/O slots.
     if (this.ownershipChecks.size + this.controls.activeReads >= 16) throw new Error("Child ownership check capacity unavailable");
     const check: OwnershipCheck = { child, parent, changed: false };
+    let read = this.childParentReads.get(child), joined = false;
     this.ownershipChecks.add(check);
-    let read = this.childParentReads.get(child);
-    if (!read) {
-      // The shared lookup belongs to its readers collectively, not the first
-      // caller's deadline or expected parent. Each reader checks its own parent.
-      const controller = new AbortController();
-      const sharedSignal = this.readSignal(controller.signal);
-      const promise = this.childParents.read(child, this.streamConnected ? String(this.streamGeneration) : undefined, async () => {
-        const info = await this.lookupChild(child, sharedSignal);
-        const actualParent = stringValue(info?.parentID);
-        if (!actualParent || ![...this.ownershipChecks].some(check => check.child === child && check.parent === actualParent && !check.changed)) throw UNVERIFIED_CHILD;
-        return [child, actualParent] as const;
-      });
-      read = { controller, promise, users: 0, settled: false };
-      this.childParentReads.set(child, read);
-      const owned = read;
-      void promise.finally(() => {
-        owned.settled = true;
-        if (this.childParentReads.get(child) === owned) this.childParentReads.delete(child);
-      }).catch(() => undefined);
-    }
-    read.users++;
     try {
-      const owner = await this.coveredRead(signal, () => read.promise);
-      if (check.changed) throw new Error("Child ownership changed during read");
-      return owner[1] === parent;
-    } catch (error) {
-      if (error === UNVERIFIED_CHILD) return false;
-      throw error;
+      if (!read) {
+        // The shared lookup belongs to its readers collectively, not the first
+        // caller's deadline or expected parent. Each reader checks its own parent.
+        const controller = new AbortController();
+        const sharedSignal = this.readSignal(controller.signal);
+        const promise = this.childParents.read(child, this.streamConnected ? String(this.streamGeneration) : undefined, async () => {
+          const info = await this.lookupChild(child, sharedSignal);
+          const actualParent = stringValue(info?.parentID);
+          if (!actualParent || ![...this.ownershipChecks].some(check => check.child === child && check.parent === actualParent && !check.changed)) throw UNVERIFIED_CHILD;
+          return [child, actualParent] as const;
+        });
+        read = { controller, promise, users: 0, settled: false };
+        this.childParentReads.set(child, read);
+        const owned = read;
+        void promise.finally(() => {
+          owned.settled = true;
+          if (this.childParentReads.get(child) === owned) this.childParentReads.delete(child);
+        }).catch(() => undefined);
+      }
+      read.users++;
+      joined = true;
+      const joinedRead = read;
+      try {
+        const owner = await this.coveredRead(signal, () => joinedRead.promise);
+        if (check.changed) throw new Error("Child ownership changed during read");
+        return owner[1] === parent;
+      } catch (error) {
+        if (error === UNVERIFIED_CHILD) return false;
+        throw error;
+      }
     } finally {
       this.ownershipChecks.delete(check);
-      if (--read.users === 0 && !read.settled) {
+      if (joined && read && --read.users === 0 && !read.settled) {
         read.controller.abort();
         if (this.childParentReads.get(child) === read) {
           this.childParentReads.delete(child);

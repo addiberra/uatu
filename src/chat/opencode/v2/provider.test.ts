@@ -183,6 +183,94 @@ test("a cancelled child ownership reader does not cancel a concurrent history re
   } finally { release(); await Promise.allSettled([cancelled, ...(concurrent ? [concurrent] : [])]); await provider.dispose(); }
 });
 
+for (const matchingFirst of [false, true]) test(`cancelled matching-parent reader leaves foreign-parent ownership false (${matchingFirst ? "matching" : "foreign"} parent first)`, async () => {
+  const fixture = JSON.parse(readFileSync(path.join(import.meta.dir, "../../../../tests/fixtures/opencode-v2/background-2.0.29.json"), "utf8"));
+  let entered!: () => void, release!: () => void;
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const server = fakeOpenCode({
+    "GET /api/session/:id/message": () => ({ data: [fixture.launch], cursor: {} }),
+    "GET /api/session/:id": async ({ path, signal }) => {
+      const id = path.split("/").at(-1)!;
+      if (id !== "ses_child") return session(id);
+      entered(); await gate; signal.throwIfAborted();
+      return session(id, { parentID: "ses_parent" });
+    },
+  });
+  const provider = server.provider(), matching = new AbortController();
+  const state = provider as unknown as { ownershipChecks: Set<unknown>; childParentReads: Map<string, { users: number }> };
+  let cancelled: ReturnType<typeof provider.listMessages> | undefined, foreign: ReturnType<typeof provider.listMessages> | undefined;
+  const startMatching = () => { cancelled = provider.listMessages("ses_parent", { limit: 10, signal: matching.signal }); void cancelled.catch(() => undefined); };
+  const startForeign = () => { foreign = provider.listMessages("ses_other", { limit: 10 }); void foreign.catch(() => undefined); };
+  try {
+    (matchingFirst ? startMatching : startForeign)();
+    await started;
+    (matchingFirst ? startForeign : startMatching)();
+    const deadline = Date.now() + 1_000;
+    while (state.ownershipChecks.size < 2 && Date.now() < deadline) await Bun.sleep(0);
+    expect(state.ownershipChecks.size).toBe(2);
+    expect(state.childParentReads.get("ses_child")?.users).toBe(2);
+    matching.abort();
+    await expect(cancelled!).rejects.toThrow();
+    expect(state.ownershipChecks.size).toBe(1);
+    expect(state.childParentReads.get("ses_child")?.users).toBe(1);
+    expect(server.requests("GET", "/api/session/ses_child")[0]!.signal.aborted).toBe(false);
+    release();
+    expect((await foreign!).completeItems?.some(item => item.type === "background_task")).toBe(false);
+    expect(server.requests("GET", "/api/session/ses_child")).toHaveLength(1);
+    expect(server.requests("GET", "/api/session/ses_child/message")).toHaveLength(0);
+    expect(state.ownershipChecks.size).toBe(0);
+    expect(state.childParentReads.size).toBe(0);
+    expect(server.calls.every(call => call.method === "GET")).toBe(true);
+  } finally { release(); await Promise.allSettled([...(cancelled ? [cancelled] : []), ...(foreign ? [foreign] : [])]); await provider.dispose(); }
+});
+
+for (const setup of ["readSignal", "childParents.read"] as const) test(`synchronous child ownership ${setup} failure retires only its unjoined guard`, async () => {
+  let entered!: () => void, release!: () => void;
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const server = fakeOpenCode({
+    "GET /api/session/ses_child": async ({ signal }) => { entered(); await gate; signal.throwIfAborted(); return session("ses_child", { parentID: "ses_parent" }); },
+  });
+  const provider = server.provider();
+  // Inject only a synchronous setup fault; normal reads still use the real SDK.
+  const state = provider as unknown as {
+    verifiedChild(child: string, parent: string, signal: AbortSignal): Promise<boolean>;
+    readSignal(signal?: AbortSignal): AbortSignal;
+    childParents: { read(...args: unknown[]): Promise<readonly [string, string]> };
+    ownershipChecks: Set<unknown>;
+    childParentReads: Map<string, { users: number }>;
+  };
+  const signal = new AbortController().signal;
+  const existing = state.verifiedChild("ses_child", "ses_parent", signal);
+  let later: Promise<boolean> | undefined;
+  try {
+    await started;
+    const fault = setup === "readSignal" ? spyOn(state, "readSignal") : spyOn(state.childParents, "read");
+    fault.mockImplementation(() => { throw new Error("injected shared-read setup failure"); });
+    try {
+      // More failures than the guard capacity must not crowd out later checks.
+      for (let index = 0; index < 16; index++) {
+        await expect(state.verifiedChild("ses_failed", "ses_parent", signal)).rejects.toThrow("injected shared-read setup failure");
+        expect(state.ownershipChecks.size).toBe(1);
+        expect(state.childParentReads.size).toBe(1);
+        expect(state.childParentReads.get("ses_child")?.users).toBe(1);
+        expect(server.requests("GET", "/api/session/ses_child")[0]!.signal.aborted).toBe(false);
+      }
+    } finally { fault.mockRestore(); }
+    later = state.verifiedChild("ses_child", "ses_parent", signal);
+    expect(state.ownershipChecks.size).toBe(2);
+    expect(state.childParentReads.get("ses_child")?.users).toBe(2);
+    release();
+    expect(await existing).toBe(true);
+    expect(await later).toBe(true);
+    expect(state.ownershipChecks.size).toBe(0);
+    expect(state.childParentReads.size).toBe(0);
+    expect(server.requests("GET", "/api/session/ses_child")).toHaveLength(1);
+    expect(server.calls.every(call => call.method === "GET")).toBe(true);
+  } finally { release(); await Promise.allSettled([existing, ...(later ? [later] : [])]); await provider.dispose(); }
+});
+
 for (const foreignWorkspace of [false, true]) test(`shared child ownership checks each caller's parent (${foreignWorkspace ? "foreign workspace" : "foreign parent first"})`, async () => {
   const fixture = JSON.parse(readFileSync(path.join(import.meta.dir, "../../../../tests/fixtures/opencode-v2/background-2.0.29.json"), "utf8"));
   let entered!: () => void, release!: () => void;
