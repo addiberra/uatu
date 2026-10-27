@@ -454,8 +454,9 @@ export class OpenCodeV2Provider implements ChatProvider {
             if (previous.item.type === "background_task" && previous.item.resultId === item.resultId && id !== item.id) normalized.delete(id);
           }
         }
-        normalized.set(item.id, { item: item.type === "background_task" && item.status === "running" && item.childConversationId && unavailableChildren.has(item.childConversationId)
-          ? { ...item, stateUncertain: true } : item, index });
+        const unavailable = item.type === "background_task" && item.status === "running" && item.childConversationId && unavailableChildren.has(item.childConversationId);
+        if (unavailable && controlRead) this.controls.incompleteRead(controlRead);
+        normalized.set(item.id, { item: unavailable ? { ...item, stateUncertain: true } : item, index });
       }
     });
     for (const update of workers.finishHistory()) if (update.kind === "upsert") {
@@ -598,8 +599,10 @@ export class OpenCodeV2Provider implements ChatProvider {
       if (item.type !== "background_task") continue;
       if (item.status !== "running") { tasks.push({ ...item, stateUncertain: false }); continue; }
       let confirmed = !!item.childConversationId && active?.[item.childConversationId] !== undefined;
+      if (item.childConversationId && active === undefined) this.controls.incompleteRead(controlRead);
       if (item.taskType === "shell" && item.outputFile?.startsWith("shell:")) {
         const shell = await this.client.shell.get({ id: item.outputFile.slice(6), ...this.scope }, { signal }).catch(() => undefined);
+        if (!shell) this.controls.incompleteRead(controlRead);
         // Exit is not job settlement: capture may still be pending. The
         // unique owned shell remains controllable until its job result arrives.
         confirmed = shell?.data.metadata.sessionID === sessionId;

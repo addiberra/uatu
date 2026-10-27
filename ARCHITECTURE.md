@@ -1010,10 +1010,14 @@ occurrence link, not merely an old-looking timestamp.
 
 Complete history reconstructs verified child execution intervals before applying
 later idle boundaries to unresolved work. Native launcher clocks within one
-interval can identify aliases; missing or tied clocks and incomplete child history
-remain conservative. This grouping preserves parent transcript order and does not
-relax retained control revocations. An idle boundary alone never completes a
-worker: settlement still requires an explicit, unambiguously correlated result.
+interval can identify aliases regardless of their content order: native content
+appends when tool input starts, while `time.ran` records when the tool is called.
+Those orders may differ. Interval comparison uses the earlier and later native
+start coordinates; missing or tied clocks, intervening boundaries in either
+direction, and incomplete child history remain conservative. This grouping
+preserves parent transcript order rather than sorting it, without relaxing retained
+control revocations. An idle boundary alone never completes a worker: settlement
+still requires an explicit, unambiguously correlated result.
 
 Live projection correlation and control evidence share a bound of 8,192 entries /
 4 MiB of conservative serialized UTF-16 payload, not a heap guarantee.
@@ -1030,6 +1034,15 @@ history and reconciliation results. Target-specific unavailable stubs prevent
 silent readmission; reconnect does not erase them, and unretained targets may
 remain unavailable for the provider lifetime. Disposal ends that in-memory
 ownership lifetime. Complete-history folds are transient and precede pagination.
+
+The first live inventory closes only after its relevant worker evidence reads
+are complete. A failed active-state, shell-ownership, or child-history lookup may
+still publish uncertain rows while admitting healthy siblings. A shared read
+guard records that incompleteness across transcript, private snapshot, and
+public visibility callers, leaving initial classification eligible for a fresh,
+positively verified retry without requiring a repeated launcher event. It does
+not reopen an already completed inventory or clear failed-read, observation-gap,
+capacity, ownership, or unavailable-target guards.
 
 Observation gaps retire existing authorizations without globally closing future
 control admission. New post-gap targets require positive native birth and matching

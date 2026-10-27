@@ -122,7 +122,7 @@ export function retainLauncherEvidence(previous: LauncherEvidence | undefined, n
 }
 
 export type ControlWitness = Readonly<{ kind: "called" | "started" | "ended" | "notification" | "created"; proof: NativeProof }>;
-export type ControlRead = { id: number; parent: string; start: number; failed: boolean; initialInventory?: boolean };
+export type ControlRead = { id: number; parent: string; start: number; failed: boolean; initialInventory?: boolean; incomplete?: true };
 type ControlRecord = { parent: string; taskId: string; unavailable?: true; pending?: true; pendingCalls?: readonly string[]; aliases?: readonly string[]; kind?: "agent" | "shell"; item?: BackgroundTaskItem; evidence?: WorkerOccurrenceEvidence; witnesses?: readonly ControlWitness[]; changed?: number };
 type ControlObservation = { parent?: string; child?: string; launch?: LauncherEvidence; calledAt?: number; witness?: ControlWitness;
   lifecycle?: { kind: string; parent?: string; directory?: string; own: boolean }; backgroundObserved?: true; seen?: number; commandFingerprint?: string };
@@ -258,12 +258,19 @@ export class BackgroundControls {
     if (!admitted || parent.length > 512 || this.reads.size >= this.readCapacity || !this.fits(this.reads, read.id, read)) { read.failed = true; return read; }
     this.write(this.reads, read.id, read); return read;
   }
+  incompleteRead(read: ControlRead): void {
+    if (read.incomplete) return;
+    // Partial evidence can still admit healthy siblings. Unlike `failed`,
+    // this only prevents callers from closing the first inventory opportunity.
+    read.incomplete = true;
+    if (this.reads.get(read.id) === read) this.write(this.reads, read.id, read);
+  }
   endRead(read: ControlRead, complete = false): void {
     this.remove(this.reads, read.id);
     // The first complete cold inventory is different from a later discovery
     // racing buffered startup frames. Reuse the accounted scope, not a cache
     // or time window; a gap survives for the provider's lifetime.
-    if (complete && !read.failed && read.initialInventory !== undefined && this.scopes.get(read.parent) !== "gap" && this.scopes.get(read.parent) !== "inventoried") {
+    if (complete && !read.failed && !read.incomplete && read.initialInventory !== undefined && this.scopes.get(read.parent) !== "gap" && this.scopes.get(read.parent) !== "inventoried") {
       if (this.fits(this.scopes, read.parent, "inventoried")) this.write(this.scopes, read.parent, "inventoried");
       else this.gap(read.parent);
     }
@@ -743,8 +750,10 @@ export class BackgroundWorkers {
     const ends = history.get(child), left = previous.ran ?? previous.created, right = next.ran ?? next.created;
     // Display fallback clocks, tied starts and incomplete histories cannot
     // prove that two calls belong to one execution. Keep them separate.
-    return ends !== undefined && left !== undefined && right !== undefined && left < right
-      && !ends.some(end => end >= left && end <= right);
+    // Content follows input-start order, not necessarily tool.called order.
+    // Compare interval coordinates in either direction without sorting rows.
+    return ends !== undefined && left !== undefined && right !== undefined && left !== right
+      && !ends.some(end => end >= Math.min(left, right) && end <= Math.max(left, right));
   }
 
   launch(parent: string, value: unknown, at: number): NormalizedProviderUpdate[] {

@@ -133,6 +133,52 @@ test("a failed initial inventory does not discard the right to classify fresh co
   controlOracle(controls);
 });
 
+test("partial inventories preserve healthy sibling proof and completion accounting across callers", () => {
+  const controls = new BackgroundControls(), healthy = controlFixture("healthy"), pending = controlFixture("pending");
+  const first = controls.beginRead("parent", true, true);
+  controls.incompleteRead(first);
+  expect(first.failed).toBe(false);
+  expect(controls.project(healthy.item, healthy.evidence, first).stateUncertain).toBe(false);
+  expect(controls.project({ ...pending.item, stateUncertain: true }, pending.evidence, first).stateUncertain).toBe(true);
+  controlOracle(controls);
+  // Every provider caller can finish publishing its partial result. None may
+  // close initial classification while a relevant evidence read is incomplete.
+  controls.endRead(first, true);
+  const retry = controls.beginRead("parent", true, true);
+  expect(retry.initialInventory).toBe(true);
+  expect(controls.project(pending.item, pending.evidence, retry).stateUncertain).toBe(false);
+  expect(controls.project(healthy.item, healthy.evidence, retry).stateUncertain).toBe(false);
+  controls.endRead(retry, true);
+  const later = controls.beginRead("parent", true, true);
+  expect(later.initialInventory).toBe(false);
+  controls.incompleteRead(later); controls.endRead(later, true);
+  const afterPartial = controls.beginRead("parent", true, true);
+  expect(afterPartial.initialInventory).toBe(false);
+  controls.endRead(afterPartial); controlOracle(controls);
+});
+
+for (const guard of ["gap", "unavailable", "capacity", "foreign-birth"] as const) test(`partial inventory completion cannot clear ${guard} control guards`, () => {
+  const controls = new BackgroundControls(guard === "capacity" ? { entries: 12 } : {});
+  const pending = controlFixture("pending", "parent", "child", "agent"), healthy = controlFixture("healthy");
+  if (guard === "unavailable") {
+    controls.project(pending.item, pending.evidence);
+    controls.project({ ...pending.item, status: "completed" }, pending.evidence);
+  }
+  const first = controls.beginRead("parent", true, true);
+  expect(controls.project(healthy.item, healthy.evidence, first).stateUncertain).toBe(false);
+  controls.incompleteRead(first); controls.endRead(first, true);
+  if (guard === "gap") controls.observationGap();
+  if (guard === "capacity") for (let index = 0; index < 30; index++) controls.observe({ shutdown: false, session: `unknown${index}`, launchers: [], execution: { phase: "started", historical: false } }, true);
+  if (guard === "foreign-birth") controls.observe({ shutdown: false, launchers: [], lifecycle: { kind: "session.created", id: "child", parent: "other", directory: "/foreign", proof: nativeProof({ id: "foreign-birth", created: 1 }, {}) } }, false);
+  for (let retry = 0; retry < 3; retry++) {
+    const read = controls.beginRead("parent", true, true);
+    expect(controls.project(pending.item, pending.evidence, read).stateUncertain).toBe(true);
+    expect(controls.current(pending.item.taskId)).toBe(false);
+    controls.incompleteRead(read); controls.endRead(read, true);
+    controlOracle(controls);
+  }
+});
+
 test("one live sibling does not consume the first complete inventory of previously unobserved cold work", () => {
   const controls = new BackgroundControls(), live = controlFixture("live"), cold = controlFixture("preexisting");
   expect(controls.project(live.item, live.evidence).stateUncertain).toBe(false);

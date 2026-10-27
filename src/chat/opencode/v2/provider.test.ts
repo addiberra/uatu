@@ -94,6 +94,36 @@ function workerHistoryServer(messages: unknown[], idle: unknown[]) {
   });
 }
 
+function workerRecoveryServer() {
+  const fixture = JSON.parse(readFileSync(path.join(import.meta.dir, "../../../../tests/fixtures/opencode-v2/background-2.0.29.json"), "utf8"));
+  const state = { failure: "", childParent: "ses_parent", shellParent: "ses_parent", messages: [fixture.launch, fixture.shell] as unknown[], revert: undefined as string | undefined };
+  let wire!: ReadableStreamDefaultController<Uint8Array>;
+  let held: { path: string; entered: () => void; gate: Promise<void> } | undefined;
+  const frame = (type: string, data: unknown, created = 90) => wire.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({ id: `${type}:${created}`, type, data, created, location: { directory: WORKSPACE } })}\n\n`));
+  const answer = async (path: string, value: unknown) => {
+    const result = state.failure === path ? new Response(null, { status: 500 }) : value;
+    if (held?.path === path) { const pending = held; held = undefined; pending.entered(); await pending.gate; }
+    return result;
+  };
+  const server = fakeOpenCode({
+    "GET /api/event": () => new Response(new ReadableStream<Uint8Array>({ start(controller) { wire = controller; frame("server.connected", {}); } }), { headers: { "content-type": "text/event-stream" } }),
+    "GET /api/session/ses_parent": () => session("ses_parent", state.revert ? { revert: { messageID: state.revert } } : {}),
+    "GET /api/session/ses_child": () => session("ses_child", { parentID: state.childParent }),
+    "GET /api/session/ses_parent/message": () => ({ data: state.messages, cursor: {} }),
+    "GET /api/session/ses_parent/inbox": () => ({ data: [] }),
+    "GET /api/session/ses_child/message": ({ path }) => answer(path, { data: [], cursor: {} }),
+    "GET /api/session/active": ({ path }) => answer(path, { ses_child: { status: "running" } }),
+    "GET /api/shell/sh_fixture": ({ path }) => answer(path, scoped({ id: "sh_fixture", command: "printf fixture", status: "running", time: { started: 71 }, metadata: { sessionID: state.shellParent } })),
+    "DELETE /api/shell/sh_fixture": () => undefined,
+    "POST /api/session/ses_child/interrupt": () => ({ interrupted: true }),
+  });
+  return { ...server, fixture, state, frame, disconnect: () => wire.close(), holdNext: (path: string) => {
+    let entered!: () => void, release!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; }), gate = new Promise<void>(resolve => { release = resolve; });
+    held = { path, entered, gate }; return { started, release };
+  } };
+}
+
 type StopEvidence = {
   parent: string; taskId: string; child?: string; launchCalls?: readonly string[]; occurrence?: unknown;
   pendingChanges: Set<string>;
@@ -1458,6 +1488,112 @@ describe("OpenCode 2.x provider: sessions", () => {
       expect(server.requests("GET", "/api/session/active")).toHaveLength(3);
     } finally { await provider.dispose(); }
   });
+  for (const path of ["/api/shell/sh_fixture", "/api/session/active", "/api/session/ses_child/message"]) {
+    test(`partial first live inventory recovers after ${path} succeeds without another launcher frame`, async () => {
+      const server = workerRecoveryServer(), provider = server.provider(), stream = observedNativeStream(provider);
+      const failedType = path.includes("/shell/") ? "shell" : "agent";
+      try {
+        await stream.seen(event => event.eventType === "server.connected"); server.state.failure = path;
+        const initial = await provider.reconcileBackgroundTasks("ses_parent", { fresh: true });
+        expect(initial.find(task => task.taskType === failedType)).toMatchObject({ status: "running", stateUncertain: true });
+        expect(initial.find(task => task.taskType !== failedType)).toMatchObject({ status: "running", stateUncertain: false });
+        server.state.failure = "";
+        for (let retry = 0; retry < 3; retry++) {
+          const recovered = await provider.reconcileBackgroundTasks("ses_parent", { fresh: true });
+          expect(recovered).toHaveLength(2);
+          expect(recovered.every(task => task.status === "running" && task.stateUncertain === false)).toBe(true);
+          expect(compactWorkers(recovered).every(worker => worker.state === "working")).toBe(true);
+        }
+        await provider.stopTask("ses_parent", failedType === "shell" ? "v2:ses_parent:call_shell" : "v2:ses_parent:call_worker");
+        expect(server.calls.filter(call => call.method !== "GET").map(call => `${call.method} ${call.path}`)).toEqual([
+          failedType === "shell" ? "DELETE /api/shell/sh_fixture" : "POST /api/session/ses_child/interrupt",
+        ]);
+      } finally { stream.lifetime.abort(); await stream.pump.catch(() => undefined); await provider.dispose(); }
+    });
+  }
+
+  test("partial first live transcript history does not consume recovery's initial inventory", async () => {
+    const server = workerRecoveryServer(), provider = server.provider(), stream = observedNativeStream(provider);
+    try {
+      await stream.seen(event => event.eventType === "server.connected"); server.state.failure = "/api/session/ses_child/message";
+      const page = await provider.listMessages("ses_parent", { limit: 100 });
+      expect(page.completeItems).toContainEqual(expect.objectContaining({ type: "background_task", taskType: "agent", stateUncertain: true }));
+      server.state.failure = "";
+      for (let retry = 0; retry < 3; retry++) expect((await provider.reconcileBackgroundTasks("ses_parent", { fresh: true })).every(task => task.stateUncertain === false)).toBe(true);
+    } finally { stream.lifetime.abort(); await stream.pump.catch(() => undefined); await provider.dispose(); }
+  });
+
+  for (const path of ["/api/shell/sh_fixture", "/api/session/active", "/api/session/ses_child/message"]) {
+    test(`queued fresh mixed-worker recovery follows partial ${path} evidence`, async () => {
+      const server = workerRecoveryServer(), provider = server.provider(), stream = observedNativeStream(provider), hold = server.holdNext(path);
+      let first: ReturnType<typeof provider.reconcileBackgroundTasks> | undefined, next: typeof first;
+      try {
+        await stream.seen(event => event.eventType === "server.connected"); server.state.failure = path;
+        first = provider.reconcileBackgroundTasks("ses_parent", { fresh: true }); await hold.started;
+        server.state.failure = ""; next = provider.reconcileBackgroundTasks("ses_parent", { fresh: true }); hold.release();
+        expect((await first).some(task => task.stateUncertain === true)).toBe(true);
+        const recovered = await next;
+        expect(recovered).toHaveLength(2); expect(recovered.every(task => task.stateUncertain === false)).toBe(true);
+        expect(server.requests("GET", path)).toHaveLength(2);
+        expect(server.calls.every(call => call.method === "GET")).toBe(true);
+      } finally { hold.release(); await Promise.allSettled([first, next].filter(Boolean)); stream.lifetime.abort(); await stream.pump.catch(() => undefined); await provider.dispose(); }
+    });
+  }
+
+  test("partial first live inventory stays retryable through public revert visibility filtering", async () => {
+    const server = workerRecoveryServer(), provider = server.provider(), stream = observedNativeStream(provider);
+    server.state.messages.push({ id: "reverted_prompt", type: "user", text: "Synthetic hidden turn", time: { created: 100 } });
+    server.state.revert = "reverted_prompt";
+    try {
+      await stream.seen(event => event.eventType === "server.connected"); server.state.failure = "/api/session/ses_child/message";
+      expect(await provider.reconcileBackgroundTasks("ses_parent", { fresh: true })).toContainEqual(expect.objectContaining({ taskType: "agent", stateUncertain: true }));
+      server.state.failure = "";
+      for (let retry = 0; retry < 3; retry++) {
+        const recovered = await provider.reconcileBackgroundTasks("ses_parent", { fresh: true });
+        expect(recovered).toHaveLength(2); expect(recovered.every(task => task.stateUncertain === false)).toBe(true);
+      }
+    } finally { stream.lifetime.abort(); await stream.pump.catch(() => undefined); await provider.dispose(); }
+  });
+
+  test("partial first inventory cannot authorize pre-gap workers after reconnect", async () => {
+    const server = workerRecoveryServer(), provider = server.provider();
+    let stream = observedNativeStream(provider);
+    try {
+      await stream.seen(event => event.eventType === "server.connected"); server.state.failure = "/api/shell/sh_fixture";
+      expect(await provider.reconcileBackgroundTasks("ses_parent", { fresh: true })).toContainEqual(expect.objectContaining({ taskType: "shell", stateUncertain: true }));
+      server.disconnect(); await stream.pump;
+      server.state.failure = ""; stream = observedNativeStream(provider); await stream.seen(event => event.eventType === "server.connected");
+      for (let retry = 0; retry < 3; retry++) {
+        const recovered = await provider.reconcileBackgroundTasks("ses_parent", { fresh: true });
+        expect(recovered).toHaveLength(2); expect(recovered.every(task => task.stateUncertain === true)).toBe(true);
+      }
+      for (const call of ["call_shell", "call_worker"]) await expect(provider.stopTask("ses_parent", `v2:ses_parent:${call}`)).rejects.toThrow(/no longer confirmed/);
+      expect(server.calls.every(call => call.method === "GET")).toBe(true);
+    } finally { stream.lifetime.abort(); await stream.pump.catch(() => undefined); await provider.dispose(); }
+  });
+
+  for (const kind of ["agent", "shell"] as const) test(`partial first inventory does not restore ${kind} controls after changed native ownership`, async () => {
+    const server = workerRecoveryServer(), provider = server.provider(), stream = observedNativeStream(provider);
+    try {
+      await stream.seen(event => event.eventType === "server.connected"); server.state.failure = kind === "shell" ? "/api/shell/sh_fixture" : "/api/session/active";
+      expect(await provider.reconcileBackgroundTasks("ses_parent", { fresh: true })).toContainEqual(expect.objectContaining({ taskType: kind, stateUncertain: true }));
+      server.state.failure = "";
+      if (kind === "agent") {
+        server.state.childParent = "foreign_parent";
+        server.frame("session.updated", { sessionID: "ses_child", parentID: "foreign_parent" });
+        await stream.seen(event => event.eventType === "session.updated");
+      } else server.state.shellParent = "foreign_parent";
+      for (let retry = 0; retry < 3; retry++) {
+        const recovered = await provider.reconcileBackgroundTasks("ses_parent", { fresh: true });
+        if (kind === "agent") expect(recovered.some(task => task.taskType === "agent")).toBe(false);
+        else expect(recovered.find(task => task.taskType === "shell")).toMatchObject({ status: "running", stateUncertain: true });
+        expect(recovered.find(task => task.taskType !== kind)).toMatchObject({ status: "running", stateUncertain: false });
+      }
+      await expect(provider.stopTask("ses_parent", kind === "shell" ? "v2:ses_parent:call_shell" : "v2:ses_parent:call_worker")).rejects.toThrow();
+      expect(server.calls.every(call => call.method === "GET")).toBe(true);
+    } finally { stream.lifetime.abort(); await stream.pump.catch(() => undefined); await provider.dispose(); }
+  });
+
   test("ownership reuse evicts at the incumbent worker entry limit and reconnect starts cold", async () => {
     const reference = (index: number) => ({ type: "tool", name: "subagent", id: `call${index}`, state: { status: "running", input: {}, metadata: { sessionID: `child${index}` } } });
     const frame = (content: unknown[]) => ({ type: "session.message.content.updated", location: { directory: WORKSPACE }, data: { sessionID: "ses_parent", messageID: "answer", content } });
@@ -3013,6 +3149,62 @@ describe("OpenCode 2.x provider: sessions", () => {
       expect(recovered.every(item => item.status === "completed" && item.stateUncertain === false)).toBe(true);
     } finally { await provider.dispose(); }
     expect(server.calls.every(call => call.method === "GET")).toBe(true);
+  });
+
+  for (const combined of [true, false]) test(`historical interleaved execution clocks correlate aliases ${combined ? "within one assistant" : "across assistants"} without reordering tools`, async () => {
+    // Native content is appended on tool.input.started; time.ran is recorded
+    // on tool.called. Input order therefore need not be execution-start order.
+    const first = historyWorkerLaunch("call_a", 10), second = historyWorkerLaunch("call_b", 12);
+    first.content[0]!.time = { created: 10, ran: 21, completed: 23 };
+    second.content[0]!.time = { created: 12, ran: 13, completed: 15 };
+    const launches = combined ? [{ ...first, content: [...first.content, ...second.content] }] : [first, second];
+    const server = workerHistoryServer([...launches, historyWorkerResult("result", 40)],
+      [3, 30].map(at => ({ id: `idle_${at}`, type: "idle", time: { created: at } })));
+    const provider = server.provider();
+    try {
+      const page = await provider.listMessages("ses_parent", { limit: 100 });
+      expect(page.completeItems?.filter(item => item.type === "tool").map(item => item.id)).toEqual(["tool:call_a", "tool:call_b"]);
+      for (const tasks of [page.completeItems?.filter(item => item.type === "background_task"), await provider.reconcileBackgroundTasks("ses_parent")]) {
+        expect(tasks).toEqual([expect.objectContaining({ toolUseId: "call_a", toolUseIds: ["call_a", "call_b"], status: "completed", stateUncertain: false, resultId: "result" })]);
+      }
+      expect(server.calls.every(call => call.method === "GET")).toBe(true);
+    } finally { await provider.dispose(); }
+  });
+
+  for (const reversed of [false, true]) for (const clock of ["between", "at-earlier", "at-later", "tied", "missing-launch", "missing-boundary"] as const) {
+    test(`historical interval coordinates reject ${clock} ambiguity in ${reversed ? "reverse" : "forward"} execution order`, async () => {
+      const first = historyWorkerLaunch("call_a", 10), second = historyWorkerLaunch("call_b", 12);
+      first.content[0]!.time = { created: 10, ran: reversed ? 21 : 13, completed: 23 };
+      second.content[0]!.time = { created: 12, ran: reversed ? 13 : 21, completed: 23 };
+      if (clock === "tied") second.content[0]!.time.ran = first.content[0]!.time.ran;
+      if (clock === "missing-launch") second.content[0]!.time = {} as typeof second.content[0]["time"];
+      const boundary = { id: "idle_boundary", type: "idle", time: { created: clock === "at-earlier" ? 13 : clock === "at-later" ? 21 : 17 } as { created?: number } };
+      if (clock === "missing-boundary") delete boundary.time.created;
+      const server = workerHistoryServer([{ ...first, content: [...first.content, ...second.content] }, historyWorkerResult("result", 40)], [boundary]);
+      const provider = server.provider();
+      try {
+        const tasks = await provider.reconcileBackgroundTasks("ses_parent");
+        const launches = tasks.filter(task => task.toolUseId);
+        expect(launches).toHaveLength(2);
+        expect(launches.every(task => !task.toolUseIds && task.status === "running" && task.stateUncertain && !task.resultId)).toBe(true);
+      } finally { await provider.dispose(); }
+    });
+  }
+
+  for (const reversed of [false, true]) test(`historical boundary-separated ${reversed ? "reverse" : "forward"} starts cannot apply an old result to the new execution`, async () => {
+    const older = historyWorkerLaunch("call_old", 10), newer = historyWorkerLaunch("call_new", 12);
+    older.content[0]!.time = { created: 10, ran: 13, completed: 15 };
+    newer.content[0]!.time = { created: 12, ran: 21, completed: 23 };
+    const content = reversed ? [...newer.content, ...older.content] : [...older.content, ...newer.content];
+    const server = workerHistoryServer([{ ...older, content }, historyWorkerResult("result_old", 16)], [{ id: "idle_old", type: "idle", time: { created: 17 } }]);
+    const provider = server.provider();
+    try {
+      const tasks = await provider.reconcileBackgroundTasks("ses_parent");
+      expect(tasks).toHaveLength(2);
+      expect(tasks.find(task => task.toolUseId === "call_old")).toMatchObject({ status: "completed", resultId: "result_old", stateUncertain: false });
+      expect(tasks.find(task => task.toolUseId === "call_new")).toMatchObject({ status: "running" });
+      expect(tasks.find(task => task.toolUseId === "call_new")?.resultId).toBeUndefined();
+    } finally { await provider.dispose(); }
   });
 
   test("historical aliases without an explicit result remain uncertain and cannot stop a continued child", async () => {
