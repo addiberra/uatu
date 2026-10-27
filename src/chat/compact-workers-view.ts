@@ -109,7 +109,7 @@ export class CompactWorkersView {
       cost.setAttribute("aria-label", cost.title);
       inspect.dataset.kind = worker.kind;
       let stop = row.querySelector<HTMLButtonElement>("[data-stop-task]");
-      if (worker.taskId && worker.stoppable && workerIsActive(worker.state) && canStop) {
+      if (worker.taskId && worker.stoppable && worker.state === "working" && canStop) {
         if (!stop) {
           stop = document.createElement("button");
           stop.type = "button";
@@ -119,9 +119,9 @@ export class CompactWorkersView {
         stop.dataset.stopTask = worker.taskId;
         stop.dataset.stopItem = worker.id;
         stop.textContent = stopping.has(worker.taskId) ? "Stopping…" : "Stop";
-        stop.disabled = worker.state === "unknown" || stopping.has(worker.taskId);
+        stop.disabled = stopping.has(worker.taskId);
         stop.setAttribute("aria-label", `Stop worker: ${worker.name}`);
-        stop.title = worker.state === "unknown" ? "Status unknown — refresh before stopping" : `Stop worker: ${worker.name}`;
+        stop.title = `Stop worker: ${worker.name}`;
       } else stop?.remove();
     }
     // Reorder siblings around the focused row. Moving that row itself with

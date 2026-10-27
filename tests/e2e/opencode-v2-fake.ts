@@ -78,6 +78,8 @@ export type OpenCodeV2Fake = {
   pauseEvents(paused: boolean): void;
   externalRevert(sessionId: string, messageId: string | null): void;
   appendHistory(sessionId: string, count: number): void;
+  holdNextMessageRead(sessionId: string): void;
+  releaseMessageRead(): void;
   loseNextBackgroundResponse(): void;
   loseNextPromptResponse(): void;
   unknownNextPromptBeforeAdmission(): void;
@@ -86,7 +88,7 @@ export type OpenCodeV2Fake = {
   launchShellOnNextSteer(sessionId: string): void;
   loseNextWorkerResponse(): void;
   wakeParent(sessionId: string): void;
-  state(): { eventSubscribers: number; sessions: Record<string, OpenCodeV2FakeSessionState>; shells: Record<string, { removed: boolean; waiter: string; captured: boolean; outputAvailable: boolean }>; unhandled: string[]; calls: string[] };
+  state(): { eventSubscribers: number; heldMessageRead: string | null; sessions: Record<string, OpenCodeV2FakeSessionState>; shells: Record<string, { removed: boolean; waiter: string; captured: boolean; outputAvailable: boolean }>; unhandled: string[]; calls: string[] };
   stop(): Promise<void>;
 };
 
@@ -117,6 +119,8 @@ export function startOpenCodeV2Fake(options: { directory: string; password?: str
   const encoder = new TextEncoder();
   const subscribers = new Set<ReadableStreamDefaultController<Uint8Array>>();
   let eventsPaused = false;
+  let messageReadHold: { sessionId: string; claimed: boolean; gate: Promise<void>; release: () => void } | undefined;
+  const releaseMessageRead = () => { messageReadHold?.release(); messageReadHold = undefined; };
   const sessions = new Map<string, SessionState>();
   const raceOnCancel = new Set<string>();
   const unhandled: string[] = [];
@@ -539,6 +543,11 @@ export function startOpenCodeV2Fake(options: { directory: string; password?: str
     }
     if (sub === "GET message") {
       const ordered = [...session.messages].sort((left, right) => left.time.created - right.time.created);
+      const hold = messageReadHold;
+      if (hold?.sessionId === sessionID && !hold.claimed) {
+        hold.claimed = true;
+        await hold.gate;
+      }
       return Response.json({ data: url.searchParams.get("order") === "desc" ? ordered.reverse() : ordered, cursor: { next: null } });
     }
     if (sub === "POST revert/stage") {
@@ -576,6 +585,7 @@ export function startOpenCodeV2Fake(options: { directory: string; password?: str
     url: `http://127.0.0.1:${server.port}`,
     password,
     reset() {
+      releaseMessageRead();
       closeStreams();
       sessions.clear();
       raceOnCancel.clear();
@@ -616,6 +626,13 @@ export function startOpenCodeV2Fake(options: { directory: string; password?: str
       emit("session.message.content.updated", { sessionID: sessionId, messageID: session.messages.at(-1)!.id, content: session.messages.at(-1)!.content });
     },
     loseNextBackgroundResponse() { loseBackground = true; },
+    holdNextMessageRead(sessionId) {
+      releaseMessageRead();
+      let release!: () => void;
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      messageReadHold = { sessionId, claimed: false, gate, release };
+    },
+    releaseMessageRead,
     loseNextPromptResponse() { losePrompt = true; },
     unknownNextPromptBeforeAdmission() { unknownBeforeAdmission = true; },
     loseNextResumeResponse() { loseResume = true; },
@@ -650,9 +667,10 @@ export function startOpenCodeV2Fake(options: { directory: string; password?: str
           messages: session.messages.map(message => ({ id: message.id, type: message.type, ...(message.type === "user" ? { text: message.text } : {}) })),
         };
       }
-      return { eventSubscribers: subscribers.size, sessions: result, shells: Object.fromEntries([...shells].map(([id, shell]) => [id, { removed: shell.removed, waiter: shell.waiter, captured: shell.captured, outputAvailable: shell.output !== null }])), unhandled: [...unhandled], calls: [...calls] };
+      return { eventSubscribers: subscribers.size, heldMessageRead: messageReadHold?.claimed ? messageReadHold.sessionId : null, sessions: result, shells: Object.fromEntries([...shells].map(([id, shell]) => [id, { removed: shell.removed, waiter: shell.waiter, captured: shell.captured, outputAvailable: shell.output !== null }])), unhandled: [...unhandled], calls: [...calls] };
     },
     async stop() {
+      releaseMessageRead();
       clearInterval(keepalive);
       closeStreams();
       await server.stop(true);

@@ -192,6 +192,7 @@ const dualAgentRouter = new MultiAgentChatService({
 // reset, so every test starts with a fresh adapter over an empty server.
 const openCodeV2Fake = startOpenCodeV2Fake({ directory: E2E_WORKSPACE_ROOT });
 let openCodeV2Router: MultiAgentChatService | null = null;
+let openCodeV2Adapter: ChatAdapter | null = null;
 function openCodeV2Stack(backgroundPreview = true): MultiAgentChatService {
   if (openCodeV2Router) return openCodeV2Router;
   const ready = { state: "ready" as const, version: "2.0.28" };
@@ -216,7 +217,7 @@ function openCodeV2Stack(backgroundPreview = true): MultiAgentChatService {
     attachmentStore: fakeAttachmentStore,
     // A short settlement wait, so a withdrawal the fake never settles
     // decides from the inbox list within a test's patience.
-    createAdapter: options => new ChatAdapter({ ...options, steerWithdrawTimeoutMs: 1_500 }),
+    createAdapter: options => (openCodeV2Adapter = new ChatAdapter({ ...options, steerWithdrawTimeoutMs: 1_500 })),
   });
   openCodeV2Router = new MultiAgentChatService({
     workspacePath: E2E_WORKSPACE_ROOT,
@@ -351,6 +352,7 @@ async function handleE2EReset(request: Request): Promise<Response> {
   activeChatRouter = singleAgentRouter;
   const retiringOpenCodeV2 = openCodeV2Router;
   openCodeV2Router = null;
+  openCodeV2Adapter = null;
   await retiringOpenCodeV2?.dispose().catch(() => undefined);
   openCodeV2Fake.reset();
 
@@ -466,7 +468,7 @@ async function handleE2EChat(request: Request): Promise<Response> {
     // fake OpenCode's controls (`opencode` action).
     stack?: "opencode-v2";
     backgroundPreview?: boolean;
-    op?: "step" | "finish" | "raceDeliverOnCancel" | "state" | "launchWorker" | "settleWorker" | "workerReport" | "disconnect" | "pauseEvents" | "reconnectEvents" | "externalRevert" | "appendHistory" | "loseBackgroundResponse" | "loseWorkerResponse" | "launchShell" | "shellPhase" | "wakeParent" | "losePromptResponse" | "unknownPromptBeforeAdmission" | "loseResumeResponse" | "refuseBackground" | "launchShellOnNextSteer";
+    op?: "step" | "finish" | "raceDeliverOnCancel" | "state" | "resync" | "launchWorker" | "settleWorker" | "workerReport" | "disconnect" | "pauseEvents" | "reconnectEvents" | "externalRevert" | "appendHistory" | "holdNextMessageRead" | "releaseMessageRead" | "loseBackgroundResponse" | "loseWorkerResponse" | "launchShell" | "shellPhase" | "wakeParent" | "losePromptResponse" | "unknownPromptBeforeAdmission" | "loseResumeResponse" | "refuseBackground" | "launchShellOnNextSteer";
     revertMessageId?: string | null;
     usedModel?: string;
     usedEffort?: string;
@@ -566,6 +568,17 @@ async function handleE2EChat(request: Request): Promise<Response> {
         case "appendHistory":
           if (body.conversationId) { openCodeV2Fake.appendHistory(body.conversationId, body.count ?? 60); return Response.json({ ok: true }); }
           break;
+        case "holdNextMessageRead":
+          if (body.conversationId) { openCodeV2Fake.holdNextMessageRead(body.conversationId); return Response.json({ ok: true }); }
+          break;
+        case "releaseMessageRead":
+          openCodeV2Fake.releaseMessageRead(); return Response.json({ ok: true });
+        case "resync":
+          if (body.conversationId && openCodeV2Adapter) {
+            openCodeV2Adapter.projectionForTests(body.conversationId).replay.publish({ type: "resync", reason: "retention-gap" });
+            return Response.json({ ok: true });
+          }
+          break;
         case "loseBackgroundResponse":
           openCodeV2Fake.loseNextBackgroundResponse(); return Response.json({ ok: true });
         case "loseWorkerResponse":
@@ -586,7 +599,9 @@ async function handleE2EChat(request: Request): Promise<Response> {
           }
           break;
         case "state":
-          return Response.json(openCodeV2Fake.state());
+          return Response.json({ ...openCodeV2Fake.state(), ...(body.conversationId && openCodeV2Adapter ? {
+            workerModels: openCodeV2Adapter.projectionForTests(body.conversationId).filter(item => item.type === "background_task").map(item => item.type === "background_task" ? item.workerSession?.model : undefined),
+          } : {}) });
       }
       break;
     case "seed":

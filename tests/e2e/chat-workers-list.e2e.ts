@@ -58,9 +58,15 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`canonical w
     }
     if (action === "Stop") {
       await update({ ...worker, stateUncertain: true });
-      await expect(stop).toBeDisabled();
+      await expect(row).toHaveAttribute("data-state", "unknown");
+      await expect(stop).toHaveCount(0);
+      await expect(inspect).toHaveRole("button");
+      await expect(inspect).toHaveAccessibleName(/Focused B · unknown/);
+      await expect(inspect).toBeVisible();
+      await expect(inspect).toBeEnabled();
       await expect(inspect).toBeFocused();
       await update(worker);
+      await expect(row).toHaveAttribute("data-state", "working");
       await expect(stop).toBeEnabled();
       await stop.focus();
     }
@@ -357,8 +363,12 @@ for (const engine of ["chromium", "webkit"] as const) test.describe(`canonical w
     // Unknown state is a retained warning, never authority for a stop.
     await request.post("/__e2e/chat", { data: { action: "item", conversationId: snapshot.conversation.id, item: { ...items.find(item => item.id === "job:18"), stateUncertain: true } } });
     await summary.tap();
-    await expect(track.locator('[data-state="unknown"] [data-stop-task]')).toBeDisabled();
     await expect(label).toHaveText("1 working · 1 unknown");
+    const unknown = track.locator('[data-worker-id="job:18"]');
+    await expect(unknown).toHaveAttribute("data-state", "unknown");
+    await expect(unknown.locator("[data-stop-task]")).toHaveCount(0);
+    await expect(unknown.getByRole("button", { name: /Build independent theme module.*unknown/ })).toBeVisible();
+    await expect(unknown.getByRole("button", { name: /Build independent theme module.*unknown/ })).toBeEnabled();
     await page.setViewportSize({ width: 390, height: 844 });
     await page.locator("#chat-input").blur();
     await page.evaluate(() => {

@@ -1039,6 +1039,14 @@ unclassified delayed notes remain conservative. These subordinate stores remain
 within the aggregate accounting and do not forget genuine worker contradictions
 when presentation payload is evicted.
 
+Native V2 history reads subscribe before recovery and merge projected changes
+through a bounded change fence. Their snapshot cursor is taken after that merge
+and recovery publication, together with the current configuration and concurrent
+conversation renames. Large worker
+rows already included in the snapshot therefore need not survive the replay
+ring merely to attach its stream. Providers without this fence retain the
+pre-read cursor so concurrent events are replayed rather than skipped.
+
 `reconcileBackgroundTasks(parent)` reads complete history, all pending inbox
 entries, verified child/active evidence and owned shell records. Unlike
 Claude's authoritative live list, absence never means cancellation. The adapter
@@ -1071,6 +1079,10 @@ per provider across stream, history and Stop validation. Capacity releases only
 when the SDK promise settles, not when a deadline wrapper returns. Event child
 verification shares a one-second deadline and stream cancellation; a failed
 child check does not discard unrelated event content.
+Concurrent ownership readers share the lookup, not its initiating caller's
+deadline or expected parent. Each reader checks parentage independently; the
+underlying lookup is cancelled only after its last reader leaves (or its
+provider/stream lifetime ends).
 Child execution boundaries also constrain unresolved worker occurrences: an
 active child may belong to a newer foreground run, so it does not reauthorize
 an old task. Stop revalidates fresh parent and child histories. Inventory

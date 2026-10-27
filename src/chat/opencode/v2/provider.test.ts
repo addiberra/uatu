@@ -122,6 +122,219 @@ function observedNativeStream(provider: OpenCodeV2Provider) {
     events.some(matches) ? Promise.resolve() : new Promise<void>(resolve => waiting.add({ matches, resolve })) };
 }
 
+test("interrupted child observation does not settle an occurrence from child session outcome alone", async () => {
+  const fixture = JSON.parse(readFileSync(path.join(import.meta.dir, "../../../../tests/fixtures/opencode-v2/background-2.0.29.json"), "utf8"));
+  let wire!: ReadableStreamDefaultController<Uint8Array>, settled = false;
+  const frame = (type: string, data: unknown) => wire.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({ type, data, created: 30, location: { directory: WORKSPACE } })}\n\n`));
+  const server = fakeOpenCode({
+    "GET /api/event": () => new Response(new ReadableStream<Uint8Array>({ start(controller) { wire = controller; frame("server.connected", {}); } }), { headers: { "content-type": "text/event-stream" } }),
+    "GET /api/session/ses_parent": () => session("ses_parent"),
+    "GET /api/session/ses_child": () => session("ses_child", { parentID: "ses_parent", ...(settled ? { outcome: "succeeded", time: { created: 10, updated: 40, idle: 40 } } : {}) }),
+    "GET /api/session/ses_parent/message": () => ({ data: [fixture.launch], cursor: {} }),
+    "GET /api/session/ses_child/message": () => ({ data: [], cursor: {} }),
+    "GET /api/session/ses_parent/inbox": () => ({ data: [] }),
+    "GET /api/session/active": () => settled ? {} : { ses_child: { type: "running" } },
+  });
+  const provider = server.provider();
+  let stream = observedNativeStream(provider);
+  try {
+    await stream.seen(event => event.eventType === "server.connected");
+    frame("session.message.content.updated", { sessionID: "ses_parent", messageID: fixture.launch.id, content: fixture.launch.content });
+    await stream.seen(event => event.updates.some(update => update.kind === "upsert" && update.item.type === "background_task"));
+    expect(await provider.reconcileBackgroundTasks("ses_parent", { fresh: true })).toContainEqual(expect.objectContaining({ status: "running", stateUncertain: false }));
+    wire.close(); await stream.pump;
+    settled = true; // The terminal SSE frame was lost while disconnected; streams do not replay it.
+    stream = observedNativeStream(provider);
+    await stream.seen(event => event.eventType === "server.connected");
+    const recovered = await provider.reconcileBackgroundTasks("ses_parent", { fresh: true });
+    await expect(provider.stopTask("ses_parent", "v2:ses_parent:call_worker")).rejects.toThrow();
+    expect(server.calls.every(call => call.method === "GET")).toBe(true);
+    expect(recovered).toContainEqual(expect.objectContaining({ taskId: "v2:ses_parent:call_worker", status: "running", stateUncertain: true }));
+  } finally { stream.lifetime.abort(); await stream.pump.catch(() => undefined); await provider.dispose(); }
+});
+
+test("a cancelled child ownership reader does not cancel a concurrent history reader", async () => {
+  const fixture = JSON.parse(readFileSync(path.join(import.meta.dir, "../../../../tests/fixtures/opencode-v2/background-2.0.29.json"), "utf8"));
+  let entered!: () => void, release!: () => void;
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const server = fakeOpenCode({
+    "GET /api/session/ses_parent": () => session("ses_parent"),
+    "GET /api/session/ses_parent/message": () => ({ data: [fixture.launch], cursor: {} }),
+    "GET /api/session/ses_child": async ({ signal }) => { entered(); await gate; signal.throwIfAborted(); return session("ses_child", { parentID: "ses_parent" }); },
+    "GET /api/session/ses_child/message": () => ({ data: [], cursor: {} }),
+  });
+  const provider = server.provider(), first = new AbortController();
+  const cancelled = provider.listMessages("ses_parent", { limit: 10, signal: first.signal });
+  void cancelled.catch(() => undefined);
+  let concurrent: ReturnType<typeof provider.listMessages> | undefined;
+  try {
+    await started;
+    concurrent = provider.listMessages("ses_parent", { limit: 10 });
+    void concurrent.catch(() => undefined);
+    const deadline = Date.now() + 1_000;
+    while ((provider as unknown as { ownershipChecks: Set<unknown> }).ownershipChecks.size < 2 && Date.now() < deadline) await Bun.sleep(0);
+    expect((provider as unknown as { ownershipChecks: Set<unknown> }).ownershipChecks.size).toBe(2);
+    first.abort();
+    await expect(cancelled).rejects.toThrow();
+    release();
+    expect((await concurrent).completeItems).toContainEqual(expect.objectContaining({ type: "background_task", childConversationId: "ses_child" }));
+    expect(server.requests("GET", "/api/session/ses_child")).toHaveLength(1);
+  } finally { release(); await Promise.allSettled([cancelled, ...(concurrent ? [concurrent] : [])]); await provider.dispose(); }
+});
+
+for (const matchingFirst of [false, true]) test(`cancelled matching-parent reader leaves foreign-parent ownership false (${matchingFirst ? "matching" : "foreign"} parent first)`, async () => {
+  const fixture = JSON.parse(readFileSync(path.join(import.meta.dir, "../../../../tests/fixtures/opencode-v2/background-2.0.29.json"), "utf8"));
+  let entered!: () => void, release!: () => void;
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const server = fakeOpenCode({
+    "GET /api/session/:id/message": () => ({ data: [fixture.launch], cursor: {} }),
+    "GET /api/session/:id": async ({ path, signal }) => {
+      const id = path.split("/").at(-1)!;
+      if (id !== "ses_child") return session(id);
+      entered(); await gate; signal.throwIfAborted();
+      return session(id, { parentID: "ses_parent" });
+    },
+  });
+  const provider = server.provider(), matching = new AbortController();
+  const state = provider as unknown as { ownershipChecks: Set<unknown>; childParentReads: Map<string, { users: number }> };
+  let cancelled: ReturnType<typeof provider.listMessages> | undefined, foreign: ReturnType<typeof provider.listMessages> | undefined;
+  const startMatching = () => { cancelled = provider.listMessages("ses_parent", { limit: 10, signal: matching.signal }); void cancelled.catch(() => undefined); };
+  const startForeign = () => { foreign = provider.listMessages("ses_other", { limit: 10 }); void foreign.catch(() => undefined); };
+  try {
+    (matchingFirst ? startMatching : startForeign)();
+    await started;
+    (matchingFirst ? startForeign : startMatching)();
+    const deadline = Date.now() + 1_000;
+    while (state.ownershipChecks.size < 2 && Date.now() < deadline) await Bun.sleep(0);
+    expect(state.ownershipChecks.size).toBe(2);
+    expect(state.childParentReads.get("ses_child")?.users).toBe(2);
+    matching.abort();
+    await expect(cancelled!).rejects.toThrow();
+    expect(state.ownershipChecks.size).toBe(1);
+    expect(state.childParentReads.get("ses_child")?.users).toBe(1);
+    expect(server.requests("GET", "/api/session/ses_child")[0]!.signal.aborted).toBe(false);
+    release();
+    expect((await foreign!).completeItems?.some(item => item.type === "background_task")).toBe(false);
+    expect(server.requests("GET", "/api/session/ses_child")).toHaveLength(1);
+    expect(server.requests("GET", "/api/session/ses_child/message")).toHaveLength(0);
+    expect(state.ownershipChecks.size).toBe(0);
+    expect(state.childParentReads.size).toBe(0);
+    expect(server.calls.every(call => call.method === "GET")).toBe(true);
+  } finally { release(); await Promise.allSettled([...(cancelled ? [cancelled] : []), ...(foreign ? [foreign] : [])]); await provider.dispose(); }
+});
+
+for (const setup of ["readSignal", "childParents.read"] as const) test(`synchronous child ownership ${setup} failure retires only its unjoined guard`, async () => {
+  let entered!: () => void, release!: () => void;
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const server = fakeOpenCode({
+    "GET /api/session/ses_child": async ({ signal }) => { entered(); await gate; signal.throwIfAborted(); return session("ses_child", { parentID: "ses_parent" }); },
+  });
+  const provider = server.provider();
+  // Inject only a synchronous setup fault; normal reads still use the real SDK.
+  const state = provider as unknown as {
+    verifiedChild(child: string, parent: string, signal: AbortSignal): Promise<boolean>;
+    readSignal(signal?: AbortSignal): AbortSignal;
+    childParents: { read(...args: unknown[]): Promise<readonly [string, string]> };
+    ownershipChecks: Set<unknown>;
+    childParentReads: Map<string, { users: number }>;
+  };
+  const signal = new AbortController().signal;
+  const existing = state.verifiedChild("ses_child", "ses_parent", signal);
+  let later: Promise<boolean> | undefined;
+  try {
+    await started;
+    const fault = setup === "readSignal" ? spyOn(state, "readSignal") : spyOn(state.childParents, "read");
+    fault.mockImplementation(() => { throw new Error("injected shared-read setup failure"); });
+    try {
+      // More failures than the guard capacity must not crowd out later checks.
+      for (let index = 0; index < 16; index++) {
+        await expect(state.verifiedChild("ses_failed", "ses_parent", signal)).rejects.toThrow("injected shared-read setup failure");
+        expect(state.ownershipChecks.size).toBe(1);
+        expect(state.childParentReads.size).toBe(1);
+        expect(state.childParentReads.get("ses_child")?.users).toBe(1);
+        expect(server.requests("GET", "/api/session/ses_child")[0]!.signal.aborted).toBe(false);
+      }
+    } finally { fault.mockRestore(); }
+    later = state.verifiedChild("ses_child", "ses_parent", signal);
+    expect(state.ownershipChecks.size).toBe(2);
+    expect(state.childParentReads.get("ses_child")?.users).toBe(2);
+    release();
+    expect(await existing).toBe(true);
+    expect(await later).toBe(true);
+    expect(state.ownershipChecks.size).toBe(0);
+    expect(state.childParentReads.size).toBe(0);
+    expect(server.requests("GET", "/api/session/ses_child")).toHaveLength(1);
+    expect(server.calls.every(call => call.method === "GET")).toBe(true);
+  } finally { release(); await Promise.allSettled([existing, ...(later ? [later] : [])]); await provider.dispose(); }
+});
+
+for (const foreignWorkspace of [false, true]) test(`shared child ownership checks each caller's parent (${foreignWorkspace ? "foreign workspace" : "foreign parent first"})`, async () => {
+  const fixture = JSON.parse(readFileSync(path.join(import.meta.dir, "../../../../tests/fixtures/opencode-v2/background-2.0.29.json"), "utf8"));
+  let entered!: () => void, release!: () => void;
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const server = fakeOpenCode({
+    "GET /api/session/:id/message": ({ path }) => ({ data: path.includes("ses_child/") ? [] : [fixture.launch], cursor: {} }),
+    "GET /api/session/:id": async ({ path }) => {
+      const id = path.split("/").at(-1)!;
+      if (id !== "ses_child") return session(id);
+      entered(); await gate;
+      return session(id, { parentID: "ses_parent", ...(foreignWorkspace ? { location: { directory: "/foreign" } } : {}) });
+    },
+  });
+  const provider = server.provider();
+  const foreign = provider.listMessages("ses_other", { limit: 10 });
+  let owned: ReturnType<typeof provider.listMessages> | undefined;
+  try {
+    await started;
+    owned = provider.listMessages("ses_parent", { limit: 10 });
+    const deadline = Date.now() + 1_000;
+    while ((provider as unknown as { ownershipChecks: Set<unknown> }).ownershipChecks.size < 2 && Date.now() < deadline) await Bun.sleep(0);
+    expect((provider as unknown as { ownershipChecks: Set<unknown> }).ownershipChecks.size).toBe(2);
+    release();
+    expect((await foreign).completeItems?.some(item => item.type === "background_task")).toBe(false);
+    expect((await owned).completeItems?.some(item => item.type === "background_task")).toBe(!foreignWorkspace);
+    expect(server.requests("GET", "/api/session/ses_child")).toHaveLength(1);
+    if (foreignWorkspace) expect(server.requests("GET", "/api/session/ses_child/message")).toHaveLength(0);
+  } finally { release(); await Promise.allSettled([foreign, ...(owned ? [owned] : [])]); await provider.dispose(); }
+});
+
+test("a stream child deadline leaves a concurrent history recovery alive", async () => {
+  const fixture = JSON.parse(readFileSync(path.join(import.meta.dir, "../../../../tests/fixtures/opencode-v2/background-2.0.29.json"), "utf8"));
+  let wire!: ReadableStreamDefaultController<Uint8Array>, entered!: () => void, release!: () => void;
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const frame = (type: string, data: unknown) => wire.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({ type, data, created: 30, location: { directory: WORKSPACE } })}\n\n`));
+  const server = fakeOpenCode({
+    "GET /api/event": () => new Response(new ReadableStream<Uint8Array>({ start(controller) { wire = controller; frame("server.connected", {}); } }), { headers: { "content-type": "text/event-stream" } }),
+    "GET /api/session/ses_parent": () => session("ses_parent"),
+    "GET /api/session/ses_parent/message": () => ({ data: [fixture.launch], cursor: {} }),
+    "GET /api/session/ses_child": async ({ signal }) => { entered(); await gate; signal.throwIfAborted(); return session("ses_child", { parentID: "ses_parent" }); },
+    "GET /api/session/ses_child/message": () => ({ data: [], cursor: {} }),
+  });
+  const provider = server.provider(), stream = observedNativeStream(provider);
+  let recovery: ReturnType<typeof provider.listMessages> | undefined;
+  try {
+    await stream.seen(event => event.eventType === "server.connected");
+    frame("session.message.content.updated", { sessionID: "ses_parent", messageID: fixture.launch.id, content: [{ type: "text", text: "Survives deadline" }, ...fixture.launch.content] });
+    await started;
+    recovery = provider.listMessages("ses_parent", { limit: 10 });
+    void recovery.catch(() => undefined);
+    const deadline = Date.now() + 800;
+    while ((provider as unknown as { ownershipChecks: Set<unknown> }).ownershipChecks.size < 2 && Date.now() < deadline) await Bun.sleep(0);
+    expect((provider as unknown as { ownershipChecks: Set<unknown> }).ownershipChecks.size).toBe(2);
+    await stream.seen(event => event.updates.some(update => update.kind === "text" && update.text === "Survives deadline"));
+    expect(server.requests("GET", "/api/session/ses_child")[0]!.signal.aborted).toBe(false);
+    release();
+    expect((await recovery).completeItems).toContainEqual(expect.objectContaining({ type: "background_task", childConversationId: "ses_child" }));
+    expect(server.requests("GET", "/api/session/ses_child")).toHaveLength(1);
+    expect(server.calls.every(call => call.method === "GET")).toBe(true);
+  } finally { release(); await recovery?.catch(() => undefined); stream.lifetime.abort(); await stream.pump.catch(() => undefined); await provider.dispose(); }
+});
+
 for (const kind of ["agent", "shell"] as const) for (const reconnect of [false, true]) test(`new live ${kind} is stoppable ${reconnect ? "after a native observation gap" : "without a gap"}`, async () => {
   const { fake, provider, adapter } = nativeBackgroundStack();
   let stream = observedNativeStream(provider);

@@ -29,6 +29,71 @@ import { notificationPipeline } from "../../tests/notification-pipeline";
 import { startOpenCodeV2Fake } from "../../tests/e2e/opencode-v2-fake";
 import { addAcceptedDraft, applyChatEvent, projectionFromSnapshot } from "./projection";
 
+test("covered V2 snapshot preserves a rename published during its history read", async () => {
+  const directory = process.cwd(), fake = startOpenCodeV2Fake({ directory });
+  const provider = createOpenCodeV2Provider({ endpoint: fake.url, password: fake.password, directory });
+  const adapter = new ChatAdapter({ provider, workspacePath: directory, coalesceWindowMs: 0 });
+  try {
+    const id = (await provider.createSession("Original title")).id;
+    await adapter.history(id);
+    const listMessages = provider.listMessages.bind(provider);
+    let renamed = false;
+    provider.listMessages = async (sessionId, options) => {
+      const page = await listMessages(sessionId, options);
+      if (sessionId === id && !renamed) {
+        renamed = true;
+        await adapter.renameConversation(id, "concurrent-rename", "Renamed while reading");
+      }
+      return page;
+    };
+    const snapshot = await adapter.history(id);
+    const client = await adapter.subscribe(id, { cursor: snapshot.cursor });
+    client.events.cancel();
+    let browser = projectionFromSnapshot(snapshot);
+    for await (const event of client.events) browser = applyChatEvent(browser, event).projection;
+    expect(browser.conversation?.title).toBe("Renamed while reading");
+  } finally { await adapter.dispose(); await fake.stop(); }
+});
+
+for (const large of [false, true]) test(`real V2 unchanged parent and child snapshots do not repeatedly request resync${large ? " with oversized settled worker output" : ""}`, async () => {
+  const directory = process.cwd(), fake = startOpenCodeV2Fake({ directory });
+  const provider = createOpenCodeV2Provider({ endpoint: fake.url, password: fake.password, directory });
+  const adapter = new ChatAdapter({ provider, workspacePath: directory, coalesceWindowMs: 0 });
+  try {
+    const parent = (await provider.createSession("Repeated recovery")).id;
+    const worker = fake.launchWorker(parent, true);
+    if (large) {
+      fake.settleWorker(worker.childId, "completed", "Large worker result. ".repeat(14_000));
+      fake.launchWorker(parent, true, worker.childId);
+    }
+    const listMessages = provider.listMessages.bind(provider);
+    let report = 0, reporting = false;
+    provider.listMessages = async (id, options) => {
+      const page = await listMessages(id, options);
+      if (large && reporting && id === parent) {
+        const model = `Concurrent report ${++report}`;
+        fake.workerReport(worker.childId, model, "high", 0.001);
+        await waitUntil(() => adapter.projectionForTests(parent).items().some(item => (item.type === "tool" || item.type === "background_task") && item.workerSession?.model === model));
+      }
+      return page;
+    };
+    for (const id of large ? [parent] : [parent, worker.childId]) {
+      await adapter.history(id);
+      reporting = true;
+      const resyncs: ChatEvent[][] = [];
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const snapshot = await adapter.history(id);
+        const client = await adapter.subscribe(id, { cursor: snapshot.cursor });
+        client.events.cancel();
+        const replay: ChatEvent[] = [];
+        for await (const event of client.events) replay.push(event);
+        resyncs.push(replay.filter(event => event.type === "resync"));
+      }
+      expect(resyncs).toEqual([[], [], []]);
+    }
+  } finally { await adapter.dispose(); await fake.stop(); }
+});
+
 for (const kind of ["agent", "shell"] as const) for (const local of [false, true]) test(`real V2 ${local ? "local" : "external"} revert keeps live ${kind} but removes its hidden settlement`, async () => {
   const directory = process.cwd(), fake = startOpenCodeV2Fake({ directory });
   const provider = createOpenCodeV2Provider({ endpoint: fake.url, password: fake.password, directory });
