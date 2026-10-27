@@ -76,6 +76,24 @@ const scoped = <T>(data: T) => ({ location: { directory: WORKSPACE }, data });
 const skillInfo = (id: string, overrides: { name?: string; description?: string } = {}) => ({ id, name: overrides.name ?? id, ...(overrides.description ? { description: overrides.description } : {}), path: `/ws/.opencode/skills/${id}/SKILL.md`, content: `# ${id}` });
 const notFound = (sessionID: string) => Response.json({ _tag: "SessionNotFoundError", sessionID, message: `Session not found: ${sessionID}` }, { status: 404 });
 
+function historyWorkerLaunch(id: string, at: number) {
+  return { id: `msg_${id}`, type: "assistant", time: { created: at }, content: [
+    { id, type: "tool", name: "subagent", time: { created: at, ran: at + 1, completed: at + 2 }, state: {
+      status: "completed", input: { description: "Fixture worker", background: true }, metadata: { sessionID: "ses_child", status: "running" },
+    } },
+  ] };
+}
+const historyWorkerResult = (id: string, at: number) => ({ id, type: "synthetic", time: { created: at }, text: "Fixture done.", metadata: { source: "subagent", childID: "ses_child", state: "completed" } });
+function workerHistoryServer(messages: unknown[], idle: unknown[]) {
+  return fakeOpenCode({
+    "GET /api/session/active": () => ({ ses_child: { status: "running" } }),
+    "GET /api/session/:id": ({ path }) => session(path.split("/").at(-1)!, path.endsWith("ses_child") ? { parentID: "ses_parent" } : {}),
+    "GET /api/session/ses_parent/inbox": () => ({ data: [] }),
+    "GET /api/session/ses_parent/message": () => ({ data: messages, cursor: {} }),
+    "GET /api/session/ses_child/message": () => ({ data: idle, cursor: {} }),
+  });
+}
+
 type StopEvidence = {
   parent: string; taskId: string; child?: string; launchCalls?: readonly string[]; occurrence?: unknown;
   pendingChanges: Set<string>;
@@ -2971,6 +2989,77 @@ describe("OpenCode 2.x provider: sessions", () => {
     const older = await provider.listMessages("ses_parent", { cursor: result.nextCursor, limit: 1 });
     expect(new Set([...result.items, ...older.items].filter(item => item.type === "background_task").map(item => item.id)).size).toBe(1);
   });
+  test("historical execution intervals correlate six launchers to five explicit results without reordering tools", async () => {
+    const launch = historyWorkerLaunch, result = historyWorkerResult;
+    const messages = [launch("call_a", 10), launch("call_b", 20), result("result_0", 40),
+      ...[1, 2, 3, 4].flatMap(i => [launch(`call_${i}`, i * 100), result(`result_${i}`, i * 100 + 40)])];
+    const server = fakeOpenCode({
+      "GET /api/session/active": () => ({}),
+      "GET /api/session/:id": ({ path }) => session(path.split("/").at(-1)!, path.endsWith("ses_child") ? { parentID: "ses_parent" } : {}),
+      "GET /api/session/ses_parent/inbox": () => ({ data: [] }),
+      "GET /api/session/ses_parent/message": () => ({ data: messages, cursor: {} }),
+      "GET /api/session/ses_child/message": () => ({ data: [30, 130, 230, 330, 430].map(at => ({ id: `idle_${at}`, type: "idle", time: { created: at } })), cursor: {} }),
+    });
+    const provider = server.provider();
+    try {
+      const page = await provider.listMessages("ses_parent", { limit: 100 });
+      const tasks = page.items.filter(item => item.type === "background_task");
+      expect(tasks).toHaveLength(5);
+      expect(tasks).toContainEqual(expect.objectContaining({ toolUseId: "call_a", toolUseIds: ["call_a", "call_b"], status: "completed", resultId: "result_0" }));
+      for (const i of [1, 2, 3, 4]) expect(tasks).toContainEqual(expect.objectContaining({ toolUseId: `call_${i}`, status: "completed", resultId: `result_${i}` }));
+      expect(page.items.filter(item => item.type === "tool").map(item => item.id)).toEqual(["tool:call_a", "tool:call_b", "tool:call_1", "tool:call_2", "tool:call_3", "tool:call_4"]);
+      const recovered = await provider.reconcileBackgroundTasks("ses_parent");
+      expect(recovered).toHaveLength(5);
+      expect(recovered.every(item => item.status === "completed" && item.stateUncertain === false)).toBe(true);
+    } finally { await provider.dispose(); }
+    expect(server.calls.every(call => call.method === "GET")).toBe(true);
+  });
+
+  test("historical aliases without an explicit result remain uncertain and cannot stop a continued child", async () => {
+    const server = workerHistoryServer([historyWorkerLaunch("call_a", 10), historyWorkerLaunch("call_b", 20)],
+      [{ id: "idle", type: "idle", time: { created: 30 } }]);
+    const provider = server.provider();
+    try {
+      expect(await provider.reconcileBackgroundTasks("ses_parent")).toEqual([expect.objectContaining({ toolUseIds: ["call_a", "call_b"], status: "running", stateUncertain: true })]);
+      await expect(provider.stopTask("ses_parent", "v2:ses_parent:call_a")).rejects.toThrow(/no longer confirmed/);
+      expect(server.calls.every(call => call.method === "GET")).toBe(true);
+    } finally { await provider.dispose(); }
+  });
+
+  for (const clock of ["missing-launch", "tied-launch", "tied-boundary", "missing-boundary"] as const) test(`historical interval grouping preserves ambiguity with ${clock} clocks`, async () => {
+    const first = historyWorkerLaunch("call_a", 10), second = historyWorkerLaunch("call_b", 20);
+    const idle = { id: "idle", type: "idle", time: { created: 30 } as { created?: number } };
+    if (clock === "missing-launch") second.content[0]!.time = {} as typeof second.content[0]["time"];
+    if (clock === "tied-launch") second.content[0]!.time = { ...first.content[0]!.time };
+    if (clock === "tied-boundary") second.content[0]!.time.ran = 30;
+    if (clock === "missing-boundary") delete idle.time.created;
+    const server = workerHistoryServer([first, second, historyWorkerResult("result", 40)], [idle]);
+    const provider = server.provider();
+    try {
+      const tasks = await provider.reconcileBackgroundTasks("ses_parent");
+      const launchers = tasks.filter(task => task.toolUseId);
+      expect(launchers).toHaveLength(2);
+      expect(launchers.every(task => task.status === "running" && task.stateUncertain && !task.resultId)).toBe(true);
+    } finally { await provider.dispose(); }
+  });
+
+  for (const datedBeforeNewRun of [true, false]) test(`historical delayed result ${datedBeforeNewRun ? "settles only the old run and deduplicates" : "cannot choose a run from a late clock"}`, async () => {
+    const report = historyWorkerResult("result", datedBeforeNewRun ? 40 : 140);
+    const server = workerHistoryServer([historyWorkerLaunch("call_a", 10), historyWorkerLaunch("call_b", 20), historyWorkerLaunch("call_new", 100), report, report],
+      [{ id: "idle", type: "idle", time: { created: 30 } }]);
+    const provider = server.provider();
+    try {
+      const tasks = await provider.reconcileBackgroundTasks("ses_parent");
+      expect(tasks.filter(task => task.resultId === "result")).toHaveLength(1);
+      expect(tasks).toContainEqual(expect.objectContaining({ toolUseId: "call_new", status: "running" }));
+      expect(tasks.find(task => task.toolUseId === "call_new")?.resultId).toBeUndefined();
+      const old = tasks.find(task => task.toolUseId === "call_a");
+      expect(old?.toolUseIds).toEqual(["call_a", "call_b"]);
+      expect(old?.status).toBe(datedBeforeNewRun ? "completed" : "running");
+      expect(old?.resultId).toBe(datedBeforeNewRun ? "result" : undefined);
+    } finally { await provider.dispose(); }
+  });
+
   test("child execution boundaries separate reused occurrences; an ambiguous delayed notice settles neither", async () => {
     const fixture = JSON.parse(readFileSync(path.join(import.meta.dir, "../../../../tests/fixtures/opencode-v2/background-2.0.29.json"), "utf8"));
     const notice = { ...fixture.stored, time: { created: 70 } };

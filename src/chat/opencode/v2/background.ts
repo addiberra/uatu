@@ -531,7 +531,11 @@ function identity(value: unknown): value is string {
  */
 export class BackgroundWorkers {
   private recoveryOnly = false;
-  constructor(private readonly budget: { entries?: number; bytes?: number; retained?: () => { bytes: number; entries: number }; onSaturation?: () => void } = {}) {}
+  constructor(private readonly budget: { entries?: number; bytes?: number; retained?: () => { bytes: number; entries: number }; onSaturation?: () => void;
+    /** Complete, verified child execution history for a transient history fold.
+     * Group occurrences before later idle boundaries revoke unresolved work. */
+    executionHistory?: ReadonlyMap<string, readonly number[]>;
+  } = {}) {}
   private readonly parents = new Map<string, string>();
   private readonly tasks = new Map<string, { parent: string; worker: string; item: BackgroundTaskItem; evidence: WorkerOccurrenceEvidence }>();
   private readonly notices = new Map<string, { proof?: NativeProof; occurrence?: string; discarded?: { parent: string; worker: string; at?: number } }>();
@@ -721,6 +725,28 @@ export class BackgroundWorkers {
     this.bound();
   }
 
+  /** End the transient history fold without treating an idle as a result. */
+  finishHistory(): NormalizedProviderUpdate[] {
+    if (!this.budget.executionHistory) return [];
+    const updates: NormalizedProviderUpdate[] = [];
+    for (const task of this.tasks.values()) if (task.item.taskType === "agent" && task.item.status === "running"
+      && this.ended.get(task.worker)?.some(end => end >= task.item.createdAt)) {
+      this.uncertain(task);
+      updates.push({ kind: "upsert", item: task.item });
+    }
+    return updates;
+  }
+
+  private sameHistoricalInterval(child: string, previous: LauncherEvidence, next: LauncherEvidence): boolean {
+    const history = this.budget.executionHistory;
+    if (!history) return true;
+    const ends = history.get(child), left = previous.ran ?? previous.created, right = next.ran ?? next.created;
+    // Display fallback clocks, tied starts and incomplete histories cannot
+    // prove that two calls belong to one execution. Keep them separate.
+    return ends !== undefined && left !== undefined && right !== undefined && left < right
+      && !ends.some(end => end >= left && end <= right);
+  }
+
   launch(parent: string, value: unknown, at: number): NormalizedProviderUpdate[] {
     return this.launchPrepared(parent, prepareTool(value, at), at);
   }
@@ -748,6 +774,7 @@ export class BackgroundWorkers {
     const invocation = this.invocations.get(`${parent}:${call}`);
     const startedAt = fact.ran ?? fact.created ?? at;
     const shared = [...this.tasks.values()].find(task => task.parent === parent && task.worker === child && task.item.taskType === (shell ? "shell" : "agent") && task.item.status === "running" && !task.evidence.uncertain
+      && (shell || task.evidence.launches.every(launch => this.sameHistoricalInterval(child, launch, fact)))
       && !this.ended.get(child)?.some(end => end >= task.item.createdAt && end < startedAt));
     if (shared) {
       if (invocation) this.set(this.invocations, `${parent}:${call}`, { ...invocation, occurrence: shared.evidence.key });
@@ -765,7 +792,7 @@ export class BackgroundWorkers {
       ...(prepared.agent ? { subagentType: prepared.agent } : {}),
       ...(prepared.prompt ? { prompt: prepared.prompt } : {}),
       status: "running",
-      ...(this.ended.get(child)?.some(end => end >= startedAt) || [...this.notices.values()].some(notice => notice.discarded?.parent === parent
+      ...(!this.budget.executionHistory?.has(child) && this.ended.get(child)?.some(end => end >= startedAt) || [...this.notices.values()].some(notice => notice.discarded?.parent === parent
         && notice.discarded.worker === child && (notice.discarded.at === undefined || notice.discarded.at >= startedAt)) ? { stateUncertain: true } : {}),
     };
     const superseded: NormalizedProviderUpdate[] = [];

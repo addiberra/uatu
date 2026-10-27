@@ -20,7 +20,7 @@ import type {
   ProviderSession,
   StoredMessageAccounting,
 } from "../../provider";
-import { pendingPermissionFields } from "../normalization";
+import { pendingPermissionFields, number } from "../normalization";
 import { BackgroundControls, BackgroundWorkers, launcherChanged, retainLauncherEvidence, sameLauncherIdentity, type ControlRead, type LauncherEvidence, type WorkerOccurrenceEvidence } from "./background";
 import { createOpenCodeV2Memory, createOpenCodeV2Normalizer, formPresentation, modelSelection, normalizeStoredMessage, pendingInboxEntry, prepareStoredMessage, storedAccounting, storedPromptId, supportedFormFields, type V2Evidence } from "./normalization";
 import type { ChatAccountChange, ChatAgent, ChatCommand, ChatLoginState, ChatMode, ChatModel, ConversationConfiguration, MessageDelivery, ModelSelection, RestoredDraft, ReversibleHistoryResult, ReversibleHistoryState } from "../../types";
@@ -407,7 +407,8 @@ export class OpenCodeV2Provider implements ChatProvider {
     signal = AbortSignal.any([signal, AbortSignal.timeout(5_000)]);
     // A finite complete-history fold is discarded after this read; only
     // long-lived stream memory uses the retention budget/fallback.
-    const workers = new BackgroundWorkers({ entries: Infinity, bytes: Infinity });
+    const executionHistory = new Map<string, readonly number[]>();
+    const workers = new BackgroundWorkers({ entries: Infinity, bytes: Infinity, executionHistory });
     const unavailableChildren = new Set<string>();
     // Only scoped session records establish child ownership. Tool metadata
     // supplies an identity to verify, never permission to read a foreign child.
@@ -433,9 +434,11 @@ export class OpenCodeV2Provider implements ChatProvider {
         // launcher completes (or when another client continued the child).
         // An active child alone cannot verify that old occurrence.
         try {
-          for (const message of await this.allMessages(child, signal)) {
-            if (message.type === "idle") workers.executionEnded(child, messageCreatedAt(message));
-          }
+          const idle = (await this.allMessages(child, signal)).filter(message => message.type === "idle");
+          const ends = idle.map(message => number(asRecord(message.time).created));
+          for (const end of ends) if (end !== undefined && end >= 0) workers.executionEnded(child, end);
+          if (ends.every((end): end is number => end !== undefined && end >= 0)) executionHistory.set(child, ends);
+          else unavailableChildren.add(child);
         } catch { unavailableChildren.add(child); }
       }
     }
@@ -455,6 +458,10 @@ export class OpenCodeV2Provider implements ChatProvider {
           ? { ...item, stateUncertain: true } : item, index });
       }
     });
+    for (const update of workers.finishHistory()) if (update.kind === "upsert") {
+      const entry = normalized.get(update.item.id);
+      if (entry) normalized.set(update.item.id, { ...entry, item: update.item });
+    }
     if (overlay) for (const [id, entry] of normalized) if (entry.item.type === "background_task") normalized.set(id, { ...entry,
       item: this.controls.project(entry.item, workers.occurrence(entry.item.taskId), controlRead, workers.controlWitnesses(entry.item.taskId)) });
     this.eventMemory?.workers.enforceBudget();

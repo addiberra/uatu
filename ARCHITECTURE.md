@@ -1008,6 +1008,13 @@ fallbacks; progress or lagging history cannot erase a known supersession.
 Consumed replay requires retained identity, stamp, semantic fingerprint and an
 occurrence link, not merely an old-looking timestamp.
 
+Complete history reconstructs verified child execution intervals before applying
+later idle boundaries to unresolved work. Native launcher clocks within one
+interval can identify aliases; missing or tied clocks and incomplete child history
+remain conservative. This grouping preserves parent transcript order and does not
+relax retained control revocations. An idle boundary alone never completes a
+worker: settlement still requires an explicit, unambiguously correlated result.
+
 Live projection correlation and control evidence share a bound of 8,192 entries /
 4 MiB of conservative serialized UTF-16 payload, not a heap guarantee.
 The provider-lifetime control cohort uses up to 2,048 entries / 1 MiB within that
