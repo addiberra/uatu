@@ -1009,15 +1009,24 @@ Consumed replay requires retained identity, stamp, semantic fingerprint and an
 occurrence link, not merely an old-looking timestamp.
 
 Complete history reconstructs verified child execution intervals before applying
-later idle boundaries to unresolved work. Native launcher clocks within one
-interval can identify aliases regardless of their content order: native content
-appends when tool input starts, while `time.ran` records when the tool is called.
-Those orders may differ. Interval comparison uses the earlier and later native
-start coordinates; missing or tied clocks, intervening boundaries in either
-direction, and incomplete child history remain conservative. This grouping
-preserves parent transcript order rather than sorting it, without relaxing retained
-control revocations. An idle boundary alone never completes a worker: settlement
-still requires an explicit, unambiguously correlated result.
+later idle boundaries to unresolved work. Launcher timing bounds an admission
+window, not an exact job start: `time.ran` precedes permission approval, while
+accepted-running tool success (`time.completed`, or its native success-event
+clock) bounds admission from above. Input-content order can differ from call
+order. Aliases require complete child history placing both windows wholly within
+one interval, with distinct native start coordinates. A boundary strictly between
+the incoming window and every prior alias's window preserves that separate
+occurrence for later aliases, rather than superseding it by content position.
+Missing, tied, reversed or boundary-straddling windows cannot supply this proof.
+This history-only exception preserves parent transcript order; live supersession
+and retained control revocations are unchanged.
+
+An idle boundary alone never completes a worker. Explicit reports remain readable
+when their occurrence is ambiguous; in particular, a report before or tied to a
+known accepted-running success cannot settle that launch, and an ambiguous
+admission window cannot justify report assignment. A unique explicit report may
+still settle a legacy launch without a recorded acceptance clock, but missing
+clocks never prove aliasing. An old result cannot settle a newer run.
 
 Live projection correlation and control evidence share a bound of 8,192 entries /
 4 MiB of conservative serialized UTF-16 payload, not a heap guarantee.
@@ -1037,12 +1046,14 @@ ownership lifetime. Complete-history folds are transient and precede pagination.
 
 The first live inventory closes only after its relevant worker evidence reads
 are complete. A failed active-state, shell-ownership, or child-history lookup may
-still publish uncertain rows while admitting healthy siblings. A shared read
-guard records that incompleteness across transcript, private snapshot, and
-public visibility callers, leaving initial classification eligible for a fresh,
-positively verified retry without requiring a repeated launcher event. It does
-not reopen an already completed inventory or clear failed-read, observation-gap,
-capacity, ownership, or unavailable-target guards.
+still publish uncertain rows while admitting healthy siblings. A partial-inventory
+marker in the existing bounded scope ledger survives read callers. While it is
+pending, transcript-only reads cannot admit unretained targets or close initial
+inventory; healthy retained siblings keep their controls. Inventory-capable fresh
+recovery can positively verify unchanged targets and discharge the marker without
+a repeated launcher event. Per-read guards still track failures and concurrency.
+Neither mechanism reopens completed inventory or clears observation-gap, capacity,
+ownership, or unavailable-target guards.
 
 Observation gaps retire existing authorizations without globally closing future
 control admission. New post-gap targets require positive native birth and matching

@@ -84,11 +84,11 @@ function historyWorkerLaunch(id: string, at: number) {
   ] };
 }
 const historyWorkerResult = (id: string, at: number) => ({ id, type: "synthetic", time: { created: at }, text: "Fixture done.", metadata: { source: "subagent", childID: "ses_child", state: "completed" } });
-function workerHistoryServer(messages: unknown[], idle: unknown[]) {
+function workerHistoryServer(messages: unknown[], idle: unknown[], pending: unknown[] = []) {
   return fakeOpenCode({
     "GET /api/session/active": () => ({ ses_child: { status: "running" } }),
     "GET /api/session/:id": ({ path }) => session(path.split("/").at(-1)!, path.endsWith("ses_child") ? { parentID: "ses_parent" } : {}),
-    "GET /api/session/ses_parent/inbox": () => ({ data: [] }),
+    "GET /api/session/ses_parent/inbox": () => ({ data: pending }),
     "GET /api/session/ses_parent/message": () => ({ data: messages, cursor: {} }),
     "GET /api/session/ses_child/message": () => ({ data: idle, cursor: {} }),
   });
@@ -1520,6 +1520,52 @@ describe("OpenCode 2.x provider: sessions", () => {
       expect(page.completeItems).toContainEqual(expect.objectContaining({ type: "background_task", taskType: "agent", stateUncertain: true }));
       server.state.failure = "";
       for (let retry = 0; retry < 3; retry++) expect((await provider.reconcileBackgroundTasks("ses_parent", { fresh: true })).every(task => task.stateUncertain === false)).toBe(true);
+    } finally { stream.lifetime.abort(); await stream.pump.catch(() => undefined); await provider.dispose(); }
+  });
+
+  for (const removed of [true, false]) test(`failed first shell inventory cannot be replaced by transcript proof for a ${removed ? "removed" : "running"} target`, async () => {
+    const fixture = JSON.parse(readFileSync(path.join(import.meta.dir, "../../../../tests/fixtures/opencode-v2/background-2.0.29.json"), "utf8"));
+    let failure = true, gone = false;
+    const healthy = structuredClone(fixture.shell);
+    healthy.id = "healthy_shell_message";
+    healthy.content[0].id = "healthy_shell";
+    healthy.content[0].state.metadata.shellID = "sh_healthy";
+    const server = fakeOpenCode({
+      "GET /api/event": () => new Response(new ReadableStream<Uint8Array>({ start(controller) {
+        controller.enqueue(new TextEncoder().encode('data: {"type":"server.connected","data":{}}\n\n'));
+      } }), { headers: { "content-type": "text/event-stream" } }),
+      "GET /api/session/active": () => ({ ses_child: { status: "running" } }),
+      "GET /api/session/:id": ({ path }) => session(path.split("/").at(-1)!, path.endsWith("ses_child") ? { parentID: "ses_parent" } : {}),
+      "GET /api/session/ses_parent/message": () => ({ data: [fixture.launch, fixture.shell, healthy], cursor: {} }),
+      "GET /api/session/ses_child/message": () => ({ data: [], cursor: {} }),
+      "GET /api/session/ses_parent/inbox": () => ({ data: [] }),
+      "GET /api/shell/:id": ({ path }) => path.endsWith("sh_fixture") && failure ? new Response(null, { status: 500 })
+        : path.endsWith("sh_fixture") && gone ? new Response(null, { status: 404 })
+          : scoped({ id: path.split("/").at(-1), command: "printf fixture", status: "running", time: { started: 71 }, metadata: { sessionID: "ses_parent" } }),
+    });
+    const provider = server.provider(), stream = observedNativeStream(provider);
+    const controls = (provider as unknown as { controls: { current(taskId: string): boolean } }).controls;
+    try {
+      await stream.seen(event => event.eventType === "server.connected");
+      expect(await provider.reconcileBackgroundTasks("ses_parent", { fresh: true })).toContainEqual(expect.objectContaining({ toolUseId: "call_shell", stateUncertain: true }));
+      expect(controls.current("v2:ses_parent:call_shell")).toBe(false);
+      failure = false; gone = removed;
+      const reads = server.requests("GET", "/api/shell/sh_fixture").length;
+      for (let retry = 0; retry < 2; retry++) {
+        const page = await provider.listMessages("ses_parent", { limit: 100 });
+        expect(page.completeItems).toContainEqual(expect.objectContaining({ toolUseId: "call_shell", status: "running", stateUncertain: true }));
+        expect(controls.current("v2:ses_parent:call_shell")).toBe(false);
+        for (const call of ["call_worker", "healthy_shell"]) {
+          expect(page.completeItems).toContainEqual(expect.objectContaining({ toolUseId: call, status: "running", stateUncertain: false }));
+          expect(controls.current(`v2:ses_parent:${call}`)).toBe(true);
+        }
+      }
+      expect(server.requests("GET", "/api/shell/sh_fixture")).toHaveLength(reads);
+      const recovered = await provider.reconcileBackgroundTasks("ses_parent", { fresh: true });
+      expect(recovered.find(task => task.toolUseId === "call_shell")).toMatchObject({ status: "running", stateUncertain: removed });
+      expect(controls.current("v2:ses_parent:call_shell")).toBe(!removed);
+      expect(server.requests("GET", "/api/shell/sh_fixture")).toHaveLength(reads + 1);
+      expect(server.calls.every(call => call.method === "GET")).toBe(true);
     } finally { stream.lifetime.abort(); await stream.pump.catch(() => undefined); await provider.dispose(); }
   });
 
@@ -3168,6 +3214,91 @@ describe("OpenCode 2.x provider: sessions", () => {
         expect(tasks).toEqual([expect.objectContaining({ toolUseId: "call_a", toolUseIds: ["call_a", "call_b"], status: "completed", stateUncertain: false, resultId: "result" })]);
       }
       expect(server.calls.every(call => call.method === "GET")).toBe(true);
+    } finally { await provider.dispose(); }
+  });
+
+  for (const combined of [true, false]) for (const order of [
+    ["new_a", "old", "new_b"], ["new_a", "new_b", "old"], ["old", "new_a", "new_b"],
+    ["old", "new_b", "new_a"], ["new_b", "new_a", "old"], ["new_b", "old", "new_a"],
+  ]) test(`historical supersession preserves separate intervals: ${order.join("/")} ${combined ? "combined" : "split"} assistants with pending results`, async () => {
+    const starts: Record<string, number> = { old: 13, new_a: 21, new_b: 25 };
+    const launches = order.map((call, index) => {
+      const message = historyWorkerLaunch(call, index + 2);
+      message.content[0]!.time = { created: index + 2, ran: starts[call]!, completed: starts[call]! + 1 };
+      return message;
+    });
+    const messages: unknown[] = combined ? [{ ...launches[0]!, content: launches.flatMap(message => message.content) }] : launches;
+    const reports = [historyWorkerResult("old_result", 18), historyWorkerResult("new_result", 40)];
+    const pending: unknown[] = reports.map(({ id, time, text, metadata }) => ({ id, time, type: "synthetic", delivery: "steer", payload: { text, metadata } }));
+    const server = workerHistoryServer(messages, [17, 30].map(at => ({ id: `idle_${at}`, type: "idle", time: { created: at } })), pending);
+    const aliases = order.filter(call => call !== "old");
+    const expected = [
+      { toolUseId: "old", toolUseIds: undefined, status: "completed" as const, stateUncertain: false, resultId: "old_result" },
+      { toolUseId: aliases[0], toolUseIds: aliases, status: "completed" as const, stateUncertain: false, resultId: "new_result" },
+    ].sort((left, right) => left.toolUseId!.localeCompare(right.toolUseId!));
+    const recovering = server.provider();
+    try {
+      const tasks = await recovering.reconcileBackgroundTasks("ses_parent", { fresh: true });
+      expect(tasks).toHaveLength(2);
+      expect(tasks.map(({ toolUseId, toolUseIds, status, stateUncertain, resultId }) => ({ toolUseId, toolUseIds, status, stateUncertain, resultId }))
+        .sort((left, right) => (left.toolUseId ?? "").localeCompare(right.toolUseId ?? ""))).toEqual(expected);
+    } finally { await recovering.dispose(); }
+    // Delivery changes the envelope, not the occurrence/result identities.
+    messages.push(...reports);
+    pending.length = 0;
+    const history = server.provider();
+    try {
+      const page = await history.listMessages("ses_parent", { limit: 100 });
+      expect(page.completeItems?.filter(item => item.type === "tool").map(item => item.id)).toEqual(order.map(call => `tool:${call}`));
+      expect(page.completeItems?.filter(item => item.type === "background_task")
+        .map(({ toolUseId, toolUseIds, status, stateUncertain, resultId }) => ({ toolUseId, toolUseIds, status, stateUncertain, resultId }))
+        .sort((left, right) => (left.toolUseId ?? "").localeCompare(right.toolUseId ?? ""))).toEqual(expected);
+      expect(server.calls.every(call => call.method === "GET")).toBe(true);
+    } finally { await history.dispose(); }
+  });
+
+  for (const completed of [false, true]) for (const reversed of [false, true]) for (const combined of [false, true]) {
+    for (const clock of ["straddling", "missing-acceptance", "missing-start", "tied-boundary", "tied-window", "reversed-window"] as const) {
+      test(`permission-delayed admission stays uncertain: ${clock}/${completed ? "completed" : "running"}/${reversed ? "reversed" : "forward"}/${combined ? "combined" : "split"}`, async () => {
+        const old = historyWorkerLaunch("old", 3), delayed = historyWorkerLaunch("delayed", 4);
+        old.content[0]!.time = { created: 3, ran: 13, completed: 16 };
+        const time: { created?: number; ran?: number; completed?: number } = { created: 4, ran: 15, completed: 23 };
+        if (clock === "missing-acceptance") delete time.completed;
+        if (clock === "missing-start") { delete time.created; delete time.ran; }
+        if (clock === "tied-boundary") time.completed = 17;
+        if (clock === "tied-window") time.completed = 15;
+        if (clock === "reversed-window") time.completed = 14;
+        delayed.content[0]!.time = time as typeof delayed.content[0]["time"];
+        const launches = reversed ? [delayed, old] : [old, delayed];
+        const messages: unknown[] = combined ? [{ ...old, content: launches.flatMap(message => message.content) }] : launches;
+        const reports = [historyWorkerResult("old_result", 18), ...(completed ? [historyWorkerResult("new_result", 40)] : [])];
+        const pending = reports.map(({ id, time, text, metadata }) => ({ id, time, type: "synthetic", delivery: "steer", payload: { text, metadata } }));
+        const server = workerHistoryServer(messages, (completed ? [17, 30] : [17]).map(at => ({ id: `idle_${at}`, type: "idle", time: { created: at } })), pending);
+        const provider = server.provider();
+        try {
+          const tasks = await provider.reconcileBackgroundTasks("ses_parent", { fresh: true });
+          const launches = tasks.filter(task => task.toolUseId);
+          expect(launches).toHaveLength(2);
+          expect(launches.every(task => task.status === "running" && task.stateUncertain && !task.toolUseIds && !task.resultId)).toBe(true);
+          for (const report of reports) expect(tasks).toContainEqual(expect.objectContaining({ resultId: report.id, status: "completed" }));
+          expect(tasks.filter(task => task.resultId).map(task => task.resultId).sort()).toEqual(reports.map(report => report.id).sort());
+          expect(server.calls.every(call => call.method === "GET")).toBe(true);
+        } finally { await provider.dispose(); }
+      });
+    }
+  }
+
+  for (const boundary of [true, false]) for (const reportAt of [18, 23]) test(`permission-delayed admission cannot consume a pre-acceptance/tied report as the only launch: ${boundary}/${reportAt}`, async () => {
+    const delayed = historyWorkerLaunch("delayed", 4);
+    delayed.content[0]!.time = { created: 4, ran: 15, completed: 23 };
+    const server = workerHistoryServer([delayed, historyWorkerResult("old_result", reportAt)], boundary ? [{ id: "idle", type: "idle", time: { created: 17 } }] : []);
+    const provider = server.provider();
+    try {
+      const tasks = await provider.reconcileBackgroundTasks("ses_parent", { fresh: true });
+      expect(tasks).toHaveLength(2);
+      expect(tasks.find(task => task.toolUseId === "delayed")).toMatchObject({ status: "running", stateUncertain: true });
+      expect(tasks.find(task => task.toolUseId === "delayed")?.resultId).toBeUndefined();
+      expect(tasks.find(task => task.resultId === "old_result")?.toolUseId).toBeUndefined();
     } finally { await provider.dispose(); }
   });
 

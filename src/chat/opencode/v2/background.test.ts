@@ -8,6 +8,22 @@ import { createOpenCodeV2Normalizer } from "./normalization";
 
 const launch = (id: string, worker = id, command = "fixture") => ({ id, name: "shell", state: { status: "completed", input: { command }, metadata: { status: "running", shellID: worker } } });
 
+for (const boundary of ["separated", "live", "missing-history", "missing-start", "tied-start", "tied-earlier", "tied-later"] as const) {
+  test(`historical supersession requires strict interval separation: ${boundary}`, () => {
+    const ends = boundary === "tied-earlier" ? [13, 30] : boundary === "tied-later" ? [21, 30] : [17, 30];
+    const workers = new BackgroundWorkers(boundary === "live" ? {} : { executionHistory: new Map(boundary === "missing-history" ? [] : [["child", ends]]) });
+    workers.verifyChild("child", "parent");
+    const tool = (id: string, ran?: number) => ({ id, name: "subagent", ...(ran === undefined ? {} : { time: { created: ran, ran, completed: ran + 1 } }),
+      state: { status: "completed", metadata: { status: "running", sessionID: "child" } } });
+    workers.launch("parent", tool("new_a", 21), 21);
+    if (boundary === "live") workers.executionEnded("child", 17);
+    workers.launch("parent", tool("old", boundary === "missing-start" ? undefined : boundary === "tied-start" ? 21 : 13), 13);
+    expect(workers.occurrence("v2:parent:new_a")?.uncertain === true).toBe(boundary !== "separated");
+    workers.launch("parent", tool("new_b", 25), 25);
+    expect(workers.occurrence("v2:parent:new_a")?.launches.map(launch => launch.call)).toEqual(boundary === "separated" ? ["new_a", "new_b"] : ["new_a"]);
+  });
+}
+
 function controlFixture(call: string, parent = "parent", worker = call, kind: "agent" | "shell" = "shell") {
   const workers = new BackgroundWorkers();
   const part = kind === "shell" ? launch(call, worker) : { id: call, name: "subagent", state: { status: "completed", input: { prompt: "fixture" }, metadata: { status: "running", sessionID: worker } } };
@@ -20,7 +36,7 @@ function controlFixture(call: string, parent = "parent", worker = call, kind: "a
 }
 
 function controlOracle(controls: BackgroundControls) {
-  const state = controls as unknown as { closed: boolean; projectionLost: boolean; gapSequence: number | null; scopes: Map<string, "retained" | "inventoried" | "gap">;
+  const state = controls as unknown as { closed: boolean; projectionLost: boolean; gapSequence: number | null; scopes: Map<string, "retained" | "partial" | "inventoried" | "gap">;
     records: Map<string, { parent: string; taskId: string; unavailable?: true; aliases?: string[]; pendingCalls?: string[]; evidence?: WorkerOccurrenceEvidence; witnesses?: unknown[]; item?: BackgroundTaskItem }>;
     reads: Map<number, unknown>; observations: Map<string, { witness?: unknown }> };
   const bytes = JSON.stringify([state.closed, state.projectionLost, state.gapSequence, [...state.scopes], [...state.records], [...state.reads], [...state.observations]]).length * 2;
@@ -155,6 +171,29 @@ test("partial inventories preserve healthy sibling proof and completion accounti
   const afterPartial = controls.beginRead("parent", true, true);
   expect(afterPartial.initialInventory).toBe(false);
   controls.endRead(afterPartial); controlOracle(controls);
+});
+
+test("transcript callers cannot discharge an incomplete initial inventory requirement", () => {
+  const controls = new BackgroundControls(), healthy = controlFixture("healthy"), pending = controlFixture("pending");
+  const first = controls.beginRead("parent", true, true);
+  controls.incompleteRead(first);
+  expect(controls.project(healthy.item, healthy.evidence, first).stateUncertain).toBe(false);
+  expect(controls.project({ ...pending.item, stateUncertain: true }, pending.evidence, first).stateUncertain).toBe(true);
+  controls.endRead(first, true);
+  for (let retry = 0; retry < 2; retry++) {
+    const transcript = controls.beginRead("parent", true, true, false);
+    expect(controls.project(pending.item, pending.evidence, transcript).stateUncertain).toBe(true);
+    expect(controls.current(pending.item.taskId)).toBe(false);
+    expect(controls.project(healthy.item, healthy.evidence, transcript).stateUncertain).toBe(false);
+    controls.endRead(transcript, true);
+    controlOracle(controls);
+  }
+  const fresh = controls.beginRead("parent", true, true);
+  expect(fresh.initialInventory).toBe(true);
+  expect(controls.project(pending.item, pending.evidence, fresh).stateUncertain).toBe(false);
+  controls.endRead(fresh, true);
+  expect(controls.current(pending.item.taskId)).toBe(true);
+  controlOracle(controls);
 });
 
 for (const guard of ["gap", "unavailable", "capacity", "foreign-birth"] as const) test(`partial inventory completion cannot clear ${guard} control guards`, () => {

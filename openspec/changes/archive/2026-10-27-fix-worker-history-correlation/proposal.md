@@ -27,3 +27,4 @@ None. This corrects the implementation of existing `opencode-chat` lifecycle, no
 - No API, dependency, configuration, stored-data, or frontend layout changes.
 - Related: #457 describes background lifecycle behavior; #552 is a distinct lookup defect already addressed by #558. No claim to resolve #522 navigation failures or the separately observed unknown shell rows.
 - This tracking record was added after the diagnostic implementation; prospective OpenSpec planning was omitted. Verification and review completion are recorded in `tasks.md`.
+- During review of #559, the user accepted this disclosed, one-time planning-order deviation with truthful remediation documentation. That acceptance does not retroactively make this record prospective or waive future planning: the recovery-edges correction and the later interval-supersession correction were each planned before their implementation.

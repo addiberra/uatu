@@ -25,3 +25,4 @@ None. Existing `opencode-chat` requirements already require one correlated resul
 - Provider recovery/accounting, historical alias grouping, colocated tests, and the affected architecture notes.
 - No API, stored-data, dependency, provider-configuration, or live-service changes.
 - Missing or tied execution evidence, observation gaps, capacity closure, and retained revocations remain conservative. Notification-first multi-alias histories with unestablished production reachability remain outside this correction.
+- This proposal, design, and task list were written before the recovery-edge implementation. Unlike the initial history-correlation record, this correction followed prospective planning; the user's accepted one-time deviation for the initial fix does not apply here or to future work.

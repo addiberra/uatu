@@ -568,7 +568,7 @@ export class OpenCodeV2Provider implements ChatProvider {
     const signal = this.readSignal(AbortSignal.any([lifetime.signal, ...(options?.signal ? [options.signal] : [])]));
     if (signal.aborted) return Promise.reject(new Error("Background recovery unavailable"));
     const timer = setTimeout(() => lifetime.abort(), 5_000);
-    const controlRead = this.beginControlRead(sessionId);
+    const controlRead = this.beginControlRead(sessionId, true);
     let completeRead = false;
     const read = this.coveredRead(signal, () => this.readBackgroundTasks(sessionId, signal, controlRead)).then(snapshot => {
       completeRead = true;
@@ -618,8 +618,8 @@ export class OpenCodeV2Provider implements ChatProvider {
     })) };
   }
 
-  private beginControlRead(parent: string): ControlRead {
-    const read = this.controls.beginRead(parent, this.controls.activeReads + this.ownershipChecks.size < 16, this.streamConnected);
+  private beginControlRead(parent: string, inventory = false): ControlRead {
+    const read = this.controls.beginRead(parent, this.controls.activeReads + this.ownershipChecks.size < 16, this.streamConnected, inventory);
     this.eventMemory?.workers.enforceBudget();
     return read;
   }

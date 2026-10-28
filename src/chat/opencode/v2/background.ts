@@ -122,7 +122,7 @@ export function retainLauncherEvidence(previous: LauncherEvidence | undefined, n
 }
 
 export type ControlWitness = Readonly<{ kind: "called" | "started" | "ended" | "notification" | "created"; proof: NativeProof }>;
-export type ControlRead = { id: number; parent: string; start: number; failed: boolean; initialInventory?: boolean; incomplete?: true };
+export type ControlRead = { id: number; parent: string; start: number; failed: boolean; inventory: boolean; initialInventory?: boolean; incomplete?: true };
 type ControlRecord = { parent: string; taskId: string; unavailable?: true; pending?: true; pendingCalls?: readonly string[]; aliases?: readonly string[]; kind?: "agent" | "shell"; item?: BackgroundTaskItem; evidence?: WorkerOccurrenceEvidence; witnesses?: readonly ControlWitness[]; changed?: number };
 type ControlObservation = { parent?: string; child?: string; launch?: LauncherEvidence; calledAt?: number; witness?: ControlWitness;
   lifecycle?: { kind: string; parent?: string; directory?: string; own: boolean }; backgroundObserved?: true; seen?: number; commandFingerprint?: string };
@@ -137,7 +137,7 @@ export class BackgroundControls {
   private gapSequence: number | null = null;
   private sequence = 0;
   private nextRead = 0;
-  private readonly scopes = new Map<string, "retained" | "inventoried" | "gap">();
+  private readonly scopes = new Map<string, "retained" | "partial" | "inventoried" | "gap">();
   private readonly records = new Map<string, ControlRecord>();
   private readonly reads = new Map<number, ControlRead>();
   private readonly observations = new Map<string, ControlObservation>();
@@ -252,9 +252,9 @@ export class BackgroundControls {
     for (const record of this.records.values()) this.retire(record);
     for (const read of this.reads.values()) { read.failed = true; this.write(this.reads, read.id, read); }
   }
-  beginRead(parent: string, admitted = true, classifyLive = false): ControlRead {
-    const read = { id: ++this.nextRead, parent, start: this.sequence, failed: !admitted,
-      ...(classifyLive ? { initialInventory: !this.scopes.has(parent) || this.scopes.get(parent) === "retained" } : {}) };
+  beginRead(parent: string, admitted = true, classifyLive = false, inventory = true): ControlRead {
+    const read = { id: ++this.nextRead, parent, start: this.sequence, failed: !admitted, inventory,
+      ...(classifyLive ? { initialInventory: !this.scopes.has(parent) || this.scopes.get(parent) === "retained" || this.scopes.get(parent) === "partial" } : {}) };
     if (!admitted || parent.length > 512 || this.reads.size >= this.readCapacity || !this.fits(this.reads, read.id, read)) { read.failed = true; return read; }
     this.write(this.reads, read.id, read); return read;
   }
@@ -263,15 +263,27 @@ export class BackgroundControls {
     // Partial evidence can still admit healthy siblings. Unlike `failed`,
     // this only prevents callers from closing the first inventory opportunity.
     read.incomplete = true;
-    if (this.reads.get(read.id) === read) this.write(this.reads, read.id, read);
+    if (this.reads.get(read.id) === read) {
+      this.write(this.reads, read.id, read);
+      // One bounded scope marker survives callers: transcript-only projection
+      // cannot substitute for outstanding current-state/ownership inventory.
+      if (this.scopes.get(read.parent) !== "gap" && this.scopes.get(read.parent) !== "inventoried") {
+        if (this.fits(this.scopes, read.parent, "partial")) this.write(this.scopes, read.parent, "partial");
+        else this.gap(read.parent);
+      }
+    }
   }
   endRead(read: ControlRead, complete = false): void {
+    if (!complete || read.failed) this.incompleteRead(read);
     this.remove(this.reads, read.id);
     // The first complete cold inventory is different from a later discovery
     // racing buffered startup frames. Reuse the accounted scope, not a cache
     // or time window; a gap survives for the provider's lifetime.
-    if (complete && !read.failed && !read.incomplete && read.initialInventory !== undefined && this.scopes.get(read.parent) !== "gap" && this.scopes.get(read.parent) !== "inventoried") {
-      if (this.fits(this.scopes, read.parent, "inventoried")) this.write(this.scopes, read.parent, "inventoried");
+    const partial = this.scopes.get(read.parent) === "partial";
+    if (complete && !read.failed && !read.incomplete && (read.initialInventory !== undefined || partial) && (!partial || read.inventory)
+      && this.scopes.get(read.parent) !== "gap" && this.scopes.get(read.parent) !== "inventoried") {
+      const scope = read.initialInventory !== undefined ? "inventoried" : "retained";
+      if (this.fits(this.scopes, read.parent, scope)) this.write(this.scopes, read.parent, scope);
       else this.gap(read.parent);
     }
   }
@@ -426,7 +438,7 @@ export class BackgroundControls {
     }
     if (record?.evidence && candidate && !this.compatible(record.evidence, candidate)) { this.retire(record); return { ...item, stateUncertain: true }; }
     const uncertain = !candidate || !this.identityAvailable(candidate) || candidate.kind !== item.taskType || candidate.uncertain === true || item.stateUncertain === true || read?.failed === true;
-    let unresolved = false;
+    let unresolved = !record && read?.inventory === false && this.scopes.get(candidate?.parent ?? read.parent) === "partial";
     if (!record && candidate && this.gapSequence !== null) {
       // The native feed is live-only. A consumed birth in this covered cohort,
       // plus its exact live launcher, can prove a distinct future occurrence.
@@ -744,16 +756,42 @@ export class BackgroundWorkers {
     return updates;
   }
 
+  private admissionWindow(launch: LauncherEvidence): { start: number; end: number } | undefined {
+    const start = launch.ran ?? launch.created, end = launch.completed ?? launch.reportedCompletion;
+    // tool.called precedes permission approval; tool success bounds admission
+    // from above. Neither clock is an exact child job-start timestamp.
+    if (start !== undefined && end !== undefined && start >= 0 && end > start) return { start, end };
+  }
+
+  private historicalAdmission(child: string, launch: LauncherEvidence): { start: number; end: number } | undefined {
+    const ends = this.budget.executionHistory?.get(child), window = this.admissionWindow(launch);
+    return ends !== undefined && window && !ends.some(end => end >= window.start && end <= window.end) ? window : undefined;
+  }
+
   private sameHistoricalInterval(child: string, previous: LauncherEvidence, next: LauncherEvidence): boolean {
-    const history = this.budget.executionHistory;
-    if (!history) return true;
-    const ends = history.get(child), left = previous.ran ?? previous.created, right = next.ran ?? next.created;
-    // Display fallback clocks, tied starts and incomplete histories cannot
-    // prove that two calls belong to one execution. Keep them separate.
-    // Content follows input-start order, not necessarily tool.called order.
-    // Compare interval coordinates in either direction without sorting rows.
-    return ends !== undefined && left !== undefined && right !== undefined && left !== right
-      && !ends.some(end => end >= Math.min(left, right) && end <= Math.max(left, right));
+    if (!this.budget.executionHistory) return true;
+    const ends = this.budget.executionHistory.get(child), left = this.historicalAdmission(child, previous), right = this.historicalAdmission(child, next);
+    return ends !== undefined && left !== undefined && right !== undefined && left.start !== right.start
+      && !ends.some(end => end >= Math.min(left.start, right.start) && end <= Math.max(left.end, right.end));
+  }
+
+  private separateHistoricalIntervals(child: string, previous: LauncherEvidence, next: LauncherEvidence): boolean {
+    const ends = this.budget.executionHistory?.get(child), left = this.historicalAdmission(child, previous), right = this.historicalAdmission(child, next);
+    return ends !== undefined && left !== undefined && right !== undefined
+      && ends.some(end => end > left.end && end < right.start || end > right.end && end < left.start);
+  }
+
+  private historicalReportCompatible(child: string, launches: readonly LauncherEvidence[], at?: number): boolean {
+    if (!this.budget.executionHistory) return true;
+    return at !== undefined && launches.every(launch => {
+      // A unique explicit report can settle a legacy clock-sparse launch, but
+      // cannot contradict a known acceptance bound or an ambiguous window.
+      // Missing bounds never supply the separate positive proof for aliasing.
+      if (launch.completed === undefined && launch.reportedCompletion === undefined) return true;
+      const window = this.admissionWindow(launch);
+      return window !== undefined && at > window.end
+        && !this.ended.get(child)?.some(end => end >= window.start && end <= window.end);
+    });
   }
 
   launch(parent: string, value: unknown, at: number): NormalizedProviderUpdate[] {
@@ -807,6 +845,9 @@ export class BackgroundWorkers {
     const superseded: NormalizedProviderUpdate[] = [];
     for (const previous of this.tasks.values()) {
       if (previous.parent !== parent || previous.worker !== child || previous.item.taskType !== item.taskType || previous.item.status !== "running") continue;
+      // Content can interleave executions. Preserve a proven other interval
+      // so its later aliases can still join it before explicit results arrive.
+      if (!shell && previous.evidence.launches.every(launch => this.separateHistoricalIntervals(child, launch, fact))) continue;
       this.uncertain(previous);
       superseded.push({ kind: "upsert", item: previous.item });
     }
@@ -817,7 +858,8 @@ export class BackgroundWorkers {
     if (invocation) this.set(this.invocations, `${parent}:${call}`, { ...invocation, occurrence: evidence.key });
     this.set(this.tasks, taskId, { parent, worker: child, item, evidence });
     const reports = [...this.unmatched.entries()].filter(([, result]) => result.parent === parent && result.worker === child && result.item.taskType === item.taskType);
-    const pending = reports.filter(([, result]) => result.correlatable && result.item.createdAt >= item.createdAt);
+    const pending = reports.filter(([, result]) => result.correlatable && result.item.createdAt >= item.createdAt
+      && (shell || this.historicalReportCompatible(child, [fact], result.item.terminalReportedAt)));
     // Shell reports alone cannot establish background membership. Once a
     // scoped launch proves it, reveal any reports which cannot safely join it.
     const revealed: NormalizedProviderUpdate[] = [];
@@ -875,7 +917,8 @@ export class BackgroundWorkers {
     const occurrences = [...this.tasks.values()].filter(task => task.parent === parent && task.worker === child && task.item.taskType === (shell ? "shell" : "agent"));
     const undatedReuse = shell && reportClock.terminalReportedAt === undefined && occurrences.length > 1;
     const candidates = occurrences.filter(task => task.item.status === "running" && (undatedReuse || task.item.createdAt <= at));
-    if (candidates.length !== 1 || undatedReuse) {
+    const ambiguousAdmission = !shell && candidates.some(task => !this.historicalReportCompatible(child, task.evidence.launches, reportClock.terminalReportedAt));
+    if (candidates.length !== 1 || undatedReuse || ambiguousAdmission) {
       const taskId = `v2:${parent}:notification:${id}`;
       const item: BackgroundTaskItem = {
         id: `task:${taskId}`, type: "background_task", taskId, createdAt: at,
