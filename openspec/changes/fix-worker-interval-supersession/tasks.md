@@ -18,9 +18,9 @@
 - [x] 2.3 Run fresh independent standards and spec/correctness reviews of the complete PR against `512290b5a6dbe1e6944b7deea4e341c651c34dbe`; reproduce and correct actionable findings, renewing affected verification/review until both fresh reports have no unresolved actionable findings.
 - [x] 2.4 Reconcile task/review records and inspect the full publication diff for secrets or unrelated changes before committing.
 - [x] 2.5 Present the updated PR description for approval, publish verified corrections to #559 while preserving ready-for-review status, and verify new-head CI, including the full `bun run test:e2e` coverage split across both browser legs and performance job; use CI as the final full-suite gate per `CONTRIBUTING.md`, and report the precise remaining blocker if any check cannot complete.
-- [x] 2.6 After publication verification, prepare the completed correction record for archival without normative spec edits; record observed CI evidence and verify strict validation and archival readiness.
+- [x] 2.6 Restore this change to its active path while #559 remains open; preserve completed implementation and verification evidence, and verify OpenSpec discovers the active change and strict validation passes.
 
-After the completion audit, archive this record through the archive workflow, verify its destination and strict validation, and publish the tracking-only update.
+Keep this change active while #559 is open. Archival belongs to the repository's normal finalization workflow, not completion of the review loop.
 
 ## Verification evidence
 

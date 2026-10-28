@@ -33,4 +33,4 @@ Round 2 independently reproduced two further defects before their corrective imp
 
 ## Migration Plan
 
-No migration. Deliver verified corrections in the existing ready-for-review PR #559 after fresh independent standards and spec reviews. Obtain approval for proposed PR-description updates before publication. Archive this completed implementation-correction record without changing normative specs; revert the corrective commit to roll back. Neither running hub is deployed or restarted by this work.
+No migration. Deliver verified corrections in the existing ready-for-review PR #559 after fresh independent standards and spec reviews. Obtain approval for proposed PR-description updates before publication. Keep this record active while the PR is open; leave archival to the repository's normal finalization workflow without changing normative specs. Revert the corrective code commit to roll back product behavior. Neither running hub is deployed or restarted by this work.
