@@ -196,6 +196,83 @@ test("transcript callers cannot discharge an incomplete initial inventory requir
   controlOracle(controls);
 });
 
+for (const rejection of ["capacity", "admission"] as const) test(`rejected ${rejection} reads retain outstanding inventory without granting proof`, () => {
+  const controls = new BackgroundControls(), healthy = controlFixture("healthy"), pending = controlFixture("pending");
+  expect(controls.project(healthy.item, healthy.evidence).stateUncertain).toBe(false);
+  const held = rejection === "capacity" ? Array.from({ length: 16 }, (_, index) => controls.beginRead(`held${index}`)) : [];
+  const rejected = controls.beginRead("parent", rejection !== "admission", true);
+  expect(rejected.failed).toBe(true);
+  expect(controls.activeReads).toBe(held.length);
+  // Fence other callers immediately, not only after the rejected caller ends.
+  expect(controlOracle(controls).scopes.get("parent")).toBe("partial");
+  expect(controls.project(pending.item, pending.evidence, rejected).stateUncertain).toBe(true);
+  expect(controls.current(pending.item.taskId)).toBe(false);
+  expect(controls.current(healthy.item.taskId)).toBe(true);
+  controls.endRead(rejected, true);
+  for (const read of held) controls.endRead(read, true);
+  for (let retry = 0; retry < 2; retry++) {
+    const transcript = controls.beginRead("parent", true, true, false);
+    expect(controls.project(pending.item, pending.evidence, transcript).stateUncertain).toBe(true);
+    expect(controls.project(healthy.item, healthy.evidence, transcript).stateUncertain).toBe(false);
+    controls.endRead(transcript, true);
+    expect(controlOracle(controls).scopes.get("parent")).toBe("partial");
+  }
+  const fresh = controls.beginRead("parent", true, true);
+  expect(controls.project(pending.item, pending.evidence, fresh).stateUncertain).toBe(false);
+  controls.endRead(fresh, true);
+  expect(controls.current(pending.item.taskId)).toBe(true);
+  expect(controlOracle(controls).scopes.get("parent")).toBe("inventoried");
+});
+
+test("overlong rejected read identities close new admission without retaining oversized scope keys", () => {
+  const controls = new BackgroundControls(), healthy = controlFixture("healthy"), pending = controlFixture("pending");
+  controls.project(healthy.item, healthy.evidence);
+  const parent = "x".repeat(513), rejected = controls.beginRead(parent);
+  expect(rejected.failed).toBe(true);
+  controls.endRead(rejected, true);
+  const state = controlOracle(controls);
+  expect(state.scopes.has(parent)).toBe(false);
+  expect(state.closed).toBe(true);
+  expect(controls.project(healthy.item, healthy.evidence).stateUncertain).toBe(false);
+  const fresh = controls.beginRead("parent", true, true);
+  expect(controls.project(pending.item, pending.evidence, fresh).stateUncertain).toBe(true);
+  controls.endRead(fresh, true); controlOracle(controls);
+});
+
+for (const budget of [{ entries: 12 }, { bytes: 5_000 }]) test(`rejected read scopes stay within ${JSON.stringify(budget)} and preserve retained controls on overflow`, () => {
+  const controls = new BackgroundControls(budget), healthy = controlFixture("healthy"), pending = controlFixture("pending");
+  expect(controls.project(healthy.item, healthy.evidence).stateUncertain).toBe(false);
+  for (let index = 0; index < 40; index++) {
+    const rejected = controls.beginRead(`rejected${index}`.padEnd(512, "x"), false, true);
+    expect(rejected.failed).toBe(true);
+    controls.endRead(rejected, true);
+    controlOracle(controls);
+    expect(controls.usage.bytes).toBeLessThanOrEqual(budget.bytes ?? Infinity);
+    expect(controls.usage.entries).toBeLessThanOrEqual(budget.entries ?? Infinity);
+  }
+  expect(controlOracle(controls).closed).toBe(true);
+  expect(controls.activeReads).toBe(0);
+  expect(controls.project(healthy.item, healthy.evidence).stateUncertain).toBe(false);
+  expect(controls.project(pending.item, pending.evidence).stateUncertain).toBe(true);
+  controlOracle(controls);
+});
+
+test("rejected reads cannot reopen completed inventory or overwrite scope gaps and revocations", () => {
+  const controls = new BackgroundControls({ entries: 12 }), retired = controlFixture("retired");
+  const complete = controls.beginRead("parent", true, true);
+  controls.project(retired.item, retired.evidence, complete); controls.endRead(complete, true);
+  controls.endRead(controls.beginRead("parent", false, true), true);
+  expect(controlOracle(controls).scopes.get("parent")).toBe("inventoried");
+  controls.project({ ...retired.item, status: "completed" }, retired.evidence);
+  for (let index = 0; index < 30; index++) controls.observe({ shutdown: false, session: "parent", launchers: [{ call: `unknown${index}`, phase: "called", background: false }] }, true);
+  expect(controlOracle(controls).scopes.get("parent")).toBe("gap");
+  controls.endRead(controls.beginRead("parent", false, true), true);
+  expect(controlOracle(controls).scopes.get("parent")).toBe("gap");
+  const fresh = controls.beginRead("parent", true, true);
+  expect(controls.project(retired.item, retired.evidence, fresh).stateUncertain).toBe(true);
+  controls.endRead(fresh, true); controlOracle(controls);
+});
+
 for (const guard of ["gap", "unavailable", "capacity", "foreign-birth"] as const) test(`partial inventory completion cannot clear ${guard} control guards`, () => {
   const controls = new BackgroundControls(guard === "capacity" ? { entries: 12 } : {});
   const pending = controlFixture("pending", "parent", "child", "agent"), healthy = controlFixture("healthy");

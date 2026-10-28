@@ -20,7 +20,7 @@ import type {
   ProviderSession,
   StoredMessageAccounting,
 } from "../../provider";
-import { pendingPermissionFields, number } from "../normalization";
+import { pendingPermissionFields, number as numberField } from "../normalization";
 import { BackgroundControls, BackgroundWorkers, launcherChanged, retainLauncherEvidence, sameLauncherIdentity, type ControlRead, type LauncherEvidence, type WorkerOccurrenceEvidence } from "./background";
 import { createOpenCodeV2Memory, createOpenCodeV2Normalizer, formPresentation, modelSelection, normalizeStoredMessage, pendingInboxEntry, prepareStoredMessage, storedAccounting, storedPromptId, supportedFormFields, type V2Evidence } from "./normalization";
 import type { ChatAccountChange, ChatAgent, ChatCommand, ChatLoginState, ChatMode, ChatModel, ConversationConfiguration, MessageDelivery, ModelSelection, RestoredDraft, ReversibleHistoryResult, ReversibleHistoryState } from "../../types";
@@ -425,6 +425,10 @@ export class OpenCodeV2Provider implements ChatProvider {
       })));
     const verified = new Set<string>();
     await this.verifyChildren(children, sessionId, signal, child => verified.add(child));
+    // Unverified ownership filters out the worker row below. That omission
+    // cannot discharge inventory for a native background launch still in history.
+    if (controlRead && prepared.some(message => [...message.tools.values()].some(tool => tool.name === "subagent" && tool.fact.background === true
+      && tool.fact.reportedChild && !verified.has(tool.fact.reportedChild)))) this.controls.incompleteRead(controlRead);
     for (const child of verified) {
       workers.verifyChild(child, sessionId);
       const launches = prepared.flatMap(message => [...message.tools.values()]).filter(tool => tool.fact.reportedChild === child);
@@ -435,7 +439,7 @@ export class OpenCodeV2Provider implements ChatProvider {
         // An active child alone cannot verify that old occurrence.
         try {
           const idle = (await this.allMessages(child, signal)).filter(message => message.type === "idle");
-          const ends = idle.map(message => number(asRecord(message.time).created));
+          const ends = idle.map(message => numberField(asRecord(message.time).created));
           for (const end of ends) if (end !== undefined && end >= 0) workers.executionEnded(child, end);
           if (ends.every((end): end is number => end !== undefined && end >= 0)) executionHistory.set(child, ends);
           else unavailableChildren.add(child);
@@ -599,14 +603,15 @@ export class OpenCodeV2Provider implements ChatProvider {
       if (item.type !== "background_task") continue;
       if (item.status !== "running") { tasks.push({ ...item, stateUncertain: false }); continue; }
       let confirmed = !!item.childConversationId && active?.[item.childConversationId] !== undefined;
-      if (item.childConversationId && active === undefined) this.controls.incompleteRead(controlRead);
       if (item.taskType === "shell" && item.outputFile?.startsWith("shell:")) {
         const shell = await this.client.shell.get({ id: item.outputFile.slice(6), ...this.scope }, { signal }).catch(() => undefined);
-        if (!shell) this.controls.incompleteRead(controlRead);
         // Exit is not job settlement: capture may still be pending. The
         // unique owned shell remains controllable until its job result arrives.
         confirmed = shell?.data.metadata.sessionID === sessionId;
       }
+      // Neither a successful but inconclusive lookup nor an absent active
+      // child is positive verification for an overlapping transcript caller.
+      if (!confirmed) this.controls.incompleteRead(controlRead);
       tasks.push({ ...item, stateUncertain: item.stateUncertain === true || !confirmed });
     }
     signal.throwIfAborted();

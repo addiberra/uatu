@@ -255,7 +255,11 @@ export class BackgroundControls {
   beginRead(parent: string, admitted = true, classifyLive = false, inventory = true): ControlRead {
     const read = { id: ++this.nextRead, parent, start: this.sequence, failed: !admitted, inventory,
       ...(classifyLive ? { initialInventory: !this.scopes.has(parent) || this.scopes.get(parent) === "retained" || this.scopes.get(parent) === "partial" } : {}) };
-    if (!admitted || parent.length > 512 || this.reads.size >= this.readCapacity || !this.fits(this.reads, read.id, read)) { read.failed = true; return read; }
+    if (!admitted || parent.length > 512 || this.reads.size >= this.readCapacity || !this.fits(this.reads, read.id, read)) {
+      read.failed = true;
+      this.incompleteRead(read);
+      return read;
+    }
     this.write(this.reads, read.id, read); return read;
   }
   incompleteRead(read: ControlRead): void {
@@ -263,14 +267,14 @@ export class BackgroundControls {
     // Partial evidence can still admit healthy siblings. Unlike `failed`,
     // this only prevents callers from closing the first inventory opportunity.
     read.incomplete = true;
-    if (this.reads.get(read.id) === read) {
-      this.write(this.reads, read.id, read);
-      // One bounded scope marker survives callers: transcript-only projection
-      // cannot substitute for outstanding current-state/ownership inventory.
-      if (this.scopes.get(read.parent) !== "gap" && this.scopes.get(read.parent) !== "inventoried") {
-        if (this.fits(this.scopes, read.parent, "partial")) this.write(this.scopes, read.parent, "partial");
-        else this.gap(read.parent);
-      }
+    if (this.reads.get(read.id) === read) this.write(this.reads, read.id, read);
+    // Negative coverage survives even a rejected guard. Keep it in the bounded
+    // scope ledger; an unrepresentable scope closes new admission, not retained
+    // healthy proof. Transcript reads cannot replace outstanding inventory.
+    if (read.parent.length > 512) this.closed = true;
+    else if (this.scopes.get(read.parent) !== "gap" && this.scopes.get(read.parent) !== "inventoried") {
+      if (this.fits(this.scopes, read.parent, "partial")) this.write(this.scopes, read.parent, "partial");
+      else this.gap(read.parent);
     }
   }
   endRead(read: ControlRead, complete = false): void {
@@ -280,8 +284,9 @@ export class BackgroundControls {
     // racing buffered startup frames. Reuse the accounted scope, not a cache
     // or time window; a gap survives for the provider's lifetime.
     const partial = this.scopes.get(read.parent) === "partial";
-    if (complete && !read.failed && !read.incomplete && (read.initialInventory !== undefined || partial) && (!partial || read.inventory)
-      && this.scopes.get(read.parent) !== "gap" && this.scopes.get(read.parent) !== "inventoried") {
+    const closesInventory = complete && !read.failed && !read.incomplete && (read.initialInventory !== undefined || partial) && (!partial || read.inventory)
+      && this.scopes.get(read.parent) !== "gap" && this.scopes.get(read.parent) !== "inventoried";
+    if (closesInventory) {
       const scope = read.initialInventory !== undefined ? "inventoried" : "retained";
       if (this.fits(this.scopes, read.parent, scope)) this.write(this.scopes, read.parent, scope);
       else this.gap(read.parent);
@@ -552,7 +557,8 @@ export class BackgroundWorkers {
   private recoveryOnly = false;
   constructor(private readonly budget: { entries?: number; bytes?: number; retained?: () => { bytes: number; entries: number }; onSaturation?: () => void;
     /** Complete, verified child execution history for a transient history fold.
-     * Group occurrences before later idle boundaries revoke unresolved work. */
+     * Group occurrences before later idle boundaries revoke unresolved work.
+     * Boundary order is irrelevant: consumers scan predicates, not positions. */
     executionHistory?: ReadonlyMap<string, readonly number[]>;
   } = {}) {}
   private readonly parents = new Map<string, string>();

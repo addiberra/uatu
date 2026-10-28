@@ -12,6 +12,8 @@ Independent review of [#559](https://github.com/tjakobsson/uatu/pull/559) reprod
 - Add provider regressions for interleaved intervals and pending completion reports, plus conservative missing-evidence and stale-result cases.
 - Document the accepted one-time planning-order deviation for the initial correction and the prospective chronology of subsequent corrections.
 - Repeat independent standards and spec reviews, correcting actionable findings until a fresh round is clear.
+- Address the follow-up review's clarity notes without changing interval semantics: document order-independent history, name the inventory-close predicate and numeric field parser, and verify the rejected-read and equal-clock observations against the existing safety contract and regressions.
+- Preserve outstanding inventory verification after a capacity-rejected read: a later transcript-only read must not regain control proof that an unsuccessful inventory could not establish.
 
 ## Capabilities
 

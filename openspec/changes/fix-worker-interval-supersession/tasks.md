@@ -22,14 +22,37 @@
 
 Keep this change active while #559 is open. Archival belongs to the repository's normal finalization workflow, not completion of the review loop.
 
+## 3. Follow-up PR review comments
+
+- [x] 3.1 Clarify order-independent execution history, name the existing inventory-close predicate, and alias the numeric field parser without changing behavior; verify typecheck, affected provider/control tests, and the focused diff.
+- [x] 3.2 Add public rejected-read and overlapping-transcript counterexamples as failing regressions, then preserve outstanding verification for rejected reads and all unconfirmed running targets, including foreign shells and agents absent from active listings; verify connected/standalone callers, removed/running/foreign targets, healthy retained siblings, safe fresh recovery, capacity/gap/revocation bounds, and independent probes before documenting the invariant.
+- [x] 3.3 Confirm existing `ran === completed` regression coverage and record each review observation's disposition with precise test/source references; verify the cited cases run successfully.
+- [ ] 3.4 Obtain independent review of the follow-up delta, publish the verified correction while keeping the change active, and observe new-head CI before reporting its result.
+
 ## Verification evidence
 
 - Round 1 reproduced and corrected historical supersession across interleaved intervals; documented the user-accepted one-time initial planning deviation without claiming retroactive compliance.
 - Round 2 reproduced and corrected permission-delayed admission miscorrelation and transcript-only admission after incomplete inventory. Each corrective expansion was planned before implementation, with red regressions first.
 - Round 3 fresh, independent native Luna/high standards and Sol/high spec/correctness reviews reported no actionable findings on the complete PR and current corrections. These are review results, not a proof of bug-freedom.
-- `bun test src/chat/opencode/v2/provider.test.ts`: 1,512 passed. `bun test src/chat/opencode/v2/background.test.ts src/chat/opencode/v2/normalization.test.ts`: 186 passed. Shared normalization: two passed. The PR adds 114 regression/safety cases in total.
+- Before the follow-up review corrections: `bun test src/chat/opencode/v2/provider.test.ts` passed 1,512 cases, control/V2 normalization passed 186, and shared normalization passed two. The PR then added 114 regression/safety cases; current follow-up totals are recorded below.
 - Independent review executed 112 focused repository tests, all 720 six-launch/three-interval content permutations, and twelve additional admission-window safety cases. Real-provider synthetic stubs assert read-only requests; captured original-history replay also passed.
 - `bun run test:ci`: 7,281 passed, 16 skipped, two unchanged failures previously reproduced on baseline: the 150 ms backend startup-progress test and the state-dir unsafe-mode fixture under inherited umask `077`. An earlier round also timed out the hub chat-retry test; the entire hub file then passed 80/80 in isolation, and that timeout did not recur in the final full-suite run. No unrelated test was modified.
 - Typecheck, build, compiled-binary/browser smoke, license audit (597 installed packages), all 61 strict OpenSpec checks, and diff checks passed. Dependency audit passed its moderate-or-higher gate while disclosing existing low-severity KaTeX advisory GHSA-238p-pmpm-9mq7.
 - Local checks used installed Bun 1.4.2; no runtime or dependency was installed. Correction `04e3a5c` was pushed to #559 and [CI run 40616093739](https://github.com/tjakobsson/uatu/actions/runs/40616093739) passed, including unit, both functional browser legs, performance, both contract jobs, strict spec validation and final validation; CodeQL also passed. The approved PR-description correction reports the observed successful result, not an unfinished run. Ready-for-review status is preserved. Independent provider checks used scripted stubs, not live-provider execution. Neither running hub was upgraded or restarted.
 - The reviewer's initial two-completed-generation probe demanded an unproved exact mapping; the reviewer confirmed that assertion was overstrict. The permanent safety matrix instead requires uncertain unproved assignments and readable, deduplicated explicit results. Notification-first multi-alias reachability remains unestablished and is not claimed fixed.
+
+### Follow-up review dispositions
+
+- Source: [follow-up review on #559](https://github.com/tjakobsson/uatu/pull/559#issuecomment-6464184970). Its rejected-read observation reproduced through public provider calls and is addressed by task 3.2 rather than a comment-only explanation.
+- Review observation 1: rejected reads now preserve negative coverage in the bounded scope ledger without taking an active-read slot. Public regressions hold sixteen unrelated reads and check removed, running and foreign shells. Subsequent independent review also reproduced foreign-shell ownership, absent-agent active-list and ownership-filtering races; the common positive-verification fence now covers these paths, connected and standalone callers, older in-flight transcripts, and healthy retained siblings.
+- Review observation 2: `BackgroundWorkers` documents that execution-history boundaries are order-independent because consumers use predicate scans; no sort or interval semantics change is needed.
+- Review observation 3: `provider.test.ts` already includes `permission-delayed admission stays uncertain: tied-window` cases, setting `ran` and `completed` to 15 across running/completed, forward/reversed and combined/split histories. Rerunning the eight cases passed; no duplicate regression was added.
+- Review observation 4: named the existing `endRead` condition `closesInventory` and aliased the numeric parser as `numberField`. Admission-window caching was not added for an unmeasured performance concern.
+- Review observation 5: the Codex comments report review-infrastructure errors, not an actionable code diagnosis. The PR separately records independent native reviews and successful CI; no external review service was retriggered by this follow-up.
+
+### Follow-up verification
+
+- The follow-up adds 19 permanent regression/safety cases, bringing this PR to 133 cases added. Full provider suite: 1,525 passed. Control and shared/V2 normalization suites: 194 passed. Typecheck, build, compiled-binary/browser smoke, 61 strict OpenSpec checks and diff checks passed.
+- Full local unit suite after the final common-fence correction: 7,300 passed, 16 skipped, two unchanged baseline failures (startup-progress timing and unsafe-mode fixture under umask `077`). A previous run also hit a macOS code-signing subsystem error in an untouched helper test; that case passed in isolation and did not fail in the final run. No unrelated test was changed.
+- Fresh native Sol/high independent safety review found no actionable issues after 192 control/normalization tests, 51 focused provider tests and twelve independently authored public-provider probes. The probes cover agent/shell, connected/standalone, negative/positive/terminal evidence, overlapping reads, healthy siblings and refused unsafe Stop. Renewed independent Luna/high standards review also found no issues. Source/test hashes remained unchanged during safety review.
+- The lead independently reran the previously failing public-provider probes and tested older child history against newer idle-boundary evidence. These scripted checks used no live-provider accounts or hub mutations. No destructive Stop bypass was demonstrated in the reported defects.
