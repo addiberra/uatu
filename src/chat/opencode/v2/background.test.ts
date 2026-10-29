@@ -122,11 +122,11 @@ test.each(["child", "message", "workerType", "created", "inputFingerprint"] as c
 
 test("later live-scope inventory reserves unobserved work pending, without confusing it with cold history or a gap", () => {
   const fixture = controlFixture("discovered"), controls = new BackgroundControls();
-  const initial = controls.beginRead("parent", true, true);
+  const initial = controls.beginRead("parent", true, true, true);
   expect(initial.initialInventory).toBe(true);
   expect(controls.project(fixture.item, fixture.evidence, initial).stateUncertain).toBe(false);
   controls.endRead(initial, true);
-  const later = controlFixture("later"), read = controls.beginRead("parent", true, true);
+  const later = controlFixture("later"), read = controls.beginRead("parent", true, true, true);
   expect(read.initialInventory).toBe(false);
   expect(controls.project(later.item, later.evidence, read).stateUncertain).toBe(true);
   expect(controls.unavailable(later.item.taskId)).toBe(false);
@@ -140,9 +140,9 @@ test("later live-scope inventory reserves unobserved work pending, without confu
 
 test("a failed initial inventory does not discard the right to classify fresh cold evidence", () => {
   const controls = new BackgroundControls(), fixture = controlFixture("cold-after-failed-read");
-  const failed = controls.beginRead("parent", true, true);
+  const failed = controls.beginRead("parent", true, true, true);
   controls.endRead(failed);
-  const recovered = controls.beginRead("parent", true, true);
+  const recovered = controls.beginRead("parent", true, true, true);
   expect(recovered.initialInventory).toBe(true);
   expect(controls.project(fixture.item, fixture.evidence, recovered).stateUncertain).toBe(false);
   controls.endRead(recovered, true);
@@ -151,7 +151,7 @@ test("a failed initial inventory does not discard the right to classify fresh co
 
 test("partial inventories preserve healthy sibling proof and completion accounting across callers", () => {
   const controls = new BackgroundControls(), healthy = controlFixture("healthy"), pending = controlFixture("pending");
-  const first = controls.beginRead("parent", true, true);
+  const first = controls.beginRead("parent", true, true, true);
   controls.incompleteRead(first);
   expect(first.failed).toBe(false);
   expect(controls.project(healthy.item, healthy.evidence, first).stateUncertain).toBe(false);
@@ -160,22 +160,44 @@ test("partial inventories preserve healthy sibling proof and completion accounti
   // Every provider caller can finish publishing its partial result. None may
   // close initial classification while a relevant evidence read is incomplete.
   controls.endRead(first, true);
-  const retry = controls.beginRead("parent", true, true);
+  const retry = controls.beginRead("parent", true, true, true);
   expect(retry.initialInventory).toBe(true);
   expect(controls.project(pending.item, pending.evidence, retry).stateUncertain).toBe(false);
   expect(controls.project(healthy.item, healthy.evidence, retry).stateUncertain).toBe(false);
   controls.endRead(retry, true);
-  const later = controls.beginRead("parent", true, true);
+  const later = controls.beginRead("parent", true, true, true);
   expect(later.initialInventory).toBe(false);
   controls.incompleteRead(later); controls.endRead(later, true);
-  const afterPartial = controls.beginRead("parent", true, true);
+  const afterPartial = controls.beginRead("parent", true, true, true);
   expect(afterPartial.initialInventory).toBe(false);
   controls.endRead(afterPartial); controlOracle(controls);
 });
 
+for (const connected of [false, true]) test(`control reads default to transcript-only across partial inventory: connected=${connected}`, () => {
+  const controls = new BackgroundControls(), healthy = controlFixture("healthy"), pending = controlFixture("pending");
+  const first = controls.beginRead("parent", true, connected, true);
+  controls.incompleteRead(first);
+  expect(controls.project(healthy.item, healthy.evidence, first).stateUncertain).toBe(false);
+  controls.endRead(first, true);
+  for (let retry = 0; retry < 2; retry++) {
+    const transcript = controls.beginRead("parent", true, connected);
+    expect(controls.project(pending.item, pending.evidence, transcript).stateUncertain).toBe(true);
+    expect(controls.current(pending.item.taskId)).toBe(false);
+    expect(controls.project(healthy.item, healthy.evidence, transcript).stateUncertain).toBe(false);
+    controls.endRead(transcript, true);
+    expect(controlOracle(controls).scopes.get("parent")).toBe("partial");
+    expect(transcript.inventory).toBe(false);
+  }
+  const fresh = controls.beginRead("parent", true, connected, true);
+  expect(controls.project(pending.item, pending.evidence, fresh).stateUncertain).toBe(false);
+  controls.endRead(fresh, true);
+  expect(controls.current(pending.item.taskId)).toBe(true);
+  expect(controlOracle(controls).scopes.get("parent")).toBe(connected ? "inventoried" : "retained");
+});
+
 test("transcript callers cannot discharge an incomplete initial inventory requirement", () => {
   const controls = new BackgroundControls(), healthy = controlFixture("healthy"), pending = controlFixture("pending");
-  const first = controls.beginRead("parent", true, true);
+  const first = controls.beginRead("parent", true, true, true);
   controls.incompleteRead(first);
   expect(controls.project(healthy.item, healthy.evidence, first).stateUncertain).toBe(false);
   expect(controls.project({ ...pending.item, stateUncertain: true }, pending.evidence, first).stateUncertain).toBe(true);
@@ -188,7 +210,7 @@ test("transcript callers cannot discharge an incomplete initial inventory requir
     controls.endRead(transcript, true);
     controlOracle(controls);
   }
-  const fresh = controls.beginRead("parent", true, true);
+  const fresh = controls.beginRead("parent", true, true, true);
   expect(fresh.initialInventory).toBe(true);
   expect(controls.project(pending.item, pending.evidence, fresh).stateUncertain).toBe(false);
   controls.endRead(fresh, true);
@@ -200,7 +222,7 @@ for (const rejection of ["capacity", "admission"] as const) test(`rejected ${rej
   const controls = new BackgroundControls(), healthy = controlFixture("healthy"), pending = controlFixture("pending");
   expect(controls.project(healthy.item, healthy.evidence).stateUncertain).toBe(false);
   const held = rejection === "capacity" ? Array.from({ length: 16 }, (_, index) => controls.beginRead(`held${index}`)) : [];
-  const rejected = controls.beginRead("parent", rejection !== "admission", true);
+  const rejected = controls.beginRead("parent", rejection !== "admission", true, true);
   expect(rejected.failed).toBe(true);
   expect(controls.activeReads).toBe(held.length);
   // Fence other callers immediately, not only after the rejected caller ends.
@@ -217,7 +239,7 @@ for (const rejection of ["capacity", "admission"] as const) test(`rejected ${rej
     controls.endRead(transcript, true);
     expect(controlOracle(controls).scopes.get("parent")).toBe("partial");
   }
-  const fresh = controls.beginRead("parent", true, true);
+  const fresh = controls.beginRead("parent", true, true, true);
   expect(controls.project(pending.item, pending.evidence, fresh).stateUncertain).toBe(false);
   controls.endRead(fresh, true);
   expect(controls.current(pending.item.taskId)).toBe(true);
@@ -234,7 +256,7 @@ test("overlong rejected read identities close new admission without retaining ov
   expect(state.scopes.has(parent)).toBe(false);
   expect(state.closed).toBe(true);
   expect(controls.project(healthy.item, healthy.evidence).stateUncertain).toBe(false);
-  const fresh = controls.beginRead("parent", true, true);
+  const fresh = controls.beginRead("parent", true, true, true);
   expect(controls.project(pending.item, pending.evidence, fresh).stateUncertain).toBe(true);
   controls.endRead(fresh, true); controlOracle(controls);
 });
@@ -243,7 +265,7 @@ for (const budget of [{ entries: 12 }, { bytes: 5_000 }]) test(`rejected read sc
   const controls = new BackgroundControls(budget), healthy = controlFixture("healthy"), pending = controlFixture("pending");
   expect(controls.project(healthy.item, healthy.evidence).stateUncertain).toBe(false);
   for (let index = 0; index < 40; index++) {
-    const rejected = controls.beginRead(`rejected${index}`.padEnd(512, "x"), false, true);
+    const rejected = controls.beginRead(`rejected${index}`.padEnd(512, "x"), false, true, true);
     expect(rejected.failed).toBe(true);
     controls.endRead(rejected, true);
     controlOracle(controls);
@@ -259,16 +281,16 @@ for (const budget of [{ entries: 12 }, { bytes: 5_000 }]) test(`rejected read sc
 
 test("rejected reads cannot reopen completed inventory or overwrite scope gaps and revocations", () => {
   const controls = new BackgroundControls({ entries: 12 }), retired = controlFixture("retired");
-  const complete = controls.beginRead("parent", true, true);
+  const complete = controls.beginRead("parent", true, true, true);
   controls.project(retired.item, retired.evidence, complete); controls.endRead(complete, true);
-  controls.endRead(controls.beginRead("parent", false, true), true);
+  controls.endRead(controls.beginRead("parent", false, true, true), true);
   expect(controlOracle(controls).scopes.get("parent")).toBe("inventoried");
   controls.project({ ...retired.item, status: "completed" }, retired.evidence);
   for (let index = 0; index < 30; index++) controls.observe({ shutdown: false, session: "parent", launchers: [{ call: `unknown${index}`, phase: "called", background: false }] }, true);
   expect(controlOracle(controls).scopes.get("parent")).toBe("gap");
-  controls.endRead(controls.beginRead("parent", false, true), true);
+  controls.endRead(controls.beginRead("parent", false, true, true), true);
   expect(controlOracle(controls).scopes.get("parent")).toBe("gap");
-  const fresh = controls.beginRead("parent", true, true);
+  const fresh = controls.beginRead("parent", true, true, true);
   expect(controls.project(retired.item, retired.evidence, fresh).stateUncertain).toBe(true);
   controls.endRead(fresh, true); controlOracle(controls);
 });
@@ -280,14 +302,14 @@ for (const guard of ["gap", "unavailable", "capacity", "foreign-birth"] as const
     controls.project(pending.item, pending.evidence);
     controls.project({ ...pending.item, status: "completed" }, pending.evidence);
   }
-  const first = controls.beginRead("parent", true, true);
+  const first = controls.beginRead("parent", true, true, true);
   expect(controls.project(healthy.item, healthy.evidence, first).stateUncertain).toBe(false);
   controls.incompleteRead(first); controls.endRead(first, true);
   if (guard === "gap") controls.observationGap();
   if (guard === "capacity") for (let index = 0; index < 30; index++) controls.observe({ shutdown: false, session: `unknown${index}`, launchers: [], execution: { phase: "started", historical: false } }, true);
   if (guard === "foreign-birth") controls.observe({ shutdown: false, launchers: [], lifecycle: { kind: "session.created", id: "child", parent: "other", directory: "/foreign", proof: nativeProof({ id: "foreign-birth", created: 1 }, {}) } }, false);
   for (let retry = 0; retry < 3; retry++) {
-    const read = controls.beginRead("parent", true, true);
+    const read = controls.beginRead("parent", true, true, true);
     expect(controls.project(pending.item, pending.evidence, read).stateUncertain).toBe(true);
     expect(controls.current(pending.item.taskId)).toBe(false);
     controls.incompleteRead(read); controls.endRead(read, true);
@@ -298,7 +320,7 @@ for (const guard of ["gap", "unavailable", "capacity", "foreign-birth"] as const
 test("one live sibling does not consume the first complete inventory of previously unobserved cold work", () => {
   const controls = new BackgroundControls(), live = controlFixture("live"), cold = controlFixture("preexisting");
   expect(controls.project(live.item, live.evidence).stateUncertain).toBe(false);
-  const read = controls.beginRead("parent", true, true);
+  const read = controls.beginRead("parent", true, true, true);
   expect(read.initialInventory).toBe(true);
   expect(controls.project(cold.item, cold.evidence, read).stateUncertain).toBe(false);
   controls.endRead(read, true);
@@ -627,7 +649,7 @@ for (const change of ["compatible", "old-command", "missing-birth-command", "mis
     }
     const fixture = change === "wrong-kind" ? controlFixture("call", parent, worker, "agent") : controlFixture("call", parent, worker);
     const evidence = change === "wrong-kind" ? fixture.evidence : projectedWorkers.occurrence("v2:parent:call");
-    const read = controls.beginRead(parent, true, true);
+    const read = controls.beginRead(parent, true, true, true);
     expect(controls.project(fixture.item, evidence, read).stateUncertain).toBe(change !== "compatible");
     expect(!!controls.proof(fixture.item.taskId)).toBe(change === "compatible");
     controls.endRead(read, true); controlOracle(controls);

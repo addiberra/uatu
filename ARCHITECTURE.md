@@ -1055,7 +1055,8 @@ Absence alone never settles a worker; explicit terminal results retain their
 existing handling. A partial-inventory
 marker in the existing bounded scope ledger survives read callers. While it is
 pending, transcript-only reads cannot admit unretained targets or close initial
-inventory; healthy retained siblings keep their controls. Inventory-capable fresh
+inventory; healthy retained siblings keep their controls. Control reads default
+to transcript-only; inventory-capable callers explicitly opt in. Fresh inventory
 recovery can positively verify unchanged targets and discharge the marker without
 a repeated launcher event. Rejected read guards record this negative coverage
 immediately, even without an active-read slot; they never grant positive proof.

@@ -27,7 +27,13 @@ Keep this change active while #559 is open. Archival belongs to the repository's
 - [x] 3.1 Clarify order-independent execution history, name the existing inventory-close predicate, and alias the numeric field parser without changing behavior; verify typecheck, affected provider/control tests, and the focused diff.
 - [x] 3.2 Add public rejected-read and overlapping-transcript counterexamples as failing regressions, then preserve outstanding verification for rejected reads and all unconfirmed running targets, including foreign shells and agents absent from active listings; verify connected/standalone callers, removed/running/foreign targets, healthy retained siblings, safe fresh recovery, capacity/gap/revocation bounds, and independent probes before documenting the invariant.
 - [x] 3.3 Confirm existing `ran === completed` regression coverage and record each review observation's disposition with precise test/source references; verify the cited cases run successfully.
-- [ ] 3.4 Obtain independent review of the follow-up delta, publish the verified correction while keeping the change active, and observe new-head CI before reporting its result.
+- [x] 3.4 Obtain independent review of the follow-up delta, publish the verified correction while keeping the change active, and observe new-head CI before reporting its result.
+
+## 4. Fail-safe read capability default
+
+- [x] 4.1 Add failing omitted-inventory regressions for connected and standalone partial scopes, then default control reads to transcript-only and make inventory-oriented test callers explicit; verify healthy retained controls, explicit fresh recovery, all control/provider/normalization tests, and typecheck.
+- [x] 4.2 Align architecture notes, obtain fresh independent review of the hardening delta, and verify strict OpenSpec validation and diff checks without changing interval semantics or unrelated tests.
+- [ ] 4.3 Publish the reviewed correction, update approved PR evidence with accurately scoped verification, and observe new-head CI; preserve ready-for-review status and keep this change active.
 
 ## Verification evidence
 
@@ -56,3 +62,11 @@ Keep this change active while #559 is open. Archival belongs to the repository's
 - Full local unit suite after the final common-fence correction: 7,300 passed, 16 skipped, two unchanged baseline failures (startup-progress timing and unsafe-mode fixture under umask `077`). A previous run also hit a macOS code-signing subsystem error in an untouched helper test; that case passed in isolation and did not fail in the final run. No unrelated test was changed.
 - Fresh native Sol/high independent safety review found no actionable issues after 192 control/normalization tests, 51 focused provider tests and twelve independently authored public-provider probes. The probes cover agent/shell, connected/standalone, negative/positive/terminal evidence, overlapping reads, healthy siblings and refused unsafe Stop. Renewed independent Luna/high standards review also found no issues. Source/test hashes remained unchanged during safety review.
 - The lead independently reran the previously failing public-provider probes and tested older child history against newer idle-boundary evidence. These scripted checks used no live-provider accounts or hub mutations. No destructive Stop bypass was demonstrated in the reported defects.
+- Correction `c181498` passed [CI run 40748776864](https://github.com/tjakobsson/uatu/actions/runs/40748776864), including unit, both functional browser legs, performance, contracts, strict specs and final validation. The approved [reviewer reply](https://github.com/tjakobsson/uatu/pull/559#issuecomment-6492258372) was published after success. Earlier intermittent UI-wrapper failures are separately reported in #560; the cause remains unconfirmed and no harness change is included here.
+
+### Fail-safe default follow-up
+
+- Source: [review at `c181498`](https://github.com/tjakobsson/uatu/pull/559#issuecomment-6496210261). Only the opposite `inventory` defaults warrant a source change. Equal-clock coverage and conservative same-start handling remain unchanged; dense-predicate cleanup and bot retries are not required by this hardening.
+- Two omitted-argument regressions failed before the default changed, then passed in the complete 196-case control/shared/V2 normalization suites. All 1,525 provider tests also passed, for 1,721 targeted passes. This adds two cases to the prior 133, bringing the PR total to 135 added regression/safety cases.
+- Fresh independent native Sol/medium standards and correctness review of the hardening delta reported no findings and independently reran all 196 control/normalization cases. The provider wrapper explicitly forwards its capability, so existing production callers are unchanged; inventory-oriented test callers now opt in explicitly without dropping assertions.
+- Typecheck, build, compiled-binary/browser smoke, 61 strict OpenSpec checks, diff checks and the moderate-or-higher dependency-audit gate passed. License checks audited 597 installed packages. The existing low-severity KaTeX advisory GHSA-238p-pmpm-9mq7 remains disclosed; no dependency or runtime was installed.

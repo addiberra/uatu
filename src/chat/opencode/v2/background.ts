@@ -252,7 +252,7 @@ export class BackgroundControls {
     for (const record of this.records.values()) this.retire(record);
     for (const read of this.reads.values()) { read.failed = true; this.write(this.reads, read.id, read); }
   }
-  beginRead(parent: string, admitted = true, classifyLive = false, inventory = true): ControlRead {
+  beginRead(parent: string, admitted = true, classifyLive = false, inventory = false): ControlRead {
     const read = { id: ++this.nextRead, parent, start: this.sequence, failed: !admitted, inventory,
       ...(classifyLive ? { initialInventory: !this.scopes.has(parent) || this.scopes.get(parent) === "retained" || this.scopes.get(parent) === "partial" } : {}) };
     if (!admitted || parent.length > 512 || this.reads.size >= this.readCapacity || !this.fits(this.reads, read.id, read)) {
