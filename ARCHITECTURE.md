@@ -1008,6 +1008,26 @@ fallbacks; progress or lagging history cannot erase a known supersession.
 Consumed replay requires retained identity, stamp, semantic fingerprint and an
 occurrence link, not merely an old-looking timestamp.
 
+Complete history reconstructs verified child execution intervals before applying
+later idle boundaries to unresolved work. Launcher timing bounds an admission
+window, not an exact job start: `time.ran` precedes permission approval, while
+accepted-running tool success (`time.completed`, or its native success-event
+clock) bounds admission from above. Input-content order can differ from call
+order. Aliases require complete child history placing both windows wholly within
+one interval, with distinct native start coordinates. A boundary strictly between
+the incoming window and every prior alias's window preserves that separate
+occurrence for later aliases, rather than superseding it by content position.
+Missing, tied, reversed or boundary-straddling windows cannot supply this proof.
+This history-only exception preserves parent transcript order; live supersession
+and retained control revocations are unchanged.
+
+An idle boundary alone never completes a worker. Explicit reports remain readable
+when their occurrence is ambiguous; in particular, a report before or tied to a
+known accepted-running success cannot settle that launch, and an ambiguous
+admission window cannot justify report assignment. A unique explicit report may
+still settle a legacy launch without a recorded acceptance clock, but missing
+clocks never prove aliasing. An old result cannot settle a newer run.
+
 Live projection correlation and control evidence share a bound of 8,192 entries /
 4 MiB of conservative serialized UTF-16 payload, not a heap guarantee.
 The provider-lifetime control cohort uses up to 2,048 entries / 1 MiB within that
@@ -1023,6 +1043,29 @@ history and reconciliation results. Target-specific unavailable stubs prevent
 silent readmission; reconnect does not erase them, and unretained targets may
 remain unavailable for the provider lifetime. Disposal ends that in-memory
 ownership lifetime. Complete-history folds are transient and precede pagination.
+
+The first live inventory closes only after its relevant worker evidence reads
+are complete. A failed active-state, shell-ownership, or child-history lookup may
+still publish uncertain rows while admitting healthy siblings. Successful but
+inconclusive inventory also stays incomplete in connected and standalone callers:
+foreign shell ownership or an active listing that omits a running child cannot
+authorize a transcript read already in flight. Unverified background-agent
+references preserve this fence even when ownership filtering omits their rows.
+Absence alone never settles a worker; explicit terminal results retain their
+existing handling. A partial-inventory
+marker in the existing bounded scope ledger survives read callers. While it is
+pending, transcript-only reads cannot admit unretained targets or close initial
+inventory; healthy retained siblings keep their controls. Control reads default
+to transcript-only; inventory-capable callers explicitly opt in. Fresh inventory
+recovery can positively verify unchanged targets and discharge the marker without
+a repeated launcher event. Rejected read guards record this negative coverage
+immediately, even without an active-read slot; they never grant positive proof.
+Scope markers share the existing byte/entry budget. An overlong scope identity
+closes new admission; marker-budget exhaustion falls back to a scope gap or global
+admission closure. These fail-closed paths preserve healthy retained proof.
+Per-read guards still track failures and concurrency.
+Neither mechanism reopens completed inventory or clears observation-gap, capacity,
+ownership, or unavailable-target guards.
 
 Observation gaps retire existing authorizations without globally closing future
 control admission. New post-gap targets require positive native birth and matching

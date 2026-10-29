@@ -76,6 +76,54 @@ const scoped = <T>(data: T) => ({ location: { directory: WORKSPACE }, data });
 const skillInfo = (id: string, overrides: { name?: string; description?: string } = {}) => ({ id, name: overrides.name ?? id, ...(overrides.description ? { description: overrides.description } : {}), path: `/ws/.opencode/skills/${id}/SKILL.md`, content: `# ${id}` });
 const notFound = (sessionID: string) => Response.json({ _tag: "SessionNotFoundError", sessionID, message: `Session not found: ${sessionID}` }, { status: 404 });
 
+function historyWorkerLaunch(id: string, at: number) {
+  return { id: `msg_${id}`, type: "assistant", time: { created: at }, content: [
+    { id, type: "tool", name: "subagent", time: { created: at, ran: at + 1, completed: at + 2 }, state: {
+      status: "completed", input: { description: "Fixture worker", background: true }, metadata: { sessionID: "ses_child", status: "running" },
+    } },
+  ] };
+}
+const historyWorkerResult = (id: string, at: number) => ({ id, type: "synthetic", time: { created: at }, text: "Fixture done.", metadata: { source: "subagent", childID: "ses_child", state: "completed" } });
+function workerHistoryServer(messages: unknown[], idle: unknown[], pending: unknown[] = []) {
+  return fakeOpenCode({
+    "GET /api/session/active": () => ({ ses_child: { status: "running" } }),
+    "GET /api/session/:id": ({ path }) => session(path.split("/").at(-1)!, path.endsWith("ses_child") ? { parentID: "ses_parent" } : {}),
+    "GET /api/session/ses_parent/inbox": () => ({ data: pending }),
+    "GET /api/session/ses_parent/message": () => ({ data: messages, cursor: {} }),
+    "GET /api/session/ses_child/message": () => ({ data: idle, cursor: {} }),
+  });
+}
+
+function workerRecoveryServer() {
+  const fixture = JSON.parse(readFileSync(path.join(import.meta.dir, "../../../../tests/fixtures/opencode-v2/background-2.0.29.json"), "utf8"));
+  const state = { failure: "", childParent: "ses_parent", shellParent: "ses_parent", messages: [fixture.launch, fixture.shell] as unknown[], revert: undefined as string | undefined };
+  let wire!: ReadableStreamDefaultController<Uint8Array>;
+  let held: { path: string; entered: () => void; gate: Promise<void> } | undefined;
+  const frame = (type: string, data: unknown, created = 90) => wire.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({ id: `${type}:${created}`, type, data, created, location: { directory: WORKSPACE } })}\n\n`));
+  const answer = async (path: string, value: unknown) => {
+    const result = state.failure === path ? new Response(null, { status: 500 }) : value;
+    if (held?.path === path) { const pending = held; held = undefined; pending.entered(); await pending.gate; }
+    return result;
+  };
+  const server = fakeOpenCode({
+    "GET /api/event": () => new Response(new ReadableStream<Uint8Array>({ start(controller) { wire = controller; frame("server.connected", {}); } }), { headers: { "content-type": "text/event-stream" } }),
+    "GET /api/session/ses_parent": () => session("ses_parent", state.revert ? { revert: { messageID: state.revert } } : {}),
+    "GET /api/session/ses_child": () => session("ses_child", { parentID: state.childParent }),
+    "GET /api/session/ses_parent/message": () => ({ data: state.messages, cursor: {} }),
+    "GET /api/session/ses_parent/inbox": () => ({ data: [] }),
+    "GET /api/session/ses_child/message": ({ path }) => answer(path, { data: [], cursor: {} }),
+    "GET /api/session/active": ({ path }) => answer(path, { ses_child: { status: "running" } }),
+    "GET /api/shell/sh_fixture": ({ path }) => answer(path, scoped({ id: "sh_fixture", command: "printf fixture", status: "running", time: { started: 71 }, metadata: { sessionID: state.shellParent } })),
+    "DELETE /api/shell/sh_fixture": () => undefined,
+    "POST /api/session/ses_child/interrupt": () => ({ interrupted: true }),
+  });
+  return { ...server, fixture, state, frame, disconnect: () => wire.close(), holdNext: (path: string) => {
+    let entered!: () => void, release!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; }), gate = new Promise<void>(resolve => { release = resolve; });
+    held = { path, entered, gate }; return { started, release };
+  } };
+}
+
 type StopEvidence = {
   parent: string; taskId: string; child?: string; launchCalls?: readonly string[]; occurrence?: unknown;
   pendingChanges: Set<string>;
@@ -1440,6 +1488,365 @@ describe("OpenCode 2.x provider: sessions", () => {
       expect(server.requests("GET", "/api/session/active")).toHaveLength(3);
     } finally { await provider.dispose(); }
   });
+  for (const path of ["/api/shell/sh_fixture", "/api/session/active", "/api/session/ses_child/message"]) {
+    test(`partial first live inventory recovers after ${path} succeeds without another launcher frame`, async () => {
+      const server = workerRecoveryServer(), provider = server.provider(), stream = observedNativeStream(provider);
+      const failedType = path.includes("/shell/") ? "shell" : "agent";
+      try {
+        await stream.seen(event => event.eventType === "server.connected"); server.state.failure = path;
+        const initial = await provider.reconcileBackgroundTasks("ses_parent", { fresh: true });
+        expect(initial.find(task => task.taskType === failedType)).toMatchObject({ status: "running", stateUncertain: true });
+        expect(initial.find(task => task.taskType !== failedType)).toMatchObject({ status: "running", stateUncertain: false });
+        server.state.failure = "";
+        for (let retry = 0; retry < 3; retry++) {
+          const recovered = await provider.reconcileBackgroundTasks("ses_parent", { fresh: true });
+          expect(recovered).toHaveLength(2);
+          expect(recovered.every(task => task.status === "running" && task.stateUncertain === false)).toBe(true);
+          expect(compactWorkers(recovered).every(worker => worker.state === "working")).toBe(true);
+        }
+        await provider.stopTask("ses_parent", failedType === "shell" ? "v2:ses_parent:call_shell" : "v2:ses_parent:call_worker");
+        expect(server.calls.filter(call => call.method !== "GET").map(call => `${call.method} ${call.path}`)).toEqual([
+          failedType === "shell" ? "DELETE /api/shell/sh_fixture" : "POST /api/session/ses_child/interrupt",
+        ]);
+      } finally { stream.lifetime.abort(); await stream.pump.catch(() => undefined); await provider.dispose(); }
+    });
+  }
+
+  test("partial first live transcript history does not consume recovery's initial inventory", async () => {
+    const server = workerRecoveryServer(), provider = server.provider(), stream = observedNativeStream(provider);
+    try {
+      await stream.seen(event => event.eventType === "server.connected"); server.state.failure = "/api/session/ses_child/message";
+      const page = await provider.listMessages("ses_parent", { limit: 100 });
+      expect(page.completeItems).toContainEqual(expect.objectContaining({ type: "background_task", taskType: "agent", stateUncertain: true }));
+      server.state.failure = "";
+      for (let retry = 0; retry < 3; retry++) expect((await provider.reconcileBackgroundTasks("ses_parent", { fresh: true })).every(task => task.stateUncertain === false)).toBe(true);
+    } finally { stream.lifetime.abort(); await stream.pump.catch(() => undefined); await provider.dispose(); }
+  });
+
+  for (const removed of [true, false]) test(`failed first shell inventory cannot be replaced by transcript proof for a ${removed ? "removed" : "running"} target`, async () => {
+    const fixture = JSON.parse(readFileSync(path.join(import.meta.dir, "../../../../tests/fixtures/opencode-v2/background-2.0.29.json"), "utf8"));
+    let failure = true, gone = false;
+    const healthy = structuredClone(fixture.shell);
+    healthy.id = "healthy_shell_message";
+    healthy.content[0].id = "healthy_shell";
+    healthy.content[0].state.metadata.shellID = "sh_healthy";
+    const server = fakeOpenCode({
+      "GET /api/event": () => new Response(new ReadableStream<Uint8Array>({ start(controller) {
+        controller.enqueue(new TextEncoder().encode('data: {"type":"server.connected","data":{}}\n\n'));
+      } }), { headers: { "content-type": "text/event-stream" } }),
+      "GET /api/session/active": () => ({ ses_child: { status: "running" } }),
+      "GET /api/session/:id": ({ path }) => session(path.split("/").at(-1)!, path.endsWith("ses_child") ? { parentID: "ses_parent" } : {}),
+      "GET /api/session/ses_parent/message": () => ({ data: [fixture.launch, fixture.shell, healthy], cursor: {} }),
+      "GET /api/session/ses_child/message": () => ({ data: [], cursor: {} }),
+      "GET /api/session/ses_parent/inbox": () => ({ data: [] }),
+      "GET /api/shell/:id": ({ path }) => path.endsWith("sh_fixture") && failure ? new Response(null, { status: 500 })
+        : path.endsWith("sh_fixture") && gone ? new Response(null, { status: 404 })
+          : scoped({ id: path.split("/").at(-1), command: "printf fixture", status: "running", time: { started: 71 }, metadata: { sessionID: "ses_parent" } }),
+    });
+    const provider = server.provider(), stream = observedNativeStream(provider);
+    const controls = (provider as unknown as { controls: { current(taskId: string): boolean } }).controls;
+    try {
+      await stream.seen(event => event.eventType === "server.connected");
+      expect(await provider.reconcileBackgroundTasks("ses_parent", { fresh: true })).toContainEqual(expect.objectContaining({ toolUseId: "call_shell", stateUncertain: true }));
+      expect(controls.current("v2:ses_parent:call_shell")).toBe(false);
+      failure = false; gone = removed;
+      const reads = server.requests("GET", "/api/shell/sh_fixture").length;
+      for (let retry = 0; retry < 2; retry++) {
+        const page = await provider.listMessages("ses_parent", { limit: 100 });
+        expect(page.completeItems).toContainEqual(expect.objectContaining({ toolUseId: "call_shell", status: "running", stateUncertain: true }));
+        expect(controls.current("v2:ses_parent:call_shell")).toBe(false);
+        for (const call of ["call_worker", "healthy_shell"]) {
+          expect(page.completeItems).toContainEqual(expect.objectContaining({ toolUseId: call, status: "running", stateUncertain: false }));
+          expect(controls.current(`v2:ses_parent:${call}`)).toBe(true);
+        }
+      }
+      expect(server.requests("GET", "/api/shell/sh_fixture")).toHaveLength(reads);
+      const recovered = await provider.reconcileBackgroundTasks("ses_parent", { fresh: true });
+      expect(recovered.find(task => task.toolUseId === "call_shell")).toMatchObject({ status: "running", stateUncertain: removed });
+      expect(controls.current("v2:ses_parent:call_shell")).toBe(!removed);
+      expect(server.requests("GET", "/api/shell/sh_fixture")).toHaveLength(reads + 1);
+      expect(server.calls.every(call => call.method === "GET")).toBe(true);
+    } finally { stream.lifetime.abort(); await stream.pump.catch(() => undefined); await provider.dispose(); }
+  });
+
+  for (const target of ["removed", "running", "foreign"] as const) test(`sixteen held reads cannot let transcript proof replace rejected inventory for a ${target} shell`, async () => {
+    const fixture = JSON.parse(readFileSync(path.join(import.meta.dir, "../../../../tests/fixtures/opencode-v2/background-2.0.29.json"), "utf8"));
+    const healthy = structuredClone(fixture.shell);
+    healthy.id = "healthy_message"; healthy.content[0].id = "healthy_call"; healthy.content[0].state.metadata.shellID = "sh_healthy";
+    let failure = true, held = 0, wire!: ReadableStreamDefaultController<Uint8Array>, entered!: () => void, release!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; }), gate = new Promise<void>(resolve => { release = resolve; });
+    const server = fakeOpenCode({
+      "GET /api/event": () => new Response(new ReadableStream<Uint8Array>({ start(controller) {
+        wire = controller; controller.enqueue(new TextEncoder().encode('data: {"type":"server.connected","data":{}}\n\n'));
+      } }), { headers: { "content-type": "text/event-stream" } }),
+      "GET /api/session/:id": ({ path }) => session(path.split("/").at(-1)!),
+      "GET /api/session/ses_parent/message": () => ({ data: [fixture.shell, healthy], cursor: {} }),
+      "GET /api/session/:id/message": async () => { if (++held === 16) entered(); await gate; return { data: [], cursor: {} }; },
+      "GET /api/session/ses_parent/inbox": () => ({ data: [] }),
+      "GET /api/session/active": () => ({}),
+      "GET /api/shell/:id": ({ path }) => path.endsWith("sh_fixture") && failure ? new Response(null, { status: 500 })
+        : path.endsWith("sh_fixture") && target === "removed" ? new Response(null, { status: 404 })
+          : scoped({ id: path.split("/").at(-1), command: "printf fixture", status: "running", time: { started: 71 },
+            metadata: { sessionID: path.endsWith("sh_fixture") && target === "foreign" ? "other_parent" : "ses_parent" } }),
+    });
+    const provider = server.provider(), stream = observedNativeStream(provider), blockers: ReturnType<typeof provider.listMessages>[] = [];
+    const controls = (provider as unknown as { controls: { current(taskId: string): boolean; activeReads: number } }).controls;
+    try {
+      await stream.seen(event => event.eventType === "server.connected");
+      // Seed only the healthy sibling through native live evidence, leaving
+      // initial inventory open for the previously unobserved target.
+      wire.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({ id: "healthy_launch", created: 81, type: "session.message.content.updated",
+        location: { directory: WORKSPACE }, data: { sessionID: "ses_parent", messageID: healthy.id, content: healthy.content } })}\n\n`));
+      await stream.seen(event => event.updates.some(update => update.kind === "upsert" && update.item.type === "background_task" && update.item.toolUseId === "healthy_call"));
+      expect(controls.current("v2:ses_parent:healthy_call")).toBe(true);
+      for (let index = 0; index < 16; index++) blockers.push(provider.listMessages(`ses_block_${index}`, { limit: 1 }));
+      await started; expect(controls.activeReads).toBe(16);
+      expect(await provider.reconcileBackgroundTasks("ses_parent", { fresh: true })).toContainEqual(expect.objectContaining({ toolUseId: "call_shell", stateUncertain: true }));
+      expect(controls.current("v2:ses_parent:call_shell")).toBe(false);
+      expect(controls.current("v2:ses_parent:healthy_call")).toBe(true);
+      release(); await Promise.all(blockers); failure = false;
+      const reads = server.requests("GET", "/api/shell/sh_fixture").length;
+      for (let retry = 0; retry < 2; retry++) {
+        const page = await provider.listMessages("ses_parent", { limit: 100 });
+        expect(page.completeItems).toContainEqual(expect.objectContaining({ toolUseId: "call_shell", status: "running", stateUncertain: true }));
+        expect(page.completeItems).toContainEqual(expect.objectContaining({ toolUseId: "healthy_call", status: "running", stateUncertain: false }));
+        expect(controls.current("v2:ses_parent:call_shell")).toBe(false);
+        expect(controls.current("v2:ses_parent:healthy_call")).toBe(true);
+      }
+      expect(server.requests("GET", "/api/shell/sh_fixture")).toHaveLength(reads);
+      const fresh = await provider.reconcileBackgroundTasks("ses_parent", { fresh: true });
+      expect(fresh.find(task => task.toolUseId === "call_shell")).toMatchObject({ status: "running", stateUncertain: target !== "running" });
+      expect(fresh.find(task => task.toolUseId === "healthy_call")).toMatchObject({ status: "running", stateUncertain: false });
+      expect(controls.current("v2:ses_parent:call_shell")).toBe(target === "running");
+      expect(server.requests("GET", "/api/shell/sh_fixture")).toHaveLength(reads + 1);
+      expect(server.calls.every(call => call.method === "GET")).toBe(true);
+    } finally { release(); await Promise.allSettled(blockers); stream.lifetime.abort(); await stream.pump.catch(() => undefined); await provider.dispose(); }
+  });
+
+  for (const target of ["removed", "running", "foreign"] as const) test(`older in-flight transcript respects a newer ${target} shell inventory`, async () => {
+    const fixture = JSON.parse(readFileSync(path.join(import.meta.dir, "../../../../tests/fixtures/opencode-v2/background-2.0.29.json"), "utf8"));
+    const healthy = structuredClone(fixture.shell);
+    healthy.id = "healthy_message"; healthy.content[0].id = "healthy_call"; healthy.content[0].state.metadata.shellID = "sh_healthy";
+    let failure = true, held = 0, holdParent = true, wire!: ReadableStreamDefaultController<Uint8Array>;
+    let entered!: () => void, release!: () => void, parentEntered!: () => void, releaseParent!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; }), gate = new Promise<void>(resolve => { release = resolve; });
+    const parentStarted = new Promise<void>(resolve => { parentEntered = resolve; }), parentGate = new Promise<void>(resolve => { releaseParent = resolve; });
+    const server = fakeOpenCode({
+      "GET /api/event": () => new Response(new ReadableStream<Uint8Array>({ start(controller) {
+        wire = controller; controller.enqueue(new TextEncoder().encode('data: {"type":"server.connected","data":{}}\n\n'));
+      } }), { headers: { "content-type": "text/event-stream" } }),
+      "GET /api/session/:id": ({ path }) => session(path.split("/").at(-1)!),
+      "GET /api/session/ses_parent/message": async () => {
+        if (holdParent) { holdParent = false; parentEntered(); await parentGate; }
+        return { data: [fixture.shell, healthy], cursor: {} };
+      },
+      "GET /api/session/:id/message": async () => { if (++held === 15) entered(); await gate; return { data: [], cursor: {} }; },
+      "GET /api/session/ses_parent/inbox": () => ({ data: [] }),
+      "GET /api/session/active": () => ({}),
+      "GET /api/shell/:id": ({ path }) => path.endsWith("sh_fixture") && failure ? new Response(null, { status: 500 })
+        : path.endsWith("sh_fixture") && target === "removed" ? new Response(null, { status: 404 })
+          : scoped({ id: path.split("/").at(-1), command: "printf fixture", status: "running", time: { started: 71 },
+            metadata: { sessionID: path.endsWith("sh_fixture") && target === "foreign" ? "other_parent" : "ses_parent" } }),
+    });
+    const provider = server.provider(), stream = observedNativeStream(provider), blockers: ReturnType<typeof provider.listMessages>[] = [];
+    const controls = (provider as unknown as { controls: { current(taskId: string): boolean; activeReads: number } }).controls;
+    let older: ReturnType<typeof provider.listMessages> | undefined;
+    try {
+      await stream.seen(event => event.eventType === "server.connected");
+      wire.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({ id: "healthy_launch", created: 81, type: "session.message.content.updated",
+        location: { directory: WORKSPACE }, data: { sessionID: "ses_parent", messageID: healthy.id, content: healthy.content } })}\n\n`));
+      await stream.seen(event => event.updates.some(update => update.kind === "upsert" && update.item.type === "background_task" && update.item.toolUseId === "healthy_call"));
+      older = provider.listMessages("ses_parent", { limit: 100 }); await parentStarted;
+      for (let index = 0; index < 15; index++) blockers.push(provider.listMessages(`ses_block_${index}`, { limit: 1 }));
+      await started; expect(controls.activeReads).toBe(16);
+      expect(await provider.reconcileBackgroundTasks("ses_parent", { fresh: true })).toContainEqual(expect.objectContaining({ toolUseId: "call_shell", stateUncertain: true }));
+      release(); await Promise.all(blockers); failure = false;
+      // This inventory must not discharge outstanding verification merely
+      // because the transport returned a shell owned by another parent.
+      const fresh = await provider.reconcileBackgroundTasks("ses_parent", { fresh: true });
+      expect(fresh.find(task => task.toolUseId === "call_shell")).toMatchObject({ status: "running", stateUncertain: target !== "running" });
+      expect(fresh.find(task => task.toolUseId === "healthy_call")).toMatchObject({ status: "running", stateUncertain: false });
+      const shellReads = server.requests("GET", "/api/shell/sh_fixture").length;
+      releaseParent(); const page = await older;
+      expect(page.completeItems).toContainEqual(expect.objectContaining({ toolUseId: "call_shell", status: "running", stateUncertain: target !== "running" }));
+      expect(page.completeItems).toContainEqual(expect.objectContaining({ toolUseId: "healthy_call", status: "running", stateUncertain: false }));
+      expect(controls.current("v2:ses_parent:call_shell")).toBe(target === "running");
+      expect(controls.current("v2:ses_parent:healthy_call")).toBe(true);
+      expect(server.requests("GET", "/api/shell/sh_fixture")).toHaveLength(shellReads);
+      if (target !== "running") await expect(provider.stopTask("ses_parent", "v2:ses_parent:call_shell")).rejects.toThrow();
+      expect(server.calls.every(call => call.method === "GET")).toBe(true);
+    } finally {
+      release(); releaseParent(); await Promise.allSettled([...blockers, ...(older ? [older] : [])]);
+      stream.lifetime.abort(); await stream.pump.catch(() => undefined); await provider.dispose();
+    }
+  });
+
+  for (const connected of [false, true]) for (const active of [false, true]) test(`older agent transcript requires positive active inventory: ${active ? "active" : "absent"}/${connected ? "connected" : "standalone"}`, async () => {
+    const fixture = JSON.parse(readFileSync(path.join(import.meta.dir, "../../../../tests/fixtures/opencode-v2/background-2.0.29.json"), "utf8"));
+    const healthy = structuredClone(fixture.launch);
+    healthy.id = "healthy_message"; healthy.content[0].id = "healthy_agent"; healthy.content[0].state.metadata.sessionID = "ses_healthy";
+    let includeTarget = false, holdParent = false, failActive = true, targetActive = active, entered!: () => void, release!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; }), gate = new Promise<void>(resolve => { release = resolve; });
+    const server = fakeOpenCode({
+      "GET /api/event": () => new Response(new ReadableStream<Uint8Array>({ start(controller) {
+        controller.enqueue(new TextEncoder().encode('data: {"type":"server.connected","data":{}}\n\n'));
+      } }), { headers: { "content-type": "text/event-stream" } }),
+      "GET /api/session/active": () => failActive ? new Response(null, { status: 500 })
+        : { ses_healthy: { status: "running" }, ...(targetActive ? { ses_child: { status: "running" } } : {}) },
+      "GET /api/session/:id": ({ path }) => session(path.split("/").at(-1)!, path.endsWith("ses_child") || path.endsWith("ses_healthy") ? { parentID: "ses_parent" } : {}),
+      "GET /api/session/ses_parent/message": async () => {
+        if (holdParent) { holdParent = false; entered(); await gate; }
+        return { data: [...(includeTarget ? [fixture.launch] : []), healthy, fixture.shell], cursor: {} };
+      },
+      "GET /api/session/:id/message": () => ({ data: [], cursor: {} }),
+      "GET /api/session/ses_parent/inbox": () => ({ data: [] }),
+      "GET /api/shell/sh_fixture": () => scoped({ id: "sh_fixture", command: "printf fixture", status: "running", time: { started: 71 }, metadata: { sessionID: "ses_parent" } }),
+    });
+    const provider = server.provider(), controls = (provider as unknown as { controls: { current(taskId: string): boolean } }).controls;
+    let stream: ReturnType<typeof observedNativeStream> | undefined, older: ReturnType<typeof provider.listMessages> | undefined;
+    const healthyCalls = ["healthy_agent", "call_shell"];
+    try {
+      // Retain both healthy kinds without closing initial live inventory.
+      await provider.listMessages("ses_parent", { limit: 100 });
+      for (const call of healthyCalls) expect(controls.current(`v2:ses_parent:${call}`)).toBe(true);
+      if (connected) { stream = observedNativeStream(provider); await stream.seen(event => event.eventType === "server.connected"); }
+      includeTarget = holdParent = true;
+      older = provider.listMessages("ses_parent", { limit: 100 }); await started;
+      expect(await provider.reconcileBackgroundTasks("ses_parent", { fresh: true })).toContainEqual(expect.objectContaining({ toolUseId: "call_worker", stateUncertain: true }));
+      failActive = false;
+      const fresh = await provider.reconcileBackgroundTasks("ses_parent", { fresh: true });
+      expect(fresh.find(task => task.toolUseId === "call_worker")).toMatchObject({ status: "running", stateUncertain: !active });
+      for (const call of healthyCalls) expect(fresh.find(task => task.toolUseId === call)).toMatchObject({ status: "running", stateUncertain: false });
+      const activeReads = server.requests("GET", "/api/session/active").length;
+      release(); const page = await older;
+      expect(page.completeItems).toContainEqual(expect.objectContaining({ toolUseId: "call_worker", status: "running", stateUncertain: !active }));
+      expect(controls.current("v2:ses_parent:call_worker")).toBe(active);
+      for (const call of healthyCalls) {
+        expect(page.completeItems).toContainEqual(expect.objectContaining({ toolUseId: call, status: "running", stateUncertain: false }));
+        expect(controls.current(`v2:ses_parent:${call}`)).toBe(true);
+      }
+      expect(server.requests("GET", "/api/session/active")).toHaveLength(activeReads);
+      if (!active) await expect(provider.stopTask("ses_parent", "v2:ses_parent:call_worker")).rejects.toThrow();
+      // Missing activity is not completion or revocation. Positive fresh
+      // verification can still recover the unchanged target without a frame.
+      targetActive = true;
+      expect(await provider.reconcileBackgroundTasks("ses_parent", { fresh: true })).toContainEqual(expect.objectContaining({ toolUseId: "call_worker", status: "running", stateUncertain: false }));
+      expect(controls.current("v2:ses_parent:call_worker")).toBe(true);
+      expect(server.calls.every(call => call.method === "GET")).toBe(true);
+    } finally { release(); await older?.catch(() => undefined); stream?.lifetime.abort(); await stream?.pump.catch(() => undefined); await provider.dispose(); }
+  });
+
+  for (const negative of ["foreign-directory", "failed-history", "malformed-idle"] as const) test(`filtered or inconclusive ${negative} child evidence cannot discharge outstanding inventory`, async () => {
+    const fixture = JSON.parse(readFileSync(path.join(import.meta.dir, "../../../../tests/fixtures/opencode-v2/background-2.0.29.json"), "utf8"));
+    let holdParent = true, phase: "failed-active" | "negative" | "owned" = "failed-active", entered!: () => void, release!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; }), gate = new Promise<void>(resolve => { release = resolve; });
+    const server = fakeOpenCode({
+      "GET /api/session/active": () => phase === "failed-active" ? new Response(null, { status: 500 }) : phase === "owned" ? { ses_child: { status: "running" } } : {},
+      "GET /api/session/ses_parent": () => session("ses_parent"),
+      "GET /api/session/ses_child": () => session("ses_child", { parentID: "ses_parent", location: { directory: phase === "negative" && negative === "foreign-directory" ? "/other" : WORKSPACE } }),
+      "GET /api/session/ses_parent/message": async () => {
+        if (holdParent) { holdParent = false; entered(); await gate; }
+        return { data: [fixture.launch, fixture.shell], cursor: {} };
+      },
+      "GET /api/session/ses_child/message": () => phase === "negative" && negative === "failed-history" ? new Response(null, { status: 500 })
+        : { data: phase === "negative" && negative === "malformed-idle" ? [{ id: "idle", type: "idle", time: {} }] : [], cursor: {} },
+      "GET /api/session/ses_parent/inbox": () => ({ data: [] }),
+      "GET /api/shell/sh_fixture": () => scoped({ id: "sh_fixture", command: "printf fixture", status: "running", time: { started: 71 }, metadata: { sessionID: "ses_parent" } }),
+    });
+    const provider = server.provider(), controls = (provider as unknown as { controls: { current(taskId: string): boolean } }).controls;
+    let older: ReturnType<typeof provider.listMessages> | undefined;
+    try {
+      older = provider.listMessages("ses_parent", { limit: 100 }); await started;
+      expect(await provider.reconcileBackgroundTasks("ses_parent", { fresh: true })).toContainEqual(expect.objectContaining({ toolUseId: "call_worker", stateUncertain: true }));
+      phase = "negative";
+      const fresh = await provider.reconcileBackgroundTasks("ses_parent", { fresh: true });
+      if (negative === "foreign-directory") expect(fresh.some(task => task.toolUseId === "call_worker")).toBe(false);
+      else expect(fresh.find(task => task.toolUseId === "call_worker")).toMatchObject({ status: "running", stateUncertain: true });
+      expect(fresh.find(task => task.toolUseId === "call_shell")).toMatchObject({ status: "running", stateUncertain: false });
+      // Without a subscription, a session may move out of this directory and
+      // back before the older caller verifies it. Parentage and IDs stay fixed;
+      // recovered ownership/history alone cannot replace pending active proof.
+      phase = "owned"; release(); const page = await older;
+      expect(page.completeItems).toContainEqual(expect.objectContaining({ toolUseId: "call_worker", status: "running", stateUncertain: true }));
+      expect(page.completeItems).toContainEqual(expect.objectContaining({ toolUseId: "call_shell", status: "running", stateUncertain: false }));
+      expect(controls.current("v2:ses_parent:call_worker")).toBe(false);
+      expect(await provider.reconcileBackgroundTasks("ses_parent", { fresh: true })).toContainEqual(expect.objectContaining({ toolUseId: "call_worker", status: "running", stateUncertain: false }));
+      expect(controls.current("v2:ses_parent:call_worker")).toBe(true);
+      expect(server.calls.every(call => call.method === "GET")).toBe(true);
+    } finally { release(); await older?.catch(() => undefined); await provider.dispose(); }
+  });
+
+  for (const path of ["/api/shell/sh_fixture", "/api/session/active", "/api/session/ses_child/message"]) {
+    test(`queued fresh mixed-worker recovery follows partial ${path} evidence`, async () => {
+      const server = workerRecoveryServer(), provider = server.provider(), stream = observedNativeStream(provider), hold = server.holdNext(path);
+      let first: ReturnType<typeof provider.reconcileBackgroundTasks> | undefined, next: typeof first;
+      try {
+        await stream.seen(event => event.eventType === "server.connected"); server.state.failure = path;
+        first = provider.reconcileBackgroundTasks("ses_parent", { fresh: true }); await hold.started;
+        server.state.failure = ""; next = provider.reconcileBackgroundTasks("ses_parent", { fresh: true }); hold.release();
+        expect((await first).some(task => task.stateUncertain === true)).toBe(true);
+        const recovered = await next;
+        expect(recovered).toHaveLength(2); expect(recovered.every(task => task.stateUncertain === false)).toBe(true);
+        expect(server.requests("GET", path)).toHaveLength(2);
+        expect(server.calls.every(call => call.method === "GET")).toBe(true);
+      } finally { hold.release(); await Promise.allSettled([first, next].filter(Boolean)); stream.lifetime.abort(); await stream.pump.catch(() => undefined); await provider.dispose(); }
+    });
+  }
+
+  test("partial first live inventory stays retryable through public revert visibility filtering", async () => {
+    const server = workerRecoveryServer(), provider = server.provider(), stream = observedNativeStream(provider);
+    server.state.messages.push({ id: "reverted_prompt", type: "user", text: "Synthetic hidden turn", time: { created: 100 } });
+    server.state.revert = "reverted_prompt";
+    try {
+      await stream.seen(event => event.eventType === "server.connected"); server.state.failure = "/api/session/ses_child/message";
+      expect(await provider.reconcileBackgroundTasks("ses_parent", { fresh: true })).toContainEqual(expect.objectContaining({ taskType: "agent", stateUncertain: true }));
+      server.state.failure = "";
+      for (let retry = 0; retry < 3; retry++) {
+        const recovered = await provider.reconcileBackgroundTasks("ses_parent", { fresh: true });
+        expect(recovered).toHaveLength(2); expect(recovered.every(task => task.stateUncertain === false)).toBe(true);
+      }
+    } finally { stream.lifetime.abort(); await stream.pump.catch(() => undefined); await provider.dispose(); }
+  });
+
+  test("partial first inventory cannot authorize pre-gap workers after reconnect", async () => {
+    const server = workerRecoveryServer(), provider = server.provider();
+    let stream = observedNativeStream(provider);
+    try {
+      await stream.seen(event => event.eventType === "server.connected"); server.state.failure = "/api/shell/sh_fixture";
+      expect(await provider.reconcileBackgroundTasks("ses_parent", { fresh: true })).toContainEqual(expect.objectContaining({ taskType: "shell", stateUncertain: true }));
+      server.disconnect(); await stream.pump;
+      server.state.failure = ""; stream = observedNativeStream(provider); await stream.seen(event => event.eventType === "server.connected");
+      for (let retry = 0; retry < 3; retry++) {
+        const recovered = await provider.reconcileBackgroundTasks("ses_parent", { fresh: true });
+        expect(recovered).toHaveLength(2); expect(recovered.every(task => task.stateUncertain === true)).toBe(true);
+      }
+      for (const call of ["call_shell", "call_worker"]) await expect(provider.stopTask("ses_parent", `v2:ses_parent:${call}`)).rejects.toThrow(/no longer confirmed/);
+      expect(server.calls.every(call => call.method === "GET")).toBe(true);
+    } finally { stream.lifetime.abort(); await stream.pump.catch(() => undefined); await provider.dispose(); }
+  });
+
+  for (const kind of ["agent", "shell"] as const) test(`partial first inventory does not restore ${kind} controls after changed native ownership`, async () => {
+    const server = workerRecoveryServer(), provider = server.provider(), stream = observedNativeStream(provider);
+    try {
+      await stream.seen(event => event.eventType === "server.connected"); server.state.failure = kind === "shell" ? "/api/shell/sh_fixture" : "/api/session/active";
+      expect(await provider.reconcileBackgroundTasks("ses_parent", { fresh: true })).toContainEqual(expect.objectContaining({ taskType: kind, stateUncertain: true }));
+      server.state.failure = "";
+      if (kind === "agent") {
+        server.state.childParent = "foreign_parent";
+        server.frame("session.updated", { sessionID: "ses_child", parentID: "foreign_parent" });
+        await stream.seen(event => event.eventType === "session.updated");
+      } else server.state.shellParent = "foreign_parent";
+      for (let retry = 0; retry < 3; retry++) {
+        const recovered = await provider.reconcileBackgroundTasks("ses_parent", { fresh: true });
+        if (kind === "agent") expect(recovered.some(task => task.taskType === "agent")).toBe(false);
+        else expect(recovered.find(task => task.taskType === "shell")).toMatchObject({ status: "running", stateUncertain: true });
+        expect(recovered.find(task => task.taskType !== kind)).toMatchObject({ status: "running", stateUncertain: false });
+      }
+      await expect(provider.stopTask("ses_parent", kind === "shell" ? "v2:ses_parent:call_shell" : "v2:ses_parent:call_worker")).rejects.toThrow();
+      expect(server.calls.every(call => call.method === "GET")).toBe(true);
+    } finally { stream.lifetime.abort(); await stream.pump.catch(() => undefined); await provider.dispose(); }
+  });
+
   test("ownership reuse evicts at the incumbent worker entry limit and reconnect starts cold", async () => {
     const reference = (index: number) => ({ type: "tool", name: "subagent", id: `call${index}`, state: { status: "running", input: {}, metadata: { sessionID: `child${index}` } } });
     const frame = (content: unknown[]) => ({ type: "session.message.content.updated", location: { directory: WORKSPACE }, data: { sessionID: "ses_parent", messageID: "answer", content } });
@@ -2971,6 +3378,218 @@ describe("OpenCode 2.x provider: sessions", () => {
     const older = await provider.listMessages("ses_parent", { cursor: result.nextCursor, limit: 1 });
     expect(new Set([...result.items, ...older.items].filter(item => item.type === "background_task").map(item => item.id)).size).toBe(1);
   });
+  test("historical execution intervals correlate six launchers to five explicit results without reordering tools", async () => {
+    const launch = historyWorkerLaunch, result = historyWorkerResult;
+    const messages = [launch("call_a", 10), launch("call_b", 20), result("result_0", 40),
+      ...[1, 2, 3, 4].flatMap(i => [launch(`call_${i}`, i * 100), result(`result_${i}`, i * 100 + 40)])];
+    const server = fakeOpenCode({
+      "GET /api/session/active": () => ({}),
+      "GET /api/session/:id": ({ path }) => session(path.split("/").at(-1)!, path.endsWith("ses_child") ? { parentID: "ses_parent" } : {}),
+      "GET /api/session/ses_parent/inbox": () => ({ data: [] }),
+      "GET /api/session/ses_parent/message": () => ({ data: messages, cursor: {} }),
+      "GET /api/session/ses_child/message": () => ({ data: [30, 130, 230, 330, 430].map(at => ({ id: `idle_${at}`, type: "idle", time: { created: at } })), cursor: {} }),
+    });
+    const provider = server.provider();
+    try {
+      const page = await provider.listMessages("ses_parent", { limit: 100 });
+      const tasks = page.items.filter(item => item.type === "background_task");
+      expect(tasks).toHaveLength(5);
+      expect(tasks).toContainEqual(expect.objectContaining({ toolUseId: "call_a", toolUseIds: ["call_a", "call_b"], status: "completed", resultId: "result_0" }));
+      for (const i of [1, 2, 3, 4]) expect(tasks).toContainEqual(expect.objectContaining({ toolUseId: `call_${i}`, status: "completed", resultId: `result_${i}` }));
+      expect(page.items.filter(item => item.type === "tool").map(item => item.id)).toEqual(["tool:call_a", "tool:call_b", "tool:call_1", "tool:call_2", "tool:call_3", "tool:call_4"]);
+      const recovered = await provider.reconcileBackgroundTasks("ses_parent");
+      expect(recovered).toHaveLength(5);
+      expect(recovered.every(item => item.status === "completed" && item.stateUncertain === false)).toBe(true);
+    } finally { await provider.dispose(); }
+    expect(server.calls.every(call => call.method === "GET")).toBe(true);
+  });
+
+  for (const combined of [true, false]) test(`historical interleaved execution clocks correlate aliases ${combined ? "within one assistant" : "across assistants"} without reordering tools`, async () => {
+    // Native content is appended on tool.input.started; time.ran is recorded
+    // on tool.called. Input order therefore need not be execution-start order.
+    const first = historyWorkerLaunch("call_a", 10), second = historyWorkerLaunch("call_b", 12);
+    first.content[0]!.time = { created: 10, ran: 21, completed: 23 };
+    second.content[0]!.time = { created: 12, ran: 13, completed: 15 };
+    const launches = combined ? [{ ...first, content: [...first.content, ...second.content] }] : [first, second];
+    const server = workerHistoryServer([...launches, historyWorkerResult("result", 40)],
+      [3, 30].map(at => ({ id: `idle_${at}`, type: "idle", time: { created: at } })));
+    const provider = server.provider();
+    try {
+      const page = await provider.listMessages("ses_parent", { limit: 100 });
+      expect(page.completeItems?.filter(item => item.type === "tool").map(item => item.id)).toEqual(["tool:call_a", "tool:call_b"]);
+      for (const tasks of [page.completeItems?.filter(item => item.type === "background_task"), await provider.reconcileBackgroundTasks("ses_parent")]) {
+        expect(tasks).toEqual([expect.objectContaining({ toolUseId: "call_a", toolUseIds: ["call_a", "call_b"], status: "completed", stateUncertain: false, resultId: "result" })]);
+      }
+      expect(server.calls.every(call => call.method === "GET")).toBe(true);
+    } finally { await provider.dispose(); }
+  });
+
+  for (const combined of [true, false]) for (const order of [
+    ["new_a", "old", "new_b"], ["new_a", "new_b", "old"], ["old", "new_a", "new_b"],
+    ["old", "new_b", "new_a"], ["new_b", "new_a", "old"], ["new_b", "old", "new_a"],
+  ]) test(`historical supersession preserves separate intervals: ${order.join("/")} ${combined ? "combined" : "split"} assistants with pending results`, async () => {
+    const starts: Record<string, number> = { old: 13, new_a: 21, new_b: 25 };
+    const launches = order.map((call, index) => {
+      const message = historyWorkerLaunch(call, index + 2);
+      message.content[0]!.time = { created: index + 2, ran: starts[call]!, completed: starts[call]! + 1 };
+      return message;
+    });
+    const messages: unknown[] = combined ? [{ ...launches[0]!, content: launches.flatMap(message => message.content) }] : launches;
+    const reports = [historyWorkerResult("old_result", 18), historyWorkerResult("new_result", 40)];
+    const pending: unknown[] = reports.map(({ id, time, text, metadata }) => ({ id, time, type: "synthetic", delivery: "steer", payload: { text, metadata } }));
+    const server = workerHistoryServer(messages, [17, 30].map(at => ({ id: `idle_${at}`, type: "idle", time: { created: at } })), pending);
+    const aliases = order.filter(call => call !== "old");
+    const expected = [
+      { toolUseId: "old", toolUseIds: undefined, status: "completed" as const, stateUncertain: false, resultId: "old_result" },
+      { toolUseId: aliases[0], toolUseIds: aliases, status: "completed" as const, stateUncertain: false, resultId: "new_result" },
+    ].sort((left, right) => left.toolUseId!.localeCompare(right.toolUseId!));
+    const recovering = server.provider();
+    try {
+      const tasks = await recovering.reconcileBackgroundTasks("ses_parent", { fresh: true });
+      expect(tasks).toHaveLength(2);
+      expect(tasks.map(({ toolUseId, toolUseIds, status, stateUncertain, resultId }) => ({ toolUseId, toolUseIds, status, stateUncertain, resultId }))
+        .sort((left, right) => (left.toolUseId ?? "").localeCompare(right.toolUseId ?? ""))).toEqual(expected);
+    } finally { await recovering.dispose(); }
+    // Delivery changes the envelope, not the occurrence/result identities.
+    messages.push(...reports);
+    pending.length = 0;
+    const history = server.provider();
+    try {
+      const page = await history.listMessages("ses_parent", { limit: 100 });
+      expect(page.completeItems?.filter(item => item.type === "tool").map(item => item.id)).toEqual(order.map(call => `tool:${call}`));
+      expect(page.completeItems?.filter(item => item.type === "background_task")
+        .map(({ toolUseId, toolUseIds, status, stateUncertain, resultId }) => ({ toolUseId, toolUseIds, status, stateUncertain, resultId }))
+        .sort((left, right) => (left.toolUseId ?? "").localeCompare(right.toolUseId ?? ""))).toEqual(expected);
+      expect(server.calls.every(call => call.method === "GET")).toBe(true);
+    } finally { await history.dispose(); }
+  });
+
+  for (const completed of [false, true]) for (const reversed of [false, true]) for (const combined of [false, true]) {
+    for (const clock of ["straddling", "missing-acceptance", "missing-start", "tied-boundary", "tied-window", "reversed-window"] as const) {
+      test(`permission-delayed admission stays uncertain: ${clock}/${completed ? "completed" : "running"}/${reversed ? "reversed" : "forward"}/${combined ? "combined" : "split"}`, async () => {
+        const old = historyWorkerLaunch("old", 3), delayed = historyWorkerLaunch("delayed", 4);
+        old.content[0]!.time = { created: 3, ran: 13, completed: 16 };
+        const time: { created?: number; ran?: number; completed?: number } = { created: 4, ran: 15, completed: 23 };
+        if (clock === "missing-acceptance") delete time.completed;
+        if (clock === "missing-start") { delete time.created; delete time.ran; }
+        if (clock === "tied-boundary") time.completed = 17;
+        if (clock === "tied-window") time.completed = 15;
+        if (clock === "reversed-window") time.completed = 14;
+        delayed.content[0]!.time = time as typeof delayed.content[0]["time"];
+        const launches = reversed ? [delayed, old] : [old, delayed];
+        const messages: unknown[] = combined ? [{ ...old, content: launches.flatMap(message => message.content) }] : launches;
+        const reports = [historyWorkerResult("old_result", 18), ...(completed ? [historyWorkerResult("new_result", 40)] : [])];
+        const pending = reports.map(({ id, time, text, metadata }) => ({ id, time, type: "synthetic", delivery: "steer", payload: { text, metadata } }));
+        const server = workerHistoryServer(messages, (completed ? [17, 30] : [17]).map(at => ({ id: `idle_${at}`, type: "idle", time: { created: at } })), pending);
+        const provider = server.provider();
+        try {
+          const tasks = await provider.reconcileBackgroundTasks("ses_parent", { fresh: true });
+          const launches = tasks.filter(task => task.toolUseId);
+          expect(launches).toHaveLength(2);
+          expect(launches.every(task => task.status === "running" && task.stateUncertain && !task.toolUseIds && !task.resultId)).toBe(true);
+          for (const report of reports) expect(tasks).toContainEqual(expect.objectContaining({ resultId: report.id, status: "completed" }));
+          expect(tasks.filter(task => task.resultId).map(task => task.resultId).sort()).toEqual(reports.map(report => report.id).sort());
+          expect(server.calls.every(call => call.method === "GET")).toBe(true);
+        } finally { await provider.dispose(); }
+      });
+    }
+  }
+
+  for (const boundary of [true, false]) for (const reportAt of [18, 23]) test(`permission-delayed admission cannot consume a pre-acceptance/tied report as the only launch: ${boundary}/${reportAt}`, async () => {
+    const delayed = historyWorkerLaunch("delayed", 4);
+    delayed.content[0]!.time = { created: 4, ran: 15, completed: 23 };
+    const server = workerHistoryServer([delayed, historyWorkerResult("old_result", reportAt)], boundary ? [{ id: "idle", type: "idle", time: { created: 17 } }] : []);
+    const provider = server.provider();
+    try {
+      const tasks = await provider.reconcileBackgroundTasks("ses_parent", { fresh: true });
+      expect(tasks).toHaveLength(2);
+      expect(tasks.find(task => task.toolUseId === "delayed")).toMatchObject({ status: "running", stateUncertain: true });
+      expect(tasks.find(task => task.toolUseId === "delayed")?.resultId).toBeUndefined();
+      expect(tasks.find(task => task.resultId === "old_result")?.toolUseId).toBeUndefined();
+    } finally { await provider.dispose(); }
+  });
+
+  for (const reversed of [false, true]) for (const clock of ["between", "at-earlier", "at-later", "tied", "missing-launch", "missing-boundary"] as const) {
+    test(`historical interval coordinates reject ${clock} ambiguity in ${reversed ? "reverse" : "forward"} execution order`, async () => {
+      const first = historyWorkerLaunch("call_a", 10), second = historyWorkerLaunch("call_b", 12);
+      first.content[0]!.time = { created: 10, ran: reversed ? 21 : 13, completed: 23 };
+      second.content[0]!.time = { created: 12, ran: reversed ? 13 : 21, completed: 23 };
+      if (clock === "tied") second.content[0]!.time.ran = first.content[0]!.time.ran;
+      if (clock === "missing-launch") second.content[0]!.time = {} as typeof second.content[0]["time"];
+      const boundary = { id: "idle_boundary", type: "idle", time: { created: clock === "at-earlier" ? 13 : clock === "at-later" ? 21 : 17 } as { created?: number } };
+      if (clock === "missing-boundary") delete boundary.time.created;
+      const server = workerHistoryServer([{ ...first, content: [...first.content, ...second.content] }, historyWorkerResult("result", 40)], [boundary]);
+      const provider = server.provider();
+      try {
+        const tasks = await provider.reconcileBackgroundTasks("ses_parent");
+        const launches = tasks.filter(task => task.toolUseId);
+        expect(launches).toHaveLength(2);
+        expect(launches.every(task => !task.toolUseIds && task.status === "running" && task.stateUncertain && !task.resultId)).toBe(true);
+      } finally { await provider.dispose(); }
+    });
+  }
+
+  for (const reversed of [false, true]) test(`historical boundary-separated ${reversed ? "reverse" : "forward"} starts cannot apply an old result to the new execution`, async () => {
+    const older = historyWorkerLaunch("call_old", 10), newer = historyWorkerLaunch("call_new", 12);
+    older.content[0]!.time = { created: 10, ran: 13, completed: 15 };
+    newer.content[0]!.time = { created: 12, ran: 21, completed: 23 };
+    const content = reversed ? [...newer.content, ...older.content] : [...older.content, ...newer.content];
+    const server = workerHistoryServer([{ ...older, content }, historyWorkerResult("result_old", 16)], [{ id: "idle_old", type: "idle", time: { created: 17 } }]);
+    const provider = server.provider();
+    try {
+      const tasks = await provider.reconcileBackgroundTasks("ses_parent");
+      expect(tasks).toHaveLength(2);
+      expect(tasks.find(task => task.toolUseId === "call_old")).toMatchObject({ status: "completed", resultId: "result_old", stateUncertain: false });
+      expect(tasks.find(task => task.toolUseId === "call_new")).toMatchObject({ status: "running" });
+      expect(tasks.find(task => task.toolUseId === "call_new")?.resultId).toBeUndefined();
+    } finally { await provider.dispose(); }
+  });
+
+  test("historical aliases without an explicit result remain uncertain and cannot stop a continued child", async () => {
+    const server = workerHistoryServer([historyWorkerLaunch("call_a", 10), historyWorkerLaunch("call_b", 20)],
+      [{ id: "idle", type: "idle", time: { created: 30 } }]);
+    const provider = server.provider();
+    try {
+      expect(await provider.reconcileBackgroundTasks("ses_parent")).toEqual([expect.objectContaining({ toolUseIds: ["call_a", "call_b"], status: "running", stateUncertain: true })]);
+      await expect(provider.stopTask("ses_parent", "v2:ses_parent:call_a")).rejects.toThrow(/no longer confirmed/);
+      expect(server.calls.every(call => call.method === "GET")).toBe(true);
+    } finally { await provider.dispose(); }
+  });
+
+  for (const clock of ["missing-launch", "tied-launch", "tied-boundary", "missing-boundary"] as const) test(`historical interval grouping preserves ambiguity with ${clock} clocks`, async () => {
+    const first = historyWorkerLaunch("call_a", 10), second = historyWorkerLaunch("call_b", 20);
+    const idle = { id: "idle", type: "idle", time: { created: 30 } as { created?: number } };
+    if (clock === "missing-launch") second.content[0]!.time = {} as typeof second.content[0]["time"];
+    if (clock === "tied-launch") second.content[0]!.time = { ...first.content[0]!.time };
+    if (clock === "tied-boundary") second.content[0]!.time.ran = 30;
+    if (clock === "missing-boundary") delete idle.time.created;
+    const server = workerHistoryServer([first, second, historyWorkerResult("result", 40)], [idle]);
+    const provider = server.provider();
+    try {
+      const tasks = await provider.reconcileBackgroundTasks("ses_parent");
+      const launchers = tasks.filter(task => task.toolUseId);
+      expect(launchers).toHaveLength(2);
+      expect(launchers.every(task => task.status === "running" && task.stateUncertain && !task.resultId)).toBe(true);
+    } finally { await provider.dispose(); }
+  });
+
+  for (const datedBeforeNewRun of [true, false]) test(`historical delayed result ${datedBeforeNewRun ? "settles only the old run and deduplicates" : "cannot choose a run from a late clock"}`, async () => {
+    const report = historyWorkerResult("result", datedBeforeNewRun ? 40 : 140);
+    const server = workerHistoryServer([historyWorkerLaunch("call_a", 10), historyWorkerLaunch("call_b", 20), historyWorkerLaunch("call_new", 100), report, report],
+      [{ id: "idle", type: "idle", time: { created: 30 } }]);
+    const provider = server.provider();
+    try {
+      const tasks = await provider.reconcileBackgroundTasks("ses_parent");
+      expect(tasks.filter(task => task.resultId === "result")).toHaveLength(1);
+      expect(tasks).toContainEqual(expect.objectContaining({ toolUseId: "call_new", status: "running" }));
+      expect(tasks.find(task => task.toolUseId === "call_new")?.resultId).toBeUndefined();
+      const old = tasks.find(task => task.toolUseId === "call_a");
+      expect(old?.toolUseIds).toEqual(["call_a", "call_b"]);
+      expect(old?.status).toBe(datedBeforeNewRun ? "completed" : "running");
+      expect(old?.resultId).toBe(datedBeforeNewRun ? "result" : undefined);
+    } finally { await provider.dispose(); }
+  });
+
   test("child execution boundaries separate reused occurrences; an ambiguous delayed notice settles neither", async () => {
     const fixture = JSON.parse(readFileSync(path.join(import.meta.dir, "../../../../tests/fixtures/opencode-v2/background-2.0.29.json"), "utf8"));
     const notice = { ...fixture.stored, time: { created: 70 } };

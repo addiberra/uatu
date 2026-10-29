@@ -20,7 +20,7 @@ import type {
   ProviderSession,
   StoredMessageAccounting,
 } from "../../provider";
-import { pendingPermissionFields } from "../normalization";
+import { pendingPermissionFields, number as numberField } from "../normalization";
 import { BackgroundControls, BackgroundWorkers, launcherChanged, retainLauncherEvidence, sameLauncherIdentity, type ControlRead, type LauncherEvidence, type WorkerOccurrenceEvidence } from "./background";
 import { createOpenCodeV2Memory, createOpenCodeV2Normalizer, formPresentation, modelSelection, normalizeStoredMessage, pendingInboxEntry, prepareStoredMessage, storedAccounting, storedPromptId, supportedFormFields, type V2Evidence } from "./normalization";
 import type { ChatAccountChange, ChatAgent, ChatCommand, ChatLoginState, ChatMode, ChatModel, ConversationConfiguration, MessageDelivery, ModelSelection, RestoredDraft, ReversibleHistoryResult, ReversibleHistoryState } from "../../types";
@@ -407,7 +407,8 @@ export class OpenCodeV2Provider implements ChatProvider {
     signal = AbortSignal.any([signal, AbortSignal.timeout(5_000)]);
     // A finite complete-history fold is discarded after this read; only
     // long-lived stream memory uses the retention budget/fallback.
-    const workers = new BackgroundWorkers({ entries: Infinity, bytes: Infinity });
+    const executionHistory = new Map<string, readonly number[]>();
+    const workers = new BackgroundWorkers({ entries: Infinity, bytes: Infinity, executionHistory });
     const unavailableChildren = new Set<string>();
     // Only scoped session records establish child ownership. Tool metadata
     // supplies an identity to verify, never permission to read a foreign child.
@@ -424,6 +425,10 @@ export class OpenCodeV2Provider implements ChatProvider {
       })));
     const verified = new Set<string>();
     await this.verifyChildren(children, sessionId, signal, child => verified.add(child));
+    // Unverified ownership filters out the worker row below. That omission
+    // cannot discharge inventory for a native background launch still in history.
+    if (controlRead && prepared.some(message => [...message.tools.values()].some(tool => tool.name === "subagent" && tool.fact.background === true
+      && tool.fact.reportedChild && !verified.has(tool.fact.reportedChild)))) this.controls.incompleteRead(controlRead);
     for (const child of verified) {
       workers.verifyChild(child, sessionId);
       const launches = prepared.flatMap(message => [...message.tools.values()]).filter(tool => tool.fact.reportedChild === child);
@@ -433,9 +438,11 @@ export class OpenCodeV2Provider implements ChatProvider {
         // launcher completes (or when another client continued the child).
         // An active child alone cannot verify that old occurrence.
         try {
-          for (const message of await this.allMessages(child, signal)) {
-            if (message.type === "idle") workers.executionEnded(child, messageCreatedAt(message));
-          }
+          const idle = (await this.allMessages(child, signal)).filter(message => message.type === "idle");
+          const ends = idle.map(message => numberField(asRecord(message.time).created));
+          for (const end of ends) if (end !== undefined && end >= 0) workers.executionEnded(child, end);
+          if (ends.every((end): end is number => end !== undefined && end >= 0)) executionHistory.set(child, ends);
+          else unavailableChildren.add(child);
         } catch { unavailableChildren.add(child); }
       }
     }
@@ -451,10 +458,15 @@ export class OpenCodeV2Provider implements ChatProvider {
             if (previous.item.type === "background_task" && previous.item.resultId === item.resultId && id !== item.id) normalized.delete(id);
           }
         }
-        normalized.set(item.id, { item: item.type === "background_task" && item.status === "running" && item.childConversationId && unavailableChildren.has(item.childConversationId)
-          ? { ...item, stateUncertain: true } : item, index });
+        const unavailable = item.type === "background_task" && item.status === "running" && item.childConversationId && unavailableChildren.has(item.childConversationId);
+        if (unavailable && controlRead) this.controls.incompleteRead(controlRead);
+        normalized.set(item.id, { item: unavailable ? { ...item, stateUncertain: true } : item, index });
       }
     });
+    for (const update of workers.finishHistory()) if (update.kind === "upsert") {
+      const entry = normalized.get(update.item.id);
+      if (entry) normalized.set(update.item.id, { ...entry, item: update.item });
+    }
     if (overlay) for (const [id, entry] of normalized) if (entry.item.type === "background_task") normalized.set(id, { ...entry,
       item: this.controls.project(entry.item, workers.occurrence(entry.item.taskId), controlRead, workers.controlWitnesses(entry.item.taskId)) });
     this.eventMemory?.workers.enforceBudget();
@@ -560,7 +572,7 @@ export class OpenCodeV2Provider implements ChatProvider {
     const signal = this.readSignal(AbortSignal.any([lifetime.signal, ...(options?.signal ? [options.signal] : [])]));
     if (signal.aborted) return Promise.reject(new Error("Background recovery unavailable"));
     const timer = setTimeout(() => lifetime.abort(), 5_000);
-    const controlRead = this.beginControlRead(sessionId);
+    const controlRead = this.beginControlRead(sessionId, true);
     let completeRead = false;
     const read = this.coveredRead(signal, () => this.readBackgroundTasks(sessionId, signal, controlRead)).then(snapshot => {
       completeRead = true;
@@ -597,6 +609,9 @@ export class OpenCodeV2Provider implements ChatProvider {
         // unique owned shell remains controllable until its job result arrives.
         confirmed = shell?.data.metadata.sessionID === sessionId;
       }
+      // Neither a successful but inconclusive lookup nor an absent active
+      // child is positive verification for an overlapping transcript caller.
+      if (!confirmed) this.controls.incompleteRead(controlRead);
       tasks.push({ ...item, stateUncertain: item.stateUncertain === true || !confirmed });
     }
     signal.throwIfAborted();
@@ -608,8 +623,8 @@ export class OpenCodeV2Provider implements ChatProvider {
     })) };
   }
 
-  private beginControlRead(parent: string): ControlRead {
-    const read = this.controls.beginRead(parent, this.controls.activeReads + this.ownershipChecks.size < 16, this.streamConnected);
+  private beginControlRead(parent: string, inventory = false): ControlRead {
+    const read = this.controls.beginRead(parent, this.controls.activeReads + this.ownershipChecks.size < 16, this.streamConnected, inventory);
     this.eventMemory?.workers.enforceBudget();
     return read;
   }
