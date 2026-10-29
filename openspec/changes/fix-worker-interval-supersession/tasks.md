@@ -35,6 +35,11 @@ Keep this change active while #559 is open. Archival belongs to the repository's
 - [x] 4.2 Align architecture notes, obtain fresh independent review of the hardening delta, and verify strict OpenSpec validation and diff checks without changing interval semantics or unrelated tests.
 - [x] 4.3 Publish the reviewed correction, update approved PR evidence with accurately scoped verification, and observe new-head CI; preserve ready-for-review status and keep this change active.
 
+## 5. Predicate readability
+
+- [x] 5.1 Replace dense alias matching and interval-separation conditions with named local checks while preserving evaluation order and short-circuits; verify provider/control/normalization suites, typecheck and focused equivalence evidence.
+- [x] 5.2 Obtain fresh independent standards/correctness review and validate strict OpenSpec and diff checks while keeping this record active. Report publication and source-commit CI results separately so recording delivery status does not require another CI-triggering bookkeeping commit.
+
 ## Verification evidence
 
 - Round 1 reproduced and corrected historical supersession across interleaved intervals; documented the user-accepted one-time initial planning deviation without claiming retroactive compliance.
@@ -73,3 +78,10 @@ Keep this change active while #559 is open. Archival belongs to the repository's
 - Final local full suite: 7,302 passed, 16 skipped, the same two baseline failures (startup-progress timing and unsafe-mode fixture). No unrelated test was changed.
 - Correction `dce56cf` passed [CI run 40910889917](https://github.com/tjakobsson/uatu/actions/runs/40910889917), including unit, both functional browser legs, performance, contracts, strict specs and final validation. The initial attempt hit the unchanged adapter fixture's recovery-read assertion before fake-timer cleanup; the exact test passed locally in isolation and the failed-job rerun passed without source changes.
 - After CI success, the user-approved PR evidence was updated to 135 added regression/safety cases, 1,721 targeted passes and 7,302 local passes, and the [hardening reply](https://github.com/tjakobsson/uatu/pull/559#issuecomment-6503231105) was published. Readback verified the counts, CI link, release override and ready-for-review status. This change remains active while #559 is open; neither hub was changed.
+
+### Predicate readability verification
+
+- Named the alias candidate's worker scope, certain running occurrence, same-interval and intervening-idle checks; early returns preserve the original evaluation order. Named the proven-separate-interval supersession guard. No interval helpers, boundaries, mutations, tests or control policies were changed.
+- All 1,525 provider and 196 control/shared/V2 normalization tests passed (1,721 total). Typecheck, build, compiled-binary/browser smoke, 61 strict OpenSpec checks and diff checks passed. No new regression cases were needed for the behavior-preserving refactor; the PR total remains 135 added cases.
+- Fresh independent native Sol/medium standards/correctness review reported no findings. Differential checks extracted the actual baseline/current predicates and matched 22,544 cases for candidate identity or separation decision, property-access order, helper calls/arguments, shell bypasses, empty launches and idle boundaries. The source hash stayed unchanged during review and lead verification. These controlled-helper probes do not replace the existing tests of interval mathematics.
+- Full-project unit and functional-browser evidence for the readability commit is reported separately through CI; the local refactor checks above do not claim a new full-suite run. The change stays active while #559 is open.

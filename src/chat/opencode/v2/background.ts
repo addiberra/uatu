@@ -826,9 +826,16 @@ export class BackgroundWorkers {
     }
     const invocation = this.invocations.get(`${parent}:${call}`);
     const startedAt = fact.ran ?? fact.created ?? at;
-    const shared = [...this.tasks.values()].find(task => task.parent === parent && task.worker === child && task.item.taskType === (shell ? "shell" : "agent") && task.item.status === "running" && !task.evidence.uncertain
-      && (shell || task.evidence.launches.every(launch => this.sameHistoricalInterval(child, launch, fact)))
-      && !this.ended.get(child)?.some(end => end >= task.item.createdAt && end < startedAt));
+    const shared = [...this.tasks.values()].find(task => {
+      const sameWorkerScope = task.parent === parent && task.worker === child && task.item.taskType === (shell ? "shell" : "agent");
+      if (!sameWorkerScope) return false;
+      const certainRunningOccurrence = task.item.status === "running" && !task.evidence.uncertain;
+      if (!certainRunningOccurrence) return false;
+      const sameInterval = shell || task.evidence.launches.every(launch => this.sameHistoricalInterval(child, launch, fact));
+      if (!sameInterval) return false;
+      const interveningIdle = this.ended.get(child)?.some(end => end >= task.item.createdAt && end < startedAt);
+      return !interveningIdle;
+    });
     if (shared) {
       if (invocation) this.set(this.invocations, `${parent}:${call}`, { ...invocation, occurrence: shared.evidence.key });
       this.set(this.aliases, callKey, shared.item.taskId);
@@ -853,7 +860,8 @@ export class BackgroundWorkers {
       if (previous.parent !== parent || previous.worker !== child || previous.item.taskType !== item.taskType || previous.item.status !== "running") continue;
       // Content can interleave executions. Preserve a proven other interval
       // so its later aliases can still join it before explicit results arrive.
-      if (!shell && previous.evidence.launches.every(launch => this.separateHistoricalIntervals(child, launch, fact))) continue;
+      const provenSeparateInterval = !shell && previous.evidence.launches.every(launch => this.separateHistoricalIntervals(child, launch, fact));
+      if (provenSeparateInterval) continue;
       this.uncertain(previous);
       superseded.push({ kind: "upsert", item: previous.item });
     }

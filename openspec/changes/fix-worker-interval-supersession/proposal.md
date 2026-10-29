@@ -15,6 +15,7 @@ Independent review of [#559](https://github.com/tjakobsson/uatu/pull/559) reprod
 - Address the follow-up review's clarity notes without changing interval semantics: document order-independent history, name the inventory-close predicate and numeric field parser, and verify the rejected-read and equal-clock observations against the existing safety contract and regressions.
 - Preserve outstanding inventory verification after a capacity-rejected read: a later transcript-only read must not regain control proof that an unsuccessful inventory could not establish.
 - Make control reads transcript-only by default, matching the provider wrapper; inventory-capable callers explicitly opt in, with a regression for omitted-argument fencing and successful explicit recovery.
+- Clarify alias matching and proven interval separation with local names, preserving short-circuit evaluation, worker grouping and uncertainty behavior.
 
 ## Capabilities
 
