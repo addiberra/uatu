@@ -33,7 +33,7 @@ Keep this change active while #559 is open. Archival belongs to the repository's
 
 - [x] 4.1 Add failing omitted-inventory regressions for connected and standalone partial scopes, then default control reads to transcript-only and make inventory-oriented test callers explicit; verify healthy retained controls, explicit fresh recovery, all control/provider/normalization tests, and typecheck.
 - [x] 4.2 Align architecture notes, obtain fresh independent review of the hardening delta, and verify strict OpenSpec validation and diff checks without changing interval semantics or unrelated tests.
-- [ ] 4.3 Publish the reviewed correction, update approved PR evidence with accurately scoped verification, and observe new-head CI; preserve ready-for-review status and keep this change active.
+- [x] 4.3 Publish the reviewed correction, update approved PR evidence with accurately scoped verification, and observe new-head CI; preserve ready-for-review status and keep this change active.
 
 ## Verification evidence
 
@@ -70,3 +70,6 @@ Keep this change active while #559 is open. Archival belongs to the repository's
 - Two omitted-argument regressions failed before the default changed, then passed in the complete 196-case control/shared/V2 normalization suites. All 1,525 provider tests also passed, for 1,721 targeted passes. This adds two cases to the prior 133, bringing the PR total to 135 added regression/safety cases.
 - Fresh independent native Sol/medium standards and correctness review of the hardening delta reported no findings and independently reran all 196 control/normalization cases. The provider wrapper explicitly forwards its capability, so existing production callers are unchanged; inventory-oriented test callers now opt in explicitly without dropping assertions.
 - Typecheck, build, compiled-binary/browser smoke, 61 strict OpenSpec checks, diff checks and the moderate-or-higher dependency-audit gate passed. License checks audited 597 installed packages. The existing low-severity KaTeX advisory GHSA-238p-pmpm-9mq7 remains disclosed; no dependency or runtime was installed.
+- Final local full suite: 7,302 passed, 16 skipped, the same two baseline failures (startup-progress timing and unsafe-mode fixture). No unrelated test was changed.
+- Correction `dce56cf` passed [CI run 40910889917](https://github.com/tjakobsson/uatu/actions/runs/40910889917), including unit, both functional browser legs, performance, contracts, strict specs and final validation. The initial attempt hit the unchanged adapter fixture's recovery-read assertion before fake-timer cleanup; the exact test passed locally in isolation and the failed-job rerun passed without source changes.
+- After CI success, the user-approved PR evidence was updated to 135 added regression/safety cases, 1,721 targeted passes and 7,302 local passes, and the [hardening reply](https://github.com/tjakobsson/uatu/pull/559#issuecomment-6503231105) was published. Readback verified the counts, CI link, release override and ready-for-review status. This change remains active while #559 is open; neither hub was changed.
