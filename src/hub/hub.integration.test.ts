@@ -1346,8 +1346,10 @@ describe("hub end to end", () => {
       headers,
       body: JSON.stringify({ path: source, name: path.basename(renamedPath), stop: true }),
     });
-    expect(confirmed.status).toBe(200);
-    expect(await confirmed.json()).toEqual({ path: renamedPath, workspaceIds: [running.id, starting.id] });
+    expect({ status: confirmed.status, body: await confirmed.json() }).toEqual({
+      status: 200,
+      body: { path: renamedPath, workspaceIds: [running.id, starting.id] },
+    });
     expect(sessions.isRunning(running.id)).toBe(false);
     expect(sessions.isRunning(starting.id)).toBe(false);
   }, 60_000);
